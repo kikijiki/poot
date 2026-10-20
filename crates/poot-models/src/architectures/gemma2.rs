@@ -242,6 +242,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: Some(p.bos.unwrap_or(GEMMA_BOS)),
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::Gemma,
+        tool_codec: None,
     };
     Ok(ModelParts::new(Box::new(Gemma2 {
         params: p,
@@ -566,6 +567,10 @@ mod family_tests {
         let model = model_of(&config, &store);
         assert_eq!(model.config().eos, BTreeSet::from([1]));
         assert_eq!(model.config().chat, ChatFormat::Gemma);
+        assert!(
+            model.config().tool_codec.is_none(),
+            "Gemma has no tool-call markup"
+        );
 
         let run = |config: &serde_json::Value| {
             run_step(

@@ -5,11 +5,12 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use poot_graph_ir::{Builder, BuilderError, Graph, TraceBudgetExceeded, TraceLimits};
 use poot_quant::weights::{HandleFormat, WeightId, WeightMap, WeightMapError};
 
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, ToolCallCodec};
 
 use crate::io::{InputId, ModelSchema, ProgramId, SchemaError, StateMismatch};
 
@@ -57,7 +58,7 @@ pub enum ModelOutput {
 }
 
 /// The family-neutral facts the driver needs about a model.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ModelConfig {
     /// The family's key.
     pub family: FamilyKey,
@@ -82,6 +83,10 @@ pub struct ModelConfig {
     /// The fallback chat format, used only when the checkpoint ships no jinja `chat_template` (the
     /// template itself is tokenizer data, not model config).
     pub chat: ChatFormat,
+    /// How this family spells a function call in its output (and the grammar that forces one): an open
+    /// [`ToolCallCodec`], `None` for a family with no tool-call markup. The loader hands it to the
+    /// text codec, so serve and the chat format never select it.
+    pub tool_codec: Option<Arc<dyn ToolCallCodec>>,
 }
 
 /// How the traced step's KV cache is laid out.

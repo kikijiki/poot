@@ -150,19 +150,6 @@ impl TextCodec {
             self.eos,
         ))
     }
-
-    /// Build a forced tool-call constraint (OpenAI `tool_choice`): exactly one ChatML
-    /// `<tool_call>{json}</tool_call>` block with `{"name": <forced>, "arguments": <args>}`, arguments
-    /// conforming to the tool's parameter schema. `forced` is the (name, parameter-schema) list the
-    /// request permits (one for a named tool, all for `"required"`). Only valid for models that emit
-    /// ChatML tool-call markup (the caller gates on chat format).
-    pub fn build_tool_call_constraint(
-        &self,
-        forced: &[(String, serde_json::Value)],
-    ) -> Result<Constraint> {
-        let pattern = tool_call_regex(forced)?;
-        self.build_regex_constraint(&pattern)
-    }
 }
 
 /// Largest compiled DFA (bytes) a client pattern may build. A pattern past it is refused with a 400.

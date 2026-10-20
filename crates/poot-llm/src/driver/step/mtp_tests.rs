@@ -26,7 +26,7 @@ use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostTensor};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 use crate::core::sampler::Sampler;
 use crate::driver::block_table::BLOCK_SIZE;
@@ -207,6 +207,7 @@ fn build_toy(raw: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, ModelEr
             prompt_bos: None,
             prefill_granule: nz(1),
             chat: ChatFormat::ChatML,
+            tool_codec: Some(Arc::new(HermesToolCodec)),
         },
         weights: WeightMap::default(),
         kind,

@@ -2832,7 +2832,8 @@ mod checkpoint {
         let forced = [("get_weather".to_string(), params)];
         let Some((out, _)) =
             guided_text(path, choice, "What's the weather in Paris? ", 48, |text| {
-                text.build_tool_call_constraint(&forced)
+                text.forced_tool_constraint(&forced)
+                    .map(|constraint| constraint.expect("a ChatML model forces a call"))
             })
         else {
             return;

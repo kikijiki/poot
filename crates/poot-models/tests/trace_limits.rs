@@ -9,6 +9,7 @@
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
 
 use poot_graph_ir::{
     AllocationSite, Attempted, BinOp, BudgetResource, Builder, Graph, TensorType,
@@ -27,7 +28,7 @@ use poot_quant::weights::{
     DenseWeight, FfnRole, WeightEntry, WeightId, WeightMap, WeightRole, WeightStore, WeightView,
 };
 use poot_tensor::DType;
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 thread_local! {
     /// How many times a scripted tracer body ran on this thread.
@@ -77,6 +78,7 @@ fn config_of(family: FamilyKey, vocab: usize) -> ModelConfig {
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     }
 }
 

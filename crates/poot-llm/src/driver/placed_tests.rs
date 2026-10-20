@@ -46,7 +46,7 @@ use poot_runtime_common::{
 };
 use poot_target::{Backend, BufferStorage, DeviceCaps};
 use poot_tensor::DType;
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 use super::capacity::{AllocationOwner, Footprint, Planner};
 use super::error::{DriverError, InvalidOptions, Unsupported};
@@ -203,6 +203,7 @@ fn build_mlp(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, Mod
             prompt_bos: None,
             prefill_granule: NonZeroUsize::MIN,
             chat: ChatFormat::ChatML,
+            tool_codec: Some(Arc::new(HermesToolCodec)),
         },
         weights: map.build(),
     })))
@@ -397,6 +398,7 @@ fn build_attn(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, Mo
             prompt_bos: None,
             prefill_granule: NonZeroUsize::MIN,
             chat: ChatFormat::ChatML,
+            tool_codec: Some(Arc::new(HermesToolCodec)),
         },
         weights: map.build(),
     })))

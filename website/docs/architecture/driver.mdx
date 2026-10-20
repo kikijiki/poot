@@ -28,7 +28,7 @@ A family implements `poot_models::model::Model`:
 
 ```rust
 pub trait Model: Send + Sync {
-    fn config(&self) -> &ModelConfig;     // vocab, eos ids, chat format
+    fn config(&self) -> &ModelConfig;     // vocab, eos ids, chat format, tool codec
     fn schema(&self) -> &ModelSchema;     // programs, request inputs, states
     fn weights(&self) -> &WeightMap;      // which checkpoint tensors feed which typed role
     fn trace_into(&self, spec: &StepSpec, b: Builder)

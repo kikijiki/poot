@@ -46,6 +46,8 @@ poot-graph-plan = { workspace = true, features = ["test-support"] }
 poot-llm = { workspace = true, features = ["test-support"] }
 poot-load = { workspace = true, features = ["test-support"] }
 poot-test-util.workspace = true
+# `TextCodec::with_tokenizer`: the hand-built codecs of the serve rows.
+poot-text = { workspace = true, features = ["test-support"] }
 # The fixture device of the engine-plan rows counts allocations the way a runtime does.
 poot-runtime-common = { workspace = true, features = ["test-support"] }
 poot-quant = { workspace = true, features = ["test-support"] }

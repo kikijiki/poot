@@ -13,6 +13,7 @@
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use poot_graph_ir::{BinOp, Builder, Graph, Slot, SlotKey, TensorType, Traced};
 use poot_quant::weights::{
@@ -36,7 +37,7 @@ use crate::model::{
 };
 use crate::names::{NameRow, Presence, Source, family_weights};
 use crate::registry::{Fixture, RawConfig};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 /// The idefics3 vision tower's name in errors and receipts. It is a container part of the `idefics3` family,
 /// not a registered family.
@@ -335,6 +336,7 @@ pub(super) fn build(
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     };
     Ok(Box::new(Idefics3Vision {
         params: p,

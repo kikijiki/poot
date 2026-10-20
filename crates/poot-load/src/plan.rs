@@ -181,3 +181,68 @@ pub fn build_store(plan: LoadPlan, workers: NonZeroUsize) -> Result<WeightStore,
     }
     Ok(builder.build())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-job plan over a 16-byte file: `range` of it read as `kind`.
+    fn plan_of(container: Container, range: Range<usize>, kind: JobKind) -> LoadPlan {
+        let mut plan = LoadPlan::new(container, vec![StoredBytes::from(vec![0u8; 16])]);
+        plan.push(TensorJob {
+            key: WeightKey::from("w"),
+            file: 0,
+            range,
+            kind,
+        });
+        plan
+    }
+
+    fn dense(dtype: DType, shape: Vec<usize>) -> JobKind {
+        JobKind::Dense { dtype, shape }
+    }
+
+    /// POOT-1289: every reader checks its ranges against the container before it plans, so a job whose range
+    /// leaves its file is a plan some other builder made; the pipeline's own guard refuses it by tensor name
+    /// with both numbers, never a slice panic in a worker. The control is the same job one byte inside.
+    ///
+    /// Mutation: have `TensorJob::run` clamp the range to the file (`range.end.min(len)`); the job reads a
+    /// short view and this row goes red (`expected TensorOutsideFile`).
+    #[test]
+    fn a_job_whose_range_leaves_its_file_is_a_tensor_outside_file_refusal() {
+        let fits = plan_of(Container::Safetensors, 0..16, dense(DType::U8, vec![16]));
+        build_store(fits, NonZeroUsize::MIN).expect("control: the job ends at the file's end");
+        let past = plan_of(Container::Safetensors, 8..17, dense(DType::U8, vec![9]));
+        match build_store(past, NonZeroUsize::MIN) {
+            Err(LoadError::TensorOutsideFile { tensor, need, have }) => {
+                assert_eq!((tensor.as_str(), need, have), ("w", 17, 16));
+            }
+            other => panic!("expected TensorOutsideFile, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// POOT-1289: a GGUF dense job whose bytes are not its shape's byte count is refused as a dense weight
+    /// in the GGUF container's own variant (a safetensors one reads as a message naming the tensor). The
+    /// GGUF reader sizes every dense range as element count times width, so this plan is a forged one.
+    ///
+    /// Mutation: make `DenseWeight::try_new` skip its byte-length comparison; the 8 bytes bind as `[4]` F32
+    /// and this row goes red (`expected GgufDenseWeight`).
+    #[test]
+    fn a_gguf_dense_job_of_the_wrong_byte_count_is_a_dense_weight_refusal() {
+        let plan = plan_of(Container::Gguf, 0..8, dense(DType::F32, vec![4]));
+        match build_store(plan, NonZeroUsize::MIN) {
+            Err(LoadError::GgufDenseWeight(_)) => {}
+            other => panic!("expected GgufDenseWeight, got {:?}", other.map(|_| ())),
+        }
+        let plan = plan_of(Container::Safetensors, 0..8, dense(DType::F32, vec![4]));
+        match build_store(plan, NonZeroUsize::MIN) {
+            Err(LoadError::SafeTensors(message)) => {
+                assert!(message.starts_with("w: "), "{message}")
+            }
+            other => panic!(
+                "expected a safetensors message, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+}

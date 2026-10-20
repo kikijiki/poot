@@ -24,6 +24,7 @@
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use poot_graph_ir::rope_table::{RopeFlavor, RopeSpec, RopeTable};
 use poot_graph_ir::{
@@ -49,7 +50,7 @@ use crate::model::{
 use crate::multimodal::idefics3::tower::{PIXELS, PIXELS_TAG};
 use crate::names::{NameRow, Presence, Source, family_weights};
 use crate::registry::{Fixture, RawConfig};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 /// The Qwen2.5-VL vision tower's [`FamilyKey`]: a family of its own beside the text tower's.
 pub(super) const FAMILY: FamilyKey = FamilyKey::new("qwen2_5_vl_vision");
@@ -539,6 +540,7 @@ pub(super) fn build(
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     };
     Ok(Box::new(Qwen25VlVision {
         params: p,

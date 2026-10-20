@@ -223,95 +223,23 @@ fn request_parses_content_array() {
     assert!(n.messages[0].content.is_none());
 }
 
+/// A codec-parsed call becomes an OpenAI `tool_calls` entry: ordered ids, the `function` kind, the
+/// arguments kept as a JSON string. The markup formats themselves are pinned in poot-text.
 #[test]
-fn parse_tool_calls_single_and_multiple_and_none() {
-    // spec 046 SC-002: one block, two blocks, no block, malformed block.
-    let one = parse_tool_calls(
-        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
+fn parse_tool_calls_shapes_the_models_calls_as_openai_entries() {
+    let codec = chatml_codec();
+    let calls = parse_tool_calls(
+        &codec,
+        "<tool_call>\n{\"name\": \"a\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call><tool_call>\n{\"name\": \"b\", \"arguments\": {}}\n</tool_call>",
     );
-    assert_eq!(one.len(), 1);
-    assert_eq!(one[0].function.name, "get_weather");
-    assert_eq!(one[0].kind, "function");
-    // arguments is re-serialized as a JSON string that parses back to the args object.
-    let args: serde_json::Value = serde_json::from_str(&one[0].function.arguments).unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].kind, "function");
+    assert_eq!(calls[0].id, "call_0");
+    assert_eq!(calls[1].id, "call_1");
+    assert_eq!(calls[1].function.name, "b");
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
     assert_eq!(args["city"], "Paris");
-
-    let two = parse_tool_calls(
-        "<tool_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool_call><tool_call>\n{\"name\": \"b\", \"arguments\": {\"x\": 1}}\n</tool_call>",
-    );
-    assert_eq!(two.len(), 2);
-    assert_eq!(two[1].function.name, "b");
-    assert_eq!(two[0].id, "call_0");
-    assert_eq!(two[1].id, "call_1");
-
-    // plain text -> no calls; a name-less / malformed block is skipped, not panicked.
-    assert!(parse_tool_calls("The weather in Paris is sunny.").is_empty());
-    assert!(parse_tool_calls("<tool_call>\nnot json\n</tool_call>").is_empty());
-    assert!(parse_tool_calls("<tool_call>\n{\"arguments\": {}}\n</tool_call>").is_empty());
-}
-
-#[test]
-fn parse_tool_calls_mistral_and_llama_forms() {
-    // spec 046: non-ChatML tool-call output forms parse into the same OpenAI shape.
-    // Mistral: [TOOL_CALLS] + a JSON array (args under `arguments`), trailing tokens tolerated.
-    let m = parse_tool_calls(
-        "[TOOL_CALLS][{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}, {\"name\": \"now\", \"arguments\": {}}]</s>",
-    );
-    assert_eq!(m.len(), 2);
-    assert_eq!(m[0].function.name, "get_weather");
-    assert_eq!(m[0].id, "call_0");
-    assert_eq!(m[1].function.name, "now");
-    let args: serde_json::Value = serde_json::from_str(&m[0].function.arguments).unwrap();
-    assert_eq!(args["city"], "Paris");
-
-    // Llama-3.1: <|python_tag|> + `;`-separated objects with args under `parameters`, end marker stripped.
-    let l = parse_tool_calls(
-        "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Rome\"}}<|eom_id|>",
-    );
-    assert_eq!(l.len(), 1);
-    assert_eq!(l[0].function.name, "get_weather");
-    let args: serde_json::Value = serde_json::from_str(&l[0].function.arguments).unwrap();
-    assert_eq!(args["city"], "Rome");
-    // two semicolon-separated Llama calls.
-    let l2 = parse_tool_calls(
-        "<|python_tag|>{\"name\": \"a\", \"parameters\": {}}; {\"name\": \"b\", \"parameters\": {\"x\": 1}}",
-    );
-    assert_eq!(l2.len(), 2);
-    assert_eq!(l2[1].function.name, "b");
-
-    // a SINGLE Llama call whose arguments contain a semicolon (inside a string value) must parse as one
-    // call, not be split mid-JSON and dropped. A naive `split(';')` produces zero calls here.
-    let semi = parse_tool_calls(
-        "<|python_tag|>{\"name\": \"run\", \"parameters\": {\"cmd\": \"echo a; echo b\"}}<|eom_id|>",
-    );
-    assert_eq!(
-        semi.len(),
-        1,
-        "a semicolon inside a string arg must not split the call"
-    );
-    assert_eq!(semi[0].function.name, "run");
-    let args: serde_json::Value = serde_json::from_str(&semi[0].function.arguments).unwrap();
-    assert_eq!(args["cmd"], "echo a; echo b");
-
-    // multiple calls where an EARLIER call's arg contains a semicolon: still two distinct calls.
-    let mixed = parse_tool_calls(
-        "<|python_tag|>{\"name\": \"a\", \"parameters\": {\"q\": \"x;y\"}}; {\"name\": \"b\", \"parameters\": {}}",
-    );
-    assert_eq!(mixed.len(), 2);
-    assert_eq!(mixed[0].function.name, "a");
-    assert_eq!(mixed[1].function.name, "b");
-    let a_args: serde_json::Value = serde_json::from_str(&mixed[0].function.arguments).unwrap();
-    assert_eq!(a_args["q"], "x;y");
-
-    // a ChatML block still wins when present; plain text is still empty.
-    assert_eq!(
-        parse_tool_calls("<tool_call>\n{\"name\":\"c\",\"arguments\":{}}\n</tool_call>").len(),
-        1
-    );
-    assert!(parse_tool_calls("just a normal answer, no tools").is_empty());
-    // malformed non-ChatML bodies are skipped, not fatal.
-    assert!(parse_tool_calls("[TOOL_CALLS]not json").is_empty());
-    assert!(parse_tool_calls("<|python_tag|>not json").is_empty());
+    assert!(parse_tool_calls(&codec, "The weather in Paris is sunny.").is_empty());
 }
 
 #[test]
@@ -320,6 +248,7 @@ fn tool_call_stream_deltas_carry_index_and_function() {
     // `index`, the OpenAI `{id, type, function:{name, arguments}}` fields, and the arguments stay a
     // JSON string.
     let calls = parse_tool_calls(
+        &chatml_codec(),
         "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call><tool_call>\n{\"name\": \"now\", \"arguments\": {}}\n</tool_call>",
     );
     let deltas = tool_call_stream_deltas(&calls);

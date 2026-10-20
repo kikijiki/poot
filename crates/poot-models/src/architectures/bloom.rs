@@ -28,6 +28,7 @@
 //! throughout.
 
 use poot_graph_ir::{Builder, Graph};
+use std::sync::Arc;
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
@@ -50,7 +51,7 @@ use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, Step
 use crate::names::gguf::GGUF_BLOOM;
 use crate::names::{FusedDims, NameRow, Presence, Source, family_weights_fused};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 // The `bloom` family behind [`Model`]: LayerNorm blocks with biases, an embedding LayerNorm,
 // ALiBi attention over a fused QKV projection and a plain tanh-GELU MLP with biases, in the
@@ -344,6 +345,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     };
     Ok(ModelParts::new(Box::new(Bloom {
         params: p,

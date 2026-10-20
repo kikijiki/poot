@@ -828,7 +828,12 @@ impl WeightBinder {
         }
         let encodes = match located.format {
             HandleFormat::Dense(dtype) => {
-                aval.dtype == dtype && crate::lanes::encoding_of(dtype, storage).is_some()
+                // The finite-F16 lane is refused: it is the one encoding that can fail on a row's data, and
+                // `embed` has no per-token error for it. (No hosted embed slot is planned in it.)
+                aval.dtype == dtype
+                    && crate::lanes::encoding_of(dtype, storage).is_some_and(|encoding| {
+                        encoding != crate::lanes::Encoding::PackedWordsFiniteF16
+                    })
             }
             HandleFormat::Packed(_) => {
                 aval.dtype == DType::F32
@@ -916,17 +921,17 @@ impl WeightBinder {
                 None => unreachable!("embed rows are resolved against the store they read"),
             }
         }
-        let encoded = match rows.format {
+        // `embed_rows` admitted this lane for these rows: a dense table's encoding exists and cannot fail on
+        // its data (the finite-F16 lane is not admitted), and a packed table's F32 rows land verbatim.
+        Ok(match rows.format {
             HandleFormat::Dense(dtype) => {
-                crate::lanes::encode_stored(dtype, &[rows.width], &dense, storage).ok()
+                crate::lanes::encode_stored(dtype, &[rows.width], &dense, storage)
+                    .expect("embed_rows admitted a lane whose encoding cannot fail on data")
             }
             HandleFormat::Packed(_) => {
                 crate::lanes::encode_host(DType::F32, bytemuck::cast_slice(&decoded), storage)
+                    .expect("embed_rows admitted a lane that holds F32 rows")
             }
-        };
-        encoded.ok_or_else(|| BindError::TokenEmbedEncode {
-            name: rows.name.clone(),
-            planned: storage,
         })
     }
 }

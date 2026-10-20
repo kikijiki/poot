@@ -23,7 +23,7 @@ use poot_quant::weights::{WeightMap, WeightStore};
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 use super::caps::PrepareRefused;
 use super::error::{DriverError, Unsupported};
@@ -171,6 +171,7 @@ fn build_carrier(raw: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, Mod
             prompt_bos: None,
             prefill_granule: nz(1),
             chat: ChatFormat::ChatML,
+            tool_codec: Some(Arc::new(HermesToolCodec)),
         },
         weights: WeightMap::default(),
         kind,

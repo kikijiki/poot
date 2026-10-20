@@ -731,7 +731,7 @@ impl Device for VpuDevice {
                         buffer: arg.buffer.clone(),
                         role: arg.buffer.0.role,
                         elements: usize::try_from(bound.elements)
-                            .expect("check_bindings sized the argument"),
+                            .expect("check_bindings matched the argument to a u32 element count"),
                     },
                     bound.storage.element(),
                 )
@@ -969,7 +969,9 @@ fn check_invocation(kernel: &LoadedKernel, invocation: VpuInvocation) -> Result<
 }
 
 /// The dispatch's arguments (every tensor but the last, then the `output`) are the kernel's ABI, binding for
-/// binding: the count, and for each binding its storage and element count.
+/// binding: the count, and for each binding its storage and element count. Whether the bound buffer is large
+/// enough for that count is not asked here: the engine bounds every argument by [`Device::buffer_elems`]
+/// before any device sees the dispatch ([`poot_executor::DispatchError::ArgExceedsBuffer`]).
 fn check_bindings(kernel: &LoadedKernel, args: &[&Arg<'_, VpuDevice>]) -> Result<(), VpuError> {
     let refuse = |reason: String| VpuError::Bindings {
         key: kernel.key.clone(),
@@ -993,20 +995,6 @@ fn check_bindings(kernel: &LoadedKernel, args: &[&Arg<'_, VpuDevice>]) -> Result
             return Err(refuse(format!(
                 "argument {index} is {} elements, the dispatch binds {}",
                 binding.elements, arg.elems
-            )));
-        }
-        let width = binding.storage.element().byte_width();
-        let needed = usize::try_from(binding.elements)
-            .ok()
-            .and_then(|elements| elements.checked_mul(width))
-            .ok_or(VpuError::Size {
-                elems: binding.elements,
-                width,
-            })?;
-        if arg.buffer.bytes() < needed {
-            return Err(refuse(format!(
-                "argument {index} needs {needed} bytes, the bound buffer holds {}",
-                arg.buffer.bytes()
             )));
         }
     }

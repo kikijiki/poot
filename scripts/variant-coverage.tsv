@@ -1,12 +1,13 @@
-# Variant -> covering test, checked by scripts/check-variant-coverage.py (POOT-1221). Hand-committed,
-# never generated from a run. `covered` rows name a #[test] fn whose body names the variant; `gap` rows are
-# variants no test names yet, each a refusal nobody has watched fire. A new variant needs a row; a gap that
-# gains a covering test must be promoted. `scripts/check-variant-coverage.py --suggest` proposes rows.
+# Variant -> covering test, checked by scripts/check-variant-coverage.py (POOT-1221). Hand-committed, never
+# generated from a run. `covered` rows name a #[test] fn whose body names the variant; `gap` rows are variants
+# no test names yet, each a refusal nobody has watched fire. A gap needs a reason that holds, stated in its last
+# column. A new variant needs a row; a gap that gains a covering test must be promoted.
+# `scripts/check-variant-coverage.py --suggest` proposes rows.
 # enum	variant	status	file	test
 @enum	Capability	crates/poot-graph-plan/src/refusal.rs
 Capability	CollectiveInStage	covered	crates/poot-graph-plan/src/kernel_mapping.rs	plan_eqn_refuses_for_aie_what_has_no_serialized_schedule
 Capability	Collective	covered	crates/poot-graph-plan/src/staged/devices/tests.rs	a_two_device_pipeline_on_wgpu_or_rocm_is_refused_before_any_stage_is_compiled
-Capability	ImportedKernelPlanning	gap	-	-
+Capability	ImportedKernelPlanning	covered	crates/poot-graph-plan/tests/refusal_coverage.rs	a_standalone_packed_dequant_is_an_imported_kernel_planning_refusal
 Capability	DtypeLowering	covered	crates/poot-graph-plan/src/compile.rs	compile_refuses_an_equation_the_traced_graph_cannot_run
 Capability	E4m3Storage	covered	crates/poot-graph-plan/src/tests.rs	e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes
 Capability	ZeroElementE4m3	covered	crates/poot-graph-plan/src/tests.rs	e4m3fn_scatter_update_rejects_empty_and_mixed_storage_by_name
@@ -14,27 +15,27 @@ Capability	DispatchSizeOverflow	covered	crates/poot-graph-plan/src/compile.rs	co
 Capability	DispatchGridLimit	covered	crates/poot-graph-plan/src/compile.rs	compile_refuses_a_dispatch_beyond_the_target_grid
 Capability	DispatchGridAxisLimit	covered	crates/poot-graph-plan/src/planner/sampling.rs	greedy_refuses_a_grid_past_the_target_limit
 Capability	ArgmaxIndexNotExact	covered	crates/poot-graph-plan/src/planner/sampling.rs	greedy_refuses_a_vocabulary_whose_indices_are_not_exact_f32
-Capability	ExactI32Op	gap	-	-
+Capability	ExactI32Op	covered	crates/poot-graph-plan/tests/refusal_coverage.rs	an_i32_remainder_by_literal_zero_is_an_exact_i32_op_refusal
 Capability	UnfoldedIota	covered	crates/poot-graph-plan/src/tests.rs	planner_refuses_an_unfolded_iota_with_a_typed_refusal
-Capability	FusedStep	gap	-	-
-Capability	OperandCount	gap	-	-
+Capability	FusedStep	covered	crates/poot-graph-plan/tests/refusal_coverage.rs	a_float_region_step_the_kernel_cannot_compute_is_a_fused_step_refusal
+Capability	OperandCount	covered	crates/poot-graph-plan/tests/refusal_coverage.rs	a_binary_equation_with_three_operands_is_an_operand_count_refusal
 Capability	OperandShape	covered	crates/poot-graph-plan/src/tests.rs	e4m3fn_dynamic_update_slice_rejects_zero_invalid_window_and_index_storage
 Capability	OperandLayout	covered	crates/poot-graph-plan/tests/indexed_contraction_plan.rs	a_sliced_then_transposed_weight_is_refused_by_layout
 Capability	LiteralFirstOperand	covered	crates/poot-graph-plan/src/tests.rs	planner_rejects_literal_first_binary_locally_without_panicking
-Capability	IndexOperand	gap	-	-
+Capability	IndexOperand	covered	crates/poot-graph-plan/tests/refusal_coverage.rs	a_negative_literal_update_index_is_an_index_operand_refusal
 Capability	NonLastAxisReduce	covered	crates/poot-graph-plan/src/kernel_mapping.rs	plan_eqn_refuses_for_aie_what_has_no_serialized_schedule
 Capability	ScatterNonZeroAxis	covered	crates/poot-graph-plan/src/compile.rs	compile_refuses_a_non_axis_zero_scatter_on_every_target
 Capability	AttentionLds	covered	crates/poot-graph-plan/src/planner/choice.rs	a_device_too_small_for_the_request_compiles_to_a_typed_refusal
 Capability	ScanLds	covered	crates/poot-models/tests/scan_contract.rs	a_state_column_that_cannot_fit_is_refused_before_dispatch
-Capability	BlockTopKWorkgroup	gap	-	-
+Capability	BlockTopKWorkgroup	covered	crates/poot-graph-plan/tests/refusal_coverage.rs	a_device_below_the_block_top_k_workgroup_is_refused_with_both_numbers
 Capability	ScratchBytes	covered	crates/poot-graph-plan/src/tests.rs	a_scratch_past_the_buffer_limit_is_refused_by_finalize
 Capability	KernelGen	covered	crates/poot-graph-plan/src/kernel_mapping.rs	plan_eqn_refuses_for_aie_what_has_no_serialized_schedule
 Capability	KernelResources	covered	crates/poot-graph-plan/src/compile.rs	compile_reverts_a_retyping_pass_whole_when_the_target_refuses_its_region
 Capability	PackedLowering	covered	crates/poot-graph-plan/src/packed_block_float.rs	a_table_without_the_gemv_row_refuses_by_name_not_a_panic
-Capability	AieSchedule	gap	-	-
+Capability	AieSchedule	covered	crates/poot-graph-plan/src/kernel_mapping.rs	the_aie_finalizer_refuses_a_plan_that_is_not_a_serialized_schedule
 Capability	GpuOnly	covered	crates/poot-graph-plan/src/kernel_mapping.rs	plan_eqn_refuses_for_aie_what_has_no_serialized_schedule
 Capability	AieLimit	covered	crates/poot-graph-plan/src/compile/package.rs	an_equation_that_fits_no_region_is_a_typed_refusal_naming_it
-Capability	AieAbi	gap	-	-
+Capability	AieAbi	covered	crates/poot-graph-plan/tests/refusal_coverage.rs	a_zero_element_tensor_on_an_aie_core_is_an_aie_abi_refusal
 Capability	Arithmetic	covered	crates/poot-graph-plan/src/planner/vpu.rs	bf16_arithmetic_is_refused_and_f32_arithmetic_names_the_missing_contract
 Capability	NarrowingContract	covered	crates/poot-graph-plan/src/planner/vpu.rs	bf16_arithmetic_is_refused_and_f32_arithmetic_names_the_missing_contract
 Capability	IntegerToFloat	covered	crates/poot-graph-plan/src/planner/vpu.rs	an_integer_to_float_cast_is_refused_with_its_exact_range
@@ -50,40 +51,36 @@ BindError	Lane	covered	crates/poot-llm/tests/wgpu_executor_contract.rs	binder_an
 BindError	Range	covered	crates/poot-executor/src/engine.rs	a_write_map_binds_only_as_a_checked_forward_slot_map
 BindError	UncheckedWriteMap	covered	crates/poot-executor/src/engine.rs	a_write_map_binds_only_as_a_checked_forward_slot_map
 BindError	NotAWriteMap	covered	crates/poot-executor/src/engine.rs	a_write_map_binds_only_as_a_checked_forward_slot_map
-BindError	StateRow	gap	-	-
+BindError	StateRow	covered	crates/poot-executor/src/engine.rs	a_state_row_past_the_pool_is_a_state_row_refusal_that_zeroes_nothing
 BindError	TokenOutOfRange	covered	crates/poot-executor/src/engine.rs	a_token_outside_the_embed_table_is_refused
-BindError	RowDecode	gap	-	-
-BindError	TokenEmbedEncode	gap	-	-
+BindError	RowDecode	covered	crates/poot-executor/src/engine.rs	a_packed_embed_row_of_another_width_than_the_map_is_a_row_decode_refusal
 BindError	RowRange	covered	crates/poot-executor/src/engine.rs	a_row_write_at_the_end_of_the_pool_is_a_row_range_refusal
 BindError	ExpertRange	covered	crates/poot-executor/tests/guard_rows.rs	an_expert_id_one_past_the_table_is_refused
 BindError	MapLength	covered	crates/poot-executor/tests/guard_rows.rs	a_map_one_element_off_is_refused
 BindError	StateSchema	covered	crates/poot-llm/tests/wgpu_executor_contract.rs	state_with_same_name_and_other_aval_is_refused
 @enum	LoadError	crates/poot-load/src/error.rs	crates/poot-load,crates/poot-models
 LoadError	Io	covered	crates/poot-load/src/safetensors.rs	shard_names_must_be_plain_file_names
-LoadError	Map	gap	-	-
+LoadError	Map	covered	crates/poot-load/tests/refusal_coverage.rs	a_shard_that_is_not_a_regular_file_is_a_map_refusal
 LoadError	SourceChanged	covered	crates/poot-load/tests/mapped_checkpoint.rs	mb5_a_truncated_file_is_refused_typed
 LoadError	Json	covered	crates/poot-load/tests/hostile_inputs.rs	a_header_that_is_not_json_is_a_json_error
 LoadError	SafeTensors	covered	crates/poot-load/src/tests.rs	an_hf_block_fp8_quantization_config_is_the_fp8_scheme
 LoadError	UnknownCheckpointDtype	covered	crates/poot-load/src/dtype.rs	parse_of_an_unrecognized_dtype_string_is_a_typed_error
-LoadError	UndecodableCheckpointDtype	gap	-	-
+LoadError	UndecodableCheckpointDtype	covered	crates/poot-load/tests/refusal_coverage.rs	a_lora_tensor_of_a_dtype_with_no_f32_decode_is_refused
 LoadError	Fp8AmbiguousScale	covered	crates/poot-load/src/tests.rs	malformed_quantized_linears_are_refused_by_tensor_name
 LoadError	DuplicateTensorName	covered	crates/poot-load/src/gguf/format.rs	repeated_tensor_names_and_metadata_keys_are_refused
 LoadError	DuplicateGgufMetadataKey	covered	crates/poot-load/src/gguf/format.rs	repeated_tensor_names_and_metadata_keys_are_refused
 LoadError	InvalidGgufAlignment	covered	crates/poot-load/src/gguf/format.rs	alignment_must_be_a_nonzero_power_of_two
 LoadError	UnsafeShardName	covered	crates/poot-load/src/safetensors.rs	shard_names_must_be_plain_file_names
-LoadError	UnsupportedQuantConfig	gap	-	-
+LoadError	UnsupportedQuantConfig	covered	crates/poot-load/tests/refusal_coverage.rs	a_gptq_checkpoint_format_other_than_gptq_is_an_unsupported_quant_config
 LoadError	UnsupportedLoraConfig	covered	crates/poot-load/src/lora.rs	per_module_patterns_are_refused
-LoadError	MissingRopeTheta	gap	-	-
-LoadError	InvalidRopeTheta	gap	-	-
-LoadError	MissingEosTokenId	gap	-	-
 LoadError	UnsupportedGgufType	covered	crates/poot-load/src/gguf.rs	read_gguf_refuses_a_scheme_with_no_packed_path_by_name
 LoadError	UnsupportedGgufTensorRank	covered	crates/poot-load/tests/hostile_inputs.rs	a_quantized_tensor_of_another_rank_is_refused
 LoadError	GgufTensorTruncated	covered	crates/poot-load/src/gguf.rs	truncated_tensor_data_is_a_typed_error
 LoadError	GgufSplit	covered	crates/poot-load/tests/gguf_shards.rs	sh5_a_set_missing_tensors_is_not_loadable
-LoadError	TensorOutsideFile	gap	-	-
+LoadError	TensorOutsideFile	covered	crates/poot-load/src/plan.rs	a_job_whose_range_leaves_its_file_is_a_tensor_outside_file_refusal
 LoadError	GgufPackedWeight	covered	crates/poot-load/tests/load_pipeline.rs	lp2_the_lowest_failing_tensor_is_reported
-LoadError	GgufDenseWeight	gap	-	-
-LoadError	GgufDuplicateWeightKey	gap	-	-
+LoadError	GgufDenseWeight	covered	crates/poot-load/src/plan.rs	a_gguf_dense_job_of_the_wrong_byte_count_is_a_dense_weight_refusal
+LoadError	GgufDuplicateWeightKey	covered	crates/poot-load/tests/refusal_coverage.rs	two_gguf_tensors_mapped_to_one_weight_key_are_a_duplicate_weight_key
 LoadError	QuantizedLinearLayout	covered	crates/poot-load/src/safetensors.rs	quantized_linear_extents_are_checked
 LoadError	InvalidQuantConfig	covered	crates/poot-load/src/tests.rs	malformed_quantized_linears_are_refused_by_tensor_name
 LoadError	QuantizedLinearPayload	covered	crates/poot-load/src/safetensors.rs	quantized_linear_extents_are_checked

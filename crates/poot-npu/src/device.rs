@@ -819,7 +819,10 @@ fn check_invocation(kernel: &LoadedKernel, invocation: AieInvocation) -> Result<
 /// The dispatch's arguments (every tensor but the last, then the written `output`) are the kernel's shape
 /// ABI, binding for binding: the count, and for each binding its storage and its element count. Which of
 /// them the region writes is the ABI's own say, not the position in the argument list; the ABI's last
-/// binding is written (checked at load), because a dispatch ends with its `output`.
+/// binding is written (checked at load), because a dispatch ends with its `output`. Whether the bound buffer
+/// is large enough for that count is not asked here: the engine bounds every argument by
+/// [`Device::buffer_elems`] before any device sees the dispatch
+/// ([`poot_executor::DispatchError::ArgExceedsBuffer`]).
 fn check_bindings(kernel: &LoadedKernel, args: &[&Arg<'_, XdnaDevice>]) -> Result<(), XdnaError> {
     let refuse = |reason: String| XdnaError::Bindings {
         key: kernel.key.clone(),
@@ -843,20 +846,6 @@ fn check_bindings(kernel: &LoadedKernel, args: &[&Arg<'_, XdnaDevice>]) -> Resul
             return Err(refuse(format!(
                 "binding {index} is {} elements, the dispatch binds {}",
                 binding.elements, arg.elems
-            )));
-        }
-        let width = binding.storage.element().byte_width();
-        let needed = usize::try_from(binding.elements)
-            .ok()
-            .and_then(|elements| elements.checked_mul(width))
-            .ok_or(XdnaError::Size {
-                elems: binding.elements,
-                width,
-            })?;
-        if arg.buffer.bytes() < needed {
-            return Err(refuse(format!(
-                "binding {index} needs {needed} bytes, the bound buffer holds {}",
-                arg.buffer.bytes()
             )));
         }
     }

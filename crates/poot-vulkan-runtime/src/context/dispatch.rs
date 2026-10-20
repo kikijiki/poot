@@ -24,7 +24,9 @@ impl Context {
             .iter()
             .map(|&buffer| Binding {
                 buffer,
-                elems: buffer.elem_count(),
+                elems: u32::try_from(buffer.native_elems()).expect(
+                    "allocate_buffer_resources refuses a buffer whose element count exceeds u32",
+                ),
             })
             .collect();
         // Refuse a bad dispatch before any pipeline is built.

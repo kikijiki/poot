@@ -234,7 +234,8 @@ impl ModelHandle {
         Self::build(family, &raw, Arc::new(store), |config| {
             let text =
                 TextCodec::from_hf_dir(dir, constraint_eos(config), config.prompt_bos, config.chat)
-                    .map_err(|e| LoadError::Text(Box::new(e)))?;
+                    .map_err(|e| LoadError::Text(Box::new(e)))?
+                    .with_tool_codec(config.tool_codec.clone());
             Ok(match template {
                 Some(template) => text.with_chat_template(template),
                 None => text,
@@ -274,7 +275,8 @@ impl ModelHandle {
         Self::build(family, &raw, Arc::new(store), |config| {
             let text =
                 TextCodec::from_gguf(&gguf_vocab(&index), constraint_eos(config), config.chat)
-                    .map_err(|e| LoadError::Text(Box::new(e)))?;
+                    .map_err(|e| LoadError::Text(Box::new(e)))?
+                    .with_tool_codec(config.tool_codec.clone());
             Ok(match template {
                 Some(template) => text.with_chat_template(template),
                 None => text,

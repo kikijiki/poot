@@ -11,6 +11,7 @@
 //! 0), so the generated tokens are tagged too.
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use poot_graph_ir::{Builder, Graph, IndexRange, Slot, SlotKey, TensorType};
 use poot_models::components::dims::{Field, Fields};
@@ -29,7 +30,7 @@ use poot_quant::weights::{
     DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole, WeightStore, WeightView,
 };
 use poot_tensor::DType;
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("poot_fixture_tagged");
 
@@ -128,6 +129,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     };
     Ok(ModelParts::new(Box::new(Tagged {
         embed: Embedding::new(&weights, vocab, width).map_err(|e| e.for_family(FAMILY))?,

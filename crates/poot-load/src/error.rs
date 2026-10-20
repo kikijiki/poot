@@ -85,28 +85,6 @@ pub enum LoadError {
         /// The `adapter_config.json` key.
         field: &'static str,
     },
-    /// `config.json` has no `rope_theta` and the model type has no reference default to fall back to.
-    #[error("config has no rope_theta and model_type {model_type:?} has no reference default")]
-    MissingRopeTheta {
-        /// The config's `model_type`.
-        model_type: String,
-    },
-    /// `config.json` carries a `rope_theta` that is not a positive finite number.
-    #[error(
-        "config rope_theta {value} for model_type {model_type:?} is not a positive finite number"
-    )]
-    InvalidRopeTheta {
-        /// The config's `model_type`.
-        model_type: String,
-        /// The rejected `rope_theta`.
-        value: f32,
-    },
-    /// `config.json` has no `eos_token_id` and the model type has no reference default to fall back to.
-    #[error("config has no eos_token_id and model_type {model_type:?} has no reference default")]
-    MissingEosTokenId {
-        /// The config's `model_type`.
-        model_type: String,
-    },
     /// [`crate::gguf::weight_format_of`] has no [`poot_quant::format::WeightFormat`] for this ggml
     /// type: a removed legacy id, or a real ggml scheme with no packed path (ADR-0103 decision 2).
     #[error("gguf tensor {tensor:?}: unsupported ggml type {ggml_type}")]

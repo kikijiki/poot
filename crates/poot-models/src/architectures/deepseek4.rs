@@ -25,12 +25,13 @@
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_tensor::DType;
+use std::sync::Arc;
 
 use crate::components::standard::{Step, check_step, decoder_program};
 use crate::io::ModelSchema;
 use crate::model::{FamilyKey, Model, ModelConfig, ModelError, ShapeReason, StepSpec, TraceError};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 mod config;
 mod csa;
@@ -80,6 +81,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: None,
         prefill_granule: p.granule,
         chat: ChatFormat::ChatML,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     };
     Ok(ModelParts::new(Box::new(DeepseekV4 {
         params: p,

@@ -1004,6 +1004,91 @@ fn a_grid_over_the_device_limit_is_refused_not_folded() {
     assert_eq!(graph.core.dispatch_count, 0);
 }
 
+/// A dispatch that tells the kernel its buffer holds one element more than it does is refused with the typed
+/// `ArgExceedsBuffer` naming the argument, before anything is recorded.
+///
+/// Mutation: delete the capacity loop in `Context::check_bindings`; the over-length dispatch goes on to
+/// record against the mock, which has no descriptor-set entry point, and the row aborts (red).
+#[test]
+fn a_dispatch_length_beyond_its_buffer_is_refused() {
+    let (context, _mock) = mock_context(None);
+    let mut graph = context.begin_graph(GraphTiming::Off).expect("mock graph");
+    let buffer = mock_buffer(&context, 4 * size_of::<f32>()).expect("mock allocation");
+    let pipeline = mock_pipeline(&context, 1);
+    let record = |graph: &mut RecordingGraph, elems| {
+        context.record_dispatch(
+            graph,
+            "k",
+            &pipeline,
+            [64, 1, 1],
+            [4, 1, 1],
+            &[Binding {
+                buffer: &buffer,
+                elems,
+            }],
+        )
+    };
+    let result = record(&mut graph, 5);
+    assert!(
+        matches!(
+            result,
+            Err(RuntimeError::ArgExceedsBuffer {
+                arg: 0,
+                elems: 5,
+                capacity: 4
+            })
+        ),
+        "got {result:?}"
+    );
+    assert_eq!(graph.core.dispatch_count, 0);
+}
+
+/// The capacity a dispatch length is bounded by is in the unit of `Binding::elems`, the buffer's native
+/// element kind, not 4-byte words: a 16-byte buffer holds 4 F32 or I32, 8 F16 or Bf16 and 16 raw bytes, and
+/// the exact count is accepted while one more is refused naming that capacity. (An F16 buffer was once
+/// compared in words and refused a real coopmat dispatch at half its length.) Packed F16/BF16/FP8 buffers
+/// are allocated as `I32`, so their unit is the word and they are the I32 row.
+///
+/// Mutation: in `Context::check_bindings` take the capacity from `buffer.elem_count()` (words); the F16,
+/// Bf16 and raw-byte exact-capacity rows are refused, `Err(ArgExceedsBuffer { elems: 8, capacity: 4 })`.
+#[test]
+fn a_dispatch_length_is_bounded_in_the_buffers_native_elements() {
+    use poot_runtime_common::{ArgAccess, ArgSchema};
+    use poot_target::ElementKind;
+    let (context, _mock) = mock_context(None);
+    for (element, storage, native) in [
+        (ElementKind::F32, BufferStorage::f32(), 4),
+        (ElementKind::I32, BufferStorage::f16_packed(), 4),
+        (ElementKind::F16, BufferStorage::f16(), 8),
+        (ElementKind::Bf16, BufferStorage::bf16(), 8),
+        (ElementKind::RawBytes, BufferStorage::raw_bytes(), 16),
+    ] {
+        let buffer = mock_buffer_with_storage(&context, 16, storage).expect("mock allocation");
+        let schema = [ArgSchema::new(element, ArgAccess::Read)];
+        let check = |elems| {
+            context.check_bindings(
+                &schema,
+                [64, 1, 1],
+                [4, 1, 1],
+                &[Binding {
+                    buffer: &buffer,
+                    elems,
+                }],
+            )
+        };
+        check(native).unwrap_or_else(|e| panic!("{element:?}: the exact capacity is refused: {e}"));
+        let over = check(native + 1);
+        assert!(
+            matches!(
+                over,
+                Err(RuntimeError::ArgExceedsBuffer { arg: 0, elems, capacity })
+                    if elems == native + 1 && capacity == native as usize
+            ),
+            "{element:?}: got {over:?}"
+        );
+    }
+}
+
 #[test]
 fn a_cached_key_answers_for_one_kernel_only() {
     let (mut context, _mock) = mock_context(None);

@@ -15,6 +15,7 @@
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use poot_graph_ir::Graph;
 use poot_graph_ir::rope_table::RopeFlavor;
@@ -38,7 +39,7 @@ use poot_quant::weights::{
     WeightRole, WeightStore, WeightView,
 };
 use poot_tensor::DType;
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, ParsedToolCall, ToolCallCodec};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("poot_fixture_neoxish");
 
@@ -53,6 +54,30 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     fixture,
     variants: &[],
 };
+
+/// The fixture family's own tool-call markup, one no built-in names: `@neoxish <name> <arguments>`.
+#[derive(Debug)]
+pub(crate) struct NeoxishToolCodec;
+
+impl ToolCallCodec for NeoxishToolCodec {
+    fn parse(&self, text: &str) -> Vec<ParsedToolCall> {
+        text.strip_prefix("@neoxish ")
+            .and_then(|rest| rest.split_once(' '))
+            .map(|(name, arguments)| ParsedToolCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            })
+            .into_iter()
+            .collect()
+    }
+
+    fn forced_pattern(
+        &self,
+        _forced: &[(String, serde_json::Value)],
+    ) -> poot_text::Result<Option<String>> {
+        Ok(None)
+    }
+}
 
 /// The vocabulary of the fixture checkpoint, and its end-of-sequence id.
 pub(crate) const VOCAB: usize = 48;
@@ -237,6 +262,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
+        tool_codec: Some(Arc::new(NeoxishToolCodec)),
     };
     Ok(ModelParts::new(Box::new(Neoxish {
         params: p,

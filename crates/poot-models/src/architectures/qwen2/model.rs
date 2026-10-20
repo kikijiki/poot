@@ -9,6 +9,7 @@
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{WeightMap, WeightStore};
@@ -27,7 +28,7 @@ use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, Step
 use crate::names::gguf::GGUF_BASE;
 use crate::names::{HF_BASE, family_weights, hf_base_shapes};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 /// qwen2's [`FamilyKey`].
 pub const FAMILY: FamilyKey = FamilyKey::new("qwen2");
@@ -274,6 +275,7 @@ fn build_from(
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     };
     Ok(ModelParts::new(Box::new(Qwen2 {
         family,

@@ -34,7 +34,9 @@ use crate::names::{
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_quant::weights::ExpertProj;
-use poot_text::ChatFormat;
+use std::sync::Arc;
+
+use poot_text::{ChatFormat, LlamaToolCodec, MistralToolCodec, ToolCallCodec};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("llama");
 
@@ -140,7 +142,31 @@ pub(crate) struct LlamaParams {
     head_required: bool,
     eos: BTreeSet<u32>,
     bos: Option<u32>,
-    chat: ChatFormat,
+    dialect: Dialect,
+}
+
+/// Which instruct dialect a llama-architecture checkpoint speaks: the chat format it falls back to and
+/// the tool-call markup it emits go together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dialect {
+    Llama3,
+    Mistral,
+}
+
+impl Dialect {
+    fn chat(self) -> ChatFormat {
+        match self {
+            Dialect::Llama3 => ChatFormat::Llama3,
+            Dialect::Mistral => ChatFormat::Mistral,
+        }
+    }
+
+    fn tool_codec(self) -> Arc<dyn ToolCallCodec> {
+        match self {
+            Dialect::Llama3 => Arc::new(LlamaToolCodec),
+            Dialect::Mistral => Arc::new(MistralToolCodec),
+        }
+    }
 }
 
 impl LlamaParams {
@@ -163,16 +189,16 @@ impl LlamaParams {
         }
         // The `mistral` and `mixtral` keys are Mistral checkpoints: their own `[INST]` template,
         // not Llama 3's.
-        let chat = match raw {
+        let dialect = match raw {
             RawConfig::HfJson { config, .. }
                 if matches!(
                     config.get("model_type").and_then(|v| v.as_str()),
                     Some("mistral" | "mixtral")
                 ) =>
             {
-                ChatFormat::Mistral
+                Dialect::Mistral
             }
-            RawConfig::HfJson { .. } | RawConfig::Gguf(_) => ChatFormat::Llama3,
+            RawConfig::HfJson { .. } | RawConfig::Gguf(_) => Dialect::Llama3,
         };
         if matches!(raw, RawConfig::Gguf(_)) {
             attention = attention.with_interleaved_rope();
@@ -204,7 +230,7 @@ impl LlamaParams {
             head_required: dims.head_required,
             eos: dims.eos,
             bos: dims.bos,
-            chat,
+            dialect,
         })
     }
 }
@@ -286,7 +312,8 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         bos: p.bos,
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
-        chat: p.chat,
+        chat: p.dialect.chat(),
+        tool_codec: Some(p.dialect.tool_codec()),
     };
     Ok(ModelParts::new(Box::new(Llama {
         params: p,
@@ -680,10 +707,33 @@ mod tests {
         let model = model_of(&config, &fx.store);
         assert_eq!(model.config().eos, BTreeSet::from([2]));
         assert_eq!(model.config().chat, ChatFormat::Llama3);
-        let config = config_with("mistral", None);
+        // The family names its tool-call markup: Llama's python tag, not Mistral's.
         assert_eq!(
-            model_of(&config, &fx.store).config().chat,
-            ChatFormat::Mistral
+            model.config().tool_codec.as_ref().map(|codec| codec
+                .parse("<|python_tag|>{\"name\": \"f\", \"parameters\": {}}")
+                .len()),
+            Some(1)
+        );
+        assert_eq!(
+            model.config().tool_codec.as_ref().map(|codec| codec
+                .parse("[TOOL_CALLS][{\"name\": \"f\", \"arguments\": {}}]")
+                .len()),
+            Some(0)
+        );
+        let config = config_with("mistral", None);
+        let mistral = model_of(&config, &fx.store);
+        assert_eq!(mistral.config().chat, ChatFormat::Mistral);
+        assert_eq!(
+            mistral.config().tool_codec.as_ref().map(|codec| codec
+                .parse("[TOOL_CALLS][{\"name\": \"f\", \"arguments\": {}}]")
+                .len()),
+            Some(1)
+        );
+        assert_eq!(
+            mistral.config().tool_codec.as_ref().map(|codec| codec
+                .parse("<|python_tag|>{\"name\": \"f\", \"parameters\": {}}")
+                .len()),
+            Some(0)
         );
     }
 

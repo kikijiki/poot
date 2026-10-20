@@ -472,14 +472,6 @@ pub enum BindError {
         /// The decode failure.
         source: poot_quant::decode::DecodeError,
     },
-    /// A hosted embed's rows do not encode into the slot's planned lane.
-    #[error("embed {name}: rows do not encode into {planned:?}")]
-    TokenEmbedEncode {
-        /// The embed's name.
-        name: String,
-        /// The lane the rows had to encode into.
-        planned: poot_target::BufferStorage,
-    },
     /// A sync wrote pool rows outside the table's pool (`first_row + len > pool_rows`).
     #[error("pooled table {table}: rows {first_row}..{end} are outside its {pool_rows} pool rows")]
     RowRange {

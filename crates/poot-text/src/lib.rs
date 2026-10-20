@@ -21,6 +21,7 @@ mod error;
 pub mod grammar;
 mod guided;
 mod tokenize;
+mod tool_call;
 
 pub use chat::{
     ChatTemplateOverride, CheckedChatTemplate, RenderedChat, Speaker, read_tokenizer_config_chat,
@@ -29,3 +30,6 @@ pub use chat_format::ChatFormat;
 pub use error::{ChatTemplateError, Result, TextError};
 pub use guided::{Constraint, JsonAcceptor};
 pub use tokenize::{ChatTemplate, EncoderTokens, GgufVocab, TextCodec};
+pub use tool_call::{
+    HermesToolCodec, LlamaToolCodec, MistralToolCodec, ParsedToolCall, ToolCallCodec,
+};
