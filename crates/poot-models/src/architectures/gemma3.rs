@@ -8,7 +8,8 @@
 //! one in, so the GGUF source uses the plain RMS kind.
 
 use poot_graph_ir::rope_table::RopeFlavor;
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::WeightMap;
 
 use crate::components::attention::{AttentionParams, QkNorm};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};

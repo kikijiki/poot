@@ -58,38 +58,40 @@ const RANKS: &[(&str, u8)] = &[
     ("poot-quant", 2),
     ("poot-codegen", 2),
     ("poot-profile", 2),
-    // 3: graph IR, the checkpoint reader (it depends on poot-quant and poot-tensor only, so it sits just above
+    // 3: the weight vocabulary and map (storage formats and tensors only; graph IR and everything above read it)
+    ("poot-weights", 3),
+    // 4: graph IR, the checkpoint reader (it depends on poot-quant and poot-tensor only, so it sits just above
     // them; FORBIDDEN_NORMAL keeps the oracle, executors and devices off it) and the runtimes whose tests
     // compile kernels
-    ("poot-graph-ir", 3),
-    ("poot-load", 3),
-    ("poot-wgpu-runtime", 3),
-    ("poot-rocm-runtime", 3),
-    ("poot-l0-runtime", 3),
-    ("poot-ptx-runtime", 3),
-    // 4: the CPU oracle and the raw Vulkan runtime
-    ("poot-eval", 4),
-    ("poot-vulkan-runtime", 4),
-    // 5: the kernel generator (its tests compile and run generated bodies)
-    ("poot-kernelgen", 5),
-    // 6: the compiler (its tests check passes against the oracle)
-    ("poot-graph-plan", 6),
-    // 7: the executor contract and the import compiler
-    ("poot-executor", 7),
-    ("pootc", 7),
-    // 8: the dev-only executor parity fixtures (ruling XC2-06: the device crates dev-depend on them)
-    ("poot-executor-parity", 8),
-    // 9: devices
-    ("poot-wgpu-device", 9),
-    ("poot-rocm-device", 9),
-    ("poot-ptx-device", 9),
-    ("poot-vulkan-device", 9),
-    ("poot-npu", 9),
-    // 10: models; 11: the driver; 12: products
-    ("poot-models", 10),
-    ("poot-llm", 11),
-    ("poot-serve", 12),
-    ("poot-bench-runner", 12),
+    ("poot-graph-ir", 4),
+    ("poot-load", 4),
+    ("poot-wgpu-runtime", 4),
+    ("poot-rocm-runtime", 4),
+    ("poot-l0-runtime", 4),
+    ("poot-ptx-runtime", 4),
+    // 5: the CPU oracle and the raw Vulkan runtime
+    ("poot-eval", 5),
+    ("poot-vulkan-runtime", 5),
+    // 6: the kernel generator (its tests compile and run generated bodies)
+    ("poot-kernelgen", 6),
+    // 7: the compiler (its tests check passes against the oracle)
+    ("poot-graph-plan", 7),
+    // 8: the executor contract and the import compiler
+    ("poot-executor", 8),
+    ("pootc", 8),
+    // 9: the dev-only executor parity fixtures (ruling XC2-06: the device crates dev-depend on them)
+    ("poot-executor-parity", 9),
+    // 10: devices
+    ("poot-wgpu-device", 10),
+    ("poot-rocm-device", 10),
+    ("poot-ptx-device", 10),
+    ("poot-vulkan-device", 10),
+    ("poot-npu", 10),
+    // 11: models; 12: the driver; 13: products
+    ("poot-models", 11),
+    ("poot-llm", 12),
+    ("poot-serve", 13),
+    ("poot-bench-runner", 13),
 ];
 
 /// Edges the ranks allow but the architecture forbids: `(dependents, dependency, reason)`.

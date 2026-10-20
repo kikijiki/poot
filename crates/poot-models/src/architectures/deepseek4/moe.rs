@@ -8,8 +8,8 @@
 //! [`components::moe`]: crate::components::moe
 
 use poot_graph_ir::{BinOp, Builder, IndexRange, RedOp, Scalar, TensorType, Traced, ops};
-use poot_quant::weights::{HandleFormat, MoeRole, WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
+use poot_weights::{HandleFormat, MoeRole, WeightId, WeightMap, WeightRole};
 
 use super::config::DeepseekV4Config;
 use crate::components::linear::{WeightError, linear};

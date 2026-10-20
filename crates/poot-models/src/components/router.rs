@@ -9,7 +9,7 @@
 //! witness, which stops the step.
 
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, UnOp, ops};
-use poot_quant::weights::{MoeRole, WeightId, WeightMap, WeightRole};
+use poot_weights::{MoeRole, WeightId, WeightMap, WeightRole};
 
 use super::linear::{Weight, WeightError, linear};
 use super::norm::NormParams;

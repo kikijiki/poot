@@ -15,10 +15,9 @@ use std::num::NonZeroUsize;
 
 use poot_graph_ir::ops::MASK_HIDDEN;
 use poot_graph_ir::{BinOp, Builder, Graph, IndexRange, Slot, SlotKey, TensorType, Traced, ops};
-use poot_quant::weights::{
-    AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole, WeightStore,
-};
+use poot_quant::weights::WeightStore;
 use poot_tensor::DType;
+use poot_weights::{AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole};
 
 use crate::components::dims::{Field, Fields};
 use crate::components::embed::Embedding;

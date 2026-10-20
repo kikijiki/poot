@@ -18,7 +18,8 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use poot_graph_ir::{Builder, Graph};
-use poot_quant::weights::{AttnRole, ExpertProj, NormRole, WeightMap, WeightRole, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::{AttnRole, ExpertProj, NormRole, WeightMap, WeightRole};
 
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
@@ -704,7 +705,7 @@ pub(crate) fn fixture() -> Fixture {
 #[cfg(test)]
 mod tests {
     use poot_load::gguf::GgufValue;
-    use poot_quant::weights::HandleFormat;
+    use poot_weights::HandleFormat;
     use serde_json::json;
 
     use super::*;

@@ -92,9 +92,11 @@ windows and keep the best `index_topk` entries per token, chosen by a small inde
 attention has a learned sink per head, the last `qk_rope_head_dim` dimensions of each head rotate (and rotate
 back on the output), and the output projection is grouped. Every layer routes through a mixture of experts
 scored by `sqrt(softplus(logit))`; the first `num_hash_layers` layers take their experts from a table indexed
-by the token id instead. The routed experts (4-bit E2M1) and the projections (E4M3) are read packed, as stored.
+by the token id instead. The model reads its routed experts (4-bit E2M1) and projections (E4M3) packed when the
+weight store holds them packed, but no loader produces packed entries from a checkpoint yet: a real quantized V4
+checkpoint is refused at load, naming the tensor whose `.scale` sibling has no layout.
 
-This family loads with `ModelHandle::load` and generates with `Driver`. Its prefill step covers whole
+This family generates with `Driver` over a dense or fixture-packed weight store. Its prefill step covers whole
 compression windows: the driver's prefill granule is the least common multiple of the layers' rates, and the
 tokens of a prompt after the last whole window run as decode steps. Layer, expert and head counts, the
 compression rates and the schedule come from the checkpoint's config, so a fine-tune with other values loads

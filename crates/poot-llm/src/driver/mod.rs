@@ -99,8 +99,8 @@ use poot_models::model::{
     FamilyKey, HiddenCarry, KvLayout, ShapeReason, StepShape, StepSpec, TraceError,
 };
 use poot_profile::{Mark, Report, TimingSnapshot};
-use poot_quant::weights::WeightMap;
 use poot_tensor::{DType, HostTensor};
+use poot_weights::WeightMap;
 
 use bind::{Binder, BoundSlot, PassInput, RequestFrame, StepColumns};
 

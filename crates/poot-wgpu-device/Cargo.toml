@@ -41,6 +41,7 @@ poot-kernelgen.workspace = true
 poot-tensor = { workspace = true, features = ["read-counter"] }
 poot-eval = { workspace = true, features = ["test-support"] }
 poot-quant = { workspace = true, features = ["test-support"] }
+poot-weights = { workspace = true, features = ["test-support"] }
 poot-runtime-common = { workspace = true, features = ["test-support"] }
 # src/tests/imported_kernel.rs deserializes a committed offline-imported Body (.kir.json) and compiles
 # it directly against poot-codegen's on-disk kernel cache; tests/buffer_plan.rs compiles its length

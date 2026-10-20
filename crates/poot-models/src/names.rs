@@ -3,9 +3,10 @@
 //! model's [`WeightMap`] against the loaded store. [`HF_BASE`] holds the rows every HF decoder with
 //! the `model.layers.{l}` layout shares; a family adds its own rows beside them.
 
-use poot_quant::weights::{
-    AttnRole, ExpertProj, FfnRole, MoeRole, NormRole, WeightId, WeightKey, WeightMap,
-    WeightMapBuilder, WeightMapError, WeightRole, WeightStore, WeightView,
+use poot_quant::weights::{WeightKey, WeightStore};
+use poot_weights::{
+    AttnRole, ExpertProj, FfnRole, MoeRole, NormRole, WeightId, WeightMap, WeightMapBuilder,
+    WeightMapError, WeightRole, WeightView,
 };
 
 use crate::model::{FamilyKey, ModelError};
@@ -883,9 +884,10 @@ mod tests {
     use std::sync::Arc;
 
     use poot_quant::format::WeightFormat;
-    use poot_quant::weights::{DenseWeight, HandleFormat, WeightEntry};
+    use poot_quant::weights::{DenseWeight, WeightEntry};
     use poot_quant::{PackedPayload, PackedWeight, SourceRole};
     use poot_tensor::DType;
+    use poot_weights::HandleFormat;
 
     use super::test_only::build_weight_map;
     use super::*;

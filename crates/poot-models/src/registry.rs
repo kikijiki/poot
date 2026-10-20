@@ -507,7 +507,7 @@ mod tests {
     use crate::test_support::family_fixtures;
     use poot_graph_ir::Graph;
     use poot_quant::StoredBytes;
-    use poot_quant::weights::WeightMap;
+    use poot_weights::WeightMap;
     use std::sync::Arc;
 
     use poot_text::{ChatFormat, HermesToolCodec};

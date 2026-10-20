@@ -138,19 +138,35 @@ impl TextCodec {
     }
 }
 
+/// The held bytes of the text files of an HF checkpoint directory. The caller reads each file once (and
+/// checks it against a pin when the load is pinned); the codec parses exactly these bytes.
+#[derive(Debug, Clone, Default)]
+pub struct HfTextFiles {
+    /// `tokenizer.json`.
+    pub tokenizer: Vec<u8>,
+    /// `tokenizer_config.json`, when the checkpoint ships one.
+    pub tokenizer_config: Option<Vec<u8>>,
+    /// The standalone `chat_template.jinja`, when the checkpoint ships one.
+    pub chat_template_jinja: Option<String>,
+}
+
 impl TextCodec {
-    /// The text services of an HF checkpoint directory: `tokenizer.json`, and the chat template and
-    /// bos/eos strings of `tokenizer_config.json` (or a sibling `chat_template.jinja`). `encode`
-    /// prepends `prompt_bos`, the family's mandatory BOS (`ModelConfig::prompt_bos`), when it has one.
-    pub fn from_hf_dir(
-        dir: &std::path::Path,
+    /// The text services of an HF checkpoint from the bytes of its text files ([`HfTextFiles`]): the
+    /// tokenizer, and the chat template and bos/eos strings of `tokenizer_config.json` (or a sibling
+    /// `chat_template.jinja`). `encode` prepends `prompt_bos`, the family's mandatory BOS
+    /// (`ModelConfig::prompt_bos`), when it has one.
+    pub fn from_hf_files(
+        files: &HfTextFiles,
         eos: u32,
         prompt_bos: Option<u32>,
         chat_format: ChatFormat,
     ) -> Result<Self> {
-        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
-            .map_err(|e| err!("load tokenizer: {e}"))?;
-        let (template, bos_token, eos_token) = crate::chat::read_tokenizer_config_chat(dir);
+        let tokenizer =
+            Tokenizer::from_bytes(&files.tokenizer).map_err(|e| err!("load tokenizer: {e}"))?;
+        let (template, bos_token, eos_token) = crate::chat::chat_from_files(
+            files.tokenizer_config.as_deref(),
+            files.chat_template_jinja.as_deref(),
+        );
         Ok(Self::new(
             tokenizer,
             None,

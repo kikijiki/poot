@@ -19,11 +19,12 @@ use poot_models::model::{
     StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
 use poot_text::{ChatFormat, HermesToolCodec};
+use poot_weights::WeightMap;
 
 use super::caps::PrepareRefused;
 use super::error::{DriverError, Unsupported};

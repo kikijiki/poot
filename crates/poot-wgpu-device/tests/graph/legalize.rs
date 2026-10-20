@@ -10,8 +10,8 @@ use super::*;
 use poot_graph_ir::WeightRef;
 use poot_graph_plan::test_support::gpu_caps;
 use poot_graph_plan::{CompileOptions, Target, compile};
-use poot_quant::weights::{WeightId, WeightRole};
 use poot_target::{Backend, DeviceCaps};
+use poot_weights::{WeightId, WeightRole};
 
 #[test]
 fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {

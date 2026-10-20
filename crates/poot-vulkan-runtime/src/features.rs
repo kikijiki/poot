@@ -104,6 +104,18 @@ impl DeviceFeatures {
         }
     }
 
+    /// The optional shader features the logical device enables ([`Self::create_device`] enables everything
+    /// supported). Float32 atomics are not among the features poot's raw-Vulkan device requests.
+    pub(crate) fn shader_features(&self) -> poot_target::ShaderFeatures {
+        poot_target::ShaderFeatures {
+            float16: self.shader_float16,
+            float64: self.shader_float64,
+            atomic_float32: false,
+            int16: self.shader_int16,
+            int64: self.shader_int64,
+        }
+    }
+
     /// Whether `VK_EXT_memory_budget` is enabled on the device, so the heap budget can be queried.
     pub(crate) fn memory_budget(&self) -> bool {
         self.memory_budget

@@ -110,7 +110,9 @@ pub fn reinfer(draft: &mut crate::GraphEdit) {
                 crate::Operand::Lit(scalar) => scalar.ty(),
             })
             .collect();
-        if let Ok(inferred) = eqn.op.infer(&ins) {
+        let is_literal =
+            |index: usize| matches!(eqn.inputs.get(index), Some(crate::Operand::Lit(_)));
+        if let Ok(inferred) = eqn.op.infer(crate::Operands::new(&ins, &is_literal)) {
             let kept_widening = matches!(eqn.op, crate::OpKind::MatMul)
                 && draft.values()[eqn.out].aval.dtype == poot_tensor::DType::F32
                 && inferred.shape == draft.values()[eqn.out].aval.shape;

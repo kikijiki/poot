@@ -33,6 +33,7 @@ poot-load.workspace = true
 # `Model::weights` returns a `WeightMap`; `RawConfig::HfJson` carries the parsed `config.json`
 # and `generation_config.json`.
 poot-quant.workspace = true
+poot-weights.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -52,6 +53,7 @@ bytemuck = { workspace = true, optional = true }
 poot-models = { path = ".", features = ["test-support"] }
 poot-graph-ir = { workspace = true, features = ["test-support"] }
 poot-quant = { workspace = true, features = ["test-support"] }
+poot-weights = { workspace = true, features = ["test-support"] }
 # `write_gguf`, the in-memory GGUF writer the family tests build checkpoints with (ADR-0113).
 poot-load = { workspace = true, features = ["test-support"] }
 # `default_caps_for` for the integration tests that trace models through `compile`.

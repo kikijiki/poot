@@ -27,7 +27,8 @@
 //! Structural template: `crate::qwen2::trace_prefill_impl`/`trace_decode_kv_masked_impl`, except for the NoPE
 //! branch. Every op is an existing `poot_graph_ir::ops` composition.
 
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::WeightMap;
 
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::model::{ConfigReason, FamilyKey, ModelError};

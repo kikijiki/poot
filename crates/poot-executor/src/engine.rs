@@ -34,9 +34,10 @@ use poot_graph_plan::{
 };
 use poot_kernel_ir::Body;
 use poot_quant::SourceRole;
-use poot_quant::weights::{StoreGeneration, WeightMap, WeightStore};
+use poot_quant::weights::{StoreGeneration, WeightStore};
 use poot_target::{AieCaps, AieTargetId, BufferStorage, TargetId, VpuTargetId};
 use poot_tensor::DType;
+use poot_weights::WeightMap;
 
 use crate::binder::{self, BoundSlot, EmbedRows, StoredAs, WeightBinder};
 use crate::device::{
@@ -4242,11 +4243,10 @@ mod f16_packed_weight_upload_tests {
         staged::ExpertPlacement, staged::Partition, staged::TargetSet, staged::compile_staged,
     };
     use poot_quant::StoredBytes;
-    use poot_quant::weights::{
-        AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightMap, WeightRole, WeightView,
-    };
+    use poot_quant::weights::{DenseWeight, WeightEntry};
     use poot_runtime_common::BufferRole;
     use poot_target::Backend;
+    use poot_weights::{AttnRole, FfnRole, WeightId, WeightMap, WeightRole, WeightView};
 
     const PROJECTION_INPUT: WeightId = WeightId::layer(0, WeightRole::Attn(AttnRole::Q));
     const PROJECTION_WEIGHT: WeightId = WeightId::layer(0, WeightRole::Ffn(FfnRole::Gate));
@@ -4693,12 +4693,12 @@ mod weight_source_tests {
         staged::compile_staged,
     };
     use poot_quant::format::WeightFormat;
-    use poot_quant::weights::{
-        AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightKey, WeightMap,
-        WeightMapError, WeightRole, WeightView,
-    };
+    use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey};
     use poot_quant::{PackedPayload, SourceRole, StoredBytes};
     use poot_runtime_common::MemoryCounters;
+    use poot_weights::{
+        AttnRole, FfnRole, WeightId, WeightMap, WeightMapError, WeightRole, WeightView,
+    };
     use std::ops::Range;
 
     /// Records every allocation (role, storage, native elements) and every write by buffer index,
@@ -5262,7 +5262,7 @@ mod weight_source_tests {
                 DenseWeight::try_new(DType::I64, vec![2, 2], StoredBytes::from(bytes)).unwrap(),
             ),
         )]);
-        let table = WeightId::layer(0, WeightRole::Moe(poot_quant::weights::MoeRole::HashTable));
+        let table = WeightId::layer(0, WeightRole::Moe(poot_weights::MoeRole::HashTable));
         let mapped = map(
             &weights,
             vec![(table, WeightView::IndexNarrow("tid2eid".into()))],
@@ -5309,7 +5309,7 @@ mod weight_source_tests {
     #[test]
     fn a_ranged_index_table_with_a_word_outside_its_range_is_refused_at_weight_bind() {
         const EXPERTS: usize = 4;
-        let table = WeightId::layer(0, WeightRole::Moe(poot_quant::weights::MoeRole::HashTable));
+        let table = WeightId::layer(0, WeightRole::Moe(poot_weights::MoeRole::HashTable));
         let load = |words: [i64; 4]| {
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             let weights = store(vec![(
@@ -6414,7 +6414,7 @@ mod weight_source_tests {
     const INTER: usize = 2;
 
     fn moe_roles(layer: usize) -> [WeightId; 3] {
-        use poot_quant::weights::{ExpertProj, MoeRole};
+        use poot_weights::{ExpertProj, MoeRole};
         [
             WeightId::layer(layer, WeightRole::Moe(MoeRole::Router)),
             WeightId::layer(layer, WeightRole::Moe(MoeRole::Stack(ExpertProj::GateUp))),
@@ -7500,11 +7500,10 @@ mod aie_engine_tests {
         CompileOptions, multi_device::topology::DeviceId, staged::DevicePlacement,
         staged::ExpertPlacement, staged::Partition, staged::TargetSet, staged::compile_staged,
     };
-    use poot_quant::weights::{
-        AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightMap, WeightRole, WeightView,
-    };
+    use poot_quant::weights::{DenseWeight, WeightEntry};
     use poot_runtime_common::BufferRole;
     use poot_target::Queried;
+    use poot_weights::{AttnRole, FfnRole, WeightId, WeightMap, WeightRole, WeightView};
 
     impl<D: Device> Engine<D> {
         /// This engine links AIE kernels with `toolchain` instead of the process environment's.
@@ -7870,11 +7869,10 @@ mod vpu_engine_tests {
         CompileOptions, multi_device::topology::DeviceId, staged::DevicePlacement,
         staged::ExpertPlacement, staged::Partition, staged::TargetSet, staged::compile_staged,
     };
-    use poot_quant::weights::{
-        AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightMap, WeightRole, WeightView,
-    };
+    use poot_quant::weights::{DenseWeight, WeightEntry};
     use poot_runtime_common::{BufferRole, KernelCode};
     use poot_target::{Queried, VendorCompilerId, VpuCaps};
+    use poot_weights::{AttnRole, FfnRole, WeightId, WeightMap, WeightRole, WeightView};
 
     const A: WeightId = WeightId::layer(0, WeightRole::Attn(AttnRole::Q));
     const B: WeightId = WeightId::layer(0, WeightRole::Ffn(FfnRole::Gate));

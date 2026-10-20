@@ -21,8 +21,9 @@ use poot_graph_plan::{
     staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::TargetSet,
     staged::compile_staged,
 };
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
 use poot_tensor::HostTensor;
+use poot_weights::WeightMap;
 
 use poot_test_util::assert_close_scaled;
 

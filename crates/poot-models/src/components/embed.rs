@@ -1,8 +1,8 @@
 //! The token embedding: rows of the `[vocab, width]` table gathered by token id.
 
 use poot_graph_ir::{Builder, Slot, SlotKey, TensorType, Traced};
-use poot_quant::weights::{WeightId, WeightMap, WeightRole};
 use poot_tensor::{DType, HostTensor};
+use poot_weights::{WeightId, WeightMap, WeightRole};
 
 use super::linear::{Weight, WeightError};
 use crate::io::{

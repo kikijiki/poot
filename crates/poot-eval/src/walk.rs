@@ -843,8 +843,11 @@ fn evaluate_cast(
         (DType::F32, DType::I32) => {
             let tensor = host_tensor(eqn, 0, env)?;
             let view = tensor.to_f32()?;
+            // `i32::MAX as f32` rounds up to 2^31, so the representable range is the half-open
+            // `[-2^31, 2^31)`: 2^31 itself would saturate silently.
+            const I32_RANGE: std::ops::Range<f32> = -2147483648.0..2147483648.0;
             for (index, &value) in view.iter().enumerate() {
-                if !value.is_finite() || value.fract() != 0.0 || value.abs() > i32::MAX as f32 {
+                if !I32_RANGE.contains(&value) || value.fract() != 0.0 {
                     return Err(crate::CastFault {
                         eqn: eqn.out,
                         from,
@@ -1374,12 +1377,6 @@ fn evaluate_dense(
             let refs: Vec<&HostTensor> = parts.iter().collect();
             ops::movement::concat(&refs, *axis)?
         }
-        OpKind::Scatter { axis } => {
-            debug_assert_eq!(*axis, 0, "scatter is axis-0 only");
-            let src = get(&eqn.inputs[0])?;
-            let index = get(&eqn.inputs[1])?;
-            ops::movement::scatter_axis0(&src, &index, eqn.out)?
-        }
         OpKind::ScatterUpdate => {
             let base = get(&eqn.inputs[0])?;
             let src = get(&eqn.inputs[1])?;
@@ -1387,8 +1384,6 @@ fn evaluate_dense(
             ops::movement::scatter_update(&base, &src, &slots, &out_shape, eqn.out)?
         }
         OpKind::ArgTopK { k } => ops::index::arg_top_k(&get(&eqn.inputs[0])?, *k, eqn.out)?,
-        OpKind::PackI8 => ops::index::pack_i8(&get(&eqn.inputs[0])?, &out_shape)?,
-        OpKind::UnpackI8 { len } => ops::index::unpack_i8(&get(&eqn.inputs[0])?, *len, &out_shape)?,
         OpKind::Iota { len, dtype } => ComputedConst::Iota {
             len: *len,
             dtype: *dtype,

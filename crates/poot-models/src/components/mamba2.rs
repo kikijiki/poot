@@ -13,8 +13,8 @@
 //! op (heads of different rows share the weights but not the state).
 
 use poot_graph_ir::{BinOp, Builder, ScanAttrs, ScanFamily, ScanResult, Traced, UnOp, ops};
-use poot_quant::weights::{Mamba2Role, WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
+use poot_weights::{Mamba2Role, WeightId, WeightMap, WeightRole};
 
 use super::conv::{ConvParams, ConvWeights, causal_conv};
 use super::linear::{Weight, WeightError, linear};

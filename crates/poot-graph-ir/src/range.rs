@@ -385,7 +385,6 @@ fn equation_range(
             .unwrap_or(IndexRange::I32),
         // `operand` and `update` each supply words of the result.
         OpKind::DynamicUpdateSlice { .. } => at(0).union(&at(1)),
-        OpKind::Scatter { .. } => at(0),
         OpKind::ScatterUpdate => at(0).union(&at(1)),
         OpKind::Reduce {
             op: RedOp::Sum,

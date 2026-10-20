@@ -14,7 +14,7 @@
 //! gated residual around them is the family's own ([`gated_residual`](super::gated_residual)).
 
 use poot_graph_ir::{BinOp, Builder, Traced};
-use poot_quant::weights::{HyperSite, WeightId, WeightMap, WeightRole};
+use poot_weights::{HyperSite, WeightId, WeightMap, WeightRole};
 
 use super::LayerKind;
 use super::config::Qwen4ExpParams;

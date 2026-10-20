@@ -19,6 +19,8 @@ pub mod graph;
 /// The canonical in-graph index-bounds guard and its validation witness (card 372c).
 pub mod index_guard;
 pub mod op;
+#[cfg(test)]
+mod operand_dtype_tests;
 pub mod ops;
 /// Graph constant names and source types of a packed linear: the `{linear_id}.packed_weight_source` /
 /// `{linear_id}.packed_scale_source` spelling and the scale byte width each carrier is shaped by.
@@ -45,25 +47,24 @@ pub use error::{
 };
 pub use graph::{
     BoundaryId, ComputedConst, EditError, Eqn, ExecutionValidationFailure, Export, Graph,
-    GraphEdit, GraphOutput, LayerIndex, LayerRuns, LayerTagError, MAX_VALIDATION_PACKET_BYTES,
-    Operand, OutputKind, Slot, SlotKey, StatePair, StatePolicy, StateRole, StateRows, Storage,
-    ValidationId, ValidationPacketEntry, ValidationPacketError, ValidationPacketLayout, ValueId,
-    ValueMeta, ValueTable, Witness, WitnessLedger,
+    GraphEdit, GraphOutput, LayerIndex, LayerOrderError, LayerRuns, LayerTagError,
+    MAX_VALIDATION_PACKET_BYTES, Operand, OutputKind, Slot, SlotKey, StatePair, StatePolicy,
+    StateRole, StateRows, Storage, ValidationId, ValidationPacketEntry, ValidationPacketError,
+    ValidationPacketLayout, ValueId, ValueMeta, ValueTable, Witness, WitnessLedger,
 };
 pub use index_guard::{
     GuardValues, GuardedIndex, IndexGuardEmitError, IndexGuardError, emit_index_guard,
     is_guard_witness,
 };
 pub use op::{
-    AttentionAttrs, BinOp, BlockTopKAttrs, BlockTopKLayout, ContractionRows,
-    DENSE_CONTRACTION_WEIGHT_DTYPES, DENSE_ROW_GATHER_SOURCE_DTYPES, KeyLayout, KvBound,
-    MaskOperand, OpClass, OpKind, RedOp, ScanAttrs, ScanFamily, ScanLayout, SelectedAttentionAttrs,
-    SelectedAttentionLayout, SinkOperand, UnOp,
+    AttentionAttrs, BinOp, BlockTopKAttrs, BlockTopKLayout, ContractionRows, KeyLayout, KvBound,
+    LocalId, MaskOperand, OpClass, OpKind, RedOp, ScanAttrs, ScanFamily, ScanLayout,
+    SelectedAttentionAttrs, SelectedAttentionLayout, SinkOperand, UnOp,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use packed_source::packed_source_constants;
 pub use packed_source::{PackedSourceName, packed_source_type, packed_stack_source_type};
 pub use range::{IndexRange, RangeFacts, value_ranges};
 pub use slot_map::{ForwardSlotMap, SlotMapError};
-pub use types::{Scalar, TensorType};
+pub use types::{Operands, Scalar, TensorType};
 pub use weight_ref::WeightRef;

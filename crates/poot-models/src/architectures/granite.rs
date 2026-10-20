@@ -6,7 +6,8 @@
 //! components, and `granitemoe`'s experts as the feed-forward when the config states an expert
 //! count. The legacy dense tracers at the end of this file are the tests' independent reference.
 
-use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::{ExpertProj, WeightMap};
 
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::moe::{GateUpForm, MoeParams};
@@ -591,7 +592,8 @@ mod moe_tests {
 
     use poot_load::gguf::GgufValue;
     use poot_quant::format::WeightFormat;
-    use poot_quant::weights::{MoeRole, WeightEntry, WeightKey, WeightMapError, WeightRole};
+    use poot_quant::weights::{WeightEntry, WeightKey};
+    use poot_weights::{MoeRole, WeightMapError, WeightRole};
     use serde_json::json;
 
     use super::*;
@@ -843,7 +845,7 @@ mod moe_tests {
         );
         for (id, view, handle) in stacks {
             assert!(
-                matches!(handle.format, poot_quant::weights::HandleFormat::Packed(_)),
+                matches!(handle.format, poot_weights::HandleFormat::Packed(_)),
                 "{id}: a packed stack"
             );
             assert_eq!(
@@ -851,7 +853,7 @@ mod moe_tests {
                 "{id}: one packed owner per expert"
             );
             assert!(
-                matches!(view, poot_quant::weights::WeightView::ExpertStack(keys) if keys.len() == EXPERTS),
+                matches!(view, poot_weights::WeightView::ExpertStack(keys) if keys.len() == EXPERTS),
                 "{id}: the experts viewed as one stack"
             );
         }

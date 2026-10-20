@@ -32,14 +32,12 @@ use poot_models::model::{
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
 use poot_quant::StoredBytes;
-use poot_quant::weights::{
-    AttnRole, DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole, WeightStore,
-    WeightView,
-};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps, ElementKind};
 use poot_tensor::DType;
 use poot_text::{ChatFormat, HermesToolCodec};
+use poot_weights::{AttnRole, WeightId, WeightMap, WeightRole, WeightView};
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 
@@ -1788,12 +1786,43 @@ fn a_hf_directory_loads_through_the_registry() {
     assert!(matches!(missing, DriverError::Load(_)), "{missing:?}");
 }
 
+/// The hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    poot_load::packed_safetensors::sha256_digest(bytes)
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The integrity manifest text pinning every file of `dir` with its real digest, except that `wrong`
+/// (when `Some`) replaces the digest of `file`.
+fn manifest_text(dir: &std::path::Path, file: &str, wrong: Option<&str>) -> String {
+    let mut files = serde_json::Map::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        if name == "integrity.json" {
+            continue;
+        }
+        let bytes = std::fs::read(dir.join(&name)).unwrap();
+        let digest = match wrong {
+            Some(wrong) if name == file => wrong.to_string(),
+            _ => sha256_hex(&bytes),
+        };
+        files.insert(
+            name,
+            serde_json::json!({"length": bytes.len(), "sha256": digest}),
+        );
+    }
+    serde_json::json!({ "files": files }).to_string()
+}
+
 /// The registry's qwen2 fixture as an HF directory, written with the shared safetensors writer, and
-/// the manifest text pinning its `model.safetensors` with `sha256_hex` (the real digest when `None`).
+/// a manifest pinning every file of it (`model.safetensors` with `sha256_hex`, the real digest when `None`).
 fn pinned_hf_directory(
     name: &str,
     weights: Option<&[u8]>,
-    sha256_hex: Option<&str>,
+    wrong_weights_digest: Option<&str>,
 ) -> (poot_test_util::UniqueTempPath, std::path::PathBuf) {
     let fixture = poot_models::test_support::family_fixtures::base(
         Registry::builtin().unwrap().entries()[0].family,
@@ -1810,20 +1839,10 @@ fn pinned_hf_directory(
         .tokenizer()
         .save(dir.join("tokenizer.json"), false)
         .unwrap();
-    let bytes = std::fs::read(&weights_path).unwrap();
-    let real: String = poot_load::packed_safetensors::sha256_digest(&bytes)
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
     let manifest = dir.join("integrity.json");
     std::fs::write(
         &manifest,
-        serde_json::json!({"files": {"model.safetensors": {
-            "length": bytes.len(),
-            "sha256": sha256_hex.unwrap_or(&real),
-        }}})
-        .to_string(),
+        manifest_text(&dir, "model.safetensors", wrong_weights_digest),
     )
     .unwrap();
     (dir, manifest)
@@ -1831,7 +1850,7 @@ fn pinned_hf_directory(
 
 /// SC-006: a dense fixture written with the `poot-test-util` writer loads with no manifest and with
 /// its right manifest; a manifest whose digest for `model.safetensors` is wrong is the typed
-/// integrity error. Mutation: skip `check_pin_reader` in `check_integrity`; the wrong-digest row loads.
+/// integrity error. Mutation: skip `check_pin_reader` in `Pins::check_weights`; the wrong-digest row loads.
 #[test]
 fn an_integrity_manifest_pins_the_weights_file() {
     let registry = Registry::builtin().unwrap();
@@ -1859,6 +1878,57 @@ fn an_integrity_manifest_pins_the_weights_file() {
         ),
         "{err:?}"
     );
+}
+
+/// POOT-1258 SC-002: with an integrity manifest, every file the load reads is pinned and parsed from the
+/// bytes that were hashed. A modified `tokenizer.json` (the pin is of the original) fails the load with the
+/// digest mismatch naming it, and a manifest that leaves `tokenizer.json` or `config.json` out is the typed
+/// `Unpinned`. Mutation: read `tokenizer.json` without `Pins::read` (no pin check); the modified-tokenizer
+/// row loads.
+#[test]
+fn a_manifest_pins_the_tokenizer_and_the_config_not_only_the_weights() {
+    let registry = Registry::builtin().unwrap();
+    let (dir, manifest) = pinned_hf_directory("driver_integrity_tokenizer", None, None);
+    let pinned = || LoadOptions {
+        integrity: Some(manifest.clone()),
+        ..LoadOptions::default()
+    };
+    ModelHandle::load(&dir, &registry, &pinned()).expect("the untouched directory loads");
+
+    // The tokenizer changes after the manifest was written: same document, one more added space.
+    let tokenizer = dir.join("tokenizer.json");
+    let mut bytes = std::fs::read(&tokenizer).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(&tokenizer, bytes).unwrap();
+    let err = ModelHandle::load(&dir, &registry, &pinned()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DriverError::Load(LoadError::Integrity(
+                poot_load::packed_safetensors::PackedSafetensorsError::ArtifactChanged { ref file }
+                    | poot_load::packed_safetensors::PackedSafetensorsError::DigestMismatch { ref file }
+            )) if file == "tokenizer.json"
+        ),
+        "{err:?}"
+    );
+
+    // A manifest that does not list a file the load reads admits nothing unchecked.
+    for left_out in ["tokenizer.json", "config.json"] {
+        let (dir, manifest) = pinned_hf_directory("driver_integrity_left_out", None, None);
+        let mut text: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        text["files"].as_object_mut().unwrap().remove(left_out);
+        std::fs::write(&manifest, text.to_string()).unwrap();
+        let options = LoadOptions {
+            integrity: Some(manifest),
+            ..LoadOptions::default()
+        };
+        let err = ModelHandle::load(&dir, &registry, &options).unwrap_err();
+        assert!(
+            matches!(&err, DriverError::Load(LoadError::Unpinned { file }) if file == left_out),
+            "{left_out}: {err:?}"
+        );
+    }
 }
 
 const OVERRIDE_TEMPLATE: &str = "{% for m in messages %}[{{ m['role'] }}:{{ m['content'] }}]{% endfor %}{% if add_generation_prompt %}[assistant:{% endif %}";
@@ -2067,7 +2137,7 @@ fn a_wrong_pin_is_refused_before_any_tensor_is_read() {
 /// An integrity manifest that does not name the GGUF file checks nothing, so it is refused: the
 /// typed `Unpinned` naming the file, before the file is opened (it is garbage here, so opening it
 /// would be a `Weights` error, which is also what the no-manifest control gives). Mutation: admit a
-/// weight file the manifest does not list (drop the `required` check in `check_integrity`); the
+/// weight file the manifest does not list (drop the `required` check in `Pins::check_weights`); the
 /// load then fails as `Weights` and the row goes red.
 #[test]
 fn a_manifest_that_does_not_pin_the_gguf_is_refused() {
@@ -2101,7 +2171,7 @@ fn a_manifest_that_does_not_pin_the_gguf_is_refused() {
 
 /// Every `*.safetensors` shard of an HF directory must be pinned: with `model.safetensors` pinned and
 /// a second shard not, the load is the typed `Unpinned` naming the second shard. Mutation: check
-/// only the shards the manifest lists (drop the `required` check in `check_integrity`); the load
+/// only the shards the manifest lists (drop the `required` check in `Pins::check_weights`); the load
 /// then reaches the garbage shard and fails as `Weights`, so the row goes red.
 #[test]
 fn an_unpinned_shard_is_refused() {
@@ -2256,13 +2326,13 @@ fn a_gguf_pin_is_checked_against_the_mapped_file() {
 }
 
 /// ADR-0103 amendment (MB-8, and its HF-directory twin): a pin is checked against the mapping the store
-/// views, never against a second open of the path. The row drives `check_integrity` where the two sides
+/// views, never against a second open of the path. The row drives `Pins::check_weights` where the two sides
 /// differ: the file is replaced by rename after it was mapped, so the mapping holds the pinned bytes and
 /// the path holds others (and the reverse). Mutation: hash `File::open(dir.join(name))` instead of the
 /// mapping; the first assertion fails with `DigestMismatch`.
 #[test]
 fn a_pin_is_checked_over_the_mapping_not_the_path() {
-    use super::handle::check_integrity;
+    use super::handle::Pins;
     use poot_load::packed_safetensors::PackedSafetensorsError;
     let dir = poot_test_util::unique_temp_path("driver_pin_over_mapping");
     std::fs::create_dir_all(&dir).unwrap();
@@ -2298,10 +2368,14 @@ fn a_pin_is_checked_over_the_mapping_not_the_path() {
     let replacement = dir.join("replacement");
     std::fs::write(&replacement, vec![9u8; 64]).unwrap();
     std::fs::rename(&replacement, &weights).unwrap();
-    check_integrity(&options(&pinned_bytes), &dir, None, &files)
-        .expect("the pin matches the mapped bytes, whatever the path holds now");
+    let check = |bytes: &[u8]| {
+        Pins::load(&options(bytes))
+            .unwrap()
+            .check_weights(&dir, None, &files)
+    };
+    check(&pinned_bytes).expect("the pin matches the mapped bytes, whatever the path holds now");
     // A pin for what the path holds now does not match the mapping the store would view.
-    let err = check_integrity(&options(&[9u8; 64]), &dir, None, &files).unwrap_err();
+    let err = check(&[9u8; 64]).unwrap_err();
     assert!(
         matches!(
             err,

@@ -18,10 +18,11 @@ use poot_graph_plan::{
     staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostView};
+use poot_weights::WeightMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Released {

@@ -8,7 +8,8 @@
 //! A phi3 GGUF stores Q/K in HF row order (no llama.cpp permutation), so both formats use the
 //! half-split rotation.
 
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::WeightMap;
 
 use crate::components::attention::AttentionParams;
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};

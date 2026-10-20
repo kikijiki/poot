@@ -36,13 +36,20 @@ fn wgpu_device_caps_matches_a_direct_adapter_query() {
     let limits = adapter.limits();
     let caps = ctx.device_caps();
 
-    // This crate's `required_limits` never raises `max_compute_workgroup_storage_size` past
-    // `downlevel_defaults()` (see `Context::new_async`), so that is what the device actually grants,
-    // not the adapter's own (possibly higher) unrequested maximum.
+    // The device is opened with the adapter's own limits, so the workgroup memory and the per-axis workgroup
+    // extents it grants are the adapter's, as raw Vulkan's are (POOT-1232).
     assert_eq!(
-        caps.lds_bytes,
-        wgpu::Limits::downlevel_defaults().max_compute_workgroup_storage_size,
-        "lds_bytes must be the granted device limit, not the adapter's own maximum"
+        caps.lds_bytes, limits.max_compute_workgroup_storage_size,
+        "lds_bytes must be the adapter's own workgroup-storage limit, not the downlevel default"
+    );
+    assert_eq!(
+        caps.max_workgroup_size,
+        [
+            limits.max_compute_workgroup_size_x,
+            limits.max_compute_workgroup_size_y,
+            limits.max_compute_workgroup_size_z
+        ],
+        "workgroup extents are the adapter's own"
     );
 
     // This crate raises `max_compute_workgroups_per_dimension` to the adapter's own maximum, so the
@@ -52,17 +59,16 @@ fn wgpu_device_caps_matches_a_direct_adapter_query() {
         "max_grid must equal the adapter's own max_compute_workgroups_per_dimension"
     );
 
-    // `effective_max_buffer_size` is `min(raw device max_buffer_size, AMD_RADV_SAFE_MAX_BUFFER_BYTES)`
-    // on an AMD Vulkan (RADV) adapter, else the raw device max (Card 453 D1); reproduce that formula
+    // `effective_max_buffer_size` is the raw device max held to the calibrated safe ceiling of the device's
+    // identity, where one was measured (Card 453 D1; RADV on Strix Halo), else the raw device max; reproduce that
     // from an independently queried adapter to prove `device_caps` did not just echo a constant.
-    let is_amd_radv = info.backend == wgpu::Backend::Vulkan && info.vendor == 0x1002;
-    let expected_max_buffer_bytes = if is_amd_radv {
-        limits
-            .max_buffer_size
-            .min(poot_target::AMD_RADV_SAFE_MAX_BUFFER_BYTES)
-    } else {
-        limits.max_buffer_size
-    };
+    let calibrated_ceiling = (info.backend == wgpu::Backend::Vulkan)
+        .then(|| poot_target::calibration::Calibration::of_vulkan_device(info.vendor, &info.name))
+        .and_then(poot_target::Queried::known)
+        .and_then(|c| c.safe_max_buffer_bytes);
+    let expected_max_buffer_bytes = calibrated_ceiling.map_or(limits.max_buffer_size, |safe| {
+        limits.max_buffer_size.min(safe)
+    });
     assert_eq!(
         caps.max_buffer_bytes, expected_max_buffer_bytes,
         "max_buffer_bytes must be the queried device max, RADV-capped where applicable"
@@ -103,6 +109,7 @@ fn wgpu_device_caps_matches_a_direct_adapter_query() {
     );
     // On this box (AMD Vulkan/RADV, RDNA3.5 WMMA hardware) this must be a confirmed family, not `None`
     // or `UnknownNotExposedByApi` - the whole point of measuring instead of parsing a name string.
+    let is_amd_radv = info.backend == wgpu::Backend::Vulkan && info.vendor == 0x1002;
     if is_amd_radv {
         assert_eq!(
             caps.tensor_core,
@@ -112,12 +119,15 @@ fn wgpu_device_caps_matches_a_direct_adapter_query() {
         );
     }
 
-    // On this box (AMD Vulkan/RADV) the watchdog budget and the tiled-GEMM miscompile ceiling are a
-    // vendor-scoped default, since no driver API reports either (they are calibrated from observed
-    // hangs and wrong output): confirm they are present exactly where the vendor/backend check says so.
-    assert_eq!(caps.watchdog_budget.is_some(), is_amd_radv);
+    // The watchdog budget and the tiled-GEMM miscompile ceiling come from the calibration table, keyed by the
+    // device's identity, since no driver API reports either (they were calibrated from observed hangs and wrong
+    // output): present exactly where the table names this device.
+    let calibrated = (info.backend == wgpu::Backend::Vulkan)
+        .then(|| poot_target::calibration::Calibration::of_vulkan_device(info.vendor, &info.name))
+        .and_then(poot_target::Queried::known);
+    assert_eq!(caps.watchdog_budget.is_some(), calibrated.is_some());
     assert_eq!(
         caps.known_miscompiles.tiled_gemm_max_workgroups.is_some(),
-        is_amd_radv
+        calibrated.is_some()
     );
 }

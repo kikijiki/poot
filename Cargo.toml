@@ -19,6 +19,7 @@ members = [
     "crates/poot-profile",
     "crates/poot-test-util",
     "crates/poot-quant",
+    "crates/poot-weights",
     "crates/poot-wgpu-runtime",
     "crates/poot-runtime-common",
     "crates/poot-ptx-runtime",
@@ -101,6 +102,7 @@ poot-kernel-ir = { path = "crates/poot-kernel-ir" }
 poot-codegen = { path = "crates/poot-codegen" }
 poot-profile = { path = "crates/poot-profile" }
 poot-quant = { path = "crates/poot-quant" }
+poot-weights = { path = "crates/poot-weights" }
 poot-target = { path = "crates/poot-target" }
 poot-graph-plan = { path = "crates/poot-graph-plan" }
 poot-wgpu-runtime = { path = "crates/poot-wgpu-runtime" }

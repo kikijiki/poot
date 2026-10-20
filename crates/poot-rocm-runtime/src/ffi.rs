@@ -66,6 +66,20 @@ fnptr!(
     *mut c_void
 );
 fnptr!(
+    HsaAgentIterateRegions,
+    bindings::hsa_status_t,
+    bindings::hsa_agent_t,
+    Option<bindings::HsaRegionIterateCb>,
+    *mut c_void
+);
+fnptr!(
+    HsaRegionGetInfo,
+    bindings::hsa_status_t,
+    bindings::hsa_region_t,
+    u32,
+    *mut c_void
+);
+fnptr!(
     HsaIsaGetInfoAlt,
     bindings::hsa_status_t,
     bindings::hsa_isa_t,
@@ -322,6 +336,8 @@ declared_as! {
     HsaShutDown = hsa_shut_down;
     HsaIterateAgents = hsa_iterate_agents;
     HsaAgentGetInfo = hsa_agent_get_info;
+    HsaAgentIterateRegions = hsa_agent_iterate_regions;
+    HsaRegionGetInfo = hsa_region_get_info;
     HsaIsaGetInfoAlt = hsa_isa_get_info_alt;
     HsaSystemGetInfo = hsa_system_get_info;
     HsaAmdProfilingSetProfilerEnabled = hsa_amd_profiling_set_profiler_enabled;
@@ -386,6 +402,10 @@ pub(crate) struct Funcs {
     pub(crate) hsa_iterate_agents: HsaIterateAgents,
     /// `hsa_agent_get_info`: reads an `HSA_AGENT_INFO_*` attribute of an agent.
     pub(crate) hsa_agent_get_info: HsaAgentGetInfo,
+    /// `hsa_agent_iterate_regions`: enumerates an agent's regions (segments) through a callback.
+    pub(crate) hsa_agent_iterate_regions: HsaAgentIterateRegions,
+    /// `hsa_region_get_info`: reads an `HSA_REGION_INFO_*` attribute of a region.
+    pub(crate) hsa_region_get_info: HsaRegionGetInfo,
     /// `hsa_isa_get_info_alt`: reads an `HSA_ISA_INFO_*` attribute of an ISA.
     pub(crate) hsa_isa_get_info_alt: HsaIsaGetInfoAlt,
     /// `hsa_system_get_info`: reads an `HSA_SYSTEM_INFO_*` attribute (timestamp frequency).
@@ -479,6 +499,8 @@ impl Funcs {
             hsa_shut_down: sym!(hsa_shut_down),
             hsa_iterate_agents: sym!(hsa_iterate_agents),
             hsa_agent_get_info: sym!(hsa_agent_get_info),
+            hsa_agent_iterate_regions: sym!(hsa_agent_iterate_regions),
+            hsa_region_get_info: sym!(hsa_region_get_info),
             hsa_isa_get_info_alt: sym!(hsa_isa_get_info_alt),
             hsa_system_get_info: sym!(hsa_system_get_info),
             hsa_amd_profiling_set_profiler_enabled: sym!(hsa_amd_profiling_set_profiler_enabled),

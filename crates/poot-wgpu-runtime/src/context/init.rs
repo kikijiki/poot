@@ -77,18 +77,17 @@ impl Context {
         self.effective_max_buffer_size
     }
 
-    /// The device-capability descriptor the planner reads (card 522): the buffer, LDS and grid limits
-    /// and the tensor-core family are this device's own query; the display-watchdog budget and the
-    /// tiled-GEMM miscompile ceiling are not device-queryable at all (they are calibrated from observed
-    /// hangs and wrong output, not reported by any driver API), so they are the vendor-scoped default for
-    /// AMD Vulkan (RADV) - [`poot_target::DeviceCaps::wgpu_rdna3_igpu`]'s values - on `self.is_amd_radv`, else absent.
+    /// The device-capability descriptor the planner reads (card 522): the buffer, LDS and grid limits, the
+    /// shader features and the tensor-core family are this device's own query. The display-watchdog budget and
+    /// the tiled-GEMM miscompile ceiling are not device-queryable at all (they are calibrated from observed
+    /// hangs and wrong output, not reported by any driver API), so they come from the calibration table keyed
+    /// by this device's identity ([`poot_target::calibration::Calibration::of_vulkan_device`]); a device nobody
+    /// measured reports none.
     pub fn device_caps(&self) -> poot_target::DeviceCaps {
-        let (watchdog_budget, known_miscompiles) = if self.is_amd_radv {
-            let d = poot_target::DeviceCaps::wgpu_rdna3_igpu();
-            (d.watchdog_budget, d.known_miscompiles)
-        } else {
-            (None, poot_target::KnownMiscompiles::default())
-        };
+        let calibration = self
+            .calibration
+            .known()
+            .unwrap_or(poot_target::calibration::Calibration::UNMEASURED);
         // Channel data is per part, read from the device's own identity (RADV names Strix Halo in its device
         // name), never given to every AMD device.
         let dram_channels = poot_target::dram_channels::DramChannels::of_device_name(
@@ -109,12 +108,21 @@ impl Context {
             max_workgroup_invocations: launch.max_workgroup_invocations,
             subgroup: launch.subgroup,
             max_grid: [self.max_workgroups; 3],
-            watchdog_budget,
+            watchdog_budget: calibration.watchdog_budget,
             tensor_core: self.tensor_core,
-            known_miscompiles,
+            known_miscompiles: calibration.known_miscompiles,
             compute_units: self.compute_units,
             memory_budget_bytes: self.memory_budget_bytes,
             dram_channels,
+            shader_features: self.shader_features,
+            // SPIR-V holds E4M3FN in packed lanes and has no native two-byte float lane on any Vulkan device.
+            e4m3_storage: poot_target::E4m3Storage::PackedLanes,
+            matrix_lowering: poot_target::MatrixLowering::vulkan(self.tensor_core),
+            native_two_byte_floats: false,
+            widens_bf16_decode_weight: false,
+            imported_lds_array_bodies: true,
+            peer_transport: false,
+            decode_gemv_max_out_cols: None,
         }
     }
 
@@ -165,18 +173,10 @@ impl Context {
         if timestamps {
             features |= wgpu::Features::TIMESTAMP_QUERY;
         }
-        // Raise the conservative downlevel limits to the adapter maxima (storage buffers per stage,
-        // workgroup size, buffer/binding sizes) so multi-slot and large-weight kernels fit. Also take the
-        // adapter's per-dimension workgroup-count cap: dispatch folding uses the device limit rather
-        // than a hardcoded 65535.
-        let a = adapter.limits();
-        let mut limits = wgpu::Limits::downlevel_defaults();
-        limits.max_storage_buffers_per_shader_stage = a.max_storage_buffers_per_shader_stage;
-        limits.max_compute_invocations_per_workgroup = a.max_compute_invocations_per_workgroup;
-        limits.max_compute_workgroup_size_x = a.max_compute_workgroup_size_x;
-        limits.max_buffer_size = a.max_buffer_size;
-        limits.max_storage_buffer_binding_size = a.max_storage_buffer_binding_size;
-        limits.max_compute_workgroups_per_dimension = a.max_compute_workgroups_per_dimension;
+        // Open the device with the adapter's own limits, the way the raw Vulkan runtime does: the downlevel
+        // defaults cap workgroup memory at 16 KiB and the y and z workgroup extents far below what the
+        // silicon offers, so the same GPU planned different attention lanes here than under raw Vulkan.
+        let limits = adapter.limits();
 
         // Experimental features need the opt-in token, and only the cooperative-matrix feature is
         // experimental here, so the token is given exactly when that feature is requested.
@@ -203,23 +203,26 @@ impl Context {
         let max_workgroups = device.limits().max_compute_workgroups_per_dimension;
         // Card 453 D1: raw largest single buffer this device accepts (queried, not hardcoded).
         let max_buffer_size = device.limits().max_buffer_size;
-        // Card 453 D1: effective limit for allocation planning. Scoped to AMD Vulkan (RADV,
-        // vendor 0x1002) where a chunk at the raw device max wedged the gfx ring on first
-        // dispatch; other vendors use the raw limit unchanged.
+        // Card 453 D1: effective limit for allocation planning. A device whose calibration measured a safe
+        // single-buffer ceiling below its advertised maximum (RADV on Strix Halo: a chunk at the raw device max
+        // wedged the gfx ring on first dispatch) is held to it; any other device uses the raw limit.
         let adapter_info = adapter.get_info();
-        let is_amd_radv =
-            adapter_info.backend == wgpu::Backend::Vulkan && adapter_info.vendor == 0x1002;
-        let effective_max_buffer_size = if is_amd_radv {
-            max_buffer_size.min(poot_target::AMD_RADV_SAFE_MAX_BUFFER_BYTES)
+        let calibration = if adapter_info.backend == wgpu::Backend::Vulkan {
+            poot_target::calibration::Calibration::of_vulkan_device(
+                adapter_info.vendor,
+                &adapter_info.name,
+            )
         } else {
-            max_buffer_size
+            poot_target::Queried::Unknown
         };
-        // Card 522: the LDS/shared-memory budget one dispatch may use. The granted device limit
-        // (`device.limits()`, like `max_workgroups`/`max_buffer_size` above), not the adapter's
-        // unrequested maximum: this crate's `required_limits` never raises
-        // `max_compute_workgroup_storage_size` past `downlevel_defaults()`, so the adapter's own higher
-        // ceiling (if any) is not actually available to a dispatch on this device.
+        let effective_max_buffer_size = calibration
+            .known()
+            .and_then(|c| c.safe_max_buffer_bytes)
+            .map_or(max_buffer_size, |safe| max_buffer_size.min(safe));
+        // The LDS/shared-memory budget one dispatch may use: the granted device limit, which is the adapter's
+        // own.
         let lds_bytes = device.limits().max_compute_workgroup_storage_size;
+        let shader_features = granted_shader_features(device.features());
         // Card 522 review: measured from `VK_KHR_cooperative_matrix` (via wgpu's own
         // `Adapter::cooperative_matrix_properties`), never parsed from the adapter's device-name
         // string - Mesa RADV reports a marketing codename, not a gfx code. Reported only for what
@@ -286,7 +289,8 @@ impl Context {
             tensor_core,
             compute_units,
             memory_budget_bytes: None,
-            is_amd_radv,
+            calibration,
+            shader_features,
             pipelines: RefCell::new(HashMap::new()),
             pipeline_builds: Default::default(),
             submits: Default::default(),
@@ -428,6 +432,18 @@ fn granted_tensor_core(
         .fold(poot_target::TensorCoreSupport::None, |acc, x| {
             acc.most_specific(x)
         })
+}
+
+/// The optional shader features the device was granted. `SHADER_I16` and `SHADER_INT64` are required at open,
+/// so a context that exists always has them.
+fn granted_shader_features(granted: wgpu::Features) -> poot_target::ShaderFeatures {
+    poot_target::ShaderFeatures {
+        float16: granted.contains(wgpu::Features::SHADER_F16),
+        float64: granted.contains(wgpu::Features::SHADER_F64),
+        atomic_float32: granted.contains(wgpu::Features::SHADER_FLOAT32_ATOMIC),
+        int16: granted.contains(wgpu::Features::SHADER_I16),
+        int64: granted.contains(wgpu::Features::SHADER_INT64),
+    }
 }
 
 /// The adapter's compute units through [`poot_runtime_common::vulkan_probe::amd_vulkan_compute_units`]; `None` off Vulkan.
@@ -583,9 +599,9 @@ mod launch_caps_device_receipt {
             );
             return;
         };
-        if !ctx.is_amd_radv {
+        if ctx.calibration.known().is_none() {
             eprintln!(
-                "SKIP a_live_amd_device_reports_the_launch_limits_the_fixture_documents: not RADV"
+                "SKIP a_live_amd_device_reports_the_launch_limits_the_fixture_documents: not the calibrated device"
             );
             return;
         }

@@ -53,6 +53,7 @@ poot-text = { workspace = true, features = ["test-support"] }
 # The fixture device of the engine-plan rows counts allocations the way a runtime does.
 poot-runtime-common = { workspace = true, features = ["test-support"] }
 poot-quant = { workspace = true, features = ["test-support"] }
+poot-weights = { workspace = true, features = ["test-support"] }
 # The dtype of the synthetic LoRA adapter the device rows write.
 poot-tensor.workspace = true
 poot-graph-ir = { workspace = true, features = ["test-support"] }

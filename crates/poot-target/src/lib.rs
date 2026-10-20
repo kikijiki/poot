@@ -17,6 +17,7 @@
 //! every runtime's buffer handle and by the planner's per-value storage record (card 527).
 
 pub mod aie;
+pub mod calibration;
 pub mod dram_channels;
 pub mod storage;
 pub mod vpu;
@@ -310,6 +311,16 @@ pub enum Queried<T> {
     Unknown,
 }
 
+impl<T> Queried<T> {
+    /// The value, or `None` where the device did not report one.
+    pub fn known(self) -> Option<T> {
+        match self {
+            Queried::Known(value) => Some(value),
+            Queried::Unknown => None,
+        }
+    }
+}
+
 /// Whether a device runs subgroup (warp/wavefront) collectives, and the lane counts one can have.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SubgroupSupport {
@@ -351,6 +362,91 @@ pub struct KnownMiscompiles {
     /// RADV: the LDS-cooperative tiled GEMM produces wrong, non-deterministic output at or above this
     /// many workgroups in one dispatch (card 095). `None` on a device with no confirmed ceiling.
     pub tiled_gemm_max_workgroups: Option<u32>,
+}
+
+/// The optional shader features a device was opened with: what its runtime requested and the device granted,
+/// out of those poot's generated kernels can declare. The planner's resource validation refuses a kernel whose
+/// body needs one the device was not opened with (`float64` is the one a body states today); a runtime that
+/// compiles without a shader-feature concept (PTX, HSA) runs every type natively and reports all of them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ShaderFeatures {
+    /// 16-bit float arithmetic.
+    pub float16: bool,
+    /// 64-bit float arithmetic.
+    pub float64: bool,
+    /// 32-bit float atomics on storage buffers.
+    pub atomic_float32: bool,
+    /// 16-bit integer arithmetic.
+    pub int16: bool,
+    /// 64-bit integer arithmetic.
+    pub int64: bool,
+}
+
+impl ShaderFeatures {
+    /// Every feature present: a runtime whose code generator has no optional shader capability to enable.
+    pub const ALL: Self = Self {
+        float16: true,
+        float64: true,
+        atomic_float32: true,
+        int16: true,
+        int64: true,
+    };
+}
+
+/// The matrix kernels the code generator has for a device's matrix hardware: which operand dtype the planner
+/// may route to a tensor-core body. A lowering fact of the runtime's target, reported next to the hardware
+/// ([`DeviceCaps::tensor_core`]) because the same hardware family is driven by different kernels on HSA and on
+/// Vulkan. Build it with the constructor of the runtime's own target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MatrixLowering {
+    /// No matrix kernel for this device.
+    #[default]
+    None,
+    /// RDNA3 WMMA over bf16 operands, through the AMDGPU backend.
+    AmdWmmaBf16,
+    /// NVIDIA `wmma` over bf16 operands.
+    NvidiaWmmaBf16,
+    /// `VK_KHR_cooperative_matrix` over f16 operands with an f32 accumulator.
+    CooperativeMatrixF16,
+}
+
+impl MatrixLowering {
+    /// The lowering of an AMD device the ROCm runtime drives: WMMA on RDNA3.
+    pub fn amd(tensor_core: TensorCoreSupport) -> Self {
+        match tensor_core {
+            TensorCoreSupport::Wmma16x16x16Rdna3 => Self::AmdWmmaBf16,
+            _ => Self::None,
+        }
+    }
+
+    /// The lowering of an NVIDIA device the PTX runtime drives.
+    pub fn nvidia(tensor_core: TensorCoreSupport) -> Self {
+        match tensor_core {
+            TensorCoreSupport::NvidiaWmma16x16x16Sm80 => Self::NvidiaWmmaBf16,
+            _ => Self::None,
+        }
+    }
+
+    /// The lowering of a Vulkan device (wgpu or raw): the cooperative matrix, where the device reported the
+    /// 16x16x16 f16-in f32-out configuration the kernels are written for.
+    pub fn vulkan(tensor_core: TensorCoreSupport) -> Self {
+        match tensor_core {
+            TensorCoreSupport::Wmma16x16x16Rdna3 => Self::CooperativeMatrixF16,
+            _ => Self::None,
+        }
+    }
+}
+
+/// How a device holds an E4M3FN tensor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum E4m3Storage {
+    /// No E4M3FN storage: only the packed-lane row gather reads an E4M3FN table (as row-padded `u32` words,
+    /// like the BF16 one).
+    None,
+    /// A native one-byte element.
+    Native,
+    /// Four elements per `u32` word (SPIR-V has no byte lane).
+    PackedLanes,
 }
 
 /// A device-capability descriptor: measured once by the runtime, read by the planner and codegen for
@@ -395,6 +491,32 @@ pub struct DeviceCaps {
     /// `None` for a device with no channel data, which no layout rule treats as camping. The planner's stored
     /// KV extent reads it (POOT-1229).
     pub dram_channels: Option<dram_channels::DramChannels>,
+    /// The optional shader features the device was opened with.
+    pub shader_features: ShaderFeatures,
+    /// How the device holds E4M3FN tensors. Without storage only the packed-lane row gather reads an E4M3FN
+    /// table.
+    pub e4m3_storage: E4m3Storage,
+    /// The matrix kernels the code generator has for this device's matrix hardware.
+    pub matrix_lowering: MatrixLowering,
+    /// Whether the device holds F16 and BF16 values in native two-byte lanes. SPIR-V has none: its two-byte
+    /// floats live as packed `u32` words, so a BF16 const is always packed there and the two-byte elementwise
+    /// bodies do not exist.
+    pub native_two_byte_floats: bool,
+    /// Whether a BF16 `[K, N]` decode projection is widened to F32 before its GEMV (the device has native
+    /// two-byte storage and no packed reader for it) instead of being refused (the lane is packed and
+    /// a widening copy of the weight would double its bytes).
+    pub widens_bf16_decode_weight: bool,
+    /// Whether the Rust-compiled imported bodies that declare workgroup-local arrays compile for this device's
+    /// code generator (R468-015: the AMDGPU LLVM rejects their Rust-compiled `zeroinitializer` in addrspace 3). Without it the
+    /// generated tiled GEMM is the tiled path.
+    pub imported_lds_array_bodies: bool,
+    /// Whether the device's runtime has a peer-to-peer transport to another device of its kind (point-to-point
+    /// copies and the collectives built on them). Without it a stage cut between two such devices has nothing
+    /// to carry its boundary.
+    pub peer_transport: bool,
+    /// The output-column count above which a decode GEMV is measured slower than the batched matmul on this
+    /// device; `None` where nobody measured one (the GEMV is kept at any width).
+    pub decode_gemv_max_out_cols: Option<u32>,
 }
 
 /// Card 258: output-element count (one `gemv_lds` workgroup per element) above which a wgpu decode-GEMV
@@ -460,12 +582,13 @@ impl DeviceCaps {
     /// `DeviceCaps` is threaded through every entry point (Card 532), and as a synthetic fixture in
     /// tests and the plan-summary corpus (card 599).
     pub fn wgpu_rdna3_igpu() -> Self {
+        let calibration = calibration::Calibration::STRIX_HALO_RADV;
         DeviceCaps {
             max_buffer_bytes: AMD_RADV_SAFE_MAX_BUFFER_BYTES,
-            lds_bytes: 16_352, // wgpu downlevel_defaults() workgroup-storage limit
-            // The wgpu runtime raises x and the invocation count to the adapter maximum (RADV: 1024);
-            // y and z stay at `downlevel_defaults()`.
-            max_workgroup_size: [1024, 256, 64],
+            // Both Vulkan runtimes open the device with the adapter's own limits: RADV offers 64 KiB of
+            // workgroup memory and 1024 invocations per workgroup axis.
+            lds_bytes: 65_536,
+            max_workgroup_size: [1024, 1024, 1024],
             max_workgroup_invocations: 1024,
             // RDNA3 runs 32- or 64-lane waves; wgpu reports the adapter's range.
             subgroup: Queried::Known(SubgroupSupport::Present {
@@ -473,20 +596,20 @@ impl DeviceCaps {
                 max_size: 64,
             }),
             max_grid: [65_535, 65_535, 65_535],
-            watchdog_budget: Some(WatchdogBudget {
-                decode_gemv_out_elems: DECODE_GEMV_CHUNK_TRIGGER,
-                serial_dequant_work: 400_000_000,
-                scatter_update_work: 1_000_000,
-                indexed_dequant_work: 800_000_000,
-                packed_tiled_work: PACKED_TILED_CHUNK_WORK,
-            }),
+            watchdog_budget: calibration.watchdog_budget,
             tensor_core: TensorCoreSupport::Wmma16x16x16Rdna3,
-            known_miscompiles: KnownMiscompiles {
-                tiled_gemm_max_workgroups: Some(1 << 15),
-            },
+            known_miscompiles: calibration.known_miscompiles,
             compute_units: STRIX_HALO_COMPUTE_UNITS,
             memory_budget_bytes: None,
             dram_channels: Some(dram_channels::DramChannels::STRIX_HALO),
+            shader_features: ShaderFeatures::ALL,
+            e4m3_storage: E4m3Storage::PackedLanes,
+            matrix_lowering: MatrixLowering::CooperativeMatrixF16,
+            native_two_byte_floats: false,
+            widens_bf16_decode_weight: false,
+            imported_lds_array_bodies: true,
+            peer_transport: false,
+            decode_gemv_max_out_cols: None,
         }
     }
 
@@ -510,6 +633,16 @@ impl DeviceCaps {
             compute_units: STRIX_HALO_COMPUTE_UNITS,
             memory_budget_bytes: None,
             dram_channels: None,
+            shader_features: ShaderFeatures::ALL,
+            // HSA has no E4M3FN tensor storage: the packed-lane row gather is the only reader.
+            e4m3_storage: E4m3Storage::None,
+            // The fixture's tensor core is `None`, so no matrix kernel: a runtime builds it from its agent.
+            matrix_lowering: MatrixLowering::None,
+            native_two_byte_floats: true,
+            widens_bf16_decode_weight: false,
+            imported_lds_array_bodies: false,
+            peer_transport: false,
+            decode_gemv_max_out_cols: None,
         }
     }
 
@@ -532,6 +665,14 @@ impl DeviceCaps {
             compute_units: SM80_A100_COMPUTE_UNITS,
             memory_budget_bytes: None,
             dram_channels: None,
+            shader_features: ShaderFeatures::ALL,
+            e4m3_storage: E4m3Storage::Native,
+            matrix_lowering: MatrixLowering::NvidiaWmmaBf16,
+            native_two_byte_floats: true,
+            widens_bf16_decode_weight: true,
+            imported_lds_array_bodies: true,
+            peer_transport: true,
+            decode_gemv_max_out_cols: calibration::nvidia_decode_gemv_max_out_cols(8).known(),
         }
     }
 }

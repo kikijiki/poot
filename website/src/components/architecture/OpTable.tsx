@@ -17,7 +17,7 @@ const OPS: Op[] = [
     inputs: "x: [...]",
     outputShape: "[...] (same)",
     notes:
-      "Neg, Exp, Log, Sqrt, Recip, Round, Tanh, Erf; Not, Clz on I32",
+      "Neg, Exp, Log, Sqrt, Recip, Tanh, Erf; Not, Clz on I32",
   },
   {
     name: "Binary(op)",
@@ -85,13 +85,6 @@ const OPS: Op[] = [
     inputs: "src: [...], idx, axis",
     outputShape: "indexed [...]",
     notes: "Embedding lookup, RoPE table row, paged KV read",
-  },
-  {
-    name: "Scatter",
-    category: "data",
-    inputs: "src: [N, ...], idx: [N], axis=0",
-    outputShape: "same as src",
-    notes: "Inverse of an axis-0 Gather; idx is a permutation (MoE routing)",
   },
   {
     name: "ScatterUpdate",
@@ -167,14 +160,6 @@ const OPS: Op[] = [
     outputShape: "[G, M, N] f32",
     notes:
       "Compiler-only; contract a checkpoint [G*N, K] weight read as G blocks of N rows against a [G, M, K] activation, so a grouped projection keeps its bf16 weight resident with no transpose or widened copy",
-  },
-  {
-    name: "PackI8 / UnpackI8",
-    category: "compute",
-    inputs: "f32 codes or i32 carrier words",
-    outputShape: "pack: last axis ceil(L/4); unpack: L",
-    notes:
-      "Pack or unpack int8 codes, 4 per i32 word; scaling is a separate composition",
   },
   // Compiler-introduced
   {

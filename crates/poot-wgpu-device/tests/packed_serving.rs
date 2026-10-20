@@ -938,7 +938,7 @@ fn packed_embedding_row_gather_is_bit_exact() {
 #[test]
 fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
     use poot_graph_plan::{PackedConst, PackedLayout, WeightFormats, bind_packed_weights};
-    use poot_quant::weights::{ExpertProj, MoeRole, WeightId, WeightRole};
+    use poot_weights::{ExpertProj, MoeRole, WeightId, WeightRole};
 
     let Some(device) =
         poot_runtime_common::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())

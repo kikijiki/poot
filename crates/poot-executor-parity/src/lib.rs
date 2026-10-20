@@ -488,7 +488,7 @@ impl<'a> BoundStep<'a> {
 /// `fixture`'s graph with each const named by a weight id, and the map over `fixture.store` that
 /// binds those names (see [`poot_graph_ir::test_support::const_weights::ConstWeights`]). Deterministic: every
 /// call names the same consts the same way, so [`staged`] and [`fixture_weights`] agree.
-fn bound(fixture: &Fixture) -> (Graph, poot_quant::weights::WeightMap) {
+fn bound(fixture: &Fixture) -> (Graph, poot_weights::WeightMap) {
     let mut weights = ConstWeights::new(&fixture.store);
     let graph = weights.graph(&fixture.graph);
     (graph, weights.map())
@@ -496,7 +496,7 @@ fn bound(fixture: &Fixture) -> (Graph, poot_quant::weights::WeightMap) {
 
 /// How `fixture`'s executable binds its store: load `Arc::new(fixture.store.clone())` with this and
 /// add the entry [`staged`] compiles. The oracle keeps reading `fixture.graph` and `fixture.store`.
-pub fn fixture_weights(fixture: &Fixture) -> Arc<poot_quant::weights::WeightMap> {
+pub fn fixture_weights(fixture: &Fixture) -> Arc<poot_weights::WeightMap> {
     Arc::new(bound(fixture).1)
 }
 

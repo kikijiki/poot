@@ -14,12 +14,13 @@ use poot_graph_ir::{BinOp, Builder, Graph};
 use poot_quant::weights::DenseWeight;
 #[cfg(feature = "test-support")]
 use poot_quant::weights::WeightEntry;
-use poot_quant::weights::{
-    AttnRole, ExpertProj, FfnRole, MoeRole, NormRole, WeightId, WeightKey, WeightMap,
-    WeightMapError, WeightRole, WeightStore,
-};
+use poot_quant::weights::{WeightKey, WeightStore};
 #[cfg(feature = "test-support")]
 use poot_tensor::DType;
+use poot_weights::{
+    AttnRole, ExpertProj, FfnRole, MoeRole, NormRole, WeightId, WeightMap, WeightMapError,
+    WeightRole,
+};
 
 use crate::components::attention::{AttentionWeights, attention};
 use crate::components::ffn::{GatedFfnWeights, geglu_ffn};

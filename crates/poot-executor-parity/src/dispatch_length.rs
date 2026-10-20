@@ -155,7 +155,7 @@ impl<D: Device> Device for ShortActivations<D> {
 fn fixture() -> (
     poot_graph_ir::Graph,
     Arc<WeightStore>,
-    Arc<poot_quant::weights::WeightMap>,
+    Arc<poot_weights::WeightMap>,
 ) {
     let b = Builder::for_tests();
     let ta = b.constant("a", TensorType::f32(vec![K])).unwrap();

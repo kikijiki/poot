@@ -11,7 +11,7 @@ use crate::op::BinOp;
 use crate::packed_source::packed_source_constants;
 use crate::types::{DType, TensorType};
 use crate::weight_ref::WeightRef;
-use poot_quant::weights::WeightId;
+use poot_weights::WeightId;
 
 /// Shared rank-2 packed linear composition. Bias remains an ordinary Binary(Add) outside
 /// the packed-contraction candidate.
@@ -145,9 +145,7 @@ pub struct PackedExpertStack {
 /// particular id.
 pub const TEST_STACK: WeightId = WeightId::layer(
     0,
-    poot_quant::weights::WeightRole::Moe(poot_quant::weights::MoeRole::Stack(
-        poot_quant::weights::ExpertProj::Up,
-    )),
+    poot_weights::WeightRole::Moe(poot_weights::MoeRole::Stack(poot_weights::ExpertProj::Up)),
 );
 
 /// A routed packed projection: `x [M, K]` contracted per row against the expert `selector [M]` names in

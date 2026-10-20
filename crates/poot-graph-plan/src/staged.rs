@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 use poot_graph_ir::analysis::{NumericsProperty, Tier2Class};
 use poot_graph_ir::{BoundaryId, Graph, Slot, SlotKey, TensorType, ValueId};
-use poot_quant::weights::{WeightId, WeightMap};
 use poot_target::BufferStorage;
+use poot_weights::{WeightId, WeightMap};
 
 pub use crate::multi_device::DeviceId;
 use crate::multi_device::{

@@ -48,11 +48,12 @@ use poot_llm::driver::{
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::model::{KvLayout, Model, StepShape, StepSpec, TraceError};
 use poot_models::registry::{ConfigSource, Fixture, Registry, RegistryError};
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
 use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::{AmdArch, Backend, DeviceCaps};
 use poot_tensor::HostTensor;
 use poot_test_util::device_caps::default_caps_for;
+use poot_weights::WeightMap;
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;

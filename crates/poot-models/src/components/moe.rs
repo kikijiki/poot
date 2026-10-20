@@ -16,7 +16,7 @@
 //! blocks, so there is no packed arm here.
 
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, ops};
-use poot_quant::weights::{ExpertProj, MoeRole, WeightId, WeightMap, WeightRole};
+use poot_weights::{ExpertProj, MoeRole, WeightId, WeightMap, WeightRole};
 
 use super::ffn::{Glu, glu};
 use super::linear::{Weight, WeightError, linear};

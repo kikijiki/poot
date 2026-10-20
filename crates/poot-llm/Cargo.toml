@@ -37,6 +37,7 @@ tracing-subscriber = { workspace = true, optional = true }
 poot-graph-plan.workspace = true
 # The checkpoint's weights as stored (ADR-0103): a `poot_quant::weights::WeightStore`, never a widened f32 decode.
 poot-quant.workspace = true
+poot-weights.workspace = true
 # The backend-neutral executor contract the driver runs on.
 poot-executor.workspace = true
 # The planning device (`driver::capacity`) implements `Device` over the runtime memory counters.
@@ -58,6 +59,7 @@ poot-graph-plan = { workspace = true, features = ["test-support"] }
 poot-runtime-common = { workspace = true, features = ["test-support"] }
 poot-eval = { workspace = true, features = ["test-support"] }
 poot-quant = { workspace = true, features = ["test-support"] }
+poot-weights = { workspace = true, features = ["test-support"] }
 # The `cli` feature for this package's own tests: it builds the `poot` binary, which the
 # `tests/poot_generate_cli.rs` rows spawn (`CARGO_BIN_EXE_poot`), in every lane that builds the tests.
 poot-llm = { workspace = true, features = ["cli"] }

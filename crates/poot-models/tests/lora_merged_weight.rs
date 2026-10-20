@@ -11,10 +11,10 @@ use poot_graph_ir::{Graph, Slot, Storage, ValueId};
 use poot_graph_plan::{CompileLimits, CompileOptions, LoraPlan, Target, compile};
 use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
-use poot_quant::weights::{LoraRole, LoraTarget, WeightId, WeightRole};
 use poot_target::Backend;
 use poot_tensor::HostTensor;
 use poot_test_util::device_caps::default_caps_for;
+use poot_weights::{LoraRole, LoraTarget, WeightId, WeightRole};
 
 const ROWS: usize = 4;
 const RANK: usize = 2;
@@ -114,6 +114,7 @@ fn plan() -> LoraPlan {
         rows: NonZeroUsize::new(ROWS).unwrap(),
         adapters: NonZeroUsize::new(2).unwrap(),
         rank: NonZeroUsize::new(RANK).unwrap(),
+        factor_dtype: poot_tensor::DType::F32,
         projections: LoraTarget::ALL.to_vec(),
     }
 }

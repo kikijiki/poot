@@ -2,7 +2,8 @@
 
 use std::num::NonZeroU32;
 
-use crate::graph::{Slot, Storage, ValueId};
+use crate::graph::{LayerOrderError, Slot, SlotTypeError, Storage, ValueId};
+use crate::op::LocalId;
 use crate::types::{DType, TensorType};
 use poot_quant::SourceRole;
 
@@ -83,6 +84,9 @@ pub enum BuilderError {
         /// The repeated tag.
         tag: String,
     },
+    /// An input was declared at a type its slot role does not admit.
+    #[error(transparent)]
+    SlotType(#[from] SlotTypeError),
     /// A composition's own precondition on its operands or parameters does not hold.
     #[error("{operation}: {requirement}")]
     Requirement {
@@ -547,6 +551,27 @@ pub enum GraphValidationError {
         /// The value's storage.
         storage: Storage,
     },
+    /// A slot input's type is one its role does not admit.
+    #[error("slot input {value}: {source}")]
+    SlotType {
+        /// The slot input.
+        value: ValueId,
+        /// The role, the type it admits and the type declared.
+        source: SlotTypeError,
+    },
+    /// A computed constant's declared type is not the type of the tensor its payload materializes into.
+    #[error("computed constant {value} is declared {declared} but its payload is {computed}")]
+    ComputedTypeMismatch {
+        /// The constant.
+        value: ValueId,
+        /// The type the graph declares.
+        declared: TensorType,
+        /// The type the payload materializes into.
+        computed: TensorType,
+    },
+    /// The equations' layer tags run backwards.
+    #[error("layer tags: {0}")]
+    LayerOrder(#[from] LayerOrderError),
     /// A `Const` or `State` input binder is missing from the const table.
     #[error("input binder {value} with {storage:?} storage is missing from const table")]
     MissingConstBinding {
@@ -570,20 +595,6 @@ pub enum GraphValidationError {
         equation: usize,
         /// The operand used too early.
         value: ValueId,
-    },
-    /// A binary equation's two value operands have different dtypes.
-    #[error(
-        "eqn {equation} ({operation}): two value operands have different dtypes ({left} vs {right})"
-    )]
-    BinaryValueDtypeMismatch {
-        /// The index of the equation.
-        equation: usize,
-        /// The name of the equation's operation.
-        operation: String,
-        /// The first operand's dtype.
-        left: DType,
-        /// The second operand's dtype.
-        right: DType,
     },
     /// An equation's output id is past the value table.
     #[error("eqn {equation} ({operation}): output {value} out of range for {value_count} values")]
@@ -930,8 +941,8 @@ pub enum ShapeError {
     /// A fused region's `pack` list is not a set of unit-last-axis locals of one type.
     #[error("fused region pack member local {local} has type {actual}; expected {expected}")]
     FusedPack {
-        /// The pack member's local index.
-        local: usize,
+        /// The pack member's local.
+        local: LocalId,
         /// The type the pack requires at this member: the first member's shape with a unit last axis, or the first member's type.
         expected: Box<TensorType>,
         /// The member's type.
@@ -987,8 +998,8 @@ pub enum ShapeError {
         dtype: DType,
     },
 
-    /// `Cast` admits every other `(from, to)` pair; these nine have no evaluator definition (card 555): `BF16`/`F16` -> `I32`/`I8`, `I32`/`I8` -> `E4M3FN`, `E4M3FN` -> `I32`/`I8`, and
-    /// `F32` -> `I8`.
+    /// `Cast` admits only the pairs of its positive table: among the graph's own float, exact-integer and FP8
+    /// dtypes, and never a float to `I8`, an integer to FP8 or a half-width float or FP8 to an integer.
     #[error("cast {from} -> {to} is not admitted")]
     CastUnsupported {
         /// The source dtype.
@@ -1066,9 +1077,7 @@ pub enum ShapeError {
     },
 
     /// The dense weight dtype is not one the contraction admits.
-    #[error(
-        "dense contraction weight dtype {actual} is not admitted (see DENSE_CONTRACTION_WEIGHT_DTYPES)"
-    )]
+    #[error("dense contraction weight dtype {actual} is not an arithmetic float")]
     DenseContractionWeightDtype {
         /// The weight's dtype.
         actual: DType,
@@ -1119,7 +1128,7 @@ pub enum ShapeError {
 
     /// The gather table's dtype is not one the row gather admits.
     #[error(
-        "dense row gather source dtype {actual} is not admitted (see DENSE_ROW_GATHER_SOURCE_DTYPES)"
+        "dense row gather source dtype {actual} has no decode to F32 (an arithmetic float or e4m3fn)"
     )]
     DenseRowGatherSourceDtype {
         /// The table's dtype.
@@ -1266,24 +1275,24 @@ pub enum FusedOperandReason {
     /// A step reads a local that is not defined at that point.
     #[error("local {local} is not defined here (only locals 0..{defined} exist)")]
     LocalNotDefined {
-        /// The local index read.
-        local: usize,
+        /// The local read.
+        local: LocalId,
         /// How many locals exist there.
         defined: usize,
     },
     /// A pack lane names an external input past the region's inputs.
     #[error("pack lane reads external input {input} of a region with {inputs} inputs")]
     PackLaneInput {
-        /// The input index.
-        input: usize,
+        /// The input read.
+        input: LocalId,
         /// The region's input count.
         inputs: usize,
     },
     /// A pack lane indexes past the last axis of its external input.
     #[error("pack lane {lane} is outside the last axis (width {width}) of external input {input}")]
     PackLaneWidth {
-        /// The input index.
-        input: usize,
+        /// The input read.
+        input: LocalId,
         /// The lane index.
         lane: usize,
         /// The input's last-axis extent.

@@ -19,9 +19,17 @@ fn device_caps_is_plausible_on_the_real_device() {
     assert!(caps.max_buffer_bytes > 0);
     assert!(caps.lds_bytes > 0);
     assert!(caps.max_grid.iter().all(|&d| d > 0));
+    // The calibration is keyed by device identity: a RADV device the table does not name reports none.
+    let calibrated = poot_target::calibration::Calibration::of_vulkan_device(
+        poot_target::calibration::VENDOR_AMD,
+        &ctx.device_name(),
+    );
     if ctx.device_name().to_ascii_lowercase().contains("radv") {
-        assert!(caps.watchdog_budget.is_some());
-        assert!(caps.known_miscompiles.tiled_gemm_max_workgroups.is_some());
+        assert_eq!(caps.watchdog_budget.is_some(), calibrated.known().is_some());
+        assert_eq!(
+            caps.known_miscompiles.tiled_gemm_max_workgroups.is_some(),
+            calibrated.known().is_some()
+        );
     }
 }
 

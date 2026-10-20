@@ -15,9 +15,8 @@
 use std::collections::BTreeMap;
 
 use crate::{Graph, PackedSourceName, Storage, WeightRef};
-use poot_quant::weights::{
-    AttnRole, FfnRole, WeightId, WeightKey, WeightMap, WeightRole, WeightStore, WeightView,
-};
+use poot_quant::weights::{WeightKey, WeightStore};
+use poot_weights::{AttnRole, FfnRole, WeightId, WeightMap, WeightRole, WeightView};
 
 /// The ids handed to the consts of one or more graphs that share one executable and store.
 pub struct ConstWeights<'s> {

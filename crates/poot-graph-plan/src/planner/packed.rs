@@ -13,7 +13,7 @@ use crate::storage_analysis::dense_contraction_weight_storage;
 use crate::types::{StorageKind, ValueStorage};
 use poot_target::{Backend, DeviceCaps};
 
-/// Plan one packed-reader equation (DenseContraction/DenseRowGather/PackI8/UnpackI8).
+/// Plan one packed-reader equation (DenseContraction/DenseRowGather).
 #[expect(clippy::too_many_arguments)]
 pub(super) fn plan(
     g: GraphTables<'_>,
@@ -144,7 +144,7 @@ pub(super) fn plan(
                         a_shape: shape(ids[0]),
                         b_shape: vec![*groups, n, k],
                     },
-                    fold: elementwise_fold(g, backend, eqn, out_shape, out_numel, caps),
+                    fold: elementwise_fold(g, eqn, out_shape, out_numel, caps),
                 }),
                 backend,
                 caps,
@@ -203,34 +203,6 @@ pub(super) fn plan(
         // read the table at the wrong element width.
         OpKind::DenseRowGather { .. } => {
             return Err(site.refuse(Capability::DtypeLowering));
-        }
-        OpKind::PackI8 => {
-            // f32 codes [.., L] -> i32 words [.., ceil(L/4)] (spec 048). Fixed dtypes (input f32,
-            // output i32). card 044: the imported kernel runs on both backends; `L` is not recoverable
-            // from `W = ceil(L/4)`, so it rides in a `[L]` launch metadata buffer (`W` derived in-kernel).
-            let a = shape(ids[0]);
-            let Some(&l) = a.last() else {
-                return Err(PlanError::BadShape(
-                    "PackI8 input needs at least 1 dimension, got a 0-D shape".into(),
-                ));
-            };
-            Planned::imported(
-                ImportedKernel::PackI8,
-                backend,
-                Some(vec![l as u32]),
-                [out_numel as u32, 1, 1],
-            )?
-        }
-        OpKind::UnpackI8 { len } => {
-            // i32 words [.., ceil(len/4)] -> f32 codes [.., len] (spec 048), fixed dtypes. card 044:
-            // the imported inverse of pack_i8 on both backends; `len` rides in a `[len]` launch metadata
-            // buffer (`W = ceil(len/4)` derived in-kernel).
-            Planned::imported(
-                ImportedKernel::UnpackI8,
-                backend,
-                Some(vec![*len as u32]),
-                [out_numel as u32, 1, 1],
-            )?
         }
         OpKind::Iota { .. } => {
             unreachable!("plan_eqn refuses an unfolded Iota before dispatching to a family")

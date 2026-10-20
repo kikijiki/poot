@@ -24,7 +24,7 @@ use crate::graph::{
 };
 use crate::op::{OpKind, SampleRule};
 use crate::range::IndexRange;
-use crate::types::{DType, Scalar, TensorType};
+use crate::types::{DType, Operands, Scalar, TensorType};
 use crate::weight_ref::WeightRef;
 use poot_quant::PackedWeight;
 
@@ -289,8 +289,7 @@ fn clone_operand_types<'t>(
     Ok(types)
 }
 
-/// The output type of an equation over `in_types`, with the dtype rule two value operands of a binary
-/// operation obey.
+/// The output type of an equation over `in_types`, the types of `operands`.
 fn infer_equation(
     op: &OpKind,
     operands: &[Operand],
@@ -298,18 +297,8 @@ fn infer_equation(
     equation: usize,
 ) -> Result<TensorType, BuilderError> {
     checked_op_sizes(op, in_types)?;
-    if let [Operand::Value(_), Operand::Value(_)] = operands
-        && matches!(op, OpKind::Binary(_))
-    {
-        crate::op::check_binary_value_dtypes(&in_types[0], &in_types[1]).map_err(|source| {
-            BuilderError::Inference {
-                equation,
-                operation: op.name(),
-                source,
-            }
-        })?;
-    }
-    op.infer(in_types)
+    let is_literal = |index: usize| matches!(operands.get(index), Some(Operand::Lit(_)));
+    op.infer(Operands::new(in_types, &is_literal))
         .map_err(|source| BuilderError::Inference {
             equation,
             operation: op.name(),
@@ -1883,6 +1872,7 @@ impl Builder {
                 dtype: aval.dtype,
             });
         }
+        SlotKey::new(slot, tag).admits(&aval)?;
         let label = slot.key_label();
         if let Some(tag) = tag
             && self.g.borrow().values().iter().any(|v| {
@@ -2092,21 +2082,8 @@ impl Builder {
         // from `binary_scalar` (where a differing literal dtype is legitimate, baked as an immediate). Here both
         // operands are real buffers read by the planner's broadcast-value kernel at one element type (`fty(odt)`); a
         // dtype mismatch would reinterpret the other operand's bytes at the wrong width, so `emit` checks it for a
-        // binary equation of two values (R466-012, the one shared rule: `crate::op::check_binary_value_dtypes`).
+        // binary equation of two values (R466-012, the one rule: `OpKind::infer`'s `Binary` arm).
         self.emit(OpKind::Binary(op), vec![self.operand(a)?, self.operand(b)?])
-    }
-
-    /// Pack int8 codes into i32 words, 4 per word along the last axis (spec 048). Output is `I32` with last dim
-    /// `ceil(L/4)`.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn pack_i8(&self, x: Traced) -> Result<Traced, BuilderError> {
-        self.emit(OpKind::PackI8, vec![self.operand(x)?])
-    }
-
-    /// Unpack `len` int8 codes from i32 words (inverse of [`Builder::pack_i8`]). Output is `F32` with last dim `len`.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn unpack_i8(&self, codes: Traced, len: usize) -> Result<Traced, BuilderError> {
-        self.emit(OpKind::UnpackI8 { len }, vec![self.operand(codes)?])
     }
 
     /// Binary op with an inline scalar literal as the second operand (broadcasts as a 0-d value).
@@ -2314,15 +2291,6 @@ impl Builder {
             operands.push(self.operand(t)?);
         }
         self.emit(OpKind::SampleToken { rule }, operands)
-    }
-
-    /// Scatter rows of `src` along axis 0 by a `[N]` permutation `index` (inverse of axis-0 gather):
-    /// `out[index[j], ..] = src[j, ..]`, same shape as `src`. See [`OpKind::Scatter`].
-    pub fn scatter(&self, src: Traced, index: Traced) -> Result<Traced, BuilderError> {
-        self.emit(
-            OpKind::Scatter { axis: 0 },
-            vec![self.operand(src)?, self.operand(index)?],
-        )
     }
 
     /// Scatter-update: `out = base` with `src[t]` written at pool slot `slots[t]` (`-1`: row `t` writes

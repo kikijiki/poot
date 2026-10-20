@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use poot_graph_ir::UnOp;
-use poot_graph_ir::op::{FusedOp, FusedOperand, FusedRegion, FusedStep};
+use poot_graph_ir::op::{FusedOp, FusedOperand, FusedRegion, FusedStep, LocalId};
 use poot_graph_ir::test_support::composites;
 use poot_graph_ir::test_support::graph_fixtures::derive;
 use poot_graph_ir::{
@@ -239,16 +239,16 @@ fn a_binary_equation_with_three_operands_is_an_operand_count_refusal() {
     );
 }
 
-/// A float fused region holds the ops its kernel computes; `Round` is not one of them (the fusion pass
-/// never admits it, so no compile produces this region). A graph some other path built still meets a typed
+/// A float fused region holds the ops its kernel computes; a narrowing `Cast` is not one of them (the fusion
+/// pass never admits it, so no compile produces this region). A graph some other path built still meets a typed
 /// refusal naming the step's op, not a kernel that silently skips it. The graph is an add whose operation
 /// is replaced by a two-step region.
 ///
-/// Mutation: make the `FusedOp::Unary(_)` arm of `map_fused_op` return `kg::FusedScalarOp::Recip`; the
+/// Mutation: make the final `FusedOp::Cast { .. }` arm of `map_fused_op` return `kg::FusedScalarOp::Widen`; the
 /// region plans and this row goes red (`the equation must be refused`).
 #[test]
 fn a_float_region_step_the_kernel_cannot_compute_is_a_fused_step_refusal() {
-    let region = |first: UnOp| {
+    let region = |first: FusedOp| {
         let b = Builder::for_tests();
         let x = b.constant("x", TensorType::f32(vec![2, 8])).unwrap();
         let y = b.constant("y", TensorType::f32(vec![2, 8])).unwrap();
@@ -259,24 +259,32 @@ fn a_float_region_step_the_kernel_cannot_compute_is_a_fused_step_refusal() {
                 n_inputs: 2,
                 steps: vec![
                     FusedStep {
-                        op: FusedOp::Unary(first),
-                        inputs: vec![FusedOperand::Local(0)],
+                        op: first,
+                        inputs: vec![FusedOperand::Local(LocalId::new(0))],
                     },
                     FusedStep {
                         op: FusedOp::Binary(BinOp::Add),
-                        inputs: vec![FusedOperand::Local(2), FusedOperand::Local(1)],
+                        inputs: vec![
+                            FusedOperand::Local(LocalId::new(0)),
+                            FusedOperand::Local(LocalId::new(1)),
+                        ],
                     },
                 ],
-                output: 3,
+                output: LocalId::new(3),
                 pack: Vec::new(),
             });
         })
         .expect("a region of pointwise steps is a well-formed graph")
     };
-    assert_eq!(refusal_or_ok(&region(UnOp::Neg)), None, "a negation plans");
     assert_eq!(
-        refusal(&region(UnOp::Round)),
-        Capability::FusedStep(FusedStepGap::OpInFloatRegion(FusedOp::Unary(UnOp::Round)))
+        refusal_or_ok(&region(FusedOp::Unary(UnOp::Neg))),
+        None,
+        "a negation plans"
+    );
+    let narrowing = FusedOp::Cast { to: DType::F16 };
+    assert_eq!(
+        refusal(&region(narrowing)),
+        Capability::FusedStep(FusedStepGap::OpInFloatRegion(narrowing))
     );
 }
 

@@ -19,9 +19,10 @@ use poot_graph_plan::{
 };
 use poot_models::model::{StepShape, StepSpec};
 use poot_models::registry::{RawConfig, Registry};
-use poot_quant::weights::{WeightEntry, WeightMap, WeightStore};
+use poot_quant::weights::{WeightEntry, WeightStore};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostTensor};
+use poot_weights::WeightMap;
 
 const CAPACITY: usize = 8;
 const TOKEN: i32 = 11;

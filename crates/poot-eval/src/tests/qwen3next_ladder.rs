@@ -15,7 +15,7 @@ use std::collections::HashMap;
 /// permutation. When two experts share a rank r<k (256-expert router logits hit f32 ties), the sum added both
 /// ids, giving an id that can exceed E and index the expert weight buffer of the router's consumer (at the
 /// time, the now-deleted `indexed_matmul_dequant`) out of bounds (prefill device loss). Decode (`moe_sparse`)
-/// uses `Scatter` (`out[rank[i]]=i`, last-wins), always
+/// inverts the rank (`out[rank[i]]=i`, last-wins), always
 /// in range. `arg_top_k_dt` now uses the same last-wins select as the eval oracle `arg_top_k`. This test
 /// checks that the old sum goes OOB on ties and that the fixed select equals the eval oracle and stays in
 /// [0,E).

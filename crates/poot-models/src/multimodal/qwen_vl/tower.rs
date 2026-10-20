@@ -31,10 +31,9 @@ use poot_graph_ir::rope_table::{RopeFlavor, RopeSpec, RopeTable};
 use poot_graph_ir::{
     BinOp, Builder, ComputedConst, Graph, Scalar, Slot, SlotKey, TensorType, Traced, UnOp, ops,
 };
-use poot_quant::weights::{
-    AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole, WeightStore,
-};
+use poot_quant::weights::WeightStore;
 use poot_tensor::{DType, HostTensor};
+use poot_weights::{AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole};
 
 use crate::components::dims::{Field, Fields};
 use crate::components::linear::{Weight, WeightError, linear};

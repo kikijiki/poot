@@ -20,16 +20,17 @@ use poot_quant::weights::WeightStore;
 
 use crate::driver::error::{DriverError, LoadError, Unsupported};
 use crate::driver::gguf_vocab::gguf_vocab;
-use poot_text::{ChatTemplateOverride, CheckedChatTemplate, TextCodec};
+use poot_text::{ChatTemplateOverride, CheckedChatTemplate, HfTextFiles, TextCodec, TextError};
 
 /// How [`ModelHandle::load`] treats the checkpoint's files.
 #[derive(Clone, Debug, Default)]
 pub struct LoadOptions {
     /// A JSON manifest pinning checkpoint files by name:
     /// `{"files": {"model.safetensors": {"length": 123, "sha256": "<64 hex digits>"}}}`.
-    /// Every listed file is checked against its pin before any tensor is read, and every weight
-    /// file the load will parse (the GGUF itself, each `*.safetensors` shard of an HF directory)
-    /// must be listed: an unlisted one is refused. `None` checks nothing.
+    /// Every file the load reads must be listed and match its pin: the weight files (the GGUF
+    /// itself, each `*.safetensors` shard of an HF directory) before any tensor is read, and the
+    /// config, tokenizer and chat-template files as the exact bytes the load parses. An unlisted
+    /// one is refused. `None` checks nothing.
     pub integrity: Option<PathBuf>,
     /// A chat template to render with in place of the checkpoint's own (or in place of none, for a base
     /// model). `None` keeps the checkpoint's.
@@ -62,69 +63,113 @@ fn digest_from_hex<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 32], D
     Ok(out)
 }
 
-/// Check the checkpoint's files against `options.integrity`, each hashed once, before any tensor is
-/// read. The weight files the load will parse must all be pinned: a GGUF's own
-/// file name (`only`), or for an HF directory every `*.safetensors` shard in it. An unpinned weight
-/// file is [`LoadError::Unpinned`], never admitted unchecked. Files that are not tensors (config,
-/// tokenizer, the shard index) need no pin, but an HF manifest entry for one is still checked.
+/// The checkpoint's integrity manifest, parsed once ([`LoadOptions::integrity`]); no manifest pins nothing.
 ///
-/// `mapped` holds the weight files the load will read, already mapped: a pin on one of them is checked
-/// against that mapping, so the digest, the header and the tensors all come from one inode (ADR-0103
-/// amendment). Only a pinned file that is no weight file of the load (config, tokenizer, the shard index,
-/// a shard the index does not name) is streamed from its path.
-pub(super) fn check_integrity(
-    options: &LoadOptions,
-    dir: &Path,
-    only: Option<&str>,
-    mapped: &[(String, StoredBytes)],
-) -> Result<(), LoadError> {
-    let Some(manifest_path) = &options.integrity else {
-        return Ok(());
-    };
-    let text = std::fs::read(manifest_path).map_err(io_error(manifest_path))?;
-    let manifest: Manifest = serde_json::from_slice(&text).map_err(|source| LoadError::Json {
-        path: manifest_path.clone(),
-        source,
-    })?;
-    let mut required: Vec<String> = match only {
-        Some(name) => vec![name.to_string()],
-        None => std::fs::read_dir(dir)
-            .map_err(io_error(dir))?
-            .map(|entry| entry.map_err(io_error(dir)))
-            .filter_map(|entry| match entry {
-                Ok(entry) => {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    name.ends_with(".safetensors").then_some(Ok(name))
-                }
-                Err(e) => Some(Err(e)),
-            })
-            .collect::<Result<_, _>>()?,
-    };
-    required.sort();
-    if let Some(file) = required
-        .iter()
-        .find(|name| !manifest.files.contains_key(*name))
-    {
-        return Err(LoadError::Unpinned { file: file.clone() });
-    }
-    for (name, pin) in &manifest.files {
-        let pin = FilePin {
-            length: pin.length,
-            sha256: Sha256Digest::new(pin.sha256),
+/// Every file the load reads is pinned when a manifest is given: the weight files are checked over the
+/// mappings the store views ([`Self::check_weights`]), and every other file is read once into held bytes
+/// that are hashed and then parsed ([`Self::read`]), so the digest and the parse come from the same
+/// bytes. A file the manifest does not list is [`LoadError::Unpinned`], never admitted unchecked.
+pub(super) struct Pins {
+    files: Option<BTreeMap<String, FilePin>>,
+}
+
+impl Pins {
+    pub(super) fn load(options: &LoadOptions) -> Result<Self, LoadError> {
+        let Some(manifest_path) = &options.integrity else {
+            return Ok(Self { files: None });
         };
-        if only.is_some_and(|only| only != name) {
-            continue;
+        let text = std::fs::read(manifest_path).map_err(io_error(manifest_path))?;
+        let manifest: Manifest =
+            serde_json::from_slice(&text).map_err(|source| LoadError::Json {
+                path: manifest_path.clone(),
+                source,
+            })?;
+        let files = manifest
+            .files
+            .into_iter()
+            .map(|(name, pin)| {
+                let pin = FilePin {
+                    length: pin.length,
+                    sha256: Sha256Digest::new(pin.sha256),
+                };
+                (name, pin)
+            })
+            .collect();
+        Ok(Self { files: Some(files) })
+    }
+
+    /// The bytes of `dir/name`, read once and checked against the file's pin when there is a manifest.
+    pub(super) fn read(&self, dir: &Path, name: &str) -> Result<Vec<u8>, LoadError> {
+        let path = dir.join(name);
+        let bytes = std::fs::read(&path).map_err(io_error(&path))?;
+        if let Some(files) = &self.files {
+            let pin = files.get(name).ok_or_else(|| LoadError::Unpinned {
+                file: name.to_string(),
+            })?;
+            check_pin_reader(bytes.as_slice(), *pin, name)?;
         }
-        match mapped.iter().find(|(file, _)| file == name) {
-            Some((_, bytes)) => check_pin_reader(bytes.as_slice(), pin, name)?,
-            None => {
-                let path = dir.join(name);
-                let file = File::open(&path).map_err(io_error(&path))?;
-                check_pin_reader(file, pin, name)?;
+        Ok(bytes)
+    }
+
+    /// [`Self::read`] of a file the checkpoint may not ship: `None` when `dir/name` does not exist.
+    pub(super) fn read_optional(
+        &self,
+        dir: &Path,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, LoadError> {
+        dir.join(name)
+            .exists()
+            .then(|| self.read(dir, name))
+            .transpose()
+    }
+
+    /// Check the weight files of the load against the manifest, each hashed once, before any tensor is
+    /// read. The weight files the load will parse must all be pinned: a GGUF's own file name (`only`),
+    /// or for an HF directory every `*.safetensors` shard in it.
+    ///
+    /// `mapped` holds the weight files the load will read, already mapped: a pin on one of them is checked
+    /// against that mapping, so the digest, the header and the tensors all come from one inode (ADR-0103
+    /// amendment). A pinned shard that is not one of them (one the index does not name) is streamed from
+    /// its path.
+    pub(super) fn check_weights(
+        &self,
+        dir: &Path,
+        only: Option<&str>,
+        mapped: &[(String, StoredBytes)],
+    ) -> Result<(), LoadError> {
+        let Some(files) = &self.files else {
+            return Ok(());
+        };
+        let mut required: Vec<String> = match only {
+            Some(name) => vec![name.to_string()],
+            None => std::fs::read_dir(dir)
+                .map_err(io_error(dir))?
+                .map(|entry| entry.map_err(io_error(dir)))
+                .filter_map(|entry| match entry {
+                    Ok(entry) => {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        name.ends_with(".safetensors").then_some(Ok(name))
+                    }
+                    Err(e) => Some(Err(e)),
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        required.sort();
+        for name in &required {
+            let pin = *files
+                .get(name)
+                .ok_or_else(|| LoadError::Unpinned { file: name.clone() })?;
+            match mapped.iter().find(|(file, _)| file == name) {
+                Some((_, bytes)) => check_pin_reader(bytes.as_slice(), pin, name)?,
+                None => {
+                    let path = dir.join(name);
+                    let file = File::open(&path).map_err(io_error(&path))?;
+                    check_pin_reader(file, pin, name)?;
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// A model, its weights and its text services, and for a vision-language model its towers and the
@@ -152,14 +197,23 @@ fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> LoadError + '_ {
     }
 }
 
-fn read_json(path: &Path) -> Result<serde_json::Value, LoadError> {
-    let bytes = std::fs::read(path).map_err(io_error(path))?;
-    poot_load::packed_safetensors::parse_json_unique_keys(&bytes).map_err(|source| {
-        LoadError::Json {
-            path: path.to_path_buf(),
-            source,
-        }
+/// `bytes` of the file `path` as JSON with unique keys.
+fn parse_json(path: &Path, bytes: &[u8]) -> Result<serde_json::Value, LoadError> {
+    poot_load::packed_safetensors::parse_json_unique_keys(bytes).map_err(|source| LoadError::Json {
+        path: path.to_path_buf(),
+        source,
     })
+}
+
+/// The JSON file `dir/name`, read once through `pins`; `None` when the checkpoint does not ship it.
+fn read_optional_json(
+    pins: &Pins,
+    dir: &Path,
+    name: &str,
+) -> Result<Option<serde_json::Value>, LoadError> {
+    pins.read_optional(dir, name)?
+        .map(|bytes| parse_json(&dir.join(name), &bytes))
+        .transpose()
 }
 
 /// The registered family `raw` names, or [`Unsupported::Registry`].
@@ -202,25 +256,18 @@ impl ModelHandle {
         options: &LoadOptions,
         template: Option<CheckedChatTemplate>,
     ) -> Result<Self, DriverError> {
-        let config = read_json(&dir.join("config.json"))?;
-        let generation_path = dir.join("generation_config.json");
-        let generation = generation_path
-            .exists()
-            .then(|| read_json(&generation_path))
-            .transpose()?;
-        let preprocessor_path = dir.join("preprocessor_config.json");
-        let preprocessor = preprocessor_path
-            .exists()
-            .then(|| read_json(&preprocessor_path))
-            .transpose()?;
+        let pins = Pins::load(options)?;
+        let config = parse_json(&dir.join("config.json"), &pins.read(dir, "config.json")?)?;
+        let generation = read_optional_json(&pins, dir, "generation_config.json")?;
+        let preprocessor = read_optional_json(&pins, dir, "preprocessor_config.json")?;
         let raw = RawConfig::HfJson {
             config: &config,
             generation: generation.as_ref(),
             preprocessor: preprocessor.as_ref(),
         };
         let family = resolve(&raw, registry)?;
-        let files = poot_load::safetensors::map_weight_files(dir).map_err(LoadError::from)?;
-        check_integrity(options, dir, None, &files)?;
+        let files = poot_load::safetensors::map_weight_files(dir, |name| pins.read(dir, name))?;
+        pins.check_weights(dir, None, &files)?;
         // A GPTQ, AWQ or FP8 checkpoint's quantized linears are packed straight from their stored
         // bytes, never decoded: the family maps the packed entries like any other weight.
         let scheme = poot_load::config::quant_scheme(&config).map_err(LoadError::from)?;
@@ -231,11 +278,28 @@ impl ModelHandle {
                 .map_err(LoadError::from)?,
             None => store,
         };
+        let text_files = HfTextFiles {
+            tokenizer: pins.read(dir, "tokenizer.json")?,
+            tokenizer_config: pins.read_optional(dir, "tokenizer_config.json")?,
+            chat_template_jinja: pins
+                .read_optional(dir, "chat_template.jinja")?
+                .map(String::from_utf8)
+                .transpose()
+                .map_err(|e| {
+                    LoadError::Text(Box::new(TextError::Msg(format!(
+                        "chat_template.jinja: {e}"
+                    ))))
+                })?,
+        };
         Self::build(family, &raw, Arc::new(store), |config| {
-            let text =
-                TextCodec::from_hf_dir(dir, constraint_eos(config), config.prompt_bos, config.chat)
-                    .map_err(|e| LoadError::Text(Box::new(e)))?
-                    .with_tool_codec(config.tool_codec.clone());
+            let text = TextCodec::from_hf_files(
+                &text_files,
+                constraint_eos(config),
+                config.prompt_bos,
+                config.chat,
+            )
+            .map_err(|e| LoadError::Text(Box::new(e)))?
+            .with_tool_codec(config.tool_codec.clone());
             Ok(match template {
                 Some(template) => text.with_chat_template(template),
                 None => text,
@@ -251,6 +315,7 @@ impl ModelHandle {
     ) -> Result<Self, DriverError> {
         // Naming any shard of a split checkpoint names the set; each shard is mapped once and pinned
         // on its own.
+        let pins = Pins::load(options)?;
         let mut files = Vec::new();
         for shard in shard_paths(path) {
             let file = File::open(&shard).map_err(io_error(&shard))?;
@@ -258,8 +323,7 @@ impl ModelHandle {
                 .map_err(poot_load::LoadError::from)
                 .map_err(LoadError::from)?;
             if let Some(name) = shard.file_name().and_then(|n| n.to_str()) {
-                check_integrity(
-                    options,
+                pins.check_weights(
                     shard.parent().unwrap_or(Path::new("")),
                     Some(name),
                     &[(name.to_string(), file.clone())],

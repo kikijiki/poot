@@ -35,3 +35,10 @@ SeqCst
 MiniMax
 # A ggml tensor type poot deliberately has no format for; the pages name it as an example of a refused type.
 Q8_K
+# Theme CSS custom properties (--poot-*) and the monospace font name in website/src/css and the homepage CSS (upstream PR #1); not crates or code identifiers.
+poot-accent
+poot-coral
+poot-ink
+poot-line
+poot-surface
+JetBrains

@@ -918,7 +918,7 @@ fn a_finetune_like_config_loads_traces_and_matches_its_reference() {
 fn a_missing_tensor_is_named_before_any_trace() {
     use crate::model::ModelError;
     use crate::registry::LoadModelError;
-    use poot_quant::weights::WeightMapError;
+    use poot_weights::WeightMapError;
 
     let registry = Registry::builtin().unwrap();
     for (label, fixture) in [

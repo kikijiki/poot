@@ -10,7 +10,8 @@
 //! state, and `abort` only needs to drop the attempted recording's buffered metadata.
 
 use poot_executor::{
-    Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind, MeasuredDeviceTime,
+    Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, FlushPolicy, LaunchKind,
+    MeasuredDeviceTime,
 };
 use poot_graph_plan::Target;
 use poot_runtime_common::{BufferRole, CompiledKernel, DeviceIdentity};
@@ -25,21 +26,14 @@ pub struct WgpuKernel {
 }
 
 enum Recorded {
-    /// Each dispatch with its planner-owned watchdog work weight: `submit` splits a
-    /// long run into several `submit_cached` calls once either bound is hit, the same constants
-    /// the deleted `GpuExecutor::flush_bounds` used.
+    /// Each dispatch with its planner-owned watchdog work weight: on a device with a watchdog budget `submit`
+    /// splits a long run into several `submit_cached` calls once either of its [`FlushPolicy`] bounds is hit.
     Dispatches(Vec<(CachedDispatch, u64)>),
     Copy {
         src: DeviceBuffer,
         dst: DeviceBuffer,
     },
 }
-
-/// Card 546a (S46-11), moved from the pre-contract `GpuExecutor::flush_bounds`: the watchdog-safe
-/// bounds one `submit_cached` call may cover. A production default, not environment-tunable (ADR-0104
-/// decision 5's precedent).
-const FLUSH_EVERY: usize = 1024;
-const FLUSH_WORK: u64 = 4_000_000;
 
 /// A recorded step.
 pub struct WgpuRecording {
@@ -51,6 +45,9 @@ pub struct WgpuRecording {
 /// model.
 pub struct WgpuDevice {
     ctx: Context,
+    /// How a long run of dispatches is cut into submits; `None` on a device with no watchdog budget, whose
+    /// stage is one submit. Derived from the context's caps once, at open.
+    flush: Option<FlushPolicy>,
     /// The open step's recording so far; `Some` between `begin` and `finish`.
     open: Option<Vec<Recorded>>,
 }
@@ -64,10 +61,7 @@ impl WgpuDevice {
 
     /// [`Self::new`] with explicit runtime [`ContextOptions`]: the bound on every wait for the device.
     pub fn new_with_options(options: ContextOptions) -> Result<Self, RuntimeError> {
-        Ok(Self {
-            ctx: Context::new_with_options(options)?,
-            open: None,
-        })
+        Self::from_context(Context::new_with_options(options)?)
     }
 
     /// Like [`Self::new`], but every replay requests per-dispatch timestamps (Card 552), so
@@ -76,8 +70,16 @@ impl WgpuDevice {
     pub fn new_with_device_timing(
         max_in_flight_queries: NonZeroUsize,
     ) -> Result<Self, RuntimeError> {
+        Self::from_context(Context::new_with_device_timing(
+            max_in_flight_queries.get(),
+        )?)
+    }
+
+    fn from_context(ctx: Context) -> Result<Self, RuntimeError> {
+        let flush = FlushPolicy::of(&ctx.device_caps());
         Ok(Self {
-            ctx: Context::new_with_device_timing(max_in_flight_queries.get())?,
+            ctx,
+            flush,
             open: None,
         })
     }
@@ -87,6 +89,15 @@ impl WgpuDevice {
     #[cfg(any(test, feature = "test-support"))]
     pub fn has_device_timestamps(&self) -> bool {
         self.ctx.timestamps_available()
+    }
+
+    /// Re-derive the flush policy as if the device reported `caps`: the production derivation
+    /// ([`FlushPolicy::of`]) over a descriptor the test chooses, so a device without a watchdog budget can be
+    /// driven on hardware that has one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_flush_caps(mut self, caps: &poot_target::DeviceCaps) -> Self {
+        self.flush = FlushPolicy::of(caps);
+        self
     }
 
     /// Diagnostic counters of the underlying context (bind groups, pipelines, submits).
@@ -101,10 +112,10 @@ impl WgpuDevice {
         }
     }
 
-    /// Split `dispatches` into runs of at most `FLUSH_EVERY` dispatches and `FLUSH_WORK` summed work
-    /// units, one `submit_cached` per run, polling between runs so in-flight work stays bounded
-    /// (SC-008). A long prefill's one recorded run still issues as several real
-    /// submits, never one past-watchdog submission.
+    /// Submit `dispatches`: one `submit_cached` for the whole run on a device with no watchdog budget; on a
+    /// device with one, split into runs bounded by the [`FlushPolicy`], one `submit_cached` per run, polling
+    /// between runs so in-flight work stays bounded (SC-008). A long prefill's one recorded run still issues
+    /// as several real submits there, never one past-watchdog submission.
     ///
     /// Card 552: always the one `submit_cached` method - whether it requests per-dispatch
     /// timestamps is `Context::device_timing`'s own decision, and the dispatch-index each chunk's
@@ -112,14 +123,15 @@ impl WgpuDevice {
     /// `Context::discard_device_timing`, called from `Self::begin_step` below), not a parameter this
     /// loop threads through.
     fn submit_chunked(&self, dispatches: &[(CachedDispatch, u64)]) -> Result<(), RuntimeError> {
+        let Some(policy) = self.flush else {
+            let refs: Vec<&CachedDispatch> = dispatches.iter().map(|(d, _)| d).collect();
+            return self.ctx.submit_cached(&refs);
+        };
         let mut start = 0;
         while start < dispatches.len() {
             let mut end = start;
             let mut work = 0u64;
-            while end < dispatches.len()
-                && end - start < FLUSH_EVERY
-                && (end == start || work + dispatches[end].1 <= FLUSH_WORK)
-            {
+            while end < dispatches.len() && !policy.must_cut(end - start, work, dispatches[end].1) {
                 work += dispatches[end].1;
                 end += 1;
             }

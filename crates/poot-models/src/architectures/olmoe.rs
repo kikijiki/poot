@@ -4,8 +4,9 @@
 //! divided by their sum only when `norm_topk_prob` is set (HF's default is not; a GGUF has no key for
 //! it and llama.cpp never renormalizes OLMoE).
 
-use poot_quant::weights::ExpertProj;
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::ExpertProj;
+use poot_weights::WeightMap;
 
 use crate::components::attention::QkNorm;
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
@@ -217,7 +218,8 @@ pub(crate) mod moe_support {
     use poot_graph_ir::OpKind;
     use poot_graph_plan::{WeightFormats, bind_packed_weights};
     use poot_load::gguf::{GgufIndex, GgufValue};
-    use poot_quant::weights::{HandleFormat, WeightEntry, WeightStore};
+    use poot_quant::weights::{WeightEntry, WeightStore};
+    use poot_weights::HandleFormat;
 
     use crate::components::standard::oracle::run_step;
     use crate::components::testing::{
@@ -364,8 +366,8 @@ mod family_tests {
     use poot_graph_ir::OpKind;
     use poot_graph_plan::{CompileLimits, CompileOptions, Plan, Target, compile};
     use poot_load::gguf::GgufValue;
-    use poot_quant::weights::{MoeRole, WeightRole};
     use poot_target::{AmdArch, Backend, DeviceCaps};
+    use poot_weights::{MoeRole, WeightRole};
     use serde_json::json;
 
     use super::moe_support::{
@@ -636,7 +638,7 @@ mod family_tests {
                 .iter()
                 .filter(|(id, _, handle)| {
                     matches!(id.role, WeightRole::Moe(MoeRole::Stack(..)))
-                        && matches!(handle.format, poot_quant::weights::HandleFormat::Packed(_))
+                        && matches!(handle.format, poot_weights::HandleFormat::Packed(_))
                 })
                 .collect();
             assert_eq!(stacks.is_empty(), !q8, "q8={q8}: packed expert stacks");
@@ -672,7 +674,7 @@ mod family_tests {
             .map(|_| ())
             .unwrap_err();
         let crate::registry::LoadModelError::Model(ModelError::Weight {
-            source: poot_quant::weights::WeightMapError::Missing { key, .. },
+            source: poot_weights::WeightMapError::Missing { key, .. },
             ..
         }) = &err
         else {

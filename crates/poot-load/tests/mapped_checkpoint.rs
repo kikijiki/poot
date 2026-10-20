@@ -387,7 +387,10 @@ fn mb5_a_truncated_safetensors_shard_is_refused_at_the_end_of_load() {
     std::fs::create_dir_all(&*dir).unwrap();
     let shard = dir.join("model.safetensors");
     poot_quant::test_support::safetensors::write(&shard, &fixture.build());
-    let files = poot_load::safetensors::map_weight_files(&*dir).unwrap();
+    let files = poot_load::safetensors::map_weight_files(&*dir, |name| {
+        std::fs::read(dir.join(name)).map_err(poot_load::LoadError::from)
+    })
+    .unwrap();
     assert!(files[0].1.len() < 4096);
 
     File::options()

@@ -57,10 +57,6 @@ pub fn movement_body(
             data_shapes.push(src_shape.clone());
             reads_index = true;
         }
-        MovementOp::PermuteRows { src_shape } => {
-            data_shapes.push(src_shape.clone());
-            reads_index = true;
-        }
     }
     let mut inputs = Vec::new();
     for shape in data_shapes {
@@ -85,21 +81,6 @@ pub fn movement_body(
     let mut cfg = Cfg::new(params);
     let thread = cfg.thread_index(x_groups);
     match &spec.op {
-        MovementOp::PermuteRows { src_shape, .. } => {
-            let numel: usize = src_shape.iter().product();
-            let in_bounds = cfg.bin(Ty::Bool, BinOp::Lt, copy(thread), cu(numel));
-            let index = index.expect("PermuteRows reads an index buffer");
-            cfg.if_then(in_bounds, |cfg| {
-                let rest: usize = src_shape[1..].iter().product();
-                let row = cfg.bin(Ty::Usize, BinOp::Div, copy(thread), cu(rest));
-                let column = cfg.bin(Ty::Usize, BinOp::Rem, copy(thread), cu(rest));
-                let destination_row = read_index(cfg, index, row);
-                let base = cfg.bin(Ty::Usize, BinOp::Mul, copy(destination_row), cu(rest));
-                let destination = cfg.bin(Ty::Usize, BinOp::Add, copy(base), copy(column));
-                let value = read_lane(cfg, storage, &inputs[0], thread);
-                cfg.assign(elem(out.param, destination), Rvalue::Use(copy(value)));
-            });
-        }
         MovementOp::ScatterRows { src_shape, window } => {
             // One thread owns one source unit (an element, or a packed `u32` word): it copies the unit to
             // the same offset of the pool slot its source row names, or nothing for a padding row. A unit
@@ -350,9 +331,6 @@ impl Source<'_> {
             }
             MovementOp::ScatterRows { .. } => {
                 unreachable!("a row scatter writes by source unit, not by output lane")
-            }
-            MovementOp::PermuteRows { .. } => {
-                unreachable!("a permuted-row scatter writes by source element, not by output lane")
             }
         }
     }

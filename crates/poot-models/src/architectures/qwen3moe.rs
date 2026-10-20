@@ -7,7 +7,8 @@
 //! (`decoder_sparse_step`, `mlp_only_layers`); a GGUF has no key for it, so a layer routes there
 //! exactly when it holds a router tensor.
 
-use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::{ExpertProj, WeightMap};
 
 use crate::components::attention::QkNorm;
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
@@ -307,7 +308,7 @@ fn sparse_flags(config: &serde_json::Value) -> Vec<bool> {
 mod tests {
     use poot_graph_ir::OpKind;
     use poot_load::gguf::{GgufIndex, GgufValue};
-    use poot_quant::weights::{MoeRole, WeightId, WeightMapError, WeightRole};
+    use poot_weights::{MoeRole, WeightId, WeightMapError, WeightRole};
     use serde_json::json;
 
     use super::*;
@@ -371,7 +372,7 @@ mod tests {
         };
         let router = WeightRole::Moe(MoeRole::Router);
         let gate_stack = WeightRole::Moe(MoeRole::Stack(ExpertProj::Gate));
-        let dense_gate = WeightRole::Ffn(poot_quant::weights::FfnRole::Gate);
+        let dense_gate = WeightRole::Ffn(poot_weights::FfnRole::Gate);
         assert!(!has(0, router) && !has(0, gate_stack) && has(0, dense_gate));
         assert!(has(1, router) && has(1, gate_stack) && !has(1, dense_gate));
         // Per-expert HF tensors stack along a new leading expert axis.
@@ -698,7 +699,7 @@ mod tests {
         let handle = model.model.weights().handle(experts).unwrap();
         assert!(matches!(
             handle.format,
-            poot_quant::weights::HandleFormat::Packed(_)
+            poot_weights::HandleFormat::Packed(_)
         ));
         assert_eq!(
             handle.shape.len(),

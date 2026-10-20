@@ -101,8 +101,8 @@ See [serving your first model](https://kikijiki.github.io/poot/docs/serve/servin
 
 ## Repository layout
 
-- `crates/` - the workspace, one crate per stage above, plus `poot-load` and `poot-quant` (checkpoint
-  loading and quantized formats) and `poot-wgpu-runtime*` (device runtimes).
+- `crates/` - the workspace, one crate per stage above, plus `poot-load`, `poot-quant` and `poot-weights` (checkpoint
+  loading, quantized formats, and the weight roles and map) and `poot-wgpu-runtime*` (device runtimes).
 - `benchmarks/` - the cross-framework benchmark suite and its recorded results.
 - `crates/poot-orchestrator` - runs the benchmark sweeps on rented RunPod GPUs.
 - `website/` - the documentation site (Docusaurus).

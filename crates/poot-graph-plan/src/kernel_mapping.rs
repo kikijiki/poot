@@ -27,6 +27,7 @@ use poot_graph_ir::Scalar;
 use poot_graph_ir::op::BinOp as GBinOp;
 use poot_graph_ir::op::FusedOp;
 use poot_graph_ir::op::FusedOperand;
+use poot_graph_ir::op::LocalId;
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::op::UnOp as GUnOp;
 use poot_graph_ir::{Eqn, Graph, ValueId};
@@ -39,7 +40,8 @@ use poot_kernelgen::UnaryOp;
 use poot_tensor::DType;
 
 /// A region-local id -> a fused-kernel operand: `< n_inputs` is a leaf, otherwise a prior step.
-pub(crate) fn map_fused_local(id: usize, n_inputs: usize) -> kg::FusedInput {
+pub(crate) fn map_fused_local(id: LocalId, n_inputs: usize) -> kg::FusedInput {
+    let id = id.index();
     if id < n_inputs {
         kg::FusedInput::Leaf(id)
     } else {
@@ -74,7 +76,7 @@ pub(crate) fn map_fused_input_i32(
             Err(site.refuse(Capability::FusedStep(FusedStepGap::F32LiteralInExactRegion)))
         }
         FusedOperand::PackLane { input, lane } => Ok(kg::FusedInput::LeafLane {
-            leaf: *input,
+            leaf: input.index(),
             lane: *lane,
         }),
     }
@@ -123,7 +125,7 @@ pub(crate) fn map_pointwise_step(
     op: FusedOp,
     inputs: &[FusedOperand],
     exact_i32: bool,
-    local_dtype: impl Fn(usize) -> DType,
+    local_dtype: impl Fn(LocalId) -> DType,
 ) -> Result<kg::FusedScalarOp, PlanError> {
     match (op, inputs) {
         (FusedOp::Cast { to: DType::F32 }, [FusedOperand::Local(id)])
@@ -164,7 +166,7 @@ pub(crate) fn check_widening_step(
     site: Site<'_>,
     op: FusedOp,
     inputs: &[FusedOperand],
-    is_input: impl Fn(usize) -> bool,
+    is_input: impl Fn(LocalId) -> bool,
 ) -> Result<(), PlanError> {
     match (op, inputs) {
         (FusedOp::Cast { .. }, [FusedOperand::Local(id)]) if is_input(*id) => Ok(()),
@@ -216,7 +218,6 @@ pub(crate) fn map_unary(site: Site<'_>, op: GUnOp) -> Result<UnaryOp, PlanError>
         GUnOp::Neg => UnaryOp::Basic(UnOp::Neg),
         GUnOp::Recip => UnaryOp::Recip,
         GUnOp::Sqrt => UnaryOp::Math(MathOp::Sqrt),
-        GUnOp::Round => UnaryOp::Math(MathOp::Round),
         GUnOp::Exp => UnaryOp::Math(MathOp::Exp),
         GUnOp::Log => UnaryOp::Math(MathOp::Log),
         GUnOp::Tanh => UnaryOp::Tanh,
@@ -777,11 +778,11 @@ fn shape_launch(
             // corrupt that reduction by redispatching at workgroup_size[0] = 256.
             | OpKind::SampleToken { .. }
         )
-        || is_decode_gemv_in(g, backend, eqn, out_shape, out_numel, caps)
-        || is_tiled_gemm_in(g, backend, eqn, out_shape, out_numel)
-        || is_batched_tiled_gemm_in(g, backend, eqn, out_shape, out_numel, caps)
-        || is_elementwise_2d_in(g, backend, eqn, out_shape, out_numel, caps);
-    if !contraction && is_elementwise_2d_in(g, backend, eqn, out_shape, out_numel, caps) {
+        || is_decode_gemv_in(g, eqn, out_shape, out_numel, caps)
+        || is_tiled_gemm_in(g, eqn, out_shape, out_numel, caps)
+        || is_batched_tiled_gemm_in(g, eqn, out_shape, out_numel, caps)
+        || is_elementwise_2d_in(g, eqn, out_shape, out_numel, caps);
+    if !contraction && is_elementwise_2d_in(g, eqn, out_shape, out_numel, caps) {
         // card 159 Inc 3: the imported scatter_update/dyn_update_slice kernels bake their own
         // `x_groups` from `out.len()` assuming a fixed `WORKGROUP_SIZE = 256` (see
         // `is_elementwise_2d`), so the dispatch wg must always be 256, unconditionally (not the
@@ -810,7 +811,7 @@ fn shape_launch(
     // the dense elementwise kernels, they have no 2-D folded form for dispatches beyond the target's x-grid
     // (`caps.max_grid[0]`). Reject such a launch while planning, before compilation or buffer allocation. Use
     // the exact packed output word count for E4M3FN writers; decode owns one thread per logical f32 output.
-    if backend == Backend::SpirvVulkan
+    if caps.e4m3_storage == poot_target::E4m3Storage::PackedLanes
         && (odt == DType::E4M3FN || has_e4m3fn_input)
         && let Some(dispatch) = plan.single()
         && dispatch.launch().meta.is_empty()
@@ -1212,13 +1213,6 @@ mod tests {
             }) => (request, reason),
             other => panic!("expected a generator refusal, got {other:?}"),
         };
-        let round = graph_of(|b| {
-            let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
-            b.unary(poot_graph_ir::UnOp::Round, x).unwrap()
-        });
-        let (request, reason) = kernel_gen(aie_refusal(&round));
-        assert_eq!(request, "serialized_schedule");
-        assert!(reason.contains("no proved lowering"), "{reason}");
         let broadcast = add_graph(vec![2, 3], vec![1, 3], DType::F32);
         assert!(kernel_gen(aie_refusal(&broadcast)).1.contains("broadcast"));
         let ints = add_graph(vec![2, 3], vec![2, 3], DType::I32);

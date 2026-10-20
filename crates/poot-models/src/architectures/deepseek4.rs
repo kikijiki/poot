@@ -27,9 +27,10 @@ use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::DenseWeight;
 #[cfg(feature = "test-support")]
 use poot_quant::weights::WeightEntry;
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
 #[cfg(feature = "test-support")]
 use poot_tensor::DType;
+use poot_weights::WeightMap;
 use std::sync::Arc;
 
 use crate::components::standard::{Step, decoder_program};

@@ -4,7 +4,7 @@
 //! `NormPlacement::Post`: the layer's two norm weights are the post-attention and post-feed-forward
 //! norms.
 
-use poot_quant::weights::{NormRole, WeightRole};
+use poot_weights::{NormRole, WeightRole};
 
 use crate::components::dims::{DenseSpec, dense_keys};
 use crate::components::standard::NormPlacement;

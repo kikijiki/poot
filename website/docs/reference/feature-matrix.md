@@ -6,7 +6,7 @@ sidebar_position: 1
 
 # Feature matrix
 
-The `poot-llm` library selects a GPU runtime with `--backend`. **Three production backends** run the
+The `poot` binary and `poot-serve` select a GPU runtime with `--backend`. **Three production backends** run the
 same graph IR today: **wgpu** (Vulkan/SPIR-V, default), **rocm** (AMD raw HSA), and **ptx** (NVIDIA).
 They are not at parity. A fourth backend, raw Vulkan, lowers to the same SPIR-V as wgpu but runs on its own
 runtime and plans against the limits its own device reports, so it is a column in the tables below and has its own
@@ -193,7 +193,6 @@ The AMD XDNA2 NPU is not a column above because no model compiles for it. This t
 | `sqrt` | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `tanh` | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `erf` | <span class="matrix-status matrix-status--yes">Plans</span> |
-| `round` | <span class="matrix-status matrix-status--no">Refused</span> one F32 equation: `round` `kernel generator: serialized_schedule: unsupported on this target: the AIE core has no proved lowering and numerical contract for this op` |
 <!-- generated:feature-matrix:end -->
 
 ## Reading the matrix

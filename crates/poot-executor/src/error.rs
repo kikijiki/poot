@@ -331,7 +331,7 @@ pub enum LoadError {
     /// The executable's weight map does not stand against its store, or a rank's share of a weight could
     /// not be cut from it.
     #[error("weight map: {0}")]
-    WeightMap(#[from] poot_quant::weights::WeightMapError),
+    WeightMap(#[from] poot_weights::WeightMapError),
     /// A kernel could not be compiled for the target.
     #[error("kernel {key}: {source}")]
     Codegen {

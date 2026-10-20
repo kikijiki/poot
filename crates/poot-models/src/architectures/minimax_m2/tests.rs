@@ -591,8 +591,8 @@ fn a_packed_store_maps_every_expert_as_its_own_weight() {
         .filter(|(id, _, handle)| {
             matches!(
                 id.role,
-                poot_quant::weights::WeightRole::Moe(poot_quant::weights::MoeRole::Stack(..))
-            ) && matches!(handle.format, poot_quant::weights::HandleFormat::Packed(_))
+                poot_weights::WeightRole::Moe(poot_weights::MoeRole::Stack(..))
+            ) && matches!(handle.format, poot_weights::HandleFormat::Packed(_))
                 && handle.shape[0] == 8
         })
         .count();

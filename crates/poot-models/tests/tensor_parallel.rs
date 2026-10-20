@@ -26,15 +26,15 @@ use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step, step};
 use poot_models::test_support::weight_map::MappedModel;
 use poot_quant::format::WeightFormat;
-use poot_quant::weights::{
-    AttnRole, DenseWeight, FfnRole, LoraRole, LoraTarget, MlaRole, WeightEntry, WeightId,
-    WeightMap, WeightRole, WeightStore, WeightView,
-};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_quant::{PackedPayload, PackedWeight, SourceRole};
 use poot_target::{Backend, TargetId};
 use poot_tensor::{DType, HostTensor};
 use poot_test_util::assert_close_scaled;
 use poot_test_util::device_caps::default_caps_for;
+use poot_weights::{
+    AttnRole, FfnRole, LoraRole, LoraTarget, MlaRole, WeightId, WeightMap, WeightRole, WeightView,
+};
 
 const WORLD: u32 = 2;
 
@@ -836,6 +836,7 @@ fn a_sharded_adapted_qwen2_with_alternating_rows_equals_the_full_adapted_graph()
         rows: NonZeroUsize::new(rows).unwrap(),
         adapters: NonZeroUsize::new(2).unwrap(),
         rank: NonZeroUsize::new(2).unwrap(),
+        factor_dtype: poot_tensor::DType::F32,
         projections: LoraTarget::ALL.to_vec(),
     };
     let with_lora = options().with_lora(lora);

@@ -6,8 +6,9 @@
 //! size and type the header gives that attribute.
 
 use crate::bindings::{
-    HSA_AGENT_INFO_DEVICE, HSA_AGENT_INFO_ISA, HSA_AGENT_INFO_NAME, HSA_AGENT_INFO_VENDOR_NAME,
-    HSA_AGENT_INFO_WAVEFRONT_SIZE, HSA_AMD_AGENT_INFO_MEMORY_AVAIL,
+    HSA_AGENT_INFO_DEVICE, HSA_AGENT_INFO_GRID_MAX_DIM, HSA_AGENT_INFO_ISA, HSA_AGENT_INFO_NAME,
+    HSA_AGENT_INFO_VENDOR_NAME, HSA_AGENT_INFO_WAVEFRONT_SIZE, HSA_AGENT_INFO_WORKGROUP_MAX_DIM,
+    HSA_AGENT_INFO_WORKGROUP_MAX_SIZE, HSA_AMD_AGENT_INFO_MEMORY_AVAIL,
     HSA_AMD_AGENT_INFO_MEMORY_PROPERTIES, HSA_AMD_AGENT_INFO_PRODUCT_NAME,
     HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO, HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS,
     HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED,
@@ -17,8 +18,9 @@ use crate::bindings::{
     HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED, HSA_AMD_MEMORY_POOL_INFO_SEGMENT,
     HSA_AMD_MEMORY_POOL_INFO_SIZE, HSA_AMD_MEMORY_POOL_LOCATION_GPU,
     HSA_AMD_MEMORY_PROPERTY_AGENT_IS_APU, HSA_AMD_SEGMENT_GLOBAL, HSA_DEVICE_TYPE_CPU,
-    HSA_DEVICE_TYPE_GPU, HSA_ISA_INFO_NAME, HSA_ISA_INFO_NAME_LENGTH, hsa_agent_t,
-    hsa_amd_memory_pool_link_info_t, hsa_amd_memory_pool_t, hsa_isa_t, hsa_queue_t, hsa_status_t,
+    HSA_DEVICE_TYPE_GPU, HSA_ISA_INFO_NAME, HSA_ISA_INFO_NAME_LENGTH, HSA_REGION_INFO_SEGMENT,
+    HSA_REGION_INFO_SIZE, HSA_REGION_SEGMENT_GROUP, hsa_agent_t, hsa_amd_memory_pool_link_info_t,
+    hsa_amd_memory_pool_t, hsa_isa_t, hsa_queue_t, hsa_region_t, hsa_status_t,
 };
 use crate::context::DeviceTiming;
 use crate::error::check;
@@ -268,6 +270,109 @@ pub(crate) unsafe fn amd_agent_u32_info(
             Err(_) => None,
         }
     }
+}
+
+/// The launch limits an HSA agent reports: what a kernel may ask of one dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AgentLimits {
+    /// `HSA_AGENT_INFO_WORKGROUP_MAX_DIM`: the largest workgroup extent per dimension.
+    pub(crate) workgroup_max_dim: [u32; 3],
+    /// `HSA_AGENT_INFO_WORKGROUP_MAX_SIZE`: the largest workgroup, in work-items.
+    pub(crate) workgroup_max_size: u32,
+    /// `HSA_AGENT_INFO_GRID_MAX_DIM`: the largest grid extent per dimension, in work-items.
+    pub(crate) grid_max_dim: [u32; 3],
+    /// The size of the agent's group-segment region: the workgroup-local (LDS) memory one workgroup may use.
+    pub(crate) group_segment_bytes: u32,
+}
+
+/// Read the launch limits of `agent`. Every attribute is mandatory in the HSA core API, so a failed query is
+/// an error, never a default.
+///
+/// # Safety
+///
+/// The module contract.
+pub(crate) unsafe fn agent_limits(
+    funcs: &Funcs,
+    agent: hsa_agent_t,
+) -> Result<AgentLimits, RocmError> {
+    let (mut dims, mut size, mut grid) = ([0u16; 3], 0u32, [0u32; 3]);
+    // SAFETY: WORKGROUP_MAX_DIM writes a `uint16_t[3]`, WORKGROUP_MAX_SIZE a `uint32_t` and GRID_MAX_DIM an
+    // `hsa_dim3_t` (three `uint32_t`) into the locals.
+    unsafe {
+        check((funcs.hsa_agent_get_info)(
+            agent,
+            HSA_AGENT_INFO_WORKGROUP_MAX_DIM,
+            dims.as_mut_ptr().cast::<c_void>(),
+        ))?;
+        check((funcs.hsa_agent_get_info)(
+            agent,
+            HSA_AGENT_INFO_WORKGROUP_MAX_SIZE,
+            (&raw mut size).cast::<c_void>(),
+        ))?;
+        check((funcs.hsa_agent_get_info)(
+            agent,
+            HSA_AGENT_INFO_GRID_MAX_DIM,
+            grid.as_mut_ptr().cast::<c_void>(),
+        ))?;
+    }
+    /// The group-segment size found so far, and the funcs the callback reads regions with.
+    struct GroupFinder<'a> {
+        funcs: &'a Funcs,
+        bytes: Option<u64>,
+    }
+    unsafe extern "C" fn visit_region(region: hsa_region_t, data: *mut c_void) -> hsa_status_t {
+        // SAFETY: `data` is the `&mut GroupFinder` passed below, used only by this synchronous callback.
+        let finder = unsafe { &mut *(data as *mut GroupFinder<'_>) };
+        let mut segment: u32 = 0;
+        // SAFETY: SEGMENT writes a 4-byte enum into the local.
+        let read = unsafe {
+            check((finder.funcs.hsa_region_get_info)(
+                region,
+                HSA_REGION_INFO_SEGMENT,
+                (&raw mut segment).cast::<c_void>(),
+            ))
+        };
+        if read.is_err() {
+            return 1;
+        }
+        if segment == HSA_REGION_SEGMENT_GROUP {
+            let mut bytes: usize = 0;
+            // SAFETY: SIZE writes a `size_t` into the local.
+            let read = unsafe {
+                check((finder.funcs.hsa_region_get_info)(
+                    region,
+                    HSA_REGION_INFO_SIZE,
+                    (&raw mut bytes).cast::<c_void>(),
+                ))
+            };
+            if read.is_err() {
+                return 1;
+            }
+            finder.bytes = Some(bytes as u64);
+        }
+        0
+    }
+    let mut finder = GroupFinder { funcs, bytes: None };
+    // SAFETY: `visit_region` matches the callback type and `finder` outlives the synchronous iteration.
+    check(unsafe {
+        (funcs.hsa_agent_iterate_regions)(
+            agent,
+            Some(visit_region),
+            (&raw mut finder).cast::<c_void>(),
+        )
+    })?;
+    let group_segment_bytes = finder
+        .bytes
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or(RocmError::AgentEnum(
+            "the GPU agent reports no group-segment (LDS) region",
+        ))?;
+    Ok(AgentLimits {
+        workgroup_max_dim: dims.map(u32::from),
+        workgroup_max_size: size,
+        grid_max_dim: grid,
+        group_segment_bytes,
+    })
 }
 
 pub(crate) unsafe fn first_cpu_agent(funcs: &Funcs) -> Result<Option<hsa_agent_t>, RocmError> {

@@ -115,6 +115,9 @@ struct CudaAttributes {
 }
 
 fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_target::DeviceCaps {
+    let tensor_core = poot_target::TensorCoreSupport::from_cuda_compute_capability(
+        attrs.compute_capability_major,
+    );
     poot_target::DeviceCaps {
         max_buffer_bytes: total_memory,
         lds_bytes: attrs.shared_memory_per_block,
@@ -126,14 +129,24 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
         }),
         max_grid: attrs.max_grid,
         watchdog_budget: None,
-        tensor_core: poot_target::TensorCoreSupport::from_cuda_compute_capability(
-            attrs.compute_capability_major,
-        ),
+        tensor_core,
         // A device's miscompiles are the target family's known facts, not something CUDA reports.
         known_miscompiles: poot_target::DeviceCaps::ptx_default().known_miscompiles,
         compute_units: attrs.multiprocessor_count,
         memory_budget_bytes: Some(total_memory),
         dram_channels: None,
+        shader_features: poot_target::ShaderFeatures::ALL,
+        e4m3_storage: poot_target::E4m3Storage::Native,
+        matrix_lowering: poot_target::MatrixLowering::nvidia(tensor_core),
+        native_two_byte_floats: true,
+        widens_bf16_decode_weight: true,
+        imported_lds_array_bodies: true,
+        peer_transport: true,
+        // Measured on Ampere only; another generation keeps the GEMV at any width.
+        decode_gemv_max_out_cols: poot_target::calibration::nvidia_decode_gemv_max_out_cols(
+            attrs.compute_capability_major,
+        )
+        .known(),
     }
 }
 
@@ -1030,6 +1043,21 @@ mod caps_tests {
             "the device's total memory"
         );
         assert_eq!(caps.tensor_core, TensorCoreSupport::NvidiaWmma16x16x16Sm80);
+    }
+
+    /// The decode-GEMV width ceiling is a measured Ampere figure, keyed by the device's compute capability: an
+    /// sm_8x device reports it and another generation reports none, so the planner keeps the GEMV at any width
+    /// there. Mutation: report the ceiling for every generation; the sm_90 row fails.
+    #[test]
+    fn the_gemv_width_ceiling_is_reported_only_for_the_measured_generation() {
+        assert_eq!(
+            caps_from_attributes(1, &sentinel(8)).decode_gemv_max_out_cols,
+            Some(256)
+        );
+        assert_eq!(
+            caps_from_attributes(1, &sentinel(9)).decode_gemv_max_out_cols,
+            None
+        );
     }
 
     /// A pre-Ampere device is a confirmed absence of the bf16 fragments poot's kernels use.

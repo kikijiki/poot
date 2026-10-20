@@ -1,5 +1,5 @@
 //! The CPU oracle for a graph whose weights bind through a [`WeightMap`] (Card 564): a const named by
-//! a [`WeightId::const_name`](poot_quant::weights::WeightId::const_name) reads
+//! a [`WeightId::const_name`](poot_weights::WeightId::const_name) reads
 //! [`WeightMap::materialize`] - the map's own row copies, independent of the executor binder's
 //! byte-run arithmetic - and a [`PackedSourceName`] over one reads that source of the materialized
 //! payload.
@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use crate::{EvalOptions, Value, eval, materialize_dense};
 use poot_graph_ir::{Graph, PackedSourceName, SlotKey, Storage, ValueId};
-use poot_quant::weights::{WeightEntry, WeightId, WeightMap, WeightStore, WeightView};
+use poot_quant::weights::{WeightEntry, WeightStore};
 use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef};
 use poot_tensor::{DType, HostTensor};
+use poot_weights::{WeightId, WeightMap, WeightView};
 
 use super::StepFixture;
 

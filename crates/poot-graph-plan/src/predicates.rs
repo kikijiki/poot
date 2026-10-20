@@ -15,7 +15,9 @@ use std::collections::HashMap;
 use poot_graph_ir::op::{ContractionHead, OpKind, UnOp as GUnOp};
 use poot_graph_ir::{Eqn, Graph, Operand, TensorType, ValueId, ValueMeta, ValueTable};
 use poot_kernelgen as kg;
-use poot_target::{Backend, DeviceCaps, TargetId, TensorCoreSupport};
+use poot_target::{Backend, DeviceCaps, TargetId};
+
+use crate::dtype_widen::matmul_tensor_core_eligible;
 
 use crate::PlanError;
 use crate::imported::ImportedKernel;
@@ -90,7 +92,7 @@ fn consumers(g: GraphTables<'_>) -> HashMap<ValueId, Vec<usize>> {
 ///
 /// Conservative allowlist: elementwise `Binary` against another value (`binary_broadcast_dt_views`),
 /// `Fused` / `FusedRow` (`fused_views` / `fused_row_parallel_views`), and the `Unary` sub-ops that share
-/// `build_unary_dt`'s skeleton (`Neg`/`Recip`/`Sqrt`/`Round`/`Exp`/`Log`, via [`map_unary_views_grid`]).
+/// `build_unary_dt`'s skeleton (`Neg`/`Recip`/`Sqrt`/`Exp`/`Log`, via [`map_unary_views_grid`]).
 /// The indexed contraction reads its weight operand (operand 1 only) strided, so a `Transpose` of the stacked
 /// expert weight is a view there. Everything else (other contractions, gather/scatter, concat, standalone
 /// `Reduce`, `Reshape`, `DynamicUpdateSlice`) keeps materializing.
@@ -107,7 +109,7 @@ fn is_strided_capable(eqn: &Eqn, value: ValueId) -> bool {
         OpKind::Fused(_) | OpKind::FusedRow(_) => true,
         OpKind::Unary(uop) => matches!(
             uop,
-            GUnOp::Neg | GUnOp::Recip | GUnOp::Sqrt | GUnOp::Round | GUnOp::Exp | GUnOp::Log
+            GUnOp::Neg | GUnOp::Recip | GUnOp::Sqrt | GUnOp::Exp | GUnOp::Log
         ),
         // The indexed contraction reads its stacked weight (operand 1 only) through a transposed layout, so a
         // `Transpose` feeding it is never materialized. Its activation, ids and epilogue leaves are read flat.
@@ -283,7 +285,6 @@ pub(crate) const GEMV_TILE: usize = 32;
 /// `"matmul:tiled"` for [`is_tiled_gemm_in`]'s).
 pub(crate) fn is_decode_gemv_in(
     g: GraphTables<'_>,
-    backend: Backend,
     eqn: &Eqn,
     out_shape: &[usize],
     out_numel: usize,
@@ -308,10 +309,13 @@ pub(crate) fn is_decode_gemv_in(
     if gemv_grid(out_numel.div_ceil(GEMV_TILE).max(1), caps).1 > caps.max_grid[1] as usize {
         return false;
     }
-    // NVPTX only: for large decode projections (gate/up/down/lm_head, N in the thousands) the GEMV's serial
-    // lane-0 LDS reduction and stride-N weight reads make it ~2x slower than `matmul_batched` on Ampere
-    // (found by the 2026-07-03 benchmark). Keep the GEMV only for small N (the weight's output dim).
-    if matches!(backend, Backend::Nvptx) && out_shape[out_shape.len() - 1] > 256 {
+    // A device can have a measured width above which the batched matmul beats the GEMV (NVIDIA Ampere: the GEMV's
+    // serial lane-0 LDS reduction and stride-N weight reads make it ~2x slower for large decode projections,
+    // gate/up/down/lm_head with N in the thousands). A device with no measurement keeps the GEMV at any width.
+    if caps
+        .decode_gemv_max_out_cols
+        .is_some_and(|max| out_shape[out_shape.len() - 1] > max as usize)
+    {
         return false;
     }
     // The weight (inputs[1]) must be rank-2 [K,N].
@@ -658,10 +662,10 @@ pub(crate) fn is_tileable_matmul_in(g: GraphTables<'_>, eqn: &Eqn) -> bool {
 /// production caller and was deleted; cross-crate tests assert on the planned `Plan`'s key instead.
 pub(crate) fn is_tiled_gemm_in(
     g: GraphTables<'_>,
-    backend: Backend,
     eqn: &Eqn,
     out_shape: &[usize],
     out_numel: usize,
+    caps: &DeviceCaps,
 ) -> bool {
     // The imported tiled GEMM body is f32-only and fail where the codegen
     // capability query says imported LDS-array bodies do not compile (R468-015: their Rust-compiled LDS
@@ -670,7 +674,7 @@ pub(crate) fn is_tiled_gemm_in(
     // matmul takes the tc-arm on NVPTX and matmul_batched_dt on AmdGcn.
     if g.aval(eqn.out).dtype != DType::F32
         || !matches!(eqn.op, OpKind::MatMul)
-        || !codegen_capability(backend.into()).imported_lds_array_bodies
+        || !caps.imported_lds_array_bodies
     {
         return false;
     }
@@ -746,7 +750,6 @@ pub(crate) fn tiled_gemm_plan(
 
 pub(crate) fn is_batched_tiled_gemm_in(
     g: GraphTables<'_>,
-    backend: Backend,
     eqn: &Eqn,
     out_shape: &[usize],
     _out_numel: usize,
@@ -756,7 +759,7 @@ pub(crate) fn is_batched_tiled_gemm_in(
     // imported LDS-array bodies do not compile (R468-015); that target falls back to serial
     // matmul_batched_dt.
     if g.aval(eqn.out).dtype != DType::F32
-        || !codegen_capability(backend.into()).imported_lds_array_bodies
+        || !caps.imported_lds_array_bodies
         || !matches!(eqn.op, OpKind::MatMul)
     {
         return false;
@@ -902,7 +905,6 @@ fn movement_units(g: GraphTables<'_>, eqn: &Eqn, out_shape: &[usize], out_numel:
 
 pub(crate) fn is_elementwise_2d_in(
     g: GraphTables<'_>,
-    backend: Backend,
     eqn: &Eqn,
     out_shape: &[usize],
     out_numel: usize,
@@ -921,8 +923,7 @@ pub(crate) fn is_elementwise_2d_in(
         | OpKind::Slice { .. }
         | OpKind::Broadcast { .. }
         | OpKind::Concat { .. }
-        | OpKind::Gather { .. }
-        | OpKind::Scatter { .. } => movement_units(g, eqn, out_shape, out_numel) > fold_ceiling,
+        | OpKind::Gather { .. } => movement_units(g, eqn, out_shape, out_numel) > fold_ceiling,
         // The in-place row write: one thread per source unit, so the fold follows the source rows.
         OpKind::ScatterUpdate => {
             let ids = value_ids(eqn);
@@ -952,11 +953,11 @@ pub(crate) fn is_elementwise_2d_in(
         // Naive fallback only, when every specialized MatMul plan declines (mirrors `plan_eqn`'s routing).
         OpKind::MatMul => {
             out_numel > fold_ceiling
-                && !is_decode_gemv_in(g, backend, eqn, out_shape, out_numel, caps)
-                && !is_tiled_gemm_in(g, backend, eqn, out_shape, out_numel)
-                && !is_batched_tiled_gemm_in(g, backend, eqn, out_shape, out_numel, caps)
+                && !is_decode_gemv_in(g, eqn, out_shape, out_numel, caps)
+                && !is_tiled_gemm_in(g, eqn, out_shape, out_numel, caps)
+                && !is_batched_tiled_gemm_in(g, eqn, out_shape, out_numel, caps)
                 && !is_decode_attn_gemv_in(g, eqn, out_shape, out_numel, caps)
-                && !matmul_takes_tensorcore(g, backend, eqn, out_shape)
+                && !matmul_takes_tensorcore(g, eqn, out_shape, caps)
         }
         // The epilogue's one-thread-per-output body: a `MatMul` head's only lowering. A dense head's is the Gemv or
         // the tiled GEMM (a custom grid, never folded).
@@ -988,14 +989,15 @@ pub(crate) fn packed_contraction_m_per_block(
     }
 }
 
-/// Does this `MatMul` eqn take a WMMA/tensor-core plan (AMD RDNA3 or NVPTX)? Factored out of
-/// [`is_elementwise_2d`] (card 181) so it can exclude the tensor-core path without duplicating
-/// `plan_eqn`'s gate (`amd_tc`/`tc`): `MatMul`'s bf16-operand and 16-aligned-dims gates.
+/// Does this `MatMul` eqn take a tensor-core plan (AMD RDNA3 WMMA, NVPTX `wmma`, or the SPIR-V cooperative
+/// matrix)? Factored out of [`is_elementwise_2d`] (card 181) so it can exclude the tensor-core path; the
+/// decision itself is [`matmul_tensor_core_eligible`], the one `plan_eqn`'s matmul route and the
+/// mixed-dtype widening pass also read.
 fn matmul_takes_tensorcore(
     g: GraphTables<'_>,
-    backend: Backend,
     eqn: &Eqn,
     out_shape: &[usize],
+    caps: &DeviceCaps,
 ) -> bool {
     if !matches!(eqn.op, OpKind::MatMul) {
         return false;
@@ -1004,29 +1006,13 @@ fn matmul_takes_tensorcore(
     if ids.len() < 2 {
         return false;
     }
-    let a = g.aval(ids[0]).shape.clone();
-    let operands_bf16 = g.aval(ids[0]).dtype == DType::BF16 && g.aval(ids[1]).dtype == DType::BF16;
-    if !operands_bf16 {
-        return false;
-    }
+    let a = &g.aval(ids[0]).shape;
     let r = out_shape.len();
     if r < 2 || a.is_empty() {
         return false;
     }
     let (mm, nn, kk) = (out_shape[r - 2], out_shape[r - 1], a[a.len() - 1]);
-    let aligned = mm.is_multiple_of(16) && nn.is_multiple_of(16) && kk.is_multiple_of(16);
-    if !aligned {
-        return false;
-    }
-    match backend {
-        Backend::Nvptx => true,
-        Backend::AmdGcn(arch) => {
-            arch.tensor_core == TensorCoreSupport::Wmma16x16x16Rdna3
-                && out_shape[..r - 2].iter().product::<usize>() == 1
-        }
-        // No tensor-core kernel: the portable body, and an AIE core has no fragment hardware.
-        Backend::SpirvVulkan => false,
-    }
+    matmul_tensor_core_eligible(caps, g.aval(ids[0]).dtype, g.aval(ids[1]).dtype, mm, nn, kk)
 }
 
 /// The 2-D fold decision of a generated one-thread-per-output-element kernel: the planner decides
@@ -1034,7 +1020,6 @@ fn matmul_takes_tensorcore(
 /// and the launch grid from it.
 pub(crate) fn elementwise_fold(
     g: GraphTables<'_>,
-    backend: Backend,
     eqn: &Eqn,
     out_shape: &[usize],
     out_numel: usize,
@@ -1042,7 +1027,7 @@ pub(crate) fn elementwise_fold(
 ) -> kg::Fold {
     kg::Fold {
         numel: out_numel,
-        two_d: is_elementwise_2d_in(g, backend, eqn, out_shape, out_numel, caps),
+        two_d: is_elementwise_2d_in(g, eqn, out_shape, out_numel, caps),
         width: ELEMENTWISE_2D_WIDTH,
     }
 }

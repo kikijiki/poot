@@ -8,8 +8,8 @@
 //! PyTorch stores a depthwise `nn.Conv1d`, `[C, 1, K]`, or as a GGUF stores it, `[C, K]`.
 
 use poot_graph_ir::{BinOp, Builder, Traced, ops};
-use poot_quant::weights::{WeightId, WeightMap};
 use poot_tensor::DType;
+use poot_weights::{WeightId, WeightMap};
 
 use super::linear::{Weight, WeightError};
 use super::standard::{ParamError, Step};
@@ -120,7 +120,7 @@ pub fn causal_conv(
 #[cfg(test)]
 mod tests {
     use poot_graph_ir::Slot;
-    use poot_quant::weights::{Mamba2Role, WeightRole};
+    use poot_weights::{Mamba2Role, WeightRole};
 
     use super::*;
     use crate::components::standard::oracle::{self, Fx};

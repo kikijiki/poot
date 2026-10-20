@@ -43,7 +43,8 @@
 //! `poot_graph_ir::ops` composition (`layernorm_no_bias`/`linear`/`attention_masked`/`attention_prefill`).
 
 use poot_graph_ir::rope_table::RopeFlavor;
-use poot_quant::weights::{AttnRole, FfnRole, NormRole, WeightMap, WeightRole, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::{AttnRole, FfnRole, NormRole, WeightMap, WeightRole};
 
 use crate::components::attention::AttentionParams;
 use crate::components::dims::{Field, Fields};

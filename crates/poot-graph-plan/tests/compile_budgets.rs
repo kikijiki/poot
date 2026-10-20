@@ -14,9 +14,9 @@ use poot_graph_plan::{
     KernelChoice, LegalizeError, PlanError, Target, compile, legalize, plan_eqn_choice,
 };
 use poot_kernelgen::{BodyLimits, BodyResource, BodyStage, KernelGenError, KernelRequest};
-use poot_quant::weights::{WeightId, WeightRole};
 use poot_target::Backend;
 use poot_test_util::device_caps::default_caps_for;
+use poot_weights::{WeightId, WeightRole};
 
 const LEGALIZE: &str = "legalize";
 

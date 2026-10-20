@@ -24,12 +24,13 @@ use poot_models::model::{
     StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostTensor};
 use poot_test_util::per_backend;
 use poot_text::{ChatFormat, HermesToolCodec};
+use poot_weights::WeightMap;
 
 use crate::core::sampler::Sampler;
 use crate::driver::block_table::BLOCK_SIZE;

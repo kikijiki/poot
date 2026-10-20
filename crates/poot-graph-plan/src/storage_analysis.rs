@@ -40,17 +40,16 @@ use poot_graph_ir::{Eqn, Graph, Operand, ValueId};
 /// reader shares ([`StorageGap::F16PackedLanes`]).
 pub(crate) fn value_storage_of_plans<'p>(
     g: &Graph,
-    target: impl Into<TargetId>,
+    target: &Target,
     plans: impl Iterator<Item = Option<&'p Plan>>,
 ) -> Result<GraphStorage, PlanError> {
-    let target = target.into();
     let plans: Vec<Option<&Plan>> = plans.collect();
     check_i32_reads(g, &plans)?;
     let mut weights = dense_contraction_weight_storages(g)?;
     weights.extend(e4m3_row_gather_table_storages(g)?);
-    let views = compute_views(g, target);
+    let views = compute_views(g, target.id());
     let storage = storage_of_kinds(g, target, &views, &weights);
-    check_bf16_const_reads(g, target, &storage, &plans)?;
+    check_bf16_const_reads(g, target.id(), &storage, &plans)?;
     Ok(storage)
 }
 
@@ -128,7 +127,7 @@ fn check_bf16_const_reads(
 
 fn storage_of_kinds(
     g: &Graph,
-    target: TargetId,
+    target: &Target,
     views: &HashMap<ValueId, Layout>,
     weights: &HashMap<ValueId, StorageKind>,
 ) -> GraphStorage {
@@ -318,7 +317,7 @@ fn value_storage_kind(
     g: &Graph,
     views: &HashMap<ValueId, Layout>,
     id: ValueId,
-    target: TargetId,
+    target: &Target,
 ) -> StorageKind {
     let declared = g.aval(id).dtype;
     if !g.meta(id).storage.holds_weight_bytes() || declared != DType::BF16 {
@@ -333,6 +332,7 @@ fn value_storage_kind(
 
 #[cfg(test)]
 mod value_storage_tests {
+    use crate::Target;
     use crate::staged::{
         DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet, compile_staged,
     };
@@ -372,7 +372,14 @@ mod value_storage_tests {
                 .ok()
             })
             .collect();
-        super::value_storage_of_plans(g, backend, plans.iter().map(Option::as_ref))
+        super::value_storage_of_plans(
+            g,
+            &Target::Gpu {
+                backend,
+                caps: poot_test_util::device_caps::default_caps_for(backend),
+            },
+            plans.iter().map(Option::as_ref),
+        )
     }
 
     /// `a x w^T -> f32` over two consts of the given dtypes, `m x 32` against a checkpoint-order `[32, 32]` weight;
@@ -595,11 +602,19 @@ mod value_storage_tests {
         let plan_of = |g: &Graph| plan_eqn(g, &g.eqns()[0], backend, &caps, &limits).unwrap();
 
         let honest = plan_of(&i32_graph);
-        super::value_storage_of_plans(&i32_graph, backend, [Some(&honest)].into_iter())
-            .expect("the planner's own I32 body reads Slice<i32>");
+        super::value_storage_of_plans(
+            &i32_graph,
+            &Target::Gpu { backend, caps },
+            [Some(&honest)].into_iter(),
+        )
+        .expect("the planner's own I32 body reads Slice<i32>");
 
         let forged = plan_of(&f32_graph);
-        match super::value_storage_of_plans(&i32_graph, backend, [Some(&forged)].into_iter()) {
+        match super::value_storage_of_plans(
+            &i32_graph,
+            &Target::Gpu { backend, caps },
+            [Some(&forged)].into_iter(),
+        ) {
             Err(crate::PlanError::I32ReadAsF32 { value, reader }) => {
                 assert_eq!((value, reader), (x, y));
             }
@@ -635,8 +650,15 @@ mod value_storage_tests {
             .find(|eqn| matches!(eqn.op, OpKind::Gather { .. }))
             .expect("the gather");
         let honest = plan_eqn(&g, gather, backend, &caps, &limits).unwrap();
-        super::value_storage_of_plans(&g, backend, [Some(&honest)].into_iter())
-            .expect("the planner's own binding reads the index through a Slice<i32>");
+        super::value_storage_of_plans(
+            &g,
+            &Target::Gpu {
+                backend,
+                caps: poot_test_util::device_caps::default_caps_for(backend),
+            },
+            [Some(&honest)].into_iter(),
+        )
+        .expect("the planner's own binding reads the index through a Slice<i32>");
 
         let Plan::Dispatches(plan) = plan_eqn(&g, gather, backend, &caps, &limits).unwrap() else {
             panic!("a gather dispatches");
@@ -660,7 +682,14 @@ mod value_storage_tests {
             })
             .collect();
         let swapped = Plan::Dispatches(crate::DispatchPlan::new(swapped, Vec::new()).unwrap());
-        match super::value_storage_of_plans(&g, backend, [Some(&swapped)].into_iter()) {
+        match super::value_storage_of_plans(
+            &g,
+            &Target::Gpu {
+                backend,
+                caps: poot_test_util::device_caps::default_caps_for(backend),
+            },
+            [Some(&swapped)].into_iter(),
+        ) {
             Err(crate::PlanError::I32ReadAsF32 { value, reader }) => {
                 assert_eq!((value, reader), (index, gathered));
             }

@@ -8,9 +8,8 @@
 //! `(1 + w)`, the value heads grouped by key head and `A_log`; llama.cpp's converter folds the one in,
 //! reorders every per-value-head tensor to tiled order (`_reorder_v_heads`) and stores `-exp(A_log)`.
 
-use poot_quant::weights::{
-    GdnRole, WeightKey, WeightMapBuilder, WeightMapError, WeightRole, WeightView,
-};
+use poot_quant::weights::WeightKey;
+use poot_weights::{GdnRole, WeightMapBuilder, WeightMapError, WeightRole, WeightView};
 
 use super::dims::{Field, Fields};
 use super::gdn::{GdnHeadOrder, GdnParams};
@@ -18,7 +17,7 @@ use super::norm::{NormKind, NormParams};
 use super::standard::ParamError;
 use crate::model::{ConfigReason, ModelError};
 use crate::registry::RawConfig;
-use poot_quant::weights::WeightId;
+use poot_weights::WeightId;
 
 /// How a checkpoint stores the `+ 1` of a zero-centered RMSNorm scale. The GDN's own gated norm is a
 /// plain scale in every container.
@@ -463,7 +462,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
-    use poot_quant::weights::{WeightMap, WeightStore};
+    use poot_quant::weights::WeightStore;
+    use poot_weights::WeightMap;
 
     use super::*;
     use crate::components::testing::f32_entry;

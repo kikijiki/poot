@@ -27,13 +27,11 @@ use poot_graph_plan::{
     staged::compile_staged,
 };
 use poot_quant::StoredBytes;
-use poot_quant::weights::{
-    DenseWeight, ExpertProj, MoeRole, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole,
-    WeightStore, WeightView,
-};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
 use poot_runtime_common::{BufferRole, MemoryCounters};
 use poot_target::{Backend, BufferStorage, DeviceCaps};
 use poot_tensor::DType;
+use poot_weights::{ExpertProj, MoeRole, WeightId, WeightMap, WeightRole, WeightView};
 
 const EXPERTS: usize = 6;
 const POOL: usize = 3;

@@ -70,6 +70,7 @@ readonly gate_policy=(
   "poot-ptx-device|reviewed|"
   "poot-ptx-runtime|reviewed|"
   "poot-quant|host|"
+  "poot-weights|host|"
   "poot-rocm-device|reviewed|"
   "poot-rocm-runtime|reviewed|"
   "poot-wgpu-runtime|reviewed|"

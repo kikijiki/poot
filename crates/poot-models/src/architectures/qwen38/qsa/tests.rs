@@ -9,7 +9,7 @@
 
 use poot_graph_ir::rope_table::RopeFlavor;
 use poot_graph_ir::{BinOp, Builder, Graph, RedOp, Scalar, Slot, TraceLimits, Traced};
-use poot_quant::weights::{QsaRole, WeightId, WeightRole};
+use poot_weights::{QsaRole, WeightId, WeightRole};
 
 use super::*;
 use crate::components::attention::carried_cache;

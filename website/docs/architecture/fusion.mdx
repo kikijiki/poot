@@ -42,7 +42,7 @@ SPIR-V/PTX/AMDGPU artifact. Imported kernels cover the shapes the synthesizer do
 - Greedy argmax as two stages and the batched samplers (`argmax_chunk.rs`, `argmax_combine.rs`,
   `sample_*_gumbel_argmax_batched.rs`)
 
-Data movement (`Gather`, `Scatter`, `Slice`, `Concat`, `Transpose`, `Broadcast`, `DynamicUpdateSlice`) is
+Data movement (`Gather`, `Slice`, `Concat`, `Transpose`, `Broadcast`, `DynamicUpdateSlice`) is
 not imported: one generated movement kernel covers every op and every storage, including packed byte
 rows, copying bits without decoding them.
 
@@ -74,8 +74,8 @@ the result; it joins pointwise regions, not row (reduction-rooted) ones, because
 Over BF16 or F16 branches the select moves the two-byte elements as stored, so it plans as its own kernel on ROCm
 and PTX; a SPIR-V target has no native two-byte lane and refuses it with a typed `DtypeLowering`. The
 activations are compositions over these, so SwiGLU and GeGLU fuse as plain `Exp`/`Div`/`Mul` chains, and a value read more than once (the activation's input)
-fuses as long as every read is inside the same region. `MatMul`, `Gather`, `Scatter`, `Concat`,
-`Reduce`, the movement ops (`Reshape`, `Slice`, `Broadcast`, `Transpose`), and the unary `Round`
+fuses as long as every read is inside the same region. `MatMul`, `Gather`, `Concat`,
+`Reduce` and the movement ops (`Reshape`, `Slice`, `Broadcast`, `Transpose`)
 are boundaries of a pointwise region; a contraction instead absorbs the chain after it (below).
 
 **Contraction epilogues.** A dense contraction (a `MatMul`, the contraction over a weight kept in

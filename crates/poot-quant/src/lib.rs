@@ -516,7 +516,7 @@ impl PackedComponentRef {
 /// upload lays them back to back at [`PackedWeight::slab_bytes`] strides.
 ///
 /// Key convention: the GGUF loader stores a rank-3 expert tensor `key` as one entry per expert named
-/// `{key}.{expert}`, and a stack's [`weights::WeightView::ExpertStack`] lists those keys in expert order. Test
+/// `{key}.{expert}`, and a stack's `poot_weights::WeightView::ExpertStack` lists those keys in expert order. Test
 /// fixtures that name a stack `S` hold its experts as `S.0`, `S.1`, .. (`poot-graph-ir`'s
 /// `test_support::const_weights::ConstWeights` and `weight_map_oracle::expert_owners` read that spelling).
 #[derive(Clone, Debug)]
@@ -761,7 +761,7 @@ impl PackedPayload {
 
     /// The weight [`Self::gather_rows`] yields for `rows` rows of `parts`, checked without touching a byte:
     /// the parts are block-format and share one format and `K`. The one rule the gather and a
-    /// [`weights`](crate::weights) map's shape-only handle both follow.
+    /// `poot_weights` map's shape-only handle both follow.
     pub fn gathered_weight(
         parts: &[&Self],
         rows: usize,

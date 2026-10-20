@@ -39,7 +39,7 @@ fn qwen2_5_0_5b_decode() -> poot_graph_ir::Graph {
 /// hold no F32 buffer of the head's element count: the head's residency is `vocab * hidden * 2` bytes.
 ///
 /// Mutation: in `fold_dense_contractions`, skip the fold for a BF16 weight (`continue` before the
-/// `DENSE_CONTRACTION_WEIGHT_DTYPES` check); the head stays a `Transpose` and a mixed-dtype `MatMul` over the BF16
+/// weight-dtype check); the head stays a `Transpose` and a mixed-dtype `MatMul` over the BF16
 /// weight, which no backend lowers (no pass retypes a const), so `compile` refuses it and this row goes red.
 #[test]
 fn the_tied_head_decode_runs_the_bf16_gemv_over_bf16_resident_weight() {

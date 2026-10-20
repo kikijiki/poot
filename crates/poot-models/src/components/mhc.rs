@@ -13,7 +13,7 @@
 //! checkpoint stores them; [`MhcSiteWeights`] and [`MhcHeadWeights`] do that for a mapped weight.
 
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, ops};
-use poot_quant::weights::{MhcRole, WeightId, WeightMap, WeightRole};
+use poot_weights::{MhcRole, WeightId, WeightMap, WeightRole};
 
 use super::linear::{Weight, WeightError};
 use super::standard::ParamError;

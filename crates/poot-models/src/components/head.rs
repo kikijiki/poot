@@ -3,7 +3,7 @@
 //! so the head's const has one reader and its storage claim is its own.
 
 use poot_graph_ir::{Builder, Traced};
-use poot_quant::weights::{WeightId, WeightMap, WeightRole};
+use poot_weights::{WeightId, WeightMap, WeightRole};
 
 use super::linear::{Weight, WeightError, linear};
 use crate::model::TraceError;

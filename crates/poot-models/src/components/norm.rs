@@ -93,7 +93,7 @@ pub fn norm(b: &Builder, x: Traced, w: &Weight, p: NormParams) -> Result<Traced,
 #[cfg(test)]
 mod tests {
     use poot_graph_ir::TensorType;
-    use poot_quant::weights::{WeightId, WeightRole};
+    use poot_weights::{WeightId, WeightRole};
 
     use super::*;
     use crate::components::standard::oracle::{self, Fx};

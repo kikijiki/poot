@@ -29,8 +29,8 @@
 
 use poot_graph_ir::ops::{self, sigmoid, silu, u64_mul_i32_const, u64_rem_u32, u64_xor};
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, UnOp, ValidationId};
-use poot_quant::weights::{PleRole, WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
+use poot_weights::{PleRole, WeightId, WeightMap, WeightRole};
 
 use super::conv::{ConvParams, ConvWeights, causal_conv};
 use super::linear::{Weight, WeightError, linear};

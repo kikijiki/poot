@@ -70,7 +70,7 @@ Verified on an AMD XDNA2 NPU (Strix Halo, `aie2p`):
   the toolchain; the compiler splits a program at these numbers, or refuses an equation that fits no region
   with a typed limit.
 
-Nothing else is verified. Every other equation (`round`, other unary ops, reductions over another axis or
+Nothing else is verified. Every other equation (`erf`, other unary ops, reductions over another axis or
 another element type, data movements other than gather, matmul, attention, collectives) is refused by the
 planner with a typed capability, and no model runs on the NPU. Performance
 is not a goal of this path: it is scalar, and not competitive with the GPU backends.

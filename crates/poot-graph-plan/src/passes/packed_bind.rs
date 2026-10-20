@@ -27,8 +27,8 @@ use super::{EditError, Eqn, Graph, OpKind, Operand, Storage, ValueId, ValueMeta}
 use poot_graph_ir::packed_source::{packed_source_type, packed_stack_source_type};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{ContractionRows, ValueTable};
-use poot_quant::weights::{HandleFormat, WeightId, WeightMap, WeightView};
 use poot_tensor::DType;
+use poot_weights::{HandleFormat, WeightId, WeightMap, WeightView};
 
 /// How a packed owner's logical `[out, K]` decode maps onto the constant a tracer declares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -424,8 +424,8 @@ mod tests {
     use crate::passes::reject_packed_dequant_escapes;
     use crate::{recognize_packed_contractions, recognize_packed_row_gathers};
     use poot_quant::format::WeightFormat;
-    use poot_quant::weights::{FfnRole, WeightRole};
     use poot_quant::{PackedWeight, SourceRole};
+    use poot_weights::{FfnRole, WeightRole};
 
     use super::*;
     use poot_graph_ir::types::TensorType;
@@ -544,9 +544,8 @@ mod tests {
     /// handle is left alone. Mutation: read every handle as dense; nothing binds.
     #[test]
     fn weight_map_formats_bind_a_checkpoint_oriented_projection_to_the_claimable_chain() {
-        use poot_quant::weights::{
-            AttnRole, DenseWeight, WeightEntry, WeightId, WeightRole, WeightStore, WeightView,
-        };
+        use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
+        use poot_weights::{AttnRole, WeightId, WeightRole, WeightView};
         let (q, k) = (
             WeightId::layer(0, WeightRole::Attn(AttnRole::Q)),
             WeightId::layer(0, WeightRole::Attn(AttnRole::K)),

@@ -1,6 +1,7 @@
 //! DeepSeek-V4 rows: the fixtures against their independent reference, the step shapes, a missing
 //! tensor, the hash table's range check, the carried state and the packed projections.
 
+mod claims;
 mod packed;
 mod reference;
 
@@ -20,7 +21,7 @@ use crate::components::testing::{assert_missing_weight_is_named, build, close, c
 use crate::model::{ConfigReason, LogitRows, StepShape};
 use crate::registry::Registry;
 use packed::{E4M3, FP4, literal, payload};
-use poot_quant::weights::{AttnRole, HandleFormat, WeightId, WeightMap, WeightRole};
+use poot_weights::{AttnRole, HandleFormat, WeightId, WeightMap, WeightRole};
 use reference::Reference;
 
 /// The cache capacity of the rows here: 8 windows of the CSA rate 2, 4 of the HCA rate 4.
@@ -686,7 +687,7 @@ fn a_checkpoint_with_packed_experts_and_projections_matches_its_decoded_twin() {
 #[test]
 fn a_real_dims_fp4_expert_projection_equals_the_hand_decoded_column_real_dims() {
     use poot_graph_ir::{Builder, TensorType};
-    use poot_quant::weights::{ExpertProj, MoeRole, WeightRole};
+    use poot_weights::{ExpertProj, MoeRole, WeightRole};
 
     use crate::components::linear::{Weight, linear};
     use crate::components::standard::oracle::Fx;

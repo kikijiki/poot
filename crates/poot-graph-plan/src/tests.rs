@@ -94,7 +94,6 @@ fn is_elementwise_2d(
 ) -> bool {
     is_elementwise_2d_in(
         g.into(),
-        backend,
         eqn,
         out_shape,
         out_numel,
@@ -1331,7 +1330,7 @@ fn e4m3fn_dynamic_update_slice_plans_static_and_runtime_exact_packed_outputs() {
 }
 
 #[test]
-fn e4m3fn_scatter_update_rejects_empty_and_mixed_storage_by_name() {
+fn e4m3fn_scatter_update_rejects_empty_storage_and_mixed_dtypes() {
     for (pool, source_rows) in [(0, 1), (2, 0)] {
         let builder = Builder::for_tests();
         let base = builder
@@ -1360,35 +1359,18 @@ fn e4m3fn_scatter_update_rejects_empty_and_mixed_storage_by_name() {
         assert_eq!(refusal.op, OpKind::ScatterUpdate);
     }
 
-    let builder = Builder::for_tests();
-    let base = builder
-        .constant("base", TensorType::new(vec![2, 5], GDt::E4M3FN))
-        .unwrap();
-    let src = builder
-        .constant("src", TensorType::f32(vec![1, 5]))
-        .unwrap();
-    let slots = builder
-        .constant("slots", TensorType::new(vec![1], GDt::I32))
-        .unwrap();
-    let output = builder.scatter_update(base, src, slots).unwrap();
-    let graph = builder.finish(output).unwrap();
-    let eqn = &graph.eqns()[0];
-    let refusal = refusal_of(
-        plan_eqn(
-            &graph,
-            eqn,
-            Backend::SpirvVulkan,
-            &default_caps_for(Backend::SpirvVulkan),
-            &crate::test_support::roomy_body_limits(),
-        ),
-        "E4M3FN ScatterUpdate over an f32 source",
-    );
-    assert_eq!(refusal.missing, Capability::DtypeLowering);
-    assert_eq!(
-        refusal.dtypes.operands,
-        [GDt::E4M3FN, GDt::F32, GDt::I32],
-        "the refusal must carry the mixed operand dtypes"
-    );
+    // An E4M3FN base under an f32 source never reaches the planner: `infer` types a `ScatterUpdate` over one
+    // dtype only (POOT-1241), so it is an IR-level `ShapeError`.
+    let err = OpKind::ScatterUpdate
+        .infer(&[
+            TensorType::new(vec![2, 5], GDt::E4M3FN),
+            TensorType::f32(vec![1, 5]),
+            TensorType::new(vec![1], GDt::I32),
+        ])
+        .expect_err(
+            "a ScatterUpdate over a base and a source of two dtypes must be rejected by infer",
+        );
+    assert!(matches!(err, ShapeError::Dtype { .. }));
 
     // Card 529: an E4M3FN slot map no longer reaches the planner - `infer` rejects it for every
     // `ScatterUpdate`, so this is an IR-level `ShapeError` now, not a planner refusal.
@@ -1702,7 +1684,7 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
 }
 
 #[test]
-fn e4m3fn_concat_rejects_zero_element_and_mixed_storage_by_name() {
+fn e4m3fn_concat_rejects_zero_element_storage_and_mixed_dtypes() {
     let builder = Builder::for_tests();
     let empty = builder
         .constant("empty", TensorType::new(vec![0, 5], GDt::E4M3FN))
@@ -1726,28 +1708,15 @@ fn e4m3fn_concat_rejects_zero_element_and_mixed_storage_by_name() {
     assert_eq!(refusal.missing, Capability::ZeroElementE4m3);
     assert_eq!(refusal.op, eqn.op);
 
-    let builder = Builder::for_tests();
-    let raw = builder
-        .constant("raw", TensorType::new(vec![1, 5], GDt::E4M3FN))
-        .unwrap();
-    let dense = builder
-        .constant("dense", TensorType::new(vec![1, 5], GDt::F32))
-        .unwrap();
-    let output = builder.concat(0, &[raw, dense]).unwrap();
-    let graph = builder.finish(output).unwrap();
-    let eqn = &graph.eqns()[0];
-    let refusal = refusal_of(
-        plan_eqn(
-            &graph,
-            eqn,
-            Backend::SpirvVulkan,
-            &default_caps_for(Backend::SpirvVulkan),
-            &crate::test_support::roomy_body_limits(),
-        ),
-        "E4M3FN Concat over a dense operand",
-    );
-    assert_eq!(refusal.missing, Capability::DtypeLowering);
-    assert_eq!(refusal.dtypes.operands, [GDt::E4M3FN, GDt::F32]);
+    // A concat of an E4M3FN part and a dense one is an IR-level `ShapeError`: `infer` types the parts of a
+    // `Concat` over one dtype only (POOT-1241), so it never reaches the planner.
+    let err = OpKind::Concat { axis: 0 }
+        .infer(&[
+            TensorType::new(vec![1, 5], GDt::E4M3FN),
+            TensorType::new(vec![1, 5], GDt::F32),
+        ])
+        .expect_err("a Concat over two dtypes must be rejected by infer");
+    assert!(matches!(err, ShapeError::Dtype { .. }));
 }
 
 #[test]
@@ -2962,7 +2931,7 @@ fn widen_inserts_cast_for_decode_shaped_mixed_matmul() {
         "unwidened decode-shaped mixed matmul should be rejected on {backend:?}: got {r:?}"
     );
 
-    let gw = widen_mismatched_matmul_dtypes(&g, backend).unwrap();
+    let gw = widen_mismatched_matmul_dtypes(&g, &default_caps_for(backend)).unwrap();
     let mm = gw
         .eqns()
         .iter()
@@ -3005,7 +2974,7 @@ fn widen_inserts_cast_for_decode_shaped_mixed_matmul() {
             matches!(&r, Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering),
             "a BF16 [K, N] decode projection must be refused on {backend:?}: got {r:?}"
         );
-        let gw = widen_mismatched_matmul_dtypes(&g, backend).unwrap();
+        let gw = widen_mismatched_matmul_dtypes(&g, &default_caps_for(backend)).unwrap();
         assert!(
             !gw.eqns()
                 .iter()
@@ -3027,7 +2996,7 @@ fn widen_is_noop_when_tensor_core_arm_fires() {
     // bf16) so `matmul_tensorcore`'s bf16 fragment loads see bf16 buffers and the `matmul:tc:` key is unchanged.
     let gm = mixed_matmul_graph(GDt::BF16, GDt::F32);
     for backend in [Backend::AmdGcn(AmdArch::gfx1151()), Backend::Nvptx] {
-        let gw = widen_mismatched_matmul_dtypes(&gm, backend).unwrap();
+        let gw = widen_mismatched_matmul_dtypes(&gm, &default_caps_for(backend)).unwrap();
         assert_eq!(
             gw.eqns().len(),
             gm.eqns().len(),
@@ -3099,7 +3068,7 @@ fn widen_preserves_cpu_oracle_numerics() {
         Backend::Nvptx,
         Backend::AmdGcn(AmdArch::gfx1151()),
     ] {
-        let gw = widen_mismatched_matmul_dtypes(&g, backend).unwrap();
+        let gw = widen_mismatched_matmul_dtypes(&g, &default_caps_for(backend)).unwrap();
         let widened = poot_eval::eval(&gw, &inputs, poot_eval::EvalOptions::default())
             .expect("cpu eval (widened)")
             .output
@@ -4667,25 +4636,194 @@ fn decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape() {
     }
 }
 
-/// R486-013 / SC-006: the NVPTX decode-GEMV is kept only for small output dims; `is_decode_gemv`'s
-/// `out_shape[last] > 256` gate sends a larger decode projection to the imported one-thread-per-output
-/// fallback. The fixture prints the branch value (`N` and the 256 threshold). Raising the threshold
-/// past 300 makes `N = 300` select the coalesced GEMV and the assertion fails; lowering it makes the
-/// `N = 256` boundary case fail.
+/// R486-013 / SC-006, POOT-1232 SC-001: the decode-GEMV is kept only below the device's measured width
+/// (`caps.decode_gemv_max_out_cols`), and the ceiling belongs to the caps, not to the backend. The NVPTX fixture
+/// carries the Ampere figure (256), so a 300-column decode projection plans the imported one-thread-per-output
+/// fallback there; the same backend with no measured ceiling keeps the coalesced GEMV, and the SPIR-V backend
+/// with the same ceiling drops it. Mutation: hard-code the 256 ceiling instead of reading the caps field: the
+/// NVPTX row without a ceiling (N=300) loses the GEMV (`assertion failed: gemv_at(Backend::Nvptx, None, 300)`).
 #[test]
-fn nvptx_decode_gemv_excludes_output_dims_above_256() {
-    for (n, expect_gemv) in [(256usize, true), (300usize, false)] {
+fn decode_gemv_width_ceiling_follows_the_caps_not_the_backend() {
+    let gemv_at = |backend: Backend, ceiling: Option<u32>, n: usize| {
         let g = matmul_graph(1, 64, n, GDt::F32);
-        let choice = matmul_choice(&g, Backend::Nvptx);
-        eprintln!(
-            "nvptx decode matmul: N={n}, gemv_n_threshold=256, gemv_eligible={expect_gemv}, choice={choice:?}"
-        );
-        assert_eq!(
-            is_imported(&choice, ImportedKernel::GemvCoalesced),
-            expect_gemv,
-            "N={n} on NVPTX: decode-GEMV eligibility must be {expect_gemv}, got {choice:?}"
-        );
+        let eqn = g
+            .eqns()
+            .iter()
+            .find(|e| matches!(e.op, OpKind::MatMul))
+            .expect("a matmul eqn");
+        let caps = DeviceCaps {
+            decode_gemv_max_out_cols: ceiling,
+            ..default_caps_for(backend)
+        };
+        let (_, choice) = planned_with_choice_caps(&g, eqn, backend, &caps).unwrap();
+        eprintln!("{backend:?} N={n} ceiling={ceiling:?}: {choice:?}");
+        is_imported(&choice, ImportedKernel::GemvCoalesced)
+    };
+    // The Ampere fixture: the boundary is inclusive.
+    assert!(
+        gemv_at(Backend::Nvptx, Some(256), 256),
+        "N=256 is at the ceiling"
+    );
+    assert!(
+        !gemv_at(Backend::Nvptx, Some(256), 300),
+        "N=300 is above it"
+    );
+    // No measured ceiling: the GEMV is kept at any width, on the backend that used to be special-cased.
+    assert!(gemv_at(Backend::Nvptx, None, 300));
+    // A ceiling on another backend applies the same way.
+    assert!(!gemv_at(Backend::SpirvVulkan, Some(256), 300));
+    assert!(gemv_at(Backend::SpirvVulkan, Some(256), 256));
+}
+
+/// POOT-1232 SC-001: whether an E4M3FN tensor has native storage is the device's `e4m3_storage`, not its
+/// backend. The ROCm backend with native E4M3FN storage admits the `ScatterUpdate` it refuses without, and the
+/// SPIR-V backend without it refuses by name. Mutation: gate on the backend again (`Backend::SpirvVulkan |
+/// Backend::Nvptx`): the ROCm row with storage is refused and the SPIR-V row without it is admitted.
+#[test]
+fn e4m3_storage_admission_follows_the_caps_not_the_backend() {
+    let builder = Builder::for_tests();
+    let base = builder
+        .constant("base", TensorType::new(vec![4, 2, 5], GDt::E4M3FN))
+        .unwrap();
+    let src = builder
+        .constant("src", TensorType::new(vec![3, 2, 5], GDt::E4M3FN))
+        .unwrap();
+    let slots = builder
+        .constant("slots", TensorType::new(vec![3], GDt::I32))
+        .unwrap();
+    let output = builder.scatter_update(base, src, slots).unwrap();
+    let graph = builder.finish(output).unwrap();
+    let eqn = &graph.eqns()[0];
+    let plan_with = |backend: Backend, e4m3_storage: bool| {
+        let caps = DeviceCaps {
+            e4m3_storage: if e4m3_storage {
+                poot_target::E4m3Storage::PackedLanes
+            } else {
+                poot_target::E4m3Storage::None
+            },
+            ..default_caps_for(backend)
+        };
+        planned_with_choice_caps(&graph, eqn, backend, &caps).map(|(plan, _)| plan)
+    };
+    let rocm = Backend::AmdGcn(AmdArch::gfx1151());
+    assert!(
+        plan_with(rocm, true).is_ok(),
+        "native storage admits it on ROCm"
+    );
+    let refusal = refusal_of(
+        plan_with(rocm, false),
+        "E4M3FN ScatterUpdate without native storage",
+    );
+    assert_eq!(refusal.missing, Capability::E4m3Storage);
+    let refusal = refusal_of(
+        plan_with(Backend::SpirvVulkan, false),
+        "E4M3FN ScatterUpdate on SPIR-V without native storage",
+    );
+    assert_eq!(refusal.missing, Capability::E4m3Storage);
+    assert!(plan_with(Backend::SpirvVulkan, true).is_ok());
+}
+
+/// POOT-1232 SC-001: which matmuls take a tensor-core body, and which mixed-dtype matmuls the widening pass
+/// leaves alone, is decided by the device's matrix lowering, not by its backend. A SPIR-V backend whose caps
+/// say bf16 WMMA takes the bf16 arm, an NVPTX backend whose caps say no matrix lowering does not, and a
+/// cooperative-matrix device takes f16 operands only. Mutation: make `matmul_nvptx_tc_eligible` ignore
+/// `caps.matrix_lowering`; the NVPTX-without-lowering row is eligible and the row goes red.
+#[test]
+fn tensor_core_eligibility_follows_the_matrix_lowering_not_the_backend() {
+    use crate::dtype_widen::{
+        matmul_amd_tc_eligible, matmul_nvptx_tc_eligible, matmul_spirv_coopmat_eligible,
+    };
+    use poot_target::MatrixLowering;
+    let with = |backend: Backend, matrix_lowering: MatrixLowering| DeviceCaps {
+        matrix_lowering,
+        ..default_caps_for(backend)
+    };
+    let (bf16, f16) = (GDt::BF16, GDt::F16);
+    let spirv_bf16 = with(Backend::SpirvVulkan, MatrixLowering::NvidiaWmmaBf16);
+    assert!(matmul_nvptx_tc_eligible(
+        &spirv_bf16,
+        bf16,
+        bf16,
+        32,
+        32,
+        32
+    ));
+    let nvptx_none = with(Backend::Nvptx, MatrixLowering::None);
+    assert!(!matmul_nvptx_tc_eligible(
+        &nvptx_none,
+        bf16,
+        bf16,
+        32,
+        32,
+        32
+    ));
+    let coop = with(Backend::Nvptx, MatrixLowering::CooperativeMatrixF16);
+    assert!(matmul_spirv_coopmat_eligible(&coop, f16, f16, 32, 32, 32));
+    assert!(!matmul_spirv_coopmat_eligible(
+        &coop, bf16, bf16, 32, 32, 32
+    ));
+    let amd = with(Backend::SpirvVulkan, MatrixLowering::AmdWmmaBf16);
+    assert!(matmul_amd_tc_eligible(&amd, bf16, bf16, 32, 32, 32));
+    assert!(
+        !matmul_amd_tc_eligible(&amd, bf16, bf16, 32, 32, 20),
+        "ragged K"
+    );
+}
+
+/// POOT-1232 SC-001: no planner rule compares a backend variant. Every non-test source file of the crate
+/// (predicates, the planner entry point and its family planners, the dtype rules, the kernel mapping, the packed
+/// lowering table, the multi-device topology) reads the device's caps instead, so a rule cannot be keyed on a name. Mutation:
+/// put `matches!(backend, Backend::Nvptx)` back in any one of them; the test names the file and line.
+#[test]
+fn predicates_and_planner_do_not_compare_backend_variants() {
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
     }
+    let mut files = Vec::new();
+    rust_files(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    // Test sources build backends to plan for; the rules are the subject.
+    files.retain(|f| {
+        !f.components().any(|c| c.as_os_str() == "tests")
+            && !f.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n == "test_support.rs" || n == "tests.rs" || n.starts_with("tests_")
+            })
+    });
+    assert!(
+        files.len() > 30,
+        "the planner sources are listed: {}",
+        files.len()
+    );
+    let mut offenders = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap();
+        // The unit tests of a file build backends to plan for; the rules above them are the subject.
+        let rules = text.split("\n#[cfg(test)]").next().unwrap();
+        for (i, line) in rules.lines().enumerate() {
+            if line.contains("Backend::") && !line.trim_start().starts_with("//") {
+                offenders.push(format!(
+                    "{}:{}: {}",
+                    file.file_name().unwrap().to_string_lossy(),
+                    i + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a planner rule keys on the backend name, not on device caps:\n{}",
+        offenders.join("\n")
+    );
 }
 
 /// Card 522 SC-002: the planner reads the display-watchdog chunk trigger from `DeviceCaps`, not from a
@@ -4934,8 +5072,9 @@ fn every_attention_fixture_plans_the_generated_attention_family_on_every_target(
 }
 
 /// The streaming schedule's lane count is the widest power of two whose partials fit the device's workgroup
-/// memory: `4 * (lanes * dv + 2 * lanes)` bytes. The same decode plans 32, 16, 8 and 4 lanes at value dim 64,
-/// 128, 256 and 512 on the wgpu cap (16352 bytes), and more on the larger ROCm and PTX caps. A fixture
+/// memory: `4 * (lanes * dv + 2 * lanes)` bytes. The same decode plans 64, 64, 32 and 16 lanes at value dim 64,
+/// 128, 256 and 512 on the Vulkan cap (65536 bytes, the adapter's own limit: wgpu no longer asks for the
+/// downlevel 16 KiB), the same as ROCm, and fewer on the PTX cap (49152 bytes). A fixture
 /// device whose workgroup memory cannot hold even one lane at `dv = 512` (2056 bytes) refuses with
 /// `AttentionLds { dv: 512, .. }`, one byte over the boundary plans a single lane, and the same graph plans
 /// on the real caps. Mutation: take the lane width from a constant 256 instead of `caps.lds_bytes`; the
@@ -4952,8 +5091,8 @@ fn attention_lanes_follow_the_device_workgroup_memory() {
     let wgpu = Backend::SpirvVulkan;
     assert_eq!(
         [64, 128, 256, 512].map(|d| lanes(wgpu, d)),
-        [32, 16, 8, 4],
-        "16352 bytes of workgroup memory"
+        [64, 64, 32, 16],
+        "65536 bytes of workgroup memory"
     );
     let rocm = Backend::AmdGcn(AmdArch::gfx1151());
     assert_eq!(
@@ -5005,21 +5144,21 @@ fn the_streaming_schedule_records_its_exact_resources() {
         (
             AttentionFixture::prefill("short prefill", 8, 4, 16, 64),
             wgpu,
-            32usize,
-            8448usize,
+            64usize,
+            4 * (64 * 64 + 2 * 64),
         ),
         (
             AttentionFixture::prefill("long prefill", 8, 4, 512, 128),
             wgpu,
-            16,
-            8320,
+            64,
+            4 * (64 * 128 + 2 * 64),
         ),
         // 192 keys is under two 128-key chunks: the rows are few but a split has nothing to gain.
         (
             AttentionFixture::decode("low-head short-cache decode", 1, 2, 1, 192, 128),
             wgpu,
-            16,
-            8320,
+            64,
+            4 * (64 * 128 + 2 * 64),
         ),
         (
             AttentionFixture::decode("high-head decode", 4, 32, 4, 2048, 128),
@@ -5057,7 +5196,7 @@ fn the_streaming_schedule_records_its_exact_resources() {
 }
 
 /// POOT-1113: the split-KV plan records the exact resources of both its launches. A 2-row decode over 1024
-/// keys on the wgpu caps plans 8 splits of 128 keys over 16 lanes: stage one is `rows * splits` workgroups of
+/// keys on the Vulkan caps plans 8 splits of 128 keys over 64 lanes: stage one is `rows * splits` workgroups of
 /// `lanes` threads with `lanes * (dv + 2) * 4` bytes of workgroup memory; the combine is one workgroup of
 /// `lanes` threads per row with no workgroup memory.
 #[test]
@@ -5066,7 +5205,7 @@ fn the_split_kv_plan_records_the_exact_resources_of_both_launches() {
     let caps = default_caps_for(backend);
     let fixture = AttentionFixture::decode("low-head long decode", 1, 2, 1, 1024, 128);
     let (plan, choice) = attention_planned(fixture, backend, &caps).expect("the decode plans");
-    let (lanes, splits) = (16usize, 8usize);
+    let (lanes, splits) = (64usize, 8usize);
     assert_eq!(
         attention_spec(&choice).schedule,
         kg::AttentionSchedule::SplitKv { lanes, splits }
@@ -5209,7 +5348,7 @@ fn card298_prefill_shaped_mixed_matmul_plans_after_widen() {
             "a raw F32xBF16 -> F32 matmul must still be rejected on {backend:?}: got {r:?}"
         );
 
-        let gp = widen_mismatched_matmul_dtypes(&g, backend).unwrap();
+        let gp = widen_mismatched_matmul_dtypes(&g, &default_caps_for(backend)).unwrap();
         assert_eq!(
             gp.aval(const_id(&gp, "w")).dtype,
             GDt::BF16,
@@ -5238,7 +5377,7 @@ fn card298_prefill_shaped_mixed_matmul_plans_after_widen() {
 fn card298_decode_shaped_mixed_matmul_is_refused_after_widen() {
     let g = mixed_operand_matmul_graph(1, 2048, 2048);
     for backend in [Backend::SpirvVulkan, Backend::AmdGcn(AmdArch::gfx1151())] {
-        let gp = widen_mismatched_matmul_dtypes(&g, backend).unwrap();
+        let gp = widen_mismatched_matmul_dtypes(&g, &default_caps_for(backend)).unwrap();
         let r = try_matmul_plan(&gp, backend);
         assert!(
             matches!(&r, Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering),
@@ -5265,7 +5404,7 @@ fn card298_decode_shaped_mixed_matmul_is_refused_after_widen() {
 fn card298_widen_keeps_amd_wmma_operands_narrow() {
     let gm = mixed_matmul_graph(GDt::BF16, GDt::F32);
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
-    let gp = widen_mismatched_matmul_dtypes(&gm, backend).unwrap();
+    let gp = widen_mismatched_matmul_dtypes(&gm, &default_caps_for(backend)).unwrap();
     for name in ["a", "w"] {
         assert_eq!(
             gp.aval(const_id(&gp, name)).dtype,
@@ -5286,7 +5425,7 @@ fn card298_widen_keeps_amd_wmma_operands_narrow() {
 #[test]
 fn card298_spirv_widens_bf16_pairs_with_casts_not_retypes() {
     let gm = mixed_matmul_graph(GDt::BF16, GDt::F32);
-    let gp = widen_mismatched_matmul_dtypes(&gm, Backend::SpirvVulkan).unwrap();
+    let gp = widen_mismatched_matmul_dtypes(&gm, &default_caps_for(Backend::SpirvVulkan)).unwrap();
     for name in ["a", "w"] {
         assert_eq!(
             gp.aval(const_id(&gp, name)).dtype,
@@ -5412,7 +5551,8 @@ fn an_m1_dense_bf16_contraction_plans_the_generated_gemv_on_every_backend() {
 #[test]
 fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
     let folded = dense_contraction_graph(1, 32, 16);
-    let prepared = widen_mismatched_matmul_dtypes(&folded, Backend::SpirvVulkan).unwrap();
+    let prepared =
+        widen_mismatched_matmul_dtypes(&folded, &default_caps_for(Backend::SpirvVulkan)).unwrap();
     let weight = const_id(&prepared, "w");
     assert_eq!(
         prepared.aval(weight).dtype,
@@ -5440,7 +5580,8 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
         &Default::default(),
         const_id(&mixed, "w")
     ));
-    let widened = widen_mismatched_matmul_dtypes(&mixed, Backend::SpirvVulkan).unwrap();
+    let widened =
+        widen_mismatched_matmul_dtypes(&mixed, &default_caps_for(Backend::SpirvVulkan)).unwrap();
     assert_eq!(widened.aval(const_id(&mixed, "w")).dtype, GDt::BF16);
     assert!(bf16_const_feeds_only_packed_readers(
         &widened,
@@ -5457,7 +5598,7 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
         const_id(&decode_mixed, "w")
     ));
     assert_eq!(
-        widen_mismatched_matmul_dtypes(&decode_mixed, Backend::SpirvVulkan,)
+        widen_mismatched_matmul_dtypes(&decode_mixed, &default_caps_for(Backend::SpirvVulkan))
             .unwrap()
             .aval(const_id(&decode_mixed, "w"))
             .dtype,
@@ -5651,7 +5792,8 @@ fn card381_bf16_const_stays_narrow_for_a_row_gather_table() {
         &Default::default(),
         table
     ));
-    let prepared = widen_mismatched_matmul_dtypes(&folded, Backend::SpirvVulkan).unwrap();
+    let prepared =
+        widen_mismatched_matmul_dtypes(&folded, &default_caps_for(Backend::SpirvVulkan)).unwrap();
     assert_eq!(
         prepared.aval(table).dtype,
         GDt::BF16,
@@ -5688,7 +5830,8 @@ fn card381_bf16_const_stays_narrow_for_a_row_gather_table() {
         &Default::default(),
         id
     ));
-    let prepared = widen_mismatched_matmul_dtypes(&unfolded, Backend::SpirvVulkan).unwrap();
+    let prepared =
+        widen_mismatched_matmul_dtypes(&unfolded, &default_caps_for(Backend::SpirvVulkan)).unwrap();
     assert_eq!(prepared.aval(id).dtype, GDt::BF16);
 }
 

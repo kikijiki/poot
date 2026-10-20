@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use poot_graph_ir::AttentionAttrs;
 use poot_graph_ir::op::{
-    ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep, RowRegion, RowStep,
+    ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep, LocalId, RowRegion, RowStep,
 };
 use poot_graph_ir::{
     BinOp, Builder, Graph, OpKind, Operand, RedOp, Scalar, TensorType, Traced, UnOp, ValueId, ops,
@@ -369,7 +369,7 @@ fn rope_composite_is_the_traced_half_split_rotation() {
 /// add, a residual add and a literal scale, `ops::linear` then the chain the tracer states.
 #[test]
 fn contraction_epilogue_composite_is_the_traced_matmul_then_chain() {
-    let local = FusedOperand::Local;
+    let local = |index: usize| FusedOperand::Local(LocalId::new(index));
     let step = |op, inputs| FusedStep { op, inputs };
     let region = FusedRegion {
         n_inputs: 3,
@@ -381,7 +381,7 @@ fn contraction_epilogue_composite_is_the_traced_matmul_then_chain() {
                 vec![local(4), FusedOperand::Lit(Scalar::F32(0.5))],
             ),
         ],
-        output: 5,
+        output: LocalId::new(5),
         pack: Vec::new(),
     };
     let inputs = [
@@ -406,7 +406,7 @@ fn contraction_epilogue_composite_is_the_traced_matmul_then_chain() {
 /// literal kept in place).
 #[test]
 fn fused_composite_is_the_traced_pointwise_chain() {
-    let local = FusedOperand::Local;
+    let local = |index: usize| FusedOperand::Local(LocalId::new(index));
     let step = |op, inputs| FusedStep { op, inputs };
     let region = FusedRegion {
         n_inputs: 2,
@@ -420,7 +420,7 @@ fn fused_composite_is_the_traced_pointwise_chain() {
             step(FusedOp::Binary(BinOp::Div), vec![local(0), local(4)]),
             step(FusedOp::Binary(BinOp::Mul), vec![local(5), local(1)]),
         ],
-        output: 6,
+        output: LocalId::new(6),
         pack: Vec::new(),
     };
     let inputs = [data(&[3, 7], 27, 3.0), data(&[3, 7], 28, 1.0)];
@@ -434,7 +434,10 @@ fn fused_composite_is_the_traced_pointwise_chain() {
 /// packs two results, which is the un-fused unit `Slice`s, wrapping arithmetic and last-axis `Concat`.
 #[test]
 fn i32_fused_composite_with_pack_lanes_is_the_traced_word_chain() {
-    let lane = |lane| FusedOperand::PackLane { input: 0, lane };
+    let lane = |lane| FusedOperand::PackLane {
+        input: LocalId::new(0),
+        lane,
+    };
     let step = |op, inputs| FusedStep { op, inputs };
     let region = FusedRegion {
         n_inputs: 2,
@@ -442,15 +445,21 @@ fn i32_fused_composite_with_pack_lanes_is_the_traced_word_chain() {
             step(FusedOp::Binary(BinOp::Add), vec![lane(0), lane(1)]),
             step(
                 FusedOp::Binary(BinOp::Mul),
-                vec![FusedOperand::Local(2), FusedOperand::Lit(Scalar::I32(3))],
+                vec![
+                    FusedOperand::Local(LocalId::new(2)),
+                    FusedOperand::Lit(Scalar::I32(3)),
+                ],
             ),
             step(
                 FusedOp::Binary(BinOp::Sub),
-                vec![FusedOperand::Local(3), FusedOperand::Local(1)],
+                vec![
+                    FusedOperand::Local(LocalId::new(3)),
+                    FusedOperand::Local(LocalId::new(1)),
+                ],
             ),
         ],
-        output: 4,
-        pack: vec![2, 4],
+        output: LocalId::new(4),
+        pack: vec![LocalId::new(2), LocalId::new(4)],
     };
     // Words near the I32 range ends, so the region's wrapping arithmetic is exercised.
     let packed = HostTensor::i32(
@@ -483,7 +492,7 @@ fn i32_fused_composite_with_pack_lanes_is_the_traced_word_chain() {
 /// SC-002 (`FusedRow`): a softmax row region is `ops::softmax`, reductions keepdim over the row axis.
 #[test]
 fn fused_row_composite_is_the_traced_softmax() {
-    let local = FusedOperand::Local;
+    let local = |index: usize| FusedOperand::Local(LocalId::new(index));
     let pointwise = |op, inputs| RowStep::Pointwise { op, inputs };
     let region = RowRegion {
         n_inputs: 1,
@@ -501,7 +510,7 @@ fn fused_row_composite_is_the_traced_softmax() {
             },
             pointwise(FusedOp::Binary(BinOp::Div), vec![local(3), local(4)]),
         ],
-        output: 5,
+        output: LocalId::new(5),
     };
     let inputs = [data(&[3, 7], 29, 4.0)];
     assert_composite_matches_chain(
@@ -613,9 +622,12 @@ fn an_error_inside_a_decomposition_names_the_composite_equation() {
         n_inputs: 2,
         steps: vec![FusedStep {
             op: FusedOp::Binary(BinOp::RemU),
-            inputs: vec![FusedOperand::Local(0), FusedOperand::Local(1)],
+            inputs: vec![
+                FusedOperand::Local(LocalId::new(0)),
+                FusedOperand::Local(LocalId::new(1)),
+            ],
         }],
-        output: 2,
+        output: LocalId::new(2),
         pack: Vec::new(),
     };
     let inputs = [
@@ -656,9 +668,12 @@ fn one_step_region(op: BinOp) -> FusedRegion {
         n_inputs: 2,
         steps: vec![FusedStep {
             op: FusedOp::Binary(op),
-            inputs: vec![FusedOperand::Local(0), FusedOperand::Local(1)],
+            inputs: vec![
+                FusedOperand::Local(LocalId::new(0)),
+                FusedOperand::Local(LocalId::new(1)),
+            ],
         }],
-        output: 2,
+        output: LocalId::new(2),
         pack: Vec::new(),
     }
 }
@@ -726,7 +741,7 @@ fn every_step_of_a_narrow_epilogue_rounds_through_the_head_dtype() {
     let (one, tie) = (0x3f80u16, 0x3b80u16);
     let tensor = |words: Vec<u16>| HostTensor::bf16(vec![1, 1], words);
     let inputs = [tensor(vec![one]), tensor(vec![one]), tensor(vec![tie])];
-    let local = FusedOperand::Local;
+    let local = |index: usize| FusedOperand::Local(LocalId::new(index));
     let region = FusedRegion {
         n_inputs: 2,
         steps: vec![
@@ -739,7 +754,7 @@ fn every_step_of_a_narrow_epilogue_rounds_through_the_head_dtype() {
                 inputs: vec![local(2), local(1)],
             },
         ],
-        output: 3,
+        output: LocalId::new(3),
         pack: Vec::new(),
     };
     let op = OpKind::ContractionEpilogue {

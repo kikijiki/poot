@@ -110,9 +110,7 @@ fn implied_op_numerics(op: &OpKind, out_dtype: DType) -> NumericsProperty {
         | OpKind::DenseContraction { .. }
         | OpKind::GroupedDenseContraction { .. }
         | OpKind::DenseRowGather { .. }
-        | OpKind::IndexedMatMul
-        | OpKind::PackI8
-        | OpKind::UnpackI8 { .. } => NumericsProperty::Narrowing,
+        | OpKind::IndexedMatMul => NumericsProperty::Narrowing,
         OpKind::Cast { to }
             if matches!(to.class(), DTypeClass::StorageOnly | DTypeClass::Packed) =>
         {

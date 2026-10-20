@@ -23,9 +23,9 @@ use poot_graph_plan::{
 };
 use poot_models::model::{Model, StepShape, StepSpec};
 use poot_models::registry::{Fixture, Registry};
-use poot_quant::weights::{WeightId, WeightRole};
 use poot_target::{AmdArch, Backend};
 use poot_tensor::DType;
+use poot_weights::{WeightId, WeightRole};
 
 /// The KV positions of every traced step.
 const CAPACITY: usize = 8;
@@ -276,8 +276,11 @@ fn ptx_and_rocm_preparation_is_untouched_by_this_card() {
     let (model, _) = qwen35();
     let traced = decode_graph(&*model);
     for backend in [Backend::Nvptx, Backend::AmdGcn(AmdArch::gfx1151())] {
-        let prepared =
-            poot_graph_plan::dtype_widen::widen_mismatched_matmul_dtypes(&traced, backend).unwrap();
+        let prepared = poot_graph_plan::dtype_widen::widen_mismatched_matmul_dtypes(
+            &traced,
+            &poot_test_util::device_caps::default_caps_for(backend),
+        )
+        .unwrap();
         assert!(
             !prepared
                 .eqns()

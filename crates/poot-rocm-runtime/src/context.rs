@@ -149,6 +149,9 @@ pub struct RocmContext {
     /// `HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT` of the GPU agent, cached at construction (card 653);
     /// `None` if the query failed ([`Self::device_caps`] then reports the ROCm default).
     pub(crate) compute_units: Option<u32>,
+    /// The launch limits the GPU agent reports (workgroup and grid extents, group-segment size), read at
+    /// open. [`Self::device_caps`] reports them; a failed query fails the open, it is never defaulted.
+    pub(crate) limits: crate::discovery::AgentLimits,
     /// Work a timed-out wait left in flight, and the poison flag that follows it.
     pub(crate) timeouts: TimeoutLeaks,
     /// Replays enqueued and not yet completed, oldest first ([`RocmContext::enqueue_graph_batched`]);
@@ -605,18 +608,17 @@ impl RocmContext {
     }
 
     /// The device-capability descriptor the planner reads (card 522). The wavefront size, VRAM total,
-    /// compute-unit count and tensor-core family are this agent's own queries. HSA exposes no group-segment
-    /// (LDS) size or per-dimension grid-count query this crate's discovery layer has found, so those
-    /// two fields, and the workgroup limits ([`poot_target::AMDGPU_MAX_WORKGROUP_INVOCATIONS`], the
-    /// AMDGPU backend's documented ceiling), are the vendor-scoped default; the display watchdog and the
-    /// card-095 tiled-GEMM miscompile are wgpu/RADV codegen-path defects this backend does not share
-    /// (HSA queues dispatches on hardware with no host display-refresh TDR), so both are absent here.
+    /// compute-unit count, tensor-core family, workgroup and grid limits and the workgroup-local (LDS) size
+    /// are this agent's own HSA queries, taken at open. The display watchdog and the card-095 tiled-GEMM
+    /// miscompile are wgpu/RADV codegen-path defects this backend does not share (HSA queues dispatches on
+    /// hardware with no host display-refresh TDR), so both are absent here.
     pub fn device_caps(&self) -> poot_target::DeviceCaps {
         caps_from_agent(&AgentProbe {
             vram_total_bytes: self.vram_total_bytes,
             isa_name: &self.isa_name,
             wavefront: self.wavefront,
             compute_units: self.compute_units,
+            limits: self.limits,
         })
     }
 
@@ -651,16 +653,22 @@ pub(crate) struct AgentProbe<'a> {
     /// `HSA_AGENT_INFO_WAVEFRONT_SIZE`; 0 is not a wavefront size.
     pub(crate) wavefront: u32,
     pub(crate) compute_units: Option<u32>,
+    pub(crate) limits: crate::discovery::AgentLimits,
 }
 
 pub(crate) fn caps_from_agent(probe: &AgentProbe<'_>) -> poot_target::DeviceCaps {
     let defaults = poot_target::DeviceCaps::rocm_default();
+    let tensor_core = poot_target::TensorCoreSupport::from_device_name(probe.isa_name);
     poot_target::DeviceCaps {
         max_buffer_bytes: if probe.vram_total_bytes == 0 {
             defaults.max_buffer_bytes
         } else {
             probe.vram_total_bytes
         },
+        lds_bytes: probe.limits.group_segment_bytes,
+        max_workgroup_size: probe.limits.workgroup_max_dim,
+        max_workgroup_invocations: probe.limits.workgroup_max_size,
+        max_grid: probe.limits.grid_max_dim,
         subgroup: if probe.wavefront == 0 {
             poot_target::Queried::Unknown
         } else {
@@ -669,7 +677,8 @@ pub(crate) fn caps_from_agent(probe: &AgentProbe<'_>) -> poot_target::DeviceCaps
                 max_size: probe.wavefront,
             })
         },
-        tensor_core: poot_target::TensorCoreSupport::from_device_name(probe.isa_name),
+        tensor_core,
+        matrix_lowering: poot_target::MatrixLowering::amd(tensor_core),
         compute_units: probe.compute_units.unwrap_or(defaults.compute_units),
         // 0 is the failed one-time pool query: unknown, not an empty device.
         memory_budget_bytes: (probe.vram_total_bytes != 0).then_some(probe.vram_total_bytes),
@@ -706,11 +715,21 @@ impl Drop for RocmContext {
 #[cfg(test)]
 mod caps_tests {
     use super::*;
+    use crate::discovery::AgentLimits;
     use poot_target::{DeviceCaps, Queried, SubgroupSupport, TensorCoreSupport};
 
-    /// SC-003: sentinel agent values (a wave64 CDNA part with 7 compute units and 12345 bytes of VRAM)
-    /// come out in exactly the fields that name them. Mutation: report the RDNA default wavefront (32)
-    /// or the default compute-unit count (40), and the equality fails on that field.
+    /// Limits no real device reports, so a field that comes from a preset instead of the probe is visible.
+    const SENTINEL_LIMITS: AgentLimits = AgentLimits {
+        workgroup_max_dim: [1000, 500, 60],
+        workgroup_max_size: 777,
+        grid_max_dim: [11, 22, 33],
+        group_segment_bytes: 12_288,
+    };
+
+    /// SC-002/SC-003: sentinel agent values (a wave64 CDNA part with 7 compute units, 12345 bytes of VRAM and
+    /// odd launch limits) come out in exactly the fields that name them. Mutation: return the preset's
+    /// workgroup memory, workgroup or grid limits (`DeviceCaps::rocm_default`), or the RDNA default wavefront
+    /// (32) or compute-unit count (40), and the equality fails on that field.
     #[test]
     fn agent_values_come_out_in_their_own_caps_fields() {
         let caps = caps_from_agent(&AgentProbe {
@@ -718,6 +737,7 @@ mod caps_tests {
             isa_name: "amdgcn-amd-amdhsa--gfx90a:sramecc+:xnack-",
             wavefront: 64,
             compute_units: Some(7),
+            limits: SENTINEL_LIMITS,
         });
         assert_eq!(caps.max_buffer_bytes, 12_345);
         assert_eq!(
@@ -730,36 +750,84 @@ mod caps_tests {
         assert_eq!(caps.tensor_core, TensorCoreSupport::CdnaMfma);
         assert_eq!(caps.compute_units, 7);
         assert_eq!(caps.memory_budget_bytes, Some(12_345), "the pool size");
-        assert_eq!(
-            caps.max_workgroup_size,
-            [poot_target::AMDGPU_MAX_WORKGROUP_INVOCATIONS; 3]
-        );
+        assert_eq!(caps.lds_bytes, 12_288, "the group-segment size");
+        assert_eq!(caps.max_workgroup_size, [1000, 500, 60]);
+        assert_eq!(caps.max_workgroup_invocations, 777);
+        assert_eq!(caps.max_grid, [11, 22, 33]);
     }
 
-    /// Receipt (SC-003): the documented AMDGPU workgroup ceiling the caps report equals what the live HSA
-    /// agent itself reports (`HSA_AGENT_INFO_WORKGROUP_MAX_SIZE` and `_MAX_DIM`), and the reported
-    /// subgroup is the agent's own wavefront. A skip (no ROCm device) is reported as one.
+    /// The text of the first GPU agent in `rocminfo`'s output: from its `Device Type: GPU` line to the next
+    /// agent.
+    fn first_gpu_agent(rocminfo: &str) -> &str {
+        let from = rocminfo
+            .find("Device Type:             GPU")
+            .expect("rocminfo lists a GPU agent");
+        let rest = &rocminfo[from..];
+        &rest[..rest.find("\nAgent ").unwrap_or(rest.len())]
+    }
+
+    /// The first number after `label` in `agent`, as `rocminfo` prints it (`1024(0x400)`).
+    fn number_after(agent: &str, label: &str) -> u64 {
+        let tail = &agent[agent
+            .find(label)
+            .unwrap_or_else(|| panic!("rocminfo has {label:?}"))
+            + label.len()..];
+        tail.trim_start()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("a number follows {label:?}"))
+    }
+
+    /// Receipt (SC-002): the workgroup, grid and workgroup-memory limits the caps report equal what
+    /// `rocminfo` prints for the GPU agent, and the subgroup is the agent's own wavefront. A skip (no ROCm
+    /// device, or no `rocminfo` on PATH) is reported as one. Mutation: report the preset
+    /// (`DeviceCaps::rocm_default`): its grid x is `u32::MAX` where this device allows 2147483647, and its
+    /// workgroup memory is a guess.
     #[test]
-    fn a_live_agent_reports_the_workgroup_ceiling_the_caps_document() {
-        use std::ffi::c_void;
+    fn a_live_agent_reports_the_limits_rocminfo_prints() {
         let Ok(ctx) = RocmContext::new() else {
-            eprintln!(
-                "SKIP a_live_agent_reports_the_workgroup_ceiling_the_caps_document: no ROCm device"
-            );
+            eprintln!("SKIP a_live_agent_reports_the_limits_rocminfo_prints: no ROCm device");
             return;
         };
-        // hsa.h: HSA_AGENT_INFO_WORKGROUP_MAX_DIM = 7 (uint16_t[3]), _MAX_SIZE = 8 (uint32_t).
-        let (mut dims, mut size) = ([0u16; 3], 0u32);
-        // SAFETY: both attributes write exactly the documented type into the pointer given.
-        unsafe {
-            let get = ctx.hsa.hsa.funcs.hsa_agent_get_info;
-            assert_eq!(get(ctx.gpu_agent, 7, dims.as_mut_ptr().cast::<c_void>()), 0);
-            assert_eq!(get(ctx.gpu_agent, 8, (&raw mut size).cast::<c_void>()), 0);
+        let Ok(output) = std::process::Command::new("rocminfo").output() else {
+            eprintln!("SKIP a_live_agent_reports_the_limits_rocminfo_prints: no rocminfo on PATH");
+            return;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        if text.matches("Device Type:             GPU").count() != 1 {
+            eprintln!(
+                "SKIP a_live_agent_reports_the_limits_rocminfo_prints: not exactly one GPU agent"
+            );
+            return;
         }
+        let agent = first_gpu_agent(&text);
         let caps = ctx.device_caps();
-        eprintln!("live rocm caps: {caps:?}; agent workgroup dims {dims:?} size {size}");
-        assert_eq!(caps.max_workgroup_invocations, size);
-        assert_eq!(caps.max_workgroup_size, dims.map(u32::from));
+        eprintln!("live rocm caps: {caps:?}");
+        let per_dim = |section: &str| {
+            let from = agent
+                .find(section)
+                .unwrap_or_else(|| panic!("rocminfo has {section:?}"));
+            let block = &agent[from..];
+            ["    x ", "    y ", "    z "].map(|axis| number_after(block, axis) as u32)
+        };
+        assert_eq!(
+            u64::from(caps.max_workgroup_invocations),
+            number_after(agent, "  Workgroup Max Size:")
+        );
+        assert_eq!(
+            caps.max_workgroup_size,
+            per_dim("  Workgroup Max Size per Dimension:")
+        );
+        assert_eq!(caps.max_grid, per_dim("  Grid Max Size per Dimension:"));
+        let group = agent
+            .find("Segment:                 GROUP")
+            .expect("rocminfo lists the group segment");
+        assert_eq!(
+            u64::from(caps.lds_bytes),
+            number_after(&agent[group..], "Size:") * 1024,
+            "workgroup memory is the group segment's size"
+        );
         assert_eq!(
             caps.subgroup,
             Queried::Known(SubgroupSupport::Present {
@@ -778,6 +846,7 @@ mod caps_tests {
             isa_name: "gfx1151",
             wavefront: 0,
             compute_units: None,
+            limits: SENTINEL_LIMITS,
         });
         assert_eq!(caps.subgroup, Queried::Unknown);
         assert_eq!(

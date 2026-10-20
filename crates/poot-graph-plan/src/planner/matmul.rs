@@ -16,7 +16,7 @@ use crate::predicates::{
     is_tiled_gemm_in, packed_contraction_m_per_block, tiled_gemm_plan,
 };
 use crate::refusal::{FusedStepGap, Site};
-use poot_graph_ir::ContractionRows;
+use poot_graph_ir::{ContractionRows, LocalId};
 use poot_target::{Backend, DeviceCaps};
 
 /// The launch of a `Tiled` contraction of `tiles` workgroups of `tile * tile` threads: the tiles laid out on the X
@@ -105,7 +105,6 @@ pub(super) fn matmul_route(
     eqn: &Eqn,
     out_shape: &[usize],
     out_numel: usize,
-    backend: Backend,
     odt: DType,
     caps: &DeviceCaps,
 ) -> RoutedMatMul {
@@ -139,15 +138,14 @@ pub(super) fn matmul_route(
     // Card 235: factored into `dtype_widen::matmul_{amd_tc,nvptx_tc}_eligible` so the
     // widen-mismatched-dtype-operand transform reuses the same eligibility decision.
     let (a_dt, b_dt) = (g.aval(ids[0]).dtype, g.aval(ids[1]).dtype);
-    let amd_tc = matmul_amd_tc_eligible(backend, a_dt, b_dt, mm, nn, kk);
-    let tc = matmul_nvptx_tc_eligible(backend, a_dt, b_dt, mm, nn, kk);
+    let amd_tc = matmul_amd_tc_eligible(caps, a_dt, b_dt, mm, nn, kk);
+    let tc = matmul_nvptx_tc_eligible(caps, a_dt, b_dt, mm, nn, kk);
     // Card 154: RADV cooperative-matrix (SPIR-V/Vulkan tensor cores). F16 operands (RADV has no
     // VK_KHR_shader_bfloat16), 16-aligned M/N/K, any batch dims (see `matmul_spirv_coopmat_eligible`). F32
     // output only (config 13 has no f16-accumulate variant).
-    let coopmat =
-        odt == DType::F32 && matmul_spirv_coopmat_eligible(backend, a_dt, b_dt, mm, nn, kk);
+    let coopmat = odt == DType::F32 && matmul_spirv_coopmat_eligible(caps, a_dt, b_dt, mm, nn, kk);
     let lowers_mixed_dtypes = amd_tc || tc || coopmat;
-    let route = if is_decode_gemv_in(g, backend, eqn, out_shape, out_numel, caps) {
+    let route = if is_decode_gemv_in(g, eqn, out_shape, out_numel, caps) {
         MatMulRoute::DecodeGemv
     } else if amd_tc {
         MatMulRoute::AmdTensorCore
@@ -155,9 +153,9 @@ pub(super) fn matmul_route(
         MatMulRoute::NvptxTensorCore
     } else if coopmat {
         MatMulRoute::Coopmat
-    } else if is_tiled_gemm_in(g, backend, eqn, out_shape, out_numel) {
+    } else if is_tiled_gemm_in(g, eqn, out_shape, out_numel, caps) {
         MatMulRoute::TiledGemm
-    } else if is_batched_tiled_gemm_in(g, backend, eqn, out_shape, out_numel, caps) {
+    } else if is_batched_tiled_gemm_in(g, eqn, out_shape, out_numel, caps) {
         MatMulRoute::BatchedTiledGemm
     } else if is_decode_attn_gemv_in(g, eqn, out_shape, out_numel, caps) {
         MatMulRoute::AttnGemv
@@ -174,12 +172,7 @@ pub(super) fn matmul_route(
 /// the epilogue fuse rule forms a [`OpKind::ContractionEpilogue`] only over such a head, so no head loses a faster schedule (a tensor-core,
 /// tiled or decode-GEMV `MatMul`) to gain a fused store. The generated Gemv, serial and tiled bodies carry an
 /// epilogue; a `MatMul` head's fragment, GEMV and imported schedules do not.
-pub(crate) fn epilogue_head_lowers(
-    g: &Graph,
-    eqn: &Eqn,
-    backend: Backend,
-    caps: &DeviceCaps,
-) -> bool {
+pub(crate) fn epilogue_head_lowers(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> bool {
     let tables = GraphTables::from(g);
     let out_shape = &g.aval(eqn.out).shape;
     let out_numel = out_numel_saturating(out_shape);
@@ -192,7 +185,6 @@ pub(crate) fn epilogue_head_lowers(
                         eqn,
                         out_shape,
                         out_numel,
-                        backend,
                         g.aval(eqn.out).dtype,
                         caps,
                     )
@@ -211,7 +203,7 @@ pub(crate) fn epilogue_head_lowers(
                 crate::packed_block_float::PACKED_LOWERING,
                 *descriptor,
                 crate::packed_block_float::PackedKernelOpKind::Contraction,
-                backend,
+                caps,
             )
             .is_ok()
                 && match rows {
@@ -266,7 +258,7 @@ pub(super) fn epilogue_of(
         });
     }
     let n_inputs = region.n_inputs;
-    let local = |id: usize| match id {
+    let local = |id: LocalId| match id.index() {
         0 => kg::EpilogueInput::Head,
         id if id < n_inputs => kg::EpilogueInput::Leaf(id - 1),
         id => kg::EpilogueInput::Step(id - n_inputs),
@@ -276,7 +268,7 @@ pub(super) fn epilogue_of(
         .iter()
         .map(|step| {
             check_widening_step(site, step.op, &step.inputs, |id| {
-                (1..n_inputs).contains(&id)
+                (1..n_inputs).contains(&id.index())
             })?;
             Ok(kg::EpilogueStep {
                 op: map_fused_op(site, step.op)?,
@@ -328,7 +320,7 @@ pub(super) fn plan(
             let (a, b) = (shape(ids[0]), shape(ids[1]));
             let r = out_shape.len();
             let (nn, kk) = (out_shape[r - 1], a[a.len() - 1]);
-            let routed = matmul_route(g, eqn, out_shape, out_numel, backend, odt, caps);
+            let routed = matmul_route(g, eqn, out_shape, out_numel, odt, caps);
             let shapes = || MatmulShapes {
                 out_shape: out_shape.to_vec(),
                 a_shape: a.clone(),
@@ -341,7 +333,7 @@ pub(super) fn plan(
                     dt: fty(odt),
                     epilogue: None,
                     shapes: shapes(),
-                    fold: elementwise_fold(g, backend, eqn, out_shape, out_numel, caps),
+                    fold: elementwise_fold(g, eqn, out_shape, out_numel, caps),
                 }))
             };
             // Every arm below except the tensor-core ones (`amd_tc`/`tc`, which read bf16 operands by
@@ -530,7 +522,7 @@ pub(super) fn plan(
                     a_shape: shape(ids[0]),
                     b_shape: shape(ids[1]),
                 },
-                fold: elementwise_fold(g, backend, eqn, out_shape, out_numel, caps),
+                fold: elementwise_fold(g, eqn, out_shape, out_numel, caps),
             }))?
         }
         OpKind::Iota { .. } => {

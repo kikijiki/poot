@@ -22,6 +22,7 @@ test-support = ["dep:poot-test-util"]
 [dependencies]
 poot-graph-ir = { workspace = true, features = ["test-support"] }
 poot-quant = { workspace = true, features = ["test-support"] }
+poot-weights = { workspace = true, features = ["test-support"] }
 poot-tensor = { workspace = true, features = ["test-support"] }
 libm.workspace = true
 # `fill`, the seeded fill the live-attention fixture draws its operands from; present only under `test-support`.

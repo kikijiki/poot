@@ -25,8 +25,8 @@ use poot_graph_ir::{
     BinOp, Builder, BuilderError, Graph, IndexRange, Outputs, Slot, StateRole, TensorType, Traced,
     ValidationId, ops,
 };
-use poot_quant::weights::{NormRole, WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
+use poot_weights::{NormRole, WeightId, WeightMap, WeightRole};
 
 use super::embed::{EMBEDS, embeds_input};
 use super::embed::{EmbedInputs, Embedding};
@@ -910,12 +910,11 @@ pub(crate) mod oracle {
 
     use poot_eval::{EvalOptions, Value};
     use poot_graph_ir::{Graph, PackedSourceName, Slot, Storage, ValueId};
-    use poot_quant::weights::{
-        DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightStore, WeightView,
-    };
+    use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
     use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef};
     use poot_tensor::DType;
     use poot_tensor::HostTensor;
+    use poot_weights::{WeightId, WeightMap, WeightView};
 
     use crate::model::{HiddenCarry, LogitRows, StepShape, StepSpec};
 
@@ -1494,7 +1493,7 @@ mod tests {
 
     use crate::model::ShapeReason;
 
-    use poot_quant::weights::{AttnRole, FfnRole};
+    use poot_weights::{AttnRole, FfnRole};
 
     use super::super::norm::NormKind;
     use super::oracle::{self, Fx};

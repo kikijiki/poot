@@ -8,14 +8,16 @@
 //! queue: it resubmits the recorded command buffers verbatim, fence-waiting after each, so by the time
 //! `replay` returns `Ok` the work is done (`synchronize` only raises the replay's staged kernel fault).
 //!
-//! A long recording is cut into several command buffers by the planner's `Dispatch::work` weight, so a
-//! replay is several submissions with a fence wait between them, never one past-watchdog submission
-//! (the same bounds `WgpuDevice` flushes on).
+//! On a device with a watchdog budget a long recording is cut into several command buffers by the planner's
+//! `Dispatch::work` weight ([`FlushPolicy`], the bounds `WgpuDevice` flushes on), so a replay is several
+//! submissions with a fence wait between them, never one past-watchdog submission. A device with no budget
+//! records a stage as one command buffer.
 //!
 //! `copy` is `vkCmdCopyBuffer` in the same command stream, ordered by the barrier every command carries.
 
 use poot_executor::{
-    Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind, MeasuredDeviceTime,
+    Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, FlushPolicy, LaunchKind,
+    MeasuredDeviceTime,
 };
 use poot_graph_plan::Target;
 use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot};
@@ -27,12 +29,6 @@ use poot_vulkan_runtime::{
 use std::sync::Arc;
 
 use crate::error::VulkanGpuError;
-
-/// Dispatches one command buffer may hold before a replay submits it on its own, and the summed
-/// planner work (`Dispatch::work`) it may hold: the watchdog-safe bounds `WgpuDevice` flushes a submit
-/// on, a production default and not environment-tunable (ADR-0104 decision 5's precedent).
-const FLUSH_EVERY: usize = 1024;
-const FLUSH_WORK: u64 = 4_000_000;
 
 /// Add one replay's measured time to the step's: durations sum, the spans of successive submissions
 /// add (the gap between them is not device time), and each dispatch keeps its place in the step.
@@ -78,10 +74,11 @@ struct OpenStep {
 }
 
 impl OpenStep {
-    /// Whether adding a command of `work` would push the open command buffer past either bound.
-    fn would_overflow(&self, work: u64) -> bool {
-        self.commands_since_cut >= FLUSH_EVERY
-            || (self.commands_since_cut > 0 && self.work_since_cut + work > FLUSH_WORK)
+    /// Whether adding a command of `work` would push the open command buffer past the flush policy's bounds.
+    fn would_overflow(&self, policy: Option<FlushPolicy>, work: u64) -> bool {
+        policy.is_some_and(|policy| {
+            policy.must_cut(self.commands_since_cut, self.work_since_cut, work)
+        })
     }
 }
 
@@ -90,6 +87,9 @@ impl OpenStep {
 /// how a recording is cut into submissions.
 pub struct VulkanDevice {
     ctx: Context,
+    /// How a long recording is cut into command buffers; `None` on a device with no watchdog budget. Derived
+    /// from the context's caps once, at open.
+    flush: Option<FlushPolicy>,
     timing: GraphTiming,
     /// The open step's recording so far; `Some` between `begin` and `finish`.
     open: Option<OpenStep>,
@@ -116,8 +116,10 @@ impl VulkanDevice {
         if timing == GraphTiming::PerDispatch && !ctx.timestamps_supported() {
             return Err(poot_vulkan_runtime::RuntimeError::TimestampsUnavailable.into());
         }
+        let flush = FlushPolicy::of(&ctx.device_caps());
         Ok(Self {
             ctx,
+            flush,
             timing,
             open: None,
             fault: None,
@@ -136,7 +138,7 @@ impl VulkanDevice {
             .open
             .as_mut()
             .ok_or(VulkanGpuError::NotRecording { op })?;
-        if step.would_overflow(work) {
+        if step.would_overflow(self.flush, work) {
             self.ctx.cut_graph(&mut step.graph)?;
             step.commands_since_cut = 0;
             step.work_since_cut = 0;

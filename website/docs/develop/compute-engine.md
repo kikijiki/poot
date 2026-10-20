@@ -132,7 +132,8 @@ use poot_graph_plan::staged::{
     compile_staged, DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet,
 };
 use poot_graph_plan::{CompileLimits, CompileOptions};
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::WeightMap;
 
 // use Builder / ops::* to trace the graph, as above; each Storage::Const the graph declares is a
 // WeightId::const_name, `store` holds the stored tensors and `map` (a WeightMap built over it)

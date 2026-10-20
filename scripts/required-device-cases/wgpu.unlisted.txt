@@ -8,6 +8,8 @@ poot-executor	binder::tests::an_unaligned_expert_table_binds_one_const_with_word
 poot-executor	coordinator::schedule::tests::a_cycle_among_rows_refuses_the_whole_plan	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
 poot-executor	coordinator::schedule::tests::malformed_participants_and_duplicate_ids_are_refused_by_name	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
 poot-executor	coordinator::schedule::tests::point_to_point_rows_are_admitted_in_dependency_order	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	device::flush_policy_tests::a_device_has_a_flush_policy_exactly_when_it_has_a_watchdog_budget	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	device::flush_policy_tests::a_run_is_cut_at_either_bound_and_never_when_empty	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
 poot-executor	engine::aie_engine_tests::a_chain_is_one_linked_region_dispatched_once_with_no_buffer_for_its_intermediates	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
 poot-executor	engine::aie_engine_tests::a_linked_artifact_past_the_targets_instruction_limit_is_refused_before_load	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
 poot-executor	engine::aie_engine_tests::a_missing_link_driver_is_a_typed_load_error_and_loads_nothing	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
@@ -94,7 +96,6 @@ poot-llm::wgpu_qwen2	prefill_kv_paged_matches_contiguous	poot-llm `wgpu_qwen2` b
 poot-llm::wgpu_qwen2	prefill_runs_a_flash_fused_compiled_graph_and_matches_cpu	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
 poot-llm::wgpu_qwen2	qwen2_decode_gpu_resident_matches_cpu	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
 poot-llm::wgpu_qwen2	qwen2_masked_decode_gpu_matches_cpu	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
-poot-wgpu-device	packed_production_tests::packed_kv_read_path_gpu_matches_cpu	wgpu device unit row; selected by package so none goes unrun
 poot-wgpu-device	packed_production_tests::packed_linear_real_projection_dims_gpu_matches_dense	wgpu device unit row; selected by package so none goes unrun
 poot-wgpu-device	packed_production_tests::wgpu_q6k_gemv_determinism_probe	wgpu device unit row; selected by package so none goes unrun
 poot-wgpu-device	parity_tests::run_once_matches_a_hand_computed_elementwise_add	wgpu device unit row; selected by package so none goes unrun
@@ -144,9 +145,6 @@ poot-wgpu-device::graph	gather_scatter::gather_nonaxis0_gpu_matches_cpu	wgpu gra
 poot-wgpu-device::graph	gather_scatter::gather_nonaxis0_gpu_matches_cpu_over_random_shapes	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	gather_scatter::gather_nonaxis0_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	gather_scatter::index_remap_layout_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
-poot-wgpu-device::graph	gather_scatter::scatter_axis0_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
-poot-wgpu-device::graph	gather_scatter::scatter_axis0_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
-poot-wgpu-device::graph	gather_scatter::scatter_composition_gpu_matches_cpu_over_random_graphs	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	gather_scatter::scatter_update_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	gather_scatter::scatter_update_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	gemm::batched_tiled_gemm_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
@@ -179,7 +177,6 @@ poot-wgpu-device::graph	norms_rope::layernorm_gpu_matches_cpu	wgpu graph-executi
 poot-wgpu-device::graph	norms_rope::log_and_softplus_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	norms_rope::rmsnorm_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	norms_rope::rope_fused_gpu_matches_cpu_decomposition	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
-poot-wgpu-device::graph	norms_rope::round_and_quantize_composition_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	packed_kv::batched_decode_gemv_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	packed_kv::decode_gemv_random_shapes_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	packed_kv::nvptx_decode_gemv_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
@@ -203,8 +200,6 @@ poot-wgpu-device::graph	ssm_linear_attn::mamba2_block_gpu_matches_cpu	wgpu graph
 poot-wgpu-device::graph	ssm_linear_attn::mamba2_ssd_decode_gpu_fuzz_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	ssm_linear_attn::mamba2_ssd_decode_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	ssm_linear_attn::mamba_core_path_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
-poot-wgpu-device::graph	tiled_dequant::pack_unpack_i8_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
-poot-wgpu-device::graph	tiled_dequant::pack_unpack_i8_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::stress	column_vector_matmul_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
 poot-wgpu-device::stress	deep_fused_chain_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
 poot-wgpu-device::stress	elementwise_large_1024_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun

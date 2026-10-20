@@ -88,7 +88,7 @@ pub(super) fn plan(
     // One thread per output buffer unit, folded onto a 2-D grid past the device's x-grid cap.
     let generate = |op: MovementOp| {
         let spec = MovementSpec::new(storage.clone(), out_shape.to_vec(), op);
-        let two_d = is_elementwise_2d_in(g, backend, eqn, out_shape, out_numel, caps);
+        let two_d = is_elementwise_2d_in(g, eqn, out_shape, out_numel, caps);
         Planned::generated(
             site,
             KernelRequest::Movement(spec.folded(two_d)),
@@ -137,15 +137,6 @@ pub(super) fn plan(
                 axis: *axis,
                 index_numel: numel(&index_shape),
             })?
-        }
-        OpKind::Scatter { axis: 0 } => generate(MovementOp::PermuteRows {
-            src_shape: shape(ids[0]),
-        })?,
-        OpKind::Scatter { axis: 1.. } => {
-            unreachable!(
-                "a non-axis-0 scatter is refused in planner.rs (Capability::ScatterNonZeroAxis) \
-                 before this per-op dispatch runs"
-            )
         }
         OpKind::ScatterUpdate => {
             let src_shape = shape(ids[1]);

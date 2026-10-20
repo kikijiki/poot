@@ -17,7 +17,7 @@
 
 use poot_graph_ir::ops::{sigmoid, silu};
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced};
-use poot_quant::weights::{HyperRole, WeightId, WeightMap};
+use poot_weights::{HyperRole, WeightId, WeightMap};
 
 use crate::components::linear::{Weight, WeightError, linear};
 use crate::components::norm::NormParams;

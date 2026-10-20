@@ -43,8 +43,6 @@ indexed_matmul f32 x bf16 w	b86f1eb2c9d01b0b
 iota	50c01ed756a4aa90
 matmul	883d9902703ac7db
 contraction_epilogue	e5bfe64acdc39f72
-pack_i8	728bef064ec9ff8c
-pack_i8 exact i32 (words only)	728bef064ec9ff8c
 random_uniform	9de26ddac4756aa1
 reduce sum	930b6c43910d2d40
 reshape	6614b4737724d95d
@@ -53,12 +51,9 @@ sample_token_greedy	c6c6d2655604b20b
 sample_token_Gumbel	c2c25e34b5024edc
 sample_token_GumbelTopK	c2c25e34b5024edc
 sample_token_GumbelTopKTopP	c2c25e34b5024edc
-scatter	0106ad912c7e5c8c
-scatter bf16 src	0106ad912c7e5c8c
 scatter_update	93b7495b2b1e6c13
 select i32	683317e7900f89bd
 slice	58f208b4ac1adf03
 transpose	736b697e806eed9d
 unary f32 neg	aafae1ea68cb474b
 unary i32 not	b8bf89a8569ceadf
-unpack_i8	ebf8fdced7b4a8a0

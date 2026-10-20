@@ -9,7 +9,7 @@
 //! store lookup reads.
 
 use poot_quant::SourceRole;
-use poot_quant::weights::WeightId;
+use poot_weights::WeightId;
 
 use crate::packed_source::PackedSourceName;
 
@@ -82,7 +82,7 @@ impl WeightRef {
 
 #[cfg(test)]
 mod tests {
-    use poot_quant::weights::{AttnRole, WeightRole};
+    use poot_weights::{AttnRole, WeightRole};
 
     use super::*;
 

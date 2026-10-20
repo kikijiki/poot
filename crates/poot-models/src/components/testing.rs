@@ -13,15 +13,14 @@ use poot_load::plan::default_workers;
 use poot_quant::SourceRole;
 use poot_quant::StoredBytes;
 use poot_quant::format::WeightFormat;
-use poot_quant::weights::{
-    AttnRole, DenseWeight, FfnRole, HandleFormat, WeightEntry, WeightRole, WeightStore,
-};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
+use poot_weights::{AttnRole, FfnRole, HandleFormat, WeightRole};
 
 use super::standard::oracle::{self, run_step};
 use crate::model::{LogitRows, Model, ModelError, StepShape, StepSpec};
 use crate::registry::{FamilyEntry, Fixture, RawConfig, Registry};
-use poot_quant::weights::WeightMapError;
+use poot_weights::WeightMapError;
 
 /// The cache capacity every family test traces at.
 pub(crate) const CAP: usize = 8;

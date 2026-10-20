@@ -46,6 +46,7 @@ poot-llm	driver::device_tests::adapter_generation_replacement_is_isolated_and_fr
 poot-llm	driver::device_tests::an_unsupported_request_is_the_same_variant_for_two_families_ptx
 poot-llm	driver::device_tests::attached_device_limit_refuses_an_oversized_constant_ptx
 poot-llm	driver::device_tests::bert_encode_matches_the_oracle_whatever_the_padding_ptx
+poot-llm	driver::device_tests::bf16_adapter_generation_replacement_is_isolated_and_freed_ptx
 poot-llm	driver::device_tests::capacity_does_not_change_the_tokens_ptx
 poot-llm	driver::device_tests::chained_decode_steps_equal_stepwise_decode_ptx
 poot-llm	driver::device_tests::chunked_prefill_equals_token_by_token_ptx

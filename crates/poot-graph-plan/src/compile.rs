@@ -901,13 +901,13 @@ pub fn compile(
         lower_nonlast_growth(pipeline.graph()),
     )?;
     pipeline.run("lower_nonlast_reduces", lower_nonlast_reduces)?;
-    if let Some((backend, _)) = gpu {
+    if let Some((_, caps)) = gpu {
         pipeline.reserve(
             "widen_mismatched_matmul_dtypes",
             widen_growth(pipeline.graph()),
         )?;
         pipeline.run("widen_mismatched_matmul_dtypes", |g| {
-            widen_mismatched_matmul_dtypes(g, backend)
+            widen_mismatched_matmul_dtypes(g, caps)
         })?;
     }
     // Card 673: admit every validation witness here, on the unfused graph. `fuse` folds a witness
@@ -922,7 +922,7 @@ pub fn compile(
     // `fuse`.
     pipeline.run("fuse_contraction_epilogues", |g| {
         transform::fuse_contraction_epilogues(g, |graph, head| match gpu {
-            Some((backend, caps)) => planner::epilogue_head_lowers(graph, head, backend, caps),
+            Some((_, caps)) => planner::epilogue_head_lowers(graph, head, caps),
             // The planner refuses every contraction for an AIE target, so no head lowers there.
             None => false,
         })
@@ -1339,9 +1339,9 @@ mod tests {
         BinOp, Builder, OpKind, RedOp, Scalar, Slot, StateRole, Storage, TensorType, UnOp,
     };
     use poot_kernelgen::{ContractionSpec, KernelRequest};
-    use poot_quant::weights::{WeightId, WeightRole};
     use poot_tensor::DType;
     use poot_test_util::device_caps::default_caps_for;
+    use poot_weights::{WeightId, WeightRole};
 
     use super::*;
     use poot_graph_ir::WeightRef;
@@ -1512,65 +1512,27 @@ mod tests {
         }
     }
 
-    /// SC-013 (R-546-4, GPU-free): `Scatter { axis: 1 }` has no live tracer (the public `Builder::scatter`
-    /// always emits axis 0), so this builds a valid axis-0 scatter and mutates the stored equation's axis
-    /// after tracing - the output type is axis-independent (`Scatter`'s `infer` arm returns the source's
-    /// own type), so the graph stays otherwise well-formed. `compile` refuses it with a typed
-    /// `Capability::ScatterNonZeroAxis` on every target, GPU-free. Mutation: remove the refusal guard
-    /// at `planner.rs` (`OpKind::Scatter { axis }` with `axis >= 1`); `compile` then returns `Ok` and
-    /// this row goes red.
-    #[test]
-    fn compile_refuses_a_non_axis_zero_scatter_on_every_target() {
-        let b = Builder::for_tests();
-        let src = b.constant("src", TensorType::f32(vec![4, 5])).unwrap();
-        let index = b
-            .constant("index", TensorType::new(vec![4], DType::I32))
-            .unwrap();
-        let out = b.scatter(src, index).unwrap();
-        let traced = b.finish(out).unwrap();
-        let scatter_idx = traced
-            .eqns()
-            .iter()
-            .position(|eqn| matches!(eqn.op, OpKind::Scatter { .. }))
-            .expect("the traced graph has one Scatter equation");
-        let g = poot_graph_ir::test_support::graph_fixtures::derive(&traced, |draft| {
-            draft.eqns_mut()[scatter_idx].op = OpKind::Scatter { axis: 1 };
-        })
-        .unwrap();
-
-        for backend in [
-            Backend::SpirvVulkan,
-            Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
-            Backend::Nvptx,
-        ] {
-            let refusal = refusal(
-                compile(&g, &target_for(backend), &REPLAY),
-                &format!("{backend:?} non-axis-0 scatter"),
-            );
-            assert_eq!(refusal.eqn, out.id());
-            assert_eq!(refusal.target, TargetId::Gpu(backend));
-            assert_eq!(refusal.missing, Capability::ScatterNonZeroAxis { axis: 1 });
-        }
-    }
-
     /// An equation the traced graph itself asks for, which the target has no kernel for, is refused: no
     /// rewrite produced it, so there is no decomposition to fall back to. (Card 534a: a non-last-axis
     /// `Reduce` no longer demonstrates this - `lower_nonlast_reduces` is now compile's own rewrite for
-    /// it - so this uses a mixed-dtype `ScatterUpdate` no pass rewrites instead.)
+    /// it - so this uses an F16 `ScatterUpdate`, a row write no pass rewrites and no target has a half-width
+    /// body for, instead.)
     #[test]
     fn compile_refuses_an_equation_the_traced_graph_cannot_run() {
         let b = Builder::for_tests();
         let base = b
-            .constant("base", TensorType::new(vec![2, 5], DType::E4M3FN))
+            .constant("base", TensorType::new(vec![2, 5], DType::F16))
             .unwrap();
-        let src = b.constant("src", TensorType::f32(vec![1, 5])).unwrap();
+        let src = b
+            .constant("src", TensorType::new(vec![1, 5], DType::F16))
+            .unwrap();
         let slots = b
             .constant("slots", TensorType::new(vec![1], DType::I32))
             .unwrap();
         let out = b.scatter_update(base, src, slots).unwrap();
         let refusal = refusal(
             compile(&b.finish(out).unwrap(), &wgpu(), &REPLAY),
-            "E4M3FN ScatterUpdate over an f32 source",
+            "F16 ScatterUpdate",
         );
         assert_eq!(refusal.eqn, out.id());
         assert_eq!(refusal.missing, Capability::DtypeLowering);

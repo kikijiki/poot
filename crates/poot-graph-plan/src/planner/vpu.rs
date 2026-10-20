@@ -231,21 +231,6 @@ fn lower_eqn(g: GraphTables<'_>, eqn: &Eqn, caps: &VpuCaps) -> Result<Lowered, P
     match class {
         OpClass::Arithmetic => arithmetic(op),
         OpClass::Movement => movement(op),
-        OpClass::Gather => {
-            if operand_dtype(&eqn.inputs[1]) != DType::I32 {
-                return Err(refuse(Capability::DtypeLowering));
-            }
-            movement(op)
-        }
-        OpClass::UpdateSlice => {
-            // The update has the operand's dtype and the index is an I32 word.
-            if operand_dtype(&eqn.inputs[0]) != operand_dtype(&eqn.inputs[1])
-                || operand_dtype(&eqn.inputs[2]) != DType::I32
-            {
-                return Err(refuse(Capability::DtypeLowering));
-            }
-            movement(op)
-        }
         OpClass::Convert => {
             // F16 <-> F32 only: a conversion through an integer or BF16 changes the value. Inside a narrowed
             // region both sides are F16 and the conversion is the identity the contract already covers. An
@@ -273,10 +258,6 @@ enum OpClass {
     Arithmetic,
     /// Moves bits: any width the device carries.
     Movement,
-    /// A `Gather`: movement whose index operand is I32.
-    Gather,
-    /// A `DynamicUpdateSlice`: movement of one dtype whose index operand is I32.
-    UpdateSlice,
     /// A `Convert`: between F16 and F32.
     Convert,
 }
@@ -317,11 +298,10 @@ fn opset_op(op: &OpKind) -> Option<(VpuOp, OpClass)> {
             OpClass::Arithmetic,
         ),
         OpKind::MatMul => (VpuOp::MatMul, OpClass::Arithmetic),
-        OpKind::Gather { axis } => (VpuOp::Gather { axis: *axis }, OpClass::Gather),
-        OpKind::DynamicUpdateSlice { axis } => (
-            VpuOp::DynamicUpdateSlice { axis: *axis },
-            OpClass::UpdateSlice,
-        ),
+        OpKind::Gather { axis } => (VpuOp::Gather { axis: *axis }, OpClass::Movement),
+        OpKind::DynamicUpdateSlice { axis } => {
+            (VpuOp::DynamicUpdateSlice { axis: *axis }, OpClass::Movement)
+        }
         OpKind::Iota { len, .. } => (VpuOp::Iota { len: *len }, OpClass::Movement),
         OpKind::Reshape { .. } => (VpuOp::Reshape, OpClass::Movement),
         OpKind::Transpose { perm } => (VpuOp::Transpose { perm: perm.clone() }, OpClass::Movement),
@@ -1102,21 +1082,6 @@ mod tests {
         let mut blob: Vec<u8> = (0..2i32).flat_map(i32::to_le_bytes).collect();
         blob.extend_from_slice(&0i64.to_le_bytes());
         assert_eq!(ir.weights, blob);
-    }
-
-    /// A scatter of rows of one dtype by an I32 index only: the update must share the operand's dtype.
-    #[test]
-    fn a_dynamic_update_slice_with_an_f32_update_over_an_f16_operand_is_refused() {
-        let g = graph_of(|b| {
-            let cache = b.constant("cache", f(DType::F16, &[6, 4])).unwrap();
-            let row = b.constant("row", f(DType::F32, &[2, 4])).unwrap();
-            let pos = b.constant("pos", f(DType::I32, &[])).unwrap();
-            b.dynamic_update_slice_dyn(cache, row, pos, 0).unwrap()
-        });
-        assert_eq!(
-            refusal(plan_vpu_region(&g, &caps())).missing,
-            Capability::DtypeLowering
-        );
     }
 
     /// An Intel NPU's artifact is the whole graph: its vendor compiler takes every equation at once, so

@@ -54,10 +54,10 @@ use poot_graph_ir::graph::{Eqn, Graph, LayerIndex, Operand, StateRole, Storage, 
 use poot_graph_ir::op::{BinOp, OpKind, RedOp, UnOp};
 use poot_graph_ir::{PackedSourceName, TensorType, ValueMeta, ValueTable, packed_source_type};
 use poot_quant::format::Storage as FormatStorage;
-use poot_quant::weights::{
+use poot_quant::{PackedWeight, SourceRole};
+use poot_weights::{
     AttnRole, FfnRole, HandleFormat, LoraRole, LoraTarget, WeightId, WeightMap, WeightRole,
 };
-use poot_quant::{PackedWeight, SourceRole};
 
 /// How the weights of a model are divided over the ranks of a tensor-parallel group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1189,7 +1189,9 @@ pub(crate) fn expand_ranks(sharded: &ShardedGraph) -> Result<RankProgram, ShardE
         copies[rank].get(&value).copied().unwrap_or(value)
     };
 
-    // Each emitted equation with the segment (collectives at or before it) and rank it belongs to.
+    // Each emitted equation with the segment (collectives at or before it) and rank it belongs to. A rank
+    // program holds every layer once per rank, so its equations carry no layer tag: the tag orders one
+    // model's layers, and the ranks' copies of them interleave by segment.
     struct Placed {
         segment: usize,
         rank: usize,
@@ -1231,7 +1233,7 @@ pub(crate) fn expand_ranks(sharded: &ShardedGraph) -> Result<RankProgram, ShardE
                                 op: OpKind::Binary(BinOp::Add),
                                 inputs: vec![Operand::Value(sum), Operand::Value(next)],
                                 out: target,
-                                layer: eqn.layer,
+                                layer: None,
                             },
                         });
                         sum = target;
@@ -1250,7 +1252,7 @@ pub(crate) fn expand_ranks(sharded: &ShardedGraph) -> Result<RankProgram, ShardE
                                 .map(|from| Operand::Value(at(&copies, from, partial)))
                                 .collect(),
                             out,
-                            layer: eqn.layer,
+                            layer: None,
                         },
                     });
                 }
@@ -1268,7 +1270,7 @@ pub(crate) fn expand_ranks(sharded: &ShardedGraph) -> Result<RankProgram, ShardE
                             })
                             .collect(),
                         out,
-                        layer: eqn.layer,
+                        layer: None,
                     },
                 }),
             }

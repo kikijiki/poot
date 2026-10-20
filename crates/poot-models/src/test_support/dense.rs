@@ -15,10 +15,9 @@ use crate::registry::{RawConfig, Registry};
 use poot_graph_ir::{Graph, Storage};
 use poot_quant::StoredBytes;
 use poot_quant::format::WeightFormat;
-use poot_quant::weights::{
-    DenseWeight, WeightEntry, WeightKey, WeightMap, WeightStore, WeightView,
-};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
 use poot_tensor::DType;
+use poot_weights::{WeightMap, WeightView};
 
 use super::weight_map::{MappedModel, Projections};
 

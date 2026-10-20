@@ -45,7 +45,8 @@ use poot_quant::format::ScaleEncoding;
 use poot_quant::format::WeightFormat;
 #[cfg(feature = "test-support")]
 use poot_quant::weights::WeightEntry;
-use poot_quant::weights::{AttnRole, FfnRole, NormRole, WeightMap, WeightRole, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::{AttnRole, FfnRole, NormRole, WeightMap, WeightRole};
 
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
@@ -835,7 +836,7 @@ mod tests {
     };
     use poot_load::plan::default_workers;
     use poot_quant::StoredBytes;
-    use poot_quant::weights::HandleFormat;
+    use poot_weights::HandleFormat;
     use serde_json::json;
 
     use super::*;
@@ -851,7 +852,8 @@ mod tests {
     };
     use crate::model::{LogitRows, StepShape};
     use crate::registry::Registry;
-    use poot_quant::weights::{WeightKey, WeightMapError};
+    use poot_quant::weights::WeightKey;
+    use poot_weights::WeightMapError;
 
     fn model_of(config: &serde_json::Value, store: &WeightStore) -> Box<dyn Model> {
         let raw = RawConfig::HfJson {

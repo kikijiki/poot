@@ -208,7 +208,7 @@ fn fused_gpu_matches_cpu_over_random_graphs() {
         for _ in 0..steps {
             match rng() % 5 {
                 0 => {
-                    let op = [UnOp::Neg, UnOp::Tanh, UnOp::Erf, UnOp::Round][(rng() as usize) % 4];
+                    let op = [UnOp::Neg, UnOp::Tanh, UnOp::Erf][(rng() as usize) % 3];
                     acc = b.unary(op, acc).unwrap();
                 }
                 1 | 2 => {

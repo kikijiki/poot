@@ -7,7 +7,8 @@
 //! table ([`GGUF_PAIRED_QK`]) reads them back in the half-split order, so the GGUF and the HF checkpoint
 //! trace one and the same rotation, which the planner fuses.
 
-use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::{ExpertProj, WeightMap};
 
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::moe::MoeParams;
@@ -855,7 +856,8 @@ mod tests {
 #[cfg(test)]
 mod moe_tests {
     use poot_load::gguf::GgufValue;
-    use poot_quant::weights::{MoeRole, WeightEntry, WeightKey, WeightMapError, WeightRole};
+    use poot_quant::weights::{WeightEntry, WeightKey};
+    use poot_weights::{MoeRole, WeightMapError, WeightRole};
     use serde_json::json;
 
     use super::*;

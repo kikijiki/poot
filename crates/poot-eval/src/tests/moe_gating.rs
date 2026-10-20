@@ -1,6 +1,5 @@
-//! scatter_axis0, ArgTopK, top-k gate, MoE dense/sparse/grouped references.
+//! ArgTopK, top-k gate, MoE dense/sparse/grouped references.
 
-use crate::ops::movement::scatter_axis0;
 use crate::{EvalOptions, Value, eval};
 use poot_graph_ir::ValueId;
 use poot_graph_ir::builder::Builder;
@@ -15,104 +14,8 @@ use super::helpers::*;
 use poot_test_util::assert_close_rel;
 
 #[test]
-fn scatter_axis0_inverts_a_permutation() {
-    // Scatter (card 034): out[index[j], ..] = src[j, ..]. With src = iota rows and index a permutation, the result is the
-    // inverse permutation, the argtop-k index inversion sparse MoE needs.
-    let b = Builder::for_tests();
-    let src = b.constant("src", TensorType::f32(vec![3, 2])).unwrap();
-    let idx = b
-        .constant("idx", TensorType::new(vec![3], DType::I32))
-        .unwrap();
-    let s = b.scatter(src, idx).unwrap();
-    let (si, ii) = (src.id(), idx.id());
-    let g = b.finish(s).unwrap();
-
-    let mut inputs = HashMap::new();
-    inputs.insert(
-        si,
-        Value::from(HostTensor::f32(
-            vec![3, 2],
-            vec![10.0, 11.0, 20.0, 21.0, 30.0, 31.0],
-        )),
-    );
-    // index = [2, 0, 1]: row 0 -> slot 2, row 1 -> slot 0, row 2 -> slot 1.
-    inputs.insert(ii, Value::from(HostTensor::i32(vec![3], vec![2, 0, 1])));
-    let got = eval(&g, &inputs, EvalOptions::default())
-        .unwrap()
-        .output
-        .into_host()
-        .expect("moe_gating tests evaluate dense graphs");
-    assert_eq!(got.shape(), vec![3, 2]);
-    // out[0]=src[1], out[1]=src[2], out[2]=src[0].
-    assert_close_rel(
-        got.as_f32().unwrap(),
-        &[20.0, 21.0, 30.0, 31.0, 10.0, 11.0],
-        1e-9,
-    );
-
-    // scalar-row case: scatter iota [0,1,2,3] by a reverse permutation -> reversed (its own inverse here).
-    let b2 = Builder::for_tests();
-    let src2 = b2.constant("s", TensorType::f32(vec![4])).unwrap();
-    let idx2 = b2
-        .constant("i", TensorType::new(vec![4], DType::I32))
-        .unwrap();
-    let sc = b2.scatter(src2, idx2).unwrap();
-    let (s2, i2) = (src2.id(), idx2.id());
-    let g2 = b2.finish(sc).unwrap();
-    let mut in2 = HashMap::new();
-    in2.insert(
-        s2,
-        Value::from(HostTensor::f32(vec![4], vec![0.0, 1.0, 2.0, 3.0])),
-    );
-    in2.insert(i2, Value::from(HostTensor::i32(vec![4], vec![3, 2, 1, 0])));
-    let got2 = eval(&g2, &in2, EvalOptions::default())
-        .unwrap()
-        .output
-        .into_host()
-        .expect("moe_gating tests evaluate dense graphs");
-    assert_close_rel(got2.as_f32().unwrap(), &[3.0, 2.0, 1.0, 0.0], 1e-9);
-}
-
-/// mutants-m4 follow-up: a Scatter index outside `0..N` (past the end, or negative) used to slice
-/// out of range and panic, or saturate to row 0 when negative. The oracle refuses it with a typed
-/// error (card 555: `EvalError::Index`, through the one index rule) naming the position.
-#[test]
-fn scatter_refuses_an_index_outside_the_rows() {
-    use crate::ops::index_rule::IndexFaultKind;
-
-    for (index, position, kind) in [
-        (vec![2, 3, 0], 1, IndexFaultKind::OutOfRange),
-        (vec![2, 0, -1], 2, IndexFaultKind::Negative),
-    ] {
-        let b = Builder::for_tests();
-        let src = b.constant("src", TensorType::f32(vec![3, 2])).unwrap();
-        let idx = b
-            .constant("idx", TensorType::new(vec![3], DType::I32))
-            .unwrap();
-        let scattered = b.scatter(src, idx).unwrap();
-        let (si, ii) = (src.id(), idx.id());
-        let g = b.finish(scattered).unwrap();
-        let mut inputs = HashMap::new();
-        inputs.insert(si, Value::from(HostTensor::f32(vec![3, 2], vec![0.0; 6])));
-        inputs.insert(ii, Value::from(HostTensor::i32(vec![3], index.clone())));
-        match eval(&g, &inputs, EvalOptions::default()).map(|r| {
-            r.output
-                .into_host()
-                .expect("moe_gating tests evaluate dense graphs")
-        }) {
-            Err(crate::EvalError::Index(fault)) => {
-                assert_eq!(fault.position, position, "{index:?}");
-                assert_eq!(fault.len, 3, "{index:?}");
-                assert_eq!(fault.kind, kind, "{index:?}");
-            }
-            other => panic!("{index:?}: expected EvalError::Index, got {other:?}"),
-        }
-    }
-}
-
-#[test]
-fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
-    // spec 136 P1: ArgTopK batches `scatter(iota,rank)[0..k]` (`moe_sparse`) over leading dims. E=32 and k=4 with a batch
+fn arg_top_k_matches_per_row_rank_inversion() {
+    // spec 136 P1: ArgTopK batches the inverted rank `[0..k]` (`moe_sparse`) over leading dims. E=32 and k=4 with a batch
     // of L=6 rows, so leading-dim batching is exercised.
     use poot_graph_ir::op::OpKind;
     let (l, e, k) = (6usize, 32usize, 4usize);
@@ -183,26 +86,21 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
         .expect("moe_gating tests evaluate dense graphs");
     assert_eq!(got.shape(), vec![l, k]);
 
-    // Reference: per row, `scatter(iota, rank)` (the same `scatter_axis0` the `Scatter` op runs), then the `[0..k]` slice on
+    // Reference: per row, invert the rank permutation (`inverted[rank[i]] = i`), then take the `[0..k]` slice on
     // the last axis (FR-002). Index-exact, no tolerance.
     for row in 0..l {
-        let rank_row = HostTensor::i32(
-            vec![e],
-            rank_t.as_f32().unwrap()[row * e..(row + 1) * e]
-                .iter()
-                .map(|&rank| rank as i32)
-                .collect(),
-        );
-        let iota_row = HostTensor::f32(vec![e], (0..e).map(|j| j as f32).collect());
-        let inverted = scatter_axis0(&iota_row, &rank_row, ValueId::new(0)).unwrap();
-        let expected: Vec<i32> = inverted.as_f32().unwrap()[0..k]
+        let mut inverted = vec![0i32; e];
+        for (i, &rank) in rank_t.as_f32().unwrap()[row * e..(row + 1) * e]
             .iter()
-            .map(|&id| id as i32)
-            .collect();
+            .enumerate()
+        {
+            inverted[rank as usize] = i as i32;
+        }
+        let expected = &inverted[0..k];
         let actual = &got.as_i32().unwrap()[row * k..(row + 1) * k];
         assert_eq!(
-            actual, &expected,
-            "row {row}: ArgTopK must equal scatter(iota,rank)[0..k] exactly"
+            actual, expected,
+            "row {row}: ArgTopK must equal the inverted rank[0..k] exactly"
         );
     }
 

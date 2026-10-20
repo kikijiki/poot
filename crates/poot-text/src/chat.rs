@@ -1,7 +1,7 @@
 //! Chat templating: jinja chat_template rendering, and the family's explicit ChatFormat for a checkpoint with no template.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::chat_format::ChatFormat;
 
@@ -750,46 +750,30 @@ pub(crate) fn parse_tokenizer_config_chat_bytes(
     Ok((template, token("bos_token"), token("eos_token")))
 }
 
-/// Read a model's chat template + bos/eos token strings from `tokenizer_config.json`. Returns all-`None` when
-/// neither source below has a template (the server then falls back to the hardcoded [`ChatFormat`]). Embedded
-/// fields use [`parse_tokenizer_config_chat_bytes`].
+/// A model's chat template + bos/eos token strings from the held bytes of its `tokenizer_config.json` and
+/// of its standalone `chat_template.jinja`, each `None` when the checkpoint ships no such file. Returns
+/// all-`None` when neither source has a template (the server then falls back to the hardcoded
+/// [`ChatFormat`]). Embedded fields use [`parse_tokenizer_config_chat_bytes`]; a `tokenizer_config.json`
+/// that does not parse contributes nothing.
 ///
-/// Also falls back to a standalone sibling `chat_template.jinja` file when `tokenizer_config.json` carries no
-/// embedded `chat_template` field (found during gpt-oss-20b coherence verification, the Backstage "gptoss real
-/// checkpoint coherence" update): current HF releases, including `openai/gpt-oss-20b`, moved the template out of
-/// `tokenizer_config.json` into its own `chat_template.jinja`. Without this any such arch would silently degrade
-/// to the `ChatFormat` fallback.
-pub fn read_tokenizer_config_chat(dir: &Path) -> (Option<String>, Option<String>, Option<String>) {
-    let parsed = std::fs::read(dir.join("tokenizer_config.json"))
-        .ok()
-        .and_then(|bytes| parse_tokenizer_config_chat_bytes(&bytes).ok());
+/// Falls back to the standalone `chat_template.jinja` when `tokenizer_config.json` carries no embedded
+/// `chat_template` field (found during gpt-oss-20b coherence verification, the Backstage "gptoss real
+/// checkpoint coherence" update): current HF releases, including `openai/gpt-oss-20b`, moved the template out
+/// of `tokenizer_config.json` into its own `chat_template.jinja`. Without this any such arch would silently
+/// degrade to the `ChatFormat` fallback.
+pub fn chat_from_files(
+    tokenizer_config: Option<&[u8]>,
+    chat_template_jinja: Option<&str>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let parsed = tokenizer_config.and_then(|bytes| parse_tokenizer_config_chat_bytes(bytes).ok());
     let (template, bos, eos) = parsed.unwrap_or_default();
-    let template =
-        template.or_else(|| std::fs::read_to_string(dir.join("chat_template.jinja")).ok());
+    let template = template.or_else(|| chat_template_jinja.map(str::to_string));
     (template, bos, eos)
 }
 
 #[cfg(test)]
-mod read_tokenizer_config_chat_tests {
-    use super::{parse_tokenizer_config_chat_bytes, read_tokenizer_config_chat};
-
-    /// A fresh directory under the system temp dir, removed when dropped.
-    struct TempDir(std::path::PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+mod chat_from_files_tests {
+    use super::{chat_from_files, parse_tokenizer_config_chat_bytes};
 
     #[test]
     fn held_bytes_preserve_embedded_chat_semantics_without_a_path() {
@@ -807,18 +791,10 @@ mod read_tokenizer_config_chat_tests {
     /// silently degrade to the hardcoded `ChatFormat` for any such model.
     #[test]
     fn falls_back_to_standalone_chat_template_jinja_file() {
-        let dir = TempDir::new("poot_chat_template_jinja_fallback_fixture");
-        std::fs::write(
-            dir.0.join("tokenizer_config.json"),
-            r#"{"bos_token": "<bos>", "eos_token": "<eos>"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.0.join("chat_template.jinja"),
-            "{{ messages[0].content }}",
-        )
-        .unwrap();
-        let (template, bos, eos) = read_tokenizer_config_chat(&dir.0);
+        let (template, bos, eos) = chat_from_files(
+            Some(br#"{"bos_token": "<bos>", "eos_token": "<eos>"}"#),
+            Some("{{ messages[0].content }}"),
+        );
         assert_eq!(template.as_deref(), Some("{{ messages[0].content }}"));
         assert_eq!(bos.as_deref(), Some("<bos>"));
         assert_eq!(eos.as_deref(), Some("<eos>"));
@@ -828,23 +804,18 @@ mod read_tokenizer_config_chat_tests {
     /// be present), as for every other arch.
     #[test]
     fn embedded_chat_template_field_takes_priority_over_standalone_file() {
-        let dir = TempDir::new("poot_chat_template_jinja_priority_fixture");
-        std::fs::write(
-            dir.0.join("tokenizer_config.json"),
-            r#"{"chat_template": "embedded"}"#,
-        )
-        .unwrap();
-        std::fs::write(dir.0.join("chat_template.jinja"), "standalone").unwrap();
-        let (template, _, _) = read_tokenizer_config_chat(&dir.0);
+        let (template, _, _) = chat_from_files(
+            Some(br#"{"chat_template": "embedded"}"#),
+            Some("standalone"),
+        );
         assert_eq!(template.as_deref(), Some("embedded"));
     }
 
     #[test]
     fn neither_source_present_returns_none() {
-        let dir = TempDir::new("poot_chat_template_jinja_none_fixture");
-        std::fs::write(dir.0.join("tokenizer_config.json"), r#"{}"#).unwrap();
-        let (template, _, _) = read_tokenizer_config_chat(&dir.0);
+        let (template, _, _) = chat_from_files(Some(br#"{}"#), None);
         assert_eq!(template, None);
+        assert_eq!(chat_from_files(None, None), (None, None, None));
     }
 }
 

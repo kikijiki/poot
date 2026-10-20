@@ -11,10 +11,14 @@
 //! 3. Every view's range is checked against the mapping length at construction
 //!    ([`super::StoredBytes::slice`]), so no slice reaches past the mapped length.
 //! 4. The one assumption the `unsafe` makes, which no Rust code can enforce: no other process modifies the
-//!    file in place while it is mapped. Breaking it is not memory-unsafe in the Rust sense for truncation
-//!    (the process dies with `SIGBUS`) and yields changing bytes for an overwrite; poot never derives a
-//!    reference, length or index from mapped bytes without checking it, so changed bytes are wrong data,
-//!    never wild memory access. A change already made is refused by [`MappedFile::check_unchanged`].
+//!    file in place while it is mapped. This is a contract, not a defended boundary. A write to the file
+//!    while a `&[u8]` into it is live is a data race, which is undefined behavior by the language's rules
+//!    whatever the hardware then does; a truncation ends the process with `SIGBUS`. The content checks of
+//!    a packed payload (finite scales, group-index range) run once on the mapped bytes at load and the
+//!    bytes are read again at upload, so a modification between the two can put an unchecked value on
+//!    the device. A modification already made is refused by [`MappedFile::check_unchanged`] at the load
+//!    end and at each binder boundary; one racing a read in flight is not detected. Replacing a
+//!    checkpoint by rename never modifies a mapped inode and is always safe.
 //!
 //! `MappedFile` is `Send + Sync` through the auto traits (`memmap2::Mmap` and `File` are); there is no
 //! `unsafe impl`.

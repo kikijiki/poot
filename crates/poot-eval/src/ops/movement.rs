@@ -1,10 +1,10 @@
 //! Movement: `Reshape`, `Transpose`, `Slice`, `Concat`, `Broadcast`, `DynamicUpdateSlice`,
-//! `ScatterUpdate` and axis-0 `Scatter`, over the host carrier and the storage-aware [`Value`] lane.
+//! `ScatterUpdate`, over the host carrier and the storage-aware [`Value`] lane.
 //!
 //! [`generic`] holds one function per op, over `T: Copy`: `Transpose`/`Slice`/`Concat`/`Broadcast`
 //! are pure geometry with no runtime index to fault on; `DynamicUpdateSlice`'s runtime start,
 //! `ScatterUpdate`'s slot map (its `-1` padding sentinel handled before any other value reaches
-//! [`index_at`](super::index_rule::index_at), a repeated slot refused) and axis-0 `Scatter`'s index all route through the one
+//! [`index_at`](super::index_rule::index_at), a repeated slot refused) route through the one
 //! index rule shared with every other index-consuming op (R470-011). The rest of this module is the
 //! thin per-class plumbing: a [`HostTensor`]'s payload is one of four storage classes (`f32`, `i32`,
 //! half-width words, raw bytes), each op runs [`generic`] over that class and republishes the same
@@ -162,27 +162,6 @@ pub(crate) mod generic {
         }
         Ok(out)
     }
-
-    /// Scatter rows of `src` along axis 0 (the inverse of axis-0 [`super::super::gather::gather`]):
-    /// `out[index[j], ..] = src[j, ..]`. `index` is a `[N]` permutation of `0..N` (N =
-    /// `src_shape[0]`); `out` has the same shape as `src`. Rows no index targets stay `T::default()`
-    /// (a permutation writes all of them).
-    pub(crate) fn scatter_axis0<T: Copy + Default>(
-        src: &[T],
-        src_shape: &[usize],
-        index: &[IndexValue],
-        eqn: ValueId,
-    ) -> Result<Vec<T>, EvalError> {
-        let n = src_shape[0];
-        let rest: usize = src_shape[1..].iter().product::<usize>().max(1);
-        let mut out = vec![T::default(); src.len()];
-        for (j, &value) in index.iter().enumerate().take(n) {
-            let dst = index_at(value, j, n, eqn)?;
-            let (dst_at, src_at) = (dst * rest, j * rest);
-            out[dst_at..dst_at + rest].copy_from_slice(&src[src_at..src_at + rest]);
-        }
-        Ok(out)
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -324,31 +303,6 @@ pub(crate) fn concat(parts: &[&HostTensor], axis: usize) -> Result<HostTensor, E
     republish(parts[0], out_shape, data)
 }
 
-/// Scatter rows of `src` along axis 0; `index` is `src`'s own index-role operand values. An index
-/// that does not select a row of `0..N` is [`EvalError::Index`], naming `eqn`.
-pub(crate) fn scatter_axis0(
-    src: &HostTensor,
-    index: &HostTensor,
-    eqn: ValueId,
-) -> Result<HostTensor, EvalError> {
-    let index_values = index_values(index)?;
-    let data = match src.data() {
-        HostData::F32(d) => {
-            HostData::F32(generic::scatter_axis0(d, src.shape(), &index_values, eqn)?.into())
-        }
-        HostData::I32(d) => {
-            HostData::I32(generic::scatter_axis0(d, src.shape(), &index_values, eqn)?.into())
-        }
-        HostData::Half(d) => {
-            HostData::Half(generic::scatter_axis0(d, src.shape(), &index_values, eqn)?.into())
-        }
-        HostData::Bytes(d) => {
-            HostData::Bytes(generic::scatter_axis0(d, src.shape(), &index_values, eqn)?.into())
-        }
-    };
-    republish(src, src.shape().to_vec(), data)
-}
-
 pub(crate) fn scatter_update(
     base: &HostTensor,
     src: &HostTensor,
@@ -451,7 +405,6 @@ pub fn apply_movement(op: &OpKind, ins: &[HostTensor]) -> Result<HostTensor, Eva
             )?;
             Ok(HostTensor::f32_arc(out_shape, out))
         }
-        OpKind::Scatter { .. } => scatter_axis0(&ins[0], &ins[1], NO_EQN),
         OpKind::Broadcast { shape } => broadcast_to(&ins[0], shape),
         other => Err(EvalError::unsupported(
             "apply_movement",

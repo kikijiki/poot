@@ -32,10 +32,11 @@ use poot_graph_plan::{
     staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot};
 use poot_target::BufferStorage;
 use poot_tensor::{DType, HostView};
+use poot_weights::WeightMap;
 
 use super::dense::{Dense, Family, step};
 

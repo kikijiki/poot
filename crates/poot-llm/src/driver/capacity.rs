@@ -1497,7 +1497,7 @@ mod tests {
     fn a_pooled_plan_has_exact_pool_bytes_and_matches_the_prepared_counters() {
         use crate::driver::device_tests::{mixtral_handle, options};
         use crate::driver::{Head, Layout, ServingShapes, Warm};
-        use poot_quant::weights::{HandleFormat, MoeRole, WeightRole};
+        use poot_weights::{HandleFormat, MoeRole, WeightRole};
         use std::collections::BTreeSet;
         use std::num::NonZeroUsize;
 

@@ -1,5 +1,5 @@
 //! The one index-validity rule every index-consuming op shares (R470-008, R470-011): `Gather`,
-//! `Scatter`, `ScatterUpdate`'s non-padding slots, `DynamicUpdateSlice`'s runtime start, `ArgTopK`'s
+//! `ScatterUpdate`'s non-padding slots, `DynamicUpdateSlice`'s runtime start, `ArgTopK`'s
 //! rank and `IndexedMatMul`'s expert id all read one row-selecting integer through [`index_at`]
 //! instead of each restating its own rounding and bounds check.
 

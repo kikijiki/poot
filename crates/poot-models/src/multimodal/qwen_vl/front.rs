@@ -462,6 +462,16 @@ mod tests {
     use crate::multimodal::qwen_vl::{ENTRY, VISION};
     use crate::registry::Fixture;
 
+    /// The text services of the fixture directory `dir`: its `tokenizer.json` and `tokenizer_config.json`.
+    fn codec_from_dir(dir: &std::path::Path, eos: u32) -> TextCodec {
+        let files = poot_text::HfTextFiles {
+            tokenizer: std::fs::read(dir.join("tokenizer.json")).unwrap(),
+            tokenizer_config: std::fs::read(dir.join("tokenizer_config.json")).ok(),
+            chat_template_jinja: None,
+        };
+        TextCodec::from_hf_files(&files, eos, None, ChatFormat::ChatML).unwrap()
+    }
+
     const USER: u32 = 2;
     const HELLO: u32 = 4;
     const T1: u32 = 1;
@@ -517,7 +527,7 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
-        TextCodec::from_hf_dir(&dir, 47, None, ChatFormat::ChatML).unwrap()
+        codec_from_dir(&dir, 47)
     }
 
     /// The front end the registry entry builds from the fixture's config.
@@ -826,7 +836,7 @@ mod tests {
                     .to_string(),
             )
             .unwrap();
-            TextCodec::from_hf_dir(&dir, 7, None, ChatFormat::ChatML).unwrap()
+            codec_from_dir(&dir, 7)
         };
         let result = front_end.prepare(
             &[ChatTurn::user(1, "hello")],

@@ -23,13 +23,11 @@ mod guided;
 mod tokenize;
 mod tool_call;
 
-pub use chat::{
-    ChatTemplateOverride, CheckedChatTemplate, RenderedChat, Speaker, read_tokenizer_config_chat,
-};
+pub use chat::{ChatTemplateOverride, CheckedChatTemplate, RenderedChat, Speaker, chat_from_files};
 pub use chat_format::ChatFormat;
 pub use error::{ChatTemplateError, Result, TextError};
 pub use guided::{Constraint, JsonAcceptor};
-pub use tokenize::{ChatTemplate, EncoderTokens, GgufVocab, TextCodec};
+pub use tokenize::{ChatTemplate, EncoderTokens, GgufVocab, HfTextFiles, TextCodec};
 pub use tool_call::{
     HermesToolCodec, LlamaToolCodec, MistralToolCodec, ParsedToolCall, ToolCallCodec,
 };

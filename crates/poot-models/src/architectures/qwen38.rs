@@ -38,7 +38,8 @@ use poot_quant::format::ScaleEncoding;
 use poot_quant::format::WeightFormat;
 #[cfg(feature = "test-support")]
 use poot_quant::weights::WeightEntry;
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::WeightMap;
 
 use crate::components::linear::WeightError;
 use crate::components::standard::{Step, decoder_program};
