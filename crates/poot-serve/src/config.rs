@@ -108,7 +108,7 @@ pub(crate) struct ServeConfig {
     /// The device backend: wgpu, rocm, ptx, vulkan, or auto (PTX if a CUDA device opens, else ROCm if an
     /// HSA GPU agent opens, else wgpu). A model the chosen backend refuses fails startup; no other
     /// backend is tried.
-    #[arg(long, default_value = "auto", value_parser = parse_backend)]
+    #[arg(long, default_value_t = BackendChoice::Auto)]
     pub(crate) backend: BackendChoice,
     /// Where the model runs: `single` (the backend's default device), `pipeline:ORD,ORD,...` (one layer
     /// stage per GPU ordinal, in order) or `tensor:ORD,ORD,...` (one tensor-parallel rank per ordinal).
@@ -352,19 +352,6 @@ fn parse_placement(spec: &str) -> Result<PlacementSpec, String> {
         "tensor" => Ok(PlacementSpec::Tensor { ordinals }),
         other => Err(format!(
             "unknown placement {other:?}: expected single, pipeline or tensor"
-        )),
-    }
-}
-
-fn parse_backend(name: &str) -> Result<BackendChoice, String> {
-    match name {
-        "wgpu" => Ok(BackendChoice::Wgpu),
-        "rocm" => Ok(BackendChoice::Rocm),
-        "ptx" => Ok(BackendChoice::Ptx),
-        "vulkan" => Ok(BackendChoice::Vulkan),
-        "auto" => Ok(BackendChoice::Auto),
-        other => Err(format!(
-            "unknown backend {other:?}: expected wgpu, rocm, ptx, vulkan or auto"
         )),
     }
 }

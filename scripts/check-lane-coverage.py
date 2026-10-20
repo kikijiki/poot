@@ -13,7 +13,7 @@ classes every test that matches nothing:
   device                  dispatches on a device: it MUST match a lane selection
   not in the inventory    a test of a package the model-free lane excludes (poot-wgpu-device, poot-rocm-device, poot-npu,
                           poot-vulkan-device), or one that exists only under a feature
-                          (poot-llm/rocm): it MUST match a lane selection
+                          (poot-npu/vpu): it MUST match a lane selection
 
 An ignored test is run by no selection, so it must be a row of a lane's required list instead (the checkpoint
 list, or a scripts/required-device-cases/<lane>.txt list), or be deleted: an ignored test in no list runs nowhere.
@@ -46,7 +46,7 @@ NEXTEST_CONFIG = ROOT / ".config" / "nextest.toml"
 # The features the device lanes build, named here so the listing sees the tests that exist only under them
 # (R2-L13-012). The lane recipes in the justfile pass the same features. `poot-npu/xdna` needs `nix develop .#npu`
 # (XRT), so its listing runs in that shell: `npu_listing`.
-FEATURES = "poot-llm/rocm,poot-npu/vpu"
+FEATURES = "poot-npu/vpu"
 NPU_FEATURES = "poot-npu/xdna,poot-npu/vpu"
 # A host with no NPU shell sets this to skip the xdna listing, as `just npu-build` does.
 ALLOW_NO_NPU_SHELL = "POOT_ALLOW_NO_NPU_SHELL"

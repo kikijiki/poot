@@ -735,6 +735,40 @@ impl PreparedAppendResult {
 /// let mask = b.constant("mask", TensorType::f32(vec![1, 1, 4, 4]));
 /// let _ = b.flash_attention_prefill_softcap(q, k, v, mask, 1, 0.5, Some(50.0));
 /// ```
+///
+/// A tracer cannot construct a pass-only composite (architecture rule 3): `OpKind::BlockTopK` and
+/// `OpKind::SelectedAttention` are formed by `compile` from the compositions [`crate::ops::block_top_k_packed`]
+/// and [`crate::ops::selected_attention`] state, so the builder has no method for either. The tests that need
+/// the op itself build it with `test_support::composites`.
+///
+/// ```compile_fail,E0599
+/// use poot_graph_ir::{BlockTopKAttrs, Builder, TensorType};
+/// # use poot_graph_ir::TraceLimits;
+/// # use std::num::{NonZeroU64, NonZeroUsize};
+/// # let n = NonZeroUsize::MIN;
+/// # let limits = TraceLimits { max_tokens: n, max_values: n, max_eqns: n, max_literal_bytes: NonZeroU64::MIN, max_owned_bytes: NonZeroU64::MIN };
+///
+/// let b = Builder::new(limits);
+/// let scores = b.constant("scores", TensorType::f32(vec![1, 1, 1, 8])).unwrap();
+/// let pos = b.constant("pos", TensorType::f32(vec![1, 1])).unwrap();
+/// let _ = b.block_top_k(BlockTopKAttrs { ratio: 2, k: 2 }, scores, pos);
+/// ```
+///
+/// ```compile_fail,E0599
+/// use poot_graph_ir::{Builder, SelectedAttentionAttrs, TensorType};
+/// # use poot_graph_ir::TraceLimits;
+/// # use std::num::{NonZeroU64, NonZeroUsize};
+/// # let n = NonZeroUsize::MIN;
+/// # let limits = TraceLimits { max_tokens: n, max_values: n, max_eqns: n, max_literal_bytes: NonZeroU64::MIN, max_owned_bytes: NonZeroU64::MIN };
+///
+/// let b = Builder::new(limits);
+/// let q = b.constant("q", TensorType::f32(vec![1, 2, 1, 4])).unwrap();
+/// let kv = b.constant("kv", TensorType::f32(vec![1, 1, 8, 4])).unwrap();
+/// let ids = b.constant("ids", TensorType::f32(vec![1, 1, 1, 2])).unwrap();
+/// let pos = b.constant("pos", TensorType::f32(vec![1, 1])).unwrap();
+/// let attrs = SelectedAttentionAttrs { n_rep: 2, scale: 0.5, softcap: None, ratio: 2, k: 2 };
+/// let _ = b.selected_attention(attrs, q, kv, kv, ids, pos);
+/// ```
 pub struct Builder {
     brand: BuilderBrand,
     g: RefCell<GraphEdit>,
@@ -1173,8 +1207,14 @@ impl Builder {
         Ok(t.id)
     }
 
+    /// How many equations the graph under construction holds, for the error a fixture builder raises.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn equation_count(&self) -> usize {
+        self.g.borrow().eqns().len()
+    }
+
     /// The operand naming the value `t`.
-    fn operand(&self, t: Traced) -> Result<Operand, BuilderError> {
+    pub(crate) fn operand(&self, t: Traced) -> Result<Operand, BuilderError> {
         Ok(Operand::Value(self.id(t)?))
     }
 
@@ -2193,62 +2233,6 @@ impl Builder {
         Ok(ScanResult { packed, y, s_out })
     }
 
-    /// The block selection of a sparse-attention indexer (POOT-1143): ONE `OpKind::BlockTopK` equation over
-    /// `scores` `[R, 1, T, NB]` and the queries' positions `pos` `[R, T]`, returned as its typed
-    /// values. The two projections are slices of the packed result at the columns its
-    /// [`crate::BlockTopKLayout`] names.
-    pub fn block_top_k(
-        &self,
-        attrs: crate::op::BlockTopKAttrs,
-        scores: Traced,
-        pos: Traced,
-    ) -> Result<BlockTopKResult, BuilderError> {
-        let layout = {
-            let (scores, pos) = (self.aval(scores)?, self.aval(pos)?);
-            attrs
-                .layout(&[scores, pos])
-                .map_err(|source| BuilderError::Inference {
-                    equation: self.g.borrow().eqns().len(),
-                    operation: OpKind::BlockTopK(attrs).name(),
-                    source,
-                })?
-        };
-        let packed = self.emit(
-            OpKind::BlockTopK(attrs),
-            vec![self.operand(scores)?, self.operand(pos)?],
-        )?;
-        let (ids, keep) = (layout.ids(), layout.keep());
-        Ok(BlockTopKResult {
-            packed,
-            ids: self.slice(packed, 3, ids.start, ids.end)?,
-            keep: self.slice(packed, 3, keep.start, keep.end)?,
-        })
-    }
-
-    /// Attention over the blocks a selection made (POOT-1143): ONE `OpKind::SelectedAttention` equation over
-    /// `q`, the cached `k` and `v`, the selected block `ids` `[B, 1, Lq, K]` and the queries' positions `pos`
-    /// `[B, Lq]`. Output `[B, Hq, Lq, Dv]`.
-    pub fn selected_attention(
-        &self,
-        attrs: crate::op::SelectedAttentionAttrs,
-        q: Traced,
-        k: Traced,
-        v: Traced,
-        ids: Traced,
-        pos: Traced,
-    ) -> Result<Traced, BuilderError> {
-        self.emit(
-            OpKind::SelectedAttention(attrs),
-            vec![
-                self.operand(q)?,
-                self.operand(k)?,
-                self.operand(v)?,
-                self.operand(ids)?,
-                self.operand(pos)?,
-            ],
-        )
-    }
-
     /// Reinterpret `x` with `shape`, which must hold the same number of elements.
     pub fn reshape(&self, x: Traced, shape: Vec<usize>) -> Result<Traced, BuilderError> {
         self.emit(OpKind::Reshape { shape }, vec![self.operand(x)?])
@@ -2632,18 +2616,6 @@ pub struct ScanResult {
     pub y: Traced,
     /// The carried state `[1, H, S, W]`.
     pub s_out: Traced,
-}
-
-/// The values of a traced block selection: the packed result its one equation defines and the two
-/// projections of it.
-#[derive(Clone, Copy, Debug)]
-pub struct BlockTopKResult {
-    /// The packed I32 `[R, 1, T, K + NB]` result.
-    pub packed: Traced,
-    /// The selected block ids `[R, 1, T, K]`, ascending, `-1` after the last selected.
-    pub ids: Traced,
-    /// The `0`/`1` keep indicator of each block `[R, 1, T, NB]`.
-    pub keep: Traced,
 }
 
 /// `(y, s_out)` as the slices of `packed` at the layout's rows.

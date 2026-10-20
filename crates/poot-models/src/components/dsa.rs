@@ -12,7 +12,6 @@
 //! scores plus the causal mask keeps top-k from picking a position the query cannot see.
 
 use poot_graph_ir::ops::MASK_HIDDEN;
-use poot_graph_ir::ops::stable_descending_rank_masked;
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, ops};
 use poot_quant::weights::{
     AttnRole, CompressRole, DsaRole, MlaRole, WeightId, WeightMap, WeightRole,
@@ -422,8 +421,24 @@ fn pooled_keep(
             false,
         )?;
 
-        let rank = stable_descending_rank_masked(b, scores, complete)?; // [rows, t, pools]
-        let chosen = b.binary(BinOp::Mul, keep_top_k_mask(b, rank, p.pool_topk)?, complete)?;
+        // The best `pool_topk` complete pools, ties to the lower pool: the block selection of
+        // `ops::block_top_k_packed` over the pools (`compile` forms `OpKind::BlockTopK` from it); its keep
+        // indicator is the chosen flag of each pool.
+        let kept_pools = p.pool_topk.min(pools);
+        let selection = ops::block_top_k_packed(
+            b,
+            b.reshape(scores, vec![rows, 1, t, pools])?,
+            step.pos(),
+            pool,
+            kept_pools,
+        )?;
+        let chosen = b.reshape(
+            b.cast(
+                b.slice(selection, 3, kept_pools, kept_pools + pools)?,
+                DType::F32,
+            )?,
+            vec![rows, t, pools],
+        )?;
         // Spread each pool's flag over its positions: `[pools, cap]` ones where slot `s` is in pool `j`.
         let starts = b.broadcast(
             b.reshape(
@@ -979,8 +994,8 @@ mod tests {
         /// SC-008: the pooled DSA layer equals the f64 definition at every output and both carried
         /// caches (whole, in two chunks and token by token), with the selection live (two of up to
         /// five complete pools are kept, and the tail positions join them), and each weight changes
-        /// the output. Mutation: an off-by-one in the keep mask (`keep_top_k_mask` over `pool_topk +
-        /// 1`); a third pool joins the attention and the whole-run rows go red.
+        /// the output. Mutation: an off-by-one in the kept pool count (`ops::block_top_k_packed` over
+        /// `pool_topk + 1`); a third pool joins the attention and the whole-run rows go red.
         #[test]
         fn the_pooled_layer_matches_the_definition_and_continues_across_chunks() {
             let fx = fixture();

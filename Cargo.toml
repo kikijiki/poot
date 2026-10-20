@@ -38,7 +38,7 @@ members = [
     "crates/poot-kernel-intrinsics",
     "crates/poot-orchestrator",
     # The cross-framework benchmark runner is a member so the binary that is benchmarked resolves from this
-    # lockfile and is checked by `--workspace` builds (it enables poot-llm's `rocm` feature).
+    # lockfile and is checked by `--workspace` builds.
     "benchmarks/runners/poot",
 ]
 

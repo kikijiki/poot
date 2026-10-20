@@ -10,10 +10,12 @@ use crate::planner::GraphTables;
 use crate::predicates::{attention_lanes, attention_splits};
 use crate::refusal::Site;
 use crate::types::ScratchDecl;
-use poot_graph_ir::{AttentionAttrs, KeyLayout, KvBound, MaskOperand, SelectedAttentionAttrs};
+use poot_graph_ir::{
+    AttentionAttrs, KeyLayout, KvBound, MaskOperand, SelectedAttentionAttrs, SinkOperand,
+};
 use poot_kernelgen::{
-    AttentionCombineSpec, AttentionSchedule, AttentionSpec, KeyBound, KeyLayout as KernelKeyLayout,
-    MaskKind, ScoreTransform,
+    AttentionCombineSpec, AttentionSchedule, AttentionSink, AttentionSpec, KeyBound,
+    KeyLayout as KernelKeyLayout, MaskKind, ScoreTransform,
 };
 use poot_target::{Backend, BufferStorage, DeviceCaps};
 
@@ -39,9 +41,10 @@ pub(super) fn plan(
         n_rep,
         scale,
         softcap,
-        mask: MaskOperand::Additive,
+        mask: mask_operand,
         key,
         bound,
+        sink,
     }) = &eqn.op
     else {
         unreachable!("plan_eqn routes only attention ops here")
@@ -58,10 +61,10 @@ pub(super) fn plan(
         KeyLayout::Paged => (shape(4)[1], v[2]),
         KeyLayout::Single | KeyLayout::Split { .. } => (k[2], v[3]),
     };
-    let mask_kind = if flash_mask_per_head(&mask, hq, "attention")? {
-        MaskKind::PerHead
-    } else {
-        MaskKind::Broadcast
+    let mask_kind = match mask_operand {
+        MaskOperand::Additive if flash_mask_per_head(&mask, hq, "attention")? => MaskKind::PerHead,
+        MaskOperand::Additive => MaskKind::Broadcast,
+        MaskOperand::Causal { window } => MaskKind::Causal { window: *window },
     };
     let lanes = attention_lanes(dv, caps).ok_or_else(|| {
         site.refuse(Capability::AttentionLds {
@@ -98,6 +101,10 @@ pub(super) fn plan(
         bound: match bound {
             KvBound::Capacity => KeyBound::Static,
             KvBound::Live => KeyBound::Live,
+        },
+        sink: match sink {
+            SinkOperand::Absent => AttentionSink::Absent,
+            SinkOperand::PerHead => AttentionSink::PerHead,
         },
         schedule: AttentionSchedule::Streaming { lanes },
     };
@@ -165,6 +172,7 @@ fn plan_selected(
             k: attrs.k,
         },
         bound: KeyBound::Static,
+        sink: AttentionSink::Absent,
         schedule: AttentionSchedule::Streaming { lanes },
     };
     // A decode row considers `(K + 1) * ratio` positions however deep the cache is, but a few heads still leave a

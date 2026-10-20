@@ -145,6 +145,7 @@ impl LayerBytes {
                 WeightView::Stored(key)
                 | WeightView::IndexNarrow(key)
                 | WeightView::RowRange { key, .. }
+                | WeightView::RowOrder { key, .. }
                 | WeightView::BlockColumns { key, .. } => std::slice::from_ref(key),
                 WeightView::RowStack(keys) | WeightView::ExpertStack(keys) => keys.as_slice(),
             };

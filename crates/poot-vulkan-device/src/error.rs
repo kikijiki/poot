@@ -18,6 +18,15 @@ pub enum VulkanGpuError {
         /// Body-local trap id the kernel wrote.
         code: u32,
     },
+    /// `begin` was called while a recording was already open.
+    #[error("vulkan device: begin inside an open recording")]
+    AlreadyRecording,
+    /// `dispatch`, `copy` or `finish` was called with no recording open.
+    #[error("vulkan device: {op} outside begin/finish")]
+    NotRecording {
+        /// The call that found no open recording.
+        op: &'static str,
+    },
 }
 
 impl From<RuntimeError> for VulkanGpuError {

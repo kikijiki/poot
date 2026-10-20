@@ -6,8 +6,6 @@
 //!
 //! Builds the graph with `Model::trace` of the qwen2 family (a paged decode step over a checkpoint of zeros) and classifies the fused equations of the graph `compile` plans.
 
-#![cfg(feature = "rocm")]
-
 use poot_graph_plan::test_support::plan_eqn;
 use poot_graph_plan::{Plan, test_support::compiled_graph};
 use poot_llm::driver::block_table::BLOCK_SIZE;

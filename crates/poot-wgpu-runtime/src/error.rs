@@ -97,13 +97,13 @@ pub enum RuntimeError {
         /// Index of the segment whose offset arithmetic overflowed.
         segment: usize,
     },
-    /// A device-side copy between buffers of different word counts.
-    #[error("cannot copy a {src}-word buffer into a {dst}-word buffer")]
+    /// A device-side copy between buffers of different byte lengths.
+    #[error("cannot copy a {src}-byte buffer into a {dst}-byte buffer")]
     CopyLength {
-        /// Word count of the destination buffer.
-        dst: u32,
-        /// Word count of the source buffer.
-        src: u32,
+        /// Allocated bytes of the destination buffer.
+        dst: u64,
+        /// Allocated bytes of the source buffer.
+        src: u64,
     },
     /// A kernel's `Assert` failed or it reached `Unreachable` on the device (card 531c, R468-007): the
     /// SpirvVulkan error word the kernel atomically wrote was nonzero. `code` is the body-local trap id

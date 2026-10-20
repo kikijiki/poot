@@ -27,8 +27,7 @@ pub fn ptx_stage_dir() -> std::path::PathBuf {
 /// a_rocm, a_ptx)` expands to three `#[test]` functions, each calling `row` with its `$choice` variant (`Wgpu`,
 /// `Rocm`, `Ptx`), so a lane names each by its suffix (`_wgpu`, `_rocm`, `_ptx`) and a backend cannot be left out.
 /// `row` is a function or closure taking the choice. A row on a host without the device skips through the
-/// requirement gate (`poot_runtime_common::device_skip`), as every device row does; a ROCm row on a build
-/// without the `rocm` feature skips the same way.
+/// requirement gate (`poot_runtime_common::device_skip`), as every device row does.
 #[macro_export]
 macro_rules! per_backend {
     ($choice:ident, $row:expr, $wgpu:ident, $rocm:ident, $ptx:ident) => {

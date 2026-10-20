@@ -209,7 +209,10 @@ fn op_selection_mask(
     causal: Traced,
     p: &QsaParams,
 ) -> Result<Traced, TraceError> {
-    let kept = select_blocks(b, step, q, block_k, p)?.keep;
+    let packed = select_blocks(b, step, q, block_k, p)?;
+    let k = kept_blocks(step, p);
+    let blocks = step.shape().capacity.get() / p.ratio;
+    let kept = b.slice(packed, 3, k, k + blocks)?;
     with_tail(b, step, penalty(b, b.cast(kept, DType::F32)?)?, causal, p)
 }
 

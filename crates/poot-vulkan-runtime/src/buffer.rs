@@ -1,9 +1,10 @@
+use crate::owner::QueueGuard;
 use crate::resources::BufferResources;
 use crate::{DeviceOwner, RuntimeError};
 use ash::vk;
 use poot_runtime_common::{AllocGuard, BufferRole};
 use poot_target::{BufferStorage, ElementKind, StorageLayout};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 /// A persistent, host-visible+coherent Vulkan buffer (see the module doc's "Memory model"), mapped for
 /// its whole lifetime. [`DeviceBuffer::read_f32`] copies from the mapped pointer into owned host data.
@@ -12,7 +13,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// ROCm's `RocmBuffer`; spec 133 P2 slice 2b, card 139). Device-resident capture needs this for
 /// `Plan::Alias` (Reshape): the aliased output shares its input's buffer by reference count. The count
 /// is atomic and the shared owner is `Send + Sync`, so a buffer moves to another thread whole (R471-010,
-/// as `PtxBuffer` does); host reads and writes through the mapping serialize on a per-allocation lock.
+/// as `PtxBuffer` does); host reads and writes through the mapping take the device's [`QueueGuard`], the
+/// one lock a replay holds across its submits and fence waits, so no host copy overlaps device access.
 ///
 /// The element count a dispatch writes into the kernel's length buffer is derived from the allocation
 /// ([`DeviceBuffer::elem_count`]), so no caller can widen a kernel's bound past the memory behind it:
@@ -32,8 +34,6 @@ pub(crate) struct DeviceBufferInner {
     pub(crate) memory: vk::DeviceMemory,
     pub(crate) ptr: *mut u8,
     pub(crate) byte_len: usize,
-    /// Serializes host reads and writes through `ptr`, so two clones on two threads cannot race a copy.
-    pub(crate) host_access: Mutex<()>,
     /// Element kind, logical dtype and layout, set at allocation (card 527, R471-009/R484-001): before
     /// this field, a Vulkan buffer carried no element kind at all (unlike ROCm/PTX's `BufferElement`).
     pub(crate) storage: BufferStorage,
@@ -50,11 +50,11 @@ pub(crate) struct DeviceBufferInner {
 // `vkUnmapMemory`/`vkFreeMemory` from any thread given external synchronization, which sole ownership at
 // drop provides). Every other field is `Send`.
 unsafe impl Send for DeviceBufferInner {}
-// SAFETY: a shared reference reaches `ptr` only through `read_bytes_at`/`write_with_at`, which hold
-// `host_access` for the whole copy, so no two host copies overlap. The native handles are never mutated
-// after construction. A host copy racing a GPU access of the same bytes is excluded by the owner's
-// contract: every submission is fence-waited before the call that issued it returns (see
-// `DeviceOwner::submit_and_wait`), and a single `&mut` device issues them.
+// SAFETY: a shared reference reaches `ptr` only through `read_bytes_at`/`write_with_at`/`zero_at`, which
+// take the device's `QueueGuard` as an argument and hold it for the whole copy, so no two host copies
+// overlap. The guard is the lock `DeviceOwner::submit_and_wait` is given and holds across a submit and its
+// fence wait, so a host copy racing a GPU access of the same bytes is excluded by type, whichever threads
+// the buffer, the graph and the context are on. The native handles are never mutated after construction.
 unsafe impl Sync for DeviceBufferInner {}
 
 impl DeviceBuffer {
@@ -75,7 +75,6 @@ impl DeviceBuffer {
                 memory: resources.memory,
                 ptr: resources.ptr,
                 byte_len,
-                host_access: Mutex::new(()),
                 storage,
                 guard,
                 owner: Arc::clone(owner),
@@ -134,7 +133,8 @@ impl DeviceBuffer {
     /// [`RuntimeError::Poisoned`] once a lost submission may still be writing the memory, and with
     /// [`RuntimeError::WriteCapacity`] if `out` is longer than the buffer.
     pub fn read_bytes(&self, out: &mut [u8]) -> Result<(), RuntimeError> {
-        self.read_bytes_at("read_bytes", 0, out)
+        let queue = self.inner.owner.lock_queue();
+        self.read_bytes_at(&queue, "read_bytes", 0, out)
     }
 
     /// Overwrite `len` bytes from byte `offset` of this buffer in place through its persistent `HOST_COHERENT`
@@ -149,7 +149,8 @@ impl DeviceBuffer {
         len: usize,
         fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), RuntimeError> {
-        self.write_with_at("write_with", offset, len, fill)
+        let queue = self.inner.owner.lock_queue();
+        self.write_with_at(&queue, "write_with", offset, len, fill)
     }
 
     /// The byte range `[offset, offset + len)` of this buffer, or [`RuntimeError::WriteCapacity`] when
@@ -167,21 +168,17 @@ impl DeviceBuffer {
     /// Read `out.len()` bytes starting at byte `offset` (see [`Self::read_bytes`]).
     pub(crate) fn read_bytes_at(
         &self,
+        _queue: &QueueGuard<'_>,
         op: &'static str,
         offset: usize,
         out: &mut [u8],
     ) -> Result<(), RuntimeError> {
         self.inner.owner.check_live(op)?;
         self.checked_range(offset, out.len())?;
-        let _host = self
-            .inner
-            .host_access
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         // SAFETY: `ptr` is valid and mapped for `byte_len` bytes for this buffer's whole lifetime; it is
         // the start of a `vkMapMemory` mapping at offset 0, and `offset + out.len() <= byte_len` was
         // just checked. No GPU access is concurrent: every submission fence-waits before returning, and
-        // a lost one poisons the device, refused above. No host copy overlaps this one: `_host` is held.
+        // a lost one poisons the device, refused above. No host copy overlaps this one: the caller holds the device's `QueueGuard`.
         unsafe {
             std::ptr::copy_nonoverlapping(self.inner.ptr.add(offset), out.as_mut_ptr(), out.len());
         }
@@ -193,6 +190,7 @@ impl DeviceBuffer {
     /// the mapped bytes. There is no staging: the buffer is host memory the GPU reads.
     pub(crate) fn write_with_at(
         &self,
+        _queue: &QueueGuard<'_>,
         op: &'static str,
         offset: usize,
         len: usize,
@@ -200,17 +198,12 @@ impl DeviceBuffer {
     ) -> Result<(), RuntimeError> {
         self.inner.owner.check_live(op)?;
         self.checked_range(offset, len)?;
-        let _host = self
-            .inner
-            .host_access
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         // SAFETY: `self.inner.ptr` is mapped HOST_COHERENT for `self.inner.byte_len` bytes for this
         // buffer's whole lifetime (see `Context::alloc_storage`); `offset + len <= byte_len` was just
         // checked. No GPU submission can still be reading/writing this buffer's memory: every submission
         // fence-waits before returning (`DeviceOwner::submit_and_wait`), and one whose wait failed
         // poisoned the device, which `check_live` refused above. No other host access overlaps this one:
-        // `_host` is held, so this is the only reference to the range while `fill` runs.
+        // the caller's `QueueGuard` is held, so this is the only reference to the range while `fill` runs.
         let out = unsafe { std::slice::from_raw_parts_mut(self.inner.ptr.add(offset), len) };
         fill(offset..offset + len, out);
         Ok(())
@@ -218,12 +211,12 @@ impl DeviceBuffer {
 
     /// Zero the whole allocation (a fresh `vkAllocateMemory` block has undefined contents).
     pub(crate) fn zero(&self) -> Result<(), RuntimeError> {
+        let queue = self.inner.owner.lock_queue();
+        self.zero_at(&queue)
+    }
+
+    fn zero_at(&self, _queue: &QueueGuard<'_>) -> Result<(), RuntimeError> {
         self.inner.owner.check_live("zero")?;
-        let _host = self
-            .inner
-            .host_access
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         // SAFETY: `ptr` is mapped for `byte_len` bytes (see `write_with_at`); no GPU access is pending
         // for a buffer this call is given before its first submission or between fence-waited ones.
         unsafe { std::ptr::write_bytes(self.inner.ptr, 0, self.inner.byte_len) };

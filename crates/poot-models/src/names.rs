@@ -45,6 +45,11 @@ pub enum Source {
         /// Which rows of the fused projection this role reads.
         part: FusedPart,
     },
+    /// The tensor `inner` names, its rows stored per head as adjacent pairs `(j, j + head_dim / 2)` and read
+    /// back in the half-split order (all first halves, then all second halves): llama.cpp's Q/K layout for
+    /// its interleaved RoPE, which the model traces as the half-split rotation. Needs
+    /// [`FusedDims::head_dim`].
+    PairedHeads(&'static Source),
 }
 
 /// Which rows of a fused projection a role reads, in the fused tensor's row order.
@@ -71,6 +76,8 @@ pub struct FusedDims {
     pub kv: usize,
     /// Rows of the gate (and of the up) projection.
     pub inter: usize,
+    /// Rows per attention head, for the rows a [`Source::PairedHeads`] reads.
+    pub head_dim: usize,
 }
 
 impl FusedDims {
@@ -79,6 +86,7 @@ impl FusedDims {
         q: 0,
         kv: 0,
         inter: 0,
+        head_dim: 0,
     };
 
     fn rows(self, part: FusedPart) -> std::ops::Range<usize> {
@@ -119,16 +127,28 @@ pub struct NameRow {
 
 impl NameRow {
     fn is_per_layer(&self) -> bool {
-        matches!(
-            self.source,
-            Source::LayerTensor { .. } | Source::LayerLinear { .. } | Source::LayerFused { .. }
-        )
+        match self.source {
+            Source::LayerTensor { .. } | Source::LayerLinear { .. } | Source::LayerFused { .. } => {
+                true
+            }
+            Source::PairedHeads(inner) => NameRow {
+                source: *inner,
+                ..*self
+            }
+            .is_per_layer(),
+            Source::Tensor(_) | Source::Linear(_) => false,
+        }
     }
 
     /// The store keys this row can read at `layer`, in preference order.
     fn candidates(&self, layer: Option<usize>) -> Vec<String> {
         let l = layer.map(|l| l.to_string()).unwrap_or_default();
         match self.source {
+            Source::PairedHeads(inner) => NameRow {
+                source: *inner,
+                ..*self
+            }
+            .candidates(layer),
             Source::Tensor(name) => vec![name.to_string()],
             Source::Linear(stem) => vec![format!("{stem}.weight"), stem.to_string()],
             Source::LayerTensor { prefix, suffix } => vec![format!("{prefix}{l}{suffix}")],
@@ -430,9 +450,10 @@ pub(crate) fn family_weights_routed(
     tables: &[&[NameRow]],
     layers: usize,
     head_required: bool,
+    fused: FusedDims,
     moe: MoeLayers<'_>,
 ) -> Result<WeightMap, ModelError> {
-    let weights = build_map(store, tables, layers, FusedDims::NONE, Some(moe))
+    let weights = build_map(store, tables, layers, fused, Some(moe))
         .map_err(|source| ModelError::Weight { family, source })?;
     check_head(family, weights, head_required)
 }
@@ -632,6 +653,30 @@ pub(crate) fn map_moe_layer(
     Ok(())
 }
 
+/// The stored row each row of the half-split order reads, for `rows` rows of heads of `head_dim` rows
+/// stored as adjacent pairs: head `h`'s row `j` is stored at `2j` and its row `head_dim / 2 + j` at
+/// `2j + 1`, so reading the stored rows in this order undoes llama.cpp's `permute`. `None` when `rows` is
+/// not a whole number of heads or `head_dim` is zero or odd.
+fn half_split_order(rows: usize, head_dim: usize) -> Option<Vec<usize>> {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) || !rows.is_multiple_of(head_dim) {
+        return None;
+    }
+    let half = head_dim / 2;
+    Some(
+        (0..rows)
+            .map(|row| {
+                let (head, within) = (row / head_dim, row % head_dim);
+                let (pair, side) = if within < half {
+                    (within, 0)
+                } else {
+                    (within - half, 1)
+                };
+                head * head_dim + 2 * pair + side
+            })
+            .collect(),
+    )
+}
+
 fn build_map(
     store: &WeightStore,
     tables: &[&[NameRow]],
@@ -678,6 +723,19 @@ fn build_map(
                     key,
                     rows: fused.rows(part),
                 },
+                Source::PairedHeads(_) => {
+                    let rows = store.get(key.as_str()).map_or(0, |entry| entry.shape()[0]);
+                    let order =
+                        half_split_order(rows, fused.head_dim).ok_or(WeightMapError::HeadRows {
+                            id,
+                            rows,
+                            head_dim: fused.head_dim,
+                        })?;
+                    WeightView::RowOrder {
+                        key,
+                        order: order.into(),
+                    }
+                }
                 _ => WeightView::Stored(key),
             };
             map.map(id, view)?;
@@ -976,6 +1034,31 @@ mod tests {
         store.build()
     }
 
+    /// llama.cpp's `permute` (`reshape(heads, 2, d / 2, ..).swapaxes(1, 2)`) stores half-split row
+    /// `(h, side, j)` at `h * d + 2 * j + side`; the order reads each half-split row from there, for two
+    /// heads of eight rows, and refuses rows that are not whole even heads.
+    /// Mutation: swap the two sides in `half_split_order`; every row of the second half reads the wrong
+    /// stored row.
+    #[test]
+    fn the_half_split_order_inverts_llama_cpps_permute() {
+        let (heads, d) = (2, 8);
+        let order = half_split_order(heads * d, d).unwrap();
+        let mut seen = vec![false; heads * d];
+        for h in 0..heads {
+            for side in 0..2 {
+                for j in 0..d / 2 {
+                    let stored = h * d + 2 * j + side;
+                    assert_eq!(order[h * d + side * (d / 2) + j], stored);
+                    seen[stored] = true;
+                }
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "the order is a permutation");
+        assert_eq!(half_split_order(15, 8), None);
+        assert_eq!(half_split_order(9, 3), None);
+        assert_eq!(half_split_order(8, 0), None);
+    }
+
     /// Fused rows read row ranges of the one stored tensor, in `q | k | v` and `gate | up` order,
     /// dense or packed; a missing fused tensor is named.
     #[test]
@@ -984,6 +1067,7 @@ mod tests {
             q: 16,
             kv: 8,
             inter: 12,
+            head_dim: 0,
         };
         let tables: &[&[NameRow]] = &[HF_BASE, HF_FUSED_QKV_GATE_UP];
         let map = build_map(&fused_store(None), tables, 1, dims, None).unwrap();

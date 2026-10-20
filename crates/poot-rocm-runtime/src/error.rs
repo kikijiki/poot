@@ -1,7 +1,7 @@
+use crate::QueuePublicationError;
 use crate::aql::DispatchGeometryViolation;
 use crate::bindings::hsa_status_t;
 use crate::queue::QueueRole;
-use crate::{QueuePublicationError, ffi};
 use poot_target::BufferStorage;
 
 /// Typed HSA error. `Driver(HsaStatus)` carries the raw status; its `Display` maps common ones to
@@ -15,7 +15,7 @@ pub enum RocmError {
     LibraryNotFound(String),
     /// A required HSA symbol was missing from the loaded library.
     #[error("hsa symbol missing: {0}")]
-    MissingSymbol(#[from] ffi::MissingSymbol),
+    MissingSymbol(&'static str),
     /// `hsa_iterate_agents` reported a callback error (e.g. the GPU picker failed).
     #[error("hsa agent enumeration: {0}")]
     AgentEnum(&'static str),

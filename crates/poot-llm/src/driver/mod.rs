@@ -90,9 +90,9 @@ use poot_executor::{
 use poot_graph_ir::ForwardSlotMap;
 use poot_graph_ir::{BoundaryId, Graph, SlotKey, StatePolicy, StateRows};
 use poot_graph_plan::{
-    CompileOptions, ShardRule, WeightFormats, bind_packed_weights, shard, staged::ExpertPlacement,
-    staged::ReadTraffic, staged::StagedCompileError, staged::StagedProgram, staged::TensorParallel,
-    staged::compile_staged,
+    CompileLimits, CompileOptions, ShardRule, WeightFormats, bind_packed_weights, shard,
+    staged::ExpertPlacement, staged::ReadTraffic, staged::StagedCompileError,
+    staged::StagedProgram, staged::TensorParallel, staged::compile_staged,
 };
 use poot_models::io::{InputSet, ModelSchema, ProgramId, ProgramSpec, RequestInputs, StepInput};
 use poot_models::model::{
@@ -280,6 +280,51 @@ pub struct DriverOptions {
     /// window ([`DraftPolicy::carry_window`]): a [`DraftPolicy::Mtp`] driver refuses options that
     /// name none or a narrower one. `None` writes none.
     pub hidden_window: Option<NonZeroUsize>,
+}
+
+impl DriverOptions {
+    /// The prepared entries a [`DriverOptions::generation`] driver may hold.
+    const GENERATION_ENTRIES: usize = 64;
+    /// The host bytes those entries may retain.
+    const GENERATION_RETAINED_BYTES: u64 = 1 << 32;
+
+    /// A replay driver of `capacity` positions that prefills in pieces of at most `prefill_chunk`, with
+    /// no draft policy and the standard prepared-set bounds. The one place those constants live: a
+    /// caller that needs other limits overrides the field it differs in.
+    pub fn generation(capacity: NonZeroUsize, prefill_chunk: NonZeroUsize) -> Self {
+        let compile = CompileOptions::new(CompileLimits::STANDARD);
+        DriverOptions {
+            prefill: compile.clone(),
+            decode: compile,
+            capacity,
+            prefill_chunk,
+            trace: serving_trace_limits(prefill_chunk),
+            prepared: PreparedSetLimits {
+                max_entries: NonZeroUsize::new(Self::GENERATION_ENTRIES).expect("nonzero"),
+                max_retained_bytes: NonZeroU64::new(Self::GENERATION_RETAINED_BYTES)
+                    .expect("nonzero"),
+            },
+            charge: program_retention,
+            draft: DraftPolicy::Off,
+            hidden_window: None,
+        }
+    }
+
+    /// A tower or encoder of `positions` positions: an `encode` step is stateless and takes the whole
+    /// extent, so the capacity and the prefill piece are both `positions`.
+    pub fn tower(positions: NonZeroUsize) -> Self {
+        Self::generation(positions, positions)
+    }
+
+    /// These options with `draft` as the draft policy and the hidden-state window it reads
+    /// ([`DraftPolicy::carry_window`]).
+    pub fn with_draft(self, draft: DraftPolicy) -> Self {
+        DriverOptions {
+            hidden_window: draft.carry_window(),
+            draft,
+            ..self
+        }
+    }
 }
 
 /// One sequence to generate. `sampler` carries its own knobs, penalty history, constraint and seed.

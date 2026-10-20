@@ -1,6 +1,7 @@
 //! Cross-crate standalone kernels (card 559, R468-016): not part of the planner's per-equation kernel
 //! choice (none has a `planner/*.rs` call site), each loaded directly by the crate that needs it -
-//! `poot-rocm-device`'s own executor-contract fixtures and `Device::copy` kernel, and `poot-wgpu-device`'s
+//! `poot-rocm-device`'s own executor-contract fixtures, the executor engine's `copy_words` state-copy kernel
+//! (`poot_executor::CopyKernel`), and `poot-wgpu-device`'s
 //! importer-capability probes (multi-array LDS + barrier, a runtime-value loop bound). Authored in Rust
 //! (`pootc/kernels/probe/*.rs`). Grouped here by destination, not by kernel family, since the "one
 //! manifest" invariant (every committed asset has exactly one entry) applies regardless of who reads it.

@@ -15,9 +15,8 @@ name = "poot-bench-runner"
 path = "src/main.rs"
 
 [dependencies]
-poot-llm = { workspace = true, features = ["rocm"] }
+poot-llm.workspace = true
 poot-executor.workspace = true
-poot-graph-plan.workspace = true
 poot-models.workspace = true
 poot-profile.workspace = true
 poot-quant.workspace = true
@@ -29,6 +28,7 @@ serde_json.workspace = true
 poot-models = { workspace = true, features = ["test-support"] }
 poot-quant = { workspace = true, features = ["test-support"] }
 poot-runtime-common.workspace = true
+poot-target.workspace = true
 poot-tensor.workspace = true
 tokenizers.workspace = true
 

@@ -41,9 +41,10 @@ pub fn mrope_input() -> RequestInput {
     )
 }
 
-/// Which dims a rotation pairs: the two halves of the rotary width (HF checkpoints), or adjacent
-/// even/odd dims (llama.cpp's GGUF Q/K rows, stored permuted for that layout). Both rotate the same
-/// pairs with the same frequencies; they differ in where the pair sits in the stored row order.
+/// Which dims a rotation pairs: the two halves of the rotary width (HF checkpoints, and llama.cpp's GGUF Q/K
+/// rows read back in that order by their name table), or adjacent even/odd dims (a latent-attention
+/// family's own rotation). Both rotate the same pairs with the same frequencies; they differ in where the
+/// pair sits in the row order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RopePairing {
     HalfSplit,

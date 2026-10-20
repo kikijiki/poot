@@ -59,7 +59,7 @@ fn wgpu_device_caps_matches_a_direct_adapter_query() {
     let expected_max_buffer_bytes = if is_amd_radv {
         limits
             .max_buffer_size
-            .min(poot_wgpu_runtime::AMD_RADV_SAFE_MAX_BUFFER_BYTES)
+            .min(poot_target::AMD_RADV_SAFE_MAX_BUFFER_BYTES)
     } else {
         limits.max_buffer_size
     };

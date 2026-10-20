@@ -40,7 +40,7 @@ fn wmma_tile_dispatches_and_matches_cpu_on_ptx() {
     let dir = std::env::temp_dir().join("poot-ptx-wmma-dispatch-probe");
     std::fs::create_dir_all(&dir).unwrap();
     let out = artifact_path(&dir, "wmma_tile_ptx", Target::Nvptx);
-    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::Nvptx, &out)
+    let artifact = compile_kernel(&body, poot_target::Backend::Nvptx, &out)
         .expect("wmma_tile must compile to PTX");
     let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
 
@@ -134,7 +134,7 @@ fn run_attention_over_keys_on_ptx(
     let dir = std::env::temp_dir().join("poot-ptx-attention-dispatch-probe");
     std::fs::create_dir_all(&dir).unwrap();
     let out_path = artifact_path(&dir, name, Target::Nvptx);
-    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::Nvptx, &out_path)
+    let artifact = compile_kernel(&body, poot_target::Backend::Nvptx, &out_path)
         .expect("the attention kernel must compile to PTX");
     let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
 
@@ -195,6 +195,7 @@ fn attention_spec(
         score,
         mask,
         bound: kg::KeyBound::Static,
+        sink: kg::AttentionSink::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes },
     }
 }
@@ -320,7 +321,9 @@ fn attention_fixture_bank_matches_cpu_on_ptx() {
         let mask_heads = match spec.mask {
             kg::MaskKind::Broadcast => 1,
             kg::MaskKind::PerHead => spec.hq,
-            kg::MaskKind::Blocks { .. } => unreachable!("no block-selected row in this table"),
+            kg::MaskKind::Causal { .. } | kg::MaskKind::Blocks { .. } => {
+                unreachable!("no structural-mask row in this table")
+            }
         };
         let mask: Vec<f32> = (0..spec.batch * mask_heads * spec.lq * spec.lk)
             .map(|i| {
@@ -390,6 +393,7 @@ fn attention_split_key_and_live_bound_match_cpu_on_ptx() {
         },
         mask: kg::MaskKind::Broadcast,
         bound: kg::KeyBound::Live,
+        sink: kg::AttentionSink::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes: 8 },
     };
     let len = [37i32, 100, -1, 1000];

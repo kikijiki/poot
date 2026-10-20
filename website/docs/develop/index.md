@@ -28,7 +28,7 @@ see [Architecture](../architecture/index.mdx).
 poot has **three production backends** and a fourth, lower-priority one (`--backend wgpu|rocm|ptx|vulkan`):
 
 - **wgpu** (default): Vulkan/SPIR-V; any modern GPU; most complete continuous-batching library path
-- **rocm**: AMD via raw HSA (`--features rocm`)
+- **rocm**: AMD via raw HSA (loaded at run time, no build flag)
 - **ptx**: NVIDIA via cudarc
 - **vulkan**: the same SPIR-V kernels as wgpu through raw Vulkan; verified on AMD (RADV) only, NVIDIA and Intel Vulkan drivers are untested
 

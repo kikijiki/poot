@@ -10,6 +10,7 @@
 //! Mutation (guards `poot-kernelgen`'s `attention.rs`, applied once, observed red, restored): drop the
 //! `l *= exp(m_old - m_new)` rescale; both rows go red with the worst absolute error against the oracle.
 
+use poot_eval::test_support::StepFixture;
 use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Device, Engine, Executor};
 use poot_executor_parity::{ConstFixture, run_once};
@@ -18,6 +19,7 @@ use poot_graph_ir::ops::{attention_masked, attention_prefill_softcap};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Graph, OpKind};
 use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, compile};
+use poot_kernelgen as kg;
 use poot_kernelgen::KernelRequest;
 use poot_rocm_device::device::RocmDevice;
 use poot_runtime_common::DeviceBackend;
@@ -90,12 +92,24 @@ fn case(
 }
 
 fn check(name: &str, case: &Case) {
-    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
-        return;
-    };
+    check_operands(name, &case.graph, &case.ids, &case.consts, &[], case.lk);
+}
+
+/// `graph` through the contract on ROCm against the oracle, its operands `ids` bound to `consts` and its slot
+/// inputs `slots` (a value and the tensor its step binds), with `lk` keys that must exceed the lanes of the
+/// planned attention kernel.
+fn check_operands(
+    name: &str,
+    graph: &Graph,
+    ids: &[poot_graph_ir::ValueId],
+    consts: &[ConstFixture],
+    slots: &[(poot_graph_ir::ValueId, HostTensor)],
+    lk: usize,
+) -> Option<kg::AttentionSpec> {
+    let device = open_or_skip(DeviceBackend::Rocm, RocmDevice::new())?;
     let target = device.target();
     let program = compile(
-        &case.graph,
+        graph,
         &target,
         &CompileOptions::new(CompileLimits::STANDARD),
     )
@@ -107,26 +121,37 @@ fn check(name: &str, case: &Case) {
     let KernelChoice::Generated(KernelRequest::Attention(spec)) = program.kernel_choice(eqn) else {
         panic!("{name}: expected the generated attention kernel");
     };
+    let spec = spec.clone();
     let lanes = spec.schedule.lanes();
     assert!(
-        case.lk > lanes,
-        "{name}: {} keys must exceed the {lanes} lanes so lanes walk several keys",
-        case.lk
+        lk > lanes,
+        "{name}: {lk} keys must exceed the {lanes} lanes so lanes walk several keys"
     );
 
-    let inputs: HashMap<_, Value> = case
-        .ids
+    let inputs: HashMap<_, Value> = ids
         .iter()
-        .zip(&case.consts)
+        .zip(consts)
         .map(|(&id, c)| (id, Value::from(c.tensor.clone())))
+        .chain(slots.iter().map(|(id, t)| (*id, Value::from(t.clone()))))
         .collect();
-    let want = eval(&case.graph, &inputs, EvalOptions::default())
+    let want = eval(graph, &inputs, EvalOptions::default())
         .unwrap_or_else(|e| panic!("{name}: oracle: {e}"))
         .output
         .into_host()
         .unwrap();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-    let got = run_once(&mut *exec, target, &case.graph, &case.consts, &[])
+    let step: Vec<StepFixture> = slots
+        .iter()
+        .map(|(id, tensor)| StepFixture {
+            key: graph
+                .meta(*id)
+                .slot_key()
+                .expect("a slot has a key")
+                .clone(),
+            tensor: tensor.clone(),
+        })
+        .collect();
+    let got = run_once(&mut *exec, target, graph, consts, &step)
         .unwrap_or_else(|e| panic!("{name}: the attention runs through the contract: {e}"));
     assert_eq!(got.shape(), want.shape(), "{name}");
     let worst = poot_test_util::max_abs_error(got.as_f32().unwrap(), want.as_f32().unwrap());
@@ -134,6 +159,7 @@ fn check(name: &str, case: &Case) {
         worst <= 1e-3,
         "{name} ({lanes} lanes): differs from the oracle by {worst:.3e}"
     );
+    Some(spec)
 }
 
 #[test]
@@ -230,7 +256,156 @@ fn gemma2_softcap_decode_matches_the_oracle_on_rocm() {
     );
 }
 
-/// SC-001 on ROCm, DeepSeek-V2 MLA: `dk` 192 (`k_nope` 128 per head plus the shared 64-wide `k_pe`), `dv` 128,
+/// A GQA attention with a per-head sink: `rows` queries into `lk` keys, over more keys than lanes. The chain's
+/// `Attention` equation carries the sink and matches the oracle. One device per test: a second device opened in
+/// the same process can fail with `HSA_STATUS_ERROR_OUT_OF_RESOURCES`.
+fn check_per_head_sink(label: &str, rows: usize, lk: usize) {
+    let (hq, hkv, d) = (4usize, 2usize, 64usize);
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![1, hq, rows, d]))
+        .unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, lk, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, lk, d]))
+        .unwrap();
+    let m = b
+        .constant("m", TensorType::f32(vec![1, 1, rows, lk]))
+        .unwrap();
+    let sinks = b.constant("sinks", TensorType::f32(vec![hq])).unwrap();
+    let out = poot_graph_ir::ops::attention_masked_sinks(
+        &b,
+        q,
+        k,
+        v,
+        hq / hkv,
+        1.0 / (d as f32).sqrt(),
+        m,
+        sinks,
+    )
+    .unwrap();
+    // Row `i` sees all but the last `rows - 1 - i` keys.
+    let mask = (0..rows * lk)
+        .map(|at| {
+            if at % lk < lk - (rows - 1 - at / lk) {
+                0.0
+            } else {
+                -1.0e9
+            }
+        })
+        .collect();
+    let tensors = [
+        ("q", vec![1, hq, rows, d], fill(1, hq * rows * d)),
+        ("k", vec![1, hkv, lk, d], fill(2, hkv * lk * d)),
+        ("v", vec![1, hkv, lk, d], fill(3, hkv * lk * d)),
+        ("m", vec![1, 1, rows, lk], mask),
+        ("sinks", vec![hq], vec![-1.0, 0.0, 0.25, 2.0]),
+    ];
+    let ids = [q.id(), k.id(), v.id(), m.id(), sinks.id()];
+    let graph = b.finish(out).unwrap();
+    check_operands(
+        label,
+        &graph,
+        &ids,
+        &tensors.map(|(name, shape, data)| ConstFixture {
+            name,
+            tensor: HostTensor::f32(shape, data),
+        }),
+        &[],
+        lk,
+    );
+}
+
+/// SC-001 on ROCm, gpt-oss: a GQA decode with a per-head attention sink, over more keys than lanes, fuses to the
+/// generated attention (the chain's `Attention` equation carries the sink) and matches the oracle. Mutation:
+/// drop the sink from the kernel's initial `(m, l)` state in `attention_body`; the sink's mass vanishes from the
+/// normalizer and the row differs from the oracle.
+#[test]
+fn per_head_sink_decode_matches_the_oracle_on_rocm() {
+    check_per_head_sink("sink decode", 1, 96);
+}
+
+/// SC-001 on ROCm, gpt-oss prefill: three rows into an 80-slot cache with the per-head sink. Mutation: as
+/// `per_head_sink_decode_matches_the_oracle_on_rocm`.
+#[test]
+fn per_head_sink_prefill_matches_the_oracle_on_rocm() {
+    check_per_head_sink("sink prefill", 3, 80);
+}
+
+/// A causal attention of `rows` queries at positions `pos0..pos0 + rows` against `lk` keys under `window`: the
+/// mask `causal_mask_from_pos` traces is stated by the positions (a ranged `Slot::Pos`, as the tracers declare
+/// it), the planned kernel is `MaskKind::Causal` and matches the oracle, which evaluates the mask tensor. One
+/// device per test, as `check_per_head_sink`.
+fn check_causal(label: &str, rows: usize, lk: usize, pos0: i32, window: Option<usize>) {
+    let (hq, hkv, d) = (4usize, 2usize, 64usize);
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![1, hq, rows, d]))
+        .unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, lk, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, lk, d]))
+        .unwrap();
+    let pos = b
+        .slot_ranged(
+            poot_graph_ir::Slot::Pos,
+            TensorType::new(vec![1, rows], DType::I32),
+            poot_graph_ir::IndexRange::below(lk).unwrap(),
+        )
+        .unwrap();
+    let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, lk, window).unwrap();
+    let out = attention_masked(&b, q, k, v, hq / hkv, 1.0 / (d as f32).sqrt(), mask).unwrap();
+    let ids = [q.id(), k.id(), v.id()];
+    let positions = (
+        pos.id(),
+        HostTensor::i32(vec![1, rows], (pos0..pos0 + rows as i32).collect()),
+    );
+    let graph = b.finish(out).unwrap();
+    let consts = [
+        ConstFixture {
+            name: "q",
+            tensor: HostTensor::f32(vec![1, hq, rows, d], fill(1, hq * rows * d)),
+        },
+        ConstFixture {
+            name: "k",
+            tensor: HostTensor::f32(vec![1, hkv, lk, d], fill(2, hkv * lk * d)),
+        },
+        ConstFixture {
+            name: "v",
+            tensor: HostTensor::f32(vec![1, hkv, lk, d], fill(3, hkv * lk * d)),
+        },
+    ];
+    if let Some(spec) = check_operands(label, &graph, &ids, &consts, &[positions], lk) {
+        assert_eq!(spec.mask, kg::MaskKind::Causal { window }, "{label}");
+    }
+}
+
+/// SC-001 (R2-C7-006) on ROCm: a decode at position 77 of a 96-slot cache, every earlier key visible. Mutation:
+/// leave the causal row's `key_end` at the capacity in `attention_body`; the windowed rows below read keys
+/// their window hides and differ from the oracle.
+#[test]
+fn causal_decode_matches_the_oracle_on_rocm() {
+    check_causal("causal decode", 1, 96, 77, None);
+}
+
+/// The same decode under a 20-key window. Mutation: as `causal_decode_matches_the_oracle_on_rocm`.
+#[test]
+fn windowed_decode_matches_the_oracle_on_rocm() {
+    check_causal("windowed decode", 1, 96, 77, Some(20));
+}
+
+/// A prefill of three rows at positions 60..63 of an 80-slot cache under a 12-key window, each row its own
+/// window. Mutation: as `causal_decode_matches_the_oracle_on_rocm`.
+#[test]
+fn windowed_prefill_matches_the_oracle_on_rocm() {
+    check_causal("windowed prefill", 3, 80, 60, Some(12));
+}
+
+/// SC-001 on ROCm, DeepSeek-V2 MLA:/// SC-001 on ROCm, DeepSeek-V2 MLA: `dk` 192 (`k_nope` 128 per head plus the shared 64-wide `k_pe`), `dv` 128,
 /// a split key over more keys than lanes. Mutation: drop the split-key recognition in `peel_key`; no
 /// attention equation is planned and the fixture fails.
 #[test]

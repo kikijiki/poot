@@ -126,6 +126,7 @@ impl StandardFamily for Phi3 {
             q: attention.heads() * attention.head_dim(),
             kv: attention.kv_heads() * attention.head_dim(),
             inter: params.dense_inter(),
+            head_dim: attention.head_dim(),
         };
         family_weights_fused(
             FAMILY,

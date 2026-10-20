@@ -68,7 +68,7 @@ fn gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle() {
     let dir = std::env::temp_dir().join("poot-ptx-device-gumbel-no-contract");
     std::fs::create_dir_all(&dir).unwrap();
     let out = artifact_path(&dir, "sample_gumbel_argmax_batched", Target::Nvptx);
-    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::Nvptx, &out)
+    let artifact = compile_kernel(&body, poot_target::Backend::Nvptx, &out)
         .expect("Gumbel asset must compile to NVPTX");
     let kernel = kernel_handle(&body, &artifact).unwrap();
 

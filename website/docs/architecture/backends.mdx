@@ -7,8 +7,8 @@ sidebar_position: 6
 # Backends
 
 poot has three first-class backends built from one kernel source: **wgpu** (Vulkan/SPIR-V, the
-portable default), **ROCm** (AMD, raw HSA) and **PTX** (NVIDIA). Raw Vulkan has a runtime crate but no
-executor or `Device` implementation. The AMD XDNA2 and Intel NPU4 NPUs are experimental `Device`s (see [NPU Offload](./npu.mdx)). The CPU
+portable default), **ROCm** (AMD, raw HSA) and **PTX** (NVIDIA). Raw Vulkan lowers to the same SPIR-V as wgpu,
+runs on its own runtime and `Device`, and plans against the caps its own device reports. The AMD XDNA2 and Intel NPU4 NPUs are experimental `Device`s (see [NPU Offload](./npu.mdx)). The CPU
 oracle also powers current embeddings and reranking.
 
 Everything from model definition through graph IR, fusion and planning is backend-neutral. Backends
@@ -68,8 +68,8 @@ Verified on NVIDIA L40S through rented pods.
 
 ## ROCm (AMD)
 
-Talks to the GPU through raw HSA rather than HIP math libraries; poot supplies every kernel. Feature
-gated (`--features rocm`).
+Talks to the GPU through raw HSA rather than HIP math libraries; poot supplies every kernel. The HSA library
+is loaded at run time, so ROCm is in every build and `--backend rocm` needs no build flag.
 
 ```
 kernel IR -> poot-codegen (LLVM IR) -> clang -target amdgcn-amd-amdhsa -> HSACO -> HSA queue
@@ -90,7 +90,7 @@ Verified on AMD Radeon 8060S (gfx1151) and gfx1100.
 What a backend can run is decided by planning, not by a list kept here: a graph runs on a backend when
 `compile` succeeds for that target, and a refusal is a typed error naming the op and the capability the
 backend lacks. The [feature matrix](../reference/feature-matrix.md#models-and-weight-formats) is generated
-from those compile results for every model family and weight format on wgpu, ROCm and PTX, and joins the
+from those compile results for every model family and weight format on wgpu, raw Vulkan, ROCm and PTX, and joins the
 stored benchmark refusals. The per-backend differences that are not about support (graph capture, cooperative
 grids, tensor-core matmul, compute dtype) are in its
 [precision and execution model](../reference/feature-matrix.md#precision-and-execution-model) table.

@@ -25,16 +25,15 @@
 //! after a drop.
 
 use std::collections::HashMap;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Layout, LoadOptions,
-    ModelHandle, PreparedSetLimits, open_executor,
+    ModelHandle, open_executor,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::registry::Registry;
@@ -69,13 +68,8 @@ fn number(values: &HashMap<&str, &str>, flag: &str, default: usize) -> Result<us
 }
 
 fn backend(name: Option<&str>) -> Result<BackendChoice> {
-    Ok(match name {
-        None | Some("auto") => BackendChoice::Auto,
-        Some("wgpu") => BackendChoice::Wgpu,
-        Some("rocm") => BackendChoice::Rocm,
-        Some("ptx") => BackendChoice::Ptx,
-        Some("vulkan") => BackendChoice::Vulkan,
-        Some(other) => bail!("--backend {other}: expected wgpu, rocm, ptx, vulkan or auto"),
+    name.map_or(Ok(BackendChoice::Auto), |name| {
+        name.parse().with_context(|| format!("--backend {name}"))
     })
 }
 
@@ -142,21 +136,11 @@ fn main() -> Result<()> {
 
     let granule = target.config().prefill_granule.get();
     let chunk = NonZeroUsize::new(128usize.div_ceil(granule) * granule).expect("nonzero");
-    let compile = CompileOptions::new(CompileLimits::STANDARD);
-    let options = DriverOptions {
-        prefill: compile.clone(),
-        decode: compile,
-        capacity: NonZeroUsize::new(prompt_tokens.len() + new).expect("nonzero"),
-        prefill_chunk: chunk,
-        trace: poot_llm::driver::serving_trace_limits(chunk),
-        prepared: PreparedSetLimits {
-            max_entries: NonZeroUsize::new(64).expect("nonzero"),
-            max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),
-        },
-        charge: poot_llm::driver::program_retention,
-        hidden_window: policy.carry_window(),
-        draft: policy,
-    };
+    let options = DriverOptions::generation(
+        NonZeroUsize::new(prompt_tokens.len() + new).expect("nonzero"),
+        chunk,
+    )
+    .with_draft(policy);
     let mut driver = Driver::new(
         Arc::clone(&target),
         open_executor(backend(values.get("--backend").copied())?)?,

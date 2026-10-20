@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use poot_graph_ir::UnOp;
 use poot_graph_ir::op::{FusedOp, FusedOperand, FusedRegion, FusedStep};
+use poot_graph_ir::test_support::composites;
 use poot_graph_ir::test_support::graph_fixtures::derive;
 use poot_graph_ir::{
     BinOp, BlockTopKAttrs, Builder, Eqn, Graph, OpKind, Operand, Scalar, TensorType,
@@ -148,9 +149,8 @@ fn a_device_below_the_block_top_k_workgroup_is_refused_with_both_numbers() {
     let pos = b
         .constant("pos", TensorType::new(vec![1, 2], DType::I32))
         .unwrap();
-    let selection = b
-        .block_top_k(BlockTopKAttrs { ratio: 2, k: 2 }, scores, pos)
-        .unwrap();
+    let selection =
+        composites::block_top_k(&b, BlockTopKAttrs { ratio: 2, k: 2 }, scores, pos).unwrap();
     let g = b.finish(selection.packed).unwrap();
     let mut caps = DeviceCaps::wgpu_rdna3_igpu();
     caps.lds_bytes = 16;
@@ -170,6 +170,47 @@ fn a_device_below_the_block_top_k_workgroup_is_refused_with_both_numbers() {
             ..
         } => assert_eq!((lds_bytes, lds_needed > 16), (16, true)),
         other => panic!("expected BlockTopKWorkgroup, got {other:?}"),
+    }
+}
+
+/// The same refusal through `compile`, from the composition a tracer states: the selection pass forms the
+/// `BlockTopK` and the small device refuses that op with its workgroup numbers, not the first primitive of the
+/// quadratic rank chain it replaced (which no device lowers). Mutation: make `compile` run the selection pass
+/// as a revertible rewrite (`pipeline.run`); the refusal reverts to the composition and this row goes red
+/// (`expected BlockTopKWorkgroup, got DtypeLowering` on the chain's `Cast`).
+#[test]
+fn a_traced_block_selection_on_a_small_device_is_refused_as_the_block_top_k() {
+    let b = Builder::for_tests();
+    let scores = b
+        .constant("scores", TensorType::f32(vec![1, 1, 2, 8]))
+        .unwrap();
+    let pos = b
+        .slot_ranged(
+            poot_graph_ir::Slot::Pos,
+            TensorType::new(vec![1, 2], DType::I32),
+            poot_graph_ir::IndexRange::below(16).unwrap(),
+        )
+        .unwrap();
+    let packed = poot_graph_ir::ops::block_top_k_packed(&b, scores, pos, 2, 2).unwrap();
+    let g = b.finish(packed).unwrap();
+    let mut caps = DeviceCaps::wgpu_rdna3_igpu();
+    caps.lds_bytes = 16;
+    let target = Target::Gpu {
+        backend: poot_target::Backend::SpirvVulkan,
+        caps,
+    };
+    let options = poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
+    let refused = poot_graph_plan::compile(&g, &target, &options).map(|_| ());
+    let Err(poot_graph_plan::CompileError::Plan(plan)) = refused else {
+        panic!("expected the block top-k's refusal, got {refused:?}")
+    };
+    match *plan {
+        PlanError::Refused(refusal) => assert!(
+            matches!(refusal.missing, Capability::BlockTopKWorkgroup { .. }),
+            "expected BlockTopKWorkgroup, got {:?}",
+            refusal.missing
+        ),
+        other => panic!("expected a typed refusal, got {other:?}"),
     }
 }
 

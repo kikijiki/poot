@@ -879,8 +879,7 @@ mod step_encode_allocation_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = poot_codegen::artifact_path(&dir, name, poot_codegen::Target::SpirvVulkan);
         let artifact =
-            poot_codegen::compile_kernel(body, poot_codegen::GpuTarget::SpirvVulkan, &path)
-                .unwrap();
+            poot_codegen::compile_kernel(body, poot_target::Backend::SpirvVulkan, &path).unwrap();
         poot_codegen::kernel_handle(body, &artifact).unwrap()
     }
 

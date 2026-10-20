@@ -3,9 +3,9 @@
 //! keys of this one family; there is no separate Mistral tracer.
 //!
 //! The body is `standard_stack` over `standard_layer` with the shared attention and gated FFN. A
-//! llama-architecture GGUF stores Q and K rows permuted for interleaved RoPE, so the GGUF
-//! family traces the interleaved rotation over the stored rows instead of un-permuting the weights
-//! (the dot products Q.K are the same).
+//! llama-architecture GGUF stores Q and K rows permuted for llama.cpp's interleaved RoPE; its name
+//! table ([`GGUF_PAIRED_QK`]) reads them back in the half-split order, so the GGUF and the HF checkpoint
+//! trace one and the same rotation, which the planner fuses.
 
 use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
 
@@ -14,10 +14,10 @@ use crate::components::moe::MoeParams;
 use crate::components::rope::{GGUF_ROPE_FREQS, rope_freq_factors};
 use crate::components::router::RouterKind;
 use crate::model::{ConfigReason, FamilyKey, ModelError};
-use crate::names::gguf::GGUF_BASE;
+use crate::names::gguf::{GGUF_BASE, GGUF_PAIRED_QK};
 #[cfg(feature = "test-support")]
 use crate::names::hf_base_shapes;
-use crate::names::{ExpertNames, HF_BASE, MoeNames};
+use crate::names::{ExpertNames, HF_BASE, MoeNames, NameRow};
 #[cfg(feature = "test-support")]
 use crate::registry::Fixture;
 use crate::registry::{ConfigSource, FamilyEntry, RawConfig};
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use poot_text::{ChatFormat, LlamaToolCodec, MistralToolCodec, ToolCallCodec};
 
 use crate::components::standard_family::{
-    Mlp, StandardFamily, StandardParams, entry, weights_with_experts,
+    Mlp, StandardFamily, StandardParams, entry, require_whole_head_rotation, weights_with_experts,
 };
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("llama");
@@ -172,9 +172,6 @@ impl StandardFamily for Llama {
             }
             RawConfig::HfJson { .. } | RawConfig::Gguf(_) => Dialect::Llama3,
         };
-        if matches!(raw, RawConfig::Gguf(_)) {
-            attention = attention.with_interleaved_rope();
-        }
         let norm = dims.norm(&fields, &SPEC)?;
         let mut params = StandardParams {
             embeddable: true,
@@ -207,9 +204,10 @@ impl StandardFamily for Llama {
         store: &WeightStore,
         params: &mut StandardParams,
     ) -> Result<WeightMap, ModelError> {
-        let (rows, moe_names) = match raw.source() {
-            ConfigSource::HfModelType => (HF_BASE, &HF_MOE),
+        let (tables, moe_names): (&[&[NameRow]], _) = match raw.source() {
+            ConfigSource::HfModelType => (&[HF_BASE], &HF_MOE),
             ConfigSource::GgufArchitecture => {
+                require_whole_head_rotation(FAMILY, params)?;
                 if let Some(entry) = store.get(GGUF_ROPE_FREQS) {
                     let factors = rope_freq_factors(FAMILY, entry)?;
                     for attention in &mut params.attention {
@@ -218,10 +216,10 @@ impl StandardFamily for Llama {
                             .map_err(|e| e.for_family(FAMILY))?;
                     }
                 }
-                (GGUF_BASE, &GGUF_MOE)
+                (&[GGUF_BASE, GGUF_PAIRED_QK], &GGUF_MOE)
             }
         };
-        weights_with_experts(FAMILY, store, &[rows], moe_names, params)
+        weights_with_experts(FAMILY, store, tables, moe_names, params)
     }
 }
 
@@ -646,14 +644,67 @@ mod tests {
         let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
         let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
-        // The K cache holds rotated, permuted rows: compare the V cache and the next logits.
+        // The GGUF rows are read back in the half-split order at load, so the K cache holds the same
+        // rotated rows as the HF body's, not permuted ones: compare the whole state and the next logits.
         let (got, _) = run_step(&*model, &store, CAP, &[5], 4, &state);
         let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
         close(&got, &want);
-        close_all(
-            &[state[1].clone(), state[3].clone()],
-            &[want_state[1].clone(), want_state[3].clone()],
+        close_all(&state, &want_state);
+    }
+
+    /// SC-002 (POOT-1238): the plan of a Q8_0 llama GGUF decode fuses the rotation of every layer's Q and
+    /// K to a `Rope` op, exactly as the HF checkpoint's does, and records no rope decline: the GGUF's
+    /// permuted Q/K rows are read back in the half-split order by the name table, so no tracer chooses a
+    /// rotation by container. This row guards the fusion (the container branch), not the row order: that
+    /// the stored rows are un-permuted correctly is guarded by the Q8_0 equivalence test above, which
+    /// compares the logits and the whole state, and by `the_half_split_order_inverts_llama_cpps_permute`.
+    /// Mutation: restore the container branch in `configure` (`if matches!(raw, RawConfig::Gguf(_)) {
+    /// attention = attention.with_interleaved_rope() }`) and read the stored rows with `GGUF_BASE` alone;
+    /// the logits still agree but the GGUF plan has no `Rope` op: `left: 0`, `right: 4`.
+    #[test]
+    fn a_gguf_llama_decode_plan_fuses_rope_like_the_hf_checkpoint() {
+        use poot_graph_ir::OpKind;
+        use poot_graph_plan::{CompileLimits, CompileOptions, FusionDeclineReason, Target};
+        use poot_target::Backend;
+
+        use crate::test_support::weight_map::trace;
+
+        let target = Target::Gpu {
+            backend: Backend::SpirvVulkan,
+            caps: poot_test_util::device_caps::default_caps_for(Backend::SpirvVulkan),
+        };
+        let ropes = |model: &dyn Model| {
+            let graph = trace(model, model.weights(), 1, CAP);
+            let program = poot_graph_plan::compile(
+                &graph,
+                &target,
+                &CompileOptions::new(CompileLimits::STANDARD),
+            )
+            .unwrap();
+            let rope_declines = program
+                .declines()
+                .iter()
+                .filter(|decline| matches!(decline.reason, FusionDeclineReason::Rope(_)))
+                .count();
+            let ropes = program
+                .graph()
+                .eqns()
+                .iter()
+                .filter(|eqn| matches!(eqn.op, OpKind::Rope { .. }))
+                .count();
+            (ropes, rope_declines)
+        };
+        let (index, store, reference_store) = gguf_case();
+        let registry = Registry::builtin().unwrap();
+        let gguf = assert_gguf_resolves_and_traces_packed(&registry, &ENTRY, &index, &store, 14);
+        let hf = model_of(&fixture_config(), &reference_store);
+        let layers = 2;
+        assert_eq!(
+            ropes(&*hf),
+            (2 * layers, 0),
+            "the HF body fuses q and k of every layer"
         );
+        assert_eq!(ropes(&*gguf), ropes(&*hf));
     }
 
     /// llama.cpp's converter rule for `rope_freqs.weight` (llama3 scaling), in f64 over the fixture's

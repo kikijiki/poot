@@ -3,6 +3,10 @@
 # a row that prints a skip report fails whether listed or not. Sorted in canonical (LC_ALL=C) order; every row must run in the lane or the gate fails.
 poot-vulkan-runtime	context::init::launch_caps_tests::a_fixed_size_and_a_missing_feature_are_reported_as_such	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	context::init::launch_caps_tests::launch_caps_carry_the_reported_limits_and_the_subgroup_range	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	context::select::tests::a_device_without_a_compute_queue_is_skipped	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	context::select::tests::a_device_without_mappable_device_local_memory_is_refused	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	context::select::tests::a_gpu_outranks_a_software_device_listed_first	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	context::select::tests::the_larger_device_local_heap_breaks_a_type_tie	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	features::tests::a_device_without_robust_buffer_access_is_refused	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	features::tests::the_enabled_core_features_include_robust_buffer_access	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	spirv::tests::a_malformed_instruction_ends_the_scan_without_reading_past_it	raw Vulkan runtime row; selected by package so none goes unrun

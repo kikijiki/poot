@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use poot_graph_ir::test_support::composites;
 use poot_graph_ir::test_support::selected_attention::{Case, cases, fill};
 use poot_graph_ir::{
     Builder, Outputs, SelectedAttentionAttrs, ShapeError, TensorType, ValueId, ops,
@@ -51,9 +52,7 @@ fn fixture(case: &Case) -> Fixture {
     let pos = b
         .constant("pos", TensorType::new(vec![batch, lq], DType::I32))
         .unwrap();
-    let out = b
-        .selected_attention(attrs(case), q, k, v, ids, pos)
-        .unwrap();
+    let out = composites::selected_attention(&b, attrs(case), [q, k, v, ids, pos]).unwrap();
     Fixture {
         graph: b.finish(Outputs::new(out)).unwrap(),
         ids: [q.id(), k.id(), v.id(), ids.id(), pos.id()],

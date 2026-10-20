@@ -13,8 +13,6 @@
 //! fails the plan row before any launch ("fuse: the program runs it"); `DEADLINE` of 1 ms
 //! aborts the process with "HANG: routed prefill did not complete within 1ms".
 
-#![cfg(feature = "rocm")]
-
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 

@@ -10,6 +10,8 @@ rust-version.workspace = true
 
 [dependencies]
 poot-runtime-common.workspace = true
+# `TargetId`, the device a timing snapshot belongs to.
+poot-target.workspace = true
 
 [lints]
 workspace = true

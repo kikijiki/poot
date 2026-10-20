@@ -54,22 +54,13 @@ pub enum Unsupported {
         /// The slot key the traced program declares, which nothing binds.
         key: String,
     },
-    /// This build has no executor for the requested backend; the backend's cargo feature of the same
-    /// name (`--features {backend}`) builds it in.
-    #[error(
-        "backend {backend} is not built into this binary: rebuild with `--features {backend}` to enable it"
-    )]
-    Backend {
-        /// The backend's name, as its cargo feature spells it.
-        backend: &'static str,
-    },
     /// The backend's devices cannot exchange values with one another, so no multi-device placement
     /// runs on it.
     #[error(
         "backend {backend} has no peer copies between its devices: a multi-device placement needs ptx"
     )]
     MultiDevice {
-        /// The backend's name, as its cargo feature spells it.
+        /// The backend's name, as `--backend` spells it.
         backend: &'static str,
     },
     /// The draft policy cannot be served on this model or with this draft.

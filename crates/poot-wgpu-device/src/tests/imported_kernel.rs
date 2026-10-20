@@ -26,9 +26,8 @@ fn load(
     let dir = std::env::temp_dir().join("poot-wgpu-device-imported-kernel-probe");
     std::fs::create_dir_all(&dir).unwrap();
     let out_path = poot_codegen::artifact_path(&dir, name, poot_codegen::Target::SpirvVulkan);
-    let artifact =
-        poot_codegen::compile_kernel(body, poot_codegen::GpuTarget::SpirvVulkan, &out_path)
-            .unwrap_or_else(|e| panic!("{name} must compile to SPIR-V: {e}"));
+    let artifact = poot_codegen::compile_kernel(body, poot_target::Backend::SpirvVulkan, &out_path)
+        .unwrap_or_else(|e| panic!("{name} must compile to SPIR-V: {e}"));
     let compiled = poot_codegen::kernel_handle(body, &artifact).unwrap();
     device
         .load_kernel(name, compiled)

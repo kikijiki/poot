@@ -521,6 +521,13 @@ impl<D: Device> Device for Counting<D> {
     type Recording = D::Recording;
     type Error = D::Error;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        self.inner.copy_mechanism()
+    }
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+
     fn target(&self) -> Target {
         self.inner.target()
     }

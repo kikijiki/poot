@@ -46,7 +46,7 @@ use poot_graph_ir::op::OpKind;
 use poot_graph_ir::ops::MASK_HIDDEN;
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{
-    BinOp, ComputedConst, ContractionRows, KeyLayout, Scalar, StateRole, WeightRef,
+    BinOp, ComputedConst, ContractionRows, KeyLayout, MaskOperand, Scalar, StateRole, WeightRef,
 };
 use poot_quant::PackedWeight;
 use poot_tensor::DType;
@@ -1100,7 +1100,11 @@ fn pad_kv_extents(
     let mut widened: HashMap<ValueId, ValueId> = HashMap::new();
     for (index, eqn) in g.eqns().iter().enumerate() {
         let mut eqn = eqn.clone();
-        if readers.contains(&index) && matches!(eqn.op, OpKind::Attention(_)) {
+        // A causal mask states which keys are visible, so a key past every position (the pad column) is
+        // hidden by the operand it already has; only a materialized mask needs the column.
+        if readers.contains(&index)
+            && matches!(&eqn.op, OpKind::Attention(a) if a.mask == MaskOperand::Additive)
+        {
             let Operand::Value(mask) = eqn.inputs[3] else {
                 unreachable!("an attention mask is a value, not a literal");
             };

@@ -167,7 +167,7 @@ fn pooled_deepseek3_tokens_equal_the_recorded_literals_wgpu() {
     pooled_tokens_equal_the_recorded_literals(BackendChoice::Wgpu, DeviceBackend::Wgpu);
 }
 
-/// Without the `rocm` feature the device does not open and the row skips.
+/// Without an AMD GPU the device does not open and the row skips.
 #[test]
 fn pooled_deepseek3_tokens_equal_the_recorded_literals_rocm() {
     pooled_tokens_equal_the_recorded_literals(BackendChoice::Rocm, DeviceBackend::Rocm);

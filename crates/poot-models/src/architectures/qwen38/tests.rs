@@ -725,6 +725,7 @@ mod reference {
 use reference::Reference;
 
 mod gguf;
+mod production_dims;
 
 /// A fixture, the prompt run through it and the cache it is traced at.
 struct Case {

@@ -216,7 +216,7 @@ fn parallel_generate_equals_the_oracle_tokens_wgpu() {
     assert_generate_matches_the_oracle(BackendChoice::Wgpu, DeviceBackend::Wgpu);
 }
 
-/// The device half on ROCm (the `rocm` feature; without it the device does not open and the row skips).
+/// The device half on ROCm (without an AMD GPU the device does not open and the row skips).
 #[test]
 fn parallel_generate_equals_the_oracle_tokens_rocm() {
     assert_generate_matches_the_oracle(BackendChoice::Rocm, DeviceBackend::Rocm);

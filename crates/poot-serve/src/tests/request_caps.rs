@@ -300,8 +300,9 @@ fn assert_nothing_reached(queue: &Receiver<EngineMsg>) {
 
 /// SC-004. A front end that panics turns `/health` to `dead` and the request in flight fails with a typed
 /// server error well inside the deadline; a request after it fails too. Mutation: remove the
-/// `catch_unwind` in `spawn_vision_thread` (run the loop bare); `/health` stays `serving` and the row
-/// goes red.
+/// `catch_unwind` in `run_vision_thread` (run the front end bare); `/health` stays `serving` and the row
+/// goes red. Mutation 2: publish `Dead` after the reply is dropped; the request fails first and the row
+/// reads `serving` at its health check.
 #[test]
 fn a_panicking_vision_thread_turns_health_dead_and_fails_the_request() {
     let rig = vision_rig(Behaviour::Panic, Duration::from_secs(30));

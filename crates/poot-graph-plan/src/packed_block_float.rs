@@ -17,38 +17,15 @@ pub enum PackedKernelOpKind {
     Contraction,
 }
 
-/// The three lowering backends, without [`AmdArch`](poot_target::AmdArch)'s runtime gfx/wave detail:
-/// packed-lowering admission never depends on which AMD part is attached, only on the backend
-/// family, and a bare discriminant is `const`-constructible (a full `Backend` is not: `AmdArch` is
-/// detected at runtime, never a compile-time constant).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PackedLoweringBackend {
-    /// The SPIR-V family: the Vulkan and wgpu backends.
-    SpirvVulkan,
-    /// The AMD GCN family: the ROCm backend, whatever the attached part.
-    AmdGcn,
-    /// The NVIDIA PTX family.
-    Nvptx,
-}
-
-impl From<Backend> for PackedLoweringBackend {
-    fn from(backend: Backend) -> Self {
-        match backend {
-            Backend::SpirvVulkan => Self::SpirvVulkan,
-            Backend::AmdGcn(_) => Self::AmdGcn,
-            Backend::Nvptx => Self::Nvptx,
-        }
-    }
-}
-
 /// One row of the descriptor-driven packed lowering table (dquant.md D3, section 5). `admits` is a
 /// descriptor PREDICATE, never a list of scheme names (the 539a rule applied to planning): a new
 /// format that satisfies an existing predicate needs no new row.
 pub struct PackedLoweringRow {
     /// The kernel op the row lowers.
     pub op: PackedKernelOpKind,
-    /// The backend families the row lowers on.
-    pub backends: &'static [PackedLoweringBackend],
+    /// Whether the row lowers on a backend. A predicate, not a list: a [`Backend`] carries the runtime
+    /// `AmdArch`, so it is not `const`-constructible, and admission never depends on which AMD part is attached.
+    pub backends: fn(Backend) -> bool,
     /// The descriptor predicate a format must satisfy for the row to admit it.
     pub admits: fn(&poot_quant::format::FormatDescriptor) -> bool,
 }
@@ -79,11 +56,10 @@ fn admits_blocks_or_planar(descriptor: &poot_quant::format::FormatDescriptor) ->
     admits_blocks(descriptor) || admits_planar(descriptor)
 }
 
-const EVERY_BACKEND: &[PackedLoweringBackend] = &[
-    PackedLoweringBackend::SpirvVulkan,
-    PackedLoweringBackend::AmdGcn,
-    PackedLoweringBackend::Nvptx,
-];
+/// A row that lowers on every backend.
+fn every_backend(_: Backend) -> bool {
+    true
+}
 
 /// The descriptor-driven packed kernel lowering table (card 542a covers `RowGather` and `Contraction`
 /// for the block-32 formats on every backend; 542b widens block admission to every block-storage
@@ -93,12 +69,12 @@ const EVERY_BACKEND: &[PackedLoweringBackend] = &[
 pub const PACKED_LOWERING: &[PackedLoweringRow] = &[
     PackedLoweringRow {
         op: PackedKernelOpKind::RowGather,
-        backends: EVERY_BACKEND,
+        backends: every_backend,
         admits: admits_blocks,
     },
     PackedLoweringRow {
         op: PackedKernelOpKind::Contraction,
-        backends: EVERY_BACKEND,
+        backends: every_backend,
         admits: admits_blocks_or_planar,
     },
 ];
@@ -114,10 +90,9 @@ pub fn admit_packed(
 ) -> Result<poot_quant::format::WeightFormat, crate::refusal::Capability> {
     let format = weight.format();
     let descriptor = format.descriptor();
-    let backend_kind = PackedLoweringBackend::from(backend);
-    let admitted = table.iter().any(|row| {
-        row.op == kind && row.backends.contains(&backend_kind) && (row.admits)(&descriptor)
-    });
+    let admitted = table
+        .iter()
+        .any(|row| row.op == kind && (row.backends)(backend) && (row.admits)(&descriptor));
     if !admitted {
         return Err(crate::refusal::Capability::PackedLowering { format, op: kind });
     }
@@ -131,6 +106,11 @@ mod packed_lowering_tests {
     use super::*;
     use crate::refusal::Capability;
 
+    /// A test table row that lowers on the SPIR-V backend only.
+    fn spirv_only(backend: Backend) -> bool {
+        matches!(backend, Backend::SpirvVulkan)
+    }
+
     /// SC-006 (card 542a): a test-only table without the Gemv row yields
     /// `Refusal { missing: PackedLowering { format, op } }` naming the equation at claim time, not a
     /// panic. Mutation: restore the row (use `PACKED_LOWERING`, which does have every op); the
@@ -140,7 +120,7 @@ mod packed_lowering_tests {
         let table = &[
             PackedLoweringRow {
                 op: PackedKernelOpKind::RowGather,
-                backends: &[PackedLoweringBackend::SpirvVulkan],
+                backends: spirv_only,
                 admits: admits_blocks,
             },
             // No Contraction row: a Gemv contraction has nothing to admit it.
@@ -196,7 +176,7 @@ mod packed_lowering_tests {
         let table = &[
             PackedLoweringRow {
                 op: PackedKernelOpKind::RowGather,
-                backends: &[PackedLoweringBackend::SpirvVulkan],
+                backends: spirv_only,
                 admits: admits_blocks,
             },
             // No Contraction row: a Tiled contraction has nothing to admit it.
@@ -316,12 +296,12 @@ mod packed_lowering_tests {
         let table = &[
             PackedLoweringRow {
                 op: PackedKernelOpKind::RowGather,
-                backends: &[PackedLoweringBackend::SpirvVulkan],
+                backends: spirv_only,
                 admits: admits_blocks,
             },
             PackedLoweringRow {
                 op: PackedKernelOpKind::Contraction,
-                backends: &[PackedLoweringBackend::SpirvVulkan],
+                backends: spirv_only,
                 admits: admits_blocks,
             },
             // Every row admits block storage only: a planar descriptor has nothing to admit it.

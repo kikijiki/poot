@@ -61,6 +61,13 @@ impl Device for EchoDevice {
     type Recording = ();
     type Error = EchoError;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        poot_executor::CopyMechanism::Native
+    }
+    fn backend_name(&self) -> &'static str {
+        "fake"
+    }
+
     fn target(&self) -> Target {
         Target::Gpu {
             backend: Backend::SpirvVulkan,

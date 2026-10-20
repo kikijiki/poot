@@ -14,7 +14,9 @@
 //! abort poisons the whole engine (`Device::abort` itself can never run again once poisoned - one
 //! engine drives one device, so there is nothing left to recover).
 
-use poot_runtime_common::{BufferRole, DeviceIdentity, VpuBinding, VpuGraphArtifact, VpuLayer};
+use poot_runtime_common::{
+    BufferRole, CompiledKernel, DeviceIdentity, VpuBinding, VpuGraphArtifact, VpuLayer,
+};
 use std::collections::HashMap;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::ops::Range;
@@ -33,12 +35,13 @@ use poot_graph_plan::{
 use poot_kernel_ir::Body;
 use poot_quant::SourceRole;
 use poot_quant::weights::{StoreGeneration, WeightMap, WeightStore};
-use poot_target::{AieCaps, AieTargetId, Backend, BufferStorage, TargetId, VpuTargetId};
+use poot_target::{AieCaps, AieTargetId, BufferStorage, TargetId, VpuTargetId};
 use poot_tensor::DType;
 
 use crate::binder::{self, BoundSlot, EmbedRows, StoredAs, WeightBinder};
 use crate::device::{
-    AieInvocation, Arg, Device, DeviceTime, Dispatch, LaunchKind, VpuInvocation, WeightUpload,
+    AieInvocation, Arg, CopyKernel, CopyMechanism, Device, DeviceTime, Dispatch, LaunchKind,
+    VpuInvocation, WeightUpload,
 };
 use crate::error::{BindError, ChainError, DeviceError, DispatchError, ExecError, LoadError};
 use crate::shared_kernels::{SharedKernels, SharedKernelsMismatch};
@@ -83,6 +86,9 @@ pub struct Engine<D: Device> {
     shared_kernels: Option<SharedKernels>,
     /// Kernels this engine resolved through `kernel_cache` ([`ExecutorStats::kernels_resolved`]).
     kernels_resolved: u64,
+    /// Whether the device already holds its state-copy kernel ([`CopyMechanism::Kernel`]); always false
+    /// for a device that copies natively.
+    copy_kernel_loaded: bool,
     /// Every live weight upload, by what it uploads. Weak: an upload lives exactly as long as some
     /// executable (or a pending release of one) holds it, so a replaced adapter's weights are freed
     /// once nothing references them while a base shared with another executable stays.
@@ -445,17 +451,11 @@ fn target_of<D: Device>(device: &D) -> TargetId {
 }
 
 pub(crate) fn device_error<E: std::error::Error + Send + Sync + 'static>(
-    target: TargetId,
+    backend: &'static str,
 ) -> impl Fn(E) -> ExecError {
     move |source| {
         ExecError::from(DeviceError {
-            backend: match target {
-                TargetId::Gpu(Backend::SpirvVulkan) => "wgpu",
-                TargetId::Gpu(Backend::AmdGcn(_)) => "rocm",
-                TargetId::Gpu(Backend::Nvptx) => "ptx",
-                TargetId::Aie(_) => "xdna",
-                TargetId::Vpu(_) => "intel-npu",
-            },
+            backend,
             source: Box::new(source),
         })
     }
@@ -606,8 +606,15 @@ impl<D: Device> Engine<D> {
     pub fn with_timing(device: D, timing: TimingOptions) -> Self {
         let target = device.target().id();
         let snapshot = match &timing {
-            TimingOptions::CountersOnly => poot_profile::TimingSnapshot::default(),
+            TimingOptions::CountersOnly => poot_profile::TimingSnapshot::new(
+                target,
+                poot_profile::BuildIdentity::current(),
+                0,
+                0,
+            ),
             TimingOptions::Detailed(d) => poot_profile::TimingSnapshot::new(
+                target,
+                poot_profile::BuildIdentity::current(),
                 d.max_retained_steps,
                 d.max_retained_dispatch_records,
             ),
@@ -627,6 +634,7 @@ impl<D: Device> Engine<D> {
                 .map(poot_codegen::KernelCache::open),
             shared_kernels: None,
             kernels_resolved: 0,
+            copy_kernel_loaded: false,
             residency: HashMap::new(),
             weight_bytes_read: 0,
             host_write_bytes: 0,
@@ -706,23 +714,16 @@ impl<D: Device> Engine<D> {
             .ok_or_else(|| LoadError::UnknownHandle.into())
     }
 
-    /// Kernel index for `body`, compiling it for GPU `backend` on first use (Card 656: the full
-    /// verified `Body` is the cache's identity, not a display key - `kernel_index` itself keys on
-    /// `KernelCache::key(body)`'s content fingerprint, so two equations sharing a planner `key`
-    /// string but compiling to different bodies never collide here, before `kernel_cache`'s own
-    /// content-keyed lookup ever runs). `key` is used only as the device's debug label.
-    fn kernel(
+    /// `body` compiled for this engine's target, resolved through the kernel cache (the shared table when
+    /// the engine has one). `key` names it in a refusal.
+    fn compile(
         &mut self,
-        backend: Backend,
         key: &str,
         body: &Body,
         max_artifact_bytes: NonZeroU64,
-    ) -> Result<usize, ExecError> {
+    ) -> Result<CompiledKernel, ExecError> {
         let cache = kernel_cache_of(&self.kernel_cache, target_of(&self.device))?;
         let id = cache.key(body).id();
-        if let Some(&index) = self.kernel_index.get(&id) {
-            return Ok(index);
-        }
         let resolve = || cache.load_or_compile(body, max_artifact_bytes);
         let codegen_error = |source| LoadError::Codegen {
             key: key.to_string(),
@@ -741,16 +742,66 @@ impl<D: Device> Engine<D> {
                 resolve().map_err(codegen_error)?
             }
         };
-        let compiled = poot_codegen::kernel_handle(body, &artifact).map_err(|source| {
-            LoadError::KernelArtifact {
-                key: key.to_string(),
-                source,
-            }
-        })?;
+        Ok(
+            poot_codegen::kernel_handle(body, &artifact).map_err(|source| {
+                LoadError::KernelArtifact {
+                    key: key.to_string(),
+                    source,
+                }
+            })?,
+        )
+    }
+
+    /// Give a device that copies with a kernel ([`CopyMechanism::Kernel`]) its [`CopyKernel`], compiled for
+    /// its target like any plan kernel, the first time an executable is loaded on it; a device that copies
+    /// natively is left alone. Every `copy` the engine records is after a load, so the kernel is there.
+    fn ensure_copy_kernel(&mut self) -> Result<(), ExecError> {
+        if self.copy_kernel_loaded || matches!(self.device.copy_mechanism(), CopyMechanism::Native)
+        {
+            return Ok(());
+        }
+        let Target::Gpu { .. } = self.device.target() else {
+            return Err(LoadError::Unimplemented(
+                "a kernel state copy on a device without a thread grid",
+            )
+            .into());
+        };
+        let compiled = self.compile(
+            "state_copy",
+            CopyKernel::body(),
+            poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
+        )?;
+        let label = self.device.backend_name();
+        if let CopyMechanism::Kernel(mut sink) = self.device.copy_mechanism() {
+            sink.load(CopyKernel::new(compiled))
+                .map_err(device_error(label))?;
+        }
+        self.copy_kernel_loaded = true;
+        Ok(())
+    }
+
+    /// Kernel index for `body`, compiling it for this device's target on first use (Card 656: the full
+    /// verified `Body` is the cache's identity, not a display key - `kernel_index` itself keys on
+    /// `KernelCache::key(body)`'s content fingerprint, so two equations sharing a planner `key`
+    /// string but compiling to different bodies never collide here, before `kernel_cache`'s own
+    /// content-keyed lookup ever runs). `key` is used only as the device's debug label.
+    fn kernel(
+        &mut self,
+        key: &str,
+        body: &Body,
+        max_artifact_bytes: NonZeroU64,
+    ) -> Result<usize, ExecError> {
+        let id = kernel_cache_of(&self.kernel_cache, target_of(&self.device))?
+            .key(body)
+            .id();
+        if let Some(&index) = self.kernel_index.get(&id) {
+            return Ok(index);
+        }
+        let compiled = self.compile(key, body, max_artifact_bytes)?;
         let kernel = self
             .device
             .load_kernel(key, compiled)
-            .map_err(device_error(backend.into()))?;
+            .map_err(device_error(self.device.backend_name()))?;
         self.kernels.push(kernel);
         let index = self.kernels.len() - 1;
         self.kernel_index.insert(id, index);
@@ -821,7 +872,7 @@ impl<D: Device> Engine<D> {
         let kernel = self
             .device
             .load_kernel(&key, handle)
-            .map_err(device_error(target.into()))?;
+            .map_err(device_error(self.device.backend_name()))?;
         self.kernels.push(kernel);
         let index = self.kernels.len() - 1;
         let invocation = AieInvocation::new(target, words);
@@ -894,7 +945,7 @@ impl<D: Device> Engine<D> {
         let kernel = self
             .device
             .load_kernel(&key, handle)
-            .map_err(device_error(target.into()))?;
+            .map_err(device_error(self.device.backend_name()))?;
         self.kernels_resolved += 1;
         self.kernels.push(kernel);
         let index = self.kernels.len() - 1;
@@ -935,10 +986,10 @@ impl<D: Device> Engine<D> {
         storage: BufferStorage,
         elems: usize,
     ) -> Result<D::Buffer, ExecError> {
-        let target = self.target_id();
+        let label = self.device.backend_name();
         self.device
             .allocate(role, storage, elems.max(1))
-            .map_err(device_error(target))
+            .map_err(device_error(label))
     }
 
     /// Loads every stage of `program` in order into one entry. A stage's boundary inputs bind the
@@ -1144,7 +1195,7 @@ impl<D: Device> Engine<D> {
                 Some(_) => {}
             }
         }
-        let target = self.target_id();
+        let label = self.device.backend_name();
         let (buffer, row_bytes, elems, allocated) = if packed {
             let StoredAs::PackedStackSource { slab_bytes } = bytes.stored else {
                 unreachable!("packed is a packed stack source")
@@ -1154,7 +1205,7 @@ impl<D: Device> Engine<D> {
             let buffer = self
                 .device
                 .allocate(BufferRole::Weight, BufferStorage::i32(), words)
-                .map_err(device_error(target))?;
+                .map_err(device_error(label))?;
             (buffer, slab_bytes, checked_u32(words)?, words * 4)
         } else {
             let total = storage
@@ -1346,7 +1397,7 @@ impl<D: Device> Engine<D> {
             .into());
         }
         let g = program.graph();
-        let target = self.target_id();
+        let label = self.device.backend_name();
         let storage_of =
             |id: ValueId| -> BufferStorage { program.storage().storage(id).buffer_storage() };
         // Card 547b: every locally-computed value's dispatch length is derived from
@@ -1442,7 +1493,7 @@ impl<D: Device> Engine<D> {
                         0,
                         &encoded,
                     )
-                    .map_err(device_error(target))?;
+                    .map_err(device_error(label))?;
                     (loc, elems)
                 }
                 Storage::Slot(Slot::TokenEmbed) => {
@@ -1548,6 +1599,7 @@ impl<D: Device> Engine<D> {
         let commit_plan = program.state_commit();
 
         let max_artifact_bytes = program.limits().max_artifact_bytes;
+        self.ensure_copy_kernel()?;
         // The region each equation belongs to, if any.
         let mut region_of: Vec<Option<usize>> = vec![None; g.eqns().len()];
         for (index, region) in program.regions().iter().enumerate() {
@@ -1688,8 +1740,8 @@ impl<D: Device> Engine<D> {
                     for dispatch in dispatches.iter() {
                         let (body, launch) = (dispatch.body(), dispatch.launch());
                         let (kernel, launch_kind) = match self.device.target() {
-                            Target::Gpu { backend, .. } => (
-                                self.kernel(backend, dispatch.key(), body, max_artifact_bytes)?,
+                            Target::Gpu { .. } => (
+                                self.kernel(dispatch.key(), body, max_artifact_bytes)?,
                                 LaunchKind::Grid {
                                     threads: launch.grid,
                                     workgroup: body.workgroup_size,
@@ -1841,7 +1893,7 @@ impl<D: Device> Engine<D> {
     }
 
     fn meta_buffer(&mut self, meta: &[u32], locals: &mut Vec<D::Buffer>) -> Result<Loc, ExecError> {
-        let target = self.target_id();
+        let label = self.device.backend_name();
         let storage = BufferStorage::dense(
             poot_target::ElementKind::I32,
             poot_target::LogicalDType::RawBytes,
@@ -1853,9 +1905,9 @@ impl<D: Device> Engine<D> {
         let buffer = self
             .device
             .allocate(BufferRole::Meta, storage, elems)
-            .map_err(device_error(target))?;
+            .map_err(device_error(label))?;
         crate::device::write_slice(&mut self.device, &buffer, 0, bytemuck::cast_slice(meta))
-            .map_err(device_error(target))?;
+            .map_err(device_error(label))?;
         locals.push(buffer);
         Ok(Loc::Local(locals.len() - 1))
     }
@@ -2002,7 +2054,7 @@ impl<D: Device> Engine<D> {
             WeightUpload::Bytes => Some(self.weight_writer(exe, &bytes, name, aval, storage)?),
             WeightUpload::SizeOnly => None,
         };
-        let target = self.target_id();
+        let label = self.device.backend_name();
         let (buffer, elems) = if packed {
             // A packed source's device buffer is always `u32` words (Card 642), never this value's
             // declared I8/RawBytes logical storage (`BufferStorage::device_elems` explicitly
@@ -2011,7 +2063,7 @@ impl<D: Device> Engine<D> {
             let buffer = self
                 .device
                 .allocate(BufferRole::Weight, BufferStorage::i32(), packed_words)
-                .map_err(device_error(target))?;
+                .map_err(device_error(label))?;
             (buffer, checked_u32(packed_words)?)
         } else {
             let (buffer, _bytes, elems) =
@@ -2023,7 +2075,7 @@ impl<D: Device> Engine<D> {
                 .write_with(&buffer, 0, writer.len(), &mut |range, out| {
                     writer.fill(range, out)
                 })
-                .map_err(device_error(target))?;
+                .map_err(device_error(label))?;
         }
         let resident = Arc::new(ResidentWeight { buffer, elems });
         self.residency.insert(key, Arc::downgrade(&resident));
@@ -2042,7 +2094,7 @@ impl<D: Device> Engine<D> {
         inputs: &StepInputs<'_>,
         late: &[SlotKey],
     ) -> Result<(), ExecError> {
-        let target = self.target_id();
+        let label = self.device.backend_name();
         let Self {
             executables,
             device,
@@ -2152,7 +2204,7 @@ impl<D: Device> Engine<D> {
         }
         for (buffer, bytes) in writes {
             host_write(device, host_write_bytes, &e.locals[buffer], &bytes)
-                .map_err(device_error(target))?;
+                .map_err(device_error(label))?;
         }
         Ok(())
     }
@@ -2169,7 +2221,7 @@ impl<D: Device> Engine<D> {
     ) -> Result<(), ExecError> {
         let (locals, arena) = buffers;
         let at = |loc| resolve::<D>(loc, locals, arena, held);
-        let on_device = device_error(target_of(device));
+        let on_device = device_error(device.backend_name());
         for step in &stage.steps {
             let inputs: Vec<Arg<'_, D>> = step
                 .inputs
@@ -2222,8 +2274,8 @@ impl<D: Device> Engine<D> {
         seams: &mut dyn StageSeams<D>,
     ) -> Result<D::Recording, ExecError> {
         self.check_not_poisoned()?;
-        let target = self.target_id();
-        let error = device_error(target);
+        let label = self.device.backend_name();
+        let error = device_error(label);
         if let Err(e) = self.device.begin() {
             self.abort_after_failure(exe, false);
             return Err(error(e));
@@ -2428,7 +2480,7 @@ impl<D: Device> Engine<D> {
             }
             .into());
         }
-        let target = self.target_id();
+        let label = self.device.backend_name();
         let Self {
             executables,
             device,
@@ -2456,7 +2508,7 @@ impl<D: Device> Engine<D> {
         }
         for (buffer, bytes) in writes {
             host_write(device, host_write_bytes, &e.locals[buffer], &bytes)
-                .map_err(device_error(target))?;
+                .map_err(device_error(label))?;
         }
         Ok(())
     }
@@ -2478,7 +2530,7 @@ impl<D: Device> Engine<D> {
         {
             return Ok(());
         }
-        let error = device_error(self.target_id());
+        let error = device_error(self.device.backend_name());
         if let Err(err) = self.device.begin() {
             self.abort_after_failure(exe, false);
             return Err(error(err));
@@ -2544,7 +2596,7 @@ impl<D: Device> Engine<D> {
         from: EntryId,
         to: EntryId,
     ) -> Result<(), ExecError> {
-        let error = device_error(self.target_id());
+        let error = device_error(self.device.backend_name());
         let replayed = {
             let Self {
                 executables,
@@ -2584,13 +2636,13 @@ impl<D: Device> Engine<D> {
         index: usize,
         host: &mut dyn HostSync,
     ) -> Result<(), ExecError> {
-        let target = self.target_id();
+        let label = self.device.backend_name();
         self.waits += 1;
         if let Err(err) = self.device.synchronize() {
             if let Some((kernel, code)) = self.device.classify_fault(&err) {
                 return Err(ExecError::Fault { kernel, code });
             }
-            return Err(device_error(target)(err));
+            return Err(device_error(label)(err));
         }
         let (point, reads) = {
             let Self {
@@ -2615,7 +2667,7 @@ impl<D: Device> Engine<D> {
                 let mut bytes = vec![0u8; elems as usize * 4];
                 device
                     .read(resolve::<D>(loc, &e.locals, &e.arena, &held), &mut bytes)
-                    .map_err(device_error(target))?;
+                    .map_err(device_error(label))?;
                 sync_counters.read_bytes += bytes.len() as u64;
                 let words = bytes
                     .as_chunks::<4>()
@@ -2649,7 +2701,7 @@ impl<D: Device> Engine<D> {
         index: usize,
         writes: &SyncWrites,
     ) -> Result<(), ExecError> {
-        let target = self.target_id();
+        let label = self.device.backend_name();
         let Self {
             executables,
             device,
@@ -2744,7 +2796,7 @@ impl<D: Device> Engine<D> {
                         .write_with(&resident.buffer, at, *row_bytes, &mut |range, out| {
                             writer.fill(range.start - at + from..range.end - at + from, out)
                         })
-                        .map_err(device_error(target))?;
+                        .map_err(device_error(label))?;
                 }
                 sync_counters.rows += 1;
                 sync_counters.refill_bytes += *row_bytes as u64;
@@ -2755,7 +2807,7 @@ impl<D: Device> Engine<D> {
             let encoded = crate::lanes::encode_host(DType::I32, &bytes, *storage)
                 .ok_or(LoadError::Unimplemented("a pool map lane that is not I32"))?;
             crate::device::write_slice(device, &map.buffer, 0, &encoded)
-                .map_err(device_error(target))?;
+                .map_err(device_error(label))?;
         }
         Ok(())
     }
@@ -2767,8 +2819,8 @@ impl<D: Device> Engine<D> {
         exe: ExecutableId,
         entry: EntryId,
     ) -> Result<std::time::Duration, ExecError> {
-        let target = self.target_id();
-        let error = device_error(target);
+        let label = self.device.backend_name();
+        let error = device_error(label);
         let sync_t0 = Instant::now();
         self.waits += 1;
         if let Err(err) = self.device.synchronize() {
@@ -2802,7 +2854,7 @@ impl<D: Device> Engine<D> {
     /// zero-lane packet reads zero bytes and always passes. Called after replay/eager execution and
     /// `synchronize`, strictly before any primary-output readback.
     fn check_validation(&mut self, exe: ExecutableId, entry_idx: usize) -> Result<(), ExecError> {
-        let target = self.target_id();
+        let label = self.device.backend_name();
         let Self {
             executables,
             device,
@@ -2828,7 +2880,7 @@ impl<D: Device> Engine<D> {
                 let len = lane_count * 4;
                 device
                     .read(buf, &mut bytes[offset..offset + len])
-                    .map_err(device_error(target))?;
+                    .map_err(device_error(label))?;
                 offset += len;
             }
             let bits: &[u32] = bytemuck::cast_slice(&bytes);
@@ -2890,20 +2942,16 @@ impl<D: Device> Engine<D> {
                 })
             }
         };
-        let (device, dispatches, device_label) = if counters_only {
+        let (device, dispatches) = if counters_only {
             // Review F9: never build the per-dispatch name lookup or format a device
             // label - counters-only retention is 0-sized, so any per-dispatch `Vec` built here
             // would only be immediately discarded.
-            (device_summary, Vec::new(), String::new())
+            (device_summary, Vec::new())
         } else if !sampled {
             // Review F3: this step's declared `sample_every` policy skips it - report the same
             // shape a backend that cannot measure at all would, regardless of what `time` held,
             // so `Coverage::Unsampled` has a real, visible effect.
-            (
-                poot_profile::DeviceCoverage::Unknown,
-                Vec::new(),
-                String::new(),
-            )
+            (poot_profile::DeviceCoverage::Unknown, Vec::new())
         } else {
             let names: Vec<(&'static str, String)> = {
                 let loaded = self.loaded(exe)?;
@@ -2934,16 +2982,11 @@ impl<D: Device> Engine<D> {
                     })
                     .collect(),
             };
-            (
-                device_summary,
-                dispatches,
-                format!("{:?}", self.target_id()),
-            )
+            (device_summary, dispatches)
         };
         self.timing.record(
             entry.raw(),
             replay,
-            device_label,
             poot_profile::HostTiming { encode, wait, wall },
             device,
             dispatches,
@@ -3107,7 +3150,7 @@ impl<D: Device> Engine<D> {
 
     /// Start a step's replays on this device ([`Device::begin_step`]).
     pub(crate) fn begin_replays(&mut self, exe: ExecutableId) -> Result<(), ExecError> {
-        let error = device_error(self.target_id());
+        let error = device_error(self.device.backend_name());
         if let Err(err) = self.device.begin_step() {
             self.abort_after_failure(exe, true);
             return Err(error(err));
@@ -3122,7 +3165,7 @@ impl<D: Device> Engine<D> {
         entry: EntryId,
         stage_idx: usize,
     ) -> Result<(), ExecError> {
-        let error = device_error(self.target_id());
+        let error = device_error(self.device.backend_name());
         let replayed = {
             let Self {
                 executables,
@@ -3158,7 +3201,7 @@ impl<D: Device> Engine<D> {
         exe: ExecutableId,
         op: impl FnOnce(&mut D) -> Result<R, D::Error>,
     ) -> Result<R, ExecError> {
-        let error = device_error(self.target_id());
+        let error = device_error(self.device.backend_name());
         match op(&mut self.device) {
             Ok(value) => Ok(value),
             Err(err) => {
@@ -3201,7 +3244,7 @@ impl<D: Device> Engine<D> {
     /// calls it on every device before it releases anything another device's graph may still address.
     pub(crate) fn quiesce(&mut self) -> Result<(), ExecError> {
         self.check_not_poisoned()?;
-        let error = device_error(self.target_id());
+        let error = device_error(self.device.backend_name());
         match self.device.synchronize() {
             Ok(()) => {
                 self.pending_release.clear();
@@ -3260,7 +3303,7 @@ impl<D: Device> OutputSource for Engine<D> {
         entry: EntryId,
         out: &mut [u8],
     ) -> Result<(), ExecError> {
-        let target = self.target_id();
+        let label = self.device.backend_name();
         let Self {
             executables,
             device,
@@ -3283,7 +3326,7 @@ impl<D: Device> OutputSource for Engine<D> {
         let buffer = resolve::<D>(e.output, &e.locals, &e.arena, &Held::of(loaded));
         device
             .read(buffer, &mut out[..e.output_bytes])
-            .map_err(device_error(target))
+            .map_err(device_error(label))
     }
 
     fn output_bytes(&self, exe: ExecutableId, entry: EntryId) -> Result<usize, ExecError> {
@@ -3513,7 +3556,7 @@ impl<D: Device> Executor for Engine<D> {
 
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError> {
         self.check_not_poisoned()?;
-        let target = self.target_id();
+        let label = self.device.backend_name();
         let Self {
             executables,
             device,
@@ -3528,7 +3571,7 @@ impl<D: Device> Executor for Engine<D> {
                 for state in &loaded.state {
                     device
                         .write_with(&state.buffer, 0, state.bytes, &mut |_, out| out.fill(0))
-                        .map_err(device_error(target))?;
+                        .map_err(device_error(label))?;
                 }
                 // A resident pool is carried state too: a host that resets its own residency
                 // bookkeeping with this call must not find rows it believes are gone.
@@ -3537,7 +3580,7 @@ impl<D: Device> Executor for Engine<D> {
                         .write_with(&resident.buffer, 0, resident.bytes, &mut |_, out| {
                             out.fill(0)
                         })
-                        .map_err(device_error(target))?;
+                        .map_err(device_error(label))?;
                 }
                 loaded.needs_reset = false;
             }
@@ -3564,7 +3607,7 @@ impl<D: Device> Executor for Engine<D> {
                 for (buffer, offset, bytes) in rows {
                     device
                         .write_with(buffer, offset, bytes, &mut |_, out| out.fill(0))
-                        .map_err(device_error(target))?;
+                        .map_err(device_error(label))?;
                 }
                 // The other rows may be mid-failure: only `All` clears `needs_reset`.
             }
@@ -3580,7 +3623,7 @@ impl<D: Device> Executor for Engine<D> {
         values: poot_tensor::HostView<'_>,
     ) -> Result<(), ExecError> {
         self.check_not_poisoned()?;
-        let target = self.target_id();
+        let label = self.device.backend_name();
         let Self {
             executables,
             device,
@@ -3632,7 +3675,7 @@ impl<D: Device> Executor for Engine<D> {
             .into());
         }
         crate::device::write_slice(device, &state.buffer, row * row_bytes, &encoded)
-            .map_err(device_error(target))?;
+            .map_err(device_error(label))?;
         *host_write_bytes += encoded.len() as u64;
         Ok(())
     }
@@ -3718,6 +3761,7 @@ mod kernel_identity_tests {
     use crate::device::DeviceTime;
     use poot_codegen::ArtifactTooLarge;
     use poot_runtime_common::BufferRole;
+    use poot_target::Backend;
 
     struct NoopDevice;
 
@@ -3726,6 +3770,14 @@ mod kernel_identity_tests {
         type Kernel = String;
         type Recording = ();
         type Error = std::convert::Infallible;
+
+        fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
+            CopyMechanism::Native
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "fake"
+        }
 
         fn target(&self) -> poot_graph_plan::Target {
             poot_graph_plan::Target::Gpu {
@@ -3793,6 +3845,125 @@ mod kernel_identity_tests {
         }
     }
 
+    /// A device with no native buffer copy: it records the copy kernel the engine hands it.
+    struct KernelCopyDevice {
+        offered: Vec<(TargetId, [u32; 3])>,
+    }
+
+    /// Where [`KernelCopyDevice`] records the kernels it is offered.
+    struct OfferLog<'a>(&'a mut Vec<(TargetId, [u32; 3])>);
+
+    impl crate::CopyKernelSink<std::convert::Infallible> for OfferLog<'_> {
+        fn load(&mut self, kernel: CopyKernel) -> Result<(), std::convert::Infallible> {
+            self.0.push((kernel.kernel().target(), kernel.workgroup()));
+            Ok(())
+        }
+    }
+
+    impl Device for KernelCopyDevice {
+        type Buffer = ();
+        type Kernel = String;
+        type Recording = ();
+        type Error = std::convert::Infallible;
+
+        fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
+            CopyMechanism::Kernel(Box::new(OfferLog(&mut self.offered)))
+        }
+        fn backend_name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn target(&self) -> poot_graph_plan::Target {
+            NoopDevice.target()
+        }
+        fn memory(&self) -> Vec<(BufferRole, poot_runtime_common::MemoryCounterSnapshot)> {
+            Vec::new()
+        }
+        fn allocate(
+            &mut self,
+            _role: BufferRole,
+            _storage: BufferStorage,
+            _elems: usize,
+        ) -> Result<(), std::convert::Infallible> {
+            Ok(())
+        }
+        fn buffer_elems(&self, _buffer: &()) -> usize {
+            usize::MAX
+        }
+        fn load_kernel(
+            &mut self,
+            key: &str,
+            _kernel: poot_runtime_common::CompiledKernel,
+        ) -> Result<String, std::convert::Infallible> {
+            Ok(key.to_string())
+        }
+        fn begin(&mut self) -> Result<(), std::convert::Infallible> {
+            Ok(())
+        }
+        fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), std::convert::Infallible> {
+            Ok(())
+        }
+        fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), std::convert::Infallible> {
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<(), std::convert::Infallible> {
+            Ok(())
+        }
+        fn replay(&mut self, _recording: &()) -> Result<(), std::convert::Infallible> {
+            Ok(())
+        }
+        fn write_with(
+            &mut self,
+            _dst: &(),
+            _offset: usize,
+            _len: usize,
+            _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
+        ) -> Result<(), std::convert::Infallible> {
+            Ok(())
+        }
+        fn read(&mut self, _src: &(), _out: &mut [u8]) -> Result<(), std::convert::Infallible> {
+            Ok(())
+        }
+        fn synchronize(&mut self) -> Result<(), std::convert::Infallible> {
+            Ok(())
+        }
+        fn device_time(&self) -> DeviceTime {
+            DeviceTime::Unknown
+        }
+        fn abort(&mut self) -> Result<(), std::convert::Infallible> {
+            Ok(())
+        }
+    }
+
+    /// POOT-1235: a device that copies with a kernel is handed the engine's `copy_words` kernel, compiled for
+    /// its target, once however many executables load. Mutation: drop the `copy_kernel_loaded` guard in
+    /// `ensure_copy_kernel`; the second call offers it again and the count goes to 2.
+    #[test]
+    fn the_engine_offers_a_kernel_copy_device_its_copy_kernel_once() {
+        let mut engine = Engine::new(KernelCopyDevice {
+            offered: Vec::new(),
+        });
+        engine.ensure_copy_kernel().unwrap();
+        engine.ensure_copy_kernel().unwrap();
+        assert_eq!(
+            engine.device.offered,
+            [(
+                TargetId::Gpu(Backend::SpirvVulkan),
+                CopyKernel::body().workgroup_size
+            )]
+        );
+    }
+
+    /// POOT-1235: a device with a native buffer copy is never offered a kernel, nor does the engine compile
+    /// one for it. Mutation: make `ensure_copy_kernel` ignore `CopyMechanism::Native`; the engine compiles
+    /// and marks the kernel loaded for the native device, so `copy_kernel_loaded` is set and the row goes red.
+    #[test]
+    fn a_native_copy_device_is_never_offered_a_copy_kernel() {
+        let mut engine = Engine::new(NoopDevice);
+        engine.ensure_copy_kernel().unwrap();
+        assert!(!engine.copy_kernel_loaded);
+    }
+
     /// SC-024: two equations whose planner-given display key happens to collide but whose compiled
     /// bodies differ must never alias onto the same device kernel, in either insertion order.
     /// Mutation (run by hand): revert `kernel_index`'s key from `KernelCache::key(body).
@@ -3823,7 +3994,6 @@ mod kernel_identity_tests {
         let mut engine = Engine::new(NoopDevice);
         let index_a = engine
             .kernel(
-                Backend::SpirvVulkan,
                 "shared_key",
                 &body_a,
                 poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
@@ -3831,7 +4001,6 @@ mod kernel_identity_tests {
             .unwrap();
         let index_b = engine
             .kernel(
-                Backend::SpirvVulkan,
                 "shared_key",
                 &body_b,
                 poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
@@ -3845,7 +4014,6 @@ mod kernel_identity_tests {
         let mut engine = Engine::new(NoopDevice);
         let index_b2 = engine
             .kernel(
-                Backend::SpirvVulkan,
                 "shared_key",
                 &body_b,
                 poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
@@ -3853,7 +4021,6 @@ mod kernel_identity_tests {
             .unwrap();
         let index_a2 = engine
             .kernel(
-                Backend::SpirvVulkan,
                 "shared_key",
                 &body_a,
                 poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
@@ -3866,7 +4033,6 @@ mod kernel_identity_tests {
 
         let index_a_again = engine
             .kernel(
-                Backend::SpirvVulkan,
                 "shared_key",
                 &body_a,
                 poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
@@ -3916,7 +4082,6 @@ mod kernel_identity_tests {
             .unwrap();
         first
             .kernel(
-                Backend::SpirvVulkan,
                 "limit",
                 &body,
                 poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
@@ -3925,10 +4090,7 @@ mod kernel_identity_tests {
         assert_eq!(first.kernels_resolved, 1);
         let mut second = Engine::new(NoopDevice).with_shared_kernels(table).unwrap();
         let tiny = NonZeroU64::new(1).unwrap();
-        let ExecError::Load(load) = second
-            .kernel(Backend::SpirvVulkan, "limit", &body, tiny)
-            .unwrap_err()
-        else {
+        let ExecError::Load(load) = second.kernel("limit", &body, tiny).unwrap_err() else {
             panic!("expected a load error");
         };
         assert!(
@@ -3953,6 +4115,7 @@ mod arena_slot_alloc_tests {
     use super::*;
     use crate::device::DeviceTime;
     use poot_runtime_common::BufferRole;
+    use poot_target::Backend;
 
     /// Records every `elems` a call actually reached `Device::allocate` with (never recomputes one).
     #[derive(Default)]
@@ -3965,6 +4128,14 @@ mod arena_slot_alloc_tests {
         type Kernel = String;
         type Recording = ();
         type Error = std::convert::Infallible;
+
+        fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
+            CopyMechanism::Native
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "fake"
+        }
 
         fn target(&self) -> poot_graph_plan::Target {
             poot_graph_plan::Target::Gpu {
@@ -4075,6 +4246,7 @@ mod f16_packed_weight_upload_tests {
         AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightMap, WeightRole, WeightView,
     };
     use poot_runtime_common::BufferRole;
+    use poot_target::Backend;
 
     const PROJECTION_INPUT: WeightId = WeightId::layer(0, WeightRole::Attn(AttnRole::Q));
     const PROJECTION_WEIGHT: WeightId = WeightId::layer(0, WeightRole::Ffn(FfnRole::Gate));
@@ -4093,8 +4265,16 @@ mod f16_packed_weight_upload_tests {
         type Recording = ();
         type Error = std::convert::Infallible;
 
+        fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
+            CopyMechanism::Native
+        }
+
         fn weight_upload(&self) -> WeightUpload {
             self.upload
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "fake"
         }
 
         fn target(&self) -> poot_graph_plan::Target {
@@ -4501,6 +4681,7 @@ mod f16_packed_weight_upload_tests {
 mod weight_source_tests {
     use super::*;
     use poot_runtime_common::BufferRole;
+    use poot_target::Backend;
 
     use crate::{NoSync, StepInputs};
     use poot_graph_ir::test_support::const_weights::ConstWeights;
@@ -4543,8 +4724,16 @@ mod weight_source_tests {
         type Recording = ();
         type Error = std::convert::Infallible;
 
+        fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
+            CopyMechanism::Native
+        }
+
         fn weight_upload(&self) -> WeightUpload {
             self.upload
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "fake"
         }
 
         fn target(&self) -> poot_graph_plan::Target {
@@ -5017,6 +5206,44 @@ mod weight_source_tests {
         }
         assert_eq!(weight_allocations(&engine), 4);
         assert_size_only_matches_bytes(&weights, &mapped, &g);
+    }
+
+    /// A `RowOrder` view uploads the stored rows it names in the order it names them, one byte run per row
+    /// (llama.cpp's paired Q/K rows read back in half-split order): rows `[3, 0, 2, 1]` of a dense F32 entry
+    /// upload as those four rows in that order, not as a range.
+    /// Mutation: in `WeightBinder::spans`, build the `Part::Ordered` runs from the sorted order; the upload
+    /// holds rows `[0, 1, 2, 3]` and this row goes red.
+    #[test]
+    fn a_row_order_view_uploads_its_rows_in_the_order_it_names() {
+        let entry = f32_entry(vec![N, K], 1);
+        let WeightEntry::Dense(dense) = &entry else {
+            unreachable!()
+        };
+        let row = |r: usize| dense.bytes().as_slice()[r * K * 4..(r + 1) * K * 4].to_vec();
+        let order = [3usize, 0, 2, 1];
+        let want: Vec<u8> = order.iter().flat_map(|&r| row(r)).collect();
+        let weights = store(vec![("w", entry.clone())]);
+        let mapped = map(
+            &weights,
+            vec![(
+                id(Q),
+                WeightView::RowOrder {
+                    key: "w".into(),
+                    order: order.into(),
+                },
+            )],
+        );
+        let g = projections(&[id(Q)], &WeightFormats::default());
+        let mut engine = Engine::new(Recorder::default());
+        let program = compile(&engine, &g);
+        let exe = engine
+            .load_weights(Arc::clone(&weights), Arc::clone(&mapped))
+            .unwrap();
+        engine.add_entry(exe, &program).unwrap();
+        assert!(
+            written(&engine).contains(&want.as_slice()),
+            "no upload holds the rows in the named order"
+        );
     }
 
     /// An I64 index table viewed by `IndexNarrow` uploads its words as I32, narrowed from the
@@ -6607,6 +6834,14 @@ mod weight_source_tests {
         type Recording = ();
         type Error = WriteFault;
 
+        fn copy_mechanism(&mut self) -> CopyMechanism<'_, WriteFault> {
+            CopyMechanism::Native
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "fake"
+        }
+
         fn target(&self) -> poot_graph_plan::Target {
             self.inner.target()
         }
@@ -6836,6 +7071,14 @@ mod weight_source_tests {
         type Kernel = ();
         type Recording = ();
         type Error = Fault;
+
+        fn copy_mechanism(&mut self) -> CopyMechanism<'_, Fault> {
+            CopyMechanism::Native
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "fake"
+        }
 
         fn target(&self) -> poot_graph_plan::Target {
             poot_graph_plan::Target::Gpu {
@@ -7297,6 +7540,14 @@ mod aie_engine_tests {
         type Recording = ();
         type Error = std::convert::Infallible;
 
+        fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
+            CopyMechanism::Native
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "fake"
+        }
+
         fn target(&self) -> Target {
             Target::Aie {
                 target: AieTargetId::Xdna2,
@@ -7648,6 +7899,14 @@ mod vpu_engine_tests {
         type Kernel = usize;
         type Recording = ();
         type Error = std::convert::Infallible;
+
+        fn copy_mechanism(&mut self) -> CopyMechanism<'_, std::convert::Infallible> {
+            CopyMechanism::Native
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "fake"
+        }
 
         fn target(&self) -> Target {
             Target::Vpu {

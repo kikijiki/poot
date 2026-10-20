@@ -12,7 +12,40 @@
 # driver generation against wgpu (generate), the wide dispatch (large_grid) and the cooperative-matrix
 # matmul (coopmat). POOT-1081: the live memory budget row (executor_contract) and the served dense row
 # (poot-serve served_groups: startup admits raw Vulkan on its VK_EXT_memory_budget figure). The Qwen2.5-0.5B
-# row is #[ignore]d (it loads a checkpoint: run by exact name).
+# row is #[ignore]d (it loads a checkpoint: run by exact name). POOT-1231: every recorded family's fixture row
+# (`recorded_<family>_tokens_vulkan`), the attached-device limit row, and the receipt that the raw Vulkan
+# reference caps are the device's own.
+poot-llm	driver::device_tests::attached_device_limit_refuses_an_oversized_constant_vulkan
+poot-llm	driver::device_tests::recorded_bloom_tokens_vulkan
+poot-llm	driver::device_tests::recorded_deepseek2_tokens_vulkan
+poot-llm	driver::device_tests::recorded_deepseek32_tokens_vulkan
+poot-llm	driver::device_tests::recorded_deepseek3_tokens_vulkan
+poot-llm	driver::device_tests::recorded_deepseek4_tokens_vulkan
+poot-llm	driver::device_tests::recorded_gemma3_tokens_vulkan
+poot-llm	driver::device_tests::recorded_gemma4_moe_tokens_vulkan
+poot-llm	driver::device_tests::recorded_gemma4_tokens_vulkan
+poot-llm	driver::device_tests::recorded_glm53_flash_tokens_vulkan
+poot-llm	driver::device_tests::recorded_gpt_oss_tokens_vulkan
+poot-llm	driver::device_tests::recorded_granite_tokens_vulkan
+poot-llm	driver::device_tests::recorded_granitemoe_tokens_vulkan
+poot-llm	driver::device_tests::recorded_llama_tokens_vulkan
+poot-llm	driver::device_tests::recorded_minimax_m2_tokens_vulkan
+poot-llm	driver::device_tests::recorded_mixtral_tokens_vulkan
+poot-llm	driver::device_tests::recorded_mpt_tokens_vulkan
+poot-llm	driver::device_tests::recorded_nemotron_h_tokens_vulkan
+poot-llm	driver::device_tests::recorded_olmo2_tokens_vulkan
+poot-llm	driver::device_tests::recorded_olmoe_tokens_vulkan
+poot-llm	driver::device_tests::recorded_phi3_tokens_vulkan
+poot-llm	driver::device_tests::recorded_qwen2_tokens_vulkan
+poot-llm	driver::device_tests::recorded_qwen35_fp8_tokens_vulkan
+poot-llm	driver::device_tests::recorded_qwen35_tokens_vulkan
+poot-llm	driver::device_tests::recorded_qwen3_tokens_vulkan
+poot-llm	driver::device_tests::recorded_qwen3moe_tokens_vulkan
+poot-llm	driver::device_tests::recorded_qwen3next_tokens_vulkan
+poot-llm	driver::device_tests::recorded_qwen4exp_finetune_tokens_vulkan
+poot-llm	driver::device_tests::recorded_qwen4exp_packed_tokens_vulkan
+poot-llm	driver::device_tests::recorded_qwen4exp_tokens_vulkan
+poot-llm	driver::device_tests::recorded_smollm3_tokens_vulkan
 poot-llm::vulkan_cross_backend	memory_counters_charge_the_roles_a_decode_entry_allocates_as_wgpu_does
 poot-llm::vulkan_generate	chunked_prefill_equals_the_whole_prompt_on_vulkan
 poot-llm::vulkan_generate	tiny_fixture_greedy_decode_equals_wgpu_on_vulkan
@@ -23,6 +56,9 @@ poot-llm::vulkan_parity_models	softcapped_qwen2_matches_the_oracle_on_vulkan
 poot-serve::served_groups	served_qwen2_vulkan
 poot-serve::served_loop	served_device_timing_flag_reports_unknown_device_time_on_raw_vulkan_vulkan
 poot-vulkan-device::coopmat	coopmat_matmul_plans_the_coopmat_arm_and_matches_the_cpu_product_on_vulkan
+poot-vulkan-device::copy	copy_between_unequal_lengths_is_refused_on_vulkan
+poot-vulkan-device::copy	copy_of_an_odd_byte_length_is_exact_on_vulkan
+poot-vulkan-device::copy	transaction_misuse_is_a_typed_error_on_vulkan
 poot-vulkan-device::executor_contract	a_copy_is_ordered_between_the_dispatches_around_it
 poot-vulkan-device::executor_contract	a_kernel_assert_is_a_fault_raised_at_synchronize
 poot-vulkan-device::executor_contract	a_long_recording_is_cut_into_several_submissions_and_replays_exactly
@@ -59,4 +95,5 @@ poot-vulkan-device::parity	tiled_region_with_a_remainder_tile_matches_the_oracle
 poot-vulkan-runtime	context::init::launch_caps_device_receipt::a_live_vulkan_device_reports_its_own_launch_limits
 poot-vulkan-runtime::device_caps	device_caps_is_plausible_on_the_real_device
 poot-vulkan-runtime::device_caps	raw_vulkan_reports_wmma_class_support_on_this_box
+poot-vulkan-runtime::device_caps	the_reference_caps_of_the_raw_vulkan_column_are_what_the_radv_device_reports
 poot-vulkan-runtime::run_add	add_runs_on_gpu_via_raw_vulkan

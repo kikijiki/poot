@@ -42,7 +42,7 @@ fn kernel_for(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel {
     std::fs::create_dir_all(&dir).unwrap();
     let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
     let artifact =
-        compile_kernel(body, poot_codegen::GpuTarget::SpirvVulkan, &out).expect("compile spirv");
+        compile_kernel(body, poot_target::Backend::SpirvVulkan, &out).expect("compile spirv");
     kernel_handle(body, &artifact).unwrap()
 }
 

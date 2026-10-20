@@ -23,6 +23,8 @@
 //! `poot-graph-plan`'s `compile` reads this to refuse an `I32 -> F32` cast whose operand is not proven
 //! inside the exactly representable integers of `f32` ([`IndexRange::F32_EXACT`]).
 
+use std::collections::HashMap;
+
 use crate::graph::{Graph, Operand, Storage, ValueId, ValueTable};
 use crate::op::{BinOp, OpKind, RedOp, UnOp};
 use crate::types::{DType, Scalar};
@@ -199,7 +201,10 @@ pub fn value_ranges(graph: &Graph) -> RangeFacts {
         }
         let (range, narrowed_by) = match eqn.op {
             OpKind::Select => select_range(graph, &defs, &ranges, &eqn.inputs),
-            _ => (equation_range(graph, &ranges, &eqn.op, &eqn.inputs), None),
+            _ => (
+                equation_range(graph, &defs, &ranges, &eqn.op, &eqn.inputs),
+                None,
+            ),
         };
         ranges[eqn.out] = Some(range);
         let mut rests_on: Vec<ValueId> = eqn
@@ -229,9 +234,66 @@ fn operand_range(ranges: &ValueTable<Option<IndexRange>>, operand: &Operand) -> 
     }
 }
 
+/// The most any F32 bound may be for [`f32_bounds`] to report it: every whole number up to here is exact in
+/// F32, so interval arithmetic in `f64` on such bounds is the F32 arithmetic.
+const EXACT_F32: f64 = 16_777_216.0;
+
+/// Closed bounds `[lo, hi]` on the value of an F32 operand, proven from its definition alone: a literal is a
+/// point, a comparison is `[0, 1]`, a movement op keeps its operand's bounds, and a sum, difference or product
+/// of bounded operands is the interval arithmetic of theirs. `None` for anything else, and for bounds that are
+/// not whole numbers within [`EXACT_F32`] (rounding could then differ from the arithmetic here).
+fn f32_bounds(
+    graph: &Graph,
+    defs: &ValueTable<Option<usize>>,
+    operand: &Operand,
+    memo: &mut HashMap<ValueId, Option<(f64, f64)>>,
+) -> Option<(f64, f64)> {
+    let id = match operand {
+        Operand::Lit(Scalar::F32(x)) => return exact_bounds(f64::from(*x), f64::from(*x)),
+        Operand::Lit(Scalar::I32(_)) => return None,
+        Operand::Value(id) => *id,
+    };
+    if let Some(known) = memo.get(&id) {
+        return *known;
+    }
+    let bounds = (|| {
+        let eqn = &graph.eqns()[defs[id]?];
+        let mut input = |index: usize| f32_bounds(graph, defs, eqn.inputs.get(index)?, memo);
+        match eqn.op {
+            OpKind::Binary(BinOp::Ge) => Some((0.0, 1.0)),
+            OpKind::Binary(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul)) => {
+                let ((a_lo, a_hi), (b_lo, b_hi)) = (input(0)?, input(1)?);
+                let corners = match op {
+                    BinOp::Add => [a_lo + b_lo, a_hi + b_hi, a_lo + b_lo, a_hi + b_hi],
+                    BinOp::Sub => [a_lo - b_hi, a_hi - b_lo, a_lo - b_hi, a_hi - b_lo],
+                    _ => [a_lo * b_lo, a_lo * b_hi, a_hi * b_lo, a_hi * b_hi],
+                };
+                exact_bounds(
+                    corners.into_iter().fold(f64::INFINITY, f64::min),
+                    corners.into_iter().fold(f64::NEG_INFINITY, f64::max),
+                )
+            }
+            OpKind::Reshape { .. }
+            | OpKind::Transpose { .. }
+            | OpKind::Slice { .. }
+            | OpKind::Broadcast { .. } => input(0),
+            _ => None,
+        }
+    })();
+    memo.insert(id, bounds);
+    bounds
+}
+
+/// `[lo, hi]` when both are whole numbers within [`EXACT_F32`].
+fn exact_bounds(lo: f64, hi: f64) -> Option<(f64, f64)> {
+    let exact = |x: f64| x.fract() == 0.0 && x.abs() <= EXACT_F32;
+    (exact(lo) && exact(hi)).then_some((lo, hi))
+}
+
 /// The range an I32-producing equation proves for its output.
 fn equation_range(
     graph: &Graph,
+    defs: &ValueTable<Option<usize>>,
     ranges: &ValueTable<Option<IndexRange>>,
     op: &OpKind,
     inputs: &[Operand],
@@ -295,6 +357,15 @@ fn equation_range(
             Some(DType::I8) => IndexRange {
                 lo: -128,
                 hi_exclusive: 128,
+            },
+            // An F32 built from comparisons and small literals (an indicator, its complement, a product of
+            // them) holds small whole numbers, so its cast does too.
+            Some(DType::F32) => match inputs.first() {
+                Some(operand) => f32_bounds(graph, defs, operand, &mut HashMap::new())
+                    .map_or(IndexRange::I32, |(lo, hi)| {
+                        IndexRange::from_closed(lo as i64, hi as i64)
+                    }),
+                None => IndexRange::I32,
             },
             _ => IndexRange::I32,
         },

@@ -618,8 +618,9 @@ fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
 /// handling that proceeds (returns `Ok` with a dummy kernel); the row's `Err` assertion goes red.
 #[test]
 fn a_byte_artifact_kernel_is_refused_at_load() {
-    use poot_codegen::{GpuTarget, compile_kernel, kernel_handle};
+    use poot_codegen::{compile_kernel, kernel_handle};
     use poot_npu::XdnaError;
+    use poot_target::Backend;
 
     let Some((_lock, mut device)) = device(XdnaConfig::default()) else {
         return;
@@ -629,7 +630,7 @@ fn a_byte_artifact_kernel_is_refused_at_load() {
     std::fs::create_dir_all(&dir).unwrap();
     let artifact = compile_kernel(
         &body,
-        GpuTarget::Nvptx,
+        Backend::Nvptx,
         &poot_codegen::artifact_path(&dir, "ptx_add", poot_codegen::Target::Nvptx),
     )
     .expect("the add kernel compiles to PTX");

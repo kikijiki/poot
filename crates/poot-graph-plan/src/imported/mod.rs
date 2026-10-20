@@ -205,7 +205,8 @@ pub enum ImportedKernel {
     AssertTrap,
     /// Probe: every lane atomically adds 1 into one `u32` counter, an exact order-independent reduction.
     AtomicAddSumSmoke,
-    /// Probe: a raw word-for-word copy, the kernel behind ROCm's `Device::copy`.
+    /// Probe: a raw word-for-word copy, the engine's state-copy kernel for a device with no native buffer
+    /// copy (`CopyMechanism::Kernel`).
     CopyWords,
     /// Probe: a finite busy-spin of a caller-chosen length, used to force a real completion-wait timeout.
     SpinBusy,

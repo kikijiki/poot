@@ -37,6 +37,14 @@ pub struct DeviceRingReceiptProvenance {
     pub contract: QueuePublicationContract,
 }
 
+impl DeviceRingReceiptProvenance {
+    /// Whether the host-to-GPU memory-pool link includes a PCIe hop.
+    pub fn has_pcie_link(&self) -> bool {
+        self.link_types
+            .contains(&bindings::HSA_AMD_LINK_INFO_TYPE_PCIE)
+    }
+}
+
 /// Header value a body write leaves in the slot until the reverse header-publication step
 /// release-stores a valid KERNEL_DISPATCH header. Note the HSA numbering: packet type 0 is
 /// `VENDOR_SPECIFIC` and type 1 is `INVALID`, so this is not the spec's `INVALID` type; the packet

@@ -494,6 +494,11 @@ per_backend!(
     attached_device_limit_refuses_an_oversized_constant_ptx
 );
 
+#[test]
+fn attached_device_limit_refuses_an_oversized_constant_vulkan() {
+    attached_device_limit_refuses_an_oversized_constant(BackendChoice::Vulkan);
+}
+
 /// POOT-575 SC-004 (R477-006 on a hybrid family's path; POOT-572 for Qwen3.5): the `family` fixture
 /// with its head zeroed (every logit exactly 0, so the distribution is uniform) answers a seeded
 /// temperature request with the sampler's tokens, not the greedy ones: a sampled run equal to the greedy
@@ -1256,14 +1261,18 @@ fn recorded_family_tokens(family: &str, choice: BackendChoice) {
 /// One row per family and backend, each its own test (and process: the ROCm runtime does not survive
 /// reopening an executor in one process).
 macro_rules! recorded_family_rows {
-    ($($family:literal => $wgpu:ident, $rocm:ident, $ptx:ident;)*) => {
+    ($($family:literal => $wgpu:ident, $vulkan:ident, $rocm:ident, $ptx:ident;)*) => {
         $(
             #[test]
             fn $wgpu() {
                 recorded_family_tokens($family, BackendChoice::Wgpu);
             }
 
-            #[cfg(feature = "rocm")]
+            #[test]
+            fn $vulkan() {
+                recorded_family_tokens($family, BackendChoice::Vulkan);
+            }
+
             #[test]
             fn $rocm() {
                 recorded_family_tokens($family, BackendChoice::Rocm);
@@ -1274,40 +1283,65 @@ macro_rules! recorded_family_rows {
                 recorded_family_tokens($family, BackendChoice::Ptx);
             }
         )*
+
+        /// The families the rows above are instantiated for, so a test can compare them with [`RECORDED`].
+        const ROWED_FAMILIES: &[&str] = &[$($family),*];
     };
 }
 
 recorded_family_rows! {
-    "qwen2" => recorded_qwen2_tokens_wgpu, recorded_qwen2_tokens_rocm, recorded_qwen2_tokens_ptx;
-    "gemma3" => recorded_gemma3_tokens_wgpu, recorded_gemma3_tokens_rocm, recorded_gemma3_tokens_ptx;
-    "gemma4" => recorded_gemma4_tokens_wgpu, recorded_gemma4_tokens_rocm, recorded_gemma4_tokens_ptx;
-    "gemma4/moe" => recorded_gemma4_moe_tokens_wgpu, recorded_gemma4_moe_tokens_rocm, recorded_gemma4_moe_tokens_ptx;
-    "granite" => recorded_granite_tokens_wgpu, recorded_granite_tokens_rocm, recorded_granite_tokens_ptx;
-    "olmo2" => recorded_olmo2_tokens_wgpu, recorded_olmo2_tokens_rocm, recorded_olmo2_tokens_ptx;
-    "bloom" => recorded_bloom_tokens_wgpu, recorded_bloom_tokens_rocm, recorded_bloom_tokens_ptx;
-    "mpt" => recorded_mpt_tokens_wgpu, recorded_mpt_tokens_rocm, recorded_mpt_tokens_ptx;
-    "smollm3" => recorded_smollm3_tokens_wgpu, recorded_smollm3_tokens_rocm, recorded_smollm3_tokens_ptx;
-    "llama" => recorded_llama_tokens_wgpu, recorded_llama_tokens_rocm, recorded_llama_tokens_ptx;
-    "qwen3" => recorded_qwen3_tokens_wgpu, recorded_qwen3_tokens_rocm, recorded_qwen3_tokens_ptx;
-    "phi3" => recorded_phi3_tokens_wgpu, recorded_phi3_tokens_rocm, recorded_phi3_tokens_ptx;
-    "qwen3moe" => recorded_qwen3moe_tokens_wgpu, recorded_qwen3moe_tokens_rocm, recorded_qwen3moe_tokens_ptx;
-    "olmoe" => recorded_olmoe_tokens_wgpu, recorded_olmoe_tokens_rocm, recorded_olmoe_tokens_ptx;
-    "llama/mixtral" => recorded_mixtral_tokens_wgpu, recorded_mixtral_tokens_rocm, recorded_mixtral_tokens_ptx;
-    "granite/granitemoe" => recorded_granitemoe_tokens_wgpu, recorded_granitemoe_tokens_rocm, recorded_granitemoe_tokens_ptx;
-    "gpt_oss" => recorded_gpt_oss_tokens_wgpu, recorded_gpt_oss_tokens_rocm, recorded_gpt_oss_tokens_ptx;
-    "minimax_m2" => recorded_minimax_m2_tokens_wgpu, recorded_minimax_m2_tokens_rocm, recorded_minimax_m2_tokens_ptx;
-    "deepseek2" => recorded_deepseek2_tokens_wgpu, recorded_deepseek2_tokens_rocm, recorded_deepseek2_tokens_ptx;
-    "deepseek3" => recorded_deepseek3_tokens_wgpu, recorded_deepseek3_tokens_rocm, recorded_deepseek3_tokens_ptx;
-    "deepseek32" => recorded_deepseek32_tokens_wgpu, recorded_deepseek32_tokens_rocm, recorded_deepseek32_tokens_ptx;
-    "nemotron_h" => recorded_nemotron_h_tokens_wgpu, recorded_nemotron_h_tokens_rocm, recorded_nemotron_h_tokens_ptx;
-    "deepseek4" => recorded_deepseek4_tokens_wgpu, recorded_deepseek4_tokens_rocm, recorded_deepseek4_tokens_ptx;
-    "qwen3next" => recorded_qwen3next_tokens_wgpu, recorded_qwen3next_tokens_rocm, recorded_qwen3next_tokens_ptx;
-    "qwen4exp" => recorded_qwen4exp_tokens_wgpu, recorded_qwen4exp_tokens_rocm, recorded_qwen4exp_tokens_ptx;
-    "qwen4exp/packed" => recorded_qwen4exp_packed_tokens_wgpu, recorded_qwen4exp_packed_tokens_rocm, recorded_qwen4exp_packed_tokens_ptx;
-    "qwen4exp/finetune" => recorded_qwen4exp_finetune_tokens_wgpu, recorded_qwen4exp_finetune_tokens_rocm, recorded_qwen4exp_finetune_tokens_ptx;
-    "qwen35" => recorded_qwen35_tokens_wgpu, recorded_qwen35_tokens_rocm, recorded_qwen35_tokens_ptx;
-    "qwen35/fp8" => recorded_qwen35_fp8_tokens_wgpu, recorded_qwen35_fp8_tokens_rocm, recorded_qwen35_fp8_tokens_ptx;
-    "glm53_flash" => recorded_glm53_flash_tokens_wgpu, recorded_glm53_flash_tokens_rocm, recorded_glm53_flash_tokens_ptx;
+    "qwen2" => recorded_qwen2_tokens_wgpu, recorded_qwen2_tokens_vulkan, recorded_qwen2_tokens_rocm, recorded_qwen2_tokens_ptx;
+    "gemma3" => recorded_gemma3_tokens_wgpu, recorded_gemma3_tokens_vulkan, recorded_gemma3_tokens_rocm, recorded_gemma3_tokens_ptx;
+    "gemma4" => recorded_gemma4_tokens_wgpu, recorded_gemma4_tokens_vulkan, recorded_gemma4_tokens_rocm, recorded_gemma4_tokens_ptx;
+    "gemma4/moe" => recorded_gemma4_moe_tokens_wgpu, recorded_gemma4_moe_tokens_vulkan, recorded_gemma4_moe_tokens_rocm, recorded_gemma4_moe_tokens_ptx;
+    "granite" => recorded_granite_tokens_wgpu, recorded_granite_tokens_vulkan, recorded_granite_tokens_rocm, recorded_granite_tokens_ptx;
+    "olmo2" => recorded_olmo2_tokens_wgpu, recorded_olmo2_tokens_vulkan, recorded_olmo2_tokens_rocm, recorded_olmo2_tokens_ptx;
+    "bloom" => recorded_bloom_tokens_wgpu, recorded_bloom_tokens_vulkan, recorded_bloom_tokens_rocm, recorded_bloom_tokens_ptx;
+    "mpt" => recorded_mpt_tokens_wgpu, recorded_mpt_tokens_vulkan, recorded_mpt_tokens_rocm, recorded_mpt_tokens_ptx;
+    "smollm3" => recorded_smollm3_tokens_wgpu, recorded_smollm3_tokens_vulkan, recorded_smollm3_tokens_rocm, recorded_smollm3_tokens_ptx;
+    "llama" => recorded_llama_tokens_wgpu, recorded_llama_tokens_vulkan, recorded_llama_tokens_rocm, recorded_llama_tokens_ptx;
+    "qwen3" => recorded_qwen3_tokens_wgpu, recorded_qwen3_tokens_vulkan, recorded_qwen3_tokens_rocm, recorded_qwen3_tokens_ptx;
+    "phi3" => recorded_phi3_tokens_wgpu, recorded_phi3_tokens_vulkan, recorded_phi3_tokens_rocm, recorded_phi3_tokens_ptx;
+    "qwen3moe" => recorded_qwen3moe_tokens_wgpu, recorded_qwen3moe_tokens_vulkan, recorded_qwen3moe_tokens_rocm, recorded_qwen3moe_tokens_ptx;
+    "olmoe" => recorded_olmoe_tokens_wgpu, recorded_olmoe_tokens_vulkan, recorded_olmoe_tokens_rocm, recorded_olmoe_tokens_ptx;
+    "llama/mixtral" => recorded_mixtral_tokens_wgpu, recorded_mixtral_tokens_vulkan, recorded_mixtral_tokens_rocm, recorded_mixtral_tokens_ptx;
+    "granite/granitemoe" => recorded_granitemoe_tokens_wgpu, recorded_granitemoe_tokens_vulkan, recorded_granitemoe_tokens_rocm, recorded_granitemoe_tokens_ptx;
+    "gpt_oss" => recorded_gpt_oss_tokens_wgpu, recorded_gpt_oss_tokens_vulkan, recorded_gpt_oss_tokens_rocm, recorded_gpt_oss_tokens_ptx;
+    "minimax_m2" => recorded_minimax_m2_tokens_wgpu, recorded_minimax_m2_tokens_vulkan, recorded_minimax_m2_tokens_rocm, recorded_minimax_m2_tokens_ptx;
+    "deepseek2" => recorded_deepseek2_tokens_wgpu, recorded_deepseek2_tokens_vulkan, recorded_deepseek2_tokens_rocm, recorded_deepseek2_tokens_ptx;
+    "deepseek3" => recorded_deepseek3_tokens_wgpu, recorded_deepseek3_tokens_vulkan, recorded_deepseek3_tokens_rocm, recorded_deepseek3_tokens_ptx;
+    "deepseek32" => recorded_deepseek32_tokens_wgpu, recorded_deepseek32_tokens_vulkan, recorded_deepseek32_tokens_rocm, recorded_deepseek32_tokens_ptx;
+    "nemotron_h" => recorded_nemotron_h_tokens_wgpu, recorded_nemotron_h_tokens_vulkan, recorded_nemotron_h_tokens_rocm, recorded_nemotron_h_tokens_ptx;
+    "deepseek4" => recorded_deepseek4_tokens_wgpu, recorded_deepseek4_tokens_vulkan, recorded_deepseek4_tokens_rocm, recorded_deepseek4_tokens_ptx;
+    "qwen3next" => recorded_qwen3next_tokens_wgpu, recorded_qwen3next_tokens_vulkan, recorded_qwen3next_tokens_rocm, recorded_qwen3next_tokens_ptx;
+    "qwen4exp" => recorded_qwen4exp_tokens_wgpu, recorded_qwen4exp_tokens_vulkan, recorded_qwen4exp_tokens_rocm, recorded_qwen4exp_tokens_ptx;
+    "qwen4exp/packed" => recorded_qwen4exp_packed_tokens_wgpu, recorded_qwen4exp_packed_tokens_vulkan, recorded_qwen4exp_packed_tokens_rocm, recorded_qwen4exp_packed_tokens_ptx;
+    "qwen4exp/finetune" => recorded_qwen4exp_finetune_tokens_wgpu, recorded_qwen4exp_finetune_tokens_vulkan, recorded_qwen4exp_finetune_tokens_rocm, recorded_qwen4exp_finetune_tokens_ptx;
+    "qwen35" => recorded_qwen35_tokens_wgpu, recorded_qwen35_tokens_vulkan, recorded_qwen35_tokens_rocm, recorded_qwen35_tokens_ptx;
+    "qwen35/fp8" => recorded_qwen35_fp8_tokens_wgpu, recorded_qwen35_fp8_tokens_vulkan, recorded_qwen35_fp8_tokens_rocm, recorded_qwen35_fp8_tokens_ptx;
+    "glm53_flash" => recorded_glm53_flash_tokens_wgpu, recorded_glm53_flash_tokens_vulkan, recorded_glm53_flash_tokens_rocm, recorded_glm53_flash_tokens_ptx;
+}
+
+/// POOT-1231 SC-004: every family with recorded tokens has its rows on every backend, raw Vulkan among them
+/// (the macro instantiates a family on all four, so a family missing from its list has none). Model-free: it
+/// compares the two lists. Mutation: delete one family's line from the `recorded_family_rows!` list: its name
+/// is in `RECORDED` and not in the instantiated set, and this fails naming it.
+#[test]
+fn every_recorded_family_has_its_rows_on_every_backend() {
+    let recorded: std::collections::BTreeSet<&str> =
+        RECORDED.iter().map(|recorded| recorded.family).collect();
+    let rowed: std::collections::BTreeSet<&str> = ROWED_FAMILIES.iter().copied().collect();
+    assert_eq!(
+        ROWED_FAMILIES.len(),
+        rowed.len(),
+        "a family is instantiated twice"
+    );
+    let missing: Vec<_> = recorded.difference(&rowed).collect();
+    let stray: Vec<_> = rowed.difference(&recorded).collect();
+    assert!(
+        missing.is_empty() && stray.is_empty(),
+        "recorded families without rows: {missing:?}; rows for families with no recorded tokens: {stray:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3122,8 +3156,8 @@ mod checkpoint {
     /// checkpoint produces on every backend (" Paris. It is the largest city in", updates 0620, 0646 and
     /// 0655), on top of the oracle comparison. The oracle reads the same weight map as the device, so a
     /// GGUF layout error they share (the Q/K row order, the NoPE layer schedule) moves both and only this
-    /// independent literal catches it. Mutation: in `Smollm3Params::from_raw`, skip
-    /// `with_interleaved_rope` for a GGUF; the continuation becomes " Paris, which is the capital of France".
+    /// independent literal catches it. Mutation: in `Smollm3::weights`, read a GGUF with `GGUF_BASE` alone
+    /// (drop `GGUF_PAIRED_QK`); the continuation becomes " Paris, which is the capital of France".
     fn smollm3_gguf_continues_like_the_safetensors_checkpoint(
         path: &std::path::Path,
         choice: BackendChoice,
@@ -3160,7 +3194,6 @@ mod checkpoint {
                         run(BackendChoice::Wgpu);
                     }
 
-                    #[cfg(feature = "rocm")]
                     #[test]
                     #[ignore = $why]
                     fn rocm() {
@@ -4840,7 +4873,6 @@ macro_rules! moe_oracle_rows {
                 moe_first_step_matches_the_oracle($family, BackendChoice::Wgpu);
             }
 
-            #[cfg(feature = "rocm")]
             #[test]
             fn $rocm() {
                 moe_first_step_matches_the_oracle($family, BackendChoice::Rocm);

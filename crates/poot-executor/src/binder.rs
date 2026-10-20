@@ -335,6 +335,8 @@ pub(crate) fn chunks<'a>(
 enum Part {
     Whole(WeightKey),
     Rows(WeightKey, Range<usize>),
+    /// The rows of an entry in the order given, one byte run per row.
+    Ordered(WeightKey, Arc<[usize]>),
     /// A whole I64 index table read as I32.
     Narrowed(WeightKey),
     /// The range `cols` of axis `axis` (at least 1) of an entry: one byte run per outer index.
@@ -430,6 +432,9 @@ impl WeightBinder {
             WeightView::RowRange { key, rows } => {
                 vec![Part::Rows(key.clone(), rows.clone())]
             }
+            WeightView::RowOrder { key, order } => {
+                vec![Part::Ordered(key.clone(), Arc::clone(order))]
+            }
             WeightView::IndexNarrow(key) => vec![Part::Narrowed(key.clone())],
             WeightView::BlockColumns { key, axis, cols } => {
                 vec![Part::Columns(key.clone(), *axis, cols.clone())]
@@ -508,6 +513,8 @@ impl WeightBinder {
                 }
                 // A narrowed table is read whole: a chunk of it would split a derived buffer.
                 Part::Narrowed(_) => return Err(shape_error()),
+                // An ordered view is a gather of rows, not a row range.
+                Part::Ordered(..) => return Err(shape_error()),
                 // A column cut is a strided set of runs, not a row range.
                 Part::Columns(..) => return Err(shape_error()),
             };
@@ -612,6 +619,7 @@ impl WeightBinder {
         let key = match part {
             Part::Whole(key)
             | Part::Rows(key, _)
+            | Part::Ordered(key, _)
             | Part::Narrowed(key)
             | Part::Columns(key, ..) => key,
         };
@@ -641,6 +649,14 @@ impl WeightBinder {
                 let row_bytes =
                     row_bytes.ok_or(LoadError::Unimplemented("a row range of a planar source"))?;
                 std::iter::once(rows.start * row_bytes..rows.end * row_bytes).collect()
+            }
+            Part::Ordered(_, order) => {
+                let row_bytes =
+                    row_bytes.ok_or(LoadError::Unimplemented("a row order of a planar source"))?;
+                order
+                    .iter()
+                    .map(|&row| row * row_bytes..(row + 1) * row_bytes)
+                    .collect()
             }
             Part::Columns(_, axis, cols) => match (entry, role) {
                 (WeightEntry::Dense(dense), None) => {
@@ -857,7 +873,7 @@ impl WeightBinder {
                     Ok(RowRun { key, rows: 0..rows })
                 }
                 // An index table is no embedding, and a column cut is no row run.
-                Part::Narrowed(_) | Part::Columns(..) => Err(shape_error()),
+                Part::Narrowed(_) | Part::Ordered(..) | Part::Columns(..) => Err(shape_error()),
             })
             .collect::<Result<Vec<_>, LoadError>>()?;
         Ok(EmbedRows {

@@ -182,26 +182,37 @@ impl Context {
         self.check_staged_faults(&staged_faults)
     }
 
-    /// Copy every 4-byte lane of `src` into `dst` on the device (Card 375f).
+    /// The number of bytes a whole-buffer copy of `src` into `dst` moves: the allocation of either, which
+    /// is its elements rounded up to whole 4-byte words (`alloc_storage`), so a buffer of an odd number of
+    /// bytes (3 bf16 values) copies whole. Refused with [`RuntimeError::CopyLength`] when the two hold
+    /// different byte lengths.
+    pub fn copy_bytes(&self, dst: &DeviceBuffer, src: &DeviceBuffer) -> Result<u64, RuntimeError> {
+        let bytes = |buffer: &DeviceBuffer| {
+            (u64::from(buffer.elem_count) * buffer.storage.element().byte_width() as u64)
+                .next_multiple_of(4)
+        };
+        let (dst_bytes, src_bytes) = (bytes(dst), bytes(src));
+        if dst_bytes != src_bytes {
+            return Err(RuntimeError::CopyLength {
+                dst: dst_bytes,
+                src: src_bytes,
+            });
+        }
+        Ok(src_bytes)
+    }
+
+    /// Copy all of `src` into `dst` on the device (Card 375f), whatever the buffers' element kind or length
+    /// ([`Self::copy_bytes`]).
     ///
     /// A validated state session seeds its own storage from a caller's state buffer this way instead of
     /// adopting the buffer, so the caller keeps no handle into session storage. One submit, no readback,
-    /// no allocation. Both buffers must hold the same number of lanes.
+    /// no allocation. Both buffers must hold the same number of bytes.
     pub fn copy_words_into(
         &self,
         dst: &DeviceBuffer,
         src: &DeviceBuffer,
     ) -> Result<(), RuntimeError> {
-        if dst.elem_count != src.elem_count {
-            return Err(RuntimeError::CopyLength {
-                dst: dst.elem_count,
-                src: src.elem_count,
-            });
-        }
-        // Card 546a: the element width comes from the buffer's own storage (card 527), not a
-        // hardcoded 4 bytes - this copy now also serves the executor contract's two-phase state
-        // commit, whose state buffers are not always F32/I32-wide.
-        let bytes = src.elem_count as u64 * src.storage.element().byte_width() as u64;
+        let bytes = self.copy_bytes(dst, src)?;
         if bytes == 0 {
             return Ok(());
         }

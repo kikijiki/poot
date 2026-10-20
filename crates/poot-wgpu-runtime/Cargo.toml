@@ -21,10 +21,9 @@ thiserror.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
 bytemuck.workspace = true
-# wgpu-hal + ash (pinned to wgpu's versions): used only to query device VRAM through the Vulkan
-# runtime (VK_EXT_memory_budget) for the GPU-memory metric (no sysfs/CLI).
+# wgpu-hal (pinned to wgpu's version): the adapter's raw Vulkan handles, read by `poot_runtime_common::vulkan_probe`
+# for the GPU-memory metric (VK_EXT_memory_budget; no sysfs/CLI) and the AMD compute-unit count.
 wgpu-hal.workspace = true
-ash.workspace = true
 
 [dev-dependencies]
 # This crate's own `tests/*.rs` integration binaries drive a `Context` through the gated upload/download API.

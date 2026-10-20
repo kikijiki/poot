@@ -23,7 +23,7 @@ fmt:
 # lint the workspace; any warning fails (cargo arguments go before the `--`)
 [positional-arguments]
 clippy *args:
-    # `poot-llm/cli` builds the binaries (`poot-generate`, `poot-caption`, `poot-embed`), which need it (anyhow, clap)
+    # `poot-llm/cli` builds the `poot` binary, which needs it (anyhow, clap)
     cargo clippy --workspace --all-targets --features poot-llm/cli "$@" -- -D warnings
 
 # ---- tests ------------------------------------------------------------------
@@ -68,12 +68,12 @@ test: test-model-free
 
 # the model-free gate: dead-pub and unused-dependency checks, docs-path references, the inventory and lane self-tests, device-probe
 # self-test, then every model-free test and doctest
-test-model-free: gate-check dead-pub machete docs-paths variant-coverage mutation-sample-report diagrams-check aie-link-driver npu-build vpu-build crates-stale-names cargo-freshness test-model-free-inventory test-lane-coverage test-bench-runner test-bench-harness
+test-model-free: gate-check dead-pub machete docs-paths variant-coverage mutation-sample-report diagrams-check aie-link-driver npu-build vpu-build crates-stale-names cargo-freshness crates-standalone test-model-free-inventory test-lane-coverage test-bench-runner test-bench-harness
     scripts/with-required-backend.sh --self-test
     scripts/test-model-free.sh run
 
-# The bench runner's host tests, which the model-free lane cannot carry (its dependency on poot-llm turns the rocm
-# feature on for every poot-llm build in the same invocation). They are rows of the model-free inventory like any
+# The bench runner's host tests, which the model-free lane cannot carry (a binary with no library target, which the
+# lane's `--lib` selection rejects). They are rows of the model-free inventory like any
 # other, so a removed or unlisted test fails the inventory check. Devices and checkpoints are hidden and required
 # here exactly as in that lane. The script's POOT_MODEL_FREE_ACTIVE re-entry guard stops a recipe that
 # re-enters itself.
@@ -196,6 +196,10 @@ npu-build:
 vpu-build:
     cargo clippy -p poot-npu --features vpu --all-targets -- -D warnings
 
+# each workspace library builds alone (`cargo check --workspace` unifies features and hides a gated import: POOT-1296)
+crates-standalone:
+    scripts/check-crates-standalone.py
+
 # fail when a crate source or manifest cites a deleted API (Runner, GpuExecutor, run_resident_kv, run_prefill, POOT_SPEC_*)
 # as if it still existed; a comment block that says the name is gone is history and passes
 crates-stale-names:
@@ -268,7 +272,7 @@ test-checkpoint-rocm:
     scripts/check-required-cases.py begin checkpoint-rocm {{results}}/device-checkpoint-rocm/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_ROCM \
         env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
-        {{nextest}} --profile device-checkpoint-rocm --run-ignored all -p poot-llm --features poot-llm/rocm \
+        {{nextest}} --profile device-checkpoint-rocm --run-ignored all -p poot-llm \
         -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-rocm)"
     scripts/check-required-cases.py check checkpoint-rocm {{results}}/device-checkpoint-rocm/results.xml
 
@@ -308,7 +312,7 @@ test-checkpoint-large-rocm:
     scripts/check-required-cases.py begin checkpoint-large-rocm {{results}}/device-checkpoint-large-rocm/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_ROCM \
         env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
-        {{nextest}} --profile device-checkpoint-large-rocm --run-ignored all -p poot-llm --features poot-llm/rocm \
+        {{nextest}} --profile device-checkpoint-large-rocm --run-ignored all -p poot-llm \
         -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-large-rocm)"
     scripts/check-required-cases.py check checkpoint-large-rocm {{results}}/device-checkpoint-large-rocm/results.xml
 
@@ -340,7 +344,7 @@ test-npu-toolchain:
 # A `package(...)` selection also runs that package's model-free tests (poot-wgpu-runtime, poot-rocm-runtime), which
 # `just test` runs too: the repeat is harmless and costs seconds.
 wgpu_selection := 'package(poot-wgpu-runtime) | (binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-llm::add_a_model) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_wgpu$/)) | (binary_id(=poot-llm::beam) & test(/_wgpu$/)) | (binary_id(=poot-llm::timed_executor) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_wgpu$/)) | (binary_id(=poot-llm::recurrent_snapshot_cost) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_wgpu$/)) | (binary_id(=poot-llm::staged_timing) & test(/_wgpu$/)) | binary_id(=poot-executor) | binary_id(=poot-executor::cr30_lifecycle) | binary_id(=poot-executor::staged_pipeline) | package(poot-wgpu-device) | binary_id(=poot-llm::wgpu_qwen2) | binary_id(=poot-llm::wgpu_gemma2) | binary_id(=poot-llm::wgpu_executor_contract) | binary_id(=poot-llm::wgpu_weight_map_binding) | binary_id(=poot-llm::wgpu_parity_models) | binary_id(=poot-llm::wgpu_staged_pipeline) | binary_id(=poot-serve::bounded_drain_production) | (binary_id(=poot-serve::served_loop) & test(/_wgpu$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-serve::served_groups) & test(/_wgpu$/)) | test(/^prefill_kv_shared_pool_matches_contiguous$/) | test(/^qwen2_decode_gpu_matches_cpu$/)'
-vulkan_selection := 'package(poot-vulkan-runtime) | package(poot-vulkan-device) | binary_id(=poot-llm::vulkan_generate) | binary_id(=poot-llm::vulkan_cross_backend) | binary_id(=poot-llm::vulkan_parity_models) | (binary_id(=poot-serve::served_groups) & test(/_vulkan$/)) | (binary_id(=poot-serve::served_loop) & test(/_vulkan$/))'
+vulkan_selection := 'package(poot-vulkan-runtime) | package(poot-vulkan-device) | (binary_id(=poot-llm) & test(/^driver::device_tests::(recorded_[a-z_0-9]+|attached_device_limit_refuses_an_oversized_constant)_vulkan$/)) | binary_id(=poot-llm::vulkan_generate) | binary_id(=poot-llm::vulkan_cross_backend) | binary_id(=poot-llm::vulkan_parity_models) | (binary_id(=poot-serve::served_groups) & test(/_vulkan$/)) | (binary_id(=poot-serve::served_loop) & test(/_vulkan$/))'
 rocm_selection := 'package(poot-rocm-runtime) | (binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-llm::add_a_model) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_rocm$/)) | package(poot-rocm-device) | binary_id(=poot-llm::rocm_executor_contract) | binary_id(=poot-llm::rocm_executor_coverage) | binary_id(=poot-llm::rocm_routed_prefill_unguarded) | binary_id(=poot-llm::rocm_parity_models) | binary_id(=poot-llm::rocm_staged_pipeline) | binary_id(=poot-llm::rocm_weight_map_binding) | (binary_id(=poot-llm::beam) & test(/_rocm$/)) | (binary_id(=poot-llm::timed_executor) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_rocm$/)) | (binary_id(=poot-llm::recurrent_snapshot_cost) & test(/_rocm$/)) | (binary_id(=poot-llm::speculate) & test(/_rocm$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_rocm$/)) | binary_id(=poot-llm::rocm_batched_decode_plan_classify) | (binary_id(=poot-serve::served_loop) & test(/_rocm$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-serve::served_groups) & test(/_rocm$/))'
 ptx_single_device_rows := '(binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_ptx$/)) | (binary_id(=poot-llm::add_a_model) & test(/_ptx$/)) | (binary_id(=poot-llm::beam) & test(/_ptx$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_ptx$/)) | (binary_id(=poot-llm::speculate) & test(/_ptx$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_ptx$/)) | (binary_id(=poot-llm::staged_timing) & test(/_ptx$/)) | (binary_id(=poot-llm::timed_executor) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_ptx$/)) | (binary_id(=poot-serve::served_groups) & test(/_ptx$/)) | package(poot-ptx-device) | binary_id(=poot-llm::ptx_gemma2_geglu) | binary_id(=poot-llm::ptx_sc_acceptance) | binary_id(=poot-llm::ptx_routed_prefill_unguarded) | binary_id(=poot-llm::ptx_parity_models) | binary_id(=poot-llm::ptx_staged_pipeline) | binary_id(=poot-llm::ptx_weight_map_binding) | package(poot-ptx-runtime)' + ' | (' + kernels_package_selection + ' & ' + ptx_named_rows + ')'
 # The multi-device rows (two NVIDIA GPUs, and the four-way tensor-parallel row) live in three test binaries, and a
@@ -362,8 +366,8 @@ ptx_named_rows := 'test(/_on_ptx(_kquant)?$/)'
 kernels_selection := kernels_package_selection + ' & not ' + ptx_named_rows
 npu_selection := 'package(poot-npu)'
 
-# poot-bench-runner builds poot-llm with the rocm feature, which cannot unify into the model-free lane, so
-# its host tests (inventory rows of the `isolated` policy, class model-free) run in `test-bench-runner`.
+# poot-bench-runner is a binary with no library target, so its host tests (inventory rows of the `isolated` policy,
+# class model-free) run in `test-bench-runner`.
 isolated_package := 'poot-bench-runner'
 
 # Required small-device lanes. Each runs through scripts/with-required-backend.sh, which clears every
@@ -415,7 +419,7 @@ test-device-rocm:
     scripts/check-required-cases.py --self-test
     scripts/check-required-cases.py begin rocm {{results}}/device-rocm/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_ROCM \
-        {{nextest}} --profile device-rocm -p poot-rocm-device -p poot-llm -p poot-rocm-runtime -p poot-serve --features poot-llm/rocm \
+        {{nextest}} --profile device-rocm -p poot-rocm-device -p poot-llm -p poot-rocm-runtime -p poot-serve \
         -E '{{rocm_selection}}'
     scripts/with-required-backend.sh POOT_REQUIRE_ROCM cargo run -p poot-rocm-device --bin rocm-check -- --add
     scripts/check-required-cases.py check rocm {{results}}/device-rocm/results.xml
@@ -535,10 +539,10 @@ docs-check:
     prettier --check $files || rc=1
     echo "-- links --"
     lychee --no-progress $files || rc=1
-    echo "-- retired names (the generate binary is poot-generate) --"
+    echo '-- retired names (the generate command is `poot generate`) --'
     # The pattern is written with a bracket so this line does not match itself.
     if git grep -nI 'qwen2-gener[a]te' -- . ; then
-        echo "the old generate binary name was renamed poot-generate: replace it where listed above"
+        echo 'the old generate binary name was retired for `poot generate`: replace it where listed above'
         rc=1
     fi
     echo "-- docs/ path references --"

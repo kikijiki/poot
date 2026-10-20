@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use poot_executor::{Executor, NoSync, StepInputs};
-use poot_graph_ir::{Builder, Slot, TensorType};
+use poot_graph_ir::{Builder, Slot, TensorType, WeightRef};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, LoraPlan, Target, multi_device::topology::DeviceId,
     staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::TargetSet,
@@ -170,13 +170,13 @@ fn run_projection(
             )
             .unwrap();
         let w = builder
-            .constant(
-                &weight_id.const_name(),
+            .weight(
+                WeightRef::whole(weight_id),
                 TensorType::f32(vec![out_dim, in_dim]),
             )
             .unwrap();
         let bias_const = builder
-            .constant(&bias_id.const_name(), TensorType::f32(vec![out_dim]))
+            .weight(WeightRef::whole(bias_id), TensorType::f32(vec![out_dim]))
             .unwrap();
         let wt = builder.transpose(w, vec![1, 0]).unwrap();
         let y = builder.matmul(xs, wt).unwrap();

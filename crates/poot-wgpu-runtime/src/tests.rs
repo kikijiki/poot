@@ -115,9 +115,8 @@ mod pending_fault_tests {
             "assert_trap_pending_fault",
             poot_codegen::Target::SpirvVulkan,
         );
-        let artifact =
-            poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out)
-                .expect("assert_trap must compile to SpirV");
+        let artifact = poot_codegen::compile_kernel(&body, poot_target::Backend::SpirvVulkan, &out)
+            .expect("assert_trap must compile to SpirV");
         let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
         (kernel, body)
     }
@@ -487,9 +486,8 @@ mod profiled_dispatch_tests {
         let dir = std::env::temp_dir().join("poot-wgpu-runtime-test");
         std::fs::create_dir_all(&dir).unwrap();
         let out = poot_codegen::artifact_path(&dir, name, poot_codegen::Target::SpirvVulkan);
-        let artifact =
-            poot_codegen::compile_kernel(body, poot_codegen::GpuTarget::SpirvVulkan, &out)
-                .expect("compile spirv");
+        let artifact = poot_codegen::compile_kernel(body, poot_target::Backend::SpirvVulkan, &out)
+            .expect("compile spirv");
         poot_codegen::kernel_handle(body, &artifact).unwrap()
     }
 
@@ -628,9 +626,8 @@ mod no_contract_tests {
         let dir = std::env::temp_dir().join("poot-wgpu-runtime-test");
         std::fs::create_dir_all(&dir).unwrap();
         let out = poot_codegen::artifact_path(&dir, name, poot_codegen::Target::SpirvVulkan);
-        let artifact =
-            poot_codegen::compile_kernel(body, poot_codegen::GpuTarget::SpirvVulkan, &out)
-                .expect("compile spirv");
+        let artifact = poot_codegen::compile_kernel(body, poot_target::Backend::SpirvVulkan, &out)
+            .expect("compile spirv");
         poot_codegen::kernel_handle(body, &artifact).unwrap()
     }
 
@@ -1023,9 +1020,8 @@ mod exec_counters_tests {
         let dir = std::env::temp_dir().join("poot-wgpu-runtime-test");
         std::fs::create_dir_all(&dir).unwrap();
         let out = poot_codegen::artifact_path(&dir, name, poot_codegen::Target::SpirvVulkan);
-        let artifact =
-            poot_codegen::compile_kernel(body, poot_codegen::GpuTarget::SpirvVulkan, &out)
-                .expect("compile spirv");
+        let artifact = poot_codegen::compile_kernel(body, poot_target::Backend::SpirvVulkan, &out)
+            .expect("compile spirv");
         poot_codegen::kernel_handle(body, &artifact).unwrap()
     }
 
@@ -1133,8 +1129,7 @@ mod device_timing_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = poot_codegen::artifact_path(&dir, name, poot_codegen::Target::SpirvVulkan);
         let artifact =
-            poot_codegen::compile_kernel(body, poot_codegen::GpuTarget::SpirvVulkan, &path)
-                .unwrap();
+            poot_codegen::compile_kernel(body, poot_target::Backend::SpirvVulkan, &path).unwrap();
         poot_codegen::kernel_handle(body, &artifact).unwrap()
     }
 

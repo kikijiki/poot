@@ -359,7 +359,7 @@ pub struct KnownMiscompiles {
 pub struct DeviceCaps {
     /// The largest single buffer allocation this device and its driver are safe to use, in bytes. Not
     /// always the raw device maximum: a driver can wedge below its own advertised limit (RADV; see
-    /// `poot-wgpu-runtime`'s `AMD_RADV_SAFE_MAX_BUFFER_BYTES`).
+    /// [`AMD_RADV_SAFE_MAX_BUFFER_BYTES`]).
     pub max_buffer_bytes: u64,
     /// Workgroup-local (LDS/shared-memory) budget, in bytes, one dispatch may use.
     pub lds_bytes: u32,
@@ -430,6 +430,15 @@ pub const DECODE_GEMV_CHUNK_TRIGGER: u64 = 220_000;
 /// the full 2048-token forward was not run. It is not tuned: a slower body or device wants a smaller value.
 pub const PACKED_TILED_CHUNK_WORK: u64 = 8_000_000_000;
 
+/// Safe single-buffer cap for AMD RADV (Vulkan), in bytes: 1.25 GiB.
+///
+/// Observed 2026-09-25 on AMD Radeon 8060S (RADV STRIX_HALO): an lm_head chunk sitting at the device
+/// `max_buffer_size` (2,147,483,647) wedged the gfx ring on its first dispatch, even though the driver accepted
+/// the allocation. Both Vulkan runtimes therefore report `min(device limit, AMD_RADV_SAFE_MAX_BUFFER_BYTES)` as
+/// [`DeviceCaps::max_buffer_bytes`] on an AMD Vulkan device, and the raw device limit elsewhere. `legalize`
+/// consumes that figure, hosting or splitting whatever constant does not fit.
+pub const AMD_RADV_SAFE_MAX_BUFFER_BYTES: u64 = 1_342_177_280;
+
 /// Strix Halo's (gfx1151, Radeon 8060S) compute units, as HSA reports them: the RDNA3 default for
 /// [`DeviceCaps::wgpu_rdna3_igpu`] (wgpu has no compute-unit query) and [`DeviceCaps::rocm_default`]
 /// (a live ROCm context reports its own agent's count).
@@ -452,8 +461,8 @@ impl DeviceCaps {
     /// tests and the plan-summary corpus (card 599).
     pub fn wgpu_rdna3_igpu() -> Self {
         DeviceCaps {
-            max_buffer_bytes: 1_342_177_280, // poot-wgpu-runtime::AMD_RADV_SAFE_MAX_BUFFER_BYTES (1.25 GiB)
-            lds_bytes: 16_352,               // wgpu downlevel_defaults() workgroup-storage limit
+            max_buffer_bytes: AMD_RADV_SAFE_MAX_BUFFER_BYTES,
+            lds_bytes: 16_352, // wgpu downlevel_defaults() workgroup-storage limit
             // The wgpu runtime raises x and the invocation count to the adapter maximum (RADV: 1024);
             // y and z stay at `downlevel_defaults()`.
             max_workgroup_size: [1024, 256, 64],

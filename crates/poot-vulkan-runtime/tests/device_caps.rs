@@ -52,3 +52,35 @@ fn raw_vulkan_reports_wmma_class_support_on_this_box() {
         "this box's gfx1151 iGPU must report confirmed WMMA-class cooperative-matrix support"
     );
 }
+
+/// POOT-1231 SC-001: the reference caps the raw Vulkan planner column compiles against are this device's
+/// own: every figure the fixture fixes (workgroup memory, workgroup and grid limits, subgroup range, matrix
+/// hardware, compute units, the vendor-scoped RADV caps) is what the live context reports. Skips on a
+/// non-RADV device (the fixture describes the RADV iGPU). Mutation: change a figure of
+/// `poot_test_util::device_caps::vulkan_rdna3_igpu` (or point it back at the wgpu preset's `lds_bytes`): the field named in the
+/// assertion differs from the live value.
+#[test]
+fn the_reference_caps_of_the_raw_vulkan_column_are_what_the_radv_device_reports() {
+    let ctx = match Context::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("no Vulkan device ({e}); skipping");
+            return;
+        }
+    };
+    if !ctx.device_name().to_ascii_lowercase().contains("radv") {
+        eprintln!("not a RADV device ({:?}); skipping", ctx.device_name());
+        return;
+    }
+    let live = ctx.device_caps();
+    let reference = poot_test_util::device_caps::vulkan_rdna3_igpu();
+    // The live budget is an observation at open, not a property of the part.
+    assert_eq!(
+        poot_target::DeviceCaps {
+            memory_budget_bytes: None,
+            ..live
+        },
+        reference,
+        "the raw Vulkan reference caps differ from the live device"
+    );
+}

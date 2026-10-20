@@ -683,7 +683,7 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
             let (from_rank, to_rank) = (plan.ranks[from_stage], plan.ranks[to_stage]);
             let mut create = |rank: usize| -> Result<D::Event, ExecError> {
                 let engine = &mut self.engines[rank];
-                let backend = engine.device().target().id();
+                let backend = engine.device().backend_name();
                 engine
                     .device_mut()
                     .create_event()
@@ -945,10 +945,17 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
     }
 
     fn stats(&self) -> ExecutorStats {
-        let mut stats = ExecutorStats::default();
         let mut memory: HashMap<BufferRole, crate::MemoryCounterSnapshot> = HashMap::new();
         let engine_stats: Vec<ExecutorStats> =
             self.engines.iter().map(|engine| engine.stats()).collect();
+        // A coordinator keeps no timing of its own: its snapshot is empty, over the target its ranks share
+        // (`new` refuses an empty group).
+        let mut stats = ExecutorStats::empty(poot_profile::TimingSnapshot::new(
+            self.engines[0].device().target().id(),
+            poot_profile::BuildIdentity::current(),
+            0,
+            0,
+        ));
         for device in &engine_stats {
             stats.host_write_bytes += device.host_write_bytes;
             stats.output_read_bytes += device.output_read_bytes;

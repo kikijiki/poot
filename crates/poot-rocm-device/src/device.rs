@@ -12,19 +12,18 @@
 //!
 //! `Device::copy` has no native ROCm primitive to record into the same AQL stream (HSA's async-copy
 //! engine is a separate queue with its own signal, not an AQL packet this recording's BARRIER-ordered
-//! replay could sequence against), so it dispatches one generated kernel instead: the
-//! committed `assets/copy_words.kir.json` fixture (`ImportedKernel::CopyWords`), a real `#[kernel]` fn
-//! (`crates/pootc/kernels/probe/copy_words.rs`) compiled once at construction. One thread per `u32`
-//! word, dtype-agnostic: every copy is sized by byte length (`byte_capacity / 4` words), never the
-//! buffer's logical element count (`build_kernarg`'s `len` is per call site, exactly because a
-//! generated typed kernel's `&[f32]`/`&[i32]`/... parameters and `copy_words`'s `&[u32]` parameters
-//! disagree on what "one element" means for any dtype narrower or wider than 4 bytes).
+//! replay could sequence against), so it dispatches the engine's copy kernel instead
+//! ([`CopyMechanism::Kernel`]): one thread per `u32` word, dtype-agnostic, so every copy is sized by the
+//! buffers' byte capacity (`byte_capacity / 4` words) and never by their logical element count. The
+//! runtime allocates whole words, so a buffer of an odd number of bytes owns the word its last byte is in
+//! and a word copy covers it. The device compiles nothing: the engine owns the kernel and hands it over
+//! through [`Device::copy_mechanism`].
 
 use poot_executor::{
-    Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind, MeasuredDeviceTime,
+    Arg, CopyKernel, CopyKernelSink, CopyMechanism, Device, DeviceTime, Dispatch,
+    DispatchDeviceTime, LaunchKind, MeasuredDeviceTime,
 };
-use poot_graph_plan::{ImportedKernel, Target};
-use poot_kernel_ir::Body;
+use poot_graph_plan::Target;
 use poot_rocm_runtime::{
     BoundKernarg, DispatchSpan, KernelHandle, RocmBuffer, RocmContext, RocmContextOptions,
     RocmError,
@@ -69,11 +68,36 @@ pub struct RocmDevice {
     /// The open step's recording so far; `Some` between `begin` and `finish` (mirrors
     /// `poot_wgpu_device::device::WgpuDevice`).
     open: Option<Vec<CapturedAql>>,
-    /// The one generated copy kernel (see the module doc), compiled once at construction.
-    copy_kernel: RocmKernel,
-    /// `copy_kernel`'s compiled workgroup shape (`Body::workgroup_size`): `Device::copy` takes no
-    /// threads/workgroup parameters, so this is the only place that shape is known.
-    copy_workgroup: [u32; 3],
+    /// The engine's copy kernel and its compiled workgroup shape (see the module doc), once
+    /// the engine has loaded it ([`Device::copy_mechanism`]): `Device::copy` takes no kernel or launch shape, so this
+    /// is the only place either is known.
+    copy: Option<CopyLaunch>,
+}
+
+/// The loaded copy kernel and the workgroup shape it was compiled for.
+struct CopyLaunch {
+    kernel: RocmKernel,
+    workgroup: [u32; 3],
+}
+
+/// Receives the engine's copy kernel into the device's copy slot ([`Device::copy_mechanism`]).
+struct CopyLoader<'a> {
+    ctx: &'a RocmContext,
+    slot: &'a mut Option<CopyLaunch>,
+}
+
+impl CopyKernelSink<RocmGpuError> for CopyLoader<'_> {
+    fn load(&mut self, copy: CopyKernel) -> Result<(), RocmGpuError> {
+        let module = self.ctx.load_hsaco(copy.kernel())?;
+        let kernel = self
+            .ctx
+            .lookup_kernel(&module, copy.kernel().entry_point())?;
+        *self.slot = Some(CopyLaunch {
+            kernel: RocmKernel { kernel },
+            workgroup: copy.workgroup(),
+        });
+        Ok(())
+    }
 }
 
 impl RocmDevice {
@@ -93,18 +117,19 @@ impl RocmDevice {
         })?)
     }
 
-    /// A device over an already-opened `ctx`: derives the GPU architecture from the context's ISA name
-    /// (falling back to gfx1151 when it is unrecognized) and compiles the one generated copy kernel.
+    /// A device over an already-opened `ctx`: derives the GPU architecture from the context's ISA name.
+    ///
+    /// # Errors
+    ///
+    /// [`RocmGpuError::Arch`] when the ISA name carries no `gfx` code: kernels are compiled for the
+    /// architecture the GPU reports, never for an assumed one.
     pub fn from_context(ctx: RocmContext) -> Result<Self, RocmGpuError> {
-        let arch = AmdArch::from_isa_name(ctx.isa_name(), ctx.wavefront())
-            .unwrap_or_else(|_| AmdArch::gfx1151());
-        let (copy_kernel, copy_workgroup) = compile_copy_words_kernel(&ctx, arch)?;
+        let arch = AmdArch::from_isa_name(ctx.isa_name(), ctx.wavefront())?;
         Ok(Self {
             ctx,
             arch,
             open: None,
-            copy_kernel,
-            copy_workgroup,
+            copy: None,
         })
     }
 
@@ -113,11 +138,9 @@ impl RocmDevice {
         &self.ctx
     }
 
-    fn push(&mut self, aql: CapturedAql) {
-        self.open
-            .as_mut()
-            .expect("dispatch/copy outside begin/finish")
-            .push(aql);
+    /// The open recording, or [`RocmGpuError::NotRecording`] for `op`.
+    fn recording(&mut self, op: &'static str) -> Result<&mut Vec<CapturedAql>, RocmGpuError> {
+        self.open.as_mut().ok_or(RocmGpuError::NotRecording { op })
     }
 
     /// Bind one kernarg of flat `(ptr: u64, len: u64)` pairs, `[in0, in1, ..., out]` (the
@@ -126,12 +149,12 @@ impl RocmDevice {
     /// `poot-wgpu-device`'s single flat kernarg layout, ROCm's own flavor of "one dispatch, one buffer").
     /// `len`'s unit is the kernel body's own: a generated kernel's typed slice parameters (`&[f32]`,
     /// `&[i32]`, ...) take the buffer's logical element count (`RocmBuffer::elem_count`), but
-    /// `copy_words`'s `&[u32]` parameters take the buffer's u32 WORD count instead - never the same
+    /// the copy kernel's `&[u32]` parameters take the buffer's u32 WORD count instead - never the same
     /// number for an element narrower than 4 bytes (bf16/f16/i8: `elem_count` over-reports by
     /// 2x/4x; `poot-target::ElementKind` has no element wider than 4 bytes today, so there is no
     /// under-report case to name). Callers pass each buffer's length explicitly so this one writer
-    /// serves both without silently assuming every element is 4 bytes wide; [`copy_word_count`]
-    /// computes the copy-specific one. The result owns a clone of every bound buffer.
+    /// serves both without silently assuming every element is 4 bytes wide; `copy` computes the
+    /// copy-specific one. The result owns a clone of every bound buffer.
     fn bind_kernarg(
         &self,
         kernel: &KernelHandle,
@@ -141,20 +164,6 @@ impl RocmDevice {
         let slots: Vec<(&RocmBuffer, u64)> = in_bufs.iter().copied().chain([out_buf]).collect();
         Ok(self.ctx.bind_kernarg(kernel, &slots)?)
     }
-}
-
-/// The u32 word count `Device::copy`'s kernarg length must carry for a buffer of `byte_capacity`
-/// bytes: always `byte_capacity / 4`, regardless of the buffer's logical element count (the
-/// over-wide `_elem_count` parameter below is accepted and ignored on purpose, not cleaned away: it
-/// is exactly the wrong value an earlier version passed here instead, so a future edit that
-/// reaches for it is a one-line regression this function's own name and the unit test below exist to
-/// make a reader stop and ask "which one"). `copy_words`'s `&[u32]` parameters address by word;
-/// `RocmBuffer::elem_count()` is the buffer's LOGICAL element count, equal to the word count only
-/// when the element is exactly 4 bytes (`poot-target::ElementKind` has nothing wider today, so there
-/// is no over-4-byte case to guard against, only narrower ones). A pure function, so it is
-/// unit-testable with no device.
-fn copy_word_count(byte_capacity: usize, _elem_count: u32) -> u64 {
-    (byte_capacity / 4) as u64
 }
 
 /// `grid[i] = ceil(threads[i] / workgroup[i]) * workgroup[i]`, `block[i] = workgroup[i]`: every AQL
@@ -177,28 +186,22 @@ fn padded_launch(threads: [u32; 3], workgroup: [u32; 3]) -> ((u32, u32, u32), (u
     )
 }
 
-fn compile_copy_words_kernel(
-    ctx: &RocmContext,
-    arch: AmdArch,
-) -> Result<(RocmKernel, [u32; 3]), RocmGpuError> {
-    let body: Body = ImportedKernel::CopyWords.body().clone();
-    let workgroup = body.workgroup_size;
-    let target = poot_codegen::Target::AmdGcn(arch);
-    let artifact = poot_codegen::KernelCache::open(target).load_or_compile(
-        &body,
-        poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
-    )?;
-    let compiled = poot_codegen::kernel_handle(&body, &artifact)?;
-    let module = ctx.load_hsaco(&compiled)?;
-    let kernel = ctx.lookup_kernel(&module, compiled.entry_point())?;
-    Ok((RocmKernel { kernel }, workgroup))
-}
-
 impl Device for RocmDevice {
     type Buffer = RocmBuffer;
     type Kernel = RocmKernel;
     type Recording = RocmRecording;
     type Error = RocmGpuError;
+
+    fn copy_mechanism(&mut self) -> CopyMechanism<'_, RocmGpuError> {
+        CopyMechanism::Kernel(Box::new(CopyLoader {
+            ctx: &self.ctx,
+            slot: &mut self.copy,
+        }))
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "rocm"
+    }
 
     fn target(&self) -> Target {
         Target::Gpu {
@@ -246,12 +249,15 @@ impl Device for RocmDevice {
         // Always opens a recording (see the module doc, mirroring `WgpuDevice::begin`). Recording never touches the device (building a kernarg
         // buffer is a host write into host-visible kernarg memory, not a dispatch), so a failed
         // begin/dispatch/copy/finish can never have mutated device state.
-        assert!(self.open.is_none(), "begin inside an open step");
+        if self.open.is_some() {
+            return Err(RocmGpuError::AlreadyRecording);
+        }
         self.open = Some(Vec::new());
         Ok(())
     }
 
     fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), RocmGpuError> {
+        self.recording("dispatch")?;
         // A thread-grid device: an AIE or NPU invocation has no grid to run, and its kernel was never loadable here.
         let (threads, workgroup) = match d.launch {
             LaunchKind::Grid { threads, workgroup } => (threads, workgroup),
@@ -286,7 +292,7 @@ impl Device for RocmDevice {
         let mut elements: Vec<ElementKind> = in_bufs.iter().map(|b| b.element()).collect();
         elements.push(d.output.buffer.element());
         let (grid, block) = padded_launch(threads, workgroup);
-        self.push(CapturedAql {
+        self.recording("dispatch")?.push(CapturedAql {
             kernel: d.kernel.kernel.clone(),
             kernarg,
             elements: elements.into_boxed_slice(),
@@ -297,33 +303,41 @@ impl Device for RocmDevice {
     }
 
     fn copy(&mut self, src: &RocmBuffer, dst: &RocmBuffer) -> Result<(), RocmGpuError> {
-        let src_bytes = src.byte_capacity();
-        if src_bytes != dst.byte_capacity() {
-            return Err(RocmGpuError::Graph(format!(
-                "copy: src is {src_bytes} bytes, dst is {} bytes",
-                dst.byte_capacity()
-            )));
+        self.recording("copy")?;
+        let (src_bytes, dst_bytes) = (src.byte_capacity(), dst.byte_capacity());
+        if src_bytes != dst_bytes {
+            return Err(RocmGpuError::CopyLength {
+                src: src_bytes,
+                dst: dst_bytes,
+            });
         }
+        // The copy kernel moves whole words and the runtime allocates them, so the last word of an odd-width
+        // buffer is owned; a buffer that is not word-sized would be written past its end.
         if !src_bytes.is_multiple_of(4) {
-            return Err(RocmGpuError::Graph(format!(
-                "copy: {src_bytes} bytes is not a whole number of u32 words"
-            )));
+            return Err(RocmGpuError::CopyNotWordAligned { bytes: src_bytes });
         }
-        let words = copy_word_count(src_bytes, src.elem_count());
-        let kernarg = self.bind_kernarg(&self.copy_kernel.kernel, &[(src, words)], (dst, words))?;
-        let (grid, block) = padded_launch([words as u32, 1, 1], self.copy_workgroup);
-        self.push(CapturedAql {
-            kernel: self.copy_kernel.kernel.clone(),
+        let copy = self.copy.as_ref().ok_or(RocmGpuError::CopyKernelMissing)?;
+        let words = src_bytes / 4;
+        let threads = u32::try_from(words).map_err(|_| RocmGpuError::CopyTooLarge { words })?;
+        let words = words as u64;
+        let kernarg = self.bind_kernarg(&copy.kernel.kernel, &[(src, words)], (dst, words))?;
+        let (grid, block) = padded_launch([threads, 1, 1], copy.workgroup);
+        let aql = CapturedAql {
+            kernel: copy.kernel.kernel.clone(),
             kernarg,
             elements: Box::new([ElementKind::I32, ElementKind::I32]),
             grid,
             block,
-        });
+        };
+        self.recording("copy")?.push(aql);
         Ok(())
     }
 
     fn finish(&mut self) -> Result<RocmRecording, RocmGpuError> {
-        let aqls = self.open.take().expect("finish without begin");
+        let aqls = self
+            .open
+            .take()
+            .ok_or(RocmGpuError::NotRecording { op: "finish" })?;
         Ok(RocmRecording { aqls })
     }
 
@@ -378,8 +392,8 @@ impl Device for RocmDevice {
     fn abort(&mut self) -> Result<(), RocmGpuError> {
         // Recording never touches the device (see the module doc). Batches an earlier stage of the
         // failed step enqueued are still in flight and read its buffers, so abort completes them
-        // before the engine releases anything. `begin` panics (not errors) on a double-open, so
-        // `self.open` is the only other Rust-level state abort must clear.
+        // before the engine releases anything. `self.open` is the only other Rust-level state abort must
+        // clear.
         self.open = None;
         self.ctx.clear_dispatch_spans();
         let drained = self.ctx.synchronize();
@@ -416,30 +430,4 @@ fn measured(spans: &[DispatchSpan]) -> DeviceTime {
             })
             .collect(),
     })
-}
-
-#[cfg(test)]
-mod copy_word_count_tests {
-    use super::copy_word_count;
-
-    /// Changing this function to return
-    /// `_elem_count` instead of computing from `byte_capacity` must turn this test red for the
-    /// 1- and 2-byte cases (where `elem_count` and the real word count disagree), proving the
-    /// function (and so `Device::copy`) is not quietly reaching for `elem_count` again. Mutation
-    /// applied and reverted for the done-report: `fn copy_word_count(byte_capacity: usize,
-    /// elem_count: u32) -> u64 { elem_count as u64 }` failed the 1-byte and 2-byte cases below
-    /// (`25 != 100`, `50 != 100`) and passed the 4-byte case only (`100 == 100`, since `elem_count
-    /// == byte_capacity/4` exactly when the element is 4 bytes wide) - the real, documented shape of
-    /// the original bug, not a contrived mismatch.
-    #[test]
-    fn copy_word_count_is_the_byte_capacity_never_the_element_count() {
-        const ELEMS: u32 = 100;
-        // 1-byte element (raw_bytes/i8): byte_capacity = 100, elem_count = 100, words = 25.
-        assert_eq!(copy_word_count(ELEMS as usize, ELEMS), 25);
-        // 2-byte element (bf16/f16): byte_capacity = 200, elem_count = 100, words = 50.
-        assert_eq!(copy_word_count(ELEMS as usize * 2, ELEMS), 50);
-        // 4-byte element (f32/i32): byte_capacity = 400, elem_count = 100, words = 100 (the one
-        // case where the buggy `elem_count` value and the correct word count happen to coincide).
-        assert_eq!(copy_word_count(ELEMS as usize * 4, ELEMS), 100);
-    }
 }

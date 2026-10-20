@@ -49,7 +49,7 @@ fn lp3_ptx_write_with_is_exact_across_ring_chunks() {
     };
     poot_executor_parity::write_probe::chunked_write_is_exact(
         &mut device,
-        poot_ptx_runtime::UPLOAD_CHUNK_BYTES,
+        poot_runtime_common::UPLOAD_CHUNK_BYTES,
         3,
     );
 }

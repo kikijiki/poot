@@ -1890,6 +1890,16 @@ fn device_vs_oracle(
         inputs.insert(*id, HostTensor::f32(shape.clone(), data));
     }
     inputs.insert(mask.0, HostTensor::f32(mask.1, mask.2));
+    device_vs_oracle_inputs(gpu, target, g, inputs)
+}
+
+/// [`device_vs_oracle`] over every input already built: the device's answer against the CPU oracle's.
+fn device_vs_oracle_inputs(
+    gpu: &mut Engine<WgpuDevice>,
+    target: poot_graph_plan::Target,
+    g: &poot_graph_ir::Graph,
+    inputs: HashMap<poot_graph_ir::ValueId, HostTensor>,
+) -> f32 {
     let eval_inputs: HashMap<_, Value> = inputs
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -1954,6 +1964,163 @@ fn gemma2_softcap_decode_gpu_matches_cpu() {
         worst <= 1e-4,
         "device differs from the oracle by {worst:.3e}"
     );
+}
+
+/// A sink attention of the shape `rows` queries against `cap` keys (`rows == 1` is a decode): the chain
+/// `attention_masked_sinks` traces fuses to the generated attention carrying the per-head sink, and the device
+/// matches the CPU oracle within tier 2. Heads are GQA (`Hq = 4`, `Hkv = 2`) so the sink is read per query head.
+fn assert_sink_attention_matches_the_oracle(label: &str, rows: usize, cap: usize) {
+    use poot_graph_ir::builder::Builder;
+    let _gpu_guard = gpu_lock();
+    let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let (hq, hkv, d) = (4usize, 2usize, 32usize);
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![1, hq, rows, d]))
+        .unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, rows, cap]))
+        .unwrap();
+    let sinks = b.constant("sinks", TensorType::f32(vec![hq])).unwrap();
+    let y = poot_graph_ir::ops::attention_masked_sinks(&b, q, k, v, hq / hkv, 1.5, mask, sinks)
+        .unwrap();
+    let (qi, ki, vi, mi, si) = (q.id(), k.id(), v.id(), mask.id(), sinks.id());
+    let g = b.finish(y).unwrap();
+    let choice = compiled_choice(&g, &target, |op| matches!(op, OpKind::Attention(_)));
+    assert!(
+        generated_attention(&choice).is_some_and(|spec| spec.sink == kg::AttentionSink::PerHead),
+        "{label}: {choice:?}"
+    );
+    // Row `i` sees the keys up to `cap - rows + i` (a prefill into a cache; a decode row sees all but its tail).
+    let mut mask_data = vec![-1.0e9; rows * cap];
+    for i in 0..rows {
+        mask_data[i * cap..i * cap + cap - rows + i + 1].fill(0.0);
+    }
+    let worst = device_vs_oracle(
+        &mut gpu,
+        target,
+        &g,
+        &[
+            (qi, vec![1, hq, rows, d], 1),
+            (ki, vec![1, hkv, cap, d], 2),
+            (vi, vec![1, hkv, cap, d], 3),
+            (si, vec![hq], 4),
+        ],
+        (mi, vec![1, 1, rows, cap], mask_data),
+    );
+    assert!(
+        worst <= 1e-4,
+        "{label}: device differs from the oracle by {worst:.3e}"
+    );
+}
+
+/// SC-001 on wgpu, gpt-oss: a GQA decode with a per-head attention sink over more keys than lanes is the
+/// generated attention carrying its sink. Mutation: drop the sink from the kernel's initial `(m, l)` state in
+/// `attention_body`; the sink's mass vanishes from the normalizer and the device differs from the oracle.
+#[test]
+fn sink_decode_gpu_matches_cpu() {
+    assert_sink_attention_matches_the_oracle("sink decode", 1, 70);
+}
+
+/// SC-001 on wgpu, gpt-oss prefill: five query rows into a 40-slot cache, each seeing its own prefix, with the
+/// per-head sink. Mutation: as `sink_decode_gpu_matches_cpu`.
+#[test]
+fn sink_prefill_into_a_cache_gpu_matches_cpu() {
+    assert_sink_attention_matches_the_oracle("sink prefill", 5, 40);
+}
+
+/// A causal attention of `rows` queries at positions `pos0..pos0 + rows` against `cap` keys under `window`:
+/// the mask `causal_mask_from_pos` traces is stated by the positions, the generated attention carries
+/// `MaskKind::Causal`, and the device matches the CPU oracle (which evaluates the mask tensor) within tier 2.
+/// Keys past the last position and before the window stay hidden by the kernel's own loop bounds.
+fn assert_causal_attention_matches_the_oracle(
+    label: &str,
+    rows: usize,
+    cap: usize,
+    pos0: i32,
+    window: Option<usize>,
+) {
+    use poot_graph_ir::builder::Builder;
+    let _gpu_guard = gpu_lock();
+    let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let (hq, hkv, d) = (4usize, 2usize, 32usize);
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![1, hq, rows, d]))
+        .unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    // A ranged position slot, as the tracers declare it: the I32-to-F32 cast of the mask is proven exact.
+    let pos = b
+        .slot_ranged(
+            poot_graph_ir::Slot::Pos,
+            TensorType::new(vec![1, rows], DType::I32),
+            poot_graph_ir::IndexRange::below(cap).unwrap(),
+        )
+        .unwrap();
+    let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, window).unwrap();
+    let y = poot_graph_ir::ops::attention_masked(&b, q, k, v, hq / hkv, 1.5, mask).unwrap();
+    let (qi, ki, vi, pi) = (q.id(), k.id(), v.id(), pos.id());
+    let g = b.finish(y).unwrap();
+    let choice = compiled_choice(&g, &target, |op| matches!(op, OpKind::Attention(_)));
+    assert!(
+        generated_attention(&choice)
+            .is_some_and(|spec| spec.mask == kg::MaskKind::Causal { window }),
+        "{label}: {choice:?}"
+    );
+    let mut inputs = HashMap::new();
+    for (id, shape, seed) in [
+        (qi, vec![1, hq, rows, d], 1u32),
+        (ki, vec![1, hkv, cap, d], 2),
+        (vi, vec![1, hkv, cap, d], 3),
+    ] {
+        let n = shape.iter().product::<usize>();
+        let data = (0..n)
+            .map(|i| ((i as f32 + seed as f32) * 0.37).sin() * 0.5)
+            .collect();
+        inputs.insert(id, HostTensor::f32(shape, data));
+    }
+    inputs.insert(
+        pi,
+        HostTensor::i32(vec![1, rows], (pos0..pos0 + rows as i32).collect()),
+    );
+    let worst = device_vs_oracle_inputs(&mut gpu, target, &g, inputs);
+    assert!(
+        worst <= 1e-4,
+        "{label}: device differs from the oracle by {worst:.3e}"
+    );
+}
+
+/// SC-001 (R2-C7-006) on wgpu: a decode at position 53 of a 70-slot cache, every earlier key visible, then the
+/// same under a 16-key window, is the generated attention with a structural causal mask. Mutation: leave the
+/// causal row's `key_end` at the capacity in `attention_body`; the window row reads keys the window hides and
+/// differs from the oracle.
+#[test]
+fn causal_decode_gpu_matches_cpu() {
+    assert_causal_attention_matches_the_oracle("causal decode", 1, 70, 53, None);
+    assert_causal_attention_matches_the_oracle("windowed decode", 1, 70, 53, Some(16));
+}
+
+/// SC-001 (R2-C7-006) on wgpu: five query rows at positions 30..35 of a 40-slot cache, each with its own
+/// visible prefix and window. Mutation: as `causal_decode_gpu_matches_cpu`.
+#[test]
+fn causal_prefill_into_a_cache_gpu_matches_cpu() {
+    assert_causal_attention_matches_the_oracle("causal prefill", 5, 40, 30, None);
+    assert_causal_attention_matches_the_oracle("windowed prefill", 5, 40, 30, Some(8));
 }
 
 /// SC-001 on wgpu, DeepSeek-V2 MLA: `dk` 192 (`k_nope` 128 per head plus the one shared 64-wide `k_pe`) and a

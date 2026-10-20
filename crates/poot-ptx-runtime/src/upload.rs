@@ -14,18 +14,13 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use cudarc::driver::{result, sys};
+use poot_runtime_common::{RING_SLOTS, RingCursor, UPLOAD_CHUNK_BYTES, chunks};
 
 use crate::error::PtxError;
 use crate::owner::PtxOwner;
 
-/// Slots in the ring.
-const RING_SLOTS: usize = 4;
-
-/// Bytes of one slot: one chunk of a write.
-pub const UPLOAD_CHUNK_BYTES: usize = 64 << 20;
-
 struct Slot {
-    /// Pinned host memory of [`UPLOAD_CHUNK_BYTES`] bytes (`cuMemHostAlloc`).
+    /// Pinned host memory of [`poot_runtime_common::UPLOAD_CHUNK_BYTES`] bytes (`cuMemHostAlloc`).
     host: *mut c_void,
     /// Recorded on the stream right after the slot's copy; complete when the host may refill the slot.
     event: sys::CUevent,
@@ -37,7 +32,7 @@ struct Slot {
 pub(crate) struct UploadRing {
     owner: Arc<PtxOwner>,
     slots: Vec<Slot>,
-    next: usize,
+    cursor: RingCursor,
 }
 
 impl UploadRing {
@@ -45,7 +40,7 @@ impl UploadRing {
         Self {
             owner,
             slots: Vec::with_capacity(RING_SLOTS),
-            next: 0,
+            cursor: RingCursor::default(),
         }
     }
 
@@ -61,7 +56,7 @@ impl UploadRing {
         &mut self,
         allocate: impl FnOnce() -> Result<Slot, PtxError>,
     ) -> Result<&mut Slot, PtxError> {
-        let index = self.next;
+        let index = self.cursor.index();
         if index == self.slots.len() {
             self.slots.push(allocate()?);
         }
@@ -72,12 +67,12 @@ impl UploadRing {
                 .map_err(|error| self.owner.observe(error))?;
             slot.in_flight = false;
         }
-        self.next = (index + 1) % RING_SLOTS;
+        self.cursor.advance();
         Ok(&mut self.slots[index])
     }
 
     /// Write `len` bytes at device address `dst`: `fill(range, out)` gets consecutive ranges `0..len` of at
-    /// most [`UPLOAD_CHUNK_BYTES`] and writes every byte of `out`, the pinned slot the copy reads. The
+    /// most [`poot_runtime_common::UPLOAD_CHUNK_BYTES`] and writes every byte of `out`, the pinned slot the copy reads. The
     /// copies are enqueued on `stream` and may still be running on return.
     ///
     /// # Safety
@@ -89,9 +84,8 @@ impl UploadRing {
         stream: sys::CUstream,
         fill: &mut dyn FnMut(Range<usize>, &mut [u8]),
     ) -> Result<(), PtxError> {
-        let mut done = 0;
-        while done < len {
-            let chunk = UPLOAD_CHUNK_BYTES.min(len - done);
+        for range in chunks(len) {
+            let (done, chunk) = (range.start, range.len());
             let slot = self.next_slot()?;
             // SAFETY: `host` is `UPLOAD_CHUNK_BYTES` bytes of pinned memory this ring owns, `chunk` of
             // them are written here, and no copy reads the slot (its event completed above).
@@ -104,7 +98,6 @@ impl UploadRing {
                 result::event::record(slot.event, stream)?;
             }
             slot.in_flight = true;
-            done += chunk;
         }
         Ok(())
     }
@@ -169,7 +162,7 @@ mod tests {
     /// POOT-1100 review: the cursor moves only past a slot that is ready. A failing allocator leaves the ring
     /// where it was (no slot, cursor unmoved), so the retry allocates the same index; after the failure
     /// clears, the cursor advances once per slot and wraps without allocating again.
-    /// Mutation: advance `self.next` before the slot is ready (the old order); the cursor skips index 0 after a
+    /// Mutation: advance `self.cursor` before the slot is ready (the old order); the cursor skips index 0 after a
     /// failed allocation and the first assertion goes red.
     #[test]
     fn the_cursor_moves_only_past_a_ready_slot() {
@@ -182,19 +175,19 @@ mod tests {
         });
         assert!(failed.is_err());
         assert_eq!(
-            (ring.next, ring.slots.len()),
+            (ring.cursor.index(), ring.slots.len()),
             (0, 0),
             "a failed allocation moves nothing"
         );
         for expected in 1..=RING_SLOTS {
             ring.next_slot_with(|| Ok(fake_slot()))
                 .expect("a ready slot");
-            assert_eq!(ring.next, expected % RING_SLOTS);
+            assert_eq!(ring.cursor.index(), expected % RING_SLOTS);
         }
         assert_eq!(ring.slots.len(), RING_SLOTS);
         ring.next_slot_with(|| panic!("a full ring allocates nothing"))
             .expect("wraps to slot 0");
-        assert_eq!(ring.next, 1);
+        assert_eq!(ring.cursor.index(), 1);
         // The fake slots hold no driver memory; dropping the ring would free null pointers.
         ring.slots.clear();
     }

@@ -104,7 +104,8 @@ pub(crate) fn allocate_buffer_resources(
             .dispatch
             .get_buffer_memory_requirements(&owner.device, buffer)
     };
-    let memory_type_index = choose_memory_type(reqs).ok_or(RuntimeError::NoHostVisibleMemory)?;
+    let memory_type_index =
+        choose_memory_type(reqs).ok_or(RuntimeError::NoMappableDeviceLocalMemory)?;
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(reqs.size)
         .memory_type_index(memory_type_index);

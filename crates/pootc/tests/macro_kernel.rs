@@ -207,7 +207,7 @@ fn kernel_attribute_is_discovered_by_pootc() {
     // byte-identical to it, so the kernel that runs is both what pootc published and what the Body compiles to.
     let sealed_out = out_dir.join("add.sealed.spv");
     let artifact =
-        poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &sealed_out)
+        poot_codegen::compile_kernel(&body, poot_target::Backend::SpirvVulkan, &sealed_out)
             .expect("recompile the add Body");
     assert_eq!(
         std::fs::read(&sealed_out).unwrap(),

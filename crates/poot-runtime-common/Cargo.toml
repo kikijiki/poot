@@ -16,7 +16,10 @@ rust-version.workspace = true
 test-support = []
 
 [dependencies]
+# Dynamically loaded (no Vulkan SDK at build time); only the property structs of `vulkan_probe`.
+ash.workspace = true
 poot-target.workspace = true
+libc.workspace = true
 
 [lints]
 workspace = true

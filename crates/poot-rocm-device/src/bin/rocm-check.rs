@@ -153,7 +153,7 @@ fn run_add() -> Result<(), CheckError> {
     });
     let target = Target::AmdGcn(arch);
     let out = artifact_path(&dir, "add", target);
-    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::AmdGcn(arch), &out)?;
+    let artifact = compile_kernel(&body, poot_target::Backend::AmdGcn(arch), &out)?;
     eprintln!(
         "compiled `add` to {} ({} bytes)",
         out.display(),
@@ -235,9 +235,8 @@ fn run_add() -> Result<(), CheckError> {
 fn run_agent_list() -> Result<(), CheckError> {
     let ctx = RocmContext::new()?;
     println!(
-        "chosen GPU: {} (handle={:#x}, upload_strategy={:?})",
+        "chosen GPU: {} (upload_strategy={:?})",
         ctx.isa_name(),
-        ctx.gpu_agent().handle,
         ctx.upload_strategy()
     );
     Ok(())
@@ -287,10 +286,7 @@ fn run_pcie_publication_receipt() -> Result<(), CheckError> {
             "HSA_ALLOCATE_QUEUE_DEV_MEM=1 was not observed at queue creation".into(),
         )));
     }
-    if !provenance
-        .link_types
-        .contains(&poot_rocm_runtime::bindings::HSA_AMD_LINK_INFO_TYPE_PCIE)
-    {
+    if !provenance.has_pcie_link() {
         return Err(CheckError::Rocm(RocmError::Hsa(format!(
             "CPU-to-GPU link types {:?} do not include PCIe",
             provenance.link_types
@@ -303,7 +299,7 @@ fn run_pcie_publication_receipt() -> Result<(), CheckError> {
         .unwrap_or_else(|_| AmdArch::new("gfx942", ctx.wavefront().max(64)));
     let target = Target::AmdGcn(arch);
     let out = artifact_path(&dir, "add-pcie-receipt", target);
-    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::AmdGcn(arch), &out)?;
+    let artifact = compile_kernel(&body, poot_target::Backend::AmdGcn(arch), &out)?;
     let compiled_kernel = kernel_handle(&body, &artifact)?;
     let module = ctx.load_hsaco(&compiled_kernel)?;
     let add_kernel = ctx.lookup_kernel(&module, compiled_kernel.entry_point())?;

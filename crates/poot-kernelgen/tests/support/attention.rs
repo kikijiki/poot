@@ -28,6 +28,12 @@ pub(crate) struct KeyExtras<'a> {
     pub(crate) len: Option<&'a [i32]>,
     /// The `[B,Lk]` slot map of a paged key.
     pub(crate) read: Option<&'a [i32]>,
+    /// The sink logit of each query head, `[Hq]`: one more position in every row's softmax that weighs
+    /// into the maximum and the normalizer and has no value.
+    pub(crate) sinks: Option<&'a [f32]>,
+    /// The `[B,Lq]` query positions of a causal mask, which reads no mask tensor: key `t` is visible to row
+    /// `i` of batch row `b` when `t <= max(pos, 0)` and, under a window, within it.
+    pub(crate) positions: Option<&'a [i32]>,
 }
 
 /// [`attention_reference`] over a split key (`k` the first `dk - s` channels of each key, `k_shared [B,1,Lk,s]`
@@ -35,7 +41,8 @@ pub(crate) struct KeyExtras<'a> {
 /// `clamp(len[b], 0, Lk)` keys, an empty row being `0 / 0`, NaN). `v` is `[B,Hkv,Lk,Dv]` and the output
 /// `[B,Hq,Lq,Dv]`. Keys past a row's bound are never read, so poison there cannot reach the result. A paged
 /// key (`read [B,Lk]`, a slot per position) reads `k [S,Hkv,Dk]` and `v [S,Hkv,Dv]` as pools: key `t` of row `b`
-/// and key head `g` is pool row `read[b * Lk + t] * Hkv + g`.
+/// and key head `g` is pool row `read[b * Lk + t] * Hkv + g`. With `sinks`, each row's softmax also holds the
+/// head's sink logit, which is never a key: a row with no visible key divides by the sink's mass alone.
 pub(crate) fn attention_reference_keys(
     spec: &AttentionSpec,
     q: &[f32],
@@ -48,6 +55,8 @@ pub(crate) fn attention_reference_keys(
         k_shared,
         len,
         read,
+        sinks,
+        positions,
     } = extras;
     use poot_kernelgen::{KeyLayout, MaskKind, ScoreTransform};
     let (hq, lq, lk, dk, dv) = (spec.hq, spec.lq, spec.lk, spec.dk, spec.dv);
@@ -58,7 +67,7 @@ pub(crate) fn attention_reference_keys(
     };
     let head_dim = dk - shared_dim;
     let mask_heads = match spec.mask {
-        MaskKind::Broadcast => 1,
+        MaskKind::Broadcast | MaskKind::Causal { .. } => 1,
         MaskKind::PerHead => hq,
         MaskKind::Blocks { .. } => unreachable!("the dense reference takes an additive mask"),
     };
@@ -103,15 +112,33 @@ pub(crate) fn attention_reference_keys(
                         if let Some(cap) = softcap {
                             score = f64::from(cap) * (score / f64::from(cap)).tanh();
                         }
-                        score + f64::from(mask[mask_plane + i * lk + t])
+                        match (spec.mask, positions) {
+                            (MaskKind::Causal { window }, Some(positions)) => {
+                                let position = positions[b * lq + i].max(0) as usize;
+                                if t > position || window.is_some_and(|w| position - t >= w) {
+                                    f64::NEG_INFINITY
+                                } else {
+                                    score
+                                }
+                            }
+                            _ => score + f64::from(mask[mask_plane + i * lk + t]),
+                        }
                     })
                     .collect();
-                let top = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let sink = sinks.map(|sinks| f64::from(sinks[h]));
+                let top = scores
+                    .iter()
+                    .copied()
+                    .chain(sink)
+                    .fold(f64::NEG_INFINITY, f64::max);
                 let weights: Vec<f64> = scores.iter().map(|s| (s - top).exp()).collect();
-                let denominator: f64 = weights.iter().sum();
+                let denominator: f64 =
+                    weights.iter().sum::<f64>() + sink.map_or(0.0, |sink| (sink - top).exp());
                 let out_row = ((b * hq + h) * lq + i) * dv;
                 for c in 0..dv {
                     let acc: f64 = (0..keys)
+                        // A hidden key weighs exactly zero and its value row is never read.
+                        .filter(|&t| weights[t] != 0.0)
                         .map(|t| weights[t] * f64::from(v[key_at(t) * dv + c]))
                         .sum();
                     out[out_row + c] = (acc / denominator) as f32;

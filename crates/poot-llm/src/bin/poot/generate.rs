@@ -1,4 +1,4 @@
-//! poot-generate: load a checkpoint and generate text from a prompt, with the flags of llama.cpp's
+//! `poot generate`: load a checkpoint and generate text from a prompt, with the flags of llama.cpp's
 //! `llama-cli` where poot has the capability.
 //!
 //! A checkpoint loads as a `driver::ModelHandle` and generates through the driver on the device
@@ -21,7 +21,7 @@
 //! A model with no chat template cannot hold a conversation.
 //!
 //! Without `--model` the model is `qwen2.5-0.5b` under the `POOT_MODELS_DIR` directory; with neither,
-//! it exits with an error naming the variable. ROCm is a build feature: `--features cli,rocm`.
+//! it exits with an error naming the variable.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -29,39 +29,19 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use clap::{ArgGroup, Parser, ValueEnum};
+use clap::ArgGroup;
 use poot_llm::driver::{
-    BackendChoice, ChatOptions, ChatSession, Generation, GenerationTiming, ModelHandle,
-    PhaseTiming, Sampling, TextRequest, generate_text, open_executor,
+    ChatOptions, ChatSession, Generation, GenerationTiming, ModelHandle, PhaseTiming, Sampling,
+    TextRequest, generate_text, open_executor,
 };
 use poot_models::registry::Registry;
 use poot_text::ChatTemplateOverride;
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Backend {
-    Auto,
-    Wgpu,
-    Rocm,
-    Ptx,
-    Vulkan,
-}
+use crate::DeviceArgs;
 
-impl From<Backend> for BackendChoice {
-    fn from(backend: Backend) -> Self {
-        match backend {
-            Backend::Auto => Self::Auto,
-            Backend::Wgpu => Self::Wgpu,
-            Backend::Rocm => Self::Rocm,
-            Backend::Ptx => Self::Ptx,
-            Backend::Vulkan => Self::Vulkan,
-        }
-    }
-}
-
-#[derive(Debug, Parser)]
-#[command(name = "poot-generate", version, about)]
+#[derive(Debug, clap::Args)]
 #[command(group(ArgGroup::new("input").args(["prompt", "file"])))]
-struct Args {
+pub(crate) struct Args {
     /// The checkpoint: a safetensors directory or a `.gguf` file. Default: `qwen2.5-0.5b` under
     /// `POOT_MODELS_DIR`.
     #[arg(short = 'm', long)]
@@ -134,9 +114,8 @@ struct Args {
     /// Generate through the model's end-of-sequence token.
     #[arg(long = "ignore-eos")]
     ignore_eos: bool,
-    /// The device.
-    #[arg(long, value_enum, default_value_t = Backend::Auto)]
-    backend: Backend,
+    #[command(flatten)]
+    device: DeviceArgs,
     /// Print the engine-measured prefill and decode tokens per second to stderr (the default).
     #[arg(long = "show-timings", overrides_with = "no_show_timings")]
     show_timings: bool,
@@ -323,20 +302,19 @@ fn report_timings(generation: &Generation) {
     }
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let level = if args.verbose { "info" } else { "warn" };
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into()),
-        )
-        .init();
+impl Args {
+    /// Whether to log what the run does.
+    pub(crate) fn verbose(&self) -> bool {
+        self.verbose
+    }
+}
+
+pub(crate) fn run(args: Args) -> Result<()> {
     let first = args.prompt_text()?;
     let model_path = model_path_or_env(args.model.as_deref())?;
 
-    // A backend this build lacks, or a host without the device, fails before the model loads.
-    let executor = open_executor(args.backend.into())?;
+    // A host without the device fails before the model loads.
+    let executor = open_executor(args.device.backend)?;
     tracing::info!(model_path = %model_path.display(), "loading model");
     let registry = Registry::builtin()?;
     let handle = Arc::new(ModelHandle::load(
@@ -352,7 +330,7 @@ fn main() -> Result<()> {
         family = %config.family,
         vocab = config.vocab,
         max_positions = config.max_positions,
-        backend = ?args.backend,
+        backend = %args.device.backend,
         "model config"
     );
     if args.conversing() {

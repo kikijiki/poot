@@ -4,7 +4,6 @@
 //! lives in `tests/packed_serving.rs::packed_e4m3_per_channel_decode_through_the_contract_is_bit_exact`;
 //! SC-009 is the required-device-lane gate, not a test here).
 
-#![cfg(feature = "rocm")]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,7 +45,7 @@ fn lp3_rocm_write_with_is_exact_across_ring_chunks() {
     };
     poot_executor_parity::write_probe::chunked_write_is_exact(
         &mut device,
-        poot_rocm_runtime::UPLOAD_CHUNK_BYTES,
+        poot_runtime_common::UPLOAD_CHUNK_BYTES,
         3,
     );
 }
@@ -604,7 +603,7 @@ fn two_phase_state_commit_matches_the_oracle_after_four_steps_on_rocm() {
     }
 }
 
-/// Card 548: `Device::copy` dispatches the generated `copy_words` kernel, whose
+/// Card 548: `Device::copy` dispatches the engine's `copy_words` kernel, whose
 /// `&[u32]` parameters take a WORD count, not the buffer's logical element count - the two disagree
 /// for any element narrower than 4 bytes (bf16/f16: 2 bytes, elem_count is 2x words; i8/raw bytes: 1
 /// byte, elem_count is 4x words; `poot-target::ElementKind` has nothing wider than 4 bytes today, so
@@ -616,17 +615,11 @@ fn two_phase_state_commit_matches_the_oracle_after_four_steps_on_rocm() {
 /// known pattern and re-read after the copy, to catch those padding threads landing past `dst`'s
 /// real extent.
 ///
-/// This test does NOT prove the length is correct (it cannot be made to - see
-/// below) - it is real, additional coverage of `Device::copy` round-tripping every byte on every
-/// narrow dtype, which nothing exercised before this card. The actual length proof is
-/// `copy_word_count`'s own unit test in `device.rs` (`copy_word_count_is_the_byte_capacity_never_
-/// the_element_count`): a pure function, mutation-tested there with no device at all. Tried and
-/// reverted here (not committed): `build_kernarg`'s per-call-site explicit length back to
-/// `buf.elem_count()` for both slots. On real gfx1151 hardware this did NOT corrupt `dst_sentinel`
-/// or crash: the bug's maximum overrun is bounded by one workgroup (<=63 words = <=252 bytes), and
-/// `BufferRole::Activation`'s coarse-grained pool allocates in page granularity, so that overrun
-/// stays inside `dst`'s own page's slack in practice (observed: unmutated and mutated runs both pass
-/// byte-for-byte) - exactly why the length needs its own pure-function unit test instead.
+/// This test does NOT prove the length is correct: a word count taken from the logical element count
+/// overruns by at most one workgroup, which the coarse pool's page slack absorbs in practice. The
+/// length is proved where it is exact: `poot_executor_parity::copy_probe::odd_width_copy_is_exact`
+/// (`copy_of_an_odd_byte_length_is_exact_on_rocm`) copies buffers whose byte length is not a word
+/// multiple, so a short or long word count changes the bytes read back.
 #[test]
 fn copy_round_trips_every_narrow_element_width_with_no_sentinel_corruption() {
     let Some(mut device) = require_rocm() else {
@@ -656,6 +649,7 @@ fn copy_round_trips_every_narrow_element_width_with_no_sentinel_corruption() {
             .unwrap_or_else(|e| panic!("{name}: write src: {e}"));
         poot_executor::write_slice(&mut device, &dst_sentinel, 0, &sentinel_pattern)
             .unwrap_or_else(|e| panic!("{name}: write dst_sentinel: {e}"));
+        poot_executor_parity::copy_probe::load_copy_kernel(&mut device);
         device.begin().unwrap();
         device
             .copy(&src, &dst)

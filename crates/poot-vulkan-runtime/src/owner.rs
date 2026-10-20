@@ -4,7 +4,7 @@ use crate::validation::Validation;
 use ash::vk;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// Shared owner for the complete native parent chain. Every child that can escape `Context` holds one.
@@ -28,7 +28,9 @@ pub(crate) struct DeviceOwner {
     pub(crate) dispatch: Arc<dyn ResourceDispatch>,
     /// The one queue every submission goes through. Vulkan requires external synchronization of a
     /// queue, so a submit holds this lock, and a buffer or graph moved to another thread cannot race
-    /// the owning context's submits.
+    /// the owning context's submits. The same lock excludes the host from the mapped memory a submission
+    /// may be writing: a [`QueueGuard`] is held across a submit and its fence wait, and a host copy needs
+    /// one too (see [`QueueGuard`]).
     queue: Mutex<vk::Queue>,
     poisoned: AtomicBool,
     /// How long a submission's fence wait may take before the device counts as hung.
@@ -41,7 +43,19 @@ pub(crate) struct DeviceOwner {
     pub(crate) memory: poot_runtime_common::MemoryCounters,
 }
 
+/// Exclusive use of the device: the queue, and with it the mapped memory GPU work reads and writes. Held
+/// across a whole replay, every submit and fence wait in it, so a host copy through a buffer's mapping
+/// ([`crate::DeviceBuffer::write_with`] and the rest) cannot overlap device access: the copy needs a guard
+/// of its own and gets one only between submissions. A submit takes the guard by reference, so no
+/// submission runs without one.
+pub(crate) struct QueueGuard<'a>(MutexGuard<'a, vk::Queue>);
+
 impl DeviceOwner {
+    /// Take the device for a host copy or a replay; blocks while another thread holds it.
+    pub(crate) fn lock_queue(&self) -> QueueGuard<'_> {
+        QueueGuard(self.queue.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
     pub(crate) fn new(
         device: ash::Device,
         instance: ash::Instance,
@@ -90,24 +104,25 @@ impl DeviceOwner {
     ///
     /// # Safety
     ///
-    /// `command_buffer` and `fence` are children of this device; `command_buffer` is executable and not
+    /// `queue` is this device's guard (`self.lock_queue()`), held for the whole call and the fence wait in
+    /// it. `command_buffer` and `fence` are children of this device; `command_buffer` is executable and not
     /// pending, `fence` is unsignaled and not in use by another submission, and every object the
     /// command buffer references stays alive until this call returns (and forever after, when it
     /// returns `SubmissionLost`).
     pub(crate) unsafe fn submit_and_wait(
         &self,
+        queue: &QueueGuard<'_>,
         command_buffer: vk::CommandBuffer,
         fence: vk::Fence,
     ) -> Result<(), RuntimeError> {
         let command_buffers = [command_buffer];
         let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
         let submitted = {
-            let queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
             // SAFETY: the caller upholds the command-buffer, fence and lifetime contract above, and
-            // the queue (this device's own) is externally synchronized by the lock held here.
+            // the queue (this device's own) is externally synchronized by the guard `queue` holds.
             unsafe {
                 self.dispatch
-                    .queue_submit(&self.device, *queue, &[submit_info], fence)
+                    .queue_submit(&self.device, *queue.0, &[submit_info], fence)
             }
         };
         match submitted {

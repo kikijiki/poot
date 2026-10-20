@@ -21,8 +21,9 @@ pub use coordinator::{
     ScheduleError, SupportActual, SupportPlan,
 };
 pub use device::{
-    AieInvocation, Arg, Collectives, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind,
-    MeasuredDeviceTime, NativeCounters, SupportBound, VpuInvocation, WeightUpload, write_slice,
+    AieInvocation, Arg, Collectives, CopyKernel, CopyKernelSink, CopyMechanism, Device, DeviceTime,
+    Dispatch, DispatchDeviceTime, LaunchKind, MeasuredDeviceTime, NativeCounters, SupportBound,
+    VpuInvocation, WeightUpload, write_slice,
 };
 pub use engine::Engine;
 pub use error::{BindError, ChainError, DeviceError, DispatchError, ExecError, LoadError};
@@ -331,7 +332,7 @@ impl LateInputs for NoLate {
 /// `read_state()` accessors the contract no longer has. `memory` is [`Device::memory`] (Card 547a): the
 /// device's own runtime counters, not an engine-side tally, so cross-backend equality is not equal by
 /// construction.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExecutorStats {
     /// Recordings made, summed over every executable.
     pub recordings: u64,
@@ -372,6 +373,28 @@ pub struct ExecutorStats {
     /// plus whatever per-dispatch detail the engine's [`TimingOptions`] retained. Never an
     /// append-only history; see [`poot_profile::TimingSnapshot`].
     pub timing: poot_profile::TimingSnapshot,
+}
+
+impl ExecutorStats {
+    /// Stats with every counter at zero and `timing` as the timing snapshot.
+    pub fn empty(timing: poot_profile::TimingSnapshot) -> Self {
+        ExecutorStats {
+            recordings: 0,
+            replays: 0,
+            stages: Vec::new(),
+            host_write_bytes: 0,
+            output_read_bytes: 0,
+            waits: 0,
+            memory: Vec::new(),
+            weight_bytes_read: 0,
+            syncs: 0,
+            sync_read_bytes: 0,
+            pool_rows_written: 0,
+            pool_refill_bytes: 0,
+            kernels_resolved: 0,
+            timing,
+        }
+    }
 }
 
 /// One stage's recording and replay counts (see [`ExecutorStats::stages`]).

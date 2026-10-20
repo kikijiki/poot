@@ -16,7 +16,7 @@ use crate::discovery::{
     amd_pool_size, cpu_to_pool_link_types, enable_device_timing, first_cpu_agent, runtime_version,
 };
 use crate::error::check;
-use crate::ffi::{Funcs, Hsa};
+use crate::ffi::Hsa;
 use crate::owner::{HsaRuntimeOwner, ResourceOwner};
 use crate::queue::{
     DEVICE_RING_OVERRIDE_AT_FIRST_HSA_LOAD, QueueCreationPlan, QueueLayout, QueueProperties,
@@ -679,7 +679,11 @@ impl RocmContext {
         storage: BufferStorage,
         role: BufferRole,
     ) -> Result<RocmBuffer, RocmError> {
-        let (elem_count, bytes) = checked_layout(op, elems, storage)?;
+        let (elem_count, element_bytes) = checked_layout(op, elems, storage)?;
+        // Whole 4-byte words: a kernel addresses storage by word (the device's state copy among them), so
+        // an odd-width buffer (3 bf16, 5 raw bytes) owns the word its last element sits in, as wgpu and
+        // Vulkan allocate.
+        let bytes = element_bytes.next_multiple_of(4);
         let pool = Pool::for_role(role);
         let native_pool = self.native_pool(pool);
         let ptr = self.pool_alloc(native_pool, bytes)?;
@@ -966,17 +970,6 @@ impl RocmContext {
             byte_capacity,
             storage,
         }
-    }
-
-    /// Raw access to the loaded function table (for examples + tests that call HSA entry points not yet
-    /// wrapped).
-    pub fn funcs(&self) -> &Funcs {
-        &self.hsa.funcs
-    }
-
-    /// The GPU agent this context's queue, code objects and copies target.
-    pub fn gpu_agent(&self) -> hsa_agent_t {
-        self.gpu_agent
     }
 
     /// How host<->device transfers reach this context's buffer pool, decided at construction.

@@ -16,10 +16,7 @@
 //! A contiguous K or V cache is declared at the logical capacity: how many positions a device stores per head
 //! is the planner's decision from the device's data, never the tracer's.
 
-use poot_graph_ir::{
-    BinOp, Builder, ComputedConst, Scalar, SelectedAttentionAttrs, StateRole, TensorType, Traced,
-    ops,
-};
+use poot_graph_ir::{BinOp, Builder, ComputedConst, Scalar, StateRole, TensorType, Traced, ops};
 use poot_quant::weights::{AttnRole, WeightId, WeightMap, WeightRole};
 
 use super::linear::{Weight, WeightError, linear};
@@ -151,14 +148,6 @@ impl AttentionParams {
     /// Whether the rotation is sectioned, so the step must carry `Step::with_mrope`.
     pub fn is_sectioned(&self) -> bool {
         self.rope.is_some_and(|rope| rope.sections().is_some())
-    }
-
-    /// Rotate adjacent even/odd dims instead of the two halves (a GGUF's permuted Q/K rows).
-    pub fn with_interleaved_rope(self) -> Self {
-        Self {
-            rope: self.rope.map(RopeParams::interleaved),
-            ..self
-        }
     }
 
     /// The same attention with its RoPE rescaled by llama.cpp's per-frequency `factors`
@@ -316,6 +305,11 @@ impl AttentionParams {
     /// The width of one head, shared by Q, K and V.
     pub fn head_dim(&self) -> usize {
         self.head_dim
+    }
+
+    /// The leading head dims that rotate, or `None` for a layer with no RoPE.
+    pub(crate) fn rotary(&self) -> Option<usize> {
+        self.rope.map(RopeParams::rotary)
     }
 }
 
@@ -610,7 +604,8 @@ pub struct BlockSelection {
 pub type BlockSelector<'a> = &'a dyn Fn(&Builder) -> Result<BlockSelection, TraceError>;
 
 /// [`attention`] over the blocks `select` names: the attention reads only the keys of each query's selected
-/// blocks and of its own unfinished block ([`poot_graph_ir::OpKind::SelectedAttention`]).
+/// blocks and of its own unfinished block ([`ops::selected_attention`]; `compile` forms `OpKind::SelectedAttention`
+/// from it).
 pub fn attention_selecting(
     b: &Builder,
     step: &Step,
@@ -769,20 +764,17 @@ fn score_selected(
         return Err(WiringError::SelectionWithBiasedScores.into());
     }
     let BlockSelection { ids, ratio } = select(b)?;
-    let k_blocks = b.aval(ids)?.shape[3];
-    Ok(b.selected_attention(
-        SelectedAttentionAttrs {
-            n_rep: p.heads / p.kv_heads,
-            scale: p.scale,
-            softcap: p.softcap,
-            ratio,
-            k: k_blocks,
-        },
+    Ok(ops::selected_attention(
+        b,
         q,
         k_cache,
         v_cache,
         ids,
         step.pos(),
+        p.heads / p.kv_heads,
+        p.scale,
+        p.softcap,
+        ratio,
     )?)
 }
 
@@ -806,7 +798,7 @@ fn score_masked(
         ops::causal_mask_from_pos(b, step.pos(), cap, p.window)?
     };
     Ok(match &w.sinks {
-        Some(sinks) => ops::attention_prefill_with_sink(
+        Some(sinks) => ops::attention_masked_sinks(
             b,
             q,
             k_cache,
@@ -815,8 +807,6 @@ fn score_masked(
             p.scale,
             mask,
             sinks.declare_f32(b)?,
-            hq,
-            t,
         )?,
         // A decode token attends to the stored positions up to its own and nothing past them, so
         // the kernel is bounded by that live length and the rest of the capacity is never read.
@@ -931,10 +921,13 @@ mod tests {
 
     fn params(o: Opts) -> AttentionParams {
         let rope = RopeParams::new(HEAD_DIM, THETA, &RopeFlavor::Plain).unwrap();
+        let rope = match o.positions {
+            Positions::Interleaved => rope.interleaved(),
+            Positions::HalfSplit | Positions::None | Positions::Alibi => rope,
+        };
         let mut p = AttentionParams::new(HEADS, KV_HEADS, HEAD_DIM, true, rope).unwrap();
         p = match o.positions {
-            Positions::HalfSplit => p,
-            Positions::Interleaved => p.with_interleaved_rope(),
+            Positions::HalfSplit | Positions::Interleaved => p,
             Positions::None => p.without_rope(),
             Positions::Alibi => p.with_alibi(),
         };

@@ -63,18 +63,6 @@ pub use pipeline::{CachedDispatch, DeviceTimingResult};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-/// Safe single-buffer cap for AMD RADV (Vulkan), in bytes: 1.25 GiB.
-///
-/// Observed 2026-09-25 on AMD Radeon 8060S (RADV STRIX_HALO): an lm_head chunk sitting at the
-/// device `max_buffer_size` (2,147,483,647) wedged the gfx ring on its first dispatch, even
-/// though `Device::create_buffer` accepted it. [`Context::effective_max_buffer_size`] is
-/// therefore `min(device max_buffer_size, AMD_RADV_SAFE_MAX_BUFFER_BYTES)` on AMD Vulkan
-/// adapters, and the raw device limit elsewhere. `compile`'s `legalize` pass (card 523a) consumes
-/// the effective limit as `DeviceCaps::max_buffer_bytes` (card 522), hosting or splitting whatever
-/// constant does not fit; this constant lives here, at the layer that owns device limits, not in a
-/// model tracer.
-pub const AMD_RADV_SAFE_MAX_BUFFER_BYTES: u64 = 1_342_177_280; // 1.25 GiB
-
 /// A wgpu device + queue. Reusable across dispatches.
 ///
 /// `device`/`queue` are private (card 608): the raw wgpu objects could be rewritten by safe code after
@@ -196,51 +184,6 @@ pub struct Context {
     /// `download_segments_u32`/`read_bytes`/`flush_faults_and_wait` call, or `Context::dispatch`'s own
     /// sync). Real pending state, not a perf counter.
     pending_faults: RefCell<Vec<PendingFault>>,
-}
-
-/// A Vulkan device's active compute units from AMD's shader-core properties:
-/// `VK_AMD_shader_core_properties2`'s `activeComputeUnitCount`, else `VK_AMD_shader_core_properties`'
-/// engine x array x per-array product; `None` when the driver exposes neither (every non-AMD device).
-/// One probe for both Vulkan runtimes (this crate's wgpu adapter and `poot-vulkan-runtime`'s ash
-/// instance; card 653).
-///
-/// # Safety
-///
-/// `physical_device` must come from `instance`'s own enumeration, and `instance` must be live.
-pub unsafe fn amd_vulkan_compute_units(
-    instance: &ash::Instance,
-    physical_device: ash::vk::PhysicalDevice,
-) -> Option<u32> {
-    use ash::{amd, vk};
-    // SAFETY: the caller's contract makes both handles valid; the enumeration and property queries
-    // only read, and each property struct is chained only when its extension is listed as supported.
-    unsafe {
-        let extensions = instance
-            .enumerate_device_extension_properties(physical_device)
-            .ok()?;
-        let supports = |name: &std::ffi::CStr| {
-            extensions
-                .iter()
-                .any(|ext| ext.extension_name_as_c_str() == Ok(name))
-        };
-        if supports(amd::shader_core_properties2::NAME) {
-            let mut core = vk::PhysicalDeviceShaderCoreProperties2AMD::default();
-            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut core);
-            instance.get_physical_device_properties2(physical_device, &mut props);
-            Some(core.active_compute_unit_count)
-        } else if supports(amd::shader_core_properties::NAME) {
-            let mut core = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
-            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut core);
-            instance.get_physical_device_properties2(physical_device, &mut props);
-            Some(
-                core.shader_engine_count
-                    * core.shader_arrays_per_engine_count
-                    * core.compute_units_per_shader_array,
-            )
-        } else {
-            None
-        }
-    }
 }
 
 #[cfg(test)]

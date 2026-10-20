@@ -887,7 +887,7 @@ mod row_gather_tests {
                 .join(&name);
             std::fs::create_dir_all(&dir).unwrap();
             let out_path = artifact_path(&dir, &name, Target::SpirvVulkan);
-            let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out_path)
+            let artifact = compile_kernel(&body, poot_target::Backend::SpirvVulkan, &out_path)
                 .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
             let kernel = kernel_handle(&body, &artifact).unwrap();
 
@@ -1044,7 +1044,7 @@ mod row_gather_tests {
                 .join(&name);
             std::fs::create_dir_all(&dir).unwrap();
             let out_path = artifact_path(&dir, &name, Target::SpirvVulkan);
-            let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out_path)
+            let artifact = compile_kernel(&body, poot_target::Backend::SpirvVulkan, &out_path)
                 .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
             let kernel = kernel_handle(&body, &artifact).unwrap();
 
@@ -1491,7 +1491,7 @@ mod contraction_tests {
             .join(&name);
         std::fs::create_dir_all(&dir).unwrap();
         let out_path = artifact_path(&dir, &name, Target::SpirvVulkan);
-        let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out_path)
+        let artifact = compile_kernel(&body, poot_target::Backend::SpirvVulkan, &out_path)
             .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
         let kernel = kernel_handle(&body, &artifact).unwrap();
 
@@ -1645,12 +1645,9 @@ mod contraction_tests {
             std::fs::create_dir_all(&dir).unwrap();
             let out_path =
                 poot_codegen::artifact_path(&dir, &name, poot_codegen::Target::SpirvVulkan);
-            let artifact = poot_codegen::compile_kernel(
-                &body,
-                poot_codegen::GpuTarget::SpirvVulkan,
-                &out_path,
-            )
-            .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
+            let artifact =
+                poot_codegen::compile_kernel(&body, poot_target::Backend::SpirvVulkan, &out_path)
+                    .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
             let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
 
             let words = pack_words(&bytes);
@@ -1951,9 +1948,8 @@ mod rocm_tests {
             .join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let out = poot_codegen::artifact_path(&dir, name, target);
-        let artifact =
-            poot_codegen::compile_kernel(body, poot_codegen::GpuTarget::AmdGcn(arch), &out)
-                .unwrap_or_else(|error| panic!("{name}: compile: {error}"));
+        let artifact = poot_codegen::compile_kernel(body, poot_target::Backend::AmdGcn(arch), &out)
+            .unwrap_or_else(|error| panic!("{name}: compile: {error}"));
         let kernel = poot_codegen::kernel_handle(body, &artifact).unwrap();
         let module = ctx
             .load_hsaco(&kernel)
@@ -2384,7 +2380,8 @@ mod planar_wgpu_tests {
     //! POOT-1193 (device tier 2): the wide register-tiled GEMM a prefill linear plans, on the local wgpu
     //! (SPIR-V/RADV) device - the wgpu counterpart of `rocm_tests`' wide-tile row.
 
-    use poot_codegen::{GpuTarget, Target, artifact_path, compile_kernel, kernel_handle};
+    use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
+    use poot_target::Backend;
     use poot_wgpu_runtime::{Context, KernelBuffer};
 
     use super::fixtures::assert_close;
@@ -2423,7 +2420,7 @@ mod planar_wgpu_tests {
                 .join(&name);
             std::fs::create_dir_all(&dir).unwrap();
             let out_path = artifact_path(&dir, &name, Target::SpirvVulkan);
-            let artifact = compile_kernel(&body, GpuTarget::SpirvVulkan, &out_path)
+            let artifact = compile_kernel(&body, Backend::SpirvVulkan, &out_path)
                 .unwrap_or_else(|error| panic!("{:?}: compile: {error}", case.format));
             let kernel = kernel_handle(&body, &artifact).unwrap();
 
@@ -2502,7 +2499,7 @@ mod ptx_tests {
             .join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let out = artifact_path(&dir, name, Target::Nvptx);
-        let artifact = compile_kernel(body, poot_codegen::GpuTarget::Nvptx, &out)
+        let artifact = compile_kernel(body, poot_target::Backend::Nvptx, &out)
             .unwrap_or_else(|error| panic!("{name}: compile: {error}"));
         kernel_handle(body, &artifact).unwrap()
     }
@@ -2789,7 +2786,7 @@ mod planar_ptx_tests {
             .join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let out = artifact_path(&dir, name, Target::Nvptx);
-        let artifact = compile_kernel(body, poot_codegen::GpuTarget::Nvptx, &out)
+        let artifact = compile_kernel(body, poot_target::Backend::Nvptx, &out)
             .unwrap_or_else(|error| panic!("{name}: compile: {error}"));
         kernel_handle(body, &artifact).unwrap()
     }

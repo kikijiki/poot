@@ -35,34 +35,19 @@ pub(crate) fn x_extent(groups: [u32; 3], wg: [u32; 3]) -> u32 {
     groups[0].saturating_mul(wg[0].max(1))
 }
 
-/// Find a memory type index whose bit is set in `type_bits` (from `VkMemoryRequirements::memoryTypeBits`,
-/// or `u32::MAX` for any type) and whose `propertyFlags` contain `required`. Prefers one that is also
-/// `DEVICE_LOCAL` (the UMA/iGPU path, see the module doc), else any match.
+/// The first memory type index whose bit is set in `type_bits` (from `VkMemoryRequirements::memoryTypeBits`,
+/// or `u32::MAX` for any type) and whose `propertyFlags` contain `required`.
 pub(crate) fn find_memory_type(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
     required: vk::MemoryPropertyFlags,
 ) -> Option<u32> {
-    let mut fallback: Option<u32> = None;
-    for i in 0..mem_props.memory_type_count {
-        if type_bits & (1 << i) == 0 {
-            continue;
-        }
-        let ty = mem_props.memory_types[i as usize];
-        if !ty.property_flags.contains(required) {
-            continue;
-        }
-        if ty
-            .property_flags
-            .contains(required | vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        {
-            return Some(i);
-        }
-        if fallback.is_none() {
-            fallback = Some(i);
-        }
-    }
-    fallback
+    (0..mem_props.memory_type_count).find(|&i| {
+        type_bits & (1 << i) != 0
+            && mem_props.memory_types[i as usize]
+                .property_flags
+                .contains(required)
+    })
 }
 
 /// `vk::PhysicalDeviceProperties::device_name` is `[c_char; 256]` with `c_char == i8` on Linux; reinterpret as `u8` for UTF-8 decoding.

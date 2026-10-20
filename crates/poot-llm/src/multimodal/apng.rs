@@ -2,7 +2,7 @@
 //!
 //! [`Apng`] probes an animated PNG for the facts frame sampling needs ([`VideoMetadata`]) and
 //! [`ApngFrames`] is the one [`FrameSource`] over it: a front end asks only for the frames it selects
-//! (`poot-caption` opens an animated PNG with it). Which frames to select, and what to do with them, is
+//! (`poot caption` opens an animated PNG with it). Which frames to select, and what to do with them, is
 //! the model family's.
 
 use std::io::Cursor;

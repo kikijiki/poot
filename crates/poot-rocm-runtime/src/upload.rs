@@ -18,19 +18,8 @@ use crate::error::check;
 use std::ops::Range;
 
 use crate::{RocmContext, RocmError, bindings};
+use poot_runtime_common::{RING_SLOTS, RingCursor, chunks, overlaps, slot_bytes};
 use std::ffi::c_void;
-
-/// Slots in the ring.
-const RING_SLOTS: usize = 4;
-
-/// Bytes of one slot: one chunk of a write.
-pub const UPLOAD_CHUNK_BYTES: usize = 64 << 20;
-
-/// The pinned size of a slot asked to hold `need` bytes: the next power of two, at least 64 KiB, at most one
-/// chunk.
-fn slot_bytes(need: usize) -> usize {
-    need.next_power_of_two().clamp(64 << 10, UPLOAD_CHUNK_BYTES)
-}
 
 /// A copy issued and not yet proven complete.
 struct InFlight {
@@ -51,7 +40,7 @@ enum SlotState {
 /// The ring and the slot the next chunk uses.
 pub(crate) struct UploadRing {
     slots: [SlotState; RING_SLOTS],
-    next: usize,
+    cursor: RingCursor,
 }
 
 impl Default for UploadRing {
@@ -63,7 +52,7 @@ impl Default for UploadRing {
                 SlotState::Empty,
                 SlotState::Empty,
             ],
-            next: 0,
+            cursor: RingCursor::default(),
         }
     }
 }
@@ -90,7 +79,7 @@ impl RocmContext {
     /// Prove slot `index`'s copy complete and make its staging buffer ready for a chunk of `need` bytes (0: just
     /// settle the slot); a copy still in flight is waited for here, and nowhere else but
     /// [`Self::drain_uploads`]. A slot is pinned at the size its first chunk asks for (a power of two, at most
-    /// [`UPLOAD_CHUNK_BYTES`]) and grows only when a later chunk is larger, so a small write pins a small
+    /// [`poot_runtime_common::UPLOAD_CHUNK_BYTES`]) and grows only when a later chunk is larger, so a small write pins a small
     /// buffer, not 64 MiB.
     fn ready_slot(
         &self,
@@ -159,9 +148,7 @@ impl RocmContext {
     ) -> Result<(), RocmError> {
         for index in 0..RING_SLOTS {
             let overlaps = match (&ring.slots[index], &range) {
-                (SlotState::Busy(_, flight), Some(range)) => {
-                    flight.dst.start < range.end && range.start < flight.dst.end
-                }
+                (SlotState::Busy(_, flight), Some(range)) => overlaps(&flight.dst, range),
                 (SlotState::Busy(..), None) => true,
                 _ => false,
             };
@@ -181,7 +168,7 @@ impl RocmContext {
     }
 
     /// Write `len` bytes at device address `dst` (a coarse-pool allocation) through the ring:
-    /// `fill(range, out)` gets consecutive ranges `0..len` of at most [`UPLOAD_CHUNK_BYTES`] and writes
+    /// `fill(range, out)` gets consecutive ranges `0..len` of at most [`poot_runtime_common::UPLOAD_CHUNK_BYTES`] and writes
     /// every byte of `out`, the pinned slot the copy reads. Returns with the last copies in flight.
     ///
     /// # Safety
@@ -198,11 +185,10 @@ impl RocmContext {
         let mut ring = self.lock_ring();
         // An earlier copy to bytes this write covers must land first, or the later write could be undone.
         self.drain_ring(&mut ring, Some(base..base + len), "ring_write")?;
-        let mut done = 0;
-        while done < len {
-            let chunk = UPLOAD_CHUNK_BYTES.min(len - done);
-            let index = ring.next;
-            ring.next = (index + 1) % RING_SLOTS;
+        for range in chunks(len) {
+            let (done, chunk) = (range.start, range.len());
+            let index = ring.cursor.index();
+            ring.cursor.advance();
             let mut staging = self.ready_slot(&mut ring, index, chunk, "ring_write")?;
             fill(done..done + chunk, &mut staging.as_mut_slice()[..chunk]);
             // SAFETY: `dst + done` is inside the allocation (function contract) and `staging` holds `chunk`
@@ -233,7 +219,6 @@ impl RocmContext {
                     return Err(error);
                 }
             }
-            done += chunk;
         }
         Ok(())
     }

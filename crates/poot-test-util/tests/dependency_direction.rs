@@ -122,6 +122,12 @@ const FORBIDDEN_NORMAL: &[(&[&str], &str, &str)] = &[
         "engine crates read weights through poot-quant's WeightStore; checkpoint-source vocabulary stays in \
          the loader (R463-004, ADR-0103)",
     ),
+    (
+        &["poot-vulkan-runtime"],
+        "poot-wgpu-runtime",
+        "the two SPIR-V runtimes are siblings: what they share lives in poot-runtime-common, so a raw Vulkan \
+         build never links wgpu (POOT-1231)",
+    ),
 ];
 
 /// Lockfile names allowed more than one version, each with what pulls the extra one. A duplicate with no row

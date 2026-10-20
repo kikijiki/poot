@@ -12,8 +12,8 @@ use crate::builder::{Builder, BuilderAppendPlan, Traced};
 use crate::error::BuilderError;
 use crate::graph::{Graph, Operand, ValueId};
 use crate::op::{
-    ContractionHead, ContractionRows, FusedOperand, FusedRegion, KeyLayout, KvBound, OpKind,
-    RowRegion, RowStep, ScanFamily,
+    ContractionHead, ContractionRows, FusedOperand, FusedRegion, KeyLayout, KvBound, MaskOperand,
+    OpKind, RowRegion, RowStep, ScanFamily, SinkOperand,
 };
 use crate::ops;
 use crate::packed_source::packed_source_constants;
@@ -91,6 +91,11 @@ pub fn decompose(
             let Some((&[q, k, v, mask], extra)) = inputs.split_first_chunk::<4>() else {
                 return Ok(None);
             };
+            let (extra, sinks) = match (attrs.sink, extra.split_last()) {
+                (SinkOperand::Absent, _) => (extra, None),
+                (SinkOperand::PerHead, Some((&sinks, rest))) => (rest, Some(sinks)),
+                (SinkOperand::PerHead, None) => return Ok(None),
+            };
             let (extra_key, len) = match (attrs.bound, extra) {
                 (KvBound::Capacity, []) => (None, None),
                 (KvBound::Capacity, &[operand]) => (Some(operand), None),
@@ -110,6 +115,14 @@ pub fn decompose(
                 ),
                 _ => return Ok(None),
             };
+            // A causal mask is built from the positions over the key axis the scores have.
+            let mask = match attrs.mask {
+                MaskOperand::Additive => mask,
+                MaskOperand::Causal { window } => {
+                    let lk = b.aval(v)?.shape[2];
+                    ops::causal_mask_from_pos(&b, mask, lk, window)?
+                }
+            };
             ops::attention_over_keys(
                 &b,
                 q,
@@ -120,6 +133,7 @@ pub fn decompose(
                 mask,
                 attrs.softcap,
                 len,
+                sinks,
             )?
         }
         OpKind::Rope { rot } => {
@@ -753,6 +767,33 @@ mod tests {
             (
                 OpKind::Attention(AttentionAttrs::new(2, 0.5, Some(30.0))),
                 prefill,
+            ),
+            (
+                // A per-head sink: the `[Hq]` logits are the last operand.
+                OpKind::Attention(AttentionAttrs {
+                    sink: crate::op::SinkOperand::PerHead,
+                    ..AttentionAttrs::new(2, 0.5, None)
+                }),
+                vec![
+                    f32(&[2, 4, 1, 8]),
+                    f32(&[2, 2, 6, 8]),
+                    f32(&[2, 2, 6, 8]),
+                    f32(&[2, 1, 1, 6]),
+                    f32(&[4]),
+                ],
+            ),
+            (
+                // A windowed causal mask: the fourth operand is the `[B, Lq]` I32 positions.
+                OpKind::Attention(AttentionAttrs {
+                    mask: MaskOperand::Causal { window: Some(3) },
+                    ..AttentionAttrs::new(2, 0.5, None)
+                }),
+                vec![
+                    f32(&[2, 4, 1, 8]),
+                    f32(&[2, 2, 6, 8]),
+                    f32(&[2, 2, 6, 8]),
+                    typed(&[2, 1], i32),
+                ],
             ),
             (
                 // A paged key: two `[S, Hkv, D]` pools read through the `[B, Lk]` slot map.

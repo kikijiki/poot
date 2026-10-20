@@ -33,6 +33,7 @@ fn dropping_a_bound_buffer_keeps_its_allocation_until_the_recording_drops() {
     let bound = live_activation_bytes(&device);
     assert_eq!(bound, before + 2 * 64 * 4, "both buffers are live");
 
+    poot_executor_parity::copy_probe::load_copy_kernel(&mut device);
     device.begin().expect("begin");
     device.copy(&src, &dst).expect("record the copy");
     let recording = device.finish().expect("finish");

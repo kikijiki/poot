@@ -10,6 +10,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+poot-codegen.workspace = true
 poot-tensor.workspace = true
 poot-executor.workspace = true
 poot-graph-plan = { workspace = true, features = ["test-support"] }

@@ -2,7 +2,9 @@
 //! [`BackendChoice`] into a `Box<dyn Executor>`. Nothing below it names a backend and nothing above it
 //! branches on one: a caller parses its `--backend` flag into a [`BackendChoice`] and passes it here.
 
+use std::fmt;
 use std::num::NonZeroUsize;
+use std::str::FromStr;
 
 use poot_executor::{
     Coordinator, DetailedTiming, DeviceError, Engine, ExecError, Executor, TimingOptions,
@@ -29,6 +31,55 @@ pub enum BackendChoice {
     /// an HSA GPU agent opens, else wgpu. Chosen by device presence only, before any program exists:
     /// a planner refusal on the chosen device is never retried on another.
     Auto,
+}
+
+impl BackendChoice {
+    /// Every choice, in the order its flag is documented.
+    pub const ALL: [BackendChoice; 5] = [
+        BackendChoice::Wgpu,
+        BackendChoice::Rocm,
+        BackendChoice::Ptx,
+        BackendChoice::Vulkan,
+        BackendChoice::Auto,
+    ];
+
+    /// The flag value that names this choice: what [`FromStr`] parses and [`fmt::Display`] prints.
+    pub const fn name(self) -> &'static str {
+        match self {
+            BackendChoice::Wgpu => "wgpu",
+            BackendChoice::Rocm => "rocm",
+            BackendChoice::Ptx => "ptx",
+            BackendChoice::Vulkan => "vulkan",
+            BackendChoice::Auto => "auto",
+        }
+    }
+}
+
+impl fmt::Display for BackendChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// A `--backend` value that names no [`BackendChoice`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("unknown backend {0:?}: expected wgpu, rocm, ptx, vulkan or auto")]
+pub struct UnknownBackend(pub String);
+
+/// The one parser of a backend name: every binary and the server take `--backend` through it.
+impl FromStr for BackendChoice {
+    type Err = UnknownBackend;
+
+    fn from_str(name: &str) -> Result<Self, UnknownBackend> {
+        match name {
+            "wgpu" => Ok(BackendChoice::Wgpu),
+            "rocm" => Ok(BackendChoice::Rocm),
+            "ptx" => Ok(BackendChoice::Ptx),
+            "vulkan" => Ok(BackendChoice::Vulkan),
+            "auto" => Ok(BackendChoice::Auto),
+            other => Err(UnknownBackend(other.to_string())),
+        }
+    }
 }
 
 /// A device that failed to open, as the contract's one device-fault variant.
@@ -118,7 +169,6 @@ fn vulkan() -> Result<Box<dyn Executor>, DriverError> {
     Ok(Box::new(Engine::new(device)))
 }
 
-#[cfg(feature = "rocm")]
 fn rocm(timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
     let device = match timing {
         Timing::Counters => poot_rocm_device::device::RocmDevice::new(),
@@ -126,11 +176,6 @@ fn rocm(timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
     }
     .map_err(|e| open_failed("rocm", e))?;
     Ok(engine(device, timing))
-}
-
-#[cfg(not(feature = "rocm"))]
-fn rocm(_timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
-    Err(Unsupported::Backend { backend: "rocm" }.into())
 }
 
 fn open(choice: BackendChoice, timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
@@ -227,20 +272,43 @@ mod bound_tests {
     }
 }
 
-#[cfg(all(test, not(feature = "rocm")))]
-mod tests {
+#[cfg(test)]
+mod name_tests {
     use super::*;
 
-    /// Without the `rocm` feature the ROCm choice is refused by name, and the message names the feature
-    /// that builds it in. Mutation: drop the feature from the `Unsupported::Backend` message.
+    /// Every choice round-trips through `Display` and `FromStr`, and the names are distinct.
+    /// Mutation: drop a variant's arm from `from_str`; that choice stops parsing and the row goes red.
     #[test]
-    fn a_rocm_choice_without_the_feature_names_the_feature_to_enable() {
-        let Err(refused) = open_executor(BackendChoice::Rocm) else {
-            panic!("a build without the rocm feature opened a ROCm executor");
+    fn every_backend_choice_round_trips_through_display_and_from_str() {
+        for choice in BackendChoice::ALL {
+            let name = choice.to_string();
+            assert_eq!(name.parse::<BackendChoice>(), Ok(choice), "{name}");
+        }
+        let mut names: Vec<_> = BackendChoice::ALL.map(BackendChoice::name).to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), BackendChoice::ALL.len());
+    }
+
+    /// `ALL` lists every variant: the exhaustive match breaks the build when a variant is added, and the
+    /// length pins the list to it.
+    #[test]
+    fn all_lists_every_variant() {
+        let count = |choice: BackendChoice| match choice {
+            BackendChoice::Wgpu
+            | BackendChoice::Rocm
+            | BackendChoice::Ptx
+            | BackendChoice::Vulkan
+            | BackendChoice::Auto => 1,
         };
-        assert!(
-            refused.to_string().contains("--features rocm"),
-            "got: {refused}"
-        );
+        assert_eq!(BackendChoice::ALL.map(count).iter().sum::<usize>(), 5);
+    }
+
+    /// An unknown name is refused and reported verbatim, never read as a known backend.
+    #[test]
+    fn an_unknown_backend_name_is_refused_by_name() {
+        let refused = "metal".parse::<BackendChoice>().unwrap_err();
+        assert_eq!(refused, UnknownBackend("metal".to_string()));
+        assert!(refused.to_string().contains("\"metal\""), "{refused}");
     }
 }

@@ -52,9 +52,8 @@ const fn layer_tensor(role: WeightRole, suffix: &'static str, presence: Presence
 
 /// The rows every GGUF decoder shares: embedding, output norm, the head (an absent `output.weight`
 /// is a head tied to the embedding), and per layer the attention and SwiGLU projections, their
-/// norms and the optional QKV biases. A llama-architecture GGUF stores Q/K rows permuted for
-/// interleaved RoPE; the rows here are the stored tensors, so that family traces interleaved
-/// rotation over them.
+/// norms and the optional QKV biases. The Q/K rows here are the stored tensors; a llama-architecture
+/// GGUF stores them permuted, which [`GGUF_PAIRED_QK`] undoes.
 pub(crate) const GGUF_BASE: &[NameRow] = &[
     NameRow {
         role: WeightRole::Embed,
@@ -103,6 +102,46 @@ pub(crate) const GGUF_BASE: &[NameRow] = &[
     layer_linear(WeightRole::Ffn(FfnRole::Gate), ".ffn_gate"),
     layer_linear(WeightRole::Ffn(FfnRole::Up), ".ffn_up"),
     layer_linear(WeightRole::Ffn(FfnRole::Down), ".ffn_down"),
+];
+
+/// Rows beside [`GGUF_BASE`] for a llama-architecture GGUF (llama, mistral, mixtral, smollm3): llama.cpp's
+/// converter stores the Q and K rows (and their biases) permuted for its interleaved RoPE, each head's rows
+/// as adjacent pairs, and these rows read them back in the half-split order the model traces, so the one
+/// fused half-split rotation serves the GGUF and the HF checkpoint alike. They replace the base rows for Q
+/// and K.
+pub(crate) const GGUF_PAIRED_QK: &[NameRow] = &[
+    NameRow {
+        role: WeightRole::Attn(AttnRole::Q),
+        source: Source::PairedHeads(&Source::LayerLinear {
+            prefix: "blk.",
+            stem: ".attn_q",
+        }),
+        presence: Presence::Required,
+    },
+    NameRow {
+        role: WeightRole::Attn(AttnRole::K),
+        source: Source::PairedHeads(&Source::LayerLinear {
+            prefix: "blk.",
+            stem: ".attn_k",
+        }),
+        presence: Presence::Required,
+    },
+    NameRow {
+        role: WeightRole::Attn(AttnRole::QBias),
+        source: Source::PairedHeads(&Source::LayerTensor {
+            prefix: "blk.",
+            suffix: ".attn_q.bias",
+        }),
+        presence: Presence::Optional,
+    },
+    NameRow {
+        role: WeightRole::Attn(AttnRole::KBias),
+        source: Source::PairedHeads(&Source::LayerTensor {
+            prefix: "blk.",
+            suffix: ".attn_k.bias",
+        }),
+        presence: Presence::Optional,
+    },
 ];
 
 /// The per-layer Q/K norm scales (qwen3 per head, OLMo 2 over the projection).

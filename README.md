@@ -62,10 +62,10 @@ decode step once per token. There is no cuBLAS and no cuDNN: every kernel is gen
 ```
 nix develop        # pinned Rust nightly, LLVM 22, Vulkan stack
 just test          # model-free tests: no GPU, no checkpoint
-cargo run -p poot-llm --release --features cli --bin poot-generate -- -m /path/to/qwen2.5-0.5b -p "The capital of France is" -n 16
+cargo run -p poot-llm --release --features cli --bin poot -- generate -m /path/to/qwen2.5-0.5b -p "The capital of France is" -n 16
 ```
 
-`poot-generate` takes the flags of llama.cpp's `llama-cli` where poot has the capability.
+`poot generate` takes the flags of llama.cpp's `llama-cli` where poot has the capability.
 
 - **Model and prompt.**
   - `-m` the model: a safetensors directory or a `.gguf` file. Without it the tool reads `qwen2.5-0.5b` under
@@ -86,7 +86,7 @@ cargo run -p poot-llm --release --features cli --bin poot-generate -- -m /path/t
 - **Conversation.** `--conversation` reads one user turn per line of stdin and keeps the conversation's K/V between
   turns (`-p`/`-f` is the first turn; `--single-turn` ends after one; no `-cnv`/`-st` short forms).
 - **Device.** `--backend wgpu|rocm|ptx|vulkan` (default `auto`). wgpu and vulkan need a Vulkan device, PTX an
-  NVIDIA GPU, and ROCm an AMD GPU and a build with `--features cli,rocm`.
+  NVIDIA GPU, and ROCm an AMD GPU.
 
 ### Serving
 

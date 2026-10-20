@@ -7,12 +7,11 @@
 //! [`pool`] are plain arithmetic on the rows the driver returns, so they are exact and need no
 //! device.
 
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
 use poot_executor::Executor;
-use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_models::bert::TOKEN_TYPE;
 use poot_models::io::{InputValue, RequestInputs, TokenValues};
 use poot_models::registry::Registry;
@@ -20,8 +19,8 @@ use poot_tensor::HostTensor;
 
 use crate::driver::error::DriverError;
 use crate::driver::{
-    DraftPolicy, Driver, DriverOptions, EncodeRequest, EncodeRow, EncodeShapes, Encoded,
-    LoadOptions, ModelHandle, PreparedSetLimits, program_retention,
+    Driver, DriverOptions, EncodeRequest, EncodeRow, EncodeShapes, Encoded, LoadOptions,
+    ModelHandle,
 };
 use poot_text::TextError;
 
@@ -53,21 +52,7 @@ fn open(
     )?);
     let positions = NonZeroUsize::new(handle.config().max_positions)
         .expect("a model has at least one position");
-    let compile = CompileOptions::new(CompileLimits::STANDARD);
-    let options = DriverOptions {
-        prefill: compile.clone(),
-        decode: compile,
-        capacity: positions,
-        prefill_chunk: positions,
-        trace: crate::driver::serving_trace_limits(positions),
-        prepared: PreparedSetLimits {
-            max_entries: NonZeroUsize::new(32).expect("nonzero"),
-            max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),
-        },
-        charge: program_retention,
-        draft: DraftPolicy::Off,
-        hidden_window: None,
-    };
+    let options = DriverOptions::tower(positions);
     let mut driver = Driver::new(Arc::clone(&handle), executor, options)?;
     driver.prepare_encode(&EncodeShapes {
         rows,

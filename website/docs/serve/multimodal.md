@@ -31,11 +31,11 @@ content. The server fetches no URLs, so a URL, an image that does not decode, a 
 image front end refuses an image part with a `400` `unsupported_capability` error, and so does a video or audio part
 on any checkpoint, instead of dropping the part.
 
-The `poot-caption` binary of `poot-llm` captions an image from the command line and does not use the
+The `poot caption` command of `poot-llm` captions an image from the command line and does not use the
 server:
 
 ```bash
-cargo run --release -p poot-llm --features cli --bin poot-caption -- /path/to/smolvlm image.jpg "Describe this image." --backend wgpu
+cargo run --release -p poot-llm --features cli --bin poot -- caption /path/to/smolvlm image.jpg "Describe this image." --backend wgpu
 ```
 
 It loads the checkpoint once and puts the vision tower and the text decoder each on its own driver

@@ -613,7 +613,7 @@ impl ContractionHead {
 /// `mask`, `key` and `bound` name the operand conventions the kernels read. A variant added to one is a new case
 /// every consumer matches, never a flag on the others. The operand list is `[q, k, v, mask]`, then the shared key
 /// part when `key` is [`KeyLayout::Split`] or the slot map `read` when it is [`KeyLayout::Paged`], then `len`
-/// when `bound` is [`KvBound::Live`].
+/// when `bound` is [`KvBound::Live`], then the per-head `sinks [Hq]` when `sink` is [`SinkOperand::PerHead`].
 #[derive(Clone, PartialEq, Debug)]
 pub struct AttentionAttrs {
     /// Query heads per key/value head (`Hq / Hkv`).
@@ -629,6 +629,8 @@ pub struct AttentionAttrs {
     pub key: KeyLayout,
     /// Which keys the kernel visits.
     pub bound: KvBound,
+    /// Whether the softmax carries a learned per-head sink logit.
+    pub sink: SinkOperand,
 }
 
 impl AttentionAttrs {
@@ -642,8 +644,21 @@ impl AttentionAttrs {
             mask: MaskOperand::Additive,
             key: KeyLayout::Single,
             bound: KvBound::Capacity,
+            sink: SinkOperand::Absent,
         }
     }
+}
+
+/// Whether [`AttentionAttrs`]'s softmax includes a sink: one position-independent logit per query head that
+/// takes part in the row maximum and the normalizer but is no key, so it adds nothing to the weighted value
+/// sum (gpt-oss, DeepSeek-V4). Equivalent to a sink column concatenated to the scores with a zero value row.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum SinkOperand {
+    /// No sink: the softmax runs over the keys alone.
+    Absent,
+    /// A `[Hq]` operand, the last of the operand list, holds the sink logit of each query head, in the
+    /// query's dtype.
+    PerHead,
 }
 
 /// How [`AttentionAttrs`]'s mask operand enters the scores.
@@ -651,6 +666,17 @@ impl AttentionAttrs {
 pub enum MaskOperand {
     /// A `[B,Hm,Lq,Lk]` tensor added to the scaled (and softcapped) scores.
     Additive,
+    /// The causal mask of absolute positions, stated rather than materialized: the operand is the I32
+    /// `[B,Lq]` position of each query row, and key `j` is visible to query `(b, i)` when `j <= pos[b,i]`
+    /// and, under a window, `pos[b,i] - j < window`. A hidden key adds nothing to the softmax, so a kernel
+    /// visits only the keys between the window's start and the position instead of reading a mask element
+    /// per key. The decomposition is `ops::causal_mask_from_pos` over a key axis of `Lk`. A row whose
+    /// position is negative (a padded query) sees no key there and key 0 in a kernel; its output is dropped
+    /// by its caller either way.
+    Causal {
+        /// The most recent keys a query sees (`pos - j < window`); `None` is every earlier key. At least 1.
+        window: Option<usize>,
+    },
 }
 
 /// How [`AttentionAttrs`]'s key operand is laid out.
@@ -975,6 +1001,8 @@ pub enum OpKind {
     /// never selected. Its definition is the primitive chain of [`crate::ops::block_top_k_packed`]: a stable
     /// rank over all `NB` blocks, quadratic in `NB`, so the CPU oracle refuses past a block-count bound
     /// and a device runs a linear selection kernel instead. The selected set is exact on every executor.
+    ///
+    /// A tracer never emits it: it states the composition above and `compile`'s selection pass forms the op.
     BlockTopK(BlockTopKAttrs),
     /// Attention over the blocks a [`OpKind::BlockTopK`] selected (POOT-1143): each query reads only the keys of
     /// its `K` selected blocks and of its own unfinished block, not all `Lk`. Operands `[q, k, v, ids, pos]`:
@@ -989,6 +1017,9 @@ pub enum OpKind {
     /// definition is the dense [`OpKind::Attention`] under the additive mask those conditions make
     /// ([`crate::ops::selected_attention`]); a device kernel visits `(K + 1) * ratio` positions per query
     /// instead of `Lk`, so its sum is reassociated (ADR-0101 tier 2) while the keys it reads are exact.
+    ///
+    /// A tracer never emits it: it states [`crate::ops::selected_attention`] and `compile`'s selection pass forms
+    /// the op.
     SelectedAttention(SelectedAttentionAttrs),
     /// A cross-replica collective reduce (card 049a, tensor-parallel). Each rank holds a same-shaped partial tensor;
     /// the collective combines them with `op` and distributes the result back to every rank. The output type is
@@ -1943,6 +1974,8 @@ impl OpKind {
     /// | --- | --- |
     /// | `Attention` | `flash_attention_capped` from the attention chain |
     /// | `Rope` | `rope_fusion` from the half-split rotation chain |
+    /// | `BlockTopK` | `form_selection` from [`crate::ops::block_top_k_packed`], the rank chain a sparse indexer's tracer states |
+    /// | `SelectedAttention` | `form_selection` from an additive `Attention` whose mask is [`crate::ops::selected_block_mask`] |
     /// | `ContractionEpilogue` | `fuse` from a contraction and the single-use pointwise chain that consumes it |
     /// | `Fused`, `FusedRow` | `fuse` from pointwise chains and their last-axis reductions |
     ///
@@ -2207,8 +2240,8 @@ impl OpKind {
             OpKind::Fused(r) => format!("fused n_in={} steps={}", r.n_inputs, r.steps.len()),
             OpKind::FusedRow(r) => format!("fused_row n_in={} steps={}", r.n_inputs, r.steps.len()),
             OpKind::Attention(a) => format!(
-                "attention n_rep={} scale={} softcap={:?} mask={:?} key={:?} bound={:?}",
-                a.n_rep, a.scale, a.softcap, a.mask, a.key, a.bound
+                "attention n_rep={} scale={} softcap={:?} mask={:?} key={:?} bound={:?} sink={:?}",
+                a.n_rep, a.scale, a.softcap, a.mask, a.key, a.bound, a.sink
             ),
             OpKind::Rope { rot } => format!("rope rot={rot}"),
             OpKind::Scan(attrs) => format!("scan {} chunk={}", attrs.family.name(), attrs.chunk),
@@ -2253,11 +2286,16 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
     let split = matches!(attrs.key, KeyLayout::Split { .. });
     let paged = matches!(attrs.key, KeyLayout::Paged);
     let live = matches!(attrs.bound, KvBound::Live);
-    arity(ins, 4 + usize::from(split || paged) + usize::from(live))?;
+    let sink = matches!(attrs.sink, SinkOperand::PerHead);
+    arity(
+        ins,
+        4 + usize::from(split || paged) + usize::from(live) + usize::from(sink),
+    )?;
     let (q, k, v, mask) = (&ins[0], &ins[1], &ins[2], &ins[3]);
     let shared = split.then(|| &ins[4]);
     let read = paged.then(|| &ins[4]);
-    let len = live.then(|| &ins[ins.len() - 1]);
+    let len = live.then(|| &ins[ins.len() - 1 - usize::from(sink)]);
+    let sinks = sink.then(|| &ins[ins.len() - 1]);
     // Float operands only: the decomposition's softmax (`Exp`, `Div`) does not type over I32.
     if q.dtype.class() != DTypeClass::Arithmetic {
         return Err(ShapeError::DtypeOp {
@@ -2265,9 +2303,12 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
             dtype: q.dtype,
         });
     }
-    for (operand, t) in [("k", k), ("v", v), ("mask", mask)]
+    let additive = matches!(attrs.mask, MaskOperand::Additive);
+    for (operand, t) in [("k", k), ("v", v)]
         .into_iter()
+        .chain(additive.then_some(("mask", mask)))
         .chain(shared.map(|t| ("k_shared", t)))
+        .chain(sinks.map(|t| ("sinks", t)))
     {
         if t.dtype != q.dtype {
             return Err(ShapeError::AttentionDtype {
@@ -2407,18 +2448,38 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
             (lk, dv)
         }
     };
-    let mask_heads = if mask.shape.get(1) == Some(&hq) {
-        hq
-    } else {
-        1
-    };
-    let dense_mask = [bsz, mask_heads, lq, lk];
-    if mask.shape != dense_mask {
-        return Err(ShapeError::AttentionOperand {
-            operand: "mask",
-            expected: dense_mask.to_vec(),
-            actual: mask.shape.clone(),
-        });
+    match attrs.mask {
+        MaskOperand::Additive => {
+            let mask_heads = if mask.shape.get(1) == Some(&hq) {
+                hq
+            } else {
+                1
+            };
+            let dense_mask = [bsz, mask_heads, lq, lk];
+            if mask.shape != dense_mask {
+                return Err(ShapeError::AttentionOperand {
+                    operand: "mask",
+                    expected: dense_mask.to_vec(),
+                    actual: mask.shape.clone(),
+                });
+            }
+        }
+        MaskOperand::Causal { window } => {
+            if mask.dtype != DType::I32 {
+                return Err(ShapeError::AttentionDtype {
+                    operand: "positions",
+                    expected: DType::I32,
+                    actual: mask.dtype,
+                });
+            }
+            if mask.shape != [bsz, lq] || window == Some(0) {
+                return Err(ShapeError::AttentionOperand {
+                    operand: "positions",
+                    expected: vec![bsz, lq],
+                    actual: mask.shape.clone(),
+                });
+            }
+        }
     }
     if let Some(len) = len
         && (len.dtype != DType::I32 || len.shape != [bsz])
@@ -2427,6 +2488,15 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
             operand: "len",
             expected: vec![bsz],
             actual: len.shape.clone(),
+        });
+    }
+    if let Some(sinks) = sinks
+        && sinks.shape != [hq]
+    {
+        return Err(ShapeError::AttentionOperand {
+            operand: "sinks",
+            expected: vec![hq],
+            actual: sinks.shape.clone(),
         });
     }
     Ok(TensorType::new(vec![bsz, hq, lq, dv], q.dtype))
@@ -3971,6 +4041,109 @@ mod tests {
         ));
     }
 
+    /// A sink types over the per-head `[Hq]` logits that follow every other operand: the output is the
+    /// sinkless one's, and a missing operand, a logit vector of another width and one of another dtype are
+    /// typed refusals naming it.
+    #[test]
+    fn a_sink_attention_types_over_per_head_logits_and_refuses_each_disagreement() {
+        let op = OpKind::Attention(AttentionAttrs {
+            sink: SinkOperand::PerHead,
+            ..AttentionAttrs::new(2, 1.0, None)
+        });
+        let ok = [
+            f(&[2, 4, 1, 8]),
+            f(&[2, 2, 6, 8]),
+            f(&[2, 2, 6, 8]),
+            f(&[2, 1, 1, 6]),
+            f(&[4]),
+        ];
+        assert_eq!(op.infer(&ok).unwrap(), f(&[2, 4, 1, 8]));
+        assert!(matches!(op.infer(&ok[..4]), Err(ShapeError::Arity { .. })));
+        let mut wide = ok.clone();
+        wide[4] = f(&[2]);
+        assert!(matches!(
+            op.infer(&wide),
+            Err(ShapeError::AttentionOperand {
+                operand: "sinks",
+                ..
+            })
+        ));
+        let mut bf16 = ok.clone();
+        bf16[4] = TensorType::new(vec![4], DType::BF16);
+        assert!(matches!(
+            op.infer(&bf16),
+            Err(ShapeError::AttentionDtype {
+                operand: "sinks",
+                ..
+            })
+        ));
+        // With a live bound the logits follow the length.
+        let live = OpKind::Attention(AttentionAttrs {
+            sink: SinkOperand::PerHead,
+            bound: KvBound::Live,
+            ..AttentionAttrs::new(2, 1.0, None)
+        });
+        let with_len = [
+            ok[0].clone(),
+            ok[1].clone(),
+            ok[2].clone(),
+            ok[3].clone(),
+            TensorType::new(vec![2], DType::I32),
+            ok[4].clone(),
+        ];
+        assert_eq!(live.infer(&with_len).unwrap(), f(&[2, 4, 1, 8]));
+    }
+
+    /// A causal mask types over the I32 `[B,Lq]` positions in the mask's place: the output is the additive
+    /// one's, and positions of another dtype, another shape or a zero window are typed refusals naming them.
+    #[test]
+    fn a_causal_attention_types_over_query_positions_and_refuses_each_disagreement() {
+        let causal = |window| {
+            OpKind::Attention(AttentionAttrs {
+                mask: MaskOperand::Causal { window },
+                ..AttentionAttrs::new(2, 1.0, None)
+            })
+        };
+        let positions = |shape: &[usize], dtype| TensorType::new(shape.to_vec(), dtype);
+        let operands = |positions: TensorType| {
+            [
+                f(&[2, 4, 3, 8]),
+                f(&[2, 2, 6, 8]),
+                f(&[2, 2, 6, 8]),
+                positions,
+            ]
+        };
+        let ok = operands(positions(&[2, 3], DType::I32));
+        assert_eq!(causal(None).infer(&ok).unwrap(), f(&[2, 4, 3, 8]));
+        assert_eq!(causal(Some(4)).infer(&ok).unwrap(), f(&[2, 4, 3, 8]));
+        assert!(matches!(
+            causal(None).infer(&operands(f(&[2, 3]))),
+            Err(ShapeError::AttentionDtype {
+                operand: "positions",
+                ..
+            })
+        ));
+        for wrong in [&[1usize, 3][..], &[2, 1], &[2, 1, 3, 6]] {
+            assert!(
+                matches!(
+                    causal(None).infer(&operands(positions(wrong, DType::I32))),
+                    Err(ShapeError::AttentionOperand {
+                        operand: "positions",
+                        ..
+                    })
+                ),
+                "{wrong:?}"
+            );
+        }
+        assert!(matches!(
+            causal(Some(0)).infer(&ok),
+            Err(ShapeError::AttentionOperand {
+                operand: "positions",
+                ..
+            })
+        ));
+    }
+
     /// A paged key types over `[S,Hkv,D]` pools and the `[B,Lk]` I32 slot map: the output is the dense one's,
     /// and every operand that disagrees with the pool or the map is a typed refusal naming it.
     #[test]
@@ -5046,6 +5219,7 @@ mod tests {
                     attrs.mask.hash(h);
                     attrs.key.hash(h);
                     attrs.bound.hash(h);
+                    attrs.sink.hash(h);
                 }
                 OpKind::Rope { rot } => rot.hash(h),
                 OpKind::Scan(attrs) => attrs.hash(h),

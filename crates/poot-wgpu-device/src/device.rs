@@ -152,6 +152,13 @@ impl Device for WgpuDevice {
     type Recording = WgpuRecording;
     type Error = RuntimeError;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        poot_executor::CopyMechanism::Native
+    }
+    fn backend_name(&self) -> &'static str {
+        "wgpu"
+    }
+
     fn target(&self) -> Target {
         Target::Gpu {
             backend: Backend::SpirvVulkan,
@@ -238,6 +245,8 @@ impl Device for WgpuDevice {
     }
 
     fn copy(&mut self, src: &DeviceBuffer, dst: &DeviceBuffer) -> Result<(), RuntimeError> {
+        // Refused at record time, like every device: a mismatched copy never reaches a replay.
+        self.ctx.copy_bytes(dst, src)?;
         self.push(Recorded::Copy {
             src: src.clone(),
             dst: dst.clone(),

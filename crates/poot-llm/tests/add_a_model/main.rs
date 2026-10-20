@@ -403,6 +403,13 @@ impl Device for FakeDevice {
     type Recording = ();
     type Error = FakeError;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        poot_executor::CopyMechanism::Native
+    }
+    fn backend_name(&self) -> &'static str {
+        "fake"
+    }
+
     fn target(&self) -> Target {
         Target::Gpu {
             backend: Backend::SpirvVulkan,
@@ -812,7 +819,7 @@ fn generate_equals_the_oracle_tokens_wgpu() {
     assert_generate_matches_the_oracle(BackendChoice::Wgpu, DeviceBackend::Wgpu);
 }
 
-/// SC-002 on ROCm (the `rocm` feature; without it the device does not open and the row skips).
+/// SC-002 on ROCm (without an AMD GPU the device does not open and the row skips).
 #[test]
 fn generate_equals_the_oracle_tokens_rocm() {
     assert_generate_matches_the_oracle(BackendChoice::Rocm, DeviceBackend::Rocm);

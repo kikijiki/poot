@@ -70,7 +70,9 @@ query row against the prompt) are the same op: `q [B, Hq, Lq, Dk]`, `k [B, Hkv, 
 softcap. Three more forms ride on the same op: a split key, a paged key and a live length (below).
 A sparse-attention indexer uses a block-selected form instead: no mask operand, the selected block ids and
 the query positions in its place, so each row visits only the `(K + 1) * ratio` positions of its `K` selected
-blocks and its own unfinished block rather than all `Lk`.
+blocks and its own unfinished block rather than all `Lk`. The tracer states the block selection and the mask
+over the selected blocks as primitives, and the selection pass of `compile` recognizes them and forms the
+`BlockTopK` and `SelectedAttention` eqns, the same way the attention rewrite forms `Attention`.
 
 The planner turns the eqn into one generation request that names the shape, the score
 transform (scale, or scale plus softcap), the mask kind, the key bound and the schedule. One

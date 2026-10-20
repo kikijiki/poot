@@ -72,7 +72,7 @@ fn f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv() {
     let dir: PathBuf = std::env::temp_dir().join("poot-f16-matmul-probe");
     std::fs::create_dir_all(&dir).unwrap();
     let out = artifact_path(&dir, "f16mm", Target::SpirvVulkan);
-    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out)
+    let artifact = compile_kernel(&body, poot_target::Backend::SpirvVulkan, &out)
         .expect("F16 matmul must compile to SPIR-V");
     if which("spirv-val") {
         let v = std::process::Command::new("spirv-val")

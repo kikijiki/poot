@@ -25,7 +25,7 @@ startup, before the server listens:
 
 `--backend vulkan` serves too: raw Vulkan reads the free device memory from `VK_EXT_memory_budget`, so the engine plan fits the workload to it like any other backend. A Vulkan driver without that extension reports no budget, and startup then stops with a typed capacity error (an unknown budget is never guessed).
 
-The backends are libraries. **wgpu** (Vulkan/SPIR-V, the default), **rocm** (AMD raw HSA, `--features rocm`)
+The backends are libraries. **wgpu** (Vulkan/SPIR-V, the default), **rocm** (AMD raw HSA)
 and **ptx** (NVIDIA CUDA) share the graph IR and model definitions, and so does **vulkan**: the same SPIR-V
 kernels as wgpu, dispatched through raw Vulkan (`ash`) with no wgpu, recorded once as native command buffers
 and replayed. Only codegen and dispatch differ. Pick one in `poot-serve` with `--backend

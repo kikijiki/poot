@@ -454,6 +454,13 @@ impl Device for FailingFinish {
     type Recording = <PtxDevice as Device>::Recording;
     type Error = PtxGpuError;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        self.inner.copy_mechanism()
+    }
+    fn backend_name(&self) -> &'static str {
+        "fake"
+    }
+
     fn target(&self) -> Target {
         self.inner.target()
     }

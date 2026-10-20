@@ -25,17 +25,17 @@ greedily through the `Driver` on the first device that opens (PTX, then ROCm, th
 smallest end-to-end GPU decode example. Other examples under `crates/poot-llm/examples/` cover graph
 tracing and fusion (`trace_and_fuse`, `flash_attention_fusion`), CPU-executor building blocks
 (`build_and_eval`), sampling (`sampling`) and speculative policies (`speculation_bench`). Encoder embeddings
-and reranking have a command line, `poot-embed`
-(`cargo run --release -p poot-llm --features cli --bin poot-embed -- embed /path/to/all-minilm "a cat" "a kitten"`),
+and reranking have a command line, `poot embed`
+(`cargo run --release -p poot-llm --features cli --bin poot -- embed similarity /path/to/all-minilm "a cat" "a kitten"`),
 which opens a device and runs the encoder on it.
 
-## Command line: poot-generate
+## Command line: poot generate
 
-`poot-generate` loads a checkpoint and generates text from a prompt on the device `--backend` names. It takes the
+`poot generate` loads a checkpoint and generates text from a prompt on the device `--backend` names. It takes the
 flags of llama.cpp's `llama-cli` where poot has the capability:
 
 ```bash
-cargo run -p poot-llm --release --features cli --bin poot-generate -- -m /path/to/qwen2.5-0.5b -p "The capital of France is" -n 16
+cargo run -p poot-llm --release --features cli --bin poot -- generate -m /path/to/qwen2.5-0.5b -p "The capital of France is" -n 16
 ```
 
 - `-m` the checkpoint (a safetensors directory or a `.gguf` file); `-p` the prompt or `-f` a prompt file;
@@ -58,19 +58,21 @@ cargo run -p poot-llm --release --features cli --bin poot-generate -- -m /path/t
 - `--show-timings` (on by default) prints the engine-measured prefill and decode tokens per second to stderr;
   `-v` logs what the run does.
 
-ROCm is a build feature: build with `--features cli,rocm` to use `--backend rocm`. Without it the error says so.
+`poot` is one binary with three commands, `generate`, `caption` and `embed`, and every command takes the same
+`--backend` flag.
 
 ## Backends
 
 poot has **three production backends** and a fourth, lower-priority one (`--backend wgpu|rocm|ptx|vulkan`):
 
 - **wgpu** (default): Vulkan/SPIR-V; any modern GPU; most complete continuous-batching library path
-- **rocm**: AMD via raw HSA (`--features rocm`)
+- **rocm**: AMD via raw HSA (loaded at run time, no build flag)
 - **ptx**: NVIDIA via cudarc
 - **vulkan**: the same SPIR-V kernels as wgpu through raw Vulkan (`ash`), with no wgpu; verified on AMD (RADV) only, NVIDIA and Intel Vulkan drivers are untested
 
-`poot-serve`, `poot-embed` and `poot-caption` take `--backend wgpu|rocm|ptx|vulkan|auto`; the benchmark runner
-takes `--backend ptx|rocm|wgpu` and has no raw Vulkan mode. Build ROCm with `--features rocm`. In
+`poot-serve` and the `poot` commands take `--backend wgpu|rocm|ptx|vulkan|auto`; the benchmark runner
+takes `--backend ptx|rocm|wgpu`. Every backend is in every build: a backend whose device is absent is refused when it
+opens. In
 library code you select the backend by wiring the matching executor crate (`poot-wgpu-device`,
 `poot-rocm-device`, `poot-ptx-device`, or `poot-vulkan-device`). See [Picking a backend](../serve/choosing-a-backend.md) for
 tradeoffs.

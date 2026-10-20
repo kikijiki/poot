@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use poot_graph_ir::test_support::block_top_k::{reference_row, selection_cases};
+use poot_graph_ir::test_support::composites;
 use poot_graph_ir::{BlockTopKAttrs, Builder, Outputs, ShapeError, TensorType, Traced, ValueId};
 use poot_tensor::{DType, HostTensor};
 
@@ -28,7 +29,7 @@ fn fixture(rows: usize, tokens: usize, blocks: usize, attrs: BlockTopKAttrs) -> 
     let pos = b
         .constant("pos", TensorType::new(vec![rows, tokens], DType::I32))
         .unwrap();
-    let result = b.block_top_k(attrs, scores, pos).unwrap();
+    let result = composites::block_top_k(&b, attrs, scores, pos).unwrap();
     let graph = b.finish(Outputs::new(result.packed)).unwrap();
     Fixture {
         graph,
@@ -142,9 +143,8 @@ fn ids_and_keep_are_typed_projections_of_one_packed_result() {
     let pos = b
         .constant("pos", TensorType::new(vec![2, 3], DType::I32))
         .unwrap();
-    let result = b
-        .block_top_k(BlockTopKAttrs { ratio: 2, k: 4 }, scores, pos)
-        .unwrap();
+    let result =
+        composites::block_top_k(&b, BlockTopKAttrs { ratio: 2, k: 4 }, scores, pos).unwrap();
     let g = b.finish(Outputs::new(result.packed)).unwrap();
     assert_eq!(g.aval(result.packed.id()).shape, vec![2, 1, 3, 13]);
     assert_eq!(g.aval(result.packed.id()).dtype, DType::I32);

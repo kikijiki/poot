@@ -50,6 +50,7 @@ fn interpret(
             k: case.k,
         },
         bound: kg::KeyBound::Static,
+        sink: kg::AttentionSink::Absent,
         schedule: match splits {
             None => kg::AttentionSchedule::Streaming { lanes },
             Some(splits) => kg::AttentionSchedule::SplitKv { lanes, splits },
@@ -227,6 +228,7 @@ fn the_kernel_lowers_to_spirv_and_ptx() {
         },
         mask: kg::MaskKind::Blocks { ratio: 4, k: 8 },
         bound: kg::KeyBound::Static,
+        sink: kg::AttentionSink::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes: 64 },
     };
     let generated = generate_request(&spec);

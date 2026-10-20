@@ -360,8 +360,9 @@ fn dispatch_count_regression_on_real_qwen2_decode_configs() {
 /// 680. The production dispatch counts are pinned through `compile` in `src/tests.rs`.
 // POOT-1150 added 3 each, the hidden pad column (iota range and concat) of the padded KV stride at capacity 64;
 // POOT-1229 moved that pad to the legalizer, which runs with a target, so the target-free pipeline is back to 537 and 681.
-const PIN_QWEN2: usize = 537;
-const PIN_QWEN3: usize = 681;
+// POOT-1238 states the causal mask by the position, so the mask region's launch is gone: 536 and 680.
+const PIN_QWEN2: usize = 536;
+const PIN_QWEN3: usize = 680;
 
 #[test]
 fn flash_default_cuts_prefill_dispatch_count() {

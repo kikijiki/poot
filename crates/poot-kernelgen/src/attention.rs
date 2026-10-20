@@ -75,6 +75,8 @@ pub struct AttentionSpec {
     pub mask: MaskKind,
     /// Which keys each row visits.
     pub bound: KeyBound,
+    /// Whether the row's softmax carries a per-head sink logit.
+    pub sink: AttentionSink,
     /// How the keys are walked and across how many workgroups.
     pub schedule: AttentionSchedule,
 }
@@ -106,7 +108,7 @@ impl AttentionSpec {
     pub fn candidates(&self) -> usize {
         match self.mask {
             MaskKind::Blocks { ratio, k } => (k + 1) * ratio,
-            MaskKind::Broadcast | MaskKind::PerHead => self.lk,
+            MaskKind::Broadcast | MaskKind::PerHead | MaskKind::Causal { .. } => self.lk,
         }
     }
 
@@ -176,6 +178,14 @@ pub enum MaskKind {
     Broadcast,
     /// `Hm == Hq`: one plane per head (ALiBi).
     PerHead,
+    /// No mask tensor: the parameter that follows the value is the `I32 [B, Lq]` position of each query row,
+    /// and key `t` is visible when `t <= position` and, under a window, `position - t < window`. The loop
+    /// visits only those keys: it ends at the position and starts at the window's first key, so a hidden key
+    /// costs nothing and the scores need no mask. A negative position (a padded query) is read as 0.
+    Causal {
+        /// The most recent keys a query sees; `None` is every earlier key. At least 1.
+        window: Option<usize>,
+    },
     /// No mask operand: the parameters that follow the value are the `I32 [B, Lq, K]` ids of the blocks each
     /// query selected (ascending, `-1` after the last) and the `I32 [B, Lq]` query positions. A row visits
     /// only the keys of its selected blocks of `ratio` positions and its own unfinished block, `(K + 1) *
@@ -216,6 +226,18 @@ pub enum KeyBound {
     /// The first `len[b]` positions of batch row `b`, read at run time from an `I32 [B]` parameter that
     /// follows the key parameters. The loop bound moves; the launch does not.
     Live,
+}
+
+/// Whether the softmax includes a sink: one learned logit per query head that joins the row maximum and the
+/// normalizer and is no key, so it weighs nothing in the value sum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttentionSink {
+    /// No sink.
+    Absent,
+    /// An `F32 [Hq]` parameter, the last before `out`, holds the sink logit of each head. It is the initial
+    /// running state of the row's first lane (of its first split): `m = sink`, `l = 1` (`exp(sink - m)`),
+    /// `o = 0`, so admitting the keys, the lane combine and the split combine need no sink case of their own.
+    PerHead,
 }
 
 /// How the region's keys are walked.
@@ -301,6 +323,9 @@ fn validate(spec: &AttentionSpec) -> Result<usize, KernelGenError> {
             value: splits,
             bound: spec.candidates(),
         });
+    }
+    if spec.mask == (MaskKind::Causal { window: Some(0) }) {
+        return Err(bad("window", 0, 1));
     }
     if let MaskKind::Blocks { ratio, k } = spec.mask {
         for (what, value) in [("ratio", ratio), ("k", k)] {
@@ -518,7 +543,7 @@ fn block_candidate(
 /// threads laid over a 2-D grid `x_groups` workgroups across: `gi = GroupY * x_groups + GroupX` is the flat
 /// `(batch, head, row)` index, and a workgroup past `workgroups()` (the fold's remainder) returns.
 /// Parameters: `q`, `k`, `v`, `mask`, then `k_shared` for a split key or `read` for a paged one, then `len` for a
-/// live bound, then `out`
+/// live bound, then `sinks` for a sink, then `out`
 /// (the partial-state scratch under [`AttentionSchedule::SplitKv`]: the `x_groups`/`gi` index then runs over
 /// `(row, split)`, `gi = row * splits + split`).
 pub(crate) fn attention_body(
@@ -539,6 +564,7 @@ pub(crate) fn attention_body(
         score,
         mask: mask_kind,
         bound,
+        sink,
         schedule,
     } = *spec;
     let splits = match schedule {
@@ -548,7 +574,7 @@ pub(crate) fn attention_body(
     let chunk = spec.keys_per_workgroup();
     let hkv = hq / n_rep;
     let mask_heads = match mask_kind {
-        MaskKind::Broadcast | MaskKind::Blocks { .. } => 1,
+        MaskKind::Broadcast | MaskKind::Causal { .. } | MaskKind::Blocks { .. } => 1,
         MaskKind::PerHead => hq,
     };
 
@@ -558,9 +584,10 @@ pub(crate) fn attention_body(
         ld(slice_f32(false), false), // 2 k
         ld(slice_f32(false), false), // 3 v
     ];
-    // 4 the additive mask, or the selected block ids and the query positions (5)
+    // 4 the additive mask, the query positions, or the selected block ids and the query positions (5)
     match mask_kind {
         MaskKind::Broadcast | MaskKind::PerHead => params.push(ld(slice_f32(false), false)),
+        MaskKind::Causal { .. } => params.push(ld(slice_dtype(Ty::I32, false), false)),
         MaskKind::Blocks { .. } => {
             params.push(ld(slice_dtype(Ty::I32, false), false));
             params.push(ld(slice_dtype(Ty::I32, false), false));
@@ -583,6 +610,10 @@ pub(crate) fn attention_body(
     let len = match bound {
         KeyBound::Static => None,
         KeyBound::Live => Some(next_param(ld(slice_dtype(Ty::I32, false), false))),
+    };
+    let sinks = match sink {
+        AttentionSink::Absent => None,
+        AttentionSink::PerHead => Some(next_param(ld(slice_f32(false), false))),
     };
     let out = next_param(ld(slice_f32(true), true));
     let (q, k, v, mask) = (
@@ -637,17 +668,21 @@ pub(crate) fn attention_body(
                 read_base: uc(c, BinOp::Mul, b, lk),
             },
         };
-        let maskbase = {
-            let plane = match mask_kind {
-                MaskKind::Broadcast | MaskKind::Blocks { .. } => uc(c, BinOp::Mul, b, mask_heads),
-                MaskKind::PerHead => {
-                    let by_batch = uc(c, BinOp::Mul, b, mask_heads);
-                    ubin(c, BinOp::Add, by_batch, h)
-                }
-            };
-            let plane_start = uc(c, BinOp::Mul, plane, lq * lk);
-            let row_start = uc(c, BinOp::Mul, i, lk);
-            ubin(c, BinOp::Add, plane_start, row_start)
+        // Where this row's additive mask starts; the other masks have no tensor to index.
+        let maskbase = match mask_kind {
+            MaskKind::Broadcast | MaskKind::PerHead => {
+                let plane = match mask_kind {
+                    MaskKind::PerHead => {
+                        let by_batch = uc(c, BinOp::Mul, b, mask_heads);
+                        ubin(c, BinOp::Add, by_batch, h)
+                    }
+                    _ => uc(c, BinOp::Mul, b, mask_heads),
+                };
+                let plane_start = uc(c, BinOp::Mul, plane, lq * lk);
+                let row_start = uc(c, BinOp::Mul, i, lk);
+                Some(ubin(c, BinOp::Add, plane_start, row_start))
+            }
+            MaskKind::Causal { .. } | MaskKind::Blocks { .. } => None,
         };
         let lane_slot = uc(c, BinOp::Mul, lane, dv);
         // The query's index among the `B * Lq` of the selection operands.
@@ -659,6 +694,24 @@ pub(crate) fn attention_body(
         // This lane's partial state: the running maximum and denominator in registers, `o` in LDS.
         let m = c.var(Ty::F32, Rvalue::Use(f32c(f32::NEG_INFINITY)));
         let l = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
+        // The sink is the row's initial state, held by exactly one lane of one workgroup of the row.
+        if let Some(sinks) = sinks {
+            let holds_sink = {
+                let first_lane = c.bin(Ty::Bool, BinOp::Eq, local_op(lane), cu(0));
+                match split {
+                    None => first_lane,
+                    Some(split) => {
+                        let first_split = c.bin(Ty::Bool, BinOp::Eq, local_op(split), cu(0));
+                        c.both(first_lane, first_split)
+                    }
+                }
+            };
+            c.if_then(holds_sink, |c| {
+                let logit = c.let_(Ty::F32, Rvalue::Use(copy(elem(sinks, h))));
+                c.assign(Place::local(m), Rvalue::Use(local_op(logit)));
+                c.assign(Place::local(l), Rvalue::Use(f32c(1.0)));
+            });
+        }
         count(c, cu(0), dv, 1, |c, channel| {
             let slot = ubin(c, BinOp::Add, lane_slot, channel);
             lds_write(c, O_ARRAY, slot, f32c(0.0));
@@ -709,6 +762,58 @@ pub(crate) fn attention_body(
                 let first = ubin(c, BinOp::Add, begin, lane);
                 (local_op(first), local_op(end))
             }
+        };
+        // A causal row walks only the keys it can see: it ends at its position and starts at its window's
+        // first key, kept on this lane's stride.
+        let (first_key, key_end) = match mask_kind {
+            MaskKind::Causal { window } => {
+                let raw = c.let_(Ty::I32, Rvalue::Use(copy(elem(mask, qrow))));
+                // The position as an index; a negative one (a padded query) is 0.
+                let position = c.var(Ty::Usize, Rvalue::Use(cu(0)));
+                let non_negative = c.bin(
+                    Ty::Bool,
+                    BinOp::Ge,
+                    local_op(raw),
+                    Operand::Const(Constant::I32(0)),
+                );
+                c.if_then(non_negative, |c| {
+                    let widened = c.let_(
+                        Ty::Usize,
+                        Rvalue::Cast {
+                            to: Ty::Usize,
+                            operand: local_op(raw),
+                        },
+                    );
+                    c.assign(Place::local(position), Rvalue::Use(local_op(widened)));
+                });
+                let visible_end = uc(c, BinOp::Add, position, 1);
+                let end = c.var(Ty::Usize, Rvalue::Use(key_end));
+                let shorter = c.bin(Ty::Bool, BinOp::Lt, local_op(visible_end), local_op(end));
+                c.if_then(shorter, |c| {
+                    c.assign(Place::local(end), Rvalue::Use(local_op(visible_end)));
+                });
+                let first = c.var(Ty::Usize, Rvalue::Use(first_key));
+                if let Some(window) = window {
+                    // window_start = visible_end - window, or 0; move `first` up to the lane's first key at or
+                    // after it: first + ceil((window_start - first) / lanes) * lanes.
+                    let past_window = c.bin(Ty::Bool, BinOp::Gt, local_op(visible_end), cu(window));
+                    c.if_then(past_window, |c| {
+                        let window_start = uc(c, BinOp::Sub, visible_end, window);
+                        let behind =
+                            c.bin(Ty::Bool, BinOp::Lt, local_op(first), local_op(window_start));
+                        c.if_then(behind, |c| {
+                            let gap = ubin(c, BinOp::Sub, window_start, first);
+                            let padded = uc(c, BinOp::Add, gap, lanes - 1);
+                            let steps = uc(c, BinOp::Div, padded, lanes);
+                            let jump = uc(c, BinOp::Mul, steps, lanes);
+                            let moved = ubin(c, BinOp::Add, first, jump);
+                            c.assign(Place::local(first), Rvalue::Use(local_op(moved)));
+                        });
+                    });
+                }
+                (local_op(first), local_op(end))
+            }
+            _ => (first_key, key_end),
         };
         let visit = |c: &mut Cfg, t: poot_kernel_ir::Local| {
             // dot = q[row] . k[t], over the key's own part and then its shared part
@@ -767,14 +872,14 @@ pub(crate) fn attention_body(
             }
 
             let s = score_of(c, score, dot);
-            // A block-selected row visits only keys it reads, so there is no mask to add.
-            let s = match mask_kind {
-                MaskKind::Blocks { .. } => s,
-                MaskKind::Broadcast | MaskKind::PerHead => {
+            // A block-selected or causal row visits only keys it can see, so there is no mask to add.
+            let s = match (mask_kind, maskbase) {
+                (MaskKind::Broadcast | MaskKind::PerHead, Some(maskbase)) => {
                     let mi = ubin(c, BinOp::Add, maskbase, t);
                     let mask_value = c.let_(Ty::F32, Rvalue::Use(copy(elem(mask, mi))));
                     fbin(c, BinOp::Add, s, mask_value)
                 }
+                _ => s,
             };
 
             // The online-softmax step. `m_new == -inf` means every position seen so far, this one
@@ -821,7 +926,7 @@ pub(crate) fn attention_body(
                     c.if_then(visible.valid, |c| visit(c, visible.key));
                 });
             }
-            MaskKind::Broadcast | MaskKind::PerHead => {
+            MaskKind::Broadcast | MaskKind::PerHead | MaskKind::Causal { .. } => {
                 count_to(c, first_key, key_end, lanes, visit);
             }
         }
@@ -1073,6 +1178,7 @@ mod tests {
             },
             mask: MaskKind::Broadcast,
             bound: KeyBound::Static,
+            sink: AttentionSink::Absent,
             schedule: AttentionSchedule::Streaming { lanes: 4 },
         }
     }

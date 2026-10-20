@@ -2,8 +2,7 @@
 //!
 //! `--add` compiles poot's `add` kernel to `.spv` via the `poot-codegen` `Target::SpirvVulkan` path,
 //! dispatches it through the raw-Vulkan (`ash`) runtime on the local Vulkan device, and checks the
-//! result against the CPU oracle (`a + b`) and, if a wgpu adapter is available, against wgpu
-//! bit-for-bit. Exits 0 on PASS or an explicit skip when no Vulkan device is present, non-zero on a
+//! result against the CPU oracle (`a + b`). Exits 0 on PASS or an explicit skip when no Vulkan device is present, non-zero on a
 //! mismatch or Vulkan error.
 
 use std::path::PathBuf;
@@ -42,7 +41,7 @@ fn compiled_add(body: &poot_kernel_ir::Body, name: &str) -> poot_runtime_common:
     let dir: PathBuf = std::env::temp_dir().join("poot-vulkan-check");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
-    let artifact = compile_kernel(body, poot_codegen::GpuTarget::SpirvVulkan, &out)
+    let artifact = compile_kernel(body, poot_target::Backend::SpirvVulkan, &out)
         .expect("compile add kernel to SPIR-V");
     kernel_handle(body, &artifact).unwrap()
 }
@@ -87,37 +86,6 @@ fn run_add() -> i32 {
         return 1;
     }
     println!("PASS: raw-vulkan add matches the CPU oracle ({got:?})");
-
-    match poot_wgpu_runtime::Context::new() {
-        Ok(wgpu_ctx) => {
-            let mut bufs = [
-                poot_wgpu_runtime::KernelBuffer::read_only_f32(&a),
-                poot_wgpu_runtime::KernelBuffer::read_only_f32(&b),
-                poot_wgpu_runtime::KernelBuffer::write_f32(a.len()),
-            ];
-            // Same `.spv` bytes, recompiled into a wgpu-side handle: the ABI is identical across the two
-            // runtimes (module doc), so this is still a same-artifact cross-check.
-            let wgpu_kernel = compiled_add(&body, "add");
-            wgpu_ctx
-                .dispatch(
-                    "add",
-                    &wgpu_kernel,
-                    [64, 1, 1],
-                    [a.len() as u32, 1, 1],
-                    &mut bufs,
-                )
-                .expect("wgpu dispatch");
-            if got != bufs[2].as_f32() {
-                println!(
-                    "FAIL: raw-vulkan add result {got:?} != wgpu result {:?}",
-                    bufs[2].as_f32()
-                );
-                return 1;
-            }
-            println!("PASS: raw-vulkan add matches wgpu bit-for-bit (same .spv, same ABI)");
-        }
-        Err(e) => println!("(wgpu cross-check skipped: no adapter - {e})"),
-    }
 
     0
 }

@@ -1,7 +1,6 @@
 # Deliberately unlisted rows of `just test-device-ptx`, one per line: binary_id<TAB>test_name<TAB>reason.
 # A row the lane runs and passes that is in neither ptx.txt nor here fails scripts/check-required-cases.py;
 # a row that prints a skip report fails whether listed or not. Sorted in canonical (LC_ALL=C) order; every row must run in the lane or the gate fails.
-poot-ptx-device	device::tests::copy_launch_params_dispatches_the_real_elem_count_never_a_byte_capacity_word_count	PTX device-crate host row (launch parameter arithmetic); opens no device, and runs under `just test`
 poot-ptx-device::bin/ptx-check	tests::a_directory_with_no_fixture_is_not_a_pass	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
 poot-ptx-device::bin/ptx-check	tests::a_failed_comparison_fails_the_run	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
 poot-ptx-device::bin/ptx-check	tests::a_partial_directory_fails_only_when_ptx_is_required	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`

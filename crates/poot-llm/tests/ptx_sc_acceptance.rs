@@ -496,6 +496,13 @@ impl Device for FaultyOnceDevice {
     type Recording = <PtxDevice as Device>::Recording;
     type Error = <PtxDevice as Device>::Error;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        self.inner.copy_mechanism()
+    }
+    fn backend_name(&self) -> &'static str {
+        "fake"
+    }
+
     fn target(&self) -> Target {
         self.inner.target()
     }
@@ -655,6 +662,13 @@ impl Device for FaultyOnceSyncDevice {
     type Kernel = <PtxDevice as Device>::Kernel;
     type Recording = <PtxDevice as Device>::Recording;
     type Error = <PtxDevice as Device>::Error;
+
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        self.inner.copy_mechanism()
+    }
+    fn backend_name(&self) -> &'static str {
+        "fake"
+    }
 
     fn target(&self) -> Target {
         self.inner.target()
