@@ -19,7 +19,7 @@ use poot_executor::{Arg, Device, DeviceTime, Dispatch, LaunchKind, MeasuredDevic
 use poot_graph_plan::Target;
 use poot_kernel_ir::Ty;
 use poot_ptx_runtime::{PtxBuffer, PtxContext, PtxError, PtxGraphExec, PtxSpan};
-use poot_runtime_common::{BufferRole, CompiledKernel};
+use poot_runtime_common::{BufferRole, CompiledKernel, DeviceIdentity};
 use poot_target::{Backend, BufferStorage, ElementKind, TargetId};
 
 use crate::PtxGpuError;
@@ -120,6 +120,10 @@ impl Device for PtxDevice {
 
     fn free_memory_bytes(&self) -> Option<u64> {
         self.ctx.vram_free_bytes()
+    }
+
+    fn identity(&self) -> Option<DeviceIdentity> {
+        self.ctx.identity()
     }
 
     fn allocate(

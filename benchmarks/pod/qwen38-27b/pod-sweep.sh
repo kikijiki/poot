@@ -9,7 +9,8 @@
 # runs (a refusal is a result). Only the model download is a hard prerequisite for the phases that read it.
 #
 # Inputs (uploaded by launch.sh): $BIN/poot-bench-runner, $BIN/poot-serve (patchelf'd), $HERE/summarize.py.
-# Knobs (env, all optional): OUT, WORK, MAX_TOTAL_S, ISLS, OSL, CONCS, BATCH_ISLS, LLAMACPP_TAG, VLLM_VERSION.
+# Knobs (env, all optional): OUT, WORK, MAX_TOTAL_S, ISLS, OSL, CONCS, BATCH_ISLS, LLAMACPP_TAG, VLLM_VERSION,
+# PHASES (space-separated engine groups to run: oracle vllm llamacpp poot; default all, `PHASES=vllm` reruns only vLLM).
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -39,6 +40,9 @@ ROW_CAP_S="${ROW_CAP_S:-300}"              # hard cap of every serve row (a capp
 # short OSL so a row fits the cap at its measured prefill rate; vLLM / llama.cpp keep the full grid above.
 POOT_SERVE_B1_ISLS="${POOT_SERVE_B1_ISLS:-128 512}"; POOT_SERVE_ISLS="${POOT_SERVE_ISLS:-512}"
 POOT_SERVE_CONCS="${POOT_SERVE_CONCS:-4}"; POOT_SERVE_OSL="${POOT_SERVE_OSL:-32}"; POOT_SERVE_PROMPTS="${POOT_SERVE_PROMPTS:-8}"
+PHASES="${PHASES:-oracle vllm llamacpp poot}"
+for g in $PHASES; do case "$g" in oracle|vllm|llamacpp|poot) ;; *) echo "unknown PHASES group '$g' (oracle vllm llamacpp poot)" >&2; exit 2;; esac; done
+wants() { case " $PHASES " in *" $1 "*) return 0;; *) return 1;; esac; }
 MAX_TOTAL_S="${MAX_TOTAL_S:-14400}"        # no new phase starts after this many seconds (cost cap)
 PORT_POOT="${PORT_POOT:-8080}"; PORT_VLLM="${PORT_VLLM:-8000}"; PORT_LLAMA="${PORT_LLAMA:-8081}"
 
@@ -102,7 +106,7 @@ say "gpu=$GPU_NAME ${GPU_MEM_MIB}MiB sm_$CC; $FP8_NOTE"
 # --- 1. downloads --------------------------------------------------------------------------------------------
 HF=$(command -v hf || command -v huggingface-cli)
 phase download_fp8 3600 -- "$HF" download "$FP8_REPO" --local-dir "$FP8_DIR"
-phase download_gguf 3600 -- "$HF" download "$GGUF_REPO" "$GGUF_FILE" --local-dir "$GGUF_DIR"
+wants llamacpp && phase download_gguf 3600 -- "$HF" download "$GGUF_REPO" "$GGUF_FILE" --local-dir "$GGUF_DIR"
 for repo in "$FP8_REPO" "$GGUF_REPO"; do
   echo "$repo $(curl -fsS -m 30 "https://huggingface.co/api/models/$repo" | grep -o '"sha":"[0-9a-f]*"' | head -1)" >>"$OUT/model-revisions.txt"
 done
@@ -117,7 +121,7 @@ GGUF_OK=0; [ -s "$GGUF" ] && GGUF_OK=1
 ORACLE_OK=0
 ORACLE_FIXTURE=crates/poot-llm/tests/data/qwen38_27b_fp8_oracle_top5.json   # repo-relative: copy $OUT/<this> into the checkout
 ORACLE_ARCHIVE="${ORACLE_ARCHIVE:-/root/oracle-lane.tar.zst}"; WS_TAR="${WS_TAR:-/root/ws.tar}"; WS_DIR="${WS_DIR:-/root/ws}"; EX_DIR="${EX_DIR:-/root/ex}"
-if [ "$FP8_OK" = 1 ] && [ -s "$ORACLE_ARCHIVE" ] && [ -s "$WS_TAR" ]; then
+if wants oracle && [ "$FP8_OK" = 1 ] && [ -s "$ORACLE_ARCHIVE" ] && [ -s "$WS_TAR" ]; then
   mkdir -p "$EX_DIR" "$WS_DIR" "$WORK/oracle-models" "$OUT/oracle" "$OUT/$(dirname "$ORACLE_FIXTURE")"
   ln -sfn "$FP8_DIR" "$WORK/oracle-models/qwen3.8-27b-fp8"      # POOT_MODELS_DIR layout: <dir>/<checkpoint>
   tar -C "$WS_DIR" -xf "$WS_TAR"
@@ -150,6 +154,7 @@ fi
 VPY="$VENV_VLLM/bin/python"; VLLM="$VENV_VLLM/bin/vllm"
 { echo "vllm=$("$VPY" -c 'import vllm;print(vllm.__version__)' 2>&1 | tail -1)"
   echo "torch=$("$VPY" -c 'import torch;print(torch.__version__, torch.version.cuda)' 2>&1 | tail -1)"
+  echo "toolkit_cuda=$(nvcc --version 2>&1 | tail -1)"; echo "cuda_home=${CUDA_HOME:-unset}"
   "$VPY" -m pip freeze 2>/dev/null | grep -Ei '^(vllm|torch|flashinfer|transformers|xformers)' ; } >"$OUT/versions-vllm.txt"
 "$VLLM" bench serve --help >"$WORK/bench-serve-help.txt" 2>&1
 CLIENT_FLAGS=()
@@ -212,25 +217,23 @@ with_server() {
 # --limit-mm-per-prompt zeroes the vision tower's profiling (text-only workload, like poot's). Prefix caching is
 # off (random prompts defeat it anyway; matches the suite's contract). max-num-batched-tokens is vLLM's chunked
 # prefill budget; recorded, not tuned.
-[ "$FP8_OK" = 1 ] && with_server vllm "$PORT_VLLM" 2400 -- "$VLLM" serve "$FP8_DIR" --host 127.0.0.1 --port "$PORT_VLLM" \
+wants vllm && [ "$FP8_OK" = 1 ] && with_server vllm "$PORT_VLLM" 2400 -- "$VLLM" serve "$FP8_DIR" --host 127.0.0.1 --port "$PORT_VLLM" \
     --max-model-len "$MAX_CTX" --max-num-seqs "$MAX_SEQS" --gpu-memory-utilization 0.90 --no-enable-prefix-caching \
     --limit-mm-per-prompt '{"image":0,"video":0}' --dtype bfloat16
 
 # --- 3. llama.cpp CUDA (Q4_K_XL GGUF) ------------------------------------------------------------------------
 LCPP="${LCPP:-$WORK/llama.cpp}"
-if [ "$GGUF_OK" = 1 ] && budget_ok; then
-  # The image's baked llama.cpp is sm_86 only and the image has no nvcc: install the toolkit pieces and build the
-  # pod's own arch. Same pinned tag as the image.
+if wants llamacpp && [ "$GGUF_OK" = 1 ] && budget_ok; then
+  # The image's baked llama.cpp is sm_86 only: build the pod's own arch with the image's CUDA 13 toolkit. Same
+  # pinned tag as the image.
   phase llamacpp_build 3000 -- bash -c "set -e
-    apt-get update -qq && apt-get install -y -qq cmake ninja-build cuda-nvcc-12-6 cuda-cudart-dev-12-6 cuda-driver-dev-12-6 libcublas-dev-12-6 >/dev/null
-    export PATH=/usr/local/cuda/bin:\$PATH
     [ -d '$LCPP' ] || git clone --depth 1 --branch '$LLAMACPP_TAG' https://github.com/ggml-org/llama.cpp.git '$LCPP'
     cd '$LCPP' && cmake -B build -G Ninja -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES='$ARCH' \
       -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' -DLLAMA_CURL=OFF
     cmake --build build -j\"\$(nproc)\" --target llama-bench llama-server
     git rev-parse HEAD"
   { echo "llamacpp_tag=$LLAMACPP_TAG"; echo "llamacpp_commit=$(git -C "$LCPP" rev-parse HEAD 2>/dev/null)"
-    echo "llamacpp_arch=$ARCH"; "$LCPP/build/bin/llama-bench" --version 2>&1 | head -3; } >"$OUT/versions-llamacpp.txt"
+    echo "llamacpp_arch=$ARCH"; echo "llamacpp_cuda=$(nvcc --version 2>&1 | tail -1)"; "$LCPP/build/bin/llama-bench" --version 2>&1 | head -3; } >"$OUT/versions-llamacpp.txt"
   LB="$LCPP/build/bin/llama-bench"; LS="$LCPP/build/bin/llama-server"
   if [ -x "$LB" ]; then
     # Prefill: pp at each ISL. Decode: tg128 at depth = ISL, the equivalent of "prefill ISL, then decode OSL".
@@ -254,7 +257,7 @@ fi
 RUNNER="$BIN/poot-bench-runner"
 CURVE=("$RUNNER" --model-dir "$FP8_DIR" --backend ptx --precision bf16 --mode decode-curve --isl-list "$ISLS"
        --osl "$OSL" --warmup "$WARMUP" --iters "$ITERS" --json)
-if [ "$FP8_OK" = 1 ]; then
+if wants poot && [ "$FP8_OK" = 1 ]; then
   phase poot_curve 5400 -- "${CURVE[@]}"                          # clean timing, first: pays the cold kernel cache
   tail -1 "$OUT/logs/poot_curve.out" >"$OUT/raw/poot_curve.json"
   # Driver phase timing + bytes read per token. Run 1 (H100): every field was `unknown` ("no pinned ceiling for this
@@ -274,7 +277,7 @@ fi
 
 # --- 5. poot batched (poot-serve, PTX), LAST: the slow, capped rows --------------------------------------------
 # It has no ignore-eos switch: the client's actual output tokens are in the JSON.
-[ "$FP8_OK" = 1 ] && with_server poot "$PORT_POOT" 3600 -- "$BIN/poot-serve" --backend ptx "$FP8_DIR" "127.0.0.1:$PORT_POOT"
+wants poot && [ "$FP8_OK" = 1 ] && with_server poot "$PORT_POOT" 3600 -- "$BIN/poot-serve" --backend ptx "$FP8_DIR" "127.0.0.1:$PORT_POOT"
 
 # --- 6. collect ----------------------------------------------------------------------------------------------
 say "summarize"

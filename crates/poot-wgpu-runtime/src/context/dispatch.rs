@@ -121,7 +121,7 @@ impl Context {
     /// count from the plan, index-aligned with `ins` plus `out` last: the length buffer this builds
     /// carries these, never `DeviceBuffer::elem_count()` (an arena slot's buffer is sized to its
     /// largest occupant, which can exceed this particular dispatch's operand).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn build_dispatch_objects(
         &self,
         key: &str,
@@ -230,7 +230,7 @@ impl Context {
     /// elsewhere (SF-2). The caller (poot-wgpu-device's `DecodeCache`) holds the returned [`CachedDispatch`] and
     /// re-encodes it every step via
     /// [`Context::submit_cached`].
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn build_cached_dispatch(
         &self,
         label: &str,

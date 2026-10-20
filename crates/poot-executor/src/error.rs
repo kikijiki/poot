@@ -281,9 +281,10 @@ pub enum LoadError {
         /// The const's name.
         name: String,
     },
-    /// A tensor-parallel rank's share of a weight could not be cut from the executable's map.
-    #[error("rank weights: {0}")]
-    RankWeights(#[from] poot_quant::weights::WeightMapError),
+    /// The executable's weight map does not stand against its store, or a rank's share of a weight could
+    /// not be cut from it.
+    #[error("weight map: {0}")]
+    WeightMap(#[from] poot_quant::weights::WeightMapError),
     /// A kernel could not be compiled for the target.
     #[error("kernel {key}: {source}")]
     Codegen {
@@ -463,14 +464,6 @@ pub enum BindError {
         token: i32,
         /// Rows in the embed table.
         rows: usize,
-    },
-    /// A packed embed row did not decode.
-    #[error("embed {name}: {source}")]
-    RowDecode {
-        /// The embed's name.
-        name: String,
-        /// The decode failure.
-        source: poot_quant::decode::DecodeError,
     },
     /// A sync wrote pool rows outside the table's pool (`first_row + len > pool_rows`).
     #[error("pooled table {table}: rows {first_row}..{end} are outside its {pool_rows} pool rows")]

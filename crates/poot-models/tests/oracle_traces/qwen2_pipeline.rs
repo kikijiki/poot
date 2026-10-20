@@ -649,7 +649,7 @@ fn draft_propose_round_schedule_matches_sequential_draft_decode() {
         let mut ref_drafts: Vec<i32> = Vec::new();
         // `pos` is the absolute decode position (fed to the graph's Slot::Pos input), and only incidentally an index into
         // `tokens_row[row]` during catch-up; an iterator rewrite would not simplify this.
-        #[allow(clippy::needless_range_loop)]
+        #[expect(clippy::needless_range_loop)]
         for pos in 0..(catchup[row] + max_k) {
             let tok = if pos < catchup[row] {
                 tokens_row[row][pos]

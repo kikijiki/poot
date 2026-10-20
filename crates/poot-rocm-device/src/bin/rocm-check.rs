@@ -62,7 +62,7 @@ fn main() {
     if let Err(e) = res {
         let kfd_present = std::path::Path::new(KFD_DEVICE_NODE).exists();
         if let CheckError::Rocm(error) = &e
-            && is_no_device(error, kfd_present)
+            && no_device_is_a_non_result(error, kfd_present, |name| std::env::var(name).ok())
         {
             eprintln!("no ROCm device: {error}");
             std::process::exit(EXIT_NO_DEVICE);
@@ -98,6 +98,17 @@ fn is_no_device(error: &RocmError, kfd_present: bool) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `error` is the "nothing to check here" outcome ([`EXIT_NO_DEVICE`]) rather than a failure: the host has
+/// no ROCm device and ROCm is not required. A lane that requires ROCm (`POOT_REQUIRE_ROCM=1`) gets
+/// [`EXIT_FAILURE`] for a missing device too, so a lane never passes on a check that could not run.
+fn no_device_is_a_non_result(
+    error: &RocmError,
+    kfd_present: bool,
+    get: impl Fn(&str) -> Option<String>,
+) -> bool {
+    is_no_device(error, kfd_present) && !DeviceBackend::Rocm.required(get)
 }
 
 /// ROCr's switch for a device-memory AQL packet ring, read once when the HSA runtime loads.
@@ -537,6 +548,22 @@ mod tests {
         }
         // A real failure is never a skip, required or not.
         assert!(!pcie_receipt_may_skip(&RocmError::NoGpuAgent, |_| None));
+    }
+
+    /// A host without a ROCm device is a non-result only while ROCm is not required.
+    #[test]
+    fn a_missing_device_is_a_failure_when_rocm_is_required() {
+        let required = |name: &str| (name == DeviceBackend::Rocm.variable()).then(|| "1".into());
+        assert!(no_device_is_a_non_result(
+            &RocmError::NoGpuAgent,
+            true,
+            |_| None
+        ));
+        assert!(!no_device_is_a_non_result(
+            &RocmError::NoGpuAgent,
+            true,
+            required
+        ));
     }
 
     fn out_of_resources() -> RocmError {

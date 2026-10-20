@@ -31,14 +31,25 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 INVENTORY = ROOT / "scripts" / "test-model-free-inventory.tsv"
 REQUIRED_CHECKPOINTS = ROOT / "scripts" / "required-checkpoint-cases.txt"
 REQUIRED_DEVICE_CASES = ROOT / "scripts" / "required-device-cases"
+NEXTEST_CONFIG = ROOT / ".config" / "nextest.toml"
+
+# The features the device lanes build, named here so the listing sees the tests that exist only under them
+# (R2-L13-012). The lane recipes in the justfile pass the same features. `poot-npu/xdna` needs `nix develop .#npu`
+# (XRT), so its listing runs in that shell: `npu_listing`.
+FEATURES = "poot-llm/rocm,poot-npu/vpu"
+NPU_FEATURES = "poot-npu/xdna,poot-npu/vpu"
+# A host with no NPU shell sets this to skip the xdna listing, as `just npu-build` does.
+ALLOW_NO_NPU_SHELL = "POOT_ALLOW_NO_NPU_SHELL"
 
 COVERED_ELSEWHERE = {"model-free", "real-dims"}
 
@@ -160,25 +171,93 @@ def uncovered(
     return problems
 
 
-def nextest_listing(selections: list[str]) -> dict:
-    union = " | ".join(f"({selection})" for selection in selections)
-    command = [
-        "cargo", "nextest", "list", "--workspace", "--lib", "--bins", "--tests",
-        "--message-format", "json", "-E", union,
-    ]  # fmt: skip
+def run_listing(command: list[str]) -> dict:
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
     if result.returncode != 0:
         sys.stderr.write(result.stderr)
-        raise SystemExit(f"{' '.join(command[:4])} failed ({result.returncode})")
-    return json.loads(result.stdout)
+        raise SystemExit(f"{' '.join(command[:6])} failed ({result.returncode})")
+    # `nix develop` prints the devshell banner on stdout before the command's own output; the listing is the
+    # one line that is a JSON object.
+    document = [line for line in result.stdout.splitlines() if line.startswith("{")]
+    if len(document) != 1:
+        raise SystemExit(f"{' '.join(command[:6])}: expected one JSON document on stdout, found {len(document)}")
+    return json.loads(document[0])
+
+
+def nextest_listing(filterset: str) -> dict:
+    """Every test of the workspace built with the lane features, `filter-match` evaluated against `filterset`.
+
+    The poot-npu suites come from the `xdna` build in `nix develop .#npu`, which lists a superset of the default
+    shell's (the `vpu` and `xdna` rows)."""
+    listing = run_listing([
+        "cargo", "nextest", "list", "--workspace", "--lib", "--bins", "--tests",
+        "--features", FEATURES, "--message-format", "json", "-E", filterset,
+    ])  # fmt: skip
+    npu_shell = subprocess.run(["nix", "develop", ".#npu", "-c", "true"], cwd=ROOT, capture_output=True)
+    if npu_shell.returncode != 0:
+        if os.environ.get(ALLOW_NO_NPU_SHELL) != "1":
+            raise SystemExit(
+                f"nix develop .#npu cannot be entered: the xdna rows cannot be listed (set {ALLOW_NO_NPU_SHELL}=1 "
+                "on a host that has no NPU shell)"
+            )
+        print(f"{ALLOW_NO_NPU_SHELL}=1: the xdna rows are not listed", file=sys.stderr)
+        return listing
+    npu = run_listing([
+        "nix", "develop", ".#npu", "-c", "cargo", "nextest", "list", "-p", "poot-npu", "--lib", "--bins", "--tests",
+        "--features", NPU_FEATURES, "--message-format", "json", "-E", filterset,
+    ])  # fmt: skip
+    listing["rust-suites"] = {
+        binary: suite
+        for binary, suite in listing["rust-suites"].items()
+        if suite["package-name"] != "poot-npu"
+    } | npu["rust-suites"]
+    return listing
+
+
+def gpu_group_filter(path: Path) -> str:
+    """The filterset of the nextest override that puts tests into the `gpu` test group."""
+    overrides = tomllib.loads(path.read_text(encoding="ascii"))["profile"]["default"]["overrides"]
+    filters = [entry["filter"].strip() for entry in overrides if entry.get("test-group") == "gpu"]
+    if len(filters) != 1:
+        raise SystemExit(f"{path.relative_to(ROOT)}: expected one override into the gpu group, found {len(filters)}")
+    return filters[0]
+
+
+def ungrouped(
+    selected: dict, grouped: dict, inventory: dict[tuple[str, str], str]
+) -> list[str]:
+    """`package binary test` for each active test a lane selects that the `gpu` test group does not hold.
+
+    A selected test that is model-free or real-dims is host-only (a `package(...)` selection also picks up its
+    package's host tests) and needs no group; every other selected test can reach the device, and two of them
+    on the one GPU at once hang it (R2-L13-008)."""
+    in_group = {
+        (binary, name)
+        for binary, suite in grouped["rust-suites"].items()
+        for name, case in suite["testcases"].items()
+        if case["filter-match"]["status"] == "matches"
+    }
+    problems = []
+    for binary, suite in sorted(selected["rust-suites"].items()):
+        for name, case in sorted(suite["testcases"].items()):
+            key = (binary, name)
+            if case["filter-match"]["status"] != "matches" or case["ignored"]:
+                continue
+            if inventory.get(key) in COVERED_ELSEWHERE or key in in_group:
+                continue
+            problems.append(f"{suite['package-name']}  {binary}  {name}")
+    return problems
 
 
 def check(selections: list[str]) -> int:
-    listing = nextest_listing(selections)
+    union = " | ".join(f"({selection})" for selection in selections)
+    listing = nextest_listing(union)
     cases, problems = load_checkpoint_cases(REQUIRED_CHECKPOINTS)
     every_device, checkpoint_device = load_device_cases(REQUIRED_DEVICE_CASES)
     problems += stale_checkpoint_cases(listing, {**cases, **checkpoint_device})
-    unselected = uncovered(listing, load_inventory(INVENTORY), cases, every_device)
+    inventory = load_inventory(INVENTORY)
+    unselected = uncovered(listing, inventory, cases, every_device)
+    escaped = ungrouped(listing, nextest_listing(gpu_group_filter(NEXTEST_CONFIG)), inventory)
     if problems:
         print("required-checkpoint lists (scripts/required-checkpoint-cases.txt, required-device-cases/checkpoint-*.txt):")
         for problem in problems:
@@ -189,9 +268,14 @@ def check(selections: list[str]) -> int:
         print("of a checkpoint lane's list; an ignored test is a row of a lane's list or is deleted):")
         for problem in unselected:
             print(f"  {problem}")
-    if problems or unselected:
+    if escaped:
+        print("tests a lane selects that the `gpu` test group of .config/nextest.toml does not hold (add the crate, binary")
+        print("or test name to that override's filter; two device tests at once can hang the GPU):")
+        for problem in escaped:
+            print(f"  {problem}")
+    if problems or unselected or escaped:
         return 1
-    print("lane coverage: every device test matches a lane selection, every checkpoint and ignored test is a required row")
+    print("lane coverage: every device test matches a lane selection and the gpu test group, every checkpoint and ignored test is a required row")
     return 0
 
 
@@ -283,6 +367,24 @@ def self_test() -> int:
         if found:
             print(f"self-test: an ignored test listed in {label} was reported: {found}", file=sys.stderr)
             return 1
+
+    # A selected test the gpu group lacks (R2-L13-008): `escapee` dispatches but no group filter holds it.
+    selected = fixture([
+        ("pkg-gpu", "pkg-gpu", "grouped", False, True),
+        ("pkg-gpu", "pkg-gpu", "escapee", False, True),
+        ("pkg", "pkg", "host", False, True),
+        ("pkg", "pkg", "unselected", False, False),
+    ])  # fmt: skip
+    group = fixture([
+        ("pkg-gpu", "pkg-gpu", "grouped", False, True),
+        ("pkg-gpu", "pkg-gpu", "escapee", False, False),
+        ("pkg", "pkg", "host", False, False),
+    ])  # fmt: skip
+    found = ungrouped(selected, group, inventory)
+    if found != ["pkg-gpu  pkg-gpu  escapee"]:
+        print(f"self-test: a selected test outside the gpu group was not the only report (got {found})", file=sys.stderr)
+        return 1
+    print(f"mutation rejected: a selected test outside the gpu group: {found[0]}")
     print("lane coverage self-test: ok")
     return 0
 
@@ -297,8 +399,12 @@ def main(argv: list[str]) -> int:
         _, checkpoint_device = load_device_cases(REQUIRED_DEVICE_CASES)
         print(lane_filter({**cases, **checkpoint_device}, argv[1]))
         return 0
-    if not argv:
-        print("usage: check-lane-coverage.py --self-test | --lane-filter <lane> | <selection>...", file=sys.stderr)
+    usage = "usage: check-lane-coverage.py --self-test | --lane-filter <lane> | <selection>..."
+    if argv in (["--help"], ["-h"]):
+        print(usage)
+        return 0
+    if not argv or any(arg.startswith("-") for arg in argv):
+        print(usage, file=sys.stderr)
         return 2
     return check(argv)
 

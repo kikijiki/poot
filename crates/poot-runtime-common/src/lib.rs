@@ -2,10 +2,12 @@
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod device_skip;
+mod identity;
 mod kernel;
 mod memory;
 pub mod telemetry;
 mod vpu;
+pub use identity::DeviceIdentity;
 pub use kernel::{
     AieArena, AieArtifactError, AieBinding, AieLinkedArtifact, AieShapeAbi, ArgAccess, ArgSchema,
     CompiledKernel, KernelArgError, KernelCode, check_element_schema, check_kernel_args,

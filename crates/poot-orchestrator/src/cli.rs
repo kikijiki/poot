@@ -2,13 +2,46 @@
 
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+use crate::runpod::CloudType;
 
 /// The most `--keep-warm` minutes `exec` accepts: a kept pod bills until its window ends.
 pub(crate) const MAX_KEEP_WARM_MINUTES: u64 = 240;
 
 /// The longest `--max-cmd` `exec` accepts.
 pub(crate) const MAX_CMD_CEILING: Duration = Duration::from_secs(12 * 3600);
+
+/// `--cloud`: which RunPod clouds provisioning may rent from. RunPod itself only knows
+/// [`CloudType`]; `All` is a provisioning policy, not a wire value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CloudChoice {
+    Secure,
+    Community,
+    /// Try SECURE first, then COMMUNITY.
+    All,
+}
+
+impl CloudChoice {
+    /// The clouds to try for one create call, in order.
+    pub(crate) fn tiers(self) -> &'static [CloudType] {
+        match self {
+            CloudChoice::Secure => &[CloudType::Secure],
+            CloudChoice::Community => &[CloudType::Community],
+            CloudChoice::All => &[CloudType::Secure, CloudType::Community],
+        }
+    }
+}
+
+impl std::fmt::Display for CloudChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CloudChoice::Secure => "SECURE",
+            CloudChoice::Community => "COMMUNITY",
+            CloudChoice::All => "ALL",
+        })
+    }
+}
 
 /// A CLI input error surfaced by clap's value parsers (typed, not `anyhow`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -79,7 +112,6 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 // The enum is built once from argv, so the size gap is harmless.
-#[allow(clippy::large_enum_variant)]
 pub(crate) enum Command {
     /// Run (or resume) a sweep: build, provision, setup, sweep, gather, teardown.
     Run(RunArgs),
@@ -143,8 +175,8 @@ pub(crate) struct ExecArgs {
     /// patching, and it carries llc and libvulkan1, which the stock runpod/pytorch image does not.
     #[arg(long, default_value = "ghcr.io/kikijiki/poot-bench:latest")]
     pub(crate) image: String,
-    #[arg(long, default_value = "SECURE")]
-    pub(crate) cloud: String,
+    #[arg(long, value_enum, ignore_case = true, default_value_t = CloudChoice::Secure)]
+    pub(crate) cloud: CloudChoice,
     /// Minimum host CUDA version; expands to RunPod `allowedCudaVersions` (all valid versions >= this).
     /// The default `cu1281` image needs >= 12.8; older-driver hosts fail the nvidia-container-cli
     /// `cuda>=12.8` hook. Empty disables the filter.
@@ -232,8 +264,8 @@ pub(crate) struct RunArgs {
     #[arg(long, default_value = "NVIDIA GeForce RTX 3090,NVIDIA RTX A5000")]
     pub(crate) gpu_types: String,
     /// SECURE by default: COMMUNITY hosts time out mid-pull on the large image.
-    #[arg(long, default_value = "SECURE")]
-    pub(crate) cloud: String,
+    #[arg(long, value_enum, ignore_case = true, default_value_t = CloudChoice::Secure)]
+    pub(crate) cloud: CloudChoice,
     #[arg(long, default_value = "ghcr.io/kikijiki/poot-bench:latest")]
     pub(crate) image: String,
     /// Minimum host CUDA version; expands to RunPod `allowedCudaVersions` (all valid versions >= this).

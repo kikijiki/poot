@@ -13,7 +13,7 @@ use crate::context::{
 use crate::discovery::{
     GpuPicker, PoolState, agent_isa_name, agent_name, agent_vendor, agent_wavefront_size,
     amd_agent_is_apu, amd_agent_memory_avail, amd_agent_product_name, amd_agent_u32_info,
-    amd_pool_size, cpu_to_pool_link_types, enable_device_timing, first_cpu_agent,
+    amd_pool_size, cpu_to_pool_link_types, enable_device_timing, first_cpu_agent, runtime_version,
 };
 use crate::error::check;
 use crate::ffi::{Funcs, Hsa};
@@ -383,6 +383,24 @@ impl RocmContext {
             batch_waits: Arc::default(),
             wait_timeout: options.wait_timeout,
             device_timing,
+        })
+    }
+
+    /// The GPU agent's product name (its agent name when none is reported) and the HSA runtime version it
+    /// runs under with its ISA. `None` if a query fails.
+    pub fn identity(&self) -> Option<poot_runtime_common::DeviceIdentity> {
+        // SAFETY: discovery contract: the context keeps its runtime initialized.
+        let (adapter, version) = unsafe {
+            let product = amd_agent_product_name(&self.hsa.funcs, self.gpu_agent);
+            let adapter = match product {
+                Some(product) => product,
+                None => agent_name(&self.hsa.funcs, self.gpu_agent).ok()?,
+            };
+            (adapter, runtime_version(&self.hsa.funcs).ok()?)
+        };
+        Some(poot_runtime_common::DeviceIdentity {
+            adapter,
+            driver: format!("hsa {}.{} {}", version.0, version.1, self.isa_name),
         })
     }
 

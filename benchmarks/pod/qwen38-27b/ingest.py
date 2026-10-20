@@ -33,7 +33,7 @@ def read_env(path):
 
 
 def driver_cuda(sweep, env):
-    """The image has no nvcc, so image_cuda is empty: fall back to the driver's CUDA version from nvidia-smi."""
+    """image_cuda is empty when the image has no nvcc (older images): fall back to the driver's CUDA version from nvidia-smi."""
     if env.get("driver_cuda"):
         return env["driver_cuda"].replace("CUDA Version: ", "")
     for line in (sweep / "nvidia-smi-q.txt").read_text().splitlines():

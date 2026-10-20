@@ -18,6 +18,7 @@ def schema_errors(value, schema, path="$", root_schema=None):
     errors = []
     type_matches = {
         "array": lambda item: isinstance(item, list),
+        "boolean": lambda item: isinstance(item, bool),
         "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
         "number": lambda item: (
             isinstance(item, (int, float))

@@ -231,7 +231,7 @@ pub(crate) fn map_unary(site: Site<'_>, op: GUnOp) -> Result<UnaryOp, PlanError>
 /// The one GPU finalizer: shape the launch of `planned`, then check every kernel it dispatches against
 /// `caps`. Takes the plan by `&mut` so the launch-owning families run it at their own tail while the
 /// dispatcher runs it after its match. An AIE target finalizes through [`finalize_aie`].
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn finalize(
     planned: &mut Planned,
     g: GraphTables<'_>,
@@ -728,7 +728,7 @@ fn validate_planned_resources(
 /// Shape the launch of a planned equation: the wgpu grid-cap workgroup bump, the elementwise 2-D fold
 /// override, and the typed E4M3FN packed-dispatch ceiling check. A bump changes the body the plan's
 /// key names, so it also changes the key.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn shape_launch(
     planned: &mut Planned,
     g: GraphTables<'_>,

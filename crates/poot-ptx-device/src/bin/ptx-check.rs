@@ -8,8 +8,10 @@
 //!
 //! Usage: `ptx-check <DIR>` where DIR holds `add.ptx`, `square.ptx`, `matmul.ptx`, ...
 
+use std::cell::{Cell, RefCell};
+
 use poot_ptx_runtime::PtxContext;
-use poot_runtime_common::{ArgAccess, ArgSchema, CompiledKernel, KernelCode};
+use poot_runtime_common::{ArgAccess, ArgSchema, CompiledKernel, DeviceBackend, KernelCode};
 use poot_target::{Backend, ElementKind, TargetId};
 
 /// Wrap a poot-codegen-emitted `.ptx` file's text as a dispatchable [`CompiledKernel`] (card 608's
@@ -58,13 +60,14 @@ fn main() {
     }
 
     let ctx = PtxContext::new().expect("init PtxContext (libcuda present?)");
+    let fixtures = Fixtures::new(&dir);
     let mut failures = 0;
 
     // Base fixtures (add/square/matmul/exp/silu/reduce/bcast/gather/dus): each is individually
-    // exists()-gated so a partial PTX dir prints a SKIP line instead of panicking; a staged but
+    // staged-gated (`Fixtures`) so a partial PTX dir prints a SKIP line instead of panicking; a staged but
     // wrong fixture still runs and can still fail the check.
     // add: c = a + b
-    if maybe_skip(&dir, "add") {
+    if fixtures.staged("add") {
         {
             let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
             let b: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0];
@@ -84,7 +87,7 @@ fn main() {
         }
     }
     // square: y = x * x
-    if maybe_skip(&dir, "square") {
+    if fixtures.staged("square") {
         {
             let x: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
             let n = x.len();
@@ -103,7 +106,7 @@ fn main() {
         }
     }
     // matmul: C[2,3] = A[2,4] @ B[4,3] (2D grid: x = N cols, y = M rows; 16x16 block).
-    if maybe_skip(&dir, "matmul") {
+    if fixtures.staged("matmul") {
         {
             let (m, n, k) = (2usize, 3, 4);
             let a: Vec<f32> = (0..m * k).map(|i| i as f32).collect();
@@ -133,7 +136,7 @@ fn main() {
     }
 
     // generated kernels (from kernelgen): exercise the NVPTX emitter paths.
-    if maybe_skip(&dir, "exp") {
+    if fixtures.staged("exp") {
         let x: Vec<f32> = vec![0.0, 1.0, -1.0, 2.0];
         let e = run(&ctx, &dir, "exp", "exp", &[&x], 4, [64, 1, 1], [4, 1, 1]);
         report_close(
@@ -144,7 +147,7 @@ fn main() {
             &mut failures,
         );
     }
-    if maybe_skip(&dir, "silu") {
+    if fixtures.staged("silu") {
         let x: Vec<f32> = vec![0.0, 1.0, -1.0, 2.0];
         let s = run(&ctx, &dir, "silu", "silu", &[&x], 4, [64, 1, 1], [4, 1, 1]);
         report_close(
@@ -155,7 +158,7 @@ fn main() {
             &mut failures,
         );
     }
-    if maybe_skip(&dir, "reduce") {
+    if fixtures.staged("reduce") {
         // reduce_last sum over cols=4, 2 rows.
         let xr: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
         let r = run(
@@ -171,7 +174,7 @@ fn main() {
         report("reduce", &r, &[10.0, 100.0], &mut failures);
     }
     // broadcast [3] -> [2,3]
-    if maybe_skip(&dir, "bcast") {
+    if fixtures.staged("bcast") {
         let bias: Vec<f32> = vec![10.0, 20.0, 30.0];
         let b = run(
             &ctx,
@@ -191,7 +194,7 @@ fn main() {
         );
     }
     // gather_axis0: data[3,2], index[2,0,1]
-    if maybe_skip(&dir, "gather") {
+    if fixtures.staged("gather") {
         let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let index: Vec<f32> = vec![2.0, 0.0, 1.0];
         let g = run(
@@ -208,7 +211,7 @@ fn main() {
     }
     // DynamicUpdateSlice (KV slot write): operand[2,4,3]=0..24, write update[2,1,3] at slot idx=2
     // on axis 1; slot 2 (flat 6..9 and 18..21) is overwritten, the rest preserved.
-    if maybe_skip(&dir, "dus") {
+    if fixtures.staged("dus") {
         let operand: Vec<f32> = (0..24).map(|i| i as f32).collect();
         let update: Vec<f32> = vec![100.0, 200.0, 300.0, 400.0, 500.0, 600.0];
         let dus = run(
@@ -229,7 +232,7 @@ fn main() {
 
     // Kernels authored in ordinary Rust and compiled by pootc (Stable MIR -> Body -> PTX), if staged.
     // Entry names are the mangled `__poot_kernel_*`.
-    if std::path::Path::new(&format!("{dir}/imported_add.ptx")).exists() {
+    if fixtures.staged("imported_add") {
         let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let b: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0];
         let c = run(
@@ -278,7 +281,7 @@ fn main() {
 
     // Imported kernels on the PTX path: the decode GEMV (+ bias), the on-device argmax, and the coarsened
     // tiled GEMM. Shapes mirror the wgpu import_run tests. Each block runs only if its .ptx is staged.
-    if std::path::Path::new(&format!("{dir}/gemv.ptx")).exists() {
+    if fixtures.staged("gemv") {
         // decode GEMV: out[col] = sum_k x[k] * w[k*N+col]. 128 lanes/output (one block per output column).
         let (k, n) = (4usize, 8usize);
         let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1 - 0.2).collect();
@@ -298,7 +301,7 @@ fn main() {
             .collect();
         report_close("imported_gemv", &got, &want, 1e-5, &mut failures);
     }
-    if std::path::Path::new(&format!("{dir}/gemv_bias.ptx")).exists() {
+    if fixtures.staged("gemv_bias") {
         let (k, n) = (4usize, 8usize);
         let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1 - 0.2).collect();
         let w: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.05 - 0.3).collect();
@@ -318,7 +321,7 @@ fn main() {
             .collect();
         report_close("imported_gemv_bias", &got, &want, 1e-5, &mut failures);
     }
-    if std::path::Path::new(&format!("{dir}/argmax.ptx")).exists() {
+    if fixtures.staged("argmax") {
         // on-device greedy argmax: 64 lanes scan the logits, lane 0 writes the winning index into out[0].
         let vocab = 64usize;
         let mut logits: Vec<f32> = (0..vocab).map(|i| (i as f32) * 0.01).collect();
@@ -335,7 +338,7 @@ fn main() {
         );
         report("imported_argmax", &got, &[42.0], &mut failures);
     }
-    if std::path::Path::new(&format!("{dir}/tiled_gemm.ptx")).exists() {
+    if fixtures.staged("tiled_gemm") {
         // coarsened tiled GEMM: C[M,N] = A[M,K] @ B[K,N], dims = [M,K,N,offset]. One TSxTS tile per block,
         // 64 lanes; grid = ceil(M/16)*ceil(N/8) blocks. M=16,K=8,N=8 -> 1 tile.
         let (m, k, n) = (16usize, 8usize, 8usize);
@@ -365,7 +368,7 @@ fn main() {
 
     // Attention decode: the generated online-softmax kernel, 4 lanes per head. Dims match the staged kernel
     // (Hq=4, n_rep=2, 6 keys, D=8); compared to the textbook two-pass attention.
-    if std::path::Path::new(&format!("{dir}/attention_decode.ptx")).exists() {
+    if fixtures.staged("attention_decode") {
         let (hq, n_rep, cap, d, lanes) = (4usize, 2usize, 6usize, 8usize, 4usize);
         let hkv = hq / n_rep;
         let scale = 0.35355338f32;
@@ -389,18 +392,22 @@ fn main() {
         report_close("attention_decode", &got, &want, 1e-4, &mut failures);
     }
 
-    if failures == 0 {
-        println!("ALL PTX CHECKS PASSED");
-    } else {
-        eprintln!("{failures} PTX CHECK(S) FAILED");
-        std::process::exit(1);
+    match fixtures.verdict(
+        failures,
+        DeviceBackend::Ptx.required(|name| std::env::var(name).ok()),
+    ) {
+        Ok(summary) => println!("{summary}"),
+        Err(reason) => {
+            eprintln!("{reason}");
+            std::process::exit(1);
+        }
     }
 }
 
 /// Load `<dir>/<file>.ptx`, dispatch `entry` through the PtxContext with read-only `inputs` (uploaded)
 /// and one writable output of `out_len` (allocated), and return the output. `label` names it for the
 /// profiler + the per-kernel device-time line.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn run(
     ctx: &PtxContext,
     dir: &str,
@@ -439,7 +446,7 @@ fn run(
 /// Like [`run`], but binds an extra `u32` metadata buffer (e.g. a tiled GEMM's `dims = [M,K,N,offset]`)
 /// between the f32 data inputs and the output - the imported shape-generic kernels read their shape from it.
 /// Uploaded via `upload_i32` (the bytes are identical for the small non-negative dims).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn run_dims(
     ctx: &PtxContext,
     dir: &str,
@@ -494,7 +501,7 @@ fn det_fill(n: usize, seed: u64) -> Vec<f32> {
 }
 
 /// The textbook two-pass decode attention: `softmax(scale * q.k + mask) @ v` per head, GQA `kv = h / n_rep`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn attention_decode_ref(
     q: &[f32],
     k: &[f32],
@@ -636,42 +643,145 @@ fn graph_probe(dir: &str) -> i32 {
     }
 }
 
-/// True when `{dir}/{label}.ptx` is staged; prints a SKIP line and returns false when missing so a
-/// partial PTX dir checks only what is present instead of panicking. A staged fixture still runs and
-/// can still fail the check.
-fn maybe_skip(dir: &str, label: &str) -> bool {
-    if std::path::Path::new(&format!("{dir}/{label}.ptx")).exists() {
-        true
-    } else {
-        println!("  {label}: SKIP (not staged)");
-        false
+/// The `.ptx` fixtures one run looks for in its directory: which were staged, which were not.
+///
+/// A check that ran nothing is not a pass: [`Fixtures::verdict`] fails a run that found no staged fixture, and
+/// fails one that lacks any fixture when the PTX backend is required (`POOT_REQUIRE_PTX=1`, set by `just
+/// test-device-ptx`). Without the requirement a partial directory checks what is present and reports the rest as
+/// skipped, as a developer staging one kernel wants.
+struct Fixtures<'a> {
+    dir: &'a str,
+    staged: Cell<u32>,
+    missing: RefCell<Vec<String>>,
+}
+
+impl<'a> Fixtures<'a> {
+    fn new(dir: &'a str) -> Self {
+        Self {
+            dir,
+            staged: Cell::new(0),
+            missing: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// True when `{dir}/{label}.ptx` is staged. A missing one prints a SKIP line and is remembered for
+    /// [`Self::verdict`]. A staged fixture runs and can still fail the check.
+    fn staged(&self, label: &str) -> bool {
+        if std::path::Path::new(&format!("{}/{label}.ptx", self.dir)).exists() {
+            self.staged.set(self.staged.get() + 1);
+            true
+        } else {
+            println!("  {label}: SKIP (not staged)");
+            self.missing.borrow_mut().push(label.to_string());
+            false
+        }
+    }
+
+    /// The run's outcome once every fixture was looked for: `Ok` with the summary line, or `Err` with the reason it
+    /// is not a pass.
+    fn verdict(&self, failures: u32, required: bool) -> Result<String, String> {
+        let staged = self.staged.get();
+        let missing = self.missing.borrow();
+        if failures > 0 {
+            return Err(format!("{failures} PTX CHECK(S) FAILED"));
+        }
+        if staged == 0 {
+            return Err(format!(
+                "no fixture staged in {}: nothing was checked ({} looked for)",
+                self.dir,
+                missing.len()
+            ));
+        }
+        if required && !missing.is_empty() {
+            return Err(format!(
+                "POOT_REQUIRE_PTX=1 and {} fixture(s) not staged in {}: {}",
+                missing.len(),
+                self.dir,
+                missing.join(", ")
+            ));
+        }
+        Ok(format!(
+            "ALL PTX CHECKS PASSED ({staged} fixtures run, {} skipped)",
+            missing.len()
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::maybe_skip;
+    use super::Fixtures;
+
+    fn stage(name: &str, files: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ptx-check-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in files {
+            std::fs::write(dir.join(format!("{file}.ptx")), "// fake ptx for gate test").unwrap();
+        }
+        dir
+    }
 
     #[test]
     fn missing_fixture_is_skipped_not_run() {
-        let dir = std::env::temp_dir().join(format!("ptx-check-missing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let d = dir.to_str().unwrap();
-        assert!(!maybe_skip(d, "add"));
-        assert!(!maybe_skip(d, "matmul"));
+        let dir = stage("missing", &[]);
+        let fixtures = Fixtures::new(dir.to_str().unwrap());
+        assert!(!fixtures.staged("add"));
+        assert!(!fixtures.staged("matmul"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn staged_fixture_is_run_not_skipped() {
-        let dir = std::env::temp_dir().join(format!("ptx-check-present-{}", std::process::id()));
+        let dir = stage("present", &["add"]);
+        let fixtures = Fixtures::new(dir.to_str().unwrap());
+        assert!(fixtures.staged("add"));
+        assert!(!fixtures.staged("square"));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("add.ptx"), "// fake ptx for gate test").unwrap();
-        let d = dir.to_str().unwrap();
-        assert!(maybe_skip(d, "add"));
-        assert!(!maybe_skip(d, "square"));
+    }
+
+    /// A directory with no fixture is a failed check, required or not (SC-003 of card 1218).
+    #[test]
+    fn a_directory_with_no_fixture_is_not_a_pass() {
+        let dir = stage("empty", &[]);
+        let fixtures = Fixtures::new(dir.to_str().unwrap());
+        assert!(!fixtures.staged("add"));
+        for required in [false, true] {
+            let error = fixtures.verdict(0, required).unwrap_err();
+            assert!(error.contains("no fixture staged"), "{error}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A partial directory passes unless the backend is required, in which case the missing fixtures fail it.
+    #[test]
+    fn a_partial_directory_fails_only_when_ptx_is_required() {
+        let dir = stage("partial", &["add"]);
+        let fixtures = Fixtures::new(dir.to_str().unwrap());
+        assert!(fixtures.staged("add"));
+        assert!(!fixtures.staged("square"));
+        assert!(
+            fixtures
+                .verdict(0, false)
+                .unwrap()
+                .contains("1 fixtures run, 1 skipped")
+        );
+        let error = fixtures.verdict(0, true).unwrap_err();
+        assert!(
+            error.contains("POOT_REQUIRE_PTX=1") && error.contains("square"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_comparison_fails_the_run() {
+        let dir = stage("failed", &["add"]);
+        let fixtures = Fixtures::new(dir.to_str().unwrap());
+        assert!(fixtures.staged("add"));
+        assert_eq!(
+            fixtures.verdict(2, false).unwrap_err(),
+            "2 PTX CHECK(S) FAILED"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -9,6 +9,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from performance_receipt import PREPARATION_LAYERS  # noqa: E402
 
 BUILD_SHA = "0123456789abcdef0123456789abcdef01234567"
+CHECKPOINT_DIGEST = "blake3:" + "ab" * 32
+
+# What a repository-built runner states beyond its timing: the build (sha, profile, features, compiler), the
+# adapter and driver the executor reported, the digest of the loaded weights and the compute dtype.
+POOT_IDENTITY = {
+    "build_sha": BUILD_SHA,
+    "build_profile": "release",
+    "build_features": "",
+    "rustc_version": "rustc 1.101.0-nightly (fixture)",
+    "adapter": "Fixture GPU",
+    "driver_version": "fixture-driver 1.0",
+    "checkpoint_digest": CHECKPOINT_DIGEST,
+    "compute_dtype": "f32",
+}
 
 OPTIONAL_OBSERVER_FIELDS = (
     "peak_vram_bytes",
@@ -98,8 +112,9 @@ def valid_single():
     return {
         "framework": "poot",
         "framework_version": "fixture-1",
-        "build_sha": BUILD_SHA,
+        **POOT_IDENTITY,
         "family": "qwen2",
+        "profiled": False,
         "backend": "ptx",
         "precision": "bf16",
         "prompt_tokens": 3,
@@ -133,8 +148,9 @@ def valid_curve():
     return {
         "framework": "poot",
         "framework_version": "fixture-1",
-        "build_sha": BUILD_SHA,
+        **POOT_IDENTITY,
         "family": "qwen2",
+        "profiled": False,
         "backend": "ptx",
         "precision": "bf16",
         "mode": "decode-curve",
@@ -153,6 +169,7 @@ def row_level_single(framework):
     """What a runner that claims row-level timing only reports: medians, no per-request boundaries."""
     return {
         "framework": framework,
+        "framework_version": "fixture-1",
         "precision": "bf16",
         "backend": "cuda",
         "prompt_tokens": 3,
@@ -179,6 +196,7 @@ def row_level_curve(framework):
 
     return {
         "framework": framework,
+        "framework_version": "fixture-1",
         "precision": "bf16",
         "backend": "cuda",
         "mode": "decode-curve",

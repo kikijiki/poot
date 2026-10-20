@@ -6,6 +6,10 @@ Subcommands:
   run      Run the matrix (or a filtered subset), wrap each runner with the external observer,
            write env.json + results.jsonl + report.md under a timestamped run directory.
   report   Render a committed run directory to a markdown comparison table (pure stdlib, no GPU).
+  compare-committed
+           The same comparison with the last committed set of each cell as the baseline (`just bench-compare`).
+           With no candidate the committed set is compared with itself, which proves it is a verifiable
+           baseline: enough repeats, one binary, a band narrow enough to exclude a practical loss.
   compare  Diff a baseline against a candidate (each one or more run directories, ideally NOISE_REPEATS
            repeats of the same matrix), cell by cell. A cell is (model, scenario, framework, backend,
            device); each is judged on every required pair (headline and every curve point) by
@@ -46,8 +50,9 @@ except ModuleNotFoundError:  # pragma: no cover
 try:
     from . import performance_receipt as receipts
     from .result_contract import (
-        BUILD_IDENTITY_FRAMEWORKS,
+        BUILD_IDENTITY_FIELDS,
         CURVE_KIND,
+        MEASUREMENT_IDENTITY_FIELDS,
         ResultValidationError,
         runner_refusal,
         timing_claim,
@@ -56,8 +61,9 @@ try:
 except ImportError:  # direct `python harness/bench.py` execution
     import performance_receipt as receipts
     from result_contract import (
-        BUILD_IDENTITY_FRAMEWORKS,
+        BUILD_IDENTITY_FIELDS,
         CURVE_KIND,
+        MEASUREMENT_IDENTITY_FIELDS,
         ResultValidationError,
         runner_refusal,
         timing_claim,
@@ -65,6 +71,9 @@ except ImportError:  # direct `python harness/bench.py` execution
     )
 
 FRAMEWORKS = ["poot", "candle", "transformers", "vllm", "llamacpp"]
+
+# Under results/: the profiled (`--diagnostic`) runs. Nothing that reads the committed results enters it.
+DIAGNOSTICS_DIR = "diagnostics"
 
 
 # --------------------------------------------------------------------------------------------------
@@ -136,6 +145,9 @@ def capture_env(manifest_path):
         "gpu_driver": gpu_driver,
         "gpu_memory_total": gpu_total,
         "cuda_version": sh(["bash", "-lc", "nvcc --version 2>/dev/null | grep -oE 'release [0-9.]+' | head -1"]),
+        # The pre-baked bench image is tagged `latest`, so its digest is the version of every baseline in it.
+        # The pod sets it; a run outside the image records none.
+        "image_digest": os.environ.get("POOT_BENCH_IMAGE_DIGEST"),
         "host_kernel": sh(["uname", "-r"]),
         "cpu": sh(["bash", "-lc", "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2"]),
         "manifest": str(manifest_path),
@@ -209,11 +221,13 @@ def _curve_progress(fw, isls):
 
 
 def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, overrides=None,
-             device=None):
+             device=None, diagnostic=False):
     """Run one cell and return its result row.
 
     `device` names the accelerator the cell runs on (env capture); it and the backend are part of the row's
-    identity, so a compare never merges cells that ran on different ones.
+    identity, so a compare never merges cells that ran on different ones. `diagnostic` runs the poot runner
+    with device timing (`--profile`): the row then carries `device_time` and `profiled: true`, and is evidence
+    of where time goes, never of throughput (device timing perturbs submission).
     """
     base = {
         "framework": fw,
@@ -249,12 +263,19 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
         "backend": os.environ.get("POOT_BENCH_BACKEND", "ptx"),
     }
     cmd = resolve_cmd(runners[fw], subst)
-    # Attribution: the digest of the executable that is about to run, read from the file itself.
-    base["binary_sha256"] = binary_sha256(resolve_binary(runners[fw]))
+    # Attribution: a repository-built runner is the binary under test, so the digest of the executable that is
+    # about to run is part of its row. An external tool runs through an interpreter whose digest says nothing
+    # about the tool: its row carries the version the tool reports instead (`framework_version`).
+    if fw in receipts.BUILD_IDENTITY_FRAMEWORKS:
+        base["binary_sha256"] = binary_sha256(resolve_binary(runners[fw]))
     base["device"] = device
-    requested_backend = subst["backend"] if fw in BUILD_IDENTITY_FRAMEWORKS else None
+    requested_backend = subst["backend"] if fw in receipts.BUILD_IDENTITY_FRAMEWORKS else None
     if requested_backend is not None:
         base["backend"] = requested_backend
+    if diagnostic:
+        if fw not in receipts.BUILD_IDENTITY_FRAMEWORKS:
+            raise ValueError(f"--diagnostic times the device through {sorted(receipts.BUILD_IDENTITY_FRAMEWORKS)} only, not {fw}")
+        cmd.append("--profile")
     curve = is_curve(scen)
     on_line = None
     if curve:
@@ -296,7 +317,7 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
         )
     if refusal is not None:
         row = {**base, "status": "unsupported", "reason": refusal, "caveats": caveats}
-        for key in ("build_sha", "family"):
+        for key in (*BUILD_IDENTITY_FIELDS, "family"):
             if key in timing:
                 row[key] = timing[key]
         return row
@@ -320,8 +341,8 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
 
     row = {**base, "status": "ok", "timing_claim": timing_claim(fw)}
     # Timing fields come from the runner; copy only the schema-known keys for this scenario.
-    timing_fields = ["framework_version", "build_sha", "family", "backend", "self_reported_vram_bytes",
-                     "preparation"]
+    timing_fields = [*BUILD_IDENTITY_FIELDS, *MEASUREMENT_IDENTITY_FIELDS, "framework_version", "family",
+                     "engine", "profiled", "driver", "backend", "self_reported_vram_bytes", "preparation"]
     if not curve:
         timing_fields += [
             "prompt_tokens", "gen_tokens", "ttft_ms", "tpot_ms", "e2e_ms",
@@ -446,6 +467,8 @@ def cmd_matrix(args):
 def cmd_run(args):
     if args.repeats < 1:
         sys.exit("bench run: --repeats must be at least 1")
+    if args.diagnostic and (args.repeats != 1 or args.framework != "poot"):
+        sys.exit("bench run: --diagnostic is one profiled run of the poot runner (--framework poot, --repeats 1)")
     manifest = load_toml(args.manifest)
     runners = load_toml(args.runners)
     suite = manifest.get("suite", {})
@@ -456,10 +479,16 @@ def cmd_run(args):
 
     sys.path.insert(0, str(HERE))  # so run_cell can import observer
     results_root = Path(args.results_dir or (BENCH_ROOT / "results"))
+    if args.diagnostic:
+        # Device timing perturbs submission: a profiled row is stored where `index`, `compare` and the
+        # committed-set check never read it.
+        results_root = results_root / DIAGNOSTICS_DIR
     run_id = args.run_id
     for repeat in range(1, args.repeats + 1):
         env = capture_env(args.manifest)
-        run_id = run_id or _default_run_id(env, args.model)
+        # A poot-only run names its backend: two backends on one machine are two sets of the same date and model.
+        backend = os.environ.get("POOT_BENCH_BACKEND", "ptx") if args.framework == "poot" else None
+        run_id = run_id or _default_run_id(env, args.model, backend)
         # One repeat is the run itself. Several are one run directory each (`<run-id>-r1` ...): each is a valid
         # input to `compare`, which counts one run per repeat of a cell.
         repeat_id = run_id if args.repeats == 1 else f"{run_id}-r{repeat}"
@@ -489,7 +518,8 @@ def _run_matrix(args, manifest, runners, suite, models_dir, env, run_dir):
             row = run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite,
                            interval_ms=args.sample_interval_ms, device=env["gpu_name"],
                            overrides={"gen_tokens": args.gen_tokens, "warmup": args.warmup,
-                                      "iters": args.iters})
+                                      "iters": args.iters},
+                           diagnostic=args.diagnostic)
             out.write(json.dumps(row) + "\n")
             out.flush()
             rows.append(row)
@@ -504,7 +534,7 @@ def _run_matrix(args, manifest, runners, suite, models_dir, env, run_dir):
     print(report)
 
 
-def _default_run_id(env, model=None):
+def _default_run_id(env, model=None, backend=None):
     captured = env.get("captured_at_utc") or ""
     date = captured[:10] or "undated"
     # The time of day keeps repeated runs of one matrix (a compare needs several) in distinct directories.
@@ -512,7 +542,7 @@ def _default_run_id(env, model=None):
     gpu = re.sub(r"[^a-z0-9]+", "-", (env.get("gpu_name") or "nogpu").lower()).replace("nvidia-", "").strip("-")
     # Include the model for single-model sweeps (the orchestrator runs one `bench run` per model) so runs
     # do not overwrite one date-gpu-clock dir.
-    mid = (model or "").replace("/", "-").replace(".", "-")
+    mid = "-".join(part for part in ((model or "").replace("/", "-").replace(".", "-"), backend) if part)
     return f"{date}-{gpu}-{mid}-{clock}" if mid else f"{date}-{gpu}-{clock}"
 
 
@@ -583,8 +613,7 @@ def render_index(runs):
                      if poot and best and best[1]["decode_tok_s"] else "-")
             date = _run_date(env)
             behind = str((newest - date).days) if date and newest else "-"
-            # Snapshots from before rows carried `build_sha` recorded the commit in env.json.
-            commit = (poot.get("build_sha") or env.get("poot_git_sha")) if poot else None
+            commit = poot.get("build_sha") if poot else None
             out.append(
                 f"| {run_id} | {date or ''} | {behind} | {(poot.get('backend') or '-') if poot else '-'} | "
                 f"{_short_sha(commit)} | "
@@ -611,6 +640,49 @@ def cmd_compare(args):
     rows_b = [row for run_dir in args.candidate for row in _load_rows(run_dir)]
     cells = compare_cells(rows_a, rows_b, receipts.load_policy(args.manifest))
     print(render_compare(args.baseline, args.candidate, cells))
+    return compare_exit_code(cells)
+
+
+def committed_sets(results_dir):
+    """The committed run directories grouped into sets, oldest first: one set is the repeats of one run id
+    (`<run-id>-r1` ... `<run-id>-rN`), or the single directory of a run with one repeat. The diagnostics
+    directory holds no `results.jsonl` of its own and is never a set."""
+    sets = {}
+    for run_dir in sorted(Path(results_dir).iterdir()):
+        if run_dir.is_dir() and (run_dir / "results.jsonl").is_file():
+            sets.setdefault(_REPEAT_SUFFIX.sub("", run_dir.name), []).append(run_dir)
+    return dict(sorted(sets.items()))
+
+
+_REPEAT_SUFFIX = re.compile(r"-r\d+$")
+
+
+def last_committed_set(results_dir):
+    """The baseline of `bench compare-committed`: for every cell, the newest committed set that ran it.
+
+    Returns (run directories, rows). A cell re-recorded later replaces the older set's rows, so a stale
+    binary is never mixed into the band of a newer one.
+    """
+    sets = committed_sets(results_dir)
+    rows_of = {name: [row for run_dir in dirs for row in _load_rows(run_dir)] for name, dirs in sets.items()}
+    newest = {}
+    for name, rows in rows_of.items():
+        for row in rows:
+            newest[cell_key(row)] = name
+    chosen = [name for name in sets if name in set(newest.values())]
+    rows = [row for name in chosen for row in rows_of[name] if newest[cell_key(row)] == name]
+    return [d for name in chosen for d in sets[name]], rows
+
+
+def cmd_compare_committed(args):
+    results_dir = Path(args.results_dir or (BENCH_ROOT / "results"))
+    baseline_dirs, baseline_rows = last_committed_set(results_dir)
+    if not baseline_rows:
+        sys.exit(f"bench compare-committed: no committed run under {results_dir}")
+    candidate_dirs = [Path(d) for d in args.candidate] or baseline_dirs
+    candidate_rows = [row for run_dir in candidate_dirs for row in _load_rows(run_dir)]
+    cells = compare_cells(baseline_rows, candidate_rows, receipts.load_policy(args.manifest))
+    print(render_compare(baseline_dirs, candidate_dirs, cells))
     return compare_exit_code(cells)
 
 
@@ -700,10 +772,14 @@ def _compare_cell(key, rows_a, rows_b, policy):
     for side, ok in (("baseline", ok_a), ("candidate", ok_b)):
         if len({r.get("binary_sha256") for r in ok}) > 1:
             return settle(receipts.UNVERIFIED, f"the {side} runs mix binaries")
+        identities = [receipts.row_identity(r) for r in ok]
+        mixed = [f for f in receipts.row_identity_fields(key[2]) if len({repr(i[f]) for i in identities}) > 1]
+        if mixed:
+            return settle(receipts.UNVERIFIED, f"the {side} runs differ in {', '.join(mixed)}")
 
     baseline, candidate = receipts.rows_receipt(rows_a, policy), receipts.rows_receipt(rows_b, policy)
     report = receipts.compare_receipts(
-        baseline, candidate, receipts.rows_spec(baseline, policy), policy, fields=receipts.ROW_IDENTITY_FIELDS
+        baseline, candidate, receipts.rows_spec(baseline, policy), policy, fields=receipts.row_identity_fields(key[2])
     )
     if report["verdict"] == receipts.INCOMPARABLE:
         fields = ", ".join(f"{field} ({why})" for field, why in report["identity_mismatches"])
@@ -888,6 +964,9 @@ def main():
     r.add_argument("--repeats", type=int, default=1, metavar="N",
                    help="run the whole matrix N times, one run directory per repeat (`<run-id>-r1` ...); "
                         f"`compare` needs {NOISE_REPEATS} repeats of a side")
+    r.add_argument("--diagnostic", action="store_true",
+                   help="run the poot runner with device timing (--profile) and store the run under "
+                        "results/diagnostics/: where the time goes, never throughput evidence")
     r.add_argument("--skip-unsupported", action="store_true",
                    help="omit unsupported cells instead of recording them")
     r.add_argument("--sample-interval-ms", type=float, default=50.0)
@@ -906,6 +985,14 @@ def main():
     c.add_argument("--candidate", nargs="+", required=True, metavar="RUN_DIR",
                    help=f"run directories of the candidate: repeats of one matrix, at least {NOISE_REPEATS}")
     c.set_defaults(func=cmd_compare)
+
+    cc = sub.add_parser("compare-committed",
+                        help="compare candidate runs (default: the committed set itself) against the last "
+                             "committed set of each cell (exit 1: regression, 2: unverified)")
+    cc.add_argument("--results-dir")
+    cc.add_argument("--candidate", nargs="*", default=[], metavar="RUN_DIR",
+                    help=f"run directories of the candidate: repeats of one matrix, at least {NOISE_REPEATS}")
+    cc.set_defaults(func=cmd_compare_committed)
 
     ix = sub.add_parser("index", help="regenerate results/INDEX.md from all snapshots (progress view)")
     ix.add_argument("--results-dir")

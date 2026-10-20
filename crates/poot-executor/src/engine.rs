@@ -14,7 +14,7 @@
 //! abort poisons the whole engine (`Device::abort` itself can never run again once poisoned - one
 //! engine drives one device, so there is nothing left to recover).
 
-use poot_runtime_common::{BufferRole, VpuBinding, VpuGraphArtifact, VpuLayer};
+use poot_runtime_common::{BufferRole, DeviceIdentity, VpuBinding, VpuGraphArtifact, VpuLayer};
 use std::collections::HashMap;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::ops::Range;
@@ -2609,7 +2609,7 @@ impl<D: Device> Engine<D> {
     /// `device_label` only for a sampled step - counters-only mode (or a step `consume_sample_
     /// decision` skips) costs only the cumulative-counter update below, as the type's own doc
     /// already claimed.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn record_step_timing(
         &mut self,
         exe: ExecutableId,
@@ -3055,12 +3055,17 @@ impl<D: Device> Executor for Engine<D> {
         self.device.free_memory_bytes()
     }
 
+    fn device_identity(&self) -> Option<DeviceIdentity> {
+        self.device.identity()
+    }
+
     fn load_weights(
         &mut self,
         store: Arc<WeightStore>,
         weights: Arc<WeightMap>,
     ) -> Result<ExecutableId, ExecError> {
         self.check_not_poisoned()?;
+        weights.check_store(&store).map_err(LoadError::from)?;
         self.executables.push(Some(Loaded {
             binder: WeightBinder::new(store, weights),
             weights: Vec::new(),
@@ -4069,8 +4074,8 @@ mod weight_source_tests {
     };
     use poot_quant::format::WeightFormat;
     use poot_quant::weights::{
-        AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole,
-        WeightView,
+        AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightKey, WeightMap,
+        WeightMapError, WeightRole, WeightView,
     };
     use poot_quant::{PackedPayload, SourceRole, StoredBytes};
     use poot_runtime_common::MemoryCounters;
@@ -4342,6 +4347,69 @@ mod weight_source_tests {
             unbound(engine.add_entry(exe, &program)),
             (missing, "b".to_string())
         );
+    }
+
+    fn weight_map_refusal(result: Result<ExecutableId, ExecError>) -> WeightMapError {
+        match result {
+            Err(ExecError::Load(error)) => match *error {
+                LoadError::WeightMap(error) => error,
+                other => panic!("expected WeightMap, got {other}"),
+            },
+            Err(other) => panic!("expected WeightMap, got {other}"),
+            Ok(_) => panic!("the weights loaded"),
+        }
+    }
+
+    /// POOT-1292: a map built against one store and loaded with another that lacks a key the map reads is
+    /// a typed refusal at `load_weights` naming the weight and the key, not a panic in the embed gather.
+    ///
+    /// Mutation: delete the `check_store` call in `Engine::load_weights`; the weights load and this row
+    /// goes red.
+    #[test]
+    fn load_weights_refuses_a_store_missing_a_key_the_map_reads() {
+        let mut engine = Engine::new(Recorder::default());
+        let embed = WeightId::model(WeightRole::Embed);
+        let built = store(vec![("w.embed", f32_entry(vec![N, K], 2))]);
+        let mapped = map(&built, vec![(embed, WeightView::Stored("w.embed".into()))]);
+        let forged = store(vec![("w.other", f32_entry(vec![N, K], 2))]);
+        assert_eq!(
+            weight_map_refusal(engine.load_weights(forged, mapped)),
+            WeightMapError::Missing {
+                id: embed,
+                key: "w.embed".into()
+            }
+        );
+    }
+
+    /// POOT-1292: a store whose entry under a mapped key is smaller than the map's shape is a typed
+    /// refusal naming both shapes, not a slice panic when the embed rows are read.
+    ///
+    /// Mutation: in `WeightMap::check_store`, skip the comparison against the recorded handle; the
+    /// weights load and this row goes red.
+    #[test]
+    fn load_weights_refuses_a_store_entry_smaller_than_the_mapped_shape() {
+        let mut engine = Engine::new(Recorder::default());
+        let embed = WeightId::model(WeightRole::Embed);
+        let built = store(vec![("w.embed", f32_entry(vec![N, K], 2))]);
+        let mapped = map(&built, vec![(embed, WeightView::Stored("w.embed".into()))]);
+        let forged = store(vec![("w.embed", f32_entry(vec![N - 1, K], 2))]);
+        let refusal = weight_map_refusal(engine.load_weights(forged, mapped));
+        let WeightMapError::StoreMismatch { id, mapped, stored } = refusal else {
+            panic!("expected StoreMismatch, got {refusal}");
+        };
+        assert_eq!(id, embed);
+        assert_eq!(mapped.shape, vec![N, K]);
+        assert_eq!(stored.shape, vec![N - 1, K]);
+    }
+
+    /// A matching pairing still loads: the check does not refuse what the loaders build.
+    #[test]
+    fn load_weights_accepts_the_store_the_map_was_built_against() {
+        let mut engine = Engine::new(Recorder::default());
+        let embed = WeightId::model(WeightRole::Embed);
+        let built = store(vec![("w.embed", f32_entry(vec![N, K], 2))]);
+        let mapped = map(&built, vec![(embed, WeightView::Stored("w.embed".into()))]);
+        engine.load_weights(built, mapped).unwrap();
     }
 
     /// SC-003: under `Map`, a const whose name equals a store key but which the map does not name is
@@ -5042,15 +5110,16 @@ mod weight_source_tests {
         assert!(engine.device().writes.len() > writes_before);
     }
 
-    /// POOT-1289: `load_weights` takes the store and the map separately, so a map built over one store can
-    /// meet another whose entry under the same key is a different shape. A packed embed row is then decoded
-    /// into a buffer of the map's width from a payload of another width: a typed `RowDecode` refusal naming
-    /// the embed, not a slice panic or a wrong row. The control binds the matching store.
+    /// POOT-1289, POOT-1292: `load_weights` takes the store and the map separately, so a map built over one
+    /// store can meet another whose packed entry under the same key is a different width. That pairing is
+    /// refused at `load_weights` with both handles, so no embed row is decoded into a buffer of the map's
+    /// width from a payload of another. The control binds the matching store.
     ///
-    /// Mutation: swallow the decode error in `WeightBinder::embed` (`.map_err(..)?` becomes `.ok()`); the
-    /// mismatched row binds and this row goes red (`expected RowDecode, got Ok(())`).
+    /// Mutation: in `WeightMap::check_store`, skip the comparison against the recorded handle; the
+    /// mismatched pairing loads and the later bind panics on the decode (`a mapped row of a checked payload
+    /// decodes`).
     #[test]
-    fn a_packed_embed_row_of_another_width_than_the_map_is_a_row_decode_refusal() {
+    fn a_packed_embed_of_another_width_than_the_map_is_refused_at_load_weights() {
         let embed = WeightId::model(WeightRole::Embed);
         let packed = |k: usize| {
             WeightEntry::Packed(Arc::new(poot_quant::test_support::packed::random_payload(
@@ -5066,8 +5135,8 @@ mod weight_source_tests {
         );
         let step_over = |weights: Arc<WeightStore>| {
             let (mut engine, program) = hosted_embed(6, 1);
-            let exe = engine.load_weights(weights, Arc::clone(&map)).unwrap();
-            let entry = engine.add_entry(exe, &program).unwrap();
+            let exe = engine.load_weights(weights, Arc::clone(&map))?;
+            let entry = engine.add_entry(exe, &program)?;
             let bytes = 3i32.to_le_bytes();
             let mut inputs = StepInputs::new();
             inputs.push(
@@ -5079,11 +5148,15 @@ mod weight_source_tests {
         };
         step_over(mapped_over.clone()).expect("control: the store the map was built over binds");
         match step_over(store(vec![("e", packed(2 * K))])) {
-            Err(ExecError::Bind(error)) => match *error {
-                BindError::RowDecode { name, .. } => assert_eq!(name, "w.embed"),
-                other => panic!("expected RowDecode, got {other}"),
+            Err(ExecError::Load(error)) => match *error {
+                LoadError::WeightMap(WeightMapError::StoreMismatch { id, mapped, stored }) => {
+                    assert_eq!(id, embed);
+                    assert_eq!(mapped.shape, vec![6, K]);
+                    assert_eq!(stored.shape, vec![6, 2 * K]);
+                }
+                other => panic!("expected StoreMismatch, got {other}"),
             },
-            other => panic!("expected RowDecode, got {other:?}"),
+            other => panic!("expected StoreMismatch, got {other:?}"),
         }
     }
 

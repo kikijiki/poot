@@ -56,7 +56,7 @@ pub fn linear_attention_decode_gated(
 /// state dim), `delta[1,Hq,1,1]` (input-dependent timestep), `a_param`/`d_skip[1,Hq,1,1]` (learned
 /// per-head A / D), `h_in[1,Hq,N,P]` (carried SSM state). Returns `(y[1,Hq,1,P], h_out[1,Hq,N,P])`.
 /// Pure primitive composition; the SSM block for nemotron_h / Mamba2 hybrid layers.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn mamba2_ssd_decode(
     b: &Builder,
@@ -103,7 +103,7 @@ pub fn mamba2_ssd_decode(
 /// (`[1,Hq,L,1]`), `a_param`/`d_skip[1,Hq,1,1]` (learned per-head A / D), `h_in[1,Hq,N,P]` (carried
 /// SSM state), `tril[1,Hq,L,L]` (lower-triangular ones including the diagonal, per-head-broadcast, as
 /// [`decay_mask_from_cumlog`] expects). Returns `(y[1,Hq,L,P], h_out[1,Hq,N,P])`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn mamba2_ssd_prefill(
     b: &Builder,
@@ -152,7 +152,7 @@ pub fn mamba2_ssd_prefill(
 /// `concat(y, h_out)` along the sequence axis, `[1, Hq, L + N, P]`. A sequence of at most one chunk is
 /// exactly `mamba2_ssd_prefill`; a longer one is the same recurrence with the O(L^2) mask bounded to
 /// `chunk^2`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn scan_ssd_packed(
     b: &Builder,

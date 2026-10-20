@@ -1,9 +1,7 @@
-//! Emit NVPTX `.ptx` for a representative set of generated kernels to /tmp/poot-ptx-stage2, so they can be
+//! Emit NVPTX `.ptx` for a representative set of generated kernels to `poot_test_util::ptx_stage_dir()`, so they can be
 //! verified on a real NVIDIA GPU via ptx-check (exp ex2.approx, the silu composition, div/rem, cast
 //! f32->usize, the index-math kernels). Run inside `nix develop` (needs llc). Asserts only that llc accepts the
 //! output; the check is the on-GPU run.
-
-use std::path::PathBuf;
 
 use poot_codegen::{Target, compile};
 use poot_kernel_ir::test_support::{matmul_kernel, square_kernel, wg_sum};
@@ -71,7 +69,7 @@ fn emit_nvptx_kernel_set() {
         eprintln!("llc not on PATH; skipping");
         return;
     }
-    let dir = PathBuf::from("/tmp/poot-ptx-stage2");
+    let dir = poot_test_util::ptx_stage_dir();
     std::fs::create_dir_all(&dir).unwrap();
     // a pointwise fused region and the two row-wise (reduction-rooted) kernels, whose multi-block control flow is
     // the NVPTX-lowering risk.
@@ -91,7 +89,7 @@ fn emit_nvptx_kernel_set() {
     .expect("fused precondition");
     // `fused_row`/`fused_row_parallel_views` (rmsnorm+softmax row kernels), `math_unary_dt` (transcendental
     // exp), `reduce_last_lds` and `array_sum_probe` are this crate's own `#[cfg(test)]`-only kernels (card
-    // 622: no cross-crate caller), so their NVPTX staging to this same `/tmp/poot-ptx-stage2` drop point
+    // 622: no cross-crate caller), so their NVPTX staging to this same drop point
     // lives in their own in-crate unit tests (`unit_helpers::stage_nvptx`) instead of here.
     let fused_unary = |name: &str, op| {
         kg::fused(

@@ -201,7 +201,7 @@ impl PooledDsaParams {
     /// `index_heads` heads of `index_dim` channels, pools `pool` consecutive keys into one and keeps
     /// the best `index_topk / pool` complete pools (so `index_topk` raw tokens) plus the tokens
     /// after the last complete pool.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         heads: usize,
         q_rank: usize,
@@ -319,7 +319,7 @@ impl PooledDsaWeights {
 /// their positions, plus every position after its last complete pool up to itself. The keys the
 /// step caches carry the position axis like attention's own (`kv.l{layer}.index`); a pool not yet
 /// written is never complete.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn pooled_keep(
     b: &Builder,
     step: &Step,

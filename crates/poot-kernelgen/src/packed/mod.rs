@@ -447,7 +447,6 @@ mod fixtures {
 
     /// A `Contraction`-shaped fixture: `blocks * out_per_block` weight rows, `blocks * m_per_block`
     /// activation rows, K = `values * 2`, deterministic activation, plus the reference contraction.
-    #[allow(clippy::type_complexity)]
     pub(super) fn contraction_fixture(
         format: WeightFormat,
         blocks: usize,

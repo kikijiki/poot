@@ -54,7 +54,7 @@ def runner_script(single, curve, args_log):
     )
 
 
-def bench_run(directory, single, curve, manifest=MANIFEST):
+def bench_run(directory, single, curve, manifest=MANIFEST, *, diagnostic=False):
     """`bench run` over a fixture manifest with a stub runner; the rows it stored in results.jsonl."""
     directory = Path(directory)
     stub = directory / "stub-runner"
@@ -77,6 +77,7 @@ def bench_run(directory, single, curve, manifest=MANIFEST):
         gen_tokens=None,
         warmup=None,
         iters=None,
+        diagnostic=diagnostic,
     )
     with (
         mock.patch.object(observer, "run_observed", side_effect=run_fixture_runner),
@@ -85,7 +86,8 @@ def bench_run(directory, single, curve, manifest=MANIFEST):
         contextlib.redirect_stderr(io.StringIO()),
     ):
         bench.cmd_run(args)
-    lines = (directory / "results" / "stub-run" / "results.jsonl").read_text().splitlines()
+    run_dir = directory / "results" / bench.DIAGNOSTICS_DIR / "stub-run" if diagnostic else directory / "results" / "stub-run"
+    lines = (run_dir / "results.jsonl").read_text().splitlines()
     return [json.loads(line) for line in lines]
 
 
@@ -121,6 +123,26 @@ class StoredRowTests(unittest.TestCase):
             ]
         self.assertEqual(len(curve_argv), 1)
         self.assertIn("--prefill-chunk 2", curve_argv[0])
+
+    def test_a_diagnostic_run_times_the_device_and_is_stored_apart(self):
+        profiled = valid_single() | {"profiled": True, "device_time": {"kind": "unknown"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = bench_run(tmp, profiled, valid_curve(), diagnostic=True)
+            argv = (Path(tmp) / "args.log").read_text()
+            committed = sorted(path.name for path in (Path(tmp) / "results").iterdir())
+
+        self.assertIn("--profile", argv)
+        self.assertEqual(committed, [bench.DIAGNOSTICS_DIR])
+        self.assertEqual(rows[0]["profiled"], True)
+        self.assertEqual(rows[0]["device_time"], {"kind": "unknown"})
+
+    def test_a_run_that_is_not_diagnostic_never_asks_for_device_timing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = bench_run(tmp, valid_single(), valid_curve())
+            argv = (Path(tmp) / "args.log").read_text()
+
+        self.assertNotIn("--profile", argv)
+        self.assertEqual(rows[0]["profiled"], False)
 
     def test_a_curve_without_a_chunk_passes_no_prefill_chunk_flag(self):
         with tempfile.TemporaryDirectory() as tmp:

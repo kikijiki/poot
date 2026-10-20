@@ -93,9 +93,9 @@ pub fn random_payload(format: WeightFormat, shape: [usize; 2], seed: u64) -> Pac
         .unwrap_or_else(|error| panic!("{format:?} {shape:?}: {error:?}"))
 }
 
-/// [`random_payload`] for a contraction fixture that must be sensitive to its scales: an E4M3 payload keeps its
+/// [`random_payload`] for a contraction fixture that must be sensitive to its scales: an E4M3 or E2M1 payload keeps its
 /// random codes but gets prescribed nonzero scales (in the format's own BF16 or F32 encoding) cycling through
-/// 0.5, 1.0, 1.5 and 2.0, so every output depends on every scale (a random sanitized scale is usually near
+/// 0.5, 1.0, 1.5 and 2.0 (an E8M0 scale, a power of two, cycles 0.5, 1, 2 and 4), so every output depends on every scale (a random sanitized scale is usually near
 /// zero, which hides a wrong scale); a block payload with E8M0 scales (MXFP4) keeps its codes and gets scales
 /// cycling through 0.25 ..= 16 (a random E8M0 scale spans `2^-127 ..= 2^127`, so a one-hot row would read
 /// `0 * inf`; the cycle has seven values and a seed-dependent phase, so a misread block or expert is visible).
@@ -113,11 +113,15 @@ pub fn prescribed_scale_payload(
             0x7d + ((block * 3 + seed as usize) % 7) as u8
         });
     }
-    let (WeightFormat::E4m3PerChannel { scale } | WeightFormat::E4m3Block128 { scale }) = format
-    else {
-        return base;
+    let scale = match format {
+        WeightFormat::E4m3PerChannel { scale } | WeightFormat::E4m3Block128 { scale } => scale,
+        // E2M1 rows carry one E8M0 scale per 32 values: random E8M0 scales span `2^-127 ..= 2^127`.
+        WeightFormat::E2m1Row32 => ScaleEncoding::E8m0,
+        _ => return base,
     };
     const SCALES: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
+    // E8M0 bytes for 2^-1, 2^0, 2^1 and 2^2.
+    const E8M0_SCALES: [u8; 4] = [126, 127, 128, 129];
     let weight = base.weight();
     let sources: Vec<(SourceRole, StoredBytes)> = weight
         .sources()
@@ -128,7 +132,7 @@ pub fn prescribed_scale_payload(
                 let width = match scale {
                     ScaleEncoding::Bf16 => 2,
                     ScaleEncoding::F32 => 4,
-                    ScaleEncoding::E8m0 => unreachable!("E4M3 scales are BF16 or F32"),
+                    ScaleEncoding::E8m0 => 1,
                 };
                 for (index, element) in bytes.chunks_mut(width).enumerate() {
                     let bits = SCALES[index % SCALES.len()].to_bits();
@@ -136,7 +140,8 @@ pub fn prescribed_scale_payload(
                         ScaleEncoding::Bf16 => {
                             element.copy_from_slice(&((bits >> 16) as u16).to_le_bytes());
                         }
-                        _ => element.copy_from_slice(&bits.to_le_bytes()),
+                        ScaleEncoding::F32 => element.copy_from_slice(&bits.to_le_bytes()),
+                        ScaleEncoding::E8m0 => element[0] = E8M0_SCALES[index % E8M0_SCALES.len()],
                     }
                 }
             }

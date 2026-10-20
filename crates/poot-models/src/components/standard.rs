@@ -1448,7 +1448,6 @@ pub(crate) mod oracle {
     }
 
     /// [`run_shape`] with the step traced under the caller's `limits`.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_shape_under(
         limits: poot_graph_ir::TraceLimits,
         model: &dyn crate::model::Model,

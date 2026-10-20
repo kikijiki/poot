@@ -368,6 +368,21 @@ impl PtxContext {
         Ok(result::mem_get_info()?)
     }
 
+    /// The device's name and the CUDA driver version (`cuDeviceGetName`, `cuDriverGetVersion`, formatted
+    /// `major.minor`). `None` if a driver call fails.
+    pub fn identity(&self) -> Option<poot_runtime_common::DeviceIdentity> {
+        let adapter = result::device::get_name(self.owner.device).ok()?;
+        let mut version = 0i32;
+        // SAFETY: `cuDriverGetVersion` writes one `int` into `version`.
+        unsafe { sys::cuDriverGetVersion(&mut version) }
+            .result()
+            .ok()?;
+        Some(poot_runtime_common::DeviceIdentity {
+            adapter,
+            driver: format!("cuda {}.{}", version / 1000, version % 1000 / 10),
+        })
+    }
+
     /// Device memory the driver reports free right now (bytes), `cuMemGetInfo`'s `free`: other
     /// processes' allocations since the context opened are out of it. `None` if the driver call fails.
     pub fn vram_free_bytes(&self) -> Option<u64> {
@@ -781,7 +796,7 @@ impl PtxContext {
     /// index-aligned with `ins` plus `out` last: the kernel ABI's `(ptr, len)` pairs carry these,
     /// never `PtxBuffer::elem_count()` - a caller with no plan of its own (a test, a probe) passes
     /// each buffer's own `elem_count()` explicitly instead.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn dispatch_dev(
         &self,
         // Card 626: unused now that the legacy label-keyed Profiler is gone (its only reader); this

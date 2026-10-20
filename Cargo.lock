@@ -1796,6 +1796,7 @@ name = "poot-bench-runner"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "poot-executor",
  "poot-graph-plan",
  "poot-llm",
@@ -1803,7 +1804,9 @@ dependencies = [
  "poot-profile",
  "poot-quant",
  "poot-runtime-common",
+ "poot-tensor",
  "serde_json",
+ "tokenizers",
 ]
 
 [[package]]

@@ -232,7 +232,10 @@ fn render() -> String {
     let options = targets::options();
     let graphs = graphs();
     let mut rows: Vec<(usize, String)> = Vec::new();
-    for RefTarget { file, target, .. } in reference_targets() {
+    for RefTarget {
+        id: file, target, ..
+    } in reference_targets()
+    {
         for (name, graph) in &graphs {
             // A refused graph has no plan and so no layout; plan_summary pins the refusal.
             let Ok(program) = compile(graph, &target, &options) else {
@@ -394,7 +397,10 @@ fn the_camping_rows_of_a_real_decode_are_exactly_the_exempt_ones() {
     let f32_bytes = size_of::<f32>();
     let options = targets::options();
     let mut wrong = Vec::new();
-    for RefTarget { file, target, .. } in reference_targets() {
+    for RefTarget {
+        id: file, target, ..
+    } in reference_targets()
+    {
         for family in real_families() {
             let (hkv, d) = (family.kv_heads, family.head_dim);
             let row = |shape: &[usize], axis: usize| -> Row {

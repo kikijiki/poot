@@ -27,6 +27,17 @@ impl Context {
         self.length_buffer_creates.get()
     }
 
+    /// The adapter this context opened and the driver wgpu reports for it (`radv` and its `Mesa` build string).
+    pub fn identity(&self) -> poot_runtime_common::DeviceIdentity {
+        let info = self._adapter.get_info();
+        poot_runtime_common::DeviceIdentity {
+            adapter: info.name,
+            driver: format!("{} {}", info.driver, info.driver_info)
+                .trim()
+                .to_string(),
+        }
+    }
+
     /// Number of compute `queue.submit` calls so far (the launch-tax signal; readback/upload submits are
     /// not counted). The batched re-encode does one per [`Context::submit_cached`] call (one per token);
     /// the per-dispatch paths (`dispatch` / `dispatch_dev`) submit once per dispatch (SC-002).

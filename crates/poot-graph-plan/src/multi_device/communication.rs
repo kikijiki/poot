@@ -171,7 +171,6 @@ pub(crate) mod test_only {
     /// carried exactly as supplied: it may be empty, uneven between participants, repeated, or nonmonotonic
     /// in either axis, and this function never reorders, sorts, or aggregates it before storing it on the
     /// returned row.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn plan_routed_exchange(
         id: PlanNodeId,
         participants: Vec<DeviceId>,

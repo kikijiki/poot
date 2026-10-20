@@ -53,7 +53,6 @@ BindError	UncheckedWriteMap	covered	crates/poot-executor/src/engine.rs	a_write_m
 BindError	NotAWriteMap	covered	crates/poot-executor/src/engine.rs	a_write_map_binds_only_as_a_checked_forward_slot_map
 BindError	StateRow	covered	crates/poot-executor/src/engine.rs	a_state_row_past_the_pool_is_a_state_row_refusal_that_zeroes_nothing
 BindError	TokenOutOfRange	covered	crates/poot-executor/src/engine.rs	a_token_outside_the_embed_table_is_refused
-BindError	RowDecode	covered	crates/poot-executor/src/engine.rs	a_packed_embed_row_of_another_width_than_the_map_is_a_row_decode_refusal
 BindError	RowRange	covered	crates/poot-executor/src/engine.rs	a_row_write_at_the_end_of_the_pool_is_a_row_range_refusal
 BindError	ExpertRange	covered	crates/poot-executor/tests/guard_rows.rs	an_expert_id_one_past_the_table_is_refused
 BindError	MapLength	covered	crates/poot-executor/tests/guard_rows.rs	a_map_one_element_off_is_refused

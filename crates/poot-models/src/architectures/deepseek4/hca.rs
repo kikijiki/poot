@@ -108,7 +108,7 @@ pub(super) fn windows_in(capacity: usize, rate: usize) -> usize {
 /// The pooled, normalized and rotated entries of `w`'s windows: `[rows, 1, windows, entry]`, or
 /// `None` when the cache is shorter than one window. This step's raw projections of `normed` are
 /// written into the compressor's carried histories first (named `tag`).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn entries(
     b: &Builder,
     step: &Step,

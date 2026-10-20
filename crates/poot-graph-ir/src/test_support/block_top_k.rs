@@ -53,7 +53,7 @@ pub fn grid_scores(blocks: usize, levels: u32, seed: u64) -> Vec<f32> {
 /// positions, ratio, k)`: distinct, coarse (many ties, some straddling the threshold) and all-equal
 /// scores at block counts that are not powers of two; eligibility edges (`E` of 0, 1, `k - 1`, `k`, `k + 1`
 /// and every block); and NaN, infinities and signed zeros.
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 pub fn selection_cases() -> Vec<(String, Vec<Vec<f32>>, Vec<i32>, usize, usize)> {
     let mut cases = Vec::new();
     let (ratio, k) = (4, 5);

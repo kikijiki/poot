@@ -21,10 +21,10 @@
 # kernelgen). See setup/poot.sh. Backend is selected via POOT_BENCH_BACKEND (ptx|rocm|wgpu, default ptx).
 bin_env = "POOT_BENCH_POOT_BIN"
 bin = "poot-bench-runner"
-# --prefill selects the batched Q=N prefill (the driver's whole-prompt forward) instead of
-# token-by-token prefill, as `--mode decode-curve` does. The bench runner has only the driver path, which
-# batches prefill, so the flag is always accepted. Without it, `--mode single` TTFT scales as per-token
-# decode rate x prompt length.
+# --prefill fills a single-mode prompt in one forward (the driver's whole-prompt chunk) instead of one token at a
+# time, as `--mode decode-curve` does for its contexts. The runner has only the driver path. Without it,
+# `--mode single` TTFT scales as per-token decode rate x prompt length. A cell is only a result from a release
+# runner (`cargo build --release -p poot-bench-runner`); a debug runner refuses to measure.
 cmd = ["{bin}", "--model-dir", "{model_dir}", "--prompt-file", "{prompt_file}",
        "--gen-tokens", "{gen_tokens}", "--warmup", "{warmup}", "--iters", "{iters}",
        "--precision", "{precision}", "--backend", "{backend}", "--prefill", "--json"]

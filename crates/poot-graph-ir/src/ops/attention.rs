@@ -37,7 +37,7 @@ pub fn repeat_kv_tiled(b: &Builder, k: Traced, n_rep: usize) -> Result<Traced, B
 /// softmax denominator but never to the weighted V sum. `sinks` is `[Hq]`. Implemented without a
 /// concat op (the IR has none): folding the sink into the max/sum over the real columns (two extra
 /// `Max`/`Add`/`Exp` steps) equals concatenating a sink column.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn attention_prefill_with_sink(
     b: &Builder,
     q: Traced,
@@ -139,7 +139,7 @@ pub fn attention_masked(
 /// `c * tanh(scores / c)` ([`softcap`]) to the scaled `Q K^T` scores BEFORE the additive mask and softmax
 /// (the Gemma2 order); `None` is byte-identical to [`attention_masked`] (no extra eqns). One definition
 /// across tracing, the oracle and every lowering.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn attention_masked_softcap(
     b: &Builder,
     q: Traced,
@@ -217,7 +217,7 @@ pub struct LiveAttention {
 /// row `b`, with `len` a raw I32 `[B]` that must lie in `1..=Lk`. The range is checked by the canonical
 /// index-bounds guard ([`Builder::guard_index_bounds`] on `len - 1`), so an out-of-range length publishes
 /// nothing through the validation channel and the graph reads a valid in-range fallback.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn attention_live(
     b: &Builder,
     q: Traced,
@@ -258,7 +258,7 @@ pub fn attention_live(
 /// inactive K and V rows are *selected* to zero before either matmul (a float `Select`, never a multiplication
 /// by zero, so a NaN there cannot survive) and inactive scores are selected to `-inf` after the mask is
 /// added, so inactive positions weigh exactly zero. Both parts of a split key are guarded.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn attention_over_keys(
     b: &Builder,
     q: Traced,

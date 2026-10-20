@@ -1706,7 +1706,6 @@ fn imported_random_uniform_matches_cpu_oracle() {
 /// and the final perturbed argmax) break ties to the lower index. `noise` is precomputed host-side via
 /// [`host_gumbel_noise_row`], matching what the graph's `RandomUniform` + `gumbel` composition would
 /// produce. `top_k <= 0.0` disables the top-k bisection; `top_p` is `None` for `Gumbel`/`GumbelTopK`.
-#[allow(clippy::too_many_arguments)]
 fn cpu_gumbel_family_pick(
     logits: &[f32],
     noise: &[f32],
@@ -1836,7 +1835,7 @@ fn imported_sample_gumbel_argmax_batched_matches_cpu_oracle() {
 
     // (batch, vocab, per-row (seed, temperature, min_p)): several seeds/temperatures plus a min-p row
     // that masks out most of the vocab (min_p=0.9 keeps only tokens within a tight band of the row max).
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     let cases: [(usize, usize, &[(u32, f32, f32)]); 3] = [
         (1, 200, &[(12345, 0.8, 0.0)]),
         (
@@ -1952,7 +1951,7 @@ fn imported_sample_truncated_gumbel_argmax_batched_matches_cpu_oracle() {
     };
 
     // (batch, vocab, per-row (seed, temperature, min_p, top_k)): top_k=0.0 means disabled.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     let cases: [(usize, usize, &[(u32, f32, f32, f32)]); 3] = [
         (1, 200, &[(12345, 0.8, 0.0, 0.0)]),
         (
@@ -2074,7 +2073,7 @@ fn imported_sample_topp_gumbel_argmax_batched_matches_cpu_oracle() {
     // (batch, vocab, per-row (seed, temperature, min_p, top_k, top_p)); top_k/top_p = 0.0/1.0 = disabled.
     // Logits decay by a clear step per index (`peak - step*i`), so the cumulative mass has wide gaps
     // between the top few tokens and the chosen top_p values sit well inside a gap.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     let cases: [(usize, usize, &[(u32, f32, f32, f32, f32)]); 5] = [
         (1, 200, &[(12345, 0.8, 0.0, 0.0, 1.0)]),
         (

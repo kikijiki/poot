@@ -25,6 +25,7 @@ use crate::driver::{
     ModelHandle, PoolShape, PrefixOutcome, PrefixSkip, PreparedSetLimits, Release, RowWork, SeqId,
     SeqRequest, Serving, ServingShapes, State, StepRow, Warm, open_executor,
 };
+use poot_test_util::per_backend;
 use poot_text::{ChatTemplate, TextCodec};
 
 pub(super) const VOCAB: usize = 48;
@@ -303,27 +304,6 @@ const CAPACITY: usize = 32;
 
 const PROMPT: [u32; 7] = [3, 17, 40, 8, 25, 11, 2];
 
-/// Declare a row once and run it per backend; each is its own test so a lane can name it.
-macro_rules! per_backend {
-    ($row:ident, $wgpu:ident, $rocm:ident, $ptx:ident) => {
-        #[test]
-        fn $wgpu() {
-            $row(BackendChoice::Wgpu);
-        }
-
-        #[test]
-        fn $ptx() {
-            $row(BackendChoice::Ptx);
-        }
-
-        #[cfg(feature = "rocm")]
-        #[test]
-        fn $rocm() {
-            $row(BackendChoice::Rocm);
-        }
-    };
-}
-
 /// POOT-574 SC-002 (R476-001 on Gemma4's path): the Gemma4 fixture with a 64-token vocabulary and its
 /// head zeroed (every logit exactly 0, so the distribution is uniform) answers a seeded temperature
 /// request with the sampler's tokens, not the greedy ones. A 16-token sampled run equal to the greedy
@@ -398,6 +378,7 @@ fn gemma4_sampled_differs_from_greedy(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     gemma4_sampled_differs_from_greedy,
     gemma4_sampled_differs_from_greedy_wgpu,
     gemma4_sampled_differs_from_greedy_rocm,
@@ -421,6 +402,7 @@ fn sampled_differs_from_greedy(choice: BackendChoice) {
     assert_eq!(sampled, again, "the same seed draws the same tokens");
 }
 per_backend!(
+    BackendChoice,
     sampled_differs_from_greedy,
     sampled_differs_from_greedy_wgpu,
     sampled_differs_from_greedy_rocm,
@@ -515,6 +497,7 @@ fn qwen35_decode_reuses_one_program_across_positions(choice: BackendChoice) {
     family_decode_reuses_one_program_across_positions("qwen35", choice, [14, 28, 25, 3, 11, 6]);
 }
 per_backend!(
+    BackendChoice,
     qwen35_decode_reuses_one_program_across_positions,
     qwen35_decode_reuses_one_program_across_positions_wgpu,
     qwen35_decode_reuses_one_program_across_positions_rocm,
@@ -525,6 +508,7 @@ fn qwen3next_decode_reuses_one_program_across_positions(choice: BackendChoice) {
     family_decode_reuses_one_program_across_positions("qwen3next", choice, [45, 10, 8, 28, 34, 22]);
 }
 per_backend!(
+    BackendChoice,
     qwen3next_decode_reuses_one_program_across_positions,
     qwen3next_decode_reuses_one_program_across_positions_wgpu,
     qwen3next_decode_reuses_one_program_across_positions_rocm,
@@ -535,6 +519,7 @@ fn qwen3next_sampled_differs_from_greedy(choice: BackendChoice) {
     family_sampled_differs_from_greedy("qwen3next", choice);
 }
 per_backend!(
+    BackendChoice,
     qwen3next_sampled_differs_from_greedy,
     qwen3next_sampled_differs_from_greedy_wgpu,
     qwen3next_sampled_differs_from_greedy_rocm,
@@ -545,6 +530,7 @@ fn qwen35_sampled_differs_from_greedy(choice: BackendChoice) {
     family_sampled_differs_from_greedy("qwen35", choice);
 }
 per_backend!(
+    BackendChoice,
     qwen35_sampled_differs_from_greedy,
     qwen35_sampled_differs_from_greedy_wgpu,
     qwen35_sampled_differs_from_greedy_rocm,
@@ -593,6 +579,7 @@ fn guided_requests_sample_inside_the_mask(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     guided_requests_sample_inside_the_mask,
     guided_requests_sample_inside_the_mask_wgpu,
     guided_requests_sample_inside_the_mask_rocm,
@@ -630,6 +617,7 @@ fn fixture_tokens_equal_the_recorded_literals(choice: BackendChoice) {
     }
 }
 per_backend!(
+    BackendChoice,
     fixture_tokens_equal_the_recorded_literals,
     fixture_tokens_equal_the_recorded_literals_wgpu,
     fixture_tokens_equal_the_recorded_literals_rocm,
@@ -680,6 +668,7 @@ fn qwen25_vl_text_only_tokens_equal_the_plain_reference(choice: BackendChoice) {
     }
 }
 per_backend!(
+    BackendChoice,
     qwen25_vl_text_only_tokens_equal_the_plain_reference,
     qwen25_vl_text_only_tokens_equal_the_plain_reference_wgpu,
     qwen25_vl_text_only_tokens_equal_the_plain_reference_rocm,
@@ -704,6 +693,7 @@ fn capacity_does_not_change_the_tokens(choice: BackendChoice) {
     assert_eq!(got, want);
 }
 per_backend!(
+    BackendChoice,
     capacity_does_not_change_the_tokens,
     capacity_does_not_change_the_tokens_wgpu,
     capacity_does_not_change_the_tokens_rocm,
@@ -754,6 +744,7 @@ fn chunked_prefill_equals_token_by_token(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     chunked_prefill_equals_token_by_token,
     chunked_prefill_equals_token_by_token_wgpu,
     chunked_prefill_equals_token_by_token_rocm,
@@ -774,6 +765,7 @@ fn greedy_ties_take_the_first_index(choice: BackendChoice) {
     assert_eq!(host, [0; 8]);
 }
 per_backend!(
+    BackendChoice,
     greedy_ties_take_the_first_index,
     greedy_ties_take_the_first_index_wgpu,
     greedy_ties_take_the_first_index_rocm,
@@ -1298,6 +1290,7 @@ fn pooled_mixtral_decodes_the_recorded_tokens_with_evictions(choice: BackendChoi
     );
 }
 per_backend!(
+    BackendChoice,
     pooled_mixtral_decodes_the_recorded_tokens_with_evictions,
     pooled_mixtral_decodes_the_recorded_tokens_with_evictions_wgpu,
     pooled_mixtral_decodes_the_recorded_tokens_with_evictions_rocm,
@@ -1354,6 +1347,7 @@ fn pooled_mixtral_interleaves_chunks_prompts_and_resets(choice: BackendChoice) {
     assert!(pooled.stats().residency.refills > 0);
 }
 per_backend!(
+    BackendChoice,
     pooled_mixtral_interleaves_chunks_prompts_and_resets,
     pooled_mixtral_interleaves_chunks_prompts_and_resets_wgpu,
     pooled_mixtral_interleaves_chunks_prompts_and_resets_rocm,
@@ -1424,6 +1418,7 @@ fn a_refused_shape_is_typed_before_any_dispatch(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     a_refused_shape_is_typed_before_any_dispatch,
     a_refused_shape_is_typed_before_any_dispatch_wgpu,
     a_refused_shape_is_typed_before_any_dispatch_rocm,
@@ -1452,6 +1447,7 @@ fn an_unsupported_request_is_the_same_variant_for_two_families(choice: BackendCh
     }
 }
 per_backend!(
+    BackendChoice,
     an_unsupported_request_is_the_same_variant_for_two_families,
     an_unsupported_request_is_the_same_variant_for_two_families_wgpu,
     an_unsupported_request_is_the_same_variant_for_two_families_rocm,
@@ -2246,6 +2242,7 @@ fn packed_checkpoints_load_as_stored_through_the_registry(choice: BackendChoice)
     );
 }
 per_backend!(
+    BackendChoice,
     packed_checkpoints_load_as_stored_through_the_registry,
     packed_checkpoints_load_as_stored_through_the_registry_wgpu,
     packed_checkpoints_load_as_stored_through_the_registry_rocm,
@@ -2380,6 +2377,7 @@ fn packed_q8_0_gguf_generates_like_its_dense_twin(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     packed_q8_0_gguf_generates_like_its_dense_twin,
     packed_q8_0_gguf_generates_like_its_dense_twin_wgpu,
     packed_q8_0_gguf_generates_like_its_dense_twin_rocm,
@@ -2393,6 +2391,7 @@ fn packed_q5_0_gguf_generates_like_its_dense_twin(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     packed_q5_0_gguf_generates_like_its_dense_twin,
     packed_q5_0_gguf_generates_like_its_dense_twin_wgpu,
     packed_q5_0_gguf_generates_like_its_dense_twin_rocm,
@@ -3577,6 +3576,7 @@ fn mixed_step_matches_generate_of(
     }
 }
 per_backend!(
+    BackendChoice,
     mixed_step_qwen2,
     mixed_step_qwen2_wgpu,
     mixed_step_qwen2_rocm,
@@ -3586,6 +3586,7 @@ fn mixed_step_qwen2(choice: BackendChoice) {
     mixed_step_matches_generate(choice, "qwen2");
 }
 per_backend!(
+    BackendChoice,
     mixed_step_bloom,
     mixed_step_bloom_wgpu,
     mixed_step_bloom_rocm,
@@ -3612,6 +3613,7 @@ fn mixed_step_recurrent(choice: BackendChoice, family: &str, recorded: &[Vec<u32
     );
 }
 per_backend!(
+    BackendChoice,
     mixed_step_qwen3next,
     mixed_step_qwen3next_wgpu,
     mixed_step_qwen3next_rocm,
@@ -3629,6 +3631,7 @@ fn mixed_step_qwen3next(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     mixed_step_qwen35,
     mixed_step_qwen35_wgpu,
     mixed_step_qwen35_rocm,
@@ -3646,6 +3649,7 @@ fn mixed_step_qwen35(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     mixed_step_nemotron_h,
     mixed_step_nemotron_h_wgpu,
     mixed_step_nemotron_h_rocm,
@@ -3724,6 +3728,7 @@ fn readmit_matches_generate(choice: BackendChoice, family: &str) {
     }
 }
 per_backend!(
+    BackendChoice,
     readmit_qwen3next,
     readmit_qwen3next_wgpu,
     readmit_qwen3next_rocm,
@@ -3733,6 +3738,7 @@ fn readmit_qwen3next(choice: BackendChoice) {
     readmit_matches_generate(choice, "qwen3next");
 }
 per_backend!(
+    BackendChoice,
     readmit_nemotron_h,
     readmit_nemotron_h_wgpu,
     readmit_nemotron_h_rocm,
@@ -3800,6 +3806,7 @@ fn prefix_reuse_hits_and_matches_the_unshared_run(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     prefix_reuse_hits_and_matches_the_unshared_run,
     prefix_reuse_hits_and_matches_the_unshared_run_wgpu,
     prefix_reuse_hits_and_matches_the_unshared_run_rocm,
@@ -3870,6 +3877,7 @@ fn commit_keeps_fewer_than_returned(choice: BackendChoice) {
     assert_eq!(lanes[0].out, want);
 }
 per_backend!(
+    BackendChoice,
     commit_keeps_fewer_than_returned,
     commit_keeps_fewer_than_returned_wgpu,
     commit_keeps_fewer_than_returned_rocm,
@@ -3952,6 +3960,7 @@ fn a_guided_row_takes_the_whole_step_to_the_logits_entry(choice: BackendChoice) 
     );
 }
 per_backend!(
+    BackendChoice,
     a_guided_row_takes_the_whole_step_to_the_logits_entry,
     a_guided_row_takes_the_whole_step_to_the_logits_entry_wgpu,
     a_guided_row_takes_the_whole_step_to_the_logits_entry_rocm,
@@ -4052,6 +4061,7 @@ fn a_nan_router_weight_is_a_typed_validation_fault_of(
     );
 }
 per_backend!(
+    BackendChoice,
     a_nan_router_weight_is_a_typed_validation_fault,
     a_nan_router_weight_is_a_typed_validation_fault_wgpu,
     a_nan_router_weight_is_a_typed_validation_fault_rocm,
@@ -4070,6 +4080,7 @@ fn a_nan_minimax_router_weight_is_a_typed_validation_fault(choice: BackendChoice
     );
 }
 per_backend!(
+    BackendChoice,
     a_nan_minimax_router_weight_is_a_typed_validation_fault,
     a_nan_minimax_router_weight_is_a_typed_validation_fault_wgpu,
     a_nan_minimax_router_weight_is_a_typed_validation_fault_rocm,
@@ -4090,6 +4101,7 @@ fn a_nan_deepseek4_router_weight_is_a_typed_validation_fault(choice: BackendChoi
     );
 }
 per_backend!(
+    BackendChoice,
     a_nan_deepseek4_router_weight_is_a_typed_validation_fault,
     a_nan_deepseek4_router_weight_is_a_typed_validation_fault_wgpu,
     a_nan_deepseek4_router_weight_is_a_typed_validation_fault_rocm,
@@ -4105,6 +4117,7 @@ fn a_nan_deepseek4_hash_router_weight_is_a_typed_validation_fault(choice: Backen
     );
 }
 per_backend!(
+    BackendChoice,
     a_nan_deepseek4_hash_router_weight_is_a_typed_validation_fault,
     a_nan_deepseek4_hash_router_weight_is_a_typed_validation_fault_wgpu,
     a_nan_deepseek4_hash_router_weight_is_a_typed_validation_fault_rocm,
@@ -4137,6 +4150,7 @@ fn a_deepseek4_prompt_of_ten_runs_as_prefill_eight_and_two_decode_steps(choice: 
     );
 }
 per_backend!(
+    BackendChoice,
     a_deepseek4_prompt_of_ten_runs_as_prefill_eight_and_two_decode_steps,
     a_deepseek4_prompt_of_ten_runs_as_prefill_eight_and_two_decode_steps_wgpu,
     a_deepseek4_prompt_of_ten_runs_as_prefill_eight_and_two_decode_steps_rocm,
@@ -4169,6 +4183,7 @@ fn a_deepseek4_chunk_that_is_not_a_granule_multiple_is_refused_before_any_execut
     }
 }
 per_backend!(
+    BackendChoice,
     a_deepseek4_chunk_that_is_not_a_granule_multiple_is_refused_before_any_executable,
     a_deepseek4_chunk_that_is_not_a_granule_multiple_is_refused_before_any_executable_wgpu,
     a_deepseek4_chunk_that_is_not_a_granule_multiple_is_refused_before_any_executable_rocm,
@@ -4241,6 +4256,7 @@ fn a_nan_glm53_flash_router_weight_is_a_typed_validation_fault(choice: BackendCh
     );
 }
 per_backend!(
+    BackendChoice,
     a_nan_glm53_flash_router_weight_is_a_typed_validation_fault,
     a_nan_glm53_flash_router_weight_is_a_typed_validation_fault_wgpu,
     a_nan_glm53_flash_router_weight_is_a_typed_validation_fault_rocm,
@@ -4313,6 +4329,7 @@ fn glm53_flash_every_position_matches_the_reference(choice: BackendChoice) {
     glm53_flash_every_position_matches_the_reference_with(choice, 8);
 }
 per_backend!(
+    BackendChoice,
     glm53_flash_every_position_matches_the_reference,
     glm53_flash_every_position_matches_the_reference_wgpu,
     glm53_flash_every_position_matches_the_reference_rocm,
@@ -4325,6 +4342,7 @@ fn glm53_flash_every_position_matches_the_reference_in_pieces_of_two(choice: Bac
     glm53_flash_every_position_matches_the_reference_with(choice, 2);
 }
 per_backend!(
+    BackendChoice,
     glm53_flash_every_position_matches_the_reference_in_pieces_of_two,
     glm53_flash_every_position_matches_the_reference_in_pieces_of_two_wgpu,
     glm53_flash_every_position_matches_the_reference_in_pieces_of_two_rocm,
@@ -4485,6 +4503,7 @@ fn glm53_flash_mtp_chain_matches_the_reference(choice: BackendChoice) {
     }
 }
 per_backend!(
+    BackendChoice,
     glm53_flash_mtp_chain_matches_the_reference,
     glm53_flash_mtp_chain_matches_the_reference_wgpu,
     glm53_flash_mtp_chain_matches_the_reference_rocm,
@@ -4518,6 +4537,7 @@ fn minimax_three_positions_match_the_reference(choice: BackendChoice) {
     }
 }
 per_backend!(
+    BackendChoice,
     minimax_three_positions_match_the_reference,
     minimax_three_positions_match_the_reference_wgpu,
     minimax_three_positions_match_the_reference_rocm,
@@ -4906,6 +4926,7 @@ fn bert_encode_matches_the_oracle_whatever_the_padding(choice: BackendChoice) {
     assert!(caps.inputs.encode && caps.widths.is_empty(), "{caps:?}");
 }
 per_backend!(
+    BackendChoice,
     bert_encode_matches_the_oracle_whatever_the_padding,
     bert_encode_matches_the_oracle_whatever_the_padding_wgpu,
     bert_encode_matches_the_oracle_whatever_the_padding_rocm,
@@ -4956,6 +4977,7 @@ fn cross_encoder_scores_pairs_in_the_oracles_order(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     cross_encoder_scores_pairs_in_the_oracles_order,
     cross_encoder_scores_pairs_in_the_oracles_order_wgpu,
     cross_encoder_scores_pairs_in_the_oracles_order_rocm,
@@ -5004,6 +5026,7 @@ fn decoder_encode_matches_the_oracle_and_its_recorded_mean(choice: BackendChoice
     close("host mean pooling", &mean, &RECORDED_MEAN);
 }
 per_backend!(
+    BackendChoice,
     decoder_encode_matches_the_oracle_and_its_recorded_mean,
     decoder_encode_matches_the_oracle_and_its_recorded_mean_wgpu,
     decoder_encode_matches_the_oracle_and_its_recorded_mean_rocm,
@@ -5064,6 +5087,7 @@ fn prompt_embeds_replace_the_tokens_they_stand_for(choice: BackendChoice) {
     assert!(compiles >= 1);
 }
 per_backend!(
+    BackendChoice,
     prompt_embeds_replace_the_tokens_they_stand_for,
     prompt_embeds_replace_the_tokens_they_stand_for_wgpu,
     prompt_embeds_replace_the_tokens_they_stand_for_rocm,
@@ -5120,6 +5144,7 @@ fn two_frames_of_one_size_embed_differently(choice: BackendChoice) {
     close("second frame in a two-row step", &both.rows[1], &b);
 }
 per_backend!(
+    BackendChoice,
     two_frames_of_one_size_embed_differently,
     two_frames_of_one_size_embed_differently_wgpu,
     two_frames_of_one_size_embed_differently_rocm,
@@ -5438,6 +5463,7 @@ fn smolvlm_caption_matches_the_oracle_rows(choice: BackendChoice) {
     }
 }
 per_backend!(
+    BackendChoice,
     smolvlm_caption_matches_the_oracle_rows,
     smolvlm_caption_matches_the_oracle_rows_wgpu,
     smolvlm_caption_matches_the_oracle_rows_rocm,
@@ -5533,6 +5559,7 @@ fn smolvlm_batched_paged_embeds_match_single_row_runs(choice: BackendChoice) {
     }
 }
 per_backend!(
+    BackendChoice,
     smolvlm_batched_paged_embeds_match_single_row_runs,
     smolvlm_batched_paged_embeds_match_single_row_runs_wgpu,
     smolvlm_batched_paged_embeds_match_single_row_runs_rocm,
@@ -5633,6 +5660,7 @@ fn smolvlm_front_end_requests_served_batched_equal_single_row_captions(choice: B
     }
 }
 per_backend!(
+    BackendChoice,
     smolvlm_front_end_requests_served_batched_equal_single_row_captions,
     smolvlm_front_end_requests_served_batched_equal_single_row_captions_wgpu,
     smolvlm_front_end_requests_served_batched_equal_single_row_captions_rocm,
@@ -5708,6 +5736,7 @@ fn paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks(choice: Backend
     assert_eq!(tokens, want_plain);
 }
 per_backend!(
+    BackendChoice,
     paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks,
     paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks_wgpu,
     paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks_rocm,
@@ -5777,6 +5806,7 @@ fn encode_refuses_what_it_cannot_batch(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     encode_refuses_what_it_cannot_batch,
     encode_refuses_what_it_cannot_batch_wgpu,
     encode_refuses_what_it_cannot_batch_rocm,
@@ -5875,6 +5905,7 @@ fn ple_histories_match_the_reference(choice: BackendChoice, handle: &Arc<ModelHa
     }
 }
 per_backend!(
+    BackendChoice,
     qwen4exp_ple_histories_match_the_reference,
     qwen4exp_ple_histories_match_the_reference_wgpu,
     qwen4exp_ple_histories_match_the_reference_rocm,
@@ -5936,6 +5967,7 @@ fn qwen4exp_sharded_ple_table_matches_the_reference(choice: BackendChoice) {
     ple_histories_match_the_reference(choice, &qwen4exp_sharded_handle());
 }
 per_backend!(
+    BackendChoice,
     qwen4exp_sharded_ple_table_matches_the_reference,
     qwen4exp_sharded_ple_table_matches_the_reference_wgpu,
     qwen4exp_sharded_ple_table_matches_the_reference_rocm,
@@ -6019,6 +6051,7 @@ fn qwen4exp_bf16_owners_are_not_widened_per_step(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     qwen4exp_bf16_owners_are_not_widened_per_step,
     qwen4exp_bf16_owners_are_not_widened_per_step_wgpu,
     qwen4exp_bf16_owners_are_not_widened_per_step_rocm,
@@ -6063,6 +6096,7 @@ fn qwen4exp_out_of_vocab_token_is_refused_at_the_driver(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     qwen4exp_out_of_vocab_token_is_refused_at_the_driver,
     qwen4exp_out_of_vocab_token_is_refused_at_the_driver_wgpu,
     qwen4exp_out_of_vocab_token_is_refused_at_the_driver_rocm,
@@ -6135,6 +6169,7 @@ fn paged_four_rows_equal_the_recorded_literals(choice: BackendChoice) {
     }
 }
 per_backend!(
+    BackendChoice,
     paged_four_rows_equal_the_recorded_literals,
     paged_four_rows_equal_the_recorded_literals_wgpu,
     paged_four_rows_equal_the_recorded_literals_rocm,
@@ -6626,6 +6661,7 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
     );
 }
 per_backend!(
+    BackendChoice,
     adapter_generation_replacement_is_isolated_and_freed,
     adapter_generation_replacement_is_isolated_and_freed_wgpu,
     adapter_generation_replacement_is_isolated_and_freed_rocm,
@@ -7021,6 +7057,7 @@ fn qwen25_vl_image_prompt_first_step_matches_the_cpu_oracle(choice: BackendChoic
     }
 }
 per_backend!(
+    BackendChoice,
     qwen25_vl_image_prompt_first_step_matches_the_cpu_oracle,
     qwen25_vl_image_prompt_first_step_matches_the_cpu_oracle_wgpu,
     qwen25_vl_image_prompt_first_step_matches_the_cpu_oracle_rocm,
@@ -7075,6 +7112,7 @@ fn qwen25_vl_an_image_past_the_patch_cap_is_a_typed_refusal(choice: BackendChoic
     assert_eq!(text.stats().steps, 0, "no generation step ran");
 }
 per_backend!(
+    BackendChoice,
     qwen25_vl_an_image_past_the_patch_cap_is_a_typed_refusal,
     qwen25_vl_an_image_past_the_patch_cap_is_a_typed_refusal_wgpu,
     qwen25_vl_an_image_past_the_patch_cap_is_a_typed_refusal_rocm,

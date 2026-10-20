@@ -3,7 +3,7 @@
 //! donated state updates in place on every backend, decided by the engine from the state-commit plan,
 //! never asked of the device.
 
-use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
+use poot_runtime_common::{BufferRole, DeviceIdentity, MemoryCounterSnapshot};
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::time::Duration;
@@ -212,6 +212,13 @@ pub trait Device {
     /// consumer treats that as an unknown budget, never as unlimited. The default is `None`, so a
     /// device that cannot observe its memory says so by not overriding it.
     fn free_memory_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    /// The adapter and driver this device runs on, read from its runtime. `None` where the runtime cannot say,
+    /// which a consumer treats as unknown, never as a default adapter. The default is `None`, so a device that
+    /// cannot observe its identity says so by not overriding it.
+    fn identity(&self) -> Option<DeviceIdentity> {
         None
     }
 

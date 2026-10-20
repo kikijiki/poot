@@ -33,6 +33,10 @@ clippy *args:
 # lane passes the same flag in scripts/test-model-free.sh.
 # `--lib --bins --tests` builds every test executable and no example: `cargo test`/nextest otherwise compile
 # each example into target/debug/examples (hundreds of GiB across a target dir). `just clippy` still checks them.
+# Every device lane's JUnit report lands under this directory, in `device-<lane>/results.xml` (the lane's
+# profile in .config/nextest.toml); the lane recipes pass each path to scripts/check-required-cases.py.
+results := "target/nextest"
+
 nextest := "cargo nextest run --no-tests=fail --no-fail-fast --lib --bins --tests"
 
 # The directory that holds the checkpoints model tests load. A test finds a model only through
@@ -46,12 +50,25 @@ models_dir := env("POOT_MODELS_DIR", home_directory() / "models")
 # are hidden and required in it, so a test that reaches for one fails. Tests that need a checkpoint or a
 # device, and tests named `*_real_dims`, stay out; they run in the lanes below.
 
+# The local merge gate (owner ruling Q8, 2026-10-18: no CI, every check runs on this box or the laptop): format
+# check, clippy with every warning an error, then the model-free lane. Each step fails the recipe; none is skipped.
+gate: fmt-check clippy test
+
+# the gate's own self-test: it runs fmt-check, clippy -D warnings and the model-free lane in order, and fmt-check fails a
+# fixture crate with a rustfmt diff (scripts/check-gate.py)
+gate-check:
+    python3 scripts/check-gate.py --self-test
+
+# fail when any crate has a rustfmt diff
+fmt-check:
+    cargo fmt --all --check
+
 # the one entry point for the whole gate: dead-pub and unused-dependency checks, every self-test, the model-free lane
 test: test-model-free
 
 # the model-free gate: dead-pub and unused-dependency checks, docs-path references, the inventory and lane self-tests, device-probe
 # self-test, then every model-free test and doctest
-test-model-free: dead-pub machete docs-paths variant-coverage mutation-sample-report diagrams-check aie-link-driver npu-build vpu-build crates-stale-names cargo-freshness test-model-free-inventory test-lane-coverage test-bench-runner
+test-model-free: gate-check dead-pub machete docs-paths variant-coverage mutation-sample-report diagrams-check aie-link-driver npu-build vpu-build crates-stale-names cargo-freshness test-model-free-inventory test-lane-coverage test-bench-runner test-bench-harness
     scripts/with-required-backend.sh --self-test
     scripts/test-model-free.sh run
 
@@ -62,6 +79,33 @@ test-model-free: dead-pub machete docs-paths variant-coverage mutation-sample-re
 # re-enters itself.
 test-bench-runner:
     scripts/test-model-free.sh run-isolated {{isolated_package}}
+
+# The benchmark harness, all of it stdlib and GPU-free: its unit tests (result contract, row identity, the committed
+# results' identity fields, the comparator, build.rs), the performance bank's claims, and the noise-aware comparator
+# over the committed results (`bench-compare`). A recipe not named here runs in no gate: until POOT-1260 nothing did.
+test-bench-harness: bench-compare
+    python3 -m unittest discover -s benchmarks/harness/tests -p 'test_*.py'
+    python3 benchmarks/harness/performance_bank.py
+
+# The noise-aware comparator (benchmarks/harness/bench.py compare-committed) on the committed results: the baseline is
+# the last committed set of each cell. With no candidate the set is compared with itself, which proves it is a
+# verifiable baseline (enough repeats, one binary, a band that excludes a practical loss) and fails the gate when it
+# is not; with candidate run directories (`just bench-compare benchmarks/results benchmarks/results/<run>-r1 ...`) it
+# judges them against that set. `results` is the directory holding the committed set. Exit 1: a regression or a failed
+# repeat; 2: a cell that cannot be verified.
+bench-compare results='benchmarks/results' *candidate:
+    python3 benchmarks/harness/bench.py compare-committed --results-dir {{results}} --candidate {{candidate}}
+
+# Record the dense cell of one local backend: 5 repeats of qwen2.5-0.5b decode-128 through the release runner, one run
+# directory per repeat under benchmarks/results/. Holds the GPU: run it as `flock /tmp/poot-gpu.lock just
+# bench-record wgpu`, with the box otherwise idle, and commit the directories with `bench index` regenerated.
+bench-record backend model='qwen2.5-0.5b' scenario='decode-128':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p poot-bench-runner
+    POOT_BENCH_BACKEND={{backend}} POOT_BENCH_POOT_BIN="${CARGO_TARGET_DIR:-target}/release/poot-bench-runner" \
+        python3 benchmarks/harness/bench.py run --framework poot --model {{model}} --scenario {{scenario}} \
+        --models-dir {{models_dir}} --repeats 5
 
 # Fail when a test runs in no lane. A test is covered when it is model-free or real-dims (the model-free lane), a
 # checkpoint test (a row of scripts/required-checkpoint-cases.txt, run by the `test-checkpoint*` recipes), or matched by one of the
@@ -130,13 +174,18 @@ aie-link-driver:
 # Build and lint poot-npu with its `xdna` feature (XRT shim, device, device rows) against the current workspace APIs.
 # The default build compiles the crate to its documentation only, so without this recipe the device code can rot
 # unseen (it did, 2026-10-12 to 2026-10-17, POOT-1158). The feature needs `nix develop .#npu`; where that shell
-# cannot be entered the recipe says so and builds nothing. It builds only: the device rows run in `test-device-npu`.
+# cannot be entered the recipe FAILS, unless POOT_ALLOW_NO_NPU_SHELL=1 says that this host has none (the laptop):
+# then it says so and builds nothing. It builds only: the device rows run in `test-device-npu`.
 npu-build:
     #!/usr/bin/env bash
     set -euo pipefail
     if ! nix develop .#npu -c true >/dev/null 2>&1; then
-        echo "npu-build: nix develop .#npu is unavailable here; poot-npu --features xdna NOT built" >&2
-        exit 0
+        if [ "${POOT_ALLOW_NO_NPU_SHELL:-}" = 1 ]; then
+            echo "npu-build: nix develop .#npu is unavailable here; poot-npu --features xdna NOT built (POOT_ALLOW_NO_NPU_SHELL=1)" >&2
+            exit 0
+        fi
+        echo "npu-build: nix develop .#npu cannot be entered; poot-npu --features xdna was not built (set POOT_ALLOW_NO_NPU_SHELL=1 on a host that has no NPU shell)" >&2
+        exit 1
     fi
     nix develop .#npu -c cargo clippy -p poot-npu --features xdna --all-targets -- -D warnings
 
@@ -168,10 +217,10 @@ test-model-free-inventory:
 test-model-free-inventory-regen:
     scripts/test-model-free.sh regen
 
-# rewrite crates/poot-models/tests/plan_summary/*.tsv (the plan-summary gate, card 599); a card that
-# changes plans on purpose runs this and lists every changed line in its landing note
+# rewrite crates/poot-models/tests/plan_summary/digests.tsv (the plan digests); a card that changes plans on
+# purpose runs this and lists every changed graph in its landing note
 test-plan-summary-regen:
-    POOT_PLAN_SUMMARY_REGEN=1 cargo nextest run -p poot-models --test plan_summary spirv_vulkan_plan_summary amd_gcn_plan_summary nvptx_plan_summary
+    POOT_PLAN_SUMMARY_REGEN=1 cargo nextest run -p poot-models --test plan_summary plan_digests_match_the_checked_in_file
 
 # rewrite the generated region of website/docs/reference/feature-matrix.md from what `compile` says about every
 # registered family's fixture graphs and every weight format on each reference target. The matrix test fails
@@ -206,65 +255,72 @@ test-checkpoint-large:
 # every real-checkpoint device row on wgpu, wgpu and the models required, then the required-case gate
 test-checkpoint-wgpu:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin checkpoint-wgpu {{results}}/device-checkpoint-wgpu/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_WGPU \
         env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
         {{nextest}} --profile device-checkpoint-wgpu --run-ignored all -p poot-llm \
         -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-wgpu)"
-    scripts/check-required-cases.py checkpoint-wgpu
+    scripts/check-required-cases.py check checkpoint-wgpu {{results}}/device-checkpoint-wgpu/results.xml
 
 # every real-checkpoint device row on ROCm, ROCm and the models required, then the required-case gate
 test-checkpoint-rocm:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin checkpoint-rocm {{results}}/device-checkpoint-rocm/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_ROCM \
         env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
         {{nextest}} --profile device-checkpoint-rocm --run-ignored all -p poot-llm --features poot-llm/rocm \
         -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-rocm)"
-    scripts/check-required-cases.py checkpoint-rocm
+    scripts/check-required-cases.py check checkpoint-rocm {{results}}/device-checkpoint-rocm/results.xml
 
 # every real-checkpoint device row on PTX (an NVIDIA pod that holds the models), then the required-case gate
 test-checkpoint-ptx:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin checkpoint-ptx {{results}}/device-checkpoint-ptx/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_PTX \
         env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
         {{nextest}} --profile device-checkpoint-ptx --run-ignored all -p poot-llm \
         -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-ptx)"
-    scripts/check-required-cases.py checkpoint-ptx
+    scripts/check-required-cases.py check checkpoint-ptx {{results}}/device-checkpoint-ptx/results.xml
 
 # the real-checkpoint row on the raw Vulkan device, then the required-case gate
 test-checkpoint-vulkan:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin checkpoint-vulkan {{results}}/device-checkpoint-vulkan/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_VULKAN \
         env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
         {{nextest}} --profile device-checkpoint-vulkan --run-ignored all -p poot-llm \
         -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-vulkan)"
-    scripts/check-required-cases.py checkpoint-vulkan
+    scripts/check-required-cases.py check checkpoint-vulkan {{results}}/device-checkpoint-vulkan/results.xml
 
 # the 20B+ device rows on wgpu: NEVER on the dev box (a pod or host with the checkpoints and the memory)
 test-checkpoint-large-wgpu:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin checkpoint-large-wgpu {{results}}/device-checkpoint-large-wgpu/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_WGPU \
         env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
         {{nextest}} --profile device-checkpoint-large-wgpu --run-ignored all -p poot-llm \
         -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-large-wgpu)"
-    scripts/check-required-cases.py checkpoint-large-wgpu
+    scripts/check-required-cases.py check checkpoint-large-wgpu {{results}}/device-checkpoint-large-wgpu/results.xml
 
 # the 20B+ device rows on ROCm: NEVER on the dev box
 test-checkpoint-large-rocm:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin checkpoint-large-rocm {{results}}/device-checkpoint-large-rocm/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_ROCM \
         env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
         {{nextest}} --profile device-checkpoint-large-rocm --run-ignored all -p poot-llm --features poot-llm/rocm \
         -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-large-rocm)"
-    scripts/check-required-cases.py checkpoint-large-rocm
+    scripts/check-required-cases.py check checkpoint-large-rocm {{results}}/device-checkpoint-large-rocm/results.xml
 
 # the 20B+ device rows on PTX (an NVIDIA pod with the memory for them)
 test-checkpoint-large-ptx:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin checkpoint-large-ptx {{results}}/device-checkpoint-large-ptx/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_PTX \
         env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
         {{nextest}} --profile device-checkpoint-large-ptx --run-ignored all -p poot-llm \
         -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-large-ptx)"
-    scripts/check-required-cases.py checkpoint-large-ptx
+    scripts/check-required-cases.py check checkpoint-large-ptx {{results}}/device-checkpoint-large-ptx/results.xml
 
 # the real-dimension rows too slow for `test-real-dims` (minutes on the CPU oracle), in release
 test-real-dims-long:
@@ -286,7 +342,7 @@ test-npu-toolchain:
 wgpu_selection := 'package(poot-wgpu-runtime) | (binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-llm::add_a_model) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_wgpu$/)) | (binary_id(=poot-llm::beam) & test(/_wgpu$/)) | (binary_id(=poot-llm::timed_executor) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_wgpu$/)) | (binary_id(=poot-llm::recurrent_snapshot_cost) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_wgpu$/)) | (binary_id(=poot-llm::staged_timing) & test(/_wgpu$/)) | binary_id(=poot-executor) | binary_id(=poot-executor::cr30_lifecycle) | binary_id(=poot-executor::staged_pipeline) | package(poot-wgpu-device) | binary_id(=poot-llm::wgpu_qwen2) | binary_id(=poot-llm::wgpu_gemma2) | binary_id(=poot-llm::wgpu_executor_contract) | binary_id(=poot-llm::wgpu_weight_map_binding) | binary_id(=poot-llm::wgpu_parity_models) | binary_id(=poot-llm::wgpu_staged_pipeline) | binary_id(=poot-serve::bounded_drain_production) | (binary_id(=poot-serve::served_loop) & test(/_wgpu$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-serve::served_groups) & test(/_wgpu$/)) | test(/^prefill_kv_shared_pool_matches_contiguous$/) | test(/^qwen2_decode_gpu_matches_cpu$/)'
 vulkan_selection := 'package(poot-vulkan-runtime) | package(poot-vulkan-device) | binary_id(=poot-llm::vulkan_generate) | binary_id(=poot-llm::vulkan_cross_backend) | binary_id(=poot-llm::vulkan_parity_models) | (binary_id(=poot-serve::served_groups) & test(/_vulkan$/)) | (binary_id(=poot-serve::served_loop) & test(/_vulkan$/))'
 rocm_selection := 'package(poot-rocm-runtime) | (binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-llm::add_a_model) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_rocm$/)) | package(poot-rocm-device) | binary_id(=poot-llm::rocm_executor_contract) | binary_id(=poot-llm::rocm_executor_coverage) | binary_id(=poot-llm::rocm_routed_prefill_unguarded) | binary_id(=poot-llm::rocm_parity_models) | binary_id(=poot-llm::rocm_staged_pipeline) | binary_id(=poot-llm::rocm_weight_map_binding) | (binary_id(=poot-llm::beam) & test(/_rocm$/)) | (binary_id(=poot-llm::timed_executor) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_rocm$/)) | (binary_id(=poot-llm::recurrent_snapshot_cost) & test(/_rocm$/)) | (binary_id(=poot-llm::speculate) & test(/_rocm$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_rocm$/)) | binary_id(=poot-llm::rocm_batched_decode_plan_classify) | (binary_id(=poot-serve::served_loop) & test(/_rocm$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-serve::served_groups) & test(/_rocm$/))'
-ptx_single_device_rows := '(binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_ptx$/)) | (binary_id(=poot-llm::add_a_model) & test(/_ptx$/)) | (binary_id(=poot-llm::speculate) & test(/_ptx$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_ptx$/)) | (binary_id(=poot-llm::staged_timing) & test(/_ptx$/)) | (binary_id(=poot-llm::timed_executor) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_ptx$/)) | (binary_id(=poot-serve::served_groups) & test(/_ptx$/)) | package(poot-ptx-device) | binary_id(=poot-llm::ptx_gemma2_geglu) | binary_id(=poot-llm::ptx_sc_acceptance) | binary_id(=poot-llm::ptx_routed_prefill_unguarded) | binary_id(=poot-llm::ptx_parity_models) | binary_id(=poot-llm::ptx_staged_pipeline) | binary_id(=poot-llm::ptx_weight_map_binding) | package(poot-ptx-runtime) | test(/^(wmma_tile_dispatches_and_matches_cpu_on_ptx|attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx|attention_fixture_bank_matches_cpu_on_ptx|attention_split_key_and_live_bound_match_cpu_on_ptx)$/)'
+ptx_single_device_rows := '(binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_ptx$/)) | (binary_id(=poot-llm::add_a_model) & test(/_ptx$/)) | (binary_id(=poot-llm::beam) & test(/_ptx$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_ptx$/)) | (binary_id(=poot-llm::speculate) & test(/_ptx$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_ptx$/)) | (binary_id(=poot-llm::staged_timing) & test(/_ptx$/)) | (binary_id(=poot-llm::timed_executor) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_ptx$/)) | (binary_id(=poot-serve::served_groups) & test(/_ptx$/)) | package(poot-ptx-device) | binary_id(=poot-llm::ptx_gemma2_geglu) | binary_id(=poot-llm::ptx_sc_acceptance) | binary_id(=poot-llm::ptx_routed_prefill_unguarded) | binary_id(=poot-llm::ptx_parity_models) | binary_id(=poot-llm::ptx_staged_pipeline) | binary_id(=poot-llm::ptx_weight_map_binding) | package(poot-ptx-runtime)' + ' | (' + kernels_package_selection + ' & ' + ptx_named_rows + ')'
 # The multi-device rows (two NVIDIA GPUs, and the four-way tensor-parallel row) live in three test binaries, and a
 # binary is the property that says how many devices a row needs: every row of one opens its devices through the
 # same `open_two` / `open_devices`. `test-device-ptx` excludes them (on a one-GPU machine they fail with `invalid
@@ -299,7 +355,11 @@ ptx_single_device_rows := '(binary_id(=poot-llm) & test(/^driver::(device_tests|
 # so a reviewer checks that a new `ptx.txt` row is a one-device row.
 ptx_multi_device_selection := 'binary_id(=poot-llm::ptx_multi_device_pipeline) | binary_id(=poot-llm::ptx_tensor_parallel) | binary_id(=poot-serve::served_multi_device)'
 ptx_selection := '(' + ptx_single_device_rows + ') & not (' + ptx_multi_device_selection + ')'
-kernels_selection := 'package(pootc) | package(poot-kernelgen)'
+# The kernels lane runs its two packages whole, less the rows that dispatch on an NVIDIA device: a row named
+# `*_on_ptx` skips on any other machine, and a skip is never a pass, so those rows belong to `test-device-ptx`.
+kernels_package_selection := '(package(pootc) | package(poot-kernelgen))'
+ptx_named_rows := 'test(/_on_ptx(_kquant)?$/)'
+kernels_selection := kernels_package_selection + ' & not ' + ptx_named_rows
 npu_selection := 'package(poot-npu)'
 
 # poot-bench-runner builds poot-llm with the rocm feature, which cannot unify into the model-free lane, so
@@ -319,10 +379,11 @@ isolated_package := 'poot-bench-runner'
 # then the required-case gate
 test-device-wgpu:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin wgpu {{results}}/device-wgpu/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_WGPU \
         {{nextest}} --profile device-wgpu -p poot-wgpu-device -p poot-executor -p poot-llm -p poot-wgpu-runtime -p poot-serve \
         -E '{{wgpu_selection}}'
-    scripts/check-required-cases.py wgpu
+    scripts/check-required-cases.py check wgpu {{results}}/device-wgpu/results.xml
 
 # The poot-executor rows this lane requires (cr30_lifecycle, kernel identity) also run in `just test`;
 # poot-wgpu-device is excluded from it (gate_policy: every test dispatches on a wgpu device), so this lane is
@@ -331,29 +392,33 @@ test-device-wgpu:
 # kernel GPU suites (pootc dispatches, poot-kernelgen runs) on wgpu, device required, then the required-case gate
 test-device-kernels:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin kernels {{results}}/device-kernels/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_WGPU \
         {{nextest}} --profile device-kernels -p pootc -p poot-kernelgen --test-threads=1 -E '{{kernels_selection}}'
-    scripts/check-required-cases.py kernels
+    scripts/check-required-cases.py check kernels {{results}}/device-kernels/results.xml
 
 # raw Vulkan lane: the poot-vulkan-runtime add dispatch and live caps receipt, and the poot-vulkan-device executor
 # contract, parity table and driver generation rows (Card 553), Vulkan device required, run under the Khronos validation
 # layer (a missing layer fails the lane; any layer warning or error fails the test that caused it), then the required-case gate
 test-device-vulkan:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin vulkan {{results}}/device-vulkan/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_VULKAN env POOT_VULKAN_VALIDATION=1 \
         {{nextest}} --profile device-vulkan -p poot-vulkan-runtime -p poot-vulkan-device -p poot-llm -p poot-serve \
         -E '{{vulkan_selection}}'
-    scripts/check-required-cases.py vulkan
+    scripts/check-required-cases.py check vulkan {{results}}/device-vulkan/results.xml
 
 # ROCm lane: the migrated executor-contract, packed-serving and parity suites (card 548; the old
 # resident probes went with resident.rs) and every poot-rocm-device test (a test no lane selects goes red silently),
 # ROCm device required, then the required-case gate
 test-device-rocm:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin rocm {{results}}/device-rocm/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_ROCM \
         {{nextest}} --profile device-rocm -p poot-rocm-device -p poot-llm -p poot-rocm-runtime -p poot-serve --features poot-llm/rocm \
         -E '{{rocm_selection}}'
-    scripts/check-required-cases.py rocm
+    scripts/with-required-backend.sh POOT_REQUIRE_ROCM cargo run -p poot-rocm-device --bin rocm-check -- --add
+    scripts/check-required-cases.py check rocm {{results}}/device-rocm/results.xml
 
 # NPU lane: every poot-npu device row on the XDNA2 NPU, through the real compile -> Engine -> XRT route. It
 # runs in `nix develop .#npu` (XRT, Peano and the IRON driver). Each row takes `/tmp/poot-npu.lock` itself
@@ -364,9 +429,10 @@ test-device-rocm:
 # each row with a SKIP report, which the required-case gate never counts as a pass.
 test-device-npu:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin npu {{results}}/device-npu/results.xml
     nix develop .#npu -c scripts/with-required-backend.sh POOT_REQUIRE_NPU \
         {{nextest}} --profile device-npu -p poot-npu --features xdna --test-threads=1 -E '{{npu_selection}}'
-    scripts/check-required-cases.py npu
+    scripts/check-required-cases.py check npu {{results}}/device-npu/results.xml
 
 # Intel NPU lane (POOT-1164): every poot-npu `vpu` row on the Lunar Lake laptop's NPU, through the real compile ->
 # Engine -> vendor graph compiler -> Level Zero route, plus the blob cache and the device's own contract. It runs
@@ -376,62 +442,21 @@ test-device-npu:
 # every row ran.
 test-device-vpu:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin vpu {{results}}/device-vpu/results.xml
     nix develop .#npu-intel -c scripts/with-required-backend.sh POOT_REQUIRE_INTEL_NPU \
         {{nextest}} --profile device-vpu -p poot-npu --features vpu --test-threads=1 -E '{{npu_selection}}'
-    scripts/check-required-cases.py vpu
+    scripts/check-required-cases.py check vpu {{results}}/device-vpu/results.xml
 
 # Level Zero device rows (POOT-1164) through poot-l0-runtime: the Intel NPU's graph extension (IR compiled by the
 # driver's graph compiler, blob reload, recordings). There is no Level Zero GPU path. It runs in `nix develop .#npu-intel` (the Level Zero loader,
 # NPU driver stack on LD_LIBRARY_PATH) on the Lunar Lake laptop. The rows are
 # `#[ignore]`d, so they are run by test binary; no device means the context open fails and the recipe fails.
 test-device-l0:
+    scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin l0 {{results}}/device-l0/results.xml
     nix develop .#npu-intel -c cargo nextest run --profile device-l0 -p poot-l0-runtime --run-ignored only \
         -E 'binary_id(=poot-l0-runtime::npu_graph)'
-    scripts/check-required-cases.py l0
-
-# The poot-llm tests that exist only under `--features rocm`. Nothing else builds the feature,
-# so without this recipe those tests never compile. It reports how many test binaries the feature turns from
-# empty into non-empty and fails when there are none.
-
-# rocm-feature tests (--features rocm, release) on the local ROCm device, device required
-test-rocm-feature:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # Release, as the rocm tests document: their debug run is codegen-bound (one real 3B test ran over 25 minutes).
-    # Checkpoint lane: POOT_REQUIRE_MODELS=1 makes an unset models directory a failure, not a lane of skips.
-    export POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1
-    packages=(-p poot-llm --release)
-    features=(--features poot-llm/rocm)
-    dir=$(mktemp -d)
-    trap 'rm -rf -- "$dir"' EXIT
-    cargo nextest list --lib --bins --tests "${packages[@]}" --message-format json >"$dir/default.json"
-    cargo nextest list --lib --bins --tests "${packages[@]}" "${features[@]}" --message-format json >"$dir/rocm.json"
-    # Suites that list no test by default and some with the feature.
-    non_empty=$(jq -r --slurpfile default "$dir/default.json" '
-        .["rust-suites"] | to_entries[]
-        | select((.value.testcases | length) > 0)
-        | select((($default[0]["rust-suites"][.key].testcases // {}) | length) == 0)
-        | .key
-    ' "$dir/rocm.json")
-    count=$(grep -c . <<<"$non_empty" || true)
-    echo "rocm feature: $count test binaries are empty by default and non-empty with the feature"
-    if [ "$count" -eq 0 ]; then
-        echo "the rocm feature added no tests to any empty test binary: the feature is not being built" >&2
-        exit 1
-    fi
-    # The active tests the feature adds, selected by exact identity.
-    selected=$(jq -r --slurpfile default "$dir/default.json" '
-        .["rust-suites"] | to_entries[]
-        | .key as $binary
-        | [ .value.testcases | to_entries[]
-            | select(.value.ignored | not)
-            | select($default[0]["rust-suites"][$binary].testcases[.key] == null)
-            | "test(=" + .key + ")" ]
-        | select(length > 0)
-        | "(binary_id(=" + $binary + ") & (" + join(" | ") + "))"
-    ' "$dir/rocm.json" | paste -sd'|' | sed 's/|/ | /g')
-    scripts/with-required-backend.sh POOT_REQUIRE_ROCM \
-        {{nextest}} "${packages[@]}" "${features[@]}" --test-threads=1 -E "$selected"
+    scripts/check-required-cases.py check l0 {{results}}/device-l0/results.xml
 
 # PTX lane: PTX implements the shared executor contract (card 549), so this mirrors the ROCm lane's own
 # packed-serving theme (the whole packed_serving.rs binary: resident, capture/replay, prefill, the
@@ -449,34 +474,43 @@ test-rocm-feature:
 # other device lane.
 test-device-ptx:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin ptx {{results}}/device-ptx/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_PTX \
-        {{nextest}} --profile device-ptx -p poot-ptx-device -p poot-ptx-runtime -p poot-kernelgen -p poot-llm -p poot-serve \
+        {{nextest}} --profile device-ptx -p poot-ptx-device -p poot-ptx-runtime -p poot-kernelgen -p pootc -p poot-llm -p poot-serve \
         -E '{{ptx_selection}}'
-    scripts/check-required-cases.py ptx
+    # The kernels `ptx-check` runs are staged by poot-kernelgen's emit tests into a directory made fresh for this run, so a
+    # fixture left by an earlier run can never satisfy it.
+    stage=$(mktemp -d) && trap 'rm -rf -- "$stage"' EXIT && \
+        POOT_PTX_STAGE_DIR="$stage" {{nextest}} -p poot-kernelgen -E 'binary_id(=poot-kernelgen) | binary_id(=poot-kernelgen::emit_nvptx)' && \
+        scripts/with-required-backend.sh POOT_REQUIRE_PTX cargo run -p poot-ptx-device --bin ptx-check -- "$stage"
+    scripts/check-required-cases.py check ptx {{results}}/device-ptx/results.xml
 
 # two-NVIDIA-GPU rows (the captured coordinator's pipeline and tensor-parallel decode across GPUs 0 and 1,
 # POOT-748 and POOT-749, and the production server's requests over both placements, POOT-750): one device
 # required and a second required too (a missing one fails instead of skipping), then the required-case gate
 test-device-ptx-2gpu:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin ptx-2gpu {{results}}/device-ptx-2gpu/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_PTX env POOT_REQUIRE_PTX_2GPU=1 \
         {{nextest}} --profile device-ptx-2gpu -p poot-llm -p poot-serve -E '({{ptx_multi_device_selection}}) & not test(/four_way/)'
-    scripts/check-required-cases.py ptx-2gpu
+    scripts/check-required-cases.py check ptx-2gpu {{results}}/device-ptx-2gpu/results.xml
 
 # four-NVIDIA-GPU rows (POOT-1102: a world-four tensor-parallel decode against single-device decode, every
 # GPU pair exchanging partial sums): four devices required, then the required-case gate
 test-device-ptx-4gpu:
     scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin ptx-4gpu {{results}}/device-ptx-4gpu/results.xml
     scripts/with-required-backend.sh POOT_REQUIRE_PTX env POOT_REQUIRE_PTX_4GPU=1 \
         {{nextest}} --profile device-ptx-4gpu -p poot-llm -E '({{ptx_multi_device_selection}}) & test(/four_way/)'
-    scripts/check-required-cases.py ptx-4gpu
+    scripts/check-required-cases.py check ptx-4gpu {{results}}/device-ptx-4gpu/results.xml
 
 # Alias for the default GPU backend.
 test-gpu: test-device-wgpu
 
-# run both criterion benches: CPU decode (poot-graph-plan) and wgpu op dispatch (poot-wgpu-device, wgpu device required)
+# the criterion benches: the CPU-oracle decode step (poot-models) and wgpu op dispatch (poot-wgpu-device, wgpu device
+# required). They time host paths and carry no baseline a gate compares; the end-to-end model benchmarks are `bench-record`.
 bench:
-    cargo bench -p poot-graph-plan --bench decode
+    cargo bench -p poot-models --bench decode
     scripts/with-required-backend.sh POOT_REQUIRE_WGPU cargo bench -p poot-wgpu-device --bench op_dispatch
 
 # ---- kernel assets ----------------------------------------------------------
@@ -578,6 +612,8 @@ site-check: _site-deps
     scripts/site-rust-snippets.sh || rc=1
     echo "-- card numbers (the site never names an internal card or board id) --"
     scripts/site-card-numbers.sh || rc=1
+    echo "-- NPU summaries (what an NPU runs is stated on architecture/npu.mdx only) --"
+    scripts/site-npu-summaries.sh || rc=1
     echo "-- ascii (no em-dashes / non-ascii) --"
     ascii_rc=0
     git grep -nIP '[^\x00-\x7F]' -- website ':!website/bun.lock' || ascii_rc=$?

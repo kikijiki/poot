@@ -1,0 +1,31 @@
+# Deliberately unlisted rows of `just test-device-vulkan`, one per line: binary_id<TAB>test_name<TAB>reason.
+# A row the lane runs and passes that is in neither vulkan.txt nor here fails scripts/check-required-cases.py;
+# a row that prints a skip report fails whether listed or not. Sorted in canonical (LC_ALL=C) order; every row must run in the lane or the gate fails.
+poot-vulkan-runtime	context::init::launch_caps_tests::a_fixed_size_and_a_missing_feature_are_reported_as_such	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	context::init::launch_caps_tests::launch_caps_carry_the_reported_limits_and_the_subgroup_range	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	features::tests::a_device_without_robust_buffer_access_is_refused	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	features::tests::the_enabled_core_features_include_robust_buffer_access	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	spirv::tests::a_malformed_instruction_ends_the_scan_without_reading_past_it	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	spirv::tests::capabilities_and_local_size_are_read_from_the_instruction_stream	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::a_cached_key_answers_for_one_kernel_only	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::a_dispatch_length_beyond_its_buffer_is_refused	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::a_dispatch_length_is_bounded_in_the_buffers_native_elements	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::a_fence_that_never_signals_times_out_within_the_bound_and_poisons	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::a_grid_over_the_device_limit_is_refused_not_folded	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::bf16_packed_word_rejected_by_dense_i32_bind	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::buffer_and_clone_outlive_context_and_readback_does_not_alias_writes	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::buffer_partial_failures_clean_up_exactly_acquired_resources	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::buffer_whose_element_count_exceeds_u32_is_refused	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::dense_f32_buffer_rejects_a_bf16_bind	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::dispatch_and_recording_refuse_objects_of_another_context	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::dispatch_refuses_a_buffer_count_other_than_the_kernels	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::failed_fence_wait_after_submit_poisons_and_leaks_everything	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::graph_partial_failures_clean_up_exactly_acquired_resources	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::recorded_graph_directly_retains_owner_and_replays_after_context_drop	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::recorded_graph_retains_buffers_and_pipelines_after_context_drop	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::submit_lost_to_device_loss_poisons	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::submit_refused_for_memory_is_retired_not_poisoned	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::vulkan_context_open_is_required_by_its_own_variable_only	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::zero_size_buffer_is_refused_before_the_driver_call	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime::run_add	square_runs_on_gpu_via_raw_vulkan	raw Vulkan add dispatch under the validation layer; selected by package so none goes unrun

@@ -12,7 +12,7 @@ use crate::refusal::Site;
 use poot_target::{Backend, BufferStorage, DeviceCaps};
 
 /// Plan one MoE-family equation (IndexedMatMul, its `ContractionEpilogue`, or ArgTopK).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,

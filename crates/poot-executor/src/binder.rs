@@ -911,14 +911,14 @@ impl WeightBinder {
                 Some(WeightEntry::Packed(payload)) => {
                     let start = decoded.len();
                     decoded.resize(start + rows.width, 0.0f32);
+                    // `load_weights` matched the payload to the map's `[rows, width]`, and `embed_rows` cut the
+                    // runs inside its rows, so the decode cannot leave the payload's shape.
+                    // Guarded by `WeightMap::check_store`'s tests (`check_store_refuses_a_packed_entry_of_another_width`).
                     payload
                         .decode_row(stored_row, &mut decoded[start..])
-                        .map_err(|source| BindError::RowDecode {
-                            name: rows.name.clone(),
-                            source,
-                        })?;
+                        .expect("a mapped row of a checked payload decodes");
                 }
-                None => unreachable!("embed rows are resolved against the store they read"),
+                None => unreachable!("load_weights checked every mapped key against this store"),
             }
         }
         // `embed_rows` admitted this lane for these rows: a dense table's encoding exists and cannot fail on

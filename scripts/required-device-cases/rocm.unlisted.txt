@@ -1,0 +1,57 @@
+# Deliberately unlisted rows of `just test-device-rocm`, one per line: binary_id<TAB>test_name<TAB>reason.
+# A row the lane runs and passes that is in neither rocm.txt nor here fails scripts/check-required-cases.py;
+# a row that prints a skip report fails whether listed or not. Sorted in canonical (LC_ALL=C) order; every row must run in the lane or the gate fails.
+poot-llm::rocm_parity_models	softcapped_qwen2_matches_the_oracle_on_rocm	poot-llm `rocm_parity_models` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-rocm-device::bin/rocm-check	tests::a_missing_device_is_a_failure_when_rocm_is_required	host-only check of the rocm-check binary's own logic: needs no device, and runs under `just test`
+poot-rocm-device::bin/rocm-check	tests::out_of_resources_is_no_device_only_without_the_kfd_node	host-only check of the rocm-check binary's own logic: needs no device, and runs under `just test`
+poot-rocm-device::bin/rocm-check	tests::pcie_receipt_skip_is_decided_by_the_rocm_requirement_only	host-only check of the rocm-check binary's own logic: needs no device, and runs under `just test`
+poot-rocm-device::pcie_receipt	pcie_receipt_without_the_env_reaches_the_device_checks	runs rocm-check's PCIe receipt mode, which skips by design on an APU; the discrete-GPU receipt is a pod row
+poot-rocm-runtime	context::caps_tests::a_failed_query_stays_unknown_not_a_guessed_default	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	context::caps_tests::agent_values_come_out_in_their_own_caps_fields	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	publication::tests::admitted_359_packet_graph_reports_one_successful_production_submission	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	publication::tests::coherent_device_ring_has_no_pcie_fence	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	publication::tests::empty_replay_has_no_reservation_or_publication	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	publication::tests::host_coherent_ring_has_no_device_fence_and_preserves_publication_order	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	publication::tests::pcie_device_ring_fences_each_chunk_between_bodies_and_reverse_headers	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	publication::tests::single_packet_dispatch_orders_body_then_fence_then_header_then_doorbell	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	publication::tests::unknown_ring_or_device_link_rejects_before_reservation	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	publication::tests::unsupported_pcie_host_rejects_before_reservation	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::allocation_arithmetic_is_checked_before_native_allocation	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::bf16_packed_word_rejected_by_dense_i32_bind	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::completion_wait_policy_spins_before_it_blocks	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::completion_wait_policy_stops_at_a_reported_device_fault	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::completion_wait_policy_times_out_on_a_signal_that_never_drops	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::device_ring_provenance_fails_closed_unless_the_override_held_throughout	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::dispatch_geometry_table_refuses_each_malformed_shape_with_its_own_violation	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::each_creation_plan_publishes_through_its_own_ring_contract	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::fnv1a_known_value	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::hsa_queue_constants_match_the_public_abi	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::hsa_status_describe_known_codes	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::immutable_metadata_and_valid_copy_share_one_allocation_contract	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::kernel_symbol_matching_is_exact_except_for_amdhsa_descriptor_suffix	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::narrow_buffer_rejected_by_f32_operation_before_copy	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::one_queue_reference_is_destroyed_once	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::overflowing_partial_offset_makes_zero_copy_calls	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::ownership_allocation_frees_once_after_clones_and_thread_handoff	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::ownership_module_constructor_errors_unwind_every_acquired_handle	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::ownership_module_destroys_executable_before_runtime_after_thread_handoff	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::ownership_multiple_runtime_owners_cleanup_independently	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::ownership_resources_are_send	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::poisoned_context_keeps_its_queue_and_healthy_one_destroys_it	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::poisoned_runtime_neither_frees_allocations_nor_destroys_executables	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::production_body_writer_leaves_header_invalid_on_synthetic_ring	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::profiling_ticks_convert_with_the_system_timestamp_frequency	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::queue_role_and_ring_provenance_are_independent_contracts	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::raw_byte_range_and_kernarg_size_reject_before_boundary_calls	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::rejected_oversized_write_makes_zero_copy_calls	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::returned_queue_contract_is_validated_before_use	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::ring_writer_completion_signal_rides_only_the_final_packet	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::ring_writer_device_store_fence_issues_the_architecture_fence	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::ring_writer_gives_each_timed_packet_its_own_completion_signal	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::ring_writer_write_body_uses_the_shared_body_writer	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::rocm_context_open_is_required_by_its_own_variable_only	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::the_queue_error_callback_records_the_fault_and_poisons	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::upload_strategy_cpu_pool_is_host_write	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::upload_strategy_gpu_coarse_grained_is_dma	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::upload_strategy_gpu_extended_scope_fine_is_host_write	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::upload_strategy_gpu_plain_fine_grained_is_dma	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`

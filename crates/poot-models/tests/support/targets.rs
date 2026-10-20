@@ -1,5 +1,5 @@
 //! The reference targets every poot-models planning test compiles for: the plan-summary gate and the
-//! feature matrix share them, so a column of the matrix and a checked-in summary file name one target.
+//! feature matrix share them, so a column of the matrix and the checked-in digests name one target.
 #![allow(
     dead_code,
     reason = "shared by two test binaries (plan_summary, feature_matrix); each uses part of it"
@@ -7,20 +7,20 @@
 use poot_graph_plan::{CompileLimits, CompileOptions, Target};
 use poot_target::{AmdArch, Backend};
 
-/// One planner target with the name its matrix column and its plan-summary file carry.
+/// One planner target with the name its matrix column and its plan digests carry.
 pub(crate) struct RefTarget {
     /// The column heading in the generated feature matrix.
     pub column: &'static str,
-    /// The stem of the checked-in `plan_summary/<file>.tsv`.
-    pub file: &'static str,
+    /// The target's id in the checked-in plan digests.
+    pub id: &'static str,
     pub target: Target,
 }
 
 /// A reference target over the device caps the test-util preset gives `backend`.
-pub(crate) fn preset(column: &'static str, file: &'static str, backend: Backend) -> RefTarget {
+pub(crate) fn preset(column: &'static str, id: &'static str, backend: Backend) -> RefTarget {
     RefTarget {
         column,
-        file,
+        id,
         target: Target::Gpu {
             backend,
             caps: poot_test_util::device_caps::default_caps_for(backend),

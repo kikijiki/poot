@@ -63,7 +63,6 @@ pub fn top_p_threshold(total: u64, top_p: f32) -> u64 {
 /// One row's `(token, non_finite_index)`. `params` is `(inv_temp, floor_offset, noise_scale)`; `top_k`
 /// is `None` when the rule has no top-k operand, `Some(k)` otherwise (`k <= 0` disables it, matching the
 /// kernel); `top_p` is `None` unless `rule` is `GumbelTopKTopP`.
-#[allow(clippy::too_many_arguments)]
 fn sample_one_row(
     logits: &[f32],
     noise: Option<&[f32]>,

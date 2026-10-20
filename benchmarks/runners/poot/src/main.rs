@@ -22,11 +22,16 @@
 //! line records the engine. The driver prefills a decode-curve context in the pieces of the chunk
 //! plan and a single-mode prompt in one forward under `--prefill`, token by token without it.
 //!
-//! Only `--precision f32|bf16|f16` are accepted: the engine loads bf16/f16 weights and computes in f32.
+//! `--precision` names what the caller expects the checkpoint to store (`bf16`, `f16`, `q8_0`, ...). The
+//! result's `precision` is what the driver's store holds (the dtype most of its bytes are stored in), read
+//! after the load, never the request echoed back: a request the store does not hold fails the cell. The
+//! engine computes in `COMPUTE_DTYPE`, reported as `compute_dtype`.
 //!
-//! When the runner refuses a request (see `refusal`: an architecture the loader does not serve, or a
-//! precision it cannot load), the line reports
-//! `"status":"unsupported"` with the refusal's own text as `reason`; any other failure exits non-zero.
+//! When the runner refuses a request (see `refusal`: an architecture or shape the loader or planner does
+//! not serve), the line reports `"status":"unsupported"` with the refusal's own text as `reason`; any
+//! other failure exits non-zero. Every result names its build (`build_sha`, `build_profile`,
+//! `build_features`, `rustc_version`); a measurement also names the adapter and driver it ran on and the
+//! digest of the checkpoint's stored weights. The runner measures only when built with the release profile.
 //! Built with a plain `cargo build --release -p poot-bench-runner` (kernels are generated at runtime).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -50,10 +55,20 @@ use poot_llm::driver::{
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::registry::Registry;
 use poot_profile::{Ceiling, Fit, GB};
-use poot_quant::weights::WeightEntry;
+use poot_quant::weights::{WeightEntry, WeightStore};
 
 /// The git sha this binary was built from (`build.rs`); the harness records it with every result.
 const BUILD_SHA: &str = env!("POOT_BUILD_SHA");
+/// The cargo profile (`release` or `debug`), the runner's enabled features (comma-separated) and the compiler
+/// this binary was built with (`build.rs`); recorded with every result beside the sha.
+const BUILD_PROFILE: &str = env!("POOT_BUILD_PROFILE");
+const BUILD_FEATURES: &str = env!("POOT_BUILD_FEATURES");
+const RUSTC_VERSION: &str = env!("POOT_RUSTC_VERSION");
+
+/// The dtype the engine computes in whatever the weights are stored in: matmuls accumulate in f32 and the
+/// activations are f32. Reported beside the resident weight dtype so a row never reads a stored dtype as a
+/// compute one.
+const COMPUTE_DTYPE: &str = "f32";
 
 /// The context every decode-curve point cycles to reach its exact length.
 const CURVE_BASE_PHRASE: &str = "The quick brown fox jumps over the lazy dog. ";
@@ -664,34 +679,80 @@ impl Generate for DriverCell {
     }
 }
 
-/// The precision a loaded GGUF reports: the format most of its packed weights are stored in.
-fn dominant_packed_format(handle: &ModelHandle, path: &str) -> anyhow::Result<String> {
-    let mut counts = BTreeMap::<String, usize>::new();
-    for (_, entry) in handle.store().iter() {
-        if let WeightEntry::Packed(payload) = entry {
-            *counts
-                .entry(format!("{:?}", payload.weight().format()).to_lowercase())
-                .or_default() += 1;
+/// A stored weight's dtype as a precision name: the checkpoint dtype of a dense tensor (`bf16`), the format of
+/// a packed one without its parameters (`q8_0`, `e4m3block128`).
+fn stored_name(entry: &WeightEntry) -> String {
+    match entry {
+        WeightEntry::Dense(dense) => dense.dtype().to_string(),
+        WeightEntry::Packed(payload) => {
+            let format = format!("{:?}", payload.weight().format());
+            format
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or_default()
+                .to_lowercase()
         }
     }
-    counts
+}
+
+/// The precision the store holds: the dtype most of its stored bytes are in.
+fn resident_precision(store: &WeightStore) -> anyhow::Result<String> {
+    let mut bytes = BTreeMap::<String, usize>::new();
+    for (_, entry) in store.iter() {
+        *bytes.entry(stored_name(entry)).or_default() += entry.stored_bytes();
+    }
+    bytes
         .into_iter()
-        .max_by_key(|&(_, n)| n)
-        .map(|(format, _)| format)
-        .ok_or_else(|| anyhow::anyhow!("{path}: no weight is stored packed"))
+        .max_by_key(|&(_, stored)| stored)
+        .map(|(name, _)| name)
+        .ok_or_else(|| anyhow::anyhow!("the store holds no weight"))
+}
+
+/// The cell's precision is the store's: a request for another dtype is the caller's mistake, and reporting the
+/// request back would label the measurement with a precision it did not run.
+fn ensure_store_holds(requested: &str, store: &WeightStore) -> anyhow::Result<String> {
+    let resident = resident_precision(store)?;
+    anyhow::ensure!(
+        resident == requested,
+        "--precision {requested} but the checkpoint's store holds {resident}"
+    );
+    Ok(resident)
+}
+
+/// A digest of the checkpoint's content as the driver holds it: every weight's name, shape, stored dtype and
+/// stored bytes in key order. Two checkpoints with one name but different weights digest differently.
+fn checkpoint_digest(store: &WeightStore) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (key, entry) in store.iter() {
+        hasher.update(key.to_string().as_bytes());
+        hasher.update(format!("{:?}", entry.shape()).as_bytes());
+        hasher.update(stored_name(entry).as_bytes());
+        match entry {
+            WeightEntry::Dense(dense) => {
+                hasher.update(dense.bytes().as_slice());
+            }
+            WeightEntry::Packed(payload) => {
+                for role in payload.weight().sources() {
+                    hasher.update(payload.bytes(role));
+                }
+            }
+        }
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
 }
 
 /// The driver engine over a loaded registered family: size every driver's KV to the longest request the
-/// mode makes, and name the precision to report.
+/// mode makes, and name what the cell ran on: the store's precision, the adapter and driver version the
+/// executor reports, and the checkpoint's digest.
 fn open_driver(
     config: &Config,
     handle: ModelHandle,
-) -> anyhow::Result<(Box<dyn Generate>, String)> {
+    family: &str,
+) -> anyhow::Result<(Box<dyn Generate>, Resolved)> {
     let handle = Arc::new(handle);
-    let precision = match &config.weights {
-        Weights::Safetensors(_) => config.precision.clone(),
-        Weights::Gguf(path) => dominant_packed_format(&handle, path)?,
-    };
+    // Before an executor opens: a request the checkpoint does not hold needs no device.
+    let precision = ensure_store_holds(&config.precision, handle.store())?;
+    let checkpoint_digest = checkpoint_digest(handle.store());
     let backend = match config.backend {
         Backend::Ptx => BackendChoice::Ptx,
         Backend::Rocm => BackendChoice::Rocm,
@@ -722,6 +783,9 @@ fn open_driver(
         open_executor(backend)
     }
     .context("open the executor")?;
+    let device = executor
+        .device_identity()
+        .context("the device cannot name its adapter and driver")?;
     let driver = Driver::new(
         Arc::clone(&handle),
         executor,
@@ -754,16 +818,31 @@ fn open_driver(
             mark: None,
             decode: PhaseTiming::default(),
         }),
-        precision,
+        Resolved {
+            family: family.to_string(),
+            precision,
+            adapter: device.adapter,
+            driver_version: device.driver,
+            checkpoint_digest,
+        },
     ))
 }
 
-/// A cell that opened: the engine, the precision to report (the requested one for a checkpoint, the
-/// dominant stored packed format for a GGUF) and the registry family the checkpoint resolved to.
+/// What an opened cell ran on, as the opened driver reports it rather than as the request named it: the
+/// registry family the checkpoint resolved to, the precision its store holds, the adapter and driver version
+/// of the device and the digest of the weights it loaded.
+struct Resolved {
+    family: String,
+    precision: String,
+    adapter: String,
+    driver_version: String,
+    checkpoint_digest: String,
+}
+
+/// A cell that opened: the engine and what it ran on.
 struct Opened {
     engine: Box<dyn Generate>,
-    precision: String,
-    family: String,
+    resolved: Resolved,
 }
 
 /// A cell that did not open. `family` is the registry family the checkpoint resolved to, `None` when
@@ -785,16 +864,6 @@ impl From<anyhow::Error> for OpenFailure {
 
 /// Load the model and open the backend's executor.
 fn open(config: &Config) -> Result<Opened, OpenFailure> {
-    // poot loads f32/bf16/f16 safetensors and computes in f32. Asking for another precision is asked
-    // before any weight is read, so a 20B checkpoint is not loaded to be turned down.
-    if !matches!(config.precision.as_str(), "f32" | "bf16" | "f16") {
-        return Err(anyhow::Error::from(Declined(format!(
-            "poot bench runner loads f32/bf16/f16 checkpoints (computes f32); got {:?}. \
-             Quantized formats (fp8/gptq/awq/mxfp4) are on the roadmap.",
-            config.precision
-        )))
-        .into());
-    }
     let path = match &config.weights {
         Weights::Safetensors(path) | Weights::Gguf(path) => path.as_str(),
     };
@@ -807,12 +876,8 @@ fn open(config: &Config) -> Result<Opened, OpenFailure> {
     )
     .map_err(|error| anyhow::Error::from(error).context(format!("load {path}")))?;
     let family = handle.config().family.to_string();
-    match open_driver(config, handle) {
-        Ok((engine, precision)) => Ok(Opened {
-            engine,
-            precision,
-            family,
-        }),
+    match open_driver(config, handle, &family) {
+        Ok((engine, resolved)) => Ok(Opened { engine, resolved }),
         Err(error) => Err(OpenFailure {
             family: Some(family),
             error,
@@ -1071,8 +1136,7 @@ fn timed_request(
 fn measure(
     config: &Config,
     engine: &mut dyn Generate,
-    precision: &str,
-    family: &str,
+    resolved: &Resolved,
 ) -> anyhow::Result<Value> {
     let mut probe = PreparationProbe::new(config.prepared_state, config.artifact_entries_at_start);
     let body = match config.mode {
@@ -1081,11 +1145,15 @@ fn measure(
     };
     let mut line = identity(
         Some(engine.engine()),
-        Some(family),
+        Some(&resolved.family),
         config.backend,
         config.mode,
-        precision,
+        &resolved.precision,
     );
+    line["compute_dtype"] = json!(COMPUTE_DTYPE);
+    line["adapter"] = json!(resolved.adapter);
+    line["driver_version"] = json!(resolved.driver_version);
+    line["checkpoint_digest"] = json!(resolved.checkpoint_digest);
     line["profiled"] = json!(config.profile);
     line["preparation"] = probe.receipt();
     if let Some(receipt) = engine.engine_receipt() {
@@ -1099,10 +1167,11 @@ fn measure(
     Ok(line)
 }
 
-/// What every result line carries: which build produced it, with which engine (when one was chosen), on
-/// which backend, in which mode. The harness checks `backend` against the one it requested and refuses a
-/// result with no `build_sha`. `family` is the registry family the checkpoint resolved to, as the registry
-/// reports it (never a mapping from the manifest); `null` on a refusal that came before one resolved.
+/// What every result line carries: which build produced it (sha, profile, features, compiler), with which
+/// engine (when one was chosen), on which backend, in which mode. The harness checks `backend` against the one
+/// it requested and refuses a result with no build identity. `family` is the registry family the checkpoint
+/// resolved to, as the registry reports it (never a mapping from the manifest); `null` on a refusal that came
+/// before one resolved. A measurement adds what only an opened cell knows (see [`measure`]).
 fn identity(
     engine: Option<Engine>,
     family: Option<&str>,
@@ -1113,6 +1182,9 @@ fn identity(
     let mut line = json!({
         "framework": "poot",
         "build_sha": BUILD_SHA,
+        "build_profile": BUILD_PROFILE,
+        "build_features": BUILD_FEATURES,
+        "rustc_version": RUSTC_VERSION,
         "family": family,
         "backend": backend.label(),
         "mode": mode.label(),
@@ -1386,31 +1458,16 @@ fn print_profile(profile: Option<Profile>) -> Value {
     profile.device_time
 }
 
-/// A request the runner itself does not serve (a precision it cannot load). Reported like any refusal.
-#[derive(Debug)]
-struct Declined(String);
-
-impl std::fmt::Display for Declined {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Declined {}
-
 /// The refusal a failure carries, if it is one, as its own text. This is the runner's only classification
-/// of "poot does not run this": [`Declined`], or the driver's [`DriverError::Unsupported`]
-/// (a family the registry does not hold, a shape the family or the planner refuses), found anywhere in
-/// the error chain.
+/// of "poot does not run this": the driver's [`DriverError::Unsupported`] (a family the registry does not
+/// hold, a shape the family or the planner refuses), found anywhere in the error chain.
 fn refusal(error: &anyhow::Error) -> Option<(Option<Engine>, String)> {
-    error.chain().find_map(|cause| {
-        if let Some(DriverError::Unsupported(_)) = cause.downcast_ref::<DriverError>() {
-            return Some((Some(Engine::Driver), cause.to_string()));
-        }
-        cause
-            .downcast_ref::<Declined>()
-            .map(|declined| (None, declined.to_string()))
-    })
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<DriverError>() {
+            Some(DriverError::Unsupported(_)) => Some((Some(Engine::Driver), cause.to_string())),
+            _ => None,
+        })
 }
 
 /// The result line for `outcome`: the measurement, or the refusal recorded as `unsupported` with the
@@ -1448,22 +1505,32 @@ fn run(config: &Config) -> anyhow::Result<Value> {
     let (family, outcome) = match open(config) {
         Ok(mut opened) => {
             let open_ms = round3(ms(open_start.elapsed()));
-            let outcome = measure(
-                config,
-                opened.engine.as_mut(),
-                &opened.precision,
-                &opened.family,
-            )
-            .map(|mut line| {
-                // Loading is timed apart from every request: it happens before the first one.
-                line["preparation"]["open_ms"] = json!(open_ms);
-                line
-            });
-            (Some(opened.family), outcome)
+            let outcome =
+                measure(config, opened.engine.as_mut(), &opened.resolved).map(|mut line| {
+                    // Loading is timed apart from every request: it happens before the first one.
+                    line["preparation"]["open_ms"] = json!(open_ms);
+                    line
+                });
+            (Some(opened.resolved.family), outcome)
         }
         Err(failure) => (failure.family, Err(failure.error)),
     };
     result_line(config, family.as_deref(), outcome)
+}
+
+/// Why a binary built with `profile` is not one to measure, or `None` for a release build. A debug build
+/// reports times of code nobody ships; the harness would record them as a result, so the runner refuses
+/// before it opens anything.
+fn non_release_build(profile: &str, debug_assertions: bool) -> Option<String> {
+    if profile != "release" {
+        return Some(format!(
+            "this runner is a {profile} build; benchmark results come from `cargo build --release` only"
+        ));
+    }
+    debug_assertions.then(|| {
+        "this runner is built with debug assertions; benchmark results come from `cargo build --release` only"
+            .to_string()
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1479,6 +1546,9 @@ fn main() -> anyhow::Result<()> {
         }
         Invocation::Run(config) => config,
     };
+    if let Some(reason) = non_release_build(BUILD_PROFILE, cfg!(debug_assertions)) {
+        anyhow::bail!(reason);
+    }
     println!("{}", run(&config)?);
     Ok(())
 }
@@ -1516,6 +1586,22 @@ fn stdev(xs: &[f64]) -> f64 {
 }
 
 #[cfg(test)]
+mod stub_cell {
+    use super::Resolved;
+
+    /// What a stub engine's cell ran on: a fixed store precision, device and digest.
+    pub(super) fn resolved(family: &str) -> Resolved {
+        Resolved {
+            family: family.to_string(),
+            precision: "bf16".to_string(),
+            adapter: "stub adapter".to_string(),
+            driver_version: "stub driver 1.0".to_string(),
+            checkpoint_digest: format!("blake3:{}", "0".repeat(64)),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::io::Write;
@@ -1523,6 +1609,7 @@ mod tests {
 
     use poot_llm::driver::error::Unsupported;
 
+    use super::stub_cell::resolved;
     use super::*;
 
     /// `CARGO_MANIFEST_DIR`, read at runtime (not baked via `env!`): the compile-time macro's value is
@@ -1753,7 +1840,7 @@ mod tests {
             ]);
             single.backend = backend;
             let mut stub = Stub::new();
-            let line = measure(&single, &mut stub, "bf16", "stub_family").unwrap();
+            let line = measure(&single, &mut stub, &resolved("stub_family")).unwrap();
             let mut expected = prompt_events(3, 6, true);
             expected.push(Event::ResetProfile);
             expected.extend(prompt_events(4, 6, true));
@@ -1777,7 +1864,7 @@ mod tests {
             ]);
             curve.backend = backend;
             let mut stub = Stub::new();
-            let line = measure(&curve, &mut stub, "bf16", "stub_family").unwrap();
+            let line = measure(&curve, &mut stub, &resolved("stub_family")).unwrap();
             let mut expected = Vec::new();
             for isl in [8, 16, 32] {
                 expected.extend(context_events(2 + 3, isl, 5));
@@ -1801,9 +1888,21 @@ mod tests {
         }
     }
 
+    /// `line` as a release runner would print it. These tests run in a dev-profile binary, which the harness's
+    /// contract refuses as a result: the line must name that profile (it does), and only the profile is then
+    /// stated as the release one so the rest of the contract is judged. That a debug runner measures nothing is
+    /// `only_a_release_build_without_debug_assertions_measures` and `tests/release_only.rs`.
+    fn as_release_line(line: &Value) -> Value {
+        assert_eq!(line["build_profile"], BUILD_PROFILE);
+        let mut release = line.clone();
+        release["build_profile"] = json!("release");
+        release
+    }
+
     /// Run the harness's own runner-result validation over `line`, as the harness would before it turns
     /// the line into a row. The runner and the harness must agree on one contract, and the harness owns it.
     fn harness_accepts(line: &Value, curve: bool, gen_tokens: usize, backend: Backend) {
+        let line = &as_release_line(line);
         let harness = format!("{}/../../harness", manifest_dir());
         let script = format!(
             "import json, sys\n\
@@ -1855,7 +1954,7 @@ mod tests {
                 "6",
             ]);
             config.backend = Backend::Rocm;
-            let outcome = measure(&config, &mut Stub::new(), "bf16", "stub_family");
+            let outcome = measure(&config, &mut Stub::new(), &resolved("stub_family"));
             let line = result_line(&config, None, outcome).unwrap();
             let text = line.to_string();
             assert!(!text.contains('\n'), "{mode:?}: the result is one line");
@@ -1894,7 +1993,7 @@ mod tests {
                 }
                 let mut config = config(&args);
                 config.backend = Backend::Rocm;
-                let outcome = measure(&config, &mut Stub::new(), "bf16", "stub_family");
+                let outcome = measure(&config, &mut Stub::new(), &resolved("stub_family"));
                 let line = result_line(&config, None, outcome).unwrap();
                 let expected = if profile {
                     json!({ "kind": "unknown" })
@@ -1951,6 +2050,7 @@ mod tests {
 
     /// The reason the harness records for `line`, read through the harness's own `runner_refusal`.
     fn harness_refusal(line: &Value, backend: Backend) -> String {
+        let line = &as_release_line(line);
         let harness = format!("{}/../../harness", manifest_dir());
         let script = format!(
             "import json, sys\n\
@@ -1996,7 +2096,7 @@ mod tests {
         let line = result_line(
             &config,
             Some("stub_family"),
-            measure(&config, &mut stub, "bf16", "stub_family"),
+            measure(&config, &mut stub, &resolved("stub_family")),
         )
         .unwrap();
         assert_eq!(line["status"], "unsupported");
@@ -2012,7 +2112,7 @@ mod tests {
         let error = result_line(
             &config,
             Some("stub_family"),
-            measure(&config, &mut stub, "bf16", "stub_family"),
+            measure(&config, &mut stub, &resolved("stub_family")),
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "out of memory");
@@ -2062,20 +2162,111 @@ mod tests {
         );
     }
 
-    /// A precision the runner cannot load is a refusal reported before any weight is read: the directory
-    /// here does not exist, so a load attempt would be a different (error) outcome.
-    #[test]
-    fn an_unloadable_precision_is_a_refusal_before_the_model_is_read() {
-        let config = config(&["--precision", "mxfp4"]);
-        let line = run(&config).unwrap();
-        assert_eq!(line["status"], "unsupported");
-        assert_eq!(line["precision"], "mxfp4");
-        let reason = line["reason"].as_str().unwrap();
-        assert!(
-            reason.contains("loads f32/bf16/f16 checkpoints") && reason.contains("mxfp4"),
-            "{reason}"
+    /// A tiny qwen2 checkpoint (config, word-level tokenizer, BF16 weights) in a fresh temp directory.
+    fn tiny_bf16_checkpoint(name: &str) -> std::path::PathBuf {
+        use poot_models::test_support::weight_map::{qwen2, Projections, DIMS};
+        use tokenizers::models::wordlevel::WordLevel;
+
+        let dir = config_only_checkpoint(
+            name,
+            &json!({
+                "model_type": "qwen2",
+                "vocab_size": DIMS.vocab,
+                "hidden_size": DIMS.hidden,
+                "intermediate_size": DIMS.inter,
+                "num_hidden_layers": DIMS.layers,
+                "num_attention_heads": DIMS.heads,
+                "num_key_value_heads": DIMS.kv_heads,
+                "rms_norm_eps": 1e-6,
+                "max_position_embeddings": 64,
+                "rope_theta": 10000.0,
+                "tie_word_embeddings": false,
+                "eos_token_id": DIMS.vocab - 1,
+                "bos_token_id": 1,
+            })
+            .to_string(),
         );
-        assert_eq!(harness_refusal(&line, Backend::Ptx), reason);
+        let vocab = (0..DIMS.vocab)
+            .map(|id| (format!("w{id}"), id as u32))
+            .collect();
+        let tokenizer = tokenizers::Tokenizer::new(
+            WordLevel::builder()
+                .vocab(vocab)
+                .unk_token("w0".to_string())
+                .build()
+                .unwrap(),
+        );
+        tokenizer.save(dir.join("tokenizer.json"), false).unwrap();
+        let mapped = qwen2(DIMS, Projections::Bf16, poot_tensor::DType::BF16);
+        poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &mapped.store);
+        dir
+    }
+
+    /// SC-002 (real entry): the cell's precision is what the loaded store holds. A BF16 checkpoint asked for as
+    /// F16 fails inside `open`, before any device opens, with both sides named; it is not a refusal, and no
+    /// result line is printed for it. Mutation: report `config.precision` instead of the store's (the request
+    /// echoed back): the F16 request opens and this goes red.
+    #[test]
+    fn a_request_the_checkpoint_does_not_hold_fails_before_a_device_opens() {
+        let dir = tiny_bf16_checkpoint("store-precision");
+        let mut config = config(&["--precision", "f16"]);
+        config.weights = Weights::Safetensors(dir.display().to_string());
+        let error = run(&config).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(
+            format!("{error:#}").contains("--precision f16 but the checkpoint's store holds bf16"),
+            "{error:#}"
+        );
+        assert!(
+            refusal(&error).is_none(),
+            "a precision disagreement is a failure, not a refusal"
+        );
+    }
+
+    /// The store a Q8_0-projection checkpoint holds reports `q8_0`, so a `bf16` request against it fails and a
+    /// `q8_0` request does not; a BF16 store reports `bf16`. The same function `open_driver` calls decides.
+    #[test]
+    fn the_store_names_its_dominant_dtype() {
+        use poot_models::test_support::weight_map::{qwen2, Projections, DIMS};
+
+        let bf16 = qwen2(DIMS, Projections::Bf16, poot_tensor::DType::BF16);
+        let q8_0 = qwen2(DIMS, Projections::Q8_0, poot_tensor::DType::BF16);
+
+        assert_eq!(ensure_store_holds("bf16", &bf16.store).unwrap(), "bf16");
+        assert_eq!(ensure_store_holds("q8_0", &q8_0.store).unwrap(), "q8_0");
+        let error = ensure_store_holds("bf16", &q8_0.store).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--precision bf16 but the checkpoint's store holds q8_0"
+        );
+    }
+
+    /// The checkpoint digest follows the stored bytes: the same store digests the same, a store differing in
+    /// one weight byte does not, and the digest names its algorithm.
+    #[test]
+    fn the_checkpoint_digest_follows_the_stored_bytes() {
+        use poot_models::test_support::weight_map::{qwen2, Projections, DIMS};
+
+        let bf16 = qwen2(DIMS, Projections::Bf16, poot_tensor::DType::BF16);
+        let f32_embed = qwen2(DIMS, Projections::Bf16, poot_tensor::DType::F32);
+        let again = qwen2(DIMS, Projections::Bf16, poot_tensor::DType::BF16);
+
+        let digest = checkpoint_digest(&bf16.store);
+        assert!(digest.starts_with("blake3:") && digest.len() == "blake3:".len() + 64);
+        assert_eq!(digest, checkpoint_digest(&again.store));
+        assert_ne!(digest, checkpoint_digest(&f32_embed.store));
+    }
+
+    /// The runner measures release builds only: a debug profile, or debug assertions in a release one, is
+    /// refused with the reason. Mutation: return `None` for every profile; the debug case goes red.
+    #[test]
+    fn only_a_release_build_without_debug_assertions_measures() {
+        assert_eq!(non_release_build("release", false), None);
+        assert!(non_release_build("debug", false).is_some_and(|why| why.contains("debug build")));
+        assert!(
+            non_release_build("release", true).is_some_and(|why| why.contains("debug assertions"))
+        );
     }
 
     #[test]
@@ -2096,7 +2287,7 @@ mod tests {
         let mut stub = Stub::new();
         stub.fail_at_isl = Some(16);
         stub.error = || anyhow::anyhow!("CUDA out of memory\nbacktrace");
-        let line = measure(&config, &mut stub, "bf16", "stub_family").unwrap();
+        let line = measure(&config, &mut stub, &resolved("stub_family")).unwrap();
         assert_eq!(line["curve"].as_array().unwrap().len(), 1);
         assert_eq!(
             line["caveats"],
@@ -2105,7 +2296,7 @@ mod tests {
 
         stub.fail_at_isl = Some(8);
         stub.error = refused;
-        let outcome = measure(&config, &mut stub, "bf16", "stub_family");
+        let outcome = measure(&config, &mut stub, &resolved("stub_family"));
         let line = result_line(&config, None, outcome).unwrap();
         assert_eq!(line["status"], "unsupported");
     }
@@ -2162,7 +2353,7 @@ mod tests {
             "--iters",
             "1",
         ]);
-        let line = measure(&config, &mut Panics, "bf16", "stub_family").unwrap();
+        let line = measure(&config, &mut Panics, &resolved("stub_family")).unwrap();
         assert_eq!(line["curve"].as_array().unwrap().len(), 1);
         let caveat = line["caveats"][0].as_str().unwrap();
         assert!(caveat.starts_with("isl 16+ omitted: "), "{caveat}");
@@ -2336,6 +2527,7 @@ mod request_timing_tests {
 
 #[cfg(test)]
 mod preparation_tests {
+    use super::stub_cell::resolved;
     use super::*;
     use std::cell::Cell;
 
@@ -2464,7 +2656,7 @@ mod preparation_tests {
     #[test]
     fn preparation_separates_what_the_set_cost_from_what_repeating_it_added() {
         let config = config(&["--warmup", "2", "--iters", "3", "--gen-tokens", "3"]);
-        let line = measure(&config, &mut Counting::new(4, 0), "bf16", "f").unwrap();
+        let line = measure(&config, &mut Counting::new(4, 0), &resolved("f")).unwrap();
 
         assert_eq!(layer(&line, "plan"), (json!(4), json!(0)));
         assert_eq!(layer(&line, "recordings"), (json!(4), json!(0)));
@@ -2486,7 +2678,7 @@ mod preparation_tests {
     #[test]
     fn work_inside_the_timed_window_is_counted_as_repeat_work() {
         let config = config(&["--warmup", "1", "--iters", "3", "--gen-tokens", "3"]);
-        let line = measure(&config, &mut Counting::new(4, 1), "bf16", "f").unwrap();
+        let line = measure(&config, &mut Counting::new(4, 1), &resolved("f")).unwrap();
 
         // Three timed requests each redo one unit: the layer is not warm.
         assert_eq!(layer(&line, "plan"), (json!(4), json!(3)));
@@ -2502,15 +2694,13 @@ mod preparation_tests {
         let cold_line = measure(
             &cold,
             &mut Counting::new(0, 0).prepared_while_opening(5),
-            "bf16",
-            "f",
+            &resolved("f"),
         )
         .unwrap();
         let reused_line = measure(
             &reused,
             &mut Counting::new(0, 0).prepared_while_opening(5),
-            "bf16",
-            "f",
+            &resolved("f"),
         )
         .unwrap();
 
@@ -2552,8 +2742,7 @@ mod preparation_tests {
         let line = measure(
             &config,
             &mut Counting::new(4, 0).redoing_recordings(1),
-            "bf16",
-            "f",
+            &resolved("f"),
         )
         .unwrap();
 
@@ -2584,8 +2773,8 @@ mod preparation_tests {
             "reused-prepared-driver",
         ]);
 
-        let cold_line = measure(&cold, &mut Counting::new(4, 0), "bf16", "f").unwrap();
-        let reused_line = measure(&reused, &mut Counting::new(4, 0), "bf16", "f").unwrap();
+        let cold_line = measure(&cold, &mut Counting::new(4, 0), &resolved("f")).unwrap();
+        let reused_line = measure(&reused, &mut Counting::new(4, 0), &resolved("f")).unwrap();
 
         assert_eq!(layer(&cold_line, "plan").0, json!(4));
         assert_eq!(layer(&reused_line, "plan").0, json!(0));
@@ -2611,7 +2800,7 @@ mod preparation_tests {
             "2",
         ]);
         // Each context's first request is cold in this engine only once; later requests add nothing.
-        let line = measure(&config, &mut Counting::new(2, 0), "bf16", "f").unwrap();
+        let line = measure(&config, &mut Counting::new(2, 0), &resolved("f")).unwrap();
         assert_eq!(layer(&line, "plan"), (json!(2), json!(0)));
     }
 

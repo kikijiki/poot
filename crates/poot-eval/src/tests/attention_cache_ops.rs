@@ -265,7 +265,7 @@ fn matmul_matches_naive() {
 #[test]
 // `st[0] * 0` / `st[0] * 1` below are the row indices in the stride formula (kept parallel across the two row
 // assertions); the explicit form triggers erasing_op/identity_op.
-#[allow(clippy::erasing_op, clippy::identity_op)]
+#[expect(clippy::erasing_op, clippy::identity_op)]
 fn dynamic_update_slice_writes_one_slot() {
     // a [2,4,3] cache; write a [2,1,3] update at slot index 2 on axis 1, the rest unchanged.
     let b = Builder::for_tests();

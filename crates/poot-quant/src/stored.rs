@@ -12,7 +12,7 @@
 //! binders run at their boundaries; one racing a read in flight is not detected (a truncation ends the
 //! process with `SIGBUS` before any torn value is used). Replacing a checkpoint by rename is always safe.
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 mod mapping;
 
 use std::fmt;

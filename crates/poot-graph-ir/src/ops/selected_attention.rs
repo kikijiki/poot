@@ -114,7 +114,7 @@ fn selected_block_mask(
 /// The output `[B, Hq, Lq, Dv]` of `OpKind::SelectedAttention` over `q`, `k`, `v`, `ids` and `pos`: dense attention
 /// under [`selected_block_mask`]. Quadratic in nothing but `Lk`, so a long context costs the oracle a dense
 /// attention and one `[B, Lq, K, blocks]` indicator.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn selected_attention(
     b: &Builder,
     q: Traced,

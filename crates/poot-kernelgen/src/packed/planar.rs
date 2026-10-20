@@ -120,7 +120,7 @@ impl PlanarPlan {
     /// format has one) and subtracts it from the code as an integer, before the one f32 cast
     /// (`poot_quant::decode::Formula::evaluate`'s `(code.integer() - zero) as f32`, never
     /// `code as f32 - zero as f32`): the codes bit reads to `emit_factors`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn emit_value(
         &self,
         e: &mut Emit,
@@ -193,7 +193,7 @@ impl PlanarPlan {
     /// divides) is decoded once. A `Float` format whose codes are one unpacked stored element per `K` index
     /// reads the whole run as one `count * bits` field (at most 32 bits) and slices it, so the address chain and
     /// the word loads are emitted once per run instead of once per element.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn emit_run(
         &self,
         e: &mut Emit,
@@ -259,7 +259,7 @@ impl PlanarPlan {
 
     /// [`Self::emit_run`]'s element-by-element form: each element addresses its own codes, and decodes its own
     /// factors unless `shared` holds the run's.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn emit_run_elements(
         &self,
         e: &mut Emit,
@@ -301,7 +301,7 @@ impl PlanarPlan {
 
     /// `operand`'s raw stored bits at logical `(o, k)`: `poot_quant::decode::read_planar`'s
     /// `element`/`lane`/`stored_shape`/bit-offset chain, emitted.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn emit_operand_bits(
         &self,
         e: &mut Emit,
@@ -318,7 +318,7 @@ impl PlanarPlan {
     }
 
     /// The bit offset in `operand`'s source of the stored bits at logical `(o, k)`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn emit_operand_bit(
         &self,
         e: &mut Emit,

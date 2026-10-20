@@ -633,7 +633,7 @@ impl RocmContext {
     /// When the batch exceeds half the queue size it is dispatched in chunks, spinning on `read_index`
     /// until each fits. Returns the number of physical AQL batch submissions (doorbell rings), which
     /// exceeds one when `dispatches` does not fit in a single chunk.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     pub fn enqueue_graph_batched(
         &self,
         dispatches: &[(KernelHandle, BoundKernarg, (u32, u32, u32), (u32, u32, u32))],
@@ -665,7 +665,7 @@ impl RocmContext {
     /// reserved ring slots, a failure (the queue-space wait timing out) can leave packets in flight and a slot
     /// reserved but never published, so it leaks the completion signal like a timed-out completion
     /// wait and poisons the context.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     fn enqueue(
         &self,
         dispatches: &[(KernelHandle, BoundKernarg, (u32, u32, u32), (u32, u32, u32))],
@@ -1017,10 +1017,6 @@ impl KernelHandle {
 pub struct BoundKernarg {
     kernarg: RocmBuffer,
     /// Held, never read: keeps each bound allocation alive for the kernarg's lifetime.
-    #[allow(
-        dead_code,
-        reason = "owned so a bound buffer outlives the packets that address it"
-    )]
     buffers: Arc<[RocmBuffer]>,
 }
 

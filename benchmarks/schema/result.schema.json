@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://poot/benchmarks/result.schema.json",
   "title": "poot benchmark result record",
-  "description": "One record per (framework, model, precision, scenario) cell. The harness writes one JSON object per line into results.jsonl. Timing fields come from the runner; memory fields come from the harness external sampler; the env block is written once per run into env.json (not repeated per row). Which binary, on which backend and device, produced a row is on the row itself (build_sha, binary_sha256, backend, device).",
+  "description": "One record per (framework, model, precision, scenario) cell. The harness writes one JSON object per line into results.jsonl. Timing fields come from the runner; memory fields come from the harness external sampler; the env block is written once per run into env.json (not repeated per row). Which binary, on which backend, adapter and device, produced a row is on the row itself: a poot row names its build (build_sha, build_profile, build_features, rustc_version), the adapter and driver the executor reported, the digest of the checkpoint it loaded and the dtype its weights are stored in (precision); an external tool row names its framework_version.",
   "definitions": {
     "deviceTime": {
       "description": "The device's own time for a profiled window (poot --profile): null when not profiled, `unknown` when the device reports none (ROCm, an untimed device), else measured milliseconds with at least one measure present. Never a zero standing for unknown.",
@@ -28,19 +28,25 @@
       ]
     },
     "nonnegativePercentiles": {
+      "description": "The median and observed range of the samples. p90 and p99 appear only from 20 samples on (harness/result_contract.py TAIL_PERCENTILE_MIN_SAMPLES), where they estimate a tail instead of interpolating between a handful of points.",
       "type": "object",
-      "required": ["p50", "p90", "p99"],
+      "required": ["p50", "min", "max"],
       "properties": {
         "p50": { "type": "number", "minimum": 0 },
+        "min": { "type": "number", "minimum": 0 },
+        "max": { "type": "number", "minimum": 0 },
         "p90": { "type": "number", "minimum": 0 },
         "p99": { "type": "number", "minimum": 0 }
       }
     },
     "positivePercentiles": {
+      "description": "As nonnegativePercentiles, for a strictly positive quantity.",
       "type": "object",
-      "required": ["p50", "p90", "p99"],
+      "required": ["p50", "min", "max"],
       "properties": {
         "p50": { "type": "number", "exclusiveMinimum": 0 },
+        "min": { "type": "number", "exclusiveMinimum": 0 },
+        "max": { "type": "number", "exclusiveMinimum": 0 },
         "p90": { "type": "number", "exclusiveMinimum": 0 },
         "p99": { "type": "number", "exclusiveMinimum": 0 }
       }
@@ -85,10 +91,20 @@
       "pattern": "[0-9a-f]{40}(-dirty)?",
       "description": "The git sha the runner binary was built from, embedded at build time and reported by the runner ('-dirty' when the tree had uncommitted changes). Reported by runners built from this repository (poot), which must give it on an 'ok' row and on a refusal ('unsupported'); absent from other engines' rows and from an 'error' row whose runner reported nothing."
     },
+    "build_profile": { "type": "string", "description": "poot: the cargo profile the runner was built with. Only `release` is a result (the runner refuses to measure otherwise). Part of a cell's comparable identity." },
+    "build_features": { "type": "string", "description": "poot: the runner's enabled cargo features, comma-separated, empty when none. Part of a cell's comparable identity." },
+    "rustc_version": { "type": "string", "description": "poot: the compiler the runner was built with (`rustc --version`). Part of a cell's comparable identity." },
+    "adapter": { "type": "string", "description": "poot: the adapter name the executor reported for the device it opened (not the host's first GPU). Part of a cell's comparable identity." },
+    "driver_version": { "type": "string", "description": "poot: the driver stack the executor's runtime reported (Mesa/Vulkan, HSA, CUDA). Part of a cell's comparable identity." },
+    "checkpoint_digest": { "type": "string", "pattern": "^blake3:[0-9a-f]{64}$", "description": "poot: blake3 over the stored weights the driver loaded (name, shape, stored dtype and bytes in key order). Two checkpoints under one model id digest differently. Part of a cell's comparable identity." },
+    "compute_dtype": { "type": "string", "description": "poot: the dtype the engine computes in; `precision` is the dtype the weights are stored in. Part of a cell's comparable identity." },
+    "engine": { "type": "string", "description": "poot: what generated the result (the driver's one loop)." },
+    "driver": { "type": "object", "description": "poot: the driver loop's own counters for the cell (prepared entries, retained bytes, compiles, steps, host picks, recordings and replays): a regression in compile or replay count shows in a stored row." },
+    "profiled": { "type": "boolean", "description": "poot: whether the runner timed the device (`--profile`). A profiled run is a diagnostic, never throughput evidence: it is stored apart (results/diagnostics/) and compares only with another profiled run." },
     "binary_sha256": {
       "type": ["string", "null"],
       "pattern": "[0-9a-f]{64}",
-      "description": "SHA-256 of the runner executable that was asked to run, read from the file by the harness; null when the runner path names no file. Names the binary; build_sha names the source it was built from."
+      "description": "poot rows: SHA-256 of the runner executable that was asked to run, read from the file by the harness; null when the runner path names no file. Names the binary; build_sha names the source it was built from. An external tool runs through an interpreter, whose digest says nothing about the tool, so its row carries framework_version instead."
     },
     "family": {
       "type": ["string", "null"],
@@ -191,8 +207,8 @@
         "required": ["framework", "status"]
       },
       "then": {
-        "required": ["build_sha", "binary_sha256", "backend", "family"],
-        "properties": { "family": { "type": "string" } }
+        "required": ["build_sha", "build_profile", "build_features", "rustc_version", "binary_sha256", "backend", "family", "adapter", "driver_version", "checkpoint_digest", "compute_dtype"],
+        "properties": { "family": { "type": "string" }, "build_profile": { "enum": ["release"] } }
       }
     },
     {
@@ -200,7 +216,14 @@
         "properties": { "framework": { "enum": ["poot"] }, "status": { "enum": ["unsupported"] } },
         "required": ["framework", "status"]
       },
-      "then": { "required": ["build_sha", "backend", "family"] }
+      "then": { "required": ["build_sha", "build_profile", "build_features", "rustc_version", "backend", "family"] }
+    },
+    {
+      "if": {
+        "properties": { "framework": { "enum": ["candle", "transformers", "vllm", "llamacpp"] }, "status": { "enum": ["ok"] } },
+        "required": ["framework", "status"]
+      },
+      "then": { "required": ["framework_version"] }
     }
   ],
   "additionalProperties": true

@@ -759,17 +759,15 @@ impl PackedPayload {
             .unwrap_or_else(|| panic!("{role:?} is not a source of {:?}", self.weight.format()))
     }
 
-    /// A new block-format payload whose logical rows are `rows` of `parts` stacked in order (row
-    /// `r` of the stack is row `r - offset` of the part holding it): the loader's row slicing, row
-    /// permutation and row concatenation (fused q|k|v slices, llama's q/k un-permute, gate||up), done
-    /// on the stored blocks byte for byte, never through a decode. A row of a block format is a whole
-    /// run of `K / block_values` blocks, so the gathered bytes are exactly the stored ones.
-    pub fn gather_rows(parts: &[&Self], rows: &[usize]) -> Result<Self, PackedWeightError> {
+    /// The weight [`Self::gather_rows`] yields for `rows` rows of `parts`, checked without touching a byte:
+    /// the parts are block-format and share one format and `K`. The one rule the gather and a
+    /// [`weights`](crate::weights) map's shape-only handle both follow.
+    pub fn gathered_weight(
+        parts: &[&Self],
+        rows: usize,
+    ) -> Result<PackedWeight, PackedWeightError> {
         let Some(first) = parts.first().map(|part| part.weight) else {
-            return Err(PackedWeightError::RowOutOfRange {
-                row: rows.first().copied().unwrap_or(0),
-                rows: 0,
-            });
+            return Err(PackedWeightError::RowOutOfRange { row: 0, rows: 0 });
         };
         let format = first.format();
         if !matches!(format.descriptor().storage, Storage::Blocks(_)) {
@@ -782,7 +780,23 @@ impl PackedPayload {
         {
             return Err(PackedWeightError::RowGatherParts { first, other });
         }
-        let weight = PackedWeight::try_new(format, [rows.len(), first.shape()[1]])?;
+        PackedWeight::try_new(format, [rows, first.shape()[1]])
+    }
+
+    /// A new block-format payload whose logical rows are `rows` of `parts` stacked in order (row
+    /// `r` of the stack is row `r - offset` of the part holding it): the loader's row slicing, row
+    /// permutation and row concatenation (fused q|k|v slices, llama's q/k un-permute, gate||up), done
+    /// on the stored blocks byte for byte, never through a decode. A row of a block format is a whole
+    /// run of `K / block_values` blocks, so the gathered bytes are exactly the stored ones.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn gather_rows(parts: &[&Self], rows: &[usize]) -> Result<Self, PackedWeightError> {
+        let Some(first) = parts.first().map(|part| part.weight) else {
+            return Err(PackedWeightError::RowOutOfRange {
+                row: rows.first().copied().unwrap_or(0),
+                rows: 0,
+            });
+        };
+        let weight = Self::gathered_weight(parts, rows.len())?;
         let [_, row_bytes] = first.source_shape(SourceRole::Blocks);
         let stacked: usize = parts.iter().map(|part| part.weight.shape()[0]).sum();
         let locate = |row: usize| {

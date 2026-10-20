@@ -168,6 +168,12 @@ impl Dispatch {
         self.key.push_str(suffix);
     }
 
+    /// [`Program::shrink_first_launch_by_one_workgroup`]: the grid, `by` threads smaller on x.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn shrink_grid_x(&mut self, by: u32) {
+        self.launch.grid[0] -= by;
+    }
+
     /// This dispatch under another binding: a planner stage that reads or writes a scratch, and
     /// [`Program::rebind_dispatches`].
     pub(crate) fn with_binding(self, binding: Binding) -> Self {

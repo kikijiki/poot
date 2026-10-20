@@ -1,0 +1,236 @@
+# Deliberately unlisted rows of `just test-device-wgpu`, one per line: binary_id<TAB>test_name<TAB>reason.
+# A row the lane runs and passes that is in neither wgpu.txt nor here fails scripts/check-required-cases.py;
+# a row that prints a skip report fails whether listed or not. Sorted in canonical (LC_ALL=C) order; every row must run in the lane or the gate fails.
+poot-executor	binder::tests::a_chunk_of_an_expert_stack_binds_its_run_of_experts	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	binder::tests::a_narrowed_index_table_is_written_as_i32_in_any_chunking	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	binder::tests::a_stack_writer_fills_any_chunking_with_zero_gaps	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	binder::tests::an_unaligned_expert_table_binds_one_const_with_word_padded_slabs	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	coordinator::schedule::tests::a_cycle_among_rows_refuses_the_whole_plan	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	coordinator::schedule::tests::malformed_participants_and_duplicate_ids_are_refused_by_name	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	coordinator::schedule::tests::point_to_point_rows_are_admitted_in_dependency_order	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::aie_engine_tests::a_chain_is_one_linked_region_dispatched_once_with_no_buffer_for_its_intermediates	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::aie_engine_tests::a_linked_artifact_past_the_targets_instruction_limit_is_refused_before_load	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::aie_engine_tests::a_missing_link_driver_is_a_typed_load_error_and_loads_nothing	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::aie_engine_tests::an_aie_device_loads_a_linked_artifact_and_dispatches_one_aie_invocation	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::arena_slot_alloc_tests::arena_slot_native_elems_reach_device_allocate_unconverted	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::f16_packed_weight_upload_tests::a_bf16_weight_declared_f32_is_a_typed_refusal_never_widened	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::f16_packed_weight_upload_tests::a_contraction_weight_declared_f32_but_stored_f16_is_a_typed_refusal	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::f16_packed_weight_upload_tests::a_non_finite_packed_f16_weight_is_a_typed_refusal	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::f16_packed_weight_upload_tests::a_size_only_device_refuses_a_dtype_mismatch_and_sizes_a_packed_weight_like_the_byte_taking_one	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::f16_packed_weight_upload_tests::add_entry_refuses_a_store_whose_mapped_file_changed	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::f16_packed_weight_upload_tests::an_f16_contraction_weight_uploads_its_two_byte_words_packed	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::kernel_identity_tests::a_shared_hit_is_checked_against_the_callers_artifact_limit	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::kernel_identity_tests::a_shared_table_bound_to_another_backend_is_refused	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::vpu_engine_tests::a_chain_is_one_graph_artifact_dispatched_once_with_no_buffer_for_its_intermediates	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::vpu_engine_tests::the_same_graph_added_twice_is_loaded_once	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_cast_of_a_gathered_ranged_table_compiles_and_an_undeclared_one_is_refused	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_chunk_set_with_a_missing_index_is_refused	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_const_with_no_store_entry_and_no_step_value_is_unbound	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_head_over_the_cap_binds_as_row_chunks_of_its_own_bytes	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_hosted_embed_is_filled_from_the_tokens_and_the_embed_view	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_map_const_that_is_only_a_store_key_is_unbound	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_packed_embed_row_of_another_width_than_the_map_is_a_row_decode_refusal	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_paged_read_map_word_outside_the_pool_is_a_typed_bind_refusal	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_pooled_step_calls_the_host_once_per_sync_point_after_its_stage_completes	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_ranged_index_table_with_a_word_outside_its_range_is_refused_at_weight_bind	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_refill_that_fails_midway_publishes_no_map_and_needs_a_complete_reset	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_refill_writes_the_experts_stored_bytes_into_its_row	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_row_write_at_the_end_of_the_pool_is_a_row_range_refusal	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_second_adapter_with_the_same_names_never_reads_the_first_adapters_bytes	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_site_is_identified_by_its_tables_bytes_across_entries_and_owners	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_state_row_past_the_pool_is_a_state_row_refusal_that_zeroes_nothing	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_store_entry_viewed_by_two_ids_uploads_once	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_syncs_writes_land_before_the_next_stage_replays	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_token_outside_the_embed_table_is_refused	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::a_write_map_binds_only_as_a_checked_forward_slot_map	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::an_i64_index_table_view_uploads_its_words_as_i32	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::an_unloaded_executable_with_pending_work_keeps_its_uploads_until_synchronize	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::dense_row_views_upload_their_stored_rows	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::distinct_row_views_of_one_payload_are_distinct_uploads_shared_across_executables	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::packed_row_views_upload_whole_block_rows	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::replacing_one_adapter_changes_neither_the_retained_entry_nor_its_resources	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	engine::weight_source_tests::shared_base_uploads_count_once_and_each_generation_stays_distinct_and_live	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	lanes::tests::a_host_f16_view_lands_only_in_the_native_f16_lane	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	lanes::tests::an_e4m3_table_pads_each_row_to_a_whole_word	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	lanes::tests::dense_e4m3_storage_has_no_encoding	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	lanes::tests::encoding_of_agrees_with_encode_stored_for_every_dtype_and_lane	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	lanes::tests::every_encoding_lands_the_oracle_bytes_in_chunks_of_any_size	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	tests::timing::absent_consumer_never_blocks_execution	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	tests::timing::sample_every_skips_detail_on_the_declared_ratio_of_steps	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	tests::timing::sc001_host_partition_sums_to_wall_without_device_subtraction	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	tests::timing::sc002_window_excludes_steps_before_the_mark	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	tests::timing::sc003_one_kind_name_spans_two_kernel_keys_through_a_real_engine_step	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	tests::timing::sc004_unknown_device_time_never_reports_a_fabricated_zero	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	tests::timing::sc005_detailed_timing_adds_no_extra_synchronization_and_keeps_dispatch_identity	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	tests::timing::sc006_bounded_retention_evicts_oldest_and_reports_truncated_coverage	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	timing::tests::default_diagnostic_is_every_step_within_finite_bounds	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	timing::tests::default_is_counters_only	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor	timing::tests::every_step_has_sample_every_one	executor-contract row against the mock device; also runs under `just test`, selected here by binary so a new row is classified
+poot-executor::cr30_lifecycle	a_rejected_validation_packet_marks_needs_reset	executor failure-lifecycle row; also runs under `just test`
+poot-executor::staged_pipeline	a_dispatch_binding_an_operand_its_equation_lacks_is_refused_at_load	executor staged-pipeline row; also runs under `just test`
+poot-llm::wgpu_executor_contract	unload_on_the_wgpu_engine_reads_zero_memory	poot-llm `wgpu_executor_contract` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_gemma2	gemma2_geglu_fused_decode_matches_unfused_and_cpu_on_gpu	poot-llm `wgpu_gemma2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_gemma2	gemma2_softcap_flash_prefill_gpu_matches_cpu	poot-llm `wgpu_gemma2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_parity_models	parity_table_matches_the_oracle_on_wgpu	poot-llm `wgpu_parity_models` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_parity_models	softcapped_qwen2_matches_the_oracle_on_wgpu	poot-llm `wgpu_parity_models` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_qwen2	batched_paged_decode_gpu_matches_cpu	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_qwen2	batched_shared_pool_decode_gpu_matches_cpu	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_qwen2	chunked_prefill_at_nonzero_start_matches_stepped_decode_gpu	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_qwen2	flash_attention_pass_prefill_gpu_matches_cpu	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_qwen2	fused_decode_matches_unfused_on_gpu	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_qwen2	fusion_dispatch_reduction_on_real_qwen2_config	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_qwen2	paged_decode_kv_gpu_matches_cpu	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_qwen2	prefill_kv_paged_matches_contiguous	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_qwen2	prefill_runs_a_flash_fused_compiled_graph_and_matches_cpu	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_qwen2	qwen2_decode_gpu_resident_matches_cpu	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-llm::wgpu_qwen2	qwen2_masked_decode_gpu_matches_cpu	poot-llm `wgpu_qwen2` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-wgpu-device	packed_production_tests::packed_kv_read_path_gpu_matches_cpu	wgpu device unit row; selected by package so none goes unrun
+poot-wgpu-device	packed_production_tests::packed_linear_real_projection_dims_gpu_matches_dense	wgpu device unit row; selected by package so none goes unrun
+poot-wgpu-device	packed_production_tests::wgpu_q6k_gemv_determinism_probe	wgpu device unit row; selected by package so none goes unrun
+poot-wgpu-device	parity_tests::run_once_matches_a_hand_computed_elementwise_add	wgpu device unit row; selected by package so none goes unrun
+poot-wgpu-device::coopmat_resident	coopmat_matmul_resident_graph_selects_coopmat_arm	wgpu cooperative-matrix resident row; selected by package so none goes unrun
+poot-wgpu-device::coopmat_resident	coopmat_matmul_resident_matches_cpu_on_radv	wgpu cooperative-matrix resident row; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	broadcast_binary_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	dynamic_update_slice_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	elementwise_add_sub_mul_div_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	ffn_block_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	gather_axis0_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	layernorm_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	masked_attention_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	matmul_bias_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	matmul_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	non_power_of_2_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	random_uniform_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	reduce_max_last_axis_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	reduce_max_nonpow2_wide_real_magnitude_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	reduce_sum_last_axis_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	reduce_sum_nonpow2_wide_real_magnitude_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	rmsnorm_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	sample_token_greedy_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	single_element_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	transpose_slice_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::cross_backend	unary_neg_exp_log_sqrt_cross_backend	wgpu half of the cross-backend parity table; selected by package so none goes unrun
+poot-wgpu-device::graph	bf16_carrier::bf16_host_tensor_binds_to_the_oracle_and_wgpu_without_widening	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::attention_batched_decode_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::attention_decode_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::attention_over_many_key_tiles_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::attention_prefill_d512_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::attention_prefill_into_a_cache_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::attention_prefill_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::flash_decode_batched_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::flash_decode_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::flash_decode_gpu_matches_cpu_over_random_shapes	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::flash_decode_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::flash_per_head_alibi_mask_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::flash_prefill_gpu_2d_grid_over_65535_workgroups	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::flash_prefill_gpu_matches_cpu_over_random_shapes	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::synthesized_production_kernels_random_shapes_match_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::synthesized_tiled_region_chunked_large_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	flash::synthesized_tiled_region_element_by_element_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gather_scatter::arg_top_k_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gather_scatter::gather_axis0_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gather_scatter::gather_composition_gpu_matches_cpu_over_random_graphs	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gather_scatter::gather_nonaxis0_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gather_scatter::gather_nonaxis0_gpu_matches_cpu_over_random_shapes	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gather_scatter::gather_nonaxis0_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gather_scatter::index_remap_layout_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gather_scatter::scatter_axis0_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gather_scatter::scatter_axis0_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gather_scatter::scatter_composition_gpu_matches_cpu_over_random_graphs	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gather_scatter::scatter_update_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gather_scatter::scatter_update_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::batched_tiled_gemm_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::batched_tiled_gemm_random_shapes_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::chunked_large_tiled_gemm_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::concat_n_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::concat_n_rank4_axis2_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::decode_gemv_chunked_at_bloom_lm_head_n_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::large_elementwise_readback_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::lm_head_gemv_2d_grid_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::nvptx_prefill_tiled_gemm_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::rank4_batched_tiled_gemm_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::synthesized_tiled_gemm_choice_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::tiled_gemm_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::tiled_gemm_large_n_under_tile_threshold_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::tiled_gemm_random_shapes_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::tiled_gemm_then_bias_add_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	gemm::tiled_gemm_tile_count_threshold_gated_and_correct	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	misc::fused_gpu_matches_cpu_over_random_graphs	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	misc::masked_attention_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	misc::movement_gpu_matches_cpu_over_random_graphs	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	misc::swiglu_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	misc::vram_budget_bytes_reports_a_plausible_value	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	moe::moe_grouped_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	moe::moe_sparse_gpu_matches_dense	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	moe::stable_moe_ties_gpu_match_independent_oracle	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	norms_rope::ge_comparison_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	norms_rope::gelu_erf_gpu_matches_true_erf_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	norms_rope::layernorm_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	norms_rope::log_and_softplus_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	norms_rope::rmsnorm_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	norms_rope::rope_fused_gpu_matches_cpu_decomposition	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	norms_rope::round_and_quantize_composition_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	packed_kv::batched_decode_gemv_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	packed_kv::decode_gemv_random_shapes_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	packed_kv::nvptx_decode_gemv_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	plan_selection::concat2_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	plan_selection::dyn_update_slice_dynamic_gpu_matches_static	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	plan_selection::dyn_update_slice_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	plan_selection::the_kernel_choice_names_generated_imported_and_no_dispatch_equations	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	prefill_qwen3next::gpu_attention_prefill_matches_cpu_l64	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	prefill_qwen3next::gpu_attention_prefill_matches_cpu_past_matmul_grid_cap	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	prefill_qwen3next::gpu_attention_prefill_matches_cpu_real_d	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	prefill_qwen3next::gpu_gdn_prefill_chunked_matches_cpu_c64	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	prefill_qwen3next::gpu_gdn_prefill_chunked_matches_cpu_heavy_pad	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	prefill_qwen3next::gpu_gdn_prefill_chunked_matches_cpu_real_d	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	prefill_qwen3next::gpu_ut_transform_matches_cpu_c64	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	ssm_linear_attn::causal_conv1d_decode_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	ssm_linear_attn::gpu_causal_conv1d_prefill_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	ssm_linear_attn::in_graph_decay_mask_gated_linear_attention_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	ssm_linear_attn::linear_attention_decode_gated_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	ssm_linear_attn::linear_attention_prefill_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	ssm_linear_attn::mamba2_block_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	ssm_linear_attn::mamba2_ssd_decode_gpu_fuzz_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	ssm_linear_attn::mamba2_ssd_decode_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	ssm_linear_attn::mamba_core_path_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	tiled_dequant::pack_unpack_i8_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::graph	tiled_dequant::pack_unpack_i8_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
+poot-wgpu-device::stress	column_vector_matmul_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	deep_fused_chain_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	elementwise_large_1024_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	elementwise_large_256_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	high_dimensional_broadcast_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	large_matmul_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	large_reduce_wide_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	non_power_of_2_elementwise_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	non_power_of_2_matmul_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	non_power_of_2_reduce_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	rmsnorm_non_power_of_2_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	row_vector_matmul_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	single_element_add_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	single_element_matmul_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	single_element_reduce_gpu_matches_cpu	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	wgpu_binary_broadcast_grid_over_65535_workgroups	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	wgpu_cast_grid_over_65535_workgroups_every_element	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	wgpu_concat2_grid_over_65535_workgroups	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	wgpu_dyn_update_slice_grid_over_65535_workgroups	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	wgpu_gather_grid_over_65535_workgroups_every_element	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	wgpu_scatter_shared_pool_chained_dus_grid_over_65535_workgroups	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	wgpu_scatter_update_grid_over_65535_workgroups	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::stress	wgpu_transpose_grid_over_65535_workgroups_feeding_matmul	wgpu stress row (repeated dispatch and resource reuse); selected by package so none goes unrun
+poot-wgpu-device::validation	wgpu_validation_ge_ieee_edges_match_cpu	wgpu input-validation row; selected by package so none goes unrun
+poot-wgpu-device::validation	wgpu_validation_plan_uses_prepared_graph_ids	wgpu input-validation row; selected by package so none goes unrun
+poot-wgpu-device::validation	wgpu_validation_prefill_refuses_noncanonical_witness_at_compile_staged	wgpu input-validation row; selected by package so none goes unrun
+poot-wgpu-device::validation	wgpu_validation_prefill_rejects_a_failing_witness	wgpu input-validation row; selected by package so none goes unrun
+poot-wgpu-device::validation	wgpu_validation_view_source_is_materialized	wgpu input-validation row; selected by package so none goes unrun
+poot-wgpu-runtime	buffer::kernel_buffer_tests::elem_count_is_always_derived_from_bytes_len_and_element_width	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
+poot-wgpu-runtime	buffer::kernel_buffer_tests::overwrite_after_readback_keeps_elem_count_in_sync	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
+poot-wgpu-runtime	buffer::kernel_buffer_tests::overwrite_after_readback_refuses_a_length_change	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
+poot-wgpu-runtime	context::init::launch_caps_tests::an_adapter_without_the_subgroup_feature_reports_absent	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
+poot-wgpu-runtime	context::init::launch_caps_tests::launch_caps_carry_the_granted_limits_and_the_adapter_subgroup_range	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
+poot-wgpu-runtime	context::init::tensor_core_tests::a_non_vulkan_backend_is_unknown_whatever_was_granted	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
+poot-wgpu-runtime	context::init::tensor_core_tests::tensor_core_is_reported_only_for_a_granted_feature	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
+poot-wgpu-runtime	tests::require_backend_tests::wgpu_context_open_is_required_by_its_own_variable_only	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
+poot-wgpu-runtime	tests::segment_layout_tests::segment_layout_is_contiguous_in_request_order	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
+poot-wgpu-runtime	tests::segment_layout_tests::segment_layout_rejects_overlong_segment	wgpu runtime row (dispatch, caps, buffers); selected by package so none goes unrun
+poot-wgpu-runtime::dispatch_probe	mixed_scalar_vec4_one_binding_is_rejected_by_spirv_val	wgpu dispatch probe; selected by package so none goes unrun

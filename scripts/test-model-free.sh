@@ -29,7 +29,8 @@ export POOT_MODEL_FREE_ACTIVE=$mode
 #   isolated  every active test needs no model and no device, so the class is derived (model-free) as for `host`,
 #             but the package's dependencies turn on a feature (poot-bench-runner enables poot-llm/rocm) that
 #             must not unify into the default lane's builds: its tests are discovered and run in their own cargo
-#             invocation (`run-isolated`, `just test-bench-runner`). It is bin-only and has no real-dims lane.
+#             invocation (`run-isolated`, `just test-bench-runner`). It has no library target (so no `--lib`) and no
+#             real-dims lane; its unit tests and its integration tests (the binary run as a process) are both listed.
 #   reviewed  the package holds tests that need a device or a checkpoint next to host-only ones, so each test's
 #             class is chosen by hand in the inventory and a new test has no default class: model-free; checkpoint
 #             (loads a model, a row of scripts/required-checkpoint-cases.txt); or device (dispatches, and `just test-lane-coverage`
@@ -153,9 +154,9 @@ discover_tests() {
     isolated_args+=("$arg")
   done < <(isolated_package_args)
   cargo nextest list "${test_targets[@]}" "${package_args[@]}" --message-format json >"$json"
-  # An isolated package is listed in its own invocation (bin-only, so no `--lib`): listing it with the lane's
-  # packages would unify its features into them.
-  cargo nextest list --bins "${isolated_args[@]}" --message-format json >"$isolated_json"
+  # An isolated package is listed in its own invocation (no library target, so no `--lib`): listing it with the
+  # lane's packages would unify its features into them.
+  cargo nextest list --bins --tests "${isolated_args[@]}" --message-format json >"$isolated_json"
   jq -r '
     .["rust-suites"] | to_entries[]
     | [.value["package-name"], .key] | @tsv
@@ -433,7 +434,7 @@ run_real_dims() {
 # The tests of an `isolated` package, in the lane's environment but its own cargo invocation: the package's
 # dependencies turn on a feature (poot-bench-runner enables poot-llm/rocm) that must not unify into the lane's
 # builds. The inventory is complete (`check` ran first), so the run is its model-free rows, and a run that selects
-# no test fails. The package is bin-only (`--lib` is an error for it), so this selects `--bins`.
+# no test fails. The package has no library target (`--lib` is an error for it), so this selects `--bins --tests`.
 run_isolated() {
   local inventory=$1
   local package=$2
@@ -448,7 +449,7 @@ run_isolated() {
       sep = " | "
     }
   ' "$inventory")
-  lane_environment cargo nextest run --no-tests=fail --no-fail-fast --bins -p "$package" -E "${selected:-none()}"
+  lane_environment cargo nextest run --no-tests=fail --no-fail-fast --bins --tests -p "$package" -E "${selected:-none()}"
 }
 
 expect_mutation_failure() {

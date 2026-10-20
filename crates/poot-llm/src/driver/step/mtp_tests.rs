@@ -26,6 +26,7 @@ use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostTensor};
+use poot_test_util::per_backend;
 use poot_text::{ChatFormat, HermesToolCodec};
 
 use crate::core::sampler::Sampler;
@@ -1276,26 +1277,6 @@ fn mtp_serves_a_sampled_row(choice: BackendChoice) {
     assert!(stats.rounds > 0, "{stats:?}");
 }
 
-macro_rules! per_backend {
-    ($row:ident, $wgpu:ident, $rocm:ident, $ptx:ident) => {
-        #[test]
-        fn $wgpu() {
-            $row(BackendChoice::Wgpu);
-        }
-
-        #[test]
-        fn $ptx() {
-            $row(BackendChoice::Ptx);
-        }
-
-        #[cfg(feature = "rocm")]
-        #[test]
-        fn $rocm() {
-            $row(BackendChoice::Rocm);
-        }
-    };
-}
-
 /// The draft passes the driver times are the decode window's: the catch-up over the prompt pieces
 /// runs inside the prefill steps, before the first token, so a tally that took them would put work in
 /// a bench's per-round breakdown that its first-token-to-last span never held. After the prefill
@@ -1342,36 +1323,42 @@ fn mtp_prefill_catch_up_is_not_a_decode_pass(choice: BackendChoice) {
 }
 
 per_backend!(
+    BackendChoice,
     mtp_prefill_catch_up_is_not_a_decode_pass,
     mtp_prefill_catch_up_is_not_a_decode_pass_wgpu,
     mtp_prefill_catch_up_is_not_a_decode_pass_rocm,
     mtp_prefill_catch_up_is_not_a_decode_pass_ptx
 );
 per_backend!(
+    BackendChoice,
     mtp_greedy_equals_off,
     mtp_greedy_equals_off_wgpu,
     mtp_greedy_equals_off_rocm,
     mtp_greedy_equals_off_ptx
 );
 per_backend!(
+    BackendChoice,
     mtp_all_accepted_equals_off,
     mtp_all_accepted_equals_off_wgpu,
     mtp_all_accepted_equals_off_rocm,
     mtp_all_accepted_equals_off_ptx
 );
 per_backend!(
+    BackendChoice,
     mtp_proposals_equal_the_oracle_chain,
     mtp_proposals_equal_the_oracle_chain_wgpu,
     mtp_proposals_equal_the_oracle_chain_rocm,
     mtp_proposals_equal_the_oracle_chain_ptx
 );
 per_backend!(
+    BackendChoice,
     mtp_two_rows_equal_off,
     mtp_two_rows_equal_off_wgpu,
     mtp_two_rows_equal_off_rocm,
     mtp_two_rows_equal_off_ptx
 );
 per_backend!(
+    BackendChoice,
     mtp_serves_a_sampled_row,
     mtp_serves_a_sampled_row_wgpu,
     mtp_serves_a_sampled_row_rocm,

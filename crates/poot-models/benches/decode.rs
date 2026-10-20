@@ -4,11 +4,11 @@
 //! the whole-prompt prefill (`Model::trace` of a prefill step, the TTFT hot path, at two prompt lengths). Larger configs
 //! keep timings off the fixed graph-walk floor. GPU/PTX perf is measured by the RunPod cross-framework sweep.
 //!
-//! Run: `cargo bench -p poot-graph-plan --bench decode` (inside `nix develop`).
+//! Run: `cargo bench -p poot-models --bench decode` (inside `nix develop`).
 //!
 //! Criterion compares against the last run and prints `change: [-x% +y%]`. To pin a named baseline:
-//!   `cargo bench -p poot-graph-plan --bench decode -- --save-baseline main`   (record once, e.g. on master)
-//!   `cargo bench -p poot-graph-plan --bench decode -- --baseline main`        (compare a change against it)
+//!   `cargo bench -p poot-models --bench decode -- --save-baseline main`   (record once, e.g. on master)
+//!   `cargo bench -p poot-models --bench decode -- --baseline main`        (compare a change against it)
 //! A regression shows as a positive `change` percentage with a `Performance has regressed` note.
 
 use std::collections::HashMap;

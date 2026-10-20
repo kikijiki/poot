@@ -3,8 +3,7 @@
 Cross-framework LLM inference benchmarks: run the same model through poot and a set of baseline engines on
 the same GPU, measure latency / throughput / VRAM / host memory with one uniform method, and store the
 results so poot's performance can be tracked over time. The headline is a **context-degradation curve** -
-how each engine's decode speed changes as the KV cache grows (poot's naive attention should bend up with
-context; the flash/paged baselines stay flat).
+how each engine's decode speed changes as the KV cache grows.
 
 The harness measures single-stream decode (see "Single-stream only"); the point is a reproducible number
 that shows where poot stands and whether an optimization moved it.
@@ -22,7 +21,10 @@ and **`results/INDEX.md`** is the progress index. The report tool renders the de
 builds"). The index is generated from the snapshots: regenerate it with `bench index` after each new run;
 the harness tests fail when `results/INDEX.md` differs from what `bench index` writes.
 
-Tracking restarted on 2026-06-13: the earlier `decode-128` snapshots are not compatible with the
+Tracking restarted on 2026-10-20: every earlier snapshot was recorded before the identity contract (a result
+states its build, profile, adapter, driver and checkpoint digest, and its precision is what the loaded store
+holds), so none is attributable. They remain in git history; the working tree holds only rows the harness tests
+accept. The older restart, 2026-06-13: the earlier `decode-128` snapshots are not compatible with the
 `decode-curve` methodology (different scenario, prefill-amortized vs prefill-excluded decode metric, text
 vs fixed-token input). They remain in git history (the 2026-06-12 commits) but not in the working tree.
 
@@ -39,7 +41,7 @@ benchmarks/
     bench.py           the orchestrator CLI: matrix / run / report / compare / index
     observer.py        the external sampler (uniform VRAM + RSS) every runner is wrapped with
     fixtures/          a synthetic run snapshot for the hermetic `report` self-check
-    tests/             the harness's own tests (`just harness-test`)
+    tests/             the harness's own tests (`just test-bench-harness`, part of the model-free gate)
   runners/
     poot/              the poot runner: root-workspace crate `poot-bench-runner`, one measure loop over
                        the ptx, rocm and wgpu backends
@@ -82,7 +84,9 @@ order-dependent TTFT variance).
   request (hidden in warmup) and the request is refused.
 - **Decode tokens/s (steady state)** = 1000 / median TPOT_ms, the headline decode number. Not
   `gen_tokens / e2e`, which folds the one-time prefill into the per-token rate.
-- Report percentiles (p50/p90/p99), not just means; windows are kept >1s (sub-second windows are
+- Report medians, not just means: a summary over fewer than 20 samples is the median with the observed range
+  (min/max), because "p99" of five iterations is the largest sample, an interpolation and not a tail estimate;
+  p90/p99 appear from 20 samples on (the token-weighted ITL stream has hundreds). Windows are kept >1s (sub-second windows are
   dominated by startup / CUDA-graph warmup / clock resolution). CUDA-async engines synchronize at the same
   points (after prefill for TTFT, around each decode token for ITL, after the last for e2e) or the
   per-token timing is wrong.
@@ -118,8 +122,19 @@ Runner JSON is not trusted because the process exits zero. Before the harness cr
 scenario-specific contract checks the requested framework and precision, finite timings, positive sample
 counts, and the requested token workload. A degradation curve must contain every requested ISL exactly once,
 with complete per-iteration samples for the requested OSL. Invalid or partial results become `error` rows
-with bounded runner and observer diagnostics; manifest and runner caveats stay visible. The contract applies
-to newly run cells only; historical snapshots are not re-validated.
+with bounded runner and observer diagnostics; manifest and runner caveats stay visible.
+
+**Identity.** A poot result is attributable to one binary, one device and one checkpoint. The runner states
+the commit it was built from (`build_sha`, `-dirty` when a build input differs from HEAD), the cargo profile
+(`release` only: a debug runner refuses to measure), its features and the compiler, and, read from the opened
+driver and not from the request, the adapter and driver version, a blake3 digest of the checkpoint's stored
+weights and the dtype those weights are stored in (`precision`; a manifest precision the store does not hold
+fails the cell) beside the dtype it computes in. These (but not the sha, which a comparison varies) are part of
+a cell's comparable identity, with a `--diagnostic` run's `profiled` flag. A diagnostic run times the device and is stored
+under `results/diagnostics/`, apart from the committed results; it is where time goes, never throughput. An
+external tool's row names the version it reports (`framework_version`); the pod image's digest is
+`POOT_BENCH_IMAGE_DIGEST` in `env.json`. `harness/tests/test_benchmark_identity.py` holds every committed row to
+this.
 
 ## Quick start
 
@@ -156,6 +171,11 @@ for i in 1 2 3 4 5; do uv run bench run --framework poot --model qwen2.5-0.5b --
 # ... rebuild, then the same loop with --run-id cand-$i ...
 python3 harness/bench.py compare --baseline results/base-{1..5} --candidate results/cand-{1..5}
 ```
+
+`just bench-compare` runs this comparator over the committed results, the last committed set of each cell being the
+baseline: with no argument it compares that set with itself, which fails unless the set is a verifiable baseline (the
+model-free gate runs it), and `just bench-compare benchmarks/results <candidate run directories>` judges fresh
+repeats against it. `bench run --repeats 5` writes the five run directories.
 
 A cell is keyed by `(model, scenario, framework, backend, device)`, and rows that state different workloads
 (precision, prompt length, output length) are `incomparable`. One comparator, `harness/performance_receipt.py`,
@@ -241,9 +261,14 @@ dev box (Strix Halo: ROCm/HSA and Vulkan), where VRAM is shared host memory, so 
 differently from a discrete GPU. On such a box:
 
 ```bash
-POOT_BENCH_BACKEND=rocm uv run bench run --framework poot --model qwen2.5-0.5b --models-dir ~/models
-benchmarks/run-local-compare.sh --model-dir ~/models/qwen2.5-0.5b   # rocm vs wgpu, one table, no snapshot
+flock /tmp/poot-gpu.lock just bench-record wgpu     # 5 repeats of qwen2.5-0.5b decode-128 through the release runner
+flock /tmp/poot-gpu.lock just bench-record rocm
+python3 benchmarks/harness/bench.py index          # regenerate results/INDEX.md, then commit the run directories
+POOT_BENCH_BACKEND=rocm uv run bench run --framework poot --model qwen2.5-0.5b --diagnostic   # where the time goes
 ```
+
+Record on a quiet box: the other jobs of a shared machine move a repeat by tens of percent, and a set whose
+repeats disagree that much is `unverified` and fails `just bench-compare`.
 
 Run one GPU job at a time on that box; a cell that does not fit in memory should be recorded as an error, not
 retried next to another job.

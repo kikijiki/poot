@@ -312,7 +312,7 @@ fn check_guided_len(field: &str, len: usize, max: usize) -> Result<()> {
 /// OpenAI `response_format` (`{type: json_schema, json_schema: {schema}}`) to the same JSON-Schema
 /// constraint, and `{type: json_object}` to a free-JSON constraint. Precedence: choice, regex,
 /// grammar, guided_json, then response_format.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn apply_guided(
     sampler: Sampler,
     text: &poot_text::TextCodec,

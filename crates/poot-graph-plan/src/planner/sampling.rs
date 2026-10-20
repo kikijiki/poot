@@ -95,7 +95,6 @@ fn greedy(
 }
 
 /// Plan one sampling-family equation (`RandomUniform`/`SampleToken`).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,

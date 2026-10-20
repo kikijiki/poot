@@ -445,6 +445,12 @@ pub const HSA_SIGNAL_CONDITION_LT: u32 = 0;
 
 // hsa.h system info attribute ids (for hsa_system_get_info)
 
+/// The HSA runtime's major version (`uint16_t`).
+pub const HSA_SYSTEM_INFO_VERSION_MAJOR: u32 = 0;
+
+/// The HSA runtime's minor version (`uint16_t`).
+pub const HSA_SYSTEM_INFO_VERSION_MINOR: u32 = 1;
+
 /// The system timestamp's increase rate in Hz (`uint64_t`); the unit of
 /// [`hsa_amd_profiling_dispatch_time_t`] ticks.
 pub const HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY: u32 = 3;

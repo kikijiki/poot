@@ -177,7 +177,6 @@ fn attention_fill(n: usize, seed: u64) -> Vec<f32> {
 }
 
 /// The streaming attention spec for `[batch, hq, lq, d]` queries against `lk` keys, `hq / n_rep` kv heads.
-#[allow(clippy::too_many_arguments)]
 fn attention_spec(
     (batch, hq, n_rep, lq, lk, d): (usize, usize, usize, usize, usize, usize),
     lanes: usize,

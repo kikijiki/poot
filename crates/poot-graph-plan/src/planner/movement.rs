@@ -66,7 +66,7 @@ pub(super) fn plan_serialized(
 }
 
 /// Plan one data-movement equation (including the e4m3fn packed forms) and refuse the collectives.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,

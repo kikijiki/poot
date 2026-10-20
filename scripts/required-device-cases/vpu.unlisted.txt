@@ -1,0 +1,11 @@
+# Deliberately unlisted rows of `just test-device-vpu`, one per line: binary_id<TAB>test_name<TAB>reason.
+# A row the lane runs and passes that is in neither vpu.txt nor here fails scripts/check-required-cases.py;
+# a row that prints a skip report fails whether listed or not. Sorted in canonical (LC_ALL=C) order; every row must run in the lane or the gate fails.
+poot-npu	blob_cache::tests::a_corrupted_or_truncated_blob_is_a_miss	host row of poot-npu (blob cache, schema, plan arithmetic); needs no device, runs because the selection is the whole package
+poot-npu	range_guard::tests::a_buffer_written_inside_the_recording_is_never_read_as_an_input	host row of poot-npu (blob cache, schema, plan arithmetic); needs no device, runs because the selection is the whole package
+poot-npu	range_guard::tests::a_constant_filled_by_a_recorded_copy_is_checked_as_the_copys_result	host row of poot-npu (blob cache, schema, plan arithmetic); needs no device, runs because the selection is the whole package
+poot-npu	range_guard::tests::a_constant_past_the_range_is_refused_at_upload_and_an_input_at_replay	host row of poot-npu (blob cache, schema, plan arithmetic); needs no device, runs because the selection is the whole package
+poot-npu	range_guard::tests::an_aborted_recording_leaves_no_checks_behind	host row of poot-npu (blob cache, schema, plan arithmetic); needs no device, runs because the selection is the whole package
+poot-npu	range_guard::tests::an_upload_that_splits_a_word_of_a_constant_is_refused	host row of poot-npu (blob cache, schema, plan arithmetic); needs no device, runs because the selection is the whole package
+poot-npu	range_guard::tests::constants_are_checked_once_per_upload_and_inputs_once_per_replay	host row of poot-npu (blob cache, schema, plan arithmetic); needs no device, runs because the selection is the whole package
+poot-npu	range_guard::tests::the_first_word_outside_the_range_is_refused_at_the_edges_of_fp16	host row of poot-npu (blob cache, schema, plan arithmetic); needs no device, runs because the selection is the whole package
