@@ -28,15 +28,25 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
+#[cfg(feature = "test-support")]
 use std::sync::Arc;
 
 use poot_graph_ir::{Builder, Graph};
-use poot_quant::format::{ScaleEncoding, WeightFormat};
-use poot_quant::weights::{
-    AttnRole, FfnRole, NormRole, WeightEntry, WeightId, WeightKey, WeightMap, WeightMapBuilder,
-    WeightMapError, WeightRole, WeightStore, WeightView,
-};
-use poot_quant::{OperandRole, PackedPayload, PackedWeight, SourceRole};
+#[cfg(feature = "test-support")]
+use poot_quant::OperandRole;
+#[cfg(feature = "test-support")]
+use poot_quant::PackedPayload;
+#[cfg(feature = "test-support")]
+use poot_quant::PackedWeight;
+#[cfg(feature = "test-support")]
+use poot_quant::SourceRole;
+#[cfg(feature = "test-support")]
+use poot_quant::format::ScaleEncoding;
+#[cfg(feature = "test-support")]
+use poot_quant::format::WeightFormat;
+#[cfg(feature = "test-support")]
+use poot_quant::weights::WeightEntry;
+use poot_quant::weights::{AttnRole, FfnRole, NormRole, WeightMap, WeightRole, WeightStore};
 
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
@@ -46,12 +56,15 @@ use crate::components::gdn_names::{GdnTable, nextn_field, trunk_layers};
 use crate::components::linear::WeightError;
 use crate::components::norm::NormParams;
 use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    decoder_program, standard_layer, standard_stack,
+    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, decoder_program,
+    standard_layer, standard_stack,
 };
 use crate::io::{ModelSchema, StateSpec};
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, FixtureVariant, ModelParts, RawConfig};
+use crate::names::{TensorRows, linear_key};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("qwen35");
@@ -64,8 +77,6 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
         (ConfigSource::GgufArchitecture, "qwen35"),
     ],
     build,
-    fixture,
-    variants: &[VARIANT_TEXT, VARIANT_FP8, VARIANT_FINETUNE],
 };
 
 /// The multimodal wrapper's `model_type`: its text tower sits under `text_config`.
@@ -390,54 +401,19 @@ impl Qwen35Params {
 /// mixer's weights its kind names and the dense feed-forward.
 fn weights_of(p: &Qwen35Params, store: &WeightStore) -> Result<WeightMap, ModelError> {
     let names = &p.names;
-    let mut map = WeightMap::builder(store);
-    let missing = |source: WeightMapError| ModelError::Weight {
-        family: FAMILY,
-        source,
-    };
+    let mut rows = TensorRows::new(FAMILY, store);
+    rows.tensor(WeightRole::Embed, None, names.embed.to_string())?;
+    rows.tensor(WeightRole::FinalNorm, None, names.final_norm.to_string())?;
+    rows.head(names.embed, names.head, p.head_required)?;
+
     // The stored key of a linear: `{stem}.weight`, dense or the packed payload the loader publishes
     // under it.
-    let linear = |stem: &str| format!("{stem}.weight");
-    let put =
-        |map: &mut WeightMapBuilder<'_>, id: WeightId, key: String| -> Result<(), ModelError> {
-            map.map(id, WeightView::Stored(WeightKey::from(key)))
-                .map_err(missing)?;
-            Ok(())
-        };
-
-    let embed = WeightId::model(WeightRole::Embed);
-    put(&mut map, embed, names.embed.to_string())?;
-    put(
-        &mut map,
-        WeightId::model(WeightRole::FinalNorm),
-        names.final_norm.to_string(),
-    )?;
-    let head = WeightId::model(WeightRole::Head);
-    let head_key = linear(names.head);
-    if store.contains(&head_key) {
-        put(&mut map, head, head_key)?;
-    } else if p.head_required {
-        return Err(missing(WeightMapError::Missing {
-            id: head,
-            key: WeightKey::from(head_key),
-        }));
-    } else {
-        put(&mut map, head, names.embed.to_string())?;
-    }
-
+    let linear = |stem: &str| linear_key(store, stem);
     for (l, kind) in p.kinds.iter().enumerate() {
         let layer = |suffix: &str| format!("{}{l}{suffix}", names.layers);
-        let id = |role| WeightId::layer(l, role);
-        put(
-            &mut map,
-            id(WeightRole::Norm(NormRole::Attn)),
-            layer(names.attn_norm),
-        )?;
-        put(
-            &mut map,
-            id(WeightRole::Norm(NormRole::Ffn)),
-            layer(names.ffn_norm),
-        )?;
+        let at = Some(l);
+        rows.tensor(WeightRole::Norm(NormRole::Attn), at, layer(names.attn_norm))?;
+        rows.tensor(WeightRole::Norm(NormRole::Ffn), at, layer(names.ffn_norm))?;
         match kind {
             LayerKind::FullAttention => {
                 let a = &names.attention;
@@ -448,24 +424,14 @@ fn weights_of(p: &Qwen35Params, store: &WeightStore) -> Result<WeightMap, ModelE
                     (AttnRole::V, v),
                     (AttnRole::O, o),
                 ] {
-                    put(&mut map, id(WeightRole::Attn(role)), linear(&layer(stem)))?;
+                    rows.linear(WeightRole::Attn(role), at, &layer(stem))?;
                 }
-                put(
-                    &mut map,
-                    id(WeightRole::Attn(AttnRole::QNorm)),
-                    layer(a.q_norm),
-                )?;
-                put(
-                    &mut map,
-                    id(WeightRole::Attn(AttnRole::KNorm)),
-                    layer(a.k_norm),
-                )?;
+                rows.tensor(WeightRole::Attn(AttnRole::QNorm), at, layer(a.q_norm))?;
+                rows.tensor(WeightRole::Attn(AttnRole::KNorm), at, layer(a.k_norm))?;
             }
             LayerKind::LinearAttention => {
-                names
-                    .gdn
-                    .map_layer(&mut map, l, &layer, &linear)
-                    .map_err(missing)?;
+                let mapped = names.gdn.map_layer(&mut rows.map, l, &layer, &linear);
+                mapped.map_err(|source| rows.error(source))?;
             }
         }
         let [gate, up, down] = names.ffn;
@@ -474,10 +440,10 @@ fn weights_of(p: &Qwen35Params, store: &WeightStore) -> Result<WeightMap, ModelE
             (FfnRole::Up, up),
             (FfnRole::Down, down),
         ] {
-            put(&mut map, id(WeightRole::Ffn(role)), linear(&layer(stem)))?;
+            rows.linear(WeightRole::Ffn(role), at, &layer(stem))?;
         }
     }
-    Ok(map.build())
+    Ok(rows.finish())
 }
 
 #[derive(Debug)]
@@ -576,7 +542,6 @@ impl Model for Qwen35 {
     fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(
             &b,
@@ -606,6 +571,7 @@ impl Model for Qwen35 {
 /// The fixture's text config: a four-layer hybrid (three GDN layers, then gated attention) over a
 /// dense feed-forward, GQA on both mixers (`value / key` heads 2 for the GDN, `heads / kv_heads` 2 for
 /// the attention), a partial rotation and the driver fixtures' 48-word vocabulary. Projection widths are multiples of 32 where a Q8_0 copy needs them.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_text_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "qwen3_5_text",
@@ -642,6 +608,7 @@ pub(crate) fn fixture_text_config() -> serde_json::Value {
 
 /// The multimodal wrapper of [`fixture_text_config`]: the text tower under `text_config`, the token ids
 /// and the head tie on the wrapper.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     let mut text = fixture_text_config();
     let object = text.as_object_mut().unwrap();
@@ -657,6 +624,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 /// The tensors of a Qwen3.5 text tower of `text`'s dims under `root` (`model.language_model` or
 /// `model`), by HF name, and its `lm_head.weight`.
+#[cfg(feature = "test-support")]
 pub(crate) fn hf_shapes(text: &serde_json::Value, root: &str) -> Vec<(String, Vec<usize>)> {
     let n = |f: &str| crate::registry::Fixture::count(text, f);
     let (vocab, w, inter) = (n("vocab_size"), n("hidden_size"), n("intermediate_size"));
@@ -713,14 +681,16 @@ pub(crate) fn hf_shapes(text: &serde_json::Value, root: &str) -> Vec<(String, Ve
     shapes
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = hf_shapes(&config["text_config"], "model.language_model");
     Fixture::bf16(config, shapes)
 }
 
 /// The text-only checkpoint (`qwen3_5_text`): the same tower stored under `model.`.
-fn fixture_text() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_text() -> Fixture {
     let config = fixture_text_config();
     let shapes = hf_shapes(&config, "model");
     Fixture::bf16(config, shapes)
@@ -729,9 +699,11 @@ fn fixture_text() -> Fixture {
 // ---- the FP8 checkpoint -------------------------------------------------------------------------
 
 /// Finite E4M3FN codes with mixed signs and magnitudes.
+#[cfg(feature = "test-support")]
 const E4M3_CODES: [u8; 9] = [0x00, 0x20, 0x28, 0x2c, 0x30, 0x34, 0xa4, 0xa8, 0xb0];
 
 /// SplitMix64 finalizer: spreads a seed so neighboring inputs give unrelated outputs.
+#[cfg(feature = "test-support")]
 fn mix64(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -742,6 +714,7 @@ fn mix64(mut z: u64) -> u64 {
 /// A packed `E4m3Block128` payload of `shape` whose codes and scale come from `stem`: seeding by
 /// the checkpoint name gives same-shaped projections (`k_proj`/`v_proj`, `gate_proj`/`up_proj`)
 /// different weights, so a projection bound under the wrong name changes the logits.
+#[cfg(feature = "test-support")]
 fn fp8_payload(stem: &str, shape: [usize; 2]) -> PackedPayload {
     let seed = stem.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
@@ -778,6 +751,7 @@ fn fp8_payload(stem: &str, shape: [usize; 2]) -> PackedPayload {
 /// Whether `key` is one of the checkpoint's quantized linears: the FP8 checkpoint quantizes every
 /// text projection and keeps the small GDN gates (`in_proj_a`, `in_proj_b`), the norms, the
 /// embedding and the head dense.
+#[cfg(feature = "test-support")]
 fn is_fp8_linear(key: &str) -> bool {
     [
         "in_proj_qkv",
@@ -797,6 +771,7 @@ fn is_fp8_linear(key: &str) -> bool {
 
 /// `fx`'s store with its quantized linears replaced by packed FP8 payloads under their `.weight` keys, as
 /// the loader publishes them.
+#[cfg(feature = "test-support")]
 fn fp8_store(fx: &Fixture) -> WeightStore {
     let mut out = WeightStore::builder();
     for (key, entry) in fx.store.iter() {
@@ -819,19 +794,17 @@ fn fp8_store(fx: &Fixture) -> WeightStore {
 
 /// The fixture as the FP8 checkpoint stores it (`Qwen/Qwen3.8-27B-FP8`): every text projection a packed
 /// `E4m3Block128` payload under its `.weight` key, the rest BF16.
-fn fixture_fp8() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_fp8() -> Fixture {
     let mut fx = fixture();
     fx.store = fp8_store(&fx);
     fx
 }
 
-const VARIANT_FP8: FixtureVariant = ("fp8", fixture_fp8);
-
-const VARIANT_TEXT: FixtureVariant = ("text", fixture_text);
-
 /// A fine-tune of the fixture's architecture with other counts than any pinned release: two layers
 /// (one GDN, one attention), other widths and head counts. It ships no manifest and is the same family.
-fn finetune_fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn finetune_fixture() -> Fixture {
     let mut config = fixture_config();
     let text = config["text_config"].as_object_mut().unwrap();
     for (key, value) in [
@@ -852,8 +825,6 @@ fn finetune_fixture() -> Fixture {
     let shapes = hf_shapes(&config["text_config"], "model.language_model");
     Fixture::bf16(config, shapes)
 }
-
-const VARIANT_FINETUNE: FixtureVariant = ("finetune", finetune_fixture);
 
 #[cfg(test)]
 mod tests {
@@ -881,6 +852,7 @@ mod tests {
     };
     use crate::model::{LogitRows, StepShape};
     use crate::registry::Registry;
+    use poot_quant::weights::{WeightKey, WeightMapError};
 
     fn model_of(config: &serde_json::Value, store: &WeightStore) -> Box<dyn Model> {
         let raw = RawConfig::HfJson {

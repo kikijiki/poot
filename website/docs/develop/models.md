@@ -153,38 +153,45 @@ PTX GPU verification is thinner than wgpu for some modalities; see the matrix be
 ## Adding a model
 
 A new family touches only its own code. The driver, planner, executors and serve code do not change. The
-repository checks this with a test (`crates/poot-llm/tests/add_a_model/`) that defines a small decoder family
-inside the test, outside every production crate, and serves it through the public API. Its `family.rs`
-is the worked example; `tagged.rs` beside it adds a request input the driver has never heard of. A family
-is five things, plus a checkpoint to load:
+repository checks this with a test (`crates/poot-llm/tests/add_a_model/`) that defines small decoder families
+inside the test, outside the model crate, and serves them through the public API: `family.rs` is a gpt-neox
+style decoder (biased LayerNorm, partial RoPE, one `query_key_value` tensor read as three row ranges),
+`parallel.rs` the same style with the parallel residual and a per-head interleaved fused QKV, and `tagged.rs`
+adds a request input the driver has never heard of.
 
-1. **A config type.** Read the checkpoint's `config.json` once, check every value, and keep the result in a
-   typed struct, so tracing cannot fail on a bad config.
-2. **A weight-name table.** Map each role of the model (embedding, a layer's query rows, a norm bias, the head)
-   to a tensor of the checkpoint with `WeightMap::builder`. A fused tensor such as `query_key_value` is read
-   through three `WeightView::RowRange` views, so a packed checkpoint stays packed.
-3. **A tracer.** Implement `Model::trace` as plain Rust over the shared components: `standard_stack` for the
-   embedding, the layers, the final norm and the head, and `standard_layer` for the residual pair, with the
-   family's own attention and MLP in the closures (the MLP closure receives a `BlockInput`: its `block` is the
-   normalized input, and `residual` is the stream it joins).
-4. **An input schema.** `Model::schema` returns a `ModelSchema`: the programs the model offers (`step`, and
-   `encode` or `draft` when it has them), the states each carries, and the request inputs it reads, each with
-   its slot, element type, shape, pad value and whether a request may omit it. A plain decoder is
-   `ModelSchema::builder().step(decoder_program(vocab)).build_for(FAMILY)`. A family that needs a value no
-   shipped family does (a tag per token, a per-row tensor) declares it here and traces it as a slot; the
-   driver binds it from the request's `RequestInputs` with no driver change.
-5. **A registry entry.** A `FamilyEntry` names the `model_type` (or GGUF architecture) that selects the
-   family, a build function and a small fixture checkpoint. The build function takes the raw config (the
-   parsed `config.json`, and the `generation_config.json` and `preprocessor_config.json` when the checkpoint
-   ships them) and the weights and returns the model container, `ModelParts`: for a text family just the model,
-   built with `ModelParts::new`. The model's `ModelConfig` carries what the driver needs to know without
-   naming the family: the vocabulary size, the maximum positions, the end-of-sequence ids, the prefill
-   granule, the fallback chat format and the family's tool-call codec (none for a family without a tool format). Register the entry with `Registry::register`, then pass the registry
-   to `ModelHandle::load`.
+A family is a file under `crates/poot-models/src/architectures/` and one row of the `SHIPPED` slice in
+`registry.rs`; nothing else names it. A decoder of the standard shape implements `StandardFamily`
+(`poot_models::components::standard_family`), which is three things plus a checkpoint to load:
+
+1. **Keys.** The `model_type` values (and GGUF architecture names) that select the family.
+2. **A config reader.** `configure` reads the checkpoint's `config.json` once, checks every value and returns the
+   typed `StandardParams`: the dimensions, the attention and the feed-forward of each layer (gated, GeGLU,
+   plain or routed), how the layer's norms sit around its blocks (pre, post, sandwich or the parallel
+   residual), the chat format, the tool-call codec (none for a family without a tool format) and the end-of-sequence
+   ids. `StandardFamily` is the public interface. Inside the crate, a dense decoder with the usual HF fields
+   uses the crate-private `DenseFamily` shorthand instead: its keys, its defaults and one attention option,
+   such as a Q/K norm.
+3. **A weight-name table.** `weights` maps each role of the model (embedding, a layer's query rows, a norm
+   bias, the head) to a tensor of the checkpoint with `WeightMap::builder`. A fused tensor such as
+   `query_key_value` is read whole when its rows interleave per head, or through `WeightView::RowRange`
+   views when `q | k | v` are contiguous, so a packed checkpoint stays packed.
+
+The stack, the layers, the `Model` implementation and its input schema are the shared `StandardModel`; the
+family writes none of them. A family whose layers are not of this shape (a latent attention, a state-space
+mixer, an encoder) implements `Model` itself: `Model::trace_into` is plain Rust over the shared components
+(`standard_stack` for the embedding, the layers, the final norm and the head; `standard_layer` for the
+residual pair), and `Model::schema` returns a `ModelSchema`: the programs the model offers, the states each
+carries, and the request inputs it reads. A family that needs a value no shipped family does (a tag per
+token, a per-row tensor) declares it there and traces it as a slot; the driver binds it from the request's
+`RequestInputs` with no driver change.
+
+A registry is the shipped families: there is no registration from outside the model crate. A test that serves
+a family of its own builds its registry with `Registry::builtin_plus`, which the `test-support` feature
+enables, and passes it to `ModelHandle::load`.
 
 The checkpoint directory that `ModelHandle::load` reads holds `config.json`, the safetensors weights and a
 `tokenizer.json`: the loader builds the text services from the tokenizer, so a checkpoint without one is
-refused. The worked example writes a small word-level tokenizer for its fixture.
+refused. The worked examples write a small word-level tokenizer for their fixtures.
 
 There is no support list to edit. A family runs on a backend when its graph compiles for that backend, and a
 refusal is a typed error that names the equation and the missing capability.
@@ -198,7 +205,7 @@ turns, the decoded images (or video clips) in the order of the turns, a `Towers`
 row of request inputs and returns its embedding rows, and the model's text codec. It returns the prompt's token
 ids and the `RequestInputs` the text model declares. The image resize, patching, chat assembly and position
 tables all live in the family's module, beside its tracer; `poot-llm` and `poot-serve` name no family. The test
-`crates/poot-llm/tests/add_a_model/vlm.rs` registers such a family from outside the production crates and serves
+`crates/poot-llm/tests/add_a_model/vlm.rs` defines such a family outside the model crate and serves
 an image request through `FrontEndSession` with no edit to `poot-llm`.
 
 ## Next steps

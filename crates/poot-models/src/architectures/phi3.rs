@@ -1,46 +1,30 @@
-//! phi3 behind [`Model`]: the Phi-3 / Phi-4-mini dense decoder. It is the plain GQA + RoPE +
-//! SwiGLU decoder with two differences: the checkpoint fuses `q|k|v` into one `qkv_proj` and
-//! `gate|up` into one `gate_up_proj` (read here as row ranges of the stored tensors, so a packed
-//! checkpoint stays packed), and RoPE rotates only the leading `partial_rotary_factor` of each
-//! head. LongRoPE (`rope_scaling.type == longrope`, and a GGUF's `rope_factors_*` tensors) is a
-//! typed refusal: its per-frequency factors need a computed constant that names a weight.
+//! phi3: the Phi-3 / Phi-4-mini dense decoder. It is the plain GQA + RoPE + SwiGLU decoder with two
+//! differences: the checkpoint fuses `q|k|v` into one `qkv_proj` and `gate|up` into one
+//! `gate_up_proj` (read here as row ranges of the stored tensors, so a packed checkpoint stays
+//! packed), and RoPE rotates only the leading `partial_rotary_factor` of each head. LongRoPE
+//! (`rope_scaling.type == longrope`, and a GGUF's `rope_factors_*` tensors) is a typed refusal: its
+//! per-frequency factors need a computed constant that names a weight.
 //!
 //! A phi3 GGUF stores Q/K in HF row order (no llama.cpp permutation), so both formats use the
 //! half-split rotation.
 
-use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
-
-use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{WeightMap, WeightStore};
 
-use crate::components::attention::{AttentionParams, AttentionWeights, attention};
+use crate::components::attention::AttentionParams;
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
-use crate::components::ffn::{GatedFfnWeights, gated_ffn};
-use crate::components::linear::WeightError;
-use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    decoder_program, standard_layer, standard_stack,
-};
-use crate::io::ModelSchema;
-use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
+use crate::model::{ConfigReason, FamilyKey, ModelError};
 use crate::names::gguf::{GGUF_BASE, GGUF_FUSED_QKV_GATE_UP};
 use crate::names::{FusedDims, HF_BASE, HF_FUSED_QKV_GATE_UP, family_weights_fused};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, RawConfig};
 use poot_text::ChatFormat;
+
+use crate::components::standard_family::{StandardFamily, StandardParams, entry};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("phi3");
 
-pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
-    family: FAMILY,
-    keys: &[
-        (ConfigSource::HfModelType, "phi3"),
-        (ConfigSource::GgufArchitecture, "phi3"),
-    ],
-    build,
-    fixture,
-    variants: &[],
-};
+pub(crate) const ENTRY: FamilyEntry = entry::<Phi3>();
 
 /// phi3's config facts: `Phi3Config`'s defaults (`rms_norm_eps` `1e-5`, `eos_token_id` `32000`)
 /// and llama.cpp's GGUF defaults.
@@ -58,24 +42,6 @@ const GGUF_ROTARY_DIM: &str = "phi3.rope.dimension_count";
 
 /// Tensors a LongRoPE GGUF carries: per-frequency factors a computed table cannot hold.
 const GGUF_LONGROPE_FACTORS: [&str; 2] = ["rope_factors_long.weight", "rope_factors_short.weight"];
-
-/// phi3's typed config: every value checked once, here, so tracing cannot fail on it.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Phi3Params {
-    vocab: usize,
-    width: usize,
-    inter: usize,
-    layers: usize,
-    max_positions: usize,
-    q_rows: usize,
-    kv_rows: usize,
-    attention: AttentionParams,
-    layer: LayerParams,
-    stack: StackParams,
-    head_required: bool,
-    eos: BTreeSet<u32>,
-    bos: Option<u32>,
-}
 
 /// The leading head dims that rotate: HF rounds `head_dim * partial_rotary_factor` down to even;
 /// a GGUF states the width in `rope.dimension_count`.
@@ -99,8 +65,16 @@ fn rotary_dim(fields: &Fields<'_>, dims: &DenseDims) -> Result<usize, ModelError
     }
 }
 
-impl Phi3Params {
-    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+pub(crate) struct Phi3;
+
+impl StandardFamily for Phi3 {
+    const FAMILY: FamilyKey = FAMILY;
+    const KEYS: &'static [(ConfigSource, &'static str)] = &[
+        (ConfigSource::HfModelType, "phi3"),
+        (ConfigSource::GgufArchitecture, "phi3"),
+    ];
+
+    fn configure(raw: &RawConfig<'_>) -> Result<StandardParams, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let dims = DenseDims::read(&fields, &SPEC)?;
         for unsupported in ["attention_bias", "mlp_bias"] {
@@ -120,140 +94,53 @@ impl Phi3Params {
                 .map_err(|e| e.for_family(FAMILY))?;
         }
         let norm = dims.norm(&fields, &SPEC)?;
-        Ok(Self {
+        Ok(StandardParams::dense(
+            &dims,
+            norm,
             attention,
-            layer: LayerParams::new(norm),
-            stack: StackParams::new(norm),
-            vocab: dims.vocab,
-            width: dims.width,
-            inter: dims.inter,
-            layers: dims.layers,
-            max_positions: dims.max_positions,
-            q_rows: dims.heads * dims.head_dim,
-            kv_rows: dims.kv_heads * dims.head_dim,
-            head_required: dims.head_required,
-            eos: dims.eos,
-            bos: dims.bos,
-        })
+            ChatFormat::Phi3,
+            None,
+        ))
     }
-}
 
-#[derive(Debug)]
-struct Layer {
-    norms: LayerNorms,
-    attn: AttentionWeights,
-    ffn: GatedFfnWeights,
-}
-
-#[derive(Debug)]
-pub(crate) struct Phi3 {
-    params: Phi3Params,
-    weights: WeightMap,
-    stack: StackWeights,
-    layers: Vec<Layer>,
-    config: ModelConfig,
-    schema: ModelSchema,
-}
-
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    let p = Phi3Params::from_raw(raw)?;
-    let (base, fused): (_, &[_]) = match raw.source() {
-        ConfigSource::HfModelType => (HF_BASE, HF_FUSED_QKV_GATE_UP),
-        ConfigSource::GgufArchitecture => {
-            if let Some(factors) = GGUF_LONGROPE_FACTORS.iter().find(|n| store.contains(n)) {
-                return Err(ModelError::Config {
-                    family: FAMILY,
-                    field: factors,
-                    reason: ConfigReason::Unsupported,
-                });
+    fn weights(
+        raw: &RawConfig<'_>,
+        store: &WeightStore,
+        params: &mut StandardParams,
+    ) -> Result<WeightMap, ModelError> {
+        let (base, fused): (_, &[_]) = match raw.source() {
+            ConfigSource::HfModelType => (HF_BASE, HF_FUSED_QKV_GATE_UP),
+            ConfigSource::GgufArchitecture => {
+                if let Some(factors) = GGUF_LONGROPE_FACTORS.iter().find(|n| store.contains(n)) {
+                    return Err(ModelError::Config {
+                        family: FAMILY,
+                        field: factors,
+                        reason: ConfigReason::Unsupported,
+                    });
+                }
+                (GGUF_BASE, GGUF_FUSED_QKV_GATE_UP)
             }
-            (GGUF_BASE, GGUF_FUSED_QKV_GATE_UP)
-        }
-    };
-    let split = FusedDims {
-        q: p.q_rows,
-        kv: p.kv_rows,
-        inter: p.inter,
-    };
-    let weights = family_weights_fused(
-        FAMILY,
-        store,
-        &[base, fused],
-        p.layers,
-        p.head_required,
-        split,
-    )?;
-    let weight_error = |e: WeightError| e.for_family(FAMILY);
-    let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
-    let layers = (0..p.layers)
-        .map(|l| {
-            Ok(Layer {
-                norms: LayerNorms::new(&weights, l, p.width)?,
-                attn: AttentionWeights::new(&weights, l, p.width, &p.attention)?,
-                ffn: GatedFfnWeights::new(&weights, l, p.width, p.inter)?,
-            })
-        })
-        .collect::<Result<Vec<_>, WeightError>>()
-        .map_err(weight_error)?;
-    let schema = ModelSchema::builder()
-        .step(decoder_program(p.vocab))
-        .build_for(FAMILY)?;
-    let config = ModelConfig {
-        family: FAMILY,
-        vocab: p.vocab,
-        max_positions: p.max_positions,
-        eos: p.eos.clone(),
-        bos: p.bos,
-        prompt_bos: None,
-        prefill_granule: NonZeroUsize::MIN,
-        chat: ChatFormat::Phi3,
-        tool_codec: None,
-    };
-    Ok(ModelParts::new(Box::new(Phi3 {
-        params: p,
-        weights,
-        stack,
-        layers,
-        config,
-        schema,
-    })))
-}
-
-impl Model for Phi3 {
-    fn config(&self) -> &ModelConfig {
-        &self.config
-    }
-
-    fn schema(&self) -> &ModelSchema {
-        &self.schema
-    }
-
-    fn weights(&self) -> &WeightMap {
-        &self.weights
-    }
-
-    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
-        let p = &self.params;
-        let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        let step = Step::new(&b, shape)?;
-        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
-            let layer = &self.layers[l];
-            standard_layer(
-                b,
-                x,
-                &layer.norms,
-                &p.layer,
-                |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
-                |b, BlockInput { block: h, .. }| gated_ffn(b, h, &layer.ffn),
-            )
-        })?;
-        Ok(step.finish(b, logits)?)
+        };
+        let attention = params.attention[0];
+        let split = FusedDims {
+            q: attention.heads() * attention.head_dim(),
+            kv: attention.kv_heads() * attention.head_dim(),
+            inter: params.dense_inter(),
+        };
+        family_weights_fused(
+            FAMILY,
+            store,
+            &[base, fused],
+            params.layers,
+            params.head_required,
+            split,
+        )
     }
 }
 
 /// The fixture's config: a tiny untied phi3 rotating half of each head, whose projection widths are
 /// multiples of 32 (so a Q8_0 copy of its store is a valid checkpoint too).
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "phi3",
@@ -275,6 +162,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 /// The tensors of a phi3 checkpoint with `config`'s HF dims, by HF name: `hf_base_shapes` with
 /// each layer's separate projections replaced by the fused `qkv_proj` and `gate_up_proj`.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
     let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (h, inter, heads) = (
@@ -298,7 +186,8 @@ pub(crate) fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usi
     shapes
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = fixture_shapes(&config);
     Fixture::bf16(config, shapes)
@@ -312,14 +201,20 @@ mod tests {
 
     use super::*;
     use crate::components::standard::oracle::run_step;
+    use crate::components::standard_family::StandardFamily;
     use crate::components::testing::{
         CAP, Recorded, assert_bf16_and_q8_0_trace_through_the_packed_transform,
         assert_chunked_prefill_equals_decode, assert_gguf_resolves_and_traces_packed,
         assert_matches_recorded, assert_missing_weight_is_named, build as built, close, close_all,
         f32_entry, gguf_dense_kvs, gguf_tensor, q8_0_store, read_back_owned, values,
     };
+    use crate::model::Model;
     use crate::model::StepShape;
+    use crate::model::StepSpec;
+    use crate::model::TraceError;
     use crate::registry::Registry;
+    use std::collections::BTreeSet;
+    use std::num::NonZeroUsize;
 
     const ROTARY: usize = 8;
 
@@ -434,7 +329,7 @@ mod tests {
             generation: None,
             preprocessor: None,
         };
-        match build(&raw, &fixture().store) {
+        match (ENTRY.build)(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
             other => panic!("{config}: expected a config error, got {other:?}"),
         }
@@ -494,10 +389,6 @@ mod tests {
         let model = model_of(&config, &fx.store);
         assert_eq!(model.config().eos, BTreeSet::from([32_000]));
         assert_eq!(model.config().chat, ChatFormat::Phi3);
-        assert!(
-            model.config().tool_codec.is_none(),
-            "Phi3 has no tool-call markup"
-        );
     }
 
     /// A Q8_0 phi3 GGUF (fused `attn_qkv` and `ffn_up` = gate||up, HF row order) and the HF F32
@@ -573,7 +464,7 @@ mod tests {
         }
         with.insert(GGUF_LONGROPE_FACTORS[0], f32_entry(vec![8], &[1.0; 8]))
             .unwrap();
-        match build(&RawConfig::Gguf(&index), &with.build()) {
+        match (ENTRY.build)(&RawConfig::Gguf(&index), &with.build()) {
             Err(ModelError::Config { field, reason, .. }) => {
                 assert_eq!(
                     (field, reason),
@@ -602,7 +493,7 @@ mod tests {
             &[],
         )))
         .unwrap();
-        let err = Phi3Params::from_raw(&RawConfig::Gguf(&index)).unwrap_err();
+        let err = Phi3::configure(&RawConfig::Gguf(&index)).unwrap_err();
         assert!(
             matches!(
                 err,

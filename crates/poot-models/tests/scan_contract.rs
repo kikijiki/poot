@@ -316,15 +316,8 @@ fn registered(family: &str, rows: usize, tokens: usize, cap: usize) -> Graph {
         .find(|entry| entry.family.as_str() == name)
         .unwrap_or_else(|| panic!("no registered family {name}"));
     let fixture = match variant {
-        "" => (entry.fixture)(),
-        variant => {
-            let (_, make) = entry
-                .variants
-                .iter()
-                .find(|(n, _)| *n == variant)
-                .unwrap_or_else(|| panic!("{name} has no fixture variant {variant}"));
-            make()
-        }
+        "" => poot_models::test_support::family_fixtures::base(entry.family),
+        variant => poot_models::test_support::family_fixtures::variant(entry.family, variant),
     };
     let model =
         (entry.build)(&fixture.raw(), &fixture.store).unwrap_or_else(|e| panic!("{family}: {e}"));

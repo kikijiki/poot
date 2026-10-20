@@ -12,12 +12,13 @@
 //! windows score strictly higher, so windows tied at the cut are all kept (a ReLU score of exactly
 //! zero is common). That can keep more than `index_topk` windows, unlike an exact top-k.
 
+use poot_graph_ir::ops::MASK_HIDDEN;
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, ops};
 use poot_quant::weights::{DsaRole, WeightId, WeightMap, WeightRole};
 
 use super::config::{DeepseekV4Config, LayerKind};
 use super::hca::{
-    CompressorWeights, DROPPED, Owner, Pooling, complete_windows, entries, softmax_pool, windows_in,
+    CompressorWeights, Owner, Pooling, complete_windows, entries, softmax_pool, windows_in,
 };
 use super::sliding::{Compressed, Local, rotate_tail};
 use crate::components::linear::{Weight, WeightError, linear};
@@ -77,7 +78,7 @@ pub(super) fn overlap_pool(
         b.slice(half(kv, 0)?, 1, 0, 1)?,
         Scalar::F32(0.0),
     )?;
-    let dropped = b.binary_scalar(BinOp::Add, zero, Scalar::F32(DROPPED))?;
+    let dropped = b.binary_scalar(BinOp::Add, zero, Scalar::F32(MASK_HIDDEN))?;
     let previous = |x: Traced, pad: Traced| {
         if windows > 1 {
             Ok::<_, TraceError>(b.concat(1, &[pad, b.slice(half(x, 0)?, 1, 0, windows - 1)?])?)
@@ -104,7 +105,7 @@ fn select_top_k(
     let dropped = b.binary_scalar(
         BinOp::Mul,
         b.binary_scalar(BinOp::Sub, keep, Scalar::F32(1.0))?,
-        Scalar::F32(-DROPPED),
+        Scalar::F32(-MASK_HIDDEN),
     )?;
     Ok(b.binary(BinOp::Add, readable, dropped)?)
 }

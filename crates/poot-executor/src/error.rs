@@ -62,6 +62,9 @@ pub enum ExecError {
     /// A coordinator refused a multi-device program or device before any device work.
     #[error(transparent)]
     Coordinator(Box<crate::CoordinatorError>),
+    /// A chained step was refused before any device work; see [`ChainError`].
+    #[error(transparent)]
+    Chain(Box<ChainError>),
     /// A stage of the program was compiled for a device this engine does not drive.
     #[error("stage {stage:?} is placed on {program:?}; this engine drives {engine:?}")]
     Placement {
@@ -77,6 +80,50 @@ pub enum ExecError {
 impl From<LoadError> for ExecError {
     fn from(error: LoadError) -> Self {
         ExecError::Load(Box::new(error))
+    }
+}
+
+/// Why a chained step was refused. Raised before any device work.
+#[derive(Debug, thiserror::Error)]
+pub enum ChainError {
+    /// A chain has at least one step.
+    #[error("a chained step has no steps")]
+    Empty,
+    /// Two steps of a chain name one entry, which would share its input buffers across steps.
+    #[error("entry {0:?} is named by two steps of one chain")]
+    RepeatedEntry(crate::EntryId),
+    /// A step of the chain pauses for the host (a pooled-expert sync point, a late input) or reads its
+    /// tokens on the host (a hosted embed gather), so the next step cannot follow on the device.
+    #[error("entry {0:?} needs the host between its stages and cannot be chained")]
+    NeedsHost(crate::EntryId),
+    /// The entry exports no value under the picked-token boundary, or has no slot for the fed token.
+    #[error("entry {entry:?} has no {what}")]
+    NoFeed {
+        /// The entry.
+        entry: crate::EntryId,
+        /// What is missing.
+        what: &'static str,
+    },
+    /// The picked token and the slot it feeds do not share a lane or an extent, so a device copy cannot
+    /// move one into the other.
+    #[error("entry {entry:?}: the picked token ({picked:?}) cannot feed the slot ({slot:?})")]
+    FeedLanes {
+        /// The entry.
+        entry: crate::EntryId,
+        /// The picked token's storage and element count.
+        picked: (BufferStorage, u32),
+        /// The fed slot's storage and element count.
+        slot: (BufferStorage, u32),
+    },
+    /// The executor runs one device program at a time and cannot order one step's device work after
+    /// another's without the host.
+    #[error("this executor does not chain steps")]
+    Unsupported,
+}
+
+impl From<ChainError> for ExecError {
+    fn from(error: ChainError) -> Self {
+        ExecError::Chain(Box::new(error))
     }
 }
 
@@ -454,6 +501,36 @@ pub enum BindError {
         row: usize,
         /// Rows on the state's leading axis.
         rows: usize,
+    },
+    /// A step's late inputs returned a different number of values than keys.
+    #[error("late inputs named {keys} slots and built {values} values")]
+    LateValues {
+        /// Keys the late inputs named.
+        keys: usize,
+        /// Values they built.
+        values: usize,
+    },
+    /// `write_state_row` named a carried state the executable does not hold.
+    #[error("no carried state is named {name}")]
+    UnknownState {
+        /// The name the write gave.
+        name: String,
+    },
+    /// `write_state_row` was given a row whose dtype or element count is not the state's own.
+    #[error(
+        "state {name}: a row holds {expected_len} {expected:?} elements, got {got_len} {got:?}"
+    )]
+    StateRowValues {
+        /// The carried state's name.
+        name: String,
+        /// The state's dtype.
+        expected: poot_tensor::DType,
+        /// Elements in one row of the state.
+        expected_len: usize,
+        /// The dtype the write carried.
+        got: poot_tensor::DType,
+        /// Elements the write carried.
+        got_len: usize,
     },
     /// A hosted embed gather's token id is not a row of its table.
     #[error("embed {name}: token {token} is not one of its {rows} rows")]

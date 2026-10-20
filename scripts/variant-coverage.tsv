@@ -51,6 +51,9 @@ BindError	Lane	covered	crates/poot-llm/tests/wgpu_executor_contract.rs	binder_an
 BindError	Range	covered	crates/poot-executor/src/engine.rs	a_write_map_binds_only_as_a_checked_forward_slot_map
 BindError	UncheckedWriteMap	covered	crates/poot-executor/src/engine.rs	a_write_map_binds_only_as_a_checked_forward_slot_map
 BindError	NotAWriteMap	covered	crates/poot-executor/src/engine.rs	a_write_map_binds_only_as_a_checked_forward_slot_map
+BindError	UnknownState	covered	crates/poot-executor/src/engine.rs	the_host_seeds_one_row_of_a_carried_state
+BindError	StateRowValues	covered	crates/poot-executor/src/engine.rs	the_host_seeds_one_row_of_a_carried_state
+BindError	LateValues	covered	crates/poot-executor/src/engine.rs	late_inputs_that_build_the_wrong_number_of_values_are_refused
 BindError	StateRow	covered	crates/poot-executor/src/engine.rs	a_state_row_past_the_pool_is_a_state_row_refusal_that_zeroes_nothing
 BindError	TokenOutOfRange	covered	crates/poot-executor/src/engine.rs	a_token_outside_the_embed_table_is_refused
 BindError	RowRange	covered	crates/poot-executor/src/engine.rs	a_row_write_at_the_end_of_the_pool_is_a_row_range_refusal

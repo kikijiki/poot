@@ -204,7 +204,7 @@ fn mapped_fixture(model_type: &str) -> MappedModel {
         .iter()
         .find(|entry| entry.keys.iter().any(|&(_, key)| key == model_type))
         .unwrap_or_else(|| panic!("no family registered for {model_type}"));
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let model = (entry.build)(&fixture.raw(), &fixture.store)
         .unwrap_or_else(|error| panic!("{model_type} fixture: {error}"));
     let map = Arc::new(model.model.weights().clone());

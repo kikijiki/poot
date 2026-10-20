@@ -365,6 +365,7 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
                 known_miscompiles: poot_target::KnownMiscompiles::default(),
                 compute_units: poot_target::STRIX_HALO_COMPUTE_UNITS,
                 memory_budget_bytes: None,
+                dram_channels: None,
             },
             memory_budget: false,
             pipeline_cache: HashMap::new(),

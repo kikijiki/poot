@@ -30,7 +30,7 @@ use poot_models::model::{
     ConfigReason, FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, ShapeReason,
     StepShape, StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{
     AttnRole, DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole, WeightStore,
@@ -486,6 +486,29 @@ struct StepRecord {
     top_k: Vec<i32>,
     /// Every input buffer the entry owns, in allocation order, as the step left it.
     inputs: Vec<Vec<u8>>,
+    /// The slot key of each of `inputs`, in the same order.
+    slot_keys: Vec<String>,
+    /// The dtype and shape of the entry's primary output.
+    output: Option<(DType, Vec<usize>)>,
+}
+
+impl StepRecord {
+    /// The bytes the step left in the input buffer of slot `key` (`"sampler.mask"`, ..), `None` when the
+    /// entry declares no such slot.
+    fn slot(&self, key: &str) -> Option<&[u8]> {
+        let at = self.slot_keys.iter().position(|k| k == key)?;
+        Some(&self.inputs[at])
+    }
+
+    /// The f32 words of slot `key`.
+    fn slot_f32(&self, key: &str) -> Option<Vec<f32>> {
+        self.slot(key).map(floats)
+    }
+
+    /// The i32 words of slot `key`.
+    fn slot_i32(&self, key: &str) -> Option<Vec<i32>> {
+        self.slot(key).map(|bytes| ints(ElementKind::I32, bytes))
+    }
 }
 
 /// Answers a committed step's output readback: `(record of the step, requested byte length)`.
@@ -501,6 +524,12 @@ struct World {
     writes: HashMap<usize, Vec<u8>>,
     /// Every write into a state buffer, in order: `(byte offset, byte length)`. A row reset is one.
     state_writes: Vec<(usize, usize)>,
+    /// The bytes of each of `state_writes`.
+    state_bytes: Vec<Vec<u8>>,
+    /// The slot keys of each entry's input buffers, in allocation order, and its output's dtype and shape.
+    entry_slots: Vec<EntrySlots>,
+    /// What the device was asked to do, in order.
+    events: Vec<DeviceEvent>,
     last: StepRecord,
     steps: Vec<StepRecord>,
     weight_allocations: usize,
@@ -516,6 +545,22 @@ struct World {
     /// Make `reset_state` fail, for the failed-open row.
     fail_reset: bool,
 }
+
+/// One thing the fake device was asked to do, for rows that order the host's work against the device's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceEvent {
+    /// A recording was replayed.
+    Replay,
+    /// The host wrote an input buffer (by allocation id).
+    Write(usize),
+    /// The host blocked on the device.
+    Wait,
+    /// The host read a buffer back.
+    Read,
+}
+
+/// An entry's input slot keys, in input-buffer allocation order, and the dtype and shape of its output.
+type EntrySlots = (Vec<String>, (DType, Vec<usize>));
 
 type Shared = Rc<RefCell<World>>;
 
@@ -625,6 +670,7 @@ impl Device for FakeDevice {
     /// become its record.
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
         let mut world = self.world.borrow_mut();
+        world.events.push(DeviceEvent::Replay);
         let written: Vec<usize> = world.writes.keys().copied().collect();
         let Some(entry) = world
             .entry_inputs
@@ -661,6 +707,8 @@ impl Device for FakeDevice {
                 .iter()
                 .map(|id| world.writes.get(id).cloned().unwrap_or_default())
                 .collect(),
+            slot_keys: world.entry_slots[entry].0.clone(),
+            output: Some(world.entry_slots[entry].1.clone()),
         };
         world.writes.clear();
         world.steps.push(record.clone());
@@ -681,8 +729,14 @@ impl Device for FakeDevice {
                 let mut bytes = vec![0u8; len];
                 fill(offset..offset + len, &mut bytes);
                 world.writes.insert(dst.id, bytes);
+                world.events.push(DeviceEvent::Write(dst.id));
             }
-            BufferRole::State => world.state_writes.push((offset, len)),
+            BufferRole::State => {
+                let mut bytes = vec![0u8; len];
+                fill(offset..offset + len, &mut bytes);
+                world.state_writes.push((offset, len));
+                world.state_bytes.push(bytes);
+            }
             _ => {}
         }
         Ok(())
@@ -692,6 +746,7 @@ impl Device for FakeDevice {
     /// nothing), so every read is answered by the script.
     fn read(&mut self, _src: &FakeBuffer, out: &mut [u8]) -> Result<(), FakeError> {
         let mut world = self.world.borrow_mut();
+        world.events.push(DeviceEvent::Read);
         let record = world.last.clone();
         let bytes = (world.script)(&record, out.len());
         assert_eq!(
@@ -704,6 +759,7 @@ impl Device for FakeDevice {
     }
 
     fn synchronize(&mut self) -> Result<(), FakeError> {
+        self.world.borrow_mut().events.push(DeviceEvent::Wait);
         if self.world.borrow().fail_synchronize {
             return Err(FakeError);
         }
@@ -753,10 +809,48 @@ impl Executor for Counting {
         let before = self.world.borrow().allocated.len();
         let id = self.inner.add_entry(exe, program)?;
         let mut world = self.world.borrow_mut();
+        // Loading an entry writes its computed constants into input buffers: not a step's binding.
+        world.writes.clear();
         world.add_entry_calls += 1;
         let inputs: Vec<usize> = (before..world.allocated.len())
             .filter(|&i| world.allocated[i].0 == BufferRole::Input)
             .collect();
+        // The entry's input buffers are allocated in the order of the program's stages' inputs, a slot
+        // two stages declare once.
+        let mut keys: Vec<String> = Vec::new();
+        for (_, _, compiled) in program.stages() {
+            let graph = compiled.graph();
+            for &id in graph.inputs() {
+                let meta = graph.meta(id);
+                let key = match meta.storage {
+                    poot_graph_ir::Storage::Computed(_) => format!("computed.{id}"),
+                    poot_graph_ir::Storage::Slot(Slot::ExpertPool | Slot::ExpertPoolMap) => {
+                        continue;
+                    }
+                    poot_graph_ir::Storage::Slot(_) => {
+                        meta.slot_key().expect("a slot carries its key").to_string()
+                    }
+                    _ => continue,
+                };
+                // A boundary between stages is the producer's buffer, not an input of its own.
+                if key.contains("boundary.") {
+                    continue;
+                }
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+        assert_eq!(
+            keys.len(),
+            inputs.len(),
+            "one input buffer per slot or computed input: {keys:?}"
+        );
+        let (_, _, last) = program.stages().last().expect("a program has a stage");
+        let output = last.graph().aval(last.graph().result());
+        world
+            .entry_slots
+            .push((keys, (output.dtype, output.shape.clone())));
         world.entry_inputs.push(inputs);
         let traced = *self
             .log
@@ -778,6 +872,25 @@ impl Executor for Counting {
         self.inner.step(exe, entry, inputs, sync)
     }
 
+    fn step_chain(
+        &mut self,
+        exe: ExecutableId,
+        steps: &[poot_executor::ChainStep<'_, '_>],
+        feed: &poot_executor::ChainFeed,
+        sync: &mut dyn HostSync,
+    ) -> Result<poot_executor::ChainOutputs<'_>, ExecError> {
+        self.inner.step_chain(exe, steps, feed, sync)
+    }
+    fn step_late(
+        &mut self,
+        exe: ExecutableId,
+        entry: EntryId,
+        inputs: &StepInputs<'_>,
+        late: &mut dyn poot_executor::LateInputs,
+        sync: &mut dyn HostSync,
+    ) -> Result<StepOutputs<'_>, ExecError> {
+        self.inner.step_late(exe, entry, inputs, late, sync)
+    }
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError> {
         if self.world.borrow().fail_reset {
             return Err(ExecError::Device(Box::new(poot_executor::DeviceError {
@@ -788,6 +901,15 @@ impl Executor for Counting {
         self.inner.reset_state(exe, scope)
     }
 
+    fn write_state_row(
+        &mut self,
+        exe: ExecutableId,
+        name: &str,
+        row: usize,
+        values: poot_tensor::HostView<'_>,
+    ) -> Result<(), ExecError> {
+        self.inner.write_state_row(exe, name, row, values)
+    }
     fn remove_entry(&mut self, exe: ExecutableId, entry: EntryId) -> Result<(), ExecError> {
         if self.world.borrow().fail_remove {
             return Err(ExecError::Device(Box::new(poot_executor::DeviceError {
@@ -819,9 +941,15 @@ impl Executor for Counting {
 /// computed; a request for the logits row is answered with the row itself.
 fn logits_script(rows: Vec<Vec<f32>>) -> Script {
     let mut reads = 0usize;
-    Box::new(move |_, len| {
-        let row = &rows[reads.min(rows.len() - 1)];
+    Box::new(move |record, len| {
+        let mut row = rows[reads.min(rows.len() - 1)].clone();
         reads += 1;
+        // An adjusted head adds the guided mask the step bound to the logits before the draw.
+        if let Some(mask) = record.slot_f32("sampler.mask") {
+            for (logit, add) in row.iter_mut().zip(mask) {
+                *logit += add;
+            }
+        }
         if len == 8 {
             let non_finite = row.iter().position(|v| !v.is_finite());
             let token = row
@@ -906,24 +1034,15 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
     // The registry holds fn pointers; the fake family reads its trace log through a thread-local so the
     // build function stays a plain `fn`.
     TRACE_LOG.with(|slot| *slot.borrow_mut() = Some(family_log));
-    let mut registry = Registry::empty();
-    registry
-        .register(FamilyEntry {
-            family: TINY,
-            keys: &[(ConfigSource::HfModelType, "tiny")],
-            build: |raw, store| {
-                let log = TRACE_LOG.with(|slot| slot.borrow().clone().expect("rig sets the log"));
-                build_tiny(raw, store, log)
-            },
-            fixture: || Fixture {
-                config: tiny_config(1, 16, Variant::Plain),
-                generation: None,
-                preprocessor: None,
-                store: WeightStore::default(),
-            },
-            variants: &[],
-        })
-        .unwrap();
+    let registry = Registry::of(&[FamilyEntry {
+        family: TINY,
+        keys: &[(ConfigSource::HfModelType, "tiny")],
+        build: |raw, store| {
+            let log = TRACE_LOG.with(|slot| slot.borrow().clone().expect("rig sets the log"));
+            build_tiny(raw, store, log)
+        },
+    }])
+    .unwrap();
     let config = tiny_config(options.granule, options.max_positions, options.variant);
     let raw = RawConfig::HfJson {
         config: &config,
@@ -941,6 +1060,9 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
         allocated: Vec::new(),
         writes: HashMap::new(),
         state_writes: Vec::new(),
+        state_bytes: Vec::new(),
+        entry_slots: Vec::new(),
+        events: Vec::new(),
         last: StepRecord::default(),
         steps: Vec::new(),
         weight_allocations: 0,
@@ -1008,6 +1130,7 @@ fn contiguous(heads: &[Head]) -> ServingShapes<'_> {
         warm: Warm::Admitted,
         windows: &[],
         adapters: &[],
+        chain: None,
     }
 }
 
@@ -1111,30 +1234,56 @@ fn a_stop_string_ends_generation_without_decoding_past_it() {
     assert_eq!(rig.driver.stats().steps, 3);
 }
 
-/// SC-002 (penalty history): the prompt and each generated token feed the penalty. A presence
-/// penalty of 1.0 turns [5.0, 4.5, 4.2] over tokens 3, 4, 5 into 4 (3 is in the prompt) and then 5
-/// (4 was just generated). Mutations: skip `seed_context` (the first token is 3) and skip `observe`
-/// (the second token is 4).
+/// SC-002 (penalty history): the adjusted head reads the sequence's history row on the device, and the
+/// driver seeds that row once from the host sampler (the prompt's counts, the bias) and binds the penalty
+/// triple. The row is seeded before the first picking step and not again while every draw is committed:
+/// the head adds each draw to the row itself.
+/// Mutations: skip `seed_context` (the seeded row lacks the prompt token's count) and bind the penalty
+/// slot from a default sampler (the triple is `(1, 0, 0)`).
 #[test]
-fn the_penalty_history_sees_the_prompt_and_each_generated_token() {
-    let mut row = vec![0.0; VOCAB];
-    row[3] = 5.0;
-    row[4] = 4.5;
-    row[5] = 4.2;
-    let mut rig = rig_default(logits_script(vec![row]));
-    let sampler = Sampler::greedy().with_penalties(1.0, 1.0, 0.0);
-    let out = run(&mut rig, request(&[3], 2, sampler)).unwrap();
-    assert_eq!(out.tokens, [4, 5]);
+fn the_penalty_history_is_seeded_once_from_the_prompt_and_the_penalties_are_bound() {
+    let mut rig = rig_default(logits_script(vec![favoring(3)]));
+    let sampler = Sampler::greedy()
+        .with_penalties(1.0, 1.0, 0.0)
+        .with_logit_bias(std::collections::HashMap::from([(7u32, 0.5f32)]));
+    run(&mut rig, request(&[3], 2, sampler)).unwrap();
+
+    let mut reference = Sampler::greedy()
+        .with_penalties(1.0, 1.0, 0.0)
+        .with_logit_bias(std::collections::HashMap::from([(7u32, 0.5f32)]));
+    reference.seed_context(&[3]);
+    let seeded: Vec<u8> = reference
+        .history_row(VOCAB)
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let world = rig.world.borrow();
+    let seeds: Vec<&Vec<u8>> = world
+        .state_bytes
+        .iter()
+        .filter(|bytes| bytes.len() == seeded.len() && bytes.iter().any(|&b| b != 0))
+        .collect();
+    assert_eq!(
+        seeds,
+        [&seeded],
+        "one history seed holding the prompt's counts and the bias"
+    );
+    for step in &world.steps {
+        assert_eq!(step.slot_f32("sampler.penalty").unwrap(), [1.0, 1.0, 0.0]);
+        assert_eq!(step.slot_i32("sampler.history_read").unwrap(), [0]);
+    }
+    drop(world);
     assert_eq!(
         rig.driver.stats().host_picks,
-        2,
-        "a penalty is not a suffix request: both picks took the host path"
+        0,
+        "a penalty is a device request: no pick took the host path"
     );
 }
 
 /// SC-002 (guided exhaustion forces EOS): once a choice constraint has produced its whole sequence
 /// it allows only EOS, so the run ends with it even though the logits favor a token the mask
-/// forbids. Mutation: do not advance the constraint with each generated token (skip `observe`); the
+/// forbids. The mask is bound to the device head each step; the fake device adds it to the logits.
+/// Mutation: do not advance the constraint with each generated token (skip `observe`); the
 /// constraint never completes and the run reaches `max_new` repeating the first token.
 #[test]
 fn an_exhausted_constraint_forces_eos() {
@@ -1167,21 +1316,26 @@ fn a_non_finite_logit_on_the_device_suffix_is_a_typed_error() {
     );
 }
 
-/// SC-003 (host path): a NaN in the logits row a host-sampled request reads back is a typed error with
-/// the offending value. Mutation: clamp non-finite logits to zero when reading them back.
+/// SC-003 (adjusted head): a non-finite logit under penalties is the same typed error naming the index,
+/// from the adjusted head's readback. The raw NaN survives the adjustment, so the draw flags it.
+/// Mutation: ignore the readback's non-finite index in `read_pick`.
 #[test]
-fn a_non_finite_logit_on_the_host_path_is_a_typed_error() {
+fn a_non_finite_logit_under_an_adjusted_head_is_a_typed_error() {
     let mut row = favoring(1);
     row[2] = f32::NAN;
     let mut rig = rig_default(logits_script(vec![row]));
     let sampler = Sampler::greedy().with_penalties(1.0, 1.0, 0.0);
     let err = run(&mut rig, request(&[5], 3, sampler)).unwrap_err();
-    match err {
-        DriverError::Sampler(SamplerFault::NonFiniteLogit { index: 2, value }) => {
-            assert!(value.is_some_and(f32::is_nan), "{value:?}");
-        }
-        other => panic!("{other:?}"),
-    }
+    assert!(
+        matches!(
+            err,
+            DriverError::Sampler(SamplerFault::NonFiniteLogit {
+                index: 2,
+                value: None
+            })
+        ),
+        "{err:?}"
+    );
 }
 
 /// SC-005: with the capacity at 8x the live length, every step still binds `Slot::Pos` to the live
@@ -1210,11 +1364,12 @@ fn pos_is_the_live_position_whatever_the_capacity() {
     }
 }
 
-/// SC-006: a guided request takes the host sampling path and gets a token its mask allows, while an
-/// ordinary request never takes it. Mutation: route every request through the host path (the head is
-/// always `Logits`); the ordinary request's host-pick count is no longer zero.
+/// SC-006: a guided request runs the adjusted head and gets a token its mask allows, reading back only
+/// the token pair, and an ordinary request runs the plain head. Neither picks on the host.
+/// Mutation: make `step_head` return the logits head for an adjusted need; the guided request reads
+/// back the whole logits row and the byte count is no longer eight.
 #[test]
-fn the_host_path_serves_only_what_the_suffix_cannot_express() {
+fn a_guided_request_masks_on_the_device_and_reads_back_only_its_token() {
     let text = tiny_text();
     let constraint = text.build_choice_constraint(&["c".to_string()]).unwrap();
     let mut rig = rig_default(logits_script(vec![favoring(9)]));
@@ -1225,7 +1380,12 @@ fn the_host_path_serves_only_what_the_suffix_cannot_express() {
         [3],
         "the mask allows only `c` (id 3), the logits favor 9"
     );
-    assert!(rig.driver.stats().host_picks > 0);
+    assert_eq!(rig.driver.stats().host_picks, 0);
+    assert_eq!(
+        rig.driver.executor_stats().output_read_bytes,
+        8,
+        "one (token, flag) pair came back, not a vocabulary of logits"
+    );
 
     let mut rig = rig_default(logits_script(vec![favoring(9)]));
     let out = run(&mut rig, request(&[5], 1, Sampler::greedy())).unwrap();
@@ -1537,11 +1697,13 @@ fn an_unregistered_family_is_a_typed_refusal() {
         generation: None,
         preprocessor: None,
     };
-    let err =
-        ModelHandle::from_checkpoint(&raw, WeightStore::default(), &Registry::empty(), |_| {
-            Ok(tiny_text())
-        })
-        .unwrap_err();
+    let err = ModelHandle::from_checkpoint(
+        &raw,
+        WeightStore::default(),
+        &Registry::of(&[]).unwrap(),
+        |_| Ok(tiny_text()),
+    )
+    .unwrap_err();
     assert!(
         matches!(err, DriverError::Unsupported(Unsupported::Registry(_))),
         "{err:?}"
@@ -1582,7 +1744,7 @@ fn a_sink_that_stops_ends_the_run() {
 #[test]
 fn a_hf_directory_loads_through_the_registry() {
     let registry = Registry::builtin().unwrap();
-    let fixture = (registry.entries()[0].fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(registry.entries()[0].family);
     let dir = poot_test_util::unique_temp_path("driver_hf_checkpoint");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.json"), fixture.config.to_string()).unwrap();
@@ -1626,7 +1788,9 @@ fn pinned_hf_directory(
     weights: Option<&[u8]>,
     sha256_hex: Option<&str>,
 ) -> (poot_test_util::UniqueTempPath, std::path::PathBuf) {
-    let fixture = (Registry::builtin().unwrap().entries()[0].fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(
+        Registry::builtin().unwrap().entries()[0].family,
+    );
     let dir = poot_test_util::unique_temp_path(name);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.json"), fixture.config.to_string()).unwrap();
@@ -2326,6 +2490,7 @@ pub(super) fn witness_resume_paged() -> DriverError {
             warm: Warm::Admitted,
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap();
     let mut conversation = crate::driver::Conversation::default();

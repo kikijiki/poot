@@ -56,7 +56,8 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use poot_executor::ExecutableId;
+use poot_executor::{ExecutableId, NoLate};
+use poot_graph_ir::ops::sampling::Adjust;
 use poot_graph_plan::WeightFormats;
 use poot_models::io::{InputSet, RequestInputs};
 use poot_models::model::{KvLayout, LogitRows, StepShape};
@@ -71,7 +72,7 @@ use super::lora::GenerationId;
 use super::sequences::Serving;
 use super::snapshot::copy_rows;
 use super::step::{Lane, Readback, RowPlan, SeqId, StepRow};
-use super::suffix::{self, Head};
+use super::suffix::Head;
 use super::{Driver, EntryKey, ModelRole, Program, ServingShapes, StateResidency, window_wall};
 use crate::core::sampler::{Sampler, SamplerFault};
 use poot_text::TextCodec;
@@ -626,6 +627,7 @@ impl Driver<Serving> {
         adapters: Option<GenerationId>,
     ) -> EntryKey {
         EntryKey {
+            chain: 0,
             role,
             program: Program::Step,
             shape: StepShape::new(
@@ -695,6 +697,7 @@ impl Driver<Serving> {
             let hidden = self.hidden_of(ModelRole::Target);
             for &rows in shapes.rows {
                 let key = |width: usize, logits: LogitRows, head: Head| EntryKey {
+                    chain: 0,
                     role: ModelRole::Target,
                     program: Program::Step,
                     shape: StepShape::new(
@@ -765,6 +768,7 @@ impl Driver<Serving> {
         for &rows in shapes.rows {
             for &width in &widths {
                 self.prepared(EntryKey {
+                    chain: 0,
                     role: ModelRole::Mtp,
                     program: Program::Draft,
                     shape: StepShape::new(
@@ -818,7 +822,7 @@ impl Driver<Serving> {
             .settings
             .time_phases
             .then(|| self.runtime.executor.stats().timing.mark());
-        self.execute(&entry, &columns, &RequestFrame::empty())?;
+        self.execute(&entry, &columns, &RequestFrame::empty(), &mut NoLate)?;
         if let Some(started) = started {
             let wall = window_wall(&self.runtime.executor.stats().timing, &started);
             let timing = &mut self.stats.rollback;
@@ -1544,7 +1548,7 @@ pub fn propose_lookup(tokens: &[u32], ngram: usize, max_k: usize) -> Vec<u32> {
 /// Whether `sampler`'s row can speculate: its draws are the plain greedy or temperature ones
 /// [`Sampler::probs`] reproduces. A penalty, bias, constraint or logprob record is not.
 pub(super) fn speculation_sampler_ok(sampler: &Sampler) -> bool {
-    suffix::rule_of(sampler).is_some()
+    sampler.adjustment() == Adjust::None && sampler.logprob_count().is_none()
 }
 
 #[cfg(test)]

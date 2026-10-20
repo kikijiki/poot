@@ -721,7 +721,8 @@ fn resume_appends_a_greedy_sample_head_and_keeps_state_unchanged() {
     let head = poot_graph_ir::ops::sampling::sample_head(
         &resumed.builder,
         resumed.outputs.result,
-        poot_graph_ir::op::SampleRule::Greedy,
+        poot_graph_ir::ops::sampling::SampleSpec::draw(poot_graph_ir::op::SampleRule::Greedy),
+        None,
     )
     .unwrap();
     let g2 = resumed

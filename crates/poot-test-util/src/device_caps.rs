@@ -5,6 +5,7 @@
 //! and used only as a `dev-dependency`, so Cargo structurally prevents this from ever reaching a
 //! production build.
 
+use poot_target::dram_channels::DramChannels;
 use poot_target::{Backend, DeviceCaps, Queried, SubgroupSupport};
 
 /// The [`DeviceCaps`] a test should use for a given [`Backend`] when it has no real measured device to
@@ -20,6 +21,7 @@ pub fn default_caps_for(backend: Backend) -> DeviceCaps {
                 min_size: arch.wave,
                 max_size: arch.wave,
             }),
+            dram_channels: DramChannels::of_device_name(arch.mcpu()),
             ..DeviceCaps::rocm_default()
         },
         Backend::Nvptx => DeviceCaps::ptx_default(),

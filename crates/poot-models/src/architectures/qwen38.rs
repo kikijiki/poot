@@ -19,22 +19,37 @@
 //! step.
 
 use std::num::NonZeroU32;
+#[cfg(feature = "test-support")]
 use std::sync::Arc;
 
 use poot_graph_ir::{Builder, Graph, StateRole};
-use poot_quant::format::{OperandRole, ScaleEncoding, WeightFormat};
-use poot_quant::weights::{WeightEntry, WeightMap, WeightStore};
-use poot_quant::{PackedPayload, PackedWeight, SourceRole, StoredBytes};
+#[cfg(feature = "test-support")]
+use poot_quant::PackedPayload;
+#[cfg(feature = "test-support")]
+use poot_quant::PackedWeight;
+#[cfg(feature = "test-support")]
+use poot_quant::SourceRole;
+#[cfg(feature = "test-support")]
+use poot_quant::StoredBytes;
+#[cfg(feature = "test-support")]
+use poot_quant::format::OperandRole;
+#[cfg(feature = "test-support")]
+use poot_quant::format::ScaleEncoding;
+#[cfg(feature = "test-support")]
+use poot_quant::format::WeightFormat;
+#[cfg(feature = "test-support")]
+use poot_quant::weights::WeightEntry;
+use poot_quant::weights::{WeightMap, WeightStore};
 
 use crate::components::linear::WeightError;
-use crate::components::moe;
-use crate::components::standard::{Step, check_step, decoder_program};
+use crate::components::standard::{Step, decoder_program};
 use crate::io::{ModelSchema, StateSpec};
 use crate::model::{
-    ConfigReason, FamilyKey, KvLayout, Model, ModelConfig, ModelError, ShapeReason, StepSpec,
-    TraceError,
+    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ShapeReason, StepSpec, TraceError,
 };
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
 
 mod config;
@@ -56,8 +71,6 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
         (ConfigSource::GgufArchitecture, "qwen4exp"),
     ],
     build,
-    fixture,
-    variants: &[("packed", packed_fixture), ("finetune", finetune_fixture)],
 };
 
 /// One layer's mixer.
@@ -141,8 +154,6 @@ impl Model for Qwen4Exp {
     fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        moe::check_step(FAMILY, shape, &p.moe)?;
         // The indexer pools whole blocks of the cache, and a prefill reads and writes whole blocks.
         let granule = p.ratio.get();
         let off_granule = !shape.capacity.get().is_multiple_of(granule)
@@ -154,14 +165,6 @@ impl Model for Qwen4Exp {
                 reason: ShapeReason::Granule { granule },
             });
         }
-        // The block-key cache is a per-row buffer; its paging granule is POOT-1148's to decide.
-        if matches!(shape.kv, KvLayout::Paged { .. }) {
-            return Err(TraceError::ShapeUnsupported {
-                family: FAMILY,
-                shape,
-                reason: ShapeReason::PagedIndexer,
-            });
-        }
         let step = Step::new(&b, shape)?;
         let logits = trace::trace_step(&b, &step, &self.body, p)?;
         Ok(step.finish(b, logits)?)
@@ -171,6 +174,7 @@ impl Model for Qwen4Exp {
 /// The fixture's config: three layers (two Gated DeltaNet, the second with the PLE, then QSA
 /// attention) over four routed experts and a gated shared expert, two Hyper-Connection streams and
 /// blocks of two positions.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "qwen4_exp",
@@ -217,6 +221,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 /// How a fixture stores the routed experts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "test-support")]
 pub(crate) enum Experts {
     /// One `gate_up_proj` and one `down_proj` stack per layer.
     Fused,
@@ -226,6 +231,7 @@ pub(crate) enum Experts {
 
 /// The tensors of a Qwen4Exp checkpoint of `config`, by HF name, with the routed experts in the
 /// stored form `experts` names.
+#[cfg(feature = "test-support")]
 pub(crate) fn hf_shapes(config: &serde_json::Value, experts: Experts) -> Vec<(String, Vec<usize>)> {
     let text = &config["text_config"];
     let n = |f: &str| crate::registry::Fixture::count(text, f);
@@ -348,7 +354,8 @@ pub(crate) fn hf_shapes(config: &serde_json::Value, experts: Experts) -> Vec<(St
     shapes
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = hf_shapes(&config, Experts::Fused);
     Fixture::bf16(config, shapes)
@@ -357,7 +364,8 @@ fn fixture() -> Fixture {
 /// A checkpoint of the same architecture at sizes no shipped one has: two layers (the PLE on the
 /// first), three experts routed one per token, three hyper-connection streams, blocks of four
 /// positions and another head layout. No manifest, no pinned count: nothing about it is special.
-fn finetune_fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn finetune_fixture() -> Fixture {
     let mut config = fixture_config();
     let text = config["text_config"].as_object_mut().unwrap();
     for (key, value) in [
@@ -391,7 +399,8 @@ fn finetune_fixture() -> Fixture {
 
 /// The fixture with every routed expert packed as the official release stores it: one E4M3 tensor
 /// per expert and projection with a block scale.
-fn packed_fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn packed_fixture() -> Fixture {
     let config = fixture_config();
     let base = Fixture::bf16(config.clone(), hf_shapes(&config, Experts::PackedE4m3));
     let text = &config["text_config"];
@@ -430,6 +439,7 @@ fn packed_fixture() -> Fixture {
 
 /// A deterministic E4M3 block-scaled `[out, K]` weight: pseudo-random finite codes under scales
 /// cycling through 0.5, 1, 1.5 and 2 (BF16), so every output depends on every scale.
+#[cfg(feature = "test-support")]
 fn e4m3_payload(shape: [usize; 2], seed: u64) -> PackedPayload {
     const SCALES: [u16; 4] = [0x3f00, 0x3f80, 0x3fc0, 0x4000];
     let format = WeightFormat::E4m3Block128 {

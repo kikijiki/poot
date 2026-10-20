@@ -1,7 +1,7 @@
 //! The add-a-model standing test (ADR-0104 rule 3, "adding a model touches only the model").
 //!
 //! The fixture family ([`family`]) is defined in this test target, outside every production crate, and
-//! reaches the product only through its public surface: `Registry::register`, `ModelHandle::load`, the
+//! reaches the product only through its public surface: `Registry::builtin_plus`, `ModelHandle::load`, the
 //! shared components and `Driver::generate`. If a production edit were needed to serve it, this file
 //! could not be written; the rows below fail the other way, when production starts to treat a family
 //! it was not compiled with differently from a built-in one.
@@ -15,6 +15,8 @@
 mod driver_is_family_free;
 mod family;
 mod no_model_type_reads;
+mod parallel;
+mod parallel_rows;
 mod tagged;
 mod tagged_rows;
 mod vlm;
@@ -123,9 +125,7 @@ fn an_external_family_names_its_own_tool_call_codec() {
 
 /// The built-in families plus the fixture family, registered from outside the production crates.
 fn registry() -> Registry {
-    let mut registry = Registry::builtin().unwrap();
-    registry.register(ENTRY).unwrap();
-    registry
+    Registry::builtin_plus(&[ENTRY]).unwrap()
 }
 
 fn load(dir: &Path) -> ModelHandle {
@@ -227,10 +227,10 @@ fn fixture_model(fixture: &Fixture) -> Box<dyn Model> {
 // Host half.
 // ---------------------------------------------------------------------------------------------
 
-/// SC-001: the family registers through the public `Registry::register`, loads from a written
+/// SC-001: the family registers through `Registry::builtin_plus`, loads from a written
 /// checkpoint through `ModelHandle::load`, and its Prefill and Decode graphs compile for the wgpu,
 /// ROCm and PTX reference targets. Before registration the same checkpoint is refused with the
-/// typed unregistered-family error. Mutation: make `Registry::register` crate-private; this file
+/// typed unregistered-family error. Mutation: make `Registry::builtin_plus` private; this file
 /// fails to compile (E0624).
 #[test]
 fn the_fixture_family_registers_loads_and_compiles_for_every_reference_target() {
@@ -528,8 +528,36 @@ impl Executor for Counting {
     ) -> Result<StepOutputs<'_>, ExecError> {
         self.inner.step(exe, entry, inputs, sync)
     }
+    fn step_chain(
+        &mut self,
+        exe: ExecutableId,
+        steps: &[poot_executor::ChainStep<'_, '_>],
+        feed: &poot_executor::ChainFeed,
+        sync: &mut dyn HostSync,
+    ) -> Result<poot_executor::ChainOutputs<'_>, ExecError> {
+        self.inner.step_chain(exe, steps, feed, sync)
+    }
+    fn step_late(
+        &mut self,
+        exe: ExecutableId,
+        entry: EntryId,
+        inputs: &StepInputs<'_>,
+        late: &mut dyn poot_executor::LateInputs,
+        sync: &mut dyn HostSync,
+    ) -> Result<StepOutputs<'_>, ExecError> {
+        self.inner.step_late(exe, entry, inputs, late, sync)
+    }
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError> {
         self.inner.reset_state(exe, scope)
+    }
+    fn write_state_row(
+        &mut self,
+        exe: ExecutableId,
+        name: &str,
+        row: usize,
+        values: poot_tensor::HostView<'_>,
+    ) -> Result<(), ExecError> {
+        self.inner.write_state_row(exe, name, row, values)
     }
     fn remove_entry(&mut self, exe: ExecutableId, entry: EntryId) -> Result<(), ExecError> {
         self.inner.remove_entry(exe, entry)
@@ -580,7 +608,9 @@ fn fake_driver(
 }
 
 const GREEDY: Head = Head::GREEDY;
-const SAMPLED: Head = Head::Sample(SampleRule::Gumbel);
+const SAMPLED: Head = Head::Sample(poot_graph_ir::ops::sampling::SampleSpec::draw(
+    SampleRule::Gumbel,
+));
 
 fn admitted(heads: &[Head]) -> ServingShapes<'_> {
     ServingShapes {
@@ -590,6 +620,7 @@ fn admitted(heads: &[Head]) -> ServingShapes<'_> {
         warm: Warm::Admitted,
         windows: &[],
         adapters: &[],
+        chain: None,
     }
 }
 
@@ -603,7 +634,7 @@ fn request(prompt_len: usize, sampler: Sampler) -> GenerateRequest {
     }
 }
 
-/// SC-003: the driver prepares a family that is not a `Family` variant exactly as it prepares a
+/// SC-003: the driver prepares a family that is not a shipped one exactly as it prepares a
 /// built-in one: every admitted entry (the step extents 4, 2 and 1, per head) compiles through the common planner and is added to the executor. Mutation: add a family match to
 /// `Driver::prepared` (`match family { "qwen2" => .., _ => refuse }`); the fixture family is refused
 /// and this row is red.
@@ -970,6 +1001,7 @@ fn assert_four_paged_rows_equal_single_row_runs(choice: BackendChoice, backend: 
             warm: Warm::Admitted,
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap();
     struct Lane {

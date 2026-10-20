@@ -335,6 +335,23 @@ fn greedy_sample_token_is_exact_on_wgpu() {
     poot_executor_parity::sample_token::assert_greedy_pick_is_exact(exec.as_mut(), t);
 }
 
+/// POOT-1268: the sampler suffix that adjusts the logits (penalties, a guided mask), draws, records top-n
+/// logprobs and carries the per-sequence history runs on wgpu: every step's record equals the CPU oracle's
+/// (token and flag columns exactly, logprobs within the tier-2 tolerance), with the history pool the first
+/// steps wrote changing the next steps' picks.
+/// Mutation (fresh `POOT_KERNEL_CACHE_DIR`): in `poot-graph-plan`'s `planner/sampling.rs` plan the greedy
+/// pick with `groups = vocab / ARGMAX_CHUNK` (the partial last chunk dropped); a winner or an alternative
+/// in the last 176 tokens of a row goes missing and the record differs from the oracle's.
+#[test]
+fn adjusted_sampling_head_matches_the_oracle_on_wgpu() {
+    let Some(device) = wgpu() else {
+        return;
+    };
+    let t = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::device_sampling::assert_matches_the_oracle(exec.as_mut(), t);
+}
+
 /// POOT-1165: executables of one engine over the same graph and different constants each compute their own,
 /// while all of them stay loaded and alternate.
 #[test]

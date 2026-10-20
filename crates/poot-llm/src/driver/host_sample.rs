@@ -1,7 +1,7 @@
-//! The one backend-neutral host sampling path (Card 734): a request the sampling
-//! suffix cannot express - a guided-decoding mask, a penalty or bias term, per-token logprobs - reads the
-//! step's logits back and picks with [`Sampler::pick`]. Every backend takes this same path; the suffix
-//! stays the default and this is the fallback, never the reverse.
+//! The host pick over a logits row (Card 734): the full-logits head - a sampled verify window under a
+//! draft policy, which needs the target's whole distribution - reads the step's logits back and picks with
+//! [`Sampler::pick`]. No ordinary request takes it: the penalties, the bias, the guided mask and the
+//! logprobs all run in the sampling suffix on the device (POOT-1268).
 
 use poot_executor::{ExecError, StepOutputs};
 

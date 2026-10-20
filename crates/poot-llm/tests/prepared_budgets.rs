@@ -29,7 +29,7 @@ use poot_models::model::{
     ConfigReason, FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
     ShapeReason, StepShape, StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
 use poot_quant::weights::{WeightMap, WeightStore};
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
@@ -372,9 +372,38 @@ impl Executor for Wrapped {
         self.asked.borrow_mut().steps.push(entry);
         self.inner.step(exe, entry, inputs, sync)
     }
+    fn step_chain(
+        &mut self,
+        exe: ExecutableId,
+        steps: &[poot_executor::ChainStep<'_, '_>],
+        feed: &poot_executor::ChainFeed,
+        sync: &mut dyn HostSync,
+    ) -> Result<poot_executor::ChainOutputs<'_>, ExecError> {
+        self.inner.step_chain(exe, steps, feed, sync)
+    }
+    fn step_late(
+        &mut self,
+        exe: ExecutableId,
+        entry: EntryId,
+        inputs: &StepInputs<'_>,
+        late: &mut dyn poot_executor::LateInputs,
+        sync: &mut dyn HostSync,
+    ) -> Result<StepOutputs<'_>, ExecError> {
+        self.asked.borrow_mut().steps.push(entry);
+        self.inner.step_late(exe, entry, inputs, late, sync)
+    }
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError> {
         self.asked.borrow_mut().resets += 1;
         self.inner.reset_state(exe, scope)
+    }
+    fn write_state_row(
+        &mut self,
+        exe: ExecutableId,
+        name: &str,
+        row: usize,
+        values: poot_tensor::HostView<'_>,
+    ) -> Result<(), ExecError> {
+        self.inner.write_state_row(exe, name, row, values)
     }
     fn remove_entry(&mut self, exe: ExecutableId, entry: EntryId) -> Result<(), ExecError> {
         self.inner.remove_entry(exe, entry)
@@ -434,24 +463,15 @@ fn rig(options: RigOptions) -> Rig {
         "max_positions": 256,
         "state": if options.recurrent { "recurrent" } else { "plain" },
     });
-    let mut registry = Registry::empty();
-    registry
-        .register(FamilyEntry {
-            family: TINY,
-            keys: &[(ConfigSource::HfModelType, "budget-tiny")],
-            build: |raw, _store| {
-                let log = TRACE_LOG.with(|slot| slot.borrow().clone().expect("the rig sets it"));
-                build_tiny(raw, log)
-            },
-            fixture: || Fixture {
-                config: serde_json::json!({"model_type": "budget-tiny", "granule": 1, "max_positions": 16}),
-                generation: None,
-                preprocessor: None,
-                store: WeightStore::default(),
-            },
-            variants: &[],
-        })
-        .unwrap();
+    let registry = Registry::of(&[FamilyEntry {
+        family: TINY,
+        keys: &[(ConfigSource::HfModelType, "budget-tiny")],
+        build: |raw, _store| {
+            let log = TRACE_LOG.with(|slot| slot.borrow().clone().expect("the rig sets it"));
+            build_tiny(raw, log)
+        },
+    }])
+    .unwrap();
     let dir = checkpoint_dir(&config, "prepared_budgets_checkpoint");
     let handle =
         ModelHandle::load(&dir, &registry, &poot_llm::driver::LoadOptions::default()).unwrap();
@@ -549,6 +569,7 @@ fn contiguous(heads: &[Head]) -> ServingShapes<'_> {
         warm: Warm::Admitted,
         windows: &[],
         adapters: &[],
+        chain: None,
     }
 }
 
@@ -901,6 +922,7 @@ fn a_step_above_the_trace_limit_is_refused_before_the_family_traces_it() {
         warm: Warm::Prompts(&[]),
         windows: &at_limit,
         adapters: &[],
+        chain: None,
     });
     let traced = rig.log.lock().unwrap().len();
 
@@ -914,6 +936,7 @@ fn a_step_above_the_trace_limit_is_refused_before_the_family_traces_it() {
             warm: Warm::Prompts(&[]),
             windows: &over,
             adapters: &[],
+            chain: None,
         })
         .unwrap_err();
     let DriverError::Unsupported(Unsupported::Trace(TraceError::Budget(refused))) = &err else {
@@ -996,7 +1019,7 @@ fn qwen2_rig(trace: poot_graph_ir::TraceLimits) -> Qwen2Rig {
         .find(|entry| entry.family == poot_models::qwen2::model::FAMILY)
         .copied()
         .expect("qwen2 is a shipped family");
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let dir = poot_test_util::unique_temp_path("prepared_budgets_qwen2");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.json"), fixture.config.to_string()).unwrap();
@@ -1051,6 +1074,7 @@ fn decode_only() -> ServingShapes<'static> {
         warm: Warm::Prompts(&[]),
         windows: &[],
         adapters: &[],
+        chain: None,
     }
 }
 

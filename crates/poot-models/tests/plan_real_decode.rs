@@ -85,12 +85,37 @@ fn real_decode_graph(dense: poot_models::test_support::dense::Dense, cap: usize)
 /// mask region that reads it, so the launch is gone again. POOT-1150: +3, the hidden pad column of the
 /// padded KV stride (one iota-built column and its concat, shared by every layer's mask; capacity 64 camps).
 /// POOT-1209: +1, the `[rows]` view of the position every layer's live attention bound reads.
-const QWEN2_0_5B_DISPATCHES: usize = 371;
+/// POOT-1229: the pad column is the legalizer's, on a target with DRAM channel data only (SPIR-V here, the Strix
+/// Halo RADV device), so a target without channel data (PTX) runs the 368 of the exact capacity.
+const QWEN2_0_5B_DISPATCHES: Dispatches = Dispatches {
+    with_channels: 371,
+    without: 368,
+};
 
 /// Dispatches per token of the 28-layer Qwen3-0.6B real-config decode graph (the legacy tracer planned 539).
 /// POOT-725: 484; POOT-1108: 483, the position cast folded as for Qwen2.5 above; POOT-1150: 486, the hidden
-/// pad column as above. POOT-1209: 487, the `[rows]` view of the position as above.
-const QWEN3_0_6B_DISPATCHES: usize = 487;
+/// pad column as above. POOT-1209: 487, the `[rows]` view of the position as above. POOT-1229: 484 on a target
+/// without channel data, as above.
+const QWEN3_0_6B_DISPATCHES: Dispatches = Dispatches {
+    with_channels: 487,
+    without: 484,
+};
+
+/// The dispatch pin of a decode graph by whether the target carries DRAM channel data (the legalizer pads the
+/// camping KV caches there and nowhere else).
+struct Dispatches {
+    with_channels: usize,
+    without: usize,
+}
+
+impl Dispatches {
+    fn on(&self, backend: Backend) -> usize {
+        match backend {
+            Backend::SpirvVulkan => self.with_channels,
+            Backend::Nvptx | Backend::AmdGcn(_) => self.without,
+        }
+    }
+}
 
 /// Dispatches per token of the same Qwen2.5-0.5B config traced over a paged KV pool: the contiguous decode's
 /// minus the one the in-place write does not need. Before attention read the pools in place this was 96 more
@@ -122,7 +147,7 @@ fn dispatch_count_planned_regression_on_real_qwen2_decode_configs() {
             let program = compiled(&g, backend);
             assert_eq!(
                 dispatches(&program),
-                pin,
+                pin.on(backend),
                 "{name} {backend:?} dispatches per token moved off its pin"
             );
             // Every norm scale and bias is read narrow by the region that uses it: no cast of a weight runs.

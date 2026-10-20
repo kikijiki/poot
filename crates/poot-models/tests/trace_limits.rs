@@ -143,28 +143,14 @@ fn build_scripted(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts
     })))
 }
 
-fn scripted_fixture() -> Fixture {
-    Fixture {
-        config: serde_json::json!({
-            "model_type": "scripted", "constants": 1, "unaries": 0, "literals": 0, "name_len": 1
-        }),
-        generation: None,
-        preprocessor: None,
-        store: WeightStore::default(),
-    }
-}
-
 const SCRIPTED_ENTRY: FamilyEntry = FamilyEntry {
     family: SCRIPTED,
     keys: &[(ConfigSource::HfModelType, "scripted")],
     build: build_scripted,
-    fixture: scripted_fixture,
-    variants: &[],
 };
 
 fn scripted(constants: usize, unaries: usize, literals: usize, name_len: usize) -> Box<dyn Model> {
-    let mut registry = Registry::empty();
-    registry.register(SCRIPTED_ENTRY).unwrap();
+    let registry = Registry::of(&[SCRIPTED_ENTRY]).unwrap();
     let fixture = Fixture {
         config: serde_json::json!({
             "model_type": "scripted",
@@ -423,13 +409,10 @@ const SHARED_ENTRY: FamilyEntry = FamilyEntry {
     family: SHARED,
     keys: &[(ConfigSource::HfModelType, "shared-components")],
     build: build_shared,
-    fixture: shared_fixture,
-    variants: &[],
 };
 
 fn shared_model() -> Box<dyn Model> {
-    let mut registry = Registry::empty();
-    registry.register(SHARED_ENTRY).unwrap();
+    let registry = Registry::of(&[SHARED_ENTRY]).unwrap();
     let fixture = shared_fixture();
     registry
         .build(&fixture.raw(), &fixture.store)

@@ -80,7 +80,7 @@ pub use moe::{moe_dense, top_k_gate};
 pub use norm::{layernorm, layernorm_no_bias, rmsnorm, rmsnorm_no_weight};
 #[cfg(any(test, feature = "test-support"))]
 pub use prefill::linear_attention_prefill;
-pub use prefill::{alibi_mask_from_pos, causal_mask_from_pos, softmax};
+pub use prefill::{MASK_HIDDEN, alibi_mask_from_pos, causal_mask_from_pos, softmax};
 #[cfg(any(test, feature = "test-support"))]
 pub use prefill::{attention_prefill, attention_prefill_softcap, rope_prefill};
 #[cfg(any(test, feature = "test-support"))]

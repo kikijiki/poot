@@ -385,14 +385,17 @@ pub fn packed_expert_fixtures() -> Vec<Fixture> {
             .map(|e| payload(scheme, 101 + 7 * e as u64 + index as u64))
             .collect();
         let table = PackedExpertStack {
-            stack_id: "experts".to_string(),
+            stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
             descriptor: payloads[0].weight(),
             experts: EXPERTS,
         };
         let entries: Vec<(String, Arc<PackedPayload>)> = payloads
             .iter()
             .enumerate()
-            .map(|(expert, payload)| (format!("experts.{expert}"), Arc::clone(payload)))
+            .map(|(expert, payload)| {
+                let stack = poot_graph_ir::test_support::packed_graphs::TEST_STACK.const_name();
+                (format!("{stack}.{expert}"), Arc::clone(payload))
+            })
             .collect();
         let b = Builder::for_tests();
         let x = b

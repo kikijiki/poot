@@ -118,7 +118,7 @@ pub enum RedOp {
 /// no fused multiply-add) over the kept index set, ties to the lowest index, after a shared row-max /
 /// non-finite pass over the raw logits (R-551a-2). `noise_scale` is 0 for `Greedy` (no operand reads
 /// `noise`/`params` at all) and 1 for the Gumbel-family rules (where it rides in `params`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub enum SampleRule {
     /// `token = min { i : logits[i] == max(logits) }`. Operands: `logits` only.
     Greedy,
@@ -170,10 +170,11 @@ impl SampleRule {
     }
 }
 
-/// The `RandomUniform` value at flat index `idx` under `seed`: `u = (2 * (hash32(seed, idx) >> 9) + 1) *
+/// The `RandomUniform` value at column `idx` under `seed`: `u = (2 * (hash32(seed, idx) >> 9) + 1) *
 /// 2^-24`, an exact I32->F32 conversion and a power-of-two multiply, always in `[2^-24, 1 - 2^-24]`. The
 /// one definition of the per-element noise coordinate, read by the host sampler (the device kernels and
-/// the oracle compute the same value; tier 1, ADR-0101).
+/// the oracle compute the same value; tier 1, ADR-0101). The coordinate is the column alone, so a seed
+/// draws the same noise whichever row of a batch it rides in.
 pub fn random_uniform_at(seed: u32, idx: u32) -> f32 {
     let mantissa = (crate::ops::sampling::hash32(seed, idx) >> 9) as i32;
     (2.0f32 * (mantissa as f32) + 1.0f32) * 5.9604645e-8f32
@@ -1023,7 +1024,8 @@ pub enum OpKind {
     /// Exact uniform noise from an integer seed (card 551a, R472-007): one integer hash plus a
     /// power-of-two multiply, bit-exact on every backend (tier 1, ADR-0101). Input `seed [..]` I32 (u32
     /// bits); output `[.., cols]` F32. For row-major flat index `r` (the seed's own flat position) and
-    /// column `i`, `x = fmix32(seed[r] XOR wrapping_mul(r * cols + i, 0x9E3779B9))`, `u = (2 * (x >> 9) +
+    /// column `i`, `x = fmix32(seed[r] XOR wrapping_mul(i, 0x9E3779B9))` (the column alone, so a seed
+    /// draws the same noise whichever row of a batch it rides in), `u = (2 * (x >> 9) +
     /// 1) * 2^-24`: an exact I32->F32 conversion below `2^24` and a power-of-two multiply, so `u` is
     /// always in `[2^-24, 1 - 2^-24]` and a double `log` of it never diverges. See
     /// [`crate::ops::sampling::hash32`] and [`crate::ops::sampling::random_uniform`].

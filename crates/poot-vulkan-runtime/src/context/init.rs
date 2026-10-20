@@ -283,6 +283,14 @@ impl Context {
                 poot_target::KnownMiscompiles::default(),
             )
         };
+        // Channel data is per part, read from the device's own name (RADV names Strix Halo in it).
+        let dram_channels = {
+            let name = bytemuck_cast_i8_to_u8(&props.device_name);
+            let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            poot_target::dram_channels::DramChannels::of_device_name(&String::from_utf8_lossy(
+                &name[..end],
+            ))
+        };
         // Card 653: AMD's shader-core properties where the driver exposes them, else
         // the RDNA3 default, as the wgpu runtime does.
         // SAFETY: `physical_device` is from this instance's own enumeration.
@@ -330,6 +338,7 @@ impl Context {
                 // SAFETY: `physical_device` is from this instance's own enumeration.
                 unsafe { device_local_heap_budget(&owner.instance, physical_device) }.budget
             }),
+            dram_channels,
         };
 
         Ok(Context {

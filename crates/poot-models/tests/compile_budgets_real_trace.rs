@@ -40,7 +40,7 @@ fn a_real_model_trace_under_explicit_limits_reaches_compile_and_each_budget_refu
         .find(|entry| entry.family == poot_models::qwen2::model::FAMILY)
         .copied()
         .expect("qwen2 is shipped");
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let model = registry.build(&fixture.raw(), &fixture.store).unwrap();
     let shape = |tokens: usize| StepShape::new(NonZeroUsize::MIN, nz(tokens), nz(16));
     let roomy = TraceLimits::for_tests();

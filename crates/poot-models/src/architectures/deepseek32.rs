@@ -4,9 +4,13 @@
 //! each query attends to the `index_topk` best of them. The indexer reads the low-rank query, so a
 //! config without `q_lora_rank` is refused.
 
-use super::deepseek2::{Kind, Scoring, build_family, hf_shapes};
+#[cfg(feature = "test-support")]
+use super::deepseek2::hf_shapes;
+use super::deepseek2::{Kind, Scoring, build_family};
 use crate::model::{FamilyKey, ModelError};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig};
 use poot_quant::weights::WeightStore;
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("deepseek32");
@@ -15,8 +19,6 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
     keys: &[(ConfigSource::HfModelType, "deepseek_v32")],
     build,
-    fixture,
-    variants: &[],
 };
 
 const KIND: Kind = Kind {
@@ -31,6 +33,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
 
 /// The fixture's config: the V3 fixture plus an indexer of 2 heads of 16 dims keeping 3 positions
 /// (fewer than the longest prompt the rows trace, so the selection drops positions).
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     let mut config = super::deepseek3::fixture_config();
     config["model_type"] = serde_json::json!("deepseek_v32");
@@ -40,7 +43,8 @@ pub(crate) fn fixture_config() -> serde_json::Value {
     config
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = hf_shapes(&config, true, true);
     Fixture::bf16(config, shapes)

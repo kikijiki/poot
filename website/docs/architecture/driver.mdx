@@ -114,21 +114,21 @@ Families fall into three groups by how much of their own they need:
   structure is not shared with anyone else (DeepSeek-V4's compressed-attention stack, the Qwen3.8 sparse-attention
   layer).
 
-Adding a model touches only the model: its config, its name table, its tracer, its fixture. If a family
+Adding a model touches only the model: its config, its name table and its tracer, plus one row in the
+registry's list of shipped families. If a family
 needs a change in the driver, the planner or an executor, that is a missing general capability, not a
 family-specific edit.
 
 ## The Registry
 
-`Registry::builtin()` holds every shipped family. A `FamilyEntry` is data:
+`Registry::builtin()` indexes `SHIPPED`, the one slice of every shipped family. A `FamilyEntry` is data, three
+fields:
 
 ```rust
 pub struct FamilyEntry {
     pub family: FamilyKey,
     pub keys: &'static [(ConfigSource, &'static str)],   // HF model_type, GGUF architecture
-    pub build: fn(&RawConfig, &WeightStore) -> Result<Box<dyn Model>, ModelError>,
-    pub fixture: fn() -> Fixture,                         // a tiny deterministic checkpoint
-    pub variants: &'static [FixtureVariant],              // option fixtures (an MoE, a packed form)
+    pub build: fn(&RawConfig, &WeightStore) -> Result<ModelParts, ModelError>,
 }
 ```
 
@@ -138,9 +138,10 @@ duplicate is an error. A key no family holds is a typed `Unregistered` error, an
 unsupported model. The family is resolved before any weight is read, so a checkpoint nobody can run is turned
 down without loading its tensors.
 
-Every entry carries a fixture. That is what makes "support is the plan" computable for every family: the
-[feature matrix](../reference/feature-matrix.md) compiles each registered fixture's graphs for each backend,
-so a registered family appears there with no edit to the generator.
+Every shipped family has a fixture, a tiny deterministic checkpoint kept in the models crate's test-support
+table (`test_support/family_fixtures.rs`, keyed by family), not on the entry. That is what makes "support is
+the plan" computable for every family: the [feature matrix](../reference/feature-matrix.md) compiles each
+fixture's graphs for each backend, so a shipped family appears there with no edit to the generator.
 
 ## ModelHandle
 
@@ -165,10 +166,17 @@ what the driver may retain.
 - **A finite, bounded set of entries.** An entry once prepared is never replaced, a new entry over the entry
   or retained-byte limit is a typed refusal before it is published, and `Driver::prepare` enumerates and warms
   the admitted set up front, so a serving step compiles nothing.
-- **The sampling suffix.** Greedy and plain-temperature requests (including top-k, top-p and min-p) append a
-  sampling step to the decode graph itself (`Head::Sample`), so the host reads back a token id and a non-finite
-  flag, not the logits. A request with a logit bias or penalty, logprob recording, or a guided-decoding
-  constraint needs the full logits and takes the one host sampling path (`Head::Logits`).
+- **The sampling suffix.** Every sampling rule runs on the device, as a suffix appended to the decode graph
+  itself (`Head::Sample`): greedy and temperature draws with top-k, top-p and min-p; the repetition, presence
+  and frequency penalties and the logit bias, read from a per-sequence history of token counts and bias that
+  the device keeps and updates with each token it draws (the host seeds a sequence's row once); a
+  guided-decoding mask, which the host builds while the forward pass runs and the device applies; and the
+  top-n logprobs of the adjusted distribution. The host reads back a token id and a non-finite flag, plus the
+  logprob record when asked, never the logits. A step runs the narrowest prepared head that serves all its
+  rows, and a request no prepared head serves is a typed refusal. The logits head (`Head::Logits`) exists for
+  a caller that asks for the full logits, as a sampled verify window does. With no guided row, several decode
+  steps can be chained (`RowWork::Chain`): the device feeds each pick into the next step and the host waits
+  once.
 - **Parts and states.** A driver is a composition of owned parts: the runtime (executor, executables,
   placement), the settings, the prepared-set ledger, the speculation state, the adapter registry, the counters
   and, once it serves, the open sequences with their KV store. A new driver is `Driver<Unprepared>`; `prepare`

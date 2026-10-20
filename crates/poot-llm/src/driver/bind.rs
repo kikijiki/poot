@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use poot_graph_ir::ops::sampling::{HISTORY_READ_TAG, HISTORY_WRITE_TAG, MASK_TAG, PENALTY_TAG};
 use poot_graph_ir::{ForwardSlotMap, Graph, Slot, SlotKey};
 use poot_models::io::{
     Cadence, Fill, InputId, InputSet, InputValue, Layout, ModelSchema, PadValue, Per, Presence,
@@ -38,6 +39,14 @@ pub(super) enum PassInput {
     SamplerParams,
     /// The sampling suffix's per-row top-k, I32.
     SamplerTopK,
+    /// An adjusted head's per-row `(repetition, presence, frequency)` penalties, `[rows, 3]` F32.
+    SamplerPenalty,
+    /// An adjusted head's additive guided-decoding mask, `[rows, vocab]` F32.
+    SamplerMask,
+    /// An adjusted head's history pool row each step row reads, `[rows]` I32.
+    HistoryRead,
+    /// The history pool row each step row writes (`-1`: none), a checked forward write map.
+    HistoryWrite,
     /// A beam reorder's row index: the row each state row takes, `[rows]` I32.
     BeamRows,
 }
@@ -50,6 +59,10 @@ impl PassInput {
             PassInput::SamplerSeed => SlotKey::new(Slot::Sampler, Some("seed")),
             PassInput::SamplerParams => SlotKey::new(Slot::Sampler, Some("params")),
             PassInput::SamplerTopK => SlotKey::new(Slot::Sampler, Some("top_k")),
+            PassInput::SamplerPenalty => SlotKey::new(Slot::Sampler, Some(PENALTY_TAG)),
+            PassInput::SamplerMask => SlotKey::new(Slot::Sampler, Some(MASK_TAG)),
+            PassInput::HistoryRead => SlotKey::new(Slot::Sampler, Some(HISTORY_READ_TAG)),
+            PassInput::HistoryWrite => SlotKey::new(Slot::WriteMap, Some(HISTORY_WRITE_TAG)),
             PassInput::BeamRows => super::reorder::beam_rows_slot(),
         }
     }
@@ -60,6 +73,10 @@ impl PassInput {
             PassInput::SamplerSeed,
             PassInput::SamplerParams,
             PassInput::SamplerTopK,
+            PassInput::SamplerPenalty,
+            PassInput::SamplerMask,
+            PassInput::HistoryRead,
+            PassInput::HistoryWrite,
             PassInput::BeamRows,
         ]
         .into_iter()
@@ -215,6 +232,10 @@ pub(super) struct StepColumns {
     pub(super) seed: Vec<i32>,
     pub(super) params: Vec<f32>,
     pub(super) top_k: Vec<i32>,
+    pub(super) penalty: Vec<f32>,
+    pub(super) history_read: Vec<i32>,
+    /// Only a checked map reaches the bind.
+    pub(super) history_write: ForwardSlotMap,
     pub(super) beam_rows: Vec<i32>,
 }
 

@@ -26,13 +26,11 @@ pub(crate) const FAMILY: FamilyKey = FamilyKey::new("poot_fixture_vlm");
 /// The HF `model_type` that names the family.
 const MODEL_TYPE: &str = "poot_fixture_vlm";
 
-/// The registry entry: what `Registry::register` takes.
+/// The registry entry: what `Registry::builtin_plus` takes.
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
     keys: &[(ConfigSource::HfModelType, MODEL_TYPE)],
     build,
-    fixture,
-    variants: &[],
 };
 
 /// The token the preprocessor puts where the image goes (any id in the vocabulary).

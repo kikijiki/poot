@@ -358,9 +358,10 @@ fn dispatch_count_regression_on_real_qwen2_decode_configs() {
 /// merging the computed constants of one payload (the per-layer RoPE tables) moved them to 537 and 681; folding
 /// the position's I32-to-F32 cast into the mask region that reads it (POOT-1108) removed that equation, 536 and
 /// 680. The production dispatch counts are pinned through `compile` in `src/tests.rs`.
-// POOT-1150: +3 each, the hidden pad column (iota range and concat) of the padded KV stride at capacity 64.
-const PIN_QWEN2: usize = 540;
-const PIN_QWEN3: usize = 684;
+// POOT-1150 added 3 each, the hidden pad column (iota range and concat) of the padded KV stride at capacity 64;
+// POOT-1229 moved that pad to the legalizer, which runs with a target, so the target-free pipeline is back to 537 and 681.
+const PIN_QWEN2: usize = 537;
+const PIN_QWEN3: usize = 681;
 
 #[test]
 fn flash_default_cuts_prefill_dispatch_count() {

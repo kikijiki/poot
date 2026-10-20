@@ -173,12 +173,27 @@ pub struct CompileOptions {
     /// The LoRA mode transform, applied to the traced graph before any other pass (POOT-579). `None`
     /// compiles the graph as traced.
     pub lora: Option<LoraPlan>,
+    /// The exported value after which the host binds the late inputs of the stages that follow it
+    /// (POOT-1268): `compile_staged` cuts the graph right after the equation that produces it, so the
+    /// stages before the cut run on the device while the host builds what the later ones read. `None`
+    /// compiles without that cut.
+    pub late: Option<BoundaryId>,
 }
 
 impl CompileOptions {
     /// Options under `limits`, with no mode transform.
     pub const fn new(limits: CompileLimits) -> Self {
-        Self { limits, lora: None }
+        Self {
+            limits,
+            lora: None,
+            late: None,
+        }
+    }
+
+    /// These options with the late-input cut after the exported value `boundary`.
+    pub fn with_late(mut self, boundary: BoundaryId) -> Self {
+        self.late = Some(boundary);
+        self
     }
 
     /// These options with the LoRA transform of `plan`.
@@ -1320,10 +1335,16 @@ mod tests {
         BinOp, Builder, OpKind, RedOp, Scalar, Slot, StateRole, Storage, TensorType, UnOp,
     };
     use poot_kernelgen::{ContractionSpec, KernelRequest};
+    use poot_quant::weights::{WeightId, WeightRole};
     use poot_tensor::DType;
     use poot_test_util::device_caps::default_caps_for;
 
     use super::*;
+    use poot_graph_ir::WeightRef;
+
+    /// The embedding table and the head of the oversized-weight graphs below.
+    const EMBED: WeightId = WeightId::model(WeightRole::Embed);
+    const HEAD: WeightId = WeightId::model(WeightRole::Head);
 
     fn wgpu() -> Target {
         Target::Gpu {
@@ -1801,8 +1822,8 @@ mod tests {
         let b = Builder::for_tests();
         let token = b.slot(Slot::Token, TensorType::scalar(DType::I32)).unwrap();
         let embed = b
-            .constant(
-                "model.embed_tokens.weight",
+            .weight(
+                WeightRef::whole(EMBED),
                 TensorType::f32(vec![vocab, hidden]),
             )
             .unwrap();
@@ -1814,11 +1835,13 @@ mod tests {
     /// dense weight). `x` is a broadcast of one real scalar, not a declared `[1, k]` constant:
     /// `legalize`'s split rewrite never looks at the activation's storage, only the weight's, so a huge
     /// `k` (forcing even one row over the limit) stays a cheap fixture.
-    fn matmul_graph(x_name: &str, k: usize, w_name: &str, n: usize) -> Graph {
+    fn matmul_graph(x_name: &str, k: usize, weight: WeightId, n: usize) -> Graph {
         let b = Builder::for_tests();
         let x0 = b.constant(x_name, TensorType::f32(vec![1, 1])).unwrap();
         let x = b.broadcast(x0, vec![1, k]).unwrap();
-        let w = b.constant(w_name, TensorType::f32(vec![n, k])).unwrap();
+        let w = b
+            .weight(WeightRef::whole(weight), TensorType::f32(vec![n, k]))
+            .unwrap();
         let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
         b.finish(out).unwrap()
     }
@@ -1865,7 +1888,7 @@ mod tests {
             .expect("compile's output graph declares the hosted embed input");
         assert_eq!(
             program.graph().meta(*hosted).name.as_deref(),
-            Some("model.embed_tokens.weight")
+            Some("w.embed")
         );
     }
 
@@ -1882,8 +1905,8 @@ mod tests {
             .slot(Slot::Token, TensorType::new(vec![1, 4], DType::I32))
             .unwrap();
         let embed = b
-            .constant(
-                "model.embed_tokens.weight",
+            .weight(
+                WeightRef::whole(EMBED),
                 TensorType::new(vec![40_960, 64], DType::BF16),
             )
             .unwrap();
@@ -1948,7 +1971,7 @@ mod tests {
     /// real entry point instead of a bare `legalize` call.
     #[test]
     fn compile_splits_an_oversized_matmul_weight() {
-        let g = matmul_graph("x", 4096, "big.weight", 200_000); // ~3.05 GB
+        let g = matmul_graph("x", 4096, HEAD, 200_000); // ~3.05 GB
         let target = wgpu_with_limit(2_147_483_647);
         let program =
             compile(&g, &target, &REPLAY).expect("an oversized matmul weight always splits");
@@ -1959,7 +1982,7 @@ mod tests {
             .consts()
             .iter()
             .filter_map(|&id| program.graph().meta(id).name.clone())
-            .filter(|n| n.starts_with("big.weight.chunk"))
+            .filter(|n| n.starts_with("w.head.chunk"))
             .collect();
         assert_eq!(
             chunk_names.len(),
@@ -1987,7 +2010,7 @@ mod tests {
         use std::collections::HashMap;
 
         let (k, n) = (4usize, 10usize);
-        let g = matmul_graph("x", k, "w", n);
+        let g = matmul_graph("x", k, HEAD, n);
         // row_bytes = k*4 = 16 bytes; limit=48 (< 4096, so `usable == limit`) => 3 rows per chunk:
         // row ranges (0,3),(3,6),(6,9),(9,10) - 4 chunks, including an uneven final one.
         let target = wgpu_with_limit(48);
@@ -1999,7 +2022,7 @@ mod tests {
                 .map(|&id| {
                     let m = graph.meta(id);
                     let t = match m.name.as_deref() {
-                        Some("w") => poot_tensor::HostTensor::f32(vec![n, k], w_data.clone()),
+                        Some("w.head") => poot_tensor::HostTensor::f32(vec![n, k], w_data.clone()),
                         Some("x") => poot_tensor::HostTensor::f32(vec![1, 1], vec![1.0]),
                         other => panic!("unexpected const {other:?}"),
                     };
@@ -2019,7 +2042,7 @@ mod tests {
         for &id in gh.consts() {
             let m = gh.meta(id);
             let name = m.name.as_deref().unwrap();
-            if let Some(rest) = name.strip_prefix("w.chunk") {
+            if let Some(rest) = name.strip_prefix("w.head.chunk") {
                 let _: usize = rest.parse().expect("chunk index");
                 let height = m.aval.shape[0];
                 let data = w_data[row * k..(row + height) * k].to_vec();
@@ -2053,7 +2076,7 @@ mod tests {
     /// before `plan_graph` ever runs - never a bare device allocation failure.
     #[test]
     fn compile_refuses_an_unlegalizable_oversized_constant() {
-        let g = matmul_graph("x", 600_000_000, "big.weight", 2);
+        let g = matmul_graph("x", 600_000_000, HEAD, 2);
         let target = wgpu_with_limit(2_147_483_647);
         let error = legalize_error(
             compile(&g, &target, &REPLAY),
@@ -2062,7 +2085,7 @@ mod tests {
         assert_eq!(
             error,
             LegalizeError::OversizedConstant {
-                name: "big.weight".to_string(),
+                name: "w.head".to_string(),
                 bytes: 600_000_000u64 * 2 * 4,
                 limit: 2_147_483_647,
             }
@@ -2310,7 +2333,7 @@ mod tests {
             )
             .unwrap();
         let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
-            stack_id: "moe.experts".to_string(),
+            stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
             descriptor: stack_descriptor(format),
             experts: MOE_EXPERTS,
         };
@@ -3178,7 +3201,7 @@ mod tests {
                 }
                 .unwrap();
                 let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
-                    stack_id: "moe.experts".to_string(),
+                    stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
                     descriptor: stack_descriptor(poot_quant::format::WeightFormat::Q8_0),
                     experts: MOE_EXPERTS,
                 };
@@ -4090,7 +4113,7 @@ mod tests {
             poot_quant::PackedWeight::try_new(poot_quant::format::WeightFormat::Q8_0, [out, k])
                 .unwrap();
         let table = PackedExpertStack {
-            stack_id: "experts".to_string(),
+            stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
             descriptor,
             experts,
         };
@@ -4165,7 +4188,7 @@ mod tests {
             let format = poot_quant::format::WeightFormat::Q8_0;
             let descriptor = poot_quant::PackedWeight::try_new(format, [4, 64]).unwrap();
             let table = PackedExpertStack {
-                stack_id: "experts".to_string(),
+                stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
                 descriptor,
                 experts: SPLIT_EXPERTS,
             };

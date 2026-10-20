@@ -84,15 +84,19 @@ pub fn softmax(b: &Builder, x: Traced) -> Result<Traced, BuilderError> {
     b.binary(BinOp::Div, e, denom)
 }
 
+/// The additive value that hides a key from a query. Every attention mask in the workspace adds this
+/// to a score (a causal or sliding-window mask, an ALiBi bias, a padding mask, the selection a sparse
+/// attention drops): softmax flushes it to an exact-zero weight because `exp(MASK_HIDDEN - row_max)`
+/// underflows to `0.0f32` for any row maximum a real score produces, and it is finite, so summing two
+/// masks or adding it to a score cannot overflow or turn into a NaN.
+pub const MASK_HIDDEN: f32 = -1.0e9;
+
 /// In-graph additive causal/sliding-window attention mask from absolute positions (Card 550): `pos` is `[rows, tokens]` I32 absolute positions (`Slot::Pos`); `cap` is the key axis length
 /// (the prompt length `L` for a one-shot prefill that starts at position 0, or a persistent cache's
 /// capacity for decode/chunked continuation). Returns `[rows, 1, tokens, cap]` f32, broadcast over
 /// heads: `0.0` where key `j` is visible to query `(r, i)` (`j <= pos[r,i]`, and `pos[r,i] - j < window`
-/// when `window` is given), `-1.0e9` elsewhere. `-1.0e9` is the same magnitude the pre-card decode path's
-/// `decode_mask_row` used; the pre-card prefill path's `prefill_causal_mask` used `-1.0e30` instead -
-/// this helper unifies both call sites on one magnitude rather than carrying the old distinction
-/// forward. Softmax flushes either choice to an exact-zero weight (`exp(mask - row_max)` underflows to
-/// `0.0f32` for any row max a real attention score produces; see
+/// when `window` is given), [`MASK_HIDDEN`] elsewhere. Softmax flushes the value to an exact-zero weight
+/// (`exp(mask - row_max)` underflows to `0.0f32` for any row max a real attention score produces; see
 /// `causal_mask_from_pos_prefill_shape_matches_visibility_pattern_and_flushes_either_magnitude` in
 /// `poot-eval`'s test suite for the numeric proof), so the value is not load-bearing beyond "large
 /// enough to underflow `exp` after the row max is subtracted".
@@ -111,7 +115,7 @@ pub fn causal_mask_from_pos(
 ) -> Result<Traced, BuilderError> {
     let (visible, ..) = mask_visibility(b, pos, cap, window)?;
     let bias = b.binary_scalar(BinOp::Sub, visible, Scalar::F32(1.0))?; // 0.0 visible, -1.0 masked
-    b.binary_scalar(BinOp::Mul, bias, Scalar::F32(1.0e9)) // 0.0 visible, -1.0e9 masked
+    b.binary_scalar(BinOp::Mul, bias, Scalar::F32(-MASK_HIDDEN)) // 0.0 visible, MASK_HIDDEN masked
 }
 
 /// [`causal_mask_from_pos`] plus a per-head ALiBi (Press et al.) linear-distance bias, for the
@@ -120,7 +124,7 @@ pub fn causal_mask_from_pos(
 /// a pure function of `n_heads` that the driver still binds as a named constant, same as `rope.cos`).
 /// Returns `[rows, n_heads, tokens, cap]`: masked pairs keep the plain causal bias unmodified (the
 /// ALiBi term is multiplied by `visible` before it is added, so it is exactly `0.0` wherever the causal
-/// term is `-1.0e9`); visible pairs add `-slope[h] * (pos[r,i] - j)`.
+/// term is [`MASK_HIDDEN`]); visible pairs add `-slope[h] * (pos[r,i] - j)`.
 pub fn alibi_mask_from_pos(
     b: &Builder,
     pos: Traced,
@@ -133,8 +137,8 @@ pub fn alibi_mask_from_pos(
     let base = b.binary_scalar(
         BinOp::Mul,
         b.binary_scalar(BinOp::Sub, visible, Scalar::F32(1.0))?,
-        Scalar::F32(1.0e9),
-    )?; // [rows,1,tokens,cap]: 0.0 visible, -1.0e9 masked
+        Scalar::F32(-MASK_HIDDEN),
+    )?; // [rows,1,tokens,cap]: 0.0 visible, MASK_HIDDEN masked
     let distance = b.binary(BinOp::Sub, pos_col, keys_row)?; // [rows,1,tokens,cap] = pos[r,i] - j
     let neg_slopes = b.reshape(b.unary(UnOp::Neg, slopes)?, vec![1, n_heads, 1, 1])?;
     let term = b.binary(BinOp::Mul, neg_slopes, distance)?; // [rows,n_heads,tokens,cap]

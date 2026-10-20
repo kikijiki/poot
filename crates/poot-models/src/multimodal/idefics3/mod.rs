@@ -15,8 +15,11 @@ use crate::architectures::llama;
 use crate::components::dims::{Field, Fields};
 use crate::model::{ConfigReason, FamilyKey, ModelError};
 use crate::multimodal::front_end::TowerId;
+#[cfg(feature = "test-support")]
 use crate::names::hf_base_shapes;
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig};
 
 mod front;
 pub(crate) mod preprocess;
@@ -32,8 +35,6 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
     keys: &[(ConfigSource::HfModelType, "idefics3")],
     build,
-    fixture,
-    variants: &[],
 };
 
 /// The checkpoint's names of the text decoder's weights: `model.text_model.X` is the `llama` family's `model.X`.
@@ -188,12 +189,15 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
 }
 
 /// The fixture's tokenizer-facing facts: a 48-word vocabulary whose id 42 is `<image>`.
+#[cfg(feature = "test-support")]
 const FIXTURE_VOCAB: usize = 48;
+#[cfg(feature = "test-support")]
 const FIXTURE_IMAGE_TOKEN: usize = 42;
 
 /// A tiny SmolVLM: the tower fixture's 8-pixel frames (16 patches, 4 visual tokens after a 2x2 pixel shuffle)
 /// beside a 24-wide llama text tower, in one checkpoint's names.
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let vision = tower::fixture();
     let mut vision_config = vision.config.clone();
     let scale = vision_config

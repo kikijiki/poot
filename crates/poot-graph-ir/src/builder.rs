@@ -25,6 +25,7 @@ use crate::graph::{
 use crate::op::{OpKind, SampleRule};
 use crate::range::IndexRange;
 use crate::types::{DType, Scalar, TensorType};
+use crate::weight_ref::WeightRef;
 use poot_quant::PackedWeight;
 
 /// The identity of one [`Builder`] (or [`BuilderAppendPlan`] staged against it): a process-unique
@@ -416,9 +417,26 @@ impl BuilderAppendPlan {
             // returns a real `ValueId`.
             key: None,
             state_role: None,
+            weight: None,
             range: None,
         });
         Ok(self.handle(id))
+    }
+
+    /// Stage the constant `weight` names, carrying its [`WeightRef`] ([`Builder::weight`] for an append
+    /// plan): a packed carrier a fixture stages as already bound.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn weight_input(
+        &mut self,
+        weight: WeightRef,
+        aval: TensorType,
+    ) -> Result<Traced, BuilderError> {
+        let handle = self.input(weight.name(), aval, Storage::Const)?;
+        self.values
+            .last_mut()
+            .expect("input staged the value just now")
+            .weight = Some(weight);
+        Ok(handle)
     }
 
     /// Atomically stage a named non-Device input binder and declare that plan-owned input as the result.
@@ -544,6 +562,7 @@ impl BuilderAppendPlan {
             name,
             key: None,
             state_role: None,
+            weight: None,
             range: None,
         });
         self.equations.push(Eqn {
@@ -810,7 +829,6 @@ impl Outputs {
 
     /// Hand `value` to another stage of a split program under `id`.
     #[must_use]
-    #[cfg(any(test, feature = "test-support"))]
     pub fn with_export(mut self, id: BoundaryId, value: Traced) -> Self {
         self.exports.push((id, value));
         self
@@ -1669,7 +1687,14 @@ impl Builder {
 
     /// A constant input (weight / table), bound at graph close. Not per-token.
     pub fn constant(&self, name: &str, aval: TensorType) -> Result<Traced, BuilderError> {
-        self.declare_constant(name, aval, None)
+        self.declare_constant(name, aval, None, None)
+    }
+
+    /// A model weight input, bound at graph close: the constant `weight` names, at `aval`. Its
+    /// [`WeightRef`] is recorded on the value ([`ValueMeta::weight`]), and its name is the
+    /// reference's spelling ([`WeightRef::name`]).
+    pub fn weight(&self, weight: WeightRef, aval: TensorType) -> Result<Traced, BuilderError> {
+        self.declare_constant(&weight.name(), aval, Some(weight), None)
     }
 
     /// [`Builder::constant`] for an I32 table whose words are declared to lie in `range`: a hash
@@ -1693,13 +1718,14 @@ impl Builder {
                 dtype: aval.dtype,
             });
         }
-        self.declare_constant(name, aval, Some(range))
+        self.declare_constant(name, aval, None, Some(range))
     }
 
     fn declare_constant(
         &self,
         name: &str,
         aval: TensorType,
+        weight: Option<WeightRef>,
         range: Option<IndexRange>,
     ) -> Result<Traced, BuilderError> {
         let id = self.append_input(
@@ -1714,6 +1740,7 @@ impl Builder {
                 name: Some(name.to_string()),
                 key: None,
                 state_role: None,
+                weight,
                 range,
             },
         )?;
@@ -1735,6 +1762,7 @@ impl Builder {
                 name: None,
                 key: None,
                 state_role: None,
+                weight: None,
                 range: None,
             },
         )?;
@@ -1848,6 +1876,7 @@ impl Builder {
                     name: Some(key.to_string()),
                     key: Some(key),
                     state_role: None,
+                    weight: None,
                     range,
                 }
             },
@@ -1891,6 +1920,7 @@ impl Builder {
                 name: Some(name.to_string()),
                 key: None,
                 state_role: Some(role),
+                weight: None,
                 range: None,
             },
         )?;
@@ -1985,6 +2015,7 @@ impl Builder {
                     name: None,
                     key: None,
                     state_role: None,
+                    weight: None,
                     range: None,
                 })
                 .map_err(|_| BuilderError::SizeOverflow {
@@ -2902,6 +2933,7 @@ mod tests {
                 name: None,
                 key: None,
                 state_role: None,
+                weight: None,
                 range: None,
             });
             plan.declare_result(plan.handle(value))?;
@@ -3060,6 +3092,7 @@ mod tests {
             name: Some(name.to_string()),
             key: None,
             state_role: (storage == Storage::State).then_some(StateRole::Recurrent),
+            weight: None,
             range: None,
         });
         match namespace {

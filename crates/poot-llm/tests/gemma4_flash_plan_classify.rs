@@ -28,15 +28,8 @@ fn gemma4(variant: Option<&str>) -> Box<dyn Model> {
         .find(|entry| entry.family.as_str() == "gemma4")
         .expect("the builtin registry holds gemma4");
     let fixture = match variant {
-        None => (entry.fixture)(),
-        Some(name) => {
-            let (_, make) = entry
-                .variants
-                .iter()
-                .find(|(n, _)| *n == name)
-                .expect("the gemma4 variant");
-            make()
-        }
+        None => poot_models::test_support::family_fixtures::base(entry.family),
+        Some(name) => poot_models::test_support::family_fixtures::variant(entry.family, name),
     };
     registry
         .build(&fixture.raw(), &fixture.store)

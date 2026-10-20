@@ -59,12 +59,10 @@ verified for the dense fixture only.
 
 ## Why is sampled decoding slower on ROCm?
 
-Today it is not backend-specific. Greedy and plain-temperature requests (including top-k/top-p/
-min-p) pick the next token on-device, on every backend: a sampling step is appended to the decode
-graph itself, and the host reads back only the chosen token id and a non-finite flag. A request with
-a logit-bias/penalty, logprob recording, or a guided-decoding constraint still reads the full logits
-back and picks on the host, since those transforms are host-side - and that readback/host-sampling
-cost is the same on ROCm, wgpu and PTX.
+It is not backend-specific. Every request picks the next token on-device, on every backend: a
+sampling step is appended to the decode graph itself, and the host reads back only the chosen token id,
+a non-finite flag and any top-n logprob alternatives. Logit bias, penalties, logprobs and guided masks
+run in that step too, so no request reads the full logits back unless the caller asks for them.
 
 ## What bounds a hung ROCm GPU job?
 

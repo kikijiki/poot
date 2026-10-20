@@ -631,7 +631,7 @@ fn run_indexed_case(
         })
         .collect();
     let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
-        stack_id: "experts".to_string(),
+        stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
         descriptor: owners_vec[0].weight(),
         experts: EXPERTS,
     };
@@ -655,7 +655,10 @@ fn run_indexed_case(
     let ids_key = graph.meta(ids.id()).slot_key().unwrap().clone();
 
     let owners: HashMap<String, Arc<PackedPayload>> = (0..EXPERTS)
-        .map(|e| (format!("experts.{e}"), Arc::clone(&owners_vec[e])))
+        .map(|e| {
+            let stack = poot_graph_ir::test_support::packed_graphs::TEST_STACK.const_name();
+            (format!("{stack}.{e}"), Arc::clone(&owners_vec[e]))
+        })
         .collect();
     let store = store_for(&graph, &owners);
     let mut weights = ConstWeights::new(&store);

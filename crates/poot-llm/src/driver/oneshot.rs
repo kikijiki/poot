@@ -426,6 +426,7 @@ impl ChatSession {
 
 #[cfg(test)]
 mod tests {
+    use poot_graph_ir::ops::sampling::Adjust;
     use poot_text::ChatFormat;
     use tokenizers::Tokenizer;
     use tokenizers::models::wordlevel::WordLevel;
@@ -565,8 +566,8 @@ mod tests {
             repeat_penalty: 1.0,
             ..flags
         };
-        assert!(plain.sampler().is_simple_temperature());
-        assert!(!sampler.is_simple_temperature());
+        assert_eq!(plain.sampler().adjustment(), Adjust::None);
+        assert_eq!(sampler.adjustment(), Adjust::History);
     }
 
     /// The seed is the draw: one seed repeats its tokens and a different seed is another stream.

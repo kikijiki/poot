@@ -71,10 +71,9 @@ Inference kernels (RMSNorm, a numerically-stable softmax, an LDS reduction, an a
 + tiled-GEMM matmuls) are authored in plain Rust and run on the GPU byte-identically to the engine's
 hand-built kernels. A sampling step built from these same primitives (a batched argmax, or a Gumbel-
 noise perturbation plus top-k/top-p bisection for temperature sampling) is appended to the decode
-graph itself and runs on-device, on every backend, for greedy and plain-temperature requests; the
-host reads back only the chosen token id and a non-finite flag. A request with a logit-bias/penalty,
-logprob recording, or a guided-decoding constraint still reads the full logits back and picks on the
-host. On the wgpu path the entire f32 matmul family (every projection GEMV and tiled GEMM, decode and
+graph itself and runs on-device, on every backend, for every request (bias, penalties, logprobs and
+guided masks included); the host reads back only the chosen token id, a non-finite flag and any top-n
+logprob alternatives. On the wgpu path the entire f32 matmul family (every projection GEMV and tiled GEMM, decode and
 prefill) are imported-from-Rust kernels dispatched every step.
 
 ## The partition: generated lowering families vs. standalone kernels

@@ -40,6 +40,12 @@ pub(super) struct Seq {
     /// The values the request supplied for its model's inputs, bound on the steps that carry them.
     /// Immutable and shared: a fork of the sequence holds the same value.
     pub(super) inputs: RequestInputs,
+    /// Whether the sequence's row of the device-resident sampler history holds exactly the sampler's
+    /// counts and bias: seeded from the host sampler, then kept by the adjusted head's own update with
+    /// each token the host commits. Cleared by every step that picks without that update, by a commit
+    /// that keeps fewer tokens than the step drew and by a failed step; the next adjusted step seeds the
+    /// row again.
+    pub(super) history_synced: bool,
 }
 
 /// Where the open sequences keep their K/V.

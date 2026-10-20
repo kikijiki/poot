@@ -24,8 +24,8 @@ use poot_models::model::{
     ConfigReason, FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
     StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
+use poot_quant::weights::WeightMap;
 use poot_runtime_common::{BufferRole, MemoryCounters};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
@@ -221,21 +221,12 @@ fn checkpoint(variant: Variant) -> (poot_test_util::UniqueTempPath, ModelHandle)
     let mut file = (header.len() as u64).to_le_bytes().to_vec();
     file.extend_from_slice(header);
     std::fs::write(dir.join("model.safetensors"), file).unwrap();
-    let mut registry = Registry::empty();
-    registry
-        .register(FamilyEntry {
-            family: FAMILY,
-            keys: &[(ConfigSource::HfModelType, "capacity-tiny")],
-            build: |raw, _store| build_tiny(raw),
-            fixture: || Fixture {
-                config: serde_json::json!({"model_type": "capacity-tiny", "state": "dense"}),
-                generation: None,
-                preprocessor: None,
-                store: WeightStore::default(),
-            },
-            variants: &[],
-        })
-        .unwrap();
+    let registry = Registry::of(&[FamilyEntry {
+        family: FAMILY,
+        keys: &[(ConfigSource::HfModelType, "capacity-tiny")],
+        build: |raw, _store| build_tiny(raw),
+    }])
+    .unwrap();
     let handle =
         ModelHandle::load(&dir, &registry, &poot_llm::driver::LoadOptions::default()).unwrap();
     (dir, handle)
@@ -356,6 +347,7 @@ fn shapes(layout: Layout) -> ServingShapes<'static> {
         warm: Warm::Admitted,
         windows: &[],
         adapters: &[],
+        chain: None,
     }
 }
 

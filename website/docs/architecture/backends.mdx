@@ -77,11 +77,11 @@ kernel IR -> poot-codegen (LLVM IR) -> clang -target amdgcn-amd-amdhsa -> HSACO 
 
 ROCm has no vendor graph API, so poot records the dispatch sequence as AQL packets and resubmits them
 per token. Paged KV and flash attention are hardware-verified. Generation picks the next token
-on-device for greedy and plain-temperature (including top-k/top-p/min-p) requests, on every backend:
-a sampling step is appended to the decode graph itself and the host reads back only the chosen token
-id (and a non-finite flag), not the full logits. A request with a logit-bias/penalty, logprob
-recording, or a guided-decoding constraint still reads the full logits back and picks on the host,
-since those transforms are host-side.
+on-device for every request, on every backend: a sampling step is appended to the decode graph itself
+and the host reads back only the chosen token id (and a non-finite flag), plus the top-n alternatives
+when logprobs are asked for, not the full logits. Logit bias and repetition/presence/frequency penalties
+run in that step from a device-resident per-sequence token history, and a guided-decoding mask is built
+on the host while the forward pass runs and applied in the step. Full logits come back only on request.
 
 Verified on AMD Radeon 8060S (gfx1151) and gfx1100.
 

@@ -39,10 +39,11 @@ use poot_quant::weights::{WeightMap, WeightStore};
 
 use crate::device::{Collectives, Device, DeviceTime, NativeCounters};
 use crate::engine::{Engine, EntryPart, Outgoing, StageSeams, device_error};
-use crate::error::{BindError, ExecError, LoadError};
+use crate::error::{BindError, ChainError, ExecError, LoadError};
 use crate::{
-    DeviceMemory, EntryId, ExecutableId, Executor, ExecutorStats, HostSync, OutputSource,
-    StageStats, StateScope, StepInputs, StepOutputs,
+    ChainFeed, ChainOutputs, ChainStep, DeviceMemory, EntryId, ExecutableId, Executor,
+    ExecutorStats, HostSync, LateInputs, OutputSource, StageStats, StateScope, StepInputs,
+    StepOutputs,
 };
 
 pub use schedule::ScheduleError;
@@ -726,6 +727,7 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
                 links: program.links(),
                 transfers: program.transfers(),
                 sync_points: &[],
+                late: None,
             };
             match self.engines[rank].add_part(per_rank_exe[rank], &part) {
                 Ok(entry) => per_rank[rank] = Some(entry),
@@ -797,6 +799,37 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
         Ok(EntryId::new(executable.entries.len() - 1))
     }
 
+    /// A program spanning devices has no late point (`compile_staged` cuts one only in a program that is
+    /// otherwise one stage on one device), so the late values are bound with the rest of the inputs.
+    fn step_late(
+        &mut self,
+        exe: ExecutableId,
+        entry: EntryId,
+        inputs: &StepInputs<'_>,
+        late: &mut dyn LateInputs,
+        sync: &mut dyn HostSync,
+    ) -> Result<StepOutputs<'_>, ExecError> {
+        let values = late.build()?;
+        let shapes: Vec<Vec<usize>> = values.iter().map(|value| value.shape().to_vec()).collect();
+        let mut all = inputs.clone();
+        for ((key, value), shape) in late.keys().iter().zip(&values).zip(&shapes) {
+            all.push(key.clone(), shape, value.view());
+        }
+        self.step(exe, entry, &all, sync)
+    }
+
+    /// A coordinator orders one step's device work across devices by events within the step; it cannot order
+    /// the next step's after it without the host.
+    fn step_chain(
+        &mut self,
+        _exe: ExecutableId,
+        _steps: &[ChainStep<'_, '_>],
+        _feed: &ChainFeed,
+        _sync: &mut dyn HostSync,
+    ) -> Result<ChainOutputs<'_>, ExecError> {
+        Err(ChainError::Unsupported.into())
+    }
+
     fn step(
         &mut self,
         exe: ExecutableId,
@@ -865,6 +898,34 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
         Ok(())
     }
 
+    fn write_state_row(
+        &mut self,
+        exe: ExecutableId,
+        name: &str,
+        row: usize,
+        values: poot_tensor::HostView<'_>,
+    ) -> Result<(), ExecError> {
+        self.check_usable()?;
+        let per_rank = self.executable(exe)?.per_rank.clone();
+        // A state lives on the devices whose stages carry it; the others do not hold it.
+        let mut written = false;
+        for (engine, exe) in self.engines.iter_mut().zip(per_rank) {
+            match engine.write_state_row(exe, name, row, values) {
+                Ok(()) => written = true,
+                Err(ExecError::Bind(bind)) if matches!(*bind, BindError::UnknownState { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if written {
+            Ok(())
+        } else {
+            Err(BindError::UnknownState {
+                name: name.to_string(),
+            }
+            .into())
+        }
+    }
+
     fn remove_entry(&mut self, exe: ExecutableId, entry: EntryId) -> Result<(), ExecError> {
         self.check_usable()?;
         let per_rank_exe = self.executable(exe)?.per_rank.clone();
@@ -890,6 +951,8 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
             self.engines.iter().map(|engine| engine.stats()).collect();
         for device in &engine_stats {
             stats.host_write_bytes += device.host_write_bytes;
+            stats.output_read_bytes += device.output_read_bytes;
+            stats.waits += device.waits;
             stats.weight_bytes_read += device.weight_bytes_read;
             stats.kernels_resolved += device.kernels_resolved;
             stats.recordings += device.recordings;

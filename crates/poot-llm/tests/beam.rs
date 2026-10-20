@@ -27,7 +27,7 @@ use poot_llm::driver::{
     ServingShapes, State, Warm, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
-use poot_models::components::standard::{Step, check_step};
+use poot_models::components::standard::Step;
 use poot_models::io::{ModelSchema, ProgramId, ProgramSpec, StateSpec};
 use poot_models::model::{
     FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, StepShape, StepSpec,
@@ -124,10 +124,7 @@ fn sharpened(fixture: &Fixture, factor: f32) -> Fixture {
 /// The built-in families plus the fixture family and the recurrent fake, registered from outside the
 /// production crates.
 fn registry() -> Registry {
-    let mut registry = Registry::builtin().unwrap();
-    registry.register(ENTRY).unwrap();
-    registry.register(RECURRENT_ENTRY).unwrap();
-    registry
+    Registry::builtin_plus(&[ENTRY, RECURRENT_ENTRY]).unwrap()
 }
 
 /// `fixture` written as a checkpoint and loaded.
@@ -149,8 +146,6 @@ const RECURRENT_ENTRY: FamilyEntry = FamilyEntry {
     family: RECURRENT,
     keys: &[(ConfigSource::HfModelType, "poot_fixture_beam_recurrent")],
     build: build_recurrent,
-    fixture: recurrent_fixture,
-    variants: &[],
 };
 
 #[derive(Debug)]
@@ -219,7 +214,6 @@ impl Model for Recurrentish {
     /// tokens accumulate.
     fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
         let shape = spec.shape;
-        check_step(RECURRENT, shape, self.config.max_positions)?;
         let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let tokens = b.cast(
@@ -988,6 +982,7 @@ fn assert_paged_beam_runs_on_contiguous_entries(choice: BackendChoice) {
             warm: Warm::Admitted,
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap_or_else(|e| panic!("{e}"));
     let caps = paged.caps().expect("prepared").clone();
@@ -1120,15 +1115,18 @@ fn beam_refusal<S: State>(driver: &mut Driver<S>, request: BeamRequest) -> BeamE
 #[test]
 fn beam_on_a_driver_with_an_open_sequence_is_busy_and_leaves_it_unharmed() {
     use poot_llm::driver::{AdapterRef, Admission, Release, RowWork, SeqRequest, StepRow};
-    let (driver, _dir) = fake_driver(0);
+    // The prefill below picks through the greedy suffix, whose (token, non-finite index) pair of all-ones
+    // words is the token -1 with no fault.
+    let (driver, _dir) = fake_driver(0xff);
     let mut driver = driver
         .prepare(&ServingShapes {
             layout: Layout::Contiguous,
             rows: &[NonZeroUsize::MIN],
-            heads: &[Head::Logits],
+            heads: &[Head::GREEDY, Head::Logits],
             warm: Warm::Admitted,
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap();
     let prompt = [3u32, 17, 8];

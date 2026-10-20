@@ -624,7 +624,7 @@ fn run_indexed_case(
         })
         .collect();
     let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
-        stack_id: "experts".to_string(),
+        stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
         descriptor: owners[0].weight(),
         experts: EXPERTS,
     };
@@ -938,6 +938,7 @@ fn packed_embedding_row_gather_is_bit_exact() {
 #[test]
 fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
     use poot_graph_plan::{PackedConst, PackedLayout, WeightFormats, bind_packed_weights};
+    use poot_quant::weights::{ExpertProj, MoeRole, WeightId, WeightRole};
 
     let Some(device) =
         poot_runtime_common::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
@@ -971,8 +972,12 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
             poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
         )
         .unwrap();
+    let stack_id = WeightId::layer(0, WeightRole::Moe(MoeRole::Stack(ExpertProj::Gate)));
     let w = b
-        .constant("experts.weight", TensorType::f32(vec![EXPERTS, OUT, K]))
+        .weight(
+            poot_graph_ir::WeightRef::whole(stack_id),
+            TensorType::f32(vec![EXPERTS, OUT, K]),
+        )
         .unwrap();
     let y = b
         .indexed_matmul(x, b.transpose(w, vec![0, 2, 1]).unwrap(), ids)
@@ -982,9 +987,8 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
     let mut formats = WeightFormats::default();
     formats
         .insert(
-            "experts.weight".to_string(),
+            stack_id,
             PackedConst {
-                linear_id: "experts.weight".to_string(),
                 weight: owners[0].weight(),
                 layout: PackedLayout::ExpertRows { experts: EXPERTS },
             },
@@ -1017,7 +1021,7 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
             Some(name) => {
                 let name = PackedSourceName::parse(name)
                     .unwrap_or_else(|| panic!("input v{id} {name:?} is not a packed carrier"));
-                assert_eq!(name.linear_id(), "experts.weight");
+                assert_eq!(name.linear_id(), stack_id.const_name());
                 inputs.insert(
                     id,
                     PackedStackComponentRef::new(Arc::clone(&stack), name.role()).into(),
@@ -1055,7 +1059,9 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
         let value = match traced.meta(id).name.as_deref() {
             Some("activation.moe-x") => activation.clone(),
             Some("activation.moe-ids") => selected.clone(),
-            Some("experts.weight") => HostTensor::f32(vec![EXPERTS, OUT, K], decoded.clone()),
+            Some(name) if name == stack_id.const_name() => {
+                HostTensor::f32(vec![EXPERTS, OUT, K], decoded.clone())
+            }
             other => panic!("unexpected traced input {other:?}"),
         };
         dense.insert(id, value.into());

@@ -12,22 +12,25 @@
 //! Every step runs on one prepared entry whose row count is a prepared capacity: rows beyond the live
 //! ones are masked, and a row with fewer tokens than the step's widest is padded on the left (a
 //! padding token's write-map entry is -1, so it writes nothing and the row's last position stays the
-//! entry's last), so a changing composition never compiles. A step in which every picking row is
-//! suffix-expressible and shares one rule runs that suffix entry; any other mix runs the logits entry
-//! and every row picks on the host through its own `Sampler` (S3).
+//! entry's last), so a changing composition never compiles. A step runs the narrowest prepared sampling
+//! head that serves every picking row (a draw of the widest rule among them, penalties, bias and a guided
+//! mask when any row has them, logprobs when any row records them); the other rows bind the neutral value
+//! of what they do not use. A request no prepared head serves is a typed refusal. Several decode steps can
+//! be chained on the device with one host wait ([`RowWork::Chain`]).
 //!
 //! Under a draft policy ([`super::speculate`]) a decode row with nothing `ahead` proposes drafts and
 //! is verified in a window step of the policy's width; the row's result is the accepted drafts and
 //! one more token, and `commit(kept)` keeps a prefix of it like any other result.
 
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use poot_graph_ir::ForwardSlotMap;
 use poot_graph_ir::op::SampleRule;
+use poot_graph_ir::ops::sampling::{Adjust, HISTORY_STATE, SampleSpec};
 use poot_models::io::{InputError, InputSet, InputValue, ProgramId, RequestInputs, StepInput};
 use poot_models::model::{KvLayout, LogitRows, StepShape, TraceError};
 
-use super::bind::{Binder, RequestFrame, RowFeed, Side, StepColumns};
+use super::bind::{Binder, PassInput, RequestFrame, RowFeed, Side, StepColumns};
 use super::block_table::{BLOCK_SIZE, PagedKvCache, PoolExhausted};
 use super::caps::StateResidency;
 use super::chunks::Piece;
@@ -38,9 +41,14 @@ use super::sequences::{KvStore, Seq, Serving};
 use super::speculate::{
     self, DraftPolicy, NotSpeculated, PassTiming, Proposal, RowSpeculation, SpecRow, StepTime,
 };
-use super::suffix::{self, Head, SuffixRows};
-use super::{Driver, EntryKey, Feature, FeatureSet, ModelRole, Program, host_sample, window_wall};
+use super::suffix::{self, DrawRow, Head, NEUTRAL_PENALTY};
+use super::{
+    Bound, Driver, EntryKey, Feature, FeatureSet, ModelRole, Program, host_sample, window_wall,
+};
 use crate::core::sampler::{Sampler, TokenLogprob};
+use poot_executor::{ChainFeed, ChainStep, ExecError, LateInputs, NoLate, NoSync, StepInputs};
+use poot_graph_ir::SlotKey;
+use poot_tensor::{DType, HostTensor, HostView};
 
 #[cfg(test)]
 pub(super) mod mtp_tests;
@@ -138,6 +146,16 @@ pub enum RowWork<'a> {
         /// decode.
         ahead: &'a [u32],
     },
+    /// Decode `steps` tokens one after another on the device with one host wait: each step's pick is
+    /// fed to the next on the device, so the host sees none of them until the last has run. The row
+    /// returns `steps` tokens, uncommitted like any result; a stop inside them is a `commit` that keeps
+    /// fewer. Every picking row of the step chains the same number of steps, with a plain or adjusted
+    /// head (no guided mask and no logprobs, whose per-step host work cannot ride a device chain), and
+    /// no row of the step is a prefill or a window.
+    Chain {
+        /// The tokens to decode, at least two.
+        steps: NonZeroUsize,
+    },
 }
 
 /// One row of a step: a sequence, its work and the sampler its pick goes through.
@@ -230,6 +248,58 @@ impl RowPlan {
 pub(super) struct Lane<'a> {
     pub(super) seq: SeqId,
     pub(super) sampler: &'a mut Sampler,
+}
+
+/// The guided-decoding mask of a step's picking lanes, as the late input of an [`Adjust::Guided`] head:
+/// `0` for a permitted token and [`MASKED_LOGIT`](poot_graph_ir::ops::sampling::MASKED_LOGIT) for an
+/// excluded one, the neutral zero row for every lane that does not pick. The executor asks for it once
+/// the device is running the forward pass, so the host work of walking each constraint overlaps it.
+struct GuidedMask<'l, 'a> {
+    lanes: &'l [Lane<'a>],
+    plans: &'l [RowPlan],
+    rows: usize,
+    vocab: usize,
+    keys: [SlotKey; 1],
+}
+
+impl<'l, 'a> GuidedMask<'l, 'a> {
+    /// The late input of a step run on `head`, `None` when the head has no mask.
+    fn of(
+        head: Head,
+        lanes: &'l [Lane<'a>],
+        plans: &'l [RowPlan],
+        rows: usize,
+        vocab: usize,
+    ) -> Option<Self> {
+        matches!(head, Head::Sample(spec) if spec.adjust == Adjust::Guided).then(|| Self {
+            lanes,
+            plans,
+            rows,
+            vocab,
+            keys: [PassInput::SamplerMask.slot_key()],
+        })
+    }
+}
+
+impl LateInputs for GuidedMask<'_, '_> {
+    fn keys(&self) -> &[SlotKey] {
+        &self.keys
+    }
+
+    fn build(&mut self) -> Result<Vec<HostTensor>, ExecError> {
+        let mut mask = Vec::with_capacity(self.rows * self.vocab);
+        for (lane, plan) in self.lanes.iter().zip(self.plans) {
+            match plan.picks > 0 {
+                true => match lane.sampler.guided_mask(self.vocab) {
+                    Some(row) => mask.extend(row),
+                    None => mask.resize(mask.len() + self.vocab, 0.0),
+                },
+                false => mask.resize(mask.len() + self.vocab, 0.0),
+            }
+        }
+        mask.resize(self.rows * self.vocab, 0.0);
+        Ok(vec![HostTensor::f32(vec![self.rows, self.vocab], mask)])
+    }
 }
 
 /// What an executed entry returned for its live rows.
@@ -400,6 +470,7 @@ impl Driver<Serving> {
                 folded: 0,
                 state_ahead: false,
                 inputs,
+                history_synced: false,
             },
         );
         self.speculation.open(seq, reused);
@@ -546,6 +617,7 @@ impl Driver<Serving> {
         state.done = reused;
         state.reserved = reserved;
         state.seeded = false;
+        state.history_synced = false;
         if reused == 0 {
             state.state_ahead = false;
         }
@@ -588,6 +660,7 @@ impl Driver<Serving> {
         }
         let window = plans.iter().any(|plan| plan.picks > 1);
         let head = self.step_head(rows, &plans, window)?;
+        let chain = Self::chain_depth(rows)?;
         let lanes: Vec<Lane<'_>> = rows
             .iter_mut()
             .map(|row| Lane {
@@ -595,7 +668,22 @@ impl Driver<Serving> {
                 sampler: &mut *row.sampler,
             })
             .collect();
-        let readback = self.run_rows(lanes, &mut plans, (head, adapter))?;
+        let readback = match chain {
+            Some(depth) => self.run_chain_rows(lanes, &plans, (head, adapter), depth),
+            None => self.run_rows(lanes, &mut plans, (head, adapter)),
+        };
+        let readback = match readback {
+            Ok(readback) => readback,
+            Err(error) => {
+                // A step that failed part-way may have updated a history row the sampler never saw.
+                for row in rows.iter() {
+                    if let Some(seq) = self.state.seqs.get_mut(&row.seq) {
+                        seq.history_synced = false;
+                    }
+                }
+                return Err(error);
+            }
+        };
 
         let mut picked: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
         let mut host_picks = false;
@@ -756,16 +844,178 @@ impl Driver<Serving> {
         Ok(Readback::merge(readbacks, &groups))
     }
 
-    /// Run one prepared entry over `plans`: bind each live row's feed, positions and cache mapping,
-    /// execute, and read back what the rows pick. `lanes` are the live rows in plan order; rows beyond
-    /// them are masked. The caller owns the sequences' bookkeeping.
-    pub(super) fn run_plans(
+    /// The number of steps every row of the step chains, `None` when none does.
+    fn chain_depth(rows: &[StepRow<'_>]) -> Result<Option<NonZeroUsize>, InvalidRequest> {
+        let mut depths = rows.iter().map(|row| match row.work {
+            RowWork::Chain { steps } => Some(steps),
+            RowWork::Prefill { .. } | RowWork::Decode { .. } => None,
+        });
+        let Some(first) = depths.next() else {
+            return Ok(None);
+        };
+        if depths.all(|depth| depth == first) {
+            Ok(first)
+        } else {
+            Err(InvalidRequest::MixedChain)
+        }
+    }
+
+    /// Run the rows of a chained step: one entry per step of the chain, the first the ordinary decode
+    /// entry of the head, the rest its chain copies, run back to back on the device with one wait. The
+    /// head must be one whose pick the device carries into the next step.
+    fn run_chain_rows(
+        &mut self,
+        mut lanes: Vec<Lane<'_>>,
+        plans: &[RowPlan],
+        (head, adapter): (Option<Head>, Option<GenerationId>),
+        depth: NonZeroUsize,
+    ) -> Result<Readback, DriverError> {
+        let chainable = matches!(head, Some(Head::Sample(spec))
+            if spec.logprobs.is_none() && spec.adjust != Adjust::Guided);
+        if !chainable {
+            return Err(InvalidRequest::ChainHead { head }.into());
+        }
+        let carried = self.carried_by(&lanes, plans);
+        let key = self.step_entry(
+            ModelRole::Target,
+            lanes.len(),
+            1,
+            (false, carried),
+            head,
+            adapter,
+        )?;
+        self.run_chain(&mut lanes, plans, key, depth.get())
+    }
+
+    /// Run `depth` chained steps of the head `key` names and read back every step's picks. Each step has
+    /// its own entry and its own bound inputs, all written before the first runs; the device carries
+    /// each step's pick into the next step's token slot ([`Executor::step_chain`]).
+    fn run_chain(
         &mut self,
         lanes: &mut [Lane<'_>],
         plans: &[RowPlan],
         key: EntryKey,
+        depth: usize,
     ) -> Result<Readback, DriverError> {
-        let entry = self.ledger.entries[&key].clone();
+        let Head::Sample(spec) = key.head else {
+            unreachable!("a chain runs a sampling head")
+        };
+        let keys: Vec<EntryKey> = (0..depth)
+            .map(|step| EntryKey {
+                chain: u8::try_from(step).expect("a chain is shorter than 256 steps"),
+                ..key
+            })
+            .collect();
+        let mut entries = Vec::with_capacity(depth);
+        for key in &keys {
+            entries.push(self.ledger.entries.get(key).cloned().ok_or(
+                PreparedSetRefusal::NotAdmitted {
+                    program: key.program,
+                    shape: key.shape,
+                    head: key.head,
+                    adapters: key.adapters,
+                },
+            )?);
+        }
+        let mut staged = Vec::with_capacity(depth);
+        for (step, entry) in entries.iter().enumerate() {
+            staged.push(self.step_columns(entry, lanes, plans, keys[step], step)?);
+        }
+        let width = key.shape.tokens.get();
+        let feeds: Vec<Vec<RowFeed<'_>>> = staged
+            .iter()
+            .map(|(_, owned)| {
+                owned
+                    .iter()
+                    .zip(plans)
+                    .map(|(inputs, plan)| RowFeed {
+                        inputs,
+                        start: plan.start,
+                        fed: plan.feed.len(),
+                    })
+                    .collect()
+            })
+            .collect();
+        let frames: Vec<RequestFrame<'_>> = feeds
+            .iter()
+            .map(|feeds| RequestFrame {
+                rows: key.shape.rows.get(),
+                tokens: width,
+                side: Side::Left,
+                feeds,
+            })
+            .collect();
+        let bound: Vec<_> = entries
+            .iter()
+            .zip(&staged)
+            .zip(&frames)
+            .enumerate()
+            .map(|(step, ((entry, (columns, _)), frame))| {
+                Self::bound_inputs(entry, columns, frame, step > 0)
+            })
+            .collect();
+        let inputs: Vec<StepInputs<'_>> = bound
+            .iter()
+            .map(|bound| {
+                let mut inputs = StepInputs::new();
+                for (key, value) in bound {
+                    match value {
+                        Bound::Tensor(tensor) => {
+                            inputs.push((*key).clone(), tensor.shape(), tensor.view());
+                        }
+                        Bound::WriteMap(map) => inputs.push_write_map((*key).clone(), map),
+                    }
+                }
+                inputs
+            })
+            .collect();
+        for (entry, (columns, _)) in entries.iter().zip(&staged) {
+            self.account_step(entry, columns);
+        }
+        let picked = entries[0].picked.ok_or(InvalidRequest::ChainHead {
+            head: Some(key.head),
+        })?;
+        let feed = ChainFeed {
+            picked,
+            slot: StepInput::Tokens.slot_key(),
+        };
+        let steps: Vec<ChainStep<'_, '_>> = entries
+            .iter()
+            .zip(&inputs)
+            .map(|(entry, inputs)| ChainStep {
+                entry: entry.id,
+                inputs,
+            })
+            .collect();
+        self.stats.chains += 1;
+        let mut outputs =
+            self.runtime
+                .executor
+                .step_chain(entries[0].exe, &steps, &feed, &mut NoSync)?;
+        let mut picked = vec![Vec::with_capacity(depth); lanes.len()];
+        for step in 0..depth {
+            let bytes = outputs.read(step)?;
+            for (i, tokens) in picked.iter_mut().enumerate() {
+                tokens.push(suffix::read_pick(spec, &bytes, i)?.token);
+            }
+        }
+        drop(outputs);
+        self.settle_history(key.head, lanes, plans);
+        Ok(Readback::Tokens(picked))
+    }
+
+    /// The columns `entry` binds for `plans`: each live row's feed, positions and cache mapping, the
+    /// sampling suffix's inputs, and the request values the lanes' sequences carry. `offset` is the step's
+    /// index within a chain: every row's token sits that many positions further on, and the sampler
+    /// draws its seeds for that step.
+    fn step_columns(
+        &mut self,
+        entry: &super::Prepared,
+        lanes: &mut [Lane<'_>],
+        plans: &[RowPlan],
+        key: EntryKey,
+        offset: usize,
+    ) -> Result<(StepColumns, Vec<RequestInputs>), DriverError> {
         let StepShape {
             rows: entry_rows,
             tokens: width,
@@ -824,7 +1074,7 @@ impl Driver<Serving> {
                 let at = i * width + k;
                 match real {
                     Some(j) => {
-                        let position = plan.start + j;
+                        let position = plan.start + j + offset;
                         columns.tokens[at] = plan.feed[j] as i32;
                         columns.pos[at] = position as i32;
                         columns.real[at] = 1;
@@ -834,7 +1084,7 @@ impl Driver<Serving> {
                             kv_write[at] = map[position] as i32;
                         }
                     }
-                    None => columns.pos[at] = plan.start as i32,
+                    None => columns.pos[at] = (plan.start + offset) as i32,
                 }
             }
         }
@@ -851,37 +1101,31 @@ impl Driver<Serving> {
                 columns.state_write = ForwardSlotMap::new(state_write, seqs.get())?;
             }
         }
-        // Sampler inputs of a non-greedy suffix: one row each, placeholders for rows that do not pick
-        // and for the masked rows.
-        if let Head::Sample(rule) = key.head
-            && rule != SampleRule::Greedy
-        {
-            let mut seed = Vec::new();
-            let mut params = Vec::new();
-            let mut top_k = Vec::new();
-            for (lane, plan) in lanes.iter_mut().zip(plans) {
-                let suffix_row = if plan.picks > 0 {
-                    SuffixRows::push(lane.sampler, rule)
-                } else {
-                    SuffixRows::placeholder(lane.sampler, rule)
-                };
-                seed.push(suffix_row.seed);
-                params.extend(suffix_row.params);
-                top_k.extend(suffix_row.top_k);
-            }
-            // Masked rows repeat the first row's placeholder.
-            let per_params = params.len() / lanes.len();
-            let masked = entry_rows - lanes.len();
-            seed.extend(std::iter::repeat_n(0, masked));
-            for _ in 0..masked {
-                params.extend_from_within(..per_params);
-                if !top_k.is_empty() {
-                    top_k.push(top_k[0]);
-                }
-            }
-            (columns.seed, columns.params, columns.top_k) = (seed, params, top_k);
+        // The sampling suffix's inputs: the draw's per-row seed and knobs, and an adjusted head's
+        // penalties, guided mask and history rows.
+        if let Head::Sample(spec) = key.head {
+            self.bind_sampler(entry, key.shape, spec, lanes, plans, &mut columns)?;
         }
+        Ok((columns, owned))
+    }
 
+    /// Run one prepared entry over `plans`: bind each live row's feed, positions and cache mapping,
+    /// execute, and read back what the rows pick. `lanes` are the live rows in plan order; rows beyond
+    /// them are masked. The caller owns the sequences' bookkeeping.
+    pub(super) fn run_plans(
+        &mut self,
+        lanes: &mut [Lane<'_>],
+        plans: &[RowPlan],
+        key: EntryKey,
+    ) -> Result<Readback, DriverError> {
+        let entry = self.ledger.entries[&key].clone();
+        let StepShape {
+            rows: entry_rows,
+            tokens: width,
+            ..
+        } = key.shape;
+        let (entry_rows, width) = (entry_rows.get(), width.get());
+        let (columns, owned) = self.step_columns(&entry, lanes, plans, key, 0)?;
         let feeds: Vec<RowFeed<'_>> = owned
             .iter()
             .zip(plans)
@@ -897,7 +1141,18 @@ impl Driver<Serving> {
             side: Side::Left,
             feeds: &feeds,
         };
-        let mut outputs = self.execute(&entry, &columns, &frame)?;
+        // A guided head's mask is built while the device runs the forward pass, not before it.
+        let mut guided = GuidedMask::of(
+            key.head,
+            lanes,
+            plans,
+            entry_rows,
+            self.handle.config().vocab,
+        );
+        let mut outputs = match &mut guided {
+            Some(mask) => self.execute(&entry, &columns, &frame, mask)?,
+            None => self.execute(&entry, &columns, &frame, &mut NoLate)?,
+        };
         let positions = match key.shape.logits {
             LogitRows::Last => 1,
             LogitRows::All => width,
@@ -907,32 +1162,135 @@ impl Driver<Serving> {
             return Ok(Readback::Tokens(vec![Vec::new(); lanes.len()]));
         }
         match key.head {
-            Head::Sample(_) => {
+            Head::Sample(spec) => {
                 let bytes = outputs.read()?;
-                let ints: &[i32] = bytemuck::cast_slice(&bytes);
                 let mut picked = Vec::with_capacity(lanes.len());
-                for (i, plan) in plans.iter().enumerate() {
+                for (i, (lane, plan)) in lanes.iter_mut().zip(plans).enumerate() {
                     let mut tokens = Vec::with_capacity(plan.picks);
                     for j in 0..plan.picks {
                         // The row's last `picks` positions under All, its one position under Last.
                         let position = positions - plan.picks + j;
-                        let at = 2 * (i * positions + position);
-                        tokens.push(suffix::read_tokens(bytemuck::cast_slice(
-                            &ints[at..at + 2],
-                        ))?);
+                        let pick = suffix::read_pick(spec, &bytes, i * positions + position)?;
+                        tokens.push(pick.token);
+                        if let (Some(mut record), Some(n)) =
+                            (pick.logprob, lane.sampler.logprob_count())
+                        {
+                            record.top.truncate(n);
+                            lane.sampler.push_logprob(record);
+                        }
                     }
                     picked.push(tokens);
                 }
+                drop(outputs);
+                self.settle_history(key.head, lanes, plans);
                 Ok(Readback::Tokens(picked))
             }
             Head::Logits => {
                 let rows = host_sample::read_logits(&mut outputs)?;
+                drop(outputs);
+                self.settle_history(key.head, lanes, plans);
                 let vocab = rows.len() / (entry_rows * positions);
                 Ok(Readback::Logits {
                     rows,
                     vocab,
                     positions,
                 })
+            }
+        }
+    }
+
+    /// Bind the sampling suffix's per-step inputs of `spec` into `columns`. The draw: one row each of seed,
+    /// knobs and top-k, placeholders for lanes that do not pick and for the masked rows. An adjusted
+    /// head: each picking lane's penalties and guided mask, the history pool row it reads and the one
+    /// its drawn token is added to, the neutral value for every other row; a picking lane whose history
+    /// row does not hold its sampler's counts is seeded first.
+    fn bind_sampler(
+        &mut self,
+        entry: &super::Prepared,
+        shape: StepShape,
+        spec: SampleSpec,
+        lanes: &mut [Lane<'_>],
+        plans: &[RowPlan],
+        columns: &mut StepColumns,
+    ) -> Result<(), DriverError> {
+        let (entry_rows, live) = (shape.rows.get(), lanes.len());
+        let masked = entry_rows - live;
+        if spec.rule != SampleRule::Greedy {
+            let mut seed = Vec::new();
+            let mut params = Vec::new();
+            let mut top_k = Vec::new();
+            for (lane, plan) in lanes.iter_mut().zip(plans) {
+                let row = if plan.picks > 0 {
+                    DrawRow::pick(lane.sampler, spec.rule)
+                } else {
+                    DrawRow::placeholder(lane.sampler, spec.rule)
+                };
+                seed.push(row.seed);
+                params.extend(row.params);
+                top_k.extend(row.top_k);
+            }
+            // Masked rows repeat the first row's placeholder.
+            let per_params = params.len() / live;
+            seed.extend(std::iter::repeat_n(0, masked));
+            for _ in 0..masked {
+                params.extend_from_within(..per_params);
+                if !top_k.is_empty() {
+                    top_k.push(top_k[0]);
+                }
+            }
+            (columns.seed, columns.params, columns.top_k) = (seed, params, top_k);
+        }
+        if spec.adjust == Adjust::None {
+            return Ok(());
+        }
+        let vocab = self.handle.config().vocab;
+        let pool_rows = match shape.kv {
+            KvLayout::Paged { seqs, .. } => seqs.get(),
+            KvLayout::Contiguous => entry_rows,
+        };
+        let mut write = vec![ForwardSlotMap::PADDING; entry_rows];
+        columns.history_read = vec![0; entry_rows];
+        columns.penalty = Vec::with_capacity(entry_rows * 3);
+        for (i, (lane, plan)) in lanes.iter().zip(plans).enumerate() {
+            let slot = self.state.seqs[&lane.seq].slot;
+            if plan.picks > 0 {
+                columns.history_read[i] = slot as i32;
+                write[i] = slot as i32;
+                columns.penalty.extend(lane.sampler.penalty_row());
+            } else {
+                columns.penalty.extend(NEUTRAL_PENALTY);
+            }
+        }
+        for _ in live..entry_rows {
+            columns.penalty.extend(NEUTRAL_PENALTY);
+        }
+        columns.history_write = ForwardSlotMap::new(write, pool_rows)?;
+        // A picking lane reads its history row: it must hold the sampler's counts and bias.
+        for (lane, plan) in lanes.iter().zip(plans) {
+            let seq = self.state.seqs.get_mut(&lane.seq).expect("planned above");
+            if plan.picks == 0 || seq.history_synced {
+                continue;
+            }
+            let row = lane.sampler.history_row(vocab);
+            let view = HostView::new(DType::F32, row.len(), bytemuck::cast_slice(&row))
+                .expect("an f32 row is whole words");
+            self.runtime
+                .executor
+                .write_state_row(entry.exe, HISTORY_STATE, seq.slot, view)?;
+            seq.history_synced = true;
+        }
+        Ok(())
+    }
+
+    /// Record what a step did to the lanes' history rows: an adjusted head added each picking lane's
+    /// drawn token to its row, which the host commits next, so the row stays the sampler's; any other
+    /// head leaves a picking lane's row behind the sampler.
+    fn settle_history(&mut self, head: Head, lanes: &[Lane<'_>], plans: &[RowPlan]) {
+        let updated = matches!(head, Head::Sample(spec) if spec.adjust != Adjust::None);
+        for (lane, plan) in lanes.iter().zip(plans) {
+            if plan.picks > 0 && !updated {
+                let seq = self.state.seqs.get_mut(&lane.seq).expect("planned above");
+                seq.history_synced = false;
             }
         }
     }
@@ -983,6 +1341,9 @@ impl Driver<Serving> {
         // A recurrent state cannot step back from the tokens a verified row folded: keeping fewer
         // leaves it ahead of the sequence.
         state.state_ahead |= kept < std::mem::take(&mut state.folded);
+        // The adjusted head added the token it drew to the sampler history on the device: a draw the
+        // caller drops is in the row but not in the sampler.
+        state.history_synced &= kept == pending.len();
         for &token in &pending[..kept] {
             sampler.observe(token);
         }
@@ -1089,24 +1450,30 @@ impl Driver<Serving> {
                         not_speculated: None,
                     }
                 }
-                RowWork::Decode { ahead } => {
+                RowWork::Decode { .. } | RowWork::Chain { .. } => {
+                    let (ahead, steps): (&[u32], usize) = match row.work {
+                        RowWork::Decode { ahead } => (ahead, 1),
+                        RowWork::Chain { steps } => (&[], steps.get()),
+                        RowWork::Prefill { .. } => unreachable!("matched above"),
+                    };
                     if seq.done < seq.prompt_len || seq.tokens.len() == seq.prompt_len {
                         return Err(InvalidRequest::DecodeBeforePrefill(row.seq).into());
                     }
                     let start = seq.tokens.len() - 1;
-                    if start >= seq.reserved {
+                    // A chained step writes the K/V of every token it decodes: the whole chain must
+                    // lie inside the blocks the sequence reserved.
+                    if start + steps > seq.reserved {
                         return Err(InvalidRequest::BeyondReservation(row.seq).into());
                     }
-                    if start + 1 + ahead.len() > capacity {
+                    if start + steps.max(1 + ahead.len()) > capacity {
                         return Err(InvalidRequest::Capacity {
                             prompt: seq.prompt_len,
-                            max_new: start + 1 + ahead.len() - seq.prompt_len,
+                            max_new: start + steps.max(1 + ahead.len()) - seq.prompt_len,
                             max: capacity,
                         }
                         .into());
                     }
-                    if !ahead.is_empty() && suffix::rule_of(row.sampler) != Some(SampleRule::Greedy)
-                    {
+                    if !ahead.is_empty() && !row.sampler.is_greedy() {
                         return Err(InvalidRequest::WindowNeedsGreedy(row.seq).into());
                     }
                     let mut feed = vec![seq.tokens[start]];
@@ -1114,7 +1481,7 @@ impl Driver<Serving> {
                     // Under a draft policy a decode row with nothing ahead speculates, when its
                     // sampler is one the window verifies; any other row decodes one token.
                     let (spec, not_speculated) = match self.speculation.policy.caps() {
-                        Some(_) if !ahead.is_empty() => (None, None),
+                        Some(_) if !ahead.is_empty() || steps > 1 => (None, None),
                         Some(_) if !self.drafts_for(&seq.inputs) => {
                             (None, Some(NotSpeculated::Inputs))
                         }
@@ -1151,10 +1518,12 @@ impl Driver<Serving> {
         Ok(plans)
     }
 
-    /// The head a step runs: the suffix of the one rule every picking row shares, else the logits
-    /// head. A step with a verify window runs the greedy suffix entry, so every picking row must be
-    /// greedy-suffix-expressible: one that is not would silently get an unmasked argmax, and the
-    /// whole step is refused instead.
+    /// The head a step runs: the narrowest prepared sampling head that serves every picking row. A step
+    /// with a verify window runs the greedy suffix entry, so every picking row must be a plain greedy
+    /// row: one that is not would silently get an unmasked argmax, and the whole step is refused instead
+    /// (under a draft policy a sampled row beside a window picks from the window entry's logits, the
+    /// head of a caller that asked for the full logits). A head no prepared set covers is a typed
+    /// refusal: there is no host pick to fall back to.
     fn step_head(
         &self,
         rows: &[StepRow<'_>],
@@ -1165,37 +1534,32 @@ impl Driver<Serving> {
             let offender = rows
                 .iter()
                 .zip(plans)
-                .find(|(row, plan)| {
-                    plan.picks > 0 && suffix::rule_of(row.sampler) != Some(SampleRule::Greedy)
-                })
+                .find(|(row, plan)| plan.picks > 0 && !row.sampler.is_greedy())
                 .map(|(row, _)| row.seq);
             return match offender {
                 None => Ok(Some(Head::GREEDY)),
-                // Under a draft policy a sampled row beside a window picks on the host, from the
-                // window entry's logits.
                 Some(_) if self.speculation.policy.caps().is_some() => Ok(Some(Head::Logits)),
                 Some(seq) => Err(InvalidRequest::WindowStepNeedsGreedy(seq)),
             };
         }
-        let mut rules = rows
+        let mut needs = rows
             .iter()
             .zip(plans)
             .filter(|(_, plan)| plan.picks > 0)
-            .map(|(row, _)| suffix::rule_of(row.sampler));
-        // No row picks: the output is unread, so any prepared head of the shape serves. A rule the
-        // prepared set has no suffix entry for picks on the host from the logits head, as `HeadSet` says.
-        let prepared = |rule| {
-            self.ledger
-                .caps
-                .as_ref()
-                .is_some_and(|caps| caps.heads.suffix.contains(&rule))
+            .map(|(row, _)| suffix::need_of(row.sampler));
+        // No row picks: the output is unread, so any prepared head of the shape serves.
+        let Some(first) = needs.next() else {
+            return Ok(None);
         };
-        Ok(rules.next().map(|first| match first {
-            Some(rule) if prepared(rule) && rules.all(|other| other == Some(rule)) => {
-                Head::Sample(rule)
-            }
-            _ => Head::Logits,
-        }))
+        let need = needs.fold(first, suffix::join);
+        let prepared = self
+            .ledger
+            .caps
+            .as_ref()
+            .map_or(&[][..], |caps| caps.heads.suffix.as_slice());
+        suffix::narrowest(prepared, need)
+            .map(|spec| Some(Head::Sample(spec)))
+            .ok_or(InvalidRequest::HeadNotPrepared { need })
     }
 
     /// The prepared entry a step runs: the smallest admitted row count holding `live` rows, at the
@@ -1232,6 +1596,7 @@ impl Driver<Serving> {
                     && key.carried == carried
                     && head.is_none_or(|head| key.head == head)
                     && key.adapters == adapters
+                    && key.chain == 0
                     && key.shape.tokens.get() == width
                     && key.shape.logits == logits
                     && key.shape.kv == kv
@@ -1241,7 +1606,7 @@ impl Driver<Serving> {
             .collect();
         candidates.sort_by_key(|key| {
             let rank = match key.head {
-                Head::Sample(SampleRule::Greedy) => 0,
+                Head::Sample(spec) if spec == SampleSpec::draw(SampleRule::Greedy) => 0,
                 Head::Logits => 1,
                 Head::Sample(_) => 2,
             };

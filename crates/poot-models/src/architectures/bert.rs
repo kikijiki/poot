@@ -13,6 +13,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
+use poot_graph_ir::ops::MASK_HIDDEN;
 use poot_graph_ir::{BinOp, Builder, Graph, IndexRange, Slot, SlotKey, TensorType, Traced, ops};
 use poot_quant::weights::{
     AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole, WeightStore,
@@ -34,7 +35,9 @@ use crate::model::{
     TraceError,
 };
 use crate::names::{NameRow, Presence, Source, family_weights};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 /// BERT's [`FamilyKey`]: the name its errors and receipts carry.
@@ -67,8 +70,6 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
     keys: &[(ConfigSource::HfModelType, "bert")],
     build,
-    fixture,
-    variants: &[("cross_encoder", cross_encoder_fixture)],
 };
 
 const fn tensor(role: WeightRole, name: &'static str) -> NameRow {
@@ -546,12 +547,12 @@ impl Model for Bert {
         let types = b.slot_named(Slot::Activation, TOKEN_TYPE_TAG, ids.clone())?;
         // A key is real (1) or padding (0): declared so the mask's `I32 -> F32` cast is proven exact.
         let real = b.slot_named_ranged(Slot::Activation, REAL_TOKENS_TAG, ids, IndexRange::FLAG)?;
-        // 0 for a real key, -1e9 for padding: the additive key mask every query shares.
+        // 0 for a real key, `MASK_HIDDEN` for padding: the additive key mask every query shares.
         let mask = b.reshape(
             b.binary_scalar(
                 BinOp::Mul,
                 b.binary_scalar(BinOp::Sub, b.cast(real, DType::F32)?, Builder::f32(1.0))?,
-                Builder::f32(1.0e9),
+                Builder::f32(-MASK_HIDDEN),
             )?,
             vec![rows, 1, 1, tokens],
         )?;
@@ -597,6 +598,7 @@ impl Model for Bert {
 }
 
 /// The fixture's config: a two-layer BERT with a 64-wide, four-head encoder.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "bert",
@@ -615,6 +617,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 /// The shape of every tensor of a BERT checkpoint with `config`'s dims whose encoder names start
 /// with `prefix`.
+#[cfg(feature = "test-support")]
 pub(crate) fn encoder_shapes(
     config: &serde_json::Value,
     prefix: &str,
@@ -658,14 +661,16 @@ pub(crate) fn encoder_shapes(
     shapes
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = encoder_shapes(&config, "");
     Fixture::bf16(config, shapes)
 }
 
 /// The cross-encoder fixture: a `bert.`-prefixed encoder, the pooler and a one-logit classifier.
-fn cross_encoder_fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn cross_encoder_fixture() -> Fixture {
     let mut config = fixture_config();
     config["architectures"] = serde_json::json!(["BertForSequenceClassification"]);
     config["id2label"] = serde_json::json!({"0": "LABEL_0"});

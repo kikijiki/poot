@@ -1,4 +1,4 @@
-//! Gemma 2 behind [`Model`] (HF `gemma2`, GGUF `gemma2`). Differs from Qwen2 and Gemma 3 in three
+//! Gemma 2 (HF `gemma2`, GGUF `gemma2`). Differs from Qwen2 and Gemma 3 in three
 //! ways:
 //! - Alternating attention: even layers slide a window, odd layers are global (full causal).
 //! - Attention logit softcapping before the softmax, and a final logit softcap.
@@ -8,43 +8,32 @@
 //! pre-feedforward and post-feedforward), a GeGLU feed-forward, and the embedding scaled by
 //! `sqrt(hidden_size)`.
 
-use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
-
-use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{WeightMap, WeightStore};
 
-use crate::components::attention::{AttentionParams, AttentionWeights, attention};
+use crate::components::attention::AttentionParams;
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
-use crate::components::ffn::{GatedFfnWeights, geglu_ffn};
-use crate::components::linear::WeightError;
 use crate::components::norm::{NormKind, NormParams};
-use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, NormPlacement, ParamError, StackParams, StackWeights,
-    Step, check_step, decoder_program, standard_layer, standard_stack,
-};
-use crate::io::ModelSchema;
-use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
+use crate::components::standard::{LayerParams, NormPlacement, ParamError, StackParams};
+use crate::model::{ConfigReason, FamilyKey, ModelError};
 use crate::names::gguf::{GGUF_BASE, GGUF_SANDWICH_NORMS};
-use crate::names::{HF_BASE, HF_SANDWICH_NORMS, family_weights, hf_base_shapes};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::names::hf_base_shapes;
+use crate::names::{HF_BASE, HF_SANDWICH_NORMS, family_weights};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, RawConfig};
 use poot_text::ChatFormat;
+
+use crate::components::standard_family::{
+    LayerNormKind, Mlp, StandardFamily, StandardParams, entry,
+};
 
 /// The Gemma vocabulary's `<bos>` id, for a config that names none.
 const GEMMA_BOS: u32 = 2;
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("gemma2");
 
-pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
-    family: FAMILY,
-    keys: &[
-        (ConfigSource::HfModelType, "gemma2"),
-        (ConfigSource::GgufArchitecture, "gemma2"),
-    ],
-    build,
-    fixture,
-    variants: &[],
-};
+pub(crate) const ENTRY: FamilyEntry = entry::<Gemma2>();
 
 /// Gemma 2's config facts: `Gemma2Config`'s defaults (eos `1`, base `10000`) and llama.cpp's GGUF
 /// defaults.
@@ -70,23 +59,6 @@ const HF_DEFAULT_QUERY_SCALAR: f32 = 256.0;
 /// The 27B model (46 layers) scales queries by the hidden width over the heads, which llama.cpp's
 /// GGUF does not record.
 const GGUF_27B_LAYERS: usize = 46;
-
-/// Gemma 2's typed config: every value checked once, here, so tracing cannot fail on it.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Gemma2Params {
-    vocab: usize,
-    width: usize,
-    inter: usize,
-    layers: usize,
-    max_positions: usize,
-    /// One per layer: global or sliding-window attention.
-    attention: Vec<AttentionParams>,
-    layer: LayerParams,
-    stack: StackParams,
-    head_required: bool,
-    eos: BTreeSet<u32>,
-    bos: Option<u32>,
-}
 
 /// A softcap: a config that omits the key takes `default` (HF only), an explicit `null` or a
 /// GGUF without the key has none.
@@ -124,8 +96,16 @@ fn sliding_layers(fields: &Fields<'_>, layers: usize) -> Result<Vec<bool>, Model
     Ok((0..layers).map(|l| l % 2 == 0).collect())
 }
 
-impl Gemma2Params {
-    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+pub(crate) struct Gemma2;
+
+impl StandardFamily for Gemma2 {
+    const FAMILY: FamilyKey = FAMILY;
+    const KEYS: &'static [(ConfigSource, &'static str)] = &[
+        (ConfigSource::HfModelType, "gemma2"),
+        (ConfigSource::GgufArchitecture, "gemma2"),
+    ];
+
+    fn configure(raw: &RawConfig<'_>) -> Result<StandardParams, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let mut dims = DenseDims::read(&fields, &SPEC)?;
         let hf = matches!(raw, RawConfig::HfJson { .. });
@@ -177,119 +157,46 @@ impl Gemma2Params {
         if let Some(cap) = final_cap {
             stack = stack.with_softcap(cap).map_err(param_error)?;
         }
-        Ok(Self {
-            attention,
-            layer: LayerParams::new(norm).with_placement(NormPlacement::Sandwich),
-            stack,
+        Ok(StandardParams {
             vocab: dims.vocab,
             width: dims.width,
-            inter: dims.inter,
             layers: dims.layers,
             max_positions: dims.max_positions,
+            attention,
+            mlp: vec![Mlp::Geglu { inter: dims.inter }; dims.layers],
+            layer: LayerParams::new(norm).with_placement(NormPlacement::Sandwich),
+            stack,
+            norms: LayerNormKind::Sandwich,
+            final_norm_bias: false,
+            embed_norm: false,
             head_required: dims.head_required,
             eos: dims.eos,
             bos: dims.bos,
+            // Gemma is trained with a mandatory BOS (`<bos>` is id 2 in every Gemma vocabulary).
+            prompt_bos: Some(dims.bos.unwrap_or(GEMMA_BOS)),
+            chat: ChatFormat::Gemma,
+            tool_codec: None,
+            embeddable: false,
         })
     }
-}
 
-#[derive(Debug)]
-struct Layer {
-    norms: LayerNorms,
-    attn: AttentionWeights,
-    ffn: GatedFfnWeights,
-}
-
-#[derive(Debug)]
-pub(crate) struct Gemma2 {
-    params: Gemma2Params,
-    weights: WeightMap,
-    stack: StackWeights,
-    layers: Vec<Layer>,
-    config: ModelConfig,
-    schema: ModelSchema,
-}
-
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    let p = Gemma2Params::from_raw(raw)?;
-    let tables: [&[_]; 2] = match raw.source() {
-        ConfigSource::HfModelType => [HF_BASE, HF_SANDWICH_NORMS],
-        ConfigSource::GgufArchitecture => [GGUF_BASE, GGUF_SANDWICH_NORMS],
-    };
-    let weights = family_weights(FAMILY, store, &tables, p.layers, p.head_required)?;
-    let weight_error = |e: WeightError| e.for_family(FAMILY);
-    let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
-    let layers = (0..p.layers)
-        .map(|l| {
-            Ok(Layer {
-                norms: LayerNorms::sandwich(&weights, l, p.width)?,
-                attn: AttentionWeights::new(&weights, l, p.width, &p.attention[l])?,
-                ffn: GatedFfnWeights::new(&weights, l, p.width, p.inter)?,
-            })
-        })
-        .collect::<Result<Vec<_>, WeightError>>()
-        .map_err(weight_error)?;
-    let schema = ModelSchema::builder()
-        .step(decoder_program(p.vocab))
-        .build_for(FAMILY)?;
-    let config = ModelConfig {
-        family: FAMILY,
-        vocab: p.vocab,
-        max_positions: p.max_positions,
-        eos: p.eos.clone(),
-        bos: p.bos,
-        // Gemma is trained with a mandatory BOS (`<bos>` is id 2 in every Gemma vocabulary).
-        prompt_bos: Some(p.bos.unwrap_or(GEMMA_BOS)),
-        prefill_granule: NonZeroUsize::MIN,
-        chat: ChatFormat::Gemma,
-        tool_codec: None,
-    };
-    Ok(ModelParts::new(Box::new(Gemma2 {
-        params: p,
-        weights,
-        stack,
-        layers,
-        config,
-        schema,
-    })))
-}
-
-impl Model for Gemma2 {
-    fn config(&self) -> &ModelConfig {
-        &self.config
-    }
-
-    fn schema(&self) -> &ModelSchema {
-        &self.schema
-    }
-
-    fn weights(&self) -> &WeightMap {
-        &self.weights
-    }
-
-    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
-        let p = &self.params;
-        let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        let step = Step::new(&b, shape)?;
-        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
-            let layer = &self.layers[l];
-            standard_layer(
-                b,
-                x,
-                &layer.norms,
-                &p.layer,
-                |b, h| attention(b, &step, l, h, &layer.attn, &p.attention[l]),
-                |b, BlockInput { block: h, .. }| geglu_ffn(b, h, &layer.ffn),
-            )
-        })?;
-        Ok(step.finish(b, logits)?)
+    fn weights(
+        raw: &RawConfig<'_>,
+        store: &WeightStore,
+        params: &mut StandardParams,
+    ) -> Result<WeightMap, ModelError> {
+        let tables: [&[_]; 2] = match raw.source() {
+            ConfigSource::HfModelType => [HF_BASE, HF_SANDWICH_NORMS],
+            ConfigSource::GgufArchitecture => [GGUF_BASE, GGUF_SANDWICH_NORMS],
+        };
+        family_weights(FAMILY, store, &tables, params.layers, params.head_required)
     }
 }
 
 /// The fixture's config: a tiny untied Gemma 2 with four layers (sliding, global, sliding,
 /// global), a 3-key window, softcaps small enough to bite and a query scalar that is not the head
 /// width; projection widths are multiples of 32 (so a Q8_0 copy is a valid checkpoint too).
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "gemma2",
@@ -313,7 +220,8 @@ pub(crate) fn fixture_config() -> serde_json::Value {
     })
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let h = config["hidden_size"].as_u64().unwrap() as usize;
     let mut shapes = hf_base_shapes(&config, false);
@@ -333,6 +241,7 @@ mod family_tests {
 
     use super::*;
     use crate::components::standard::oracle::run_step;
+    use crate::components::standard_family::StandardFamily;
     use crate::components::testing::{
         CAP, Recorded, assert_bf16_and_q8_0_trace_through_the_packed_transform,
         assert_chunked_prefill_equals_decode, assert_gguf_resolves_and_traces_packed,
@@ -340,8 +249,13 @@ mod family_tests {
         close, f32_entry, gguf_dense_kvs, gguf_name_with_head, gguf_tensor, q8_0_store,
         read_back_owned, step_shape, values, with_norm_offsets_folded,
     };
+    use crate::model::Model;
+    use crate::model::StepSpec;
+    use crate::model::TraceError;
     use crate::model::{LogitRows, StepShape};
     use crate::registry::Registry;
+    use std::collections::BTreeSet;
+    use std::num::NonZeroUsize;
 
     fn is_projection(key: &str) -> bool {
         key.ends_with("_proj.weight")
@@ -491,7 +405,7 @@ mod family_tests {
             generation: None,
             preprocessor: None,
         };
-        match build(&raw, &fixture().store) {
+        match (ENTRY.build)(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
             other => panic!("{config}: expected a config error, got {other:?}"),
         }
@@ -673,7 +587,7 @@ mod family_tests {
             &[],
         )))
         .unwrap();
-        let err = Gemma2Params::from_raw(&RawConfig::Gguf(&index)).unwrap_err();
+        let err = Gemma2::configure(&RawConfig::Gguf(&index)).unwrap_err();
         assert!(
             matches!(
                 err,

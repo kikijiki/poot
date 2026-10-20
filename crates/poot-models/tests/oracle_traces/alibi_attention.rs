@@ -59,7 +59,7 @@ fn bloom_f32_model() -> Box<dyn Model> {
         .iter()
         .find(|e| e.family.as_str() == "bloom")
         .expect("the bloom family is registered");
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let mut store = WeightStore::builder();
     for (key, tensor) in fixture.store.iter() {
         let shape = tensor.shape();

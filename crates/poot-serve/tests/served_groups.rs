@@ -101,15 +101,8 @@ fn fixture_of(name: &str) -> Fixture {
         .find(|entry| entry.family.as_str() == family)
         .unwrap_or_else(|| panic!("no builtin family {family}"));
     match variant {
-        "" => (entry.fixture)(),
-        variant => {
-            let (_, make) = entry
-                .variants
-                .iter()
-                .find(|(option, _)| *option == variant)
-                .unwrap_or_else(|| panic!("{family} has no variant {variant}"));
-            make()
-        }
+        "" => poot_models::test_support::family_fixtures::base(entry.family),
+        variant => poot_models::test_support::family_fixtures::variant(entry.family, variant),
     }
 }
 
@@ -130,7 +123,7 @@ fn every_generating_family_is_in_a_served_group() {
     let registry = Registry::builtin().unwrap();
     let mut missing = Vec::new();
     for entry in registry.entries() {
-        let fixture = (entry.fixture)();
+        let fixture = poot_models::test_support::family_fixtures::base(entry.family);
         let model = registry
             .build(&fixture.raw(), &fixture.store)
             .unwrap_or_else(|error| panic!("{}: {error}", entry.family))
@@ -929,7 +922,7 @@ per_backend!(
 );
 
 /// The server pages its KV pool, and the qwen4exp indexer's per-row block-key cache has no paged
-/// layout yet (POOT-1148): startup stops with the typed `PagedIndexer` refusal, before the listener
+/// layout yet (POOT-1148): startup stops with the typed `PagedBlockedState` refusal, before the listener
 /// binds. Mutation: drop the paged check from `Qwen4Exp::trace_into`; the engine plans a paged
 /// indexer and the server starts, so the row goes red.
 fn a_paged_pool_refuses_the_qwen4exp_indexer_startup(choice: BackendChoice) {
@@ -940,7 +933,7 @@ fn a_paged_pool_refuses_the_qwen4exp_indexer_startup(choice: BackendChoice) {
     let dir = write_checkpoint("qwen4exp");
     let stderr = refused(&dir, flag, &[]);
     assert!(
-        stderr.contains("PagedIndexer"),
+        stderr.contains("PagedBlockedState"),
         "the refusal does not name the paged indexer: {stderr}"
     );
 }
@@ -1321,12 +1314,14 @@ mod smolvlm {
     /// tokenizer.
     pub(super) fn write_checkpoint(no_eos: u32) -> poot_test_util::UniqueTempPath {
         let registry = Registry::builtin().unwrap();
-        let fixture = (registry
-            .entries()
-            .iter()
-            .find(|entry| entry.family.as_str() == "idefics3")
-            .unwrap()
-            .fixture)();
+        let fixture = poot_models::test_support::family_fixtures::base(
+            registry
+                .entries()
+                .iter()
+                .find(|entry| entry.family.as_str() == "idefics3")
+                .unwrap()
+                .family,
+        );
         // The text tower's weights are scaled up so the image rows reach the greedy token.
         let mut text = WeightStore::builder();
         for (key, entry) in fixture.store.iter().filter(|(key, _)| {
@@ -1624,7 +1619,7 @@ mod qwen_vl {
             .iter()
             .find(|entry| entry.family.as_str() == family)
             .unwrap_or_else(|| panic!("{family} is a shipped family"));
-        (entry.fixture)()
+        poot_models::test_support::family_fixtures::base(entry.family)
     }
 
     /// The registry's Qwen2.5-VL fixture (the text and vision towers over one set of weights, multiplied by

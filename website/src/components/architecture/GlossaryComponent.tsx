@@ -336,7 +336,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Registry",
-    def: "The set of model families a driver can load. Each FamilyEntry names the config keys that select the family (a Hugging Face model_type, a GGUF architecture), how to build it and its fixture. A key no family holds is a typed unsupported-model error.",
+    def: "The set of model families a driver can load. Each FamilyEntry names the config keys that select the family (a Hugging Face model_type, a GGUF architecture), and how to build it. A key no family holds is a typed unsupported-model error.",
     see: "driver",
   },
   {

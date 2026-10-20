@@ -5,8 +5,8 @@
 //!
 //! The corpus is `Registry::builtin().entries()` crossed with each entry's fixtures and the towers of their
 //! containers (the same walk the plan-summary gate uses), so a family registered with a fixture joins this row with no edit here.
-//! `Family::ALL` itself is crate-private; its drift row is
-//! `registry::tests::family_all_lists_every_variant_once_and_builtin_registers_exactly_them`.
+//! The shipped list (`SHIPPED`) is crate-private; its drift row is
+//! `registry::tests::builtin_registers_exactly_the_shipped_rows_and_each_has_fixtures`.
 //!
 //! Shapes are the corpus's own (decode, prefill at the 4-token prompt, prefill into a larger cache, or an
 //! encoder's forward): 4 tokens, not 3, because compressed-attention families trace only multiples of

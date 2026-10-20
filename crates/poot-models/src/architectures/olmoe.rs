@@ -1,46 +1,34 @@
-//! OLMoE behind [`Model`]: a standard pre-norm block with olmo2's RMSNorm over the whole Q and K
+//! OLMoE: a standard pre-norm block with olmo2's RMSNorm over the whole Q and K
 //! projections before RoPE (`QkNorm::Projection`), whose feed-forward routes every layer through a
 //! mixture of experts. The router is a softmax over all experts, then the `top_k` probabilities,
 //! divided by their sum only when `norm_topk_prob` is set (HF's default is not; a GGUF has no key for
 //! it and llama.cpp never renormalizes OLMoE).
 
-use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
+use poot_quant::weights::ExpertProj;
+use poot_quant::weights::{WeightMap, WeightStore};
+
+use crate::components::attention::QkNorm;
+use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
+use crate::components::moe::MoeParams;
+use crate::components::router::RouterKind;
+use crate::model::{ConfigReason, FamilyKey, ModelError};
+use crate::names::gguf::{GGUF_BASE, GGUF_QK_NORM};
+#[cfg(feature = "test-support")]
+use crate::names::hf_base_shapes;
+use crate::names::{ExpertNames, HF_BASE, HF_QK_NORM, MoeNames};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, RawConfig};
+use poot_text::{ChatFormat, HermesToolCodec};
 use std::sync::Arc;
 
-use poot_graph_ir::{Builder, Graph};
-use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
-
-use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
-use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
-use crate::components::linear::WeightError;
-use crate::components::moe::{self, MoeParams, MoeWeights};
-use crate::components::router::RouterKind;
-use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    decoder_program, standard_layer, standard_stack,
+use crate::components::standard_family::{
+    Mlp, StandardFamily, StandardParams, entry, weights_with_experts,
 };
-use crate::io::ModelSchema;
-use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
-use crate::names::gguf::{GGUF_BASE, GGUF_QK_NORM};
-use crate::names::{
-    ExpertNames, HF_BASE, HF_QK_NORM, MoeLayers, MoeNames, family_weights_routed, hf_base_shapes,
-};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_text::{ChatFormat, HermesToolCodec};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("olmoe");
 
-pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
-    family: FAMILY,
-    keys: &[
-        (ConfigSource::HfModelType, "olmoe"),
-        (ConfigSource::GgufArchitecture, "olmoe"),
-    ],
-    build,
-    fixture,
-    variants: &[],
-};
+pub(crate) const ENTRY: FamilyEntry = entry::<Olmoe>();
 
 /// OLMoE's config facts: `OlmoeConfig`'s defaults (`rms_norm_eps` 1e-5, `rope_theta` 1e4; the class
 /// declares no `eos_token_id`) and llama.cpp's GGUF defaults.
@@ -110,24 +98,17 @@ const GGUF_MOE: MoeNames = MoeNames {
     ],
 };
 
-/// OLMoE's typed config: every value checked once, here, so tracing cannot fail on it.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct OlmoeConfig {
-    vocab: usize,
-    width: usize,
-    layers: usize,
-    max_positions: usize,
-    attention: AttentionParams,
-    layer: LayerParams,
-    stack: StackParams,
-    moe: MoeParams,
-    head_required: bool,
-    eos: BTreeSet<u32>,
-    bos: Option<u32>,
-}
+/// OLMoE: every layer routes through a softmax top-k mixture of experts.
+pub(crate) struct Olmoe;
 
-impl OlmoeConfig {
-    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+impl StandardFamily for Olmoe {
+    const FAMILY: FamilyKey = FAMILY;
+    const KEYS: &'static [(ConfigSource, &'static str)] = &[
+        (ConfigSource::HfModelType, "olmoe"),
+        (ConfigSource::GgufArchitecture, "olmoe"),
+    ];
+
+    fn configure(raw: &RawConfig<'_>) -> Result<StandardParams, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         // `intermediate_size` is the per-expert width: every layer routes.
         let dims = DenseDims::read(&fields, &SPEC)?;
@@ -147,132 +128,37 @@ impl OlmoeConfig {
             fields.count(TOP_K, None)?,
             RouterKind::SoftmaxTopK { renormalize },
         )?;
-        Ok(Self {
-            attention: dims
-                .attention(&fields, &SPEC, false)?
-                .with_qk_norm(QkNorm::Projection(norm)),
-            layer: LayerParams::new(norm),
-            stack: StackParams::new(norm),
-            vocab: dims.vocab,
-            width: dims.width,
-            layers: dims.layers,
-            max_positions: dims.max_positions,
-            moe,
-            head_required: dims.head_required,
-            eos: dims.eos,
-            bos: dims.bos,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct Layer {
-    norms: LayerNorms,
-    attn: AttentionWeights,
-    moe: MoeWeights,
-}
-
-#[derive(Debug)]
-pub(crate) struct Olmoe {
-    params: OlmoeConfig,
-    weights: WeightMap,
-    stack: StackWeights,
-    layers: Vec<Layer>,
-    config: ModelConfig,
-    schema: ModelSchema,
-}
-
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    let p = OlmoeConfig::from_raw(raw)?;
-    let (tables, names): ([&[_]; 2], &MoeNames) = match raw.source() {
-        ConfigSource::HfModelType => ([HF_BASE, HF_QK_NORM], &HF_MOE),
-        ConfigSource::GgufArchitecture => ([GGUF_BASE, GGUF_QK_NORM], &GGUF_MOE),
-    };
-    let sparse = vec![true; p.layers];
-    let weights = family_weights_routed(
-        FAMILY,
-        store,
-        &tables,
-        p.layers,
-        p.head_required,
-        MoeLayers {
-            names,
-            sparse: &sparse,
-            experts: p.moe.experts(),
-        },
-    )?;
-    let weight_error = |e: WeightError| e.for_family(FAMILY);
-    let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
-    let layers = (0..p.layers)
-        .map(|l| {
-            Ok(Layer {
-                norms: LayerNorms::new(&weights, l, p.width)?,
-                attn: AttentionWeights::new(&weights, l, p.width, &p.attention)?,
-                moe: MoeWeights::new(&weights, l, &p.moe)?,
-            })
-        })
-        .collect::<Result<Vec<_>, WeightError>>()
-        .map_err(weight_error)?;
-    let schema = ModelSchema::builder()
-        .step(decoder_program(p.vocab))
-        .build_for(FAMILY)?;
-    let config = ModelConfig {
-        family: FAMILY,
-        vocab: p.vocab,
-        max_positions: p.max_positions,
-        eos: p.eos.clone(),
-        bos: p.bos,
-        prompt_bos: None,
-        prefill_granule: NonZeroUsize::MIN,
-        chat: ChatFormat::ChatML,
-        tool_codec: Some(Arc::new(HermesToolCodec)),
-    };
-    Ok(ModelParts::new(Box::new(Olmoe {
-        params: p,
-        weights,
-        stack,
-        layers,
-        config,
-        schema,
-    })))
-}
-
-impl Model for Olmoe {
-    fn config(&self) -> &ModelConfig {
-        &self.config
-    }
-
-    fn schema(&self) -> &ModelSchema {
-        &self.schema
-    }
-
-    fn weights(&self) -> &WeightMap {
-        &self.weights
-    }
-
-    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
-        let p = &self.params;
-        let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        moe::check_step(FAMILY, shape, &p.moe)?;
-        let step = Step::new(&b, shape)?;
-        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
-            let layer = &self.layers[l];
-            standard_layer(
-                b,
-                x,
-                &layer.norms,
-                &p.layer,
-                |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
-                |b, BlockInput { block: h, .. }| moe::moe(b, &step, l, h, None, &layer.moe, &p.moe),
+        let attention = dims
+            .attention(&fields, &SPEC, false)?
+            .with_qk_norm(QkNorm::Projection(norm));
+        Ok(StandardParams {
+            mlp: vec![Mlp::Routed(moe); dims.layers],
+            ..StandardParams::dense(
+                &dims,
+                norm,
+                attention,
+                ChatFormat::ChatML,
+                Some(Arc::new(HermesToolCodec)),
             )
-        })?;
-        Ok(step.finish(b, logits)?)
+        })
+    }
+
+    fn weights(
+        raw: &RawConfig<'_>,
+        store: &WeightStore,
+        params: &mut StandardParams,
+    ) -> Result<WeightMap, ModelError> {
+        let (tables, names): ([&[_]; 2], &MoeNames) = match raw.source() {
+            ConfigSource::HfModelType => ([HF_BASE, HF_QK_NORM], &HF_MOE),
+            ConfigSource::GgufArchitecture => ([GGUF_BASE, GGUF_QK_NORM], &GGUF_MOE),
+        };
+        weights_with_experts(FAMILY, store, &tables, names, params)
     }
 }
 
 /// The fixture's config: a tiny untied OLMoE (plain MHA, no renormalization) whose projection
 /// widths are multiples of 32 (so a Q8_0 copy of its store is a valid checkpoint too).
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "olmoe",
@@ -293,7 +179,8 @@ pub(crate) fn fixture_config() -> serde_json::Value {
     })
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let n = |f: &str| crate::registry::Fixture::count(&config, f);
     let (h, experts, inter) = (n("hidden_size"), n("num_experts"), n("intermediate_size"));
@@ -491,6 +378,8 @@ mod family_tests {
         close, decoded, q8_0_store, step_shape,
     };
     use crate::model::LogitRows;
+    use crate::model::Model;
+    use crate::model::StepSpec;
     use crate::registry::Registry;
     use poot_quant::weights::WeightKey;
 
@@ -560,7 +449,7 @@ mod family_tests {
             generation: None,
             preprocessor: None,
         };
-        match build(&raw, &fixture().store) {
+        match (ENTRY.build)(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
             other => panic!("{config}: expected a config error, got {other:?}"),
         }

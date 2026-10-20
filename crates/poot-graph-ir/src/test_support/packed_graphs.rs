@@ -10,6 +10,8 @@ use crate::graph::{Operand, Storage};
 use crate::op::BinOp;
 use crate::packed_source::packed_source_constants;
 use crate::types::{DType, TensorType};
+use crate::weight_ref::WeightRef;
+use poot_quant::weights::WeightId;
 
 /// Shared rank-2 packed linear composition. Bias remains an ordinary Binary(Add) outside
 /// the packed-contraction candidate.
@@ -127,17 +129,26 @@ pub fn packed_block_diagonal_linear(
 }
 
 /// The stacked table of one routed projection: `experts` packed weights of one `descriptor`, staged as one
-/// carrier constant per source role named after `stack_id` (the stack's own `WeightId::const_name`), each
+/// carrier constant per source role of `stack` (a [`WeightRef`] with that source), each
 /// `[experts, slab_bytes]` ([`crate::packed_source::packed_stack_source_type`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedExpertStack {
-    /// The stack's own weight name; each source role's carrier constant is named after it.
-    pub stack_id: String,
+    /// The stack's own weight; each source role's carrier constant is a part of it.
+    pub stack: WeightId,
     /// The packed layout every expert in the stack shares.
     pub descriptor: poot_quant::PackedWeight,
     /// The number of experts stacked along the carrier's leading axis.
     pub experts: usize,
 }
+
+/// The stack the packed fixtures share: the weight a fixture's expert carriers are parts of when it needs no
+/// particular id.
+pub const TEST_STACK: WeightId = WeightId::layer(
+    0,
+    poot_quant::weights::WeightRole::Moe(poot_quant::weights::MoeRole::Stack(
+        poot_quant::weights::ExpertProj::Up,
+    )),
+);
 
 /// A routed packed projection: `x [M, K]` contracted per row against the expert `selector [M]` names in
 /// `table`, `[M, out]`. One claimed [`crate::op::OpKind::PackedContraction`] with
@@ -149,10 +160,6 @@ pub fn packed_indexed_linear(
     selector: Traced,
     table: &PackedExpertStack,
 ) -> Result<Traced, BuilderError> {
-    assert!(
-        !table.stack_id.is_empty(),
-        "a packed stack needs an id to name its carriers"
-    );
     let mut plan = b.append_plan(0)?;
     let [_, k] = table.descriptor.shape();
     let x_type = plan
@@ -176,12 +183,11 @@ pub fn packed_indexed_linear(
         TensorType::new(vec![x_type.shape[0]], DType::I32),
     )?;
     let mut operands = vec![Operand::Value(x.id()), Operand::Value(selector.id())];
-    for (name, tensor_type) in crate::packed_source::packed_stack_source_constants(
-        &table.stack_id,
-        table.descriptor,
-        table.experts,
-    ) {
-        let carrier = plan.input(name, tensor_type, Storage::Const)?;
+    for role in table.descriptor.sources() {
+        let carrier = plan.weight_input(
+            WeightRef::whole(table.stack).with_source(role),
+            crate::packed_source::packed_stack_source_type(table.descriptor, table.experts, role),
+        )?;
         operands.push(Operand::Value(carrier.id()));
     }
     let output = plan.equation(
@@ -507,7 +513,7 @@ mod tests {
             };
             let descriptor = PackedWeight::try_new(format, [3, k]).unwrap();
             let table = PackedExpertStack {
-                stack_id: "layer.experts".to_string(),
+                stack: TEST_STACK,
                 descriptor,
                 experts: 3,
             };
@@ -541,8 +547,12 @@ mod tests {
             );
             for (position, role) in descriptor.sources().into_iter().enumerate() {
                 let carrier = operand_value(eqn, 2 + position);
-                let expected = PackedSourceName::new("layer.experts", role);
-                assert_eq!(graph.meta(carrier).name.as_deref(), Some(expected.as_str()));
+                let expected = WeightRef::whole(TEST_STACK).with_source(role);
+                assert_eq!(
+                    graph.meta(carrier).name.as_deref(),
+                    Some(expected.name().as_str())
+                );
+                assert_eq!(graph.meta(carrier).weight(), Some(expected));
                 assert_eq!(
                     graph.aval(carrier),
                     &TensorType::new(vec![3, descriptor.slab_bytes(role)], DType::I8),
@@ -560,7 +570,7 @@ mod tests {
     fn packed_indexed_linear_refuses_a_bad_table_or_operand_without_mutation() {
         let descriptor = PackedWeight::try_new(WeightFormat::Q8_0, [3, 32]).unwrap();
         let table = PackedExpertStack {
-            stack_id: "experts".to_string(),
+            stack: TEST_STACK,
             descriptor,
             experts: 2,
         };

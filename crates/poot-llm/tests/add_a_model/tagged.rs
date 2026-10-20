@@ -37,13 +37,11 @@ pub(crate) const FAMILY: FamilyKey = FamilyKey::new("poot_fixture_tagged");
 /// The HF `model_type` that names the family.
 const MODEL_TYPE: &str = "poot_fixture_tagged";
 
-/// The registry entry: what `Registry::register` takes.
+/// The registry entry: what `Registry::builtin_plus` takes.
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
     keys: &[(ConfigSource::HfModelType, MODEL_TYPE)],
     build,
-    fixture,
-    variants: &[],
 };
 
 /// The new request input: one tag per prompt position.

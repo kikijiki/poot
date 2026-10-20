@@ -40,8 +40,7 @@ use crate::io::{
 };
 use crate::model::WiringError;
 use crate::model::{
-    ConfigReason, FamilyKey, KvLayout, LogitRows, ModelError, ModelOutput, ShapeReason, StepShape,
-    TraceError,
+    ConfigReason, FamilyKey, KvLayout, LogitRows, ModelError, ModelOutput, StepShape, TraceError,
 };
 use poot_graph_ir::Requirement;
 
@@ -567,6 +566,9 @@ pub enum NormPlacement {
     Post,
     /// `x += post(block(pre(x)))`: both (Gemma 2 and 3). Needs [`LayerNorms::sandwich`].
     Sandwich,
+    /// `x += mixer(norm_attn(x)) + ffn(norm_ffn(x))`: both blocks read the layer's input and their
+    /// outputs join the residual together (GPT-NeoX and Pythia's parallel residual).
+    Parallel,
 }
 
 /// How a standard layer combines its blocks: the norm, where it sits and the scale applied to each
@@ -615,8 +617,9 @@ impl LayerParams {
 
 /// `x += mixer(norm(x)); x += ffn(norm(x))`, or with [`NormPlacement::Post`]
 /// `x += norm(mixer(x)); x += norm(ffn(x))`, or with [`NormPlacement::Sandwich`] both norms around
-/// each block, each block's output scaled by the residual scale. A `Sandwich` placement over
-/// norms not built by [`LayerNorms::sandwich`] is a caller bug and panics.
+/// each block, each block's output scaled by the residual scale; with [`NormPlacement::Parallel`]
+/// both blocks read `x` and `x += mixer(norm_attn(x)) + ffn(norm_ffn(x))`. A `Sandwich` placement
+/// over norms not built by [`LayerNorms::sandwich`] is a caller bug and panics.
 pub fn standard_layer(
     b: &Builder,
     x: Traced,
@@ -625,6 +628,18 @@ pub fn standard_layer(
     mixer: impl FnOnce(&Builder, Traced) -> Result<Traced, TraceError>,
     ffn: impl FnOnce(&Builder, BlockInput) -> Result<Traced, TraceError>,
 ) -> Result<Traced, TraceError> {
+    if p.placement == NormPlacement::Parallel {
+        let mixed = mixer(b, norm_with(b, x, &norms.attn, p.norm)?)?;
+        let fed = ffn(
+            b,
+            BlockInput {
+                block: norm_with(b, x, &norms.ffn, p.norm)?,
+                residual: x,
+            },
+        )?;
+        let joined = b.binary(BinOp::Add, scaled(b, p, mixed)?, scaled(b, p, fed)?)?;
+        return Ok(b.binary(BinOp::Add, x, joined)?);
+    }
     let post = |i: usize| norms.post.as_ref().map(|post| &post[i]);
     let x = residual_block(b, x, &norms.attn, post(0), p, |b, input| {
         mixer(b, input.block)
@@ -653,7 +668,9 @@ fn residual_block(
 ) -> Result<Traced, TraceError> {
     let input = |block| BlockInput { block, residual: x };
     let out = match p.placement {
-        NormPlacement::Pre => block(b, input(norm_with(b, x, w, p.norm)?))?,
+        NormPlacement::Pre | NormPlacement::Parallel => {
+            block(b, input(norm_with(b, x, w, p.norm)?))?
+        }
         NormPlacement::Post => norm_with(b, block(b, input(x))?, w, p.norm)?,
         NormPlacement::Sandwich => {
             let post = post.ok_or(WiringError::SandwichWithoutPostNorms)?;
@@ -665,11 +682,15 @@ fn residual_block(
             )?
         }
     };
-    let out = match p.residual_scale {
+    Ok(b.binary(BinOp::Add, x, scaled(b, p, out)?)?)
+}
+
+/// `out` times the layer's residual scale, when it has one.
+fn scaled(b: &Builder, p: &LayerParams, out: Traced) -> Result<Traced, TraceError> {
+    Ok(match p.residual_scale {
         Some(scale) => b.binary_scalar(BinOp::Mul, out, Builder::f32(scale))?,
         None => out,
-    };
-    Ok(b.binary(BinOp::Add, x, out)?)
+    })
 }
 
 /// The model-level weights around the layers.
@@ -840,55 +861,6 @@ pub fn standard_stack(
         Some(cap) => Ok(ops::softcap(b, logits, cap)?),
         None => Ok(logits),
     }
-}
-
-/// Refuse a step shape the dense decoder body cannot trace: a capacity above the model's maximum
-/// positions, more new tokens than the cache holds, or a hidden-state carry narrower than the step.
-pub fn check_step(
-    family: FamilyKey,
-    shape: StepShape,
-    max_positions: usize,
-) -> Result<(), TraceError> {
-    let refuse = |reason| {
-        Err(TraceError::ShapeUnsupported {
-            family,
-            shape,
-            reason,
-        })
-    };
-    if shape.capacity.get() > max_positions {
-        return refuse(ShapeReason::CapacityAboveMax { max: max_positions });
-    }
-    if shape.tokens > shape.capacity {
-        return refuse(ShapeReason::TokensAboveCapacity);
-    }
-    if let Some(carry) = shape.hidden
-        && carry.positions < shape.tokens
-    {
-        return refuse(ShapeReason::HiddenCarryNarrow {
-            positions: carry.positions.get(),
-            tokens: shape.tokens.get(),
-        });
-    }
-    Ok(())
-}
-
-/// [`check_step`] for a family's draft program: the layer's step is checked as a prefill over the same
-/// cache shape, and it must name the hidden-state carry it reads.
-pub fn check_draft_step(
-    family: FamilyKey,
-    shape: StepShape,
-    max_positions: usize,
-) -> Result<(), TraceError> {
-    check_step(family, shape, max_positions)?;
-    if shape.hidden.is_none() {
-        return Err(TraceError::ShapeUnsupported {
-            family,
-            shape,
-            reason: ShapeReason::DraftWithoutCarry,
-        });
-    }
-    Ok(())
 }
 
 /// The `draft` program of a model with a multi-token-prediction layer: logits over `vocab` from the
@@ -1520,6 +1492,8 @@ pub(crate) mod oracle {
 mod tests {
     use std::num::NonZeroUsize;
 
+    use crate::model::ShapeReason;
+
     use poot_quant::weights::{AttnRole, FfnRole};
 
     use super::super::norm::NormKind;
@@ -1752,7 +1726,7 @@ mod tests {
 
     /// POOT-1109 SC-003: a hidden-state carry with fewer positions than the step has tokens is a typed
     /// shape refusal before any graph is built. Mutation: drop the `HiddenCarryNarrow` return in
-    /// `check_step`; the step traces and the assertion is red.
+    /// `check_shape`; the step traces and the assertion is red.
     #[test]
     fn a_carry_narrower_than_the_step_is_refused_before_tracing() {
         use crate::model::HiddenCarry;
@@ -1763,10 +1737,10 @@ mod tests {
             })
         };
         let mut shape = oracle::step_shape(4, 8, LogitRows::Last, None);
-        assert!(check_step(family, shape, 8).is_ok());
+        assert!(crate::model::check_shape(family, shape, 8).is_ok());
         shape.hidden = carry(3);
         assert!(matches!(
-            check_step(family, shape, 8),
+            crate::model::check_shape(family, shape, 8),
             Err(TraceError::ShapeUnsupported {
                 reason: ShapeReason::HiddenCarryNarrow {
                     positions: 3,
@@ -1776,7 +1750,7 @@ mod tests {
             })
         ));
         shape.hidden = carry(4);
-        assert!(check_step(family, shape, 8).is_ok());
+        assert!(crate::model::check_shape(family, shape, 8).is_ok());
     }
 
     /// SC-001: the post-norm placement with a residual scale against its f64 definition
@@ -1842,6 +1816,72 @@ mod tests {
             let mut p = fx.clone();
             p.perturb(id);
             oracle::assert_differs(&run(&p, NormPlacement::Post), &got, id);
+        }
+    }
+
+    /// The parallel placement against its f64 definition `x + mixer(rms_a(x)) + ffn(rms_f(x))`: both
+    /// blocks read the layer input, so the result differs from the sequential layer, and each norm
+    /// weight matters.
+    #[test]
+    fn parallel_placement_matches_an_f64_reference() {
+        let (t, w) = (3, 6);
+        let eps = 1e-5f32;
+        let attn = WeightId::layer(0, WeightRole::Norm(NormRole::Attn));
+        let ffn = WeightId::layer(0, WeightRole::Norm(NormRole::Ffn));
+        let mix = WeightId::layer(0, WeightRole::Attn(AttnRole::O));
+        let feed = WeightId::layer(0, WeightRole::Ffn(FfnRole::Down));
+        let mut fx = Fx::new(13);
+        fx.f32(attn, &[w]);
+        fx.f32(ffn, &[w]);
+        fx.f32(mix, &[w, w]);
+        fx.f32(feed, &[w, w]);
+        let x = oracle::random(t * w, 15);
+        let run = |fx: &Fx, placement| {
+            let map = fx.map();
+            let norms = LayerNorms::new(&map, 0, w).unwrap();
+            let (m, f) = (
+                Weight::new(&map, mix, &[w, w]).unwrap(),
+                Weight::new(&map, feed, &[w, w]).unwrap(),
+            );
+            let params = LayerParams::new(NormParams::new(eps).unwrap()).with_placement(placement);
+            let b = Builder::for_tests();
+            let xs = b.constant("x", TensorType::f32(vec![t, w])).unwrap();
+            let y = standard_layer(
+                &b,
+                xs,
+                &norms,
+                &params,
+                |b, h| super::super::linear::linear(b, h, &m, None),
+                |b, BlockInput { block: h, .. }| super::super::linear::linear(b, h, &f, None),
+            )
+            .unwrap();
+            fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
+        };
+        let got = run(&fx, NormPlacement::Parallel);
+        let mat = |id, v: &[f64]| -> Vec<f64> {
+            let m = fx.values(id);
+            (0..w)
+                .map(|o| (0..w).map(|j| v[j] * f64::from(m[o * w + j])).sum())
+                .collect()
+        };
+        let eps = f64::from(eps);
+        let mut want = Vec::new();
+        for row in x.chunks(w) {
+            let x0: Vec<f64> = row.iter().map(|&v| f64::from(v)).collect();
+            let m = mat(mix, &rms(&x0, &fx.values(attn), eps));
+            let f = mat(feed, &rms(&x0, &fx.values(ffn), eps));
+            want.extend((0..w).map(|i| x0[i] + m[i] + f[i]));
+        }
+        oracle::assert_matches_f64(&got, &want, 1e-5);
+        assert_ne!(
+            got,
+            run(&fx, NormPlacement::Pre),
+            "the parallel layer is not the sequential one"
+        );
+        for id in [attn, ffn] {
+            let mut p = fx.clone();
+            p.perturb(id);
+            oracle::assert_differs(&run(&p, NormPlacement::Parallel), &got, id);
         }
     }
 

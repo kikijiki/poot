@@ -8,7 +8,7 @@
 //! the same bits as the device's 64-lane LDS-reduced count/mass.
 
 use poot_graph_ir::op::SampleRule;
-use poot_graph_ir::ops::sampling::hash32;
+use poot_graph_ir::ops::sampling::{MASKED_LOGIT, hash32};
 
 use poot_tensor::HostTensor;
 
@@ -24,7 +24,7 @@ pub(crate) fn random_uniform(seed: &HostTensor, cols: usize) -> Result<HostTenso
     for (r, &s) in seed_words.iter().enumerate() {
         let s = s as u32;
         for c in 0..cols {
-            let idx = (r * cols + c) as u32;
+            let idx = c as u32;
             let x = hash32(s, idx);
             let mantissa = (x >> 9) as i32;
             data[r * cols + c] = (2.0f32 * (mantissa as f32) + 1.0f32) * 5.9604645e-8f32; // 2^-24
@@ -34,11 +34,6 @@ pub(crate) fn random_uniform(seed: &HostTensor, cols: usize) -> Result<HostTenso
     shape.push(cols);
     Ok(HostTensor::f32(shape, data))
 }
-
-/// The finite stand-in a caller writes for a token it excluded from the row (a guided-decoding mask).
-/// `SampleToken` flags a non-finite logit, so a masked token cannot be `-inf`; it is the lowest finite
-/// f32 instead, and the bisection floor ignores it so top-k and top-p search the real logits only.
-pub const MASKED_LOGIT: f32 = f32::MIN;
 
 /// Fixed-point scale of a token's top-p mass: `2^24` units for the top token (probability ratio 1).
 /// A token whose probability is at least `2^-25` of the top token keeps a nonzero mass, so the tail of a

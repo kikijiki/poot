@@ -50,6 +50,7 @@ pub(crate) fn with_eqns(g: &Graph, eqns: Vec<Eqn>) -> Result<Graph, EditError> {
 
 pub(crate) use budget::GraphBudget;
 pub(crate) use legalize::refuse_oversized_constants;
+pub(crate) use legalize::{KvExtent, kv_extents};
 pub use legalize::{LegalizeError, legalize};
 pub(crate) use lora::apply_lora;
 pub use lora::{LoraError, LoraPlan};

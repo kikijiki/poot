@@ -76,7 +76,7 @@ fn entry(family: FamilyKey) -> FamilyEntry {
 /// The family's shipped fixture, built into a model over its own weights for the CPU oracle.
 fn mapped(family: FamilyKey) -> MappedModel {
     let entry = entry(family);
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let model = (entry.build)(&fixture.raw(), &fixture.store).unwrap();
     let map = Arc::new(model.model.weights().clone());
     MappedModel {
@@ -403,7 +403,10 @@ fn compile_options() -> CompileOptions {
 /// The state bytes the production planner publishes for one decode row of the fixture checkpoint.
 fn planned_state_bytes(family: FamilyKey) -> u64 {
     let dir = poot_test_util::unique_temp_path("recurrent_snapshot_cost");
-    write_checkpoint(&dir, &(entry(family).fixture)());
+    write_checkpoint(
+        &dir,
+        &poot_models::test_support::family_fixtures::base(entry(family).family),
+    );
     let handle = Arc::new(
         ModelHandle::load(&dir, &Registry::builtin().unwrap(), &LoadOptions::default()).unwrap(),
     );
@@ -421,6 +424,7 @@ fn planned_state_bytes(family: FamilyKey) -> u64 {
                 warm: Warm::Admitted,
                 windows: &[],
                 adapters: &[],
+                chain: None,
             },
             &[],
         )
@@ -821,7 +825,12 @@ fn a_gdn_fixture_speculates_with_prompt_lookup_without_diverging_from_greedy_wgp
         return;
     };
     let dir = poot_test_util::unique_temp_path("recurrent_snapshot_cost_guard");
-    write_checkpoint(&dir, &(entry(poot_models::qwen3next::FAMILY).fixture)());
+    write_checkpoint(
+        &dir,
+        &poot_models::test_support::family_fixtures::base(
+            entry(poot_models::qwen3next::FAMILY).family,
+        ),
+    );
     let handle = Arc::new(
         ModelHandle::load(&dir, &Registry::builtin().unwrap(), &LoadOptions::default()).unwrap(),
     );

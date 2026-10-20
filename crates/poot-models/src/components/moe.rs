@@ -48,6 +48,7 @@ pub enum GateUpForm {
 /// Checked MoE parameters.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MoeParams {
+    family: FamilyKey,
     router: RouterParams,
     width: usize,
     inter: usize,
@@ -80,6 +81,7 @@ impl MoeParams {
             }
         }
         Ok(Self {
+            family,
             router: RouterParams::new(experts, top_k, kind).map_err(as_config)?,
             width,
             inter,
@@ -210,12 +212,8 @@ impl MoeParams {
 const MAX_EXACT_ROWS: usize = 1 << 24;
 
 /// Refuse a step whose `tokens * top_k` routed rows, or whose expert count, exceed what the F32 rank counts
-/// carry exactly.
-pub fn check_step(
-    family: FamilyKey,
-    shape: StepShape,
-    params: &MoeParams,
-) -> Result<(), TraceError> {
+/// carry exactly. [`moe`] runs it, so no family has to remember to.
+fn check_routed_rows(shape: StepShape, params: &MoeParams) -> Result<(), TraceError> {
     let rows = shape
         .rows
         .get()
@@ -223,7 +221,7 @@ pub fn check_step(
         .saturating_mul(params.top_k());
     if rows > MAX_EXACT_ROWS || params.experts() >= MAX_EXACT_ROWS {
         return Err(TraceError::ShapeUnsupported {
-            family,
+            family: params.family,
             shape,
             reason: ShapeReason::RoutedRows {
                 max: MAX_EXACT_ROWS,
@@ -403,6 +401,7 @@ pub fn moe(
     w: &MoeWeights,
     p: &MoeParams,
 ) -> Result<Traced, TraceError> {
+    check_routed_rows(step.shape(), p)?;
     let shape = b.aval(x)?.shape;
     if let Some(route_x) = route_x {
         debug_assert_eq!(

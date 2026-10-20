@@ -1,9 +1,11 @@
 //! The one family registry (ADR-0104): a checkpoint's config names its family, and the
 //! family's [`FamilyEntry`] builds its [`ModelParts`]: the served [`Model`] and, for a vision-language
-//! family, its towers and front end (ADR-0117 d6). Families are data: any crate adds one with
-//! [`Registry::register`]. The shipped families are the closed [`Family`] enum, whose exhaustive
-//! match is the completeness check ADR-0074 keeps (a drift test, not a support list). The driver and
-//! the loader take a `&Registry`; there is no global registry.
+//! family, its towers and front end (ADR-0117 d6). Families are data: [`SHIPPED`] is the one list of
+//! them, a const slice of entries (a family's keys and how to build it, nothing else), and
+//! [`Registry::builtin`] indexes it. A family is added by writing its file under `architectures` and
+//! adding its row to [`SHIPPED`]. There is no out-of-tree registration: a registry is the shipped
+//! families, and only a test builds a different one. The driver and the loader take a `&Registry`;
+//! there is no global registry.
 
 use crate::architectures::{
     bloom, deepseek2, deepseek3, deepseek4, deepseek32, gemma2, gemma3, gpt_oss, granite, llama,
@@ -141,8 +143,10 @@ impl RawConfig<'_> {
     }
 }
 
-/// A synthetic checkpoint a family ships for tests: it owns its raw config, because
-/// [`RawConfig`] borrows.
+/// A synthetic checkpoint of a family, for tests: it owns its raw config, because [`RawConfig`]
+/// borrows. The table of them, keyed by family, is
+/// [`crate::test_support::family_fixtures`]: a family's entry carries none.
+#[cfg(feature = "test-support")]
 #[derive(Clone, Debug)]
 pub struct Fixture {
     /// The HF `config.json` the family parses.
@@ -155,6 +159,7 @@ pub struct Fixture {
     pub store: WeightStore,
 }
 
+#[cfg(feature = "test-support")]
 impl Fixture {
     /// The count `field` of a fixture's literal config. A fixture derives its tensor shapes from the
     /// config it builds beside them, so a missing or non-integer field is an inconsistent literal in
@@ -307,10 +312,7 @@ impl ModelParts {
 /// Builds a family's [`ModelParts`] from a raw config and the checkpoint's weights.
 pub type BuildModel = fn(&RawConfig<'_>, &WeightStore) -> Result<ModelParts, ModelError>;
 
-/// A named extra fixture of a family: `(option name, fixture)`.
-pub type FixtureVariant = (&'static str, fn() -> Fixture);
-
-/// One family, as data: the config keys that name it, how to build it and its test fixture.
+/// One family, as data: the config keys that name it and how to build it.
 #[derive(Clone, Copy)]
 pub struct FamilyEntry {
     /// The family's key.
@@ -319,11 +321,6 @@ pub struct FamilyEntry {
     pub keys: &'static [(ConfigSource, &'static str)],
     /// Builds the family's [`ModelParts`].
     pub build: BuildModel,
-    /// The family's base test fixture.
-    pub fixture: fn() -> Fixture,
-    /// More fixtures of the same family, one per option a key can select (llama's Mixtral experts,
-    /// granite's `granitemoe` experts), by name.
-    pub variants: &'static [FixtureVariant],
 }
 
 impl fmt::Debug for FamilyEntry {
@@ -339,7 +336,7 @@ impl fmt::Debug for FamilyEntry {
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RegistryError {
     #[error(
-        "no family is registered for {origin} {key:?}: a family must be added with Registry::register before a checkpoint naming it can load"
+        "no family is registered for {origin} {key:?}: a checkpoint loads only when its family is one of the shipped ones"
     )]
     /// No registered family is named by this key.
     Unregistered {
@@ -379,6 +376,41 @@ pub enum LoadModelError {
     Model(#[from] ModelError),
 }
 
+/// The shipped families: the one list a registry is built from, one row per family. A family is added
+/// by writing its file under `architectures` and adding its row here; nothing else names it. The
+/// rows' family keys and config keys are disjoint, which `Registry::builtin` refuses to build
+/// without and the registry tests check.
+pub(crate) const SHIPPED: &[FamilyEntry] = &[
+    crate::qwen2::model::ENTRY,
+    llama::ENTRY,
+    qwen3::ENTRY,
+    olmo2::ENTRY,
+    phi3::ENTRY,
+    smollm3::ENTRY,
+    granite::ENTRY,
+    mpt::ENTRY,
+    bloom::ENTRY,
+    gemma3::ENTRY,
+    gemma2::ENTRY,
+    qwen3moe::ENTRY,
+    gpt_oss::ENTRY,
+    olmoe::ENTRY,
+    crate::gemma4::ENTRY,
+    minimax_m2::ENTRY,
+    deepseek2::ENTRY,
+    deepseek3::ENTRY,
+    deepseek32::ENTRY,
+    crate::nemotron_h::ENTRY,
+    deepseek4::ENTRY,
+    crate::bert::ENTRY,
+    crate::multimodal::IDEFICS3,
+    crate::qwen3next::ENTRY,
+    qwen38_27b::ENTRY,
+    qwen38::ENTRY,
+    crate::glm53_flash::ENTRY,
+    crate::multimodal::QWEN_VL,
+];
+
 /// The families a driver can load, keyed by the config keys that name them.
 #[derive(Debug, Default)]
 pub struct Registry {
@@ -387,49 +419,55 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// A registry with no families; [`Registry::builtin`] is the one a driver's caller wants.
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Every shipped family ([`Family::ALL`]): the registry a driver's caller hands to
+    /// The registry of the [`SHIPPED`] families: the one a driver's caller hands to
     /// `ModelHandle::load`.
     pub fn builtin() -> Result<Self, RegistryError> {
-        let mut registry = Self::empty();
-        for family in Family::ALL {
-            registry.register(family.entry())?;
-        }
-        Ok(registry)
+        Self::index(SHIPPED.iter().copied())
     }
 
-    /// Add a family. Refused, with the registry unchanged, when the family is already registered or
-    /// one of its keys already names another family: every key resolves to exactly one family.
-    pub fn register(&mut self, entry: FamilyEntry) -> Result<(), RegistryError> {
-        if self.entries.iter().any(|e| e.family == entry.family) {
-            return Err(RegistryError::DuplicateFamily(entry.family));
-        }
-        let mut keys = BTreeSet::new();
-        for &(origin, key) in entry.keys {
-            let taken = self
-                .by_key
-                .get(&(origin, key.to_string()))
-                .map(|&i| self.entries[i].family)
-                .or_else(|| (!keys.insert((origin, key))).then_some(entry.family));
-            if let Some(first) = taken {
-                return Err(RegistryError::DuplicateKey {
-                    origin,
-                    key: key.to_string(),
-                    first,
-                    second: entry.family,
-                });
+    /// The shipped families and `extra` ones, for a test that serves a family of its own.
+    #[cfg(feature = "test-support")]
+    pub fn builtin_plus(extra: &[FamilyEntry]) -> Result<Self, RegistryError> {
+        Self::index(SHIPPED.iter().chain(extra).copied())
+    }
+
+    /// A registry of exactly `entries`, for a test of the registry itself.
+    #[cfg(feature = "test-support")]
+    pub fn of(entries: &[FamilyEntry]) -> Result<Self, RegistryError> {
+        Self::index(entries.iter().copied())
+    }
+
+    /// The registry of `entries`. Refused when a family appears twice or one of its keys already
+    /// names another family: every key resolves to exactly one family.
+    fn index(entries: impl IntoIterator<Item = FamilyEntry>) -> Result<Self, RegistryError> {
+        let mut registry = Self::default();
+        for entry in entries {
+            if registry.entries.iter().any(|e| e.family == entry.family) {
+                return Err(RegistryError::DuplicateFamily(entry.family));
             }
+            let mut keys = BTreeSet::new();
+            for &(origin, key) in entry.keys {
+                let taken = registry
+                    .by_key
+                    .get(&(origin, key.to_string()))
+                    .map(|&i| registry.entries[i].family)
+                    .or_else(|| (!keys.insert((origin, key))).then_some(entry.family));
+                if let Some(first) = taken {
+                    return Err(RegistryError::DuplicateKey {
+                        origin,
+                        key: key.to_string(),
+                        first,
+                        second: entry.family,
+                    });
+                }
+            }
+            let index = registry.entries.len();
+            for &(origin, key) in entry.keys {
+                registry.by_key.insert((origin, key.to_string()), index);
+            }
+            registry.entries.push(entry);
         }
-        let index = self.entries.len();
-        for &(origin, key) in entry.keys {
-            self.by_key.insert((origin, key.to_string()), index);
-        }
-        self.entries.push(entry);
-        Ok(())
+        Ok(registry)
     }
 
     /// The family `raw` names.
@@ -461,114 +499,12 @@ impl Registry {
     }
 }
 
-/// The shipped families: each variant is a family that implements [`Model`] (no
-/// placeholders). A new variant does not build until [`Family::entry`] and the test-only index have
-/// an arm for it, and `registry::tests` fail until [`Family::ALL`] lists it: the test counts the
-/// variants with the compiler's `variant_count`, not a hand-kept number.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Family {
-    Qwen2,
-    Llama,
-    Qwen3,
-    Olmo2,
-    Phi3,
-    Smollm3,
-    Granite,
-    Mpt,
-    Bloom,
-    Gemma3,
-    Gemma2,
-    Qwen3Moe,
-    GptOss,
-    Olmoe,
-    Gemma4,
-    MiniMaxM2,
-    Deepseek2,
-    Deepseek3,
-    Deepseek32,
-    NemotronH,
-    DeepseekV4,
-    Bert,
-    Idefics3,
-    Qwen3Next,
-    Qwen35,
-    Qwen4Exp,
-    Glm53Flash,
-    Qwen25Vl,
-}
-
-impl Family {
-    /// Every variant, in [`Self::index`] order; [`Registry::builtin`] registers these.
-    pub(crate) const ALL: &'static [Family] = &[
-        Family::Qwen2,
-        Family::Llama,
-        Family::Qwen3,
-        Family::Olmo2,
-        Family::Phi3,
-        Family::Smollm3,
-        Family::Granite,
-        Family::Mpt,
-        Family::Bloom,
-        Family::Gemma3,
-        Family::Gemma2,
-        Family::Qwen3Moe,
-        Family::GptOss,
-        Family::Olmoe,
-        Family::Gemma4,
-        Family::MiniMaxM2,
-        Family::Deepseek2,
-        Family::Deepseek3,
-        Family::Deepseek32,
-        Family::NemotronH,
-        Family::DeepseekV4,
-        Family::Bert,
-        Family::Idefics3,
-        Family::Qwen3Next,
-        Family::Qwen35,
-        Family::Qwen4Exp,
-        Family::Glm53Flash,
-        Family::Qwen25Vl,
-    ];
-
-    pub(crate) const fn entry(self) -> FamilyEntry {
-        match self {
-            Family::Qwen2 => crate::qwen2::model::ENTRY,
-            Family::Llama => llama::ENTRY,
-            Family::Qwen3 => qwen3::ENTRY,
-            Family::Olmo2 => olmo2::ENTRY,
-            Family::Phi3 => phi3::ENTRY,
-            Family::Smollm3 => smollm3::ENTRY,
-            Family::Granite => granite::ENTRY,
-            Family::Mpt => mpt::ENTRY,
-            Family::Bloom => bloom::ENTRY,
-            Family::Gemma3 => gemma3::ENTRY,
-            Family::Gemma2 => gemma2::ENTRY,
-            Family::Qwen3Moe => qwen3moe::ENTRY,
-            Family::GptOss => gpt_oss::ENTRY,
-            Family::Olmoe => olmoe::ENTRY,
-            Family::Gemma4 => crate::gemma4::ENTRY,
-            Family::MiniMaxM2 => minimax_m2::ENTRY,
-            Family::Deepseek2 => deepseek2::ENTRY,
-            Family::Deepseek3 => deepseek3::ENTRY,
-            Family::Deepseek32 => deepseek32::ENTRY,
-            Family::NemotronH => crate::nemotron_h::ENTRY,
-            Family::DeepseekV4 => deepseek4::ENTRY,
-            Family::Bert => crate::bert::ENTRY,
-            Family::Idefics3 => crate::multimodal::IDEFICS3,
-            Family::Qwen3Next => crate::qwen3next::ENTRY,
-            Family::Qwen35 => qwen38_27b::ENTRY,
-            Family::Qwen4Exp => qwen38::ENTRY,
-            Family::Glm53Flash => crate::glm53_flash::ENTRY,
-            Family::Qwen25Vl => crate::multimodal::QWEN_VL,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::ModelSchema;
     use crate::model::{ModelConfig, StepSpec, TraceError};
+    use crate::test_support::family_fixtures;
     use poot_graph_ir::Graph;
     use poot_quant::StoredBytes;
     use poot_quant::weights::WeightMap;
@@ -577,38 +513,24 @@ mod tests {
     use poot_text::{ChatFormat, HermesToolCodec};
     use std::num::NonZeroUsize;
 
-    /// SC-001: `Family::ALL` lists every variant exactly once, in index order, and the built-in
-    /// registry holds exactly those families, each under its own entry: the registry and the closed
-    /// enum agree both ways. The variant count is the compiler's, so a variant added to the enum
-    /// but not to `ALL` fails here, whether or not anything else constructs it.
+    /// The registry holds exactly the [`SHIPPED`] families, in order, and the fixture table has a
+    /// row for each of them and for nothing else: a family is registered by its `SHIPPED` row alone,
+    /// and a shipped family without a checkpoint to test it on, or a checkpoint of a family that is
+    /// not shipped, fails here.
     #[test]
-    fn family_all_lists_every_variant_once_and_builtin_registers_exactly_them() {
-        const VARIANTS: usize = std::mem::variant_count::<Family>();
-        assert_eq!(
-            Family::ALL.len(),
-            VARIANTS,
-            "Family::ALL must list each of the {VARIANTS} variants once"
-        );
-        let mut seen = [false; VARIANTS];
-        for &family in Family::ALL {
-            let i = family.index();
-            assert!(
-                i < VARIANTS,
-                "{family:?} has index {i} but there are {VARIANTS} variants: indices must be 0..{VARIANTS}"
-            );
-            assert!(!seen[i], "{family:?} appears twice in Family::ALL");
-            seen[i] = true;
-            assert_eq!(Family::ALL[i], family, "Family::ALL is out of index order");
-        }
-        assert!(
-            seen.iter().all(|&s| s),
-            "an index has no variant in Family::ALL"
-        );
-
+    fn builtin_registers_exactly_the_shipped_rows_and_each_has_fixtures() {
         let registry = Registry::builtin().expect("shipped families register disjoint keys");
+        let shipped: Vec<FamilyKey> = SHIPPED.iter().map(|entry| entry.family).collect();
         let registered: Vec<FamilyKey> = registry.entries().iter().map(|e| e.family).collect();
-        let shipped: Vec<FamilyKey> = Family::ALL.iter().map(|f| f.entry().family).collect();
         assert_eq!(registered, shipped);
+        let fixtures: Vec<FamilyKey> = family_fixtures::FIXTURES
+            .iter()
+            .map(|fixtures| fixtures.family)
+            .collect();
+        assert_eq!(
+            fixtures, shipped,
+            "the fixture table is one row per shipped family, in SHIPPED order"
+        );
     }
 
     /// Card 732 SC-007: every shipped family's fixture greedy-decodes a non-constant sequence on
@@ -633,7 +555,7 @@ mod tests {
         let registry = Registry::builtin().expect("shipped families register disjoint keys");
         assert!(!registry.entries().is_empty());
         for entry in registry.entries() {
-            let fixture = (entry.fixture)();
+            let fixture = family_fixtures::base(entry.family);
             let parts = registry
                 .build(&fixture.raw(), &fixture.store)
                 .unwrap_or_else(|e| panic!("{}: {e}", entry.family));
@@ -663,17 +585,100 @@ mod tests {
         }
     }
 
-    /// SC-001: every key of every shipped family resolves to that family and no other.
+    /// Every `.rs` file under `dir`, as (path relative to `root`, text).
+    fn sources(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(root, &path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((relative, std::fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+
+    /// SC-001: a family is registered by one row of [`SHIPPED`] and nowhere else. The scripted add: a new
+    /// family is one file under `architectures`, its module line and its `SHIPPED` row (and its fixture
+    /// row in test support, which holds checkpoints, not registrations). This counts the files that
+    /// name a family's entry (`module::ENTRY`): `registry.rs` and the two places a container reuses an
+    /// entry (the vision-language aliases, and idefics3's text tower built with llama's), never a
+    /// second index. Mutation: keep an index of the families beside `SHIPPED` (a `const INDEX:
+    /// &[FamilyEntry] = &[qwen3::ENTRY]` in any other file); the file is counted and the row is red.
+    #[test]
+    fn a_family_entry_is_named_in_the_shipped_slice_only() {
+        const ALLOWED: [&str; 3] = [
+            "registry.rs",
+            "multimodal/mod.rs",
+            "multimodal/idefics3/mod.rs",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        sources(&root, &root, &mut files);
+        let naming: Vec<&str> = files
+            .iter()
+            .filter(|(_, text)| {
+                text.lines().any(|line| {
+                    let code = line.split("//").next().unwrap_or("");
+                    code.contains("::ENTRY") || code.contains("multimodal::IDEFICS3")
+                })
+            })
+            .map(|(path, _)| path.as_str())
+            .collect();
+        let extra: Vec<&&str> = naming
+            .iter()
+            .filter(|path| !ALLOWED.contains(*path))
+            .collect();
+        assert!(
+            extra.is_empty(),
+            "these files name a family entry besides the SHIPPED slice: {extra:?}"
+        );
+        assert!(
+            naming.contains(&"registry.rs"),
+            "the SHIPPED slice is where the entries are named"
+        );
+    }
+
+    /// Every key of every shipped family resolves, through the public `resolve` of a config naming
+    /// it, to that family and no other: a registry has no key twice (it refuses to build), so the
+    /// keys are a function from (config source, key) to family. An HF config names its family by
+    /// `model_type`, a GGUF by `general.architecture`.
     #[test]
     fn every_builtin_key_resolves_to_exactly_its_family() {
+        use poot_load::gguf::{GgufValue, write_gguf};
         let registry = Registry::builtin().expect("shipped families register disjoint keys");
+        let mut seen = BTreeSet::new();
         for entry in registry.entries() {
+            assert!(!entry.keys.is_empty(), "{} names no key", entry.family);
             for &(origin, key) in entry.keys {
-                let resolved = registry
-                    .by_key
-                    .get(&(origin, key.to_string()))
-                    .map(|&i| registry.entries[i].family);
-                assert_eq!(resolved, Some(entry.family), "{origin} {key:?}");
+                assert!(
+                    seen.insert((origin, key)),
+                    "{origin} {key:?} is listed twice"
+                );
+                let resolved = match origin {
+                    ConfigSource::HfModelType => {
+                        let config = serde_json::json!({ "model_type": key });
+                        let raw = RawConfig::HfJson {
+                            config: &config,
+                            generation: None,
+                            preprocessor: None,
+                        };
+                        registry.resolve(&raw).map(|e| e.family)
+                    }
+                    ConfigSource::GgufArchitecture => {
+                        let gguf = GgufIndex::parse(&StoredBytes::from(write_gguf(
+                            &[("general.architecture", GgufValue::Str(key.into()))],
+                            &[],
+                        )))
+                        .unwrap();
+                        registry.resolve(&RawConfig::Gguf(&gguf)).map(|e| e.family)
+                    }
+                };
+                assert_eq!(resolved, Ok(entry.family), "{origin} {key:?}");
             }
         }
     }
@@ -701,33 +706,24 @@ mod tests {
             family: FamilyKey::new(family),
             keys,
             build: |_, _| Ok(ModelParts::new(Box::new(Unbuildable))),
-            fixture: || Fixture {
-                config: serde_json::json!({}),
-                generation: None,
-                preprocessor: None,
-                store: WeightStore::default(),
-            },
-            variants: &[],
         }
     }
 
-    /// SC-001 (spec 507): one key registered under two families is refused, and the registry keeps
-    /// resolving it to the first; a key the same entry lists twice is refused the same way.
+    /// SC-001 (spec 507): one key registered under two families is refused, and no registry is
+    /// built; a key the same entry lists twice is refused the same way, and so is one family twice.
     #[test]
     fn a_key_registered_under_two_families_is_refused() {
-        let mut registry = Registry::empty();
-        registry
-            .register(entry("alpha", &[(ConfigSource::HfModelType, "shared")]))
-            .unwrap();
-        let err = registry
-            .register(entry(
+        let err = Registry::of(&[
+            entry("alpha", &[(ConfigSource::HfModelType, "shared")]),
+            entry(
                 "beta",
                 &[
                     (ConfigSource::GgufArchitecture, "beta"),
                     (ConfigSource::HfModelType, "shared"),
                 ],
-            ))
-            .unwrap_err();
+            ),
+        ])
+        .unwrap_err();
         assert_eq!(
             err,
             RegistryError::DuplicateKey {
@@ -737,41 +733,39 @@ mod tests {
                 second: FamilyKey::new("beta"),
             }
         );
+
+        let err = Registry::of(&[entry(
+            "gamma",
+            &[
+                (ConfigSource::HfModelType, "g"),
+                (ConfigSource::HfModelType, "g"),
+            ],
+        )])
+        .unwrap_err();
+        assert!(matches!(err, RegistryError::DuplicateKey { .. }), "{err}");
+
         assert_eq!(
-            registry.entries().len(),
-            1,
-            "a refused entry leaves no trace"
+            Registry::of(&[entry("alpha", &[]), entry("alpha", &[])]).unwrap_err(),
+            RegistryError::DuplicateFamily(FamilyKey::new("alpha"))
         );
+
+        let registry =
+            Registry::of(&[entry("alpha", &[(ConfigSource::HfModelType, "a")])]).unwrap();
         let gguf =
             poot_load::gguf::GgufIndex::parse(&StoredBytes::from(poot_load::gguf::write_gguf(
                 &[(
                     "general.architecture",
-                    poot_load::gguf::GgufValue::Str("beta".into()),
+                    poot_load::gguf::GgufValue::Str("a".into()),
                 )],
                 &[],
             )))
             .unwrap();
-        assert!(matches!(
-            registry.resolve(&RawConfig::Gguf(&gguf)),
-            Err(RegistryError::Unregistered { .. })
-        ));
-
-        let err = Registry::empty()
-            .register(entry(
-                "gamma",
-                &[
-                    (ConfigSource::HfModelType, "g"),
-                    (ConfigSource::HfModelType, "g"),
-                ],
-            ))
-            .unwrap_err();
-        assert!(matches!(err, RegistryError::DuplicateKey { .. }), "{err}");
-
-        let mut registry = Registry::empty();
-        registry.register(entry("alpha", &[])).unwrap();
-        assert_eq!(
-            registry.register(entry("alpha", &[])),
-            Err(RegistryError::DuplicateFamily(FamilyKey::new("alpha")))
+        assert!(
+            matches!(
+                registry.resolve(&RawConfig::Gguf(&gguf)),
+                Err(RegistryError::Unregistered { .. })
+            ),
+            "a key resolves only under the config source it was registered for"
         );
     }
 
@@ -853,42 +847,5 @@ mod tests {
             raw.eos_token_ids(FamilyKey::new("qwen2")).unwrap(),
             BTreeSet::from([151645])
         );
-    }
-
-    impl Family {
-        /// Dense 0-based position in [`Self::ALL`]. Exhaustive (no `_` arm), so a new variant needs one.
-        /// `cfg(test)`: it exists for the drift test.
-        const fn index(self) -> usize {
-            match self {
-                Family::Qwen2 => 0,
-                Family::Llama => 1,
-                Family::Qwen3 => 2,
-                Family::Olmo2 => 3,
-                Family::Phi3 => 4,
-                Family::Smollm3 => 5,
-                Family::Granite => 6,
-                Family::Mpt => 7,
-                Family::Bloom => 8,
-                Family::Gemma3 => 9,
-                Family::Gemma2 => 10,
-                Family::Qwen3Moe => 11,
-                Family::GptOss => 12,
-                Family::Olmoe => 13,
-                Family::Gemma4 => 14,
-                Family::MiniMaxM2 => 15,
-                Family::Deepseek2 => 16,
-                Family::Deepseek3 => 17,
-                Family::Deepseek32 => 18,
-                Family::NemotronH => 19,
-                Family::DeepseekV4 => 20,
-                Family::Bert => 21,
-                Family::Idefics3 => 22,
-                Family::Qwen3Next => 23,
-                Family::Qwen35 => 24,
-                Family::Qwen4Exp => 25,
-                Family::Glm53Flash => 26,
-                Family::Qwen25Vl => 27,
-            }
-        }
     }
 }

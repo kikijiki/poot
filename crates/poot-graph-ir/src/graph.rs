@@ -11,6 +11,7 @@ use crate::op::OpKind;
 use crate::range::IndexRange;
 use crate::rope_table::{self, RopeSpec, RopeTable};
 use crate::types::{DType, Scalar, TensorType};
+use crate::weight_ref::WeightRef;
 
 /// An SSA value: an index into [`Graph::values`] (the jaxpr `Var`, an arena index not object identity).
 ///
@@ -454,7 +455,8 @@ pub enum Slot {
     /// own name, as [`Slot::ExpertPoolMap`] does for the same reason). `seed` is per-row I32 noise
     /// state for [`crate::ops::sampling::sample_head`]'s `RandomUniform`; `params` is the per-row
     /// `[inv_temp, floor_offset, noise_scale]` (+ `top_p` for `GumbelTopKTopP`) F32 table;
-    /// `top_k` is the per-row I32 threshold for the two `TopK` rules. Per-step-varying (sampling
+    /// `top_k` is the per-row I32 threshold for the two `TopK` rules. An adjusted head (POOT-1268) adds
+    /// `penalty`, `mask` and `history_read` (see [`crate::ops::sampling`]). Per-step-varying (sampling
     /// parameters can change every request), so a `Slot`, never a `Const`.
     Sampler,
 }
@@ -681,6 +683,12 @@ pub enum StateRole {
     /// the rest keep what earlier steps wrote, so a reader must know how many rows the last writer
     /// covered and read no more.
     Handoff,
+    /// A device-resident per-sequence sampler history (POOT-1268): the token counts the penalties read and
+    /// the logit bias, one row per sequence, which the sampler suffix updates with the token it draws.
+    /// The host seeds a sequence's row once and the device keeps it from there, so it is neither rolled
+    /// back (a discarded draw makes the host reseed the row) nor a hand-off, and it leaves a graph's
+    /// residency `KvOnly`.
+    Sampler,
 }
 
 /// Which extent a state value's leading axis has in a step.
@@ -734,6 +742,11 @@ impl StateRole {
                 rollback: false,
                 handoff: true,
             },
+            StateRole::Sampler => StatePolicy {
+                rows: StateRows::PoolSeqs,
+                rollback: false,
+                handoff: false,
+            },
         }
     }
 }
@@ -773,6 +786,11 @@ pub struct ValueMeta {
     /// [`Graph::validate`] checks both directions (a `State` value with no role, and any other value
     /// with one).
     pub(crate) state_role: Option<StateRole>,
+    /// The mapped weight a [`Storage::Const`] input holds, set once at construction
+    /// ([`crate::builder::Builder::weight`], [`ValueMeta::weight_const`]). The packed-weight binder
+    /// and legalize read this, never `name`, to find the weight a constant is. `None` for a constant
+    /// that is no mapped weight and for every other storage.
+    pub(crate) weight: Option<WeightRef>,
     /// The range a [`Storage::Slot`] or [`Storage::Const`] input declares for its I32 words, set once
     /// at construction ([`crate::builder::Builder::slot_ranged`],
     /// [`crate::builder::Builder::constant_ranged`]) and checked by the binder against the bound
@@ -796,6 +814,7 @@ impl ValueMeta {
             name,
             key: None,
             state_role: None,
+            weight: None,
             range: None,
         }
     }
@@ -811,6 +830,7 @@ impl ValueMeta {
             name: Some(key.to_string()),
             key: Some(key),
             state_role: None,
+            weight: None,
             range: None,
         }
     }
@@ -826,8 +846,37 @@ impl ValueMeta {
             name,
             key: None,
             state_role: Some(role),
+            weight: None,
             range: None,
         }
+    }
+
+    /// This constant as the part `weight` of a mapped weight: its name is the reference's spelling
+    /// ([`WeightRef::name`]). The constructor of every carrier and chunk constant a pass stages.
+    #[must_use]
+    pub fn weight_const(aval: TensorType, weight: WeightRef) -> Self {
+        ValueMeta {
+            aval,
+            storage: Storage::Const,
+            name: Some(weight.name()),
+            key: None,
+            state_role: None,
+            weight: Some(weight),
+            range: None,
+        }
+    }
+
+    /// A weight constant a pass rewrote into the computation of its value (the decode of its packed
+    /// owner): no longer an input, so it keeps no name and no weight reference.
+    pub fn decode_in_place(&mut self) {
+        self.storage = Storage::Device;
+        self.name = None;
+        self.weight = None;
+    }
+
+    /// The mapped weight this constant holds, if it is one.
+    pub fn weight(&self) -> Option<WeightRef> {
+        self.weight
     }
 
     /// The range this input declares for its I32 words, if any. The binders check it at bind;
@@ -1530,6 +1579,8 @@ impl GraphEdit {
         meta.storage = Storage::Slot(Slot::ExpertPool);
         meta.name = Some(key.to_string());
         meta.key = Some(key.clone());
+        // The pool is a slot the executor fills by the key's tag, no longer the weight constant.
+        meta.weight = None;
         self.draft.consts.retain(|&c| c != value);
         self.draft.slots.push((value, Slot::ExpertPool));
         key
@@ -1559,6 +1610,7 @@ impl GraphEdit {
             name: Some(name),
             key: Some(key),
             state_role: None,
+            weight: None,
             range: None,
         });
         self.draft.inputs.push(id);
@@ -1868,7 +1920,10 @@ impl Graph {
                         });
                     }
                 }
-                (Storage::State, Some(StateRole::Recurrent | StateRole::Handoff)) => {}
+                (
+                    Storage::State,
+                    Some(StateRole::Recurrent | StateRole::Handoff | StateRole::Sampler),
+                ) => {}
                 (_, Some(_)) => {
                     return Err(GraphValidationError::UnexpectedStateRole {
                         value: id,
@@ -1876,6 +1931,17 @@ impl Graph {
                     });
                 }
                 (_, None) => {}
+            }
+        }
+
+        // Only a constant is a mapped weight: a reference on any other value would name a weight the
+        // value does not hold.
+        for (id, meta) in self.values.iter_enumerated() {
+            if meta.weight.is_some() && meta.storage != Storage::Const {
+                return Err(GraphValidationError::UnexpectedWeightRef {
+                    value: id,
+                    storage: meta.storage,
+                });
             }
         }
 
@@ -2408,6 +2474,7 @@ mod tests {
             name: None,
             key: None,
             state_role: None,
+            weight: None,
             range: None,
         });
         graph.remap_results(|value| {
@@ -2802,6 +2869,7 @@ mod tests {
                 name: None,
                 key: None,
                 state_role: None,
+                weight: None,
                 range: None,
             });
             let expected = match corruption {
@@ -2875,6 +2943,31 @@ mod tests {
         assert_eq!(
             crate::test_support::verdict(&graph),
             Err(GraphValidationError::StateInputNotInput { value: state.id() })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_weight_reference_on_a_value_that_is_not_a_constant() {
+        use poot_quant::weights::{WeightId, WeightRole};
+
+        let b = Builder::for_tests();
+        let w = b
+            .weight(
+                crate::WeightRef::whole(WeightId::model(WeightRole::Head)),
+                TensorType::f32(vec![2]),
+            )
+            .unwrap();
+        let out = b.unary(crate::op::UnOp::Neg, w).unwrap();
+        let mut graph = b.finish(out).unwrap().into_draft();
+        graph.values_mut()[out.id()].weight =
+            Some(crate::WeightRef::whole(WeightId::model(WeightRole::Embed)));
+
+        assert_eq!(
+            crate::test_support::verdict(&graph),
+            Err(GraphValidationError::UnexpectedWeightRef {
+                value: out.id(),
+                storage: Storage::Device,
+            })
         );
     }
 

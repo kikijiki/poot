@@ -17,7 +17,7 @@ use std::num::NonZeroUsize;
 
 use std::sync::Arc;
 
-use poot_executor::{ExecError, ExecutableId};
+use poot_executor::{ExecError, ExecutableId, NoLate};
 use poot_models::io::{
     InputSet, InputValue, ModelSchema, Per, ProgramId, ProgramSpec, RequestInputs,
 };
@@ -165,6 +165,7 @@ impl<S: State> Driver<S> {
         carried: InputSet,
     ) -> EntryKey {
         EntryKey {
+            chain: 0,
             role: ModelRole::Target,
             program: Program::Encode,
             shape: StepShape::new(rows, tokens, tokens)
@@ -319,7 +320,7 @@ impl<S: State> Driver<S> {
             side: Side::Right,
             feeds: &feeds,
         };
-        let mut outputs = match self.execute(&entry, &columns, &frame) {
+        let mut outputs = match self.execute(&entry, &columns, &frame, &mut NoLate) {
             Ok(outputs) => outputs,
             Err(error) => return Err(self.recover_encode(entry.exe, error)),
         };

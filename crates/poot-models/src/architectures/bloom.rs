@@ -27,33 +27,29 @@
 //! **Attention shape.** Plain multi-head attention (`n_kv_heads == n_heads`), so `n_rep = 1`
 //! throughout.
 
-use poot_graph_ir::{Builder, Graph};
-use std::sync::Arc;
-
-use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
-
 use poot_graph_ir::rope_table::RopeFlavor;
 use poot_quant::weights::{AttnRole, FfnRole, NormRole, WeightMap, WeightRole, WeightStore};
 
-use crate::components::attention::{AttentionParams, AttentionWeights, attention};
+use crate::components::attention::AttentionParams;
 use crate::components::dims::{Field, Fields};
-use crate::components::ffn::{Gelu, PlainMlpWeights, plain_mlp};
-use crate::components::linear::WeightError;
+use crate::components::ffn::Gelu;
 use crate::components::norm::{NormKind, NormParams};
 use crate::components::rope::RopeParams;
-use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    decoder_program, standard_layer, standard_stack,
-};
-use crate::io::ModelSchema;
-use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
+use crate::components::standard::{LayerParams, StackParams};
+use crate::model::{ConfigReason, FamilyKey, ModelError};
 use crate::names::gguf::GGUF_BLOOM;
 use crate::names::{FusedDims, NameRow, Presence, Source, family_weights_fused};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
+use std::sync::Arc;
 
-// The `bloom` family behind [`Model`]: LayerNorm blocks with biases, an embedding LayerNorm,
+use crate::components::standard_family::{
+    LayerNormKind, Mlp, StandardFamily, StandardParams, entry,
+};
+
+// The `bloom` family: LayerNorm blocks with biases, an embedding LayerNorm,
 // ALiBi attention over a fused QKV projection and a plain tanh-GELU MLP with biases, in the
 // standard stack and layer. An HF checkpoint's fused QKV interleaves per head, so it is one weight
 // (`AttnRole::Qkv`) the attention component splits in the graph; llama.cpp's converter
@@ -61,16 +57,7 @@ use poot_text::{ChatFormat, HermesToolCodec};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("bloom");
 
-pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
-    family: FAMILY,
-    keys: &[
-        (ConfigSource::HfModelType, "bloom"),
-        (ConfigSource::GgufArchitecture, "bloom"),
-    ],
-    build,
-    fixture,
-    variants: &[],
-};
+pub(crate) const ENTRY: FamilyEntry = entry::<Bloom>();
 
 /// The HF rows of a BLOOM checkpoint whose tensor names start with `$p` (`"transformer."`, or
 /// `""` for a base-model checkpoint, which has no prefix): two LayerNorms with biases per layer,
@@ -215,22 +202,16 @@ const MAX_POSITIONS: Field = Field::new("seq_length", "bloom.context_length");
 const FFN: Field = Field::new("", "bloom.feed_forward_length");
 
 /// bloom's typed config: every value checked once, here, so tracing cannot fail on it.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct BloomParams {
-    vocab: usize,
-    width: usize,
-    inter: usize,
-    layers: usize,
-    max_positions: usize,
-    attention: AttentionParams,
-    layer: LayerParams,
-    stack: StackParams,
-    eos: BTreeSet<u32>,
-    bos: Option<u32>,
-}
+pub(crate) struct Bloom;
 
-impl BloomParams {
-    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+impl StandardFamily for Bloom {
+    const FAMILY: FamilyKey = FAMILY;
+    const KEYS: &'static [(ConfigSource, &'static str)] = &[
+        (ConfigSource::HfModelType, "bloom"),
+        (ConfigSource::GgufArchitecture, "bloom"),
+    ];
+
+    fn configure(raw: &RawConfig<'_>) -> Result<StandardParams, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let vocab = fields.vocab()?;
         let width = fields.count(hf_alias(&fields, WIDTH_HF, "bloom.embedding_length"), None)?;
@@ -272,126 +253,58 @@ impl BloomParams {
         if matches!(raw, RawConfig::HfJson { .. }) {
             attention = attention.with_fused_qkv().map_err(param)?;
         }
-        Ok(Self {
+        Ok(StandardParams {
             vocab,
             width,
-            inter,
             layers,
             max_positions,
-            attention,
+            attention: vec![attention; layers],
+            mlp: vec![
+                Mlp::Plain {
+                    inter,
+                    act: Gelu::Tanh,
+                    biased: true
+                };
+                layers
+            ],
             layer: LayerParams::new(norm),
             stack: StackParams::new(norm),
+            norms: LayerNormKind::Biased,
+            final_norm_bias: true,
+            embed_norm: true,
+            head_required: false,
             eos: fields.eos(Some(2))?,
             bos: fields.bos()?,
+            prompt_bos: None,
+            chat: ChatFormat::ChatML,
+            tool_codec: Some(Arc::new(HermesToolCodec)),
+            embeddable: false,
         })
     }
-}
 
-#[derive(Debug)]
-struct Layer {
-    norms: LayerNorms,
-    attn: AttentionWeights,
-    ffn: PlainMlpWeights,
-}
-
-#[derive(Debug)]
-pub(crate) struct Bloom {
-    params: BloomParams,
-    weights: WeightMap,
-    stack: StackWeights,
-    layers: Vec<Layer>,
-    config: ModelConfig,
-    schema: ModelSchema,
-}
-
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    let p = BloomParams::from_raw(raw)?;
-    let rows = match raw.source() {
-        ConfigSource::HfModelType if store.contains("word_embeddings.weight") => HF_ROWS_BARE,
-        ConfigSource::HfModelType => HF_ROWS_PREFIXED,
-        ConfigSource::GgufArchitecture => GGUF_BLOOM,
-    };
-    let h = p.width;
-    let fused = FusedDims {
-        q: h,
-        kv: h,
-        inter: 0,
-    };
-    let weights = family_weights_fused(FAMILY, store, &[rows], p.layers, false, fused)?;
-    let weight_error = |e: WeightError| e.for_family(FAMILY);
-    let stack = StackWeights::new(&weights, p.vocab, p.width)
-        .and_then(|s| s.with_final_norm_bias(&weights, p.width))
-        .and_then(|s| s.with_embed_norm(&weights, p.width))
-        .map_err(weight_error)?;
-    let layers = (0..p.layers)
-        .map(|l| {
-            Ok(Layer {
-                norms: LayerNorms::biased(&weights, l, p.width)?,
-                attn: AttentionWeights::new(&weights, l, p.width, &p.attention)?,
-                ffn: PlainMlpWeights::new(&weights, l, p.width, p.inter, true)?,
-            })
-        })
-        .collect::<Result<Vec<_>, WeightError>>()
-        .map_err(weight_error)?;
-    let schema = ModelSchema::builder()
-        .step(decoder_program(p.vocab))
-        .build_for(FAMILY)?;
-    let config = ModelConfig {
-        family: FAMILY,
-        vocab: p.vocab,
-        max_positions: p.max_positions,
-        eos: p.eos.clone(),
-        bos: p.bos,
-        prompt_bos: None,
-        prefill_granule: NonZeroUsize::MIN,
-        chat: ChatFormat::ChatML,
-        tool_codec: Some(Arc::new(HermesToolCodec)),
-    };
-    Ok(ModelParts::new(Box::new(Bloom {
-        params: p,
-        weights,
-        stack,
-        layers,
-        config,
-        schema,
-    })))
-}
-
-impl Model for Bloom {
-    fn config(&self) -> &ModelConfig {
-        &self.config
-    }
-
-    fn schema(&self) -> &ModelSchema {
-        &self.schema
-    }
-
-    fn weights(&self) -> &WeightMap {
-        &self.weights
-    }
-
-    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
-        let p = &self.params;
-        let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        let step = Step::new(&b, shape)?;
-        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
-            let layer = &self.layers[l];
-            standard_layer(
-                b,
-                x,
-                &layer.norms,
-                &p.layer,
-                |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
-                |b, BlockInput { block: h, .. }| plain_mlp(b, h, &layer.ffn, Gelu::Tanh),
-            )
-        })?;
-        Ok(step.finish(b, logits)?)
+    fn weights(
+        raw: &RawConfig<'_>,
+        store: &WeightStore,
+        params: &mut StandardParams,
+    ) -> Result<WeightMap, ModelError> {
+        let rows = match raw.source() {
+            ConfigSource::HfModelType if store.contains("word_embeddings.weight") => HF_ROWS_BARE,
+            ConfigSource::HfModelType => HF_ROWS_PREFIXED,
+            ConfigSource::GgufArchitecture => GGUF_BLOOM,
+        };
+        let h = params.width;
+        let fused = FusedDims {
+            q: h,
+            kv: h,
+            inter: 0,
+        };
+        family_weights_fused(FAMILY, store, &[rows], params.layers, false, fused)
     }
 }
 
 /// The fixture's config: a tiny BLOOM whose projection widths are multiples of 32 (so a Q8_0 copy
 /// of its store is a valid checkpoint too).
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "bloom",
@@ -407,6 +320,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 }
 
 /// The shape of every tensor a BLOOM checkpoint with `config`'s dims carries, by HF name.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
     let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (vocab, h) = (n("vocab_size"), n("hidden_size"));
@@ -449,7 +363,8 @@ pub(crate) fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usi
     shapes
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = fixture_shapes(&config);
     Fixture::bf16(config, shapes)
@@ -468,7 +383,9 @@ mod family_tests {
         assert_missing_weight_is_named, build as built, close, close_all, f32_entry, gguf_tensor,
         q8_0_store, read_back_owned, values,
     };
+    use crate::model::Model;
     use crate::registry::Registry;
+    use std::collections::BTreeSet;
 
     const VOCAB: usize = 48;
     const H: usize = 64;
@@ -581,7 +498,7 @@ mod family_tests {
             generation: None,
             preprocessor: None,
         };
-        match build(&raw, &fixture().store) {
+        match (ENTRY.build)(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
             other => panic!("{config}: expected a config error, got {other:?}"),
         }

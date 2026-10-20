@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use poot_graph_ir::{BinOp, Builder, Graph};
 use poot_quant::weights::{
-    AttnRole, FfnRole, Mamba2Role, NormRole, WeightId, WeightKey, WeightMap, WeightMapError,
-    WeightRole, WeightStore, WeightView,
+    AttnRole, FfnRole, Mamba2Role, NormRole, WeightId, WeightKey, WeightMap, WeightRole,
+    WeightStore, WeightView,
 };
 
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
@@ -27,11 +27,14 @@ use crate::components::linear::{Weight, WeightError};
 use crate::components::mamba2::{Mamba2Params, Mamba2Weights, mamba2};
 use crate::components::norm::{NormParams, norm};
 use crate::components::standard::{
-    StackParams, StackWeights, Step, check_step, decoder_program, standard_stack,
+    StackParams, StackWeights, Step, decoder_program, standard_stack,
 };
 use crate::io::{ModelSchema, StateSpec};
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+use crate::names::TensorRows;
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
 
 /// Nemotron-H's [`FamilyKey`].
@@ -41,8 +44,6 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
     keys: &[(ConfigSource::HfModelType, "nemotron_h")],
     build,
-    fixture,
-    variants: &[],
 };
 
 /// One layer's mixer, decoded from a `hybrid_override_pattern` character.
@@ -166,80 +167,42 @@ impl NemotronHConfig {
 /// the mixer's weights its kind names. `in_proj` is one stored tensor whose three row ranges are
 /// the Mamba2 gate, conv input and timestep projections.
 fn weights_of(p: &NemotronHConfig, store: &WeightStore) -> Result<WeightMap, ModelError> {
-    let mut map = WeightMap::builder(store);
-    let missing = |source: WeightMapError| ModelError::Weight {
-        family: FAMILY,
-        source,
-    };
-    // The stored key of a linear: `{stem}.weight`, or the bare stem a packed loader names it.
-    let linear_key = |stem: &str| {
-        let dense = format!("{stem}.weight");
-        if store.contains(&dense) || !store.contains(stem) {
-            dense
-        } else {
-            stem.to_string()
-        }
-    };
-    let required = |id: WeightId, key: String| -> Result<WeightKey, ModelError> {
-        if store.contains(&key) {
-            Ok(WeightKey::from(key))
-        } else {
-            Err(missing(WeightMapError::Missing {
-                id,
-                key: WeightKey::from(key),
-            }))
-        }
-    };
-
-    let embed = WeightId::model(WeightRole::Embed);
-    let embed_key = required(embed, "backbone.embeddings.weight".into())?;
-    map.map(embed, WeightView::Stored(embed_key.clone()))
-        .map_err(missing)?;
-    let norm_f = WeightId::model(WeightRole::FinalNorm);
-    let norm_key = required(norm_f, "backbone.norm_f.weight".into())?;
-    map.map(norm_f, WeightView::Stored(norm_key))
-        .map_err(missing)?;
-    let head = WeightId::model(WeightRole::Head);
-    let head_key = linear_key("lm_head");
-    let head_key = if store.contains(&head_key) {
-        WeightKey::from(head_key)
-    } else if p.head_required {
-        return Err(missing(WeightMapError::Missing {
-            id: head,
-            key: WeightKey::from("lm_head.weight"),
-        }));
-    } else {
-        embed_key
-    };
-    map.map(head, WeightView::Stored(head_key))
-        .map_err(missing)?;
+    const EMBED: &str = "backbone.embeddings.weight";
+    let mut rows = TensorRows::new(FAMILY, store);
+    rows.tensor(WeightRole::Embed, None, EMBED.into())?;
+    rows.tensor(WeightRole::FinalNorm, None, "backbone.norm_f.weight".into())?;
+    rows.head(EMBED, "lm_head", p.head_required)?;
 
     let inner = p.mamba.inner();
     for (l, kind) in p.kinds.iter().enumerate() {
-        let id = |role| WeightId::layer(l, role);
+        let at = Some(l);
         let layer = format!("backbone.layers.{l}");
-        let norm_id = id(WeightRole::Norm(NormRole::Attn));
-        let key = required(norm_id, format!("{layer}.norm.weight"))?;
-        map.map(norm_id, WeightView::Stored(key)).map_err(missing)?;
+        rows.tensor(
+            WeightRole::Norm(NormRole::Attn),
+            at,
+            format!("{layer}.norm.weight"),
+        )?;
         let mixer = |name: &str| format!("{layer}.mixer.{name}");
         match kind {
             LayerKind::Mamba => {
-                let in_proj_id = id(WeightRole::Mamba2(Mamba2Role::Z));
-                let in_proj = required(in_proj_id, linear_key(&mixer("in_proj")))?;
+                let z = WeightId::layer(l, WeightRole::Mamba2(Mamba2Role::Z));
+                let in_proj = rows.linear_key(&mixer("in_proj"));
+                if !store.contains(&in_proj) {
+                    return Err(rows.missing(z, in_proj));
+                }
                 let conv = p.mamba.conv_channels();
-                for (role, rows) in [
+                for (role, range) in [
                     (Mamba2Role::Z, 0..inner),
                     (Mamba2Role::Xbc, inner..inner + conv),
                     (Mamba2Role::Dt, inner + conv..inner + conv + p.mamba.heads()),
                 ] {
-                    map.map(
-                        id(WeightRole::Mamba2(role)),
+                    rows.add(
+                        WeightId::layer(l, WeightRole::Mamba2(role)),
                         WeightView::RowRange {
-                            key: in_proj.clone(),
-                            rows,
+                            key: WeightKey::from(in_proj.as_str()),
+                            rows: range,
                         },
-                    )
-                    .map_err(missing)?;
+                    )?;
                 }
                 for (role, name) in [
                     (Mamba2Role::DtBias, "dt_bias"),
@@ -249,13 +212,9 @@ fn weights_of(p: &NemotronHConfig, store: &WeightStore) -> Result<WeightMap, Mod
                     (Mamba2Role::D, "D"),
                     (Mamba2Role::GateNorm, "norm.weight"),
                 ] {
-                    let role = id(WeightRole::Mamba2(role));
-                    let key = required(role, mixer(name))?;
-                    map.map(role, WeightView::Stored(key)).map_err(missing)?;
+                    rows.tensor(WeightRole::Mamba2(role), at, mixer(name))?;
                 }
-                let out = id(WeightRole::Mamba2(Mamba2Role::Out));
-                let key = required(out, linear_key(&mixer("out_proj")))?;
-                map.map(out, WeightView::Stored(key)).map_err(missing)?;
+                rows.linear(WeightRole::Mamba2(Mamba2Role::Out), at, &mixer("out_proj"))?;
             }
             LayerKind::Attention => {
                 for (role, name) in [
@@ -264,21 +223,17 @@ fn weights_of(p: &NemotronHConfig, store: &WeightStore) -> Result<WeightMap, Mod
                     (AttnRole::V, "v_proj"),
                     (AttnRole::O, "o_proj"),
                 ] {
-                    let role = id(WeightRole::Attn(role));
-                    let key = required(role, linear_key(&mixer(name)))?;
-                    map.map(role, WeightView::Stored(key)).map_err(missing)?;
+                    rows.linear(WeightRole::Attn(role), at, &mixer(name))?;
                 }
             }
             LayerKind::Mlp => {
                 for (role, name) in [(FfnRole::Up, "up_proj"), (FfnRole::Down, "down_proj")] {
-                    let role = id(WeightRole::Ffn(role));
-                    let key = required(role, linear_key(&mixer(name)))?;
-                    map.map(role, WeightView::Stored(key)).map_err(missing)?;
+                    rows.linear(WeightRole::Ffn(role), at, &mixer(name))?;
                 }
             }
         }
     }
-    Ok(map.build())
+    Ok(rows.finish())
 }
 
 #[derive(Debug)]
@@ -387,7 +342,6 @@ impl Model for NemotronH {
     fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(
             &b,
@@ -412,6 +366,7 @@ impl Model for NemotronH {
 
 /// The fixture's config: a four-layer hybrid (`M*M-`) whose Mamba2 mixer has 4 heads of 8 over 2
 /// groups, so widths are multiples of 32 where a Q8_0 copy needs them.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "nemotron_h",
@@ -436,6 +391,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 }
 
 /// The tensors of a Nemotron-H checkpoint of `config`, by HF name.
+#[cfg(feature = "test-support")]
 pub(crate) fn hf_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
     let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (vocab, w, inter) = (n("vocab_size"), n("hidden_size"), n("intermediate_size"));
@@ -492,7 +448,8 @@ pub(crate) fn hf_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)>
     shapes
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = hf_shapes(&config);
     Fixture::bf16(config, shapes)

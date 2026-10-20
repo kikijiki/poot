@@ -1,6 +1,6 @@
 //! POOT-1226 SC-002: the out-of-tree "vlm" family ([`vlm`]) serves an image request, and no file under
 //! `crates/poot-llm/src` was edited for it: this crate reaches the product through its public surface
-//! only (`Registry::register`, `ModelHandle::load`, `FrontEndSession`, `Driver::generate_with_inputs`).
+//! only (`Registry::builtin_plus`, `ModelHandle::load`, `FrontEndSession`, `Driver::generate_with_inputs`).
 //!
 //! - The family registers, loads from a written checkpoint, and its handle carries the front end its
 //!   registry entry built. A session over it lowers an image and a question to a prompt and the tags the
@@ -27,10 +27,7 @@ use crate::vlm::{self, PLACEHOLDER, quadrant_tags};
 use crate::{Counting, FakeDevice, driver_options, write_checkpoint};
 
 fn registry() -> Registry {
-    let mut registry = Registry::builtin().unwrap();
-    registry.register(crate::tagged::ENTRY).unwrap();
-    registry.register(vlm::ENTRY).unwrap();
-    registry
+    Registry::builtin_plus(&[crate::tagged::ENTRY, vlm::ENTRY]).unwrap()
 }
 
 fn load(dir: &Path) -> Arc<ModelHandle> {

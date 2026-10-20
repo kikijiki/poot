@@ -1,15 +1,15 @@
 //! A mapped weight as a component reads it, and the dense linear projection over one.
 //!
 //! A component never sees bytes or a storage choice: it holds [`Weight`]s (a typed id and its
-//! handle from the model's [`WeightMap`]) and declares each as a graph const named
-//! [`WeightId::const_name`], in checkpoint orientation (`[out, in]` for a projection). [`linear`]
+//! handle from the model's [`WeightMap`]) and declares each as a graph const carrying a
+//! [`WeightRef`] to its id, in checkpoint orientation (`[out, in]` for a projection). [`linear`]
 //! spells every projection as the logical dense `matmul(x, transpose(w))`, whatever the handle's
 //! format: `compile` claims that pattern into a dense contraction, and a packed handle's const is
 //! rewritten into its `PackedDequant` chain by the one packed-weight transform
 //! (`poot_graph_plan::bind_packed_weights` over `WeightFormats::from_weight_map`). There is no packed
 //! arm here.
 
-use poot_graph_ir::{BinOp, Builder, TensorType, Traced};
+use poot_graph_ir::{BinOp, Builder, TensorType, Traced, WeightRef};
 use poot_quant::weights::{HandleFormat, WeightHandle, WeightId, WeightMap, WeightMapError};
 use poot_tensor::DType;
 
@@ -163,8 +163,8 @@ impl Weight {
             HandleFormat::Dense(dtype) => dtype,
             HandleFormat::Packed(_) => DType::F32,
         };
-        Ok(b.constant(
-            &self.id.const_name(),
+        Ok(b.weight(
+            WeightRef::whole(self.id),
             TensorType::new(self.handle.shape.clone(), dtype),
         )?)
     }

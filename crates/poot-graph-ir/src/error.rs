@@ -732,6 +732,14 @@ pub enum GraphValidationError {
         /// Its storage.
         storage: Storage,
     },
+    /// A value that is not a `Const` carries a weight reference: only a constant is a mapped weight.
+    #[error("{value} carries a WeightRef but {storage:?} storage; expected Const")]
+    UnexpectedWeightRef {
+        /// The value.
+        value: ValueId,
+        /// Its storage.
+        storage: Storage,
+    },
     /// A `Positional` role names an axis past the value's rank.
     #[error(
         "state input {value} declares Positional axis {axis} out of range for rank-{rank} value"

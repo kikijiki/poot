@@ -17,6 +17,8 @@ poot-executor.workspace = true
 # The timing snapshot the engine publishes is summarized with its own report.
 poot-profile.workspace = true
 poot-graph-plan.workspace = true
+# The sampling heads the engine plan prepares are named by their draw rule and features.
+poot-graph-ir.workspace = true
 poot-target.workspace = true
 poot-runtime-common.workspace = true
 # LoRA administration loads a PEFT adapter directory; the synthetic GGUF writer of the startup and

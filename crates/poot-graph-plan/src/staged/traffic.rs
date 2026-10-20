@@ -147,7 +147,7 @@ pub(super) fn read_traffic(program: &Program) -> ReadTraffic {
                     traffic.recurrent_state_bytes =
                         traffic.recurrent_state_bytes.saturating_add(bytes)
                 }
-                Some(StateRole::Handoff) => {}
+                Some(StateRole::Handoff | StateRole::Sampler) => {}
             },
             Storage::Device | Storage::Computed(_) | Storage::Slot(_) => {}
         }

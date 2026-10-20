@@ -1,48 +1,32 @@
-//! qwen2 behind [`Model`]: its typed config, its HF and GGUF name rows, and ONE body for prefill and
-//! decode.
+//! qwen2: its typed config, its HF and GGUF name rows, and ONE body for prefill and decode.
 //!
 //! A step of `tokens` new tokens continues from the absolute positions in `Slot::Pos`; decode is the
-//! same body with `tokens = 1`. The body is `standard_stack` over `standard_layer` with the shared
-//! attention (QKV bias, RoPE) and gated FFN components. Weights stay in checkpoint `[out, in]`
-//! orientation at their stored format: a dense weight is declared at its stored dtype, a packed one
-//! is rewritten by the one packed-weight transform from the `WeightMap`.
+//! same body with `tokens = 1`. The body is the shared [`super::super::standard_family::StandardModel`]:
+//! `standard_stack` over `standard_layer` with the shared attention (QKV bias, RoPE) and gated FFN
+//! components. Weights stay in checkpoint `[out, in]` orientation at their stored format: a dense
+//! weight is declared at its stored dtype, a packed one is rewritten by the one packed-weight
+//! transform from the `WeightMap`.
 
-use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-
-use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{WeightMap, WeightStore};
 
-use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
-use crate::components::embed::EMBEDS;
-use crate::components::ffn::{GatedFfnWeights, gated_ffn};
-use crate::components::linear::WeightError;
-use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    embeddable_decoder_schema, standard_layer, standard_stack,
-};
-use crate::io::{ModelSchema, ProgramId};
-use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
+use crate::model::{ConfigReason, FamilyKey, ModelError};
 use crate::names::gguf::GGUF_BASE;
-use crate::names::{HF_BASE, family_weights, hf_base_shapes};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::names::hf_base_shapes;
+use crate::names::{HF_BASE, family_weights};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
+use std::sync::Arc;
+
+use crate::components::standard_family::{StandardFamily, StandardParams, entry};
 
 /// qwen2's [`FamilyKey`].
 pub const FAMILY: FamilyKey = FamilyKey::new("qwen2");
 
-pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
-    family: FAMILY,
-    keys: &[
-        (ConfigSource::HfModelType, "qwen2"),
-        (ConfigSource::GgufArchitecture, "qwen2"),
-    ],
-    build,
-    fixture,
-    variants: &[],
-};
+pub(crate) const ENTRY: FamilyEntry = entry::<Qwen2>();
 
 /// The Qwen2.5-VL text tower: the qwen2 body with sectioned RoPE over `Slot::MropePosition`.
 pub const VL_FAMILY: FamilyKey = FamilyKey::new("qwen2_5_vl");
@@ -58,53 +42,77 @@ const SPEC: DenseSpec = DenseSpec {
     eos: None,
 };
 
-/// qwen2's typed config: every value checked once, here, so tracing cannot fail on it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Qwen2Params {
-    vocab: usize,
-    width: usize,
-    inter: usize,
-    layers: usize,
-    max_positions: usize,
-    attention: AttentionParams,
-    layer: LayerParams,
-    stack: StackParams,
-    head_required: bool,
-    eos: BTreeSet<u32>,
-    bos: Option<u32>,
+/// The dimensions every qwen2-shaped config carries, errors reported for `family`.
+fn read(raw: &RawConfig<'_>, family: FamilyKey) -> Result<(StandardParams, DenseDims), ModelError> {
+    let spec = DenseSpec { family, ..SPEC };
+    let fields = Fields::new(raw, family);
+    let dims = DenseDims::read(&fields, &spec)?;
+    if fields.flag(Field::hf("use_sliding_window"), false)? {
+        return Err(fields.error("use_sliding_window", ConfigReason::Unsupported));
+    }
+    let norm = dims.norm(&fields, &spec)?;
+    let attention = dims.attention(&fields, &spec, true)?;
+    let params = StandardParams {
+        embeddable: true,
+        ..StandardParams::dense(
+            &dims,
+            norm,
+            attention,
+            ChatFormat::ChatML,
+            Some(Arc::new(HermesToolCodec)),
+        )
+    };
+    Ok((params, dims))
 }
 
-impl Qwen2Params {
+/// The weight map of a qwen2-shaped checkpoint, errors reported for `family`.
+fn weights_of(
+    family: FamilyKey,
+    raw: &RawConfig<'_>,
+    store: &WeightStore,
+    params: &StandardParams,
+) -> Result<WeightMap, ModelError> {
+    let rows = match raw.source() {
+        ConfigSource::HfModelType => HF_BASE,
+        ConfigSource::GgufArchitecture => GGUF_BASE,
+    };
+    family_weights(family, store, &[rows], params.layers, params.head_required)
+}
+
+/// The Qwen2.5-class dense decoder: HF's `Qwen2Config` defaults, and llama.cpp's GGUF defaults (a
+/// `1e6` base when the GGUF omits it).
+pub(crate) struct Qwen2;
+
+impl StandardFamily for Qwen2 {
+    const FAMILY: FamilyKey = FAMILY;
+    const KEYS: &'static [(ConfigSource, &'static str)] = &[
+        (ConfigSource::HfModelType, "qwen2"),
+        (ConfigSource::GgufArchitecture, "qwen2"),
+    ];
+
     /// Reads the typed config from an HF `config.json` or a GGUF index; sliding-window attention and
     /// other fields the family cannot serve are a typed [`ModelError::Config`].
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
-        Self::read(raw, FAMILY).map(|(params, _)| params)
+    fn configure(raw: &RawConfig<'_>) -> Result<StandardParams, ModelError> {
+        read(raw, FAMILY).map(|(params, _)| params)
     }
 
-    /// The dimensions every qwen2-shaped config carries, errors reported for `family`.
-    fn read(raw: &RawConfig<'_>, family: FamilyKey) -> Result<(Self, DenseDims), ModelError> {
-        let spec = DenseSpec { family, ..SPEC };
-        let fields = Fields::new(raw, family);
-        let dims = DenseDims::read(&fields, &spec)?;
-        if fields.flag(Field::hf("use_sliding_window"), false)? {
-            return Err(fields.error("use_sliding_window", ConfigReason::Unsupported));
-        }
-        let norm = dims.norm(&fields, &spec)?;
-        let params = Self {
-            attention: dims.attention(&fields, &spec, true)?,
-            layer: LayerParams::new(norm),
-            stack: StackParams::new(norm),
-            vocab: dims.vocab,
-            width: dims.width,
-            inter: dims.inter,
-            layers: dims.layers,
-            max_positions: dims.max_positions,
-            head_required: dims.head_required,
-            eos: dims.eos.clone(),
-            bos: dims.bos,
-        };
-        Ok((params, dims))
+    fn weights(
+        raw: &RawConfig<'_>,
+        store: &WeightStore,
+        params: &mut StandardParams,
+    ) -> Result<WeightMap, ModelError> {
+        weights_of(FAMILY, raw, store, params)
     }
+}
+
+/// The Qwen2.5-VL text tower alone: the model container of a `qwen2_5_vl` checkpoint adds its
+/// vision tower and front end around it (`multimodal::qwen_vl`).
+pub(crate) struct Qwen25VlText;
+
+impl StandardFamily for Qwen25VlText {
+    const FAMILY: FamilyKey = VL_FAMILY;
+    const KEYS: &'static [(ConfigSource, &'static str)] =
+        &[(ConfigSource::HfModelType, "qwen2_5_vl")];
 
     /// The Qwen2.5-VL text tower's config: the qwen2 dimensions of the checkpoint's top level, under
     /// the conventions the sectioned body is written for. Anything else is refused, naming the
@@ -113,7 +121,7 @@ impl Qwen2Params {
     /// is not three widths covering the rotary pairs exactly. The tower is HF-only (a GGUF config is
     /// refused at `model_type`), and the old convention's `qk_norm=false` half has no analogue to
     /// check: the qwen2 body holds no q/k norm tensors.
-    pub fn from_vl_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    fn configure(raw: &RawConfig<'_>) -> Result<StandardParams, ModelError> {
         let fields = Fields::new(raw, VL_FAMILY);
         let RawConfig::HfJson {
             config, generation, ..
@@ -134,7 +142,7 @@ impl Qwen2Params {
         if !fields.flag(Field::hf("attention_bias"), true)? {
             return Err(fields.error("attention_bias", ConfigReason::Unsupported));
         }
-        let (mut params, dims) = Self::read(raw, VL_FAMILY)?;
+        let (mut params, dims) = read(raw, VL_FAMILY)?;
         let natural = dims.width / dims.heads;
         if !dims.width.is_multiple_of(dims.heads) || dims.head_dim != natural {
             return Err(fields.error(
@@ -157,11 +165,19 @@ impl Qwen2Params {
             ));
         }
         let sections = mrope_section(&fields, raw)?;
-        params.attention = params
-            .attention
+        let sectioned = params.attention[0]
             .with_sectioned_rope(sections)
             .map_err(|e| e.for_family(VL_FAMILY))?;
+        params.attention = vec![sectioned; params.layers];
         Ok(params)
+    }
+
+    fn weights(
+        raw: &RawConfig<'_>,
+        store: &WeightStore,
+        params: &mut StandardParams,
+    ) -> Result<WeightMap, ModelError> {
+        weights_of(VL_FAMILY, raw, store, params)
     }
 }
 
@@ -210,134 +226,9 @@ fn mrope_section(fields: &Fields<'_>, raw: &RawConfig<'_>) -> Result<[usize; 3],
     Ok(sections)
 }
 
-#[derive(Debug)]
-struct Layer {
-    norms: LayerNorms,
-    attn: AttentionWeights,
-    ffn: GatedFfnWeights,
-}
-
-/// A built qwen2-shaped model: config, name-resolved weights, the stack-level tensors and the
-/// per-layer weights. `family` is the key its errors carry, so a family that reuses this body
-/// reports under its own name. Owns its weights; holds no per-request state.
-#[derive(Debug)]
-pub struct Qwen2 {
-    family: FamilyKey,
-    params: Qwen2Params,
-    weights: WeightMap,
-    stack: StackWeights,
-    layers: Vec<Layer>,
-    config: ModelConfig,
-    schema: ModelSchema,
-}
-
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    build_from(FAMILY, Qwen2Params::from_raw(raw)?, raw, store)
-}
-
-/// The Qwen2.5-VL text tower alone: the model container of a `qwen2_5_vl` checkpoint adds its vision tower
-/// and front end around it (`multimodal::qwen_vl`).
-pub(crate) fn build_vl(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    build_from(VL_FAMILY, Qwen2Params::from_vl_raw(raw)?, raw, store)
-}
-
-fn build_from(
-    family: FamilyKey,
-    p: Qwen2Params,
-    raw: &RawConfig<'_>,
-    store: &WeightStore,
-) -> Result<ModelParts, ModelError> {
-    let rows = match raw.source() {
-        ConfigSource::HfModelType => HF_BASE,
-        ConfigSource::GgufArchitecture => GGUF_BASE,
-    };
-    let weights = family_weights(family, store, &[rows], p.layers, p.head_required)?;
-    let weight_error = |e: WeightError| e.for_family(family);
-    let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
-    let layers = (0..p.layers)
-        .map(|l| {
-            Ok(Layer {
-                norms: LayerNorms::new(&weights, l, p.width)?,
-                attn: AttentionWeights::new(&weights, l, p.width, &p.attention)?,
-                ffn: GatedFfnWeights::new(&weights, l, p.width, p.inter)?,
-            })
-        })
-        .collect::<Result<Vec<_>, WeightError>>()
-        .map_err(weight_error)?;
-    let schema = embeddable_decoder_schema(p.vocab, p.width, p.attention.is_sectioned())
-        .build_for(family)?;
-    let config = ModelConfig {
-        family,
-        vocab: p.vocab,
-        max_positions: p.max_positions,
-        eos: p.eos.clone(),
-        bos: p.bos,
-        prompt_bos: None,
-        prefill_granule: NonZeroUsize::MIN,
-        chat: ChatFormat::ChatML,
-        tool_codec: Some(Arc::new(HermesToolCodec)),
-    };
-    Ok(ModelParts::new(Box::new(Qwen2 {
-        family,
-        params: p,
-        weights,
-        stack,
-        layers,
-        config,
-        schema,
-    })))
-}
-
-impl Model for Qwen2 {
-    fn config(&self) -> &ModelConfig {
-        &self.config
-    }
-
-    fn schema(&self) -> &ModelSchema {
-        &self.schema
-    }
-
-    fn weights(&self) -> &WeightMap {
-        &self.weights
-    }
-
-    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
-        let p = &self.params;
-        let shape = spec.shape;
-        check_step(self.family, shape, p.max_positions)?;
-        let step = Step::new(&b, shape)?;
-        let step = if spec.program == ProgramId::ENCODE {
-            step.returning_hidden()
-        } else {
-            step
-        };
-        let step = if spec.carries(EMBEDS) {
-            step.with_embeds(&b, p.width)?
-        } else {
-            step
-        };
-        let step = if p.attention.is_sectioned() {
-            step.with_mrope(&b)?
-        } else {
-            step
-        };
-        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
-            let layer = &self.layers[l];
-            standard_layer(
-                b,
-                x,
-                &layer.norms,
-                &p.layer,
-                |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
-                |b, BlockInput { block: h, .. }| gated_ffn(b, h, &layer.ffn),
-            )
-        })?;
-        Ok(step.finish(b, logits)?)
-    }
-}
-
 /// The fixture's config: a tiny untied qwen2 whose projection widths are multiples of 32 (so a
 /// Q8_0 copy of its store is a valid checkpoint too).
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "qwen2",
@@ -358,6 +249,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 /// The Qwen2.5-VL text tower's fixture config: the qwen2 fixture with the released config's keys
 /// (`model_type`, `rope_scaling` naming `mrope` and its sections over the 8 rotary pairs).
+#[cfg(feature = "test-support")]
 pub(crate) fn vl_fixture_config() -> serde_json::Value {
     let mut config = fixture_config();
     config["model_type"] = "qwen2_5_vl".into();
@@ -365,14 +257,16 @@ pub(crate) fn vl_fixture_config() -> serde_json::Value {
     config
 }
 
+#[cfg(feature = "test-support")]
 pub(crate) fn vl_fixture() -> Fixture {
     let config = vl_fixture_config();
     let shapes = hf_base_shapes(&config, true);
     Fixture::bf16(config, shapes)
 }
 
-/// A tiny deterministic BF16 qwen2 checkpoint (`FamilyEntry::fixture`).
-fn fixture() -> Fixture {
+/// A tiny deterministic BF16 qwen2 checkpoint (its row of the fixture table).
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = hf_base_shapes(&config, true);
     Fixture::bf16(config, shapes)
@@ -393,6 +287,13 @@ mod tests {
 
     use super::*;
     use crate::components::standard::oracle::{self, run_step};
+    use crate::components::standard_family::StandardFamily;
+    use crate::model::Model;
+    use crate::model::StepSpec;
+    use crate::model::TraceError;
+    use poot_graph_ir::Graph;
+    use std::collections::BTreeSet;
+    use std::num::NonZeroUsize;
     /// The first four dimensions of the mean over `PROMPT`'s positions of the `Encode` hidden state on
     /// the fixture: the sentence vector before any normalization (tier 2).
     const RECORDED_MEAN: [f32; 4] = [-0.6346052, 0.3129701, 0.27594122, -0.24472162];
@@ -690,7 +591,7 @@ mod tests {
             generation: None,
             preprocessor: None,
         };
-        match build(&raw, &fixture().store) {
+        match (ENTRY.build)(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
             other => panic!("{config}: expected a config error, got {other:?}"),
         }
@@ -786,7 +687,7 @@ mod tests {
             generation: None,
             preprocessor: None,
         };
-        build(&raw, &fx.store).unwrap();
+        (ENTRY.build)(&raw, &fx.store).unwrap();
 
         let mut store = WeightStore::builder();
         for (key, entry) in fx.store.iter() {
@@ -794,7 +695,7 @@ mod tests {
                 store.insert(key.clone(), entry.clone()).unwrap();
             }
         }
-        let err = build(&fx.raw(), &store.build()).unwrap_err();
+        let err = (ENTRY.build)(&fx.raw(), &store.build()).unwrap_err();
         assert!(err.to_string().contains("lm_head.weight"), "{err}");
     }
 
@@ -1075,7 +976,7 @@ mod tests {
             &[],
         )))
         .unwrap();
-        let err = Qwen2Params::from_raw(&RawConfig::Gguf(&index)).unwrap_err();
+        let err = Qwen2::configure(&RawConfig::Gguf(&index)).unwrap_err();
         assert!(
             matches!(
                 err,

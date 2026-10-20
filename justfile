@@ -116,8 +116,8 @@ test-lane-coverage:
     scripts/check-lane-coverage.py '{{wgpu_selection}}' '{{vulkan_selection}}' '{{rocm_selection}}' '{{ptx_selection}}' '{{ptx_multi_device_selection}}' '{{kernels_selection}}' '{{npu_selection}}'
 
 # The add-a-model standing test (ADR-0104 rule 3), host half: a family defined inside the test (a config type, a
-# checkpoint-name table, a tracer over `standard_stack` and `standard_layer`) registers through the public
-# `Registry::register`, loads from a written checkpoint, compiles Prefill and Decode for the wgpu, ROCm and PTX
+# checkpoint-name table, a `StandardFamily` over the shared wrapper) registers with `Registry::builtin_plus`,
+# loads from a written checkpoint, compiles Prefill and Decode for the wgpu, ROCm and PTX
 # reference targets, decodes the pinned oracle tokens and runs under a driver with the same typed limits as a
 # built-in family. The rows are model-free, so `just test` (test-model-free) already runs them: the inventory
 # classes each one. This recipe is the focused entry a stage gate names. The device half (`_wgpu`, `_rocm`,

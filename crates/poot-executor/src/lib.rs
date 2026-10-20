@@ -25,7 +25,7 @@ pub use device::{
     MeasuredDeviceTime, NativeCounters, SupportBound, VpuInvocation, WeightUpload, write_slice,
 };
 pub use engine::Engine;
-pub use error::{BindError, DeviceError, DispatchError, ExecError, LoadError};
+pub use error::{BindError, ChainError, DeviceError, DispatchError, ExecError, LoadError};
 use poot_runtime_common::{BufferRole, DeviceIdentity, MemoryCounterSnapshot};
 use poot_tensor::{HostTensor, HostView};
 pub use shared_kernels::{SharedKernels, SharedKernelsMismatch};
@@ -202,7 +202,7 @@ pub struct StepValue<'a> {
 /// A [`Slot::WriteMap`](poot_graph_ir::Slot::WriteMap) slot is bound only through
 /// [`Self::push_write_map`], which takes a checked [`ForwardSlotMap`]: a repeated or out-of-pool slot is
 /// unrepresentable there, and [`Self::push`] of a raw view to such a slot is a [`BindError`].
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct StepInputs<'a> {
     values: Vec<(SlotKey, StepValue<'a>)>,
     write_maps: Vec<(SlotKey, &'a ForwardSlotMap)>,
@@ -234,6 +234,98 @@ impl<'a> StepInputs<'a> {
     }
 }
 
+/// One step of a chained dispatch ([`Executor::step_chain`]): the entry it runs and the inputs it binds.
+pub struct ChainStep<'a, 'b> {
+    /// The entry the step runs. Distinct per step: each step has the buffers of its own entry.
+    pub entry: EntryId,
+    /// The step's inputs; every step after the first leaves the fed slot unbound.
+    pub inputs: &'b StepInputs<'a>,
+}
+
+/// How a chain carries a token from one step to the next without the host: the entry exports the value it
+/// picked under `picked`, and the next step's `slot` takes it by a device copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainFeed {
+    /// The boundary every step's entry exports its picked token under.
+    pub picked: BoundaryId,
+    /// The token slot of the next step, bound by the copy and not by the caller.
+    pub slot: SlotKey,
+}
+
+/// The outputs of a chained dispatch, one per step in step order, borrowed from the executor like
+/// [`StepOutputs`].
+pub struct ChainOutputs<'a> {
+    source: &'a mut dyn OutputSource,
+    exe: ExecutableId,
+    entries: Vec<EntryId>,
+    time: DeviceTime,
+}
+
+impl<'a> ChainOutputs<'a> {
+    pub(crate) fn new<S: OutputSource>(
+        source: &'a mut S,
+        exe: ExecutableId,
+        entries: Vec<EntryId>,
+        time: DeviceTime,
+    ) -> Self {
+        Self {
+            source,
+            exe,
+            entries,
+            time,
+        }
+    }
+
+    /// The number of steps.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the chain has no steps (a chain always has one).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Step `step`'s primary output bytes, in its planned lane.
+    pub fn read(&mut self, step: usize) -> Result<Vec<u8>, ExecError> {
+        let entry = self.entries[step];
+        let mut out = vec![0u8; self.source.output_bytes(self.exe, entry)?];
+        self.source.read_output(self.exe, entry, &mut out)?;
+        Ok(out)
+    }
+
+    /// The device time of the chain.
+    pub fn device_time(&self) -> DeviceTime {
+        self.time.clone()
+    }
+}
+
+/// The inputs of a step that the host builds after the stages before the program's late point were
+/// enqueued (POOT-1268): the sampler's guided-decoding mask is the one user. The device runs those stages
+/// while the host builds the values; a program with no late point binds them before its first stage, so
+/// the values are the same either way and only the overlap differs.
+pub trait LateInputs {
+    /// The slots [`Self::build`] fills, in its order. They are not part of the step's [`StepInputs`].
+    fn keys(&self) -> &[SlotKey];
+
+    /// Build the value of every key. Called once per step, with the device already running whatever the
+    /// program placed before its late point.
+    fn build(&mut self) -> Result<Vec<HostTensor>, ExecError>;
+}
+
+/// The late inputs of a step that has none.
+pub struct NoLate;
+
+impl LateInputs for NoLate {
+    fn keys(&self) -> &[SlotKey] {
+        &[]
+    }
+
+    fn build(&mut self) -> Result<Vec<HostTensor>, ExecError> {
+        Ok(Vec::new())
+    }
+}
+
 /// Recordings, replays and live memory by role, aggregated over every executable this executor
 /// holds (R-546-11): the bench profile report's one source, replacing the test-only `recordings()`/
 /// `read_state()` accessors the contract no longer has. `memory` is [`Device::memory`] (Card 547a): the
@@ -251,6 +343,12 @@ pub struct ExecutorStats {
     /// Bytes the host wrote to device buffers while binding steps: the caller's inputs and hosted
     /// embeds. A link between stages is a shared device buffer, never a host write.
     pub host_write_bytes: u64,
+    /// Bytes of step output the host read back from the device ([`StepOutputs::read`] and
+    /// [`StepOutputs::to_host`]); not the sync-point reads, which `sync_read_bytes` counts.
+    pub output_read_bytes: u64,
+    /// Times the engine blocked the host on the device: once to complete each step and once per sync
+    /// point. A device that runs k steps for one completion adds one.
+    pub waits: u64,
     /// The device's own live bytes by role ([`Device::memory`]).
     pub memory: Vec<(BufferRole, MemoryCounterSnapshot)>,
     /// Bytes read from the weight store and encoded for upload, summed over every weight upload. A
@@ -362,8 +460,46 @@ pub trait Executor {
         inputs: &StepInputs<'_>,
         sync: &mut dyn HostSync,
     ) -> Result<StepOutputs<'_>, ExecError>;
+    /// Run `steps` one after another on the device with one completion wait: step `j + 1` binds its
+    /// ordinary inputs, the device runs step `j`, and `feed` carries the token step `j` picked into step
+    /// `j + 1`'s token slot by a device copy, so the host never sees a token between steps. Every step runs
+    /// its own entry (a separate set of input buffers, the carried state shared), which makes the inputs of
+    /// all steps bindable up front. An entry that needs the host between its stages is refused
+    /// ([`ChainError`]).
+    fn step_chain(
+        &mut self,
+        exe: ExecutableId,
+        steps: &[ChainStep<'_, '_>],
+        feed: &ChainFeed,
+        sync: &mut dyn HostSync,
+    ) -> Result<ChainOutputs<'_>, ExecError>;
+    /// [`Self::step`] with inputs the host builds while the device runs the stages before the program's
+    /// late point ([`poot_graph_plan::staged::StagedProgram::late_after`]): `inputs` is bound first, the
+    /// stages up to the late point are enqueued, `late` is asked for its values, they are written, and
+    /// the rest of the program is enqueued. One completion wait covers the whole step. A program with no
+    /// late point binds the late values before its first stage.
+    fn step_late(
+        &mut self,
+        exe: ExecutableId,
+        entry: EntryId,
+        inputs: &StepInputs<'_>,
+        late: &mut dyn LateInputs,
+        sync: &mut dyn HostSync,
+    ) -> Result<StepOutputs<'_>, ExecError>;
     /// Zero the carried state of `exe` selected by `scope`.
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError>;
+    /// Overwrite row `row` of the leading axis of the carried state named `name` with `values`, one row
+    /// of the state's own dtype. The host seeds a state it then leaves to the device (the sampler's
+    /// per-sequence history); no step is in flight, because `step` returns only after its wait. A
+    /// name the executable does not hold, a row outside the leading axis or a row of another dtype or
+    /// length is a [`BindError`] and writes nothing.
+    fn write_state_row(
+        &mut self,
+        exe: ExecutableId,
+        name: &str,
+        row: usize,
+        values: HostView<'_>,
+    ) -> Result<(), ExecError>;
     /// Drops `entry`'s recording and arena; the executable's shared state is untouched (R-546-3).
     fn remove_entry(&mut self, exe: ExecutableId, entry: EntryId) -> Result<(), ExecError>;
     /// Counters aggregated over every executable this executor holds.

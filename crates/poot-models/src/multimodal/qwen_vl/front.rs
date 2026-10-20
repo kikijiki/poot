@@ -522,7 +522,7 @@ mod tests {
 
     /// The front end the registry entry builds from the fixture's config.
     fn front_end() -> Box<dyn FrontEnd> {
-        let fixture: Fixture = (ENTRY.fixture)();
+        let fixture: Fixture = crate::test_support::family_fixtures::base(ENTRY.family);
         (ENTRY.build)(&fixture.raw(), &fixture.store)
             .unwrap()
             .front_end

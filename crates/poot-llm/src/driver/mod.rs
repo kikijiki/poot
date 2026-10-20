@@ -5,9 +5,11 @@
 //! of its own. It knows no family and no backend. A step's graph comes from [`Model::trace`], gets
 //! the sampling suffix its request needs appended ([`suffix`]), compiles through
 //! `poot_graph_plan::compile_staged` for the executor's own target, and runs through the object-safe
-//! [`Executor`]. A request the suffix cannot express (a guided mask, a penalty or bias, logprobs)
-//! falls back to the one host sampling path ([`host_sample`]). [`Driver::beam`] is beam search over
-//! the rows of a batched step, with its own contiguous entries ([`beam`]).
+//! [`Executor`]. Every sampling rule runs in that suffix on the device: the draw, the penalties and
+//! bias read from a per-sequence history the device keeps, a guided-decoding mask, and top-n
+//! logprobs. The host reads back tokens (and the logprob records), never the logits; the logits head
+//! ([`host_sample`]) is for a caller that asks for the full logits. [`Driver::beam`] is beam search
+//! over the rows of a batched step, with its own contiguous entries ([`beam`]).
 //!
 //! # Prepared entries
 //!
@@ -82,11 +84,11 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use poot_executor::{
-    Collectives, Coordinator, Device, EntryId, ExecError, ExecutableId, Executor, HostSync, NoSync,
-    StepInputs,
+    Collectives, Coordinator, Device, EntryId, ExecError, ExecutableId, Executor, HostSync,
+    LateInputs, NoSync, StepInputs,
 };
 use poot_graph_ir::ForwardSlotMap;
-use poot_graph_ir::{Graph, SlotKey, StatePolicy, StateRows};
+use poot_graph_ir::{BoundaryId, Graph, SlotKey, StatePolicy, StateRows};
 use poot_graph_plan::{
     CompileOptions, ShardRule, WeightFormats, bind_packed_weights, shard, staged::ExpertPlacement,
     staged::ReadTraffic, staged::StagedCompileError, staged::StagedProgram, staged::TensorParallel,
@@ -440,8 +442,10 @@ pub struct DriverStats {
     pub compiles: u64,
     /// Entries added to the executor.
     pub entries_added: u64,
-    /// Steps run, of every kind.
+    /// Steps run, of every kind; each step of a chain counts.
     pub steps: u64,
+    /// Chained dispatches run ([`step::RowWork::Chain`]): several steps for one host wait.
+    pub chains: u64,
     /// Bytes the plan reads, summed over the steps run, split by whether the step's entry was a
     /// decode entry ([`ReadTraffic`]).
     pub decode_read_bytes: u64,
@@ -538,6 +542,18 @@ struct EntryKey {
     adapters: Option<GenerationId>,
     /// The carriable request inputs the entry binds: the program variant it traces.
     carried: InputSet,
+    /// The step of a chained dispatch this copy of the entry serves (0 for the entry an ordinary step
+    /// runs). Each step of a chain runs an entry of its own, so the inputs of every step can be bound
+    /// before the first runs.
+    chain: u8,
+}
+
+/// What binding and reading an entry takes beyond its program: its slots with their binders, the shape of
+/// its output and the boundary of the token it picks, when a chain can carry it.
+struct EntryIo {
+    slots: Vec<BoundSlot>,
+    output: Vec<usize>,
+    picked: Option<BoundaryId>,
 }
 
 /// What a step needs of a prepared entry beyond its id: every slot its program declares, with the
@@ -556,6 +572,17 @@ struct Prepared {
     slots: Vec<BoundSlot>,
     /// The shape of the program's output, as traced: `[rows, positions, width]` for an encode step.
     output: Vec<usize>,
+    /// The boundary the program exports the picked token `[rows, 1]` under, when a chained step can
+    /// carry it into the next step.
+    picked: Option<BoundaryId>,
+    /// The state the program carries, at the avals the planner chose: a row graph over it shares the buffers.
+    carried: Vec<reorder::CarriedState>,
+}
+
+/// What one slot binds: a tensor view, or a write map, which binds only as its checked type.
+enum Bound<'a> {
+    Tensor(HostTensor),
+    WriteMap(&'a ForwardSlotMap),
 }
 
 /// A driver that has not been prepared: it owns its prepared entries, adapters and executables, and
@@ -1136,7 +1163,7 @@ impl<S: State> Driver<S> {
                 && residency == StateResidency::Recurrent,
             Feature::RecurrentDraftState,
         ))?;
-        let graph = match key.role {
+        let (graph, late, picked) = match key.role {
             ModelRole::Snapshot | ModelRole::Restore => {
                 // A rollback copy moves state and binds no weight: its graph is the decode
                 // program's state schema, rows copied by index.
@@ -1145,13 +1172,18 @@ impl<S: State> Driver<S> {
                     .ok_or(Unsupported::RowGraph(Box::new(
                         reorder::RowGraphError::NoState,
                     )))?;
-                match key.role {
+                let graph = match key.role {
                     ModelRole::Snapshot => entries.snapshot,
                     _ => entries.restore,
-                }
+                };
+                (graph, None, None)
             }
-            _ => suffix::with_head(graph, key.head, self.settings.options.trace)
-                .map_err(|error| Unsupported::Graph(Box::new(error)))?,
+            _ => {
+                let head =
+                    suffix::with_head(graph, key.head, key.shape, self.settings.options.trace)
+                        .map_err(|error| Unsupported::Graph(Box::new(error)))?;
+                (head.graph, head.late, head.picked)
+            }
         };
         let mut slots = match key.role {
             ModelRole::Snapshot | ModelRole::Restore => bind::resolve_passes(&graph, program.id())?,
@@ -1159,6 +1191,9 @@ impl<S: State> Driver<S> {
         };
         let output = graph.aval(graph.result()).shape.clone();
         let mut compile = self.options_for(key.program, key.shape);
+        if let Some(boundary) = late {
+            compile = compile.with_late(boundary);
+        }
         let stack = key
             .adapters
             .map(|generation| {
@@ -1176,6 +1211,9 @@ impl<S: State> Driver<S> {
             ));
         }
         let program = self.compile(&graph, self.formats_of(key.role), &compile)?;
+        // A stage split keeps the inputs a stage uses: a slot of the traced graph no stage reads is not
+        // one a step binds.
+        slots.retain(|slot| program.takes_input(&slot.key));
         let reservation = self.admit(&program)?;
         let exe = match (key.adapters, key.program) {
             (Some(generation), _) => self.adapter_exe(generation)?,
@@ -1188,8 +1226,11 @@ impl<S: State> Driver<S> {
             exe,
             &program,
             reservation,
-            slots,
-            output,
+            EntryIo {
+                slots,
+                output,
+                picked,
+            },
             (key.program, key.shape),
         )?;
         if key.role != ModelRole::Draft && residency == StateResidency::Recurrent {
@@ -1268,8 +1309,7 @@ impl<S: State> Driver<S> {
         exe: ExecutableId,
         program: &StagedProgram,
         reservation: Reservation,
-        slots: Vec<BoundSlot>,
-        output: Vec<usize>,
+        io: EntryIo,
         (program_kind, shape): (Program, StepShape),
     ) -> Result<Prepared, DriverError> {
         let id = self.runtime.executor.add_entry(exe, program)?;
@@ -1288,8 +1328,13 @@ impl<S: State> Driver<S> {
             held: reservation.held,
             traffic: program.read_traffic(),
             decode: program_kind == Program::Step && shape.is_decode(),
-            slots,
-            output,
+            slots: io.slots,
+            output: io.output,
+            picked: io.picked,
+            carried: program
+                .stages()
+                .flat_map(|(_, _, stage)| reorder::CarriedState::of_graph(stage.graph()))
+                .collect(),
         })
     }
 
@@ -1362,31 +1407,28 @@ impl<S: State> Driver<S> {
         Ok(residency)
     }
 
-    /// Run `entry` over `columns` and the rows of `frame`: bind each slot the entry declares, in its
-    /// declared shape, by its binder ([`bind`]).
-    fn execute(
-        &mut self,
-        entry: &Prepared,
-        columns: &StepColumns,
+    /// The value every slot of `entry` binds from `columns` and the rows of `frame`, by its binder
+    /// ([`bind`]). The guided mask is bound late and the token slot of a chained step by the device, so
+    /// neither is among them (`fed` leaves the token slot out).
+    fn bound_inputs<'c>(
+        entry: &'c Prepared,
+        columns: &'c StepColumns,
         frame: &RequestFrame<'_>,
-    ) -> Result<poot_executor::StepOutputs<'_>, DriverError> {
-        // What one slot binds: a tensor view, or a write map, which binds only as its checked type.
-        enum Bound<'a> {
-            Tensor(HostTensor),
-            WriteMap(&'a ForwardSlotMap),
-        }
-        let bound: Vec<(&SlotKey, Bound<'_>)> = entry
+        fed: bool,
+    ) -> Vec<(&'c SlotKey, Bound<'c>)> {
+        entry
             .slots
             .iter()
-            .map(|spec| {
+            .filter_map(|spec| {
                 let shape = spec.shape.clone();
                 let tensor = match &spec.binder {
                     Binder::Step(StepInput::KvWriteMap) => {
-                        return (&spec.key, Bound::WriteMap(&columns.kv_write));
+                        return Some((&spec.key, Bound::WriteMap(&columns.kv_write)));
                     }
                     Binder::Step(StepInput::StateWriteRows) => {
-                        return (&spec.key, Bound::WriteMap(&columns.state_write));
+                        return Some((&spec.key, Bound::WriteMap(&columns.state_write)));
                     }
+                    Binder::Step(StepInput::Tokens) if fed => return None,
                     Binder::Step(StepInput::Tokens) => {
                         HostTensor::i32(shape, columns.tokens.clone())
                     }
@@ -1414,25 +1456,32 @@ impl<S: State> Driver<S> {
                     Binder::Pass(PassInput::SamplerTopK) => {
                         HostTensor::i32(shape, columns.top_k.clone())
                     }
+                    Binder::Pass(PassInput::SamplerPenalty) => {
+                        HostTensor::f32(shape, columns.penalty.clone())
+                    }
+                    // The guided mask is bound late, while the device runs the forward pass.
+                    Binder::Pass(PassInput::SamplerMask) => return None,
+                    Binder::Pass(PassInput::HistoryRead) => {
+                        HostTensor::i32(shape, columns.history_read.clone())
+                    }
+                    Binder::Pass(PassInput::HistoryWrite) => {
+                        return Some((&spec.key, Bound::WriteMap(&columns.history_write)));
+                    }
                     Binder::Pass(PassInput::BeamRows) => {
                         HostTensor::i32(shape, columns.beam_rows.clone())
                     }
                     Binder::Request(request) => bind::bind_request(request, &shape, frame),
                 };
-                (&spec.key, Bound::Tensor(tensor))
+                Some((&spec.key, Bound::Tensor(tensor)))
             })
-            .collect();
-        let mut inputs = StepInputs::new();
-        for (key, bound) in &bound {
-            match bound {
-                Bound::Tensor(tensor) => inputs.push((*key).clone(), tensor.shape(), tensor.view()),
-                Bound::WriteMap(map) => inputs.push_write_map((*key).clone(), map),
-            }
-        }
+            .collect()
+    }
+
+    /// Count one step of `entry` over `columns`: a token at position `p` attends `p + 1` cached positions,
+    /// so the plan's KV bytes per position times that count (a block-selected cache: times at most its
+    /// selected positions) lands on top of the weights and recurrent state every step streams.
+    fn account_step(&mut self, entry: &Prepared, columns: &StepColumns) {
         self.stats.steps += 1;
-        // A token at position `p` attends `p + 1` cached positions: the plan's KV bytes per position
-        // times that count (a block-selected cache: times at most its selected positions), on top of the
-        // weights and recurrent state every step streams.
         let bytes = entry.traffic.step_bytes(
             columns
                 .pos
@@ -1445,6 +1494,28 @@ impl<S: State> Driver<S> {
             &mut self.stats.prefill_read_bytes
         };
         *counter = counter.saturating_add(bytes);
+    }
+
+    /// Run `entry` over `columns` and the rows of `frame`: bind each slot the entry declares, in its
+    /// declared shape, by its binder ([`bind`]). `late` supplies the inputs the host builds while the
+    /// device runs the program's first stage (the guided mask); an entry with none passes
+    /// [`NoLate`].
+    fn execute(
+        &mut self,
+        entry: &Prepared,
+        columns: &StepColumns,
+        frame: &RequestFrame<'_>,
+        late: &mut dyn LateInputs,
+    ) -> Result<poot_executor::StepOutputs<'_>, DriverError> {
+        let bound = Self::bound_inputs(entry, columns, frame, false);
+        let mut inputs = StepInputs::new();
+        for (key, bound) in &bound {
+            match bound {
+                Bound::Tensor(tensor) => inputs.push((*key).clone(), tensor.shape(), tensor.view()),
+                Bound::WriteMap(map) => inputs.push_write_map((*key).clone(), map),
+            }
+        }
+        self.account_step(entry, columns);
         let mut none = NoSync;
         let host: &mut dyn HostSync = match &mut self.runtime.pool {
             Some(pool) => pool.managers.entry(entry.exe).or_default(),
@@ -1455,7 +1526,7 @@ impl<S: State> Driver<S> {
         match self
             .runtime
             .executor
-            .step(entry.exe, entry.id, &inputs, host)
+            .step_late(entry.exe, entry.id, &inputs, late, host)
         {
             Ok(outputs) => Ok(outputs),
             Err(error) => {
@@ -1592,10 +1663,7 @@ impl Driver<Serving> {
         request: GenerateRequest,
         sink: &mut dyn TokenSink,
     ) -> Result<Generation, DriverError> {
-        let head = match suffix::rule_of(&request.sampler) {
-            Some(rule) => Head::Sample(rule),
-            None => Head::Logits,
-        };
+        let head = Head::serving(&request.sampler);
         let shapes = ServingShapes {
             layout: self.state.layout(),
             rows: &[NonZeroUsize::MIN],
@@ -1603,6 +1671,7 @@ impl Driver<Serving> {
             warm: Warm::Admitted,
             windows: &[],
             adapters: &[],
+            chain: None,
         };
         self.extend(&shapes)?;
         let seq = match conversation.seq {
@@ -1674,10 +1743,7 @@ impl Driver<Serving> {
             });
         }
         self.check_admission(prompt, max_new)?;
-        let head = match suffix::rule_of(sampler) {
-            Some(rule) => Head::Sample(rule),
-            None => Head::Logits,
-        };
+        let head = Head::serving(sampler);
         let shapes = ServingShapes {
             layout: self.state.layout(),
             rows: &[NonZeroUsize::MIN],
@@ -1685,6 +1751,7 @@ impl Driver<Serving> {
             warm: Warm::Prompts(&[prompt.len()]),
             windows: &[],
             adapters: &[],
+            chain: None,
         };
         self.extend(&shapes)?;
         let carriable = self.carriable_in(&inputs);

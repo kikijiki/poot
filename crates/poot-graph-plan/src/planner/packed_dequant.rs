@@ -1014,7 +1014,7 @@ mod tests {
     ) -> (poot_graph_ir::Graph, usize) {
         let descriptor = PackedWeight::try_new(WeightFormat::Q8_0, [out, k]).unwrap();
         let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
-            stack_id: "experts".to_string(),
+            stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
             descriptor,
             experts,
         };

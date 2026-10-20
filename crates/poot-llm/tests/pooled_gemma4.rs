@@ -80,13 +80,9 @@ fn moe_handle() -> Arc<ModelHandle> {
         .iter()
         .find(|entry| entry.family == poot_models::gemma4::FAMILY)
         .expect("gemma4 is a shipped family");
-    let (_, make) = entry
-        .variants
-        .iter()
-        .find(|(name, _)| *name == "moe")
-        .expect("gemma4 ships a moe fixture");
+    let fixture = poot_models::test_support::family_fixtures::variant(entry.family, "moe");
     let dir = poot_test_util::unique_temp_path("pooled_gemma4");
-    write_checkpoint(&dir, &make());
+    write_checkpoint(&dir, &fixture);
     Arc::new(ModelHandle::load(&dir, &registry, &LoadOptions::default()).unwrap())
 }
 

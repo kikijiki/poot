@@ -96,9 +96,7 @@ fn write_checkpoint(dir: &Path, fixture: &Fixture, tokenizer: &Tokenizer) {
 
 /// The built-in families plus the fixture family, registered from outside the production crates.
 fn registry() -> Registry {
-    let mut registry = Registry::builtin().unwrap();
-    registry.register(ENTRY).unwrap();
-    registry
+    Registry::builtin_plus(&[ENTRY]).unwrap()
 }
 
 fn load(dir: &Path) -> Arc<ModelHandle> {
@@ -278,8 +276,36 @@ impl Executor for Counting {
     ) -> Result<StepOutputs<'_>, ExecError> {
         self.inner.step(exe, entry, inputs, sync)
     }
+    fn step_chain(
+        &mut self,
+        exe: ExecutableId,
+        steps: &[poot_executor::ChainStep<'_, '_>],
+        feed: &poot_executor::ChainFeed,
+        sync: &mut dyn HostSync,
+    ) -> Result<poot_executor::ChainOutputs<'_>, ExecError> {
+        self.inner.step_chain(exe, steps, feed, sync)
+    }
+    fn step_late(
+        &mut self,
+        exe: ExecutableId,
+        entry: EntryId,
+        inputs: &StepInputs<'_>,
+        late: &mut dyn poot_executor::LateInputs,
+        sync: &mut dyn HostSync,
+    ) -> Result<StepOutputs<'_>, ExecError> {
+        self.inner.step_late(exe, entry, inputs, late, sync)
+    }
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError> {
         self.inner.reset_state(exe, scope)
+    }
+    fn write_state_row(
+        &mut self,
+        exe: ExecutableId,
+        name: &str,
+        row: usize,
+        values: poot_tensor::HostView<'_>,
+    ) -> Result<(), ExecError> {
+        self.inner.write_state_row(exe, name, row, values)
     }
     fn remove_entry(&mut self, exe: ExecutableId, entry: EntryId) -> Result<(), ExecError> {
         self.inner.remove_entry(exe, entry)
@@ -340,6 +366,7 @@ fn contiguous(heads: &[Head]) -> ServingShapes<'_> {
         warm: Warm::Admitted,
         windows: &[],
         adapters: &[],
+        chain: None,
     }
 }
 
@@ -394,7 +421,9 @@ fn the_policy_compiles_one_window_entry_per_head_and_off_compiles_none() {
     let sampled = sampled
         .prepare(&contiguous(&[
             Head::GREEDY,
-            Head::Sample(poot_graph_ir::op::SampleRule::Gumbel),
+            Head::Sample(poot_graph_ir::ops::sampling::SampleSpec::draw(
+                poot_graph_ir::op::SampleRule::Gumbel,
+            )),
         ]))
         .unwrap();
     let sampled_off = {
@@ -403,7 +432,9 @@ fn the_policy_compiles_one_window_entry_per_head_and_off_compiles_none() {
         let off = off
             .prepare(&contiguous(&[
                 Head::GREEDY,
-                Head::Sample(poot_graph_ir::op::SampleRule::Gumbel),
+                Head::Sample(poot_graph_ir::ops::sampling::SampleSpec::draw(
+                    poot_graph_ir::op::SampleRule::Gumbel,
+                )),
             ]))
             .unwrap();
         off.prepared_entries()
@@ -660,6 +691,7 @@ fn serve(
             warm: Warm::Prompts(&[prompt.len()]),
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap_or_else(|e| panic!("{e}"));
     let compiled = driver.stats().compiles;
@@ -995,7 +1027,9 @@ fn assert_sampled_speculation_matches_the_host_replay(
 
     let mut driver = device_driver(target, executor, draft_model(draft)).serve(Layout::Contiguous);
     let mut sampler = Sampler::new(1.0, 0, 1.0, SEED);
-    let heads = [Head::Sample(poot_graph_ir::op::SampleRule::Gumbel)];
+    let heads = [Head::Sample(
+        poot_graph_ir::ops::sampling::SampleSpec::draw(poot_graph_ir::op::SampleRule::Gumbel),
+    )];
     let (served, rounds) = serve(&mut driver, &PROMPT, NEW_TOKENS, &mut sampler, &heads);
     assert_eq!(
         served, reference,
@@ -1040,10 +1074,21 @@ fn assert_rows_report_why_they_did_not_speculate(choice: BackendChoice, backend:
         .prepare(&ServingShapes {
             layout: Layout::Contiguous,
             rows: &[NonZeroUsize::MIN],
-            heads: &[Head::GREEDY, Head::Logits],
+            // The penalty row decodes one token a step through the adjusted head.
+            heads: &[
+                Head::GREEDY,
+                Head::Sample(
+                    poot_graph_ir::ops::sampling::SampleSpec::draw(
+                        poot_graph_ir::op::SampleRule::Greedy,
+                    )
+                    .adjusted(),
+                ),
+                Head::Logits,
+            ],
             warm: Warm::Admitted,
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap_or_else(|e| panic!("{e}"));
     let mut expected = SpeculationStats::default();
@@ -1254,6 +1299,7 @@ fn assert_a_window_past_the_capacity_is_refused_at_plan_time(
             warm: Warm::Admitted,
             windows: &[nz(K + 1)],
             adapters: &[],
+            chain: None,
         })
         .unwrap_or_else(|e| panic!("{e}"));
     let mut sampler = Sampler::greedy();
@@ -1344,7 +1390,9 @@ fn assert_sampled_prompt_lookup_matches_the_host_replay(
     };
     let mut driver = device_driver(target, executor, policy).serve(Layout::Contiguous);
     let mut sampler = Sampler::new(COLD, 0, 1.0, SEED);
-    let heads = [Head::Sample(poot_graph_ir::op::SampleRule::Gumbel)];
+    let heads = [Head::Sample(
+        poot_graph_ir::ops::sampling::SampleSpec::draw(poot_graph_ir::op::SampleRule::Gumbel),
+    )];
     let (served, rounds) = serve(&mut driver, &prompt, NEW_TOKENS, &mut sampler, &heads);
     assert_eq!(
         served, reference,
@@ -1408,6 +1456,7 @@ fn serve_paged(
             warm: Warm::Admitted,
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap_or_else(|e| panic!("{e}"));
     let compiled = driver.stats().compiles;
@@ -1583,7 +1632,9 @@ fn assert_paged_mixed_draft_rows_match(choice: BackendChoice, backend: DeviceBac
     // Rows of different rules in one step pick on the host, from the logits entry.
     let heads = [
         Head::GREEDY,
-        Head::Sample(poot_graph_ir::op::SampleRule::Gumbel),
+        Head::Sample(poot_graph_ir::ops::sampling::SampleSpec::draw(
+            poot_graph_ir::op::SampleRule::Gumbel,
+        )),
         Head::Logits,
     ];
     let served = serve_paged(driver, rows, NEW_TOKENS, &heads);

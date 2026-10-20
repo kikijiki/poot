@@ -1024,7 +1024,7 @@ fn the_traced_mtp_chain_over_the_carry_equals_the_from_scratch_chain_for_k_3() {
 
 /// The layer's step needs the carry it reads: a `draft` shape that names none is a typed
 /// refusal before any graph is built, and a carry narrower than the step's tokens is the carry's own
-/// refusal. Mutation: drop the `DraftWithoutCarry` return in `check_draft_step`; the shape traces the
+/// refusal. Mutation: drop the `DraftWithoutCarry` return in `<dyn Model>::trace`; the shape traces the
 /// layer over a carry that does not exist (or panics at the `expect`) and the row goes red.
 #[test]
 fn an_mtp_step_without_a_carry_or_with_a_narrow_one_is_a_typed_refusal() {
@@ -1120,7 +1120,7 @@ fn every_other_family_refuses_the_draft_program_typed() {
         if entry.family == FAMILY {
             continue;
         }
-        let fx = (entry.fixture)();
+        let fx = crate::test_support::family_fixtures::base(entry.family);
         let model = build(entry, &fx.raw(), &fx.store);
         match model.trace(
             &StepSpec::draft(step),

@@ -63,10 +63,10 @@ suffix and the carried inputs they bind, so a token, a position or a sampler par
 so do the rest: `Driver::encode` runs an `encode` step (a BERT encoder's embeddings and reranking, a decoder's
 hidden states, a vision tower's frames). Token-row shapes are prepared up front by `Driver::prepare_encode` and a step never compiles one; a vision tower's frames still prepare on first use, and a prompt can supply values for the inputs its model declares, such as embedding rows in place of some tokens'
 (`Driver::generate_with_inputs`), which is how the vision-language caption path scatters its image rows. Those
-rows and a frame's pixels are bound by value, never baked into a program. Greedy and plain-temperature generation (including top-k/top-p/min-p)
-pick the next token on-device: a sampling step is appended to the decode graph itself, and the host
-reads back only the chosen token id and a non-finite flag, not the full logits. A request with logit-bias/penalty, logprob recording, or a guided-decoding constraint still reads the full logits
-back and picks on the host, since those transforms are host-side. `poot-serve` runs the driver in one scheduling loop that admits requests into
+rows and a frame's pixels are bound by value, never baked into a program. Generation picks the next token on-device for every request, including logit bias,
+penalties, logprobs and guided masks: a sampling step is appended to the decode graph itself, and the
+host reads back only the chosen token id, a non-finite flag and any top-n logprob alternatives, not the
+full logits. `poot-serve` runs the driver in one scheduling loop that admits requests into
 slots and fits the KV cache to the device ([Continuous batching](../serve/continuous-batching.md)).
 
 ## Failure handling

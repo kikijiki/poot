@@ -1511,6 +1511,7 @@ mod tests {
             warm: Warm::Prompts(&[2]),
             windows: &[],
             adapters: &[],
+            chain: None,
         };
         let plan = |pool: Option<usize>| {
             let mut planner =

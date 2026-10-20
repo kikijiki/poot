@@ -42,46 +42,34 @@
 //! Structural template: `crate::architectures::bloom`. Primitive composition only (AGENTS.md): every op is an existing
 //! `poot_graph_ir::ops` composition (`layernorm_no_bias`/`linear`/`attention_masked`/`attention_prefill`).
 
-use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-
 use poot_graph_ir::rope_table::RopeFlavor;
-use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{AttnRole, FfnRole, NormRole, WeightMap, WeightRole, WeightStore};
 
-use crate::components::attention::{AttentionParams, AttentionWeights, attention};
+use crate::components::attention::AttentionParams;
 use crate::components::dims::{Field, Fields};
-use crate::components::ffn::{Gelu, PlainMlpWeights, plain_mlp};
-use crate::components::linear::WeightError;
+use crate::components::ffn::Gelu;
 use crate::components::norm::{NormKind, NormParams};
 use crate::components::rope::RopeParams;
-use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    decoder_program, standard_layer, standard_stack,
-};
-use crate::io::ModelSchema;
-use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
+use crate::components::standard::{LayerParams, StackParams};
+use crate::model::{ConfigReason, FamilyKey, ModelError};
 use crate::names::gguf::GGUF_MPT;
 use crate::names::{FusedDims, FusedPart, NameRow, Presence, Source, family_weights_fused};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
+use std::sync::Arc;
 
-// The `mpt` family behind [`Model`]: bias-free LayerNorm blocks, ALiBi attention over a fused
-// contiguous `Wqkv`, and a plain exact-GELU MLP, in the standard stack and layer.
+use crate::components::standard_family::{
+    LayerNormKind, Mlp, StandardFamily, StandardParams, entry,
+};
+
+// The `mpt` family: bias-free LayerNorm blocks, ALiBi attention over a fused contiguous `Wqkv`, and a
+// plain exact-GELU MLP, in the standard stack and layer.
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("mpt");
 
-pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
-    family: FAMILY,
-    keys: &[
-        (ConfigSource::HfModelType, "mpt"),
-        (ConfigSource::GgufArchitecture, "mpt"),
-    ],
-    build,
-    fixture,
-    variants: &[],
-};
+pub(crate) const ENTRY: FamilyEntry = entry::<Mpt>();
 
 const WIDTH: Field = Field::new("d_model", "mpt.embedding_length");
 const HEADS: Field = Field::new("n_heads", "mpt.attention.head_count");
@@ -160,21 +148,6 @@ const fn row_norm(role: NormRole, suffix: &'static str) -> NameRow {
 /// A GGUF tensor of a learned-position MPT, which this ALiBi family does not carry.
 const GGUF_POSITIONS: &str = "position_embd.weight";
 
-/// mpt's typed config: every value checked once, here, so tracing cannot fail on it.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct MptParams {
-    vocab: usize,
-    width: usize,
-    inter: usize,
-    layers: usize,
-    max_positions: usize,
-    attention: AttentionParams,
-    layer: LayerParams,
-    stack: StackParams,
-    eos: BTreeSet<u32>,
-    bos: Option<u32>,
-}
-
 /// An `attn_config` entry, when the HF config sets it to something other than `null`.
 fn attn_config<'a>(raw: &'a RawConfig<'_>, key: &str) -> Option<&'a serde_json::Value> {
     match raw {
@@ -186,8 +159,16 @@ fn attn_config<'a>(raw: &'a RawConfig<'_>, key: &str) -> Option<&'a serde_json::
     }
 }
 
-impl MptParams {
-    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+pub(crate) struct Mpt;
+
+impl StandardFamily for Mpt {
+    const FAMILY: FamilyKey = FAMILY;
+    const KEYS: &'static [(ConfigSource, &'static str)] = &[
+        (ConfigSource::HfModelType, "mpt"),
+        (ConfigSource::GgufArchitecture, "mpt"),
+    ];
+
+    fn configure(raw: &RawConfig<'_>) -> Result<StandardParams, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let unsupported = |field| fields.error(field, ConfigReason::Unsupported);
         // This family is the bias-free, ALiBi, plain-MHA MPT every public checkpoint is.
@@ -260,131 +241,66 @@ impl MptParams {
         let attention = AttentionParams::new(heads, heads, head_dim, false, rope)
             .map_err(param)?
             .with_alibi();
-        Ok(Self {
+        Ok(StandardParams {
             vocab,
             width,
-            inter,
             layers,
             max_positions,
-            attention,
+            attention: vec![attention; layers],
+            mlp: vec![
+                Mlp::Plain {
+                    inter,
+                    act: Gelu::Erf,
+                    biased: false
+                };
+                layers
+            ],
             layer: LayerParams::new(norm),
             stack: StackParams::new(norm),
+            norms: LayerNormKind::Scale,
+            final_norm_bias: false,
+            embed_norm: false,
+            head_required: false,
             eos: fields.eos(Some(0))?,
             bos: fields.bos()?,
+            prompt_bos: None,
+            chat: ChatFormat::ChatML,
+            tool_codec: Some(Arc::new(HermesToolCodec)),
+            embeddable: false,
         })
     }
-}
 
-#[derive(Debug)]
-struct Layer {
-    norms: LayerNorms,
-    attn: AttentionWeights,
-    ffn: PlainMlpWeights,
-}
-
-#[derive(Debug)]
-pub(crate) struct Mpt {
-    params: MptParams,
-    weights: WeightMap,
-    stack: StackWeights,
-    layers: Vec<Layer>,
-    config: ModelConfig,
-    schema: ModelSchema,
-}
-
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    let p = MptParams::from_raw(raw)?;
-    let rows = match raw.source() {
-        ConfigSource::HfModelType => HF_ROWS,
-        ConfigSource::GgufArchitecture => {
-            if store.contains(GGUF_POSITIONS) {
-                return Err(ModelError::Config {
-                    family: FAMILY,
-                    field: GGUF_POSITIONS,
-                    reason: ConfigReason::Unsupported,
-                });
+    fn weights(
+        raw: &RawConfig<'_>,
+        store: &WeightStore,
+        params: &mut StandardParams,
+    ) -> Result<WeightMap, ModelError> {
+        let rows = match raw.source() {
+            ConfigSource::HfModelType => HF_ROWS,
+            ConfigSource::GgufArchitecture => {
+                if store.contains(GGUF_POSITIONS) {
+                    return Err(ModelError::Config {
+                        family: FAMILY,
+                        field: GGUF_POSITIONS,
+                        reason: ConfigReason::Unsupported,
+                    });
+                }
+                GGUF_MPT
             }
-            GGUF_MPT
-        }
-    };
-    let h = p.width;
-    let fused = FusedDims {
-        q: h,
-        kv: h,
-        inter: 0,
-    };
-    let weights = family_weights_fused(FAMILY, store, &[rows], p.layers, false, fused)?;
-    let weight_error = |e: WeightError| e.for_family(FAMILY);
-    let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
-    let layers = (0..p.layers)
-        .map(|l| {
-            Ok(Layer {
-                norms: LayerNorms::new(&weights, l, p.width)?,
-                attn: AttentionWeights::new(&weights, l, p.width, &p.attention)?,
-                ffn: PlainMlpWeights::new(&weights, l, p.width, p.inter, false)?,
-            })
-        })
-        .collect::<Result<Vec<_>, WeightError>>()
-        .map_err(weight_error)?;
-    let schema = ModelSchema::builder()
-        .step(decoder_program(p.vocab))
-        .build_for(FAMILY)?;
-    let config = ModelConfig {
-        family: FAMILY,
-        vocab: p.vocab,
-        max_positions: p.max_positions,
-        eos: p.eos.clone(),
-        bos: p.bos,
-        prompt_bos: None,
-        prefill_granule: NonZeroUsize::MIN,
-        chat: ChatFormat::ChatML,
-        tool_codec: Some(Arc::new(HermesToolCodec)),
-    };
-    Ok(ModelParts::new(Box::new(Mpt {
-        params: p,
-        weights,
-        stack,
-        layers,
-        config,
-        schema,
-    })))
-}
-
-impl Model for Mpt {
-    fn config(&self) -> &ModelConfig {
-        &self.config
-    }
-
-    fn schema(&self) -> &ModelSchema {
-        &self.schema
-    }
-
-    fn weights(&self) -> &WeightMap {
-        &self.weights
-    }
-
-    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
-        let p = &self.params;
-        let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        let step = Step::new(&b, shape)?;
-        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
-            let layer = &self.layers[l];
-            standard_layer(
-                b,
-                x,
-                &layer.norms,
-                &p.layer,
-                |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
-                |b, BlockInput { block: h, .. }| plain_mlp(b, h, &layer.ffn, Gelu::Erf),
-            )
-        })?;
-        Ok(step.finish(b, logits)?)
+        };
+        let h = params.width;
+        let fused = FusedDims {
+            q: h,
+            kv: h,
+            inter: 0,
+        };
+        family_weights_fused(FAMILY, store, &[rows], params.layers, false, fused)
     }
 }
 
 /// The fixture's config: a tiny MPT whose projection widths are multiples of 32 (so a Q8_0 copy of
 /// its store is a valid checkpoint too).
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "mpt",
@@ -403,6 +319,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 }
 
 /// The `[out, in]` (or `[n]`) shape of every tensor an MPT checkpoint with `config`'s dims carries.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
     let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (vocab, h) = (n("vocab_size"), n("d_model"));
@@ -427,7 +344,8 @@ pub(crate) fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usi
     shapes
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = fixture_shapes(&config);
     Fixture::bf16(config, shapes)
@@ -446,7 +364,9 @@ mod family_tests {
         assert_missing_weight_is_named, build as built, close, close_all, f32_entry, gguf_tensor,
         q8_0_store, read_back_owned, values,
     };
+    use crate::model::Model;
     use crate::registry::Registry;
+    use std::collections::BTreeSet;
 
     const VOCAB: usize = 48;
     const H: usize = 64;
@@ -511,7 +431,7 @@ mod family_tests {
             generation: None,
             preprocessor: None,
         };
-        match build(&raw, &fixture().store) {
+        match (ENTRY.build)(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
             other => panic!("{config}: expected a config error, got {other:?}"),
         }
@@ -588,7 +508,7 @@ mod family_tests {
             BTreeSet::from([0])
         );
         config.as_object_mut().unwrap().remove("expansion_ratio");
-        match build(
+        match (ENTRY.build)(
             &RawConfig::HfJson {
                 config: &config,
                 generation: None,
@@ -696,7 +616,7 @@ mod family_tests {
         with_positions
             .insert(GGUF_POSITIONS, f32_entry(vec![4, 4], &[0.0; 16]))
             .unwrap();
-        match build(&RawConfig::Gguf(&index), &with_positions.build()) {
+        match (ENTRY.build)(&RawConfig::Gguf(&index), &with_positions.build()) {
             Err(ModelError::Config { field, reason, .. }) => {
                 assert_eq!((field, reason), (GGUF_POSITIONS, ConfigReason::Unsupported));
             }

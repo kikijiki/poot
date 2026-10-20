@@ -82,7 +82,7 @@ fn run_moe(exec: &mut dyn Executor, target: Target, out: usize, k: usize) -> (Ve
         })
         .collect();
     let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
-        stack_id: "experts".to_string(),
+        stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
         descriptor: owners[0].weight(),
         experts: EXPERTS,
     };
@@ -107,7 +107,10 @@ fn run_moe(exec: &mut dyn Executor, target: Target, out: usize, k: usize) -> (Ve
     for (ordinal, owner) in owners.iter().enumerate() {
         store
             .insert(
-                format!("experts.{ordinal}"),
+                format!(
+                    "{}.{ordinal}",
+                    poot_graph_ir::test_support::packed_graphs::TEST_STACK.const_name()
+                ),
                 WeightEntry::Packed(Arc::clone(owner)),
             )
             .unwrap();

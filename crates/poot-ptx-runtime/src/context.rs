@@ -133,6 +133,7 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
         known_miscompiles: poot_target::DeviceCaps::ptx_default().known_miscompiles,
         compute_units: attrs.multiprocessor_count,
         memory_budget_bytes: Some(total_memory),
+        dram_channels: None,
     }
 }
 

@@ -65,11 +65,12 @@ Prefill and decode are one body. The step's token and position inputs are typed 
 positions, so a prefill is a step that continues from a position, and a decode is the same graph with one
 new token.
 
-**Adding a model is writing a graph.** A family is a config type parsed from the checkpoint, a table
-mapping weight names to `(layer, role)`, a fixture, and a tracer over shared components. KV layout,
+**Adding a model is writing a graph.** A family is a config reader for the checkpoint, a table
+mapping weight names to `(layer, role)`, and, when its layers are not of the standard shape, a tracer over
+shared components; a standard decoder gets its tracer from the shared wrapper. KV layout,
 batching, paging, weight format and device limits are not the tracer's business: they are binding
 choices, graph transforms or planner legalization, and nothing in the driver, the planner or an executor
-changes when a family is added. The family is registered in the model registry, which is how the driver finds it.
+changes when a family is added. The family has one row in the registry's `SHIPPED` slice, which is how the driver finds it.
 
 ## How the tracer records eqns
 

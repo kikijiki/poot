@@ -42,7 +42,7 @@ use poot_llm::driver::{
     RowResult, RowSpeculation, RowWork, SeqId, SeqRequest, Serving, ServingShapes, State, StepRow,
     Unprepared, Warm, open_executor, program_retention,
 };
-use poot_models::components::standard::{Step, check_step};
+use poot_models::components::standard::Step;
 use poot_models::io::{ModelSchema, ProgramId, ProgramSpec, StateSpec};
 use poot_models::model::{
     FamilyKey, HiddenCarry, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
@@ -111,7 +111,10 @@ fn write_checkpoint(dir: &Path, fixture: &Fixture) {
 /// A family's shipped fixture checkpoint, loaded.
 fn fixture_handle(family: FamilyKey) -> (Arc<ModelHandle>, poot_test_util::UniqueTempPath) {
     let dir = poot_test_util::unique_temp_path("speculate_recurrent");
-    write_checkpoint(&dir, &(entry(family).fixture)());
+    write_checkpoint(
+        &dir,
+        &poot_models::test_support::family_fixtures::base(entry(family).family),
+    );
     let handle =
         ModelHandle::load(&dir, &Registry::builtin().unwrap(), &LoadOptions::default()).unwrap();
     (Arc::new(handle), dir)
@@ -156,8 +159,6 @@ const RECURRENT_ENTRY: FamilyEntry = FamilyEntry {
     family: RECURRENT,
     keys: &[(ConfigSource::HfModelType, "poot_fixture_recurrentish")],
     build: build_recurrent,
-    fixture: recurrent_fixture,
-    variants: &[],
 };
 
 /// One `StateRole::Recurrent` state folded with every token. Its prefill granule is the config's
@@ -196,10 +197,6 @@ fn build_recurrent(raw: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, M
     })))
 }
 
-fn recurrent_fixture() -> Fixture {
-    recurrent_fixture_with(1)
-}
-
 fn recurrent_fixture_with(granule: usize) -> Fixture {
     let mut store = WeightStore::builder();
     let dummy = DenseWeight::try_new(DType::BF16, vec![1], vec![0u8, 0].into()).unwrap();
@@ -233,7 +230,6 @@ impl Model for Recurrentish {
 
     fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
         let shape = spec.shape;
-        check_step(RECURRENT, shape, self.config.max_positions)?;
         let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let first = if shape.logits == LogitRows::All {
@@ -280,10 +276,7 @@ fn recurrent_handle(granule: usize) -> (Arc<ModelHandle>, poot_test_util::Unique
 
 /// The built-in families, the recurrent fake and the dense add-a-model fixture family.
 fn fake_registry() -> Registry {
-    let mut registry = Registry::builtin().unwrap();
-    registry.register(RECURRENT_ENTRY).unwrap();
-    registry.register(family::ENTRY).unwrap();
-    registry
+    Registry::builtin_plus(&[RECURRENT_ENTRY, family::ENTRY]).unwrap()
 }
 
 /// The dense add-a-model fixture, loaded with the same tokenizer and vocabulary as the fakes.
@@ -396,6 +389,7 @@ fn contiguous() -> ServingShapes<'static> {
         warm: Warm::Admitted,
         windows: &[],
         adapters: &[],
+        chain: None,
     }
 }
 
@@ -584,6 +578,7 @@ fn serve(
             warm: Warm::Prompts(&[prompt.len()]),
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap_or_else(|e| panic!("{e}"));
     let compiled = driver.stats().compiles;
@@ -805,6 +800,25 @@ impl Probed {
     }
 }
 
+impl Probed {
+    /// Read the armed recurrent state before the step the driver is about to issue.
+    fn read_armed(&mut self, exe: ExecutableId) -> Result<(), ExecError> {
+        let armed = std::mem::take(&mut self.shared.borrow_mut().armed);
+        if !armed.is_empty() && self.shared.borrow().exe == Some(exe) {
+            let mut read = Vec::with_capacity(armed.len());
+            for (name, aval) in &armed {
+                let probe = self.probe_entry(exe, name, aval)?;
+                let mut outputs = self
+                    .inner
+                    .step(exe, probe, &StepInputs::new(), &mut NoSync)?;
+                read.push(outputs.to_host()?);
+            }
+            self.shared.borrow_mut().read = read;
+        }
+        Ok(())
+    }
+}
+
 impl Executor for Probed {
     fn target_set(&self) -> TargetSet {
         self.inner.target_set()
@@ -835,22 +849,40 @@ impl Executor for Probed {
         inputs: &StepInputs<'_>,
         sync: &mut dyn HostSync,
     ) -> Result<StepOutputs<'_>, ExecError> {
-        let armed = std::mem::take(&mut self.shared.borrow_mut().armed);
-        if !armed.is_empty() && self.shared.borrow().exe == Some(exe) {
-            let mut read = Vec::with_capacity(armed.len());
-            for (name, aval) in &armed {
-                let probe = self.probe_entry(exe, name, aval)?;
-                let mut outputs = self
-                    .inner
-                    .step(exe, probe, &StepInputs::new(), &mut NoSync)?;
-                read.push(outputs.to_host()?);
-            }
-            self.shared.borrow_mut().read = read;
-        }
+        self.read_armed(exe)?;
         self.inner.step(exe, entry, inputs, sync)
+    }
+    fn step_chain(
+        &mut self,
+        exe: ExecutableId,
+        steps: &[poot_executor::ChainStep<'_, '_>],
+        feed: &poot_executor::ChainFeed,
+        sync: &mut dyn HostSync,
+    ) -> Result<poot_executor::ChainOutputs<'_>, ExecError> {
+        self.inner.step_chain(exe, steps, feed, sync)
+    }
+    fn step_late(
+        &mut self,
+        exe: ExecutableId,
+        entry: EntryId,
+        inputs: &StepInputs<'_>,
+        late: &mut dyn poot_executor::LateInputs,
+        sync: &mut dyn HostSync,
+    ) -> Result<StepOutputs<'_>, ExecError> {
+        self.read_armed(exe)?;
+        self.inner.step_late(exe, entry, inputs, late, sync)
     }
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError> {
         self.inner.reset_state(exe, scope)
+    }
+    fn write_state_row(
+        &mut self,
+        exe: ExecutableId,
+        name: &str,
+        row: usize,
+        values: poot_tensor::HostView<'_>,
+    ) -> Result<(), ExecError> {
+        self.inner.write_state_row(exe, name, row, values)
     }
     fn remove_entry(&mut self, exe: ExecutableId, entry: EntryId) -> Result<(), ExecError> {
         self.inner.remove_entry(exe, entry)
@@ -910,7 +942,7 @@ fn probe_schema(
     kv: KvLayout,
     hidden: Option<NonZeroUsize>,
 ) -> Vec<(String, TensorType)> {
-    let fixture = (entry(family).fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry(family).family);
     let model = (entry(family).build)(&fixture.raw(), &fixture.store).unwrap();
     let graph = model
         .model
@@ -1011,6 +1043,7 @@ fn prepare_for(probing: Probing, prompt_len: usize) -> Probing<Serving> {
         warm: Warm::Prompts(&[prompt_len]),
         windows: &[],
         adapters: &[],
+        chain: None,
     })
 }
 
@@ -1243,6 +1276,7 @@ fn paged_probing_driver(
         warm: Warm::Prompts(&lens),
         windows: &[],
         adapters: &[],
+        chain: None,
     }))
 }
 
@@ -1417,7 +1451,7 @@ fn a_partial_row_leaves_a_full_accept_row_alone_on_mamba2_ptx() {
 /// state its first `i` tokens built.
 fn oracle_rows(family: FamilyKey, tokens: &[u32]) -> Vec<Vec<f32>> {
     let n = tokens.len();
-    let fixture = (entry(family).fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry(family).family);
     let model = (entry(family).build)(&fixture.raw(), &fixture.store).unwrap();
     let shape = StepShape::new(NonZeroUsize::MIN, nz(n), nz(CAPACITY)).with_logits(LogitRows::All);
     let graph = model
@@ -1534,7 +1568,9 @@ fn assert_sampled_lookup_matches_the_host_replay(
         "the replay has no round that restores: the prompt proves nothing"
     );
     let mut sampler = Sampler::new(1.0, 0, 1.0, SEED);
-    let heads = [Head::Sample(poot_graph_ir::op::SampleRule::Gumbel)];
+    let heads = [Head::Sample(
+        poot_graph_ir::ops::sampling::SampleSpec::draw(poot_graph_ir::op::SampleRule::Gumbel),
+    )];
     let served = serve(
         &mut driver,
         &SAMPLED_PROMPT,
@@ -1757,7 +1793,7 @@ fn recurrent_rollback_cost_on_mamba2_ptx() {
 #[test]
 fn shadow_state_share_of_the_state_budget() {
     for (label, family) in FAMILIES {
-        let fixture = (entry(family).fixture)();
+        let fixture = poot_models::test_support::family_fixtures::base(entry(family).family);
         let model = (entry(family).build)(&fixture.raw(), &fixture.store).unwrap();
         let bytes =
             |t: &TensorType| (t.shape.iter().product::<usize>() * t.dtype.byte_size()) as u64;

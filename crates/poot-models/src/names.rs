@@ -346,6 +346,7 @@ pub(crate) const HF_SINK_ATTENTION: &[NameRow] = &[
 
 /// The `[out, in]` (or `[n]`) shape of every [`HF_BASE`] tensor a checkpoint with `config`'s HF dims
 /// carries (the QKV biases when `qkv_bias`), by its HF name: what a family's test fixture holds.
+#[cfg(feature = "test-support")]
 pub(crate) fn hf_base_shapes(
     config: &serde_json::Value,
     qkv_bias: bool,
@@ -688,6 +689,135 @@ fn build_map(
         }
     }
     Ok(map.build())
+}
+
+/// The key of linear `stem` in `store`: `{stem}.weight` unless only the packed `{stem}` is stored.
+pub(crate) fn linear_key(store: &WeightStore, stem: &str) -> String {
+    let dense = format!("{stem}.weight");
+    if store.contains(&dense) || !store.contains(stem) {
+        dense
+    } else {
+        stem.to_string()
+    }
+}
+
+/// The weight map of a family that names its tensors in code (hybrid and latent-attention families whose
+/// layers do not fit a [`NameRow`] table): the map builder, the store it reads, and one method per way a
+/// tensor is named. Every such family builds its map through this, so the missing-tensor error, the packed
+/// spelling of a linear and the tied head are written once.
+pub(crate) struct TensorRows<'s> {
+    family: FamilyKey,
+    pub(crate) map: WeightMapBuilder<'s>,
+    pub(crate) store: &'s WeightStore,
+}
+
+impl<'s> TensorRows<'s> {
+    /// An empty map over `store`, whose errors name `family`.
+    pub(crate) fn new(family: FamilyKey, store: &'s WeightStore) -> Self {
+        Self {
+            family,
+            map: WeightMap::builder(store),
+            store,
+        }
+    }
+
+    /// The model error for a map failure: a value outside its declared range is the weight's own
+    /// error, anything else the family's weight error.
+    pub(crate) fn error(&self, source: WeightMapError) -> ModelError {
+        match source {
+            WeightMapError::IndexOutOfRange {
+                id, index, value, ..
+            } => ModelError::WeightValue {
+                family: self.family,
+                id,
+                index,
+                value,
+            },
+            source => ModelError::Weight {
+                family: self.family,
+                source,
+            },
+        }
+    }
+
+    /// The typed missing-weight error naming `id` and the `key` the store lacks.
+    pub(crate) fn missing(&self, id: WeightId, key: String) -> ModelError {
+        self.error(WeightMapError::Missing {
+            id,
+            key: WeightKey::from(key),
+        })
+    }
+
+    /// Map `id` to `view`.
+    pub(crate) fn add(&mut self, id: WeightId, view: WeightView) -> Result<(), ModelError> {
+        self.map
+            .map(id, view)
+            .map(|_| ())
+            .map_err(|source| self.error(source))
+    }
+
+    /// Map `id` onto the stored tensor `key`; a key the store lacks is the map's own typed refusal.
+    pub(crate) fn put(&mut self, id: WeightId, key: String) -> Result<(), ModelError> {
+        self.add(id, WeightView::Stored(WeightKey::from(key)))
+    }
+
+    /// The tensor stored under exactly `key`.
+    pub(crate) fn tensor(
+        &mut self,
+        role: WeightRole,
+        layer: Option<usize>,
+        key: String,
+    ) -> Result<(), ModelError> {
+        let id = WeightId { layer, role };
+        if !self.store.contains(&key) {
+            return Err(self.missing(id, key));
+        }
+        self.add(id, WeightView::Stored(WeightKey::from(key)))
+    }
+
+    /// The linear projection with stem `stem`: `{stem}.weight` dense, else the packed `{stem}`.
+    pub(crate) fn linear(
+        &mut self,
+        role: WeightRole,
+        layer: Option<usize>,
+        stem: &str,
+    ) -> Result<(), ModelError> {
+        let id = WeightId { layer, role };
+        let key = self.linear_key(stem);
+        if !self.store.contains(&key) {
+            return Err(self.missing(id, key));
+        }
+        self.add(id, WeightView::Stored(WeightKey::from(key)))
+    }
+
+    /// The key of linear `stem`: its dense spelling unless only the packed one is stored.
+    pub(crate) fn linear_key(&self, stem: &str) -> String {
+        linear_key(self.store, stem)
+    }
+
+    /// The head: the linear `head_stem` when the store holds one, else (when the checkpoint does not
+    /// require its own) the embedding's tensor `embed`, which a tied head reads as its own map entry.
+    pub(crate) fn head(
+        &mut self,
+        embed: &str,
+        head_stem: &str,
+        required: bool,
+    ) -> Result<(), ModelError> {
+        let head = WeightId::model(WeightRole::Head);
+        let key = self.linear_key(head_stem);
+        if self.store.contains(&key) {
+            self.add(head, WeightView::Stored(WeightKey::from(key)))
+        } else if required {
+            Err(self.missing(head, key))
+        } else {
+            self.add(head, WeightView::Stored(WeightKey::from(embed)))
+        }
+    }
+
+    /// The finished map.
+    pub(crate) fn finish(self) -> WeightMap {
+        self.map.build()
+    }
 }
 
 #[cfg(test)]

@@ -45,7 +45,7 @@ matmul	883d9902703ac7db
 contraction_epilogue	e5bfe64acdc39f72
 pack_i8	728bef064ec9ff8c
 pack_i8 exact i32 (words only)	728bef064ec9ff8c
-random_uniform	6c5b1dcd6be2e0ef
+random_uniform	9de26ddac4756aa1
 reduce sum	930b6c43910d2d40
 reshape	6614b4737724d95d
 reshape f16 (legitimately narrowed)	6cf78079089ff22c

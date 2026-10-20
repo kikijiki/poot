@@ -87,8 +87,7 @@ fn options() -> DriverOptions {
 fn profiled_generation(executor: Box<dyn poot_executor::Executor>) -> (Vec<u32>, WindowReport) {
     let dir = poot_test_util::unique_temp_path("timed_executor");
     write_checkpoint(&dir, &family::fixture());
-    let mut registry = Registry::builtin().unwrap();
-    registry.register(family::ENTRY).unwrap();
+    let registry = Registry::builtin_plus(&[family::ENTRY]).unwrap();
     let handle = Arc::new(ModelHandle::load(&dir, &registry, &LoadOptions::default()).unwrap());
     let driver = Driver::new(handle, executor, options()).unwrap();
     let prompt = vec![1, 2, 3, 4];
@@ -100,6 +99,7 @@ fn profiled_generation(executor: Box<dyn poot_executor::Executor>) -> (Vec<u32>,
             warm: Warm::Prompts(&[prompt.len()]),
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap();
     let mark = driver.executor_stats().timing.mark();

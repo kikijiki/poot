@@ -23,7 +23,7 @@ use std::sync::Arc;
 use poot_graph_ir::{BinOp, Builder, Graph, TensorType, UnOp};
 use poot_graph_plan::{CompileError, LegalizeError, Target, compile};
 use poot_models::model::{LogitRows, StepSpec};
-use poot_models::registry::{ConfigSource, FamilyEntry, Registry};
+use poot_models::registry::Registry;
 use poot_quant::format::{GroupMap, ScaleEncoding, WeightFormat};
 use poot_quant::weights::{WeightEntry, WeightStore};
 use poot_target::aie::RegionLimits;
@@ -346,7 +346,7 @@ struct Feature {
     exercised_by: fn(binary: &str, test: &str) -> bool,
 }
 
-fn features() -> [Feature; 10] {
+fn features() -> [Feature; 11] {
     [
         Feature {
             name: "Served models and server startup (`poot-serve`)",
@@ -389,6 +389,10 @@ fn features() -> [Feature; 10] {
         Feature {
             name: "Embeddings and prompt embeds",
             exercised_by: |_, test| test.contains("embed"),
+        },
+        Feature {
+            name: "Planning against the attached device's own limits",
+            exercised_by: |_, test| test.contains("attached_device"),
         },
     ]
 }
@@ -582,8 +586,7 @@ fn families_table(registry: &Registry, targets: &[RefTarget]) -> String {
     writeln!(
         out,
         "Every registered family's fixture graphs (decode and prefill for a decoder, one forward for an \
-         encoder) compiled for each target at the fixture's small dimensions. A family joins this table by \
-         being registered with a fixture.\n"
+         encoder) compiled for each target at the fixture's small dimensions. A family joins this table by having a row in the registry's `SHIPPED` slice and a checkpoint in the fixture table.\n"
     )
     .unwrap();
     out.push_str(&header("Family", targets));
@@ -1274,31 +1277,20 @@ fn the_latest_run_per_family_and_backend_is_the_measured_row() {
     );
 }
 
-/// S6: registering a family with a fixture adds its matrix row with no edit to the generator. Mutation:
-/// hard-code the family list in `corpus.rs`: the clone has no row.
+/// S6: every shipped family has a matrix row, with no edit to the generator: it walks the registry
+/// and the fixture table. Mutation: hard-code the family list in `corpus.rs`: a family it does not
+/// list has no row.
 #[test]
-fn a_registered_family_adds_a_row_with_no_generator_edit() {
-    let mut registry = registry();
-    let qwen2 = registry
-        .entries()
-        .iter()
-        .find(|e| e.family.as_str() == "qwen2")
-        .copied()
-        .expect("qwen2 is registered");
-    let clone = FamilyEntry {
-        family: poot_models::model::FamilyKey::new("poot_fixture_clone"),
-        keys: &[(ConfigSource::HfModelType, "poot_fixture_clone")],
-        ..qwen2
-    };
-    registry
-        .register(clone)
-        .expect("a new family key registers");
-
+fn every_shipped_family_has_a_row_with_no_generator_edit() {
+    let registry = registry();
     let rendered = families_table(&registry, &reference_targets()[..1]);
-    assert!(
-        rendered.contains("`poot_fixture_clone`"),
-        "the new family has a row:\n{rendered}"
-    );
+    for entry in registry.entries() {
+        assert!(
+            rendered.contains(&format!("`{}`", entry.family.as_str())),
+            "{} has no row:\n{rendered}",
+            entry.family
+        );
+    }
 }
 
 /// The generator names no card number in what it writes (site-check checks the page; this checks the
@@ -1309,4 +1301,23 @@ fn the_rendered_region_names_no_card_number() {
     assert_no_card_numbers(&rendered);
     let result = std::panic::catch_unwind(|| assert_no_card_numbers("| a | see Card 577 |"));
     assert!(result.is_err(), "a card number is caught");
+}
+
+/// POOT-1293: every device lane requires a case that plans against the caps its attached device
+/// reported, so the preset caps the matrix compiles against are not the only caps a lane's refusal is
+/// checked on. Mutation: delete a lane's `attached_device_limit_*` line from
+/// `scripts/required-device-cases/<lane>.txt`: that column reads `No case` and this test names it.
+#[test]
+fn every_device_lane_requires_planning_against_its_attached_device() {
+    let lanes = lane_cases();
+    let feature = features()
+        .into_iter()
+        .find(|f| f.name.starts_with("Planning against the attached device"))
+        .expect("a listed feature");
+    for column in ["wgpu", "ROCm", "PTX"] {
+        assert!(
+            lanes.count(column, &feature) > 0,
+            "the {column} lane requires no case that plans against its attached device's caps"
+        );
+    }
 }

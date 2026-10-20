@@ -215,39 +215,45 @@ fn stop_list_truncates_unbounded_stop_array_to_cap() {
 
 #[test]
 fn sampler_of_applies_adjusters_on_both_greedy_and_temperature_paths() {
-    // The API->engine mapping (`sampler_of`) must apply penalties / logit_bias on both the greedy (temperature<=0) and temperature bases. A greedy request with a penalty/bias must be non-greedy so it takes the host readback path (where the adjuster reshapes the argmax) instead of the on-device argmax that ignores it.
+    // The API->engine mapping (`sampler_of`) must apply penalties / logit_bias on both the greedy
+    // (temperature<=0) and temperature bases. The adjusted device head applies them, so a request with one
+    // asks for it, whatever its draw.
+    use poot_graph_ir::op::SampleRule;
+    use poot_graph_ir::ops::sampling::Adjust;
     let greedy_penalty: CompletionReq =
         serde_json::from_str(r#"{"prompt":"x","temperature":0.0,"repetition_penalty":1.2}"#)
             .unwrap();
+    let s = sampler_of(&greedy_penalty.sampling);
     assert!(
-        !sampler_of(&greedy_penalty.sampling).is_greedy(),
-        "greedy request + penalty must take the host path so the penalty is applied"
+        !s.is_greedy() && s.adjustment() == Adjust::History && s.draw_rule() == SampleRule::Greedy,
+        "greedy request + penalty is an adjusted argmax"
     );
     let greedy_bias: CompletionReq =
         serde_json::from_str(r#"{"prompt":"x","temperature":0.0,"logit_bias":{"5":-10.0}}"#)
             .unwrap();
+    let s = sampler_of(&greedy_bias.sampling);
     assert!(
-        !sampler_of(&greedy_bias.sampling).is_greedy(),
-        "greedy request + logit_bias must take the host path"
+        !s.is_greedy() && s.adjustment() == Adjust::History,
+        "greedy request + logit_bias is an adjusted argmax"
     );
 
-    // temperature>0 with only truncation knobs (top_k/top_p/min_p) is the on-device gumbel fast path.
+    // temperature>0 with only truncation knobs (top_k/top_p/min_p) is a plain draw.
     let temp_trunc: CompletionReq = serde_json::from_str(
         r#"{"prompt":"x","temperature":0.8,"top_k":40,"top_p":0.9,"min_p":0.1}"#,
     )
     .unwrap();
+    let s = sampler_of(&temp_trunc.sampling);
     assert!(
-        sampler_of(&temp_trunc.sampling).is_simple_temperature(),
-        "temperature + top_k/top_p/min_p is the on-device gumbel path"
+        s.adjustment() == Adjust::None && s.draw_rule() == SampleRule::GumbelTopKTopP,
+        "temperature + top_k/top_p/min_p is the plain top-p draw"
     );
-    // temperature>0 WITH a penalty is neither fast path - the gumbel kernel ignores penalties, so it must
-    // fall back to the host readback path.
+    // temperature>0 WITH a penalty asks for the adjusted head as well.
     let temp_penalty: CompletionReq =
         serde_json::from_str(r#"{"prompt":"x","temperature":0.8,"presence_penalty":0.5}"#).unwrap();
     let s = sampler_of(&temp_penalty.sampling);
     assert!(
-        !s.is_greedy() && !s.is_simple_temperature(),
-        "temperature + a penalty must take the host readback path (neither fast path)"
+        s.adjustment() == Adjust::History && s.draw_rule() == SampleRule::Gumbel,
+        "temperature + a penalty asks for the adjusted head"
     );
 }
 

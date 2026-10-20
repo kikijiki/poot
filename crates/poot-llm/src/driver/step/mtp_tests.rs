@@ -12,16 +12,18 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
 use poot_executor::{Device, Dispatch, Engine};
+use poot_graph_ir::op::SampleRule;
+use poot_graph_ir::ops::sampling::SampleSpec;
 use poot_graph_ir::{BinOp, Graph, Slot, SlotKey};
 use poot_graph_plan::{CompileLimits, CompileOptions, Target};
 use poot_models::components::embed::{EMBEDS, embeds_input};
-use poot_models::components::standard::{Step, check_draft_step, check_step};
+use poot_models::components::standard::Step;
 use poot_models::io::{ModelSchema, Presence, ProgramId, ProgramSpec, RequestInputs, StateSpec};
 use poot_models::model::{
     FamilyKey, HiddenCarry, LogitRows, Model, ModelConfig, ModelError, ModelOutput, StepShape,
     StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
@@ -109,11 +111,6 @@ impl Model for Toy {
     fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
         let shape = spec.shape;
         let draft = spec.program == ProgramId::DRAFT;
-        if draft {
-            check_draft_step(TOY, shape, TOY_CAPACITY)?;
-        } else {
-            check_step(TOY, shape, TOY_CAPACITY)?;
-        }
         let mut step = Step::new(&b, shape)?;
         let embeds = spec.carries(EMBEDS);
         if embeds {
@@ -216,21 +213,12 @@ fn build_toy(raw: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, ModelEr
 }
 
 fn toy_handle(kind: Kind) -> Arc<ModelHandle> {
-    let mut registry = Registry::empty();
-    registry
-        .register(FamilyEntry {
-            family: TOY,
-            keys: &[(ConfigSource::HfModelType, "poot_fixture_mtp_toy")],
-            build: build_toy,
-            fixture: || Fixture {
-                config: serde_json::json!({}),
-                generation: None,
-                preprocessor: None,
-                store: WeightStore::default(),
-            },
-            variants: &[],
-        })
-        .unwrap();
+    let registry = Registry::of(&[FamilyEntry {
+        family: TOY,
+        keys: &[(ConfigSource::HfModelType, "poot_fixture_mtp_toy")],
+        build: build_toy,
+    }])
+    .unwrap();
     let config = serde_json::json!({
         "model_type": "poot_fixture_mtp_toy",
         "kind": kind.name(),
@@ -373,6 +361,7 @@ fn toy_shapes(layout: Layout) -> ServingShapes<'static> {
         warm: Warm::Admitted,
         windows: &[],
         adapters: &[],
+        chain: None,
     }
 }
 
@@ -782,7 +771,7 @@ fn glm_handle(head: FixtureHead) -> Arc<ModelHandle> {
         .iter()
         .find(|entry| entry.family.as_str() == "glm53_flash")
         .expect("glm53_flash is a shipped family");
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(NO_EOS);
     let raw = RawConfig::HfJson {
@@ -924,10 +913,15 @@ fn prepare(
         .prepare(&ServingShapes {
             layout,
             rows,
-            heads: &[Head::GREEDY, Head::Logits],
+            heads: &[
+                Head::GREEDY,
+                Head::Sample(SampleSpec::draw(SampleRule::GumbelTopKTopP)),
+                Head::Logits,
+            ],
             warm: Warm::Prompts(prompts),
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap_or_else(|e| panic!("{e}"))
 }

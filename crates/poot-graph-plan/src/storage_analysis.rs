@@ -11,7 +11,8 @@ use poot_graph_ir::Storage;
 use poot_target::TargetId;
 
 use crate::dtype_widen::bf16_const_is_packed;
-use crate::{Capability, Plan, PlanError, Source, StorageGap, compute_views, value_ids};
+use crate::passes::{KvExtent, kv_extents};
+use crate::{Capability, Plan, PlanError, Source, StorageGap, Target, compute_views, value_ids};
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::{Eqn, Graph, Operand, ValueId};
 
@@ -51,6 +52,29 @@ pub(crate) fn value_storage_of_plans<'p>(
     let storage = storage_of_kinds(g, target, &views, &weights);
     check_bf16_const_reads(g, target, &storage, &plans)?;
     Ok(storage)
+}
+
+/// POOT-1229: no contiguous KV cache of `g` stores a head stride that camps on `target`'s DRAM channels unless the
+/// plan records why ([`KvExemption`]). Stored KV extent is the legalizer's decision from the device's channel
+/// data; a graph that reaches the planner with a camping cache the legalizer could have padded is a planning
+/// bug, refused here by name. A target with no channel data has nothing to camp on.
+pub(crate) fn check_kv_head_strides(g: &Graph, target: &Target) -> Result<(), PlanError> {
+    let Target::Gpu { caps, .. } = target else {
+        return Ok(());
+    };
+    let Some(channels) = caps.dram_channels else {
+        return Ok(());
+    };
+    for (state, extent) in kv_extents(g, channels) {
+        if extent == KvExtent::Camps {
+            let shape = &g.aval(state).shape;
+            return Err(PlanError::KvHeadStrideCamps {
+                state,
+                stride_bytes: shape[2] * shape[3] * size_of::<f32>(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Card 1011: a BF16 const is never widened on upload, so the kernel param each reader binds it to must be
@@ -864,5 +888,208 @@ mod value_storage_tests {
                 Ok(_) => panic!("{backend:?}: a shared E4M3 table was planned"),
             }
         }
+    }
+}
+
+/// POOT-1229: the planner-side check over the stored KV extent.
+#[cfg(test)]
+mod kv_stride_tests {
+    use poot_graph_ir::ops::{AttentionKeys, attention_live, causal_mask_from_pos};
+    use poot_graph_ir::{
+        BinOp, Builder, Graph, IndexRange, Outputs, RedOp, Scalar, Slot, StateRole, TensorType,
+    };
+    use poot_target::{AmdArch, Backend, DeviceCaps};
+    use poot_tensor::DType;
+
+    use crate::compile::{CompileError, CompileOptions, Target};
+    use crate::planner::plan_graph;
+    use crate::{CompileLimits, PlanError, compile};
+
+    const HEADS: usize = 2;
+
+    /// gfx1151 with the Strix Halo channel data, and a target without any.
+    fn with_channels() -> Target {
+        let arch = AmdArch::gfx1151();
+        Target::Gpu {
+            backend: Backend::AmdGcn(arch),
+            caps: DeviceCaps {
+                dram_channels: poot_target::dram_channels::DramChannels::of_device_name("gfx1151"),
+                ..DeviceCaps::rocm_default()
+            },
+        }
+    }
+
+    fn without_channels() -> Target {
+        Target::Gpu {
+            backend: Backend::Nvptx,
+            caps: DeviceCaps::ptx_default(),
+        }
+    }
+
+    /// How the K cache of the decode graph below is read.
+    #[derive(Clone, Copy)]
+    enum Reader {
+        /// By an attention over dense keys: the legalizer can pad it.
+        Attention,
+        /// By a reduce over its positions: only the logical extent is meaningful.
+        Reduce,
+    }
+
+    /// One decode step over a `[1, HEADS, cap, d]` K and V cache pair: the cache write at `Slot::Pos`, then `reader`.
+    fn decode(cap: usize, d: usize, reader: Reader) -> Graph {
+        let b = Builder::for_tests();
+        let q = b
+            .constant("q", TensorType::f32(vec![1, HEADS, 1, d]))
+            .unwrap();
+        let new_k = b
+            .constant("k", TensorType::f32(vec![1, HEADS, 1, d]))
+            .unwrap();
+        let new_v = b
+            .constant("v", TensorType::f32(vec![1, HEADS, 1, d]))
+            .unwrap();
+        let pos = b
+            .slot_ranged(
+                Slot::Pos,
+                TensorType::new(vec![1, 1], DType::I32),
+                IndexRange::below(cap).expect("a non-empty range"),
+            )
+            .unwrap();
+        let at = b.reshape(pos, vec![]).unwrap();
+        let state = |name: &str| {
+            b.state_input(
+                name,
+                TensorType::f32(vec![1, HEADS, cap, d]),
+                StateRole::Positional { axis: 2 },
+            )
+            .unwrap()
+        };
+        let (k_in, v_in) = (state("kv.k"), state("kv.v"));
+        let k = b.dynamic_update_slice_dyn(k_in, new_k, at, 2).unwrap();
+        let v = b.dynamic_update_slice_dyn(v_in, new_v, at, 2).unwrap();
+        let out = match reader {
+            Reader::Attention => {
+                let mask = causal_mask_from_pos(&b, pos, cap, None).unwrap();
+                let len = b
+                    .binary_scalar(BinOp::Add, b.reshape(pos, vec![1]).unwrap(), Scalar::I32(1))
+                    .unwrap();
+                attention_live(
+                    &b,
+                    q,
+                    AttentionKeys::Single(k),
+                    v,
+                    1,
+                    0.125,
+                    mask,
+                    None,
+                    len,
+                )
+                .unwrap()
+                .out
+            }
+            Reader::Reduce => {
+                let total = |x| b.reduce(RedOp::Sum, x, 2, true).unwrap();
+                b.binary(BinOp::Add, total(k), total(v)).unwrap()
+            }
+        };
+        b.finish(Outputs::new(out).with_state(&[(k_in, k), (v_in, v)]))
+            .unwrap()
+    }
+
+    /// The graph `compile` hands the legalizer: canonical, deduplicated, its iotas folded and its attention
+    /// chain the fused op.
+    fn fused(g: &Graph) -> Graph {
+        let (canonical, _) = crate::passes::canonicalize_with_declines(g).unwrap();
+        let folded = crate::passes::fold_iota(&crate::passes::cse(&canonical).unwrap()).unwrap();
+        let fused = crate::passes::flash_attention_capped(&folded, None)
+            .unwrap()
+            .0;
+        assert!(
+            fused
+                .eqns()
+                .iter()
+                .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::Attention(_))),
+            "the decode chain fuses to an attention"
+        );
+        crate::passes::dce(&fused).unwrap()
+    }
+
+    fn stored(program: &crate::Program) -> Vec<usize> {
+        program
+            .graph()
+            .state_pairs()
+            .map(|pair| program.graph().aval(pair.input).shape[2])
+            .collect()
+    }
+
+    fn options() -> CompileOptions {
+        CompileOptions::new(CompileLimits::STANDARD)
+    }
+
+    /// SC-004: a plan whose stored stride camps on a target with channel data is refused by name when the
+    /// graph reaches the planner unpadded; the same graph through `compile` is padded by the legalizer and
+    /// plans; a target without channel data plans the exact capacity. Mutation: make
+    /// `check_kv_head_strides` return `Ok(())` at its first line; the unpadded graph plans and this goes red.
+    #[test]
+    fn a_camping_cache_the_legalizer_did_not_pad_is_refused() {
+        // 512 positions of a 128-wide head: a 2048 B stride, whole channel periods.
+        let g = decode(512, 128, Reader::Attention);
+        let limits = CompileLimits::STANDARD.body();
+        let Err(refused) = plan_graph(&fused(&g), &with_channels(), &limits) else {
+            panic!("a camping cache the legalizer could pad was planned");
+        };
+        assert!(
+            matches!(
+                refused,
+                CompileError::Plan(ref error)
+                    if matches!(**error, PlanError::KvHeadStrideCamps { stride_bytes: 262_144, .. })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            stored(&compile(&g, &with_channels(), &options()).expect("the legalizer pads it")),
+            [513, 513]
+        );
+        assert!(plan_graph(&fused(&g), &without_channels(), &limits).is_ok());
+        assert_eq!(
+            stored(&compile(&g, &without_channels(), &options()).unwrap()),
+            [512, 512]
+        );
+    }
+
+    /// The typed exemptions plan as declared: a head row that is itself whole periods cannot be padded off, a
+    /// cache read by anything but an attention keeps its logical extent, and a paged pool's row stride is the
+    /// pool's. Mutation: have `kv_caches` classify a whole-period row as `KvExtent::Camps`; the whole-period row goes red.
+    #[test]
+    fn a_camping_cache_with_a_typed_exemption_plans_as_declared() {
+        let limits = CompileLimits::STANDARD.body();
+        // 512 f32 per head row is 2048 B: no whole-position pad escapes the period.
+        let whole_period = decode(4, 512, Reader::Attention);
+        assert!(plan_graph(&fused(&whole_period), &with_channels(), &limits).is_ok());
+        assert_eq!(
+            stored(&compile(&whole_period, &with_channels(), &options()).unwrap()),
+            [4, 4]
+        );
+        // Read by a reduce: the legalizer cannot add a position the reader would sum.
+        let logical = decode(512, 128, Reader::Reduce);
+        assert_eq!(
+            stored(&compile(&logical, &with_channels(), &options()).unwrap()),
+            [512, 512]
+        );
+        // A pool: `[slots, kv_heads, head_dim]` rows of 8 x 128 f32 are 4096 B.
+        let b = Builder::for_tests();
+        let pool = b
+            .state_input(
+                "pool",
+                TensorType::f32(vec![64, 8, 128]),
+                StateRole::Positional { axis: 0 },
+            )
+            .unwrap();
+        let row = b.constant("row", TensorType::f32(vec![1, 8, 128])).unwrap();
+        let at = b.slot(Slot::Pos, TensorType::scalar(DType::I32)).unwrap();
+        let next = b.dynamic_update_slice_dyn(pool, row, at, 0).unwrap();
+        let g = b
+            .finish(Outputs::new(next).with_state(&[(pool, next)]))
+            .unwrap();
+        assert!(plan_graph(&g, &with_channels(), &limits).is_ok());
     }
 }
