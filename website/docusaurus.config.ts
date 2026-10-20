@@ -4,11 +4,20 @@ import type * as Preset from '@docusaurus/preset-classic';
 
 // This runs in Node.js - Don't use client-side code here (browser APIs, JSX...)
 
+const baseUrl = process.env.DOCS_BASE_URL ?? '/';
+
 const config: Config = {
   title: 'poot',
   tagline:
     'Backend-neutral graph IR, automatic kernel fusion, and async capture/replay for LLM inference.',
   favicon: 'img/favicon.ico',
+  headTags: [
+    // Crisp vector favicon for browsers that support it; favicon.ico stays as the fallback.
+    {
+      tagName: 'link',
+      attributes: {rel: 'icon', type: 'image/svg+xml', href: `${baseUrl}img/favicon.svg`},
+    },
+  ],
 
   // Improve compatibility with the upcoming Docusaurus v4.
   future: {
@@ -17,7 +26,7 @@ const config: Config = {
 
   // Production deployment root.
   url: process.env.DOCS_SITE_URL ?? 'https://kikijiki.github.io',
-  baseUrl: process.env.DOCS_BASE_URL ?? '/',
+  baseUrl,
   trailingSlash: false,
 
   organizationName: 'kikijiki',
@@ -98,6 +107,7 @@ const config: Config = {
       logo: {
         alt: 'poot logo',
         src: 'img/logo.svg',
+        srcDark: 'img/logo-dark.svg',
       },
       items: [
         {
