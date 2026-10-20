@@ -21,6 +21,7 @@
 }
 
 .featureIcon {
+  color: var(--ifm-color-primary);
   height: 4rem;
   width: 4rem;
   margin-bottom: 0.5rem;
