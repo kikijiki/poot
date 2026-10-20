@@ -45,7 +45,10 @@ an invalid guided-decoding constraint, image input the served model cannot take,
 stream (a stream has nowhere to put them). `max_tokens` above the cap
 (32768) is clamped, not refused, and `n`, `logprobs` and the number of `stop` strings (16) are clamped the same way.
 More than 10,000 `logit_bias` entries, a `stop` string over 1,024 bytes, or `stop` strings totalling over 4,096 bytes
-are a `400`, since each is paid at every generated token. A request without `seed` draws one from the operating system,
+are a `400`, since each is paid at every generated token. Sampling runs on the device: temperature, top-k, top-p and
+min-p, the repetition, presence and frequency penalties, `logit_bias`, a guided-decoding constraint, and the top-n
+`logprobs` of a request are all computed there, and only token ids (and the logprob values asked for) come back, never
+the full logits. A request without `seed` draws one from the operating system,
 so two identical sampled requests differ; a request with a `seed` is reproducible. Errors are
 OpenAI-shaped: `{"error": {"message", "type", "code"}}`. Over-limit requests get `429` with
 `Retry-After` when `--rate-limit-rpm` is set.

@@ -1040,9 +1040,9 @@ fn a_shape_off_the_granule_is_a_typed_refusal() {
     );
 }
 
-/// SC-1143-5: a paged-KV step is a typed refusal naming the indexer, and builds no graph: the block-key
-/// cache is per row and its paging granule is POOT-1148's. Mutation: drop the paged check from
-/// `Qwen4Exp::trace_into`; the paged shape traces and the refusal assertion goes red.
+/// SC-1143-5: a paged-KV step is a typed refusal naming the block-pooled state, and builds no graph: the
+/// block-key cache is per row and its paging granule is POOT-1148's. Mutation: drop the paged check
+/// from `<dyn Model>::trace`; the paged shape traces and the refusal assertion goes red.
 #[test]
 fn a_paged_step_is_a_typed_indexer_refusal() {
     use crate::model::{ShapeReason, TraceError};
@@ -1068,7 +1068,7 @@ fn a_paged_step_is_a_typed_indexer_refusal() {
         matches!(
             refusal,
             TraceError::ShapeUnsupported {
-                reason: ShapeReason::PagedIndexer,
+                reason: ShapeReason::PagedBlockedState,
                 ..
             }
         ),

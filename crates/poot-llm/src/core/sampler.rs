@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use poot_graph_ir::op::{SampleRule, gumbel_noise, random_uniform_at};
+use poot_graph_ir::ops::sampling::{Adjust, MASKED_LOGIT};
 use poot_text::Constraint;
 
 /// The index of the largest logit (the first on a tie). A [`SamplerFault`] when `v` holds a NaN or `+inf`, or no
@@ -130,10 +131,9 @@ impl Sampler {
         }
     }
 
-    /// True when the sampler picks the argmax with no logit adjustment, so GPU decode can choose the token
-    /// on-device and skip the logits readback. Any active penalty/bias reshapes the argmax, logprob
-    /// recording needs the full logits, and a guided-decoding constraint masks them; each forces the
-    /// host-side readback path (FR-006 / FR-004).
+    /// True when the sampler is a plain argmax: no logit adjustment, no logprob recording and no guided
+    /// decoding. Only such a row can ride a verify window, whose positions pick without a history of
+    /// their own.
     pub fn is_greedy(&self) -> bool {
         self.temperature <= 0.0
             && !self.adjusts_logits()
@@ -141,15 +141,80 @@ impl Sampler {
             && self.constraint.is_none()
     }
 
-    /// Whether this row can sample on the GPU via an on-device top-p-Gumbel-max kernel instead of the host
-    /// `pick()` path (card 148): min-p folds into a logit floor, top-k into a bisected count threshold, and
-    /// top-p into a bisected integer-mass threshold (the nucleus the device selects is held to the exact
-    /// host nucleus by the ADR-0114 mass tolerance). Same "no penalties/bias/logprobs/guided" bar as [`Self::is_greedy`].
-    pub fn is_simple_temperature(&self) -> bool {
-        self.temperature > 0.0
-            && !self.adjusts_logits()
-            && self.top_logprobs.is_none()
-            && self.constraint.is_none()
+    /// The draw this row asks of the device sampling head: the argmax at temperature 0, otherwise the
+    /// rule its truncation knobs select ([`SampleRule::for_truncation`], the one classification the host
+    /// reference and the device share).
+    pub fn draw_rule(&self) -> SampleRule {
+        if self.temperature <= 0.0 {
+            SampleRule::Greedy
+        } else {
+            SampleRule::for_truncation(self.top_k, self.top_p)
+        }
+    }
+
+    /// What the row needs the head to do to the logits: nothing, apply its penalties and bias, or also
+    /// mask to a guided-decoding constraint.
+    pub fn adjustment(&self) -> Adjust {
+        if self.constraint.is_some() {
+            Adjust::Guided
+        } else if self.adjusts_logits() {
+            Adjust::History
+        } else {
+            Adjust::None
+        }
+    }
+
+    /// The alternatives per token the row records, `None` when it records no logprobs.
+    pub fn logprob_count(&self) -> Option<usize> {
+        self.top_logprobs
+    }
+
+    /// The `(repetition, presence, frequency)` penalties; `(1, 0, 0)` when none is set.
+    pub(crate) fn penalty_row(&self) -> [f32; 3] {
+        [
+            self.repetition_penalty,
+            self.presence_penalty,
+            self.frequency_penalty,
+        ]
+    }
+
+    /// The row's device-resident history over a `vocab`-token vocabulary: `[counts, bias]`, each `vocab`
+    /// long. The counts are the prompt and the tokens observed so far; the bias is the logit bias. A token
+    /// id past the vocabulary is dropped, as the host adjustment does.
+    pub(crate) fn history_row(&self, vocab: usize) -> Vec<f32> {
+        let mut row = vec![0.0f32; 2 * vocab];
+        for (&token, &count) in &self.counts {
+            if let Some(slot) = row
+                .get_mut(token as usize)
+                .filter(|_| (token as usize) < vocab)
+            {
+                *slot = count as f32;
+            }
+        }
+        for (&token, &bias) in &self.logit_bias {
+            if (token as usize) < vocab {
+                row[vocab + token as usize] = bias;
+            }
+        }
+        row
+    }
+
+    /// The additive guided-decoding mask of the next step over `vocab` tokens (`0` for a permitted token,
+    /// [`MASKED_LOGIT`] for an excluded one), `None` for a row without a constraint. It is the host mask
+    /// of [`Self::pick`] with the finite stand-in the device draw takes for `-inf`.
+    pub(crate) fn guided_mask(&self, vocab: usize) -> Option<Vec<f32>> {
+        let keep = self.constraint_keep(vocab)?;
+        Some(
+            keep.into_iter()
+                .map(|keep| if keep { 0.0 } else { MASKED_LOGIT })
+                .collect(),
+        )
+    }
+
+    /// Record the logprobs the device head computed for the token it drew, as [`Self::pick`] records
+    /// them on the host.
+    pub(crate) fn push_logprob(&mut self, record: TokenLogprob) {
+        self.recorded.push(record);
     }
 
     /// Whether any penalty or bias would change the raw logits (and thus the argmax).
@@ -337,17 +402,33 @@ impl Sampler {
         Ok(chosen)
     }
 
-    /// Mask `logits` to the tokens the guided-decoding constraint permits at the current generated prefix:
-    /// disallowed ids become -inf. EOS is allowed once a choice is complete; if nothing continues (the
-    /// constraint is exhausted), EOS is forced so the masked logits are never all -inf (FR-003).
-    fn apply_constraint_mask(&self, logits: &mut [f32]) {
-        let c = self.constraint.as_ref().unwrap();
-        let (allowed, eos_ok) = c.allowed_next();
+    /// Whether each of the `vocab` tokens is permitted by the guided-decoding constraint at the current
+    /// generated prefix, `None` without a constraint. EOS is allowed once a choice is complete; if nothing
+    /// continues (the constraint is exhausted), EOS is forced so the masked logits are never all excluded
+    /// (FR-003). The one definition the host mask and the device mask share.
+    fn constraint_keep(&self, vocab: usize) -> Option<Vec<bool>> {
+        let constraint = self.constraint.as_ref()?;
+        let (allowed, eos_ok) = constraint.allowed_next();
         let eos_ok = eos_ok || allowed.is_empty();
-        let eos = c.eos();
-        for (i, l) in logits.iter_mut().enumerate() {
-            let id = i as u32;
-            let keep = allowed.contains(&id) || (eos_ok && id == eos);
+        let mut keep = vec![false; vocab];
+        for &id in &allowed {
+            if let Some(slot) = keep.get_mut(id as usize) {
+                *slot = true;
+            }
+        }
+        if eos_ok && let Some(slot) = keep.get_mut(constraint.eos() as usize) {
+            *slot = true;
+        }
+        Some(keep)
+    }
+
+    /// Mask `logits` to the tokens the guided-decoding constraint permits ([`Self::constraint_keep`]):
+    /// excluded ids become -inf.
+    fn apply_constraint_mask(&self, logits: &mut [f32]) {
+        let keep = self
+            .constraint_keep(logits.len())
+            .expect("a mask is applied only under a constraint");
+        for (l, keep) in logits.iter_mut().zip(keep) {
             if !keep {
                 *l = f32::NEG_INFINITY;
             }
@@ -528,10 +609,14 @@ impl Sampler {
 }
 
 #[cfg(test)]
+mod device_head_tests;
+
+#[cfg(test)]
 mod sampler_tests {
     use std::collections::HashMap;
 
     use poot_graph_ir::op::SampleRule;
+    use poot_graph_ir::ops::sampling::Adjust;
 
     use super::argmax;
     use super::{Constraint, Sampler, SamplerFault};
@@ -760,57 +845,75 @@ mod sampler_tests {
         );
     }
 
+    /// What a request asks of the device head is read off the sampler: the draw rule from the
+    /// temperature and the truncation knobs, the adjustment from any penalty, bias or constraint, the
+    /// alternatives from the logprob count. Every row, whatever it asks, has a head; none is a host pick.
     #[test]
-    fn is_simple_temperature_gates_like_the_serving_kernel() {
-        // Gate for the on-device top-p-Gumbel-max kernel (card 148). A plain temperature draw (no
-        // penalties/bias/logprobs/guided) qualifies, as do min-p, top-k, and top-p (each folds into the
-        // kernel's logit floor / integer-mass nucleus threshold). Greedy (temperature<=0) and every host-only
-        // knob must not.
-        assert!(Sampler::new(0.8, 0, 1.0, 1).is_simple_temperature());
-        assert!(
-            Sampler::new(0.8, 0, 1.0, 1)
-                .with_min_p(0.5)
-                .is_simple_temperature()
+    fn the_sampler_names_what_it_asks_of_the_head() {
+        let ask = |s: &Sampler| (s.draw_rule(), s.adjustment(), s.logprob_count());
+        assert_eq!(
+            ask(&Sampler::greedy()),
+            (SampleRule::Greedy, Adjust::None, None)
         );
-        assert!(
-            Sampler::new(0.8, 5, 1.0, 1).is_simple_temperature(),
-            "top_k alone (card 148 phase 2a) is now on-device, not a host fallback"
+        assert_eq!(
+            ask(&Sampler::new(0.0, 5, 0.9, 1)),
+            (SampleRule::Greedy, Adjust::None, None),
+            "temperature 0 is the argmax whatever the truncation knobs say"
         );
-        assert!(
-            Sampler::new(0.8, 0, 0.9, 1).is_simple_temperature(),
-            "top_p alone (card 148 phase 2b) is now on-device, not a host fallback"
+        assert_eq!(
+            ask(&Sampler::new(0.8, 0, 1.0, 1)),
+            (SampleRule::Gumbel, Adjust::None, None)
         );
-        assert!(
-            Sampler::new(0.8, 5, 0.9, 1).is_simple_temperature(),
-            "top_k + top_p combined (card 148 phase 2b) is now on-device"
+        assert_eq!(
+            ask(&Sampler::new(0.8, 0, 1.0, 1).with_min_p(0.5)),
+            (SampleRule::Gumbel, Adjust::None, None),
+            "min-p rides in every Gumbel rule's params"
         );
-        assert!(!Sampler::greedy().is_simple_temperature());
-        assert!(!Sampler::new(0.0, 0, 1.0, 1).is_simple_temperature());
-        assert!(
-            !Sampler::new(0.8, 0, 1.0, 1)
-                .with_penalties(1.2, 0.0, 0.0)
-                .is_simple_temperature()
+        assert_eq!(
+            ask(&Sampler::new(0.8, 5, 1.0, 1)),
+            (SampleRule::GumbelTopK, Adjust::None, None)
         );
-        assert!(
-            !Sampler::new(0.8, 0, 1.0, 1)
-                .with_logprobs(0)
-                .is_simple_temperature()
+        assert_eq!(
+            ask(&Sampler::new(0.8, 0, 0.9, 1)),
+            (SampleRule::GumbelTopKTopP, Adjust::None, None)
         );
-        // A logit_bias reshapes the argmax and the gumbel kernel never sees it, so a biased row must take the
-        // host path (the same divergence class as the fixed top_p=0 GPU-fastpath bug). Covered for is_greedy by
-        // `bias_makes_sampler_non_greedy`; pinned here too.
-        assert!(
-            !Sampler::new(0.8, 0, 1.0, 1)
-                .with_logit_bias(std::collections::HashMap::from([(0u32, -1.0)]))
-                .is_simple_temperature()
+        assert_eq!(
+            ask(&Sampler::new(0.8, 5, 0.9, 1)),
+            (SampleRule::GumbelTopKTopP, Adjust::None, None)
         );
-        // A guided-decoding constraint masks the logits every step and the gumbel kernel cannot enforce it, so
-        // a constrained row must take the host path.
-        assert!(
-            !Sampler::new(0.8, 0, 1.0, 1)
-                .with_constraint(Constraint::choices(vec![vec![1u32]], 2))
-                .is_simple_temperature()
+        assert_eq!(
+            ask(&Sampler::new(0.8, 0, 1.0, 1).with_penalties(1.2, 0.0, 0.0)),
+            (SampleRule::Gumbel, Adjust::History, None)
         );
+        assert_eq!(
+            ask(&Sampler::new(0.8, 0, 1.0, 1).with_logprobs(3)),
+            (SampleRule::Gumbel, Adjust::None, Some(3))
+        );
+        assert_eq!(
+            ask(&Sampler::new(0.8, 0, 1.0, 1)
+                .with_logit_bias(std::collections::HashMap::from([(0u32, -1.0)]))),
+            (SampleRule::Gumbel, Adjust::History, None),
+            "a bias reshapes the argmax: the adjusted head applies it"
+        );
+        assert_eq!(
+            ask(&Sampler::greedy().with_constraint(Constraint::choices(vec![vec![1u32]], 2))),
+            (SampleRule::Greedy, Adjust::Guided, None),
+            "a guided row masks the logits on the device"
+        );
+    }
+
+    /// The device history row is the host sampler's own: the counts it observed (the prompt and the
+    /// committed tokens) and its logit bias, over the vocabulary, dropping an id past it.
+    #[test]
+    fn the_history_row_is_the_counts_and_the_bias() {
+        let mut s = Sampler::greedy().with_logit_bias(HashMap::from([(1u32, 0.5f32), (9, 2.0)]));
+        s.seed_context(&[3, 3, 7]);
+        s.observe(3);
+        s.observe(9);
+        let row = s.history_row(8);
+        assert_eq!(row.len(), 16);
+        assert_eq!(&row[..8], &[0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(&row[8..], &[0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
     }
 
     /// `top_p = 0.0` must mean "the minimal nucleus" (top-1), not "disabled": `pick_from`'s `top_p < 1.0`
@@ -1363,7 +1466,7 @@ mod sampler_tests {
         );
         assert_ne!(da, dc, "a different salt must give an independent stream");
         // the fork must carry the parent's temperature/top_k/top_p/min_p through (not reset to greedy).
-        assert!(a.is_simple_temperature());
+        assert_eq!(a.draw_rule(), SampleRule::GumbelTopKTopP);
         assert_eq!(a.top_k, 5);
         assert_eq!(a.top_p, 0.9);
         assert_eq!(a.min_p, 0.1);
@@ -1514,7 +1617,7 @@ mod sampler_tests {
     /// with distinct seeds, as a test-local graph. Returns the tokens drawn, ascending.
     fn device_support(logits: &[f32], temperature: f32, top_p: f32, rows: usize) -> Vec<usize> {
         use poot_eval::{EvalOptions, Value};
-        use poot_graph_ir::ops::sampling::sample_head;
+        use poot_graph_ir::ops::sampling::{SampleSpec, sample_head};
         use poot_graph_ir::{Builder, Slot, TensorType};
         use poot_tensor::{DType, HostTensor};
 
@@ -1526,7 +1629,13 @@ mod sampler_tests {
                 TensorType::new(vec![rows, vocab], DType::F32),
             )
             .unwrap();
-        let head = sample_head(&b, logits_in, SampleRule::GumbelTopKTopP).unwrap();
+        let head = sample_head(
+            &b,
+            logits_in,
+            SampleSpec::draw(SampleRule::GumbelTopKTopP),
+            None,
+        )
+        .unwrap();
         let g = b.finish(head.out).unwrap();
         let row_params = [1.0 / temperature, f32::NEG_INFINITY, 1.0, top_p];
         let mut inputs = HashMap::new();

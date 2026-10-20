@@ -44,15 +44,8 @@ fn qwen35_stored_as(variant: &str) -> (Box<dyn Model>, Fixture) {
         .find(|entry| entry.family.as_str() == "qwen35")
         .expect("qwen35 is a registered family");
     let fixture = match variant {
-        "" => (entry.fixture)(),
-        variant => {
-            let (_, make) = entry
-                .variants
-                .iter()
-                .find(|(name, _)| *name == variant)
-                .unwrap_or_else(|| panic!("qwen35 has no fixture variant {variant}"));
-            make()
-        }
+        "" => poot_models::test_support::family_fixtures::base(entry.family),
+        variant => poot_models::test_support::family_fixtures::variant(entry.family, variant),
     };
     let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
     (model.model, fixture)

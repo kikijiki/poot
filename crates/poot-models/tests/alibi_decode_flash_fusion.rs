@@ -65,7 +65,7 @@ fn mpt_graph(tokens: usize, cap: usize) -> Graph {
         .iter()
         .find(|e| e.family.as_str() == "mpt")
         .expect("the registry ships mpt");
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let mut f32_store = WeightStore::builder();
     for (key, stored) in fixture.store.iter() {
         let WeightEntry::Dense(_) = stored else {

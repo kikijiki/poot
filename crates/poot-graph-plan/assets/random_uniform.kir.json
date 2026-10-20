@@ -119,14 +119,6 @@
       "mutable": false
     },
     {
-      "ty": "Usize",
-      "mutable": true
-    },
-    {
-      "ty": "Usize",
-      "mutable": true
-    },
-    {
       "ty": "U32",
       "mutable": true
     },
@@ -779,68 +771,6 @@
           "Assign": [
             {
               "local": {
-                "index": 23
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Mul",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 13
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 8
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 22
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Add",
-                {
-                  "Move": {
-                    "local": {
-                      "index": 23
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 15
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
                 "index": 21
               },
               "projection": []
@@ -849,9 +779,9 @@
               "Cast": {
                 "to": "U32",
                 "operand": {
-                  "Move": {
+                  "Copy": {
                     "local": {
-                      "index": 22
+                      "index": 15
                     },
                     "projection": []
                   }
@@ -864,7 +794,7 @@
           "Assign": [
             {
               "local": {
-                "index": 25
+                "index": 23
               },
               "projection": []
             },
@@ -892,7 +822,7 @@
           "Assign": [
             {
               "local": {
-                "index": 24
+                "index": 22
               },
               "projection": []
             },
@@ -903,6 +833,105 @@
                   "Copy": {
                     "local": {
                       "index": 17
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 23
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 24
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 22
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 26
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 22
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 25
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Shr",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 26
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "I32": 16
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 22
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "BitXor",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 24
                     },
                     "projection": []
                   }
@@ -923,114 +952,15 @@
           "Assign": [
             {
               "local": {
-                "index": 26
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 24
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 28
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 24
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
                 "index": 27
               },
               "projection": []
             },
             {
-              "BinaryOp": [
-                "Shr",
-                {
-                  "Move": {
-                    "local": {
-                      "index": 28
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Const": {
-                    "I32": 16
-                  }
-                }
-              ]
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 24
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "BitXor",
-                {
-                  "Move": {
-                    "local": {
-                      "index": 26
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Move": {
-                    "local": {
-                      "index": 27
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 29
-              },
-              "projection": []
-            },
-            {
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 24
+                    "index": 22
                   },
                   "projection": []
                 }
@@ -1042,7 +972,7 @@
           "Assign": [
             {
               "local": {
-                "index": 24
+                "index": 22
               },
               "projection": []
             },
@@ -1052,7 +982,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 29
+                      "index": 27
                     },
                     "projection": []
                   }
@@ -1070,6 +1000,26 @@
           "Assign": [
             {
               "local": {
+                "index": 28
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 22
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
                 "index": 30
               },
               "projection": []
@@ -1078,7 +1028,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 24
+                    "index": 22
                   },
                   "projection": []
                 }
@@ -1090,27 +1040,7 @@
           "Assign": [
             {
               "local": {
-                "index": 32
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 24
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 31
+                "index": 29
               },
               "projection": []
             },
@@ -1120,7 +1050,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 32
+                      "index": 30
                     },
                     "projection": []
                   }
@@ -1138,7 +1068,7 @@
           "Assign": [
             {
               "local": {
-                "index": 24
+                "index": 22
               },
               "projection": []
             },
@@ -1148,7 +1078,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 30
+                      "index": 28
                     },
                     "projection": []
                   }
@@ -1156,7 +1086,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 31
+                      "index": 29
                     },
                     "projection": []
                   }
@@ -1169,7 +1099,7 @@
           "Assign": [
             {
               "local": {
-                "index": 33
+                "index": 31
               },
               "projection": []
             },
@@ -1177,7 +1107,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 24
+                    "index": 22
                   },
                   "projection": []
                 }
@@ -1189,7 +1119,7 @@
           "Assign": [
             {
               "local": {
-                "index": 24
+                "index": 22
               },
               "projection": []
             },
@@ -1199,7 +1129,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 33
+                      "index": 31
                     },
                     "projection": []
                   }
@@ -1217,6 +1147,26 @@
           "Assign": [
             {
               "local": {
+                "index": 32
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 22
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
                 "index": 34
               },
               "projection": []
@@ -1225,7 +1175,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 24
+                    "index": 22
                   },
                   "projection": []
                 }
@@ -1237,27 +1187,7 @@
           "Assign": [
             {
               "local": {
-                "index": 36
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 24
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 35
+                "index": 33
               },
               "projection": []
             },
@@ -1267,7 +1197,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 36
+                      "index": 34
                     },
                     "projection": []
                   }
@@ -1285,7 +1215,7 @@
           "Assign": [
             {
               "local": {
-                "index": 24
+                "index": 22
               },
               "projection": []
             },
@@ -1295,7 +1225,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 34
+                      "index": 32
                     },
                     "projection": []
                   }
@@ -1303,7 +1233,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 35
+                      "index": 33
                     },
                     "projection": []
                   }
@@ -1316,7 +1246,7 @@
           "Assign": [
             {
               "local": {
-                "index": 39
+                "index": 37
               },
               "projection": []
             },
@@ -1324,7 +1254,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 24
+                    "index": 22
                   },
                   "projection": []
                 }
@@ -1336,7 +1266,7 @@
           "Assign": [
             {
               "local": {
-                "index": 38
+                "index": 36
               },
               "projection": []
             },
@@ -1346,7 +1276,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 39
+                      "index": 37
                     },
                     "projection": []
                   }
@@ -1364,7 +1294,7 @@
           "Assign": [
             {
               "local": {
-                "index": 37
+                "index": 35
               },
               "projection": []
             },
@@ -1374,7 +1304,7 @@
                 "operand": {
                   "Move": {
                     "local": {
-                      "index": 38
+                      "index": 36
                     },
                     "projection": []
                   }
@@ -1387,7 +1317,7 @@
           "Assign": [
             {
               "local": {
-                "index": 43
+                "index": 41
               },
               "projection": []
             },
@@ -1397,7 +1327,7 @@
                 "operand": {
                   "Copy": {
                     "local": {
-                      "index": 37
+                      "index": 35
                     },
                     "projection": []
                   }
@@ -1410,7 +1340,7 @@
           "Assign": [
             {
               "local": {
-                "index": 42
+                "index": 40
               },
               "projection": []
             },
@@ -1425,7 +1355,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 43
+                      "index": 41
                     },
                     "projection": []
                   }
@@ -1438,7 +1368,7 @@
           "Assign": [
             {
               "local": {
-                "index": 41
+                "index": 39
               },
               "projection": []
             },
@@ -1448,7 +1378,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 42
+                      "index": 40
                     },
                     "projection": []
                   }
@@ -1466,7 +1396,7 @@
           "Assign": [
             {
               "local": {
-                "index": 40
+                "index": 38
               },
               "projection": []
             },
@@ -1476,7 +1406,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 41
+                      "index": 39
                     },
                     "projection": []
                   }
@@ -1494,7 +1424,7 @@
           "Assign": [
             {
               "local": {
-                "index": 45
+                "index": 43
               },
               "projection": []
             },
@@ -1514,7 +1444,7 @@
           "Assign": [
             {
               "local": {
-                "index": 46
+                "index": 44
               },
               "projection": []
             },
@@ -1532,7 +1462,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 45
+                      "index": 43
                     },
                     "projection": []
                   }
@@ -1571,7 +1501,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 40
+                    "index": 38
                   },
                   "projection": []
                 }

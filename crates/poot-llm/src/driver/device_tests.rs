@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
+use poot_graph_ir::op::SampleRule;
+use poot_graph_ir::ops::sampling::SampleSpec;
 use poot_graph_plan::CompileOptions;
 use poot_models::registry::{RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -139,7 +141,7 @@ pub(super) fn handle(weights: Weights, eos: u32) -> Arc<ModelHandle> {
 /// [`handle`] for a model that ships `chat_template`.
 fn handle_with(weights: Weights, eos: u32, chat_template: ChatTemplate) -> Arc<ModelHandle> {
     let registry = Registry::builtin().unwrap();
-    let fixture = (registry.entries()[0].fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(registry.entries()[0].family);
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(eos);
     let store = match weights {
@@ -318,7 +320,7 @@ fn gemma4_sampled_differs_from_greedy(choice: BackendChoice) {
         .iter()
         .find(|entry| entry.family.as_str() == "gemma4")
         .unwrap();
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(NO_EOS);
     config["text_config"]["vocab_size"] = serde_json::json!(WIDE);
@@ -409,6 +411,89 @@ per_backend!(
     sampled_differs_from_greedy_ptx
 );
 
+/// POOT-1293: the planner decides against the caps the attached device reported, not a preset. A tied
+/// `[vocab, 64]` f32 table (gathered by token and read again by a matmul, so legalize cannot host or
+/// split it) one row over the device's own `max_buffer_bytes` is refused with that limit named; one row
+/// under it plans. The limit is whatever this device measured (RADV's safe figure on wgpu, the VRAM or
+/// memory total on ROCm and PTX), so the refusal reads as the real limit of each backend. Mutation: compile
+/// against the preset caps (`default_caps_for`) instead of the executor's target: on ROCm the preset's
+/// limit is `u64::MAX`, so the over-row plans (`a 120259084544-byte table plans on Rocm`); halve the
+/// target's limit and the refusal names the wrong one (`left: 671088640, right: 1342177280` on wgpu,
+/// whose preset equals RADV's safe figure, so the preset alone is inert there).
+fn attached_device_limit_refuses_an_oversized_constant(choice: BackendChoice) {
+    use poot_graph_ir::Builder;
+    use poot_graph_ir::types::TensorType;
+    use poot_graph_plan::{LegalizeError, Target, compile};
+
+    let Some(executor) = open(choice) else {
+        return;
+    };
+    let targets = executor.target_set();
+    let [(_, target)] = targets.devices() else {
+        panic!("{choice:?} drives one device");
+    };
+    let Target::Gpu { caps, .. } = target else {
+        panic!("{choice:?} reports a GPU target, got {target:?}");
+    };
+    let limit = caps.max_buffer_bytes;
+    const HIDDEN: usize = 64;
+    let row_bytes = (HIDDEN * 4) as u64;
+    let tied = |vocab: u64| {
+        let b = Builder::for_tests();
+        let token = b
+            .slot(Slot::Token, TensorType::scalar(poot_tensor::DType::I32))
+            .unwrap();
+        let table = b
+            .constant("tied.weight", TensorType::f32(vec![vocab as usize, HIDDEN]))
+            .unwrap();
+        let row = b.gather_scalar(table, 0, token).unwrap();
+        let x = b.reshape(row, vec![1, HIDDEN]).unwrap();
+        let out = b
+            .matmul(x, b.transpose(table, vec![1, 0]).unwrap())
+            .unwrap();
+        b.finish(out).unwrap()
+    };
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
+
+    let over = limit / row_bytes + 1;
+    let error = compile(&tied(over), target, &options)
+        .err()
+        .unwrap_or_else(|| panic!("a {}-byte table plans on {choice:?}", over * row_bytes));
+    let poot_graph_plan::CompileError::Legalize(legalize) = &error else {
+        panic!("{choice:?}: a typed legalize refusal, got {error}");
+    };
+    let LegalizeError::OversizedConstant {
+        bytes, limit: seen, ..
+    } = legalize.as_ref()
+    else {
+        panic!("{choice:?}: the oversized constant, got {legalize}");
+    };
+    assert_eq!(
+        *seen, limit,
+        "{choice:?}: the refusal names the device's own limit"
+    );
+    assert_eq!(*bytes, over * row_bytes);
+    assert!(
+        error.to_string().contains(&limit.to_string()),
+        "{choice:?}: the message carries the limit {limit}: {error}"
+    );
+
+    let under = limit / row_bytes;
+    compile(&tied(under), target, &options).unwrap_or_else(|e| {
+        panic!(
+            "{choice:?}: a {}-byte table fits the {limit}-byte limit: {e}",
+            under * row_bytes
+        )
+    });
+}
+per_backend!(
+    BackendChoice,
+    attached_device_limit_refuses_an_oversized_constant,
+    attached_device_limit_refuses_an_oversized_constant_wgpu,
+    attached_device_limit_refuses_an_oversized_constant_rocm,
+    attached_device_limit_refuses_an_oversized_constant_ptx
+);
+
 /// POOT-575 SC-004 (R477-006 on a hybrid family's path; POOT-572 for Qwen3.5): the `family` fixture
 /// with its head zeroed (every logit exactly 0, so the distribution is uniform) answers a seeded
 /// temperature request with the sampler's tokens, not the greedy ones: a sampled run equal to the greedy
@@ -421,7 +506,7 @@ fn family_sampled_differs_from_greedy(family: &str, choice: BackendChoice) {
         .iter()
         .find(|entry| entry.family.as_str() == family)
         .unwrap();
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(NO_EOS);
     let raw = RawConfig::HfJson {
@@ -463,7 +548,7 @@ fn family_decode_reuses_one_program_across_positions(
         .iter()
         .find(|entry| entry.family.as_str() == family)
         .unwrap();
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(NO_EOS);
     let raw = RawConfig::HfJson {
@@ -537,15 +622,15 @@ per_backend!(
     qwen35_sampled_differs_from_greedy_ptx
 );
 
-/// The regex naming the 16 tokens `a`..`p`, 25 times over: a mask the sampling suffix cannot express,
+/// The regex naming the 16 tokens `a`..`p`, 25 times over: a mask the adjusted head applies on the device,
 /// that no 24-token run completes (so EOS is never allowed).
 pub(super) const SIXTEEN: &str = "[a-p]{25}";
 
-/// SC-001 and SC-006: a guided request with a DFA mask over 16 tokens falls back to the host sampling
-/// path and gets masked tokens; a seeded draw over the masked uniform logits differs from the greedy
-/// guided run (probability 16^-24 = 2^-96 of equality) and every token is allowed by the mask.
-/// Mutation: ignore the sampler in the host path (take the argmax of the masked row); the draw equals
-/// the greedy guided run.
+/// SC-001 and SC-006: a guided request with a DFA mask over 16 tokens runs the adjusted head and gets
+/// masked tokens; a seeded draw over the masked uniform logits differs from the greedy guided run
+/// (probability 16^-24 = 2^-96 of equality) and every token is allowed by the mask. No pick takes the
+/// host path.
+/// Mutation: bind the zero mask in `AdjustRow::of` (no mask); the tokens leave a..p.
 fn guided_requests_sample_inside_the_mask(choice: BackendChoice) {
     let handle = handle(Weights::ZeroHead, NO_EOS);
     let Some(mut driver) = driver(choice, &handle, 4, CAPACITY) else {
@@ -567,16 +652,11 @@ fn guided_requests_sample_inside_the_mask(choice: BackendChoice) {
     assert_ne!(sampled, greedy);
     assert_eq!(
         driver.stats().host_picks,
-        48,
-        "every guided pick took the host path"
+        0,
+        "every guided pick ran on the device"
     );
-    let before = driver.stats().host_picks;
     generate(&mut driver, &PROMPT, 4, Sampler::greedy());
-    assert_eq!(
-        driver.stats().host_picks,
-        before,
-        "an ordinary request never takes the host path"
-    );
+    assert_eq!(driver.stats().host_picks, 0, "so did an ordinary request");
 }
 per_backend!(
     BackendChoice,
@@ -588,9 +668,9 @@ per_backend!(
 
 /// SC-004 (c): the fixture's greedy tokens equal the literals recorded when this card landed, for the
 /// whole prompt in one prefill and in chunks of 5 (internal regression literals Card 737 keeps), and a
-/// host-path greedy request (logprobs force it) agrees with the device suffix. Mutation: flip the
-/// greedy tie-break to the last index; the host leg of the tie row below (and this row's host leg
-/// when two logits tie) takes a different token.
+/// greedy request with logprobs (the head with logprobs) agrees with the plain suffix. Mutation: flip the
+/// greedy tie-break to the last index; the logprob leg of the tie row below (and this row's when two
+/// logits tie) takes a different token.
 const FIXTURE_GREEDY: [u32; 24] = [
     33, 37, 41, 3, 41, 46, 41, 3, 8, 37, 41, 32, 41, 32, 44, 3, 8, 37, 3, 41, 41, 41, 41, 17,
 ];
@@ -646,7 +726,7 @@ fn vl_handle() -> Arc<ModelHandle> {
 /// A text-only Qwen2.5-VL prompt generates the plain qwen2 reference's tokens: the driver binds
 /// `Slot::MropePosition` with every token at its text position on the temporal, height and width
 /// axes, which is plain RoPE, so the tower over the same tensors runs the recorded literals of
-/// `fixture_tokens_equal_the_recorded_literals` (whole and chunked prefill, suffix and host path).
+/// `fixture_tokens_equal_the_recorded_literals` (whole and chunked prefill, plain head and logprob head).
 /// Mutation: bind `Slot::MropePosition` as zeros (`StepData::text_mrope`); every position rotates
 /// as position 0 and the tokens diverge from the literal.
 fn qwen25_vl_text_only_tokens_equal_the_plain_reference(choice: BackendChoice) {
@@ -751,9 +831,9 @@ per_backend!(
     chunked_prefill_equals_token_by_token_ptx
 );
 
-/// SC-004 tie-break row: with every logit equal, greedy takes the first index on the device suffix and
-/// on the host path alike. Mutation: flip the greedy tie-break to the last index; the host leg picks the
-/// last token (47) and the row fails.
+/// SC-004 tie-break row: with every logit equal, greedy takes the first index on the plain suffix and
+/// on the head with logprobs alike. Mutation: flip the greedy tie-break to the last index; the logprob leg
+/// picks the last token (47) and the row fails.
 fn greedy_ties_take_the_first_index(choice: BackendChoice) {
     let handle = handle(Weights::ZeroHead, NO_EOS);
     let Some(mut driver) = driver(choice, &handle, 4, CAPACITY) else {
@@ -1124,15 +1204,8 @@ fn recorded_family_handle_with(recorded: &RecordedFamily, restore: &Restore) -> 
         .find(|entry| entry.family.as_str() == name)
         .unwrap_or_else(|| panic!("no builtin family {name}"));
     let fixture = match variant {
-        "" => (entry.fixture)(),
-        variant => {
-            let (_, make) = entry
-                .variants
-                .iter()
-                .find(|(n, _)| *n == variant)
-                .unwrap_or_else(|| panic!("{name} has no variant {variant}"));
-            make()
-        }
+        "" => poot_models::test_support::family_fixtures::base(entry.family),
+        variant => poot_models::test_support::family_fixtures::variant(entry.family, variant),
     };
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(NO_EOS);
@@ -1376,6 +1449,7 @@ fn prepare_admitted(driver: Driver) -> Result<Driver<Serving>, Box<PrepareRefuse
         warm: Warm::Admitted,
         windows: &[],
         adapters: &[],
+        chain: None,
     })
 }
 
@@ -1537,7 +1611,10 @@ fn builtin_fixture_dir(family: &str) -> poot_test_util::UniqueTempPath {
         .iter()
         .find(|entry| entry.family.as_str() == family)
         .unwrap();
-    fixture_dir(&format!("{family}_fixture"), &(entry.fixture)())
+    fixture_dir(
+        &format!("{family}_fixture"),
+        &poot_models::test_support::family_fixtures::base(entry.family),
+    )
 }
 
 /// `ModelHandle::load` resolves the family before it reads a tensor: a checkpoint whose config names an
@@ -1648,12 +1725,7 @@ fn a_finetune_like_minimax_checkpoint_loads_through_model_handle_load() {
         .iter()
         .find(|entry| entry.family.as_str() == "minimax_m2")
         .unwrap();
-    let (_, finetune) = entry
-        .variants
-        .iter()
-        .find(|(name, _)| *name == "finetune")
-        .expect("minimax_m2 ships a finetune-like fixture");
-    let fixture = finetune();
+    let fixture = poot_models::test_support::family_fixtures::variant(entry.family, "finetune");
     let dir = fixture_dir("minimax_m2_finetune", &fixture);
     let handle =
         ModelHandle::load(&dir, &registry, &crate::driver::LoadOptions::default()).unwrap();
@@ -1674,12 +1746,7 @@ fn a_finetune_like_qwen35_checkpoint_loads_through_model_handle_load() {
         .iter()
         .find(|entry| entry.family.as_str() == "qwen35")
         .unwrap();
-    let (_, finetune) = entry
-        .variants
-        .iter()
-        .find(|(name, _)| *name == "finetune")
-        .expect("qwen35 ships a finetune-like fixture");
-    let fixture = finetune();
+    let fixture = poot_models::test_support::family_fixtures::variant(entry.family, "finetune");
     assert_eq!(fixture.config["text_config"]["num_hidden_layers"], 2);
     let dir = fixture_dir("qwen35_finetune", &fixture);
     let handle =
@@ -1705,12 +1772,7 @@ fn a_block_fp8_qwen35_checkpoint_loads_packed_through_model_handle_load() {
         .iter()
         .find(|entry| entry.family.as_str() == "qwen35")
         .unwrap();
-    let (_, fp8) = entry
-        .variants
-        .iter()
-        .find(|(name, _)| *name == "fp8")
-        .expect("qwen35 ships an FP8 fixture");
-    let fixture = fp8();
+    let fixture = poot_models::test_support::family_fixtures::variant(entry.family, "fp8");
     let mut config = fixture.config.clone();
     config["quantization_config"] = serde_json::json!({
         "quant_method": "fp8",
@@ -1847,7 +1909,7 @@ fn llama_fp8_and_decoded_twin() -> (Vec<ArchiveTensor>, Vec<ArchiveTensor>) {
         .iter()
         .find(|entry| entry.family.as_str() == "llama")
         .unwrap();
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     // Finite E4M3 codes of both signs, magnitude 2^-6 .. 2^0.
     let codes = [0x18u8, 0x20, 0x28, 0x30, 0x98, 0xa0, 0xa8, 0xb0];
     let (mut packed, mut twin) = (Vec::new(), Vec::new());
@@ -2098,7 +2160,7 @@ fn packed_checkpoints_load_as_stored_through_the_registry(choice: BackendChoice)
             .iter()
             .find(|entry| entry.family.as_str() == "llama")
             .unwrap();
-        let mut config = (entry.fixture)().config;
+        let mut config = poot_models::test_support::family_fixtures::base(entry.family).config;
         config["eos_token_id"] = serde_json::json!(NO_EOS);
         config
     };
@@ -3318,7 +3380,7 @@ fn family_handle(family: &str, eos: u32) -> Arc<ModelHandle> {
         .iter()
         .find(|entry| entry.family.as_str() == family)
         .unwrap_or_else(|| panic!("no builtin family {family}"));
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(eos);
     let raw = RawConfig::HfJson {
@@ -3344,7 +3406,7 @@ fn recurrent_family_handle(family: &str) -> Arc<ModelHandle> {
         .iter()
         .find(|entry| entry.family.as_str() == family)
         .unwrap_or_else(|| panic!("no builtin family {family}"));
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(NO_EOS);
     let raw = RawConfig::HfJson {
@@ -3402,6 +3464,7 @@ fn prepare_serving(
             warm: Warm::Admitted,
             windows: &windows,
             adapters: &[],
+            chain: None,
         })
         .unwrap()
 }
@@ -3884,11 +3947,89 @@ per_backend!(
     commit_keeps_fewer_than_returned_ptx
 );
 
-/// SC-006: a step mixing one greedy row and one guided row runs the logits entry for the whole step and
+/// SC-005 (device side): a chain of three decode steps returns the tokens three ordinary steps return,
+/// for a plain row and a row with penalties side by side, and waits once for the three. The second row
+/// shows the history flows through the chain: each chained step adds its token to the device history
+/// before the next step reads it. Mutation: skip the history write of a chained step (bind the write map
+/// as all `-1` for steps after the first); the penalized row's tokens diverge.
+fn chained_decode_steps_equal_stepwise_decode(choice: BackendChoice) {
+    const STEPS: usize = 3;
+    let handle = family_handle("qwen2", NO_EOS);
+    let Some(driver) = serving_driver(choice, &handle) else {
+        return;
+    };
+    let Some(mut reference) = solo_driver(choice, &handle) else {
+        return;
+    };
+    let penalized = || Sampler::greedy().with_penalties(1.4, 0.3, 0.2);
+    let max_new = 1 + 3 * STEPS;
+    let want_plain = generate(&mut reference, &MEDIUM, max_new, Sampler::greedy());
+    let want_penalized = generate(&mut reference, &SHORT, max_new, penalized());
+
+    let heads = [
+        Head::GREEDY,
+        Head::Sample(SampleSpec::draw(SampleRule::Greedy).adjusted()),
+    ];
+    let rows = [nz(2)];
+    let shapes = ServingShapes {
+        layout: Layout::Paged(pool_shape(8, 2)),
+        rows: &rows,
+        heads: &heads,
+        warm: Warm::Admitted,
+        windows: &[],
+        adapters: &[],
+        chain: Some(nz(STEPS)),
+    };
+    let mut driver = driver.prepare(&shapes).unwrap();
+    let (plain, _) = Lane::open(&mut driver, &MEDIUM, max_new, Sampler::greedy());
+    let (adjusted, _) = Lane::open(&mut driver, &SHORT, max_new, penalized());
+    let mut lanes = [plain, adjusted];
+    // Prefill both lanes: the first token of each.
+    while lanes.iter().any(|lane| lane.out.is_empty()) {
+        step_lanes(&mut driver, &mut lanes, &[0, 1]);
+    }
+    let waits = driver.executor_stats().waits;
+    for _ in 0..3 {
+        let mut rows: Vec<StepRow<'_>> = lanes
+            .iter_mut()
+            .map(|lane| StepRow {
+                seq: lane.seq,
+                work: RowWork::Chain { steps: nz(STEPS) },
+                sampler: &mut lane.sampler,
+            })
+            .collect();
+        let results = driver.step(&mut rows).unwrap();
+        drop(rows);
+        for result in results {
+            let lane = lanes.iter_mut().find(|l| l.seq == result.seq).unwrap();
+            assert_eq!(result.tokens.len(), STEPS);
+            lane.out.extend(&result.tokens);
+            driver
+                .commit(result.seq, result.tokens.len(), &mut lane.sampler)
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        driver.executor_stats().waits - waits,
+        3,
+        "three chains of three steps: one wait each"
+    );
+    assert_eq!(lanes[0].out, want_plain, "the plain row");
+    assert_eq!(lanes[1].out, want_penalized, "the penalized row");
+}
+per_backend!(
+    BackendChoice,
+    chained_decode_steps_equal_stepwise_decode,
+    chained_decode_steps_equal_stepwise_decode_wgpu,
+    chained_decode_steps_equal_stepwise_decode_rocm,
+    chained_decode_steps_equal_stepwise_decode_ptx
+);
+
+/// SC-006: a step mixing one greedy row and one guided row runs the adjusted head for the whole step and
 /// returns the sampler's token for both rows, matching `generate` for each row alone, and no step
-/// compiles. Mutation: drop the logits branch and always run the plain suffix; the guided row's token
-/// is the unmasked argmax and diverges.
-fn a_guided_row_takes_the_whole_step_to_the_logits_entry(choice: BackendChoice) {
+/// compiles. Neither pick takes the host path. Mutation: run the plain suffix for the mixed step; the
+/// guided row's token is the unmasked argmax and diverges.
+fn a_guided_row_takes_the_adjusted_head_for_the_whole_step(choice: BackendChoice) {
     let handle = family_handle("qwen2", NO_EOS);
     let Some(driver) = serving_driver(choice, &handle) else {
         return;
@@ -3921,7 +4062,10 @@ fn a_guided_row_takes_the_whole_step_to_the_logits_entry(choice: BackendChoice) 
         driver,
         pool_shape(8, 2),
         &[2],
-        &[Head::GREEDY, Head::Logits],
+        &[
+            Head::GREEDY,
+            Head::Sample(SampleSpec::draw(SampleRule::Greedy).guided()),
+        ],
         &[],
     );
     let compiled = driver.compile_count();
@@ -3934,7 +4078,7 @@ fn a_guided_row_takes_the_whole_step_to_the_logits_entry(choice: BackendChoice) 
         guided(Sampler::greedy()),
     );
     let mut lanes = [plain, masked];
-    // The plain row alone first: the suffix entry; then both: the logits entry.
+    // The plain row alone first: the plain suffix entry; then both: the adjusted entry.
     while lanes[0].out.len() < 3 {
         step_lanes(&mut driver, &mut lanes, &[0]);
     }
@@ -3949,9 +4093,10 @@ fn a_guided_row_takes_the_whole_step_to_the_logits_entry(choice: BackendChoice) 
         "the greedy row beside a guided one"
     );
     assert_eq!(lanes[1].out, want_guided, "the guided row");
-    assert!(
-        driver.stats().host_picks > host_before,
-        "the guided row took the host path"
+    assert_eq!(
+        driver.stats().host_picks,
+        host_before,
+        "the guided row masked on the device, not on the host"
     );
     assert_eq!(
         driver.compile_count(),
@@ -3961,10 +4106,10 @@ fn a_guided_row_takes_the_whole_step_to_the_logits_entry(choice: BackendChoice) 
 }
 per_backend!(
     BackendChoice,
-    a_guided_row_takes_the_whole_step_to_the_logits_entry,
-    a_guided_row_takes_the_whole_step_to_the_logits_entry_wgpu,
-    a_guided_row_takes_the_whole_step_to_the_logits_entry_rocm,
-    a_guided_row_takes_the_whole_step_to_the_logits_entry_ptx
+    a_guided_row_takes_the_adjusted_head_for_the_whole_step,
+    a_guided_row_takes_the_adjusted_head_for_the_whole_step_wgpu,
+    a_guided_row_takes_the_adjusted_head_for_the_whole_step_rocm,
+    a_guided_row_takes_the_adjusted_head_for_the_whole_step_ptx
 );
 
 // ---------------------------------------------------------------------------------------------
@@ -3980,7 +4125,7 @@ fn poisoned_router_handle(family: &str, key_to_poison: &str) -> Arc<ModelHandle>
         .iter()
         .find(|entry| entry.family.as_str() == family)
         .unwrap();
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(NO_EOS);
     let mut store = WeightStore::builder();
@@ -4203,12 +4348,7 @@ fn a_finetune_like_deepseek4_checkpoint_loads_through_model_handle_load() {
         .iter()
         .find(|entry| entry.family.as_str() == "deepseek4")
         .unwrap();
-    let (_, finetune) = entry
-        .variants
-        .iter()
-        .find(|(name, _)| *name == "finetune")
-        .expect("deepseek4 ships a finetune-like fixture");
-    let fixture = finetune();
+    let fixture = poot_models::test_support::family_fixtures::variant(entry.family, "finetune");
     let dir = fixture_dir("deepseek4_finetune", &fixture);
     let handle =
         ModelHandle::load(&dir, &registry, &crate::driver::LoadOptions::default()).unwrap();
@@ -4230,12 +4370,7 @@ fn a_finetune_like_glm53_flash_checkpoint_loads_through_model_handle_load() {
         .iter()
         .find(|entry| entry.family.as_str() == "glm53_flash")
         .unwrap();
-    let (_, finetune) = entry
-        .variants
-        .iter()
-        .find(|(name, _)| *name == "finetune")
-        .expect("glm53_flash ships a finetune-like fixture");
-    let fixture = finetune();
+    let fixture = poot_models::test_support::family_fixtures::variant(entry.family, "finetune");
     let dir = fixture_dir("glm53_flash_finetune", &fixture);
     let handle =
         ModelHandle::load(&dir, &registry, &crate::driver::LoadOptions::default()).unwrap();
@@ -4759,13 +4894,8 @@ fn encoder_family_handle(family: &str, variant: Option<&str>) -> (Arc<ModelHandl
         .find(|entry| entry.family.as_str() == family)
         .unwrap();
     let fixture = match variant {
-        None => (entry.fixture)(),
-        Some(name) => entry
-            .variants
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, f)| f())
-            .unwrap(),
+        None => poot_models::test_support::family_fixtures::base(entry.family),
+        Some(name) => poot_models::test_support::family_fixtures::variant(entry.family, name),
     };
     let handle =
         ModelHandle::from_checkpoint(&fixture.raw(), fixture.store.clone(), &registry, |_| {
@@ -5542,6 +5672,7 @@ fn smolvlm_batched_paged_embeds_match_single_row_runs(choice: BackendChoice) {
                 warm: Warm::Admitted,
                 windows: &[],
                 adapters: &[],
+                chain: None,
             },
             &[EMBEDS],
         )
@@ -5643,6 +5774,7 @@ fn smolvlm_front_end_requests_served_batched_equal_single_row_captions(choice: B
                 warm: Warm::Admitted,
                 windows: &[],
                 adapters: &[],
+                chain: None,
             },
             &[EMBEDS],
         )
@@ -5714,6 +5846,7 @@ fn paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks(choice: Backend
                 warm: Warm::Admitted,
                 windows: &[],
                 adapters: &[],
+                chain: None,
             },
             &[EMBEDS],
         )
@@ -6315,7 +6448,9 @@ fn family_handle_over(family: &str, eos: u32, store: WeightStore) -> Arc<ModelHa
         .iter()
         .find(|entry| entry.family.as_str() == family)
         .unwrap_or_else(|| panic!("no builtin family {family}"));
-    let mut config = (entry.fixture)().config.clone();
+    let mut config = poot_models::test_support::family_fixtures::base(entry.family)
+        .config
+        .clone();
     config["eos_token_id"] = serde_json::json!(eos);
     let raw = RawConfig::HfJson {
         config: &config,
@@ -6463,7 +6598,13 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
 
     let shapes = |adapters: &[crate::driver::GenerationId]| {
         let pool = pool_shape(8, 4);
-        let (rows, heads) = ([nz(1)], [Head::GREEDY, Head::Logits]);
+        let (rows, heads) = (
+            [nz(1)],
+            [
+                Head::GREEDY,
+                Head::Sample(SampleSpec::draw(SampleRule::Greedy).with_logprobs(5)),
+            ],
+        );
         (pool, rows, heads, adapters.to_vec())
     };
     let prepare = |driver: Driver, adapters: &[crate::driver::GenerationId]| {
@@ -6476,6 +6617,7 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
                 warm: Warm::Prompts(&[prompt.len()]),
                 windows: &[],
                 adapters: &adapters,
+                chain: None,
             })
             .unwrap()
     };
@@ -6490,6 +6632,7 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
                 warm: Warm::Prompts(&[prompt.len()]),
                 windows: &[],
                 adapters: &adapters,
+                chain: None,
             })
             .unwrap();
     };

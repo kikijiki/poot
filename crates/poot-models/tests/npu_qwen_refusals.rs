@@ -89,15 +89,15 @@ fn refusal_table(
 }
 
 /// The traced block's refusals on a target that records no narrowing contract, pinned: (op, missing capability)
-/// and the number of equations. Five groups of the 111 equations. Every op the block uses has an opset lowering
+/// and the number of equations. Five groups of the 105 equations. Every op the block uses has an opset lowering
 /// (POOT-1177), so what is left is one cause: the tracer emits F32 where the device computes FP16 and nothing
 /// bounds narrowing it (POOT-1178), and the `cast` is a conversion through BF16 or an integer that changes the
-/// value. The 49 equations the lowering admits are the ones that move data, the two `dynamic_update_slice` and
-/// the two `iota` among them.
+/// value. The 45 equations the lowering admits are the ones that move data, the two `dynamic_update_slice` and
+/// the `iota` among them.
 const UNCONTRACTED_REFUSALS: [(&str, usize); 5] = [
     (
         "binary                       NarrowingContract { dtype: F32 }",
-        38,
+        36,
     ),
     ("cast                         DtypeLowering", 1),
     (
@@ -145,7 +145,7 @@ fn pinned(rows: &[(&str, usize)]) -> BTreeMap<String, usize> {
 /// Mutation: in `compile` run `fuse_index_casts` for every target; the outcome is the untyped
 /// `BinaryValueDtypeMismatch` edit error and the compile-outcome row fails.
 ///
-/// Mutation: in `opset_op` delete the `OpKind::Iota` arm; the two `iota` equations come back as a refusal and the
+/// Mutation: in `opset_op` delete the `OpKind::Iota` arm; the `iota` equation comes back as a refusal and the
 /// table no longer matches.
 ///
 /// Mutation: drop the `narrowed` clamp in `arithmetic_scalar` (poot-graph-plan); the `sub` by `1e9` comes

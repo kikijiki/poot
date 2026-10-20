@@ -90,7 +90,7 @@ fn run_moe(gpu: &mut PtxDevice, out: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
         })
         .collect();
     let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
-        stack_id: "experts".to_string(),
+        stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
         descriptor: owners[0].weight(),
         experts: EXPERTS,
     };

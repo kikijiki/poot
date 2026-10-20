@@ -26,6 +26,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use poot_graph_ir::ops::MASK_HIDDEN;
 use poot_graph_ir::rope_table::{RopeFlavor, RopeSpec, RopeTable};
 use poot_graph_ir::{
     BinOp, Builder, ComputedConst, Graph, Scalar, Slot, SlotKey, TensorType, Traced, UnOp, ops,
@@ -49,7 +50,9 @@ use crate::model::{
 };
 use crate::multimodal::idefics3::tower::{PIXELS, PIXELS_TAG};
 use crate::names::{NameRow, Presence, Source, family_weights};
-use crate::registry::{Fixture, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::RawConfig;
 use poot_text::{ChatFormat, HermesToolCodec};
 
 /// The Qwen2.5-VL vision tower's [`FamilyKey`]: a family of its own beside the text tower's.
@@ -96,10 +99,6 @@ fn patch_input(id: InputId, tag: &str, dtype: DType, trailing: Vec<usize>) -> Re
 
 /// The base of the vision tower's rotary frequencies (`VisionRotaryEmbedding`'s default).
 const ROTARY_THETA: f32 = 10_000.0;
-
-/// The score added where an attention mask forbids a key: large enough to weigh zero after the softmax
-/// of any score the tower produces, finite so no NaN can arise.
-const MASKED: f32 = -1.0e9;
 
 /// The most patches one step takes. Attention is dense over a step's patches (the windows are a mask),
 /// so a step's score matrices grow with the square of this; a larger image is the caller's to refuse
@@ -558,7 +557,7 @@ pub(super) fn build(
 }
 
 /// The additive attention mask `[rows, 1, patches, patches]` of `ids` (`[rows, patches]` F32): `0`
-/// where two patches carry the same id, [`MASKED`] elsewhere.
+/// where two patches carry the same id, [`MASK_HIDDEN`] elsewhere.
 /// The refusal of a value whose rank is not the one `operation` reads.
 fn rank_error(operation: &'static str, expected: usize, found: Vec<usize>) -> TraceError {
     poot_graph_ir::BuilderError::Requirement {
@@ -583,7 +582,7 @@ fn same_id_mask(b: &Builder, ids: Traced) -> Result<Traced, TraceError> {
         b.binary(BinOp::Ge, along_columns, along_rows)?,
     )?;
     let different = b.binary_scalar(BinOp::Sub, same, Scalar::F32(1.0))?;
-    Ok(b.binary_scalar(BinOp::Mul, different, Scalar::F32(-MASKED))?)
+    Ok(b.binary_scalar(BinOp::Mul, different, Scalar::F32(-MASK_HIDDEN))?)
 }
 
 /// `x` (`[rows, heads, patches, head_dim]`) rotated by the 2-D rotary table: the first quarter of the
@@ -761,6 +760,7 @@ impl Model for Qwen25VlVision {
 }
 
 /// The fixture's `vision_config`; see [`fixture`].
+#[cfg(feature = "test-support")]
 pub(super) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "depth": 4,
@@ -781,6 +781,7 @@ pub(super) fn fixture_config() -> serde_json::Value {
 /// A tiny tower: 16-wide blocks of two 8-wide heads over 2-pixel patches that merge 2 x 2 into
 /// 64-wide rows (the width of the qwen2 fixture's text tower), windows of 2 x 2 cells, and blocks 1
 /// and 3 attending over the whole frame.
+#[cfg(feature = "test-support")]
 pub(super) fn fixture() -> Fixture {
     let config = fixture_config();
     let n = |f: &str| crate::registry::Fixture::count(&config, f);

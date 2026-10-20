@@ -17,6 +17,9 @@ use crate::components::testing::{
     CAP, assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build, close_all,
     q8_0_store, step_shape, values,
 };
+use crate::model::Model;
+use crate::model::StepSpec;
+use crate::model::TraceError;
 use crate::model::{LogitRows, ShapeReason, StepShape};
 use crate::registry::Registry;
 

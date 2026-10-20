@@ -17,7 +17,7 @@ use poot_executor::{
 };
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::{BinOp, RedOp, SampleRule};
-use poot_graph_ir::ops::sampling::sample_head;
+use poot_graph_ir::ops::sampling::{SampleSpec, sample_head};
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{Graph, Slot, SlotKey, Storage, TensorType, ValueId};
 use poot_graph_plan::{
@@ -885,7 +885,13 @@ fn card551b_suffix_graph(rule: SampleRule) -> (Graph, Graph, ValueId, ValueId) {
     let base = decode_graph();
     let base_for_slots = base.clone();
     let resumed = Builder::resume(base, poot_graph_ir::TraceLimits::for_tests()).unwrap();
-    let sh = sample_head(&resumed.builder, resumed.outputs.result, rule).unwrap();
+    let sh = sample_head(
+        &resumed.builder,
+        resumed.outputs.result,
+        SampleSpec::draw(rule),
+        None,
+    )
+    .unwrap();
     let seed_id = sh
         .seed
         .expect("a non-Greedy rule declares a seed slot")
@@ -1017,7 +1023,13 @@ fn card551b_sc003_nan_logits_are_a_typed_fault_ptx() {
         let base = decode_graph();
         let base_for_slots = base.clone();
         let resumed = Builder::resume(base, poot_graph_ir::TraceLimits::for_tests()).unwrap();
-        let sh = sample_head(&resumed.builder, resumed.outputs.result, rule).unwrap();
+        let sh = sample_head(
+            &resumed.builder,
+            resumed.outputs.result,
+            SampleSpec::draw(rule),
+            None,
+        )
+        .unwrap();
         let (seed_id, params_id) = (sh.seed.map(|t| t.id()), sh.params.map(|t| t.id()));
         let suffix_g = resumed
             .builder

@@ -1,4 +1,4 @@
-//! qwen3-MoE behind [`Model`]: qwen3's body (per-head Q/K RMSNorm before RoPE, an explicit
+//! qwen3-MoE: qwen3's body (per-head Q/K RMSNorm before RoPE, an explicit
 //! `head_dim`) whose feed-forward is a routed mixture of experts on some layers and the plain gated
 //! FFN on the others.
 //!
@@ -7,47 +7,30 @@
 //! (`decoder_sparse_step`, `mlp_only_layers`); a GGUF has no key for it, so a layer routes there
 //! exactly when it holds a router tensor.
 
-use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-
-use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
 
-use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
+use crate::components::attention::QkNorm;
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
-use crate::components::ffn::{GatedFfnWeights, gated_ffn};
-use crate::components::linear::WeightError;
-use crate::components::moe::{self, MoeParams, MoeWeights};
+use crate::components::moe::MoeParams;
 use crate::components::router::RouterKind;
-use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    decoder_program, standard_layer, standard_stack,
-};
-use crate::io::ModelSchema;
-use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ParamBlock, StepSpec, TraceError,
-    WiringError,
-};
+use crate::model::{ConfigReason, FamilyKey, ModelError};
 use crate::names::gguf::{GGUF_BASE, GGUF_QK_NORM};
-use crate::names::{
-    ExpertNames, HF_BASE, HF_QK_NORM, MoeLayers, MoeNames, family_weights_routed, hf_base_shapes,
-};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::names::hf_base_shapes;
+use crate::names::{ExpertNames, HF_BASE, HF_QK_NORM, MoeNames};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
+use std::sync::Arc;
+
+use crate::components::standard_family::{
+    Mlp, StandardFamily, StandardParams, entry, weights_with_experts,
+};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("qwen3moe");
 
-pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
-    family: FAMILY,
-    keys: &[
-        (ConfigSource::HfModelType, "qwen3_moe"),
-        (ConfigSource::GgufArchitecture, "qwen3moe"),
-    ],
-    build,
-    fixture,
-    variants: &[],
-};
+pub(crate) const ENTRY: FamilyEntry = entry::<Qwen3Moe>();
 
 /// qwen3-MoE's config facts: `Qwen3MoeConfig`'s defaults (the class declares no `eos_token_id`: a
 /// checkpoint names it) and llama.cpp's GGUF base default.
@@ -124,28 +107,17 @@ const GGUF_MOE: MoeNames = MoeNames {
     ],
 };
 
-/// qwen3-MoE's typed config: every value checked once, here, so tracing cannot fail on it.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Qwen3MoeParams {
-    vocab: usize,
-    width: usize,
-    /// The dense layers' FFN width; `None` when the config does not state one.
-    dense_inter: Option<usize>,
-    layers: usize,
-    max_positions: usize,
-    attention: AttentionParams,
-    layer: LayerParams,
-    stack: StackParams,
-    moe: MoeParams,
-    /// Per layer: routed (`true`) or the plain gated FFN.
-    sparse: Vec<bool>,
-    head_required: bool,
-    eos: BTreeSet<u32>,
-    bos: Option<u32>,
-}
+/// qwen3-MoE: routed layers beside plain gated ones, by the config's sparsity.
+pub(crate) struct Qwen3Moe;
 
-impl Qwen3MoeParams {
-    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+impl StandardFamily for Qwen3Moe {
+    const FAMILY: FamilyKey = FAMILY;
+    const KEYS: &'static [(ConfigSource, &'static str)] = &[
+        (ConfigSource::HfModelType, "qwen3_moe"),
+        (ConfigSource::GgufArchitecture, "qwen3moe"),
+    ];
+
+    fn configure(raw: &RawConfig<'_>) -> Result<StandardParams, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let dims = DenseDims::read_with_inter(&fields, &SPEC, EXPERT_INTER)?;
         for unsupported in ["attention_bias", "use_sliding_window"] {
@@ -172,26 +144,40 @@ impl Qwen3MoeParams {
             RouterKind::SoftmaxTopK { renormalize },
         )?;
         let sparse = sparse_layers(&fields, dims.layers)?;
-        if dense_inter.is_none() && sparse.contains(&false) {
-            return Err(fields.error(fields.key(DENSE_INTER), ConfigReason::Missing));
-        }
-        Ok(Self {
-            attention: dims
-                .attention(&fields, &SPEC, false)?
-                .with_qk_norm(QkNorm::PerHead(norm)),
-            layer: LayerParams::new(norm),
-            stack: StackParams::new(norm),
-            vocab: dims.vocab,
-            width: dims.width,
-            dense_inter,
-            layers: dims.layers,
-            max_positions: dims.max_positions,
-            moe,
-            sparse,
-            head_required: dims.head_required,
-            eos: dims.eos,
-            bos: dims.bos,
+        let attention = dims
+            .attention(&fields, &SPEC, false)?
+            .with_qk_norm(QkNorm::PerHead(norm));
+        // A dense layer needs the width the config states for it.
+        let mlp = sparse
+            .iter()
+            .map(|&routed| match (routed, dense_inter) {
+                (true, _) => Ok(Mlp::Routed(moe)),
+                (false, Some(inter)) => Ok(Mlp::Gated { inter }),
+                (false, None) => Err(fields.error(fields.key(DENSE_INTER), ConfigReason::Missing)),
+            })
+            .collect::<Result<Vec<_>, ModelError>>()?;
+        Ok(StandardParams {
+            mlp,
+            ..StandardParams::dense(
+                &dims,
+                norm,
+                attention,
+                ChatFormat::ChatML,
+                Some(Arc::new(HermesToolCodec)),
+            )
         })
+    }
+
+    fn weights(
+        raw: &RawConfig<'_>,
+        store: &WeightStore,
+        params: &mut StandardParams,
+    ) -> Result<WeightMap, ModelError> {
+        let (tables, names): ([&[_]; 2], &MoeNames) = match raw.source() {
+            ConfigSource::HfModelType => ([HF_BASE, HF_QK_NORM], &HF_MOE),
+            ConfigSource::GgufArchitecture => ([GGUF_BASE, GGUF_QK_NORM], &GGUF_MOE),
+        };
+        weights_with_experts(FAMILY, store, &tables, names, params)
     }
 }
 
@@ -237,132 +223,10 @@ fn sparse_layers(fields: &Fields<'_>, layers: usize) -> Result<Vec<bool>, ModelE
     }
 }
 
-#[derive(Debug)]
-enum Ffn {
-    Dense(Box<GatedFfnWeights>),
-    Routed(Box<MoeWeights>),
-}
-
-#[derive(Debug)]
-struct Layer {
-    norms: LayerNorms,
-    attn: AttentionWeights,
-    ffn: Ffn,
-}
-
-#[derive(Debug)]
-pub(crate) struct Qwen3Moe {
-    params: Qwen3MoeParams,
-    weights: WeightMap,
-    stack: StackWeights,
-    layers: Vec<Layer>,
-    config: ModelConfig,
-    schema: ModelSchema,
-}
-
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    let p = Qwen3MoeParams::from_raw(raw)?;
-    let (tables, names): ([&[_]; 2], &MoeNames) = match raw.source() {
-        ConfigSource::HfModelType => ([HF_BASE, HF_QK_NORM], &HF_MOE),
-        ConfigSource::GgufArchitecture => ([GGUF_BASE, GGUF_QK_NORM], &GGUF_MOE),
-    };
-    let weights = family_weights_routed(
-        FAMILY,
-        store,
-        &tables,
-        p.layers,
-        p.head_required,
-        MoeLayers {
-            names,
-            sparse: &p.sparse,
-            experts: p.moe.experts(),
-        },
-    )?;
-    let weight_error = |e: WeightError| e.for_family(FAMILY);
-    let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
-    let layers = (0..p.layers)
-        .map(|l| {
-            let ffn = match (p.sparse[l], p.dense_inter) {
-                (true, _) => Ffn::Routed(Box::new(MoeWeights::new(&weights, l, &p.moe)?)),
-                (false, Some(inter)) => {
-                    Ffn::Dense(Box::new(GatedFfnWeights::new(&weights, l, p.width, inter)?))
-                }
-                (false, None) => {
-                    return Err(WiringError::MissingParams(ParamBlock::Dense).into());
-                }
-            };
-            Ok(Layer {
-                norms: LayerNorms::new(&weights, l, p.width)?,
-                attn: AttentionWeights::new(&weights, l, p.width, &p.attention)?,
-                ffn,
-            })
-        })
-        .collect::<Result<Vec<_>, WeightError>>()
-        .map_err(weight_error)?;
-    let schema = ModelSchema::builder()
-        .step(decoder_program(p.vocab))
-        .build_for(FAMILY)?;
-    let config = ModelConfig {
-        family: FAMILY,
-        vocab: p.vocab,
-        max_positions: p.max_positions,
-        eos: p.eos.clone(),
-        bos: p.bos,
-        prompt_bos: None,
-        prefill_granule: NonZeroUsize::MIN,
-        chat: ChatFormat::ChatML,
-        tool_codec: Some(Arc::new(HermesToolCodec)),
-    };
-    Ok(ModelParts::new(Box::new(Qwen3Moe {
-        params: p,
-        weights,
-        stack,
-        layers,
-        config,
-        schema,
-    })))
-}
-
-impl Model for Qwen3Moe {
-    fn config(&self) -> &ModelConfig {
-        &self.config
-    }
-
-    fn schema(&self) -> &ModelSchema {
-        &self.schema
-    }
-
-    fn weights(&self) -> &WeightMap {
-        &self.weights
-    }
-
-    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
-        let p = &self.params;
-        let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        moe::check_step(FAMILY, shape, &p.moe)?;
-        let step = Step::new(&b, shape)?;
-        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
-            let layer = &self.layers[l];
-            standard_layer(
-                b,
-                x,
-                &layer.norms,
-                &p.layer,
-                |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
-                |b, BlockInput { block: h, .. }| match &layer.ffn {
-                    Ffn::Dense(w) => gated_ffn(b, h, w),
-                    Ffn::Routed(w) => moe::moe(b, &step, l, h, None, w, &p.moe),
-                },
-            )
-        })?;
-        Ok(step.finish(b, logits)?)
-    }
-}
-
 /// The fixture's config: a tiny untied qwen3-MoE of two layers, the first dense and the second
 /// routed (`decoder_sparse_step` 2), with `head_dim` 32 and projection widths that are multiples
 /// of 32 (so a Q8_0 copy of its store is a valid checkpoint too).
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "qwen3_moe",
@@ -388,7 +252,8 @@ pub(crate) fn fixture_config() -> serde_json::Value {
     })
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let n = |f: &str| crate::registry::Fixture::count(&config, f);
     let (h, d) = (n("hidden_size"), n("head_dim"));
@@ -430,6 +295,7 @@ fn fixture() -> Fixture {
 }
 
 /// Which layers of a fixture `config` route, by the HF rule.
+#[cfg(feature = "test-support")]
 fn sparse_flags(config: &serde_json::Value) -> Vec<bool> {
     let step = config["decoder_sparse_step"].as_u64().unwrap() as usize;
     (0..config["num_hidden_layers"].as_u64().unwrap() as usize)
@@ -445,15 +311,31 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::components::standard_family::{Mlp, StandardParams};
+
+    /// Which layers of `params` route.
+    fn routed_layers(params: &StandardParams) -> Vec<bool> {
+        params
+            .mlp
+            .iter()
+            .map(|mlp| matches!(mlp, Mlp::Routed(_)))
+            .collect()
+    }
     use crate::components::standard::oracle::run_step;
+    use crate::components::standard_family::StandardFamily;
     use crate::components::testing::{
         CAP, GGML_Q8_0, assert_chunked_prefill_equals_decode, assert_missing_weight_is_named,
         build as built, close, close_all, decoded, f32_entry, gguf_dense_kvs, gguf_name_with_head,
         gguf_tensor, q8_0_store, read_back_owned, step_shape, values,
     };
     use crate::components::witness::WitnessKind;
+    use crate::model::Model;
+    use crate::model::StepSpec;
+    use crate::model::TraceError;
     use crate::model::{LogitRows, StepShape};
     use crate::registry::Registry;
+    use std::collections::BTreeSet;
+    use std::num::NonZeroUsize;
 
     fn model_of(config: &serde_json::Value, store: &WeightStore) -> Box<dyn Model> {
         let raw = RawConfig::HfJson {
@@ -638,7 +520,7 @@ mod tests {
             generation: None,
             preprocessor: None,
         };
-        match build(&raw, &fixture().store) {
+        match (ENTRY.build)(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
             other => panic!("{config}: expected a config error, got {other:?}"),
         }
@@ -706,7 +588,10 @@ mod tests {
             generation: None,
             preprocessor: None,
         };
-        assert_eq!(Qwen3MoeParams::from_raw(&raw).unwrap().sparse, [true, true]);
+        assert_eq!(
+            routed_layers(&Qwen3Moe::configure(&raw).unwrap()),
+            [true, true]
+        );
     }
 
     /// HF's `Qwen3MoeDecoderLayer` rule: `mlp_only_layers` forces a layer dense and
@@ -723,7 +608,7 @@ mod tests {
                 generation: None,
                 preprocessor: None,
             };
-            Qwen3MoeParams::from_raw(&raw).unwrap().sparse
+            routed_layers(&Qwen3Moe::configure(&raw).unwrap())
         };
         assert_eq!(sparse(1, json!([])), [true; 4]);
         assert_eq!(sparse(2, json!([])), [false, true, false, true]);
@@ -806,7 +691,7 @@ mod tests {
         assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
         let model = registry.build(&raw, &store).unwrap();
         assert_eq!(
-            Qwen3MoeParams::from_raw(&raw).unwrap().sparse,
+            routed_layers(&Qwen3Moe::configure(&raw).unwrap()),
             [false, true]
         );
         let experts = WeightId::layer(1, WeightRole::Moe(MoeRole::Stack(ExpertProj::Gate)));
@@ -842,7 +727,7 @@ mod tests {
                 without.insert(key.clone(), entry.clone()).unwrap();
             }
         }
-        let err = build(&RawConfig::Gguf(&index), &without.build()).unwrap_err();
+        let err = (ENTRY.build)(&RawConfig::Gguf(&index), &without.build()).unwrap_err();
         assert!(
             matches!(
                 &err,

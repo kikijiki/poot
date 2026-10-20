@@ -38,8 +38,8 @@ use crate::components::norm::NormParams;
 use crate::components::rope::RopeParams;
 use crate::components::router::{RouterBias, RouterKind, SigmoidTopK};
 use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    decoder_program, standard_layer, standard_stack,
+    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, decoder_program,
+    standard_layer, standard_stack,
 };
 use crate::io::ModelSchema;
 use crate::model::{
@@ -49,7 +49,9 @@ use crate::model::{
 use crate::names::{
     ExpertNames, MoeLayers, MoeNames, NameRow, Presence, SharedNames, Source, family_weights_routed,
 };
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("deepseek2");
@@ -61,8 +63,6 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
         (ConfigSource::GgufArchitecture, "deepseek2"),
     ],
     build,
-    fixture,
-    variants: &[],
 };
 
 /// How a router scores the experts before it selects.
@@ -849,7 +849,6 @@ pub(crate) struct Deepseek {
     layers: Vec<Layer>,
     config: ModelConfig,
     schema: ModelSchema,
-    family: FamilyKey,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
@@ -943,7 +942,6 @@ pub(crate) fn build_family(
         layers,
         config,
         schema,
-        family: kind.family,
     })))
 }
 
@@ -963,8 +961,6 @@ impl Model for Deepseek {
     fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         let shape = spec.shape;
-        check_step(self.family, shape, p.max_positions)?;
-        moe::check_step(self.family, shape, &p.moe)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
@@ -995,6 +991,7 @@ impl Model for Deepseek {
 
 /// The fixture's config: a tiny V2 with a low-rank query, YaRN with `mscale`, group-limited
 /// routing and two shared experts, whose widths are multiples of 32 where a Q8_0 copy needs them.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "deepseek_v2",
@@ -1038,6 +1035,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 /// The tensors of an HF DeepSeek MLA checkpoint of `config` (`bias` adds the V3 selection bias,
 /// `indexer` the V3.2 indexer's weights), by HF name.
+#[cfg(feature = "test-support")]
 pub(crate) fn hf_shapes(
     config: &serde_json::Value,
     bias: bool,
@@ -1123,7 +1121,8 @@ pub(crate) fn hf_shapes(
     shapes
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = hf_shapes(&config, false, false);
     Fixture::bf16(config, shapes)

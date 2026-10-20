@@ -220,6 +220,25 @@ pub enum InvalidRequest {
         "sequence {0:?} picks with more than the greedy suffix, in a step that carries a verify window"
     )]
     WindowStepNeedsGreedy(SeqId),
+    /// A chained step mixes rows that do not chain together: a row that is not a chain, or chains of
+    /// different lengths.
+    #[error("the rows of a chained step all chain the same number of steps")]
+    MixedChain,
+    /// A chained step needs a sampling head whose pick the device can carry into the next step: a plain
+    /// or adjusted draw with no logprobs and no guided mask.
+    #[error("a chained step cannot run on {head:?}")]
+    ChainHead {
+        /// The head the rows' samplers need.
+        head: Option<Head>,
+    },
+    /// The rows of a step ask more of the sampler than any prepared sampling head serves: a draw rule,
+    /// an adjustment or logprobs that no head in the prepared set covers. Every sampling rule runs on
+    /// the device, so there is no host pick to fall back to; the caller prepares the head it serves.
+    #[error("no prepared sampling head serves {need:?}")]
+    HeadNotPrepared {
+        /// What the step's picking rows ask of the head, joined.
+        need: poot_graph_ir::ops::sampling::SampleSpec,
+    },
     /// `generate` on a paged driver whose pool cannot hold the request.
     #[error("the paged pool cannot hold the request: {needed_blocks} more blocks needed")]
     NoRoom {
@@ -298,6 +317,9 @@ pub enum EncodeError {
 /// A [`DriverOptions`](crate::driver::DriverOptions) value the model cannot honor.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InvalidOptions {
+    /// A chain of 256 or more steps: a step of a chain is numbered in a byte.
+    #[error("a chained dispatch is at most 255 steps")]
+    ChainTooLong,
     /// An input to prepare entries for that the model's `step` program does not read as a carriable
     /// one (a per-token input read at every step needs no entry of its own).
     #[error("input {input} is not a carriable input of the model's step program")]

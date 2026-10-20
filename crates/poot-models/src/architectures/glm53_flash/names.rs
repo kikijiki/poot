@@ -16,96 +16,47 @@
 
 use poot_quant::weights::{
     AttnRole, CompressRole, DsaRole, ExpertProj, FfnRole, KdaRole, MhcRole, MlaRole, MoeRole,
-    MtpRole, NormRole, WeightId, WeightKey, WeightMap, WeightMapBuilder, WeightMapError,
-    WeightRole, WeightStore, WeightView,
+    MtpRole, NormRole, WeightId, WeightKey, WeightMap, WeightRole, WeightStore, WeightView,
 };
 
 use super::FAMILY;
 use super::config::{Ffn, Glm53Config, Mixer};
 use crate::model::ModelError;
+use crate::names::TensorRows;
 
 const TOWER: &str = "model.language_model.";
 const LAYERS: &str = "model.language_model.layers.";
 
 /// The weight map of a checkpoint over `store`.
 pub(super) fn weights_of(cfg: &Glm53Config, store: &WeightStore) -> Result<WeightMap, ModelError> {
-    let mut rows = Rows {
-        map: WeightMap::builder(store),
-        store,
-    };
+    let mut rows = Rows(TensorRows::new(FAMILY, store));
     rows.model(cfg)?;
     for (layer, kind) in cfg.layers.iter().enumerate() {
         rows.layer(cfg, layer, kind.mixer, kind.ffn)?;
     }
     rows.mtp(cfg)?;
     rows.known(cfg);
-    Ok(rows.map.build())
+    Ok(rows.0.finish())
 }
 
-/// The map builder and the store it reads, with one method per way a tensor is named.
-struct Rows<'s> {
-    map: WeightMapBuilder<'s>,
-    store: &'s WeightStore,
+/// The shared tensor rows, with this family's way of reading each part of a checkpoint.
+struct Rows<'s>(TensorRows<'s>);
+
+impl<'s> std::ops::Deref for Rows<'s> {
+    type Target = TensorRows<'s>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
-fn weight_error(source: WeightMapError) -> ModelError {
-    ModelError::Weight {
-        family: FAMILY,
-        source,
+impl std::ops::DerefMut for Rows<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
 impl Rows<'_> {
-    fn add(&mut self, id: WeightId, view: WeightView) -> Result<(), ModelError> {
-        self.map.map(id, view).map(|_| ()).map_err(weight_error)
-    }
-
-    fn missing(id: WeightId, key: String) -> ModelError {
-        weight_error(WeightMapError::Missing {
-            id,
-            key: WeightKey::from(key),
-        })
-    }
-
-    /// The tensor stored under exactly `key`.
-    fn tensor(
-        &mut self,
-        role: WeightRole,
-        layer: Option<usize>,
-        key: String,
-    ) -> Result<(), ModelError> {
-        let id = WeightId { layer, role };
-        if !self.store.contains(&key) {
-            return Err(Self::missing(id, key));
-        }
-        self.add(id, WeightView::Stored(WeightKey::from(key)))
-    }
-
-    /// The linear projection with stem `stem`: `{stem}.weight` dense, else the packed `{stem}`.
-    fn linear(
-        &mut self,
-        role: WeightRole,
-        layer: Option<usize>,
-        stem: &str,
-    ) -> Result<(), ModelError> {
-        let id = WeightId { layer, role };
-        let key = self.linear_key(stem);
-        if !self.store.contains(&key) {
-            return Err(Self::missing(id, key));
-        }
-        self.add(id, WeightView::Stored(WeightKey::from(key)))
-    }
-
-    /// The key of linear `stem`: its dense spelling unless only the packed one is stored.
-    fn linear_key(&self, stem: &str) -> String {
-        let dense = format!("{stem}.weight");
-        if self.store.contains(&dense) || !self.store.contains(stem) {
-            dense
-        } else {
-            stem.to_string()
-        }
-    }
-
     fn model(&mut self, cfg: &Glm53Config) -> Result<(), ModelError> {
         let embed = format!("{TOWER}embed_tokens.weight");
         self.tensor(WeightRole::Embed, None, embed.clone())?;
@@ -308,7 +259,7 @@ impl Rows<'_> {
                     if self.store.contains(&key) {
                         Ok(WeightKey::from(key))
                     } else {
-                        Err(Self::missing(stack, key))
+                        Err(self.missing(stack, key))
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;

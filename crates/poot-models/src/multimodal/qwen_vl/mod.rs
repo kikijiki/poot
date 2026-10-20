@@ -12,11 +12,16 @@ use poot_quant::weights::WeightStore;
 use self::front::Qwen25VlFrontEnd;
 use self::processor::Qwen25VlImageProcessorConfig;
 use self::tower::Qwen25VlVisionParams;
-use crate::architectures::qwen2::model::{VL_FAMILY, build_vl, vl_fixture_config};
+#[cfg(feature = "test-support")]
+use crate::architectures::qwen2::model::vl_fixture_config;
+use crate::architectures::qwen2::model::{Qwen25VlText, VL_FAMILY};
+use crate::components::standard_family::{StandardFamily, build_standard};
 use crate::model::{ConfigReason, ModelError};
 use crate::multimodal::front_end::TowerId;
 use crate::multimodal::mrope::MropeConfigMetadata;
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{FamilyEntry, ModelParts, RawConfig};
 
 mod front;
 mod media;
@@ -28,10 +33,8 @@ pub(crate) const VISION: TowerId = TowerId::new("vision");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: VL_FAMILY,
-    keys: &[(ConfigSource::HfModelType, "qwen2_5_vl")],
+    keys: <Qwen25VlText as StandardFamily>::KEYS,
     build,
-    fixture,
-    variants: &[],
 };
 
 fn front_end_error(error: impl std::error::Error + Send + Sync + 'static) -> ModelError {
@@ -44,7 +47,7 @@ fn front_end_error(error: impl std::error::Error + Send + Sync + 'static) -> Mod
 /// The container of a Qwen2.5-VL checkpoint: the text model alone for a text-only config, else with
 /// the vision tower and the front end.
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    let text = build_vl(raw, store)?;
+    let text = build_standard::<Qwen25VlText>(raw, store)?;
     let RawConfig::HfJson {
         config,
         preprocessor,
@@ -76,13 +79,17 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
 }
 
 /// The marker ids of the fixture's 48-word vocabulary.
+#[cfg(feature = "test-support")]
 const FIXTURE_VISION_START: u32 = 40;
+#[cfg(feature = "test-support")]
 const FIXTURE_IMAGE: u32 = 41;
+#[cfg(feature = "test-support")]
 const FIXTURE_VIDEO: u32 = 42;
 
 /// A tiny Qwen2.5-VL: the qwen2 text fixture beside the tower fixture (2-pixel patches that merge 2 x 2
 /// into rows of the text tower's width), one set of weights.
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let text = crate::architectures::qwen2::model::vl_fixture();
     let vision = tower::fixture();
     let mut store = WeightStore::builder();

@@ -391,6 +391,10 @@ pub struct DeviceCaps {
     /// lets this process use), ROCm the coarse pool's size and PTX the device's total memory. The last two
     /// are capacities, not what is free: do not read them as available memory.
     pub memory_budget_bytes: Option<u64>,
+    /// The device's DRAM channel map, where it was measured ([`dram_channels::DramChannels::STRIX_HALO`]);
+    /// `None` for a device with no channel data, which no layout rule treats as camping. The planner's stored
+    /// KV extent reads it (POOT-1229).
+    pub dram_channels: Option<dram_channels::DramChannels>,
 }
 
 /// Card 258: output-element count (one `gemv_lds` workgroup per element) above which a wgpu decode-GEMV
@@ -473,6 +477,7 @@ impl DeviceCaps {
             },
             compute_units: STRIX_HALO_COMPUTE_UNITS,
             memory_budget_bytes: None,
+            dram_channels: Some(dram_channels::DramChannels::STRIX_HALO),
         }
     }
 
@@ -495,6 +500,7 @@ impl DeviceCaps {
             known_miscompiles: KnownMiscompiles::default(),
             compute_units: STRIX_HALO_COMPUTE_UNITS,
             memory_budget_bytes: None,
+            dram_channels: None,
         }
     }
 
@@ -516,6 +522,7 @@ impl DeviceCaps {
             known_miscompiles: KnownMiscompiles::default(),
             compute_units: SM80_A100_COMPUTE_UNITS,
             memory_budget_bytes: None,
+            dram_channels: None,
         }
     }
 }

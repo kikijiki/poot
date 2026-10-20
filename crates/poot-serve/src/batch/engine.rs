@@ -271,6 +271,7 @@ impl DriverEngine {
             warm: Warm::Admitted,
             windows: &[],
             adapters: &[generation],
+            chain: None,
         })?;
         Ok(())
     }

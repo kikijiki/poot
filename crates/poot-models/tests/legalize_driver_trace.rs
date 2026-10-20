@@ -51,7 +51,7 @@ struct Driver {
 /// The registry's qwen2 fixture, traced as one decode step exactly as the driver traces it.
 fn driver_trace() -> Driver {
     let registry = Registry::builtin().unwrap();
-    let fixture = (registry.entries()[0].fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(registry.entries()[0].family);
     let raw = RawConfig::HfJson {
         config: &fixture.config,
         generation: fixture.generation.as_ref(),

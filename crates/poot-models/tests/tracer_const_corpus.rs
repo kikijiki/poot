@@ -57,7 +57,7 @@ fn registered_trace(family: &str, spec: StepSpec) -> Graph {
         .iter()
         .find(|entry| entry.family.as_str() == family)
         .unwrap_or_else(|| panic!("{family} is registered"));
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
     // A routed family declares router witnesses; the corpus counts consts, which they do not touch.
     let traced = model

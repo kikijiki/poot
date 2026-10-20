@@ -34,7 +34,7 @@ poot-llm	driver::device_tests::a_chat_turn_end_is_cut_from_the_text_and_a_revers
 poot-llm	driver::device_tests::a_deepseek4_chunk_that_is_not_a_granule_multiple_is_refused_before_any_executable_wgpu
 poot-llm	driver::device_tests::a_deepseek4_prompt_of_ten_runs_as_prefill_eight_and_two_decode_steps_wgpu
 poot-llm	driver::device_tests::a_generations_phase_timings_partition_the_engine_wall_wgpu
-poot-llm	driver::device_tests::a_guided_row_takes_the_whole_step_to_the_logits_entry_wgpu
+poot-llm	driver::device_tests::a_guided_row_takes_the_adjusted_head_for_the_whole_step_wgpu
 poot-llm	driver::device_tests::a_nan_deepseek4_hash_router_weight_is_a_typed_validation_fault_wgpu
 poot-llm	driver::device_tests::a_nan_deepseek4_router_weight_is_a_typed_validation_fault_wgpu
 poot-llm	driver::device_tests::a_nan_glm53_flash_router_weight_is_a_typed_validation_fault_wgpu
@@ -46,8 +46,10 @@ poot-llm	driver::device_tests::a_second_turn_over_a_rewritten_history_still_equa
 poot-llm	driver::device_tests::a_text_run_ends_at_the_window_and_reports_engine_timing_wgpu
 poot-llm	driver::device_tests::adapter_generation_replacement_is_isolated_and_freed_wgpu
 poot-llm	driver::device_tests::an_unsupported_request_is_the_same_variant_for_two_families_wgpu
+poot-llm	driver::device_tests::attached_device_limit_refuses_an_oversized_constant_wgpu
 poot-llm	driver::device_tests::bert_encode_matches_the_oracle_whatever_the_padding_wgpu
 poot-llm	driver::device_tests::capacity_does_not_change_the_tokens_wgpu
+poot-llm	driver::device_tests::chained_decode_steps_equal_stepwise_decode_wgpu
 poot-llm	driver::device_tests::chunked_prefill_equals_token_by_token_wgpu
 poot-llm	driver::device_tests::commit_keeps_fewer_than_returned_wgpu
 poot-llm	driver::device_tests::cross_encoder_scores_pairs_in_the_oracles_order_wgpu
@@ -150,6 +152,7 @@ poot-llm	driver::step::mtp_tests::mtp_serves_a_sampled_row_wgpu
 poot-llm	driver::step::mtp_tests::mtp_two_rows_equal_off_wgpu
 poot-llm::add_a_model	four_paged_rows_equal_single_row_runs_wgpu
 poot-llm::add_a_model	generate_equals_the_oracle_tokens_wgpu
+poot-llm::add_a_model	parallel_rows::parallel_generate_equals_the_oracle_tokens_wgpu
 poot-llm::add_a_model	tagged_rows::tagged_generate_equals_the_oracle_tokens_wgpu
 poot-llm::beam	beam_matches_the_host_reference_wgpu
 poot-llm::beam	paged_beam_runs_on_contiguous_entries_wgpu
@@ -275,6 +278,7 @@ poot-serve::served_loop	served_sampled_and_guided_requests_return_the_samplers_t
 poot-serve::served_loop	served_streamed_and_non_streamed_requests_complete_wgpu
 poot-wgpu-device	imported_kernel_tests::rmsnorm_dyn_asset_matches_cpu_on_wgpu
 poot-wgpu-device	imported_kernel_tests::rowsum_for_asset_matches_cpu_on_wgpu
+poot-wgpu-device	parity_tests::adjusted_sampling_head_matches_the_oracle_on_wgpu
 poot-wgpu-device	parity_tests::alibi_slopes_attention_matches_the_oracle_and_the_reference_on_wgpu
 poot-wgpu-device	parity_tests::bf16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu
 poot-wgpu-device	parity_tests::bf16_const_cast_is_bit_exact_on_wgpu

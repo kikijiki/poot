@@ -10,10 +10,15 @@
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::{BinOp, Builder, Graph};
+#[cfg(feature = "test-support")]
+use poot_quant::weights::DenseWeight;
+#[cfg(feature = "test-support")]
+use poot_quant::weights::WeightEntry;
 use poot_quant::weights::{
-    AttnRole, DenseWeight, ExpertProj, FfnRole, MoeRole, NormRole, WeightEntry, WeightId,
-    WeightKey, WeightMap, WeightMapError, WeightRole, WeightStore,
+    AttnRole, ExpertProj, FfnRole, MoeRole, NormRole, WeightId, WeightKey, WeightMap,
+    WeightMapError, WeightRole, WeightStore,
 };
+#[cfg(feature = "test-support")]
 use poot_tensor::DType;
 
 use crate::components::attention::{AttentionWeights, attention};
@@ -22,8 +27,7 @@ use crate::components::linear::{Weight, WeightError};
 use crate::components::moe::{MoeWeights, moe};
 use crate::components::norm::norm;
 use crate::components::standard::{
-    LayerNorms, LayerScale, StackWeights, Step, check_step, decoder_program, standard_layer,
-    standard_stack,
+    LayerNorms, LayerScale, StackWeights, Step, decoder_program, standard_layer, standard_stack,
 };
 use crate::io::ModelSchema;
 use crate::model::{FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
@@ -31,7 +35,9 @@ use crate::names::gguf::{
     GGUF_BASE, GGUF_GEMMA4, GGUF_GEMMA4_MOE, GGUF_QK_NORM, GGUF_SANDWICH_NORMS,
 };
 use crate::names::{NameRow, Presence, Source, family_weights};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 mod config;
@@ -51,11 +57,10 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
         (ConfigSource::GgufArchitecture, "gemma4"),
     ],
     build,
-    fixture,
-    variants: &[("moe", moe_fixture)],
 };
 
 /// The text tower's tensor prefix in an HF `gemma4` checkpoint.
+#[cfg(feature = "test-support")]
 const TOWER: &str = "model.language_model.";
 const LAYERS: &str = "model.language_model.layers.";
 
@@ -340,7 +345,6 @@ impl Model for Gemma4 {
     fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
@@ -383,6 +387,7 @@ impl Model for Gemma4 {
 /// The fixture's config: a tiny dense Gemma 4 with four layers (local, global, local, global): a
 /// 3-key window, global heads twice as wide with one KV head that is also V, a quarter of the
 /// global head's frequency pairs rotating, and the final softcap.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config(moe: bool) -> serde_json::Value {
     let mut config = serde_json::json!({
         "model_type": "gemma4",
@@ -440,7 +445,8 @@ pub(crate) fn fixture_config(moe: bool) -> serde_json::Value {
 }
 
 /// The shape of every tensor of a Gemma 4 text tower with `config`'s dims by its HF name.
-fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
     let text = &config["text_config"];
     let n = |f: &str| crate::registry::Fixture::count(text, f);
     let (vocab, h, inter, heads) = (
@@ -500,7 +506,8 @@ fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
 /// The fixture of `config`. The scales a layer multiplies by (the layer scalar, the router's
 /// input scale, the per-expert scale) hold values near one: random values centred on zero would
 /// silence their layer or flip its sign.
-fn fixture_of(config: serde_json::Value) -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_of(config: serde_json::Value) -> Fixture {
     let shapes = fixture_shapes(&config);
     let fx = Fixture::bf16(config, shapes);
     let mut store = WeightStore::builder();
@@ -540,12 +547,14 @@ fn fixture_of(config: serde_json::Value) -> Fixture {
     }
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     fixture_of(fixture_config(false))
 }
 
 /// The same tower with eight routed experts beside every layer's dense feed-forward.
-fn moe_fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn moe_fixture() -> Fixture {
     fixture_of(fixture_config(true))
 }
 

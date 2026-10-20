@@ -45,6 +45,19 @@ pub enum PlanError {
         /// The value defined by the reading equation.
         reader: ValueId,
     },
+    /// A KV cache state's stored head stride camps on a device whose DRAM channel data says so, and no typed
+    /// exemption applies: the planner's stored extent (`legalize`) could have fixed it with one more position
+    /// (POOT-1229).
+    #[error(
+        "KV cache state {state} stores a {stride_bytes}-byte head stride that camps on the device's DRAM channels, \
+         and no exemption applies"
+    )]
+    KvHeadStrideCamps {
+        /// The cache's state input.
+        state: ValueId,
+        /// The stored bytes between two heads of one position.
+        stride_bytes: usize,
+    },
     /// A device executor admits only witness heads whose computation is exact on the device.
     #[error("validation {id:?} {value} is not a canonical device witness: {reason}")]
     ValidationWitnessNotCanonical {

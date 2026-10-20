@@ -472,7 +472,7 @@ fn indexed_graph(
     use poot_graph_ir::test_support::packed_graphs::{PackedExpertStack, packed_indexed_linear};
     let (m, k) = (route.len(), descriptor.shape()[1]);
     let table = PackedExpertStack {
-        stack_id: "moe.experts".to_string(),
+        stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
         descriptor,
         experts: experts.len(),
     };

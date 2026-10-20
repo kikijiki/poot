@@ -208,9 +208,10 @@ pub(crate) fn fixtured(registry: &Registry) -> Vec<Fixtured> {
         out.extend(Fixtured::build(
             entry.family.as_str().to_string(),
             entry,
-            (entry.fixture)(),
+            poot_models::test_support::family_fixtures::base(entry.family),
         ));
-        for (variant, make) in entry.variants {
+        for (variant, make) in poot_models::test_support::family_fixtures::of(entry.family).variants
+        {
             out.extend(Fixtured::build(
                 format!("{}/{variant}", entry.family.as_str()),
                 entry,

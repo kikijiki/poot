@@ -1578,7 +1578,7 @@ mod device {
             .iter()
             .find(|entry| entry.family.as_str() == "qwen2")
             .expect("the qwen2 family is registered");
-        let fixture = (entry.fixture)();
+        let fixture = poot_models::test_support::family_fixtures::base(entry.family);
         let vocab: String = (0..48)
             .map(|i| format!("\"w{i}\":{i}"))
             .collect::<Vec<_>>()

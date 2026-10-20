@@ -47,14 +47,15 @@ delivery; see [Continuous batching](../serve/continuous-batching.md).
 **Streaming.** Tokens are emitted as SSE events through a bounded channel, so a slow client applies
 back-pressure.
 
-**Sampling.** Greedy, temperature, top-k and top-p [^topp]. Generation picks the next token
-on-device for greedy and plain-temperature requests (a sampling step appended to the decode graph
-itself, reading back only the chosen token and a non-finite flag); a logit-bias/penalty, logprob
-recording, or a guided-decoding constraint still reads the full logits back and picks on the host.
+**Sampling.** Greedy, temperature, top-k and top-p [^topp], with logit bias, penalties and logprobs.
+Generation picks the next token on-device for every request (a sampling step appended to the decode
+graph itself, reading back only the chosen token, a non-finite flag and any top-n logprob
+alternatives); full logits come back only when a caller asks for them.
 
 **Guided decoding.** Regex, JSON schema (`guided_json`, `response_format`), GBNF grammar, choice lists
 and forced tool calls are parsed and validated. They constrain sampling with a CPU automaton that masks
-disallowed tokens, which requires the host-readback sampling path.
+disallowed tokens. The mask is built on the host while the forward pass runs and applied in the
+on-device sampling step.
 
 **Speculative decoding** is a policy of the driver: a decode row proposes drafts (prompt lookup or a second model)
 and verifies them in one step, and the scheduling loop does not change. `poot-serve` takes the policy with

@@ -7,7 +7,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use poot_graph_ir::{Builder, BuilderError, Graph, TraceBudgetExceeded, TraceLimits};
+use poot_graph_ir::{Builder, BuilderError, Graph, StateRole, TraceBudgetExceeded, TraceLimits};
 use poot_quant::weights::{HandleFormat, WeightId, WeightMap, WeightMapError};
 
 use poot_text::{ChatFormat, ToolCallCodec};
@@ -352,6 +352,29 @@ impl dyn Model + '_ {
             }
         }
         limits.admit_tokens(step.shape.tokens)?;
+        check_shape(family, step.shape, self.config().max_positions)?;
+        // A paged layout pools positional state; a block-pooled state has no paging granule to pool by
+        // (the paged-KV owner's to define), so a program that carries one refuses a paged step.
+        if matches!(step.shape.kv, KvLayout::Paged { .. })
+            && program
+                .states()
+                .iter()
+                .any(|state| matches!(state.role(), StateRole::Blocked { .. }))
+        {
+            return Err(TraceError::ShapeUnsupported {
+                family,
+                shape: step.shape,
+                reason: ShapeReason::PagedBlockedState,
+            });
+        }
+        // A draft program reads the hidden-state carry, so the step must name it.
+        if step.program == ProgramId::DRAFT && step.shape.hidden.is_none() {
+            return Err(TraceError::ShapeUnsupported {
+                family,
+                shape: step.shape,
+                reason: ShapeReason::DraftWithoutCarry,
+            });
+        }
         let graph = self.trace_into(step, Builder::new(limits))?;
         program
             .check_states(graph.state_pairs().map(|pair| pair.role))
@@ -362,6 +385,38 @@ impl dyn Model + '_ {
             })?;
         Ok(graph)
     }
+}
+
+/// Refuse a step shape no family's body can trace: a capacity above the model's maximum positions,
+/// more new tokens than the cache holds, or a hidden-state carry narrower than the step.
+/// [`dyn Model::trace`](Model) runs it before the family's `trace_into`, so no family has to remember to.
+pub(crate) fn check_shape(
+    family: FamilyKey,
+    shape: StepShape,
+    max_positions: usize,
+) -> Result<(), TraceError> {
+    let refuse = |reason| {
+        Err(TraceError::ShapeUnsupported {
+            family,
+            shape,
+            reason,
+        })
+    };
+    if shape.capacity.get() > max_positions {
+        return refuse(ShapeReason::CapacityAboveMax { max: max_positions });
+    }
+    if shape.tokens > shape.capacity {
+        return refuse(ShapeReason::TokensAboveCapacity);
+    }
+    if let Some(carry) = shape.hidden
+        && carry.positions < shape.tokens
+    {
+        return refuse(ShapeReason::HiddenCarryNarrow {
+            positions: carry.positions.get(),
+            tokens: shape.tokens.get(),
+        });
+    }
+    Ok(())
 }
 
 /// Why a config field cannot configure a family.
@@ -461,10 +516,11 @@ pub enum ShapeReason {
     HiddenCarryUnrequested,
     /// A draft step whose shape names no hidden-state carry: there is nothing for the layer to read.
     DraftWithoutCarry,
-    /// A paged-KV step of a family whose indexer keeps a per-row block-key cache. The cache's paging
-    /// granule (a page must hold whole blocks) belongs to the paged-KV owner, POOT-1148; until it
-    /// decides, the indexer refuses a paged layout rather than invent one.
-    PagedIndexer,
+    /// A paged-KV step of a program that carries a block-pooled state (a per-row cache of whole blocks,
+    /// [`StateRole::Blocked`]). The state's paging granule (a page must hold whole blocks) belongs to
+    /// the paged-KV owner, POOT-1148; until it decides, such a program refuses a paged layout rather
+    /// than invent one.
+    PagedBlockedState,
 }
 
 /// A model could not be built from its config and weights.
@@ -559,7 +615,7 @@ pub enum WiringError {
     #[error("a layer needs the {0} parameters, which the config did not read")]
     MissingParams(ParamBlock),
     /// A program that reads the hidden-state carry was traced for a step whose shape names none:
-    /// the draft check ([`check_draft_step`](crate::components::standard::check_draft_step)) refuses it.
+    /// `<dyn Model>::trace` refuses it for a draft step.
     #[error("the step's shape names no hidden-state carry")]
     MissingHiddenCarry,
     /// An MLA attention was given a key-position selector but a plain (not low-rank) query: the

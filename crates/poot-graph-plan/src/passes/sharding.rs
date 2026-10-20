@@ -50,7 +50,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 
 use poot_graph_ir::analysis::NumericsProperty;
-use poot_graph_ir::graph::{Eqn, Graph, LayerIndex, Operand, Storage, ValueId};
+use poot_graph_ir::graph::{Eqn, Graph, LayerIndex, Operand, StateRole, Storage, ValueId};
 use poot_graph_ir::op::{BinOp, OpKind, RedOp, UnOp};
 use poot_graph_ir::{PackedSourceName, TensorType, ValueMeta, ValueTable, packed_source_type};
 use poot_quant::format::Storage as FormatStorage;
@@ -393,6 +393,8 @@ impl<'a> Sharder<'a> {
                 self.cut_weight(input, name, id, source, axis)?;
                 Layout::Split(axis)
             }
+            // The sampler's history is the same on every rank: the suffix draws from logits every rank holds.
+            Storage::State if self.g.state_role(input) == Some(StateRole::Sampler) => Layout::Whole,
             Storage::State => match &self.states {
                 None => {
                     self.origin.insert(input, input);
@@ -1170,8 +1172,11 @@ pub(crate) fn expand_ranks(sharded: &ShardedGraph) -> Result<RankProgram, ShardE
     // names, and consts, slots and computed constants are shared by every rank.
     let mut copies: Vec<HashMap<ValueId, ValueId>> = vec![HashMap::new(); world];
     let mut state: Vec<(ValueId, ValueId)> = g.state().collect();
+    // The sampler's history lives on rank 0 alone: the suffix is computed once, from logits rank 0 holds,
+    // and the other ranks' copy of it is dead.
+    let ranked = |state_in: ValueId| g.state_role(state_in) != Some(StateRole::Sampler);
     for (rank, rank_copies) in copies.iter_mut().enumerate().skip(1) {
-        for (state_in, _) in g.state() {
+        for (state_in, _) in g.state().filter(|&(state_in, _)| ranked(state_in)) {
             let mut meta = g.meta(state_in).clone();
             meta.name = meta.name.map(|name| format!("{name}.tp{rank}"));
             let carried = values.push(meta);
@@ -1277,8 +1282,10 @@ pub(crate) fn expand_ranks(sharded: &ShardedGraph) -> Result<RankProgram, ShardE
     let mut live: ValueTable<bool> = ValueTable::filled(values.len(), false);
     live[g.result()] = true;
     for rank in 0..world {
-        for (_, state_out) in g.state() {
-            live[at(&copies, rank, state_out)] = true;
+        for (state_in, state_out) in g.state() {
+            if rank == 0 || ranked(state_in) {
+                live[at(&copies, rank, state_out)] = true;
+            }
         }
     }
     for declaration in g.witnesses() {
@@ -1323,9 +1330,9 @@ pub(crate) fn expand_ranks(sharded: &ShardedGraph) -> Result<RankProgram, ShardE
     }
 
     for rank in 1..world {
-        state.extend(g.state().map(|(state_in, state_out)| {
-            (at(&copies, rank, state_in), at(&copies, rank, state_out))
-        }));
+        state.extend(g.state().filter(|&(state_in, _)| ranked(state_in)).map(
+            |(state_in, state_out)| (at(&copies, rank, state_in), at(&copies, rank, state_out)),
+        ));
     }
     let mut graph = g.edit();
     *graph.values_mut() = values;

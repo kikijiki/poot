@@ -12,7 +12,8 @@
 //! [`row_index`] and [`state_row_gather`], so beam reorder and snapshot cannot drift (R-647-2).
 
 use poot_graph_ir::{
-    Builder, BuilderError, Graph, Slot, SlotKey, TensorType, TraceLimits, Traced, ValueId,
+    Builder, BuilderError, Graph, Slot, SlotKey, StateRole, TensorType, TraceLimits, Traced,
+    ValueId,
 };
 use poot_tensor::DType;
 
@@ -73,32 +74,57 @@ pub enum RowGraphError {
     Build(#[from] BuilderError),
 }
 
-/// The reorder graph over `decode`'s state pairs: each state value becomes its own rows gathered by
-/// `row_index`. Refused when `decode` carries no state or a state value has no leading row axis of the
-/// common length.
-pub(super) fn reorder_graph(decode: &Graph, limits: TraceLimits) -> Result<Graph, RowGraphError> {
+/// One carried state value of a compiled program: what a row graph over it declares.
+#[derive(Clone, Debug)]
+pub(super) struct CarriedState {
+    name: Option<String>,
+    aval: TensorType,
+    role: StateRole,
+    input: ValueId,
+}
+
+impl CarriedState {
+    /// The state pairs of one compiled stage graph, at the avals the planner chose.
+    pub(super) fn of_graph(graph: &Graph) -> impl Iterator<Item = Self> + '_ {
+        graph.state_pairs().map(|pair| {
+            let meta = graph.meta(pair.input);
+            Self {
+                name: meta.name.clone(),
+                aval: meta.aval.clone(),
+                role: pair.role,
+                input: pair.input,
+            }
+        })
+    }
+}
+
+/// The reorder graph over the `carried` state of a compiled decode entry: each state value becomes its own rows
+/// gathered by `row_index`. The avals are the compiled program's, so a cache whose stored extent the planner chose
+/// is moved at that extent. Refused when `carried` is empty or a state value has no leading row axis of the common
+/// length.
+pub(super) fn reorder_graph(
+    carried: &[CarriedState],
+    limits: TraceLimits,
+) -> Result<Graph, RowGraphError> {
     let b = Builder::new(limits);
-    let mut pairs = decode.state_pairs().peekable();
-    let rows = pairs
-        .peek()
-        .and_then(|pair| decode.aval(pair.input).shape.first().copied())
+    let rows = carried
+        .first()
+        .and_then(|state| state.aval.shape.first().copied())
         .ok_or(RowGraphError::NoState)?;
     let index = row_index(&b, rows)?;
     let mut moved = Vec::new();
-    for pair in pairs {
-        let meta = decode.meta(pair.input);
-        let name = meta
-            .name
-            .as_deref()
-            .ok_or(RowGraphError::UnnamedState { value: pair.input })?;
-        if meta.aval.shape.first() != Some(&rows) {
+    for carried in carried {
+        let name = carried.name.as_deref().ok_or(RowGraphError::UnnamedState {
+            value: carried.input,
+        })?;
+        if carried.aval.shape.first() != Some(&rows) {
             return Err(RowGraphError::RowAxis {
                 name: name.to_string(),
                 rows,
-                found: meta.aval.shape.first().copied(),
+                found: carried.aval.shape.first().copied(),
             });
         }
-        let state = b.state_input(name, meta.aval.clone(), pair.role)?;
+        let state = b.state_input(name, carried.aval.clone(), carried.role)?;
         moved.push((state, state_row_gather(&b, state, index)?));
     }
     let Some(&(_, out)) = moved.first() else {

@@ -807,6 +807,7 @@ fn open_driver(
             warm: Warm::Prompts(&prompts),
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .map_err(DriverError::from)
         .context("prepare the driver")?;

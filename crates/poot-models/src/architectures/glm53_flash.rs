@@ -23,16 +23,21 @@
 //! program typed.
 
 use poot_graph_ir::{Builder, Graph};
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
+#[cfg(feature = "test-support")]
+use poot_quant::weights::DenseWeight;
+#[cfg(feature = "test-support")]
+use poot_quant::weights::WeightEntry;
+use poot_quant::weights::{WeightMap, WeightStore};
+#[cfg(feature = "test-support")]
 use poot_tensor::DType;
 use std::sync::Arc;
 
-use crate::components::standard::{
-    Step, check_draft_step, check_step, decoder_program, draft_program,
-};
+use crate::components::standard::{Step, decoder_program, draft_program};
 use crate::io::{ModelSchema, ProgramId, StateSpec};
 use crate::model::{FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
 
 mod config;
@@ -52,8 +57,6 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
     keys: &[(ConfigSource::HfModelType, "glm5_next")],
     build,
-    fixture,
-    variants: &[("finetune", finetune_fixture)],
 };
 
 /// The built GLM-5.3-Flash model: config, name-resolved weights, the layer tower and the routed
@@ -114,14 +117,6 @@ impl Model for Glm53Flash {
         let p = &self.params;
         let shape = spec.shape;
         let draft = spec.program == ProgramId::DRAFT;
-        if draft {
-            check_draft_step(FAMILY, shape, p.max_positions)?;
-        } else {
-            check_step(FAMILY, shape, p.max_positions)?;
-        }
-        if let Some(moe) = &p.moe {
-            crate::components::moe::check_step(FAMILY, shape, moe)?;
-        }
         let step = Step::new(&b, shape)?;
         let logits = if draft {
             self.tower
@@ -142,6 +137,7 @@ impl Model for Glm53Flash {
 /// every dimension small. The indexer pools 2 positions and keeps 2 pools, so a few tokens already
 /// leave pools out of the attention. A checkpoint stores one multi-token-prediction layer after the
 /// four: a DSA layer over routed experts with no hyper-connections.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     let mut text = serde_json::json!({
         "model_type": "glm5_next_text",
@@ -213,14 +209,16 @@ pub(crate) fn fixture_config() -> serde_json::Value {
     })
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     fixture_of(fixture_config())
 }
 
 /// A fine-tune of the fixture's architecture with other counts than any release: three layers in
 /// another order (KDA over a dense block, DSA, then KDA), fewer routed experts and heads, another
 /// pool size and no multi-token-prediction layer. It ships no manifest and is the same family.
-fn finetune_fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn finetune_fixture() -> Fixture {
     let mut config = fixture_config();
     let text = &mut config["text_config"];
     text["num_hidden_layers"] = serde_json::json!(3);
@@ -243,12 +241,14 @@ fn finetune_fixture() -> Fixture {
 
 /// How a fixture tensor is stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "test-support")]
 pub(crate) enum Stored {
     Bf16,
     F32,
 }
 
 /// Every tensor of a checkpoint of `config`'s dimensions: `(name, shape, how it is stored)`.
+#[cfg(feature = "test-support")]
 pub(crate) fn tensors(config: &serde_json::Value) -> Vec<(String, Vec<usize>, Stored)> {
     let text = &config["text_config"];
     let n = |f: &str| crate::registry::Fixture::count(text, f);
@@ -442,7 +442,8 @@ pub(crate) fn tensors(config: &serde_json::Value) -> Vec<(String, Vec<usize>, St
 
 /// A deterministic checkpoint of `config`: norm scales near one, hyper-connection scales near one,
 /// every other weight small and centred, so every expert differs and a routing error is observable.
-fn fixture_of(config: serde_json::Value) -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_of(config: serde_json::Value) -> Fixture {
     let mut store = WeightStore::builder();
     let mut seed = 0x9e37_79b9u32;
     let mut uniform = move || {

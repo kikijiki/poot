@@ -36,7 +36,9 @@ use crate::model::{
     TraceError,
 };
 use crate::names::{NameRow, Presence, Source, family_weights};
-use crate::registry::{Fixture, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::RawConfig;
 use poot_text::{ChatFormat, HermesToolCodec};
 
 /// The idefics3 vision tower's name in errors and receipts. It is a container part of the `idefics3` family,
@@ -461,6 +463,7 @@ impl Model for Idefics3Vision {
 
 /// The fixture's `vision_config` plus the two facts the family reads from the top level: 8-pixel
 /// frames of 2-pixel patches (16 patches), a 2x2 pixel shuffle (4 visual tokens) and a 24-wide text tower.
+#[cfg(feature = "test-support")]
 pub(super) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "hidden_size": 16,
@@ -477,6 +480,7 @@ pub(super) fn fixture_config() -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "test-support")]
 pub(super) fn fixture() -> Fixture {
     let config = fixture_config();
     let n = |f: &str| crate::registry::Fixture::count(&config, f);

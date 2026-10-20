@@ -14,7 +14,6 @@ pub mod gdn;
 pub(crate) mod gdn_names;
 pub mod head;
 pub mod kda;
-pub mod kv_stride;
 pub mod linear;
 pub mod mamba2;
 pub mod mhc;
@@ -26,6 +25,7 @@ pub mod rope;
 pub mod router;
 pub(crate) mod sparse_top_k;
 pub mod standard;
+pub mod standard_family;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod witness;

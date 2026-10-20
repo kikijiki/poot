@@ -89,6 +89,11 @@ impl Context {
         } else {
             (None, poot_target::KnownMiscompiles::default())
         };
+        // Channel data is per part, read from the device's own identity (RADV names Strix Halo in its device
+        // name), never given to every AMD device.
+        let dram_channels = poot_target::dram_channels::DramChannels::of_device_name(
+            &self._adapter.get_info().name,
+        );
         let launch = LaunchCaps::from_wgpu(
             &self.device.limits(),
             self._adapter.features().contains(wgpu::Features::SUBGROUP),
@@ -109,6 +114,7 @@ impl Context {
             known_miscompiles,
             compute_units: self.compute_units,
             memory_budget_bytes: self.memory_budget_bytes,
+            dram_channels,
         }
     }
 

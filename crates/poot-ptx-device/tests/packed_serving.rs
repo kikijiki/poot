@@ -540,7 +540,7 @@ fn run_indexed_case(
         })
         .collect();
     let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
-        stack_id: "experts".to_string(),
+        stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
         descriptor: owners[0].weight(),
         experts: EXPERTS,
     };

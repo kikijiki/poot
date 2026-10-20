@@ -15,11 +15,26 @@ use crate::driver::{
 use poot_models::components::embed::EMBEDS;
 use poot_models::components::rope::MROPE;
 use poot_models::io::{Fill, InputError, InputValue, RequestInputs, TokenValues};
-use poot_tensor::HostTensor;
+use poot_tensor::{DType, HostTensor};
 
 /// The fake device's answer to any step: every row picks token 1, or favors it in the logits.
 fn picks_one() -> Script {
-    Box::new(|_, len| {
+    Box::new(|record, len| {
+        // A head with logprobs publishes F32 records `[token, flag, logprob]`.
+        if let Some((DType::F32, shape)) = &record.output
+            && shape.len() == 2
+            && shape[1] != VOCAB
+        {
+            // (token, flag, logprob), then zeros for the alternatives.
+            return (0..shape[0])
+                .flat_map(|_| {
+                    let mut row = vec![0.0f32; shape[1]];
+                    (row[0], row[1]) = (1.0, -1.0);
+                    row
+                })
+                .flat_map(f32::to_le_bytes)
+                .collect();
+        }
         if len.is_multiple_of(VOCAB * 4) {
             (0..len / (VOCAB * 4))
                 .flat_map(|_| favoring(1))
@@ -59,6 +74,7 @@ fn shapes<'a>(
         warm: Warm::Prompts(&[]),
         windows: &[],
         adapters,
+        chain: None,
     }
 }
 
@@ -106,7 +122,7 @@ const PREFILL1: RowWork<'static> = RowWork::Prefill { upto: 1 };
 /// A plain decode step.
 const DECODE: RowWork<'static> = RowWork::Decode { ahead: &[] };
 
-/// A greedy row, and a row the suffix cannot express (logprobs force the host path).
+/// A greedy row, and a row that records logprobs (the head with logprobs serves it).
 fn plain() -> Sampler {
     Sampler::greedy()
 }
@@ -119,7 +135,7 @@ fn paged_rig(options: RigOptions) -> Rig {
     build_rig(options, picks_one()).unwrap()
 }
 
-/// SC-008: with `max_entries = 4`, rows {1, 2} x heads {suffix, logits} for one fixed schema are four
+/// SC-008: with `max_entries = 4`, rows {1, 2} x heads {argmax, argmax with logprobs} for one fixed schema are four
 /// entries; exercising all four repeatedly with changing row assignments compiles and adds nothing; a
 /// fifth static schema is refused (and a step that needs it is refused typed) while every old entry
 /// still runs; a driver with a larger scope admits it. Mutations: drop `rows` from the entry identity
@@ -131,14 +147,16 @@ fn rows_and_heads_are_four_entries_that_serve_every_composition() {
         ..RigOptions::default()
     });
     let rows = [nz(1), nz(2)];
-    let heads = [Head::GREEDY, Head::Logits];
+    let greedy =
+        poot_graph_ir::ops::sampling::SampleSpec::draw(poot_graph_ir::op::SampleRule::Greedy);
+    let heads = [Head::GREEDY, Head::Sample(greedy.with_logprobs(0))];
     let mut rig = rig
         .prepare(&shapes(pool(8, 3), &rows, &heads, &[]))
         .unwrap();
     let caps = rig.driver.caps().unwrap().clone();
     assert_eq!((caps.rows, caps.kv_blocks), (nz(2), 8));
-    assert_eq!(caps.heads.suffix, [poot_graph_ir::op::SampleRule::Greedy]);
-    assert!(caps.heads.with_logits);
+    assert_eq!(caps.heads.suffix, [greedy, greedy.with_logprobs(0)]);
+    assert!(!caps.heads.with_logits);
     assert_eq!(caps.row_counts, [nz(1), nz(2)]);
     assert_eq!(caps.widths, [nz(1)]);
     assert_eq!(rig.driver.compile_count(), 4);
@@ -580,6 +598,7 @@ fn release_skips_recurrent_state_and_registers_dense_prefixes() {
             warm: Warm::Admitted,
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap()
     };
@@ -815,6 +834,7 @@ fn a_preempted_sequence_registers_no_prefix() {
             warm: Warm::Admitted,
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap();
     let prompt = prompt_of(35, 5);
@@ -948,6 +968,7 @@ fn admit_paged(
         warm: Warm::Prompts(&[]),
         windows,
         adapters: &[],
+        chain: None,
     })
     .unwrap()
 }
@@ -1855,6 +1876,7 @@ fn a_failed_row_reset_gives_the_adapter_lease_back() {
             warm: Warm::Admitted,
             windows: &[],
             adapters: &[g],
+            chain: None,
         })
         .unwrap();
     let adapter = AdapterRef::Adapter {
@@ -1931,4 +1953,269 @@ fn beam_refuses_an_overflowing_max_new_and_an_out_of_vocab_id() {
         ),
         "{error:?}"
     );
+}
+
+/// A draw the caller drops is in the device history but not in the sampler: the next adjusted step
+/// seeds the row again from the sampler, which holds only what was committed.
+/// Mutation: keep the row synced when a commit keeps fewer tokens than the step drew; the second seed
+/// never happens.
+#[test]
+fn a_dropped_draw_makes_the_next_adjusted_step_seed_the_history_row_again() {
+    let adjusted = Head::Sample(
+        poot_graph_ir::ops::sampling::SampleSpec::draw(poot_graph_ir::op::SampleRule::Greedy)
+            .adjusted(),
+    );
+    let mut rig = paged_rig(RigOptions::default())
+        .prepare(&shapes(pool(8, 2), &[nz(1)], &[adjusted], &[]))
+        .unwrap();
+    let mut sampler = Sampler::greedy().with_penalties(1.0, 1.0, 0.0);
+    let seq = open_one(&mut rig, &[3], AdapterRef::Base);
+    let seeds = |rig: &Rig<Serving>| {
+        rig.world
+            .borrow()
+            .state_bytes
+            .iter()
+            .filter(|bytes| bytes.len() == 2 * VOCAB * 4)
+            .count()
+    };
+    let step = |rig: &mut Rig<Serving>, sampler: &mut Sampler, work| {
+        let mut rows = [StepRow { seq, work, sampler }];
+        rig.driver.step(&mut rows).unwrap()
+    };
+    step(&mut rig, &mut sampler, RowWork::Prefill { upto: 1 });
+    assert_eq!(seeds(&rig), 1);
+    rig.driver.commit(seq, 1, &mut sampler).unwrap();
+    step(&mut rig, &mut sampler, RowWork::Decode { ahead: &[] });
+    assert_eq!(seeds(&rig), 1, "a committed draw keeps the row synced");
+    // The caller drops this draw: the device row holds a token the sampler never saw.
+    rig.driver.commit(seq, 0, &mut sampler).unwrap();
+    step(&mut rig, &mut sampler, RowWork::Decode { ahead: &[] });
+    assert_eq!(seeds(&rig), 2, "the row is seeded again from the sampler");
+}
+
+/// The head specs the sampling rows below use: the argmax with the penalties, bias and mask applied on
+/// the device, and the same with two alternatives per token.
+fn adjusted_heads() -> (poot_graph_ir::ops::sampling::SampleSpec, [Head; 2]) {
+    let adjusted =
+        poot_graph_ir::ops::sampling::SampleSpec::draw(poot_graph_ir::op::SampleRule::Greedy)
+            .adjusted();
+    (
+        adjusted,
+        [
+            Head::Sample(adjusted),
+            Head::Sample(adjusted.with_logprobs(2)),
+        ],
+    )
+}
+
+/// SC-001: a batched decode step whose rows carry penalties and a logit bias reads back the tokens and,
+/// when a row asks for them, its top-n logprobs - the byte counter equals that, not vocabulary x 4 x
+/// rows. The step is one launch of the adjusted head; no row's pick takes the host path.
+///
+/// Mutation: route a row with a penalty to the logits head (`step_head` returns `Head::Logits` for an
+/// adjusted need and the pick runs on the host); the counter reads vocabulary x 4 x rows and goes red.
+#[test]
+fn a_batched_step_with_penalty_and_bias_rows_reads_back_only_tokens_and_logprobs() {
+    // The logits head is prepared too, as it is for a driver that serves a sampled verify window: the
+    // adjusted rows must still not take it.
+    let (_, [adjusted, logprobs]) = adjusted_heads();
+    let heads = [adjusted, logprobs, Head::Logits];
+    let mut rig = paged_rig(RigOptions::default())
+        .prepare(&shapes(pool(8, 3), &[nz(2)], &heads, &[]))
+        .unwrap();
+    let seqs: Vec<SeqId> = (0..2)
+        .map(|i| open_one(&mut rig, &[5 + i], AdapterRef::Base))
+        .collect();
+    let penalty = || Sampler::greedy().with_penalties(1.3, 0.2, 0.1);
+    let biased =
+        || Sampler::greedy().with_logit_bias(std::collections::HashMap::from([(4u32, 2.0f32)]));
+    let read = |rig: &Rig<Serving>| rig.driver.executor_stats().output_read_bytes;
+
+    let before = read(&rig);
+    step_rows(
+        &mut rig,
+        &mut [
+            (seqs[0], PREFILL1, penalty()),
+            (seqs[1], PREFILL1, biased()),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        read(&rig) - before,
+        2 * 8,
+        "two (token, flag) pairs, not two rows of {VOCAB} logits"
+    );
+    assert_eq!(rig.driver.stats().host_picks, 0);
+
+    // A row that asks for two alternatives widens the record to its F32 form, still tokens and logprobs
+    // only: (token, flag, logprob) and two (token, logprob) pairs per row.
+    let before = read(&rig);
+    let mut rows = [
+        (seqs[0], DECODE, penalty().with_logprobs(2)),
+        (seqs[1], DECODE, biased()),
+    ];
+    let picked = step_rows(&mut rig, &mut rows).unwrap();
+    assert_eq!(picked, [[1], [1]]);
+    assert_eq!(read(&rig) - before, 2 * (3 + 2 * 2) * 4);
+    assert_eq!(rig.driver.stats().host_picks, 0);
+}
+
+/// SC-003: a request without logprobs or full logits reads no full-logits buffer. The buffer a step
+/// reads back is the entry's output: a sampling head's is a token pair or a logprob record per row, and
+/// only the logits head's is a vocabulary of logits per row. A driver that prepared no logits head has
+/// no entry whose output is that big.
+///
+/// Mutation: make `with_head` return the raw logits graph for a sampling head (always write the full
+/// logits out); the sampling entries' output holds a vocabulary per row and this row goes red.
+#[test]
+fn a_request_without_logprobs_or_full_logits_reads_no_full_logits_buffer() {
+    let (_, heads) = adjusted_heads();
+    let rig = paged_rig(RigOptions::default())
+        .prepare(&shapes(pool(8, 3), &[nz(2)], &heads, &[]))
+        .unwrap();
+    let outputs = |rig: &Rig<Serving>| -> Vec<usize> {
+        rig.driver
+            .ledger
+            .entries
+            .values()
+            .map(|entry| entry.output.iter().product())
+            .collect()
+    };
+    let sampling = outputs(&rig);
+    assert!(!sampling.is_empty(), "the entries have outputs");
+    assert!(
+        sampling.iter().all(|&elems| elems < 2 * VOCAB),
+        "a sampling head's readback holds records, not logits: {sampling:?}"
+    );
+
+    // The control: the logits head's output is a vocabulary per row, so the measure can fail.
+    let logits = paged_rig(RigOptions::default())
+        .prepare(&shapes(pool(8, 3), &[nz(2)], &[Head::Logits], &[]))
+        .unwrap();
+    assert!(
+        outputs(&logits).iter().all(|&elems| elems >= 2 * VOCAB),
+        "{:?}",
+        outputs(&logits)
+    );
+}
+
+/// SC-004: a guided row's mask is built on the host while the device runs the forward pass, and applied by
+/// the sampling stage on the device. The device events of the step, in order: the step's ordinary inputs
+/// are written, the forward stage is replayed, only then is the mask written (the host builds it while that
+/// stage runs), the sampling stage is replayed, the host waits once and reads back one (token, flag) pair.
+/// The mask never reaches the device before the forward stage is on it, and nothing but the pair comes back.
+///
+/// Mutation: apply the mask on the host - `step_head` returns the logits head for a guided need and the
+/// pick runs on the host; there is no mask write, the readback is a vocabulary of logits and this row
+/// goes red.
+#[test]
+fn a_guided_row_builds_its_mask_while_the_forward_pass_runs() {
+    let guided = Head::Sample(
+        poot_graph_ir::ops::sampling::SampleSpec::draw(poot_graph_ir::op::SampleRule::Greedy)
+            .guided(),
+    );
+    // The logits head is prepared too: the mutation needs somewhere to send the row.
+    let mut rig = paged_rig(RigOptions::default())
+        .prepare(&shapes(pool(8, 3), &[nz(1)], &[guided, Head::Logits], &[]))
+        .unwrap();
+    let seq = open_one(&mut rig, &[5], AdapterRef::Base);
+    let text = tiny_text();
+    let constraint = text.build_choice_constraint(&["c".to_string()]).unwrap();
+    let sampler = Sampler::greedy().with_constraint(constraint);
+
+    let before = rig.world.borrow().events.len();
+    step_rows(&mut rig, &mut [(seq, PREFILL1, sampler)]).unwrap();
+    let world = rig.world.borrow();
+    let events = &world.events[before..];
+    let (keys, _) = world
+        .entry_slots
+        .iter()
+        .find(|(keys, _)| keys.iter().any(|key| key == "sampler.mask"))
+        .expect("the guided head declares the mask slot");
+    let entry = world
+        .entry_slots
+        .iter()
+        .position(|(other, _)| other == keys)
+        .unwrap();
+    let ordinal = keys.iter().position(|key| key == "sampler.mask").unwrap();
+    let mask = world.entry_inputs[entry][ordinal];
+
+    let at = |wanted: DeviceEvent| -> Vec<usize> {
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| **event == wanted)
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let (replays, mask_writes) = (at(DeviceEvent::Replay), at(DeviceEvent::Write(mask)));
+    assert_eq!(
+        replays.len(),
+        2,
+        "forward stage, then sampling stage: {events:?}"
+    );
+    assert_eq!(mask_writes.len(), 1, "the mask is written once: {events:?}");
+    assert!(
+        replays[0] < mask_writes[0] && mask_writes[0] < replays[1],
+        "the mask is built between the two stages: {events:?}"
+    );
+    assert!(
+        events[..replays[0]]
+            .iter()
+            .all(|event| matches!(event, DeviceEvent::Write(_))),
+        "only ordinary inputs are written before the forward stage runs: {events:?}"
+    );
+    assert_eq!(
+        &events[replays[1] + 1..],
+        [DeviceEvent::Wait, DeviceEvent::Read],
+        "one wait after the sampling stage, then one readback: {events:?}"
+    );
+    drop(world);
+    assert_eq!(
+        rig.driver.executor_stats().output_read_bytes,
+        8,
+        "only the (token, flag) pair came back"
+    );
+}
+
+/// SC-005: with no guided rows, k decode steps run with one host wait. A chain of four steps is four
+/// replays and three device copies (each step's pick into the next step's token slot) behind one
+/// completion wait and returns four tokens; the same four tokens as four ordinary steps wait four times.
+///
+/// Mutation: force a wait after every step of the chain (`step_chain` completes each entry); the chain
+/// waits four times and this row goes red.
+#[test]
+fn four_chained_decode_steps_run_with_one_host_wait() {
+    let depth = nz(4);
+    let (heads, rows) = ([Head::GREEDY], [nz(1)]);
+    let shapes = ServingShapes {
+        chain: Some(depth),
+        ..shapes(pool(8, 2), &rows, &heads, &[])
+    };
+    let mut rig = paged_rig(RigOptions::default()).prepare(&shapes).unwrap();
+    let seq = open_one(&mut rig, &[5], AdapterRef::Base);
+    step_rows(&mut rig, &mut [(seq, PREFILL1, plain())]).unwrap();
+
+    let waits = |rig: &Rig<Serving>| rig.driver.executor_stats().waits;
+    let before = (waits(&rig), rig.driver.executor_stats().replays);
+    let mut sampler = plain();
+    let mut rows = [StepRow {
+        seq,
+        work: RowWork::Chain { steps: depth },
+        sampler: &mut sampler,
+    }];
+    let results = rig.driver.step(&mut rows).unwrap();
+    assert_eq!(results[0].tokens, [1, 1, 1, 1]);
+    let after = (waits(&rig), rig.driver.executor_stats().replays);
+    assert_eq!(after.0 - before.0, 1, "four steps, one host wait");
+    assert_eq!(after.1 - before.1, 4, "four entries replayed");
+    assert_eq!(rig.driver.stats().chains, 1);
+    rig.driver.commit(seq, 4, &mut sampler).unwrap();
+
+    // The same four tokens one step at a time wait once each.
+    let before = waits(&rig);
+    for _ in 0..4 {
+        step_rows(&mut rig, &mut [(seq, DECODE, plain())]).unwrap();
+    }
+    assert_eq!(waits(&rig) - before, 4, "four ordinary steps, four waits");
 }

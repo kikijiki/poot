@@ -14,7 +14,7 @@ fn model(family: &str, tweak: impl FnOnce(&mut serde_json::Value)) -> Box<dyn Mo
         .iter()
         .find(|e| e.family.as_str() == family)
         .unwrap_or_else(|| panic!("no family {family}"));
-    let mut fixture = (entry.fixture)();
+    let mut fixture = crate::test_support::family_fixtures::base(entry.family);
     tweak(&mut fixture.config);
     (entry.build)(&fixture.raw(), &fixture.store).unwrap().model
 }
@@ -54,7 +54,7 @@ fn dims(model: &dyn Model, family: &str) -> (usize, usize, usize, usize) {
         .iter()
         .find(|e| e.family.as_str() == family)
         .unwrap();
-    let config = (entry.fixture)().config;
+    let config = crate::test_support::family_fixtures::base(entry.family).config;
     let n = |f: &str| crate::registry::Fixture::count(&config, f);
     let head_dim = config["head_dim"]
         .as_u64()
@@ -490,9 +490,10 @@ mod vl {
     use poot_graph_ir::Slot;
     use poot_quant::weights::WeightStore;
 
-    use super::super::model::{VL_FAMILY, build_vl, vl_fixture};
+    use super::super::model::{Qwen25VlText, VL_FAMILY, vl_fixture};
     use super::*;
     use crate::components::standard::oracle;
+    use crate::components::standard_family::build_standard;
     use crate::components::testing::{CAP, close, step_shape};
     use crate::model::{ConfigReason, ModelError};
     use crate::registry::Fixture;
@@ -504,7 +505,8 @@ mod vl {
     ) -> (Fixture, Result<Box<dyn Model>, ModelError>) {
         let mut fixture = vl_fixture();
         tweak(&mut fixture.config);
-        let built = build_vl(&fixture.raw(), &fixture.store).map(|parts| parts.model);
+        let built =
+            build_standard::<Qwen25VlText>(&fixture.raw(), &fixture.store).map(|parts| parts.model);
         (fixture, built)
     }
 
@@ -745,7 +747,7 @@ mod vl {
     fn text_positions_on_all_three_axes_are_the_plain_qwen2_model() {
         let (fixture, vl) = vl_model();
         let plain = fixture_model("qwen2");
-        let plain_store = (plain_entry().fixture)().store;
+        let plain_store = crate::test_support::family_fixtures::base(plain_entry().family).store;
         assert_eq!(
             plain_store.iter().count(),
             fixture.store.iter().count(),
@@ -774,7 +776,12 @@ mod vl {
     }
 
     fn plain_entry() -> crate::registry::FamilyEntry {
-        super::super::model::ENTRY
+        *crate::registry::Registry::builtin()
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|entry| entry.family == super::super::model::FAMILY)
+            .expect("qwen2 is shipped")
     }
 
     /// Each axis of `Slot::MropePosition` reaches the logits through its own section: moving only
@@ -796,7 +803,7 @@ mod vl {
         // Independent reference: with all three axes on the moved ids the cache sits at the moved
         // positions too, and the tower is plain qwen2 at those positions (holes in the cache and all).
         let plain = fixture_model("qwen2");
-        let plain_store = (plain_entry().fixture)().store;
+        let plain_store = crate::test_support::family_fixtures::base(plain_entry().family).store;
         let g = plain
             .trace(
                 &StepSpec::step(step_shape(PROMPT.len(), CAP, LogitRows::All)),

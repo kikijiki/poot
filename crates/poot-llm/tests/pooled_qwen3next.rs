@@ -130,7 +130,7 @@ fn handle(scale: Option<f32>) -> Arc<ModelHandle> {
         .iter()
         .find(|entry| entry.family == poot_models::qwen3next::FAMILY)
         .expect("qwen3next is a shipped family");
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let store = match scale {
         Some(factor) => scaled(&fixture.store, factor),
         None => fixture.store.clone(),
@@ -340,6 +340,7 @@ fn pooled_qwen3next_keeps_each_state_row_across_alternating_steps(choice: Backen
             warm: Warm::Admitted,
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap();
     for (row, prompt) in [&MEDIUM[..], &SHORT[..]].into_iter().enumerate() {

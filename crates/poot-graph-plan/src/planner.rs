@@ -15,7 +15,7 @@ use crate::kernel_mapping::{finalize, finalize_aie};
 use crate::planner::kg::Layout;
 use crate::predicates::GraphTables;
 use crate::refusal::Site;
-use crate::storage_analysis::value_storage_of_plans;
+use crate::storage_analysis::{check_kv_head_strides, value_storage_of_plans};
 use crate::types::GraphStorage;
 use poot_kernelgen::BodyLimits;
 use poot_target::{AieCaps, AieTargetId, Backend, DeviceCaps};
@@ -250,6 +250,7 @@ pub(crate) fn plan_graph(
     limits: &BodyLimits,
 ) -> Result<PlannedGraph, CompileError> {
     let id = target.id();
+    check_kv_head_strides(g, target)?;
     let views = compute_views(g, id);
     let (plans, choices): (Vec<_>, Vec<_>) = g
         .eqns()

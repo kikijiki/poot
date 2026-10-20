@@ -31,6 +31,7 @@ mod slot_map;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod types;
+pub mod weight_ref;
 
 pub use budget::{AllocationSite, Attempted, BudgetResource, TraceBudgetExceeded, TraceLimits};
 #[cfg(any(test, feature = "test-support"))]
@@ -63,9 +64,8 @@ pub use op::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use packed_source::packed_source_constants;
-pub use packed_source::{
-    PackedSourceName, packed_source_type, packed_stack_source_constants, packed_stack_source_type,
-};
+pub use packed_source::{PackedSourceName, packed_source_type, packed_stack_source_type};
 pub use range::{IndexRange, RangeFacts, value_ranges};
 pub use slot_map::{ForwardSlotMap, SlotMapError};
 pub use types::{Scalar, TensorType};
+pub use weight_ref::WeightRef;

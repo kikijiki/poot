@@ -79,7 +79,7 @@ fn load() -> (Arc<ModelHandle>, poot_test_util::UniqueTempPath) {
         .iter()
         .find(|entry| entry.family.as_str() == FAMILY)
         .unwrap_or_else(|| panic!("no builtin family {FAMILY}"));
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(NO_EOS);
     let dir = poot_test_util::unique_temp_path("pooled-deepseek3");
@@ -203,7 +203,7 @@ fn pooled_deepseek3_stages_run_the_contraction_and_pointwise_passes() {
         .iter()
         .find(|entry| entry.family.as_str() == FAMILY)
         .unwrap_or_else(|| panic!("no builtin family {FAMILY}"));
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let raw = RawConfig::HfJson {
         config: &fixture.config,
         generation: None,

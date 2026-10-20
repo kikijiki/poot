@@ -61,15 +61,8 @@ fn registered_step_and_weights(
         .find(|entry| entry.family.as_str() == family)
         .unwrap_or_else(|| panic!("{family} is registered"));
     let fixture = match variant {
-        None => (entry.fixture)(),
-        Some(variant) => {
-            let (_, make) = entry
-                .variants
-                .iter()
-                .find(|(name, _)| *name == variant)
-                .unwrap_or_else(|| panic!("{family} ships a {variant} fixture"));
-            make()
-        }
+        None => poot_models::test_support::family_fixtures::base(entry.family),
+        Some(variant) => poot_models::test_support::family_fixtures::variant(entry.family, variant),
     };
     let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
     let n = |v| NonZeroUsize::new(v).unwrap();

@@ -23,14 +23,21 @@
 //! projections are read as stored.
 
 use poot_graph_ir::{Builder, Graph};
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
+#[cfg(feature = "test-support")]
+use poot_quant::weights::DenseWeight;
+#[cfg(feature = "test-support")]
+use poot_quant::weights::WeightEntry;
+use poot_quant::weights::{WeightMap, WeightStore};
+#[cfg(feature = "test-support")]
 use poot_tensor::DType;
 use std::sync::Arc;
 
-use crate::components::standard::{Step, check_step, decoder_program};
+use crate::components::standard::{Step, decoder_program};
 use crate::io::ModelSchema;
 use crate::model::{FamilyKey, Model, ModelConfig, ModelError, ShapeReason, StepSpec, TraceError};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
 
 mod config;
@@ -52,8 +59,6 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
     keys: &[(ConfigSource::HfModelType, "deepseek_v4")],
     build,
-    fixture,
-    variants: &[("finetune", finetune_fixture)],
 };
 
 #[derive(Debug)]
@@ -108,8 +113,6 @@ impl Model for DeepseekV4 {
     fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        crate::components::moe::check_step(FAMILY, shape, &p.score_moe)?;
         let granule = p.granule.get();
         if !shape.is_decode() && !shape.tokens.get().is_multiple_of(granule) {
             return Err(TraceError::ShapeUnsupported {
@@ -128,6 +131,7 @@ impl Model for DeepseekV4 {
 /// prefill granule of 4), two hyper-connection streams, a hash-routed first layer and score-routed
 /// others over 8 experts of which 2 route, with every projection width a multiple of 32 (so a packed
 /// copy of its store is a valid checkpoint too).
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "deepseek_v4",
@@ -167,14 +171,16 @@ pub(crate) fn fixture_config() -> serde_json::Value {
     })
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     fixture_of(fixture_config())
 }
 
 /// A fine-tune of the fixture's architecture with other counts than any release: three layers
 /// (CSA, sliding, HCA) at other compression rates, two hash-routed layers, six experts, fewer
 /// heads and a narrower window. It ships no manifest and is the same family.
-fn finetune_fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn finetune_fixture() -> Fixture {
     let mut config = fixture_config();
     config["num_hidden_layers"] = serde_json::json!(3);
     config["compress_rates"] = serde_json::json!({
@@ -190,6 +196,7 @@ fn finetune_fixture() -> Fixture {
 }
 
 /// Every tensor of a checkpoint of `config`'s dimensions: `(name, shape, how it is stored)`.
+#[cfg(feature = "test-support")]
 pub(crate) fn tensors(config: &serde_json::Value) -> Vec<(String, Vec<usize>, Stored)> {
     let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (vocab, w, layers) = (n("vocab_size"), n("hidden_size"), n("num_hidden_layers"));
@@ -310,6 +317,7 @@ pub(crate) fn tensors(config: &serde_json::Value) -> Vec<(String, Vec<usize>, St
 
 /// How a fixture tensor is stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "test-support")]
 pub(crate) enum Stored {
     Bf16,
     F32,
@@ -320,7 +328,8 @@ pub(crate) enum Stored {
 /// A deterministic checkpoint of `config`: norm scales near one, hyper-connection scales near one,
 /// every other weight small and centred, and a hash table whose row `t` names the experts `t,
 /// t + 1, ...` (mod the expert count), so neighbouring tokens route differently.
-fn fixture_of(config: serde_json::Value) -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_of(config: serde_json::Value) -> Fixture {
     let experts = config["n_routed_experts"].as_u64().unwrap() as usize;
     let mut store = WeightStore::builder();
     let mut seed = 0x9e37_79b9u32;

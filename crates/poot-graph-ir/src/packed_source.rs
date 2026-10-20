@@ -166,26 +166,6 @@ pub fn packed_stack_source_type(
     TensorType::new(vec![experts, weight.slab_bytes(role)], DType::I8)
 }
 
-/// Every source constant of an expert-stacked table of `weight`, in [`PackedWeight::sources`] order: the name to
-/// stage (after the stack's own id) and the type to stage it with
-/// ([`packed_stack_source_type`]).
-pub fn packed_stack_source_constants(
-    stack_id: &str,
-    weight: PackedWeight,
-    experts: usize,
-) -> Vec<(PackedSourceName, TensorType)> {
-    weight
-        .sources()
-        .into_iter()
-        .map(|role| {
-            (
-                PackedSourceName::new(stack_id, role),
-                packed_stack_source_type(weight, experts, role),
-            )
-        })
-        .collect()
-}
-
 /// Every source constant of one packed weight, in [`PackedWeight::sources`] order: the name to
 /// stage and the type to stage it with. One constant per source - the registered E4M3/E2M1 cells
 /// stage exactly two (weight, scale); other schemes stage as many as their descriptor names.

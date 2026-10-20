@@ -12,6 +12,7 @@
 //! window is visible to a query once the window's last position is: until then it is masked, and
 //! the (finite) garbage of an unwritten window never reaches the output.
 
+use poot_graph_ir::ops::MASK_HIDDEN;
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, ops};
 use poot_quant::weights::{CompressRole, WeightId, WeightMap, WeightRole};
 
@@ -24,10 +25,6 @@ use crate::components::norm::norm;
 use crate::components::rope::{RopeParams, rope_strided_rows};
 use crate::components::standard::Step;
 use crate::model::TraceError;
-
-/// Additive mask for a window a query may not read: finite, so that adding it to another mask or to
-/// a score cannot overflow.
-pub(super) const DROPPED: f32 = -1.0e30;
 
 /// One compressor's weights: the key and gate projections `[raw, width]`, the position bias
 /// `[rate, raw]` and the norm of the pooled entry `[entry]`. `raw` is the entry width for
@@ -179,7 +176,7 @@ pub(super) fn softmax_pool(b: &Builder, kv: Traced, gate: Traced) -> Result<Trac
 
 /// The additive mask of which of `windows` windows each query token may read:
 /// `[rows, 1, tokens, windows]`, `0.0` once the window's last position is at or before the query's
-/// own position, [`DROPPED`] before.
+/// own position, [`MASK_HIDDEN`] before.
 pub(super) fn complete_windows(
     b: &Builder,
     step: &Step,
@@ -201,7 +198,7 @@ pub(super) fn complete_windows(
     Ok(b.binary_scalar(
         BinOp::Mul,
         b.binary_scalar(BinOp::Sub, visible, Scalar::F32(1.0))?,
-        Scalar::F32(-DROPPED),
+        Scalar::F32(-MASK_HIDDEN),
     )?)
 }
 

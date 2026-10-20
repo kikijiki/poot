@@ -7,51 +7,31 @@
 //! family traces the interleaved rotation over the stored rows instead of un-permuting the weights
 //! (the dot products Q.K are the same).
 
-use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
+use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
 
-use poot_graph_ir::{Builder, Graph};
-use poot_quant::weights::{WeightMap, WeightStore};
-
-use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
-use crate::components::embed::EMBEDS;
-use crate::components::ffn::{GatedFfnWeights, gated_ffn};
-use crate::components::linear::WeightError;
-use crate::components::moe::{self, MoeParams, MoeWeights};
+use crate::components::moe::MoeParams;
 use crate::components::rope::{GGUF_ROPE_FREQS, rope_freq_factors};
 use crate::components::router::RouterKind;
-use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    embeddable_decoder_schema, standard_layer, standard_stack,
-};
-use crate::io::{ModelSchema, ProgramId};
-use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
+use crate::model::{ConfigReason, FamilyKey, ModelError};
 use crate::names::gguf::GGUF_BASE;
-use crate::names::{
-    ExpertNames, HF_BASE, MoeLayers, MoeNames, family_weights, family_weights_routed,
-    hf_base_shapes,
-};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_quant::weights::ExpertProj;
+#[cfg(feature = "test-support")]
+use crate::names::hf_base_shapes;
+use crate::names::{ExpertNames, HF_BASE, MoeNames};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, RawConfig};
 use std::sync::Arc;
 
 use poot_text::{ChatFormat, LlamaToolCodec, MistralToolCodec, ToolCallCodec};
 
+use crate::components::standard_family::{
+    Mlp, StandardFamily, StandardParams, entry, weights_with_experts,
+};
+
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("llama");
 
-pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
-    family: FAMILY,
-    keys: &[
-        (ConfigSource::HfModelType, "llama"),
-        (ConfigSource::HfModelType, "mistral"),
-        (ConfigSource::HfModelType, "mixtral"),
-        (ConfigSource::GgufArchitecture, "llama"),
-    ],
-    build,
-    fixture,
-    variants: &[("mixtral", mixtral_fixture)],
-};
+pub(crate) const ENTRY: FamilyEntry = entry::<Llama>();
 
 /// llama's config facts: `LlamaConfig`'s and `MistralConfig`'s defaults (they agree), and
 /// llama.cpp's GGUF defaults.
@@ -125,26 +105,6 @@ const GGUF_MOE: MoeNames = MoeNames {
 const EXPERTS: Field = Field::new("num_local_experts", "llama.expert_count");
 const TOP_K: Field = Field::new("num_experts_per_tok", "llama.expert_used_count");
 
-/// llama's typed config: every value checked once, here, so tracing cannot fail on it.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct LlamaParams {
-    vocab: usize,
-    width: usize,
-    inter: usize,
-    layers: usize,
-    max_positions: usize,
-    attention: AttentionParams,
-    layer: LayerParams,
-    stack: StackParams,
-    /// The experts of every layer's feed-forward when the config names an expert count (`inter` is
-    /// then each expert's width).
-    moe: Option<MoeParams>,
-    head_required: bool,
-    eos: BTreeSet<u32>,
-    bos: Option<u32>,
-    dialect: Dialect,
-}
-
 /// Which instruct dialect a llama-architecture checkpoint speaks: the chat format it falls back to and
 /// the tool-call markup it emits go together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,8 +129,20 @@ impl Dialect {
     }
 }
 
-impl LlamaParams {
-    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+/// llama: the plain GQA + RoPE + SwiGLU decoder, or Mixtral's top-k experts when the config states
+/// an expert count.
+pub(crate) struct Llama;
+
+impl StandardFamily for Llama {
+    const FAMILY: FamilyKey = FAMILY;
+    const KEYS: &'static [(ConfigSource, &'static str)] = &[
+        (ConfigSource::HfModelType, "llama"),
+        (ConfigSource::HfModelType, "mistral"),
+        (ConfigSource::HfModelType, "mixtral"),
+        (ConfigSource::GgufArchitecture, "llama"),
+    ];
+
+    fn configure(raw: &RawConfig<'_>) -> Result<StandardParams, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let dims = DenseDims::read(&fields, &SPEC)?;
         // `attention_bias` biases the output projection too, which no weight role carries yet.
@@ -187,8 +159,8 @@ impl LlamaParams {
                 .with_window(window)
                 .map_err(|e| e.for_family(FAMILY))?;
         }
-        // The `mistral` and `mixtral` keys are Mistral checkpoints: their own `[INST]` template,
-        // not Llama 3's.
+        // The `mistral` and `mixtral` keys are Mistral checkpoints: their own `[INST]` template and
+        // tool-call markup, not Llama 3's.
         let dialect = match raw {
             RawConfig::HfJson { config, .. }
                 if matches!(
@@ -204,178 +176,58 @@ impl LlamaParams {
             attention = attention.with_interleaved_rope();
         }
         let norm = dims.norm(&fields, &SPEC)?;
+        let mut params = StandardParams {
+            embeddable: true,
+            ..StandardParams::dense(
+                &dims,
+                norm,
+                attention,
+                dialect.chat(),
+                Some(dialect.tool_codec()),
+            )
+        };
         // The feed-forward routes exactly when the config states an expert count (a GGUF writes
-        // `llama.expert_count = 0` for a dense model).
-        let moe = match fields.opt_u64(EXPERTS)? {
-            None | Some(0) => None,
-            Some(_) => Some(MoeParams::new(
+        // `llama.expert_count = 0` for a dense model); `inter` is then each expert's width.
+        if !matches!(fields.opt_u64(EXPERTS)?, None | Some(0)) {
+            let moe = MoeParams::new(
                 FAMILY,
                 dims.width,
                 dims.inter,
                 fields.count(EXPERTS, None)?,
                 fields.count(TOP_K, None)?,
                 RouterKind::TopKSoftmax,
-            )?),
-        };
-        Ok(Self {
-            moe,
-            attention,
-            layer: LayerParams::new(norm),
-            stack: StackParams::new(norm),
-            vocab: dims.vocab,
-            width: dims.width,
-            inter: dims.inter,
-            layers: dims.layers,
-            max_positions: dims.max_positions,
-            head_required: dims.head_required,
-            eos: dims.eos,
-            bos: dims.bos,
-            dialect,
-        })
+            )?;
+            params.mlp = vec![Mlp::Routed(moe); dims.layers];
+        }
+        Ok(params)
     }
-}
 
-#[derive(Debug)]
-enum Ffn {
-    Dense(GatedFfnWeights),
-    Routed(Box<MoeWeights>, MoeParams),
-}
-
-#[derive(Debug)]
-struct Layer {
-    norms: LayerNorms,
-    attn: AttentionWeights,
-    ffn: Ffn,
-}
-
-#[derive(Debug)]
-pub(crate) struct Llama {
-    params: LlamaParams,
-    weights: WeightMap,
-    stack: StackWeights,
-    layers: Vec<Layer>,
-    config: ModelConfig,
-    schema: ModelSchema,
-}
-
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    let mut p = LlamaParams::from_raw(raw)?;
-    let (rows, moe_names) = match raw.source() {
-        ConfigSource::HfModelType => (HF_BASE, &HF_MOE),
-        ConfigSource::GgufArchitecture => {
-            if let Some(entry) = store.get(GGUF_ROPE_FREQS) {
-                p.attention = p
-                    .attention
-                    .with_rope_freq_factors(&rope_freq_factors(FAMILY, entry)?)
-                    .map_err(|e| e.for_family(FAMILY))?;
+    fn weights(
+        raw: &RawConfig<'_>,
+        store: &WeightStore,
+        params: &mut StandardParams,
+    ) -> Result<WeightMap, ModelError> {
+        let (rows, moe_names) = match raw.source() {
+            ConfigSource::HfModelType => (HF_BASE, &HF_MOE),
+            ConfigSource::GgufArchitecture => {
+                if let Some(entry) = store.get(GGUF_ROPE_FREQS) {
+                    let factors = rope_freq_factors(FAMILY, entry)?;
+                    for attention in &mut params.attention {
+                        *attention = attention
+                            .with_rope_freq_factors(&factors)
+                            .map_err(|e| e.for_family(FAMILY))?;
+                    }
+                }
+                (GGUF_BASE, &GGUF_MOE)
             }
-            (GGUF_BASE, &GGUF_MOE)
-        }
-    };
-    let weights = match &p.moe {
-        None => family_weights(FAMILY, store, &[rows], p.layers, p.head_required)?,
-        Some(moe) => family_weights_routed(
-            FAMILY,
-            store,
-            &[rows],
-            p.layers,
-            p.head_required,
-            MoeLayers {
-                names: moe_names,
-                sparse: &vec![true; p.layers],
-                experts: moe.experts(),
-            },
-        )?,
-    };
-    let weight_error = |e: WeightError| e.for_family(FAMILY);
-    let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
-    let layers = (0..p.layers)
-        .map(|l| {
-            let ffn = match &p.moe {
-                None => Ffn::Dense(GatedFfnWeights::new(&weights, l, p.width, p.inter)?),
-                Some(moe) => Ffn::Routed(Box::new(MoeWeights::new(&weights, l, moe)?), *moe),
-            };
-            Ok(Layer {
-                norms: LayerNorms::new(&weights, l, p.width)?,
-                attn: AttentionWeights::new(&weights, l, p.width, &p.attention)?,
-                ffn,
-            })
-        })
-        .collect::<Result<Vec<_>, WeightError>>()
-        .map_err(weight_error)?;
-    let schema = embeddable_decoder_schema(p.vocab, p.width, false).build_for(FAMILY)?;
-    let config = ModelConfig {
-        family: FAMILY,
-        vocab: p.vocab,
-        max_positions: p.max_positions,
-        eos: p.eos.clone(),
-        bos: p.bos,
-        prompt_bos: None,
-        prefill_granule: NonZeroUsize::MIN,
-        chat: p.dialect.chat(),
-        tool_codec: Some(p.dialect.tool_codec()),
-    };
-    Ok(ModelParts::new(Box::new(Llama {
-        params: p,
-        weights,
-        stack,
-        layers,
-        config,
-        schema,
-    })))
-}
-
-impl Model for Llama {
-    fn config(&self) -> &ModelConfig {
-        &self.config
-    }
-
-    fn schema(&self) -> &ModelSchema {
-        &self.schema
-    }
-
-    fn weights(&self) -> &WeightMap {
-        &self.weights
-    }
-
-    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
-        let p = &self.params;
-        let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        if let Some(params) = &p.moe {
-            moe::check_step(FAMILY, shape, params)?;
-        }
-        let step = Step::new(&b, shape)?;
-        let step = if spec.program == ProgramId::ENCODE {
-            step.returning_hidden()
-        } else {
-            step
         };
-        let step = if spec.carries(EMBEDS) {
-            step.with_embeds(&b, p.width)?
-        } else {
-            step
-        };
-        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
-            let layer = &self.layers[l];
-            standard_layer(
-                b,
-                x,
-                &layer.norms,
-                &p.layer,
-                |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
-                |b, BlockInput { block: h, .. }| match &layer.ffn {
-                    Ffn::Dense(w) => gated_ffn(b, h, w),
-                    Ffn::Routed(w, params) => moe::moe(b, &step, l, h, None, w, params),
-                },
-            )
-        })?;
-        Ok(step.finish(b, logits)?)
+        weights_with_experts(FAMILY, store, &[rows], moe_names, params)
     }
 }
 
 /// The fixture's config: a tiny untied llama whose projection widths are multiples of 32 (so a
 /// Q8_0 copy of its store is a valid checkpoint too).
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "llama",
@@ -394,15 +246,18 @@ pub(crate) fn fixture_config() -> serde_json::Value {
     })
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = hf_base_shapes(&config, false);
     Fixture::bf16(config, shapes)
 }
 
 /// How many experts the Mixtral fixture holds.
+#[cfg(feature = "test-support")]
 const FIXTURE_EXPERTS: usize = 4;
 
+#[cfg(feature = "test-support")]
 fn mixtral_config() -> serde_json::Value {
     let mut config = fixture_config();
     config["model_type"] = serde_json::json!("mixtral");
@@ -413,7 +268,8 @@ fn mixtral_config() -> serde_json::Value {
 }
 
 /// A tiny untied Mixtral: every layer routes, `intermediate_size` is each expert's width.
-fn mixtral_fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn mixtral_fixture() -> Fixture {
     let config = mixtral_config();
     let h = 64;
     let inter = 64;
@@ -441,6 +297,7 @@ mod tests {
 
     use super::*;
     use crate::components::standard::oracle::run_step;
+    use crate::components::standard_family::StandardFamily;
     use crate::components::testing::{
         CAP, Recorded, assert_bf16_and_q8_0_trace_through_the_packed_transform,
         assert_chunked_prefill_equals_decode, assert_gguf_resolves_and_traces_packed,
@@ -448,8 +305,13 @@ mod tests {
         close, close_all, f32_entry, gguf_dense_kvs, gguf_name_with_head, gguf_tensor, q8_0_store,
         read_back_owned, step_shape, values,
     };
+    use crate::model::Model;
+    use crate::model::StepSpec;
+    use crate::model::TraceError;
     use crate::model::{LogitRows, StepShape};
     use crate::registry::Registry;
+    use std::collections::BTreeSet;
+    use std::num::NonZeroUsize;
 
     fn is_projection(key: &str) -> bool {
         key.ends_with("_proj.weight")
@@ -645,7 +507,7 @@ mod tests {
             generation: None,
             preprocessor: None,
         };
-        match build(&raw, &fixture().store) {
+        match (ENTRY.build)(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
             other => panic!("{config}: expected a config error, got {other:?}"),
         }
@@ -708,33 +570,22 @@ mod tests {
         assert_eq!(model.config().eos, BTreeSet::from([2]));
         assert_eq!(model.config().chat, ChatFormat::Llama3);
         // The family names its tool-call markup: Llama's python tag, not Mistral's.
-        assert_eq!(
-            model.config().tool_codec.as_ref().map(|codec| codec
-                .parse("<|python_tag|>{\"name\": \"f\", \"parameters\": {}}")
-                .len()),
-            Some(1)
-        );
-        assert_eq!(
-            model.config().tool_codec.as_ref().map(|codec| codec
-                .parse("[TOOL_CALLS][{\"name\": \"f\", \"arguments\": {}}]")
-                .len()),
-            Some(0)
-        );
+        let parsed = |model: &dyn Model, text: &str| {
+            model
+                .config()
+                .tool_codec
+                .as_ref()
+                .map(|codec| codec.parse(text).len())
+        };
+        let llama_call = "<|python_tag|>{\"name\": \"f\", \"parameters\": {}}";
+        let mistral_call = "[TOOL_CALLS][{\"name\": \"f\", \"arguments\": {}}]";
+        assert_eq!(parsed(&*model, llama_call), Some(1));
+        assert_eq!(parsed(&*model, mistral_call), Some(0));
         let config = config_with("mistral", None);
         let mistral = model_of(&config, &fx.store);
         assert_eq!(mistral.config().chat, ChatFormat::Mistral);
-        assert_eq!(
-            mistral.config().tool_codec.as_ref().map(|codec| codec
-                .parse("[TOOL_CALLS][{\"name\": \"f\", \"arguments\": {}}]")
-                .len()),
-            Some(1)
-        );
-        assert_eq!(
-            mistral.config().tool_codec.as_ref().map(|codec| codec
-                .parse("<|python_tag|>{\"name\": \"f\", \"parameters\": {}}")
-                .len()),
-            Some(0)
-        );
+        assert_eq!(parsed(&*mistral, mistral_call), Some(1));
+        assert_eq!(parsed(&*mistral, llama_call), Some(0));
     }
 
     /// Un-permute the rows of llama.cpp's Q/K layout for interleaved RoPE: llama.cpp stores,
@@ -844,7 +695,7 @@ mod tests {
         let freqs = llama3_rope_freqs(8.0, 1.0, 4.0, 64.0);
         assert!(freqs.iter().any(|f| *f > 1.0 && *f < 8.0), "{freqs:?}");
         let store = with_rope_freqs(&store, &freqs);
-        let model = build(&RawConfig::Gguf(&index), &store).unwrap();
+        let model = (ENTRY.build)(&RawConfig::Gguf(&index), &store).unwrap();
         let mut config = fixture_config();
         config["rope_scaling"] = json!({
             "rope_type": "llama3",
@@ -873,7 +724,7 @@ mod tests {
     #[test]
     fn a_gguf_rope_freqs_that_is_not_a_llama3_rescale_is_refused_naming_the_tensor() {
         let (index, store, _) = gguf_case();
-        let refused = |store: &WeightStore| match build(&RawConfig::Gguf(&index), store) {
+        let refused = |store: &WeightStore| match (ENTRY.build)(&RawConfig::Gguf(&index), store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
             other => panic!("{other:?}"),
         };
@@ -912,7 +763,7 @@ mod tests {
             &[],
         )))
         .unwrap();
-        let err = LlamaParams::from_raw(&RawConfig::Gguf(&index)).unwrap_err();
+        let err = Llama::configure(&RawConfig::Gguf(&index)).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -966,6 +817,7 @@ mod moe_tests {
         close, f32_entry, gguf_dense_kvs, gguf_name_with_head, gguf_tensor, q8_0_store,
         read_back_owned, values,
     };
+    use crate::model::Model;
     use crate::registry::{LoadModelError, Registry};
 
     use super::FIXTURE_EXPERTS as EXPERTS;
@@ -1059,7 +911,7 @@ mod moe_tests {
                 generation: None,
                 preprocessor: None,
             };
-            match build(&raw, &fx.store) {
+            match (ENTRY.build)(&raw, &fx.store) {
                 Err(ModelError::Config {
                     field: got,
                     reason: why,

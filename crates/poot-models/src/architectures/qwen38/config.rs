@@ -16,7 +16,7 @@ use std::num::NonZeroUsize;
 use poot_load::gguf::GgufIndex;
 use poot_quant::weights::{
     AttnRole, ExpertProj, HyperRole, HyperSite, PleRole, QsaRole, WeightId, WeightKey, WeightMap,
-    WeightMapBuilder, WeightMapError, WeightRole, WeightStore, WeightView,
+    WeightRole, WeightStore, WeightView,
 };
 
 use super::gated_residual::HyperParams;
@@ -33,7 +33,7 @@ use crate::components::rope::RopeParams;
 use crate::components::router::RouterKind;
 use crate::components::standard::ParamError;
 use crate::model::{ConfigReason, ModelError};
-use crate::names::{ExpertNames, MoeNames, SharedNames, map_moe_layer};
+use crate::names::{ExpertNames, MoeNames, SharedNames, TensorRows, linear_key, map_moe_layer};
 use crate::registry::RawConfig;
 
 /// The config facts the HF `qwen4_exp` class defaults; a GGUF must name its RoPE base.
@@ -860,16 +860,6 @@ pub(super) fn expert_layout(
     }
 }
 
-/// Map `id` onto the stored tensor `key`.
-fn put(map: &mut WeightMapBuilder<'_>, id: WeightId, key: String) -> Result<(), ModelError> {
-    map.map(id, WeightView::Stored(WeightKey::from(key)))
-        .map_err(|source| ModelError::Weight {
-            family: FAMILY,
-            source,
-        })?;
-    Ok(())
-}
-
 /// The weight map of a checkpoint: the model-level weights and, per layer, the two Hyper-Connections
 /// gates, the mixer its kind names, the PLE block where the layer has one and the routed block. A
 /// tensor the store lacks is [`WeightMapError::Missing`], naming its key, before any trace.
@@ -882,51 +872,26 @@ pub(super) fn weights_of(
         Layout::Hf => &HF_NAMES,
         Layout::Gguf => &GGUF_NAMES,
     };
-    let mut map = WeightMap::builder(store);
-    let missing = |source: WeightMapError| ModelError::Weight {
-        family: FAMILY,
-        source,
-    };
+    let mut rows = TensorRows::new(FAMILY, store);
     // The stored key of a linear: `{stem}.weight`, or the bare stem a packed loader names it.
-    let linear = |stem: &str| {
-        let dense = format!("{stem}.weight");
-        if store.contains(&dense) || !store.contains(stem) {
-            dense
-        } else {
-            stem.to_string()
-        }
-    };
-
-    let embed = WeightId::model(WeightRole::Embed);
-    put(&mut map, embed, names.embed.to_string())?;
-    let head = WeightId::model(WeightRole::Head);
-    let head_key = linear(names.head);
-    if store.contains(&head_key) {
-        put(&mut map, head, head_key)?;
-    } else if p.head_required {
-        return Err(missing(WeightMapError::Missing {
-            id: head,
-            key: WeightKey::from(head_key),
-        }));
-    } else {
-        put(&mut map, head, names.embed.to_string())?;
-    }
+    let linear = |stem: &str| linear_key(store, stem);
+    rows.put(WeightId::model(WeightRole::Embed), names.embed.to_string())?;
+    rows.head(names.embed, names.head, p.head_required)?;
     // One Hyper-Connections gate: the grouped norm scale, the two low-rank projections and, unless
     // it is the model-level mixer, the per-stream injection weights. `at` joins a gate's name to
     // the tensor's stem.
-    let hyper = |map: &mut WeightMapBuilder<'_>,
+    let hyper = |rows: &mut TensorRows<'_>,
                  id: &dyn Fn(HyperRole) -> WeightId,
                  stem: &str,
                  gate: &HyperNames,
                  inject: bool|
      -> Result<(), ModelError> {
-        put(map, id(HyperRole::Norm), format!("{stem}{}", gate.norm))?;
+        rows.put(id(HyperRole::Norm), format!("{stem}{}", gate.norm))?;
         for (role, suffix) in [(HyperRole::MixDown, gate.down), (HyperRole::MixUp, gate.up)] {
-            put(map, id(role), linear(&format!("{stem}{suffix}")))?;
+            rows.put(id(role), linear(&format!("{stem}{suffix}")))?;
         }
         if inject {
-            put(
-                map,
+            rows.put(
                 id(HyperRole::Inject),
                 linear(&format!("{stem}{}", gate.inject)),
             )?;
@@ -934,7 +899,7 @@ pub(super) fn weights_of(
         Ok(())
     };
     hyper(
-        &mut map,
+        &mut rows,
         &|role| WeightId::model(WeightRole::Hyper(HyperSite::Final, role)),
         match p.layout {
             Layout::Hf => "model.language_model.hyper_connection_mixer",
@@ -952,7 +917,7 @@ pub(super) fn weights_of(
             (HyperSite::Mlp, &names.mlp_gate),
         ] {
             hyper(
-                &mut map,
+                &mut rows,
                 &|role| id(WeightRole::Hyper(site, role)),
                 &layer(""),
                 gate,
@@ -970,30 +935,25 @@ pub(super) fn weights_of(
                     if store.contains(&shard(0)) {
                         for ordinal in (0..).take_while(|&ordinal| store.contains(&shard(ordinal)))
                         {
-                            put(
-                                &mut map,
+                            rows.put(
                                 id(WeightRole::Ple(PleRole::TableShard(ordinal))),
                                 shard(ordinal),
                             )?;
                         }
-                        put(
-                            &mut map,
+                        rows.put(
                             id(WeightRole::Ple(PleRole::TableScale)),
                             format!("{table}.weight_scale"),
                         )?;
                     } else {
-                        put(
-                            &mut map,
+                        rows.put(
                             id(WeightRole::Ple(PleRole::Table)),
                             format!("{table}.weight"),
                         )?;
                     }
                 }
-                PleTable::Model(name) => put(
-                    &mut map,
-                    id(WeightRole::Ple(PleRole::Table)),
-                    name.to_string(),
-                )?,
+                PleTable::Model(name) => {
+                    rows.put(id(WeightRole::Ple(PleRole::Table)), name.to_string())?
+                }
             }
             for (role, key) in [
                 (PleRole::Key, linear(&layer(ple.key))),
@@ -1003,7 +963,7 @@ pub(super) fn weights_of(
                 (PleRole::ConvNorm, layer(ple.conv_norm)),
                 (PleRole::Conv, layer(ple.conv)),
             ] {
-                put(&mut map, id(WeightRole::Ple(role)), key)?;
+                rows.put(id(WeightRole::Ple(role)), key)?;
             }
         }
         match kind {
@@ -1015,30 +975,30 @@ pub(super) fn weights_of(
                     (AttnRole::V, a.v),
                     (AttnRole::O, a.o),
                 ] {
-                    put(&mut map, id(WeightRole::Attn(role)), linear(&layer(stem)))?;
+                    rows.put(id(WeightRole::Attn(role)), linear(&layer(stem)))?;
                 }
                 for (role, key) in [(AttnRole::QNorm, a.q_norm), (AttnRole::KNorm, a.k_norm)] {
-                    put(&mut map, id(WeightRole::Attn(role)), layer(key))?;
+                    rows.put(id(WeightRole::Attn(role)), layer(key))?;
                 }
                 match a.indexer.proj {
                     // The query and key rows are one fused projection, query rows first.
                     IndexerProj::Fused(stem) => {
                         let fused = linear(&layer(stem));
                         let query_rows = p.qsa.query_rows();
-                        for (role, rows) in [
+                        for (role, range) in [
                             (QsaRole::Q, 0..query_rows),
                             (QsaRole::K, query_rows..query_rows + p.qsa.dim()),
                         ] {
                             let view = WeightView::RowRange {
                                 key: WeightKey::from(fused.as_str()),
-                                rows,
+                                rows: range,
                             };
-                            map.map(id(WeightRole::Qsa(role)), view).map_err(missing)?;
+                            rows.add(id(WeightRole::Qsa(role)), view)?;
                         }
                     }
                     IndexerProj::Split { q, k } => {
                         for (role, stem) in [(QsaRole::Q, q), (QsaRole::K, k)] {
-                            put(&mut map, id(WeightRole::Qsa(role)), linear(&layer(stem)))?;
+                            rows.put(id(WeightRole::Qsa(role)), linear(&layer(stem)))?;
                         }
                     }
                 }
@@ -1046,19 +1006,18 @@ pub(super) fn weights_of(
                     (QsaRole::QNorm, a.indexer.q_norm),
                     (QsaRole::KNorm, a.indexer.k_norm),
                 ] {
-                    put(&mut map, id(WeightRole::Qsa(role)), layer(key))?;
+                    rows.put(id(WeightRole::Qsa(role)), layer(key))?;
                 }
             }
             LayerKind::LinearAttention => {
-                p.layout
-                    .gdn()
-                    .map_layer(&mut map, l, &layer, &linear)
-                    .map_err(missing)?;
+                let mapped = p.layout.gdn().map_layer(&mut rows.map, l, &layer, &linear);
+                mapped.map_err(|source| rows.error(source))?;
             }
         }
     }
     for l in 0..p.kinds.len() {
-        map_moe_layer(&mut map, store, moe_names, l, p.moe.experts()).map_err(missing)?;
+        let mapped = map_moe_layer(&mut rows.map, store, moe_names, l, p.moe.experts());
+        mapped.map_err(|source| rows.error(source))?;
     }
-    Ok(map.build())
+    Ok(rows.finish())
 }

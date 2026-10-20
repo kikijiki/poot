@@ -1,4 +1,4 @@
-//! MiniMax-M2 behind [`Model`]: a standard pre-norm block with GQA attention, RMSNorm over the
+//! MiniMax-M2: a standard pre-norm block with GQA attention, RMSNorm over the
 //! whole Q and K projections before a partial RoPE (`QkNorm::Projection`), whose feed-forward
 //! routes every layer through a mixture of experts. The router is
 //! [`RouterKind::SigmoidBiasedTopK`]: sigmoid scores, the `top_k` of score plus the
@@ -10,39 +10,31 @@
 //! the same family. The checkpoint's quantization (FP8 blocks) is the loader's business; the
 //! family names its tensors and reads them as stored.
 
-use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
+#[cfg(feature = "test-support")]
+use poot_quant::weights::{DenseWeight, WeightEntry};
+use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
+
+use crate::components::attention::{AttentionParams, QkNorm};
+use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
+use crate::components::moe::MoeParams;
+use crate::components::router::{RouterBias, RouterKind, SigmoidTopK};
+use crate::model::{ConfigReason, FamilyKey, ModelError};
+#[cfg(feature = "test-support")]
+use crate::names::hf_base_shapes;
+use crate::names::{ExpertNames, HF_BASE, HF_QK_NORM, MoeNames};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, RawConfig};
+use poot_text::{ChatFormat, HermesToolCodec};
 use std::sync::Arc;
 
-use poot_graph_ir::{Builder, Graph};
-use poot_quant::weights::{DenseWeight, ExpertProj, WeightEntry, WeightMap, WeightStore};
-
-use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
-use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
-use crate::components::linear::WeightError;
-use crate::components::moe::{self, MoeParams, MoeWeights};
-use crate::components::router::{RouterBias, RouterKind, SigmoidTopK};
-use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    decoder_program, standard_layer, standard_stack,
+use crate::components::standard_family::{
+    Mlp, StandardFamily, StandardParams, entry, weights_with_experts,
 };
-use crate::io::ModelSchema;
-use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
-use crate::names::{
-    ExpertNames, HF_BASE, HF_QK_NORM, MoeLayers, MoeNames, family_weights_routed, hf_base_shapes,
-};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_text::{ChatFormat, HermesToolCodec};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("minimax_m2");
 
-pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
-    family: FAMILY,
-    keys: &[(ConfigSource::HfModelType, "minimax_m2")],
-    build,
-    fixture,
-    variants: &[("finetune", finetune_fixture)],
-};
+pub(crate) const ENTRY: FamilyEntry = entry::<MiniMaxM2>();
 
 /// MiniMax-M2's config facts: the released config states `rms_norm_eps` and `rope_theta`, so these
 /// defaults only serve a config that omits them (HF's `MiniMaxM2Config`). The family is HF-only;
@@ -88,24 +80,15 @@ const HF_MOE: MoeNames = MoeNames {
     shared: None,
 };
 
-/// MiniMax-M2's typed config: every value checked once, here, so tracing cannot fail on it.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct MiniMaxM2Config {
-    vocab: usize,
-    width: usize,
-    layers: usize,
-    max_positions: usize,
-    attention: AttentionParams,
-    layer: LayerParams,
-    stack: StackParams,
-    moe: MoeParams,
-    head_required: bool,
-    eos: BTreeSet<u32>,
-    bos: Option<u32>,
-}
+/// MiniMax-M2: every layer routes through a sigmoid top-k mixture of experts.
+pub(crate) struct MiniMaxM2;
 
-impl MiniMaxM2Config {
-    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+impl StandardFamily for MiniMaxM2 {
+    const FAMILY: FamilyKey = FAMILY;
+    const KEYS: &'static [(ConfigSource, &'static str)] =
+        &[(ConfigSource::HfModelType, "minimax_m2")];
+
+    fn configure(raw: &RawConfig<'_>) -> Result<StandardParams, ModelError> {
         // The family is HF-only: a GGUF never names it, so any other source is refused.
         let RawConfig::HfJson { config, .. } = raw else {
             return Err(ModelError::Config {
@@ -150,127 +133,31 @@ impl MiniMaxM2Config {
         )?
         .with_router_bias(RouterBias::SelectionOnly)
         .map_err(param)?;
-        Ok(Self {
-            attention,
-            layer: LayerParams::new(norm),
-            stack: StackParams::new(norm),
-            vocab: dims.vocab,
-            width: dims.width,
-            layers: dims.layers,
-            max_positions: dims.max_positions,
-            moe,
-            head_required: dims.head_required,
-            eos: dims.eos,
-            bos: dims.bos,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct Layer {
-    norms: LayerNorms,
-    attn: AttentionWeights,
-    moe: MoeWeights,
-}
-
-#[derive(Debug)]
-pub(crate) struct MiniMaxM2 {
-    params: MiniMaxM2Config,
-    weights: WeightMap,
-    stack: StackWeights,
-    layers: Vec<Layer>,
-    config: ModelConfig,
-    schema: ModelSchema,
-}
-
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    let p = MiniMaxM2Config::from_raw(raw)?;
-    let sparse = vec![true; p.layers];
-    let weights = family_weights_routed(
-        FAMILY,
-        store,
-        &[HF_BASE, HF_QK_NORM],
-        p.layers,
-        p.head_required,
-        MoeLayers {
-            names: &HF_MOE,
-            sparse: &sparse,
-            experts: p.moe.experts(),
-        },
-    )?;
-    let weight_error = |e: WeightError| e.for_family(FAMILY);
-    let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
-    let layers = (0..p.layers)
-        .map(|l| {
-            Ok(Layer {
-                norms: LayerNorms::new(&weights, l, p.width)?,
-                attn: AttentionWeights::new(&weights, l, p.width, &p.attention)?,
-                moe: MoeWeights::new(&weights, l, &p.moe)?,
-            })
-        })
-        .collect::<Result<Vec<_>, WeightError>>()
-        .map_err(weight_error)?;
-    let schema = ModelSchema::builder()
-        .step(decoder_program(p.vocab))
-        .build_for(FAMILY)?;
-    let config = ModelConfig {
-        family: FAMILY,
-        vocab: p.vocab,
-        max_positions: p.max_positions,
-        eos: p.eos.clone(),
-        bos: p.bos,
-        prompt_bos: None,
-        prefill_granule: NonZeroUsize::MIN,
-        chat: ChatFormat::ChatML,
-        tool_codec: Some(Arc::new(HermesToolCodec)),
-    };
-    Ok(ModelParts::new(Box::new(MiniMaxM2 {
-        params: p,
-        weights,
-        stack,
-        layers,
-        config,
-        schema,
-    })))
-}
-
-impl Model for MiniMaxM2 {
-    fn config(&self) -> &ModelConfig {
-        &self.config
-    }
-
-    fn schema(&self) -> &ModelSchema {
-        &self.schema
-    }
-
-    fn weights(&self) -> &WeightMap {
-        &self.weights
-    }
-
-    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
-        let p = &self.params;
-        let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        moe::check_step(FAMILY, shape, &p.moe)?;
-        let step = Step::new(&b, shape)?;
-        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
-            let layer = &self.layers[l];
-            standard_layer(
-                b,
-                x,
-                &layer.norms,
-                &p.layer,
-                |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
-                |b, BlockInput { block: h, .. }| moe::moe(b, &step, l, h, None, &layer.moe, &p.moe),
+        Ok(StandardParams {
+            mlp: vec![Mlp::Routed(moe); dims.layers],
+            ..StandardParams::dense(
+                &dims,
+                norm,
+                attention,
+                ChatFormat::ChatML,
+                Some(Arc::new(HermesToolCodec)),
             )
-        })?;
-        Ok(step.finish(b, logits)?)
+        })
+    }
+
+    fn weights(
+        _raw: &RawConfig<'_>,
+        store: &WeightStore,
+        params: &mut StandardParams,
+    ) -> Result<WeightMap, ModelError> {
+        weights_with_experts(FAMILY, store, &[HF_BASE, HF_QK_NORM], &HF_MOE, params)
     }
 }
 
 /// The fixture's config: a tiny untied MiniMax-M2 with grouped-query heads (4 over 2), a partial
 /// RoPE (8 of 16 dims) and 8 experts of which 2 route, whose projection widths are multiples of 32
 /// (so a Q8_0 copy of its store is a valid checkpoint too).
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "minimax_m2",
@@ -296,14 +183,16 @@ pub(crate) fn fixture_config() -> serde_json::Value {
     })
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     fixture_of(fixture_config())
 }
 
 /// A fine-tune of the fixture's architecture with other counts than any pinned release: one layer,
 /// four experts of which three route, four key-value heads and a RoPE as wide as the head. It
 /// ships no manifest and is the same family.
-fn finetune_fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn finetune_fixture() -> Fixture {
     let mut config = fixture_config();
     config["num_hidden_layers"] = serde_json::json!(1);
     config["num_local_experts"] = serde_json::json!(4);
@@ -314,7 +203,8 @@ fn finetune_fixture() -> Fixture {
 }
 
 /// A BF16 checkpoint of `config`'s dimensions, one tensor per name the family reads.
-fn fixture_of(config: serde_json::Value) -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_of(config: serde_json::Value) -> Fixture {
     let n = |f: &str| crate::registry::Fixture::count(&config, f);
     let (h, experts, inter) = (
         n("hidden_size"),
@@ -349,10 +239,12 @@ fn fixture_of(config: serde_json::Value) -> Fixture {
 
 /// The head's power-of-two scale: exact in BF16, and it spreads the logits so a greedy decode's
 /// top-two margins stay far above the f32 rounding difference between a device and a reference.
+#[cfg(feature = "test-support")]
 const HEAD_SCALE: u16 = 3;
 
 /// `store` with the `lm_head.weight` entries' BF16 exponent raised by [`HEAD_SCALE`] (a multiply by
 /// `2^HEAD_SCALE`, exact for every normal value).
+#[cfg(feature = "test-support")]
 fn with_scaled_head(store: &WeightStore) -> WeightStore {
     let mut out = WeightStore::builder();
     for (key, entry) in store.iter() {

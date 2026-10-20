@@ -71,7 +71,7 @@ fn fixture_tokenizer() -> Tokenizer {
 /// end-of-sequence id), one safetensors archive of its bf16 tensors and the fixture tokenizer.
 fn fixture_checkpoint() -> poot_test_util::UniqueTempPath {
     let registry = Registry::builtin().unwrap();
-    let fixture = (registry.entries()[0].fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(registry.entries()[0].family);
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(NO_EOS);
     let dir = poot_test_util::unique_temp_path("poot_card553_qwen2_fixture");

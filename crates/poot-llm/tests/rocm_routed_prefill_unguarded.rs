@@ -50,7 +50,7 @@ fn fixture() -> Fixture {
         .iter()
         .find(|entry| entry.family.as_str() == "qwen4exp")
         .expect("qwen4exp is registered");
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
     let map = Arc::new(model.model.weights().clone());
     Fixture {

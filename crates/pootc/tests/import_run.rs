@@ -1611,13 +1611,12 @@ fn host_hash32(seed: u32, idx: u32) -> u32 {
     x
 }
 
-/// `base` is this row's offset into the flat multi-row buffer (`row * cols`): the hash mixes in the
-/// GLOBAL flat index `base + i`, not a per-row-reset `i` (deval.md section 8.1's `r*cols+i`, matching
+/// The hash mixes in the column `i` of the row's own stream: the noise is row-local, so a seed draws the same noise whichever row of a batch it rides in (matching
 /// `random_uniform.rs` and `poot_eval::ops::sampling::random_uniform`).
-fn host_random_uniform_row(seed: u32, base: u32, vocab: usize) -> Vec<f32> {
+fn host_random_uniform_row(seed: u32, vocab: usize) -> Vec<f32> {
     (0..vocab as u32)
         .map(|i| {
-            let x = host_hash32(seed, base + i);
+            let x = host_hash32(seed, i);
             let mantissa = (x >> 9) as i32;
             (2.0f32 * (mantissa as f32) + 1.0f32) * 5.9604645e-8f32 // 2^-24
         })
@@ -1628,8 +1627,8 @@ fn host_random_uniform_row(seed: u32, base: u32, vocab: usize) -> Vec<f32> {
 /// (`UnOp::Log`/`UnOp::Neg`), applied host-side here since this file dispatches the kernel directly
 /// (bypassing the planner/graph). `random_uniform.rs`'s `u` is always in `[2^-24, 1-2^-24]`, so this is
 /// always finite.
-fn host_gumbel_noise_row(seed: u32, base: u32, vocab: usize) -> Vec<f32> {
-    host_random_uniform_row(seed, base, vocab)
+fn host_gumbel_noise_row(seed: u32, vocab: usize) -> Vec<f32> {
+    host_random_uniform_row(seed, vocab)
         .into_iter()
         .map(|u| -((-(u.ln())).ln()))
         .collect()
@@ -1681,7 +1680,7 @@ fn imported_random_uniform_matches_cpu_oracle() {
         let got = bufs[2].as_f32().to_vec();
 
         for (r, &seed) in seeds.iter().enumerate() {
-            let want = host_random_uniform_row(seed, (r * cols) as u32, cols);
+            let want = host_random_uniform_row(seed, cols);
             assert_eq!(
                 &got[r * cols..(r + 1) * cols],
                 want.as_slice(),
@@ -1863,11 +1862,8 @@ fn imported_sample_gumbel_argmax_batched_matches_cpu_oracle() {
         let mut noise = vec![0f32; b * vocab];
         let mut params_buf = vec![0f32; b * 3];
         for (row, &(seed, temp, min_p)) in rows.iter().enumerate() {
-            noise[row * vocab..(row + 1) * vocab].copy_from_slice(&host_gumbel_noise_row(
-                seed,
-                (row * vocab) as u32,
-                vocab,
-            ));
+            noise[row * vocab..(row + 1) * vocab]
+                .copy_from_slice(&host_gumbel_noise_row(seed, vocab));
             params_buf[row * 3] = 1.0 / temp; // inv_temp
             params_buf[row * 3 + 1] = if min_p > 0.0 {
                 temp * min_p.ln()
@@ -1979,11 +1975,8 @@ fn imported_sample_truncated_gumbel_argmax_batched_matches_cpu_oracle() {
         let mut params_buf = vec![0f32; b * 3];
         let mut top_k_buf = vec![0i32; b];
         for (row, &(seed, temp, min_p, top_k)) in rows.iter().enumerate() {
-            noise[row * vocab..(row + 1) * vocab].copy_from_slice(&host_gumbel_noise_row(
-                seed,
-                (row * vocab) as u32,
-                vocab,
-            ));
+            noise[row * vocab..(row + 1) * vocab]
+                .copy_from_slice(&host_gumbel_noise_row(seed, vocab));
             params_buf[row * 3] = 1.0 / temp;
             params_buf[row * 3 + 1] = if min_p > 0.0 {
                 temp * min_p.ln()
@@ -2106,11 +2099,8 @@ fn imported_sample_topp_gumbel_argmax_batched_matches_cpu_oracle() {
         let mut params_buf = vec![0f32; b * 4];
         let mut top_k_buf = vec![0i32; b];
         for (row, &(seed, temp, min_p, top_k, top_p)) in rows.iter().enumerate() {
-            noise[row * vocab..(row + 1) * vocab].copy_from_slice(&host_gumbel_noise_row(
-                seed,
-                (row * vocab) as u32,
-                vocab,
-            ));
+            noise[row * vocab..(row + 1) * vocab]
+                .copy_from_slice(&host_gumbel_noise_row(seed, vocab));
             params_buf[row * 4] = 1.0 / temp;
             params_buf[row * 4 + 1] = if min_p > 0.0 {
                 temp * min_p.ln()

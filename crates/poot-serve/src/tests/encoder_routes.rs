@@ -17,13 +17,8 @@ fn write_encoder_checkpoint(variant: Option<&str>) -> std::path::PathBuf {
         .find(|entry| entry.family.as_str() == "bert")
         .expect("the bert family is registered");
     let fixture = match variant {
-        None => (entry.fixture)(),
-        Some(name) => entry
-            .variants
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, build)| build())
-            .expect("the bert family registers the variant"),
+        None => poot_models::test_support::family_fixtures::base(entry.family),
+        Some(name) => poot_models::test_support::family_fixtures::variant(entry.family, name),
     };
     let vocab: String = (0..48)
         .map(|i| format!("\"w{i}\":{i}"))

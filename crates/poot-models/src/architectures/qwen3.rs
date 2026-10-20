@@ -1,194 +1,60 @@
-//! qwen3 behind [`Model`]: the qwen2 body without QKV biases, with a per-head RMSNorm on Q and K
-//! before RoPE (`QkNorm::PerHead`) and an explicit `head_dim` that may exceed `width / heads`.
+//! qwen3: the qwen2 body without QKV biases, with a per-head RMSNorm on Q and K before RoPE
+//! (`QkNorm::PerHead`) and an explicit `head_dim` that may exceed `width / heads`.
 //!
-//! The body is `standard_stack` over `standard_layer` with the shared attention and gated FFN.
+//! A dense family is its keys, its config defaults and one attention option ([`DenseFamily`]); the
+//! model is the shared [`super::standard_family::StandardModel`].
 
-use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
+use crate::components::dims::{DenseSpec, dense_keys};
+use crate::model::FamilyKey;
+use crate::names::gguf::{GGUF_BASE, GGUF_QK_NORM};
+use crate::names::{HF_BASE, HF_QK_NORM, NameRow};
+use crate::registry::{ConfigSource, FamilyEntry};
+#[cfg(feature = "test-support")]
+use crate::{names::hf_base_shapes, registry::Fixture};
 use std::sync::Arc;
 
-use poot_graph_ir::{Builder, Graph};
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_text::{ChatFormat, HermesToolCodec, ToolCallCodec};
 
-use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
-use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
-use crate::components::ffn::{GatedFfnWeights, gated_ffn};
-use crate::components::linear::WeightError;
-use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    decoder_program, standard_layer, standard_stack,
-};
-use crate::io::ModelSchema;
-use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
-use crate::names::gguf::{GGUF_BASE, GGUF_QK_NORM};
-use crate::names::{HF_BASE, HF_QK_NORM, family_weights, hf_base_shapes};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_text::{ChatFormat, HermesToolCodec};
+use crate::components::standard_family::{DenseFamily, QkNormScope, entry};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("qwen3");
 
-pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
-    family: FAMILY,
-    keys: &[
+/// qwen3: `Qwen3Config`'s defaults (the class declares no `eos_token_id`: a checkpoint names it) and
+/// llama.cpp's GGUF base default; the qwen2 body without QKV biases, with a per-head RMSNorm on Q
+/// and K before RoPE and an explicit `head_dim` that may exceed `width / heads`.
+pub(crate) struct Qwen3;
+
+impl DenseFamily for Qwen3 {
+    const FAMILY: FamilyKey = FAMILY;
+    const KEYS: &'static [(ConfigSource, &'static str)] = &[
         (ConfigSource::HfModelType, "qwen3"),
         (ConfigSource::GgufArchitecture, "qwen3"),
-    ],
-    build,
-    fixture,
-    variants: &[],
-};
-
-/// qwen3's config facts: `Qwen3Config`'s defaults (the class declares no `eos_token_id`: a
-/// checkpoint names it) and llama.cpp's GGUF base default.
-const SPEC: DenseSpec = DenseSpec {
-    family: FAMILY,
-    gguf: dense_keys!("qwen3"),
-    hf_theta: 10_000.0,
-    gguf_theta: Some(1_000_000.0),
-    eps: 1e-6,
-    eos: None,
-};
-
-/// qwen3's typed config: every value checked once, here, so tracing cannot fail on it.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Qwen3Params {
-    vocab: usize,
-    width: usize,
-    inter: usize,
-    layers: usize,
-    max_positions: usize,
-    attention: AttentionParams,
-    layer: LayerParams,
-    stack: StackParams,
-    head_required: bool,
-    eos: BTreeSet<u32>,
-    bos: Option<u32>,
-}
-
-impl Qwen3Params {
-    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
-        let fields = Fields::new(raw, FAMILY);
-        let dims = DenseDims::read(&fields, &SPEC)?;
-        // `attention_bias` biases the output projection too, which no weight role carries yet.
-        for unsupported in ["attention_bias", "use_sliding_window"] {
-            if fields.flag(Field::hf(unsupported), false)? {
-                return Err(fields.error(unsupported, ConfigReason::Unsupported));
-            }
-        }
-        let norm = dims.norm(&fields, &SPEC)?;
-        Ok(Self {
-            attention: dims
-                .attention(&fields, &SPEC, false)?
-                .with_qk_norm(QkNorm::PerHead(norm)),
-            layer: LayerParams::new(norm),
-            stack: StackParams::new(norm),
-            vocab: dims.vocab,
-            width: dims.width,
-            inter: dims.inter,
-            layers: dims.layers,
-            max_positions: dims.max_positions,
-            head_required: dims.head_required,
-            eos: dims.eos,
-            bos: dims.bos,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct Layer {
-    norms: LayerNorms,
-    attn: AttentionWeights,
-    ffn: GatedFfnWeights,
-}
-
-#[derive(Debug)]
-pub(crate) struct Qwen3 {
-    params: Qwen3Params,
-    weights: WeightMap,
-    stack: StackWeights,
-    layers: Vec<Layer>,
-    config: ModelConfig,
-    schema: ModelSchema,
-}
-
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    let p = Qwen3Params::from_raw(raw)?;
-    let tables: [&[_]; 2] = match raw.source() {
-        ConfigSource::HfModelType => [HF_BASE, HF_QK_NORM],
-        ConfigSource::GgufArchitecture => [GGUF_BASE, GGUF_QK_NORM],
-    };
-    let weights = family_weights(FAMILY, store, &tables, p.layers, p.head_required)?;
-    let weight_error = |e: WeightError| e.for_family(FAMILY);
-    let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
-    let layers = (0..p.layers)
-        .map(|l| {
-            Ok(Layer {
-                norms: LayerNorms::new(&weights, l, p.width)?,
-                attn: AttentionWeights::new(&weights, l, p.width, &p.attention)?,
-                ffn: GatedFfnWeights::new(&weights, l, p.width, p.inter)?,
-            })
-        })
-        .collect::<Result<Vec<_>, WeightError>>()
-        .map_err(weight_error)?;
-    let schema = ModelSchema::builder()
-        .step(decoder_program(p.vocab))
-        .build_for(FAMILY)?;
-    let config = ModelConfig {
+    ];
+    const SPEC: DenseSpec = DenseSpec {
         family: FAMILY,
-        vocab: p.vocab,
-        max_positions: p.max_positions,
-        eos: p.eos.clone(),
-        bos: p.bos,
-        prompt_bos: None,
-        prefill_granule: NonZeroUsize::MIN,
-        chat: ChatFormat::ChatML,
-        tool_codec: Some(Arc::new(HermesToolCodec)),
+        gguf: dense_keys!("qwen3"),
+        hf_theta: 10_000.0,
+        gguf_theta: Some(1_000_000.0),
+        eps: 1e-6,
+        eos: None,
     };
-    Ok(ModelParts::new(Box::new(Qwen3 {
-        params: p,
-        weights,
-        stack,
-        layers,
-        config,
-        schema,
-    })))
+    const CHAT: ChatFormat = ChatFormat::ChatML;
+
+    fn tool_codec() -> Option<Arc<dyn ToolCallCodec>> {
+        Some(Arc::new(HermesToolCodec))
+    }
+    // `attention_bias` biases the output projection too, which no weight role carries yet.
+    const UNSUPPORTED: &'static [&'static str] = &["attention_bias", "use_sliding_window"];
+    const QK_NORM: Option<QkNormScope> = Some(QkNormScope::PerHead);
+    const HF_TABLES: &'static [&'static [NameRow]] = &[HF_BASE, HF_QK_NORM];
+    const GGUF_TABLES: &'static [&'static [NameRow]] = &[GGUF_BASE, GGUF_QK_NORM];
 }
 
-impl Model for Qwen3 {
-    fn config(&self) -> &ModelConfig {
-        &self.config
-    }
-
-    fn schema(&self) -> &ModelSchema {
-        &self.schema
-    }
-
-    fn weights(&self) -> &WeightMap {
-        &self.weights
-    }
-
-    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
-        let p = &self.params;
-        let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        let step = Step::new(&b, shape)?;
-        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
-            let layer = &self.layers[l];
-            standard_layer(
-                b,
-                x,
-                &layer.norms,
-                &p.layer,
-                |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
-                |b, BlockInput { block: h, .. }| gated_ffn(b, h, &layer.ffn),
-            )
-        })?;
-        Ok(step.finish(b, logits)?)
-    }
-}
+pub(crate) const ENTRY: FamilyEntry = entry::<Qwen3>();
 
 /// The fixture's config: a tiny untied qwen3 with `head_dim` 32 (above `64 / 4`), projection widths
 /// that are multiples of 32 (so a Q8_0 copy of its store is a valid checkpoint too).
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "qwen3",
@@ -208,7 +74,8 @@ pub(crate) fn fixture_config() -> serde_json::Value {
     })
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let mut shapes = hf_base_shapes(&config, false);
     let d = config["head_dim"].as_u64().unwrap() as usize;
@@ -227,14 +94,24 @@ mod tests {
 
     use super::*;
     use crate::components::standard::oracle::run_step;
+    use crate::components::standard_family::StandardFamily;
     use crate::components::testing::{
         CAP, Recorded, assert_bf16_and_q8_0_trace_through_the_packed_transform,
         assert_chunked_prefill_equals_decode, assert_gguf_resolves_and_traces_packed,
         assert_matches_recorded, assert_missing_weight_is_named, build as built, close, f32_entry,
         gguf_dense_kvs, gguf_name_with_head, gguf_tensor, q8_0_store, read_back_owned, values,
     };
+    use crate::model::ConfigReason;
+    use crate::model::Model;
+    use crate::model::ModelError;
     use crate::model::StepShape;
+    use crate::model::StepSpec;
+    use crate::model::TraceError;
+    use crate::registry::RawConfig;
     use crate::registry::Registry;
+    use poot_quant::weights::WeightStore;
+    use std::collections::BTreeSet;
+    use std::num::NonZeroUsize;
 
     fn is_projection(key: &str) -> bool {
         key.ends_with("_proj.weight")
@@ -333,7 +210,7 @@ mod tests {
             generation: None,
             preprocessor: None,
         };
-        match build(&raw, &fixture().store) {
+        match (ENTRY.build)(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
             other => panic!("{config}: expected a config error, got {other:?}"),
         }
@@ -450,7 +327,7 @@ mod tests {
             &[],
         )))
         .unwrap();
-        let err = Qwen3Params::from_raw(&RawConfig::Gguf(&index)).unwrap_err();
+        let err = Qwen3::configure(&RawConfig::Gguf(&index)).unwrap_err();
         assert!(
             matches!(
                 err,

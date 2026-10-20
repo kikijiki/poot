@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::op::SampleRule;
+use poot_graph_ir::ops::sampling::{Adjust, SampleSpec};
 use poot_models::io::{InputId, InputSet, RequestInputs};
 use poot_models::model::{KvLayout, LogitRows, StepShape};
 
@@ -77,6 +77,11 @@ pub struct ServingShapes<'a> {
     pub windows: &'a [NonZeroUsize],
     /// Adapter-set generations to compile entries for, besides the base weights.
     pub adapters: &'a [GenerationId],
+    /// The most decode steps a row chains for one host wait ([`RowWork::Chain`](super::RowWork::Chain)):
+    /// for each row count and each sampling head a device chain can carry (a plain or adjusted draw with
+    /// no logprobs), `depth - 1` more copies of the head's decode entry, one per step after the first
+    /// (the first runs the ordinary entry). `None` prepares no chain.
+    pub chain: Option<NonZeroUsize>,
 }
 
 /// Whether a model's carried state is only positional KV (a rejected token's write is harmless) or
@@ -94,10 +99,11 @@ pub enum StateResidency {
 /// Which sampling heads compiled.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeadSet {
-    /// The sampling-suffix rules with prepared entries (greedy, the Gumbel family). A step whose
-    /// picking rows share one of these runs it; any other mix needs `with_logits`.
-    pub suffix: Vec<SampleRule>,
-    /// The logits head: rows that need the host path pick from its output.
+    /// The sampling heads with prepared entries (the greedy argmax, the Gumbel family, an adjusted or
+    /// logprob variant of each). A step runs the narrowest of them that serves all its picking rows;
+    /// a request none serves is refused, never picked on the host.
+    pub suffix: Vec<SampleSpec>,
+    /// The logits head: the full logits for a caller that asked for them (a sampled verify window).
     pub with_logits: bool,
 }
 
@@ -290,7 +296,47 @@ impl Driver<Serving> {
             }
         }
         self.prepare_speculation(shapes, kv, &pieces)?;
+        if let Some(depth) = shapes.chain {
+            self.prepare_chain(shapes, kv, depth)?;
+        }
         Ok(self.refresh_caps())
+    }
+
+    /// The chained decode of `depth` steps for the heads of `shapes` a device chain can carry; see
+    /// [`ServingShapes::chain`].
+    fn prepare_chain(
+        &mut self,
+        shapes: &ServingShapes<'_>,
+        kv: KvLayout,
+        depth: NonZeroUsize,
+    ) -> Result<(), DriverError> {
+        let adapters = std::iter::once(None).chain(shapes.adapters.iter().copied().map(Some));
+        for adapters in adapters {
+            for &rows in shapes.rows {
+                for &head in shapes.heads {
+                    let Head::Sample(spec) = head else {
+                        continue;
+                    };
+                    if spec.logprobs.is_some() || spec.adjust == Adjust::Guided {
+                        continue;
+                    }
+                    for step in 1..depth.get() {
+                        let key = self.step_key(
+                            ModelRole::Target,
+                            kv,
+                            piece_key(Piece::Decode),
+                            rows,
+                            head,
+                            adapters,
+                            InputSet::EMPTY,
+                        );
+                        let chain = u8::try_from(step).map_err(|_| InvalidOptions::ChainTooLong)?;
+                        self.prepared(EntryKey { chain, ..key })?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// This driver as it was before its layout was fixed: the prepared entries stay, the open
@@ -458,6 +504,7 @@ impl<S: State> Driver<S> {
         carried: InputSet,
     ) -> EntryKey {
         EntryKey {
+            chain: 0,
             role,
             program: if role == ModelRole::Mtp {
                 Program::Draft
@@ -628,6 +675,7 @@ impl<S: State> Driver<S> {
                 && key.shape.kv == kv
                 && key.program == Program::Step
                 && key.carried.is_empty()
+                && key.chain == 0
         });
         for key in target_entries {
             let StepShape { rows, tokens, .. } = key.shape;
@@ -636,7 +684,7 @@ impl<S: State> Driver<S> {
             }
             match key.head {
                 Head::Logits => heads.with_logits = true,
-                Head::Sample(rule) if !heads.suffix.contains(&rule) => heads.suffix.push(rule),
+                Head::Sample(spec) if !heads.suffix.contains(&spec) => heads.suffix.push(spec),
                 Head::Sample(_) => {}
             }
             if key.shape.logits == LogitRows::All {
@@ -654,6 +702,7 @@ impl<S: State> Driver<S> {
         }
         row_counts.sort();
         widths.sort();
+        heads.suffix.sort();
         windows.sort_by_key(|w| (w.rows, w.width));
         self.ledger.caps.insert(DriverCaps {
             rows: row_counts

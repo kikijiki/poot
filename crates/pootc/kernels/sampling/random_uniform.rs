@@ -1,7 +1,8 @@
 //! Exact uniform noise, `OpKind::RandomUniform` (card 551a, R472-007, deval.md section 8.1): one thread
 //! per output element, no workgroup reduction. `seed` is `[rows]` I32 (u32 bits); `dims[0]` carries
 //! `cols`; output is `[rows, cols]` F32. For row `r` (`i / cols`) and column `c` (`i % cols`):
-//! `x = fmix32(seed[r] XOR (r*cols+c)*0x9E3779B9)` (murmur3's finalizer, matching
+//! `x = fmix32(seed[r] XOR c*0x9E3779B9)` (murmur3's finalizer, row-local so a seed draws the same noise
+//! whichever row of a batch it rides in, matching
 //! `poot_graph_ir::ops::sampling::hash32` and the CPU oracle bit for bit), `u = (2*(x>>9)+1) * 2^-24`.
 //! `x >> 9` keeps the top 23 bits (`< 2^23`), so `2*(x>>9)+1` is an odd integer in `[1, 2^24-1]`: both the
 //! `u32 -> f32` conversion and the power-of-two multiply are exact, giving `u` in `[2^-24, 1-2^-24]` on
@@ -17,7 +18,7 @@ pub fn __poot_kernel_random_uniform(seed: &[i32], dims: &[u32], out: &mut [f32])
         let r = i / cols;
         let c = i % cols;
         let s = seed[r] as u32;
-        let idx = (r * cols + c) as u32;
+        let idx = c as u32;
         let mut x = s ^ (idx * 0x9E3779B9u32);
         x = x ^ (x >> 16);
         x = x * 0x85EBCA6Bu32;

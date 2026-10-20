@@ -4,9 +4,13 @@
 //! group-limited selection by the sum of each group's two best biased scores, the selected
 //! unbiased scores renormalized (`norm_topk_prob`) and scaled by `routed_scaling_factor`.
 
-use super::deepseek2::{Kind, Scoring, build_family, hf_shapes};
+#[cfg(feature = "test-support")]
+use super::deepseek2::hf_shapes;
+use super::deepseek2::{Kind, Scoring, build_family};
 use crate::model::{FamilyKey, ModelError};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig};
 use poot_quant::weights::WeightStore;
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("deepseek3");
@@ -15,8 +19,6 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
     keys: &[(ConfigSource::HfModelType, "deepseek_v3")],
     build,
-    fixture,
-    variants: &[],
 };
 
 const KIND: Kind = Kind {
@@ -31,6 +33,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
 
 /// The fixture's config: a tiny V3 with a low-rank query, sigmoid routing with a selection bias,
 /// `noaux_tc` group limiting, one shared expert and a renormalized, scaled gate.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "deepseek_v3",
@@ -73,7 +76,8 @@ pub(crate) fn fixture_config() -> serde_json::Value {
     })
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = hf_shapes(&config, true, false);
     Fixture::bf16(config, shapes)

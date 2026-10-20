@@ -5,6 +5,8 @@
 #[cfg(feature = "test-support")]
 pub mod dense;
 #[cfg(feature = "test-support")]
+pub mod family_fixtures;
+#[cfg(feature = "test-support")]
 pub mod fixtures;
 #[cfg(feature = "test-support")]
 pub mod pipeline;

@@ -15,6 +15,8 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, RwLock};
 
 use poot_executor::{Collectives, Coordinator, Device, Executor, SharedKernelsMismatch};
+use poot_graph_ir::op::SampleRule;
+use poot_graph_ir::ops::sampling::SampleSpec;
 use poot_graph_plan::multi_device::DeviceSpec;
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Refusal, ShardRule, multi_device::topology::DeviceId,
@@ -45,8 +47,9 @@ pub(crate) const SUPPORT_RESERVE_BYTES: u64 = 256 << 20;
 const MIN_MAX_SEQ: usize = 128;
 /// The prefill chunk, in tokens, rounded down to the model's granule and capped by the capacity.
 const PREFILL_CHUNK_TOKENS: usize = 128;
-/// Entries the driver may retain, and the host bytes their programs may retain.
-const MAX_ENTRIES: usize = 64;
+/// Entries the driver may retain, and the host bytes their programs may retain. Every row count, prefill
+/// piece and adapter generation exists once per sampling head ([`SERVING_HEADS`]).
+const MAX_ENTRIES: usize = 256;
 const MAX_RETAINED_BYTES: u64 = 1 << 32;
 
 /// What the operator asked for. Absent fields take the defaults of [`crate::config`].
@@ -456,18 +459,35 @@ fn driver_options(handle: &ModelHandle, workload: Workload, draft: DraftPolicy) 
     }
 }
 
+/// The sampling heads a server prepares, each a rung a request climbs only as far as it needs: the
+/// argmax, a plain draw, a draw with the penalties and bias applied from the device-resident history, a
+/// draw that also masks to a guided-decoding constraint, and that draw with the OpenAI-bounded top-n
+/// logprobs. A step runs the narrowest rung that serves all its rows. Every sampling rule runs on the
+/// device, so there is no logits head to fall back to.
+const SERVING_HEADS: [Head; 5] = [
+    Head::GREEDY,
+    Head::Sample(SampleSpec::draw(SampleRule::GumbelTopKTopP)),
+    Head::Sample(SampleSpec::draw(SampleRule::GumbelTopKTopP).adjusted()),
+    Head::Sample(SampleSpec::draw(SampleRule::GumbelTopKTopP).guided()),
+    Head::Sample(
+        SampleSpec::draw(SampleRule::GumbelTopKTopP)
+            .guided()
+            .with_logprobs(crate::api::MAX_LOGPROBS),
+    ),
+];
+
 /// The shapes a generation workload serves: every admitted prefill piece and the decode step, with the
-/// greedy suffix and the logits head, over the candidate's paged pool. A temperature request, or any
-/// mix of rules, picks on the host from the logits head. `rows` is the candidate's own
-/// row count, held by the caller so the shapes can borrow it.
+/// [`SERVING_HEADS`], over the candidate's paged pool. `rows` is the candidate's own row count, held by
+/// the caller so the shapes can borrow it.
 fn shapes_of<'a>(candidate: &Candidate, rows: &'a [NonZeroUsize; 1]) -> ServingShapes<'a> {
     ServingShapes {
         layout: Layout::Paged(candidate.pool()),
         rows,
-        heads: &[Head::GREEDY, Head::Logits],
+        heads: &SERVING_HEADS,
         warm: Warm::Admitted,
         windows: &[],
         adapters: &[],
+        chain: None,
     }
 }
 

@@ -357,8 +357,36 @@ impl Executor for Probe {
     ) -> Result<StepOutputs<'_>, ExecError> {
         self.inner.step(exe, entry, inputs, sync)
     }
+    fn step_chain(
+        &mut self,
+        exe: ExecutableId,
+        steps: &[poot_executor::ChainStep<'_, '_>],
+        feed: &poot_executor::ChainFeed,
+        sync: &mut dyn HostSync,
+    ) -> Result<poot_executor::ChainOutputs<'_>, ExecError> {
+        self.inner.step_chain(exe, steps, feed, sync)
+    }
+    fn step_late(
+        &mut self,
+        exe: ExecutableId,
+        entry: EntryId,
+        inputs: &StepInputs<'_>,
+        late: &mut dyn poot_executor::LateInputs,
+        sync: &mut dyn HostSync,
+    ) -> Result<StepOutputs<'_>, ExecError> {
+        self.inner.step_late(exe, entry, inputs, late, sync)
+    }
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError> {
         self.inner.reset_state(exe, scope)
+    }
+    fn write_state_row(
+        &mut self,
+        exe: ExecutableId,
+        name: &str,
+        row: usize,
+        values: poot_tensor::HostView<'_>,
+    ) -> Result<(), ExecError> {
+        self.inner.write_state_row(exe, name, row, values)
     }
     fn remove_entry(&mut self, exe: ExecutableId, entry: EntryId) -> Result<(), ExecError> {
         self.inner.remove_entry(exe, entry)
@@ -749,6 +777,10 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
 /// Input fell with POOT-1148: the paged write map is `[rows * tokens]` words instead of one word per pool
 /// slot (55224 -> 44952 at four rows). `Meta` moved with POOT-1146: the greedy pick is two dispatches
 /// (chunk and combine) with their own metadata words where it was one, 868 -> 980 and 1220 -> 1332 bytes.
+/// POOT-1268 prepares five sampling heads in place of the greedy suffix and the logits head (the argmax,
+/// a plain draw, the adjusted draw, the guided draw and the guided draw with logprobs), so every entry
+/// shape exists five times and the adjusted heads carry the sampler's history pool (`State` grew by 128, 64 and 32 bytes at
+/// four, two and one rows: `[sequences, 2, vocabulary]` words).
 ///
 /// Mutation: size a dense weight from `shape[..1]` in `Engine::weight_buffer`'s size-only path; `Weight`
 /// is no longer 5344 and this row goes red.
@@ -766,17 +798,17 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         (
             4,
             64,
-            "Activation=827336 Input=44952 Meta=980 State=12288 Weight=5344",
+            "Activation=2091972 Input=117980 Meta=5264 State=12416 Weight=5344",
         ),
         (
             2,
             64,
-            "Activation=413752 Input=31688 Meta=980 State=6144 Weight=5344",
+            "Activation=1046196 Input=82188 Meta=5264 State=6208 Weight=5344",
         ),
         (
             1,
             64,
-            "Activation=206960 Input=25056 Meta=1332 State=3072 Weight=5344",
+            "Activation=523308 Input=64292 Meta=6144 State=3104 Weight=5344",
         ),
     ];
     let domain = candidates(&handle, &args);
@@ -1512,7 +1544,7 @@ fn recurrent_handle() -> Arc<ModelHandle> {
         .iter()
         .find(|entry| entry.family.as_str() == "qwen3next")
         .expect("the builtin qwen3next family");
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
     let dir = poot_test_util::unique_temp_path("poot_serve_qwen3next_fixture");
     std::fs::create_dir_all(&dir).unwrap();
     let mut config = fixture.config.clone();
@@ -1579,6 +1611,7 @@ fn a_recurrent_family_plans_many_rows_and_its_state_bytes_grow_with_the_sequence
                     warm: Warm::Admitted,
                     windows: &[],
                     adapters: &[],
+                    chain: None,
                 },
                 &[],
             )

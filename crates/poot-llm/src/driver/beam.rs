@@ -34,15 +34,16 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use poot_executor::NoLate;
 use poot_models::io::{InputSet, ProgramId, RequestInputs};
-use poot_models::model::{StepShape, StepSpec};
+use poot_models::model::StepShape;
 
 use super::bind::{self, RequestFrame, RowFeed, Side, StepColumns};
 use super::chunks::Piece;
 use super::error::{InvalidRequest, PreparedSetRefusal, Unsupported};
 use super::{
-    Driver, DriverError, EntryKey, FinishReason, Head, ModelRole, Program, State, host_sample,
-    reorder,
+    Driver, DriverError, EntryIo, EntryKey, FinishReason, Head, ModelRole, Program, State,
+    host_sample, reorder,
 };
 
 /// One beam search to run. `width` beams are kept; the search generates at most `max_new` tokens.
@@ -296,6 +297,7 @@ impl<S: State> Driver<S> {
     /// The beam entry of `tokens` new tokens per row at `rows` rows: contiguous layout, the logits head.
     fn beam_key(&self, rows: NonZeroUsize, tokens: usize) -> EntryKey {
         EntryKey {
+            chain: 0,
             role: ModelRole::Beam,
             program: Program::Step,
             shape: StepShape::new(
@@ -324,7 +326,7 @@ impl<S: State> Driver<S> {
         self.prepare_reorder(rows)
     }
 
-    /// The row gather for `rows` rows, compiled from the decode entry's state avals and added to the
+    /// The row gather for `rows` rows, compiled from the compiled decode entry's state avals and added to the
     /// same executable, so it moves the state the decode entry carries.
     fn prepare_reorder(&mut self, rows: NonZeroUsize) -> Result<(), DriverError> {
         if self.ledger.reorders.contains_key(&rows) {
@@ -336,12 +338,9 @@ impl<S: State> Driver<S> {
             return Err(PreparedSetRefusal::Entries { held, limit }.into());
         }
         let decode = self.beam_key(rows, 1);
-        let graph = self
-            .handle
-            .model()
-            .trace(&StepSpec::step(decode.shape), self.settings.options.trace)
-            .map_err(Unsupported::Trace)?;
-        let graph = reorder::reorder_graph(&graph, self.settings.options.trace)
+        // The state the decode entry carries is the compiled program's, at the stored extent the planner chose.
+        let carried = self.prepared(decode)?.carried;
+        let graph = reorder::reorder_graph(&carried, self.settings.options.trace)
             .map_err(|error| Unsupported::RowGraph(Box::new(error)))?;
         let slots = bind::resolve_passes(&graph, ProgramId::STEP)?;
         let output = graph.aval(graph.result()).shape.clone();
@@ -355,8 +354,11 @@ impl<S: State> Driver<S> {
             self.runtime.exe,
             &program,
             reservation,
-            slots,
-            output,
+            EntryIo {
+                slots,
+                output,
+                picked: None,
+            },
             (decode.program, decode.shape),
         )?;
         self.ledger.reorders.insert(rows, entry);
@@ -399,7 +401,7 @@ impl<S: State> Driver<S> {
                 side: Side::Left,
                 feeds: &feeds,
             };
-            let mut outputs = self.execute(&entry, &columns, &frame)?;
+            let mut outputs = self.execute(&entry, &columns, &frame, &mut NoLate)?;
             if i + 1 == pieces.len() {
                 logits = host_sample::read_logits(&mut outputs)?;
             }
@@ -447,7 +449,7 @@ impl<S: State> Driver<S> {
             side: Side::Left,
             feeds: &feeds,
         };
-        let mut outputs = self.execute(&entry, &columns, &frame)?;
+        let mut outputs = self.execute(&entry, &columns, &frame, &mut NoLate)?;
         Ok(host_sample::read_logits(&mut outputs)?)
     }
 
@@ -470,7 +472,7 @@ impl<S: State> Driver<S> {
             beam_rows: index,
             ..StepColumns::default()
         };
-        self.execute(&entry, &columns, &RequestFrame::empty())?;
+        self.execute(&entry, &columns, &RequestFrame::empty(), &mut NoLate)?;
         Ok(())
     }
 }

@@ -1,53 +1,35 @@
-//! Granite behind [`Model`]. A pre-norm transformer block (GQA, RMSNorm, RoPE) plus Granite's four
-//! scalar multipliers (embedding, attention, residual, logits). The MLP is a dense swiglu
+//! Granite. A pre-norm transformer block (GQA, RMSNorm, RoPE) plus Granite's four scalar
+//! multipliers (embedding, attention, residual, logits). The MLP is a dense swiglu
 //! (`model_type: granite`) or a top-k expert mixture (`model_type: granitemoe`).
+//!
+//! The standard stack and layer with Granite's four scalar multipliers as options of the shared
+//! components, and `granitemoe`'s experts as the feed-forward when the config states an expert
+//! count. The legacy dense tracers at the end of this file are the tests' independent reference.
 
-use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-
-use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
 
-use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
-use crate::components::ffn::{GatedFfnWeights, gated_ffn};
-use crate::components::linear::WeightError;
-use crate::components::moe::{self, GateUpForm, MoeParams, MoeWeights};
+use crate::components::moe::{GateUpForm, MoeParams};
 use crate::components::router::RouterKind;
-use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    decoder_program, standard_layer, standard_stack,
-};
-use crate::io::ModelSchema;
-use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
+use crate::components::standard::{LayerParams, StackParams};
+use crate::model::{ConfigReason, FamilyKey, ModelError};
 use crate::names::gguf::GGUF_BASE;
-use crate::names::{
-    ExpertNames, HF_BASE, MoeLayers, MoeNames, family_weights, family_weights_routed,
-    hf_base_shapes,
-};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+#[cfg(feature = "test-support")]
+use crate::names::hf_base_shapes;
+use crate::names::{ExpertNames, HF_BASE, MoeNames};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
+use std::sync::Arc;
 
-// The `granite` family behind [`Model`]: the standard stack and layer with Granite's four scalar
-// multipliers as options of the shared components, and `granitemoe`'s experts as the feed-forward
-// when the config states an expert count. The legacy dense tracers at the end of this file are the
-// tests' independent reference.
+use crate::components::standard_family::{
+    Mlp, StandardFamily, StandardParams, entry, weights_with_experts,
+};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("granite");
 
-pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
-    family: FAMILY,
-    keys: &[
-        (ConfigSource::HfModelType, "granite"),
-        (ConfigSource::HfModelType, "granitemoe"),
-        (ConfigSource::GgufArchitecture, "granite"),
-        (ConfigSource::GgufArchitecture, "granitemoe"),
-    ],
-    build,
-    fixture,
-    variants: &[("granitemoe", moe_fixture)],
-};
+pub(crate) const ENTRY: FamilyEntry = entry::<Granite>();
 
 /// The config facts of one granite architecture: `GraniteConfig`'s defaults (`rms_norm_eps` 1e-6,
 /// `rope_theta` 1e4, eos 2), llama.cpp's GGUF defaults and the GGUF keys under the architecture's
@@ -157,27 +139,19 @@ fn scalar(fields: &Fields<'_>, field: Field) -> Result<f32, ModelError> {
     }
 }
 
-/// granite's typed config: every value checked once, here, so tracing cannot fail on it.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct GraniteConfig {
-    vocab: usize,
-    width: usize,
-    inter: usize,
-    layers: usize,
-    max_positions: usize,
-    attention: AttentionParams,
-    layer: LayerParams,
-    stack: StackParams,
-    /// The experts of every layer's feed-forward when the config names an expert count (`inter`
-    /// is then each expert's width).
-    moe: Option<MoeParams>,
-    head_required: bool,
-    eos: BTreeSet<u32>,
-    bos: Option<u32>,
-}
+/// Granite: a dense swiglu feed-forward (`granite`), or `granitemoe`'s experts.
+pub(crate) struct Granite;
 
-impl GraniteConfig {
-    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+impl StandardFamily for Granite {
+    const FAMILY: FamilyKey = FAMILY;
+    const KEYS: &'static [(ConfigSource, &'static str)] = &[
+        (ConfigSource::HfModelType, "granite"),
+        (ConfigSource::HfModelType, "granitemoe"),
+        (ConfigSource::GgufArchitecture, "granite"),
+        (ConfigSource::GgufArchitecture, "granitemoe"),
+    ];
+
+    fn configure(raw: &RawConfig<'_>) -> Result<StandardParams, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let keys = keys_of(raw);
         let dims = DenseDims::read(&fields, &keys.spec)?;
@@ -205,168 +179,54 @@ impl GraniteConfig {
             .map_err(param)?
             .with_logit_divisor(scalar(&fields, keys.logits)?)
             .map_err(param)?;
-        let moe = match fields.opt_u64(keys.experts)? {
-            None | Some(0) => None,
-            Some(_) => {
-                let gate_up = match raw {
-                    RawConfig::HfJson { .. } => GateUpForm::FusedHalves,
-                    RawConfig::Gguf(_) => GateUpForm::Split,
-                };
-                Some(
-                    MoeParams::new(
-                        FAMILY,
-                        dims.width,
-                        dims.inter,
-                        fields.count(keys.experts, None)?,
-                        fields.count(keys.top_k, None)?,
-                        RouterKind::TopKSoftmax,
-                    )?
-                    .with_gate_up(gate_up),
-                )
-            }
-        };
-        Ok(Self {
-            moe,
-            attention,
+        let mut params = StandardParams {
             layer,
             stack,
-            vocab: dims.vocab,
-            width: dims.width,
-            inter: dims.inter,
-            layers: dims.layers,
-            max_positions: dims.max_positions,
             head_required,
-            eos: dims.eos,
-            bos: dims.bos,
-        })
-    }
-}
-
-#[derive(Debug)]
-enum Ffn {
-    Dense(GatedFfnWeights),
-    Routed(Box<MoeWeights>, MoeParams),
-}
-
-#[derive(Debug)]
-struct Layer {
-    norms: LayerNorms,
-    attn: AttentionWeights,
-    ffn: Ffn,
-}
-
-#[derive(Debug)]
-pub(crate) struct Granite {
-    params: GraniteConfig,
-    weights: WeightMap,
-    stack: StackWeights,
-    layers: Vec<Layer>,
-    config: ModelConfig,
-    schema: ModelSchema,
-}
-
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    let p = GraniteConfig::from_raw(raw)?;
-    let (rows, moe_names) = match raw.source() {
-        ConfigSource::HfModelType => (HF_BASE, &HF_MOE),
-        ConfigSource::GgufArchitecture => (GGUF_BASE, &GGUF_MOE),
-    };
-    let weights = match &p.moe {
-        None => family_weights(FAMILY, store, &[rows], p.layers, p.head_required)?,
-        Some(moe) => family_weights_routed(
-            FAMILY,
-            store,
-            &[rows],
-            p.layers,
-            p.head_required,
-            MoeLayers {
-                names: moe_names,
-                sparse: &vec![true; p.layers],
-                experts: moe.experts(),
-            },
-        )?,
-    };
-    let weight_error = |e: WeightError| e.for_family(FAMILY);
-    let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
-    let layers = (0..p.layers)
-        .map(|l| {
-            let ffn = match &p.moe {
-                None => Ffn::Dense(GatedFfnWeights::new(&weights, l, p.width, p.inter)?),
-                Some(moe) => Ffn::Routed(Box::new(MoeWeights::new(&weights, l, moe)?), *moe),
-            };
-            Ok(Layer {
-                norms: LayerNorms::new(&weights, l, p.width)?,
-                attn: AttentionWeights::new(&weights, l, p.width, &p.attention)?,
-                ffn,
-            })
-        })
-        .collect::<Result<Vec<_>, WeightError>>()
-        .map_err(weight_error)?;
-    let schema = ModelSchema::builder()
-        .step(decoder_program(p.vocab))
-        .build_for(FAMILY)?;
-    let config = ModelConfig {
-        family: FAMILY,
-        vocab: p.vocab,
-        max_positions: p.max_positions,
-        eos: p.eos.clone(),
-        bos: p.bos,
-        prompt_bos: None,
-        prefill_granule: NonZeroUsize::MIN,
-        chat: ChatFormat::Granite,
-        tool_codec: Some(Arc::new(HermesToolCodec)),
-    };
-    Ok(ModelParts::new(Box::new(Granite {
-        params: p,
-        weights,
-        stack,
-        layers,
-        config,
-        schema,
-    })))
-}
-
-impl Model for Granite {
-    fn config(&self) -> &ModelConfig {
-        &self.config
-    }
-
-    fn schema(&self) -> &ModelSchema {
-        &self.schema
-    }
-
-    fn weights(&self) -> &WeightMap {
-        &self.weights
-    }
-
-    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
-        let p = &self.params;
-        let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        if let Some(params) = &p.moe {
-            moe::check_step(FAMILY, shape, params)?;
-        }
-        let step = Step::new(&b, shape)?;
-        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
-            let layer = &self.layers[l];
-            standard_layer(
-                b,
-                x,
-                &layer.norms,
-                &p.layer,
-                |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
-                |b, BlockInput { block: h, .. }| match &layer.ffn {
-                    Ffn::Dense(w) => gated_ffn(b, h, w),
-                    Ffn::Routed(w, params) => moe::moe(b, &step, l, h, None, w, params),
-                },
+            ..StandardParams::dense(
+                &dims,
+                norm,
+                attention,
+                ChatFormat::Granite,
+                Some(Arc::new(HermesToolCodec)),
             )
-        })?;
-        Ok(step.finish(b, logits)?)
+        };
+        // `inter` is each expert's width when the config names an expert count.
+        if !matches!(fields.opt_u64(keys.experts)?, None | Some(0)) {
+            let gate_up = match raw {
+                RawConfig::HfJson { .. } => GateUpForm::FusedHalves,
+                RawConfig::Gguf(_) => GateUpForm::Split,
+            };
+            let moe = MoeParams::new(
+                FAMILY,
+                dims.width,
+                dims.inter,
+                fields.count(keys.experts, None)?,
+                fields.count(keys.top_k, None)?,
+                RouterKind::TopKSoftmax,
+            )?
+            .with_gate_up(gate_up);
+            params.mlp = vec![Mlp::Routed(moe); dims.layers];
+        }
+        Ok(params)
+    }
+
+    fn weights(
+        raw: &RawConfig<'_>,
+        store: &WeightStore,
+        params: &mut StandardParams,
+    ) -> Result<WeightMap, ModelError> {
+        let (rows, moe_names) = match raw.source() {
+            ConfigSource::HfModelType => (HF_BASE, &HF_MOE),
+            ConfigSource::GgufArchitecture => (GGUF_BASE, &GGUF_MOE),
+        };
+        weights_with_experts(FAMILY, store, &[rows], moe_names, params)
     }
 }
 
 /// The fixture's config: a tiny untied granite with non-trivial multipliers, whose projection widths
 /// are multiples of 32 (so a Q8_0 copy of its store is a valid checkpoint too).
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "granite",
@@ -389,17 +249,22 @@ pub(crate) fn fixture_config() -> serde_json::Value {
     })
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = hf_base_shapes(&config, false);
     Fixture::bf16(config, shapes)
 }
 
 /// The shape of the `granitemoe` fixture.
+#[cfg(feature = "test-support")]
 const FIXTURE_EXPERTS: usize = 4;
+#[cfg(feature = "test-support")]
 const FIXTURE_WIDTH: usize = 64;
+#[cfg(feature = "test-support")]
 const FIXTURE_INTER: usize = 64;
 
+#[cfg(feature = "test-support")]
 fn moe_config() -> serde_json::Value {
     let mut config = fixture_config();
     config["model_type"] = serde_json::json!("granitemoe");
@@ -412,7 +277,8 @@ fn moe_config() -> serde_json::Value {
 /// A tiny untied granitemoe: every layer routes; HF stores the experts fused, `input_linear`
 /// `[experts, 2 * inter, width]` (gate rows then up rows) and `output_linear` `[experts, width,
 /// inter]`.
-fn moe_fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn moe_fixture() -> Fixture {
     let config = moe_config();
     let mut shapes: Vec<_> = hf_base_shapes(&config, false)
         .into_iter()
@@ -443,6 +309,7 @@ mod family_tests {
 
     use super::*;
     use crate::components::standard::oracle::run_step;
+    use crate::components::standard_family::StandardFamily;
     use crate::components::testing::{
         CAP, Recorded, assert_bf16_and_q8_0_trace_through_the_packed_transform,
         assert_chunked_prefill_equals_decode, assert_gguf_resolves_and_traces_packed,
@@ -450,7 +317,9 @@ mod family_tests {
         f32_entry, gguf_dense_kvs, gguf_name_with_head, gguf_tensor, q8_0_store, read_back_owned,
         values,
     };
+    use crate::model::Model;
     use crate::registry::Registry;
+    use std::collections::BTreeSet;
 
     fn is_projection(key: &str) -> bool {
         key.ends_with("_proj.weight")
@@ -568,7 +437,7 @@ mod family_tests {
             generation: None,
             preprocessor: None,
         };
-        match build(&raw, &fixture().store) {
+        match (ENTRY.build)(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
             other => panic!("{config}: expected a config error, got {other:?}"),
         }
@@ -700,7 +569,7 @@ mod family_tests {
         kvs.push(("granite.embedding_scale".to_string(), GgufValue::F32(2.0)));
         let (partial, _) = read_back_owned(&kvs, &[]);
         drop(index);
-        let err = GraniteConfig::from_raw(&RawConfig::Gguf(&partial)).unwrap_err();
+        let err = Granite::configure(&RawConfig::Gguf(&partial)).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -734,6 +603,7 @@ mod moe_tests {
         CAP, assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build as built,
         close, f32_entry, gguf_dense_kvs, gguf_name_with_head, values,
     };
+    use crate::model::Model;
     use crate::registry::{LoadModelError, Registry};
 
     use super::{FIXTURE_EXPERTS as EXPERTS, FIXTURE_INTER as INTER, FIXTURE_WIDTH as WIDTH};
@@ -827,7 +697,7 @@ mod moe_tests {
                 generation: None,
                 preprocessor: None,
             };
-            match build(&raw, &fx.store) {
+            match (ENTRY.build)(&raw, &fx.store) {
                 Err(ModelError::Config {
                     field: got,
                     reason: why,

@@ -50,9 +50,7 @@ const PINNED: [u32; NEW_TOKENS] = [24, 37, 3, 45, 10, 20, 45, 10];
 const PINNED_OTHER: [u32; NEW_TOKENS] = [20, 45, 10, 20, 45, 10, 20, 45];
 
 fn registry() -> Registry {
-    let mut registry = Registry::builtin().unwrap();
-    registry.register(tagged::ENTRY).unwrap();
-    registry
+    Registry::builtin_plus(&[tagged::ENTRY]).unwrap()
 }
 
 fn load(dir: &Path) -> ModelHandle {
@@ -198,6 +196,7 @@ fn a_request_without_the_required_tag_is_refused_before_it_holds_a_slot() {
             warm: Warm::Prompts(&[PROMPT.len()]),
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap();
     let missing = driver
@@ -235,6 +234,7 @@ fn a_tag_column_that_does_not_fit_the_prompt_is_refused_with_a_typed_defect() {
             warm: Warm::Prompts(&[PROMPT.len()]),
             windows: &[],
             adapters: &[],
+            chain: None,
         })
         .unwrap();
     let open = |driver: &mut Driver<Serving>, inputs| {

@@ -1,45 +1,29 @@
-//! gpt-oss behind [`Model`]: attention with per-head sink logits and biased projections,
+//! gpt-oss: attention with per-head sink logits and biased projections,
 //! alternating sliding-window and full layers, and a routed block of biased clamped-GLU experts. The
 //! body is `standard_stack` over `standard_layer` with the shared attention and `components::moe`.
 
-use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-
-use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
 
-use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::Glu;
-use crate::components::linear::WeightError;
-use crate::components::moe::{self, GateUpForm, MoeParams, MoeWeights, Orientation};
+use crate::components::moe::{GateUpForm, MoeParams, Orientation};
 use crate::components::router::{RouterBias, RouterKind};
-use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    decoder_program, standard_layer, standard_stack,
-};
-use crate::io::ModelSchema;
-use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
+use crate::model::{ConfigReason, FamilyKey, ModelError};
 use crate::names::gguf::{GGUF_BASE, GGUF_SINK_ATTENTION};
-use crate::names::{
-    ExpertNames, HF_BASE, HF_SINK_ATTENTION, MoeLayers, MoeNames, family_weights_routed,
-};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+use crate::names::{ExpertNames, HF_BASE, HF_SINK_ATTENTION, MoeNames};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
+use std::sync::Arc;
+
+use crate::components::standard_family::{
+    Mlp, StandardFamily, StandardParams, entry, weights_with_experts,
+};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("gpt_oss");
 
-pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
-    family: FAMILY,
-    keys: &[
-        (ConfigSource::HfModelType, "gpt_oss"),
-        (ConfigSource::GgufArchitecture, "gpt-oss"),
-    ],
-    build,
-    fixture,
-    variants: &[],
-};
+pub(crate) const ENTRY: FamilyEntry = entry::<GptOss>();
 
 /// gpt-oss's config facts: `GptOssConfig`'s defaults (the class declares no `eos_token_id`: a
 /// checkpoint names it) and the `rope_theta` both formats carry.
@@ -111,28 +95,17 @@ const GGUF_MOE: MoeNames = MoeNames {
     ],
 };
 
-/// gpt-oss's typed config: every value checked once, here, so tracing cannot fail on it.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct GptOssConfig {
-    vocab: usize,
-    width: usize,
-    layers: usize,
-    max_positions: usize,
-    /// Full attention and the sliding-window attention: the same parameters but the window.
-    full: AttentionParams,
-    sliding: AttentionParams,
-    /// Per layer: sliding window (`true`) or full attention.
-    layer_is_sliding: Vec<bool>,
-    layer: LayerParams,
-    stack: StackParams,
-    moe: MoeParams,
-    head_required: bool,
-    eos: BTreeSet<u32>,
-    bos: Option<u32>,
-}
+/// gpt-oss: sink attention over alternating sliding and full layers, every layer routed.
+pub(crate) struct GptOss;
 
-impl GptOssConfig {
-    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+impl StandardFamily for GptOss {
+    const FAMILY: FamilyKey = FAMILY;
+    const KEYS: &'static [(ConfigSource, &'static str)] = &[
+        (ConfigSource::HfModelType, "gpt_oss"),
+        (ConfigSource::GgufArchitecture, "gpt-oss"),
+    ];
+
+    fn configure(raw: &RawConfig<'_>) -> Result<StandardParams, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let dims = DenseDims::read(&fields, &SPEC)?;
         // Every gpt-oss projection has a bias; a config that says otherwise describes another model.
@@ -151,7 +124,7 @@ impl GptOssConfig {
             Some(n) => usize::try_from(n)
                 .map_err(|_| fields.error(fields.key(WINDOW), ConfigReason::WrongType))?,
         };
-        let sliding = full.with_window(window).map_err(param)?;
+        let sliding_attention = full.with_window(window).map_err(param)?;
         let limit = fields.float(Field::hf("swiglu_limit"), DEFAULT_GLU_LIMIT)?;
         let moe = MoeParams::new(
             FAMILY,
@@ -174,21 +147,33 @@ impl GptOssConfig {
                 .with_gate_up(GateUpForm::FusedInterleaved),
             RawConfig::Gguf(_) => moe,
         };
-        Ok(Self {
-            full,
-            sliding,
-            layer_is_sliding,
-            layer: LayerParams::new(norm),
-            stack: StackParams::new(norm),
-            vocab: dims.vocab,
-            width: dims.width,
-            layers: dims.layers,
-            max_positions: dims.max_positions,
-            moe,
-            head_required: dims.head_required,
-            eos: dims.eos,
-            bos: dims.bos,
+        let attention = layer_is_sliding
+            .iter()
+            .map(|&sliding| if sliding { sliding_attention } else { full })
+            .collect();
+        Ok(StandardParams {
+            attention,
+            mlp: vec![Mlp::Routed(moe); dims.layers],
+            ..StandardParams::dense(
+                &dims,
+                norm,
+                full,
+                ChatFormat::ChatML,
+                Some(Arc::new(HermesToolCodec)),
+            )
         })
+    }
+
+    fn weights(
+        raw: &RawConfig<'_>,
+        store: &WeightStore,
+        params: &mut StandardParams,
+    ) -> Result<WeightMap, ModelError> {
+        let (tables, names): ([&[_]; 2], &MoeNames) = match raw.source() {
+            ConfigSource::HfModelType => ([HF_BASE, HF_SINK_ATTENTION], &HF_MOE),
+            ConfigSource::GgufArchitecture => ([GGUF_BASE, GGUF_SINK_ATTENTION], &GGUF_MOE),
+        };
+        weights_with_experts(FAMILY, store, &tables, names, params)
     }
 }
 
@@ -220,120 +205,10 @@ fn layer_schedule(fields: &Fields<'_>, layers: usize) -> Result<Vec<bool>, Model
         .collect()
 }
 
-#[derive(Debug)]
-struct Layer {
-    norms: LayerNorms,
-    attn: AttentionWeights,
-    moe: MoeWeights,
-}
-
-#[derive(Debug)]
-pub(crate) struct GptOss {
-    params: GptOssConfig,
-    weights: WeightMap,
-    stack: StackWeights,
-    layers: Vec<Layer>,
-    config: ModelConfig,
-    schema: ModelSchema,
-}
-
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
-    let p = GptOssConfig::from_raw(raw)?;
-    let (tables, names): ([&[_]; 2], &MoeNames) = match raw.source() {
-        ConfigSource::HfModelType => ([HF_BASE, HF_SINK_ATTENTION], &HF_MOE),
-        ConfigSource::GgufArchitecture => ([GGUF_BASE, GGUF_SINK_ATTENTION], &GGUF_MOE),
-    };
-    let sparse = vec![true; p.layers];
-    let weights = family_weights_routed(
-        FAMILY,
-        store,
-        &tables,
-        p.layers,
-        p.head_required,
-        MoeLayers {
-            names,
-            sparse: &sparse,
-            experts: p.moe.experts(),
-        },
-    )?;
-    let weight_error = |e: WeightError| e.for_family(FAMILY);
-    let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
-    let layers = (0..p.layers)
-        .map(|l| {
-            Ok(Layer {
-                norms: LayerNorms::new(&weights, l, p.width)?,
-                attn: AttentionWeights::new(&weights, l, p.width, &p.full)?,
-                moe: MoeWeights::new(&weights, l, &p.moe)?,
-            })
-        })
-        .collect::<Result<Vec<_>, WeightError>>()
-        .map_err(weight_error)?;
-    let schema = ModelSchema::builder()
-        .step(decoder_program(p.vocab))
-        .build_for(FAMILY)?;
-    let config = ModelConfig {
-        family: FAMILY,
-        vocab: p.vocab,
-        max_positions: p.max_positions,
-        eos: p.eos.clone(),
-        bos: p.bos,
-        prompt_bos: None,
-        prefill_granule: NonZeroUsize::MIN,
-        chat: ChatFormat::ChatML,
-        tool_codec: Some(Arc::new(HermesToolCodec)),
-    };
-    Ok(ModelParts::new(Box::new(GptOss {
-        params: p,
-        weights,
-        stack,
-        layers,
-        config,
-        schema,
-    })))
-}
-
-impl Model for GptOss {
-    fn config(&self) -> &ModelConfig {
-        &self.config
-    }
-
-    fn schema(&self) -> &ModelSchema {
-        &self.schema
-    }
-
-    fn weights(&self) -> &WeightMap {
-        &self.weights
-    }
-
-    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
-        let p = &self.params;
-        let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        moe::check_step(FAMILY, shape, &p.moe)?;
-        let step = Step::new(&b, shape)?;
-        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
-            let layer = &self.layers[l];
-            let attn = if p.layer_is_sliding[l] {
-                &p.sliding
-            } else {
-                &p.full
-            };
-            standard_layer(
-                b,
-                x,
-                &layer.norms,
-                &p.layer,
-                |b, h| attention(b, &step, l, h, &layer.attn, attn),
-                |b, BlockInput { block: h, .. }| moe::moe(b, &step, l, h, None, &layer.moe, &p.moe),
-            )
-        })?;
-        Ok(step.finish(b, logits)?)
-    }
-}
-
 /// The fixture's config: a tiny gpt-oss of two layers (sliding then full, a window of 3 keys that
 /// a five-token prompt exceeds), 8 experts of which 2 route, biases everywhere, `head_dim` 32 and
 /// tied embeddings off. Widths are multiples of 32 so a Q8_0 copy of the expert stacks is valid.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "gpt_oss",
@@ -359,7 +234,8 @@ pub(crate) fn fixture_config() -> serde_json::Value {
     })
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let n = |f: &str| crate::registry::Fixture::count(&config, f);
     let (h, d, inter, experts) = (
@@ -419,9 +295,13 @@ mod family_tests {
         assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build as built,
         close, f32_entry, gguf_dense_kvs, read_back_owned, values,
     };
+    use crate::model::Model;
     use crate::model::StepShape;
+    use crate::model::StepSpec;
+    use crate::model::TraceError;
     use crate::registry::Registry;
     use poot_load::gguf::{GgufIndex, GgufValue};
+    use std::num::NonZeroUsize;
 
     fn model_of(config: &serde_json::Value, store: &WeightStore) -> Box<dyn Model> {
         let raw = RawConfig::HfJson {
@@ -770,7 +650,7 @@ mod family_tests {
             generation: None,
             preprocessor: None,
         };
-        match build(&raw, &fixture().store) {
+        match (ENTRY.build)(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
             other => panic!("{config}: expected a config error, got {other:?}"),
         }

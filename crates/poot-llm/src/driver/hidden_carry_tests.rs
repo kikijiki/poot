@@ -12,13 +12,13 @@ use std::sync::Arc;
 use poot_executor::{Device, Dispatch, Engine};
 use poot_graph_ir::{BinOp, Graph, StateRole, TensorType};
 use poot_graph_plan::{CompileLimits, CompileOptions, Target};
-use poot_models::components::standard::{HIDDEN_CARRY_STATE, Step, check_step};
+use poot_models::components::standard::{HIDDEN_CARRY_STATE, Step};
 use poot_models::io::{ModelSchema, ProgramId, ProgramSpec, StateSpec};
 use poot_models::model::{
     FamilyKey, HiddenCarry, LogitRows, Model, ModelConfig, ModelError, ModelOutput, ShapeReason,
     StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
 use poot_quant::weights::{WeightMap, WeightStore};
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
@@ -100,7 +100,6 @@ impl Model for Carrier {
 
     fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
         let shape = spec.shape;
-        check_step(CARRIER, shape, CAPACITY)?;
         let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let token = b.cast(
@@ -179,21 +178,12 @@ fn build_carrier(raw: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, Mod
 }
 
 fn handle_of(kind: Kind) -> Arc<ModelHandle> {
-    let mut registry = Registry::empty();
-    registry
-        .register(FamilyEntry {
-            family: CARRIER,
-            keys: &[(ConfigSource::HfModelType, "poot_fixture_carrier")],
-            build: build_carrier,
-            fixture: || Fixture {
-                config: serde_json::json!({}),
-                generation: None,
-                preprocessor: None,
-                store: WeightStore::default(),
-            },
-            variants: &[],
-        })
-        .unwrap();
+    let registry = Registry::of(&[FamilyEntry {
+        family: CARRIER,
+        keys: &[(ConfigSource::HfModelType, "poot_fixture_carrier")],
+        build: build_carrier,
+    }])
+    .unwrap();
     let config = serde_json::json!({
         "model_type": "poot_fixture_carrier",
         "carrier": kind.name(),
@@ -331,6 +321,7 @@ fn prepare(
         warm: Warm::Admitted,
         windows,
         adapters: &[],
+        chain: None,
     })
 }
 

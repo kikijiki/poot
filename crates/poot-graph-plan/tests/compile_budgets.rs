@@ -7,13 +7,14 @@ use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use poot_graph_ir::op::SampleRule;
-use poot_graph_ir::{BinOp, Builder, Graph, OpKind, RedOp, TensorType, UnOp};
+use poot_graph_ir::{BinOp, Builder, Graph, OpKind, RedOp, TensorType, UnOp, WeightRef};
 use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
 use poot_graph_plan::{
     Capability, CompileError, CompileLimits, CompileOptions, ExpansionError, GraphResource,
     KernelChoice, LegalizeError, PlanError, Target, compile, legalize, plan_eqn_choice,
 };
 use poot_kernelgen::{BodyLimits, BodyResource, BodyStage, KernelGenError, KernelRequest};
+use poot_quant::weights::{WeightId, WeightRole};
 use poot_target::Backend;
 use poot_test_util::device_caps::default_caps_for;
 
@@ -83,7 +84,12 @@ const BUFFER_LIMIT_BYTES: u64 = 32;
 fn oversized_weight() -> (Graph, Target) {
     let b = Builder::for_tests();
     let x = b.constant("x", TensorType::f32(vec![1, 4])).unwrap();
-    let w = b.constant("w", TensorType::f32(vec![16, 4])).unwrap();
+    let w = b
+        .weight(
+            WeightRef::whole(WeightId::model(WeightRole::Head)),
+            TensorType::f32(vec![16, 4]),
+        )
+        .unwrap();
     let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
     let Target::Gpu { backend, mut caps } = wgpu() else {
         unreachable!("wgpu() is a GPU target")

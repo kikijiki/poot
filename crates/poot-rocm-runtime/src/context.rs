@@ -673,6 +673,7 @@ pub(crate) fn caps_from_agent(probe: &AgentProbe<'_>) -> poot_target::DeviceCaps
         compute_units: probe.compute_units.unwrap_or(defaults.compute_units),
         // 0 is the failed one-time pool query: unknown, not an empty device.
         memory_budget_bytes: (probe.vram_total_bytes != 0).then_some(probe.vram_total_bytes),
+        dram_channels: poot_target::dram_channels::DramChannels::of_device_name(probe.isa_name),
         ..defaults
     }
 }

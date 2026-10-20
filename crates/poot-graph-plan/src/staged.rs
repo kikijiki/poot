@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use poot_graph_ir::analysis::{NumericsProperty, Tier2Class};
-use poot_graph_ir::{BoundaryId, Graph, TensorType, ValueId};
+use poot_graph_ir::{BoundaryId, Graph, Slot, SlotKey, TensorType, ValueId};
 use poot_quant::weights::{WeightId, WeightMap};
 use poot_target::BufferStorage;
 
@@ -210,6 +210,10 @@ pub struct StagedProgram {
     comm: CommunicationPlan,
     footprints: Vec<(DeviceId, ByteCategories)>,
     sync_points: Vec<SyncPoint>,
+    /// The stage after which the host binds the late inputs of the stages that follow it, when the
+    /// compile was asked for the cut ([`CompileOptions::late`]) and the program is otherwise one stage on
+    /// one device. `None` binds every input before the first stage.
+    late: Option<StageId>,
     tensor: Option<TensorParallel>,
     /// What the transforms that cut the graph into stages (the tensor-parallel shard, the expert pool) did
     /// to its arithmetic, which no stage's own program sees.
@@ -226,6 +230,7 @@ impl StagedProgram {
             comm: CommunicationPlan::default(),
             footprints: Vec::new(),
             sync_points: Vec::new(),
+            late: None,
             tensor: None,
             transform: NumericsProperty::Exact,
         }
@@ -272,6 +277,7 @@ impl StagedProgram {
             comm: CommunicationPlan::default(),
             footprints: Vec::new(),
             sync_points: parts.sync_points,
+            late: None,
             tensor: None,
             transform: NumericsProperty::Exact,
         }
@@ -314,6 +320,26 @@ impl StagedProgram {
     /// The step's host sync points, in stage order (empty unless experts are pooled).
     pub fn sync_points(&self) -> &[SyncPoint] {
         &self.sync_points
+    }
+
+    /// Whether a step of this program takes an input for `key`: a slot one of its stages declares, or the
+    /// token ids a hosted embed gather reads. A stage split keeps only the inputs a stage uses, so a slot
+    /// of the traced graph that no stage reads is not one a step binds.
+    pub fn takes_input(&self, key: &SlotKey) -> bool {
+        let token = SlotKey::new(Slot::Token, None);
+        self.stages.iter().any(|(_, _, program)| {
+            let graph = program.graph();
+            graph.slots().iter().any(|&(id, kind)| {
+                graph.meta(id).slot_key() == Some(key)
+                    || (*key == token && kind == Slot::TokenEmbed)
+            })
+        })
+    }
+
+    /// The stage after which the host binds the late inputs of the stages that follow it: they run on the
+    /// device while the host builds those inputs. `None`: every input is bound before the first stage.
+    pub fn late_after(&self) -> Option<StageId> {
+        self.late
     }
 }
 
@@ -508,7 +534,15 @@ pub fn compile_staged(
         Some(cuts) => cuts.is_empty(),
         None => placement.after_layers.is_empty() && placed.sites.is_empty(),
     };
-    if uncut {
+    // The late-input cut (POOT-1268) splits a program that is otherwise one stage on one device: a program
+    // that is cut already, or that spans devices, binds its late inputs with the rest.
+    let late_site = match options.late {
+        Some(boundary) if uncut && rank_cuts.is_none() && !placement.spans_devices() => {
+            late_position(&adapted, boundary)
+        }
+        _ => None,
+    };
+    if uncut && late_site.is_none() {
         let only = &placement.stages[0];
         let mut program = StagedProgram::single(
             crate::compile(&adapted, &only.target, &stage_options)?,
@@ -541,6 +575,8 @@ pub fn compile_staged(
             .collect();
         (sites, cuts)
     };
+    let mut cut_sites = cut_sites;
+    cut_sites.extend(late_site.map(CutSite::Before));
     let split = split_stages(
         &adapted,
         &StageAssignment::from_sites(&adapted, &cut_sites)?,
@@ -669,9 +705,18 @@ pub fn compile_staged(
         comm: plan.communication,
         footprints,
         sync_points,
+        late: late_site.map(|_| StageId(0)),
         tensor,
         transform,
     })
+}
+
+/// The equation position right after the one that produces the exported value `boundary` names: where
+/// the late-input cut falls. `None` when the graph exports no such value or nothing follows it.
+fn late_position(g: &Graph, boundary: BoundaryId) -> Option<usize> {
+    let value = g.exports().find(|export| export.id == boundary)?.value;
+    let at = g.eqns().iter().position(|eqn| eqn.out == value)?;
+    (at + 1 < g.eqns().len()).then_some(at + 1)
 }
 
 /// One boundary as both programs compiled it: the producer's export, the consumer's import and the

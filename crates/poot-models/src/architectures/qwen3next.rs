@@ -18,10 +18,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use poot_graph_ir::{Builder, Graph};
-use poot_quant::weights::{
-    AttnRole, ExpertProj, NormRole, WeightId, WeightKey, WeightMap, WeightMapBuilder,
-    WeightMapError, WeightRole, WeightStore, WeightView,
-};
+use poot_quant::weights::{AttnRole, ExpertProj, NormRole, WeightMap, WeightRole, WeightStore};
 
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
@@ -32,13 +29,15 @@ use crate::components::moe::{self, MoeParams, MoeWeights};
 use crate::components::norm::NormParams;
 use crate::components::router::RouterKind;
 use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    decoder_program, standard_layer, standard_stack,
+    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, decoder_program,
+    standard_layer, standard_stack,
 };
 use crate::io::{ModelSchema, StateSpec};
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
-use crate::names::{ExpertNames, MoeNames, SharedNames, map_moe_layer};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
+use crate::names::{ExpertNames, MoeNames, SharedNames, TensorRows, linear_key, map_moe_layer};
+#[cfg(feature = "test-support")]
+use crate::registry::Fixture;
+use crate::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
 
 /// Qwen3-Next's [`FamilyKey`].
@@ -51,8 +50,6 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
         (ConfigSource::GgufArchitecture, "qwen35moe"),
     ],
     build,
-    fixture,
-    variants: &[],
 };
 
 /// Qwen3-Next's config facts: `Qwen3NextConfig`'s defaults. The class declares no `eos_token_id`: a
@@ -409,60 +406,18 @@ fn weights_of(
     store: &WeightStore,
     names: &Names,
 ) -> Result<WeightMap, ModelError> {
-    let mut map = WeightMap::builder(store);
-    let missing = |source: WeightMapError| ModelError::Weight {
-        family: FAMILY,
-        source,
-    };
+    let mut rows = TensorRows::new(FAMILY, store);
+    rows.tensor(WeightRole::Embed, None, names.embed.to_string())?;
+    rows.tensor(WeightRole::FinalNorm, None, names.final_norm.to_string())?;
+    rows.head(names.embed, names.head, p.head_required)?;
+
     // The stored key of a linear: `{stem}.weight`, or the bare stem a packed loader names it.
-    let linear = |stem: &str| {
-        let dense = format!("{stem}.weight");
-        if store.contains(&dense) || !store.contains(stem) {
-            dense
-        } else {
-            stem.to_string()
-        }
-    };
-    let put =
-        |map: &mut WeightMapBuilder<'_>, id: WeightId, key: String| -> Result<(), ModelError> {
-            map.map(id, WeightView::Stored(WeightKey::from(key)))
-                .map_err(missing)?;
-            Ok(())
-        };
-
-    let embed = WeightId::model(WeightRole::Embed);
-    put(&mut map, embed, names.embed.to_string())?;
-    put(
-        &mut map,
-        WeightId::model(WeightRole::FinalNorm),
-        names.final_norm.to_string(),
-    )?;
-    let head = WeightId::model(WeightRole::Head);
-    let head_key = linear(names.head);
-    if store.contains(&head_key) {
-        put(&mut map, head, head_key)?;
-    } else if p.head_required {
-        return Err(missing(WeightMapError::Missing {
-            id: head,
-            key: WeightKey::from(head_key),
-        }));
-    } else {
-        put(&mut map, head, names.embed.to_string())?;
-    }
-
+    let linear = |stem: &str| linear_key(store, stem);
     for (l, kind) in p.kinds.iter().enumerate() {
         let layer = |suffix: &str| format!("{}{l}{suffix}", names.prefix);
-        let id = |role| WeightId::layer(l, role);
-        put(
-            &mut map,
-            id(WeightRole::Norm(NormRole::Attn)),
-            layer(names.attn_norm),
-        )?;
-        put(
-            &mut map,
-            id(WeightRole::Norm(NormRole::Ffn)),
-            layer(names.ffn_norm),
-        )?;
+        let at = Some(l);
+        rows.tensor(WeightRole::Norm(NormRole::Attn), at, layer(names.attn_norm))?;
+        rows.tensor(WeightRole::Norm(NormRole::Ffn), at, layer(names.ffn_norm))?;
         match kind {
             LayerKind::FullAttention => {
                 let a = &names.attention;
@@ -472,31 +427,22 @@ fn weights_of(
                     (AttnRole::V, a.v),
                     (AttnRole::O, a.o),
                 ] {
-                    put(&mut map, id(WeightRole::Attn(role)), linear(&layer(stem)))?;
+                    rows.linear(WeightRole::Attn(role), at, &layer(stem))?;
                 }
-                put(
-                    &mut map,
-                    id(WeightRole::Attn(AttnRole::QNorm)),
-                    layer(a.q_norm),
-                )?;
-                put(
-                    &mut map,
-                    id(WeightRole::Attn(AttnRole::KNorm)),
-                    layer(a.k_norm),
-                )?;
+                rows.tensor(WeightRole::Attn(AttnRole::QNorm), at, layer(a.q_norm))?;
+                rows.tensor(WeightRole::Attn(AttnRole::KNorm), at, layer(a.k_norm))?;
             }
             LayerKind::LinearAttention => {
-                names
-                    .gdn
-                    .map_layer(&mut map, l, &layer, &linear)
-                    .map_err(missing)?;
+                let mapped = names.gdn.map_layer(&mut rows.map, l, &layer, &linear);
+                mapped.map_err(|source| rows.error(source))?;
             }
         }
     }
     for l in 0..p.kinds.len() {
-        map_moe_layer(&mut map, store, &names.moe, l, p.moe.experts()).map_err(missing)?;
+        let mapped = map_moe_layer(&mut rows.map, store, &names.moe, l, p.moe.experts());
+        mapped.map_err(|source| rows.error(source))?;
     }
-    Ok(map.build())
+    Ok(rows.finish())
 }
 
 #[derive(Debug)]
@@ -601,8 +547,6 @@ impl Model for Qwen3Next {
     fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         let shape = spec.shape;
-        check_step(FAMILY, shape, p.max_positions)?;
-        moe::check_step(FAMILY, shape, &p.moe)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(
             &b,
@@ -634,6 +578,7 @@ impl Model for Qwen3Next {
 /// The fixture's config: a four-layer hybrid (three GDN layers, then gated attention) over four
 /// routed experts and a gated shared expert. Projection widths are multiples of 32 where a Q8_0 copy
 /// needs them.
+#[cfg(feature = "test-support")]
 pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "qwen3_next",
@@ -666,6 +611,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 }
 
 /// The tensors of a Qwen3-Next checkpoint of `config`, by HF name.
+#[cfg(feature = "test-support")]
 pub(crate) fn hf_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
     let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (vocab, w) = (n("vocab_size"), n("hidden_size"));
@@ -748,7 +694,8 @@ pub(crate) fn hf_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)>
     shapes
 }
 
-fn fixture() -> Fixture {
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = hf_shapes(&config);
     Fixture::bf16(config, shapes)

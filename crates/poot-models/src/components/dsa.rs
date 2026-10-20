@@ -11,6 +11,7 @@
 //! mask on top of the causal one, so it composes with the attention core unchanged: ranking the
 //! scores plus the causal mask keeps top-k from picking a position the query cannot see.
 
+use poot_graph_ir::ops::MASK_HIDDEN;
 use poot_graph_ir::ops::stable_descending_rank_masked;
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, ops};
 use poot_quant::weights::{
@@ -27,10 +28,6 @@ use super::sparse_top_k::{keep_top_k_mask, pairwise_rank};
 use super::standard::{ParamError, Step};
 use crate::model::ConfigReason;
 use crate::model::TraceError;
-
-/// Additive penalty for a position the selection drops: not `f32::MIN` or `-inf`, so it zeroes
-/// out after the softmax and summing it with the causal mask's own penalty does not overflow.
-const DROPPED: f32 = -1e30;
 
 /// The indexer's key LayerNorm epsilon (`Indexer.k_norm = nn.LayerNorm(head_dim, eps=1e-6)`).
 const K_NORM_EPS: f32 = 1e-6;
@@ -153,7 +150,7 @@ pub fn dsa_scores(
     Ok(b.reduce(RedOp::Sum, scored, 1, true)?)
 }
 
-/// The mask of the sparse attention of `layer`: `sel.mask` plus a [`DROPPED`] penalty on every
+/// The mask of the sparse attention of `layer`: `sel.mask` plus a [`MASK_HIDDEN`] penalty on every
 /// position outside each query token's `topk` best by [`dsa_scores`]. `x` is the layer's normalized
 /// hidden state `[rows, tokens, width]`; the indexer's query reads the low-rank query in `sel`.
 pub fn dsa_select(
@@ -171,8 +168,8 @@ pub fn dsa_select(
     let drop = b.binary_scalar(
         BinOp::Mul,
         b.binary_scalar(BinOp::Sub, keep, Scalar::F32(1.0))?,
-        Scalar::F32(-DROPPED),
-    )?; // 0 kept, DROPPED dropped
+        Scalar::F32(-MASK_HIDDEN),
+    )?; // 0 kept, MASK_HIDDEN dropped
     Ok(b.binary(BinOp::Add, sel.mask, drop)?)
 }
 
@@ -309,7 +306,7 @@ impl PooledDsaWeights {
 }
 
 /// The pooled indexer's keep mask of the cached positions, one row per query token: `[rows, 1,
-/// tokens, capacity]`, `0` for a position the token attends and [`DROPPED`] for the others.
+/// tokens, capacity]`, `0` for a position the token attends and [`MASK_HIDDEN`] for the others.
 ///
 /// The cached indexer keys (and the gates that weight them) of every `pool` consecutive positions
 /// pool into one key, the softmax of the gates plus the position bias over the pool's positions
@@ -463,8 +460,8 @@ fn pooled_keep(
     let drop = b.binary_scalar(
         BinOp::Mul,
         b.binary_scalar(BinOp::Sub, keep, Scalar::F32(1.0))?,
-        Scalar::F32(-DROPPED),
-    )?; // 0 kept, DROPPED dropped
+        Scalar::F32(-MASK_HIDDEN),
+    )?; // 0 kept, MASK_HIDDEN dropped
     Ok(b.reshape(drop, vec![rows, 1, t, cap])?)
 }
 
@@ -703,7 +700,7 @@ mod tests {
                     kept += 1;
                     assert!(got.abs() < 1e-3, "token {t} key {s} should stay: {got}");
                 } else {
-                    assert!(got < -1e29, "token {t} key {s} should drop: {got}");
+                    assert_eq!(got, MASK_HIDDEN, "token {t} key {s} should drop: {got}");
                 }
             }
             assert_eq!(kept, 2.min(t + 1), "token {t}");

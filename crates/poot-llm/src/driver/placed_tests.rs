@@ -35,7 +35,7 @@ use poot_models::model::{
     ConfigReason, FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, ShapeReason,
     StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{
     AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole,
@@ -248,21 +248,12 @@ fn store() -> WeightStore {
 }
 
 fn handle() -> Arc<ModelHandle> {
-    let mut registry = Registry::empty();
-    registry
-        .register(FamilyEntry {
-            family: MLP,
-            keys: &[(ConfigSource::HfModelType, "mlp2")],
-            build: build_mlp,
-            fixture: || Fixture {
-                config: serde_json::json!({"model_type": "mlp2", "max_positions": 32}),
-                generation: None,
-                preprocessor: None,
-                store: WeightStore::default(),
-            },
-            variants: &[],
-        })
-        .unwrap();
+    let registry = Registry::of(&[FamilyEntry {
+        family: MLP,
+        keys: &[(ConfigSource::HfModelType, "mlp2")],
+        build: build_mlp,
+    }])
+    .unwrap();
     let config = serde_json::json!({"model_type": "mlp2", "max_positions": 32});
     let raw = RawConfig::HfJson {
         config: &config,
@@ -417,21 +408,12 @@ fn attn_store() -> WeightStore {
 }
 
 fn attn_handle() -> Arc<ModelHandle> {
-    let mut registry = Registry::empty();
-    registry
-        .register(FamilyEntry {
-            family: ATTN,
-            keys: &[(ConfigSource::HfModelType, "attn1")],
-            build: build_attn,
-            fixture: || Fixture {
-                config: serde_json::json!({"model_type": "attn1", "max_positions": 32}),
-                generation: None,
-                preprocessor: None,
-                store: WeightStore::default(),
-            },
-            variants: &[],
-        })
-        .unwrap();
+    let registry = Registry::of(&[FamilyEntry {
+        family: ATTN,
+        keys: &[(ConfigSource::HfModelType, "attn1")],
+        build: build_attn,
+    }])
+    .unwrap();
     let config = serde_json::json!({"model_type": "attn1", "max_positions": 32});
     let raw = RawConfig::HfJson {
         config: &config,
@@ -1147,6 +1129,7 @@ fn serving() -> ServingShapes<'static> {
         warm: Warm::Admitted,
         windows: &[],
         adapters: &[],
+        chain: None,
     }
 }
 
@@ -1331,6 +1314,7 @@ fn paged_serving() -> ServingShapes<'static> {
         warm: Warm::Admitted,
         windows: &[],
         adapters: &[],
+        chain: None,
     }
 }
 

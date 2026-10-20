@@ -7,8 +7,10 @@
 //! `compile` directly on a small synthetic oversized weight instead.
 
 use super::*;
+use poot_graph_ir::WeightRef;
 use poot_graph_plan::test_support::gpu_caps;
 use poot_graph_plan::{CompileOptions, Target, compile};
+use poot_quant::weights::{WeightId, WeightRole};
 use poot_target::{Backend, DeviceCaps};
 
 #[test]
@@ -25,7 +27,10 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
     let x0 = b.constant("x", TensorType::f32(vec![1, 1])).unwrap();
     let x = b.broadcast(x0, vec![1, k]).unwrap();
     // The tracers' `linear`: an `[out, in]` weight read through a transpose.
-    let w = b.constant("w", TensorType::f32(vec![n, k])).unwrap();
+    let head = WeightId::model(WeightRole::Head);
+    let w = b
+        .weight(WeightRef::whole(head), TensorType::f32(vec![n, k]))
+        .unwrap();
     let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
     let g = b.finish(out).unwrap();
 
@@ -55,7 +60,7 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
     for &id in g.inputs() {
         let m = g.meta(id);
         let t = match m.name.as_deref() {
-            Some("w") => HostTensor::f32(vec![n, k], w_data.clone()),
+            Some("w.head") => HostTensor::f32(vec![n, k], w_data.clone()),
             Some("x") => HostTensor::f32(vec![1, 1], vec![1.0]),
             other => panic!("unexpected const {other:?}"),
         };
@@ -67,13 +72,13 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
         .into_host()
         .unwrap();
 
-    // The device binds the compiled program's `w.chunkN` consts from the one parent weight `w`, stored
-    // whole under its own name: the binder places chunk N as the next rows of `w`.
+    // The device binds the compiled program's `w.head.chunkN` consts from the one parent weight `w.head`,
+    // stored whole under its own name: the binder places chunk N as the next rows of it.
     let gh_chunks: Vec<_> = gh
         .consts()
         .iter()
         .filter_map(|&id| gh.meta(id).name.as_deref())
-        .filter(|name| name.starts_with("w.chunk"))
+        .filter(|name| name.starts_with("w.head.chunk"))
         .collect();
     assert_eq!(
         gh_chunks.len(),
@@ -86,7 +91,7 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
             tensor: HostTensor::f32(vec![1, 1], vec![1.0]),
         },
         poot_executor_parity::ConstFixture {
-            name: "w",
+            name: "w.head",
             tensor: HostTensor::f32(vec![n, k], w_data),
         },
     ];
