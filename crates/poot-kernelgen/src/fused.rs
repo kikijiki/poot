@@ -1052,7 +1052,7 @@ pub fn fused_i32_views_grid_pack(
 /// (entered with the flat element index `i`), `bb2` the work, `bb3` the early exit. `x_groups: None` reads
 /// the flat thread index; `Some(xg)` reads the 2-D folded grid (`i = (GroupY * xg + GroupX) * wg + LocalX`),
 /// which the launch's `x_groups` (`fold_groups`) and workgroup width must match.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn pointwise_body(
     name: &str,
     param_count: u32,
@@ -1356,7 +1356,7 @@ enum RowKind {
 /// Compute a leaf's element offset from the linear output index `i_local`, into `off`: `off` starts at the
 /// leaf's layout `base`, then for each output dim with a nonzero effective stride,
 /// `off += (i / out_strides[d] % out_shape[d]) * eff[d]`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn emit_leaf_offset(
     leaf_eff: &[usize],
     base: usize,
@@ -1520,7 +1520,6 @@ fn local_for_leaf(j: usize) -> Local {
 ///
 /// Reads each leaf through its own physical [`Layout`]; byte-identical to a hypothetical contiguous-only
 /// form when every layout is `Layout::contiguous`.
-#[allow(clippy::too_many_arguments)]
 pub fn fused_row_parallel_views(
     name: &str,
     out_shape: &[usize],

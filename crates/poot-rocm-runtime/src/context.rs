@@ -432,10 +432,6 @@ impl DevicePoison {
 /// What a copy still references besides its completion signal: the runtime-owned staging buffer.
 /// Allocations and code objects are not listed: they stay alive through [`DevicePoison`].
 #[derive(Default)]
-#[allow(
-    dead_code,
-    reason = "owned so a timed-out submission's resources are never released"
-)]
 pub(crate) struct Held {
     pub(crate) staging: Option<StagingBuffer>,
     /// The kernels of an enqueued batch: its packets run their code objects until the batch completes.
@@ -473,9 +469,12 @@ impl std::fmt::Debug for Held {
 
 /// A completion signal and the resources of a submission whose bounded wait gave up. The device may
 /// still decrement the signal and use the staging buffer, so neither is released.
-#[allow(
-    dead_code,
-    reason = "owned so a timed-out submission's resources are never released"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "owned so a timed-out submission's resources are never released; the tests read them"
+    )
 )]
 pub(crate) struct Abandoned {
     pub(crate) signal: bindings::hsa_signal_t,

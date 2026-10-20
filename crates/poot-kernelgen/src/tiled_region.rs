@@ -20,7 +20,7 @@ use poot_target::BufferStorage;
 /// output rows (thread-coarsened, `row1 = row0 + ts`) so the grid matches `dispatch_grid`'s
 /// `ceil(M/2ts) * ceil(N/ts)` workgroups. Params: `_1 a` \[M*K\] f32, `_2 b` \[K*N\] (read as `layout` says, in
 /// the `weight` storage: `BufferStorage::f32()` or, Card 1007, `BufferStorage::f16_packed()`), `out` \[M*N\].
-#[allow(clippy::too_many_arguments)] // one baked dimension or mode per argument, as in the sibling generators
+#[expect(clippy::too_many_arguments)] // one baked dimension or mode per argument, as in the sibling generators
 pub fn tiled_region(
     name: &str,
     m: usize,

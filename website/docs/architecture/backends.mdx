@@ -8,8 +8,7 @@ sidebar_position: 6
 
 poot has three first-class backends built from one kernel source: **wgpu** (Vulkan/SPIR-V, the
 portable default), **ROCm** (AMD, raw HSA) and **PTX** (NVIDIA). Raw Vulkan has a runtime crate but no
-executor or `Device` implementation. The AMD XDNA2 and Intel NPU4 NPUs are experimental `Device`s that run a few F32 or F16
-programs (see [NPU Offload](./npu)). The CPU
+executor or `Device` implementation. The AMD XDNA2 and Intel NPU4 NPUs are experimental `Device`s (see [NPU Offload](./npu.mdx)). The CPU
 oracle also powers current embeddings and reranking.
 
 Everything from model definition through graph IR, fusion and planning is backend-neutral. Backends
@@ -100,4 +99,5 @@ grids, tensor-core matmul, compute dtype) are in its
 
 Every backend is checked against the CPU oracle (`poot-eval`): per-backend executor tests dispatch
 kernels with identical inputs and compare to the oracle, and the `ptx-check` and `rocm-check`
-binaries of the PTX and ROCm device crates do the same on real hardware. See [Execution](./execution#verification).
+binaries of the PTX and ROCm device crates do the same on real hardware; the device lanes run them, and `ptx-check`
+fails when it finds no fixture to check (or, in the PTX lane, any missing one). See [Execution](./execution#verification).

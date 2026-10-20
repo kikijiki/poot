@@ -100,7 +100,6 @@ pub(super) struct RoutedMatMul {
 }
 
 /// Choose `eqn`'s `MatMul` route.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn matmul_route(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -232,7 +231,7 @@ pub(crate) fn epilogue_head_lowers(
 /// the steps. A leaf has the head's dtype (a float the generated bodies round through), or, under an f32
 /// epilogue, is a BF16 weight (a bias) that a `Cast` step widens by reading it through its packed lane
 /// (`packed_operands[position]`, the storage plan's choice); anything else is a typed refusal.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn epilogue_of(
     site: Site<'_>,
     g: GraphTables<'_>,
@@ -307,7 +306,7 @@ pub(super) fn epilogue_of(
 }
 
 /// Plan one matmul-family equation (`MatMul`, or a `ContractionEpilogue` over a `MatMul` head).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,

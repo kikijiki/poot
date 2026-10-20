@@ -62,7 +62,7 @@ impl MlaParams {
     /// `kv_rank`-wide latent; the query is low-rank when `q_rank` is set. `rope` is the rotation of
     /// the rotated slice (its width is `rope_dim`) and `scale` the score scale (the family's: it
     /// carries YaRN's softmax correction).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         heads: usize,
         kv_rank: usize,

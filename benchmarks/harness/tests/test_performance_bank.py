@@ -205,15 +205,16 @@ class ClaimTests(BankRoot):
     def test_a_planned_case_cannot_be_verified_even_with_a_receipt(self):
         case, backend = self.first_verified()
         source = self.root / self.entry(case, backend)["receipt"]
-        target = self.root / "receipts" / "wgpu" / "long-recurrence-scan.json"
+        planned = next(c for c in self.cases()["cases"] if c["status"] == bank.PLANNED)
+        target = self.root / "receipts" / "wgpu" / f"{planned['id']}.json"
         shutil.copy(source, target)
         self.edit_entry(
-            "long-recurrence-scan",
+            planned["id"],
             "wgpu",
             status="verified",
-            receipt="receipts/wgpu/long-recurrence-scan.json",
+            receipt=f"receipts/wgpu/{planned['id']}.json",
             receipt_sha256=hashlib.sha256(target.read_bytes()).hexdigest(),
-            command=bank.bank_command(self.cases(), next(c for c in self.cases()["cases"] if c["id"] == "long-recurrence-scan"), "wgpu"),
+            command=bank.bank_command(self.cases(), planned, "wgpu"),
         )
         self.assertTrue(any("a planned case cannot be verified" in e for e in self.errors()))
 

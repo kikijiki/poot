@@ -45,7 +45,7 @@ cu130 wheel. Container disk 200 GB.
 - **order** (cheap and decisive first): downloads, oracle fixture, vLLM, llama.cpp, poot curve + roofline + profile,
   poot-serve rows last.
 - **vLLM**: baked `vllm==0.22.1` venv, FP8 as stored, `--no-enable-prefix-caching`, mm profiling off, gpu-util 0.90.
-- **llama.cpp**: tag b9601 built on the pod for the pod's arch (apt `cuda-nvcc-12-6`), `unsloth/Qwen3.8-27B-GGUF`
+- **llama.cpp**: tag b9601 built on the pod for the pod's arch (the image's CUDA 13 toolkit), `unsloth/Qwen3.8-27B-GGUF`
   `UD-Q4_K_XL` (Qwen/ publishes no GGUF); `llama-bench` pp at each ISL and tg128 at depth = ISL, `-fa 1 -b/-ub 2048`.
 - **peak memory**: nvidia-smi sampled every 0.5 s per phase (`phases.tsv`, MiB) - not engine-reported.
 - **oracle fixture**: the `qwen35_27b_fp8_receipt::ptx` row (CPU oracle + device, needs the large pod host RAM) ->
@@ -55,10 +55,13 @@ cu130 wheel. Container disk 200 GB.
 
 Everything lands in `/root/results` (`results.tgz`): `env.txt`, `versions-*.txt`, `model-revisions.txt`,
 `commands.tsv` (exact command of every phase), `phases.tsv` (rc, wall s, peak VRAM), `summary.tsv`, `raw/`, `logs/`.
+`PHASES=vllm` (space-separated groups: `oracle vllm llamacpp poot`) reruns only that engine's phases.
 A failed phase is a recorded row, not an abort; `MAX_TOTAL_S` (4 h) stops new phases from starting.
 
 ## Caveats the report must carry
 
+- llama.cpp is now built with the image's CUDA 13.0 toolkit (earlier runs used 12.6): llama.cpp rows from this change on
+  are not like-for-like with earlier ones. The toolkit version is recorded in `versions-llamacpp.txt` (`llamacpp_cuda`).
 - poot's curve context is a repeated phrase cycled to exactly ISL tokens; the shared client sends random tokens
   re-tokenized by each server (counts can drift a few tokens). poot-serve has no ignore-eos switch: `summary.tsv`
   flags rows whose mean output is under 95 % of OSL.
@@ -93,7 +96,7 @@ assumed from their documented formats: the first real run is the check).
 H100 SXM $3.99/h: **~$12-18** (expect ~$14). A100 SXM $1.79/h: ~$6-9. The keep-warm/keep window bills until the pod
 is deleted: delete by id as soon as `extract` succeeds. These are estimates, not measurements.
 
-## Run 1 findings (2026-10-18, H100, poot b00cb7feb; committed under `benchmarks/results/2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb`)
+## Run 1 findings (2026-10-18, H100, poot b00cb7feb; its snapshot `2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb` was removed from `benchmarks/results/` on 2026-10-20: recorded before the identity contract, it is in git history)
 
 - **poot PTX batch 1**: decode 8.2 tok/s (TPOT 122 ms, flat from ISL 128 to 8192), prefill ~35 tok/s (ISL 8192 = 234 s),
   peak 39.5 GiB. 122 ms per token for ~28 GB is ~230 GB/s of a ~3.35 TB/s card: a poot performance problem, not a
@@ -110,7 +113,7 @@ this device"}` (no calibrated ceiling row for the H100 in `crates/poot-profile/d
   `unknown` (needs two points with different bytes per token). `summarize.py` now prints that reason.
 - `ingest.py` turns a sweep dir into a `results/<run-id>` snapshot through the harness's own result contract.
 
-## Run 2 findings (2026-10-18, H100, same poot build; `benchmarks/results/2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb-run2`)
+## Run 2 findings (2026-10-18, H100, same poot build; snapshot `2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb-run2`, removed likewise, is in git history)
 
 - **oracle row passed** (3623 s): fixture committed as `crates/poot-llm/tests/data/qwen38_27b_fp8_oracle_top5.json`. ROCm and PTX device
   top-5 agree to 9e-6 and both sit a near-constant ~7e-4 below the CPU oracle (inside the 1e-3 criterion, thin margin).

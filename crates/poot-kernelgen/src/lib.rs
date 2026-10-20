@@ -144,8 +144,8 @@ pub(crate) mod unit_helpers {
             .unwrap_or(false)
     }
 
-    /// Stage `body`'s NVPTX to `/tmp/poot-ptx-stage2/<name>.ptx`, the well-known drop point `tests/emit_nvptx.rs`
-    /// (and, downstream, `ptx-check` on a real NVIDIA pod) reads from. Skips (not fails) if `llc` is
+    /// Stage `body`'s NVPTX to `<poot_test_util::ptx_stage_dir()>/<name>.ptx`, the drop point `tests/emit_nvptx.rs`
+    /// and `ptx-check` (the PTX lane's `POOT_PTX_STAGE_DIR`) share. Skips (not fails) if `llc` is
     /// absent, matching `emit_nvptx.rs`'s own skip.
     pub(crate) fn stage_nvptx(body: &Body) {
         if std::process::Command::new("llc")
@@ -156,7 +156,7 @@ pub(crate) mod unit_helpers {
             eprintln!("llc not on PATH; skipping NVPTX stage for {}", body.name);
             return;
         }
-        let dir = std::path::PathBuf::from("/tmp/poot-ptx-stage2");
+        let dir = poot_test_util::ptx_stage_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join(format!("{}.ptx", body.name));
         compile(body, Target::Nvptx, &out).unwrap_or_else(|e| panic!("{}: {e}", body.name));

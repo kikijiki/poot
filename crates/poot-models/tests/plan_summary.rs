@@ -1,35 +1,42 @@
-//! Card 599: a committed plan-summary dump over a named fixture corpus.
+//! The plan digests: a committed record of what `compile` plans for a named fixture corpus, small enough
+//! to review, plus the invariants that say a plan is right.
 //!
-//! Cards that change plans on purpose (or by accident) gate on "every fixture graph plans with unchanged
-//! dispatch counts". This test is that gate. For each graph in [`corpus`] and each target it compiles
-//! through [`compile`], the one graph-to-program entry point every executor runs (ADR-0100 decision 1):
-//! no hand-rolled sub-pipeline here duplicates what `compile` already does (card 523b review: that
-//! duplication is the exact "per-executor pre-plan pipelines drift" this epic removes). A
-//! graph `compile` accepts gets one summary line per equation (graph, equation index, op, plan kind,
-//! kernel choice, a digest of its request, kernel launches, launch grid, detail); a graph `compile` refuses gets exactly one summary
-//! line for the whole graph, carrying the typed [`CompileError`] as `compile` reports it - never a
-//! partial per-equation dump of an intermediate pipeline stage `compile` itself would still rewrite.
-//! The lines are compared with the checked-in `tests/plan_summary/<target>.tsv`.
+//! For each graph in [`corpus`] and each reference target the test compiles through [`compile`], the one
+//! graph-to-program entry point every executor runs (ADR-0100 decision 1), and describes every equation
+//! (graph, equation index, op, plan kind, kernel choice, a digest of its request, kernel launches, launch
+//! grid, detail). A graph `compile` refuses gets one description naming the typed [`CompileError`]. The
+//! description is digested per graph: `tests/plan_summary/digests.tsv` holds one line per target and
+//! graph with the plan verdict, the equation and launch counts and the digest. A digest says a plan moved,
+//! never that it is right, so it is the tripwire and not the evidence: the evidence is the invariant rows
+//! below (every launch fits the device, every one-element-per-thread kernel covers its output) and the
+//! literal launch counts. A planner regression is the planner's to catch (`poot-graph-plan`'s own tests);
+//! this file only notices that a model's plan changed.
 //!
-//! A raw hash of the plans would change whenever a plan type changes; a line per equation names what
-//! moved. A card that changes plans by design regenerates the files with `just test-plan-summary-regen`
-//! and lists every changed line in its landing note.
+//! A card that changes plans by design regenerates the file with `just test-plan-summary-regen` and lists
+//! every changed graph in its landing note. To see which equations of a changed graph moved, run the test
+//! with `POOT_PLAN_SUMMARY_DUMP=<dir>` before and after: it writes the full per-equation description of
+//! every target to `<dir>/<target>.tsv` (uncommitted), and the two directories diff.
 //!
 //! The corpus needs no checkpoint: every graph is a registered family's fixture traced at tiny fixed
-//! dims, plus the dense parity checkpoints (`support/corpus.rs`). A family registered with a fixture
-//! joins it with no edit here.
+//! dims, plus the dense parity checkpoints (`support/corpus.rs`), and the invariants also run on the
+//! real-dimension models of `support/real_dims.rs`, built over zero weights. A family registered with a
+//! fixture joins the corpus with no edit here.
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use poot_graph_ir::{Eqn, Graph, Operand};
+use poot_graph_ir::{Eqn, Operand};
 use poot_graph_plan::{
-    CompileError, CompileOptions, Dispatch, KernelChoice, Plan, PlanError, Target, compile,
+    CompileError, Dispatch, KernelChoice, Plan, PlanError, Program, Target, compile,
 };
 use poot_models::registry::Registry;
 
 #[path = "support/corpus.rs"]
 mod corpus;
+#[path = "support/invariants.rs"]
+mod invariants;
+#[path = "support/real_dims.rs"]
+mod real_dims;
 #[path = "support/targets.rs"]
 mod targets;
 
@@ -37,9 +44,11 @@ use corpus::corpus;
 use poot_target::Backend;
 use targets::{RefTarget, preset, reference_targets};
 
-/// The environment variable that turns the comparison into a rewrite of the expected files. The
+/// The environment variable that turns the comparison into a rewrite of the expected file. The
 /// `test-plan-summary-regen` recipe sets it.
 const REGEN_ENV: &str = "POOT_PLAN_SUMMARY_REGEN";
+/// The environment variable naming a directory to write the full per-equation descriptions to.
+const DUMP_ENV: &str = "POOT_PLAN_SUMMARY_DUMP";
 
 fn registry() -> Registry {
     Registry::builtin().expect("the builtin registry")
@@ -47,7 +56,7 @@ fn registry() -> Registry {
 
 // ---- the summary -----------------------------------------------------------------------------
 
-const HEADER: &str = "graph\teqn\top\tplan\tchoice\trequest\tlaunches\tgrid\tdetail\n";
+const DUMP_HEADER: &str = "graph\teqn\top\tplan\tchoice\trequest\tlaunches\tgrid\tdetail\n";
 
 /// Tabs and newlines in a free-text field would break the line format.
 fn cell(s: &str) -> String {
@@ -244,153 +253,183 @@ fn write_line(out: &mut String, name: &str, eqn: &str, op: &str, c: &PlanCells) 
     .expect("write to a String");
 }
 
-/// The whole summary for one target: every corpus graph, in corpus order, compiled through the real
-/// [`compile`] entry point (card 523b: a hand-rolled `optimize`/`widen_mismatched_matmul_dtypes`/
-/// `plan_eqn_views` sub-pipeline here was the same "second entry point" anti-pattern R469-021
-/// found in the wgpu/ROCm/PTX executors before card 534a unified them onto `compile`).
-fn render(registry: &Registry, target: &Target) -> String {
-    let mut out = String::from(HEADER);
-    let options = targets::options();
-    for row in corpus(registry) {
-        summarize(&mut out, &row.name, &row.graph(), target, &options);
-    }
-    out
+/// One graph's description, as `compile` planned (or refused) it.
+struct GraphPlan {
+    /// The description lines, one per planned equation or one for a refused graph.
+    text: String,
+    /// `plans`, or `refused` when `compile` returned an error.
+    verdict: &'static str,
+    /// Planned equations, or 0 for a refused graph.
+    eqns: usize,
+    /// Kernel launches over all equations.
+    launches: usize,
 }
 
-/// One graph's lines: one per planned equation, or one for the whole graph when `compile` refuses it.
-fn summarize(out: &mut String, name: &str, g: &Graph, target: &Target, options: &CompileOptions) {
-    match compile(g, target, options) {
+/// `g` compiled for `target` and described: one line per planned equation, or one line for the whole
+/// graph when `compile` refuses it.
+fn describe_graph(name: &str, g: &poot_graph_ir::Graph, target: &Target) -> GraphPlan {
+    let mut text = String::new();
+    match compile(g, target, &targets::options()) {
         Ok(program) => {
+            let mut launches = 0;
+            let mut eqns = 0;
             for (i, (eqn, plan)) in program.planned().enumerate() {
                 let c = describe_plan(eqn, plan, program.kernel_choice(eqn));
-                write_line(out, name, &i.to_string(), &eqn.op.name(), &c);
+                write_line(&mut text, name, &i.to_string(), &eqn.op.name(), &c);
+                launches += c.launches;
+                eqns += 1;
+            }
+            GraphPlan {
+                text,
+                verdict: "plans",
+                eqns,
+                launches,
             }
         }
         Err(error) => {
             let (eqn, op, c) = describe_compile_error(&error);
-            write_line(out, name, &eqn, &op, &c);
+            write_line(&mut text, name, &eqn, &op, &c);
+            GraphPlan {
+                text,
+                verdict: "refused",
+                eqns: 0,
+                launches: 0,
+            }
         }
     }
 }
 
-fn expected_path(target: &str) -> PathBuf {
+const DIGEST_HEADER: &str = "target\tgraph\tplan\teqns\tlaunches\tdigest\n";
+
+/// Every corpus graph on `reference`, as `(graph, description)`, in corpus order.
+fn plans(registry: &Registry, reference: &RefTarget) -> Vec<(String, GraphPlan)> {
+    corpus(registry)
+        .into_iter()
+        .map(|row| {
+            let plan = describe_graph(&row.name, &row.graph(), &reference.target);
+            (row.name, plan)
+        })
+        .collect()
+}
+
+/// The digest file's lines for every reference target: the verdict, the counts and the digest of the
+/// graph's full description.
+fn render_digests(registry: &Registry) -> String {
+    let mut out = String::from(DIGEST_HEADER);
+    for reference in reference_targets() {
+        for (graph, plan) in plans(registry, &reference) {
+            writeln!(
+                out,
+                "{}\t{graph}\t{}\t{}\t{}\t{:016x}",
+                reference.id,
+                plan.verdict,
+                plan.eqns,
+                plan.launches,
+                fnv1a(&plan.text)
+            )
+            .expect("write to a String");
+        }
+    }
+    out
+}
+
+/// The full per-equation description of `reference`, for [`DUMP_ENV`].
+fn render_dump(registry: &Registry, reference: &RefTarget) -> String {
+    let mut out = String::from(DUMP_HEADER);
+    for (_, plan) in plans(registry, reference) {
+        out.push_str(&plan.text);
+    }
+    out
+}
+
+fn digests_path() -> PathBuf {
     // `std::env::var`, not `env!`: the latter bakes the path into this test binary's compiled object code
     // at build time, and a shared compile cache (kache) that reuses that object across worktrees by
-    // source-content hash would then serve whichever worktree's path happened to compile it first
-    // (card 530's build.rs fix; card 543 review). `std::env::var` reads the environment cargo sets fresh
-    // for every test-binary invocation, so it is correct regardless of which worktree compiled the binary.
+    // source-content hash would then serve whichever worktree's path happened to compile it first.
+    // `std::env::var` reads the environment cargo sets fresh for every test-binary invocation.
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
         .expect("CARGO_MANIFEST_DIR must be set by cargo for test binaries");
     PathBuf::from(manifest_dir)
         .join("tests")
         .join("plan_summary")
-        .join(format!("{target}.tsv"))
+        .join("digests.tsv")
 }
 
 // ---- the comparison --------------------------------------------------------------------------
 
-/// The `graph` and `eqn` columns of a summary line: the identity a changed line is paired by.
-fn line_key(line: &str) -> (&str, &str) {
-    let mut cols = line.splitn(3, '\t');
-    (cols.next().unwrap_or(""), cols.next().unwrap_or(""))
+/// A digest line with its tabs as ` | `, for a failure message.
+fn spaced(line: &str) -> String {
+    line.replace('\t', " | ")
 }
 
-/// Lines shown in a failure before the rest are counted.
-const DIFF_LIMIT: usize = 40;
-
-/// The columns of two lines for the same equation that differ, one `column: old -> new` line each.
-fn changed_columns(old: &str, new: &str) -> String {
-    let names = HEADER.trim_end().split('\t');
-    let mut old_cols = old.split('\t');
-    let mut new_cols = new.split('\t');
-    let mut lines = Vec::new();
-    for name in names {
-        let (o, n) = (old_cols.next().unwrap_or(""), new_cols.next().unwrap_or(""));
-        if o != n {
-            lines.push(format!("    {name}: {o} -> {n}"));
-        }
-    }
-    lines.join("\n")
-}
-
-/// A readable diff of two summaries: each changed equation once, with the columns that moved (old to
-/// new), paired by (graph, equation). Empty when they are equal.
+/// The graphs whose line differs between two digest files, one `old -> new` pair per graph, keyed by
+/// (target, graph). Empty when the files are equal.
 fn diff(expected: &str, actual: &str) -> String {
-    fn by_key(text: &str) -> BTreeMap<(&str, usize), &str> {
+    fn by_key(text: &str) -> BTreeMap<(&str, &str), &str> {
         text.lines()
             .skip(1)
-            .map(|l| {
-                let (g, e) = line_key(l);
-                ((g, e.parse::<usize>().unwrap_or(usize::MAX)), l)
+            .map(|line| {
+                let mut cols = line.splitn(3, '\t');
+                let key = (cols.next().unwrap_or(""), cols.next().unwrap_or(""));
+                (key, line)
             })
             .collect()
     }
     let (old, new) = (by_key(expected), by_key(actual));
-    let mut changes: Vec<(&str, String)> = Vec::new();
+    let mut changes = Vec::new();
     for (key, old_line) in &old {
         match new.get(key) {
             Some(new_line) if new_line == old_line => {}
-            Some(new_line) => changes.push((
+            Some(new_line) => changes.push(format!(
+                "changed {} {}\n  - {}\n  + {}",
                 key.0,
-                format!(
-                    "changed {}#{} ({})\n{}",
-                    key.0,
-                    key.1,
-                    old_line.split('\t').nth(2).unwrap_or("?"),
-                    changed_columns(old_line, new_line)
-                ),
+                key.1,
+                spaced(old_line),
+                spaced(new_line)
             )),
-            None => changes.push((
+            None => changes.push(format!(
+                "removed {} {}\n  - {}",
                 key.0,
-                format!("removed {}#{}\n  - {old_line}", key.0, key.1),
+                key.1,
+                spaced(old_line)
             )),
         }
     }
     for (key, new_line) in &new {
         if !old.contains_key(key) {
-            changes.push((key.0, format!("added {}#{}\n  + {new_line}", key.0, key.1)));
+            changes.push(format!(
+                "added {} {}\n  + {}",
+                key.0,
+                key.1,
+                spaced(new_line)
+            ));
         }
     }
-    if changes.is_empty() {
-        // Pairing by (graph, equation) cannot see order: the same lines in another order are a difference.
-        return if expected == actual {
-            String::new()
-        } else {
-            "every equation line is unchanged but the lines are in a different order".to_string()
-        };
+    if changes.is_empty() && expected != actual {
+        return "every graph line is unchanged but the lines are in a different order".to_string();
     }
-    let mut per_graph: BTreeMap<&str, usize> = BTreeMap::new();
-    for (graph, _) in &changes {
-        *per_graph.entry(graph).or_default() += 1;
-    }
-    let total = changes.len();
-    let mut out = format!(
-        "{total} changed equations: {}\n",
-        per_graph
-            .iter()
-            .map(|(graph, n)| format!("{graph} ({n})"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let shown: Vec<String> = changes
-        .into_iter()
-        .take(DIFF_LIMIT)
-        .map(|(_, text)| text)
-        .collect();
-    out.push_str(&shown.join("\n"));
-    if total > DIFF_LIMIT {
-        write!(out, "\n... and {} more", total - DIFF_LIMIT).expect("write to a String");
-    }
-    out
+    changes.join("\n")
 }
 
-/// Compare (or, under [`REGEN_ENV`], rewrite) one target's checked-in summary.
-fn check_target(reference: &RefTarget) {
-    let actual = render(&registry(), &reference.target);
-    let target = reference.file;
-    let path = expected_path(target);
+/// The checked-in digests equal what `compile` plans now. Mutation: change one op's lowering (for
+/// example the row-kernel workgroup size in the planner): the graphs that contain it change digest and
+/// the failure names them, target by target.
+#[test]
+fn plan_digests_match_the_checked_in_file() {
+    let registry = registry();
+    if let Some(dir) = std::env::var_os(DUMP_ENV) {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+        for reference in reference_targets() {
+            let path = dir.join(format!("{}.tsv", reference.id));
+            std::fs::write(&path, render_dump(&registry, &reference))
+                .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        }
+    }
+    let actual = render_digests(&registry);
+    let path = digests_path();
     if std::env::var_os(REGEN_ENV).is_some() {
-        std::fs::create_dir_all(path.parent().expect("expected file has a parent"))
+        std::fs::create_dir_all(path.parent().expect("the digest file has a parent"))
             .expect("create tests/plan_summary");
         std::fs::write(&path, &actual).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
         return;
@@ -404,26 +443,11 @@ fn check_target(reference: &RefTarget) {
     let changes = diff(&expected, &actual);
     assert!(
         changes.is_empty(),
-        "{target}: the plan summary differs from {}\n{changes}\n\
+        "the plan digests differ from {}\n{changes}\n\
          If the plan change is intended, run `just test-plan-summary-regen` and list every changed \
-         line in the card's landing note.",
+         graph in the card's landing note.",
         path.display()
     );
-}
-
-#[test]
-fn spirv_vulkan_plan_summary_matches_the_checked_in_file() {
-    check_target(&reference_targets()[0]);
-}
-
-#[test]
-fn amd_gcn_plan_summary_matches_the_checked_in_file() {
-    check_target(&reference_targets()[1]);
-}
-
-#[test]
-fn nvptx_plan_summary_matches_the_checked_in_file() {
-    check_target(&reference_targets()[2]);
 }
 
 /// The plan kinds `poot_executor::Engine::load` accepts: every kind a single-device `compile` may emit.
@@ -468,22 +492,18 @@ fn compile_emits_only_loadable_plan_kinds_over_the_whole_corpus() {
     );
 }
 
-/// Rendering the same corpus twice, from freshly traced graphs, gives the same text: nothing in the
-/// summary depends on hash-map order, an address or a timestamp. Without this a checked-in file could
-/// pass once and fail on the next run.
+/// Rendering the digests twice, from freshly traced graphs, gives the same text: nothing in the
+/// description depends on hash-map order, an address or a timestamp. Without this a checked-in file
+/// could pass once and fail on the next run.
 #[test]
 fn plan_summary_rendering_is_deterministic() {
     let registry = registry();
-    for reference in reference_targets() {
-        let first = render(&registry, &reference.target);
-        let second = render(&registry, &reference.target);
-        assert!(
-            first == second,
-            "{}: two renders of the same corpus differ\n{}",
-            reference.column,
-            diff(&first, &second)
-        );
-    }
+    let (first, second) = (render_digests(&registry), render_digests(&registry));
+    assert!(
+        first == second,
+        "two renders of the same corpus differ\n{}",
+        diff(&first, &second)
+    );
 }
 
 /// Card 557 SC-003: a tracer states primitives and `ops::` compositions only. Every corpus graph, as
@@ -533,4 +553,172 @@ fn every_corpus_trace_is_primitive_before_compile() {
         composites_after_compile > 0,
         "compile formed no composite over the corpus, so the traced check proves nothing"
     );
+}
+
+// ---- the invariants --------------------------------------------------------------------------
+
+/// SC-003: every plan `compile` makes for the fixture corpus satisfies the launch invariants on its
+/// target's caps: each launch is a whole number of workgroups the device can run within its workgroup
+/// memory, and each one-element-per-thread kernel launches at least its output's element count.
+/// Mutation: have the planner launch one workgroup fewer for a row kernel, or drop the cover check in
+/// `support/invariants.rs`: the failure names the equation and the launch.
+#[test]
+fn every_corpus_plan_satisfies_the_launch_invariants() {
+    let registry = registry();
+    let mut checked = 0usize;
+    for RefTarget { column, target, .. } in reference_targets() {
+        for row in corpus(&registry) {
+            let Ok(program) = compile(&row.graph(), &target, &targets::options()) else {
+                continue;
+            };
+            let found = invariants::violations(&program);
+            assert!(
+                found.is_empty(),
+                "{} on {column} breaks a launch invariant:\n{}",
+                row.name,
+                found.join("\n")
+            );
+            checked += program.planned().count();
+        }
+    }
+    assert!(
+        checked > 1000,
+        "the corpus checked only {checked} equations"
+    );
+}
+
+/// The same invariants at real dimensions, on the targets' preset caps: a launch grid, a workgroup
+/// memory budget or a limit that only a real width reaches. A graph the planner refuses at these
+/// dimensions is a matrix cell (`feature_matrix`), not an invariant violation.
+#[test]
+fn every_real_dimension_plan_satisfies_the_launch_invariants() {
+    let root = std::path::Path::new(
+        &std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .join("../..");
+    let mut planned = 0usize;
+    for model in real_dims::real_models(&root) {
+        for &shape in model.shapes() {
+            let graph = model.trace(shape);
+            for RefTarget { column, target, .. } in reference_targets() {
+                let Ok(program) = compile(&graph, &target, &targets::options()) else {
+                    continue;
+                };
+                let found = invariants::violations(&program);
+                assert!(
+                    found.is_empty(),
+                    "{} {} on {column} breaks a launch invariant:\n{}",
+                    model.label,
+                    shape.name,
+                    found.join("\n")
+                );
+                planned += 1;
+            }
+        }
+    }
+    assert!(
+        planned > 20,
+        "only {planned} real-dimension programs planned"
+    );
+}
+
+/// The first equation of `program` whose only launch writes one element per thread and whose grid has
+/// no slack: one workgroup fewer cannot cover its output.
+fn tight_launch(program: &Program) -> usize {
+    program
+        .planned()
+        .position(|(eqn, plan)| {
+            let [dispatch] = plan.dispatches() else {
+                return false;
+            };
+            let workgroup = u64::from(dispatch.body().workgroup_size[0]);
+            let threads = dispatch
+                .launch()
+                .grid
+                .iter()
+                .map(|&x| u64::from(x))
+                .product::<u64>();
+            let elements = program
+                .graph()
+                .aval(eqn.out)
+                .shape
+                .iter()
+                .map(|&d| d as u64)
+                .product::<u64>();
+            invariants::writes_one_element_per_thread(dispatch)
+                && dispatch.launch().grid[1] == 1
+                && dispatch.launch().grid[2] == 1
+                && threads > workgroup
+                && threads - workgroup < elements
+        })
+        .expect("the corpus holds a tight one-element-per-thread launch")
+}
+
+/// SC-003 control: a plan whose launch grid is one workgroup short of covering its output fails the
+/// invariants, naming the equation. Without it the rows above would pass whatever the checker did.
+/// Mutation: drop the grid-covers-output check in `support/invariants.rs`; this row goes red on
+/// `a grid one workgroup short went undetected`.
+#[test]
+fn a_launch_grid_one_workgroup_short_is_caught() {
+    let wgpu = preset("wgpu", "spirv_vulkan", Backend::SpirvVulkan);
+    let graph = corpus(&registry())
+        .into_iter()
+        .find(|row| row.name == "parity.qwen2.decode")
+        .expect("the parity corpus has a qwen2 decode graph")
+        .graph();
+    let mut program = compile(&graph, &wgpu.target, &targets::options()).expect("qwen2 plans");
+    assert_eq!(
+        invariants::violations(&program),
+        Vec::<String>::new(),
+        "the unmodified plan is sound"
+    );
+
+    let index = tight_launch(&program);
+    program
+        .shrink_first_launch_by_one_workgroup(index)
+        .expect("a shorter grid is still a valid dispatch plan");
+    let found = invariants::violations(&program);
+    assert!(
+        found.iter().any(|v| v.contains(&format!("eqn {index} "))
+            && v.contains("threads launched for an output of")),
+        "a grid one workgroup short went undetected: {found:?}"
+    );
+}
+
+/// Launch counts, written out. A digest changes whenever anything about a plan does; these numbers are
+/// the ones a reviewer can hold the planner to. One decode step of the two-layer dense qwen2 launches 38
+/// kernels (a token gather, two layers of norm, Q/K/V projections, two rotaries, two cache updates,
+/// attention, output projection, norm and the gate/up/down feed-forward, then the final norm and the
+/// head), and qwen3 adds one query-norm and one key-norm launch per layer: 38 + 2 * 2 = 42. The counts
+/// are the same on every target because no target here lacks a fusion another has. The same graph takes
+/// far fewer launches than it has equations. Mutation: disable a fusion pass (for example
+/// `fuse_contraction_epilogues`): the launch count rises and the row names the graph and the target.
+#[test]
+fn literal_launch_counts() {
+    let registry = registry();
+    let corpus = corpus(&registry);
+    for (name, launches) in [
+        ("parity.qwen2.decode", 38usize),
+        ("parity.qwen3.decode", 42),
+    ] {
+        let graph = corpus
+            .iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("the parity corpus has {name}"))
+            .graph();
+        for reference in reference_targets() {
+            let program = compile(&graph, &reference.target, &targets::options()).expect("plans");
+            let counted: usize = program
+                .planned()
+                .map(|(_, plan)| plan.dispatches().len())
+                .sum();
+            assert_eq!(counted, launches, "{name} launches on {}", reference.column);
+            assert!(
+                counted < program.graph().eqns().len(),
+                "{name} on {}: {counted} launches for {} equations: nothing fused",
+                reference.column,
+                program.graph().eqns().len()
+            );
+        }
+    }
 }

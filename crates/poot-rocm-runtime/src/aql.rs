@@ -117,7 +117,6 @@ impl KernargAddress for BoundKernarg {
 /// validated power-of-two queue size, after the queue half's `wait_for_space` proved the packet
 /// processor has consumed it) addresses a free slot the packet processor is not reading. The writer
 /// shares that ring with the queue half and never touches the queue, the doorbell or the context.
-#[allow(clippy::type_complexity)]
 pub(crate) struct AqlRingWriter<'a, K: KernargAddress> {
     pub(crate) dispatches: &'a [(KernelHandle, K, DispatchGeometry)],
     pub(crate) completion: bindings::hsa_signal_t,

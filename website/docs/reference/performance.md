@@ -10,7 +10,10 @@ description: Single-request decode and prefill throughput across backends and fr
 This page preserves benchmark snapshots from July and August 2026. They describe those binaries and
 execution paths, not current master after the September architecture changes. Quantized loading,
 kernel selection and executor code have changed since these runs; no current performance claim should
-be inferred from the old tables.
+be inferred from the old tables. The snapshots behind them were recorded before benchmark results carried
+their identity (build, profile, adapter, driver, checkpoint digest, the dtype the weights are stored in), so
+they are no longer in `benchmarks/results/`; they remain in git history. Results recorded since 2026-10-20
+carry that identity.
 
 :::info Scope
 These are **single-request decode/prefill** snapshots, not continuous-batching throughput. The recorded

@@ -9,7 +9,8 @@
 #   - crates whose tests are device tests or drive device runtimes are grouped whole;
 #   - pootc dispatches from two test binaries only;
 #   - poot-llm and poot-serve are grouped by binary or test name (gpu, ptx, rocm, vulkan, hardware). A device
-#     test named without one of those words escapes the group, so name device tests that way. The filter
+#     test named without one of those words escapes the group, so name device tests that way, or list its
+#     binary here; `just test-lane-coverage` fails on a test a lane selects that this filter does not hold. The filter
 #     language has no variables, so the binary regex and the test regex spell the same list: change both.
 
 [test-groups]
@@ -21,6 +22,7 @@ package(poot-npu) | package(poot-l0-runtime) | package(poot-wgpu-device) | packa
 | package(poot-rocm-device) | package(poot-rocm-runtime) | package(poot-vulkan-runtime) | package(poot-vulkan-device)
 | package(poot-ptx-device) | package(poot-ptx-runtime)
 | (package(pootc) & (binary(import_run) | binary(macro_kernel)))
+| binary_id(=poot-serve::bounded_drain_production)
 | ((package(poot-llm) | package(poot-serve)) & (binary(/gpu|ptx|rocm|vulkan|hardware/) | test(/gpu|ptx|rocm|vulkan|hardware/)))
 '''
 test-group = 'gpu'
@@ -31,72 +33,90 @@ test-group = 'gpu'
 # inherit the default profile, so the gpu test-group override above still serializes device tests
 # under a lane profile. `store-success-output` keeps every passing test's captured stdout/stderr in
 # the report: a runtime skip prints its report and returns, and the gate must be able to read that
-# report - a skipped case is never a pass.
+# report - a skipped case is never a pass. `report-name` is the profile's own name: scripts/check-required-cases.py
+# rejects a results file whose report names another profile (a foreign or stale file).
 
 [profile.device-wgpu.junit]
 path = "results.xml"
+report-name = "device-wgpu"
 store-success-output = true
 
 [profile.device-kernels.junit]
 path = "results.xml"
+report-name = "device-kernels"
 store-success-output = true
 
 [profile.device-vulkan.junit]
 path = "results.xml"
+report-name = "device-vulkan"
 store-success-output = true
 
 [profile.device-rocm.junit]
 path = "results.xml"
+report-name = "device-rocm"
 store-success-output = true
 
 [profile.device-ptx.junit]
 path = "results.xml"
+report-name = "device-ptx"
 store-success-output = true
 
 [profile.device-ptx-2gpu.junit]
 path = "results.xml"
+report-name = "device-ptx-2gpu"
 store-success-output = true
 
 [profile.device-ptx-4gpu.junit]
 path = "results.xml"
+report-name = "device-ptx-4gpu"
 store-success-output = true
 
 [profile.device-npu.junit]
 path = "results.xml"
+report-name = "device-npu"
 store-success-output = true
 
 [profile.device-vpu.junit]
 path = "results.xml"
+report-name = "device-vpu"
 store-success-output = true
 
 [profile.device-l0.junit]
 path = "results.xml"
+report-name = "device-l0"
 store-success-output = true
 
 [profile.device-checkpoint-wgpu.junit]
 path = "results.xml"
+report-name = "device-checkpoint-wgpu"
 store-success-output = true
 
 [profile.device-checkpoint-rocm.junit]
 path = "results.xml"
+report-name = "device-checkpoint-rocm"
 store-success-output = true
 
 [profile.device-checkpoint-ptx.junit]
 path = "results.xml"
+report-name = "device-checkpoint-ptx"
 store-success-output = true
 
 [profile.device-checkpoint-vulkan.junit]
 path = "results.xml"
+report-name = "device-checkpoint-vulkan"
 store-success-output = true
 
 [profile.device-checkpoint-large-wgpu.junit]
 path = "results.xml"
+report-name = "device-checkpoint-large-wgpu"
 store-success-output = true
 
 [profile.device-checkpoint-large-rocm.junit]
 path = "results.xml"
+report-name = "device-checkpoint-large-rocm"
 store-success-output = true
 
 [profile.device-checkpoint-large-ptx.junit]
 path = "results.xml"
+report-name = "device-checkpoint-large-ptx"
 store-success-output = true

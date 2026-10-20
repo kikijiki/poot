@@ -84,7 +84,7 @@ fn rope_ref(x: &[f32], cos: &[f32], sin: &[f32], heads: usize, d: usize) -> Vec<
 /// `kv_caches`: one entry per layer, each a `(k_flat, v_flat)` pair with shape `[hkv, cap, d]`
 /// (flat row-major). Position `pos` will be WRITTEN by this call (simulating the DUS), so the
 /// caller should pass the initial cache state (same as the eval state inputs).
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[expect(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn gemma2_decode_ref(
     vocab_size: usize,
     hidden: usize,
@@ -528,7 +528,7 @@ fn gemma2_prefill_matches_decode_last_position() {
 /// - No embedding scale (unlike Gemma2).
 ///
 /// This mirrors the graph exactly so the comparison is bit-exact.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[expect(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn llama_decode_ref(
     vocab: usize,
     hidden: usize,

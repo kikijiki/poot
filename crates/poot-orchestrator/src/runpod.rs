@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::db::PodOwnerPrefix;
 
@@ -58,6 +58,26 @@ impl Pod {
     }
 }
 
+/// The RunPod cloud one create request rents from. The REST API accepts exactly these two values
+/// for `cloudType`; any other string is a 400.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum CloudType {
+    /// RunPod-operated datacenters.
+    Secure,
+    /// Third-party hosts.
+    Community,
+}
+
+impl std::fmt::Display for CloudType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CloudType::Secure => "SECURE",
+            CloudType::Community => "COMMUNITY",
+        })
+    }
+}
+
 /// Fields for a create request.
 pub struct CreateSpec<'a> {
     /// The state database's pod prefix. The pod's cloud name is built from it, so `reap` finds every pod
@@ -71,8 +91,8 @@ pub struct CreateSpec<'a> {
     pub image: &'a str,
     /// The RunPod GPU type id to rent.
     pub gpu_type_id: &'a str,
-    /// Which RunPod cloud to rent from: `COMMUNITY`, `SECURE` or `ALL`.
-    pub cloud_type: &'a str,
+    /// Which RunPod cloud to rent from.
+    pub cloud_type: CloudType,
     /// How many GPUs the pod gets.
     pub gpu_count: u32,
     /// Size of the pod's container disk, in GB.
@@ -348,7 +368,7 @@ mod tests {
             attempt: 2,
             image: "ghcr.io/kikijiki/poot-bench:latest",
             gpu_type_id: "NVIDIA RTX A5000",
-            cloud_type: "SECURE",
+            cloud_type: CloudType::Secure,
             gpu_count: 1,
             container_disk_gb: 40,
             ports: &["22/tcp"],
@@ -411,7 +431,7 @@ mod tests {
             attempt: 1,
             image: "img",
             gpu_type_id: "NVIDIA GeForce RTX 3090",
-            cloud_type: "COMMUNITY",
+            cloud_type: CloudType::Community,
             gpu_count: 1,
             container_disk_gb: 20,
             ports: &["22/tcp"],
@@ -437,7 +457,7 @@ mod tests {
             attempt: 1,
             image: "img",
             gpu_type_id: "NVIDIA GeForce RTX 3090",
-            cloud_type: "COMMUNITY",
+            cloud_type: CloudType::Community,
             gpu_count: 1,
             container_disk_gb: 20,
             ports: &["22/tcp"],
@@ -469,7 +489,7 @@ mod tests {
             attempt: 1,
             image: "img",
             gpu_type_id: "NVIDIA RTX A5000",
-            cloud_type: "SECURE",
+            cloud_type: CloudType::Secure,
             gpu_count: 1,
             container_disk_gb: 30,
             ports: &["22/tcp"],
@@ -539,7 +559,7 @@ mod tests {
             attempt: 1,
             image: "img",
             gpu_type_id: "AMD_Instinct_MI300X_OAM",
-            cloud_type: "SECURE",
+            cloud_type: CloudType::Secure,
             gpu_count: 1,
             container_disk_gb: 30,
             ports: &["22/tcp"],

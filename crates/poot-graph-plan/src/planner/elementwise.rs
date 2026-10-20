@@ -17,7 +17,7 @@ use crate::refusal::Site;
 use poot_target::Backend;
 
 /// Plan one elementwise-family equation (Binary/Select/Unary/Rope/Reduce/Fused/FusedRow).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,

@@ -69,6 +69,19 @@ RUN curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /us
     && rm -rf /var/lib/apt/lists/*
 ENV POOT_LLC=/usr/lib/llvm-22/bin/llc
 
+# CUDA 13.0 toolkit pieces next to the 12.6 runtime base. vLLM 0.22.1 is a cu130 wheel; its DeepGEMM FP8 GEMMs
+# JIT-compile with nvcc at the first FP8 layer and die with "std::filesystem::exists(nvcc_path)" (POOT-1184 run 2)
+# when CUDA_HOME has no nvcc. cuda-nvcc/cudart-dev/cccl are the compile + header set that JIT needs; cmake,
+# cuda-driver-dev and libcublas-dev let pod-sweep.sh build llama.cpp for the pod's arch without an apt step.
+# The packages repoint /usr/local/cuda to 13.0; the baked llama.cpp and candle binaries resolve their 12.x
+# libraries through the base image's ldconfig entries, not through that symlink. CUDA_HOME names the toolkit
+# explicitly for DeepGEMM.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cmake cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-cccl-13-0 cuda-driver-dev-13-0 libcublas-dev-13-0 \
+    && rm -rf /var/lib/apt/lists/*
+ENV CUDA_HOME=/usr/local/cuda-13.0 \
+    PATH=/usr/local/cuda-13.0/bin:$PATH
+
 # uv (harness + per-engine venvs) + the `hf` CLI for model downloads (the slim base has no system pip;
 # `uv tool` installs hf into /root/.local/bin).
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -111,9 +124,10 @@ RUN uv venv /opt/vllm-venv --python 3.11 \
     && uv pip install --python /opt/vllm-venv/bin/python accelerate pillow
 
 # vLLM's V1 EngineCore auto-selects FlashInfer for top-k/top-p sampling when importable, and FlashInfer
-# JIT-compiles its CUDA kernel with nvcc during profile_run, so it fires on every vLLM cell. This runtime
-# stage has no nvcc, so the JIT died with "nvcc: not found", surfaced only as a generic "Engine core
-# initialization failed" (seen 2026-08-20 on an RTX 3090 pod). Force the native PyTorch sampler; the suite
+# JIT-compiles its CUDA kernel with nvcc during profile_run, so it fires on every vLLM cell. Before the CUDA 13
+# toolkit above was added this stage had no nvcc, so the JIT died with "nvcc: not found", surfaced only as a
+# generic "Engine core initialization failed" (seen 2026-08-20 on an RTX 3090 pod). The sampler stays on the native
+# PyTorch path regardless (no JIT, no first-cell compile); the suite
 # samples greedily. runners/vllm/run.py also sets this for on-pod installs (setup/vllm.sh).
 ENV VLLM_USE_FLASHINFER_SAMPLER=0
 
@@ -128,6 +142,9 @@ RUN uv venv /opt/tf-venv --python 3.11 \
 ENV POOT_BENCH_CANDLE_BIN=/opt/benchmarks/runners/candle/target/release/bench-candle-runner \
     LLAMA_BENCH_BIN=/opt/llama.cpp/build/bin/llama-bench \
     LLAMA_SERVER_BIN=/opt/llama.cpp/build/bin/llama-server
+
+# Smoke check: the CUDA 13 toolkit runs and the baked llama.cpp / candle binaries still resolve their libraries.
+RUN /opt/benchmarks/setup/image-smoke.sh
 
 # The nvidia base ENTRYPOINT execs CMD.
 CMD ["/start.sh"]

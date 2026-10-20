@@ -11,6 +11,11 @@ Two NPUs run a narrow set of programs through the ordinary pipeline: AMD's XDNA2
 Lake). Neither is a serving backend and neither has a `--backend` option: each is a library `Device`
 (`poot-npu`, behind its `xdna` feature under the repository's `nix develop .#npu` shell, and its `vpu`
 feature under `nix develop .#npu-intel`).
+
+The NPUs are wanted and under active development. The goal is prefill: an NPU produces the KV cache and
+another device decodes from it. That handoff is not built yet, and a model served wholly by an NPU is a goal
+only if a worthwhile one exists. The generated [feature matrix](../reference/feature-matrix.md) lists which
+ops the planner admits for the XDNA2 today.
 :::
 
 ## What runs

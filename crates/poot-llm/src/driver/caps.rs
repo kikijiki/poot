@@ -446,7 +446,7 @@ impl<S: State> Driver<S> {
     }
 
     /// The key of the `step` entry of `tokens` tokens per row over `rows` rows that binds `carried`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn step_key(
         &self,
         role: ModelRole,

@@ -37,7 +37,7 @@ use runpod::RunPod;
 use workflow::{cmd_exec, cmd_image, cmd_logs, cmd_run, cmd_status, reap, runpod_api_key};
 
 pub use db::PodOwnerPrefix;
-pub use runpod::CreateSpec;
+pub use runpod::{CloudType, CreateSpec};
 
 /// The orchestrator command line: parse `argv` and run the command.
 pub fn run_from_args() -> Result<()> {
@@ -82,7 +82,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::db::{ExecOwner, ReapProtection, Run};
-    use crate::runpod::{CreateSpec, Pod};
+    use crate::runpod::{CloudType, CreateSpec, Pod};
 
     /// SC-001: the `verify-batch` subcommand no longer exists, so the parser refuses it as an unknown
     /// subcommand. Re-adding a `VerifyBatch` arm to `Command` makes the parse succeed and this red.
@@ -264,7 +264,7 @@ frameworks.transformers = { support = true, precision = "bf16" }
             attempt: 1,
             image: "ghcr.io/kikijiki/poot-bench:latest",
             gpu_type_id: "NVIDIA RTX A5000",
-            cloud_type: "SECURE",
+            cloud_type: CloudType::Secure,
             gpu_count: 1,
             container_disk_gb: 40,
             ports: &["22/tcp"],

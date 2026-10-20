@@ -365,7 +365,6 @@ pub fn dispatch_work(g: &Graph, eqn: &Eqn) -> u64 {
 /// per-device `DeviceCaps` to every call site; until a caller has one, it passes a documented fixture,
 /// e.g. `poot_test_util::device_caps::default_caps_for`). `out_shape`/`out_numel` are graph-derived, not
 /// caller-supplied (card 525 R469-019).
-#[allow(clippy::too_many_arguments)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn plan_eqn_views(
     g: &Graph,
@@ -479,7 +478,7 @@ fn out_numel_saturating(shape: &[usize]) -> usize {
 /// [`Graph::aval`] of `eqn.out` (card 525 R469-019: no entry point takes a caller-supplied shape that
 /// could disagree with the graph's own inferred one). It reads only the value table, so it is not generic
 /// over the validation channel and is compiled once in this crate.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn plan_eqn_views_impl(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -523,7 +522,7 @@ pub(crate) fn plan_eqn_views_impl(
 /// against the target's own limits. Every other family's lowering reads GPU capabilities ([`DeviceCaps`])
 /// and is refused with [`Capability::GpuOnly`]; a collective is a cut between stage programs on every
 /// target.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn plan_aie_eqn(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -579,7 +578,7 @@ fn plan_aie_eqn(
 /// A GPU target's per-equation planner body: one thin dispatch table. It runs the shared dtype/storage
 /// guards, routes each op family to its owned function and applies the shared launch-shaping postamble
 /// (`finalize`).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn plan_gpu_eqn(
     g: GraphTables<'_>,
     eqn: &Eqn,

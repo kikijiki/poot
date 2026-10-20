@@ -715,6 +715,30 @@ impl Program {
         Ok(())
     }
 
+    /// Shrink the first launch of equation `index`'s plan by one workgroup along x, as the plan-invariant
+    /// rows need a plan whose grid no longer covers its output (ADR-0113: gated, no production caller).
+    /// Panics if the plan launches nothing or that launch is a single workgroup wide.
+    #[cfg(feature = "test-support")]
+    pub fn shrink_first_launch_by_one_workgroup(
+        &mut self,
+        index: usize,
+    ) -> Result<(), DispatchPlanError> {
+        let Plan::Dispatches(plan) = &self.plans[index] else {
+            panic!("equation {index} launches nothing");
+        };
+        let mut dispatches = plan.to_vec();
+        let first = &mut dispatches[0];
+        let workgroup = first.body().workgroup_size[0];
+        assert!(
+            first.launch().grid[0] > workgroup,
+            "the first launch of equation {index} is one workgroup wide"
+        );
+        first.shrink_grid_x(workgroup);
+        let scratch = plan.scratch().to_vec();
+        self.plans[index] = Plan::Dispatches(DispatchPlan::new(dispatches, scratch)?);
+        Ok(())
+    }
+
     /// Every value's storage, as the plan chose it.
     pub fn storage(&self) -> &GraphStorage {
         &self.storage

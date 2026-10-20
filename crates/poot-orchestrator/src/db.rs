@@ -72,7 +72,7 @@ fn migrate(conn: &Connection) -> Result<()> {
 /// and neither is one accepted where the create call wants it:
 ///
 /// ```compile_fail,E0308
-/// use poot_orchestrator::CreateSpec;
+/// use poot_orchestrator::{CloudType, CreateSpec};
 ///
 /// let env = std::collections::HashMap::new();
 /// let _ = CreateSpec {
@@ -81,7 +81,7 @@ fn migrate(conn: &Connection) -> Result<()> {
 ///     attempt: 1,
 ///     image: "ghcr.io/kikijiki/poot-bench:latest",
 ///     gpu_type_id: "NVIDIA L40S",
-///     cloud_type: "SECURE",
+///     cloud_type: CloudType::Secure,
 ///     gpu_count: 1,
 ///     container_disk_gb: 10,
 ///     ports: &["22/tcp"],

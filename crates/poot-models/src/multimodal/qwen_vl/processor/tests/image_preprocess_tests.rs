@@ -362,7 +362,6 @@ fn qwen25_vl_image_patchify_matches_upstream_axis_order() {
 }
 
 #[test]
-#[allow(clippy::excessive_precision)] // Mirror the upstream constants used by the implementation.
 fn qwen25_vl_image_default_output_satisfies_processed_media_contract() {
     let decoded = Image::from_rgb8(56, 56, rgb_fixture(56, 56)).unwrap();
     let actual = preprocess_qwen2_5_vl_image(&decoded).unwrap();

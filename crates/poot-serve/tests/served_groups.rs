@@ -28,6 +28,7 @@ use poot_models::model::ModelOutput;
 use poot_models::registry::{Fixture, Registry};
 use poot_quant::weights::WeightEntry;
 use poot_runtime_common::DeviceBackend;
+use poot_test_util::per_backend;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -265,6 +266,28 @@ fn driver_options() -> DriverOptions {
     }
 }
 
+/// The requirement variable's backend of a row's choice.
+fn backend_of(choice: BackendChoice) -> DeviceBackend {
+    match choice {
+        BackendChoice::Wgpu => DeviceBackend::Wgpu,
+        BackendChoice::Rocm => DeviceBackend::Rocm,
+        BackendChoice::Ptx => DeviceBackend::Ptx,
+        BackendChoice::Vulkan => DeviceBackend::Vulkan,
+        BackendChoice::Auto => unreachable!("rows name their backend"),
+    }
+}
+
+/// The server's `--backend` flag value of a row's choice.
+fn flag_of(choice: BackendChoice) -> &'static str {
+    match choice {
+        BackendChoice::Wgpu => "wgpu",
+        BackendChoice::Rocm => "rocm",
+        BackendChoice::Ptx => "ptx",
+        BackendChoice::Vulkan => "vulkan",
+        BackendChoice::Auto => unreachable!("rows name their backend"),
+    }
+}
+
 /// Generate `prompt` once with each of `samplers`, on one driver over `choice`'s device (a ROCm executor
 /// cannot be reopened in a process), or `None` where the device is absent (a skip).
 fn references(
@@ -484,7 +507,8 @@ fn greedy(prompt: &[u32]) -> serde_json::Value {
 /// the stream's chunks add up to it). Mutation: skip `engine.commit` in `commit_tokens` for the group;
 /// the sequence never advances, the served text diverges from (or never completes against) the driver's
 /// and the row goes red.
-fn served_family(name: &str, choice: BackendChoice, backend: DeviceBackend, flag: &str) {
+fn served_family(name: &str, choice: BackendChoice) {
+    let (backend, flag) = (backend_of(choice), flag_of(choice));
     let dir = write_checkpoint(name);
     let Some(expected) = reference(
         choice,
@@ -523,58 +547,202 @@ fn served_family(name: &str, choice: BackendChoice, backend: DeviceBackend, flag
     );
 }
 
-macro_rules! served_rows {
-    ($($family:literal => $wgpu:ident, $rocm:ident;)*) => {
-        $(
-            #[test]
-            fn $wgpu() {
-                served_family($family, BackendChoice::Wgpu, DeviceBackend::Wgpu, "wgpu");
-            }
-
-            #[test]
-            fn $rocm() {
-                served_family($family, BackendChoice::Rocm, DeviceBackend::Rocm, "rocm");
-            }
-        )*
-    };
-}
-
-served_rows! {
-    "deepseek4" => served_deepseek4_wgpu, served_deepseek4_rocm;
-    "glm53_flash" => served_glm53_flash_wgpu, served_glm53_flash_rocm;
-    "minimax_m2" => served_minimax_m2_wgpu, served_minimax_m2_rocm;
-    "qwen35" => served_qwen35_wgpu, served_qwen35_rocm;
-    "gemma4" => served_gemma4_wgpu, served_gemma4_rocm;
-    "qwen3next" => served_qwen3next_wgpu, served_qwen3next_rocm;
-    "qwen2" => served_qwen2_wgpu, served_qwen2_rocm;
-    "llama" => served_llama_wgpu, served_llama_rocm;
-    "qwen3" => served_qwen3_wgpu, served_qwen3_rocm;
-    "gemma3" => served_gemma3_wgpu, served_gemma3_rocm;
-    "gemma2" => served_gemma2_wgpu, served_gemma2_rocm;
-    "granite" => served_granite_wgpu, served_granite_rocm;
-    "olmo2" => served_olmo2_wgpu, served_olmo2_rocm;
-    "bloom" => served_bloom_wgpu, served_bloom_rocm;
-    "mpt" => served_mpt_wgpu, served_mpt_rocm;
-    "smollm3" => served_smollm3_wgpu, served_smollm3_rocm;
-    "phi3" => served_phi3_wgpu, served_phi3_rocm;
-    "qwen2_5_vl" => served_qwen2_5_vl_wgpu, served_qwen2_5_vl_rocm;
-    "idefics3" => served_idefics3_wgpu, served_idefics3_rocm;
-    "qwen3moe" => served_qwen3moe_wgpu, served_qwen3moe_rocm;
-    "olmoe" => served_olmoe_wgpu, served_olmoe_rocm;
-    "llama/mixtral" => served_mixtral_wgpu, served_mixtral_rocm;
-    "granite/granitemoe" => served_granitemoe_wgpu, served_granitemoe_rocm;
-    "gpt_oss" => served_gpt_oss_wgpu, served_gpt_oss_rocm;
-    "deepseek2" => served_deepseek2_wgpu, served_deepseek2_rocm;
-    "deepseek3" => served_deepseek3_wgpu, served_deepseek3_rocm;
-    "deepseek32" => served_deepseek32_wgpu, served_deepseek32_rocm;
-    "nemotron_h" => served_nemotron_h_wgpu, served_nemotron_h_rocm;
-}
-
-/// The dense fixture served on PTX, greedy (a pod row).
-#[test]
-fn served_qwen2_ptx() {
-    served_family("qwen2", BackendChoice::Ptx, DeviceBackend::Ptx, "ptx");
-}
+per_backend!(
+    BackendChoice,
+    |choice| served_family("deepseek4", choice),
+    served_deepseek4_wgpu,
+    served_deepseek4_rocm,
+    served_deepseek4_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("glm53_flash", choice),
+    served_glm53_flash_wgpu,
+    served_glm53_flash_rocm,
+    served_glm53_flash_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("minimax_m2", choice),
+    served_minimax_m2_wgpu,
+    served_minimax_m2_rocm,
+    served_minimax_m2_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("qwen35", choice),
+    served_qwen35_wgpu,
+    served_qwen35_rocm,
+    served_qwen35_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("gemma4", choice),
+    served_gemma4_wgpu,
+    served_gemma4_rocm,
+    served_gemma4_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("qwen3next", choice),
+    served_qwen3next_wgpu,
+    served_qwen3next_rocm,
+    served_qwen3next_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("qwen2", choice),
+    served_qwen2_wgpu,
+    served_qwen2_rocm,
+    served_qwen2_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("llama", choice),
+    served_llama_wgpu,
+    served_llama_rocm,
+    served_llama_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("qwen3", choice),
+    served_qwen3_wgpu,
+    served_qwen3_rocm,
+    served_qwen3_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("gemma3", choice),
+    served_gemma3_wgpu,
+    served_gemma3_rocm,
+    served_gemma3_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("gemma2", choice),
+    served_gemma2_wgpu,
+    served_gemma2_rocm,
+    served_gemma2_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("granite", choice),
+    served_granite_wgpu,
+    served_granite_rocm,
+    served_granite_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("olmo2", choice),
+    served_olmo2_wgpu,
+    served_olmo2_rocm,
+    served_olmo2_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("bloom", choice),
+    served_bloom_wgpu,
+    served_bloom_rocm,
+    served_bloom_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("mpt", choice),
+    served_mpt_wgpu,
+    served_mpt_rocm,
+    served_mpt_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("smollm3", choice),
+    served_smollm3_wgpu,
+    served_smollm3_rocm,
+    served_smollm3_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("phi3", choice),
+    served_phi3_wgpu,
+    served_phi3_rocm,
+    served_phi3_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("qwen2_5_vl", choice),
+    served_qwen2_5_vl_wgpu,
+    served_qwen2_5_vl_rocm,
+    served_qwen2_5_vl_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("idefics3", choice),
+    served_idefics3_wgpu,
+    served_idefics3_rocm,
+    served_idefics3_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("qwen3moe", choice),
+    served_qwen3moe_wgpu,
+    served_qwen3moe_rocm,
+    served_qwen3moe_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("olmoe", choice),
+    served_olmoe_wgpu,
+    served_olmoe_rocm,
+    served_olmoe_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("llama/mixtral", choice),
+    served_mixtral_wgpu,
+    served_mixtral_rocm,
+    served_mixtral_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("granite/granitemoe", choice),
+    served_granitemoe_wgpu,
+    served_granitemoe_rocm,
+    served_granitemoe_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("gpt_oss", choice),
+    served_gpt_oss_wgpu,
+    served_gpt_oss_rocm,
+    served_gpt_oss_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("deepseek2", choice),
+    served_deepseek2_wgpu,
+    served_deepseek2_rocm,
+    served_deepseek2_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("deepseek3", choice),
+    served_deepseek3_wgpu,
+    served_deepseek3_rocm,
+    served_deepseek3_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("deepseek32", choice),
+    served_deepseek32_wgpu,
+    served_deepseek32_rocm,
+    served_deepseek32_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_family("nemotron_h", choice),
+    served_nemotron_h_wgpu,
+    served_nemotron_h_rocm,
+    served_nemotron_h_ptx
+);
 
 /// The dense fixture served on raw Vulkan, greedy (POOT-1081): the executor reports a live memory budget
 /// from `VK_EXT_memory_budget`, so startup admits it and the served tokens equal `Driver::generate`'s.
@@ -582,12 +750,7 @@ fn served_qwen2_ptx() {
 /// the server never listens.
 #[test]
 fn served_qwen2_vulkan() {
-    served_family(
-        "qwen2",
-        BackendChoice::Vulkan,
-        DeviceBackend::Vulkan,
-        "vulkan",
-    );
+    served_family("qwen2", BackendChoice::Vulkan);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -598,7 +761,8 @@ fn served_qwen2_vulkan() {
 /// sampler, and they are not the greedy tokens. Mutation: take the greedy argmax in the served path
 /// (replace the job's sampler with `Sampler::greedy()` when the slot opens); the served text is the
 /// greedy text and the row goes red.
-fn served_sampled(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
+fn served_sampled(choice: BackendChoice) {
+    let (backend, flag) = (backend_of(choice), flag_of(choice));
     const SEED: u64 = 7;
     let dir = write_checkpoint("qwen2");
     let sampler = || Sampler::new(1.0, 0, 1.0, SEED);
@@ -632,20 +796,13 @@ fn served_sampled(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
     );
 }
 
-#[test]
-fn served_sampled_request_returns_the_samplers_tokens_wgpu() {
-    served_sampled(BackendChoice::Wgpu, DeviceBackend::Wgpu, "wgpu");
-}
-
-#[test]
-fn served_sampled_request_returns_the_samplers_tokens_rocm() {
-    served_sampled(BackendChoice::Rocm, DeviceBackend::Rocm, "rocm");
-}
-
-#[test]
-fn served_sampled_request_returns_the_samplers_tokens_ptx() {
-    served_sampled(BackendChoice::Ptx, DeviceBackend::Ptx, "ptx");
-}
+per_backend!(
+    BackendChoice,
+    served_sampled,
+    served_sampled_request_returns_the_samplers_tokens_wgpu,
+    served_sampled_request_returns_the_samplers_tokens_rocm,
+    served_sampled_request_returns_the_samplers_tokens_ptx
+);
 
 // ---------------------------------------------------------------------------------------------
 // SC-003: served speculative decoding.
@@ -659,7 +816,8 @@ fn served_sampled_request_returns_the_samplers_tokens_ptx() {
 ///
 /// Mutations: accept every draft in the driver's verification (the tokens diverge from `Off`); record
 /// `tokens.len()` instead of the driver's accepted count in the loop (the sum goes red).
-fn served_speculative(choice: BackendChoice, backend: DeviceBackend, flag: &str, draft: Draft) {
+fn served_speculative(choice: BackendChoice, draft: Draft) {
+    let (backend, flag) = (backend_of(choice), flag_of(choice));
     // The MTP policy needs a family with an MTP program: the GLM-5.3-Flash fixture, which is also
     // recurrent, so its rejecting rounds restore and replay under the server's own loop.
     let family = match draft {
@@ -748,37 +906,34 @@ enum Draft {
     Mtp,
 }
 
-macro_rules! speculative_rows {
-    ($($draft:expr => $wgpu:ident, $rocm:ident;)*) => {
-        $(
-            #[test]
-            fn $wgpu() {
-                served_speculative(BackendChoice::Wgpu, DeviceBackend::Wgpu, "wgpu", $draft);
-            }
-
-            #[test]
-            fn $rocm() {
-                served_speculative(BackendChoice::Rocm, DeviceBackend::Rocm, "rocm", $draft);
-            }
-        )*
-    };
-}
-
-speculative_rows! {
-    Draft::Lookup => served_lookup_speculation_returns_the_off_tokens_wgpu, served_lookup_speculation_returns_the_off_tokens_rocm;
-    Draft::Model => served_draft_model_speculation_returns_the_off_tokens_wgpu, served_draft_model_speculation_returns_the_off_tokens_rocm;
-    Draft::Mtp => served_mtp_speculation_returns_the_off_tokens_wgpu, served_mtp_speculation_returns_the_off_tokens_rocm;
-}
+per_backend!(
+    BackendChoice,
+    |choice| served_speculative(choice, Draft::Lookup),
+    served_lookup_speculation_returns_the_off_tokens_wgpu,
+    served_lookup_speculation_returns_the_off_tokens_rocm,
+    served_lookup_speculation_returns_the_off_tokens_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_speculative(choice, Draft::Model),
+    served_draft_model_speculation_returns_the_off_tokens_wgpu,
+    served_draft_model_speculation_returns_the_off_tokens_rocm,
+    served_draft_model_speculation_returns_the_off_tokens_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| served_speculative(choice, Draft::Mtp),
+    served_mtp_speculation_returns_the_off_tokens_wgpu,
+    served_mtp_speculation_returns_the_off_tokens_rocm,
+    served_mtp_speculation_returns_the_off_tokens_ptx
+);
 
 /// The server pages its KV pool, and the qwen4exp indexer's per-row block-key cache has no paged
 /// layout yet (POOT-1148): startup stops with the typed `PagedIndexer` refusal, before the listener
 /// binds. Mutation: drop the paged check from `Qwen4Exp::trace_into`; the engine plans a paged
 /// indexer and the server starts, so the row goes red.
-fn a_paged_pool_refuses_the_qwen4exp_indexer_startup(
-    choice: BackendChoice,
-    backend: DeviceBackend,
-    flag: &str,
-) {
+fn a_paged_pool_refuses_the_qwen4exp_indexer_startup(choice: BackendChoice) {
+    let (backend, flag) = (backend_of(choice), flag_of(choice));
     if poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice)).is_none() {
         return;
     }
@@ -790,32 +945,19 @@ fn a_paged_pool_refuses_the_qwen4exp_indexer_startup(
     );
 }
 
-#[test]
-fn a_paged_pool_refuses_the_qwen4exp_indexer_startup_wgpu() {
-    a_paged_pool_refuses_the_qwen4exp_indexer_startup(
-        BackendChoice::Wgpu,
-        DeviceBackend::Wgpu,
-        "wgpu",
-    );
-}
-
-#[test]
-fn a_paged_pool_refuses_the_qwen4exp_indexer_startup_rocm() {
-    a_paged_pool_refuses_the_qwen4exp_indexer_startup(
-        BackendChoice::Rocm,
-        DeviceBackend::Rocm,
-        "rocm",
-    );
-}
+per_backend!(
+    BackendChoice,
+    a_paged_pool_refuses_the_qwen4exp_indexer_startup,
+    a_paged_pool_refuses_the_qwen4exp_indexer_startup_wgpu,
+    a_paged_pool_refuses_the_qwen4exp_indexer_startup_rocm,
+    a_paged_pool_refuses_the_qwen4exp_indexer_startup_ptx
+);
 
 /// `--draft-mtp` on a family with no `draft` program stops startup with the family's typed program
 /// refusal (`TraceError::ProgramUnsupported`), before the listener binds. Mutation: build `DraftPolicy::Off` for the flag in `draft_policy`; the
 /// server starts and serves, and the row goes red.
-fn a_model_without_an_mtp_layer_refuses_draft_mtp_startup(
-    choice: BackendChoice,
-    backend: DeviceBackend,
-    flag: &str,
-) {
+fn a_model_without_an_mtp_layer_refuses_draft_mtp_startup(choice: BackendChoice) {
+    let (backend, flag) = (backend_of(choice), flag_of(choice));
     if poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice)).is_none() {
         return;
     }
@@ -827,23 +969,13 @@ fn a_model_without_an_mtp_layer_refuses_draft_mtp_startup(
     );
 }
 
-#[test]
-fn a_model_without_an_mtp_layer_refuses_draft_mtp_startup_wgpu() {
-    a_model_without_an_mtp_layer_refuses_draft_mtp_startup(
-        BackendChoice::Wgpu,
-        DeviceBackend::Wgpu,
-        "wgpu",
-    );
-}
-
-#[test]
-fn a_model_without_an_mtp_layer_refuses_draft_mtp_startup_rocm() {
-    a_model_without_an_mtp_layer_refuses_draft_mtp_startup(
-        BackendChoice::Rocm,
-        DeviceBackend::Rocm,
-        "rocm",
-    );
-}
+per_backend!(
+    BackendChoice,
+    a_model_without_an_mtp_layer_refuses_draft_mtp_startup,
+    a_model_without_an_mtp_layer_refuses_draft_mtp_startup_wgpu,
+    a_model_without_an_mtp_layer_refuses_draft_mtp_startup_rocm,
+    a_model_without_an_mtp_layer_refuses_draft_mtp_startup_ptx
+);
 
 /// A `--draft-model` path that holds no checkpoint stops startup with the load error, before the engine
 /// plan is built. The server never binds. Mutation: ignore the draft path in `draft_policy` (return
@@ -889,11 +1021,8 @@ fn wider_vocabulary(name: &str, vocab: usize) -> Fixture {
 /// `DraftMismatch` while the engine plan is built, so startup fails before the listener binds. Mutation:
 /// skip `check_draft` in the driver; the server serves a draft it cannot verify against and the row
 /// goes red.
-fn draft_with_a_larger_vocabulary_refuses_startup(
-    choice: BackendChoice,
-    backend: DeviceBackend,
-    flag: &str,
-) {
+fn draft_with_a_larger_vocabulary_refuses_startup(choice: BackendChoice) {
+    let (backend, flag) = (backend_of(choice), flag_of(choice));
     if poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice)).is_none() {
         return;
     }
@@ -913,34 +1042,21 @@ fn draft_with_a_larger_vocabulary_refuses_startup(
     );
 }
 
-#[test]
-fn draft_with_a_larger_vocabulary_refuses_startup_wgpu() {
-    draft_with_a_larger_vocabulary_refuses_startup(
-        BackendChoice::Wgpu,
-        DeviceBackend::Wgpu,
-        "wgpu",
-    );
-}
-
-#[test]
-fn draft_with_a_larger_vocabulary_refuses_startup_rocm() {
-    draft_with_a_larger_vocabulary_refuses_startup(
-        BackendChoice::Rocm,
-        DeviceBackend::Rocm,
-        "rocm",
-    );
-}
+per_backend!(
+    BackendChoice,
+    draft_with_a_larger_vocabulary_refuses_startup,
+    draft_with_a_larger_vocabulary_refuses_startup_wgpu,
+    draft_with_a_larger_vocabulary_refuses_startup_rocm,
+    draft_with_a_larger_vocabulary_refuses_startup_ptx
+);
 
 /// Rows the verify window cannot check (a penalty, logprobs) decode one token under a draft policy and
 /// the driver reports why: `speculative_skipped_rows` moves for each such request, and the tokens are
 /// the ones `Driver::generate` returns for that sampler without a policy. `n > 1` of such a request
 /// skips on every choice. Mutation: have `Driver::step` speculate these rows without the sampler check;
 /// the counter does not move or the tokens diverge and the row goes red.
-fn served_unspeculated_rows_decode_as_off(
-    choice: BackendChoice,
-    backend: DeviceBackend,
-    flag: &str,
-) {
+fn served_unspeculated_rows_decode_as_off(choice: BackendChoice) {
+    let (backend, flag) = (backend_of(choice), flag_of(choice));
     let dir = write_checkpoint("qwen2");
     let penalised = || Sampler::greedy().with_penalties(1.5, 0.0, 0.0);
     let Some(mut both) = references(
@@ -1021,15 +1137,13 @@ fn served_unspeculated_rows_decode_as_off(
     );
 }
 
-#[test]
-fn served_unspeculated_rows_decode_as_off_wgpu() {
-    served_unspeculated_rows_decode_as_off(BackendChoice::Wgpu, DeviceBackend::Wgpu, "wgpu");
-}
-
-#[test]
-fn served_unspeculated_rows_decode_as_off_rocm() {
-    served_unspeculated_rows_decode_as_off(BackendChoice::Rocm, DeviceBackend::Rocm, "rocm");
-}
+per_backend!(
+    BackendChoice,
+    served_unspeculated_rows_decode_as_off,
+    served_unspeculated_rows_decode_as_off_wgpu,
+    served_unspeculated_rows_decode_as_off_rocm,
+    served_unspeculated_rows_decode_as_off_ptx
+);
 
 // ---------------------------------------------------------------------------------------------
 // A vision-language checkpoint: a served image request returns the driver's caption.
@@ -1305,7 +1419,8 @@ impl Server {
 /// entries, so each checkpoint is built by the other's preprocessor; observed on wgpu, this row,
 /// `served_qwen_vl_caption`, `served_idefics3_wgpu` and `served_qwen2_5_vl_wgpu` all fail to load their
 /// fixture (`config field scale_factor: Missing`, `config field model_type: Unsupported`) and go red.
-fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
+fn served_smolvlm_caption(choice: BackendChoice) {
+    let (backend, flag) = (backend_of(choice), flag_of(choice));
     use poot_models::multimodal::front_end::ChatTurn;
 
     let dir = smolvlm::write_checkpoint(NO_EOS);
@@ -1444,20 +1559,13 @@ fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
     refused(&tools, "tools");
 }
 
-#[test]
-fn served_smolvlm_caption_wgpu() {
-    served_smolvlm_caption(BackendChoice::Wgpu, DeviceBackend::Wgpu, "wgpu");
-}
-
-#[test]
-fn served_smolvlm_caption_rocm() {
-    served_smolvlm_caption(BackendChoice::Rocm, DeviceBackend::Rocm, "rocm");
-}
-
-#[test]
-fn served_smolvlm_caption_ptx() {
-    served_smolvlm_caption(BackendChoice::Ptx, DeviceBackend::Ptx, "ptx");
-}
+per_backend!(
+    BackendChoice,
+    served_smolvlm_caption,
+    served_smolvlm_caption_wgpu,
+    served_smolvlm_caption_rocm,
+    served_smolvlm_caption_ptx
+);
 
 // ---------------------------------------------------------------------------------------------
 // Qwen2.5-VL: the second image front end, with the prompt's sectioned positions.
@@ -1571,7 +1679,8 @@ fn small_png_of(fill: impl Fn(u32, u32) -> u8) -> Vec<u8> {
 /// positions with zeros where `DriverEngine::open` hands them to `Driver::open` as request inputs; the served generation
 /// leaves the reference's and the row goes red. The registry mutation of `served_smolvlm_caption` (swap
 /// the two entries' `keys`) also turns this row red.
-fn served_qwen_vl_caption(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
+fn served_qwen_vl_caption(choice: BackendChoice) {
+    let (backend, flag) = (backend_of(choice), flag_of(choice));
     use poot_models::multimodal::front_end::ChatTurn;
 
     const QUESTION: &str = "hello";
@@ -1640,15 +1749,13 @@ fn served_qwen_vl_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
     refused(&garbage, "image");
 }
 
-#[test]
-fn served_qwen_vl_caption_wgpu() {
-    served_qwen_vl_caption(BackendChoice::Wgpu, DeviceBackend::Wgpu, "wgpu");
-}
-
-#[test]
-fn served_qwen_vl_caption_rocm() {
-    served_qwen_vl_caption(BackendChoice::Rocm, DeviceBackend::Rocm, "rocm");
-}
+per_backend!(
+    BackendChoice,
+    served_qwen_vl_caption,
+    served_qwen_vl_caption_wgpu,
+    served_qwen_vl_caption_rocm,
+    served_qwen_vl_caption_ptx
+);
 
 /// A Qwen2.5-VL checkpoint refuses what it cannot take, as the client's error: an image of more patches
 /// than the vision tower takes in one step (4100 against 4096) is a 400 from the tower's own bound, not a
@@ -1656,7 +1763,8 @@ fn served_qwen_vl_caption_rocm() {
 /// model it is, whose image part is the typed `unsupported_capability` refusal. Mutation: stop mapping the
 /// tower's patch cap into a `Refused` in `Qwen25VlFrontEnd::prepare`; the oversize image is a 500 and
 /// the row goes red.
-fn served_qwen_vl_refusals(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
+fn served_qwen_vl_refusals(choice: BackendChoice) {
+    let (backend, flag) = (backend_of(choice), flag_of(choice));
     // The refusals are the server's, not the device's: skip when the backend is absent.
     if poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice)).is_none() {
         return;
@@ -1696,12 +1804,10 @@ fn served_qwen_vl_refusals(choice: BackendChoice, backend: DeviceBackend, flag: 
     assert_eq!(error["error"]["type"], "unsupported_capability", "{error}");
 }
 
-#[test]
-fn served_qwen_vl_refusals_wgpu() {
-    served_qwen_vl_refusals(BackendChoice::Wgpu, DeviceBackend::Wgpu, "wgpu");
-}
-
-#[test]
-fn served_qwen_vl_refusals_rocm() {
-    served_qwen_vl_refusals(BackendChoice::Rocm, DeviceBackend::Rocm, "rocm");
-}
+per_backend!(
+    BackendChoice,
+    served_qwen_vl_refusals,
+    served_qwen_vl_refusals_wgpu,
+    served_qwen_vl_refusals_rocm,
+    served_qwen_vl_refusals_ptx
+);

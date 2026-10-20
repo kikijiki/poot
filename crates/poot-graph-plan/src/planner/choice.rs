@@ -35,7 +35,6 @@ pub enum NoDispatch {
 /// The kernel the planner chose for one equation.
 // One record per planned equation, matched by value in many places: boxing the request would put a
 // `Box` pattern wall between every caller and the request it reads.
-#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum KernelChoice {
     /// A body `poot-kernelgen` generated from this request, launched as a thread grid.

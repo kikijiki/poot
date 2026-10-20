@@ -9,7 +9,7 @@ use crate::refusal::Site;
 use poot_target::{Backend, DeviceCaps};
 
 /// Plan one Cast equation, matching the (input, output) dtype pair exhaustively.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,

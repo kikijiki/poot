@@ -483,7 +483,6 @@ fn delta_rule_step(
 /// `[x, b, c, delta, a, d]`. One reduction per token: consecutive tokens alternate planes, so a lane that
 /// runs a token ahead writes the plane its slower neighbours are not reading, and a lane two tokens ahead
 /// cannot exist (it would have to pass the barrier of the token between).
-#[allow(clippy::too_many_arguments)]
 fn ssd_step(
     c: &mut Cfg,
     spec: &ScanSpec,

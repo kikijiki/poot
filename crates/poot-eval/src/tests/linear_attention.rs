@@ -519,7 +519,7 @@ fn check_gdn_prefill_chunked_matches_decode(l: usize, chunk: usize, abs_tol_only
 
 /// Generalized [`check_gdn_prefill_chunked_matches_decode`] with configurable head/dim shape, a `seed_base`
 /// for independent deterministic random streams, and a relative tolerance `tol` (default callers use 1e-4).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn check_gdn_prefill_chunked_matches_decode_ex(
     l: usize,
     chunk: usize,
@@ -1122,7 +1122,6 @@ fn gdn_decode_continuation_error_shrinks_after_chunked_prefill_real_dims() {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gdn_decode_continuation_one_level(
     h_v: usize,
     d: usize,

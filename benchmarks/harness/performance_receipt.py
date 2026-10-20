@@ -522,17 +522,45 @@ def preparation_report(preparation):
 # --------------------------------------------------------------------------------------------------
 # Harness result rows as receipts
 # --------------------------------------------------------------------------------------------------
-# What a results.jsonl row states about its workload. Backend and device are the cell key, not identity.
-ROW_IDENTITY_FIELDS = ("precision", "prompt_tokens", "requested_output")
+# Frameworks whose runner is a binary built from this repository: their rows state the build and platform that
+# produced them (`ROW_IDENTITY_FIELDS`). Every other framework is an external tool.
+BUILD_IDENTITY_FRAMEWORKS = frozenset({"poot"})
+
+# What a results.jsonl row states about the workload and the build and platform that ran it. Backend and device
+# are the cell key, not identity. Every field here must agree between baseline and candidate or the cell is
+# incomparable: a debug-profile runner, other cargo features or compiler, a different checkpoint under one model
+# id, another adapter or driver stack, a device-timed (profiled) run, or a dtype the weights are not stored in
+# is not the cell it is compared with. `build_sha` is deliberately absent: it is what a comparison varies.
+# These are the fields of a row of a repository-built runner (poot); the runner states every one of them.
+ROW_IDENTITY_FIELDS = (
+    "precision",
+    "prompt_tokens",
+    "requested_output",
+    "build_profile",
+    "build_features",
+    "rustc_version",
+    "adapter",
+    "driver_version",
+    "checkpoint_digest",
+    "compute_dtype",
+    "profiled",
+)
+# An external tool states its workload and the version of the engine that ran it, and nothing of a build or a
+# platform it does not report: a baseline whose engine version moved is not the cell it was recorded as.
+EXTERNAL_ROW_IDENTITY_FIELDS = ("precision", "prompt_tokens", "requested_output", "framework_version")
+
+
+def row_identity_fields(framework):
+    """The identity fields a row of `framework` must state and agree on to be compared."""
+    return ROW_IDENTITY_FIELDS if framework in BUILD_IDENTITY_FRAMEWORKS else EXTERNAL_ROW_IDENTITY_FIELDS
 HEADLINE_CELL = "headline"
 
 
-def _row_identity(rows):
-    row = rows[0]
+def row_identity(row):
+    """What one stored row states about the workload and the build and platform that ran it."""
     return {
-        "precision": row.get("precision"),
-        "prompt_tokens": row.get("prompt_tokens"),
-        "requested_output": row.get("osl", row.get("gen_tokens")),
+        field: row.get("osl", row.get("gen_tokens")) if field == "requested_output" else row.get(field)
+        for field in row_identity_fields(row.get("framework"))
     }
 
 
@@ -562,7 +590,7 @@ def rows_receipt(rows, policy):
     for name, record in cells.items():
         if name != HEADLINE_CELL:
             record["repeats"] += [{"status": "failed"} for row in rows if row.get("status") != "ok"]
-    return {"identity": _row_identity(ok or rows), "cells": cells}
+    return {"identity": row_identity((ok or rows)[0]), "cells": cells}
 
 
 def rows_spec(baseline_receipt, policy):

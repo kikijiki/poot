@@ -1,5 +1,8 @@
-//! Embeds the git sha this binary is built from as `POOT_BUILD_SHA`, so every benchmark result can name the
-//! commit of the binary that produced it (not the checkout the harness happens to run in).
+//! Embeds what a benchmark result must say about the binary that produced it: the git sha it is built from as
+//! `POOT_BUILD_SHA` (the commit of the binary, not the checkout the harness happens to run in), the cargo
+//! profile as `POOT_BUILD_PROFILE`, the runner's enabled cargo features as `POOT_BUILD_FEATURES` (sorted,
+//! comma-separated, empty when none) and the compiler as `POOT_RUSTC_VERSION`. The runner refuses to measure
+//! when the profile is not `release`.
 //!
 //! Inside a git checkout the sha is the checkout's HEAD, with a `-dirty` suffix when a tracked build input
 //! differs from HEAD; git is the only source of truth there. A build from a source export with no `.git`
@@ -45,6 +48,45 @@ fn main() {
     let sha = resolve_sha(checkout(&manifest_dir), exported.as_deref())
         .unwrap_or_else(|reason| panic!("cannot determine the build sha: {reason}"));
     println!("cargo:rustc-env=POOT_BUILD_SHA={sha}");
+
+    let profile = cargo_variable("PROFILE");
+    println!("cargo:rustc-env=POOT_BUILD_PROFILE={profile}");
+    println!(
+        "cargo:rustc-env=POOT_BUILD_FEATURES={}",
+        enabled_features(std::env::vars())
+    );
+    println!(
+        "cargo:rustc-env=POOT_RUSTC_VERSION={}",
+        rustc_version(&cargo_variable("RUSTC"))
+    );
+}
+
+/// A variable cargo sets for every build script; its absence means this is not running under cargo.
+fn cargo_variable(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("cargo sets {name} for a build script"))
+}
+
+/// The package's enabled features, from cargo's `CARGO_FEATURE_<NAME>` variables: lowercase with `_` for `-`,
+/// sorted, comma-separated.
+fn enabled_features(vars: impl Iterator<Item = (String, String)>) -> String {
+    let mut features: Vec<String> = vars
+        .filter_map(|(name, _)| {
+            name.strip_prefix("CARGO_FEATURE_")
+                .map(|feature| feature.to_lowercase())
+        })
+        .collect();
+    features.sort();
+    features.join(",")
+}
+
+/// `rustc --version` of the compiler cargo builds this package with.
+fn rustc_version(rustc: &str) -> String {
+    let out = Command::new(rustc)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run {rustc} --version: {error}"));
+    assert!(out.status.success(), "{rustc} --version failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn is_sha(value: &str) -> bool {

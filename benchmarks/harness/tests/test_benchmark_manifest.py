@@ -14,7 +14,8 @@ sys.path.insert(0, str(HARNESS_DIR))
 
 import bench  # noqa: E402
 import observer  # noqa: E402
-from runner_fixtures import BUILD_SHA, run_fixture_runner, valid_single  # noqa: E402
+from result_contract import BUILD_IDENTITY_FIELDS  # noqa: E402
+from runner_fixtures import BUILD_SHA, POOT_IDENTITY, run_fixture_runner, valid_single  # noqa: E402
 
 REFUSAL = "exact model stub_model has no accepted Wgpu Decode route"
 
@@ -79,7 +80,7 @@ def refusing_runner(directory, payload):
 def refusal_payload(**overrides):
     payload = {
         "framework": "poot",
-        "build_sha": BUILD_SHA,
+        **{field: POOT_IDENTITY[field] for field in BUILD_IDENTITY_FIELDS},
         "backend": "wgpu",
         "mode": "single",
         "precision": "bf16",
@@ -115,6 +116,9 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(row["status"], "unsupported")
         self.assertEqual(row["reason"], REFUSAL)
         self.assertEqual(row["build_sha"], BUILD_SHA)
+        self.assertEqual({field: row[field] for field in BUILD_IDENTITY_FIELDS}, {
+            field: POOT_IDENTITY[field] for field in BUILD_IDENTITY_FIELDS
+        })
         self.assertEqual(row["backend"], "wgpu")
 
     def test_the_manifest_has_no_say_when_the_runner_answers(self):
@@ -139,7 +143,8 @@ class RefusalTests(unittest.TestCase):
     def test_a_refusal_names_the_build_and_backend_it_came_from(self):
         for payload in (
             refusal_payload(backend="rocm"),
-            {k: v for k, v in refusal_payload().items() if k != "build_sha"},
+            refusal_payload(build_profile="debug"),
+            *({k: v for k, v in refusal_payload().items() if k != field} for field in BUILD_IDENTITY_FIELDS),
         ):
             with self.subTest(payload=payload), tempfile.TemporaryDirectory() as tmp:
                 row = run_poot_cell(refusing_runner(tmp, payload))

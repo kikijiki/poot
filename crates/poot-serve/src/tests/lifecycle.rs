@@ -1488,6 +1488,7 @@ mod device {
         program_retention,
     };
     use poot_runtime_common::DeviceBackend;
+    use poot_test_util::per_backend;
 
     use super::*;
     use crate::batch::engine::{DriverEngine, run_engine_thread};
@@ -1540,6 +1541,7 @@ mod device {
         match choice {
             BackendChoice::Wgpu => DeviceBackend::Wgpu,
             BackendChoice::Rocm => DeviceBackend::Rocm,
+            BackendChoice::Ptx => DeviceBackend::Ptx,
             other => panic!("poot-serve has no device row on {other:?}"),
         }
     }
@@ -2246,38 +2248,32 @@ mod device {
         let _ = std::fs::remove_dir_all(other);
     }
 
-    macro_rules! per_backend {
-        ($row:ident, $wgpu:ident, $rocm:ident) => {
-            #[test]
-            fn $wgpu() {
-                $row(BackendChoice::Wgpu);
-            }
-
-            #[test]
-            fn $rocm() {
-                $row(BackendChoice::Rocm);
-            }
-        };
-    }
-
     per_backend!(
+        BackendChoice,
         a_multimodal_job_through_the_loop_matches_generate_with_inputs,
         a_multimodal_job_through_the_loop_matches_generate_with_inputs_wgpu,
-        a_multimodal_job_through_the_loop_matches_generate_with_inputs_rocm
+        a_multimodal_job_through_the_loop_matches_generate_with_inputs_rocm,
+        a_multimodal_job_through_the_loop_matches_generate_with_inputs_ptx
     );
     per_backend!(
+        BackendChoice,
         an_encoder_checkpoint_serves_embeddings_on_the_device,
         an_encoder_checkpoint_serves_embeddings_on_the_device_wgpu,
-        an_encoder_checkpoint_serves_embeddings_on_the_device_rocm
+        an_encoder_checkpoint_serves_embeddings_on_the_device_rocm,
+        an_encoder_checkpoint_serves_embeddings_on_the_device_ptx
     );
     per_backend!(
+        BackendChoice,
         an_encode_job_on_the_serving_driver_matches_a_fresh_drivers_encode,
         an_encode_job_on_the_serving_driver_matches_a_fresh_drivers_encode_wgpu,
-        an_encode_job_on_the_serving_driver_matches_a_fresh_drivers_encode_rocm
+        an_encode_job_on_the_serving_driver_matches_a_fresh_drivers_encode_rocm,
+        an_encode_job_on_the_serving_driver_matches_a_fresh_drivers_encode_ptx
     );
     per_backend!(
+        BackendChoice,
         a_hot_loaded_adapter_serves_requests_and_unload_frees_it,
         a_hot_loaded_adapter_serves_requests_and_unload_frees_it_wgpu,
-        a_hot_loaded_adapter_serves_requests_and_unload_frees_it_rocm
+        a_hot_loaded_adapter_serves_requests_and_unload_frees_it_rocm,
+        a_hot_loaded_adapter_serves_requests_and_unload_frees_it_ptx
     );
 }

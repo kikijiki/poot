@@ -38,6 +38,7 @@ use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostTensor};
+use poot_test_util::per_backend;
 use poot_text::{ChatFormat, HermesToolCodec};
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
@@ -588,10 +589,13 @@ fn assert_matches(beams: &[Beam], prompt: &[u32], reference: &Reference, rules: 
     }
 }
 
-fn device(
-    choice: BackendChoice,
-    backend: DeviceBackend,
-) -> Option<Box<dyn poot_executor::Executor>> {
+fn device(choice: BackendChoice) -> Option<Box<dyn poot_executor::Executor>> {
+    let backend = match choice {
+        BackendChoice::Wgpu => DeviceBackend::Wgpu,
+        BackendChoice::Rocm => DeviceBackend::Rocm,
+        BackendChoice::Ptx => DeviceBackend::Ptx,
+        other => panic!("the beam rows have no device row on {other:?}"),
+    };
     poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
 }
 
@@ -820,8 +824,8 @@ fn beam_or_panic<S: State>(driver: &mut Driver<S>, request: BeamRequest) -> Vec<
 /// ended beam, a live one, a ranking that changes between steps and a parent change.
 /// Mutations: expand each beam by `width` continuations instead of `2 * width` (`beam`: `breadth`); keep
 /// expanding a beam after EOS (`beam`: push the ended child to `children`).
-fn assert_beam_matches_the_reference(choice: BackendChoice, backend: DeviceBackend) {
-    let Some(executor) = device(choice, backend) else {
+fn assert_beam_matches_the_reference(choice: BackendChoice) {
+    let Some(executor) = device(choice) else {
         return;
     };
     let case = dense_case();
@@ -831,28 +835,21 @@ fn assert_beam_matches_the_reference(choice: BackendChoice, backend: DeviceBacke
     assert_matches(&beams, case.prompt, &case.reference(), case.rules());
 }
 
-#[test]
-fn beam_matches_the_host_reference_wgpu() {
-    assert_beam_matches_the_reference(BackendChoice::Wgpu, DeviceBackend::Wgpu);
-}
-
-#[test]
-fn beam_matches_the_host_reference_rocm() {
-    assert_beam_matches_the_reference(BackendChoice::Rocm, DeviceBackend::Rocm);
-}
+per_backend!(
+    BackendChoice,
+    assert_beam_matches_the_reference,
+    beam_matches_the_host_reference_wgpu,
+    beam_matches_the_host_reference_rocm,
+    beam_matches_the_host_reference_ptx
+);
 
 /// SC-002 (narrowed: the chosen token's log-probability at every step, not the whole logits row, which
 /// `Beam` does not expose): every returned beam's log-probability at every generated token equals the log-softmax of a
 /// fresh prefill of the beam's own token list on the oracle, so the state a beam decodes from after a
 /// reorder is the state of its own tokens. Mutation: skip the state reorder (`beam_reorder` returns
 /// before the gather); each row keeps its old state and the log-probabilities diverge.
-fn assert_reordered_beams_equal_a_fresh_prefill(
-    choice: BackendChoice,
-    backend: DeviceBackend,
-    case: Case,
-    name: &str,
-) {
-    let Some(executor) = device(choice, backend) else {
+fn assert_reordered_beams_equal_a_fresh_prefill(choice: BackendChoice, case: Case, name: &str) {
+    let Some(executor) = device(choice) else {
         return;
     };
     let (handle, _dir) = handle_of(&case, name);
@@ -875,51 +872,35 @@ fn assert_reordered_beams_equal_a_fresh_prefill(
     assert_matches(&beams, case.prompt, &case.reference(), case.rules());
 }
 
-#[test]
-fn reordered_dense_beams_equal_a_fresh_prefill_wgpu() {
-    assert_reordered_beams_equal_a_fresh_prefill(
-        BackendChoice::Wgpu,
-        DeviceBackend::Wgpu,
+per_backend!(
+    BackendChoice,
+    |choice| assert_reordered_beams_equal_a_fresh_prefill(
+        choice,
         dense_case(),
-        "beam_dense_reorder",
-    );
-}
+        "beam_dense_reorder"
+    ),
+    reordered_dense_beams_equal_a_fresh_prefill_wgpu,
+    reordered_dense_beams_equal_a_fresh_prefill_rocm,
+    reordered_dense_beams_equal_a_fresh_prefill_ptx
+);
 
-#[test]
-fn reordered_dense_beams_equal_a_fresh_prefill_rocm() {
-    assert_reordered_beams_equal_a_fresh_prefill(
-        BackendChoice::Rocm,
-        DeviceBackend::Rocm,
-        dense_case(),
-        "beam_dense_reorder",
-    );
-}
-
-#[test]
-fn reordered_recurrent_beams_equal_a_fresh_prefill_wgpu() {
-    assert_reordered_beams_equal_a_fresh_prefill(
-        BackendChoice::Wgpu,
-        DeviceBackend::Wgpu,
+per_backend!(
+    BackendChoice,
+    |choice| assert_reordered_beams_equal_a_fresh_prefill(
+        choice,
         recurrent_case(),
-        "beam_recurrent_reorder",
-    );
-}
-
-#[test]
-fn reordered_recurrent_beams_equal_a_fresh_prefill_rocm() {
-    assert_reordered_beams_equal_a_fresh_prefill(
-        BackendChoice::Rocm,
-        DeviceBackend::Rocm,
-        recurrent_case(),
-        "beam_recurrent_reorder",
-    );
-}
+        "beam_recurrent_reorder"
+    ),
+    reordered_recurrent_beams_equal_a_fresh_prefill_wgpu,
+    reordered_recurrent_beams_equal_a_fresh_prefill_rocm,
+    reordered_recurrent_beams_equal_a_fresh_prefill_ptx
+);
 
 /// SC-003, width 1: beam search at width 1 and length penalty 0 returns the tokens `Driver::generate`
 /// returns for the same greedy request (the end-of-sequence token, which `generate` leaves out, ends the
 /// beam).
-fn assert_width_one_beam_is_greedy(choice: BackendChoice, backend: DeviceBackend) {
-    let Some(executor) = device(choice, backend) else {
+fn assert_width_one_beam_is_greedy(choice: BackendChoice) {
+    let Some(executor) = device(choice) else {
         return;
     };
     let case = dense_case();
@@ -949,20 +930,18 @@ fn assert_width_one_beam_is_greedy(choice: BackendChoice, backend: DeviceBackend
     }
 }
 
-#[test]
-fn width_one_beam_is_the_greedy_loop_wgpu() {
-    assert_width_one_beam_is_greedy(BackendChoice::Wgpu, DeviceBackend::Wgpu);
-}
-
-#[test]
-fn width_one_beam_is_the_greedy_loop_rocm() {
-    assert_width_one_beam_is_greedy(BackendChoice::Rocm, DeviceBackend::Rocm);
-}
+per_backend!(
+    BackendChoice,
+    assert_width_one_beam_is_greedy,
+    width_one_beam_is_the_greedy_loop_wgpu,
+    width_one_beam_is_the_greedy_loop_rocm,
+    width_one_beam_is_the_greedy_loop_ptx
+);
 
 /// SC-003, penalty 1: the beams are ranked by score over the prompt-included length. Mutation: count
 /// the generated tokens only (`Ranking::score`: drop `self.prompt_len`); the two beams swap.
-fn assert_length_penalty_counts_the_prompt(choice: BackendChoice, backend: DeviceBackend) {
-    let Some(executor) = device(choice, backend) else {
+fn assert_length_penalty_counts_the_prompt(choice: BackendChoice) {
+    let Some(executor) = device(choice) else {
         return;
     };
     let case = length_case();
@@ -972,25 +951,23 @@ fn assert_length_penalty_counts_the_prompt(choice: BackendChoice, backend: Devic
     assert_matches(&beams, case.prompt, &case.reference(), case.rules());
 }
 
-#[test]
-fn penalty_one_ranks_by_the_prompt_included_length_wgpu() {
-    assert_length_penalty_counts_the_prompt(BackendChoice::Wgpu, DeviceBackend::Wgpu);
-}
-
-#[test]
-fn penalty_one_ranks_by_the_prompt_included_length_rocm() {
-    assert_length_penalty_counts_the_prompt(BackendChoice::Rocm, DeviceBackend::Rocm);
-}
+per_backend!(
+    BackendChoice,
+    assert_length_penalty_counts_the_prompt,
+    penalty_one_ranks_by_the_prompt_included_length_wgpu,
+    penalty_one_ranks_by_the_prompt_included_length_rocm,
+    penalty_one_ranks_by_the_prompt_included_length_ptx
+);
 
 /// SC-004: on a driver that prepared the paged pool, `beam` runs on contiguous entries of its own and
 /// returns the beams a contiguous driver returns. Mutation: run the row gather over the paged pool
 /// (`beam_key`: take the serving layout's `kv`); the paged pool's leading axis is blocks, not rows,
 /// and the beams diverge.
-fn assert_paged_beam_runs_on_contiguous_entries(choice: BackendChoice, backend: DeviceBackend) {
-    let Some(first) = device(choice, backend) else {
+fn assert_paged_beam_runs_on_contiguous_entries(choice: BackendChoice) {
+    let Some(first) = device(choice) else {
         return;
     };
-    let Some(second) = device(choice, backend) else {
+    let Some(second) = device(choice) else {
         return;
     };
     let case = dense_case();
@@ -1024,15 +1001,13 @@ fn assert_paged_beam_runs_on_contiguous_entries(choice: BackendChoice, backend: 
     );
 }
 
-#[test]
-fn paged_beam_runs_on_contiguous_entries_wgpu() {
-    assert_paged_beam_runs_on_contiguous_entries(BackendChoice::Wgpu, DeviceBackend::Wgpu);
-}
-
-#[test]
-fn paged_beam_runs_on_contiguous_entries_rocm() {
-    assert_paged_beam_runs_on_contiguous_entries(BackendChoice::Rocm, DeviceBackend::Rocm);
-}
+per_backend!(
+    BackendChoice,
+    assert_paged_beam_runs_on_contiguous_entries,
+    paged_beam_runs_on_contiguous_entries_wgpu,
+    paged_beam_runs_on_contiguous_entries_rocm,
+    paged_beam_runs_on_contiguous_entries_ptx
+);
 
 // ---------------------------------------------------------------------------------------------
 // Refusals and the last step, on a fake device: the real driver, engine and planner; only the device is

@@ -38,7 +38,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::PackedStack;
-use crate::{PackedPayload, PackedWeight, SourceChanged, SourceRole, StoredBytes};
+#[cfg(any(test, feature = "test-support"))]
+use crate::SourceRole;
+use crate::{PackedPayload, PackedWeight, SourceChanged, StoredBytes};
 
 /// The name a loader assigned one stored weight: the checkpoint tensor name for a dense entry, or
 /// the loader's linear id (built from that weight's several source tensors - `weight` and `scale`
@@ -1541,6 +1543,16 @@ pub enum WeightMapError {
         /// The axis the cut was requested on.
         axis: usize,
     },
+    /// [`WeightMap::check_store`] over a store whose entries read, for `id`, a different handle than the
+    /// map recorded: the map was built against another store.
+    StoreMismatch {
+        /// The weight whose view no longer reads what the map recorded.
+        id: WeightId,
+        /// What the map recorded.
+        mapped: Box<WeightHandle>,
+        /// What the store's entries give the view now.
+        stored: Box<WeightHandle>,
+    },
 }
 
 impl fmt::Display for WeightMapError {
@@ -1641,6 +1653,10 @@ impl fmt::Display for WeightMapError {
                 f,
                 "weight {id}: its view cannot be cut to a rank's share of axis {axis}"
             ),
+            Self::StoreMismatch { id, mapped, stored } => write!(
+                f,
+                "weight {id}: the map recorded {mapped:?} but the store gives its view {stored:?}"
+            ),
         }
     }
 }
@@ -1720,6 +1736,23 @@ impl WeightMap {
     /// Whether no weight is mapped.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Check that `store` is the one this map was built against: every view still reads entries of
+    /// `store`, and reads the handle the map recorded. A map built against another store fails with the
+    /// weight, the key or the two handles, so a binder never meets a missing entry or a short one.
+    pub fn check_store(&self, store: &WeightStore) -> Result<(), WeightMapError> {
+        for (&id, (view, mapped)) in &self.entries {
+            let stored = view_handle(id, view, store)?;
+            if &stored != mapped {
+                return Err(WeightMapError::StoreMismatch {
+                    id,
+                    mapped: Box::new(mapped.clone()),
+                    stored: Box::new(stored),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Where every key of `store` stands: read by a mapped weight, claimed as known, or unknown.
@@ -1931,27 +1964,15 @@ fn check_row_range(
     Ok(())
 }
 
-/// What a checked [`WeightView::BlockColumns`] cuts: `outer` runs of `extent` values on its axis, each
-/// value `inner` elements wide, `extent_product` elements in all; for a packed entry also the encoding
-/// block it must fall on.
-struct ColumnCut {
-    outer: usize,
-    extent: usize,
-    inner: usize,
-    extent_product: usize,
-    block_values: Option<usize>,
-    block_bytes: Option<usize>,
-}
-
 /// Check that `cols` is a non-empty range of axis `axis` (at least 1) of `entry`, and, for a packed
 /// entry, that it is the `K` axis cut on whole blocks of a block format.
-fn column_cut(
+fn check_columns(
     id: WeightId,
     key: &WeightKey,
     entry: &WeightEntry,
     axis: usize,
     cols: &std::ops::Range<usize>,
-) -> Result<ColumnCut, WeightMapError> {
+) -> Result<(), WeightMapError> {
     let shape = entry.shape();
     if axis == 0 || axis >= shape.len() {
         return Err(WeightMapError::ColumnAxis {
@@ -1970,7 +1991,6 @@ fn column_cut(
             available: extent,
         });
     }
-    let (mut block_values, mut block_bytes) = (None, None);
     if let WeightEntry::Packed(payload) = entry {
         let planar = || WeightMapError::ColumnsOfPlanar {
             id,
@@ -1991,15 +2011,48 @@ fn column_cut(
                 block_values: layout.values,
             });
         }
-        (block_values, block_bytes) = (Some(layout.values), Some(layout.bytes));
     }
+    Ok(())
+}
+
+/// What a checked [`WeightView::BlockColumns`] cuts: `outer` runs of `extent` values on its axis, each
+/// value `inner` elements wide, `extent_product` elements in all; for a packed entry also the encoding
+/// block it must fall on.
+#[cfg(any(test, feature = "test-support"))]
+struct ColumnCut {
+    outer: usize,
+    extent: usize,
+    inner: usize,
+    extent_product: usize,
+    block_values: Option<usize>,
+    block_bytes: Option<usize>,
+}
+
+/// [`check_columns`], then the geometry of the cut.
+#[cfg(any(test, feature = "test-support"))]
+fn column_cut(
+    id: WeightId,
+    key: &WeightKey,
+    entry: &WeightEntry,
+    axis: usize,
+    cols: &std::ops::Range<usize>,
+) -> Result<ColumnCut, WeightMapError> {
+    check_columns(id, key, entry, axis, cols)?;
+    let shape = entry.shape();
+    let layout = match entry {
+        WeightEntry::Packed(payload) => match payload.weight().format().descriptor().storage {
+            crate::format::Storage::Blocks(layout) => Some(layout),
+            crate::format::Storage::Planar(_) => None,
+        },
+        WeightEntry::Dense(_) => None,
+    };
     Ok(ColumnCut {
         outer: shape[..axis].iter().product(),
-        extent,
+        extent: shape[axis],
         inner: shape[axis + 1..].iter().product(),
         extent_product: shape.iter().product::<usize>().max(1),
-        block_values,
-        block_bytes,
+        block_values: layout.map(|layout| layout.values),
+        block_bytes: layout.map(|layout| layout.bytes),
     })
 }
 
@@ -2010,9 +2063,17 @@ fn packed_error(id: WeightId) -> impl FnOnce(crate::PackedWeightError) -> Weight
     }
 }
 
-/// The handle `view` materializes into, checked against the store without copying a dense byte.
-/// A packed view is checked by the payload operation [`materialize_view`] runs, so the map and the
-/// bytes follow one rule.
+fn packed_handle(weight: PackedWeight) -> WeightHandle {
+    WeightHandle {
+        shape: weight.shape().to_vec(),
+        format: HandleFormat::Packed(weight),
+    }
+}
+
+/// The handle `view` materializes into, checked against the store without copying a byte. A packed
+/// view is checked by the payload's shape-only rule ([`PackedPayload::gathered_weight`],
+/// [`PackedPayload::concatenated_weight`]) that the operation [`materialize_view`] runs first, so the
+/// map and the bytes follow one rule and a check costs no gather.
 fn view_handle(
     id: WeightId,
     view: &WeightView,
@@ -2032,7 +2093,11 @@ fn view_handle(
                         shape,
                     })
                 }
-                WeightEntry::Packed(_) => Ok(WeightHandle::of(&materialize_view(id, view, store)?)),
+                WeightEntry::Packed(payload) => {
+                    PackedPayload::gathered_weight(&[payload.as_ref()], rows.len())
+                        .map(packed_handle)
+                        .map_err(packed_error(id))
+                }
             }
         }
         WeightView::RowStack(parts) => {
@@ -2069,13 +2134,23 @@ fn view_handle(
                     })
                 }
                 HandleFormat::Packed(_) => {
-                    Ok(WeightHandle::of(&materialize_view(id, view, store)?))
+                    // `same_format` above admitted only packed parts.
+                    let payloads: Vec<&PackedPayload> = parts
+                        .iter()
+                        .filter_map(|key| match store.get(key.as_str()) {
+                            Some(WeightEntry::Packed(payload)) => Some(payload.as_ref()),
+                            _ => None,
+                        })
+                        .collect();
+                    PackedPayload::concatenated_weight(&payloads)
+                        .map(packed_handle)
+                        .map_err(packed_error(id))
                 }
             }
         }
         WeightView::BlockColumns { key, axis, cols } => {
             let entry = stored(id, key, store)?;
-            column_cut(id, key, entry, *axis, cols)?;
+            check_columns(id, key, entry, *axis, cols)?;
             match entry {
                 WeightEntry::Dense(dense) => {
                     let mut shape = dense.shape().to_vec();
@@ -2128,6 +2203,7 @@ fn view_handle(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn materialize_view(
     id: WeightId,
     view: &WeightView,
@@ -2324,6 +2400,7 @@ fn not_an_index_table(id: WeightId, key: &WeightKey, entry: &WeightEntry) -> Wei
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn mixed(id: WeightId, first: &WeightEntry, other: &WeightEntry) -> WeightMapError {
     WeightMapError::MixedParts {
         id,
@@ -2932,6 +3009,156 @@ mod tests {
                 rows: 4..6,
                 available: 3
             })
+        );
+    }
+
+    /// A store of `entries`.
+    fn store_of(entries: Vec<(&str, WeightEntry)>) -> WeightStore {
+        let mut b = WeightStore::builder();
+        for (key, entry) in entries {
+            b.insert(key, entry).unwrap();
+        }
+        b.build()
+    }
+
+    /// The map of `views` over `store`.
+    fn map_of(store: &WeightStore, views: Vec<(WeightId, WeightView)>) -> WeightMap {
+        let mut b = WeightMap::builder(store);
+        for (id, view) in views {
+            b.map(id, view).unwrap();
+        }
+        b.build()
+    }
+
+    fn row_range(key: &str, rows: std::ops::Range<usize>) -> WeightView {
+        WeightView::RowRange {
+            key: key.into(),
+            rows,
+        }
+    }
+
+    fn row_stack(keys: &[&str]) -> WeightView {
+        WeightView::RowStack(keys.iter().map(|key| WeightKey::from(*key)).collect())
+    }
+
+    /// The `StoreMismatch` shapes `map.check_store(forged)` refuses with.
+    fn mismatch_shapes(map: &WeightMap, forged: &WeightStore) -> (Vec<usize>, Vec<usize>) {
+        match map.check_store(forged) {
+            Err(WeightMapError::StoreMismatch { id, mapped, stored }) => {
+                assert_eq!(id, K);
+                (mapped.shape, stored.shape)
+            }
+            other => panic!("expected StoreMismatch, got {other:?}"),
+        }
+    }
+
+    /// The store the map was built over passes, for every view kind the check re-derives.
+    ///
+    /// Mutation: make the comparison in `check_store` always refuse (`if true || &stored != mapped`);
+    /// this row goes red with `Err(StoreMismatch ..)`.
+    #[test]
+    fn check_store_accepts_the_store_the_map_was_built_over() {
+        let store = view_store();
+        let map = map_of(
+            &store,
+            vec![
+                (Q, WeightView::Stored("qkv".into())),
+                (K, row_range("pqkv", 1..4)),
+                (GATE_UP, row_stack(&["pgate", "pup"])),
+            ],
+        );
+        assert_eq!(map.check_store(&store), Ok(()));
+    }
+
+    /// A store lacking a key a `RowRange` or `RowStack` view reads is `Missing`, naming the weight and key.
+    ///
+    /// Mutation: in `check_store`, skip a view `view_handle` refuses (`let Ok(stored) = .. else {
+    /// continue }`); this row goes red with `left: Ok(()) right: Err(Missing ..)`.
+    #[test]
+    fn check_store_refuses_a_store_missing_a_key_a_row_view_reads() {
+        let store = view_store();
+        let map = map_of(
+            &store,
+            vec![
+                (K, row_range("qkv", 1..3)),
+                (GATE_UP, row_stack(&["gate", "up"])),
+            ],
+        );
+        let without = |dropped: &str| {
+            let mut b = WeightStore::builder();
+            for key in ["qkv", "gate", "up"] {
+                if key != dropped {
+                    b.insert(key, ramp(6, 2, 0)).unwrap();
+                }
+            }
+            b.build()
+        };
+        assert_eq!(
+            map.check_store(&without("qkv")),
+            Err(WeightMapError::Missing {
+                id: K,
+                key: "qkv".into()
+            })
+        );
+        assert_eq!(
+            map.check_store(&without("up")),
+            Err(WeightMapError::Missing {
+                id: GATE_UP,
+                key: "up".into()
+            })
+        );
+    }
+
+    /// A smaller dense entry: a `RowRange` whose rows it no longer holds is `RowRangeOutOfBounds`; one
+    /// still inside it but narrower is `StoreMismatch` of the two shapes; a `RowStack` part with fewer
+    /// rows changes the stacked total, also `StoreMismatch`.
+    ///
+    /// Mutation: skip the `stored != mapped` comparison in `check_store`; the narrower and the shorter
+    /// stack load (`expected StoreMismatch, got Ok(())`) and these assertions go red.
+    #[test]
+    fn check_store_refuses_a_smaller_dense_entry() {
+        let built = store_of(vec![("a", ramp(6, 2, 0)), ("b", ramp(3, 2, 20))]);
+        let ranged = map_of(&built, vec![(K, row_range("a", 2..4))]);
+        assert_eq!(
+            ranged.check_store(&store_of(vec![("a", ramp(3, 2, 0))])),
+            Err(WeightMapError::RowRangeOutOfBounds {
+                id: K,
+                rows: 2..4,
+                available: 3
+            })
+        );
+        assert_eq!(
+            mismatch_shapes(&ranged, &store_of(vec![("a", ramp(6, 1, 0))])),
+            (vec![2, 2], vec![2, 1])
+        );
+        let stacked = map_of(&built, vec![(K, row_stack(&["a", "b"]))]);
+        assert_eq!(
+            mismatch_shapes(
+                &stacked,
+                &store_of(vec![("a", ramp(6, 2, 0)), ("b", ramp(2, 2, 20))])
+            ),
+            (vec![9, 2], vec![8, 2])
+        );
+    }
+
+    /// A packed entry of another `K` than the map recorded, under a `RowRange` or a `RowStack`: the
+    /// shape-only handle differs, so `StoreMismatch` names `[rows, 32]` against `[rows, 64]`.
+    ///
+    /// Mutation: compare only the row counts in `check_store` (`stored.shape[0] != mapped.shape[0]`); the
+    /// forged width is not seen (`expected StoreMismatch, got Ok(())`).
+    #[test]
+    fn check_store_refuses_a_packed_entry_of_another_width() {
+        let built = store_of(vec![("a", q4_rows(4, 0x10)), ("b", q4_rows(2, 0x40))]);
+        let wide = |rows| WeightEntry::Packed(packed_entry([rows, 64]));
+        let ranged = map_of(&built, vec![(K, row_range("a", 1..3))]);
+        assert_eq!(
+            mismatch_shapes(&ranged, &store_of(vec![("a", wide(4))])),
+            (vec![2, 32], vec![2, 64])
+        );
+        let stacked = map_of(&built, vec![(K, row_stack(&["a", "b"]))]);
+        assert_eq!(
+            mismatch_shapes(&stacked, &store_of(vec![("a", wide(4)), ("b", wide(2))])),
+            (vec![6, 32], vec![6, 64])
         );
     }
 

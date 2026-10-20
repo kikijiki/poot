@@ -74,11 +74,9 @@ context so no later dispatch reuses the queue.
 
 ## Is raw Vulkan or NPU a fourth production backend?
 
-Raw Vulkan is selectable (`--backend vulkan`) but is the lowest-priority backend; production is `wgpu` | `rocm` | `ptx`. The AMD XDNA2 and Intel NPU4 NPUs are experimental library devices, not backends you can serve with.
+Raw Vulkan is selectable (`--backend vulkan`) but is the lowest-priority backend; production is `wgpu` | `rocm` | `ptx`. The AMD XDNA2 and Intel NPU4 NPUs are experimental library devices, not backends you can serve with (see [Architecture: NPU Offload](../architecture/npu.mdx)).
 
 - Raw Vulkan implements the same executor contract as the others. It is verified on AMD (RADV) only; NVIDIA and Intel Vulkan drivers are untested.
-- The XDNA2 NPU runs F32 `add`, `sub` and `mul` programs, verified bit-exact against the CPU oracle on
-  integer-valued inputs and within 1e-5 on fractional ones, and nothing else. See [Architecture: NPU Offload](../architecture/npu.mdx).
 
 ## Tests skipped. Did verification pass?
 

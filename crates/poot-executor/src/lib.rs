@@ -26,7 +26,7 @@ pub use device::{
 };
 pub use engine::Engine;
 pub use error::{BindError, DeviceError, DispatchError, ExecError, LoadError};
-use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
+use poot_runtime_common::{BufferRole, DeviceIdentity, MemoryCounterSnapshot};
 use poot_tensor::{HostTensor, HostView};
 pub use shared_kernels::{SharedKernels, SharedKernelsMismatch};
 pub use timing::{DetailedTiming, DrainPolicy, TimingOptions};
@@ -326,6 +326,11 @@ pub trait Executor {
     /// read live; `None` where the runtime cannot say. Admission asks again at each decision instead of
     /// trusting the figure the device reported when it opened.
     fn free_memory_bytes(&self) -> Option<u64>;
+    /// The adapter and driver the executor's device runs on ([`Device::identity`]); `None` where the runtime
+    /// cannot say, and for an executor over several devices, which has no single one.
+    fn device_identity(&self) -> Option<DeviceIdentity> {
+        None
+    }
     /// A new executable over `store`, its consts bound by `weights`. Records both and uploads
     /// nothing: a weight's device lane is a per-program planning decision, so upload happens at
     /// `add_entry`, through the engine's residency map keyed by (store generation, stored byte

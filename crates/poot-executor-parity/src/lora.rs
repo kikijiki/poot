@@ -100,7 +100,7 @@ pub fn assert_batched_lora_matches_merged_weights(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn run_projection(
     exec: &mut dyn Executor,
     target: Target,

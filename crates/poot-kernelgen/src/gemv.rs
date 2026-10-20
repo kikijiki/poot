@@ -41,7 +41,7 @@ use poot_target::BufferStorage;
 /// `n_col = col % N` and `tot = len(out)`
 /// already generalize to any starting `col`. Zero when unchunked; the add is emitted only if `!= 0`, so
 /// zero-offset callers get unchanged IR.
-#[allow(clippy::too_many_arguments)] // one baked dimension or mode per argument, as in the sibling generators
+#[expect(clippy::too_many_arguments)] // one baked dimension or mode per argument, as in the sibling generators
 pub fn gemv_lds(
     name: &str,
     k: usize,

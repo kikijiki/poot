@@ -7,13 +7,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::cli::CloudChoice;
 use crate::cli::{ExecArgs, ImageArgs, LogsArgs, RunArgs};
 use crate::clock::{iso_in_minutes, new_exec_run_id, now_iso};
 use crate::db::{Db, ExecOwner, ExecReapReport, PodOwnerPrefix, ReapProtection, Run};
 use crate::image_resolve::{DigestResolver, RegistryV2Resolver, pin_image};
 use crate::logging::{list_logs, log, logs_dir, read_log_tail, run_streaming, set_log_sink};
 use crate::manifest::{Model, parse_manifest_models, select_models};
-use crate::runpod::{CreateSpec, Pod, RunPod};
+use crate::runpod::{CloudType, CreateSpec, Pod, RunPod};
 use crate::ssh::{self, Remote};
 
 /// The RunPod operations the orchestrator uses. Production is [`RunPod`]; tests fake it.
@@ -600,7 +601,7 @@ struct ExecPod {
 /// The image tag is resolved to a digest first, before the run row or any pod exists, and the pod is
 /// created from the digest reference: a tag that moves during the run cannot change the image. The run
 /// row records the digest reference, so only a pod kept warm for that same image is adopted.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn acquire_exec_pod<P: PodApi + ?Sized>(
     db: &Db,
     pods: &P,
@@ -716,7 +717,7 @@ fn acquire_exec_pod<P: PodApi + ?Sized>(
     let cfg = ProvisionCfg {
         gpu_types: &a.gpu_types,
         gpu_count: a.gpu_count,
-        cloud: &a.cloud,
+        cloud: a.cloud,
         image: &image,
         container_disk_gb: a.container_disk_gb,
         network_volume_id: None,
@@ -728,7 +729,7 @@ fn acquire_exec_pod<P: PodApi + ?Sized>(
         run_id,
         allowed_cuda_versions: &allowed_cuda,
     };
-    let (pod_id, host, port) = match provision_pod(pods, &cfg, env, |pid, _gpu| {
+    let (pod_id, host, port) = match provision_pod(pods, &cfg, env, |pid, _gpu, _cloud| {
         db.set_pod(run_id, pid, None, None)
     }) {
         Ok(v) => v,
@@ -1433,7 +1434,7 @@ struct ProvisionCfg<'a> {
     pub(crate) gpu_types: &'a str,
     /// GPUs per pod (multi-GPU, e.g. tensor-parallel).
     pub(crate) gpu_count: u32,
-    pub(crate) cloud: &'a str,
+    pub(crate) cloud: CloudChoice,
     pub(crate) image: &'a str,
     pub(crate) container_disk_gb: u32,
     pub(crate) network_volume_id: Option<&'a str>,
@@ -1532,6 +1533,44 @@ pub(crate) fn wait_for_ssh_endpoint(
     Err(anyhow!("no SSH endpoint within {}s", timeout.as_secs()))
 }
 
+/// Create the pod of one attempt in the first of `cfg.cloud`'s clouds that accepts it, and return it
+/// with that cloud. RunPod has no "any cloud" value, so `--cloud all` is this ordered fallback; the
+/// error is the last cloud's refusal.
+fn create_in_first_cloud<P: PodApi + ?Sized>(
+    pods: &P,
+    cfg: &ProvisionCfg,
+    env: &HashMap<String, String>,
+    gpu: &str,
+    attempt: u32,
+) -> Result<(Pod, CloudType)> {
+    let mut last = anyhow!("no cloud to rent from");
+    for &cloud_type in cfg.cloud.tiers() {
+        let spec = CreateSpec {
+            owner: cfg.owner,
+            run_id: cfg.run_id,
+            attempt,
+            image: cfg.image,
+            gpu_type_id: gpu,
+            cloud_type,
+            gpu_count: cfg.gpu_count,
+            container_disk_gb: cfg.container_disk_gb,
+            ports: &["22/tcp"],
+            env,
+            network_volume_id: cfg.network_volume_id,
+            data_center_ids: cfg.data_center_ids,
+            allowed_cuda_versions: cfg.allowed_cuda_versions,
+        };
+        match pods.create_pod(&spec) {
+            Ok(pod) => return Ok((pod, cloud_type)),
+            Err(e) => {
+                log(format!("  create in {cloud_type} failed: {e}"));
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
 /// Provision one GPU pod, rotating over `cfg.gpu_types` for up to `cfg.attempts` tries, and return its
 /// SSH endpoint. `on_create` gets the pod id right after creation (before the SSH wait) so callers can
 /// persist it and never leak a pod on a crash. A timed-out attempt deletes its pod before the next try.
@@ -1539,8 +1578,8 @@ fn provision_pod<P: PodApi + ?Sized>(
     pods: &P,
     cfg: &ProvisionCfg,
     env: &HashMap<String, String>,
-    // Called with (pod_id, gpu_type) right after creation; gpu_type is the attempt's actual GPU.
-    on_create: impl Fn(&str, &str) -> Result<()>,
+    // Called with (pod_id, gpu_type, cloud) right after creation; both are the attempt's actual values.
+    on_create: impl Fn(&str, &str, CloudType) -> Result<()>,
 ) -> Result<(String, String, u16)> {
     let gpus: Vec<&str> = cfg
         .gpu_types
@@ -1558,25 +1597,10 @@ fn provision_pod<P: PodApi + ?Sized>(
             "provision {attempt}/{}: {gpu} ({}) image={}",
             cfg.attempts, cfg.cloud, cfg.image
         ));
-        let spec = CreateSpec {
-            owner: cfg.owner,
-            run_id: cfg.run_id,
-            attempt,
-            image: cfg.image,
-            gpu_type_id: gpu,
-            cloud_type: cfg.cloud,
-            gpu_count: cfg.gpu_count,
-            container_disk_gb: cfg.container_disk_gb,
-            ports: &["22/tcp"],
-            env,
-            network_volume_id: cfg.network_volume_id,
-            data_center_ids: cfg.data_center_ids,
-            allowed_cuda_versions: cfg.allowed_cuda_versions,
-        };
-        match pods.create_pod(&spec) {
-            Ok(pod) => {
+        match create_in_first_cloud(pods, cfg, env, gpu, attempt) {
+            Ok((pod, cloud)) => {
                 // Hand the id to the caller immediately so a crash cannot leak the pod.
-                on_create(&pod.id, gpu)?;
+                on_create(&pod.id, gpu, cloud)?;
                 log(format!(
                     "  pod {} created; waiting up to {}s for SSH endpoint (large image - be patient)",
                     pod.id, cfg.timeout_s
@@ -1630,7 +1654,7 @@ fn provision<P: PodApi + ?Sized>(
     let cfg = ProvisionCfg {
         gpu_types: &a.gpu_types,
         gpu_count: 1,
-        cloud: &a.cloud,
+        cloud: a.cloud,
         image: &a.image,
         container_disk_gb: a.container_disk_gb,
         network_volume_id: a.network_volume_id.as_deref(),
@@ -1644,8 +1668,8 @@ fn provision<P: PodApi + ?Sized>(
     };
     // Persist the pod id right away so reap can find it after a crash, and record it in the `pods` table
     // as `provisioning` (spec 030); run_phases promotes it to `busy`.
-    provision_pod(rp, &cfg, &env, |id, gpu| {
-        db.create_pod_record(id, gpu, &a.cloud, &a.image)?;
+    provision_pod(rp, &cfg, &env, |id, gpu, cloud| {
+        db.create_pod_record(id, gpu, &cloud.to_string(), &a.image)?;
         db.set_pod(run_id, id, None, None)
     })
 }
@@ -2035,6 +2059,10 @@ mod tests {
         created: Cell<u32>,
         /// The image each create call asked for, in order.
         images: RefCell<Vec<String>>,
+        /// The REST body of every create call, in order: what RunPod would have been sent.
+        bodies: RefCell<Vec<serde_json::Value>>,
+        /// Makes every SECURE create fail the way RunPod does when that cloud has no capacity.
+        refuse_secure: Cell<bool>,
     }
 
     impl FakePods {
@@ -2069,6 +2097,12 @@ mod tests {
             let n = self.created.get() + 1;
             self.created.set(n);
             self.images.borrow_mut().push(spec.image.to_string());
+            self.bodies
+                .borrow_mut()
+                .push(crate::runpod::create_pod_body(spec));
+            if self.refuse_secure.get() && spec.cloud_type == CloudType::Secure {
+                bail!("create_pod failed (500): no SECURE capacity");
+            }
             let entry = (
                 format!("fake-pod-{n}"),
                 spec.owner.pod_name(spec.run_id, spec.attempt),
@@ -2118,7 +2152,7 @@ mod tests {
         ProvisionCfg {
             gpu_types: "NVIDIA L40S",
             gpu_count: 1,
-            cloud: "SECURE",
+            cloud: CloudChoice::Secure,
             image: "img",
             container_disk_gb: 10,
             network_volume_id: None,
@@ -2161,7 +2195,7 @@ mod tests {
             &cloud,
             &provision_cfg(&owner, "run-1"),
             &HashMap::new(),
-            |_, _| bail!("crashed before the pod was recorded"),
+            |_, _, _| bail!("crashed before the pod was recorded"),
         )
         .unwrap_err();
         assert!(format!("{crash:#}").contains("crashed before"), "{crash:#}");
@@ -2418,6 +2452,94 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].0.image, by_digest, "the run records what ran");
         assert_eq!(runs[0].0.pod_id.as_deref(), Some(pod.pod_id.as_str()));
+    }
+
+    /// `--cloud all` is not a RunPod value (it answers 400 to `cloudType: ALL`): provisioning sends SECURE,
+    /// and COMMUNITY only after SECURE is refused, and records the cloud the pod really landed in.
+    #[test]
+    fn cloud_all_falls_back_from_secure_to_community_on_the_wire() {
+        let owner = Db::open(":memory:").unwrap().pod_owner_prefix().unwrap();
+        let cloud = FakePods::default();
+        cloud.refuse_secure.set(true);
+        let cfg = ProvisionCfg {
+            cloud: CloudChoice::All,
+            ..provision_cfg(&owner, "run-1")
+        };
+        let landed = RefCell::new(None);
+
+        provision_pod(&cloud, &cfg, &HashMap::new(), |_, _, cloud| {
+            *landed.borrow_mut() = Some(cloud);
+            Ok(())
+        })
+        .unwrap();
+
+        let sent: Vec<_> = cloud
+            .bodies
+            .borrow()
+            .iter()
+            .map(|b| b["cloudType"].clone())
+            .collect();
+        assert_eq!(
+            sent,
+            [serde_json::json!("SECURE"), serde_json::json!("COMMUNITY")]
+        );
+        assert_eq!(*landed.borrow(), Some(CloudType::Community));
+        assert_eq!(cloud.ids().len(), 1);
+    }
+
+    /// When SECURE has capacity, `--cloud all` never asks COMMUNITY.
+    #[test]
+    fn cloud_all_stops_at_the_first_cloud_that_accepts() {
+        let owner = Db::open(":memory:").unwrap().pod_owner_prefix().unwrap();
+        let cloud = FakePods::default();
+        let cfg = ProvisionCfg {
+            cloud: CloudChoice::All,
+            ..provision_cfg(&owner, "run-1")
+        };
+
+        provision_pod(&cloud, &cfg, &HashMap::new(), |_, _, _| Ok(())).unwrap();
+
+        assert_eq!(cloud.bodies.borrow().len(), 1);
+        assert_eq!(cloud.bodies.borrow()[0]["cloudType"], "SECURE");
+    }
+
+    /// A single-cloud choice does not fall back: a refused SECURE stays refused.
+    #[test]
+    fn cloud_secure_does_not_fall_back_to_community() {
+        let owner = Db::open(":memory:").unwrap().pod_owner_prefix().unwrap();
+        let cloud = FakePods::default();
+        cloud.refuse_secure.set(true);
+
+        let err = provision_pod(
+            &cloud,
+            &provision_cfg(&owner, "run-1"),
+            &HashMap::new(),
+            |_, _, _| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("no SECURE capacity"), "{err:#}");
+        assert_eq!(cloud.bodies.borrow().len(), 1);
+    }
+
+    /// `--cloud` accepts the three choices in any case and rejects anything else at parse time.
+    #[test]
+    fn cloud_flag_parses_the_three_choices_and_nothing_else() {
+        let parse = |v: &str| {
+            Cli::try_parse_from(["poot-orchestrator", "exec", "--cmd", "true", "--cloud", v])
+        };
+        for (arg, want) in [
+            ("ALL", CloudChoice::All),
+            ("all", CloudChoice::All),
+            ("SECURE", CloudChoice::Secure),
+            ("community", CloudChoice::Community),
+        ] {
+            let Command::Exec(a) = parse(arg).unwrap().command else {
+                panic!("exec");
+            };
+            assert_eq!(a.cloud, want, "{arg}");
+        }
+        assert!(parse("ANY").is_err());
     }
 
     /// A registry that will not resolve the tag stops `exec` before the run row or any pod exists.

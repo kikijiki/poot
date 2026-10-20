@@ -456,6 +456,38 @@ class BenchmarkResultContractTests(unittest.TestCase):
         self.assertTrue(all(point["tpot_ms"]["p50"] > 0 for point in row["curve"]))
         self.assert_schema_valid(row)
 
+    def test_a_summary_over_few_iterations_is_the_median_and_range_with_no_tail_percentile(self):
+        def curve_of(iterations):
+            payload = valid_curve()
+            for point in payload["curve"]:
+                point["iters"] = [
+                    timed_request([point["isl"] + k * 0.1, point["isl"] + 2.0 + k * 0.1, point["isl"] + 4.0 + k * 0.1],
+                                  point["isl"] + 6.0 + k * 0.1)
+                    for k in range(iterations)
+                ]
+            return payload
+
+        few, _ = self.run_payload(curve_of(5), scenario=self.curve_scenario)
+        many, _ = self.run_payload(curve_of(20), scenario=self.curve_scenario)
+
+        for field in ("ttft_ms", "tpot_ms"):
+            self.assertEqual(sorted(few["curve"][0][field]), ["max", "min", "p50"], field)
+            self.assertEqual(sorted(many["curve"][0][field]), ["max", "min", "p50", "p90", "p99"], field)
+        self.assertLess(few["curve"][0]["ttft_ms"]["min"], few["curve"][0]["ttft_ms"]["max"])
+        # The ITL stream is token-weighted: five iterations of two gaps are ten samples, still under the threshold.
+        self.assertEqual(sorted(few["curve"][0]["itl_ms"]), ["max", "min", "p50"])
+        self.assert_schema_valid(few)
+        self.assert_schema_valid(many)
+
+    def test_an_external_tool_result_names_the_version_it_measured(self):
+        payload = row_level_single("vllm")
+        del payload["framework_version"]
+
+        row, _ = self.run_payload(payload, framework="vllm")
+
+        self.assertEqual(row["status"], "error")
+        self.assertIn("framework_version", row["reason"])
+
     def test_accepted_shapes_are_schema_valid_with_observer_metrics_unavailable(self):
         cases = (
             ("single", valid_single(), self.single_scenario),

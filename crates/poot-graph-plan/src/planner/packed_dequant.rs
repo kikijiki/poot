@@ -31,7 +31,7 @@ use poot_target::{Backend, DeviceCaps};
 /// Plan one imported packed equation. A descriptor card 542a's table does not admit for this op is
 /// refused with `Capability::PackedLowering`; a standalone `PackedDequant`, which no kernel lowers, with
 /// `Capability::ImportedKernelPlanning`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -100,7 +100,7 @@ pub(super) fn plan(
 /// `out[.., :] = decode(ids[..], :)`: the `PackedRowGather` equation (quantized token
 /// embeddings). Params `(words, ids, metadata, out)` - `eqn.inputs` is the one `Blocks` carrier then
 /// the row ids, bound to kernel params 1..=n in that order; one thread per output element.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn try_plan_row_gather(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -180,7 +180,7 @@ fn try_plan_row_gather(
 /// never touches this arm (`kernel_mapping::shape_launch` exempts every packed contraction request by
 /// type), since bumping the baked 64-lane workgroup would corrupt the fixed-size LDS tile regardless of
 /// the grid.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn try_plan_contraction(
     g: GraphTables<'_>,
     eqn: &Eqn,

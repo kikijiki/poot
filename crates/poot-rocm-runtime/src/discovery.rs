@@ -170,6 +170,23 @@ pub(crate) unsafe fn agent_name(funcs: &Funcs, agent: hsa_agent_t) -> Result<Str
     }
 }
 
+/// The loaded HSA runtime's `(major, minor)` version.
+pub(crate) unsafe fn runtime_version(funcs: &Funcs) -> Result<(u16, u16), RocmError> {
+    let (mut major, mut minor) = (0u16, 0u16);
+    // SAFETY: `HSA_SYSTEM_INFO_VERSION_MAJOR` and `_MINOR` each write one `uint16_t`.
+    unsafe {
+        check((funcs.hsa_system_get_info)(
+            bindings::HSA_SYSTEM_INFO_VERSION_MAJOR,
+            &mut major as *mut u16 as *mut c_void,
+        ))?;
+        check((funcs.hsa_system_get_info)(
+            bindings::HSA_SYSTEM_INFO_VERSION_MINOR,
+            &mut minor as *mut u16 as *mut c_void,
+        ))?;
+    }
+    Ok((major, minor))
+}
+
 pub(crate) unsafe fn agent_vendor(funcs: &Funcs, agent: hsa_agent_t) -> Result<String, RocmError> {
     // SAFETY: `HSA_AGENT_INFO_VENDOR_NAME` writes a NUL-terminated `char[64]` into the 64-byte `name`.
     unsafe {

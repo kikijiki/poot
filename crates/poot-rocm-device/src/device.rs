@@ -29,7 +29,7 @@ use poot_rocm_runtime::{
     BoundKernarg, DispatchSpan, KernelHandle, RocmBuffer, RocmContext, RocmContextOptions,
     RocmError,
 };
-use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot};
+use poot_runtime_common::{BufferRole, CompiledKernel, DeviceIdentity, MemoryCounterSnapshot};
 use poot_target::{AmdArch, Backend, BufferStorage, ElementKind, TargetId};
 
 use crate::error::RocmGpuError;
@@ -213,6 +213,10 @@ impl Device for RocmDevice {
 
     fn free_memory_bytes(&self) -> Option<u64> {
         self.ctx.vram_free_bytes()
+    }
+
+    fn identity(&self) -> Option<DeviceIdentity> {
+        self.ctx.identity()
     }
 
     fn allocate(

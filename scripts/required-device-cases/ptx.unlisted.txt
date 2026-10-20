@@ -1,34 +1,35 @@
-# Deliberately unlisted rows of `just test-device-ptx` (POOT-1125), one per line:
-# binary_id<TAB>test_name<TAB>reason. A row the lane runs and passes that is in neither
-# ptx.txt nor here fails scripts/check-required-cases.py (an exhaustive lane). Rows here are
-# not hardware coverage: each is host-only, and `just test` runs it. Sorted in canonical
-# (LC_ALL=C) order; every row must run in the lane or the gate fails.
-poot-ptx-device	device::tests::copy_launch_params_dispatches_the_real_elem_count_never_a_byte_capacity_word_count	pure host arithmetic on the launch parameters; opens no device. Runs under `just test` with the package's other host tests
-poot-ptx-device::bin/ptx-check	tests::missing_fixture_is_skipped_not_run	host-only check of the ptx-check binary's fixture handling: needs no device, and runs under `just test`
-poot-ptx-device::bin/ptx-check	tests::staged_fixture_is_run_not_skipped	host-only check of the ptx-check binary's fixture handling: needs no device, and runs under `just test`
-poot-ptx-runtime	context::caps_tests::a_pre_ampere_device_has_no_matrix_hardware_for_poots_kernels	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	context::caps_tests::every_attribute_lands_in_its_own_caps_field	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::a_sticky_device_fault_is_device_lost_and_the_next_call_is_poisoned	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::allocation_arithmetic_is_checked_before_native_allocation	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::allocation_initialization_failure_frees_before_returning	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::bf16_packed_word_rejected_by_dense_i32_bind	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::captured_graph_owns_dispatched_buffers_until_it_drops	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::children_delay_context_cleanup_and_preserve_dependency_order	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::cleanup_activation_failure_suppresses_context_dependent_destruction	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::cleanup_restores_foreign_and_no_current_states	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::context_construction_releases_each_acquired_handle_in_order	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::cross_device_operations_refuse_in_a_capture_outside_one_and_on_foreign_handles	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::event_pair_failure_destroys_the_first_event	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::every_non_dispatch_operation_refuses_while_a_capture_is_open	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::final_owner_release_unbinds_owner_or_restores_prior_context	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::final_owner_restore_failure_suppresses_primary_release	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::graph_instantiate_failure_destroys_partial_exec_then_graph	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::immutable_metadata_and_valid_copy_share_one_allocation_contract	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::module_lookup_failure_unloads_the_loaded_module	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::narrow_buffer_rejected_by_f32_operation_before_copy	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::native_counters_count_instantiations_launches_and_events	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::overflowing_partial_offset_makes_zero_copy_calls	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::rejected_oversized_write_makes_zero_copy_calls	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	tests::require_backend_tests::ptx_context_open_is_required_by_its_own_variable_only	host-only check of the require-variable logic; its output carries a skip-shaped line, so it can never be a required row
-poot-ptx-runtime	tests::surviving_graph_scopes_launch_and_sync_after_context_switch_or_clear	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
-poot-ptx-runtime	upload::tests::the_cursor_moves_only_past_a_ready_slot	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
+# Deliberately unlisted rows of `just test-device-ptx`, one per line: binary_id<TAB>test_name<TAB>reason.
+# A row the lane runs and passes that is in neither ptx.txt nor here fails scripts/check-required-cases.py;
+# a row that prints a skip report fails whether listed or not. Sorted in canonical (LC_ALL=C) order; every row must run in the lane or the gate fails.
+poot-ptx-device	device::tests::copy_launch_params_dispatches_the_real_elem_count_never_a_byte_capacity_word_count	PTX device-crate host row (launch parameter arithmetic); opens no device, and runs under `just test`
+poot-ptx-device::bin/ptx-check	tests::a_directory_with_no_fixture_is_not_a_pass	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
+poot-ptx-device::bin/ptx-check	tests::a_failed_comparison_fails_the_run	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
+poot-ptx-device::bin/ptx-check	tests::a_partial_directory_fails_only_when_ptx_is_required	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
+poot-ptx-device::bin/ptx-check	tests::missing_fixture_is_skipped_not_run	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
+poot-ptx-device::bin/ptx-check	tests::staged_fixture_is_run_not_skipped	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
+poot-ptx-runtime	context::caps_tests::a_pre_ampere_device_has_no_matrix_hardware_for_poots_kernels	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	context::caps_tests::every_attribute_lands_in_its_own_caps_field	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::a_sticky_device_fault_is_device_lost_and_the_next_call_is_poisoned	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::allocation_arithmetic_is_checked_before_native_allocation	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::allocation_initialization_failure_frees_before_returning	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::bf16_packed_word_rejected_by_dense_i32_bind	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::captured_graph_owns_dispatched_buffers_until_it_drops	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::children_delay_context_cleanup_and_preserve_dependency_order	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::cleanup_activation_failure_suppresses_context_dependent_destruction	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::cleanup_restores_foreign_and_no_current_states	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::context_construction_releases_each_acquired_handle_in_order	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::cross_device_operations_refuse_in_a_capture_outside_one_and_on_foreign_handles	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::event_pair_failure_destroys_the_first_event	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::every_non_dispatch_operation_refuses_while_a_capture_is_open	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::final_owner_release_unbinds_owner_or_restores_prior_context	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::final_owner_restore_failure_suppresses_primary_release	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::graph_instantiate_failure_destroys_partial_exec_then_graph	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::immutable_metadata_and_valid_copy_share_one_allocation_contract	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::module_lookup_failure_unloads_the_loaded_module	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::narrow_buffer_rejected_by_f32_operation_before_copy	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::native_counters_count_instantiations_launches_and_events	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::overflowing_partial_offset_makes_zero_copy_calls	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::rejected_oversized_write_makes_zero_copy_calls	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::require_backend_tests::ptx_context_open_is_required_by_its_own_variable_only	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::surviving_graph_scopes_launch_and_sync_after_context_switch_or_clear	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	upload::tests::the_cursor_moves_only_past_a_ready_slot	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`

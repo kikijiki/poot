@@ -312,7 +312,7 @@ impl Reference {
     /// The compressed entries of window `w` of a compressor: `rate` positions of `kv`/`gate`
     /// (raw histories), pooled disjointly or, for `overlapping`, with the previous window's first
     /// half; normed and rotated at the window's first position.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn window_entry(
         &self,
         prefix: &str,

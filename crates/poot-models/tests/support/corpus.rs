@@ -148,6 +148,16 @@ impl Fixtured {
                 }]
             }
         };
+        Self::at(label, config, model, shapes)
+    }
+
+    /// A fixture of an already built `model`, traced at `shapes`.
+    pub(crate) fn at(
+        label: String,
+        config: serde_json::Value,
+        model: Arc<dyn Model>,
+        shapes: Vec<Shape>,
+    ) -> Self {
         Self {
             label,
             config,

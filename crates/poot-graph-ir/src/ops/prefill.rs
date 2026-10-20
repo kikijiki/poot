@@ -44,7 +44,7 @@ pub fn attention_prefill(
 /// [`attention_prefill`] with optional Gemma2/Grok attention-logit softcapping. `Some(c)` applies
 /// `c * tanh(scores / c)` ([`softcap`]) to the scaled `Q K^T` scores BEFORE the causal mask and softmax;
 /// `None` is byte-identical to [`attention_prefill`] (no extra eqns). One definition.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn attention_prefill_softcap(
     b: &Builder,
@@ -460,7 +460,7 @@ pub fn cumulative_log_decay_scan(
 /// (FR-005, [`zero_pad_seq`]) and the output truncated back to `L`; the padded tail is inert (zero
 /// `k`/`v`/`beta` never contribute, zero `g` never changes cumulative decay). Returns
 /// `(o [1,H_v,L,D], s_out [1,H_v,D,D])`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn gdn_prefill_chunked(
     b: &Builder,
@@ -582,7 +582,7 @@ pub fn gdn_prefill_chunked(
 /// `concat(o, s_out)` along the sequence axis, `[1, H, L + D, D]` (one value, so the single-result `Eqn` and
 /// `Decomposition` carry it; `crate::ScanLayout` names the rows). The chain is [`gdn_prefill_chunked`]
 /// itself with its triangular tables computed in-graph, so there is one semantic definition.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn scan_delta_rule_packed(
     b: &Builder,

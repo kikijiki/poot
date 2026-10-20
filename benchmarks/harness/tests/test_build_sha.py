@@ -1,4 +1,5 @@
-"""The half of provenance the harness cannot see: which sha build.rs embeds in the runner binary.
+"""The half of provenance the harness cannot see: which sha, profile, features and compiler build.rs embeds in
+the runner binary.
 
 build.rs is compiled with rustc once and run as cargo would run it (CARGO_MANIFEST_DIR set) against
 temporary git checkouts and against a copy with no .git, so the rules are tested on the real file.
@@ -44,17 +45,30 @@ class BuildShaTests(unittest.TestCase):
         run([*git, "commit", "-q", "-m", "first"])
         return root, run([*git, "rev-parse", "HEAD"]).stdout.strip()
 
-    def build(self, root, exported=None):
-        env = {k: v for k, v in os.environ.items() if k != "POOT_BUILD_SHA"}
-        env["CARGO_MANIFEST_DIR"] = str(root / MANIFEST_SUBDIR)
+    def build_with_env(self, root, exported=None, **cargo):
+        """Run build.rs as cargo would: the variables cargo sets, plus `cargo` overrides. Returns the process and
+        every `cargo:rustc-env=NAME=VALUE` it printed."""
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k != "POOT_BUILD_SHA" and not k.startswith("CARGO_FEATURE_")
+        }
+        env.update(PROFILE="release", RUSTC="rustc", CARGO_MANIFEST_DIR=str(root / MANIFEST_SUBDIR))
+        env.update(cargo)
         if exported is not None:
             env["POOT_BUILD_SHA"] = exported
         done = subprocess.run(
             [str(self.script)], capture_output=True, text=True, check=False, env=env
         )
-        prefix = "cargo:rustc-env=POOT_BUILD_SHA="
-        embedded = [line[len(prefix):] for line in done.stdout.splitlines() if line.startswith(prefix)]
-        return done, (embedded[0] if embedded else None)
+        prefix = "cargo:rustc-env="
+        embedded = dict(
+            line[len(prefix):].split("=", 1) for line in done.stdout.splitlines() if line.startswith(prefix)
+        )
+        return done, embedded
+
+    def build(self, root, exported=None):
+        done, embedded = self.build_with_env(root, exported)
+        return done, embedded.get("POOT_BUILD_SHA")
 
     def export(self, root):
         """The same sources with no .git, as a source export would be."""
@@ -69,6 +83,36 @@ class BuildShaTests(unittest.TestCase):
 
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(embedded, head)
+
+    def test_the_profile_features_and_compiler_are_embedded(self):
+        root, _ = self.make_checkout()
+
+        done, embedded = self.build_with_env(
+            root, PROFILE="debug", CARGO_FEATURE_ROCM="1", CARGO_FEATURE_FAST_MATH="1"
+        )
+
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(embedded["POOT_BUILD_PROFILE"], "debug")
+        self.assertEqual(embedded["POOT_BUILD_FEATURES"], "fast_math,rocm")
+        self.assertEqual(embedded["POOT_RUSTC_VERSION"], run(["rustc", "--version"]).stdout.strip())
+
+    def test_no_features_embed_an_empty_list(self):
+        root, _ = self.make_checkout()
+
+        done, embedded = self.build_with_env(root)
+
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(embedded["POOT_BUILD_FEATURES"], "")
+
+    def test_a_build_outside_cargo_has_no_profile_and_fails(self):
+        root, _ = self.make_checkout()
+        env = {k: v for k, v in os.environ.items() if k not in ("PROFILE", "POOT_BUILD_SHA")}
+        env["CARGO_MANIFEST_DIR"] = str(root / MANIFEST_SUBDIR)
+
+        done = subprocess.run([str(self.script)], capture_output=True, text=True, check=False, env=env)
+
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("cargo sets PROFILE", done.stderr)
 
     def test_tracked_edit_to_a_build_input_marks_the_sha_dirty(self):
         root, head = self.make_checkout()

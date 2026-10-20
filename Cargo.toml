@@ -75,6 +75,9 @@ rust-version = "1.101"
 [workspace.lints.clippy]
 ignore_without_reason = "deny"
 wildcard_imports = "deny"
+# An outer `#[allow]` hides a lint that stops firing; `#[expect]` fails once the lint is gone (R2-L13-014). Inner
+# `#![allow]` attributes, which clippy leaves alone, remain the way to share a test support module across binaries.
+allow_attributes = "deny"
 
 # A held `#[expect(dead_code, reason = "held for POOT-N")]` must fail once its item gains a caller: the
 # expectation is then unfulfilled, and `unfulfilled_lint_expectations` is warn-by-default. Deny it everywhere.

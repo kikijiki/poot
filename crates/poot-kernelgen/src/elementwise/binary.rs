@@ -22,7 +22,7 @@ use super::{
 /// `fold_groups` over the output's element count launches the matching grid. The caller must bake
 /// `workgroup_size = [ELEMENTWISE_2D_WIDTH, 1, 1]` on the returned `Body`; this function leaves the
 /// default `[64,1,1]` because it cannot see `poot-graph-plan`'s constant.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn binary_broadcast_dt_views_grid(
     name: &str,
     op: BinOp,
@@ -41,7 +41,6 @@ pub fn binary_broadcast_dt_views_grid(
 
 /// Exact unsigned comparison over I32 storage bit patterns. Operands are bitcast to U32 for the
 /// comparison; the bool result is written as I32 zero or one.
-#[allow(clippy::too_many_arguments)]
 pub fn binary_broadcast_i32_geu_views_grid(
     name: &str,
     out_shape: &[usize],
@@ -67,7 +66,6 @@ pub fn binary_broadcast_i32_geu_views_grid(
 
 /// Exact unsigned remainder over I32 storage bit patterns. Operands are bitcast to U32 for the
 /// remainder; the u32 result is bitcast back to the I32 storage pattern.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn binary_broadcast_i32_remu_views_grid(
     name: &str,
     out_shape: &[usize],
@@ -91,7 +89,7 @@ pub(crate) fn binary_broadcast_i32_remu_views_grid(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn binary_broadcast_typed_views_grid(
     name: &str,
     op: BinOp,

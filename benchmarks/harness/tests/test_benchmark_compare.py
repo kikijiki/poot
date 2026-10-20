@@ -10,6 +10,7 @@ sys.path.insert(0, str(HARNESS_DIR))
 
 import bench  # noqa: E402
 import performance_receipt as receipts  # noqa: E402
+from runner_fixtures import POOT_IDENTITY  # noqa: E402
 
 DEVICE = "fixture-gpu"
 
@@ -24,7 +25,9 @@ def result_row(tok_s, *, backend="ptx", device=DEVICE, binary="bin-1", status="o
         "backend": backend,
         "device": device,
         "binary_sha256": binary,
+        **POOT_IDENTITY,
         "build_sha": binary.ljust(40, "0"),
+        "profiled": False,
         "prompt_tokens": 3,
         "gen_tokens": 4,
     }

@@ -31,14 +31,9 @@ fn row_block(operand: &PlanarOperand) -> Option<usize> {
 }
 
 impl PackedPayload {
-    /// `parts` stacked along `out` in order (a fused `gate||up` expert from its `gate_proj` and
-    /// `up_proj`), byte for byte and never through a decode. The parts must share one format and
-    /// `K`. A block format stacks whole stored rows ([`Self::gather_rows`]). A planar format stacks
-    /// each operand's source tensor, which is the stacked weight's source only when every operand
-    /// stores its rows out-major and every part is a whole number of that operand's row blocks: an
-    /// `E4m3Block128` part must have a multiple of 128 rows, or its last 128x128 scale block would
-    /// cover rows of the next part. Both are refused with a typed error before any byte is copied.
-    pub fn concat_rows(parts: &[&Self]) -> Result<Self, PackedWeightError> {
+    /// The weight [`Self::concat_rows`] yields for `parts`, checked without touching a byte: the parts share
+    /// one format and `K`, and a planar format's parts are whole row blocks of every operand.
+    pub fn concatenated_weight(parts: &[&Self]) -> Result<PackedWeight, PackedWeightError> {
         let Some(first) = parts.first().map(|part| part.weight) else {
             return Err(PackedWeightError::RowConcatEmpty);
         };
@@ -52,7 +47,7 @@ impl PackedPayload {
         }
         let rows: usize = parts.iter().map(|part| part.weight.shape()[0]).sum();
         let Storage::Planar(layout) = format.descriptor().storage else {
-            return Self::gather_rows(parts, &(0..rows).collect::<Vec<_>>());
+            return Self::gathered_weight(parts, rows);
         };
         for operand in layout.operands {
             let role = operand.role;
@@ -70,7 +65,23 @@ impl PackedPayload {
                 });
             }
         }
-        let weight = PackedWeight::try_new(format, [rows, first.shape()[1]])?;
+        PackedWeight::try_new(format, [rows, first.shape()[1]])
+    }
+
+    /// `parts` stacked along `out` in order (a fused `gate||up` expert from its `gate_proj` and
+    /// `up_proj`), byte for byte and never through a decode. The parts must share one format and
+    /// `K`. A block format stacks whole stored rows ([`Self::gather_rows`]). A planar format stacks
+    /// each operand's source tensor, which is the stacked weight's source only when every operand
+    /// stores its rows out-major and every part is a whole number of that operand's row blocks: an
+    /// `E4m3Block128` part must have a multiple of 128 rows, or its last 128x128 scale block would
+    /// cover rows of the next part. Both are refused with a typed error before any byte is copied.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn concat_rows(parts: &[&Self]) -> Result<Self, PackedWeightError> {
+        let weight = Self::concatenated_weight(parts)?;
+        let Storage::Planar(layout) = weight.format().descriptor().storage else {
+            let rows = weight.shape()[0];
+            return Self::gather_rows(parts, &(0..rows).collect::<Vec<_>>());
+        };
         let sources: Vec<(SourceRole, StoredBytes)> = layout
             .operands
             .iter()

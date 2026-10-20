@@ -1045,7 +1045,6 @@ fn fill(seed: u64, count: usize) -> Vec<f32> {
 /// `x_key` bound to `activation` (`[rows, K]`) and every named dense `[OUT]`-or-`[1, OUT]` const in `consts`
 /// bound by name; the output read back, with the numerics class the compiled program publishes: the class
 /// the output is compared with the oracle within.
-#[allow(clippy::too_many_arguments)]
 fn run_dense_activation(
     engine: &mut Engine<RocmDevice>,
     target: Target,

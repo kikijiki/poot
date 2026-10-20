@@ -1,7 +1,0 @@
-
-running 1 test
-test driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx has been running for over 60 seconds
-test driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 659 filtered out; finished in 3622.59s
-

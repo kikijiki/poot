@@ -22,10 +22,15 @@ poot-models.workspace = true
 poot-profile.workspace = true
 poot-quant.workspace = true
 anyhow.workspace = true
+blake3.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+poot-models = { workspace = true, features = ["test-support"] }
+poot-quant = { workspace = true, features = ["test-support"] }
 poot-runtime-common.workspace = true
+poot-tensor.workspace = true
+tokenizers.workspace = true
 
 [lints]
 workspace = true

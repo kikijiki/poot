@@ -206,6 +206,35 @@ impl Fixture {
         }
     }
 
+    /// A checkpoint of `config` holding one all-zero BF16 tensor per `(key, shape)`, for a test that reads
+    /// only the traced graph at a real checkpoint's dimensions: the zero pages are never touched, so a
+    /// 27B-parameter store costs address space and no time.
+    #[cfg(feature = "test-support")]
+    pub fn zeroed_bf16(
+        config: serde_json::Value,
+        tensors: impl IntoIterator<Item = (String, Vec<usize>)>,
+    ) -> Self {
+        let mut store = WeightStore::builder();
+        for (key, shape) in tensors {
+            let bytes = vec![0u8; 2 * shape.iter().product::<usize>()];
+            let dense = poot_quant::weights::DenseWeight::try_new(
+                poot_tensor::DType::BF16,
+                shape,
+                bytes.into(),
+            )
+            .expect("zero bytes match their shape");
+            store
+                .insert(key, poot_quant::weights::WeightEntry::Dense(dense))
+                .expect("fixture keys are unique");
+        }
+        Self {
+            config,
+            generation: None,
+            preprocessor: None,
+            store: store.build(),
+        }
+    }
+
     /// The fixture as a [`RawConfig`] borrowing its config and generation config.
     pub fn raw(&self) -> RawConfig<'_> {
         RawConfig::HfJson {

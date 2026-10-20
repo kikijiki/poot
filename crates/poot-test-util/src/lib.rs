@@ -14,6 +14,41 @@ pub mod device_caps;
 pub mod qwen_vl;
 pub mod smolvlm;
 
+/// The directory NVPTX kernels are staged into for `ptx-check`: `$POOT_PTX_STAGE_DIR` when the PTX lane sets it (to a
+/// directory it makes fresh for the run), else a per-process directory under the temp dir that nothing else reads.
+pub fn ptx_stage_dir() -> std::path::PathBuf {
+    std::env::var_os("POOT_PTX_STAGE_DIR").map_or_else(
+        || std::env::temp_dir().join(format!("poot-ptx-stage-{}", std::process::id())),
+        std::path::PathBuf::from,
+    )
+}
+
+/// Declare a device row once and run it on every backend that can host it: `per_backend!(BackendChoice, row, a_wgpu,
+/// a_rocm, a_ptx)` expands to three `#[test]` functions, each calling `row` with its `$choice` variant (`Wgpu`,
+/// `Rocm`, `Ptx`), so a lane names each by its suffix (`_wgpu`, `_rocm`, `_ptx`) and a backend cannot be left out.
+/// `row` is a function or closure taking the choice. A row on a host without the device skips through the
+/// requirement gate (`poot_runtime_common::device_skip`), as every device row does; a ROCm row on a build
+/// without the `rocm` feature skips the same way.
+#[macro_export]
+macro_rules! per_backend {
+    ($choice:ident, $row:expr, $wgpu:ident, $rocm:ident, $ptx:ident) => {
+        #[test]
+        fn $wgpu() {
+            ($row)($choice::Wgpu);
+        }
+
+        #[test]
+        fn $rocm() {
+            ($row)($choice::Rocm);
+        }
+
+        #[test]
+        fn $ptx() {
+            ($row)($choice::Ptx);
+        }
+    };
+}
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};

@@ -61,7 +61,8 @@ def exists(ref, doc=None):
 
 
 def recipes(justfile_text):
-    return set(re.findall(r"^([a-z][\w-]*)\b[^:=\n]*:(?!=)", justfile_text, flags=re.MULTILINE))
+    """A recipe line is a name, its parameters (which may have defaults) and a colon; `name := value` is a variable."""
+    return set(re.findall(r"^([a-z][\w-]*)(?:[ \t]+[^:\n]*)?:(?!=)", justfile_text, flags=re.MULTILINE))
 
 
 class NamedFilesExistTests(unittest.TestCase):
@@ -72,8 +73,11 @@ class NamedFilesExistTests(unittest.TestCase):
                     self.assertTrue(exists(ref, doc), f"{doc.relative_to(REPO_ROOT)} names {ref}, which does not exist")
 
     def test_every_recipe_the_docs_name_exists(self):
-        known = recipes((BENCH_ROOT / "justfile").read_text())
+        # The image and sweep recipes live in the benchmarks justfile; the bench recipes the README documents
+        # (`bench-record`, `bench-compare`, `test-bench-harness`) live in the repository's.
+        known = recipes((BENCH_ROOT / "justfile").read_text()) | recipes((REPO_ROOT / "justfile").read_text())
         self.assertIn("harness-test", known)
+        self.assertIn("bench-compare", known)
         for doc in DOCS:
             for name in sorted(set(_JUST_RECIPE.findall(doc.read_text()))):
                 with self.subTest(doc=doc.name, recipe=name):

@@ -556,7 +556,7 @@ pub(crate) fn first_writes(b: &Builder, step: &Step) -> Result<Vec<Traced>, Trac
 /// written into it and carried to the next step; returns the `[rows, hkv, capacity, d]` cache
 /// attention reads, in logical order. A pool and a private cache are different buffers, so they
 /// carry different names: one executable can hold both without a schema clash.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn carried_cache(
     b: &Builder,
     step: &Step,

@@ -13,7 +13,7 @@ use poot_executor::{
     Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind, MeasuredDeviceTime,
 };
 use poot_graph_plan::Target;
-use poot_runtime_common::{BufferRole, CompiledKernel};
+use poot_runtime_common::{BufferRole, CompiledKernel, DeviceIdentity};
 use poot_target::{Backend, BufferStorage, TargetId};
 use poot_wgpu_runtime::{CachedDispatch, Context, ContextOptions, DeviceBuffer, RuntimeError};
 use std::num::NonZeroUsize;
@@ -165,6 +165,10 @@ impl Device for WgpuDevice {
 
     fn free_memory_bytes(&self) -> Option<u64> {
         self.ctx.vram_free_bytes()
+    }
+
+    fn identity(&self) -> Option<DeviceIdentity> {
+        Some(self.ctx.identity())
     }
 
     fn allocate(

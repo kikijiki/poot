@@ -108,7 +108,7 @@ enum WeightRead {
     Nk(WeightLane),
 }
 
-#[allow(clippy::too_many_arguments)] // shapes plus the epilogue/weight/fold modes the public entry points fix
+#[expect(clippy::too_many_arguments)] // shapes plus the epilogue/weight/fold modes the public entry points fix
 fn matmul_batched_impl(
     name: &str,
     dt: Ty,

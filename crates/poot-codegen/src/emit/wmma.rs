@@ -370,7 +370,7 @@ impl<'a> Emitter<'a> {
 
     // ---- dispatch (target-neutral entry points, card 530) -------------------------------------------
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn emit_wmma_load(
         &mut self,
         which: poot_kernel_ir::WmmaMat,
@@ -398,7 +398,7 @@ impl<'a> Emitter<'a> {
 
     /// WMMA-load an A/B fragment from a workgroup-local (LDS) array (the dequant gemm stages a bf16 B-tile
     /// there); same intrinsic as `emit_wmma_load` with the LDS global addrspacecast to generic. NVPTX-only.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn emit_wmma_load_lds(
         &mut self,
         which: poot_kernel_ir::WmmaMat,
@@ -571,7 +571,7 @@ impl<'a> Emitter<'a> {
         self.store_place(&Place::local(dst), &frag, frag_ty, w)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn emit_wmma_mma(
         &mut self,
         dtype: poot_kernel_ir::WmmaDtype,

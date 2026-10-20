@@ -14,7 +14,7 @@ use crate::types::{StorageKind, ValueStorage};
 use poot_target::{Backend, DeviceCaps};
 
 /// Plan one packed-reader equation (DenseContraction/DenseRowGather/PackI8/UnpackI8).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -262,7 +262,7 @@ pub(super) fn plan(
 /// The dense decode GEMV over an `[N, K]` weight held in `weight` storage, with `epilogue` applied to each column's
 /// sum: one generated body per storage, launch and epilogue, shape-generic (`K` and `N` ride in its metadata), so
 /// every weight dtype and backend takes the same loop nest (Card 727).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn dense_gemv(
     site: Site<'_>,
     backend: Backend,
