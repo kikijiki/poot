@@ -4,29 +4,83 @@
  * work well for content-centric websites.
  */
 
-/* You can override the default Infima variables here. */
+/*
+ * poot palette. Coral puff on warm ink.
+ *   ink      #1a1420  (dark background, hero, footer)
+ *   surface  #241c2b  (dark cards and surfaces)
+ *   rose     #d1344f  (primary, light mode)
+ *   coral    #ff8fa3  (primary, dark mode)
+ *   mint     #5eead4  (accent)
+ */
 :root {
-  --ifm-color-primary: #2e8555;
-  --ifm-color-primary-dark: #29784c;
-  --ifm-color-primary-darker: #277148;
-  --ifm-color-primary-darkest: #205d3b;
-  --ifm-color-primary-light: #33925d;
-  --ifm-color-primary-lighter: #359962;
-  --ifm-color-primary-lightest: #3cad6e;
-  --ifm-code-font-size: 95%;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+  --poot-ink: #1a1420;
+  --poot-surface: #241c2b;
+  --poot-line: #2f2535;
+  --poot-coral: #ff8fa3;
+  --poot-accent: #5eead4;
+
+  --ifm-color-primary: #d1344f;
+  --ifm-color-primary-dark: #c02b45;
+  --ifm-color-primary-darker: #b52941;
+  --ifm-color-primary-darkest: #952236;
+  --ifm-color-primary-light: #d64961;
+  --ifm-color-primary-lighter: #d8546b;
+  --ifm-color-primary-lightest: #df7486;
+
+  --ifm-background-color: #fffaf9;
+  --ifm-font-family-monospace: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas,
+    'Liberation Mono', monospace;
+  --ifm-code-font-size: 92%;
+  --ifm-code-border-radius: 0.3rem;
+  --ifm-global-radius: 0.5rem;
+  --ifm-footer-background-color: var(--poot-ink);
+  --docusaurus-highlighted-code-line-bg: rgba(209, 52, 79, 0.1);
 }
 
-/* For readability concerns, you should choose a lighter palette in dark mode. */
 [data-theme='dark'] {
-  --ifm-color-primary: #25c2a0;
-  --ifm-color-primary-dark: #21af90;
-  --ifm-color-primary-darker: #1fa588;
-  --ifm-color-primary-darkest: #1a8870;
-  --ifm-color-primary-light: #29d5b0;
-  --ifm-color-primary-lighter: #32d8b4;
-  --ifm-color-primary-lightest: #4fddbf;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+  --ifm-color-primary: #ff8fa3;
+  --ifm-color-primary-dark: #f9809a;
+  --ifm-color-primary-darker: #f57690;
+  --ifm-color-primary-darkest: #e85a78;
+  --ifm-color-primary-light: #ff9cae;
+  --ifm-color-primary-lighter: #ffa6b6;
+  --ifm-color-primary-lightest: #ffbfcb;
+
+  --ifm-background-color: var(--poot-ink);
+  --ifm-background-surface-color: var(--poot-surface);
+  --ifm-navbar-background-color: var(--poot-ink);
+  --ifm-color-emphasis-200: var(--poot-line);
+  --ifm-toc-border-color: var(--poot-line);
+  --ifm-hr-border-color: var(--poot-line);
+  --docusaurus-highlighted-code-line-bg: rgba(255, 143, 163, 0.12);
+}
+
+/* Navbar: a hairline instead of the default drop shadow, monospace wordmark. */
+.navbar {
+  box-shadow: none;
+  border-bottom: 1px solid var(--ifm-color-emphasis-200);
+}
+
+.navbar__title {
+  font-family: var(--ifm-font-family-monospace);
+  font-weight: 700;
+  font-size: 1.15rem;
+  letter-spacing: -0.02em;
+}
+
+.navbar__logo {
+  height: 1.9rem;
+}
+
+/* Footer: same ink as the hero in both modes. */
+.footer--dark {
+  --ifm-footer-background-color: var(--poot-ink);
+  border-top: 1px solid var(--poot-line);
+}
+
+/* Sidebar: mark the active page with a bar in the primary color. */
+.menu__link--active:not(.menu__link--sublist) {
+  box-shadow: inset 3px 0 0 var(--ifm-color-primary);
 }
 
 /* Shared matrix status badges (the feature-matrix markdown tables). */

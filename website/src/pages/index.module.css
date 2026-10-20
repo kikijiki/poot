@@ -4,10 +4,42 @@
  */
 
 .heroBanner {
-  padding: 4rem 0;
+  padding: 4.5rem 0 4rem;
   text-align: center;
   position: relative;
   overflow: hidden;
+  color: #f3eaf0;
+  /* Ink in both color modes, with a faint dot grid like a graph canvas. */
+  background-color: var(--poot-ink);
+  background-image: radial-gradient(rgba(255, 143, 163, 0.14) 1px, transparent 1px);
+  background-size: 22px 22px;
+  border-bottom: 1px solid var(--poot-line);
+}
+
+.heroLogo {
+  display: block;
+  margin: 0 auto 1rem;
+}
+
+.heroTitle {
+  font-family: var(--ifm-font-family-monospace);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  color: #fff7f5;
+}
+
+.heroBanner :global(.hero__subtitle) {
+  color: #b9aab5;
+  max-width: 44rem;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* The hero is always ink, so its button uses the dark-mode coral. */
+.heroBanner :global(.button--primary) {
+  --ifm-button-background-color: var(--poot-coral);
+  --ifm-button-border-color: var(--poot-coral);
+  color: var(--poot-ink);
 }
 
 @media screen and (max-width: 996px) {
