@@ -39,7 +39,7 @@ use poot_quant::weights::{
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps, ElementKind};
 use poot_tensor::DType;
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 
@@ -391,6 +391,7 @@ fn build_tiny(
             prompt_bos: None,
             prefill_granule: granule,
             chat: ChatFormat::ChatML,
+            tool_codec: Some(Arc::new(HermesToolCodec)),
         },
         weights: tiny_weights(variant, store),
         log,

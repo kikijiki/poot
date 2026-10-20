@@ -20,7 +20,7 @@ use crate::admin::LoraAdminPolicy;
 use crate::api::{
     ChatReq, CompletionReq, GuidedDecodeError, MAX_CHOICES, MAX_LOGPROBS, MAX_NEW_TOKENS_CAP,
     MAX_STOP_SEQUENCES, ResponseFormatConstraint, Stop, StreamOptions, UnsupportedCapabilityError,
-    clamp_logprobs, clamp_n, classify_handler_error, default_max, parse_tool_calls,
+    apply_guided, clamp_logprobs, clamp_n, classify_handler_error, default_max, parse_tool_calls,
     reject_unsupported_modality, resolve_forced_tools, response_format_constraint, sampler_of,
     suppress_stream_usage, tool_call_stream_deltas,
 };
@@ -70,6 +70,7 @@ mod scheduling;
 mod streaming;
 mod telemetry;
 mod terminal_done;
+mod tool_codec;
 mod write_deadline;
 
 use recording_engine::{
@@ -290,6 +291,32 @@ pub(crate) fn serve_with_fake_caps(
     let metrics = Arc::clone(metrics);
     let join = std::thread::spawn(move || run_engine_thread(engine, queue, &metrics, &health));
     (served, EngineThread { join })
+}
+
+/// A text codec over a small SentencePiece vocabulary whose chat format is `format`: the text services of
+/// a model with no checkpoint behind it.
+pub(crate) fn spm_codec(format: poot_text::ChatFormat) -> poot_text::TextCodec {
+    let tokens: Vec<String> = ["<unk>", "<s>", "</s>", "a", "b", "c"]
+        .map(String::from)
+        .to_vec();
+    poot_text::TextCodec::from_gguf(
+        &poot_text::GgufVocab {
+            model: Some("llama".into()),
+            scores: Some(vec![0.0; tokens.len()]),
+            tokens: Some(tokens),
+            unknown_token_id: Some(0),
+            ..poot_text::GgufVocab::default()
+        },
+        2,
+        format,
+    )
+    .expect("build the SPM codec")
+}
+
+/// [`spm_codec`] of a ChatML (Hermes tool-call) model.
+pub(crate) fn chatml_codec() -> poot_text::TextCodec {
+    spm_codec(poot_text::ChatFormat::ChatML)
+        .with_tool_codec(Some(Arc::new(poot_text::HermesToolCodec)))
 }
 
 /// The model of the tiny GGUF fixture, loaded and its file removed.

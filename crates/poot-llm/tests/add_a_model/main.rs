@@ -103,6 +103,24 @@ fn write_checkpoint(dir: &Path, fixture: &Fixture) {
     poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
 }
 
+/// A family registered from outside the production crates names its own tool-call codec in its
+/// `ModelConfig`, and the loaded model's text services parse through it: no chat-format variant, no
+/// serve change. Mutation: drop `with_tool_codec(config.tool_codec.clone())` in `ModelHandle::load`; the
+/// call is no longer found.
+#[test]
+fn an_external_family_names_its_own_tool_call_codec() {
+    let dir = poot_test_util::unique_temp_path("neoxish_tool_codec");
+    write_checkpoint(&dir, &family::fixture());
+    let handle = load(&dir);
+    let calls = handle
+        .text()
+        .parse_tool_calls("@neoxish get_weather {\"city\":\"Paris\"}");
+    assert_eq!(calls.len(), 1, "the family's codec found the call");
+    assert_eq!(calls[0].name, "get_weather");
+    assert_eq!(calls[0].arguments, "{\"city\":\"Paris\"}");
+    assert!(handle.text().parse_tool_calls("plain reply").is_empty());
+}
+
 /// The built-in families plus the fixture family, registered from outside the production crates.
 fn registry() -> Registry {
     let mut registry = Registry::builtin().unwrap();

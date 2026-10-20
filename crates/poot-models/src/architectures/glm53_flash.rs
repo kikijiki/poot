@@ -25,6 +25,7 @@
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_tensor::DType;
+use std::sync::Arc;
 
 use crate::components::standard::{
     Step, check_draft_step, check_step, decoder_program, draft_program,
@@ -32,7 +33,7 @@ use crate::components::standard::{
 use crate::io::{ModelSchema, ProgramId, StateSpec};
 use crate::model::{FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 mod config;
 mod mtp;
@@ -85,6 +86,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: None,
         prefill_granule: std::num::NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     };
     Ok(ModelParts::new(Box::new(Glm53Flash {
         params: p,

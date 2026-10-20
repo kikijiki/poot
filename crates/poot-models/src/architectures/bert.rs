@@ -488,6 +488,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
+        tool_codec: None,
     };
     Ok(ModelParts::new(Box::new(Bert {
         word: Embedding::new(&weights, p.vocab, w).map_err(weight_error)?,

@@ -1312,6 +1312,45 @@ mod tests {
         assert!(plan_aie(&add).is_ok(), "control: the roomy target plans it");
     }
 
+    /// POOT-1289: the AIE finalizer admits only a serialized schedule. Every AIE lowering the planner
+    /// reaches is serialized, so the finalizer is handed a GPU plan (a thread grid, the choice a GPU
+    /// target makes for the same add) and refuses it by name instead of linking a body that assumes a grid.
+    ///
+    /// Mutation: let the `Generated` arm of `finalize_aie` return `Ok(())`; the grid plan is admitted and
+    /// this row goes red (`expected AieSchedule`).
+    #[test]
+    fn the_aie_finalizer_refuses_a_plan_that_is_not_a_serialized_schedule() {
+        let add = add_graph(vec![2, 3], vec![2, 3], DType::F32);
+        let gpu = Target::Gpu {
+            backend: Backend::SpirvVulkan,
+            caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+        };
+        let grid = crate::plan_eqn_choice(&add, last_eqn(&add), &gpu, &HashMap::new(), &limits())
+            .expect("the GPU plans the add");
+        assert!(matches!(grid.choice, KernelChoice::Generated(_)));
+        let serialized = plan_aie(&add).expect("control: the core plans it");
+        let tables = crate::kernel_mapping::GraphTables::from(&add);
+        let finalize = |planned: &crate::planner::Planned| {
+            super::finalize_aie(
+                planned,
+                tables,
+                last_eqn(&add),
+                AieTargetId::Xdna2,
+                &aie_caps(),
+            )
+        };
+        assert!(
+            finalize(&serialized).is_ok(),
+            "control: a serialized plan finalizes"
+        );
+        match finalize(&grid) {
+            Err(PlanError::Refused(refusal)) => {
+                assert_eq!(refusal.missing, Capability::AieSchedule);
+            }
+            other => panic!("expected AieSchedule, got {:?}", other.map(|_| ())),
+        }
+    }
+
     /// Finalization of the linked artifact reads the target's limits: an unmeasured limit refuses (never
     /// a guess), and a reservation past a measured one refuses with both numbers. Mutation: treat
     /// `Unknown` as unbounded, or drop the `needed > available` comparison.

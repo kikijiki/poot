@@ -53,7 +53,7 @@ use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostTensor};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
@@ -184,6 +184,7 @@ fn build_recurrent(raw: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, M
             prompt_bos: None,
             prefill_granule: nz(granule),
             chat: ChatFormat::ChatML,
+            tool_codec: Some(Arc::new(HermesToolCodec)),
         },
         schema: ModelSchema::builder()
             .step(

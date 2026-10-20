@@ -1,7 +1,7 @@
 //! OpenAI-compatible API types (request/response structs, serde) and request-shaping helpers.
 
 use anyhow::{Context, Result, bail};
-use poot_llm::driver::{AdapterRef, DriverCaps, ModelHandle};
+use poot_llm::driver::{AdapterRef, DriverCaps};
 use poot_llm::{Sampler, TokenLogprob};
 
 use crate::modality::Modality;
@@ -315,7 +315,7 @@ fn check_guided_len(field: &str, len: usize, max: usize) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_guided(
     sampler: Sampler,
-    handle: &ModelHandle,
+    text: &poot_text::TextCodec,
     guided_choice: &Option<Vec<String>>,
     guided_regex: &Option<String>,
     guided_grammar: &Option<String>,
@@ -325,27 +325,23 @@ pub(crate) fn apply_guided(
     tool_choice: &Option<serde_json::Value>,
 ) -> Result<Sampler> {
     // OpenAI `tool_choice` forcing (highest precedence): when the client requires a specific tool (or
-    // any tool), constrain the output to exactly one schema-conforming ChatML tool call. Only models
-    // that emit ChatML `<tool_call>` markup are constrained; other tool-call formats fall through to
-    // the model + template.
+    // any tool), the model's tool-call codec constrains the output to exactly one schema-conforming call
+    // in its own markup. A model whose codec cannot be forced falls through to the model + template.
     if let Some(forced) = resolve_forced_tools(tools, tool_choice)?
-        && matches!(
-            handle.text().chat_format(),
-            poot_text::ChatFormat::ChatML | poot_text::ChatFormat::Granite
-        )
+        && let Some(constraint) = text.forced_tool_constraint(&forced)?
     {
-        return Ok(sampler.with_constraint(handle.text().build_tool_call_constraint(&forced)?));
+        return Ok(sampler.with_constraint(constraint));
     }
     if let Some(choices) = guided_choice.as_ref().filter(|c| !c.is_empty()) {
-        return Ok(sampler.with_constraint(handle.text().build_choice_constraint(choices)?));
+        return Ok(sampler.with_constraint(text.build_choice_constraint(choices)?));
     }
     if let Some(pattern) = guided_regex.as_ref().filter(|p| !p.is_empty()) {
         check_guided_len("guided_regex", pattern.len(), MAX_GUIDED_PATTERN_BYTES)?;
-        return Ok(sampler.with_constraint(handle.text().build_regex_constraint(pattern)?));
+        return Ok(sampler.with_constraint(text.build_regex_constraint(pattern)?));
     }
     if let Some(gbnf) = guided_grammar.as_ref().filter(|g| !g.is_empty()) {
         check_guided_len("guided_grammar", gbnf.len(), MAX_GUIDED_GRAMMAR_BYTES)?;
-        return Ok(sampler.with_constraint(handle.text().build_grammar_constraint(gbnf)?));
+        return Ok(sampler.with_constraint(text.build_grammar_constraint(gbnf)?));
     }
     if let Some(schema) = guided_json {
         check_guided_len(
@@ -353,7 +349,7 @@ pub(crate) fn apply_guided(
             schema.to_string().len(),
             MAX_GUIDED_SCHEMA_BYTES,
         )?;
-        return Ok(sampler.with_constraint(handle.text().build_json_constraint(schema)?));
+        return Ok(sampler.with_constraint(text.build_json_constraint(schema)?));
     }
     // OpenAI structured outputs (the standard field clients send, vs poot's `guided_json` extension).
     if let Some(rf) = response_format {
@@ -364,10 +360,10 @@ pub(crate) fn apply_guided(
                     schema.to_string().len(),
                     MAX_GUIDED_SCHEMA_BYTES,
                 )?;
-                return Ok(sampler.with_constraint(handle.text().build_json_constraint(schema)?));
+                return Ok(sampler.with_constraint(text.build_json_constraint(schema)?));
             }
             ResponseFormatConstraint::JsonObject => {
-                return Ok(sampler.with_constraint(handle.text().build_json_object_constraint()?));
+                return Ok(sampler.with_constraint(text.build_json_object_constraint()?));
             }
             ResponseFormatConstraint::Unconstrained => {}
         }
@@ -671,9 +667,9 @@ pub(crate) struct ChatReq {
     #[serde(default)]
     pub(crate) tools: Option<serde_json::Value>,
     /// OpenAI `tool_choice` ("auto" / "none" / "required" / a named function). For "required" or a named
-    /// function on a ChatML tool-format model, generation is constrained to exactly one schema-conforming
-    /// `<tool_call>` block (see `resolve_forced_tools` / `apply_guided`); "auto"/"none" and non-ChatML
-    /// formats leave the decision to the template + model.
+    /// function on a model whose tool-call codec can be forced, generation is constrained to exactly one
+    /// schema-conforming call in that codec's markup (see `resolve_forced_tools` / `apply_guided`);
+    /// "auto"/"none" and a codec that cannot be forced leave the decision to the template + model.
     #[serde(default)]
     pub(crate) tool_choice: Option<serde_json::Value>,
     /// poot extension (spec 248, epic 129 B8): the same field and resolution path as
@@ -698,117 +694,22 @@ impl ChatReq {
     }
 }
 
-/// Convert one model-emitted call object into an OpenAI `tool_calls` entry. The object must carry a
-/// string `name`; args come from `arguments` (ChatML/Mistral) or `parameters` (Llama-3.1),
-/// re-serialized as a JSON string (OpenAI's shape), defaulting to `{}`. Returns `None` (skipped, not
-/// fatal) when there is no name: a garbled call must not 500 the request.
-pub(crate) fn tool_call_from_value(v: &serde_json::Value, idx: usize) -> Option<ToolCallOut> {
-    let name = v.get("name").and_then(|n| n.as_str())?;
-    let arguments = v
-        .get("arguments")
-        .or_else(|| v.get("parameters"))
-        .map(|a| a.to_string())
-        .unwrap_or_else(|| "{}".to_string());
-    Some(ToolCallOut {
-        id: format!("call_{idx}"),
-        kind: "function",
-        function: ToolCallFn {
-            name: name.to_string(),
-            arguments,
-        },
-    })
-}
-
-/// Parse the model's tool-call markup (spec 046) into OpenAI `tool_calls`, dispatching on the marker
-/// present:
-/// - ChatML/Hermes (qwen2.5, hermes, granite): `<tool_call>\n{json}\n</tool_call>` blocks.
-/// - Mistral: `[TOOL_CALLS]` followed by a JSON array of call objects.
-/// - Llama-3.1: `<|python_tag|>` followed by one or more `;`-separated `{name, parameters}` objects
-///   (terminated by `<|eom_id|>` / `<|eot_id|>` when present).
-///
-/// Returns empty when there is no tool-call markup (the normal text reply). Malformed bodies are
-/// skipped, never fatal.
-pub(crate) fn parse_tool_calls(text: &str) -> Vec<ToolCallOut> {
-    if text.contains("<tool_call>") {
-        return parse_chatml_tool_calls(text);
-    }
-    if let Some(after) = text.split("[TOOL_CALLS]").nth(1) {
-        return parse_mistral_tool_calls(after);
-    }
-    if let Some(after) = text.split("<|python_tag|>").nth(1) {
-        return parse_llama_tool_calls(after);
-    }
-    Vec::new()
-}
-
-/// ChatML/Hermes `<tool_call>{json}</tool_call>` blocks.
-pub(crate) fn parse_chatml_tool_calls(text: &str) -> Vec<ToolCallOut> {
-    let mut calls = Vec::new();
-    let mut rest = text;
-    while let Some(open) = rest.find("<tool_call>") {
-        let after = &rest[open + "<tool_call>".len()..];
-        let Some(close) = after.find("</tool_call>") else {
-            break;
-        };
-        let body = after[..close].trim();
-        rest = &after[close + "</tool_call>".len()..];
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body)
-            && let Some(call) = tool_call_from_value(&v, calls.len())
-        {
-            calls.push(call);
-        }
-    }
-    calls
-}
-
-/// Mistral `[TOOL_CALLS]` form: the text after the marker is a JSON array of `{name, arguments}` objects.
-pub(crate) fn parse_mistral_tool_calls(after_marker: &str) -> Vec<ToolCallOut> {
-    let mut calls = Vec::new();
-    // The array may be followed by other tokens (e.g. `</s>`); parse the first JSON value.
-    let trimmed = after_marker.trim_start();
-    let mut de = serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>();
-    if let Some(Ok(serde_json::Value::Array(items))) = de.next() {
-        for item in &items {
-            if let Some(call) = tool_call_from_value(item, calls.len()) {
-                calls.push(call);
-            }
-        }
-    }
-    calls
-}
-
-/// Llama-3.1 `<|python_tag|>` form: one or more `;`-separated `{name, parameters}` objects,
-/// terminated by an end marker when present.
-pub(crate) fn parse_llama_tool_calls(after_marker: &str) -> Vec<ToolCallOut> {
-    let mut calls = Vec::new();
-    // Strip the Llama turn-end markers.
-    let body = after_marker
-        .split("<|eom_id|>")
-        .next()
-        .unwrap_or(after_marker)
-        .split("<|eot_id|>")
-        .next()
-        .unwrap_or(after_marker);
-    // Parse consecutive JSON objects, tolerating `;`/whitespace separators between them. A naive
-    // `body.split(';')` corrupts a call whose arguments contain a semicolon (e.g. `{"cmd":"a;b"}`),
-    // both halves fail to parse and the call is silently dropped. Instead parse one JSON value at a time
-    // with the streaming deserializer and skip separators by byte offset, as the Mistral parser does.
-    let mut rest = body.trim_start();
-    while !rest.is_empty() {
-        let (val, consumed) = {
-            let mut stream =
-                serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>();
-            match stream.next() {
-                Some(Ok(v)) => (v, stream.byte_offset()),
-                _ => break, // no further parseable JSON value: stop (skip any trailing junk)
-            }
-        };
-        if let Some(call) = tool_call_from_value(&val, calls.len()) {
-            calls.push(call);
-        }
-        rest = rest[consumed..].trim_start_matches(|c: char| c == ';' || c.is_whitespace());
-    }
-    calls
+/// The model's tool calls in `text` as OpenAI `tool_calls` entries, parsed by the model's own codec;
+/// empty when it has none or `text` carries no tool-call markup (the normal text reply).
+pub(crate) fn parse_tool_calls(codec: &poot_text::TextCodec, text: &str) -> Vec<ToolCallOut> {
+    codec
+        .parse_tool_calls(text)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, call)| ToolCallOut {
+            id: format!("call_{idx}"),
+            kind: "function",
+            function: ToolCallFn {
+                name: call.name,
+                arguments: call.arguments,
+            },
+        })
+        .collect()
 }
 
 /// Build the OpenAI streaming `delta.tool_calls` array (spec 046 slice 2): each parsed call becomes

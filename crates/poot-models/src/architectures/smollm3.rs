@@ -28,6 +28,7 @@
 //! branch. Every op is an existing `poot_graph_ir::ops` composition.
 
 use poot_graph_ir::{Builder, Graph};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------------------------
 // The `Model` family.
@@ -51,7 +52,7 @@ use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, Step
 use crate::names::gguf::GGUF_BASE;
 use crate::names::{HF_BASE, family_weights, hf_base_shapes};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("smollm3");
 
@@ -217,6 +218,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: p.chat,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     };
     Ok(ModelParts::new(Box::new(Smollm3 {
         params: p,

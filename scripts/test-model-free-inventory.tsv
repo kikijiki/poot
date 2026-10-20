@@ -392,6 +392,7 @@ poot-executor	poot-executor	model-free	engine::weight_source_tests::a_const_with
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_head_over_the_cap_binds_as_row_chunks_of_its_own_bytes
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_hosted_embed_is_filled_from_the_tokens_and_the_embed_view
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_map_const_that_is_only_a_store_key_is_unbound
+poot-executor	poot-executor	model-free	engine::weight_source_tests::a_packed_embed_row_of_another_width_than_the_map_is_a_row_decode_refusal
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_paged_read_map_word_outside_the_pool_is_a_typed_bind_refusal
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_pooled_step_calls_the_host_once_per_sync_point_after_its_stage_completes
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_ranged_index_table_with_a_word_outside_its_range_is_refused_at_weight_bind
@@ -400,6 +401,7 @@ poot-executor	poot-executor	model-free	engine::weight_source_tests::a_refill_wri
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_row_write_at_the_end_of_the_pool_is_a_row_range_refusal
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_second_adapter_with_the_same_names_never_reads_the_first_adapters_bytes
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_site_is_identified_by_its_tables_bytes_across_entries_and_owners
+poot-executor	poot-executor	model-free	engine::weight_source_tests::a_state_row_past_the_pool_is_a_state_row_refusal_that_zeroes_nothing
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_store_entry_viewed_by_two_ids_uploads_once
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_syncs_writes_land_before_the_next_stage_replays
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_token_outside_the_embed_table_is_refused
@@ -745,6 +747,7 @@ poot-graph-plan	poot-graph-plan	model-free	kernel_mapping::tests::plan_eqn_plans
 poot-graph-plan	poot-graph-plan	model-free	kernel_mapping::tests::plan_eqn_plans_a_unary_f32_under_its_numerical_contract
 poot-graph-plan	poot-graph-plan	model-free	kernel_mapping::tests::plan_eqn_plans_an_f32_add_under_the_aie_serialized_schedule_and_it_links
 poot-graph-plan	poot-graph-plan	model-free	kernel_mapping::tests::plan_eqn_refuses_for_aie_what_has_no_serialized_schedule
+poot-graph-plan	poot-graph-plan	model-free	kernel_mapping::tests::the_aie_finalizer_refuses_a_plan_that_is_not_a_serialized_schedule
 poot-graph-plan	poot-graph-plan	model-free	kernel_mapping::tests::the_planner_refuses_a_shape_abi_the_target_cannot_bind
 poot-graph-plan	poot-graph-plan	model-free	multi_device::tests::accounting::multi_device_accounting_is_per_device_checked
 poot-graph-plan	poot-graph-plan	model-free	multi_device::tests::capability::multi_device_communication_capability_is_admitted_per_row
@@ -899,6 +902,7 @@ poot-graph-plan	poot-graph-plan	model-free	planner::choice::tests::an_empty_spli
 poot-graph-plan	poot-graph-plan	model-free	planner::choice::tests::every_request_family_has_a_field_that_changes_the_digest
 poot-graph-plan	poot-graph-plan	model-free	planner::choice::tests::requests_differing_only_in_an_f32_parameter_get_different_keys
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::a_fp8_prefill_linear_plans_the_register_tiled_gemm_on_gfx1151
+poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::a_fp8_prefill_linear_plans_the_register_tiled_gemm_on_wgpu
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::a_packed_tiled_contraction_over_the_watchdog_budget_splits_into_tile_ranges
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::a_prefill_indexed_contraction_above_the_gemv_grid_plans_a_folded_tiled_schedule
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::an_indexed_contraction_beyond_the_grid_or_the_bit_range_is_a_typed_refusal
@@ -1209,6 +1213,13 @@ poot-graph-plan	poot-graph-plan::numerical_legality	model-free	reciprocal_roundi
 poot-graph-plan	poot-graph-plan::numerical_legality	model-free	rhs_underflow_is_not_factored_out_of_contraction
 poot-graph-plan	poot-graph-plan::numerical_legality	model-free	scalar_contraction_corner_corpus_is_bitwise
 poot-graph-plan	poot-graph-plan::numerical_legality	model-free	softcap_requires_the_exact_reciprocal_literal
+poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_binary_equation_with_three_operands_is_an_operand_count_refusal
+poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_device_below_the_block_top_k_workgroup_is_refused_with_both_numbers
+poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_float_region_step_the_kernel_cannot_compute_is_a_fused_step_refusal
+poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_negative_literal_update_index_is_an_index_operand_refusal
+poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_standalone_packed_dequant_is_an_imported_kernel_planning_refusal
+poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_zero_element_tensor_on_an_aie_core_is_an_aie_abi_refusal
+poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	an_i32_remainder_by_literal_zero_is_an_exact_i32_op_refusal
 poot-graph-plan	poot-graph-plan::transform_soundness	model-free	card536a_attention_near_misses_decline_with_a_reason
 poot-graph-plan	poot-graph-plan::transform_soundness	model-free	card536a_attention_spellings_fuse_like_the_helper
 poot-graph-plan	poot-graph-plan::transform_soundness	model-free	card536a_contraction_is_covered_by_the_in_crate_oracle
@@ -2093,6 +2104,7 @@ poot-llm	poot-llm::add_a_model	device	tagged_rows::tagged_generate_equals_the_or
 poot-llm	poot-llm::add_a_model	device	tagged_rows::tagged_generate_equals_the_oracle_tokens_rocm
 poot-llm	poot-llm::add_a_model	device	tagged_rows::tagged_generate_equals_the_oracle_tokens_wgpu
 poot-llm	poot-llm::add_a_model	model-free	a_chunk_above_the_trace_limit_is_refused_before_construction_for_an_external_family
+poot-llm	poot-llm::add_a_model	model-free	an_external_family_names_its_own_tool_call_codec
 poot-llm	poot-llm::add_a_model	model-free	an_unregistered_model_type_is_refused_by_load_naming_origin_and_key
 poot-llm	poot-llm::add_a_model	model-free	driver_is_family_free::the_driver_source_names_no_family_and_no_family_input
 poot-llm	poot-llm::add_a_model	model-free	driver_is_family_free::the_matcher_flags_family_names_and_spares_the_gguf_key
@@ -2432,6 +2444,8 @@ poot-load	poot-load	model-free	lora::tests::rejects_embedding_and_unrelated_keys
 poot-load	poot-load	model-free	lora::tests::rslora_scaling_divides_by_sqrt_r
 poot-load	poot-load	model-free	packed_safetensors::tests::a_repeated_json_key_is_refused_at_any_depth
 poot-load	poot-load	model-free	packed_safetensors::tests::the_streamed_pin_check_admits_its_own_pin_and_refuses_a_changed_file
+poot-load	poot-load	model-free	plan::tests::a_gguf_dense_job_of_the_wrong_byte_count_is_a_dense_weight_refusal
+poot-load	poot-load	model-free	plan::tests::a_job_whose_range_leaves_its_file_is_a_tensor_outside_file_refusal
 poot-load	poot-load	model-free	safetensors::tests::quantized_linear_extents_are_checked
 poot-load	poot-load	model-free	safetensors::tests::shard_names_must_be_plain_file_names
 poot-load	poot-load	model-free	tests::an_hf_block_fp8_quantization_config_is_the_fp8_scheme
@@ -2516,6 +2530,10 @@ poot-load	poot-load::mapped_checkpoint	model-free	mb5_a_truncated_file_is_refuse
 poot-load	poot-load::mapped_checkpoint	model-free	mb5_a_truncated_safetensors_shard_is_refused_at_the_end_of_load
 poot-load	poot-load::mapped_checkpoint	model-free	mb6_rename_replacement_is_safe
 poot-load	poot-load::mapped_checkpoint	model-free	mb7_validation_runs_over_mapped_bytes
+poot-load	poot-load::refusal_coverage	model-free	a_gptq_checkpoint_format_other_than_gptq_is_an_unsupported_quant_config
+poot-load	poot-load::refusal_coverage	model-free	a_lora_tensor_of_a_dtype_with_no_f32_decode_is_refused
+poot-load	poot-load::refusal_coverage	model-free	a_shard_that_is_not_a_regular_file_is_a_map_refusal
+poot-load	poot-load::refusal_coverage	model-free	two_gguf_tensors_mapped_to_one_weight_key_are_a_duplicate_weight_key
 poot-models	poot-models	checkpoint	architectures::qwen38_27b::tests::every_tensor_of_the_real_gguf_plans_through_the_production_name_map
 poot-models	poot-models	checkpoint	architectures::qwen38_27b::tests::the_real_gguf_config_reads_into_the_pinned_dimensions
 poot-models	poot-models	checkpoint	architectures::qwen38_27b::tests::the_real_gguf_first_blocks_bind_packed_and_trace
@@ -3915,8 +3933,7 @@ poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::chat_req_par
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::completion_req_defaults_stream_options_to_none
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::completion_req_parses_empty_stream_options_object
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::completion_req_parses_stream_options_include_usage_false
-poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::parse_tool_calls_mistral_and_llama_forms
-poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::parse_tool_calls_single_and_multiple_and_none
+poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::parse_tool_calls_shapes_the_models_calls_as_openai_entries
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::read_request_from_parses_a_normal_request
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::read_request_from_refuses_a_body_shorter_than_its_declared_length
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::read_request_from_rejects_an_oversized_header_line
@@ -4035,6 +4052,10 @@ poot-serve	poot-serve::bin/poot-serve	model-free	tests::telemetry::publishing_th
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::telemetry::sampled_detail_is_reported_as_sampled
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::terminal_done::deliver_terminal_publishes_the_outcome_before_the_event_is_delivered
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::terminal_done::the_loops_terminal_done_publishes_its_count_before_the_event_is_delivered
+poot-serve	poot-serve::bin/poot-serve	model-free	tests::tool_codec::a_forced_call_is_constrained_by_the_models_own_grammar
+poot-serve	poot-serve::bin/poot-serve	model-free	tests::tool_codec::a_model_with_a_custom_tool_codec_has_its_calls_parsed
+poot-serve	poot-serve::bin/poot-serve	model-free	tests::tool_codec::a_model_with_no_tool_codec_is_not_forced
+poot-serve	poot-serve::bin/poot-serve	model-free	tests::tool_codec::serve_never_branches_on_the_chat_format
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::write_deadline::oversized_content_length_413_response_shape
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::write_deadline::write_deadline_bounds_normal_http_response_to_never_reading_client
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::write_deadline::write_deadline_bounds_production_stream_after_a_piece_saturates
@@ -4313,6 +4334,10 @@ poot-text	poot-text	model-free	tokenize::stream_piece_tests::stream_piece_ascii_
 poot-text	poot-text	model-free	tokenize::stream_piece_tests::stream_piece_preserves_leading_space_metaspace
 poot-text	poot-text	model-free	tokenize::stream_piece_tests::stream_piece_reassembles_cjk_split_across_tokens
 poot-text	poot-text	model-free	tokenize::stream_piece_tests::stream_piece_reassembles_emoji_split_across_tokens
+poot-text	poot-text	model-free	tool_call::tests::a_codec_parses_only_its_own_markup
+poot-text	poot-text	model-free	tool_call::tests::hermes_single_multiple_and_none
+poot-text	poot-text	model-free	tool_call::tests::llama_python_tag_form
+poot-text	poot-text	model-free	tool_call::tests::mistral_array_form
 poot-text	poot-text::hostile_guided	model-free	a_choice_list_of_any_size_builds_inside_the_budget
 poot-text	poot-text::hostile_guided	model-free	a_deeply_nested_schema_is_refused_by_the_regex_size_bound
 poot-text	poot-text::hostile_guided	model-free	a_pattern_inside_the_limits_builds
@@ -4332,6 +4357,8 @@ poot-vulkan-runtime	poot-vulkan-runtime	model-free	features::tests::a_device_wit
 poot-vulkan-runtime	poot-vulkan-runtime	model-free	spirv::tests::a_malformed_instruction_ends_the_scan_without_reading_past_it
 poot-vulkan-runtime	poot-vulkan-runtime	model-free	spirv::tests::capabilities_and_local_size_are_read_from_the_instruction_stream
 poot-vulkan-runtime	poot-vulkan-runtime	model-free	tests::a_cached_key_answers_for_one_kernel_only
+poot-vulkan-runtime	poot-vulkan-runtime	model-free	tests::a_dispatch_length_beyond_its_buffer_is_refused
+poot-vulkan-runtime	poot-vulkan-runtime	model-free	tests::a_dispatch_length_is_bounded_in_the_buffers_native_elements
 poot-vulkan-runtime	poot-vulkan-runtime	model-free	tests::a_fence_that_never_signals_times_out_within_the_bound_and_poisons
 poot-vulkan-runtime	poot-vulkan-runtime	model-free	tests::a_grid_over_the_device_limit_is_refused_not_folded
 poot-vulkan-runtime	poot-vulkan-runtime	model-free	tests::a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed

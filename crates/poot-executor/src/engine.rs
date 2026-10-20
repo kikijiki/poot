@@ -4991,6 +4991,102 @@ mod weight_source_tests {
         }
     }
 
+    /// POOT-1289: `reset_state(Row(r))` for a row past the carried state's leading axis is a typed
+    /// `StateRow` refusal naming the state and its row count, and zeroes nothing (the pool is written only
+    /// after every buffer passed).
+    ///
+    /// Mutation: relax the guard in `Engine::reset_state` from `row >= leading` to `row > leading`; row 4
+    /// of a 4-row pool passes the check and this row goes red (`expected StateRow, got Ok(())`).
+    #[test]
+    fn a_state_row_past_the_pool_is_a_state_row_refusal_that_zeroes_nothing() {
+        use poot_graph_ir::StateRole;
+        const POOL: usize = 4;
+        let mut engine = Engine::new(Recorder::default());
+        let b = Builder::for_tests();
+        let pool = b
+            .state_input("pool", TensorType::f32(vec![POOL, K]), StateRole::Recurrent)
+            .unwrap();
+        let src = b
+            .slot_named(Slot::Activation, "src", TensorType::f32(vec![2, K]))
+            .unwrap();
+        let slots = b.write_map("write", 2, POOL).unwrap();
+        let out = b.scatter_update(pool, src, slots).unwrap();
+        let graph = b
+            .finish(poot_graph_ir::Outputs::new(out).with_state(&[(pool, out)]))
+            .unwrap();
+        let program = compile(&engine, &graph);
+        let weights = store(vec![]);
+        let exe = engine
+            .load_weights(Arc::clone(&weights), map(&weights, vec![]))
+            .unwrap();
+        engine.add_entry(exe, &program).unwrap();
+
+        let writes_before = engine.device().writes.len();
+        match engine.reset_state(exe, StateScope::Row(POOL)) {
+            Err(ExecError::Bind(error)) => match *error {
+                BindError::StateRow { name, row, rows } => {
+                    assert_eq!((name.as_str(), row, rows), ("pool", POOL, POOL));
+                }
+                other => panic!("expected StateRow, got {other}"),
+            },
+            other => panic!("expected StateRow, got {other:?}"),
+        }
+        assert_eq!(
+            engine.device().writes.len(),
+            writes_before,
+            "a refused row reset writes nothing"
+        );
+        engine
+            .reset_state(exe, StateScope::Row(POOL - 1))
+            .expect("the last row of the pool resets");
+        assert!(engine.device().writes.len() > writes_before);
+    }
+
+    /// POOT-1289: `load_weights` takes the store and the map separately, so a map built over one store can
+    /// meet another whose entry under the same key is a different shape. A packed embed row is then decoded
+    /// into a buffer of the map's width from a payload of another width: a typed `RowDecode` refusal naming
+    /// the embed, not a slice panic or a wrong row. The control binds the matching store.
+    ///
+    /// Mutation: swallow the decode error in `WeightBinder::embed` (`.map_err(..)?` becomes `.ok()`); the
+    /// mismatched row binds and this row goes red (`expected RowDecode, got Ok(())`).
+    #[test]
+    fn a_packed_embed_row_of_another_width_than_the_map_is_a_row_decode_refusal() {
+        let embed = WeightId::model(WeightRole::Embed);
+        let packed = |k: usize| {
+            WeightEntry::Packed(Arc::new(poot_quant::test_support::packed::random_payload(
+                WeightFormat::Q8_0,
+                [6, k],
+                5,
+            )))
+        };
+        let mapped_over = store(vec![("e", packed(K))]);
+        let map = map(
+            &mapped_over,
+            vec![(embed, WeightView::Stored(WeightKey::from("e")))],
+        );
+        let step_over = |weights: Arc<WeightStore>| {
+            let (mut engine, program) = hosted_embed(6, 1);
+            let exe = engine.load_weights(weights, Arc::clone(&map)).unwrap();
+            let entry = engine.add_entry(exe, &program).unwrap();
+            let bytes = 3i32.to_le_bytes();
+            let mut inputs = StepInputs::new();
+            inputs.push(
+                SlotKey::new(Slot::Token, None),
+                &[1, 1],
+                poot_tensor::HostView::new(DType::I32, 1, &bytes).unwrap(),
+            );
+            engine.step(exe, entry, &inputs, &mut NoSync).map(drop)
+        };
+        step_over(mapped_over.clone()).expect("control: the store the map was built over binds");
+        match step_over(store(vec![("e", packed(2 * K))])) {
+            Err(ExecError::Bind(error)) => match *error {
+                BindError::RowDecode { name, .. } => assert_eq!(name, "w.embed"),
+                other => panic!("expected RowDecode, got {other}"),
+            },
+            other => panic!("expected RowDecode, got {other:?}"),
+        }
+    }
+
     /// POOT-1148: a forward write map is the one input whose words the scatter kernel stores through, so it
     /// binds only as a checked `ForwardSlotMap`. A raw I32 view of the slot is refused by name; a typed map
     /// checked against a larger pool than the graph declares meets the slot's declared range at the bind; a

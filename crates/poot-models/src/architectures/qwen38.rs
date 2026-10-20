@@ -35,7 +35,7 @@ use crate::model::{
     TraceError,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 mod config;
 mod gated_residual;
@@ -114,6 +114,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: None,
         prefill_granule: p.ratio,
         chat: ChatFormat::ChatML,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     };
     Ok(ModelParts::new(Box::new(Qwen4Exp {
         params: p,

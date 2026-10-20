@@ -13,9 +13,10 @@
 //! HG-2 `DETERMINIZE_SIZE_LIMIT` raised back to 1 MiB (the random-pattern row goes red on its time
 //! budget: one pattern takes 7 s to refuse).
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use poot_text::{ChatFormat, Constraint, GgufVocab, TextCodec};
+use poot_text::{ChatFormat, Constraint, GgufVocab, HermesToolCodec, TextCodec};
 
 /// Longest a build or a refusal may take. The bounded builds finish in milliseconds; the margin
 /// absorbs a loaded box without letting an unbounded build (seconds to minutes) pass.
@@ -55,7 +56,9 @@ fn codec() -> TextCodec {
         add_space_prefix: Some(true),
         ..GgufVocab::default()
     };
-    TextCodec::from_gguf(&vocab, 2, ChatFormat::ChatML).expect("build the SPM codec")
+    TextCodec::from_gguf(&vocab, 2, ChatFormat::ChatML)
+        .expect("build the SPM codec")
+        .with_tool_codec(Some(Arc::new(HermesToolCodec)))
 }
 
 /// A deterministic xorshift stream (the repository's tests carry no rng dependency).
@@ -452,22 +455,19 @@ fn forced_tool_calls_of_any_count_build_inside_the_budget() {
             )
         })
         .collect();
-    bounded("300 forced tools", || {
-        codec.build_tool_call_constraint(&tools)
-    })
-    .ok();
+    bounded("300 forced tools", || codec.forced_tool_constraint(&tools)).ok();
     let hostile_name = vec![(
         "na\"me\\(".to_string(),
         serde_json::json!({"type": "integer"}),
     )];
     let built = bounded("a name that is regex syntax", || {
-        codec.build_tool_call_constraint(&hostile_name)
+        codec.forced_tool_constraint(&hostile_name)
     });
-    if let Ok(mut constraint) = built {
+    if let Ok(Some(mut constraint)) = built {
         walk_a_few_steps(&mut constraint);
     }
     assert!(
-        bounded("no tools", || codec.build_tool_call_constraint(&[])).is_err(),
+        bounded("no tools", || codec.forced_tool_constraint(&[])).is_err(),
         "a forced call with no tool to force has no constraint"
     );
 }

@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
@@ -26,7 +27,7 @@ use crate::names::{
     hf_base_shapes,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 // The `granite` family behind [`Model`]: the standard stack and layer with Granite's four scalar
 // multipliers as options of the shared components, and `granitemoe`'s experts as the feed-forward
@@ -313,6 +314,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::Granite,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     };
     Ok(ModelParts::new(Box::new(Granite {
         params: p,
@@ -642,6 +644,12 @@ mod family_tests {
         let model = model_of(&config, &store.build());
         assert_eq!(model.config().eos, BTreeSet::from([2]));
         assert_eq!(model.config().chat, ChatFormat::Granite);
+        assert_eq!(
+            model.config().tool_codec.as_ref().map(|codec| codec
+                .parse("<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>")
+                .len()),
+            Some(1)
+        );
     }
 
     /// A Q8_0 granite GGUF (projections Q8_0, the rest F32, scalars in `granite.*` keys).

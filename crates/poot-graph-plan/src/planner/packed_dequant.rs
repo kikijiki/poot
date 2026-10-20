@@ -616,6 +616,86 @@ mod tests {
     #[test]
     fn a_fp8_prefill_linear_plans_the_register_tiled_gemm_on_gfx1151() {
         let (m, k, n) = (128usize, 5120usize, 17408usize);
+        let target = Target::Gpu {
+            backend: Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
+            caps: DeviceCaps::rocm_default(),
+        };
+        let Fp8PrefillPlan {
+            schedule,
+            tiles,
+            launches,
+            workgroup,
+        } = plan_fp8_prefill_linear(&target, m, k, n);
+        assert_eq!(workgroup, [256, 1, 1]);
+        let Schedule::RegisterTiled { lanes, rows, run } = schedule else {
+            panic!("a prefill linear is the register-tiled GEMM, got {schedule:?}");
+        };
+        assert_eq!(
+            (lanes.get(), rows.get(), run.get()),
+            (16, 8, 4),
+            "128 rows fill the 16x16 lane grid's 128-row tile; K = 5120 stages as word-sized runs of byte codes"
+        );
+        assert_eq!(schedule.output_tile(), Some((128, 64)));
+        assert_eq!(tiles, 272, "one row-tile of 128 by 272 column-tiles of 64");
+        let [(grid, meta)] = &launches[..] else {
+            panic!("expected a single dispatch, got {launches:?}");
+        };
+        assert_eq!(*grid, [tiles as u32 * 256, 1, 1]);
+        assert_eq!(meta[..], [k as u32, n as u32, m as u32, tiles as u32, 0]);
+    }
+
+    /// POOT-1264 (GPU-free): the same FP8 prefill linear on the wgpu device (Vulkan, RDNA3 iGPU caps) plans the
+    /// same register-tiled 16x16-lane GEMM as ROCm, not the one-output-per-lane tile that ran it at 3.9 tok/s,
+    /// and, under wgpu's watchdog budget, as contiguous tile ranges that together cover all 272 tiles. Driven
+    /// through `compile`. Mutation: make `RegisterTiling::choose` always pick the 8x8 grid; the lane grid, tile
+    /// and tile count go red.
+    #[test]
+    fn a_fp8_prefill_linear_plans_the_register_tiled_gemm_on_wgpu() {
+        let (m, k, n) = (128usize, 5120usize, 17408usize);
+        let target = Target::Gpu {
+            backend: Backend::SpirvVulkan,
+            caps: DeviceCaps::wgpu_rdna3_igpu(),
+        };
+        let Fp8PrefillPlan {
+            schedule,
+            tiles,
+            launches,
+            workgroup,
+        } = plan_fp8_prefill_linear(&target, m, k, n);
+        assert_eq!(workgroup, [256, 1, 1]);
+        let Schedule::RegisterTiled { lanes, rows, run } = schedule else {
+            panic!("a wgpu prefill linear is the register-tiled GEMM, got {schedule:?}");
+        };
+        assert_eq!((lanes.get(), rows.get(), run.get()), (16, 8, 4));
+        assert_eq!(schedule.output_tile(), Some((128, 64)));
+        assert_eq!(tiles, 272);
+        let mut next = 0usize;
+        for (grid, meta) in &launches {
+            let [kk, nn, mm, x_groups, offset] = meta[..] else {
+                panic!("tiled metadata is [K, N, M, x_groups, tile_offset]: {meta:?}");
+            };
+            assert_eq!(
+                (kk as usize, nn as usize, mm as usize),
+                (k, n, m),
+                "{meta:?}"
+            );
+            assert_eq!(offset as usize, next, "ranges are contiguous: {meta:?}");
+            next += ((x_groups * grid[1]) as usize).min(tiles - next);
+        }
+        assert_eq!(next, tiles, "the ranges cover every tile");
+    }
+
+    /// What the planner gives one `[m, k] x [n, k]` E4M3 block-scaled packed linear on `target`.
+    struct Fp8PrefillPlan {
+        schedule: Schedule,
+        tiles: usize,
+        /// Each dispatch's `(grid, meta)`.
+        launches: Vec<([u32; 3], Vec<u32>)>,
+        /// The first dispatch's workgroup size.
+        workgroup: [u32; 3],
+    }
+
+    fn plan_fp8_prefill_linear(target: &Target, m: usize, k: usize, n: usize) -> Fp8PrefillPlan {
         let descriptor = PackedWeight::try_new(
             WeightFormat::E4m3Block128 {
                 scale: poot_quant::format::ScaleEncoding::Bf16,
@@ -631,40 +711,32 @@ mod tests {
             &builder, x, "up_proj", descriptor, None, None,
         )
         .unwrap();
-        let target = Target::Gpu {
-            backend: Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
-            caps: DeviceCaps::rocm_default(),
-        };
         let options = CompileOptions::new(crate::CompileLimits::STANDARD);
-        let program = compile(&builder.finish(out).unwrap(), &target, &options).unwrap();
+        let program = compile(&builder.finish(out).unwrap(), target, &options).unwrap();
         let (eqn, plan) = program
             .planned()
             .find(|(eqn, _)| matches!(eqn.op, OpKind::PackedContraction { .. }))
             .unwrap_or_else(|| panic!("no PackedContraction planned"));
-        let Some(Dispatch { body, launch, .. }) = plan.single() else {
-            panic!("expected a single dispatch, got {plan:?}");
-        };
         let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(
             PackedContraction { schedule, .. },
         ))) = program.kernel_choice(eqn)
         else {
             panic!("a packed contraction is a generated contraction request");
         };
-        let Schedule::RegisterTiled { lanes, rows, run } = *schedule else {
-            panic!("a prefill linear is the register-tiled GEMM, got {schedule:?}");
-        };
-        assert_eq!(
-            (lanes.get(), rows.get(), run.get()),
-            (16, 8, 4),
-            "128 rows fill the 16x16 lane grid's 128-row tile; K = 5120 stages as word-sized runs of byte codes"
-        );
-        let (tile_rows, tile_cols) = schedule.output_tile().unwrap();
-        assert_eq!((tile_rows, tile_cols), (128, 64));
+        let (tile_rows, tile_cols) = schedule.output_tile().expect("a tiled schedule");
         let tiles = m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
-        assert_eq!(tiles, 272, "one row-tile of 128 by 272 column-tiles of 64");
-        assert_eq!(body.workgroup_size, [256, 1, 1]);
-        assert_eq!(launch.grid, [tiles as u32 * 256, 1, 1]);
-        assert_eq!(launch.meta, [k as u32, n as u32, m as u32, tiles as u32, 0]);
+        let launches = plan
+            .dispatches()
+            .iter()
+            .map(|dispatch| (dispatch.launch().grid, dispatch.launch().meta.clone()))
+            .collect();
+        let workgroup = plan.dispatches()[0].body().workgroup_size;
+        Fp8PrefillPlan {
+            schedule: *schedule,
+            tiles,
+            launches,
+            workgroup,
+        }
     }
 
     /// POOT-1263 (GPU-free): a packed tiled contraction (E4M3 here; the split is format-agnostic) whose multiply-accumulates exceed the device's

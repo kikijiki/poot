@@ -184,7 +184,7 @@ fn completion_sampler(
     }
     apply_guided(
         sampler,
-        model,
+        model.text(),
         &req.guided_choice,
         &req.guided_regex,
         &req.guided_grammar,
@@ -296,7 +296,7 @@ fn chat_sampler(model: &ModelHandle, req: &ChatReq, seed: u64, choice: usize) ->
     }
     apply_guided(
         sampler,
-        model,
+        model.text(),
         &req.guided_choice,
         &req.guided_regex,
         &req.guided_grammar,
@@ -481,8 +481,8 @@ pub(crate) fn handle_completion(
 }
 
 /// Render a chat request into its prompt tokens and the assistant turn-end stop markers: the jinja chat template
-/// (the checkpoint's, or the `--chat-template` given at startup) when there is one, else the per-arch
-/// `ChatFormat`. Shared by the stream and non-stream paths. The prompt must come from the template; wrong
+/// (the checkpoint's, or the `--chat-template` given at startup) when there is one, else the family's
+/// fallback format. Shared by the stream and non-stream paths. The prompt must come from the template; wrong
 /// markup degrades output and the turn-end never matches. A template that fails to render the conversation
 /// refuses the request rather than answering in another format. Message contents are tokenized as plain text:
 /// a message cannot spell a control token.
@@ -534,10 +534,11 @@ pub(crate) fn handle_chat(
         let content = completion.text.trim_end().to_string();
         let completion_tokens = completion_tokens(&served.model, completion, &content)?;
         total_completion += completion_tokens;
-        // If the model emitted <tool_call> markup, surface it as message.tool_calls with content=null and
-        // finish_reason "tool_calls". Only when the request offered tools; otherwise it stays plain text.
+        // If the model's codec finds tool calls in the completion, surface them as message.tool_calls with
+        // content=null and finish_reason "tool_calls". Only when the request offered tools; otherwise it
+        // stays plain text.
         let tool_calls = if req.tools.is_some() {
-            let tc = parse_tool_calls(&content);
+            let tc = parse_tool_calls(served.model.text(), &content);
             (!tc.is_empty()).then_some(tc)
         } else {
             None
@@ -615,7 +616,7 @@ pub(crate) fn stream_chat(
     };
     write_all_within(stream, SSE_HEADERS)?;
     // When the request offers `tools`, the output is buffered instead of streamed as content deltas,
-    // since `<tool_call>` markup must not reach the client as content. At choice end: parsed calls become
+    // since a tool call's markup must not reach the client as content. At choice end: parsed calls become
     // a `delta.tool_calls` chunk; otherwise the text is flushed as one content delta.
     let tools_mode = req.tools.is_some();
     let start = Instant::now();
@@ -681,7 +682,7 @@ pub(crate) fn stream_chat(
         // In tools mode, parse the buffered output: tool calls -> a tool_calls delta + "tool_calls"
         // finish; otherwise flush the buffer as one content delta and finish normally.
         let tool_calls = if tools_mode {
-            parse_tool_calls(&completion.text)
+            parse_tool_calls(served.model.text(), &completion.text)
         } else {
             Vec::new()
         };

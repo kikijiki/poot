@@ -312,6 +312,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: Some(p.bos.unwrap_or(GEMMA_BOS)),
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::Gemma,
+        tool_codec: None,
     };
     Ok(ModelParts::new(Box::new(Gemma4 {
         params: p,

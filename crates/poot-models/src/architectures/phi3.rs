@@ -207,6 +207,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::Phi3,
+        tool_codec: None,
     };
     Ok(ModelParts::new(Box::new(Phi3 {
         params: p,
@@ -493,6 +494,10 @@ mod tests {
         let model = model_of(&config, &fx.store);
         assert_eq!(model.config().eos, BTreeSet::from([32_000]));
         assert_eq!(model.config().chat, ChatFormat::Phi3);
+        assert!(
+            model.config().tool_codec.is_none(),
+            "Phi3 has no tool-call markup"
+        );
     }
 
     /// A Q8_0 phi3 GGUF (fused `attn_qkv` and `ffn_up` = gate||up, HF row order) and the HF F32

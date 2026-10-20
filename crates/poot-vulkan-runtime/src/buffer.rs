@@ -83,7 +83,14 @@ impl DeviceBuffer {
         }
     }
 
-    /// The number of 4-byte elements this buffer holds: the bound a dispatch passes the kernel for it.
+    /// The number of native elements ([`Self::element`]) this buffer holds: the bound a dispatch may tell
+    /// a kernel it has, in the unit of [`crate::Binding::elems`].
+    pub fn native_elems(&self) -> usize {
+        self.inner.byte_len / self.inner.storage.element().byte_width()
+    }
+
+    /// The number of 4-byte words this buffer holds, whatever its element kind; not the unit of a dispatch
+    /// length (see [`Self::native_elems`]).
     pub fn elem_count(&self) -> u32 {
         u32::try_from(self.inner.byte_len / 4)
             .expect("allocate_buffer_resources refuses a buffer whose element count exceeds u32")

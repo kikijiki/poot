@@ -11,6 +11,7 @@ use tokenizers::Tokenizer;
 use crate::chat::RenderedChat;
 use crate::chat_format::ChatFormat;
 use crate::error::{OptionExt, Result};
+use crate::tool_call::ToolCallCodec;
 
 /// A GGUF checkpoint's tokenizer metadata as plain data: the `tokenizer.ggml.*` and `tokenizer.chat_template`
 /// keys the text services read, each `None` when the file does not carry it. `poot-llm` fills it from the
@@ -87,6 +88,8 @@ pub struct TextCodec {
     /// The id a guided constraint permits once its pattern is complete.
     pub(crate) eos: u32,
     pub(crate) chat_format: ChatFormat,
+    /// The model's tool-call output format; `None` when its family has no tool-call markup.
+    pub(crate) tool_codec: Option<Arc<dyn ToolCallCodec>>,
     pub(crate) chat_template: ChatTemplate,
     /// Per-token UTF-8 bytes (token id -> decoded bytes), built once on first use: it depends only on
     /// the static tokenizer (~50ms for a 150k vocab).
@@ -127,6 +130,7 @@ impl TextCodec {
             eos_suffix: None,
             eos,
             chat_format,
+            tool_codec: None,
             chat_template,
             guided_byte_table: OnceLock::new(),
             guided_dfa_cache: Mutex::new(HashMap::new()),

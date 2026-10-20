@@ -156,6 +156,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::Olmo2,
+        tool_codec: None,
     };
     Ok(ModelParts::new(Box::new(Olmo2 {
         params: p,
@@ -410,6 +411,10 @@ mod tests {
         let model = model_of(&config, &fx.store);
         assert_eq!(model.config().eos, BTreeSet::from([50279]));
         assert_eq!(model.config().chat, ChatFormat::Olmo2);
+        assert!(
+            model.config().tool_codec.is_none(),
+            "Olmo2 has no tool-call markup"
+        );
     }
 
     /// llama.cpp's GGUF name of an OLMo 2 HF tensor.

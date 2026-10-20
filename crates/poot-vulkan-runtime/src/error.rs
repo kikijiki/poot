@@ -53,6 +53,17 @@ pub enum RuntimeError {
     /// release-build error before any submission.
     #[error("kernel argument schema violation: {0}")]
     KernelArgs(#[from] poot_runtime_common::KernelArgError),
+    /// A dispatch argument told the kernel it holds more elements than its buffer does. The kernel trusts
+    /// the length it is published, so the dispatch is refused before anything is recorded.
+    #[error("dispatch argument {arg} asserts {elems} elements, its buffer holds {capacity}")]
+    ArgExceedsBuffer {
+        /// Position of the argument in the dispatch.
+        arg: usize,
+        /// The element count the dispatch asserted.
+        elems: u32,
+        /// The element count the buffer holds.
+        capacity: usize,
+    },
     /// A pipeline key was reused for a different kernel: other SPIR-V, argument schema or trap shape.
     #[error("pipeline key {key:?} is cached for a different kernel")]
     PipelineKeyConflict {

@@ -52,7 +52,7 @@ use crate::components::standard::{
 use crate::io::{ModelSchema, StateSpec};
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, FixtureVariant, ModelParts, RawConfig};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("qwen35");
 
@@ -548,6 +548,7 @@ fn assemble(p: Qwen35Params, store: &WeightStore) -> Result<ModelParts, ModelErr
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     };
     Ok(ModelParts::new(Box::new(Qwen35 {
         params: p,

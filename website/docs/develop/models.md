@@ -179,7 +179,7 @@ is five things, plus a checkpoint to load:
    ships them) and the weights and returns the model container, `ModelParts`: for a text family just the model,
    built with `ModelParts::new`. The model's `ModelConfig` carries what the driver needs to know without
    naming the family: the vocabulary size, the maximum positions, the end-of-sequence ids, the prefill
-   granule and the fallback chat format. Register the entry with `Registry::register`, then pass the registry
+   granule, the fallback chat format and the family's tool-call codec (none for a family without a tool format). Register the entry with `Registry::register`, then pass the registry
    to `ModelHandle::load`.
 
 The checkpoint directory that `ModelHandle::load` reads holds `config.json`, the safetensors weights and a

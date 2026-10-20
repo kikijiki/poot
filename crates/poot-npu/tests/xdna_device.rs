@@ -494,7 +494,10 @@ fn f32_bytes(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
 /// the shape ABI, and a written output that is not last are each a typed [`XdnaError`]; the refusal leaves
 /// the device healthy, and the valid dispatch that follows runs and computes the sum.
 ///
-/// Mutation: delete the `check_bindings` call in `XdnaDevice::dispatch`. The short-buffer dispatch is
+/// Whether a buffer holds the element count a dispatch asserts is not the device's question: the engine
+/// bounds it by `buffer_elems` for every backend (`poot_executor::DispatchError::ArgExceedsBuffer`).
+///
+/// Mutation: delete the `check_bindings` call in `XdnaDevice::dispatch`. The one-element-short dispatch is
 /// recorded, runs, and the device fails or computes over the wrong length instead of returning `Bindings`.
 #[test]
 fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
@@ -519,7 +522,6 @@ fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
     let a = alloc(&mut device, BufferRole::Weight, N);
     let b = alloc(&mut device, BufferRole::Weight, N);
     let out = alloc(&mut device, BufferRole::Activation, N);
-    let short = alloc(&mut device, BufferRole::Activation, N - 1);
     poot_executor::write_slice(&mut device, &a, 0, &f32_bytes((0..N).map(|i| i as f32))).unwrap();
     poot_executor::write_slice(
         &mut device,
@@ -575,10 +577,6 @@ fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
     ));
     assert!(matches!(
         try_dispatch(&mut device, aie, &inputs[..1], arg(&out, N as u32)),
-        Err(XdnaError::Bindings { .. })
-    ));
-    assert!(matches!(
-        try_dispatch(&mut device, aie, &inputs, arg(&short, (N - 1) as u32)),
         Err(XdnaError::Bindings { .. })
     ));
     assert!(matches!(

@@ -29,7 +29,7 @@ use poot_quant::weights::{WeightMap, WeightStore};
 use poot_runtime_common::{BufferRole, MemoryCounters};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
@@ -180,6 +180,7 @@ fn build_tiny(raw: &RawConfig<'_>) -> Result<ModelParts, ModelError> {
             prompt_bos: None,
             prefill_granule: NonZeroUsize::MIN,
             chat: ChatFormat::ChatML,
+            tool_codec: Some(Arc::new(HermesToolCodec)),
         },
         schema,
         weights: WeightMap::default(),

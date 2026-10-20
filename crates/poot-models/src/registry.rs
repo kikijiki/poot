@@ -543,7 +543,9 @@ mod tests {
     use poot_graph_ir::Graph;
     use poot_quant::StoredBytes;
     use poot_quant::weights::WeightMap;
-    use poot_text::ChatFormat;
+    use std::sync::Arc;
+
+    use poot_text::{ChatFormat, HermesToolCodec};
     use std::num::NonZeroUsize;
 
     /// SC-001: `Family::ALL` lists every variant exactly once, in index order, and the built-in
@@ -776,6 +778,7 @@ mod tests {
             prompt_bos: None,
             prefill_granule: NonZeroUsize::MIN,
             chat: ChatFormat::ChatML,
+            tool_codec: Some(Arc::new(HermesToolCodec)),
         };
         assert_eq!(config.eos, BTreeSet::from([151643, 151645]));
     }

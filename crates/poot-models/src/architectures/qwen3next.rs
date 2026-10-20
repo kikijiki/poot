@@ -15,6 +15,7 @@
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{
@@ -38,7 +39,7 @@ use crate::io::{ModelSchema, StateSpec};
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::{ExpertNames, MoeNames, SharedNames, map_moe_layer};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 /// Qwen3-Next's [`FamilyKey`].
 pub const FAMILY: FamilyKey = FamilyKey::new("qwen3next");
@@ -572,6 +573,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     };
     Ok(ModelParts::new(Box::new(Qwen3Next {
         params: p,

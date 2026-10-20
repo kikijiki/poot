@@ -44,6 +44,7 @@
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use poot_graph_ir::rope_table::RopeFlavor;
 use poot_graph_ir::{Builder, Graph};
@@ -64,7 +65,7 @@ use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, Step
 use crate::names::gguf::GGUF_MPT;
 use crate::names::{FusedDims, FusedPart, NameRow, Presence, Source, family_weights_fused};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_text::ChatFormat;
+use poot_text::{ChatFormat, HermesToolCodec};
 
 // The `mpt` family behind [`Model`]: bias-free LayerNorm blocks, ALiBi attention over a fused
 // contiguous `Wqkv`, and a plain exact-GELU MLP, in the standard stack and layer.
@@ -337,6 +338,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
+        tool_codec: Some(Arc::new(HermesToolCodec)),
     };
     Ok(ModelParts::new(Box::new(Mpt {
         params: p,
