@@ -7,7 +7,7 @@
 //! serial chain is `rows / split` rows long. The rule reads the layout and the device's limits, nothing else.
 
 use super::{BodyLimits, Capability, Eqn, KernelRequest, OpKind, PlanError, Planned, value_ids};
-use crate::planner::GraphTables;
+use crate::planner::{GraphTables, StorageDtypes};
 use crate::refusal::Site;
 use poot_graph_ir::{ScanFamily, ScanLayout};
 use poot_kernelgen::{ScanKernel, ScanSpec};
@@ -84,6 +84,12 @@ pub(crate) fn scan_geometry(layout: &ScanLayout, caps: &DeviceCaps) -> Option<Sc
             .find_map(|split| fit(split, lanes_limit))
             .unwrap_or(unsplit),
     )
+}
+
+/// Whether this family lowers these storage dtypes: its bodies are f32/i32 only, so a 2-byte float or a
+/// packed E4M3FN payload is refused by name.
+pub(super) fn admits_dtypes(dtypes: StorageDtypes) -> Result<(), Capability> {
+    dtypes.refuse_unwired()
 }
 
 pub(super) fn plan(

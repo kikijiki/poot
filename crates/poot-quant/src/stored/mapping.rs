@@ -16,8 +16,10 @@
 //!    whatever the hardware then does; a truncation ends the process with `SIGBUS`. The content checks of
 //!    a packed payload (finite scales, group-index range) run once on the mapped bytes at load and the
 //!    bytes are read again at upload, so a modification between the two can put an unchecked value on
-//!    the device. A modification already made is refused by [`MappedFile::check_unchanged`] at the load
-//!    end and at each binder boundary; one racing a read in flight is not detected. Replacing a
+//!    the device. [`MappedFile::check_unchanged`] runs at the load end and on both sides of the
+//!    load-time upload's reads, so a modification made before, or during, that upload is refused after
+//!    it and the weights are dropped unpublished. The runtime reads of the mapping (embed rows, expert
+//!    refills) are not followed by a check, so a modification racing one is not detected. Replacing a
 //!    checkpoint by rename never modifies a mapped inode and is always safe.
 //!
 //! `MappedFile` is `Send + Sync` through the auto traits (`memmap2::Mmap` and `File` are); there is no

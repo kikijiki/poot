@@ -130,6 +130,9 @@ pub struct Dispatch {
     pub(crate) launch: Launch,
     binding: Binding,
     choice: KernelChoice,
+    /// The planner's watchdog cost of this dispatch ([`Dispatch::work`]); `None` until the equation's plan
+    /// assigns it ([`DispatchPlan::apportion_work`]).
+    work: Option<u64>,
 }
 
 impl Dispatch {
@@ -148,7 +151,22 @@ impl Dispatch {
             launch,
             binding,
             choice,
+            work: None,
         }
+    }
+
+    /// The planner-computed watchdog cost of this dispatch, in the unit `FlushPolicy` bounds: the equation's
+    /// output element count apportioned over its dispatches by the threads each launches
+    /// ([`DispatchPlan::apportion_work`]). The contracted dimension is not in it, so a long-`K` contraction
+    /// weighs the same as a short one of equal output.
+    ///
+    /// # Panics
+    ///
+    /// If the dispatch never went through an equation's plan: a zero cost would silently disable the
+    /// executor's watchdog split, so a dispatch with no assigned cost is refused loudly instead.
+    pub fn work(&self) -> u64 {
+        self.work
+            .expect("a dispatch's work is assigned when its equation is planned")
     }
 
     /// The kernel body.
@@ -532,6 +550,28 @@ impl DispatchPlan {
         match self.dispatches.as_slice() {
             [dispatch] => Some(dispatch),
             _ => None,
+        }
+    }
+
+    /// Set every dispatch's [`Dispatch::work`] from `total`, the equation's output element count, in proportion
+    /// to the threads each dispatch launches, so a chunked plan's last, smaller chunk weighs less than a full
+    /// one. A plan whose dispatches launch no threads splits `total` evenly.
+    pub(crate) fn apportion_work(&mut self, total: u64) {
+        let threads = |dispatch: &Dispatch| {
+            dispatch
+                .launch
+                .grid
+                .iter()
+                .map(|&extent| u128::from(extent))
+                .product::<u128>()
+        };
+        let launched: u128 = self.dispatches.iter().map(threads).sum();
+        let count = self.dispatches.len() as u128;
+        for dispatch in &mut self.dispatches {
+            let share = (u128::from(total) * threads(dispatch))
+                .checked_div(launched)
+                .unwrap_or(u128::from(total) / count);
+            dispatch.work = Some(u64::try_from(share).expect("a share of a u64 total fits a u64"));
         }
     }
 

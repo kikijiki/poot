@@ -6,12 +6,24 @@ use super::{
     KernelRequest, MatmulShapes, OpKind, PlanError, Planned, ValueId, WeightLayout, kg, matmul,
     value_ids,
 };
-use crate::planner::{GraphTables, finalize};
+use crate::planner::{GraphTables, StorageDtypes, finalize};
 use crate::predicates::{dense_decode_gemv_in, elementwise_fold};
 use crate::refusal::Site;
 use crate::storage_analysis::dense_contraction_weight_storage;
 use crate::types::{StorageKind, ValueStorage};
 use poot_target::{Backend, DeviceCaps};
+
+/// Whether this family lowers `op` over these storage dtypes. The E4M3FN table row gather reads the
+/// payload as row-padded u32 words on every device (so it needs no native E4M3FN storage); no other dense
+/// reader takes an E4M3FN operand, and none produces a 2-byte float (a dense contraction is F32 out).
+pub(super) fn admits_dtypes(op: &OpKind, dtypes: StorageDtypes) -> Result<(), Capability> {
+    match op {
+        OpKind::DenseRowGather {
+            source: DType::E4M3FN,
+        } => Ok(()),
+        _ => dtypes.refuse_unwired(),
+    }
+}
 
 /// Plan one packed-reader equation (DenseContraction/DenseRowGather).
 #[expect(clippy::too_many_arguments)]

@@ -147,6 +147,7 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
             attrs.compute_capability_major,
         )
         .known(),
+        launch_class: poot_target::calibration::LaunchClass::Cuda,
     }
 }
 

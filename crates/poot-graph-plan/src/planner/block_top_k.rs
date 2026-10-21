@@ -6,10 +6,16 @@
 //! A device below that refuses with a typed [`Capability::BlockTopKWorkgroup`], never a quadratic fallback.
 
 use super::{BodyLimits, Capability, Eqn, KernelRequest, OpKind, PlanError, Planned, value_ids};
-use crate::planner::GraphTables;
+use crate::planner::{GraphTables, StorageDtypes};
 use crate::refusal::Site;
 use poot_kernelgen::{BLOCK_TOP_K_LANES, BlockTopKSpec};
 use poot_target::{Backend, DeviceCaps};
+
+/// Whether this family lowers these storage dtypes: its bodies are f32/i32 only, so a 2-byte float or a
+/// packed E4M3FN payload is refused by name.
+pub(super) fn admits_dtypes(dtypes: StorageDtypes) -> Result<(), Capability> {
+    dtypes.refuse_unwired()
+}
 
 pub(super) fn plan(
     g: GraphTables<'_>,

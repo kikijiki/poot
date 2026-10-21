@@ -1000,7 +1000,7 @@ fn many_layer_prefill_splits_submits_by_dispatch_count_and_matches_the_oracle() 
 
 /// SC-008: a fixture whose dispatch *count* stays far under the `FlushPolicy` dispatch bound but
 /// whose summed `Dispatch::work` crosses its work bound on its own - the prior dispatch-count fixture
-/// never exercises this (an "ignore `Dispatch::work`" probe stayed green against it). `dispatch_work` is an equation's OUTPUT element count only, never the
+/// never exercises this (an "ignore `Dispatch::work`" probe stayed green against it). a dispatch's planned work (`Dispatch::work`) is its share of the equation's OUTPUT element count only, never the
 /// contracted dimension, so a single-layer decode step with a huge `vocab` crosses the work bound in
 /// the lm_head matmul's one equation while the real FLOPs (vocab * hidden) and the CPU oracle's cost
 /// stay small, since hidden/layers/cap all stay tiny.

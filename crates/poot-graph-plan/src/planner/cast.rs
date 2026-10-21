@@ -4,9 +4,19 @@ use super::{
     BodyLimits, Capability, CastSpec, ContractionHead, DType, ElementwiseSpec, Eqn, ImportedKernel,
     KernelRequest, OpKind, PlanError, Planned, ValueId, value_ids,
 };
-use crate::planner::GraphTables;
+use crate::planner::{GraphTables, StorageDtypes};
 use crate::refusal::Site;
 use poot_target::{Backend, DeviceCaps};
+
+/// Whether this family lowers these storage dtypes: a cast reads and writes E4M3FN only on a device that
+/// stores it natively, and its (input, output) pair is then matched exhaustively by [`plan`].
+pub(super) fn admits_dtypes(dtypes: StorageDtypes, caps: &DeviceCaps) -> Result<(), Capability> {
+    if dtypes.touches_e4m3fn() && caps.e4m3_storage == poot_target::E4m3Storage::None {
+        Err(Capability::E4m3Storage)
+    } else {
+        Ok(())
+    }
+}
 
 /// Plan one Cast equation, matching the (input, output) dtype pair exhaustively.
 #[expect(clippy::too_many_arguments)]

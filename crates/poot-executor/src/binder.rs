@@ -113,7 +113,8 @@ pub(crate) struct StoredSpan {
     pub role: Option<SourceRole>,
     pub bytes: Range<usize>,
     /// The bytes are an I64 table read as I32 ([`WeightView::IndexNarrow`]): [`WeightWriter`]
-    /// narrows each word. The map range-checked the table against this very entry when it was built.
+    /// narrows each word ([`narrow_word`]). The map range-checked the table against this very entry when
+    /// it was built.
     pub narrowed: bool,
 }
 
@@ -167,6 +168,14 @@ fn stored_bytes<'s>(store: &'s WeightStore, span: &StoredSpan) -> &'s [u8] {
         _ => unreachable!("a span is built from the store it reads"),
     };
     &stored[span.bytes.clone()]
+}
+
+/// One word of an I64 table read as I32 ([`StoredSpan::narrowed`]). The map range-checked every word
+/// when it was built, so a word outside I32 can only come from a source file modified since: it
+/// saturates, never panics. The load-time upload's identity check after its reads
+/// ([`WeightBinder::check_sources`]) refuses the modified source, so the saturated word is not published.
+fn narrow_word(wide: i64) -> i32 {
+    i32::try_from(wide).unwrap_or(if wide < 0 { i32::MIN } else { i32::MAX })
 }
 
 impl StoredSpan {
@@ -260,9 +269,7 @@ impl WeightWriter {
                     let (word, lane) = (offset / 4, offset % 4);
                     let wide =
                         i64::from_le_bytes(stored[word * 8..word * 8 + 8].try_into().unwrap());
-                    let value = i32::try_from(wide)
-                        .expect("WeightMapBuilder::map range-checked this table against the store");
-                    *byte = value.to_le_bytes()[lane];
+                    *byte = narrow_word(wide).to_le_bytes()[lane];
                 }
             } else {
                 into.copy_from_slice(&stored[lo - start..hi - start]);
@@ -391,7 +398,9 @@ impl WeightBinder {
     }
 
     /// The store's mapped checkpoint files are still the files that were loaded (one `fstat` per
-    /// file): the boundary before a bind batch reads the store's views.
+    /// file). `Engine::add_part` runs it on both sides of the load-time upload's reads: before, so no
+    /// page of a changed file is read; after, so the bytes that upload read are the bytes the load
+    /// validated. The runtime reads (embed rows, expert refills) are not followed by it.
     pub(crate) fn check_sources(&self) -> Result<(), LoadError> {
         Ok(self.store.check_sources()?)
     }
@@ -746,12 +755,16 @@ impl WeightBinder {
         let mut base = 0;
         for span in &bytes.spans {
             let stored = stored_bytes(&self.store, span);
-            // A narrowed span is an I64 table whose map already range-checked every word into I32.
+            // A narrowed span is an I64 table whose words the map range-checked into I32
+            // ([`narrow_word`]).
             let words: Box<dyn Iterator<Item = i32> + '_> = if span.narrowed {
-                Box::new(stored.as_chunks::<8>().0.iter().map(|word| {
-                    i32::try_from(i64::from_le_bytes(*word))
-                        .expect("WeightMapBuilder::map range-checked this table against the store")
-                }))
+                Box::new(
+                    stored
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|word| narrow_word(i64::from_le_bytes(*word))),
+                )
             } else {
                 Box::new(
                     stored
@@ -1048,6 +1061,19 @@ mod tests {
             binder.const_bytes(ValueId::new(0), name.as_str(), &per_expert, None),
             Err(LoadError::WeightShape { .. })
         ));
+    }
+
+    /// POOT-1300: a narrowed word outside I32 (only a modified source file holds one) saturates instead of
+    /// panicking in the upload; the load-time upload's identity check after its reads refuses the file.
+    /// Mutation: make `narrow_word` `unwrap` the conversion; the out-of-range rows go red.
+    #[test]
+    fn narrow_word_saturates_outside_i32() {
+        assert_eq!(narrow_word(7), 7);
+        assert_eq!(narrow_word(-7), -7);
+        assert_eq!(narrow_word(i64::from(i32::MAX) + 1), i32::MAX);
+        assert_eq!(narrow_word(i64::from(i32::MIN) - 1), i32::MIN);
+        assert_eq!(narrow_word(i64::MAX), i32::MAX);
+        assert_eq!(narrow_word(i64::MIN), i32::MIN);
     }
 
     /// POOT-1100 LP-4: a stack's writer fills any chunking of its range with the transport layout of

@@ -123,6 +123,7 @@ impl Context {
             imported_lds_array_bodies: true,
             peer_transport: false,
             decode_gemv_max_out_cols: None,
+            launch_class: poot_target::calibration::LaunchClass::Vulkan,
         }
     }
 

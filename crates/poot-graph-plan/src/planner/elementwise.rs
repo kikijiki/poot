@@ -11,10 +11,25 @@ use crate::kernel_mapping::{
     map_fused_input_i32, map_fused_local, map_fused_op, map_mixed_input_i32, map_pointwise_step,
     map_unary,
 };
-use crate::planner::{GraphTables, Layout};
+use crate::planner::{GraphTables, Layout, StorageDtypes};
 use crate::predicates::{ELEMENTWISE_2D_WIDTH, elementwise_fold, row_parallel_width};
 use crate::refusal::Site;
 use poot_graph_ir::LocalId;
+
+/// Whether this family lowers `op` over these storage dtypes. A packed E4M3FN payload is never an
+/// elementwise operand; a 2-byte float output is wired for the pointwise and reduce bodies but not for the
+/// fused-region, fused-row and RoPE bodies, which compute over f32 storage.
+pub(super) fn admits_dtypes(op: &OpKind, dtypes: StorageDtypes) -> Result<(), Capability> {
+    if dtypes.touches_e4m3fn() {
+        return Err(Capability::E4m3Storage);
+    }
+    match op {
+        OpKind::Rope { .. } | OpKind::Fused(_) | OpKind::FusedRow(_) if dtypes.out_is_half() => {
+            Err(Capability::DtypeLowering)
+        }
+        _ => Ok(()),
+    }
+}
 
 /// Plan one elementwise-family equation (Binary/Select/Unary/Rope/Reduce/Fused/FusedRow).
 #[expect(clippy::too_many_arguments)]

@@ -337,18 +337,11 @@ pub(crate) fn fty_ty(d: DType) -> Ty {
     }
 }
 
-/// Card 546a (S46-11, moved from `poot-wgpu-device`'s `exec.rs::eqn_work_units`, deleted as a vestigial
-/// wrapper before this card landed): one equation's watchdog work weight, the
-/// planner-owned cost `Device::dispatch`'s caller (the contract engine) carries in `Dispatch::work`
-/// to split a long run of dispatches across several submits before the device driver's TDR fires.
-///
-/// Every equation's weight is its output element count: the dense elementwise/reduction/contraction
-/// kernels this crate plans are all one thread (or one serial per-thread reduction) per output
-/// element. `PackedContraction` does not need its own arm: Card 658 retagged every packed contraction
-/// onto `Schedule::Tiled`'s fold-aware grid (never `Schedule::Serial`'s per-thread-unbounded K loop),
-/// so the O(K) serial-reduction gap an earlier design named is already closed - the output
-/// element count bounds the per-thread work for every op class this planner emits.
-pub fn dispatch_work(g: &Graph, eqn: &Eqn) -> u64 {
+/// The watchdog work weight of one member of a fused region, which has no dispatch plan of its own to carry a
+/// cost: the member's output element count. It is a proxy, not a bound on the member's work: a contraction's
+/// cost grows with its contracted dimension, which this weight leaves out. A planned dispatch carries its own
+/// cost ([`crate::Dispatch::work`], [`crate::DispatchPlan::apportion_work`]).
+pub fn region_member_work(g: &Graph, eqn: &Eqn) -> u64 {
     numel(&g.aval(eqn.out).shape) as u64
 }
 
@@ -487,7 +480,7 @@ pub(crate) fn plan_eqn_views_impl(
     packed_operands: &[bool],
     limits: BodyLimits,
 ) -> Result<Planned, PlanError> {
-    match target {
+    let mut planned = match target {
         Target::Gpu { backend, caps } => plan_gpu_eqn(
             g,
             eqn,
@@ -511,7 +504,11 @@ pub(crate) fn plan_eqn_views_impl(
             limits,
         ),
         Target::Vpu { caps, .. } => vpu::plan_eqn(g, eqn, caps),
+    }?;
+    if let Plan::Dispatches(dispatches) = &mut planned.plan {
+        dispatches.apportion_work(out_numel as u64);
     }
+    Ok(planned)
 }
 
 /// An AIE target's per-equation plan. The AIE core runs one sequential loop, and `poot-kernelgen` has a
@@ -573,6 +570,60 @@ fn plan_aie_eqn(
     Ok(planned)
 }
 
+/// The storage dtypes of one equation that decide whether its family can lower it: the output's, and
+/// whether any operand is a packed E4M3FN payload (which scalar type selection would otherwise reinterpret
+/// as f32/i8/i32).
+#[derive(Clone, Copy)]
+pub(crate) struct StorageDtypes {
+    pub(crate) out: DType,
+    pub(crate) reads_e4m3fn: bool,
+}
+
+impl StorageDtypes {
+    /// Whether the equation's output or any operand is E4M3FN.
+    pub(crate) fn touches_e4m3fn(self) -> bool {
+        self.out == DType::E4M3FN || self.reads_e4m3fn
+    }
+
+    /// Whether the output is a 2-byte float, which the kernel element type must bridge to `Ty::BF16` or
+    /// `Ty::F16` rather than fall into f32 over 2-byte storage.
+    pub(crate) fn out_is_half(self) -> bool {
+        matches!(self.out, DType::BF16 | DType::F16)
+    }
+
+    /// The rule of a family with no E4M3FN or 2-byte float body: both are refused by name.
+    pub(crate) fn refuse_unwired(self) -> Result<(), Capability> {
+        if self.touches_e4m3fn() {
+            Err(Capability::E4m3Storage)
+        } else if self.out_is_half() {
+            Err(Capability::DtypeLowering)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Ask the family that lowers `op` whether it lowers these storage dtypes on this device. Each family owns
+/// its decision (`admits_dtypes` in its module); this only routes, so a family gaining a dtype row changes
+/// that family alone.
+fn admit_dtypes(op: &OpKind, dtypes: StorageDtypes, caps: &DeviceCaps) -> Result<(), Capability> {
+    match op {
+        packed_ops!() => packed::admits_dtypes(op, dtypes),
+        moe_ops!() => moe::admits_dtypes(dtypes),
+        elementwise_ops!() => elementwise::admits_dtypes(op, dtypes),
+        matmul_ops!() => matmul::admits_dtypes(dtypes),
+        attention_ops!() => attention::admits_dtypes(dtypes),
+        scan_ops!() => scan::admits_dtypes(dtypes),
+        block_top_k_ops!() => block_top_k::admits_dtypes(dtypes),
+        sampling_ops!() => sampling::admits_dtypes(dtypes),
+        cast_ops!() => cast::admits_dtypes(dtypes, caps),
+        movement_ops!() => movement::admits_dtypes(op, dtypes, caps),
+        // An unfolded `Iota` and an imported op are refused (or routed) by their own arms, before any dtype
+        // rule applies.
+        OpKind::Iota { .. } | imported_ops!() => Ok(()),
+    }
+}
+
 /// A GPU target's per-equation planner body: one thin dispatch table. It runs the shared dtype/storage
 /// guards, routes each op family to its owned function and applies the shared launch-shaping postamble
 /// (`finalize`).
@@ -606,52 +657,14 @@ fn plan_gpu_eqn(
         );
     }
     let ids = value_ids(eqn);
-
-    // Spec 149 SC-005d/e/f/g/h/i/j/k/n: only storage-aware executor entry points bind the packed
-    // representation. The shared planner exposes Cast/Reshape/Transpose/Slice/Gather/Concat/Broadcast/
-    // DynamicUpdateSlice/ScatterUpdate bodies here for SPIR-V/wgpu and bounded PTX typed capture. Every
-    // other op/backend keeps a named rejection before scalar type selection can reinterpret E4M3FN as f32/i8/i32.
-    let has_e4m3fn_input = ids.iter().any(|&id| g.aval(id).dtype == DType::E4M3FN);
-    if g.aval(eqn.out).dtype == DType::E4M3FN || has_e4m3fn_input {
-        // A device without native E4M3FN tensor storage still reads the table through the packed-lane row
-        // gather, which takes it as row-padded u32 words like the BF16 one, so it alone is admitted there.
-        let admitted_row_gather = matches!(
-            eqn.op,
-            OpKind::DenseRowGather {
-                source: DType::E4M3FN
-            }
-        );
-        if caps.e4m3_storage == poot_target::E4m3Storage::None && !admitted_row_gather {
-            return Err(site.refuse(Capability::E4m3Storage));
-        }
-        if !matches!(
-            eqn.op,
-            OpKind::Cast { .. }
-                | OpKind::Reshape { .. }
-                | OpKind::Transpose { .. }
-                | OpKind::Slice { .. }
-                | OpKind::Gather { .. }
-                | OpKind::Broadcast { .. }
-                | OpKind::Concat { .. }
-                | OpKind::ScatterUpdate
-                | OpKind::DynamicUpdateSlice { .. }
-                // Card 449 D1: the PLE sharded E4M3FN table lookup `fold_dense_bf16_row_gathers`
-                // rewrites into one equation (the Card 381 BF16 row's second source dtype). The
-                // table is the only E4M3FN operand - the index is I32 and the output F32 -
-                // and the storage plan gives the table its packed lane (`StorageKind::E4m3Packed`, or
-                // refuses it by name), so no dtype rule beyond "this op may read E4M3FN" is needed here.
-                | OpKind::DenseRowGather { source: DType::E4M3FN }
-        ) {
-            return Err(site.refuse(Capability::E4m3Storage));
-        }
-    }
-
-    // spec 024: the output storage dtype. bf16 is wired only for MatMul, broadcast Binary (value
-    // operand), and Reshape (a buffer alias, dtype-agnostic); reject bf16 elsewhere with a clear
-    // diagnostic rather than silently emitting an f32 kernel on bf16 bytes. `fty` maps the
-    // dtype to the kernel element Ty; `dtag` is the cache-key dtype tag (empty for f32, so f32 keys are
-    // unchanged).
     let odt = g.aval(eqn.out).dtype;
+    let dtypes = StorageDtypes {
+        out: odt,
+        reads_e4m3fn: ids.iter().any(|&id| g.aval(id).dtype == DType::E4M3FN),
+    };
+    if let Err(missing) = admit_dtypes(&eqn.op, dtypes, caps) {
+        return Err(site.refuse(missing));
+    }
     if odt == DType::I32
         && out_shape
             .iter()
@@ -661,31 +674,6 @@ fn plan_gpu_eqn(
         return Err(PlanError::BadShape(format!(
             "I32 output shape {out_shape:?} overflows usize"
         )));
-    }
-    // spec 135: F16 bridges to Ty::F16 exactly like BF16 bridges to Ty::BF16 (storage is 2 bytes;
-    // arithmetic accumulates in f32 in both cases). It must not fall into the `else` and be bridged to
-    // Ty::F32 over 2-byte storage, which miscompiles.
-    if odt == DType::BF16 || odt == DType::F16 {
-        let wired = matches!(
-            eqn.op,
-            OpKind::MatMul
-                | OpKind::ContractionEpilogue { .. }
-                | OpKind::Reshape { .. }
-                | OpKind::Transpose { .. }
-                | OpKind::Slice { .. }
-                | OpKind::Broadcast { .. }
-                | OpKind::Binary(_)
-                | OpKind::Unary(_)
-                | OpKind::Select
-                | OpKind::Gather { .. }
-                | OpKind::Concat { .. }
-                | OpKind::DynamicUpdateSlice { .. }
-                | OpKind::Reduce { .. }
-                | OpKind::Cast { .. }
-        );
-        if !wired {
-            return Err(site.refuse(Capability::DtypeLowering));
-        }
     }
     if odt == DType::I32 && matches!(eqn.op, OpKind::Reduce { .. } | OpKind::FusedRow(_)) {
         return Err(site.refuse(Capability::ExactI32Op));

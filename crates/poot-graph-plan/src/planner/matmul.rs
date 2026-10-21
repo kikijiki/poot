@@ -9,11 +9,11 @@ use crate::dtype_widen::{
     matmul_amd_tc_eligible, matmul_nvptx_tc_eligible, matmul_spirv_coopmat_eligible,
 };
 use crate::kernel_mapping::{check_widening_step, float_region_leaf_storage, map_fused_op};
-use crate::planner::GraphTables;
+use crate::planner::{GraphTables, StorageDtypes};
 use crate::predicates::{
-    GEMM_TILE, GEMV_WIDTH, decode_gemv_plan, elementwise_fold, indexed_matmul_lowers,
-    is_batched_tiled_gemm_in, is_decode_attn_gemv_in, is_decode_gemv_in, is_tileable_matmul_in,
-    is_tiled_gemm_in, packed_contraction_m_per_block, tiled_gemm_plan,
+    GEMV_WIDTH, IMPORTED_TILED_GEMM_TILE, decode_gemv_plan, elementwise_fold,
+    indexed_matmul_lowers, is_batched_tiled_gemm_in, is_decode_attn_gemv_in, is_decode_gemv_in,
+    is_tileable_matmul_in, is_tiled_gemm_in, packed_contraction_m_per_block, tiled_gemm_plan,
 };
 use crate::refusal::{FusedStepGap, Site};
 use poot_graph_ir::{ContractionRows, LocalId};
@@ -297,6 +297,16 @@ pub(super) fn epilogue_of(
     })
 }
 
+/// Whether this family lowers these storage dtypes: the matmul bodies take BF16 and F16 operands and
+/// outputs, and never a packed E4M3FN payload.
+pub(super) fn admits_dtypes(dtypes: StorageDtypes) -> Result<(), Capability> {
+    if dtypes.touches_e4m3fn() {
+        Err(Capability::E4m3Storage)
+    } else {
+        Ok(())
+    }
+}
+
 /// Plan one matmul-family equation (`MatMul`, or a `ContractionEpilogue` over a `MatMul` head).
 #[expect(clippy::too_many_arguments)]
 pub(super) fn plan(
@@ -445,12 +455,13 @@ pub(super) fn plan(
                     // `[E,M,K,N]` it bakes as consts ride in a metadata buffer (launch metadata).
                     let ec: usize = out_shape[..r - 2].iter().product();
                     let mm = out_shape[r - 2];
-                    let groups = mm.div_ceil(2 * GEMM_TILE) * nn.div_ceil(GEMM_TILE);
+                    let tile = IMPORTED_TILED_GEMM_TILE;
+                    let groups = mm.div_ceil(2 * tile) * nn.div_ceil(tile);
                     Planned::imported(
                         ImportedKernel::TiledGemmBatched,
                         backend,
                         Some(vec![ec as u32, mm as u32, kk as u32, nn as u32]),
-                        [(ec * groups * GEMM_TILE * GEMM_TILE) as u32, 1, 1],
+                        [(ec * groups * tile * tile) as u32, 1, 1],
                     )?
                 }
                 MatMulRoute::AttnGemv => {
@@ -581,13 +592,13 @@ pub(super) fn tiled_region_plan(
     if layout == WeightLayout::Kn && weight != poot_target::BufferStorage::f32() {
         return Err(site.refuse(Capability::DtypeLowering));
     }
-    let groups = m.div_ceil(2 * GEMM_TILE) * n.div_ceil(GEMM_TILE);
+    let tile = caps.gemm_launch().tile_edge as usize;
+    let groups = m.div_ceil(2 * tile) * n.div_ceil(tile);
     let over_cap = caps
         .known_miscompiles
         .tiled_gemm_max_workgroups
         .is_some_and(|max| groups >= max as usize);
     let region = |offset: usize, groups: usize| {
-        let tile = GEMM_TILE;
         KernelRequest::Contraction(match layout {
             WeightLayout::Kn => ContractionSpec::TiledRegion {
                 m,

@@ -184,6 +184,10 @@ impl Schedule {
     }
 }
 
+/// Rows per lane of the wide register tile that [`RegisterTiling::choose`] sizes: with the 16-lane wide edge it is
+/// the 128-row tile (card 542b / POOT-1193, the shape the register-tiled kernel was swept at).
+const WIDE_TILE_LANE_ROWS: usize = 8;
+
 /// The geometry of a [`Schedule::RegisterTiled`] contraction, chosen from the shapes and the device by
 /// [`RegisterTiling::choose`]. It is the schedule's fields before they are wrapped, so a planner reads the lane
 /// grid and output tile it launches without destructuring the [`Schedule`] again.
@@ -196,21 +200,22 @@ pub struct RegisterTiling {
 
 impl RegisterTiling {
     /// The tiling for a block-diagonal contraction of `m_per_block` activation rows per block over a weight whose
-    /// rows hold `k` values, on `caps`: the 16x16 lane grid (a 128-row tile) once there are 128 rows and the
-    /// device runs 256-lane workgroups with room for its two tiles, else the 8x8 grid; rows per lane so the tile
-    /// does not far exceed the rows ([`LaneRows::covering`]); and the longest run that divides `k`. Chosen from
-    /// shapes and device limits alone, never from the format.
+    /// rows hold `k` values, on `caps`: the wide lane grid (`caps.gemm_launch`, a 128-row tile at 16x16) once there
+    /// are enough rows and the device runs its workgroups with room for the two tiles, else the narrow grid; rows
+    /// per lane so the tile does not far exceed the rows ([`LaneRows::covering`]); and the longest run that
+    /// divides `k`. Chosen from shapes and device limits alone, never from the format.
     pub fn choose(m_per_block: usize, k: usize, caps: &poot_target::DeviceCaps) -> Self {
-        const WIDE: usize = 16;
-        const NARROW: usize = 8;
-        let wide_rows = tiled::tile_rows(WIDE, 8);
-        let fits = WIDE * WIDE <= caps.max_workgroup_invocations as usize
-            && WIDE * WIDE <= caps.max_workgroup_size[0] as usize
-            && tiled::lds_bytes(WIDE, 8) <= caps.lds_bytes as usize;
+        let launch = caps.gemm_launch();
+        let wide = launch.register_lane_edge_wide as usize;
+        let narrow = launch.register_lane_edge as usize;
+        let wide_rows = tiled::tile_rows(wide, WIDE_TILE_LANE_ROWS);
+        let fits = wide * wide <= caps.max_workgroup_invocations as usize
+            && wide * wide <= caps.max_workgroup_size[0] as usize
+            && tiled::lds_bytes(wide, WIDE_TILE_LANE_ROWS) <= caps.lds_bytes as usize;
         let lanes = if m_per_block >= wide_rows && fits {
-            WIDE
+            wide
         } else {
-            NARROW
+            narrow
         };
         Self {
             lanes: TileSize(lanes as u32),
