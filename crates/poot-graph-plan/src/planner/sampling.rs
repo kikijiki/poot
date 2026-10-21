@@ -13,9 +13,10 @@
 //! pick rule (larger value, lower index on a tie), associative and commutative, so the split cannot
 //! change the answer.
 
-use super::{ContractionHead, DType, Eqn, ImportedKernel, OpKind, PlanError, Planned, value_ids};
-use crate::Capability;
-use crate::planner::GraphTables;
+use super::{
+    Capability, ContractionHead, DType, Eqn, ImportedKernel, OpKind, PlanError, Planned, value_ids,
+};
+use crate::planner::{GraphTables, StorageDtypes};
 use crate::refusal::refusal_at;
 use crate::types::{Binding, ScratchDecl, ScratchId, Sink, Source};
 use poot_graph_ir::op::SampleRule;
@@ -92,6 +93,12 @@ fn greedy(
         vec![chunk, combine],
         vec![ScratchDecl::new(BufferStorage::f32(), rows * groups * 3)],
     )
+}
+
+/// Whether this family lowers these storage dtypes: its bodies are f32/i32 only, so a 2-byte float or a
+/// packed E4M3FN payload is refused by name.
+pub(super) fn admits_dtypes(dtypes: StorageDtypes) -> Result<(), Capability> {
+    dtypes.refuse_unwired()
 }
 
 /// Plan one sampling-family equation (`RandomUniform`/`SampleToken`).

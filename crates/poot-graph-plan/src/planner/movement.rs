@@ -10,7 +10,7 @@ use super::{
     BodyLimits, Capability, ContractionHead, DType, Eqn, HashMap, KernelRequest, OpKind, Operand,
     PlanError, Planned, Scalar, ValueId, fty_ty, numel, value_ids,
 };
-use crate::planner::{GraphTables, Layout, Lowering};
+use crate::planner::{GraphTables, Layout, Lowering, StorageDtypes};
 use crate::predicates::{is_elementwise_2d_in, scatter_update_plan};
 use crate::refusal::Site;
 use poot_kernelgen::{MovementOp, MovementSpec, Storage, UpdateIndex};
@@ -63,6 +63,26 @@ pub(super) fn plan_serialized(
         },
     );
     Planned::lowered(site, KernelRequest::Movement(spec), Lowering::Aie(target))
+}
+
+/// Whether this family lowers `op` over these storage dtypes. Movement is dtype-agnostic bytes, so a packed
+/// E4M3FN payload moves wherever the device stores it natively, and a 2-byte float moves everywhere; the
+/// scatter and the collectives are wired for neither.
+pub(super) fn admits_dtypes(
+    op: &OpKind,
+    dtypes: StorageDtypes,
+    caps: &DeviceCaps,
+) -> Result<(), Capability> {
+    let collective = matches!(op, OpKind::AllReduce { .. } | OpKind::AllGather { .. });
+    if dtypes.touches_e4m3fn()
+        && (collective || caps.e4m3_storage == poot_target::E4m3Storage::None)
+    {
+        return Err(Capability::E4m3Storage);
+    }
+    if dtypes.out_is_half() && (collective || matches!(op, OpKind::ScatterUpdate)) {
+        return Err(Capability::DtypeLowering);
+    }
+    Ok(())
 }
 
 /// Plan one data-movement equation (including the e4m3fn packed forms) and refuse the collectives.

@@ -454,31 +454,41 @@ pub(crate) struct DenseGemvLaunch {
 /// time per token: `cols` 64 7.1 ms, 32 6.0, 16 5.3, 8 4.9, 4 4.7; ROCm decode: 78 to 81 tok/s from `cols` 16 to
 /// 2). The `{64, 32}, else 16` table the spike measured is the `[K, N]` column-tile body's, not this one's.
 pub(crate) fn dense_gemv_launch(n: usize, compute_units: u32) -> DenseGemvLaunch {
-    let min_workgroups = 2 * compute_units as usize;
-    let cols = if n.div_ceil(4) >= min_workgroups {
-        4
+    let min_workgroups = DENSE_GEMV_WORKGROUPS_PER_CU * compute_units as usize;
+    let cols = if n.div_ceil(DENSE_GEMV_WIDE_COLS as usize) >= min_workgroups {
+        DENSE_GEMV_WIDE_COLS
     } else {
-        2
+        DENSE_GEMV_NARROW_COLS
     };
     DenseGemvLaunch {
-        width: 256,
+        width: DENSE_GEMV_WIDTH,
         cols,
-        unroll: 4,
+        unroll: DENSE_GEMV_UNROLL,
     }
 }
+
+/// Lanes in a dense Gemv workgroup ([`dense_gemv_launch`]).
+const DENSE_GEMV_WIDTH: u32 = 256;
+/// Contiguous `K` elements a dense Gemv lane reads per trip.
+const DENSE_GEMV_UNROLL: u32 = 4;
+/// Output columns a dense Gemv workgroup owns while `N` still fills the device.
+const DENSE_GEMV_WIDE_COLS: u32 = 4;
+/// Output columns a dense Gemv workgroup owns for a small `N`, so it does not starve the device.
+const DENSE_GEMV_NARROW_COLS: u32 = 2;
+/// Workgroups per compute unit the wide column count must still launch.
+const DENSE_GEMV_WORKGROUPS_PER_CU: usize = 2;
 
 /// Workgroup width of a one-thread-per-element kernel folded onto a 2-D grid: always 256 (the portable
 /// Vulkan max). A folded body derives its global index from this width, so the dispatch must not use the
 /// generic 64-or-256 wg-bump.
 pub(crate) const ELEMENTWISE_2D_WIDTH: usize = 256;
 
-/// LDS tile edge for the wgpu prefill tiled GEMM (`tiled_gemm`). A workgroup of
-/// `GEMM_TILE*GEMM_TILE` lanes computes a `(2*GEMM_TILE) x GEMM_TILE` output tile (each lane computes 2
-/// output rows). 8 gives 64 lanes, one RADV wave64: a 256-lane workgroup miscomputes on this wgpu/RADV
-/// stack (upper waves' LDS writes are not visible after the barrier; output rows come back ~0) even
-/// though the SPIR-V is valid. A bigger tile needs that bug fixed. Used by `plan_eqn` for the body and the
-/// planned grid.
-pub(crate) const GEMM_TILE: usize = 8;
+/// LDS tile edge the imported tiled-GEMM bodies (`ImportedKernel::TiledGemm`, `TiledGemmBatched`) bake: a
+/// workgroup of `IMPORTED_TILED_GEMM_TILE^2` lanes computes a `(2*IMPORTED_TILED_GEMM_TILE) x
+/// IMPORTED_TILED_GEMM_TILE` output tile (each lane computes 2 output rows). The edge is the shipped body's,
+/// not a launch choice: the planned grid must match it on every device. The generated tiled schedules take
+/// their edge from `caps.gemm_launch` instead.
+pub(crate) const IMPORTED_TILED_GEMM_TILE: usize = 8;
 
 /// The workgroup width a scatter-update chunk is sized in: a generated body's default width, so a chunk's
 /// thread count and its dispatch agree.
@@ -553,13 +563,15 @@ pub(crate) fn scatter_update_plan(
     Planned::split(chunks)
 }
 
+/// The most lanes the streaming attention schedule uses ([`attention_lanes`]).
+const MAX_LANES: usize = 64;
+
 /// The lane count of the streaming attention schedule: the widest power of two, at most 64, whose
 /// partials fit the device. Each lane stages one online-softmax triple `(m, l, o[dv])` in workgroup memory,
 /// so `lanes` lanes need `4 * (lanes * dv + 2 * lanes)` bytes of `caps.lds_bytes`, and `lanes` may not
 /// exceed the workgroup limits. More than 64 lanes only lengthen the serial per-lane combine. `None` when
 /// not even one lane fits.
 pub(crate) fn attention_lanes(dv: usize, caps: &DeviceCaps) -> Option<usize> {
-    const MAX_LANES: usize = 64;
     let lanes_limit = (caps.max_workgroup_size[0] as usize)
         .min(caps.max_workgroup_invocations as usize)
         .min(MAX_LANES);
@@ -688,8 +700,8 @@ pub(crate) fn is_tiled_gemm_in(
     if m == 1 {
         return false; // M==1 is the decode GEMV; M>1 only here.
     }
-    // tile is (2*GEMM_TILE) rows x GEMM_TILE cols (thread-coarsened 2 rows/lane).
-    let groups = m.div_ceil(2 * GEMM_TILE) * n.div_ceil(GEMM_TILE);
+    // tile is (2*IMPORTED_TILED_GEMM_TILE) rows x IMPORTED_TILED_GEMM_TILE cols (thread-coarsened 2 rows/lane).
+    let groups = m.div_ceil(2 * IMPORTED_TILED_GEMM_TILE) * n.div_ceil(IMPORTED_TILED_GEMM_TILE);
     // Any size is handled (the lowering chunks at the device's known-miscompile ceiling, cards 095/096);
     // only an empty launch is gated.
     if groups == 0 {
@@ -711,7 +723,7 @@ pub(crate) fn tiled_gemm_plan(
     nn: usize,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
-    let ts = GEMM_TILE;
+    let ts = IMPORTED_TILED_GEMM_TILE;
     let groups = mrows.div_ceil(2 * ts) * nn.div_ceil(ts);
     // Card 044: the imported coarsened tiled GEMM, f32. Same grid and `[a, b, out]` buffers as
     // kernelgen's `tiled_gemm_dt`; dims ride in a `[M,K,N,offset]` metadata buffer, and one
@@ -726,7 +738,7 @@ pub(crate) fn tiled_gemm_plan(
             kernel,
             backend,
             Some(vec![mrows as u32, kk as u32, nn as u32, 0]),
-            // GEMM_TILE^2 lanes per (2*GEMM_TILE) x GEMM_TILE output tile (see `is_tiled_gemm_in`'s doc).
+            // IMPORTED_TILED_GEMM_TILE^2 lanes per (2*IMPORTED_TILED_GEMM_TILE) x IMPORTED_TILED_GEMM_TILE output tile (see `is_tiled_gemm_in`'s doc).
             [(groups * ts * ts) as u32, 1, 1],
         );
     }
@@ -788,7 +800,8 @@ pub(crate) fn is_batched_tiled_gemm_in(
         return false;
     }
     let batch: usize = out_shape[..r - 2].iter().product();
-    let groups = batch * m.div_ceil(2 * GEMM_TILE) * n.div_ceil(GEMM_TILE);
+    let groups =
+        batch * m.div_ceil(2 * IMPORTED_TILED_GEMM_TILE) * n.div_ceil(IMPORTED_TILED_GEMM_TILE);
     // Card 522: one owner for the tile ceiling, `caps.known_miscompiles` (card 095's RADV
     // miscompile at or above `tiled_gemm_max_workgroups`); a device with no confirmed ceiling has none.
     groups > 0
@@ -1032,8 +1045,12 @@ pub(crate) fn elementwise_fold(
     }
 }
 
-/// Workgroup width (lanes per row) for the parallel [`OpKind::FusedRow`] kernel: at most 128, and no more
-/// than the row width. Shared by `plan_eqn` and the `FusedRow` launch grid it bakes alongside it.
+/// The most lanes one row of the parallel [`OpKind::FusedRow`] kernel uses.
+const FUSED_ROW_MAX_WIDTH: usize = 128;
+
+/// Workgroup width (lanes per row) for the parallel [`OpKind::FusedRow`] kernel: at most
+/// [`FUSED_ROW_MAX_WIDTH`], and no more than the row width. Shared by `plan_eqn` and the `FusedRow` launch grid
+/// it bakes alongside it.
 pub(crate) fn row_parallel_width(n_cols: usize) -> usize {
-    n_cols.clamp(1, 128)
+    n_cols.clamp(1, FUSED_ROW_MAX_WIDTH)
 }

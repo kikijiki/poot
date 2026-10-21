@@ -28,9 +28,9 @@ use poot_graph_ir::{
 };
 use poot_graph_plan::multi_device::PlanNodeId;
 use poot_graph_plan::{
-    Plan, PoolSite, Program, Region, Sink, Source, Target, dispatch_work,
-    multi_device::topology::DeviceId, staged::Link, staged::StageId, staged::StagedProgram,
-    staged::SyncPoint, staged::TargetSet, staged::Transfer, validate_linked_artifact, value_ids,
+    Plan, PoolSite, Program, Region, Sink, Source, Target, multi_device::topology::DeviceId,
+    region_member_work, staged::Link, staged::StageId, staged::StagedProgram, staged::SyncPoint,
+    staged::TargetSet, staged::Transfer, validate_linked_artifact, value_ids,
 };
 use poot_kernel_ir::Body;
 use poot_quant::SourceRole;
@@ -1680,7 +1680,7 @@ impl<D: Device> Engine<D> {
                     .ok_or(LoadError::Unimplemented("a region that returns no value"))?;
                 let work = region
                     .members()
-                    .map(|member| dispatch_work(g, &g.eqns()[member]))
+                    .map(|member| region_member_work(g, &g.eqns()[member]))
                     .sum();
                 let members = region.members();
                 steps.push(LoadedStep {
@@ -1694,7 +1694,6 @@ impl<D: Device> Engine<D> {
                 });
                 continue;
             }
-            let work = dispatch_work(g, eqn);
             match plan {
                 Plan::Alias(source) => {
                     values[eqn.out] = Some(operand(&values, *source)?);
@@ -1737,7 +1736,6 @@ impl<D: Device> Engine<D> {
                                 checked_u32(decl.elems())?,
                             ))
                         };
-                    let per_dispatch_work = work / (dispatches.len().max(1) as u64);
                     for dispatch in dispatches.iter() {
                         let (body, launch) = (dispatch.body(), dispatch.launch());
                         let (kernel, launch_kind) = match self.device.target() {
@@ -1788,7 +1786,7 @@ impl<D: Device> Engine<D> {
                             inputs,
                             output,
                             launch: launch_kind,
-                            work: per_dispatch_work,
+                            work: dispatch.work(),
                             kind_name: eqn.op.kind_name(),
                             label: dispatch.label().to_string(),
                         });
@@ -3044,7 +3042,13 @@ impl<D: Device> Engine<D> {
                 loaded.resident.len(),
             )
         };
-        let entry = match self.load_entry(exe, part) {
+        // The same check after the reads: the weights `load_entry` uploaded are the bytes the load validated
+        // only if the file did not change in between, and a modification is refused like one before the load.
+        let loaded_entry = self.load_entry(exe, part).and_then(|entry| {
+            self.loaded(exe)?.binder.check_sources()?;
+            Ok(entry)
+        });
+        let entry = match loaded_entry {
             Ok(entry) => entry,
             Err(e) => {
                 {
@@ -4257,6 +4261,9 @@ mod f16_packed_weight_upload_tests {
         allocations: Vec<(BufferRole, BufferStorage, usize)>,
         writes: Vec<(usize, Vec<u8>)>,
         upload: WeightUpload,
+        /// Runs once the device has the destination and before the first stored byte is read into it:
+        /// the instant between a load's validation and its upload.
+        before_fill: Option<Box<dyn FnMut()>>,
     }
 
     impl Device for UploadRecorder {
@@ -4327,6 +4334,9 @@ mod f16_packed_weight_upload_tests {
             len: usize,
             fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
         ) -> Result<(), std::convert::Infallible> {
+            if let Some(before_fill) = &mut self.before_fill {
+                before_fill();
+            }
             let mut bytes = vec![0u8; len];
             fill(offset..offset + len, &mut bytes);
             self.writes.push((*dst, bytes));
@@ -4467,6 +4477,46 @@ mod f16_packed_weight_upload_tests {
         assert!(
             engine.device.allocations.is_empty() && engine.device.writes.is_empty(),
             "nothing was allocated or written"
+        );
+    }
+
+    /// ADR-0103 amendment, boundary 2 after the reads (POOT-1300): a mapped checkpoint file modified in
+    /// place after the load validated it and after `add_entry`'s check before the reads, at the moment
+    /// the weight is being uploaded, is refused as the typed `LoadError::SourceChanged`, and no entry is
+    /// published. Without the check after the reads the same entry loads with the modified bytes.
+    ///
+    /// Mutation: drop the `check_sources` after `load_entry` in `Engine::add_part`; `add_entry` returns
+    /// `Ok` and this row goes red.
+    #[test]
+    fn add_entry_refuses_a_file_modified_while_its_weight_uploads() {
+        let path = poot_test_util::unique_temp_path("bind_modified_during_upload.bin");
+        let bits = finite_bits();
+        let file_len = 4 * K * 4 + bits.len() * 2;
+        std::fs::write(&path, vec![0u8; file_len]).unwrap();
+        let mapped = StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut next = 0;
+        let store = projection_store(&bits, DType::F16, |bytes| {
+            let view = mapped.slice(next..next + bytes.len()).unwrap();
+            next += bytes.len();
+            view
+        });
+        let mut engine = Engine::new(UploadRecorder::default());
+        let modified = path.to_path_buf();
+        engine.device.before_fill = Some(Box::new(move || {
+            // Same length, so only the timestamps show it; `mtime` is set explicitly (nanosecond
+            // identity), so a coarse-timestamp filesystem cannot hide the write.
+            std::fs::write(&modified, vec![0x5au8; file_len]).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&modified)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+                .unwrap();
+        }));
+        let error = load_projection(&mut engine, store, DType::F16).unwrap_err();
+        assert!(
+            matches!(&error, ExecError::Load(load) if matches!(**load, LoadError::SourceChanged(_))),
+            "{error:?}"
         );
     }
 

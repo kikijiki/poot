@@ -6,7 +6,7 @@ use super::{
     Sink, Source, value_ids,
 };
 use crate::graph_validation::flash_mask_per_head;
-use crate::planner::GraphTables;
+use crate::planner::{GraphTables, StorageDtypes};
 use crate::predicates::{attention_lanes, attention_splits};
 use crate::refusal::Site;
 use crate::types::ScratchDecl;
@@ -18,6 +18,12 @@ use poot_kernelgen::{
     KeyLayout as KernelKeyLayout, MaskKind, ScoreTransform,
 };
 use poot_target::{Backend, BufferStorage, DeviceCaps};
+
+/// Whether this family lowers these storage dtypes: its bodies are f32/i32 only, so a 2-byte float or a
+/// packed E4M3FN payload is refused by name.
+pub(super) fn admits_dtypes(dtypes: StorageDtypes) -> Result<(), Capability> {
+    dtypes.refuse_unwired()
+}
 
 /// Plan one attention equation and record the kernel it takes.
 ///

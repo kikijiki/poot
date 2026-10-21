@@ -5,8 +5,8 @@ use crate::dtype_widen::{bf16_const_feeds_only_packed_readers, widen_mismatched_
 use crate::graph_validation::ValidationPacketSource;
 use crate::planner::{Planned, fty_ty};
 use crate::predicates::{
-    DenseGemvLaunch, ELEMENTWISE_2D_WIDTH, GEMM_TILE, GEMV_WIDTH, GraphTables,
-    dense_decode_gemv_in, dense_gemv_launch, is_elementwise_2d_in,
+    DenseGemvLaunch, ELEMENTWISE_2D_WIDTH, GEMV_WIDTH, GraphTables, dense_decode_gemv_in,
+    dense_gemv_launch, is_elementwise_2d_in,
 };
 use crate::refusal::RefusalDtypes;
 use crate::types::{DispatchPlanError, Launch, ScratchDecl};
@@ -3749,7 +3749,7 @@ fn is_tiled_region(choice: &KernelChoice) -> bool {
 #[test]
 fn tiled_matmul_gets_the_tiled_grid_not_the_naive_fallthrough() {
     // Card 099b: the generated tiled GEMM (the contraction choice for an M>1 F32 shared-weight
-    // MatMul, Card 557) gets the tiled-GEMM launch grid (`groups * GEMM_TILE^2` threads), not the
+    // MatMul, Card 557) gets the tiled-GEMM launch grid (`groups * tile^2` threads, the tile edge `caps.gemm_launch` names), not the
     // one-thread-per-output default (a ~2x over-launch).
     let (m, k, n) = (64usize, 32usize, 48usize);
     let g = matmul_graph(m, k, n, GDt::F32);
@@ -3763,10 +3763,13 @@ fn tiled_matmul_gets_the_tiled_grid_not_the_naive_fallthrough() {
     );
     let tiled = plain(plan).launch().grid;
 
-    let groups = m.div_ceil(2 * GEMM_TILE) * n.div_ceil(GEMM_TILE);
+    let tile = default_caps_for(Backend::SpirvVulkan)
+        .gemm_launch()
+        .tile_edge as usize;
+    let groups = m.div_ceil(2 * tile) * n.div_ceil(tile);
     assert_eq!(
         tiled,
-        [(groups * GEMM_TILE * GEMM_TILE) as u32, 1, 1],
+        [(groups * tile * tile) as u32, 1, 1],
         "the generated tiled GEMM must get the tiled-GEMM grid"
     );
     assert_ne!(
@@ -3777,7 +3780,7 @@ fn tiled_matmul_gets_the_tiled_grid_not_the_naive_fallthrough() {
 }
 
 /// The generated tiled GEMM over the RADV tile ceiling (card 096) splits into sub-cap dispatches whose grids
-/// are `groups * GEMM_TILE^2` threads each and whose groups sum to the whole tile range. Mutation: build a
+/// are `groups * tile^2` threads each and whose groups sum to the whole tile range. Mutation: build a
 /// split dispatch's grid as `groups + workgroup` instead of `groups * workgroup`; the grid assertion goes red.
 #[test]
 fn a_tiled_gemm_over_the_tile_ceiling_splits_into_disjoint_launches() {
@@ -3793,11 +3796,14 @@ fn a_tiled_gemm_over_the_tile_ceiling_splits_into_disjoint_launches() {
         .known_miscompiles
         .tiled_gemm_max_workgroups
         .expect("wgpu on RADV has a tile ceiling") as usize;
-    let groups = m.div_ceil(2 * GEMM_TILE) * n.div_ceil(GEMM_TILE);
+    let tile = default_caps_for(Backend::SpirvVulkan)
+        .gemm_launch()
+        .tile_edge as usize;
+    let groups = m.div_ceil(2 * tile) * n.div_ceil(tile);
     assert!(groups >= ceiling, "the fixture must reach the ceiling");
     let dispatches = plan.dispatches();
     assert!(dispatches.len() > 1, "{plan:?}");
-    let lanes = GEMM_TILE * GEMM_TILE;
+    let lanes = tile * tile;
     let mut covered = 0usize;
     for dispatch in dispatches {
         let launch = dispatch.launch();
@@ -3816,17 +3822,17 @@ fn a_tiled_gemm_over_the_tile_ceiling_splits_into_disjoint_launches() {
     assert_eq!(covered, groups, "the launches tile the whole output");
 }
 
-/// Card 557: the generated tiled GEMM owns its launch (`GEMM_TILE^2`-lane workgroups over a 64-lane LDS
-/// tile), and the op alone no longer says so: `finalize` reads the recorded choice. On AMDGCN (where
+/// Card 557: the generated tiled GEMM owns its launch (`tile^2`-lane workgroups, `caps.gemm_launch.tile_edge` a side), and the op alone no longer says so: `finalize` reads the recorded choice. On AMDGCN (where
 /// the imported tiled GEMM, and so `is_tiled_gemm_in`, does not apply) a MatMul whose output is past the
-/// grid cap at 64 lanes must keep its 64-lane workgroups. Mutation: drop the choice from `finalize`'s
+/// grid cap at one tile of lanes must keep its tile-wide workgroups. Mutation: drop the choice from `finalize`'s
 /// custom-grid test; the wg-bump widens the body to 256 lanes and this row goes red.
 #[test]
 fn a_large_tiled_matmul_keeps_its_tile_workgroup_on_amdgcn() {
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let caps = default_caps_for(backend);
     let (k, n) = (8usize, 2048usize);
-    let m = (caps.max_grid[0] as usize * GEMM_TILE * GEMM_TILE).div_ceil(n) + 1;
+    let tile = caps.gemm_launch().tile_edge as usize;
+    let m = (caps.max_grid[0] as usize * tile * tile).div_ceil(n) + 1;
     let g = matmul_graph(m, k, n, GDt::F32);
     let program = compiled(&g, backend);
     let (plan, choice) = compiled_matmul(&program);
@@ -3846,10 +3852,318 @@ fn a_large_tiled_matmul_keeps_its_tile_workgroup_on_amdgcn() {
     for body in bodies {
         assert_eq!(
             body.workgroup_size[0] as usize,
-            GEMM_TILE * GEMM_TILE,
+            tile * tile,
             "the tiled GEMM's workgroup must stay one tile wide"
         );
     }
+}
+
+/// Where a launch figure came from: the `const`'s name, its value and the evidence behind it.
+struct Provenance {
+    name: &'static str,
+    value: u64,
+    source: &'static str,
+}
+
+/// Where each launch literal in `predicates.rs` comes from: one entry per `const` item that is a number. The
+/// `every_launch_literal_has_provenance` test reads this file's own source and fails on a numeric `const` with no
+/// entry here, and on an entry whose `const` no longer exists or has another value. A figure measured on one
+/// device (`gfx1151`, wgpu/RADV unless noted) says so; one that is a structural limit says that instead.
+const LAUNCH_PROVENANCE: &[Provenance] = &[
+    prov(
+        "GEMV_WIDTH",
+        128,
+        "measured: Qwen2.5-0.5B decode on RADV STRIX_HALO, fused ms/tok w=32 50.9, w=64 53.7, w=128 39.8, w=256 45.6",
+    ),
+    prov(
+        "GEMV_TILE",
+        32,
+        "structural: one wave32's contiguous W[k, col0..col0+32] run; baked into the imported coalesced Gemv body",
+    ),
+    prov(
+        "DENSE_GEMV_WIDTH",
+        256,
+        "card 727: sweep on gfx1151 over the qwen2.5-0.5b BF16 decode shapes",
+    ),
+    prov("DENSE_GEMV_UNROLL", 4, "card 727: same sweep"),
+    prov(
+        "DENSE_GEMV_WIDE_COLS",
+        4,
+        "card 727: wgpu Gemv device time per token cols 64 7.1 ms, 32 6.0, 16 5.3, 8 4.9, 4 4.7; ROCm decode 78-81 tok/s from cols 16 to 2",
+    ),
+    prov(
+        "DENSE_GEMV_NARROW_COLS",
+        2,
+        "card 727: the fallback that keeps a small N from starving the device",
+    ),
+    prov(
+        "DENSE_GEMV_WORKGROUPS_PER_CU",
+        2,
+        "card 727: at least two workgroups per compute unit before the wide column count",
+    ),
+    prov(
+        "ELEMENTWISE_2D_WIDTH",
+        256,
+        "structural: the portable Vulkan workgroup maximum; a folded body derives its index from this width",
+    ),
+    prov(
+        "IMPORTED_TILED_GEMM_TILE",
+        8,
+        "structural: the edge the shipped imported tiled-GEMM bodies bake (card 044); not a launch choice",
+    ),
+    prov(
+        "SCATTER_UPDATE_WG",
+        64,
+        "structural: a generated scatter body's default workgroup width",
+    ),
+    prov(
+        "FUSED_ROW_MAX_WIDTH",
+        128,
+        "design bound, not swept: the widest row workgroup the portable FusedRow reduction runs; a wider row loops",
+    ),
+    prov(
+        "MAX_LANES",
+        64,
+        "design bound, not swept: more lanes only lengthen the serial per-lane combine",
+    ),
+    prov(
+        "MAX_ATTENTION_SPLITS",
+        16,
+        "design bound, not swept: past it the combine stage's per-row reduction costs more than the extra workgroups hide (Flash-Decoding occupancy rule)",
+    ),
+    prov(
+        "MIN_KEYS_PER_SPLIT",
+        128,
+        "design bound, not swept: a shorter chunk leaves a workgroup's lanes idle and the launch is the combine's overhead",
+    ),
+    prov(
+        "WORKGROUPS_PER_COMPUTE_UNIT",
+        2,
+        "design bound, not swept: two resident workgroups keep a CU busy while one waits on its K/V loads",
+    ),
+    prov(
+        "INDEXED_GEMV_MAX_ROWS",
+        32,
+        "design bound, not swept: a decode step's selected experts or a few steps batched; above it the segmented Tiled schedule shares expert weight tiles",
+    ),
+];
+
+/// A provenance entry; the value is read from the `const` of the same name by the test.
+const fn prov(name: &'static str, value: u64, source: &'static str) -> Provenance {
+    Provenance {
+        name,
+        value,
+        source,
+    }
+}
+
+/// POOT-1233 SC-003: every numeric `const` in `predicates.rs` (the file's launch literals) has an entry in
+/// `LAUNCH_PROVENANCE` with the same value and a stated source, and every entry names a `const` that exists.
+/// The test reads the file's own source, so a literal added without an entry cannot pass. It covers every
+/// numeric `const` item; the inline arithmetic that remains is structural, not a launch choice: `4 * (..)` and
+/// `2 * lanes` in `attention_lanes` (bytes per f32 and the online-softmax `m`, `l` scalars) and the `2 *` rows per
+/// workgroup of the imported tiled-GEMM bodies. The register-tiled lane figures live in `poot-target`'s own
+/// table. Mutation: add
+/// `const UNSOURCED_LAUNCH: usize = 7;` to `predicates.rs`; this goes red naming it.
+#[test]
+fn every_launch_literal_has_provenance() {
+    let source = include_str!("predicates.rs");
+    let declared: Vec<(&str, u64)> = source
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            (!line.starts_with("//")).then_some(())?;
+            let item = line.split_once("const ")?.1;
+            let (name, rest) = item.split_once(": ")?;
+            let (ty, value) = rest.split_once(" = ")?;
+            matches!(ty, "usize" | "u32" | "u64").then_some(())?;
+            let value = value.split_once(';')?.0;
+            Some((name, value.replace('_', "").parse().unwrap_or_else(|_| {
+                panic!("launch literal {name} = {value} is not a plain integer; give it a plain literal")
+            })))
+        })
+        .collect();
+    let table = LAUNCH_PROVENANCE;
+    for &(name, value) in &declared {
+        if name == "LAUNCH_PROVENANCE" {
+            continue;
+        }
+        let entry = table
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("launch literal {name} has no provenance entry"));
+        assert_eq!(entry.value, value, "{name}: the entry states another value");
+        assert!(!entry.source.is_empty(), "{name} states no source");
+    }
+    for entry in table {
+        assert!(
+            declared.iter().any(|&(name, _)| name == entry.name),
+            "provenance entry {} names no const in predicates.rs",
+            entry.name
+        );
+    }
+}
+
+/// The `Tiled` edge a routed (indexed) contraction over `rows > INDEXED_GEMV_MAX_ROWS` rows plans on `backend`
+/// with `caps`, for the dense f32-stack form (`packed == false`) and the packed-stack form.
+fn indexed_tile_edge(backend: Backend, caps: &DeviceCaps, packed: bool) -> u32 {
+    let (rows, k, n, experts) = (64usize, 64usize, 32usize, 2usize);
+    assert!(rows > crate::predicates::INDEXED_GEMV_MAX_ROWS);
+    let b = Builder::for_tests();
+    let x = b
+        .slot_named(
+            poot_graph_ir::Slot::Activation,
+            "x",
+            TensorType::f32(vec![rows, k]),
+        )
+        .unwrap();
+    let ids = b
+        .slot_named_ranged(
+            poot_graph_ir::Slot::Activation,
+            "ids",
+            TensorType::new(vec![rows], GDt::I32),
+            poot_graph_ir::IndexRange::below(experts).unwrap(),
+        )
+        .unwrap();
+    let out = if packed {
+        let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
+            stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
+            descriptor: poot_quant::PackedWeight::try_new(
+                poot_quant::format::WeightFormat::Q8_0,
+                [n, k],
+            )
+            .unwrap(),
+            experts,
+        };
+        poot_graph_ir::test_support::packed_graphs::packed_indexed_linear(&b, x, ids, &table)
+            .unwrap()
+    } else {
+        let w = b
+            .constant("w", TensorType::f32(vec![experts, k, n]))
+            .unwrap();
+        b.indexed_matmul(x, w, ids).unwrap()
+    };
+    let g = b.finish(out).unwrap();
+    let eqn = g
+        .eqns()
+        .iter()
+        .find(|e| {
+            matches!(
+                e.op,
+                OpKind::IndexedMatMul | OpKind::PackedContraction { .. }
+            )
+        })
+        .expect("a routed contraction eqn");
+    let (_, choice) = planned_with_choice_caps(&g, eqn, backend, caps)
+        .unwrap_or_else(|error| panic!("{backend:?} packed={packed}: {error}"));
+    let KernelChoice::Generated(KernelRequest::Contraction(spec)) = choice else {
+        panic!("{backend:?} packed={packed}: not a generated contraction: {choice:?}");
+    };
+    let schedule = match spec {
+        ContractionSpec::Indexed(indexed) => indexed.schedule,
+        ContractionSpec::Packed(packed) => packed.schedule,
+        other => panic!("{backend:?} packed={packed}: not a routed contraction: {other:?}"),
+    };
+    match schedule {
+        kg::Schedule::Tiled { tile } => tile.get(),
+        other => panic!("{backend:?} packed={packed}: expected the Tiled schedule, got {other:?}"),
+    }
+}
+
+/// POOT-1233 SC-001: on a target without the RADV defect the routed M>1 tile is the calibrated edge, not the
+/// RADV 8x8: ROCm caps plan the measured 16x16, in both the dense and the packed form, and PTX caps plan whatever
+/// their (still unmeasured, portable) class names. Mutation: restore a global `8` as the tile edge in `moe.rs`
+/// and `packed_dequant.rs`; the ROCm row goes red.
+#[test]
+fn the_routed_tile_is_the_calibrated_edge_off_radv() {
+    for backend in [Backend::AmdGcn(AmdArch::gfx1151()), Backend::Nvptx] {
+        let caps = default_caps_for(backend);
+        assert!(
+            !caps.known_miscompiles.lds_stale_above_wave64,
+            "{backend:?}"
+        );
+        for packed in [false, true] {
+            let edge = indexed_tile_edge(backend, &caps, packed);
+            assert_eq!(
+                edge,
+                caps.gemm_launch().tile_edge,
+                "{backend:?} packed={packed}: the plan must launch the caps' calibrated tile"
+            );
+            if matches!(backend, Backend::AmdGcn(_)) {
+                assert_ne!(edge, 8, "{backend:?} packed={packed}: still the RADV 8x8");
+            }
+        }
+    }
+}
+
+/// POOT-1233 SC-002: on RADV caps the routed tile stays 8x8, because `known_miscompiles` names the
+/// LDS-visibility defect there; the same caps without that flag plan the class tile. Mutation: drop the
+/// `lds_stale_above_wave64` gate in `GemmLaunch::resolve`; the RADV row (`tile 16`) goes red.
+#[test]
+fn the_routed_tile_stays_8x8_where_known_miscompiles_names_the_defect() {
+    let backend = Backend::SpirvVulkan;
+    let radv = default_caps_for(backend);
+    assert!(
+        radv.known_miscompiles.lds_stale_above_wave64,
+        "the RADV fixture must carry the defect in known_miscompiles"
+    );
+    for packed in [false, true] {
+        assert_eq!(
+            indexed_tile_edge(backend, &radv, packed),
+            8,
+            "packed={packed}: RADV caps keep the 8x8 tile"
+        );
+    }
+    let hsa = default_caps_for(Backend::AmdGcn(AmdArch::gfx1151()));
+    let gated = DeviceCaps {
+        known_miscompiles: poot_target::KnownMiscompiles {
+            lds_stale_above_wave64: true,
+            ..poot_target::KnownMiscompiles::NONE
+        },
+        ..hsa
+    };
+    assert_eq!(
+        indexed_tile_edge(Backend::AmdGcn(AmdArch::gfx1151()), &gated, false),
+        8,
+        "an HSA device with the defect in known_miscompiles is gated to 8x8"
+    );
+}
+
+/// POOT-1233: a dispatch carries a planner-computed cost, apportioned over a split plan by the threads each
+/// launches, and the output element count is conserved (up to rounding). Mutation: apportion evenly instead of by
+/// grid threads; the last, smaller chunk weighs as much as a full one and this goes red.
+#[test]
+fn a_split_plans_dispatches_carry_work_in_proportion_to_their_launch() {
+    let (m, k, n) = (4096usize, 8usize, 4096usize);
+    let g = matmul_graph(m, k, n, GDt::F32);
+    let program = compiled(&g, Backend::SpirvVulkan);
+    let (plan, _) = compiled_matmul(&program);
+    let dispatches = plan.dispatches();
+    assert!(dispatches.len() > 1, "{plan:?}");
+    let threads = |d: &Dispatch| {
+        d.launch()
+            .grid
+            .iter()
+            .map(|&e| u64::from(e))
+            .product::<u64>()
+    };
+    let total: u64 = dispatches.iter().map(Dispatch::work).sum();
+    let out = (m * n) as u64;
+    assert!(
+        total <= out && out - total < dispatches.len() as u64,
+        "the shares sum to the output count: {total} vs {out}"
+    );
+    let (full, last) = (&dispatches[0], dispatches.last().unwrap());
+    assert!(
+        threads(last) < threads(full),
+        "the fixture needs a short tail chunk"
+    );
+    assert!(last.work() < full.work(), "work must follow the launch");
+    assert_eq!(
+        full.work() * threads(last) / threads(full),
+        last.work(),
+        "work is proportional to the launched threads"
+    );
 }
 
 // --- a collective is a cut between stages, never an equation a stage program plans ---
@@ -5472,7 +5786,9 @@ fn try_dense_contraction_plan_planned(
 
 /// Card 380 FR-009, narrowed by cards 450 ROCm and 450 PTX; the body is Card 1024's. The lowering is scoped by
 /// name to the backends that have a typed packed walk: wgpu's (card 380), ROCm's (card 450 ROCm) and PTX's
-/// (card 450 PTX). Above M == 1 all three plan the same generated `[N, K]` Tiled body over the packed-BF16 lanes.
+/// (card 450 PTX). Above M == 1 all three plan the same generated `[N, K]` Tiled body over the packed-BF16
+/// lanes; the tile edge (and so the workgroup count) is each device class's calibrated one
+/// (`caps.gemm_launch`, POOT-1233), the one field they may differ in.
 #[test]
 fn card450_dense_contraction_plans_on_nvptx_with_the_wgpu_key() {
     let g = dense_contraction_graph(2, 32, 16);
@@ -5486,14 +5802,25 @@ fn card450_dense_contraction_plans_on_nvptx_with_the_wgpu_key() {
         let Ok((_, choice)) = try_dense_contraction_plan_planned(&g, backend) else {
             panic!("the packed-BF16 contraction must plan on {backend:?}");
         };
-        let KernelChoice::Generated(KernelRequest::Contraction(
-            request @ ContractionSpec::DenseTiled { weight, .. },
-        )) = choice
+        let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled {
+            m,
+            k,
+            n,
+            tile,
+            weight,
+            epilogue,
+            ..
+        })) = choice
         else {
             panic!("{backend:?}: expected the generated dense Tiled body, got {choice:?}");
         };
         assert_eq!(weight, poot_target::BufferStorage::bf16_packed());
-        format!("{request:?}")
+        assert_eq!(
+            tile,
+            default_caps_for(backend).gemm_launch().tile_edge as usize,
+            "{backend:?}: the tile is the caps' calibrated edge"
+        );
+        format!("{m} {k} {n} {weight:?} {epilogue:?}")
     })
     .collect();
     assert!(
@@ -6428,4 +6755,228 @@ fn a_scratch_past_the_buffer_limit_is_refused_by_finalize() {
             max_buffer_bytes: caps.max_buffer_bytes,
         }
     );
+}
+
+/// Per-family dtype admission (POOT-1298): each family planner owns the storage dtypes it lowers, and the
+/// router in `plan_gpu_eqn` only asks it. These rows drive the production planner entry with graphs whose
+/// op is one family's and whose dtype that family refuses or admits. E4M3FN is IR-rejected as an arithmetic,
+/// contraction or sampling operand (Card 529), so only the movement, cast and row-gather families can meet
+/// it here; the other families' E4M3FN refusal is a defense behind `infer`.
+mod family_dtype_admission {
+    use super::*;
+
+    fn caps_with_e4m3(storage: poot_target::E4m3Storage) -> DeviceCaps {
+        DeviceCaps {
+            e4m3_storage: storage,
+            ..default_caps_for(Backend::SpirvVulkan)
+        }
+    }
+
+    fn plan_first(g: &Graph, caps: &DeviceCaps) -> Result<Plan, PlanError> {
+        planned_with_choice_caps(g, &g.eqns()[0], Backend::SpirvVulkan, caps).map(|(plan, _)| plan)
+    }
+
+    fn missing(result: Result<Plan, PlanError>, what: &str) -> Capability {
+        refusal_of(result, what).missing
+    }
+
+    /// Mutation: drop `ScatterUpdate` from the half refusal in `movement::admits_dtypes`; the F16 scatter
+    /// plans a 2-byte row write it has no body for and the first assertion goes red.
+    #[test]
+    fn movement_refuses_a_half_scatter_and_a_native_less_e4m3_and_admits_a_half_slice() {
+        let caps = default_caps_for(Backend::SpirvVulkan);
+        let b = Builder::for_tests();
+        let base = b
+            .constant("base", TensorType::new(vec![2, 5], GDt::F16))
+            .unwrap();
+        let src = b
+            .constant("src", TensorType::new(vec![1, 5], GDt::F16))
+            .unwrap();
+        let slots = b.constant("s", TensorType::new(vec![1], GDt::I32)).unwrap();
+        let scatter = b.scatter_update(base, src, slots).unwrap();
+        let g = b.finish(scatter).unwrap();
+        assert_eq!(
+            missing(plan_first(&g, &caps), "F16 ScatterUpdate"),
+            Capability::DtypeLowering
+        );
+
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::new(vec![4, 6], GDt::F16))
+            .unwrap();
+        let sliced = b.slice(x, 0, 0, 2).unwrap();
+        let g = b.finish(sliced).unwrap();
+        assert!(
+            plan_first(&g, &caps).is_ok(),
+            "an F16 Slice moves 2-byte elements"
+        );
+
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::new(vec![4, 8], GDt::E4M3FN))
+            .unwrap();
+        let sliced = b.slice(x, 0, 0, 2).unwrap();
+        let g = b.finish(sliced).unwrap();
+        let none = caps_with_e4m3(poot_target::E4m3Storage::None);
+        assert_eq!(
+            missing(plan_first(&g, &none), "E4M3FN Slice without native storage"),
+            Capability::E4m3Storage
+        );
+        let packed = caps_with_e4m3(poot_target::E4m3Storage::PackedLanes);
+        assert!(plan_first(&g, &packed).is_ok());
+    }
+
+    /// Mutation: drop the `collective ||` arm of the half refusal in `movement::admits_dtypes`; the F16
+    /// all-reduce stops being refused by name here.
+    #[test]
+    fn movement_refuses_a_half_collective() {
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::new(vec![4, 8], GDt::F16))
+            .unwrap();
+        let reduced = b.all_reduce(x, poot_graph_ir::op::RedOp::Sum, 0).unwrap();
+        let g = b.finish(reduced).unwrap();
+        assert_eq!(
+            missing(
+                plan_first(&g, &default_caps_for(Backend::SpirvVulkan)),
+                "F16 AllReduce"
+            ),
+            Capability::DtypeLowering
+        );
+    }
+
+    /// Mutation: in `elementwise::admits_dtypes`, drop the `Fused(_)` pattern; the BF16 fused region plans a
+    /// kernel over f32 storage and the refusal assertion goes red.
+    #[test]
+    fn elementwise_refuses_a_half_fused_region_and_admits_a_half_binary() {
+        let caps = default_caps_for(Backend::SpirvVulkan);
+        let b = Builder::for_tests();
+        let slot = |name: &str| {
+            let _ = name;
+            b.slot(
+                poot_graph_ir::Slot::Activation,
+                TensorType::new(vec![4, 8], GDt::BF16),
+            )
+            .unwrap()
+        };
+        let (x, s, bias) = (slot("x"), slot("s"), slot("bias"));
+        let scaled = b.binary(GBinOp::Mul, x, s).unwrap();
+        let e = b.unary(GUnOp::Exp, scaled).unwrap();
+        let out = b.binary(GBinOp::Add, e, bias).unwrap();
+        let g = b.finish(out).unwrap();
+        let plain = &g.eqns()[0];
+        assert!(
+            planned_with_choice_caps(&g, plain, Backend::SpirvVulkan, &caps).is_ok(),
+            "a BF16 Binary is wired"
+        );
+        let fused = crate::passes::fuse(&g).unwrap();
+        let region = fused
+            .eqns()
+            .iter()
+            .find(|eqn| matches!(eqn.op, OpKind::Fused(_)))
+            .expect("fuse fuses the chain");
+        let refusal = refusal_of(
+            planned_with_choice_caps(&fused, region, Backend::SpirvVulkan, &caps)
+                .map(|(plan, _)| plan),
+            "BF16 Fused region",
+        );
+        assert_eq!(refusal.missing, Capability::DtypeLowering);
+    }
+
+    /// Mutation: make `matmul::admits_dtypes` return `Err(Capability::DtypeLowering)` for every dtype; the
+    /// BF16 matmul stops planning.
+    #[test]
+    fn matmul_admits_a_half_matmul() {
+        let g = matmul_graph(16, 32, 16, GDt::BF16);
+        assert!(try_matmul_plan(&g, Backend::SpirvVulkan).is_ok());
+    }
+
+    /// The indexed matmul's half refusal is stated twice: by `moe::admits_dtypes` and by
+    /// `indexed_matmul_lowers` inside the planner body, which answers the same typed refusal, so no single
+    /// mutation of the router arm turns this red; mutating `indexed_matmul_lowers` alone does not either.
+    /// Both together do.
+    #[test]
+    fn moe_refuses_a_half_indexed_matmul() {
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::new(vec![4, 8], GDt::BF16))
+            .unwrap();
+        let w = b
+            .constant("w", TensorType::new(vec![2, 8, 16], GDt::BF16))
+            .unwrap();
+        let idx = b.constant("i", TensorType::new(vec![4], GDt::I32)).unwrap();
+        let out = b.indexed_matmul(x, w, idx).unwrap();
+        let g = b.finish(out).unwrap();
+        assert_eq!(
+            g.aval(g.eqns()[0].out).dtype,
+            GDt::BF16,
+            "a half output over a half weight, which the weight lowering alone would admit as packed lanes"
+        );
+        assert_eq!(
+            missing(
+                plan_first(&g, &default_caps_for(Backend::SpirvVulkan)),
+                "F16 IndexedMatMul"
+            ),
+            Capability::DtypeLowering
+        );
+    }
+
+    /// Mutation: in `packed::admits_dtypes`, delete the `DenseRowGather` arm; the E4M3FN row gather then
+    /// refuses on a device with no native E4M3FN storage. A dense contraction is F32 out (`infer`), so
+    /// the packed family has no half-output case to build.
+    #[test]
+    fn packed_admits_the_e4m3_row_gather_without_native_storage() {
+        let g = dense_row_gather_graph(8, 4, 3, GDt::E4M3FN);
+        let gather = g
+            .eqns()
+            .iter()
+            .find(|e| matches!(e.op, OpKind::DenseRowGather { .. }))
+            .expect("a dense row gather eqn");
+        let none = caps_with_e4m3(poot_target::E4m3Storage::None);
+        assert!(
+            planned_with_choice_caps(&g, gather, Backend::SpirvVulkan, &none).is_ok(),
+            "the E4M3FN row gather reads row-padded words on a device with no native storage"
+        );
+    }
+
+    /// Mutation: make `attention::admits_dtypes` (via `StorageDtypes::refuse_unwired`) return `Ok(())`; the
+    /// F16 attention plans an f32 kernel over 2-byte storage and the refusal assertion goes red.
+    #[test]
+    fn attention_refuses_a_half_output() {
+        let b = Builder::for_tests();
+        let slot = |name: &str, shape: Vec<usize>| {
+            b.slot_named(
+                poot_graph_ir::Slot::Activation,
+                name,
+                TensorType::new(shape, GDt::F16),
+            )
+            .unwrap()
+        };
+        let q = slot("q", vec![1, 2, 1, 16]);
+        let k = slot("k", vec![1, 2, 8, 16]);
+        let v = slot("v", vec![1, 2, 8, 16]);
+        let mask = b
+            .constant("mask", TensorType::new(vec![1, 1, 1, 8], GDt::F16))
+            .unwrap();
+        let mut plan = b.append_plan(0).unwrap();
+        let out = plan
+            .equation(
+                OpKind::Attention(poot_graph_ir::op::AttentionAttrs::new(1, 0.25, None)),
+                [q, k, v, mask]
+                    .map(|operand| poot_graph_ir::Operand::Value(operand.id()))
+                    .to_vec(),
+            )
+            .expect("stage the F16 attention");
+        plan.declare_result(out).expect("declare the result");
+        let mut prepared = b.preflight_append(plan).expect("preflight");
+        let committed = b.commit_append(&mut prepared).expect("commit");
+        let g = b.finish(committed).unwrap();
+        assert_eq!(
+            missing(
+                plan_first(&g, &default_caps_for(Backend::SpirvVulkan)),
+                "F16 Attention"
+            ),
+            Capability::DtypeLowering
+        );
+    }
 }

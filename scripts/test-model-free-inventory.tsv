@@ -370,6 +370,7 @@ poot-executor	poot-executor	model-free	binder::tests::a_chunk_of_an_expert_stack
 poot-executor	poot-executor	model-free	binder::tests::a_narrowed_index_table_is_written_as_i32_in_any_chunking
 poot-executor	poot-executor	model-free	binder::tests::a_stack_writer_fills_any_chunking_with_zero_gaps
 poot-executor	poot-executor	model-free	binder::tests::an_unaligned_expert_table_binds_one_const_with_word_padded_slabs
+poot-executor	poot-executor	model-free	binder::tests::narrow_word_saturates_outside_i32
 poot-executor	poot-executor	model-free	coordinator::schedule::tests::a_cycle_among_rows_refuses_the_whole_plan
 poot-executor	poot-executor	model-free	coordinator::schedule::tests::malformed_participants_and_duplicate_ids_are_refused_by_name
 poot-executor	poot-executor	model-free	coordinator::schedule::tests::point_to_point_rows_are_admitted_in_dependency_order
@@ -384,6 +385,7 @@ poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_contraction_weight_declared_f32_but_stored_f16_is_a_typed_refusal
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_non_finite_packed_f16_weight_is_a_typed_refusal
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_size_only_device_refuses_a_dtype_mismatch_and_sizes_a_packed_weight_like_the_byte_taking_one
+poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::add_entry_refuses_a_file_modified_while_its_weight_uploads
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::add_entry_refuses_a_store_whose_mapped_file_changed
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::an_f16_contraction_weight_uploads_its_two_byte_words_packed
 poot-executor	poot-executor	model-free	engine::kernel_identity_tests::a_native_copy_device_is_never_offered_a_copy_kernel
@@ -1030,6 +1032,7 @@ poot-graph-plan	poot-graph-plan	model-free	tests::a_k_by_n_bf16_decode_projectio
 poot-graph-plan	poot-graph-plan	model-free	tests::a_large_tiled_matmul_keeps_its_tile_workgroup_on_amdgcn
 poot-graph-plan	poot-graph-plan	model-free	tests::a_refusal_names_the_equation_op_dtypes_target_and_missing_capability_on_every_backend
 poot-graph-plan	poot-graph-plan	model-free	tests::a_scratch_past_the_buffer_limit_is_refused_by_finalize
+poot-graph-plan	poot-graph-plan	model-free	tests::a_split_plans_dispatches_carry_work_in_proportion_to_their_launch
 poot-graph-plan	poot-graph-plan	model-free	tests::a_tiled_gemm_over_the_tile_ceiling_splits_into_disjoint_launches
 poot-graph-plan	poot-graph-plan	model-free	tests::amd_tensor_core_arm_admits_multi_block_batched_shapes
 poot-graph-plan	poot-graph-plan	model-free	tests::amd_wmma_reached_only_by_mixed_bf16_in_f32_out
@@ -1086,6 +1089,7 @@ poot-graph-plan	poot-graph-plan	model-free	tests::e4m3fn_slice_materializes_prop
 poot-graph-plan	poot-graph-plan	model-free	tests::e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu
 poot-graph-plan	poot-graph-plan	model-free	tests::e4m3fn_zero_element_transpose_is_rejected_by_name
 poot-graph-plan	poot-graph-plan	model-free	tests::every_attention_fixture_plans_the_generated_attention_family_on_every_target
+poot-graph-plan	poot-graph-plan	model-free	tests::every_launch_literal_has_provenance
 poot-graph-plan	poot-graph-plan	model-free	tests::exact_i32_binary_plans_typed_integer_kernels_on_every_compute_backend
 poot-graph-plan	poot-graph-plan	model-free	tests::exact_i32_bit_select_and_closed_fusion_plan_as_i32
 poot-graph-plan	poot-graph-plan	model-free	tests::exact_i32_planner_rejects_static_numel_overflow
@@ -1094,6 +1098,13 @@ poot-graph-plan	poot-graph-plan	model-free	tests::f16_matmul_bridges_to_ty_f16_n
 poot-graph-plan	poot-graph-plan	model-free	tests::f16_matmul_never_reaches_tiled_region
 poot-graph-plan	poot-graph-plan	model-free	tests::f16_non_wired_op_rejected_with_diagnostic
 poot-graph-plan	poot-graph-plan	model-free	tests::f32_matmul_request_is_the_f32_serial_kernel_after_f16_dtype_added
+poot-graph-plan	poot-graph-plan	model-free	tests::family_dtype_admission::attention_refuses_a_half_output
+poot-graph-plan	poot-graph-plan	model-free	tests::family_dtype_admission::elementwise_refuses_a_half_fused_region_and_admits_a_half_binary
+poot-graph-plan	poot-graph-plan	model-free	tests::family_dtype_admission::matmul_admits_a_half_matmul
+poot-graph-plan	poot-graph-plan	model-free	tests::family_dtype_admission::moe_refuses_a_half_indexed_matmul
+poot-graph-plan	poot-graph-plan	model-free	tests::family_dtype_admission::movement_refuses_a_half_collective
+poot-graph-plan	poot-graph-plan	model-free	tests::family_dtype_admission::movement_refuses_a_half_scatter_and_a_native_less_e4m3_and_admits_a_half_slice
+poot-graph-plan	poot-graph-plan	model-free	tests::family_dtype_admission::packed_admits_the_e4m3_row_gather_without_native_storage
 poot-graph-plan	poot-graph-plan	model-free	tests::float_select_past_the_grid_ceiling_emits_a_2d_fold
 poot-graph-plan	poot-graph-plan	model-free	tests::float_select_plans_a_float_pointwise_kernel_with_an_i32_condition_leaf
 poot-graph-plan	poot-graph-plan	model-free	tests::gather_over_i32_data_reads_the_table_on_the_i32_lane
@@ -1120,6 +1131,8 @@ poot-graph-plan	poot-graph-plan	model-free	tests::tensorcore_amdgcn_selected_for
 poot-graph-plan	poot-graph-plan	model-free	tests::tensorcore_not_selected_for_spirv
 poot-graph-plan	poot-graph-plan	model-free	tests::tensorcore_selected_only_for_nvptx_bf16_aligned
 poot-graph-plan	poot-graph-plan	model-free	tests::the_dense_gemv_arm_is_finalized
+poot-graph-plan	poot-graph-plan	model-free	tests::the_routed_tile_is_the_calibrated_edge_off_radv
+poot-graph-plan	poot-graph-plan	model-free	tests::the_routed_tile_stays_8x8_where_known_miscompiles_names_the_defect
 poot-graph-plan	poot-graph-plan	model-free	tests::the_split_kv_plan_records_the_exact_resources_of_both_launches
 poot-graph-plan	poot-graph-plan	model-free	tests::the_streaming_schedule_records_its_exact_resources
 poot-graph-plan	poot-graph-plan	model-free	tests::tiled_matmul_gets_the_tiled_grid_not_the_naive_fallthrough
@@ -4515,7 +4528,9 @@ poot-serve	poot-serve::startup_dense_family	model-free	startup_resolves_a_dense_
 poot-serve	poot-serve::startup_write_timeout	model-free	invalid_write_timeout_fails_before_every_model_loader
 poot-serve	poot-serve::startup_write_timeout	model-free	non_unicode_write_timeout_fails_before_model_loading
 poot-target	poot-target	model-free	calibration::tests::calibration_is_keyed_by_device_identity_not_vendor
+poot-target	poot-target	model-free	calibration::tests::every_gemm_launch_figure_has_provenance
 poot-target	poot-target	model-free	calibration::tests::the_gemv_ceiling_is_known_only_for_the_measured_generation
+poot-target	poot-target	model-free	calibration::tests::the_tile_edge_is_the_class_figure_gated_by_the_lds_defect
 poot-target	poot-target	model-free	dram_channels::tests::a_stride_camps_above_four_channels_idle
 poot-target	poot-target	model-free	dram_channels::tests::alias_factor_is_gcd_of_stride_granules_and_channels
 poot-target	poot-target	model-free	dram_channels::tests::only_a_measured_amd_part_has_a_channel_map
@@ -4523,6 +4538,7 @@ poot-target	poot-target	model-free	storage::tests::bf16_packed_shares_element_ki
 poot-target	poot-target	model-free	storage::tests::dense_constructors_agree_element_and_dtype
 poot-target	poot-target	model-free	storage::tests::e4m3_packed_pads_each_row_to_a_whole_word
 poot-target	poot-target	model-free	storage::tests::f16_packed_is_its_own_record_on_the_packed_word
+poot-target	poot-target	model-free	tests::a_hand_built_caps_with_the_lds_defect_clamps_the_tile_to_the_portable_edge
 poot-target	poot-target	model-free	tests::a_vpu_target_names_its_platform_and_arithmetic
 poot-target	poot-target	model-free	tests::amd_gfx_code_classification_matches_known_families
 poot-target	poot-target	model-free	tests::calibration_labels_name_the_backend_and_the_amd_gfx_code

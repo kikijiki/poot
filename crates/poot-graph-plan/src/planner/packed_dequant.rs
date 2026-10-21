@@ -20,7 +20,7 @@ use super::{
     KernelRequest, OpKind, PackedRequest, PlanError, Planned, matmul, value_ids,
 };
 use crate::planner::{GraphTables, finalize};
-use crate::predicates::{GEMM_TILE, INDEXED_GEMV_MAX_ROWS, packed_contraction_m_per_block};
+use crate::predicates::{INDEXED_GEMV_MAX_ROWS, packed_contraction_m_per_block};
 use crate::refusal::Site;
 use poot_graph_ir::ContractionRows;
 use poot_kernelgen::{
@@ -396,7 +396,7 @@ fn plan_indexed(
             (schedule, 0, [threads, 1, 1])
         }
         None => {
-            let tile = poot_kernelgen::TileSize::new(GEMM_TILE as u32)
+            let tile = poot_kernelgen::TileSize::new(caps.gemm_launch().tile_edge)
                 .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
             let ts = tile.get() as usize;
             let tiles = m

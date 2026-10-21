@@ -6,10 +6,16 @@ use super::{
     BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, HashMap, KernelRequest,
     OpKind, PlanError, Planned, TopKSpec, ValueId, kg, matmul, value_ids,
 };
-use crate::planner::{GraphTables, Layout, finalize};
-use crate::predicates::{GEMM_TILE, indexed_gemv_in, indexed_matmul_lowers, view_source};
+use crate::planner::{GraphTables, Layout, StorageDtypes, finalize};
+use crate::predicates::{indexed_gemv_in, indexed_matmul_lowers, view_source};
 use crate::refusal::Site;
 use poot_target::{Backend, BufferStorage, DeviceCaps};
+
+/// Whether this family lowers these storage dtypes: the indexed matmul and the rank inversion are f32/i32
+/// bodies (`indexed_matmul_lowers`), so a 2-byte float or a packed E4M3FN payload is refused by name.
+pub(super) fn admits_dtypes(dtypes: StorageDtypes) -> Result<(), Capability> {
+    dtypes.refuse_unwired()
+}
 
 /// Plan one MoE-family equation (IndexedMatMul, its `ContractionEpilogue`, or ArgTopK).
 #[expect(clippy::too_many_arguments)]
@@ -167,7 +173,7 @@ fn plan_indexed(
             (schedule, [threads, 1, 1], 0)
         }
         None => {
-            let tile = kg::TileSize::new(GEMM_TILE as u32)
+            let tile = kg::TileSize::new(caps.gemm_launch().tile_edge)
                 .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
             let ts = tile.get() as usize;
             let tiles = m

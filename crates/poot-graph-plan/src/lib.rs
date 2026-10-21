@@ -100,7 +100,7 @@ pub use passes::{
     flash_attention_capped, fold_iota, fuse, legalize, passes_without_target, rope_fusion,
     routed_expert_sites,
 };
-pub use planner::{KernelChoice, NoDispatch, Planned, dispatch_work};
+pub use planner::{KernelChoice, NoDispatch, Planned, region_member_work};
 #[cfg(any(test, feature = "test-support"))]
 pub use planner::{plan_eqn, plan_eqn_choice, plan_eqn_views, vpu_refusals};
 pub use predicates::{compute_views, numel, value_ids};

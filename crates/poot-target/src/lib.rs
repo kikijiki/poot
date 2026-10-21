@@ -362,6 +362,18 @@ pub struct KnownMiscompiles {
     /// RADV: the LDS-cooperative tiled GEMM produces wrong, non-deterministic output at or above this
     /// many workgroups in one dispatch (card 095). `None` on a device with no confirmed ceiling.
     pub tiled_gemm_max_workgroups: Option<u32>,
+    /// RADV: a workgroup wider than one wave64 miscomputes, because the upper waves' workgroup-local writes
+    /// are not visible after the barrier (output rows come back about zero) even though the SPIR-V is valid.
+    /// Gates the LDS tile edge to the 64-lane one ([`calibration::GemmLaunch::resolve`]).
+    pub lds_stale_above_wave64: bool,
+}
+
+impl KnownMiscompiles {
+    /// No confirmed defect: the state of a device nobody found one on.
+    pub const NONE: Self = Self {
+        tiled_gemm_max_workgroups: None,
+        lds_stale_above_wave64: false,
+    };
 }
 
 /// The optional shader features a device was opened with: what its runtime requested and the device granted,
@@ -517,6 +529,17 @@ pub struct DeviceCaps {
     /// The output-column count above which a decode GEMV is measured slower than the batched matmul on this
     /// device; `None` where nobody measured one (the GEMV is kept at any width).
     pub decode_gemv_max_out_cols: Option<u32>,
+    /// The kind of device the launch figures are calibrated for. The M>1 launch is derived from it and
+    /// `known_miscompiles` by [`DeviceCaps::gemm_launch`], so the two cannot disagree.
+    pub launch_class: calibration::LaunchClass,
+}
+
+impl DeviceCaps {
+    /// The tile edge and lane grids the M>1 contraction schedules launch with on this device: the class figure
+    /// with the `known_miscompiles` gate applied ([`calibration::GemmLaunch::resolve`]).
+    pub const fn gemm_launch(&self) -> calibration::GemmLaunch {
+        calibration::GemmLaunch::resolve(self.launch_class, &self.known_miscompiles)
+    }
 }
 
 /// Card 258: output-element count (one `gemv_lds` workgroup per element) above which a wgpu decode-GEMV
@@ -610,6 +633,7 @@ impl DeviceCaps {
             imported_lds_array_bodies: true,
             peer_transport: false,
             decode_gemv_max_out_cols: None,
+            launch_class: calibration::LaunchClass::Vulkan,
         }
     }
 
@@ -643,6 +667,7 @@ impl DeviceCaps {
             imported_lds_array_bodies: false,
             peer_transport: false,
             decode_gemv_max_out_cols: None,
+            launch_class: calibration::LaunchClass::Hsa,
         }
     }
 
@@ -673,6 +698,7 @@ impl DeviceCaps {
             imported_lds_array_bodies: true,
             peer_transport: true,
             decode_gemv_max_out_cols: calibration::nvidia_decode_gemv_max_out_cols(8).known(),
+            launch_class: calibration::LaunchClass::Cuda,
         }
     }
 }
@@ -680,6 +706,38 @@ impl DeviceCaps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The launch edge is derived from the class and `known_miscompiles`, never stored beside them: hand-built
+    /// caps that set the LDS defect launch the portable 8 whatever their class, and the RADV preset does too.
+    /// Mutation: drop the `lds_stale_above_wave64` gate in `GemmLaunch::resolve`; the hand-built HSA row reads 16.
+    #[test]
+    fn a_hand_built_caps_with_the_lds_defect_clamps_the_tile_to_the_portable_edge() {
+        let defect = KnownMiscompiles {
+            lds_stale_above_wave64: true,
+            ..KnownMiscompiles::NONE
+        };
+        let edge = |caps: &DeviceCaps| caps.gemm_launch().tile_edge;
+        let rocm = DeviceCaps::rocm_default();
+        assert_eq!(edge(&rocm), calibration::HSA_TILE_EDGE);
+        assert_eq!(
+            edge(&DeviceCaps {
+                known_miscompiles: defect,
+                ..rocm
+            }),
+            calibration::PORTABLE_TILE_EDGE
+        );
+        assert_eq!(
+            edge(&DeviceCaps {
+                known_miscompiles: defect,
+                ..DeviceCaps::ptx_default()
+            }),
+            calibration::PORTABLE_TILE_EDGE
+        );
+        assert_eq!(
+            edge(&DeviceCaps::wgpu_rdna3_igpu()),
+            calibration::PORTABLE_TILE_EDGE
+        );
+    }
 
     /// A calibration table keys a device class by this label: each GPU backend has its own, an AMD part
     /// carries its gfx code, and an NPU has none. Mutation: drop the arch from the amdgcn label.

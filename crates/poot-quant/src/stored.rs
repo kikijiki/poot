@@ -11,8 +11,11 @@
 //! not a defined failure: a write while a slice is live is a data race, and the content checks that ran
 //! at load are not repeated at upload (see `mapping`, invariant 4). A modification already made is refused
 //! by [`StoredBytes::check_unchanged`], an `fstat` identity check on the mapped descriptor that loaders
-//! and binders run at their boundaries; one racing a read in flight is not detected (a truncation ends the
-//! process with `SIGBUS`). Replacing a checkpoint by rename is always safe.
+//! and binders run at their boundaries. The load-time upload of a weight runs it before and after its
+//! reads, so a file modified while that upload read it is refused and the entry is not published; the
+//! runtime reads of the mapping (embed rows, expert refills) have no check after them, so a modification
+//! racing one is not detected (a truncation ends the process with `SIGBUS`). Replacing a checkpoint by
+//! rename is always safe.
 
 #[expect(unsafe_code)]
 mod mapping;
