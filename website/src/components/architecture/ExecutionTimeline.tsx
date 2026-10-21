@@ -15,7 +15,7 @@ const STRATEGIES: Strategy[] = [
     id: "naive",
     label: "Naive",
     description:
-      "One dispatch per primitive eqn, per token: over a thousand for Qwen2.5-0.5B (illustrative count).",
+      "One dispatch per primitive eqn, per token: over a thousand for a 24-layer decoder (illustrative count).",
     dispatches: 1400,
     hostCalls: 1400,
     color: "var(--ifm-color-danger)",
@@ -33,7 +33,7 @@ const STRATEGIES: Strategy[] = [
     id: "captured",
     label: "Native replay",
     description:
-      "Illustrative native replay: one graph launch for the recorded dispatch sequence on PTX. ROCm replays AQL packets; wgpu re-encodes cached dispatches and may split submissions. Full token steps also update inputs and read outputs.",
+      "Illustrative native replay: one graph launch for the recorded dispatch sequence on PTX. ROCm replays AQL packets; raw Vulkan resubmits recorded command buffers, one fence wait per submission; wgpu re-encodes cached dispatches and may split submissions. Full token steps also update inputs and read outputs.",
     dispatches: 80,
     hostCalls: 1,
     color: "var(--ifm-color-success)",

@@ -6,20 +6,15 @@ sidebar_position: 8
 
 # The Megakernel
 
-:::note[Removed]
-poot has no megakernel. The earlier implementation was deleted because nothing used it and it
-silently passed through ops it could not run.
-:::
-
 A megakernel combines work from several kernels into one persistent device launch. Extending it to
 an entire token loop also requires on-device sampling and stop handling. Related persistent-kernel
 work includes Mirage [^mirage] and MPK [^mpk].
 
-The current kernel IR has scoped fences and compare-and-swap, and the PTX and ROCm runtimes expose
+poot has no megakernel. The kernel IR has scoped fences and compare-and-swap, and the PTX and ROCm runtimes expose
 cooperative-launch mechanisms. Those pieces do not constitute a megakernel: a recorder alone cannot
 make arbitrary host-loaded kernels callable from a persistent kernel, and a multi-token loop needs
-sampling, cancellation and streaming contracts. wgpu lacks the grid-wide synchronization this
-strategy would require. Current execution uses
+sampling, cancellation and streaming contracts. The SPIR-V backends, wgpu and raw Vulkan, have no
+grid-wide synchronization primitive, which this strategy would require. Execution is
 [native replay or cached dispatch encoding](./execution).
 
 [^mirage]: Wu, M. et al., "Mirage: A Multi-Level Superoptimizer for Tensor Programs," OSDI, 2024. https://arxiv.org/abs/2405.05751

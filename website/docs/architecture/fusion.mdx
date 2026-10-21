@@ -29,7 +29,7 @@ registers or shared memory. `poot_graph_ir::analysis::dispatch_count` gives a gr
 | Widening-cast folding        | A norm scale or bias stored in bf16 is widened inside the fused region that reads it, so its cast is not a dispatch |
 | Computed-constant CSE        | Tables built from one recipe, such as the RoPE tables every layer asks for, exist once and are gathered once per step |
 | Flash attention rewrite      | Each attention layer's chain becomes one dispatch               |
-| Capture and replay           | Native replay or cached wgpu dispatches reduce host work        |
+| Capture and replay           | Native replay (CUDA graphs, HSA packets, Vulkan command buffers) or cached wgpu dispatches reduce host work |
 
 ## Imported vs synthesized kernels
 
@@ -38,9 +38,11 @@ registers or shared memory. `poot_graph_ir::analysis::dispatch_count` gives a gr
 crate's `assets/`). The plan carries the imported body and the executor dispatches its precompiled
 SPIR-V/PTX/AMDGPU artifact. Imported kernels cover the shapes the synthesizer does not:
 
-- Decode `MatMul` (M=1) over an f32 `[K, N]` weight, and its batched variant (`gemv_coalesced*.rs`)
-- Greedy argmax as two stages and the batched samplers (`argmax_chunk.rs`, `argmax_combine.rs`,
-  `sample_*_gumbel_argmax_batched.rs`)
+- Decode `MatMul` (M=1) over an f32 `[K, N]` weight, and its batched variant (`gemv_coalesced*.rs`), and the
+  tiled GEMMs (`tiled_gemm*.rs`)
+- Greedy argmax as two stages, the uniform generator and the batched samplers (`argmax_chunk.rs`,
+  `argmax_combine.rs`, `random_uniform.rs`, `sample_*_gumbel_argmax_batched.rs`)
+- Packed row gathers and the packed bf16 to f32 conversion (`packed_*.rs`)
 
 Data movement (`Gather`, `Slice`, `Concat`, `Transpose`, `Broadcast`, `DynamicUpdateSlice`) is
 not imported: one generated movement kernel covers every op and every storage, including packed byte
@@ -102,8 +104,8 @@ the exact chain the attention tracer emits. `matmul(q, k^T) -> scale -> mask -> 
 -> sub -> exp -> reduce-sum -> div -> matmul(scores, v)`, and replaces it with a single
 `Attention` eqn, for decode and prefill alike. The planner then generates its kernel: one
 online-softmax generator for every head width, with the lane count read from the device's workgroup
-memory. On wgpu the default pipeline skips the prefill rewrite when
-`Hq * L` exceeds 65535 workgroups. This rewrite fires once per attention layer [^flash1] [^flash2].
+memory. The default pipeline skips the prefill rewrite when
+`Hq * L` exceeds the target's x-grid limit (65535 workgroups on wgpu). This rewrite fires once per attention layer [^flash1] [^flash2].
 
 Canonicalization and matcher legality checks cover equivalent spellings and reject unsupported shapes.
 The matchers recognize bounded patterns.
@@ -123,7 +125,7 @@ request, imported from a shipped kernel, or needs no dispatch at all.
 | **Reduction**         | `FusedRow` region                                | Synthesized: block reduce + epilogue in shared memory                                                                     |
 | **GEMV**              | `MatMul` with M=1 (decode)                       | Imported or `kernelgen::gemv_lds`: one workgroup per output row                                                           |
 | **Tiled GEMM**        | `MatMul` with f32 operands, M>1 and a 2-D weight | Synthesized by `kg::tiled_region`: 2-D tile with LDS staging                                                                |
-| **Tensor-core GEMM**  | bf16 operands                                    | WMMA bodies on PTX and ROCm; not on wgpu                                                                                  |
+| **Tensor-core GEMM**  | bf16 operands (f16 on a Vulkan device)           | WMMA bodies on PTX and ROCm; a cooperative-matrix body on a Vulkan device whose caps report the 16x16x16 f16-in f32-out configuration, with 16-aligned M, N and K |
 | **Attention**         | `Attention`                                      | Generated from `KernelRequest::Attention` (`AttentionSpec`): one workgroup per (batch row, Q head, query row), lanes striding the keys, softcap optional |
 | **Dequant GEMV/GEMM** | `PackedContraction`                              | Generated decode from the format descriptor, then contraction                                                             |
 

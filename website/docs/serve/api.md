@@ -6,8 +6,7 @@ sidebar_position: 5
 
 # OpenAI-compatible API
 
-`poot-serve` is an OpenAI-compatible HTTP server. Per-connection threads accept and parse requests, so
-a slow request never blocks new ones.
+`poot-serve` is an OpenAI-compatible HTTP server. A slow request never blocks new ones.
 
 `POST /v1/completions` and `POST /v1/chat/completions` run on the engine thread's one scheduling loop
 ([Continuous batching](./continuous-batching.md)). The embeddings, rerank and LoRA administration routes send
@@ -35,7 +34,7 @@ curl -i http://localhost:8080/v1/completions \
 | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `POST /v1/completions`                                   | Parsed, bounded and run by the scheduling loop. Fields: `prompt`, `max_tokens`, `stream`, `stop`, `n`, `logprobs`, sampling, guided fields, `lora_adapter`.                                                    |
 | `POST /v1/chat/completions`                              | Parsed, bounded and run by the scheduling loop. Fields: `messages`, `max_tokens` or `max_completion_tokens`, `logprobs`/`top_logprobs`, `tools`/`tool_choice`, `response_format`, plus the completions fields. |
-| `POST /v1/embeddings`, `POST /v1/rerank`                 | Run as `encode` steps on the engine thread; hidden states are pooled on the host. See [Embeddings and reranking](./embeddings-and-reranking.md).                                                               |
+| `POST /v1/embeddings`, `POST /v1/rerank`                 | See [Embeddings and reranking](./embeddings-and-reranking.md).                                                                                                                                                 |
 | `GET /v1/models`, `GET /v1/models/{id}`                  | One served model; an unknown id is 404.                                                                                                                                                                        |
 | `GET`/`POST`/`DELETE /v1/lora_adapters`                  | List, hot-load and unload adapters on the engine thread, under the trust policy in [LoRA adapters](./lora-adapters.md).                                                                                        |
 | `GET /health`, `GET /metrics`, `GET /metrics/prometheus` | Liveness and metrics.                                                                                                                                                                                          |
@@ -58,7 +57,7 @@ the chat template's own text carries control tokens. This holds for message cont
 and image-chat text parts alike. A chat template that fails to render the conversation (it raises, spends its instruction
 budget, or prints more than its output budget) is a `400` naming the template error; no other format answers in its
 place. One limit: a template that builds a control token's text out of a message by string surgery, rather than printing
-the message or cutting it apart, is not covered. Qwen-VL image chats are not covered yet: their prompt is tokenized with
+the message or cutting it apart, is not covered. Image chats are not covered yet: their prompt is tokenized with
 control tokens parsed.
 
 An error the engine reports is answered by its class: a request the engine refuses (an empty or too long
@@ -69,10 +68,4 @@ receipt or `[DONE]`.
 
 ## Checkpoints
 
-The model can be a safetensors directory or a single **GGUF** file. A causal decoder (Qwen2/3, Llama, Mistral,
-Mixtral, Gemma, Granite, Granite MoE, OLMo 2, OLMoE, Phi-3, SmolLM3, BLOOM, MPT, Qwen3-MoE, gpt-oss, Gemma 4,
-DeepSeek-V2/V3/V3.2, Nemotron-H, Qwen3-Next, Qwen3.8-Flash-Next) is served if compiling its graph for the chosen backend succeeds; a refusal names the equation and the missing capability. A BERT encoder or cross-encoder is fitted and prepared like a decoder and serves `/v1/embeddings` and `/v1/rerank`; a decoder whose family has an embedding pass answers the same routes through it. A SmolVLM (idefics3) or Qwen2.5-VL checkpoint also takes images; see [Multimodal](./multimodal.md). See the [feature matrix](../reference/feature-matrix.md) for what the
-libraries support.
-
-Related: [Configuration reference](./configuration.md), [LoRA adapters](./lora-adapters.md),
-[Using quantized checkpoints](./quantized-checkpoints.md).
+The model can be a safetensors directory or a single **GGUF** file. A causal decoder of a registered family is served if compiling its graph for the chosen backend succeeds; a refusal names the equation and the missing capability. An embedding encoder or cross-encoder is fitted and prepared like a decoder and serves `/v1/embeddings` and `/v1/rerank`; a decoder whose family has an embedding pass answers the same routes through it. A checkpoint whose family has a vision front end also takes images; see [Multimodal](./multimodal.md). The [feature matrix](../reference/feature-matrix.md) lists which families are served.

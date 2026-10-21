@@ -69,16 +69,16 @@ consume the weight, and a packed MoE expert stack is read by one indexed packed 
 
 | Format                                  | Packed on GPU                                                         |
 | --------------------------------------- | --------------------------------------------------------------------- |
-| GGUF K-quants and legacy quants [^gguf] | Yes, by default                                                       |
-| MXFP4 (gpt-oss routed experts)          | Packed at load; read in place by the indexed packed contraction       |
+| GGUF K-quants and Q4_0/Q8_0-style quants [^gguf] | Yes, by default                                                       |
+| MXFP4 (routed MoE experts)              | Packed at load; read in place by the indexed packed contraction       |
 | GPTQ [^gptq], AWQ [^awq]                | Packed 4-bit projections by default                                   |
-| FP8 (`compressed-tensors`)              | Packed E4M3 per-channel projections on the supported Qwen loader path |
+| FP8 (`compressed-tensors`)              | Packed E4M3 per-channel projections on the supported loader path          |
 
 Mixed K-quant files such as `Q4_K_M` widen some layers, as the ggml quantizer writes them. KV-cache
 quantization is not implemented. Operator detail: [Using quantized checkpoints](../serve/quantized-checkpoints.md).
 
 **LoRA adapters** [^lora] use the PEFT [^peft] layout. `poot-serve` loads, selects and unloads them while it runs. Adapters apply to the seven attention
-and MLP projections of dense qwen2/llama-shaped models. See [Using LoRA adapters](../serve/lora-adapters.md).
+and MLP projections of dense decoder families that use those projections (the [feature matrix](../reference/feature-matrix.md) lists the families). See [Using LoRA adapters](../serve/lora-adapters.md).
 
 **Tensor parallelism** divides the weights by role and the paged KV pool by KV heads over the ranks
 of a group. A multi-device coordinator in `poot-executor` runs pipeline and tensor-parallel programs

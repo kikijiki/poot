@@ -43,7 +43,7 @@ directory, so a test that reaches for a device or a checkpoint fails instead of 
 a checkpoint run in separate lanes, and each device lane fails before any test runs when its device is missing:
 
 ```bash
-just test-device-wgpu      # the required migrated wgpu cases (executor contract, packed serving, launch widening, I32, cr30 failure lifecycle), wgpu device required
+just test-device-wgpu      # the required migrated wgpu cases (executor contract, packed serving, launch widening, I32, failure lifecycle), wgpu device required
 just test-device-kernels   # pootc and poot-kernelgen kernel suites, wgpu device required
 just test-device-vulkan    # raw Vulkan: live caps receipt, executor contract, parity table and driver generation rows, under the validation layer
 just test-device-rocm      # poot-rocm-device resident probes and packed-serving cases
@@ -66,7 +66,7 @@ The checkpoint lanes (`just test-checkpoint`, `just test-checkpoint-wgpu`, `just
 Each checkpoint lane runs its rows by exact name (an `#[ignore]`d row too): `scripts/required-checkpoint-cases.txt` for
 the CPU lanes, the `checkpoint-wgpu.txt`, `checkpoint-rocm.txt`, `checkpoint-ptx.txt` and `checkpoint-vulkan.txt` lists in `scripts/required-device-cases/` for the device lanes, which also fail a row that
 skipped. The lists are hand-maintained. A `checkpoint` test or an `#[ignore]`d test that is in no lane's list, and a row
-that names no test, all fail `just test-lane-coverage`; an ignored test no lane runs is deleted.
+that names no test, all fail `just test-lane-coverage`.
 
 `scripts/test-model-free.sh` decides which packages the default lane covers. Its `gate_policy` names every
 workspace package and either gates it or excludes it with a reason, and the lane fails when a package is missing

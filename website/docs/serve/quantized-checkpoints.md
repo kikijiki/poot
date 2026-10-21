@@ -17,17 +17,17 @@ that every model architecture or execution path supports it; see the [feature ma
 example generates through the driver on the first device that opens; it is not a performance benchmark:
 
 ```bash
-hf download Qwen/Qwen2.5-0.5B-Instruct-GGUF qwen2.5-0.5b-instruct-q8_0.gguf \
-  --local-dir ~/models/qwen2.5-0.5b-gguf
+hf download <org>/<model>-GGUF <file>.gguf --local-dir ~/models/<model>-gguf
 
 cargo run -p poot-llm --release --example gguf_generate -- \
-  ~/models/qwen2.5-0.5b-gguf/qwen2.5-0.5b-instruct-q8_0.gguf
+  ~/models/<model>-gguf/<file>.gguf
 ```
 
 The reader accepts F32, F16 and BF16, legacy quants `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`,
 K-quants `Q2_K` through `Q6_K`, `IQ2_XS`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, and MXFP4. Quantized weights stay packed at
-load time. Q8_0 and Q4_K_M Qwen library decode paths have real-checkpoint receipts on wgpu, ROCm
-and PTX; those receipts do not establish every family/format combination.
+load time. Q8_0 and Q4_K_M library decode paths have real-checkpoint receipts on wgpu, ROCm
+and PTX. Raw Vulkan has a real-checkpoint receipt for a bf16 safetensors decode and none for a GGUF quant. These
+receipts do not establish every family/format combination.
 
 `Q8_K` and the grid formats not listed above (the IQ1 family and the other IQ2 formats) are unsupported and refused by name.
 
@@ -55,10 +55,9 @@ at packed checkpoint size.
 
 ## FP8 safetensors
 
-The `compressed-tensors` per-channel E4M3 projection path, for any dense family the registry knows (not only
-Qwen), uses the same packed descriptors and
-compiler lowering as other quantized projections. It no longer expands those projections to f32 at
-load time or requires a separate resident-E4M3 executor route. Generated kernels decode the stored
+The `compressed-tensors` per-channel E4M3 projection path, for any dense family the registry knows, uses the same packed descriptors and
+compiler lowering as other quantized projections. Projections stay packed at load time (no f32
+expansion) and need no separate resident-E4M3 executor route. Generated kernels decode the stored
 values and apply their scales; this does not require native FP8 tensor-core instructions.
 
 ## Memory expectations
@@ -72,4 +71,4 @@ values and apply their scales; this does not require native FP8 tensor-core inst
 - Choose a supported model architecture and execution path as well as a format. A format-level kernel
   test alone is not a complete model-support receipt.
 
-Design notes: [Serving design](../architecture/serving-design.mdx).
+Design: [Serving design](../architecture/serving-design.mdx).

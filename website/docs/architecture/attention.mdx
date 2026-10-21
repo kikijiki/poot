@@ -114,7 +114,7 @@ m = m_new;
 ```
 
 The accumulators are in workgroup LDS, not private arrays: private arrays with dynamic indices
-crash some SPIR-V drivers (RADV). The same generated kernel runs on wgpu, PTX and ROCm.
+crash some SPIR-V drivers (RADV). The same generated kernel runs on wgpu, raw Vulkan, ROCm and PTX.
 
 A key whose score is `-inf` adds exactly zero weight, and a row with no visible key at all is
 `0 / 0`, as the oracle's softmax gives. Peak memory is **O(head_dim)** per workgroup: the
@@ -126,8 +126,7 @@ A key whose score is `-inf` adds exactly zero weight, and a row with no visible 
 rotary part shared by every head: `concat(k_nope, broadcast(k_pe))`. The rewrite recognizes that
 chain and keeps the two parts as separate operands, `k [B, Hkv, Lk, Dk - s]` and
 `k_shared [B, 1, Lk, s]`. The kernel reads the shared part once per key for every head, so the
-broadcast key is never built. A value narrower than the key (DeepSeek-V2: key width 192, value width
-128) is part of the op's type.
+broadcast key is never built. A value narrower than the key is part of the op's type.
 
 **Paged keys.** A paged KV cache keeps K and V in per-layer pools of fixed slots (see
 [Paged KV](#kv-cache)). The paged key form takes the pools themselves, `k [S, Hkv, Dk]` and
@@ -196,8 +195,8 @@ is part of the request, so it is part of the plan key.
 The combine reassociates the float sums (per-split partials, then across splits), so it matches
 the streaming schedule and the oracle within a tolerance, not bit for bit.
 
-This is the portable first schedule. Later schedules (tiled prefill) reuse the same score, mask
-and softmax-combine semantics and are chosen by the planner per shape.
+Every schedule shares the same score, mask and softmax-combine semantics; the planner chooses
+the schedule per shape.
 
 ## KV cache
 
@@ -249,12 +248,10 @@ policy, the kernel itself does not change.
   (multi-head latent attention [^mla]) is a first-class operand layout. The matcher declines a chain
   whose key or value the op's typing rule cannot type, such as a single key head the matmul merely
   broadcasts. See [Crates and implementation details](./implementation).
-- **Softcap.** The softcap is part of the score transform on every phase: Gemma 2's decode and
+- **Softcap.** The softcap is part of the score transform on every phase: decode and
   prefill both run the generated kernel.
 - **Head width.** There is no fixed head-width limit: the lane count follows the device's workgroup
   memory, so a 512-wide head runs on every target with fewer lanes than a 64-wide one.
-- **RADV.** Mesa's open-source AMD Vulkan driver. Several SPIR-V subset rules (no private arrays with
-  dynamic indices; structurized CFG) exist because RADV crashed on otherwise-valid patterns.
 
 More crate-level notes live on [Crates and implementation details](./implementation).
 

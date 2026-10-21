@@ -25,18 +25,13 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Backend",
-    def: "A specific GPU target that poot can lower kernels to. First-class backends are wgpu (SPIR-V/Vulkan), ROCm (AMD HSA), and PTX (NVIDIA); raw Vulkan is a fourth, lower-priority one. A backend consists of a codegen target, a runtime, and an executor.",
+    def: "A specific GPU target that poot can lower kernels to. The GPU backends are wgpu (SPIR-V/Vulkan), raw Vulkan (SPIR-V through ash), ROCm (AMD HSA) and PTX (NVIDIA). A backend consists of a codegen target, a runtime, and an executor.",
     see: "backends",
   },
   {
     term: "Block table",
     def: "A host-side per-sequence table that maps logical KV block indices to physical block indices in the paged KV pool. The host flattens it into the Slot::SlotMap graph input (logical position to physical slot), which the paged decode graph uses to gather K/V, and into the Slot::WriteMap input (each new token to its physical slot), which the graph writes K/V through.",
     see: "attention",
-  },
-  {
-    term: "Bucket",
-    def: "A power-of-two range used to discretize a dynamic dimension (sequence length or batch size). Graphs are compiled or captured once per bucket. Amortizes compilation cost over all sequences in that length range.",
-    see: "execution",
   },
   {
     term: "Causal mask",
@@ -129,7 +124,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "iGPU",
-    def: "Integrated GPU - built into the same chip as the CPU, sharing system memory (unified memory architecture). Accessed via the wgpu/Vulkan backend.",
+    def: "Integrated GPU - built into the same chip as the CPU, sharing system memory (unified memory architecture). Accessed via the wgpu or raw Vulkan backend.",
   },
   {
     term: "KIR / kernel IR",
@@ -163,7 +158,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Megakernel",
-    def: "A persistent device launch combining work from several kernels. poot has no megakernel today. A future bounded single-step implementation needs compiler lowering and a co-residency proof; an entire token loop needs additional contracts. The required grid-wide synchronization is unavailable on wgpu.",
+    def: "A persistent device launch combining work from several kernels. poot has no megakernel. A bounded single-step implementation needs compiler lowering and a co-residency proof; an entire token loop needs additional contracts. The required grid-wide synchronization is unavailable on the SPIR-V backends (wgpu and raw Vulkan).",
     see: "megakernel",
   },
   {
@@ -178,7 +173,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "MLA (multi-head latent attention)",
-    def: "DeepSeek-style attention that compresses K/V into a latent cache. Can use different head widths for Q/K vs V; poot keeps unequal-width cases on the primitive decomposition rather than flash fusion.",
+    def: "Attention that compresses K/V into a latent cache. Can use different head widths for Q/K vs V; poot keeps unequal-width cases on the primitive decomposition rather than flash fusion.",
     see: "attention",
   },
   {
@@ -243,7 +238,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "RADV",
-    def: "Mesa's open-source Vulkan driver for AMD GPUs. poot's wgpu path is verified against RADV; several SPIR-V subset rules exist because RADV crashed on otherwise-valid patterns.",
+    def: "Mesa's open-source Vulkan driver for AMD GPUs. poot's wgpu and raw Vulkan paths are verified against RADV; several SPIR-V subset rules exist because RADV crashes on otherwise valid patterns.",
     see: "backends",
   },
   {
@@ -262,7 +257,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "SPIR-V",
-    def: "A portable binary intermediate language for GPU kernels, used by Vulkan. poot lowers kernel IR to SPIR-V via LLVM's spirv64 backend and loads the binary via wgpu.",
+    def: "A portable binary intermediate language for GPU kernels, used by Vulkan. poot lowers kernel IR to SPIR-V via LLVM's spirv64 backend and loads the binary via wgpu or raw Vulkan.",
     see: "backends",
   },
   {
@@ -301,7 +296,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "wgpu",
-    def: "A Rust crate providing a safe, portable GPU API over Vulkan, Metal, DX12, and WebGPU. poot uses wgpu as the runtime for the SPIR-V/Vulkan backend.",
+    def: "A Rust crate providing a safe, portable GPU API over Vulkan, Metal, DX12, and WebGPU. poot uses wgpu as the runtime of the wgpu backend.",
     see: "backends",
   },
   {

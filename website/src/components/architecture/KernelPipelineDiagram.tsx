@@ -24,7 +24,7 @@ pub fn elementwise_add(
         out[i] = a[i] + b[i];
     }
 }`,
-    note: 'Full Rust: type-checked, borrow-checked. Testable on CPU under cfg(test).',
+    note: 'Full Rust: type-checked and borrow-checked by rustc.',
   },
   {
     title: '2. Stable MIR import',
@@ -101,7 +101,7 @@ live:
     ...
 $done: ret;
 }`,
-    note: 'llc produces SPIR-V and PTX; the ROCm-flavored clang links a loadable HSACO. Loaded by wgpu (SPIR-V), cudarc (PTX), or HSA (HSACO), and dispatched per Plan entry.',
+    note: 'llc produces SPIR-V and PTX; the ROCm-flavored clang links a loadable HSACO. Loaded by wgpu or raw Vulkan (SPIR-V), cudarc (PTX), or HSA (HSACO), and dispatched per Plan entry.',
   },
 ];
 

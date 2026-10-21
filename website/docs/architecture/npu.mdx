@@ -12,10 +12,9 @@ Lake). Neither is a serving backend and neither has a `--backend` option: each i
 (`poot-npu`, behind its `xdna` feature under the repository's `nix develop .#npu` shell, and its `vpu`
 feature under `nix develop .#npu-intel`).
 
-The NPUs are wanted and under active development. The goal is prefill: an NPU produces the KV cache and
-another device decodes from it. That handoff is not built yet, and a model served wholly by an NPU is a goal
-only if a worthwhile one exists. The generated [feature matrix](../reference/feature-matrix.md) lists which
-ops the planner admits for the XDNA2 today.
+Planned: prefill on an NPU, which produces the KV cache that another device decodes from. That handoff is
+not implemented. The generated [feature matrix](../reference/feature-matrix.md) lists which ops the planner
+admits for the XDNA2.
 :::
 
 ## What runs
@@ -63,8 +62,7 @@ Verified on an AMD XDNA2 NPU (Strix Halo, `aie2p`):
 - **Gather** of `F32` or `I32` elements through an `I32` index returns the source elements bit for bit,
   negative zero and NaN payloads included, along any axis. An index outside the axis is not checked, as on
   the GPU kernel.
-- **A graph of twenty equations with twenty distinct shapes runs in three hardware contexts**, where one
-  artifact per equation fails at the seventeenth load.
+- **A graph of twenty equations with twenty distinct shapes runs in three hardware contexts.**
 - **Region bounds, measured**: 32 compute tiles, 16 host streams in and 16 out, 2 streams per tile, and a
   tile-local limit of 64512 bytes. An artifact at each bound links and runs, and one past it is refused by
   the toolchain; the compiler splits a program at these numbers, or refuses an equation that fits no region
@@ -109,7 +107,7 @@ graph's other F32 inputs are checked before each replay: a value beyond the rang
 error that names the argument and the element and runs nothing. An argument that an earlier command of the
 same recording writes is checked as that command's result instead, and so is a weight a recorded copy fills. The F32 results
 are checked after the replay too, since a result that left the range was computed outside what the bound was
-measured on. On the laptop NPU an F32 input of 65504 runs, an input of 65520 (which FP16 rounds to infinity)
+measured on. On the Intel NPU an F32 input of 65504 runs, an input of 65520 (which FP16 rounds to infinity)
 is refused, and a sum of two in-range inputs that exceeds the range comes back as a finite F32 and is refused
 as a result.
 

@@ -39,7 +39,8 @@ the request with a `400` too.
 
 ## Scope
 
-- **Model family:** dense qwen2/llama-shaped models, served through the driver.
+- **Model family:** dense decoders whose attention and MLP projections carry the module names below, served
+  through the driver; the [feature matrix](../reference/feature-matrix.md) lists the families.
 - **Target modules:** the seven attention and MLP projections (`q_proj`, `k_proj`, `v_proj`,
   `o_proj`, `gate_proj`, `up_proj`, `down_proj`). An adapter that targets any other module is refused
   outright at load time; poot does not partially apply an adapter.
@@ -48,7 +49,7 @@ the request with a `400` too.
 - **Adapter dtype:** F32, F16 or BF16 factors, uploaded in the dtype the adapter file stores them in (a BF16
   adapter takes half the device memory of its F32 twin) and widened on the device by the correction. The
   adapters of one load must share one stored dtype; a mixed set is refused at load.
-- **Backends:** verified on wgpu and ROCm.
+- **Backends:** the adapter path is backend-independent driver code, and its device tests run on wgpu, ROCm and PTX (the
+  PTX test skips without an NVIDIA GPU); no device test covers adapters on raw Vulkan.
 
-Design notes and primary sources live under
-[Architecture: Serving design](../architecture/serving-design.mdx).
+Design and primary sources: [Architecture: Serving design](../architecture/serving-design.mdx).

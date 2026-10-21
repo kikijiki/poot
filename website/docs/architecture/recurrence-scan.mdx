@@ -6,7 +6,7 @@ sidebar_position: 14
 
 # Recurrence Scan
 
-Gated delta rule (GDN) layers (Qwen3-Next, Qwen3.8) and Mamba2 layers (Nemotron-H) replace attention with a
+Gated delta rule (GDN) layers and Mamba2 layers replace attention with a
 recurrence over the sequence: each token updates a per-head state matrix, and the state is carried from one
 step to the next. Prefill traced as primitive equations is one unrolled chunk body per chunk, so the graph grows
 with the prompt length.
@@ -34,5 +34,4 @@ and the graph stay the same size at every prompt length. When a device reports a
 dispatch, the sequence is split into launches that each stay within it, handing the state on through the result.
 A state column that does not fit the device's workgroup memory is refused at plan time.
 
-The kernel is the streaming recurrence, so its time grows linearly with the prompt length. A chunk-parallel
-matrix form of the same recurrence was built and measured on wgpu and ROCm; it was no faster, so it was not kept.
+The kernel is the streaming recurrence, so its time grows linearly with the prompt length.

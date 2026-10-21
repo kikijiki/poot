@@ -79,7 +79,7 @@ const STEPS: Step[] = [
       {
         id: "spirv",
         label: "SPIR-V",
-        sublabel: "llc, wgpu",
+        sublabel: "llc, wgpu / raw Vulkan (ash)",
         href: "./backends",
         color: "runtime",
       },
@@ -102,7 +102,7 @@ const STEPS: Step[] = [
   {
     id: "executor",
     label: "Backend executors",
-    sublabel: "native replay or cached encoding; shared contract planned",
+    sublabel: "one Engine over a per-backend Device: native replay or cached encoding",
     href: "./execution",
     color: "runtime",
   },

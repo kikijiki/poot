@@ -6,46 +6,32 @@ sidebar_position: 1
 
 # Serving
 
-`poot-serve` is the OpenAI-compatible HTTP server. These pages cover operating it: API shape,
-checkpoints, first-time bring-up, and the features that are available. For embedding poot as a library,
-see [Develop](../develop/index.md).
+`poot-serve` is the OpenAI-compatible HTTP server. It loads a registered model, fits it to the device and serves
+`/v1/completions` and `/v1/chat/completions` from one scheduling loop over the driver. An embedding or reranking
+checkpoint serves `/v1/embeddings` and `/v1/rerank`, which a decoder's embedding pass also serves. LoRA
+administration runs on the same engine thread between steps. For embedding poot as a library, see
+[Develop](../develop/index.md); the design behind these pages is under
+[Serving design](../architecture/serving-design.mdx). Which families, quantizations and backends are served is
+listed per row in the [feature matrix](../reference/feature-matrix.md), and measured speed on the
+[performance](../reference/performance.md) page.
 
-The server loads a registered model, fits it to the device and serves `/v1/completions` and `/v1/chat/completions` from one scheduling loop over the driver ([Continuous batching](./continuous-batching.md)). `/health` answers `200` `serving` once the engine thread is running, `503` while it starts, drains, or after it dies (`"status": "dead"` with the cause and reason). An embedding or reranking checkpoint (a BERT encoder or cross-encoder) is fitted and prepared the same way and serves `/v1/embeddings` and `/v1/rerank`, which a decoder's embedding pass also serves ([Embeddings and reranking](./embeddings-and-reranking.md)). `--rows` and `--max-seq` set the rows and positions the fit starts from. LoRA administration runs on the same engine thread between steps, so it does not hold up running requests. A model can be split over several GPUs as a layer pipeline (`--placement pipeline:...`, `ptx` backend); tensor parallelism is requested the same way (`--placement tensor:...`) and divides the paged KV pool by KV heads. A tensor group and a layer pipeline have served requests on a two-GPU NVLink A100 pair, and a four-GPU tensor group has decoded a tiny model; serving a group of four and a real checkpoint are not covered ([Tensor parallelism](./tensor-parallelism.md)). Pooled MoE serving is not implemented. A SmolVLM or Qwen2.5-VL checkpoint also takes images on `/v1/chat/completions` ([Multimodal](./multimodal.md)). Speculative decoding is served through the same loop ([Speculative decoding](./speculative-decoding.md)).
+## Getting started
 
-Design and paper provenance for continuous batching, speculative decoding, LoRA, quantization,
-and tensor parallelism live under [Serving design](../architecture/serving-design.mdx).
+- [Serving your first model](./serving-your-first-model.md): first HTTP responses from a checkpoint.
+- [Picking a backend](./choosing-a-backend.md): the `--backend` option and how `auto` chooses.
+- [Using quantized checkpoints](./quantized-checkpoints.md): packed GGUF and safetensors formats.
+- [Configuration reference](./configuration.md): every command-line flag.
 
-## Bring-up
+## API
 
-- **[Serving your first model](./serving-your-first-model.md)**: First HTTP responses from a GGUF or
-  safetensors checkpoint.
-- **[Picking a backend](./choosing-a-backend.md)**: The `--backend` option and how `auto` chooses.
-- **[Using quantized checkpoints](./quantized-checkpoints.md)**: GGUF K-quants, GPTQ, AWQ, FP8.
-- **[Configuration reference](./configuration.md)**: CLI flags and environment variables in one place.
+- [OpenAI-compatible API](./api.md): endpoints, error classes, bounds and metrics.
+- [Guided decoding](./guided-decoding.md): constrained output (regex, grammar, JSON schema, tools).
+- [Embeddings and reranking](./embeddings-and-reranking.md): `/v1/embeddings` and `/v1/rerank`.
+- [Multimodal](./multimodal.md): image input for a checkpoint with a vision front end.
+- [Using LoRA adapters](./lora-adapters.md): load, select and unload adapters.
 
-## Reference
+## Scheduling and placement
 
-- **[Feature matrix](../reference/feature-matrix.md)**: Backend capabilities (models, quant, serving
-  features).
-- **[Performance](../reference/performance.md)**: Single-request decode benchmarks across backends.
-- **[FAQ](../reference/faq.md)**: Short answers to common operator questions.
-
-## API and modalities
-
-- **[OpenAI-compatible API](./api.md)**: Endpoints, error classes, bounds and metrics.
-- **[Guided decoding](./guided-decoding.md)**: Constrained output (regex, grammar, JSON schema, tools).
-- **[Embeddings and reranking](./embeddings-and-reranking.md)**: `/v1/embeddings` and `/v1/rerank`.
-- **[Multimodal](./multimodal.md)**: Image input for a SmolVLM or Qwen2.5-VL checkpoint.
-
-## Serving features
-
-- **[Continuous batching and concurrency](./continuous-batching.md)**: The scheduling loop, rows and bounds.
-- **[Speculative decoding](./speculative-decoding.md)**: Prompt lookup, draft-model and the model's own MTP layer, served through the one loop.
-- **[Using LoRA adapters](./lora-adapters.md)**: Hot-load, select and unload adapters.
-- **[Tensor parallelism](./tensor-parallelism.md)**: Weights and the paged KV pool divided over ranks; served on a two-GPU PTX pair.
-
-## Library users
-
-- **[Develop: Build and test](../develop/build-and-test.md)**: Nix shell, `just` recipes, release builds.
-- **[Develop: Run a model](../develop/run-a-model.md)**: Load checkpoints and generate from Rust.
-- **[Authoring kernels](../develop/authoring-kernels.md)**: Write `#[kernel]` functions through `pootc`.
+- [Continuous batching and concurrency](./continuous-batching.md): the scheduling loop, rows and bounds.
+- [Speculative decoding](./speculative-decoding.md): prompt lookup, draft model and the model's own MTP layer.
+- [Tensor parallelism](./tensor-parallelism.md): weights and the paged KV pool divided over GPU ranks.
