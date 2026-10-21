@@ -27,6 +27,7 @@ LLM generation uses the same engine: trace a model into a graph, then run that g
 | `poot-executor`                  | Executor contract: `Engine<D>` over a per-backend `Device` trait |
 | `poot-wgpu-device`                       | wgpu/Vulkan: `WgpuDevice`, the contract's wgpu `Device`          |
 | `poot-ptx-device` / `poot-rocm-device` | NVIDIA / AMD: `PtxDevice` / `RocmDevice` on the same contract    |
+| `poot-vulkan-device`             | Raw Vulkan: `VulkanDevice` on the same contract, no wgpu         |
 | `poot-kernel-attr` + `pootc`     | `#[kernel]` import: `pootc` lowers marked fns to GPU code        |
 | `poot-wgpu-runtime`                   | Host `Context` + typed launchers for imported kernels            |
 
@@ -89,7 +90,7 @@ cargo run -p poot-llm --release --example build_and_eval
 
 ## Compile for a target
 
-Use the compiler entry instead of assembling a production pass sequence:
+`compile` is the compiler entry and runs the production pass sequence:
 
 ```rust
 use poot_executor::Device;
@@ -119,7 +120,7 @@ cargo run -p poot-llm --release --example trace_and_fuse
 
 ## Run on GPU (wgpu)
 
-The wgpu backend runs the same contract as PTX and ROCm: build a `WgpuDevice`, wrap it in an
+The wgpu backend runs the same contract as PTX, ROCm and raw Vulkan: build a `WgpuDevice`, wrap it in an
 `Engine`, load the weights, add an entry per graph, then step it.
 
 ```rust
@@ -166,7 +167,7 @@ let out = exec.step(exe, entry, &StepInputs::new(), &mut NoSync)?.read()?;
 
 The first `step` on an entry records the dispatch sequence; every later `step` replays it. Drop the
 entry with `Executor::remove_entry` when the graph shape changes, and `Executor::unload` to free the
-executable. `Engine<PtxDevice>` and `Engine<RocmDevice>` take the same `Graph` and the same calls;
+executable. `Engine<PtxDevice>`, `Engine<RocmDevice>` and `Engine<VulkanDevice>` take the same `Graph` and the same calls;
 that is the engine the `poot-llm` driver runs on.
 
 ## Direct `#[kernel]` dispatch

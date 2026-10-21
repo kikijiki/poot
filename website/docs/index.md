@@ -64,5 +64,4 @@ inference with async capture/replay.
 - [Performance](./reference/performance.md)
 - [FAQ](./reference/faq.md)
 
-Production backends: **wgpu** (default), **rocm**, **ptx**. Raw Vulkan (**vulkan**) implements the same
-executor contract; it is verified on AMD (RADV) only, and NVIDIA and Intel Vulkan drivers are untested. The AMD XDNA2 and Intel NPU4 NPUs are experimental library devices; see [NPU Offload](./architecture/npu.mdx).
+Backends and devices: see [Develop: Backends](./develop/index.md#backends).

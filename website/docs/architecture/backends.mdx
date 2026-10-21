@@ -6,27 +6,29 @@ sidebar_position: 6
 
 # Backends
 
-poot has three first-class backends built from one kernel source: **wgpu** (Vulkan/SPIR-V, the
-portable default), **ROCm** (AMD, raw HSA) and **PTX** (NVIDIA). Raw Vulkan lowers to the same SPIR-V as wgpu,
-runs on its own runtime and `Device`, and plans against the caps its own device reports. The AMD XDNA2 and Intel NPU4 NPUs are experimental `Device`s (see [NPU Offload](./npu.mdx)). The CPU
-oracle also powers current embeddings and reranking.
+poot has four GPU backends built from one kernel source: **wgpu** (Vulkan/SPIR-V, the
+portable default), **raw Vulkan** (the same SPIR-V through `ash`, with no wgpu), **ROCm** (AMD, raw HSA) and
+**PTX** (NVIDIA). The AMD XDNA2 and Intel NPU4 NPUs are experimental `Device`s (see [NPU Offload](./npu.mdx)).
+The CPU oracle is a test-side reference, not a backend.
 
 Everything from model definition through graph IR, fusion and planning is backend-neutral. Backends
 diverge late, in three places:
 
-- **Kernel selection.** The planner picks a specialization per target, for example tensor-core matmul
-  (WMMA) on PTX and on ROCm's RDNA path, which wgpu does not use. What a target cannot run is a planner
-  refusal, not an executor branch.
+- **Kernel selection.** The planner picks a specialization per target from the caps its device reports, for
+  example tensor-core matmul: WMMA on PTX and on ROCm's RDNA path, and a SPIR-V cooperative matrix (f16
+  operands) on a Vulkan device that reports the 16x16x16 f16-in f32-out configuration. What a target cannot
+  run is a planner refusal, not an executor branch.
 - **Codegen target.** `poot-codegen` emits LLVM IR for `SpirvVulkan`, `Nvptx` or `AmdGcn(arch)`, choosing
   address spaces, intrinsics, atomics and the AMD tensor-core family. `AieCore` codegen produces a typed,
   linked artifact for a region of equations, one serialized core per equation (the ordinary kernel body with its thread grid turned into loops), which `poot-npu` loads and
   runs on an XDNA2 NPU.
-- **Runtime dispatch.** wgpu re-encodes a cached command buffer; ROCm replays recorded HSA AQL
-  packets; PTX replays CUDA graphs through [cudarc](https://github.com/coreylowman/cudarc).
+- **Runtime dispatch.** wgpu re-encodes a cached command buffer; raw Vulkan resubmits recorded command
+  buffers; ROCm replays recorded HSA AQL packets; PTX replays CUDA graphs through
+  [cudarc](https://github.com/coreylowman/cudarc).
 
 All backends implement the backend-neutral executor contract (`poot-executor`: one generic
 `Engine<D>` over a thin `Device` trait): `poot-wgpu-device`'s `WgpuDevice`, `poot-rocm-device`'s `RocmDevice`,
-`poot-ptx-device`'s `PtxDevice` and `poot-vulkan-device`'s `VulkanDevice` (raw Vulkan, verified on AMD RADV only; the device must support robust buffer access, which the runtime enables and refuses to open without). A dev-only table-driven parity crate (`poot-executor-parity`) runs
+`poot-ptx-device`'s `PtxDevice` and `poot-vulkan-device`'s `VulkanDevice`. A dev-only table-driven parity crate (`poot-executor-parity`) runs
 the same fixture programs through the `Executor` on any `Device`. See [Execution](./execution) for
 the contract's shape.
 
@@ -41,11 +43,34 @@ kernel IR -> poot-codegen (LLVM IR) -> llc (SPIR-V) -> wgpu::ShaderModule -> Com
 Cached graph execution reuses pipelines and bind groups, then re-encodes dispatches per token.
 Submission can be split, and sampling can add dispatches, temporary buffers and readback work.
 
-Constraints: no grid-wide sync or cooperative kernels; SPIR-V needs structured control flow (a
-structurization pass runs before emit, which fixed a class of RADV crashes); private arrays with
-dynamic indices are banned (use workgroup LDS); no bf16 on most iGPUs, so compute is f32.
+Constraints of the SPIR-V targets (wgpu and raw Vulkan): no grid-wide sync or cooperative kernels; SPIR-V
+needs structured control flow (a structurization pass runs before emit); private arrays with dynamic
+indices are banned (use workgroup LDS); no bf16 on most iGPUs, so compute is f32.
 
 Verified on AMD Radeon (RADV) and Intel Arc iGPUs.
+
+## Raw Vulkan (SPIR-V)
+
+```
+kernel IR -> poot-codegen (LLVM IR) -> llc (SPIR-V) -> Vulkan shader module -> compute pipeline (ash)
+```
+
+`poot-vulkan-runtime` dispatches the same `.spv` as wgpu with the same binding ABI (storage buffers in
+descriptor set 0, then a length buffer), so a kernel runs unmodified on either. `VulkanDevice` records a
+step once as Vulkan command buffers and resubmits them verbatim per token, with a fence wait after each
+submission ([Execution](./execution)). The runtime owns the failure mechanics:
+
+- **Faults.** A failing kernel check sets a bit in the dispatch's error word; `synchronize` raises it as a
+  typed fault. SPIR-V has no trap, so the runtime requires `robustBufferAccess` and refuses to open a device
+  without it.
+- **Timeouts and lost submissions.** Each fence wait is bounded (600 seconds by default). A timed-out wait
+  or a failed submission poisons the device, which leaks what the pending work could reference and refuses
+  every later operation.
+- **Serving** requires `VK_EXT_memory_budget` to read live device memory.
+- **Not available:** collectives and multi-GPU execution.
+
+Verified on the AMD Strix Halo iGPU under RADV only; NVIDIA and Intel Vulkan drivers are untested. The
+[feature matrix](../reference/feature-matrix.md) lists what compiles for it.
 
 ## PTX (NVIDIA)
 
@@ -100,4 +125,5 @@ grids, tensor-core matmul, compute dtype) are in its
 Every backend is checked against the CPU oracle (`poot-eval`): per-backend executor tests dispatch
 kernels with identical inputs and compare to the oracle, and the `ptx-check` and `rocm-check`
 binaries of the PTX and ROCm device crates do the same on real hardware; the device lanes run them, and `ptx-check`
-fails when it finds no fixture to check (or, in the PTX lane, any missing one). See [Execution](./execution#verification).
+fails when it finds no fixture to check (or, in the PTX lane, any missing one). `poot-vulkan-check` is a one-kernel smoke check of the raw Vulkan
+runtime. See [Execution](./execution#verification).

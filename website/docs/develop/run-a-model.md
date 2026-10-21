@@ -21,12 +21,12 @@ cargo run -p poot-llm --release --example gguf_generate -- /path/to/model.gguf
 ```
 
 Optional prompt as a second argument. The example loads the GGUF through the model registry and generates
-greedily through the `Driver` on the first device that opens (PTX, then ROCm, then wgpu), so it is also the
+greedily through the `Driver` on the first device that opens (PTX, then ROCm, then wgpu; `auto` never picks raw Vulkan), so it is also the
 smallest end-to-end GPU decode example. Other examples under `crates/poot-llm/examples/` cover graph
 tracing and fusion (`trace_and_fuse`, `flash_attention_fusion`), CPU-executor building blocks
 (`build_and_eval`), sampling (`sampling`) and speculative policies (`speculation_bench`). Encoder embeddings
 and reranking have a command line, `poot embed`
-(`cargo run --release -p poot-llm --features cli --bin poot -- embed similarity /path/to/all-minilm "a cat" "a kitten"`),
+(`cargo run --release -p poot-llm --features cli --bin poot -- embed similarity /path/to/embedding-checkpoint "a cat" "a kitten"`),
 which opens a device and runs the encoder on it.
 
 ## Command line: poot generate
@@ -35,7 +35,7 @@ which opens a device and runs the encoder on it.
 flags of llama.cpp's `llama-cli` where poot has the capability:
 
 ```bash
-cargo run -p poot-llm --release --features cli --bin poot -- generate -m /path/to/qwen2.5-0.5b -p "The capital of France is" -n 16
+cargo run -p poot-llm --release --features cli --bin poot -- generate -m /path/to/checkpoint -p "The capital of France is" -n 16
 ```
 
 - `-m` the checkpoint (a safetensors directory or a `.gguf` file); `-p` the prompt or `-f` a prompt file;
@@ -63,19 +63,11 @@ cargo run -p poot-llm --release --features cli --bin poot -- generate -m /path/t
 
 ## Backends
 
-poot has **three production backends** and a fourth, lower-priority one (`--backend wgpu|rocm|ptx|vulkan`):
-
-- **wgpu** (default): Vulkan/SPIR-V; any modern GPU; most complete continuous-batching library path
-- **rocm**: AMD via raw HSA (loaded at run time, no build flag)
-- **ptx**: NVIDIA via cudarc
-- **vulkan**: the same SPIR-V kernels as wgpu through raw Vulkan (`ash`), with no wgpu; verified on AMD (RADV) only, NVIDIA and Intel Vulkan drivers are untested
-
 `poot-serve` and the `poot` commands take `--backend wgpu|rocm|ptx|vulkan|auto`; the benchmark runner
-takes `--backend ptx|rocm|wgpu`. Every backend is in every build: a backend whose device is absent is refused when it
-opens. In
-library code you select the backend by wiring the matching executor crate (`poot-wgpu-device`,
-`poot-rocm-device`, `poot-ptx-device`, or `poot-vulkan-device`). See [Picking a backend](../serve/choosing-a-backend.md) for
-tradeoffs.
+takes `--backend ptx|rocm|wgpu` (raw Vulkan is not benchmarked). Every backend is in every build: a backend whose device is absent is refused when it
+opens. In library code you select the backend by wiring the matching executor crate (`poot-wgpu-device`,
+`poot-rocm-device`, `poot-ptx-device`, or `poot-vulkan-device`). The backends are described under
+[Develop: Backends](./index.md#backends); see [Picking a backend](../serve/choosing-a-backend.md) for tradeoffs.
 
 :::note
 The AMD XDNA2 and Intel NPUs are library devices, not serving backends yet; they are under active development, with prefill as the goal. See

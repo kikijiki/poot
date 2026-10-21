@@ -48,7 +48,7 @@ pub trait Model: Send + Sync {
   sequence's carried state and return logits; prefill and decode are one program, and decode is a step of one
   token), `encode` (one stateless pass over whole rows, returning hidden states or scores, for an embedding
   model, a reranker, a decoder's embedding pass or a vision tower) and `draft` (a multi-token-prediction layer
-  run over the hidden-state carry and the host tokens that follow it; only GLM-5.3-Flash has one). A family
+  run over the hidden-state carry and the host tokens that follow it; only a family with such a layer has one). A family
   declares only the programs it offers; a request for one it lacks is a typed `TraceError`.
 - A step's token and position inputs are typed slots and positions are absolute, so a prefill is a step that
   continues from a position.
@@ -103,16 +103,15 @@ run one `layer_scope` per layer, apply the final norm and the head; and per laye
 tracer of a dense decoder is a call of these two functions plus its attention parameters. A norm placed after
 the block, sandwich norms, residual scales and a softcap are options of the component, not copies of it.
 
-Families fall into three groups by how much of their own they need:
+Families fall into three groups by how much of their own they need (the [feature matrix](../reference/feature-matrix.md)
+lists the registered families):
 
-- **Dense decoders** are a `standard_stack` over the shared attention and feed-forward with their own options
-  (Qwen2/3, Llama, Mistral, Gemma 2/3, Granite, OLMo 2, Phi-3, SmolLM3, BLOOM, MPT).
+- **Dense decoders** are a `standard_stack` over the shared attention and feed-forward with their own options.
 - **Mixture-of-experts and hybrids** pass a different mixer or feed-forward to `standard_layer`: the router and
   experts, MLA, Mamba2, or a per-layer kind that chooses the mixer. Mamba2 and convolution state are ordinary
   state pairs, so the driver carries them exactly like KV.
 - **Family-local topology** is a family's own layer or stack function over the same components, where the
-  structure is not shared with anyone else (DeepSeek-V4's compressed-attention stack, the Qwen3.8 sparse-attention
-  layer).
+  structure is not shared with anyone else (a compressed-attention stack, a sparse-attention layer).
 
 Adding a model touches only the model: its config, its name table and its tracer, plus one row in the
 registry's list of shipped families. If a family

@@ -34,7 +34,7 @@ too. The server notices the hang-up while it waits for the result, and the engin
 sequence, registering the prompt prefix it had filled.
 
 Prefix reuse: a finished request registers its prompt's whole blocks in the prefix cache, and a later
-request with the same prefix reuses them. A model with recurrent state (a Qwen3-Next style hybrid)
+request with the same prefix reuses them. A model with recurrent state
 registers nothing, because a cached block holds none of that state. `/metrics` reports
 `prefix_registered_tokens`, `prefix_skipped_releases` and `prefix_cache_hit_rate`.
 

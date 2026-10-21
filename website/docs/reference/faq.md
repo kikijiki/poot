@@ -53,9 +53,9 @@ that reach each other only across CPU sockets are not covered. Other backends do
 
 ## Where is prefix caching available?
 
-Prefix caching is served on wgpu and ROCm: the loop registers a finished prompt's full blocks and a later
-request reuses them. The driver's chunked prefill is the only prefill path, on every backend. PTX serving is
-verified for the dense fixture only.
+Prefix reuse is driver code, so it applies on every backend ([Continuous batching](../serve/continuous-batching.md)
+describes it). Its device tests run on wgpu and ROCm; PTX serving is verified for the dense fixture only, and no
+raw Vulkan device test covers prefix reuse. The driver's chunked prefill is the only prefill path, on every backend.
 
 ## Why is sampled decoding slower on ROCm?
 
@@ -64,17 +64,15 @@ sampling step is appended to the decode graph itself, and the host reads back on
 a non-finite flag and any top-n logprob alternatives. Logit bias, penalties, logprobs and guided masks
 run in that step too, so no request reads the full logits back unless the caller asks for them.
 
-## What bounds a hung ROCm GPU job?
+## What bounds a hung GPU job?
 
-The ROCm runtime waits for a submission or DMA with a generous timeout (600 s by default). Set
-`POOT_GPU_WAIT_TIMEOUT_SECS` to lower it. On a timeout the runtime reports a typed error and poisons the
-context so no later dispatch reuses the queue.
+The ROCm and raw Vulkan runtimes wait for a submission with a 600 s timeout. On a timeout, or when a submitted
+command buffer is lost, the runtime reports a typed error and poisons the device so no later dispatch reuses it; the
+server then answers `/health` with `503` and `"status": "dead"` ([Continuous batching](../serve/continuous-batching.md)).
 
-## Is raw Vulkan or NPU a fourth production backend?
+## Are raw Vulkan and the NPUs production backends?
 
-Raw Vulkan is selectable (`--backend vulkan`) but is the lowest-priority backend; production is `wgpu` | `rocm` | `ptx`. The AMD XDNA2 and Intel NPU4 NPUs are experimental library devices, not backends you can serve with (see [Architecture: NPU Offload](../architecture/npu.mdx)).
-
-- Raw Vulkan implements the same executor contract as the others. It is verified on AMD (RADV) only; NVIDIA and Intel Vulkan drivers are untested.
+Production is `wgpu`, `rocm` and `ptx`. Raw Vulkan is selectable with `--backend vulkan` and described in the [feature matrix](./feature-matrix.md#raw-vulkan). The AMD XDNA2 and Intel NPU4 NPUs are experimental library devices, not backends you can serve with ([Architecture: NPU Offload](../architecture/npu.mdx)).
 
 ## Tests skipped. Did verification pass?
 

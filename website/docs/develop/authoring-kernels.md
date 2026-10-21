@@ -13,11 +13,11 @@ GPU code. There is no DSL and no separate kernel language.
 
 The `#[kernel]` attribute (from `poot-kernel-attr`) marks a function for import by **pootc**, poot's rustc
 driver. Which of the attribute's two expansions a build gets is `poot-kernel-attr`'s own `device-pass`
-Cargo feature, not an environment variable: extern-link a `poot-kernel-attr` built with
+Cargo feature: extern-link a `poot-kernel-attr` built with
 `--features device-pass` (the device pass) and the attribute renames each marked function into poot's
 reserved namespace; pootc reads the functions from Stable MIR and lowers each kernel to SPIR-V and PTX, and
 writes a module cache (`poot_cache.rs`) next to them. Extern-link the crate's default build (the host pass)
-and the macro emits a typed host launcher that looks the compiled module up by name instead. There is no
+and the macro emits a typed host launcher that looks the compiled module up by name. There is no
 cargo integration in the repository yet: you invoke `pootc` on the kernel source yourself, `--extern`-linking
 whichever `poot-kernel-attr` build the pass needs.
 
@@ -53,43 +53,24 @@ dispatches it on a GPU. It skips the dispatch if no GPU is present.
 
 ## Standalone imported kernel
 
-Running an imported kernel with nothing else around it is not available as a standalone example (the example that demonstrated it was removed). The same import-and-dispatch path (an imported
-kernel body loaded and run on the GPU, matching the engine's hand-built kernel byte-for-byte) is exercised
-by `poot-wgpu-device`'s own test suite instead.
+There is no standalone example that runs an imported kernel with nothing else around it. Two test suites cover
+the import-and-dispatch path: `pootc`'s `import_run` test imports kernels fresh from source and runs them on a
+GPU, and `poot-wgpu-device`'s `imported_kernel` tests load the committed kernel assets through the
+`Device` trait and dispatch them on wgpu.
 
 ## Accepted Rust subset
 
-The importer accepts:
+The importer accepts a defined subset of Rust and rejects everything else with a named diagnostic. The subset is
+listed on [Kernels from Rust](../architecture/kernel-import.mdx#accepted-rust-subset).
 
-- Index and range loops (`for k in 0..n`, `0..=n`, `for x in slice`)
-- Float math (`x.sqrt()`, `x.exp()`, `x.max(y)`)
-- Runtime dimensions (one kernel serves any shape)
-- Workgroup-parallel kernels with a barrier and workgroup-local (LDS) arrays, including a barrier inside a
-  loop and a 2-D LDS tile (what a blocked GEMM needs)
+## Standalone kernels and generated kernels
 
-Inference kernels (RMSNorm, a numerically-stable softmax, an LDS reduction, an argmax, and the GEMV
-+ tiled-GEMM matmuls) are authored in plain Rust and run on the GPU byte-identically to the engine's
-hand-built kernels. A sampling step built from these same primitives (a batched argmax, or a Gumbel-
-noise perturbation plus top-k/top-p bisection for temperature sampling) is appended to the decode
-graph itself and runs on-device, on every backend, for every request (bias, penalties, logprobs and
-guided masks included); the host reads back only the chosen token id, a non-finite flag and any top-n
-logprob alternatives. On the wgpu path the entire f32 matmul family (every projection GEMV and tiled GEMM, decode and
-prefill) are imported-from-Rust kernels dispatched every step.
-
-## The partition: generated lowering families vs. standalone kernels
-
-Most of poot's kernels are never hand-authored: a fusion/lowering pass generates a `Body` for an
-equation shape at compile time (the elementwise, reduce, matmul and attention families kernelgen
-produces on the fly). Authoring a kernel in Rust and shipping it as a committed asset is for the kernels
-that family generation doesn't cover: the coalesced decode GEMVs over an f32 `[K, N]` weight
-(with and without bias), the coarsened prefill GEMMs, the M > 1 BF16 contraction over a checkpoint-order
-weight and the flash-attention bodies, whose shape-generic form is simpler to hand-write than to
-synthesize per shape (the decode GEMV over a checkpoint-order `[N, K]` weight is generated), the
-on-device sampler bodies, the I8 KV-cache pack/unpack pair, the packed-row gathers, and a handful of
-importer-capability probes. These standalone kernels live under `crates/pootc/kernels/<family>/*.rs`,
-one family subdirectory per kind (matching
-poot's own kernel-choice families: contraction, attention, movement, packed, sampling, plus a `probe`
-family for kernels a backend crate loads directly rather than through the planner).
+Most kernels are never hand-authored: the planner generates a kernel body for each equation shape at compile time.
+A kernel authored in Rust and committed as an asset covers what generation does not: the decode GEMVs and
+prefill GEMMs over particular weight layouts, the flash-attention bodies, the on-device sampler, the KV-cache
+pack and unpack pair, the packed-row gathers, and a handful of importer-capability probes. These sources live
+under `crates/pootc/kernels/<family>/*.rs`, one subdirectory per kernel-choice family (contraction, attention,
+movement, packed, sampling, and `probe` for kernels a backend crate loads directly).
 
 ## The one kernel asset manifest
 
@@ -97,8 +78,9 @@ Every standalone kernel source has exactly one committed asset (`<crate>/assets/
 exactly one entry in the manifest table (one Rust file per family, aggregated into one list), the single
 source of truth for which source produces which asset and who ships it. A test regenerates every asset
 from its source and checks it byte-for-byte against the committed one, and separately checks that each
-destination `assets/` directory holds exactly its manifest's entries - a committed asset with no manifest
-entry, or a manifest entry with no committed asset, fails by name rather than drifting unnoticed.
+destination `assets/` directory holds exactly its manifest's entries: a committed asset with no manifest
+entry, or a manifest entry with no committed asset, fails by name. `poot-codegen` lowers each `.kir.json` asset
+to SPIR-V for wgpu and raw Vulkan, PTX for NVIDIA and AMDGCN for ROCm.
 
 After editing a kernel source under `crates/pootc/kernels/<family>/*.rs`, run `just regen-kernel-assets` to
 refresh its committed `.kir.json` asset. `pootc`'s own compiler fixtures (used only by pootc's own test

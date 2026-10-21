@@ -46,8 +46,8 @@ decode step once per token. There is no cuBLAS and no cuDNN: every kernel is gen
 6. **Executors.** `poot-executor` runs a planned graph on a device: `poot-wgpu-device` (wgpu),
    `poot-rocm-device` (AMD, raw HSA), `poot-ptx-device` (NVIDIA) and `poot-vulkan-device` (raw Vulkan). A decode step is captured once against
    stable buffers and replayed per token: a CUDA graph launch on PTX, resubmitted AQL packets on ROCm, a
-   cached command-buffer re-encode on wgpu. `poot-vulkan-device` implements the executor contract over
-   `poot-vulkan-runtime`, which drives Vulkan directly. See
+   cached command-buffer re-encode on wgpu, a native command-buffer record and replay on raw Vulkan.
+   `poot-vulkan-device` implements the executor contract over `poot-vulkan-runtime`, which drives Vulkan directly. See
    [execution](https://kikijiki.github.io/poot/docs/architecture/execution) and [backends](https://kikijiki.github.io/poot/docs/architecture/backends).
 
    ![Capture the decode step once and replay it every token, one host call per token](website/static/img/architecture/capture-replay.png)
@@ -62,13 +62,13 @@ decode step once per token. There is no cuBLAS and no cuDNN: every kernel is gen
 ```
 nix develop        # pinned Rust nightly, LLVM 22, Vulkan stack
 just test          # model-free tests: no GPU, no checkpoint
-cargo run -p poot-llm --release --features cli --bin poot -- generate -m /path/to/qwen2.5-0.5b -p "The capital of France is" -n 16
+cargo run -p poot-llm --release --features cli --bin poot -- generate -m /path/to/checkpoint -p "The capital of France is" -n 16
 ```
 
 `poot generate` takes the flags of llama.cpp's `llama-cli` where poot has the capability.
 
 - **Model and prompt.**
-  - `-m` the model: a safetensors directory or a `.gguf` file. Without it the tool reads `qwen2.5-0.5b` under
+  - `-m` the model: a safetensors directory or a `.gguf` file. Without it the tool reads a default model directory under
     `POOT_MODELS_DIR`, and tests that load checkpoints read them from the same directory.
   - `-p` or `-f` the prompt.
   - `--system-prompt` (no `-sys` short form, unlike llama-cli).
@@ -93,7 +93,7 @@ cargo run -p poot-llm --release --features cli --bin poot -- generate -m /path/t
 `poot-serve` exposes an OpenAI-compatible HTTP server over the same engine:
 
 ```
-cargo run -p poot-serve --release -- /path/to/qwen2.5-0.5b 127.0.0.1:8080
+cargo run -p poot-serve --release -- /path/to/checkpoint 127.0.0.1:8080
 ```
 
 See [serving your first model](https://kikijiki.github.io/poot/docs/serve/serving-your-first-model) and

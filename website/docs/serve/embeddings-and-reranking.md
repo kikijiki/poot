@@ -19,9 +19,9 @@ The served model is the checkpoint the server was started on:
   `"pooling": "cls"`) and scaled to unit length, so a dot product of two vectors is their cosine.
   `/v1/rerank` orders the documents by the cosine of their vectors to the query's. A family with no embedding
   pass serves generation only and answers these routes with `400`.
-- a **BERT embedding encoder** answers the same two routes. It serves nothing else: a chat or completion request
+- an **embedding encoder** answers the same two routes. It serves nothing else: a chat or completion request
   is `400`.
-- a **cross-encoder** (`BertForSequenceClassification`) answers `/v1/rerank` by scoring each query and
+- a **cross-encoder** (a sequence-classification head) answers `/v1/rerank` by scoring each query and
   document pair together and returning the raw logit as `relevance_score` (higher is more relevant, not
   bounded to `[0, 1]`).
 
@@ -46,16 +46,16 @@ A request the engine cannot serve is answered by its class: see [OpenAI-compatib
 
 ## Request fields
 
-| Route | Fields |
-| ----- | ------ |
+| Route                 | Fields                                                                                                                                                                                            |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `POST /v1/embeddings` | `input` (one string or a list), `pooling` (`mean` or `cls`; default from the checkpoint's `1_Pooling` config, else `mean`), `encoding_format` (`float` or `base64`, the little-endian f32 bytes). |
-| `POST /v1/rerank` | `query`, `documents`, `top_n`. The response is `{"results": [{"index", "relevance_score"}]}`, most relevant first. |
+| `POST /v1/rerank`     | `query`, `documents`, `top_n`. The response is `{"results": [{"index", "relevance_score"}]}`, most relevant first.                                                                                |
 
 An empty text, an empty `input`, an unknown `pooling` or `encoding_format`, and malformed JSON are `400`.
 Every request counts in the request metrics: its latency, and the tokens it encoded as prompt tokens.
 
 ## In a program
 
-Both run on the driver's `encode` step, on wgpu, ROCm or PTX. `SentenceEncoder` returns L2-normalized vectors,
+Both run on the driver's `encode` step, which is backend-independent driver code. Its device tests run on wgpu, ROCm and PTX; none covers raw Vulkan. `SentenceEncoder` returns L2-normalized vectors,
 so a dot product is the cosine similarity; `CrossEncoder` returns the classifier's raw logit. See
 [Embedding poot](../develop/embedding.md) for the API.

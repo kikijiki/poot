@@ -8,13 +8,15 @@ sidebar_position: 7
 
 Execution has two phases: compile once (trace, optimize, plan, capture), then replay per token. The
 host cost depends on the backend: native graph replay on PTX, recorded packet submission on ROCm,
-and command encoding from cached dispatches on wgpu, plus slot writes and readback.
+resubmission of recorded command buffers on raw Vulkan, and command encoding from cached dispatches on
+wgpu, plus slot writes and readback.
 
 ## Why capture
 
 A small-batch decode step is memory-bound and the GPU work per dispatch is tiny. Issuing each dispatch
 through the driver costs microseconds, so with dozens of dispatches per token the CPU can set the
-pace. Native replay removes per-dispatch driver calls; wgpu's cached encoding reduces preparation work.
+pace. Native replay (CUDA graphs, HSA packets, Vulkan command buffers) removes per-dispatch driver calls;
+wgpu's cached encoding reduces preparation work.
 
 ## A constant-shape decode graph
 
@@ -38,29 +40,35 @@ capture, which would replay a stale value.
 
 ## Per backend
 
-| Backend | Capture (once)                                           | Per token                                       |
-| ------- | -------------------------------------------------------- | ----------------------------------------------- |
-| PTX     | `cuStreamBeginCapture`, launch every plan, instantiate   | write slots, `cuGraphLaunch`, copy logits, sync |
-| ROCm    | record the AQL packets of every plan                     | write slots, resubmit packets, read back        |
-| wgpu    | build pipelines and bind groups, cache the dispatch list | write slots, encode from cache, submit, map     |
+| Backend | Capture (once)                                                                 | Per token                                                           |
+| ------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| PTX     | `cuStreamBeginCapture`, launch every plan, instantiate                         | write slots, `cuGraphLaunch`, copy logits, sync                     |
+| ROCm    | record the AQL packets of every plan                                           | write slots, resubmit packets, read back                            |
+| wgpu    | build pipelines and bind groups, cache the dispatch list                       | write slots, encode from cache, submit, map                         |
+| Vulkan  | record Vulkan command buffers (pipeline bind, descriptor bind, dispatch or copy, a full memory barrier between commands) | write slots, resubmit the command buffers verbatim with a fence wait after each, then raise the replay's staged kernel fault at `synchronize` |
+
+On raw Vulkan, descriptor sets are baked at record time and per-replay data overwrites the same bound
+buffers in place. A device with a watchdog budget cuts a long recording into several command buffers by
+the planner's per-dispatch work weight, so one replay is several submissions rather than one past the
+display watchdog; a device with no budget records a stage as one command buffer.
 
 wgpu's cached re-encode reuses the graph's pipelines, bind groups and intermediate buffers, but still
 encodes commands per token. Sampling can add dispatches, submissions and temporary buffers. The
 complete token step is not allocation-free and need not be one submit.
 
-A backend-neutral contract now lives in `poot-executor`: one generic `Engine<D>` over a thin
+The backend-neutral contract lives in `poot-executor`: one generic `Engine<D>` over a thin
 per-backend `Device` trait implements an object-safe `Executor` (`target_set`, `load_weights`,
 `add_entry`, `step`, `reset_state`, `remove_entry`, `stats`, `unload`), so the driver above it never
-branches on a backend. A step is recorded once and replayed. The three `Device` implementations are `poot-wgpu-device`'s `WgpuDevice`,
-`poot-rocm-device`'s `RocmDevice` and `poot-ptx-device`'s `PtxDevice`. `load_weights` takes the weight store and a weight map, which binds each weight a graph names by its typed role; a const the map
+branches on a backend. A step is recorded once and replayed. The GPU `Device` implementations are `poot-wgpu-device`'s `WgpuDevice`,
+`poot-rocm-device`'s `RocmDevice`, `poot-ptx-device`'s `PtxDevice` and `poot-vulkan-device`'s `VulkanDevice`;
+`poot-npu` adds the experimental `XdnaDevice` and `VpuDevice` ([NPU Offload](./npu.mdx)). `load_weights` takes the weight store and a weight map, which binds each weight a graph names by its typed role; a const the map
 does not name is unbound, even when a store key spells its name.
 
 The `poot-llm` driver drives this contract on every backend ([Models, Registry and the
 Driver](./driver.mdx)): `Driver::new` loads a `ModelHandle`'s weights once, as one executable (through the
 model's weight map), and each step shape it needs is an entry added to that executable, from the family's
 `trace` for that shape, compiled for the executor's target. Entries are keyed by program, step shape, sampling
-suffix and the carried inputs they bind, so a token, a position or a sampler parameter never makes a new one. Every causal family that generates is registered and runs on the driver, and
-so do the rest: `Driver::encode` runs an `encode` step (a BERT encoder's embeddings and reranking, a decoder's
+suffix and the carried inputs they bind, so a token, a position or a sampler parameter never makes a new one. `Driver::encode` runs an `encode` step (an encoder's embeddings and reranking, a decoder's
 hidden states, a vision tower's frames). Token-row shapes are prepared up front by `Driver::prepare_encode` and a step never compiles one; a vision tower's frames still prepare on first use, and a prompt can supply values for the inputs its model declares, such as embedding rows in place of some tokens'
 (`Driver::generate_with_inputs`), which is how the vision-language caption path scatters its image rows. Those
 rows and a frame's pixels are bound by value, never baked into a program. Generation picks the next token on-device for every request, including logit bias,
@@ -73,7 +81,9 @@ slots and fits the KV cache to the device ([Continuous batching](../serve/contin
 
 A device fault is a typed error on every backend, and it never aborts the process. On ROCm a fault
 reaches the context through the HSA queue error callback and the system event handler; on PTX it is a
-sticky CUDA error; on wgpu it is the device-lost callback. The call that observes it returns a
+sticky CUDA error; on wgpu it is the device-lost callback; on raw Vulkan it is a submission or fence wait
+that fails (device loss included), which poisons the device and leaks what the pending work
+could reference. The call that observes it returns a
 device-lost error, the context is poisoned, and every later call is refused as poisoned without touching
 the device. Once a device cannot clean up after a failed step, the engine itself is poisoned and refuses
 all work.
@@ -82,6 +92,12 @@ Every wait for the device is bounded by a configured timeout (600 seconds by def
 raw Vulkan. A wait that outlasts it fails with a typed timeout error and poisons the context, so a hung
 device surfaces as an error instead of a hang.
 
+ROCm and PTX execute a real device trap for a failed kernel check. A SPIR-V compute shader has no trap
+instruction, so on raw Vulkan and wgpu a failing check accumulates a per-thread fault bit in a reserved
+error word and the dispatch continues under robust buffer access (the Vulkan runtime refuses a device that
+lacks it). The result of that dispatch is discarded, and on both `synchronize` raises a typed fault
+naming the kernel and the trap code.
+
 A step that fails after it replayed leaves the executable needing a complete state reset: a kernel
 assert, a rejected validation packet and a device failure all mark it, and `step` refuses until
 `reset_state` clears it.
@@ -89,8 +105,8 @@ assert, a rejected validation packet and a device failure all mark it, and `step
 ## Verification
 
 `poot-eval` is the CPU reference: one evaluation walk, `poot_eval::eval(&graph, &inputs, EvalOptions)`,
-which returns an `Evaluation` (primary output, carried state, optional environment). The driver's
-oracle checks and the device rows' CPU references call it; GPU generation never does.
+which returns an `Evaluation` (primary output, carried state, optional environment). Tests and device
+checks call it as the CPU reference; generation never does.
 The verification contract has three tiers; these are requirements, not a claim that every current
 path has complete coverage:
 

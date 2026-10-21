@@ -10,8 +10,8 @@ import ExecutionTimeline from "@site/src/components/architecture/ExecutionTimeli
 # Architecture Overview
 
 poot is a from-scratch LLM inference engine in Rust. It runs its own GPU kernels, lowered from
-ordinary Rust source, on three first-class backends: wgpu (Vulkan/SPIR-V), ROCm (AMD, raw HSA) and
-PTX (NVIDIA). It uses no cuBLAS, cuDNN or other vendor math libraries.
+ordinary Rust source, on four GPU backends: wgpu (Vulkan/SPIR-V), raw Vulkan (SPIR-V through its own
+runtime), ROCm (AMD, raw HSA) and PTX (NVIDIA). It uses no cuBLAS, cuDNN or other vendor math libraries.
 
 The problem it targets: small-batch decode is dominated by host overhead. A naive loop issues
 hundreds of tiny dispatches per token, each costing microseconds of driver time before the GPU does
@@ -22,14 +22,14 @@ any work. poot answers with two mechanisms:
   per fusable region instead of picking from a menu of hand-written fused kernels.
 - **Capture and replay.** The decode graph has a constant shape (fixed-capacity KV plus masking), so
   its dispatch sequence is recorded once and replayed per token: CUDA graphs on PTX, recorded HSA AQL
-  packets on ROCm, and cached re-encode on wgpu, with submits split where required.
+  packets on ROCm, recorded Vulkan command buffers on raw Vulkan, and cached re-encode on wgpu, with
+  submits split where required.
 
 ## The one pipeline
 
 The pipeline is one path for every model and backend: the registry finds the family, the family's `Model`
 traces a step, `compile` is the shared compiler entry, `poot-executor`'s `Engine<D>` is the shared executor, and
-the driver runs the token loop over it. The diagram below shows that pipeline; the remaining gaps are listed
-under "Where the code is today".
+the driver runs the token loop over it.
 
 ```text
 checkpoint -> loader -> typed weights
@@ -60,7 +60,7 @@ Driver: token loop, sampling suffix, stops, KV slots  ->  serve: one scheduling 
 
 ## Design principles
 
-These rules describe the target architecture. The current state of the code is listed below.
+These rules describe how the code is organized.
 
 - **One pipeline.** Every model is traced, compiled, executed through one executor contract and driven
   by one generation loop. A family or backend never gets a private route.
@@ -85,13 +85,13 @@ These rules describe the target architecture. The current state of the code is l
   CPU oracle within a stated tolerance, real checkpoints match an independent reference on tokens, and
   a skipped device test is reported as a skip.
 
-## Where the code is today
+## Current state
 
 The code runs on one pipeline: a target descriptor, a single `compile` entry, and a shared executor
-contract. Current state:
+contract.
 
-- Tracing, optimization, planning, kernel import and codegen, and capture/replay work on wgpu, ROCm
-  and PTX. Generation runs through the `poot-llm` library driver, over any family the model registry holds.
+- Tracing, optimization, planning, kernel import and codegen, and capture/replay work on wgpu, raw Vulkan,
+  ROCm and PTX. Generation runs through the `poot-llm` library driver, over any family the model registry holds.
 - `poot-serve` starts, bounds requests, loads any registered model and serves it through the driver on one
   engine thread: generation, embeddings, rerank and LoRA administration are messages on one queue. See
   [Serving design](./serving-design.mdx).
@@ -103,7 +103,7 @@ contract. Current state:
 - Packed projections keep their stored representation through loading. Dense BF16/F16 weights are kept
   as stored words with no host f32 copy, and packed MoE experts are read in place by an indexed packed
   contraction, so no expert table is materialized on the device.
-- The megakernel was removed; it is a possible future execution strategy, not code.
+- There is no megakernel: it is a possible future execution strategy, not code.
 
 For models and features by backend, use the [feature matrix](../reference/feature-matrix.md).
 
@@ -121,6 +121,6 @@ For models and features by backend, use the [feature matrix](../reference/featur
 | [Attention and KV Cache](./attention.mdx)                 | Flash-attention rewrite, paged KV, prefix caching    |
 | [Serving design](./serving-design.mdx)                    | HTTP API and the serving design                      |
 | [Crates and implementation details](./implementation.mdx) | Crate map and cross-cutting notes                    |
-| [The Megakernel](./megakernel.mdx)                        | Removed; a possible future execution strategy        |
+| [The Megakernel](./megakernel.mdx)                        | Not implemented; a possible future execution strategy |
 | [NPU Offload](./npu.mdx)                                  | Experimental XDNA2 and Intel NPU4 devices            |
 | [Glossary](./glossary.mdx)                                | Terms used in this section                           |

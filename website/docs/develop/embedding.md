@@ -40,17 +40,17 @@ use poot_llm::driver::{LoadOptions, ModelHandle};
 use poot_models::registry::Registry;
 
 let registry = Registry::builtin()?;
-let handle = ModelHandle::load("/path/to/qwen2.5-0.5b".as_ref(), &registry, &LoadOptions::default())?;
+let handle = ModelHandle::load("/path/to/checkpoint".as_ref(), &registry, &LoadOptions::default())?;
 let handle = ModelHandle::load("/path/to/model.gguf".as_ref(), &registry, &LoadOptions::default())?;
 
 // GPTQ, AWQ and FP8 projections stay packed as stored; dense BF16/F16 weights stay BF16/F16 words,
 // never widened to f32 copies.
-let handle = ModelHandle::load("/path/to/gptq-model".as_ref(), &registry, &LoadOptions::default())?;
+let handle = ModelHandle::load("/path/to/quantized-checkpoint".as_ref(), &registry, &LoadOptions::default())?;
 ```
 
 A family the registry does not know is a typed refusal, `DriverError::Unsupported(Unsupported::Registry(..))`.
-The dense, mixture-of-experts (Qwen3-MoE, Granite MoE, Mixtral, OLMoE, gpt-oss), MLA (DeepSeek) and hybrid
-(Nemotron-H) families are registered, as are the BERT encoders and the SmolVLM vision tower (below).
+Decoder, mixture-of-experts, latent-attention, hybrid, encoder and vision-language families are registered; the
+[feature matrix](../reference/feature-matrix.md) lists them per family.
 `LoadOptions::integrity` names a manifest of file lengths and SHA-256 digests. Every file the load reads must be
 listed: the weight files are checked before any tensor is read, and `config.json`, `tokenizer.json` and the other
 config and chat-template files are hashed once and parsed from those same bytes, so a modified tokenizer fails the
@@ -94,7 +94,7 @@ let options = DriverOptions {
     charge: poot_llm::driver::program_retention,
     draft: DraftPolicy::Off, // or PromptLookup / DraftModel / Mtp { k }: see Speculative decoding
     hidden_window: None,    // Some(window): every program also writes a hidden-state carry;
-                            // under Mtp, draft.carry_window() (the driver refuses otherwise)
+                            // required under Mtp, where draft.carry_window() supplies it
 };
 let mut driver = Driver::new(Arc::clone(&handle), open_executor(BackendChoice::Auto)?, options)?
     .serve(Layout::Contiguous); // or `prepare(&shapes)`: the Serving driver is the one that generates
@@ -143,7 +143,7 @@ let text = handle.text().decode(&ids)?;
 
 ## Sentence embeddings and reranking
 
-Embeddings and reranking come from BERT-class models, which run on the driver's `encode` step on the device
+Embeddings and reranking come from encoder models, which run on the driver's `encode` step on the device
 you open. `SentenceEncoder` and `CrossEncoder` load a checkpoint and a backend, tokenize, run the step and
 do the host side (pooling, normalization, ranking). The load takes the most texts one call encodes; the encode
 entries for that many rows and every length up to the model's positions are prepared at load, and a larger call
@@ -156,11 +156,11 @@ use poot_llm::driver::{BackendChoice, open_executor};
 use poot_llm::encoders::{CrossEncoder, SentenceEncoder};
 
 let rows = NonZeroUsize::new(8).unwrap();
-let mut enc = SentenceEncoder::load(Path::new("/path/to/all-minilm"), open_executor(BackendChoice::Auto)?, rows)?;
+let mut enc = SentenceEncoder::load(Path::new("/path/to/embedding-checkpoint"), open_executor(BackendChoice::Auto)?, rows)?;
 let vectors = enc.embed(&["a small domestic cat", "a young kitten"])?; // L2-normalized
 let ranked = enc.rerank("query", &["doc a", "doc b"])?;
 
-let mut ce = CrossEncoder::load(Path::new("/path/to/ms-marco-minilm"), open_executor(BackendChoice::Auto)?, rows)?;
+let mut ce = CrossEncoder::load(Path::new("/path/to/reranker-checkpoint"), open_executor(BackendChoice::Auto)?, rows)?;
 let ranked = ce.rerank("query", &["doc a", "doc b"])?;
 ```
 
@@ -168,10 +168,7 @@ A decoder's embedding pass is the same step: call `Driver::prepare_encode` with 
 need, then `Driver::encode` over token rows returns the final hidden state of every position, and the pooling
 is yours. `encode` never compiles a token-row shape: one that was not prepared is a typed refusal.
 
-## What not to do in-process
+## See also
 
-- Multi-tenant HTTP, embeddings/rerank endpoints, metrics: use
-  [Serving](../serve/index.md).
-- Writing GPU kernels: [Authoring kernels](./authoring-kernels.md).
-- Backend tradeoffs and capability tables: [Picking a backend](../serve/choosing-a-backend.md) and the
-  [feature matrix](../reference/feature-matrix.md).
+[Serving](../serve/index.md) for HTTP endpoints, metrics and multi-tenant use; [Authoring kernels](./authoring-kernels.md)
+for GPU kernels; the [feature matrix](../reference/feature-matrix.md) for backend and family coverage.

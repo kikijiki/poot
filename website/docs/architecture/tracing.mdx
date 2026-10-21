@@ -104,12 +104,12 @@ bound to a stable device buffer that the host rewrites in place every step.
 `state_out` value; the executor feeds the buffer in and overwrites it with the output.
 
 **Device intermediates** (`Storage::Device`). Every activation produced by an eqn.
-Allocated once at stable addresses determined at plan time, which CUDA graph capture
+Allocated once at stable addresses determined at plan time, which recorded replay
 requires.
 
 ## What a full trace looks like
 
-A Qwen2.5-0.5B decode step (24 layers, 896 hidden dim, 14 Q heads, 2 KV heads) traces to
+A decode step of a 24-layer dense decoder traces to
 a flat graph of primitive eqns, on the order of a thousand or more. Count it with
 `poot_graph_ir::analysis::dispatch_count` on the traced decode graph.
 Every shape is known statically at trace time. The trace takes a few milliseconds and
@@ -134,7 +134,7 @@ directly (`kv_head = q_head / n_rep`).
 
 ## SwiGLU and GeLU FFN
 
-The SwiGLU [^swiglu] activation used in Llama, Qwen, and Mistral:
+The SwiGLU [^swiglu] activation of a gated feed-forward:
 
 ```
 ffn(x) = (SiLU(gate_proj(x)) * up_proj(x)) @ down_proj
@@ -143,8 +143,8 @@ ffn(x) = (SiLU(gate_proj(x)) * up_proj(x)) @ down_proj
 `ops::swiglu` is `silu(gate) * up` between the gate/up and down `MatMul`s, where `silu` is
 itself a composition, `x / (1 + exp(-x))`, over the `Neg`, `Exp`, `Add` and `Div` primitives.
 The GeLU [^gelu] variants replace `silu` with another composition: the tanh approximation
-(used by Gemma's `geglu`) is the same sigmoid form over `Exp` and `Div`, and the exact erf form
-(used by BERT-class encoders) is built on the `Erf` primitive. No activation unary and no
+(the `geglu` variant) is the same sigmoid form over `Exp` and `Div`, and the exact erf form
+(used by encoder feed-forwards) is built on the `Erf` primitive. No activation unary and no
 special FFN opcode exists.
 
 ## Checkpoint loading

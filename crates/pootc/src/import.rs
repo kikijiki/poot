@@ -30,8 +30,9 @@
 //! A MIR `Assert` (bounds, overflow, divide, shift) lowers to a `SwitchInt` that traps on failure instead
 //! of erasing to its success target; `Unreachable` lowers directly to a trap ([`kir::Terminator::Trap`]).
 //! The GPU has no panic path, so the trap is the kernel-subset's abort: on ROCm and PTX it is a real device
-//! trap instruction; on SpirvVulkan, which has none, `poot-codegen` refuses a `Trap`-containing body with a
-//! typed error (card 531c; R468-007). `.rev()`/`.step_by()` are rejected.
+//! trap instruction; on SpirvVulkan, which has none, `poot-codegen` rewrites each trap into a per-thread
+//! fault bit in the dispatch's error word and the executor raises a typed fault at its next sync point
+//! (card 531c; R468-007; see `poot-codegen`'s `debranch`). `.rev()`/`.step_by()` are rejected.
 
 use poot_kernel_ir as kir;
 use rustc_public::mir as smir;

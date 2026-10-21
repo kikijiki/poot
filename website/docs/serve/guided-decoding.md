@@ -97,9 +97,9 @@ the reply is guaranteed to parse):
 - `tool_choice: "auto"` / `"none"` (or omitted), the model and template decide, unconstrained.
 
 Each model names its own tool-call format, and both the parsing of its calls into `tool_calls` and
-forcing go through it. Forcing applies to models that emit the ChatML `<tool_call>` markup (Qwen2.5,
-Hermes, Granite); the Mistral (`[TOOL_CALLS]`) and Llama 3.1 (`<|python_tag|>`) formats are parsed
-but left to the template when forced, and a model with no tool-call format returns its reply as
-plain content. This takes precedence over the `guided_*` fields.
+forcing go through it. Forcing applies to models whose tool-call codec emits the ChatML `<tool_call>` markup; the
+`[TOOL_CALLS]` and `<|python_tag|>` formats are parsed but left to the template when forced, and a model with no
+tool-call codec returns its reply as plain content. The [feature matrix](../reference/feature-matrix.md) lists the
+codec of each family. This takes precedence over the `guided_*` fields.
 
 Design notes: [Architecture: Serving design](../architecture/serving-design.mdx#the-scheduling-loop).

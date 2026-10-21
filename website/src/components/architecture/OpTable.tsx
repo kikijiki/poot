@@ -33,7 +33,7 @@ const OPS: Op[] = [
     inputs: "cond, if_true, if_false",
     outputShape: "[...] (same)",
     notes:
-      "cond is I32, nonzero picks if_true; branches share one dtype. A native hardware select that moves the chosen element bit for bit, so a NaN or Inf in the unselected branch never reaches the output. I32, F32, F16 and BF16 branches; ROCm and PTX lower all four, while SPIR-V (wgpu, Vulkan) refuses F16 and BF16 with a typed DtypeLowering",
+      "cond is I32, nonzero picks if_true; branches share one dtype. A native hardware select that moves the chosen element bit for bit, so a NaN or Inf in the unselected branch never reaches the output. I32, F32, F16 and BF16 branches; ROCm and PTX lower all four, while SPIR-V (wgpu, raw Vulkan) refuses F16 and BF16 with a typed DtypeLowering",
   },
   {
     name: "Cast(to)",

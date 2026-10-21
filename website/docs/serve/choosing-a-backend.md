@@ -25,19 +25,17 @@ startup, before the server listens:
 
 `--backend vulkan` serves too: raw Vulkan reads the free device memory from `VK_EXT_memory_budget`, so the engine plan fits the workload to it like any other backend. A Vulkan driver without that extension reports no budget, and startup then stops with a typed capacity error (an unknown budget is never guessed).
 
-The backends are libraries. **wgpu** (Vulkan/SPIR-V, the default), **rocm** (AMD raw HSA)
-and **ptx** (NVIDIA CUDA) share the graph IR and model definitions, and so does **vulkan**: the same SPIR-V
-kernels as wgpu, dispatched through raw Vulkan (`ash`) with no wgpu, recorded once as native command buffers
-and replayed. Only codegen and dispatch differ. Pick one in `poot-serve` with `--backend
-wgpu|rocm|ptx|vulkan|auto`, or in library code through the `poot-llm` API; `auto` never picks vulkan, since it runs on the same hardware as wgpu. Raw Vulkan
-is the lowest-priority backend: it is verified on AMD (RADV) only. See the
-[feature matrix](../reference/feature-matrix.md) for what each supports and
-[Architecture: Backends](../architecture/backends.mdx) for the design.
+The backends are libraries that share the graph IR and model definitions: **wgpu** (Vulkan/SPIR-V, the default),
+**rocm** (AMD raw HSA), **ptx** (NVIDIA CUDA) and **vulkan** (the same SPIR-V kernels as wgpu, dispatched through raw
+Vulkan with no wgpu). Only codegen and dispatch differ. Pick one in library code through the `poot-llm` API. `auto`
+never picks vulkan, since it runs on the same hardware as wgpu. The
+[feature matrix](../reference/feature-matrix.md) lists what each supports, including the raw Vulkan section, and
+[Architecture: Backends](../architecture/backends.mdx) describes the design.
 
-The AMD XDNA2 and Intel NPU4 NPUs are not serving backends: they are experimental library devices.
-See [Architecture: NPU Offload](../architecture/npu.mdx).
+The AMD XDNA2 and Intel NPU4 NPUs are not serving backends: they are experimental library devices
+([Architecture: NPU Offload](../architecture/npu.mdx)).
 
-## Verifying the sanity check for your box
+## Checking that the toolchain sees your GPU
 
 Whatever backend you use, confirm the toolchain sees your GPU before troubleshooting:
 

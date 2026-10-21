@@ -162,8 +162,8 @@ Every `OpKind` implements `infer(input_types) -> output_type`. Shape inference
 runs entirely on the host at trace time. No shape computation ever happens on the device.
 
 Two consequences. First, the executor knows every buffer size before the first dispatch
-and can allocate everything upfront at stable addresses, a requirement for CUDA graph
-capture. Second, because all shapes are static, the planner can select kernel
+and can allocate everything upfront at stable addresses, a requirement for recorded replay
+(CUDA graphs, HSA packets, Vulkan command buffers). Second, because all shapes are static, the planner can select kernel
 specializations (GEMV vs GEMM, the attention schedule) at compile time rather than
 conditionally at runtime.
 
@@ -180,7 +180,7 @@ the `WeightFormat`, shape and source roles. The compiler recognizes dense projec
 `PackedContraction` and embedding lookups as `PackedRowGather`; generated kernels decode only the
 weight values they consume.
 
-The old per-scheme dequant-matmul op family is removed. GPTQ, AWQ, supported GGUF quants and the
+GPTQ, AWQ, supported GGUF quants and the
 registered FP8/E2M1 layouts use the descriptor-driven lowering. Support still depends on the consuming
 graph: a packed MoE expert stack is rewritten when its weights are bound into one indexed packed
 contraction that decodes only the selected experts' blocks, and the packed loader keeps the weights packed.
