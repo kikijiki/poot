@@ -1941,6 +1941,7 @@ pub struct SerializedBinding {
 
 #[cfg(test)]
 mod tests {
+    use crate::fused::{LeafId, RowValue, StepId};
     use crate::{EpilogueInput, EpilogueLeaf, EpilogueStep, FusedScalarOp};
     use std::num::NonZeroUsize;
 
@@ -2593,13 +2594,13 @@ mod tests {
                     .map(|s| crate::fused::FusedStep {
                         op: crate::fused::FusedScalarOp::Erf,
                         inputs: vec![if s == 0 {
-                            FusedInput::Leaf(0)
+                            FusedInput::Leaf(LeafId::new(0))
                         } else {
-                            FusedInput::Step(s - 1)
+                            FusedInput::Step(StepId::new(s - 1))
                         }],
                     })
                     .collect(),
-                output: FusedInput::Step(steps - 1),
+                output: FusedInput::Step(StepId::new(steps - 1)),
             },
             form: PointwiseForm::Float {
                 fold: Fold {
@@ -2821,31 +2822,46 @@ mod tests {
                 steps: vec![
                     step(
                         binary(BinOp::Mul),
-                        vec![FusedInput::Leaf(0), FusedInput::Leaf(0)],
+                        vec![
+                            FusedInput::Leaf(LeafId::new(0)),
+                            FusedInput::Leaf(LeafId::new(0)),
+                        ],
                     ),
                     RowOp::Reduce {
                         op: RowReduce::Sum,
-                        input: FusedInput::Step(0),
+                        input: FusedInput::Step(StepId::new(0)),
                     },
                     step(
                         binary(BinOp::Mul),
-                        vec![FusedInput::Step(1), FusedInput::Lit(1.0 / cols as f32)],
+                        vec![
+                            FusedInput::Step(StepId::new(1)),
+                            FusedInput::Lit(1.0 / cols as f32),
+                        ],
                     ),
                     step(
                         binary(BinOp::Add),
-                        vec![FusedInput::Step(2), FusedInput::Lit(1e-5)],
+                        vec![FusedInput::Step(StepId::new(2)), FusedInput::Lit(1e-5)],
                     ),
-                    step(FusedScalarOp::Math(MathOp::Sqrt), vec![FusedInput::Step(3)]),
+                    step(
+                        FusedScalarOp::Math(MathOp::Sqrt),
+                        vec![FusedInput::Step(StepId::new(3))],
+                    ),
                     step(
                         binary(BinOp::Div),
-                        vec![FusedInput::Leaf(0), FusedInput::Step(4)],
+                        vec![
+                            FusedInput::Leaf(LeafId::new(0)),
+                            FusedInput::Step(StepId::new(4)),
+                        ],
                     ),
                     step(
                         binary(BinOp::Mul),
-                        vec![FusedInput::Step(5), FusedInput::Leaf(1)],
+                        vec![
+                            FusedInput::Step(StepId::new(5)),
+                            FusedInput::Leaf(LeafId::new(1)),
+                        ],
                     ),
                 ],
-                output: 2 + 6,
+                output: RowValue::Step(StepId::new(6)),
             },
             width,
         })
@@ -3041,7 +3057,7 @@ mod tests {
         assert!(cooperative.contains("one-lane"), "{cooperative}");
 
         // A row kernel over one leaf with a single step `op(x, x)` / `op(x)` reduced or written out.
-        let kernel = |steps: Vec<RowOp>, output: usize| {
+        let kernel = |steps: Vec<RowOp>, output: RowValue| {
             KernelRequest::Row(RowSpec::Fused {
                 out_shape: vec![3, 8],
                 numel: 24,
@@ -3059,30 +3075,35 @@ mod tests {
                 width: 1,
             })
         };
-        let leaf_pair = || vec![FusedInput::Leaf(0), FusedInput::Leaf(0)];
+        let leaf_pair = || {
+            vec![
+                FusedInput::Leaf(LeafId::new(0)),
+                FusedInput::Leaf(LeafId::new(0)),
+            ]
+        };
         let point = |op, inputs| RowOp::Pointwise { op, inputs };
         // x - x: may cancel, no relative bound.
         let sub = kernel(
             vec![point(FusedScalarOp::Binary(BinOp::Sub), leaf_pair())],
-            1,
+            RowValue::Step(StepId::new(0)),
         );
         assert_eq!(unsupported(&sub), crate::aie_row::NO_BOUND);
         // A running sum of values of either sign has no relative bound in a fused kernel.
         let signed_sum = kernel(
             vec![RowOp::Reduce {
                 op: RowReduce::Sum,
-                input: FusedInput::Leaf(0),
+                input: FusedInput::Leaf(LeafId::new(0)),
             }],
-            1,
+            RowValue::Step(StepId::new(0)),
         );
         assert_eq!(unsupported(&signed_sum), crate::aie_row::NO_BOUND);
         // sqrt of a value that may be negative or zero.
         let sqrt = kernel(
             vec![point(
                 FusedScalarOp::Math(MathOp::Sqrt),
-                vec![FusedInput::Leaf(0)],
+                vec![FusedInput::Leaf(LeafId::new(0))],
             )],
-            1,
+            RowValue::Step(StepId::new(0)),
         );
         assert_eq!(unsupported(&sqrt), crate::aie_row::NO_BOUND);
         // A reduction other than sum and max, and a half-precision row.

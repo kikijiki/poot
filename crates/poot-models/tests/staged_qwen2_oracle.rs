@@ -179,7 +179,7 @@ fn weight_names(graph: &Graph) -> Vec<String> {
         .iter()
         .map(|&value| graph.meta(value))
         .filter(|meta| meta.storage == poot_graph_ir::Storage::Const)
-        .filter_map(|meta| meta.name.clone())
+        .filter_map(|meta| meta.name().map(std::borrow::Cow::into_owned))
         .collect();
     names.sort();
     names
@@ -281,14 +281,14 @@ fn adapted_input(
     let found = original.inputs().iter().find(|&&candidate| {
         let theirs = original.meta(candidate);
         theirs.storage == meta.storage
-            && theirs.name == meta.name
+            && theirs.name() == meta.name()
             && theirs.slot_key() == meta.slot_key()
     });
     if let Some(&other) = found {
         return inputs[&other].clone();
     }
     match meta.storage {
-        poot_graph_ir::Storage::Slot(Slot::LoraIdx) => {
+        poot_graph_ir::Storage::Slot(Slot::Owned(role)) if role == poot_graph_plan::LORA_IDX => {
             let numel = meta.aval.numel();
             Value::from(HostTensor::i32(
                 meta.aval.shape.clone(),
@@ -297,7 +297,7 @@ fn adapted_input(
         }
         poot_graph_ir::Storage::Computed(payload) => Value::from(payload.tensor()),
         poot_graph_ir::Storage::Const => {
-            let name = meta.name.as_deref().unwrap();
+            let name = meta.name().unwrap();
             let seed = name
                 .bytes()
                 .fold(7u64, |h, c| (h ^ u64::from(c)).wrapping_mul(1099511628211));
@@ -309,6 +309,6 @@ fn adapted_input(
                     .collect(),
             ))
         }
-        other => panic!("no binding for {other:?} {:?}", meta.name),
+        other => panic!("no binding for {other:?} {:?}", meta.name()),
     }
 }

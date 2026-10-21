@@ -247,7 +247,7 @@ pub fn decompose(
         | OpKind::Iota { .. }
         | OpKind::Gather { .. }
         | OpKind::ScatterUpdate
-        | OpKind::MatMul
+        | OpKind::MatMul { .. }
         | OpKind::PackedDequant { .. }
         | OpKind::PackedRowGather { .. }
         | OpKind::ArgTopK { .. }
@@ -336,8 +336,8 @@ fn region_operand(
             };
             let slice = OpKind::Slice {
                 axis,
-                start: *lane,
-                end: lane + 1,
+                start: lane.index(),
+                end: lane.index() + 1,
             };
             Operand::Value(plan.equation(slice, vec![Operand::Value(packed)])?.id())
         }
@@ -471,7 +471,8 @@ fn fused_row(
 pub(crate) mod tests {
     use super::*;
     use crate::op::{
-        AttentionAttrs, BinOp, FusedOp, FusedStep, LocalId, OpClass, RedOp, SampleRule, UnOp,
+        AttentionAttrs, BinOp, FusedOp, FusedStep, LaneId, LocalId, OpClass, RedOp, SampleRule,
+        UnOp,
     };
     use crate::types::{DType, Scalar};
     use poot_quant::PackedWeight;
@@ -502,7 +503,7 @@ pub(crate) mod tests {
             OpKind::Iota { .. } => 10,
             OpKind::Gather { .. } => 11,
             OpKind::ScatterUpdate => 12,
-            OpKind::MatMul => 13,
+            OpKind::MatMul { .. } => 13,
             OpKind::PackedDequant { .. } => 14,
             OpKind::PackedContraction { .. } => 15,
             OpKind::PackedRowGather { .. } => 16,
@@ -589,7 +590,7 @@ pub(crate) mod tests {
         };
         let lane = |lane| FusedOperand::PackLane {
             input: LocalId::new(0),
-            lane,
+            lane: LaneId::new(lane),
         };
         let i32_region = FusedRegion {
             n_inputs: 1,
@@ -684,7 +685,7 @@ pub(crate) mod tests {
                 OpKind::ScatterUpdate,
                 vec![f32(&[4, 3]), f32(&[2, 3]), typed(&[2], i32)],
             ),
-            (OpKind::MatMul, vec![f32(&[2, 3]), f32(&[3, 4])]),
+            (OpKind::matmul(), vec![f32(&[2, 3]), f32(&[3, 4])]),
             (
                 OpKind::PackedDequant { descriptor: packed },
                 with_sources(Vec::new(), false),

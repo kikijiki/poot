@@ -327,8 +327,8 @@ fn read_weights(g: &Graph) -> Vec<(String, TensorType)> {
         .filter(|value| read.contains(value))
         .filter_map(|value| {
             let meta = g.meta(value);
-            match (&meta.storage, &meta.name) {
-                (Storage::Const, Some(name)) => Some((name.clone(), meta.aval.clone())),
+            match (&meta.storage, meta.name()) {
+                (Storage::Const, Some(name)) => Some((name.into_owned(), meta.aval.clone())),
                 _ => None,
             }
         })
@@ -448,8 +448,8 @@ pub(super) fn footprints(
             );
             match meta.storage {
                 Storage::Const => {
-                    let key = match &meta.name {
-                        Some(name) => SharedBuffer::Key(name.clone()),
+                    let key = match meta.name() {
+                        Some(name) => SharedBuffer::Key(name.into_owned()),
                         None => SharedBuffer::Local(*stage, input),
                     };
                     if shared.insert((*device, key)) {

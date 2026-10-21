@@ -122,7 +122,7 @@ fn implied_op_numerics(op: &OpKind, out_dtype: DType) -> NumericsProperty {
         // The unfused hardware baseline. A contraction or reduction sums in a device-defined order, and
         // a float elementwise chain is another device-executed arithmetic path, so none of them is
         // bit-exact against the CPU oracle.
-        OpKind::MatMul | OpKind::ContractionEpilogue { .. } | OpKind::Reduce { .. } => {
+        OpKind::MatMul { .. } | OpKind::ContractionEpilogue { .. } | OpKind::Reduce { .. } => {
             NumericsProperty::Unfused
         }
         OpKind::Binary(_) | OpKind::Unary(_)

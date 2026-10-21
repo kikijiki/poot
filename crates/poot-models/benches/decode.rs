@@ -89,10 +89,7 @@ fn bind(g: &Graph) -> HashMap<ValueId, Value> {
             }
             Storage::Slot(other) => unreachable!("unexpected slot {other:?} in a dense step graph"),
             Storage::Const => {
-                inputs.insert(
-                    id,
-                    Value::from(weight(m.name.as_deref().unwrap(), &m.aval.shape)),
-                );
+                inputs.insert(id, Value::from(weight(&m.name().unwrap(), &m.aval.shape)));
             }
             Storage::State | Storage::Device | Storage::Computed(_) => {}
         }

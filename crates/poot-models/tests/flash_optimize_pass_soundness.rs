@@ -119,7 +119,7 @@ fn bind(
                 )
             }
             Storage::Slot(other) => panic!("unexpected slot {other:?}"),
-            Storage::Const => weight(m.name.as_deref().unwrap(), &shape),
+            Storage::Const => weight(&m.name().unwrap(), &shape),
             Storage::Computed(c) => c.tensor(),
             Storage::State => continue,
             Storage::Device => unreachable!(),

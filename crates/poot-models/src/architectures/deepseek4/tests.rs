@@ -56,7 +56,7 @@ fn state_names(model: &dyn Model, capacity: usize) -> Vec<String> {
         )
         .unwrap();
     g.state()
-        .map(|(input, _)| g.meta(input).name.clone().unwrap())
+        .map(|(input, _)| g.meta(input).name().unwrap().into_owned())
         .collect()
 }
 
@@ -307,7 +307,7 @@ fn the_hash_table_is_declared_in_the_expert_range() {
         .iter()
         .map(|&id| g.meta(id))
         .filter(|meta| {
-            meta.name
+            meta.name()
                 .as_deref()
                 .is_some_and(|name| name.ends_with(".moe.hash_table"))
         })
@@ -318,7 +318,7 @@ fn the_hash_table_is_declared_in_the_expert_range() {
             meta.range(),
             poot_graph_ir::IndexRange::below(8),
             "{:?}",
-            meta.name
+            meta.name()
         );
     }
 }
@@ -832,7 +832,7 @@ fn a_bf16_checkpoint_keeps_the_grouped_o_projection_bf16_resident() {
                 let id = g
                     .values()
                     .iter_enumerated()
-                    .find(|(_, meta)| meta.name.as_deref() == Some(name))
+                    .find(|(_, meta)| meta.name().as_deref() == Some(name))
                     .map(|(id, _)| id)
                     .unwrap_or_else(|| {
                         panic!("{tokens}-token step on {backend:?}: no const {name}")

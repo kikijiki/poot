@@ -440,7 +440,7 @@ fn compile_chooses_the_generated_tiled_gemm_for_m_over_one_only() {
             compile(&b.finish(y).unwrap(), &target, &options).expect("the matmul compiles");
         let (eqn, _) = program
             .planned()
-            .find(|(eqn, _)| matches!(eqn.op, OpKind::MatMul))
+            .find(|(eqn, _)| matches!(eqn.op, OpKind::MatMul { .. }))
             .expect("the graph keeps a plain MatMul");
         program.kernel_choice(eqn).clone()
     };

@@ -86,7 +86,12 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
     let h = traced
         .eqns()
         .iter()
-        .filter(|eqn| matches!(eqn.op, OpKind::MatMul | OpKind::ContractionEpilogue { .. }))
+        .filter(|eqn| {
+            matches!(
+                eqn.op,
+                OpKind::MatMul { .. } | OpKind::ContractionEpilogue { .. }
+            )
+        })
         .map(|eqn| eqn.out)
         .filter(|&value| traced.aval(value).dtype == DType::F32)
         .min_by_key(|&value| traced.aval(value).numel())

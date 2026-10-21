@@ -183,12 +183,15 @@ fn run(g: &Graph, overrides: &HashMap<String, Vec<f32>>, tokens: &[i32], lora: &
         let tensor = match meta.storage {
             Storage::Slot(Slot::Token) => HostTensor::i32(aval.shape, tokens.to_vec()),
             Storage::Slot(Slot::Pos) => HostTensor::i32(aval.shape, vec![3; tokens.len()]),
-            Storage::Slot(Slot::LoraIdx) => HostTensor::i32(aval.shape, lora.to_vec()),
+            Storage::Slot(Slot::Owned(role)) if role == poot_graph_plan::LORA_IDX => {
+                HostTensor::i32(aval.shape, lora.to_vec())
+            }
             Storage::Slot(other) => panic!("unexpected slot {other:?}"),
             Storage::Computed(c) => c.tensor(),
             Storage::State => HostTensor::f32(aval.shape.clone(), vec![0.0; aval.numel()]),
             Storage::Const => {
-                let name = meta.name.as_deref().expect("a const has a name");
+                let name = meta.name().expect("a const has a name");
+                let name = name.as_ref();
                 let data = overrides
                     .get(name)
                     .cloned()

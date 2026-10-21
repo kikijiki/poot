@@ -52,9 +52,9 @@ pub(crate) fn with_eqns(g: &Graph, eqns: Vec<Eqn>) -> Result<Graph, EditError> {
 pub(crate) use budget::GraphBudget;
 pub(crate) use legalize::refuse_oversized_constants;
 pub(crate) use legalize::{KvExtent, kv_extents};
-pub use legalize::{LegalizeError, legalize};
+pub use legalize::{LegalizeError, TOKEN_EMBED, legalize};
 pub(crate) use lora::apply_lora;
-pub use lora::{LoraError, LoraPlan};
+pub use lora::{LORA_IDX, LoraError, LoraPlan};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use attention_match::canonicalize;
@@ -85,7 +85,7 @@ pub use fuse::fuse;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) use fuse::fuse;
 pub(crate) use fuse::fuse_contraction_epilogues;
-pub(crate) use guard_witness::{first_unobserved_clamp, producer_map};
+pub(crate) use guard_witness::first_unobserved_clamp;
 #[cfg(any(test, feature = "test-support"))]
 pub use iota::fold_iota;
 #[cfg(not(any(test, feature = "test-support")))]
@@ -100,7 +100,9 @@ pub use packed_bind::{
     WeightFormatsError, bind_packed_weights,
 };
 pub(crate) use pool::pool_experts;
-pub use pool::{PoolError, PoolSite, PoolSpec, PooledWeight, routed_step_demand};
+pub use pool::{
+    EXPERT_POOL, EXPERT_POOL_MAP, PoolError, PoolSite, PoolSpec, PooledWeight, routed_step_demand,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use routed_experts::{RoutedExpertSite, routed_expert_sites};
 pub(crate) use selection::form_selection;

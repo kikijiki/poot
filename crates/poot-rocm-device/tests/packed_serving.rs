@@ -97,7 +97,7 @@ fn store_for(graph: &Graph, owners: &HashMap<String, Arc<PackedPayload>>) -> Arc
     for &id in graph.inputs() {
         let Some(name) = graph
             .meta(id)
-            .name
+            .name()
             .as_deref()
             .and_then(PackedSourceName::parse)
         else {
@@ -1062,7 +1062,7 @@ fn run_dense_activation(
     for &id in graph.inputs() {
         let Some(name) = graph
             .meta(id)
-            .name
+            .name()
             .as_deref()
             .and_then(PackedSourceName::parse)
         else {
@@ -1161,7 +1161,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_rocm() {
             for &id in graph.inputs() {
                 if let Some(name) = graph
                     .meta(id)
-                    .name
+                    .name()
                     .as_deref()
                     .and_then(PackedSourceName::parse)
                 {

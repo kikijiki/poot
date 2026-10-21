@@ -15,8 +15,7 @@ use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::Executor;
 use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::ops::sampling::{
-    Adjust, HISTORY_READ_TAG, HISTORY_WRITE_TAG, LogprobRecord, MASK_TAG, MASKED_LOGIT,
-    PENALTY_TAG, SampleSpec, sample_head,
+    Adjust, HISTORY_WRITE_TAG, LogprobRecord, MASKED_LOGIT, SampleSpec, SamplerInput, sample_head,
 };
 use poot_graph_ir::{Builder, Outputs, Slot, SlotKey, TensorType};
 use poot_graph_plan::Target;
@@ -67,19 +66,19 @@ fn step(spec: SampleSpec, graph: &poot_graph_ir::Graph, index: usize) -> Vec<Ste
         let cols = spec.rule.params_cols();
         let row = [1.0 / 0.8, f32::NEG_INFINITY, 1.0, 0.9];
         fixtures.push(put(
-            key(Slot::Sampler, "seed"),
+            SamplerInput::Seed.key(),
             HostTensor::i32(
                 vec![ROWS],
                 (0..ROWS as i32).map(|r| 31 * index as i32 + r).collect(),
             ),
         ));
         fixtures.push(put(
-            key(Slot::Sampler, "params"),
+            SamplerInput::Params.key(),
             HostTensor::f32(vec![ROWS, cols], vec![row[..cols].to_vec(); ROWS].concat()),
         ));
         if spec.rule.has_top_k() {
             fixtures.push(put(
-                key(Slot::Sampler, "top_k"),
+                SamplerInput::TopK.key(),
                 HostTensor::i32(vec![ROWS], vec![0; ROWS]),
             ));
         }
@@ -101,17 +100,17 @@ fn step(spec: SampleSpec, graph: &poot_graph_ir::Graph, index: usize) -> Vec<Ste
             .map(|r| if index + 1 == STEPS && r == 2 { -1 } else { r })
             .collect();
         fixtures.push(put(
-            key(Slot::Sampler, PENALTY_TAG),
+            SamplerInput::Penalty.key(),
             HostTensor::f32(vec![ROWS, 3], penalty.to_vec()),
         ));
         if spec.adjust == Adjust::Guided {
             fixtures.push(put(
-                key(Slot::Sampler, MASK_TAG),
+                SamplerInput::Mask.key(),
                 HostTensor::f32(vec![ROWS, VOCAB], mask),
             ));
         }
         fixtures.push(put(
-            key(Slot::Sampler, HISTORY_READ_TAG),
+            SamplerInput::HistoryRead.key(),
             HostTensor::i32(vec![ROWS], (0..ROWS as i32).collect()),
         ));
         fixtures.push(put(

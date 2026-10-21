@@ -974,7 +974,9 @@ fn probe_schema(
         .map(|pair| {
             let meta = graph.meta(pair.input);
             (
-                meta.name.clone().expect("a state input carries its name"),
+                meta.name()
+                    .expect("a state input carries its name")
+                    .into_owned(),
                 meta.aval.clone(),
             )
         })

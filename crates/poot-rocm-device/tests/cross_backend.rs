@@ -48,7 +48,7 @@ fn run_once_rocm(
                 meta.storage
             );
         }
-        let name = meta.name.clone().expect("named const");
+        let name = meta.name().expect("named const").into_owned();
         let value = inputs
             .get(&id)
             .unwrap_or_else(|| panic!("run_once_rocm: no input bound for const {name}"));
@@ -1177,7 +1177,7 @@ fn sample_token_greedy_rocm_matches_cpu() {
         .unwrap();
 
     let mut builder = WeightStore::builder();
-    let name = g.meta(li).name.clone().unwrap();
+    let name = g.meta(li).name().unwrap().into_owned();
     let tensor = inputs[&li].as_host().unwrap();
     let bytes = StoredBytes::from(
         tensor
@@ -1234,11 +1234,11 @@ fn sample_token_greedy_rocm_matches_cpu() {
 
 /// Card 551a (SC-001, SC-010): `OpKind::RandomUniform` through the full compile/planner/executor
 /// contract matches the CPU oracle bit for bit on ROCm (tier 1, ADR-0101). `seed` is I32, so it rides
-/// as a `Slot::Sampler` (not a `Storage::Const`: `run_once_rocm` panics on any non-Const input and
+/// as a `Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER)` (not a `Storage::Const`: `run_once_rocm` panics on any non-Const input and
 /// hardcodes F32 weight storage, since every other fixture in this file is F32-const-only).
 #[test]
 fn random_uniform_rocm_matches_cpu() {
-    use poot_graph_ir::{Slot, SlotKey};
+    use poot_graph_ir::Slot;
     use poot_tensor::HostView;
 
     let (target, mut rocm) = match try_rocm() {
@@ -1249,7 +1249,7 @@ fn random_uniform_rocm_matches_cpu() {
     let b = Builder::for_tests();
     let seed = b
         .slot_named(
-            Slot::Sampler,
+            Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER),
             "seed",
             TensorType::new(vec![rows], DType::I32),
         )
@@ -1293,7 +1293,7 @@ fn random_uniform_rocm_matches_cpu() {
     let mut step_in = StepInputs::new();
     let seed_shape = [rows];
     step_in.push(
-        SlotKey::new(Slot::Sampler, Some("seed")),
+        poot_graph_ir::ops::sampling::SamplerInput::Seed.key(),
         &seed_shape,
         HostView::new(DType::I32, rows, &seed_bytes).unwrap(),
     );
@@ -1314,7 +1314,7 @@ fn random_uniform_rocm_matches_cpu() {
 
 /// Builds and runs a Gumbel-family `SampleToken` graph through the full contract on ROCm: `logits`/
 /// `noise`/`params` as F32 consts (`run_once_rocm` panics on any non-Const input and hardcodes F32,
-/// as `random_uniform_rocm_matches_cpu` documents), `top_k` (when present) as an I32 `Slot::Sampler`
+/// as `random_uniform_rocm_matches_cpu` documents), `top_k` (when present) as an I32 `Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER)`
 /// bind, same pattern as that test's `seed`.
 fn run_gumbel_family_contract_rocm(
     rocm: &mut Engine<RocmDevice>,
@@ -1325,12 +1325,11 @@ fn run_gumbel_family_contract_rocm(
     params: (ValueId, Vec<usize>, Vec<f32>),
     top_k: Option<(ValueId, Vec<usize>, Vec<i32>)>,
 ) -> Vec<i32> {
-    use poot_graph_ir::{Slot, SlotKey};
     use poot_tensor::HostView;
 
     let mut builder = WeightStore::builder();
     for (id, shape, data) in [&logits, &noise, &params] {
-        let name = g.meta(*id).name.clone().unwrap();
+        let name = g.meta(*id).name().unwrap().into_owned();
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let dense =
             DenseWeight::try_new(DType::F32, shape.clone(), StoredBytes::from(bytes)).unwrap();
@@ -1368,7 +1367,7 @@ fn run_gumbel_family_contract_rocm(
             .flat_map(|v| v.to_le_bytes())
             .collect::<Vec<u8>>();
         step_in.push(
-            SlotKey::new(Slot::Sampler, Some("top_k")),
+            poot_graph_ir::ops::sampling::SamplerInput::TopK.key(),
             shape,
             HostView::new(DType::I32, shape.iter().product(), &top_k_bytes).unwrap(),
         );
@@ -1497,7 +1496,7 @@ fn sample_token_gumbel_topk_rocm_matches_cpu() {
     let top_k = {
         use poot_graph_ir::Slot;
         b.slot_named(
-            Slot::Sampler,
+            Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER),
             "top_k",
             TensorType::new(vec![rows], DType::I32),
         )
@@ -1606,7 +1605,7 @@ fn sample_token_topp_nucleus_rocm_matches_cpu() {
         let top_k = {
             use poot_graph_ir::Slot;
             b.slot_named(
-                Slot::Sampler,
+                Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER),
                 "top_k",
                 TensorType::new(vec![rows], DType::I32),
             )
@@ -1718,7 +1717,7 @@ fn sample_token_gumbel_topk_topp_rocm_matches_cpu() {
     let top_k = {
         use poot_graph_ir::Slot;
         b.slot_named(
-            Slot::Sampler,
+            Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER),
             "top_k",
             TensorType::new(vec![rows], DType::I32),
         )
@@ -1814,7 +1813,7 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_rocm_matches_cpu() 
     let top_k = {
         use poot_graph_ir::Slot;
         b.slot_named(
-            Slot::Sampler,
+            Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER),
             "top_k",
             TensorType::new(vec![rows], DType::I32),
         )
@@ -1909,7 +1908,7 @@ fn run_under(
         )
         .unwrap();
         builder
-            .insert(meta.name.clone().unwrap(), WeightEntry::Dense(dense))
+            .insert(meta.name().unwrap().into_owned(), WeightEntry::Dense(dense))
             .unwrap();
     }
     let store = Arc::new(builder.build());

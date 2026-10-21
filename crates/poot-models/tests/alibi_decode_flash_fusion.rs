@@ -117,14 +117,14 @@ fn bind(
             ),
             Storage::Slot(other) => panic!("unexpected slot {other:?}"),
             Storage::Computed(c) => c.tensor(),
-            Storage::Const if m.name.as_deref() == Some(SLOPES) => {
+            Storage::Const if m.name().as_deref() == Some(SLOPES) => {
                 HostTensor::f32(m.aval.shape.clone(), slopes.expect("bound slopes").to_vec())
             }
             Storage::Const => {
                 // Small Q and K keep the scores near one, where the softmax still reads the ALiBi
                 // distance term; at full scale it saturates and no slope shows.
                 let gain = if m
-                    .name
+                    .name()
                     .as_deref()
                     .is_some_and(|n| n.ends_with(".attn.q") || n.ends_with(".attn.k"))
                 {
@@ -152,7 +152,9 @@ fn slopes_as_input(g: &Graph) -> Graph {
         for &id in g.inputs() {
             if matches!(g.values()[id].storage, Storage::Computed(_)) {
                 draft.values_mut()[id].storage = Storage::Const;
-                draft.values_mut()[id].name = Some(SLOPES.to_string());
+                draft.values_mut()[id]
+                    .rename(SLOPES)
+                    .expect("a computed constant is anonymous");
             }
         }
     })

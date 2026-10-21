@@ -332,7 +332,7 @@ fn lora_idx(index: u32) -> LoraIdx {
 }
 
 /// Whether an input buffer of the last replayed step holds exactly `expected` as i32 words: the
-/// `Slot::LoraIdx` row values. The step's token buffer is `[3]`/`[4]`/`[5]` and its position buffer `[0]`,
+/// ``LORA_IDX`` row values. The step's token buffer is `[3]`/`[4]`/`[5]` and its position buffer `[0]`,
 /// so a one- or two-valued adapter index is told apart by its value.
 fn last_step_bound(rig: &Rig<Serving>, expected: &[i32]) -> bool {
     let world = rig.world.borrow();

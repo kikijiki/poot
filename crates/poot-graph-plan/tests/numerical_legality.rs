@@ -329,7 +329,7 @@ fn narrow_contraction_rounds_before_fused_epilogue() {
                 .graph()
                 .eqns()
                 .iter()
-                .any(|eqn| matches!(eqn.op, OpKind::MatMul)
+                .any(|eqn| matches!(eqn.op, OpKind::MatMul { .. })
                     && program.graph().aval(eqn.out).dtype == dtype),
             "the contraction's narrow result remains a boundary"
         );

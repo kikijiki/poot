@@ -510,10 +510,10 @@ mod tests {
             ops(&bound),
             ["packed_dequant q8_0", "transpose [1, 0]", "matmul"]
         );
-        let names: Vec<&str> = bound
+        let names: Vec<_> = bound
             .inputs()
             .iter()
-            .filter_map(|&id| bound.meta(id).name.as_deref())
+            .filter_map(|&id| bound.meta(id).name())
             .collect();
         assert_eq!(names, ["x", "w.l0.ffn.up.packed_blocks_source"]);
         let carrier = bound
@@ -744,10 +744,10 @@ mod tests {
                     rows: ContractionRows::Indexed { experts },
                 }
             );
-            let names: Vec<&str> = bound
+            let names: Vec<_> = bound
                 .inputs()
                 .iter()
-                .filter_map(|&id| bound.meta(id).name.as_deref())
+                .filter_map(|&id| bound.meta(id).name())
                 .collect();
             assert_eq!(names, ["x", "sel", "w.l1.ffn.up.packed_blocks_source"]);
             let carrier = bound.inputs()[2];
@@ -888,32 +888,35 @@ mod tests {
         ));
     }
 
-    /// SC-003: a packed weight binds by the `WeightRef` its constant carries, not by the constant's
-    /// name. The constant of `LAYER` is renamed after the tracer declared it: it still binds, its
-    /// carriers named after the weight. A constant that merely spells the weight's name, declared
-    /// without the reference, is no weight and is left alone. Mutation: look the weight up by the
-    /// constant's name (`meta.name` against `WeightId::const_name`) instead of by `meta.weight()`;
-    /// the renamed row finds nothing to bind and the dense constant survives.
+    /// SC-003: a packed weight binds by the `WeightRef` its constant carries, not by the constant's name. The
+    /// name of a mapped weight is derived from the reference, so it cannot be changed after the tracer declared
+    /// it (`ValueMeta::rename` refuses); a constant that merely spells the weight's name, declared without the
+    /// reference, is no weight and is left alone. Mutation: look the weight up by the constant's name
+    /// (`meta.name()` against `WeightId::const_name`) instead of by `meta.weight()`; the by-name-only constant
+    /// is bound and the dense constant is lost.
     #[test]
-    fn a_renamed_weight_constant_still_binds_by_its_weight_ref() {
+    fn a_constant_that_only_spells_a_weights_name_is_not_that_weight() {
         let b = Builder::for_tests();
         let x = b.constant("x", TensorType::f32(vec![2, 64])).unwrap();
         let w = declare(&b, LAYER, vec![64, 8]);
         let y = b.matmul(x, w).unwrap();
-        let mut g = b.finish(y).unwrap();
+        let g = b.finish(y).unwrap();
         let mut edit = g.edit();
-        edit.values_mut()[w.id()].name = Some("renamed.by.a.pass".into());
-        g = edit.commit().unwrap();
+        assert_eq!(
+            edit.values_mut()[w.id()].rename("renamed.by.a.pass"),
+            Err(poot_graph_ir::RenameError { kind: "weight" })
+        );
+        let g = edit.commit().unwrap();
 
         let bound = bind_packed_weights(&g, &formats(&[(LAYER, column(8, 64))])).unwrap();
         assert_eq!(
             ops(&bound),
             ["packed_dequant q8_0", "transpose [1, 0]", "matmul"]
         );
-        let names: Vec<&str> = bound
+        let names: Vec<_> = bound
             .inputs()
             .iter()
-            .filter_map(|&id| bound.meta(id).name.as_deref())
+            .filter_map(|&id| bound.meta(id).name())
             .collect();
         assert_eq!(names, ["x", "w.l0.ffn.up.packed_blocks_source"]);
 

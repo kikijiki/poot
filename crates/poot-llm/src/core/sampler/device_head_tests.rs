@@ -11,8 +11,7 @@ use std::num::NonZeroUsize;
 use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::ops::sampling::{
-    Adjust, HISTORY_READ_TAG, HISTORY_WRITE_TAG, LogprobRecord, MASK_TAG, MASKED_LOGIT,
-    PENALTY_TAG, SampleSpec, sample_head,
+    Adjust, HISTORY_WRITE_TAG, LogprobRecord, MASKED_LOGIT, SampleSpec, SamplerInput, sample_head,
 };
 use poot_graph_ir::{Builder, Graph, Outputs, Slot, SlotKey, TensorType, ValueId};
 use poot_tensor::{DType, HostTensor};
@@ -131,17 +130,17 @@ impl Head {
                 HostTensor::f32(vec![self.pool_rows, 2, self.vocab], pool.to_vec()),
             );
             put(
-                self.slot(&format!("sampler.{PENALTY_TAG}")),
+                self.slot(&SamplerInput::Penalty.key().to_string()),
                 HostTensor::f32(vec![self.rows, 3], flat(&|r| r.penalty.to_vec())),
             );
             if self.spec.adjust == Adjust::Guided {
                 put(
-                    self.slot(&format!("sampler.{MASK_TAG}")),
+                    self.slot(&SamplerInput::Mask.key().to_string()),
                     HostTensor::f32(vec![self.rows, self.vocab], flat(&|r| r.mask.clone())),
                 );
             }
             put(
-                self.slot(&format!("sampler.{HISTORY_READ_TAG}")),
+                self.slot(&SamplerInput::HistoryRead.key().to_string()),
                 HostTensor::i32(vec![self.rows], rows.iter().map(|r| r.read).collect()),
             );
             put(

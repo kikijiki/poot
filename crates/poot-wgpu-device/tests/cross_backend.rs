@@ -112,7 +112,7 @@ fn split_consts_and_slots(
         let m = g.meta(id);
         match m.storage {
             Storage::Const => {
-                let name = m.name.clone().expect("named const");
+                let name = m.name().expect("named const").into_owned();
                 let t = inputs
                     .get(&id)
                     .unwrap_or_else(|| panic!("missing const input {id:?}"));
@@ -950,7 +950,7 @@ fn sample_token_greedy_cross_backend() {
 /// contract matches the CPU oracle bit for bit (tier 1, ADR-0101).
 #[test]
 fn random_uniform_cross_backend() {
-    use poot_graph_ir::{Slot, SlotKey};
+    use poot_graph_ir::Slot;
 
     let _g = gpu_lock();
     let Some((mut exec, target)) = try_gpu() else {
@@ -958,13 +958,13 @@ fn random_uniform_cross_backend() {
     };
     let (rows, cols) = (3usize, 37usize);
     let b = Builder::for_tests();
-    // `seed` is I32, so it rides as a `Slot` (card 551a's `Slot::Sampler`), not a `Storage::Const`:
+    // `seed` is I32, so it rides as a `Slot` (card 551a's `Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER)`), not a `Storage::Const`:
     // `split_consts_and_slots`'s shared helper hardcodes F32 weight storage for consts (every other
     // cross_backend test is F32-only), so this test builds its own slot bind with the real I32 dtype
     // instead of widening the test helper for this one case.
     let seed = b
         .slot_named(
-            Slot::Sampler,
+            Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER),
             "seed",
             TensorType::new(vec![rows], DType::I32),
         )
@@ -995,7 +995,7 @@ fn random_uniform_cross_backend() {
     let entry = exec.add_entry(exe, &program).unwrap();
     let seed_bytes: Vec<u8> = seed_data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let bind = SlotBind {
-        key: SlotKey::new(Slot::Sampler, Some("seed")),
+        key: poot_graph_ir::ops::sampling::SamplerInput::Seed.key(),
         shape: vec![rows],
         dtype: DType::I32,
         bytes: seed_bytes,
@@ -1016,7 +1016,7 @@ fn random_uniform_cross_backend() {
 
 /// Builds and runs a Gumbel-family `SampleToken` graph through the full contract: `logits`/`noise`/
 /// `params` as F32 consts (`split_consts_and_slots` elsewhere in this file hardcodes F32 for consts,
-/// which is right for these three), `top_k` (when present) as an I32 `Slot::Sampler` bind - the same
+/// which is right for these three), `top_k` (when present) as an I32 `Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER)` bind - the same
 /// dtype problem `random_uniform_cross_backend` documents, handled the same way.
 fn run_gumbel_family_contract(
     exec: &mut dyn Executor,
@@ -1027,11 +1027,9 @@ fn run_gumbel_family_contract(
     params: (ValueId, Vec<usize>, Vec<f32>),
     top_k: Option<(ValueId, Vec<usize>, Vec<i32>)>,
 ) -> Vec<i32> {
-    use poot_graph_ir::Slot;
-
     let mut builder = WeightStore::builder();
     for (id, shape, data) in [&logits, &noise, &params] {
-        let name = g.meta(*id).name.clone().unwrap();
+        let name = g.meta(*id).name().unwrap().into_owned();
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let dense =
             DenseWeight::try_new(DType::F32, shape.clone(), StoredBytes::from(bytes)).unwrap();
@@ -1046,7 +1044,7 @@ fn run_gumbel_family_contract(
     if let Some((_, shape, data)) = &top_k {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         binds.push(SlotBind {
-            key: SlotKey::new(Slot::Sampler, Some("top_k")),
+            key: poot_graph_ir::ops::sampling::SamplerInput::TopK.key(),
             shape: shape.clone(),
             dtype: DType::I32,
             bytes,
@@ -1178,7 +1176,7 @@ fn sample_token_gumbel_topk_cross_backend() {
     let top_k = {
         use poot_graph_ir::Slot;
         b.slot_named(
-            Slot::Sampler,
+            Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER),
             "top_k",
             TensorType::new(vec![rows], DType::I32),
         )
@@ -1287,7 +1285,7 @@ fn sample_token_topp_nucleus_matches_cpu_cross_backend() {
         let top_k = {
             use poot_graph_ir::Slot;
             b.slot_named(
-                Slot::Sampler,
+                Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER),
                 "top_k",
                 TensorType::new(vec![rows], DType::I32),
             )
@@ -1404,7 +1402,7 @@ fn sample_token_gumbel_topk_topp_cross_backend() {
     let top_k = {
         use poot_graph_ir::Slot;
         b.slot_named(
-            Slot::Sampler,
+            Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER),
             "top_k",
             TensorType::new(vec![rows], DType::I32),
         )
@@ -1509,7 +1507,7 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_cross_backend() {
     let top_k = {
         use poot_graph_ir::Slot;
         b.slot_named(
-            Slot::Sampler,
+            Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER),
             "top_k",
             TensorType::new(vec![rows], DType::I32),
         )

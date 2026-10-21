@@ -12,13 +12,13 @@
 //!
 //! `compile` (`poot-graph-plan`) runs this as one of its own passes, between `dce` and `fuse`: it is
 //! the one pass whose rewrite can change a graph's declared input set (an oversized embed table
-//! becomes a host-computed [`Slot::TokenEmbed`] input instead of a device `Gather`), so a caller that
+//! becomes a host-computed `TOKEN_EMBED` input instead of a device `Gather`), so a caller that
 //! binds a graph's inputs before executing it must bind against what `compile` actually produced
 //! (card 523a: a bare call outside `compile` is a second entry point).
 //!
 //! Four rewrites, tried in order, before anything still over the limit is refused:
 //! - [`host_oversized_token_gathers`]: an axis-0 `Gather` of an oversized constant by a `Slot::Token`
-//!   index (the tracers' embedding lookup) becomes a host-computed `Slot::TokenEmbed` row.
+//!   index (the tracers' embedding lookup) becomes a host-computed `TOKEN_EMBED` row.
 //! - [`split_oversized_matmul_weights`]: an oversized 2D weight splits into row chunks that each fit, each chunk
 //!   computed separately and joined by a `Concat` (Card 453 D1's lm_head precedent, generalized to any matmul -
 //!   restoring the "split" capability card 523a's first landing dropped). The weight is read either as the
@@ -40,13 +40,14 @@ use poot_target::DeviceCaps;
 use poot_target::dram_channels::DramChannels;
 
 use poot_graph_ir::graph::{
-    EditError, Eqn, Graph, LayerIndex, Operand, Slot, Storage, ValueId, ValueMeta,
+    EditError, Eqn, Graph, LayerIndex, Operand, Slot, SlotKey, Storage, ValueId, ValueMeta,
 };
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::ops::MASK_HIDDEN;
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{
-    BinOp, ComputedConst, ContractionRows, KeyLayout, MaskOperand, Scalar, StateRole, WeightRef,
+    BinOp, ComputedConst, ContractionRows, KeyLayout, MaskOperand, OwnedSlot, Scalar, StateRole,
+    WeightRef,
 };
 use poot_quant::PackedWeight;
 use poot_tensor::DType;
@@ -57,6 +58,23 @@ use poot_graph_ir::ValueTable;
 
 /// The stage name an expansion refusal reports.
 const STAGE: &str = "legalize";
+
+/// The slot of a hosted embed gather: the current token's already-embedded input row `[hidden]`, computed by the
+/// host per step (a single-row dequant, not a device gather) and named after the weight it reads. Legalization
+/// hosts the gather when the embedding table is over a backend's single-buffer limit (gemma4's `hidden=5376`
+/// gives ~5.6 GB, over wgpu's ~2 GB `max_buffer_size`), so a decode graph need not declare the full
+/// `[vocab, hidden]` table as a device-resident `Const`. Its buffer holds the table's rows in the lane the
+/// readers' storage plan chose.
+pub const TOKEN_EMBED: OwnedSlot = OwnedSlot::new("tokenembed", true, |aval, _| {
+    use poot_graph_ir::types::{DTypeClass, DTypeClassExt};
+    (aval.dtype.class() != DTypeClass::Arithmetic).then_some("a float tensor")
+});
+
+/// The key of the hosted embed gather that reads `weight`: the role, tagged with the weight's name, which is how
+/// the executor finds the table the host gathers the rows from.
+fn token_embed_key(weight: WeightRef) -> SlotKey {
+    SlotKey::new(Slot::Owned(TOKEN_EMBED), Some(&weight.name()))
+}
 
 /// Why [`legalize`] could not fit `g` onto a target's device limits.
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -97,7 +115,7 @@ impl From<poot_graph_ir::EditError> for LegalizeError {
 /// and loads the same graph regardless of backend, and only this pass, given the caller's real
 /// [`DeviceCaps`], decides whether a constant fits as one device buffer. Two rewrites, in order:
 /// [`host_oversized_token_gathers`] (an axis-0 `Gather` of a named constant by a `Slot::Token` index,
-/// over the limit, becomes a host-computed `Slot::TokenEmbed` row block named after the constant it
+/// over the limit, becomes a host-computed `TOKEN_EMBED` row block named after the constant it
 /// replaces - the binder reads that name to gather the row(s) host-side instead of uploading the whole
 /// table, `poot-llm`'s `gather_token_embed_rows`), then [`split_oversized_matmul_weights`] (an
 /// oversized 2D weight read by a `DenseContraction`, or through a transpose into a `MatMul`, splits into row
@@ -173,7 +191,7 @@ fn operand_value(o: Operand) -> Option<ValueId> {
 }
 
 /// Host every axis-0 `Gather(Const, Slot::Token)` whose constant exceeds `limit`: the gather's output
-/// value becomes a `Slot::TokenEmbed` input named after the weight the constant holds (so a binder can
+/// value becomes a `TOKEN_EMBED` input named after the weight the constant holds (so a binder can
 /// still find the weight to gather host-side), the gather equation is dropped, and the constant (and the token slot,
 /// if nothing else reads it) drop out of the graph's input tables. Every other value keeps its
 /// [`ValueId`], so nothing downstream needs rewiring. A constant is hosted only when every reader of it
@@ -254,13 +272,10 @@ fn host_oversized_token_gathers(g: &Graph, limit: u64) -> Result<Graph, EditErro
     for (out, data_id, index_id) in hosted {
         let weight = declared_weight(g, data_id)
             .expect("a hosted gather's table is a declared weight: candidates are filtered on it");
-        values[out] = ValueMeta::new(
-            values[out].aval.clone(),
-            Storage::Slot(Slot::TokenEmbed),
-            Some(weight.name()),
-        );
+        values[out] = ValueMeta::slot_input(values[out].aval.clone(), token_embed_key(weight))
+            .map_err(poot_graph_ir::EditError::from)?;
         new_inputs.push(out);
-        new_slots.push((out, Slot::TokenEmbed));
+        new_slots.push((out, Slot::Owned(TOKEN_EMBED)));
         drop_values.insert(data_id);
         if !referenced(index_id) {
             drop_values.insert(index_id);
@@ -317,7 +332,7 @@ pub(crate) fn refuse_oversized_constants(g: &Graph, limit: u64) -> Result<(), Le
         }
         let bytes = const_bytes(g, id);
         if bytes > limit {
-            let name = g.meta(id).name.clone().unwrap_or_default();
+            let name = g.meta(id).name().unwrap_or_default().into_owned();
             return Err(LegalizeError::OversizedConstant { name, bytes, limit });
         }
     }
@@ -437,7 +452,9 @@ fn splittable_matmul(
     let x = operand_value(eqn.inputs[0])?;
     let read = operand_value(eqn.inputs[1])?;
     let (weight, how) = match eqn.op {
-        OpKind::MatMul => (*transposed.get(&read)?, WeightRead::Transposed),
+        OpKind::MatMul { .. } if eqn.op.is_plain_matmul() => {
+            (*transposed.get(&read)?, WeightRead::Transposed)
+        }
         OpKind::DenseContraction { .. } if g.meta(read).storage == Storage::Const => {
             (read, WeightRead::Dense)
         }
@@ -1248,7 +1265,7 @@ mod tests {
         b.finish(out).unwrap()
     }
 
-    /// SC-002 (host): an embed table over the limit is rewritten to a host-computed `Slot::TokenEmbed`
+    /// SC-002 (host): an embed table over the limit is rewritten to a host-computed `TOKEN_EMBED`
     /// input named after the constant it replaces, and the gather and the oversized constant are gone.
     /// Mutation (recorded, not committed): neutering the eqn scan in `host_oversized_token_gathers` so
     /// it never matches a `Gather` left the 2.18 GB embed `Const` in the graph, which
@@ -1280,8 +1297,8 @@ mod tests {
         );
         let id = legalized.inputs()[0];
         let meta = legalized.meta(id);
-        assert_eq!(meta.storage, Storage::Slot(Slot::TokenEmbed));
-        assert_eq!(meta.name.as_deref(), Some("w.embed"));
+        assert_eq!(meta.storage, Storage::Slot(Slot::Owned(crate::TOKEN_EMBED)));
+        assert_eq!(meta.slot_key().and_then(SlotKey::tag), Some("w.embed"));
         assert_eq!(meta.aval.shape, vec![hidden_of(&g)]);
     }
 
@@ -1380,13 +1397,13 @@ mod tests {
             legalized
                 .consts()
                 .iter()
-                .all(|&id| legalized.meta(id).name.as_deref() != Some("w.head")),
+                .all(|&id| legalized.meta(id).name().as_deref() != Some("w.head")),
             "the unsplit weight is gone"
         );
-        let chunk_names: Vec<&str> = legalized
+        let chunk_names: Vec<_> = legalized
             .consts()
             .iter()
-            .filter_map(|&id| legalized.meta(id).name.as_deref())
+            .filter_map(|&id| legalized.meta(id).name())
             .filter(|n| n.starts_with("w.head.chunk"))
             .collect();
         assert_eq!(
@@ -1452,7 +1469,7 @@ mod tests {
             !legalized
                 .eqns()
                 .iter()
-                .any(|e| matches!(e.op, OpKind::Transpose { .. } | OpKind::MatMul)),
+                .any(|e| matches!(e.op, OpKind::Transpose { .. } | OpKind::MatMul { .. })),
             "the chunks read the stored rows directly"
         );
         assert_eq!(legalized.result(), g.result());
@@ -1490,21 +1507,21 @@ mod tests {
         let g = build(false);
         let legalized = legalize(&g, &caps, &CompileLimits::STANDARD)
             .expect("a transposed oversized weight splits");
-        let chunks: Vec<(&str, Vec<usize>)> = legalized
+        let chunks: Vec<(String, Vec<usize>)> = legalized
             .consts()
             .iter()
             .filter_map(|&id| {
                 let m = legalized.meta(id);
-                Some((m.name.as_deref()?, m.aval.shape.clone()))
+                Some((m.name()?.into_owned(), m.aval.shape.clone()))
             })
             .filter(|(n, _)| n.starts_with("w.head"))
             .collect();
         assert_eq!(
             chunks,
             vec![
-                ("w.head.chunk0", vec![4, 4]),
-                ("w.head.chunk1", vec![4, 4]),
-                ("w.head.chunk2", vec![2, 4]),
+                ("w.head.chunk0".to_string(), vec![4, 4]),
+                ("w.head.chunk1".to_string(), vec![4, 4]),
+                ("w.head.chunk2".to_string(), vec![2, 4]),
             ]
         );
         assert_eq!(legalized.result(), g.result());

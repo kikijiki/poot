@@ -494,7 +494,7 @@ fn matmul_rejects_bf16_weight_on_the_left_at_infer_time() {
     // Card 623 (SC-001): `MatMul` rejects the reverse pairing (BF16 activation x F32 weight,
     // "weight on the left") at `infer` now, so it never reaches the evaluator at all - a trace-time
     // `ShapeError`, not an `ExactBf16` admission rejection.
-    let matmul_err = OpKind::MatMul
+    let matmul_err = OpKind::matmul()
         .infer(&[
             TensorType::new(vec![2, 2], DType::BF16),
             TensorType::f32(vec![2, 2]),

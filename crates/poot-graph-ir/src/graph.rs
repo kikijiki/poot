@@ -1,5 +1,6 @@
 //! The flat SSA graph: a value table + ordered eqns (the open-form jaxpr analog: binders + body, no data).
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
 use std::num::NonZeroU32;
@@ -10,7 +11,7 @@ use crate::error::GraphValidationError;
 use crate::op::OpKind;
 use crate::range::IndexRange;
 use crate::rope_table::{self, RopeSpec, RopeTable};
-use crate::types::{DType, DTypeClass, DTypeClassExt, Operands, Scalar, TensorType};
+use crate::types::{DType, Operands, Scalar, TensorType};
 use crate::weight_ref::WeightRef;
 
 /// An SSA value: an index into [`Graph::values`] (the jaxpr `Var`, an arena index not object identity).
@@ -415,7 +416,11 @@ pub enum Operand {
 /// Runtime inputs. Most variants are graph-architecture.md PerTokenSlots: `Token` and `Pos` are scalars. The
 /// attention mask is not a slot: it is an in-graph computation over `Pos` and an iota.
 /// `Activation` is an explicitly named standalone boundary, not a model-engine slot.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+///
+/// The roles a model tracer declares and an engine binds from the step's inputs are variants here. A role
+/// only a pass or a runtime feature declares is its owner's [`OwnedSlot`], carried as [`Slot::Owned`]: the IR
+/// registers none of them.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Slot {
     /// The current step's token id, a scalar per token row.
     Token,
@@ -444,58 +449,95 @@ pub enum Slot {
     /// [`crate::builder::Builder::slot_named_ranged`] over `[-1, pool_slots)`; several occurrences (a KV pool's
     /// and a recurrent pool's) are told apart by tag.
     WriteMap,
-    /// The current token's already-embedded input row `[hidden]`, host-computed per step (a single-row dequant, not
-    /// a GPU gather). Lets a decode graph skip declaring the full `[vocab,hidden]` embedding table as a GPU-resident
-    /// Const, needed when its dense-f32 size exceeds a backend's max single-buffer size (gemma4's `hidden=5376`
-    /// gives ~5.6 GB, over wgpu's ~2 GB `max_buffer_size` here).
-    TokenEmbed,
-    /// Spec 248 (epic 129 B8): a batched LoRA decode graph's per-row adapter selection `[batch]` (I32, the index
-    /// dtype `IndexedMatMul` reads): row `m`'s value is the
-    /// adapter index (1-based; 0 is the no-adapter row) whose stacked `A`/`B` the LoRA compile pass applies to
-    /// that row this step. A distinct variant from `Slot::SlotMap`: an engine binder resolves one whole `Slot` kind
-    /// from one buffer per bind call. Per-step-varying (requests and adapters change as the batch admits/evicts),
-    /// so a `Slot` rebound every step, never a `Const` (const-cache staleness).
-    LoraIdx,
-    /// Spec 266: an MoE layer's expert-pool assignment table `[E]` (I32, the index dtype `Gather` reads): entry
-    /// `e` is the pool slot currently holding global expert `e`, or `-1` when
-    /// not resident in that layer's pool this step. An in-graph `Gather` translates the router's global expert ids
-    /// into pool-slot ids with this table, so the unmodified `IndexedMatMul` op addresses a smaller
-    /// `[P, ...]` pool weight instead of the full `[E, ...]` stack.
-    ///
-    /// Unlike every other `Slot` kind, one graph contains many of these (one per MoE layer, each with different
-    /// content in the same step). Slot binders resolve a whole kind from one buffer (a `Slot::SlotMap` at two shapes), which would
-    /// stamp the same bytes onto every layer's table. So this kind must be declared through
-    /// [`crate::builder::Builder::slot_named`], giving each occurrence a distinct [`ValueMeta::name`], and its
-    /// binders must resolve per name (as `Const` does), never per kind. Per-step-varying (a refill moves experts
-    /// between slots), so a `Slot`, never a `Const`: the const cache keys by name + element count and would serve a
-    /// stale table.
-    ExpertPoolMap,
-    /// An expert table paged through a pool (POOT-746): one `[P, ..]` slot per pooled routed table
-    /// (a dense `[E, ..]` stack or one packed source role of it), declared by the pool pass in place of
-    /// the table's `Const` and tagged with that const's name. Unlike every other slot it is not written
-    /// from the step's inputs: it is resident for the executable's life and the expert-residency
-    /// manager refills one row at a time at a sync point. Several occurrences exist in one graph, one
-    /// per table, so the key is its tag, never the kind.
-    ExpertPool,
-    /// Card 551a (R-551a-4): the sampler suffix's per-step inputs, declared through
-    /// [`crate::builder::Builder::slot_named`] with one of the three fixed tags `seed`, `params` or
-    /// `top_k` (never the untagged [`crate::builder::Builder::slot`] form - a graph's sampler suffix
-    /// needs up to three distinctly-shaped buffers of this one kind, so each occurrence must carry its
-    /// own name, as [`Slot::ExpertPoolMap`] does for the same reason). `seed` is per-row I32 noise
-    /// state for [`crate::ops::sampling::sample_head`]'s `RandomUniform`; `params` is the per-row
-    /// `[inv_temp, floor_offset, noise_scale]` (+ `top_p` for `GumbelTopKTopP`) F32 table;
-    /// `top_k` is the per-row I32 threshold for the two `TopK` rules. An adjusted head (POOT-1268) adds
-    /// `penalty`, `mask` and `history_read` (see [`crate::ops::sampling`]). Per-step-varying (sampling
-    /// parameters can change every request), so a `Slot`, never a `Const`.
-    Sampler,
+    /// A role its owner defines ([`OwnedSlot`]): a pass or runtime feature that declares the input and the
+    /// binder that fills it, neither of which the tracers see.
+    Owned(OwnedSlot),
+}
+
+impl fmt::Debug for Slot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Slot::Token => f.write_str("Token"),
+            Slot::Activation => f.write_str("Activation"),
+            Slot::Pos => f.write_str("Pos"),
+            Slot::MropePosition => f.write_str("MropePosition"),
+            Slot::SlotMap => f.write_str("SlotMap"),
+            Slot::WriteMap => f.write_str("WriteMap"),
+            Slot::Owned(role) => fmt::Debug::fmt(role, f),
+        }
+    }
+}
+
+/// A slot role defined by the pass or runtime feature that declares its inputs, not by the IR: the owner
+/// states it once as a `const`, names every input of it through [`Slot::Owned`], and is the only code that
+/// builds or reads its keys. What the IR needs of a role is the three facts here: its wire label, whether its
+/// buffer holds a weight's stored bytes, and the one type rule [`SlotKey::admits`] checks every declaration
+/// against.
+///
+/// Two roles are the same role when their labels are; an owner's label is unique to it.
+#[derive(Clone, Copy)]
+pub struct OwnedSlot {
+    label: &'static str,
+    holds_weight_bytes: bool,
+    admits: fn(&TensorType, Option<&str>) -> Option<&'static str>,
+}
+
+impl OwnedSlot {
+    /// A role labelled `label` (its key fragment: lowercase, unique to the owner). `admits` returns what the
+    /// role needs, in words, when `aval` (declared under the occurrence tag, if any) is not a type it admits,
+    /// and `None` when it is. `holds_weight_bytes` says whether its buffer holds a weight's stored bytes in the
+    /// lane its readers' storage plan chose ([`Storage::holds_weight_bytes`]).
+    pub const fn new(
+        label: &'static str,
+        holds_weight_bytes: bool,
+        admits: fn(&TensorType, Option<&str>) -> Option<&'static str>,
+    ) -> Self {
+        OwnedSlot {
+            label,
+            holds_weight_bytes,
+            admits,
+        }
+    }
+
+    /// A role whose inputs are I32 tensors and hold no weight bytes: a per-step index or table.
+    pub const fn i32_tensor(label: &'static str) -> Self {
+        fn admits(aval: &TensorType, _tag: Option<&str>) -> Option<&'static str> {
+            (aval.dtype != DType::I32).then_some("an I32 tensor")
+        }
+        Self::new(label, false, admits)
+    }
+
+    /// The role's key fragment: the one spelling every [`Storage::Slot`] input name is built from.
+    pub const fn label(&self) -> &'static str {
+        self.label
+    }
+}
+
+impl PartialEq for OwnedSlot {
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label
+    }
+}
+
+impl Eq for OwnedSlot {}
+
+impl std::hash::Hash for OwnedSlot {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.label.hash(state);
+    }
+}
+
+impl fmt::Debug for OwnedSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label)
+    }
 }
 
 impl Slot {
     /// This variant's key fragment: the one spelling every [`Storage::Slot`] input name
     /// ([`SlotKey`]) is built from, hand-written per variant rather than taken from `Debug`
-    /// (R466-013). `Slot`'s derived `Debug` happens to agree with this today, but nothing here
-    /// depends on that: a renamed variant changes this match, and only this match, never a bound
-    /// buffer's key silently drifting with whatever the derive emits.
+    /// (R466-013). A renamed variant changes this match, and only this match, never a bound
+    /// buffer's key silently drifting with whatever a derive emits.
     pub(crate) const fn key_label(&self) -> &'static str {
         match self {
             Slot::Token => "token",
@@ -504,11 +546,7 @@ impl Slot {
             Slot::MropePosition => "mropeposition",
             Slot::SlotMap => "slotmap",
             Slot::WriteMap => "writemap",
-            Slot::TokenEmbed => "tokenembed",
-            Slot::LoraIdx => "loraidx",
-            Slot::ExpertPoolMap => "expertpoolmap",
-            Slot::ExpertPool => "expertpool",
-            Slot::Sampler => "sampler",
+            Slot::Owned(role) => role.label,
         }
     }
 }
@@ -534,15 +572,16 @@ pub enum Storage {
 
 impl Storage {
     /// Whether the buffer holds a weight's stored bytes in the lane its readers' storage plan chose: a
-    /// `Const` uploaded once, the resident [`Slot::ExpertPool`] a host refills row by row from the
-    /// same stored bytes, or the [`Slot::TokenEmbed`] rows a host gathers from an embedding table too
-    /// large for one device buffer and encodes in the storage the plan chose. Lane decisions made for a
-    /// weight (a packed BF16 table, a packed contraction source) apply to all three.
+    /// `Const` uploaded once, or a slot of a role that says so ([`OwnedSlot::new`]): a resident expert pool a
+    /// host refills row by row from the same stored bytes, or the rows a host gathers from an embedding table
+    /// too large for one device buffer and encodes in the storage the plan chose. Lane decisions made for a
+    /// weight (a packed BF16 table, a packed contraction source) apply to all of them.
     pub fn holds_weight_bytes(self) -> bool {
-        matches!(
-            self,
-            Storage::Const | Storage::Slot(Slot::ExpertPool | Slot::TokenEmbed)
-        )
+        match self {
+            Storage::Const => true,
+            Storage::Slot(Slot::Owned(role)) => role.holds_weight_bytes,
+            _ => false,
+        }
     }
 }
 
@@ -792,34 +831,50 @@ pub struct StatePair {
     pub role: StateRole,
 }
 
-/// What a graph records about one SSA value: its abstract type, how it is stored, and the optional
-/// name and construction-time facts (slot key, state role, declared range) binders and passes read.
+/// What identifies a value to the code that binds or finds it: one typed fact, so no name ever sits beside the
+/// key or weight reference it would be derived from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Identity {
+    /// Nothing: an intermediate, or a constant the compiler computes.
+    Anonymous,
+    /// A name the declarer chose: the lookup key of a constant that is no mapped weight, a carried state
+    /// buffer's key, a label.
+    Named(String),
+    /// A mapped weight, or one source component or row chunk of it. Its spelling ([`WeightRef::name`]) is
+    /// derived from the reference, never stored beside it.
+    Weight(WeightRef),
+    /// A slot input. Its wire spelling ([`SlotKey`]'s `Display`) is derived from the key.
+    Slot(SlotKey),
+}
+
+/// Why [`ValueMeta::rename`] refused.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a {kind} value has a typed identity; only a named or anonymous value is renamed")]
+pub struct RenameError {
+    /// What the value's identity is.
+    pub kind: &'static str,
+}
+
+/// What a graph records about one SSA value: its abstract type, how it is stored, and the
+/// construction-time facts (identity, state role, declared range) binders and passes read.
 #[derive(Clone, Debug)]
 pub struct ValueMeta {
     /// The value's shape and dtype, computed host-side at construction.
     pub aval: TensorType,
     /// How the value is stored.
     pub storage: Storage,
-    /// The value's name: the lookup key of a `Const`, the wire spelling of a `Slot`, a label otherwise.
-    pub name: Option<String>,
-    /// The structured identity of a [`Storage::Slot`] input, set once at construction
-    /// ([`crate::builder::Builder::slot`], `slot_named`, `exact_i32_slot`) and never rebuilt from
-    /// `name` (R466-013): `name` is the wire spelling existing binders read, `key` is the typed
-    /// fact those binders will move to (Cards 550/564). `None` for every other storage (their
-    /// identity is `name` itself, Keep-list section 1) and for a `Slot` value a caller assembled
-    /// directly instead of through `Builder` (a malformed-graph test fixture).
-    pub(crate) key: Option<SlotKey>,
+    /// Who the value is, set once at construction: the weight a [`Storage::Const`] input holds
+    /// ([`crate::builder::Builder::weight`], [`ValueMeta::weight_const`]), the key of a [`Storage::Slot`] input
+    /// ([`crate::builder::Builder::slot`], `slot_named`, `exact_i32_slot`), or a name. Every spelling is
+    /// derived from it ([`ValueMeta::name`]); a `Slot` value a caller assembled directly instead of through
+    /// `Builder` (a malformed-graph test fixture) has only a name.
+    identity: Identity,
     /// A [`Storage::State`] input's declared [`StateRole`], set once at construction
     /// ([`ValueMeta::new_state`], [`crate::builder::Builder::state_input`]) and read by
     /// [`Graph::state_pairs`]/[`Graph::state_role`]. `None` for every other storage;
     /// [`Graph::validate`] checks both directions (a `State` value with no role, and any other value
     /// with one).
     pub(crate) state_role: Option<StateRole>,
-    /// The mapped weight a [`Storage::Const`] input holds, set once at construction
-    /// ([`crate::builder::Builder::weight`], [`ValueMeta::weight_const`]). The packed-weight binder
-    /// and legalize read this, never `name`, to find the weight a constant is. `None` for a constant
-    /// that is no mapped weight and for every other storage.
-    pub(crate) weight: Option<WeightRef>,
     /// The range a [`Storage::Slot`] or [`Storage::Const`] input declares for its I32 words, set once
     /// at construction ([`crate::builder::Builder::slot_ranged`],
     /// [`crate::builder::Builder::constant_ranged`]) and checked by the binder against the bound
@@ -828,40 +883,67 @@ pub struct ValueMeta {
 }
 
 impl ValueMeta {
+    /// This value declaring `range` for its I32 words.
+    pub(crate) fn with_range(mut self, range: Option<IndexRange>) -> Self {
+        self.range = range;
+        self
+    }
+
+    /// This value as a carried state buffer of `role`.
+    pub(crate) fn with_state_role(mut self, role: StateRole) -> Self {
+        self.state_role = Some(role);
+        self
+    }
+
+    /// A value with `identity`, no state role and no declared range.
+    pub(crate) fn with_identity(aval: TensorType, storage: Storage, identity: Identity) -> Self {
+        ValueMeta {
+            aval,
+            storage,
+            identity,
+            state_role: None,
+            range: None,
+        }
+    }
+
     /// A `ValueMeta` with no structured slot key and no state role: every storage but a
-    /// `Builder`-constructed `Slot` or `State`. `key` and `state_role` are private fields so a
-    /// literal cannot set them from outside this crate; test fixtures across the workspace that
-    /// build a `Graph` by hand (bypassing `Builder`) call this instead of a struct literal.
+    /// `Builder`-constructed `Slot` or `State`. Test fixtures across the workspace that build a `Graph` by
+    /// hand (bypassing `Builder`) call this instead of a struct literal.
     pub fn new(aval: TensorType, storage: Storage, name: Option<String>) -> Self {
         debug_assert!(
             storage != Storage::State,
             "ValueMeta::new: a Storage::State value must carry a StateRole - use ValueMeta::new_state"
         );
-        ValueMeta {
+        Self::with_identity(
             aval,
             storage,
-            name,
-            key: None,
-            state_role: None,
-            weight: None,
-            range: None,
-        }
+            name.map_or(Identity::Anonymous, Identity::Named),
+        )
     }
 
     /// The input binder a consuming stage declares for the exported value `id`: a keyed
     /// [`Slot::Activation`] ([`BoundaryId::slot_key`]), named by that key's wire spelling like every
     /// other keyed slot.
     pub fn boundary_input(aval: TensorType, id: BoundaryId) -> Self {
-        let key = id.slot_key();
-        ValueMeta {
+        Self::with_identity(
             aval,
-            storage: Storage::Slot(Slot::Activation),
-            name: Some(key.to_string()),
-            key: Some(key),
-            state_role: None,
-            weight: None,
-            range: None,
-        }
+            Storage::Slot(Slot::Activation),
+            Identity::Slot(id.slot_key()),
+        )
+    }
+
+    /// A slot input keyed `key` and declared at `aval`: for a pass that turns a computed value into an input.
+    ///
+    /// # Errors
+    ///
+    /// [`SlotTypeError`] when `aval` is not a type the key's role admits.
+    pub fn slot_input(aval: TensorType, key: SlotKey) -> Result<Self, SlotTypeError> {
+        key.admits(&aval)?;
+        Ok(Self::with_identity(
+            aval,
+            Storage::Slot(key.role()),
+            Identity::Slot(key),
+        ))
     }
 
     /// A `Storage::State` input's `ValueMeta`, carrying its declared `role`. The only constructor
@@ -869,43 +951,93 @@ impl ValueMeta {
     /// value built any other way (it would carry no role).
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_state(aval: TensorType, name: Option<String>, role: StateRole) -> Self {
-        ValueMeta {
+        Self::with_identity(
             aval,
-            storage: Storage::State,
-            name,
-            key: None,
-            state_role: Some(role),
-            weight: None,
-            range: None,
-        }
+            Storage::State,
+            name.map_or(Identity::Anonymous, Identity::Named),
+        )
+        .with_state_role(role)
     }
 
     /// This constant as the part `weight` of a mapped weight: its name is the reference's spelling
     /// ([`WeightRef::name`]). The constructor of every carrier and chunk constant a pass stages.
     #[must_use]
     pub fn weight_const(aval: TensorType, weight: WeightRef) -> Self {
-        ValueMeta {
-            aval,
-            storage: Storage::Const,
-            name: Some(weight.name()),
-            key: None,
-            state_role: None,
-            weight: Some(weight),
-            range: None,
-        }
+        Self::with_identity(aval, Storage::Const, Identity::Weight(weight))
     }
 
     /// A weight constant a pass rewrote into the computation of its value (the decode of its packed
     /// owner): no longer an input, so it keeps no name and no weight reference.
     pub fn decode_in_place(&mut self) {
         self.storage = Storage::Device;
-        self.name = None;
-        self.weight = None;
+        self.identity = Identity::Anonymous;
+    }
+
+    /// The value's name: the lookup key of a constant (a mapped weight spells [`WeightRef::name`]), a carried
+    /// state buffer's key, the wire spelling of a slot, a label otherwise. Derived from the identity, so it can
+    /// never disagree with the weight reference or slot key it spells.
+    pub fn name(&self) -> Option<Cow<'_, str>> {
+        match &self.identity {
+            Identity::Anonymous => None,
+            Identity::Named(name) => Some(Cow::Borrowed(name)),
+            Identity::Weight(weight) => Some(Cow::Owned(weight.name())),
+            Identity::Slot(key) => Some(Cow::Owned(key.to_string())),
+        }
+    }
+
+    /// Name this value `name`: for a value whose identity is a name or none (a constant that is no mapped
+    /// weight, a carried state buffer).
+    ///
+    /// # Errors
+    ///
+    /// [`RenameError`] for a mapped weight or a keyed slot, whose spelling follows from what it is.
+    pub fn rename(&mut self, name: impl Into<String>) -> Result<(), RenameError> {
+        match self.identity {
+            Identity::Anonymous | Identity::Named(_) => {
+                self.identity = Identity::Named(name.into());
+                Ok(())
+            }
+            Identity::Weight(_) => Err(RenameError { kind: "weight" }),
+            Identity::Slot(_) => Err(RenameError { kind: "slot" }),
+        }
+    }
+
+    /// Forget this value's name, for a fixture that shows a consumer does not depend on one.
+    ///
+    /// # Errors
+    ///
+    /// [`RenameError`] for a mapped weight or a keyed slot, whose identity is not a name.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn clear_name(&mut self) -> Result<(), RenameError> {
+        match self.identity {
+            Identity::Anonymous | Identity::Named(_) => {
+                self.identity = Identity::Anonymous;
+                Ok(())
+            }
+            Identity::Weight(_) => Err(RenameError { kind: "weight" }),
+            Identity::Slot(_) => Err(RenameError { kind: "slot" }),
+        }
+    }
+
+    /// Replace this value's identity with the plain name `name`: for a fixture that must give an oracle a spelling
+    /// a typed identity has none for (the oracle of a split packed carrier reads its role and stack off a name).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn spell_as(&mut self, name: impl Into<String>) {
+        self.identity = Identity::Named(name.into());
+    }
+
+    /// Make this constant the mapped weight `weight`, so its spelling is the reference's.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn bind_weight(&mut self, weight: WeightRef) {
+        self.identity = Identity::Weight(weight);
     }
 
     /// The mapped weight this constant holds, if it is one.
     pub fn weight(&self) -> Option<WeightRef> {
-        self.weight
+        match self.identity {
+            Identity::Weight(weight) => Some(weight),
+            _ => None,
+        }
     }
 
     /// The range this input declares for its I32 words, if any. The binders check it at bind;
@@ -918,7 +1050,10 @@ impl ValueMeta {
     /// (Card 546a, Z9): the executor binder's primary key. `None` for every other storage and for a
     /// `Slot` value a caller assembled directly instead of through `Builder` (see the field doc).
     pub fn slot_key(&self) -> Option<&SlotKey> {
-        self.key.as_ref()
+        match &self.identity {
+            Identity::Slot(key) => Some(key),
+            _ => None,
+        }
     }
 }
 
@@ -953,18 +1088,19 @@ impl SlotKey {
         self.role
     }
 
+    /// The occurrence tag of a [`crate::builder::Builder::slot_named`] input, if it has one.
+    pub fn tag(&self) -> Option<&str> {
+        self.tag.as_deref()
+    }
+
     /// Whether an input of this key may be declared at `aval`: the one rule the builder declares a slot by
     /// and [`Graph::validate`] checks it against. A role names the dtype its binder fills (and, for the
     /// position tuple, its leading axis), so a graph that declares another cannot be bound.
     pub fn admits(&self, aval: &TensorType) -> Result<(), SlotTypeError> {
-        let tag = self.tag.as_deref();
         let expected: Option<&'static str> = match self.role {
-            Slot::Token
-            | Slot::Pos
-            | Slot::SlotMap
-            | Slot::WriteMap
-            | Slot::LoraIdx
-            | Slot::ExpertPoolMap => (aval.dtype != DType::I32).then_some("an I32 tensor"),
+            Slot::Token | Slot::Pos | Slot::SlotMap | Slot::WriteMap => {
+                (aval.dtype != DType::I32).then_some("an I32 tensor")
+            }
             Slot::MropePosition => {
                 (aval.dtype != DType::I32 || aval.shape.len() != 2 || aval.shape[0] != 3)
                     .then_some("an I32 tensor of shape [3, N]")
@@ -972,20 +1108,7 @@ impl SlotKey {
             // A standalone boundary: it carries whatever an earlier stage exported (a float activation, an
             // I32 selector, the I8 carriers of a packed weight).
             Slot::Activation => None,
-            Slot::TokenEmbed => {
-                (aval.dtype.class() != DTypeClass::Arithmetic).then_some("a float tensor")
-            }
-            Slot::ExpertPool => aval.shape.is_empty().then_some("a tensor with a pool axis"),
-            Slot::Sampler => match tag.map(sampler_dtype) {
-                Some(Some(dtype)) => (aval.dtype != dtype).then(|| {
-                    if dtype == DType::I32 {
-                        "an I32 tensor"
-                    } else {
-                        "an F32 tensor"
-                    }
-                }),
-                _ => Some("one of the sampler inputs by tag"),
-            },
+            Slot::Owned(role) => (role.admits)(aval, self.tag.as_deref()),
         };
         match expected {
             None => Ok(()),
@@ -996,17 +1119,6 @@ impl SlotKey {
                 actual: aval.clone(),
             }),
         }
-    }
-}
-
-/// The dtype of the sampler input `tag` names: the fixed set a sampler suffix declares
-/// ([`crate::ops::sampling`]).
-fn sampler_dtype(tag: &str) -> Option<DType> {
-    use crate::ops::sampling::{HISTORY_READ_TAG, MASK_TAG, PENALTY_TAG};
-    match tag {
-        "seed" | "top_k" | HISTORY_READ_TAG => Some(DType::I32),
-        "params" | PENALTY_TAG | MASK_TAG => Some(DType::F32),
-        _ => None,
     }
 }
 
@@ -1149,11 +1261,10 @@ pub enum EditError {
         /// The `State` input that lost its pair.
         input: ValueId,
     },
-    /// [`GraphEdit::rebind_const_as_pool`] was asked to pool a value that is not a named `Const` input with a
-    /// leading axis.
-    #[error("value {value} cannot be pooled: {reason}")]
-    NotPoolable {
-        /// The value that was asked to be a pool.
+    /// [`GraphEdit::rebind_const_as_slot`] was asked to rebind a value that is not a named `Const` input.
+    #[error("value {value} cannot be rebound as a slot: {reason}")]
+    NotRebindable {
+        /// The value that was asked to become a slot.
         value: ValueId,
         /// What it lacks.
         reason: &'static str,
@@ -1389,10 +1500,10 @@ impl Graph {
     pub(crate) fn input_key(&self, id: ValueId) -> Option<InputKey> {
         let meta = self.meta(id);
         match meta.storage {
-            Storage::Const => meta.name.clone().map(InputKey::Const),
+            Storage::Const => meta.name().map(|name| InputKey::Const(name.into_owned())),
             Storage::Computed(_) => None,
-            Storage::State => meta.name.clone().map(InputKey::State),
-            Storage::Slot(_) => meta.key.clone().map(InputKey::Slot),
+            Storage::State => meta.name().map(|name| InputKey::State(name.into_owned())),
+            Storage::Slot(_) => meta.slot_key().cloned().map(InputKey::Slot),
             Storage::Device => None,
         }
     }
@@ -1680,48 +1791,42 @@ impl GraphEdit {
             .retain(|output| !matches!(output.kind, OutputKind::Export(_)));
     }
 
-    /// Turn the named `Const` input `value` into the resident [`Slot::ExpertPool`] of a pool of `rows`
-    /// rows: the leading axis shrinks to `rows`, the value keeps its id and dtype, and its identity is
-    /// the key tagged with the const's own name, which is returned. The const's name is therefore
-    /// still how the table is found in the weight map; only its role in the graph changes.
+    /// Turn the named `Const` input `value` into a slot of `role` declared at `aval`: the value keeps its id and
+    /// its identity is the key tagged with the const's own name, which is returned. The const's name is
+    /// therefore still how the table is found in the weight map; only its role in the graph changes. For a
+    /// pass that replaces a weight by a resident buffer a host fills from it (the expert pool).
     ///
     /// # Errors
     ///
-    /// [`EditError::NotPoolable`] when `value` is not a named `Const` input with a leading axis.
-    pub fn rebind_const_as_pool(
+    /// [`EditError::NotRebindable`] when `value` is not a named `Const` input, and [`EditError::SlotType`] when
+    /// `aval` is not a type `role` admits.
+    pub fn rebind_const_as_slot(
         &mut self,
         value: ValueId,
-        rows: usize,
+        role: Slot,
+        aval: TensorType,
     ) -> Result<SlotKey, EditError> {
-        let not_poolable = |reason| EditError::NotPoolable { value, reason };
+        let not_rebindable = |reason| EditError::NotRebindable { value, reason };
         let meta = self
             .draft
             .values
             .get_mut(value)
-            .ok_or_else(|| not_poolable("it is not a value of the graph"))?;
+            .ok_or_else(|| not_rebindable("it is not a value of the graph"))?;
         if meta.storage != Storage::Const {
-            return Err(not_poolable("it is not a const"));
+            return Err(not_rebindable("it is not a const"));
         }
         let tag = meta
-            .name
-            .clone()
-            .ok_or_else(|| not_poolable("a const input carries its name"))?;
-        let mut pooled = meta.aval.clone();
-        let leading = pooled
-            .shape
-            .first_mut()
-            .ok_or_else(|| not_poolable("a pooled table has a leading expert axis"))?;
-        *leading = rows;
-        let key = SlotKey::new(Slot::ExpertPool, Some(&tag));
-        key.admits(&pooled)?;
-        meta.aval = pooled;
-        meta.storage = Storage::Slot(Slot::ExpertPool);
-        meta.name = Some(key.to_string());
-        meta.key = Some(key.clone());
-        // The pool is a slot the executor fills by the key's tag, no longer the weight constant.
-        meta.weight = None;
+            .name()
+            .ok_or_else(|| not_rebindable("a const input carries its name"))?
+            .into_owned();
+        let key = SlotKey::new(role, Some(&tag));
+        key.admits(&aval)?;
+        meta.aval = aval;
+        meta.storage = Storage::Slot(role);
+        // The slot is filled by the key's tag, no longer the weight constant.
+        meta.identity = Identity::Slot(key.clone());
         self.draft.consts.retain(|&c| c != value);
-        self.draft.slots.push((value, Slot::ExpertPool));
+        self.draft.slots.push((value, role));
         Ok(key)
     }
 
@@ -1746,22 +1851,18 @@ impl GraphEdit {
             .draft
             .values
             .iter()
-            .any(|v| v.storage == Storage::Slot(slot) && v.name.as_deref() == Some(&name))
+            .any(|v| v.storage == Storage::Slot(slot) && v.name().as_deref() == Some(name.as_str()))
         {
             return Err(EditError::DuplicateSlotTag {
                 slot,
                 tag: tag.to_string(),
             });
         }
-        let id = self.draft.values.push(ValueMeta {
+        let id = self.draft.values.push(ValueMeta::with_identity(
             aval,
-            storage: Storage::Slot(slot),
-            name: Some(name),
-            key: Some(key),
-            state_role: None,
-            weight: None,
-            range: None,
-        });
+            Storage::Slot(slot),
+            Identity::Slot(key),
+        ));
         self.draft.inputs.push(id);
         self.draft.slots.push((id, slot));
         Ok(id)
@@ -2050,6 +2151,9 @@ impl Graph {
                     key.admits(&meta.aval)
                         .map_err(|source| GraphValidationError::SlotType { value: id, source })?;
                 }
+                (Storage::Slot(slot), None) => {
+                    return Err(GraphValidationError::SlotWithoutKey { value: id, slot });
+                }
                 _ => {}
             }
         }
@@ -2108,7 +2212,7 @@ impl Graph {
         // Only a constant is a mapped weight: a reference on any other value would name a weight the
         // value does not hold.
         for (id, meta) in self.values.iter_enumerated() {
-            if meta.weight.is_some() && meta.storage != Storage::Const {
+            if meta.weight().is_some() && meta.storage != Storage::Const {
                 return Err(GraphValidationError::UnexpectedWeightRef {
                     value: id,
                     storage: meta.storage,
@@ -2222,8 +2326,7 @@ impl Graph {
                     source,
                 })?;
             let stored = &self.values[eqn.out].aval;
-            if inferred != *stored && !is_matmul_f32_accumulate_widening(&eqn.op, &inferred, stored)
-            {
+            if inferred != *stored {
                 return Err(GraphValidationError::EquationOutputTypeMismatch {
                     equation: i,
                     operation: eqn.op.name(),
@@ -2335,29 +2438,6 @@ impl ValidationPacketLayout {
     }
 }
 
-/// Whether a `MatMul` eqn's stored output aval is a legitimate F32-accumulate widening of its
-/// `infer`red (narrower-operand) type, rather than a type error.
-///
-/// `OpKind::MatMul::infer` reports the dtype of operand A, so a plain matmul type-checks normally. But backends
-/// dispatch mixed-precision matmuls where both operands are narrowed (F16 or BF16) while the eqn's output aval
-/// stays F32: tensor-core/cooperative-matrix units accumulate in f32 regardless of operand width (see
-/// `DType::BF16`/`DType::F16`). Producers: a mixed-bf16 matmul cast insertion (AMD WMMA, spec 130 FR-004:
-/// both operands cast to bf16, output f32) and the SPIR-V cooperative-matrix arm's test fixtures (card 154: F16
-/// operands, F32 output; RADV coopmat config 13 has no f16-accumulate mode). Rejecting this shape would make
-/// `run_resident` unusable for either backend's mixed-precision matmul.
-///
-/// Only MatMul gets this exception: every other op's `infer` must match the stored aval exactly.
-fn is_matmul_f32_accumulate_widening(
-    op: &OpKind,
-    inferred: &TensorType,
-    stored: &TensorType,
-) -> bool {
-    matches!(op, OpKind::MatMul)
-        && inferred.shape == stored.shape
-        && stored.dtype == DType::F32
-        && matches!(inferred.dtype, DType::F16 | DType::BF16)
-}
-
 impl fmt::Display for Graph {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "graph {{")?;
@@ -2389,7 +2469,7 @@ impl fmt::Display for Graph {
                     Operand::Lit(s) => write!(f, "{s}")?,
                 }
             }
-            match &outm.name {
+            match outm.name() {
                 Some(name) => writeln!(f, ")   // {name}")?,
                 None => writeln!(f, ")")?,
             }
@@ -2430,16 +2510,24 @@ impl fmt::Display for Graph {
 
 #[cfg(test)]
 mod tests {
+    use super::{Identity, RenameError};
     use crate::builder::Builder;
     use crate::op::{BinOp, OpKind};
     use crate::types::{Scalar, TensorType};
     use crate::{BuilderError, ComputedConst, LayerIndex, LayerOrderError, SlotKey};
     use crate::{
-        EditError, GraphEdit, GraphValidationError, Operand, Slot, StateRole, Storage,
+        EditError, GraphEdit, GraphValidationError, Operand, OwnedSlot, Slot, StateRole, Storage,
         ValidationId, ValidationPacketError, ValidationPacketLayout, ValueId, ValueMeta,
     };
     use poot_tensor::DType;
     use std::num::NonZeroU32;
+
+    /// Roles an owner defines, as the pool and adapter passes do: the IR registers none of them.
+    const POOL_MAP: OwnedSlot = OwnedSlot::i32_tensor("poolmap");
+    const ADAPTER: OwnedSlot = OwnedSlot::i32_tensor("adapter");
+    const POOL: OwnedSlot = OwnedSlot::new("pool", true, |aval, _| {
+        aval.shape.is_empty().then_some("a tensor with a pool axis")
+    });
 
     /// The typed validity error a draft's commit refuses with.
     fn commit_invalid(draft: GraphEdit) -> GraphValidationError {
@@ -2485,14 +2573,14 @@ mod tests {
         let weight = b.constant("weight", TensorType::f32(vec![1])).unwrap();
         let first_pool = b
             .slot_named(
-                Slot::ExpertPoolMap,
+                Slot::Owned(POOL_MAP),
                 "layer_0",
                 TensorType::new(vec![1], DType::I32),
             )
             .unwrap();
         let _second_pool = b
             .slot_named(
-                Slot::ExpertPoolMap,
+                Slot::Owned(POOL_MAP),
                 "layer_1",
                 TensorType::new(vec![1], DType::I32),
             )
@@ -2632,15 +2720,11 @@ mod tests {
         ));
 
         let undefined = ValueId::from_index(graph.values().len()).unwrap();
-        graph.values_mut().push(ValueMeta {
-            aval: TensorType::f32([1]),
-            storage: Storage::Device,
-            name: None,
-            key: None,
-            state_role: None,
-            weight: None,
-            range: None,
-        });
+        graph.values_mut().push(ValueMeta::with_identity(
+            TensorType::f32([1]),
+            Storage::Device,
+            Identity::Anonymous,
+        ));
         graph.remap_results(|value| {
             if value == ValueId::new(u32::MAX) {
                 undefined
@@ -2797,14 +2881,14 @@ mod tests {
             graph
                 .slots()
                 .iter()
-                .filter(|(_, slot)| *slot == Slot::ExpertPoolMap)
+                .filter(|(_, slot)| *slot == Slot::Owned(POOL_MAP))
                 .count(),
             2,
             "fixture must exercise two separately named slots of one kind"
         );
         assert_ne!(
-            graph.meta(graph.slots()[0].0).name,
-            graph.meta(graph.slots()[1].0).name,
+            graph.meta(graph.slots()[0].0).name(),
+            graph.meta(graph.slots()[1].0).name(),
             "the same-kind slots must remain distinguishable by name"
         );
         crate::test_support::verdict(&graph)
@@ -2885,7 +2969,7 @@ mod tests {
                 Corruption::SlotIdOutOfRange => {
                     graph
                         .slots_mut()
-                        .push((ValueId::new(u32::MAX), Slot::ExpertPoolMap));
+                        .push((ValueId::new(u32::MAX), Slot::Owned(POOL_MAP)));
                     GraphValidationError::SlotOutOfRange {
                         value: ValueId::new(u32::MAX),
                         value_count: graph.values().len(),
@@ -2902,7 +2986,7 @@ mod tests {
                 Corruption::DuplicateSlot => {
                     graph
                         .slots_mut()
-                        .push((ids.first_pool, Slot::ExpertPoolMap));
+                        .push((ids.first_pool, Slot::Owned(POOL_MAP)));
                     GraphValidationError::DuplicateSlot {
                         value: ids.first_pool,
                     }
@@ -2921,14 +3005,14 @@ mod tests {
                     graph.consts_mut().push(ids.first_pool);
                     GraphValidationError::ConstStorageMismatch {
                         value: ids.first_pool,
-                        storage: Storage::Slot(Slot::ExpertPoolMap),
+                        storage: Storage::Slot(Slot::Owned(POOL_MAP)),
                     }
                 }
                 Corruption::SlotStorageMismatch => {
-                    graph.slots_mut().push((ids.weight, Slot::ExpertPoolMap));
+                    graph.slots_mut().push((ids.weight, Slot::Owned(POOL_MAP)));
                     GraphValidationError::SlotStorageMismatch {
                         value: ids.weight,
-                        table_slot: Slot::ExpertPoolMap,
+                        table_slot: Slot::Owned(POOL_MAP),
                         storage: Storage::Const,
                     }
                 }
@@ -2942,7 +3026,7 @@ mod tests {
                     GraphValidationError::SlotStorageMismatch {
                         value: ids.first_pool,
                         table_slot: Slot::Token,
-                        storage: Storage::Slot(Slot::ExpertPoolMap),
+                        storage: Storage::Slot(Slot::Owned(POOL_MAP)),
                     }
                 }
                 Corruption::MissingConstBinding => {
@@ -2963,7 +3047,7 @@ mod tests {
                     graph.slots_mut().retain(|&(id, _)| id != ids.first_pool);
                     GraphValidationError::MissingSlotBinding {
                         value: ids.first_pool,
-                        slot: Slot::ExpertPoolMap,
+                        slot: Slot::Owned(POOL_MAP),
                     }
                 }
                 Corruption::DeviceInput => {
@@ -3027,15 +3111,11 @@ mod tests {
             graph.eqns_mut()[0].inputs[0] = Operand::Value(ValueId::new(u32::MAX));
             // An in-range, correctly typed value with neither an input binder nor a producer.
             let undefined = ValueId::from_index(graph.values().len()).unwrap();
-            graph.values_mut().push(ValueMeta {
-                aval: TensorType::f32([1]),
-                storage: Storage::Device,
-                name: None,
-                key: None,
-                state_role: None,
-                weight: None,
-                range: None,
-            });
+            graph.values_mut().push(ValueMeta::with_identity(
+                TensorType::f32([1]),
+                Storage::Device,
+                Identity::Anonymous,
+            ));
             let expected = match corruption {
                 ResultCorruption::DuplicateStateDestination => {
                     let first = graph.state().next().unwrap();
@@ -3123,14 +3203,38 @@ mod tests {
             .unwrap();
         let out = b.unary(crate::op::UnOp::Neg, w).unwrap();
         let mut graph = b.finish(out).unwrap().into_draft();
-        graph.values_mut()[out.id()].weight =
-            Some(crate::WeightRef::whole(WeightId::model(WeightRole::Embed)));
+        graph.values_mut()[out.id()]
+            .bind_weight(crate::WeightRef::whole(WeightId::model(WeightRole::Embed)));
 
         assert_eq!(
             crate::test_support::verdict(&graph),
             Err(GraphValidationError::UnexpectedWeightRef {
                 value: out.id(),
                 storage: Storage::Device,
+            })
+        );
+    }
+
+    /// A slot input is identified by its key: a `Slot` value whose identity was reduced to a bare name has no role
+    /// for a binder to fill, and `validate` refuses it.
+    ///
+    /// Mutation: delete the `(Storage::Slot(slot), None)` arm of the identity check in `Graph::check`; it validates.
+    #[test]
+    fn validate_rejects_a_slot_input_that_has_only_a_name() {
+        let b = Builder::for_tests();
+        let token = b
+            .slot(Slot::Token, TensorType::new(vec![4], DType::I32))
+            .unwrap();
+        let out = b.cast(token, DType::F32).unwrap();
+        let mut graph = b.finish(out).unwrap().into_draft();
+        assert_eq!(crate::test_support::verdict(&graph), Ok(()));
+        graph.values_mut()[token.id()].spell_as("token");
+
+        assert_eq!(
+            crate::test_support::verdict(&graph),
+            Err(GraphValidationError::SlotWithoutKey {
+                value: token.id(),
+                slot: Slot::Token,
             })
         );
     }
@@ -3192,15 +3296,20 @@ mod tests {
                 i32s(&[8]),
                 TensorType::f32(vec![8]),
             ),
-            (Slot::LoraIdx, None, i32s(&[2]), TensorType::f32(vec![2])),
             (
-                Slot::Sampler,
+                Slot::Owned(ADAPTER),
+                None,
+                i32s(&[2]),
+                TensorType::f32(vec![2]),
+            ),
+            (
+                Slot::Owned(crate::ops::sampling::SAMPLER),
                 Some("seed"),
                 i32s(&[2]),
                 TensorType::f32(vec![2]),
             ),
             (
-                Slot::Sampler,
+                Slot::Owned(crate::ops::sampling::SAMPLER),
                 Some("params"),
                 TensorType::f32(vec![2, 3]),
                 i32s(&[2, 3]),
@@ -3243,9 +3352,9 @@ mod tests {
     /// Mutation: make the unknown-tag arm of `SlotKey::admits` accept (`None`); the unknown-tag rows go red.
     #[test]
     fn an_unknown_sampler_tag_is_refused_apart_from_a_wrong_dtype() {
-        let unknown = SlotKey::new(Slot::Sampler, Some("bogus"));
-        let wrong_dtype = SlotKey::new(Slot::Sampler, Some("seed"));
-        let untagged = SlotKey::new(Slot::Sampler, None);
+        let unknown = SlotKey::new(Slot::Owned(crate::ops::sampling::SAMPLER), Some("bogus"));
+        let wrong_dtype = SlotKey::new(Slot::Owned(crate::ops::sampling::SAMPLER), Some("seed"));
+        let untagged = SlotKey::new(Slot::Owned(crate::ops::sampling::SAMPLER), None);
         for aval in [
             TensorType::f32(vec![2]),
             TensorType::new(vec![2], DType::I32),
@@ -3271,7 +3380,7 @@ mod tests {
         );
         let b = Builder::for_tests();
         assert!(matches!(
-            b.slot_named(Slot::Sampler, "bogus", TensorType::f32(vec![2])),
+            b.slot_named(Slot::Owned(crate::ops::sampling::SAMPLER), "bogus", TensorType::f32(vec![2])),
             Err(BuilderError::SlotType(e)) if e.expected == "one of the sampler inputs by tag"
         ));
     }
@@ -3289,44 +3398,40 @@ mod tests {
         let out = b.binary(BinOp::Mul, table, table).unwrap();
         let g = b.finish(out).unwrap();
 
+        let pooled = TensorType::f32(vec![2, 2]);
         let mut edit = g.edit();
         assert_eq!(
-            edit.rebind_const_as_pool(out.id(), 2),
-            Err(EditError::NotPoolable {
+            edit.rebind_const_as_slot(out.id(), Slot::Owned(POOL), pooled.clone()),
+            Err(EditError::NotRebindable {
                 value: out.id(),
                 reason: "it is not a const",
             })
         );
-        let g_scalar = {
-            let b = Builder::for_tests();
-            let scalar = b
-                .constant("scalar", TensorType::scalar(DType::F32))
-                .unwrap();
-            (b.finish(scalar).unwrap(), scalar.id())
-        };
-        let mut edit_scalar = g_scalar.0.edit();
-        assert_eq!(
-            edit_scalar.rebind_const_as_pool(g_scalar.1, 2),
-            Err(EditError::NotPoolable {
-                value: g_scalar.1,
-                reason: "a pooled table has a leading expert axis",
-            })
-        );
+        assert!(matches!(
+            edit.rebind_const_as_slot(
+                table.id(),
+                Slot::Owned(POOL),
+                TensorType::scalar(DType::F32)
+            ),
+            Err(EditError::SlotType(_))
+        ));
 
-        let pool = edit.rebind_const_as_pool(table.id(), 2).unwrap();
-        assert_eq!(pool.role(), Slot::ExpertPool);
+        let pool = edit
+            .rebind_const_as_slot(table.id(), Slot::Owned(POOL), pooled)
+            .unwrap();
+        assert_eq!(pool.role(), Slot::Owned(POOL));
         let map = TensorType::new(vec![4], DType::I32);
-        edit.declare_slot(Slot::ExpertPoolMap, "site.0", map.clone())
+        edit.declare_slot(Slot::Owned(POOL_MAP), "site.0", map.clone())
             .unwrap();
         assert_eq!(
-            edit.declare_slot(Slot::ExpertPoolMap, "site.0", map),
+            edit.declare_slot(Slot::Owned(POOL_MAP), "site.0", map),
             Err(EditError::DuplicateSlotTag {
-                slot: Slot::ExpertPoolMap,
+                slot: Slot::Owned(POOL_MAP),
                 tag: "site.0".into(),
             })
         );
         assert!(matches!(
-            edit.declare_slot(Slot::ExpertPoolMap, "site.1", TensorType::f32(vec![4])),
+            edit.declare_slot(Slot::Owned(POOL_MAP), "site.1", TensorType::f32(vec![4])),
             Err(EditError::SlotType(_))
         ));
     }
@@ -3504,6 +3609,47 @@ mod tests {
         crate::test_support::verdict(&g).expect("literal-first Binary remains graph-valid");
     }
 
+    /// POOT-1301 SC-001: a matmul's stored output is exactly what `infer` returns, with no widening exemption. An
+    /// operand-width matmul whose output is declared F32 is refused; the F32-accumulate op over the same operands
+    /// declares F32 and validates.
+    #[test]
+    fn validate_holds_a_matmul_to_the_inferred_accumulate_dtype() {
+        let b = Builder::for_tests();
+        let a = b
+            .constant("a", TensorType::new(vec![2, 3], DType::BF16))
+            .unwrap();
+        let w = b
+            .constant("w", TensorType::new(vec![3, 4], DType::BF16))
+            .unwrap();
+        let out = b.matmul(a, w).unwrap();
+        let mut g = b.finish(out).unwrap().into_draft();
+        let inferred = g.values()[out.id()].aval.clone();
+        assert_eq!(inferred.dtype, DType::BF16);
+        let widened = TensorType::new(inferred.shape.clone(), DType::F32);
+        g.values_mut()[out.id()].aval = widened.clone();
+        assert_eq!(
+            crate::test_support::verdict(&g),
+            Err(GraphValidationError::EquationOutputTypeMismatch {
+                equation: 0,
+                operation: "matmul".into(),
+                stored: widened.clone(),
+                inferred,
+            })
+        );
+
+        let b = Builder::for_tests();
+        let a = b
+            .constant("a", TensorType::new(vec![2, 3], DType::BF16))
+            .unwrap();
+        let w = b
+            .constant("w", TensorType::new(vec![3, 4], DType::BF16))
+            .unwrap();
+        let out = b.matmul_f32_accumulate(a, w).unwrap();
+        let g = b.finish(out).unwrap();
+        assert_eq!(g.aval(out.id()), &widened);
+        assert_eq!(crate::test_support::verdict(&g.into_draft()), Ok(()));
+    }
+
     #[test]
     fn validate_rejects_mismatched_binary_value_operands_including_scalars() {
         let b = Builder::for_tests();
@@ -3625,14 +3771,14 @@ mod tests {
         let b = Builder::for_tests();
         let layer0 = b
             .slot_named(
-                Slot::ExpertPoolMap,
+                Slot::Owned(POOL_MAP),
                 "layer_0",
                 TensorType::new(vec![4], DType::I32),
             )
             .unwrap();
         let layer1 = b
             .slot_named(
-                Slot::ExpertPoolMap,
+                Slot::Owned(POOL_MAP),
                 "layer_1",
                 TensorType::new(vec![4], DType::I32),
             )
@@ -3648,41 +3794,53 @@ mod tests {
         );
     }
 
-    /// Card 528b (R466-013 F1). `Graph::input_key` must read the [`ValueMeta::key`] `Builder` set
-    /// at construction, never rebuild it by parsing [`ValueMeta::name`] back apart: corrupting the
-    /// wire name after the fact must not change the structured key at all.
+    /// POOT-1301: a keyed slot and a mapped weight have no name beside their identity: the name is derived from
+    /// the key or the reference, so the two cannot disagree, and renaming one is refused rather than leaving the
+    /// typed identity pointing at a different spelling. A plain named value renames freely.
     ///
-    /// Mutation (observed red, then reverted): `input_key`'s `Storage::Slot` arm changed back to
-    /// parsing `meta.name` (the pre-review shape: `meta.name.as_deref().and_then(|name|
-    /// parse_slot_key(role, name)).unwrap_or_else(|| SlotKey::new(role, None))`, `parse_slot_key`
-    /// temporarily restored alongside it). `after` no longer equalled `original`: `assertion
-    /// \`left == right\` failed: input_key must come from the value's stored key, never by
-    /// parsing \`name\` / left: Some(Slot(SlotKey { role: ExpertPoolMap, tag: None })) / right:
-    /// Some(Slot(SlotKey { role: ExpertPoolMap, tag: Some("layer_0") }))` - the corrupted name no
-    /// longer parsed to the real tag, so the reintroduced parse silently lost it. Restored, re-run
-    /// green.
+    /// Mutation: make `ValueMeta::rename` replace the identity of a keyed slot with the new name; the first
+    /// refusal assertion goes red.
     #[test]
-    fn input_key_reads_the_stored_key_never_the_name_string() {
+    fn a_typed_identity_has_no_name_beside_it() {
+        use poot_weights::{WeightId, WeightRole};
+
         let b = Builder::for_tests();
         let layer0 = b
             .slot_named(
-                Slot::ExpertPoolMap,
+                Slot::Owned(POOL_MAP),
                 "layer_0",
                 TensorType::new(vec![4], DType::I32),
             )
             .unwrap();
-        let mut g = b.finish(layer0).unwrap().into_draft();
-        let original = g.input_key(layer0.id()).expect("declared slot input");
+        let weight = crate::WeightRef::whole(WeightId::model(WeightRole::Head));
+        let head = b.weight(weight, TensorType::f32(vec![4])).unwrap();
+        let plain = b.constant("plain", TensorType::f32(vec![4])).unwrap();
+        let out = b.binary(BinOp::Add, head, plain).unwrap();
+        let mut g = b.finish(out).unwrap().into_draft();
 
-        // Corrupt the wire name a parser would read; the typed key lives elsewhere and must be
-        // unaffected.
-        g.values_mut()[layer0.id()].name = Some("not.a.recoverable.name".to_string());
-        let after = g.input_key(layer0.id());
-
+        let slot = g.values_mut()[layer0.id()].clone();
+        let key = slot
+            .slot_key()
+            .expect("a declared slot has its key")
+            .clone();
+        assert_eq!(slot.name().as_deref(), Some(key.to_string().as_str()));
+        let mut renamed = slot;
         assert_eq!(
-            after,
-            Some(original),
-            "input_key must come from the value's stored key, never by parsing `name`"
+            renamed.rename("elsewhere"),
+            Err(RenameError { kind: "slot" })
         );
+        assert_eq!(renamed.slot_key(), Some(&key));
+
+        let mut head = g.values_mut()[head.id()].clone();
+        assert_eq!(head.name().as_deref(), Some(weight.name().as_str()));
+        assert_eq!(
+            head.rename("elsewhere"),
+            Err(RenameError { kind: "weight" })
+        );
+        assert_eq!(head.weight(), Some(weight));
+
+        let mut plain = g.values_mut()[plain.id()].clone();
+        assert_eq!(plain.rename("renamed"), Ok(()));
+        assert_eq!(plain.name().as_deref(), Some("renamed"));
     }
 }

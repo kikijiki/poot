@@ -725,7 +725,7 @@ mod family_tests {
     /// lm_head (second-to-last dim 1).
     fn assert_no_materialized_scores(g: &poot_graph_ir::Graph, n: usize) {
         for e in g.eqns() {
-            if matches!(e.op, poot_graph_ir::OpKind::MatMul) {
+            if matches!(e.op, poot_graph_ir::OpKind::MatMul { .. }) {
                 let shape = &g.aval(e.out).shape;
                 let r = shape.len();
                 assert!(

@@ -252,7 +252,7 @@ fn run_projection(
         rows_adapter.iter().map(|&i| i as i32).collect(),
     );
     let x_key = poot_graph_ir::SlotKey::new(Slot::Activation, Some("x"));
-    let idx_key = poot_graph_ir::SlotKey::new(Slot::LoraIdx, None);
+    let idx_key = poot_graph_ir::SlotKey::new(Slot::Owned(poot_graph_plan::LORA_IDX), None);
     let mut inputs = StepInputs::new();
     inputs.push(x_key, activation.shape(), activation.view());
     inputs.push(idx_key, lora_idx.shape(), lora_idx.view());

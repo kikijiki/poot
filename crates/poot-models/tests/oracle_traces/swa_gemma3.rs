@@ -31,9 +31,7 @@ pub(super) fn run_step(
                 (pos0..pos0 + tokens.len()).map(|p| p as i32).collect(),
             ),
             Storage::Slot(other) => panic!("unexpected slot {other:?} in a dense step graph"),
-            Storage::Const => {
-                HostTensor::f32(shape.clone(), weight(m.name.as_deref().unwrap(), &shape))
-            }
+            Storage::Const => HostTensor::f32(shape.clone(), weight(&m.name().unwrap(), &shape)),
             Storage::Computed(c) => c.tensor(),
             Storage::State => continue,
             Storage::Device => panic!("a graph input is never a device intermediate"),

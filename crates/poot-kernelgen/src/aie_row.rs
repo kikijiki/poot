@@ -24,7 +24,7 @@
 
 use crate::{
     ErrorBound, FusedInput, FusedScalarOp, NumericalContract, RowKernel, RowOp, RowReduce,
-    request::SQRT_REL,
+    RowValue, request::SQRT_REL,
 };
 use poot_kernel_ir::{BinOp, MathOp};
 
@@ -51,12 +51,11 @@ pub(crate) const NO_BOUND: &str = "the row kernel has a step the AIE core has no
 
 /// The contract of `kernel` on an AIE core, or the reason it has none.
 pub(crate) fn row_contract(kernel: &RowKernel) -> Result<NumericalContract, &'static str> {
-    let leaves = kernel.n_leaves;
     let mut steps: Vec<Quantity> = Vec::with_capacity(kernel.steps.len());
     let operand = |input: &FusedInput, steps: &[Quantity]| -> Option<Quantity> {
         match input {
             FusedInput::Leaf(_) => Some(Quantity::EXACT_ANY_SIGN),
-            FusedInput::Step(s) => steps.get(*s).copied(),
+            FusedInput::Step(s) => steps.get(s.index()).copied(),
             FusedInput::Lit(c) => Some(Quantity {
                 rel: 0.0,
                 at_least: (*c >= 0.0).then_some(*c),
@@ -65,9 +64,8 @@ pub(crate) fn row_contract(kernel: &RowKernel) -> Result<NumericalContract, &'st
         }
     };
     let same = |a: &FusedInput, b: &FusedInput| match (a, b) {
-        (FusedInput::Leaf(i), FusedInput::Leaf(j)) | (FusedInput::Step(i), FusedInput::Step(j)) => {
-            i == j
-        }
+        (FusedInput::Leaf(i), FusedInput::Leaf(j)) => i == j,
+        (FusedInput::Step(i), FusedInput::Step(j)) => i == j,
         _ => false,
     };
     for step in &kernel.steps {
@@ -141,9 +139,9 @@ pub(crate) fn row_contract(kernel: &RowKernel) -> Result<NumericalContract, &'st
         };
         steps.push(quantity);
     }
-    let output = match kernel.output.checked_sub(leaves) {
-        Some(step) => *steps.get(step).ok_or(NO_BOUND)?,
-        None => Quantity::EXACT_ANY_SIGN,
+    let output = match kernel.output {
+        RowValue::Step(step) => *steps.get(step.index()).ok_or(NO_BOUND)?,
+        RowValue::Leaf(_) => Quantity::EXACT_ANY_SIGN,
     };
     Ok(NumericalContract {
         id: "f32-row-derived-v1",

@@ -144,7 +144,9 @@ enum Identity {
 fn identity(graph: &Graph, value: ValueId) -> Identity {
     let meta = graph.meta(value);
     match meta.storage {
-        Storage::Const | Storage::State => Identity::Named(meta.name.clone().expect("named")),
+        Storage::Const | Storage::State => {
+            Identity::Named(meta.name().expect("named").into_owned())
+        }
         Storage::Slot(_) => Identity::Slot(meta.slot_key().cloned().expect("a keyed slot")),
         Storage::Computed(payload) => Identity::Computed(payload),
         Storage::Device => unreachable!("an input binder is never a device value"),
@@ -276,7 +278,7 @@ fn decode_step(graph: &Graph) -> Step {
                     HostTensor::i32(shape, map),
                 );
             }
-            Storage::Slot(Slot::LoraIdx) => {
+            Storage::Slot(Slot::Owned(role)) if role == poot_graph_plan::LORA_IDX => {
                 // Alternating rows: adapter 1, no adapter, adapter 2, ...
                 let idx = (0..numel).map(|row| ((row + 1) % 3) as i32).collect();
                 slots.insert(
@@ -287,7 +289,7 @@ fn decode_step(graph: &Graph) -> Step {
             Storage::State => {
                 let seed = 7000 + state.len() as u64;
                 state.insert(
-                    meta.name.clone().unwrap(),
+                    meta.name().unwrap().into_owned(),
                     HostTensor::f32(shape, fill(numel, seed)),
                 );
             }
@@ -388,7 +390,7 @@ fn walk(
             boundaries.insert(export.id.slot_key(), value);
         }
         for ((state_in, _), value) in g.state().zip(result.state) {
-            let name = g.meta(state_in).name.clone().unwrap();
+            let name = g.meta(state_in).name().unwrap().into_owned();
             let (base, from) = base_name(&name);
             state.insert(
                 (base.to_string(), from),
@@ -442,7 +444,7 @@ fn whole(
         .zip(result.state)
         .map(|((state_in, _), value)| {
             (
-                graph.meta(state_in).name.clone().unwrap(),
+                graph.meta(state_in).name().unwrap().into_owned(),
                 value.as_host().unwrap().clone(),
             )
         })

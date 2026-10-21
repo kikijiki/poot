@@ -16,6 +16,12 @@ use poot_kernel_ir::{
 /// A scalar op inside a fused elementwise kernel (G5), already lowered to kernel-ir ops by the caller
 /// (`poot_graph_plan` translates the graph-ir region). Unary covers `neg`; Math covers the float
 /// intrinsics (exp/sqrt); Binary covers the arithmetic ops.
+///
+/// Deliberately not `poot_graph_ir::FusedOp`: that is the semantic op set a region is typed with (a `Cast`, a
+/// `Unary` of any `UnOp`), this is the set a kernel body has an emitter for (`Widen` is the lane decode of a
+/// `Cast` to F32, `Recip`, `Tanh` and `Erf` are the unary ops with a synthesized body). Kernelgen does not
+/// depend on the graph IR, and the one translation, `poot_graph_plan`'s `map_fused_op`, is total over the graph
+/// ops: each is lowered or refused by name (`FusedStepGap`).
 #[derive(Clone, Copy, Debug)]
 pub enum FusedScalarOp {
     /// A kernel-ir unary op.
@@ -205,24 +211,79 @@ pub(crate) fn emit_scalar_op(
     stmts.push(Statement::Assign(Place::local(dst), rv));
 }
 
+macro_rules! index_id {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(usize);
+
+        impl $name {
+            /// The id at `index` of its own index space.
+            pub const fn new(index: usize) -> Self {
+                Self(index)
+            }
+
+            /// The position this id names in its own index space.
+            pub const fn index(self) -> usize {
+                self.0
+            }
+        }
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}{}", stringify!($name), self.0)
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+    };
+}
+
+index_id! {
+    /// An input leaf of a fused kernel: its position among the kernel's input slices (`leaf_tys`, `leaf_storage`).
+    /// Distinct from a [`StepId`] (a prior step's register) and a [`LaneId`] (a word of a packed leaf): each is a
+    /// `usize` elsewhere, and none can stand for another.
+    ///
+    /// ```compile_fail,E0308
+    /// use poot_kernelgen::FusedInput;
+    ///
+    /// let _ = FusedInput::Leaf(0usize);
+    /// ```
+    LeafId
+}
+
+index_id! {
+    /// A step of a fused kernel: its position in `steps`, whose result sits in one register.
+    StepId
+}
+
+index_id! {
+    /// A lane of a packed I32 leaf: a coordinate along the leaf's last axis.
+    LaneId
+}
+
 /// An operand of a fused step: a leaf input (read with broadcast strides), a prior step's register, or an
 /// inline literal.
 #[derive(Clone, Copy, Debug)]
 pub enum FusedInput {
-    /// Leaf input `j`, read at the output element's broadcast position.
-    Leaf(usize),
-    /// The register of an earlier step `s`.
-    Step(usize),
+    /// A leaf input, read at the output element's broadcast position.
+    Leaf(LeafId),
+    /// The register of an earlier step.
+    Step(StepId),
     /// An inline `f32` literal.
     Lit(f32),
     /// An inline `i32` literal, for exact-I32 regions.
     LitI32(i32),
     /// Last-axis lane of a packed I32 leaf. The leaf's last dimension is the pack width.
     LeafLane {
-        /// Index of the packed I32 leaf.
-        leaf: usize,
+        /// The packed I32 leaf.
+        leaf: LeafId,
         /// Which last-axis lane of that leaf's word to read.
-        lane: usize,
+        lane: LaneId,
     },
 }
 
@@ -303,6 +364,25 @@ pub enum RowOp {
     },
 }
 
+/// A value of a row-wise fused kernel that can be written out: a leaf row or a step's result, never a literal
+/// or a packed lane.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowValue {
+    /// An input leaf's row.
+    Leaf(LeafId),
+    /// A step's result.
+    Step(StepId),
+}
+
+impl From<RowValue> for FusedInput {
+    fn from(value: RowValue) -> Self {
+        match value {
+            RowValue::Leaf(leaf) => Self::Leaf(leaf),
+            RowValue::Step(step) => Self::Step(step),
+        }
+    }
+}
+
 /// The recipe for a row-wise (reduction-rooted) fused kernel: `n_leaves` input slices, `n_cols` = the
 /// reduction extent N, a straight-line list of steps, and which value is written out (a row value). The
 /// kernelgen-native mirror of `poot_graph_ir::RowRegion`. Lowered by [`fused_row`] to one kernel that
@@ -319,8 +399,18 @@ pub struct RowKernel {
     pub n_cols: usize,
     /// The steps in evaluation order; a step may name only earlier steps.
     pub steps: Vec<RowOp>,
-    /// The value written out, as an index into the leaves followed by the steps: `0..n_leaves` is a leaf, `n_leaves + s` is step `s`.
-    pub output: usize,
+    /// The value written out.
+    pub output: RowValue,
+}
+
+impl RowKernel {
+    /// The position of `value` in the recipe's one value space: the leaves, then the steps.
+    fn slot(&self, value: RowValue) -> usize {
+        match value {
+            RowValue::Leaf(leaf) => leaf.index(),
+            RowValue::Step(step) => self.n_leaves + step.index(),
+        }
+    }
 }
 
 impl FusedKernel {
@@ -501,11 +591,11 @@ fn check_float_region_tys(
     generator: &'static str,
     k: &FusedKernel,
 ) -> Result<FloatRegionTys, KernelGenError> {
-    let leaf_ty = |leaf: usize| k.leaf_tys.get(leaf).copied().map(LeafTy::ty);
+    let leaf_ty = |leaf: LeafId| k.leaf_tys.get(leaf.index()).copied().map(LeafTy::ty);
     let mut steps: Vec<Ty> = Vec::with_capacity(k.steps.len());
     let input_ty = |input: &FusedInput, steps: &[Ty]| match input {
         FusedInput::Leaf(leaf) => leaf_ty(*leaf).unwrap_or(Ty::F32),
-        FusedInput::Step(step) => steps.get(*step).cloned().unwrap_or(Ty::F32),
+        FusedInput::Step(step) => steps.get(step.index()).cloned().unwrap_or(Ty::F32),
         FusedInput::LitI32(_) => Ty::I32,
         FusedInput::Lit(_) | FusedInput::LeafLane { .. } => Ty::F32,
     };
@@ -696,8 +786,8 @@ pub fn fused_views(
     // resolve a recipe operand to a register copy or an inline constant.
     let resolve = |inp: &FusedInput| -> Operand {
         match inp {
-            FusedInput::Leaf(j) => copy(Place::local(leaf_val[*j])),
-            FusedInput::Step(s) => copy(Place::local(step_reg[*s])),
+            FusedInput::Leaf(j) => copy(Place::local(leaf_val[j.index()])),
+            FusedInput::Step(s) => copy(Place::local(step_reg[s.index()])),
             FusedInput::Lit(c) => Operand::Const(Constant::F32(*c)),
             FusedInput::LitI32(c) => Operand::Const(Constant::I32(*c)),
             FusedInput::LeafLane { .. } => {
@@ -860,9 +950,9 @@ pub fn fused_i32_views_grid_pack(
     let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
 
     let mut used_leaf = vec![false; n];
-    let mut used_lanes: Vec<(usize, usize)> = Vec::new();
+    let mut used_lanes: Vec<(LeafId, LaneId)> = Vec::new();
     let mut mark = |inp: &FusedInput| match inp {
-        FusedInput::Leaf(j) => used_leaf[*j] = true,
+        FusedInput::Leaf(j) => used_leaf[j.index()] = true,
         FusedInput::LeafLane { leaf, lane } => used_lanes.push((*leaf, *lane)),
         _ => {}
     };
@@ -877,7 +967,7 @@ pub fn fused_i32_views_grid_pack(
     }
     used_lanes.sort_unstable();
     used_lanes.dedup();
-    let mut lane_val: HashMap<(usize, usize), Local> = HashMap::new();
+    let mut lane_val: HashMap<(LeafId, LaneId), Local> = HashMap::new();
     for &(leaf, lane) in &used_lanes {
         lane_val.insert((leaf, lane), al.add(Ty::I32, false));
     }
@@ -925,10 +1015,10 @@ pub fn fused_i32_views_grid_pack(
         ));
     }
     for &(leaf, lane) in &used_lanes {
-        let lshape = leaf_shapes[leaf];
-        let layout = &leaf_layouts[leaf];
+        let lshape = leaf_shapes[leaf.index()];
+        let layout = &leaf_layouts[leaf.index()];
         let (eff, base) = view_eff_strides(&index_shape, lshape, layout);
-        let off = leaf_off[leaf];
+        let off = leaf_off[leaf.index()];
         body.push(Statement::Assign(Place::local(off), Rvalue::Use(cu(base))));
         for (d, &e) in eff.iter().enumerate().take(r) {
             if e == 0 {
@@ -960,23 +1050,27 @@ pub fn fused_i32_views_grid_pack(
             ));
         }
         let last_stride = layout.strides.last().copied().unwrap_or(1);
-        if lane != 0 && last_stride != 0 {
+        if lane.index() != 0 && last_stride != 0 {
             body.push(Statement::Assign(
                 Place::local(off),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(off)), cu(lane * last_stride)),
+                Rvalue::BinaryOp(
+                    BinOp::Add,
+                    copy(Place::local(off)),
+                    cu(lane.index() * last_stride),
+                ),
             ));
         }
         body.push(Statement::Assign(
             Place::local(lane_val[&(leaf, lane)]),
-            Rvalue::Use(copy(elem(local((leaf + 1) as u32), off))),
+            Rvalue::Use(copy(elem(local((leaf.index() + 1) as u32), off))),
         ));
     }
 
     let resolve = |inp: &FusedInput| -> Operand {
         match inp {
-            FusedInput::Leaf(j) => copy(Place::local(leaf_val[*j])),
+            FusedInput::Leaf(j) => copy(Place::local(leaf_val[j.index()])),
             FusedInput::LeafLane { leaf, lane } => copy(Place::local(lane_val[&(*leaf, *lane)])),
-            FusedInput::Step(s) => copy(Place::local(step_reg[*s])),
+            FusedInput::Step(s) => copy(Place::local(step_reg[s.index()])),
             FusedInput::LitI32(c) => Operand::Const(Constant::I32(*c)),
             FusedInput::Lit(_) => {
                 panic!("I32 fused kernel cannot carry an f32 literal")
@@ -1461,11 +1555,16 @@ fn emit_row_value(
             .iter()
             .map(|inp| match inp {
                 FusedInput::Leaf(j) => copy(Place::local(emit_row_value(
-                    ctx, *j, i_local, al, stmts, memo,
+                    ctx,
+                    j.index(),
+                    i_local,
+                    al,
+                    stmts,
+                    memo,
                 ))),
                 FusedInput::Step(s) => copy(Place::local(emit_row_value(
                     ctx,
-                    n + *s,
+                    n + s.index(),
                     i_local,
                     al,
                     stmts,
@@ -1574,7 +1673,7 @@ pub fn fused_row_parallel_views(
             RowOp::Pointwise { inputs, .. } => {
                 let any_row = inputs.iter().any(|i| match i {
                     FusedInput::Leaf(_) => true,
-                    FusedInput::Step(st) => kind[n + *st] == RowKind::Row,
+                    FusedInput::Step(st) => kind[n + st.index()] == RowKind::Row,
                     FusedInput::Lit(_) | FusedInput::LitI32(_) | FusedInput::LeafLane { .. } => {
                         false
                     }
@@ -1619,7 +1718,9 @@ pub fn fused_row_parallel_views(
 
     let scalar_operand = |inp: &FusedInput, scalar_reg: &[Option<Local>]| -> Operand {
         match inp {
-            FusedInput::Step(s) => copy(Place::local(scalar_reg[n + *s].expect("scalar ready"))),
+            FusedInput::Step(s) => copy(Place::local(
+                scalar_reg[n + s.index()].expect("scalar ready"),
+            )),
             FusedInput::Lit(c) => Operand::Const(Constant::F32(*c)),
             FusedInput::LitI32(_) | FusedInput::LeafLane { .. } => {
                 panic!("f32 fused kernel cannot carry an I32 packed lane or literal")
@@ -1713,12 +1814,22 @@ pub fn fused_row_parallel_views(
                 emit_i(&mut body_stmts);
                 let mut memo = std::collections::HashMap::new();
                 let in_local = match input {
-                    FusedInput::Leaf(jx) => {
-                        emit_row_value(&rctx, *jx, i_local, &mut al, &mut body_stmts, &mut memo)
-                    }
-                    FusedInput::Step(st) => {
-                        emit_row_value(&rctx, n + *st, i_local, &mut al, &mut body_stmts, &mut memo)
-                    }
+                    FusedInput::Leaf(jx) => emit_row_value(
+                        &rctx,
+                        jx.index(),
+                        i_local,
+                        &mut al,
+                        &mut body_stmts,
+                        &mut memo,
+                    ),
+                    FusedInput::Step(st) => emit_row_value(
+                        &rctx,
+                        n + st.index(),
+                        i_local,
+                        &mut al,
+                        &mut body_stmts,
+                        &mut memo,
+                    ),
                     FusedInput::Lit(_) | FusedInput::LitI32(_) | FusedInput::LeafLane { .. } => {
                         unreachable!("reduce over a literal")
                     }
@@ -1854,7 +1965,7 @@ pub fn fused_row_parallel_views(
     let mut memo = std::collections::HashMap::new();
     let out_val = emit_row_value(
         &rctx,
-        k.output,
+        k.slot(k.output),
         i_local,
         &mut al,
         &mut body_stmts,
@@ -1949,34 +2060,46 @@ mod tests {
             steps: vec![
                 RowOp::Pointwise {
                     op: FusedScalarOp::Binary(BinOp::Mul),
-                    inputs: vec![FusedInput::Leaf(0), FusedInput::Leaf(0)],
+                    inputs: vec![
+                        FusedInput::Leaf(LeafId::new(0)),
+                        FusedInput::Leaf(LeafId::new(0)),
+                    ],
                 },
                 RowOp::Reduce {
                     op: RowReduce::Sum,
-                    input: FusedInput::Step(0),
+                    input: FusedInput::Step(StepId::new(0)),
                 },
                 RowOp::Pointwise {
                     op: FusedScalarOp::Binary(BinOp::Mul),
-                    inputs: vec![FusedInput::Step(1), FusedInput::Lit(1.0 / n_cols as f32)],
+                    inputs: vec![
+                        FusedInput::Step(StepId::new(1)),
+                        FusedInput::Lit(1.0 / n_cols as f32),
+                    ],
                 },
                 RowOp::Pointwise {
                     op: FusedScalarOp::Binary(BinOp::Add),
-                    inputs: vec![FusedInput::Step(2), FusedInput::Lit(eps)],
+                    inputs: vec![FusedInput::Step(StepId::new(2)), FusedInput::Lit(eps)],
                 },
                 RowOp::Pointwise {
                     op: FusedScalarOp::Math(MathOp::Sqrt),
-                    inputs: vec![FusedInput::Step(3)],
+                    inputs: vec![FusedInput::Step(StepId::new(3))],
                 },
                 RowOp::Pointwise {
                     op: FusedScalarOp::Binary(BinOp::Div),
-                    inputs: vec![FusedInput::Leaf(0), FusedInput::Step(4)],
+                    inputs: vec![
+                        FusedInput::Leaf(LeafId::new(0)),
+                        FusedInput::Step(StepId::new(4)),
+                    ],
                 },
                 RowOp::Pointwise {
                     op: FusedScalarOp::Binary(BinOp::Mul),
-                    inputs: vec![FusedInput::Step(5), FusedInput::Leaf(1)],
+                    inputs: vec![
+                        FusedInput::Step(StepId::new(5)),
+                        FusedInput::Leaf(LeafId::new(1)),
+                    ],
                 },
             ],
-            output: 2 + 6,
+            output: RowValue::Step(StepId::new(6)),
         }
     }
 
@@ -2021,26 +2144,32 @@ mod tests {
             steps: vec![
                 RowOp::Reduce {
                     op: RowReduce::Max,
-                    input: FusedInput::Leaf(0),
+                    input: FusedInput::Leaf(LeafId::new(0)),
                 },
                 RowOp::Pointwise {
                     op: FusedScalarOp::Binary(BinOp::Sub),
-                    inputs: vec![FusedInput::Leaf(0), FusedInput::Step(0)],
+                    inputs: vec![
+                        FusedInput::Leaf(LeafId::new(0)),
+                        FusedInput::Step(StepId::new(0)),
+                    ],
                 },
                 RowOp::Pointwise {
                     op: FusedScalarOp::Math(MathOp::Exp),
-                    inputs: vec![FusedInput::Step(1)],
+                    inputs: vec![FusedInput::Step(StepId::new(1))],
                 },
                 RowOp::Reduce {
                     op: RowReduce::Sum,
-                    input: FusedInput::Step(2),
+                    input: FusedInput::Step(StepId::new(2)),
                 },
                 RowOp::Pointwise {
                     op: FusedScalarOp::Binary(BinOp::Div),
-                    inputs: vec![FusedInput::Step(2), FusedInput::Step(3)],
+                    inputs: vec![
+                        FusedInput::Step(StepId::new(2)),
+                        FusedInput::Step(StepId::new(3)),
+                    ],
                 },
             ],
-            output: 1 + 4,
+            output: RowValue::Step(StepId::new(4)),
         }
     }
 
@@ -2244,7 +2373,10 @@ mod tests {
     fn chain(op: FusedScalarOp, arity: usize, steps: usize, leaf: LeafTy) -> FusedKernel {
         let mut all = vec![FusedStep {
             op: FusedScalarOp::Binary(BinOp::Add),
-            inputs: vec![FusedInput::Leaf(0), FusedInput::Leaf(1)],
+            inputs: vec![
+                FusedInput::Leaf(LeafId::new(0)),
+                FusedInput::Leaf(LeafId::new(1)),
+            ],
         }];
         all.extend((0..steps).map(|s| {
             FusedStep {
@@ -2252,9 +2384,9 @@ mod tests {
                 inputs: (0..arity)
                     .map(|i| {
                         if i == 0 {
-                            FusedInput::Step(s)
+                            FusedInput::Step(StepId::new(s))
                         } else {
-                            FusedInput::Leaf(i % 2)
+                            FusedInput::Leaf(LeafId::new(i % 2))
                         }
                     })
                     .collect(),
@@ -2262,7 +2394,7 @@ mod tests {
         }));
         FusedKernel {
             leaf_tys: vec![leaf; 2],
-            output: FusedInput::Step(steps),
+            output: FusedInput::Step(StepId::new(steps)),
             steps: all,
         }
     }
@@ -2342,20 +2474,20 @@ mod tests {
                         .map(|s| FusedStep {
                             op: FusedScalarOp::Select,
                             inputs: vec![
-                                FusedInput::Leaf(0),
+                                FusedInput::Leaf(LeafId::new(0)),
                                 if s == 0 {
-                                    FusedInput::Leaf(1)
+                                    FusedInput::Leaf(LeafId::new(1))
                                 } else {
-                                    FusedInput::Step(s - 1)
+                                    FusedInput::Step(StepId::new(s - 1))
                                 },
-                                FusedInput::Leaf(2),
+                                FusedInput::Leaf(LeafId::new(2)),
                             ],
                         })
                         .collect(),
                     output: if steps == 0 {
-                        FusedInput::Leaf(1)
+                        FusedInput::Leaf(LeafId::new(1))
                     } else {
-                        FusedInput::Step(steps - 1)
+                        FusedInput::Step(StepId::new(steps - 1))
                     },
                 };
                 let shapes: [&[usize]; 3] = [&out_shape, &out_shape, &out_shape];
@@ -2423,15 +2555,24 @@ mod tests {
             steps: vec![FusedStep {
                 op: FusedScalarOp::Binary(BinOp::Add),
                 inputs: vec![
-                    FusedInput::LeafLane { leaf: 0, lane: 0 },
-                    FusedInput::LeafLane { leaf: 0, lane: 1 },
+                    FusedInput::LeafLane {
+                        leaf: LeafId::new(0),
+                        lane: LaneId::new(0),
+                    },
+                    FusedInput::LeafLane {
+                        leaf: LeafId::new(0),
+                        lane: LaneId::new(1),
+                    },
                 ],
             }],
-            output: FusedInput::Step(0),
+            output: FusedInput::Step(StepId::new(0)),
         };
         let pack = [
-            FusedInput::Step(0),
-            FusedInput::LeafLane { leaf: 0, lane: 1 },
+            FusedInput::Step(StepId::new(0)),
+            FusedInput::LeafLane {
+                leaf: LeafId::new(0),
+                lane: LaneId::new(1),
+            },
         ];
         let body = fused_i32_views_grid_pack(
             "k",
@@ -2541,7 +2682,7 @@ mod tests {
                 RowOp::Pointwise { inputs, .. } => {
                     let any_row = inputs.iter().any(|i| match i {
                         FusedInput::Leaf(_) => true,
-                        FusedInput::Step(st) => kind[n + *st] == RowKind::Row,
+                        FusedInput::Step(st) => kind[n + st.index()] == RowKind::Row,
                         FusedInput::Lit(_)
                         | FusedInput::LitI32(_)
                         | FusedInput::LeafLane { .. } => false,
@@ -2585,9 +2726,9 @@ mod tests {
         // helper to read a scalar operand (already-computed register or a literal).
         let scalar_operand = |inp: &FusedInput, scalar_reg: &[Option<Local>]| -> Operand {
             match inp {
-                FusedInput::Step(s) => {
-                    copy(Place::local(scalar_reg[n + *s].expect("scalar ready")))
-                }
+                FusedInput::Step(s) => copy(Place::local(
+                    scalar_reg[n + s.index()].expect("scalar ready"),
+                )),
                 FusedInput::Lit(c) => Operand::Const(Constant::F32(*c)),
                 FusedInput::LitI32(_) | FusedInput::LeafLane { .. } => {
                     panic!("f32 fused kernel cannot carry an I32 packed lane or literal")
@@ -2677,12 +2818,17 @@ mod tests {
                     emit_i(&mut body_stmts);
                     let mut memo = std::collections::HashMap::new();
                     let in_local = match input {
-                        FusedInput::Leaf(jx) => {
-                            emit_row_value(&ctx, *jx, i_local, &mut al, &mut body_stmts, &mut memo)
-                        }
+                        FusedInput::Leaf(jx) => emit_row_value(
+                            &ctx,
+                            jx.index(),
+                            i_local,
+                            &mut al,
+                            &mut body_stmts,
+                            &mut memo,
+                        ),
                         FusedInput::Step(st) => emit_row_value(
                             &ctx,
-                            n + *st,
+                            n + st.index(),
                             i_local,
                             &mut al,
                             &mut body_stmts,
@@ -2760,7 +2906,14 @@ mod tests {
         let mut body_stmts: Vec<Statement> = Vec::new();
         emit_i(&mut body_stmts);
         let mut memo = std::collections::HashMap::new();
-        let out_val = emit_row_value(&ctx, k.output, i_local, &mut al, &mut body_stmts, &mut memo);
+        let out_val = emit_row_value(
+            &ctx,
+            k.slot(k.output),
+            i_local,
+            &mut al,
+            &mut body_stmts,
+            &mut memo,
+        );
         body_stmts.push(Statement::Assign(
             elem(out_local, i_local),
             Rvalue::Use(copy(Place::local(out_val))),

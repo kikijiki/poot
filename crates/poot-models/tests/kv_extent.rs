@@ -197,7 +197,7 @@ fn step_logits(graph: &Graph, logical_cap: usize, tokens: usize, pos: i32, pad: 
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
             Storage::Computed(c) => c.tensor(),
             Storage::Const | Storage::State => {
-                let name = meta.name.clone().expect("a bound input is named");
+                let name = meta.name().expect("a bound input is named").into_owned();
                 let stored =
                     aval.shape.get(2).copied().filter(|_| {
                         graph.state_role(id) == Some(StateRole::Positional { axis: 2 })

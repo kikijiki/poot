@@ -547,7 +547,11 @@ mod family_tests {
                         && matches!(plan, Plan::Dispatches(_))
                 })
                 .filter_map(|(eqn, _)| match eqn.inputs.first() {
-                    Some(poot_graph_ir::Operand::Value(v)) => program.graph().meta(*v).name.clone(),
+                    Some(poot_graph_ir::Operand::Value(v)) => program
+                        .graph()
+                        .meta(*v)
+                        .name()
+                        .map(std::borrow::Cow::into_owned),
                     _ => None,
                 })
                 .collect();

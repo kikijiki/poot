@@ -173,7 +173,7 @@ fn witness_op(op: &OpKind) -> WitnessOp {
         OpKind::Unary(_)
         | OpKind::Gather { .. }
         | OpKind::ScatterUpdate
-        | OpKind::MatMul
+        | OpKind::MatMul { .. }
         | OpKind::PackedDequant { .. }
         | OpKind::PackedContraction { .. }
         | OpKind::PackedRowGather { .. }

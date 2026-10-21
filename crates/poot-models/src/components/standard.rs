@@ -1237,18 +1237,20 @@ pub(crate) mod oracle {
             let value: Value = match &meta.storage {
                 Storage::State | Storage::Computed(_) => continue,
                 Storage::Slot(_)
-                    if floats.iter().any(|(n, _)| Some(*n) == meta.name.as_deref()) =>
+                    if floats
+                        .iter()
+                        .any(|(n, _)| Some(*n) == meta.name().as_deref()) =>
                 {
                     let (_, values) = floats
                         .iter()
-                        .find(|(n, _)| Some(*n) == meta.name.as_deref())
+                        .find(|(n, _)| Some(*n) == meta.name().as_deref())
                         .expect("matched above");
                     HostTensor::f32(shape, values.to_vec()).into()
                 }
                 Storage::Slot(slot) => {
                     let by_name = named
                         .iter()
-                        .find(|(n, _)| Some(*n) == meta.name.as_deref())
+                        .find(|(n, _)| Some(*n) == meta.name().as_deref())
                         .map(|(_, ints)| *ints);
                     let ints = by_name.unwrap_or_else(|| {
                         slots
@@ -1260,7 +1262,8 @@ pub(crate) mod oracle {
                     HostTensor::i32(shape, ints.to_vec()).into()
                 }
                 Storage::Const => {
-                    let name = meta.name.as_deref().expect("a const has a name");
+                    let name = meta.name().expect("a const has a name");
+                    let name = name.as_ref();
                     if let Some((_, values)) = consts.iter().find(|(n, _)| *n == name) {
                         HostTensor::f32(shape, values.to_vec()).into()
                     } else if let Some(&wid) = ids.get(name) {

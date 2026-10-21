@@ -554,10 +554,10 @@ fn eval_pooled_syncing(
                     .expect("f32")
                     .to_vec();
                 tables.insert(
-                    meta.name.clone().expect("named"),
+                    meta.name().expect("named").into_owned(),
                     (meta.aval.shape.clone(), host),
                 );
-                by_name.insert(meta.name.clone().expect("named"), value);
+                by_name.insert(meta.name().expect("named").into_owned(), value);
             }
             Storage::Slot(_) => {
                 activations.insert(meta.slot_key().cloned().expect("keyed"), value);
@@ -583,8 +583,10 @@ fn eval_pooled_syncing(
                 let meta = g.meta(id);
                 let value = match meta.storage {
                     Storage::Computed(payload) => Value::from(payload.tensor()),
-                    Storage::Const => by_name[meta.name.as_deref().expect("named")].clone(),
-                    Storage::Slot(Slot::ExpertPool | Slot::ExpertPoolMap) => {
+                    Storage::Const => by_name[meta.name().expect("named").as_ref()].clone(),
+                    Storage::Slot(Slot::Owned(role))
+                        if role == crate::EXPERT_POOL || role == crate::EXPERT_POOL_MAP =>
+                    {
                         resident_slots[meta.slot_key().expect("keyed")].clone()
                     }
                     Storage::Slot(_) => {

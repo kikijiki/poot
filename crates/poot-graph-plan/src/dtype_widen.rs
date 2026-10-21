@@ -317,7 +317,7 @@ pub(crate) fn fold_dense_contractions(g: &Graph) -> Result<Graph, EditError> {
     let mut f16_folds = Vec::new();
 
     for (matmul_index, matmul) in g.eqns().iter().enumerate() {
-        if !matches!(matmul.op, OpKind::MatMul) || matmul.inputs.len() != 2 {
+        if !matmul.op.is_plain_matmul() || matmul.inputs.len() != 2 {
             continue;
         }
         let (Some(activation), Some(transposed)) = (value_input(matmul, 0), value_input(matmul, 1))
@@ -847,7 +847,7 @@ pub fn widen_mismatched_matmul_dtypes(g: &Graph, caps: &DeviceCaps) -> Result<Gr
             }
             continue;
         }
-        let is_matmul = matches!(eqn.op, OpKind::MatMul);
+        let is_matmul = matches!(eqn.op, OpKind::MatMul { .. });
         let widenable = is_matmul || matches!(eqn.op, OpKind::Binary(_));
         let (a_id, b_id) = match (eqn.inputs.first(), eqn.inputs.get(1)) {
             (Some(Operand::Value(a)), Some(Operand::Value(b))) if widenable => (*a, *b),
@@ -905,8 +905,14 @@ pub fn widen_mismatched_matmul_dtypes(g: &Graph, caps: &DeviceCaps) -> Result<Gr
         inputs[0] = Operand::Value(na);
         let nb = cast_to(&mut out, b_id, odt);
         inputs[1] = Operand::Value(nb);
+        // Widened to the output dtype, a matmul's operands already carry its accumulate dtype.
+        let op = if is_matmul {
+            OpKind::matmul()
+        } else {
+            eqn.op.clone()
+        };
         out.eqns_mut().push(Eqn {
-            op: eqn.op.clone(),
+            op,
             inputs,
             out: eqn.out,
             layer: eqn.layer,
@@ -917,8 +923,7 @@ pub fn widen_mismatched_matmul_dtypes(g: &Graph, caps: &DeviceCaps) -> Result<Gr
 
 #[cfg(test)]
 mod tests {
-    use poot_graph_ir::test_support::graph_fixtures::derive;
-    use poot_graph_ir::{Builder, Graph, OpKind, Storage, TensorType};
+    use poot_graph_ir::{Builder, Graph, Storage, TensorType};
     use poot_target::AmdArch;
 
     use poot_target::Backend;
@@ -937,15 +942,12 @@ mod tests {
             .constant("w", TensorType::new(vec![32, 32], w_dtype))
             .unwrap();
         let wt = b.transpose(w, vec![1, 0]).unwrap();
-        let mm = b.matmul(a, wt).unwrap();
-        let g = b.finish(mm).unwrap();
-        let out = g
-            .eqns()
-            .iter()
-            .find(|e| matches!(e.op, OpKind::MatMul))
-            .expect("matmul eqn")
-            .out;
-        derive(&g, |draft| draft.values_mut()[out].aval.dtype = DType::F32).unwrap()
+        let mm = if a_dtype == w_dtype {
+            b.matmul_f32_accumulate(a, wt).unwrap()
+        } else {
+            b.matmul(a, wt).unwrap()
+        };
+        b.finish(mm).unwrap()
     }
 
     /// Card 1011: no pass retypes a BF16 const, on any backend or AMD arch family, over the checkpoint matmuls
@@ -1033,7 +1035,10 @@ mod tensor_core_weight_tests {
     fn card278_existing_tensor_core_choice_keeps_eligible_bf16_weight_narrow() {
         let b = Builder::for_tests();
         let x = b
-            .slot(Slot::TokenEmbed, TensorType::new(vec![16, 16], DType::BF16))
+            .slot(
+                Slot::Owned(crate::TOKEN_EMBED),
+                TensorType::new(vec![16, 16], DType::BF16),
+            )
             .unwrap();
         let weight = b
             .constant("weight", TensorType::new(vec![16, 16], DType::BF16))
@@ -1056,7 +1061,7 @@ mod tensor_core_weight_tests {
         let eqn = widened
             .eqns()
             .iter()
-            .find(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::MatMul))
+            .find(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::MatMul { .. }))
             .expect("matmul remains");
         match crate::plan_eqn_choice(
             &widened,
@@ -1200,7 +1205,7 @@ mod fold_dense_bf16_tests {
     fn const_id(g: &Graph, name: &str) -> ValueId {
         g.values()
             .iter_enumerated()
-            .find(|(_, value)| value.name.as_deref() == Some(name))
+            .find(|(_, value)| value.name().as_deref() == Some(name))
             .map(|(id, _)| id)
             .expect("named constant")
     }

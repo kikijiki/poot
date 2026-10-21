@@ -9,7 +9,7 @@ use super::{
 use crate::kernel_mapping::{
     check_widening_step, float_region_leaf_storage, map_binop, map_fused_input,
     map_fused_input_i32, map_fused_local, map_fused_op, map_mixed_input_i32, map_pointwise_step,
-    map_unary,
+    map_row_value, map_unary,
 };
 use crate::planner::{GraphTables, Layout, StorageDtypes};
 use crate::predicates::{ELEMENTWISE_2D_WIDTH, elementwise_fold, row_parallel_width};
@@ -196,17 +196,43 @@ pub(super) fn plan(
                 }
                 _ => return Err(site.refuse(Capability::DtypeLowering)),
             };
+            // A value operand is a leaf of the kernel; a branch literal is inline in the step. The condition is
+            // always a leaf: a literal condition is a constant branch, which the planner's grammar has no
+            // kernel for.
+            let mut leaf_tys = vec![kg::LeafTy::I32];
+            let mut select_inputs = vec![kg::FusedInput::Leaf(kg::LeafId::new(0))];
+            let (condition, branches) = eqn.inputs.split_first().ok_or_else(|| {
+                site.refuse(Capability::OperandCount {
+                    expected: 3,
+                    actual: 0,
+                })
+            })?;
+            if matches!(condition, Operand::Lit(_)) {
+                return Err(site.refuse(Capability::LiteralFirstOperand));
+            }
+            for operand in branches {
+                select_inputs.push(match operand {
+                    Operand::Value(_) => {
+                        leaf_tys.push(branch);
+                        kg::FusedInput::Leaf(kg::LeafId::new(leaf_tys.len() - 1))
+                    }
+                    Operand::Lit(Scalar::I32(word)) if odt == DType::I32 => {
+                        kg::FusedInput::LitI32(*word)
+                    }
+                    Operand::Lit(Scalar::F32(value)) if odt == DType::F32 => {
+                        kg::FusedInput::Lit(*value)
+                    }
+                    // Graph inference types a branch literal as its branch.
+                    Operand::Lit(_) => return Err(site.refuse(Capability::DtypeLowering)),
+                });
+            }
             let kernel = kg::FusedKernel {
-                leaf_tys: vec![kg::LeafTy::I32, branch, branch],
+                leaf_tys,
                 steps: vec![kg::FusedStep {
                     op: kg::FusedScalarOp::Select,
-                    inputs: vec![
-                        kg::FusedInput::Leaf(0),
-                        kg::FusedInput::Leaf(1),
-                        kg::FusedInput::Leaf(2),
-                    ],
+                    inputs: select_inputs,
                 }],
-                output: kg::FusedInput::Step(0),
+                output: kg::FusedInput::Step(kg::StepId::new(0)),
             };
             generate(KernelRequest::Pointwise(PointwiseSpec {
                 out_shape: out_shape.to_vec(),
@@ -383,9 +409,7 @@ pub(super) fn plan(
                 leaf_storage,
                 n_cols: out_shape[region.axis],
                 steps,
-                // the region's output local id uses the same 0..n_inputs leaves, n_inputs+s steps
-                // numbering as the kernelgen recipe.
-                output: region.output.index(),
+                output: map_row_value(region.output, region.n_inputs),
             };
             generate(KernelRequest::Row(RowSpec::Fused {
                 out_shape: out_shape.to_vec(),

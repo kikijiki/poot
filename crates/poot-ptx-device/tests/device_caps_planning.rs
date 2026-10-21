@@ -54,13 +54,8 @@ fn a_live_device_reports_caps_the_fragment_kernel_plans_against() {
     let w = b
         .constant("w", TensorType::new(vec![32, 16], DType::BF16))
         .unwrap();
-    let out = b.matmul(a, w).unwrap();
-    let traced = b.finish(out).unwrap();
-    let out = traced.result();
-    let graph = poot_graph_ir::test_support::graph_fixtures::derive(&traced, |draft| {
-        draft.values_mut()[out].aval.dtype = DType::F32;
-    })
-    .unwrap();
+    let out = b.matmul_f32_accumulate(a, w).unwrap();
+    let graph = b.finish(out).unwrap();
     let options = CompileOptions::new(CompileLimits::STANDARD);
     let program = compile(&graph, &target, &options)
         .unwrap_or_else(|error| panic!("the live caps must admit the fragment kernel: {error}"));

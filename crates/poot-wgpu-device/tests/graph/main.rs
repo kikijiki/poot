@@ -96,7 +96,8 @@ fn run_via_contract(
         );
         match meta.storage {
             Storage::Const => {
-                let name: &'static str = Box::leak(meta.name.clone().unwrap().into_boxed_str());
+                let name: &'static str =
+                    Box::leak(meta.name().unwrap().into_owned().into_boxed_str());
                 consts.push(poot_executor_parity::ConstFixture {
                     name,
                     tensor: t.clone(),
@@ -160,7 +161,7 @@ fn add_resident_entry(
             matches!(meta.storage, Storage::Const),
             "add_resident_entry: {id:?} is not Storage::Const"
         );
-        let name = meta.name.clone().unwrap();
+        let name = meta.name().unwrap().into_owned();
         let bytes: Vec<u8> = match (t.as_f32(), t.as_i32()) {
             (Some(values), _) => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
             (_, Some(words)) => words.iter().flat_map(|v| v.to_le_bytes()).collect(),

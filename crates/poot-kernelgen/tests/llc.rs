@@ -134,16 +134,18 @@ fn exact_i32_arithmetic_lowers_without_float_conversion() {
                                 poot_kernel_ir::BinOp::BitAnd,
                             ),
                             inputs: vec![
-                                poot_kernelgen::FusedInput::Leaf(0),
+                                poot_kernelgen::FusedInput::Leaf(poot_kernelgen::LeafId::new(0)),
                                 poot_kernelgen::FusedInput::LitI32(-1),
                             ],
                         },
                         poot_kernelgen::FusedStep {
                             op: poot_kernelgen::FusedScalarOp::Clz,
-                            inputs: vec![poot_kernelgen::FusedInput::Step(0)],
+                            inputs: vec![poot_kernelgen::FusedInput::Step(
+                                poot_kernelgen::StepId::new(0),
+                            )],
                         },
                     ],
-                    output: poot_kernelgen::FusedInput::Step(1),
+                    output: poot_kernelgen::FusedInput::Step(poot_kernelgen::StepId::new(1)),
                 },
                 None,
             )

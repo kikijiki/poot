@@ -67,7 +67,7 @@ fn packed_graph_with_extra_consumer() -> Result<Graph, poot_graph_ir::BuilderErr
     };
     let second_output = graph.values_mut().push(base.values()[first_output].clone());
     graph.eqns_mut().push(Eqn {
-        op: OpKind::MatMul,
+        op: OpKind::matmul(),
         inputs: vec![Operand::Value(activation), Operand::Value(transpose2)],
         out: second_output,
         layer: None,
@@ -154,7 +154,7 @@ fn wrong_permutation(g: &Graph) -> Graph {
     let matmul = g
         .eqns()
         .iter()
-        .position(|eqn| matches!(eqn.op, OpKind::MatMul))
+        .position(|eqn| matches!(eqn.op, OpKind::MatMul { .. }))
         .unwrap();
     let Operand::Value(activation) = g.eqns()[matmul].inputs[0] else {
         unreachable!()
@@ -288,7 +288,7 @@ fn packed_block_diagonal_graph_with_extra_consumer() -> Result<Graph, poot_graph
     };
     let second_output = graph.values_mut().push(base.values()[first_output].clone());
     graph.eqns_mut().push(Eqn {
-        op: OpKind::MatMul,
+        op: OpKind::matmul(),
         inputs: vec![Operand::Value(activation), Operand::Value(transpose2)],
         out: second_output,
         layer: None,
@@ -388,7 +388,9 @@ fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir:
     let as_state = |draft: &mut poot_graph_ir::GraphEdit, value: ValueId| {
         let meta = poot_graph_ir::ValueMeta::new_state(
             draft.values()[value].aval.clone(),
-            draft.values()[value].name.clone(),
+            draft.values()[value]
+                .name()
+                .map(std::borrow::Cow::into_owned),
             poot_graph_ir::StateRole::Recurrent,
         );
         draft.values_mut()[value] = meta;
@@ -557,7 +559,7 @@ fn flash_attention_fuses_a_sink_attention_to_the_sink_variant() {
         .inputs()
         .iter()
         .copied()
-        .find(|&input| g.meta(input).name.as_deref() == Some("sinks"))
+        .find(|&input| g.meta(input).name().as_deref() == Some("sinks"))
         .unwrap();
     assert_eq!(attention.inputs.len(), 5);
     assert!(matches!(attention.inputs.last(), Some(&Operand::Value(last)) if last == sinks));
@@ -622,7 +624,7 @@ fn flash_attention_states_a_causal_mask_by_its_positions() {
             .iter()
             .copied()
             .find(|&input| {
-                g.meta(input).name.as_deref() != Some("q") && g.aval(input).shape == [2, 1]
+                g.meta(input).name().as_deref() != Some("q") && g.aval(input).shape == [2, 1]
             })
             .unwrap();
         let (attrs, inputs) = fused_attention(&g);
@@ -1338,7 +1340,7 @@ fn fuse_i32_pack_concat_absorbs_unit_last_axis_unpack_slices() {
             assert!(region.steps.iter().any(|step| {
                 step.inputs
                     .iter()
-                    .any(|operand| matches!(operand, FusedOperand::PackLane { lane: 1, .. }))
+                    .any(|operand| matches!(operand, FusedOperand::PackLane { lane, .. } if lane.index() == 1))
             }));
         }
         other => panic!("expected consumer Fused, got {}", other.name()),
@@ -1380,7 +1382,11 @@ fn fuse_does_not_cross_a_matmul_boundary() {
     let g = b.finish(out).unwrap();
     let fg = fuse(&g).unwrap();
     // matmul stays; neither add fuses with anything (each is a singleton across the boundary).
-    assert!(fg.eqns().iter().any(|e| matches!(e.op, OpKind::MatMul)));
+    assert!(
+        fg.eqns()
+            .iter()
+            .any(|e| matches!(e.op, OpKind::MatMul { .. }))
+    );
     assert!(!fg.eqns().iter().any(|e| matches!(e.op, OpKind::Fused(_))));
 }
 
@@ -1910,7 +1916,7 @@ fn adr0099_s2_stage_graphs_partition_every_equation_and_validate() {
 
         // Carried state stays whole: stage `s` owns exactly the pairs listed for it (by declared
         // name), and a pair the stage does not own never reaches its binding tables.
-        let state_name = |graph: &Graph, id: ValueId| graph.meta(id).name.clone().unwrap();
+        let state_name = |graph: &Graph, id: ValueId| graph.meta(id).name().unwrap().into_owned();
         for (stage_index, stage) in split.stages.iter().enumerate() {
             let owned: Vec<String> = stage
                 .graph
@@ -2669,7 +2675,7 @@ fn card533_unfused_decode_matmul_is_not_bit_exact() {
     assert!(
         matches!(
             graph.eqns(),
-            [eqn] if matches!(eqn.op, OpKind::MatMul)
+            [eqn] if matches!(eqn.op, OpKind::MatMul { .. })
         ),
         "the M==1 decode MatMul must stay a bare MatMul (no pass retags it), or this row proves nothing"
     );
@@ -3491,7 +3497,7 @@ fn canonicalize_preserves_unproved_spellings_and_removes_identity() {
         let graph = b.finish(output).unwrap();
         let (canonical, declines) = canonicalize_with_declines(&graph).unwrap();
         let root = canonical.eqns().last().unwrap();
-        assert!(matches!(root.op, OpKind::MatMul));
+        assert!(matches!(root.op, OpKind::MatMul { .. }));
         assert_eq!(root.out, graph.result());
         if scale == 1.0 {
             assert!(matches!(root.inputs[0], Operand::Value(id) if id == x.id()));

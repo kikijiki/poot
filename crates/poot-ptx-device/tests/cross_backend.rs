@@ -1005,7 +1005,7 @@ fn sample_token_greedy_ptx_matches_cpu() {
 
 /// Card 551a (SC-001, SC-010): `OpKind::RandomUniform` through the full compile/planner/executor
 /// contract matches the CPU oracle bit for bit on PTX/NVIDIA (tier 1, ADR-0101). `seed` is I32, so it
-/// rides as a `Slot::Sampler` (`make_inputs` is F32-only, like every other fixture in this file).
+/// rides as a `Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER)` (`make_inputs` is F32-only, like every other fixture in this file).
 #[test]
 fn random_uniform_ptx_matches_cpu() {
     use poot_graph_ir::Slot;
@@ -1018,7 +1018,7 @@ fn random_uniform_ptx_matches_cpu() {
     let b = Builder::for_tests();
     let seed = b
         .slot_named(
-            Slot::Sampler,
+            Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER),
             "seed",
             TensorType::new(vec![rows], poot_tensor::DType::I32),
         )
@@ -1086,7 +1086,7 @@ fn sample_token_topp_nucleus_ptx_matches_cpu() {
         let top_k = {
             use poot_graph_ir::Slot;
             b.slot_named(
-                Slot::Sampler,
+                Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER),
                 "top_k",
                 TensorType::new(vec![rows], poot_tensor::DType::I32),
             )
@@ -1194,7 +1194,7 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_ptx_matches_cpu() {
         .unwrap();
     let top_k = b
         .slot_named(
-            Slot::Sampler,
+            Slot::Owned(poot_graph_ir::ops::sampling::SAMPLER),
             "top_k",
             TensorType::new(vec![rows], poot_tensor::DType::I32),
         )

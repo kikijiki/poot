@@ -176,7 +176,7 @@ pub(crate) fn canonicalize_with_declines(
                 reason: NumericalRewriteReason::ReciprocalRounding,
             });
         }
-        if !matches!(eqn.op, OpKind::MatMul) {
+        if !matches!(eqn.op, OpKind::MatMul { .. }) {
             continue;
         }
         for operand in &mut eqn.inputs {
@@ -572,7 +572,7 @@ fn match_pre_mask(
 ) -> Result<(ValueId, f32, Option<f32>), AttentionDecline> {
     let pe = |v: ValueId| -> Option<&Eqn> { prod.get(&v).map(|&i| &g.eqns()[i]) };
     let eqn = pe(pre_mask).ok_or(AttentionDecline::ScoreProduct)?;
-    if matches!(eqn.op, OpKind::MatMul) && g.aval(pre_mask).dtype == DType::F32 {
+    if matches!(eqn.op, OpKind::MatMul { .. }) && g.aval(pre_mask).dtype == DType::F32 {
         // A pre-scaled query remains an input value, including its rounding boundary. The
         // fused definition's post-contraction multiplication by +1 is exact; no scale moves.
         return Ok((pre_mask, 1.0, None));
@@ -585,7 +585,7 @@ fn match_pre_mask(
         return Err(AttentionDecline::ScoreProduct);
     };
     let product_eqn = pe(product).ok_or(AttentionDecline::ScoreProduct)?;
-    if matches!(product_eqn.op, OpKind::MatMul) {
+    if matches!(product_eqn.op, OpKind::MatMul { .. }) {
         // No softcap: pre_mask = Mul(qk, scale_lit); `product` IS the qk MatMul directly.
         return Ok((product, scalar, None));
     }
@@ -625,7 +625,7 @@ fn match_pre_mask(
     let Scalar::F32(scale) = scale else {
         return Err(AttentionDecline::SoftcapShape);
     };
-    if !matches!(pe(qk).map(|eqn| &eqn.op), Some(OpKind::MatMul)) {
+    if !pe(qk).is_some_and(|eqn| eqn.op.is_plain_matmul()) {
         return Err(AttentionDecline::SoftcapShape);
     }
     Ok((qk, scale, Some(cap)))
@@ -656,7 +656,7 @@ pub(super) fn match_attention(
     let last_axis = |v: ValueId| g.aval(v).rank().saturating_sub(1);
 
     // root: out = MatMul(p, v_rep)
-    if !matches!(root.op, OpKind::MatMul) {
+    if !root.op.is_plain_matmul() {
         return Err(AttentionDecline::RootNotMatmul);
     }
     if g.aval(root.out).dtype != DType::F32 {
@@ -801,7 +801,7 @@ pub(super) fn match_attention(
 
     // qk = MatMul(q, kt); kt = Transpose(krep, [0,1,3,2])
     let qk_eqn = pe(qk).ok_or(AttentionDecline::QkMatmul)?;
-    if !matches!(qk_eqn.op, OpKind::MatMul) {
+    if !qk_eqn.op.is_plain_matmul() {
         return Err(AttentionDecline::QkMatmul);
     }
     let q = val(qk_eqn.inputs.first().ok_or(AttentionDecline::QkMatmul)?)
@@ -840,7 +840,7 @@ pub(super) fn match_attention(
         if !same_len {
             return Err(AttentionDecline::LiveKeyGuard);
         }
-        if !live_length_proved(g, prod, facts, len, lk) {
+        if !live_length_proved(g, facts, len, lk) {
             return Err(AttentionDecline::LiveLengthUnproved);
         }
     }
@@ -970,18 +970,12 @@ fn match_causal_mask(
 /// guard clamped the length (`facts.clamps`) fuses only when each such guard's witness is a declared
 /// validation output, so a bad length publishes nothing instead of turning silently into a valid-looking
 /// answer (spec 375).
-fn live_length_proved(
-    g: &Graph,
-    prod: &HashMap<ValueId, usize>,
-    facts: &RangeFacts,
-    len: ValueId,
-    lk: usize,
-) -> bool {
+fn live_length_proved(g: &Graph, facts: &RangeFacts, len: ValueId, lk: usize) -> bool {
     let live = i64::try_from(lk)
         .ok()
         .and_then(|lk| IndexRange::new(1, lk + 1));
     let in_range = live.is_some_and(|live| facts[len].is_some_and(|proved| proved.within(&live)));
-    in_range && first_unobserved_clamp(g, prod, facts, len).is_none()
+    in_range && first_unobserved_clamp(g, facts, len).is_none()
 }
 
 impl AttnMatch {

@@ -304,13 +304,8 @@ fn bf16_fragment_graph() -> poot_graph_ir::Graph {
     let w = b
         .constant("w", TensorType::new(vec![32, 16], DType::BF16))
         .unwrap();
-    let out = b.matmul(a, w).unwrap();
-    let graph = b.finish(out).unwrap();
-    let out = graph.result();
-    poot_graph_ir::test_support::graph_fixtures::derive(&graph, |draft| {
-        draft.values_mut()[out].aval.dtype = DType::F32;
-    })
-    .unwrap()
+    let out = b.matmul_f32_accumulate(a, w).unwrap();
+    b.finish(out).unwrap()
 }
 
 /// One degraded-device row: what changed, how, and the refusal it must produce.
@@ -411,13 +406,8 @@ fn f16_coopmat_graph() -> poot_graph_ir::Graph {
     let w = b
         .constant("w", TensorType::new(vec![16, 16], DType::F16))
         .unwrap();
-    let out = b.matmul(a, w).unwrap();
-    let graph = b.finish(out).unwrap();
-    let out = graph.result();
-    poot_graph_ir::test_support::graph_fixtures::derive(&graph, |draft| {
-        draft.values_mut()[out].aval.dtype = DType::F32;
-    })
-    .unwrap()
+    let out = b.matmul_f32_accumulate(a, w).unwrap();
+    b.finish(out).unwrap()
 }
 
 /// SC-001, the same rule for the SPIR-V cooperative-matrix kernel: a Vulkan device with no subgroup

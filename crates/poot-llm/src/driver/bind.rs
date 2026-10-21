@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use poot_graph_ir::ops::sampling::{HISTORY_READ_TAG, HISTORY_WRITE_TAG, MASK_TAG, PENALTY_TAG};
+use poot_graph_ir::ops::sampling::{HISTORY_WRITE_TAG, SamplerInput};
 use poot_graph_ir::{ForwardSlotMap, Graph, Slot, SlotKey};
 use poot_models::io::{
     Cadence, Fill, InputId, InputSet, InputValue, Layout, ModelSchema, PadValue, Per, Presence,
@@ -55,13 +55,13 @@ impl PassInput {
     /// The slot a pass declares this input as.
     pub(super) fn slot_key(self) -> SlotKey {
         match self {
-            PassInput::LoraIndex => SlotKey::new(Slot::LoraIdx, None),
-            PassInput::SamplerSeed => SlotKey::new(Slot::Sampler, Some("seed")),
-            PassInput::SamplerParams => SlotKey::new(Slot::Sampler, Some("params")),
-            PassInput::SamplerTopK => SlotKey::new(Slot::Sampler, Some("top_k")),
-            PassInput::SamplerPenalty => SlotKey::new(Slot::Sampler, Some(PENALTY_TAG)),
-            PassInput::SamplerMask => SlotKey::new(Slot::Sampler, Some(MASK_TAG)),
-            PassInput::HistoryRead => SlotKey::new(Slot::Sampler, Some(HISTORY_READ_TAG)),
+            PassInput::LoraIndex => SlotKey::new(Slot::Owned(poot_graph_plan::LORA_IDX), None),
+            PassInput::SamplerSeed => SamplerInput::Seed.key(),
+            PassInput::SamplerParams => SamplerInput::Params.key(),
+            PassInput::SamplerTopK => SamplerInput::TopK.key(),
+            PassInput::SamplerPenalty => SamplerInput::Penalty.key(),
+            PassInput::SamplerMask => SamplerInput::Mask.key(),
+            PassInput::HistoryRead => SamplerInput::HistoryRead.key(),
             PassInput::HistoryWrite => SlotKey::new(Slot::WriteMap, Some(HISTORY_WRITE_TAG)),
             PassInput::BeamRows => super::reorder::beam_rows_slot(),
         }

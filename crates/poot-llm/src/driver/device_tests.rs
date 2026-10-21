@@ -4586,7 +4586,7 @@ fn glm53_flash_mtp_chain_matches_the_reference(choice: BackendChoice) {
         assert!(
             graph
                 .state()
-                .any(|(input, _)| graph.meta(input).name.as_deref() == Some(HIDDEN_CARRY_STATE)),
+                .any(|(input, _)| graph.meta(input).name().as_deref() == Some(HIDDEN_CARRY_STATE)),
             "{program} at {tokens} tokens declares the carry"
         );
         let graph = bind_packed_weights(&graph, &formats).unwrap();

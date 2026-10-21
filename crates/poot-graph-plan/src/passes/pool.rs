@@ -5,11 +5,11 @@
 //! One [`PoolSite`] is one selection of expert ids and the tables its indexed contractions read (the
 //! up and down projections of one layer share a site). For each site the pass
 //!
-//! - declares the site's [`Slot::ExpertPoolMap`] `[E]` (the pool row holding global expert `e`, or `-1`),
+//! - declares the site's `EXPERT_POOL_MAP` `[E]` (the pool row holding global expert `e`, or `-1`),
 //! - inserts `Gather(map, ids)` just before the first contraction that reads the ids and points every
 //!   contraction of the site at the translated ids,
 //! - rebinds each table const (a dense `[E, ..]` stack, or each source role of a packed stack) as a
-//!   resident [`Slot::ExpertPool`] `[P, ..]` of the same name, and a packed contraction's `Indexed`
+//!   resident `EXPERT_POOL` `[P, ..]` of the same name, and a packed contraction's `Indexed`
 //!   expert count becomes `P`.
 //!
 //! The translating `Gather` is where the program is cut: everything before it computes the ids, the
@@ -31,7 +31,7 @@ use poot_graph_ir::graph::{
 use poot_graph_ir::op::{ContractionRows, OpKind};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{
-    GuardValues, IndexGuardEmitError, IndexGuardError, ShapeError, emit_index_guard,
+    GuardValues, IndexGuardEmitError, IndexGuardError, OwnedSlot, ShapeError, emit_index_guard,
 };
 use poot_tensor::DType;
 
@@ -40,6 +40,26 @@ use super::routed_experts::routed_expert_sites;
 use crate::ExpansionError;
 
 const STAGE: &str = "pool_experts";
+
+/// A site's expert-pool assignment table `[E]` (I32, the index dtype `Gather` reads): entry `e` is the pool slot
+/// currently holding global expert `e`, or `-1` when not resident in that layer's pool this step. An in-graph
+/// `Gather` translates the router's global expert ids into pool-slot ids with it, so the unmodified
+/// `IndexedMatMul` op addresses a smaller `[P, ..]` pool weight instead of the full `[E, ..]` stack.
+///
+/// One graph contains many (one per MoE layer, each with different content in the same step), told apart by the
+/// tag `site.N`. A binder resolves them per key, never per role. A refill moves experts between slots, so it is a
+/// slot rebound every step, never a `Const` (the const cache keys by name and element count and would serve a
+/// stale table).
+pub const EXPERT_POOL_MAP: OwnedSlot = OwnedSlot::i32_tensor("expertpoolmap");
+
+/// An expert table paged through a pool: one `[P, ..]` slot per pooled routed table (a dense `[E, ..]` stack or
+/// one packed source role of it), declared by the pool pass in place of the table's `Const` and tagged with that
+/// const's name. Unlike every other slot it is not written from the step's inputs: it is resident for the
+/// executable's life and the expert-residency manager refills one row at a time at a sync point. Several exist in
+/// one graph, one per table, so the key is its tag, never the role. Its buffer holds the table's stored bytes.
+pub const EXPERT_POOL: OwnedSlot = OwnedSlot::new("expertpool", true, |aval, _| {
+    aval.shape.is_empty().then_some("a tensor with a pool axis")
+});
 
 /// One pooled table: the const it replaces (its name is how the weight map finds the stored experts), the
 /// resident slot that stands in for it, and that slot's type, `[P, ..]`.
@@ -240,7 +260,7 @@ pub(crate) fn pool_experts(
         let layer = g.eqns()[first].layer;
         let tag = format!("site.{ordinal}");
         let map = pooled.declare_slot(
-            Slot::ExpertPoolMap,
+            Slot::Owned(EXPERT_POOL_MAP),
             &tag,
             TensorType::new(vec![site.experts], DType::I32),
         )?;
@@ -290,7 +310,16 @@ pub(crate) fn pool_experts(
         }
         let mut weights = Vec::with_capacity(site.tables.len());
         for table in &site.tables {
-            let slot = pooled.rebind_const_as_pool(table.value, slots)?;
+            let mut pooled_aval = pooled.aval(table.value).clone();
+            *pooled_aval
+                .shape
+                .first_mut()
+                .ok_or(PoolError::TableNotPageable {
+                    eqn: site.eqns[0],
+                    value: table.value,
+                })? = slots;
+            let slot =
+                pooled.rebind_const_as_slot(table.value, Slot::Owned(EXPERT_POOL), pooled_aval)?;
             weights.push(PooledWeight {
                 name: table.name.clone(),
                 slot,
@@ -302,7 +331,7 @@ pub(crate) fn pool_experts(
             experts: site.experts,
             slots,
             ids: BoundaryId(site.ids),
-            map: SlotKey::new(Slot::ExpertPoolMap, Some(&tag)),
+            map: SlotKey::new(Slot::Owned(EXPERT_POOL_MAP), Some(&tag)),
             weights,
         });
     }
@@ -482,9 +511,9 @@ fn find(g: &Graph) -> Result<Vec<Found>, PoolError> {
                 }
                 let name = g
                     .meta(table)
-                    .name
-                    .clone()
-                    .expect("walk_to_const returns a named const");
+                    .name()
+                    .expect("walk_to_const returns a named const")
+                    .into_owned();
                 // Every reader of the const and of each view must be this site's own chain.
                 let mut allowed: HashSet<usize> = allowed_start.iter().copied().collect();
                 allowed.extend(chain.iter().copied());
@@ -545,7 +574,7 @@ fn walk_to_const(
             None => {
                 let meta = g.meta(value);
                 return if meta.storage == Storage::Const
-                    && meta.name.is_some()
+                    && meta.name().is_some()
                     && !g.aval(value).shape.is_empty()
                 {
                     Ok((value, chain))

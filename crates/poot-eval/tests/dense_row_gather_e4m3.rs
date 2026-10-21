@@ -11,8 +11,8 @@
 use poot_eval::fp8::e4m3fn_tensor;
 use poot_eval::{EvalOptions, Value};
 use poot_graph_ir::{
-    BinOp, Eqn, Graph, GraphEdit, OpKind, Operand, Scalar, Slot, Storage, TensorType, ValueId,
-    ValueMeta,
+    BinOp, Eqn, Graph, GraphEdit, OpKind, Operand, Scalar, Slot, SlotKey, Storage, TensorType,
+    ValueId, ValueMeta,
 };
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
@@ -52,11 +52,13 @@ fn build_graph(
     g.consts_mut().push(table_id);
 
     let index_shape = vec![index_len];
-    let index_id = g.values_mut().push(ValueMeta::new(
-        TensorType::new(index_shape.clone(), DType::I32),
-        Storage::Slot(Slot::Token),
-        None,
-    ));
+    let index_id = g.values_mut().push(
+        ValueMeta::slot_input(
+            TensorType::new(index_shape.clone(), DType::I32),
+            SlotKey::new(Slot::Token, None),
+        )
+        .expect("a token slot admits an I32 tensor"),
+    );
     g.inputs_mut().push(index_id);
     g.slots_mut().push((index_id, Slot::Token));
 

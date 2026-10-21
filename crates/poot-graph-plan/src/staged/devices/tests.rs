@@ -461,7 +461,7 @@ fn the_weight_derivation_of_a_layered_decode_places_every_owner_on_its_stages() 
             .iter()
             .filter(|&&value| {
                 stage.2.graph().meta(value).storage == poot_graph_ir::Storage::Const
-                    && stage.2.graph().meta(value).name.is_some()
+                    && stage.2.graph().meta(value).name().is_some()
             })
             .map(|&value| {
                 crate::staged::devices::value_bytes(

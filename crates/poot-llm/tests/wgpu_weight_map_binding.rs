@@ -67,7 +67,7 @@ fn fused_and_stacked_views_equal_separate_storage() {
 /// its gather and nothing else.
 const HOSTED: Qwen2Dims = Qwen2Dims { vocab: 256, ..DIMS };
 
-/// SC-006: with a fixture cap that makes legalize host the embed gather as `Slot::TokenEmbed`, the
+/// SC-006: with a fixture cap that makes legalize host the embed gather as ``TOKEN_EMBED``, the
 /// binder fills it from the step's tokens and the logits equal the unhosted run.
 #[test]
 fn a_hosted_embed_gather_equals_the_device_gather() {
@@ -81,7 +81,9 @@ fn a_hosted_embed_gather_equals_the_device_gather() {
         let g = poot_graph_plan::legalize(&g, &caps, &poot_graph_plan::CompileLimits::STANDARD)
             .unwrap();
         assert!(
-            g.slots().iter().any(|&(_, slot)| slot == Slot::TokenEmbed),
+            g.slots()
+                .iter()
+                .any(|&(_, slot)| slot == Slot::Owned(poot_graph_plan::TOKEN_EMBED)),
             "the fixture cap hosts the embed gather"
         );
         g

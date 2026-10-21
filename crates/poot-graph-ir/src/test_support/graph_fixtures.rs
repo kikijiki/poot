@@ -97,8 +97,7 @@ pub fn derive(
 
 /// Recompute every equation's declared output type from its operands' types, in order. A fixture that
 /// changes an operation (a different axis, another permutation) calls this so the graph stays well
-/// formed and only the shape consequences of the change remain. A `MatMul` keeps an f32-accumulate
-/// widening it already declares.
+/// formed and only the shape consequences of the change remain.
 pub fn reinfer(draft: &mut crate::GraphEdit) {
     for index in 0..draft.eqns().len() {
         let eqn = draft.eqns()[index].clone();
@@ -113,22 +112,7 @@ pub fn reinfer(draft: &mut crate::GraphEdit) {
         let is_literal =
             |index: usize| matches!(eqn.inputs.get(index), Some(crate::Operand::Lit(_)));
         if let Ok(inferred) = eqn.op.infer(crate::Operands::new(&ins, &is_literal)) {
-            let kept_widening = matches!(eqn.op, crate::OpKind::MatMul)
-                && draft.values()[eqn.out].aval.dtype == poot_tensor::DType::F32
-                && inferred.shape == draft.values()[eqn.out].aval.shape;
-            if !kept_widening {
-                draft.values_mut()[eqn.out].aval = inferred;
-            }
+            draft.values_mut()[eqn.out].aval = inferred;
         }
     }
-}
-
-/// `g` with `value`'s declared type replaced by `aval`, everything else unchanged: a fixture for a graph
-/// shape no tracer emits (a matmul that accumulates and stores f32 over bf16 operands).
-pub fn with_declared_type(
-    g: &Graph,
-    value: crate::ValueId,
-    aval: TensorType,
-) -> Result<Graph, crate::EditError> {
-    derive(g, |draft| draft.values_mut()[value].aval = aval)
 }

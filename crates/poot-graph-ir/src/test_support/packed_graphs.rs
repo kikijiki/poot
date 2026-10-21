@@ -41,7 +41,7 @@ pub fn packed_linear(
         None => weight,
     };
     let output = plan.equation(
-        crate::op::OpKind::MatMul,
+        crate::op::OpKind::matmul(),
         vec![Operand::Value(x.id()), Operand::Value(weight.id())],
     )?;
     let output = match bias {
@@ -118,7 +118,7 @@ pub fn packed_block_diagonal_linear(
         vec![Operand::Value(weight.id())],
     )?;
     let output = plan.equation(
-        crate::op::OpKind::MatMul,
+        crate::op::OpKind::matmul(),
         vec![Operand::Value(x.id()), Operand::Value(weight.id())],
     )?;
     let output = match bias {
@@ -284,12 +284,13 @@ mod tests {
         assert_eq!(graph.consts().len(), 4);
         assert!(graph.slots().is_empty());
         let [weight_name, scale_name] = PackedSourceName::pair("layer");
+        let names: Vec<_> = graph
+            .inputs()
+            .iter()
+            .map(|&value| graph.meta(value).name())
+            .collect();
         assert_eq!(
-            graph
-                .inputs()
-                .iter()
-                .map(|&value| graph.meta(value).name.as_deref())
-                .collect::<Vec<_>>(),
+            names.iter().map(|name| name.as_deref()).collect::<Vec<_>>(),
             vec![
                 Some("x"),
                 Some("bias"),
@@ -302,7 +303,7 @@ mod tests {
             [
                 OpKind::PackedDequant { .. },
                 OpKind::Transpose { perm },
-                OpKind::MatMul,
+                OpKind::MatMul { .. },
                 OpKind::Binary(BinOp::Add),
             ] if perm.as_slice() == [1, 0]
         ));
@@ -360,7 +361,7 @@ mod tests {
                 .iter()
                 .map(|&carrier| {
                     let meta = graph.meta(carrier);
-                    let name = PackedSourceName::parse(meta.name.as_deref().unwrap()).unwrap();
+                    let name = PackedSourceName::parse(&meta.name().unwrap()).unwrap();
                     assert_eq!(name.linear_id(), "layer");
                     assert_eq!(meta.storage, Storage::Const);
                     (name.role(), graph.aval(carrier).dtype)
@@ -459,7 +460,7 @@ mod tests {
                 OpKind::PackedDequant { .. },
                 OpKind::Reshape { shape },
                 OpKind::Transpose { perm },
-                OpKind::MatMul,
+                OpKind::MatMul { .. },
             ] if shape.as_slice() == [4, 2, 35] && perm.as_slice() == [0, 2, 1]
         ));
         Ok(())
@@ -547,7 +548,7 @@ mod tests {
                 let carrier = operand_value(eqn, 2 + position);
                 let expected = WeightRef::whole(TEST_STACK).with_source(role);
                 assert_eq!(
-                    graph.meta(carrier).name.as_deref(),
+                    graph.meta(carrier).name().as_deref(),
                     Some(expected.name().as_str())
                 );
                 assert_eq!(graph.meta(carrier).weight(), Some(expected));

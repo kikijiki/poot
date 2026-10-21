@@ -96,7 +96,7 @@ fn store_for(graphs: &[&Graph]) -> WeightStore {
         for &id in g.inputs() {
             let meta = g.meta(id);
             if meta.storage == Storage::Const {
-                entries.insert(meta.name.clone().unwrap(), meta.aval.shape.clone());
+                entries.insert(meta.name().unwrap().into_owned(), meta.aval.shape.clone());
             }
         }
     }
@@ -201,8 +201,8 @@ fn oracle_step(
         let meta = g.meta(id);
         let value = match meta.storage {
             Storage::Const => {
-                let name = meta.name.as_deref().unwrap();
-                let WeightEntry::Dense(dense) = store.get(name).unwrap() else {
+                let name = meta.name().unwrap();
+                let WeightEntry::Dense(dense) = store.get(name.as_ref()).unwrap() else {
                     unreachable!()
                 };
                 let data: Vec<f32> = bytemuck_f32(dense.bytes().as_slice());
@@ -210,7 +210,7 @@ fn oracle_step(
             }
             Storage::State => Value::from(
                 state
-                    .entry(meta.name.clone().unwrap())
+                    .entry(meta.name().unwrap().into_owned())
                     .or_insert_with(|| HostTensor::zeros(meta.aval.shape.clone()))
                     .clone(),
             ),
@@ -230,7 +230,7 @@ fn oracle_step(
     let evaluation = eval(g, &inputs, EvalOptions::default()).unwrap();
     for ((si, _), t) in g.state().zip(evaluation.state) {
         state.insert(
-            g.meta(si).name.clone().unwrap(),
+            g.meta(si).name().unwrap().into_owned(),
             t.into_host().expect("dense state tensor"),
         );
     }
@@ -936,14 +936,14 @@ fn card551b_push_sampler_rows(
     let seed_shape = g.meta(seed_id).aval.shape.clone();
     let params_shape = g.meta(params_id).aval.shape.clone();
     values.push(SlotValue {
-        key: SlotKey::new(Slot::Sampler, Some("seed")),
+        key: poot_graph_ir::ops::sampling::SamplerInput::Seed.key(),
         shape: seed_shape,
         f32s: vec![],
         i32s: vec![seed],
         dtype: DType::I32,
     });
     values.push(SlotValue {
-        key: SlotKey::new(Slot::Sampler, Some("params")),
+        key: poot_graph_ir::ops::sampling::SamplerInput::Params.key(),
         shape: params_shape,
         f32s: params.to_vec(),
         i32s: vec![],
@@ -1054,7 +1054,7 @@ fn card551b_sc003_nan_logits_are_a_typed_fault_ptx() {
         for &id in suffix_g.inputs() {
             let meta = suffix_g.meta(id);
             if meta.storage == Storage::Const {
-                entries.insert(meta.name.clone().unwrap(), meta.aval.shape.clone());
+                entries.insert(meta.name().unwrap().into_owned(), meta.aval.shape.clone());
             }
         }
         let mut builder = WeightStore::builder();

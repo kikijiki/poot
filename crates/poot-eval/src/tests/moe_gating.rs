@@ -315,10 +315,13 @@ fn moe_sparse_matches_dense() {
         let mut inputs = HashMap::new();
         for &id in g.inputs() {
             let meta = g.meta(id);
-            let name = meta.name.as_deref().unwrap();
+            let name = meta.name().unwrap();
             inputs.insert(
                 id,
-                Value::from(HostTensor::f32(meta.aval.shape.clone(), data[name].clone())),
+                Value::from(HostTensor::f32(
+                    meta.aval.shape.clone(),
+                    data[name.as_ref()].clone(),
+                )),
             );
         }
         inputs
@@ -383,10 +386,13 @@ fn moe_grouped_matches_dense() {
         let mut inputs = HashMap::new();
         for &id in g.inputs() {
             let meta = g.meta(id);
-            let name = meta.name.as_deref().unwrap();
+            let name = meta.name().unwrap();
             inputs.insert(
                 id,
-                Value::from(HostTensor::f32(meta.aval.shape.clone(), data[name].clone())),
+                Value::from(HostTensor::f32(
+                    meta.aval.shape.clone(),
+                    data[name.as_ref()].clone(),
+                )),
             );
         }
         inputs
@@ -491,8 +497,8 @@ fn eval_tied_route(route: RouteKind, scores: &[f32], k: usize, w_in: &[f32], w_o
         .inputs()
         .iter()
         .map(|&id| {
-            let name = graph.meta(id).name.as_deref().expect("named fixture input");
-            (id, Value::from(named[name].clone()))
+            let name = graph.meta(id).name().expect("named fixture input");
+            (id, Value::from(named[name.as_ref()].clone()))
         })
         .collect();
     eval(&graph, &inputs, EvalOptions::default())
@@ -672,7 +678,7 @@ fn deterministic_moe_routes_match_stable_sort_table() {
             .iter()
             .copied()
             .map(|id| {
-                let name = graph.meta(id).name.as_deref().expect("named gate input");
+                let name = graph.meta(id).name().expect("named gate input");
                 let tensor = if name == "scores" {
                     HostTensor::f32(vec![1, 5], case.scores.to_vec())
                 } else {

@@ -152,16 +152,18 @@ fn exact_i32_fused_body_keeps_i32_locals_and_literals() {
                 poot_kernelgen::FusedStep {
                     op: poot_kernelgen::FusedScalarOp::Binary(BinOp::BitAnd),
                     inputs: vec![
-                        poot_kernelgen::FusedInput::Leaf(0),
+                        poot_kernelgen::FusedInput::Leaf(poot_kernelgen::LeafId::new(0)),
                         poot_kernelgen::FusedInput::LitI32(-1),
                     ],
                 },
                 poot_kernelgen::FusedStep {
                     op: poot_kernelgen::FusedScalarOp::Clz,
-                    inputs: vec![poot_kernelgen::FusedInput::Step(0)],
+                    inputs: vec![poot_kernelgen::FusedInput::Step(
+                        poot_kernelgen::StepId::new(0),
+                    )],
                 },
             ],
-            output: poot_kernelgen::FusedInput::Step(1),
+            output: poot_kernelgen::FusedInput::Step(poot_kernelgen::StepId::new(1)),
         },
         None,
     )
@@ -211,12 +213,21 @@ fn packed_i32_fused_kernel_guards_with_output_len_over_lanes() {
         &poot_kernelgen::FusedKernel {
             leaf_tys: vec![poot_kernelgen::LeafTy::I32; 1],
             steps: vec![],
-            output: poot_kernelgen::FusedInput::LeafLane { leaf: 0, lane: 0 },
+            output: poot_kernelgen::FusedInput::LeafLane {
+                leaf: poot_kernelgen::LeafId::new(0),
+                lane: poot_kernelgen::LaneId::new(0),
+            },
         },
         None,
         &[
-            poot_kernelgen::FusedInput::LeafLane { leaf: 0, lane: 0 },
-            poot_kernelgen::FusedInput::LeafLane { leaf: 0, lane: 1 },
+            poot_kernelgen::FusedInput::LeafLane {
+                leaf: poot_kernelgen::LeafId::new(0),
+                lane: poot_kernelgen::LaneId::new(0),
+            },
+            poot_kernelgen::FusedInput::LeafLane {
+                leaf: poot_kernelgen::LeafId::new(0),
+                lane: poot_kernelgen::LaneId::new(1),
+            },
         ],
     )
     .expect("fused_i32_views_grid_pack precondition");
@@ -265,12 +276,21 @@ fn packed_i32_leaf_lane_broadcasts_a_unit_prefix() {
         &poot_kernelgen::FusedKernel {
             leaf_tys: vec![poot_kernelgen::LeafTy::I32; 1],
             steps: vec![],
-            output: poot_kernelgen::FusedInput::LeafLane { leaf: 0, lane: 0 },
+            output: poot_kernelgen::FusedInput::LeafLane {
+                leaf: poot_kernelgen::LeafId::new(0),
+                lane: poot_kernelgen::LaneId::new(0),
+            },
         },
         None,
         &[
-            poot_kernelgen::FusedInput::LeafLane { leaf: 0, lane: 0 },
-            poot_kernelgen::FusedInput::LeafLane { leaf: 0, lane: 1 },
+            poot_kernelgen::FusedInput::LeafLane {
+                leaf: poot_kernelgen::LeafId::new(0),
+                lane: poot_kernelgen::LaneId::new(0),
+            },
+            poot_kernelgen::FusedInput::LeafLane {
+                leaf: poot_kernelgen::LeafId::new(0),
+                lane: poot_kernelgen::LaneId::new(1),
+            },
         ],
     )
     .expect("fused_i32_views_grid_pack precondition");

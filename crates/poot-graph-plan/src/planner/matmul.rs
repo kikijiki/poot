@@ -177,7 +177,7 @@ pub(crate) fn epilogue_head_lowers(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> b
     let out_shape = &g.aval(eqn.out).shape;
     let out_numel = out_numel_saturating(out_shape);
     match &eqn.op {
-        OpKind::MatMul => {
+        OpKind::MatMul { .. } => {
             out_shape.len() >= 2
                 && matches!(
                     matmul_route(
@@ -326,7 +326,7 @@ pub(super) fn plan(
     let fty = fty_ty;
     let generate = |request: KernelRequest| Planned::generated(site, request, backend, caps);
     let planned = match &eqn.op {
-        OpKind::MatMul => {
+        OpKind::MatMul { .. } => {
             let (a, b) = (shape(ids[0]), shape(ids[1]));
             let r = out_shape.len();
             let (nn, kk) = (out_shape[r - 1], a[a.len() - 1]);

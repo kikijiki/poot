@@ -196,7 +196,7 @@ fn run(
         .map(|(&id, t)| {
             let meta = p.graph.meta(id);
             assert_eq!(meta.storage, Storage::Const);
-            let name: &'static str = Box::leak(meta.name.clone().unwrap().into_boxed_str());
+            let name: &'static str = Box::leak(meta.name().unwrap().into_owned().into_boxed_str());
             poot_executor_parity::ConstFixture {
                 name,
                 tensor: t.clone(),

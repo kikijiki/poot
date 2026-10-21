@@ -32,7 +32,7 @@ fn roots(g: &Graph) -> usize {
     };
     g.eqns()
         .iter()
-        .filter(|e| matches!(e.op, OpKind::MatMul))
+        .filter(|e| matches!(e.op, OpKind::MatMul { .. }))
         .filter_map(|e| producer(e.inputs.first()))
         .filter(|div| matches!(div.op, OpKind::Binary(BinOp::Div)))
         .filter_map(|div| producer(div.inputs.first()))

@@ -24,9 +24,11 @@ enum Identity {
 
 fn identity(meta: &ValueMeta) -> Identity {
     match meta.storage {
-        Storage::Const | Storage::State => {
-            Identity::Named(meta.name.clone().expect("a const or state binder is named"))
-        }
+        Storage::Const | Storage::State => Identity::Named(
+            meta.name()
+                .expect("a const or state binder is named")
+                .into_owned(),
+        ),
         Storage::Slot(_) => Identity::Slot(
             meta.slot_key()
                 .cloned()
@@ -100,7 +102,11 @@ pub fn chain(graph: &Graph, stages: &[&Graph], inputs: &HashMap<ValueId, Value>)
             witnesses.insert(declaration.id, value);
         }
         for ((state_input, _), value) in g.state().zip(result.state) {
-            let name = g.meta(state_input).name.clone().expect("state is named");
+            let name = g
+                .meta(state_input)
+                .name()
+                .expect("state is named")
+                .into_owned();
             state_by_name.insert(name, value);
         }
         if index + 1 == stages.len() {
@@ -110,13 +116,9 @@ pub fn chain(graph: &Graph, stages: &[&Graph], inputs: &HashMap<ValueId, Value>)
     let state = graph
         .state()
         .map(|(state_input, _)| {
-            let name = graph
-                .meta(state_input)
-                .name
-                .as_ref()
-                .expect("state is named");
+            let name = graph.meta(state_input).name().expect("state is named");
             state_by_name
-                .remove(name)
+                .remove(name.as_ref())
                 .unwrap_or_else(|| panic!("no stage owns carried state {name}"))
         })
         .collect();
@@ -139,16 +141,12 @@ pub fn bind_decode(g: &Graph) -> HashMap<ValueId, Value> {
         let tensor = match meta.storage {
             Storage::Slot(poot_graph_ir::Slot::Token) => HostTensor::i32(shape, vec![5; numel]),
             Storage::Slot(poot_graph_ir::Slot::Pos) => HostTensor::i32(shape, vec![3; numel]),
-            // Adapter 1 on the first row, no adapter on the rest.
-            Storage::Slot(poot_graph_ir::Slot::LoraIdx) => {
-                HostTensor::i32(shape, (0..numel).map(|row| i32::from(row == 0)).collect())
-            }
             Storage::Slot(poot_graph_ir::Slot::Activation) => {
                 HostTensor::f32(shape, fill(numel, 31).iter().map(|v| v * 0.5).collect())
             }
             Storage::Slot(other) => panic!("unexpected slot {other:?}"),
             Storage::Const => {
-                let name = meta.name.as_deref().expect("a constant is named");
+                let name = meta.name().expect("a constant is named");
                 let seed = name.bytes().fold(1469598103934665603u64, |h, c| {
                     (h ^ u64::from(c)).wrapping_mul(1099511628211)
                 });

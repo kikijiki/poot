@@ -125,7 +125,7 @@ pub fn store_with(g: &Graph, adjust: impl Fn(&str, &mut [f32])) -> WeightStore {
     for &id in g.inputs() {
         let meta = g.meta(id);
         if meta.storage == Storage::Const {
-            entries.insert(meta.name.clone().unwrap(), meta.aval.shape.clone());
+            entries.insert(meta.name().unwrap().into_owned(), meta.aval.shape.clone());
         }
     }
     let mut builder = WeightStore::builder();

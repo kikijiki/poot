@@ -139,7 +139,7 @@ pub(crate) fn projection_consts(model: &dyn Model) -> Vec<String> {
 pub(crate) fn declared_dtype(g: &Graph, name: &str) -> Option<DType> {
     g.inputs()
         .iter()
-        .find(|&&id| g.meta(id).name.as_deref() == Some(name))
+        .find(|&&id| g.meta(id).name().as_deref() == Some(name))
         .map(|&id| g.aval(id).dtype)
 }
 
@@ -503,14 +503,24 @@ pub(crate) fn assert_same_graph(a: &Graph, b: &Graph) {
     assert_eq!(a.eqns().len(), b.eqns().len(), "equation count");
     for (i, (x, y)) in a.eqns().iter().zip(b.eqns()).enumerate() {
         assert_eq!(format!("{x:?}"), format!("{y:?}"), "equation {i}");
-        assert_eq!(a.meta(x.out).name, b.meta(y.out).name, "equation {i} name");
+        assert_eq!(
+            a.meta(x.out).name(),
+            b.meta(y.out).name(),
+            "equation {i} name"
+        );
     }
     let named = |g: &dyn Fn(ValueId) -> Option<String>, ids: &[ValueId]| -> Vec<Option<String>> {
         ids.iter().map(|&id| g(id)).collect()
     };
     assert_eq!(
-        named(&|id| a.meta(id).name.clone(), a.inputs()),
-        named(&|id| b.meta(id).name.clone(), b.inputs()),
+        named(
+            &|id| a.meta(id).name().map(std::borrow::Cow::into_owned),
+            a.inputs()
+        ),
+        named(
+            &|id| b.meta(id).name().map(std::borrow::Cow::into_owned),
+            b.inputs()
+        ),
         "named inputs"
     );
 }

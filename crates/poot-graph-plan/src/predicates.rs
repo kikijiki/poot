@@ -290,7 +290,7 @@ pub(crate) fn is_decode_gemv_in(
     out_numel: usize,
     caps: &DeviceCaps,
 ) -> bool {
-    if !matches!(eqn.op, OpKind::MatMul) {
+    if !matches!(eqn.op, OpKind::MatMul { .. }) {
         return false;
     }
     // The imported decode GEMV is f32; bf16 decode on NVPTX/AmdGcn takes the tensor-core path.
@@ -647,7 +647,7 @@ pub(crate) fn is_tileable_matmul_in(g: GraphTables<'_>, eqn: &Eqn) -> bool {
     // A `ContractionEpilogue` over a `MatMul` head is judged by its head operands (its extra inputs are the
     // epilogue's leaves); its output is the head's.
     let head_operands = match &eqn.op {
-        OpKind::MatMul => 2,
+        OpKind::MatMul { .. } => 2,
         OpKind::ContractionEpilogue {
             head: ContractionHead::MatMul,
             ..
@@ -685,7 +685,7 @@ pub(crate) fn is_tiled_gemm_in(
     // tiled GEMM (`is_tileable_matmul_in`, WorkgroupLocalDecl with undef init) is the tiled path. BF16
     // matmul takes the tc-arm on NVPTX and matmul_batched_dt on AmdGcn.
     if g.aval(eqn.out).dtype != DType::F32
-        || !matches!(eqn.op, OpKind::MatMul)
+        || !matches!(eqn.op, OpKind::MatMul { .. })
         || !caps.imported_lds_array_bodies
     {
         return false;
@@ -772,7 +772,7 @@ pub(crate) fn is_batched_tiled_gemm_in(
     // matmul_batched_dt.
     if g.aval(eqn.out).dtype != DType::F32
         || !caps.imported_lds_array_bodies
-        || !matches!(eqn.op, OpKind::MatMul)
+        || !matches!(eqn.op, OpKind::MatMul { .. })
     {
         return false;
     }
@@ -818,7 +818,7 @@ pub(crate) fn is_decode_attn_gemv_in(
     out_numel: usize,
     caps: &DeviceCaps,
 ) -> bool {
-    if g.aval(eqn.out).dtype != DType::F32 || !matches!(eqn.op, OpKind::MatMul) {
+    if g.aval(eqn.out).dtype != DType::F32 || !matches!(eqn.op, OpKind::MatMul { .. }) {
         return false;
     }
     let r = out_shape.len();
@@ -964,7 +964,7 @@ pub(crate) fn is_elementwise_2d_in(
                 && dense_decode_gemv_in(eqn, out_shape, out_numel, caps).is_none()
         }
         // Naive fallback only, when every specialized MatMul plan declines (mirrors `plan_eqn`'s routing).
-        OpKind::MatMul => {
+        OpKind::MatMul { .. } => {
             out_numel > fold_ceiling
                 && !is_decode_gemv_in(g, eqn, out_shape, out_numel, caps)
                 && !is_tiled_gemm_in(g, eqn, out_shape, out_numel, caps)
@@ -1012,7 +1012,7 @@ fn matmul_takes_tensorcore(
     out_shape: &[usize],
     caps: &DeviceCaps,
 ) -> bool {
-    if !matches!(eqn.op, OpKind::MatMul) {
+    if !matches!(eqn.op, OpKind::MatMul { .. }) {
         return false;
     }
     let ids = value_ids(eqn);

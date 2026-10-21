@@ -3,7 +3,7 @@
 //! `VK_KHR_cooperative_matrix` and the SPIR-V the planner selects for it declares the capability, so a
 //! planned coopmat kernel is one the device runs.
 //!
-//! An F16 `[1, 32, 16] @ [16, 32]` matmul with the output retagged F32 (the shape
+//! An F16 `[1, 32, 16] @ [16, 32]` matmul accumulating F32 (the shape
 //! `matmul_spirv_coopmat_eligible` accepts) is compiled for the device's own measured target, must plan
 //! the coopmat arm, and must match the f16-rounded f32-accumulated CPU product. The row skips on a device
 //! with no cooperative-matrix hardware (it reports `TensorCoreSupport::None`).
@@ -37,7 +37,7 @@ fn f16_tensor(shape: Vec<usize>, data: &[f32]) -> HostTensor {
     )
 }
 
-/// `a[1, m, k] @ w[k, n]` over F16 operands with the output retagged F32.
+/// `a[1, m, k] @ w[k, n]` over F16 operands accumulating and storing F32.
 fn f16_in_f32_out_matmul_graph(m: usize, k: usize, n: usize) -> poot_graph_ir::Graph {
     let builder = Builder::for_tests();
     let a = builder
@@ -46,18 +46,8 @@ fn f16_in_f32_out_matmul_graph(m: usize, k: usize, n: usize) -> poot_graph_ir::G
     let w = builder
         .constant("w", TensorType::new(vec![k, n], DType::F16))
         .unwrap();
-    let product = builder.matmul(a, w).unwrap();
-    let graph = builder.finish(product).unwrap();
-    let out = graph
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
-        .expect("a matmul eqn")
-        .out;
-    poot_graph_ir::test_support::graph_fixtures::derive(&graph, |draft| {
-        draft.values_mut()[out].aval.dtype = DType::F32;
-    })
-    .unwrap()
+    let product = builder.matmul_f32_accumulate(a, w).unwrap();
+    builder.finish(product).unwrap()
 }
 
 #[test]
@@ -77,7 +67,7 @@ fn coopmat_matmul_plans_the_coopmat_arm_and_matches_the_cpu_product_on_vulkan() 
     let eqn = graph
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .unwrap();
     let planned = poot_graph_plan::plan_eqn_choice(
         &graph,

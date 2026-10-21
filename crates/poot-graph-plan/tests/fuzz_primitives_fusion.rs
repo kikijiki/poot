@@ -224,7 +224,10 @@ fn fused_equals_unfused_matmul_epilogue() {
             "seed {seed}: no Fused region after matmul epilogue (eqns: {n_fused})"
         );
         // The matmul itself must not have been absorbed.
-        let has_matmul = fg.eqns().iter().any(|e| matches!(e.op, OpKind::MatMul));
+        let has_matmul = fg
+            .eqns()
+            .iter()
+            .any(|e| matches!(e.op, OpKind::MatMul { .. }));
         assert!(
             has_matmul,
             "seed {seed}: matmul disappeared - fusion crossed the matmul boundary"

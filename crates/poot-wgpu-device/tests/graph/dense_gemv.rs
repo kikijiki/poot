@@ -246,7 +246,7 @@ fn a_contraction_keeps_its_lds_width_through_the_planner_on_wgpu() {
     let program = compile(&fixture.graph, &target, &OPTIONS).expect("the fixture compiles");
     let (eqn, plan) = program
         .planned()
-        .find(|(eqn, _)| matches!(eqn.op, OpKind::MatMul))
+        .find(|(eqn, _)| matches!(eqn.op, OpKind::MatMul { .. }))
         .expect("the scores @ V matmul");
     assert!(
         matches!(

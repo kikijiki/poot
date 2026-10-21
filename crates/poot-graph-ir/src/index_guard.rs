@@ -13,39 +13,26 @@
 //!
 //! ```text
 //! invalid     = Binary(GeU)(raw, Lit::I32(upper_exclusive))   [n] I32, every lane 0 or 1
-//! zero        = Binary(Sub)(raw, raw)                         [n] I32, every lane 0
-//! guarded     = Select(invalid, zero, raw)                    [n] I32, in range in every lane
+//! guarded     = Select(invalid, Lit::I32(0), raw)             [n] I32, in range in every lane
 //! invalid_f32 = Cast { to: F32 }(invalid)                     [n] F32
 //! witness     = Reduce { Sum, last axis, keepdim }(invalid_f32)  [.., 1] F32
 //! ```
 //!
-//! Three details are forced:
-//!
-//! - One unsigned comparison decides both bounds. `GeU` compares the I32 lanes as u32, so a negative id
-//!   becomes a very large unsigned value and fails the same test as an id at or above `upper_exclusive`.
-//!   There is no lower-bound comparison to keep in step with the upper one.
-//! - The condition is the *invalid* flag, not `valid`. The planner rejects a literal-first `Binary`, so
-//!   neither `GeU(Lit, raw)` nor `Sub(Lit(1), invalid)` can be planned. `Select` picks `if_true`
-//!   where the condition word is nonzero, so `Select(invalid, zero, raw)` is the same function of
-//!   `raw` that `Select(valid, raw, 0)` would be.
-//! - `zero` is a value, not a literal operand. The planner's `Select` builds a three-leaf kernel from the
-//!   equation's *value* operands, so a literal `0` would not produce three leaves. `Sub(raw, raw)` keeps
-//!   the guard self-contained: no caller-bound constant, exact on every lane, and already wired on device.
+//! One unsigned comparison decides both bounds. `GeU` compares the I32 lanes as u32, so a negative id
+//! becomes a very large unsigned value and fails the same test as an id at or above `upper_exclusive`.
+//! There is no lower-bound comparison to keep in step with the upper one.
 //!
 //! The guard condition and the witness observation are the same value, so nothing has to be tied together
-//! after the fact.
+//! after the fact: a witness is a declared validation output that [`crate::value_ranges`] proves observes the
+//! condition ([`crate::RangeFacts::observes`], from the `Cast` and `Reduce` rules), the same way it proves
+//! the guarded range.
 //!
 //! One emitter ([`emit_index_guard`]) writes the shape for any equation sink: [`Builder::guard_index_bounds`]
-//! appends it to a traced graph, and a graph pass appends it to the graph it rewrites. The one recognizer
-//! of a guard's witness ([`is_guard_witness`]) lives beside it and reads exactly this shape, so a consumer
-//! that must know a clamped lane is observed (the attention matcher, the expert-id check) cannot drift from
-//! the emitter.
-
-use std::collections::HashMap;
+//! appends it to a traced graph, and a graph pass appends it to the graph it rewrites.
 
 use crate::builder::{Builder, Traced};
 use crate::error::BuilderError;
-use crate::graph::{Eqn, Graph, Operand, ValueId};
+use crate::graph::{Operand, ValueId};
 use crate::op::{BinOp, OpKind, RedOp};
 use crate::types::{DType, Scalar, TensorType};
 
@@ -108,7 +95,7 @@ pub enum IndexGuardEmitError<E: std::error::Error + 'static> {
 }
 
 /// Emit the canonical guard (see the [module docs](self)) over `raw`, of type `raw_type`, through `emit`:
-/// each call appends one equation with the given operands and returns its output value. The five equations
+/// each call appends one equation with the given operands and returns its output value. The four equations
 /// are emitted in order and the last is the witness.
 ///
 /// This is the one definition of the shape; [`Builder::guard_index_bounds`] and graph passes both call it.
@@ -138,10 +125,9 @@ pub fn emit_index_guard<E: std::error::Error + 'static>(
         OpKind::Binary(BinOp::GeU),
         vec![value(raw), Operand::Lit(Scalar::I32(bound))],
     )?;
-    let zero = step(OpKind::Binary(BinOp::Sub), vec![value(raw), value(raw)])?;
     let guarded = step(
         OpKind::Select,
-        vec![value(invalid), value(zero), value(raw)],
+        vec![value(invalid), Operand::Lit(Scalar::I32(0)), value(raw)],
     )?;
     let invalid_f32 = step(OpKind::Cast { to: DType::F32 }, vec![value(invalid)])?;
     let witness = step(
@@ -155,45 +141,9 @@ pub fn emit_index_guard<E: std::error::Error + 'static>(
     Ok(GuardValues { guarded, witness })
 }
 
-/// Whether `witness` is the witness [`emit_index_guard`] emits for the guard whose invalid flag is
-/// `condition`: a keepdim last-axis `Sum` of the F32 cast of `condition`. Anything else (a witness over
-/// another value, a reduction over another axis) does not observe every clamped lane. `producer` maps each
-/// value to its equation's index in `g`.
-pub fn is_guard_witness(
-    g: &Graph,
-    producer: &HashMap<ValueId, usize>,
-    witness: ValueId,
-    condition: ValueId,
-) -> bool {
-    let of =
-        |value: ValueId| -> Option<&Eqn> { producer.get(&value).map(|&index| &g.eqns()[index]) };
-    let Some(sum) = of(witness) else {
-        return false;
-    };
-    let (
-        OpKind::Reduce {
-            op: RedOp::Sum,
-            axis,
-            keepdim: true,
-        },
-        [Operand::Value(flag)],
-    ) = (&sum.op, sum.inputs.as_slice())
-    else {
-        return false;
-    };
-    if *axis + 1 != g.aval(*flag).shape.len() {
-        return false;
-    }
-    matches!(
-        of(*flag),
-        Some(Eqn { op: OpKind::Cast { to: DType::F32 }, inputs, .. })
-            if matches!(inputs.as_slice(), [Operand::Value(observed)] if *observed == condition)
-    )
-}
-
 impl Builder {
     /// Emit the canonical index-bounds guard for `raw` and return the guarded selector plus the witness
-    /// to declare as a validation output. See the [module docs](self) for the shape and why it is forced.
+    /// to declare as a validation output. See the [module docs](self) for the shape.
     pub fn guard_index_bounds(
         &self,
         raw: Traced,

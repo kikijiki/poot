@@ -127,7 +127,7 @@ fn a_bias_cast_folds_into_the_contraction_epilogue_and_evaluates_identically() {
     let bias_const = g
         .values()
         .iter_enumerated()
-        .find(|(_, v)| v.name.as_deref() == Some("bias"))
+        .find(|(_, v)| v.name().as_deref() == Some("bias"))
         .map(|(id, _)| id)
         .expect("the bias const");
 

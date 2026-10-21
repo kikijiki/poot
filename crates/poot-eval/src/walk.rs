@@ -1389,7 +1389,7 @@ fn evaluate_dense(
             dtype: *dtype,
         }
         .tensor(),
-        OpKind::MatMul => {
+        OpKind::MatMul { .. } => {
             let a = get(&eqn.inputs[0])?;
             let b = get(&eqn.inputs[1])?;
             ops::contraction::matmul_to(&a, &b, &out_shape)?

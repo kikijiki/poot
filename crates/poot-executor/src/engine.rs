@@ -39,7 +39,7 @@ use poot_target::{AieCaps, AieTargetId, BufferStorage, TargetId, VpuTargetId};
 use poot_tensor::DType;
 use poot_weights::WeightMap;
 
-use crate::binder::{self, BoundSlot, EmbedRows, StoredAs, WeightBinder};
+use crate::binder::{self, BoundSlot, EmbedRows, LocalBuffer, StoredAs, WeightBinder};
 use crate::device::{
     AieInvocation, Arg, CopyKernel, CopyMechanism, Device, DeviceTime, Dispatch, LaunchKind,
     VpuInvocation, WeightUpload,
@@ -129,7 +129,7 @@ pub struct Engine<D: Device> {
 enum Loc {
     /// An ad hoc buffer this entry owns outright: a metadata buffer, or the `preserve_output`
     /// snapshot (Card 547b: never arena-shared - each is sized and used exactly once per entry).
-    Local(usize),
+    Local(LocalBuffer),
     /// An arena slot (Card 547b): the buffer at this index of `Entry::arena`, shared
     /// across every value [`Program::buffer_plan`] assigned to this slot. The slot's capacity may
     /// exceed this particular value's own logical size; a dispatch using it carries its own element
@@ -273,7 +273,7 @@ struct EntryBuild<D: Device> {
 /// planned storage, that the consuming stage reads in place of the producer's buffer.
 struct ImportBuffer {
     row: PlanNodeId,
-    buffer: usize,
+    buffer: LocalBuffer,
 }
 
 /// A value a transfer carries away: the producing stage (an index into the entry's stages), where the
@@ -305,7 +305,7 @@ struct Entry<D: Device> {
     /// stage's).
     arena: Vec<D::Buffer>,
     slots: Vec<BoundSlot>,
-    /// Hosted embed gathers (`legalize`'s `Slot::TokenEmbed`), filled each step from the step's
+    /// Hosted embed gathers (`legalize`'s `TOKEN_EMBED`), filled each step from the step's
     /// `Slot::Token` input and the executable's embed rows, never supplied by the caller.
     token_embeds: Vec<TokenEmbedSlot>,
     /// Where the final stage's primary output is read from: its pre-commit snapshot when the output
@@ -401,7 +401,7 @@ struct TokenEmbedSlot {
     rows: EmbedRows,
     numel: usize,
     storage: BufferStorage,
-    buffer: usize,
+    buffer: LocalBuffer,
 }
 
 /// The entry's validation packet sources, resolved to device locations (empty for a zero-lane
@@ -586,7 +586,7 @@ fn resolve<'a, D: Device>(
     held: &Held<'a, D>,
 ) -> &'a D::Buffer {
     match loc {
-        Loc::Local(i) => &locals[i],
+        Loc::Local(i) => i.of(locals),
         Loc::Arena(i) => &arena[i],
         Loc::Weight(i) => &held.weights[i].buffer,
         Loc::State(i) => &held.state[i].buffer,
@@ -1433,15 +1433,17 @@ impl<D: Device> Engine<D> {
         macro_rules! push_local {
             ($role:expr, $storage:expr, $shape:expr) => {{
                 let (buffer, _bytes, elems) = self.allocate($role, $storage, $shape)?;
-                locals.push(buffer);
-                (Loc::Local(locals.len() - 1), checked_u32(elems)?)
+                (
+                    Loc::Local(LocalBuffer::push(locals, buffer)),
+                    checked_u32(elems)?,
+                )
             }};
         }
 
         let chunks = binder::chunks(g.inputs().iter().filter_map(|&id| {
             let meta = g.meta(id);
             (meta.storage == Storage::Const)
-                .then(|| Some((id, meta.name.as_deref()?, meta.aval.shape.as_slice())))
+                .then(|| Some((id, meta.weight()?, meta.aval.shape.as_slice())))
                 .flatten()
         }))?;
         for &id in g.inputs() {
@@ -1450,9 +1452,9 @@ impl<D: Device> Engine<D> {
             let (loc, elems) = match meta.storage {
                 Storage::State => {
                     let name = meta
-                        .name
-                        .clone()
-                        .ok_or(LoadError::UnnamedConst { value: id })?;
+                        .name()
+                        .ok_or(LoadError::UnnamedConst { value: id })?
+                        .into_owned();
                     let role = g
                         .state_role(id)
                         .expect("a validated graph gives every state input a role");
@@ -1461,10 +1463,7 @@ impl<D: Device> Engine<D> {
                     (Loc::State(idx), elems)
                 }
                 Storage::Const => {
-                    let name = meta
-                        .name
-                        .clone()
-                        .ok_or(LoadError::UnnamedConst { value: id })?;
+                    let name = meta.name().ok_or(LoadError::UnnamedConst { value: id })?;
                     let (idx, elems) =
                         self.weight_buffer(exe, id, &name, meta, chunks.get(&id), storage)?;
                     (Loc::Weight(idx), elems)
@@ -1497,15 +1496,16 @@ impl<D: Device> Engine<D> {
                     .map_err(device_error(label))?;
                     (loc, elems)
                 }
-                Storage::Slot(Slot::TokenEmbed) => {
-                    let name = meta
-                        .name
-                        .as_deref()
-                        .ok_or(LoadError::UnnamedConst { value: id })?;
+                Storage::Slot(Slot::Owned(role)) if role == poot_graph_plan::TOKEN_EMBED => {
+                    // The key's tag is the name of the table the host gathers the rows from.
+                    let table = meta
+                        .slot_key()
+                        .and_then(SlotKey::tag)
+                        .ok_or(LoadError::UnkeyedSlot { value: id })?;
                     let rows = self
                         .loaded(exe)?
                         .binder
-                        .embed_rows(id, name, &meta.aval, storage)?;
+                        .embed_rows(id, table, &meta.aval, storage)?;
                     let (loc, elems) = push_local!(BufferRole::Input, storage, &meta.aval.shape);
                     let Loc::Local(buffer) = loc else {
                         unreachable!("push_local! always returns Loc::Local")
@@ -1518,7 +1518,10 @@ impl<D: Device> Engine<D> {
                     });
                     (loc, elems)
                 }
-                Storage::Slot(Slot::ExpertPool | Slot::ExpertPoolMap) => {
+                Storage::Slot(Slot::Owned(role))
+                    if role == poot_graph_plan::EXPERT_POOL
+                        || role == poot_graph_plan::EXPERT_POOL_MAP =>
+                {
                     let key = meta
                         .slot_key()
                         .cloned()
@@ -1847,8 +1850,7 @@ impl<D: Device> Engine<D> {
                 storage_of(g.result()),
                 &g.aval(g.result()).shape,
             )?;
-            locals.push(buf);
-            Some(Loc::Local(locals.len() - 1))
+            Some(Loc::Local(LocalBuffer::push(locals, buf)))
         } else {
             None
         };
@@ -1907,8 +1909,7 @@ impl<D: Device> Engine<D> {
             .map_err(device_error(label))?;
         crate::device::write_slice(&mut self.device, &buffer, 0, bytemuck::cast_slice(meta))
             .map_err(device_error(label))?;
-        locals.push(buffer);
-        Ok(Loc::Local(locals.len() - 1))
+        Ok(Loc::Local(LocalBuffer::push(locals, buffer)))
     }
 
     /// The executable's state buffer for (name, aval, storage), allocated zeroed on first
@@ -2118,7 +2119,7 @@ impl<D: Device> Engine<D> {
             .collect();
         // CR30: validate every StepInput before writing any of them, so a later
         // input's refusal cannot leave an earlier input's write already on the device.
-        let mut writes: Vec<(usize, Vec<u8>)> = Vec::with_capacity(e.slots.len());
+        let mut writes: Vec<(LocalBuffer, Vec<u8>)> = Vec::with_capacity(e.slots.len());
         let token_key = SlotKey::new(Slot::Token, None);
         let mut tokens = None;
         for (key, value) in inputs.iter() {
@@ -2202,7 +2203,7 @@ impl<D: Device> Engine<D> {
             writes.push((embed.buffer, bytes));
         }
         for (buffer, bytes) in writes {
-            host_write(device, host_write_bytes, &e.locals[buffer], &bytes)
+            host_write(device, host_write_bytes, buffer.of(&e.locals), &bytes)
                 .map_err(device_error(label))?;
         }
         Ok(())
@@ -2506,7 +2507,7 @@ impl<D: Device> Engine<D> {
             writes.push((slot.buffer, bytes));
         }
         for (buffer, bytes) in writes {
-            host_write(device, host_write_bytes, &e.locals[buffer], &bytes)
+            host_write(device, host_write_bytes, buffer.of(&e.locals), &bytes)
                 .map_err(device_error(label))?;
         }
         Ok(())
@@ -2569,7 +2570,7 @@ impl<D: Device> Engine<D> {
             let held = Held::of(loaded);
             let src = resolve::<D>(picked.loc, &source.locals, &source.arena, &held);
             device
-                .copy(src, &target.locals[slot.buffer])
+                .copy(src, slot.buffer.of(&target.locals))
                 .and_then(|()| device.finish())
         };
         match recorded {
@@ -3103,7 +3104,7 @@ impl<D: Device> Engine<D> {
             .iter()
             .find(|import| import.row == row)
             .ok_or(LoadError::UnknownHandle)?;
-        Ok(&e.locals[import.buffer])
+        Ok(import.buffer.of(&e.locals))
     }
 
     /// Bind a step's inputs: [`Self::bind`] for a coordinator that splits one step's inputs per device.
@@ -5565,7 +5566,7 @@ mod weight_source_tests {
 
     /// An engine whose target's buffer cap is one byte below a `[rows, K]` F32 table, and an embed
     /// gather of `w.embed` by the step's tokens compiled for it: `compile`'s legalize hosts the
-    /// gather as a `Slot::TokenEmbed` input.
+    /// gather as a `TOKEN_EMBED` input.
     fn hosted_embed(rows: usize, tokens: usize) -> (Engine<Recorder>, StagedProgram) {
         let engine = Engine::new(Recorder {
             cap: Some((rows * K * 4 - 1) as u64),
@@ -5587,7 +5588,7 @@ mod weight_source_tests {
                 .graph()
                 .slots()
                 .iter()
-                .any(|&(_, slot)| slot == Slot::TokenEmbed),
+                .any(|&(_, slot)| slot == Slot::Owned(poot_graph_plan::TOKEN_EMBED)),
             "the cap hosts the gather"
         );
         (engine, program)
@@ -5736,9 +5737,10 @@ mod weight_source_tests {
     #[test]
     fn a_chunk_set_with_a_missing_index_is_refused() {
         let shape = [4usize, K];
+        let head = WeightRef::whole(WeightId::model(WeightRole::Head));
         let refused = binder::chunks([
-            (ValueId::new(0), "w.head.chunk0", shape.as_slice()),
-            (ValueId::new(1), "w.head.chunk2", shape.as_slice()),
+            (ValueId::new(0), head.with_chunk(0), shape.as_slice()),
+            (ValueId::new(1), head.with_chunk(2), shape.as_slice()),
         ])
         .expect_err("chunk 1 is missing");
         assert!(

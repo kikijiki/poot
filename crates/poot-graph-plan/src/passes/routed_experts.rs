@@ -93,7 +93,7 @@ fn upstream_router(g: &Graph, producer: &HashMap<ValueId, usize>, start: usize) 
             continue;
         }
         let eqn = &g.eqns()[i];
-        if i != start && matches!(eqn.op, OpKind::MatMul) {
+        if i != start && eqn.op.is_plain_matmul() {
             return Some(i);
         }
         stack.extend(value_inputs(&eqn.inputs).filter_map(|v| producer.get(&v).copied()));
@@ -212,7 +212,7 @@ mod tests {
         let [ref site] = routed_expert_sites(&g)[..] else {
             panic!("one site");
         };
-        assert!(matches!(g.eqns()[site.router].op, OpKind::MatMul));
+        assert!(matches!(g.eqns()[site.router].op, OpKind::MatMul { .. }));
         assert!(matches!(g.eqns()[site.select].op, OpKind::ArgTopK { .. }));
         assert_eq!(site.experts.len(), 1);
         assert!(matches!(

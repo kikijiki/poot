@@ -155,7 +155,7 @@ impl I32SlotGatherVariant {
             .iter()
             .map(|&id| {
                 let meta = graph.meta(id);
-                let tensor = match (&meta.storage, meta.name.as_deref()) {
+                let tensor = match (&meta.storage, meta.name().as_deref()) {
                     (Storage::Slot(Slot::Pos), _) => {
                         HostTensor::i32(vec![POSITIONS.len()], POSITIONS.to_vec())
                     }

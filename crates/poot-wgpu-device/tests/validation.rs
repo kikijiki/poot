@@ -89,7 +89,7 @@ fn split_consts_and_slots(
         let m = g.meta(id);
         match m.storage {
             poot_graph_ir::Storage::Const => {
-                let name = m.name.clone().expect("named const");
+                let name = m.name().expect("named const").into_owned();
                 let t = inputs
                     .get(&id)
                     .and_then(Value::as_host)

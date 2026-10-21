@@ -372,7 +372,8 @@ impl<'a> Sharder<'a> {
         let meta = self.g.meta(input);
         let layout = match meta.storage {
             Storage::Const => {
-                let Some(name) = meta.name.as_deref() else {
+                let name = meta.name();
+                let Some(name) = name.as_deref() else {
                     return Ok(());
                 };
                 let Some((id, source)) = self.weight_of(name) else {
@@ -409,7 +410,7 @@ impl<'a> Sharder<'a> {
                             return Err(ShardError::NotDivisible {
                                 what: format!(
                                     "carried state {}",
-                                    self.g.meta(input).name.as_deref().unwrap_or("?")
+                                    self.g.meta(input).name().as_deref().unwrap_or("?")
                                 ),
                                 extent,
                                 world: self.world_n.get(),
@@ -623,7 +624,7 @@ impl<'a> Sharder<'a> {
             K::Concat { axis } => self.concat(eqn, inputs, *axis),
             K::Iota { .. } => Ok((eqn.op.clone(), inputs, Layout::Whole)),
             K::Gather { axis } => self.gather(eqn, inputs, *axis),
-            K::MatMul => self.matmul(eqn, inputs),
+            K::MatMul { .. } => self.matmul(eqn, inputs),
             K::IndexedMatMul => self.indexed_matmul(eqn, inputs),
             K::DynamicUpdateSlice { axis } => self.update_slice(eqn, inputs, *axis),
             K::ScatterUpdate => self.scatter_update(eqn, inputs),
@@ -937,7 +938,7 @@ impl<'a> Sharder<'a> {
             .is_some_and(|seen| seen != decided)
         {
             return Err(ShardError::StateLayout {
-                name: self.g.meta(root).name.clone().unwrap_or_default(),
+                name: self.g.meta(root).name().unwrap_or_default().into_owned(),
                 read: "written with two layouts".into(),
                 written: decided.describe(),
             });
@@ -1088,7 +1089,7 @@ impl<'a> Sharder<'a> {
         let mut state: Vec<(ValueId, ValueId)> = self.g.state().collect();
         for pair in &mut state {
             let (read, written) = (self.layout[pair.0], self.layout[pair.1]);
-            let name = self.g.meta(pair.0).name.clone().unwrap_or_default();
+            let name = self.g.meta(pair.0).name().unwrap_or_default().into_owned();
             let read = if read == Layout::Undecided {
                 Layout::Whole
             } else {
@@ -1178,7 +1179,10 @@ pub(crate) fn expand_ranks(sharded: &ShardedGraph) -> Result<RankProgram, ShardE
     for (rank, rank_copies) in copies.iter_mut().enumerate().skip(1) {
         for (state_in, _) in g.state().filter(|&(state_in, _)| ranked(state_in)) {
             let mut meta = g.meta(state_in).clone();
-            meta.name = meta.name.map(|name| format!("{name}.tp{rank}"));
+            if let Some(name) = meta.name() {
+                meta.rename(format!("{name}.tp{rank}"))
+                    .expect("a carried state buffer is a named value");
+            }
             let carried = values.push(meta);
             inputs.push(carried);
             consts.push(carried);

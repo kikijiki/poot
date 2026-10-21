@@ -7,7 +7,7 @@
 //! y + gather(lora.scale, idx) * IndexedMatMul(IndexedMatMul(x, lora.a, idx), lora.b, idx)
 //! ```
 //!
-//! where `idx` is the one [`Slot::LoraIdx`] input `[rows]` (I32, the index dtype),
+//! where `idx` is the one `LORA_IDX` input `[rows]` (I32, the index dtype),
 //! expanded to one entry per token. The adapters of one set are stacked on a leading axis beside the
 //! base weights, in the `x @ W` orientation (`A [adapters + 1, in, r]`, `B [adapters + 1, r, out]`,
 //! `scale [adapters + 1]`), zero-padded to a common rank `r`; entry 0 is the no-adapter row, whose `A`
@@ -27,7 +27,7 @@ use poot_graph_ir::builder::Resumed;
 use poot_graph_ir::graph::{Eqn, Graph, Operand, Storage, ValueId, ValueMeta};
 use poot_graph_ir::op::{BinOp, OpKind};
 use poot_graph_ir::types::TensorType;
-use poot_graph_ir::{Builder, IndexRange, Slot, ValueTable, WeightRef};
+use poot_graph_ir::{Builder, IndexRange, OwnedSlot, Slot, ValueTable, WeightRef};
 use poot_tensor::DType;
 use poot_weights::{LoraRole, LoraTarget, WeightId, WeightRole};
 
@@ -37,12 +37,18 @@ use crate::ExpansionError;
 /// The stage name an expansion refusal reports.
 const STAGE: &str = "apply_lora";
 
+/// The one slot of an adapter-stacked graph: the per-row adapter selection `[rows]` (I32, the index dtype
+/// `IndexedMatMul` reads). Row `m`'s value is the 1-based adapter index (0 is the no-adapter row) whose stacked
+/// `A`/`B` this pass applies to that row this step. It varies per step (requests and adapters change as the
+/// batch admits and evicts), so it is a slot rebound every step, never a `Const` (const-cache staleness).
+pub const LORA_IDX: OwnedSlot = OwnedSlot::i32_tensor("loraidx");
+
 /// What one LoRA transform inserts: which projections are adapted, and the shape of the adapter stack
 /// the program is compiled against. The stack's contents are bound at run time; only its shape is a
 /// compile-time fact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoraPlan {
-    /// The step's row count: the extent of the [`Slot::LoraIdx`] input, one adapter index per row.
+    /// The step's row count: the extent of the `LORA_IDX` input, one adapter index per row.
     pub rows: NonZeroUsize,
     /// Adapters in the stack, not counting the reserved no-adapter entry 0.
     pub adapters: NonZeroUsize,
@@ -178,7 +184,7 @@ pub(crate) fn apply_lora(
         IndexRange::below(stack).ok_or(LoraError::StackNotIndexable { entries: stack })?;
     let idx = b
         .slot_ranged(
-            Slot::LoraIdx,
+            Slot::Owned(LORA_IDX),
             TensorType::new(vec![rows], DType::I32),
             entries,
         )?
@@ -337,8 +343,8 @@ fn sites(g: &Graph, plan: &LoraPlan) -> Vec<Site> {
     }
     let mut found = Vec::new();
     for (e, eqn) in g.eqns().iter().enumerate() {
-        let (OpKind::MatMul, [Operand::Value(x), Operand::Value(w)]) =
-            (&eqn.op, eqn.inputs.as_slice())
+        let (true, [Operand::Value(x), Operand::Value(w)]) =
+            (eqn.op.is_plain_matmul(), eqn.inputs.as_slice())
         else {
             continue;
         };

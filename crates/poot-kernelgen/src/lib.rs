@@ -54,7 +54,8 @@ pub use contraction::{
     Schedule, TileSize,
 };
 pub use fused::{
-    FusedInput, FusedKernel, FusedScalarOp, FusedStep, LeafTy, RowKernel, RowOp, RowReduce,
+    FusedInput, FusedKernel, FusedScalarOp, FusedStep, LaneId, LeafId, LeafTy, RowKernel, RowOp,
+    RowReduce, RowValue, StepId,
 };
 pub use helpers::{BodyBudget, BodyLimits, BodySize, Layout, WeightLayout, view_eff_strides};
 pub use packed::{PackedKernelOp, PackedKernelSpec};

@@ -123,7 +123,7 @@ fn gemma2_geglu_fused_decode_matches_the_cpu_oracle_ptx() {
                 inputs.insert(id, HostTensor::i32(m.aval.shape.clone(), vec![v]).into());
             }
             _ => {
-                let seed = seed_of(m.name.as_deref().unwrap_or("")).wrapping_add(100 + i as u64);
+                let seed = seed_of(m.name().as_deref().unwrap_or("")).wrapping_add(100 + i as u64);
                 inputs.insert(
                     id,
                     HostTensor::f32(m.aval.shape.clone(), fill(m.aval.numel(), seed)).into(),

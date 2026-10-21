@@ -79,7 +79,7 @@ fn store_for(g: &Graph) -> WeightStore {
     for &id in g.inputs() {
         let meta = g.meta(id);
         if meta.storage == Storage::Const {
-            entries.insert(meta.name.clone().unwrap(), meta.aval.shape.clone());
+            entries.insert(meta.name().unwrap().into_owned(), meta.aval.shape.clone());
         }
     }
     let mut builder = WeightStore::builder();
@@ -192,7 +192,7 @@ fn load_pair(
         .state_pairs()
         .map(|pair| {
             let meta = g.meta(pair.input);
-            let probe = state_probe(meta.name.as_deref().unwrap(), meta.aval.clone());
+            let probe = state_probe(&meta.name().unwrap(), meta.aval.clone());
             let mut on = |exe| {
                 let program = compile(&probe, target, DevicePlacement::Single(DeviceId(0)));
                 (exe, exec.add_entry(exe, &program).unwrap())
