@@ -445,7 +445,7 @@ fn a_bf16_expert_stack_plans_the_packed_lane_without_a_widened_copy() {
                     .consts()
                     .iter()
                     .copied()
-                    .find(|&id| graph.meta(id).name.as_deref() == Some("w"))
+                    .find(|&id| graph.meta(id).name().as_deref() == Some("w"))
                     .expect("the expert stack is a const");
                 assert_eq!(
                     program.storage().storage(stack).buffer_storage(),

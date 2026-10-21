@@ -48,17 +48,17 @@ pub use error::{
 pub use graph::{
     BoundaryId, ComputedConst, EditError, Eqn, ExecutionValidationFailure, Export, Graph,
     GraphEdit, GraphOutput, LayerIndex, LayerOrderError, LayerRuns, LayerTagError,
-    MAX_VALIDATION_PACKET_BYTES, Operand, OutputKind, Slot, SlotKey, StatePair, StatePolicy,
-    StateRole, StateRows, Storage, ValidationId, ValidationPacketEntry, ValidationPacketError,
-    ValidationPacketLayout, ValueId, ValueMeta, ValueTable, Witness, WitnessLedger,
+    MAX_VALIDATION_PACKET_BYTES, Operand, OutputKind, OwnedSlot, RenameError, Slot, SlotKey,
+    StatePair, StatePolicy, StateRole, StateRows, Storage, ValidationId, ValidationPacketEntry,
+    ValidationPacketError, ValidationPacketLayout, ValueId, ValueMeta, ValueTable, Witness,
+    WitnessLedger,
 };
 pub use index_guard::{
     GuardValues, GuardedIndex, IndexGuardEmitError, IndexGuardError, emit_index_guard,
-    is_guard_witness,
 };
 pub use op::{
     AttentionAttrs, BinOp, BlockTopKAttrs, BlockTopKLayout, ContractionRows, KeyLayout, KvBound,
-    LocalId, MaskOperand, OpClass, OpKind, RedOp, ScanAttrs, ScanFamily, ScanLayout,
+    LaneId, LocalId, MaskOperand, OpClass, OpKind, RedOp, ScanAttrs, ScanFamily, ScanLayout,
     SelectedAttentionAttrs, SelectedAttentionLayout, SinkOperand, UnOp,
 };
 #[cfg(any(test, feature = "test-support"))]

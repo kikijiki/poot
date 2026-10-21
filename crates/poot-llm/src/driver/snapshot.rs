@@ -52,9 +52,9 @@ pub(super) fn snapshot_entries(
     {
         let meta = schema.meta(pair.input);
         let name = meta
-            .name
-            .clone()
-            .ok_or(RowGraphError::UnnamedState { value: pair.input })?;
+            .name()
+            .ok_or(RowGraphError::UnnamedState { value: pair.input })?
+            .into_owned();
         carried.push(Carried {
             name,
             aval: meta.aval.clone(),

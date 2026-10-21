@@ -48,7 +48,7 @@ fn state_names(model: &dyn Model, capacity: usize) -> Vec<String> {
         )
         .unwrap();
     g.state()
-        .map(|(input, _)| g.meta(input).name.clone().unwrap())
+        .map(|(input, _)| g.meta(input).name().unwrap().into_owned())
         .collect()
 }
 
@@ -908,7 +908,7 @@ fn the_pooled_selection_compiles_to_a_block_top_k_per_dsa_layer() {
                 .filter(|(input, _)| {
                     graph
                         .meta(*input)
-                        .name
+                        .name()
                         .as_deref()
                         .is_some_and(|name| name.ends_with(".index"))
                 })
@@ -951,7 +951,7 @@ fn run_named(
         .unwrap();
     let names: Vec<String> = graph
         .state()
-        .map(|(input, _)| graph.meta(input).name.clone().unwrap())
+        .map(|(input, _)| graph.meta(input).name().unwrap().into_owned())
         .collect();
     let input: Vec<Vec<f32>> = graph
         .state()

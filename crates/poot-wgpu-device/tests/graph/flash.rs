@@ -721,7 +721,7 @@ fn synthesized_production_kernels_random_shapes_match_cpu() {
         let out = b.matmul(x, w).unwrap();
         let g = b.finish(out).unwrap();
         let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
-            matches!(op, OpKind::MatMul)
+            matches!(op, OpKind::MatMul { .. })
         });
         assert!(
             is_tiled_region(&choice),
@@ -1500,7 +1500,7 @@ fn synthesized_tiled_region_element_by_element_matches_cpu() {
         let g = b.finish(out).unwrap();
 
         let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
-            matches!(op, OpKind::MatMul)
+            matches!(op, OpKind::MatMul { .. })
         });
         assert!(
             matches!(
@@ -1560,7 +1560,7 @@ fn synthesized_tiled_region_chunked_large_matches_cpu() {
     let program = compile_full(&g, &spirv_fixture_target());
     let (eqn, plan) = program
         .planned()
-        .find(|(eqn, _)| matches!(eqn.op, OpKind::MatMul))
+        .find(|(eqn, _)| matches!(eqn.op, OpKind::MatMul { .. }))
         .expect("the compiled graph holds the matmul");
     let choice = program.kernel_choice(eqn);
     assert!(

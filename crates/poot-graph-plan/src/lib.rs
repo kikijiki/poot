@@ -82,12 +82,12 @@ pub use imported::ImportedKernel;
 pub use imported::{AssetDest, AssetEntry, MANIFEST};
 pub use kernel_mapping::{AieAbiRefusal, AieLimitRefusal, aie_shape_abi, validate_linked_artifact};
 pub use passes::{
-    AttentionDecline, BoundaryDescriptor, ExpertStackRefusal, FusionDecline, FusionDeclineReason,
-    LegalizeError, PackedBindError, PackedConst, PackedDequantErrorContext,
-    PackedDequantProductionError, PackedLayout, PoolError, PoolSite, PoolSpec, PooledWeight,
-    RopeDecline, ShardError, ShardRule, ShardedGraph, StageSplitError, WeightFormats,
-    WeightFormatsError, bind_packed_weights, recognize_packed_contractions,
-    recognize_packed_row_gathers, routed_step_demand, shard,
+    AttentionDecline, BoundaryDescriptor, EXPERT_POOL, EXPERT_POOL_MAP, ExpertStackRefusal,
+    FusionDecline, FusionDeclineReason, LORA_IDX, LegalizeError, PackedBindError, PackedConst,
+    PackedDequantErrorContext, PackedDequantProductionError, PackedLayout, PoolError, PoolSite,
+    PoolSpec, PooledWeight, RopeDecline, ShardError, ShardRule, ShardedGraph, StageSplitError,
+    TOKEN_EMBED, WeightFormats, WeightFormatsError, bind_packed_weights,
+    recognize_packed_contractions, recognize_packed_row_gathers, routed_step_demand, shard,
 };
 // Card 626 (SC-001): `compile` alone runs the graph passes in production - `passes` is a private module, so a
 // default build has no way to name or sequence one. Gated here (ADR-0113 point 3: no forwarder, consumers

@@ -19,8 +19,8 @@ use crate::error::{BuilderCollection, BuilderError, Requirement};
 #[cfg(any(test, feature = "test-support"))]
 use crate::graph::ValueTable;
 use crate::graph::{
-    BoundaryId, ComputedConst, EditError, Eqn, Export, Graph, GraphEdit, GraphOutput, LayerIndex,
-    Operand, Slot, SlotKey, StateRole, Storage, ValidationId, ValueId, ValueMeta,
+    BoundaryId, ComputedConst, EditError, Eqn, Export, Graph, GraphEdit, GraphOutput, Identity,
+    LayerIndex, Operand, Slot, SlotKey, StateRole, Storage, ValidationId, ValueId, ValueMeta,
 };
 use crate::op::{OpKind, SampleRule};
 use crate::range::IndexRange;
@@ -396,19 +396,13 @@ impl BuilderAppendPlan {
             self.held.release(taken);
             return Err(error);
         }
-        self.values.push(ValueMeta {
+        // This generic staging method knows only the already-formatted name; a `Slot` staged here (rather
+        // than through `Builder::slot`/`slot_named`, which build the typed `SlotKey` up front) is a name alone.
+        self.values.push(ValueMeta::with_identity(
             aval,
             storage,
-            name: Some(name),
-            // This generic staging method knows only the already-formatted wire name; a `Slot`
-            // staged here (rather than through `Builder::slot`/`slot_named`, which build the typed
-            // `SlotKey` up front) would need the caller to patch it in once `commit_append`
-            // returns a real `ValueId`.
-            key: None,
-            state_role: None,
-            weight: None,
-            range: None,
-        });
+            Identity::Named(name),
+        ));
         Ok(self.handle(id))
     }
 
@@ -424,7 +418,7 @@ impl BuilderAppendPlan {
         self.values
             .last_mut()
             .expect("input staged the value just now")
-            .weight = Some(weight);
+            .bind_weight(weight);
         Ok(handle)
     }
 
@@ -545,15 +539,11 @@ impl BuilderAppendPlan {
                 return Err(error);
             }
         };
-        self.values.push(ValueMeta {
+        self.values.push(ValueMeta::with_identity(
             aval,
-            storage: Storage::Device,
-            name,
-            key: None,
-            state_role: None,
-            weight: None,
-            range: None,
-        });
+            Storage::Device,
+            name.map_or(Identity::Anonymous, Identity::Named),
+        ));
         self.equations.push(Eqn {
             op,
             inputs: operands,
@@ -936,7 +926,7 @@ fn live_name_namespace(g: &Graph, name: &str) -> Option<BuilderValueNamespace> {
     let (value, _) = g
         .values()
         .iter_enumerated()
-        .find(|(_, meta)| meta.name.as_deref() == Some(name))?;
+        .find(|(_, meta)| meta.name().as_deref() == Some(name))?;
     if g.consts().contains(&value) {
         Some(BuilderValueNamespace::Constant)
     } else if g.slots().iter().any(|&(id, _)| id == value) {
@@ -1337,7 +1327,8 @@ impl Builder {
         let mut staged_inputs = 0usize;
         let mut staged_constants = 0usize;
         let mut staged_slots = 0usize;
-        let mut staged_names: HashMap<&str, BuilderValueNamespace> = HashMap::new();
+        let mut staged_names: HashMap<std::borrow::Cow<str>, BuilderValueNamespace> =
+            HashMap::new();
         reserve(plan.values.len(), BuilderCollection::NameBytes, |n| {
             staged_names.try_reserve(n)
         })?;
@@ -1363,18 +1354,18 @@ impl Builder {
                     Storage::Device => {}
                 }
             }
-            if let Some(name) = meta.name.as_deref() {
+            if let Some(name) = meta.name() {
                 if name.is_empty() {
                     return Err(BuilderError::EmptyName { namespace });
                 }
-                if let Some(existing) = staged_names.insert(name, namespace) {
+                if let Some(existing) = staged_names.insert(name.clone(), namespace) {
                     return Err(BuilderError::NameCollision {
                         name: name.to_string(),
                         requested: namespace,
                         existing,
                     });
                 }
-                if let Some(existing) = live_name_namespace(&g, name) {
+                if let Some(existing) = live_name_namespace(&g, &name) {
                     return Err(BuilderError::NameCollision {
                         name: name.to_string(),
                         requested: namespace,
@@ -1763,14 +1754,13 @@ impl Builder {
             name.len(),
             0,
             InputTable::Const,
-            || ValueMeta {
-                aval,
-                storage: Storage::Const,
-                name: Some(name.to_string()),
-                key: None,
-                state_role: None,
-                weight,
-                range,
+            || {
+                ValueMeta::with_identity(
+                    aval,
+                    Storage::Const,
+                    weight.map_or_else(|| Identity::Named(name.to_string()), Identity::Weight),
+                )
+                .with_range(range)
             },
         )?;
         Ok(self.handle(id))
@@ -1785,14 +1775,12 @@ impl Builder {
             0,
             0,
             InputTable::Const,
-            || ValueMeta {
-                aval: TensorType::new(computed.shape(), computed.dtype()),
-                storage: Storage::Computed(computed),
-                name: None,
-                key: None,
-                state_role: None,
-                weight: None,
-                range: None,
+            || {
+                ValueMeta::with_identity(
+                    TensorType::new(computed.shape(), computed.dtype()),
+                    Storage::Computed(computed),
+                    Identity::Anonymous,
+                )
             },
         )?;
         Ok(self.handle(id))
@@ -1825,7 +1813,7 @@ impl Builder {
     /// the same [`Slot`] kind with different per-call content (spec 266: one expert-pool assignment table per MoE
     /// layer; spec 149: a named standalone activation). [`Builder::slot`] names every occurrence of a kind
     /// identically ([`Slot::key_label`], R466-013: a hand-written label, never `Debug`), which model-engine binders
-    /// rely on to resolve a whole `Slot` kind from one caller-supplied buffer (see [`Slot::ExpertPoolMap`]). A named
+    /// rely on to resolve a whole `Slot` kind from one caller-supplied buffer (the expert pool's map is told apart by tag). A named
     /// input has no such implicit buffer. The name is `"{kind}.{tag}"` (built by [`crate::graph::SlotKey`]), and its
     /// binder must dispatch on [`crate::graph::ValueMeta::name`] as the `Const` path does, not on the kind alone.
     ///
@@ -1877,7 +1865,7 @@ impl Builder {
         if let Some(tag) = tag
             && self.g.borrow().values().iter().any(|v| {
                 v.storage == Storage::Slot(slot)
-                    && v.name.as_deref().is_some_and(|name| {
+                    && v.name().as_deref().is_some_and(|name| {
                         name.strip_prefix(label)
                             .and_then(|rest| rest.strip_prefix('.'))
                             == Some(tag)
@@ -1900,15 +1888,8 @@ impl Builder {
             InputTable::Slot(slot),
             || {
                 let key = SlotKey::new(slot, tag);
-                ValueMeta {
-                    aval,
-                    storage: Storage::Slot(slot),
-                    name: Some(key.to_string()),
-                    key: Some(key),
-                    state_role: None,
-                    weight: None,
-                    range,
-                }
+                ValueMeta::with_identity(aval, Storage::Slot(slot), Identity::Slot(key))
+                    .with_range(range)
             },
         )?;
         Ok(self.handle(id))
@@ -1944,14 +1925,9 @@ impl Builder {
             name.len(),
             0,
             InputTable::Const,
-            || ValueMeta {
-                aval,
-                storage: Storage::State,
-                name: Some(name.to_string()),
-                key: None,
-                state_role: Some(role),
-                weight: None,
-                range: None,
+            || {
+                ValueMeta::with_identity(aval, Storage::State, Identity::Named(name.to_string()))
+                    .with_state_role(role)
             },
         )?;
         Ok(self.handle(id))
@@ -2039,15 +2015,11 @@ impl Builder {
             })?;
             let out = g
                 .values_mut()
-                .try_push(ValueMeta {
+                .try_push(ValueMeta::with_identity(
                     aval,
-                    storage: Storage::Device,
-                    name: None,
-                    key: None,
-                    state_role: None,
-                    weight: None,
-                    range: None,
-                })
+                    Storage::Device,
+                    Identity::Anonymous,
+                ))
                 .map_err(|_| BuilderError::SizeOverflow {
                     collection: BuilderCollection::Values,
                     current: g.values().len(),
@@ -2418,7 +2390,18 @@ impl Builder {
 
     /// Batched matrix product `a[.., M, K] x b[.., K, N] -> [.., M, N]`, batch dims broadcasting.
     pub fn matmul(&self, a: Traced, b: Traced) -> Result<Traced, BuilderError> {
-        self.emit(OpKind::MatMul, vec![self.operand(a)?, self.operand(b)?])
+        self.emit(OpKind::matmul(), vec![self.operand(a)?, self.operand(b)?])
+    }
+
+    /// [`Builder::matmul`] over two operands of one narrow float dtype (F16 or BF16), accumulating and storing F32:
+    /// the shape a tensor-core or cooperative-matrix unit computes. No tracer or pass emits it; the fixtures that
+    /// exercise the tensor-core arms of the planner and the devices do.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn matmul_f32_accumulate(&self, a: Traced, b: Traced) -> Result<Traced, BuilderError> {
+        self.emit(
+            OpKind::matmul_f32_accumulate(),
+            vec![self.operand(a)?, self.operand(b)?],
+        )
     }
 
     /// Emit the backend-neutral packed-dequant semantic primitive. The compiler-only `PackedContraction`,
@@ -2498,8 +2481,7 @@ fn graph_charge(meter: &Meter, g: &Graph) -> Result<Charge, BuilderError> {
     let mut owned = 0u64;
     let mut literal = 0u64;
     for meta in g.values().iter() {
-        let name_len = meta.name.as_ref().map_or(0, String::len)
-            + meta.key.as_ref().map_or(0, |key| key.to_string().len());
+        let name_len = meta.name().map_or(0, |name| name.len());
         owned = plus(
             meter,
             site,
@@ -2632,7 +2614,7 @@ mod tests {
             names: graph
                 .values()
                 .iter()
-                .map(|meta| meta.name.clone())
+                .map(|meta| meta.name().map(std::borrow::Cow::into_owned))
                 .collect(),
             types: graph
                 .values()
@@ -2743,7 +2725,8 @@ mod tests {
     }
 
     #[test]
-    fn transactional_input_slot_can_be_result() -> Result<(), BuilderError> {
+    fn a_staged_slot_input_has_a_name_but_no_key_and_finish_refuses_it() -> Result<(), BuilderError>
+    {
         let builder = Builder::for_tests();
         let mut plan = builder.append_plan(0).unwrap();
         let result = plan.input_result(
@@ -2755,21 +2738,13 @@ mod tests {
         let mut prepared = builder.preflight_append(plan)?;
         assert_eq!(builder.commit_append(&mut prepared)?.id(), ValueId::new(0));
 
-        let graph = builder.finish(result).unwrap();
-        assert_eq!(graph.result(), ValueId::new(0));
-        assert_eq!(graph.inputs(), vec![ValueId::new(0)]);
-        assert!(graph.consts().is_empty());
-        assert_eq!(graph.slots(), vec![(ValueId::new(0), Slot::SlotMap)]);
-        assert!(graph.eqns().is_empty());
-        assert_eq!(
-            graph.values()[ValueId::new(0)].storage,
-            Storage::Slot(Slot::SlotMap)
+        // A plan names its input but cannot key it, so the staged slot is the keyless shape `validate` refuses.
+        let refused = builder.finish(result).unwrap_err();
+        assert!(
+            matches!(refused, BuilderError::Invalid(_))
+                && refused.to_string().contains("no slot key"),
+            "{refused}"
         );
-        assert_eq!(
-            graph.values()[ValueId::new(0)].aval,
-            TensorType::new(vec![4], DType::I8)
-        );
-        assert!(crate::test_support::verdict(&graph).is_ok());
         Ok(())
     }
 
@@ -2867,15 +2842,11 @@ mod tests {
             let builder = Builder::for_tests();
             let mut plan = builder.append_plan(0).unwrap();
             let value = plan.next_value_id()?;
-            plan.values.push(ValueMeta {
-                aval: TensorType::f32(vec![1]),
-                storage: Storage::Device,
-                name: None,
-                key: None,
-                state_role: None,
-                weight: None,
-                range: None,
-            });
+            plan.values.push(ValueMeta::with_identity(
+                TensorType::f32(vec![1]),
+                Storage::Device,
+                Identity::Anonymous,
+            ));
             plan.declare_result(plan.handle(value))?;
             let before = state(&builder);
             assert!(matches!(
@@ -3026,15 +2997,15 @@ mod tests {
             }
             BuilderValueNamespace::Input | BuilderValueNamespace::Constant => Storage::State,
         };
-        let id = graph.values_mut().push(ValueMeta {
-            aval: TensorType::f32(vec![1]),
+        let mut meta = ValueMeta::with_identity(
+            TensorType::f32(vec![1]),
             storage,
-            name: Some(name.to_string()),
-            key: None,
-            state_role: (storage == Storage::State).then_some(StateRole::Recurrent),
-            weight: None,
-            range: None,
-        });
+            Identity::Named(name.to_string()),
+        );
+        if storage == Storage::State {
+            meta = meta.with_state_role(StateRole::Recurrent);
+        }
+        let id = graph.values_mut().push(meta);
         match namespace {
             BuilderValueNamespace::Input => graph.inputs_mut().push(id),
             BuilderValueNamespace::Constant => {
@@ -3264,7 +3235,7 @@ mod tests {
         let mut plan = builder.append_plan(7).unwrap();
         let constant = plan.input("weight", TensorType::f32(vec![3, 4]), Storage::Const)?;
         let output = plan.equation(
-            OpKind::MatMul,
+            OpKind::matmul(),
             vec![Operand::Value(input.id), Operand::Value(constant.id)],
         )?;
         plan.declare_result(output)?;

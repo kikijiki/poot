@@ -888,12 +888,12 @@ fn a_two_byte_select_is_one_llvm_select_over_the_stored_type() {
                 steps: vec![kg::FusedStep {
                     op: kg::FusedScalarOp::Select,
                     inputs: vec![
-                        kg::FusedInput::Leaf(0),
-                        kg::FusedInput::Leaf(1),
-                        kg::FusedInput::Leaf(2),
+                        kg::FusedInput::Leaf(kg::LeafId::new(0)),
+                        kg::FusedInput::Leaf(kg::LeafId::new(1)),
+                        kg::FusedInput::Leaf(kg::LeafId::new(2)),
                     ],
                 }],
-                output: kg::FusedInput::Step(0),
+                output: kg::FusedInput::Step(kg::StepId::new(0)),
             },
             None,
         )

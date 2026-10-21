@@ -829,7 +829,10 @@ impl Executor for Counting {
                 let meta = graph.meta(id);
                 let key = match meta.storage {
                     poot_graph_ir::Storage::Computed(_) => format!("computed.{id}"),
-                    poot_graph_ir::Storage::Slot(Slot::ExpertPool | Slot::ExpertPoolMap) => {
+                    poot_graph_ir::Storage::Slot(Slot::Owned(role))
+                        if role == poot_graph_plan::EXPERT_POOL
+                            || role == poot_graph_plan::EXPERT_POOL_MAP =>
+                    {
                         continue;
                     }
                     poot_graph_ir::Storage::Slot(_) => {

@@ -33,7 +33,7 @@ pub(crate) fn op_label(op: &OpKind) -> &'static str {
         OpKind::Iota { .. } => "iota",
         OpKind::Gather { .. } => "gather",
         OpKind::ScatterUpdate => "scatter_update",
-        OpKind::MatMul => "matmul",
+        OpKind::MatMul { .. } => "matmul",
         OpKind::PackedDequant { .. } => "packed_dequant",
         OpKind::PackedContraction { .. } => "packed_contraction",
         OpKind::PackedRowGather { .. } => "packed_row_gather",
@@ -112,7 +112,9 @@ pub(crate) fn classify<'a>(graph: &Graph, eqn: &'a Eqn) -> Option<Bf16Equation<'
                 perm: perm.as_slice(),
             })
         }
-        OpKind::MatMul if (arity, first, second) == (2, Some(DType::F32), Some(DType::BF16)) => {
+        OpKind::MatMul { .. }
+            if (arity, first, second) == (2, Some(DType::F32), Some(DType::BF16)) =>
+        {
             Some(Bf16Equation::WeightMatMul)
         }
         _ => None,

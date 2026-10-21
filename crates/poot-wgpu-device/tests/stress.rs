@@ -114,7 +114,7 @@ fn split_consts_and_slots_t(
         let m = g.meta(id);
         match m.storage {
             Storage::Const => {
-                let name = m.name.clone().expect("named const");
+                let name = m.name().expect("named const").into_owned();
                 let t = inputs
                     .get(&id)
                     .unwrap_or_else(|| panic!("missing const input {id:?}"));
@@ -173,7 +173,7 @@ fn split_consts_and_slots_v(
         let m = g.meta(id);
         match m.storage {
             Storage::Const => {
-                let name = m.name.clone().expect("named const");
+                let name = m.name().expect("named const").into_owned();
                 let t = inputs
                     .get(&id)
                     .and_then(Value::as_host)

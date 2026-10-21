@@ -112,7 +112,7 @@ fn bind_packed_carriers<'a>(
     }
     let source_name = |value_id: ValueId, role: SourceRole| {
         g.meta(value_id)
-            .name
+            .name()
             .as_deref()
             .and_then(crate::PackedSourceName::parse)
             .filter(|name| name.role() == role)
@@ -278,7 +278,7 @@ pub(crate) fn packed_stack_components<'a>(
         first.get_or_insert(component);
         let name = g
             .meta(*value_id)
-            .name
+            .name()
             .as_deref()
             .and_then(crate::PackedSourceName::parse)
             .filter(|name| name.role() == role)

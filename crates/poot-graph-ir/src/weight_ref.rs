@@ -51,6 +51,15 @@ impl WeightRef {
         }
     }
 
+    /// This reference without its chunk: the whole constant a chunk is a row block of.
+    #[must_use]
+    pub const fn parent(self) -> Self {
+        Self {
+            chunk: None,
+            ..self
+        }
+    }
+
     /// The mapped weight this constant is part of.
     pub const fn id(&self) -> WeightId {
         self.id

@@ -80,7 +80,7 @@ fn plan_failures(g: &Graph, backend: Backend) -> Vec<(usize, PlanError)> {
 /// The guard lives only on [`OpKind::MatMul`]: a bias epilogue is never formed over a mixed-dtype head, so
 /// it is not part of the rejected set.
 fn bf16_matmul(g: &Graph, eqn: &Eqn) -> bool {
-    eqn.op == OpKind::MatMul
+    eqn.op == OpKind::matmul()
         && eqn
             .inputs
             .iter()

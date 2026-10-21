@@ -78,9 +78,9 @@ fn fused_unary(name: &str, op: kg::FusedScalarOp) -> Body {
             leaf_tys: vec![kg::LeafTy::F32; 1],
             steps: vec![kg::FusedStep {
                 op,
-                inputs: vec![kg::FusedInput::Leaf(0)],
+                inputs: vec![kg::FusedInput::Leaf(kg::LeafId::new(0))],
             }],
-            output: kg::FusedInput::Step(0),
+            output: kg::FusedInput::Step(kg::StepId::new(0)),
         },
     )
     .expect("fused precondition")

@@ -13,7 +13,8 @@ use std::collections::HashMap;
 
 use poot_graph_ir::AttentionAttrs;
 use poot_graph_ir::op::{
-    ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep, LocalId, RowRegion, RowStep,
+    ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep, LaneId, LocalId, RowRegion,
+    RowStep,
 };
 use poot_graph_ir::{
     BinOp, Builder, Graph, OpKind, Operand, RedOp, Scalar, TensorType, Traced, UnOp, ValueId, ops,
@@ -436,7 +437,7 @@ fn fused_composite_is_the_traced_pointwise_chain() {
 fn i32_fused_composite_with_pack_lanes_is_the_traced_word_chain() {
     let lane = |lane| FusedOperand::PackLane {
         input: LocalId::new(0),
-        lane,
+        lane: LaneId::new(lane),
     };
     let step = |op, inputs| FusedStep { op, inputs };
     let region = FusedRegion {

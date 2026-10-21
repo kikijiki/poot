@@ -102,7 +102,7 @@ fn store_for(graphs: &[&Graph]) -> WeightStore {
         for &id in g.inputs() {
             let meta = g.meta(id);
             if meta.storage == Storage::Const {
-                entries.insert(meta.name.clone().unwrap(), meta.aval.shape.clone());
+                entries.insert(meta.name().unwrap().into_owned(), meta.aval.shape.clone());
             }
         }
     }
@@ -216,8 +216,8 @@ fn oracle_step(
         let meta = g.meta(id);
         let value = match meta.storage {
             Storage::Const => {
-                let name = meta.name.as_deref().unwrap();
-                let WeightEntry::Dense(dense) = store.get(name).unwrap() else {
+                let name = meta.name().unwrap();
+                let WeightEntry::Dense(dense) = store.get(name.as_ref()).unwrap() else {
                     unreachable!()
                 };
                 let data: Vec<f32> = bytemuck_f32(dense.bytes().as_slice());
@@ -225,7 +225,7 @@ fn oracle_step(
             }
             Storage::State => Value::from(
                 state
-                    .entry(meta.name.clone().unwrap())
+                    .entry(meta.name().unwrap().into_owned())
                     .or_insert_with(|| HostTensor::zeros(meta.aval.shape.clone()))
                     .clone(),
             ),
@@ -245,7 +245,7 @@ fn oracle_step(
     let evaluation = eval(g, &inputs, EvalOptions::default()).unwrap();
     for ((si, _), t) in g.state().zip(evaluation.state) {
         state.insert(
-            g.meta(si).name.clone().unwrap(),
+            g.meta(si).name().unwrap().into_owned(),
             t.into_host().expect("dense state tensor"),
         );
     }
@@ -384,7 +384,7 @@ fn prefill_and_decode_entries_share_state_and_reset_without_rerecording() {
     for &id in decode_g.inputs() {
         let meta = decode_g.meta(id);
         if meta.storage == Storage::State {
-            let name = meta.name.clone().unwrap();
+            let name = meta.name().unwrap().into_owned();
             let probe_graph = state_probe_graph(&name, meta.aval.clone());
             let probe = engine
                 .add_entry(exe, &staged(&probe_graph, target))
@@ -1112,7 +1112,7 @@ fn packed_linear_matches_the_oracle(format: WeightFormat, out: usize, k: usize) 
         let meta = g.meta(id);
         let value = match meta.storage {
             Storage::Const => {
-                let parsed = PackedSourceName::parse(meta.name.as_deref().unwrap()).unwrap();
+                let parsed = PackedSourceName::parse(&meta.name().unwrap()).unwrap();
                 Value::from(PackedComponentRef::new(Arc::clone(&payload), parsed.role()))
             }
             Storage::Slot(Slot::Activation) => {
@@ -1502,7 +1502,7 @@ fn bf16_embed_weight_feeds_gather_and_decode_gemv_with_no_host_f32_copy() {
         if meta.storage != Storage::Slot(Slot::Activation) {
             continue;
         }
-        match meta.name.as_deref() {
+        match meta.name().as_deref() {
             Some("activation.idx") => inputs.push(
                 meta.slot_key().unwrap().clone(),
                 &[],
@@ -1546,7 +1546,7 @@ fn bf16_embed_weight_feeds_gather_and_decode_gemv_with_no_host_f32_copy() {
             Storage::Const => Value::from(
                 HostTensor::from_le_bytes(DType::BF16, vec![rows, cols], &w_bytes).unwrap(),
             ),
-            Storage::Slot(Slot::Activation) => match meta.name.as_deref() {
+            Storage::Slot(Slot::Activation) => match meta.name().as_deref() {
                 Some("activation.idx") => Value::from(HostTensor::i32(vec![], vec![idx_value])),
                 Some("activation.x") => {
                     Value::from(HostTensor::f32(vec![1, cols], x_values.clone()))

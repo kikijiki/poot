@@ -94,7 +94,7 @@ fn checkpoint_orientation_projection_plans_one_dense_contraction_and_no_transpos
                 "{label}"
             );
             assert_eq!(
-                count(&program, |op| matches!(op, OpKind::MatMul)),
+                count(&program, |op| matches!(op, OpKind::MatMul { .. })),
                 0,
                 "{label}"
             );
@@ -139,7 +139,7 @@ fn a_transposed_weight_with_a_second_consumer_keeps_the_transpose_and_the_matmul
             "{label}"
         );
         assert_eq!(
-            count(&program, |op| matches!(op, OpKind::MatMul)),
+            count(&program, |op| matches!(op, OpKind::MatMul { .. })),
             1,
             "{label}"
         );
@@ -175,7 +175,7 @@ fn a_transposed_weight_that_escapes_the_graph_keeps_the_transpose_and_the_matmul
             "{label}"
         );
         assert_eq!(
-            count(&program, |op| matches!(op, OpKind::MatMul)),
+            count(&program, |op| matches!(op, OpKind::MatMul { .. })),
             1,
             "{label}"
         );
@@ -250,7 +250,7 @@ fn an_f16_checkpoint_projection_plans_one_packed_dense_contraction_and_no_transp
                 "{label}"
             );
             assert_eq!(
-                count(&program, |op| matches!(op, OpKind::MatMul)),
+                count(&program, |op| matches!(op, OpKind::MatMul { .. })),
                 0,
                 "{label}"
             );
@@ -349,7 +349,7 @@ fn a_packed_f16_weight_with_a_native_reader_is_a_typed_refusal() {
         let matmul = draft
             .eqns_mut()
             .iter_mut()
-            .find(|eqn| matches!(eqn.op, OpKind::MatMul))
+            .find(|eqn| matches!(eqn.op, OpKind::MatMul { .. }))
             .expect("the traced graph multiplies");
         matmul.op = OpKind::DenseContraction { weight: DType::F16 };
         matmul.inputs[1] = Operand::Value(w.id());
@@ -665,7 +665,7 @@ fn a_grouped_bf16_projection_plans_one_grouped_dense_contraction_and_no_transpos
             assert_eq!(count(&program, is_grouped_bf16), 1, "{label}");
             for (name, op) in [
                 ("Transpose", OpKind::Transpose { perm: vec![] }),
-                ("MatMul", OpKind::MatMul),
+                ("MatMul", OpKind::matmul()),
                 ("Cast", OpKind::Cast { to: DType::F32 }),
             ] {
                 let same = |planned: &OpKind| {
@@ -743,7 +743,7 @@ fn a_blocked_weight_with_a_second_consumer_is_not_folded() {
                     "{label}"
                 );
                 assert_eq!(
-                    count(&program, |op| matches!(op, OpKind::MatMul)),
+                    count(&program, |op| matches!(op, OpKind::MatMul { .. })),
                     1,
                     "{label}"
                 );
@@ -820,7 +820,7 @@ fn a_grouped_contraction_over_a_weight_without_grouped_rows_is_a_typed_refusal()
         let matmul = traced
             .eqns()
             .iter()
-            .position(|eqn| matches!(eqn.op, OpKind::MatMul))
+            .position(|eqn| matches!(eqn.op, OpKind::MatMul { .. }))
             .expect("the projection has one matmul");
         let g = poot_graph_ir::test_support::graph_fixtures::derive(&traced, |draft| {
             draft.eqns_mut()[matmul].op = OpKind::GroupedDenseContraction {

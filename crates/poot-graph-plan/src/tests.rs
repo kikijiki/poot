@@ -205,7 +205,7 @@ fn matmul_choice(g: &Graph, backend: Backend) -> KernelChoice {
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .expect("a matmul eqn");
     choice_of(g, eqn, backend)
 }
@@ -481,6 +481,78 @@ fn float_select_plans_a_float_pointwise_kernel_with_an_i32_condition_leaf() {
         assert_eq!(element(3), Ty::Slice(Box::new(Ty::F32)), "{backend:?}");
         assert_eq!(element(4), Ty::Slice(Box::new(Ty::F32)), "{backend:?}");
     }
+}
+
+/// POOT-1301: a `Select` branch that is an inline literal is an inline operand of the kernel's step, not a leaf:
+/// the index guard's `Select(invalid, 0, raw)` plans as a two-leaf exact-I32 kernel (the flag and `raw`) on every
+/// compute backend, and a literal condition has no kernel and is refused by name.
+///
+/// Mutation: make the planner's `Select` arm push a leaf for a literal branch; the leaf count and the step's
+/// operands go red.
+#[test]
+fn a_select_with_a_literal_branch_plans_the_literal_inline() {
+    let b = Builder::for_tests();
+    let raw = b
+        .constant("raw", TensorType::new(vec![4], GDt::I32))
+        .unwrap();
+    let guard = b.guard_index_bounds(raw, 3).unwrap();
+    let g = b.finish(guard.guarded).unwrap();
+    let eqn = g
+        .eqns()
+        .iter()
+        .find(|e| matches!(e.op, OpKind::Select))
+        .expect("the guard selects");
+    assert!(matches!(
+        eqn.inputs.as_slice(),
+        [
+            poot_graph_ir::Operand::Value(_),
+            poot_graph_ir::Operand::Lit(poot_graph_ir::Scalar::I32(0)),
+            poot_graph_ir::Operand::Value(_)
+        ]
+    ));
+    for backend in [
+        Backend::SpirvVulkan,
+        Backend::Nvptx,
+        Backend::AmdGcn(AmdArch::gfx1151()),
+    ] {
+        let (_, choice) = planned_with_choice(&g, eqn, backend).unwrap();
+        let KernelChoice::Generated(KernelRequest::Pointwise(spec)) = &choice else {
+            panic!("a Select is one pointwise kernel: {choice:?}");
+        };
+        assert!(
+            matches!(spec.form, PointwiseForm::ExactI32 { .. }),
+            "{backend:?}: {choice:?}"
+        );
+        assert_eq!(spec.leaves.len(), 2, "{backend:?}: the flag and raw");
+        assert_eq!(spec.kernel.leaf_tys, [kg::LeafTy::I32, kg::LeafTy::I32]);
+        assert!(
+            matches!(
+                spec.kernel.steps[0].inputs.as_slice(),
+                [
+                    kg::FusedInput::Leaf(flag),
+                    kg::FusedInput::LitI32(0),
+                    kg::FusedInput::Leaf(raw)
+                ] if flag.index() == 0 && raw.index() == 1
+            ),
+            "{backend:?}: {:?}",
+            spec.kernel.steps[0].inputs
+        );
+    }
+
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::new(vec![4], GDt::I32)).unwrap();
+    let y = b.constant("y", TensorType::new(vec![4], GDt::I32)).unwrap();
+    let selected = b.select(x, x, y).unwrap();
+    let g = b.finish(selected).unwrap();
+    let mut edit = g.edit();
+    edit.eqns_mut()[0].inputs[0] = poot_graph_ir::Operand::Lit(poot_graph_ir::Scalar::I32(1));
+    let g = edit.commit().unwrap();
+    let refusal = planned_with_choice(&g, &g.eqns()[0], Backend::SpirvVulkan)
+        .expect_err("a literal condition has no kernel");
+    let PlanError::Refused(refusal) = refusal else {
+        panic!("a typed refusal: {refusal:?}")
+    };
+    assert_eq!(refusal.missing, Capability::LiteralFirstOperand);
 }
 
 /// A float `Select` past the grid ceiling takes the same 2-D fold the exact-I32 `Select` does, standalone and
@@ -956,7 +1028,7 @@ fn try_matmul_plan_planned(g: &Graph, backend: Backend) -> Result<(Plan, KernelC
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .expect("a matmul eqn");
     planned_with_choice(g, eqn, backend)
 }
@@ -1098,7 +1170,7 @@ fn e4m3fn_graph_execution_is_rejected_by_name_for_every_unwired_arithmetic_class
     // Card 623: infer now rejects E4M3FN MatMul directly too (via `reject_non_arithmetic`,
     // the same class check Unary/Binary/Reduce already had), so it also never reaches the planner any
     // more - an IR-level `ShapeError`, not a planner refusal.
-    let matmul_err = OpKind::MatMul
+    let matmul_err = OpKind::matmul()
         .infer(&[
             TensorType::new(vec![1, 4], GDt::E4M3FN),
             TensorType::new(vec![4, 2], GDt::E4M3FN),
@@ -2499,24 +2571,28 @@ fn tensorcore_selected_only_for_nvptx_bf16_aligned() {
     assert!(!is_tensor_core(&matmul_choice(&gk, Backend::Nvptx)));
 }
 
-/// Build a 16-aligned matmul `[1,16,32] @ [32,16]` with bf16/f16 operands and an explicit output dtype,
-/// to exercise the mixed-precision (bf16-in/f32-out) case that reaches the AMD WMMA path. `MatMul.infer`
-/// sets the output dtype to the operand dtype, so the mixed case overrides the output aval (white-box,
-/// plan-only test).
-fn mixed_matmul_graph(op_dt: GDt, out_dt: GDt) -> Graph {
-    mixed_matmul_graph_shape(16, 32, 16, op_dt, out_dt)
+/// Build a 16-aligned matmul `[1,16,32] @ [32,16]` over bf16/f16 operands that accumulates and stores F32
+/// (the mixed-precision case that reaches the AMD WMMA path).
+fn mixed_matmul_graph(op_dt: GDt) -> Graph {
+    mixed_matmul_graph_shape(16, 32, 16, op_dt)
 }
 
 /// Like [`mixed_matmul_graph`] but with an explicit M/K/N shape.
-fn mixed_matmul_graph_shape(m: usize, k: usize, n: usize, op_dt: GDt, out_dt: GDt) -> Graph {
-    let g = matmul_graph(m, k, n, op_dt);
-    let out = g
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
-        .expect("a matmul eqn")
-        .out;
-    derive(&g, |draft| draft.values_mut()[out].aval.dtype = out_dt).unwrap()
+fn mixed_matmul_graph_shape(m: usize, k: usize, n: usize, op_dt: GDt) -> Graph {
+    mixed_batched_matmul_graph(1, m, k, n, op_dt)
+}
+
+/// `[batch,m,k] @ [k,n]` over `op_dt` operands, accumulating and storing F32.
+fn mixed_batched_matmul_graph(batch: usize, m: usize, k: usize, n: usize, op_dt: GDt) -> Graph {
+    let bld = Builder::for_tests();
+    let a = bld
+        .constant("a", TensorType::new(vec![batch, m, k], op_dt))
+        .unwrap();
+    let w = bld
+        .constant("w", TensorType::new(vec![k, n], op_dt))
+        .unwrap();
+    let mm = bld.matmul_f32_accumulate(a, w).unwrap();
+    bld.finish(mm).unwrap()
 }
 
 /// spec 130 FR-004 / card 145: what reaches the AMD WMMA tensor-core path (the `matmul:tc:` tag) on
@@ -2532,7 +2608,7 @@ fn mixed_matmul_graph_shape(m: usize, k: usize, n: usize, op_dt: GDt, out_dt: GD
 fn amd_wmma_reached_only_by_mixed_bf16_in_f32_out() {
     let amd = Backend::AmdGcn(AmdArch::gfx1151());
     // Mixed bf16 operands -> f32 output: AMD WMMA tensor cores.
-    let gmix = mixed_matmul_graph(GDt::BF16, GDt::F32);
+    let gmix = mixed_matmul_graph(GDt::BF16);
     assert!(
         is_tensor_core(&matmul_choice(&gmix, amd)),
         "mixed bf16-in/f32-out 16-aligned matmul on gfx1151 should select WMMA"
@@ -2546,7 +2622,7 @@ fn amd_wmma_reached_only_by_mixed_bf16_in_f32_out() {
     // F16 operands, even with an f32 output, must not route through the bf16 WMMA kernel. There is no
     // serial route for the mix either (the fallback's single element type would read the 2-byte f16
     // operands as f32 words), so the planner rejects the pair outright.
-    let gf16_mix = mixed_matmul_graph(GDt::F16, GDt::F32);
+    let gf16_mix = mixed_matmul_graph(GDt::F16);
     assert!(
         matches!(
             try_matmul_plan(&gf16_mix, amd),
@@ -2568,7 +2644,7 @@ fn amd_wmma_reached_only_by_mixed_bf16_in_f32_out() {
     // Mixed bf16-in/f32-out but a non-16-aligned K: WMMA needs aligned M/N/K, and the serial fallback
     // cannot serve a mixed matmul (its single element type would read the bf16 operands as f32 words),
     // so the pair is rejected.
-    let gk = mixed_matmul_graph_shape(16, 24, 16, GDt::BF16, GDt::F32);
+    let gk = mixed_matmul_graph_shape(16, 24, 16, GDt::BF16);
     assert!(matches!(
         try_matmul_plan(&gk, amd),
         Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering
@@ -2800,17 +2876,12 @@ fn mixed_bf16_tc_key_encodes_operand_dtype_not_just_output() {
     // The WMMA tensor-core shape: bf16 operands, f32-accumulate output (the deleted `to_mixed_bf16`
     // pass used to produce this by inserting Cast(F32->BF16) on both operands; built directly here).
     let gf = matmul_graph(16, 32, 16, GDt::F32);
-    let bf16 = matmul_graph(16, 32, 16, GDt::BF16);
-    let mm_out = bf16.result();
-    let gm = derive(&bf16, |draft| {
-        draft.values_mut()[mm_out].aval.dtype = GDt::F32
-    })
-    .unwrap();
+    let gm = mixed_matmul_graph(GDt::BF16);
     // sanity: the matmul reads bf16 operands and writes f32.
     let mm = gm
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .expect("a matmul eqn");
     assert_eq!(gm.aval(mm.out).dtype, GDt::F32, "output stays f32");
     for op in &mm.inputs {
@@ -2840,7 +2911,7 @@ fn mixed_bf16_tc_key_encodes_operand_dtype_not_just_output() {
         let eqn = g
             .eqns()
             .iter()
-            .find(|e| matches!(e.op, OpKind::MatMul))
+            .find(|e| matches!(e.op, OpKind::MatMul { .. }))
             .unwrap();
         into_plain(planned_with_choice(g, eqn, gfx1151).unwrap().0)
             .key()
@@ -2877,7 +2948,7 @@ fn mixed_dtype_matmul_rejected_when_no_tensor_core_arm_fires() {
     // reading 2-byte bf16 operand buffers as f32 words (silent garbage), under a cache key colliding with
     // the f32 matmul. The planner must reject the mix by name on every route where
     // no tensor-core arm fires.
-    let gm = mixed_matmul_graph(GDt::BF16, GDt::F32);
+    let gm = mixed_matmul_graph(GDt::BF16);
     let cdna = AmdArch::new("gfx942", 64);
     let r = try_matmul_plan(&gm, Backend::AmdGcn(cdna));
     assert!(
@@ -2935,7 +3006,7 @@ fn widen_inserts_cast_for_decode_shaped_mixed_matmul() {
     let mm = gw
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .expect("matmul eqn retained");
     // both matmul operands read F32 (the odt): `a` already was, `w` gained a Cast.
     for (i, op) in mm.inputs.iter().take(2).enumerate() {
@@ -2994,7 +3065,7 @@ fn widen_is_noop_when_tensor_core_arm_fires() {
     // A 16-aligned, no-batch-dims mixed matmul (bf16 operands -> f32 output, `to_mixed_bf16`'s shape)
     // takes the amd_tc/tc arm directly. The widen pass must leave it untouched (no Cast, operands stay
     // bf16) so `matmul_tensorcore`'s bf16 fragment loads see bf16 buffers and the `matmul:tc:` key is unchanged.
-    let gm = mixed_matmul_graph(GDt::BF16, GDt::F32);
+    let gm = mixed_matmul_graph(GDt::BF16);
     for backend in [Backend::AmdGcn(AmdArch::gfx1151()), Backend::Nvptx] {
         let gw = widen_mismatched_matmul_dtypes(&gm, &default_caps_for(backend)).unwrap();
         assert_eq!(
@@ -3323,7 +3394,7 @@ fn matmul_plan(g: &Graph, backend: Backend) -> Plan {
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .expect("a matmul eqn");
     plan_eqn(
         g,
@@ -3457,7 +3528,7 @@ fn only_an_f32_m_gt_1_matmul_takes_the_tiled_gemm() {
         let eqn = g
             .eqns()
             .iter()
-            .find(|e| matches!(e.op, OpKind::MatMul))
+            .find(|e| matches!(e.op, OpKind::MatMul { .. }))
             .expect("a matmul eqn");
         let planned = plan_eqn_choice(
             &g,
@@ -3489,7 +3560,7 @@ fn f16_matmul_never_reaches_tiled_region() {
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .expect("a matmul eqn");
     let planned = plan_eqn_choice(
         &g,
@@ -3541,11 +3612,11 @@ fn f16_matmul_never_reaches_tiled_region() {
 fn coopmat_matmul_traces_plans_and_validates() {
     // 16x16x16: F16 operands, F32 output (the only shape/dtype combination
     // `matmul_spirv_coopmat_eligible` accepts, see its doc).
-    let g = mixed_matmul_graph_shape(16, 16, 16, GDt::F16, GDt::F32);
+    let g = mixed_matmul_graph_shape(16, 16, 16, GDt::F16);
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .expect("a matmul eqn");
     let (plan, choice) = planned_with_choice(&g, eqn, Backend::SpirvVulkan)
         .expect("a 16x16x16 f16-in/f32-out matmul must plan on SpirvVulkan");
@@ -3620,7 +3691,7 @@ fn nvptx_tc_batched_bf16_matmul_grid_includes_batch_factor() {
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .expect("a matmul eqn");
     let (plan, choice) = planned_with_choice(&g, eqn, Backend::Nvptx)
         .expect("a batched 16x16x16 bf16 matmul must plan on Nvptx");
@@ -3636,24 +3707,19 @@ fn nvptx_tc_batched_bf16_matmul_grid_includes_batch_factor() {
     );
 }
 
-/// `batched_matmul_graph` with the output retagged to the f32 accumulate type (the mixed shape every tensor-core arm
-/// admits), planned for `backend`: the plan and its kernel choice.
+/// `mixed_batched_matmul_graph` (the F32-accumulate shape every tensor-core arm admits), planned for `backend`: the
+/// plan and its kernel choice.
 fn mixed_batched_matmul_plan(
     batch: usize,
     (m, k, n): (usize, usize, usize),
     operand: GDt,
     backend: Backend,
 ) -> Result<(Plan, KernelChoice), PlanError> {
-    let traced = batched_matmul_graph(batch, m, k, n, operand);
-    let out = traced.result();
-    let g = derive(&traced, |draft| {
-        draft.values_mut()[out].aval.dtype = GDt::F32
-    })
-    .unwrap();
+    let g = mixed_batched_matmul_graph(batch, m, k, n, operand);
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .expect("a matmul eqn");
     planned_with_choice(&g, eqn, backend)
 }
@@ -3732,7 +3798,7 @@ fn compiled(g: &Graph, backend: Backend) -> Program {
 fn compiled_matmul(program: &Program) -> (&Plan, &KernelChoice) {
     let (eqn, plan) = program
         .planned()
-        .find(|(eqn, _)| matches!(eqn.op, OpKind::MatMul))
+        .find(|(eqn, _)| matches!(eqn.op, OpKind::MatMul { .. }))
         .expect("a matmul eqn");
     (plan, program.kernel_choice(eqn))
 }
@@ -4876,7 +4942,7 @@ fn decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape() {
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .unwrap();
     let out_shape = g.aval(eqn.out).shape.clone();
     let out_numel = numel(&out_shape);
@@ -4924,7 +4990,7 @@ fn decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape() {
     let eqn2 = g2
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .unwrap();
     match planned_with_choice(&g2, eqn2, Backend::SpirvVulkan).unwrap() {
         (compute_plan, choice) if is_plain(&compute_plan) => {
@@ -4963,7 +5029,7 @@ fn decode_gemv_width_ceiling_follows_the_caps_not_the_backend() {
         let eqn = g
             .eqns()
             .iter()
-            .find(|e| matches!(e.op, OpKind::MatMul))
+            .find(|e| matches!(e.op, OpKind::MatMul { .. }))
             .expect("a matmul eqn");
         let caps = DeviceCaps {
             decode_gemv_max_out_cols: ceiling,
@@ -5153,7 +5219,7 @@ fn decode_gemv_chunking_follows_the_caps_watchdog_trigger_not_a_fixed_constant()
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .unwrap();
     let out_shape = g.aval(eqn.out).shape.clone();
     let out_numel = numel(&out_shape);
@@ -5635,7 +5701,7 @@ fn is_elementwise_2d_folds_binary_and_unary_for_a_non_f32_dtype() {
 fn const_id(g: &Graph, name: &str) -> ValueId {
     g.values()
         .ids()
-        .find(|&id| g.meta(id).name.as_deref() == Some(name))
+        .find(|&id| g.meta(id).name().as_deref() == Some(name))
         .unwrap_or_else(|| panic!("const {name} not found"))
 }
 
@@ -5716,7 +5782,7 @@ fn card298_decode_shaped_mixed_matmul_is_refused_after_widen() {
 /// tensor-core arm reads them that way.
 #[test]
 fn card298_widen_keeps_amd_wmma_operands_narrow() {
-    let gm = mixed_matmul_graph(GDt::BF16, GDt::F32);
+    let gm = mixed_matmul_graph(GDt::BF16);
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let gp = widen_mismatched_matmul_dtypes(&gm, &default_caps_for(backend)).unwrap();
     for name in ["a", "w"] {
@@ -5738,7 +5804,7 @@ fn card298_widen_keeps_amd_wmma_operands_narrow() {
 /// their BF16 dtype; nothing reaches codegen as a BF16 matmul.
 #[test]
 fn card298_spirv_widens_bf16_pairs_with_casts_not_retypes() {
-    let gm = mixed_matmul_graph(GDt::BF16, GDt::F32);
+    let gm = mixed_matmul_graph(GDt::BF16);
     let gp = widen_mismatched_matmul_dtypes(&gm, &default_caps_for(Backend::SpirvVulkan)).unwrap();
     for name in ["a", "w"] {
         assert_eq!(
@@ -6499,9 +6565,12 @@ fn bf16_projection_contraction_choice(
         caps: default_caps_for(backend),
     };
     let program = compile(&graph, &target, &options)?;
-    let mut contractions = program
-        .planned()
-        .filter(|(eqn, _)| matches!(eqn.op, OpKind::MatMul | OpKind::DenseContraction { .. }));
+    let mut contractions = program.planned().filter(|(eqn, _)| {
+        matches!(
+            eqn.op,
+            OpKind::MatMul { .. } | OpKind::DenseContraction { .. }
+        )
+    });
     let (eqn, _) = contractions
         .next()
         .unwrap_or_else(|| panic!("{backend:?} transposed={transposed}: no contraction planned"));

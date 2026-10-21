@@ -3,7 +3,7 @@ use super::{
     HashMap, HashSet, OpKind, Operand, RowRegion, RowStep, TensorType, UnOp, ValueId,
     collapse_reshape_chains, elide_noop_transposes, with_eqns,
 };
-use poot_graph_ir::{ContractionRows, LocalId, ValueTable};
+use poot_graph_ir::{ContractionRows, LaneId, LocalId, ValueTable};
 /// The `f32` unaries the pointwise-fusion phase admits into a region. [`kernel_mapping::map_fused_op`]
 /// (`poot-graph-plan`) must lower every one of these inside a fused region: legality here and the
 /// kernel table are one contract (card 536b, R481-007), checked by
@@ -199,7 +199,7 @@ fn i32_unit_last_slice(
     g: &Graph,
     producer: &ValueTable<Option<usize>>,
     value: ValueId,
-) -> Option<(usize, ValueId, usize)> {
+) -> Option<(usize, ValueId, LaneId)> {
     let eqn_idx = producer[value]?;
     let OpKind::Slice { axis, start, end } = g.eqns()[eqn_idx].op else {
         return None;
@@ -221,7 +221,7 @@ fn i32_unit_last_slice(
     {
         return None;
     }
-    Some((eqn_idx, *parent, start))
+    Some((eqn_idx, *parent, LaneId::new(start)))
 }
 
 fn i32_region_leaves(
@@ -802,7 +802,7 @@ fn epilogue_head(g: &Graph, eqn: &Eqn) -> Option<ContractionHead> {
             (is_float(dtype) && g.aval(*x).dtype == dtype && weight_fits)
                 .then_some(ContractionHead::Indexed)
         }
-        OpKind::MatMul => {
+        OpKind::MatMul { .. } => {
             let [Operand::Value(a), Operand::Value(b)] = eqn.inputs.as_slice() else {
                 return None;
             };

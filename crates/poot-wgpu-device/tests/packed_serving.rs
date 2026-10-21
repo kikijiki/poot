@@ -105,7 +105,7 @@ fn split_consts_and_slots(
         let m = g.meta(id);
         match m.storage {
             Storage::Const => {
-                let name = m.name.clone().expect("named const");
+                let name = m.name().expect("named const").into_owned();
                 match inputs.get(&id) {
                     Some(Value::Packed(component)) => {
                         let parsed = PackedSourceName::parse(&name)
@@ -295,7 +295,7 @@ fn carriers(graph: &Graph, owner: &Arc<PackedPayload>) -> HashMap<ValueId, Value
         .inputs()
         .iter()
         .filter_map(|&id| {
-            let name = PackedSourceName::parse(graph.meta(id).name.as_deref()?)?;
+            let name = PackedSourceName::parse(graph.meta(id).name().as_deref()?)?;
             assert_eq!(graph.aval(id).dtype, DType::I8);
             Some((
                 id,
@@ -647,7 +647,12 @@ fn run_indexed_case(
     let g = b.finish(y).unwrap();
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     for &id in g.inputs() {
-        let Some(name) = g.meta(id).name.as_deref().and_then(PackedSourceName::parse) else {
+        let Some(name) = g
+            .meta(id)
+            .name()
+            .as_deref()
+            .and_then(PackedSourceName::parse)
+        else {
             continue;
         };
         inputs.insert(
@@ -1011,7 +1016,7 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     for &id in graph.inputs() {
         let meta = graph.meta(id);
-        match meta.name.as_deref() {
+        match meta.name().as_deref() {
             Some("activation.moe-x") => {
                 inputs.insert(id, activation.clone().into());
             }
@@ -1056,7 +1061,7 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
     }
     let mut dense: HashMap<ValueId, Value> = HashMap::new();
     for &id in traced.inputs() {
-        let value = match traced.meta(id).name.as_deref() {
+        let value = match traced.meta(id).name().as_deref() {
             Some("activation.moe-x") => activation.clone(),
             Some("activation.moe-ids") => selected.clone(),
             Some(name) if name == stack_id.const_name() => {

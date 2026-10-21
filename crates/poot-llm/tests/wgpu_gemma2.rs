@@ -114,7 +114,7 @@ fn bind(
             // this one-shot prefill always starts at position 0.
             Storage::Slot(Slot::Pos) => HostTensor::i32(vec![1, n], (0..n as i32).collect()),
             Storage::Const => {
-                let name = m.name.as_deref().unwrap_or("");
+                let name = m.name().unwrap_or_default();
                 let seed: u64 = name.bytes().fold(1469598103934665603u64, |h, c| {
                     (h ^ c as u64).wrapping_mul(1099511628211)
                 });
@@ -172,7 +172,7 @@ fn gpu_consts_and_slots(
             }
             Storage::Slot(other) => panic!("unexpected slot {other:?} on gemma2 prefill"),
             Storage::Const => {
-                let name = m.name.clone().unwrap();
+                let name = m.name().unwrap().into_owned();
                 let seed: u64 = name.bytes().fold(1469598103934665603u64, |h, c| {
                     (h ^ c as u64).wrapping_mul(1099511628211)
                 });
@@ -404,7 +404,7 @@ fn gpu_consts_and_slots_decode(
                 });
             }
             Storage::Const => {
-                let name = m.name.clone().unwrap();
+                let name = m.name().unwrap().into_owned();
                 let data = fill(m.aval.numel(), 100 + i as u64);
                 let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let dense = DenseWeight::try_new(

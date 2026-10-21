@@ -2,175 +2,113 @@
 id: performance
 title: Performance
 sidebar_position: 2
-description: Single-request decode and prefill throughput across backends and frameworks.
+description: Single-request decode and prefill throughput of poot on the wgpu and ROCm backends, with the identity of every measured run.
 ---
 
 # Performance
 
-This page preserves benchmark snapshots from July and August 2026. They describe those binaries and
-execution paths, not current master after the September architecture changes. Quantized loading,
-kernel selection and executor code have changed since these runs; no current performance claim should
-be inferred from the old tables. The snapshots behind them were recorded before benchmark results carried
-their identity (build, profile, adapter, driver, checkpoint digest, the dtype the weights are stored in), so
-they are no longer in `benchmarks/results/`; they remain in git history. Results recorded since 2026-10-20
-carry that identity.
+Every number on this page comes from a run of poot's own benchmark harness (`benchmarks/`), recorded with the
+identity the harness stores in each result row: the build, the adapter and driver, the dtype the model
+computes in and the checkpoint digest. The run directories are in `benchmarks/results`, indexed in
+`benchmarks/results/INDEX.md`.
 
 :::info Scope
-These are **single-request decode/prefill** snapshots, not continuous-batching throughput. The recorded
-poot runs used the f32 path; comparison frameworks often used BF16/F16. For current format and model
-limitations see the [feature matrix](./feature-matrix.md).
+These are **single-request decode and prefill** measurements, not continuous-batching throughput. Which
+families, formats and backends are supported is in the [feature matrix](./feature-matrix.md).
 :::
 
-All numbers below come from poot's own benchmark harness, which runs each `(model, framework, scenario)`
-cell and records the raw result.
+## What was measured
 
-## Method
+| Field         | Value                                                                                                                       |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Build         | poot `775975d9`, release profile                                                                                            |
+| Hardware      | AMD Ryzen AI Max+ 395 "Strix Halo" with its Radeon 8060S iGPU (gfx1151)                                                     |
+| wgpu adapter  | AMD Radeon 8060S Graphics (RADV STRIX_HALO), driver `radv Mesa 26.1.3`                                                      |
+| ROCm adapter  | AMD Radeon 8060S Graphics, driver `hsa 1.18 amdgcn-amd-amdhsa--gfx1151`                                                     |
+| Model         | Qwen2.5-0.5B, bf16 safetensors checkpoint, digest `blake3:ed28ccbfe8235cc8b9f74c7779287d543faa71671816cd8fe09d0068d7ea35fb` |
+| Compute dtype | `f32`                                                                                                                       |
 
-- **Hardware:** an NVIDIA RTX 3090 (rented, dedicated) for the cross-framework comparison; a local AMD Ryzen
-  AI Max+ 395 "Strix Halo" iGPU (RADV/ROCm) for poot's cross-backend and the comparable-hardware view.
-- **Model:** Qwen2.5-0.5B-Instruct (poot's most-verified model), bf16 checkpoint. The measured poot binary loaded bf16/f16 and
-  upcast to f32; candle/transformers/vLLM run bf16; llama.cpp runs f16 GGUF.
-- **Scenarios:** `decode-128` (short prompt, 128 generated tokens, decode throughput), `prefill-1k` (~1k
-  prompt, 32 out, prefill/TTFT), `decode-curve` (decode throughput vs growing context).
-- Warmup then 5 timed iterations per cell; steady-state decode tok/s reported.
+The decode-128 cell is measured on wgpu and ROCm, the prefill-1k cell on ROCm only; decode against context length is not measured on this page. PTX and raw Vulkan are not measured on this page.
 
-## Decode throughput (RTX 3090, decode-128)
+Each cell is five repeats of the harness's own warmup and timed iterations; the tables give the median over the
+five repeats with the minimum and maximum in brackets. The iGPU is shared with the desktop, so the spread is
+part of the result.
 
-Decode tok/s (short prompt, 128 generated tokens). The Qwen2.5-0.5B column is the 2026-07-28 snapshot
-(poot commit `78ca82f2`); the Qwen3-0.6B column is the 2026-07-03 snapshot (`a39b146b`), the latest
-decode-128 run for that model. Compare rows within a column only.
+## What poot computes
 
-| Framework            | Qwen2.5-0.5B (07-28) | Qwen3-0.6B (07-03) |
-| -------------------- | -------------------- | ------------------ |
-| llama.cpp (f16 GGUF) | 424                  | 386                |
-| vLLM (bf16)          | (init error)         | 398                |
-| candle (bf16)        | 133                  | 124                |
-| poot PTX (f32)       | 101                  | 45                 |
-| transformers (bf16)  | 50                   | 32                 |
+The recorded identity of this run says `compute_dtype: f32`: the dense bf16 checkpoint is read as bf16 and its
+tensors are computed in f32. That is a property of the dense safetensors path measured here. Packed GGUF,
+GPTQ/AWQ and supported FP8 projections stay packed in memory and are decoded by the generated kernels as they
+consume them; see [Using quantized checkpoints](../serve/quantized-checkpoints.md). A run on a quantized
+checkpoint carries its own identity and is not comparable to the rows below.
 
-poot sits above transformers and below candle here. llama.cpp and vLLM are far ahead; they use
-f16/quantized paths, while these poot snapshots used the f32 path. vLLM's
-engine core failed to initialize for Qwen2.5-0.5B on this pod but ran for Qwen3-0.6B, so its cell is flaky
-(a setup/environment issue, not a model result).
+## Decode and prefill
 
-## Prefill (RTX 3090, Qwen2.5-0.5B, prefill-1k)
+| Scenario                                        | Backend | Decode tok/s           | TPOT ms | TTFT ms          |
+| ----------------------------------------------- | ------- | ---------------------- | ------- | ---------------- |
+| `decode-128` (5 prompt tokens, 128 generated)   | wgpu    | 165.9 (164.6 to 167.3) | 6.0     | 10.2             |
+| `decode-128` (5 prompt tokens, 128 generated)   | ROCm    | 160.8 (158.8 to 162.0) | 6.2     | 9.6              |
+| `prefill-1k` (1041 prompt tokens, 32 generated) | ROCm    | 150.0 (148.2 to 151.8) | 6.7     | 449 (439 to 450) |
 
-| Framework    | tok/s |
-| ------------ | ----- |
-| llama.cpp    | 462   |
-| candle       | 95    |
-| transformers | 45    |
-| poot (PTX)   | 49    |
+`decode-128` isolates decode: the decode rate is the steady rate once the short prompt is primed. `prefill-1k`
+isolates the prefill pass: its time to first token is the whole 1041-token prompt in one pass, about 2,300
+prompt tokens per second on ROCm.
 
-poot's prefill is a naive O(L^2) attention pass with no flash-prefill on this path, a known weakness at
-long prompts (poot has a fused flash-prefill kernel that this decode-oriented runner does not use yet). This number is the steady decode rate once the 1k-token prompt is primed, not the prefill pass
-itself; TTFT for that prefill pass is still highly variable run to run (1.7-17.7 s across two same-day
-snapshots), a separate, unresolved cost from the naive-attention pass above.
+### Prefill attention
 
-## Decode vs context length (RTX 3090, Qwen2.5-0.5B, poot PTX)
+The attention of the prefill plan is the same generated streaming kernel as decode's, with the causal mask
+stated by position: one workgroup per (query row, head) keeps the online-softmax state in workgroup memory, so
+the `[query x key]` score matrix is never written. The plan summary of the Qwen2 prefill graph (build `775975d9`, committed as `benchmarks/performance-bank/plan-summary/qwen2-attention-775975d9.tsv`) lists every attention equation as the `generated:attention` choice with `schedule=streaming` on the AMD GCN, Vulkan, SPIR-V Vulkan and NVPTX targets. A tiled prefill schedule is planned; the
+[attention page](../architecture/attention.mdx#the-streaming-schedule) describes the schedule.
 
-| Context (ISL) | Decode tok/s | Per-token (TPOT) |
-| ------------- | ------------ | ---------------- |
-| 128           | 74.0         | 13.5 ms          |
-| 512           | 64.8         | 15.4 ms          |
-| 2048          | 43.1         | 23.2 ms          |
-| 8192          | 16.5         | 60.6 ms          |
+## Low-head decode attention at the kernel level
 
-Per-token cost grows with context because attention over the KV cache is O(context) per token. This
-table was measured before the split-KV decode schedule existed: that binary walked the whole cache with
-one workgroup per head. The planner now splits the keys of a low-head decode across workgroups (see
-the attention architecture page), which the next section measures at the kernel level.
+One decode attention step with 2 query heads of width 128 over 1 key/value head, f32, as the performance bank
+measures it through the executor contract: wall step plus readback, nine timed repeats, same build and
+adapters as above. The values are the median with the minimum and maximum in brackets, in microseconds.
 
-## Low-head decode attention at the kernel level (Strix Halo iGPU)
+| Cache | Live keys              | wgpu              | ROCm                |
+| ----- | ---------------------- | ----------------- | ------------------- |
+| 4096  | 4096 (the cache bound) | 236 (105 to 470)  | 47.6 (46.7 to 49.0) |
+| 32768 | 32768                  | 323 (266 to 403)  | 158 (146 to 165)    |
+| 32768 | 1024                   | 641 (209 to 2135) | 79.0 (77.1 to 84.7) |
 
-One decode attention, 2 query heads of width 128 over 1 key/value head, f32, step time (wall step plus
-readback) of the planner's schedule before and after the split-KV schedule, median of 27 samples per
-side, interleaved runs on the same device and driver:
+The planner splits the keys of a low-head decode across workgroups: only for a single-row decode whose rows do
+not already fill the device's compute units, at most 16 splits, never a chunk under 128 keys (see
+[Split-KV decode](../architecture/attention.mdx#split-kv-decode)). The plans of all three rows are the two-launch
+partials-and-combine form. A two-head decode on a 40-compute-unit device therefore runs up to thirty-two
+workgroups instead of two. The ROCm spread is narrow; the wgpu rows have outlier repeats (the 1024-live-key row
+spans 209 to 2135 us), so read them as an order of magnitude, not a precise figure. Every row's result agrees
+with the bank's independent f64 reference within its tolerance. The raw receipts are under
+`benchmarks/performance-bank/candidates`. PTX and raw Vulkan rows are not recorded.
 
-| Cache | Live keys | wgpu before | wgpu after | ROCm before | ROCm after |
-| ----- | --------- | ----------- | ---------- | ----------- | ---------- |
-| 4096 (full cache bound) | all | 527 us | 117 us | 233 us | 47 us |
-| 32768 | 32768 | 4194 us | 357 us | 1911 us | 162 us |
-| 32768 | 1024 | 200 us | 201 us | 92 us | 91 us |
+## Reproducing
 
-A low-head decode over a long cache is about 5x (4096 keys) to 12x (32768 keys) faster on both
-backends: two workgroups on a 40-compute-unit device become thirty-two (sixteen splits per head). At a short live length the
-cache's capacity does not matter (the live bound already limits the keys a step visits), so the split
-neither helps nor costs measurable time there. The wgpu 4096-key row has outlier repeats that widen
-the harness's uncertainty band, so its verdict is "unverified" under the harness rule even though
-every "after" sample is below every "before" sample; the other rows are verdict "improvement" or
-"within noise". Receipts and the comparator's verdicts are under
-`benchmarks/performance-bank/candidates`. The CUDA (PTX) rows are not measured yet.
+```bash
+# 5 repeats of one cell on the local backend, then regenerate the index
+just bench-record rocm qwen2.5-0.5b prefill-1k
+python3 benchmarks/harness/bench.py index
+```
 
-## Cross-backend: one engine, three backends (Qwen2.5-0.5B, decode)
+`just bench-record <backend> <model> <scenario>` takes the scenarios `decode-128`, `prefill-1k` and
+`decode-curve`. `just bench-compare` judges a new set of repeats against the committed one with the harness's
+noise-aware comparator.
 
-| Backend   | Hardware              | Decode tok/s |
-| --------- | --------------------- | ------------ |
-| poot PTX  | RTX 3090 (NVIDIA)     | 101          |
-| poot ROCm | Strix Halo iGPU (AMD) | 27           |
-| poot wgpu | Strix Halo iGPU (AMD) | 18           |
+## Planned comparisons
 
-The PTX row is the 2026-07-28 decode-128 run; the ROCm and wgpu rows are the 2026-07-01 Strix Halo run
-(27.1 and 18.2 tok/s, prompt 5, 40 generated), so the hardware and snapshots differ. The same Qwen2.5-0.5B
-graph runs on all three of poot's backends. The RTX 3090 (a discrete GPU) leads the Strix Halo integrated
-GPU; in that short decode run poot's native ROCm/HSA path is about 1.5x its portable Vulkan
-(wgpu) path. In the later decode-curve run (2026-07-12) the two are level at ISL 128 (25.9 vs 25.7 tok/s), and
-wgpu fails at ISL 2048 and above on a dispatch-grid cap. All three backends lower the same primitive graph, with no vendor
-inference library underneath.
+Comparisons against llama.cpp and vLLM on NVIDIA hardware, and poot's PTX backend on that hardware, are
+planned. No pooled MoE decode throughput is measured; see [expert pooling](./feature-matrix.md#expert-pooling).
 
-## Broader model coverage (RTX 3090 / L40S / RTX A6000, 2026-08-19 to 2026-08-20)
+## Request timing
 
-A wider decode-curve sweep across other supported models shows roughly the same gap as Qwen2.5-0.5B, at
-short context (ISL 128):
+The benchmark runner records request start, every delivered token, and completion. TTFT ends at the first
+token. TPOT is the mean of all inter-token gaps, including the first gap; finish is the time from the last
+token to completion. E2E includes all three windows. Preparing wgpu decode before delivering the first token
+includes submitting and completing pending uploads after a cache build or request-state reset. That cost
+belongs to preparation, TTFT and E2E; it can increase TTFT and reduce the first gap without reducing E2E. Raw
+cold and repeated requests are retained separately. For zero tokens, first/last token times are absent and the
+whole request is finish; zero/one-token requests have no token-to-token gap, so their TPOT and decode rate
+are undefined (null in the per-request record).
 
-| Model        | GPU      | poot tok/s | llama.cpp tok/s | poot vs llama.cpp |
-| ------------ | -------- | ---------- | --------------- | ----------------- |
-| OLMo 2 1B    | RTX 3090 | 39.2       | 279.4           | 0.14x             |
-| Phi-3.5-mini | RTX 3090 | 25.8       | 100.4           | 0.26x             |
-| SmolLM3 3B   | RTX 3090 | 16.5       | 121.0           | 0.14x             |
-
-At larger sizes the sweep hits a different problem before it gets to a speed comparison: poot's cell
-errored (rc=-9, consistent with an out-of-memory kill) on Qwen3-14B on an L40S (46 GiB), and did not
-produce a result at all for Phi-4 on an RTX A6000 (48 GiB) in this run. Both are consistent with poot's
-f32-everywhere memory footprint scaling worse than the bf16/f16 baselines at this parameter count; llama.cpp
-completed both cells cleanly (25.8 and 24.0 tok/s). This is separate from the raw-speed gap above and is not root-caused.
-
-## Notes and caveats
-
-- **The measured path used f32.** Current packed GGUF, GPTQ/AWQ and supported FP8 projections stay
-  packed at load time. Dense host mirrors remain a separate limitation;
-  see [Using quantized checkpoints](../serve/quantized-checkpoints.md).
-- **vLLM** is flaky on the test pods: its engine core failed to initialize for Qwen2.5-0.5B but ran for
-  Qwen3-0.6B. That is a setup/environment issue, not a model result; failed cells are recorded as errors
-  rather than dropped.
-- **Run-to-run variance** on rented pods is ~10-15% (e.g. candle measured 131 then 111 tok/s on two
-  different RTX 3090 rentals; poot's own prefill-1k TTFT varied 1.7-17.7 s across two same-day snapshots).
-  The decode-128 and decode-vs-context-length tables above are each a single snapshot so their own rows are
-  directly comparable within the table; the decode-128 table is from earlier snapshots (2026-07-28 and 2026-07-03) than the
-  prefill and decode-vs-context-length tables (2026-08-20), so do not compare tok/s figures across tables.
-- **`decode-128` and `decode-curve` are different scenarios, not the same measurement at ISL 128.**
-  `decode-128` amortizes prefill into the reported rate; `decode-curve` (used in the decode-vs-context-length
-  table and the broader-coverage table above) excludes prefill and reports steady-state TPOT only. That is
-  why poot's ISL-128 decode-curve number (74.0 tok/s) does not match its decode-128 number (101 tok/s) above, they are not comparable to each other.
-- **These numbers are from early builds.** poot's kernels and kernel selection are still being tuned (for example,
-  a better kernel choice for the projection shapes lifted PTX decode in the decode-128 scenario from 45 to 57 tok/s on
-  2026-07-03; the 2026-07-28 run measured 101 tok/s).
-- **No pooled MoE decode has been measured**: expert pooling exists (`--expert-pool`) but there are no pooled throughput numbers; the
-  numbers above cover the dense and standard-MoE decode path with every expert resident. See the
-  [feature matrix](./feature-matrix.md#expert-pooling).
-
-## Request timing in the current runner
-
-The benchmark runner records request start, every delivered token, and completion. TTFT ends
-at the first token. TPOT is the mean of all inter-token gaps, including the first gap; finish
-is the time from the last token to completion. E2E includes all three windows. Preparing wgpu decode
-before delivering the first token includes submitting and completing pending uploads after a
-cache build or request-state reset. That cost belongs to preparation, TTFT and E2E; it can
-increase TTFT and reduce the first gap without reducing E2E. Raw cold and repeated requests are
-retained separately. For zero tokens, first/last token
-times are absent and the whole request is finish; zero/one-token requests have no token-to-token gap, so their TPOT and
-decode rate are undefined (null in the per-request record). These conventions do not revise the historical tables above.
-
-Unprofiled wgpu execution groups dispatches within each existing submission into one compute
-pass. Profiling preserves per-dispatch passes and adds measurement overhead; use unprofiled
-wall time for latency comparisons.
+Unprofiled wgpu execution groups dispatches within each existing submission into one compute pass. Profiling
+preserves per-dispatch passes and adds measurement overhead; use unprofiled wall time for latency comparisons.

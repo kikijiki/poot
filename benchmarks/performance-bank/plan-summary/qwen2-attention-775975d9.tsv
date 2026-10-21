@@ -1,0 +1,17 @@
+build	dump	graph	eqn	op	plan	choice	grid	detail
+775975d9	amd_gcn	qwen2.decode	20	attention	compute	generated:attention	256,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=live(v82)
+775975d9	amd_gcn	qwen2.decode	39	attention	compute	generated:attention	256,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=live(v82)
+775975d9	amd_gcn	qwen2.prefill	21	attention	compute	generated:attention	1024,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=capacity
+775975d9	amd_gcn	qwen2.prefill	44	attention	compute	generated:attention	1024,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=capacity
+775975d9	vulkan	qwen2.decode	20	attention	compute	generated:attention	256,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=live(v82)
+775975d9	vulkan	qwen2.decode	39	attention	compute	generated:attention	256,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=live(v82)
+775975d9	vulkan	qwen2.prefill	21	attention	compute	generated:attention	1024,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=capacity
+775975d9	vulkan	qwen2.prefill	44	attention	compute	generated:attention	1024,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=capacity
+775975d9	spirv_vulkan	qwen2.decode	20	attention	compute	generated:attention	256,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=live(v82)
+775975d9	spirv_vulkan	qwen2.decode	39	attention	compute	generated:attention	256,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=live(v82)
+775975d9	spirv_vulkan	qwen2.prefill	21	attention	compute	generated:attention	1024,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=capacity
+775975d9	spirv_vulkan	qwen2.prefill	44	attention	compute	generated:attention	1024,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=capacity
+775975d9	nvptx	qwen2.decode	20	attention	compute	generated:attention	256,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=live(v82)
+775975d9	nvptx	qwen2.decode	39	attention	compute	generated:attention	256,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=live(v82)
+775975d9	nvptx	qwen2.prefill	21	attention	compute	generated:attention	1024,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=capacity
+775975d9	nvptx	qwen2.prefill	44	attention	compute	generated:attention	1024,1,1	schedule=streaming lanes=64 lds=4608 key=single bound=capacity

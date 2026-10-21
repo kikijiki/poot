@@ -15,21 +15,26 @@ const LOADER_CLAIMS: [&str; 3] = [
 #[test]
 fn no_source_or_doc_claims_a_v4_packed_loader() {
     let names = include_str!("../names.rs");
-    let models = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../website/docs/develop/models.md"
-    ))
-    .expect("the models page of the public docs");
-    // Only the DeepSeek-V4 section of the page: other families' sections load their checkpoints.
-    let section = models
-        .split("\n## ")
-        .find(|section| section.starts_with("DeepSeek-V4"))
-        .expect("the models page has a DeepSeek-V4 section");
+    // The public pages that could state a V4 loader: the models page (model-neutral) and the feature matrix
+    // (the per-model support table). The claims are specific sentences, so the whole page is scanned.
+    let page = |path: &str| {
+        std::fs::read_to_string(format!(
+            "{}/../../website/docs/{path}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("the public docs page {path}: {e}"))
+    };
+    let models = page("develop/models.md");
+    let matrix = page("reference/feature-matrix.md");
     assert!(
         names.contains("No loader produces the packed form"),
         "names.rs must state that no loader builds V4's packed entries"
     );
-    for (file, text) in [("names.rs", names), ("develop/models.md", section)] {
+    for (file, text) in [
+        ("names.rs", names.to_string()),
+        ("develop/models.md", models),
+        ("reference/feature-matrix.md", matrix),
+    ] {
         for claim in LOADER_CLAIMS {
             assert!(
                 !text.contains(claim),

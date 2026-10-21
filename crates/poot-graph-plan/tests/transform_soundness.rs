@@ -427,7 +427,7 @@ fn card536a_contraction_is_covered_by_the_in_crate_oracle() {
         optimized
             .eqns()
             .iter()
-            .any(|eqn| matches!(eqn.op, OpKind::MatMul)),
+            .any(|eqn| matches!(eqn.op, OpKind::MatMul { .. })),
         "the contraction stays a plain MatMul through the passes"
     );
     assert_eq!(

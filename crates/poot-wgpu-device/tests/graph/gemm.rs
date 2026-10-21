@@ -48,7 +48,7 @@ fn tiled_gemm_large_n_under_tile_threshold_matches_cpu() {
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .unwrap();
     let (plan, choice) = plan_eqn_with_choice(
         &g,
@@ -117,7 +117,7 @@ fn tiled_gemm_tile_count_threshold_gated_and_correct() {
         let eqn = g
             .eqns()
             .iter()
-            .find(|e| matches!(e.op, OpKind::MatMul))
+            .find(|e| matches!(e.op, OpKind::MatMul { .. }))
             .unwrap();
         // both take the tiled path; the plan is one dispatch or several.
         let (plan, choice) = plan_eqn_with_choice(
@@ -218,7 +218,7 @@ fn lm_head_gemv_2d_grid_matches_cpu() {
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .unwrap();
     let (plan, choice) = plan_eqn_with_choice(
         &g,
@@ -287,7 +287,7 @@ fn decode_gemv_chunked_at_bloom_lm_head_n_matches_cpu() {
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .unwrap();
     let (plan, choice) = plan_eqn_with_choice(
         &g,
@@ -994,7 +994,7 @@ fn tiled_gemm_random_shapes_gpu_matches_cpu() {
             .find(|(e, _)| {
                 matches!(
                     e.op,
-                    OpKind::MatMul
+                    OpKind::MatMul { .. }
                         | OpKind::ContractionEpilogue {
                             head: ContractionHead::MatMul,
                             ..
@@ -1098,7 +1098,7 @@ fn synthesized_tiled_gemm_choice_matches_cpu() {
         let g = b.finish(out).unwrap();
 
         let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
-            matches!(op, OpKind::MatMul)
+            matches!(op, OpKind::MatMul { .. })
         });
         assert!(
             matches!(
@@ -1157,7 +1157,7 @@ fn chunked_large_tiled_gemm_gpu_matches_cpu() {
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .unwrap();
     let (plan, _) = plan_eqn_with_choice(
         &g,
@@ -1275,7 +1275,7 @@ fn batched_tiled_gemm_random_shapes_gpu_matches_cpu() {
         let eqn = g
             .eqns()
             .iter()
-            .find(|e| matches!(e.op, OpKind::MatMul))
+            .find(|e| matches!(e.op, OpKind::MatMul { .. }))
             .unwrap();
         // the batched-weight tiled GEMM is the imported kernel, dispatched with a metadata buffer (the `[E,M,K,N]` dims buffer) rather than a kernelgen launch with none.
         let (plan, choice) = plan_eqn_with_choice(
@@ -1531,7 +1531,7 @@ fn nvptx_prefill_tiled_gemm_plan_selection() {
         let eqn = g
             .eqns()
             .iter()
-            .find(|e| matches!(e.op, OpKind::MatMul))
+            .find(|e| matches!(e.op, OpKind::MatMul { .. }))
             .unwrap();
         plan_eqn_with_choice(
             &g,

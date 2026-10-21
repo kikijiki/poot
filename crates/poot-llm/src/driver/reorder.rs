@@ -89,7 +89,7 @@ impl CarriedState {
         graph.state_pairs().map(|pair| {
             let meta = graph.meta(pair.input);
             Self {
-                name: meta.name.clone(),
+                name: meta.name().map(std::borrow::Cow::into_owned),
                 aval: meta.aval.clone(),
                 role: pair.role,
                 input: pair.input,

@@ -21,7 +21,7 @@ fn run_case(
         let meta = case.graph.meta(id);
         match meta.storage {
             Storage::Const => {
-                let name = meta.name.clone().ok_or("a const without a name")?;
+                let name = meta.name().ok_or("a const without a name")?.into_owned();
                 consts.push(ConstFixture {
                     name: Box::leak(name.into_boxed_str()),
                     tensor,

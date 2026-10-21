@@ -125,7 +125,7 @@ fn carriers(graph: &Graph, owner: &Arc<PackedPayload>) -> HashMap<ValueId, Value
         .inputs()
         .iter()
         .filter_map(|&id| {
-            let name = PackedSourceName::parse(graph.meta(id).name.as_deref()?)?;
+            let name = PackedSourceName::parse(graph.meta(id).name().as_deref()?)?;
             assert_eq!(graph.aval(id).dtype, DType::I8);
             Some((
                 id,
@@ -294,7 +294,7 @@ fn packed_decode_through_capture_and_replay_is_bit_exact_on_ptx() {
             .inputs()
             .iter()
             .copied()
-            .find(|&id| graph.meta(id).name.as_deref() == Some("eye"))
+            .find(|&id| graph.meta(id).name().as_deref() == Some("eye"))
             .unwrap();
         consts.insert(eye_id, eye().into());
 
@@ -565,7 +565,7 @@ fn run_indexed_case(
     for &id in graph.inputs() {
         let Some(name) = graph
             .meta(id)
-            .name
+            .name()
             .as_deref()
             .and_then(PackedSourceName::parse)
         else {

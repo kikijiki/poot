@@ -297,7 +297,7 @@ fn opset_op(op: &OpKind) -> Option<(VpuOp, OpClass)> {
             },
             OpClass::Arithmetic,
         ),
-        OpKind::MatMul => (VpuOp::MatMul, OpClass::Arithmetic),
+        OpKind::MatMul { .. } => (VpuOp::MatMul, OpClass::Arithmetic),
         OpKind::Gather { axis } => (VpuOp::Gather { axis: *axis }, OpClass::Movement),
         OpKind::DynamicUpdateSlice { axis } => {
             (VpuOp::DynamicUpdateSlice { axis: *axis }, OpClass::Movement)

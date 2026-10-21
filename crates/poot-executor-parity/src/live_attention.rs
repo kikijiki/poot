@@ -76,7 +76,7 @@ pub fn live_steps(
                 .unwrap();
                 store
                     .insert(
-                        meta.name.clone().expect("a named const"),
+                        meta.name().expect("a named const").into_owned(),
                         WeightEntry::Dense(dense),
                     )
                     .unwrap();

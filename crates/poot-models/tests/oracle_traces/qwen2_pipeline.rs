@@ -121,7 +121,7 @@ pub(super) fn eval_step(
                 HostTensor::i32(m.aval.shape.clone(), write.to_vec())
             }
             Storage::Slot(other) => panic!("unexpected slot {other:?}"),
-            Storage::Const => named_weight(m.name.as_deref().unwrap(), &m.aval.shape),
+            Storage::Const => named_weight(&m.name().unwrap(), &m.aval.shape),
             Storage::Computed(c) => c.tensor(),
             Storage::State => continue,
             Storage::Device => unreachable!(),

@@ -64,8 +64,7 @@ fn small_integers(n: usize, seed: u64, range: i32) -> Vec<i32> {
 /// the planner runs on the RDNA3 WMMA tensor cores (every dimension a multiple of 16, no batch
 /// dimension; a bf16 result is planned as the serial kernel instead). No tracer emits it any more (the
 /// `to_mixed_bf16` pass that rewrote f32 matmuls into it is deleted), so the fixture states it directly:
-/// the matmul's stored output type is f32 over bf16 operands, which `Graph` validation admits as an
-/// f32-accumulate widening. `x` is an f32 step slot (the contract binds F32 and I32 slots) cast to bf16
+/// the matmul is the f32-accumulate form, f32 over bf16 operands. `x` is an f32 step slot (the contract binds F32 and I32 slots) cast to bf16
 /// in the program, `w` a bf16 constant held as its stored words. Both are small integers (`|x| <= 1`,
 /// `|w| <= 2`), so every product and sum is exact in the bf16 operands and the f32 accumulator, and the
 /// device's result equals the oracle's bit for bit whatever its summation order.
@@ -77,15 +76,10 @@ fn wmma_fixture(name: &'static str, s: usize) -> Fixture {
     let w = b
         .constant("w", TensorType::new(vec![s, s], DType::BF16))
         .unwrap();
-    let out = b.matmul(b.cast(x, DType::BF16).unwrap(), w).unwrap();
+    let out = b
+        .matmul_f32_accumulate(b.cast(x, DType::BF16).unwrap(), w)
+        .unwrap();
     let graph = b.finish(out).unwrap();
-    let accumulated = TensorType::new(graph.aval(out.id()).shape.clone(), DType::F32);
-    let graph = poot_graph_ir::test_support::graph_fixtures::with_declared_type(
-        &graph,
-        out.id(),
-        accumulated,
-    )
-    .unwrap();
     let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2u64)
         .map(|step| {
@@ -151,15 +145,10 @@ fn wmma_batched_fixture(name: &'static str, operand: DType) -> Fixture {
             TensorType::new(vec![WMMA_BATCH, WMMA_K, WMMA_N], operand),
         )
         .unwrap();
-    let out = b.matmul(b.cast(x, operand).unwrap(), w).unwrap();
+    let out = b
+        .matmul_f32_accumulate(b.cast(x, operand).unwrap(), w)
+        .unwrap();
     let graph = b.finish(out).unwrap();
-    let accumulated = TensorType::new(graph.aval(out.id()).shape.clone(), DType::F32);
-    let graph = poot_graph_ir::test_support::graph_fixtures::with_declared_type(
-        &graph,
-        out.id(),
-        accumulated,
-    )
-    .unwrap();
     let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2usize)
         .map(|step| {

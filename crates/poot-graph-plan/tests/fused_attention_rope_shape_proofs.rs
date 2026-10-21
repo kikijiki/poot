@@ -158,7 +158,7 @@ fn broadcast_kv_attention_stays_decomposed_and_matches_the_oracle() {
             .iter()
             .map(|e| match e.op {
                 OpKind::Transpose { .. } => "transpose",
-                OpKind::MatMul => "matmul",
+                OpKind::MatMul { .. } => "matmul",
                 OpKind::Fused(_) => "fused",
                 OpKind::FusedRow(_) => "fused_row",
                 OpKind::ContractionEpilogue { .. } => "contraction_epilogue",

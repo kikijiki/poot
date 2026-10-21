@@ -88,7 +88,7 @@ fn value_named(graph: &Graph, name: &str) -> ValueId {
     graph
         .values()
         .iter_enumerated()
-        .find_map(|(id, value)| (value.name.as_deref() == Some(name)).then_some(id))
+        .find_map(|(id, value)| (value.name().as_deref() == Some(name)).then_some(id))
         .unwrap_or_else(|| panic!("the graph declares {name}"))
 }
 
@@ -167,7 +167,7 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_lm_head_weight() {
         assert!(
             value.aval.dtype != DType::F32 || value.aval.shape != vec![vocab, hidden],
             "F32 vocabulary matrix {:?} in the prepared graph",
-            value.name
+            value.name()
         );
     }
 }
@@ -372,7 +372,7 @@ fn largest_projection(graph: &Graph) -> (String, u64, u64) {
         .consts()
         .iter()
         .filter_map(|&id| {
-            let name = graph.meta(id).name.clone()?;
+            let name = graph.meta(id).name()?.into_owned();
             let shape = &graph.aval(id).shape;
             (shape.len() == 2 && !skip.contains(&name)).then(|| {
                 let row = shape[1] as u64 * graph.aval(id).dtype.byte_size() as u64;
@@ -413,20 +413,20 @@ fn a_cap_below_the_largest_projection_splits_it_on_every_backend() {
             !planned
                 .consts()
                 .iter()
-                .any(|&id| planned.meta(id).name.as_deref() == Some(name.as_str())),
+                .any(|&id| planned.meta(id).name().as_deref() == Some(name.as_str())),
             "{backend:?}: {name} is still one constant after compile"
         );
-        // The embedding gather is hosted off the device (`Slot::TokenEmbed`) where the target admits
+        // The embedding gather is hosted off the device (`TOKEN_EMBED`) where the target admits
         // it, so the cap binds every other constant: the projections, split, and the head, split.
         for &id in planned
             .consts()
             .iter()
-            .filter(|&&id| planned.meta(id).name.as_deref() != Some(&*embedding()))
+            .filter(|&&id| planned.meta(id).name().as_deref() != Some(&*embedding()))
         {
             assert!(
                 const_bytes(planned, id) <= cap,
                 "{backend:?}: {:?} is {} bytes, over the {cap}-byte cap",
-                planned.meta(id).name,
+                planned.meta(id).name(),
                 const_bytes(planned, id)
             );
         }
@@ -455,7 +455,7 @@ fn a_cap_below_one_projection_row_is_a_typed_refusal_naming_the_constant() {
                         graph
                             .consts()
                             .iter()
-                            .any(|&id| graph.meta(id).name.as_deref() == Some(name.as_str())),
+                            .any(|&id| graph.meta(id).name().as_deref() == Some(name.as_str())),
                         "{name} is a constant of the graph"
                     );
                 }

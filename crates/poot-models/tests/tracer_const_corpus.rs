@@ -322,7 +322,7 @@ fn const_avals(g: &Graph) -> BTreeMap<String, Vec<usize>> {
             if m.storage != Storage::Const {
                 return None;
             }
-            let name = m.name.clone()?;
+            let name = m.name().map(std::borrow::Cow::into_owned)?;
             Some((name, m.aval.shape.clone()))
         })
         .collect()
@@ -429,12 +429,17 @@ fn card_550_dense_corpus_counts_zero_mask_step_inputs_and_consts() {
         for &id in g.inputs() {
             let m = g.meta(id);
             let is_mask_const = m.storage == Storage::Const
-                && m.name
+                && m.name()
                     .as_deref()
                     .is_some_and(|n| n.contains("mask") || n == "causal.mask");
             if is_mask_const {
                 mask_count += 1;
-                offenders.push(format!("{}: {:?} (name={:?})", row.name, m.storage, m.name));
+                offenders.push(format!(
+                    "{}: {:?} (name={:?})",
+                    row.name,
+                    m.storage,
+                    m.name()
+                ));
             }
         }
     }

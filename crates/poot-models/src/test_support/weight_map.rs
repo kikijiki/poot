@@ -643,7 +643,7 @@ pub fn check_split_head(exec: &mut dyn Executor, target: Target) {
             .iter()
             .filter(|&&id| {
                 g.meta(id)
-                    .name
+                    .name()
                     .as_deref()
                     .is_some_and(|n| n.starts_with("w.head.chunk"))
             })
@@ -654,7 +654,7 @@ pub fn check_split_head(exec: &mut dyn Executor, target: Target) {
             assert!(
                 bytes as u64 <= SPLIT_LIMIT,
                 "{:?} ({bytes} bytes) fits the limit",
-                g.meta(id).name
+                g.meta(id).name()
             );
         }
         g

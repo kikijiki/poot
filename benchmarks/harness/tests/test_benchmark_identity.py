@@ -257,10 +257,13 @@ class BenchCompareRecipeTests(unittest.TestCase):
         )
 
     def planted(self, results, scale):
-        """Candidate run directories beside (not inside) the committed results: every committed set again, the
-        newest one with every `decode_tok_s` scaled by `scale`."""
-        sets = bench.committed_sets(results)
-        newest = next(reversed(sets))
+        """Candidate run directories beside (not inside) the committed results: the baseline's sets again (the
+        newest set of each cell), the newest one with every `decode_tok_s` scaled by `scale`."""
+        baseline_dirs, _ = bench.last_committed_set(results)
+        sets = {}
+        for source in baseline_dirs:
+            sets.setdefault(bench._REPEAT_SUFFIX.sub("", source.name), []).append(source)
+        newest = max(sets)
         candidate_root = Path(tempfile.mkdtemp(dir=self.work.name))
         dirs = []
         for name, sources in sets.items():

@@ -8,9 +8,8 @@
 //! f16-rounded CPU oracle.
 //!
 //! Shape/dtype follow `matmul_spirv_coopmat_eligible` (card 154): F16 operands, F32 output, M/N/K
-//! 16-aligned. `Builder::matmul` infers the output dtype from operand A (F16), so the
-//! output is retagged to F32 via `ValueMeta::aval`, as `poot-graph-plan`'s `mixed_matmul_graph_shape`
-//! helper does; no checkpoint loader produces an f16-in/f32-out matmul yet.
+//! 16-aligned. `Builder::matmul_f32_accumulate` is the f16-in/f32-out matmul; no checkpoint loader
+//! produces one yet.
 
 use poot_runtime_common::DeviceBackend;
 use poot_tensor::{DType, HostTensor};
@@ -40,7 +39,7 @@ fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
     GPU.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Build `a[1,m,k] @ w[k,n] -> [1,m,n]` with F16 operands, then retag the output to F32 (the shape
+/// Build `a[1,m,k] @ w[k,n] -> [1,m,n]` with F16 operands accumulating and storing F32 (the shape
 /// `matmul_spirv_coopmat_eligible` accepts).
 fn f16_in_f32_out_matmul_graph(
     m: usize,
@@ -58,24 +57,9 @@ fn f16_in_f32_out_matmul_graph(
     let w = bld
         .constant("w", TensorType::new(vec![k, n], DType::F16))
         .unwrap();
-    let mm = bld.matmul(a, w).unwrap();
+    let mm = bld.matmul_f32_accumulate(a, w).unwrap();
     let (ai, wi) = (a.id(), w.id());
-    let g = bld.finish(mm).unwrap();
-    let out = g
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
-        .expect("a matmul eqn")
-        .out;
-    assert_eq!(
-        g.values()[out].aval.dtype,
-        DType::F16,
-        "sanity: Builder::matmul must still infer F16 (operand A's dtype) before the retag"
-    );
-    let retagged = TensorType::new(g.aval(out).shape.clone(), DType::F32);
-    let g =
-        poot_graph_ir::test_support::graph_fixtures::with_declared_type(&g, out, retagged).unwrap();
-    (g, ai, wi)
+    (bld.finish(mm).unwrap(), ai, wi)
 }
 
 /// Trace an F16 matmul, let `plan_eqn` select the `Backend::SpirvVulkan` coopmat arm, and run it through
@@ -163,7 +147,7 @@ fn coopmat_matmul_resident_graph_selects_coopmat_arm() {
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul))
+        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
         .expect("a matmul eqn");
     let (plan, choice) = plan_eqn_with_choice(
         &g,

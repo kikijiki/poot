@@ -538,7 +538,7 @@ pub fn assert_split_kv_pipeline_matches_the_oracle(
         let meta = graph.meta(id);
         match meta.storage {
             Storage::Const => {
-                let name = meta.name.clone().expect("a named const");
+                let name = meta.name().expect("a named const").into_owned();
                 let tensor = &tensors
                     .iter()
                     .find(|(n, _)| *n == name)

@@ -54,37 +54,32 @@ impl<'s> ConstWeights<'s> {
             if meta.storage != Storage::Const {
                 continue;
             }
-            let name = meta.name.as_deref().expect("a const has a name");
-            let (renamed, weight) = match PackedSourceName::parse(name) {
+            let name = meta.name().expect("a const has a name");
+            let name = name.as_ref();
+            let weight = match PackedSourceName::parse(name) {
                 Some(source)
                     if self.store.contains(source.linear_id())
                         || self.store.contains(&format!("{}.0", source.linear_id())) =>
                 {
                     let id = self.id(source.linear_id());
-                    let weight = WeightRef::whole(id).with_source(source.role());
-                    (weight.name(), weight)
+                    WeightRef::whole(id).with_source(source.role())
                 }
                 Some(_) => continue,
-                None if self.store.contains(name) => {
-                    let weight = WeightRef::whole(self.id(name));
-                    (weight.name(), weight)
-                }
+                None if self.store.contains(name) => WeightRef::whole(self.id(name)),
                 None => match name.rsplit_once(".chunk") {
                     // legalize's `<base>.chunkN` split of a stored weight follows its parent's id.
                     Some((base, index))
                         if index.parse::<usize>().is_ok() && self.store.contains(base) =>
                     {
                         let index = index.parse().expect("checked above");
-                        let weight = WeightRef::whole(self.id(base)).with_chunk(index);
-                        (weight.name(), weight)
+                        WeightRef::whole(self.id(base)).with_chunk(index)
                     }
                     _ => continue,
                 },
             };
-            named.values_mut()[input].name = Some(renamed);
-            // The reference follows the name, so a pass that derives a part's name from it (legalize's
+            // The reference is the constant's identity, so a pass that derives a part's name from it (legalize's
             // chunks) stays consistent with the store entries the map views.
-            named.values_mut()[input].weight = Some(weight);
+            named.values_mut()[input].bind_weight(weight);
         }
         named
             .commit()

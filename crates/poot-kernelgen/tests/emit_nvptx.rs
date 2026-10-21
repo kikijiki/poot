@@ -82,9 +82,12 @@ fn emit_nvptx_kernel_set() {
             leaf_tys: vec![kg::LeafTy::F32; 2],
             steps: vec![kg::FusedStep {
                 op: kg::FusedScalarOp::Binary(BinOp::Add),
-                inputs: vec![kg::FusedInput::Leaf(0), kg::FusedInput::Leaf(1)],
+                inputs: vec![
+                    kg::FusedInput::Leaf(kg::LeafId::new(0)),
+                    kg::FusedInput::Leaf(kg::LeafId::new(1)),
+                ],
             }],
-            output: kg::FusedInput::Step(0),
+            output: kg::FusedInput::Step(kg::StepId::new(0)),
         },
     )
     .expect("fused precondition");
@@ -101,9 +104,9 @@ fn emit_nvptx_kernel_set() {
                 leaf_tys: vec![kg::LeafTy::F32; 1],
                 steps: vec![kg::FusedStep {
                     op,
-                    inputs: vec![kg::FusedInput::Leaf(0)],
+                    inputs: vec![kg::FusedInput::Leaf(kg::LeafId::new(0))],
                 }],
-                output: kg::FusedInput::Step(0),
+                output: kg::FusedInput::Step(kg::StepId::new(0)),
             },
         )
         .expect("fused precondition")

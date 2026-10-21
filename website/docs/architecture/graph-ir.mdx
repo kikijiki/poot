@@ -58,9 +58,9 @@ struct Eqn {
 }
 
 struct ValueMeta {
-    aval:    TensorType,                   // shape + dtype - no data
-    storage: Storage,                      // Device | Const | Slot(Slot) | State | Computed
-    name:    Option<String>,
+    aval:     TensorType,                  // shape + dtype - no data
+    storage:  Storage,                     // Device | Const | Slot(Slot) | State | Computed
+    identity: Identity,                    // Anonymous | Named(String) | Weight(WeightRef) | Slot(SlotKey)
 }
 ```
 
@@ -75,12 +75,12 @@ is defined by the unique `Eqn` whose `out` is that id. This makes all transforms
 Activation tensors such as attention scores, MLP outputs and the residual stream use this class.
 
 **`Const`**. A weight or constant tensor (weight matrices, embedding tables, RoPE tables).
-Bound from the input map and uploaded for execution. Weight caches use payload identity and storage
-representation, so reusing a name for different bytes does not reuse the previous weight. `Graph::consts()` lists the const binders.
+Bound from the input map and uploaded for execution. A mapped weight is identified by its `WeightRef`, not by a name;
+weight caches use payload identity and storage representation, so different bytes never reuse a cached weight. `Graph::consts()` lists the const binders.
 
 **`Slot(Slot)`**. A per-step input routed through a stable device buffer that the host
 rewrites in place. The `Slot` kind says what it carries: `Token`, `Pos`, `SlotMap` and `WriteMap` (paged KV
-reads and writes; both declare the range of the words they hold, which the bind checks), `LoraIdx`, and others. The attention mask is not a slot: it is computed in-graph from `Pos`.
+reads and writes; both declare the range of the words they hold, which the bind checks), and others. A role only a pass or a runtime feature declares (the adapter index, the hosted embedding row, the expert pool and its map, the sampler inputs) is defined by that owner, not by the IR: the IR knows its label and the one type rule it declares inputs by. The attention mask is not a slot: it is computed in-graph from `Pos`.
 
 **`State`**. A persistent buffer carried across decode steps: the KV cache. Pre-allocated to
 `cap` capacity per layer. `Graph::state()` pairs each `state_in` binder with a `state_out`

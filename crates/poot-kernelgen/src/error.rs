@@ -10,6 +10,8 @@
 //! before it builds one (a block size a tile decomposition depends on, a rank two shapes must share, an
 //! index that must fit inside another extent).
 
+use crate::fused::LeafId;
+
 /// A public kernel generator's precondition, violated. `generator` names the function (its own name, not
 /// a caller's), so a match on the error variant plus `generator` says exactly which contract broke.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
@@ -116,8 +118,8 @@ pub enum KernelGenError {
     IndexLeafOperand {
         /// The generator function whose precondition was violated.
         generator: &'static str,
-        /// Index of the I32 leaf in the region's leaves.
-        leaf: usize,
+        /// The I32 leaf in the region's leaves.
+        leaf: LeafId,
         /// The operation the offending value feeds.
         consumer: String,
     },

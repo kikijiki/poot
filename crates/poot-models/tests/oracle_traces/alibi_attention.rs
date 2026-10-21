@@ -26,7 +26,7 @@ fn bloom_alibi_decode_skips_rope() {
     for id in g.inputs() {
         let m = &g.values()[*id];
         if let Storage::Const = m.storage {
-            let name = m.name.as_deref().unwrap_or("");
+            let name = m.name().unwrap_or_default();
             assert!(
                 !name.contains("rope"),
                 "an ALiBi decode must not declare rope tables, found {name}"

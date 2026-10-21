@@ -66,7 +66,7 @@ fn run_under(
         )
         .unwrap();
         builder
-            .insert(meta.name.clone().unwrap(), WeightEntry::Dense(dense))
+            .insert(meta.name().unwrap().into_owned(), WeightEntry::Dense(dense))
             .unwrap();
     }
     let store = builder.build();

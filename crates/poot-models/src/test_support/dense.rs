@@ -400,12 +400,12 @@ pub fn const_named_weights(m: &MappedModel, g: &Graph) -> (WeightStore, WeightMa
         if meta.storage != Storage::Const {
             continue;
         }
-        let name = meta.name.as_deref().expect("a const has a name");
+        let name = meta.name().expect("a const has a name").into_owned();
         let id = *ids
-            .get(name)
+            .get(name.as_str())
             .unwrap_or_else(|| panic!("the weight map names no const {name}"));
         store
-            .insert(name, m.map.materialize(id, &m.store).unwrap())
+            .insert(name.as_str(), m.map.materialize(id, &m.store).unwrap())
             .unwrap();
         named.push((id, name));
     }

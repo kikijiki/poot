@@ -3,7 +3,7 @@
 use std::num::NonZeroU32;
 
 use crate::graph::{LayerOrderError, Slot, SlotTypeError, Storage, ValueId};
-use crate::op::LocalId;
+use crate::op::{LaneId, LocalId};
 use crate::types::{DType, TensorType};
 use poot_quant::SourceRole;
 
@@ -743,6 +743,15 @@ pub enum GraphValidationError {
         /// Its storage.
         storage: Storage,
     },
+    /// A `Slot` input carries no [`crate::SlotKey`]: its identity is a bare name, so no binder can say which
+    /// role fills it.
+    #[error("{value} is a {slot:?} slot input with no slot key")]
+    SlotWithoutKey {
+        /// The value.
+        value: ValueId,
+        /// The slot kind its storage names.
+        slot: Slot,
+    },
     /// A value that is not a `Const` carries a weight reference: only a constant is a mapped weight.
     #[error("{value} carries a WeightRef but {storage:?} storage; expected Const")]
     UnexpectedWeightRef {
@@ -1294,7 +1303,7 @@ pub enum FusedOperandReason {
         /// The input read.
         input: LocalId,
         /// The lane index.
-        lane: usize,
+        lane: LaneId,
         /// The input's last-axis extent.
         width: usize,
     },

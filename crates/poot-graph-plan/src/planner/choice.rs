@@ -621,10 +621,10 @@ mod tests {
         use poot_kernel_ir::{BinOp, Ty};
         use poot_kernelgen::{
             ContractionSpec, ElementwiseSpec, Fold, FusedInput, FusedKernel, FusedScalarOp,
-            FusedStep, LeafTy, MatmulShapes, MovementOp, MovementSpec, PackedContraction,
+            FusedStep, LeafId, LeafTy, MatmulShapes, MovementOp, MovementSpec, PackedContraction,
             PackedKernelOp, PackedKernelSpec, PackedRequest, PointwiseForm, PointwiseSpec,
-            RopeSpec, RowKernel, RowOp, RowSpec, ScanKernel, ScanSpec, Schedule, Storage, TileSize,
-            TopKSpec, UnaryOp, ViewOperand,
+            RopeSpec, RowKernel, RowOp, RowSpec, RowValue, ScanKernel, ScanSpec, Schedule, StepId,
+            Storage, TileSize, TopKSpec, UnaryOp, ViewOperand,
         };
         use poot_quant::format::WeightFormat;
 
@@ -637,9 +637,9 @@ mod tests {
             leaf_tys: vec![LeafTy::F32; 1],
             steps: vec![FusedStep {
                 op: FusedScalarOp::Binary(BinOp::Add),
-                inputs: vec![FusedInput::Leaf(0), FusedInput::Lit(literal)],
+                inputs: vec![FusedInput::Leaf(LeafId::new(0)), FusedInput::Lit(literal)],
             }],
-            output: FusedInput::Step(0),
+            output: FusedInput::Step(StepId::new(0)),
         };
         let leaf = || ViewOperand {
             shape: vec![4],
@@ -665,9 +665,9 @@ mod tests {
                     n_cols: 4,
                     steps: vec![RowOp::Pointwise {
                         op: FusedScalarOp::Recip,
-                        inputs: vec![FusedInput::Leaf(0)],
+                        inputs: vec![FusedInput::Leaf(LeafId::new(0))],
                     }],
-                    output: 1,
+                    output: RowValue::Step(StepId::new(0)),
                 },
                 width,
             })

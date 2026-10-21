@@ -456,7 +456,7 @@ fn the_rollback_copies_recurrent_state_and_leaves_the_carry_untouched() {
     let carried: Vec<String> = schema
         .state_pairs()
         .filter(|pair| pair.role == StateRole::Handoff)
-        .map(|pair| schema.meta(pair.input).name.clone().unwrap())
+        .map(|pair| schema.meta(pair.input).name().unwrap().into_owned())
         .collect();
     assert_eq!(
         carried,
@@ -469,7 +469,7 @@ fn the_rollback_copies_recurrent_state_and_leaves_the_carry_untouched() {
     for graph in [&rollback.snapshot, &rollback.restore] {
         let mut names: Vec<String> = graph
             .state()
-            .map(|(input, _)| graph.meta(input).name.clone().unwrap())
+            .map(|(input, _)| graph.meta(input).name().unwrap().into_owned())
             .collect();
         names.sort();
         assert_eq!(names, ["toy.state", "toy.state@snap"]);

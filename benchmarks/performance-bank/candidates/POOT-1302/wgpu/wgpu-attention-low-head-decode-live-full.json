@@ -1,0 +1,131 @@
+{
+  "backend": "wgpu",
+  "binary": "/home/kikijiki/.cache/poot-cargo-target-2/release/examples/performance_bank",
+  "case": "attention-low-head-decode-live-full",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 303.959
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 322.714
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 395.761
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 361.23600000000005
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 402.674
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 350.105
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 301.435
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 302.18600000000004
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 265.487
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "hardware": {
+    "backend": "wgpu",
+    "device": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+    "driver": "radv Mesa 26.1.3"
+  },
+  "memory": [
+    {
+      "live_bytes": 33555456,
+      "peak_bytes": 33555456,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 17668,
+      "peak_bytes": 17668,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 262148,
+      "peak_bytes": 262148,
+      "role": "Input"
+    },
+    {
+      "live_bytes": 52,
+      "peak_bytes": 1076,
+      "role": "Staging"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 32768,
+      "d": 128,
+      "hkv": 1,
+      "hq": 2,
+      "live": 32768
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 33554432,
+    "weight_copies": 1
+  },
+  "plan": [
+    "pointwise [0b50dc5e45f514695441b6afb6634185135664b728e0cd3a4112ec99220f9154]",
+    "attention [502278429887dad661deeff54d2befc2e8dd3f376d1d8910466d967c0038ecfb]",
+    "attention_combine [e5162701f4a983fb947bb8f1d3a6cdd4f36d6e1ab1290197071c91a3ed2d3f00]"
+  ],
+  "plan_id": "0d6b74e078a39e6ad099ef7c2d080b2b506df5493f0b9e1665bcabb299605d00",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 2.002603767967667e-9,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1
+}

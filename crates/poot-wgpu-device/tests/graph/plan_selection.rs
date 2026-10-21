@@ -314,7 +314,7 @@ fn the_kernel_choice_names_generated_imported_and_no_dispatch_equations() {
         matches!(reshape, KernelChoice::NoDispatch(NoDispatch::Alias)),
         "a reshape launches nothing: {reshape:?}"
     );
-    let matmul = choice_of(|op| matches!(op, OpKind::MatMul));
+    let matmul = choice_of(|op| matches!(op, OpKind::MatMul { .. }));
     assert!(
         matches!(
             matmul,

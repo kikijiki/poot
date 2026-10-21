@@ -858,7 +858,13 @@ fn oracle_drafts(handle: &ModelHandle, tokens: &[u32], k: usize) -> Vec<u32> {
         ];
         let names: Vec<String> = graph
             .state()
-            .map(|(input, _)| graph.meta(input).name.clone().expect("state is named"))
+            .map(|(input, _)| {
+                graph
+                    .meta(input)
+                    .name()
+                    .expect("state is named")
+                    .into_owned()
+            })
             .collect();
         let held: Vec<HostTensor> = graph
             .state()

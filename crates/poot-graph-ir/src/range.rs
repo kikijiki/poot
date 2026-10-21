@@ -14,7 +14,8 @@
 //!
 //! The analysis proves what a graph computes, never what a caller claims: the in-graph index guard
 //! ([`crate::Builder::guard_index_bounds`]) is the same primitives as any other code, and its output is
-//! in `[0, upper)` through the `GeU` and `Select` rules alone. No shape is matched.
+//! in `[0, upper)` through the `GeU` and `Select` rules alone. No shape is matched. The same goes for the
+//! guard's witness: [`RangeFacts::observes`] follows a flag through the `Cast` and `Reduce` rules.
 //!
 //! I32 arithmetic is modulo 2^32, so an interval whose result leaves `i32` may have wrapped and the
 //! analysis answers the whole `i32` range for it: a sound fact in both the wrapping and the faulting
@@ -25,7 +26,7 @@
 
 use std::collections::HashMap;
 
-use crate::graph::{Graph, Operand, Storage, ValueId, ValueTable};
+use crate::graph::{Eqn, Graph, Operand, Storage, ValueId, ValueTable};
 use crate::op::{BinOp, OpKind, RedOp, UnOp};
 use crate::types::{DType, Scalar};
 
@@ -149,6 +150,7 @@ impl std::fmt::Display for IndexRange {
 pub struct RangeFacts {
     ranges: ValueTable<Option<IndexRange>>,
     clamps: ValueTable<Vec<ValueId>>,
+    observes: ValueTable<Vec<ValueId>>,
 }
 
 impl RangeFacts {
@@ -157,6 +159,14 @@ impl RangeFacts {
     /// and bound-checked slots alone.
     pub fn clamps(&self, value: ValueId) -> &[ValueId] {
         self.clamps.get(value).map_or(&[], Vec::as_slice)
+    }
+
+    /// The nonnegative I32 values `value` is nonzero for, whenever any of their lanes is nonzero: a flag
+    /// cast to F32 is, a sum of such lanes along any axis is, and a movement op that keeps every lane is. A
+    /// declared validation witness over `value` therefore reports each of them (the witness fails when the
+    /// flag does). Empty for a value no rule derives this for.
+    pub fn observes(&self, value: ValueId) -> &[ValueId] {
+        self.observes.get(value).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -195,7 +205,10 @@ pub fn value_ranges(graph: &Graph) -> RangeFacts {
         defs[eqn.out] = Some(index);
     }
     let mut clamps: ValueTable<Vec<ValueId>> = ValueTable::filled(graph.values().len(), Vec::new());
+    let mut observes: ValueTable<Vec<ValueId>> =
+        ValueTable::filled(graph.values().len(), Vec::new());
     for eqn in graph.eqns() {
+        observes[eqn.out] = observed_flags(graph, &ranges, &observes, eqn);
         if graph.aval(eqn.out).dtype != DType::I32 {
             continue;
         }
@@ -221,7 +234,39 @@ pub fn value_ranges(graph: &Graph) -> RangeFacts {
         rests_on.dedup();
         clamps[eqn.out] = rests_on;
     }
-    RangeFacts { ranges, clamps }
+    RangeFacts {
+        ranges,
+        clamps,
+        observes,
+    }
+}
+
+/// The flags the F32 result of `eqn` is nonzero for whenever any lane of theirs is (see
+/// [`RangeFacts::observes`]). A nonnegative I32 word converts to a nonnegative F32 that is zero only for zero;
+/// a sum of nonnegative lanes is zero only when every lane is; a reshape, transpose or broadcast keeps every
+/// lane. Anything else (a slice drops lanes, arithmetic can cancel) derives nothing.
+fn observed_flags(
+    graph: &Graph,
+    ranges: &ValueTable<Option<IndexRange>>,
+    observes: &ValueTable<Vec<ValueId>>,
+    eqn: &Eqn,
+) -> Vec<ValueId> {
+    let [Operand::Value(operand)] = eqn.inputs.as_slice() else {
+        return Vec::new();
+    };
+    match eqn.op {
+        OpKind::Cast { to: DType::F32 }
+            if graph.aval(*operand).dtype == DType::I32
+                && ranges[*operand].is_some_and(|range| range.nonnegative()) =>
+        {
+            vec![*operand]
+        }
+        OpKind::Reduce { op: RedOp::Sum, .. }
+        | OpKind::Reshape { .. }
+        | OpKind::Transpose { .. }
+        | OpKind::Broadcast { .. } => observes[*operand].clone(),
+        _ => Vec::new(),
+    }
 }
 
 /// The range of one operand: a literal is a point, a value its proven range. A non-I32 value (the
@@ -338,10 +383,6 @@ fn equation_range(
                 .unwrap_or(IndexRange::I32),
             _ => IndexRange::I32,
         },
-        // `x - x` is zero in every word, whatever `x` holds: the fallback of an index guard.
-        OpKind::Binary(BinOp::Sub) if matches!(inputs, [Operand::Value(a), Operand::Value(b)] if a == b) => {
-            IndexRange::point(0)
-        }
         OpKind::Binary(op) => binary_range(*op, at(0), at(1)),
         OpKind::Unary(UnOp::Not) => {
             // `!x == -x - 1`.

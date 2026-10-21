@@ -305,7 +305,7 @@ fn router_choices_are_serial(program: &Program, tokens: usize, experts: usize) -
         .filter(|eqn| {
             matches!(
                 eqn.op,
-                OpKind::MatMul
+                OpKind::MatMul { .. }
                     | OpKind::DenseContraction { .. }
                     | OpKind::ContractionEpilogue { .. }
             ) && g.aval(eqn.out).shape == [tokens, experts]

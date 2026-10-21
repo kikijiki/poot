@@ -39,14 +39,19 @@ use poot_kernelgen::KernelRequest;
 use poot_kernelgen::UnaryOp;
 use poot_tensor::DType;
 
-/// A region-local id -> a fused-kernel operand: `< n_inputs` is a leaf, otherwise a prior step.
-pub(crate) fn map_fused_local(id: LocalId, n_inputs: usize) -> kg::FusedInput {
+/// A region-local id -> a kernel value: `< n_inputs` is a leaf, otherwise a prior step.
+pub(crate) fn map_row_value(id: LocalId, n_inputs: usize) -> kg::RowValue {
     let id = id.index();
     if id < n_inputs {
-        kg::FusedInput::Leaf(id)
+        kg::RowValue::Leaf(kg::LeafId::new(id))
     } else {
-        kg::FusedInput::Step(id - n_inputs)
+        kg::RowValue::Step(kg::StepId::new(id - n_inputs))
     }
+}
+
+/// A region-local id -> a fused-kernel operand: `< n_inputs` is a leaf, otherwise a prior step.
+pub(crate) fn map_fused_local(id: LocalId, n_inputs: usize) -> kg::FusedInput {
+    map_row_value(id, n_inputs).into()
 }
 
 pub(crate) fn map_fused_input(
@@ -76,8 +81,8 @@ pub(crate) fn map_fused_input_i32(
             Err(site.refuse(Capability::FusedStep(FusedStepGap::F32LiteralInExactRegion)))
         }
         FusedOperand::PackLane { input, lane } => Ok(kg::FusedInput::LeafLane {
-            leaf: input.index(),
-            lane: *lane,
+            leaf: kg::LeafId::new(input.index()),
+            lane: kg::LaneId::new(lane.index()),
         }),
     }
 }

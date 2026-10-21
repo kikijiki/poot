@@ -240,13 +240,14 @@ fn a_paged_decode_of_the_real_qwen2_config_dispatches_no_gather_or_transpose_of_
     }
 }
 
-/// A copy of `g` with every named value renamed by `rename(value_index, old_name)`. Ids, shapes,
-/// storage and equations are untouched, so only the strings differ.
+/// A copy of `g` with every renamable named value renamed by `rename(value_index, old_name)`. Ids, shapes,
+/// storage and equations are untouched, so only the strings differ. A mapped weight and a keyed slot have no
+/// name to vary: their spelling is their identity.
 fn rename_values(g: &Graph, rename: impl Fn(usize, &str) -> String) -> Graph {
     derive(g, |draft| {
         for (index, value) in draft.values_mut().iter_mut().enumerate() {
-            if let Some(name) = &value.name {
-                value.name = Some(rename(index, name));
+            if let Some(name) = value.name().map(std::borrow::Cow::into_owned) {
+                let _typed_identity_keeps_its_spelling = value.rename(rename(index, &name));
             }
         }
     })
@@ -323,7 +324,7 @@ fn planning_a_graph_does_not_depend_on_its_value_names() {
 
     for (graph_index, graph) in graphs.iter().enumerate() {
         assert!(
-            graph.values().iter().any(|value| value.name.is_some()),
+            graph.values().iter().any(|value| value.name().is_some()),
             "graph {graph_index} has no named value, so renaming would prove nothing"
         );
         for backend in backends {

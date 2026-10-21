@@ -92,7 +92,7 @@ fn without_lm_head(g: poot_graph_ir::Graph) -> poot_graph_ir::Graph {
         .find(|e| e.out == g.result())
         .expect("the graph's declared output is produced by an equation");
     assert!(
-        matches!(out_eqn.op, OpKind::MatMul),
+        matches!(out_eqn.op, OpKind::MatMul { .. }),
         "expected the traced graph to end in the lm_head MatMul, found {:?}",
         out_eqn.op
     );
@@ -153,10 +153,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
                 di.insert(id, Value::from(HostTensor::i32(vec![1, 1], vec![pos])))
             }
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
-            Storage::Const => di.insert(
-                id,
-                Value::from(weight(m.name.as_deref().unwrap(), &m.aval.shape)),
-            ),
+            Storage::Const => di.insert(id, Value::from(weight(&m.name().unwrap(), &m.aval.shape))),
             Storage::Computed(computed) => Some(Value::from(computed.tensor())),
             Storage::State => None,
             Storage::Device => unreachable!(),
@@ -185,7 +182,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
     assert!(
         gh.consts()
             .iter()
-            .all(|&id| gh.meta(id).name.as_deref() != Some("w.embed")),
+            .all(|&id| gh.meta(id).name().as_deref() != Some("w.embed")),
         "legalize must drop the oversized embed const, not merely refuse it"
     );
     let embed_w = weight("w.embed", &[VOCAB, HIDDEN]);
@@ -202,7 +199,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
             Storage::Slot(Slot::Pos) => {
                 hi.insert(id, Value::from(HostTensor::i32(vec![1, 1], vec![pos])))
             }
-            Storage::Slot(Slot::TokenEmbed) => {
+            Storage::Slot(Slot::Owned(role)) if role == poot_graph_plan::TOKEN_EMBED => {
                 assert_eq!(m.aval.shape, vec![1, 1, h], "single-row TokenEmbed shape");
                 hi.insert(
                     id,
@@ -210,10 +207,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
                 )
             }
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
-            Storage::Const => hi.insert(
-                id,
-                Value::from(weight(m.name.as_deref().unwrap(), &m.aval.shape)),
-            ),
+            Storage::Const => hi.insert(id, Value::from(weight(&m.name().unwrap(), &m.aval.shape))),
             Storage::Computed(computed) => Some(Value::from(computed.tensor())),
             Storage::State => None,
             Storage::Device => unreachable!(),
@@ -239,7 +233,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
 }
 
 /// Same as [`compile_hosts_the_decode_embed_gather_without_changing_hidden_state`], for the multi-row
-/// prefill step (a `step` of L>1 tokens) - the hosted `Slot::TokenEmbed` shape is `[l,hidden]` (one row
+/// prefill step (a `step` of L>1 tokens) - the hosted `TOKEN_EMBED` shape is `[l,hidden]` (one row
 /// per prompt position), driven through `compile`.
 #[test]
 fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
@@ -275,10 +269,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
                 Value::from(HostTensor::i32(vec![1, l], (0..l as i32).collect())),
             ),
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
-            Storage::Const => di.insert(
-                id,
-                Value::from(weight(m.name.as_deref().unwrap(), &m.aval.shape)),
-            ),
+            Storage::Const => di.insert(id, Value::from(weight(&m.name().unwrap(), &m.aval.shape))),
             Storage::Computed(computed) => Some(Value::from(computed.tensor())),
             Storage::State => None,
             Storage::Device => unreachable!(),
@@ -317,7 +308,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
             Storage::Slot(Slot::Token) => {
                 unreachable!("legalize must drop the Token slot once it hosts the gather")
             }
-            Storage::Slot(Slot::TokenEmbed) => {
+            Storage::Slot(Slot::Owned(role)) if role == poot_graph_plan::TOKEN_EMBED => {
                 assert_eq!(m.aval.shape, vec![1, l, h], "prefill TokenEmbed shape");
                 hi.insert(
                     id,
@@ -329,10 +320,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
                 Value::from(HostTensor::i32(vec![1, l], (0..l as i32).collect())),
             ),
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
-            Storage::Const => hi.insert(
-                id,
-                Value::from(weight(m.name.as_deref().unwrap(), &m.aval.shape)),
-            ),
+            Storage::Const => hi.insert(id, Value::from(weight(&m.name().unwrap(), &m.aval.shape))),
             Storage::Computed(computed) => Some(Value::from(computed.tensor())),
             Storage::State => None,
             Storage::Device => unreachable!(),

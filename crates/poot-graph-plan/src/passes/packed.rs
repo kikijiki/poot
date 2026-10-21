@@ -245,7 +245,7 @@ fn validate_packed_carriers(
                     context,
                     carrier: carriers[i],
                     roles: (roles[i], roles[j]),
-                    name: g.meta(carriers[i]).name.clone(),
+                    name: g.meta(carriers[i]).name().map(std::borrow::Cow::into_owned),
                 });
             }
         }
@@ -448,7 +448,7 @@ pub fn recognize_packed_contractions(g: &Graph) -> Result<Graph, EditError> {
     let mut removed = HashSet::new();
 
     for (matmul_index, matmul) in g.eqns().iter().enumerate() {
-        if !matches!(matmul.op, OpKind::MatMul) || matmul.inputs.len() != 2 {
+        if !matmul.op.is_plain_matmul() || matmul.inputs.len() != 2 {
             continue;
         }
         let (Some(activation), Some(weight)) = (value_input(matmul, 0), value_input(matmul, 1))
@@ -515,7 +515,7 @@ pub fn recognize_packed_contractions(g: &Graph) -> Result<Graph, EditError> {
             continue;
         }
         let inner_matmul = &g.eqns()[inner_matmul_index];
-        if !matches!(inner_matmul.op, OpKind::MatMul) || inner_matmul.inputs.len() != 2 {
+        if !inner_matmul.op.is_plain_matmul() || inner_matmul.inputs.len() != 2 {
             continue;
         }
         if consumers[product].len() != 1 || is_graph_escape(g, product) {
@@ -808,7 +808,7 @@ mod tests {
                 layer: None,
             });
             g.eqns_mut().push(Eqn {
-                op: OpKind::MatMul,
+                op: OpKind::matmul(),
                 inputs: vec![Operand::Value(dequant), Operand::Value(xt)],
                 out: wx,
                 layer: None,
@@ -873,12 +873,14 @@ mod tests {
     fn canonical_chain_is_recognized_with_no_packed_source_names() {
         let named = canonical_graph();
         assert!(
-            named.values().iter().any(|value| value.name.is_some()),
+            named.values().iter().any(|value| value.name().is_some()),
             "fixture has no named value, so clearing names would prove nothing"
         );
         let g = poot_graph_ir::test_support::graph_fixtures::derive(&named, |draft| {
             for value in draft.values_mut().iter_mut() {
-                value.name = None;
+                value
+                    .clear_name()
+                    .expect("the fixture's values are plain named ones");
             }
         })
         .unwrap();
@@ -947,7 +949,7 @@ mod tests {
             .unwrap();
         let output = plan
             .equation(
-                OpKind::MatMul,
+                OpKind::matmul(),
                 vec![
                     Operand::Value(activation.id()),
                     Operand::Value(weight_t.id()),

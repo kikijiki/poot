@@ -14,7 +14,7 @@
 //! its parent weight `<name>` that the chunks before it leave off, as a row range of the parent's
 //! own spans: the parent is never read or uploaded whole. A chunk of a packed expert stack's source (legalize's
 //! split of a stack over the buffer limit) is a run of whole experts, padded to the slab stride like the whole.
-//! A hosted embed gather ([`Slot::TokenEmbed`](poot_graph_ir::Slot::TokenEmbed)) reads its rows
+//! A hosted embed gather (`TOKEN_EMBED`(`TOKEN_EMBED`)) reads its rows
 //! through the same resolution.
 
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use poot_graph_ir::{
-    IndexRange, PackedSourceName, SlotKey, TensorType, ValueId, packed_stack_source_type,
+    IndexRange, PackedSourceName, SlotKey, TensorType, ValueId, WeightRef, packed_stack_source_type,
 };
 use poot_quant::SourceRole;
 use poot_quant::weights::{StoreGeneration, WeightEntry, WeightKey, WeightStore};
@@ -33,14 +33,32 @@ use poot_weights::{HandleFormat, WeightId, WeightMap, WeightView};
 use crate::error::{BindError, LoadError};
 use crate::lanes::{EncodeError, Encoding, first_non_finite_f16};
 
+/// A position in an entry's `locals`: the buffers the entry owns outright. Distinct from an arena slot, a weight,
+/// a state buffer and a resident table, which are positions in other lists (`Loc`), and from a graph value id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LocalBuffer(usize);
+
+impl LocalBuffer {
+    /// Append `buffer` to `locals` and name where it landed.
+    pub(crate) fn push<B>(locals: &mut Vec<B>, buffer: B) -> Self {
+        locals.push(buffer);
+        Self(locals.len() - 1)
+    }
+
+    /// The buffer this names in the entry's `locals`.
+    pub(crate) fn of<B>(self, locals: &[B]) -> &B {
+        &locals[self.0]
+    }
+}
+
 /// One entry slot: the structured key a step input matches by, its declared type, and the device
 /// lane the planner chose for it.
 pub(crate) struct BoundSlot {
     pub key: SlotKey,
     pub aval: TensorType,
     pub storage: BufferStorage,
-    /// Index into the entry's `locals`.
-    pub buffer: usize,
+    /// The slot's buffer in the entry's `locals`.
+    pub buffer: LocalBuffer,
     /// The range the graph declares for this slot's I32 words ([`poot_graph_ir::ValueMeta::range`]):
     /// checked at every bind, so the planner and the graph's consumers may rely on it.
     pub range: Option<IndexRange>,
@@ -286,26 +304,18 @@ pub(crate) struct Chunk {
     pub rows: Range<usize>,
 }
 
-/// `name` as `(base, N)` when it is spelled `<base>.chunkN`, the name legalize gives chunk `N` of an
-/// oversized weight `base`.
-fn chunk_name(name: &str) -> Option<(&str, usize)> {
-    let (base, index) = name.rsplit_once(".chunk")?;
-    let parsed: usize = index.parse().ok()?;
-    (!base.is_empty() && parsed.to_string() == index).then_some((base, parsed))
-}
-
-/// The [`Chunk`] of every chunk const among `consts` (`(value, name, declared shape)`): a parent's
+/// The [`Chunk`] of every chunk const among `consts` (`(value, weight, declared shape)`): a parent's
 /// chunks tile its rows in index order, each as tall as its declared leading axis. Chunk indices
 /// that are not dense from 0 are a graph no binder can place, refused by name.
 pub(crate) fn chunks<'a>(
-    consts: impl IntoIterator<Item = (ValueId, &'a str, &'a [usize])>,
+    consts: impl IntoIterator<Item = (ValueId, WeightRef, &'a [usize])>,
 ) -> Result<HashMap<ValueId, Chunk>, LoadError> {
-    let mut by_base: HashMap<&str, Vec<(usize, ValueId, usize)>> = HashMap::new();
-    for (value, name, shape) in consts {
-        if let Some((base, index)) = chunk_name(name) {
+    let mut by_base: HashMap<WeightRef, Vec<(usize, ValueId, usize)>> = HashMap::new();
+    for (value, weight, shape) in consts {
+        if let Some(index) = weight.chunk() {
             let height = shape.first().copied().unwrap_or(0);
             by_base
-                .entry(base)
+                .entry(weight.parent())
                 .or_default()
                 .push((index, value, height));
         }
@@ -313,6 +323,7 @@ pub(crate) fn chunks<'a>(
     let mut placed = HashMap::new();
     for (base, mut members) in by_base {
         members.sort_unstable();
+        let base = base.name();
         let mut start = 0;
         for (position, (index, value, height)) in members.into_iter().enumerate() {
             if index != position {
@@ -326,7 +337,7 @@ pub(crate) fn chunks<'a>(
             placed.insert(
                 value,
                 Chunk {
-                    base: base.to_string(),
+                    base: base.clone(),
                     rows,
                 },
             );
@@ -366,7 +377,7 @@ struct RowRun {
     rows: Range<usize>,
 }
 
-/// Where a hosted embed gather ([`Slot::TokenEmbed`](poot_graph_ir::Slot::TokenEmbed)) reads its
+/// Where a hosted embed gather (`TOKEN_EMBED`(`TOKEN_EMBED`)) reads its
 /// rows: the embed view's row runs in order, the row width, and how a row is stored.
 #[derive(Clone, Debug)]
 pub(crate) struct EmbedRows {
@@ -831,7 +842,7 @@ impl WeightBinder {
         })
     }
 
-    /// Where the hosted embed gather named `name` (the `Slot::TokenEmbed` input `value`, declared
+    /// Where the hosted embed gather named `name` (the `TOKEN_EMBED` input `value`, declared
     /// `aval`, planned in `storage`) reads its rows: the embed view's `[rows, width]` table. A dense
     /// table's rows encode into `storage` as stored; a packed one's decode to F32 rows.
     pub(crate) fn embed_rows(
@@ -1183,24 +1194,18 @@ mod tests {
         let (binder, id, experts) = q8_stack();
         let weight = PackedWeight::try_new(WeightFormat::Q8_0, [3, 32]).unwrap();
         let role = SourceRole::Blocks;
-        let parent = PackedSourceName::new(&id.const_name(), role).to_string();
-        let chunk_names = [format!("{parent}.chunk0"), format!("{parent}.chunk1")];
+        let parent = WeightRef::whole(id).with_source(role);
+        let chunk_refs = [parent.with_chunk(0), parent.with_chunk(1)];
         let shape_of = |experts: usize| packed_stack_source_type(weight, experts, role);
         let declared = [shape_of(2), shape_of(1)];
-        let placed = chunks(chunk_names.iter().zip(&declared).enumerate().map(
-            |(value, (name, aval))| {
-                (
-                    ValueId::new(value as u32),
-                    name.as_str(),
-                    aval.shape.as_slice(),
-                )
-            },
+        let placed = chunks(chunk_refs.iter().zip(&declared).enumerate().map(
+            |(value, (weight, aval))| (ValueId::new(value as u32), *weight, aval.shape.as_slice()),
         ))
         .unwrap();
-        for (index, (name, aval)) in chunk_names.iter().zip(&declared).enumerate() {
+        for (index, (weight, aval)) in chunk_refs.iter().zip(&declared).enumerate() {
             let index = ValueId::new(index as u32);
             let bytes = binder
-                .const_bytes(index, name, aval, placed.get(&index))
+                .const_bytes(index, &weight.name(), aval, placed.get(&index))
                 .expect("the chunk binds");
             assert_eq!(
                 bytes.stored,
@@ -1224,11 +1229,16 @@ mod tests {
         // A chunk declared taller than the experts left past its start is refused, never clamped.
         let tall = shape_of(2);
         let past_the_end = Chunk {
-            base: parent.clone(),
+            base: parent.name(),
             rows: 2..4,
         };
         assert!(matches!(
-            binder.const_bytes(ValueId::new(0), &chunk_names[1], &tall, Some(&past_the_end)),
+            binder.const_bytes(
+                ValueId::new(0),
+                &chunk_refs[1].name(),
+                &tall,
+                Some(&past_the_end)
+            ),
             Err(LoadError::WeightShape { .. })
         ));
     }

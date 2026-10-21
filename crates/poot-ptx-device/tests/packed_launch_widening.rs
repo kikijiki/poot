@@ -56,7 +56,7 @@ fn carriers(
         .inputs()
         .iter()
         .filter_map(|&id| {
-            let name = PackedSourceName::parse(graph.meta(id).name.as_deref()?)?;
+            let name = PackedSourceName::parse(graph.meta(id).name().as_deref()?)?;
             let owner = owner_of(name.linear_id());
             Some((id, PackedComponentRef::new(owner, name.role()).into()))
         })
@@ -129,7 +129,7 @@ fn run_moe(gpu: &mut PtxDevice, out: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
         .inputs()
         .iter()
         .filter_map(|&id| {
-            let name = PackedSourceName::parse(graph.meta(id).name.as_deref()?)?;
+            let name = PackedSourceName::parse(graph.meta(id).name().as_deref()?)?;
             Some((
                 id,
                 PackedStackComponentRef::new(Arc::clone(&stack), name.role()).into(),

@@ -249,7 +249,7 @@ fn without_lm_head(g: Graph) -> Graph {
         .find(|e| e.out == g.result())
         .expect("the graph's declared output is produced by an equation");
     assert!(
-        matches!(out_eqn.op, OpKind::MatMul),
+        matches!(out_eqn.op, OpKind::MatMul { .. }),
         "expected the traced graph to end in the lm_head MatMul, found {:?}",
         out_eqn.op
     );
@@ -288,7 +288,7 @@ fn without_lm_head(g: Graph) -> Graph {
 fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
     // Card 523a: `legalize`, given a target whose buffer limit is below the embed table, rewrites the
     // dense in-graph gather `trace_decode_kv_masked` always emits into a host-computed
-    // `Slot::TokenEmbed` row. The two graphs (traced once, legalized only for the second run) must be
+    // `TOKEN_EMBED` row. The two graphs (traced once, legalized only for the second run) must be
     // numerically equivalent: this was card 168's `host_embed=true`/`false` tracer-flag equivalence,
     // now a property of the one rewrite instead of two tracer branches. See [`without_lm_head`] for why
     // this compares the pre-lm_head hidden state, not final logits.
@@ -319,7 +319,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
             }
             Storage::Slot(Slot::Pos) => di.insert(id, HostTensor::i32(vec![1, 1], vec![pos])),
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
-            Storage::Const => di.insert(id, weight(m.name.as_deref().unwrap(), &m.aval.shape)),
+            Storage::Const => di.insert(id, weight(&m.name().unwrap(), &m.aval.shape)),
             Storage::Computed(computed) => Some(computed.tensor()),
             Storage::State => None,
             Storage::Device => unreachable!(),
@@ -352,7 +352,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
     assert!(
         gh.consts()
             .iter()
-            .all(|&id| gh.meta(id).name.as_deref() != Some("w.embed")),
+            .all(|&id| gh.meta(id).name().as_deref() != Some("w.embed")),
         "legalize must drop the oversized embed const, not merely refuse it"
     );
     let embed_w = weight("w.embed", &[VOCAB, HIDDEN]);
@@ -367,12 +367,12 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
                 unreachable!("legalize must drop the Token slot once it hosts the gather")
             }
             Storage::Slot(Slot::Pos) => hi.insert(id, HostTensor::i32(vec![1, 1], vec![pos])),
-            Storage::Slot(Slot::TokenEmbed) => {
+            Storage::Slot(Slot::Owned(role)) if role == poot_graph_plan::TOKEN_EMBED => {
                 assert_eq!(m.aval.shape, vec![1, 1, h], "single-row TokenEmbed shape");
                 hi.insert(id, HostTensor::f32(vec![1, 1, h], token_row.clone()))
             }
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
-            Storage::Const => hi.insert(id, weight(m.name.as_deref().unwrap(), &m.aval.shape)),
+            Storage::Const => hi.insert(id, weight(&m.name().unwrap(), &m.aval.shape)),
             Storage::Computed(computed) => Some(computed.tensor()),
             Storage::State => None,
             Storage::Device => unreachable!(),
@@ -406,7 +406,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
 #[test]
 fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
     // Same equivalence as `legalize_hosts_the_decode_embed_gather_without_changing_hidden_state`, for
-    // the multi-row prefill step (a `step` of L>1 tokens): the hosted `Slot::TokenEmbed` shape is
+    // the multi-row prefill step (a `step` of L>1 tokens): the hosted `TOKEN_EMBED` shape is
     // `[l,hidden]` (one row per prompt position).
     use std::collections::HashMap as Map;
 
@@ -438,7 +438,7 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
                 di.insert(id, HostTensor::i32(vec![1, l], (0..l as i32).collect()))
             }
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
-            Storage::Const => di.insert(id, weight(m.name.as_deref().unwrap(), &m.aval.shape)),
+            Storage::Const => di.insert(id, weight(&m.name().unwrap(), &m.aval.shape)),
             Storage::Computed(computed) => Some(computed.tensor()),
             Storage::State => None,
             Storage::Device => unreachable!(),
@@ -478,7 +478,7 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
             Storage::Slot(Slot::Token) => {
                 unreachable!("legalize must drop the Token slot once it hosts the gather")
             }
-            Storage::Slot(Slot::TokenEmbed) => {
+            Storage::Slot(Slot::Owned(role)) if role == poot_graph_plan::TOKEN_EMBED => {
                 assert_eq!(m.aval.shape, vec![1, l, h], "prefill TokenEmbed shape");
                 hi.insert(id, HostTensor::f32(vec![1, l, h], rows.clone()))
             }
@@ -486,7 +486,7 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
                 hi.insert(id, HostTensor::i32(vec![1, l], (0..l as i32).collect()))
             }
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
-            Storage::Const => hi.insert(id, weight(m.name.as_deref().unwrap(), &m.aval.shape)),
+            Storage::Const => hi.insert(id, weight(&m.name().unwrap(), &m.aval.shape)),
             Storage::Computed(computed) => Some(computed.tensor()),
             Storage::State => None,
             Storage::Device => unreachable!(),

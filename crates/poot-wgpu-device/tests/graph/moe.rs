@@ -24,10 +24,10 @@ fn moe_sparse_gpu_matches_dense() {
         let mut inputs = HashMap::new();
         for &id in g.inputs() {
             let meta = g.meta(id);
-            let name = meta.name.as_deref().unwrap();
+            let name = meta.name().unwrap();
             inputs.insert(
                 id,
-                HostTensor::f32(meta.aval.shape.clone(), data[name].clone()),
+                HostTensor::f32(meta.aval.shape.clone(), data[name.as_ref()].clone()),
             );
         }
         inputs
@@ -126,10 +126,10 @@ fn moe_sparse_decode_with_separated_experts_matches_the_oracle() {
         .iter()
         .map(|&id| {
             let meta = g.meta(id);
-            let name = meta.name.as_deref().unwrap();
+            let name = meta.name().unwrap();
             (
                 id,
-                HostTensor::f32(meta.aval.shape.clone(), data[name].clone()),
+                HostTensor::f32(meta.aval.shape.clone(), data[name.as_ref()].clone()),
             )
         })
         .collect();
@@ -192,10 +192,10 @@ fn moe_grouped_gpu_matches_cpu() {
         let mut inputs = HashMap::new();
         for &id in g.inputs() {
             let meta = g.meta(id);
-            let name = meta.name.as_deref().unwrap();
+            let name = meta.name().unwrap();
             inputs.insert(
                 id,
-                HostTensor::f32(meta.aval.shape.clone(), data[name].clone()),
+                HostTensor::f32(meta.aval.shape.clone(), data[name.as_ref()].clone()),
             );
         }
         inputs
@@ -306,11 +306,7 @@ fn stable_moe_ties_gpu_match_independent_oracle() {
             .iter()
             .copied()
             .map(|id| {
-                let input_name = graph
-                    .meta(id)
-                    .name
-                    .as_deref()
-                    .expect("named tie probe input");
+                let input_name = graph.meta(id).name().expect("named tie probe input");
                 let tensor = if input_name == "scores" {
                     HostTensor::f32(vec![1, e], scores_data.to_vec())
                 } else {

@@ -1,0 +1,124 @@
+{
+  "backend": "wgpu",
+  "binary": "/home/kikijiki/.cache/poot-cargo-target-2/release/examples/performance_bank",
+  "case": "attention-low-head-decode",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 104.63600000000001
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 236.292
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 469.499
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 439.52299999999997
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 306.043
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 241.622
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 234.95999999999998
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 154.72
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 127.238
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "hardware": {
+    "backend": "wgpu",
+    "device": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+    "driver": "radv Mesa 26.1.3"
+  },
+  "memory": [
+    {
+      "live_bytes": 4211712,
+      "peak_bytes": 4211712,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 17664,
+      "peak_bytes": 17664,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 36,
+      "peak_bytes": 1060,
+      "role": "Staging"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 4096,
+      "d": 128,
+      "hkv": 1,
+      "hq": 2
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 4194304,
+    "weight_copies": 1
+  },
+  "plan": [
+    "attention [43249908922fa5b9165073b289c4dac31a546cd2b95eaf50343cf111cd4defe1]",
+    "attention_combine [e5162701f4a983fb947bb8f1d3a6cdd4f36d6e1ab1290197071c91a3ed2d3f00]"
+  ],
+  "plan_id": "1eb87dd1f745d737ce2cf756f85163f1c60aa76f4da001eecd637de105f6fc0d",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 9.979488836799164e-9,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1
+}

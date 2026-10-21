@@ -509,6 +509,7 @@ poot-graph-ir	poot-graph-ir	model-free	budget::tests::tokens_admit_the_exact_bou
 poot-graph-ir	poot-graph-ir	model-free	builder::tests::a_foreign_handle_cannot_finish_a_graph
 poot-graph-ir	poot-graph-ir	model-free	builder::tests::a_foreign_handle_has_no_aval
 poot-graph-ir	poot-graph-ir	model-free	builder::tests::a_foreign_handle_in_an_emitter_is_a_typed_error_and_appends_nothing
+poot-graph-ir	poot-graph-ir	model-free	builder::tests::a_staged_slot_input_has_a_name_but_no_key_and_finish_refuses_it
 poot-graph-ir	poot-graph-ir	model-free	builder::tests::binary_dtype_rule_rejects_the_same_mismatch_at_every_call_site
 poot-graph-ir	poot-graph-ir	model-free	builder::tests::builder_append_failure_is_atomic
 poot-graph-ir	poot-graph-ir	model-free	builder::tests::builder_append_is_atomic
@@ -523,7 +524,6 @@ poot-graph-ir	poot-graph-ir	model-free	builder::tests::resume_reopens_a_finished
 poot-graph-ir	poot-graph-ir	model-free	builder::tests::transactional_input_constant_can_be_result
 poot-graph-ir	poot-graph-ir	model-free	builder::tests::transactional_input_result_rejections_are_atomic
 poot-graph-ir	poot-graph-ir	model-free	builder::tests::transactional_input_result_reservation_is_atomic
-poot-graph-ir	poot-graph-ir	model-free	builder::tests::transactional_input_slot_can_be_result
 poot-graph-ir	poot-graph-ir	model-free	builder_budget_tests::a_dropped_plan_gives_back_everything_it_charged
 poot-graph-ir	poot-graph-ir	model-free	builder_budget_tests::a_foreign_dtype_error_releases_what_the_failed_equation_reserved
 poot-graph-ir	poot-graph-ir	model-free	builder_budget_tests::a_preflight_charges_its_tables_before_it_builds_them
@@ -542,18 +542,20 @@ poot-graph-ir	poot-graph-ir	model-free	builder_budget_tests::values_admit_the_ei
 poot-graph-ir	poot-graph-ir	model-free	decompose::tests::an_ill_typed_composite_has_no_decomposition
 poot-graph-ir	poot-graph-ir	model-free	decompose::tests::class_is_composite_exactly_when_decompose_is_some
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::a_slot_role_declared_at_a_type_it_cannot_bind_is_refused_by_the_builder_and_validate
+poot-graph-ir	poot-graph-ir	model-free	graph::tests::a_typed_identity_has_no_name_beside_it
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::alibi_slopes_follow_the_published_series
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::an_unknown_sampler_tag_is_refused_apart_from_a_wrong_dtype
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::graph_edits_of_inputs_return_typed_errors
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::input_key_distinguishes_same_role_tagged_slots
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::input_key_is_structured_not_debug_formatted_and_not_by_value_id
-poot-graph-ir	poot-graph-ir	model-free	graph::tests::input_key_reads_the_stored_key_never_the_name_string
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::result_tables_precede_unrelated_equation_errors
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_accepts_a_well_formed_graph
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_accepts_named_same_kind_slots_and_valid_state_topologies
+poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_holds_a_matmul_to_the_inferred_accumulate_dtype
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_preserves_literal_first_binary_contract
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_a_computed_constant_whose_payload_disagrees_with_its_type
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_a_duplicate_ssa_producer
+poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_a_slot_input_that_has_only_a_name
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_a_weight_reference_on_a_value_that_is_not_a_constant
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_arithmetic_on_a_packed_or_storage_only_dtype
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_blocked_axis_out_of_range_for_rank
@@ -568,10 +570,11 @@ poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_state_inpu
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validation_bits_accept_only_signed_zero
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validation_declarations_and_packet_bound_are_checked
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validation_layout_is_ordered_and_bounded
+poot-graph-ir	poot-graph-ir	model-free	index_guard::tests::a_reduction_over_arithmetic_on_flags_observes_nothing
 poot-graph-ir	poot-graph-ir	model-free	index_guard::tests::guard_helper_emits_the_documented_chain
 poot-graph-ir	poot-graph-ir	model-free	index_guard::tests::guard_helper_rejects_a_selector_it_cannot_guard
+poot-graph-ir	poot-graph-ir	model-free	index_guard::tests::the_declared_witness_is_proven_to_observe_the_invalid_flag_and_only_that_one
 poot-graph-ir	poot-graph-ir	model-free	index_guard::tests::the_emitter_orders_its_equations_and_surfaces_a_refusing_sink
-poot-graph-ir	poot-graph-ir	model-free	index_guard::tests::the_recognizer_accepts_the_emitted_witness_and_only_that_one
 poot-graph-ir	poot-graph-ir	model-free	op::tests::a_causal_attention_types_over_query_positions_and_refuses_each_disagreement
 poot-graph-ir	poot-graph-ir	model-free	op::tests::a_paged_attention_types_over_pools_and_a_slot_map_and_refuses_each_disagreement
 poot-graph-ir	poot-graph-ir	model-free	op::tests::a_sink_attention_types_over_per_head_logits_and_refuses_each_disagreement
@@ -608,6 +611,8 @@ poot-graph-ir	poot-graph-ir	model-free	op::tests::kind_name_ignores_params_and_d
 poot-graph-ir	poot-graph-ir	model-free	op::tests::matmul_accepts_only_the_closed_operand_dtype_set
 poot-graph-ir	poot-graph-ir	model-free	op::tests::matmul_batch_broadcast
 poot-graph-ir	poot-graph-ir	model-free	op::tests::matmul_contract_mismatch
+poot-graph-ir	poot-graph-ir	model-free	op::tests::matmul_f32_accumulate_is_typed_by_infer
+poot-graph-ir	poot-graph-ir	model-free	op::tests::matmul_hash_params_distinguish_the_accumulate_form
 poot-graph-ir	poot-graph-ir	model-free	op::tests::matmul_rejects_a_storage_only_or_packed_operand
 poot-graph-ir	poot-graph-ir	model-free	op::tests::packed_contraction_blocks_require_rank_three_activation
 poot-graph-ir	poot-graph-ir	model-free	op::tests::packed_contraction_requires_f32_activation_and_output
@@ -837,6 +842,7 @@ poot-graph-plan	poot-graph-plan	model-free	passes::packed::tests::canonical_chai
 poot-graph-plan	poot-graph-plan	model-free	passes::packed::tests::transposed_spelling_is_recognized_as_one_contraction
 poot-graph-plan	poot-graph-plan	model-free	passes::packed_bind::tests::a_biased_packed_projection_keeps_its_bias_outside_the_contraction
 poot-graph-plan	poot-graph-plan	model-free	passes::packed_bind::tests::a_bound_weight_decodes_just_before_its_first_reader
+poot-graph-plan	poot-graph-plan	model-free	passes::packed_bind::tests::a_constant_that_only_spells_a_weights_name_is_not_that_weight
 poot-graph-plan	poot-graph-plan	model-free	passes::packed_bind::tests::a_decode_read_first_by_a_claimed_equation_precedes_it
 poot-graph-plan	poot-graph-plan	model-free	passes::packed_bind::tests::a_mismatched_declaration_is_refused_by_name
 poot-graph-plan	poot-graph-plan	model-free	passes::packed_bind::tests::a_packed_embedding_binds_to_the_claimable_row_gather
@@ -844,7 +850,6 @@ poot-graph-plan	poot-graph-plan	model-free	passes::packed_bind::tests::a_packed_
 poot-graph-plan	poot-graph-plan	model-free	passes::packed_bind::tests::a_packed_expert_stack_with_any_other_use_is_refused_by_name
 poot-graph-plan	poot-graph-plan	model-free	passes::packed_bind::tests::a_packed_projection_binds_to_the_claimable_contraction_chain
 poot-graph-plan	poot-graph-plan	model-free	passes::packed_bind::tests::a_packed_weight_read_outside_a_contraction_is_left_for_the_gate
-poot-graph-plan	poot-graph-plan	model-free	passes::packed_bind::tests::a_renamed_weight_constant_still_binds_by_its_weight_ref
 poot-graph-plan	poot-graph-plan	model-free	passes::packed_bind::tests::weight_map_formats_bind_a_checkpoint_oriented_projection_to_the_claimable_chain
 poot-graph-plan	poot-graph-plan	model-free	passes::packed_dequant_eval_soundness::a_packed_projection_past_the_oracle_cap_evaluates
 poot-graph-plan	poot-graph-plan	model-free	passes::packed_dequant_eval_soundness::blocked_packed_contraction_fused_and_unfused_compositions_match
@@ -1032,6 +1037,7 @@ poot-graph-plan	poot-graph-plan	model-free	tests::a_k_by_n_bf16_decode_projectio
 poot-graph-plan	poot-graph-plan	model-free	tests::a_large_tiled_matmul_keeps_its_tile_workgroup_on_amdgcn
 poot-graph-plan	poot-graph-plan	model-free	tests::a_refusal_names_the_equation_op_dtypes_target_and_missing_capability_on_every_backend
 poot-graph-plan	poot-graph-plan	model-free	tests::a_scratch_past_the_buffer_limit_is_refused_by_finalize
+poot-graph-plan	poot-graph-plan	model-free	tests::a_select_with_a_literal_branch_plans_the_literal_inline
 poot-graph-plan	poot-graph-plan	model-free	tests::a_split_plans_dispatches_carry_work_in_proportion_to_their_launch
 poot-graph-plan	poot-graph-plan	model-free	tests::a_tiled_gemm_over_the_tile_ceiling_splits_into_disjoint_launches
 poot-graph-plan	poot-graph-plan	model-free	tests::amd_tensor_core_arm_admits_multi_block_batched_shapes

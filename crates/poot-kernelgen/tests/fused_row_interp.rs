@@ -15,26 +15,32 @@ fn softmax_kernel(n_cols: usize) -> kg::RowKernel {
         steps: vec![
             kg::RowOp::Reduce {
                 op: kg::RowReduce::Max,
-                input: kg::FusedInput::Leaf(0),
+                input: kg::FusedInput::Leaf(kg::LeafId::new(0)),
             },
             kg::RowOp::Pointwise {
                 op: kg::FusedScalarOp::Binary(BinOp::Sub),
-                inputs: vec![kg::FusedInput::Leaf(0), kg::FusedInput::Step(0)],
+                inputs: vec![
+                    kg::FusedInput::Leaf(kg::LeafId::new(0)),
+                    kg::FusedInput::Step(kg::StepId::new(0)),
+                ],
             },
             kg::RowOp::Pointwise {
                 op: kg::FusedScalarOp::Math(MathOp::Exp),
-                inputs: vec![kg::FusedInput::Step(1)],
+                inputs: vec![kg::FusedInput::Step(kg::StepId::new(1))],
             },
             kg::RowOp::Reduce {
                 op: kg::RowReduce::Sum,
-                input: kg::FusedInput::Step(2),
+                input: kg::FusedInput::Step(kg::StepId::new(2)),
             },
             kg::RowOp::Pointwise {
                 op: kg::FusedScalarOp::Binary(BinOp::Div),
-                inputs: vec![kg::FusedInput::Step(2), kg::FusedInput::Step(3)],
+                inputs: vec![
+                    kg::FusedInput::Step(kg::StepId::new(2)),
+                    kg::FusedInput::Step(kg::StepId::new(3)),
+                ],
             },
         ],
-        output: 1 + 4,
+        output: kg::RowValue::Step(kg::StepId::new(4)),
     }
 }
 
@@ -89,38 +95,38 @@ fn rmsnorm_with_packed_scale(n_cols: usize, eps: f32) -> kg::RowKernel {
         steps: vec![
             RowOp::Pointwise {
                 op: Op::Binary(BinOp::Mul),
-                inputs: vec![In::Leaf(0), In::Leaf(0)],
+                inputs: vec![In::Leaf(kg::LeafId::new(0)), In::Leaf(kg::LeafId::new(0))],
             },
             RowOp::Reduce {
                 op: kg::RowReduce::Sum,
-                input: In::Step(0),
+                input: In::Step(kg::StepId::new(0)),
             },
             RowOp::Pointwise {
                 op: Op::Binary(BinOp::Mul),
-                inputs: vec![In::Step(1), In::Lit(1.0 / n_cols as f32)],
+                inputs: vec![In::Step(kg::StepId::new(1)), In::Lit(1.0 / n_cols as f32)],
             },
             RowOp::Pointwise {
                 op: Op::Binary(BinOp::Add),
-                inputs: vec![In::Step(2), In::Lit(eps)],
+                inputs: vec![In::Step(kg::StepId::new(2)), In::Lit(eps)],
             },
             RowOp::Pointwise {
                 op: Op::Math(MathOp::Sqrt),
-                inputs: vec![In::Step(3)],
+                inputs: vec![In::Step(kg::StepId::new(3))],
             },
             RowOp::Pointwise {
                 op: Op::Binary(BinOp::Div),
-                inputs: vec![In::Leaf(0), In::Step(4)],
+                inputs: vec![In::Leaf(kg::LeafId::new(0)), In::Step(kg::StepId::new(4))],
             },
             RowOp::Pointwise {
                 op: Op::Widen,
-                inputs: vec![In::Leaf(1)],
+                inputs: vec![In::Leaf(kg::LeafId::new(1))],
             },
             RowOp::Pointwise {
                 op: Op::Binary(BinOp::Mul),
-                inputs: vec![In::Step(5), In::Step(6)],
+                inputs: vec![In::Step(kg::StepId::new(5)), In::Step(kg::StepId::new(6))],
             },
         ],
-        output: leaves + 7,
+        output: kg::RowValue::Step(kg::StepId::new(7)),
     }
 }
 

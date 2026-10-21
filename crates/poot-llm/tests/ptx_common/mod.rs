@@ -58,7 +58,7 @@ fn const_store(g: &Graph, inputs: &HashMap<ValueId, Value>) -> WeightStore {
         if meta.storage != Storage::Const {
             continue;
         }
-        let name = meta.name.clone().expect("unnamed const");
+        let name = meta.name().expect("unnamed const").into_owned();
         let value = inputs
             .get(&id)
             .unwrap_or_else(|| panic!("no value bound for const {name}"));

@@ -386,7 +386,7 @@ fn packed_dequant_fused_and_unfused_compositions_match() -> Result<(), BuilderEr
         for graph_input in graph.inputs() {
             let Some(source) = graph
                 .meta(*graph_input)
-                .name
+                .name()
                 .as_deref()
                 .and_then(PackedSourceName::parse)
             else {
@@ -505,7 +505,7 @@ fn indexed_graph(
     for graph_input in graph.inputs() {
         let Some(source) = graph
             .meta(*graph_input)
-            .name
+            .name()
             .as_deref()
             .and_then(PackedSourceName::parse)
         else {
@@ -717,7 +717,7 @@ fn transposed_packed_contraction_fused_and_unfused_compositions_match() -> Resul
             vec![Operand::Value(activation.id())],
         )?;
         let product = plan.equation(
-            OpKind::MatMul,
+            OpKind::matmul(),
             vec![
                 Operand::Value(weight.id()),
                 Operand::Value(activation_t.id()),
@@ -760,7 +760,7 @@ fn transposed_packed_contraction_fused_and_unfused_compositions_match() -> Resul
         for graph_input in graph.inputs() {
             let Some(source) = graph
                 .meta(*graph_input)
-                .name
+                .name()
                 .as_deref()
                 .and_then(PackedSourceName::parse)
             else {
@@ -849,7 +849,7 @@ fn blocked_packed_contraction_fused_and_unfused_compositions_match() -> Result<(
         for graph_input in graph.inputs() {
             let Some(source) = graph
                 .meta(*graph_input)
-                .name
+                .name()
                 .as_deref()
                 .and_then(PackedSourceName::parse)
             else {
@@ -2022,7 +2022,7 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderError> {
                     .filter_map(|&input| {
                         let source = graph
                             .meta(input)
-                            .name
+                            .name()
                             .as_deref()
                             .and_then(PackedSourceName::parse)?;
                         Some((
@@ -2138,7 +2138,7 @@ fn packed_contraction_oracle_decodes_gguf_rows_bit_exactly() -> Result<(), Build
         for graph_input in graph.inputs() {
             if let Some(source) = graph
                 .meta(*graph_input)
-                .name
+                .name()
                 .as_deref()
                 .and_then(PackedSourceName::parse)
             {
@@ -2231,7 +2231,7 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
     for &id in graph.inputs() {
         if let Some(source) = graph
             .meta(id)
-            .name
+            .name()
             .as_deref()
             .and_then(PackedSourceName::parse)
         {
@@ -2317,7 +2317,7 @@ fn bind_carriers(graph: &Graph, owner: &Arc<PackedPayload>) -> HashMap<ValueId, 
         .filter_map(|&id| {
             let source = graph
                 .meta(id)
-                .name
+                .name()
                 .as_deref()
                 .and_then(PackedSourceName::parse)?;
             Some((

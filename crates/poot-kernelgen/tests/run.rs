@@ -460,9 +460,9 @@ fn fused_unary(name: &str, op: kg::FusedScalarOp, n: usize) -> Body {
         leaf_tys: vec![kg::LeafTy::F32; 1],
         steps: vec![kg::FusedStep {
             op,
-            inputs: vec![kg::FusedInput::Leaf(0)],
+            inputs: vec![kg::FusedInput::Leaf(kg::LeafId::new(0))],
         }],
-        output: kg::FusedInput::Step(0),
+        output: kg::FusedInput::Step(kg::StepId::new(0)),
     };
     kg::fused(name, &[n], &[&[n]], &k).expect("fused precondition")
 }
@@ -956,18 +956,27 @@ fn fused_chain_with_broadcast_and_literal() {
         steps: vec![
             kg::FusedStep {
                 op: kg::FusedScalarOp::Binary(BinOp::Add),
-                inputs: vec![kg::FusedInput::Leaf(0), kg::FusedInput::Leaf(1)],
+                inputs: vec![
+                    kg::FusedInput::Leaf(kg::LeafId::new(0)),
+                    kg::FusedInput::Leaf(kg::LeafId::new(1)),
+                ],
             },
             kg::FusedStep {
                 op: kg::FusedScalarOp::Binary(BinOp::Mul),
-                inputs: vec![kg::FusedInput::Step(0), kg::FusedInput::Leaf(2)],
+                inputs: vec![
+                    kg::FusedInput::Step(kg::StepId::new(0)),
+                    kg::FusedInput::Leaf(kg::LeafId::new(2)),
+                ],
             },
             kg::FusedStep {
                 op: kg::FusedScalarOp::Binary(BinOp::Add),
-                inputs: vec![kg::FusedInput::Step(1), kg::FusedInput::Lit(1.0)],
+                inputs: vec![
+                    kg::FusedInput::Step(kg::StepId::new(1)),
+                    kg::FusedInput::Lit(1.0),
+                ],
             },
         ],
-        output: kg::FusedInput::Step(2),
+        output: kg::FusedInput::Step(kg::StepId::new(2)),
     };
     let body = kg::fused("fchain", &[4], &[&[4], &[4], &[1]], &k).expect("fused precondition");
     let s = spv(&body, "fchain");
@@ -995,13 +1004,22 @@ fn fused_swiglu_chain() {
     let k = kg::FusedKernel {
         leaf_tys: vec![kg::LeafTy::F32; 2],
         steps: vec![
-            step(Op::Unary(UnOp::Neg), vec![Leaf(0)]),
-            step(Op::Math(MathOp::Exp), vec![Step(0)]),
-            step(Op::Binary(BinOp::Add), vec![Step(1), Lit(1.0)]),
-            step(Op::Binary(BinOp::Div), vec![Leaf(0), Step(2)]),
-            step(Op::Binary(BinOp::Mul), vec![Step(3), Leaf(1)]),
+            step(Op::Unary(UnOp::Neg), vec![Leaf(kg::LeafId::new(0))]),
+            step(Op::Math(MathOp::Exp), vec![Step(kg::StepId::new(0))]),
+            step(
+                Op::Binary(BinOp::Add),
+                vec![Step(kg::StepId::new(1)), Lit(1.0)],
+            ),
+            step(
+                Op::Binary(BinOp::Div),
+                vec![Leaf(kg::LeafId::new(0)), Step(kg::StepId::new(2))],
+            ),
+            step(
+                Op::Binary(BinOp::Mul),
+                vec![Step(kg::StepId::new(3)), Leaf(kg::LeafId::new(1))],
+            ),
         ],
-        output: Step(4),
+        output: Step(kg::StepId::new(4)),
     };
     let body = kg::fused("swiglu", &[4], &[&[4], &[4]], &k).expect("fused precondition");
     let s = spv(&body, "swiglu");
@@ -1049,37 +1067,49 @@ fn rmsnorm_kernel(n_cols: usize, eps: f32) -> kg::RowKernel {
         steps: vec![
             kg::RowOp::Pointwise {
                 op: kg::FusedScalarOp::Binary(BinOp::Mul),
-                inputs: vec![kg::FusedInput::Leaf(0), kg::FusedInput::Leaf(0)],
+                inputs: vec![
+                    kg::FusedInput::Leaf(kg::LeafId::new(0)),
+                    kg::FusedInput::Leaf(kg::LeafId::new(0)),
+                ],
             },
             kg::RowOp::Reduce {
                 op: kg::RowReduce::Sum,
-                input: kg::FusedInput::Step(0),
+                input: kg::FusedInput::Step(kg::StepId::new(0)),
             },
             kg::RowOp::Pointwise {
                 op: kg::FusedScalarOp::Binary(BinOp::Mul),
                 inputs: vec![
-                    kg::FusedInput::Step(1),
+                    kg::FusedInput::Step(kg::StepId::new(1)),
                     kg::FusedInput::Lit(1.0 / n_cols as f32),
                 ],
             },
             kg::RowOp::Pointwise {
                 op: kg::FusedScalarOp::Binary(BinOp::Add),
-                inputs: vec![kg::FusedInput::Step(2), kg::FusedInput::Lit(eps)],
+                inputs: vec![
+                    kg::FusedInput::Step(kg::StepId::new(2)),
+                    kg::FusedInput::Lit(eps),
+                ],
             },
             kg::RowOp::Pointwise {
                 op: kg::FusedScalarOp::Math(MathOp::Sqrt),
-                inputs: vec![kg::FusedInput::Step(3)],
+                inputs: vec![kg::FusedInput::Step(kg::StepId::new(3))],
             },
             kg::RowOp::Pointwise {
                 op: kg::FusedScalarOp::Binary(BinOp::Div),
-                inputs: vec![kg::FusedInput::Leaf(0), kg::FusedInput::Step(4)],
+                inputs: vec![
+                    kg::FusedInput::Leaf(kg::LeafId::new(0)),
+                    kg::FusedInput::Step(kg::StepId::new(4)),
+                ],
             },
             kg::RowOp::Pointwise {
                 op: kg::FusedScalarOp::Binary(BinOp::Mul),
-                inputs: vec![kg::FusedInput::Step(5), kg::FusedInput::Leaf(1)],
+                inputs: vec![
+                    kg::FusedInput::Step(kg::StepId::new(5)),
+                    kg::FusedInput::Leaf(kg::LeafId::new(1)),
+                ],
             },
         ],
-        output: 2 + 6,
+        output: kg::RowValue::Step(kg::StepId::new(6)),
     }
 }
 
@@ -1500,26 +1530,32 @@ fn softmax_kernel(n_cols: usize) -> kg::RowKernel {
         steps: vec![
             kg::RowOp::Reduce {
                 op: kg::RowReduce::Max,
-                input: kg::FusedInput::Leaf(0),
+                input: kg::FusedInput::Leaf(kg::LeafId::new(0)),
             },
             kg::RowOp::Pointwise {
                 op: kg::FusedScalarOp::Binary(BinOp::Sub),
-                inputs: vec![kg::FusedInput::Leaf(0), kg::FusedInput::Step(0)],
+                inputs: vec![
+                    kg::FusedInput::Leaf(kg::LeafId::new(0)),
+                    kg::FusedInput::Step(kg::StepId::new(0)),
+                ],
             },
             kg::RowOp::Pointwise {
                 op: kg::FusedScalarOp::Math(MathOp::Exp),
-                inputs: vec![kg::FusedInput::Step(1)],
+                inputs: vec![kg::FusedInput::Step(kg::StepId::new(1))],
             },
             kg::RowOp::Reduce {
                 op: kg::RowReduce::Sum,
-                input: kg::FusedInput::Step(2),
+                input: kg::FusedInput::Step(kg::StepId::new(2)),
             },
             kg::RowOp::Pointwise {
                 op: kg::FusedScalarOp::Binary(BinOp::Div),
-                inputs: vec![kg::FusedInput::Step(2), kg::FusedInput::Step(3)],
+                inputs: vec![
+                    kg::FusedInput::Step(kg::StepId::new(2)),
+                    kg::FusedInput::Step(kg::StepId::new(3)),
+                ],
             },
         ],
-        output: 1 + 4,
+        output: kg::RowValue::Step(kg::StepId::new(4)),
     }
 }
 

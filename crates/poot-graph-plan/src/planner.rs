@@ -139,7 +139,7 @@ macro_rules! elementwise_ops {
 /// Ops planned by `planner::matmul`.
 macro_rules! matmul_ops {
     () => {
-        OpKind::MatMul
+        OpKind::MatMul { .. }
             | OpKind::ContractionEpilogue {
                 head: ContractionHead::MatMul,
                 ..

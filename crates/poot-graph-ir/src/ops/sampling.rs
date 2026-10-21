@@ -13,7 +13,7 @@ use std::num::NonZeroUsize;
 use super::{
     BinOp, Builder, BuilderError, DType, RedOp, Requirement, Scalar, TensorType, Traced, UnOp,
 };
-use crate::graph::{Slot, StateRole};
+use crate::graph::{OwnedSlot, Slot, SlotKey, StateRole};
 use crate::op::SampleRule;
 use crate::range::IndexRange;
 
@@ -113,14 +113,100 @@ impl SampleSpec {
 /// name and aval.
 pub const HISTORY_STATE: &str = "sampler.history";
 
-/// Tag of the `[rows, 3]` F32 `(repetition, presence, frequency)` penalty slot. The neutral row is
-/// `(1, 0, 0)`.
-pub const PENALTY_TAG: &str = "penalty";
-/// Tag of the `[rows, vocab]` F32 additive guided-decoding mask slot of an [`Adjust::Guided`] head: `0` for
-/// an allowed token, [`MASKED_LOGIT`] for an excluded one. The neutral row is all zeros.
-pub const MASK_TAG: &str = "mask";
-/// Tag of the `[rows]` I32 slot naming the history pool row each step row reads.
-pub const HISTORY_READ_TAG: &str = "history_read";
+/// The sampler suffix's per-step slot role: the inputs [`sample_head`] declares and the driver binds, told
+/// apart by [`SamplerInput`]. The suffix is the only code that declares them, so the role is defined here
+/// rather than registered by the IR.
+pub const SAMPLER: OwnedSlot = OwnedSlot::new("sampler", false, admits_sampler_input);
+
+fn admits_sampler_input(aval: &TensorType, tag: Option<&str>) -> Option<&'static str> {
+    match tag.and_then(SamplerInput::from_tag) {
+        Some(input) => (aval.dtype != input.dtype()).then(|| {
+            if input.dtype() == DType::I32 {
+                "an I32 tensor"
+            } else {
+                "an F32 tensor"
+            }
+        }),
+        None => Some("one of the sampler inputs by tag"),
+    }
+}
+
+/// One input of the sampler suffix: the typed form of the tag its [`SAMPLER`] slot carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SamplerInput {
+    /// Per-row I32 noise state for `RandomUniform`.
+    Seed,
+    /// The per-row F32 `[inv_temp, floor_offset, noise_scale]` table (plus `top_p` for
+    /// [`SampleRule::GumbelTopKTopP`]).
+    Params,
+    /// The per-row I32 threshold of the two `TopK` rules.
+    TopK,
+    /// The `[rows, 3]` F32 `(repetition, presence, frequency)` penalty slot. The neutral row is `(1, 0, 0)`.
+    Penalty,
+    /// The `[rows, vocab]` F32 additive guided-decoding mask of an [`Adjust::Guided`] head: `0` for an allowed
+    /// token, [`MASKED_LOGIT`] for an excluded one. The neutral row is all zeros.
+    Mask,
+    /// The `[rows]` I32 slot naming the history pool row each step row reads.
+    HistoryRead,
+}
+
+impl SamplerInput {
+    /// The tag the input's slot is told apart by.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Seed => "seed",
+            Self::Params => "params",
+            Self::TopK => "top_k",
+            Self::Penalty => "penalty",
+            Self::Mask => "mask",
+            Self::HistoryRead => "history_read",
+        }
+    }
+
+    /// The input a tag names, `None` for a tag no sampler input has.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        [
+            Self::Seed,
+            Self::Params,
+            Self::TopK,
+            Self::Penalty,
+            Self::Mask,
+            Self::HistoryRead,
+        ]
+        .into_iter()
+        .find(|input| input.tag() == tag)
+    }
+
+    /// The dtype the input is declared in.
+    pub const fn dtype(self) -> DType {
+        match self {
+            Self::Seed | Self::TopK | Self::HistoryRead => DType::I32,
+            Self::Params | Self::Penalty | Self::Mask => DType::F32,
+        }
+    }
+
+    /// The key the input's slot is bound by.
+    pub fn key(self) -> SlotKey {
+        SlotKey::new(Slot::Owned(SAMPLER), Some(self.tag()))
+    }
+
+    /// The input a sampler slot key names, `None` for any other key.
+    pub fn of(key: &SlotKey) -> Option<Self> {
+        (key.role() == Slot::Owned(SAMPLER))
+            .then(|| key.tag().and_then(Self::from_tag))
+            .flatten()
+    }
+
+    /// Declare the input at `aval`.
+    ///
+    /// # Errors
+    ///
+    /// [`BuilderError::SlotType`] when `aval` is not the input's dtype.
+    pub fn declare(self, b: &Builder, aval: TensorType) -> Result<Traced, BuilderError> {
+        b.slot_named(Slot::Owned(SAMPLER), self.tag(), aval)
+    }
+}
+
 /// Tag of the `[rows]` forward write map naming the history pool row each step row writes, `-1` for a
 /// row whose draw is not kept (a prefill chunk, a masked row).
 pub const HISTORY_WRITE_TAG: &str = "history_write";
@@ -151,7 +237,7 @@ impl LogprobRecord {
     }
 }
 
-/// A finished sampler suffix (card 551a, R-551a-3/R-551a-4): the result, plus the `Slot::Sampler` inputs
+/// A finished sampler suffix (card 551a, R-551a-3/R-551a-4): the result, plus the [`SAMPLER`] inputs
 /// this call declared (`None` for [`SampleRule::Greedy`], which reads only `logits`). A caller binds
 /// `seed`/`params`/`top_k` by their [`crate::graph::SlotKey`] name (`"sampler.seed"`, `"sampler.params"`,
 /// `"sampler.top_k"`); the driver wires that through its binder instead of exposing these fields.
@@ -172,7 +258,7 @@ pub struct SampleHead {
 /// Append a sampling suffix after `logits` (`[rows, V]` F32 when the spec adjusts or records logprobs,
 /// `[.., V]` otherwise): the graph suffix L7 asks for, so every backend samples the same way instead of a
 /// per-backend fused entry point (R472-007). `spec.rule` selects the draw's operand set (see
-/// [`SampleRule`]). `Greedy` needs nothing else. Every other rule declares one `Slot::Sampler` input per
+/// [`SampleRule`]). `Greedy` needs nothing else. Every other rule declares one [`SAMPLER`] input per
 /// tag it needs (R-551a-4: `seed` always, `params` always, `top_k` for the two `TopK` rules), builds the
 /// `RandomUniform` noise over `logits`' shape from `seed`, and transforms it with [`gumbel`];
 /// `sample_token` then maximizes `logits[i]*inv_temp + noise_scale*noise[i]` inside the kept set
@@ -243,24 +329,14 @@ pub fn sample_head(
     let token_pair = if matches!(rule, SampleRule::Greedy) {
         b.sample_token(rule, z, None, None, None)?
     } else {
-        let seed_in = b.slot_named(
-            Slot::Sampler,
-            "seed",
-            TensorType::new(leading.clone(), DType::I32),
-        )?;
+        let seed_in =
+            SamplerInput::Seed.declare(b, TensorType::new(leading.clone(), DType::I32))?;
         let mut params_shape = leading.clone();
         params_shape.push(rule.params_cols());
-        let params_in = b.slot_named(
-            Slot::Sampler,
-            "params",
-            TensorType::new(params_shape, DType::F32),
-        )?;
+        let params_in =
+            SamplerInput::Params.declare(b, TensorType::new(params_shape, DType::F32))?;
         let top_k_in = if rule.has_top_k() {
-            Some(b.slot_named(
-                Slot::Sampler,
-                "top_k",
-                TensorType::new(leading.clone(), DType::I32),
-            )?)
+            Some(SamplerInput::TopK.declare(b, TensorType::new(leading.clone(), DType::I32))?)
         } else {
             None
         };
@@ -317,23 +393,15 @@ fn adjust_logits(
         StateRole::Sampler,
     )?;
     let read = b.slot_named_ranged(
-        Slot::Sampler,
-        HISTORY_READ_TAG,
+        Slot::Owned(SAMPLER),
+        SamplerInput::HistoryRead.tag(),
         TensorType::new(vec![rows], DType::I32),
         IndexRange::below(pool_rows).expect("a pool has rows"),
     )?;
     let write = b.write_map(HISTORY_WRITE_TAG, rows, pool_rows)?;
-    let penalty = b.slot_named(
-        Slot::Sampler,
-        PENALTY_TAG,
-        TensorType::new(vec![rows, 3], DType::F32),
-    )?;
+    let penalty = SamplerInput::Penalty.declare(b, TensorType::new(vec![rows, 3], DType::F32))?;
     let mask = if guided {
-        Some(b.slot_named(
-            Slot::Sampler,
-            MASK_TAG,
-            TensorType::new(vec![rows, vocab], DType::F32),
-        )?)
+        Some(SamplerInput::Mask.declare(b, TensorType::new(vec![rows, vocab], DType::F32))?)
     } else {
         None
     };

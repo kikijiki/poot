@@ -157,7 +157,10 @@ fn carried(decode: &Graph) -> Vec<Carried> {
         .map(|pair| {
             let meta = decode.meta(pair.input);
             Carried {
-                name: meta.name.clone().expect("a state input carries its name"),
+                name: meta
+                    .name()
+                    .expect("a state input carries its name")
+                    .into_owned(),
                 aval: meta.aval.clone(),
                 role: pair.role,
             }

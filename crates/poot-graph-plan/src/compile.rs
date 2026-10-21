@@ -427,7 +427,6 @@ pub struct ExpertIdsError {
 /// indexed head is built by the fuse pass after this check from one of those two, never traced.
 fn refuse_unproven_expert_ids(g: &Graph) -> Result<(), ExpertIdsError> {
     let facts = value_ranges(g);
-    let producers = transform::producer_map(g);
     for eqn in g.eqns() {
         // `g.validate()` (run by `compile` before the adapters and this check, and by the adapter itself)
         // infers every equation, and `OpKind::infer` gives each of these operands a rank (w rank 3, ids
@@ -463,7 +462,7 @@ fn refuse_unproven_expert_ids(g: &Graph) -> Result<(), ExpertIdsError> {
         if !IndexRange::below(experts).is_some_and(|valid| proven.within(&valid)) {
             return Err(refusal(ExpertIdsGap::OutOfRange));
         }
-        if let Some(guard) = transform::first_unobserved_clamp(g, &producers, &facts, ids) {
+        if let Some(guard) = transform::first_unobserved_clamp(g, &facts, ids) {
             return Err(refusal(ExpertIdsGap::UnobservedGuard { guard }));
         }
     }
@@ -805,7 +804,7 @@ impl Program {
 /// `fold_dense_contractions` runs before `legalize`: an oversized weight is split as the `DenseContraction`
 /// that reads it, so each chunk is the contraction the planner lowers (a BF16 `[K, N]` matmul over a
 /// transposed chunk has no lowering to probe). `legalize` runs before `fold_dense_bf16_row_gathers`: it can
-/// retag a `Gather` into a `Slot::TokenEmbed` input, and that fold pattern-matches a `Gather` specifically,
+/// retag a `Gather` into a `TOKEN_EMBED` input, and that fold pattern-matches a `Gather` specifically,
 /// so a table `legalize` already hosted must not still look like one to it. Card 534a's step is the one
 /// preparation every target needs before planning: no executor sequences its own copy of it any more.
 ///
@@ -1171,7 +1170,7 @@ fn widen_growth(g: &Graph) -> Growth {
     let casts = g.eqns().iter().fold(0usize, |casts, eqn| {
         casts.saturating_add(match eqn.op {
             OpKind::Gather { axis: 0 } | OpKind::Slice { .. } => 1,
-            OpKind::MatMul | OpKind::Binary(_) => 2,
+            OpKind::MatMul { .. } | OpKind::Binary(_) => 2,
             _ => 0,
         })
     });
@@ -1820,7 +1819,7 @@ mod tests {
     }
 
     /// SC-002 (host), driven through `compile`: an embed table over the target's
-    /// buffer limit compiles to a program whose graph binds `Slot::TokenEmbed`, not a device `Gather`,
+    /// buffer limit compiles to a program whose graph binds `TOKEN_EMBED`, not a device `Gather`,
     /// and `legalize` is recorded among the passes that changed the graph - `compile`'s own
     /// `Program::passes()`, not a bare call to `legalize`. Mutation (recorded, not committed): replacing
     /// `compile`'s `pipeline.try_run("legalize", ...)` call with a no-op pass-through (same effect as
@@ -1850,10 +1849,16 @@ mod tests {
             .graph()
             .inputs()
             .iter()
-            .find(|&&id| program.graph().meta(id).storage == Storage::Slot(Slot::TokenEmbed))
+            .find(|&&id| {
+                program.graph().meta(id).storage == Storage::Slot(Slot::Owned(crate::TOKEN_EMBED))
+            })
             .expect("compile's output graph declares the hosted embed input");
         assert_eq!(
-            program.graph().meta(*hosted).name.as_deref(),
+            program
+                .graph()
+                .meta(*hosted)
+                .slot_key()
+                .and_then(poot_graph_ir::SlotKey::tag),
             Some("w.embed")
         );
     }
@@ -1862,7 +1867,7 @@ mod tests {
     /// weight bytes in the lane the plan chose, exactly as the table's own const would be. On wgpu that
     /// lane is the packed `u32` one (SPIR-V has no scalar BF16), so the widening `Cast` plans the
     /// packed body; planning it as the native two-byte cast failed at codegen on the real Qwen3.8-27B-FP8
-    /// checkpoint (`bf16 compute is NVPTX-only`). Mutation: drop `Slot::TokenEmbed` from
+    /// checkpoint (`bf16 compute is NVPTX-only`). Mutation: drop `TOKEN_EMBED` from
     /// `Storage::holds_weight_bytes`; the slot's storage is `Dense(BF16)` and the cast the native one.
     #[test]
     fn compile_reads_hosted_bf16_embed_rows_through_the_packed_lane() {
@@ -1888,7 +1893,9 @@ mod tests {
             .graph()
             .inputs()
             .iter()
-            .find(|&&id| program.graph().meta(id).storage == Storage::Slot(Slot::TokenEmbed))
+            .find(|&&id| {
+                program.graph().meta(id).storage == Storage::Slot(Slot::Owned(crate::TOKEN_EMBED))
+            })
             .expect("the oversized table is hosted");
         assert_eq!(
             program.storage().storage(hosted).buffer_storage(),
@@ -1947,7 +1954,13 @@ mod tests {
             .graph()
             .consts()
             .iter()
-            .filter_map(|&id| program.graph().meta(id).name.clone())
+            .filter_map(|&id| {
+                program
+                    .graph()
+                    .meta(id)
+                    .name()
+                    .map(std::borrow::Cow::into_owned)
+            })
             .filter(|n| n.starts_with("w.head.chunk"))
             .collect();
         assert_eq!(
@@ -1987,7 +2000,7 @@ mod tests {
             ids.iter()
                 .map(|&id| {
                     let m = graph.meta(id);
-                    let t = match m.name.as_deref() {
+                    let t = match m.name().as_deref() {
                         Some("w.head") => poot_tensor::HostTensor::f32(vec![n, k], w_data.clone()),
                         Some("x") => poot_tensor::HostTensor::f32(vec![1, 1], vec![1.0]),
                         other => panic!("unexpected const {other:?}"),
@@ -2007,7 +2020,7 @@ mod tests {
         let mut row = 0usize;
         for &id in gh.consts() {
             let m = gh.meta(id);
-            let name = m.name.as_deref().unwrap();
+            let name = m.name().unwrap();
             if let Some(rest) = name.strip_prefix("w.head.chunk") {
                 let _: usize = rest.parse().expect("chunk index");
                 let height = m.aval.shape[0];
@@ -2106,7 +2119,7 @@ mod tests {
                         assert!(
                             bytes <= limit,
                             "{backend:?}: compiled with a {bytes}-byte const {:?} over {limit}",
-                            graph.meta(id).name
+                            graph.meta(id).name()
                         );
                     }
                 }
@@ -2191,9 +2204,11 @@ mod tests {
                         let Operand::Value(carrier) = operand else {
                             panic!("{what}: literal carrier");
                         };
-                        let name = program.graph().meta(*carrier).name.as_deref().unwrap();
+                        let name = program.graph().meta(*carrier).name().unwrap();
                         assert_eq!(
-                            poot_graph_ir::PackedSourceName::parse(name).unwrap().role(),
+                            poot_graph_ir::PackedSourceName::parse(&name)
+                                .unwrap()
+                                .role(),
                             role,
                             "{what}: carrier out of role order"
                         );
@@ -4225,7 +4240,7 @@ mod tests {
 
         /// `split` as the oracle binds it, and the stack of each carrier. The oracle reads a carrier's role and
         /// stack id off a [`PackedSourceName`], which has no spelling for `{carrier}.chunkN`, so each chunk is
-        /// renamed to the packed name of stack `{id}.chunkN`; its stack is the experts the chunks before it
+        /// spelled as the packed name of stack `{id}.chunkN`; its stack is the experts the chunks before it
         /// leave off, as the executor binder places them.
         fn oracle_split(
             &self,
@@ -4240,7 +4255,7 @@ mod tests {
             let mut runs: HashMap<String, std::ops::Range<usize>> = HashMap::new();
             for &id in split.consts() {
                 let meta = split.meta(id);
-                let name = meta.name.clone().expect("a named carrier");
+                let name = meta.name().expect("a named carrier").into_owned();
                 let (carrier, index) = name
                     .rsplit_once(".chunk")
                     .expect("only chunk carriers remain");
@@ -4260,7 +4275,7 @@ mod tests {
             }
             let graph = poot_graph_ir::test_support::graph_fixtures::derive(split, |draft| {
                 for (id, name) in &renames {
-                    draft.values_mut()[*id].name = Some(name.clone());
+                    draft.values_mut()[*id].spell_as(name.clone());
                 }
             })
             .unwrap();
@@ -4294,9 +4309,7 @@ mod tests {
                 } else if id == self.ids {
                     Value::from(poot_tensor::HostTensor::i32(vec![11], routed.to_vec()))
                 } else {
-                    Value::from(stacks(
-                        graph.meta(id).name.as_deref().expect("a named carrier"),
-                    ))
+                    Value::from(stacks(&graph.meta(id).name().expect("a named carrier")))
                 };
                 inputs.insert(id, value);
             }

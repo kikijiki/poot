@@ -352,7 +352,7 @@ fn assert_flash_fused_prefill(family: &str, kv: KvLayout) {
     // no MatMul should produce a full [.,Hq,L,L] (or larger) score-matrix-shaped output; flash
     // attention never materializes it.
     for e in opt.eqns() {
-        if matches!(e.op, OpKind::MatMul) {
+        if matches!(e.op, OpKind::MatMul { .. }) {
             // Shape-aware, not a size threshold (Card 557: the projections are plain `MatMul`s too
             // now, and an `[1,L,inter]` MLP output can exceed L*L elements): a rank-4 `[.,Hq,L,L']`
             // output with both trailing dims >= n is the materialized softmax(QK^T) score matrix.
@@ -402,7 +402,7 @@ fn optimize_fuses_flash_prefill_vlm_embeds_no_materialized_scores() {
         "expected one fused flash-prefill op per layer"
     );
     for e in opt.eqns() {
-        if matches!(e.op, OpKind::MatMul) {
+        if matches!(e.op, OpKind::MatMul { .. }) {
             let shape = &opt.aval(e.out).shape;
             let r = shape.len();
             assert!(
@@ -429,7 +429,8 @@ fn cse_only_leaves_naive_materialized_scores() {
         .unwrap();
     let g = poot_graph_plan::cse(&g).unwrap();
     let has_naive_scores = g.eqns().iter().any(|e| {
-        matches!(e.op, OpKind::MatMul) && g.aval(e.out).shape.iter().product::<usize>() >= n * n
+        matches!(e.op, OpKind::MatMul { .. })
+            && g.aval(e.out).shape.iter().product::<usize>() >= n * n
     });
     assert!(
         has_naive_scores,

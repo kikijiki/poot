@@ -6,7 +6,7 @@
 //!
 //! The reference is `weight_map_oracle::eval_mapped` over the unsplit trace; the compiled program is
 //! evaluated on the same weights, each `<name>.chunkN` const bound as the matching row block of `<name>`
-//! and the hosted `Slot::TokenEmbed` as the token's embedding row.
+//! and the hosted `TOKEN_EMBED` as the token's embedding row.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -156,12 +156,17 @@ fn driver_compile_splits_transposed_weights_under_a_small_buffer_limit() {
     }
     for &id in g.inputs() {
         let meta = g.meta(id);
-        let name = meta.name.as_deref();
+        let name = meta.name();
+        let name = name.as_deref();
         let value = match meta.storage {
             Storage::State => continue,
             Storage::Computed(c) => c.tensor(),
-            Storage::Slot(Slot::TokenEmbed) => {
-                let embed = dense_weight(&d.map, &d.store, name.expect("a hosted embed is named"));
+            Storage::Slot(Slot::Owned(role)) if role == poot_graph_plan::TOKEN_EMBED => {
+                let table = meta
+                    .slot_key()
+                    .and_then(SlotKey::tag)
+                    .expect("a hosted embed is keyed by its table");
+                let embed = dense_weight(&d.map, &d.store, table);
                 let row = rows_of(&embed, TOKEN as usize, 1);
                 row.reshaped(meta.aval.shape.clone()).unwrap()
             }
@@ -193,7 +198,7 @@ fn driver_compile_splits_transposed_weights_under_a_small_buffer_limit() {
         assert!(
             bytes <= LIMIT,
             "{:?} is {bytes} bytes, over the limit",
-            g.meta(id).name
+            g.meta(id).name()
         );
     }
     let (head, &(_, rows)) = next

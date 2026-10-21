@@ -800,7 +800,7 @@ impl Case {
             )
             .unwrap();
         g.state()
-            .map(|(input, _)| g.meta(input).name.clone().expect("state is named"))
+            .map(|(input, _)| g.meta(input).name().expect("state is named").into_owned())
             .collect()
     }
 }
@@ -1100,7 +1100,7 @@ fn the_block_key_cache_is_declared_blocked() {
         .unwrap();
     let role = |name: &str| {
         g.state_pairs()
-            .find(|pair| g.meta(pair.input).name.as_deref() == Some(name))
+            .find(|pair| g.meta(pair.input).name().as_deref() == Some(name))
             .unwrap_or_else(|| panic!("no state {name}"))
             .role
     };
@@ -1274,7 +1274,7 @@ fn packed_experts_trace_as_packed_weights_and_dense_ones_as_stored_stacks() {
             .iter()
             .filter_map(|&id| {
                 let meta = bound.meta(id);
-                let name = meta.name.clone()?;
+                let name = meta.name().map(std::borrow::Cow::into_owned)?;
                 let expert = name.contains(".moe.expert") || name.contains(".moe.stack");
                 (meta.storage == Storage::Const && expert).then_some((name, meta.aval.dtype))
             })

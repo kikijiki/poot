@@ -92,7 +92,7 @@ fn store_for(g: &Graph) -> Arc<WeightStore> {
     for &id in g.inputs() {
         let meta = g.meta(id);
         if meta.storage == poot_graph_ir::Storage::Const {
-            entries.insert(meta.name.clone().unwrap(), meta.aval.shape.clone());
+            entries.insert(meta.name().unwrap().into_owned(), meta.aval.shape.clone());
         }
     }
     let mut builder = WeightStore::builder();
@@ -322,8 +322,8 @@ fn oracle_decode_step(
         let meta = g.meta(id);
         let value = match meta.storage {
             poot_graph_ir::Storage::Const => {
-                let name = meta.name.as_deref().unwrap();
-                let WeightEntry::Dense(dense) = store.get(name).unwrap() else {
+                let name = meta.name().unwrap();
+                let WeightEntry::Dense(dense) = store.get(name.as_ref()).unwrap() else {
                     unreachable!()
                 };
                 Value::from(HostTensor::f32(
@@ -333,7 +333,7 @@ fn oracle_decode_step(
             }
             poot_graph_ir::Storage::State => Value::from(
                 state
-                    .entry(meta.name.clone().unwrap())
+                    .entry(meta.name().unwrap().into_owned())
                     .or_insert_with(|| HostTensor::zeros(meta.aval.shape.clone()))
                     .clone(),
             ),
@@ -362,7 +362,10 @@ fn oracle_decode_step(
     }
     let evaluation = eval(g, &inputs, EvalOptions::default()).unwrap();
     for ((si, _), t) in g.state().zip(evaluation.state) {
-        state.insert(g.meta(si).name.clone().unwrap(), t.into_host().unwrap());
+        state.insert(
+            g.meta(si).name().unwrap().into_owned(),
+            t.into_host().unwrap(),
+        );
     }
     evaluation
         .output
@@ -863,7 +866,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm() {
             if meta.storage != poot_graph_ir::Storage::Const {
                 continue;
             }
-            let name = meta.name.as_deref().unwrap().to_string();
+            let name = meta.name().unwrap().to_string();
             let tensor = base_inputs[&id]
                 .clone()
                 .into_host()
@@ -909,7 +912,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm() {
         let mut seed_graphs = Vec::new();
         for (i, (si, _)) in variant.graph.state().enumerate() {
             let meta = variant.graph.meta(si);
-            let name = meta.name.as_deref().unwrap().to_string();
+            let name = meta.name().unwrap().to_string();
             let shape = meta.aval.shape.clone();
             let b = Builder::for_tests();
             let state_in = b

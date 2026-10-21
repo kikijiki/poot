@@ -757,7 +757,7 @@ mod tests {
             .unwrap();
         let names: Vec<String> = g
             .state()
-            .map(|(input, _)| g.meta(input).name.clone().unwrap())
+            .map(|(input, _)| g.meta(input).name().unwrap().into_owned())
             .collect();
         assert_eq!(
             names,

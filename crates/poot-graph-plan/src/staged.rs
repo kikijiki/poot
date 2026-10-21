@@ -331,7 +331,7 @@ impl StagedProgram {
             let graph = program.graph();
             graph.slots().iter().any(|&(id, kind)| {
                 graph.meta(id).slot_key() == Some(key)
-                    || (*key == token && kind == Slot::TokenEmbed)
+                    || (*key == token && kind == Slot::Owned(crate::TOKEN_EMBED))
             })
         })
     }

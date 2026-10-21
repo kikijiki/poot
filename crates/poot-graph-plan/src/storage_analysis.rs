@@ -393,18 +393,12 @@ mod value_storage_tests {
             .constant("w", TensorType::new(vec![32, 32], w_dtype))
             .unwrap();
         let wt = b.transpose(w, vec![1, 0]).unwrap();
-        let mm = b.matmul(a, wt).unwrap();
-        let g = b.finish(mm).unwrap();
-        let out = g
-            .eqns()
-            .iter()
-            .find(|e| matches!(e.op, OpKind::MatMul))
-            .expect("matmul eqn")
-            .out;
-        poot_graph_ir::test_support::graph_fixtures::derive(&g, |draft| {
-            draft.values_mut()[out].aval.dtype = DType::F32;
-        })
-        .unwrap()
+        let mm = if a_dtype == w_dtype {
+            b.matmul_f32_accumulate(a, wt).unwrap()
+        } else {
+            b.matmul(a, wt).unwrap()
+        };
+        b.finish(mm).unwrap()
     }
 
     /// Card 526, Card 1011: the compiled program's per-value storage dtype is the const's declared dtype for every
@@ -815,7 +809,7 @@ mod value_storage_tests {
                     .consts()
                     .iter()
                     .copied()
-                    .find(|&id| pg.meta(id).name.as_deref() == Some(name))
+                    .find(|&id| pg.meta(id).name().as_deref() == Some(name))
                     .unwrap();
                 assert_eq!(
                     program.storage().storage(id).buffer_storage(),

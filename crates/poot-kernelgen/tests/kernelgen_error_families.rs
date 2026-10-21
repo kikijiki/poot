@@ -41,7 +41,7 @@ fn fused_family_rejects_leaf_count_mismatch_and_zero_width() {
     let kfk = poot_kernelgen::FusedKernel {
         leaf_tys: vec![poot_kernelgen::LeafTy::F32; 2],
         steps: vec![],
-        output: poot_kernelgen::FusedInput::Leaf(0),
+        output: poot_kernelgen::FusedInput::Leaf(poot_kernelgen::LeafId::new(0)),
     };
     let layouts = vec![poot_kernelgen::Layout::contiguous(&[4])];
     let err = poot_kernelgen::fused_views("t", &[4], &[&[4]], &layouts, &kfk, None)
@@ -61,7 +61,7 @@ fn fused_family_rejects_leaf_count_mismatch_and_zero_width() {
         leaf_storage: vec![poot_target::BufferStorage::f32()],
         n_cols: 4,
         steps: vec![],
-        output: 0,
+        output: poot_kernelgen::RowValue::Leaf(poot_kernelgen::LeafId::new(0)),
     };
     let layouts = vec![poot_kernelgen::Layout::contiguous(&[4])];
     let err = poot_kernelgen::fused_row_parallel_views("t", &[4], &[&[4]], &layouts, &krk, 0, 1)
@@ -188,20 +188,25 @@ fn concat_family_rejects_zero_inputs() {
 /// this row goes red.
 #[test]
 fn float_region_rejects_an_i32_leaf_outside_a_select_condition() {
-    use poot_kernelgen::{FusedInput, FusedKernel, FusedScalarOp, FusedStep, LeafTy};
+    use poot_kernelgen::{
+        FusedInput, FusedKernel, FusedScalarOp, FusedStep, LeafId, LeafTy, StepId,
+    };
     let read_as_float = FusedKernel {
         leaf_tys: vec![LeafTy::I32, LeafTy::F32],
         steps: vec![FusedStep {
             op: FusedScalarOp::Binary(poot_kernel_ir::BinOp::Add),
-            inputs: vec![FusedInput::Leaf(0), FusedInput::Leaf(1)],
+            inputs: vec![
+                FusedInput::Leaf(LeafId::new(0)),
+                FusedInput::Leaf(LeafId::new(1)),
+            ],
         }],
-        output: FusedInput::Step(0),
+        output: FusedInput::Step(StepId::new(0)),
     };
     let layouts = vec![poot_kernelgen::Layout::contiguous(&[4]); 2];
     let err = poot_kernelgen::fused_views("t", &[4], &[&[4], &[4]], &layouts, &read_as_float, None)
         .expect_err("an I32 leaf feeds a float Add");
     assert!(
-        matches!(err, KernelGenError::IndexLeafOperand { leaf: 0, .. }),
+        matches!(err, KernelGenError::IndexLeafOperand { leaf, .. } if leaf.index() == 0),
         "{err:?}"
     );
 
@@ -211,12 +216,12 @@ fn float_region_rejects_an_i32_leaf_outside_a_select_condition() {
         steps: vec![FusedStep {
             op: FusedScalarOp::Select,
             inputs: vec![
-                FusedInput::Leaf(0),
-                FusedInput::Leaf(1),
-                FusedInput::Leaf(2),
+                FusedInput::Leaf(LeafId::new(0)),
+                FusedInput::Leaf(LeafId::new(1)),
+                FusedInput::Leaf(LeafId::new(2)),
             ],
         }],
-        output: FusedInput::Step(0),
+        output: FusedInput::Step(StepId::new(0)),
     };
     let layouts = vec![poot_kernelgen::Layout::contiguous(&[4]); 3];
     poot_kernelgen::fused_views(
@@ -233,7 +238,7 @@ fn float_region_rejects_an_i32_leaf_outside_a_select_condition() {
     let float_leaf = FusedKernel {
         leaf_tys: vec![LeafTy::F32],
         steps: vec![],
-        output: FusedInput::Leaf(0),
+        output: FusedInput::Leaf(LeafId::new(0)),
     };
     let layouts = vec![poot_kernelgen::Layout::contiguous(&[4])];
     let err = poot_kernelgen::fused_i32_views_grid("t", &[4], &[&[4]], &layouts, &float_leaf, None)
@@ -257,7 +262,9 @@ fn float_region_rejects_an_i32_leaf_outside_a_select_condition() {
 /// arithmetic row would build a body that adds raw two-byte lanes as F32 and this row goes red.
 #[test]
 fn a_two_byte_float_is_only_ever_a_select_branch() {
-    use poot_kernelgen::{FusedInput, FusedKernel, FusedScalarOp, FusedStep, LeafTy};
+    use poot_kernelgen::{
+        FusedInput, FusedKernel, FusedScalarOp, FusedStep, LeafId, LeafTy, StepId,
+    };
     let layouts = vec![poot_kernelgen::Layout::contiguous(&[4]); 3];
     let shapes: [&[usize]; 3] = [&[4], &[4], &[4]];
     let select = |leaf_tys: Vec<LeafTy>| FusedKernel {
@@ -265,12 +272,12 @@ fn a_two_byte_float_is_only_ever_a_select_branch() {
         steps: vec![FusedStep {
             op: FusedScalarOp::Select,
             inputs: vec![
-                FusedInput::Leaf(0),
-                FusedInput::Leaf(1),
-                FusedInput::Leaf(2),
+                FusedInput::Leaf(LeafId::new(0)),
+                FusedInput::Leaf(LeafId::new(1)),
+                FusedInput::Leaf(LeafId::new(2)),
             ],
         }],
-        output: FusedInput::Step(0),
+        output: FusedInput::Step(StepId::new(0)),
     };
     for leaf in [LeafTy::BF16, LeafTy::F16] {
         poot_kernelgen::fused_views(
@@ -301,9 +308,12 @@ fn a_two_byte_float_is_only_ever_a_select_branch() {
         leaf_tys: vec![LeafTy::F32, LeafTy::BF16],
         steps: vec![FusedStep {
             op: FusedScalarOp::Binary(poot_kernel_ir::BinOp::Add),
-            inputs: vec![FusedInput::Leaf(0), FusedInput::Leaf(1)],
+            inputs: vec![
+                FusedInput::Leaf(LeafId::new(0)),
+                FusedInput::Leaf(LeafId::new(1)),
+            ],
         }],
-        output: FusedInput::Step(0),
+        output: FusedInput::Step(StepId::new(0)),
     };
     let err =
         poot_kernelgen::fused_views("t", &[4], &shapes[..2], &layouts[..2], &arithmetic, None)
@@ -320,15 +330,17 @@ fn a_two_byte_float_is_only_ever_a_select_branch() {
 /// `check_float_region_tys`; the first row builds a body and goes red.
 #[test]
 fn float_region_rejects_a_cast_of_a_float_operand_and_mixed_arithmetic() {
-    use poot_kernelgen::{FusedInput, FusedKernel, FusedScalarOp, FusedStep, LeafTy};
+    use poot_kernelgen::{
+        FusedInput, FusedKernel, FusedScalarOp, FusedStep, LeafId, LeafTy, StepId,
+    };
     let layouts = vec![poot_kernelgen::Layout::contiguous(&[4]); 2];
     let cast_of_float = FusedKernel {
         leaf_tys: vec![LeafTy::F32],
         steps: vec![FusedStep {
             op: FusedScalarOp::I32ToF32,
-            inputs: vec![FusedInput::Leaf(0)],
+            inputs: vec![FusedInput::Leaf(LeafId::new(0))],
         }],
-        output: FusedInput::Step(0),
+        output: FusedInput::Step(StepId::new(0)),
     };
     let err = poot_kernelgen::fused_views("t", &[4], &[&[4]], &layouts[..1], &cast_of_float, None)
         .expect_err("a cast of an f32 leaf has no meaning");
@@ -344,14 +356,20 @@ fn float_region_rejects_a_cast_of_a_float_operand_and_mixed_arithmetic() {
         steps: vec![
             FusedStep {
                 op: FusedScalarOp::GeU,
-                inputs: vec![FusedInput::Leaf(0), FusedInput::Leaf(1)],
+                inputs: vec![
+                    FusedInput::Leaf(LeafId::new(0)),
+                    FusedInput::Leaf(LeafId::new(1)),
+                ],
             },
             FusedStep {
                 op: FusedScalarOp::Binary(poot_kernel_ir::BinOp::Add),
-                inputs: vec![FusedInput::Step(0), FusedInput::Leaf(2)],
+                inputs: vec![
+                    FusedInput::Step(StepId::new(0)),
+                    FusedInput::Leaf(LeafId::new(2)),
+                ],
             },
         ],
-        output: FusedInput::Step(1),
+        output: FusedInput::Step(StepId::new(1)),
     };
     let layouts = vec![poot_kernelgen::Layout::contiguous(&[4]); 3];
     let err = poot_kernelgen::fused_views("t", &[4], &[&[4], &[4], &[4]], &layouts, &mixed, None)

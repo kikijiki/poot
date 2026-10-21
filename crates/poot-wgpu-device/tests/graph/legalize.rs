@@ -59,7 +59,7 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
     let mut cpu_inputs = HashMap::new();
     for &id in g.inputs() {
         let m = g.meta(id);
-        let t = match m.name.as_deref() {
+        let t = match m.name().as_deref() {
             Some("w.head") => HostTensor::f32(vec![n, k], w_data.clone()),
             Some("x") => HostTensor::f32(vec![1, 1], vec![1.0]),
             other => panic!("unexpected const {other:?}"),
@@ -77,7 +77,7 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
     let gh_chunks: Vec<_> = gh
         .consts()
         .iter()
-        .filter_map(|&id| gh.meta(id).name.as_deref())
+        .filter_map(|&id| gh.meta(id).name())
         .filter(|name| name.starts_with("w.head.chunk"))
         .collect();
     assert_eq!(

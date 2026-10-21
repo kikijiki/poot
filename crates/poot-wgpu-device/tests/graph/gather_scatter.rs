@@ -821,7 +821,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
             };
             match meta.storage {
                 Storage::Const => {
-                    let name = meta.name.clone().ok_or("const without a name")?;
+                    let name = meta.name().ok_or("const without a name")?.into_owned();
                     let bytes: Vec<u8> = t
                         .as_f32()
                         .unwrap()
@@ -856,7 +856,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
                     slot_bytes.push((key, t.shape().to_vec(), meta.aval.dtype, bytes));
                 }
                 Storage::State => {
-                    let name = meta.name.clone().ok_or("state without a name")?;
+                    let name = meta.name().ok_or("state without a name")?.into_owned();
                     let seed_bytes: Vec<u8> = t
                         .as_f32()
                         .unwrap()

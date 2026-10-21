@@ -65,9 +65,9 @@ fn a_cast_step_converts_an_i32_leaf_to_the_nearest_f32() {
         leaf_tys: vec![kg::LeafTy::I32],
         steps: vec![kg::FusedStep {
             op: kg::FusedScalarOp::I32ToF32,
-            inputs: vec![kg::FusedInput::Leaf(0)],
+            inputs: vec![kg::FusedInput::Leaf(kg::LeafId::new(0))],
         }],
-        output: kg::FusedInput::Step(0),
+        output: kg::FusedInput::Step(kg::StepId::new(0)),
     };
     let mut buffers = [
         Buffer::from_i32s(&words),
@@ -101,18 +101,24 @@ fn an_exact_i32_chain_then_a_cast_then_float_arithmetic_is_one_region() {
         steps: vec![
             kg::FusedStep {
                 op: kg::FusedScalarOp::GeU,
-                inputs: vec![kg::FusedInput::Leaf(0), kg::FusedInput::Leaf(1)],
+                inputs: vec![
+                    kg::FusedInput::Leaf(kg::LeafId::new(0)),
+                    kg::FusedInput::Leaf(kg::LeafId::new(1)),
+                ],
             },
             kg::FusedStep {
                 op: kg::FusedScalarOp::I32ToF32,
-                inputs: vec![kg::FusedInput::Step(0)],
+                inputs: vec![kg::FusedInput::Step(kg::StepId::new(0))],
             },
             kg::FusedStep {
                 op: kg::FusedScalarOp::Binary(poot_kernel_ir::BinOp::Mul),
-                inputs: vec![kg::FusedInput::Step(1), kg::FusedInput::Leaf(2)],
+                inputs: vec![
+                    kg::FusedInput::Step(kg::StepId::new(1)),
+                    kg::FusedInput::Leaf(kg::LeafId::new(2)),
+                ],
             },
         ],
-        output: kg::FusedInput::Step(2),
+        output: kg::FusedInput::Step(kg::StepId::new(2)),
     };
     let mut buffers = [
         Buffer::from_i32s(&a),

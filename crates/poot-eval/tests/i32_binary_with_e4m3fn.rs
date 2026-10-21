@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use poot_eval::fp8::e4m3fn_tensor;
 use poot_eval::{EvalOptions, Value};
 use poot_graph_ir::{
-    BinOp, Eqn, Graph, GraphEdit, OpKind, Operand, Scalar, Slot, Storage, TensorType, ValueId,
-    ValueMeta,
+    BinOp, Eqn, Graph, GraphEdit, OpKind, Operand, Scalar, Slot, SlotKey, Storage, TensorType,
+    ValueId, ValueMeta,
 };
 use poot_tensor::HostTensor;
 
@@ -32,11 +32,13 @@ fn build_graph() -> (Graph, ValueId, ValueId) {
     g.inputs_mut().push(e4m3_id);
     g.consts_mut().push(e4m3_id);
 
-    let id_val = g.values_mut().push(ValueMeta::new(
-        TensorType::scalar(DType::I32),
-        Storage::Slot(Slot::Token),
-        None,
-    ));
+    let id_val = g.values_mut().push(
+        ValueMeta::slot_input(
+            TensorType::scalar(DType::I32),
+            SlotKey::new(Slot::Token, None),
+        )
+        .expect("a token slot admits an I32 tensor"),
+    );
     g.inputs_mut().push(id_val);
     g.slots_mut().push((id_val, Slot::Token));
 

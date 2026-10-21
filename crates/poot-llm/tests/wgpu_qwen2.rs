@@ -108,7 +108,7 @@ fn split_consts_and_slots_v(
         let dtype = m.aval.dtype;
         match m.storage {
             Storage::Const => {
-                let name = m.name.clone().expect("named const");
+                let name = m.name().expect("named const").into_owned();
                 let t = inputs
                     .get(&id)
                     .and_then(Value::as_host)
@@ -288,18 +288,18 @@ fn bind(g: &Graph, feed: &Feed, seed_state: bool) -> HashMap<ValueId, Value> {
         let t = match meta.storage {
             Storage::Slot(Slot::Token) => HostTensor::i32(shape, feed.tokens.clone()),
             Storage::Slot(Slot::Pos) => HostTensor::i32(shape, feed.pos.clone()),
-            Storage::Slot(Slot::SlotMap) => match meta.name.as_deref() {
+            Storage::Slot(Slot::SlotMap) => match meta.name().as_deref() {
                 Some("slotmap.read") => HostTensor::i32(shape, feed.read.clone()),
                 other => panic!("unexpected slot map {other:?}"),
             },
-            Storage::Slot(Slot::WriteMap) => match meta.name.as_deref() {
+            Storage::Slot(Slot::WriteMap) => match meta.name().as_deref() {
                 Some("writemap.write") => HostTensor::i32(shape, feed.write.clone()),
                 other => panic!("unexpected write map {other:?}"),
             },
             Storage::Slot(other) => panic!("unexpected slot {other:?}"),
             Storage::Const => {
                 assert_eq!(meta.aval.dtype, DType::F32, "an F32 model's const");
-                weight(meta.name.as_deref().expect("a named const"), &shape)
+                weight(&meta.name().expect("a named const"), &shape)
             }
             Storage::Computed(c) => c.tensor(),
             Storage::State if seed_state => HostTensor::zeros(shape),
@@ -578,7 +578,7 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
     );
     for (i, (si, so)) in g_paged.state().enumerate() {
         let cpu = env_p[so].as_ref().unwrap();
-        let name = g_paged.meta(si).name.clone().expect("named state");
+        let name = g_paged.meta(si).name().expect("named state").into_owned();
         let probe = state_probe_graph(&name, g_paged.aval(si).clone());
         let probe_entry = exec.add_entry(exe, &staged(&probe, target)).unwrap();
         let got = f32_bytes(
@@ -997,7 +997,7 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode_gpu() {
                 if meta.storage != Storage::Const {
                     continue;
                 }
-                let name = meta.name.clone().unwrap();
+                let name = meta.name().unwrap().into_owned();
                 if !seen.insert(name.clone()) {
                     continue;
                 }

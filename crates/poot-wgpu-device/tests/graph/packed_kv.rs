@@ -23,7 +23,7 @@ fn nvptx_decode_gemv_plan_selection() {
         let eqn = g
             .eqns()
             .iter()
-            .find(|e| matches!(e.op, OpKind::MatMul))
+            .find(|e| matches!(e.op, OpKind::MatMul { .. }))
             .unwrap();
         plan_eqn_with_choice(
             &g,
@@ -135,7 +135,7 @@ fn decode_gemv_random_shapes_gpu_matches_cpu() {
         let program = compile_full(&g, &spirv_fixture_target());
         let (eqn, plan) = program
             .planned()
-            .find(|(e, _)| matches!(e.op, OpKind::MatMul))
+            .find(|(e, _)| matches!(e.op, OpKind::MatMul { .. }))
             .unwrap();
         assert_eq!(
             program
@@ -259,7 +259,7 @@ fn batched_decode_gemv_gpu_matches_cpu() {
         let program = compile_full(&g, &spirv_fixture_target());
         let (eqn, plan) = program
             .planned()
-            .find(|(e, _)| matches!(e.op, OpKind::MatMul))
+            .find(|(e, _)| matches!(e.op, OpKind::MatMul { .. }))
             .unwrap();
         assert_eq!(
             program

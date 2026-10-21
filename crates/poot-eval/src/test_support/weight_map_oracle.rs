@@ -50,7 +50,8 @@ pub fn eval_mapped(
                 tensor.clone().into()
             }
             Storage::Const => {
-                let name = meta.name.as_deref().expect("a const has a name");
+                let name = meta.name().expect("a const has a name");
+                let name = name.as_ref();
                 if let Some(&wid) = ids.get(name) {
                     let WeightEntry::Dense(dense) = materialize(wid) else {
                         panic!("{name} is packed but the graph declares it dense")
@@ -121,7 +122,7 @@ pub fn oracle_for<'a>(
         .inputs()
         .iter()
         .filter_map(|&id| {
-            let source = PackedSourceName::parse(graph.meta(id).name.as_deref()?)?;
+            let source = PackedSourceName::parse(graph.meta(id).name().as_deref()?)?;
             if let Some(WeightEntry::Packed(owner)) = store.get(source.linear_id()) {
                 return Some((
                     id,
@@ -149,13 +150,11 @@ pub fn oracle_for<'a>(
             let value = match meta.storage {
                 Storage::Const => match packed.get(&id) {
                     Some(component) => component.clone(),
-                    None => Value::from(
-                        materialize_dense(store, meta.name.as_deref().unwrap()).unwrap(),
-                    ),
+                    None => Value::from(materialize_dense(store, &meta.name().unwrap()).unwrap()),
                 },
                 Storage::State => Value::from(
                     state
-                        .entry(meta.name.clone().unwrap())
+                        .entry(meta.name().unwrap().into_owned())
                         .or_insert_with(|| zero_state(&meta.aval))
                         .clone(),
                 ),
@@ -172,7 +171,7 @@ pub fn oracle_for<'a>(
         let evaluation = eval(graph, &inputs, EvalOptions::default()).unwrap();
         for ((si, _), t) in graph.state().zip(evaluation.state) {
             state.insert(
-                graph.meta(si).name.clone().unwrap(),
+                graph.meta(si).name().unwrap().into_owned(),
                 t.into_host().expect("dense state tensor"),
             );
         }

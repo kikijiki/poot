@@ -258,6 +258,42 @@ impl fmt::Display for LocalId {
     }
 }
 
+/// A lane of a packed I32 region input: a coordinate along the input's last axis, where each lane is one word of
+/// a pack. Distinct from a [`LocalId`] (a region value) and from an element offset of a kernel: the same `usize`
+/// elsewhere, and none can stand for another.
+///
+/// ```compile_fail,E0308
+/// use poot_graph_ir::op::{FusedOperand, LocalId};
+///
+/// let _ = FusedOperand::PackLane { input: LocalId::new(0), lane: 1usize };
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LaneId(usize);
+
+impl LaneId {
+    /// The lane at `index` along its input's last axis.
+    pub const fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    /// The position of this lane along the last axis.
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl fmt::Debug for LaneId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "lane{}", self.0)
+    }
+}
+
+impl fmt::Display for LaneId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// An operand of a [`FusedStep`]: a local value id, or an inline literal captured from the source graph. Locals
 /// `0..n_inputs` are the region's external inputs (matching the fused eqn's `inputs`, all `Operand::Value`, in
 /// order); locals `n_inputs + j` are the result of step `j`.
@@ -273,7 +309,7 @@ pub enum FusedOperand {
         /// The external packed input read.
         input: LocalId,
         /// The lane (index along the input's last axis) taken.
-        lane: usize,
+        lane: LaneId,
     },
 }
 
@@ -411,11 +447,11 @@ fn local_ty(locals: &[TensorType], id: LocalId) -> Result<&TensorType, ShapeErro
 fn pack_lane_ty(
     source: &TensorType,
     input: LocalId,
-    lane: usize,
+    lane: LaneId,
 ) -> Result<TensorType, ShapeError> {
     let mut shape = source.shape.clone();
     match shape.last_mut() {
-        Some(width) if lane < *width => *width = 1,
+        Some(width) if lane.index() < *width => *width = 1,
         other => {
             return Err(ShapeError::FusedOperand(
                 FusedOperandReason::PackLaneWidth {
@@ -568,6 +604,45 @@ impl ContractionRows {
     }
 }
 
+/// The dtype an [`OpKind::MatMul`] accumulates and stores.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum MatMulAccumulate {
+    /// The dtype of operand A: the contraction rounds to the operand width, as every traced matmul does.
+    Operand,
+    /// F32, over two operands of one narrow float dtype (F16 or BF16): the accumulate dtype of a tensor-core or
+    /// cooperative-matrix unit, which sums in f32 whatever the operand width. The result stays F32, so the
+    /// consumer reads the accumulator unrounded.
+    F32,
+}
+
+impl OpKind {
+    /// Whether this is a matmul that stores A's own dtype: the form every tracer emits and every pattern pass
+    /// recognizes. A pass that rewrites a matmul declines the F32-accumulate form it does not model.
+    pub const fn is_plain_matmul(&self) -> bool {
+        matches!(
+            self,
+            OpKind::MatMul {
+                accumulate: MatMulAccumulate::Operand
+            }
+        )
+    }
+
+    /// A matmul that stores A's own dtype.
+    pub const fn matmul() -> Self {
+        OpKind::MatMul {
+            accumulate: MatMulAccumulate::Operand,
+        }
+    }
+
+    /// A matmul over narrow operands that stores its F32 accumulator.
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn matmul_f32_accumulate() -> Self {
+        OpKind::MatMul {
+            accumulate: MatMulAccumulate::F32,
+        }
+    }
+}
+
 /// The contraction an [`OpKind::ContractionEpilogue`] runs before its pointwise region: the heads the planner
 /// lowers with an epilogue. Each names the primitive op whose result local 0 of the region reads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -609,7 +684,7 @@ impl ContractionHead {
     /// The primitive op that computes the head's result.
     pub fn op(self) -> OpKind {
         match self {
-            Self::MatMul => OpKind::MatMul,
+            Self::MatMul => OpKind::matmul(),
             Self::Dense { weight } => OpKind::DenseContraction { weight },
             Self::Indexed => OpKind::IndexedMatMul,
             Self::Packed { descriptor, rows } => OpKind::PackedContraction { descriptor, rows },
@@ -809,8 +884,12 @@ pub enum OpKind {
     /// repeated slot, and the oracle refuses one too. The unnamed rows pass through: the scattered analog of
     /// [`OpKind::DynamicUpdateSlice`].
     ScatterUpdate,
-    /// Batched matmul A[..,M,K] x B[..,K,N] -> [..,M,N], batch dims broadcast (numpy semantics).
-    MatMul,
+    /// Batched matmul A[..,M,K] x B[..,K,N] -> [..,M,N], batch dims broadcast (numpy semantics). `accumulate`
+    /// names the dtype of the result: A's own, or the F32 a tensor-core unit accumulates in over narrowed operands.
+    MatMul {
+        /// The dtype the contraction stores.
+        accumulate: MatMulAccumulate,
+    },
     /// Decode one validated rank-2 packed payload into checkpoint-order `[out,K]` f32.
     /// Its `descriptor.sources()` I8 operands are opaque const byte carriers, not numeric tensors,
     /// one per named [`poot_quant::SourceRole`] in that order (no positional slots): a GGUF block
@@ -1151,7 +1230,8 @@ fn check_same_dtype(a: &TensorType, b: &TensorType) -> Result<(), ShapeError> {
 
 /// Card 623 (R466-011, SC-001): the closed set of `MatMul` operand-dtype pairings `infer` accepts. Not
 /// strict equality: two passes deliberately build a genuinely mismatched F32-activation x BF16/F16-weight
-/// `MatMul` on purpose, so this is a stated exception, not a gap. `poot_graph_plan`'s `fold_dense_contractions`
+/// `MatMul` on purpose, so this is a stated exception, not a gap. ([`MatMulAccumulate::F32`] narrows it further:
+/// two operands of one narrow float dtype.) `poot_graph_plan`'s `fold_dense_contractions`
 /// folds exactly that pair (behind a `Transpose`) into `DenseContraction` (its own `weight` dtype table is
 /// `DenseContraction` weight dtype); the planner's own
 /// `poot_graph_plan::widen_mismatched_matmul_dtypes` (card 273) either widens that exact pair with a Cast
@@ -1538,7 +1618,7 @@ impl OpKind {
                 }
                 Ok(base.clone())
             }
-            OpKind::MatMul => {
+            OpKind::MatMul { accumulate } => {
                 arity(ins, 2)?;
                 let (a, b) = (&ins[0], &ins[1]);
                 reject_non_arithmetic("MatMul", a.dtype)?;
@@ -1549,6 +1629,18 @@ impl OpKind {
                         b: b.dtype,
                     });
                 }
+                let out_dtype = match accumulate {
+                    MatMulAccumulate::Operand => a.dtype,
+                    MatMulAccumulate::F32 => {
+                        if a.dtype != b.dtype || !matches!(a.dtype, DType::F16 | DType::BF16) {
+                            return Err(ShapeError::MatMulOperandDtype {
+                                a: a.dtype,
+                                b: b.dtype,
+                            });
+                        }
+                        DType::F32
+                    }
+                };
                 if a.rank() < 2 || b.rank() < 2 {
                     return Err(ShapeError::MatMulRank {
                         a: a.shape.clone(),
@@ -1574,7 +1666,7 @@ impl OpKind {
                 let mut shape = batch;
                 shape.push(m);
                 shape.push(n);
-                Ok(TensorType::new(shape, a.dtype))
+                Ok(TensorType::new(shape, out_dtype))
             }
             OpKind::PackedDequant { descriptor } => {
                 let roles = descriptor.sources();
@@ -2023,7 +2115,7 @@ impl OpKind {
             | Self::Iota { .. }
             | Self::Gather { .. }
             | Self::ScatterUpdate
-            | Self::MatMul
+            | Self::MatMul { .. }
             | Self::DynamicUpdateSlice { .. }
             | Self::PackedDequant { .. }
             | Self::ArgTopK { .. }
@@ -2092,7 +2184,7 @@ impl OpKind {
             Self::Iota { .. } => "iota",
             Self::Gather { .. } => "gather",
             Self::ScatterUpdate => "scatter_update",
-            Self::MatMul => "matmul",
+            Self::MatMul { .. } => "matmul",
             Self::PackedDequant { .. } => "packed_dequant",
             Self::PackedContraction { .. } => "packed_contraction",
             Self::PackedRowGather { .. } => "packed_row_gather",
@@ -2166,7 +2258,7 @@ impl OpKind {
             | OpKind::Iota { .. }
             | OpKind::Gather { .. }
             | OpKind::ScatterUpdate
-            | OpKind::MatMul
+            | OpKind::MatMul { .. }
             | OpKind::PackedDequant { .. }
             | OpKind::PackedContraction { .. }
             | OpKind::PackedRowGather { .. }
@@ -2210,7 +2302,10 @@ impl OpKind {
             OpKind::Gather { axis } => format!("gather ax={axis}"),
             OpKind::ArgTopK { k } => format!("arg_top_k k={k}"),
             OpKind::ScatterUpdate => "scatter_update".to_string(),
-            OpKind::MatMul => "matmul".to_string(),
+            OpKind::MatMul { accumulate } => match accumulate {
+                MatMulAccumulate::Operand => "matmul".to_string(),
+                MatMulAccumulate::F32 => "matmul f32_accumulate".to_string(),
+            },
             OpKind::PackedDequant { descriptor } => {
                 format!("packed_dequant {:?}", descriptor.format()).to_lowercase()
             }
@@ -3202,12 +3297,12 @@ mod tests {
         };
         assert_eq!(reduce_ax0.kind_name(), reduce_ax1.kind_name());
         assert_eq!(reduce_ax0.kind_name(), "reduce");
-        assert_ne!(reduce_ax0.kind_name(), OpKind::MatMul.kind_name());
-        assert_eq!(OpKind::MatMul.kind_name(), "matmul");
+        assert_ne!(reduce_ax0.kind_name(), OpKind::matmul().kind_name());
+        assert_eq!(OpKind::matmul().kind_name(), "matmul");
         // Every call is the same `&'static str` pointer: no per-call formatting/allocation.
         assert_eq!(
-            OpKind::MatMul.kind_name().as_ptr(),
-            OpKind::MatMul.kind_name().as_ptr()
+            OpKind::matmul().kind_name().as_ptr(),
+            OpKind::matmul().kind_name().as_ptr()
         );
     }
 
@@ -3282,12 +3377,12 @@ mod tests {
 
     #[test]
     fn matmul_batch_broadcast() {
-        let out = OpKind::MatMul
+        let out = OpKind::matmul()
             .infer(&[f(&[1, 14, 1, 64]), f(&[1, 14, 64, 10])])
             .unwrap();
         assert_eq!(out.shape, vec![1, 14, 1, 10]);
         // linear: [1,1,896] x [896,896] -> [1,1,896]
-        let out = OpKind::MatMul
+        let out = OpKind::matmul()
             .infer(&[f(&[1, 1, 896]), f(&[896, 896])])
             .unwrap();
         assert_eq!(out.shape, vec![1, 1, 896]);
@@ -3308,7 +3403,7 @@ mod tests {
             );
             // The same operand pair read in contraction order would not type-check as a MatMul: these are
             // different equations over the same buffer.
-            assert!(OpKind::MatMul.infer(&[f(&[1, 3, 5]), weight]).is_err());
+            assert!(OpKind::matmul().infer(&[f(&[1, 3, 5]), weight]).is_err());
         }
     }
 
@@ -3983,7 +4078,7 @@ mod tests {
 
     #[test]
     fn matmul_contract_mismatch() {
-        let e = OpKind::MatMul
+        let e = OpKind::matmul()
             .infer(&[f(&[1, 1, 896]), f(&[897, 896])])
             .unwrap_err();
         assert!(matches!(e, ShapeError::MatMulContract { .. }));
@@ -3997,11 +4092,11 @@ mod tests {
         for bad_dtype in [DType::E4M3FN, DType::I8] {
             let bad = TensorType::new(vec![2, 3], bad_dtype);
             assert!(matches!(
-                OpKind::MatMul.infer(&[bad.clone(), f(&[3, 4])]),
+                OpKind::matmul().infer(&[bad.clone(), f(&[3, 4])]),
                 Err(ShapeError::DtypeOp { op: "MatMul", dtype }) if dtype == bad_dtype
             ));
             assert!(matches!(
-                OpKind::MatMul.infer(&[f(&[2, 3]), bad]),
+                OpKind::matmul().infer(&[f(&[2, 3]), bad]),
                 Err(ShapeError::DtypeOp { op: "MatMul", dtype }) if dtype == bad_dtype
             ));
         }
@@ -4017,7 +4112,7 @@ mod tests {
         // Allowed: same arithmetic dtype.
         for dt in [DType::F32, DType::BF16, DType::F16] {
             assert!(
-                OpKind::MatMul
+                OpKind::matmul()
                     .infer(&[
                         TensorType::new(vec![2, 3], dt),
                         TensorType::new(vec![3, 4], dt)
@@ -4030,7 +4125,7 @@ mod tests {
         // to_f16, poot_graph_plan::widen_mismatched_matmul_dtypes).
         for weight_dt in [DType::BF16, DType::F16] {
             assert!(
-                OpKind::MatMul
+                OpKind::matmul()
                     .infer(&[f(&[2, 3]), TensorType::new(vec![3, 4], weight_dt)])
                     .is_ok(),
                 "F32 x {weight_dt} must be allowed"
@@ -4046,7 +4141,7 @@ mod tests {
         for (a_dt, b_dt) in rejected {
             assert!(
                 matches!(
-                    OpKind::MatMul.infer(&[
+                    OpKind::matmul().infer(&[
                         TensorType::new(vec![2, 3], a_dt),
                         TensorType::new(vec![3, 4], b_dt)
                     ]),
@@ -4055,6 +4150,47 @@ mod tests {
                 "{a_dt} x {b_dt} must be rejected"
             );
         }
+    }
+
+    /// POOT-1301 SC-001: the F32-accumulate matmul is typed by `infer` itself: two operands of one narrow float
+    /// dtype give F32, any other operand pairing is refused, and the operand-width matmul keeps A's dtype.
+    #[test]
+    fn matmul_f32_accumulate_is_typed_by_infer() {
+        let narrow = |dt| {
+            OpKind::matmul_f32_accumulate().infer(&[
+                TensorType::new(vec![2, 3], dt),
+                TensorType::new(vec![3, 4], dt),
+            ])
+        };
+        for dt in [DType::BF16, DType::F16] {
+            assert_eq!(narrow(dt).unwrap(), f(&[2, 4]), "{dt} accumulates in f32");
+        }
+        assert_eq!(
+            narrow(DType::F32),
+            Err(ShapeError::MatMulOperandDtype {
+                a: DType::F32,
+                b: DType::F32
+            }),
+            "an f32 contraction has nothing to widen"
+        );
+        assert_eq!(
+            OpKind::matmul_f32_accumulate()
+                .infer(&[f(&[2, 3]), TensorType::new(vec![3, 4], DType::BF16)]),
+            Err(ShapeError::MatMulOperandDtype {
+                a: DType::F32,
+                b: DType::BF16
+            }),
+        );
+        assert_eq!(
+            OpKind::matmul()
+                .infer(&[
+                    TensorType::new(vec![2, 3], DType::BF16),
+                    TensorType::new(vec![3, 4], DType::BF16)
+                ])
+                .unwrap()
+                .dtype,
+            DType::BF16
+        );
     }
 
     #[test]
@@ -4635,7 +4771,7 @@ mod tests {
                 op: FusedOp::Unary(UnOp::Neg),
                 inputs: vec![FusedOperand::PackLane {
                     input: LocalId::new(0),
-                    lane: 0,
+                    lane: LaneId::new(0),
                 }],
             }],
             output: LocalId::new(1),
@@ -4653,7 +4789,7 @@ mod tests {
                 op: RedOp::Sum,
                 input: FusedOperand::PackLane {
                     input: LocalId::new(0),
-                    lane: 0,
+                    lane: LaneId::new(0),
                 },
             }],
             output: LocalId::new(1),
@@ -4686,7 +4822,7 @@ mod tests {
                 FusedOp::Unary(UnOp::Neg),
                 vec![FusedOperand::PackLane {
                     input: LocalId::new(input),
-                    lane,
+                    lane: LaneId::new(lane),
                 }],
             ))
         };
@@ -4868,7 +5004,7 @@ mod tests {
                 vec![i32_ty(&[2, 4])],
                 ShapeError::FusedOperand(FusedOperandReason::PackLaneWidth {
                     input: LocalId::new(0),
-                    lane: 4,
+                    lane: LaneId::new(4),
                     width: 4,
                 }),
             ),
@@ -4965,6 +5101,27 @@ mod tests {
         assert_eq!(hash(&iota(4, DType::F32)), hash(&iota(4, DType::F32)));
         assert_ne!(hash(&iota(4, DType::F32)), hash(&iota(5, DType::F32)));
         assert_ne!(hash(&iota(4, DType::F32)), hash(&iota(4, DType::I32)));
+    }
+
+    /// `accumulate` is a parameter of `MatMul`, so the fingerprint tells the plain form from the F32-accumulate one.
+    ///
+    /// Mutation: hash nothing for `OpKind::MatMul`; the two forms hash alike.
+    #[test]
+    fn matmul_hash_params_distinguish_the_accumulate_form() {
+        let hash = |op: &OpKind| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            op.hash_params(&mut hasher);
+            std::hash::Hasher::finish(&hasher)
+        };
+        let matmul = |accumulate| OpKind::MatMul { accumulate };
+        assert_eq!(
+            hash(&matmul(MatMulAccumulate::F32)),
+            hash(&matmul(MatMulAccumulate::F32))
+        );
+        assert_ne!(
+            hash(&matmul(MatMulAccumulate::Operand)),
+            hash(&matmul(MatMulAccumulate::F32))
+        );
     }
 
     /// Card 528a SC-003. `hash_params` is the content fingerprint that guards the wgpu CSE memo and decode
@@ -5226,8 +5383,8 @@ mod tests {
                     dtype.hash(h);
                 }
                 OpKind::Gather { axis } => axis.hash(h),
-                OpKind::Select | OpKind::ScatterUpdate | OpKind::MatMul | OpKind::IndexedMatMul => {
-                } // no params beyond the discriminant already hashed
+                OpKind::MatMul { accumulate } => accumulate.hash(h),
+                OpKind::Select | OpKind::ScatterUpdate | OpKind::IndexedMatMul => {} // no params beyond the discriminant already hashed
                 OpKind::ContractionEpilogue { head, region } => {
                     head.hash(h);
                     region.n_inputs.hash(h);

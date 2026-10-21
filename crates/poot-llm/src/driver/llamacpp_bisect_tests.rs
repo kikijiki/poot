@@ -456,7 +456,8 @@ mod checkpoint_rows {
             let meta = graph.meta(id);
             let value: Value = match meta.storage {
                 Storage::Const => {
-                    let name = meta.name.as_deref().expect("a const has a name");
+                    let name = meta.name().expect("a const has a name");
+                    let name = name.as_ref();
                     match ids_by_const.get(name) {
                         Some(&weight) => {
                             let WeightEntry::Dense(dense) = map.materialize(weight, store).unwrap()
