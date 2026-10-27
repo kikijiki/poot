@@ -134,12 +134,12 @@ describe("charts", () => {
     expect(CHART_METRICS.filter((m) => m.wholeRun).map((m) => m.key)).toEqual(["peak_rss_bytes", "peak_vram_bytes", "energy_j"]);
   });
 
-  test("a memory bar states the load peak beside the inference peak, or says it includes the load", () => {
+  test("a memory bar says it includes the load only when the run has no load boundary", () => {
     const GiB = 2 ** 30;
     const split = withMetrics("m", { peak_rss_bytes: stat(6 * GiB), load_rss_bytes: stat(26 * GiB) });
     const lifetime = withMetrics("m", { peak_rss_bytes: stat(53 * GiB) }, 128, "rocm");
     lifetime.memory_scope = "includes_load";
-    expect(runBars([split, lifetime], "peak_rss_bytes").map((b) => [b.label, b.note])).toEqual([["poot (ptx)", "26.00 GiB while loading"], ["poot (rocm)", "includes model load"]]);
+    expect(runBars([split, lifetime], "peak_rss_bytes").map((b) => [b.label, b.note])).toEqual([["poot (ptx)", null], ["poot (rocm)", "includes load"]]);
     expect(runBars([withMetrics("m", { energy_j: stat(1) })], "energy_j").map((b) => b.note)).toEqual([null]);
   });
 });

@@ -2,7 +2,7 @@
 // against the data (a pick the data cannot satisfy falls back), offered only the options that exist, and kept in the URL
 // query. The data is one workload family: rates over input tokens. Pure functions of the data, so the filtering and the
 // aggregation maths are tested without a browser.
-import { CHART_METRICS, GIB, LOAD_COMPANION, num, seriesId, seriesSlot, type Unit } from "./format";
+import { CHART_METRICS, MEMORY_METRICS, num, seriesId, seriesSlot, type Unit } from "./format";
 import type { Hardware, PerformanceData, Point, PointMetric, Stat } from "./types";
 
 // One column of the page: a hardware and a model.
@@ -149,14 +149,10 @@ export function legendSeries(points: Point[]): { id: string; label: string }[] {
 
 export type Bar = { id: string; label: string; value: number; verified: boolean; note: string | null; point: Point };
 
-// What a memory bar measures beyond its title: a run with no usable load boundary says its peak includes the load; any other states the
-// peak while loading beside the inference peak. Null for a metric that is not memory.
+// What a memory bar measures beyond its title: a run with no usable load boundary says its peak includes the load. Null otherwise
+// and for a metric that is not memory.
 export function memoryNote(p: Point, metric: PointMetric): string | null {
-  const companion = LOAD_COMPANION[metric];
-  if (!companion) return null;
-  if (p.memory_scope === "includes_load") return "includes model load";
-  const load = p.metrics[companion];
-  return load ? `${num(load.median, GIB)} ${GIB.suffix} while loading` : null;
+  return MEMORY_METRICS.includes(metric) && p.memory_scope === "includes_load" ? "includes load" : null;
 }
 
 function niceMax(value: number): number {

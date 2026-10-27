@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import data from "@site/src/data/performance.json";
 import Lines from "./Lines";
 import RunBars from "./RunBars";
-import { CHART_METRICS, LOAD_COMPANION, metricInfo, seriesColor } from "./format";
+import { CHART_METRICS, MEMORY_METRICS, metricInfo, seriesColor } from "./format";
 import { chartMetrics, defaultSecond, findHardware, fromQuery, options, resolve, selectPoints, legendSeries, runBars, seriesLines, toQuery, yTop, type Selection, type Side } from "./selection";
 import styles from "./performance.module.css";
 import type { Hardware, PerformanceData, PointMetric } from "./types";
@@ -77,7 +77,7 @@ function Column({ side, other, slots, onChange }: { side: Side; other?: Side; sl
             const bars = runBars(points, m.key);
             const otherBars = other ? runBars(otherPoints, m.key) : [];
             const top = Math.max(...[...bars, ...otherBars].map((b) => b.value * info.unit.scale));
-            return <RunBars key={m.key} title={m.title} subtitle={`${side.model}, ${info.unit.suffix} per run${LOAD_COMPANION[m.key] ? ", peak after the model is loaded and warmed up, load stated beside it" : ""}, ${direction}`} metric={m.key} bars={bars} top={other ? top : undefined} />;
+            return <RunBars key={m.key} title={m.title} subtitle={`${side.model}, ${info.unit.suffix} per run${MEMORY_METRICS.includes(m.key) ? ", after load and warmup" : ""}, ${direction}`} metric={m.key} bars={bars} top={other ? top : undefined} />;
           }
           const lines = seriesLines(points, m.key);
           return (
