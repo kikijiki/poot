@@ -20,8 +20,8 @@ export const CHART_METRICS: { key: PointMetric; title: string; wholeRun?: true }
   { key: "energy_j", title: "Energy (whole run)", wholeRun: true },
 ];
 
-// The inference-time memory metrics and the metric stating the same quantity during the load, shown as a note on the bar.
-export const LOAD_COMPANION: Partial<Record<PointMetric, PointMetric>> = { peak_rss_bytes: "load_rss_bytes", peak_vram_bytes: "load_vram_bytes" };
+// The whole-run memory metrics: peaks measured after the load and warmup.
+export const MEMORY_METRICS: PointMetric[] = ["peak_rss_bytes", "peak_vram_bytes"];
 
 export type MetricInfo = { key: PointMetric; label: string; unit: Unit; higherIsBetter: boolean };
 

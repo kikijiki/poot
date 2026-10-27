@@ -35,8 +35,7 @@ export type Point = {
   spread: Partial<Record<PointMetric, Spread>>;
   latest: boolean;
   verified: boolean;
-  // What the memory metrics measure: "inference" is the peak after the model is loaded and warmed up (the load peak is stated
-  // beside it); "includes_load" is the lifetime peak of a run whose load boundary could not be found.
+  // What the memory metrics measure: "inference" is the peak after the model is loaded and warmed up; "includes_load" is the lifetime peak of a run whose load boundary could not be found.
   memory_scope: "inference" | "includes_load";
   // The noise band of the headline metric as a fraction of its median.
   band: number;

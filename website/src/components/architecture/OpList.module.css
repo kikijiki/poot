@@ -1,0 +1,113 @@
+/* Graph IR op reference: one real table per op. Every table uses table-layout: fixed and the same colgroup widths
+   (defined once as variables on .ops), so label, name, shape and meaning columns align across every op on the page.
+   Name and shape cells never wrap; only meaning and notes do. Below the table's minimum width the container scrolls
+   rather than squashing a column. Spacing: 0.5rem cell padding. */
+
+.ops {
+  --col-label: 5rem;
+  --col-field: 12ch;
+  --col-shape: 22ch;
+  --col-meaning: 24rem;
+
+  margin: 1rem 0 2rem;
+}
+
+/* Each table sits in the site's `.table-scroll` frame (custom.css): hairline, rounded corners, scroll shadows. This
+   file only sets what is specific to the op tables: fixed layout and a minimum width below which the frame scrolls
+   rather than squeezing a column. Infima's zebra rows are reset so the layout is the one stated here. */
+.ops .table {
+  min-width: calc(var(--col-label) + var(--col-field) + var(--col-shape) + var(--col-meaning));
+  table-layout: fixed;
+  background: none;
+}
+
+.table tr,
+.table tr:nth-child(2n) {
+  background: none;
+  border: 0;
+}
+
+.table th,
+.table td {
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  vertical-align: baseline;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.col_label {
+  width: var(--col-label);
+}
+
+.col_field {
+  width: var(--col-field);
+}
+
+.col_shape {
+  width: var(--col-shape);
+}
+
+.col_meaning {
+  width: auto;
+}
+
+.title {
+  background: var(--ifm-color-emphasis-100);
+  font-family: var(--ifm-font-family-monospace);
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.name {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--ifm-font-color-base);
+}
+
+.params {
+  margin-left: 0.25rem;
+  font-size: 0.85rem;
+  color: var(--ifm-color-emphasis-600);
+}
+
+.table th.label {
+  background: var(--ifm-color-emphasis-100);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ifm-color-emphasis-600);
+}
+
+.table td.fieldName {
+  white-space: nowrap;
+}
+
+.fieldName code {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ifm-font-color-base);
+}
+
+.table td.shape {
+  white-space: nowrap;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8rem;
+  color: var(--ifm-color-emphasis-600);
+}
+
+.meaning {
+  color: var(--ifm-font-color-base);
+}
+
+.table td.notes {
+  line-height: 1.55;
+  color: var(--ifm-color-emphasis-700);
+}

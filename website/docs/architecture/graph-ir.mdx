@@ -4,8 +4,8 @@ title: The Graph IR
 sidebar_position: 2
 ---
 
-import OpTable from "@site/src/components/architecture/OpTable";
 import GraphDagDiagram from "@site/src/components/architecture/GraphDagDiagram";
+import OpList from "@site/src/components/architecture/OpList";
 
 # The Graph IR
 
@@ -54,7 +54,35 @@ A sparse-attention indexer writes its selection as primitive chains. The selecti
 
 No op records a kernel choice; which kernel runs an eqn is a property of its plan.
 
-<OpTable />
+### Elementwise
+
+Pointwise ops over one or two tensors; the output keeps the input shape, or the broadcast of the two.
+
+<OpList category="elementwise" />
+
+### Shape
+
+Ops that move or re-index elements without computing new values; several lower to a view or an alias.
+
+<OpList category="shape" />
+
+### Data
+
+Indexed reads and writes: embedding lookups, KV-cache access and MoE routing.
+
+<OpList category="data" />
+
+### Reduce
+
+Collapses one axis with a sum or a max.
+
+<OpList category="reduce" />
+
+### Compute
+
+Contractions, the compiler-introduced composites, and the tensor-parallel collectives.
+
+<OpList category="compute" />
 
 ## What composites decompose to
 

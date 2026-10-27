@@ -193,67 +193,6 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Op table (graph-ir page) */
-
-.opTableWrap {
-  margin: 1.5rem 0;
-}
-
-.opSearch {
-  width: 100%;
-  padding: 0.5rem 0.75rem;
-  border: 1px solid var(--ifm-color-emphasis-300);
-  border-radius: 6px;
-  font-size: 0.875rem;
-  margin-bottom: 0.75rem;
-  background: var(--ifm-background-color);
-  color: var(--ifm-font-color-base);
-}
-
-.opSearch:focus {
-  outline: none;
-  border-color: var(--ifm-color-primary);
-}
-
-.opTable {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.82rem;
-}
-
-.opTable th {
-  background: var(--ifm-color-emphasis-100);
-  padding: 0.4rem 0.75rem;
-  text-align: left;
-  font-weight: 600;
-  border-bottom: 2px solid var(--ifm-color-emphasis-200);
-}
-
-.opTable td {
-  padding: 0.4rem 0.75rem;
-  border-bottom: 1px solid var(--ifm-color-emphasis-100);
-  vertical-align: top;
-}
-
-.opTable tr:last-child td {
-  border-bottom: none;
-}
-
-.opCategory {
-  display: inline-block;
-  padding: 1px 7px;
-  border-radius: 4px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.catElemwise { background: color-mix(in srgb, var(--ifm-color-primary) 15%, transparent); color: var(--ifm-color-primary-darkest); }
-.catShape    { background: color-mix(in srgb, #6c8ebf 15%, transparent);                  color: #2c5f8a; }
-.catData     { background: color-mix(in srgb, #9b59b6 15%, transparent);                  color: #6c3483; }
-.catReduce   { background: color-mix(in srgb, #e67e22 15%, transparent);                  color: #935116; }
-.catCompute  { background: color-mix(in srgb, #27ae60 15%, transparent);                  color: #1a6e3c; }
-
 /* Fusion before/after toggle */
 
 .fusionToggle {

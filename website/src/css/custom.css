@@ -206,6 +206,21 @@
   overflow-wrap: anywhere;
 }
 
+/* A table whose last column is Notes (className set in src/theme/MDXComponents.tsx): only Notes wraps. The other
+   columns never break a token; when they do not fit, the `.table-scroll` frame scrolls. Notes keeps a readable width
+   instead of being squeezed to its longest word. */
+.table-notes-last th:not(:last-child),
+.table-notes-last td:not(:last-child),
+.table-notes-last td:not(:last-child) code {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.table-notes-last th:last-child,
+.table-notes-last td:last-child {
+  min-width: 24rem;
+}
+
 .markdown table th:last-child,
 .markdown table td:last-child {
   border-right-width: 0;
@@ -219,4 +234,16 @@
 /* The Performance page uses the full width of the content area: its tables and chart grids need it. */
 .container:has(.performance-root) {
   max-width: none;
+}
+
+/* Disclosure blocks (the Performance methodology) sit on the muted surface instead of Infima's saturated info alert colours. */
+details.alert {
+  --ifm-alert-background-color: var(--ifm-color-emphasis-100);
+  --ifm-alert-border-color: var(--ifm-color-emphasis-200);
+  --ifm-alert-foreground-color: var(--ifm-font-color-base);
+  --docusaurus-details-decoration-color: var(--ifm-color-emphasis-600);
+}
+
+[data-theme='dark'] details.alert {
+  --ifm-alert-background-color: var(--poot-surface);
 }
