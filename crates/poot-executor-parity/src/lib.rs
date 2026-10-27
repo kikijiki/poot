@@ -44,6 +44,7 @@ pub mod launch;
 pub mod live_attention;
 pub mod lora;
 pub mod packed;
+pub mod reference_blocks;
 pub mod routing;
 pub mod sample_token;
 pub mod scan;
@@ -405,7 +406,7 @@ pub fn planned_ops(fixture: &Fixture, target: Target) -> Vec<String> {
 /// A weight store of named dense tensors, each held as its own dtype (a BF16 tensor as its stored
 /// words, an I32 tensor as its words), for a fixture whose constants carry chosen data rather than
 /// [`store_for`]'s hash-seeded fill.
-fn store_from_tensors(entries: Vec<(&str, HostTensor)>) -> WeightStore {
+pub(crate) fn store_from_tensors(entries: Vec<(&str, HostTensor)>) -> WeightStore {
     let mut builder = WeightStore::builder();
     for (name, tensor) in entries {
         let dense = DenseWeight::try_new(
@@ -500,8 +501,27 @@ pub fn fixture_weights(fixture: &Fixture) -> Arc<poot_weights::WeightMap> {
     Arc::new(bound(fixture).1)
 }
 
-/// Compile `fixture.graph` for `target`, single-stage, single-device (Card 546a's only shape).
+/// Compile `fixture.graph` for the GPU `target`, single-stage, single-device (Card 546a's only shape). An NPU
+/// target needs the lowering its device owns: [`staged_on`].
 pub fn staged(fixture: &Fixture, target: Target) -> StagedProgram {
+    compile_fixture(
+        fixture,
+        target,
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+    )
+}
+
+/// [`staged`] for the device `exec` drives, compiled with the options that device takes
+/// ([`Executor::compile_options`]): the way to compile for an NPU.
+pub fn staged_on(exec: &dyn Executor, fixture: &Fixture, target: Target) -> StagedProgram {
+    compile_fixture(
+        fixture,
+        target,
+        &exec.compile_options(poot_graph_plan::CompileLimits::STANDARD),
+    )
+}
+
+fn compile_fixture(fixture: &Fixture, target: Target, options: &CompileOptions) -> StagedProgram {
     let g = bound(fixture).0;
     compile_staged(
         &g,
@@ -510,7 +530,7 @@ pub fn staged(fixture: &Fixture, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        options,
     )
     .unwrap()
 }
@@ -638,7 +658,7 @@ pub fn run_once(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &exec.compile_options(poot_graph_plan::CompileLimits::STANDARD),
     )
     .map_err(|e| format!("run_once: compile_staged: {e}"))?;
     let entry = exec
@@ -720,7 +740,7 @@ pub fn run_parity(
     let exe = exec
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
-    let program = staged(fixture, target);
+    let program = staged_on(exec, fixture, target);
     let class = program.numerics_class();
     let entry = exec
         .add_entry(exe, &program)
@@ -779,7 +799,7 @@ pub fn run_outputs(
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
     let entry = exec
-        .add_entry(exe, &staged(fixture, target))
+        .add_entry(exe, &staged_on(exec, fixture, target))
         .map_err(|e| format!("{}: add_entry: {e}", fixture.name))?;
     let mut outputs = Vec::with_capacity(fixture.steps.len());
     for (i, step) in fixture.steps.iter().enumerate() {
@@ -829,7 +849,7 @@ pub fn run_device_times(
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
     let entry = exec
-        .add_entry(exe, &staged(fixture, target))
+        .add_entry(exe, &staged_on(exec, fixture, target))
         .map_err(|e| format!("{}: add_entry: {e}", fixture.name))?;
     let step = fixture
         .steps
@@ -896,7 +916,7 @@ pub fn run_capture_replay(
     let exe = exec
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
-    let program = staged(fixture, target);
+    let program = staged_on(exec, fixture, target);
     let class = program.numerics_class();
     let entry = exec
         .add_entry(exe, &program)

@@ -19,11 +19,11 @@
 //! constructor is `unsafe`, called only by `poot-codegen`, so safe code here cannot mint one:
 //!
 //! ```compile_fail,E0133
-//! fn from_any_bytes(spv: &[u8]) -> poot_runtime_common::CompiledKernel {
-//!     poot_runtime_common::CompiledKernel::new(
+//! fn from_any_bytes(spv: &[u8]) -> poot_codegen::CompiledKernel {
+//!     poot_codegen::CompiledKernel::new(
 //!         poot_target::TargetId::Gpu(poot_target::Backend::SpirvVulkan),
 //!         "main",
-//!         poot_runtime_common::KernelCode::spirv_from_le_bytes(spv),
+//!         poot_codegen::KernelCode::spirv_from_le_bytes(spv),
 //!         Vec::new(),
 //!         false,
 //!     )
@@ -31,13 +31,14 @@
 //! ```
 //!
 //! ```compile_fail,E0451
-//! fn forge(code: poot_runtime_common::KernelCode) -> poot_runtime_common::CompiledKernel {
-//!     poot_runtime_common::CompiledKernel {
+//! fn forge(code: poot_codegen::KernelCode) -> poot_codegen::CompiledKernel {
+//!     poot_codegen::CompiledKernel {
 //!         target: poot_target::TargetId::Gpu(poot_target::Backend::SpirvVulkan),
 //!         entry_point: "main".into(),
 //!         code,
 //!         args: Vec::new().into(),
 //!         has_trap: false,
+//!         index_width: poot_kernel_ir::IndexWidth::Native,
 //!     }
 //! }
 //! ```

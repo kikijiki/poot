@@ -15,10 +15,12 @@
 //!   on the GPU from these (see import_run.rs);
 //! - workgroup-parallel kernels (spec 054): `local_index()`/`group_index()` are the within-group lane and
 //!   workgroup id (`ThreadIndexCall` LocalX/GroupX), `workgroup_barrier()` a `Barrier`, and
-//!   `wg_write(array,i,v)`/`wg_read(array,i)` access the workgroup-local (LDS) arrays. An imported argmax
-//!   (2 LDS arrays) matches kernelgen's `argmax_lds`, a GEMV matches `gemv_lds`, and an LDS
-//!   sum-reduction matches `wg_sum`. A `const WORKGROUP_SIZE: usize = N;` sets the body's lane count
-//!   (default 64). Every intrinsic above (plus `atomic_add`) is a real call into the `poot_kernel_intrinsics`
+//!   `wg_write(array,i,v)`/`wg_read(array,i)` access the workgroup-local (LDS) arrays. A kernel declares its
+//!   launch in `#[kernel(workgroup(x, y, z), lds(T, len), ..)]`, which the macro records as
+//!   `declare_workgroup`/`declare_lds` calls at the head of the body: the workgroup shape and, in call order,
+//!   each LDS array's element type and length. A kernel that reads a lane or workgroup index, calls the
+//!   barrier or touches an LDS array must declare its workgroup; one that uses an array must declare it, with
+//!   the element type its accesses name. Every intrinsic above (plus `atomic_add`) is a real call into the `poot_kernel_intrinsics`
 //!   crate; a kernel source depends on it and never redeclares its own stub. The importer recognizes an
 //!   intrinsic by the callee's resolved declaration (crate `poot_kernel_intrinsics` + item name), never by
 //!   the bare callee name, so a kernel-authored helper of the same name is an ordinary (rejected) call
@@ -36,7 +38,7 @@
 
 use poot_kernel_ir as kir;
 use rustc_public::mir as smir;
-use rustc_public::ty::{ConstantKind, FloatTy, IntTy, RigidTy, TyKind, UintTy};
+use rustc_public::ty::{ConstantKind, FloatTy, GenericArgKind, IntTy, RigidTy, TyKind, UintTy};
 use rustc_public::{CrateDef, CrateItem};
 
 type R<T> = Result<T, String>;
@@ -201,96 +203,160 @@ pub(crate) fn import_body(name: &str, body: &smir::Body) -> R<kir::Body> {
         }
     }
     let mut raw = kir::Body::new(name, param_count, locals, blocks);
-    // A kernel may declare its lane count with `const WORKGROUP_SIZE: usize = N;`, which sets
-    // `workgroup_size` to `[N, 1, 1]` (default 64), so a workgroup-parallel kernel can match its
-    // kernelgen twin (e.g. a GEMV at 128). Spec 054 FR-003.
-    if let Some(wg) = workgroup_size_from_body(body) {
-        raw.workgroup_size = [wg, 1, 1];
+    // The launch the kernel declared in `#[kernel(workgroup(..), lds(..))]` (see `declared_launch`).
+    let declared = declared_launch(body)?;
+    check_lds_accesses(body, &declared)?;
+    if let Some(shape) = declared.workgroup {
+        raw.workgroup_size = shape;
+    } else if let Some(use_) = needs_workgroup_declaration(&raw) {
+        return unsupported(format!(
+            "{use_} needs a declared workgroup shape: add `workgroup(..)` to the kernel's `#[kernel(..)]`"
+        ));
     }
-    // A kernel using the LDS intrinsics gets one workgroup-local array per array id it touches (argmax
-    // uses 2: values + indices), each sized to `workgroup_size[0]` lanes (emitted as `addrspace(3)`
-    // globals). Spec 054. A kernel whose LDS tile exceeds the lane count (a thread-coarsened tiled GEMM
-    // stages 2*ts*ts A elements with ts*ts lanes) declares `const LDS_SIZE: usize = N;` and every LDS
-    // array is sized to N.
-    if let Some(max_array) = max_lds_array(&raw) {
-        let len = lds_size_from_body(body).unwrap_or(raw.workgroup_size[0]);
-        raw.workgroup_locals = (0..=max_array)
-            .map(|_| kir::WorkgroupLocalDecl {
-                elem_ty: kir::Ty::F32,
-                len,
-            })
-            .collect();
-    }
+    raw.workgroup_locals = declared.lds;
     Ok(crate::normalize::normalize(raw))
 }
 
-/// The highest workgroup-local (LDS) array id any block touches, or `None` if the kernel uses no LDS. One `WorkgroupLocalDecl` per id `0..=max` is declared.
-fn max_lds_array(body: &kir::Body) -> Option<u8> {
-    body.blocks
-        .iter()
-        .flat_map(|bb| &bb.statements)
-        .filter_map(|s| match s {
-            kir::Statement::WorkgroupLocalWrite { array, .. } => Some(*array),
-            kir::Statement::Assign(_, kir::Rvalue::WorkgroupLocalRead { array, .. }) => {
-                Some(*array)
-            }
-            _ => None,
-        })
-        .max()
+/// A kernel's declared launch: what `#[kernel(workgroup(..), lds(..))]` recorded as `declare_workgroup` and
+/// `declare_lds` calls at the head of the body.
+struct DeclaredLaunch {
+    /// The workgroup shape, or `None` when the kernel declared none (the default 64 lanes along X applies to a
+    /// kernel with no lane-level cooperation).
+    workgroup: Option<[u32; 3]>,
+    /// The workgroup-local arrays, in declaration order: array id `n` is `lds[n]`.
+    lds: Vec<kir::WorkgroupLocalDecl>,
 }
 
-/// Read a `const WORKGROUP_SIZE: usize = N;` used by the kernel (it appears as a named Unevaluated
-/// const in the MIR) and return `N`, or `None` (default 64 applies). Scans operands in `Assign` rvalues
-/// and terminator call args.
-fn workgroup_size_from_body(body: &smir::Body) -> Option<u32> {
-    named_usize_const_from_body(body, "WORKGROUP_SIZE")
+/// The `poot_kernel_intrinsics` function the call `func` is, by its resolved declaration.
+fn intrinsic_call(func: &smir::Operand, body: &smir::Body) -> Option<String> {
+    callee_full_name(func, body).and_then(|path| kernel_intrinsic_name(&path).map(str::to_string))
 }
 
-/// Read a `const LDS_SIZE: usize = N;` used by the kernel and return `N`, sizing every LDS array to N.
-/// `None` sizes them to `workgroup_size[0]`. A coarsened tiled GEMM (A tile of 2*ts*ts elements staged by
-/// ts*ts lanes) declares `LDS_SIZE = 2*ts*ts`.
-fn lds_size_from_body(body: &smir::Body) -> Option<u32> {
-    named_usize_const_from_body(body, "LDS_SIZE")
-}
-
-/// Read a named `const NAME: usize = N;` used by the kernel (a named Unevaluated const in the MIR, as a
-/// stride, bound, or array size) and return `N`. Scans operands in `Assign` rvalues and terminator call
-/// args.
-fn named_usize_const_from_body(body: &smir::Body, name: &str) -> Option<u32> {
-    let from_operand = |op: &smir::Operand| -> Option<u32> {
-        let smir::Operand::Constant(c) = op else {
-            return None;
-        };
-        let ConstantKind::Unevaluated(uc) = c.const_.kind() else {
-            return None;
-        };
-        if uc.def.name().rsplit("::").next() == Some(name) {
-            return c.const_.eval_target_usize().ok().map(|v| v as u32);
-        }
-        None
+/// The first generic argument of the called function, as a type: `T` of `wg_read::<T>` / `declare_lds::<T>`.
+fn callee_type_arg(func: &smir::Operand, body: &smir::Body) -> R<rustc_public::ty::Ty> {
+    let ty = func
+        .ty(body.locals())
+        .map_err(|e| format!("callee type: {e}"))?;
+    let TyKind::RigidTy(RigidTy::FnDef(_, args)) = ty.kind() else {
+        return unsupported("an LDS intrinsic call that is not a direct function call");
     };
-    let from_rvalue = |rv: &smir::Rvalue| -> Option<u32> {
-        match rv {
-            smir::Rvalue::Use(op, _)
-            | smir::Rvalue::UnaryOp(_, op)
-            | smir::Rvalue::Cast(_, op, _) => from_operand(op),
-            smir::Rvalue::BinaryOp(_, a, b) => from_operand(a).or_else(|| from_operand(b)),
-            _ => None,
+    match args.0.first() {
+        Some(GenericArgKind::Type(ty)) => Ok(*ty),
+        _ => unsupported("an LDS intrinsic call without an element type"),
+    }
+}
+
+/// The element type of an LDS array: `f32`, `u32` or `i32`.
+fn lds_element_ty(ty: &rustc_public::ty::Ty) -> R<kir::Ty> {
+    match map_ty(ty)? {
+        element @ (kir::Ty::F32 | kir::Ty::U32 | kir::Ty::I32) => Ok(element),
+        other => unsupported(format!(
+            "workgroup-local array element type {other:?} (f32, u32 or i32)"
+        )),
+    }
+}
+
+/// A constant `usize` argument of a declaration call.
+fn declared_usize(op: &smir::Operand, what: &str) -> R<u32> {
+    match map_operand(op)? {
+        kir::Operand::Const(kir::Constant::Usize(n)) => {
+            u32::try_from(n).map_err(|_| format!("{what} {n} does not fit a u32"))
         }
+        _ => unsupported(format!("{what} must be a constant")),
+    }
+}
+
+/// Read the launch the kernel declared: the constants of its `declare_workgroup(x, y, z)` call and, in call
+/// order, the element type and length of each `declare_lds::<T>(len)` call. The macro puts these at the head of
+/// the body, so they are plain straight-line calls in the first blocks; each is dropped when the call terminator
+/// is translated.
+fn declared_launch(body: &smir::Body) -> R<DeclaredLaunch> {
+    let mut declared = DeclaredLaunch {
+        workgroup: None,
+        lds: Vec::new(),
     };
     for bb in &body.blocks {
-        for s in &bb.statements {
-            if let smir::StatementKind::Assign(_, rv) = &s.kind
-                && let Some(n) = from_rvalue(rv)
-            {
-                return Some(n);
-            }
-        }
-        if let smir::TerminatorKind::Call { args, .. } = &bb.terminator.kind {
-            for a in args {
-                if let Some(n) = from_operand(a) {
-                    return Some(n);
+        let smir::TerminatorKind::Call { func, args, .. } = &bb.terminator.kind else {
+            continue;
+        };
+        match intrinsic_call(func, body).as_deref() {
+            Some("declare_workgroup") if args.len() == 3 => {
+                let shape = [
+                    declared_usize(&args[0], "the workgroup extent")?,
+                    declared_usize(&args[1], "the workgroup extent")?,
+                    declared_usize(&args[2], "the workgroup extent")?,
+                ];
+                if shape.contains(&0) {
+                    return unsupported("a workgroup extent of 0");
                 }
+                if declared.workgroup.replace(shape).is_some() {
+                    return unsupported("the workgroup shape is declared twice");
+                }
+            }
+            Some("declare_lds") if args.len() == 1 => {
+                declared.lds.push(kir::WorkgroupLocalDecl {
+                    elem_ty: lds_element_ty(&callee_type_arg(func, body)?)?,
+                    len: declared_usize(&args[0], "the workgroup-local array length")?,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(declared)
+}
+
+/// Every `wg_read`/`wg_write` names a declared array and its declared element type.
+fn check_lds_accesses(body: &smir::Body, declared: &DeclaredLaunch) -> R<()> {
+    for bb in &body.blocks {
+        let smir::TerminatorKind::Call { func, args, .. } = &bb.terminator.kind else {
+            continue;
+        };
+        if !matches!(
+            intrinsic_call(func, body).as_deref(),
+            Some("wg_read" | "wg_write")
+        ) {
+            continue;
+        }
+        let array = const_lds_array(args.first().ok_or("an LDS access without an array id")?)?;
+        let Some(decl) = declared.lds.get(usize::from(array)) else {
+            return unsupported(format!(
+                "workgroup-local array {array} is used but not declared (declare it with `lds(T, len)`, in array-id order; {} declared)",
+                declared.lds.len()
+            ));
+        };
+        let accessed = lds_element_ty(&callee_type_arg(func, body)?)?;
+        if accessed != decl.elem_ty {
+            return unsupported(format!(
+                "workgroup-local array {array} is declared {:?} but accessed as {accessed:?}",
+                decl.elem_ty
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What in `body` needs a declared workgroup shape: a lane index, the barrier or an LDS access. Dispatch-level
+/// kernels (one thread per element, no cooperation) run at any width and need none.
+fn needs_workgroup_declaration(body: &kir::Body) -> Option<&'static str> {
+    use kir::IndexAxis::{LocalX, LocalY, LocalZ};
+    for bb in &body.blocks {
+        if let kir::Terminator::ThreadIndexCall {
+            dim: LocalX | LocalY | LocalZ,
+            ..
+        } = bb.terminator
+        {
+            return Some("a lane index (`local_index_*`)");
+        }
+        if matches!(bb.terminator, kir::Terminator::Barrier { .. }) {
+            return Some("the workgroup barrier");
+        }
+        for statement in &bb.statements {
+            match statement {
+                kir::Statement::WorkgroupLocalWrite { .. }
+                | kir::Statement::Assign(_, kir::Rvalue::WorkgroupLocalRead { .. }) => {
+                    return Some("a workgroup-local array");
+                }
+                _ => {}
             }
         }
     }
@@ -513,7 +579,7 @@ fn analyze_range_loops(body: &smir::Body) -> R<Loops> {
             if let smir::StatementKind::Assign(dest, rv) = &s.kind {
                 match rv {
                     smir::Rvalue::Aggregate(smir::AggregateKind::Adt(def, ..), ops)
-                        if def.name().contains("Range") && ops.len() == 2 =>
+                        if is_core_item(&def.name(), "ops::Range") && ops.len() == 2 =>
                     {
                         range_of.insert(dest.local, (map_operand(&ops[0])?, map_operand(&ops[1])?));
                     }
@@ -536,7 +602,7 @@ fn analyze_range_loops(body: &smir::Body) -> R<Loops> {
             destination,
             ..
         } = &bb.terminator.kind
-            && callee_last_seg(func, body).as_deref() == Some("into_iter")
+            && callee_is_core_item(func, body, "iter::IntoIterator::into_iter")
             && let Some(smir::Operand::Copy(p) | smir::Operand::Move(p)) = args.first()
             && p.projection.is_empty()
         {
@@ -577,14 +643,14 @@ fn analyze_range_loops(body: &smir::Body) -> R<Loops> {
         else {
             continue;
         };
-        if callee_last_seg(func, body).as_deref() != Some("next") {
+        if !callee_is_core_item(func, body, "iter::Iterator::next") {
             continue;
         }
         let TyKind::RigidTy(RigidTy::Adt(def, _)) = body.locals()[destination.local].ty.kind()
         else {
             continue;
         };
-        if !def.name().contains("Option") {
+        if !is_core_item(&def.name(), "option::Option") {
             continue;
         }
         let latch_block = bidx;
@@ -682,7 +748,7 @@ fn analyze_range_loops(body: &smir::Body) -> R<Loops> {
 
 /// Is `ty` a `RangeInclusive<_>` (the `a..=b` struct built by `RangeInclusive::new`)?
 fn is_range_inclusive_ty(ty: &rustc_public::ty::Ty) -> bool {
-    matches!(ty.kind(), TyKind::RigidTy(RigidTy::Adt(def, _)) if def.name().contains("RangeInclusive"))
+    matches!(ty.kind(), TyKind::RigidTy(RigidTy::Adt(def, _)) if is_core_item(&def.name(), "ops::RangeInclusive"))
 }
 
 /// Is `ty` a `&[T]`? `for x in slice` iterates such a param.
@@ -698,9 +764,13 @@ fn is_slice_ref_ty(ty: &rustc_public::ty::Ty) -> bool {
 fn is_iter_support_ty(ty: &rustc_public::ty::Ty) -> bool {
     fn is_plumbing_adt(ty: &rustc_public::ty::Ty) -> bool {
         if let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind() {
-            let n = def.name();
-            // `slice::Iter` is the `for x in slice` iterator, Range/RangeInclusive the range iterators, Option the `next()` result.
-            n.contains("Range") || n.contains("Option") || n.contains("Iter")
+            // `slice::Iter` is the `for x in slice` iterator, Range/RangeInclusive the range iterators, Option the
+            // `next()` result: exactly these `core` items, never a kernel-authored type that merely has such a word
+            // in its name.
+            matches!(
+                core_item(&def.name()),
+                Some("ops::Range" | "ops::RangeInclusive" | "option::Option" | "slice::Iter")
+            )
         } else {
             false
         }
@@ -1090,6 +1160,17 @@ fn map_terminator(
                 .as_deref()
                 .and_then(kernel_intrinsic_name)
             {
+                // A launch declaration (`#[kernel(workgroup(..), lds(..))]`): read up front by
+                // `declared_launch`, so the call itself lowers to nothing.
+                Some("declare_workgroup" | "declare_lds") => {
+                    let target = target.ok_or("diverging launch declaration")?;
+                    return Ok((
+                        vec![],
+                        kir::Terminator::Goto {
+                            target: map_block(target),
+                        },
+                    ));
+                }
                 Some("workgroup_barrier") => {
                     let target = target.ok_or("diverging workgroup_barrier")?;
                     return Ok((
@@ -1197,7 +1278,7 @@ fn map_terminator(
             }
             let callee = callee_last_seg(func, body).unwrap_or_else(|| "<opaque>".into());
             unsupported(format!(
-                "call to `{callee}` (only thread_index*()/local_index()/group_index(), unary float-math \
+                "call to `{callee}` (only the thread/local/group index intrinsics, unary float-math \
                  like `x.sqrt()`, `x.max()`/`x.min()`, the LDS intrinsics \
                  `workgroup_barrier()`/`wg_read()`/`wg_write()`, `atomic_add(buffer, index, value)`, and \
                  `no_contract_add(a, b)` are allowed in a kernel)"
@@ -1269,6 +1350,25 @@ fn callee_full_name(func: &smir::Operand, body: &smir::Body) -> Option<String> {
     Some(def.name())
 }
 
+/// The path of a `core`/`std` item below its crate (`std::ops::Range` -> `ops::Range`), whichever of the two crate
+/// names rustc prints for the item's DefId, or `None` for an item of any other crate. Items are compared whole,
+/// never by substring: a kernel type named `MyRange`, or a method named `next`, lives in the kernel's own crate and
+/// matches nothing here.
+fn core_item(path: &str) -> Option<&str> {
+    path.strip_prefix("std::")
+        .or_else(|| path.strip_prefix("core::"))
+}
+
+/// Whether `path` is exactly the `core`/`std` item `item` (`"ops::Range"`).
+fn is_core_item(path: &str, item: &str) -> bool {
+    core_item(path) == Some(item)
+}
+
+/// Whether the called function's DefId is exactly the `core`/`std` item `item` (`"iter::Iterator::next"`).
+fn callee_is_core_item(func: &smir::Operand, body: &smir::Body, item: &str) -> bool {
+    callee_full_name(func, body).is_some_and(|path| is_core_item(&path, item))
+}
+
 /// If `full_name` is a real `f32`/`f64` method (path ends in `f32::<method>` or `f64::<method>`),
 /// return the bare method name; otherwise `None`. A bare last-segment match would also accept a
 /// kernel helper of the same name in any module.
@@ -1289,20 +1389,11 @@ fn thread_index_axis(func: &smir::Operand, body: &smir::Body) -> Option<kir::Ind
     axis_from_name(kernel_intrinsic_name(&full)?)
 }
 
+/// The dispatch axis of the intrinsic `name` (the bare function name), from the table the intrinsics crate
+/// exports one function per entry of.
 fn axis_from_name(name: &str) -> Option<kir::IndexAxis> {
-    match name.rsplit("::").next()? {
-        // Global thread id (the grid index).
-        "thread_index" | "thread_index_x" => Some(kir::IndexAxis::X),
-        "thread_index_y" => Some(kir::IndexAxis::Y),
-        "thread_index_z" => Some(kir::IndexAxis::Z),
-        // Lane id within the workgroup (`0..workgroup_size_x`), used to address per-lane LDS slots. Card 044 / spec 054.
-        "local_index" | "local_index_x" => Some(kir::IndexAxis::LocalX),
-        "local_index_y" => Some(kir::IndexAxis::LocalY),
-        "local_index_z" => Some(kir::IndexAxis::LocalZ),
-        // Workgroup id (the row a per-row LDS reduction owns).
-        "group_index" | "group_index_x" => Some(kir::IndexAxis::GroupX),
-        "group_index_y" => Some(kir::IndexAxis::GroupY),
-        "group_index_z" => Some(kir::IndexAxis::GroupZ),
-        _ => None,
-    }
+    kir::naming::AXIS_INTRINSICS
+        .iter()
+        .find(|(intrinsic, _)| *intrinsic == name)
+        .map(|&(_, axis)| axis)
 }

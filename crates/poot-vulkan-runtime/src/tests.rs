@@ -1,7 +1,8 @@
 use crate::driver::ResourceDispatch;
 use crate::owner::{DeviceOwner, PipelineShape};
 use crate::resources::{allocate_buffer_resources, require_gpu_check_with};
-use poot_runtime_common::{BufferRole, CompiledKernel};
+use poot_codegen::CompiledKernel;
+use poot_runtime_common::BufferRole;
 use poot_target::BufferStorage;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};
@@ -371,7 +372,6 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
                 matrix_lowering: poot_target::MatrixLowering::None,
                 native_two_byte_floats: false,
                 widens_bf16_decode_weight: false,
-                imported_lds_array_bodies: false,
                 peer_transport: false,
                 decode_gemv_max_out_cols: None,
                 launch_class: poot_target::calibration::LaunchClass::Vulkan,
@@ -883,11 +883,11 @@ fn test_kernel(data_buffers: usize) -> CompiledKernel {
 
 fn test_kernel_with_code(data_buffers: usize, first_word: u32) -> CompiledKernel {
     // Never reaches the driver: every test below is refused before a pipeline is built.
-    let args: Vec<poot_runtime_common::ArgSchema> = (0..data_buffers)
+    let args: Vec<poot_codegen::ArgSchema> = (0..data_buffers)
         .map(|_| {
-            poot_runtime_common::ArgSchema::new(
+            poot_codegen::ArgSchema::new(
                 poot_target::ElementKind::F32,
-                poot_runtime_common::ArgAccess::Read,
+                poot_target::ArgAccess::Read,
             )
         })
         .collect();
@@ -897,7 +897,7 @@ fn test_kernel_with_code(data_buffers: usize, first_word: u32) -> CompiledKernel
         CompiledKernel::new(
             poot_target::TargetId::Gpu(poot_target::Backend::SpirvVulkan),
             "main",
-            poot_runtime_common::KernelCode::SpirvWords(Box::new([first_word])),
+            poot_codegen::KernelCode::SpirvWords(Box::new([first_word])),
             args,
             false,
         )
@@ -913,7 +913,7 @@ fn dispatch_refuses_a_buffer_count_other_than_the_kernels() {
         matches!(
             result,
             Err(RuntimeError::KernelArgs(
-                poot_runtime_common::KernelArgError::Count {
+                poot_codegen::KernelArgError::Count {
                     expected: 2,
                     actual: 1
                 }
@@ -1063,7 +1063,8 @@ fn a_dispatch_length_beyond_its_buffer_is_refused() {
 /// Bf16 and raw-byte exact-capacity rows are refused, `Err(ArgExceedsBuffer { elems: 8, capacity: 4 })`.
 #[test]
 fn a_dispatch_length_is_bounded_in_the_buffers_native_elements() {
-    use poot_runtime_common::{ArgAccess, ArgSchema};
+    use poot_codegen::ArgSchema;
+    use poot_target::ArgAccess;
     use poot_target::ElementKind;
     let (context, _mock) = mock_context(None);
     for (element, storage, native) in [
@@ -1092,7 +1093,7 @@ fn a_dispatch_length_is_bounded_in_the_buffers_native_elements() {
             matches!(
                 over,
                 Err(RuntimeError::ArgExceedsBuffer { arg: 0, elems, capacity })
-                    if elems == native + 1 && capacity == native as usize
+                    if elems == native + 1 && capacity == native
             ),
             "{element:?}: got {over:?}"
         );

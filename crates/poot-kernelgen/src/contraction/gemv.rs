@@ -7,32 +7,33 @@ use poot_kernel_ir::{
     Terminator, Ty,
 };
 
-use super::epilogue::{Epilogue, emit_epilogue};
+use super::GemvActivation;
+use super::epilogue::{BoundEpilogue, emit_epilogue};
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
-use crate::helpers::{Alloc, WeightLane, elem, guard};
+use crate::helpers::{Alloc, elem, guard};
 
-/// The epilogue a Gemv applies to each column's sum before its one store, and the buffers its leaves read.
-/// The body's output is f32, so the epilogue's dtype is f32 too.
-#[derive(Clone, Copy)]
-pub(crate) struct GemvEpilogue<'a> {
-    pub(crate) epilogue: &'a Epilogue,
-    pub(crate) leaves: &'a [Local],
-    /// How each leaf buffer reads back as a value ([`Epilogue::lanes`]).
-    pub(crate) lanes: &'a [Option<WeightLane>],
-}
-
-/// A [`super::Schedule::Gemv`]'s launch shape, checked once before emission: every extent at least one and
-/// `width` a multiple of `cols`, so each column owns exactly `width / cols` lanes.
+/// A [`super::Schedule::Gemv`]'s launch shape, checked once before emission: every extent at least one,
+/// `width` a multiple of `cols`, so each column owns exactly `width / cols` lanes, and a vector activation
+/// read only over runs of whole groups.
 #[derive(Clone, Copy)]
 pub(crate) struct GemvLaunch {
     width: usize,
     cols: usize,
     unroll: usize,
+    activation: GemvActivation,
 }
 
+/// The lanes of one [`GemvActivation::Vec4`] group read.
+const ACTIVATION_GROUP: usize = GemvActivation::VEC4_LANES;
+
 impl GemvLaunch {
-    pub(crate) fn new(width: u32, cols: u32, unroll: u32) -> Result<Self, KernelGenError> {
+    pub(crate) fn new(
+        width: u32,
+        cols: u32,
+        unroll: u32,
+        activation: GemvActivation,
+    ) -> Result<Self, KernelGenError> {
         for (what, value) in [("width", width), ("cols", cols), ("unroll", unroll)] {
             if value == 0 {
                 return Err(KernelGenError::BelowMinimum {
@@ -51,10 +52,20 @@ impl GemvLaunch {
                 divisor: cols as usize,
             });
         }
+        if activation == GemvActivation::Vec4 && !(unroll as usize).is_multiple_of(ACTIVATION_GROUP)
+        {
+            return Err(KernelGenError::NotDivisible {
+                generator: "contraction_gemv",
+                dim: "unroll (vector activation)".to_string(),
+                value: unroll as usize,
+                divisor: ACTIVATION_GROUP,
+            });
+        }
         Ok(Self {
             width: width as usize,
             cols: cols as usize,
             unroll: unroll as usize,
+            activation,
         })
     }
 
@@ -84,13 +95,14 @@ pub(crate) fn gemv_body(
     param_count: u32,
     [activation, metadata, out]: [Local; 3],
     launch: GemvLaunch,
-    epilogue: Option<GemvEpilogue>,
+    epilogue: Option<BoundEpilogue>,
     mut decode_run: impl FnMut(&mut Emit, Local, Local, usize, Local, Local) -> Vec<Local>,
 ) -> Body {
     let GemvLaunch {
         width,
         cols,
         unroll,
+        activation: activation_read,
     } = launch;
     let lanes_per_col = launch.lanes_per_col();
     let group = al.add(Ty::Usize, false);
@@ -190,17 +202,60 @@ pub(crate) fn gemv_body(
         },
     };
 
-    // `partial += activation[b, k] * w[k]` over the `count` elements `k0 ..`, left to right.
+    // `partial += activation[b, k] * w[k]` over the `count` elements `k0 ..`, left to right. A full run under
+    // `GemvActivation::Vec4` reads its activation values in groups of four (`act_base` is a multiple of four
+    // there: `K`, `k0` and `unroll` all are); the values and the order they meet the weights are the same.
     let mut accumulate = |e: &mut Emit, count: usize| {
         let values = decode_run(e, weight_row, k0, count, k, out_total);
         let act_base = bin(e, Ty::Usize, BinOp::Add, copy(act_row_base), copy(k0));
+        // The vector groups are read before the run's products; a scalar run reads each value as it meets it.
+        let grouped: Option<Vec<Local>> =
+            (activation_read == GemvActivation::Vec4 && count == unroll).then(|| {
+                let first_group = bin(
+                    e,
+                    Ty::Usize,
+                    BinOp::Div,
+                    copy(act_base),
+                    cu(ACTIVATION_GROUP),
+                );
+                (0..count / ACTIVATION_GROUP)
+                    .flat_map(|g| {
+                        let group_idx = bin(e, Ty::Usize, BinOp::Add, copy(first_group), cu(g));
+                        let group = e.let_(
+                            Ty::Vec {
+                                elem: Box::new(Ty::F32),
+                                lanes: ACTIVATION_GROUP as u32,
+                            },
+                            Rvalue::VectorLoad {
+                                place: elem(activation, group_idx),
+                            },
+                        );
+                        (0..ACTIVATION_GROUP as u32)
+                            .map(|lane| {
+                                e.let_(
+                                    Ty::F32,
+                                    Rvalue::VectorExtract {
+                                        vector: copy(group),
+                                        lane,
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            });
         let mut sum = partial;
         for (j, value) in values.into_iter().enumerate() {
-            let act_idx = bin(e, Ty::Usize, BinOp::Add, copy(act_base), cu(j));
-            let act = e.let_(
-                Ty::F32,
-                Rvalue::Use(Operand::Copy(elem(activation, act_idx))),
-            );
+            let act = match &grouped {
+                Some(acts) => acts[j],
+                None => {
+                    let act_idx = bin(e, Ty::Usize, BinOp::Add, copy(act_base), cu(j));
+                    e.let_(
+                        Ty::F32,
+                        Rvalue::Use(Operand::Copy(elem(activation, act_idx))),
+                    )
+                }
+            };
             let product = bin(e, Ty::F32, BinOp::Mul, copy(act), copy(value));
             sum = bin(e, Ty::F32, BinOp::Add, copy(sum), copy(product));
         }
@@ -305,7 +360,7 @@ pub(crate) fn gemv_body(
     let mut store = Emit::new(&mut al);
     let sum = store.read_lds(Ty::F32, 0, copy(lane));
     let value = match epilogue {
-        Some(GemvEpilogue {
+        Some(BoundEpilogue {
             epilogue,
             leaves,
             lanes,

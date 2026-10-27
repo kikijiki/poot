@@ -14,8 +14,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# The NPU rows emit a VPU region with poot-codegen and build its F16 inputs with poot-quant.
-poot-codegen.workspace = true
+# The NPU rows build the F16 inputs of their graphs with poot-quant.
 poot-quant.workspace = true
 
 [lints]

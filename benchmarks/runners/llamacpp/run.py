@@ -28,6 +28,27 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+def cpu_fallback(rows):
+    """The reason llama-bench ran on the CPU although `-ngl 99` asked for the GPU, or None. With no usable GPU
+    the tool still exits 0 and prints CPU numbers; a GPU cell must not report them. Each row names the backends
+    the build loaded and used (`backends`, e.g. "CUDA"); one that lists only CPU/BLAS ran on the host."""
+    for row in rows:
+        backends = {b.strip().upper() for b in str(row.get("backends", "")).split(",") if b.strip()}
+        if not backends - {"CPU", "BLAS"}:
+            return f"llama-bench ran on backends {row.get('backends')!r}, not a GPU (-ngl 99 was requested)"
+    return None
+
+
+def reported_backend(rows):
+    """The accelerator backend llama-bench loaded and used (lower case: "cuda", "vulkan", "rocm"), from the
+    `backends` field of its rows. A run that used only the host has no such backend: cpu_fallback refuses it first."""
+    for row in rows:
+        for backend in str(row.get("backends", "")).split(","):
+            if backend.strip().upper() not in ("", "CPU", "BLAS"):
+                return backend.strip().lower()
+    raise ValueError("llama-bench reported no accelerator backend")
+
+
 # Map the manifest precision to a converter outtype and an optional llama-quantize k-quant type. The
 # harness hands every framework the same safetensors checkpoint dir; llama.cpp is GGUF-only, so convert on
 # demand and cache the result in the dir. f16/bf16 convert directly; a k-quant (qN_k_m) converts to f16 then
@@ -72,14 +93,34 @@ def _convert_hf_to_gguf(hf_dir, precision):
     return q_path
 
 
+_SHARD = re.compile(r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$")
+
+
+def _first_shard(ggufs):
+    """The first shard of `ggufs` when they are exactly one complete split set (llama.cpp's `-0000N-of-0000M.gguf`
+    files), else None. llama.cpp loads the whole set from its first shard."""
+    shards = [_SHARD.match(f) for f in ggufs]
+    if not ggufs or not all(shards):
+        return None
+    stems = {m["stem"] for m in shards}
+    counts = {int(m["count"]) for m in shards}
+    if len(stems) != 1 or len(counts) != 1 or sorted(int(m["index"]) for m in shards) != list(range(1, counts.pop() + 1)):
+        return None
+    return next(m.string for m in shards if int(m["index"]) == 1)
+
+
 def resolve_gguf(gguf, precision="f16"):
-    """Resolve --gguf to a single .gguf file. If the dir holds no GGUF (the usual case: it's the HF
+    """Resolve --gguf to the .gguf file llama.cpp loads: a file as given (the first shard of a split set names the
+    set), a directory holding one GGUF or one complete shard set. If the dir holds no GGUF (the usual case: it's the HF
     safetensors checkpoint the harness hands every framework), convert on demand and cache in the dir."""
     if not os.path.isdir(gguf):
         return gguf
     ggufs = [f for f in os.listdir(gguf) if f.endswith(".gguf")]
     if len(ggufs) == 1:
         return os.path.join(gguf, ggufs[0])
+    first = _first_shard(ggufs)
+    if first is not None:
+        return os.path.join(gguf, first)
     if len(ggufs) == 0:
         return _convert_hf_to_gguf(gguf, precision)
     # More than one GGUF and no way to pick: prefer one matching the requested precision, else error.
@@ -111,7 +152,7 @@ def run_decode_curve(args):
                "ITL/TPOT is the llama-bench aggregate tg rate at depth (avg over -r reps), NOT a per-token distribution"]
     if args.precision.startswith("q") or "k_m" in args.precision:
         caveats.append(f"{args.precision} is a llama.cpp k-quant, not GPTQ/AWQ - bit-width parity only")
-    curve, version = [], "unknown"
+    curve, version, backend = [], "unknown", None
 
     def bench(extra):
         cmd = [BENCH, "-m", gguf, "-ngl", "99", "-r", reps, "-o", "json"] + extra
@@ -120,7 +161,13 @@ def run_decode_curve(args):
         if r.returncode != 0:
             log(f"llamacpp rc={r.returncode}: {(r.stderr or '')[-300:]}")
             return None
-        return json.loads(r.stdout)
+        rows = json.loads(r.stdout)
+        fallback = cpu_fallback(rows)
+        if fallback:
+            print(json.dumps({"framework": "llamacpp", "precision": args.precision, "mode": "decode-curve",
+                              "error": fallback}))
+            sys.exit(1)
+        return rows
 
     for isl in isls:
         pp_rows = bench(["-p", str(isl), "-n", "0"])              # prefill ISL tokens at depth 0 -> ttft
@@ -137,10 +184,11 @@ def run_decode_curve(args):
         ttft = (isl / pp_ts * 1000.0) if pp_ts else None
         tpot = 1000.0 / tg_ts
         e2e = (ttft or 0.0) + tpot * osl
+        backend = reported_backend(tg_rows)
         curve.append({"isl": isl, "prompt_tokens": isl,
                       "iters": [{"ttft_ms": ttft, "e2e_ms": e2e, "itl_ms": [tpot] * max(osl - 1, 0)}]})
-    print(json.dumps({"framework": "llamacpp", "framework_version": version, "precision": args.precision,
-                      "mode": "decode-curve", "osl": osl, "caveats": caveats, "curve": curve}))
+    print(json.dumps({"framework": "llamacpp", **({"backend": backend} if backend else {}), "framework_version": version,
+                      "precision": args.precision, "mode": "decode-curve", "osl": osl, "caveats": caveats, "curve": curve}))
 
 
 def main():
@@ -188,6 +236,10 @@ def main():
         sys.exit(1)
 
     rows = json.loads(r.stdout)
+    fallback = cpu_fallback(rows)
+    if fallback:
+        print(json.dumps({"framework": "llamacpp", "precision": args.precision, "error": fallback, "caveats": caveats}))
+        sys.exit(1)
     pp = next((x for x in rows if x.get("n_prompt", 0) > 0 and x.get("n_gen", 0) == 0), None)
     tg = next((x for x in rows if x.get("n_gen", 0) > 0 and x.get("n_prompt", 0) == 0), None)
     version = (pp or tg or {}).get("build_commit", "unknown")
@@ -201,6 +253,7 @@ def main():
 
     out = {
         "framework": "llamacpp",
+        "backend": reported_backend(rows),
         "framework_version": version,
         "precision": args.precision,
         "prompt_tokens": p_tokens,

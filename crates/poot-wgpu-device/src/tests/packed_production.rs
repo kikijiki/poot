@@ -159,7 +159,7 @@ fn packed_linear_case(
 /// Q8_0 at M=1 (decode, `Schedule::Gemv`) at these real dims is already covered end to end against a real
 /// GGUF checkpoint (`poot-llm`'s `probe_rocm_q8_0_decode_matches_cpu`,
 /// `q8_0_0p5b_gguf_ptx_decode_matches_cpu`), so this covers what those leave: Q8_0 at M=4 (ragged prefill,
-/// `Schedule::Tiled`) and Q4_0 at both M=1 and M=4 (no real-GGUF checkpoint in this repo stores a Q4_0
+/// `Schedule::RegisterTiled`) and Q4_0 at both M=1 and M=4 (no real-GGUF checkpoint in this repo stores a Q4_0
 /// tensor at these widths, so Q4_0's real-dims decode has no other coverage at all).
 ///
 /// Binds the weight as a `WeightEntry::Packed` source (never a dense f32 copy) and compares against a

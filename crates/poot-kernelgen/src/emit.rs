@@ -45,7 +45,7 @@ impl<'a> Emit<'a> {
     }
 
     /// `lds[array][idx] = value` (a workgroup-local write): the cooperative-load seam
-    /// `crate::packed`'s `Schedule::Tiled` writes its decoded weight and activation tile elements
+    /// the register-tiled body (`crate::contraction`'s `tiled_body`) writes its decoded weight and activation tile elements
     /// through.
     pub(crate) fn write_lds(&mut self, array: u8, idx: Operand, value: Operand) {
         self.stmts
@@ -171,6 +171,57 @@ pub(crate) fn emit_read_bits(e: &mut Emit, words: Local, bit: Local, width: u32)
     bin(e, Ty::U32, BinOp::BitAnd, copy(combined), c32(mask))
 }
 
+/// `chunks` consecutive 32-bit windows of `words` starting at bit `bit`: window `c` holds bits
+/// `bit + 32 * c ..` as a `u32`, whatever the alignment of `bit`. One load per word covered
+/// (`chunks + 1`), then one funnel shift per window, `(lo >> sh) | (hi << (32 - sh))` with the left
+/// shift split in two (`(hi << 1) << (31 - sh)`) so `sh == 0` never shifts by 32. This is the read a
+/// run of neighbouring fields shares: a run of `n` fields of `w` bits costs `n * w / 32 + 1` loads here,
+/// against two per field through [`emit_read_bits`].
+///
+/// The word at `bit / 32 + 1` is the zero guard word at worst; later words are clamped to the last word of
+/// the slice, so a window that reaches past the data reads the last word instead of past the buffer (the
+/// bits a caller extracts never lie there).
+pub(crate) fn emit_read_windows(
+    e: &mut Emit,
+    words: Local,
+    bit: Local,
+    chunks: usize,
+) -> Vec<Local> {
+    assert!(chunks >= 1, "emit_read_windows: no windows");
+    let first = bin(e, Ty::Usize, BinOp::Div, copy(bit), cu(32));
+    let bit_in_word = bin(e, Ty::Usize, BinOp::Rem, copy(bit), cu(32));
+    let shift = e.let_(
+        Ty::U32,
+        Rvalue::Cast {
+            to: Ty::U32,
+            operand: copy(bit_in_word),
+        },
+    );
+    let complement = bin(e, Ty::U32, BinOp::Sub, c32(31), copy(shift));
+    let len = e.let_(Ty::Usize, Rvalue::Len(Place::local(words)));
+    let last = bin(e, Ty::Usize, BinOp::Sub, copy(len), cu(1));
+    let loaded: Vec<Local> = (0..=chunks)
+        .map(|k| {
+            let at = bin(e, Ty::Usize, BinOp::Add, copy(first), cu(k));
+            let at = if k >= 2 {
+                bin(e, Ty::Usize, BinOp::Min, copy(at), copy(last))
+            } else {
+                at
+            };
+            e.let_(Ty::U32, Rvalue::Use(Operand::Copy(elem(words, at))))
+        })
+        .collect();
+    loaded
+        .windows(2)
+        .map(|pair| {
+            let low = bin(e, Ty::U32, BinOp::Shr, copy(pair[0]), copy(shift));
+            let once = bin(e, Ty::U32, BinOp::Shl, copy(pair[1]), c32(1));
+            let high = bin(e, Ty::U32, BinOp::Shl, copy(once), copy(complement));
+            bin(e, Ty::U32, BinOp::BitOr, copy(low), copy(high))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use poot_kernel_ir::interp::{Buffer, run};
@@ -245,5 +296,79 @@ mod tests {
         // zero here) must contribute nothing.
         let words = [0x8000_0000u32, 0];
         assert_eq!(read_at(&words, 31, 1), 1);
+    }
+
+    /// A one-thread body that stores `chunks` windows of [`emit_read_windows`] at bit `bit` of `words`, bitcast to
+    /// `f32` (the interpreter has no `u32` readback), into `out[0..chunks]`.
+    fn windows_body(bit: usize, chunks: usize) -> Body {
+        let mut al = Alloc::new(vec![
+            ld(Ty::Unit, false),
+            ld(slice_dtype(Ty::U32, false), false),
+            ld(slice_f32(true), true),
+        ]);
+        let (words, out) = (local(1), local(2));
+        let mut emit = Emit::new(&mut al);
+        let bit_local = emit.let_(Ty::Usize, Rvalue::Use(cu(bit)));
+        let windows = emit_read_windows(&mut emit, words, bit_local, chunks);
+        for (c, window) in windows.into_iter().enumerate() {
+            let as_f32 = emit.let_(
+                Ty::F32,
+                Rvalue::Bitcast {
+                    to: Ty::F32,
+                    operand: copy(window),
+                },
+            );
+            let at = emit.let_(Ty::Usize, Rvalue::Use(cu(c)));
+            emit.assign(elem(out, at), Rvalue::Use(copy(as_f32)));
+        }
+        let block = BasicBlock {
+            statements: emit.take(),
+            terminator: Terminator::Return,
+        };
+        Body::new("read_windows_probe", 2, al.locals, vec![block])
+    }
+
+    fn windows_at(words: &[u32], bit: usize, chunks: usize) -> Vec<u32> {
+        let body = windows_body(bit, chunks);
+        let mut buffers = [
+            Buffer::from_u32s(words),
+            Buffer::from_f32s(&vec![0.0; chunks]),
+        ];
+        run(&body, workgroups_covering(&body, 1), &mut buffers).unwrap();
+        buffers[1]
+            .to_f32s()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Bits `at .. at + 32` of `words` read one bit at a time, zero past the last word.
+    fn scalar_window(words: &[u32], at: usize) -> u32 {
+        (0..32).fold(0u32, |acc, k| {
+            let bit = at + k;
+            let set = words
+                .get(bit / 32)
+                .is_some_and(|word| word >> (bit % 32) & 1 == 1);
+            acc | u32::from(set) << k
+        })
+    }
+
+    /// Every window at every start bit of the data words (the last word is the zero guard): `bit % 32 == 0`
+    /// (the funnel's shift is 0, so `hi << 32` would be undefined unless split), the last data bit, and one to
+    /// three windows, whose later words clamp to the last word of the slice and so read the zero guard.
+    /// Mutation: `31 - shift` -> `30 - shift` in `emit_read_windows`; every start bit but 0 goes red.
+    #[test]
+    fn windows_equal_the_scalar_read_at_every_start_bit() {
+        let words = [0xdead_beef_u32, 0x1234_5678, 0x8000_0001, 0xffff_0000, 0];
+        for chunks in 1..=3 {
+            for bit in 0..(words.len() - 1) * 32 {
+                let got = windows_at(&words, bit, chunks);
+                let want: Vec<u32> = (0..chunks)
+                    .map(|c| scalar_window(&words, bit + 32 * c))
+                    .collect();
+                assert_eq!(got, want, "bit {bit}, {chunks} window(s)");
+            }
+        }
     }
 }

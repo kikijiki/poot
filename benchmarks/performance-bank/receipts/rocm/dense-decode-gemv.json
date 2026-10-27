@@ -6,63 +6,63 @@
       "repeats": [
         {
           "metrics": {
-            "step_us": 2371.099
+            "step_us": 285.154
           },
           "slot": 0,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2357.294
+            "step_us": 283.951
           },
           "slot": 1,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2341.764
+            "step_us": 298.228
           },
           "slot": 2,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2361.201
+            "step_us": 284.041
           },
           "slot": 3,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2372.442
+            "step_us": 295.20300000000003
           },
           "slot": 4,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2355.811
+            "step_us": 295.77299999999997
           },
           "slot": 5,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2507.676
+            "step_us": 284.843
           },
           "slot": 6,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2331.596
+            "step_us": 293.038
           },
           "slot": 7,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2370.558
+            "step_us": 294.431
           },
           "slot": 8,
           "status": "ok"
@@ -99,13 +99,13 @@
     "weight_copies": 16
   },
   "plan": [
-    "imported:gemvcoalesced [0dca0862148b7aa9025b6c35c312b63e8b982b6b16362aec95c4dbcb3f5a4e17]"
+    "contraction:gemv_chunk [63c5cee97bcef720c86a4aae4ee22812baec8b9cf2f0cde4dc78ab433e42dbbf]"
   ],
-  "plan_id": "2d60ca76dad0c3c691e98637dc9f674d76b03dad90d1b849dd3c5b89abe293cd",
+  "plan_id": "434c2aad736034d9b9e7f476e57961e09e986fcff89c1301c551539d919de04c",
   "recordings": 16,
   "reference": {
     "agrees": true,
-    "max_relative_error": 1.5774541433770534e-05,
+    "max_relative_error": 4.792419894831075e-06,
     "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
     "provenance": "independent-golden",
     "tolerance": 0.002
@@ -118,7 +118,7 @@
     "run",
     "--release",
     "-p",
-    "poot-rocm-gpu",
+    "poot-rocm-device",
     "--example",
     "performance_bank",
     "--",
@@ -129,8 +129,8 @@
     "--out",
     "benchmarks/performance-bank/receipts/rocm/dense-decode-gemv.json"
   ],
-  "parent_revision": "e178f51722183668cf2f554e21b0dca17d3b0caf",
-  "binary_sha256": "7a8e978a9087ff303dd4f147cc5d1bb86a841f8b46790086293ff7e5c02f0928",
+  "parent_revision": "21da98dafbdbc5887ce2943f1e7609381412b01c",
+  "binary_sha256": "fa7cc4a1a9eed9df3b6d92017c74dca3232fb97ed7f7a979028b73f4895caf65",
   "identity": {
     "checkpoint_digest": "synthetic-no-checkpoint",
     "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
@@ -163,7 +163,7 @@
     },
     "backend": "rocm",
     "device": "AMD Radeon 8060S Graphics",
-    "driver": "host kernel 7.2.9"
+    "driver": "host kernel 7.3.0"
   },
   "identity_digest": "ddf91990536c590e6c03a698de2f57569f07b1e6cb7ef9307e494694d835d35f",
   "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"

@@ -30,15 +30,16 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use poot_executor::{AieInvocation, Arg, Device, DeviceTime, Dispatch, LaunchKind};
-use poot_graph_plan::Target;
-use poot_runtime_common::{
-    AieLinkedArtifact, AllocGuard, ArgAccess, BufferRole, CompiledKernel, KernelCode,
-    MemoryCounterSnapshot, MemoryCounters,
-};
+use poot_codegen::{CompiledKernel, KernelCode};
+use poot_executor::{Arg, Device, DeviceTime, Dispatch, LaunchKind, RegionLoader};
+use poot_graph_plan::{NpuTarget, Target};
+use poot_npu_artifacts::{AieInvocation, AieLinkedArtifact};
+use poot_runtime_common::{AllocGuard, BufferRole, MemoryCounterSnapshot, MemoryCounters};
+use poot_target::ArgAccess;
 use poot_target::aie::RegionLimits;
 use poot_target::{AieCaps, AieTargetId, BufferStorage, Queried, TargetId};
 
+use crate::region_loader::AieRegionLoader;
 use crate::xrt::{XrtBo, XrtDevice, XrtError, XrtKernel};
 
 /// The data buffer arguments of the kernel the IRON link driver builds: the NPU firmware's dispatch ABI is
@@ -304,6 +305,8 @@ pub struct XdnaRecording(Rc<[Op]>);
 pub struct XdnaDevice {
     device: XrtDevice,
     caps: AieCaps,
+    /// Links this device's regions for the engine (see [`RegionLoader`]).
+    loader: AieRegionLoader,
     counters: MemoryCounters,
     run_timeout: Duration,
     open: Option<Vec<Op>>,
@@ -359,6 +362,7 @@ impl XdnaDevice {
         Ok(Self {
             device,
             caps,
+            loader: AieRegionLoader::new(caps),
             counters: MemoryCounters::new(),
             run_timeout: config.run_timeout,
             open: None,
@@ -519,10 +523,14 @@ impl Device for XdnaDevice {
     }
 
     fn target(&self) -> Target {
-        Target::Aie {
+        Target::Npu(NpuTarget::Aie {
             target: self.caps.target,
             caps: self.caps,
-        }
+        })
+    }
+
+    fn region_loader(&self) -> Option<&dyn RegionLoader> {
+        Some(&self.loader)
     }
 
     fn memory(&self) -> Vec<(BufferRole, MemoryCounterSnapshot)> {
@@ -849,7 +857,7 @@ fn check_bindings(kernel: &LoadedKernel, args: &[&Arg<'_, XdnaDevice>]) -> Resul
                 binding.storage, arg.buffer.0.storage
             )));
         }
-        if u64::from(arg.elems) != binding.elements {
+        if arg.elems as u64 != binding.elements {
             return Err(refuse(format!(
                 "binding {index} is {} elements, the dispatch binds {}",
                 binding.elements, arg.elems

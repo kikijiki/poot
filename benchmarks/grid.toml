@@ -1,0 +1,235 @@
+# The standing benchmark grid (owner decision 2026-10-24): every cell the Performance page is expected to show.
+#
+# A cell is (machine, model, framework, backend, scenario). The model, framework and scenario come from
+# manifest.toml; the scenario names the context lengths (`isl`) the cell must hold. `harness/grid.py` checks this
+# file against website/src/data/performance.json (`just grid-check`, run by `site-check` and the harness tests):
+#
+#   (no status)  required: every context length of the scenario has a verified point of at least `repeats` repeats
+#   pending      required, not run yet: allowed, listed in the report, and a failure under `grid.py check --strict`
+#                (the release gate)
+#   not-run      deliberately not run: needs a `reason`
+#
+# A group lists models x engines for one machine and scenario; its cells share its status, reason and repeats.
+# Re-run on a release (or when a kernel changes), not continuously. Design: backstage designs/benchmark-grid.md.
+
+# Repeats every cell needs (the verdict minimum, manifest.toml [performance] min_trials).
+repeats = 5
+
+# ----------------------------------------------------------------------------------------------
+# Machines. `hardware` is the id of the machine's entry in performance.json.
+# ----------------------------------------------------------------------------------------------
+[[machine]]
+id = "strix-halo"
+hardware = "amd-radeon-8060s-graphics"
+label = "Strix Halo, the local box (pause combeanie first: it shares the GPU)"
+
+# One RunPod machine, SECURE cloud only (community hosts are unstable: dead GPUs, slow uplinks). The orchestrator
+# reads these three fields through `grid.py machine nvidia-rtx-pro-6000`.
+[[machine]]
+id = "nvidia-rtx-pro-6000"
+hardware = "nvidia-rtx-pro-6000-blackwell"
+label = "RunPod RTX PRO 6000 Blackwell 96 GB, secure cloud"
+cloud = "secure"
+gpu_types = ["NVIDIA RTX PRO 6000 Blackwell Server Edition", "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"]
+max_price_per_hour = 2.7
+
+# ----------------------------------------------------------------------------------------------
+# Strix Halo: poot wgpu, Vulkan and ROCm, llama.cpp Vulkan.
+# ----------------------------------------------------------------------------------------------
+[[group]]
+machine = "strix-halo"
+scenario = "decode-curve"
+models = ["qwen3-0.6b", "qwen3-4b"]
+engines = [
+  { framework = "poot", backend = "wgpu" },
+  { framework = "llamacpp", backend = "vulkan" },
+]
+
+[[group]]
+machine = "strix-halo"
+scenario = "decode-curve"
+models = ["qwen3-0.6b"]
+engines = [
+  { framework = "poot", backend = "vulkan" },
+  { framework = "poot", backend = "rocm" },
+]
+
+[[group]]
+machine = "strix-halo"
+scenario = "decode-curve"
+models = ["qwen3-4b"]
+engines = [
+  { framework = "poot", backend = "vulkan" },
+]
+
+[[group]]
+machine = "strix-halo"
+scenario = "decode-curve"
+models = ["qwen3-4b"]
+engines = [
+  { framework = "poot", backend = "rocm" },
+]
+
+[[group]]
+machine = "strix-halo"
+scenario = "decode-curve"
+models = ["qwen3-4b-q4km"]
+engines = [
+  { framework = "poot", backend = "wgpu" },
+  { framework = "poot", backend = "vulkan" },
+  { framework = "poot", backend = "rocm" },
+  { framework = "llamacpp", backend = "vulkan" },
+]
+
+# gpt-oss-20b: poot cannot load its MXFP4 weights yet (a poot feature gap, tracked by a card): the poot cells are
+# not run; the llama.cpp reference is still measured.
+[[group]]
+machine = "strix-halo"
+scenario = "decode-curve"
+status = "not-run"
+reason = "gpt-oss-20b is skipped for the benchmarks until poot can load MXFP4: a llama.cpp-only row compares nothing"
+models = ["gpt-oss-20b"]
+engines = [
+  { framework = "llamacpp", backend = "vulkan" },
+]
+
+[[group]]
+machine = "strix-halo"
+scenario = "decode-curve"
+status = "not-run"
+reason = "poot cannot load gpt-oss-20b's MXFP4 weights yet (unsupported MXFP4 load); skipped for the benchmarks until poot supports it"
+models = ["gpt-oss-20b"]
+engines = [
+  { framework = "poot", backend = "wgpu" },
+  { framework = "poot", backend = "vulkan" },
+  { framework = "poot", backend = "rocm" },
+]
+
+# The large rows: ROCm and llama.cpp only.
+[[group]]
+machine = "strix-halo"
+scenario = "decode-curve-large"
+models = ["qwen3.8-27b-q4"]
+engines = [
+  { framework = "poot", backend = "rocm" },
+  { framework = "llamacpp", backend = "vulkan" },
+]
+
+[[group]]
+machine = "strix-halo"
+scenario = "decode-curve-large"
+models = ["qwen3.8-flash-next-q2"]
+engines = [
+  { framework = "llamacpp", backend = "vulkan" },
+]
+
+[[group]]
+machine = "strix-halo"
+scenario = "decode-curve-large"
+models = ["qwen3.8-flash-next-q2"]
+engines = [
+  { framework = "poot", backend = "rocm" },
+]
+
+[[group]]
+machine = "strix-halo"
+scenario = "decode-curve-large"
+status = "not-run"
+reason = "too slow (a poot wgpu 27B repeat takes ~37 min)"
+models = ["qwen3.8-27b-q4"]
+engines = [
+  { framework = "poot", backend = "wgpu" },
+  { framework = "poot", backend = "vulkan" },
+]
+
+[[group]]
+machine = "strix-halo"
+scenario = "decode-curve-large"
+status = "not-run"
+reason = "refused at plan time (measured 2026-10-27, 18-34 s): the 26.8 GiB per-layer embedding table is a packed source of 230401105952 bits, over the 4294967295 bits the SPIR-V kernels address (PackedSourceAddressing), so the prefill chunk cannot be fitted; it is not a speed limit"
+models = ["qwen3.8-flash-next-q2"]
+engines = [
+  { framework = "poot", backend = "wgpu" },
+  { framework = "poot", backend = "vulkan" },
+]
+
+# ----------------------------------------------------------------------------------------------
+# NVIDIA RTX PRO 6000: poot PTX, llama.cpp CUDA, transformers, candle (candle only on the two bf16 qwen3 rows).
+# ----------------------------------------------------------------------------------------------
+[[group]]
+machine = "nvidia-rtx-pro-6000"
+scenario = "decode-curve"
+models = ["qwen3-0.6b", "qwen3-4b"]
+engines = [
+  { framework = "poot", backend = "ptx" },
+  { framework = "llamacpp", backend = "cuda" },
+  { framework = "candle", backend = "cuda" },
+]
+
+# Measured with a cu130 torch (the pod's blackwell-torch.sh step), 5 repeats; the torch build is in each row's framework_version.
+[[group]]
+machine = "nvidia-rtx-pro-6000"
+scenario = "decode-curve"
+models = ["qwen3-0.6b", "qwen3-4b"]
+engines = [
+  { framework = "transformers", backend = "cuda" },
+]
+
+[[group]]
+machine = "nvidia-rtx-pro-6000"
+scenario = "decode-curve"
+models = ["qwen3-4b-q4km"]
+engines = [
+  { framework = "poot", backend = "ptx" },
+  { framework = "llamacpp", backend = "cuda" },
+]
+
+[[group]]
+machine = "nvidia-rtx-pro-6000"
+scenario = "decode-curve"
+status = "not-run"
+reason = "gpt-oss-20b is removed from the benchmarks and the website (owner, 2026-10-24); a llama.cpp-only row compares nothing"
+models = ["gpt-oss-20b"]
+engines = [
+  { framework = "llamacpp", backend = "cuda" },
+]
+
+[[group]]
+machine = "nvidia-rtx-pro-6000"
+scenario = "decode-curve"
+status = "not-run"
+reason = "poot cannot load gpt-oss-20b's MXFP4 weights yet (unsupported MXFP4 load); skipped for the benchmarks until poot supports it"
+models = ["gpt-oss-20b"]
+engines = [
+  { framework = "poot", backend = "ptx" },
+]
+
+[[group]]
+machine = "nvidia-rtx-pro-6000"
+scenario = "decode-curve"
+status = "not-run"
+reason = "transformers fails to run gpt-oss-20b (SDPA ValueError, deterministic on the pod image's transformers version)"
+models = ["gpt-oss-20b"]
+engines = [
+  { framework = "transformers", backend = "cuda" },
+]
+
+[[group]]
+machine = "nvidia-rtx-pro-6000"
+scenario = "decode-curve-large"
+models = ["qwen3.8-27b-q4"]
+engines = [
+  { framework = "poot", backend = "ptx" },
+  { framework = "llamacpp", backend = "cuda" },
+]
+
+# Measured and verified on the RTX PRO 6000 Server (4 lengths x 5 repeats): the two lengths of the large scenario are
+# among them, so the cells are satisfied by the existing data.
+[[group]]
+machine = "nvidia-rtx-pro-6000"
+scenario = "decode-curve-large"
+models = ["qwen3.8-flash-next-q2"]
+engines = [
+  { framework = "poot", backend = "ptx" },
+  { framework = "llamacpp", backend = "cuda" },
+]

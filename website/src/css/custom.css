@@ -6,7 +6,7 @@
 
 /*
  * poot palette. Coral puff on warm ink.
- *   ink      #1a1420  (dark background, hero, footer)
+ *   ink      #1a1420  (dark background, hero)
  *   surface  #241c2b  (dark cards and surfaces)
  *   rose     #d1344f  (primary, light mode)
  *   coral    #ff8fa3  (primary, dark mode)
@@ -33,7 +33,6 @@
   --ifm-code-font-size: 92%;
   --ifm-code-border-radius: 0.3rem;
   --ifm-global-radius: 0.5rem;
-  --ifm-footer-background-color: var(--poot-ink);
   --docusaurus-highlighted-code-line-bg: rgba(209, 52, 79, 0.1);
 }
 
@@ -72,18 +71,23 @@
   height: 1.9rem;
 }
 
-/* Footer: same ink as the hero in both modes. */
-.footer--dark {
-  --ifm-footer-background-color: var(--poot-ink);
-  border-top: 1px solid var(--poot-line);
-}
-
-/* Sidebar: mark the active page with a bar in the primary color. */
+/* Sidebar: the active page is bold on Infima's tinted background (no edge bar: the website rules forbid left-edge accents). */
 .menu__link--active:not(.menu__link--sublist) {
-  box-shadow: inset 3px 0 0 var(--ifm-color-primary);
+  font-weight: 600;
 }
 
-/* Shared matrix status badges (the feature-matrix markdown tables). */
+/* Admonitions and quotes are tinted boxes, not a coloured bar on the left edge. */
+:root {
+  --ifm-alert-border-left-width: 1px;
+  --ifm-blockquote-border-left-width: 0;
+}
+
+.markdown blockquote {
+  background: var(--ifm-color-emphasis-100);
+  border-radius: 0.4rem;
+}
+
+/* Shared matrix status badges (the supported-models markdown tables). */
 .matrix-status {
   display: inline-block;
   font-weight: 700;
@@ -157,7 +161,62 @@
   background: rgba(156, 163, 175, 0.2);
 }
 
-/* Feature-matrix page: style status badges inside ordinary markdown tables. */
+/* Supported-models page: style status badges inside ordinary markdown tables. */
 .markdown table td .matrix-status {
   margin-right: 0.15rem;
+}
+
+/* Tables. The `.table-scroll` wrapper (src/theme/MDXComponents.tsx) carries the hairline frame, the rounded corners
+   and the scroll shadows; the table inside fills the frame and wraps its cells, so it only scrolls when a cell has no
+   break point left. The cells draw the grid (right and bottom hairlines). */
+.table-scroll {
+  margin-bottom: var(--ifm-spacing-vertical);
+  overflow-x: auto;
+  border: 1px solid var(--ifm-table-border-color);
+  border-radius: 10px;
+  /* Scroll shadows: a shadow shows on the edge that has more to scroll to. The `local` covers move with the
+     content and hide the `scroll` shadows once the edge is reached. */
+  background:
+    linear-gradient(to right, var(--scroll-cover, var(--ifm-background-color)) 30%, transparent) left center / 28px 100% no-repeat local,
+    linear-gradient(to left, var(--scroll-cover, var(--ifm-background-color)) 30%, transparent) right center / 28px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, rgba(0, 0, 0, 0.3), transparent) left center / 12px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, rgba(0, 0, 0, 0.3), transparent) right center / 12px 100% no-repeat scroll;
+}
+
+.table-scroll > table {
+  display: table;
+  width: 100%;
+  min-width: 100%;
+  margin: 0;
+  border: 0;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.markdown table th,
+.markdown table td {
+  border-width: 0 1px 1px 0;
+  border-style: solid;
+  border-color: var(--ifm-table-border-color);
+  overflow-wrap: anywhere;
+}
+
+.markdown table td code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.markdown table th:last-child,
+.markdown table td:last-child {
+  border-right-width: 0;
+}
+
+.markdown table tbody tr:last-child td,
+.markdown table:not(:has(tbody)) tr:last-child td {
+  border-bottom-width: 0;
+}
+
+/* The Performance page uses the full width of the content area: its tables and chart grids need it. */
+.container:has(.performance-root) {
+  max-width: none;
 }

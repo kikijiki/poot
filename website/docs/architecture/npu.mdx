@@ -1,153 +1,166 @@
 ---
 id: npu
 title: NPU Offload
-sidebar_position: 12
+sidebar_position: 13
 ---
 
 # NPU Offload
 
-:::note[Experimental, correctness-scoped]
-Two NPUs run a narrow set of programs through the ordinary pipeline: AMD's XDNA2 and Intel's NPU4 (Lunar
-Lake). Neither is a serving backend and neither has a `--backend` option: each is a library `Device`
-(`poot-npu`, behind its `xdna` feature under the repository's `nix develop .#npu` shell, and its `vpu`
-feature under `nix develop .#npu-intel`).
+This page states what the two experimental NPU devices run, with their numerical contracts and refusals.
 
-Planned: prefill on an NPU, which produces the KV cache that another device decodes from. That handoff is
-not implemented. The generated [feature matrix](../reference/feature-matrix.md) lists which ops the planner
-admits for the XDNA2.
+:::note[Experimental, correctness-scoped]
+AMD's XDNA2 and Intel's NPU4 (Lunar Lake) each run a narrow set of programs through the ordinary pipeline. Neither is a
+serving backend or a `--backend` option. Each is a library `Device` in `poot-npu`:
+
+- XDNA2: the `xdna` feature, under `nix develop .#npu`.
+- Intel: the `vpu` feature, under `nix develop .#npu-intel`.
+
+Planned: prefill on an NPU, with another device decoding from its KV cache. That handoff is not implemented. The generated
+[XDNA2 table](../develop/supported-models.md#xdna2-npu) lists the ops the planner admits.
 :::
 
-## What runs
+## AMD XDNA2
 
-The planner admits each equation for the AIE target. The NPU holds a bounded number of hardware contexts
-(16 on this XDNA2) and one loaded artifact takes one, so the compiler groups the planned equations of a
-program into **regions**: a contiguous run of equations that is one artifact and one run per step. Each
-equation of a region is a Peano core object on its own compute tile; a value only the region's own
-equations read moves tile to tile and never reaches host memory, and the region's other tensors sit at fixed
-offsets in a few host arenas. A region closes where the next equation would break a measured bound (32
-compute tiles, 16 host streams each way, 64512 tile-local bytes). `poot-codegen` links a region with IRON
-into an xclbin and instruction stream, the shared `Engine` loads it, and `XdnaDevice` runs it through XRT.
-There is no second executor and no graph matcher.
+### How a program runs
 
-Verified on an AMD XDNA2 NPU (Strix Halo, `aie2p`):
+The NPU has a bounded number of hardware contexts (16 on this XDNA2), and one loaded artifact takes one. The compiler groups
+planned equations into **regions**, each one artifact and one run per step.
 
-- **Pointwise F32 ops** over dense tensors run as serialized cores: the ordinary kernel body with its
-  thread grid turned into loops. Each op has a numerical contract measured on the hardware and checked
-  against the CPU oracle over inputs that reach the edges of its domain. Outside the domain nothing is
-  promised.
-  - `add` and `sub`: within 2 x 2^-23 of the larger operand (the core's adder is not round-to-nearest-even;
-    a cancellation that leaves a small result is exact). Domain: finite operands with a finite normal result.
-  - `mul`, `div`, `neg`, `recip` and `ge`: bit for bit equal to the IEEE result. Domain: finite operands with
-    a finite normal result.
-  - `exp`: absolute error 2e-6 plus relative 1e-5. Domain: -87 to 88. The core clamps its argument to
-    +-88, so larger arguments saturate instead of overflowing.
-  - `log`: the same bound. Domain: positive normal numbers (from 1.18e-38 up); smaller inputs are not
-    promised.
-  - `tanh` and `erf`: the same bound over every finite input, which they saturate exactly.
-  - `sqrt`: relative error 4e-7, the core's software square root (a bit-halving estimate and four Newton
-    steps). Domain: positive normal numbers.
-  - `max`: the larger operand, exactly (a compare and select). Domain: operands that are not NaN.
-  Activation slots and a carried running-sum state replay over changing inputs.
-- **Row reductions and norms** run as the ordinary row kernel with one lane per row, its row loop serialized
-  like the pointwise ones: no workgroup memory and no barrier.
-  - A last-axis `sum` adds in order and is within `2 x cols x 2^-23` of the sum of the row's magnitudes (each
-    addition is faithful to two units of its larger operand, and a sum that cancels has no relative bound).
-    A last-axis `max` is exact.
-  - A fused norm (RMSNorm, with or without a weight) has a bound derived from its steps: `mul` and `div`
-    are exact, an `add` is admitted only when both operands are provably non-negative (it cannot cancel), a
-    `sqrt` only when its operand is provably a positive normal number, and a `sum` only over non-negative
-    terms. The derived relative bound of a 64-column RMSNorm is 8.5e-6, and the hardware stays under
-    3 percent of it. A step with no derived bound (a subtraction, `exp` inside a row kernel, a signed `sum`) is
-    a typed refusal that names the missing bound, so a LayerNorm and a softmax are refused.
-- **Gather** of `F32` or `I32` elements through an `I32` index returns the source elements bit for bit,
-  negative zero and NaN payloads included, along any axis. An index outside the axis is not checked, as on
-  the GPU kernel.
-- **A graph of twenty equations with twenty distinct shapes runs in three hardware contexts.**
-- **Region bounds, measured**: 32 compute tiles, 16 host streams in and 16 out, 2 streams per tile, and a
-  tile-local limit of 64512 bytes. An artifact at each bound links and runs, and one past it is refused by
-  the toolchain; the compiler splits a program at these numbers, or refuses an equation that fits no region
-  with a typed limit.
+- Each equation is a Peano core object on its own compute tile.
+- Values read only inside the region move tile to tile and never reach host memory.
+- A region closes where the next equation would break a measured bound:
 
-Nothing else is verified. Every other equation (`erf`, other unary ops, reductions over another axis or
-another element type, data movements other than gather, matmul, attention, collectives) is refused by the
-planner with a typed capability, and no model runs on the NPU. Performance
-is not a goal of this path: it is scalar, and not competitive with the GPU backends.
+| Bound | Limit |
+| --- | --- |
+| Compute tiles | 32 |
+| Host streams | 16 in, 16 out, 2 per tile |
+| Tile-local bytes | 64512 |
+
+An artifact at a bound links and runs; one past it is refused by the toolchain. The compiler splits a program there, or refuses
+an equation that fits no region with a typed limit. Twenty equations with twenty distinct shapes run in three contexts.
+
+`poot-codegen` compiles each core with Peano, `poot-npu` links a region with IRON into an xclbin and instruction stream, the
+shared `Engine` loads it, and `XdnaDevice` runs it through XRT. There is no second executor and no graph matcher.
+`poot-npu-artifacts` holds the host side of a compiled artifact (XDNA2 and Intel); the planner and engine know no vendor.
+
+### Verified: pointwise F32 ops
+
+Pointwise ops run as serialized cores: the ordinary kernel body with its thread grid turned into loops. Each contract was
+measured on hardware against the CPU oracle; outside the domain nothing is promised. Activation slots and a carried running-sum
+state replay over changing inputs.
+
+| Op | Contract | Domain |
+| --- | --- | --- |
+| `add`, `sub` | Within 2 x 2^-23 of the larger operand (the adder is not round-to-nearest-even). | Finite operands, finite normal result |
+| `mul`, `div`, `neg`, `recip`, `ge` | Bit for bit the IEEE result. | Finite operands, finite normal result |
+| `exp` | Absolute 2e-6 plus relative 1e-5; the argument clamps to +-88. | -87 to 88 |
+| `log` | Same bound. | Positive normal numbers |
+| `tanh`, `erf` | Same bound; they saturate exactly. | Every finite input |
+| `sqrt` | Relative 4e-7 (software: bit-halving estimate, four Newton steps). | Positive normal numbers |
+| `max` | The larger operand, exactly. | Operands that are not NaN |
+
+### Verified: reductions, norms and gather
+
+Row reductions and norms run as the ordinary row kernel, one lane per row, with no workgroup memory or barrier.
+
+- **Last-axis `sum`:** adds in order, within `2 x cols x 2^-23` of the sum of magnitudes. **`max`:** exact.
+- **Fused RMSNorm** (with or without a weight): bound derived from its steps; 8.5e-6 relative for 64 columns, and the hardware
+  stays under 3 percent of it.
+- **Gather** of `F32` or `I32` through an `I32` index returns source elements bit for bit, along any axis. An index outside
+  the axis is not checked.
+
+A norm step is admitted only with a derived bound:
+
+| Step | Admitted when |
+| --- | --- |
+| `mul`, `div` | Always (exact) |
+| `add` | Both operands provably non-negative |
+| `sqrt` | Operand provably a positive normal number |
+| `sum` | Over non-negative terms |
+
+A step with no derived bound (subtraction, `exp` in a row kernel, a signed `sum`) is a typed refusal naming the missing bound,
+so LayerNorm and softmax are refused.
+
+### Not verified
+
+Every other equation is refused with a typed capability: other unary ops, other-axis reductions, data movement other than
+gather, matmul, attention, collectives. No model runs on the NPU, and performance is not a goal.
 
 ## Intel NPU
 
-An Intel NPU has no public core ISA or kernel toolchain. Its only entry point is the driver's graph compiler,
-so the artifact of a program is one **graph**: the planner lowers each equation to the one OpenVINO opset op
-with the same semantics (`add`, `subtract`, `multiply`, `divide`, `maximum`, `greater-equal`, `exp`, `negative`, `sqrt`,
-`reduce-sum`, `reduce-max`, `matmul`, `gather`, `reshape`, `transpose`, `broadcast`, `slice`, `concat`,
-`convert`, a constant range for `iota`, and a scatter for `dynamic_update_slice`; an inline scalar literal
-becomes a constant) and nothing is recognized as a composite, so attention stays its
-primitives and the vendor compiler fuses what it can. `poot-codegen` serializes the whole program as OpenVINO
-IR, the shared `Engine` hands it to `VpuDevice`, the driver's compiler builds the blob, and the device runs
-the graph through Level Zero. Every value the graph's own equations read stays inside it; its arguments are
-the weights, activations and state it reads and the values it returns, in host memory the NPU addresses.
+Intel NPUs have no public core ISA, so a program's artifact is one **graph** built by the driver's graph compiler.
 
-The NPU computes in FP16, and a vendor compiler handed an F32 graph narrows it silently, so poot makes the
-narrowing a step of its own. When the device records a numerical contract (a bound on the normwise error of a
-narrowed region, measured on the device against the F32 CPU oracle), `compile` rewrites the graph itself
-(`narrow_to_device_precision`, the first pass for this target): each F32 argument is converted to FP16 by an
-explicit `Cast` equation on entry, the whole graph computes in FP16 and each F32 result is converted back by a
-`Cast` on exit; nothing in between is converted op by op, so the contract bounds the graph's error as a whole.
-The casts are ordinary equations, so the program's published numerics class sees the narrowing: it is
-`NarrowStorage`, the loosest comparison tolerance, and a result is compared against the oracle within it. A target that
-records no contract refuses an F32 arithmetic equation with a typed capability naming the missing contract,
-and BF16 arithmetic, which no contract covers, is refused as well. Data movement is bit exact in any width the
-device carries.
+1. The planner lowers each equation to the OpenVINO opset op with the same semantics. Nothing is recognized as a composite.
+2. `poot-npu` serializes the program as OpenVINO IR; `VpuDevice` has the driver build the blob and runs it through Level Zero.
+3. Values read only inside the graph stay inside it. Arguments (weights, activations, state, results) live in host memory.
 
-The contract's bound holds only for values FP16 can hold, so the contract also records the largest magnitude an
-F32 value may have (65504). A literal beyond it is refused when the graph is planned, except the additive
-literals described below, which saturate on purpose. The device checks F32 values where the host can see
-them. A weight is checked once, as it is uploaded: a weight beyond the range, or a NaN, is refused with
-`NarrowingRangeUpload`, which names the element, before any replay exists, and no replay reads it again. The
-graph's other F32 inputs are checked before each replay: a value beyond the range, or a NaN, is a typed
-error that names the argument and the element and runs nothing. An argument that an earlier command of the
-same recording writes is checked as that command's result instead, and so is a weight a recorded copy fills. The F32 results
-are checked after the replay too, since a result that left the range was computed outside what the bound was
-measured on. On the Intel NPU an F32 input of 65504 runs, an input of 65520 (which FP16 rounds to infinity)
-is refused, and a sum of two in-range inputs that exceeds the range comes back as a finite F32 and is refused
-as a result.
+Lowered ops: `add`, `subtract`, `multiply`, `divide`, `maximum`, `greater-equal`, `exp`, `negative`, `sqrt`, `reduce-sum`,
+`reduce-max`, `matmul`, `gather`, `reshape`, `transpose`, `broadcast`, `slice`, `concat`, `convert`, `iota` (a constant range)
+and `dynamic_update_slice` (a scatter). A scalar literal becomes a constant.
 
-Compiled blobs are cached on disk under the region's full identity (the part, the vendor compiler's version,
-the compiler options and the IR with its constants), so a second run of the same program loads the blob and
-never runs the compiler. A cache entry that is damaged, truncated or another region's, or that the driver
-refuses, is recompiled and replaced.
+### FP16 narrowing
+
+The NPU computes in FP16, and a vendor compiler narrows an F32 graph silently. poot makes narrowing an explicit step. When the
+device records a numerical contract (a normwise error bound measured against the F32 CPU oracle), `compile` runs
+`narrow_to_device_precision`, the first pass for this target:
+
+1. Each F32 argument gets a `Cast` to FP16 on entry.
+2. The whole graph computes in FP16.
+3. Each F32 result gets a `Cast` back on exit.
+
+The contract bounds the graph as a whole, and the program's numerics class is `NarrowStorage`, the loosest tolerance.
+
+| Case | Outcome |
+| --- | --- |
+| F32 arithmetic, no recorded contract | Typed capability error naming the missing contract |
+| BF16 arithmetic | Refused; no contract covers it |
+| Data movement | Bit exact in any width the device carries |
+
+### Range checks
+
+The contract holds only for values FP16 can hold, so F32 magnitudes are limited to 65504.
+
+| Value | Checked | On failure |
+| --- | --- | --- |
+| Literal | At planning | `NarrowingRange`, except additive literals (below) |
+| Weight | Once, at upload | `NarrowingRangeUpload`, naming the element |
+| Other F32 inputs | Before each replay | Typed error naming argument and element; nothing runs |
+| F32 results | After each replay | Typed error |
+
+NaN weights and inputs are refused. An input of 65504 runs; 65520 (which rounds to infinity) is refused; a sum of in-range
+inputs that exceeds the range is refused as a result. An additive literal (an add or subtract operand) with a recorded contract
+saturates to +-65504, a mask sentinel acting as infinity. Multiplicative use stays refused, infinite literals stay infinite,
+and NaN literals are refused.
+
+### Blob cache
+
+Blobs are cached on disk under the region's full identity: part, vendor compiler version, options, and the IR with constants. A
+repeat run never invokes the compiler. A damaged, truncated, foreign or driver-refused entry is recompiled and replaced.
+
+### Verified and refused
 
 Verified on an Intel Core Ultra (Lunar Lake) NPU, driver and compiler 1.38.0:
 
-- **F16 programs** over elementwise `add`, `sub`, `mul`, `max`, `ge`, `div`, `neg`, `sqrt` and `exp`, inline
-  scalar literals, row and column sums and maxima, a matmul, a gather by `I32` indices (also by an `iota`),
-  transpose, reshape, slice, concat and broadcast, a `dynamic_update_slice` at a literal and at a runtime
-  index, rank four tensors, an `F32` boundary around FP16 arithmetic, activation slots, a carried running-sum
-  state, and replay over changing inputs match the CPU oracle bit for bit on integer-valued inputs and within
-  FP16 tolerance for `exp`, `div` and `sqrt`. The sign of a zero is not promised: the NPU's `neg` of `+0` is
-  `+0`.
-- **A program is one compiled graph and one replay per step**, however many equations it holds.
-- **The compiled graph's arguments are checked against the program's** (names, order, direction, extents,
-  precision) before anything runs, so a compiler that reordered, retyped or reshaped an argument is a typed
-  refusal.
+- **F16 programs** over the lowered ops (elementwise, reductions, matmul, gather, layout ops, `dynamic_update_slice`, rank four
+  tensors, an `F32` boundary around FP16 arithmetic, activation slots, carried state, replay over changing inputs) match the
+  CPU oracle bit for bit on integer-valued inputs and within FP16 tolerance for `exp`, `div` and `sqrt`. The sign of a zero is
+  not promised (`neg` of `+0` is `+0`).
+- **One compiled graph and one replay per step**, however many equations.
+- **Arguments are checked** against the program's (names, order, direction, extents, precision) before anything runs.
 
-Nothing else is verified. Every other equation is refused by the planner with a typed capability: `log`,
-`recip` and the other unary ops, BF16 arithmetic and F32 arithmetic on a target with no recorded narrowing
-contract (the NPU computes in FP16), and converts through BF16 or an integer. Softmax, attention and
-collectives are not recognized as composites, and no model runs on the Intel NPU. A literal FP16 cannot hold
-is refused (`NarrowingRange`), unless the target records the narrowing contract and the literal is the operand
-of an add or subtract: then a finite F32 literal saturates to +/-65504 (a mask sentinel acting as an infinity).
-A multiplicative use stays refused, an infinite literal stays infinite and a NaN literal is refused. An integer
-converted to a float is refused as `IntegerToFloat`, because FP16 holds integers exactly only up to 2048. The
-index of a runtime `dynamic_update_slice` must select a window that fits: the CPU oracle rejects an
-out-of-range index with a typed error, but the NPU does not check it and its result is undefined. A layer the
-vendor compiler rejects is a typed error carrying the compiler's own log. Performance is not a goal of this
-path.
+Refused with a typed capability (no model runs on the Intel NPU; performance is not a goal):
+
+- `log`, `recip` and other unary ops.
+- BF16 arithmetic, and F32 arithmetic with no recorded contract.
+- Converts through BF16 or an integer; integer to float is `IntegerToFloat`, since FP16 holds integers exactly only to 2048.
+- Softmax, attention and collectives.
+- A layer the vendor compiler rejects, with the compiler's log.
+
+The index of a runtime `dynamic_update_slice` must select a window that fits. The CPU oracle rejects an out-of-range index; the
+NPU does not check it, and its result is undefined.
 
 ## Failure behavior
 
-Dispatch refusals that need no hardware (a grid launch, a stream or buffer that is not the kernel's shape
-ABI) are typed errors before XRT is touched. A run that misses its deadline is a typed error and poisons the
-device; the buffers and host arenas it used stay allocated until the device is dropped. The Intel device
-behaves the same way: its dispatch refusals (a grid launch, an invocation of another graph, a buffer that is
-not the graph's argument) are typed errors before Level Zero is touched, and a replay that misses its deadline
-poisons the device and keeps the failed recording's buffers alive until it is dropped.
+- Dispatch refusals that need no hardware are typed errors before XRT or Level Zero is touched: a grid launch, a buffer that is
+  not the kernel's shape ABI (XDNA2), an invocation of another graph, a buffer that is not the graph's argument (Intel).
+- A run that misses its deadline is a typed error and poisons the device. Its buffers stay allocated until the device drops.

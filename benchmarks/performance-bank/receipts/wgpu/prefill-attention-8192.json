@@ -1,0 +1,206 @@
+{
+  "backend": "wgpu",
+  "case": "prefill-attention-8192",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 114845.992
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 117496.96399999999
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 116074.221
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 112606.241
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 116460.224
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 117232.067
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 117935.254
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 122038.091
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 120644.653
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 134217728,
+      "peak_bytes": 134217728,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 67108864,
+      "peak_bytes": 67108864,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 65536,
+      "peak_bytes": 65536,
+      "role": "Input"
+    },
+    {
+      "live_bytes": 672,
+      "peak_bytes": 67109536,
+      "role": "Staging"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 8192,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 8192
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 67108864,
+    "weight_copies": 1
+  },
+  "plan": [
+    "attention [1b2e39e6fec623155c7c4f43096f83c231484a794346b5ad86bd04459be01c2b]",
+    "attention [3fd65b19ad030cc241eb998dd7444aba1e418aed40fdb19ab20afde666472e7d]",
+    "attention [f88add2a65614f16806e420abf74d2317450620d78ce2352a90db2a844823dfa]",
+    "attention [184a7932bac14ffe7c694cf44c7e723f30a462138710eced0dfb6298a3f774ad]",
+    "attention [6dad0fd805c24e1229fdc8f8f5534574463aa5769353b1fc584e4a1f9d1762a0]",
+    "attention [729fa80e499a12da47e99e582329382681afcf1170d2682a62a9ac4af56443c1]",
+    "attention [72498eaf5663a706c0636fddb05d8c8d2937c4f1ebfb3f3095fba0261460a415]",
+    "attention [a8edfc32b1249cc5ee87c0163422976d2b594ca7af38d8e3b14fa2424bbd6a09]",
+    "attention [3bcaeb038d895593e9e646e745f7842ddcddeec10258c080310c6c1cc1423a11]",
+    "attention [b1c4265b719e7ceeb3f4437ffbd2f819a9c17f7dbebe8af4b6a0547081273111]",
+    "attention [48d6f4cc6a14551547672060b68485d6542a5ea546669ede7d4121c4433b2108]",
+    "attention [4c1122c71f51dc209ffd478639b9e4cc7b4437a1874485fef6f5dc26e29751d3]",
+    "attention [a85dbf6ac2b55915c0c10926dcdf1bcec1bb34bc35ce1d53b26cb8a2803688c9]",
+    "attention [e217d13a021535fd7e3b89c1ac844805b92a014c3f180dd761f9a739358ac0bf]",
+    "attention [0294a27f5af9bf7dde04f28b4039e1e6cc625a8ab2c406a322f94b35cc32f0e7]",
+    "attention [0c83306dec18a0021824cb13305884ba58224413d8b997c94ee410c4d921a850]",
+    "attention [33e1c7b4e8d46280272085c03256211c00e87f9e925d87de5aff9ef68b5de4c3]",
+    "attention [c41a6b19f31a5adb262f0e225d96b85f058363499f80fba035a662ecc76c5613]",
+    "attention [d0a37d63c41ce6de8af9e3af388d15a72fbf80ee818c3d0627f4921c0a33bef0]",
+    "attention [042c4da898063ace20db6de46c1ce4e0c00b7015ea27ecd99191e6adb105798a]",
+    "attention [08089591c53520231acadda732cb299c124edad6d0a3955f78ae85f79b3c8181]",
+    "attention [5802a8356f3f0b764fa54eb95f14991640c5d8ea0edda5e0cad20d287a5180bf]",
+    "attention [2a5198213da815b83cabaf8bd613900f67be6ec2666754696cc945ba0f252e76]",
+    "attention [af755387244dfa6f53b57e8fae3a3e07f72ac3c7e8a8ac0bfcaa18a88b14311b]",
+    "attention [bc67f21a7ca9bea1872fd655c831cf6988017b292f99fe6cbe8fd6b30067d677]",
+    "attention [283923753610655c48e96ce322afff2e191012665fc59df3e2ee25aa3485e773]",
+    "attention [f47c66aaff25066c7de6b08a31784719adbfe754071118b475b2d9ffd4bbf67b]",
+    "attention [7b1b05f57ee7cb1988ab49346812aaf107ccb39f38c1fe0dcfe81ef9a49b79a9]"
+  ],
+  "plan_id": "97863b0e6914fc0f99c5b7281cfe2e75e5c74ba1ad266a655c843e63bdfc72e7",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 1.6799183880282588e-07,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-wgpu-device",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "prefill-attention-8192",
+    "--out",
+    "benchmarks/performance-bank/receipts/wgpu/prefill-attention-8192.json"
+  ],
+  "parent_revision": "21da98dafbdbc5887ce2943f1e7609381412b01c",
+  "binary_sha256": "59fb25d4b5612f6e7fff1a8733ea1d5fe6fd175eb42fe4ece8f827d434b78935",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "bhsd",
+    "dimensions": {
+      "hq": 16,
+      "hkv": 8,
+      "d": 128,
+      "lq": 8192,
+      "cap": 8192
+    },
+    "prompt_tokens": 1,
+    "live_context": 8192,
+    "max_context": 8192,
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "prefill-attention-8192"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "wgpu",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.3.0"
+  },
+  "identity_digest": "979524a18e965f318da65ceff507991d2eb5b734218604833aed3cc09ab47e3f",
+  "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"
+}

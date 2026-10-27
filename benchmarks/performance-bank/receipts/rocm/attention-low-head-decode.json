@@ -6,63 +6,63 @@
       "repeats": [
         {
           "metrics": {
-            "step_us": 62.637
+            "step_us": 78.687
           },
           "slot": 0,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 58.399
+            "step_us": 66.375
           },
           "slot": 1,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 57.979
+            "step_us": 61.785000000000004
           },
           "slot": 2,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 58.199000000000005
+            "step_us": 64.982
           },
           "slot": 3,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 58.379
+            "step_us": 62.236999999999995
           },
           "slot": 4,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 58.440000000000005
+            "step_us": 66.214
           },
           "slot": 5,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 58.389
+            "step_us": 69.47
           },
           "slot": 6,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 58.32899999999999
+            "step_us": 74.118
           },
           "slot": 7,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 63.69
+            "step_us": 60.573
           },
           "slot": 8,
           "status": "ok"
@@ -100,10 +100,10 @@
     "weight_copies": 1
   },
   "plan": [
-    "attention [c9fc1783247cedc898ddca6ea31a1ee8921d875ccf92ccf1983cba5c574b2d46]",
-    "attention_combine [ab98131947c3b59c56bff03678f73c16653e4028a2695636d871530e9f32c86b]"
+    "attention [cef11cb522e32cc407724e4f007d4fd7fdf1caeec2cbda2210395c7000b64d0a]",
+    "attention_combine [74dcf705faddce771a423d20099bf8ace115ff387ca433a9579624c5bfd157fa]"
   ],
-  "plan_id": "864ca01f0cb2e371ff83f1544a9ebc840d3a867a7b80be33e274ba81c4b8ffe2",
+  "plan_id": "c94207f4c7b1fc0a6fbb67f7757773b50ef98c67b7461288d79383ca42a7961b",
   "recordings": 1,
   "reference": {
     "agrees": true,
@@ -120,7 +120,7 @@
     "run",
     "--release",
     "-p",
-    "poot-rocm-gpu",
+    "poot-rocm-device",
     "--example",
     "performance_bank",
     "--",
@@ -131,8 +131,8 @@
     "--out",
     "benchmarks/performance-bank/receipts/rocm/attention-low-head-decode.json"
   ],
-  "parent_revision": "d03659c4efa0e259809a15c917fb76df7b77cfc0",
-  "binary_sha256": "40e581af43fecf10dba65fff766e2fd0591f2fded88ebe8f460fa710ed120ef3",
+  "parent_revision": "21da98dafbdbc5887ce2943f1e7609381412b01c",
+  "binary_sha256": "fa7cc4a1a9eed9df3b6d92017c74dca3232fb97ed7f7a979028b73f4895caf65",
   "identity": {
     "checkpoint_digest": "synthetic-no-checkpoint",
     "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
@@ -166,7 +166,7 @@
     },
     "backend": "rocm",
     "device": "AMD Radeon 8060S Graphics",
-    "driver": "host kernel 7.2.9"
+    "driver": "host kernel 7.3.0"
   },
   "identity_digest": "199253cbba3a85b4fe014043d3d0db8d73a3ddf52869559a1716520b05811001",
   "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"

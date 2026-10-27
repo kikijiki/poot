@@ -11,7 +11,11 @@
 //! `Docker-Content-Digest` response header; for multi-arch tags that is the INDEX
 //! digest, which is what `repo@sha256:...` pins.
 
+use std::collections::BTreeMap;
+
 use thiserror::Error;
+
+use crate::cuda::CudaVersion;
 
 /// Accept headers so a multi-arch tag returns the index/list manifest (digest = index).
 pub(crate) const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
@@ -22,6 +26,51 @@ pub(crate) const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+jso
 /// Resolve a mutable image tag reference to an immutable `sha256:<64-hex>` digest.
 pub(crate) trait DigestResolver {
     fn resolve_digest(&self, image_tag: &str) -> Result<String, ImageResolveError>;
+}
+
+/// The image label that says what host CUDA the image needs (`major.minor`): its nvcc toolchain and CUDA wheels
+/// need a driver at least that new. An image without it has no floor.
+pub(crate) const MIN_CUDA_LABEL: &str = "org.poot.bench.min-cuda";
+
+/// The labels an image's config declares.
+pub(crate) trait ImageLabels {
+    fn labels(&self, image: &str) -> Result<BTreeMap<String, String>, ImageResolveError>;
+}
+
+/// The host CUDA floor `image` declares through [`MIN_CUDA_LABEL`]; `None` when it declares none. A label that is
+/// not a version is an error (the image says something the orchestrator cannot honour).
+pub(crate) fn image_min_cuda(
+    resolver: &dyn ImageLabels,
+    image: &str,
+) -> Result<Option<CudaVersion>, String> {
+    let labels = resolver.labels(image).map_err(|e| e.to_string())?;
+    labels
+        .get(MIN_CUDA_LABEL)
+        .map(|text| text.parse::<CudaVersion>())
+        .transpose()
+        .map_err(|e| format!("label {MIN_CUDA_LABEL} of {image}: {e}"))
+}
+
+/// The digest of the linux/amd64 manifest of an OCI index or Docker manifest list; `None` when `index` is a plain
+/// manifest or lists no such platform.
+fn amd64_manifest_digest(index: &serde_json::Value) -> Option<String> {
+    index
+        .get("manifests")?
+        .as_array()?
+        .iter()
+        .find(|m| m["platform"]["os"] == "linux" && m["platform"]["architecture"] == "amd64")
+        .and_then(|m| m["digest"].as_str())
+        .map(String::from)
+}
+
+/// The `config.Labels` of an image config blob, as strings.
+fn labels_of_config(config: &serde_json::Value) -> BTreeMap<String, String> {
+    config["config"]["Labels"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+        .collect()
 }
 
 /// Failures beneath the tag-to-digest seam (fail-closed, before DB/RunPod side effects).
@@ -305,6 +354,75 @@ impl DigestResolver for RegistryV2Resolver {
     }
 }
 
+impl RegistryV2Resolver {
+    /// GET `url` with `accept`, answering an anonymous bearer challenge once, and parse the JSON body.
+    fn get_json(&self, url: &str, accept: &str) -> Result<serde_json::Value, ImageResolveError> {
+        let send = |token: Option<&str>| {
+            let mut rb = self.client.get(url).header(reqwest::header::ACCEPT, accept);
+            if let Some(token) = token {
+                rb = rb.bearer_auth(token);
+            }
+            rb.send().map_err(|e| ImageResolveError::Http {
+                context: format!("GET {url}"),
+                detail: e.to_string(),
+            })
+        };
+        let mut resp = send(None)?;
+        if resp.status().as_u16() == 401 {
+            let header = resp
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let token = fetch_anonymous_token(&self.client, &parse_bearer_challenge(&header)?)?;
+            resp = send(Some(&token))?;
+        }
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            return Err(ImageResolveError::Http {
+                context: format!("GET {url} ({status})"),
+                detail: text,
+            });
+        }
+        serde_json::from_str(&text).map_err(|e| ImageResolveError::Http {
+            context: format!("GET {url}"),
+            detail: format!("not JSON: {e}"),
+        })
+    }
+}
+
+impl ImageLabels for RegistryV2Resolver {
+    /// manifest (or the linux/amd64 one of an index) -> config blob -> `config.Labels`.
+    fn labels(&self, image: &str) -> Result<BTreeMap<String, String>, ImageResolveError> {
+        let (registry, repo, reference) = parse_image_ref(image)?;
+        let mut manifest = self.get_json(
+            &self.manifest_url(&registry, &repo, &reference),
+            MANIFEST_ACCEPT,
+        )?;
+        if let Some(digest) = amd64_manifest_digest(&manifest) {
+            manifest = self.get_json(
+                &self.manifest_url(&registry, &repo, &digest),
+                MANIFEST_ACCEPT,
+            )?;
+        }
+        let config_digest =
+            manifest["config"]["digest"]
+                .as_str()
+                .ok_or_else(|| ImageResolveError::Http {
+                    context: format!("manifest of {image}"),
+                    detail: "no config digest".to_string(),
+                })?;
+        let blob = format!(
+            "{}/v2/{}/blobs/{config_digest}",
+            self.origin(&registry),
+            repo.trim_matches('/')
+        );
+        Ok(labels_of_config(&self.get_json(&blob, "application/json")?))
+    }
+}
+
 /// GET the challenge realm (anonymous) and parse `{"token"|"access_token": "..."}`.
 fn fetch_anonymous_token(
     client: &reqwest::blocking::Client,
@@ -383,6 +501,58 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
+
+    struct FakeLabels(Result<BTreeMap<String, String>, ImageResolveError>);
+
+    impl ImageLabels for FakeLabels {
+        fn labels(&self, _image: &str) -> Result<BTreeMap<String, String>, ImageResolveError> {
+            self.0.clone()
+        }
+    }
+
+    fn labelled(pairs: &[(&str, &str)]) -> FakeLabels {
+        FakeLabels(Ok(pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()))
+    }
+
+    /// An image declares its floor through the label; one that declares none has none; a label that is not a
+    /// version is an error, not a silent "no floor".
+    #[test]
+    fn an_image_label_gives_the_floor_and_no_label_gives_none() {
+        let floor = image_min_cuda(&labelled(&[(MIN_CUDA_LABEL, "13.0")]), "img").unwrap();
+        assert_eq!(floor, Some("13.0".parse().unwrap()));
+        assert_eq!(
+            image_min_cuda(&labelled(&[("other", "x")]), "img"),
+            Ok(None)
+        );
+        assert!(image_min_cuda(&labelled(&[(MIN_CUDA_LABEL, "thirteen")]), "img").is_err());
+        let down = FakeLabels(Err(ImageResolveError::Http {
+            context: "c".into(),
+            detail: "d".into(),
+        }));
+        assert!(image_min_cuda(&down, "img").is_err());
+    }
+
+    #[test]
+    fn the_amd64_manifest_and_the_config_labels_are_read_from_registry_json() {
+        let index: serde_json::Value = serde_json::json!({"manifests": [
+            {"digest": "sha256:arm", "platform": {"os": "linux", "architecture": "arm64"}},
+            {"digest": "sha256:amd", "platform": {"os": "linux", "architecture": "amd64"}},
+        ]});
+        assert_eq!(amd64_manifest_digest(&index).as_deref(), Some("sha256:amd"));
+        assert_eq!(
+            amd64_manifest_digest(&serde_json::json!({"config": {}})),
+            None
+        );
+        let config = serde_json::json!({"config": {"Labels": {MIN_CUDA_LABEL: "13.0", "n": 1}}});
+        assert_eq!(
+            labels_of_config(&config),
+            BTreeMap::from([(MIN_CUDA_LABEL.to_string(), "13.0".to_string())])
+        );
+        assert!(labels_of_config(&serde_json::json!({"config": {}})).is_empty());
+    }
 
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 

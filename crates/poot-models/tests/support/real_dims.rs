@@ -1,6 +1,6 @@
 //! The reference models at their real dimensions, with all-zero weights: the planner decides on shapes,
 //! dtypes and caps, not on weight values, so the graph a real checkpoint would trace is the graph these
-//! models trace, and the feature matrix compiles it for the device limits of each target.
+//! models trace, and the supported-models tables compile it for the device limits of each target.
 //!
 //! A real model's dimensions come from its `config.json` (`Qwen/Qwen3.8-27B`'s is checked in beside the
 //! poot-llm tests) or from the published dimensions of the dense checkpoints

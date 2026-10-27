@@ -318,8 +318,13 @@ fn the_kernel_choice_names_generated_imported_and_no_dispatch_equations() {
     assert!(
         matches!(
             matmul,
-            KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Serial { .. }))
+            KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(
+                poot_kernelgen::DenseTiledContraction {
+                    weight: poot_kernelgen::DenseTiledWeight::KnF32,
+                    ..
+                }
+            )))
         ),
-        "the M > 1 matmul is the generated serial kernel: {matmul:?}"
+        "the batched M > 1 matmul is the generated batched tiled GEMM: {matmul:?}"
     );
 }

@@ -1,0 +1,170 @@
+{
+  "backend": "rocm",
+  "case": "prefill-dense-bf16-nk",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 14685.550000000001
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 13073.414
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 13349.140000000001
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 13249.112000000001
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 13599.658000000001
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 12301.058
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 12621.698
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 12340.983
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 12444.757000000001
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 14680064,
+      "peak_bytes": 14680064,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 25165824,
+      "peak_bytes": 25165824,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 84,
+      "peak_bytes": 84,
+      "role": "Meta"
+    }
+  ],
+  "observed": {
+    "layout": "nk",
+    "shape": {
+      "k": 1024,
+      "m": 2048,
+      "n": 3072
+    },
+    "storage": "bf16",
+    "weight_bytes_per_copy": 6291456,
+    "weight_copies": 1
+  },
+  "plan": [
+    "contraction:dense_tiled [0dc46f9a598cf4237f379aa6caad9f1de30ae3fc3da96935e10ce1747b6fd54d]"
+  ],
+  "plan_id": "3c7e4a5e6249a12436d24d4d92ae16ebd2d954087dba78f44884852663822c50",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 2.6164006212513264e-05,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-rocm-device",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "prefill-dense-bf16-nk",
+    "--out",
+    "benchmarks/performance-bank/receipts/rocm/prefill-dense-bf16-nk.json"
+  ],
+  "parent_revision": "21da98dafbdbc5887ce2943f1e7609381412b01c",
+  "binary_sha256": "fa7cc4a1a9eed9df3b6d92017c74dca3232fb97ed7f7a979028b73f4895caf65",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "bf16",
+    "layout": "nk",
+    "dimensions": {
+      "m": 2048,
+      "k": 1024,
+      "n": 3072
+    },
+    "prompt_tokens": 2048,
+    "live_context": "n/a",
+    "max_context": "n/a",
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "prefill-dense-bf16-nk"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "rocm",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.3.0"
+  },
+  "identity_digest": "fbdfa37c3a5597a24509afb4d47b85e9888339110fbad0bac25be285f45bd05e",
+  "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"
+}

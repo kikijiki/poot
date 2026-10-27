@@ -10,16 +10,17 @@
 //!
 //! Mutations (applied by hand, shown red, restored; recorded in the POOT-1221 report):
 //! HG-1 `MAX_SCHEMA_REGEX_BYTES` raised to 2 GiB (the nested-schema row goes red on its memory bound);
-//! HG-2 `DETERMINIZE_SIZE_LIMIT` raised back to 1 MiB (the random-pattern row goes red on its time
+//! HG-2 `DETERMINIZE_SIZE_LIMIT` raised back to 1 MiB (the random-pattern row goes red on its CPU-time
 //! budget: one pattern takes 7 s to refuse).
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use poot_text::{ChatFormat, Constraint, GgufVocab, HermesToolCodec, TextCodec};
 
-/// Longest a build or a refusal may take. The bounded builds finish in milliseconds; the margin
-/// absorbs a loaded box without letting an unbounded build (seconds to minutes) pass.
+/// Most CPU time a build or a refusal may use. The bounded builds finish in milliseconds (the slowest
+/// random pattern takes about 1.3 s); an unbounded build uses seconds to minutes. It is CPU time of the
+/// building thread, not wall-clock, so a loaded box that deschedules the test cannot fail it.
 const BUDGET: Duration = Duration::from_secs(5);
 
 fn codec() -> TextCodec {
@@ -93,15 +94,27 @@ fn peak_resident_bytes() -> u64 {
     kib * 1024
 }
 
-/// Run `build`, require it to return inside [`BUDGET`] and the process to stay under [`MEMORY_BOUND`],
+/// CPU time this thread has spent running, from the scheduler's accounting (`/proc/thread-self/schedstat`,
+/// first field: nanoseconds on a CPU). Time spent waiting for a CPU is not counted.
+fn thread_cpu_time() -> Duration {
+    let schedstat = std::fs::read_to_string("/proc/thread-self/schedstat").expect("read schedstat");
+    let nanos: u64 = schedstat
+        .split_whitespace()
+        .next()
+        .and_then(|field| field.parse().ok())
+        .expect("on-cpu nanoseconds in /proc/thread-self/schedstat");
+    Duration::from_nanos(nanos)
+}
+
+/// Run `build`, require it to use less than [`BUDGET`] of CPU time and the process to stay under [`MEMORY_BOUND`],
 /// and give back what it answered.
 fn bounded<T>(what: &str, build: impl FnOnce() -> T) -> T {
-    let started = Instant::now();
+    let started = thread_cpu_time();
     let answer = build();
-    let took = started.elapsed();
+    let took = thread_cpu_time() - started;
     assert!(
         took < BUDGET,
-        "{what}: took {took:?}, over the {BUDGET:?} budget"
+        "{what}: used {took:?} of CPU, over the {BUDGET:?} budget"
     );
     let peak = peak_resident_bytes();
     assert!(

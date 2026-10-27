@@ -111,9 +111,9 @@ pub enum ChainError {
         /// The entry.
         entry: crate::EntryId,
         /// The picked token's storage and element count.
-        picked: (BufferStorage, u32),
+        picked: (BufferStorage, usize),
         /// The fed slot's storage and element count.
-        slot: (BufferStorage, u32),
+        slot: (BufferStorage, usize),
     },
     /// The executor runs one device program at a time and cannot order one step's device work after
     /// another's without the host.
@@ -163,7 +163,7 @@ pub enum DispatchError {
         /// The argument's position: the inputs in kernel parameter order, then the output.
         arg: usize,
         /// The element count the dispatch asserted for the argument.
-        elems: u32,
+        elems: usize,
         /// The element capacity of the bound buffer ([`crate::Device::buffer_elems`]).
         capacity: usize,
     },
@@ -184,6 +184,22 @@ pub enum LoadError {
         /// The target of the device.
         device: Box<Target>,
     },
+    /// A buffer the engine must allocate is larger than the device's single-buffer limit
+    /// ([`poot_target::DeviceCaps::max_buffer_bytes`], this backend's own figure): refused before the
+    /// driver sees the request.
+    #[error(
+        "a {bytes}-byte {role:?} buffer exceeds the {backend} device's {limit}-byte single-buffer limit"
+    )]
+    BufferExceedsDeviceLimit {
+        /// The backend whose limit applies.
+        backend: &'static str,
+        /// What the buffer is for.
+        role: poot_runtime_common::BufferRole,
+        /// The requested size in bytes.
+        bytes: u64,
+        /// The device's `max_buffer_bytes`.
+        limit: u64,
+    },
     /// A graph const its executable's weight map binds no weight to: a name that is no mapped
     /// `WeightId::const_name` (even when a store key equals it).
     #[error("const {value} ({name}) is bound to no weight")]
@@ -193,61 +209,20 @@ pub enum LoadError {
         /// The name the weight map was asked for.
         name: String,
     },
-    /// An AIE region's plans have no link recipe to link against (POOT-664, POOT-1160).
+    /// The device's region loader refused a region: a toolchain stage, the ABI or limit check, or the artifact
+    /// validator, as the loader's own typed cause.
     #[error("kernel {key}: {source}")]
-    AieAbi {
+    Region {
         /// The region.
         key: String,
-        /// Why the plans carry no link recipe.
-        source: poot_graph_plan::AieAbiRefusal,
-    },
-    /// A linked AIE artifact's instruction stream is empty or longer than `u32::MAX` words, which the
-    /// artifact validator and the artifact limit rule out: an invariant breach, named.
-    #[error("kernel {key}: the AIE instruction stream is {bytes} bytes")]
-    AieInstructionStream {
-        /// The plan key of the kernel.
-        key: String,
-        /// The stream's length in bytes.
-        bytes: usize,
-    },
-    /// An Intel NPU region could not be emitted as OpenVINO IR: the region the planner assembled is not well
-    /// formed. An invariant breach in the lowering, named.
-    #[error("kernel {key}: {source}")]
-    VpuEmit {
-        /// The key of the region.
-        key: String,
-        /// What the emitter refused.
-        source: poot_codegen::VpuEmitError,
-    },
-    /// The region's argument ABI is not one the NPU device can bind.
-    #[error("kernel {key}: {source}")]
-    VpuArtifact {
-        /// The key of the region.
-        key: String,
-        /// Why the artifact was refused.
-        source: poot_runtime_common::VpuArtifactError,
+        /// The loader's typed cause.
+        source: crate::device::RegionLoadError,
     },
     /// The program has no kernel-body compiler for its target, but a per-equation kernel was asked for.
     #[error("target {target:?} compiles no per-equation kernel bodies")]
     NoKernelBodies {
         /// The target.
         target: poot_target::TargetId,
-    },
-    /// An AIE kernel could not be linked: a toolchain stage, the body/ABI check or the artifact validator.
-    #[error("kernel {key}: {source}")]
-    AieCompile {
-        /// The plan key of the kernel.
-        key: String,
-        /// The toolchain, body/ABI or validator failure.
-        source: poot_codegen::AieCompileError,
-    },
-    /// The linked AIE artifact does not fit the target's measured limits (an unmeasured limit refuses).
-    #[error("kernel {key}: {source}")]
-    AieLimit {
-        /// The plan key of the kernel.
-        key: String,
-        /// Which measured limit the artifact exceeds or lacks.
-        source: poot_graph_plan::AieLimitRefusal,
     },
     /// A graph const carries no name, so no weight can be bound to it.
     #[error("const {value} has no name to bind by")]
@@ -541,6 +516,16 @@ pub enum BindError {
         token: i32,
         /// Rows in the embed table.
         rows: usize,
+    },
+    /// A packed embed table's row did not decode into the embed's width (the stored payload no longer matches the shape the map was checked against).
+    #[error("embed {name}: token {token}'s row does not decode: {source}")]
+    EmbedDecode {
+        /// The embed's name.
+        name: String,
+        /// The token whose row failed.
+        token: i32,
+        /// Why the decode refused.
+        source: poot_quant::decode::DecodeError,
     },
     /// A sync wrote pool rows outside the table's pool (`first_row + len > pool_rows`).
     #[error("pooled table {table}: rows {first_row}..{end} are outside its {pool_rows} pool rows")]

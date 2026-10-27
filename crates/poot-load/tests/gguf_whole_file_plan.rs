@@ -40,7 +40,7 @@ fn local_qwen38_files() -> Option<Vec<PathBuf>> {
             !required,
             "{MODELS_DIR_VARIABLE} is unset but {REQUIRE_MODELS_VARIABLE}=1"
         );
-        eprintln!("SKIP: the Qwen3.8 GGUF files need {MODELS_DIR_VARIABLE}, which is unset");
+        eprintln!("POOT-SKIP: the Qwen3.8 GGUF files need {MODELS_DIR_VARIABLE}, which is unset");
         return None;
     };
     let mut files = Vec::new();
@@ -68,7 +68,7 @@ fn local_qwen38_files() -> Option<Vec<PathBuf>> {
         "{REQUIRE_MODELS_VARIABLE}=1 but {models} holds no Qwen3.8 GGUF"
     );
     if files.is_empty() {
-        eprintln!("SKIP: no Qwen3.8 GGUF under {models}");
+        eprintln!("POOT-SKIP: no Qwen3.8 GGUF under {models}");
         return None;
     }
     Some(files)

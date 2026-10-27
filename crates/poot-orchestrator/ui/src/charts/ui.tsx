@@ -66,6 +66,28 @@ export function ChartCard(props: {
   );
 }
 
+// The legend of a chart, in the page above the plot: it wraps to as many lines as the width needs, so it can
+// never overlap an axis title (a legend drawn inside the SVG has a fixed height and does).
+export function ChartLegend(props: {items: {label: string; color: string; dashed?: boolean}[]}) {
+  return (
+    <div className={styles.legend}>
+      {props.items.map((item) => (
+        <span className={styles.legendItem} key={item.label}>
+          <span
+            className={styles.legendSwatch}
+            style={{
+              background: item.dashed
+                ? `repeating-linear-gradient(90deg, ${item.color} 0 5px, transparent 5px 8px)`
+                : item.color,
+            }}
+          />
+          {item.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 export function Empty(props: {children: React.ReactNode}) {
   return <div className={styles.empty}>{props.children}</div>;
 }

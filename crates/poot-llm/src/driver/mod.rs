@@ -73,6 +73,8 @@ mod llamacpp_bisect_tests;
 #[cfg(test)]
 mod llamacpp_kl_tests;
 #[cfg(test)]
+mod llamacpp_longrope_tests;
+#[cfg(test)]
 mod placed_tests;
 #[cfg(test)]
 mod tests;
@@ -96,7 +98,7 @@ use poot_graph_plan::{
 };
 use poot_models::io::{InputSet, ModelSchema, ProgramId, ProgramSpec, RequestInputs, StepInput};
 use poot_models::model::{
-    FamilyKey, HiddenCarry, KvLayout, ShapeReason, StepShape, StepSpec, TraceError,
+    FamilyKey, HiddenCarry, KvDtype, KvLayout, ShapeReason, StepShape, StepSpec, TraceError,
 };
 use poot_profile::{Mark, Report, TimingSnapshot};
 use poot_tensor::{DType, HostTensor};
@@ -280,6 +282,10 @@ pub struct DriverOptions {
     /// window ([`DraftPolicy::carry_window`]): a [`DraftPolicy::Mtp`] driver refuses options that
     /// name none or a narrower one. `None` writes none.
     pub hidden_window: Option<NonZeroUsize>,
+    /// The KV cache dtype the user asked for, overriding the model's preference; `None` takes the model's
+    /// preference or the engine default ([`KvDtype::resolve`]). One dtype per driver: state is keyed by
+    /// (name, aval), so every program of the driver declares its caches in it.
+    pub kv_dtype: Option<KvDtype>,
 }
 
 impl DriverOptions {
@@ -307,6 +313,7 @@ impl DriverOptions {
             charge: program_retention,
             draft: DraftPolicy::Off,
             hidden_window: None,
+            kv_dtype: None,
         }
     }
 
@@ -730,6 +737,16 @@ struct Settings {
     /// (name, aval) inside an executable, so a program that declared another extent would bind a
     /// separate zero-filled buffer and its readers would see stale rows.
     hidden: Option<HiddenCarry>,
+    /// The KV cache dtype every program of the driver stores: [`DriverOptions::kv_dtype`] resolved against the
+    /// model's preference once, at construction.
+    kv_dtype: KvDtype,
+}
+
+impl Settings {
+    /// A step of `rows` sequences of `tokens` new tokens at the driver's capacity and KV dtype.
+    fn step_shape(&self, rows: NonZeroUsize, tokens: NonZeroUsize) -> StepShape {
+        StepShape::new(rows, tokens, self.options.capacity).with_kv_dtype(self.kv_dtype)
+    }
 }
 
 /// One decode loop over an executor, built from a [`ModelHandle`], an executor and [`DriverOptions`].
@@ -784,6 +801,7 @@ impl Driver<Unprepared> {
         let placed = Placed::resolve(executor.target_set(), Placement::Single)?;
         let chunks = Self::check_options(&handle, &options)?;
         let weights = Arc::new(handle.model().weights().clone());
+        capacity::log_device_memory(&*executor, "executor open");
         let exe = executor.load_weights(handle.shared_store().clone(), Arc::clone(&weights))?;
         Ok(Self::assemble(
             handle, executor, exe, options, chunks, placed, weights,
@@ -872,7 +890,8 @@ impl Driver<Unprepared> {
             .ok()
             .and_then(std::num::NonZeroU32::new)
             .ok_or(InvalidOptions::TensorWithoutDevices)?;
-        let shape = StepShape::new(NonZeroUsize::MIN, NonZeroUsize::MIN, options.capacity);
+        let shape = StepShape::new(NonZeroUsize::MIN, NonZeroUsize::MIN, options.capacity)
+            .with_kv_dtype(KvDtype::resolve(options.kv_dtype, handle.config().kv_dtype));
         let graph = handle
             .model()
             .trace(&StepSpec::step(shape), options.trace)
@@ -898,6 +917,7 @@ impl Driver<Unprepared> {
     ) -> Self {
         let formats = WeightFormats::from_weight_map(handle.model().weights());
         let speculation = speculate::Speculation::new(options.draft.clone());
+        let kv_dtype = KvDtype::resolve(options.kv_dtype, handle.config().kv_dtype);
         Self {
             handle,
             runtime: Runtime {
@@ -915,6 +935,7 @@ impl Driver<Unprepared> {
                 chunks,
                 time_phases: false,
                 hidden: None,
+                kv_dtype,
             },
             ledger: ledger::PreparedLedger::default(),
             speculation,
@@ -931,11 +952,9 @@ impl Driver<Unprepared> {
     /// runs as more chunks; a pool that cannot serve one granule, a pool not smaller than the experts
     /// and a model with no routed experts are refused.
     pub fn with_expert_pool(mut self, slots_per_layer: NonZeroUsize) -> Result<Self, DriverError> {
-        let shape = StepShape::new(
-            NonZeroUsize::MIN,
-            NonZeroUsize::MIN,
-            self.settings.options.capacity,
-        );
+        let shape = self
+            .settings
+            .step_shape(NonZeroUsize::MIN, NonZeroUsize::MIN);
         let graph = self
             .handle
             .model()
@@ -1119,6 +1138,12 @@ impl<S: State> Driver<S> {
             manager.reset();
         }
         Ok(())
+    }
+
+    /// The KV cache dtype every program of the driver stores: the user's [`DriverOptions::kv_dtype`], else the
+    /// model's preference, else [`KvDtype::DEFAULT`].
+    pub fn kv_dtype(&self) -> KvDtype {
+        self.settings.kv_dtype
     }
 
     /// What the driver has done so far, with the residency manager's counters read current.
@@ -1358,6 +1383,10 @@ impl<S: State> Driver<S> {
         (program_kind, shape): (Program, StepShape),
     ) -> Result<Prepared, DriverError> {
         let id = self.runtime.executor.add_entry(exe, program)?;
+        capacity::log_device_memory(
+            &*self.runtime.executor,
+            &format!("entry added ({program_kind:?}, {shape:?})"),
+        );
         let numerics = program.numerics_class();
         tracing::debug!(
             ?numerics,
@@ -1700,25 +1729,20 @@ impl Driver<Serving> {
     /// resident and only the rest is prefilled. The sequence stays open for the next turn until
     /// [`Driver::end_conversation`] or an error, which closes it.
     ///
-    /// Turns can be any length, so the prepared set is the admitted one ([`Warm::Admitted`]), not the
-    /// pieces one prompt plans to.
+    /// Turns can be any length, so the prepared set is the admitted one ([`ServingShapes::turn`]), not the
+    /// pieces one prompt plans to. A driver planned for its device (`fit_prefill_chunk`) is planned over
+    /// those shapes, so the extension here adds nothing the plan did not count.
     pub fn generate_turn(
         &mut self,
         conversation: &mut Conversation,
         request: GenerateRequest,
         sink: &mut dyn TokenSink,
     ) -> Result<Generation, DriverError> {
-        let head = Head::serving(&request.sampler);
-        let shapes = ServingShapes {
-            layout: self.state.layout(),
-            rows: &[NonZeroUsize::MIN],
-            heads: &[head],
-            warm: Warm::Admitted,
-            windows: &[],
-            adapters: &[],
-            chain: None,
-        };
+        let heads = [Head::serving(&request.sampler)];
+        let shapes = ServingShapes::turn(self.state.layout(), &heads);
+        capacity::log_device_memory(&*self.runtime.executor, "turn start");
         self.extend(&shapes)?;
+        capacity::log_device_memory(&*self.runtime.executor, "turn extended");
         let seq = match conversation.seq {
             Some(seq) => {
                 self.resume(seq, &request.prompt, request.max_new)?;
@@ -1744,6 +1768,7 @@ impl Driver<Serving> {
         };
         conversation.seq = Some(seq);
         let generation = self.decode_sequence(seq, request, sink);
+        capacity::log_device_memory(&*self.runtime.executor, "turn done");
         match generation {
             Err(error) => {
                 conversation.seq = None;

@@ -152,47 +152,6 @@ fn bf16_const_cast_is_bit_exact_on_ptx() {
     }
 }
 
-/// Card 663 SC-001, PTX. The batched, multi-block tensor-core matmul: `[2, 32, 48] x [2, 48, 32]` bf16 operands
-/// (`poot_executor_parity::launch::wmma_bf16_batched_fixture`), 2 x 2 x 2 output tiles each accumulating three
-/// 16-wide K blocks, every output element of both steps compared with the oracle. The fixture values give every
-/// K block a distinct nonzero contribution to every output (at least 16 per block), so a dropped, doubled or
-/// wrong-batch block moves all outputs far past the parity tolerance.
-///
-/// Mutation: drop the last K block in `poot-kernelgen`'s `tensor_core_tiles` (the loop bound `k0 < k` becomes
-/// `k0 + 16 < k`), with a fresh `POOT_KERNEL_CACHE_DIR`; every output is short by its last block's contribution
-/// and the row goes red.
-#[test]
-fn batched_multi_block_wmma_matmul_matches_the_oracle_on_ptx() {
-    let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
-        return;
-    };
-    let t = device.target();
-    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-    let fixture = poot_executor_parity::launch::wmma_bf16_batched_fixture();
-    let multiplies_on_tensor_cores = poot_executor_parity::staged(&fixture, t)
-        .stages()
-        .flat_map(|(_, _, program)| {
-            program
-                .planned()
-                .filter_map(|(_, plan)| plan.single().map(|dispatch| dispatch.body().clone()))
-                .collect::<Vec<_>>()
-        })
-        .any(|body| {
-            body.blocks
-                .iter()
-                .flat_map(|block| &block.statements)
-                .any(|statement| matches!(statement, poot_kernel_ir::Statement::WmmaMma { .. }))
-        });
-    assert!(
-        multiplies_on_tensor_cores,
-        "{}: no dispatched kernel multiplies on the WMMA tensor cores",
-        fixture.name
-    );
-    let mut oracle = oracle_for(&fixture.graph, &fixture.store);
-    poot_executor_parity::run_parity(exec.as_mut(), t, &fixture, &mut oracle)
-        .unwrap_or_else(|e| panic!("{e}"));
-}
-
 /// POOT-1074: a recurrent state pool addressed by slot (rows in any order, a masked row committing
 /// nothing) and `reset_state(Row(n))` zeroing exactly pool row `n`, on PTX; a row outside the pool is a
 /// typed `StateRow` refusal that zeroes nothing.
@@ -299,4 +258,22 @@ fn selected_attention_reads_exactly_the_selected_blocks_on_ptx() {
                 .unwrap_or_else(|e| panic!("{e}"));
         }
     }
+}
+
+/// Prefill MoE rows are sorted by expert before the indexed contraction (POOT-1336). The grouping equals a stable
+/// sort by expert and its inverse at every replayed step, on routings that break a naive grouping (every row on one
+/// expert, experts without rows, ties, ids outside the table sorted last, a partial last workgroup, more experts than
+/// rows); a contraction through it is bit-identical per row to the direct one; and an invalid id is a NaN row in
+/// both halves, never another expert's result.
+///
+/// Mutation: in `expert_group` count a bucket's start with `Le` instead of `Lt`; the order and its inverse differ
+/// from the stable sort on the first case.
+#[test]
+fn expert_grouping_is_the_stable_sort_and_changes_no_row_on_ptx() {
+    let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
+        return;
+    };
+    let target = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::routing::assert_expert_grouping_on_device(exec.as_mut(), target);
 }

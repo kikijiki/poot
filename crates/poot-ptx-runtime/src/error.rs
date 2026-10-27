@@ -23,7 +23,7 @@ pub enum PtxError {
     /// The kernel text or entry name could not be loaded as a PTX module; carries the reason.
     #[error("invalid kernel text or entry name: {0}")]
     BadKernel(String),
-    /// A dispatch was given a [`poot_runtime_common::CompiledKernel`] compiled for a different backend
+    /// A dispatch was given a [`poot_codegen::CompiledKernel`] compiled for a different backend
     /// (card 608): this runtime only ever dispatches an `Nvptx`-compiled kernel.
     #[error("PTX dispatch requires an Nvptx-compiled kernel, got one compiled for {actual:?}")]
     WrongKernelTarget {
@@ -33,7 +33,7 @@ pub enum PtxError {
     /// The bound buffers did not meet the compiled kernel's argument schema (card 608, SC-002): a typed
     /// release-build error before any submission.
     #[error("kernel argument schema violation: {0}")]
-    KernelArgs(#[from] poot_runtime_common::KernelArgError),
+    KernelArgs(#[from] poot_codegen::KernelArgError),
     /// The CUDA driver library could not be loaded on this host; carries the loader message.
     #[error("CUDA library unavailable: {0}")]
     CudaUnavailable(String),
@@ -47,12 +47,41 @@ pub enum PtxError {
         /// Elements the caller supplied.
         got: usize,
     },
-    /// A buffer is longer than the `u32` element count the kernel ABI passes.
-    #[error("{op} element count {elements} exceeds the native u32 kernel-length ABI")]
+    /// A buffer bound to a kernel parameter does not start on [`poot_codegen::BUFFER_PARAM_ALIGN`], which the kernel
+    /// bodies' aligned group reads assume.
+    #[error(
+        "{op} binds parameter {param} at device address {address:#x}, not {alignment}-byte aligned"
+    )]
+    MisalignedBinding {
+        /// The runtime entry point that refused.
+        op: &'static str,
+        /// The kernel parameter (inputs in order, the output last).
+        param: usize,
+        /// The buffer's device address.
+        address: u64,
+        /// The alignment the binding contract requires.
+        alignment: u64,
+    },
+    /// A kernel narrowed to 32-bit index math is bound to a buffer longer than its index bound reaches.
+    #[error(
+        "{op} binds {elems} elements to a 32-bit-index kernel whose indices reach {scale} per element plus {slack}, past the 32-bit index range"
+    )]
+    IndexBoundExceeded {
+        /// The runtime entry point that refused.
+        op: &'static str,
+        /// The longest length bound to the kernel.
+        elems: usize,
+        /// The kernel's index bound: index units per element.
+        scale: u32,
+        /// The kernel's index bound: the overshoot past `scale * elems`.
+        slack: u32,
+    },
+    /// A kernel argument is longer than the `i64` element count the NVPTX slice ABI passes.
+    #[error("{op} element count {elements} exceeds the native i64 kernel-length ABI")]
     ElementCountTooLarge {
         /// The runtime entry point that refused.
         op: &'static str,
-        /// The element count that does not fit in `u32`.
+        /// The element count that does not fit in `i64`.
         elements: usize,
     },
     /// `elements * element_bytes` overflowed `usize`.

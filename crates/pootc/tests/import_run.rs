@@ -13,8 +13,8 @@
 use poot_test_util::contained_child::ContainChild;
 use std::process::Command;
 
+use poot_codegen::CompiledKernel;
 use poot_kernel_ir::Body;
-use poot_runtime_common::CompiledKernel;
 use poot_wgpu_runtime::{Context, KernelBuffer};
 
 /// Serialize GPU access within this test binary: the Intel Arc Vulkan driver segfaults when several tests
@@ -24,30 +24,14 @@ fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
     GPU.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// `CARGO_MANIFEST_DIR`, read at runtime (not baked via `env!`): the compile-time macro's value is
-/// embedded into this test binary's compiled object code at build time, and a shared compile cache (kache)
-/// that reuses that object across worktrees by source-content hash would then serve whichever worktree's
-/// path happened to compile it first (card 530's build.rs fix; card 543 review). `std::env::var` reads the
-/// environment cargo sets fresh for every test-binary invocation, so it is correct regardless of which
-/// worktree compiled the binary.
-fn manifest_dir() -> &'static std::path::Path {
-    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
-        std::path::PathBuf::from(
-            std::env::var("CARGO_MANIFEST_DIR")
-                .expect("CARGO_MANIFEST_DIR must be set by cargo for test binaries"),
-        )
-    })
-}
-
-/// `<CARGO_MANIFEST_DIR>/<rel>`, leaked to `&'static str` to match the call-site type these tests need
+/// `<manifest dir>/<rel>`, leaked to `&'static str` to match the call-site type these tests need
 /// (`concat!(env!(...), ..)`'s old return type); test binaries exit after the process runs, so the leak is
 /// bounded and cheap.
 fn manifest_path(rel: &str) -> &'static str {
-    Box::leak(format!("{}/{rel}", manifest_dir().display()).into_boxed_str())
+    Box::leak(format!("{}/{rel}", poot_test_util::manifest_dir().display()).into_boxed_str())
 }
 
-/// `CARGO_BIN_EXE_pootc`, read at runtime for the same reason as [`manifest_dir`].
+/// `CARGO_BIN_EXE_pootc`, read at runtime for the same reason as [`poot_test_util::manifest_dir`].
 fn pootc_exe() -> &'static str {
     static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     EXE.get_or_init(|| {
@@ -69,7 +53,7 @@ fn kernel_intrinsics_rmeta() -> &'static std::path::Path {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let manifest_dir = manifest_dir();
+        let manifest_dir = poot_test_util::manifest_dir();
         let mut checkout = DefaultHasher::new();
         manifest_dir.hash(&mut checkout);
         let target_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -123,6 +107,74 @@ fn kernel_intrinsics_extern() -> String {
     )
 }
 
+/// Build `poot-kernel-attr` from this checkout with its device pass and return the proc-macro library cargo
+/// reports for it, memoized for the process. A kernel declaring its launch in `#[kernel(workgroup(..), lds(..))]`
+/// needs the macro to expand to the `declare_*` calls the importer reads. The target directory is keyed by the
+/// checkout (mirrors `macro_kernel.rs`'s `build_proc_macro`).
+fn kernel_attr_dll() -> &'static std::path::Path {
+    static DLL: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DLL.get_or_init(|| {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let manifest_dir = poot_test_util::manifest_dir();
+        let mut checkout = DefaultHasher::new();
+        manifest_dir.hash(&mut checkout);
+        let target_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("kernel-attr-device-{:016x}", checkout.finish()));
+        let output = Command::new(env!("CARGO"))
+            .args([
+                "build",
+                "--locked",
+                "--message-format=json-render-diagnostics",
+                "--features",
+                "device-pass",
+            ])
+            .arg("--manifest-path")
+            .arg(manifest_dir.join("../poot-kernel-attr/Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .output()
+            .expect("run cargo to build poot-kernel-attr");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "building poot-kernel-attr failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        let libraries: Vec<std::path::PathBuf> = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .filter(|message| message["target"]["name"] == "poot_kernel_attr")
+            .filter(|message| message["target"]["kind"] == serde_json::json!(["proc-macro"]))
+            .flat_map(|message| message["filenames"].as_array().cloned().unwrap_or_default())
+            .filter_map(|name| name.as_str().map(std::path::PathBuf::from))
+            .filter(|path| path.extension().is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION))
+            .collect();
+        let [library] = libraries.as_slice() else {
+            panic!(
+                "cargo reported {} proc-macro libraries for poot-kernel-attr, wanted exactly one: {libraries:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                libraries.len()
+            );
+        };
+        library.clone()
+    })
+}
+
+/// The `--extern` arguments of every pootc invocation that compiles a kernel source: the intrinsics it calls
+/// and the `#[kernel]` macro it declares its launch with.
+fn kernel_externs() -> Vec<String> {
+    vec![
+        "--extern".to_string(),
+        kernel_intrinsics_extern(),
+        "--extern".to_string(),
+        format!("poot_kernel_attr={}", kernel_attr_dll().display()),
+    ]
+}
+
 /// The dispatchable handle for `body` over the artifact pootc staged for it. A handle is built only from a
 /// sealed artifact, so `body` is compiled afresh and the staged bytes must be byte-identical to that compile:
 /// the kernel that runs is then both the one pootc published and the one `body` compiles to.
@@ -164,8 +216,7 @@ fn pootc_compile(kernel_file: &str, src_name: &str) -> (CompiledKernel, u32, boo
             "-o",
         ])
         .arg(out_dir.join(format!("{src_name}.out")))
-        .arg("--extern")
-        .arg(kernel_intrinsics_extern())
+        .args(kernel_externs())
         .env("POOT_KERNEL_OUT", &out_dir)
         .status()
         .expect("run pootc");
@@ -199,8 +250,7 @@ fn pootc_compile_nvptx(kernel_file: &str, src_name: &str) -> (Body, String) {
             "-o",
         ])
         .arg(out_dir.join(format!("{src_name}.out")))
-        .arg("--extern")
-        .arg(kernel_intrinsics_extern())
+        .args(kernel_externs())
         .env("POOT_KERNEL_OUT", &out_dir)
         .status()
         .expect("run pootc");
@@ -282,8 +332,7 @@ fn regenerate_asset(entry: &poot_graph_plan::AssetEntry) -> String {
         .arg(&src_path)
         .arg("-o")
         .arg(out_dir.join(format!("{}.out", entry.source)))
-        .arg("--extern")
-        .arg(kernel_intrinsics_extern())
+        .args(kernel_externs())
         .env("POOT_KERNEL_OUT", &out_dir)
         .status()
         .expect("run pootc");
@@ -430,8 +479,7 @@ fn llc_spin_depth4_and_reproducer() {
         .contained()
         .args(["--edition", "2021", "--crate-type", "lib", kernel, "-o"])
         .arg(out_dir.join("llc_spin_depth4_and.out"))
-        .arg("--extern")
-        .arg(kernel_intrinsics_extern())
+        .args(kernel_externs())
         .env("POOT_KERNEL_OUT", &out_dir)
         .stdout(std::process::Stdio::from(
             log.try_clone().expect("clone the log handle"),
@@ -712,8 +760,7 @@ fn assert_trap_traps_on_ptx() {
         .contained()
         .args(["--edition", "2021", "--crate-type", "lib", kernel, "-o"])
         .arg(out_dir.join("assert_trap.out"))
-        .arg("--extern")
-        .arg(kernel_intrinsics_extern())
+        .args(kernel_externs())
         .env("POOT_KERNEL_OUT", &out_dir)
         .status()
         .expect("run pootc");
@@ -738,7 +785,7 @@ fn assert_trap_traps_on_ptx() {
     let ctx = match poot_ptx_runtime::PtxContext::new() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("SKIP assert_trap_traps_on_ptx: no PTX device ({e})");
+            eprintln!("POOT-SKIP assert_trap_traps_on_ptx: no PTX device ({e})");
             return;
         }
     };
@@ -809,8 +856,7 @@ fn add_kernel_imported_from_mir_emits_ptx() {
         .contained()
         .args(["--edition", "2021", "--crate-type", "lib", kernel, "-o"])
         .arg(out_dir.join("add.out"))
-        .arg("--extern")
-        .arg(kernel_intrinsics_extern())
+        .args(kernel_externs())
         .env("POOT_KERNEL_OUT", &out_dir)
         .status()
         .expect("run pootc");
@@ -2328,9 +2374,9 @@ fn imported_atomic_add_sum_smoke_runs_on_gpu() {
     // 64-lane workgroup = 4 workgroups, exercising cross-workgroup global-atomic contention. Proves the
     // imported `Rvalue::GlobalAtomic { Add }` lowers to valid SPIR-V and runs bit-correct on wgpu.
     //
-    // Card 559: loads the committed asset through `ImportedKernel::AtomicAddSumSmoke`, not a fresh
+    // Card 559: loads the committed asset through `ProbeKernel::AtomicAddSumSmoke`, not a fresh
     // `pootc_compile` of the source - this is the one real consumer that keeps the manifest entry live.
-    let body = poot_graph_plan::ImportedKernel::AtomicAddSumSmoke
+    let body = poot_graph_plan::ProbeKernel::AtomicAddSumSmoke
         .body()
         .clone();
     assert_eq!(
@@ -2507,142 +2553,6 @@ fn imported_tiled_gemm_masked_matches_reference() {
         "imported ragged tiled GEMM (branchless bounds masking + in-loop barrier) matches CPU - the mask is \
          correct and convergence-safe"
     );
-}
-
-#[test]
-fn imported_tiled_gemm_coarsened_matches_reference() {
-    // card 044: the thread-coarsened tiled GEMM (kernelgen tiled_gemm_dt's structure): each of the 64 lanes
-    // computes two output rows of a 2*TS x TS tile, so the A sub-tile is 128 slots (bigger than the 64-lane
-    // workgroup). The first kernel to use `const LDS_SIZE` to size its LDS arrays independently of the lane
-    // count. Verified vs a CPU A@B reference over shapes spanning multiple 2*TS row-tiles and ragged shapes
-    // where the second row is out of bounds.
-    const TS: usize = 8;
-    let kernel = manifest_path("kernels/contraction/tiled_gemm_coarsened.rs");
-    let (compiled_kernel, params, _needs_error_word) =
-        pootc_compile(kernel, "tiled_gemm_coarsened");
-    assert_eq!(params, 4, "tiled_gemm_coarsened: a, b, dims, out");
-
-    let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
-    };
-    for (m, k, n) in [
-        (16usize, 8usize, 8usize), // one 2*TS x TS tile
-        (32, 16, 16),              // multiple row-tiles, multi K-tile
-        (17, 11, 9),               // ragged: 2 row-tiles, row1 partly out of bounds, partial K-tile
-        (7, 5, 9),                 // M < TS: row1 fully out of bounds for every lane
-        (33, 10, 20),              // ragged across all dims
-    ] {
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32) * 0.1 - 0.7).collect();
-        let b: Vec<f32> = (0..k * n).map(|i| ((i % 11) as f32) * 0.07 - 0.3).collect();
-        let want: Vec<f32> = (0..m * n)
-            .map(|idx| {
-                let (r, c) = (idx / n, idx % n);
-                (0..k).map(|j| a[r * k + j] * b[j * n + c]).sum()
-            })
-            .collect();
-        // coarsened grid: ceil(M/(2*TS)) x ceil(N/TS) tiles, 64 lanes each.
-        let tiles = m.div_ceil(2 * TS) * n.div_ceil(TS);
-        let mut bufs = [
-            KernelBuffer::read_only_f32(&a),
-            KernelBuffer::read_only_f32(&b),
-            KernelBuffer::read_only_u32(&[m as u32, k as u32, n as u32, 0]),
-            KernelBuffer::write_f32(m * n),
-        ];
-        ctx.dispatch(
-            "tgc",
-            &compiled_kernel,
-            [64, 1, 1],
-            [(tiles * 64) as u32, 1, 1],
-            &mut bufs,
-        )
-        .expect("dispatch imported tiled_gemm_coarsened");
-        let got = bufs[3].as_f32();
-        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-            assert!(
-                (g - w).abs() < 1e-3,
-                "tiled_gemm_coarsened {m}x{k}x{n} elem {i} (r={},c={}): {g} vs CPU ref {w}",
-                i / n,
-                i % n
-            );
-        }
-    }
-    eprintln!(
-        "imported coarsened tiled GEMM (2 rows/lane, 128-slot LDS via const LDS_SIZE) matches CPU - the LDS \
-         array size is now decoupled from the lane count"
-    );
-}
-
-#[test]
-fn imported_tiled_gemm_batched_matches_reference() {
-    // card 044: the batched-weight tiled GEMM (A[E,M,K] @ B[E,K,N], per-expert/per-head weight): the
-    // coarsened kernel plus a batch decode and per-batch A/B/C bases. The Body the planner swaps in for
-    // is_batched_tiled_gemm. Verified vs a CPU per-batch `A@B` reference, with ragged shapes so the masking
-    // and the batch/tile decode are both exercised.
-    const TS: usize = 8;
-    let kernel = manifest_path("kernels/contraction/tiled_gemm_batched.rs");
-    let (compiled_kernel, params, _needs_error_word) = pootc_compile(kernel, "tiled_gemm_batched");
-    assert_eq!(params, 4, "tiled_gemm_batched: a, b, dims, out");
-
-    let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
-    };
-    for (e, m, k, n) in [
-        (2usize, 16usize, 8usize, 8usize),
-        (3, 17, 11, 9),
-        (4, 7, 5, 9),
-        (2, 33, 10, 20),
-    ] {
-        let a: Vec<f32> = (0..e * m * k)
-            .map(|i| ((i % 17) as f32) * 0.1 - 0.7)
-            .collect();
-        let b: Vec<f32> = (0..e * k * n)
-            .map(|i| ((i % 11) as f32) * 0.07 - 0.3)
-            .collect();
-        // per-batch CPU reference: out[bt, r, c] = sum_j a[bt,r,j] * b[bt,j,c].
-        let want: Vec<f32> = (0..e * m * n)
-            .map(|idx| {
-                let bt = idx / (m * n);
-                let rem = idx % (m * n);
-                let (r, c) = (rem / n, rem % n);
-                (0..k)
-                    .map(|j| a[bt * m * k + r * k + j] * b[bt * k * n + j * n + c])
-                    .sum()
-            })
-            .collect();
-        let tiles = e * m.div_ceil(2 * TS) * n.div_ceil(TS);
-        let mut bufs = [
-            KernelBuffer::read_only_f32(&a),
-            KernelBuffer::read_only_f32(&b),
-            KernelBuffer::read_only_u32(&[e as u32, m as u32, k as u32, n as u32]),
-            KernelBuffer::write_f32(e * m * n),
-        ];
-        ctx.dispatch(
-            "tgb",
-            &compiled_kernel,
-            [64, 1, 1],
-            [(tiles * 64) as u32, 1, 1],
-            &mut bufs,
-        )
-        .expect("dispatch imported tiled_gemm_batched");
-        let got = bufs[3].as_f32();
-        for (i, (gv, wv)) in got.iter().zip(&want).enumerate() {
-            assert!(
-                (gv - wv).abs() < 1e-3,
-                "tiled_gemm_batched E{e} {m}x{k}x{n} elem {i}: {gv} vs CPU ref {wv}"
-            );
-        }
-    }
-    eprintln!("imported batched-weight tiled GEMM (per-batch bases) matches CPU per-expert A@B");
 }
 
 #[test]

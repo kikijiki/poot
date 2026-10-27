@@ -182,6 +182,7 @@ fn witness_op(op: &OpKind) -> WitnessOp {
         | OpKind::DenseRowGather { .. }
         | OpKind::ContractionEpilogue { .. }
         | OpKind::ArgTopK { .. }
+        | OpKind::ExpertGroup { .. }
         | OpKind::IndexedMatMul
         | OpKind::DynamicUpdateSlice { .. }
         | OpKind::Fused(_)

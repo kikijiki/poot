@@ -270,7 +270,7 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity() {
             kernel: &kernel,
             inputs: &[Arg {
                 buffer: &len_src,
-                elems: REAL_LEN as u32,
+                elems: REAL_LEN,
             }],
             output: Arg {
                 buffer: &out_buf,

@@ -1,0 +1,174 @@
+{
+  "backend": "ptx",
+  "case": "prefill-attention-8192",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 48310.661
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 48199.344
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 47995.777
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 47954.525
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 48039.37300000001
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 47999.974
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 48151.902
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 47900.193
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 48026.974
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 134217728,
+      "peak_bytes": 134217728,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 67108864,
+      "peak_bytes": 67108864,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 65536,
+      "peak_bytes": 65536,
+      "role": "Input"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 8192,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 8192
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 67108864,
+    "weight_copies": 1
+  },
+  "plan": [
+    "attention [6d3a1980e10ff0e384bea559a33e625feb952403f7b5a8d5b187902419fd3167]"
+  ],
+  "plan_id": "e997df06e55d94c10c44af2a1b63014ea948afde2b18b1d2ba962682f913db2a",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 1.9524678437753117e-07,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-ptx-device",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "prefill-attention-8192",
+    "--out",
+    "benchmarks/performance-bank/receipts/ptx/prefill-attention-8192.json"
+  ],
+  "parent_revision": "ce0d5a1ec6adf1a248789951101210d9493c4762",
+  "binary_sha256": "f3d48cded04c71a1e921a19a9b78d949e6587f9090f8feb6726c4ae41ff1ac57",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "bhsd",
+    "dimensions": {
+      "hq": 16,
+      "hkv": 8,
+      "d": 128,
+      "lq": 8192,
+      "cap": 8192
+    },
+    "prompt_tokens": 1,
+    "live_context": 8192,
+    "max_context": 8192,
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "prefill-attention-8192"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "ptx",
+    "device": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "driver": "595.91.07"
+  },
+  "identity_digest": "979524a18e965f318da65ceff507991d2eb5b734218604833aed3cc09ab47e3f",
+  "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"
+}

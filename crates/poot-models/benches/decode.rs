@@ -95,7 +95,13 @@ fn bind(g: &Graph) -> HashMap<ValueId, Value> {
         }
     }
     for (si, _) in g.state() {
-        inputs.insert(si, Value::from(HostTensor::zeros(g.aval(si).shape.clone())));
+        inputs.insert(
+            si,
+            Value::from(HostTensor::zeros_of(
+                g.aval(si).dtype,
+                g.aval(si).shape.clone(),
+            )),
+        );
     }
     inputs
 }

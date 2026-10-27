@@ -517,6 +517,7 @@ fn plan_eqn_with_choice(
         },
         &std::collections::HashMap::new(),
         &poot_graph_plan::test_support::roomy_body_limits(),
+        None,
     )
     .map(|planned| (planned.plan, planned.choice))
 }

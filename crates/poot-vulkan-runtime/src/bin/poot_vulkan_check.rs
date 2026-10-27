@@ -37,7 +37,7 @@ fn read_f32(buf: &DeviceBuffer) -> Vec<f32> {
         .collect()
 }
 
-fn compiled_add(body: &poot_kernel_ir::Body, name: &str) -> poot_runtime_common::CompiledKernel {
+fn compiled_add(body: &poot_kernel_ir::Body, name: &str) -> poot_codegen::CompiledKernel {
     let dir: PathBuf = std::env::temp_dir().join("poot-vulkan-check");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
@@ -50,7 +50,7 @@ fn run_add() -> i32 {
     let ctx = match Context::new() {
         Ok(c) => c,
         Err(e) => {
-            println!("SKIP: no Vulkan device available ({e})");
+            println!("POOT-SKIP: no Vulkan device available ({e})");
             return 0;
         }
     };

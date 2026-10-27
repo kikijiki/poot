@@ -2086,7 +2086,7 @@ fn bf16_bits(x: f32) -> u16 {
 /// POOT-1032 (ROCm, the generated tiled GEMM): the dense head at `M > 1` over an F32 and a packed-BF16 `[N, K]`
 /// weight, with the same chain, fuses into one `ContractionEpilogue { head: Dense }` at a single partial row-tile
 /// (`M == 5`) and at many (`M == 160`); the device result meets the oracle. Mutation: drop the
-/// epilogue from the tiled store in `tiled_region`; the nonzero inputs then differ and this row goes red.
+/// epilogue from the store chain of `tiled_body` (`contraction/tiled.rs`); the nonzero inputs then differ and this row goes red.
 #[test]
 fn a_dense_tiled_epilogue_matches_the_oracle_on_rocm() {
     let Some((target, mut rocm)) = try_rocm() else {

@@ -278,6 +278,21 @@ impl HostTensor {
         Self::f32(shape, vec![0.0f32; count])
     }
 
+    /// A tensor of zeros of `dtype` (F32, F16, BF16 or I32): a carried state's initial value in its declared
+    /// dtype (an f16 KV cache, an I32 token history), as a test binds it. Panics on any other dtype, which has
+    /// no zero carrier.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn zeros_of(dtype: DType, shape: Vec<usize>) -> Self {
+        let count = shape.iter().product();
+        match dtype {
+            DType::F32 => Self::zeros(shape),
+            DType::F16 => Self::f16(shape, vec![0; count]),
+            DType::BF16 => Self::bf16(shape, vec![0; count]),
+            DType::I32 => Self::i32(shape, vec![0; count]),
+            other => panic!("HostTensor::zeros_of: no {other} carrier"),
+        }
+    }
+
     fn of_class(dtype: DType, shape: Vec<usize>, data: HostData) -> Self {
         Self::new(dtype, shape, data).unwrap_or_else(|error| panic!("HostTensor: {error}"))
     }

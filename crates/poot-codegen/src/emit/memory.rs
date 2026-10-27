@@ -15,7 +15,13 @@ impl<'a> Emitter<'a> {
             return Err(EmitError::Unsupported("Len of a non-param".into()));
         }
         match self.target {
-            Target::Nvptx | Target::SpirvOpenCl => Ok((format!("%n{}", slice.index), "i64".into())),
+            // A narrowed body truncates the ABI's i64 length to its i32 `usize`: the planner proved it fits.
+            Target::Nvptx if self.narrowed() => {
+                let t = self.fresh();
+                let _ = writeln!(w, "  {t} = trunc i64 %n{} to i32", slice.index);
+                Ok((t, "i32".into()))
+            }
+            Target::Nvptx => Ok((format!("%n{}", slice.index), "i64".into())),
             // AIE core: the length is a scalar i32 kernel arg per slice (the IRON harness passes the tile length); same
             // model as NVPTX but 32-bit.
             Target::AieCore => Ok((format!("%n{}", slice.index), "i32".into())),
@@ -185,11 +191,12 @@ impl<'a> Emitter<'a> {
         // load the index value (usize-width).
         let (idx_val, _) = self.load_place(&Place::local(idx_local), w)?;
         match self.target {
-            Target::Nvptx | Target::SpirvOpenCl => {
+            Target::Nvptx => {
                 let p = self.fresh();
+                let us = self.usize_llty();
                 let _ = writeln!(
                     w,
-                    "  {p} = getelementptr inbounds {elem_llty}, ptr addrspace(1) %p{}, i64 {idx_val}",
+                    "  {p} = getelementptr inbounds {elem_llty}, ptr addrspace(1) %p{}, {us} {idx_val}",
                     place.local.index
                 );
                 Ok((p, elem_llty, 1))
@@ -231,24 +238,18 @@ impl<'a> Emitter<'a> {
 
     /// Address a `Ty::Vec` access `(*place.local)[i]` at vector-group index `i` (spec 134 P1,
     /// `Rvalue::VectorLoad`/`Statement::VectorStore`): elements `[i*lanes, i*lanes+lanes)` of the underlying scalar
-    /// buffer, reinterpreted as one `vec_ty` value. SpirvVulkan-only for now (FR-007). The resource for this access
+    /// buffer, reinterpreted as one `vec_ty` value. On NVPTX it is a GEP over `<lanes x elem>` into the param's own
+    /// pointer, so the same param may also be read element by element. On SpirvVulkan the resource for this access
     /// is declared with the `<lanes x elem>` element type (FR-004, the A1 probe fixture), which may differ from the
-    /// scalar-typed resource `element_ptr`/`param_bind_ty` would pick. A body must not mix scalar and vector access
-    /// to one param yet (FR-004b's two-binding fallback is not wired; `param_bind_ty` picks one binding type per
-    /// param).
+    /// scalar-typed resource `element_ptr`/`param_bind_ty` would pick, so a body must not mix scalar and vector
+    /// access to one param there (FR-004b's two-binding fallback is not wired; `param_bind_ty` picks one binding
+    /// type per param). Other targets refuse `Ty::Vec` in `scalar_llty`.
     pub(super) fn vector_element_ptr(
         &mut self,
         place: &Place,
         vec_ty: &Ty,
         w: &mut String,
     ) -> Result<(String, String, u32), EmitError> {
-        if self.target != Target::SpirvVulkan {
-            return Err(EmitError::Unsupported(format!(
-                "Ty::Vec buffer access on {:?}: vector codegen is SpirvVulkan-only in this increment \
-                 (spec 134 P1); NVPTX/AMDGCN is a later phase",
-                self.target
-            )));
-        }
         let idx_local = match place.projection.as_slice() {
             [ProjectionElem::Deref, ProjectionElem::Index(i)] => *i,
             other => {
@@ -257,8 +258,20 @@ impl<'a> Emitter<'a> {
                 )));
             }
         };
+        // `scalar_llty` refuses `Ty::Vec` on a target without vector codegen.
         let elem_llty = self.scalar_llty(vec_ty)?;
-        let (idx_val, _) = self.load_place(&Place::local(idx_local), w)?;
+        let (idx_val, idx_llty) = self.load_place(&Place::local(idx_local), w)?;
+        if self.target == Target::Nvptx {
+            // The group index steps over `<lanes x elem>`: group `i` starts at element `i * lanes` of the param's
+            // `ptr addrspace(1)`, which the same param's scalar reads also index (NVPTX has no typed resource).
+            let p = self.fresh();
+            let _ = writeln!(
+                w,
+                "  {p} = getelementptr inbounds {elem_llty}, ptr addrspace(1) %p{}, {idx_llty} {idx_val}",
+                place.local.index
+            );
+            return Ok((p, elem_llty, 1));
+        }
         let (bufty, mangle) = self.spirv_buf(vec_ty, true)?;
         let p = self.fresh();
         let _ = writeln!(

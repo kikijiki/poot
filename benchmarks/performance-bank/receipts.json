@@ -7,13 +7,13 @@
       "backend": "ptx",
       "status": "verified",
       "receipt": "receipts/ptx/attention-low-head-decode.json",
-      "receipt_sha256": "ff81c537397e866f477c74948d67b98001b9275191323c05750fa329bc27787b",
+      "receipt_sha256": "53db68ab0193e8e2f853860873529f7b6cd599a6139e598f2b71dc45bd41164f",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-ptx-gpu",
+        "poot-ptx-device",
         "--example",
         "performance_bank",
         "--",
@@ -24,22 +24,23 @@
         "--out",
         "benchmarks/performance-bank/receipts/ptx/attention-low-head-decode.json"
       ],
-      "spread": 0.0019,
+      "spread": 0.0137,
       "exceeds_max_uncertainty": false,
-      "note": "measured on a RunPod community RTX 3090 via poot-orchestrator exec; the recorded binary digest is the local pre-patchelf file"
+      "tflop_per_s": 0.0682,
+      "note": "measured on a RunPod secure RTX PRO 6000 Blackwell Server Edition via poot-orchestrator exec (POOT-1410); the recorded binary digest is the local pre-patchelf file"
     },
     {
       "case": "attention-low-head-decode",
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/attention-low-head-decode.json",
-      "receipt_sha256": "2a4c0faf2860f6b1752643d601b8379d4e35a50edd065202bc5836ef97a0348f",
+      "receipt_sha256": "329cc024646bd57c454eb9c4b519ed66ec96f8b30ed501b2fd555995d3e18843",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -50,8 +51,9 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/attention-low-head-decode.json"
       ],
-      "spread": 0.0978,
+      "spread": 0.2736,
       "exceeds_max_uncertainty": true,
+      "tflop_per_s": 0.0633,
       "note": "recorded on the split-KV plan (attention + attention_combine); the streaming plan measured 233 us median on this device, see candidates/POOT-1113/comparison.json (the earlier ~2.2 ms floor note described a previous runtime and no longer holds)"
     },
     {
@@ -59,13 +61,13 @@
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/attention-low-head-decode.json",
-      "receipt_sha256": "0f9f396976ec37d9a9fac522652acfd2796c4712a0a412caf5160a7c17a7c43a",
+      "receipt_sha256": "bb110feb3b8c13d16d21739ca6ef1fa6a3d5849ad64eae9862b38805f53fb4db",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -76,21 +78,22 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/attention-low-head-decode.json"
       ],
-      "spread": 0.319,
-      "exceeds_max_uncertainty": true
+      "spread": 0.3316,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 0.0481
     },
     {
       "case": "attention-low-head-decode-live-full",
       "backend": "ptx",
       "status": "verified",
       "receipt": "receipts/ptx/attention-low-head-decode-live-full.json",
-      "receipt_sha256": "de2a19c02fc7cf708d3e9ce2f23390d390ac107dd6ebf6bcf37e92da17c65117",
+      "receipt_sha256": "d07cdf2351bf34ee8cae597b6b38097c6fa02abd88068c73e2dbfc45a9d012d8",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-ptx-gpu",
+        "poot-ptx-device",
         "--example",
         "performance_bank",
         "--",
@@ -101,22 +104,23 @@
         "--out",
         "benchmarks/performance-bank/receipts/ptx/attention-low-head-decode-live-full.json"
       ],
-      "spread": 0.0032,
+      "spread": 0.0044,
       "exceeds_max_uncertainty": false,
-      "note": "measured on a RunPod secure RTX A5000 via poot-orchestrator exec on the split-KV plan (attention + attention_combine); the recorded binary digest is the local pre-patchelf file; three runs of 9 repeats are in receipts/ptx/poot-1124-a5000"
+      "tflop_per_s": 0.1091,
+      "note": "measured on a RunPod secure RTX PRO 6000 Blackwell Server Edition via poot-orchestrator exec (POOT-1410) on the split-KV plan (attention + attention_combine); the recorded binary digest is the local pre-patchelf file; the earlier A5000 runs (three runs of 9 repeats) are in receipts/ptx/poot-1124-a5000"
     },
     {
       "case": "attention-low-head-decode-live-full",
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/attention-low-head-decode-live-full.json",
-      "receipt_sha256": "6717cb0c8d2fdbc3c313a576fad63702e1f373d8d1a652c65e4a58c060a16a38",
+      "receipt_sha256": "f4129f052be2c9d77633eb32a615748347c96f60b7a1a888e83409d064fdda2b",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -127,21 +131,22 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/attention-low-head-decode-live-full.json"
       ],
-      "spread": 7.2581,
-      "exceeds_max_uncertainty": true
+      "spread": 0.1815,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 0.1711
     },
     {
       "case": "attention-low-head-decode-live-full",
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/attention-low-head-decode-live-full.json",
-      "receipt_sha256": "35238023b6a91867697635c53659347cb9a1c729bf1811eac53c202c36b04f93",
+      "receipt_sha256": "65c78b0e7a368a794ebec1ef1cba0c1389f08f400b0808edecb623b7f2986c0c",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -152,8 +157,9 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/attention-low-head-decode-live-full.json"
       ],
-      "spread": 0.0635,
-      "exceeds_max_uncertainty": true
+      "spread": 0.2099,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 0.1558
     },
     {
       "case": "attention-low-head-decode-live-short",
@@ -166,13 +172,13 @@
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/attention-low-head-decode-live-short.json",
-      "receipt_sha256": "353de1b22f24fad86979b8bc78e1e3616293305b2823e271b9cbe3974a5155af",
+      "receipt_sha256": "f0486f3c0467458d64381f346c851bd5ee4c36f9c8f9364d4b64a0bcdda00eb0",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -183,21 +189,22 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/attention-low-head-decode-live-short.json"
       ],
-      "spread": 13.1205,
-      "exceeds_max_uncertainty": true
+      "spread": 0.0922,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 0.0093
     },
     {
       "case": "attention-low-head-decode-live-short",
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/attention-low-head-decode-live-short.json",
-      "receipt_sha256": "afd5a797c51b7cbd045606a69044b7710c03c9a36aa797554dd5417549ff0ed8",
+      "receipt_sha256": "54fccb36b51094c1e00cfacf6ddba365bc9401ee2f0e10a541032a3e26cc9311",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -208,21 +215,22 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/attention-low-head-decode-live-short.json"
       ],
-      "spread": 2.2812,
-      "exceeds_max_uncertainty": true
+      "spread": 0.2467,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 0.0075
     },
     {
       "case": "batched-decode-gemm",
       "backend": "ptx",
       "status": "verified",
       "receipt": "receipts/ptx/batched-decode-gemm.json",
-      "receipt_sha256": "75e77c0af997cc5f86c8e1cd29b05d6a55fff9655ee795abeacec941b31bff84",
+      "receipt_sha256": "04b69a412bd0e6d504803a3822ee0e835bc962ff04764c8246c3c7b7e5757d8e",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-ptx-gpu",
+        "poot-ptx-device",
         "--example",
         "performance_bank",
         "--",
@@ -233,22 +241,23 @@
         "--out",
         "benchmarks/performance-bank/receipts/ptx/batched-decode-gemm.json"
       ],
-      "spread": 0.0718,
-      "exceeds_max_uncertainty": true,
-      "note": "measured on a RunPod community RTX 3090 via poot-orchestrator exec; the recorded binary digest is the local pre-patchelf file"
+      "spread": 0.0309,
+      "exceeds_max_uncertainty": false,
+      "tflop_per_s": 0.3782,
+      "note": "measured on a RunPod secure RTX PRO 6000 Blackwell Server Edition via poot-orchestrator exec (POOT-1410); the recorded binary digest is the local pre-patchelf file"
     },
     {
       "case": "batched-decode-gemm",
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/batched-decode-gemm.json",
-      "receipt_sha256": "f23608035ee1f36d0d7812e6a0ab03f6b965f1a8066cdc65293ac83e829dbaec",
+      "receipt_sha256": "4dfe34e5c0dd5530753272f66164804e4f9d0a8cb8d73b5ab5d924fba8079133",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -259,8 +268,9 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/batched-decode-gemm.json"
       ],
-      "spread": 0.0335,
-      "exceeds_max_uncertainty": false,
+      "spread": 0.5979,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 0.5595,
       "note": "submit/readback-bound: ROCm steps sit at a ~2.2-2.35 ms floor whatever the kernel does, so this receipt does not discriminate kernel cost"
     },
     {
@@ -268,13 +278,13 @@
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/batched-decode-gemm.json",
-      "receipt_sha256": "646acc1c8dfb74f3e3b760ff1e1e73d0654dbc935a437a01d69da90cd09163d9",
+      "receipt_sha256": "041c31901c38289eb4f4bff0a8e4f934c12af03d546c193ae2fb0e74f07f66bc",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -285,21 +295,22 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/batched-decode-gemm.json"
       ],
-      "spread": 0.3578,
-      "exceeds_max_uncertainty": true
+      "spread": 0.3482,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 0.3401
     },
     {
       "case": "dense-decode-gemv",
       "backend": "ptx",
       "status": "verified",
       "receipt": "receipts/ptx/dense-decode-gemv.json",
-      "receipt_sha256": "5fd4f5f51e8a2a7d8ecd7b638b19932dbb118beaa6f0f15faf0c107b5eff9664",
+      "receipt_sha256": "a15817bdb5a73c1d3a4e309569079f6e94b4c370f3d9b3ddee3764d504879eb4",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-ptx-gpu",
+        "poot-ptx-device",
         "--example",
         "performance_bank",
         "--",
@@ -310,22 +321,23 @@
         "--out",
         "benchmarks/performance-bank/receipts/ptx/dense-decode-gemv.json"
       ],
-      "spread": 0.0096,
+      "spread": 0.0145,
       "exceeds_max_uncertainty": false,
-      "note": "measured on a RunPod community RTX 3090 via poot-orchestrator exec; the recorded binary digest is the local pre-patchelf file"
+      "tflop_per_s": 0.1514,
+      "note": "measured on a RunPod secure RTX PRO 6000 Blackwell Server Edition via poot-orchestrator exec (POOT-1410); the recorded binary digest is the local pre-patchelf file"
     },
     {
       "case": "dense-decode-gemv",
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/dense-decode-gemv.json",
-      "receipt_sha256": "a9bba4e896efe506a82a3c436d796e8d92da7ac1cb72c0d095c7e51bd05f7631",
+      "receipt_sha256": "ac20dca98b8420c5ed28bb45d57843bd7e33f1687504564d7f56193cf3bffe2e",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -336,8 +348,9 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/dense-decode-gemv.json"
       ],
-      "spread": 0.0746,
-      "exceeds_max_uncertainty": true,
+      "spread": 0.0487,
+      "exceeds_max_uncertainty": false,
+      "tflop_per_s": 0.0286,
       "note": "submit/readback-bound: ROCm steps sit at a ~2.2-2.35 ms floor whatever the kernel does, so this receipt does not discriminate kernel cost"
     },
     {
@@ -345,13 +358,13 @@
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/dense-decode-gemv.json",
-      "receipt_sha256": "75a5286c3071a2859afe5200eda8d4dd264f7037a35318f9600654e7a22f9059",
+      "receipt_sha256": "208cb50e178f8185a8731466c8cff88362a370fde77afec34cf8745571eb868d",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -362,8 +375,9 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/dense-decode-gemv.json"
       ],
-      "spread": 0.1238,
-      "exceeds_max_uncertainty": true
+      "spread": 0.1737,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 0.0267
     },
     {
       "case": "expert-routing-shuffled",
@@ -412,13 +426,13 @@
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/long-recurrence-scan.json",
-      "receipt_sha256": "3e3aeaee528a8a3885857b5e6532b58a9a7d3ca0f24f59fceb381cf3c0282f95",
+      "receipt_sha256": "f90b6daae48e3e671265193d2729694fbcf4adaccdeece64858f53318112bda6",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -429,7 +443,7 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/long-recurrence-scan.json"
       ],
-      "spread": 0.0686,
+      "spread": 0.1778,
       "exceeds_max_uncertainty": true
     },
     {
@@ -437,13 +451,13 @@
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/long-recurrence-scan.json",
-      "receipt_sha256": "a76f83a7a43068ac1b2c840aae5d1e8a1b6440a921152615d896ad275e8a5ac7",
+      "receipt_sha256": "0af0fc1a65c2b99d9d9c0e45f7ab5b61faa8b38c0d2c9c35afa3454832891079",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -454,7 +468,7 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/long-recurrence-scan.json"
       ],
-      "spread": 0.1983,
+      "spread": 0.084,
       "exceeds_max_uncertainty": true
     },
     {
@@ -476,17 +490,254 @@
       "reason": "no packed-weight bank producer in the backend runners yet; the packed gemv is measured by the request-level decode curve until then"
     },
     {
-      "case": "prefill-long-gemm",
+      "case": "prefill-attention-2048",
       "backend": "ptx",
       "status": "verified",
-      "receipt": "receipts/ptx/prefill-long-gemm.json",
-      "receipt_sha256": "e4f44a51ae8f9f38045a04d36d2bcc838dc10aaaca01462728120a600b2423b6",
+      "receipt": "receipts/ptx/prefill-attention-2048.json",
+      "receipt_sha256": "a2aae4983507751922e0b899b1e066009cca0dc0eb9f1ca421b42d7e834777a5",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-ptx-gpu",
+        "poot-ptx-device",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "prefill-attention-2048",
+        "--out",
+        "benchmarks/performance-bank/receipts/ptx/prefill-attention-2048.json"
+      ],
+      "spread": 0.0264,
+      "exceeds_max_uncertainty": false,
+      "tflop_per_s": 2.1847,
+      "note": "measured on a RunPod secure RTX PRO 6000 Blackwell Server Edition via poot-orchestrator exec (POOT-1404); the recorded binary digest is the local pre-patchelf file"
+    },
+    {
+      "case": "prefill-attention-2048",
+      "backend": "rocm",
+      "status": "verified",
+      "receipt": "receipts/rocm/prefill-attention-2048.json",
+      "receipt_sha256": "50b5b3164776e2f5d2fb6d5b398c2323f1fd3f4b168c343bab40c2718f1d80d8",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-rocm-device",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "prefill-attention-2048",
+        "--out",
+        "benchmarks/performance-bank/receipts/rocm/prefill-attention-2048.json"
+      ],
+      "spread": 0.1517,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 1.3324
+    },
+    {
+      "case": "prefill-attention-2048",
+      "backend": "wgpu",
+      "status": "verified",
+      "receipt": "receipts/wgpu/prefill-attention-2048.json",
+      "receipt_sha256": "e86c2a44bd4364be01d999db426976cdae21ed5b0dc31f65c57ddfb00fd9a123",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-wgpu-device",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "prefill-attention-2048",
+        "--out",
+        "benchmarks/performance-bank/receipts/wgpu/prefill-attention-2048.json"
+      ],
+      "spread": 0.1235,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 1.6992
+    },
+    {
+      "case": "prefill-attention-8192",
+      "backend": "ptx",
+      "status": "verified",
+      "receipt": "receipts/ptx/prefill-attention-8192.json",
+      "receipt_sha256": "d7839f27c447009e976ddd50a40716ac5a65cd5ba5b69a8a458376d89ef958a3",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-ptx-device",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "prefill-attention-8192",
+        "--out",
+        "benchmarks/performance-bank/receipts/ptx/prefill-attention-8192.json"
+      ],
+      "spread": 0.0085,
+      "exceeds_max_uncertainty": false,
+      "tflop_per_s": 5.7241,
+      "note": "measured on a RunPod secure RTX PRO 6000 Blackwell Server Edition via poot-orchestrator exec (POOT-1404); the recorded binary digest is the local pre-patchelf file"
+    },
+    {
+      "case": "prefill-attention-8192",
+      "backend": "rocm",
+      "status": "verified",
+      "receipt": "receipts/rocm/prefill-attention-8192.json",
+      "receipt_sha256": "a20cb51399c648f3063967eec68a869aa971d26de531c53485cde8c1de648533",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-rocm-device",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "prefill-attention-8192",
+        "--out",
+        "benchmarks/performance-bank/receipts/rocm/prefill-attention-8192.json"
+      ],
+      "spread": 0.1205,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 1.3999
+    },
+    {
+      "case": "prefill-attention-8192",
+      "backend": "wgpu",
+      "status": "verified",
+      "receipt": "receipts/wgpu/prefill-attention-8192.json",
+      "receipt_sha256": "b2441811eb78a06ecfc72199c593b229ed5833d693078efdd8be640e4ed71f8e",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-wgpu-device",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "prefill-attention-8192",
+        "--out",
+        "benchmarks/performance-bank/receipts/wgpu/prefill-attention-8192.json"
+      ],
+      "spread": 0.0805,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 2.345
+    },
+    {
+      "case": "prefill-dense-bf16-nk",
+      "backend": "ptx",
+      "status": "verified",
+      "receipt": "receipts/ptx/prefill-dense-bf16-nk.json",
+      "receipt_sha256": "e92e76c1b982c22250e487fd1af53afa2adbfe77de174a08230d08dcca13eba1",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-ptx-device",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "prefill-dense-bf16-nk",
+        "--out",
+        "benchmarks/performance-bank/receipts/ptx/prefill-dense-bf16-nk.json"
+      ],
+      "spread": 0.0088,
+      "exceeds_max_uncertainty": false,
+      "tflop_per_s": 1.2689,
+      "note": "measured on a RunPod secure RTX PRO 6000 Blackwell Server Edition via poot-orchestrator exec (POOT-1404); the recorded binary digest is the local pre-patchelf file"
+    },
+    {
+      "case": "prefill-dense-bf16-nk",
+      "backend": "rocm",
+      "status": "verified",
+      "receipt": "receipts/rocm/prefill-dense-bf16-nk.json",
+      "receipt_sha256": "062c3a6ec3a90621f1018afba6902aea0e25fce20a99be012931db506bf66afc",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-rocm-device",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "prefill-dense-bf16-nk",
+        "--out",
+        "benchmarks/performance-bank/receipts/rocm/prefill-dense-bf16-nk.json"
+      ],
+      "spread": 0.1824,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 0.9856
+    },
+    {
+      "case": "prefill-dense-bf16-nk",
+      "backend": "wgpu",
+      "status": "verified",
+      "receipt": "receipts/wgpu/prefill-dense-bf16-nk.json",
+      "receipt_sha256": "b473ba248d9c7971e6622543c910a025ba1ed9d1fed36322edee06500fa5c8a1",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-wgpu-device",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "prefill-dense-bf16-nk",
+        "--out",
+        "benchmarks/performance-bank/receipts/wgpu/prefill-dense-bf16-nk.json"
+      ],
+      "spread": 0.1457,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 0.9164
+    },
+    {
+      "case": "prefill-long-gemm",
+      "backend": "ptx",
+      "status": "verified",
+      "receipt": "receipts/ptx/prefill-long-gemm.json",
+      "receipt_sha256": "3af98da4ee79a5078cbefca5b142b95d00edb9efc0bc8204ce6535f55f9fc18b",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-ptx-device",
         "--example",
         "performance_bank",
         "--",
@@ -497,22 +748,23 @@
         "--out",
         "benchmarks/performance-bank/receipts/ptx/prefill-long-gemm.json"
       ],
-      "spread": 0.0597,
-      "exceeds_max_uncertainty": true,
-      "note": "measured on a RunPod community RTX 3090 via poot-orchestrator exec; the recorded binary digest is the local pre-patchelf file"
+      "spread": 0.0262,
+      "exceeds_max_uncertainty": false,
+      "tflop_per_s": 8.5002,
+      "note": "measured on a RunPod secure RTX PRO 6000 Blackwell Server Edition via poot-orchestrator exec (POOT-1410); the recorded binary digest is the local pre-patchelf file"
     },
     {
       "case": "prefill-long-gemm",
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/prefill-long-gemm.json",
-      "receipt_sha256": "a9d414b1ccb7b8009989bc80e3530b8a5133fc0805d6f7bc2114d9f400193009",
+      "receipt_sha256": "62cd31f851b09973fa266d5293e8a28e0f11a35f4561acc889a344a2c74528a2",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -523,21 +775,22 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/prefill-long-gemm.json"
       ],
-      "spread": 0.1471,
-      "exceeds_max_uncertainty": true
+      "spread": 0.1449,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 3.7619
     },
     {
       "case": "prefill-long-gemm",
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/prefill-long-gemm.json",
-      "receipt_sha256": "86d88d381880b61f6ae8b728c53d8a3b19c03fa25c2fe54bfee69c0fbbd7fc67",
+      "receipt_sha256": "8accb3d39b62b6f5be8008d22bb0bde6c1faca7563d8ecd700e997ef7bdddd2b",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -548,21 +801,22 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/prefill-long-gemm.json"
       ],
-      "spread": 0.0458,
-      "exceeds_max_uncertainty": false
+      "spread": 0.1384,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 4.6802
     },
     {
       "case": "prefill-short-gemm",
       "backend": "ptx",
       "status": "verified",
       "receipt": "receipts/ptx/prefill-short-gemm.json",
-      "receipt_sha256": "c12edd68a328ca0c3777be93d631f01f6279ebf85c3d8c72c214f49740807b08",
+      "receipt_sha256": "65078a00f457cdd51681809663595a514c25adbe65d18e7c1a6cd4555cc328b1",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-ptx-gpu",
+        "poot-ptx-device",
         "--example",
         "performance_bank",
         "--",
@@ -573,22 +827,23 @@
         "--out",
         "benchmarks/performance-bank/receipts/ptx/prefill-short-gemm.json"
       ],
-      "spread": 0.0178,
+      "spread": 0.023,
       "exceeds_max_uncertainty": false,
-      "note": "measured on a RunPod community RTX 3090 via poot-orchestrator exec; the recorded binary digest is the local pre-patchelf file"
+      "tflop_per_s": 4.9128,
+      "note": "measured on a RunPod secure RTX PRO 6000 Blackwell Server Edition via poot-orchestrator exec (POOT-1410); the recorded binary digest is the local pre-patchelf file"
     },
     {
       "case": "prefill-short-gemm",
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/prefill-short-gemm.json",
-      "receipt_sha256": "eb264021d1e39d1cd1bab60125a75601252dc1c2cdc116dca5b004eddb887745",
+      "receipt_sha256": "4276c5e04602cc0b62349914885acae0c95c70d6a4a3c72d7c10491a5bf8d154",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -599,8 +854,9 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/prefill-short-gemm.json"
       ],
-      "spread": 0.0987,
+      "spread": 0.3128,
       "exceeds_max_uncertainty": true,
+      "tflop_per_s": 3.5883,
       "note": "submit/readback-bound: ROCm steps sit at a ~2.2-2.35 ms floor whatever the kernel does, so this receipt does not discriminate kernel cost"
     },
     {
@@ -608,13 +864,13 @@
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/prefill-short-gemm.json",
-      "receipt_sha256": "26fc745693a1f0e652654ea8e1951061436e6eff2e536e49d497644d6f7ab96f",
+      "receipt_sha256": "bd182b2af415f245d95494c776633cf98cd9f65ff7e28539ff2b806c20671be5",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -625,8 +881,9 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/prefill-short-gemm.json"
       ],
-      "spread": 0.1368,
-      "exceeds_max_uncertainty": true
+      "spread": 0.2186,
+      "exceeds_max_uncertainty": true,
+      "tflop_per_s": 2.5348
     },
     {
       "case": "recurrence-scan-many-heads",
@@ -639,13 +896,13 @@
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/recurrence-scan-many-heads.json",
-      "receipt_sha256": "27ce8830443975a9d0864cf1ddb65ce58c276132062a24a1d6325182b92d2e5a",
+      "receipt_sha256": "cd3719e2695d9d2ca3994b512cf567e8020aa84d9da9ae9adcafd43f4ef4aefe",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -656,7 +913,7 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/recurrence-scan-many-heads.json"
       ],
-      "spread": 0.091,
+      "spread": 0.0756,
       "exceeds_max_uncertainty": true
     },
     {
@@ -664,13 +921,13 @@
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/recurrence-scan-many-heads.json",
-      "receipt_sha256": "04cbcd45ea5875033cee5671d7d8d691d622f74b2182e7d38284f69b77aacc12",
+      "receipt_sha256": "10f6adc1683503b2f3924c7fbdaf3d67a7ba1dc7f01825b34022da530664a716",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -681,7 +938,7 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/recurrence-scan-many-heads.json"
       ],
-      "spread": 0.4647,
+      "spread": 0.4942,
       "exceeds_max_uncertainty": true
     },
     {
@@ -695,13 +952,13 @@
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/recurrence-scan-narrow-state.json",
-      "receipt_sha256": "cdbd6015b1de651df75f98f4faccfd33c094b7ab6bb4d7d5e8e0095ee7051c17",
+      "receipt_sha256": "307b94aa19703c7114c16029179402138cc41b0857ea256061ce5db2849bd69d",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -712,7 +969,7 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/recurrence-scan-narrow-state.json"
       ],
-      "spread": 0.1984,
+      "spread": 0.695,
       "exceeds_max_uncertainty": true
     },
     {
@@ -720,13 +977,13 @@
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/recurrence-scan-narrow-state.json",
-      "receipt_sha256": "acca028501218395f42ec91c08af56e0c5cc4ea59533c60d7490a1dcaba6a5ae",
+      "receipt_sha256": "ae0e13192bc8a4298e42ef0a16e19806e095df10c6b164d9e5d7b381d2f75213",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -737,8 +994,8 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/recurrence-scan-narrow-state.json"
       ],
-      "spread": 0.0385,
-      "exceeds_max_uncertainty": false
+      "spread": 0.5326,
+      "exceeds_max_uncertainty": true
     },
     {
       "case": "recurrence-scan-short",
@@ -751,13 +1008,13 @@
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/recurrence-scan-short.json",
-      "receipt_sha256": "0738acf21e5a0975fd944bee52c7d313257ecdb4d9a0537acab1a051bbab98f5",
+      "receipt_sha256": "26810642e789e350c904014cc2108b539ef4c6b3410e3d1413f65ae20b98c54d",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -768,21 +1025,21 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/recurrence-scan-short.json"
       ],
-      "spread": 0.7236,
-      "exceeds_max_uncertainty": true
+      "spread": 0.0452,
+      "exceeds_max_uncertainty": false
     },
     {
       "case": "recurrence-scan-short",
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/recurrence-scan-short.json",
-      "receipt_sha256": "9990e832c09b9d5272e8d3f439a490154bc4a5a40b3b2de5cdac4e22ef8a8ce2",
+      "receipt_sha256": "fc3d55de69d943b4fdcc157f407143da81b2561445012bc0881a52be4d426c19",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -793,7 +1050,7 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/recurrence-scan-short.json"
       ],
-      "spread": 0.1085,
+      "spread": 0.5421,
       "exceeds_max_uncertainty": true
     },
     {
@@ -807,13 +1064,13 @@
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/ssd-long-recurrence-scan.json",
-      "receipt_sha256": "2fbd7e2628e548a79743fb73162d8470ef5672e62d48dfaab5c388bf892c6b30",
+      "receipt_sha256": "cb3bceb29db135aefc9ab652673d21364ab3e3b0da41bf1f83e2b5483bc3acbc",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -824,21 +1081,21 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/ssd-long-recurrence-scan.json"
       ],
-      "spread": 0.0251,
-      "exceeds_max_uncertainty": false
+      "spread": 0.1107,
+      "exceeds_max_uncertainty": true
     },
     {
       "case": "ssd-long-recurrence-scan",
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/ssd-long-recurrence-scan.json",
-      "receipt_sha256": "0108de5c3ba31c72259b6a51d7a8e1a41e52f5ee75e76149cd70648bf21e6684",
+      "receipt_sha256": "92eb8eef1a20deed50c8e36b9d69472545154084c24eb0161044c41abdf3591f",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -849,7 +1106,7 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/ssd-long-recurrence-scan.json"
       ],
-      "spread": 0.0519,
+      "spread": 0.0703,
       "exceeds_max_uncertainty": true
     },
     {
@@ -863,13 +1120,13 @@
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/ssd-recurrence-scan-boundary.json",
-      "receipt_sha256": "d22fd4b0982d87f68d818b951d58395886660e6ce6b7f12457a3c0d6290325e6",
+      "receipt_sha256": "09d0d7875bb772008733f1505052a8b3cee634a7f04a9765863b01709c229e93",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -880,7 +1137,7 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/ssd-recurrence-scan-boundary.json"
       ],
-      "spread": 4.2607,
+      "spread": 0.4221,
       "exceeds_max_uncertainty": true
     },
     {
@@ -888,13 +1145,13 @@
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/ssd-recurrence-scan-boundary.json",
-      "receipt_sha256": "88ef45764aee338f2906032728fe41d68b02bc9bd840e67b3454a0c85923afea",
+      "receipt_sha256": "ea0e92ef68633abed45b83b35300c6572294b1447a4f3c11cfa9301a22c244d8",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -905,7 +1162,7 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/ssd-recurrence-scan-boundary.json"
       ],
-      "spread": 0.2367,
+      "spread": 0.4068,
       "exceeds_max_uncertainty": true
     },
     {
@@ -919,13 +1176,13 @@
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/ssd-recurrence-scan-many-heads.json",
-      "receipt_sha256": "a061501dc99e8eac14ef51ade99329f0f7bf0c88fdb4703b893b19cde03ea2d3",
+      "receipt_sha256": "0f0b5e9eef208649413891c51861a896430c1d23354f4336475a1c0877c97777",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -936,21 +1193,21 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/ssd-recurrence-scan-many-heads.json"
       ],
-      "spread": 0.1186,
-      "exceeds_max_uncertainty": true
+      "spread": 0.0484,
+      "exceeds_max_uncertainty": false
     },
     {
       "case": "ssd-recurrence-scan-many-heads",
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/ssd-recurrence-scan-many-heads.json",
-      "receipt_sha256": "fb10dea471f511a32f821a0a8a369c4463627fc8d32ef9efa3677825305e2fd4",
+      "receipt_sha256": "6b2ba7a5f3ff756dd60b6f92fe43c1dd13f4b5f213918d27bb9c411c71f2c147",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -961,7 +1218,7 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/ssd-recurrence-scan-many-heads.json"
       ],
-      "spread": 0.0997,
+      "spread": 0.1977,
       "exceeds_max_uncertainty": true
     },
     {
@@ -975,13 +1232,13 @@
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/ssd-recurrence-scan-short.json",
-      "receipt_sha256": "c7123ef201572f3ebca6140570792b9ae5b57aea9039a2fce4a2ece4360ede54",
+      "receipt_sha256": "99a6c68a6434b6ad888c8aa4fc182b4548b05cda5aa7e21f80ed69e37da2cd81",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-rocm-gpu",
+        "poot-rocm-device",
         "--example",
         "performance_bank",
         "--",
@@ -992,21 +1249,21 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/ssd-recurrence-scan-short.json"
       ],
-      "spread": 0.1079,
-      "exceeds_max_uncertainty": true
+      "spread": 0.0323,
+      "exceeds_max_uncertainty": false
     },
     {
       "case": "ssd-recurrence-scan-short",
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/ssd-recurrence-scan-short.json",
-      "receipt_sha256": "01ab96638918fb837ef36e9be9efaf7853cb53f87a5c96a0afef874a72880cc6",
+      "receipt_sha256": "fa68d2b20d47f22b67235e0a224bf259110358ff54c1ce6f6ec44ac754631c22",
       "command": [
         "cargo",
         "run",
         "--release",
         "-p",
-        "poot-gpu",
+        "poot-wgpu-device",
         "--example",
         "performance_bank",
         "--",
@@ -1017,7 +1274,7 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/ssd-recurrence-scan-short.json"
       ],
-      "spread": 0.3374,
+      "spread": 0.1631,
       "exceeds_max_uncertainty": true
     }
   ]

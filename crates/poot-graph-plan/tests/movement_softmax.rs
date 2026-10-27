@@ -416,7 +416,7 @@ fn fused_pointwise_over_empty_tensor_edges() {
 #[test]
 fn compile_chooses_the_generated_tiled_gemm_for_m_over_one_only() {
     // card 099b (spec 060), Card 557: the planner's contraction choice takes the synthesized
-    // element-by-element tiled GEMM (`kg::tiled_region`) for a bare M>1 / rank-2-[K,N]-weight F32
+    // register-tiled GEMM for a bare M>1 / rank-2-[K,N]-weight F32
     // matmul, and records it as the plan's kernel choice (the graph keeps a plain `MatMul`). A decode
     // GEMV (M==1) does not take it.
     use poot_graph_ir::op::OpKind;
@@ -447,9 +447,7 @@ fn compile_chooses_the_generated_tiled_gemm_for_m_over_one_only() {
     let tiled = |choice: &KernelChoice| {
         matches!(
             choice,
-            KernelChoice::Generated(KernelRequest::Contraction(
-                ContractionSpec::TiledRegion { .. }
-            ))
+            KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(_)))
         )
     };
     let prefill = choice_of(6);

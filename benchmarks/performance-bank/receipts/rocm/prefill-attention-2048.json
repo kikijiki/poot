@@ -1,0 +1,179 @@
+{
+  "backend": "rocm",
+  "case": "prefill-attention-2048",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 12900.67
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 12092.367
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 12932.419
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 12242.829
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 12122.885
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 13992.964
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 12494.55
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 13893.007000000001
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 14049.139000000001
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 33554432,
+      "peak_bytes": 33554432,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 16777216,
+      "peak_bytes": 16777216,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 16384,
+      "peak_bytes": 16384,
+      "role": "Input"
+    },
+    {
+      "live_bytes": 80,
+      "peak_bytes": 80,
+      "role": "Meta"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 2048,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 2048
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 16777216,
+    "weight_copies": 1
+  },
+  "plan": [
+    "attention [eb764850c569c9f7a613a52e6af077863ed02ebfb29345b3e15cb79436d94b19]"
+  ],
+  "plan_id": "5b4588f1f7974604bceb015ba110bf03e1703c2f2ce8d78d78660b97e8f883a1",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 1.5188435890075968e-07,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-rocm-device",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "prefill-attention-2048",
+    "--out",
+    "benchmarks/performance-bank/receipts/rocm/prefill-attention-2048.json"
+  ],
+  "parent_revision": "21da98dafbdbc5887ce2943f1e7609381412b01c",
+  "binary_sha256": "fa7cc4a1a9eed9df3b6d92017c74dca3232fb97ed7f7a979028b73f4895caf65",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "bhsd",
+    "dimensions": {
+      "hq": 16,
+      "hkv": 8,
+      "d": 128,
+      "lq": 2048,
+      "cap": 2048
+    },
+    "prompt_tokens": 1,
+    "live_context": 2048,
+    "max_context": 2048,
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "prefill-attention-2048"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "rocm",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.3.0"
+  },
+  "identity_digest": "85738fd589aaa7d2b842026f16ae4cc73b8877d05c3a0d375037a668478899fa",
+  "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"
+}

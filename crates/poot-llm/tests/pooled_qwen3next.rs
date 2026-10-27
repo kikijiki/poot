@@ -143,6 +143,7 @@ fn handle(scale: Option<f32>) -> Arc<ModelHandle> {
 fn options(chunk: usize) -> DriverOptions {
     let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(CAPACITY),

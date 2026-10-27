@@ -32,11 +32,11 @@
 //! constructor is `unsafe`, called only by `poot-codegen`, so safe code here cannot mint one.
 //!
 //! ```compile_fail,E0133
-//! fn from_any_text(text: &str) -> poot_runtime_common::CompiledKernel {
-//!     poot_runtime_common::CompiledKernel::new(
+//! fn from_any_text(text: &str) -> poot_codegen::CompiledKernel {
+//!     poot_codegen::CompiledKernel::new(
 //!         poot_target::TargetId::Gpu(poot_target::Backend::Nvptx),
 //!         "add",
-//!         poot_runtime_common::KernelCode::Ptx(text.into()),
+//!         poot_codegen::KernelCode::Ptx(text.into()),
 //!         Vec::new(),
 //!         false,
 //!     )
@@ -44,13 +44,14 @@
 //! ```
 //!
 //! ```compile_fail,E0451
-//! fn forge(code: poot_runtime_common::KernelCode) -> poot_runtime_common::CompiledKernel {
-//!     poot_runtime_common::CompiledKernel {
+//! fn forge(code: poot_codegen::KernelCode) -> poot_codegen::CompiledKernel {
+//!     poot_codegen::CompiledKernel {
 //!         target: poot_target::TargetId::Gpu(poot_target::Backend::Nvptx),
 //!         entry_point: "add".into(),
 //!         code,
 //!         args: Vec::new().into(),
 //!         has_trap: false,
+//!         index_width: poot_kernel_ir::IndexWidth::Native,
 //!     }
 //! }
 //! ```

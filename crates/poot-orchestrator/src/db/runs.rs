@@ -1,8 +1,16 @@
 use super::{Context, Db, ErrorKind, OptionalExtension, Result, bail, now_iso, params};
 
+/// The SQL condition for a run that has not reached a terminal status. Every query that means "nonterminal" uses
+/// this one list, so a new terminal status is added in one place.
+macro_rules! unfinished {
+    () => {
+        "(status NOT IN ('done','failed','aborted','cancelled','abandoned') AND status NOT LIKE 'incomplete%')"
+    };
+}
+
 /// A run record. `status` drives resume/teardown. `kind` is the resumable bench `sweep` (the `run`
 /// command) or a one-off `exec`; both are recorded so every pod is tracked, but only `sweep` rows are
-/// eligible for resume (see `active_run`).
+/// eligible for resume (see `resumable_runs`).
 #[derive(Debug, Clone)]
 pub(crate) struct Run {
     pub id: String,
@@ -35,7 +43,7 @@ fn repeat_dirs(run_id: &str, repeats: u32) -> Vec<String> {
     }
 }
 
-/// A kept-warm exec pod a later exec may adopt (see [`Db::find_warm_exec`]).
+/// A kept-warm exec pod a later exec may adopt (see [`Db::find_warm_execs`]).
 #[derive(Debug, Clone)]
 pub(crate) struct WarmExec {
     pub run_id: String,
@@ -47,13 +55,17 @@ pub(crate) struct WarmExec {
 }
 
 /// Identity of the local process that owns a nonterminal `exec` row. A PID can be reused, so the
-/// process start tick and boot id must also match before the owner counts as live.
+/// process start tick and boot id must also match before the owner counts as live. `/proc/<pid>` only shows
+/// the processes of the reader's own pid namespace, so a pid is evidence of death only inside the namespace
+/// the owner was recorded in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExecOwner {
     pub hostname: String,
     pub pid: i64,
     pub boot_id: String,
     pub start_ticks: String,
+    /// Identity of the pid namespace the owner runs in (`pid:[inode]`, the `/proc/self/ns/pid` link).
+    pub pid_ns: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +106,7 @@ struct ExecReapCandidate {
     owner_pid: Option<i64>,
     owner_boot_id: Option<String>,
     owner_start_ticks: Option<String>,
+    owner_pid_ns: Option<String>,
 }
 
 impl ExecReapCandidate {
@@ -103,13 +116,17 @@ impl ExecReapCandidate {
             self.owner_pid,
             self.owner_boot_id.clone(),
             self.owner_start_ticks.clone(),
+            self.owner_pid_ns.clone(),
         ) {
-            (Some(hostname), Some(pid), Some(boot_id), Some(start_ticks)) => Some(ExecOwner {
-                hostname,
-                pid,
-                boot_id,
-                start_ticks,
-            }),
+            (Some(hostname), Some(pid), Some(boot_id), Some(start_ticks), Some(pid_ns)) => {
+                Some(ExecOwner {
+                    hostname,
+                    pid,
+                    boot_id,
+                    start_ticks,
+                    pid_ns,
+                })
+            }
             _ => None,
         }
     }
@@ -125,6 +142,7 @@ impl ExecOwner {
             start_ticks: process_start_ticks(pid)
                 .context("read current process start ticks")?
                 .context("current process disappeared while reading start ticks")?,
+            pid_ns: local_pid_ns().context("read local pid namespace")?,
         })
     }
 
@@ -140,8 +158,20 @@ impl ExecOwner {
         if self.boot_id != boot_id {
             return OwnerLiveness::Dead;
         }
+        // A pid missing from /proc proves death only where the pid is visible: another or unreadable pid
+        // namespace (a sandbox that keeps the host's hostname and boot id) can hide a live owner.
+        match local_pid_ns() {
+            Ok(ns) if ns == self.pid_ns => {}
+            _ => return OwnerLiveness::Unknown,
+        }
         process_start_liveness(process_start_ticks(self.pid), &self.start_ticks)
     }
+}
+
+fn local_pid_ns() -> Result<String> {
+    Ok(std::fs::read_link("/proc/self/ns/pid")?
+        .to_string_lossy()
+        .into_owned())
 }
 
 fn local_hostname() -> String {
@@ -212,6 +242,8 @@ pub(crate) struct RunView {
     pub pod_id: Option<String>,
     pub ssh_host: Option<String>,
     pub ssh_port: Option<u16>,
+    /// How many times each model's sweep is repeated.
+    pub repeats: u32,
     pub models: Vec<ModelView>,
 }
 
@@ -225,18 +257,14 @@ pub(crate) struct ModelView {
 }
 
 impl Db {
-    pub(crate) fn create_run(&self, r: &Run) -> Result<()> {
-        self.create_run_with_owner(r, None)
-    }
-
     pub(crate) fn create_run_with_owner(&self, r: &Run, owner: Option<&ExecOwner>) -> Result<()> {
         let now = now_iso();
         self.conn.execute(
             "INSERT INTO runs (
                 id, created_at, updated_at, git_ref, scenario, models, gpu_types, image, status, kind,
-                owner_hostname, owner_pid, owner_boot_id, owner_start_ticks, repeats
+                owner_hostname, owner_pid, owner_boot_id, owner_start_ticks, owner_pid_ns, repeats
              )
-             VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 r.id,
                 now,
@@ -251,6 +279,7 @@ impl Db {
                 owner.map(|o| o.pid),
                 owner.map(|o| o.boot_id.as_str()),
                 owner.map(|o| o.start_ticks.as_str()),
+                owner.map(|o| o.pid_ns.as_str()),
                 r.repeats,
             ],
         )?;
@@ -263,18 +292,152 @@ impl Db {
         Ok(())
     }
 
-    /// The single in-progress run, if any. One sweep at a time: a second would fight over pod-name reaping.
-    pub(crate) fn active_run(&self) -> Result<Option<Run>> {
-        self.conn
+    /// The unfinished sweeps `req` may resume: the same request (ref, scenario, models, gpu types, image,
+    /// repeats), newest first, and no live owner. A run whose owner is alive, cannot be proven dead (another
+    /// host) or was never recorded belongs to another process and is never returned: that process still
+    /// drives its pod.
+    pub(crate) fn resumable_runs(
+        &self,
+        req: &Run,
+        liveness: impl Fn(&ExecOwner) -> OwnerLiveness,
+    ) -> Result<Vec<Run>> {
+        let mut stmt = self.conn.prepare(
+            concat!("SELECT id, git_ref, scenario, models, gpu_types, image, status, pod_id, kind, repeats,
+                    owner_hostname, owner_pid, owner_boot_id, owner_start_ticks, owner_pid_ns
+             FROM runs
+             WHERE ", unfinished!(), " AND kind='sweep' AND id<>?1
+               AND git_ref=?2 AND scenario=?3 AND models=?4 AND gpu_types=?5 AND image=?6 AND repeats=?7
+             ORDER BY created_at DESC"),
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    req.id,
+                    req.git_ref,
+                    req.scenario,
+                    req.models.join(","),
+                    req.gpu_types,
+                    req.image,
+                    req.repeats
+                ],
+                |row| {
+                    let owner = match (
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<String>>(14)?,
+                    ) {
+                        (
+                            Some(hostname),
+                            Some(pid),
+                            Some(boot_id),
+                            Some(start_ticks),
+                            Some(pid_ns),
+                        ) => Some(ExecOwner {
+                            hostname,
+                            pid,
+                            boot_id,
+                            start_ticks,
+                            pid_ns,
+                        }),
+                        _ => None,
+                    };
+                    Ok((Self::row_to_run(row)?, owner))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, owner)| {
+                owner
+                    .as_ref()
+                    .is_some_and(|o| liveness(o) == OwnerLiveness::Dead)
+            })
+            .map(|(run, _)| run)
+            .collect())
+    }
+
+    /// The process recorded as driving `run_id`, if one was.
+    pub(crate) fn run_owner(&self, run_id: &str) -> Result<Option<ExecOwner>> {
+        let row = self
+            .conn
             .query_row(
-                "SELECT id, git_ref, scenario, models, gpu_types, image, status, pod_id, kind, repeats
-                 FROM runs WHERE status NOT IN ('done','failed','aborted') AND kind='sweep'
-                 ORDER BY created_at DESC LIMIT 1",
-                [],
-                Self::row_to_run,
+                "SELECT owner_hostname, owner_pid, owner_boot_id, owner_start_ticks, owner_pid_ns FROM runs WHERE id=?1",
+                params![run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        Ok(match row {
+            Some((Some(hostname), Some(pid), Some(boot_id), Some(start_ticks), Some(pid_ns))) => {
+                Some(ExecOwner {
+                    hostname,
+                    pid,
+                    boot_id,
+                    start_ticks,
+                    pid_ns,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// Every unfinished sweep with the owner it recorded (`None` for a run that never recorded one).
+    pub(crate) fn unfinished_sweeps(&self) -> Result<Vec<(Run, Option<ExecOwner>)>> {
+        let mut stmt = self.conn.prepare(
+            concat!("SELECT id, git_ref, scenario, models, gpu_types, image, status, pod_id, kind, repeats, id
+             FROM runs
+             WHERE kind='sweep' AND ", unfinished!(), "
+             ORDER BY created_at"),
+        )?;
+        let runs = stmt
+            .query_map([], Self::row_to_run)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        runs.into_iter()
+            .map(|run| {
+                let owner = self.run_owner(&run.id)?;
+                Ok((run, owner))
+            })
+            .collect()
+    }
+
+    /// Make `owner` the process that drives `run_id` (a resuming process takes over a dead one's run).
+    pub(crate) fn set_owner(&self, run_id: &str, owner: &ExecOwner) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET owner_hostname=?2, owner_pid=?3, owner_boot_id=?4, owner_start_ticks=?5, owner_pid_ns=?6, updated_at=?7
+             WHERE id=?1",
+            params![run_id, owner.hostname, owner.pid, owner.boot_id, owner.start_ticks, owner.pid_ns, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget the run's pod (it is gone and a replacement is coming); the run stays unfinished.
+    pub(crate) fn clear_run_pod(&self, run_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET pod_id=NULL, ssh_host=NULL, ssh_port=NULL, updated_at=?2 WHERE id=?1",
+            params![run_id, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// When the pod was recorded as created (UTC ISO, comparable with [`now_iso`]).
+    pub(crate) fn pod_created_at(&self, pod_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT created_at FROM pods WHERE id=?1",
+                params![pod_id],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     fn row_to_run(row: &rusqlite::Row) -> rusqlite::Result<Run> {
@@ -299,7 +462,7 @@ impl Db {
 
     /// Card 437: refuses to overwrite a row still inside its keep-warm window. [`Self::set_warm`] stores
     /// warm-ness in `status`, so an unguarded write would leave a terminal status with `warm_until` in the
-    /// future: unadoptable ([`Self::find_warm_exec`] filters `status='warm'`) and reapable
+    /// future: unadoptable ([`Self::find_warm_execs`] filters `status='warm'`) and reapable
     /// ([`Self::reap_protection`] treats terminal statuses as reapable), destroying a deliberately kept pod.
     ///
     /// Legitimate exits from 'warm' use their own guarded SQL ([`Self::try_adopt_warm_exec`],
@@ -402,6 +565,55 @@ impl Db {
             .collect())
     }
 
+    /// The name this run's result sets carry: its own id, or the id of the failed run it resumes (see
+    /// [`Db::resumable_set_id`]), so the repeats of both runs are one `<set>-<model>-rN` set.
+    pub(crate) fn set_id(&self, run_id: &str) -> Result<String> {
+        let recorded: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT set_id FROM runs WHERE id=?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(recorded.flatten().unwrap_or_else(|| run_id.to_string()))
+    }
+
+    pub(crate) fn set_set_id(&self, run_id: &str, set_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET set_id=?2 WHERE id=?1",
+            params![run_id, set_id],
+        )?;
+        Ok(())
+    }
+
+    /// The result-set name of the newest failed or aborted sweep that asked for what `r` asks for (same ref,
+    /// scenario, models and repeats) and started within `max_age_s` of `now_epoch_s`: the run `r` resumes.
+    /// Run ids are `run-<epoch seconds>`; an id that is not one is never resumed.
+    pub(crate) fn resumable_set_id(
+        &self,
+        r: &Run,
+        now_epoch_s: u64,
+        max_age_s: u64,
+    ) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, COALESCE(set_id, id) FROM runs
+             WHERE kind='sweep' AND (status IN ('failed','aborted','cancelled','abandoned') OR status LIKE 'incomplete%') AND id<>?1
+               AND git_ref=?2 AND scenario=?3 AND models=?4 AND repeats=?5
+             ORDER BY created_at DESC",
+        )?;
+        let candidates = stmt
+            .query_map(
+                params![r.id, r.git_ref, r.scenario, r.models.join(","), r.repeats],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(candidates.into_iter().find_map(|(id, set_id)| {
+            let started: u64 = id.strip_prefix("run-")?.split('-').next()?.parse().ok()?;
+            (now_epoch_s.saturating_sub(started) <= max_age_s).then_some(set_id)
+        }))
+    }
+
     /// Finalize nonterminal `exec` rows only when their owner is gone. An `exec` is non-resumable, but
     /// another process may be running it, so normal reap checks the owner identity before releasing its
     /// pod from `live_pod_ids`. `force` is the `reap --all` override.
@@ -417,9 +629,9 @@ impl Db {
         let now = now_iso();
         let candidates = {
             let mut stmt = self.conn.prepare(
-                "SELECT id, status, warm_until, owner_hostname, owner_pid, owner_boot_id, owner_start_ticks
+                concat!("SELECT id, status, warm_until, owner_hostname, owner_pid, owner_boot_id, owner_start_ticks, owner_pid_ns
                  FROM runs
-                 WHERE kind='exec' AND status NOT IN ('done','failed','aborted')",
+                 WHERE kind='exec' AND ", unfinished!()),
             )?;
             stmt.query_map([], |row| {
                 Ok(ExecReapCandidate {
@@ -430,6 +642,7 @@ impl Db {
                     owner_pid: row.get(4)?,
                     owner_boot_id: row.get(5)?,
                     owner_start_ticks: row.get(6)?,
+                    owner_pid_ns: row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
@@ -475,17 +688,22 @@ impl Db {
     fn abort_exec_candidate(&self, candidate: &ExecReapCandidate, now: &str) -> Result<usize> {
         self.conn
             .execute(
-                "UPDATE runs
+                concat!(
+                    "UPDATE runs
                  SET status='aborted', updated_at=?2
                  WHERE id=?1
                    AND kind='exec'
-                   AND status NOT IN ('done','failed','aborted')
+                   AND ",
+                    unfinished!(),
+                    "
                    AND status IS ?3
                    AND warm_until IS ?4
                    AND owner_hostname IS ?5
                    AND owner_pid IS ?6
                    AND owner_boot_id IS ?7
-                   AND owner_start_ticks IS ?8",
+                   AND owner_start_ticks IS ?8
+                   AND owner_pid_ns IS ?9"
+                ),
                 params![
                     candidate.id.as_str(),
                     now,
@@ -495,13 +713,14 @@ impl Db {
                     candidate.owner_pid,
                     candidate.owner_boot_id.as_deref(),
                     candidate.owner_start_ticks.as_deref(),
+                    candidate.owner_pid_ns.as_deref(),
                 ],
             )
             .map_err(Into::into)
     }
 
     /// Keep a finished exec's pod warm until `warm_until` (UTC ISO); a later exec with the same image
-    /// adopts it via [`find_warm_exec`].
+    /// adopts it via [`find_warm_execs`].
     pub(crate) fn set_warm(&self, run_id: &str, warm_until: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE runs SET status='warm', warm_until=?2, updated_at=?3 WHERE id=?1",
@@ -547,15 +766,20 @@ impl Db {
         }
 
         let new_changed = tx.execute(
-            "UPDATE runs
+            concat!(
+                "UPDATE runs
              SET pod_id=?2, ssh_host=?3, ssh_port=?4, status='running', updated_at=?5
              WHERE id=?1
                AND kind='exec'
-               AND status NOT IN ('done','failed','aborted')
+               AND ",
+                unfinished!(),
+                "
                AND owner_hostname IS ?6
                AND owner_pid IS ?7
                AND owner_boot_id IS ?8
-               AND owner_start_ticks IS ?9",
+               AND owner_start_ticks IS ?9
+               AND owner_pid_ns IS ?10"
+            ),
             params![
                 new_run_id,
                 warm.pod_id.as_str(),
@@ -566,6 +790,7 @@ impl Db {
                 new_owner.pid,
                 new_owner.boot_id.as_str(),
                 new_owner.start_ticks.as_str(),
+                new_owner.pid_ns.as_str(),
             ],
         )?;
         if new_changed == 0 {
@@ -603,29 +828,28 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// The newest kept-warm exec pod for `image` with a recorded endpoint. The caller checks expiry and
-    /// SSH reachability.
-    pub(crate) fn find_warm_exec(&self, image: &str) -> Result<Option<WarmExec>> {
-        self.conn
-            .query_row(
-                "SELECT id, image, pod_id, ssh_host, ssh_port, warm_until FROM runs
-                 WHERE kind='exec' AND status='warm' AND image=?1 AND pod_id IS NOT NULL
-                   AND ssh_host IS NOT NULL AND ssh_port IS NOT NULL
-                 ORDER BY updated_at DESC LIMIT 1",
-                params![image],
-                |row| {
-                    Ok(WarmExec {
-                        run_id: row.get(0)?,
-                        image: row.get(1)?,
-                        pod_id: row.get(2)?,
-                        host: row.get(3)?,
-                        port: row.get::<_, i64>(4)? as u16,
-                        warm_until: row.get(5)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Into::into)
+    /// The kept-warm exec pods for `image` with a recorded endpoint, newest first (a tie in `updated_at` goes to
+    /// the later row). The caller checks expiry and SSH reachability.
+    pub(crate) fn find_warm_execs(&self, image: &str) -> Result<Vec<WarmExec>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, image, pod_id, ssh_host, ssh_port, warm_until FROM runs
+             WHERE kind='exec' AND status='warm' AND image=?1 AND pod_id IS NOT NULL
+               AND ssh_host IS NOT NULL AND ssh_port IS NOT NULL
+             ORDER BY updated_at DESC, rowid DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![image], |row| {
+                Ok(WarmExec {
+                    run_id: row.get(0)?,
+                    image: row.get(1)?,
+                    pod_id: row.get(2)?,
+                    host: row.get(3)?,
+                    port: row.get::<_, i64>(4)? as u16,
+                    warm_until: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Snapshot every nonterminal run claim after the cloud pod list has been read (the caller owns that
@@ -633,9 +857,9 @@ impl Db {
     /// name is run-specific; with a generic name from an older binary, any unrecorded live claim makes
     /// normal reap defer deletion for this pass.
     pub(crate) fn reap_protection(&self) -> Result<ReapProtection> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, pod_id FROM runs WHERE status NOT IN ('done','failed','aborted')",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(concat!("SELECT id, pod_id FROM runs WHERE ", unfinished!()))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
@@ -669,12 +893,22 @@ impl Db {
 
     /// Recent runs with per-model progress for the web dashboard: one query for runs, one per run for models.
     pub(crate) fn dashboard(&self, limit: i64) -> Result<Vec<RunView>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, updated_at, git_ref, scenario, gpu_types, image, status, pod_id, ssh_host, ssh_port, kind
-             FROM runs ORDER BY created_at DESC LIMIT ?1",
-        )?;
+        self.run_views("ORDER BY created_at DESC LIMIT ?1", params![limit])
+    }
+
+    /// One run as the dashboard shows it, whatever its age, or `None` for an id the DB does not know.
+    pub(crate) fn dashboard_run(&self, run_id: &str) -> Result<Option<RunView>> {
+        Ok(self.run_views("WHERE id=?1", params![run_id])?.pop())
+    }
+
+    /// The runs that `tail` (a `WHERE`/`ORDER BY`/`LIMIT` clause of the `runs` table) selects, with their models.
+    fn run_views(&self, tail: &str, args: impl rusqlite::Params) -> Result<Vec<RunView>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, created_at, updated_at, git_ref, scenario, gpu_types, image, status, pod_id, ssh_host, ssh_port, kind, repeats
+             FROM runs {tail}"
+        ))?;
         let mut runs = stmt
-            .query_map([limit], |row| {
+            .query_map(args, |row| {
                 Ok(RunView {
                     id: row.get(0)?,
                     created_at: row.get(1)?,
@@ -688,6 +922,7 @@ impl Db {
                     ssh_host: row.get(9)?,
                     ssh_port: row.get::<_, Option<i64>>(10)?.map(|p| p as u16),
                     kind: row.get(11)?,
+                    repeats: row.get(12)?,
                     models: Vec::new(),
                 })
             })?
@@ -712,6 +947,17 @@ impl Db {
         Ok(runs)
     }
 
+    /// The ids of the runs that have not reached a terminal status.
+    pub(crate) fn unfinished_run_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(concat!("SELECT id FROM runs WHERE ", unfinished!()))?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
     /// All recent runs for the `status` command.
     pub(crate) fn recent_runs(&self, limit: i64) -> Result<Vec<(Run, String)>> {
         let mut stmt = self.conn.prepare(
@@ -734,10 +980,15 @@ pub(crate) mod test_only {
     use super::*;
 
     impl Db {
+        /// A run with no recorded owner (the orchestrator always records one).
+        pub(crate) fn create_run(&self, r: &Run) -> Result<()> {
+            self.create_run_with_owner(r, None)
+        }
+
         pub(crate) fn set_exec_owner(&self, run_id: &str, owner: &ExecOwner) -> Result<()> {
             self.conn.execute(
                 "UPDATE runs
-                 SET owner_hostname=?2, owner_pid=?3, owner_boot_id=?4, owner_start_ticks=?5, updated_at=?6
+                 SET owner_hostname=?2, owner_pid=?3, owner_boot_id=?4, owner_start_ticks=?5, owner_pid_ns=?6, updated_at=?7
                  WHERE id=?1 AND kind='exec'",
                 params![
                     run_id,
@@ -745,6 +996,7 @@ pub(crate) mod test_only {
                     owner.pid,
                     owner.boot_id.as_str(),
                     owner.start_ticks.as_str(),
+                    owner.pid_ns.as_str(),
                     now_iso()
                 ],
             )?;
@@ -753,9 +1005,10 @@ pub(crate) mod test_only {
 
         /// Test-only view of recorded pod ids of nonterminal runs. Production reap uses [`Self::reap_protection`].
         pub(crate) fn live_pod_ids(&self) -> Result<Vec<String>> {
-            let mut stmt = self.conn.prepare(
-                "SELECT pod_id FROM runs WHERE pod_id IS NOT NULL AND status NOT IN ('done','failed','aborted')",
-            )?;
+            let mut stmt = self.conn.prepare(concat!(
+                "SELECT pod_id FROM runs WHERE pod_id IS NOT NULL AND ",
+                unfinished!()
+            ))?;
             let ids = stmt
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -771,6 +1024,15 @@ pub(crate) mod test_only {
                 )
                 .optional()
                 .map_err(Into::into)
+        }
+
+        /// Backdate a run, to place it behind the runs the dashboard lists.
+        pub(crate) fn set_created_at(&self, run_id: &str, created_at: &str) -> Result<()> {
+            self.conn.execute(
+                "UPDATE runs SET created_at=?2 WHERE id=?1",
+                params![run_id, created_at],
+            )?;
+            Ok(())
         }
     }
 }

@@ -9,92 +9,61 @@ import KVCacheDiagram from "@site/src/components/architecture/KVCacheDiagram";
 
 # Attention and KV Cache
 
-The original Transformer [^transformer] attention mechanism computes
-`softmax(QK^T / sqrtd_k) * V`. Computed naively, this materializes an `[L x L]` score matrix
-that does not fit in GPU SRAM for long contexts. poot handles attention in three stages:
-primitive decomposition (what the tracer records), flash attention rewrite (what the compiler
-produces), and KV caching (how past context is stored).
+Naive attention, `softmax(QK^T / sqrtd_k) * V` [^transformer], builds an `[L x L]` score matrix that does not fit in GPU SRAM
+for long contexts. poot handles it in three stages: the tracer records primitive ops, a compiler pass fuses them into one
+flash attention op, and a KV cache stores past keys and values.
 
 ## Attention as primitive ops
 
-The model tracer (`ops::attention_masked`) emits attention as a sequence of about ten
-primitive eqns, plus the KV write and the GQA repeat:
+`ops::attention_masked` emits about ten primitive eqns, plus the KV write and the GQA repeat. There is no attention opcode.
 
-```
-# q: [1, H_q, 1, D]; the new k/v are written into the state buffers at position `pos`
-k_cache = DynamicUpdateSlice(k_cache, k, pos)     # state_in -> state_out
-v_cache = DynamicUpdateSlice(v_cache, v, pos)
+| Step | Eqns |
+| --- | --- |
+| KV write | `DynamicUpdateSlice` of k and v into the state buffers at `pos` |
+| GQA repeat | `repeat_kv`: `Reshape`, `Broadcast`, `Reshape` (a no-op when `H_q == H_kv`) |
+| Scores | `MatMul(q, Transpose(k))`, `Mul` by scale (usually `1/sqrt(D)`), `Add` of the mask |
+| Softmax | `Reduce(Max)`, `Sub`, `Exp`, `Reduce(Sum)`, `Div` |
+| Output | `MatMul(p, v)` |
 
-# GQA repeat: Reshape -> Broadcast -> Reshape (no-op if H_q == H_kv)
-k_exp = repeat_kv(k_cache, n_rep)
-v_exp = repeat_kv(v_cache, n_rep)
-
-scores = MatMul(q, Transpose(k_exp))       # [1, H_q, 1, cap]
-scores = Mul(scores, scale)                # scale, usually 1/sqrt(D)
-scores = Add(scores, mask)                 # large negative past `pos`; a graph computation over
-                                            # Slot::Pos
-
-# Numerically stable softmax (max-subtract, then normalize); binary ops broadcast implicitly
-m   = Reduce(Max, scores, axis=-1, keepdim=True)
-xs  = Sub(scores, m)
-ex  = Unary(Exp, xs)
-s   = Reduce(Sum, ex, axis=-1, keepdim=True)
-p   = Div(ex, s)
-
-out = MatMul(p, v_exp)                     # [1, H_q, 1, D]
-```
-
-No special attention opcode. The flash attention rewrite pass recognizes this chain and replaces it.
+The mask is large negative past `pos`; it is a graph computation over `Slot::Pos`. The flash rewrite recognizes this chain.
 
 ## Multi-head, GQA, and MQA
 
-Multi-query attention (MQA) [^mqa] and grouped-query attention (GQA) [^gqa] reduce the
-number of K and V heads relative to Q. poot handles this with `repeat_kv`
-(`Reshape`, `Broadcast`, `Reshape`) over the head axis, no special opcode. For a model with
-32 Q heads and 8 KV heads, K and V are expanded 4x. After the flash rewrite the fused op
-carries `n_rep = 4` and the kernel reads `kv_head = q_head / n_rep`, so the same K/V rows
-are shared by several Q heads without a copy.
+Multi-query (MQA) [^mqa] and grouped-query attention (GQA) [^gqa] use fewer K/V heads than Q heads. The fused op carries
+`n_rep` (4 for 32 Q heads and 8 KV heads), and the kernel reads `kv_head = q_head / n_rep`, so Q heads share K/V rows without a
+copy.
 
 ## The attention rewrite pass
 
-Flash attention [^flash1] [^flash2] avoids materializing the `[Lq x Lk]` score matrix by
-streaming over K/V and maintaining a running (max, denominator, accumulator) triple in
-workgroup memory. poot implements this as a **compiler pass**, not an opt-in mode.
+Flash attention [^flash1] [^flash2] streams over K/V with a running (max, denominator, accumulator) triple in workgroup memory,
+so the score matrix never exists. In poot it is a **compiler pass**, not an opt-in mode.
 
-`compile`'s attention rewrite runs after canonicalization and RoPE recognition, using the
-target grid limit. It recognizes supported attention subgraphs and replaces them with a single
-`Attention` eqn. Decode (one query row against a capacity-long cache) and prefill (every
-query row against the prompt) are the same op: `q [B, Hq, Lq, Dk]`, `k [B, Hkv, Lk, Dk]`,
-`v [B, Hkv, Lk, Dv]` (the value width is independent of the key width), an additive
-`mask [B, Hm, Lq, Lk]` whose head axis is 1 or `Hq` (ALiBi), and an optional attention-logit
-softcap. Three more forms ride on the same op: a split key, a paged key and a live length (below).
-A sparse-attention indexer uses a block-selected form instead: no mask operand, the selected block ids and
-the query positions in its place, so each row visits only the `(K + 1) * ratio` positions of its `K` selected
-blocks and its own unfinished block rather than all `Lk`. The tracer states the block selection and the mask
-over the selected blocks as primitives, and the selection pass of `compile` recognizes them and forms the
-`BlockTopK` and `SelectedAttention` eqns, the same way the attention rewrite forms `Attention`.
+It runs in `compile` after canonicalization and RoPE recognition, and replaces each supported subgraph with one `Attention`
+eqn. Unsupported patterns keep their primitives. Decode and prefill are the same op:
 
-The planner turns the eqn into one generation request that names the shape, the score
-transform (scale, or scale plus softcap), the mask kind, the key bound and the schedule. One
-generator serves every phase, target and head width. The planner picks the schedule's lane
-count from the device's workgroup memory and records the request with the plan. It refuses the
-eqn with a typed capability error only when the device cannot hold the running state of even
-one lane (`AttentionLds`, naming the value width and the device's bytes).
+| Operand | Shape | Notes |
+| --- | --- | --- |
+| `q` | `[B, Hq, Lq, Dk]` | |
+| `k` | `[B, Hkv, Lk, Dk]` | |
+| `v` | `[B, Hkv, Lk, Dv]` | `Dv` is independent of `Dk`. |
+| `mask` | `[B, Hm, Lq, Lk]` | Additive; `Hm` is 1 or `Hq` (ALiBi). |
+| softcap | scalar | Optional. |
 
-Models compose attention with `ops::attention_masked` or `ops::attention_prefill`. The compiler
-selects the fused op when the shape and target satisfy the matcher checks. Unsupported patterns
-keep their primitive decomposition.
+A sparse-attention indexer uses a block-selected form: no mask, the selected block ids and query positions instead. Each row
+visits only the `(K + 1) * ratio` positions of its `K` selected blocks and its own unfinished block. The selection pass forms
+`BlockTopK` and `SelectedAttention` eqns.
+
+The planner turns the eqn into one generation request (shape, score transform, mask kind, key bound, schedule). One generator
+serves every phase, target and head width. The lane count follows the device's workgroup memory; only a device that cannot hold
+one lane's state gets the typed error `AttentionLds`.
 
 ## The streaming schedule
 
-The implemented schedule runs one workgroup of `lanes` threads per (batch row, query head,
-query row): `B * n_q_heads * Lq` workgroups, laid over a 2-D grid when that count passes the
-device's X grid limit. Each lane strides over the keys (`t = lane, lane + lanes, ...`) and
-keeps its own running state. The lane count is the widest power of two, at most 64, whose
-state fits the device's workgroup memory: `lanes * (dv + 2)` floats.
+Decode, and any attention whose rows cannot share key blocks, takes the streaming schedule. One workgroup of `lanes`
+threads runs per (batch row, query head, query row). Each lane strides over the keys with its own
+running state. `lanes` is the widest power of two, at most 64, with `lanes * (dv + 2)` floats fitting workgroup memory.
 
-**The online softmax algorithm** [^onlinesoftmax] keeps three accumulators per lane in LDS
-(workgroup-local memory):
+The online softmax [^onlinesoftmax] keeps three accumulators per lane in LDS:
 
 <FlashAttentionDiagram />
 
@@ -102,158 +71,186 @@ state fits the device's workgroup memory: `lanes * (dv + 2)` floats.
 // Per lane, over its keys:
 let score = softcap_or_identity(dot(q, k[t]) * scale) + mask[t];
 let m_new = max(m, score);
-let rescale = exp(m - m_new);        // 0 while the lane has seen nothing
+let rescale = exp(m - m_new);
 let weight = exp(score - m_new);
 l = l * rescale + weight;
 for d in 0..head_dim {
     o[d] = o[d] * rescale + weight * v[t][d];
 }
 m = m_new;
-// One barrier, then every lane folds the lanes' partials over a slice of the output channels:
-// M = max of the lane maxima, out[c] = sum_i o_i[c] * exp(m_i - M) / sum_i l_i * exp(m_i - M)
+// Then one barrier; lanes merge partials weighted by exp(m_i - M).
 ```
 
-The accumulators are in workgroup LDS, not private arrays: private arrays with dynamic indices
-crash some SPIR-V drivers (RADV). The same generated kernel runs on wgpu, raw Vulkan, ROCm and PTX.
+- The accumulators live in LDS because private arrays with dynamic indices crash some SPIR-V drivers (RADV).
+- A `-inf` score adds zero weight; a row with no visible key is `0 / 0`, as in the oracle.
+- Peak memory is **O(head_dim)** per workgroup. The same kernel runs on wgpu, raw Vulkan, ROCm and PTX.
 
-A key whose score is `-inf` adds exactly zero weight, and a row with no visible key at all is
-`0 / 0`, as the oracle's softmax gives. Peak memory is **O(head_dim)** per workgroup: the
-`[Lq x Lk]` score matrix is never written.
+<details>
+<summary>Bank-conflict swizzle</summary>
+
+When `dv` is a multiple of the 32 workgroup-memory banks, each lane's partial `o` is stored with its channel XORed with
+`lane % 32`. Every lane then uses a different bank, and the footprint stays `lanes * dv` words. A padded stride would also avoid
+conflicts but can cost a resident workgroup per compute unit. The swizzle is in the shared generator, so all schedules use it.
+
+</details>
+
+## The tiled prefill schedule
+
+A prefill has many query rows that read the same keys. The tiled schedule (FlashAttention-2 [^flash2]) lets them
+share each key load:
+
+- One workgroup serves a block of `br` query positions of one (batch row, key/value head). The `n_rep` query heads
+  of the key/value head are packed into the block, so it has `br * n_rep` rows.
+- The block's queries are staged in workgroup memory once. The keys are walked in blocks of `bc` (32 or 16); each
+  block of keys, then of values, is staged once for every row. A two-byte cache (f16 or bf16) is widened to f32 as
+  it is staged.
+- Both products, `S = Q K^T` and `O += P V`, run as per-lane register tiles. The online softmax keeps one running
+  maximum and sum per row; a block that every row sees whole is not masked.
+- A causal block walks only the keys from its rows' earliest window start to its last row's position, and a live
+  length bounds the walk. A key no row of the block sees is never read.
+
+The planner chooses the tiling from the shape and the device:
+
+| Rule | Value |
+| --- | --- |
+| Applies to | More than one query row, dense keys (single, split or paged), any mask but a block selection |
+| Workgroup | The widest of 256, 128 and 64 lanes the device allows; 64 on RADV (Strix Halo), whose wider workgroups lose workgroup-memory writes |
+| Registers | At most 64 accumulators per lane across the two tiles |
+| Memory | The staged tiles fit the device's workgroup memory |
+| Fill | At least one workgroup per compute unit; otherwise the streaming schedule |
+
+Among the tilings that fit, the widest workgroup wins, then the most rows per block, then the wider key block. The
+numerics are the same online softmax with a different summation order, so results match the oracle within the flash
+tolerance, not bit for bit. Unlike the streaming schedule, a key that one row of a block sees is read by every row of
+it: a non-finite key or value there reaches the rows that cannot see it.
+
+## The block-selected schedule
+
+The selected ids are per query row, so all `n_rep` heads of a key/value head read the same positions. Two schedules exist:
+
+| Schedule | When | Shape |
+| --- | --- | --- |
+| **Grouped** | Rows keep the device full (at least two groups per compute unit). | One workgroup per (key/value head, query row), serving all `n_rep` heads. |
+| **Ungrouped** | Decode, or a device whose workgroup memory cannot hold the `n_rep` head lanes. | One workgroup per head, one key per step. |
+
+Grouped loads each selected key and value row once per group [^nsa]. Each step takes one block's keys (up to four), sharing one
+load of `q` and one rescale. The request records the choice (`grouped`). Where a display watchdog bounds a dispatch, a long
+chunk is cut into runs.
 
 ## Split keys, paged keys and the live length
 
-**Split keys.** Multi-head latent attention [^mla] builds each key from a per-head part and one
-rotary part shared by every head: `concat(k_nope, broadcast(k_pe))`. The rewrite recognizes that
-chain and keeps the two parts as separate operands, `k [B, Hkv, Lk, Dk - s]` and
-`k_shared [B, 1, Lk, s]`. The kernel reads the shared part once per key for every head, so the
-broadcast key is never built. A value narrower than the key is part of the op's type.
+| Form | Operands | Effect |
+| --- | --- | --- |
+| **Split keys** [^mla] | `k [B, Hkv, Lk, Dk - s]`, `k_shared [B, 1, Lk, s]` | Multi-head latent attention's `concat(k_nope, broadcast(k_pe))` is never built; the shared part is read once per key. |
+| **Paged keys** | Pools `k [S, Hkv, Dk]`, `v [S, Hkv, Dv]`, `I32 read [B, Lk]` | Key `t` of row `b`, head `g` is pool row `read[b, t] * Hkv + g`; no gather or transpose. |
+| **Live length** | `I32 len [B]` | Visits only the first `len[b]` keys, so a step costs the live length, not `cap`. |
 
-**Paged keys.** A paged KV cache keeps K and V in per-layer pools of fixed slots (see
-[Paged KV](#kv-cache)). The paged key form takes the pools themselves, `k [S, Hkv, Dk]` and
-`v [S, Hkv, Dv]`, and an `I32 read [B, Lk]` operand that names the pool slot of each logical
-position. The kernel addresses key `t` of row `b` and key head `g` as pool row
-`read[b, t] * Hkv + g`, so the per-row `[B, Hkv, Lk, D]` view is never gathered or transposed. The
-schedule, live length and mask handling are the ones the dense form uses; only the address
-differs. The rewrite fuses a paged key only when the graph proves every word of `read` is a slot of
-the pool (the map's declared range, which the bind enforces); otherwise the attention stays over the
-gathered view. Attention that reads other cached values (latent, indexer and sliding-window caches)
-keeps the gathered view.
+**Paged keys** fuse only when the graph proves every word of `read` is a slot of the pool (the map's declared range, enforced at
+bind). Other cached values (latent, indexer, sliding-window) keep the gathered view.
 
-**Live length.** A decode over a capacity-long cache normally visits every slot and lets the mask
-hide the unused ones. The live form takes an `I32 len [B]` operand and visits only the first
-`len[b]` keys of each batch row, so a decode step costs the live length, not the capacity. The grid
-and the recorded launch do not depend on `len`, so capture and replay stay valid. The length is built
-in the graph from the position (`len = pos + 1`).
+**Live length** keeps the grid and launch independent of `len`, so capture and replay stay valid. The graph builds
+`len = pos + 1`, and `ops::attention_live` is the one definition:
 
-`ops::attention_live` is the one definition. It requires `1 <= len[b] <= Lk` and bounds the length in
-the graph with an index guard whose witness is a validation output: an out-of-range length fails
-through the validation channel and publishes nothing. It then selects the inactive key and value rows
-to zero before either matmul (a true select, so a NaN in an unused row cannot reach the output;
-multiplying by zero would keep it) and selects the inactive scores to `-inf` before the softmax. The
-rewrite emits the live bound when the graph proves `1 <= len <= Lk` from value ranges, and it holds
-the clamp to the same contract: a length whose range comes from an index guard's clamp fuses only
-when that guard's witness is a declared validation output, so a bad length never turns silently into
-a valid-looking answer; a range that comes from a declared position slot, which every binder checks,
-needs no witness.
-A graph with only a score mask (the in-graph causal mask of the dense families), a guard on some
-operands, or a length it cannot prove keeps its capacity form or its primitive decomposition,
-and its results do not change. The live bound types at every float dtype, but the generated kernel is F32 only: a
-BF16 or F16 chain (live or not) stays the primitive decomposition, with the same selects at its own dtype, and runs on
-ROCm and PTX (a SPIR-V target refuses the two-byte select with a typed `DtypeLowering`). That primitive form runs on every device: the key positions it
-compares against `len` are an exact `I32` range, with no round trip through `F32`. A generated
-kernel clamps `len` into `0..=Lk` before it bounds the loop, so no length can read outside the
-buffers.
+- It requires `1 <= len[b] <= Lk` and bounds the length with an index guard whose witness is a validation output; an
+  out-of-range length publishes nothing.
+- It selects inactive key and value rows to zero before either matmul (a true select, so a NaN in an unused row cannot reach
+  the output) and inactive scores to `-inf` before the softmax.
+- The rewrite fuses it only when value ranges prove `1 <= len <= Lk`. A range from an index guard's clamp needs that guard's
+  witness to be a declared validation output; a declared position slot needs none.
+- Otherwise (score-mask-only graphs, partial guards, unprovable lengths) the capacity form or primitives stay, with unchanged
+  results.
+- The generated live kernel is F32 only. A BF16 or F16 chain stays primitives with selects at its own dtype: it runs on ROCm and
+  PTX, and a SPIR-V target refuses the two-byte select with a typed `DtypeLowering`. Generated kernels clamp `len` into
+  `0..=Lk`.
 
 ## Split-KV decode
 
-A decode step has one query row per head, so the streaming schedule launches `B * n_q_heads`
-workgroups. At a few heads on a device with tens of compute units, most of the device idles while
-each workgroup walks the whole cache. The split-KV schedule (Flash-Decoding [^flashdecoding]) cuts
-the keys into `splits` contiguous chunks and runs two launches:
+Decode launches only `B * n_q_heads` workgroups, which leaves most of a large device idle. The split-KV schedule
+(Flash-Decoding [^flashdecoding]) cuts the keys into `splits` chunks and runs two launches:
 
-1. **Partials.** One workgroup per (row, split) runs the streaming body over its own chunk of the
-   live range and writes the *unnormalized* state `(o[dv], m, l)` to a scratch buffer at
-   `[(row * splits + split) * (dv + 2)]`. A split whose chunk is past the live length, or whose keys
-   are all masked, publishes the neutral `(0, -inf, 0)` by the same arithmetic as a lane that saw
-   nothing, so the scratch needs no initialization and a stale slot cannot leak into a result.
-2. **Combine.** One workgroup of `lanes` threads per row reduces the row's partials with the same
-   `exp(m_i - M)` weighting the lane combine uses, and writes the output.
+1. **Partials:** one workgroup per (row, split) runs the streaming body over its chunk and writes the unnormalized
+   `(o[dv], m, l)` to scratch. A split past the live length, or fully masked, writes the neutral `(0, -inf, 0)`, so the scratch
+   needs no initialization.
+2. **Combine:** one workgroup per row merges the partials with the `exp(m_i - M)` weighting and writes the output.
 
-The scratch is a plan-local buffer the equation declares (its storage and element count) beside
-its two dispatches, and the dispatches run in order. The buffer plan colors it with the values:
-it lives exactly as long as its equation, is never an export, and shares its arena slot with the
-next layer's scratch, so the arena does not grow with the layer count and the stage's memory budget
-already counts it.
+The scratch is a plan-local buffer. The buffer plan shares one arena slot across layers, so the arena does not grow with layer
+count. The split count is part of the request and the plan key. The planner chooses it as follows:
 
-The planner chooses the split from the device and the shape: only for a decode (`Lq == 1`) whose
-rows do not already fill the device's compute units, at most 16 splits, never a chunk under 128
-keys. It keeps the streaming schedule when the partial state would exceed the device's
-single-buffer limit or the launch's 2-D fold would pass the device's grid; a plan that declares a
-scratch the device cannot allocate anyway is refused with a typed `ScratchBytes`. The split count
-is part of the request, so it is part of the plan key.
+| Rule | Value |
+| --- | --- |
+| Applies to | Decode (`Lq == 1`) whose rows do not fill the compute units |
+| Splits | At most 16, chunks of at least 128 keys |
+| Falls back to streaming | Partial state over the single-buffer limit, or the 2-D fold passing the grid |
 
-The combine reassociates the float sums (per-split partials, then across splits), so it matches
-the streaming schedule and the oracle within a tolerance, not bit for bit.
-
-Every schedule shares the same score, mask and softmax-combine semantics; the planner chooses
-the schedule per shape.
+A scratch the device cannot allocate is refused with a typed `ScratchBytes`. The combine reassociates float sums, so results
+match the oracle within a tolerance, not bit for bit.
 
 ## KV cache
 
-The attention kernel reads from K/V buffers accumulated over all past tokens. Without
-caching, K and V would be recomputed from scratch every decode step at O(L) cost.
-
-poot supports two KV allocation schemes:
+Without a cache, K and V would be recomputed every decode step at O(L) cost. poot has two allocation schemes:
 
 <KVCacheDiagram />
 
-**Fixed-capacity with causal masking:** K and V are `Storage::State` buffers pre-allocated to
-`cap` positions per layer. Per token, new K/V are written at position `pos` (a
-`DynamicUpdateSlice`). The attention kernel sweeps the full `[cap]` allocation; a mask hides
-positions after `pos` with a large negative value. That mask is built in-graph from `Slot::Pos`
-against an `Iota`; no slot carries it. The grid is
-constant every token, capturable as a CUDA graph. Memory usage = capacity regardless of actual
-sequence length.
+**Fixed capacity with causal masking.** K and V are `Storage::State` buffers of `cap` positions per layer. Each token writes at
+`pos`; the kernel sweeps all `[cap]` positions under an in-graph mask. The grid is constant, so it is capturable as a CUDA
+graph. Memory is `cap` whatever the sequence length.
 
-**Paged KV** [^pagedattn]: K/V space is divided into fixed-size blocks (16 tokens,
-`poot_llm::driver::block_table::BLOCK_SIZE`) from a shared pool, inspired by virtual memory
-management in operating systems. Each layer holds one `[pool_slots, kv_heads, head_dim]` pool
-shared by every row of a step. The driver keeps a block table per sequence and binds two inputs
-per step: `read` (`Slot::SlotMap`), an `[rows, cap]` i32 map from each row's logical position to
-its flat physical slot, and `write` (`Slot::WriteMap`), a `[rows * tokens]` i32 map from each new
-token to the pool slot it is written to (or -1, so a padding token writes nothing). A write map is
-bound only as a checked `ForwardSlotMap`, which refuses a slot outside the pool or named twice. The
-read map is declared in `[0, pool_slots)`, so a word outside the pool is refused at the bind as a
-typed range error before anything dispatches. The
-paged graph writes new rows with `ScatterUpdate` through `write`, in place on the donated pool and
-at a cost that follows the tokens, not the pool. Attention then reads each row's K/V from the
-written pools in place through `read` (a paged key, see [Paged keys](#split-keys-paged-keys-and-the-live-length)), with no gather and no transpose, and
-applies the same causal mask as the contiguous layout. Blocks are allocated on demand and freed
-when the sequence completes. Memory scales with actual usage. Shared prefix blocks enable prefix
-caching across requests.
+**Paged KV** [^pagedattn]. Fixed-size blocks (16 tokens, `poot_llm::driver::block_table::BLOCK_SIZE`) come from a shared pool;
+each layer has one `[pool_slots, kv_heads, head_dim]` pool. The driver keeps a block table per sequence and binds two inputs per
+step:
+
+| Input | Slot | Shape | Meaning |
+| --- | --- | --- | --- |
+| `read` | `Slot::SlotMap` | `[rows, cap]` i32 | Logical position to physical slot. |
+| `write` | `Slot::WriteMap` | `[rows * tokens]` i32 | New token to pool slot, or -1 for padding. |
+
+- A write map is bound only as a checked `ForwardSlotMap`, which refuses a slot outside the pool or named twice.
+- The read map is declared in `[0, pool_slots)`, so a word outside the pool is a typed range error at bind.
+- New rows go in with `ScatterUpdate` through `write`, in place on the donated pool, at a cost that follows the tokens.
+- Attention reads the pools in place through `read` (a paged key). Blocks are allocated on demand and freed on completion.
+
+### Storage dtype
+
+The cache stores f16 by default, half the bytes of f32, as llama.cpp does. Attention computes in f32 whatever is stored.
+
+| Dtype | Use |
+| --- | --- |
+| `f16` | The default. |
+| `bf16` | Same size as f16, wider range, fewer mantissa bits. Not on wgpu or Vulkan: SPIR-V has no bf16 type, so the planner refuses it with a typed `DtypeLowering`. |
+| `f32` | The exact reference, twice the bytes. |
+
+The dtype a driver runs comes from, in order: an explicit option (`DriverOptions::kv_dtype`, `--kv-dtype` on the server and the
+benchmark runner), the model's own preference (`ModelConfig::kv_dtype`), then f16. A family whose cache is read by contractions,
+not only by attention (the DeepSeek and GLM-5.3-Flash latent and indexer caches), prefers f32: no contraction body reads a two-byte operand in
+place yet, so a narrow cache there would be widened into an f32 copy every step.
+
+- The write narrows: `DynamicUpdateSlice` and `ScatterUpdate` store an f32 update into a two-byte cache with round-to-nearest-even,
+  one kernel, no narrowed copy of the new entries.
+- The read widens: the tracer reads the cache through a `Cast` to f32, which the attention rewrite folds into the fused op, so
+  the kernel loads two-byte keys and values and converts in registers.
+- The oracle evaluates the same graph, so it holds the same rounded cache, and an exact-token gate against it compares like with
+  like.
+
+Measured against an f32 cache on qwen3-0.6b and qwen3-4b (bf16 and Q4_K_M checkpoints), teacher-forced over 737 positions of
+mixed prose and code: f16 keeps the top token at 99.9 to 100 percent of positions (the one flip was a tie within 4e-4 nats),
+with a mean top-token log-probability change of 4e-4 to 6e-4 and an identical 128-token greedy continuation. bf16 changes it
+about seven to ten times more and also keeps the greedy continuation.
 
 ## Prefix caching
 
-When a new request begins with a prefix that matches a previous request's K/V blocks
-(identified by a hash of token ids plus the effective model weights), those blocks are pinned in
-the pool and the new request's block table is pointed at them. The prefill for the matching prefix
-is skipped. Because the weights identity is part of the key, the base model and each LoRA adapter
-keep separate prefix entries even when their token ids match, and a hot-reloaded adapter gets a
-fresh identity so it never reuses the previous adapter's cached K/V. This is a block-allocation
-policy, the kernel itself does not change.
+A request whose prefix matches earlier K/V blocks reuses them: the blocks are pinned, the block table points at them, and that
+prefill is skipped. The match key is a hash of the token ids plus the effective model weights. The base model and each LoRA
+adapter therefore keep separate entries, and a hot-reloaded adapter gets a fresh identity. This is allocation policy; the kernel
+is unchanged.
 
 ## Implementation details
 
-- **Key and value widths.** The value width is independent of the key width, and a split key
-  (multi-head latent attention [^mla]) is a first-class operand layout. The matcher declines a chain
-  whose key or value the op's typing rule cannot type, such as a single key head the matmul merely
-  broadcasts. See [Crates and implementation details](./implementation).
-- **Softcap.** The softcap is part of the score transform on every phase: decode and
-  prefill both run the generated kernel.
-- **Head width.** There is no fixed head-width limit: the lane count follows the device's workgroup
-  memory, so a 512-wide head runs on every target with fewer lanes than a 64-wide one.
+- **Widths.** The value width is independent of the key width, and a split key is a first-class operand layout. The matcher
+  declines a chain whose key or value the typing rule cannot type, such as a single key head the matmul merely broadcasts.
+- **Softcap.** Part of the score transform on every phase.
+- **Head width.** No fixed limit: the lane count follows workgroup memory, so a 512-wide head runs everywhere with fewer lanes.
 
-More crate-level notes live on [Crates and implementation details](./implementation).
+More in [Crates and implementation details](./implementation).
 
 ---
 
@@ -270,6 +267,8 @@ More crate-level notes live on [Crates and implementation details](./implementat
 [^flash2]: Dao, T., "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning," ICLR, 2024. https://arxiv.org/abs/2307.08691
 
 [^onlinesoftmax]: Milakov, M. & Gimelshein, N., "Online Normalizer Calculation for Softmax," arXiv:1805.02867, 2018. https://arxiv.org/abs/1805.02867
+
+[^nsa]: Yuan, J. et al., "Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention," arXiv:2502.11089, 2025. https://arxiv.org/abs/2502.11089
 
 [^flashdecoding]: Dao, T., Haziza, D., Massa, F. & Sizov, G., "Flash-Decoding for long-context inference," blog post, 2023. https://pytorch.org/blog/flash-decoding/
 

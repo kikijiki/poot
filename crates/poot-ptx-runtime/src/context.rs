@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cudarc::driver::{result, sys};
-use poot_runtime_common::{BufferRole, CompiledKernel, DeviceBackend, KernelCode, fnv1a};
+use poot_codegen::{CompiledKernel, KernelCode};
+use poot_runtime_common::{BufferRole, DeviceBackend, fnv1a};
 use poot_target::ElementKind;
 
 use super::buffer::{PtxBuffer, allocate_owned, checked_copy};
@@ -140,7 +141,6 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
         matrix_lowering: poot_target::MatrixLowering::nvidia(tensor_core),
         native_two_byte_floats: true,
         widens_bf16_decode_weight: true,
-        imported_lds_array_bodies: true,
         peer_transport: true,
         // Measured on Ampere only; another generation keeps the GEMV at any width.
         decode_gemv_max_out_cols: poot_target::calibration::nvidia_decode_gemv_max_out_cols(
@@ -258,6 +258,7 @@ impl PtxContext {
 
     /// Upload host i32 to the device (e.g. packed GPTQ qweight/qzeros/g_idx, spec 026). `elem_count` is the
     /// element count, matching a kernel's i32-slice GEPs.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn upload_i32(&self, data: &[i32]) -> Result<PtxBuffer, PtxError> {
         self.refuse_during_capture("upload_i32")?;
         self.upload_elements(
@@ -466,7 +467,7 @@ impl PtxContext {
         b: &PtxBuffer,
         storage: BufferStorage,
     ) -> Result<Vec<T>, PtxError> {
-        let elements = b.elem_count() as usize;
+        let elements = b.elem_count();
         checked_copy(b, op, storage, 0, elements, true, |range| {
             self.synchronize()?;
             let mut out = vec![T::default(); elements];
@@ -860,9 +861,9 @@ impl PtxContext {
         block: [u32; 3],
         threads: [u32; 3],
         ins: &[&PtxBuffer],
-        ins_lens: &[u32],
+        ins_lens: &[usize],
         out: &PtxBuffer,
-        out_len: u32,
+        out_len: usize,
     ) -> Result<(), PtxError> {
         self.bind()?;
         check_ptx_args(kernel, ins, out)?;
@@ -874,7 +875,14 @@ impl PtxContext {
         let (ptx, entry) = ptx_text_and_entry(kernel)?;
         let func = self.function(ptx, entry)?;
 
-        let args = KernelArgs::pack(&self.capture, ins, ins_lens, out, out_len);
+        let args = KernelArgs::pack(
+            &self.capture,
+            kernel.index_width(),
+            ins,
+            ins_lens,
+            out,
+            out_len,
+        )?;
         let mut params = args.params();
 
         let grid = (
@@ -940,7 +948,7 @@ fn check_ptx_args(
         .map(|b| b.element())
         .chain(std::iter::once(out.element()))
         .collect();
-    poot_runtime_common::check_kernel_args(kernel, &elements)?;
+    poot_codegen::check_kernel_args(kernel, &elements)?;
     Ok(())
 }
 
@@ -963,27 +971,61 @@ pub(crate) struct KernelArgs {
 impl KernelArgs {
     /// `lens`' unit is the caller's own (Card 547b): each buffer's planned element
     /// count, index-aligned with `ins` plus `out` last - never `PtxBuffer::elem_count()` (an arena
-    /// slot's buffer can be larger than this particular operand's own need).
+    /// slot's buffer can be larger than this particular operand's own need). A buffer that does not start on
+    /// [`poot_codegen::BUFFER_PARAM_ALIGN`] is refused (`PtxError::MisalignedBinding`): the kernels read
+    /// aligned groups of a parameter on that guarantee. A kernel narrowed to 32-bit index math
+    /// ([`poot_kernel_ir::IndexWidth::U32`]) is refused (`PtxError::IndexBoundExceeded`) a binding whose longest
+    /// length its bound does not keep within [`poot_kernel_ir::IndexBound::U32_LIMIT`]: the planner proved the
+    /// planned lengths fit, and a length past that proof would wrap the kernel's indices.
     pub(crate) fn pack(
         capture: &CaptureRetention,
+        index_width: poot_kernel_ir::IndexWidth,
         ins: &[&PtxBuffer],
-        ins_lens: &[u32],
+        ins_lens: &[usize],
         out: &PtxBuffer,
-        out_len: u32,
-    ) -> Self {
-        let buffers = ins.iter().copied().chain(std::iter::once(out));
-        let lens = ins_lens.iter().copied().chain(std::iter::once(out_len));
+        out_len: usize,
+    ) -> Result<Self, PtxError> {
+        let buffers = || ins.iter().copied().chain(std::iter::once(out));
+        if let Some((param, buffer)) = buffers().enumerate().find(|(_, buffer)| {
+            !buffer
+                .ptr()
+                .is_multiple_of(poot_codegen::BUFFER_PARAM_ALIGN)
+        }) {
+            return Err(PtxError::MisalignedBinding {
+                op: "dispatch_dev",
+                param,
+                address: buffer.ptr(),
+                alignment: poot_codegen::BUFFER_PARAM_ALIGN,
+            });
+        }
+        let lens = || ins_lens.iter().copied().chain(std::iter::once(out_len));
+        if let poot_kernel_ir::IndexWidth::U32(bound) = index_width {
+            let longest = lens().max().unwrap_or(0);
+            if !bound.fits_u32(longest as u64) {
+                return Err(PtxError::IndexBoundExceeded {
+                    op: "dispatch_dev",
+                    elems: longest,
+                    scale: bound.scale,
+                    slack: bound.slack,
+                });
+            }
+        }
         let mut dptrs = Vec::with_capacity(ins.len() + 1);
         let mut packed_lens = Vec::with_capacity(ins.len() + 1);
-        for (buffer, len) in buffers.zip(lens) {
+        for (buffer, len) in buffers().zip(lens()) {
             capture.retain(buffer);
             dptrs.push(buffer.ptr());
-            packed_lens.push(i64::from(len));
+            packed_lens.push(
+                i64::try_from(len).map_err(|_| PtxError::ElementCountTooLarge {
+                    op: "dispatch_dev",
+                    elements: len,
+                })?,
+            );
         }
-        Self {
+        Ok(Self {
             dptrs,
             lens: packed_lens,
-        }
+        })
     }
 
     /// `cuLaunchKernel`'s parameter array: one pointer per scalar, interleaved `(ptr, len)` per buffer. The

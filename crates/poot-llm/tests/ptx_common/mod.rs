@@ -251,7 +251,7 @@ impl Device for PtxDeviceProxy<'_> {
     fn load_kernel(
         &mut self,
         key: &str,
-        kernel: poot_runtime_common::CompiledKernel,
+        kernel: poot_codegen::CompiledKernel,
     ) -> Result<Self::Kernel, Self::Error> {
         self.0.load_kernel(key, kernel)
     }

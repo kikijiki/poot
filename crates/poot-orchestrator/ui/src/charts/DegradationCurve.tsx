@@ -6,13 +6,12 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
-  Legend,
   ResponsiveContainer,
 } from 'recharts';
 import type {Run, ResultRow, CurvePoint, Pct} from './types';
 import {frameworkColor, frameworkLabel} from './types';
 import {rowsFor, frameworksInRows} from './data';
-import {ToggleGroup, ControlWrap, ChartCard, Empty} from './ui';
+import {ToggleGroup, ControlWrap, ChartCard, ChartLegend, Empty} from './ui';
 import styles from './styles.module.css';
 
 type Metric = 'decode_tok_s' | 'tpot_ms' | 'ttft_ms' | 'itl_ms';
@@ -98,8 +97,9 @@ export default function DegradationCurve(props: {run: Run; model: string}) {
           </ControlWrap>
         ) : null}
       </div>
+      <ChartLegend items={frameworks.map((f) => ({label: frameworkLabel(f), color: frameworkColor(f)}))} />
       <ResponsiveContainer width="100%" height={380}>
-        <LineChart key={`${metric}:${pct}`} data={data} margin={{top: 8, right: 24, bottom: 24, left: 8}}>
+        <LineChart key={`${metric}:${pct}`} data={data} margin={{top: 4, right: 24, bottom: 4, left: 8}}>
           <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
           <XAxis
             dataKey="isl"
@@ -107,7 +107,8 @@ export default function DegradationCurve(props: {run: Run; model: string}) {
             domain={['auto', 'auto']}
             type="number"
             tickFormatter={fmtIsl}
-            label={{value: 'context length (ISL, tokens, log)', position: 'bottom', offset: 8}}
+            height={52}
+            label={{value: 'context (ISL, tokens, log)', position: 'insideBottom', offset: 0}}
           />
           <YAxis
             label={{value: yLabel, angle: -90, position: 'insideLeft', style: {textAnchor: 'middle'}}}
@@ -120,7 +121,6 @@ export default function DegradationCurve(props: {run: Run; model: string}) {
             ]) as never}
             labelFormatter={(l) => `ISL ${fmtIsl(Number(l))}`}
           />
-          <Legend formatter={(v) => frameworkLabel(String(v))} />
           {frameworks.map((f) => (
             <Line
               key={f}

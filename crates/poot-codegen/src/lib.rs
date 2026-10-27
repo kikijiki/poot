@@ -3,14 +3,12 @@
 //! HSACO for AMDGPU/ROCm, or an AIE core object for AMD XDNA2. [`Target`] names all four paths; individual
 //! IR operations can have narrower target support.
 //!
-//! # The AIE (XDNA2) path
+//! # The NPU paths
 //!
-//! Supporting NPUs (Intel, AMD XDNA2) remains a poot objective (POOT-1093). The [`aie`] module is this
-//! crate's half of it (POOT-664): a core object compiled by Peano from each tile body of a region, a typed
-//! wiring/layout [`AieLinkRecipe`], IRON linking to one loadable xclbin/instruction artifact, the
-//! shape-wiring-and-toolchain-keyed cache identity, and [`aie_kernel_handle`] over the linked artifact.
-//! Device loading and execution are the XDNA runtime's (POOT-641); nothing here runs on hardware, and no
-//! Peano/IRON positive compile is claimed unless a receipt names the toolchain.
+//! The AIE core is a [`Target`] like the GPU ones: a sequential body compiled by Peano to a core object. The
+//! recipe that places such cores on tiles, the IRON link that makes one loadable artifact and everything
+//! about the Intel NPU's vendor graphs are the NPU's (`poot-npu`, `poot-npu-artifacts`): [`KernelCode`] only
+//! carries their artifact types as the payload of its `Aie` and `Vpu` variants.
 //!
 //! The rustc-bearing MIR import (Stable MIR -> Body) is the separate `pootc` crate; this crate is the
 //! rustc-free emit + llc half, host-testable with hand-built fixtures.
@@ -24,54 +22,46 @@
 //! and its version into the cache key precisely so a toolchain change cannot silently serve a stale
 //! artifact). Kept per the Scope exception for a read that is a toolchain path or a cache kill-switch.
 
-mod aie;
 mod cache;
 mod debranch;
 mod emit;
 mod handle;
+mod kernel;
 mod spirv_postprocess;
 mod structurize;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
-mod vpu;
 
 use std::path::Path;
 use std::process::Command;
 
-pub use aie::{
-    AieAbiMismatch, AieCompileError, AieCompiled, AieFifo, AieIdentity, AieLinkRecipe, AieStage,
-    AieTile, AieToolIdentity, AieTools, FifoEnd, RecipeFault, compile_aie,
+pub use cache::{
+    ArtifactTooLarge, CODEGEN_SRC_HASH, CachedArtifact, KernelCache, KernelId, KernelKey, WorkDir,
+    epoch as kernel_cache_epoch,
 };
-pub use cache::{ArtifactTooLarge, KernelCache, KernelId, KernelKey, epoch as kernel_cache_epoch};
 pub use emit::emit_llvm_ir;
 pub use handle::{
-    ArtifactMismatch, CompiledArtifact, NoBodyTarget, NotAByteTarget, aie_kernel_handle,
-    compile_kernel, kernel_handle, vpu_kernel_handle,
+    ArtifactMismatch, CompiledArtifact, NoBodyTarget, NotAByteTarget, compile_kernel,
+    kernel_handle, try_arg_schema,
+};
+pub use kernel::{
+    ArgSchema, CompiledKernel, KernelArgError, KernelCode, check_element_schema, check_kernel_args,
 };
 use poot_target::AmdArch;
 pub use spirv_postprocess::NoContractionError;
-pub use vpu::{
-    VpuElem, VpuEmitError, VpuInput, VpuIr, VpuNode, VpuOp, VpuRegion, VpuScalar, VpuTensor,
-    VpuValue, emit_vpu,
-};
 
 /// A codegen backend target.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
     /// SPIR-V for Vulkan/wgpu (triple `spirv-unknown-vulkan1.3-compute`, carried in the IR text).
     SpirvVulkan,
-    /// OpenCL-flavoured SPIR-V (`Kernel` capability) for Level Zero devices such as the Intel Xe iGPU
-    /// (triple `spirv64-unknown-unknown`). The ABI is the PTX one: flat `ptr addrspace(1)` arguments plus
-    /// an `i64` length per slice, `get_global_id`-style builtins, no structurize or debranch pass. The
-    /// validator needs `--target-env spv1.4` or newer for the backend's output.
-    SpirvOpenCl,
     /// PTX for NVIDIA/cudarc (triple `nvptx64-nvidia-cuda`).
     Nvptx,
     /// AIE core machine code for the AMD XDNA2 NPU, via Peano (`llc --march=aie2p`). One AIE core runs a
     /// scalar loop kernel (no SPMD thread-index, no workgroup barrier, no LDS); the IRON harness tiles the
     /// data and does host<->tile movement. The IR is plain scalar LLVM IR with flat `ptr` args (card 089 /
     /// spec 057). The triple/datalayout come from Peano via `--march`, not the IR text. Its identity is
-    /// [`poot_target::AieTargetId::Xdna2`] (`TargetId::Aie`); the loadable artifact is built by [`aie`].
+    /// [`poot_target::AieTargetId::Xdna2`] (`TargetId::Aie`); the loadable artifact is linked by `poot-npu`.
     AieCore,
     /// HSACO for an AMD GPU (e.g. the Radeon 8060S, gfx1151) via the ROCm-flavored clang.
     /// `llc -filetype=obj` produces a relocatable without the `PT_AMDGPU_HSA_LOAD_*` program headers the
@@ -84,8 +74,15 @@ pub enum Target {
     AmdGcn(AmdArch),
 }
 
+/// The byte alignment every buffer an executor binds to a kernel parameter starts at (POOT-1405): an executor binds
+/// a buffer at its allocation base, never at an offset into it, so this is a floor every native allocator meets
+/// (`cuMemAlloc` returns 256-byte aligned memory). Kernel codegen relies on it: an `Rvalue::VectorLoad` of a
+/// 4-lane f32 group `i` reads bytes `16 * i ..` and is stamped `align 16`. An executor whose binding would break
+/// it refuses the dispatch (the PTX runtime's kernel-argument packing).
+pub const BUFFER_PARAM_ALIGN: u64 = 16;
+
 /// What this target's codegen can lower today, a query the planner reads instead of restating a
-/// per-backend match by hand (card 522, R468-014, R468-015, R469-022).
+/// per-backend match by hand (card 522, R468-014, R469-022).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Capability {
     /// A strided (non-row-major) value operand can be read directly by a kernel body, with no
@@ -96,6 +93,20 @@ pub struct Capability {
     /// `Target::Nvptx` like any other kernel; `false` here just meant PTX paid an extra materialize copy
     /// for no codegen reason (R-546-9, card 549).
     pub strided_views: bool,
+    /// A kernel body may read one buffer param both in aligned groups (`Rvalue::VectorLoad` into a 4-lane
+    /// `Ty::Vec`, then `Rvalue::VectorExtract`) and element by element. NVPTX lowers a group read to one
+    /// `ld.global.v4` on the param's pointer; scalar `align 4` reads stay scalar there, since NVPTX
+    /// vectorises only naturally aligned accesses (POOT-1405). SPIR-V binds a vector-read param as a
+    /// vector-typed resource, so it cannot also be read element by element (spec 134 FR-004b, not
+    /// built). AMDGPU has no vector lowering: its backend already merges dword-aligned scalar reads into
+    /// `global_load_b128` (POOT-1390 ISA). The AIE core has no vector types.
+    pub mixed_vector_reads: bool,
+    /// A body the planner narrowed (`poot_kernel_ir::IndexWidth::U32`) lowers its `usize` as i32 where the
+    /// target's own index type is i64: NVPTX, where the 64-bit index math was about a quarter of the decode
+    /// Gemv's instructions and narrowing it raised Q4_K/Q5_K/Q6_K 19-32% (POOT-1405). AMDGPU has no narrowed
+    /// lowering: at its calibrated 32-element run i32 index math measured slower (Q4_K 193-199 -> 173-177 GB/s,
+    /// POOT-1390). SPIR-V and the AIE core index in 32 bits already, so nothing narrows there.
+    pub narrow_index: bool,
 }
 
 /// The capability query for `target`. See [`Capability`]'s fields for what each one means and why it
@@ -104,25 +115,30 @@ pub fn capability(target: Target) -> Capability {
     match target {
         Target::SpirvVulkan => Capability {
             strided_views: true,
-        },
-        Target::SpirvOpenCl => Capability {
-            strided_views: true,
+            mixed_vector_reads: false,
+            narrow_index: false,
         },
         Target::AmdGcn(_) => Capability {
             strided_views: true,
+            mixed_vector_reads: false,
+            narrow_index: false,
         },
         Target::Nvptx => Capability {
             strided_views: true,
+            mixed_vector_reads: true,
+            narrow_index: true,
         },
         Target::AieCore => Capability {
             strided_views: false,
+            mixed_vector_reads: false,
+            narrow_index: false,
         },
     }
 }
 
 impl Target {
     /// The `llc` arguments for this target (the triple for SPIR-V is carried in the IR `target triple`).
-    fn llc_args(&self) -> Vec<String> {
+    pub fn llc_args(&self) -> Vec<String> {
         match self {
             // sm_80 (Ampere): bf16 tensor cores (wmma m16n16k16 bf16) need sm_80+ (spec 025). The driver
             // JITs sm_80 PTX for every pod GPU poot targets (RTX 3090/A5000 = sm_86, 4090 = sm_89).
@@ -142,14 +158,6 @@ impl Target {
                 // config 13: F16xF16->F32).
                 "--spirv-ext=+SPV_EXT_shader_atomic_float_add,+SPV_EXT_shader_atomic_float_min_max,\
                  +SPV_KHR_cooperative_matrix"
-                    .into(),
-            ],
-            // OpenCL SPIR-V: the triple is carried in the IR text, as for Vulkan. Float atomics are the only
-            // extensions the kernels use; the cooperative-matrix path is Vulkan-only.
-            Target::SpirvOpenCl => vec![
-                "-O0".into(),
-                "-filetype=obj".into(),
-                "--spirv-ext=+SPV_EXT_shader_atomic_float_add,+SPV_EXT_shader_atomic_float_min_max"
                     .into(),
             ],
             // Peano (llvm-aie) lowers scalar LLVM IR to the AIE2p core ISA. The IRON harness links the `.o`
@@ -184,7 +192,7 @@ impl Target {
     fn output_ext(&self) -> &'static str {
         match self {
             Target::Nvptx => "ptx",
-            Target::SpirvVulkan | Target::SpirvOpenCl => "spv",
+            Target::SpirvVulkan => "spv",
             Target::AieCore => "o",
             // ELF (`e_machine = EM_AMDGPU`); `.hsaco` distinguishes it from the AIE `.o`.
             Target::AmdGcn(_) => "hsaco",
@@ -267,6 +275,7 @@ pub fn compile(
 }
 
 /// The external tools [`compile`] shells out to, resolved from the environment once per compile.
+#[derive(Debug)]
 pub struct Toolchain {
     /// `$POOT_LLC` or `llc` on PATH: lowers SPIR-V and PTX.
     llc: String,
@@ -274,7 +283,7 @@ pub struct Toolchain {
     /// llc cannot lower `aie2p`, so an unset variable is a typed missing-toolchain error.
     aie_llc: Option<String>,
     /// `$POOT_AIE_IRON`: the IRON link driver that turns a core object and a typed link recipe into an
-    /// xclbin and instruction stream (the protocol is in [`aie`]). No fallback.
+    /// xclbin and instruction stream (the protocol is `poot-npu`'s). No fallback.
     aie_iron: Option<String>,
     /// `$POOT_AMD_CLANG`: the AMD-flavored clang that links the HSACO and adds the `PT_AMDGPU_HSA_LOAD_*` program
     /// headers the HSA loader needs. There is no fallback: a bare llc object is rejected at load with
@@ -303,6 +312,16 @@ impl Toolchain {
         }
     }
 
+    /// `$POOT_AIE_LLC`, the Peano `llc`, when set.
+    pub fn aie_llc(&self) -> Option<&str> {
+        self.aie_llc.as_deref()
+    }
+
+    /// `$POOT_AIE_IRON`, the IRON link driver, when set.
+    pub fn aie_iron(&self) -> Option<&str> {
+        self.aie_iron.as_deref()
+    }
+
     /// The one binary that lowers `target`, or [`CompileError::ToolchainMissing`] when it is not configured.
     fn binary(&self, target: Target) -> Result<&str, CompileError> {
         match target {
@@ -323,12 +342,13 @@ impl Toolchain {
                     target,
                     variable: "POOT_AMD_CLANG",
                 }),
-            Target::Nvptx | Target::SpirvVulkan | Target::SpirvOpenCl => Ok(&self.llc),
+            Target::Nvptx | Target::SpirvVulkan => Ok(&self.llc),
         }
     }
 }
 
-fn compile_with(
+/// [`compile`] with an explicit `toolchain` instead of the process environment's.
+pub fn compile_with(
     body: &poot_kernel_ir::Body,
     target: Target,
     out: &Path,
@@ -454,6 +474,19 @@ fn run_tool(mut tool: Command, target: Target) -> Result<(), CompileError> {
     }
     Ok(())
 }
+
+/// The NVPTX fixtures `ptx-check` accepts as compile-only: poot-kernelgen's tests stage them (into
+/// `poot_test_util::ptx_stage_dir`) to prove their NVPTX lowers, and no device case runs them. One list for both sides,
+/// so the staging tests and `ptx-check` cannot drift: a required `ptx-check` run fails when any is not staged.
+pub const NVPTX_COMPILE_ONLY_FIXTURES: &[&str] = &[
+    "array_sum_probe",
+    "fused_pw",
+    "rms_par",
+    "rmsnorm",
+    "rsum",
+    "softmax",
+    "wg_sum",
+];
 
 /// Convenience: a default artifact path next to `dir` named `<kernel>.<ext>`.
 pub fn artifact_path(dir: &Path, kernel: &str, target: Target) -> std::path::PathBuf {

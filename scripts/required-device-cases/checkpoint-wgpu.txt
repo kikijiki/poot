@@ -60,11 +60,11 @@ poot-llm	driver::device_tests::checkpoint::smollm2_gguf_coherent::wgpu
 poot-llm	driver::device_tests::checkpoint::smollm3_coherent::wgpu
 poot-llm	driver::device_tests::checkpoint::smollm3_gguf_oracle::wgpu
 poot-llm	driver::device_tests::checkpoint::tinyllama_coherent::wgpu
-poot-llm::smolvlm_checkpoint	caption_matches_the_recorded_vlm_runner_tokens_wgpu
-poot-llm::smolvlm_checkpoint	too_many_images_are_refused_before_the_tower_runs
-poot-llm::smolvlm_checkpoint	two_captions_on_one_front_end_are_not_stale_wgpu
-poot-llm::smolvlm_checkpoint	two_images_in_one_turn_caption_together
 poot-llm::coherence	bge_cls_pooling_separates_related
 poot-llm::coherence	cross_encoder_reranks
 poot-llm::coherence	minilm_encoder_reranks
 poot-llm::coherence	minilm_encoder_separates_related
+poot-llm::smolvlm_checkpoint	caption_matches_the_recorded_vlm_runner_tokens_wgpu
+poot-llm::smolvlm_checkpoint	too_many_images_are_refused_before_the_tower_runs
+poot-llm::smolvlm_checkpoint	two_captions_on_one_front_end_are_not_stale_wgpu
+poot-llm::smolvlm_checkpoint	two_images_in_one_turn_caption_together

@@ -15,7 +15,9 @@ mod planar;
 mod source;
 
 pub(crate) use kernel::packed_contraction;
-pub use kernel::{PackedKernelOp, PackedKernelSpec, packed_kernel};
+pub use kernel::{
+    PackedKernelOp, PackedKernelSpec, PackedRunSharing, packed_kernel, packed_run_sharing,
+};
 
 #[cfg(test)]
 mod float_decode_tests {
@@ -130,7 +132,8 @@ mod fixtures {
         BlockLayout, FieldEncoding, FloatFormat, OperandRole, Storage, ValueMap, WeightFormat,
     };
 
-    use crate::contraction::{LaneRows, RunLength, Schedule, TileSize};
+    use crate::contraction::{RunLength, Schedule, TileSize};
+    use crate::microtile::{LaneRows, MicroCols};
 
     /// A codegen-safe (LLVM-identifier-safe) name fragment for a schedule: `{schedule:?}` on
     /// `Schedule::Gemv { .. }` contains `{`, `}` and a space, which breaks an AMDGCN/NVPTX global
@@ -141,25 +144,36 @@ mod fixtures {
                 width,
                 cols,
                 unroll,
-            } => format!("gemv{width}c{cols}u{unroll}"),
-            Schedule::Tiled {
-                tile: TileSize(tile),
-            } => format!("tiled{tile}"),
+                activation,
+            } => {
+                let read = match activation {
+                    crate::GemvActivation::Scalar => "",
+                    crate::GemvActivation::Vec4 => "v4",
+                };
+                format!("gemv{width}c{cols}u{unroll}{read}")
+            }
             Schedule::RegisterTiled {
                 lanes: TileSize(lanes),
                 rows,
+                cols,
                 run,
-            } => format!("register_tiled{lanes}x{}r{}", rows.get(), run.get()),
+            } => format!(
+                "register_tiled{lanes}x{}x{}r{}",
+                rows.get(),
+                cols.get(),
+                run.get()
+            ),
         }
     }
 
-    /// A [`Schedule::RegisterTiled`] of `lanes x lanes` lanes of two rows each (small tiles, so a few rows span
+    /// A [`Schedule::RegisterTiled`] of `lanes x lanes` lanes of two rows by four columns each (small tiles, so a few rows span
     /// several) over a weight whose rows hold `k` values: the longest run of consecutive `K` values that divides `k`, as the planner picks it. Block formats' `k` is a
     /// whole number of blocks, so any block width stands for it.
     pub(super) fn register_tiled(lanes: u32, k: usize) -> Schedule {
         Schedule::RegisterTiled {
             lanes: TileSize::new(lanes).unwrap(),
             rows: LaneRows(2),
+            cols: MicroCols::new(4),
             run: RunLength::dividing(k),
         }
     }
@@ -175,21 +189,25 @@ mod fixtures {
             width: 32,
             cols: 1,
             unroll: 1,
+            activation: crate::GemvActivation::Scalar,
         },
         Schedule::Gemv {
             width: 32,
             cols: 4,
             unroll: 4,
+            activation: crate::GemvActivation::Scalar,
         },
         Schedule::Gemv {
             width: 64,
             cols: 8,
             unroll: 3,
+            activation: crate::GemvActivation::Scalar,
         },
         Schedule::Gemv {
             width: 32,
             cols: 2,
             unroll: 32,
+            activation: crate::GemvActivation::Scalar,
         },
     ];
 
@@ -500,6 +518,7 @@ mod planar_fixtures {
     use poot_quant::{PackedWeight, SourceRole};
 
     use crate::contraction::{RegisterTiling, Schedule};
+    use crate::helpers::WeightLayout;
 
     fn nz(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).unwrap()
@@ -683,8 +702,8 @@ mod planar_fixtures {
         (sources, expected)
     }
 
-    /// A prefill-sized planar contraction at the geometry the planner picks for it on `caps`: the 16x16 lane grid
-    /// of 8-row lanes (a 128 x 64 output tile), over more rows and columns than one tile so both edges are ragged.
+    /// A prefill-sized planar contraction at the widest geometry `caps` runs (the 16x16 lane grid of 8x8 register
+    /// tiles, a 128 x 128 output tile), over more rows and columns than one tile so both edges are ragged.
     /// Every device row that must run the wide workgroup on hardware (the interpreter rows above run the same
     /// shapes) builds its launch from this one case.
     pub(super) struct WideTile {
@@ -698,18 +717,24 @@ mod planar_fixtures {
     }
 
     /// The [`WideTile`] for a weight row of `k` values: `E4m3Block128` (the FP8 checkpoints' format), `130` rows
-    /// and `70` columns, so each of the 128 x 64 tile's edges is partial. Panics if `caps` does not plan the wide
-    /// grid, so the row cannot silently run a narrower one.
+    /// and `130` columns, so each edge of the largest tile the planner weighs (a 16x16 lane grid of 8x8 register
+    /// tiles, 128 x 128) is partial. Panics if `caps` does not run that tiling, so the row cannot silently run a
+    /// narrower one.
     pub(super) fn wide_tile(k: usize, caps: &poot_target::DeviceCaps) -> WideTile {
         let format = WeightFormat::E4m3Block128 {
             scale: ScaleEncoding::F32,
         };
-        let (m, out_rows) = (130, 70);
-        let tiling = RegisterTiling::choose(m, k, caps);
+        let (m, out_rows) = (130, 130);
+        let tiling = RegisterTiling::candidates(k, WeightLayout::Nk, caps)
+            .max_by_key(|tiling| {
+                let (rows, cols) = tiling.output_tile();
+                rows * cols
+            })
+            .expect("the caps run a register tiling");
         assert_eq!(
             (tiling.lanes(), tiling.output_tile()),
-            (16, (128, 64)),
-            "{m} rows on these caps must plan the 16x16 lane grid"
+            (16, (128, 128)),
+            "these caps must run the 16x16 lane grid of 8x8 tiles"
         );
         let (sources, decoded) = fixture(format, out_rows, k, 11);
         let mut state = 0x2545_f491_4f6c_dd1du64;
@@ -773,6 +798,41 @@ mod row_gather_tests {
     use super::fixtures::{BLOCK32, GatherCase, KQUANT, fixture, kquant_gather_cases, pack_words};
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_kernel};
 
+    /// POOT-1317: the row gather's block address and bit offset are `usize` arithmetic with no 32-bit step, so
+    /// a row whose block lies past `u32::MAX` bits (Flash-Next's PLE table: row `2^26` of a `[_, 160]` `IQ4_NL`
+    /// table is bit 4.8e10) is addressed at its true word, not at the word a wrapped offset names. No 28 GB
+    /// table is built: the words buffer is four words long, so the gather must fault, and the fault names the
+    /// word index it tried to read. A 64-bit offset names word 1509949440 (= `2^26 * 5 * 144 / 32`); a
+    /// wrapped one names a word inside `u32::MAX / 32` (which a real, smaller table would silently read).
+    ///
+    /// Mutation: in `DecodePlan::block_base_bit`, multiply the block in `u32` and widen it back; the fault names
+    /// a wrapped word and this goes red.
+    #[test]
+    fn row_gather_addresses_a_block_past_u32_bits_at_its_true_word() {
+        let spec = PackedKernelSpec {
+            format: poot_quant::format::WeightFormat::Iq4_Nl,
+            op: PackedKernelOp::RowGather,
+        };
+        let body = packed_kernel("row_gather_wide", spec).unwrap();
+        let (k, row) = (160usize, 1i32 << 26);
+        let mut buffers = [
+            Buffer::from_u32s(&[0; 4]),
+            Buffer::from_i32s(&[row]),
+            Buffer::from_u32s(&[k as u32]),
+            Buffer::from_f32s(&vec![0.0; k]),
+        ];
+        let error = run(&body, workgroups_covering(&body, k), &mut buffers).expect_err(
+            "the table is four words: a row past it must fault, not read a wrapped word",
+        );
+        let word = (row as u64) * 5 * 144 / 32;
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("index {word} is out of bounds")),
+            "the gather must read word {word}, got: {error}"
+        );
+    }
+
     /// The K-quant sibling of `row_gather_matches_decode_blocks_rows_for_every_block32_format`
     /// (card 542b): exercises `DecodePlan`'s `SubScale`/`SubMin` path through `RowGather` too.
     #[test]
@@ -833,8 +893,10 @@ mod row_gather_tests {
 
     #[test]
     fn row_gather_bodies_compile_for_kquant_amdgcn() {
-        use poot_codegen::{Target, artifact_path, compile};
+        use poot_codegen::{Target, artifact_path};
         let arch = poot_target::AmdArch::gfx1151();
+        // False once the AMD toolchain proved absent: the SPIR-V and NVPTX compiles still run.
+        let mut amd = true;
         for format in KQUANT {
             let spec = PackedKernelSpec {
                 format,
@@ -847,8 +909,7 @@ mod row_gather_tests {
                 .join(&name);
             std::fs::create_dir_all(&dir).unwrap();
             let out = artifact_path(&dir, &name, Target::AmdGcn(arch));
-            compile(&body, Target::AmdGcn(arch), &out)
-                .unwrap_or_else(|error| panic!("{format:?}: AMDGCN compile: {error}"));
+            amd = amd && crate::unit_helpers::compile_amdgcn_or_skip(&name, &body, arch, &out);
         }
     }
 
@@ -860,7 +921,10 @@ mod row_gather_tests {
         let ctx = match Context::new() {
             Ok(ctx) => ctx,
             Err(error) => {
-                eprintln!("no GPU ({error}); skipping");
+                poot_test_util::skip_report(
+                    "poot-kernelgen",
+                    &format_args!("no wgpu context: {error}"),
+                );
                 return;
             }
         };
@@ -983,8 +1047,10 @@ mod row_gather_tests {
 
     #[test]
     fn row_gather_bodies_compile_for_amdgcn() {
-        use poot_codegen::{Target, artifact_path, compile};
+        use poot_codegen::{Target, artifact_path};
         let arch = poot_target::AmdArch::gfx1151();
+        // False once the AMD toolchain proved absent: the SPIR-V and NVPTX compiles still run.
+        let mut amd = true;
         for format in BLOCK32 {
             let spec = PackedKernelSpec {
                 format,
@@ -997,8 +1063,7 @@ mod row_gather_tests {
                 .join(&name);
             std::fs::create_dir_all(&dir).unwrap();
             let out = artifact_path(&dir, &name, Target::AmdGcn(arch));
-            compile(&body, Target::AmdGcn(arch), &out)
-                .unwrap_or_else(|error| panic!("{format:?}: AMDGCN compile: {error}"));
+            amd = amd && crate::unit_helpers::compile_amdgcn_or_skip(&name, &body, arch, &out);
         }
     }
 
@@ -1012,7 +1077,10 @@ mod row_gather_tests {
         let ctx = match Context::new() {
             Ok(ctx) => ctx,
             Err(error) => {
-                eprintln!("no GPU ({error}); skipping");
+                poot_test_util::skip_report(
+                    "poot-kernelgen",
+                    &format_args!("no wgpu context: {error}"),
+                );
                 return;
             }
         };
@@ -1099,6 +1167,24 @@ mod contraction_tests {
         m_per_block: usize,
         out_per_block: usize,
     ) {
+        let (got, expected) = interpret(format, schedule, blocks, m_per_block, out_per_block);
+        assert_close(
+            format,
+            &format!("Contraction {schedule:?} blocks={blocks}"),
+            &got,
+            &expected,
+        );
+    }
+
+    /// `packed_contraction`'s body for `schedule` run on the interpreter over [`contraction_fixture`]: the output
+    /// and the plain f32 reference.
+    fn interpret(
+        format: poot_quant::format::WeightFormat,
+        schedule: Schedule,
+        blocks: usize,
+        m_per_block: usize,
+        out_per_block: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
         let (k, bytes, activation, expected) =
             contraction_fixture(format, blocks, m_per_block, out_per_block);
         let rows = blocks * m_per_block;
@@ -1133,13 +1219,77 @@ mod contraction_tests {
         );
         run(&body, workgroups, &mut buffers)
             .unwrap_or_else(|error| panic!("{format:?}: interpreter: {error}"));
-        let got = buffers[3].to_f32s().unwrap();
+        (buffers[3].to_f32s().unwrap(), expected)
+    }
 
-        assert_close(
-            format,
-            &format!("Contraction {schedule:?} blocks={blocks}"),
-            &got,
-            &expected,
+    /// POOT-1405: a Gemv that reads its full runs' activation values as 4-lane vector groups
+    /// ([`crate::GemvActivation::Vec4`]) computes the same output bits as the scalar read, for every block-32 and
+    /// K-quant format, over the Gemv shapes whose run is a multiple of four (a 4-element run, and a 32-element run
+    /// across K-quant sub-blocks), blocks 1 and 2 (activation row `b` starts at `b * K`). Both stay within the
+    /// reference's tolerance. Mutation: extract each group's lanes in reverse in `gemv_body`; every row goes red.
+    #[test]
+    fn a_vector_activation_read_matches_the_scalar_read_bit_for_bit() {
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for format in BLOCK32.into_iter().chain(KQUANT) {
+            for scalar in GEMV_SCHEDULES {
+                let Schedule::Gemv {
+                    width,
+                    cols,
+                    unroll,
+                    ..
+                } = scalar
+                else {
+                    unreachable!("GEMV_SCHEDULES holds Gemv schedules")
+                };
+                if !unroll.is_multiple_of(4) {
+                    continue;
+                }
+                let vector = Schedule::Gemv {
+                    width,
+                    cols,
+                    unroll,
+                    activation: crate::GemvActivation::Vec4,
+                };
+                for (blocks, out_per_block) in [(1, 11), (2, 5)] {
+                    let what = format!("{format:?} {scalar:?} blocks={blocks}");
+                    let (want, reference) = interpret(format, scalar, blocks, 1, out_per_block);
+                    let (got, _) = interpret(format, vector, blocks, 1, out_per_block);
+                    assert_eq!(bits(&got), bits(&want), "{what}");
+                    assert_close(format, &what, &got, &reference);
+                }
+            }
+        }
+    }
+
+    /// A vector activation read over a run that is not whole groups is refused when the body is built, never
+    /// emitted with a short group (the planner never asks for it: [`crate::GemvActivation::Vec4`]'s rule).
+    /// Mutation: drop the `unroll % 4` check in `GemvLaunch::new`; the 6-element run builds (or panics) instead.
+    #[test]
+    fn a_vector_activation_read_over_a_partial_group_run_is_refused() {
+        let schedule = Schedule::Gemv {
+            width: 32,
+            cols: 4,
+            unroll: 6,
+            activation: crate::GemvActivation::Vec4,
+        };
+        let refused = packed_contraction(
+            "contraction_vec4_unroll6",
+            poot_quant::format::WeightFormat::Q8_0,
+            schedule,
+            None,
+            crate::PackedRows::Blocks,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(crate::KernelGenError::NotDivisible {
+                    value: 6,
+                    divisor: 4,
+                    ..
+                })
+            ),
+            "got {:?}",
+            refused.err()
         );
     }
 
@@ -1400,8 +1550,10 @@ mod contraction_tests {
     /// artifacts for the PTX pod batch (SC-005).
     #[test]
     fn contraction_bodies_compile_for_spirv_nvptx_and_amdgcn() {
-        use poot_codegen::{Target, artifact_path, compile};
+        use poot_codegen::{Target, artifact_path};
         let arch = poot_target::AmdArch::gfx1151();
+        // False once the AMD toolchain proved absent: the SPIR-V and NVPTX compiles still run.
+        let mut amd = true;
         for format in BLOCK32 {
             for schedule in GEMV_SCHEDULES {
                 let name = format!("contraction_{format:?}_{}", schedule_tag(schedule));
@@ -1415,9 +1567,7 @@ mod contraction_tests {
                     .join(format!("{name}_amdgcn"));
                 std::fs::create_dir_all(&dir).unwrap();
                 let out = artifact_path(&dir, &name, Target::AmdGcn(arch));
-                compile(&body, Target::AmdGcn(arch), &out).unwrap_or_else(|error| {
-                    panic!("{format:?} {schedule:?}: AMDGCN compile: {error}")
-                });
+                amd = amd && crate::unit_helpers::compile_amdgcn_or_skip(&name, &body, arch, &out);
             }
         }
     }
@@ -1427,8 +1577,10 @@ mod contraction_tests {
     /// artifacts for the PTX pod batch.
     #[test]
     fn contraction_tiled_and_kquant_bodies_compile_for_spirv_nvptx_and_amdgcn() {
-        use poot_codegen::{Target, artifact_path, compile};
+        use poot_codegen::{Target, artifact_path};
         let arch = poot_target::AmdArch::gfx1151();
+        // False once the AMD toolchain proved absent: the SPIR-V and NVPTX compiles still run.
+        let mut amd = true;
         for format in KQUANT {
             for schedule in GEMV_SCHEDULES {
                 let name = format!("contraction_kquant_{format:?}_{}", schedule_tag(schedule));
@@ -1442,9 +1594,7 @@ mod contraction_tests {
                     .join(format!("{name}_amdgcn"));
                 std::fs::create_dir_all(&dir).unwrap();
                 let out = artifact_path(&dir, &name, Target::AmdGcn(arch));
-                compile(&body, Target::AmdGcn(arch), &out).unwrap_or_else(|error| {
-                    panic!("{format:?} {schedule:?}: AMDGCN compile: {error}")
-                });
+                amd = amd && crate::unit_helpers::compile_amdgcn_or_skip(&name, &body, arch, &out);
             }
         }
         for format in BLOCK32.into_iter().chain(KQUANT) {
@@ -1459,8 +1609,7 @@ mod contraction_tests {
                 .join(format!("{name}_amdgcn"));
             std::fs::create_dir_all(&dir).unwrap();
             let out = artifact_path(&dir, &name, Target::AmdGcn(arch));
-            compile(&body, Target::AmdGcn(arch), &out)
-                .unwrap_or_else(|error| panic!("{format:?} {schedule:?}: AMDGCN compile: {error}"));
+            amd = amd && crate::unit_helpers::compile_amdgcn_or_skip(&name, &body, arch, &out);
         }
     }
 
@@ -1533,7 +1682,10 @@ mod contraction_tests {
         let ctx = match poot_wgpu_runtime::Context::new() {
             Ok(ctx) => ctx,
             Err(error) => {
-                eprintln!("no GPU ({error}); skipping");
+                poot_test_util::skip_report(
+                    "poot-kernelgen",
+                    &format_args!("no wgpu context: {error}"),
+                );
                 return;
             }
         };
@@ -1550,7 +1702,10 @@ mod contraction_tests {
         let ctx = match poot_wgpu_runtime::Context::new() {
             Ok(ctx) => ctx,
             Err(error) => {
-                eprintln!("no GPU ({error}); skipping");
+                poot_test_util::skip_report(
+                    "poot-kernelgen",
+                    &format_args!("no wgpu context: {error}"),
+                );
                 return;
             }
         };
@@ -1570,7 +1725,10 @@ mod contraction_tests {
         let ctx = match poot_wgpu_runtime::Context::new() {
             Ok(ctx) => ctx,
             Err(error) => {
-                eprintln!("no GPU ({error}); skipping");
+                poot_test_util::skip_report(
+                    "poot-kernelgen",
+                    &format_args!("no wgpu context: {error}"),
+                );
                 return;
             }
         };
@@ -1591,7 +1749,10 @@ mod contraction_tests {
         let ctx = match poot_wgpu_runtime::Context::new() {
             Ok(ctx) => ctx,
             Err(error) => {
-                eprintln!("no GPU ({error}); skipping");
+                poot_test_util::skip_report(
+                    "poot-kernelgen",
+                    &format_args!("no wgpu context: {error}"),
+                );
                 return;
             }
         };
@@ -1618,7 +1779,10 @@ mod contraction_tests {
         let ctx = match poot_wgpu_runtime::Context::new() {
             Ok(ctx) => ctx,
             Err(error) => {
-                eprintln!("no GPU ({error}); skipping");
+                poot_test_util::skip_report(
+                    "poot-kernelgen",
+                    &format_args!("no wgpu context: {error}"),
+                );
                 return;
             }
         };
@@ -1700,6 +1864,7 @@ mod planar_contraction_tests {
     use super::kernel::packed_contraction;
     use super::planar_fixtures::{every_planar_format, fixture, pack_words};
     use crate::contraction::{RegisterTiling, Schedule};
+    use crate::helpers::WeightLayout;
 
     /// `K` values of a weight row: 17 leaves no run longer than one value, 18 stages in runs of two, 20 in
     /// runs of four.
@@ -1801,17 +1966,18 @@ mod planar_contraction_tests {
         }
     }
 
-    /// The geometries the planner actually picks ([`RegisterTiling::choose`]): the 8x8 lane grid with 2, 4 and 8
-    /// rows per lane (16-, 32- and 64-row tiles) and the 16x16 grid at 8 rows (a 128-row tile), over row counts
-    /// that are not multiples of the tile, for every planar format and a four-value run (`K = 20`). The 2-lane rows above cover the grid arithmetic cheaply; this one covers the shapes that run.
+    /// Every geometry the planner weighs ([`RegisterTiling::candidates`]): the 8x8 and 16x16 lane grids with 2, 4
+    /// and 8 rows and 4 and 8 columns per lane, over row counts that are not multiples of the tile, for every
+    /// planar format and a four-value run (`K = 20`). The 2-lane rows above cover the grid arithmetic cheaply; this one covers the shapes that run.
     #[test]
     fn contraction_tiled_matches_reference_at_the_planned_geometries() {
         let caps = poot_target::DeviceCaps::rocm_default();
         let k = 20;
         for format in every_planar_format() {
             for m in [9, 33, 70, 130] {
-                let schedule = RegisterTiling::choose(m, k, &caps).schedule();
-                run_case(format, k, 6, m, schedule);
+                for tiling in RegisterTiling::candidates(k, WeightLayout::Nk, &caps) {
+                    run_case(format, k, 6, m, tiling.schedule());
+                }
             }
         }
     }
@@ -1905,10 +2071,11 @@ mod rocm_tests {
     use poot_kernel_ir::Body;
     use std::sync::Arc;
 
+    use poot_codegen::CompiledKernel;
     use poot_rocm_runtime::{
         BoundKernarg, HsacoModule, KernelHandle, RocmBuffer, RocmContext, RocmError,
     };
-    use poot_runtime_common::{BufferRole, CompiledKernel};
+    use poot_runtime_common::BufferRole;
     use poot_target::ElementKind;
 
     use super::fixtures::{
@@ -1922,11 +2089,11 @@ mod rocm_tests {
         match RocmContext::new() {
             Ok(ctx) => Some(ctx),
             Err(RocmError::LibraryNotFound(msg)) => {
-                eprintln!("poot-kernelgen: SKIP {test} (no HSA library): {msg}");
+                eprintln!("POOT-SKIP poot-kernelgen: {test} (no HSA library): {msg}");
                 None
             }
             Err(RocmError::NoGpuAgent) => {
-                eprintln!("poot-kernelgen: SKIP {test} (no GPU agent)");
+                eprintln!("POOT-SKIP poot-kernelgen: {test} (no GPU agent)");
                 None
             }
             Err(error) => panic!("{test}: {error}"),
@@ -1977,7 +2144,7 @@ mod rocm_tests {
     ) -> BoundKernarg {
         let slots: Vec<(&RocmBuffer, u64)> = buffers
             .iter()
-            .map(|&buffer| (buffer, u64::from(buffer.elem_count())))
+            .map(|&buffer| (buffer, buffer.elem_count() as u64))
             .collect();
         ctx.bind_kernarg(kernel, &slots).expect("bind kernarg")
     }
@@ -2388,21 +2555,23 @@ mod planar_wgpu_tests {
     use super::kernel::packed_contraction;
     use super::planar_fixtures::wide_tile;
 
-    /// A 16x16 lane grid (a 256-lane workgroup, 8 rows per lane, a 128 x 64 tile) of `E4m3Block128` over 130 rows
-    /// and 70 columns, `K = 20` (a four-value run and a `K` tail of 4) and `K = 32`, matches the reference.
-    /// Mutation: `RegisterTiling::choose` never picks the wide grid and `wide_tile` refuses the caps.
-    #[test]
-    fn contraction_wide_register_tile_matches_reference_on_wgpu() {
+    /// The widest register tiling `caps` runs (see `wide_tile`) of `E4m3Block128` over 130 rows and 130 columns,
+    /// `K = 20` (a four-value run and a `K` tail of 4) and `K = 32`, dispatched on the local RADV device as a
+    /// workgroup of `lanes` lanes, matches the reference.
+    fn wide_tile_matches_reference_on_radv(caps: &poot_target::DeviceCaps, lanes: u32) {
         let ctx = match Context::new() {
             Ok(ctx) => ctx,
             Err(error) => {
-                eprintln!("no GPU ({error}); skipping");
+                poot_test_util::skip_report(
+                    "poot-kernelgen",
+                    &format_args!("no wgpu context: {error}"),
+                );
                 return;
             }
         };
         for k in [20usize, 32] {
-            let case = wide_tile(k, &poot_target::DeviceCaps::wgpu_rdna3_igpu());
-            let name = format!("contraction_wide_wgpu_k{k}");
+            let case = wide_tile(k, caps);
+            let name = format!("contraction_wide_wgpu_{lanes}_k{k}");
             let body = packed_contraction(
                 &name,
                 case.format,
@@ -2411,10 +2580,7 @@ mod planar_wgpu_tests {
                 crate::PackedRows::Blocks,
             )
             .unwrap_or_else(|error| panic!("{:?}: packed_kernel: {error}", case.format));
-            assert_eq!(
-                body.workgroup_size[0], 256,
-                "the wide grid is a 256-lane workgroup"
-            );
+            assert_eq!(body.workgroup_size[0], lanes, "the case's lane grid");
             let dir = std::env::temp_dir()
                 .join("poot-kernelgen-1193-wide")
                 .join(&name);
@@ -2445,11 +2611,22 @@ mod planar_wgpu_tests {
             let got = buffers.last().unwrap().as_f32();
             assert_close(
                 case.format,
-                &format!("wide register tile K={k} (wgpu)"),
+                &format!("{lanes}-lane register tile K={k} (wgpu)"),
                 got,
                 &case.expected,
             );
         }
+    }
+
+    /// The guard of the RADV wave64 LDS defect (update 0169: a 256-lane LDS-tiled GEMM came back with output rows 8
+    /// and up near zero, the upper waves' LDS writes invisible after the barrier), which does not reproduce on this
+    /// body: the widest tiling the RADV caps plan, the 16x16 lane grid of 8x8 register tiles, a 256-lane workgroup of
+    /// four waves staging 16.5 KiB of LDS, matches the reference on RADV. Mutation (the defect's own shape): in
+    /// `tiled_body`'s stage block, stage zeros from the lanes past the first wave64; the upper rows read zeros and
+    /// this row goes red ("element 2080: got 0 want 2460.198").
+    #[test]
+    fn the_register_tiled_body_runs_256_lane_workgroups_on_radv() {
+        wide_tile_matches_reference_on_radv(&poot_target::DeviceCaps::wgpu_rdna3_igpu(), 256);
     }
 }
 
@@ -2487,13 +2664,13 @@ mod ptx_tests {
         match PtxContext::new() {
             Ok(ctx) => Some(ctx),
             Err(error) => {
-                eprintln!("poot-kernelgen: SKIP {test} (no PTX device): {error}");
+                eprintln!("POOT-SKIP poot-kernelgen: {test} (no PTX device): {error}");
                 None
             }
         }
     }
 
-    fn compile_and_load(name: &str, body: &Body) -> poot_runtime_common::CompiledKernel {
+    fn compile_and_load(name: &str, body: &Body) -> poot_codegen::CompiledKernel {
         let dir = std::env::temp_dir()
             .join("poot-kernelgen-sc004-ptx")
             .join(name);
@@ -2774,13 +2951,13 @@ mod planar_ptx_tests {
         match PtxContext::new() {
             Ok(ctx) => Some(ctx),
             Err(error) => {
-                eprintln!("poot-kernelgen: SKIP {test} (no PTX device): {error}");
+                eprintln!("POOT-SKIP poot-kernelgen: {test} (no PTX device): {error}");
                 None
             }
         }
     }
 
-    fn compile_and_load(name: &str, body: &Body) -> poot_runtime_common::CompiledKernel {
+    fn compile_and_load(name: &str, body: &Body) -> poot_codegen::CompiledKernel {
         let dir = std::env::temp_dir()
             .join("poot-kernelgen-sc002-planar-ptx")
             .join(name);
@@ -2858,7 +3035,7 @@ mod planar_ptx_tests {
         let mut arg_refs: Vec<&PtxBuffer> = vec![&activation_buf];
         arg_refs.extend(source_bufs.iter());
         arg_refs.push(&metadata_buf);
-        let arg_lens: Vec<u32> = arg_refs.iter().map(|b| b.elem_count()).collect();
+        let arg_lens: Vec<usize> = arg_refs.iter().map(|b| b.elem_count()).collect();
         let threads = schedule.grid_threads(1, m, out_rows) as u32;
         ctx.dispatch_dev(
             &name,
@@ -2907,6 +3084,80 @@ mod planar_ptx_tests {
             for k in KS {
                 run_case(&ctx, format, k, 5, register_tiled(2, k));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_gather_index_width_tests {
+    use poot_codegen::{Target, emit_llvm_ir};
+    use poot_quant::format::WeightFormat;
+    use poot_target::AmdArch;
+
+    use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_kernel};
+
+    fn ir(target: Target) -> String {
+        let spec = PackedKernelSpec {
+            format: WeightFormat::Iq4_Nl,
+            op: PackedKernelOp::RowGather,
+        };
+        let body = packed_kernel("row_gather_width", spec).unwrap();
+        emit_llvm_ir(&body, target).unwrap()
+    }
+
+    /// POOT-1317: the IQ4_NL row gather's block-to-bit multiply (144 bits per block) and every word index
+    /// it loads through are `i64` on the backends whose kernels are 64-bit (PTX, ROCm), with no `trunc` of
+    /// the offset chain, so a PLE row past `u32::MAX` bits is addressed at its true word. SPIR-V for Vulkan
+    /// lowers `usize` to `i32` (its resource index is `i32`): the same multiply is `i32` there, which is why
+    /// the planner refuses a packed source past `u32::MAX` bits on that backend
+    /// (`check_source_addressable`) instead of letting it wrap.
+    ///
+    /// Mutation: lower `usize` to `i32` on NVPTX in `usize_llty_of`; the NVPTX `mul i64` assertion goes red.
+    #[test]
+    fn the_row_gather_offset_chain_is_64_bit_where_the_backend_is() {
+        for (target, label) in [
+            (Target::Nvptx, "nvptx"),
+            (Target::AmdGcn(AmdArch::gfx1151()), "amdgcn"),
+        ] {
+            let ir = ir(target);
+            let multiplies: Vec<&str> = ir
+                .lines()
+                .filter(|line| line.contains(" = mul ") && line.trim_end().ends_with(", 144"))
+                .collect();
+            assert!(
+                !multiplies.is_empty(),
+                "{label}: the block-to-bit multiply is emitted"
+            );
+            for line in &multiplies {
+                assert!(
+                    line.contains("= mul i64 "),
+                    "{label}: 32-bit block-to-bit multiply: {line}"
+                );
+            }
+            // The words param (`%p1`) is read through `i64` indices only.
+            let word_loads: Vec<&str> = ir
+                .lines()
+                .filter(|line| line.contains("getelementptr inbounds i32, ptr addrspace(1) %p1,"))
+                .collect();
+            assert!(!word_loads.is_empty(), "{label}: the packed words are read");
+            for line in &word_loads {
+                assert!(
+                    line.contains(", i64 "),
+                    "{label}: a packed word read indexed in 32 bits: {line}"
+                );
+            }
+        }
+        let vulkan = ir(Target::SpirvVulkan);
+        let multiplies: Vec<&str> = vulkan
+            .lines()
+            .filter(|line| line.contains(" = mul ") && line.trim_end().ends_with(", 144"))
+            .collect();
+        assert!(!multiplies.is_empty());
+        for line in multiplies {
+            assert!(
+                line.contains("= mul i32 "),
+                "SPIR-V for Vulkan multiplies in 32 bits: {line}"
+            );
         }
     }
 }

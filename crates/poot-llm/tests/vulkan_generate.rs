@@ -109,6 +109,7 @@ fn options(chunk: usize, capacity: usize) -> DriverOptions {
     let compile = CompileOptions::new(CompileLimits::STANDARD);
     let nz = |n| NonZeroUsize::new(n).unwrap();
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(capacity),

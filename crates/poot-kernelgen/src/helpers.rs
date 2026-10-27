@@ -356,7 +356,7 @@ pub(crate) fn broadcast_eff_strides(out: &[usize], operand: &[usize]) -> Vec<usi
 /// source buffer. A contiguous value (the default) has row-major strides and offset 0 (`Layout::contiguous`).
 ///
 /// Lives here, not in `poot-graph-plan` (which owns the planner-facing `Plan::View`), because the dependency
-/// runs `poot-graph-plan -> poot-kernelgen`: the kernel bodies that read a view (`binary_broadcast_dt`, `fused`,
+/// runs `poot-graph-plan -> poot-kernelgen`: the kernel bodies that read a view (`fused`,
 /// `fused_row`, `fused_row_parallel`) need the type. `poot-graph-plan` re-exports it as `poot_graph_plan::Layout`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {

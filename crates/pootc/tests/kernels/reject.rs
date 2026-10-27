@@ -2,7 +2,7 @@
 //! reject it with a named "unsupported" diagnostic rather than silently miscompile.
 
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 
 #[inline(never)]
 fn helper(x: f32) -> f32 {
@@ -10,7 +10,7 @@ fn helper(x: f32) -> f32 {
 }
 
 pub fn __poot_kernel_bad(a: &[f32], c: &mut [f32]) {
-    let i = thread_index();
+    let i = thread_index_x();
     if i < c.len() {
         // calling an arbitrary function is not in the kernel subset.
         c[i] = helper(a[i]);

@@ -88,6 +88,8 @@ class CheckedInBankTests(unittest.TestCase):
             "long recurrence",
             "sorted expert routing",
             "shuffled expert routing",
+            "causal prefill attention, GQA",
+            "compute-heavy prefill projection over a checkpoint-order bf16 weight",
         ):
             self.assertIn(needed, regimes)
 
@@ -257,6 +259,38 @@ class SpreadTests(BankRoot):
         self.assertFalse(bank.spread_of(with_samples([100, 101, 100, 100, 100]))["exceeds_max_uncertainty"])
 
 
+class ThroughputTests(BankRoot):
+    def test_the_flop_model_counts_the_causal_half_and_the_live_keys(self):
+        # Two query rows at positions 1 and 2 of a 3-key context see 2 + 3 = 5 key pairs, 4 * d FLOP each.
+        prefill = {"producer": "attention_prefill", "shape": {"hq": 3, "hkv": 1, "d": 8, "lq": 2, "cap": 3}}
+        self.assertEqual(bank.work_flop(prefill), 3 * 5 * 4 * 8)
+        decode = {"producer": "attention_decode", "shape": {"hq": 2, "hkv": 1, "d": 8, "cap": 100, "live": 7}}
+        self.assertEqual(bank.work_flop(decode), 2 * 7 * 4 * 8)
+        contraction = {"producer": "dense_contraction", "shape": {"m": 3, "k": 5, "n": 7}}
+        self.assertEqual(bank.work_flop(contraction), 2 * 3 * 5 * 7)
+        self.assertIsNone(bank.work_flop({"producer": "recurrence_scan", "shape": {}}))
+
+    def test_a_claimed_throughput_that_the_repeats_do_not_give_is_refused(self):
+        self.edit_entry("prefill-long-gemm", "rocm", tflop_per_s=9.9)
+        errors = self.errors()
+        self.assertTrue(any("tflop_per_s is 9.9" in e for e in errors), errors)
+
+    def test_a_throughput_claimed_for_a_case_with_no_flop_model_is_refused(self):
+        verified_scan = next(
+            (case, backend) for case, backend in verified_pairs(self.root) if "scan" in case
+        )
+        self.edit_entry(*verified_scan, tflop_per_s=1.0)
+        errors = self.errors()
+        self.assertTrue(any("tflop_per_s is 1.0 but the receipt's repeats give None" in e for e in errors), errors)
+
+    def test_every_verified_flop_case_states_its_throughput(self):
+        cases = {c["id"]: c for c in self.cases()["cases"]}
+        for entry in self.manifest()["entries"]:
+            if entry["status"] == "verified" and bank.work_flop(cases[entry["case"]]) is not None:
+                with self.subTest(case=entry["case"], backend=entry["backend"]):
+                    self.assertGreater(entry["tflop_per_s"], 0)
+
+
 class ReceiptTests(BankRoot):
     def pair(self):
         # A cold-weights (rotation) case, so the rotation fixtures apply.
@@ -405,6 +439,8 @@ class RecordTests(unittest.TestCase):
         entry = next(e for e in bank.load_json(self.root / "receipts.json")["entries"]
                      if (e["case"], e["backend"]) == ("dense-decode-gemv", "wgpu"))
         self.assertEqual(entry["spread"], round(8 / 104, 4))
+        # 2 * 1 * 2048 * 2048 FLOP over the 104 us median repeat.
+        self.assertEqual(entry["tflop_per_s"], round(2 * 2048 * 2048 / 104e-6 / 1e12, 4))
 
     def test_a_runner_that_executed_another_workload_is_refused_and_registers_nothing(self):
         wrong = {"shape": {"m": 1, "k": 1024, "n": 2048}, "storage": "f32", "layout": "kn",

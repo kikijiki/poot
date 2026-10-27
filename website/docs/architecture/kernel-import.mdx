@@ -8,26 +8,21 @@ import KernelPipelineDiagram from "@site/src/components/architecture/KernelPipel
 
 # Kernels from Rust
 
-Imported GPU kernels are Rust functions, type-checked and borrow-checked by rustc. The same
-source produces SPIR-V for wgpu and raw Vulkan, PTX for NVIDIA, and an AMDGCN code object for ROCm, not
-separate implementations for each backend. (Other kernels are synthesized; see [Fusion](./fusion).)
+Imported GPU kernels are Rust functions, type-checked and borrow-checked by rustc. One source produces SPIR-V for wgpu and raw Vulkan, PTX for NVIDIA, and an AMDGCN code object for ROCm. Other kernels are synthesized; see [Fusion](./fusion).
 
 ## A kernel looks like this
 
 ```rust
 #[kernel]
 pub fn elementwise_add(a: &[f32], b: &[f32], out: &mut [f32]) {
-    let i = thread_index();
+    let i = thread_index_x();
     if i < out.len() {
         out[i] = a[i] + b[i];
     }
 }
 ```
 
-The `#[kernel]` attribute marks the function for import by pootc. The ABI is slices:
-inputs as `&[T]`, outputs as `&mut [T]`. The attribute renames the function into the reserved
-`__poot_kernel_<name>` namespace for pootc; a normal host build gets a typed launch wrapper
-instead of the body, so kernel bodies do not need to be host-compatible.
+The ABI is slices: inputs as `&[T]`, outputs as `&mut [T]`. The attribute renames the function into the reserved `__poot_kernel_<name>` namespace for pootc. A normal host build gets a typed launch wrapper instead of the body, so kernel bodies need not be host-compatible.
 
 ## The import pipeline
 
@@ -35,135 +30,85 @@ Step through each stage to see how a `#[kernel]` fn becomes a GPU binary:
 
 <KernelPipelineDiagram />
 
-**pootc** is a thin rustc driver. It calls rustc normally (producing the normal compiled
-artifact) and hooks `after_analysis` to visit every `#[kernel]` fn's MIR body using
-Stable MIR [^stableMir], the stable, versioned interface to rustc's Mid-level IR
-that does not change with every nightly.
+**pootc** is a thin rustc driver. It calls rustc normally and hooks `after_analysis` to visit every `#[kernel]` fn's MIR body through Stable MIR [^stableMir], the stable, versioned interface to rustc's Mid-level IR.
 
-**Kernel IR** (`poot-kernel-ir`) is a small CFG-based IR: basic blocks with statements
-(`Assign`, `WorkgroupLocalWrite`, `VectorStore`, and the `Wmma*` matrix ops) and terminators
-(`Goto`, `SwitchInt`, `ThreadIndexCall`, `Barrier`, `Return`, `Trap`). It
-decouples the importer from the codegen backends, the importer only needs to know the
-kernel IR; the backends only need to consume it. Rustc's bounds check on a slice index (`a[i]`)
-imports as a `Trap`; what a trap does on each target is under [Failed checks](#failed-checks).
+**Kernel IR** (`poot-kernel-ir`) is a small CFG-based IR of basic blocks, statements (`Assign`, `WorkgroupLocalWrite`, `VectorStore`, `Wmma*`) and terminators (`Goto`, `SwitchInt`, `ThreadIndexCall`, `Barrier`, `Return`, `Trap`). The importer only needs to know it, and the backends only need to consume it.
 
-## How kernels connect to the graph executor
+A kernel binary is bound to a compute `Plan` produced by `plan_eqn`, which `compile` runs last. The planner chooses an imported or a synthesized body by region description and target, never by model; [Fusion and Planning](./fusion) owns which ops take which.
 
-A kernel binary does not execute on its own; it is bound to a compute `Plan` produced by
-`plan_eqn`, which connects the import pipeline to the graph planning layer. `compile` runs
-this planning as its last step. A plan body is either an imported kernel (the committed
-assets below) or a synthesized one; the planner chooses by region description and target, never by
-model, and [Fusion and Planning](./fusion) owns which ops take which.
-
-Imported kernel sources live under `crates/pootc/kernels/<family>/`, one subdirectory per family:
-`contraction`, `packed` and `sampling`, plus a `probe` family for kernels a backend crate loads directly.
+Imported sources live under `crates/pootc/kernels/<family>/`: `packed`, `sampling`, `state`, and `probe` (test fixtures). Matmul and elementwise kernels are never imported; they are generated.
 
 ## Accepted Rust subset
 
-This section is the one statement of what a kernel may contain. It is derived from the importer
-(`crates/pootc/src/import.rs`) and the `poot_kernel_intrinsics` crate. Anything outside it produces a
-named `unsupported in kernel: ...` diagnostic from pootc, never a silent miscompile.
+This section is the one statement of what a kernel may contain, derived from `crates/pootc/src/import.rs` and `poot_kernel_intrinsics`. Anything else is a named `unsupported in kernel: ...` diagnostic from pootc, never a silent miscompile.
 
-**Types.** `bool`, `usize`, `i32`, `u32`, `f32`, `f64`, `f16`, the unit type, references and raw pointers
-to those, and slices of them. Structs, tuples, arrays, enums, closures, trait objects and heap types
-(`Vec`, `Box`, `String`) have no lowering and are rejected.
+| | Accepted | Rejected |
+| --- | --- | --- |
+| Types | `bool`, `usize`, `i32`, `u32`, `f32`, `f64`, `f16`, unit, references and raw pointers to those, slices | Structs, tuples, arrays, enums, closures, trait objects, `Vec`, `Box`, `String` |
+| Expressions | Arithmetic, bit ops and shifts, comparisons, unary `-` and `!`, numeric `as`, slice indexing, `len()`, `if / else` | |
+| Loops | `while`, `for k in a..b`, `a..=b`, `for x in slice` | `.rev()`, `.step_by()` |
+| Methods | Float `sqrt abs floor ceil trunc round exp ln sin cos`; `max` and `min`; `f32::from_bits(u32)` | Any other function: no inlined helpers, `unwrap`, `expect`, recursion or I/O |
+| Arrays | Workgroup memory (below) | Private arrays with dynamic indices |
 
-**Expressions.** Integer and float arithmetic (`+`, `-`, `*`, `/`, `%`), bit operations and shifts,
-comparisons, unary `-` and `!`, numeric `as` casts, slice indexing and `len()`, and `if / else`.
+The importer matches a `core` or `std` method by its resolved path, so a kernel-authored helper of the same name is an ordinary call and is rejected.
 
-**Loops.** `while`; `for k in a..b` and `for k in a..=b`; and `for x in slice`, which reads
-`slice[counter]` for `*x`. `.rev()` and `.step_by()` are rejected.
+### Intrinsics
 
-**Float and integer methods.** On floats, `sqrt`, `abs`, `floor`, `ceil`, `trunc`, `round`, `exp`, `ln`,
-`sin`, `cos`; `max` and `min` on floats and on integers; and `f32::from_bits(u32)`, which reinterprets a
-`u32` as an `f32` (for example a scale packed into a metadata buffer). The importer matches the
-`core`/`std` method by its resolved path, so a kernel-authored helper with the same name is an ordinary call
-and is rejected.
+The only other calls a kernel may make are `poot_kernel_intrinsics` functions, recognized by their resolved declaration:
 
-**Intrinsics.** A call into the `poot_kernel_intrinsics` crate is the only call a kernel may make besides the
-methods above. The importer recognizes an intrinsic by the callee's resolved declaration, not its bare name,
-so a kernel never redeclares one.
+- `thread_index_{x,y,z}()`, `local_index_{x,y,z}()`, `group_index_{x,y,z}()`: the global dispatch index, the lane within its workgroup, the workgroup index.
+- `workgroup_barrier()`: earlier workgroup-local writes are visible to every lane after it.
+- `wg_write::<T>(array, i, v)` and `wg_read::<T>(array, i)`: LDS access. `array` is a literal id of a declared array.
+- `atomic_add(buffer, i, v)`: atomic `u32` add on a slice parameter, returning the old value.
+- `no_contract_add(a, b)`: an add no backend may fuse with a producing multiply into an FMA.
 
-| Intrinsic                                          | Meaning                                                                                                                    |
-| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `thread_index()`                                   | The global dispatch index along X                                                                                          |
-| `local_index()`                                    | The lane within its workgroup along X                                                                                      |
-| `group_index()`, `group_index_y()`                 | The workgroup index along X, Y                                                                                             |
-| `workgroup_barrier()`                              | Workgroup barrier; earlier workgroup-local writes are visible to every lane after it                                       |
-| `wg_write(array, i, v)`, `wg_read(array, i)`       | Workgroup-local (LDS) `f32` access; `array` must be a literal array id                                                     |
-| `atomic_add(buffer, i, v)`                         | Atomic `u32` add on `buffer[i]`, returning the old value; `buffer` is a slice parameter and `i` a `usize` local, not a literal |
-| `no_contract_add(a, b)`                            | `a + b` that no backend may contract with a producing multiply into an FMA                                                  |
+### Declared launch
 
-`const WORKGROUP_SIZE: usize = N;` in the kernel sets the workgroup lane count (default 64).
+`#[kernel(workgroup(x, y, z), lds(T, len), ...)]` states the launch, and the importer reads exactly that. `workgroup` is the lane count per axis (missing axes are 1). Each `lds(T, len)` declares the next workgroup-local array: `len` elements of `f32`, `u32` or `i32`.
 
-**Not supported.** A call to any other function is rejected, so helper functions are not inlined and
-`unwrap`, `expect`, recursion and standard-library I/O have no lowering. Private local arrays with dynamic
-indices are rejected as well; use workgroup memory (below).
+A kernel that reads a lane or workgroup index, calls the barrier or touches an LDS array must declare its workgroup. Without one it runs at 64 lanes along X.
 
 ### Failed checks
 
-A MIR `Assert` (a slice bounds check, an arithmetic overflow, a divide or shift check) lowers to a branch that
-traps on failure; `Unreachable` lowers directly to a trap. A bounds check that a dominating guard provably
-repeats is dropped, and a check no guard covers stays a trap.
+A MIR `Assert` (a bounds, overflow, divide or shift check) lowers to a branch that traps, and `Unreachable` lowers to a trap. A check a dominating guard provably repeats is dropped.
 
-| Target                | A trap                                                                                                                                                    |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ROCm, PTX             | A device trap instruction                                                                                                                                 |
-| wgpu, raw Vulkan      | SPIR-V has no trap. `poot-codegen` accumulates a per-thread bit for the failed site (up to 32 sites per kernel; further sites share the last bit) into the dispatch's error word and the thread carries on under robust buffer access. The executor discards the dispatch and raises a typed fault at its next sync point |
-| XDNA2 NPU (AIE)       | `poot-codegen` refuses a body that contains a trap with a typed error                                                                                     |
+- **ROCm, PTX:** a device trap instruction.
+- **wgpu, raw Vulkan:** SPIR-V has no trap. `poot-codegen` sets a per-thread bit for the failed site in the dispatch's error word (up to 32 sites per kernel; more share the last bit), and the thread carries on under robust buffer access. The executor discards the dispatch and raises a typed fault at its next sync point.
+- **XDNA2 NPU (AIE):** `poot-codegen` refuses a body that contains a trap, with a typed error.
 
 ## LDS arrays and barriers
 
-Workgroup-local (shared) memory is written and read with `wg_write` and `wg_read`, indexed by
-a literal array id:
+Workgroup-local memory is declared in the attribute and indexed by a literal array id:
 
 ```rust
-pub fn __poot_kernel_wg_reduce(a: &[f32], out: &mut [f32]) {
-    let lane = local_index();
-    wg_write(0, lane, a[lane]);   // array 0, slot `lane`
+#[kernel(workgroup(64), lds(f32, 64))]
+pub fn wg_reduce(a: &[f32], out: &mut [f32]) {
+    let lane = local_index_x();
+    wg_write::<f32>(0, lane, a[lane]);
     workgroup_barrier();
     if lane == 0 {
         let mut acc = 0.0f32;
-        for j in 0..64 { acc = acc + wg_read(0, j); }
+        for j in 0..64 { acc = acc + wg_read::<f32>(0, j); }
         out[0] = acc;
     }
 }
 ```
 
-Use LDS instead of a local `[f32; N]` for SPIR-V: private arrays with dynamic indices
-crash some driver stacks (RADV on AMD). The generated attention kernel
-keeps its running output in an LDS array for this reason. LDS works on wgpu, raw Vulkan, ROCm and PTX.
+Use LDS instead of a local `[f32; N]` for SPIR-V: private arrays with dynamic indices crash some driver stacks (RADV). The generated attention kernel keeps its running output in LDS for this reason. A structurization pass turns the unstructured CFG into loops and if/else before SPIR-V emit.
 
-The structurization pass converts the kernel IR's unstructured CFG to structured control
-flow (proper loops, if/else) before SPIR-V emit.
+## Committed assets
 
-## .kir.json assets and drift guarding
+Each imported kernel has a committed `.kir.json` under its consuming crate's `assets/`, generated from `crates/pootc/kernels/<family>/`. This keeps GPU binaries reproducible without running pootc on every build.
 
-Each imported kernel has a committed `.kir.json` under its consuming crate's `assets/`
-(`poot-graph-plan/assets/` for every kernel the planner chooses between; `poot-rocm-device/assets/` and
-`poot-wgpu-device/src/tests/assets/` for the handful a backend crate loads directly), generated from a source
-under `crates/pootc/kernels/<family>/`. One manifest table lists every asset, its source and its
-destination; a test regenerates each asset from its source and checks it byte-for-byte against the
-committed one, and separately checks that each destination directory holds exactly its manifest's
-entries. `just regen-kernel-assets` regenerates all of them.
-
-Committing the kernel IR keeps GPU binaries reproducible from the repo without running pootc on every build.
+One manifest lists every asset, its source and its destination. A test regenerates each asset and compares it byte for byte, and checks that each destination holds exactly its manifest's entries. `just regen-kernel-assets` regenerates them.
 
 ## Verification
 
-Before codegen, `Body::verify` checks every matrix-fragment operation against the declared
-`Ty::Fragment` type of its locals: the role (A, B or accumulator), the operand dtype and the tile
-shape must match at every producer and consumer, and a fragment cannot be assigned like a scalar.
-A mismatch returns a typed error with the offending statement location. Matrix operations are
-collective over one 32-lane subgroup, so the verifier also rejects any matrix operation reachable
-under a branch that can split a subgroup (`DivergentFragmentParticipation`); selecting a whole
-subgroup, such as warp 0, is accepted. The accumulator is an ordinary variable on every target, so
-it carries across a K loop; target and shape restrictions still apply.
+Before codegen, `Body::verify` checks every matrix-fragment operation against its locals' `Ty::Fragment` type. Role (A, B or accumulator), operand dtype and tile shape must match at every producer and consumer, and a mismatch is a typed error with the statement location.
 
-`committed_assets_match_their_kernel_sources` regenerates every committed asset from its source and
-fails if any is stale. Executor tests then dispatch the kernels on each device backend and compare against
-the CPU oracle under the contract described in [Execution](./execution#verification). PTX tests run on
-rented NVIDIA pods.
+Matrix operations are collective over one 32-lane subgroup, so the verifier rejects one reachable under a branch that can split a subgroup (`DivergentFragmentParticipation`). Selecting a whole subgroup, such as warp 0, is accepted. The accumulator is an ordinary variable and carries across a K loop.
+
+Executor tests dispatch the kernels on each device backend and compare against the CPU oracle ([Execution](./execution#verification)); PTX tests run on rented NVIDIA pods.
 
 ---
 

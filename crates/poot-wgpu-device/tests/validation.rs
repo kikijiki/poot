@@ -627,7 +627,7 @@ fn wgpu_live_attention_never_reads_the_poisoned_tail() {
 }
 
 /// POOT-1041 on wgpu: a BF16 or F16 live-attention graph is refused at planning with the typed `DtypeLowering`
-/// on its `Select`, never run through a kernel that reads the two-byte lanes as something else: SPIR-V has no
+/// on its first two-byte equation (the F16 `Select`; the BF16 graph's narrowing `Cast`), never run through a kernel that reads the two-byte lanes as something else: SPIR-V has no
 /// native two-byte lane to move. The compile happens against the real device's target. Mutation: drop the
 /// SPIR-V exclusion from the two-byte arm of the `Select` planning (`planner/elementwise.rs`); the plan
 /// succeeds and this row goes red.
@@ -673,10 +673,13 @@ fn wgpu_live_attention_two_byte_branches_are_a_typed_refusal() {
             poot_graph_plan::Capability::DtypeLowering,
             "{dtype:?}"
         );
-        assert!(
-            matches!(refusal.op, poot_graph_ir::OpKind::Select),
-            "{dtype:?}: {refusal:?}"
-        );
+        // A BF16 graph is refused at its first bf16 equation, the cast narrowing into it (SPIR-V has no
+        // bf16 type to store, POOT-1395); an F16 one at the select.
+        let first = match dtype {
+            DType::BF16 => matches!(refusal.op, poot_graph_ir::OpKind::Cast { to: DType::BF16 }),
+            _ => matches!(refusal.op, poot_graph_ir::OpKind::Select),
+        };
+        assert!(first, "{dtype:?}: {refusal:?}");
     }
 }
 

@@ -49,7 +49,7 @@ pub struct RocmBuffer {
     /// Logical element count passed to the native slice ABI. Handle-level, like [`Self::storage`]
     /// (Card 547a: moved out of the shared [`RocmAlloc`] so [`Self::with_storage`] can retag a clone
     /// without needing sole ownership of the physical allocation).
-    pub(crate) elem_count: u32,
+    pub(crate) elem_count: usize,
     /// Byte capacity established before the native allocation call. Handle-level; see
     /// [`Self::elem_count`].
     pub(crate) byte_capacity: usize,
@@ -66,7 +66,7 @@ impl RocmBuffer {
     }
 
     /// Logical element count passed to the native slice ABI.
-    pub fn elem_count(&self) -> u32 {
+    pub fn elem_count(&self) -> usize {
         self.elem_count
     }
 
@@ -127,17 +127,14 @@ pub(crate) fn checked_layout(
     op: &'static str,
     elements: usize,
     storage: BufferStorage,
-) -> Result<(u32, usize), RocmError> {
+) -> Result<usize, RocmError> {
     let element_bytes = storage.element().byte_width();
-    poot_runtime_common::checked_layout(elements, element_bytes).map_err(|error| match error {
-        poot_runtime_common::LayoutError::ElementCountTooLarge => {
-            RocmError::ElementCountTooLarge { op, elements }
-        }
-        poot_runtime_common::LayoutError::ByteSizeOverflow => RocmError::ByteSizeOverflow {
+    poot_runtime_common::checked_byte_capacity(elements, element_bytes).map_err(|_| {
+        RocmError::ByteSizeOverflow {
             op,
             elements,
             element_bytes,
-        },
+        }
     })
 }
 

@@ -519,6 +519,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         bos: p.bos,
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
+        kv_dtype: None,
         chat: ChatFormat::ChatML,
         tool_codec: Some(Arc::new(HermesToolCodec)),
     };

@@ -45,7 +45,7 @@ fn scalar_decay_decode(
 }
 
 /// Stage one `Attention { softcap: None }` over `[q, k, v, mask]`. Card 557: `Builder` has no
-/// method for a composite (`compile`'s `flash_attention_capped` forms it from the traced chain), so a test
+/// method for a composite (`compile`'s `flash_attention` forms it from the traced chain), so a test
 /// of the op's own eval stages it through an append plan, as `e4m3_per_channel.rs` stages a
 /// `PackedContraction`.
 fn stage_flash_prefill(

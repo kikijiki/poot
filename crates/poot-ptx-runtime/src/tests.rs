@@ -823,24 +823,27 @@ fn captured_graph_owns_dispatched_buffers_until_it_drops() {
         )
         .expect("mock allocation")
     };
-    let (a, b, out) = (alloc(101), alloc(102), alloc(103));
-    let uncaptured = alloc(104);
+    // Fake device addresses on the binding alignment (`poot_codegen::BUFFER_PARAM_ALIGN`), as `cuMemAlloc` returns.
+    let (a, b, out) = (alloc(0x1010), alloc(0x1020), alloc(0x1030));
+    let uncaptured = alloc(0x1040);
 
     context.capture.begin();
     let args = KernelArgs::pack(
         &context.capture,
+        poot_kernel_ir::IndexWidth::Native,
         &[&a, &b],
         &[a.elem_count(), b.elem_count()],
         &out,
         out.elem_count(),
-    );
+    )
+    .expect("lengths fit the i64 kernel ABI");
     let params: Vec<u64> = args
         .params()
         .iter()
         // SAFETY: each parameter points at a live `u64` device pointer or `i64` length owned by `args`.
         .map(|param| unsafe { param.cast::<u64>().read() })
         .collect();
-    assert_eq!(params, [101, 4, 102, 4, 103, 4]);
+    assert_eq!(params, [0x1010, 4, 0x1020, 4, 0x1030, 4]);
     drop((a, b, out));
     assert_eq!(
         free_count(&mock),
@@ -889,6 +892,128 @@ fn captured_graph_owns_dispatched_buffers_until_it_drops() {
         expected.extend(free_one);
     }
     assert_eq!(mock.snapshot(), expected);
+}
+
+/// POOT-1405: a buffer bound to a kernel parameter off the binding alignment is refused before any launch
+/// parameter is packed or any buffer is retained, naming the parameter (inputs in order, the output last): the
+/// kernels read aligned vector groups of a parameter (`Rvalue::VectorLoad`, `align 16`) on that guarantee.
+/// Mutation: drop the alignment check in `KernelArgs::pack`; the misaligned input packs and this row goes red.
+#[test]
+fn kernel_args_refuse_a_buffer_off_the_binding_alignment() {
+    use poot_kernel_ir::IndexWidth::Native;
+    let mock = Arc::new(MockCleanup::default());
+    let context = mock_context(&mock);
+    let alloc = |ptr: sys::CUdeviceptr| {
+        allocate_owned(
+            Arc::clone(&context.owner),
+            "test_alloc",
+            4,
+            BufferStorage::f32(),
+            BufferRole::Activation,
+            |_| Ok(ptr),
+            |_, _| Ok(()),
+        )
+        .expect("mock allocation")
+    };
+    let (aligned, misaligned, out) = (alloc(0x2000), alloc(0x2104), alloc(0x2200));
+    let refused = KernelArgs::pack(
+        &context.capture,
+        Native,
+        &[&aligned, &misaligned],
+        &[4, 4],
+        &out,
+        4,
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(PtxError::MisalignedBinding {
+                param: 1,
+                address: 0x2104,
+                alignment: 16,
+                ..
+            })
+        ),
+        "a misaligned input binding must be refused by name, got {:?}",
+        refused.as_ref().err()
+    );
+    let refused_out = KernelArgs::pack(&context.capture, Native, &[&aligned], &[4], &misaligned, 4);
+    assert!(
+        matches!(
+            refused_out,
+            Err(PtxError::MisalignedBinding { param: 1, .. })
+        ),
+        "a misaligned output binding is refused too, got {:?}",
+        refused_out.as_ref().err()
+    );
+    KernelArgs::pack(&context.capture, Native, &[&aligned], &[4], &out, 4)
+        .expect("aligned bindings pack");
+}
+
+/// POOT-1405: a kernel narrowed to 32-bit index math is refused a binding whose longest length its index bound
+/// carries past the 32-bit index range, before any launch parameter is packed; the same bound admits the
+/// longest length that stays within it, and a native-width kernel takes any length. The lengths are the
+/// caller's own (the plan's), so the refusal is the runtime's half of the planner's proof.
+/// Mutation: drop the index-bound check in `KernelArgs::pack`; the over-long binding packs and this row goes red.
+#[test]
+fn kernel_args_refuse_a_binding_past_a_narrowed_kernels_index_bound() {
+    use poot_kernel_ir::{IndexBound, IndexWidth};
+    let mock = Arc::new(MockCleanup::default());
+    let context = mock_context(&mock);
+    let (input, out) = (
+        allocate_owned(
+            Arc::clone(&context.owner),
+            "test_alloc",
+            4,
+            BufferStorage::f32(),
+            BufferRole::Activation,
+            |_| Ok(0x3000),
+            |_, _| Ok(()),
+        )
+        .expect("mock allocation"),
+        allocate_owned(
+            Arc::clone(&context.owner),
+            "test_alloc",
+            4,
+            BufferStorage::f32(),
+            BufferRole::Activation,
+            |_| Ok(0x3100),
+            |_, _| Ok(()),
+        )
+        .expect("mock allocation"),
+    );
+    let bound = IndexBound {
+        scale: 32,
+        slack: 4096,
+    };
+    // The longest length whose indices stay within the 32-bit range, and one past it.
+    let fits = ((IndexBound::U32_LIMIT - 4096) / 32) as usize;
+    let narrowed = IndexWidth::U32(bound);
+    let refused = KernelArgs::pack(&context.capture, narrowed, &[&input], &[fits + 1], &out, 4);
+    assert!(
+        matches!(
+            refused,
+            Err(PtxError::IndexBoundExceeded {
+                elems,
+                scale: 32,
+                slack: 4096,
+                ..
+            }) if elems == fits + 1
+        ),
+        "a length past the narrowed kernel's bound must be refused by name, got {:?}",
+        refused.as_ref().err()
+    );
+    KernelArgs::pack(&context.capture, narrowed, &[&input], &[fits], &out, 4)
+        .expect("the longest length within the bound packs");
+    KernelArgs::pack(
+        &context.capture,
+        IndexWidth::Native,
+        &[&input],
+        &[fits + 1],
+        &out,
+        4,
+    )
+    .expect("a native-width kernel takes any length its ABI holds");
 }
 
 /// Card 516a: while a capture is open only kernel dispatches may reach the stream. Every other operation is
@@ -1188,8 +1313,49 @@ fn immutable_metadata_and_valid_copy_share_one_allocation_contract() {
 fn allocation_arithmetic_is_checked_before_native_allocation() {
     assert!(matches!(
         checked_layout("alloc_f32", usize::MAX, BufferStorage::f32()),
-        Err(PtxError::ElementCountTooLarge { .. } | PtxError::ByteSizeOverflow { .. })
+        Err(PtxError::ByteSizeOverflow { .. })
     ));
+}
+
+/// POOT-1317 on a real device: a buffer of more than `u32::MAX` elements allocates, reports its true
+/// element count, and its last bytes are writable (Flash-Next's PLE table is 7.2 G words). Only the host
+/// layout bounds the count; the kernel ABI's lengths are `i64`.
+///
+/// Mutation: make `poot_runtime_common::checked_byte_capacity` refuse a count past `u32::MAX`; the
+/// allocation is refused and the first expectation goes red.
+#[test]
+fn a_buffer_past_u32_elements_allocates_and_its_tail_is_writable() {
+    let ctx = match PtxContext::new() {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            eprintln!(
+                "POOT-SKIP a_buffer_past_u32_elements_allocates_and_its_tail_is_writable: {error}"
+            );
+            return;
+        }
+    };
+    let elements = u32::MAX as usize + 2;
+    let buffer = ctx
+        .alloc_storage(BufferRole::Weight, BufferStorage::raw_bytes(), elements)
+        .expect("a buffer past u32 elements");
+    assert_eq!(buffer.elem_count(), elements);
+    write_host_bytes(&ctx, &buffer, elements - 4, &[1, 2, 3, 4]).expect("the tail is in range");
+    let error = write_host_bytes(&ctx, &buffer, buffer.byte_capacity() - 3, &[0; 4]).unwrap_err();
+    assert!(
+        matches!(error, PtxError::RangeOutOfBounds { .. }),
+        "a write past the end is a typed range error, got {error:?}"
+    );
+}
+
+/// The kernel ABI's lengths are `i64` (`KernelArgs`), so an element count past `u32::MAX` is a valid
+/// layout whose size is its byte count (POOT-1317: Flash-Next's 7.2 G-word PLE table).
+#[test]
+fn allocation_layout_accepts_an_element_count_past_u32() {
+    let elements = u32::MAX as usize + 1;
+    assert_eq!(
+        checked_layout("alloc_i32", elements, BufferStorage::i32()).expect("a 64-bit layout"),
+        elements * 4
+    );
 }
 
 const LIFECYCLE_PTX: &str = r#"
@@ -1230,23 +1396,23 @@ DONE:
 
 /// A [`CompiledKernel`] for [`LIFECYCLE_PTX`]'s one-input-one-output f32 kernel: hand-written PTX text,
 /// not compiler output, so this test builds the handle directly (card 608's sanctioned "imported kernel"
-/// escape hatch, see `poot_runtime_common::CompiledKernel::new`'s doc).
-fn lifecycle_kernel() -> poot_runtime_common::CompiledKernel {
+/// escape hatch, see `poot_codegen::CompiledKernel::new`'s doc).
+fn lifecycle_kernel() -> poot_codegen::CompiledKernel {
     // SAFETY: `LIFECYCLE_PTX` above declares exactly one f32 input pointer/length pair and one f32
     // output pointer/length pair, matching this schema; it never traps.
     unsafe {
-        poot_runtime_common::CompiledKernel::new(
+        poot_codegen::CompiledKernel::new(
             poot_target::TargetId::Gpu(poot_target::Backend::Nvptx),
             "card305_add_one",
-            poot_runtime_common::KernelCode::Ptx(LIFECYCLE_PTX.into()),
+            poot_codegen::KernelCode::Ptx(LIFECYCLE_PTX.into()),
             vec![
-                poot_runtime_common::ArgSchema::new(
+                poot_codegen::ArgSchema::new(
                     poot_target::ElementKind::F32,
-                    poot_runtime_common::ArgAccess::Read,
+                    poot_target::ArgAccess::Read,
                 ),
-                poot_runtime_common::ArgSchema::new(
+                poot_codegen::ArgSchema::new(
                     poot_target::ElementKind::F32,
-                    poot_runtime_common::ArgAccess::Write,
+                    poot_target::ArgAccess::Write,
                 ),
             ],
             false,
@@ -1260,7 +1426,7 @@ fn card305_ptx_lifecycle_repeated_contexts_and_surviving_children() {
         Ok(context) => context,
         Err(error) => {
             eprintln!(
-                "SKIP card305_ptx_lifecycle_repeated_contexts_and_surviving_children: {error}"
+                "POOT-SKIP card305_ptx_lifecycle_repeated_contexts_and_surviving_children: {error}"
             );
             return;
         }
@@ -1375,7 +1541,7 @@ fn native_buffer_contract_roundtrip_ptx() {
     let ctx = match PtxContext::new() {
         Ok(ctx) => ctx,
         Err(error) => {
-            eprintln!("SKIP native_buffer_contract_roundtrip_ptx: {error}");
+            eprintln!("POOT-SKIP native_buffer_contract_roundtrip_ptx: {error}");
             return;
         }
     };
@@ -1457,7 +1623,7 @@ fn no_contract_fma_sensitive_rows(n: usize) -> Vec<(f32, f32, f32, f32)> {
 /// Compile `poot_kernel_ir::test_support::no_contract_probe_kernel(marked)` for `Target::Nvptx` through the
 /// real production toolchain (the same `poot_codegen::compile_kernel`/`kernel_handle` pair every other backend's
 /// device test uses - `poot-wgpu-runtime`'s `no_contract_tests`, `poot-rocm-runtime`'s `no_contract_*`).
-fn no_contract_nvptx_kernel(marked: bool) -> poot_runtime_common::CompiledKernel {
+fn no_contract_nvptx_kernel(marked: bool) -> poot_codegen::CompiledKernel {
     let tag = if marked { "marked" } else { "unmarked" };
     let body = poot_kernel_ir::test_support::no_contract_probe_kernel(marked);
     let dir = std::env::temp_dir().join("poot-ptx-runtime-no-contract-test");
@@ -1496,7 +1662,7 @@ fn no_contract_marker_matches_unfused_reference_on_fma_sensitive_rows() {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "SKIP no_contract_marker_matches_unfused_reference_on_fma_sensitive_rows (no PTX device): {e}"
+                "POOT-SKIP no_contract_marker_matches_unfused_reference_on_fma_sensitive_rows (no PTX device): {e}"
             );
             return;
         }
@@ -1553,7 +1719,7 @@ fn no_contract_marker_matches_unfused_reference_on_fma_sensitive_rows() {
 #[test]
 fn ptx_buffer_and_its_context_move_into_another_thread() {
     let Ok(ctx) = PtxContext::new() else {
-        eprintln!("SKIP ptx_buffer_and_its_context_move_into_another_thread: no NVIDIA GPU");
+        eprintln!("POOT-SKIP ptx_buffer_and_its_context_move_into_another_thread: no NVIDIA GPU");
         return;
     };
     let buffer = ctx.upload_f32(&[1.0, 2.0, 3.0, 4.0]).expect("upload f32");
@@ -1578,7 +1744,7 @@ fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() 
     let ctx = match PtxContext::new() {
         Ok(ctx) => ctx,
         Err(error) => {
-            eprintln!("SKIP a_write_at_an_offset_leaves_its_neighbours_intact: {error}");
+            eprintln!("POOT-SKIP a_write_at_an_offset_leaves_its_neighbours_intact: {error}");
             return;
         }
     };
@@ -1686,7 +1852,7 @@ fn a_sticky_device_fault_is_device_lost_and_the_next_call_is_poisoned() {
 #[test]
 fn an_out_of_bounds_store_is_device_lost_and_poisons_the_context() {
     let Ok(ctx) = PtxContext::new() else {
-        eprintln!("SKIP an_out_of_bounds_store_is_device_lost: no NVIDIA GPU");
+        eprintln!("POOT-SKIP an_out_of_bounds_store_is_device_lost: no NVIDIA GPU");
         return;
     };
     let body = poot_kernel_ir::fixtures::add_kernel();
@@ -1700,12 +1866,15 @@ fn an_out_of_bounds_store_is_device_lost_and_poisons_the_context() {
     let a = ctx.upload_f32(&[1.0; 4]).expect("upload a");
     let b = ctx.upload_f32(&[1.0; 4]).expect("upload b");
     let c = ctx.alloc_f32(4).expect("alloc c");
-    let wild = 1u32 << 30;
+    let wild = 1usize << 30;
+    // The kernel carries its body's workgroup size as `maxntid`, so the block is that size: a wider block is
+    // refused by the driver at the launch, before any store.
+    let block = body.workgroup_size;
     ctx.dispatch_dev(
         "add",
         &kernel,
-        [256, 1, 1],
-        [u32::MAX - 255, 1, 1],
+        block,
+        [u32::MAX - (block[0] - 1), 1, 1],
         &[&a, &b],
         &[wild, wild],
         &c,

@@ -10,9 +10,10 @@ use super::{
     BodyLimits, Capability, ContractionHead, DType, Eqn, HashMap, KernelRequest, OpKind, Operand,
     PlanError, Planned, Scalar, ValueId, fty_ty, numel, value_ids,
 };
-use crate::planner::{GraphTables, Layout, Lowering, StorageDtypes};
-use crate::predicates::{is_elementwise_2d_in, scatter_update_plan};
+use crate::planner::{GraphTables, Layout, Lowering, OutputBuffer, StorageDtypes};
+use crate::predicates::{ELEMENTWISE_2D_WIDTH, is_elementwise_2d_in, scatter_update_plan};
 use crate::refusal::Site;
+use crate::{Binding, Sink, Source};
 use poot_kernelgen::{MovementOp, MovementSpec, Storage, UpdateIndex};
 use poot_target::{AieTargetId, Backend, DeviceCaps};
 
@@ -67,7 +68,9 @@ pub(super) fn plan_serialized(
 
 /// Whether this family lowers `op` over these storage dtypes. Movement is dtype-agnostic bytes, so a packed
 /// E4M3FN payload moves wherever the device stores it natively, and a 2-byte float moves everywhere; the
-/// scatter and the collectives are wired for neither.
+/// collectives are wired for neither. A write into a carried buffer (an update or a scatter) stores in the
+/// buffer's own element type, so it writes BF16 only where the device has a bf16 lane (SPIR-V has none); F16
+/// is native everywhere.
 pub(super) fn admits_dtypes(
     op: &OpKind,
     dtypes: StorageDtypes,
@@ -79,13 +82,20 @@ pub(super) fn admits_dtypes(
     {
         return Err(Capability::E4m3Storage);
     }
-    if dtypes.out_is_half() && (collective || matches!(op, OpKind::ScatterUpdate)) {
+    let write = matches!(
+        op,
+        OpKind::ScatterUpdate | OpKind::DynamicUpdateSlice { .. }
+    );
+    let bf16_write = write && dtypes.out == DType::BF16 && !caps.native_two_byte_floats;
+    if dtypes.out_is_half() && (collective || bf16_write) {
         return Err(Capability::DtypeLowering);
     }
     Ok(())
 }
 
 /// Plan one data-movement equation (including the e4m3fn packed forms) and refuse the collectives.
+/// `output` says whether the output buffer already holds an update's base (a donated state), in which
+/// case the update writes only its window.
 #[expect(clippy::too_many_arguments)]
 pub(super) fn plan(
     g: GraphTables<'_>,
@@ -97,17 +107,32 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
+    output: OutputBuffer,
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
     let ids = value_ids(eqn);
     let storage = movement_storage(odt);
     let packed = odt == DType::E4M3FN;
+    // A write of f32 values into a two-byte buffer stores them narrowed (the IR's `stores_as`): the body
+    // reads the update in its own element type and converts on the store.
+    let written = match &eqn.op {
+        OpKind::DynamicUpdateSlice { .. } | OpKind::ScatterUpdate
+            if g.aval(ids[1]).dtype != odt =>
+        {
+            Some(fty_ty(g.aval(ids[1]).dtype))
+        }
+        _ => None,
+    };
+    let with_written = |spec: MovementSpec| match &written {
+        Some(ty) => spec.writing(ty.clone()),
+        None => spec,
+    };
     // A packed payload is never read through a strided view: the layout has no row padding to stride over.
     let view = views.get(&eqn.out).filter(|_| !packed);
     // One thread per output buffer unit, folded onto a 2-D grid past the device's x-grid cap.
     let generate = |op: MovementOp| {
-        let spec = MovementSpec::new(storage.clone(), out_shape.to_vec(), op);
+        let spec = with_written(MovementSpec::new(storage.clone(), out_shape.to_vec(), op));
         let two_d = is_elementwise_2d_in(g, eqn, out_shape, out_numel, caps);
         Planned::generated(
             site,
@@ -167,7 +192,15 @@ pub(super) fn plan(
             // chunks by output-unit range (see `scatter_update_plan`) so a wide shared-pool KV write
             // (gemma4-dense batched prefill) does not trip `poot-wgpu-device`'s display-watchdog `flush_work` cap
             // on its own.
-            scatter_update_plan(site, backend, &storage, out_shape, src_shape, caps)?
+            scatter_update_plan(
+                site,
+                backend,
+                &storage,
+                written.as_ref(),
+                out_shape,
+                src_shape,
+                caps,
+            )?
         }
         OpKind::Transpose { perm } => {
             refuse_zero(out_shape.contains(&0))?;
@@ -259,11 +292,39 @@ pub(super) fn plan(
                     }));
                 }
             }
-            generate(MovementOp::UpdateSlice {
-                update_shape,
-                axis: *axis,
-                index,
-            })?
+            match output {
+                OutputBuffer::Fresh => generate(MovementOp::UpdateSlice {
+                    update_shape,
+                    axis: *axis,
+                    index,
+                })?,
+                // POOT-1389: the donated base is already in the output buffer, so the kernel reads only
+                // the update (and its runtime index) and launches over the window it writes, never the
+                // whole state.
+                OutputBuffer::HoldsBase => {
+                    let mut reads = vec![Source::Operand(1)];
+                    if index == UpdateIndex::Runtime {
+                        reads.push(Source::Operand(2));
+                    }
+                    let spec = with_written(MovementSpec::new(
+                        storage.clone(),
+                        out_shape.to_vec(),
+                        MovementOp::WriteSlice {
+                            update_shape,
+                            axis: *axis,
+                            index,
+                        },
+                    ));
+                    let two_d = spec.threads() > caps.max_grid[0] as usize * ELEMENTWISE_2D_WIDTH;
+                    let write = Planned::generated_dispatch(
+                        site,
+                        KernelRequest::Movement(spec.folded(two_d)),
+                        backend,
+                        caps,
+                    )?;
+                    Planned::split(vec![write.bound(Binding::new(reads, Sink::Out))])?
+                }
+            }
         }
         OpKind::Iota { .. } => {
             unreachable!("plan_eqn refuses an unfolded Iota before dispatching to a family")

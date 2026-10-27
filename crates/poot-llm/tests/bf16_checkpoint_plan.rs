@@ -87,6 +87,18 @@ fn bf16_matmul(g: &Graph, eqn: &Eqn) -> bool {
             .any(|operand| matches!(operand, Operand::Value(v) if g.aval(*v).dtype == DType::BF16))
 }
 
+/// Whether `eqn` widens a computed BF16 value (not a const, which the packed lane reads) on `backend` with no
+/// bf16 lane: SPIR-V has no bf16 type, so the planner refuses that cast by name (the passes fold the raw
+/// graph's one such cast, the embedding row's, into the row gather before any device plans it).
+fn bf16_widen_without_lane(g: &Graph, eqn: &Eqn, backend: Backend) -> bool {
+    backend == Backend::SpirvVulkan
+        && eqn.op == (OpKind::Cast { to: DType::F32 })
+        && eqn.inputs.iter().any(|operand| {
+            matches!(operand, Operand::Value(v)
+                if g.aval(*v).dtype == DType::BF16 && g.meta(*v).storage != Storage::Const)
+        })
+}
+
 /// The BF16 consts of `g`.
 fn bf16_consts(g: &Graph) -> BTreeSet<ValueId> {
     g.values()
@@ -156,13 +168,13 @@ fn bf16_prefill_and_decode_graphs_plan_on_wgpu_and_rocm() {
         for backend in backends() {
             // The raw graph is rejected for exactly the BF16 `MatMul`s (mixed F32 x BF16 -> F32 with no
             // lowering): the fold into a `DenseContraction` has not run, and a BF16 `[K, N]` decode
-            // projection has none. Every rejection must be a BF16 consumer, and no BF16 `MatMul` may be
-            // missing from the rejected set.
+            // projection has none. On SPIR-V the widening of a computed BF16 value is refused too. Every
+            // rejection must be a BF16 consumer, and no BF16 `MatMul` may be missing from the rejected set.
             let expected_rejected: BTreeSet<usize> = g
                 .eqns()
                 .iter()
                 .enumerate()
-                .filter(|(_, eqn)| bf16_matmul(g, eqn))
+                .filter(|(_, eqn)| bf16_matmul(g, eqn) || bf16_widen_without_lane(g, eqn, backend))
                 .map(|(i, _)| i)
                 .collect();
             let rejected: BTreeSet<usize> = plan_failures(g, backend)

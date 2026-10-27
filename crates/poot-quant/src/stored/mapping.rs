@@ -22,6 +22,10 @@
 //!    refills) are not followed by a check, so a modification racing one is not detected. Replacing a
 //!    checkpoint by rename never modifies a mapped inode and is always safe.
 //!
+//! 5. [`MappedFile::release`] is the one `madvise(MADV_DONTNEED)`: it only ever names whole pages of a
+//!    clean private file mapping, which drops them from this process and changes no byte a slice reads
+//!    (invariant 1), so it is sound while slices into the range are live.
+//!
 //! `MappedFile` is `Send + Sync` through the auto traits (`memmap2::Mmap` and `File` are); there is no
 //! `unsafe impl`.
 
@@ -29,7 +33,7 @@ use std::fs::{File, Metadata};
 use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
 
-use memmap2::{Advice, Mmap, MmapOptions};
+use memmap2::{Advice, Mmap, MmapOptions, UncheckedAdvice};
 
 use super::{Access, FileIdentity, MapError, SourceChanged};
 
@@ -123,13 +127,34 @@ impl MappedFile {
         }
     }
 
-    /// A paging hint over `range` of the mapping. Advisory: a refusal is ignored. Never `DONTNEED`.
+    /// A paging hint over `range` of the mapping. Advisory: a refusal is ignored.
     pub(super) fn advise(&self, range: Range<usize>, access: Access) {
         let advice = match access {
             Access::Sequential => Advice::Sequential,
             Access::WillNeed => Advice::WillNeed,
+            Access::Release => return self.release(range),
         };
         let start = range.start / MAX_PAGE * MAX_PAGE;
         let _ = self.map.advise_range(advice, start, range.end - start);
+    }
+
+    /// Drop this process's page-table entries for the pages wholly inside `range`. The edges round
+    /// inward (to [`MAX_PAGE`]), never outward: the neighbouring tensors sharing an edge page have not
+    /// been consumed yet. Advisory: a refusal is ignored.
+    fn release(&self, range: Range<usize>) {
+        let start = range.start.next_multiple_of(MAX_PAGE);
+        let end = range.end / MAX_PAGE * MAX_PAGE;
+        if start >= end {
+            return;
+        }
+        // SAFETY: invariant 1 of the module docs: the mapping is `PROT_READ` and `MAP_PRIVATE` over a
+        // regular file and this process never wrote a page of it, so every page is clean and file-backed.
+        // `MADV_DONTNEED` on such a page only unmaps it from this process (the page cache keeps it), and
+        // the next access to the range faults the file's bytes in again, so no `&[u8]` into the mapping
+        // changes meaning. The range is inside the mapping: `range` is a checked view range (invariant 3).
+        let _ = unsafe {
+            self.map
+                .unchecked_advise_range(UncheckedAdvice::DontNeed, start, end - start)
+        };
     }
 }

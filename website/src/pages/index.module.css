@@ -28,6 +28,14 @@
   color: #fff7f5;
 }
 
+/* The README's tagline, set as a quiet line between the name and the description. */
+.heroQuote {
+  margin: -0.25rem 0 1rem;
+  font-style: italic;
+  letter-spacing: 0.02em;
+  color: var(--poot-coral);
+}
+
 .heroBanner :global(.hero__subtitle) {
   color: #b9aab5;
   max-width: 44rem;
@@ -48,10 +56,7 @@
   }
 }
 
-.buttons {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 1rem;
-  flex-wrap: wrap;
+
+.heroBackends {
+  margin: 0 0 1.5rem;
 }

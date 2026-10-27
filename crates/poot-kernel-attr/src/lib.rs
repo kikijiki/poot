@@ -27,41 +27,138 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-#[cfg(any(test, feature = "device-pass"))]
-use syn::Ident;
+use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
 #[cfg(any(test, not(feature = "device-pass")))]
-use syn::{FnArg, Pat, Type};
-use syn::{ItemFn, parse_macro_input};
+use syn::{FnArg, Pat};
+use syn::{Ident, ItemFn, LitInt, Token, Type, parse_macro_input};
+
+/// What `#[kernel(...)]` declares of the launch, so `pootc` reads a declaration instead of inferring one:
+///
+/// - `workgroup(x)`, `workgroup(x, y)` or `workgroup(x, y, z)`: the workgroup shape in lanes (the missing axes
+///   are 1);
+/// - `lds(T, len)`, once per workgroup-local array, in array-id order: `len` elements of `T` (`f32`, `u32` or
+///   `i32`).
+///
+/// A kernel that reads a lane or workgroup index, calls the barrier or touches an LDS array must declare its
+/// workgroup shape.
+#[derive(Default)]
+struct LaunchDecl {
+    workgroup: Option<[usize; 3]>,
+    lds: Vec<(Type, usize)>,
+}
+
+impl Parse for LaunchDecl {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut decl = LaunchDecl::default();
+        let items = Punctuated::<LaunchItem, Token![,]>::parse_terminated(input)?;
+        for item in items {
+            match item {
+                LaunchItem::Workgroup(shape, span) => {
+                    if decl.workgroup.replace(shape).is_some() {
+                        return Err(syn::Error::new(span, "`workgroup(..)` is declared twice"));
+                    }
+                }
+                LaunchItem::Lds(element, len) => decl.lds.push((*element, len)),
+            }
+        }
+        Ok(decl)
+    }
+}
+
+enum LaunchItem {
+    Workgroup([usize; 3], proc_macro2::Span),
+    Lds(Box<Type>, usize),
+}
+
+impl Parse for LaunchItem {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let name: Ident = input.parse()?;
+        let args;
+        syn::parenthesized!(args in input);
+        match name.to_string().as_str() {
+            "workgroup" => {
+                let extents = Punctuated::<LitInt, Token![,]>::parse_terminated(&args)?;
+                if extents.is_empty() || extents.len() > 3 {
+                    return Err(syn::Error::new(
+                        name.span(),
+                        "`workgroup(..)` takes 1 to 3 lane counts",
+                    ));
+                }
+                let mut shape = [1usize; 3];
+                for (axis, extent) in extents.iter().enumerate() {
+                    shape[axis] = extent.base10_parse()?;
+                    if shape[axis] == 0 {
+                        return Err(syn::Error::new(
+                            extent.span(),
+                            "a workgroup extent is at least 1",
+                        ));
+                    }
+                }
+                Ok(LaunchItem::Workgroup(shape, name.span()))
+            }
+            "lds" => {
+                let element: Type = args.parse()?;
+                args.parse::<Token![,]>()?;
+                let len: LitInt = args.parse()?;
+                Ok(LaunchItem::Lds(Box::new(element), len.base10_parse()?))
+            }
+            _ => Err(syn::Error::new(
+                name.span(),
+                "unknown #[kernel(..)] argument: expected `workgroup(..)` or `lds(T, len)`",
+            )),
+        }
+    }
+}
 
 /// Marks a function as a poot kernel. Device pass: renames it into the reserved kernel namespace and makes it
 /// `pub` so `pootc` finds it in MIR (see the crate doc).
 #[cfg(feature = "device-pass")]
 #[proc_macro_attribute]
-pub fn kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let decl = parse_macro_input!(attr as LaunchDecl);
     let func = parse_macro_input!(item as ItemFn);
-    device_fn(func).into()
+    device_fn(func, &decl).into()
 }
 
 /// Marks a function as a poot kernel. Host pass: replaces it with a typed launch wrapper of the same name
 /// that dispatches the kernel `pootc` compiled (see the crate doc).
 #[cfg(not(feature = "device-pass"))]
 #[proc_macro_attribute]
-pub fn kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // The host launches the `Body` the device pass compiled, which carries the declared shape: the declaration is
+    // parsed here to reject a malformed one, and read by `pootc`.
+    parse_macro_input!(attr as LaunchDecl);
     let func = parse_macro_input!(item as ItemFn);
     host_wrapper(&func)
         .unwrap_or_else(|e| e.to_compile_error())
         .into()
 }
 
-/// Device pass: rename to the reserved namespace + make `pub` so the kernel survives to MIR for pootc.
+/// Device pass: rename to the reserved namespace + make `pub` so the kernel survives to MIR for pootc, and
+/// record the declared launch as `poot_kernel_intrinsics::declare_*` calls at the head of the body: `pootc`
+/// reads their constants and drops the calls, so the declaration is data in the MIR, resolved by the callee's
+/// DefId like every other intrinsic.
 /// Compiled outside `--features device-pass` too, under `cfg(test)`: SC-002's
 /// `device_fn_expansion_is_deterministic` calls it directly to prove it takes no environment input,
 /// without needing a second build of this crate.
 #[cfg(any(test, feature = "device-pass"))]
-fn device_fn(mut func: ItemFn) -> TokenStream2 {
+fn device_fn(mut func: ItemFn, decl: &LaunchDecl) -> TokenStream2 {
     let mangled = poot_kernel_ir::naming::mangle(&func.sig.ident.to_string());
     func.sig.ident = Ident::new(&mangled, func.sig.ident.span());
     func.vis = syn::parse_quote!(pub);
+    let mut declarations: Vec<syn::Stmt> = Vec::new();
+    if let Some([x, y, z]) = decl.workgroup {
+        declarations.push(syn::parse_quote! {
+            ::poot_kernel_intrinsics::declare_workgroup(#x, #y, #z);
+        });
+    }
+    for (element, len) in &decl.lds {
+        declarations.push(syn::parse_quote! {
+            ::poot_kernel_intrinsics::declare_lds::<#element>(#len);
+        });
+    }
+    func.block.stmts.splice(0..0, declarations);
     quote!(#func)
 }
 
@@ -208,9 +305,60 @@ mod card537_no_env_input_tests {
     /// is what makes the split-by-feature design in this module's doc comment sound.
     #[test]
     fn device_fn_expansion_is_deterministic() {
-        let a = device_fn(add_fn());
-        let b = device_fn(add_fn());
+        let a = device_fn(add_fn(), &LaunchDecl::default());
+        let b = device_fn(add_fn(), &LaunchDecl::default());
         assert_eq!(a.to_string(), b.to_string());
         assert!(a.to_string().contains("__poot_kernel_add"));
+    }
+
+    /// The declared launch is recorded as intrinsic calls at the head of the body, in declaration order: the
+    /// workgroup shape first, then each LDS array. A kernel with no arguments gets none.
+    ///
+    /// Mutation: emit the `declare_lds` calls before `declare_workgroup`, or drop the `splice`; the expansion
+    /// below no longer starts with the workgroup declaration, or has no declarations at all.
+    #[test]
+    fn device_fn_records_the_declared_launch_in_order() {
+        let decl: LaunchDecl = syn::parse_quote!(workgroup(128, 2), lds(f32, 256), lds(u32, 64));
+        let expanded = device_fn(add_fn(), &decl).to_string();
+        let workgroup = expanded
+            .find("declare_workgroup (128usize , 2usize , 1usize)")
+            .expect("the workgroup declaration");
+        let first = expanded
+            .find("declare_lds :: < f32 > (256usize)")
+            .expect("the first array");
+        let second = expanded
+            .find("declare_lds :: < u32 > (64usize)")
+            .expect("the second array");
+        let body = expanded.find("c [0] = a [0] + b [0]").expect("the body");
+        assert!(
+            workgroup < first && first < second && second < body,
+            "{expanded}"
+        );
+        let bare = device_fn(add_fn(), &LaunchDecl::default()).to_string();
+        assert!(!bare.contains("declare_"), "{bare}");
+    }
+
+    /// A malformed declaration is a compile error naming the problem, not a silently ignored argument.
+    #[test]
+    fn a_malformed_launch_declaration_is_refused() {
+        let parse = |tokens: TokenStream2| {
+            syn::parse2::<LaunchDecl>(tokens)
+                .err()
+                .map(|e| e.to_string())
+        };
+        assert!(parse(quote!(workgroup(0))).unwrap().contains("at least 1"));
+        assert!(
+            parse(quote!(workgroup(1, 2, 3, 4)))
+                .unwrap()
+                .contains("1 to 3")
+        );
+        assert!(
+            parse(quote!(workgroup(64), workgroup(32)))
+                .unwrap()
+                .contains("twice")
+        );
+        assert!(parse(quote!(shared(64))).unwrap().contains("unknown"));
+        assert!(parse(quote!(lds(f32))).is_some());
+        assert!(parse(quote!(workgroup(64), lds(f32, 64))).is_none());
     }
 }

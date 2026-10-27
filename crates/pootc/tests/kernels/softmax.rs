@@ -2,10 +2,10 @@
 //! normalize by the sum. Exercises `x.max(y)`, `.exp()`, a `1..D` exclusive range, two reductions, and
 //! division.
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 const D: usize = 4;
 pub fn __poot_kernel_softmax(x: &[f32], out: &mut [f32]) {
-    let r = thread_index();
+    let r = thread_index_x();
     if r * D < out.len() {
         let mut m = x[r * D];
         for j in 1..D {

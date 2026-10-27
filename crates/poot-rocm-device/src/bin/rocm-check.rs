@@ -253,7 +253,7 @@ fn run_pcie_publication_receipt() -> Result<(), CheckError> {
         Ok(ctx) => ctx,
         Err(error) if pcie_receipt_may_skip(&error, |name| std::env::var(name).ok()) => {
             println!(
-                "SKIP: --pcie-publication-receipt requires a discrete PCIe GPU \
+                "POOT-SKIP: --pcie-publication-receipt requires a discrete PCIe GPU \
                  (local agent reports APU / unified memory)"
             );
             return Ok(());

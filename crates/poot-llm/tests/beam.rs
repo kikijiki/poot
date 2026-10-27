@@ -30,8 +30,8 @@ use poot_llm::{GenerationControl, Sampler};
 use poot_models::components::standard::Step;
 use poot_models::io::{ModelSchema, ProgramId, ProgramSpec, StateSpec};
 use poot_models::model::{
-    FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, StepShape, StepSpec,
-    TraceError,
+    FamilyKey, KvDtype, LogitRows, Model, ModelConfig, ModelError, ModelOutput, StepShape,
+    StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -166,6 +166,7 @@ fn build_recurrent(_: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, Mod
             bos: None,
             prompt_bos: None,
             prefill_granule: NonZeroUsize::MIN,
+            kv_dtype: None,
             chat: ChatFormat::ChatML,
             tool_codec: Some(Arc::new(HermesToolCodec)),
         },
@@ -327,7 +328,9 @@ impl Oracle {
     /// The logits after the last of `tokens`, from one fresh prefill of the whole list at position 0.
     fn last_logits(&self, tokens: &[u32]) -> Vec<f32> {
         let n = tokens.len();
-        let shape = StepShape::new(NonZeroUsize::MIN, nz(n), nz(CAPACITY));
+        // The KV dtype the beam's driver resolves: the reference evaluates the cache the device stores.
+        let kv = KvDtype::resolve(None, self.model.config().kv_dtype);
+        let shape = StepShape::new(NonZeroUsize::MIN, nz(n), nz(CAPACITY)).with_kv_dtype(kv);
         let graph = self
             .model
             .trace(
@@ -337,7 +340,9 @@ impl Oracle {
             .unwrap();
         let state: Vec<HostTensor> = graph
             .state()
-            .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+            .map(|(input, _)| {
+                HostTensor::zeros_of(graph.aval(input).dtype, graph.aval(input).shape.clone())
+            })
             .collect();
         let slots = [
             (
@@ -517,6 +522,7 @@ fn differs(a: &Reference, b: &Reference) -> bool {
 fn options() -> DriverOptions {
     let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(CAPACITY),
@@ -1057,7 +1063,7 @@ impl Device for FakeDevice {
     fn load_kernel(
         &mut self,
         _key: &str,
-        _kernel: poot_runtime_common::CompiledKernel,
+        _kernel: poot_codegen::CompiledKernel,
     ) -> Result<(), FakeError> {
         Ok(())
     }

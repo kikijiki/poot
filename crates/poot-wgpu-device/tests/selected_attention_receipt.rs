@@ -9,7 +9,9 @@
 use std::num::NonZeroUsize;
 
 use poot_executor::{Device, Engine};
-use poot_executor_parity::selected_attention::{print_attention_receipt, print_top_k_receipt};
+use poot_executor_parity::selected_attention::{
+    print_attention_receipt, print_prefill_receipt, print_top_k_receipt,
+};
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
 use poot_wgpu_device::device::WgpuDevice;
@@ -34,5 +36,8 @@ fn block_top_k_and_selected_attention_device_times() {
     // row is timed at 32K only; the selected attention is timed at both depths.
     lines += print_attention_receipt(&mut engine, target, "wgpu", 32_768, true);
     lines += print_attention_receipt(&mut engine, target, "wgpu", 131_072, false);
-    assert_eq!(lines, 6);
+    // POOT-1338: the chunk of a long prompt, at the 8K of the benchmark and at 32K, where it is flat.
+    lines += print_prefill_receipt(&mut engine, target, "wgpu", 8_192);
+    lines += print_prefill_receipt(&mut engine, target, "wgpu", 32_768);
+    assert_eq!(lines, 8);
 }

@@ -2,10 +2,10 @@
 //! out[r,j] = x[r,j] * rsqrt(mean_j(x[r,j]^2) + eps) * w[j]. Exercises a sum-of-squares reduction
 //! (`for j in 0..D`), the `D as f32` cast, `.sqrt()`, division, and the broadcast weight.
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 const D: usize = 4;
 pub fn __poot_kernel_rmsnorm(x: &[f32], w: &[f32], out: &mut [f32]) {
-    let r = thread_index();
+    let r = thread_index_x();
     if r * D < out.len() {
         let mut ss = 0.0f32;
         for j in 0..D {

@@ -12,7 +12,7 @@ use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Arg, Device, Dispatch, Engine, Executor, ExecutorStats, NoSync, StepInputs};
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType};
-use poot_graph_plan::ImportedKernel;
+use poot_graph_plan::ProbeKernel;
 use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
 use poot_kernel_ir::Body;
 use poot_models::model::{LogitRows, StepSpec};
@@ -334,7 +334,9 @@ fn oracle_decode_step(
             poot_graph_ir::Storage::State => Value::from(
                 state
                     .entry(meta.name().unwrap().into_owned())
-                    .or_insert_with(|| HostTensor::zeros(meta.aval.shape.clone()))
+                    .or_insert_with(|| {
+                        HostTensor::zeros_of(meta.aval.dtype, meta.aval.shape.clone())
+                    })
                     .clone(),
             ),
             poot_graph_ir::Storage::Slot(slot) => {
@@ -713,7 +715,7 @@ fn a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poi
     // not a fake/forged state): the production path proves the timeout for real, on real hardware,
     // through `RocmDevice`'s own `Device` methods - never a private `RocmContext`/queue internal.
     let codegen_target = poot_codegen::Target::AmdGcn(arch);
-    let body: Body = ImportedKernel::SpinBusy.body().clone();
+    let body: Body = ProbeKernel::SpinBusy.body().clone();
     let artifact = poot_codegen::KernelCache::open(codegen_target)
         .load_or_compile(
             &body,

@@ -6,63 +6,63 @@
       "repeats": [
         {
           "metrics": {
-            "step_us": 344.651
+            "step_us": 347.77000000000004
           },
           "slot": 0,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 344.421
+            "step_us": 312.024
           },
           "slot": 1,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 335.444
+            "step_us": 307.465
           },
           "slot": 2,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 343.408
+            "step_us": 340.898
           },
           "slot": 3,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 372.633
+            "step_us": 305.50199999999995
           },
           "slot": 4,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 354.359
+            "step_us": 336.72999999999996
           },
           "slot": 5,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 329.983
+            "step_us": 360.074
           },
           "slot": 6,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 337.889
+            "step_us": 314.048
           },
           "slot": 7,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 344.791
+            "step_us": 314.098
           },
           "slot": 8,
           "status": "ok"
@@ -82,8 +82,8 @@
       "role": "Activation"
     },
     {
-      "live_bytes": 320,
-      "peak_bytes": 8512,
+      "live_bytes": 256,
+      "peak_bytes": 8448,
       "role": "Staging"
     }
   ],
@@ -99,13 +99,13 @@
     "weight_copies": 16
   },
   "plan": [
-    "imported:gemvcoalesced [9658977a440a58c13c42b34a9b8a66d10e6cb650c19ee7e6b7bd9fada65b4886]"
+    "contraction:gemv_chunk [64a4c7125837b78ff0acd7b07ff8ffd143b17eb8da765a1854b81e2d9308acf6]"
   ],
-  "plan_id": "4183a501f28a7e312a26e4d7c32080f904cbafb6cc08ce410124341195fb4c1e",
+  "plan_id": "26c2baef4d2f7c94e5e831cf3907bd2f4f89d2e830eee45a808426b02050ead9",
   "recordings": 16,
   "reference": {
     "agrees": true,
-    "max_relative_error": 1.699360279256305e-05,
+    "max_relative_error": 3.879108803846385e-06,
     "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
     "provenance": "independent-golden",
     "tolerance": 0.002
@@ -118,7 +118,7 @@
     "run",
     "--release",
     "-p",
-    "poot-gpu",
+    "poot-wgpu-device",
     "--example",
     "performance_bank",
     "--",
@@ -129,8 +129,8 @@
     "--out",
     "benchmarks/performance-bank/receipts/wgpu/dense-decode-gemv.json"
   ],
-  "parent_revision": "e178f51722183668cf2f554e21b0dca17d3b0caf",
-  "binary_sha256": "ac158d08f5360e51d7a612b83aca1e868a126f6da5fb7058acff3b679a8d76dc",
+  "parent_revision": "21da98dafbdbc5887ce2943f1e7609381412b01c",
+  "binary_sha256": "59fb25d4b5612f6e7fff1a8733ea1d5fe6fd175eb42fe4ece8f827d434b78935",
   "identity": {
     "checkpoint_digest": "synthetic-no-checkpoint",
     "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
@@ -163,7 +163,7 @@
     },
     "backend": "wgpu",
     "device": "AMD Radeon 8060S Graphics",
-    "driver": "host kernel 7.2.9"
+    "driver": "host kernel 7.3.0"
   },
   "identity_digest": "ddf91990536c590e6c03a698de2f57569f07b1e6cb7ef9307e494694d835d35f",
   "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"

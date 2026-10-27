@@ -50,7 +50,7 @@ export default function FlashAttentionDiagram(): React.ReactElement {
         Streaming attention: one workgroup per query row, streaming over K/V chunks
       </div>
 
-      <svg width={SVG_W} height={SVG_H} viewBox={`0 0 ${SVG_W} ${SVG_H}`}
+      <svg role="img" aria-label="Flash attention streaming over K/V chunks with a running max, denominator and accumulator" width={SVG_W} height={SVG_H} viewBox={`0 0 ${SVG_W} ${SVG_H}`}
         style={{ display: 'block', margin: '0 auto', maxWidth: '100%', overflow: 'visible' }}>
 
         {/* Column headers */}

@@ -6,63 +6,63 @@
       "repeats": [
         {
           "metrics": {
-            "step_us": 1570.692
+            "step_us": 313.336
           },
           "slot": 0,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 1624.723
+            "step_us": 321.351
           },
           "slot": 1,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2627.0719999999997
+            "step_us": 316.873
           },
           "slot": 2,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 1659.8590000000002
+            "step_us": 307.456
           },
           "slot": 3,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2760.943
+            "step_us": 311.64300000000003
           },
           "slot": 4,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 1561.094
+            "step_us": 318.987
           },
           "slot": 5,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 1632.458
+            "step_us": 312.235
           },
           "slot": 6,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 1658.277
+            "step_us": 321.62199999999996
           },
           "slot": 7,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2668.419
+            "step_us": 312.29400000000004
           },
           "slot": 8,
           "status": "ok"
@@ -99,9 +99,9 @@
     "weight_copies": 1
   },
   "plan": [
-    "scan [ee315cc47208da1e47d520f7fb9ffc10a79cfb81e95f12f7bb29c1cd899d1700]"
+    "scan [85e6fdb25d2dacb8fe393d4f2cf7cbde6607632079aa04d3cfaab80641f2867b]"
   ],
-  "plan_id": "23834ee13aba0ece84d2ec1484c8252df76fd9346fe0f734580ece095134f850",
+  "plan_id": "7dd1b1f31c9dcc1c585db8e4aaef51714b32d80f1e38f4ed35b5fb658ca46958",
   "recordings": 1,
   "reference": {
     "agrees": true,
@@ -118,7 +118,7 @@
     "run",
     "--release",
     "-p",
-    "poot-rocm-gpu",
+    "poot-rocm-device",
     "--example",
     "performance_bank",
     "--",
@@ -129,8 +129,8 @@
     "--out",
     "benchmarks/performance-bank/receipts/rocm/recurrence-scan-short.json"
   ],
-  "parent_revision": "6bef68f754b33c3259b4ed7aad536c0e2f623eee",
-  "binary_sha256": "8854cee8aba05467ec4af00d4ae95b9a7be8dd63ce5abf083ae00432555d176d",
+  "parent_revision": "21da98dafbdbc5887ce2943f1e7609381412b01c",
+  "binary_sha256": "fa7cc4a1a9eed9df3b6d92017c74dca3232fb97ed7f7a979028b73f4895caf65",
   "identity": {
     "checkpoint_digest": "synthetic-no-checkpoint",
     "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
@@ -163,7 +163,7 @@
     },
     "backend": "rocm",
     "device": "AMD Radeon 8060S Graphics",
-    "driver": "host kernel 7.2.9"
+    "driver": "host kernel 7.3.0"
   },
   "identity_digest": "9cfef4297fcd5d218e1724acabc3fccd810d46e55239b14fd5bc88277c4087a2",
   "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb"

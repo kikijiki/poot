@@ -80,6 +80,9 @@ pub struct ModelConfig {
     /// Semantic alignment of a prefill step: a prefill's token count is a multiple of it (1 except
     /// for compressed attention). It never limits how large a step may be.
     pub prefill_granule: NonZeroUsize,
+    /// The KV cache dtype this model prefers, when it has one (a model whose keys or values overflow f16,
+    /// say); `None` takes [`KvDtype::DEFAULT`]. An explicit user choice overrides it ([`KvDtype::resolve`]).
+    pub kv_dtype: Option<KvDtype>,
     /// The fallback chat format, used only when the checkpoint ships no jinja `chat_template` (the
     /// template itself is tokenizer data, not model config).
     pub chat: ChatFormat,
@@ -108,6 +111,77 @@ pub enum KvLayout {
         /// Sequences the recurrent state pool serves: one state row each.
         seqs: NonZeroUsize,
     },
+}
+
+/// The dtype a step's KV cache stores (POOT-1395). Storage only: attention widens each key and value to f32
+/// in registers and computes in f32, as a narrow weight is read. `F32` is the exact reference; the two-byte
+/// dtypes halve the cache's bytes and its per-token read and write.
+///
+/// The dtype a driver runs is [`KvDtype::resolve`]d from an explicit user choice, then the model's
+/// preference ([`ModelConfig::kv_dtype`]), then [`KvDtype::DEFAULT`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KvDtype {
+    /// IEEE binary16: 10 mantissa bits, finite range about +-65504.
+    F16,
+    /// bfloat16: 7 mantissa bits, the f32 exponent range.
+    Bf16,
+    /// IEEE binary32: what the cache held before narrow storage, the exact reference.
+    F32,
+}
+
+impl KvDtype {
+    /// The engine default when neither the user nor the model names one (owner decision 2026-10-25, as
+    /// llama.cpp).
+    pub const DEFAULT: KvDtype = KvDtype::F16;
+
+    /// Every accepted dtype, in the order a message lists them.
+    pub const ALL: [KvDtype; 3] = [KvDtype::F16, KvDtype::Bf16, KvDtype::F32];
+
+    /// The dtype a driver runs: the user's explicit choice, else the model's preference, else
+    /// [`Self::DEFAULT`].
+    pub fn resolve(user: Option<KvDtype>, model: Option<KvDtype>) -> KvDtype {
+        user.or(model).unwrap_or(Self::DEFAULT)
+    }
+
+    /// The graph dtype the cache state is declared in.
+    pub const fn dtype(self) -> poot_tensor::DType {
+        match self {
+            KvDtype::F16 => poot_tensor::DType::F16,
+            KvDtype::Bf16 => poot_tensor::DType::BF16,
+            KvDtype::F32 => poot_tensor::DType::F32,
+        }
+    }
+
+    /// The name a flag or config value spells it with.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            KvDtype::F16 => "f16",
+            KvDtype::Bf16 => "bf16",
+            KvDtype::F32 => "f32",
+        }
+    }
+}
+
+impl fmt::Display for KvDtype {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A KV dtype name that is not one of [`KvDtype::ALL`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("unknown KV cache dtype {0:?} (accepted: f16, bf16, f32)")]
+pub struct UnknownKvDtype(pub String);
+
+impl std::str::FromStr for KvDtype {
+    type Err = UnknownKvDtype;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|dtype| dtype.as_str() == name)
+            .ok_or_else(|| UnknownKvDtype(name.to_owned()))
+    }
 }
 
 /// Which positions of a step produce logits.
@@ -151,6 +225,8 @@ pub struct StepShape {
     pub capacity: NonZeroUsize,
     /// How the KV cache is laid out.
     pub kv: KvLayout,
+    /// The dtype the KV cache stores.
+    pub kv_dtype: KvDtype,
     /// Which positions produce logits.
     pub logits: LogitRows,
     /// The hidden-state carry the step also writes, when its caller asks for one.
@@ -163,14 +239,16 @@ pub struct StepShape {
 
 impl StepShape {
     /// A step of `rows` sequences of `tokens` new tokens against `capacity` cache positions, over a
-    /// contiguous cache, returning the last position's logits, carrying no hidden state and with no
-    /// row extent.
+    /// contiguous f32 cache (the exact reference), returning the last position's logits, carrying no hidden
+    /// state and with no row extent. A driver sets the dtype it resolved with [`Self::with_kv_dtype`], and an
+    /// oracle checking a driver traces that same dtype, so both evaluate the same narrowed state.
     pub const fn new(rows: NonZeroUsize, tokens: NonZeroUsize, capacity: NonZeroUsize) -> Self {
         Self {
             rows,
             tokens,
             capacity,
             kv: KvLayout::Contiguous,
+            kv_dtype: KvDtype::F32,
             logits: LogitRows::Last,
             hidden: None,
             row_extent: None,
@@ -187,6 +265,13 @@ impl StepShape {
     #[must_use]
     pub const fn with_kv(mut self, kv: KvLayout) -> Self {
         self.kv = kv;
+        self
+    }
+
+    /// This shape storing its KV cache as `kv_dtype`.
+    #[must_use]
+    pub const fn with_kv_dtype(mut self, kv_dtype: KvDtype) -> Self {
+        self.kv_dtype = kv_dtype;
         self
     }
 

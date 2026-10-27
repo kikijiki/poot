@@ -45,7 +45,7 @@ cu130 wheel. Container disk 200 GB.
 - **order** (cheap and decisive first): downloads, oracle fixture, vLLM, llama.cpp, poot curve + roofline + profile,
   poot-serve rows last.
 - **vLLM**: baked `vllm==0.22.1` venv, FP8 as stored, `--no-enable-prefix-caching`, mm profiling off, gpu-util 0.90.
-- **llama.cpp**: tag b9601 built on the pod for the pod's arch (the image's CUDA 13 toolkit), `unsloth/Qwen3.8-27B-GGUF`
+- **llama.cpp**: tag v0.4.1 built on the pod for the pod's arch (the image's CUDA 13 toolkit), `unsloth/Qwen3.8-27B-GGUF`
   `UD-Q4_K_XL` (Qwen/ publishes no GGUF); `llama-bench` pp at each ISL and tg128 at depth = ISL, `-fa 1 -b/-ub 2048`.
 - **peak memory**: nvidia-smi sampled every 0.5 s per phase (`phases.tsv`, MiB) - not engine-reported.
 - **oracle fixture**: the `qwen35_27b_fp8_receipt::ptx` row (CPU oracle + device, needs the large pod host RAM) ->
@@ -67,7 +67,7 @@ A failed phase is a recorded row, not an abort; `MAX_TOTAL_S` (4 h) stops new ph
   flags rows whose mean output is under 95 % of OSL.
 - poot runs the FP8 checkpoint (`--precision bf16` names the compute dtype); llama.cpp runs a 4.5-bit K-quant: not
   the same precision, never present as clean apples-to-apples.
-- llama.cpp b9601 / vLLM 0.22.1 support for this architecture is assumed from the image pins; if a server or bench
+- llama.cpp v0.4.1 / vLLM 0.22.1 support for this architecture is assumed from the image pins; if a server or bench
   refuses, the failure is the recorded result (`logs/*.err`).
 
 ## Dry run (done, no GPU/pod/network)

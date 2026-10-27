@@ -41,8 +41,10 @@ use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
 use poot_wgpu_device::device::WgpuDevice;
 
-/// Row count of the probe: 131072 rows x 256 B = 32 MiB read per step.
-const ROWS: usize = 131072;
+/// Row count of the probe: 98304 rows x 256 B = 24 MiB read per step. The widest stride (12288 B) makes the
+/// activation slot 1.2 GB, which stays under the device's declared single-buffer limit (the executor refuses
+/// an allocation past it, POOT-1317); 131072 rows made that slot 1.6 GB.
+const ROWS: usize = 98304;
 /// The strides: the one-channel stride and its control (twice the stride, the same alias factor), then 2, 4
 /// and 8 channels, then the unaliased stride.
 const STRIDES: [usize; 6] = [4096, 8192, 10240, 5120, 10752, 10496];

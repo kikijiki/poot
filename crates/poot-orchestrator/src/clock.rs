@@ -4,6 +4,30 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Time as provisioning sees it: how long it has been going, and a sleep. Production is [`SystemClock`]; tests
+/// advance a fake one instead of waiting.
+pub(crate) trait Clock {
+    fn elapsed(&self) -> std::time::Duration;
+    fn sleep(&self, d: std::time::Duration);
+}
+
+pub(crate) struct SystemClock(std::time::Instant);
+
+impl SystemClock {
+    pub(crate) fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+
+impl Clock for SystemClock {
+    fn elapsed(&self) -> std::time::Duration {
+        self.0.elapsed()
+    }
+    fn sleep(&self, d: std::time::Duration) {
+        std::thread::sleep(d);
+    }
+}
+
 static EXEC_RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn now_iso() -> String {
@@ -14,13 +38,14 @@ pub(crate) fn now_iso() -> String {
     iso_from_secs(secs)
 }
 
-/// UTC ISO `minutes` from now (the `--keep-warm` expiry). Same format as [`now_iso`], so they compare as strings.
-pub(crate) fn iso_in_minutes(minutes: u64) -> String {
+/// UTC ISO `minutes` from now, negative for the past (the `--keep-warm` expiry and the miss window). Same format as
+/// [`now_iso`], so they compare as strings.
+pub(crate) fn iso_in_minutes(minutes: i64) -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
-        + (minutes as i64) * 60;
+        + minutes * 60;
     iso_from_secs(secs)
 }
 
@@ -54,6 +79,44 @@ pub(crate) fn iso_from_secs(secs: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// Seconds since the epoch of an ISO timestamp in the format of [`iso_from_secs`] (the DB's `created_at`/`updated_at`).
+/// `None` for any other shape.
+pub(crate) fn secs_from_iso(iso: &str) -> Option<i64> {
+    let b = iso.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return None;
+    }
+    let num = |a: usize, z: usize| iso.get(a..z)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, s) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
+        return None;
+    }
+    // Howard Hinnant's days-from-civil, the inverse of the conversion in `iso_from_secs`.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + h * 3600 + mi * 60 + s)
+}
+
+/// The current time, seconds since the epoch.
+pub(crate) fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Local UTC offset in seconds, read once from `date +%z` (e.g. "+0900" -> 32400); 0 if `date` is

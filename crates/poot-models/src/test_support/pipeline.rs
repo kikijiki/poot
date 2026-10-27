@@ -17,6 +17,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::model::{LogitRows, StepSpec};
+use poot_codegen::CompiledKernel;
 use poot_executor::{
     Arg, Device, DeviceTime, Dispatch, EntryId, ExecutableId, Executor, NoSync, StepInputs,
     WeightUpload,
@@ -33,7 +34,7 @@ use poot_graph_plan::{
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
-use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot};
+use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
 use poot_target::BufferStorage;
 use poot_tensor::{DType, HostView};
 use poot_weights::WeightMap;

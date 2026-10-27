@@ -4,126 +4,68 @@ title: Backends
 sidebar_position: 6
 ---
 
+import BackendDiagram from "@site/src/components/architecture/BackendDiagram";
+
 # Backends
 
-poot has four GPU backends built from one kernel source: **wgpu** (Vulkan/SPIR-V, the
-portable default), **raw Vulkan** (the same SPIR-V through `ash`, with no wgpu), **ROCm** (AMD, raw HSA) and
-**PTX** (NVIDIA). The AMD XDNA2 and Intel NPU4 NPUs are experimental `Device`s (see [NPU Offload](./npu.mdx)).
-The CPU oracle is a test-side reference, not a backend.
+poot has four GPU backends built from one kernel source. The AMD XDNA2 and Intel NPU4 NPUs are experimental `Device`s (see [NPU Offload](./npu.mdx)). The CPU oracle is a test-side reference, not a backend.
 
-Everything from model definition through graph IR, fusion and planning is backend-neutral. Backends
-diverge late, in three places:
+<BackendDiagram />
 
-- **Kernel selection.** The planner picks a specialization per target from the caps its device reports, for
-  example tensor-core matmul: WMMA on PTX and on ROCm's RDNA path, and a SPIR-V cooperative matrix (f16
-  operands) on a Vulkan device that reports the 16x16x16 f16-in f32-out configuration. What a target cannot
-  run is a planner refusal, not an executor branch.
-- **Codegen target.** `poot-codegen` emits LLVM IR for `SpirvVulkan`, `Nvptx` or `AmdGcn(arch)`, choosing
-  address spaces, intrinsics, atomics and the AMD tensor-core family. `AieCore` codegen produces a typed,
-  linked artifact for a region of equations, one serialized core per equation (the ordinary kernel body with its thread grid turned into loops), which `poot-npu` loads and
-  runs on an XDNA2 NPU.
-- **Runtime dispatch.** wgpu re-encodes a cached command buffer; raw Vulkan resubmits recorded command
-  buffers; ROCm replays recorded HSA AQL packets; PTX replays CUDA graphs through
-  [cudarc](https://github.com/coreylowman/cudarc).
+| Backend | Codegen target | Compiler | Artifact | Runtime per token | `Device` |
+| --- | --- | --- | --- | --- | --- |
+| **wgpu** (portable default) | `SpirvVulkan` | `llc` | SPIR-V | Cached command buffer, re-encoded | `WgpuDevice` |
+| **Raw Vulkan** (SPIR-V through `ash`) | `SpirvVulkan` | `llc` | SPIR-V | Command buffers recorded once, replayed | `VulkanDevice` |
+| **ROCm** (AMD, raw HSA) | `AmdGcn(arch)` | `clang` (amdgcn-amd-amdhsa) | HSACO | HSA AQL packet replay | `RocmDevice` |
+| **PTX** (NVIDIA) | `Nvptx` | `llc` (nvptx64, sm_80) | PTX | CUDA graph replay through [cudarc](https://github.com/coreylowman/cudarc) | `PtxDevice` |
 
-All backends implement the backend-neutral executor contract (`poot-executor`: one generic
-`Engine<D>` over a thin `Device` trait): `poot-wgpu-device`'s `WgpuDevice`, `poot-rocm-device`'s `RocmDevice`,
-`poot-ptx-device`'s `PtxDevice` and `poot-vulkan-device`'s `VulkanDevice`. A dev-only table-driven parity crate (`poot-executor-parity`) runs
-the same fixture programs through the `Executor` on any `Device`. See [Execution](./execution) for
-the contract's shape.
+Everything from model definition through graph IR, fusion and planning is backend-neutral. Backends diverge late: the planner picks a kernel specialization from the caps the device reports (what a target cannot run is a planner refusal, not an executor branch), `poot-codegen` chooses address spaces, intrinsics and atomics per target, and the runtime dispatches differently.
+
+All four implement one executor contract: `poot-executor`'s generic `Engine<D>` over a thin `Device` trait, checked by the table-driven `poot-executor-parity` crate. See [Execution](./execution). `AieCore` codegen produces a linked artifact for an NPU region, loaded by `poot-npu`.
 
 ## wgpu (SPIR-V)
 
-Runs on any Vulkan-capable GPU, including integrated ones; needs no vendor SDK.
+Runs on any Vulkan-capable GPU, integrated ones included, with no vendor SDK. Verified on AMD Radeon (RADV) and Intel Arc iGPUs. Cached graph execution reuses pipelines and bind groups and re-encodes dispatches per token.
 
-```
-kernel IR -> poot-codegen (LLVM IR) -> llc (SPIR-V) -> wgpu::ShaderModule -> ComputePipeline
-```
-
-Cached graph execution reuses pipelines and bind groups, then re-encodes dispatches per token.
-Submission can be split, and sampling can add dispatches, temporary buffers and readback work.
-
-Constraints of the SPIR-V targets (wgpu and raw Vulkan): no grid-wide sync or cooperative kernels; SPIR-V
-needs structured control flow (a structurization pass runs before emit); private arrays with dynamic
-indices are banned (use workgroup LDS); no bf16 on most iGPUs, so compute is f32.
-
-Verified on AMD Radeon (RADV) and Intel Arc iGPUs.
+SPIR-V targets (wgpu and raw Vulkan) have no grid-wide sync or cooperative kernels, need structured control flow (a structurization pass runs before emit), ban private arrays with dynamic indices (use workgroup LDS), and have no bf16 on most iGPUs, so compute is f32.
 
 ## Raw Vulkan (SPIR-V)
 
-```
-kernel IR -> poot-codegen (LLVM IR) -> llc (SPIR-V) -> Vulkan shader module -> compute pipeline (ash)
-```
+`poot-vulkan-runtime` dispatches the same `.spv` as wgpu with the same binding ABI, so a kernel runs unmodified on either. `VulkanDevice` records a step once and resubmits it per token.
 
-`poot-vulkan-runtime` dispatches the same `.spv` as wgpu with the same binding ABI (storage buffers in
-descriptor set 0, then a length buffer), so a kernel runs unmodified on either. `VulkanDevice` records a
-step once as Vulkan command buffers and resubmits them verbatim per token, with a fence wait after each
-submission ([Execution](./execution)). The runtime owns the failure mechanics:
+- **Faults.** A failing kernel check sets a bit in the dispatch's error word, and `synchronize` raises it as a typed fault. SPIR-V has no trap, so the runtime requires `robustBufferAccess`.
+- **Timeouts.** Each fence wait is bounded (600 seconds by default). A timeout or a failed submission poisons the device and refuses every later operation.
+- **Serving** needs `VK_EXT_memory_budget`.
+- **Selection.** `--backend vulkan` asks for it; `--backend auto` never picks it, since it is the same hardware as wgpu's adapter ([Picking a backend](../serve/choosing-a-backend.md#supported-backends)).
+- **Not available:** collectives, multi-GPU, and device time (`--device-timing` reports `null`).
 
-- **Faults.** A failing kernel check sets a bit in the dispatch's error word; `synchronize` raises it as a
-  typed fault. SPIR-V has no trap, so the runtime requires `robustBufferAccess` and refuses to open a device
-  without it.
-- **Timeouts and lost submissions.** Each fence wait is bounded (600 seconds by default). A timed-out wait
-  or a failed submission poisons the device, which leaks what the pending work could reference and refuses
-  every later operation.
-- **Serving** requires `VK_EXT_memory_budget` to read live device memory.
-- **Not available:** collectives and multi-GPU execution.
-
-Verified on the AMD Strix Halo iGPU under RADV only; NVIDIA and Intel Vulkan drivers are untested. The
-[feature matrix](../reference/feature-matrix.md) lists what compiles for it.
+Verified on the AMD Strix Halo iGPU under RADV only.
 
 ## PTX (NVIDIA)
 
-```
-kernel IR -> poot-codegen (LLVM IR, NVVM intrinsics) -> llc (nvptx64, sm_80) -> PTX -> cudarc JIT
-```
+The decode dispatch sequence is captured once into a CUDA graph and replayed per token with one `cuGraphLaunch`. Kernel arguments point at stable slot buffers the host rewrites in place.
 
-The decode dispatch sequence is captured once into a CUDA graph and replayed per token with one
-`cuGraphLaunch`; kernel arguments point at stable slot buffers the host rewrites in place (see
-[Execution](./execution)). Tensor-core GEMMs use `llvm.nvvm.mma.*`.
-
-PTX can also drive several GPUs from one executor: a layer pipeline across devices, where each
-stage is captured into its own CUDA graph on its own device and the activations that cross a stage
-boundary are copied peer to peer, with replay creating nothing new. Only point-to-point pipeline
-transfers are supported; reductions and gathers are refused as unsupported. The coordinator lives in
-`poot-executor`, over the peer-copy and event operations `PtxDevice` provides. It is not used for
-serving.
+PTX can also drive several GPUs from one executor as a layer pipeline: each stage is its own CUDA graph on its own device, and activations crossing a stage boundary are copied peer to peer. Only point-to-point transfers are supported; reductions and gathers are refused. This is not used for serving.
 
 Verified on NVIDIA L40S through rented pods.
 
 ## ROCm (AMD)
 
-Talks to the GPU through raw HSA rather than HIP math libraries; poot supplies every kernel. The HSA library
-is loaded at run time, so ROCm is in every build and `--backend rocm` needs no build flag.
+ROCm talks to the GPU through raw HSA, not HIP math libraries; poot supplies every kernel. The HSA library is loaded at run time, so ROCm is in every build and `--backend rocm` needs no build flag.
 
-```
-kernel IR -> poot-codegen (LLVM IR) -> clang -target amdgcn-amd-amdhsa -> HSACO -> HSA queue
-```
+With no vendor graph API, poot records the dispatch sequence as AQL packets and resubmits them per token. Paged KV and flash attention are hardware-verified on AMD Radeon 8060S (gfx1151) and gfx1100.
 
-ROCm has no vendor graph API, so poot records the dispatch sequence as AQL packets and resubmits them
-per token. Paged KV and flash attention are hardware-verified. Generation picks the next token
-on-device for every request, on every backend: a sampling step is appended to the decode graph itself
-and the host reads back only the chosen token id (and a non-finite flag), plus the top-n alternatives
-when logprobs are asked for, not the full logits. Logit bias and repetition/presence/frequency penalties
-run in that step from a device-resident per-sequence token history, and a guided-decoding mask is built
-on the host while the forward pass runs and applied in the step. Full logits come back only on request.
+## Sampling and precision
 
-Verified on AMD Radeon 8060S (gfx1151) and gfx1100.
+On every backend the next token is picked on the device, in a step appended to the decode graph. The host reads back the token id, a non-finite flag and any logprobs; bias, penalties and the guided mask run in that step. See [Serving design](./serving-design.mdx#the-scheduling-loop).
 
-## Capability comparison
+What a backend can run is decided by planning: a graph runs when `compile` succeeds for that target, and a refusal names the op and the missing capability. [Supported models and formats](../develop/supported-models.md) is generated from those results.
 
-What a backend can run is decided by planning, not by a list kept here: a graph runs on a backend when
-`compile` succeeds for that target, and a refusal is a typed error naming the op and the capability the
-backend lacks. The [feature matrix](../reference/feature-matrix.md#models-and-weight-formats) is generated
-from those compile results for every model family and weight format on wgpu, raw Vulkan, ROCm and PTX, and joins the
-stored benchmark refusals. The per-backend differences that are not about support (graph capture, cooperative
-grids, tensor-core matmul, compute dtype) are in its
-[precision and execution model](../reference/feature-matrix.md#precision-and-execution-model) table.
+| | wgpu, raw Vulkan | ROCm | PTX |
+| --- | --- | --- | --- |
+| Compute dtype | f32 | f32, opt-in bf16 matmul | f32, opt-in bf16 matmul |
+| Matrix unit | Not used: every GEMM is the register-tiled body on the vector units | Not used | Not used |
 
-## Correctness across backends
+## Correctness
 
-Every backend is checked against the CPU oracle (`poot-eval`): per-backend executor tests dispatch
-kernels with identical inputs and compare to the oracle, and the `ptx-check` and `rocm-check`
-binaries of the PTX and ROCm device crates do the same on real hardware; the device lanes run them, and `ptx-check`
-fails when it finds no fixture to check (or, in the PTX lane, any missing one). `poot-vulkan-check` is a one-kernel smoke check of the raw Vulkan
-runtime. See [Execution](./execution#verification).
+Every backend is checked against the CPU oracle (`poot-eval`): executor tests dispatch kernels with identical inputs and compare. `ptx-check` and `rocm-check` do the same on real hardware, and fail when they find no fixture. `poot-vulkan-check` is a one-kernel smoke check of the raw Vulkan runtime. See [Execution](./execution#verification).

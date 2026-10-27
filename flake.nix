@@ -75,7 +75,7 @@
         '';
 
         # The IRON link driver `$POOT_AIE_IRON` names (scripts/poot-aie-link.py): pinned interpreter,
-        # PYTHONPATH and Peano, so the wrapper's bytes change with the toolchain (poot-codegen hashes them).
+        # PYTHONPATH and Peano, so the wrapper's bytes change with the toolchain (poot-npu hashes them).
         pootAieLink = pkgs.writeShellScriptBin "poot-aie-link" ''
           export PYTHONPATH=${mlirAie.passthru.pythonPath}
           export PEANO_INSTALL_DIR=${peano}

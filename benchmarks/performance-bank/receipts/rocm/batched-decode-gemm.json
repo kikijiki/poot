@@ -6,63 +6,63 @@
       "repeats": [
         {
           "metrics": {
-            "step_us": 2181.4429999999998
+            "step_us": 120.556
           },
           "slot": 0,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2191.8430000000003
+            "step_us": 119.944
           },
           "slot": 1,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2208.0530000000003
+            "step_us": 189.264
           },
           "slot": 2,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2196.04
+            "step_us": 119.994
           },
           "slot": 3,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2205.408
+            "step_us": 117.841
           },
           "slot": 4,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2202.623
+            "step_us": 117.951
           },
           "slot": 5,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2201.691
+            "step_us": 117.55
           },
           "slot": 6,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2198.264
+            "step_us": 120.586
           },
           "slot": 7,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2255.162
+            "step_us": 118.812
           },
           "slot": 8,
           "status": "ok"
@@ -82,8 +82,8 @@
       "role": "Activation"
     },
     {
-      "live_bytes": 768,
-      "peak_bytes": 768,
+      "live_bytes": 1344,
+      "peak_bytes": 1344,
       "role": "Meta"
     }
   ],
@@ -99,13 +99,13 @@
     "weight_copies": 16
   },
   "plan": [
-    "contraction:tiled_region [629ebd7665727bb42b4530055cf7ead5741200ce48b83223d89269107c33a02c]"
+    "contraction:dense_tiled [71b40eb39dd7ff31402e441d2196abd7a916e92ad62584c032a498f5736aa2f9]"
   ],
-  "plan_id": "81b8a4f6f6ee0e02d1240ba1f186e4ce996c56318e50ead554eceef0a3475171",
+  "plan_id": "758304dad6ca1c4fea0f81353e0d30558d1f8a95bad8f414a1119da15fb56550",
   "recordings": 16,
   "reference": {
     "agrees": true,
-    "max_relative_error": 3.450093914121139e-05,
+    "max_relative_error": 3.6710963312382336e-05,
     "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
     "provenance": "independent-golden",
     "tolerance": 0.002
@@ -118,7 +118,7 @@
     "run",
     "--release",
     "-p",
-    "poot-rocm-gpu",
+    "poot-rocm-device",
     "--example",
     "performance_bank",
     "--",
@@ -129,8 +129,8 @@
     "--out",
     "benchmarks/performance-bank/receipts/rocm/batched-decode-gemm.json"
   ],
-  "parent_revision": "e178f51722183668cf2f554e21b0dca17d3b0caf",
-  "binary_sha256": "7a8e978a9087ff303dd4f147cc5d1bb86a841f8b46790086293ff7e5c02f0928",
+  "parent_revision": "21da98dafbdbc5887ce2943f1e7609381412b01c",
+  "binary_sha256": "fa7cc4a1a9eed9df3b6d92017c74dca3232fb97ed7f7a979028b73f4895caf65",
   "identity": {
     "checkpoint_digest": "synthetic-no-checkpoint",
     "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
@@ -163,7 +163,7 @@
     },
     "backend": "rocm",
     "device": "AMD Radeon 8060S Graphics",
-    "driver": "host kernel 7.2.9"
+    "driver": "host kernel 7.3.0"
   },
   "identity_digest": "f3f5253f9609272ca971cc3f5f97383f79217d3c74c17be0284c97cc08ec5dd6",
   "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"

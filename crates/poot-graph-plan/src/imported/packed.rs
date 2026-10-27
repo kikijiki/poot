@@ -1,10 +1,9 @@
 //! Packed-reader imported kernels (card 044): the packed BF16/E4M3FN embedding row gathers (cards 381,
-//! 449 D1) - the dense BF16 contraction bodies
-//! live in [`crate::imported::contraction`] (card 380 shares that family's "read checkpoint bytes as
-//! packed u32 lanes" shape with the GEMV/GEMM bodies there). Authored in Rust
-//! (`pootc/kernels/packed/*.rs`).
+//! 449 D1) and the BF16 const widening cast, which read checkpoint bytes as packed `u32` lanes. Authored in
+//! Rust (`pootc/kernels/packed/*.rs`).
 
 kernel_assets! {
+    kind = ImportedKernel;
     family = body_packed;
 
     PackedBf16RowGather {

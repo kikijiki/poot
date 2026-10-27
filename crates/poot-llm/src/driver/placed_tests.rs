@@ -17,6 +17,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use poot_codegen::CompiledKernel;
 use poot_executor::{
     Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine, NativeCounters, SupportBound,
 };
@@ -38,9 +39,7 @@ use poot_models::model::{
 use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
-use poot_runtime_common::{
-    AllocGuard, BufferRole, CompiledKernel, MemoryCounterSnapshot, MemoryCounters,
-};
+use poot_runtime_common::{AllocGuard, BufferRole, MemoryCounterSnapshot, MemoryCounters};
 use poot_target::{Backend, BufferStorage, DeviceCaps};
 use poot_tensor::DType;
 use poot_text::{ChatFormat, HermesToolCodec};
@@ -200,6 +199,7 @@ fn build_mlp(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, Mod
             bos: None,
             prompt_bos: None,
             prefill_granule: NonZeroUsize::MIN,
+            kv_dtype: None,
             chat: ChatFormat::ChatML,
             tool_codec: Some(Arc::new(HermesToolCodec)),
         },
@@ -386,6 +386,7 @@ fn build_attn(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, Mo
             bos: None,
             prompt_bos: None,
             prefill_granule: NonZeroUsize::MIN,
+            kv_dtype: None,
             chat: ChatFormat::ChatML,
             tool_codec: Some(Arc::new(HermesToolCodec)),
         },
@@ -558,12 +559,38 @@ fn element_of(body: &Body, index: usize) -> Result<Ty, InterpFault> {
     }
 }
 
+/// The bytes one element of a kernel buffer of `elem` occupies: two for an f16 or bf16 buffer (a narrow KV
+/// cache), four for every other element this device binds.
+fn element_bytes(elem: &Ty) -> usize {
+    match elem {
+        Ty::F16 | Ty::BF16 => 2,
+        _ => 4,
+    }
+}
+
 fn execute(body: &Body, args: &[(Buf, usize)], workgroups: [u32; 3]) -> Result<(), InterpFault> {
     let mut buffers = Vec::with_capacity(args.len());
     for (index, (buf, elems)) in args.iter().enumerate() {
         let data = buf.data.borrow();
-        let (words, _) = data[..elems * 4].as_chunks::<4>();
-        let buffer = match element_of(body, index)? {
+        let elem = element_of(body, index)?;
+        let bytes = &data[..elems * element_bytes(&elem)];
+        let (words, _) = bytes.as_chunks::<4>();
+        let (halves, _) = bytes.as_chunks::<2>();
+        let buffer = match elem {
+            Ty::F16 => Buffer::from_halves(
+                Ty::F16,
+                &halves
+                    .iter()
+                    .map(|h| poot_quant::scalar::f16_to_f32(u16::from_le_bytes(*h)))
+                    .collect::<Vec<_>>(),
+            ),
+            Ty::BF16 => Buffer::from_halves(
+                Ty::BF16,
+                &halves
+                    .iter()
+                    .map(|h| poot_quant::scalar::bf16_to_f32(u16::from_le_bytes(*h)))
+                    .collect::<Vec<_>>(),
+            ),
             Ty::F32 => Buffer::from_f32s(
                 &words
                     .iter()
@@ -589,7 +616,20 @@ fn execute(body: &Body, args: &[(Buf, usize)], workgroups: [u32; 3]) -> Result<(
     run(body, workgroups, &mut buffers).map_err(|e| fault(format!("kernel {}: {e}", body.name)))?;
     for (index, ((buf, elems), buffer)) in args.iter().zip(&buffers).enumerate() {
         let mut data = buf.data.borrow_mut();
-        let bytes: Vec<u8> = match element_of(body, index)? {
+        let elem = element_of(body, index)?;
+        let bytes: Vec<u8> = match elem {
+            Ty::F16 => buffer
+                .to_halves()
+                .map_err(fault)?
+                .iter()
+                .flat_map(|&v| poot_quant::scalar::f32_to_f16(v).to_le_bytes())
+                .collect(),
+            Ty::BF16 => buffer
+                .to_halves()
+                .map_err(fault)?
+                .iter()
+                .flat_map(|&v| poot_quant::scalar::f32_to_bf16(v).to_le_bytes())
+                .collect(),
             Ty::F32 => buffer
                 .to_f32s()
                 .map_err(fault)?
@@ -609,7 +649,7 @@ fn execute(body: &Body, args: &[(Buf, usize)], workgroups: [u32; 3]) -> Result<(
                 .flat_map(|v| v.to_le_bytes())
                 .collect(),
         };
-        data[..elems * 4].copy_from_slice(&bytes);
+        data[..elems * element_bytes(&elem)].copy_from_slice(&bytes);
     }
     Ok(())
 }
@@ -672,8 +712,8 @@ impl Device for Interp {
         let args = d
             .inputs
             .iter()
-            .map(|arg| (Rc::clone(arg.buffer), arg.elems as usize))
-            .chain([(Rc::clone(d.output.buffer), d.output.elems as usize)])
+            .map(|arg| (Rc::clone(arg.buffer), arg.elems))
+            .chain([(Rc::clone(d.output.buffer), d.output.elems)])
             .collect();
         let poot_executor::LaunchKind::Grid { threads, workgroup } = d.launch else {
             panic!("the interpreter device runs thread grids only");
@@ -808,6 +848,7 @@ impl Collectives for Interp {
 fn options() -> DriverOptions {
     let compile = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(16),
@@ -1359,10 +1400,11 @@ fn paged_tokens(driver: Driver, max_new: usize) -> Vec<u32> {
 }
 
 /// Bytes of the paged KV pools one rank holds: K and V of one layer, `pool_slots` rows of `kv_heads`
-/// heads of `HEAD_DIM` f32 values, the heads divided over `world` ranks.
+/// heads of `HEAD_DIM` values in the default driver's KV dtype, the heads divided over `world` ranks.
 fn pool_bytes(world: usize) -> u64 {
     let slots = POOL_BLOCKS * super::block_table::BLOCK_SIZE;
-    (2 * slots * (HEADS / world) * HEAD_DIM * 4) as u64
+    let element = poot_models::model::KvDtype::DEFAULT.dtype().byte_size();
+    (2 * slots * (HEADS / world) * HEAD_DIM * element) as u64
 }
 
 /// A paged tensor-parallel decode over two executing devices equals the single-device driver's tokens:

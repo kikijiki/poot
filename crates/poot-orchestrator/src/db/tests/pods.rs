@@ -20,8 +20,12 @@ fn pick_idle_pod_matches_idle_image_with_ssh() {
 #[test]
 fn pods_table_lifecycle_roundtrips() {
     let db = Db::open(":memory:").unwrap();
-    db.create_pod_record("p1", "RTX 3090", "COMMUNITY", "img-a")
+    db.create_pod_record("p1", "RTX 3090", "COMMUNITY", Some(0.22), "img-a")
         .unwrap();
+    // the cloud and the hourly price RunPod reported are kept with the record.
+    let recorded = &db.live_pods().unwrap()[0];
+    assert_eq!(recorded.cloud, "COMMUNITY");
+    assert_eq!(recorded.cost_per_hr, Some(0.22));
     // provisioning, no endpoint -> not adoptable.
     assert!(pick_idle_pod(&db.live_pods().unwrap(), "img-a").is_none());
     db.set_pod_endpoint("p1", "1.2.3.4", 8700).unwrap();

@@ -437,6 +437,7 @@ pub fn build_standard<F: StandardFamily>(
         bos: p.bos,
         prompt_bos: p.prompt_bos,
         prefill_granule: NonZeroUsize::MIN,
+        kv_dtype: None,
         chat: p.chat,
         tool_codec: p.tool_codec.clone(),
     };

@@ -5,7 +5,7 @@
 use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_executor::{Device, Engine, Executor};
 use poot_graph_ir::Slot;
-use poot_graph_plan::test_support::gpu_caps;
+use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
 use poot_models::test_support::weight_map::{self as fixture, DIMS, Projections, Qwen2Dims, Step};
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
@@ -78,8 +78,13 @@ fn a_hosted_embed_gather_equals_the_device_gather() {
     let mut caps = gpu_caps(&target);
     caps.max_buffer_bytes = (HOSTED.vocab * HOSTED.hidden * 4 - 1) as u64;
     let hosted = |g| {
-        let g = poot_graph_plan::legalize(&g, &caps, &poot_graph_plan::CompileLimits::STANDARD)
-            .unwrap();
+        let g = poot_graph_plan::legalize(
+            &g,
+            gpu_backend(&target),
+            &caps,
+            &poot_graph_plan::CompileLimits::STANDARD,
+        )
+        .unwrap();
         assert!(
             g.slots()
                 .iter()

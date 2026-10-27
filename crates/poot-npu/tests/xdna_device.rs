@@ -228,7 +228,7 @@ fn the_declared_tile_memory_is_the_size_that_links_and_runs() {
     let Some(mut npu) = npu() else { return };
     let target = npu.engine.device().target();
     let reserved = (3 * FULL_TILE_ELEMENTS * 4 * 2) as u32;
-    let poot_graph_plan::Target::Aie { caps, .. } = target else {
+    let poot_graph_plan::Target::Npu(poot_graph_plan::NpuTarget::Aie { caps, .. }) = target else {
         panic!("the device's target is an AIE target");
     };
     assert_eq!(
@@ -254,7 +254,7 @@ fn the_declared_tile_memory_is_the_size_that_links_and_runs() {
     let reserved_over = 3 * (FULL_TILE_ELEMENTS + 1) * 4 * 2;
     assert_eq!(
         refusal.missing,
-        poot_graph_plan::Capability::AieLimit(poot_graph_plan::AieLimitRefusal::Exceeded {
+        poot_graph_plan::Capability::AieLimit(poot_npu_artifacts::AieLimitRefusal::Exceeded {
             resource: "link recipe tile-local bytes",
             needed: reserved_over as u64,
             available: u64::from(reserved),
@@ -367,9 +367,10 @@ fn every_buffer_is_released_when_the_executable_is_unloaded() {
             poot_executor_parity::fixture_weights(fixture),
         )
         .expect("the weights load");
+    let program = poot_executor_parity::staged_on(&npu.engine, fixture, target);
     let entry = npu
         .engine
-        .add_entry(exe, &poot_executor_parity::staged(fixture, target))
+        .add_entry(exe, &program)
         .expect("the entry compiles and loads");
     let mut inputs = StepInputs::new();
     for step in &fixture.steps[0] {
@@ -416,19 +417,21 @@ fn replaying_a_recording_over_reset_state_is_bit_identical() {
 /// A real linked elementwise add of `n` elements: the compiler's output for the ordinary sequential request,
 /// linked by the real Peano and IRON driver, wrapped by the ordinary handle.
 struct LinkedAdd {
-    kernel: poot_runtime_common::CompiledKernel,
+    kernel: poot_codegen::CompiledKernel,
     words: std::num::NonZeroU32,
 }
 
 fn linked_add(n: usize) -> LinkedAdd {
-    use poot_codegen::{
-        KernelCache, Target, Toolchain, aie_kernel_handle, compile_aie,
-        test_support::single_tile_recipe,
-    };
+    use poot_codegen::{KernelCache, Target, Toolchain};
     use poot_kernelgen::{
-        BodyLimits, ElementwiseSpec, Fold, KernelRequest, Layout, ValueBinary, ViewOperand,
+        BodyLimits, Fold, FusedInput, FusedKernel, FusedScalarOp, KernelRequest, Layout, LeafId,
+        LeafTy, PointwiseForm, PointwiseSpec, ViewOperand,
     };
-    use poot_runtime_common::{AieBinding, AieShapeAbi, ArgAccess};
+    use poot_npu::aie_kernel_handle;
+    use poot_npu::compile_aie;
+    use poot_npu::test_support::single_tile_recipe;
+    use poot_npu_artifacts::{AieBinding, AieShapeAbi};
+    use poot_target::ArgAccess;
     use poot_target::{AieTargetId, BufferStorage};
 
     let shape = vec![n];
@@ -436,15 +439,22 @@ fn linked_add(n: usize) -> LinkedAdd {
         shape: shape.clone(),
         layout: Layout::contiguous(&shape),
     };
-    let request = KernelRequest::Elementwise(ElementwiseSpec::Binary {
-        op: ValueBinary::Basic(poot_kernel_ir::BinOp::Add, poot_kernel_ir::Ty::F32),
+    let leaf = |index| FusedInput::Leaf(LeafId::new(index));
+    let request = KernelRequest::Pointwise(PointwiseSpec {
         out_shape: shape.clone(),
-        a: operand(),
-        b: operand(),
-        fold: Fold {
-            numel: n,
-            two_d: false,
-            width: 256,
+        numel: n,
+        leaves: vec![operand(), operand()],
+        kernel: FusedKernel::one_step(
+            FusedScalarOp::Binary(poot_kernel_ir::BinOp::Add),
+            vec![LeafTy::F32; 2],
+            vec![leaf(0), leaf(1)],
+        ),
+        form: PointwiseForm::Float {
+            fold: Fold {
+                numel: n,
+                two_d: false,
+                width: 256,
+            },
         },
     });
     let limits = BodyLimits {
@@ -498,8 +508,9 @@ fn f32_bytes(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
 /// recorded, runs, and the device fails or computes over the wrong length instead of returning `Bindings`.
 #[test]
 fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
-    use poot_executor::{AieInvocation, Arg, Dispatch, LaunchKind};
+    use poot_executor::{Arg, Dispatch, LaunchKind};
     use poot_npu::XdnaError;
+    use poot_npu_artifacts::AieInvocation;
     use poot_runtime_common::BufferRole;
     use poot_target::{AieTargetId, BufferStorage};
 
@@ -546,22 +557,22 @@ fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
         device.abort().unwrap();
         result
     };
-    let inputs = [arg(&a, N as u32), arg(&b, N as u32)];
+    let inputs = [arg(&a, N), arg(&b, N)];
 
     let grid = LaunchKind::Grid {
         threads: [N as u32, 1, 1],
         workgroup: [1, 1, 1],
     };
     assert!(matches!(
-        try_dispatch(&mut device, grid, &inputs, arg(&out, N as u32)),
+        try_dispatch(&mut device, grid, &inputs, arg(&out, N)),
         Err(XdnaError::GridLaunch { threads: [6, 1, 1] })
     ));
-    let graph = LaunchKind::VpuGraph(poot_executor::VpuInvocation::new(
+    let graph = LaunchKind::VpuGraph(poot_npu_artifacts::VpuInvocation::new(
         poot_target::VpuTargetId::Npu4,
         0,
     ));
     assert!(matches!(
-        try_dispatch(&mut device, graph, &inputs, arg(&out, N as u32)),
+        try_dispatch(&mut device, graph, &inputs, arg(&out, N)),
         Err(XdnaError::GraphLaunch)
     ));
     let other_stream = LaunchKind::Aie(AieInvocation::new(
@@ -569,15 +580,15 @@ fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
         std::num::NonZeroU32::new(linked.words.get() + 1).unwrap(),
     ));
     assert!(matches!(
-        try_dispatch(&mut device, other_stream, &inputs, arg(&out, N as u32)),
+        try_dispatch(&mut device, other_stream, &inputs, arg(&out, N)),
         Err(XdnaError::InvocationMismatch { .. })
     ));
     assert!(matches!(
-        try_dispatch(&mut device, aie, &inputs[..1], arg(&out, N as u32)),
+        try_dispatch(&mut device, aie, &inputs[..1], arg(&out, N)),
         Err(XdnaError::Bindings { .. })
     ));
     assert!(matches!(
-        try_dispatch(&mut device, aie, &inputs, arg(&out, (N - 1) as u32)),
+        try_dispatch(&mut device, aie, &inputs, arg(&out, N - 1)),
         Err(XdnaError::Bindings { .. })
     ));
 
@@ -587,7 +598,7 @@ fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
         .dispatch(Dispatch {
             kernel: &kernel,
             inputs: &inputs,
-            output: arg(&out, N as u32),
+            output: arg(&out, N),
             launch: aie,
             work: 0,
         })
@@ -654,7 +665,8 @@ fn a_byte_artifact_kernel_is_refused_at_load() {
 #[test]
 fn an_artifact_whose_last_binding_is_read_only_is_refused_at_load() {
     use poot_npu::XdnaError;
-    use poot_runtime_common::{AieBinding, AieLinkedArtifact, AieShapeAbi, ArgAccess};
+    use poot_npu_artifacts::{AieBinding, AieLinkedArtifact, AieShapeAbi};
+    use poot_target::ArgAccess;
     use poot_target::{AieTargetId, BufferStorage};
 
     let Some((_lock, mut device)) = device(XdnaConfig::default()) else {
@@ -677,7 +689,7 @@ fn an_artifact_whose_last_binding_is_read_only_is_refused_at_load() {
     )
     .unwrap();
     let error = device
-        .load_kernel("read_last", poot_codegen::aie_kernel_handle(artifact))
+        .load_kernel("read_last", poot_npu::aie_kernel_handle(artifact))
         .err()
         .expect("refused");
     assert!(
@@ -703,8 +715,9 @@ fn an_artifact_whose_last_binding_is_read_only_is_refused_at_load() {
 /// is attempted again instead of returning `Poisoned`.
 #[test]
 fn a_run_that_misses_its_deadline_poisons_the_device_and_keeps_its_buffers() {
-    use poot_executor::{AieInvocation, Arg, Dispatch, LaunchKind};
+    use poot_executor::{Arg, Dispatch, LaunchKind};
     use poot_npu::XdnaError;
+    use poot_npu_artifacts::AieInvocation;
     use poot_runtime_common::BufferRole;
     use poot_target::{AieTargetId, BufferStorage};
 
@@ -731,11 +744,11 @@ fn a_run_that_misses_its_deadline_poisons_the_device_and_keeps_its_buffers() {
     let inputs = [
         Arg {
             buffer: &a,
-            elems: N as u32,
+            elems: N,
         },
         Arg {
             buffer: &b,
-            elems: N as u32,
+            elems: N,
         },
     ];
     device.begin().unwrap();
@@ -745,7 +758,7 @@ fn a_run_that_misses_its_deadline_poisons_the_device_and_keeps_its_buffers() {
             inputs: &inputs,
             output: Arg {
                 buffer: &out,
-                elems: N as u32,
+                elems: N,
             },
             launch: LaunchKind::Aie(AieInvocation::new(AieTargetId::Xdna2, linked.words)),
             work: 0,

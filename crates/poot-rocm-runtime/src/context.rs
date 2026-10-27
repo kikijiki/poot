@@ -146,6 +146,10 @@ pub struct RocmContext {
     /// card 030 VRAM budget; see [`Self::vram_budget_bytes`]. 0 if the SIZE query failed (the budget then
     /// reports unavailable).
     pub(crate) vram_total_bytes: u64,
+    /// The GPU agent is an APU: its memory is the host's RAM, so a device allocation takes memory the
+    /// host cannot use ([`RocmContext::vram_free_bytes`]). `HSA_AMD_MEMORY_PROPERTY_AGENT_IS_APU`, read at
+    /// construction.
+    pub(crate) unified_memory: bool,
     /// `HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT` of the GPU agent, cached at construction (card 653);
     /// `None` if the query failed ([`Self::device_caps`] then reports the ROCm default).
     pub(crate) compute_units: Option<u32>,
@@ -787,17 +791,19 @@ mod caps_tests {
     #[test]
     fn a_live_agent_reports_the_limits_rocminfo_prints() {
         let Ok(ctx) = RocmContext::new() else {
-            eprintln!("SKIP a_live_agent_reports_the_limits_rocminfo_prints: no ROCm device");
+            eprintln!("POOT-SKIP a_live_agent_reports_the_limits_rocminfo_prints: no ROCm device");
             return;
         };
         let Ok(output) = std::process::Command::new("rocminfo").output() else {
-            eprintln!("SKIP a_live_agent_reports_the_limits_rocminfo_prints: no rocminfo on PATH");
+            eprintln!(
+                "POOT-SKIP a_live_agent_reports_the_limits_rocminfo_prints: no rocminfo on PATH"
+            );
             return;
         };
         let text = String::from_utf8_lossy(&output.stdout);
         if text.matches("Device Type:             GPU").count() != 1 {
             eprintln!(
-                "SKIP a_live_agent_reports_the_limits_rocminfo_prints: not exactly one GPU agent"
+                "POOT-SKIP a_live_agent_reports_the_limits_rocminfo_prints: not exactly one GPU agent"
             );
             return;
         }

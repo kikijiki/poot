@@ -28,6 +28,33 @@ fn movement(name: &str, out_shape: Vec<usize>, op: kg::MovementOp) -> Body {
     .expect("a valid movement request")
 }
 
+/// The pointwise region of one f32 `op` step over contiguous leaves of `leaf_shapes`, each broadcast into
+/// `out_shape`, with `lit` as the last operand when given: what every f32 unary, binary and scalar-literal
+/// equation lowers to.
+fn one_step(
+    name: &str,
+    op: kg::FusedScalarOp,
+    out_shape: &[usize],
+    leaf_shapes: &[&[usize]],
+    lit: Option<f32>,
+) -> Body {
+    let mut inputs: Vec<_> = (0..leaf_shapes.len())
+        .map(|leaf| kg::FusedInput::Leaf(kg::LeafId::new(leaf)))
+        .collect();
+    inputs.extend(lit.map(kg::FusedInput::Lit));
+    kg::fused(
+        name,
+        out_shape,
+        leaf_shapes,
+        &kg::FusedKernel {
+            leaf_tys: vec![kg::LeafTy::F32; leaf_shapes.len()],
+            steps: vec![kg::FusedStep { op, inputs }],
+            output: kg::FusedInput::Step(kg::StepId::new(0)),
+        },
+    )
+    .expect("a one-step f32 region generates")
+}
+
 /// The f32 numpy-broadcasting elementwise `c = a op b` over contiguous operands.
 fn binary_broadcast(
     name: &str,
@@ -36,20 +63,16 @@ fn binary_broadcast(
     a_shape: &[usize],
     b_shape: &[usize],
 ) -> Body {
-    kg::binary_broadcast_dt_views_grid(
+    one_step(
         name,
-        op,
-        Ty::F32,
+        kg::FusedScalarOp::Binary(op),
         out_shape,
-        a_shape,
-        &kg::Layout::contiguous(a_shape),
-        b_shape,
-        &kg::Layout::contiguous(b_shape),
+        &[a_shape, b_shape],
         None,
     )
 }
 
-fn spv(body: &Body, name: &str) -> poot_runtime_common::CompiledKernel {
+fn spv(body: &Body, name: &str) -> poot_codegen::CompiledKernel {
     let dir: PathBuf = std::env::temp_dir().join("poot-kernelgen-test").join(name);
     std::fs::create_dir_all(&dir).unwrap();
     let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
@@ -59,8 +82,8 @@ fn spv(body: &Body, name: &str) -> poot_runtime_common::CompiledKernel {
 
 /// The compiled SPIR-V word count of a handle `spv()` built, for callers that just want to assert a
 /// non-empty compile (card 608: `CompiledKernel` has no `len`/`is_empty` of its own).
-fn spirv_word_count(kernel: &poot_runtime_common::CompiledKernel) -> usize {
-    let poot_runtime_common::KernelCode::SpirvWords(words) = kernel.code() else {
+fn spirv_word_count(kernel: &poot_codegen::CompiledKernel) -> usize {
+    let poot_codegen::KernelCode::SpirvWords(words) = kernel.code() else {
         panic!("expected a SpirvVulkan-compiled kernel");
     };
     words.len()
@@ -91,6 +114,7 @@ fn attention_spec(
     mask: kg::MaskKind,
 ) -> kg::AttentionSpec {
     kg::AttentionSpec {
+        kv: poot_kernelgen::KvLane::F32,
         batch,
         hq,
         n_rep,
@@ -129,22 +153,22 @@ fn synthesized_kernels_compile_to_valid_ptx() {
     // fused-dequant GEMM, attention) must also lower to NVPTX. A clean `compile(.., Nvptx)` means
     // llc accepted the IR; the `.extern .func` grep catches an unresolved intrinsic (a wrong NVPTX intrinsic name
     // only JIT-fails on a real GPU, see memory `nvptx-lg2-intrinsic-name`), so it must be empty.
-    let (m, k, n, ts) = (17usize, 64usize, 24usize, 8usize);
+    let (m, k, n) = (17usize, 64usize, 24usize);
+    let caps = poot_target::DeviceCaps::wgpu_rdna3_igpu();
     let kernels: Vec<(&str, Body)> = vec![
         (
-            "tiled_region",
-            kg::tiled_region(
-                "tr",
-                m,
-                k,
-                n,
-                ts,
-                0,
-                kg::WeightLayout::Kn,
-                BufferStorage::f32(),
+            "dense_tiled_kn",
+            dense_tiled_generated(kg::DenseTiledWeight::KnF32, (m, k, n), None, &caps).body,
+        ),
+        (
+            "dense_tiled_nk_bf16",
+            dense_tiled_generated(
+                kg::DenseTiledWeight::Nk(BufferStorage::bf16_packed()),
+                (m, k, n),
                 None,
+                &caps,
             )
-            .expect("f32 weight storage"),
+            .body,
         ),
         (
             "attention_decode",
@@ -164,6 +188,7 @@ fn synthesized_kernels_compile_to_valid_ptx() {
         (
             "attention_softcapped_prefill",
             attention(&kg::AttentionSpec {
+                kv: poot_kernelgen::KvLane::F32,
                 score: kg::ScoreTransform::ScaleSoftcap {
                     scale_bits: 0.5f32.to_bits(),
                     cap_bits: 30.0f32.to_bits(),
@@ -178,7 +203,7 @@ fn synthesized_kernels_compile_to_valid_ptx() {
         ),
     ];
     if !which("llc") {
-        eprintln!("llc not on PATH; skipping the NVPTX-compile check");
+        poot_test_util::skip_report("poot-kernelgen", &"llc not on PATH");
         return;
     }
     for (name, body) in &kernels {
@@ -204,7 +229,7 @@ fn ctx() -> Option<Context> {
     match Context::new() {
         Ok(c) => Some(c),
         Err(e) => {
-            eprintln!("no GPU ({e}); skipping");
+            poot_test_util::skip_report("poot-kernelgen", &format_args!("no wgpu context: {e}"));
             None
         }
     }
@@ -213,7 +238,10 @@ fn ctx() -> Option<Context> {
 #[test]
 fn binary_mul() {
     let Some(ctx) = ctx() else { return };
-    let s = spv(&kg::binary("mul", BinOp::Mul), "mul");
+    let s = spv(
+        &binary_broadcast("mul", BinOp::Mul, &[4], &[4], &[4]),
+        "mul",
+    );
     let a = [1.0f32, 2.0, 3.0, 4.0];
     let b = [2.0f32, 3.0, 4.0, 5.0];
     let mut bufs = [
@@ -290,7 +318,7 @@ fn fence_validates_as_spirv_both_scopes() {
                 String::from_utf8_lossy(&v.stderr)
             );
         } else {
-            eprintln!("spirv-val not on PATH; skipping the validity check for {name}");
+            poot_test_util::skip_report("poot-kernelgen", &"spirv-val not on PATH");
         }
     }
 }
@@ -367,7 +395,16 @@ fn fence_rejects_on_aiecore() {
 #[test]
 fn binary_scalar_add() {
     let Some(ctx) = ctx() else { return };
-    let s = spv(&kg::binary_scalar("addk", BinOp::Add, 10.0), "addk");
+    let s = spv(
+        &one_step(
+            "addk",
+            kg::FusedScalarOp::Binary(BinOp::Add),
+            &[3],
+            &[&[3]],
+            Some(10.0),
+        ),
+        "addk",
+    );
     let a = [1.0f32, 2.0, 3.0];
     let mut bufs = [KernelBuffer::read_only_f32(&a), KernelBuffer::write_f32(3)];
     ctx.dispatch("test", &s, [64, 1, 1], [3, 1, 1], &mut bufs)
@@ -378,7 +415,16 @@ fn binary_scalar_add() {
 #[test]
 fn unary_neg() {
     let Some(ctx) = ctx() else { return };
-    let s = spv(&kg::unary("neg", UnOp::Neg), "neg");
+    let s = spv(
+        &one_step(
+            "neg",
+            kg::FusedScalarOp::Unary(UnOp::Neg),
+            &[3],
+            &[&[3]],
+            None,
+        ),
+        "neg",
+    );
     let x = [1.0f32, -2.0, 3.0];
     let mut bufs = [KernelBuffer::read_only_f32(&x), KernelBuffer::write_f32(3)];
     ctx.dispatch("test", &s, [64, 1, 1], [3, 1, 1], &mut bufs)
@@ -663,6 +709,22 @@ fn matmul_bias_epilogue() {
     assert_eq!(bufs[3].as_f32(), &want[..]);
 }
 
+/// The cost model's register tiling of an indexed `[E, K, N]` (`Kn`) contraction of `m` rows, on the wgpu caps.
+fn indexed_tiling((m, k, n, experts): (usize, usize, usize, usize)) -> kg::Schedule {
+    kg::RegisterTiling::choose(
+        kg::TiledShape {
+            blocks: 1,
+            m_per_block: m,
+            out_per_block: n,
+            k,
+            layout: kg::WeightLayout::Kn,
+            segments: experts,
+        },
+        &poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+    )
+    .schedule()
+}
+
 /// The generated indexed contraction for `(m, k, n, experts)` under `schedule`, with the unfolded launch the planner
 /// builds (`Gemv`: `ceil(M*N/cols)` workgroups; `Tiled`: one workgroup per `tile x tile` output block) and the
 /// `[K, N, E, M, x_groups]` metadata. Returns the compiled kernel and its launch.
@@ -670,7 +732,7 @@ fn indexed_kernel(
     schedule: kg::Schedule,
     (m, k, n, experts): (usize, usize, usize, usize),
     name: &str,
-) -> (poot_runtime_common::CompiledKernel, kg::Launch, [u32; 3]) {
+) -> (poot_codegen::CompiledKernel, kg::Launch, [u32; 3]) {
     use poot_target::DeviceCaps;
     let caps = DeviceCaps::wgpu_rdna3_igpu();
     let limits = kg::BodyLimits {
@@ -680,9 +742,8 @@ fn indexed_kernel(
     let threads = schedule.grid_threads(1, m, n);
     let x_groups = match schedule {
         kg::Schedule::Gemv { .. } => 0,
-        kg::Schedule::Tiled { tile } => (threads / (tile.get() * tile.get()) as usize) as u32,
-        kg::Schedule::RegisterTiled { .. } => {
-            panic!("an indexed contraction is never RegisterTiled")
+        kg::Schedule::RegisterTiled { lanes, .. } => {
+            (threads / (lanes.get() * lanes.get()) as usize) as u32
         }
     };
     let request =
@@ -692,7 +753,7 @@ fn indexed_kernel(
             weight: BufferStorage::f32(),
             epilogue: None,
             grid: [threads as u32, 1, 1],
-            meta: vec![k as u32, n as u32, experts as u32, m as u32, x_groups],
+            meta: vec![k as u32, n as u32, m as u32, x_groups, 0, experts as u32],
         }));
     let generated =
         kg::generate(&request, &caps, &limits).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -703,7 +764,7 @@ fn indexed_kernel(
 /// Run the indexed kernel and return its `[M, N]` output.
 fn run_indexed(
     ctx: &Context,
-    (kernel, launch, workgroup): &(poot_runtime_common::CompiledKernel, kg::Launch, [u32; 3]),
+    (kernel, launch, workgroup): &(poot_codegen::CompiledKernel, kg::Launch, [u32; 3]),
     (x, w, ids): (&[f32], &[f32], &[i32]),
     out_len: usize,
 ) -> Vec<f32> {
@@ -759,6 +820,7 @@ fn indexed_gemv_selects_expert_in_kernel() {
         width: 16,
         cols: 2,
         unroll: 2,
+        activation: poot_kernelgen::GemvActivation::Scalar,
     };
     let kernel = indexed_kernel(gemv, (1, k, n, e), "igemv");
     for expert in 0..e {
@@ -775,17 +837,15 @@ fn indexed_gemv_selects_expert_in_kernel() {
 
 #[test]
 fn indexed_matmul_routes_rows_to_experts() {
-    // M>1 indexed GEMM on the segmented Tiled schedule: out[m,n] = sum_k x[m,k] * W[idx[m],k,n], each row
-    // routed to its own expert in-kernel. E=3, M=3, K=4, N=2; rows pick experts 2, 0, 1, so one tile holds rows
+    // M>1 indexed GEMM on the register-tiled schedule's expert walk: out[m,n] = sum_k x[m,k] * W[idx[m],k,n], each
+    // row routed to its own expert in-kernel. E=3, M=3, K=4, N=2; rows pick experts 2, 0, 1, so one tile holds rows
     // of three experts and the kernel reads a different weight block per row.
     let Some(ctx) = ctx() else { return };
     let (e, m, k, n) = (3usize, 3usize, 4usize, 2usize);
     let x: Vec<f32> = (0..m * k).map(|v| (v as f32) - 5.0).collect();
     let w: Vec<f32> = (0..e * k * n).map(|v| (v as f32) - 11.0).collect();
     let ids = [2i32, 0, 1];
-    let tiled = kg::Schedule::Tiled {
-        tile: kg::TileSize::new(4).unwrap(),
-    };
+    let tiled = indexed_tiling((m, k, n, e));
     let kernel = indexed_kernel(tiled, (m, k, n, e), "igemm");
     let got = run_indexed(&ctx, &kernel, (&x, &w, &ids), m * n);
     let want = indexed_oracle((&x, &w, &ids), (k, n, e));
@@ -797,7 +857,7 @@ fn indexed_matmul_routes_rows_to_experts() {
 
 #[test]
 fn indexed_bodies_compile_to_valid_spirv_and_nvptx() {
-    // The Gemv and the segmented Tiled body, each bare and with an epilogue, build, verify and compile on both
+    // The Gemv and the register-tiled expert walk, each bare and with an epilogue, build, verify and compile on both
     // SPIR-V and NVPTX.
     use kg::{ContractionSpec, IndexedContraction, KernelRequest, Schedule};
     use poot_target::DeviceCaps;
@@ -806,13 +866,12 @@ fn indexed_bodies_compile_to_valid_spirv_and_nvptx() {
         max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),
         max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),
     };
-    let tile = Schedule::Tiled {
-        tile: kg::TileSize::new(8).unwrap(),
-    };
+    let tile = indexed_tiling((8, 16, 8, 4));
     let gemv = Schedule::Gemv {
         width: 64,
         cols: 4,
         unroll: 4,
+        activation: poot_kernelgen::GemvActivation::Scalar,
     };
     let request = |schedule, epilogue| {
         KernelRequest::Contraction(ContractionSpec::Indexed(IndexedContraction {
@@ -821,7 +880,7 @@ fn indexed_bodies_compile_to_valid_spirv_and_nvptx() {
             weight: BufferStorage::f32(),
             epilogue,
             grid: [64, 1, 1],
-            meta: vec![16, 8, 4, 8, 0],
+            meta: vec![16, 8, 8, 0, 0, 4],
         }))
     };
     let requests = [
@@ -852,7 +911,7 @@ fn indexed_bodies_compile_to_valid_spirv_and_nvptx() {
             );
         }
     } else {
-        eprintln!("llc not on PATH; skipping the NVPTX-compile check");
+        poot_test_util::skip_report("poot-kernelgen", &"llc not on PATH");
     }
 }
 
@@ -1114,47 +1173,42 @@ fn rmsnorm_kernel(n_cols: usize, eps: f32) -> kg::RowKernel {
 }
 
 #[test]
-fn tiled_region_epilogue_is_bit_exact_against_the_unfused_chain() {
-    // `out = (A @ B + bias) + residual` through the tiled body's epilogue equals the same body without one, followed by
-    // the two f32 adds on the host: bit for bit, at a single partial tile (M = 5) and at many (M = 160), in both
-    // weight layouts.
+fn dense_tiled_epilogue_is_bit_exact_against_the_unfused_chain() {
+    // `out = (A @ B + bias) + residual` through the register-tiled body's epilogue equals the same body without
+    // one, followed by the two f32 adds on the host: bit for bit, at a single partial tile (M = 5) and at many
+    // (M = 160), in both weight layouts.
     let Some(ctx) = ctx() else { return };
-    let (ts, k, n) = (8usize, 32usize, 24usize);
-    let fill = |seed: u64, count: usize| -> Vec<f32> {
-        let mut s = seed.wrapping_add(0x9E3779B97F4A7C15) | 1;
-        (0..count)
-            .map(|_| {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                ((s >> 40) as f32 / (1u64 << 24) as f32) * 0.4 - 0.2
-            })
-            .collect()
-    };
-    let run = |body: &Body, inputs: &[&[f32]], numel: usize, groups: usize| -> Vec<f32> {
-        let s = spv(body, "tiled_region_epilogue");
+    let caps = poot_target::DeviceCaps::wgpu_rdna3_igpu();
+    let (k, n) = (32usize, 24usize);
+    let run = |generated: &kg::Generated, inputs: &[&[f32]], numel: usize| -> Vec<f32> {
+        let s = spv(&generated.body, "dense_tiled_epilogue");
         let mut bufs: Vec<KernelBuffer> = inputs
             .iter()
             .map(|input| KernelBuffer::read_only_f32(input))
             .collect();
+        bufs.push(KernelBuffer::read_only_u32(
+            generated.launch.meta.as_deref().expect("tiled metadata"),
+        ));
         bufs.push(KernelBuffer::write_f32(numel));
         ctx.dispatch(
             "test",
             &s,
-            [(ts * ts) as u32, 1, 1],
-            [(groups * ts * ts) as u32, 1, 1],
+            generated.body.workgroup_size,
+            generated.launch.grid,
             &mut bufs,
         )
         .unwrap();
         bufs.pop().unwrap().as_f32().to_vec()
     };
     for m in [5usize, 160] {
-        for layout in [kg::WeightLayout::Kn, kg::WeightLayout::Nk] {
-            let a = fill(1, m * k);
-            let b = fill(2, k * n);
-            let bias = fill(3, n);
-            let residual = fill(4, m * n);
-            let groups = m.div_ceil(2 * ts) * n.div_ceil(ts);
+        for weight in [
+            kg::DenseTiledWeight::KnF32,
+            kg::DenseTiledWeight::Nk(BufferStorage::f32()),
+        ] {
+            let a = fill_unit(1, m * k);
+            let b = fill_unit(2, k * n);
+            let bias = fill_unit(3, n);
+            let residual = fill_unit(4, m * n);
             let epilogue = kg::Epilogue {
                 dt: Ty::F32,
                 out_shape: vec![m, n],
@@ -1177,27 +1231,16 @@ fn tiled_region_epilogue_is_bit_exact_against_the_unfused_chain() {
                 ],
                 output: kg::EpilogueInput::Step(1),
             };
-            let body = |epilogue| {
-                kg::tiled_region(
-                    "tiled_region_epilogue",
-                    m,
-                    k,
-                    n,
-                    ts,
-                    0,
-                    layout,
-                    BufferStorage::f32(),
-                    epilogue,
-                )
-                .expect("f32 weight storage")
-            };
             let fused = run(
-                &body(Some(&epilogue)),
+                &dense_tiled_generated(weight, (m, k, n), Some(epilogue), &caps),
                 &[&a, &b, &bias, &residual],
                 m * n,
-                groups,
             );
-            let head = run(&body(None), &[&a, &b], m * n, groups);
+            let head = run(
+                &dense_tiled_generated(weight, (m, k, n), None, &caps),
+                &[&a, &b],
+                m * n,
+            );
             let unfused: Vec<f32> = head
                 .iter()
                 .enumerate()
@@ -1207,89 +1250,87 @@ fn tiled_region_epilogue_is_bit_exact_against_the_unfused_chain() {
             assert_eq!(
                 bits(&fused),
                 bits(&unfused),
-                "m={m} {layout:?}: the fused epilogue differs from the unfused chain"
+                "m={m} {weight:?}: the fused epilogue differs from the unfused chain"
             );
         }
     }
 }
 
+/// Deterministic values in `[-0.2, 0.2)` from a xorshift stream.
+fn fill_unit(seed: u64, count: usize) -> Vec<f32> {
+    let mut s = seed.wrapping_add(0x9E3779B97F4A7C15) | 1;
+    (0..count)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / (1u64 << 24) as f32) * 0.4 - 0.2
+        })
+        .collect()
+}
+
 #[test]
-fn tiled_region_validates_and_matches_cpu_matmul() {
-    // `kg::tiled_region` (element-by-element tiled-GEMM generator): (1) compile to SPIR-V and spirv-val (strict
-    // check: in-loop barrier + LDS); (2) dispatch on the Arc and compare to a serial CPU matmul over partial-tile
-    // shapes.
-    let (ts, m, k, n) = (8usize, 17usize, 32usize, 24usize); // partial tiles in M (17), N (24)
-    let body = kg::tiled_region(
-        "tiled_region",
-        m,
-        k,
-        n,
-        ts,
-        0,
-        kg::WeightLayout::Kn,
-        BufferStorage::f32(),
-        None,
-    )
-    .expect("f32 weight storage");
-    let s = spv(&body, "tiled_region");
-
-    // strict SPIR-V validity (skip only if spirv-val is absent).
-    let dir = std::env::temp_dir()
-        .join("poot-kernelgen-test")
-        .join("tiled_region");
-    let spv_path = poot_codegen::artifact_path(&dir, "tiled_region", Target::SpirvVulkan);
-    if which("spirv-val") {
-        let v = std::process::Command::new("spirv-val")
-            .arg(&spv_path)
-            .output()
-            .expect("run spirv-val");
-        assert!(
-            v.status.success(),
-            "spirv-val failed:\n{}",
-            String::from_utf8_lossy(&v.stderr)
-        );
-    } else {
-        eprintln!("spirv-val not on PATH; skipping the validity check");
-    }
-
-    let Some(ctx) = ctx() else { return };
-    let fill = |seed: u64, count: usize| -> Vec<f32> {
-        let mut s = seed.wrapping_add(0x9E3779B97F4A7C15) | 1;
-        (0..count)
-            .map(|_| {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                ((s >> 40) as f32 / (1u64 << 24) as f32) * 0.4 - 0.2
-            })
-            .collect()
-    };
-    let a = fill(1, m * k);
-    let b = fill(2, k * n);
-    let mut bufs = [
-        KernelBuffer::read_only_f32(&a),
-        KernelBuffer::read_only_f32(&b),
-        KernelBuffer::write_f32(m * n),
-    ];
-    // grid: ceil(M/2ts) row-tiles * ceil(N/ts) col-tiles workgroups, ts*ts lanes each (matches the body).
-    let groups = m.div_ceil(2 * ts) * n.div_ceil(ts);
-    ctx.dispatch(
-        "test",
-        &s,
-        [(ts * ts) as u32, 1, 1],
-        [(groups * ts * ts) as u32, 1, 1],
-        &mut bufs,
-    )
-    .unwrap();
-    let got = bufs[2].as_f32();
-    for i in 0..m {
-        for j in 0..n {
-            let want: f32 = (0..k).map(|kk| a[i * k + kk] * b[kk * n + j]).sum();
-            let g = got[i * n + j];
+fn dense_tiled_validates_and_matches_cpu_matmul() {
+    // The register-tiled GEMM over both weight layouts: (1) compile to SPIR-V and spirv-val (strict check:
+    // in-loop barrier + LDS); (2) dispatch and compare to a serial CPU matmul over partial-tile shapes, with an
+    // odd `K` (single-value runs and a `K` tail).
+    let caps = poot_target::DeviceCaps::wgpu_rdna3_igpu();
+    let (m, k, n) = (17usize, 37usize, 24usize); // partial tiles in M (17) and N (24)
+    for weight in [
+        kg::DenseTiledWeight::KnF32,
+        kg::DenseTiledWeight::Nk(BufferStorage::f32()),
+    ] {
+        let generated = dense_tiled_generated(weight, (m, k, n), None, &caps);
+        let s = spv(&generated.body, "dense_tiled");
+        let dir = std::env::temp_dir()
+            .join("poot-kernelgen-test")
+            .join("dense_tiled");
+        let spv_path = poot_codegen::artifact_path(&dir, "dense_tiled", Target::SpirvVulkan);
+        if which("spirv-val") {
+            let v = std::process::Command::new("spirv-val")
+                .arg(&spv_path)
+                .output()
+                .expect("run spirv-val");
             assert!(
-                (g - want).abs() < 1e-4,
-                "tiled_region [{i},{j}]: gpu {g} vs cpu {want}"
+                v.status.success(),
+                "spirv-val failed:\n{}",
+                String::from_utf8_lossy(&v.stderr)
             );
+        } else {
+            poot_test_util::skip_report("poot-kernelgen", &"spirv-val not on PATH");
+        }
+
+        let Some(ctx) = ctx() else { return };
+        let a = fill_unit(1, m * k);
+        let b = fill_unit(2, k * n);
+        let mut bufs = [
+            KernelBuffer::read_only_f32(&a),
+            KernelBuffer::read_only_f32(&b),
+            KernelBuffer::read_only_u32(generated.launch.meta.as_deref().expect("metadata")),
+            KernelBuffer::write_f32(m * n),
+        ];
+        ctx.dispatch(
+            "test",
+            &s,
+            generated.body.workgroup_size,
+            generated.launch.grid,
+            &mut bufs,
+        )
+        .unwrap();
+        let got = bufs[3].as_f32();
+        for i in 0..m {
+            for j in 0..n {
+                let w = |kk: usize| match weight {
+                    kg::DenseTiledWeight::KnF32 => b[kk * n + j],
+                    kg::DenseTiledWeight::Nk(_) => b[j * k + kk],
+                };
+                let want: f32 = (0..k).map(|kk| a[i * k + kk] * w(kk)).sum();
+                let g = got[i * n + j];
+                assert!(
+                    (g - want).abs() < 1e-4,
+                    "dense_tiled {weight:?} [{i},{j}]: gpu {g} vs cpu {want}"
+                );
+            }
         }
     }
 }
@@ -1316,7 +1357,7 @@ fn run_attention(
             String::from_utf8_lossy(&v.stderr)
         );
     } else {
-        eprintln!("spirv-val not on PATH; skipping the validity check");
+        poot_test_util::skip_report("poot-kernelgen", &"spirv-val not on PATH");
     }
     let ctx = ctx()?;
     let mut bufs = [
@@ -1442,7 +1483,7 @@ fn attn_scores_v_gemv_lds_matches_naive_batched_matmul() {
             String::from_utf8_lossy(&v.stderr)
         );
     } else {
-        eprintln!("spirv-val not on PATH; skipping the validity check");
+        poot_test_util::skip_report("poot-kernelgen", &"spirv-val not on PATH");
     }
 
     let Some(ctx) = ctx() else { return };
@@ -1580,9 +1621,7 @@ fn softmax_kernel(n_cols: usize) -> kg::RowKernel {
 #[test]
 fn every_hot_synthesized_kernel_validates_as_spirv() {
     if !which("spirv-val") {
-        eprintln!(
-            "spirv-val not on PATH; skipping every_hot_synthesized_kernel_validates_as_spirv"
-        );
+        poot_test_util::skip_report("poot-kernelgen", &"spirv-val not on PATH");
         return;
     }
 
@@ -1843,6 +1882,56 @@ fn matmul_epilogue_chain_matches_cpu() {
     }
 }
 
+/// A one-dispatch register-tiled dense contraction of `m` rows, depth `k` and `n` columns over `weight` with
+/// `epilogue`, the tiling the planner would choose on `caps` and every tile on the X grid.
+fn dense_tiled(
+    weight: kg::DenseTiledWeight,
+    (m, k, n): (usize, usize, usize),
+    epilogue: Option<kg::Epilogue>,
+    caps: &poot_target::DeviceCaps,
+) -> kg::KernelRequest {
+    let layout = match weight {
+        kg::DenseTiledWeight::Nk(_) => kg::WeightLayout::Nk,
+        kg::DenseTiledWeight::KnF32 => kg::WeightLayout::Kn,
+    };
+    let tiling = kg::RegisterTiling::choose(
+        kg::TiledShape {
+            blocks: 1,
+            m_per_block: m,
+            out_per_block: n,
+            k,
+            layout,
+            segments: 1,
+        },
+        caps,
+    );
+    let (tile_rows, tile_cols) = tiling.output_tile();
+    let tiles = m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
+    let lanes = tiling.lanes() * tiling.lanes();
+    kg::KernelRequest::Contraction(kg::ContractionSpec::DenseTiled(kg::DenseTiledContraction {
+        weight,
+        schedule: tiling.schedule(),
+        epilogue,
+        grid: [(tiles * lanes) as u32, 1, 1],
+        meta: vec![k as u32, n as u32, m as u32, tiles as u32, 0],
+    }))
+}
+
+/// [`dense_tiled`], generated for `caps`.
+fn dense_tiled_generated(
+    weight: kg::DenseTiledWeight,
+    shape: (usize, usize, usize),
+    epilogue: Option<kg::Epilogue>,
+    caps: &poot_target::DeviceCaps,
+) -> kg::Generated {
+    let limits = kg::BodyLimits {
+        max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),
+        max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),
+    };
+    kg::generate(&dense_tiled(weight, shape, epilogue, caps), caps, &limits)
+        .expect("the dense tiled request generates")
+}
+
 #[test]
 fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
     use kg::{ContractionSpec, KernelRequest, MatmulShapes, Schedule};
@@ -1873,28 +1962,21 @@ fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
         ),
         (
             "epilogue_dense_tiled_bf16_weight",
-            KernelRequest::Contraction(ContractionSpec::DenseTiled {
-                m: 3,
-                k: 4,
-                n: 5,
-                tile: 8,
-                offset: 0,
-                groups: 1,
-                weight: BufferStorage::bf16_packed(),
-                epilogue: Some(chain_epilogue(Ty::F32, &[3, 5])),
-            }),
+            dense_tiled(
+                kg::DenseTiledWeight::Nk(BufferStorage::bf16_packed()),
+                (3, 4, 5),
+                Some(chain_epilogue(Ty::F32, &[3, 5])),
+                &caps,
+            ),
         ),
         (
-            "epilogue_tiled_region_f32",
-            KernelRequest::Contraction(ContractionSpec::TiledRegion {
-                m: 3,
-                k: 4,
-                n: 5,
-                tile: 8,
-                offset: 0,
-                groups: 1,
-                epilogue: Some(chain_epilogue(Ty::F32, &[3, 5])),
-            }),
+            "epilogue_dense_tiled_kn_f32_weight",
+            dense_tiled(
+                kg::DenseTiledWeight::KnF32,
+                (3, 4, 5),
+                Some(chain_epilogue(Ty::F32, &[3, 5])),
+                &caps,
+            ),
         ),
         (
             "epilogue_dense_gemv_f16_weight",
@@ -1904,6 +1986,7 @@ fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
                     width: 16,
                     cols: 2,
                     unroll: 2,
+                    activation: poot_kernelgen::GemvActivation::Scalar,
                 },
                 k: 8,
                 n: 5,
@@ -1950,6 +2033,6 @@ fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
             );
         }
     } else {
-        eprintln!("llc not on PATH; skipping the NVPTX-compile check");
+        poot_test_util::skip_report("poot-kernelgen", &"llc not on PATH");
     }
 }

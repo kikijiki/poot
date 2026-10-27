@@ -211,7 +211,9 @@ fn oracle_step(
             Storage::State => Value::from(
                 state
                     .entry(meta.name().unwrap().into_owned())
-                    .or_insert_with(|| HostTensor::zeros(meta.aval.shape.clone()))
+                    .or_insert_with(|| {
+                        HostTensor::zeros_of(meta.aval.dtype, meta.aval.shape.clone())
+                    })
                     .clone(),
             ),
             Storage::Computed(c) => Value::from(c.tensor()),
@@ -523,7 +525,7 @@ impl Device for FaultyOnceDevice {
     fn load_kernel(
         &mut self,
         key: &str,
-        kernel: poot_runtime_common::CompiledKernel,
+        kernel: poot_codegen::CompiledKernel,
     ) -> Result<Self::Kernel, Self::Error> {
         self.inner.load_kernel(key, kernel)
     }
@@ -690,7 +692,7 @@ impl Device for FaultyOnceSyncDevice {
     fn load_kernel(
         &mut self,
         key: &str,
-        kernel: poot_runtime_common::CompiledKernel,
+        kernel: poot_codegen::CompiledKernel,
     ) -> Result<Self::Kernel, Self::Error> {
         self.inner.load_kernel(key, kernel)
     }

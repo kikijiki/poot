@@ -161,7 +161,7 @@ fn selector() -> Operand {
     copy(SELECTOR)
 }
 
-/// `(lane % 256) < 32`: the warp-0 selection `matmul_tensorcore` uses.
+/// `(lane % 256) < 32`: warp 0 of a 256-lane workgroup.
 fn warp_zero_by_remainder() -> Vec<Statement> {
     vec![
         binary(SELECTOR, BinOp::Rem, lane(), usize_const(256)),

@@ -1,20 +1,25 @@
-use super::{Connection, Context, Result, migrate};
+use super::{Connection, Result, SCHEMA_VERSION, bail};
 
 pub(crate) struct Db {
     pub(super) conn: Connection,
 }
 
-fn add_column_if_missing(conn: &Connection, sql: &str, context: &str) -> Result<()> {
-    match conn.execute(sql, []) {
-        Ok(_) => Ok(()),
-        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
-        Err(e) => Err(e).with_context(|| context.to_string()),
-    }
-}
-
 impl Db {
     pub(crate) fn open(path: &str) -> Result<Db> {
         let conn = Connection::open(path)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let has_runs: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs')",
+            [],
+            |row| row.get(0),
+        )?;
+        // No migrations: a database from another schema is rejected, not upgraded.
+        if has_runs && version != SCHEMA_VERSION {
+            bail!(
+                "state database {path} has schema version {version}, this build needs {SCHEMA_VERSION}: \
+                 delete the file (it only holds run history) and run again"
+            );
+        }
         conn.execute_batch(
             r#"
             -- The default state DB is machine-wide shared (see main.rs `state_dir_from`), so several
@@ -37,7 +42,17 @@ impl Db {
                 status      TEXT NOT NULL,
                 pod_id      TEXT,
                 ssh_host    TEXT,
-                ssh_port    INTEGER
+                ssh_port    INTEGER,
+                kind        TEXT NOT NULL DEFAULT 'sweep',   -- sweep | exec
+                warm_until  TEXT,
+                -- the local process that created the run; a run is resumed only once this process is gone
+                owner_hostname    TEXT,
+                owner_pid         INTEGER,
+                owner_boot_id     TEXT,
+                owner_start_ticks TEXT,
+                owner_pid_ns      TEXT,
+                repeats     INTEGER NOT NULL DEFAULT 1,
+                set_id      TEXT             -- the name of the result sets (the failed run this one resumes)
             );
             CREATE TABLE IF NOT EXISTS model_runs (
                 run_id      TEXT NOT NULL,
@@ -54,6 +69,7 @@ impl Db {
                 id          TEXT PRIMARY KEY,
                 gpu_type    TEXT NOT NULL,
                 cloud       TEXT NOT NULL,
+                cost_per_hr REAL,            -- USD per hour as RunPod reported it at create; NULL if it did not
                 image       TEXT NOT NULL,
                 status      TEXT NOT NULL,   -- provisioning | idle | busy | terminated
                 ssh_host    TEXT,
@@ -64,44 +80,7 @@ impl Db {
             );
             "#,
         )?;
-        // SQLite has no ADD COLUMN IF NOT EXISTS: ignore duplicate-column only; any other failure must
-        // be reported.
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'sweep'",
-            "add runs.kind",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE runs ADD COLUMN warm_until TEXT",
-            "add runs.warm_until",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE runs ADD COLUMN owner_hostname TEXT",
-            "add runs.owner_hostname",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE runs ADD COLUMN owner_pid INTEGER",
-            "add runs.owner_pid",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE runs ADD COLUMN owner_boot_id TEXT",
-            "add runs.owner_boot_id",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE runs ADD COLUMN owner_start_ticks TEXT",
-            "add runs.owner_start_ticks",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE runs ADD COLUMN repeats INTEGER NOT NULL DEFAULT 1",
-            "add runs.repeats",
-        )?;
-        migrate(&conn)?;
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(Db { conn })
     }
 }

@@ -55,7 +55,7 @@ function BatchChart({ mode }: { mode: Mode }) {
   ] : [];
 
   return (
-    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: 'block', maxWidth: '100%' }}>
+    <svg role="img" aria-label="Request slots over time: requests join and leave slots as they finish" width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: 'block', maxWidth: '100%' }}>
       {/* Slot labels */}
       {Array.from({ length: N_SLOTS }).map((_, s) => (
         <text key={s} x={PAD.left - 6} y={PAD.top + s * (SLOT_H + 4) + SLOT_H / 2 + 4}

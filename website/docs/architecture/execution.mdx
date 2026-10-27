@@ -4,120 +4,102 @@ title: Execution
 sidebar_position: 7
 ---
 
+import ExecutionTimeline from "@site/src/components/architecture/ExecutionTimeline";
+
 # Execution
 
-Execution has two phases: compile once (trace, optimize, plan, capture), then replay per token. The
-host cost depends on the backend: native graph replay on PTX, recorded packet submission on ROCm,
-resubmission of recorded command buffers on raw Vulkan, and command encoding from cached dispatches on
-wgpu, plus slot writes and readback.
+Compile once (trace, optimize, plan, capture), then replay per token. This page covers what is captured, how each backend
+replays it, and how faults surface.
 
 ## Why capture
 
-A small-batch decode step is memory-bound and the GPU work per dispatch is tiny. Issuing each dispatch
-through the driver costs microseconds, so with dozens of dispatches per token the CPU can set the
-pace. Native replay (CUDA graphs, HSA packets, Vulkan command buffers) removes per-dispatch driver calls;
-wgpu's cached encoding reduces preparation work.
+A small-batch decode step is memory-bound, and each driver call costs microseconds. With dozens of dispatches per token the
+CPU sets the pace; native replay removes those calls.
+
+<ExecutionTimeline />
 
 ## A constant-shape decode graph
 
-Replay needs the same dispatches with the same parameters every token, so the decode graph must have
-a constant shape. poot uses **fixed-capacity KV with masking**:
+Replay needs identical dispatches every token, so poot uses **fixed-capacity KV with masking**:
 
-- K and V are `Storage::State` buffers preallocated to a capacity `cap` per layer.
-- Each step writes the new K/V at `pos` (`DynamicUpdateSlice`, or `ScatterUpdate` through a
-  `Slot::WriteMap` for paged KV).
-- Attention always sweeps `[cap]`; a mask hides positions after `pos`. That mask is a graph
-  computation over `Slot::Pos` against an `Iota`; no slot carries it.
+- K and V are `Storage::State` buffers preallocated to `cap` positions per layer.
+- Each step writes the new K/V at `pos` (`DynamicUpdateSlice`, or `ScatterUpdate` through `Slot::WriteMap` for paged KV).
+- Attention sweeps all `[cap]` positions; a mask built in-graph from `Slot::Pos` hides those after `pos`.
 
 Grids and buffer addresses stay constant, so one capture serves every position up to `cap`.
 
 ## Slot buffers
 
-Per-step inputs (`Slot::Token`, `Slot::Pos`, and `Slot::SlotMap` and `Slot::WriteMap` for paged KV) live in device buffers at stable addresses. The
-recorded kernel arguments point at them, and the host rewrites their contents before each replay. The
-planner binds any scalar that depends on a slot to the slot buffer rather than baking it into the
-capture, which would replay a stale value.
+Per-step inputs (`Slot::Token`, `Slot::Pos`, and `Slot::SlotMap` / `Slot::WriteMap` for paged KV) live in device buffers at
+stable addresses. Recorded kernels point at them, and the host rewrites their contents before each replay. A scalar that depends
+on a slot is bound to the slot buffer, never baked into the capture.
 
 ## Per backend
 
-| Backend | Capture (once)                                                                 | Per token                                                           |
-| ------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
-| PTX     | `cuStreamBeginCapture`, launch every plan, instantiate                         | write slots, `cuGraphLaunch`, copy logits, sync                     |
-| ROCm    | record the AQL packets of every plan                                           | write slots, resubmit packets, read back                            |
-| wgpu    | build pipelines and bind groups, cache the dispatch list                       | write slots, encode from cache, submit, map                         |
-| Vulkan  | record Vulkan command buffers (pipeline bind, descriptor bind, dispatch or copy, a full memory barrier between commands) | write slots, resubmit the command buffers verbatim with a fence wait after each, then raise the replay's staged kernel fault at `synchronize` |
+| Backend | Capture (once) | Per token |
+| --- | --- | --- |
+| PTX | `cuStreamBeginCapture`, launch every plan, instantiate | Write slots, `cuGraphLaunch`, copy logits, sync. |
+| ROCm | Record the AQL packets of every plan. | Write slots, resubmit packets, read back. |
+| Vulkan | Record command buffers (pipeline bind, descriptor bind, dispatch or copy, full barrier). | Write slots, resubmit verbatim with a fence wait each, raise the staged kernel fault at `synchronize`. |
+| wgpu | Build pipelines and bind groups, cache the dispatch list. | Write slots, encode from cache, submit, map. |
 
-On raw Vulkan, descriptor sets are baked at record time and per-replay data overwrites the same bound
-buffers in place. A device with a watchdog budget cuts a long recording into several command buffers by
-the planner's per-dispatch work weight, so one replay is several submissions rather than one past the
-display watchdog; a device with no budget records a stage as one command buffer.
+- **Vulkan:** descriptor sets are baked at record time. A device with a watchdog budget gets several command buffers per replay,
+  cut by the planner's per-dispatch work weight.
+- **wgpu:** the re-encode still encodes per token; a token step is not allocation-free.
 
-wgpu's cached re-encode reuses the graph's pipelines, bind groups and intermediate buffers, but still
-encodes commands per token. Sampling can add dispatches, submissions and temporary buffers. The
-complete token step is not allocation-free and need not be one submit.
+## The executor contract
 
-The backend-neutral contract lives in `poot-executor`: one generic `Engine<D>` over a thin
-per-backend `Device` trait implements an object-safe `Executor` (`target_set`, `load_weights`,
-`add_entry`, `step`, `reset_state`, `remove_entry`, `stats`, `unload`), so the driver above it never
-branches on a backend. A step is recorded once and replayed. The GPU `Device` implementations are `poot-wgpu-device`'s `WgpuDevice`,
-`poot-rocm-device`'s `RocmDevice`, `poot-ptx-device`'s `PtxDevice` and `poot-vulkan-device`'s `VulkanDevice`;
-`poot-npu` adds the experimental `XdnaDevice` and `VpuDevice` ([NPU Offload](./npu.mdx)). `load_weights` takes the weight store and a weight map, which binds each weight a graph names by its typed role; a const the map
-does not name is unbound, even when a store key spells its name.
+`poot-executor` holds the backend-neutral contract: one generic `Engine<D>` over a per-backend `Device` trait implements an
+object-safe `Executor`, so the driver never branches on a backend.
 
-The `poot-llm` driver drives this contract on every backend ([Models, Registry and the
-Driver](./driver.mdx)): `Driver::new` loads a `ModelHandle`'s weights once, as one executable (through the
-model's weight map), and each step shape it needs is an entry added to that executable, from the family's
-`trace` for that shape, compiled for the executor's target. Entries are keyed by program, step shape, sampling
-suffix and the carried inputs they bind, so a token, a position or a sampler parameter never makes a new one. `Driver::encode` runs an `encode` step (an encoder's embeddings and reranking, a decoder's
-hidden states, a vision tower's frames). Token-row shapes are prepared up front by `Driver::prepare_encode` and a step never compiles one; a vision tower's frames still prepare on first use, and a prompt can supply values for the inputs its model declares, such as embedding rows in place of some tokens'
-(`Driver::generate_with_inputs`), which is how the vision-language caption path scatters its image rows. Those
-rows and a frame's pixels are bound by value, never baked into a program. Generation picks the next token on-device for every request, including logit bias,
-penalties, logprobs and guided masks: a sampling step is appended to the decode graph itself, and the
-host reads back only the chosen token id, a non-finite flag and any top-n logprob alternatives, not the
-full logits. `poot-serve` runs the driver in one scheduling loop that admits requests into
-slots and fits the KV cache to the device ([Continuous batching](../serve/continuous-batching.md)).
+| Item | Members |
+| --- | --- |
+| `Executor` methods | `target_set`, `load_weights`, `add_entry`, `step`, `reset_state`, `remove_entry`, `stats`, `unload` |
+| Devices | `WgpuDevice`, `RocmDevice`, `PtxDevice`, `VulkanDevice`; experimental `XdnaDevice`, `VpuDevice` ([NPU Offload](./npu.mdx)) |
+
+`load_weights` binds each weight a graph names by its typed role through a weight map. A const the map does not name stays
+unbound, even if a store key spells its name.
+
+## The driver
+
+The `poot-llm` driver ([Models, Registry and the Driver](./driver.mdx)) uses this contract on every backend.
+
+1. `Driver::new` loads the weights once, as one executable.
+2. Each step shape becomes an entry on it, traced by the family and compiled for the target. Entries are keyed by program,
+   shape, sampling suffix and carried inputs, so a token, position or sampler value never makes a new one.
+3. `Driver::encode` runs encoder, hidden-state and vision-tower steps; `Driver::generate_with_inputs` binds prompt-supplied
+   inputs (such as image rows) by value.
+
+Sampling runs on-device and is appended to the decode graph. The host reads back only the token id, a non-finite flag and any
+top-n logprobs. `poot-serve` runs the driver in one scheduling loop ([Continuous batching](../serve/continuous-batching.md)).
 
 ## Failure handling
 
-A device fault is a typed error on every backend, and it never aborts the process. On ROCm a fault
-reaches the context through the HSA queue error callback and the system event handler; on PTX it is a
-sticky CUDA error; on wgpu it is the device-lost callback; on raw Vulkan it is a submission or fence wait
-that fails (device loss included), which poisons the device and leaks what the pending work
-could reference. The call that observes it returns a
-device-lost error, the context is poisoned, and every later call is refused as poisoned without touching
-the device. Once a device cannot clean up after a failed step, the engine itself is poisoned and refuses
-all work.
+A device fault is a typed error on every backend and never aborts the process.
 
-Every wait for the device is bounded by a configured timeout (600 seconds by default) on ROCm, wgpu and
-raw Vulkan. A wait that outlasts it fails with a typed timeout error and poisons the context, so a hung
-device surfaces as an error instead of a hang.
+| Backend | Fault source |
+| --- | --- |
+| ROCm | HSA queue error callback and system event handler |
+| PTX | Sticky CUDA error |
+| wgpu | Device-lost callback |
+| Vulkan | Failed submission or fence wait; the device is poisoned |
 
-ROCm and PTX execute a real device trap for a failed kernel check. A SPIR-V compute shader has no trap
-instruction, so on raw Vulkan and wgpu a failing check accumulates a per-thread fault bit in a reserved
-error word and the dispatch continues under robust buffer access (the Vulkan runtime refuses a device that
-lacks it). The result of that dispatch is discarded, and on both `synchronize` raises a typed fault
-naming the kernel and the trap code.
-
-A step that fails after it replayed leaves the executable needing a complete state reset: a kernel
-assert, a rejected validation packet and a device failure all mark it, and `step` refuses until
-`reset_state` clears it.
+- The call that sees a fault returns a device-lost error and poisons the context; later calls are refused without touching the
+  device. If a device cannot clean up after a failed step, the engine is poisoned too.
+- Waits on ROCm, wgpu and raw Vulkan time out (600 s by default) with a typed error and poison the context.
+- ROCm and PTX execute a device trap for a failed kernel check. SPIR-V has none, so Vulkan and wgpu set a fault bit and
+  continue under robust buffer access; `synchronize` then raises a typed fault naming the kernel and trap code.
+- A step that fails after replay needs `reset_state`; `step` refuses until it runs.
 
 ## Verification
 
-`poot-eval` is the CPU reference: one evaluation walk, `poot_eval::eval(&graph, &inputs, EvalOptions)`,
-which returns an `Evaluation` (primary output, carried state, optional environment). Tests and device
-checks call it as the CPU reference; generation never does.
-The verification contract has three tiers; these are requirements, not a claim that every current
-path has complete coverage:
+`poot_eval::eval(&graph, &inputs, EvalOptions)` is the CPU reference. Tests and device checks call it; generation never does.
+Three tiers (requirements, not a claim of complete coverage):
 
-1. **Bit-exact where it can be.** Semantic graph transforms must preserve oracle results bit for bit.
-   Integer and packed-byte work, movement ops, routing ties and capture versus eager on one device are
-   bit-exact on every backend.
-2. **Stated tolerance for floats.** Device float results match the oracle over every element of every
-   output and carried state, within a tolerance derived from how much the program reassociates.
-3. **Tokens on real checkpoints.** Greedy tokens match an independent reference (Hugging Face
-   transformers, llama.cpp); a flip is allowed only where the reference's top-two margin is inside the
-   tier 2 tolerance. Instruct models are checked with their chat template.
+1. **Bit-exact where it can be:** graph transforms, integer and packed-byte work, movement ops, routing ties, capture versus
+   eager on one device.
+2. **Stated tolerance for floats:** every output and carried-state element, within a tolerance derived from reassociation.
+3. **Tokens on real checkpoints:** greedy tokens match an independent reference (Hugging Face transformers, llama.cpp). A flip
+   is allowed only inside the reference's top-two margin. Instruct models use their chat template.
 
-NaN or infinity where the oracle is finite is a failure at any tolerance. A test that skips because its
-device is missing is reported as a skip, not a pass.
+NaN or infinity where the oracle is finite fails at any tolerance. A test skipped for a missing device is reported as a skip.

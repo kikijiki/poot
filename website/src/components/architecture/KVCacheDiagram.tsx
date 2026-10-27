@@ -51,7 +51,7 @@ function FixedView() {
 
   return (
     <div>
-      <svg width={W} height={160} viewBox={`0 0 ${W} 160`} style={{ display: 'block', margin: '0 auto', maxWidth: '100%' }}>
+      <svg role="img" aria-label="Fixed-capacity K/V allocation: a pre-allocated bar of cap positions" width={W} height={160} viewBox={`0 0 ${W} 160`} style={{ display: 'block', margin: '0 auto', maxWidth: '100%' }}>
         {/* Allocation bar */}
         <text x={W / 2} y={18} textAnchor="middle" fontSize={11} fontWeight={600} fill="var(--ifm-color-emphasis-700)">
           K/V allocation: cap = {MAX_SEQ} positions (pre-allocated)
@@ -124,7 +124,7 @@ function PagedView() {
 
   return (
     <div>
-      <svg width={W} height={240} viewBox={`0 0 ${W} 240`} style={{ display: 'block', margin: '0 auto', maxWidth: '100%' }}>
+      <svg role="img" aria-label="Paged K/V: a shared block pool with per-sequence block tables" width={W} height={240} viewBox={`0 0 ${W} 240`} style={{ display: 'block', margin: '0 auto', maxWidth: '100%' }}>
         {/* Pool */}
         <text x={W / 2} y={18} textAnchor="middle" fontSize={11} fontWeight={600} fill="var(--ifm-color-emphasis-700)">
           Shared block pool: {BLOCK_SIZE} tokens/block

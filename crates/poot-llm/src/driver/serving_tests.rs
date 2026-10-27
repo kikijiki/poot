@@ -937,7 +937,9 @@ fn misuse_is_a_typed_refusal() {
 #[test]
 fn generate_with_the_contiguous_slot_taken_is_slots_busy() {
     let mut rig = rig_default(logits_script(vec![favoring(1)]));
-    rig.driver.extend(&contiguous(&[Head::GREEDY])).unwrap();
+    rig.driver
+        .extend(&ServingShapes::turn(Layout::Contiguous, &[Head::GREEDY]))
+        .unwrap();
     let seq = open_one(&mut rig, &[1], AdapterRef::Base);
     let err = run(&mut rig, request_generate());
     assert!(
@@ -1311,7 +1313,10 @@ fn generate_is_the_serving_surface_driven_for_one_row() {
     let out = run(&mut generated, request(&prompt, max_new, Sampler::greedy())).unwrap();
 
     let mut manual = rig_default(script());
-    manual.driver.extend(&contiguous(&[Head::GREEDY])).unwrap();
+    manual
+        .driver
+        .extend(&ServingShapes::turn(Layout::Contiguous, &[Head::GREEDY]))
+        .unwrap();
     let Admission::Opened { seq, .. } = manual
         .driver
         .open(SeqRequest::new(&prompt, max_new, AdapterRef::Base))
@@ -1800,7 +1805,9 @@ fn a_token_id_at_the_vocabulary_size_is_refused_at_every_open_entry() {
     assert_eq!(rig.driver.free_blocks(), free, "a refusal held no blocks");
 
     let mut rig = rig_default(picks_one());
-    rig.driver.extend(&contiguous(&[Head::GREEDY])).unwrap();
+    rig.driver
+        .extend(&ServingShapes::turn(Layout::Contiguous, &[Head::GREEDY]))
+        .unwrap();
     let seq = open_one(&mut rig, &[1, 2, 3], AdapterRef::Base);
     refused(rig.driver.resume(seq, &bad, 2).unwrap_err());
 }
@@ -1901,7 +1908,9 @@ fn a_failed_row_reset_gives_the_adapter_lease_back() {
 #[test]
 fn a_failed_row_reset_in_resume_leaves_the_sequence_untouched() {
     let mut rig = rig_default(picks_one());
-    rig.driver.extend(&contiguous(&[Head::GREEDY])).unwrap();
+    rig.driver
+        .extend(&ServingShapes::turn(Layout::Contiguous, &[Head::GREEDY]))
+        .unwrap();
     let seq = open_one(&mut rig, &[1, 2, 3], AdapterRef::Base);
     let held = |rig: &Rig<Serving>| format!("{:?}", rig.driver.state.seqs[&seq]);
     let before = held(&rig);

@@ -193,6 +193,18 @@ pub enum Capability {
         /// The packed op with no admitting row.
         op: crate::packed_block_float::PackedKernelOpKind,
     },
+    /// A packed source's bit offsets do not fit the `usize` this backend's kernels index with: a kernel
+    /// addresses the source by `block * block_bits + bit` in `usize`, which is 32 bits on SPIR-V for Vulkan,
+    /// so a source of more than `u32::MAX` bits (512 MiB) would wrap rather than read its high blocks
+    /// (POOT-1317). A 64-bit backend (PTX, ROCm) has no such limit; the refusal is scoped to the one that does.
+    PackedSourceAddressing {
+        /// The packed format.
+        format: poot_quant::format::WeightFormat,
+        /// The uploaded source's size in bits, guard word included.
+        source_bits: u64,
+        /// The most bits this backend's kernels address.
+        max_bits: u64,
+    },
     /// The plan is not an AIE sequential schedule: an AIE core runs one loop, so a plan built from a thread
     /// grid or a shipped GPU template cannot run there.
     AieSchedule,
@@ -201,7 +213,7 @@ pub enum Capability {
     GpuOnly,
     /// The plan's shape ABI does not fit the AIE target's measured limits (POOT-664): the limit that is
     /// unknown, or the need and the offer.
-    AieLimit(crate::AieLimitRefusal),
+    AieLimit(poot_npu_artifacts::AieLimitRefusal),
     /// The plan has no AIE shape ABI (the choice is not an AIE sequential schedule, or a binding is
     /// malformed).
     AieAbi(crate::AieAbiRefusal),
@@ -485,6 +497,14 @@ impl fmt::Display for Capability {
             Capability::PackedLowering { format, op } => {
                 write!(f, "no packed lowering admits {format:?} for {op:?}")
             }
+            Capability::PackedSourceAddressing {
+                format,
+                source_bits,
+                max_bits,
+            } => write!(
+                f,
+                "a {format:?} source of {source_bits} bits is past the {max_bits} bits this backend's kernels address"
+            ),
             Capability::AieSchedule => f.write_str(
                 "the plan is not an AIE sequential schedule (a shipped GPU template or a thread-grid kernel)",
             ),

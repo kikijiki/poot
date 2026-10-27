@@ -182,5 +182,22 @@ pub fn cases() -> Vec<Case> {
         ids: selected_ids(&pos, blocks, ratio, blocks, 1 << 20),
         pos,
     });
+    // A prefill chunk of a wide GQA group (six query heads per key/value head, as a block-selected layer's
+    // workgroup serves them together): two batch rows of five queries, one on the first block, one before any
+    // block completes, the rest deep.
+    let pos = vec![0, 2, 19, 20, 39, 3, 11, 24, 31, 38];
+    cases.push(Case {
+        label: "prefill of a wide GQA group".into(),
+        batch: 2,
+        hq: 12,
+        n_rep: 6,
+        lq: 5,
+        lk,
+        d: 8,
+        ratio,
+        k: 3,
+        ids: selected_ids(&pos, blocks, ratio, 3, 1 << 20),
+        pos,
+    });
     cases
 }

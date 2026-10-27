@@ -11,6 +11,7 @@ use std::sync::Arc;
 use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::ops::sampling::SampleSpec;
 use poot_graph_plan::CompileOptions;
+use poot_models::model::KvDtype;
 use poot_models::registry::{RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::DeviceBackend;
@@ -165,6 +166,7 @@ fn handle_with(weights: Weights, eos: u32, chat_template: ChatTemplate) -> Arc<M
 pub(super) fn options(chunk: usize, capacity: usize) -> DriverOptions {
     let compile = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(capacity),
@@ -1135,8 +1137,8 @@ const RECORDED: &[RecordedFamily] = &[
         prompt: &PROMPT,
         tied_head: false,
         tokens: [
-            38, 45, 2, 44, 16, 27, 35, 25, 34, 10, 28, 16, 14, 10, 15, 35, 36, 3, 38, 30, 4, 39,
-            18, 21,
+            22, 6, 32, 38, 38, 29, 17, 14, 41, 19, 40, 32, 12, 10, 33, 36, 42, 33, 1, 29, 24, 15,
+            8, 47,
         ],
     },
     RecordedFamily {
@@ -1144,8 +1146,8 @@ const RECORDED: &[RecordedFamily] = &[
         prompt: &PROMPT,
         tied_head: false,
         tokens: [
-            22, 22, 46, 11, 6, 18, 7, 22, 26, 28, 45, 9, 11, 13, 30, 33, 28, 30, 12, 31, 11, 5, 11,
-            11,
+            22, 22, 0, 21, 36, 11, 3, 43, 19, 19, 36, 14, 22, 26, 33, 22, 41, 29, 26, 16, 29, 26,
+            22, 31,
         ],
     },
     RecordedFamily {
@@ -1153,8 +1155,7 @@ const RECORDED: &[RecordedFamily] = &[
         prompt: &PROMPT,
         tied_head: false,
         tokens: [
-            12, 6, 34, 37, 30, 7, 38, 40, 18, 38, 7, 40, 7, 6, 34, 21, 38, 46, 27, 7, 43, 31, 28,
-            28,
+            5, 38, 7, 12, 33, 8, 31, 15, 5, 7, 7, 5, 7, 7, 7, 38, 7, 40, 40, 18, 37, 32, 16, 32,
         ],
     },
     // qwen35 (POOT-572) has no recording from the deleted `Runner`: its tokens are the CPU oracle's greedy decode over the
@@ -4693,9 +4694,17 @@ fn minimax_three_positions_match_the_reference(choice: BackendChoice) {
         .find(|recorded| recorded.family == "minimax_m2")
         .unwrap();
     let handle = recorded_family_handle(recorded);
-    let Some(mut driver) = driver(choice, &handle, 8, CAPACITY) else {
+    // The literals are the f32 reference's, so the driver runs the exact f32 cache.
+    let Some(executor) = open(choice) else {
         return;
     };
+    let exact = DriverOptions {
+        kv_dtype: Some(KvDtype::F32),
+        ..options(8, CAPACITY)
+    };
+    let mut driver = Driver::new(Arc::clone(&handle), executor, exact)
+        .unwrap()
+        .serve(Layout::Contiguous);
     let (tokens, logprobs) = generate_traced(&mut driver, &PROMPT3, 3);
     assert_eq!(tokens, TOKENS, "minimax_m2 on {choice:?}");
     for (step, (got, want)) in logprobs.iter().zip(LOGPROBS).enumerate() {
@@ -4731,7 +4740,7 @@ fn oracle_step_logits(
     let mut state: Vec<poot_tensor::HostTensor> = Vec::new();
     let mut rows = Vec::new();
     for &(start, len) in steps {
-        let shape = StepShape::new(nz(1), nz(len), nz(capacity));
+        let shape = StepShape::new(nz(1), nz(len), nz(capacity)).with_kv_dtype(driver_kv(handle));
         let graph = model
             .trace(
                 &StepSpec::step(shape),
@@ -4764,7 +4773,7 @@ fn oracle_step_logits(
                         poot_tensor::DType::I32 => {
                             poot_tensor::HostTensor::i32(aval.shape.clone(), vec![0; aval.numel()])
                         }
-                        _ => poot_tensor::HostTensor::zeros(aval.shape.clone()),
+                        _ => poot_tensor::HostTensor::zeros_of(aval.dtype, aval.shape.clone()),
                     }
                 })
                 .collect();
@@ -4787,6 +4796,12 @@ fn oracle_step_logits(
         );
     }
     rows
+}
+
+/// The KV cache dtype a driver opened with default options runs `handle`'s model in: an oracle checking such a
+/// driver traces it, so the two evaluate the same narrowed cache (POOT-1395).
+fn driver_kv(handle: &ModelHandle) -> KvDtype {
+    KvDtype::resolve(None, handle.config().kv_dtype)
 }
 
 /// `logits` as log-probabilities.
@@ -4954,7 +4969,9 @@ fn oracle(
         .unwrap();
     let state: Vec<HostTensor> = graph
         .state()
-        .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+        .map(|(input, _)| {
+            HostTensor::zeros_of(graph.aval(input).dtype, graph.aval(input).shape.clone())
+        })
         .collect();
     eval_mapped(&graph, handle.store(), model.weights(), slots, &state)
         .0
@@ -6005,25 +6022,25 @@ const PLE_HISTORIES: [[u32; 6]; 3] = [
 ];
 const PLE_HISTORIES_TOP5: [[(u32, f64); 5]; 3] = [
     [
-        (25, -1.903_203_6),
-        (33, -2.256_853_4),
-        (15, -3.129_722),
-        (21, -3.237_417),
-        (1, -3.352_075_7),
+        (8, -2.235_063_5),
+        (30, -2.696_976_8),
+        (40, -3.029_003_7),
+        (23, -3.061_339_9),
+        (25, -3.124_625),
     ],
     [
-        (35, -2.689_749_4),
-        (25, -2.868_450_9),
-        (30, -2.914_160_6),
-        (26, -2.922_117_3),
-        (2, -3.010_46),
+        (2, -2.744_261_7),
+        (40, -3.040_147_7),
+        (25, -3.060_595_2),
+        (3, -3.182_795_8),
+        (23, -3.196_833_6),
     ],
     [
-        (32, -2.643_691_5),
-        (21, -2.647_688_7),
-        (38, -2.836_676_7),
-        (23, -2.846_178_8),
-        (29, -2.876_545),
+        (7, -2.550_995_5),
+        (34, -2.828_969_5),
+        (23, -2.847_241),
+        (13, -2.861_092_5),
+        (46, -2.909_138_8),
     ],
 ];
 
@@ -7169,18 +7186,19 @@ fn qwen_vl_oracle_logprobs(
         .collect();
     let graph = model
         .trace(
-            &StepSpec::step(StepShape::new(
-                nz(1),
-                nz(n),
-                nz(model.config().max_positions),
-            ))
+            &StepSpec::step(
+                StepShape::new(nz(1), nz(n), nz(model.config().max_positions))
+                    .with_kv_dtype(KvDtype::F32),
+            )
             .carrying(EMBEDS),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
     let state: Vec<HostTensor> = graph
         .state()
-        .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+        .map(|(input, _)| {
+            HostTensor::zeros_of(graph.aval(input).dtype, graph.aval(input).shape.clone())
+        })
         .collect();
     let activation = |tag| SlotKey::new(Slot::Activation, Some(tag));
     let slots = [
@@ -7244,7 +7262,13 @@ fn qwen25_vl_image_prompt_first_step_matches_the_cpu_oracle(choice: BackendChoic
         return;
     };
     let mut towers = OracleCheckedTowers::open(&handle, vision);
-    let mut text = Driver::new(Arc::clone(&handle), text, options(16, 32))
+    // The exact f32 cache on both sides: the row checks the image plumbing at a tolerance below one f16
+    // rounding step of a cached key.
+    let exact = DriverOptions {
+        kv_dtype: Some(KvDtype::F32),
+        ..options(16, 32)
+    };
+    let mut text = Driver::new(Arc::clone(&handle), text, exact)
         .unwrap()
         .serve(Layout::Contiguous);
     let prepared =
@@ -7644,4 +7668,195 @@ fn a_second_turn_over_a_rewritten_history_still_equals_one_run_wgpu() {
     // The first context is `b c d a`; the second renders `b c d <reply> e f g a`: three tokens are shared.
     let timing = run.second.timing.expect("a session measures its phases");
     assert_eq!(timing.prefill.tokens, run.context - 3);
+}
+
+/// The log-probability of every vocabulary token at the prompt's last position, as the head's host path
+/// reads it back: the first generated token of a one-token request that records the whole distribution.
+fn last_position_logprobs(driver: &mut Driver<Serving>, prompt: &[u32]) -> Vec<f32> {
+    let generated = driver
+        .generate(
+            GenerateRequest {
+                prompt: prompt.to_vec(),
+                max_new: 1,
+                sampler: Sampler::greedy().with_logprobs(VOCAB),
+                stops: Vec::new(),
+                ignore_eos: false,
+            },
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .unwrap();
+    let mut top = generated.logprobs[0].top.clone();
+    top.sort_by_key(|&(token, _)| token);
+    assert_eq!(top.len(), VOCAB, "the whole distribution was recorded");
+    top.into_iter().map(|(_, logprob)| logprob).collect()
+}
+
+/// The executor noise floor of a chunked against a one-shot prefill, per log-probability: the packed-vs-dense
+/// bound the rows above already use (`assert_same_trace`). A different chunk runs the same math in other
+/// tile shapes and reduction orders, so the logits are not bit-equal; a wrong position or state carry moves a
+/// log-probability by far more.
+const CHUNKED_PREFILL_LOGPROB_TOLERANCE: f32 = 1e-3;
+
+/// The widest log-probability difference between a one-shot and a chunked prefill, and the spread of the
+/// one-shot distribution. A non-finite log-probability on either side fails here, naming the side and the
+/// token: `f32::max` skips a NaN, so a fold over the differences would call a broken output "close".
+#[track_caller]
+fn chunked_prefill_difference(one_shot: &[f32], in_pieces: &[f32]) -> (f32, f32) {
+    for (side, logprobs) in [("one-shot", one_shot), ("chunked", in_pieces)] {
+        if let Some(token) = logprobs.iter().position(|v| !v.is_finite()) {
+            panic!(
+                "the {side} prefill's log-probability of token {token} is {}",
+                logprobs[token]
+            );
+        }
+    }
+    let widest = poot_test_util::max_abs_error(in_pieces, one_shot);
+    let spread = one_shot.iter().copied().fold(f32::MIN, f32::max)
+        - one_shot.iter().copied().fold(f32::MAX, f32::min);
+    (widest, spread)
+}
+
+/// The comparison refuses a NaN on either side, and measures finite values. Mutation: compare with
+/// `fold(0.0, f32::max)` over the differences and no finite check; the NaN rows stop panicking.
+#[test]
+#[should_panic(expected = "the one-shot prefill's log-probability of token 1 is NaN")]
+fn the_chunked_prefill_comparison_refuses_a_nan_one_shot() {
+    chunked_prefill_difference(&[0.0, f32::NAN, -1.0], &[0.0, -2.0, -1.0]);
+}
+
+#[test]
+#[should_panic(expected = "the chunked prefill's log-probability of token 2 is NaN")]
+fn the_chunked_prefill_comparison_refuses_a_nan_chunked() {
+    chunked_prefill_difference(&[0.0, -2.0, -1.0], &[0.0, -2.0, f32::NAN]);
+}
+
+#[test]
+fn the_chunked_prefill_comparison_measures_finite_values() {
+    let (widest, spread) = chunked_prefill_difference(&[0.0, -2.0, -1.0], &[0.0, -2.5, -1.0]);
+    assert_eq!((widest, spread), (0.5, 2.0));
+}
+
+/// POOT-1327: prefilling a prompt in chunks gives the logits of prefilling it whole, within the executor noise
+/// floor. `family`'s fixture, with weights scaled so the distribution is far from uniform, prefills a
+/// seven-token prompt in one piece and in pieces of three (3, 3, 1): each later piece attends to the earlier
+/// pieces' cache (a three-key window crosses the boundaries for gemma3) or continues their recurrent state
+/// (qwen3next). Every one of the 48 log-probabilities agrees within [`CHUNKED_PREFILL_LOGPROB_TOLERANCE`], the
+/// largest difference is printed, and the first token is the same.
+/// Mutation: start each piece after the first one position late (`RowPlan::start` + 1 in `plan_rows`); the
+/// distributions diverge and every family goes red.
+fn chunked_prefill_matches_one_shot(family: &str, choice: BackendChoice) {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == family)
+        .unwrap();
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
+    let mut config = fixture.config.clone();
+    config["eos_token_id"] = serde_json::json!(NO_EOS);
+    let raw = RawConfig::HfJson {
+        config: &config,
+        generation: None,
+        preprocessor: None,
+    };
+    let handle = Arc::new(
+        ModelHandle::from_checkpoint(&raw, scaled(&fixture.store, 4.0), &registry, |_| {
+            Ok(fixture_text())
+        })
+        .unwrap(),
+    );
+    // Both executors open before either runs (see `fixture_tokens_equal_the_recorded_literals`).
+    let Some(mut whole) = driver(choice, &handle, PROMPT.len(), CAPACITY) else {
+        return;
+    };
+    let Some(mut chunked) = driver(choice, &handle, 3, CAPACITY) else {
+        return;
+    };
+    let one_shot = last_position_logprobs(&mut whole, &PROMPT);
+    let in_pieces = last_position_logprobs(&mut chunked, &PROMPT);
+    let (widest, spread) = chunked_prefill_difference(&one_shot, &in_pieces);
+    eprintln!(
+        "chunked prefill, {family} on {choice:?}: widest log-probability difference {widest:e} \
+         over a spread of {spread:.3}"
+    );
+    assert!(
+        spread > 0.5,
+        "{family}: the distribution must be far from uniform for the row to mean anything: {spread}"
+    );
+    assert!(
+        widest <= CHUNKED_PREFILL_LOGPROB_TOLERANCE,
+        "{family} on {choice:?}: chunked prefill moved a log-probability by {widest:e}"
+    );
+    let argmax = |values: &[f32]| {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(token, _)| token)
+    };
+    assert_eq!(
+        argmax(&one_shot),
+        argmax(&in_pieces),
+        "{family}: the first token"
+    );
+}
+
+fn chunked_prefill_matches_one_shot_dense(choice: BackendChoice) {
+    chunked_prefill_matches_one_shot("qwen2", choice);
+}
+per_backend!(
+    BackendChoice,
+    chunked_prefill_matches_one_shot_dense,
+    chunked_prefill_matches_one_shot_dense_wgpu,
+    chunked_prefill_matches_one_shot_dense_rocm,
+    chunked_prefill_matches_one_shot_dense_ptx
+);
+#[test]
+fn chunked_prefill_matches_one_shot_dense_vulkan() {
+    chunked_prefill_matches_one_shot_dense(BackendChoice::Vulkan);
+}
+
+fn chunked_prefill_matches_one_shot_moe(choice: BackendChoice) {
+    chunked_prefill_matches_one_shot("qwen3moe", choice);
+}
+per_backend!(
+    BackendChoice,
+    chunked_prefill_matches_one_shot_moe,
+    chunked_prefill_matches_one_shot_moe_wgpu,
+    chunked_prefill_matches_one_shot_moe_rocm,
+    chunked_prefill_matches_one_shot_moe_ptx
+);
+#[test]
+fn chunked_prefill_matches_one_shot_moe_vulkan() {
+    chunked_prefill_matches_one_shot_moe(BackendChoice::Vulkan);
+}
+
+fn chunked_prefill_matches_one_shot_sliding_window(choice: BackendChoice) {
+    chunked_prefill_matches_one_shot("gemma3", choice);
+}
+per_backend!(
+    BackendChoice,
+    chunked_prefill_matches_one_shot_sliding_window,
+    chunked_prefill_matches_one_shot_sliding_window_wgpu,
+    chunked_prefill_matches_one_shot_sliding_window_rocm,
+    chunked_prefill_matches_one_shot_sliding_window_ptx
+);
+#[test]
+fn chunked_prefill_matches_one_shot_sliding_window_vulkan() {
+    chunked_prefill_matches_one_shot_sliding_window(BackendChoice::Vulkan);
+}
+
+fn chunked_prefill_matches_one_shot_recurrent(choice: BackendChoice) {
+    chunked_prefill_matches_one_shot("qwen3next", choice);
+}
+per_backend!(
+    BackendChoice,
+    chunked_prefill_matches_one_shot_recurrent,
+    chunked_prefill_matches_one_shot_recurrent_wgpu,
+    chunked_prefill_matches_one_shot_recurrent_rocm,
+    chunked_prefill_matches_one_shot_recurrent_ptx
+);
+#[test]
+fn chunked_prefill_matches_one_shot_recurrent_vulkan() {
+    chunked_prefill_matches_one_shot_recurrent(BackendChoice::Vulkan);
 }

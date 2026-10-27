@@ -646,6 +646,84 @@ pub fn no_contract_probe_kernel(marked: bool) -> Body {
     Body::new("no_contract_probe", 5, locals, vec![bb0, bb1, bb2, bb3])
 }
 
+/// `out[i] = a[i] * b[i] + c[i]` over three parallel f32 slices: one [`Rvalue::MulAdd`] when `fused`, a plain
+/// multiply then a plain add otherwise.
+pub fn mul_add_probe_kernel(fused: bool) -> Body {
+    let f32_ro = slice_f32(false);
+    let locals = vec![
+        ld(Ty::Unit, false),
+        ld(f32_ro.clone(), false), // 1 a
+        ld(f32_ro.clone(), false), // 2 b
+        ld(f32_ro, false),         // 3 c
+        ld(slice_f32(true), true), // 4 out
+        ld(Ty::Usize, false),      // 5 i
+        ld(Ty::Usize, false),      // 6 len
+        ld(Ty::Bool, false),       // 7 cmp
+        ld(Ty::F32, false),        // 8 product (unfused only)
+        ld(Ty::F32, false),        // 9 r
+    ];
+    let (a, b, c, out, i, len, cmp, product, r) = (
+        local(1),
+        local(2),
+        local(3),
+        local(4),
+        local(5),
+        local(6),
+        local(7),
+        local(8),
+        local(9),
+    );
+    let bb0 = BasicBlock {
+        statements: vec![],
+        terminator: Terminator::ThreadIndexCall {
+            destination: Place::local(i),
+            dim: IndexAxis::X,
+            target: BlockId { index: 1 },
+        },
+    };
+    let bb1 = BasicBlock {
+        statements: vec![
+            Statement::Assign(Place::local(len), Rvalue::Len(Place::local(out))),
+            Statement::Assign(
+                Place::local(cmp),
+                Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(i)), copy(Place::local(len))),
+            ),
+        ],
+        terminator: guard(cmp, 3, 2),
+    };
+    let compute = if fused {
+        vec![Statement::Assign(
+            Place::local(r),
+            Rvalue::MulAdd(copy(elem(a, i)), copy(elem(b, i)), copy(elem(c, i))),
+        )]
+    } else {
+        vec![
+            Statement::Assign(
+                Place::local(product),
+                Rvalue::BinaryOp(BinOp::Mul, copy(elem(a, i)), copy(elem(b, i))),
+            ),
+            Statement::Assign(
+                Place::local(r),
+                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(product)), copy(elem(c, i))),
+            ),
+        ]
+    };
+    let mut statements = compute;
+    statements.push(Statement::Assign(
+        elem(out, i),
+        Rvalue::Use(copy(Place::local(r))),
+    ));
+    let bb2 = BasicBlock {
+        statements,
+        terminator: Terminator::Return,
+    };
+    let bb3 = BasicBlock {
+        statements: vec![],
+        terminator: Terminator::Return,
+    };
+    Body::new("mul_add_probe", 4, locals, vec![bb0, bb1, bb2, bb3])
+}
+
 // --- poot-kernel-ir interp helpers (ex poot-kernel-ir/src/interp.rs) ----------------------------------------
 
 /// The workgroup counts that cover `threads` global `X` indices of a body with a one-dimensional workgroup.
@@ -1033,33 +1111,31 @@ pub fn workgroup_fence_spin_wait(name: &str, threads: u32) -> Body {
 /// subgroup's) WMMA/cooperative-matrix `m16n16k16` load/mma/store. A/B are row-major F16 slices (stride 16);
 /// C a row-major f32 slice. Launched with one warp/subgroup (workgroup_size [32,1,1]).
 pub fn wmma_tile(name: &str) -> Body {
+    wmma_tile_of(name, WmmaDtype::F16)
+}
+
+/// [`wmma_tile`] over `dtype` operand fragments (F16 or Bf16), the A/B slices typed to match.
+pub fn wmma_tile_of(name: &str, dtype: WmmaDtype) -> Body {
+    let operand = match dtype {
+        WmmaDtype::F16 => Ty::F16,
+        WmmaDtype::Bf16 => Ty::BF16,
+    };
     let locals = vec![
         ld(Ty::Unit, false),
-        ld(slice_dtype(Ty::F16, false), false), // 1 a (f16, row-major 16x16)
-        ld(slice_dtype(Ty::F16, false), false), // 2 b
-        ld(slice_f32(true), true),              // 3 c (f32 out)
-        ld(Ty::Usize, false),                   // 4 idx0
+        ld(slice_dtype(operand.clone(), false), false), // 1 a (row-major 16x16)
+        ld(slice_dtype(operand, false), false),         // 2 b
+        ld(slice_f32(true), true),                      // 3 c (f32 out)
+        ld(Ty::Usize, false),                           // 4 idx0
         ld(
-            Ty::Fragment(FragmentTy::matrix(
-                WmmaMat::A,
-                WmmaDtype::F16,
-                WmmaShape::M16N16K16,
-            )),
+            Ty::Fragment(FragmentTy::matrix(WmmaMat::A, dtype, WmmaShape::M16N16K16)),
             false,
         ), // 5 af
         ld(
-            Ty::Fragment(FragmentTy::matrix(
-                WmmaMat::B,
-                WmmaDtype::F16,
-                WmmaShape::M16N16K16,
-            )),
+            Ty::Fragment(FragmentTy::matrix(WmmaMat::B, dtype, WmmaShape::M16N16K16)),
             false,
         ), // 6 bf
         ld(
-            Ty::Fragment(FragmentTy::accumulator(
-                WmmaDtype::F16,
-                WmmaShape::M16N16K16,
-            )),
+            Ty::Fragment(FragmentTy::accumulator(dtype, WmmaShape::M16N16K16)),
             false,
         ), // 7 acc
     ];
@@ -1073,12 +1149,12 @@ pub fn wmma_tile(name: &str) -> Body {
             Rvalue::Use(Operand::Const(Constant::Usize(0))),
         ),
         Statement::WmmaZero {
-            dtype: WmmaDtype::F16,
+            dtype,
             shape: WmmaShape::M16N16K16,
             dst: acc,
         },
         Statement::WmmaLoad {
-            dtype: WmmaDtype::F16,
+            dtype,
             shape: WmmaShape::M16N16K16,
             which: WmmaMat::A,
             tile: tile(a),
@@ -1086,7 +1162,7 @@ pub fn wmma_tile(name: &str) -> Body {
             dst: af,
         },
         Statement::WmmaLoad {
-            dtype: WmmaDtype::F16,
+            dtype,
             shape: WmmaShape::M16N16K16,
             which: WmmaMat::B,
             tile: tile(b),
@@ -1094,7 +1170,7 @@ pub fn wmma_tile(name: &str) -> Body {
             dst: bf,
         },
         Statement::WmmaMma {
-            dtype: WmmaDtype::F16,
+            dtype,
             shape: WmmaShape::M16N16K16,
             a: af,
             b: bf,
@@ -1102,7 +1178,7 @@ pub fn wmma_tile(name: &str) -> Body {
             dst: acc,
         },
         Statement::WmmaStore {
-            dtype: WmmaDtype::F16,
+            dtype,
             shape: WmmaShape::M16N16K16,
             tile: tile(c),
             stride: 16,

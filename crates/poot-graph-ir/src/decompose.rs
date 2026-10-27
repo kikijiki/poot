@@ -103,15 +103,24 @@ pub fn decompose(
                 (KvBound::Live, &[operand, len]) => (Some(operand), Some(len)),
                 _ => return Ok(None),
             };
-            // The paged form is the dense one over the views its slot map gathers out of the pools.
+            // The paged form is the dense one over the views its slot map gathers out of the pools. A key or
+            // value stored narrower than the query is widened to it where it is read.
+            let dtype = operands[0].dtype;
             let (keys, v) = match (attrs.key, extra_key) {
-                (KeyLayout::Single, None) => (ops::AttentionKeys::Single(k), v),
-                (KeyLayout::Split { .. }, Some(shared)) => {
-                    (ops::AttentionKeys::Split { head: k, shared }, v)
-                }
+                (KeyLayout::Single, None) => (
+                    ops::AttentionKeys::Single(widened(&b, k, dtype)?),
+                    widened(&b, v, dtype)?,
+                ),
+                (KeyLayout::Split { .. }, Some(shared)) => (
+                    ops::AttentionKeys::Split {
+                        head: widened(&b, k, dtype)?,
+                        shared: widened(&b, shared, dtype)?,
+                    },
+                    widened(&b, v, dtype)?,
+                ),
                 (KeyLayout::Paged, Some(read)) => (
-                    ops::AttentionKeys::Single(ops::paged_view(&b, k, read)?),
-                    ops::paged_view(&b, v, read)?,
+                    ops::AttentionKeys::Single(widened(&b, ops::paged_view(&b, k, read)?, dtype)?),
+                    widened(&b, ops::paged_view(&b, v, read)?, dtype)?,
                 ),
                 _ => return Ok(None),
             };
@@ -148,11 +157,12 @@ pub fn decompose(
             let &[q, k, v, ids, pos] = inputs.as_slice() else {
                 return Ok(None);
             };
+            let dtype = operands[0].dtype;
             ops::selected_attention(
                 &b,
                 q,
-                k,
-                v,
+                widened(&b, k, dtype)?,
+                widened(&b, v, dtype)?,
                 ids,
                 pos,
                 attrs.n_rep,
@@ -251,6 +261,7 @@ pub fn decompose(
         | OpKind::PackedDequant { .. }
         | OpKind::PackedRowGather { .. }
         | OpKind::ArgTopK { .. }
+        | OpKind::ExpertGroup { .. }
         | OpKind::IndexedMatMul
         | OpKind::DynamicUpdateSlice { .. }
         | OpKind::AllReduce { .. }
@@ -267,6 +278,16 @@ pub fn decompose(
         operands: inputs.iter().map(|input| input.id()).collect(),
         graph: b.finish(result)?,
     }))
+}
+
+/// An attention key or value read as the query's `dtype`: a `Cast` of one stored narrower (a two-byte KV
+/// cache, [`crate::op::stored_kv_reads_as`]), the operand itself otherwise.
+fn widened(b: &Builder, x: Traced, dtype: DType) -> Result<Traced, BuilderError> {
+    if b.aval(x)?.dtype == dtype {
+        Ok(x)
+    } else {
+        b.cast(x, dtype)
+    }
 }
 
 /// A fragment that does not stage because the composite is ill typed has no decomposition (`Ok(None)`);
@@ -525,10 +546,11 @@ pub(crate) mod tests {
             OpKind::AllGather { .. } => 28,
             OpKind::RandomUniform { .. } => 29,
             OpKind::SampleToken { .. } => 30,
+            OpKind::ExpertGroup { .. } => 35,
         }
     }
 
-    pub(crate) const VARIANTS: usize = 35;
+    pub(crate) const VARIANTS: usize = 36;
 
     /// The epilogue region `(head + bias) + residual`: local 0 the head result, 1 the bias, 2 the residual.
     fn bias_residual_region() -> FusedRegion {
@@ -749,6 +771,7 @@ pub(crate) mod tests {
                 vec![f32(&[2, 3]), f32(&[3, 4]), f32(&[4]), f32(&[2, 4])],
             ),
             (OpKind::ArgTopK { k: 2 }, vec![f32(&[2, 5])]),
+            (OpKind::ExpertGroup { experts: 4 }, vec![typed(&[6], i32)]),
             (
                 OpKind::IndexedMatMul,
                 vec![f32(&[2, 3]), f32(&[4, 3, 5]), typed(&[2], i32)],

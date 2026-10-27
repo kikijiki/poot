@@ -67,11 +67,21 @@ impl Admits {
     }
 }
 
+/// The half-width storage dtypes an F32 value may be stored in and read back from (POOT-1395).
+const NARROW_STORE: Admits = Admits::Only(&[DType::F16, DType::BF16]);
+
 /// The expectation of every operand of every canonical row, by the row's name prefix. The names are checked
 /// against the rows so the table cannot drift out of step with the fixture.
 fn expectations() -> Vec<(&'static str, Vec<Admits>)> {
     use Admits::{Anything, Nothing, OtherFloats};
     let rigid = |operands: usize| vec![Nothing; operands];
+    // POOT-1395: an F32 attention reads its keys and values from a half-width cache, widening on load.
+    let narrow_kv = |operands: usize| {
+        let mut admits = rigid(operands);
+        admits[1] = NARROW_STORE;
+        admits[2] = NARROW_STORE;
+        admits
+    };
     vec![
         ("neg", vec![OtherFloats]),
         ("add", rigid(2)),
@@ -95,7 +105,8 @@ fn expectations() -> Vec<(&'static str, Vec<Admits>)> {
         ("concat", rigid(2)),
         ("iota", Vec::new()),
         ("gather", vec![Anything, Nothing]),
-        ("scatter_update", rigid(3)),
+        // POOT-1395: a store narrows an F32 update into a half-width base (the KV cache's storage dtype).
+        ("scatter_update", vec![NARROW_STORE, Nothing, Nothing]),
         // `A x B`: the left operand fixes the pairing, a half-width weight may follow an F32 activation.
         ("matmul", vec![Nothing, OtherFloats]),
         ("packed_dequant", rigid(2)),
@@ -113,22 +124,23 @@ fn expectations() -> Vec<(&'static str, Vec<Admits>)> {
             vec![Nothing, OtherFloats, Nothing, Nothing],
         ),
         ("arg_top_k", vec![OtherFloats]),
+        ("expert_group", rigid(1)),
         ("indexed_matmul", vec![Nothing, OtherFloats, Nothing]),
-        ("dyn_update_slice", rigid(3)),
+        ("dyn_update_slice", vec![NARROW_STORE, Nothing, Nothing]),
         ("fused n_in=2", rigid(2)),
         ("fused n_in=1", rigid(1)),
         ("fused_row", vec![OtherFloats]),
-        ("attention", rigid(4)),
-        ("attention", rigid(4)),
-        ("attention", rigid(4)),
-        ("attention", rigid(5)),
-        ("attention", rigid(4)),
-        ("attention", rigid(5)),
+        ("attention", narrow_kv(4)),
+        ("attention", narrow_kv(4)),
+        ("attention", narrow_kv(4)),
+        ("attention", narrow_kv(5)),
+        ("attention", narrow_kv(4)),
+        ("attention", narrow_kv(5)),
         ("rope", rigid(3)),
         ("rope", rigid(3)),
         ("scan delta_rule", rigid(6)),
         ("scan ssd", rigid(7)),
-        ("selected_attention", rigid(5)),
+        ("selected_attention", narrow_kv(5)),
         ("block_top_k", rigid(2)),
         ("all_reduce", vec![OtherFloats]),
         ("all_gather", vec![Anything]),

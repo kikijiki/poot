@@ -26,7 +26,7 @@ use poot_executor::{Device, Executor, NoSync, StepInputs};
 use poot_graph_ir::{
     Builder, Graph, PackedSourceName, Slot, SlotKey, StateRole, Storage, TensorType, ValueId,
 };
-use poot_graph_plan::test_support::gpu_caps;
+use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
 use poot_graph_plan::{
     CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
     staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
@@ -484,7 +484,7 @@ fn packed_prefill_through_serving_paths_is_bit_exact() {
 
 const EXPERTS: usize = 3;
 const ROWS: usize = 5;
-/// Rows past `INDEXED_GEMV_MAX_ROWS` (32), so an indexed contraction of them runs the segmented Tiled schedule.
+/// Rows past `INDEXED_GEMV_MAX_ROWS` (32), so an indexed contraction of them runs the register-tiled expert walk.
 const PREFILL_ROWS: usize = 70;
 const PREFILL_OUT: usize = 11;
 /// Row `m` routed to expert `(2m + 1) % EXPERTS`: every window of rows holds all the experts.
@@ -575,9 +575,13 @@ impl StackBuffers {
                     max_buffer_bytes: 2 * slab,
                     ..gpu_caps(&target)
                 };
-                let split =
-                    poot_graph_plan::legalize(g, &caps, &poot_graph_plan::CompileLimits::STANDARD)
-                        .expect("the stacked table splits");
+                let split = poot_graph_plan::legalize(
+                    g,
+                    gpu_backend(&target),
+                    &caps,
+                    &poot_graph_plan::CompileLimits::STANDARD,
+                )
+                .expect("the stacked table splits");
                 let carriers: Vec<usize> = split
                     .consts()
                     .iter()
@@ -797,10 +801,10 @@ fn an_unaligned_expert_slab_table_runs_bit_exact() {
 }
 
 /// A prefill-sized routed table (wgpu): `PREFILL_ROWS` rows is past the decode row count, so the indexed packed
-/// contraction runs the segmented Tiled schedule (rows routed by `gapped`, so a tile holds several
+/// contraction runs the register-tiled expert walk (rows routed by `gapped`, so a tile holds several
 /// experts and may skip one) over every format, with `N = 11` leaving edge columns in the last column tile. One-hot rows bit-exact
 /// against the oracle decoder. Mutation: take the Tiled step's slab from the wrong segment (`weight.step(.., lo,
-/// ..)` in `indexed_tiled_body`); rows routed to an expert after a gap read another expert and go red.
+/// ..)` in `tiled_body`); rows routed to an expert after a gap read another expert and go red.
 #[test]
 fn packed_indexed_prefill_runs_bit_exact() {
     let Some(device) =
@@ -823,9 +827,9 @@ fn packed_indexed_prefill_runs_bit_exact() {
 }
 
 /// A routed prefill above the wgpu Gemv-body route's `DispatchGridLimit` (more than 65,535 x 256 outputs) (wgpu): `4096 x 4160` outputs of a Q8_0 table is 17.0M, past
-/// 65,535 x 256, which the Gemv-body route refused; the Tiled schedule plans it (folded onto `GroupY` where the
+/// 65,535 x 256, which the Gemv-body route refused; the register-tiled schedule plans it (folded onto `GroupY` where the
 /// device's X extent is smaller than the tile count) and every one of the 17M outputs is bit-exact against the
-/// oracle decoder. Mutation: read the tile index from `GroupX` alone in `indexed_tiled_body`; every tile past
+/// oracle decoder. Mutation: read the tile index from `GroupX` alone in `tiled_body`; every tile past
 /// the first fold row is never computed and goes red.
 #[test]
 fn packed_indexed_prefill_above_the_gemv_grid_limit_runs_bit_exact() {
@@ -1238,7 +1242,7 @@ fn run_dense_activation(
 
 /// SC-001: Q4_K, Q8_0 and FP8 contractions through the packed loaders meet their tier-2 oracle contract. A
 /// dense activation makes every output a sum over every `K` block, so a dropped block or a wrong scale moves
-/// every element; `m == 1` takes the Gemv schedule and `m == 17` the Tiled schedule (ragged against its tile),
+/// every element; `m == 1` takes the Gemv schedule and `m == 17` the register-tiled schedule (ragged against its tile),
 /// and every output element is compared. Mutation: omit one block's contribution in `DecodePlan`'s address or
 /// scale a factor by a nonzero constant; every row goes red.
 #[test]

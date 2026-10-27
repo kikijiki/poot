@@ -45,6 +45,7 @@ use anyhow::Context;
 use serde_json::{json, Value};
 
 use poot_executor::DetailedTiming;
+use poot_llm::driver::capacity::{chunk_candidates, fit_prefill_chunk, Observation};
 use poot_llm::driver::error::DriverError;
 use poot_llm::driver::{
     open_executor, open_timed_executor, BackendChoice, Driver, DriverOptions, DriverStats,
@@ -52,9 +53,11 @@ use poot_llm::driver::{
     ServingShapes, State, Warm,
 };
 use poot_llm::{GenerationControl, Sampler};
+use poot_models::model::KvDtype;
 use poot_models::registry::Registry;
 use poot_profile::{Ceiling, Fit, GB};
 use poot_quant::weights::{WeightEntry, WeightStore};
+use poot_quant::Access;
 
 /// The git sha this binary was built from (`build.rs`); the harness records it with every result.
 const BUILD_SHA: &str = env!("POOT_BUILD_SHA");
@@ -73,14 +76,19 @@ const COMPUTE_DTYPE: &str = "f32";
 const CURVE_BASE_PHRASE: &str = "The quick brown fox jumps over the lazy dog. ";
 
 /// The backends a benchmark row can name: a row's identity is the device that ran it, so `auto` is not one.
-const BACKENDS: [BackendChoice; 3] = [BackendChoice::Ptx, BackendChoice::Rocm, BackendChoice::Wgpu];
+const BACKENDS: [BackendChoice; 4] = [
+    BackendChoice::Ptx,
+    BackendChoice::Rocm,
+    BackendChoice::Wgpu,
+    BackendChoice::Vulkan,
+];
 
 /// The `--backend` of a run: one of [`BACKENDS`], parsed by [`BackendChoice`]'s own `FromStr`.
 fn parse_backend(name: &str) -> anyhow::Result<BackendChoice> {
     let choice: BackendChoice = name.parse()?;
     anyhow::ensure!(
         BACKENDS.contains(&choice),
-        "backend {name:?} is not benchmarked (supported: ptx, rocm, wgpu)"
+        "backend {name:?} is not benchmarked (supported: ptx, rocm, wgpu, vulkan)"
     );
     Ok(choice)
 }
@@ -203,6 +211,9 @@ struct Config {
     /// dispatch that runs too long needs it to bound the per-dispatch work.
     prefill_chunk: Option<usize>,
     prepared_state: Option<PreparedState>,
+    /// The KV cache dtype the cell asks the driver for (`--kv-dtype`); `None` takes the model's preference or
+    /// the engine default. The result names the dtype the driver ran.
+    kv_dtype: Option<KvDtype>,
     /// Artifacts the cache directory held before this process opened anything (`None`: no directory named).
     artifact_entries_at_start: Option<u64>,
 }
@@ -217,7 +228,7 @@ enum Invocation {
 /// Options that take a value and switches that do not. Everything else is an error: a flag the runner
 /// ignores would report a measurement the caller did not ask for. `--synthetic` is part of the suite's
 /// runner contract (the harness passes it to every runner); decode-curve contexts are always synthetic.
-const VALUE_FLAGS: [&str; 14] = [
+const VALUE_FLAGS: [&str; 15] = [
     "--roofline-fit",
     "--model-dir",
     "--gguf",
@@ -232,6 +243,7 @@ const VALUE_FLAGS: [&str; 14] = [
     "--osl",
     "--prefill-chunk",
     "--prepared-state",
+    "--kv-dtype",
 ];
 const SWITCHES: [&str; 6] = [
     "--roofline",
@@ -319,6 +331,10 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
         prepared_state: values
             .get("--prepared-state")
             .map(|name| PreparedState::parse(name))
+            .transpose()?,
+        kv_dtype: values
+            .get("--kv-dtype")
+            .map(|name| name.parse::<KvDtype>())
             .transpose()?,
         artifact_entries_at_start: artifact_cache_entries(),
     };
@@ -542,9 +558,14 @@ fn curve_prefill_chunk(limit: Option<usize>, longest: usize) -> usize {
     limit.map_or(longest, |limit| limit.min(longest))
 }
 
-fn driver_options(capacity: NonZeroUsize, chunk: usize) -> anyhow::Result<DriverOptions> {
+fn driver_options(
+    capacity: NonZeroUsize,
+    chunk: usize,
+    kv_dtype: Option<KvDtype>,
+) -> anyhow::Result<DriverOptions> {
     let chunk = NonZeroUsize::new(chunk).context("a prefill chunk holds a token")?;
     Ok(DriverOptions {
+        kv_dtype,
         trace: poot_llm::driver::serving_trace_limits(capacity),
         prepared: PreparedSetLimits {
             max_entries: NonZeroUsize::new(64).expect("nonzero"),
@@ -655,6 +676,20 @@ impl Generate for DriverCell {
             "host_picks": stats.host_picks,
             "recordings": executor.recordings,
             "replays": executor.replays,
+            "memory": executor
+                .memory
+                .iter()
+                .map(|(role, counters)| {
+                    (
+                        format!("{role:?}").to_lowercase(),
+                        json!({
+                            "live_bytes": counters.live_bytes,
+                            "peak_bytes": counters.peak_bytes,
+                            "allocations": counters.allocations,
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>(),
         }))
     }
 }
@@ -710,10 +745,13 @@ fn checkpoint_digest(store: &WeightStore) -> String {
         match entry {
             WeightEntry::Dense(dense) => {
                 hasher.update(dense.bytes().as_slice());
+                dense.bytes().advise(Access::Release);
             }
             WeightEntry::Packed(payload) => {
                 for role in payload.weight().sources() {
-                    hasher.update(payload.bytes(role));
+                    let bytes = payload.bytes(role);
+                    hasher.update(bytes);
+                    payload.advise(role, 0..bytes.len(), Access::Release);
                 }
             }
         }
@@ -734,12 +772,15 @@ fn open_driver(
     let precision = ensure_store_holds(&config.precision, handle.store())?;
     let checkpoint_digest = checkpoint_digest(handle.store());
     let backend = config.backend;
-    let (longest, chunk, prompts) = match config.mode {
+    // The chunk each prompt prefills in when it fits the device (the whole longest prompt, or the chunk the
+    // caller named), and whether the device may shrink it to fit.
+    let (longest, wanted, shrinkable, prompts) = match config.mode {
         Mode::Single => {
             let prompt = handle.text().encode(&single_prompt(config)?)?.len();
             (
                 prompt + config.gen_tokens,
                 if config.prefill { prompt } else { 1 },
+                config.prefill,
                 vec![prompt],
             )
         }
@@ -748,10 +789,12 @@ fn open_driver(
             (
                 isl + config.osl,
                 curve_prefill_chunk(config.prefill_chunk, isl),
+                config.prefill_chunk.is_none(),
                 config.isl_list.clone(),
             )
         }
     };
+    let wanted = NonZeroUsize::new(wanted).context("a prefill chunk holds a token")?;
     let capacity = NonZeroUsize::new(longest).context("the longest request is empty")?;
     let executor = if config.profile {
         open_timed_executor(backend, DetailedTiming::default_diagnostic())
@@ -762,29 +805,56 @@ fn open_driver(
     let device = executor
         .device_identity()
         .context("the device cannot name its adapter and driver")?;
-    let driver = Driver::new(
-        Arc::clone(&handle),
-        executor,
-        driver_options(capacity, chunk)?,
+    let options = driver_options(capacity, wanted.get(), config.kv_dtype)?;
+    // Every entry the cell's prompts plan to is compiled and added before the first timed token.
+    let shapes = ServingShapes {
+        layout: Layout::Contiguous,
+        rows: &[NonZeroUsize::MIN],
+        heads: &[Head::GREEDY],
+        warm: Warm::Prompts(&prompts),
+        windows: &[],
+        adapters: &[],
+        chain: None,
+    };
+    // The prefill chunk is the one the cell asks for when its plan fits the device, else the largest smaller
+    // one that does, chosen on the plan before the driver allocates. A cell no chunk fits names its
+    // largest allocations and the shortfall instead of failing as a late device out-of-memory. The chunk
+    // is part of the workload: the row states it.
+    let candidates = if shrinkable {
+        chunk_candidates(wanted, handle.config().prefill_granule)
+    } else {
+        vec![wanted]
+    };
+    let fitted = fit_prefill_chunk(
+        &handle,
+        &executor.target_set(),
+        || Observation::of(&*executor),
+        &options,
+        &shapes,
+        &candidates,
     )
-    .context("open the driver")?;
+    .context("fit the prefill chunk to the device")?;
+    if fitted.chunk != wanted {
+        eprintln!(
+            "poot-bench: prefill chunk {} does not fit the device; running with {}",
+            wanted, fitted.chunk
+        );
+    }
+    let prefill_chunk = fitted.chunk;
+    let options = DriverOptions {
+        prefill_chunk,
+        ..options
+    };
+    let driver = Driver::new(Arc::clone(&handle), executor, options).context("open the driver")?;
     let driver = if config.roofline {
         driver.with_phase_timing()
     } else {
         driver
     };
     let initial = driver_counters(&driver);
-    // Every entry the cell's prompts plan to is compiled and added before the first timed token.
+    let kv_dtype = driver.kv_dtype();
     let driver = driver
-        .prepare(&ServingShapes {
-            layout: Layout::Contiguous,
-            rows: &[NonZeroUsize::MIN],
-            heads: &[Head::GREEDY],
-            warm: Warm::Prompts(&prompts),
-            windows: &[],
-            adapters: &[],
-            chain: None,
-        })
+        .prepare(&shapes)
         .map_err(DriverError::from)
         .context("prepare the driver")?;
     Ok((
@@ -801,19 +871,24 @@ fn open_driver(
             adapter: device.adapter,
             driver_version: device.driver,
             checkpoint_digest,
+            prefill_chunk: prefill_chunk.get(),
+            kv_dtype,
         },
     ))
 }
 
 /// What an opened cell ran on, as the opened driver reports it rather than as the request named it: the
 /// registry family the checkpoint resolved to, the precision its store holds, the adapter and driver version
-/// of the device and the digest of the weights it loaded.
+/// of the device, the digest of the weights it loaded, the prefill chunk the cell fitted to the device and the
+/// KV cache dtype the driver resolved.
 struct Resolved {
     family: String,
     precision: String,
     adapter: String,
     driver_version: String,
     checkpoint_digest: String,
+    prefill_chunk: usize,
+    kv_dtype: KvDtype,
 }
 
 /// A cell that opened: the engine and what it ran on.
@@ -1131,6 +1206,8 @@ fn measure(
     line["adapter"] = json!(resolved.adapter);
     line["driver_version"] = json!(resolved.driver_version);
     line["checkpoint_digest"] = json!(resolved.checkpoint_digest);
+    line["prefill_chunk"] = json!(resolved.prefill_chunk);
+    line["kv_dtype"] = json!(resolved.kv_dtype.as_str());
     line["profiled"] = json!(config.profile);
     line["preparation"] = probe.receipt();
     if let Some(receipt) = engine.engine_receipt() {
@@ -1418,7 +1495,6 @@ fn measure_curve(
         .then(|| roofline_fit(curve.iter().map(|point| &point["roofline"])));
     Ok(json!({
         "osl": config.osl,
-        "prefill_chunk": config.prefill_chunk,
         "caveats": caveats,
         "curve": curve,
         "roofline_fit": fit,
@@ -1574,6 +1650,8 @@ mod stub_cell {
             adapter: "stub adapter".to_string(),
             driver_version: "stub driver 1.0".to_string(),
             checkpoint_digest: format!("blake3:{}", "0".repeat(64)),
+            prefill_chunk: 4,
+            kv_dtype: poot_models::model::KvDtype::DEFAULT,
         }
     }
 }
@@ -1588,21 +1666,6 @@ mod tests {
 
     use super::stub_cell::resolved;
     use super::*;
-
-    /// `CARGO_MANIFEST_DIR`, read at runtime (not baked via `env!`): the compile-time macro's value is
-    /// embedded into this test binary's compiled object code at build time, and a shared compile cache
-    /// (kache) that reuses that object across worktrees by source-content hash would then serve whichever
-    /// worktree's path happened to compile it first (card 530's build.rs fix; card 543 review).
-    /// `std::env::var` reads the environment cargo sets fresh for every test-binary invocation, so it is
-    /// correct regardless of which worktree compiled the binary.
-    fn manifest_dir() -> &'static str {
-        static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        DIR.get_or_init(|| {
-            std::env::var("CARGO_MANIFEST_DIR")
-                .expect("CARGO_MANIFEST_DIR must be set by cargo for test binaries")
-        })
-        .as_str()
-    }
 
     #[derive(Debug, PartialEq)]
     enum Event {
@@ -1782,6 +1845,18 @@ mod tests {
         }
     }
 
+    /// POOT-1308: raw Vulkan is a benchmarked backend, and `auto` (a device chosen by presence, not by name) is
+    /// not. Mutation: drop `BackendChoice::Vulkan` from `BACKENDS`; red: `parse_backend("vulkan")` refuses it.
+    #[test]
+    fn vulkan_is_benchmarked_and_auto_is_not() {
+        assert_eq!(
+            parse_backend("vulkan").unwrap(),
+            BackendChoice::Vulkan,
+            "raw Vulkan runs on the dev box"
+        );
+        assert!(parse_backend("auto").is_err());
+    }
+
     fn refused() -> anyhow::Error {
         anyhow::Error::from(DriverError::Unsupported(Unsupported::UnboundSlot {
             program: poot_models::io::ProgramId::STEP,
@@ -1829,6 +1904,8 @@ mod tests {
             assert_eq!(line["backend"], label);
             assert_eq!(line["iterations"], 4, "{label}");
             assert_eq!(line["gen_tokens"], 6, "{label}");
+            // The KV dtype the opened driver resolved, not a request echoed back.
+            assert_eq!(line["kv_dtype"], "f16", "{label}");
 
             let mut curve = config(&[
                 "--mode",
@@ -1883,7 +1960,7 @@ mod tests {
     /// the line into a row. The runner and the harness must agree on one contract, and the harness owns it.
     fn harness_accepts(line: &Value, curve: bool, gen_tokens: usize, backend: BackendChoice) {
         let line = &as_release_line(line);
-        let harness = format!("{}/../../harness", manifest_dir());
+        let harness = format!("{}/../../harness", poot_test_util::manifest_dir().display());
         let script = format!(
             "import json, sys\n\
              sys.path.insert(0, {harness:?})\n\
@@ -2031,7 +2108,7 @@ mod tests {
     /// The reason the harness records for `line`, read through the harness's own `runner_refusal`.
     fn harness_refusal(line: &Value, backend: BackendChoice) -> String {
         let line = &as_release_line(line);
-        let harness = format!("{}/../../harness", manifest_dir());
+        let harness = format!("{}/../../harness", poot_test_util::manifest_dir().display());
         let script = format!(
             "import json, sys\n\
              sys.path.insert(0, {harness:?})\n\
@@ -2355,6 +2432,13 @@ mod tests {
         assert_eq!(defaults.backend, BackendChoice::Ptx);
         assert_eq!(defaults.mode, Mode::Single);
         assert!(matches!(defaults.weights, Weights::Safetensors(_)));
+        // No `--kv-dtype`: the driver resolves the model's preference or the engine default.
+        assert_eq!(defaults.kv_dtype, None);
+        assert_eq!(
+            config(&["--kv-dtype", "bf16"]).kv_dtype,
+            Some(KvDtype::Bf16)
+        );
+        assert_eq!(config(&["--kv-dtype", "f32"]).kv_dtype, Some(KvDtype::F32));
 
         assert!(matches!(
             config(&["--gguf", "/m/model.gguf"]).weights,
@@ -2374,6 +2458,7 @@ mod tests {
         assert!(parse_error(&["--backend", "cuda"]).contains("unknown backend"));
         assert!(parse_error(&["--mode", "decode-curve"]).contains("non-empty --isl-list"));
         assert!(parse_error(&["--engine", "driver"]).contains("unknown argument"));
+        assert!(parse_error(&["--kv-dtype", "f8"]).contains("unknown KV cache dtype"));
     }
 
     /// The registry decides the engine: a registered family's checkpoint opens through the driver (here
@@ -2798,7 +2883,7 @@ mod preparation_tests {
     /// The labels and layer names the runner prints are the ones the harness validates against.
     #[test]
     fn the_harness_and_the_runner_agree_on_states_and_layers() {
-        let harness = format!("{}/../../harness", env!("CARGO_MANIFEST_DIR"));
+        let harness = format!("{}/../../harness", poot_test_util::manifest_dir().display());
         let script = format!(
             "import json, sys\nsys.path.insert(0, {harness:?})\nimport performance_receipt as r\n\
              print(json.dumps([list(r.PREPARATION_STATES), list(r.PREPARATION_LAYERS)]))\n"

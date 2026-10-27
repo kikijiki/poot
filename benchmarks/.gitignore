@@ -9,3 +9,9 @@ models/
 
 # orchestrator local run-state (SQLite db + logs)
 .orchestrator/
+
+# in-progress mirrors of a set the orchestrator is sweeping (see bench.PARTIAL_SUFFIX)
+results/*.partial/
+
+# sets with no ok row (see poot-orchestrator gather::failed_dir)
+failed-results/

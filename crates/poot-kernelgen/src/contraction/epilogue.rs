@@ -24,6 +24,23 @@ use crate::helpers::{
     Layout, WeightLane, elem, ld, row_major_strides, slice_dtype, view_eff_strides,
 };
 
+/// An epilogue with the buffers its leaves read: what a body applies to each output's f32 sum before its store.
+/// The bodies that take one store f32, so the epilogue's dtype is f32 too.
+#[derive(Clone, Copy)]
+pub(crate) struct BoundEpilogue<'a> {
+    pub(crate) epilogue: &'a Epilogue,
+    pub(crate) leaves: &'a [Local],
+    /// How each leaf buffer reads back as a value ([`Epilogue::lanes`]).
+    pub(crate) lanes: &'a [Option<WeightLane>],
+}
+
+impl BoundEpilogue<'_> {
+    /// The value to store for output element `out_index` whose sum is `acc` ([`emit_epilogue`]).
+    pub(crate) fn emit(self, e: &mut Emit, out_index: Local, acc: Local) -> Local {
+        emit_epilogue(e, self.epilogue, out_index, self.leaves, self.lanes, acc)
+    }
+}
+
 /// An operand of an epilogue step.
 #[derive(Clone, Copy, Debug)]
 pub enum EpilogueInput {

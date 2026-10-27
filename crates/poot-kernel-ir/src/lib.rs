@@ -98,10 +98,10 @@ ir_node! {
             len: u32,
         },
         /// A fixed-lane SIMD vector (spec 134 P1): `lanes` is 2 or 4, `elem` a scalar numeric type.
-        /// Backend-neutral (no wave width baked in). `poot-codegen` lowers it to LLVM `<lanes x elem>`;
-        /// only SpirvVulkan is implemented (NVPTX/AMDGCN emit a named `Unsupported` diagnostic, see
+        /// Backend-neutral (no wave width baked in). `poot-codegen` lowers it to LLVM `<lanes x elem>` on
+        /// SpirvVulkan and NVPTX (AMDGCN and the AIE core emit a named `Unsupported` diagnostic, see
         /// emit.rs). `Rvalue::VectorLoad`/`Statement::VectorStore` read/write a scalar-element slice
-        /// `lanes` elements at a time.
+        /// `lanes` elements at a time; `Rvalue::VectorExtract` reads one lane.
         Vec {
             /// The scalar element type.
             elem: Box<Ty>,
@@ -386,6 +386,11 @@ ir_node! {
         /// `Rvalue::BinaryOp` keeps today's contraction-eligible codegen (no across-the-board performance
         /// change) - only the packed-dequant decode formula (dquant.md 3.3) opts in.
         BinaryOpNoContract(BinOp, Operand, Operand),
+        /// `a * b + c` with one rounding: a fused multiply-add, on every backend (the interpreter's
+        /// `f32::mul_add`). A body that wants the fused accumulate states it here, so it does not depend on a
+        /// backend contracting an `fmul` feeding an `fadd` (AMDGCN never does). The three operands and the
+        /// result are `F32`.
+        MulAdd(Operand, Operand, Operand),
         /// `op` applied to one operand.
         UnaryOp(UnOp, Operand),
         /// A float math function of one operand.
@@ -495,8 +500,11 @@ ir_node! {
         /// Load `lanes` contiguous elements of a scalar-element slice as one `Ty::Vec` value (spec 134,
         /// FR-001). `place` must project a slice-typed local at `[Deref, Index(i)]`; `i` is the vector-group
         /// index (elements `[i*lanes, i*lanes+lanes)`), not a scalar element index. `lanes`/`elem` come from
-        /// the destination local's declared `Ty::Vec`. Alignment (FR-003) is a builder obligation; codegen
-        /// only stamps `align`. SpirvVulkan-only: a body must not mix scalar and vector access to one param
+        /// the destination local's declared `Ty::Vec`. Codegen stamps the group's natural alignment
+        /// (`lanes` times the element size): group `i` is aligned because every buffer an executor binds
+        /// starts on a 16-byte boundary (the binding contract in `poot-executor`). Whether one param may
+        /// also be read element by element is the target's `poot_codegen::Capability::mixed_vector_reads`:
+        /// NVPTX lowers both on one pointer, SPIR-V declares a vector-read param as a vector resource
         /// (the two-binding mechanism, FR-004b, is not implemented).
         VectorLoad {
             /// The slice element group loaded.
@@ -504,6 +512,14 @@ ir_node! {
         },
         /// Broadcast a scalar operand to every lane of the destination's declared `Ty::Vec` type.
         VectorSplat(Operand),
+        /// Lane `lane` of a `Ty::Vec` operand, a scalar of its element type (spec 134 FR-002: the lane is a
+        /// constant, below the vector's lane count).
+        VectorExtract {
+            /// The vector read.
+            vector: Operand,
+            /// The lane read.
+            lane: u32,
+        },
     }
 }
 
@@ -859,9 +875,10 @@ ir_node! {
 
 ir_node! {
     /// A constant table: read-only `u32` words fixed at kernel-generation time, readable by any
-    /// thread at a dynamic index ([`Rvalue::ConstantTableRead`]). The lookup tables of the lattice
-    /// quants (`IQ2_XS`, `IQ3_XXS`, `IQ3_S`) are the use: too large for a select tree over immediates, and
-    /// the same for every launch, so they belong to the kernel and not to a buffer the launch binds.
+    /// thread at a dynamic index ([`Rvalue::ConstantTableRead`]). The value tables of the packed
+    /// formats are the use: the lattice grids (`IQ2_XS`, `IQ3_XXS`, `IQ3_S`) and the 16-entry codebook
+    /// (`IQ4_NL`, `IQ4_XS`), where one cached load replaces a select tree over immediates. They are the
+    /// same for every launch, so they belong to the kernel and not to a buffer the launch binds.
     #[derive(Clone, PartialEq, Eq, Debug)]
     pub struct ConstantTableDecl {
         /// The table's words.
@@ -877,6 +894,50 @@ ir_node! {
         pub statements: Vec<Statement>,
         /// How control leaves the block.
         pub terminator: Terminator,
+    }
+}
+
+ir_node! {
+    /// The bound a body's builder proves for every [`Ty::Usize`] value the body forms (POOT-1405): each is
+    /// below `scale * n + slack`, where `n` is the largest element count bound to any of the body's params. A
+    /// builder states it only for a body whose indices are formed from its launch, its metadata and its
+    /// buffers' lengths, never from values it reads out of a buffer.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+    pub struct IndexBound {
+        /// Index units per element of the longest param (32 for a body that addresses packed `u32` words by
+        /// bit).
+        pub scale: u32,
+        /// The overshoot past `scale * n` the body's own loop structure adds (a run that starts past the end).
+        pub slack: u32,
+    }
+}
+
+impl IndexBound {
+    /// The largest index a 32-bit [`IndexWidth::U32`] body may form: a signed 32-bit GEP index stays
+    /// non-negative below it.
+    pub const U32_LIMIT: u64 = i32::MAX as u64;
+
+    /// Whether every index stays within [`Self::U32_LIMIT`] when the longest param bound holds `elems`
+    /// elements.
+    pub fn fits_u32(self, elems: u64) -> bool {
+        u64::from(self.scale)
+            .checked_mul(elems)
+            .and_then(|scaled| scaled.checked_add(u64::from(self.slack)))
+            .is_some_and(|max| max <= Self::U32_LIMIT)
+    }
+}
+
+ir_node! {
+    /// The integer width [`Ty::Usize`] lowers to in one body (POOT-1405).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+    pub enum IndexWidth {
+        /// The target's own index type: 64-bit on NVPTX and AMDGPU, 32-bit on SPIR-V and the AIE core.
+        #[default]
+        Native,
+        /// 32-bit index math, planned for a dispatch whose bound lengths the planner proved keep every index
+        /// within [`IndexBound::U32_LIMIT`] under the body's bound. A runtime refuses a binding that breaks
+        /// it (`poot_codegen::CompiledKernel::index_width`).
+        U32(IndexBound),
     }
 }
 
@@ -902,6 +963,22 @@ ir_node! {
             serde(default, skip_serializing_if = "Vec::is_empty")
         )]
         pub constant_tables: Vec<ConstantTableDecl>,
+        /// The width [`Ty::Usize`] lowers to; [`IndexWidth::Native`] unless the planner narrowed this
+        /// dispatch.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "IndexWidth::is_native")
+        )]
+        pub index_width: IndexWidth,
+    }
+}
+
+impl IndexWidth {
+    /// Whether this is the target's own index type: a body serializes its width only when narrowed, so every
+    /// native body keeps its serialized form.
+    #[cfg(feature = "serde")]
+    fn is_native(&self) -> bool {
+        *self == IndexWidth::Native
     }
 }
 
@@ -921,6 +998,7 @@ impl Body {
             workgroup_size: [64, 1, 1],
             workgroup_locals: Vec::new(),
             constant_tables: Vec::new(),
+            index_width: IndexWidth::Native,
         }
     }
 
@@ -1059,6 +1137,14 @@ mod verify {
             what: &'static str,
             /// The type found.
             found: Ty,
+        },
+        /// A [`Rvalue::VectorExtract`] lane at or past the vector's lane count.
+        #[error("vector extract of lane {lane} from a {lanes}-lane vector")]
+        VectorLaneOutOfRange {
+            /// The lane read.
+            lane: u32,
+            /// The vector's lane count.
+            lanes: u32,
         },
         /// A store or atomic through a `&[T]` binding (the buffer is read-only).
         #[error("write through the read-only buffer binding _{}", param.index)]
@@ -1566,6 +1652,12 @@ mod verify {
                     }
                     Ok(ta)
                 }
+                Rvalue::MulAdd(a, b, c) => {
+                    for operand in [a, b, c] {
+                        expect_ty("multiply-add operand", &Ty::F32, &self.operand_ty(operand)?)?;
+                    }
+                    Ok(Ty::F32)
+                }
                 Rvalue::UnaryOp(_, a) => self.operand_ty(a),
                 Rvalue::MathUnary(_, a) => {
                     let ty = self.operand_ty(a)?;
@@ -1720,6 +1812,16 @@ mod verify {
                     other => Err(VerifyErrorKind::InvalidOperandType {
                         what: "splat destination",
                         found: other.clone(),
+                    }),
+                },
+                Rvalue::VectorExtract { vector, lane } => match self.operand_ty(vector)? {
+                    Ty::Vec { elem, lanes } if *lane < lanes => Ok(*elem),
+                    Ty::Vec { lanes, .. } => {
+                        Err(VerifyErrorKind::VectorLaneOutOfRange { lane: *lane, lanes })
+                    }
+                    other => Err(VerifyErrorKind::InvalidOperandType {
+                        what: "vector extract operand",
+                        found: other,
                     }),
                 },
             }
@@ -2249,11 +2351,16 @@ mod verify {
             Rvalue::UnaryOp(_, op)
             | Rvalue::MathUnary(_, op)
             | Rvalue::IntScalarUnary(_, op)
-            | Rvalue::VectorSplat(op) => operand_class(op, flow).opaque(),
+            | Rvalue::VectorSplat(op)
+            | Rvalue::VectorExtract { vector: op, .. } => operand_class(op, flow).opaque(),
             Rvalue::BinaryOp(op, a, b) => binary_class(*op, a, b, flow),
             Rvalue::BinaryOpNoContract(_, a, b) => operand_class(a, flow)
                 .opaque()
                 .join(operand_class(b, flow).opaque()),
+            Rvalue::MulAdd(a, b, c) => operand_class(a, flow)
+                .opaque()
+                .join(operand_class(b, flow).opaque())
+                .join(operand_class(c, flow).opaque()),
             Rvalue::Cast { operand, .. }
             | Rvalue::Bitcast { operand, .. }
             | Rvalue::Fp8Encode { operand, .. } => operand_class(operand, flow).opaque(),
@@ -2408,13 +2515,19 @@ mod verify {
             | Rvalue::UnaryOp(_, a)
             | Rvalue::MathUnary(_, a)
             | Rvalue::IntScalarUnary(_, a)
-            | Rvalue::VectorSplat(a) => operand_reads(a, f),
+            | Rvalue::VectorSplat(a)
+            | Rvalue::VectorExtract { vector: a, .. } => operand_reads(a, f),
             Rvalue::Cast { operand, .. }
             | Rvalue::Bitcast { operand, .. }
             | Rvalue::Fp8Encode { operand, .. } => operand_reads(operand, f),
             Rvalue::BinaryOp(_, a, b) | Rvalue::BinaryOpNoContract(_, a, b) => {
                 operand_reads(a, f);
                 operand_reads(b, f);
+            }
+            Rvalue::MulAdd(a, b, c) => {
+                operand_reads(a, f);
+                operand_reads(b, f);
+                operand_reads(c, f);
             }
             Rvalue::Select {
                 condition,
@@ -4548,5 +4661,26 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A multiply-add takes three `F32` operands: the probe verifies, and the same body with its addend replaced
+    /// by the `Usize` thread index is rejected naming the operand. Mutation: drop the operand check in the
+    /// verifier's `MulAdd` arm (return `F32` unconditionally); the ill-typed body verifies and this row goes red.
+    #[test]
+    fn a_mul_add_reads_three_f32_operands() {
+        let good = crate::test_support::mul_add_probe_kernel(true);
+        good.verify().expect("three f32 operands");
+        let mut bad = good.clone();
+        let Statement::Assign(_, Rvalue::MulAdd(_, _, addend)) = &mut bad.blocks[2].statements[0]
+        else {
+            panic!("the fused probe's first compute statement is the multiply-add");
+        };
+        *addend = Operand::Copy(Place::local(Local { index: 5 }));
+        let (site, kind) = rejection(&bad);
+        assert_eq!(site, at_statement(2, 0));
+        assert!(
+            matches!(kind, VerifyErrorKind::TypeMismatch { .. }),
+            "{kind:?}"
+        );
     }
 }

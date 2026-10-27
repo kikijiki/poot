@@ -11,6 +11,22 @@ pub fn mangle(name: &str) -> String {
     format!("{KERNEL_PREFIX}{name}")
 }
 
+/// The dispatch-axis intrinsics of `poot_kernel_intrinsics`, by bare function name: the one table the importer reads
+/// and the intrinsics crate exports, one entry per exported axis function
+/// (`pootc/tests/intrinsics_table.rs` checks the two agree). `thread_index_*` is the global dispatch index along an
+/// axis, `local_index_*` the lane's position in its workgroup, `group_index_*` the workgroup's index.
+pub const AXIS_INTRINSICS: [(&str, crate::IndexAxis); 9] = [
+    ("thread_index_x", crate::IndexAxis::X),
+    ("thread_index_y", crate::IndexAxis::Y),
+    ("thread_index_z", crate::IndexAxis::Z),
+    ("local_index_x", crate::IndexAxis::LocalX),
+    ("local_index_y", crate::IndexAxis::LocalY),
+    ("local_index_z", crate::IndexAxis::LocalZ),
+    ("group_index_x", crate::IndexAxis::GroupX),
+    ("group_index_y", crate::IndexAxis::GroupY),
+    ("group_index_z", crate::IndexAxis::GroupZ),
+];
+
 /// Is this (mangled) symbol a poot kernel?
 pub fn is_kernel(symbol: &str) -> bool {
     last_segment(symbol).starts_with(KERNEL_PREFIX)

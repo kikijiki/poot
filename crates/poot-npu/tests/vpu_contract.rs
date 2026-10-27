@@ -13,14 +13,15 @@ mod vpu_common;
 
 use std::time::Duration;
 
-use poot_codegen::{
-    VpuElem, VpuInput, VpuNode, VpuOp, VpuRegion, VpuTensor, VpuValue, emit_vpu, vpu_kernel_handle,
-};
-use poot_executor::{AieInvocation, Arg, Device, Dispatch, LaunchKind, VpuInvocation};
+use poot_executor::{Arg, Device, Dispatch, LaunchKind};
 use poot_l0_runtime::L0Error;
+use poot_npu::vpu_kernel_handle;
 use poot_npu::{VpuConfig, VpuDevice, VpuError};
+use poot_npu::{VpuElem, VpuInput, VpuNode, VpuOp, VpuRegion, VpuTensor, VpuValue, emit_vpu};
+use poot_npu_artifacts::{AieInvocation, VpuInvocation};
+use poot_npu_artifacts::{VpuBinding, VpuGraphArtifact, VpuLayer};
 use poot_quant::scalar::f32_to_f16;
-use poot_runtime_common::{BufferRole, VpuBinding, VpuGraphArtifact, VpuLayer};
+use poot_runtime_common::BufferRole;
 use poot_target::{BufferStorage, VpuTargetId};
 
 use vpu_common::{add_artifact, device};
@@ -153,7 +154,7 @@ fn a_dispatch_that_is_not_the_graphs_abi_is_refused_before_it_runs() {
             work: 1,
         })
     };
-    let two = [arg(&a, N as u32), arg(&b, N as u32)];
+    let two = [arg(&a, N), arg(&b, N)];
 
     assert!(matches!(
         dispatch(
@@ -162,7 +163,7 @@ fn a_dispatch_that_is_not_the_graphs_abi_is_refused_before_it_runs() {
                 workgroup: [1, 1, 1]
             },
             &two,
-            arg(&out, N as u32)
+            arg(&out, N)
         ),
         Err(VpuError::GridLaunch { .. })
     ));
@@ -173,7 +174,7 @@ fn a_dispatch_that_is_not_the_graphs_abi_is_refused_before_it_runs() {
                 std::num::NonZeroU32::new(8).unwrap()
             )),
             &two,
-            arg(&out, N as u32)
+            arg(&out, N)
         ),
         Err(VpuError::AieLaunch)
     ));
@@ -181,29 +182,29 @@ fn a_dispatch_that_is_not_the_graphs_abi_is_refused_before_it_runs() {
         dispatch(
             LaunchKind::VpuGraph(VpuInvocation::new(VpuTargetId::Npu4, digest ^ 1)),
             &two,
-            arg(&out, N as u32)
+            arg(&out, N)
         ),
         Err(VpuError::InvocationMismatch { .. })
     ));
     assert!(matches!(
-        dispatch(honest, &two[..1], arg(&out, N as u32)),
+        dispatch(honest, &two[..1], arg(&out, N)),
         Err(VpuError::Bindings { reason, .. }) if reason.contains("graph has 3 arguments, the dispatch binds 2")
     ));
     assert!(matches!(
-        dispatch(honest, &[arg(&wide, N as u32), arg(&b, N as u32)], arg(&out, N as u32)),
+        dispatch(honest, &[arg(&wide, N), arg(&b, N)], arg(&out, N)),
         Err(VpuError::Bindings { reason, .. }) if reason.contains("argument 0")
     ));
     assert!(matches!(
-        dispatch(honest, &two, arg(&out, N as u32 - 1)),
+        dispatch(honest, &two, arg(&out, N - 1)),
         Err(VpuError::Bindings { reason, .. }) if reason.contains("argument 2 is 16 elements, the dispatch binds 15")
     ));
     assert!(matches!(
-        dispatch(honest, &two, arg(&short, N as u32)),
+        dispatch(honest, &two, arg(&short, N)),
         Err(VpuError::Bindings { reason, .. }) if reason.contains("needs 32 bytes, the bound buffer holds 30")
     ));
 
     // The honest dispatch runs after all of those.
-    dispatch(honest, &two, arg(&out, N as u32)).expect("the honest dispatch records");
+    dispatch(honest, &two, arg(&out, N)).expect("the honest dispatch records");
     device
         .write_with(&a, 0, 32, &mut |_, bytes| {
             bytes.copy_from_slice(&words((0..N).map(|i| i as f32)))
@@ -279,7 +280,7 @@ fn a_replay_that_misses_its_deadline_poisons_the_device() {
         })
         .collect();
     device.begin().unwrap();
-    let n = elems as u32;
+    let n = elems;
     device
         .dispatch(Dispatch {
             kernel: &kernel,
@@ -537,11 +538,11 @@ fn an_argument_a_recorded_execution_writes_is_range_checked_as_its_result() {
                 kernel: &kernel,
                 inputs: &[Arg {
                     buffer: input,
-                    elems: N as u32,
+                    elems: N,
                 }],
                 output: Arg {
                     buffer: output,
-                    elems: N as u32,
+                    elems: N,
                 },
                 launch,
                 work: 1,
@@ -630,11 +631,11 @@ fn a_constant_is_range_checked_at_its_upload_and_not_on_every_replay() {
             kernel: &kernel,
             inputs: &[Arg {
                 buffer: &weight,
-                elems: N as u32,
+                elems: N,
             }],
             output: Arg {
                 buffer: &out,
-                elems: N as u32,
+                elems: N,
             },
             launch: LaunchKind::VpuGraph(VpuInvocation::new(VpuTargetId::Npu4, digest)),
             work: 1,

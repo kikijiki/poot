@@ -69,6 +69,11 @@ pub enum Access {
     Sequential,
     /// The range will be needed soon, so the kernel may start paging it in.
     WillNeed,
+    /// The bytes have been consumed (copied to the device): the process drops its page-table entries
+    /// for every whole page inside the range, so the checkpoint no longer counts in its resident set
+    /// (`RssFile`) beside the device copy. The pages stay in the page cache for the next reader; a later
+    /// read of the range faults them in again from there or from the disk, with the same bytes.
+    Release,
 }
 
 /// [`StoredBytes::map`] refused a file.
@@ -235,6 +240,16 @@ impl StoredBytes {
     pub fn advise(&self, access: Access) {
         if let Region::Mapped(mapped) = &*self.region {
             mapped.advise(self.range.clone(), access);
+        }
+    }
+
+    /// [`Self::advise`] over `range` of this view (relative to it); a range past the view's end is
+    /// clamped to it. A no-op on an owned region.
+    pub fn advise_range(&self, range: Range<usize>, access: Access) {
+        if let Region::Mapped(mapped) = &*self.region {
+            let end = range.end.min(self.len());
+            let start = range.start.min(end);
+            mapped.advise(self.range.start + start..self.range.start + end, access);
         }
     }
 

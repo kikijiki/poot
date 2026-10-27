@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+use poot_codegen::CompiledKernel;
 use poot_executor::{
     Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine, EntryId, ExecError,
     ExecutableId, Executor, ExecutorStats, HostSync, NativeCounters, StateScope, StepInputs,
@@ -18,7 +19,7 @@ use poot_executor::{
 use poot_graph_plan::{Capability, Target, staged::StagedProgram, staged::TargetSet};
 use poot_llm::driver::{BackendChoice, DraftPolicy, ModelHandle};
 use poot_quant::weights::WeightStore;
-use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot, MemoryCounters};
+use poot_runtime_common::{BufferRole, MemoryCounterSnapshot, MemoryCounters};
 use poot_target::{AmdArch, Backend, DeviceCaps, TargetId};
 use poot_weights::WeightMap;
 
@@ -466,6 +467,7 @@ fn args(backend: BackendChoice) -> EngineArgs {
         draft: DraftPolicy::Off,
         embeds: false,
         expert_pool: None,
+        kv_dtype: None,
     }
 }
 
@@ -487,7 +489,7 @@ fn live_total(handle: &Arc<ModelHandle>, candidate: &Candidate) -> u64 {
     let driver = Driver::new(
         Arc::clone(handle),
         Box::new(executor),
-        driver_options(handle, generate(candidate), DraftPolicy::Off),
+        driver_options(handle, generate(candidate), DraftPolicy::Off, None),
     )
     .expect("driver");
     let rows = [candidate.rows];
@@ -744,7 +746,7 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
         let rows = [candidate.rows];
         let planned = planner
             .plan(
-                driver_options(&handle, generate(candidate), DraftPolicy::Off),
+                driver_options(&handle, generate(candidate), DraftPolicy::Off, None),
                 &shapes_of(&candidate, &rows),
                 &[],
             )
@@ -753,7 +755,7 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
         let driver = Driver::new(
             Arc::clone(&handle),
             Box::new(executor),
-            driver_options(&handle, generate(candidate), DraftPolicy::Off),
+            driver_options(&handle, generate(candidate), DraftPolicy::Off, None),
         )
         .unwrap();
         let driver = driver.prepare(&shapes_of(&candidate, &rows)).unwrap();
@@ -787,10 +789,18 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
 /// (chunk and combine) with their own metadata words where it was one, 868 -> 980 and 1220 -> 1332 bytes.
 /// POOT-1238 states the causal mask by the query positions, so the mask the attention read is no longer an
 /// activation: 2091972 -> 1577492 at four rows (1046196 -> 788956 at two, 523308 -> 394748 at one).
+/// POOT-1336 groups a prefill step's routed rows by expert, so the grouping (`[2, rows]` words) and the rows gathered
+/// into expert order are activations of their own: 1577492 -> 1658772 at four rows (788956 -> 829596 at two,
+/// 394748 -> 414908 at one).
 /// POOT-1268 prepares five sampling heads in place of the greedy suffix and the logits head (the argmax,
 /// a plain draw, the adjusted draw, the guided draw and the guided draw with logprobs), so every entry
 /// shape exists five times and the adjusted heads carry the sampler's history pool (`State` grew by 128, 64 and 32 bytes at
 /// four, two and one rows: `[sequences, 2, vocabulary]` words).
+/// POOT-1403 runs every dense `M > 1` contraction on the shape-generic register-tiled body, whose shape rides in a
+/// five-word metadata buffer per dispatch where the deleted tiled GEMM baked it: `Meta` 5264 -> 16464 at four and two
+/// rows, 6144 -> 15144 at one. Its indexed (routed-expert) contractions run the same body inside an expert walk, whose
+/// metadata adds the tile offset and the expert count to the old segmented body's words: 16464 -> 16884 at four and
+/// two rows, 15144 -> 15564 at one.
 ///
 /// Mutation: size a dense weight from `shape[..1]` in `Engine::weight_buffer`'s size-only path; `Weight`
 /// is no longer 5344 and this row goes red.
@@ -808,17 +818,17 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         (
             4,
             64,
-            "Activation=1577492 Input=117980 Meta=5264 State=12416 Weight=5344",
+            "Activation=1658772 Input=117980 Meta=16884 State=12416 Weight=5344",
         ),
         (
             2,
             64,
-            "Activation=788956 Input=82188 Meta=5264 State=6208 Weight=5344",
+            "Activation=829596 Input=82188 Meta=16884 State=6208 Weight=5344",
         ),
         (
             1,
             64,
-            "Activation=394748 Input=64292 Meta=6144 State=3104 Weight=5344",
+            "Activation=414908 Input=64292 Meta=15564 State=3104 Weight=5344",
         ),
     ];
     let domain = candidates(&handle, &args);
@@ -831,7 +841,7 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         let r = [candidate.rows];
         let planned = planner
             .plan(
-                driver_options(&handle, generate(candidate), DraftPolicy::Off),
+                driver_options(&handle, generate(candidate), DraftPolicy::Off, None),
                 &shapes_of(candidate, &r),
                 &[],
             )
@@ -870,7 +880,7 @@ fn startup_reads_the_weights_once_however_many_candidates_it_plans() {
         let driver = Driver::new(
             Arc::clone(&handle),
             Box::new(executor),
-            driver_options(&handle, generate(chosen), DraftPolicy::Off),
+            driver_options(&handle, generate(chosen), DraftPolicy::Off, None),
         )
         .expect("driver");
         let rows = [chosen.rows];
@@ -919,7 +929,7 @@ fn loaded_kernels(handle: &Arc<ModelHandle>, candidate: &Candidate) -> HashSet<u
     let driver = Driver::new(
         Arc::clone(handle),
         Box::new(executor),
-        driver_options(handle, generate(candidate), DraftPolicy::Off),
+        driver_options(handle, generate(candidate), DraftPolicy::Off, None),
     )
     .expect("driver");
     let rows = [candidate.rows];
@@ -952,7 +962,7 @@ fn a_planner_resolves_each_distinct_kernel_once_across_candidates() {
         let rows = [candidate.rows];
         planner
             .plan(
-                driver_options(&handle, generate(candidate), DraftPolicy::Off),
+                driver_options(&handle, generate(candidate), DraftPolicy::Off, None),
                 &shapes_of(candidate, &rows),
                 &[],
             )
@@ -1081,7 +1091,7 @@ fn admission_uses_the_fresh_budget_and_publishes_only_the_chosen_candidate() {
         let driver = Driver::new(
             Arc::clone(&handle),
             Box::new(reference),
-            driver_options(&handle, generate(domain[k]), DraftPolicy::Off),
+            driver_options(&handle, generate(domain[k]), DraftPolicy::Off, None),
         )
         .expect("driver");
         let rows = [domain[k].rows];
@@ -1362,6 +1372,42 @@ fn rows_and_max_seq_flags_are_the_shapes_the_plan_is_fitted_at() {
     assert_eq!(started.plan.caps.rows.get(), 2);
 }
 
+/// POOT-1395: `--kv-dtype` is the KV cache dtype the started engine's driver runs, through the real parser and
+/// `engine_args`; without it the driver takes the model's preference or the default (f16). Mutation: drop the
+/// flag in `engine_args` (no `with_kv_dtype`); the flagged engine runs f16 and the row goes red.
+#[test]
+fn the_kv_dtype_flag_is_the_dtype_the_started_driver_runs() {
+    for (flags, want) in [
+        (&["poot-serve", "--kv-dtype", "f32"][..], KvDtype::F32),
+        (&["poot-serve", "--kv-dtype", "bf16"][..], KvDtype::Bf16),
+        (&["poot-serve"][..], KvDtype::F16),
+    ] {
+        let config = ServeConfig::try_parse_from(flags).expect("the flags parse");
+        let args = crate::startup::engine_args(&config, DraftPolicy::Off).expect("engine args");
+        let handle = dense_model_of(1024);
+        let health = EngineHealth::starting();
+        let (executor, _) = probe(spirv_target(), 0);
+        let (result, _) = build_with(&args, &handle, executor, roomy, &health);
+        let started = match result {
+            Ok(started) => started,
+            // bf16 has no lane on the SPIR-V probe: the refusal names the cast, which is this flag's effect too.
+            Err(error) if want == KvDtype::Bf16 => {
+                assert!(
+                    error.to_string().contains("DtypeLowering"),
+                    "{flags:?}: {error}"
+                );
+                continue;
+            }
+            Err(error) => panic!("{flags:?}: {error}"),
+        };
+        assert_eq!(started.driver.kv_dtype(), want, "{flags:?}");
+    }
+    let refused = ServeConfig::try_parse_from(["poot-serve", "--kv-dtype", "f8"])
+        .expect_err("an unknown dtype is a startup error")
+        .to_string();
+    assert!(refused.contains("accepted: f16, bf16, f32"), "{refused}");
+}
+
 /// The budget is the runtime's live answer, not the figure the device queried when it opened. The target
 /// reports an enormous open-time budget; the runtime reports it has room for exactly the first
 /// candidate's live bytes (plus the reserve) and no more. Through the production observer the first
@@ -1381,7 +1427,7 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
     let oracle = Driver::new(
         Arc::clone(&handle),
         Box::new(executor),
-        driver_options(&handle, generate(first), DraftPolicy::Off),
+        driver_options(&handle, generate(first), DraftPolicy::Off, None),
     )
     .unwrap();
     let oracle = oracle.prepare(&shapes_of(&first, &[first.rows])).unwrap();
@@ -1418,7 +1464,7 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
             Planner::new(Arc::clone(&handle), &targets, Placement::Single)
                 .unwrap()
                 .plan(
-                    driver_options(&handle, generate(c), DraftPolicy::Off),
+                    driver_options(&handle, generate(c), DraftPolicy::Off, None),
                     &shapes_of(&c, &rows),
                     &[],
                 )
@@ -1515,7 +1561,7 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
     let rows = [candidate.rows];
     let planned = planner
         .plan(
-            driver_options(&handle, generate(candidate), DraftPolicy::Off),
+            driver_options(&handle, generate(candidate), DraftPolicy::Off, None),
             &shapes_of(&candidate, &rows),
             &[],
         )
@@ -1530,7 +1576,7 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
     let driver = Driver::new(
         Arc::clone(&handle),
         Box::new(executor),
-        driver_options(&handle, generate(candidate), DraftPolicy::Off),
+        driver_options(&handle, generate(candidate), DraftPolicy::Off, None),
     )
     .unwrap();
     let driver = driver.prepare(&shapes_of(&candidate, &rows)).unwrap();
@@ -1613,6 +1659,7 @@ fn a_recurrent_family_plans_many_rows_and_its_state_bytes_grow_with_the_sequence
                         max_seq,
                     },
                     DraftPolicy::Off,
+                    None,
                 ),
                 &ServingShapes {
                     layout: Layout::Paged(pool),
@@ -1811,7 +1858,7 @@ fn smallest_candidate_bytes(
     let planned = Planner::new(Arc::clone(handle), &targets, placement)
         .expect("a planner")
         .plan(
-            driver_options(handle, generate(candidate), DraftPolicy::Off),
+            driver_options(handle, generate(candidate), DraftPolicy::Off, None),
             &shapes_of(&candidate, &rows),
             &[],
         )

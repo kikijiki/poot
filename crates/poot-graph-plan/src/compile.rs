@@ -24,14 +24,16 @@ use crate::dtype_widen::{
     widen_mismatched_matmul_dtypes,
 };
 use crate::graph_validation::ValidationPacketPlan;
-use crate::planner::{plan_eqn_compiled, plan_graph, plan_vpu_region};
-use crate::state_commit::{StateCommitPlan, state_commit_from_plans};
+use crate::npu::{NpuHandle, NpuLowering, NpuRegionRefusal, NpuTarget};
+use crate::planner::{OutputBuffer, plan_eqn_compiled, plan_graph};
+use crate::predicates::GraphTables;
+use crate::refusal::refusal_at;
+use crate::state_commit::StateCommitPlan;
 #[cfg(feature = "test-support")]
 use crate::types::{DispatchPlanError, ScratchDecl};
 use crate::types::{GraphStorage, ValueStorage};
 #[cfg(feature = "test-support")]
 use crate::{Binding, DispatchPlan};
-use poot_codegen::VpuRegion;
 use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 
@@ -43,42 +45,36 @@ use poot_graph_ir::{
     BoundaryId, ContractionRows, EditError, Eqn, Export, Graph, IndexRange, OpKind, Operand, Slot,
     ValueId, ValueTable, value_ranges,
 };
-use poot_target::{
-    AieCaps, AieTargetId, Backend, DeviceCaps, Queried, TargetId, VpuCaps, VpuTargetId,
-};
+use poot_target::{Backend, DeviceCaps, Queried, TargetId};
 use poot_tensor::DType;
 
-use crate::kernel_mapping::{AieAbiRefusal, aie_region_recipe};
 use crate::passes::{
     self as transform, FusionDecline, GraphBudget, LegalizeError, PackedDequantProductionError,
 };
 pub use crate::passes::{LoraError, LoraPlan};
 use crate::{
-    BufferPlan, Dispatch, KernelChoice, Plan, PlanError, Refusal, compute_views, device_validation,
-    planner,
+    BufferPlan, KernelChoice, Plan, PlanError, Refusal, compute_views, device_validation, planner,
 };
-use poot_codegen::AieLinkRecipe;
-use poot_kernel_ir::Body;
 
 mod package;
 use package::package;
-pub(crate) use package::whole_graph_region;
 pub use package::{ArtifactGranularity, Region};
 
 /// What a graph is compiled for: the target and the device's measured capabilities (card 522). Passes and
 /// the planner read it; tracers never see it.
 ///
 /// One enum, so a target's identity and its capability descriptor can never disagree: a GPU backend
-/// carries [`DeviceCaps`], an AIE target carries [`AieCaps`], and no value pairs one with the other's
-/// (POOT-1117). A consumer that needs GPU capabilities matches [`Target::Gpu`]; the planner answers a GPU-only
-/// lowering on an AIE target with [`Capability::GpuOnly`].
+/// carries [`DeviceCaps`], an NPU carries its own limits ([`NpuTarget`]), and no value pairs one with the
+/// other's (POOT-1117). A consumer that needs GPU capabilities matches [`Target::Gpu`]; the planner answers a
+/// GPU-only lowering on an AIE target with [`Capability::GpuOnly`]. A target is plain data: the NPU
+/// lowering it needs is [`CompileOptions::npu`].
 ///
-/// An AIE target with GPU capabilities, and a GPU target with an AIE tag, are not constructible:
+/// An NPU target with GPU capabilities, and a GPU target with an NPU tag, are not constructible:
 ///
 /// ```compile_fail,E0308
-/// use poot_graph_plan::Target;
+/// use poot_graph_plan::NpuTarget;
 /// use poot_target::{AieTargetId, DeviceCaps};
-/// let _ = Target::Aie {
+/// let _ = NpuTarget::Aie {
 ///     target: AieTargetId::Xdna2,
 ///     caps: DeviceCaps::wgpu_rdna3_igpu(),
 /// };
@@ -107,21 +103,8 @@ pub enum Target {
         /// What the device measured: the limits and features the planner consults.
         caps: DeviceCaps,
     },
-    /// An AMD XDNA target and the limits its runtime reports (unmeasured until POOT-641).
-    Aie {
-        /// The XDNA part the program is generated for.
-        target: AieTargetId,
-        /// The limits the part's runtime reports.
-        caps: AieCaps,
-    },
-    /// An Intel NPU target and the capabilities its runtime reports: the vendor graph compiler compiles the
-    /// OpenVINO graph poot emits for a region of equations.
-    Vpu {
-        /// The Intel NPU part the program is generated for.
-        target: VpuTargetId,
-        /// The capabilities the part's runtime reports.
-        caps: VpuCaps,
-    },
+    /// An NPU and the limits its runtime reports.
+    Npu(NpuTarget),
 }
 
 impl Target {
@@ -130,11 +113,11 @@ impl Target {
     pub fn memory_budget_bytes(&self) -> Option<u64> {
         match self {
             Target::Gpu { caps, .. } => caps.memory_budget_bytes,
-            Target::Aie { caps, .. } => match caps.memory_budget_bytes {
+            Target::Npu(NpuTarget::Aie { caps, .. }) => match caps.memory_budget_bytes {
                 Queried::Known(bytes) => Some(bytes),
                 Queried::Unknown => None,
             },
-            Target::Vpu { caps, .. } => match caps.memory_budget_bytes {
+            Target::Npu(NpuTarget::Vpu { caps, .. }) => match caps.memory_budget_bytes {
                 Queried::Known(bytes) => Some(bytes),
                 Queried::Unknown => None,
             },
@@ -145,8 +128,7 @@ impl Target {
     pub const fn id(&self) -> TargetId {
         match self {
             Target::Gpu { backend, .. } => TargetId::Gpu(*backend),
-            Target::Aie { target, .. } => TargetId::Aie(*target),
-            Target::Vpu { target, .. } => TargetId::Vpu(*target),
+            Target::Npu(npu) => npu.id(),
         }
     }
 
@@ -157,10 +139,10 @@ impl Target {
     pub const fn granularity(&self) -> ArtifactGranularity {
         match self {
             Target::Gpu { .. } => ArtifactGranularity::Kernel,
-            Target::Aie { caps, .. } => ArtifactGranularity::Region {
+            Target::Npu(NpuTarget::Aie { caps, .. }) => ArtifactGranularity::Region {
                 limits: caps.region,
             },
-            Target::Vpu { .. } => ArtifactGranularity::Graph,
+            Target::Npu(NpuTarget::Vpu { .. }) => ArtifactGranularity::Graph,
         }
     }
 }
@@ -178,6 +160,9 @@ pub struct CompileOptions {
     /// stages before the cut run on the device while the host builds what the later ones read. `None`
     /// compiles without that cut.
     pub late: Option<BoundaryId>,
+    /// The NPU's lowering, required when the target is an [`NpuTarget`] and unused for a GPU target: the
+    /// NPU crate's object behind which its opset table, narrowing pass and region limits sit.
+    pub npu: Option<NpuHandle>,
 }
 
 impl CompileOptions {
@@ -187,6 +172,7 @@ impl CompileOptions {
             limits,
             lora: None,
             late: None,
+            npu: None,
         }
     }
 
@@ -564,8 +550,8 @@ pub struct Program {
     /// The target this program was compiled for (Card 546a): the contract's `add_entry` refuses a
     /// program compiled for a different target with a typed `LoadError::TargetMismatch`.
     target: Target,
-    /// The native state-commit plan, derived once from this program's own plans
-    /// (`state_commit_from_plans`) rather than re-planning the graph a second time.
+    /// The native state-commit plan `plan_graph` decided from this program's own plans' aliasing, before
+    /// planning the updates that read it.
     state_commit: StateCommitPlan,
     /// The validation packet layout and source plan (ADR-0101 decision 2's validated session, Card
     /// 546a): a zero-lane packet for a graph with no validation outputs, checked
@@ -574,9 +560,6 @@ pub struct Program {
     /// The regions `package` grouped the planned equations into: empty for a target whose artifacts are
     /// kernels, otherwise a partition of the program's dispatching equations into contiguous runs.
     regions: Vec<Region>,
-    /// The Intel NPU graph the program's one region runs: every equation lowered to an opset node, with the
-    /// region's reads as its arguments and its writes as its results. `None` for every other target.
-    vpu: Option<VpuRegion>,
     /// Lifetimes and arena-slot assignment for this program's locally-computed values (Card 547b),
     /// derived from `plans`, `storage`, `state_commit`, `validation` and `regions` once here.
     buffer_plan: BufferPlan,
@@ -602,6 +585,11 @@ impl Program {
         &self.limits
     }
 
+    /// One plan per equation of [`Self::graph`], index-aligned with its equations.
+    pub fn plans(&self) -> &[Plan] {
+        &self.plans
+    }
+
     /// The native state-commit plan (donation and explicit two-phase copies), derived from this
     /// program's own plans.
     pub fn state_commit(&self) -> &StateCommitPlan {
@@ -624,36 +612,6 @@ impl Program {
     /// target whose artifacts are kernels ([`Target::granularity`]), where every dispatch is its own.
     pub fn regions(&self) -> &[Region] {
         &self.regions
-    }
-
-    /// The Intel NPU graph the program's one region runs, ready for [`poot_codegen::emit_vpu`]; `None` for a
-    /// program compiled for any other target.
-    pub fn vpu_region(&self) -> Option<&VpuRegion> {
-        self.vpu.as_ref()
-    }
-
-    /// What `region` is linked from: its link recipe and, in tile order, the body each tile runs. The
-    /// recipe is derived from the same plans the bodies are, so the two cannot disagree.
-    pub fn region_link(
-        &self,
-        region: &Region,
-    ) -> Result<(AieLinkRecipe, Vec<&Body>), AieAbiRefusal> {
-        let Target::Aie { target, .. } = self.target else {
-            return Err(AieAbiRefusal::NotAnAieProgram);
-        };
-        let recipe = aie_region_recipe(&self.graph, &self.plans, region, target)?;
-        let bodies = region
-            .members()
-            .map(|index| {
-                self.plans[index]
-                    .single()
-                    .map(Dispatch::body)
-                    .ok_or_else(|| AieAbiRefusal::NotOneDispatch {
-                        eqn: self.graph.eqns()[index].out,
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((recipe, bodies))
     }
 
     /// Where each exported boundary lives after optimization, CSE and renumbering: the compiled
@@ -811,8 +769,8 @@ impl Program {
 /// After planning, a target whose artifacts are regions (`Target::granularity`) has its planned equations grouped
 /// into regions by `package` before the buffer plan runs; a kernel target has none.
 ///
-/// Every target runs every pass, in this one order, on every graph, except the GPU-limit stages (flash
-/// prefill cap, legalization, matmul dtype widening, the contraction epilogue probe and the oversized-constant
+/// Every target runs every pass, in this one order, on every graph, except the GPU-limit stages
+/// (legalization, matmul dtype widening, the contraction epilogue probe and the oversized-constant
 /// re-check): they read [`DeviceCaps`], so an AIE target does not run them.
 pub fn compile(
     g: &Graph,
@@ -840,19 +798,18 @@ pub fn compile(
     // GPU stages and an AIE compile does not run them.
     let gpu = match target {
         Target::Gpu { backend, caps } => Some((*backend, caps)),
-        Target::Aie { .. } | Target::Vpu { .. } => None,
+        Target::Npu(_) => None,
     };
-    // A flash prefill launches `Hq * L` workgroups on one grid axis; cap the rewrite at the target's grid so
-    // the planner is never handed a launch the device cannot issue.
-    let max_prefill_groups = gpu.map(|(_, caps)| caps.max_grid[0] as usize);
-    let mut pipeline = PassPipeline::new(g, target, options.limits);
+    let npu = options.npu.as_ref().map(NpuHandle::lowering);
+    let mut pipeline = PassPipeline::new(g, target, options.limits, npu);
     // An Intel NPU narrows F32 to its arithmetic width as a graph transform, first, so every later pass and
     // the planner see the graph the device runs. It is required, not an optimization, so a refusal of the
     // narrowed graph is the planner's, never a revert to the F32 graph.
-    if let Target::Vpu { caps, .. } = target {
-        pipeline.require("narrow_to_device_precision", |g| {
-            crate::planner::narrow_to_device_precision(g, caps)
+    if let Target::Npu(NpuTarget::Vpu { target, caps }) = target {
+        let lowering = npu.ok_or(PlanError::NpuLoweringMissing {
+            target: (*target).into(),
         })?;
+        pipeline.require("narrow_to_device_precision", |g| lowering.narrow(g, caps))?;
     }
     let (canonical, numerical_declines) = transform::canonicalize_with_declines(pipeline.graph())?;
     pipeline.after_apply("canonicalize", canonical)?;
@@ -864,8 +821,8 @@ pub fn compile(
         declines.extend(declined);
         Ok(fused)
     })?;
-    pipeline.run("flash_attention_capped", |g| {
-        let (fused, declined) = transform::flash_attention_capped(g, max_prefill_groups)?;
+    pipeline.run("flash_attention", |g| {
+        let (fused, declined) = transform::flash_attention(g)?;
         declines.extend(declined);
         Ok(fused)
     })?;
@@ -889,9 +846,9 @@ pub fn compile(
     )?);
     pipeline.reject_escapes(restored)?;
     pipeline.run("fold_dense_contractions", fold_dense_contractions)?;
-    if let Some((_, caps)) = gpu {
+    if let Some((backend, caps)) = gpu {
         pipeline.try_run("legalize", |g| {
-            transform::legalize(g, caps, &options.limits)
+            transform::legalize(g, backend, caps, &options.limits)
         })?;
     }
     pipeline.run("fold_dense_bf16_row_gathers", fold_dense_bf16_row_gathers)?;
@@ -941,14 +898,17 @@ pub fn compile(
     if let Some((_, caps)) = gpu {
         transform::refuse_oversized_constants(&graph, caps.max_buffer_bytes)?;
     }
-    let planned = plan_graph(&graph, target, &options.limits.body())?;
-    let state_commit = state_commit_from_plans(&graph, &planned.plans)?;
+    let planned = plan_graph(&graph, target, &options.limits.body(), npu)?;
+    let state_commit = planned.state_commit;
     let validation = device_validation::validation_packet_plan(&graph);
-    let regions = package(&graph, &planned.plans, target)?;
-    let vpu = match target {
-        Target::Vpu { caps, .. } => Some(plan_vpu_region(&graph, caps)?),
-        Target::Gpu { .. } | Target::Aie { .. } => None,
-    };
+    let regions = package(&graph, &planned.plans, target, npu)?;
+    // An Intel NPU's graph must assemble into its one region: the device's loader assembles it again to
+    // build the artifact, so a region argument the device cannot carry is refused here, at compile.
+    if let (Target::Npu(NpuTarget::Vpu { target, caps }), Some(lowering)) = (target, npu) {
+        lowering
+            .check_region(&graph, &Region::whole_graph(&graph), caps)
+            .map_err(|refusal| npu_region_error(&graph, *target, refusal))?;
+    }
     let buffer_plan = plan_buffers(
         &graph,
         &planned.plans,
@@ -971,7 +931,6 @@ pub fn compile(
         state_commit,
         validation,
         regions,
-        vpu,
         buffer_plan,
         limits: options.limits,
     })
@@ -994,6 +953,8 @@ pub(crate) fn adapt(
 struct PassPipeline<'t> {
     graph: Graph,
     target: &'t Target,
+    /// The NPU lowering the rewrite-legality probes plan an NPU target's equations through.
+    npu: Option<&'t dyn NpuLowering>,
     /// The strongest of the traced graph's own numerics (the unfused baseline every device run carries) and
     /// what the passes that changed it produced so far.
     recorded: NumericsProperty,
@@ -1004,10 +965,16 @@ struct PassPipeline<'t> {
 }
 
 impl<'t> PassPipeline<'t> {
-    fn new(g: &Graph, target: &'t Target, limits: CompileLimits) -> Self {
+    fn new(
+        g: &Graph,
+        target: &'t Target,
+        limits: CompileLimits,
+        npu: Option<&'t dyn NpuLowering>,
+    ) -> Self {
         Self {
             graph: g.clone(),
             target,
+            npu,
             recorded: implied_numerics(g),
             passes: Vec::new(),
             limits,
@@ -1095,8 +1062,13 @@ impl<'t> PassPipeline<'t> {
         out: Graph,
     ) -> Result<HashMap<ValueId, Refusal>, CompileError> {
         self.budget.admit(pass, &out)?;
-        let (out, restored) =
-            revert_unplannable_rewrites(&self.graph, out, self.target, &self.limits.body())?;
+        let (out, restored) = revert_unplannable_rewrites(
+            &self.graph,
+            out,
+            self.target,
+            &self.limits.body(),
+            self.npu,
+        )?;
         self.record(pass, out);
         Ok(restored)
     }
@@ -1247,6 +1219,7 @@ fn revert_unplannable_rewrites(
     after: Graph,
     target: &Target,
     limits: &poot_kernelgen::BodyLimits,
+    npu: Option<&dyn NpuLowering>,
 ) -> Result<(Graph, HashMap<ValueId, Refusal>), CompileError> {
     let before_at: HashMap<ValueId, usize> = before
         .eqns()
@@ -1264,7 +1237,15 @@ fn revert_unplannable_rewrites(
     let views = compute_views(&after, target.id());
     let mut refused: Vec<(ValueId, Refusal)> = Vec::new();
     for eqn in rewritten {
-        match plan_eqn_compiled(&after, eqn, target, &views, limits) {
+        match plan_eqn_compiled(
+            &after,
+            eqn,
+            target,
+            &views,
+            limits,
+            npu,
+            OutputBuffer::Fresh,
+        ) {
             Ok(_) => {}
             Err(PlanError::Refused(refusal)) => refused.push((eqn.out, *refusal)),
             Err(error) => return Err(error.into()),
@@ -1328,10 +1309,32 @@ fn revert_unplannable_rewrites(
     Ok((crate::passes::with_eqns(&after, eqns)?, restored))
 }
 
+/// An NPU lowering's region refusal as the planner's own typed error: the refused equation's typed refusal, or
+/// the unrepresentable region argument.
+fn npu_region_error(
+    graph: &Graph,
+    target: poot_target::VpuTargetId,
+    refusal: NpuRegionRefusal,
+) -> PlanError {
+    match refusal {
+        NpuRegionRefusal::Eqn { eqn, missing } => {
+            let eqn = graph
+                .eqns()
+                .iter()
+                .find(|candidate| candidate.out == eqn)
+                .expect("a lowering refuses an equation of the graph it was given");
+            refusal_at(GraphTables::from(graph), eqn, target, missing)
+        }
+        NpuRegionRefusal::Argument { value, dtype, gap } => {
+            PlanError::UnrepresentableValue { value, dtype, gap }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::planner::test_only::{per_eqn_plans_inside_compile, per_eqn_plans_outside_compile};
-    use crate::test_support::{gpu_caps, gpu_caps_mut};
+    use crate::test_support::{gpu_backend, gpu_caps, gpu_caps_mut};
     use crate::{Capability, Dispatch, plan_eqn};
     use poot_graph_ir::analysis::Tier2Class;
     use poot_graph_ir::{
@@ -1415,7 +1418,8 @@ mod tests {
     #[test]
     fn a_pass_that_introduces_a_reassociating_op_is_recorded_as_reassociating() {
         let target = wgpu();
-        let mut pipeline = PassPipeline::new(&pointwise_chain(), &target, CompileLimits::STANDARD);
+        let mut pipeline =
+            PassPipeline::new(&pointwise_chain(), &target, CompileLimits::STANDARD, None);
         pipeline
             .run("fixture_pass", transform::fuse)
             .expect("the fixture pass runs");
@@ -1514,16 +1518,16 @@ mod tests {
     /// An equation the traced graph itself asks for, which the target has no kernel for, is refused: no
     /// rewrite produced it, so there is no decomposition to fall back to. (Card 534a: a non-last-axis
     /// `Reduce` no longer demonstrates this - `lower_nonlast_reduces` is now compile's own rewrite for
-    /// it - so this uses an F16 `ScatterUpdate`, a row write no pass rewrites and no target has a half-width
-    /// body for, instead.)
+    /// it - so this uses a BF16 `ScatterUpdate`, a row write no pass rewrites and SPIR-V, which has no bf16
+    /// type, has no body for, instead. POOT-1395: an F16 scatter is the paged KV write and plans everywhere.)
     #[test]
     fn compile_refuses_an_equation_the_traced_graph_cannot_run() {
         let b = Builder::for_tests();
         let base = b
-            .constant("base", TensorType::new(vec![2, 5], DType::F16))
+            .constant("base", TensorType::new(vec![2, 5], DType::BF16))
             .unwrap();
         let src = b
-            .constant("src", TensorType::new(vec![1, 5], DType::F16))
+            .constant("src", TensorType::new(vec![1, 5], DType::BF16))
             .unwrap();
         let slots = b
             .constant("slots", TensorType::new(vec![1], DType::I32))
@@ -1531,7 +1535,7 @@ mod tests {
         let out = b.scatter_update(base, src, slots).unwrap();
         let refusal = refusal(
             compile(&b.finish(out).unwrap(), &wgpu(), &REPLAY),
-            "F16 ScatterUpdate",
+            "BF16 ScatterUpdate",
         );
         assert_eq!(refusal.eqn, out.id());
         assert_eq!(refusal.missing, Capability::DtypeLowering);
@@ -2561,7 +2565,7 @@ mod tests {
     /// the scatter: a step that also reads the pool as it was before the write, or a scatter over a value
     /// that is not carried state. Both targets differ from the donated shape only in what reads the base.
     ///
-    /// Mutation: drop the `ScatterNotInPlace` check in `state_commit_from_plans`; both graphs compile and the
+    /// Mutation: drop the `ScatterNotInPlace` check in `state_commit_from_aliases`; both graphs compile and the
     /// rows go red with "expected ScatterNotInPlace, got Ok".
     #[test]
     fn compile_refuses_a_scatter_whose_output_cannot_be_donated_to_its_base() {
@@ -2629,7 +2633,7 @@ mod tests {
     /// Mutation: in `write_paged`, view the pool state input instead of the scatter's output (the models' own
     /// tracer): `a_paged_decode_of_the_real_qwen2_config_dispatches_no_gather_or_transpose_of_the_pools` goes
     /// red with `the graph compiles: Plan(ScatterNotInPlace { value: v66 })`; and drop the `ScatterNotInPlace`
-    /// check in `state_commit_from_plans` and this row goes red with "expected ScatterNotInPlace, got Ok".
+    /// check in `state_commit_from_aliases` and this row goes red with "expected ScatterNotInPlace, got Ok".
     #[test]
     fn a_paged_attention_over_the_pools_before_the_write_is_refused_and_after_it_fuses() {
         let build = |stale: bool| {
@@ -3955,10 +3959,76 @@ mod tests {
         );
     }
 
+    /// POOT-1317: a packed table's kernels read a block at `block * block_bits` in the backend's `usize`, which
+    /// is 32 bits on SPIR-V for Vulkan: a source past `u32::MAX` bits (512 MiB) would wrap and read the wrong
+    /// rows. `compile` refuses it there with the typed `PackedSourceAddressing` capability, naming the format
+    /// and the sizes; PTX and ROCm (64-bit `usize`) plan the same gather as a `PackedRowGather`, and a table
+    /// under the bound plans on Vulkan too. The graph names the table's shape only, so no 540 MB buffer exists.
+    ///
+    /// Mutation: in `check_source_addressable`, return `Ok(())` for every backend; the Vulkan row plans the
+    /// gather and the first assertion goes red.
+    #[test]
+    fn compile_refuses_a_packed_source_past_the_backends_index_width() {
+        let format = poot_quant::format::WeightFormat::Iq4_Nl;
+        let graph = |rows: usize| {
+            let descriptor = poot_quant::PackedWeight::try_new(format, [rows, 160]).unwrap();
+            let b = Builder::for_tests();
+            let ids = b
+                .slot(Slot::Token, TensorType::new(vec![2], DType::I32))
+                .unwrap();
+            let sources: Vec<poot_graph_ir::Traced> =
+                poot_graph_ir::packed_source_constants("table", descriptor)
+                    .into_iter()
+                    .map(|(name, tensor_type)| b.constant(name.as_str(), tensor_type).unwrap())
+                    .collect();
+            let table = b.packed_dequant(&sources, descriptor).unwrap();
+            let rows = b.gather(table, 0, ids).unwrap();
+            b.finish(rows).unwrap()
+        };
+        // 160 values per row = 5 blocks of 18 bytes: 6.0 M rows is 540 MB of source, 3.0 M rows 270 MB.
+        let (past, under) = (graph(6_000_000), graph(3_000_000));
+        let roomy = |backend| {
+            let mut target = target_for(backend);
+            crate::test_support::gpu_caps_mut(&mut target).max_buffer_bytes = u64::MAX / 2;
+            target
+        };
+        let refusal = match compile(&past, &roomy(Backend::SpirvVulkan), &REPLAY) {
+            Err(CompileError::Plan(error)) => match *error {
+                PlanError::Refused(refusal) => refusal,
+                other => panic!("expected a refusal, got {other:?}"),
+            },
+            other => panic!(
+                "expected the planner's refusal, got {:?}",
+                other.map(|_| ())
+            ),
+        };
+        assert!(
+            matches!(
+                refusal.missing,
+                crate::Capability::PackedSourceAddressing { format: refused, source_bits, max_bits }
+                    if refused == format && source_bits > max_bits && max_bits == u64::from(u32::MAX)
+            ),
+            "got {:?}",
+            refusal.missing
+        );
+        compile(&under, &roomy(Backend::SpirvVulkan), &REPLAY)
+            .expect("a table under the 32-bit bit-offset bound plans on Vulkan");
+        for backend in [
+            Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
+            Backend::Nvptx,
+        ] {
+            compile(&past, &roomy(backend), &REPLAY)
+                .unwrap_or_else(|error| panic!("{backend:?}: a 64-bit backend plans it: {error}"));
+            // Flash-Next's whole PLE table: 51.2 G logical elements, 28.8 GB of source.
+            compile(&graph(320_001_536), &roomy(backend), &REPLAY)
+                .unwrap_or_else(|error| panic!("{backend:?}: the PLE table plans: {error}"));
+        }
+    }
+
     /// POOT-1220 SC-003: a near-miss attention chain (the softmax normalizer sums the wrong axis) is not
     /// fused, and `Program::declines` names the candidate and the first failing check; an ordinary graph
     /// reports none.
-    /// Mutation: in `flash_attention_capped`, drop the `declines.push` for an attention reason; red:
+    /// Mutation: in `flash_attention`, drop the `declines.push` for an attention reason; red:
     /// `left: []` against the one `Denom` decline.
     #[test]
     fn program_declines_name_the_first_failing_check_of_a_near_miss_attention_chain() {
@@ -4014,6 +4084,67 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.op, OpKind::Attention(_))),
             "the near-miss chain must keep its decomposition"
+        );
+    }
+
+    /// The traced prefill attention chain `[1, hq, l, d]` over a square causal mask, as a graph.
+    fn prefill_attention_chain(hq: usize, l: usize) -> Graph {
+        let d = 4usize;
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, hq, l, d])).unwrap();
+        let k = b.constant("k", TensorType::f32(vec![1, hq, l, d])).unwrap();
+        let v = b.constant("v", TensorType::f32(vec![1, hq, l, d])).unwrap();
+        let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l])).unwrap();
+        let out = poot_graph_ir::ops::attention_prefill(&b, q, k, v, 1, 0.3, mask).unwrap();
+        b.finish(out).unwrap()
+    }
+
+    fn has_attention(program: &Program) -> bool {
+        program
+            .graph()
+            .eqns()
+            .iter()
+            .any(|e| matches!(e.op, OpKind::Attention(_)))
+    }
+
+    /// POOT-1308: a prefill whose `Hq * L` query rows pass the target's X grid cap still fuses to the flash
+    /// kernel, which folds its rows onto a 2-D grid. Declining it kept the `[Hq, L, capacity]` F32 scores,
+    /// 3.8 GB at Qwen2.5-0.5B's 8192-token prefill, which no wgpu device can allocate.
+    /// Mutation: in `flash_attention`, decline a candidate whose `Hq * L` passes 65535; red: the chain stays
+    /// decomposed and this assertion fails.
+    #[test]
+    fn a_prefill_past_the_x_grid_cap_fuses_onto_the_folded_grid() {
+        let (hq, l) = (512usize, 130usize);
+        let target = wgpu();
+        let max_x = match &target {
+            Target::Gpu { caps, .. } => caps.max_grid[0] as usize,
+            _ => unreachable!("wgpu() is a GPU target"),
+        };
+        assert!(
+            hq * l > max_x,
+            "the chain must pass the X cap to prove the fold"
+        );
+        let program = compile(&prefill_attention_chain(hq, l), &target, &REPLAY).unwrap();
+        assert!(program.declines().is_empty(), "{:?}", program.declines());
+        assert!(
+            has_attention(&program),
+            "the prefill must fuse past the X cap"
+        );
+    }
+
+    /// POOT-1308: a launch the device cannot make even folded (the Y extent past its Y cap) is the planner's
+    /// refusal, and `compile` keeps the decomposition the rewrite replaced instead of handing the executor
+    /// a grid it cannot issue.
+    /// Mutation: in `fold_within_grid`, drop the Y check; red: the fused op survives into the program.
+    #[test]
+    fn a_prefill_whose_fold_passes_the_y_cap_keeps_its_decomposition() {
+        let mut target = wgpu();
+        gpu_caps_mut(&mut target).max_grid = [4, 4, 65_535];
+        // 4 heads x 5 rows = 20 workgroups: 4 across, 5 down, past the Y cap of 4.
+        let program = compile(&prefill_attention_chain(4, 5), &target, &REPLAY).unwrap();
+        assert!(
+            !has_attention(&program),
+            "an unplannable launch must revert"
         );
     }
 
@@ -4143,6 +4274,33 @@ mod tests {
         assert_eq!(refused.missing, Capability::DispatchSizeOverflow);
     }
 
+    /// POOT-1323: the 2^32-bit offset bound belongs to the 32-bit backends. The 570 MB stack of 16 Q8_0
+    /// `[4096, 8192]` experts that Vulkan splits into 15 + 1 stays one source on PTX and ROCm (64-bit kernel
+    /// indices, under the buffer limit), and so does a single 570 MB expert that Vulkan refuses.
+    /// Mutation: in `expert_ranges` bound the chunk by `u32::MAX` bits again (`max_stack_experts(u32::MAX as
+    /// u64)`); the 64-bit backends split 15 + 1 and `heights` is `[15, 1]`, not `[16]`.
+    #[test]
+    fn a_64_bit_backend_keeps_a_stack_past_the_32_bit_offset_range_whole() {
+        for backend in [
+            Backend::Nvptx,
+            Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
+        ] {
+            let target = target_for(backend);
+            let program = compile(&decode_stack_graph(16, 4096, 8192), &target, &REPLAY)
+                .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+            let heights: Vec<usize> = program
+                .graph()
+                .consts()
+                .iter()
+                .map(|&id| program.graph().aval(id).shape[0])
+                .collect();
+            assert_eq!(heights, [16], "{backend:?}: one source, no split");
+
+            compile(&decode_stack_graph(2, 32768, 16384), &target, &REPLAY)
+                .unwrap_or_else(|error| panic!("{backend:?}: one 570 MB expert plans: {error}"));
+        }
+    }
+
     /// A Q8_0 `[4, 64]` stack of `SPLIT_EXPERTS` random experts routed from 11 rows: the unsplit routed
     /// projection, its split compile on a target whose buffer limit holds two experts, and the oracle inputs of both.
     struct SplitStack {
@@ -4221,9 +4379,11 @@ mod tests {
         }
 
         fn legalize(&self) -> Graph {
+            let target = self.two_experts();
             crate::passes::legalize(
                 &self.graph,
-                &gpu_caps(&self.two_experts()),
+                gpu_backend(&target),
+                &gpu_caps(&target),
                 &CompileLimits::STANDARD,
             )
             .expect("splits the stack")

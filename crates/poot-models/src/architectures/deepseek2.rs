@@ -935,6 +935,7 @@ pub(crate) fn build_family(
         bos: p.bos,
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
+        kv_dtype: Some(crate::components::attention::CONTRACTION_READ_KV),
         chat: ChatFormat::ChatML,
         tool_codec: Some(Arc::new(HermesToolCodec)),
     };

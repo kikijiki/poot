@@ -178,7 +178,7 @@ fn open_pair() -> Option<Coordinator<impl Collectives + 'static>> {
                 std::env::var_os("POOT_REQUIRE_PTX_2GPU").is_none(),
                 "two NVIDIA devices are required (POOT_REQUIRE_PTX_2GPU) and unavailable: {error}"
             );
-            eprintln!("SKIP: two NVIDIA devices are unavailable: {error}");
+            eprintln!("POOT-SKIP: two NVIDIA devices are unavailable: {error}");
             None
         }
     }
@@ -229,6 +229,7 @@ fn driver_options(handle: &ModelHandle, capacity: NonZeroUsize) -> DriverOptions
     // A multiple of the granule within the window, never below one granule.
     let chunk = nz((capacity.get().min(128) / granule).max(1) * granule.get());
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity,

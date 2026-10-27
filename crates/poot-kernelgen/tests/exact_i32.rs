@@ -2,11 +2,46 @@
 //! and arithmetic as I32 (unsigned operations bitcast through U32), and a packed I32 leaf is read lane by
 //! lane. These check the emitted `Body` structure; no external tool runs.
 
-use poot_kernel_ir::{BinOp, Rvalue, Statement, Ty};
+use poot_kernel_ir::{BinOp, Body, Constant, Operand, Rvalue, Statement, Ty, UnOp};
+use poot_kernelgen::{FusedInput, FusedKernel, FusedScalarOp, FusedStep, LeafId, LeafTy, StepId};
+
+/// The exact-I32 body of one `op` step over a `[4]` leaf, with the literal as its second operand when given: the
+/// region every I32 unary, binary and scalar-literal equation lowers to.
+fn one_step(op: FusedScalarOp, lit: Option<i32>) -> Body {
+    let mut inputs = vec![FusedInput::Leaf(LeafId::new(0))];
+    inputs.extend(lit.map(FusedInput::LitI32));
+    poot_kernelgen::fused_i32_views_grid(
+        "k",
+        &[4],
+        &[&[4]],
+        &[poot_kernelgen::Layout::contiguous(&[4])],
+        &FusedKernel {
+            leaf_tys: vec![LeafTy::I32],
+            steps: vec![FusedStep { op, inputs }],
+            output: FusedInput::Step(StepId::new(0)),
+        },
+        None,
+    )
+    .expect("an exact-I32 step generates")
+}
+
+fn statements(body: &Body) -> Vec<&Statement> {
+    body.blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .collect()
+}
+
+/// Whether `body` assigns `rvalue`-shaped statement matching `pattern` anywhere.
+fn any_rvalue(body: &Body, pattern: impl Fn(&Rvalue) -> bool) -> bool {
+    statements(body)
+        .into_iter()
+        .any(|statement| matches!(statement, Statement::Assign(_, rvalue) if pattern(rvalue)))
+}
 
 #[test]
 fn exact_i32_scalar_body_keeps_i32_buffers_literals_and_arithmetic() {
-    let body = poot_kernelgen::binary_scalar_i32_grid("k", BinOp::Add, -1, None);
+    let body = one_step(FusedScalarOp::Binary(BinOp::Add), Some(-1));
     assert_eq!(body.param_count, 2);
     for local in &body.locals[1..=2] {
         let Ty::Ref { pointee, .. } = &local.ty else {
@@ -14,60 +49,41 @@ fn exact_i32_scalar_body_keeps_i32_buffers_literals_and_arithmetic() {
         };
         assert_eq!(**pointee, Ty::Slice(Box::new(Ty::I32)));
     }
-    assert!(
-        body.blocks
-            .iter()
-            .flat_map(|block| &block.statements)
-            .any(|statement| {
-                matches!(
-                    statement,
-                    Statement::Assign(
-                        _,
-                        Rvalue::BinaryOp(
-                            BinOp::Add,
-                            _,
-                            poot_kernel_ir::Operand::Const(poot_kernel_ir::Constant::I32(-1))
-                        )
-                    )
-                )
-            })
-    );
+    assert!(any_rvalue(&body, |rvalue| matches!(
+        rvalue,
+        Rvalue::BinaryOp(BinOp::Add, _, Operand::Const(Constant::I32(-1)))
+    )));
 }
 
 #[test]
 fn exact_i32_unsigned_compare_body_uses_u32_bitcasts() {
-    let body = poot_kernelgen::binary_scalar_i32_geu_grid("k", i32::MIN, None);
-    let statements: Vec<_> = body
-        .blocks
-        .iter()
-        .flat_map(|block| &block.statements)
-        .collect();
-    assert!(statements.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::Assign(_, Rvalue::Bitcast { to: Ty::U32, .. })
-        )
-    }));
-    assert!(statements.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::Assign(
-                _,
-                Rvalue::BinaryOp(
-                    BinOp::Ge,
-                    _,
-                    poot_kernel_ir::Operand::Const(poot_kernel_ir::Constant::U32(0x8000_0000))
-                )
-            )
-        )
-    }));
+    let body = one_step(FusedScalarOp::GeU, Some(i32::MIN));
+    // The literal is bitcast to U32 like the value, so both sides compare as unsigned words.
+    assert!(any_rvalue(&body, |rvalue| matches!(
+        rvalue,
+        Rvalue::Bitcast {
+            to: Ty::U32,
+            operand: Operand::Const(Constant::I32(i32::MIN)),
+        }
+    )));
+    assert!(any_rvalue(&body, |rvalue| matches!(
+        rvalue,
+        Rvalue::Bitcast {
+            to: Ty::U32,
+            operand: Operand::Copy(_),
+        }
+    )));
+    assert!(any_rvalue(&body, |rvalue| matches!(
+        rvalue,
+        Rvalue::BinaryOp(BinOp::Ge, Operand::Copy(_), Operand::Copy(_))
+    )));
 }
 
 #[test]
 fn exact_i32_unary_not_and_clz_keep_i32_storage() {
     for body in [
-        poot_kernelgen::unary_dt_grid("k", Ty::I32, poot_kernel_ir::UnOp::Not, None),
-        poot_kernelgen::unary_i32_clz_grid("k", None),
+        one_step(FusedScalarOp::Unary(UnOp::Not), None),
+        one_step(FusedScalarOp::Clz, None),
     ] {
         for local in &body.locals[1..=2] {
             let Ty::Ref { pointee, .. } = &local.ty else {
@@ -75,65 +91,42 @@ fn exact_i32_unary_not_and_clz_keep_i32_storage() {
             };
             assert_eq!(**pointee, Ty::Slice(Box::new(Ty::I32)));
         }
-        assert!(
-            !body
-                .blocks
-                .iter()
-                .flat_map(|block| &block.statements)
-                .any(|statement| matches!(
-                    statement,
-                    Statement::Assign(_, Rvalue::Cast { to: Ty::F32, .. })
-                ))
-        );
+        assert!(!any_rvalue(&body, |rvalue| matches!(
+            rvalue,
+            Rvalue::Cast { to: Ty::F32, .. }
+        )));
     }
 }
 
 #[test]
 fn exact_i32_shift_masks_the_amount() {
-    let body = poot_kernelgen::binary_scalar_i32_grid("k", BinOp::Shl, 33, None);
-    let statements: Vec<_> = body
-        .blocks
-        .iter()
-        .flat_map(|block| &block.statements)
-        .collect();
-    assert!(statements.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::Assign(
-                _,
-                Rvalue::BinaryOp(
-                    BinOp::Shl,
-                    _,
-                    poot_kernel_ir::Operand::Const(poot_kernel_ir::Constant::I32(1))
-                )
-            )
+    let body = one_step(FusedScalarOp::Binary(BinOp::Shl), Some(33));
+    // The amount is masked with 31 before the shift, so a shift by 33 is a shift by 1.
+    assert!(any_rvalue(&body, |rvalue| matches!(
+        rvalue,
+        Rvalue::BinaryOp(
+            BinOp::BitAnd,
+            Operand::Const(Constant::I32(33)),
+            Operand::Const(Constant::I32(31))
         )
-    }));
+    )));
+    assert!(any_rvalue(&body, |rvalue| matches!(
+        rvalue,
+        Rvalue::BinaryOp(BinOp::Shl, _, Operand::Copy(_))
+    )));
 }
 
 #[test]
 fn exact_i32_shr_bitcasts_through_u32_for_logical_shift() {
-    let body = poot_kernelgen::binary_scalar_i32_grid("k", BinOp::Shr, 1, None);
-    let statements: Vec<_> = body
-        .blocks
-        .iter()
-        .flat_map(|block| &block.statements)
-        .collect();
-    assert!(statements.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::Assign(_, Rvalue::Bitcast { to: Ty::U32, .. })
-        )
-    }));
-    assert!(statements.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::Assign(
-                _,
-                Rvalue::BinaryOp(BinOp::Shr, _, poot_kernel_ir::Operand::Copy(_))
-            )
-        )
-    }));
+    let body = one_step(FusedScalarOp::Binary(BinOp::Shr), Some(1));
+    assert!(any_rvalue(&body, |rvalue| matches!(
+        rvalue,
+        Rvalue::Bitcast { to: Ty::U32, .. }
+    )));
+    assert!(any_rvalue(&body, |rvalue| matches!(
+        rvalue,
+        Rvalue::BinaryOp(BinOp::Shr, Operand::Copy(_), Operand::Copy(_))
+    )));
 }
 
 #[test]
@@ -319,35 +312,21 @@ fn packed_i32_leaf_lane_broadcasts_a_unit_prefix() {
 
 #[test]
 fn exact_i32_unsigned_remainder_bitcasts_through_u32() {
-    let body = poot_kernelgen::binary_scalar_i32_remu_grid("k", 0x7fff_ffff, None);
-    let statements: Vec<_> = body
-        .blocks
-        .iter()
-        .flat_map(|block| &block.statements)
-        .collect();
-    assert!(statements.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::Assign(_, Rvalue::Bitcast { to: Ty::U32, .. })
-        )
-    }));
-    assert!(statements.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::Assign(
-                _,
-                Rvalue::BinaryOp(
-                    BinOp::Rem,
-                    _,
-                    poot_kernel_ir::Operand::Const(poot_kernel_ir::Constant::U32(0x7fff_ffff))
-                )
-            )
-        )
-    }));
-    assert!(!statements.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::Assign(_, Rvalue::Cast { to: Ty::F32, .. })
-        )
-    }));
+    let body = one_step(FusedScalarOp::RemU, Some(0x7fff_ffff));
+    assert!(any_rvalue(&body, |rvalue| matches!(
+        rvalue,
+        Rvalue::Bitcast {
+            to: Ty::U32,
+            operand: Operand::Const(Constant::I32(0x7fff_ffff)),
+        }
+    )));
+    assert!(any_rvalue(&body, |rvalue| matches!(
+        rvalue,
+        Rvalue::BinaryOp(BinOp::Rem, Operand::Copy(_), Operand::Copy(_))
+    )));
+    // The u32 result is bitcast back to the I32 storage pattern.
+    assert!(any_rvalue(&body, |rvalue| matches!(
+        rvalue,
+        Rvalue::Bitcast { to: Ty::I32, .. }
+    )));
 }

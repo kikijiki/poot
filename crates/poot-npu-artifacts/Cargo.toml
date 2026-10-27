@@ -1,0 +1,21 @@
+[package]
+name = "poot-npu-artifacts"
+description = "The host side of an NPU kernel: AMD XDNA2 linked artifacts and shape ABI, Intel NPU graph artifacts and the OpenVINO IR region emitter"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# `check_aie_bindings` and its types: the AIE loader's own check is the device's; only tests call this one
+# (ADR-0113). Enabled only from `[dev-dependencies]` edges.
+test-support = []
+
+[dependencies]
+poot-target.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

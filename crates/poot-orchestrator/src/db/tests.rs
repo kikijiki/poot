@@ -10,6 +10,7 @@ fn pod(id: &str, status: &str, image: &str, ssh: bool) -> Pod {
         id: id.into(),
         gpu_type: "RTX 3090".into(),
         cloud: "COMMUNITY".into(),
+        cost_per_hr: Some(0.22),
         image: image.into(),
         status: status.into(),
         ssh_host: if ssh { Some("1.2.3.4".into()) } else { None },
@@ -41,5 +42,6 @@ fn owner(pid: i64, start_ticks: &str) -> ExecOwner {
         pid,
         boot_id: "boot-a".into(),
         start_ticks: start_ticks.into(),
+        pid_ns: "pid:[4026531836]".into(),
     }
 }

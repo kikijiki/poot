@@ -2238,6 +2238,12 @@ impl Builder {
         self.emit(OpKind::ArgTopK { k }, vec![self.operand(rank)?])
     }
 
+    /// The permutation that groups `ids [M]` by expert and its inverse: `[2, M]`, row 0 the sorted order and row 1
+    /// each row's sorted position. See [`OpKind::ExpertGroup`].
+    pub fn expert_group(&self, ids: Traced, experts: usize) -> Result<Traced, BuilderError> {
+        self.emit(OpKind::ExpertGroup { experts }, vec![self.operand(ids)?])
+    }
+
     /// Exact uniform noise from an integer seed (card 551a, R472-007): `seed` is any-shape I32; output
     /// is `seed`'s shape with one trailing `cols` axis appended. See [`OpKind::RandomUniform`] and
     /// [`crate::ops::sampling`].

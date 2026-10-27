@@ -116,7 +116,7 @@ fn ge_comparison_gpu_matches_cpu() {
     let bd: Vec<f32> = vec![1.0; n];
     let cd: Vec<f32> = (0..n).map(|i| i as f32 * 0.1 + 1.0).collect();
 
-    // standalone broadcast `ge(a, b)` (exercises binary_broadcast_dt).
+    // standalone broadcast `ge(a, b)` (a one-step pointwise region over two broadcast leaves).
     let b = Builder::for_tests();
     let a = b.constant("a", TensorType::f32(vec![1, 1, n])).unwrap();
     let bb = b.constant("b", TensorType::f32(vec![1, 1, n])).unwrap();

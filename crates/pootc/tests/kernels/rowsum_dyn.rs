@@ -2,9 +2,9 @@
 //! a const. out[r] = sum of x's row of `dims[0]` columns. One imported Body runs any shape; the dim rides
 //! in a one-element slice, reusing the existing slice binding.
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 pub fn __poot_kernel_rowsum_dyn(x: &[f32], dims: &[u32], out: &mut [f32]) {
-    let r = thread_index();
+    let r = thread_index_x();
     if r < out.len() {
         let cols = dims[0] as usize;
         let mut acc = 0.0f32;

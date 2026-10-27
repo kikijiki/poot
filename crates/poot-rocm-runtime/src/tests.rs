@@ -528,7 +528,7 @@ fn rocm_context_open_is_required_by_its_own_variable_only() {
 }
 
 fn test_buffer(elements: usize, storage: BufferStorage) -> RocmBuffer {
-    let (elem_count, byte_capacity) =
+    let byte_capacity =
         checked_layout("test_buffer", elements, storage).expect("valid test buffer");
     let (owner, _) = recording_owner(0);
     let memory = MemoryCounters::new();
@@ -542,7 +542,7 @@ fn test_buffer(elements: usize, storage: BufferStorage) -> RocmBuffer {
             ),
             poison: DevicePoison::default(),
         }),
-        elem_count,
+        elem_count: elements,
         byte_capacity,
         storage,
     }
@@ -693,8 +693,45 @@ fn immutable_metadata_and_valid_copy_share_one_allocation_contract() {
 fn allocation_arithmetic_is_checked_before_native_allocation() {
     assert!(matches!(
         checked_layout("allocate_f32", usize::MAX, BufferStorage::f32()),
-        Err(RocmError::ElementCountTooLarge { .. } | RocmError::ByteSizeOverflow { .. })
+        Err(RocmError::ByteSizeOverflow { .. })
     ));
+}
+
+/// POOT-1317 on a real device: a buffer of more than `u32::MAX` elements allocates, reports its true
+/// element count, and its last bytes are writable (Flash-Next's PLE table is 7.2 G words). Only the host
+/// layout bounds the count; the kernarg lengths are 64-bit.
+///
+/// Mutation: make `poot_runtime_common::checked_byte_capacity` refuse a count past `u32::MAX`; the
+/// allocation is refused and the first expectation goes red.
+#[test]
+fn a_buffer_past_u32_elements_allocates_and_its_tail_is_writable() {
+    let Some(ctx) =
+        open_context_or_skip("a_buffer_past_u32_elements_allocates_and_its_tail_is_writable")
+    else {
+        return;
+    };
+    let elements = u32::MAX as usize + 2;
+    let buffer = ctx
+        .allocate(BufferRole::Weight, BufferStorage::raw_bytes(), elements)
+        .expect("a buffer past u32 elements");
+    assert_eq!(buffer.elem_count(), elements);
+    write_host_bytes(&ctx, &buffer, elements - 4, &[1, 2, 3, 4]).expect("the tail is in range");
+    let error = write_host_bytes(&ctx, &buffer, buffer.byte_capacity() - 3, &[0; 4]).unwrap_err();
+    assert!(
+        matches!(error, RocmError::RangeOutOfBounds { .. }),
+        "a write past the end is a typed range error, got {error:?}"
+    );
+}
+
+/// The kernarg lengths are 64-bit (`bind_kernarg`), so an element count past `u32::MAX` is a valid
+/// layout whose size is its byte count (POOT-1317: Flash-Next's 7.2 G-word PLE table).
+#[test]
+fn allocation_layout_accepts_an_element_count_past_u32() {
+    let elements = u32::MAX as usize + 1;
+    assert_eq!(
+        checked_layout("allocate_i32", elements, BufferStorage::i32()).expect("a 64-bit layout"),
+        elements * 4
+    );
 }
 
 #[test]
@@ -742,13 +779,13 @@ fn native_buffer_contract_roundtrip_rocm() {
         Ok(ctx) => ctx,
         Err(RocmError::LibraryNotFound(msg)) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP native_buffer_contract_roundtrip_rocm (no HSA library): {msg}"
+                "POOT-SKIP poot-rocm-runtime: native_buffer_contract_roundtrip_rocm (no HSA library): {msg}"
             );
             return;
         }
         Err(RocmError::NoGpuAgent) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP native_buffer_contract_roundtrip_rocm (no GPU agent)"
+                "POOT-SKIP poot-rocm-runtime: native_buffer_contract_roundtrip_rocm (no GPU agent)"
             );
             return;
         }
@@ -891,11 +928,11 @@ fn agent_enumeration_works() {
         }
         Err(RocmError::LibraryNotFound(msg)) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP agent_enumeration_works (no HSA library): {msg}"
+                "POOT-SKIP poot-rocm-runtime: agent_enumeration_works (no HSA library): {msg}"
             );
         }
         Err(RocmError::NoGpuAgent) => {
-            tracing::info!("poot-rocm-runtime: SKIP agent_enumeration_works (no GPU agent)");
+            tracing::info!("POOT-SKIP poot-rocm-runtime: agent_enumeration_works (no GPU agent)");
         }
         Err(e) => panic!("agent_enumeration_works failed: {e}"),
     }
@@ -910,14 +947,14 @@ fn vram_budget_bytes_reports_a_plausible_value() {
         Ok(ctx) => ctx,
         Err(RocmError::LibraryNotFound(msg)) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP vram_budget_bytes_reports_a_plausible_value (no HSA \
+                "POOT-SKIP poot-rocm-runtime: vram_budget_bytes_reports_a_plausible_value (no HSA \
                  library): {msg}"
             );
             return;
         }
         Err(RocmError::NoGpuAgent) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP vram_budget_bytes_reports_a_plausible_value (no GPU agent)"
+                "POOT-SKIP poot-rocm-runtime: vram_budget_bytes_reports_a_plausible_value (no GPU agent)"
             );
             return;
         }
@@ -937,16 +974,45 @@ fn vram_budget_bytes_reports_a_plausible_value() {
     );
 }
 
+/// POOT-1382: on a unified-memory device the free figure the driver plans against leaves the host its
+/// floor. The HSA pool alone reports about what the host has available (the box the card measured: 111.9
+/// GiB pool, 112 GiB `MemAvailable`), so a plan that filled the pool left the host 2 GiB and starved it.
+/// The slack covers the host's memory moving between the two reads.
+///
+/// Mutation: return the pool's figure unbounded in `RocmContext::vram_free_bytes`; free is then within the
+/// slack of `MemAvailable` and the row goes red. Skips (logged) where ROCm, a GPU, or an APU is absent.
+#[test]
+fn a_unified_memory_device_leaves_the_host_its_floor() {
+    let Some(ctx) = open_context_or_skip("a_unified_memory_device_leaves_the_host_its_floor")
+    else {
+        return;
+    };
+    if !ctx.unified_memory {
+        tracing::info!(
+            "POOT-SKIP poot-rocm-runtime: a_unified_memory_device_leaves_the_host_its_floor (discrete GPU)"
+        );
+        return;
+    }
+    const SLACK: u64 = 2 << 30;
+    let free = ctx.vram_free_bytes().expect("a pool free figure");
+    let host = crate::host_memory::host_available_bytes().expect("MemAvailable");
+    assert!(
+        free + crate::host_memory::UNIFIED_HOST_FLOOR_BYTES <= host + SLACK,
+        "free {free} leaves the host less than its floor of {} (MemAvailable {host})",
+        crate::host_memory::UNIFIED_HOST_FLOOR_BYTES
+    );
+}
+
 /// Open a context for a device test, or `None` (a logged skip) when ROCm or a GPU is absent.
 fn open_context_or_skip(test: &str) -> Option<RocmContext> {
     match RocmContext::new() {
         Ok(ctx) => Some(ctx),
         Err(RocmError::LibraryNotFound(msg)) => {
-            tracing::info!("poot-rocm-runtime: SKIP {test} (no HSA library): {msg}");
+            tracing::info!("POOT-SKIP poot-rocm-runtime: {test} (no HSA library): {msg}");
             None
         }
         Err(RocmError::NoGpuAgent) => {
-            tracing::info!("poot-rocm-runtime: SKIP {test} (no GPU agent)");
+            tracing::info!("POOT-SKIP poot-rocm-runtime: {test} (no GPU agent)");
             None
         }
         Err(e) => panic!("{test} failed: {e}"),
@@ -963,11 +1029,11 @@ fn open_context_with_one_second_wait_bound_or_skip(test: &str) -> Option<RocmCon
     }) {
         Ok(ctx) => Some(ctx),
         Err(RocmError::LibraryNotFound(msg)) => {
-            tracing::info!("poot-rocm-runtime: SKIP {test} (no HSA library): {msg}");
+            tracing::info!("POOT-SKIP poot-rocm-runtime: {test} (no HSA library): {msg}");
             None
         }
         Err(RocmError::NoGpuAgent) => {
-            tracing::info!("poot-rocm-runtime: SKIP {test} (no GPU agent)");
+            tracing::info!("POOT-SKIP poot-rocm-runtime: {test} (no GPU agent)");
             None
         }
         Err(e) => panic!("{test} failed: {e}"),
@@ -1562,13 +1628,13 @@ fn wait_completion_bounded_wakes_when_signal_drops() {
         Ok(ctx) => ctx,
         Err(RocmError::LibraryNotFound(msg)) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP wait_completion_bounded_wakes_when_signal_drops (no HSA library): {msg}"
+                "POOT-SKIP poot-rocm-runtime: wait_completion_bounded_wakes_when_signal_drops (no HSA library): {msg}"
             );
             return;
         }
         Err(RocmError::NoGpuAgent) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP wait_completion_bounded_wakes_when_signal_drops (no GPU agent)"
+                "POOT-SKIP poot-rocm-runtime: wait_completion_bounded_wakes_when_signal_drops (no GPU agent)"
             );
             return;
         }
@@ -1749,13 +1815,13 @@ fn enqueue_graph_batched_chunk_size_vs_granitemoe_step_aql_count() {
         Ok(ctx) => ctx,
         Err(RocmError::LibraryNotFound(msg)) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP enqueue_graph_batched_chunk_size_vs_granitemoe_step_aql_count (no HSA library): {msg}"
+                "POOT-SKIP poot-rocm-runtime: enqueue_graph_batched_chunk_size_vs_granitemoe_step_aql_count (no HSA library): {msg}"
             );
             return;
         }
         Err(RocmError::NoGpuAgent) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP enqueue_graph_batched_chunk_size_vs_granitemoe_step_aql_count (no GPU agent)"
+                "POOT-SKIP poot-rocm-runtime: enqueue_graph_batched_chunk_size_vs_granitemoe_step_aql_count (no GPU agent)"
             );
             return;
         }
@@ -2075,13 +2141,13 @@ fn device_caps_matches_a_direct_hsa_query() {
         Ok(ctx) => ctx,
         Err(RocmError::LibraryNotFound(msg)) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP device_caps_matches_a_direct_hsa_query (no HSA library): {msg}"
+                "POOT-SKIP poot-rocm-runtime: device_caps_matches_a_direct_hsa_query (no HSA library): {msg}"
             );
             return;
         }
         Err(RocmError::NoGpuAgent) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP device_caps_matches_a_direct_hsa_query (no GPU agent)"
+                "POOT-SKIP poot-rocm-runtime: device_caps_matches_a_direct_hsa_query (no GPU agent)"
             );
             return;
         }
@@ -2139,7 +2205,7 @@ fn compile_and_load(
     ctx: &RocmContext,
     name: &str,
     body: &poot_kernel_ir::Body,
-) -> (Arc<HsacoModule>, poot_runtime_common::CompiledKernel) {
+) -> (Arc<HsacoModule>, poot_codegen::CompiledKernel) {
     let arch =
         poot_target::AmdArch::from_isa_name(ctx.isa_name(), ctx.wavefront()).unwrap_or_else(|e| {
             panic!(
@@ -2172,7 +2238,7 @@ fn bind_add_kernarg(
     b: &RocmBuffer,
     c: &RocmBuffer,
 ) -> BoundKernarg {
-    let len = |buffer: &RocmBuffer| u64::from(buffer.elem_count());
+    let len = |buffer: &RocmBuffer| buffer.elem_count() as u64;
     ctx.bind_kernarg(kernel, &[(a, len(a)), (b, len(b)), (c, len(c))])
         .expect("bind add kernarg")
 }
@@ -2218,12 +2284,10 @@ fn dispatch_rejects_buffers_that_do_not_meet_the_compiled_schema() {
     assert!(
         matches!(
             wrong_count,
-            Err(RocmError::KernelArgs(
-                poot_runtime_common::KernelArgError::Count {
-                    expected: 3,
-                    actual: 2,
-                }
-            ))
+            Err(RocmError::KernelArgs(poot_codegen::KernelArgError::Count {
+                expected: 3,
+                actual: 2,
+            }))
         ),
         "got {wrong_count:?}"
     );
@@ -2240,7 +2304,7 @@ fn dispatch_rejects_buffers_that_do_not_meet_the_compiled_schema() {
         matches!(
             wrong_kind,
             Err(RocmError::KernelArgs(
-                poot_runtime_common::KernelArgError::ElementKind {
+                poot_codegen::KernelArgError::ElementKind {
                     index: 2,
                     expected: ElementKind::F32,
                     actual: ElementKind::Bf16,
@@ -2335,10 +2399,7 @@ fn lookup_kernel_rejects_a_mismatched_entry_point_and_dispatches_the_right_kerne
     let square_kernarg = ctx
         .bind_kernarg(
             &square_kernel,
-            &[
-                (&x, u64::from(x.elem_count())),
-                (&y, u64::from(y.elem_count())),
-            ],
+            &[(&x, x.elem_count() as u64), (&y, y.elem_count() as u64)],
         )
         .expect("bind square kernarg");
     ctx.dispatch(
@@ -2415,7 +2476,7 @@ fn dispatch_no_contract_probe(
         .bind_kernarg(
             &kernel,
             &[&a_buf, &b_buf, &c_buf, &d_buf, &out_buf]
-                .map(|buffer| (buffer, u64::from(buffer.elem_count()))),
+                .map(|buffer| (buffer, buffer.elem_count() as u64)),
         )
         .expect("bind no_contract_probe kernarg");
     let n = rows.len() as u32;

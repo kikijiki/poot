@@ -10,9 +10,10 @@ architecture, usage, and examples (`docs/`). Benchmark results live under `../be
   - **Develop** - library build, run, kernels, embedding, models
   - **Serve** - `poot-serve` operator guide and configuration
   - **Architecture** - design, IR, backends, serving design
-  - **Reference** - feature matrix, performance, FAQ
+  - **Performance** - measured throughput
 - `src/components/architecture/` - interactive diagrams used by the architecture pages.
 - `diagrams/` - the SVG sources of the architecture images the README and the website use; `just diagrams` renders them to `static/img/architecture/`.
+  Run it inside the dev shell. Options: `--only a,b` renders some sources, `--out DIR` renders elsewhere, `--publish-dir DIR` also copies the PNGs and `index.json` there, `--check` fails when a committed PNG differs from its source (`just test` runs it). Rendering uses the pinned `resvg` and one bundled font, so output is byte-reproducible; `index.json` holds each image's name, size, checksums, source and alt text.
 
 ## Commands
 

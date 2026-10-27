@@ -16,7 +16,6 @@ use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Device, Engine, Executor};
 use poot_executor_parity::Fixture;
 use poot_graph_plan::Target;
-use poot_graph_plan::test_support::gpu_caps;
 use poot_kernel_ir::Body;
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
@@ -268,48 +267,13 @@ fn captured_replay_of_the_toy_graphs_equals_the_recording_step_on_vulkan() {
 /// The generated tiled GEMM at the gemma4-MoE router shape `M = 32, K = 2816, N = 128`, and the same shape with a
 /// remainder tile on both output axes (`M = 33`, `N = 130`). Each matches the oracle at every step.
 #[test]
-fn tiled_region_with_a_remainder_tile_matches_the_oracle_on_vulkan() {
+fn tiled_gemm_with_a_remainder_tile_matches_the_oracle_on_vulkan() {
     let Some((mut exec, target)) = vulkan() else {
         return;
     };
-    for fixture in &poot_executor_parity::launch::tiled_region_fixtures() {
+    for fixture in &poot_executor_parity::launch::tiled_gemm_fixtures() {
         assert_matches_oracle(exec.as_mut(), target, fixture);
     }
-}
-
-/// Card 663 SC-001, raw Vulkan. The batched, multi-block cooperative-matrix matmul: `[2, 32, 48] x [2, 48, 32]`
-/// f16 operands (`poot_executor_parity::launch::wmma_f16_batched_fixture`), 2 x 2 x 2 output tiles each carrying its
-/// accumulator across three 16-wide K blocks, every output element of both steps compared with the oracle. The
-/// fixture values give every K block a distinct nonzero contribution to every output (at least 16 per block), so a
-/// dropped, doubled or wrong-batch block moves all outputs far past the parity tolerance. Skips on a device with no
-/// cooperative-matrix hardware.
-///
-/// Mutation: drop the last K block in `poot-kernelgen`'s `tensor_core_tiles` (the loop bound `k0 < k` becomes
-/// `k0 + 16 < k`), with a fresh `POOT_KERNEL_CACHE_DIR`; every output is short by its last block's contribution and
-/// the row goes red. A second mutation, restoring the single K tile (`K == 16` only) in
-/// `matmul_spirv_coopmat_eligible`, plans the serial kernel, and the dispatched-body check goes red.
-#[test]
-fn batched_multi_block_coopmat_matmul_matches_the_oracle_on_vulkan() {
-    let Some((mut exec, target)) = vulkan() else {
-        return;
-    };
-    if gpu_caps(&target).tensor_core == poot_target::TensorCoreSupport::None {
-        eprintln!("SKIP: this device reports no cooperative-matrix hardware");
-        return;
-    }
-    let fixture = poot_executor_parity::launch::wmma_f16_batched_fixture();
-    assert!(
-        dispatched_bodies(&fixture, target)
-            .iter()
-            .any(|(body, _)| body
-                .blocks
-                .iter()
-                .flat_map(|block| &block.statements)
-                .any(|statement| matches!(statement, poot_kernel_ir::Statement::WmmaMma { .. }))),
-        "{}: no dispatched kernel multiplies on the cooperative matrix",
-        fixture.name
-    );
-    assert_matches_oracle(exec.as_mut(), target, &fixture);
 }
 
 /// One elementwise region over 70001 elements is one dispatch whose grid needs more than 256 workgroups at any
@@ -361,6 +325,18 @@ fn packed_linears_and_the_indexed_expert_contraction_match_the_oracle_on_vulkan(
         );
         assert_matches_oracle(exec.as_mut(), target, &fixture);
     }
+}
+
+/// POOT-1337: the decode Gemv decodes the real Flash-Next blocks (Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XS, IQ3_XXS, IQ4_NL)
+/// to llama.cpp's gguf-py values bit for bit (`poot_executor_parity::reference_blocks`). The oracle rows above compare
+/// the device with poot's own CPU decode; this row's reference is independent of it.
+/// Mutation: swap two entries of the IQ2_XS grid in `poot_quant::grids`; the `reference_iq2_xs` rows go red.
+#[test]
+fn packed_decode_gemv_matches_llama_cpp_dequantisation_on_real_blocks_on_vulkan() {
+    let Some((mut exec, target)) = vulkan() else {
+        return;
+    };
+    poot_executor_parity::reference_blocks::assert_reference_blocks(exec.as_mut(), target);
 }
 
 /// The chunked Gated-DeltaNet prefill (many small chained dependent dispatches in one recorded program: a Hillis-Steele chunked decay scan, a tiled
@@ -577,4 +553,20 @@ fn selected_attention_reads_exactly_the_selected_blocks_on_vulkan() {
             assert_matches_oracle(exec.as_mut(), target, &case.fixture);
         }
     }
+}
+
+/// Prefill MoE rows are sorted by expert before the indexed contraction (POOT-1336). The grouping equals a stable
+/// sort by expert and its inverse at every replayed step, on routings that break a naive grouping (every row on one
+/// expert, experts without rows, ties, ids outside the table sorted last, a partial last workgroup, more experts than
+/// rows); a contraction through it is bit-identical per row to the direct one; and an invalid id is a NaN row in
+/// both halves, never another expert's result.
+///
+/// Mutation: in `expert_group` count a bucket's start with `Le` instead of `Lt`; the order and its inverse differ
+/// from the stable sort on the first case.
+#[test]
+fn expert_grouping_is_the_stable_sort_and_changes_no_row_on_vulkan() {
+    let Some((mut exec, target)) = vulkan() else {
+        return;
+    };
+    poot_executor_parity::routing::assert_expert_grouping_on_device(exec.as_mut(), target);
 }

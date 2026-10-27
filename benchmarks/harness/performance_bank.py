@@ -313,6 +313,39 @@ def spread_of(receipt, policy=receipts.POLICY):
     return {"spread": spread, "exceeds_max_uncertainty": 2 * spread > policy["metrics"][KERNEL_METRIC]["max_uncertainty"]}
 
 
+def work_flop(case):
+    """The useful floating-point work of one step of `case`, from its definition, or `None` for a producer whose
+    cost is not a FLOP count (the scans are bound by their serial recurrence). A multiply-add is two FLOP.
+    Attention counts `Q K^T` and `P V` over the key pairs the mask leaves visible: `4 * d` per pair, so a causal
+    prefill counts its causal half, as FlashAttention and llama.cpp report it."""
+    shape, producer = case["shape"], case["producer"]
+    if producer in ("dense_matmul", "dense_contraction"):
+        return 2 * shape["m"] * shape["k"] * shape["n"]
+    if producer == "attention_decode":
+        return shape["hq"] * 4 * shape["d"] * shape.get("live", shape["cap"])
+    if producer == "attention_prefill":
+        lq, cap = shape["lq"], shape["cap"]
+        # Query row i sits at position cap - lq + i and sees keys 0..=that position.
+        pairs = lq * (cap - lq) + lq * (lq + 1) // 2
+        return shape["hq"] * 4 * shape["d"] * pairs
+    return None
+
+
+def throughput_of(case, receipt):
+    """`tflop_per_s` of a receipt: the case's work over its median repeat, or `None` when the case has no FLOP
+    model. Derived, like the spread, so the manifest states it and validation recomputes it."""
+    flop = work_flop(case)
+    if flop is None:
+        return {"tflop_per_s": None}
+    median_us = statistics.median(r["metrics"][KERNEL_METRIC] for r in receipt["cells"]["kernel"]["repeats"])
+    return {"tflop_per_s": round(flop / (median_us * 1e-6) / 1e12, 4)}
+
+
+def derived_of(case, receipt):
+    """Every field a verified claim derives from its receipt."""
+    return {**spread_of(receipt), **throughput_of(case, receipt)}
+
+
 def _verified_errors(bank, case, backend, entry, root):
     path = Path(root) / entry.get("receipt", "")
     if not entry.get("receipt") or not path.is_file():
@@ -324,7 +357,7 @@ def _verified_errors(bank, case, backend, entry, root):
         return ["the claimed command is not the checked-in bank command for this case and backend"]
     receipt = json.loads(data)
     errors = receipt_errors(bank, case, backend, receipt)
-    for field, value in spread_of(receipt).items():
+    for field, value in derived_of(case, receipt).items():
         if entry.get(field) != value:
             errors.append(f"{field} is {entry.get(field)!r} but the receipt's repeats give {value!r}")
     return errors
@@ -405,7 +438,7 @@ def record(case_id, backend, *, wrap=(), root=BANK_ROOT, repo=REPO_ROOT, device=
             "receipt": str(path.relative_to(root)),
             "receipt_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "command": command,
-            **spread_of(receipt),
+            **{k: v for k, v in derived_of(case, receipt).items() if v is not None},
             **({"note": previous["note"]} if "note" in previous else {}),
         }
     )

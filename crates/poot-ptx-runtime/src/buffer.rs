@@ -33,7 +33,7 @@ impl PtxBuffer {
     }
 
     /// Immutable logical element count passed to the native slice ABI.
-    pub fn elem_count(&self) -> u32 {
+    pub fn elem_count(&self) -> usize {
         self.alloc.elem_count
     }
 
@@ -67,7 +67,7 @@ impl PtxBuffer {
 
 pub(crate) struct PtxAlloc {
     pub(crate) ptr: sys::CUdeviceptr,
-    pub(crate) elem_count: u32,
+    pub(crate) elem_count: usize,
     pub(crate) byte_capacity: usize,
     pub(crate) storage: BufferStorage,
     pub(crate) owner: Option<Arc<PtxOwner>>,
@@ -81,17 +81,14 @@ pub(crate) fn checked_layout(
     op: &'static str,
     elements: usize,
     storage: BufferStorage,
-) -> Result<(u32, usize), PtxError> {
+) -> Result<usize, PtxError> {
     let element_bytes = storage.element().byte_width();
-    poot_runtime_common::checked_layout(elements, element_bytes).map_err(|error| match error {
-        poot_runtime_common::LayoutError::ElementCountTooLarge => {
-            PtxError::ElementCountTooLarge { op, elements }
-        }
-        poot_runtime_common::LayoutError::ByteSizeOverflow => PtxError::ByteSizeOverflow {
+    poot_runtime_common::checked_byte_capacity(elements, element_bytes).map_err(|_| {
+        PtxError::ByteSizeOverflow {
             op,
             elements,
             element_bytes,
-        },
+        }
     })
 }
 
@@ -104,13 +101,13 @@ pub(crate) fn allocate_owned(
     allocate: impl FnOnce(usize) -> Result<sys::CUdeviceptr, PtxError>,
     initialize: impl FnOnce(sys::CUdeviceptr, usize) -> Result<(), PtxError>,
 ) -> Result<PtxBuffer, PtxError> {
-    let (elem_count, bytes) = checked_layout(op, elements, storage)?;
+    let bytes = checked_layout(op, elements, storage)?;
     let ptr = allocate(bytes)?;
     let guard = std::mem::ManuallyDrop::new(owner.memory.record_alloc(role, bytes as u64));
     let buffer = PtxBuffer {
         alloc: Arc::new(PtxAlloc {
             ptr,
-            elem_count,
+            elem_count: elements,
             byte_capacity: bytes,
             storage,
             owner: Some(owner),
@@ -231,7 +228,7 @@ pub(crate) mod test_only {
         storage: BufferStorage,
         owner: Option<Arc<PtxOwner>>,
     ) -> Result<PtxBuffer, PtxError> {
-        let (elem_count, byte_capacity) = checked_layout(op, elements, storage)?;
+        let byte_capacity = checked_layout(op, elements, storage)?;
         let guard = owner.as_ref().map(|owner| {
             std::mem::ManuallyDrop::new(
                 owner
@@ -242,7 +239,7 @@ pub(crate) mod test_only {
         Ok(PtxBuffer {
             alloc: Arc::new(PtxAlloc {
                 ptr,
-                elem_count,
+                elem_count: elements,
                 byte_capacity,
                 storage,
                 owner,

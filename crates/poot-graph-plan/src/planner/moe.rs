@@ -1,7 +1,7 @@
-//! MoE equation planning: the indexed matmul (with its fused gate-weighting epilogue) and the ArgTopK rank
-//! inversion.
+//! MoE equation planning: the indexed matmul (with its fused gate-weighting epilogue), the ArgTopK rank
+//! inversion and the expert grouping of the routed rows.
 
-use super::matmul::{FoldedTileGrid, folded_tile_grid};
+use super::matmul::{TiledDispatch, planned_dispatches, register_tiled_launch};
 use super::{
     BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, HashMap, KernelRequest,
     OpKind, PlanError, Planned, TopKSpec, ValueId, kg, matmul, value_ids,
@@ -75,6 +75,12 @@ pub(super) fn plan(
                 caps,
             )?
         }
+        OpKind::ExpertGroup { experts } => Planned::generated(
+            site,
+            KernelRequest::ExpertGroup(kg::ExpertGroupSpec { experts: *experts }),
+            backend,
+            caps,
+        )?,
         OpKind::Iota { .. } => {
             unreachable!("plan_eqn refuses an unfolded Iota before dispatching to a family")
         }
@@ -129,8 +135,8 @@ fn weight_layout(
 /// One generated indexed contraction ([`ContractionSpec::Indexed`]): `x[M, K]` against the stacked `W[E, K, N]`
 /// (or its checkpoint `[E, N, K]` view) with row `m` reading slab `idx[m]`, optionally with an epilogue over each
 /// sum. The schedule is chosen from shapes and the device alone ([`indexed_gemv_in`]): the Gemv at decode row
-/// counts, else the segmented Tiled, whose grid is folded onto `GroupY` above the device's X extent and refused
-/// with a typed error beyond that too.
+/// counts, else the register-tiled schedule inside an expert walk ([`register_tiled_launch`] over one block of `M`
+/// rows in `E` segments), split and folded as every register-tiled contraction is.
 fn plan_indexed(
     site: Site<'_>,
     g: GraphTables<'_>,
@@ -167,39 +173,54 @@ fn plan_indexed(
         }));
     }
     let overflow = || site.refuse(Capability::DispatchSizeOverflow);
-    let (schedule, grid, x_groups) = match indexed_gemv_in(m, n, caps) {
-        Some(schedule) => {
-            let threads = u32::try_from(schedule.grid_threads(1, m, n)).map_err(|_| overflow())?;
-            (schedule, [threads, 1, 1], 0)
+    let word = |extent: usize| u32::try_from(extent).map_err(|_| overflow());
+    let (schedule, dispatches) = match indexed_gemv_in(m, n, caps) {
+        Some(launch) => {
+            let schedule = launch.schedule(backend, k);
+            let threads = word(schedule.grid_threads(1, m, n))?;
+            let meta = vec![word(k)?, word(n)?, word(m)?, 0, 0, word(experts)?];
+            (
+                schedule,
+                vec![TiledDispatch {
+                    grid: [threads, 1, 1],
+                    meta,
+                }],
+            )
         }
         None => {
-            let tile = kg::TileSize::new(caps.gemm_launch().tile_edge)
-                .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
-            let ts = tile.get() as usize;
-            let tiles = m
-                .div_ceil(ts)
-                .checked_mul(n.div_ceil(ts))
-                .ok_or_else(overflow)?;
-            let FoldedTileGrid { x_groups, grid } = folded_tile_grid(site, tiles, ts, caps)?;
-            (kg::Schedule::Tiled { tile }, grid, x_groups)
+            let (tiling, mut dispatches) = register_tiled_launch(
+                site,
+                kg::TiledShape {
+                    blocks: 1,
+                    m_per_block: m,
+                    out_per_block: n,
+                    k,
+                    layout,
+                    segments: experts,
+                },
+                caps,
+            )?;
+            let experts = word(experts)?;
+            for dispatch in &mut dispatches {
+                dispatch.meta.push(experts);
+            }
+            (tiling.schedule(), dispatches)
         }
     };
-    let meta = [k, n, experts, m]
-        .into_iter()
-        .map(|extent| u32::try_from(extent).map_err(|_| overflow()))
-        .chain([Ok(x_groups)])
-        .collect::<Result<Vec<_>, _>>()?;
-    Planned::generated(
+    planned_dispatches(
         site,
-        KernelRequest::Contraction(ContractionSpec::Indexed(kg::IndexedContraction {
-            schedule,
-            layout,
-            weight,
-            epilogue,
-            grid,
-            meta,
-        })),
         backend,
         caps,
+        dispatches,
+        |TiledDispatch { grid, meta }| {
+            KernelRequest::Contraction(ContractionSpec::Indexed(kg::IndexedContraction {
+                schedule,
+                layout,
+                weight,
+                epilogue: epilogue.clone(),
+                grid,
+                meta,
+            }))
+        },
     )
 }

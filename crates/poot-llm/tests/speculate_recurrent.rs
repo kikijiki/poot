@@ -124,6 +124,7 @@ fn fixture_handle(family: FamilyKey) -> (Arc<ModelHandle>, poot_test_util::Uniqu
 fn options(draft: DraftPolicy) -> DriverOptions {
     let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(CAPACITY),
@@ -185,6 +186,7 @@ fn build_recurrent(raw: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, M
             bos: None,
             prompt_bos: None,
             prefill_granule: nz(granule),
+            kv_dtype: None,
             chat: ChatFormat::ChatML,
             tool_codec: Some(Arc::new(HermesToolCodec)),
         },
@@ -339,7 +341,7 @@ impl Device for FakeDevice {
     fn load_kernel(
         &mut self,
         _key: &str,
-        _kernel: poot_runtime_common::CompiledKernel,
+        _kernel: poot_codegen::CompiledKernel,
     ) -> Result<(), FakeError> {
         Ok(())
     }
@@ -1473,7 +1475,9 @@ fn oracle_rows(family: FamilyKey, tokens: &[u32]) -> Vec<Vec<f32>> {
         .unwrap();
     let state: Vec<HostTensor> = graph
         .state()
-        .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+        .map(|(input, _)| {
+            HostTensor::zeros_of(graph.aval(input).dtype, graph.aval(input).shape.clone())
+        })
         .collect();
     let slots = [
         (

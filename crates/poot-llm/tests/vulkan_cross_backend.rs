@@ -115,7 +115,7 @@ fn the_same_gpu_plans_the_same_attention_lanes_on_wgpu_and_raw_vulkan() {
     let wgpu_adapter = wgpu.identity().map(|identity| identity.adapter);
     if wgpu_adapter.as_deref() != Some(vulkan.context().device_name().as_str()) {
         eprintln!(
-            "SKIP: the two runtimes did not open one GPU (vulkan {:?}, wgpu {wgpu_adapter:?})",
+            "POOT-SKIP: the two runtimes did not open one GPU (vulkan {:?}, wgpu {wgpu_adapter:?})",
             vulkan.context().device_name()
         );
         return;

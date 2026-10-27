@@ -1,10 +1,10 @@
-# llama.cpp runner notes (research 2026-06-12, tag b9601)
+# llama.cpp runner notes (research 2026-06-12, pin bumped to v0.4.1 by POOT-1318)
 
 > Status: snapshot. Pins as of 2026-06; spot-checked 2026-09-19 against `benchmarks/docker/Dockerfile`
-> (llama.cpp b9601, vLLM 0.22.1, transformers 5.0.0, candle 0.10.2 match). The image is the source of truth and
+> (llama.cpp v0.4.1, vLLM 0.22.1, transformers 5.0.0, candle 0.10.2 match). The image is the source of truth and
 > is now Ubuntu 24.04 / CUDA 12.6.3, so CUDA 12.4 / Ubuntu 22.04 mentions below are stale.
 
-llama.cpp ships date-stamped rolling tags (`bNNNN`), not semver. Pin by tag: **`b9601`** (2026-06-11).
+llama.cpp moved from date-stamped `bNNNN` tags to semver releases (`v0.4.0`, 2026-09-04). Pin by tag: **`v0.4.1`** (2026-09-14), the first release with the `qwen4exp` architecture (PR #27742, in v0.4.0) and the GDN normalization fix (PR #28068, first in v0.4.1).
 
 ## Build needs the full CUDA toolkit (nvcc)
 
@@ -13,7 +13,7 @@ kernels with nvcc. So **build ON a `*-devel` pod** (e.g. `nvidia/cuda:12.4.1-dev
 runtime/base image. cmake 3.21+, GCC 12+, driver 525+.
 
 ```bash
-export LLAMACPP_TAG=b9601
+export LLAMACPP_TAG=v0.4.1
 git clone --depth 1 --branch "$LLAMACPP_TAG" https://github.com/ggml-org/llama.cpp.git && cd llama.cpp
 cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90"   # A100;A10/30xx;Ada/40xx;Hopper
@@ -46,7 +46,7 @@ Download a pre-quant GGUF (ggml-org / bartowski / unsloth) or convert:
 - Qwen2/2.5/3 (+MoE), Llama, Mistral: fully supported.
 - **gpt-oss: native MXFP4 GGUF** - load the published MXFP4 as the model's full-precision form (re-quantizing
   degrades the FFN). Native on Hopper/Blackwell; Ampere upcasts to bf16 at runtime. The best MoE baseline.
-- OLMoE: converts but less proven on b9601 - verify before relying; prefer gpt-oss as headline MoE.
+- OLMoE: converts but less proven on v0.4.1 - verify before relying; prefer gpt-oss as headline MoE.
 - SmolVLM: supported via `libmtmd` / `llama-mtmd-cli`, needs model GGUF **+ an mmproj-\*.gguf** (vision
   projector). `llama-mtmd-cli -hf ggml-org/SmolVLM-Instruct-GGUF -ngl 99 --image x.jpg -p "..."`.
   **llama-bench does NOT benchmark the vision path** - VLM timing is stderr-only via llama-mtmd-cli.

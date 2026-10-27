@@ -4,10 +4,10 @@
 //! and runs. Regression guard: an ordinary nested `if`, not branchless masking.
 
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 
 pub fn __poot_kernel_nested_sel(a: &[f32], sel: &[u32], out: &mut [f32]) {
-    let i = thread_index();
+    let i = thread_index_x();
     if i < out.len() {
         if sel[i] != 0 {
             out[i] = a[i] * 2.0;

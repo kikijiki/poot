@@ -298,17 +298,16 @@ fn device_witness_rejects_the_chain_above_the_exact_bound() {
 }
 
 /// Direct rows for the checks the production planner cannot reach with today's kernels: a body states
-/// something no generator or shipped template emits (a zero extent, a fragment with no declared subgroup,
-/// a workgroup that is not a whole number of subgroups, an LDS array of an
-/// unmeasurable type). They guard the day a generator or an imported asset does; the production-path rows
-/// are in `tests/generated_resources.rs`.
+/// something no generator or shipped template emits (a zero extent, a matrix fragment, a declared subgroup, a
+/// workgroup that is not a whole number of subgroups, an LDS array of an unmeasurable type). They guard the
+/// day a generator or an imported asset does; the production-path rows are in `tests/generated_resources.rs`.
 mod resources {
     use poot_kernel_ir::WorkgroupLocalDecl;
     use poot_kernel_ir::{
         BasicBlock, Body, Local, Statement, Terminator, Ty, WmmaDtype, WmmaShape,
     };
     use poot_kernelgen::{FragmentUse, KernelRequirements};
-    use poot_target::{DeviceCaps, Queried, SubgroupSupport};
+    use poot_target::{DeviceCaps, Queried, SubgroupSupport, TensorCoreSupport};
 
     use crate::device_validation::{ResourceRefusal, validate_kernel_resources};
 
@@ -429,5 +428,76 @@ mod resources {
                 max_size: 32,
             })
         );
+    }
+
+    /// A fragment kernel that declares its 32-lane subgroup is refused, with the matching typed reason, by a
+    /// device that reports no subgroups, does not expose them, has subgroups of another size, has no matrix
+    /// hardware, or has matrix hardware its API does not expose; `Unknown` is never read as "present". The
+    /// device that reports 32-lane subgroups and matrix hardware admits it. Mutation: in
+    /// `validate_kernel_resources`, answer `Ok` for `Queried::Unknown` subgroups; the "not exposed" row is
+    /// admitted and goes red.
+    #[test]
+    fn a_fragment_kernel_needs_the_subgroup_and_matrix_hardware_the_device_reports() {
+        let declared = KernelRequirements {
+            subgroup_lanes: Some(32),
+        };
+        let fragment = FragmentUse {
+            dtype: WmmaDtype::F16,
+            shape: WmmaShape::M16N16K16,
+        };
+        let kernel = body([32, 1, 1], vec![fragment_statement()]);
+        assert_eq!(
+            validate_kernel_resources(&kernel, declared, &caps()),
+            Ok(())
+        );
+        type Degrade = fn(&mut DeviceCaps);
+        let rows: [(&str, Degrade, ResourceRefusal); 5] = [
+            (
+                "no subgroup support",
+                |caps| caps.subgroup = Queried::Known(SubgroupSupport::Absent),
+                ResourceRefusal::SubgroupAbsent { lanes: 32 },
+            ),
+            (
+                "subgroup support not exposed",
+                |caps| caps.subgroup = Queried::Unknown,
+                ResourceRefusal::SubgroupUnknown { lanes: 32 },
+            ),
+            (
+                "64-lane subgroups only",
+                |caps| {
+                    caps.subgroup = Queried::Known(SubgroupSupport::Present {
+                        min_size: 64,
+                        max_size: 64,
+                    });
+                },
+                ResourceRefusal::SubgroupSize {
+                    lanes: 32,
+                    min_size: 64,
+                    max_size: 64,
+                },
+            ),
+            (
+                "no matrix hardware",
+                |caps| caps.tensor_core = TensorCoreSupport::None,
+                ResourceRefusal::FragmentUnsupported {
+                    fragment,
+                    tensor_core: TensorCoreSupport::None,
+                },
+            ),
+            (
+                "matrix hardware not exposed",
+                |caps| caps.tensor_core = TensorCoreSupport::UnknownNotExposedByApi,
+                ResourceRefusal::FragmentCapabilityUnknown { fragment },
+            ),
+        ];
+        for (what, degrade, expected) in rows {
+            let mut degraded = caps();
+            degrade(&mut degraded);
+            assert_eq!(
+                validate_kernel_resources(&kernel, declared, &degraded),
+                Err(expected),
+                "{what}"
+            );
+        }
     }
 }

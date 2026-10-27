@@ -42,6 +42,7 @@ pub(crate) fn op_label(op: &OpKind) -> &'static str {
         OpKind::DenseRowGather { .. } => "dense_row_gather",
         OpKind::ContractionEpilogue { .. } => "contraction_epilogue",
         OpKind::ArgTopK { .. } => "arg_top_k",
+        OpKind::ExpertGroup { .. } => "expert_group",
         OpKind::IndexedMatMul => "indexed_matmul",
         OpKind::DynamicUpdateSlice { .. } => "dynamic_update_slice",
         OpKind::Fused(_) => "fused",

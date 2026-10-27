@@ -539,7 +539,9 @@ pub fn check_matches_oracle(
         if state.is_empty() {
             state = g
                 .state()
-                .map(|(input, _)| HostTensor::zeros(g.aval(input).shape.clone()))
+                .map(|(input, _)| {
+                    HostTensor::zeros_of(g.aval(input).dtype, g.aval(input).shape.clone())
+                })
                 .collect();
         }
         let (want, next) = oracle(&g, &m.store, &m.map, &step.slots(), &state);
@@ -631,13 +633,18 @@ pub fn check_split_head(exec: &mut dyn Executor, target: Target) {
     // An F32 embedding: its hosted rows are an F32 slot, so no kernel computes in bf16 on the embed path.
     let m = qwen2(DIMS, Projections::Bf16, DType::F32);
     let steps = [Step::new(&[3, 1, 4], 0), Step::new(&[1], 3)];
-    let Target::Gpu { mut caps, .. } = target else {
+    let Target::Gpu { backend, mut caps } = target else {
         panic!("the split-head check legalizes against GPU limits; {target:?} has none");
     };
     caps.max_buffer_bytes = SPLIT_LIMIT;
     let split = |g: Graph| {
-        let g = poot_graph_plan::legalize(&g, &caps, &poot_graph_plan::CompileLimits::STANDARD)
-            .unwrap_or_else(|e| panic!("legalize under a {SPLIT_LIMIT}-byte limit: {e}"));
+        let g = poot_graph_plan::legalize(
+            &g,
+            backend,
+            &caps,
+            &poot_graph_plan::CompileLimits::STANDARD,
+        )
+        .unwrap_or_else(|e| panic!("legalize under a {SPLIT_LIMIT}-byte limit: {e}"));
         let head_chunks = g
             .consts()
             .iter()
@@ -745,7 +752,7 @@ pub fn check_tied_head(exec: &mut dyn Executor, target: Target, oracle: &MappedO
     let entry = exec.add_entry(exe, &program).unwrap();
     let mut state: Vec<HostTensor> = g
         .state()
-        .map(|(input, _)| HostTensor::zeros(g.aval(input).shape.clone()))
+        .map(|(input, _)| HostTensor::zeros_of(g.aval(input).dtype, g.aval(input).shape.clone()))
         .collect();
     for step in [Step::new(&[3], 0), Step::new(&[1], 1)] {
         let got = exec

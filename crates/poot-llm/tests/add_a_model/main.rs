@@ -160,7 +160,9 @@ fn oracle_step(
     if state.is_empty() {
         *state = graph
             .state()
-            .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+            .map(|(input, _)| {
+                HostTensor::zeros_of(graph.aval(input).dtype, graph.aval(input).shape.clone())
+            })
             .collect();
     }
     let slots = [
@@ -437,7 +439,7 @@ impl Device for FakeDevice {
     fn load_kernel(
         &mut self,
         _key: &str,
-        _kernel: poot_runtime_common::CompiledKernel,
+        _kernel: poot_codegen::CompiledKernel,
     ) -> Result<(), FakeError> {
         Ok(())
     }
@@ -581,6 +583,7 @@ impl Executor for Counting {
 fn driver_options(chunk: usize, max_trace_tokens: usize) -> DriverOptions {
     let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(CAPACITY),
@@ -874,7 +877,9 @@ fn oracle_paged_step(
     if state.is_empty() {
         *state = graph
             .state()
-            .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+            .map(|(input, _)| {
+                HostTensor::zeros_of(graph.aval(input).dtype, graph.aval(input).shape.clone())
+            })
             .collect();
     }
     let read: Vec<i32> = (0..rows)

@@ -6,6 +6,15 @@
 //! keyed by [`poot_graph_ir::SlotKey`] and replays the entry's recording (capture is the
 //! default, ADR-0102). No test-only accessor and no `test-hooks` feature: a test
 //! reads carried state through a production step output, never a `read_state` escape hatch.
+//!
+//! # Buffer binding contract
+//!
+//! Every buffer a [`Device`] binds to a kernel parameter starts at its allocation base, aligned to at
+//! least [`poot_codegen::BUFFER_PARAM_ALIGN`] (16) bytes: an arena slot shares a whole allocation from
+//! offset 0, and no dispatch binds an offset into a buffer. Generated kernels rely on it (a Gemv reads its
+//! activation in aligned 16-byte groups where the planner proved the group offsets, POOT-1405). A device
+//! refuses a binding that breaks it instead of launching: the PTX runtime's kernel-argument packing
+//! returns `PtxError::MisalignedBinding`.
 
 mod binder;
 mod coordinator;
@@ -21,9 +30,9 @@ pub use coordinator::{
     ScheduleError, SupportActual, SupportPlan,
 };
 pub use device::{
-    AieInvocation, Arg, Collectives, CopyKernel, CopyKernelSink, CopyMechanism, Device, DeviceTime,
-    Dispatch, DispatchDeviceTime, FlushPolicy, LaunchKind, MeasuredDeviceTime, NativeCounters,
-    SupportBound, VpuInvocation, WeightUpload, write_slice,
+    Arg, Collectives, CompiledRegion, CopyKernel, CopyKernelSink, CopyMechanism, Device,
+    DeviceTime, Dispatch, DispatchDeviceTime, FlushPolicy, LaunchKind, MeasuredDeviceTime,
+    NativeCounters, RegionLoadError, RegionLoader, SupportBound, WeightUpload, write_slice,
 };
 pub use engine::Engine;
 pub use error::{BindError, ChainError, DeviceError, DispatchError, ExecError, LoadError};
@@ -37,8 +46,8 @@ mod tests;
 
 use poot_graph_ir::{BoundaryId, ForwardSlotMap, SlotKey};
 use poot_graph_plan::{
-    multi_device::topology::DeviceId, staged::StageId, staged::StagedProgram, staged::SyncPoint,
-    staged::TargetSet,
+    CompileLimits, CompileOptions, multi_device::topology::DeviceId, staged::StageId,
+    staged::StagedProgram, staged::SyncPoint, staged::TargetSet,
 };
 use poot_quant::weights::WeightStore;
 use poot_weights::WeightMap;
@@ -452,6 +461,11 @@ pub trait Executor {
     /// cannot say, and for an executor over several devices, which has no single one.
     fn device_identity(&self) -> Option<DeviceIdentity> {
         None
+    }
+    /// The options a compile for this executor's device takes: `limits`, and for an NPU the lowering its device
+    /// owns ([`RegionLoader::lowering`]). The default is the options of a device with no region loader.
+    fn compile_options(&self, limits: CompileLimits) -> CompileOptions {
+        CompileOptions::new(limits)
     }
     /// A new executable over `store`, its consts bound by `weights`. Records both and uploads
     /// nothing: a weight's device lane is a per-program planning decision, so upload happens at

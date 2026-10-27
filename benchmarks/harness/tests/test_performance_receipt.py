@@ -222,9 +222,44 @@ class UncertaintyTests(unittest.TestCase):
         self.assertEqual(got["verdict"], pr.UNVERIFIED)
         self.assertIn("exceeds the tolerated uncertainty", got["note"])
 
-    def test_one_outlier_widens_the_band_instead_of_being_averaged_away(self):
+    def test_one_outlier_does_not_set_the_band(self):
+        # A single wild repeat is what the median and the interquartile range are built to ignore.
         got = self.verdict([100.0, 100.0, 100.0, 100.0, 300.0])
+        self.assertEqual(got["verdict"], pr.WITHIN_NOISE)
+
+    def test_identical_runs_on_both_sides_show_no_noise(self):
+        steady = [100.0] * 5
+        got = pr.metric_verdict(steady, steady, pr.POLICY, self.METRIC)
         self.assertEqual(got["verdict"], pr.UNVERIFIED)
+        self.assertIn("no noise was observed", got["note"])
+
+    def test_outliers_beside_identical_runs_size_no_band(self):
+        # The middle half is identical, so the robust spread is 0 while the range is not: no band to judge by.
+        outlier = [100.0, 100.0, 100.0, 100.0, 300.0]
+        got = pr.metric_verdict(outlier, list(outlier), pr.POLICY, self.METRIC)
+        self.assertEqual(got["verdict"], pr.UNVERIFIED)
+        self.assertIn("middle half", got["note"])
+
+    def test_a_stable_cell_that_five_repeats_cannot_verify_verifies_with_fifteen(self):
+        five = [96.0, 98.0, 100.0, 102.0, 104.0]
+        early = pr.metric_verdict(five, list(five), pr.POLICY, self.METRIC)
+        self.assertEqual(early["verdict"], pr.UNVERIFIED)
+        self.assertIn("band 13.82% exceeds the tolerated uncertainty 10.00%", early["note"])
+        self.assertIn("a stable cell narrows with repeats: about 10 per side would fit (have 5)", early["note"])
+        # The same per-run spread, measured three times as often: the band narrows by sqrt(5 / 15).
+        full = pr.metric_verdict(five * 3, five * 3, pr.POLICY, self.METRIC)
+        self.assertEqual(full["verdict"], pr.WITHIN_NOISE)
+        self.assertTrue(full["budget_exhausted"])
+
+    def test_a_bimodal_cell_is_unverified_at_the_full_budget(self):
+        # A slow mode holding a quarter or more of the repeats is not noise around one value; the MAD of an
+        # 8/7 split would be small, the interquartile range spans the gap.
+        for fast, slow in ((8, 7), (10, 5), (11, 4)):
+            with self.subTest(fast=fast, slow=slow):
+                bimodal = [100.0] * fast + [70.0] * slow
+                got = pr.metric_verdict(bimodal, list(bimodal), pr.POLICY, self.METRIC)
+                self.assertEqual(got["verdict"], pr.UNVERIFIED)
+                self.assertIn("exceeds the tolerated uncertainty", got["note"])
 
     def test_a_wide_band_that_still_clears_a_big_loss_is_a_regression(self):
         wide = [80.0, 90.0, 100.0, 110.0, 120.0]
@@ -235,11 +270,12 @@ class UncertaintyTests(unittest.TestCase):
         got = pr.metric_verdict(wide, list(wide), pr.POLICY, self.METRIC)
         self.assertEqual(got["verdict"], pr.UNVERIFIED)
         self.assertTrue(got["budget_exhausted"])
-        self.assertIn("budget is exhausted", got["note"])
+        self.assertIn("would not fit it", got["note"])
+        self.assertIn("a cell with two modes does not narrow", got["note"])
         # With budget left the same width asks for more repeats instead.
         early = pr.metric_verdict(wide[:5], wide[:5], pr.POLICY, self.METRIC)
         self.assertFalse(early["budget_exhausted"])
-        self.assertIn("more repeats may narrow it", early["note"])
+        self.assertIn("would not fit it", early["note"])
 
     def test_too_few_repeats_is_unverified(self):
         self.assertEqual(pr.metric_verdict(self.A[:4], self.A, pr.POLICY, self.METRIC)["verdict"], pr.UNVERIFIED)

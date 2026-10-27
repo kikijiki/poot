@@ -27,8 +27,8 @@ use poot_models::io::{
     RequestInput, StateSpec,
 };
 use poot_models::model::{
-    ConfigReason, FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, ShapeReason,
-    StepShape, StepSpec, TraceError,
+    ConfigReason, FamilyKey, KvDtype, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
+    ShapeReason, StepShape, StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
 use poot_quant::StoredBytes;
@@ -326,6 +326,17 @@ fn build_tiny(
         field: "granule",
         reason: ConfigReason::Zero,
     })?;
+    // The KV dtype the family prefers, when its config names one.
+    let kv_dtype = config
+        .get("kv_dtype")
+        .and_then(|v| v.as_str())
+        .map(str::parse::<KvDtype>)
+        .transpose()
+        .map_err(|_| ModelError::Config {
+            family: TINY,
+            field: "kv_dtype",
+            reason: ConfigReason::Unsupported,
+        })?;
     let variant =
         Variant::parse(config.get("state").and_then(|v| v.as_str())).ok_or(ModelError::Config {
             family: TINY,
@@ -388,6 +399,7 @@ fn build_tiny(
             bos: None,
             prompt_bos: None,
             prefill_granule: granule,
+            kv_dtype,
             chat: ChatFormat::ChatML,
             tool_codec: Some(Arc::new(HermesToolCodec)),
         },
@@ -650,7 +662,7 @@ impl Device for FakeDevice {
     fn load_kernel(
         &mut self,
         _key: &str,
-        _kernel: poot_runtime_common::CompiledKernel,
+        _kernel: poot_codegen::CompiledKernel,
     ) -> Result<(), FakeError> {
         Ok(())
     }
@@ -1018,6 +1030,10 @@ pub(super) struct RigOptions {
     max_positions: usize,
     /// Speculate with the rig's own model as the draft, `k` tokens a round.
     draft_model_k: Option<NonZeroUsize>,
+    /// The KV dtype the driver options name.
+    kv_dtype: Option<KvDtype>,
+    /// The KV dtype the family's config prefers.
+    model_kv: Option<KvDtype>,
 }
 
 impl Default for RigOptions {
@@ -1032,6 +1048,8 @@ impl Default for RigOptions {
             charge: crate::driver::program_retention,
             max_positions: 256,
             draft_model_k: None,
+            kv_dtype: None,
+            model_kv: None,
         }
     }
 }
@@ -1051,7 +1069,10 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
         },
     }])
     .unwrap();
-    let config = tiny_config(options.granule, options.max_positions, options.variant);
+    let mut config = tiny_config(options.granule, options.max_positions, options.variant);
+    if let Some(kv) = options.model_kv {
+        config["kv_dtype"] = serde_json::json!(kv.as_str());
+    }
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
@@ -1103,6 +1124,7 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
         handle,
         Box::new(executor),
         DriverOptions {
+            kv_dtype: options.kv_dtype,
             prefill: compile.clone(),
             decode: compile,
             capacity: nz(options.capacity),
@@ -1126,20 +1148,6 @@ thread_local! {
 
 fn rig_default(script: Script) -> Rig<Serving> {
     build_rig(RigOptions::default(), script).unwrap().serve()
-}
-
-/// The shapes of `generate`'s single contiguous row: every admitted prefill piece and decode at one
-/// heads.
-fn contiguous(heads: &[Head]) -> ServingShapes<'_> {
-    ServingShapes {
-        layout: Layout::Contiguous,
-        rows: &[NonZeroUsize::MIN],
-        heads,
-        warm: Warm::Admitted,
-        windows: &[],
-        adapters: &[],
-        chain: None,
-    }
 }
 
 fn request(prompt: &[u32], max_new: usize, sampler: Sampler) -> GenerateRequest {
@@ -1171,6 +1179,52 @@ fn step_shapes(rig: &Rig<Serving>) -> Vec<(StepKind, usize)> {
 // ---------------------------------------------------------------------------------------------
 // Rows.
 // ---------------------------------------------------------------------------------------------
+
+/// POOT-1395: every step a driver traces stores the KV dtype it resolved: the user's
+/// [`DriverOptions::kv_dtype`], else the model's preference ([`ModelConfig::kv_dtype`]), else f16. The
+/// shapes are the ones the model's `trace` received, prefill and decode alike. Mutation: resolve the model's
+/// preference before the user's (`model.or(user)` in `KvDtype::resolve`); the user-over-model case goes red.
+#[test]
+fn every_traced_step_stores_the_kv_dtype_the_driver_resolved() {
+    let cases = [
+        (None, None, KvDtype::F16),
+        (None, Some(KvDtype::Bf16), KvDtype::Bf16),
+        (Some(KvDtype::F32), Some(KvDtype::Bf16), KvDtype::F32),
+        (Some(KvDtype::Bf16), None, KvDtype::Bf16),
+    ];
+    for (user, model, want) in cases {
+        let options = RigOptions {
+            kv_dtype: user,
+            model_kv: model,
+            ..RigOptions::default()
+        };
+        let mut rig = build_rig(
+            options,
+            logits_script(vec![favoring(1), favoring(2), favoring(3)]),
+        )
+        .unwrap()
+        .serve();
+        run(&mut rig, request(&[5, 6], 3, Sampler::greedy())).unwrap();
+        assert_eq!(
+            rig.driver.kv_dtype(),
+            want,
+            "user {user:?}, model {model:?}"
+        );
+        let log = TRACE_LOG.with(|slot| slot.borrow().clone().expect("the rig set the log"));
+        let traced = log.lock().unwrap().clone();
+        let kinds: Vec<StepKind> = traced.iter().map(|&(kind, _)| kind).collect();
+        assert!(
+            kinds.contains(&StepKind::Prefill) && kinds.contains(&StepKind::Decode),
+            "a prefill and a decode step were traced: {kinds:?}"
+        );
+        for (kind, shape) in traced {
+            assert_eq!(
+                shape.kv_dtype, want,
+                "user {user:?}, model {model:?}: a traced {kind:?} step"
+            );
+        }
+    }
+}
 
 /// SC-002 (EOS): the model's end-of-sequence token ends the run and is not part of the output; no
 /// step runs after it. Mutation: treat EOS as an ordinary token (skip the `is_eos` break); the run
@@ -1514,7 +1568,9 @@ fn a_prepared_set_replays_without_compiling() {
         ..RigOptions::default()
     };
     let rig = build_rig(options, logits_script(vec![favoring(1), favoring(2)])).unwrap();
-    let mut rig = rig.prepare(&contiguous(&[Head::GREEDY])).unwrap();
+    let mut rig = rig
+        .prepare(&ServingShapes::turn(Layout::Contiguous, &[Head::GREEDY]))
+        .unwrap();
     let warmed = rig.driver.stats();
     let entries = rig.driver.prepared_entries();
     for (prompt, max_new) in [(vec![1u32; 4], 3usize), (vec![2; 7], 4), (vec![3; 11], 5)] {
@@ -1552,7 +1608,7 @@ fn the_entry_limit_refuses_the_third_and_keeps_the_first_two() {
     let rig = build_rig(options, logits_script(vec![favoring(1)])).unwrap();
     let refused = rig
         .driver
-        .prepare(&contiguous(&[Head::GREEDY]))
+        .prepare(&ServingShapes::turn(Layout::Contiguous, &[Head::GREEDY]))
         .unwrap_err();
     let err = refused.error;
     assert!(
@@ -1601,7 +1657,7 @@ fn the_byte_limit_refuses_the_second_without_moving_the_counters() {
     let rig = build_rig(options, logits_script(vec![favoring(1)])).unwrap();
     let refused = rig
         .driver
-        .prepare(&contiguous(&[Head::GREEDY]))
+        .prepare(&ServingShapes::turn(Layout::Contiguous, &[Head::GREEDY]))
         .unwrap_err();
     let (err, driver) = (refused.error, refused.driver);
     assert!(
@@ -2438,6 +2494,35 @@ fn phase_timing_is_reported_only_when_asked_for() {
     assert_eq!(timing.prefill.tokens, 3);
 }
 
+/// POOT-1347: the first turn of a driver prepared for `ServingShapes::turn` compiles no entry and retains no
+/// byte: what a device was fitted for is what the turn allocates. Mutation: make `ServingShapes::turn`
+/// ignore its heads (`heads: &[Head::Logits]`); the turn's extension compiles the logits head's entries and
+/// the compile count moves (3 to 6).
+#[test]
+fn a_driver_prepared_for_the_turn_shapes_adds_nothing_on_its_first_turn() {
+    let heads = [Head::GREEDY];
+    let mut rig = build_rig(RigOptions::default(), logits_script(vec![favoring(1)]))
+        .unwrap()
+        .prepare(&ServingShapes {
+            layout: Layout::Contiguous,
+            rows: &[NonZeroUsize::MIN],
+            heads: &heads,
+            warm: Warm::Admitted,
+            windows: &[],
+            adapters: &[],
+            chain: None,
+        })
+        .unwrap();
+    let (compiles, retained) = (rig.driver.compile_count(), rig.driver.retained_bytes());
+    let mut conversation = crate::driver::Conversation::default();
+    turn(&mut rig, &mut conversation, &[5, 6, 7], 3);
+    assert_eq!(
+        (rig.driver.compile_count(), rig.driver.retained_bytes()),
+        (compiles, retained),
+        "the turn extended the prepared set past what was prepared"
+    );
+}
+
 /// One turn of `conversation` over the whole `context`: the generation, and the positions each prefill
 /// and decode step of the turn fed (the steps the rig recorded since the turn began).
 fn turn(
@@ -2601,7 +2686,7 @@ pub(super) fn witness_recurrent_draft_model() -> DriverError {
         logits_script(vec![favoring(1)]),
     )
     .unwrap()
-    .prepare(&contiguous(&[Head::GREEDY]))
+    .prepare(&ServingShapes::turn(Layout::Contiguous, &[Head::GREEDY]))
     .map(|_| ())
     .expect_err("a draft model with recurrent state is refused")
 }

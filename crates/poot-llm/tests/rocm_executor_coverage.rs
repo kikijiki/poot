@@ -21,7 +21,7 @@ use poot_executor::{Device, Engine, Executor};
 use poot_executor_parity::Fixture;
 use poot_graph_ir::Storage;
 use poot_graph_plan::Target;
-use poot_kernel_ir::{Body, Statement};
+use poot_kernel_ir::Body;
 use poot_rocm_device::device::RocmDevice;
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
@@ -211,78 +211,17 @@ fn captured_replay_of_the_toy_graphs_equals_the_recording_step_on_rocm() {
 /// gfx1151 at the gemma4-MoE router shape `M = 32, K = 2816, N = 128`), and adds the same shape with a
 /// remainder tile on both output axes (`M = 33`, `N = 130`). Each matches the oracle at every step.
 ///
-/// Mutation: in `poot-kernelgen`'s `tiled_region` kernel, drop the last tile's remainder (the column
-/// tile count is `n / tile` in place of `n.div_ceil(tile)`), with a fresh `POOT_KERNEL_CACHE_DIR`; the
-/// remainder-tile row goes red and the exact router shape stays green.
+/// Mutation: in `poot-kernelgen`'s `tiled_body`, drop the last column tile (the column tile count is
+/// `out_per_block / edge_n` in place of the ceiling), with a fresh `POOT_KERNEL_CACHE_DIR`; the remainder-tile
+/// row goes red and the exact router shape stays green.
 #[test]
-fn tiled_region_with_a_remainder_tile_matches_the_oracle_on_rocm() {
+fn tiled_gemm_with_a_remainder_tile_matches_the_oracle_on_rocm() {
     let Some((mut exec, target)) = rocm() else {
         return;
     };
-    for fixture in &poot_executor_parity::launch::tiled_region_fixtures() {
+    for fixture in &poot_executor_parity::launch::tiled_gemm_fixtures() {
         assert_matches_oracle(exec.as_mut(), target, fixture);
     }
-}
-
-/// SC-008, WMMA half. Replaces the deleted WMMA bf16 `16x16x16` and `64x64x64` probes: a mixed-precision
-/// matmul (bf16 operands, f32 accumulate and result, the shape the planner runs on the RDNA3 tensor
-/// cores) at one tile and at a `4 x 4` grid of tiles with a four-step K loop. The operands are small
-/// integers, so the exact result is an integer and any wrong product, lost K step or unseeded
-/// accumulator moves an element by at least one, three orders of magnitude past the parity tolerance
-/// (the tensor cores' own accumulation is not IEEE-exact: the device lands within about `1e-6` of the
-/// integer, which is why the comparison is a tolerance and not a bit match).
-///
-/// Mutation: zero the accumulator fragment after each K step (a `WmmaZero` after the `WmmaMma` in
-/// `poot-kernelgen`'s `matmul_tensorcore`), with a fresh `POOT_KERNEL_CACHE_DIR`; the stored result is
-/// all zeros and both sizes go red.
-#[test]
-fn wmma_bf16_matmuls_match_the_oracle_on_rocm() {
-    let Some((mut exec, target)) = rocm() else {
-        return;
-    };
-    for fixture in &poot_executor_parity::launch::wmma_bf16_fixtures() {
-        assert!(
-            dispatched_bodies(fixture, target)
-                .iter()
-                .any(|(body, _)| body
-                    .blocks
-                    .iter()
-                    .flat_map(|block| &block.statements)
-                    .any(|statement| matches!(statement, Statement::WmmaMma { .. }))),
-            "{}: no dispatched kernel multiplies on the WMMA tensor cores",
-            fixture.name
-        );
-        assert_matches_oracle(exec.as_mut(), target, fixture);
-    }
-}
-
-/// Card 663 SC-001, ROCm. The batched, multi-block tensor-core matmul: `[2, 32, 48] x [2, 48, 32]` bf16 operands
-/// (`poot_executor_parity::launch::wmma_bf16_batched_fixture`), 2 x 2 x 2 output tiles each accumulating
-/// three 16-wide K blocks, every output element of both steps compared with the oracle. The fixture values give
-/// every K block a distinct nonzero contribution to every output (at least 16 per block), so a dropped, doubled
-/// or wrong-batch block moves all outputs far past the parity tolerance.
-///
-/// Mutation: drop the last K block in `poot-kernelgen`'s `tensor_core_tiles` (the loop bound `k0 < k` becomes
-/// `k0 + 16 < k`), with a fresh `POOT_KERNEL_CACHE_DIR`; every output is short by its last block's
-/// contribution and the row goes red.
-#[test]
-fn batched_multi_block_wmma_matmul_matches_the_oracle_on_rocm() {
-    let Some((mut exec, target)) = rocm() else {
-        return;
-    };
-    let fixture = poot_executor_parity::launch::wmma_bf16_batched_fixture();
-    assert!(
-        dispatched_bodies(&fixture, target)
-            .iter()
-            .any(|(body, _)| body
-                .blocks
-                .iter()
-                .flat_map(|block| &block.statements)
-                .any(|statement| matches!(statement, Statement::WmmaMma { .. }))),
-        "{}: no dispatched kernel multiplies on the WMMA tensor cores",
-        fixture.name
-    );
-    assert_matches_oracle(exec.as_mut(), target, &fixture);
 }
 
 /// SC-008, grid half. Replaces the deleted single-AQL 256-workgroup probe: one elementwise region over
@@ -346,6 +285,18 @@ fn packed_linears_and_the_indexed_expert_contraction_match_the_oracle_on_rocm() 
         );
         assert_matches_oracle(exec.as_mut(), target, &fixture);
     }
+}
+
+/// POOT-1337: the decode Gemv decodes the real Flash-Next blocks (Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XS, IQ3_XXS, IQ4_NL)
+/// to llama.cpp's gguf-py values bit for bit (`poot_executor_parity::reference_blocks`). The oracle rows above compare
+/// the device with poot's own CPU decode; this row's reference is independent of it.
+/// Mutation: swap two entries of the IQ2_XS grid in `poot_quant::grids`; the `reference_iq2_xs` rows go red.
+#[test]
+fn packed_decode_gemv_matches_llama_cpp_dequantisation_on_real_blocks_on_rocm() {
+    let Some((mut exec, target)) = rocm() else {
+        return;
+    };
+    poot_executor_parity::reference_blocks::assert_reference_blocks(exec.as_mut(), target);
 }
 
 /// Replaces `probe_gdn_prefill_chunked_rocm_test`. The chunked Gated-DeltaNet prefill (many small
@@ -618,4 +569,20 @@ fn selected_attention_reads_exactly_the_selected_blocks_on_rocm() {
             assert_matches_oracle(exec.as_mut(), target, &case.fixture);
         }
     }
+}
+
+/// Prefill MoE rows are sorted by expert before the indexed contraction (POOT-1336). The grouping equals a stable
+/// sort by expert and its inverse at every replayed step, on routings that break a naive grouping (every row on one
+/// expert, experts without rows, ties, ids outside the table sorted last, a partial last workgroup, more experts than
+/// rows); a contraction through it is bit-identical per row to the direct one; and an invalid id is a NaN row in
+/// both halves, never another expert's result.
+///
+/// Mutation: in `expert_group` count a bucket's start with `Le` instead of `Lt`; the order and its inverse differ
+/// from the stable sort on the first case.
+#[test]
+fn expert_grouping_is_the_stable_sort_and_changes_no_row_on_rocm() {
+    let Some((mut exec, target)) = rocm() else {
+        return;
+    };
+    poot_executor_parity::routing::assert_expert_grouping_on_device(exec.as_mut(), target);
 }

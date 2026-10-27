@@ -35,6 +35,38 @@ fn add_spirv_shape() {
     assert!(ir.contains("a0i32_12_0t"));
 }
 
+/// The exact-I32 body of one `op` step over leaves of `leaf_shapes` (each broadcast into `out_shape`), with
+/// the literal as its last operand when given.
+fn exact_i32_step(
+    name: &str,
+    op: poot_kernelgen::FusedScalarOp,
+    out_shape: &[usize],
+    leaf_shapes: &[&[usize]],
+    lit: Option<i32>,
+) -> poot_kernel_ir::Body {
+    let mut inputs: Vec<_> = (0..leaf_shapes.len())
+        .map(|leaf| poot_kernelgen::FusedInput::Leaf(poot_kernelgen::LeafId::new(leaf)))
+        .collect();
+    inputs.extend(lit.map(poot_kernelgen::FusedInput::LitI32));
+    let layouts: Vec<_> = leaf_shapes
+        .iter()
+        .map(|shape| poot_kernelgen::Layout::contiguous(shape))
+        .collect();
+    poot_kernelgen::fused_i32_views_grid(
+        name,
+        out_shape,
+        leaf_shapes,
+        &layouts,
+        &poot_kernelgen::FusedKernel {
+            leaf_tys: vec![poot_kernelgen::LeafTy::I32; leaf_shapes.len()],
+            steps: vec![poot_kernelgen::FusedStep { op, inputs }],
+            output: poot_kernelgen::FusedInput::Step(poot_kernelgen::StepId::new(0)),
+        },
+        None,
+    )
+    .expect("an exact-I32 step generates")
+}
+
 #[test]
 fn exact_i32_pointwise_emits_integer_arithmetic_and_unsigned_comparison() {
     let signed = [
@@ -44,30 +76,25 @@ fn exact_i32_pointwise_emits_integer_arithmetic_and_unsigned_comparison() {
         (poot_kernel_ir::BinOp::Max, "llvm.smax.i32"),
         (poot_kernel_ir::BinOp::Ge, "icmp sge i32"),
     ];
-    let geu = poot_kernelgen::binary_scalar_i32_geu_grid("exact_i32_geu", i32::MIN, None);
-    let a_shape = [2, 1];
-    let b_shape = [1, 3];
-    let out_shape = [2, 3];
-    let a_layout = poot_kernelgen::Layout::contiguous(&a_shape);
-    let b_layout = poot_kernelgen::Layout::contiguous(&b_shape);
-    let broadcast_add = poot_kernelgen::binary_broadcast_dt_views_grid(
+    let geu = exact_i32_step(
+        "exact_i32_geu",
+        poot_kernelgen::FusedScalarOp::GeU,
+        &[4],
+        &[&[4]],
+        Some(i32::MIN),
+    );
+    let broadcast_add = exact_i32_step(
         "exact_i32_broadcast_add",
-        poot_kernel_ir::BinOp::Add,
-        poot_kernel_ir::Ty::I32,
-        &out_shape,
-        &a_shape,
-        &a_layout,
-        &b_shape,
-        &b_layout,
+        poot_kernelgen::FusedScalarOp::Binary(poot_kernel_ir::BinOp::Add),
+        &[2, 3],
+        &[&[2, 1], &[1, 3]],
         None,
     );
-    let broadcast_geu = poot_kernelgen::binary_broadcast_i32_geu_views_grid(
+    let broadcast_geu = exact_i32_step(
         "exact_i32_broadcast_geu",
-        &out_shape,
-        &a_shape,
-        &a_layout,
-        &b_shape,
-        &b_layout,
+        poot_kernelgen::FusedScalarOp::GeU,
+        &[2, 3],
+        &[&[2, 1], &[1, 3]],
         None,
     );
     for target in [
@@ -76,8 +103,13 @@ fn exact_i32_pointwise_emits_integer_arithmetic_and_unsigned_comparison() {
         Target::AmdGcn(AmdArch::gfx1151()),
     ] {
         for (op, opcode) in signed {
-            let body =
-                poot_kernelgen::binary_scalar_i32_grid("exact_i32_signed", op, i32::MIN, None);
+            let body = exact_i32_step(
+                "exact_i32_signed",
+                poot_kernelgen::FusedScalarOp::Binary(op),
+                &[4],
+                &[&[4]],
+                Some(i32::MIN),
+            );
             let ir = emit_llvm_ir(&body, target).unwrap();
             assert!(ir.contains(opcode), "{op:?} {target:?}: {ir}");
             assert!(!ir.contains(" float"), "{op:?} {target:?}: {ir}");
@@ -486,8 +518,7 @@ fn exp_aie_emits_software_exp() {
 /// lowers on every implemented target - AMDGCN WMMA, NVPTX `mma.sync`/`wmma`, and SPIR-V cooperative
 /// matrix - with no per-target `Body` variant. Real device evidence (not just this compile-time check)
 /// is `poot-kernelgen`'s `coopmat_dispatch_probe` (RADV coopmat) and `poot-rocm-device`'s
-/// `tests::resident::probe_*_wmma_rocm` (AMDGCN WMMA), both of which dispatch this same generator (or
-/// its production `matmul_tensorcore` sibling) on real hardware and compare against the CPU oracle.
+/// `tests::resident::probe_*_wmma_rocm` (AMDGCN WMMA), both of which dispatch this same generator on real hardware and compare against the CPU oracle.
 #[test]
 fn wmma_tile_is_one_body_lowered_on_every_target() {
     let body = wmma_tile("wmma_tile_neutral");
@@ -573,9 +604,8 @@ fn wmma_tile_is_one_body_lowered_on_every_target() {
 #[test]
 fn wmma_amdgcn_emits_wmma_intrinsic() {
     // `wmma_tile` is card 530's target-neutral F16 fragment body; on AMDGCN it must emit the F16 WMMA
-    // intrinsic (gfx1151 wave32: v16f16 A/B, v8f32 C). The Bf16 production shape (v16i16 A/B, the same
-    // register packing, different element bits) is `matmul_tensorcore`'s coverage in `tests/llc.rs`'s
-    // `amd_wmma_matmul_lowers_to_wmma_intrinsic`.
+    // intrinsic (gfx1151 wave32: v16f16 A/B, v8f32 C). The Bf16 shape (v16i16 A/B, the same register
+    // packing, different element bits) is `tests/llc.rs`'s `amd_wmma_bf16_tile_lowers_to_the_bf16_intrinsic`.
     let body = wmma_tile("wmma_amdgcn_test");
     let ir = emit_llvm_ir(&body, Target::AmdGcn(AmdArch::gfx1151())).unwrap();
     // Must emit the typed AMDGPU WMMA MMA intrinsic (gfx1151 wave32: v16f16 A/B, v8f32 C).
@@ -672,19 +702,14 @@ fn coopmat_tile_emits_real_builtin_calls() {
 /// `VK_KHR_shader_bfloat16`) - a typed error, not silently-wrong codegen.
 #[test]
 fn wmma_dtype_target_mismatch_is_typed_error() {
-    // `matmul_tensorcore` (Bf16 fragments, the NVPTX/AMDGCN production convention) declares BF16-typed
-    // slice params, which an earlier check already rejects on SpirvVulkan (bf16 buffers are NVPTX-only;
-    // SPIR-V needs SPV_KHR_bfloat16). `wmma_check_target`'s (SpirvVulkan, Bf16) arm is therefore
-    // unreachable via this route; assert the mismatch is rejected (by whichever check fires first)
-    // rather than pin the message.
-    let bf16_body = poot_kernelgen::matmul_tensorcore(
+    // The Bf16 tile declares BF16-typed slice params, which an earlier check already rejects on SpirvVulkan
+    // (SPIR-V needs SPV_KHR_bfloat16). `wmma_check_target`'s (SpirvVulkan, Bf16) arm is therefore unreachable
+    // via this route; assert the mismatch is rejected (by whichever check fires first) rather than pin the
+    // message.
+    let bf16_body = poot_kernel_ir::test_support::wmma_tile_of(
         "wmma_bf16_wrong_target",
-        poot_kernel_ir::Ty::F32,
-        &[16, 16],
-        &[16, 16],
-        &[16, 16],
-    )
-    .expect("matmul_tensorcore precondition");
+        poot_kernel_ir::WmmaDtype::Bf16,
+    );
     let err = emit_llvm_ir(&bf16_body, Target::SpirvVulkan)
         .expect_err("Bf16 fragments on SpirvVulkan must be a typed error");
     let EmitError::Unsupported(msg) = err else {

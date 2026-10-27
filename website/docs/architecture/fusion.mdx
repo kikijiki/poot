@@ -8,183 +8,176 @@ import FusionDiagram from "@site/src/components/architecture/FusionDiagram";
 
 # Fusion and Planning
 
-Fusion takes the primitive graph and groups its eqns into a smaller set of kernel
-dispatches. Planning assigns each group a concrete kernel specialization, either an
-**imported kernel** (a `#[kernel]` Rust function) or a **synthesized kernel** (generated
-on the fly from the op pattern). Together they reduce a decode step from one dispatch per
-primitive eqn to a few dozen fused dispatches per token.
+Fusion groups the primitive graph's eqns into a smaller set of kernel dispatches. Planning then assigns each group a concrete
+kernel: an **imported kernel** (a `#[kernel]` Rust function) or a **synthesized kernel** (generated from the op pattern).
+Together they reduce a decode step from one dispatch per primitive eqn to a few dozen fused dispatches per token.
 
 ## Why this matters
 
-Every dispatch costs host time, and every intermediate written to DRAM costs bandwidth. Fusion, a
-standard ML-compiler technique [^xla] [^tvm] [^halide], removes both by keeping intermediates in
-registers or shared memory. `poot_graph_ir::analysis::dispatch_count` gives a graph's static dispatch count:
+Every dispatch costs host time, and every intermediate written to DRAM costs bandwidth. Fusion [^xla] [^tvm] [^halide] removes
+both by keeping intermediates in registers or shared memory. `poot_graph_ir::analysis::dispatch_count` gives a graph's static
+dispatch count.
 
-| Stage                        | Effect on dispatches per token                                  |
-| ---------------------------- | --------------------------------------------------------------- |
-| Unfused primitives           | One per equation                                                |
-| RoPE fusion                  | The rotate-half chain (about 6-8 dispatches) becomes one `Rope` |
-| Pointwise + reduction fusion | Each fusable region becomes one dispatch                        |
-| Contraction epilogue         | A bias, activation or residual add rides in its contraction     |
-| Widening-cast folding        | A norm scale or bias stored in bf16 is widened inside the fused region that reads it, so its cast is not a dispatch |
-| Computed-constant CSE        | Tables built from one recipe, such as the RoPE tables every layer asks for, exist once and are gathered once per step |
-| Flash attention rewrite      | Each attention layer's chain becomes one dispatch               |
-| Capture and replay           | Native replay (CUDA graphs, HSA packets, Vulkan command buffers) or cached wgpu dispatches reduce host work |
+| Stage | Effect on dispatches per token |
+| --- | --- |
+| Unfused primitives | One per equation. |
+| RoPE fusion | The rotate-half chain (about 6-8 dispatches) becomes one `Rope`. |
+| Pointwise + reduction fusion | Each fusable region becomes one dispatch. |
+| Contraction epilogue | A bias, activation or residual add rides in its contraction. |
+| Widening-cast folding | A bf16 norm scale or bias is widened inside the fused region that reads it; its cast is not a dispatch. |
+| Computed-constant CSE | Tables built from one recipe (such as the RoPE tables every layer asks for) exist once and are gathered once per step. |
+| Flash attention rewrite | Each attention layer's chain becomes one dispatch. |
+| Capture and replay | Native replay (CUDA graphs, HSA packets, Vulkan command buffers) or cached wgpu dispatches reduce host work. |
 
 ## Imported vs synthesized kernels
 
-**Imported kernels** are `#[kernel]` Rust functions compiled via pootc from source
-(sources under `crates/pootc/kernels/<family>/`, with committed `.kir.json` assets under each consuming
-crate's `assets/`). The plan carries the imported body and the executor dispatches its precompiled
-SPIR-V/PTX/AMDGPU artifact. Imported kernels cover the shapes the synthesizer does not:
+**Imported kernels** are `#[kernel]` Rust functions compiled by pootc (sources in `crates/pootc/kernels/<family>/`, committed
+`.kir.json` assets under each consuming crate's `assets/`). The executor dispatches their precompiled SPIR-V/PTX/AMDGPU
+artifact. They cover only what the synthesizer does not:
 
-- Decode `MatMul` (M=1) over an f32 `[K, N]` weight, and its batched variant (`gemv_coalesced*.rs`), and the
-  tiled GEMMs (`tiled_gemm*.rs`)
-- Greedy argmax as two stages, the uniform generator and the batched samplers (`argmax_chunk.rs`,
-  `argmax_combine.rs`, `random_uniform.rs`, `sample_*_gumbel_argmax_batched.rs`)
-- Packed row gathers and the packed bf16 to f32 conversion (`packed_*.rs`)
+- Greedy argmax in two stages, the uniform generator and the batched samplers.
+- Packed row gathers and the packed bf16 to f32 conversion.
+- The state-copy kernel for a device without a native buffer copy.
 
-Data movement (`Gather`, `Slice`, `Concat`, `Transpose`, `Broadcast`, `DynamicUpdateSlice`) is
-not imported: one generated movement kernel covers every op and every storage, including packed byte
-rows, copying bits without decoding them.
-
-**Synthesized kernels** are generated by the fusion pass's codegen from the subgraph's
-op pattern. A pointwise chain (`Mul -> Exp -> Add -> ...`) or a reduction-rooted region
-(`Reduce(Max) -> Sub -> Exp -> Reduce(Sum) -> Div`) produces unique kernel IR on the fly.
-The synthesizer writes the kernel IR; poot-codegen lowers it to LLVM IR and then to
-SPIR-V/PTX/AMDGPU. Synthesized kernels handle the structural glue, normalization epilogues,
-and elementwise chains. In the default pipeline they also cover prefill GEMMs (the tiled
-GEMM), packed contractions, and attention (one generator for decode and prefill), all
-generated from the op's shape rather than selected from a menu. These are kernel choices the
-planner records for an ordinary `MatMul` or `Attention` eqn, not separate ops.
+**Synthesized kernels** are generated from the subgraph's op pattern: the synthesizer writes kernel IR, and `poot-codegen`
+lowers it to LLVM IR and then SPIR-V/PTX/AMDGPU. They cover every contraction (decode GEMV, tiled GEMMs, packed contractions),
+every unary, binary and scalar-literal op, attention (one generator for decode and prefill), normalization epilogues and
+elementwise chains. Data movement (`Gather`, `Slice`, `Concat`, `Transpose`, `Broadcast`, `DynamicUpdateSlice`) is one
+generated kernel for every op and storage, copying bits without decoding. These are choices the planner records for ordinary
+`MatMul` or `Attention` eqns, not separate ops.
 
 ## The fusion diagram
 
-The diagram below shows an attention subgraph (score matmul, scale, mask, softmax, output
-matmul): 9 primitive eqns. Toggle between unfused (9 dispatches) and fused (1 dispatch: the
-flash attention rewrite replaces the whole chain, both matmuls included).
+The diagram shows an attention subgraph (score matmul, scale, mask, softmax, output matmul): 9 primitive eqns. Toggle between
+unfused (9 dispatches) and fused (1 dispatch: the flash attention rewrite replaces the whole chain, both matmuls included).
 
 <FusionDiagram />
 
 ## Fusable region shapes
 
-**Pointwise chains.** `Binary` ops and the unaries `Neg`, `Exp`, `Log`, `Sqrt`, `Recip`, `Tanh`,
-and `Erf` (plus the I32 bit ops and `Select`, whose I32 condition is a region input) with compatible
-iteration spaces fuse into one synthesized elementwise kernel. A float `Select` is a bit-moving select
-inside the kernel (a hardware select, never arithmetic), so a NaN or Inf in the branch it does not pick never reaches
-the result; it joins pointwise regions, not row (reduction-rooted) ones, because a row kernel reads float lanes only.
-Over BF16 or F16 branches the select moves the two-byte elements as stored, so it plans as its own kernel on ROCm
-and PTX; a SPIR-V target has no native two-byte lane and refuses it with a typed `DtypeLowering`. The
-activations are compositions over these, so SwiGLU and GeGLU fuse as plain `Exp`/`Div`/`Mul` chains, and a value read more than once (the activation's input)
-fuses as long as every read is inside the same region. `MatMul`, `Gather`, `Concat`,
-`Reduce` and the movement ops (`Reshape`, `Slice`, `Broadcast`, `Transpose`)
-are boundaries of a pointwise region; a contraction instead absorbs the chain after it (below).
+### Pointwise chains
 
-**Contraction epilogues.** A dense contraction (a `MatMul`, the contraction over a weight kept in
-checkpoint `[N, K]` order, or the routed expert matmul `IndexedMatMul`) whose result is read only by a
-chain of pointwise steps becomes one `ContractionEpilogue`: the bias, activation or residual add runs in
-registers before the kernel's one store. Every other value the chain reads (a bias `[N]`, a residual
-`[M, N]`) is read at its broadcast position. The head's result keeps the dtype the head declares: a BF16
-or F16 head rounds to that dtype before the first step reads it, and each step rounds through it, so the
-fused kernel computes what the unfused kernels would have stored. A dense head fuses at every row count:
-the decode Gemv at one row, the generated tiled GEMM above it. A `MatMul` head fuses where its generated
-tiled GEMM (an f32 `[K, N]` weight above one row) or its one-thread-per-output body is the plan; a
-`MatMul` head that takes a decode GEMV, an imported tiled or a tensor-core schedule keeps its chain as
-separate dispatches. The routed expert matmul is the exception: its gate weighting fuses as an epilogue
-with an indexed head on both its decode Gemv and its segmented tiled schedule, where each row reads its
-own expert's weights and the gate is read at that row.
+`Binary` ops, the unaries `Neg`, `Exp`, `Log`, `Sqrt`, `Recip`, `Tanh`, `Erf`, the I32 bit ops and `Select` fuse into one
+synthesized elementwise kernel when their iteration spaces are compatible.
 
-**Reduction-rooted regions.** A `Reduce` op followed by pointwise ops on the reduction
-output fuses into one synthesized reduction kernel. The reduction kernel computes the
-reduced value in shared memory, then the pointwise epilogue runs inside the same kernel.
-Regions are last-axis, keepdim reductions. This is the shape of RMSNorm (sum-of-squares -> sqrt -> div) and softmax.
+- SwiGLU and GeGLU fuse as plain `Exp`/`Div`/`Mul` chains; a value read more than once fuses if every read is in the region.
+- `MatMul`, `Gather`, `Concat`, `Reduce` and the movement ops (`Reshape`, `Slice`, `Broadcast`, `Transpose`) end a pointwise
+  region. A contraction absorbs the chain after it instead.
+- A float `Select` is a hardware bit select, so a NaN or Inf in the unpicked branch never reaches the result. It joins
+  pointwise regions only, not row regions.
+- Over BF16 or F16 it plans as its own kernel on ROCm and PTX; SPIR-V refuses it with a typed `DtypeLowering`.
 
-**Flash attention rewrite.** A separate rewrite inside `compile` pattern-matches
-the exact chain the attention tracer emits. `matmul(q, k^T) -> scale -> mask -> reduce-max
--> sub -> exp -> reduce-sum -> div -> matmul(scores, v)`, and replaces it with a single
-`Attention` eqn, for decode and prefill alike. The planner then generates its kernel: one
-online-softmax generator for every head width, with the lane count read from the device's workgroup
-memory. The default pipeline skips the prefill rewrite when
-`Hq * L` exceeds the target's x-grid limit (65535 workgroups on wgpu). This rewrite fires once per attention layer [^flash1] [^flash2].
+### Contraction epilogues
 
-Canonicalization and matcher legality checks cover equivalent spellings and reject unsupported shapes.
-The matchers recognize bounded patterns.
+A dense contraction (a `MatMul`, a weight kept in checkpoint `[N, K]` order, or the routed `IndexedMatMul`) whose result feeds
+only pointwise steps becomes one `ContractionEpilogue`: bias, activation or residual add run in registers before the single
+store. Other values the chain reads are read at their broadcast position. A BF16 or F16 head rounds to its dtype before each
+step, so the fused kernel computes what the unfused kernels would have stored.
+
+| Head | Fuses | Stays separate |
+| --- | --- | --- |
+| Dense contraction | At every row count (decode Gemv at one row, tiled GEMM above) | |
+| `MatMul` | Generated tiled GEMM (f32 `[K, N]` weight above one row) or one-thread-per-output body | Decode GEMV, batched-weight tiled schedules |
+| Routed expert matmul | Gate weighting, on both decode Gemv and register-tiled schedules | |
+
+### Reduction-rooted regions
+
+A last-axis, keepdim `Reduce` followed by pointwise ops on its output becomes one kernel: the reduction runs in shared memory,
+then the epilogue. This is the shape of RMSNorm and softmax.
+
+### Flash attention rewrite
+
+A rewrite in `compile` matches the chain the attention tracer emits and replaces it with one `Attention` eqn for decode and
+prefill, once per layer [^flash1] [^flash2]:
+
+1. `matmul(q, k^T)`, scale, mask.
+2. Softmax: reduce-max, sub, exp, reduce-sum, div.
+3. `matmul(scores, v)`.
+
+The planner generates one online-softmax kernel for every head width. A launch the target cannot make even on a 2-D grid is
+refused and the decomposition stays. Matchers recognize bounded patterns and reject unsupported shapes.
 
 ## Kernel specialization (planning)
 
-`plan_eqn` (in `poot-graph-plan`) assigns each eqn of the optimized graph a `Plan`: a compute
-body, a compute body plus a `u32` metadata buffer, chunked dispatches, a
-buffer alias or strided view, or a cross-rank collective. `compile` runs this planning as its last
-step. The same `OpKind` can map to different bodies depending on shape and dtype. Kernel choice
-is a plan property: the planner records, beside each plan, whether the body was generated from a
-request, imported from a shipped kernel, or needs no dispatch at all.
+`plan_eqn` (in `poot-graph-plan`) assigns each eqn of the optimized graph a `Plan`. It is one of:
 
-| Specialization        | When                                             | Implementation                                                                                                            |
-| --------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
-| **Elementwise**       | `Fused` pointwise region                         | Synthesized: one thread per element                                                                                       |
-| **Reduction**         | `FusedRow` region                                | Synthesized: block reduce + epilogue in shared memory                                                                     |
-| **GEMV**              | `MatMul` with M=1 (decode)                       | Imported or `kernelgen::gemv_lds`: one workgroup per output row                                                           |
-| **Tiled GEMM**        | `MatMul` with f32 operands, M>1 and a 2-D weight | Synthesized by `kg::tiled_region`: 2-D tile with LDS staging                                                                |
-| **Tensor-core GEMM**  | bf16 operands (f16 on a Vulkan device)           | WMMA bodies on PTX and ROCm; a cooperative-matrix body on a Vulkan device whose caps report the 16x16x16 f16-in f32-out configuration, with 16-aligned M, N and K |
-| **Attention**         | `Attention`                                      | Generated from `KernelRequest::Attention` (`AttentionSpec`): one workgroup per (batch row, Q head, query row), lanes striding the keys, softcap optional |
-| **Dequant GEMV/GEMM** | `PackedContraction`                              | Generated decode from the format descriptor, then contraction                                                             |
+- a compute body;
+- a compute body plus a `u32` metadata buffer;
+- chunked dispatches;
+- a buffer alias or strided view;
+- a cross-rank collective.
+
+`compile` runs this planning as its last step. The same `OpKind` can map to different bodies depending on shape and dtype.
+Kernel choice is a plan property: beside each plan, the planner records whether the body was generated from a request, imported
+from a shipped kernel, or needs no dispatch at all.
+
+| Specialization | When | Implementation |
+| --- | --- | --- |
+| **Elementwise** | `Fused` pointwise region | Synthesized: one thread per element. |
+| **Reduction** | `FusedRow` region | Synthesized: block reduce + epilogue in shared memory. |
+| **GEMV** | `MatMul` with M=1 (decode) | Synthesized: `kernelgen::gemv_lds`, one workgroup per output row. |
+| **Tiled GEMM** | A dense contraction with M>1: a `MatMul` with f32 operands and a shared or per-batch weight, or a weight in checkpoint `[N, K]` order | Synthesized register-tiled GEMM: LDS-staged tiles, a register tile per lane, the tile sized from the shape and the device. |
+| **Attention** | `Attention` | Generated from `KernelRequest::Attention` (`AttentionSpec`): one workgroup per (batch row, Q head, query row), lanes striding the keys, softcap optional. A block-selected prefill serves the `n_rep` heads of a key/value head in one workgroup. |
+| **Dequant GEMV/GEMM** | `PackedContraction` | Generated decode from the format descriptor, then contraction. |
 
 ## Launch metadata
 
-An imported, shape-generic kernel reads its dimensions from a small read-only `u32` buffer
-instead of baked-in constants. A dispatch's `launch.meta` carries that buffer,
-bound between the eqn's data inputs and its output. This lets one compiled binary serve
-multiple configurations. For the imported tiled GEMM the buffer is `[M, K, N, offset]`.
+An imported, shape-generic kernel reads its dimensions from a small read-only `u32` buffer instead of baked-in constants. A
+dispatch's `launch.meta` carries that buffer, bound between the eqn's data inputs and its output. One compiled binary then
+serves multiple configurations. The sampling kernels read their vocabulary and chunk sizes from it.
 
 ## The compile pipeline
 
-`poot_graph_plan::compile(graph, target, options)` runs the graph passes and planning together and
-returns a `Program`. A GPU `Target` pairs a backend with runtime-measured `DeviceCaps`; an AIE `Target` carries its own `AieCaps`.
+`poot_graph_plan::compile(graph, target, options)` runs the passes and planning and returns a `Program`. A GPU `Target` pairs a
+backend with measured `DeviceCaps`; an AIE `Target` carries `AieCaps`. Every target runs every pass on every graph (no
+per-graph skip), and callers choose typed options, not pass sequences. The order:
 
-The current order is canonicalization, CSE, iota folding, RoPE and attention recognition, DCE, packed
-contraction/row-gather recognition and the packed escape check, legalization, dense BF16 recognition,
-reduction/dtype preparation, then fusion, tiling and flash-region synthesis. Planning then runs over
-the optimized graph to produce the equation plans, storage decisions and slot schema. `Program::passes()`
-lists transformations that changed the graph.
+1. Canonicalization, CSE, iota folding.
+2. RoPE and attention recognition, DCE.
+3. Packed contraction and row-gather recognition, packed escape check.
+4. Legalization, dense BF16 recognition, reduction and dtype preparation.
+5. Fusion, tiling and flash-region synthesis.
 
-Canonicalization preserves the primitive computation's rounding and arithmetic order. General scalar
-factoring across a contraction and replacing reciprocal multiplication with division are declined
-without an exact proof. `Program::numerical_declines()` reports the original candidate value and a
-typed reason; the graph remains compilable through its original operations. `Program::declines()` reports
-the attention and RoPE chains the fusion matchers left alone: for a chain that nearly matched, it names the
-value and the first check that failed, and the graph keeps its original operations. F32 multiplication by
-one on a contraction operand is a proved identity that canonicalization can remove.
+Planning then produces equation plans, storage decisions and the slot schema. `Program::passes()` lists the passes that changed
+the graph.
 
-Attention with an already-scaled query can still select a flash region: the scaled query remains a
-region input, and the region's post-contraction scale is one. Reciprocal softmax keeps its original
-operations because the current flash representation uses division. Explicit F16/BF16 casts remain
-fusion boundaries. A narrow contraction result rounds before a following F32 epilogue, even when
-that epilogue is fused. The numerical comparison class describes device scheduling; it does not
-prove a semantic graph rewrite legal.
+### Numerics and declines
 
-Every target runs every pass on every graph, a routed-expert prefill included: `compile` has no per-graph
-skip. Packed recognition and legalization run in the same fixed order. Callers select typed options, not
-their own pass sequence.
+Canonicalization preserves rounding and arithmetic order. Scalar factoring across a contraction and replacing reciprocal
+multiplication with division are declined without an exact proof; F32 multiplication by one is a proved identity it may remove.
 
-Planner refusals are typed and name the equation and missing capability. The executor contract
-consumes the complete `Program`: `compile_staged` stages it for one device and `Executor::add_entry`
-loads it, so no caller re-plans the graph.
+- `Program::numerical_declines()` gives the candidate value and a typed reason.
+- `Program::declines()` lists attention and RoPE chains the matchers left alone, naming the first failed check.
+- An already-scaled query can still fuse (the region's scale is one). Reciprocal softmax does not, since flash uses division.
+- F16/BF16 casts stay fusion boundaries, and a narrow contraction result rounds before a following F32 epilogue.
+
+### Packed expert legalization
+
+A packed expert stack splits into expert ranges when a source passes the single-buffer limit or a bit offset passes the index
+width:
+
+| Backend | Index width | Splits |
+| --- | --- | --- |
+| PTX, ROCm | 64 bits | Only at the buffer limit |
+| Raw Vulkan, wgpu | 32 bits | Where a source passes 2^32 bits (512 MiB) |
+
+An expert whose slab alone passes the bound is refused as a dispatch size overflow, never wrapped. Planner refusals are typed
+and name the equation and capability. `compile_staged` stages the `Program` for one device and `Executor::add_entry` loads it.
 
 ## What fusion reports
 
-`poot_graph_ir::analysis::dispatch_count` and `poot_graph_ir::analysis::peak_transient_bytes` (peak live
-activation bytes) are computed from the graph. `poot-serve` reports the driver's compile count and device bytes on `/metrics`.
+`poot_graph_ir::analysis::dispatch_count` and `poot_graph_ir::analysis::peak_transient_bytes` (peak live activation bytes) are
+computed from the graph. `poot-serve` reports the driver's compile count and device bytes on `/metrics`.
 
 ## Implementation details
 
-- **Flash is a structural rewrite.** Pointwise/reduction fusion synthesizes
-  kernels; flash attention is a separate matcher that replaces a recognized attention subgraph with
-  one `Attention` eqn. Gates that refuse the rewrite (a live length no
-  validation bounds, a key or value the op's typing rule cannot type such as a single key head the
-  matmul merely broadcasts) keep the safe primitive graph, see [Attention](./attention#implementation-details).
-- **Specialization vs source.** A `Plan` body is either an imported `#[kernel]` (loaded from the
-  committed `pootc` assets) or a synthesized body from `poot-kernelgen`. Both lower through
-  `poot-codegen`; the planner decides which path, not the model tracer.
+- **Flash is a structural rewrite.** Pointwise and reduction fusion synthesize kernels. Flash attention is a separate matcher
+  that replaces a recognized attention subgraph with one `Attention` eqn. Gates that refuse the rewrite keep the safe primitive
+  graph (a live length no validation bounds; a key or value the op's typing rule cannot type, such as a single key head the
+  matmul merely broadcasts). See [Attention](./attention#implementation-details).
+- **Specialization vs source.** A `Plan` body is either an imported `#[kernel]` (loaded from the committed `pootc` assets) or
+  a synthesized body from `poot-kernelgen`. Both lower through `poot-codegen`. The planner decides which path, not the model
+  tracer.
 
 ---
 

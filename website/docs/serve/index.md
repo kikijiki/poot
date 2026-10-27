@@ -6,14 +6,15 @@ sidebar_position: 1
 
 # Serving
 
-`poot-serve` is the OpenAI-compatible HTTP server. It loads a registered model, fits it to the device and serves
-`/v1/completions` and `/v1/chat/completions` from one scheduling loop over the driver. An embedding or reranking
-checkpoint serves `/v1/embeddings` and `/v1/rerank`, which a decoder's embedding pass also serves. LoRA
-administration runs on the same engine thread between steps. For embedding poot as a library, see
-[Develop](../develop/index.md); the design behind these pages is under
-[Serving design](../architecture/serving-design.mdx). Which families, quantizations and backends are served is
-listed per row in the [feature matrix](../reference/feature-matrix.md), and measured speed on the
-[performance](../reference/performance.md) page.
+`poot-serve` is the OpenAI-compatible HTTP server. It loads a registered model, fits it to the device and serves `/v1/completions` and `/v1/chat/completions` from one scheduling loop. Embedding and reranking checkpoints serve `/v1/embeddings` and `/v1/rerank`, and so can a decoder. LoRA administration runs on the same engine thread.
+
+Related pages:
+
+- Embedding poot as a library: [Develop](../develop/index.md).
+- The design behind these pages: [Serving design](../architecture/serving-design.mdx).
+- Which families and weight formats plan on which backend: [Supported models and formats](../develop/supported-models.md).
+- What each backend's lane runs: [Serving capabilities](./capabilities.md).
+- Measured speed: [Performance](../performance/index.mdx).
 
 ## Getting started
 
@@ -35,3 +36,4 @@ listed per row in the [feature matrix](../reference/feature-matrix.md), and meas
 - [Continuous batching and concurrency](./continuous-batching.md): the scheduling loop, rows and bounds.
 - [Speculative decoding](./speculative-decoding.md): prompt lookup, draft model and the model's own MTP layer.
 - [Tensor parallelism](./tensor-parallelism.md): weights and the paged KV pool divided over GPU ranks.
+- [Serving capabilities by backend](./capabilities.md): what each backend's lane runs, and expert pooling.

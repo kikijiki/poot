@@ -13,9 +13,11 @@ import performance_receipt as receipts  # noqa: E402
 from runner_fixtures import POOT_IDENTITY  # noqa: E402
 
 DEVICE = "fixture-gpu"
+HOST_CPU = "fixture-cpu"
+DRIVER = "fixture-driver"
 
 
-def result_row(tok_s, *, backend="ptx", device=DEVICE, binary="bin-1", status="ok", model="m", **extra):
+def result_row(tok_s, *, backend="ptx", device=DEVICE, host_cpu=HOST_CPU, gpu_driver=DRIVER, binary="bin-1", status="ok", model="m", **extra):
     row = {
         "framework": "poot",
         "model": model,
@@ -24,6 +26,8 @@ def result_row(tok_s, *, backend="ptx", device=DEVICE, binary="bin-1", status="o
         "status": status,
         "backend": backend,
         "device": device,
+        "host_cpu": host_cpu,
+        "gpu_driver": gpu_driver,
         "binary_sha256": binary,
         **POOT_IDENTITY,
         "build_sha": binary.ljust(40, "0"),
@@ -44,7 +48,8 @@ def repeats(samples, **kwargs):
     return [result_row(tok_s, **kwargs) for tok_s in samples]
 
 
-# Five repeats with median 100 and range 4: the band is 96..104 and a change needs to clear 2 * 4 = 8.
+# Five repeats with median 100 and interquartile range 2: the noise is 2.33 * 2 / 1.349 = 3.45 and a change
+# needs to clear twice that, 6.9.
 BASELINE = [98.0, 99.0, 100.0, 101.0, 102.0]
 
 
@@ -106,11 +111,60 @@ class CompareCellKeyTests(unittest.TestCase):
 
     def test_a_backend_or_device_the_row_does_not_record_is_its_own_cell(self):
         legacy = repeats(BASELINE, backend=None, device=None)
-        legacy = [{k: v for k, v in row.items() if k not in ("backend", "device")} for row in legacy]
+        legacy = [{k: v for k, v in row.items() if k not in ("backend", "device", "host_cpu", "gpu_driver")} for row in legacy]
 
         cells = bench.compare_cells(legacy + repeats(BASELINE), legacy + repeats(BASELINE), receipts.POLICY)
 
-        self.assertEqual({cell["key"][3:] for cell in cells}, {(None, None), ("ptx", DEVICE)})
+        self.assertEqual({cell["key"][3:] for cell in cells}, {(None, None, None, None), ("ptx", DEVICE, HOST_CPU, DRIVER)})
+
+    def test_hosts_of_the_same_gpu_are_separate_cells(self):
+        # The same GPU on two host CPUs: a host-bound metric differs between them, so one band over both would
+        # be two-mode. Each host keeps its own cell and its own verdict.
+        baseline = repeats(BASELINE, host_cpu="cpu-a") + repeats([x * 2 for x in BASELINE], host_cpu="cpu-b")
+
+        cells = bench.compare_cells(baseline, baseline, receipts.POLICY)
+
+        self.assertEqual([cell["key"][5] for cell in cells], ["cpu-a", "cpu-b"])
+        self.assertEqual([(cell["n_a"], cell["median_a"]) for cell in cells], [(5, 100.0), (5, 200.0)])
+
+    def test_drivers_of_the_same_gpu_are_separate_cells(self):
+        rows = repeats(BASELINE, gpu_driver="535") + repeats(BASELINE, gpu_driver="550")
+
+        cells = bench.compare_cells(rows, rows, receipts.POLICY)
+
+        self.assertEqual([cell["key"][6] for cell in cells], ["535", "550"])
+
+    def test_the_same_hardware_still_pools_its_repeats(self):
+        rows = repeats(BASELINE[:3]) + repeats(BASELINE[3:])
+
+        (cell,) = bench.compare_cells(rows, rows, receipts.POLICY)
+
+        self.assertEqual(cell["n_a"], 5)
+
+    def test_a_host_the_run_did_not_record_is_never_pooled_with_a_known_one(self):
+        unknown = repeats(BASELINE, host_cpu=None)
+
+        cells = bench.compare_cells(unknown + repeats(BASELINE), unknown + repeats(BASELINE), receipts.POLICY)
+
+        self.assertEqual({cell["key"][5] for cell in cells}, {None, HOST_CPU})
+        self.assertEqual([cell["n_a"] for cell in cells], [5, 5])
+
+    def test_a_run_directory_with_no_recorded_cpu_is_not_pooled_with_a_known_cpu(self):
+        # The production path: the host comes from each run directory's env.json, and a directory whose env.json
+        # lacks the cpu (or has no env.json) is an unknown host. Its repeats stay out of the known host's band.
+        def bare(samples):
+            return [{k: v for k, v in row.items() if k not in ("host_cpu", "gpu_driver")} for row in repeats(samples)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            known = write_run(tmp, "known", bare(BASELINE))
+            (Path(known) / "env.json").write_text(json.dumps({"cpu": HOST_CPU, "gpu_driver": DRIVER}))
+            no_cpu = write_run(tmp, "no-cpu", bare(BASELINE))
+            (Path(no_cpu) / "env.json").write_text(json.dumps({"gpu_driver": DRIVER}))
+            rows = [row for run in (known, no_cpu) for row in bench._load_rows(run)]
+
+        cells = bench.compare_cells(rows, rows, receipts.POLICY)
+
+        self.assertEqual([(cell["key"][5], cell["n_a"]) for cell in cells], [(None, 5), (HOST_CPU, 5)])
 
     def test_cell_present_on_one_side_only_is_reported_not_dropped(self):
         got = verdicts(
@@ -121,15 +175,15 @@ class CompareCellKeyTests(unittest.TestCase):
         self.assertEqual(
             got,
             {
-                ("only-a", "single", "poot", "ptx", DEVICE): receipts.NOT_RUN,
-                ("m", "single", "poot", "ptx", DEVICE): receipts.WITHIN_NOISE,
-                ("only-b", "single", "poot", "ptx", DEVICE): receipts.NEW,
+                ("only-a", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER): receipts.NOT_RUN,
+                ("m", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER): receipts.WITHIN_NOISE,
+                ("only-b", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER): receipts.NEW,
             },
         )
 
 
 class CompareNoiseBandTests(unittest.TestCase):
-    key = ("m", "single", "poot", "ptx", DEVICE)
+    key = ("m", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER)
 
     def verdict(self, candidate_samples, **kwargs):
         return verdicts(repeats(BASELINE), repeats(candidate_samples, **kwargs))[self.key]
@@ -142,12 +196,12 @@ class CompareNoiseBandTests(unittest.TestCase):
         self.assertEqual(self.verdict([96.0, 97.0, 97.5, 96.5, 97.0]), receipts.WITHIN_NOISE)
         self.assertEqual(self.verdict([103.0, 104.0, 103.5, 102.5, 103.0]), receipts.WITHIN_NOISE)
 
-    def test_the_band_edge_is_median_minus_twice_the_range(self):
-        # Baseline median 100, range 4: the edge is 92. Exactly on it is noise, one step below regresses.
-        self.assertEqual(self.verdict([92.0] * 5), receipts.WITHIN_NOISE)
-        self.assertEqual(self.verdict([91.5] * 5), receipts.REGRESSION)
-        self.assertEqual(self.verdict([108.0] * 5), receipts.WITHIN_NOISE)
-        self.assertEqual(self.verdict([108.5] * 5), receipts.IMPROVEMENT)
+    def test_the_band_edge_is_median_minus_twice_the_robust_noise(self):
+        # Baseline median 100, noise 3.45: the edge is 93.1. Inside it is noise, past it regresses.
+        self.assertEqual(self.verdict([93.2] * 5), receipts.WITHIN_NOISE)
+        self.assertEqual(self.verdict([93.0] * 5), receipts.REGRESSION)
+        self.assertEqual(self.verdict([106.8] * 5), receipts.WITHIN_NOISE)
+        self.assertEqual(self.verdict([107.0] * 5), receipts.IMPROVEMENT)
 
     def test_a_noisier_baseline_widens_the_band_until_it_cannot_exclude_a_regression(self):
         noisy = [80.0, 90.0, 100.0, 110.0, 120.0]
@@ -163,10 +217,10 @@ class CompareNoiseBandTests(unittest.TestCase):
     def test_identical_baseline_runs_borrow_the_candidates_observed_noise(self):
         steady = repeats([100.0] * 5)
 
-        # Baseline range 0: the candidate's own range (4) sizes the band, so 97 is noise and 80 is not.
-        self.assertEqual(verdicts(steady, repeats([95.0, 97.0, 97.0, 97.0, 99.0]))[self.key],
+        # Baseline range 0: the candidate's own noise (3.45) sizes the band, so 97 is noise and 80 is not.
+        self.assertEqual(verdicts(steady, repeats([94.0, 96.0, 97.0, 98.0, 100.0]))[self.key],
                          receipts.WITHIN_NOISE)
-        self.assertEqual(verdicts(steady, repeats([78.0, 80.0, 80.0, 80.0, 82.0]))[self.key],
+        self.assertEqual(verdicts(steady, repeats([76.0, 78.0, 80.0, 82.0, 84.0]))[self.key],
                          receipts.REGRESSION)
 
     def test_identical_runs_on_both_sides_have_no_observed_noise_and_are_unverified(self):
@@ -176,9 +230,9 @@ class CompareNoiseBandTests(unittest.TestCase):
             with self.subTest(candidate=candidate[0]):
                 self.assertEqual(verdicts(steady, repeats(candidate))[self.key], receipts.UNVERIFIED)
 
-    def test_an_outlier_run_widens_the_band_so_the_cell_is_unverified(self):
-        # The median ignores the 300, but the 200-wide range it makes cannot exclude a material loss.
-        self.assertEqual(self.verdict([100.0, 100.0, 100.0, 100.0, 300.0]), receipts.UNVERIFIED)
+    def test_one_wild_run_does_not_set_the_band(self):
+        # The median ignores the 300 and so does the robust noise: the baseline's own 3.45 sizes the band.
+        self.assertEqual(self.verdict([100.0, 100.0, 100.0, 100.0, 300.0]), receipts.WITHIN_NOISE)
 
     def test_fewer_than_five_repeats_on_either_side_is_unverified(self):
         for baseline_runs, candidate_runs in ((5, 4), (4, 5), (1, 1)):
@@ -216,12 +270,16 @@ def curve_row(isl_values, *, tpot_scale=None, ttft_scale=None, tok_s=100.0, jitt
     points = [
         {
             "isl": isl,
+            "prompt_tokens": isl,
             "tpot_ms": {"p50": 10.0 * jitter * tpot_scale.get(isl, 1.0)},
             "ttft_ms": {"p50": 0.5 * isl * jitter * ttft_scale.get(isl, 1.0)},
         }
         for isl in isl_values
     ]
-    return result_row(tok_s, curve=points, osl=128, **extra)
+    row = result_row(tok_s, curve=points, osl=128, **extra)
+    # A curve row states its prompt lengths per point; it has no top-level prompt_tokens.
+    del row["prompt_tokens"]
+    return row
 
 
 def curve_repeats(isls, **kwargs):
@@ -230,11 +288,11 @@ def curve_repeats(isls, **kwargs):
 
 
 class CompareCurveCoverageTests(unittest.TestCase):
-    key = ("m", "single", "poot", "ptx", DEVICE)
+    key = ("m", "single", "poot", "ptx", DEVICE, HOST_CPU, DRIVER)
     ISLS = (128, 2048, 8192)
 
-    def cell(self, candidate):
-        (got,) = bench.compare_cells(curve_repeats(self.ISLS), candidate, receipts.POLICY)
+    def cell(self, candidate, baseline=None):
+        (got,) = bench.compare_cells(baseline or curve_repeats(self.ISLS), candidate, receipts.POLICY)
         return got
 
     def test_matching_curves_are_within_noise_on_every_point(self):
@@ -254,6 +312,22 @@ class CompareCurveCoverageTests(unittest.TestCase):
         self.assertEqual(got["verdict"], receipts.REGRESSION)
         self.assertIn("isl=8192 ttft_ms", got["note"])
 
+    def test_curve_rows_are_compared_by_their_prompt_lengths_not_a_missing_top_level_one(self):
+        """Mutation: read only a top-level `prompt_tokens` for identity and every curve cell is incomparable."""
+        for framework in ("poot", "llamacpp"):
+            with self.subTest(framework=framework):
+                extra = {"framework": framework, "framework_version": "b1"}
+                got = self.cell(curve_repeats(self.ISLS, **extra), baseline=curve_repeats(self.ISLS, **extra))
+                self.assertEqual(got["verdict"], receipts.WITHIN_NOISE, got["note"])
+
+    def test_a_curve_and_a_single_prompt_state_different_workloads(self):
+        candidate = [{**row, "prompt_tokens": 3} for row in curve_repeats(self.ISLS)]
+        for row in candidate:
+            del row["curve"]
+        (got,) = bench.compare_cells(curve_repeats(self.ISLS), candidate, receipts.POLICY)
+        self.assertEqual(got["verdict"], receipts.INCOMPARABLE)
+        self.assertIn("prompt_tokens", got["note"])
+
     def test_a_context_length_the_candidate_did_not_run_is_not_run_and_exits_2(self):
         candidate = curve_repeats((128, 2048))
         got = self.cell(candidate)
@@ -265,6 +339,17 @@ class CompareCurveCoverageTests(unittest.TestCase):
         got = self.cell(curve_repeats(self.ISLS) + repeats([0], status="error"))
         self.assertEqual(got["verdict"], receipts.REPEAT_FAILED)
         self.assertEqual(bench.compare_exit_code([got]), 1)
+
+    def test_curve_rows_state_their_prompt_length_per_point(self):
+        def with_prompts(row, prompt_for):
+            return {**row, "curve": [{**p, "prompt_tokens": prompt_for(p["isl"])} for p in row["curve"]]}
+
+        baseline = [with_prompts(r, lambda isl: isl) for r in curve_repeats(self.ISLS)]
+        (same,) = bench.compare_cells(baseline, baseline, receipts.POLICY)
+        self.assertNotEqual(same["verdict"], receipts.INCOMPARABLE)
+        shifted = [with_prompts(r, lambda isl: isl + 1) for r in curve_repeats(self.ISLS)]
+        (got,) = bench.compare_cells(baseline, shifted, receipts.POLICY)
+        self.assertEqual(got["verdict"], receipts.INCOMPARABLE)
 
     def test_rows_that_state_different_workloads_are_incomparable(self):
         for field, value in (("precision", "fp16"), ("prompt_tokens", 99), ("gen_tokens", 7)):

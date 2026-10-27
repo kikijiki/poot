@@ -33,7 +33,7 @@ use poot_llm::driver::{
     ModelHandle, PreparedSetLimits, ServingShapes, Warm, open_timed_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
-use poot_models::model::{FamilyKey, LogitRows, StepSpec};
+use poot_models::model::{FamilyKey, KvDtype, LogitRows, StepSpec};
 use poot_models::registry::{FamilyEntry, Fixture, Registry};
 use poot_models::test_support::dense::step as step_shape;
 use poot_models::test_support::weight_map::MappedModel;
@@ -108,6 +108,7 @@ fn write_checkpoint(dir: &Path, fixture: &Fixture) {
 fn options() -> DriverOptions {
     let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(CAPACITY),
@@ -142,9 +143,11 @@ impl Carried {
 }
 
 fn decode_graph(m: &MappedModel, rows: usize) -> Graph {
+    // The KV dtype a default driver resolves, so the traced state is the state the planner accounts for.
+    let kv = KvDtype::resolve(None, m.model.config().kv_dtype);
     m.model
         .trace(
-            &StepSpec::step(step_shape(rows, 1, CAPACITY, LogitRows::Last)),
+            &StepSpec::step(step_shape(rows, 1, CAPACITY, LogitRows::Last).with_kv_dtype(kv)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -358,7 +361,7 @@ impl Device for CountingDevice {
     fn load_kernel(
         &mut self,
         _key: &str,
-        _kernel: poot_runtime_common::CompiledKernel,
+        _kernel: poot_codegen::CompiledKernel,
     ) -> Result<(), CountingError> {
         Ok(())
     }
@@ -601,7 +604,7 @@ fn restoring_a_snapshot_undoes_folded_drafts_on_both_recurrent_families() {
         let live: Vec<_> = at.iter().map(|&i| prompted[i].clone()).collect();
         let zeros: Vec<_> = live
             .iter()
-            .map(|t| HostTensor::zeros(t.shape().to_vec()))
+            .map(|t| HostTensor::zeros_of(t.dtype(), t.shape().to_vec()))
             .collect();
         let (_, shadow) = copy(&m, &snapshot, &live, &zeros);
         let (_, folded) = run(&m, &graph, prompted, &DRAFTS, PROMPT.len());

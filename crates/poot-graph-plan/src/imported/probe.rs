@@ -1,12 +1,13 @@
-//! Cross-crate standalone kernels (card 559, R468-016): not part of the planner's per-equation kernel
-//! choice (none has a `planner/*.rs` call site), each loaded directly by the crate that needs it -
-//! `poot-rocm-device`'s own executor-contract fixtures, the executor engine's `copy_words` state-copy kernel
-//! (`poot_executor::CopyKernel`), and `poot-wgpu-device`'s
-//! importer-capability probes (multi-array LDS + barrier, a runtime-value loop bound). Authored in Rust
-//! (`pootc/kernels/probe/*.rs`). Grouped here by destination, not by kernel family, since the "one
-//! manifest" invariant (every committed asset has exactly one entry) applies regardless of who reads it.
+//! Test-support kernels (card 559, R468-016; POOT-1237): the executor-contract fixtures and importer-capability
+//! probes, none with a planner call site. Each is loaded directly by the crate whose test needs it -
+//! `poot-rocm-device`'s executor-contract fixtures (a device trap, an atomic counter, a busy-spin) and
+//! `poot-wgpu-device`'s importer-capability probes (multi-array LDS + barrier, a runtime-value loop bound).
+//! Authored in Rust (`pootc/kernels/probe/*.rs`). Grouped here by destination, not by kernel family, since the
+//! "one manifest" invariant (every committed asset has exactly one entry) applies regardless of who reads it.
+//! Compiled only for tests and the `test-support` feature: the shipped planner carries none of them.
 
 kernel_assets! {
+    kind = ProbeKernel;
     family = body_probe;
 
     AssertTrap {
@@ -21,13 +22,6 @@ kernel_assets! {
         source: "atomic_add_sum_smoke",
         entry: "__poot_kernel_atomic_add_sum_smoke",
         params: 1,
-        dest: Crate("poot-rocm-device/assets"),
-    },
-    CopyWords {
-        name: "copy_words",
-        source: "copy_words",
-        entry: "__poot_kernel_copy_words",
-        params: 2,
         dest: Crate("poot-rocm-device/assets"),
     },
     SpinBusy {

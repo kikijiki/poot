@@ -124,7 +124,7 @@ fn bind(
                 if !include_state {
                     continue;
                 }
-                HostTensor::zeros(m.aval.shape.clone())
+                HostTensor::zeros_of(m.aval.dtype, m.aval.shape.clone())
             }
             _ => continue,
         };
@@ -536,7 +536,7 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_on_gpu() {
     // names where in the RoPE table/valid-prefix slice the step reads, not how many prior steps ran).
     let zero_state: Vec<HostTensor> = g
         .state()
-        .map(|(si, _)| HostTensor::zeros(g.aval(si).shape.clone()))
+        .map(|(si, _)| HostTensor::zeros_of(g.aval(si).dtype, g.aval(si).shape.clone()))
         .collect();
 
     let mut cpu_inputs = inputs.clone();

@@ -9,6 +9,8 @@ pub mod family_fixtures;
 #[cfg(feature = "test-support")]
 pub mod fixtures;
 #[cfg(feature = "test-support")]
+pub mod flash_next;
+#[cfg(feature = "test-support")]
 pub mod pipeline;
 #[cfg(feature = "test-support")]
 pub mod real_dims;

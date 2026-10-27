@@ -152,6 +152,13 @@ class BuildIdentityContractTests(unittest.TestCase):
         ):
             self.validate(payload)
 
+    def test_poot_result_without_its_prefill_chunk_is_rejected(self):
+        payload = valid_single()
+        del payload["prefill_chunk"]
+
+        with self.assertRaisesRegex(bench.ResultValidationError, "prefill_chunk must be a positive integer"):
+            self.validate(payload)
+
     def test_poot_result_without_backend_is_rejected(self):
         payload = valid_single()
         del payload["backend"]

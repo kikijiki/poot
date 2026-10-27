@@ -3,11 +3,11 @@
 
 #![crate_type = "lib"]
 use poot_kernel_attr::kernel;
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 
 #[kernel]
 pub fn add(a: &[f32], b: &[f32], c: &mut [f32]) {
-    let i = thread_index();
+    let i = thread_index_x();
     if i < c.len() {
         c[i] = a[i] + b[i];
     }

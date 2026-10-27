@@ -193,7 +193,7 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_rocm(
             kernel: &kernel,
             inputs: &[Arg {
                 buffer: &len_src,
-                elems: REAL_LEN as u32,
+                elems: REAL_LEN,
             }],
             output: Arg {
                 buffer: &out_buf,
@@ -270,7 +270,7 @@ fn an_aie_launch_is_a_typed_refusal_on_rocm() {
                 buffer: &output,
                 elems: 1,
             },
-            launch: poot_executor::LaunchKind::Aie(poot_executor::AieInvocation::new(
+            launch: poot_executor::LaunchKind::Aie(poot_npu_artifacts::AieInvocation::new(
                 AieTargetId::Xdna2,
                 std::num::NonZeroU32::new(1).unwrap(),
             )),

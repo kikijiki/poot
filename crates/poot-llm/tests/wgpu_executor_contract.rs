@@ -226,7 +226,9 @@ fn oracle_step(
             Storage::State => Value::from(
                 state
                     .entry(meta.name().unwrap().into_owned())
-                    .or_insert_with(|| HostTensor::zeros(meta.aval.shape.clone()))
+                    .or_insert_with(|| {
+                        HostTensor::zeros_of(meta.aval.dtype, meta.aval.shape.clone())
+                    })
                     .clone(),
             ),
             Storage::Computed(c) => Value::from(c.tensor()),
@@ -1187,7 +1189,7 @@ fn packed_awq_linear_binds_by_store_key_and_source_role_and_matches_the_oracle()
 /// begin/dispatch/finish/replay/synchronize sequence `Engine::step`/`run_transaction` uses
 /// internally (recording never touches the device, F2: the dispatch only actually runs once
 /// `replay` submits it), directly on the public `Device` trait surface, loading the one committed
-/// fixture that IS a real rustc-inserted bounds check (`ImportedKernel::AssertTrap`,
+/// fixture that IS a real rustc-inserted bounds check (`ProbeKernel::AssertTrap`,
 /// `poot-rocm-device/assets/assert_trap.kir.json`, card 531c: `out[i] = data[idx[i]]`), same as
 /// `poot_wgpu_runtime`'s own `pending_fault_tests` module.
 ///
@@ -1204,7 +1206,7 @@ fn wgpu_device_classifies_a_kernel_assert_fault_from_synchronize() {
     let Some(mut device) = require_wgpu() else {
         return;
     };
-    let body: poot_kernel_ir::Body = poot_graph_plan::ImportedKernel::AssertTrap.body().clone();
+    let body: poot_kernel_ir::Body = poot_graph_plan::ProbeKernel::AssertTrap.body().clone();
     let dir = std::env::temp_dir().join("poot-wgpu-device-sc015-fault-probe");
     std::fs::create_dir_all(&dir).unwrap();
     let out_path =
@@ -1287,7 +1289,8 @@ fn wgpu_device_classifies_a_kernel_assert_fault_from_synchronize() {
 /// as a silent dead arm would); `dispatch` returns `Ok` and the row goes red.
 #[test]
 fn wgpu_device_refuses_an_aie_launch_as_a_typed_error() {
-    use poot_executor::{AieInvocation, Arg, Device, Dispatch, LaunchKind};
+    use poot_executor::{Arg, Device, Dispatch, LaunchKind};
+    use poot_npu_artifacts::AieInvocation;
     use poot_runtime_common::BufferRole;
     use poot_target::{AieTargetId, BufferStorage, TargetId};
     use std::num::NonZeroU32;

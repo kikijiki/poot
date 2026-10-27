@@ -17,12 +17,11 @@ use poot_graph_ir::{
 };
 use poot_kernel_ir::{BinOp, Body, Ty};
 use poot_kernelgen::{
-    CastSpec, ContractionSpec, ElementwiseSpec, I32Binary, KernelRequest, PointwiseForm,
-    PointwiseSpec, ValueBinary,
+    CastSpec, ContractionSpec, DenseTiledContraction, DenseTiledWeight, FusedInput, FusedScalarOp,
+    KernelRequest, LeafTy, PointwiseForm, PointwiseSpec, Schedule,
 };
 use poot_target::{
-    AmdArch, Backend, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps, TargetId, TensorCoreSupport,
-    WatchdogBudget,
+    AmdArch, Backend, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps, TargetId, WatchdogBudget,
 };
 use poot_tensor::DType as GDt;
 use poot_test_util::device_caps::default_caps_for;
@@ -148,19 +147,6 @@ fn matmul_graph(m: usize, k: usize, n: usize, dt: GDt) -> Graph {
     bld.finish(mm).unwrap()
 }
 
-/// Like [`matmul_graph`] but with an explicit leading batch dim: `[batch,m,k] @ [k,n]`. NVPTX WMMA
-/// (`matmul_nvptx_tc_eligible`) allows batch dims, unlike the AMD arm, so this is the shape needed to
-/// exercise the `tc` arm's batch factor (card 525).
-fn batched_matmul_graph(batch: usize, m: usize, k: usize, n: usize, dt: GDt) -> Graph {
-    let bld = Builder::for_tests();
-    let a = bld
-        .constant("a", TensorType::new(vec![batch, m, k], dt))
-        .unwrap();
-    let w = bld.constant("w", TensorType::new(vec![k, n], dt)).unwrap();
-    let mm = bld.matmul(a, w).unwrap();
-    bld.finish(mm).unwrap()
-}
-
 /// The plan and the kernel choice behind it for one equation (single-device, no views).
 fn planned_with_choice(
     g: &Graph,
@@ -186,6 +172,7 @@ fn planned_with_choice_caps(
         },
         &HashMap::new(),
         &crate::test_support::roomy_body_limits(),
+        None,
     )
     .map(|Planned { plan, choice }| (plan, choice))
 }
@@ -193,6 +180,12 @@ fn planned_with_choice_caps(
 /// Whether a choice is the shipped kernel `kernel`.
 fn is_imported(choice: &KernelChoice, kernel: ImportedKernel) -> bool {
     matches!(choice, KernelChoice::Imported { kernel: k, .. } if *k == kernel)
+}
+
+/// Whether the choice is the generated decode GEMV (`kg::gemv_lds`): the one body every decode `[K, N]` GEMV
+/// runs, whole or split.
+fn is_decode_gemv(choice: &KernelChoice) -> bool {
+    matches!(contraction(choice), Some(ContractionSpec::GemvChunk { .. }))
 }
 
 /// The kernel choice for one equation. Tests assert on this record, never on the plan's opaque key.
@@ -228,14 +221,6 @@ fn serial_matmul_dtype(choice: &KernelChoice) -> Option<&Ty> {
     }
 }
 
-/// Whether the choice generated a tensor-core matmul with this element type.
-fn is_tensor_core(choice: &KernelChoice) -> bool {
-    matches!(
-        contraction(choice),
-        Some(ContractionSpec::TensorCore { .. })
-    )
-}
-
 #[test]
 fn exact_i32_binary_plans_typed_integer_kernels_on_every_compute_backend() {
     let b = Builder::for_tests();
@@ -266,24 +251,22 @@ fn exact_i32_binary_plans_typed_integer_kernels_on_every_compute_backend() {
         ] {
             let (planned_plan, choice) = planned_with_choice(&g, eqn, backend).unwrap();
             let Dispatch { body, .. } = into_plain(planned_plan);
-            // The request names the exact-I32 operation, not the f32 lane's.
-            let named = match (&choice, expected_name) {
-                (
-                    KernelChoice::Generated(KernelRequest::Elementwise(ElementwiseSpec::Binary {
-                        op: ValueBinary::Basic(BinOp::Add, Ty::I32),
-                        ..
-                    })),
-                    "Add",
-                ) => true,
-                (
-                    KernelChoice::Generated(KernelRequest::Elementwise(
-                        ElementwiseSpec::ScalarI32 { op, .. },
-                    )),
-                    name,
-                ) => matches!(
-                    (op, name),
-                    (I32Binary::GeU, "GeU") | (I32Binary::RemU, "RemU")
-                ),
+            // The request names the exact-I32 operation, not the f32 lane's: a one-step exact-I32 pointwise
+            // region over I32 leaves.
+            let named = match &choice {
+                KernelChoice::Generated(KernelRequest::Pointwise(PointwiseSpec {
+                    kernel,
+                    form: PointwiseForm::ExactI32 { .. },
+                    ..
+                })) => {
+                    let expected_op = match expected_name {
+                        "Add" => FusedScalarOp::Binary(BinOp::Add),
+                        "GeU" => FusedScalarOp::GeU,
+                        _ => FusedScalarOp::RemU,
+                    };
+                    kernel.leaf_tys.iter().all(|&leaf| leaf == LeafTy::I32)
+                        && matches!(kernel.steps.as_slice(), [step] if step.op == expected_op)
+                }
                 _ => false,
             };
             assert!(named, "{expected_name} on {backend:?}: {choice:?}");
@@ -343,17 +326,8 @@ fn exact_i32_bit_select_and_closed_fusion_plan_as_i32() {
         ] {
             let (planned_plan, choice) = planned_with_choice(&g, eqn, backend).unwrap();
             let Dispatch { body, .. } = into_plain(planned_plan);
-            // Every step runs over exact I32 storage: an I32 element type, the exact-I32 pointwise
-            // forms, or the unsigned-literal kernels.
+            // Every step runs over exact I32 storage: the exact-I32 pointwise forms.
             let exact = match &choice {
-                KernelChoice::Generated(KernelRequest::Elementwise(spec)) => match spec {
-                    ElementwiseSpec::Unary { dt, .. } => *dt == Ty::I32,
-                    ElementwiseSpec::ScalarI32 { .. } => true,
-                    ElementwiseSpec::Binary { op, .. } => {
-                        matches!(op, ValueBinary::Basic(_, Ty::I32))
-                    }
-                    _ => false,
-                },
                 KernelChoice::Generated(KernelRequest::Pointwise(spec)) => {
                     matches!(
                         spec.form,
@@ -771,9 +745,14 @@ fn an_i32_binary_plans_the_same_kernel_whatever_consumes_it() {
         assert!(
             matches!(
                 choice,
-                KernelChoice::Generated(KernelRequest::Elementwise(
-                    ElementwiseSpec::ScalarI32 { .. }
-                ))
+                KernelChoice::Generated(KernelRequest::Pointwise(PointwiseSpec {
+                    form: PointwiseForm::ExactI32 { .. },
+                    kernel,
+                    ..
+                })) if matches!(
+                    kernel.steps.as_slice(),
+                    [step] if matches!(step.inputs.as_slice(), [FusedInput::Leaf(_), FusedInput::LitI32(_)])
+                )
             ),
             "{choice:?}"
         );
@@ -1039,7 +1018,7 @@ fn try_matmul_plan(g: &Graph, backend: Backend) -> Result<Plan, PlanError> {
 
 /// A biased matmul whose weight dtype differs from its activation's is not a contraction epilogue: the
 /// fuse rule only forms one over a head whose operands and result share a dtype (a mixed pairing is the
-/// tensor-core and decode-GEMV arms' contract, and `widen_mismatched_matmul_dtypes` casts the rest), so
+/// decode-GEMV arm's contract, and `widen_mismatched_matmul_dtypes` casts the rest), so
 /// the graph keeps its matmul and its add. Mutation: drop the dtype check in `epilogue_head`; the mixed
 /// matmul fuses and this row goes red.
 #[test]
@@ -2553,40 +2532,12 @@ fn e4m3fn_gather_rejects_empty_output_and_non_i32_indices_by_name() {
     ));
 }
 
-#[test]
-fn tensorcore_selected_only_for_nvptx_bf16_aligned() {
-    // NVPTX + bf16 + all dims 16-aligned -> tensor cores (the `tc:` tag).
-    let g = matmul_graph(16, 32, 16, GDt::BF16);
-    assert!(is_tensor_core(&matmul_choice(&g, Backend::Nvptx)));
-    // same graph on SPIR-V -> the serial kernel (WMMA is NVPTX-only).
-    assert!(!is_tensor_core(&matmul_choice(&g, Backend::SpirvVulkan)));
-    // f32 on NVPTX -> serial (tensor cores are the bf16 path).
-    let gf = matmul_graph(16, 32, 16, GDt::F32);
-    assert!(!is_tensor_core(&matmul_choice(&gf, Backend::Nvptx)));
-    // bf16 but a non-16-aligned N -> serial fallback.
-    let gn = matmul_graph(16, 32, 24, GDt::BF16);
-    assert!(!is_tensor_core(&matmul_choice(&gn, Backend::Nvptx)));
-    // bf16 but a non-16-aligned K -> serial fallback.
-    let gk = matmul_graph(16, 24, 16, GDt::BF16);
-    assert!(!is_tensor_core(&matmul_choice(&gk, Backend::Nvptx)));
-}
-
-/// Build a 16-aligned matmul `[1,16,32] @ [32,16]` over bf16/f16 operands that accumulates and stores F32
-/// (the mixed-precision case that reaches the AMD WMMA path).
+/// A 16-aligned matmul `[1,16,32] @ [32,16]` over bf16/f16 operands that accumulates and stores F32.
 fn mixed_matmul_graph(op_dt: GDt) -> Graph {
-    mixed_matmul_graph_shape(16, 32, 16, op_dt)
-}
-
-/// Like [`mixed_matmul_graph`] but with an explicit M/K/N shape.
-fn mixed_matmul_graph_shape(m: usize, k: usize, n: usize, op_dt: GDt) -> Graph {
-    mixed_batched_matmul_graph(1, m, k, n, op_dt)
-}
-
-/// `[batch,m,k] @ [k,n]` over `op_dt` operands, accumulating and storing F32.
-fn mixed_batched_matmul_graph(batch: usize, m: usize, k: usize, n: usize, op_dt: GDt) -> Graph {
+    let (m, k, n) = (16, 32, 16);
     let bld = Builder::for_tests();
     let a = bld
-        .constant("a", TensorType::new(vec![batch, m, k], op_dt))
+        .constant("a", TensorType::new(vec![1, m, k], op_dt))
         .unwrap();
     let w = bld
         .constant("w", TensorType::new(vec![k, n], op_dt))
@@ -2595,66 +2546,10 @@ fn mixed_batched_matmul_graph(batch: usize, m: usize, k: usize, n: usize, op_dt:
     bld.finish(mm).unwrap()
 }
 
-/// spec 130 FR-004 / card 145: what reaches the AMD WMMA tensor-core path (the `matmul:tc:` tag) on
-/// AmdGcn (RDNA3 gfx1151), and the spec-135 F16 boundary.
-///
-/// The AMD WMMA gate is on the operand dtype (bf16), but the tensor-core kernel also needs an F32 output:
-/// `matmul_tensorcore` writes f32 via plain `WmmaStore`, whereas a bf16 output needs `WmmaStoreLds`
-/// (f32->bf16 LDS narrowing), which is not wired for AMDGPU. So a pure bf16->bf16 matmul falls to the
-/// serial `matmul_batched_dt`; only a mixed bf16-in/f32-out matmul dispatches AMD WMMA. F16 operands never
-/// take this path (the WMMA fragment loads hardcode the bf16 bit layout and would reinterpret f16 bits).
-/// CPU-safe: inspects the selected plan key only.
-#[test]
-fn amd_wmma_reached_only_by_mixed_bf16_in_f32_out() {
-    let amd = Backend::AmdGcn(AmdArch::gfx1151());
-    // Mixed bf16 operands -> f32 output: AMD WMMA tensor cores.
-    let gmix = mixed_matmul_graph(GDt::BF16);
-    assert!(
-        is_tensor_core(&matmul_choice(&gmix, amd)),
-        "mixed bf16-in/f32-out 16-aligned matmul on gfx1151 should select WMMA"
-    );
-    // Pure bf16 -> bf16: serial fallback (WmmaStoreLds narrowing not wired for AMDGPU).
-    let gbf = matmul_graph(16, 32, 16, GDt::BF16);
-    assert!(
-        !is_tensor_core(&matmul_choice(&gbf, amd)),
-        "pure bf16->bf16 on AMD takes the serial fallback, not WMMA"
-    );
-    // F16 operands, even with an f32 output, must not route through the bf16 WMMA kernel. There is no
-    // serial route for the mix either (the fallback's single element type would read the 2-byte f16
-    // operands as f32 words), so the planner rejects the pair outright.
-    let gf16_mix = mixed_matmul_graph(GDt::F16);
-    assert!(
-        matches!(
-            try_matmul_plan(&gf16_mix, amd),
-            Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering
-        ),
-        "f16 operands must never reach the bf16-hardcoded WMMA kernel (spec 135)"
-    );
-    // Pure f16 -> the dtype-generic serial fallback.
-    let gf16 = matmul_graph(16, 32, 16, GDt::F16);
-    let f16_choice = matmul_choice(&gf16, amd);
-    assert_eq!(
-        serial_matmul_dtype(&f16_choice),
-        Some(&Ty::F16),
-        "f16 matmul should take the dtype-generic serial fallback: {f16_choice:?}"
-    );
-    // f32 on AmdGcn -> serial (tensor cores are the bf16 path).
-    let gf32 = matmul_graph(16, 32, 16, GDt::F32);
-    assert!(!is_tensor_core(&matmul_choice(&gf32, amd)));
-    // Mixed bf16-in/f32-out but a non-16-aligned K: WMMA needs aligned M/N/K, and the serial fallback
-    // cannot serve a mixed matmul (its single element type would read the bf16 operands as f32 words),
-    // so the pair is rejected.
-    let gk = mixed_matmul_graph_shape(16, 24, 16, GDt::BF16);
-    assert!(matches!(
-        try_matmul_plan(&gk, amd),
-        Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering
-    ));
-}
-
 #[test]
 fn attention_rank4_matmul_routes_through_batched_tiled_gemm() {
-    // A prefill-attention-shaped matmul [B,H,M,K] @ [B,H,K,N] -> [B,H,M,N] (M>1) under the 2^15 workgroup
-    // cap routes through the batched tiled GEMM (b_count = B*H), not the naive batched kernel.
+    // A prefill-attention-shaped matmul [B,H,M,K] @ [B,H,K,N] -> [B,H,M,N] (M>1) routes through the register-tiled
+    // GEMM with one `[K, N]` slab per block (B*H blocks), not the naive batched kernel.
     let bld = Builder::for_tests();
     let q = bld
         .constant("q", TensorType::new(vec![1, 14, 64, 64], GDt::F32))
@@ -2664,18 +2559,18 @@ fn attention_rank4_matmul_routes_through_batched_tiled_gemm() {
         .unwrap();
     let mm = bld.matmul(q, kt).unwrap();
     let g = bld.finish(mm).unwrap();
-    let choice = matmul_choice(&g, Backend::SpirvVulkan);
+    let (plan, choice) = planned_with_choice(&g, &g.eqns()[0], Backend::SpirvVulkan).unwrap();
     assert!(
-        matches!(
-            choice,
-            KernelChoice::Imported {
-                kernel: ImportedKernel::TiledGemmBatched,
-                ..
-            }
-        ),
+        kn_tiled(&choice).is_some_and(|spec| spec.meta[..3] == [64, 64, 64]),
         "attention matmul should take the tiled path: {choice:?}"
     );
-    // Above the 2^15 workgroup cap (very long context) it falls back to the naive batched kernel (card 095).
+    assert_eq!(
+        one_dispatch(plan).body().params().count(),
+        4,
+        "[q, kt, meta, out]: the 14 blocks are the output's own length over [m_per_block, out_per_block]"
+    );
+    // At a long context the same body splits into dispatches over disjoint tile ranges (the device's watchdog
+    // budget), each a tiled body, never the naive batched kernel.
     let bld2 = Builder::for_tests();
     let q2 = bld2
         .constant("q", TensorType::new(vec![1, 14, 2048, 2048], GDt::F32))
@@ -2685,10 +2580,16 @@ fn attention_rank4_matmul_routes_through_batched_tiled_gemm() {
         .unwrap();
     let mm2 = bld2.matmul(q2, k2).unwrap();
     let g2 = bld2.finish(mm2).unwrap();
-    let choice2 = matmul_choice(&g2, Backend::SpirvVulkan);
+    let eqn2 = &g2.eqns()[0];
+    let (plan2, _) = planned_with_choice(&g2, eqn2, Backend::SpirvVulkan).unwrap();
     assert!(
-        serial_matmul_dtype(&choice2).is_some(),
-        "over-cap attention matmul should fall back to naive: {choice2:?}"
+        plan2.dispatches().len() > 1
+            && plan2
+                .dispatches()
+                .iter()
+                .all(|d| kn_tiled(d.choice())
+                    .is_some_and(|spec| spec.meta[..3] == [2048, 2048, 2048])),
+        "over-cap attention matmul should split into tiled dispatches: {plan2:?}"
     );
 }
 
@@ -2743,7 +2644,7 @@ fn decode_attn_scores_v_matmul_lowers_to_the_lds_gemv_kernel() {
         "Q@K^T must not take the scores@V attn GEMV path: got {choice_q:?}"
     );
 
-    // M>1 (prefill) stays off this M=1-only path (is_batched_tiled_gemm handles it).
+    // M>1 (prefill) stays off this M=1-only path (the batched tiled GEMM handles it).
     let bldp = Builder::for_tests();
     let probs_p = bldp
         .constant("probs", TensorType::new(vec![1, 8, 4, 300], GDt::F32))
@@ -2771,11 +2672,9 @@ fn gdn_decode_matmuls_route_as_expected_on_amdgcn() {
     //     Transpose output) hits `is_decode_attn_gemv` -> the LDS-parallel `attn_scores_v_gemv_lds`
     //     kernel, same as decode `scores @ V` above.
     //   - `o = q_scaled @ s_out` has the same shape/operand-producer as `kv` -> same kernel.
-    //   - `outer = k_col @ delta` [1,32,128,1] @ [1,32,1,128] -> [1,32,128,128] (M=128) never takes
-    //     `is_batched_tiled_gemm` on AmdGcn: that gate is `SpirvVulkan | Nvptx` only (the imported
-    //     batched-tiled body miscompiles on AMDGCN, LDS zeroinitializer in addrspace(3); see the gate's
-    //     doc). It falls through to the naive `matmul_batched_dt_grid` one-thread-per-output kernel, a
-    //     documented backend gap.
+    //   - `outer = k_col @ delta` [1,32,128,1] @ [1,32,1,128] -> [1,32,128,128] (M=128) takes the generated
+    //     batched-weight tiled GEMM on every backend: the LDS-array bodies compile for AmdGcn (hardware-verified,
+    //     POOT-1237), so no backend withholds it.
     let amd = Backend::AmdGcn(AmdArch::gfx1151());
     const H: usize = 32;
     const D: usize = 128;
@@ -2840,133 +2739,32 @@ fn gdn_decode_matmuls_route_as_expected_on_amdgcn() {
     let g_outer = bld_outer.finish(outer).unwrap();
     let choice_outer = matmul_choice(&g_outer, amd);
     assert!(
-        matches!(
-            contraction(&choice_outer),
-            Some(ContractionSpec::Serial { dt: Ty::F32, epilogue: None, shapes, .. })
-                if shapes.out_shape == [1, 32, 128, 128]
-                    && shapes.a_shape == [1, 32, 128, 1]
-                    && shapes.b_shape == [1, 32, 1, 128]
-        ),
-        "GDN outer=k_col@delta should fall through to the naive batched matmul on AmdGcn \
-         (is_batched_tiled_gemm is SpirvVulkan|Nvptx-only): got {choice_outer:?}"
+        kn_tiled(&choice_outer).is_some_and(|spec| spec.meta[..3] == [1, 128, 128]),
+        "GDN outer=k_col@delta should take the generated batched tiled GEMM on AmdGcn: got {choice_outer:?}"
     );
 }
 
-// --- spec 130 / FR-001 / FR-004 / FR-005 / SC-004 ---
-
+/// A mixed matmul (bf16 or f16 operands, f32 output) has no lowering on any backend: every matmul body reads one
+/// element type, so planned at f32 it would read the two-byte operand buffers as f32 words. The planner refuses
+/// the pair by name, and the widening pass is what makes it plannable. Mutation: drop the operand-dtype guard in
+/// `planner/matmul.rs`; the pair plans the tiled-or-serial f32 body and every row goes red.
 #[test]
-fn tensorcore_amdgcn_selected_for_bf16_aligned_rdna3() {
-    // Backend::AmdGcn(gfx1151) + bf16 + 16-aligned unbatched: plan_eqn routes through the amd_tc arm
-    // (FR-003: selection in plan_eqn, not the executor). The WMMA Body (matmul_tensorcore) is a
-    // placeholder pending WmmaStoreLds AmdGcn codegen; the arm uses matmul_batched_dt(BF16) as a serial fallback.
-    let g = matmul_graph(16, 32, 16, GDt::BF16);
-    let choice = matmul_choice(&g, Backend::AmdGcn(AmdArch::gfx1151()));
-    assert_eq!(
-        serial_matmul_dtype(&choice),
-        Some(&Ty::BF16),
-        "gfx1151 bf16 aligned should use serial bf16 fallback (amd_tc arm): got {choice:?}"
-    );
-}
-
-#[test]
-fn mixed_bf16_tc_key_encodes_operand_dtype_not_just_output() {
-    // Card 045: the mixed-precision WMMA matmul (bf16 operands -> f32 output) must put the operand dtype
-    // in its cache key, not only the output dtype; otherwise the `matmul:tc:` key reads as an f32 key
-    // (dtag(F32) == "") and could share a disk artifact with an f32-operand kernel of the same shapes.
-    // The WMMA tensor-core shape: bf16 operands, f32-accumulate output (the deleted `to_mixed_bf16`
-    // pass used to produce this by inserting Cast(F32->BF16) on both operands; built directly here).
-    let gf = matmul_graph(16, 32, 16, GDt::F32);
-    let gm = mixed_matmul_graph(GDt::BF16);
-    // sanity: the matmul reads bf16 operands and writes f32.
-    let mm = gm
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
-        .expect("a matmul eqn");
-    assert_eq!(gm.aval(mm.out).dtype, GDt::F32, "output stays f32");
-    for op in &mm.inputs {
-        if let poot_graph_ir::Operand::Value(v) = op {
-            assert_eq!(gm.aval(*v).dtype, GDt::BF16, "operands are bf16");
+fn mixed_dtype_matmul_is_refused_on_every_backend() {
+    for operand in [GDt::BF16, GDt::F16] {
+        let gm = mixed_matmul_graph(operand);
+        for backend in [
+            Backend::SpirvVulkan,
+            Backend::Nvptx,
+            Backend::AmdGcn(AmdArch::gfx1151()),
+            Backend::AmdGcn(AmdArch::new("gfx942", 64)),
+        ] {
+            let r = try_matmul_plan(&gm, backend);
+            assert!(
+                matches!(&r, Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering),
+                "{operand:?} -> f32 matmul on {backend:?} must be refused, not planned at f32: got {r:?}"
+            );
         }
     }
-    // On gfx1151 the mixed matmul takes the amd_tc arm. Its key must start with `matmul:tc:` and carry
-    // the bf16 operand tag, so it is distinct from any f32-operand kernel.
-    let gfx1151 = Backend::AmdGcn(AmdArch::gfx1151());
-    let choice = matmul_choice(&gm, gfx1151);
-    assert!(
-        matches!(
-            contraction(&choice),
-            Some(ContractionSpec::TensorCore { dt: Ty::F32, .. })
-        ),
-        "mixed matmul should take the WMMA tc arm: got {choice:?}"
-    );
-    // The equivalent f32-operand matmul (no cast) is a different request (the serial kernel), so the two
-    // never share a plan key: the tensor-core request exists only for bf16 operands.
-    let choice_f32 = matmul_choice(&gf, gfx1151);
-    assert!(
-        !is_tensor_core(&choice_f32),
-        "the f32-operand matmul must not be the WMMA request: {choice_f32:?}"
-    );
-    let plan_key = |g: &Graph| {
-        let eqn = g
-            .eqns()
-            .iter()
-            .find(|e| matches!(e.op, OpKind::MatMul { .. }))
-            .unwrap();
-        into_plain(planned_with_choice(g, eqn, gfx1151).unwrap().0)
-            .key()
-            .to_string()
-    };
-    assert_ne!(
-        plan_key(&gm),
-        plan_key(&gf),
-        "bf16-operand and f32-operand plan keys must differ"
-    );
-}
-
-#[test]
-fn tensorcore_amdgcn_not_selected_for_non_rdna3() {
-    // Backend::AmdGcn(gfx942) = CDNA3/CdnaMfma: no WMMA, must not take the tc path.
-    let g = matmul_graph(16, 32, 16, GDt::BF16);
-    let cdna = AmdArch::new("gfx942", 64);
-    assert_eq!(
-        cdna.tensor_core,
-        TensorCoreSupport::CdnaMfma,
-        "sanity: gfx942 = CDNA"
-    );
-    let choice = matmul_choice(&g, Backend::AmdGcn(cdna));
-    assert!(
-        !is_tensor_core(&choice),
-        "gfx942 (CdnaMfma) must not take the RDNA3 WMMA path: got {choice:?}"
-    );
-}
-
-#[test]
-fn mixed_dtype_matmul_rejected_when_no_tensor_core_arm_fires() {
-    // A mixed matmul (bf16 operands, f32 output; `to_mixed_bf16`'s shape) on an AMD arch without RDNA3
-    // WMMA (CDNA gfx942, RDNA4) would fall to the serial fallback planned at Ty::F32: an f32 kernel
-    // reading 2-byte bf16 operand buffers as f32 words (silent garbage), under a cache key colliding with
-    // the f32 matmul. The planner must reject the mix by name on every route where
-    // no tensor-core arm fires.
-    let gm = mixed_matmul_graph(GDt::BF16);
-    let cdna = AmdArch::new("gfx942", 64);
-    let r = try_matmul_plan(&gm, Backend::AmdGcn(cdna));
-    assert!(
-        matches!(&r, Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering),
-        "mixed bf16->f32 matmul on CDNA must be rejected, not silently planned at f32: got {r:?}"
-    );
-    // SPIR-V has no tensor-core arm either: same rejection.
-    let r = try_matmul_plan(&gm, Backend::SpirvVulkan);
-    assert!(
-        matches!(&r, Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering),
-        "mixed bf16->f32 matmul on SPIR-V must be rejected: got {r:?}"
-    );
-    // The tensor-core arms are unaffected: RDNA3 and NVPTX still plan the WMMA kernel.
-    assert!(is_tensor_core(&matmul_choice(
-        &gm,
-        Backend::AmdGcn(AmdArch::gfx1151())
-    )));
-    assert!(is_tensor_core(&matmul_choice(&gm, Backend::Nvptx)));
 }
 
 // --- card 235: the decode-time mixed-operand-dtype MatMul widen-cast pass ---
@@ -2990,9 +2788,8 @@ fn mixed_operand_matmul_graph(m: usize, k: usize, n: usize) -> Graph {
 
 #[test]
 fn widen_inserts_cast_for_decode_shaped_mixed_matmul() {
-    // Card 235: decode is always M=1, so `mm.is_multiple_of(16)` fails and neither the amd_tc nor the tc
-    // arm can fire, regardless of N/K alignment. Without the widen pass every backend that is not the
-    // refused decode projection (NVPTX, and any other shape) rejects this graph.
+    // Card 235: every matmul body reads one element type, so without the widen pass every backend that is not
+    // the refused decode projection (NVPTX, and any other shape) rejects this graph.
     let g = mixed_operand_matmul_graph(1, 32, 16);
     // NVPTX has no refused column Gemv (PTX has its own prepare rule), so it still needs the widening Cast.
     let backend = Backend::Nvptx;
@@ -3060,28 +2857,28 @@ fn widen_inserts_cast_for_decode_shaped_mixed_matmul() {
     }
 }
 
+/// A 16-aligned mixed matmul (bf16 operands, f32 output) gains a widening `Cast` on each operand on every backend
+/// and then plans the register-tiled GEMM: no backend reads the narrow pair directly. Mutation: skip the widening
+/// of a 16-aligned matmul in `widen_mismatched_matmul_dtypes`; no cast is added and the row goes red.
 #[test]
-fn widen_is_noop_when_tensor_core_arm_fires() {
-    // A 16-aligned, no-batch-dims mixed matmul (bf16 operands -> f32 output, `to_mixed_bf16`'s shape)
-    // takes the amd_tc/tc arm directly. The widen pass must leave it untouched (no Cast, operands stay
-    // bf16) so `matmul_tensorcore`'s bf16 fragment loads see bf16 buffers and the `matmul:tc:` key is unchanged.
+fn widen_casts_an_aligned_mixed_matmul_onto_the_tiled_gemm() {
     let gm = mixed_matmul_graph(GDt::BF16);
-    for backend in [Backend::AmdGcn(AmdArch::gfx1151()), Backend::Nvptx] {
+    for backend in [
+        Backend::SpirvVulkan,
+        Backend::Nvptx,
+        Backend::AmdGcn(AmdArch::gfx1151()),
+    ] {
         let gw = widen_mismatched_matmul_dtypes(&gm, &default_caps_for(backend)).unwrap();
-        assert_eq!(
-            gw.eqns().len(),
-            gm.eqns().len(),
-            "no eqns should be added when the tensor-core arm already fires on {backend:?}"
-        );
+        let casts = gw
+            .eqns()
+            .iter()
+            .filter(|e| matches!(e.op, OpKind::Cast { to: GDt::F32 }))
+            .count();
+        assert_eq!(casts, 2, "both bf16 operands are widened on {backend:?}");
+        let choice = matmul_choice(&gw, backend);
         assert!(
-            !gw.eqns()
-                .iter()
-                .any(|e| matches!(e.op, OpKind::Cast { .. })),
-            "no cast should be inserted when the tensor-core arm already fires on {backend:?}"
-        );
-        assert!(
-            is_tensor_core(&matmul_choice(&gw, backend)),
-            "tensor-core-eligible matmul should still take the tc arm after widen on {backend:?}"
+            kn_tiled(&choice).is_some(),
+            "the widened matmul takes the register-tiled GEMM on {backend:?}: got {choice:?}"
         );
     }
 }
@@ -3105,7 +2902,7 @@ fn widen_preserves_cpu_oracle_numerics() {
     // bf16 before it enters the graph). `poot_eval`'s `Cast{to: F32}` is the identity on f32-resident data
     // and `MatMul`'s eval rounds only by output dtype, so the CPU oracle is unaffected by widening: the
     // pass changes what `plan_eqn` accepts, not what the graph computes.
-    let (m, k, n) = (1, 37, 41); // deliberately non-16-aligned: decode-realistic, not tensor-core-shaped
+    let (m, k, n) = (1, 37, 41); // deliberately non-16-aligned: decode-realistic
     let g = mixed_operand_matmul_graph(m, k, n);
 
     let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.037).sin() * 3.0).collect();
@@ -3211,16 +3008,30 @@ fn cast_arm_matches_dtype_pairs_exhaustively() {
             (GDt::F32, GDt::F16) => CastSpec::F32ToF16 { numel: 8 },
             _ => CastSpec::F16ToF32 { numel: 8 },
         };
-        match cast_planned(in_dt, to, Backend::SpirvVulkan) {
-            Ok((
-                compute_plan,
-                KernelChoice::Generated(KernelRequest::Elementwise(ElementwiseSpec::Cast(got))),
-            )) if is_plain(&compute_plan) => {
+        // The native bf16 body has no SPIR-V type to store into (see below), so the bf16 pair is checked
+        // where the device has two-byte lanes.
+        let backend = if to == GDt::BF16 {
+            Backend::Nvptx
+        } else {
+            Backend::SpirvVulkan
+        };
+        match cast_planned(in_dt, to, backend) {
+            Ok((compute_plan, KernelChoice::Generated(KernelRequest::Cast(got))))
+                if is_plain(&compute_plan) =>
+            {
                 assert_eq!(format!("{got:?}"), format!("{want:?}"), "{in_dt:?}->{to:?}")
             }
             other => panic!("cast {in_dt:?}->{to:?} should plan a Compute kernel: {other:?}"),
         }
     }
+    // POOT-1395: SPIR-V has no bf16 type, so a native bf16 cast body (an f32 narrowed into, or a computed
+    // bf16 widened out of, a bf16 buffer) cannot be generated there; both are refused by name at planning
+    // instead of failing in code generation.
+    let r = cast_plan(GDt::F32, GDt::BF16, Backend::SpirvVulkan);
+    assert!(
+        matches!(&r, Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering),
+        "cast f32->bf16 on SPIR-V must be refused by name: got {r:?}"
+    );
     // Card 1011: a BF16 const read only by this cast is stored as packed `u32` lanes on every backend, so the
     // cast plans the imported packed body there. A BF16 computed value is the native two-byte cast.
     for backend in [
@@ -3254,13 +3065,14 @@ fn cast_arm_matches_dtype_pairs_exhaustively() {
             .find(|e| matches!(e.op, OpKind::Cast { .. }))
             .unwrap();
         match planned_with_choice(&g, eqn, Backend::Nvptx) {
-            Ok((
-                compute_plan,
-                KernelChoice::Generated(KernelRequest::Elementwise(ElementwiseSpec::Cast(got))),
-            )) if is_plain(&compute_plan) => assert_eq!(
-                format!("{got:?}"),
-                format!("{:?}", CastSpec::Bf16ToF32 { numel: 8 })
-            ),
+            Ok((compute_plan, KernelChoice::Generated(KernelRequest::Cast(got))))
+                if is_plain(&compute_plan) =>
+            {
+                assert_eq!(
+                    format!("{got:?}"),
+                    format!("{:?}", CastSpec::Bf16ToF32 { numel: 8 })
+                )
+            }
             other => panic!("a computed BF16 cast should plan the native cast: {other:?}"),
         }
     }
@@ -3353,9 +3165,7 @@ fn cast_i32_to_f32_plans_an_i32_in_f32_out_kernel() {
     assert!(
         matches!(
             &choice,
-            KernelChoice::Generated(KernelRequest::Elementwise(ElementwiseSpec::Cast(
-                CastSpec::I32ToF32 { numel: 8 }
-            )))
+            KernelChoice::Generated(KernelRequest::Cast(CastSpec::I32ToF32 { numel: 8 }))
         ),
         "{choice:?}"
     );
@@ -3444,16 +3254,17 @@ fn f16_matmul_bridges_to_ty_f16_not_f32() {
 #[test]
 fn f32_matmul_request_is_the_f32_serial_kernel_after_f16_dtype_added() {
     // SC-003: adding DType::F16 (and its `fty` arm) must not change the request an existing F32 matmul
-    // plans. A rank-3 weight on AmdGcn steers past every fast path (decode-GEMV and the generated tiled
-    // GEMM need a rank-2 weight; the imported batched-tiled GEMM is SpirvVulkan/Nvptx-only for a plain
-    // MatMul) to the naive serial fallback.
+    // plans. A batched `[2, 1, 32] @ [2, 32, 16]` steers past every fast path (decode-GEMV needs a rank-2
+    // weight, the attention GEMV a Transpose-producer-free operand pair, the generated tiled GEMMs `M > 1`)
+    // to the naive serial fallback; the Transpose on the weight rules out the attention GEMV.
     let b = Builder::for_tests();
     let x = b
-        .constant("x", TensorType::new(vec![2, 32, 32], GDt::F32))
+        .constant("x", TensorType::new(vec![2, 1, 32], GDt::F32))
         .unwrap();
-    let w = b
-        .constant("w", TensorType::new(vec![2, 32, 16], GDt::F32))
+    let wt = b
+        .constant("wt", TensorType::new(vec![2, 16, 32], GDt::F32))
         .unwrap();
+    let w = b.transpose(wt, vec![0, 2, 1]).unwrap();
     let out = b.matmul(x, w).unwrap();
     let g = b.finish(out).unwrap();
     let program = compiled(&g, Backend::AmdGcn(AmdArch::gfx1151()));
@@ -3508,8 +3319,8 @@ fn f16_non_wired_op_rejected_with_diagnostic() {
 }
 
 /// Card 557: the contraction choice (`is_tileable_matmul_in`) takes the generated tiled GEMM only for
-/// an M>1 matmul over F32 operands and a rank-2 weight, on every backend. A BF16 matmul must reach the
-/// WMMA / tensor-core arms, and an F16 one the dtype-generic serial kernel (the generated body is
+/// an M>1 matmul over F32 operands and a rank-2 weight, on every backend. A BF16 or F16 matmul takes the
+/// dtype-generic serial kernel (the generated body is
 /// f32-only; spec 135 FR-012). Mutation: drop the F32-operand clause from `is_tileable_matmul_in`; the
 /// BF16 and F16 rows plan the tiled GEMM and this row goes red.
 #[test]
@@ -3539,10 +3350,11 @@ fn only_an_f32_m_gt_1_matmul_takes_the_tiled_gemm() {
             },
             &HashMap::new(),
             &crate::test_support::roomy_body_limits(),
+            None,
         )
         .unwrap_or_else(|e| panic!("{backend:?} {dtype:?} M={m}: {e:?}"));
         assert_eq!(
-            is_tiled_region(&planned.choice),
+            is_kn_tiled(&planned.choice),
             tiled,
             "{backend:?} {dtype:?} M={m}: {:?}",
             planned.choice
@@ -3551,7 +3363,7 @@ fn only_an_f32_m_gt_1_matmul_takes_the_tiled_gemm() {
 }
 
 #[test]
-fn f16_matmul_never_reaches_tiled_region() {
+fn f16_matmul_never_reaches_the_tiled_gemm() {
     // FR-012: an F16 whole-graph matmul with M>1 (the tiled-GEMM shape) must not take the f32-only
     // generated tiled GEMM (`is_tileable_matmul_in`, the contraction choice); that kernel reads all
     // buffers as f32, so an F16 operand would be read as 4-byte f32 over 2-byte storage (a fault). M=32
@@ -3571,14 +3383,13 @@ fn f16_matmul_never_reaches_tiled_region() {
         },
         &HashMap::new(),
         &crate::test_support::roomy_body_limits(),
+        None,
     )
     .expect("the F16 matmul plans");
     assert!(
         !matches!(
             planned.choice,
-            KernelChoice::Generated(KernelRequest::Contraction(
-                ContractionSpec::TiledRegion { .. }
-            ))
+            KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(_)))
         ),
         "an F16 M>1 matmul must never take the f32-only generated tiled GEMM: {:?}",
         planned.choice
@@ -3593,194 +3404,6 @@ fn f16_matmul_never_reaches_tiled_region() {
             pointee: Box::new(Ty::Slice(Box::new(Ty::F16))),
         },
         "the M>1 F16 matmul must still bridge to Ty::F16 via the serial fallback: got {ty:?}"
-    );
-}
-
-/// Card 154 end-to-end: trace a small F16-in/F32-out matmul graph, plan it through the SpirvVulkan
-/// coopmat selection arm, emit it via `poot_codegen`, and confirm the SPIR-V (after `fix_coopmat_calls`,
-/// wired into `compile()`) is `spirv-val`-clean, through the real graph-trace -> plan -> emit pipeline.
-/// Skips if `llc`/`spirv-val` are absent, like every other real-toolchain test in this workspace.
-///
-/// Card 525 SC-001 / R469-003: the grid assertion below closes the drift the pre-card-525
-/// `dispatch_grid` had (no coopmat arm, so it fell through to the generic `out_numel` default).
-/// MUTATION (recorded here, never left in the tree): in `planner/matmul.rs`'s `coopmat` arm, `grid:
-/// [(num_tiles * 32) as u32, 1, 1]` was changed to `grid: [out_numel as u32, 1, 1]` (the pre-card-525
-/// value). Rerunning this test then panicked: `assertion `left == right` failed: planned grid must
-/// be num_tiles*32 (1 tile here), not the generic out_numel default (256) left: [256, 1, 1] right:
-/// [32, 1, 1]`. Restoring the real formula made it green again.
-#[test]
-fn coopmat_matmul_traces_plans_and_validates() {
-    // 16x16x16: F16 operands, F32 output (the only shape/dtype combination
-    // `matmul_spirv_coopmat_eligible` accepts, see its doc).
-    let g = mixed_matmul_graph_shape(16, 16, 16, GDt::F16);
-    let eqn = g
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
-        .expect("a matmul eqn");
-    let (plan, choice) = planned_with_choice(&g, eqn, Backend::SpirvVulkan)
-        .expect("a 16x16x16 f16-in/f32-out matmul must plan on SpirvVulkan");
-    let Dispatch {
-        body,
-        launch: Launch { grid, .. },
-        ..
-    } = into_plain(plan);
-    assert!(
-        matches!(contraction(&choice), Some(ContractionSpec::Coopmat { .. })),
-        "expected the coopmat arm to fire: got {choice:?}"
-    );
-    // card 525 R469-003: `matmul_tensorcore_coopmat` bakes one 32-lane subgroup per 16x16 output tile
-    // (`body.workgroup_size == [32,1,1]`, `block = global_thread_id / 32`); at 16x16 output that is
-    // exactly 1 tile, so the plan's own grid must be [32,1,1] threads, not out_numel (16*16 = 256) -
-    // the wrong value the pre-card-525 `dispatch_grid` fell through to (no coopmat arm).
-    assert_eq!(
-        body.workgroup_size,
-        [32, 1, 1],
-        "the coopmat body's baked workgroup size must stay one subgroup"
-    );
-    assert_eq!(
-        grid,
-        [32, 1, 1],
-        "planned grid must be num_tiles*32 (1 tile here), not the generic out_numel default (256)"
-    );
-
-    fn have(bin: &str) -> bool {
-        std::process::Command::new(bin)
-            .arg("--version")
-            .output()
-            .is_ok()
-    }
-    if !have("llc") || !have("spirv-val") {
-        eprintln!("llc/spirv-val not on PATH; skipping coopmat graph-plan round-trip validation");
-        return;
-    }
-    let dir = std::env::temp_dir().join("poot-graph-plan-coopmat-test");
-    std::fs::create_dir_all(&dir).unwrap();
-    let out =
-        poot_codegen::artifact_path(&dir, "coopmat_matmul", poot_codegen::Target::SpirvVulkan);
-    poot_codegen::compile(&body, poot_codegen::Target::SpirvVulkan, &out)
-        .expect("the planned coopmat body must compile");
-    let v = std::process::Command::new("spirv-val")
-        .args(["--target-env", "vulkan1.3"])
-        .arg(&out)
-        .output()
-        .unwrap();
-    assert!(
-        v.status.success(),
-        "spirv-val failed on the planned coopmat matmul:\n{}",
-        String::from_utf8_lossy(&v.stderr)
-    );
-}
-
-/// Card 525: the NVPTX `tc` arm's grid dropped the batch factor.
-/// `matmul_nvptx_tc_eligible` deliberately allows batch dims ("batch dims are fine on NVPTX, unlike
-/// the AMD arm"), and `kg::matmul_tensorcore` (wmma.rs) launches one 256-thread block per
-/// `batch_count * tiles_m * tiles_n`, decoding `bidx = tid/256`. A `[2,16,16] @ [16,16] -> [2,16,16]`
-/// bf16 matmul is 1 tile (16x16) per batch element, so the plan must launch `2*1*256 = 512` threads,
-/// not the pre-fix `256` (which dispatches only batch 0; batch 1's output buffer would keep its
-/// stale/zero contents on a real device).
-///
-/// MUTATION (recorded here, never left in the tree): in `planner/matmul.rs`'s `tc` arm, `grid:
-/// [(batch_dims_product * num_tiles * 256) as u32, 1, 1]` was changed to `grid: [(num_tiles * 256) as
-/// u32, 1, 1]` (dropping the batch factor, the pre-fix bug). Rerunning this test then panicked:
-/// `assertion `left == right` failed: planned grid must include the batch factor (2 batches * 1 tile *
-/// 256 threads) left: [256, 1, 1] right: [512, 1, 1]`. Restoring the real formula made it green again.
-#[test]
-fn nvptx_tc_batched_bf16_matmul_grid_includes_batch_factor() {
-    let g = batched_matmul_graph(2, 16, 16, 16, GDt::BF16);
-    let eqn = g
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
-        .expect("a matmul eqn");
-    let (plan, choice) = planned_with_choice(&g, eqn, Backend::Nvptx)
-        .expect("a batched 16x16x16 bf16 matmul must plan on Nvptx");
-    let grid = into_plain(plan).launch().grid;
-    assert!(
-        is_tensor_core(&choice),
-        "expected the NVPTX tc arm to fire: got {choice:?}"
-    );
-    assert_eq!(
-        grid,
-        [512, 1, 1],
-        "planned grid must include the batch factor (2 batches * 1 tile * 256 threads)"
-    );
-}
-
-/// `mixed_batched_matmul_graph` (the F32-accumulate shape every tensor-core arm admits), planned for `backend`: the
-/// plan and its kernel choice.
-fn mixed_batched_matmul_plan(
-    batch: usize,
-    (m, k, n): (usize, usize, usize),
-    operand: GDt,
-    backend: Backend,
-) -> Result<(Plan, KernelChoice), PlanError> {
-    let g = mixed_batched_matmul_graph(batch, m, k, n, operand);
-    let eqn = g
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
-        .expect("a matmul eqn");
-    planned_with_choice(&g, eqn, backend)
-}
-
-/// Card 663 SC-001/SC-003, planner side: the cooperative-matrix arm admits a multi-block (`K = 48`) batched
-/// (`[2, 32, 48] @ [48, 32]`) matmul, launching one subgroup per output tile of every batch element
-/// (`2 * 2 * 2 = 8` tiles of 32 lanes); a ragged `K` (not a multiple of 16) is not eligible, is not padded, and
-/// refuses the mixed-dtype lowering (the f16-in/f32-out shape has no other kernel).
-///
-/// Mutation: restore the single K tile in `matmul_spirv_coopmat_eligible` (`k == 16`); the multi-block shape
-/// stops selecting the coopmat arm and the first assertion goes red.
-#[test]
-fn coopmat_arm_admits_multi_block_batched_shapes_and_refuses_a_ragged_k() {
-    let (plan, choice) = mixed_batched_matmul_plan(2, (32, 48, 32), GDt::F16, Backend::SpirvVulkan)
-        .expect("a 16-aligned batched f16-in/f32-out matmul plans on SpirvVulkan");
-    assert!(
-        matches!(contraction(&choice), Some(ContractionSpec::Coopmat { .. })),
-        "expected the coopmat arm for K = 48: got {choice:?}"
-    );
-    assert_eq!(
-        into_plain(plan).launch().grid,
-        [8 * 32, 1, 1],
-        "one 32-lane subgroup per output tile of every batch element"
-    );
-    let ragged = mixed_batched_matmul_plan(2, (32, 40, 32), GDt::F16, Backend::SpirvVulkan);
-    assert!(
-        matches!(&ragged, Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering),
-        "a ragged K must refuse rather than pad: got {ragged:?}"
-    );
-}
-
-/// Card 663 SC-001, planner side for the AMD arm: a batched multi-block bf16 matmul on gfx1151 selects the WMMA
-/// tensor-core kernel (it used to fall to the serial kernel for any batch dim) and launches one 256-thread block per
-/// output tile of every batch element.
-///
-/// Mutation: restore the single-batch requirement in `matmul_amd_tc_eligible`; the choice is no longer the
-/// tensor-core kernel and the row goes red.
-#[test]
-fn amd_tensor_core_arm_admits_multi_block_batched_shapes() {
-    let (plan, choice) = mixed_batched_matmul_plan(
-        2,
-        (32, 48, 32),
-        GDt::BF16,
-        Backend::AmdGcn(AmdArch::gfx1151()),
-    )
-    .expect("a 16-aligned batched bf16-in/f32-out matmul plans on gfx1151");
-    assert!(
-        is_tensor_core(&choice),
-        "expected the WMMA tensor-core arm for a batched K = 48: got {choice:?}"
-    );
-    assert_eq!(into_plain(plan).launch().grid, [8 * 256, 1, 1]);
-}
-
-#[test]
-fn tensorcore_not_selected_for_spirv() {
-    // SpirvVulkan + bf16 + 16-aligned -> the serial path (WMMA is not wgpu).
-    let g = matmul_graph(16, 32, 16, GDt::BF16);
-    let choice = matmul_choice(&g, Backend::SpirvVulkan);
-    assert!(
-        !is_tensor_core(&choice),
-        "SpirvVulkan must never select the tc path: got {choice:?}"
     );
 }
 
@@ -3803,20 +3426,31 @@ fn compiled_matmul(program: &Program) -> (&Plan, &KernelChoice) {
     (plan, program.kernel_choice(eqn))
 }
 
-fn is_tiled_region(choice: &KernelChoice) -> bool {
-    matches!(
-        choice,
-        KernelChoice::Generated(KernelRequest::Contraction(
-            ContractionSpec::TiledRegion { .. }
-        ))
-    )
+/// The register-tiled GEMM over an f32 `[K, N]` weight, if `choice` is one.
+fn kn_tiled(choice: &KernelChoice) -> Option<&DenseTiledContraction> {
+    match contraction(choice) {
+        Some(ContractionSpec::DenseTiled(spec)) if spec.weight == DenseTiledWeight::KnF32 => {
+            Some(spec)
+        }
+        _ => None,
+    }
+}
+
+fn is_kn_tiled(choice: &KernelChoice) -> bool {
+    kn_tiled(choice).is_some()
+}
+
+/// `g` compiled for `backend` on `caps` through the full pipeline.
+fn compiled_on(g: &Graph, backend: Backend, caps: DeviceCaps) -> Program {
+    let options = CompileOptions::new(crate::CompileLimits::STANDARD);
+    compile(g, &Target::Gpu { backend, caps }, &options).expect("the matmul compiles")
 }
 
 #[test]
 fn tiled_matmul_gets_the_tiled_grid_not_the_naive_fallthrough() {
-    // Card 099b: the generated tiled GEMM (the contraction choice for an M>1 F32 shared-weight
-    // MatMul, Card 557) gets the tiled-GEMM launch grid (`groups * tile^2` threads, the tile edge `caps.gemm_launch` names), not the
-    // one-thread-per-output default (a ~2x over-launch).
+    // Card 099b: the generated tiled GEMM (the contraction choice for an M>1 F32 shared-weight MatMul, Card 557)
+    // gets its schedule's launch grid (`tiles * lanes^2` threads, `Schedule::grid_threads`), not the
+    // one-thread-per-output default.
     let (m, k, n) = (64usize, 32usize, 48usize);
     let g = matmul_graph(m, k, n, GDt::F32);
     let out_numel = m * n;
@@ -3824,19 +3458,15 @@ fn tiled_matmul_gets_the_tiled_grid_not_the_naive_fallthrough() {
     let program = compiled(&g, Backend::SpirvVulkan);
     let (plan, choice) = compiled_matmul(&program);
     assert!(
-        is_tiled_region(choice),
+        is_kn_tiled(choice),
         "the compile chooses the tiled GEMM: {choice:?}"
     );
-    let tiled = plain(plan).launch().grid;
-
-    let tile = default_caps_for(Backend::SpirvVulkan)
-        .gemm_launch()
-        .tile_edge as usize;
-    let groups = m.div_ceil(2 * tile) * n.div_ceil(tile);
+    let tiled = with_meta(plan).launch().grid;
+    let schedule = kn_tiled(choice).expect("the tiled GEMM").schedule;
     assert_eq!(
         tiled,
-        [(groups * tile * tile) as u32, 1, 1],
-        "the generated tiled GEMM must get the tiled-GEMM grid"
+        [schedule.grid_threads(1, m, n) as u32, 1, 1],
+        "the generated tiled GEMM must get its schedule's grid"
     );
     assert_ne!(
         tiled,
@@ -3845,81 +3475,83 @@ fn tiled_matmul_gets_the_tiled_grid_not_the_naive_fallthrough() {
     );
 }
 
-/// The generated tiled GEMM over the RADV tile ceiling (card 096) splits into sub-cap dispatches whose grids
-/// are `groups * tile^2` threads each and whose groups sum to the whole tile range. Mutation: build a
-/// split dispatch's grid as `groups + workgroup` instead of `groups * workgroup`; the grid assertion goes red.
+/// The generated tiled GEMM over the RADV tile ceiling (card 096) splits into sub-cap dispatches over contiguous
+/// tile ranges, each launching whole workgroups of its schedule's lanes, whose tiles sum to the whole range. The
+/// ceiling is shrunk to 100 so a modest shape crosses it, and the watchdog budget removed so the ceiling is the
+/// only bound. Mutation: in `register_tiled_launch`, drop the `tiled_gemm_max_workgroups` bound; the plan is one
+/// dispatch and this row goes red.
 #[test]
 fn a_tiled_gemm_over_the_tile_ceiling_splits_into_disjoint_launches() {
     let (m, k, n) = (4096usize, 8usize, 4096usize);
+    let ceiling = 100usize;
+    let base = default_caps_for(Backend::SpirvVulkan);
+    let caps = DeviceCaps {
+        watchdog_budget: None,
+        known_miscompiles: poot_target::KnownMiscompiles {
+            tiled_gemm_max_workgroups: Some(ceiling as u32),
+        },
+        ..base
+    };
     let g = matmul_graph(m, k, n, GDt::F32);
-    let program = compiled(&g, Backend::SpirvVulkan);
+    let program = compiled_on(&g, Backend::SpirvVulkan, caps);
     let (plan, choice) = compiled_matmul(&program);
-    assert!(
-        is_tiled_region(choice),
-        "the compile chooses the tiled GEMM: {choice:?}"
-    );
-    let ceiling = default_caps_for(Backend::SpirvVulkan)
-        .known_miscompiles
-        .tiled_gemm_max_workgroups
-        .expect("wgpu on RADV has a tile ceiling") as usize;
-    let tile = default_caps_for(Backend::SpirvVulkan)
-        .gemm_launch()
-        .tile_edge as usize;
-    let groups = m.div_ceil(2 * tile) * n.div_ceil(tile);
-    assert!(groups >= ceiling, "the fixture must reach the ceiling");
+    let schedule = kn_tiled(choice)
+        .expect("the compile chooses the tiled GEMM")
+        .schedule;
+    let (tile_rows, tile_cols) = schedule.output_tile().expect("a tiled schedule");
+    let tiles = m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
+    assert!(tiles >= ceiling, "the fixture must reach the ceiling");
     let dispatches = plan.dispatches();
     assert!(dispatches.len() > 1, "{plan:?}");
-    let lanes = tile * tile;
     let mut covered = 0usize;
     for dispatch in dispatches {
         let launch = dispatch.launch();
-        let chunk_groups = launch.grid[0] as usize / lanes;
+        let lanes = dispatch.body().workgroup_size[0] as usize;
+        let chunk = launch.grid[0] as usize / lanes;
         assert_eq!(
             launch.grid,
-            [(chunk_groups * lanes) as u32, 1, 1],
+            [(chunk * lanes) as u32, 1, 1],
             "a split dispatch launches whole tile workgroups"
         );
-        assert!(
-            chunk_groups < ceiling,
-            "each launch stays under the ceiling"
-        );
-        covered += chunk_groups;
+        assert!(chunk < ceiling, "each launch stays under the ceiling");
+        assert_eq!(launch.meta[4] as usize, covered, "contiguous tile ranges");
+        covered += chunk;
     }
-    assert_eq!(covered, groups, "the launches tile the whole output");
+    assert_eq!(covered, tiles, "the launches tile the whole output");
 }
 
-/// Card 557: the generated tiled GEMM owns its launch (`tile^2`-lane workgroups, `caps.gemm_launch.tile_edge` a side), and the op alone no longer says so: `finalize` reads the recorded choice. On AMDGCN (where
-/// the imported tiled GEMM, and so `is_tiled_gemm_in`, does not apply) a MatMul whose output is past the
-/// grid cap at one tile of lanes must keep its tile-wide workgroups. Mutation: drop the choice from `finalize`'s
-/// custom-grid test; the wg-bump widens the body to 256 lanes and this row goes red.
+/// Card 557: the generated tiled GEMM owns its launch (workgroups of its schedule's `lanes^2` lanes), and the op
+/// alone no longer says so: `finalize` reads the recorded choice. A MatMul whose output is past the grid cap at
+/// one workgroup of lanes per tile must keep its schedule-wide workgroups. Mutation: drop the choice from
+/// `finalize`'s custom-grid test; the wg-bump widens the body to 256 lanes and this row goes red.
 #[test]
 fn a_large_tiled_matmul_keeps_its_tile_workgroup_on_amdgcn() {
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
-    let caps = default_caps_for(backend);
+    // A 65 535-wide X grid (the HSA fixture's is `u32::MAX`, past any `u32` thread count): the output below is
+    // past it at 64 threads per workgroup, where the generic bump would widen a one-thread-per-output body.
+    let caps = DeviceCaps {
+        max_grid: [65_535, 65_535, 65_535],
+        ..default_caps_for(backend)
+    };
     let (k, n) = (8usize, 2048usize);
-    let tile = caps.gemm_launch().tile_edge as usize;
-    let m = (caps.max_grid[0] as usize * tile * tile).div_ceil(n) + 1;
+    let m = (caps.max_grid[0] as usize * 64).div_ceil(n) + 1;
     let g = matmul_graph(m, k, n, GDt::F32);
-    let program = compiled(&g, backend);
+    let program = compiled_on(&g, backend, caps);
     let (plan, choice) = compiled_matmul(&program);
-    let bodies: Vec<&Body> = plan
-        .dispatches()
-        .iter()
-        .map(|dispatch| dispatch.body())
-        .collect();
+    let Some(Schedule::RegisterTiled { lanes, .. }) = kn_tiled(choice).map(|spec| spec.schedule)
+    else {
+        panic!("an M>1 F32 matmul takes the generated tiled GEMM: {choice:?}");
+    };
+    let lanes = lanes.get() as usize;
     assert!(
-        !bodies.is_empty(),
+        !plan.dispatches().is_empty(),
         "the tiled GEMM plans a dispatch: {plan:?}"
     );
-    assert!(
-        is_tiled_region(choice),
-        "an M>1 F32 matmul takes the generated tiled GEMM: {choice:?}"
-    );
-    for body in bodies {
+    for dispatch in plan.dispatches() {
         assert_eq!(
-            body.workgroup_size[0] as usize,
-            tile * tile,
-            "the tiled GEMM's workgroup must stay one tile wide"
+            dispatch.body().workgroup_size[0] as usize,
+            lanes * lanes,
+            "the tiled GEMM's workgroup must stay its lane grid"
         );
     }
 }
@@ -3940,11 +3572,6 @@ const LAUNCH_PROVENANCE: &[Provenance] = &[
         "GEMV_WIDTH",
         128,
         "measured: Qwen2.5-0.5B decode on RADV STRIX_HALO, fused ms/tok w=32 50.9, w=64 53.7, w=128 39.8, w=256 45.6",
-    ),
-    prov(
-        "GEMV_TILE",
-        32,
-        "structural: one wave32's contiguous W[k, col0..col0+32] run; baked into the imported coalesced Gemv body",
     ),
     prov(
         "DENSE_GEMV_WIDTH",
@@ -3973,11 +3600,6 @@ const LAUNCH_PROVENANCE: &[Provenance] = &[
         "structural: the portable Vulkan workgroup maximum; a folded body derives its index from this width",
     ),
     prov(
-        "IMPORTED_TILED_GEMM_TILE",
-        8,
-        "structural: the edge the shipped imported tiled-GEMM bodies bake (card 044); not a launch choice",
-    ),
-    prov(
         "SCATTER_UPDATE_WG",
         64,
         "structural: a generated scatter body's default workgroup width",
@@ -3991,6 +3613,11 @@ const LAUNCH_PROVENANCE: &[Provenance] = &[
         "MAX_LANES",
         64,
         "design bound, not swept: more lanes only lengthen the serial per-lane combine",
+    ),
+    prov(
+        "SELECTED_SLICES",
+        2,
+        "measured (POOT-1338, RTX PRO 6000, one prefill chunk of 1024 queries, 2052 candidates, ms): 1 slice 54.4, 2 slices 46.8; 4 and more do not fit 48 KiB of workgroup memory at 12 head lanes of 256",
     ),
     prov(
         "MAX_ATTENTION_SPLITS",
@@ -4010,7 +3637,22 @@ const LAUNCH_PROVENANCE: &[Provenance] = &[
     prov(
         "INDEXED_GEMV_MAX_ROWS",
         32,
-        "design bound, not swept: a decode step's selected experts or a few steps batched; above it the segmented Tiled schedule shares expert weight tiles",
+        "design bound, not swept: a decode step's selected experts or a few steps batched; above it the register-tiled expert walk shares expert weight tiles",
+    ),
+    prov(
+        "TILED_MAX_ROWS",
+        128,
+        "design bound, not swept: past 128 rows the query tile alone (128 x d words) exceeds a 64 KiB workgroup memory at d 128",
+    ),
+    prov(
+        "TILED_ACCUMULATORS_PER_LANE",
+        64,
+        "POOT-1402 bank sweep (Strix Halo wgpu): 40 accumulators beat 80; half of the 128-register occupancy point",
+    ),
+    prov(
+        "TILED_MAX_LANE_COLS",
+        16,
+        "design bound, not swept: a lane's columns are one register each, as wide as the widest key block it splits",
     ),
 ];
 
@@ -4027,8 +3669,7 @@ const fn prov(name: &'static str, value: u64, source: &'static str) -> Provenanc
 /// `LAUNCH_PROVENANCE` with the same value and a stated source, and every entry names a `const` that exists.
 /// The test reads the file's own source, so a literal added without an entry cannot pass. It covers every
 /// numeric `const` item; the inline arithmetic that remains is structural, not a launch choice: `4 * (..)` and
-/// `2 * lanes` in `attention_lanes` (bytes per f32 and the online-softmax `m`, `l` scalars) and the `2 *` rows per
-/// workgroup of the imported tiled-GEMM bodies. The register-tiled lane figures live in `poot-target`'s own
+/// `2 * lanes` in `attention_lanes` (bytes per f32 and the online-softmax `m`, `l` scalars). The register-tiled lane figures live in `poot-target`'s own
 /// table. Mutation: add
 /// `const UNSOURCED_LAUNCH: usize = 7;` to `predicates.rs`; this goes red naming it.
 #[test]
@@ -4070,10 +3711,14 @@ fn every_launch_literal_has_provenance() {
     }
 }
 
-/// The `Tiled` edge a routed (indexed) contraction over `rows > INDEXED_GEMV_MAX_ROWS` rows plans on `backend`
-/// with `caps`, for the dense f32-stack form (`packed == false`) and the packed-stack form.
-fn indexed_tile_edge(backend: Backend, caps: &DeviceCaps, packed: bool) -> u32 {
-    let (rows, k, n, experts) = (64usize, 64usize, 32usize, 2usize);
+/// The routed (indexed) contraction shape the lane-grid rows plan: past the decode Gemv's rows and large enough to
+/// fill a device many times over, two experts.
+const ROUTED: (usize, usize, usize, usize) = (4096, 256, 1024, 2);
+
+/// The register-tiled lane-grid edge a routed (indexed) contraction of [`ROUTED`]'s shape plans on `backend` with
+/// `caps`, for the dense f32-stack form (`packed == false`) and the packed-stack form.
+fn indexed_lane_edge(backend: Backend, caps: &DeviceCaps, packed: bool) -> usize {
+    let (rows, k, n, experts) = ROUTED;
     assert!(rows > crate::predicates::INDEXED_GEMV_MAX_ROWS);
     let b = Builder::for_tests();
     let x = b
@@ -4131,78 +3776,55 @@ fn indexed_tile_edge(backend: Backend, caps: &DeviceCaps, packed: bool) -> u32 {
         other => panic!("{backend:?} packed={packed}: not a routed contraction: {other:?}"),
     };
     match schedule {
-        kg::Schedule::Tiled { tile } => tile.get(),
-        other => panic!("{backend:?} packed={packed}: expected the Tiled schedule, got {other:?}"),
-    }
-}
-
-/// POOT-1233 SC-001: on a target without the RADV defect the routed M>1 tile is the calibrated edge, not the
-/// RADV 8x8: ROCm caps plan the measured 16x16, in both the dense and the packed form, and PTX caps plan whatever
-/// their (still unmeasured, portable) class names. Mutation: restore a global `8` as the tile edge in `moe.rs`
-/// and `packed_dequant.rs`; the ROCm row goes red.
-#[test]
-fn the_routed_tile_is_the_calibrated_edge_off_radv() {
-    for backend in [Backend::AmdGcn(AmdArch::gfx1151()), Backend::Nvptx] {
-        let caps = default_caps_for(backend);
-        assert!(
-            !caps.known_miscompiles.lds_stale_above_wave64,
-            "{backend:?}"
-        );
-        for packed in [false, true] {
-            let edge = indexed_tile_edge(backend, &caps, packed);
-            assert_eq!(
-                edge,
-                caps.gemm_launch().tile_edge,
-                "{backend:?} packed={packed}: the plan must launch the caps' calibrated tile"
-            );
-            if matches!(backend, Backend::AmdGcn(_)) {
-                assert_ne!(edge, 8, "{backend:?} packed={packed}: still the RADV 8x8");
-            }
+        kg::Schedule::RegisterTiled { lanes, .. } => lanes.get() as usize,
+        other => {
+            panic!(
+                "{backend:?} packed={packed}: expected the RegisterTiled schedule, got {other:?}"
+            )
         }
     }
 }
 
-/// POOT-1233 SC-002: on RADV caps the routed tile stays 8x8, because `known_miscompiles` names the
-/// LDS-visibility defect there; the same caps without that flag plan the class tile. Mutation: drop the
-/// `lds_stale_above_wave64` gate in `GemmLaunch::resolve`; the RADV row (`tile 16`) goes red.
+/// POOT-1233 SC-001, POOT-1403: the routed M>1 contraction takes the cost model's lane grid for its shape on every
+/// backend: the wide 16x16 grid on ROCm, PTX and RADV caps for a contraction that fills the device, in both the
+/// dense and the packed form (the RADV wave64 LDS defect that once kept RADV to 8x8 does not reproduce, see
+/// `REGISTER_LANE_EDGE_WIDE`'s provenance). Mutation: pin the narrow lane edge in `RegisterTiling::candidates`; the
+/// rows read 8 and go red.
 #[test]
-fn the_routed_tile_stays_8x8_where_known_miscompiles_names_the_defect() {
-    let backend = Backend::SpirvVulkan;
-    let radv = default_caps_for(backend);
-    assert!(
-        radv.known_miscompiles.lds_stale_above_wave64,
-        "the RADV fixture must carry the defect in known_miscompiles"
-    );
-    for packed in [false, true] {
-        assert_eq!(
-            indexed_tile_edge(backend, &radv, packed),
-            8,
-            "packed={packed}: RADV caps keep the 8x8 tile"
-        );
+fn the_routed_lane_grid_is_the_cost_models_on_every_backend() {
+    for backend in [
+        Backend::AmdGcn(AmdArch::gfx1151()),
+        Backend::Nvptx,
+        Backend::SpirvVulkan,
+    ] {
+        let caps = default_caps_for(backend);
+        for packed in [false, true] {
+            assert_eq!(
+                indexed_lane_edge(backend, &caps, packed),
+                16,
+                "{backend:?} packed={packed}: a device-filling routed contraction takes the wide grid"
+            );
+        }
     }
-    let hsa = default_caps_for(Backend::AmdGcn(AmdArch::gfx1151()));
-    let gated = DeviceCaps {
-        known_miscompiles: poot_target::KnownMiscompiles {
-            lds_stale_above_wave64: true,
-            ..poot_target::KnownMiscompiles::NONE
-        },
-        ..hsa
-    };
-    assert_eq!(
-        indexed_tile_edge(Backend::AmdGcn(AmdArch::gfx1151()), &gated, false),
-        8,
-        "an HSA device with the defect in known_miscompiles is gated to 8x8"
-    );
 }
 
 /// POOT-1233: a dispatch carries a planner-computed cost, apportioned over a split plan by the threads each
-/// launches, and the output element count is conserved (up to rounding). Mutation: apportion evenly instead of by
-/// grid threads; the last, smaller chunk weighs as much as a full one and this goes red.
+/// launches, and the output element count is conserved (up to rounding). The tile ceiling is shrunk to 100 so
+/// the plan splits with a short tail. Mutation: apportion evenly instead of by grid threads; the last, smaller
+/// chunk weighs as much as a full one and this goes red.
 #[test]
 fn a_split_plans_dispatches_carry_work_in_proportion_to_their_launch() {
     let (m, k, n) = (4096usize, 8usize, 4096usize);
+    let base = default_caps_for(Backend::SpirvVulkan);
+    let caps = DeviceCaps {
+        watchdog_budget: None,
+        known_miscompiles: poot_target::KnownMiscompiles {
+            tiled_gemm_max_workgroups: Some(100),
+        },
+        ..base
+    };
     let g = matmul_graph(m, k, n, GDt::F32);
-    let program = compiled(&g, Backend::SpirvVulkan);
+    let program = compiled_on(&g, Backend::SpirvVulkan, caps);
     let (plan, _) = compiled_matmul(&program);
     let dispatches = plan.dispatches();
     assert!(dispatches.len() > 1, "{plan:?}");
@@ -4984,7 +4606,7 @@ fn decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape() {
         "chunks must exactly cover the full output"
     );
 
-    // gpt-oss's scale (at/under the trigger) stays the single unchunked imported dispatch.
+    // gpt-oss's scale (at/under the trigger) stays the single unchunked dispatch of the same body.
     let (k2, n2) = (32usize, 201_088usize);
     let g2 = matmul_graph(1, k2, n2, GDt::F32);
     let eqn2 = g2
@@ -4994,23 +4616,17 @@ fn decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape() {
         .unwrap();
     match planned_with_choice(&g2, eqn2, Backend::SpirvVulkan).unwrap() {
         (compute_plan, choice) if is_plain(&compute_plan) => {
-            assert!(
-                is_imported(&choice, ImportedKernel::GemvCoalesced),
-                "{choice:?}"
-            )
+            assert!(is_decode_gemv(&choice), "{choice:?}")
         }
         other => panic!("gpt-oss-scale wgpu decode-GEMV should stay one dispatch: {other:?}"),
     }
 
-    // AmdGcn has no display watchdog: stays the single unchunked imported dispatch even at BLOOM's
+    // AmdGcn has no display watchdog: stays the single unchunked dispatch even at BLOOM's
     // large shape (chunking is SpirvVulkan-only, as in card 163).
     let amdgcn = Backend::AmdGcn(AmdArch::gfx1151());
     match planned_with_choice(&g, eqn, amdgcn).unwrap() {
         (compute_plan, choice) if is_plain(&compute_plan) => {
-            assert!(
-                is_imported(&choice, ImportedKernel::GemvCoalesced),
-                "{choice:?}"
-            )
+            assert!(is_decode_gemv(&choice), "{choice:?}")
         }
         other => panic!("AmdGcn decode-GEMV should stay one dispatch (no chunking): {other:?}"),
     }
@@ -5018,7 +4634,7 @@ fn decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape() {
 
 /// R486-013 / SC-006, POOT-1232 SC-001: the decode-GEMV is kept only below the device's measured width
 /// (`caps.decode_gemv_max_out_cols`), and the ceiling belongs to the caps, not to the backend. The NVPTX fixture
-/// carries the Ampere figure (256), so a 300-column decode projection plans the imported one-thread-per-output
+/// carries the Ampere figure (256), so a 300-column decode projection plans the one-thread-per-output
 /// fallback there; the same backend with no measured ceiling keeps the coalesced GEMV, and the SPIR-V backend
 /// with the same ceiling drops it. Mutation: hard-code the 256 ceiling instead of reading the caps field: the
 /// NVPTX row without a ceiling (N=300) loses the GEMV (`assertion failed: gemv_at(Backend::Nvptx, None, 300)`).
@@ -5037,7 +4653,7 @@ fn decode_gemv_width_ceiling_follows_the_caps_not_the_backend() {
         };
         let (_, choice) = planned_with_choice_caps(&g, eqn, backend, &caps).unwrap();
         eprintln!("{backend:?} N={n} ceiling={ceiling:?}: {choice:?}");
-        is_imported(&choice, ImportedKernel::GemvCoalesced)
+        is_decode_gemv(&choice)
     };
     // The Ampere fixture: the boundary is inclusive.
     assert!(
@@ -5103,53 +4719,6 @@ fn e4m3_storage_admission_follows_the_caps_not_the_backend() {
     assert!(plan_with(Backend::SpirvVulkan, true).is_ok());
 }
 
-/// POOT-1232 SC-001: which matmuls take a tensor-core body, and which mixed-dtype matmuls the widening pass
-/// leaves alone, is decided by the device's matrix lowering, not by its backend. A SPIR-V backend whose caps
-/// say bf16 WMMA takes the bf16 arm, an NVPTX backend whose caps say no matrix lowering does not, and a
-/// cooperative-matrix device takes f16 operands only. Mutation: make `matmul_nvptx_tc_eligible` ignore
-/// `caps.matrix_lowering`; the NVPTX-without-lowering row is eligible and the row goes red.
-#[test]
-fn tensor_core_eligibility_follows_the_matrix_lowering_not_the_backend() {
-    use crate::dtype_widen::{
-        matmul_amd_tc_eligible, matmul_nvptx_tc_eligible, matmul_spirv_coopmat_eligible,
-    };
-    use poot_target::MatrixLowering;
-    let with = |backend: Backend, matrix_lowering: MatrixLowering| DeviceCaps {
-        matrix_lowering,
-        ..default_caps_for(backend)
-    };
-    let (bf16, f16) = (GDt::BF16, GDt::F16);
-    let spirv_bf16 = with(Backend::SpirvVulkan, MatrixLowering::NvidiaWmmaBf16);
-    assert!(matmul_nvptx_tc_eligible(
-        &spirv_bf16,
-        bf16,
-        bf16,
-        32,
-        32,
-        32
-    ));
-    let nvptx_none = with(Backend::Nvptx, MatrixLowering::None);
-    assert!(!matmul_nvptx_tc_eligible(
-        &nvptx_none,
-        bf16,
-        bf16,
-        32,
-        32,
-        32
-    ));
-    let coop = with(Backend::Nvptx, MatrixLowering::CooperativeMatrixF16);
-    assert!(matmul_spirv_coopmat_eligible(&coop, f16, f16, 32, 32, 32));
-    assert!(!matmul_spirv_coopmat_eligible(
-        &coop, bf16, bf16, 32, 32, 32
-    ));
-    let amd = with(Backend::SpirvVulkan, MatrixLowering::AmdWmmaBf16);
-    assert!(matmul_amd_tc_eligible(&amd, bf16, bf16, 32, 32, 32));
-    assert!(
-        !matmul_amd_tc_eligible(&amd, bf16, bf16, 32, 32, 20),
-        "ragged K"
-    );
-}
-
 /// POOT-1232 SC-001: no planner rule compares a backend variant. Every non-test source file of the crate
 /// (predicates, the planner entry point and its family planners, the dtype rules, the kernel mapping, the packed
 /// lowering table, the multi-device topology) reads the device's caps instead, so a rule cannot be keyed on a name. Mutation:
@@ -5167,10 +4736,7 @@ fn predicates_and_planner_do_not_compare_backend_variants() {
         }
     }
     let mut files = Vec::new();
-    rust_files(
-        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut files,
-    );
+    rust_files(&poot_test_util::manifest_dir().join("src"), &mut files);
     // Test sources build backends to plan for; the rules are the subject.
     files.retain(|f| {
         !f.components().any(|c| c.as_os_str() == "tests")
@@ -5253,10 +4819,7 @@ fn decode_gemv_chunking_follows_the_caps_watchdog_trigger_not_a_fixed_constant()
     let high = caps_for(1_000_000);
     match planned_with_choice_caps(&g, eqn, Backend::SpirvVulkan, &high).unwrap() {
         (compute_plan, choice) if is_plain(&compute_plan) => {
-            assert!(
-                is_imported(&choice, ImportedKernel::GemvCoalesced),
-                "{choice:?}"
-            )
+            assert!(is_decode_gemv(&choice), "{choice:?}")
         }
         other => panic!("high watchdog trigger should stay a single dispatch: {other:?}"),
     }
@@ -5512,6 +5075,296 @@ fn attention_lanes_follow_the_device_workgroup_memory() {
         .expect("the same graph plans on the real caps");
 }
 
+/// The selected-attention equation of a Flash-Next layer at `lq` queries over `lk` stored positions (24 query
+/// heads over 2 key/value heads of 256, blocks of four, 512 selected), and what planning it chose.
+fn selected_attention_planned(
+    lq: usize,
+    backend: Backend,
+    caps: &DeviceCaps,
+) -> Result<(Plan, KernelChoice), PlanError> {
+    let lk = 8448;
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![1, 24, lq, 256]))
+        .unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, 2, lk, 256]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, 2, lk, 256]))
+        .unwrap();
+    let ids = b
+        .constant("ids", TensorType::new(vec![1, 1, lq, 512], GDt::I32))
+        .unwrap();
+    let pos = b
+        .constant("pos", TensorType::new(vec![1, lq], GDt::I32))
+        .unwrap();
+    let out = poot_graph_ir::test_support::composites::selected_attention(
+        &b,
+        poot_graph_ir::SelectedAttentionAttrs {
+            n_rep: 12,
+            scale: 0.0625,
+            softcap: None,
+            ratio: 4,
+            k: 512,
+        },
+        [q, k, v, ids, pos],
+    )
+    .unwrap();
+    let g = b.finish(poot_graph_ir::Outputs::new(out)).unwrap();
+    let eqn = g
+        .eqns()
+        .iter()
+        .find(|e| matches!(e.op, OpKind::SelectedAttention(_)))
+        .expect("a selected attention eqn");
+    planned_with_choice_caps(&g, eqn, backend, caps)
+}
+
+/// POOT-1338: a prefill chunk of a block-selected attention serves the 12 query heads of a key/value head in one
+/// workgroup (the K/V rows load once for the group): the request is `grouped`, its lanes a multiple of 12 and
+/// its workgroups one per `(kv head, query)`. A decode row, whose two groups would leave the device idle, keeps a
+/// workgroup per head. A device whose workgroup memory cannot hold the 12 head lanes plans the chunk ungrouped
+/// (the schedule it ran before grouping existed), and refuses by name (`AttentionLds`) only when not even one
+/// head's lane fits. Mutation: make `groups_selected_heads` return `false`; the chunk rows go red.
+#[test]
+fn a_selected_attention_chunk_groups_the_heads_of_a_key_value_head() {
+    for backend in ATTENTION_TARGETS.map(|b| b()) {
+        let caps = DeviceCaps {
+            watchdog_budget: None,
+            ..default_caps_for(backend)
+        };
+        let (_, chunk) = selected_attention_planned(1024, backend, &caps)
+            .unwrap_or_else(|e| panic!("{backend:?} chunk: {e:?}"));
+        let spec = attention_spec(&chunk);
+        assert!(
+            matches!(spec.mask, kg::MaskKind::Blocks { grouped: true, .. }),
+            "{backend:?}: the chunk is grouped: {:?}",
+            spec.mask
+        );
+        assert_eq!(spec.schedule.lanes() % 12, 0, "{backend:?}: head lanes");
+        assert_eq!(
+            spec.workgroups(),
+            2 * 1024,
+            "{backend:?}: one per (kv head, query)"
+        );
+
+        let (_, decode) = selected_attention_planned(1, backend, &caps)
+            .unwrap_or_else(|e| panic!("{backend:?} decode: {e:?}"));
+        assert!(
+            matches!(
+                attention_spec(&decode).mask,
+                kg::MaskKind::Blocks { grouped: false, .. }
+            ),
+            "{backend:?}: decode keeps a workgroup per head"
+        );
+    }
+
+    // 4 * (12 * 256 + 2 * 12) bytes: the partials of exactly the 12 head lanes.
+    let wgpu = Backend::SpirvVulkan;
+    let with_lds = |lds_bytes: u32| DeviceCaps {
+        lds_bytes,
+        watchdog_budget: None,
+        ..default_caps_for(wgpu)
+    };
+    let (_, small) = selected_attention_planned(1024, wgpu, &with_lds(12383))
+        .expect("12383 bytes cannot hold 12 head lanes, so the chunk plans ungrouped");
+    let small = attention_spec(&small);
+    assert!(
+        matches!(small.mask, kg::MaskKind::Blocks { grouped: false, .. }),
+        "12383 bytes: ungrouped, got {:?}",
+        small.mask
+    );
+    assert_eq!(
+        small.workgroups(),
+        24 * 1024,
+        "a workgroup per head and query"
+    );
+    let refusal = refusal_of(
+        selected_attention_planned(1024, wgpu, &with_lds(1023)).map(|(plan, _)| plan),
+        "not one head lane on 1023 bytes",
+    );
+    assert_eq!(
+        refusal.missing,
+        Capability::AttentionLds {
+            dv: 256,
+            lds_bytes: 1023
+        }
+    );
+    let (_, twelve) = selected_attention_planned(1024, wgpu, &with_lds(12384))
+        .expect("12384 bytes hold exactly the 12 head lanes");
+    let twelve = attention_spec(&twelve);
+    assert!(matches!(
+        twelve.mask,
+        kg::MaskKind::Blocks { grouped: true, .. }
+    ));
+    assert_eq!(
+        twelve.schedule,
+        kg::AttentionSchedule::Streaming { lanes: 12 }
+    );
+}
+
+/// POOT-1338 x POOT-1313: a grouped chunk on a device with a display watchdog splits into runs of row groups
+/// (one per `(kv head, query)`, each costing its `n_rep` rows), not runs of rows: the run counts are in the
+/// workgroups the kernel launches. Mutation: drop the `heads_per_workgroup` factor from
+/// `attention_rows_per_dispatch`; the budget then admits all 2048 groups in one run and the chunk is not split.
+#[test]
+fn a_grouped_chunk_under_a_watchdog_splits_into_runs_of_row_groups() {
+    let wgpu = Backend::SpirvVulkan;
+    let caps = default_caps_for(wgpu);
+    assert!(
+        caps.watchdog_budget.is_some(),
+        "the wgpu fixture has a watchdog"
+    );
+    let (_, first) = selected_attention_planned(1024, wgpu, &caps).expect("the chunk plans");
+    let KernelChoice::Generated(KernelRequest::AttentionRows(run)) = &first else {
+        panic!("a chunk past the budget plans runs, got {first:?}");
+    };
+    assert!(matches!(
+        run.spec.mask,
+        kg::MaskKind::Blocks { grouped: true, .. }
+    ));
+    assert_eq!(run.spec.row_groups(), 2 * 1024);
+    assert_eq!(run.first, 0);
+    assert!(
+        0 < run.count && run.count < run.spec.row_groups(),
+        "a run is some of the {} row groups, got {}",
+        run.spec.row_groups(),
+        run.count
+    );
+}
+
+/// The attention request of a plan's first dispatch: the whole attention, or the first run of its row groups
+/// a device with a display watchdog splits it into.
+fn first_attention_spec(choice: &KernelChoice) -> &kg::AttentionSpec {
+    match choice {
+        KernelChoice::Generated(KernelRequest::Attention(spec)) => spec,
+        KernelChoice::Generated(KernelRequest::AttentionRows(run)) => &run.spec,
+        other => panic!("expected a generated attention request, got {other:?}"),
+    }
+}
+
+/// POOT-1402: the bank's long prefill (16 query heads over 8 key/value heads, d 128, 2048 rows) plans the tiled
+/// schedule on every target, within the device's limits: its workgroup is within the workgroup caps, its body declares exactly the workgroup memory the tiles need and
+/// no more than the device has, and its row groups fill the device's compute units. A decode of the same heads
+/// keeps a streaming or split-KV schedule, whose rows are one query each.
+///
+/// Mutation: in `planner::attention::plan`, skip `attention_tiling` (plan the streaming spec); every prefill row
+/// goes red with the streaming schedule.
+#[test]
+fn a_long_prefill_plans_the_tiled_schedule_and_a_decode_does_not() {
+    for target in ATTENTION_TARGETS {
+        let backend = target();
+        let caps = default_caps_for(backend);
+        let fixture = AttentionFixture::prefill("bank prefill 2048", 16, 2, 2048, 128);
+        let (plan, choice) = attention_planned(fixture, backend, &caps)
+            .unwrap_or_else(|e| panic!("{backend:?}: {e:?}"));
+        let spec = first_attention_spec(&choice);
+        let kg::AttentionSchedule::Tiled { lanes, .. } = spec.schedule else {
+            panic!(
+                "{backend:?}: a long prefill plans the tiled schedule, got {:?}",
+                spec.schedule
+            );
+        };
+        assert!(
+            lanes <= caps.max_workgroup_invocations as usize,
+            "{backend:?}: {lanes} lanes"
+        );
+        assert!(
+            spec.row_groups() >= caps.compute_units as usize,
+            "{backend:?}: {} row groups on {} compute units",
+            spec.row_groups(),
+            caps.compute_units
+        );
+        let dispatch = match &plan {
+            Plan::Dispatches(dispatches) => &dispatches[0],
+            other => other.single().expect("one dispatch"),
+        };
+        let used = kg::BodyUse::measure(dispatch.body()).expect("measurable workgroup memory");
+        let tiles = spec
+            .tiled_lds_bytes()
+            .expect("a tiled schedule")
+            .expect("its tiles fit the shape");
+        assert_eq!(used.lds_bytes, tiles as u64, "{backend:?}: LDS");
+        assert!(
+            used.lds_bytes <= u64::from(caps.lds_bytes),
+            "{backend:?}: LDS budget"
+        );
+        assert_eq!(
+            used.workgroup,
+            [lanes as u32, 1, 1],
+            "{backend:?}: workgroup"
+        );
+
+        let decode = AttentionFixture::decode("bank decode", 1, 16, 2, 2048, 128);
+        let (_, choice) = attention_planned(decode, backend, &caps)
+            .unwrap_or_else(|e| panic!("{backend:?} decode: {e:?}"));
+        let schedule = first_attention_spec(&choice).schedule;
+        assert!(
+            !matches!(schedule, kg::AttentionSchedule::Tiled { .. }),
+            "{backend:?}: a decode keeps a per-row schedule, got {schedule:?}"
+        );
+    }
+}
+
+/// POOT-1402: the tiled schedule is chosen only within what the device holds. The same long prefill on a device
+/// whose workgroup memory holds no tiling (8 KiB: the narrowest staged key block, 16 keys of a 128-wide head, is
+/// 8.5 KiB alone) keeps the streaming schedule, and so does a short prefill whose row groups cannot give each compute unit one;
+/// a device that launches at most 64 invocations per workgroup gets a 64-lane tiling, where the Vulkan caps launch a
+/// wider one.
+///
+/// Mutation: drop the `lds <= caps.lds_bytes` test in `attention_tiling`; the 8 KiB device plans a tiling its
+/// memory cannot hold and the first row goes red. Mutation: drop the `lanes <= lanes_limit` filter; the
+/// 64-invocation device is given a 256-lane tiling its launch check refuses (`WorkgroupInvocations`), and the
+/// last rows go red.
+#[test]
+fn the_tiled_schedule_is_chosen_only_within_the_devices_resources() {
+    let wgpu = Backend::SpirvVulkan;
+    let caps = default_caps_for(wgpu);
+    let long = AttentionFixture::prefill("bank prefill 2048", 16, 2, 2048, 128);
+    let small_lds = DeviceCaps {
+        lds_bytes: 8 * 1024,
+        ..caps
+    };
+    let (_, choice) = attention_planned(long, wgpu, &small_lds).expect("the prefill plans");
+    assert!(
+        matches!(
+            first_attention_spec(&choice).schedule,
+            kg::AttentionSchedule::Streaming { .. }
+        ),
+        "8 KiB of workgroup memory holds no tiling, got {:?}",
+        first_attention_spec(&choice).schedule
+    );
+
+    let short = AttentionFixture::prefill("short prefill", 2, 2, 16, 64);
+    let (_, choice) = attention_planned(short, wgpu, &caps).expect("the prefill plans");
+    assert!(
+        matches!(
+            first_attention_spec(&choice).schedule,
+            kg::AttentionSchedule::Streaming { .. }
+        ),
+        "16 rows of one key/value head cannot fill {} compute units",
+        caps.compute_units
+    );
+
+    let lanes_of = |caps: &DeviceCaps| {
+        let (_, choice) = attention_planned(long, wgpu, caps).expect("the prefill plans");
+        first_attention_spec(&choice).schedule.lanes()
+    };
+    assert!(
+        lanes_of(&caps) > 64,
+        "the Vulkan caps launch a workgroup wider than one wave64"
+    );
+    let narrow = DeviceCaps {
+        max_workgroup_invocations: 64,
+        ..caps
+    };
+    assert_eq!(
+        lanes_of(&narrow),
+        64,
+        "a 64-invocation device gets a 64-lane tiling"
+    );
+}
+
 /// The plan records the implemented streaming schedule and the exact resources it needs, over a fixed bank:
 /// short and long prefill, low- and high-head decode, and a D = 256 softcapped prefill. Per row the request
 /// names `Streaming { lanes }`, the dispatch body states `lanes * (dv + 2) * 4` bytes of workgroup memory
@@ -5528,7 +5381,8 @@ fn the_streaming_schedule_records_its_exact_resources() {
             4 * (64 * 64 + 2 * 64),
         ),
         (
-            AttentionFixture::prefill("long prefill", 8, 4, 512, 128),
+            // One key/value head of 32 rows gives the 40 compute units too few row groups to tile.
+            AttentionFixture::prefill("one-group prefill", 8, 8, 32, 128),
             wgpu,
             64,
             4 * (64 * 128 + 2 * 64),
@@ -5706,10 +5560,9 @@ fn const_id(g: &Graph, name: &str) -> ValueId {
 }
 
 /// Card 298, Card 1011: the operand shape a natively-bf16 safetensors checkpoint traces for every projection
-/// matmul: an F32 activation against a BF16 weight const, F32 output. `plan_eqn` rejects it on wgpu and
-/// ROCm with "has no non-tensor-core kernel"; the 16-alignment named in that message is misleading: olmo2-1b's
-/// prefill shape (M=128, K=2048, N=8192, every dim 16-aligned) is still rejected, because both
-/// tensor-core gates require both operands bf16 and the activation is F32.
+/// matmul: an F32 activation against a BF16 weight const, F32 output. `plan_eqn` refuses it on every
+/// backend unwidened (olmo2-1b's prefill shape, M=128, K=2048, N=8192): every matmul body reads one element
+/// type.
 ///
 /// `widen_mismatched_matmul_dtypes`, run by `compile`, makes the eqn plan with an explicit
 /// `Cast{BF16 -> F32}` of the weight: the weight const stays BF16 (the stored words upload as they are) and
@@ -5777,30 +5630,8 @@ fn card298_decode_shaped_mixed_matmul_is_refused_after_widen() {
     }
 }
 
-/// Card 298: the widening must not touch an AMD WMMA operand pair. `to_mixed_bf16` emits bf16 x
-/// bf16 -> f32 at 16-aligned dims, ROCm's binder uploads those consts as two-byte bf16, and the
-/// tensor-core arm reads them that way.
-#[test]
-fn card298_widen_keeps_amd_wmma_operands_narrow() {
-    let gm = mixed_matmul_graph(GDt::BF16);
-    let backend = Backend::AmdGcn(AmdArch::gfx1151());
-    let gp = widen_mismatched_matmul_dtypes(&gm, &default_caps_for(backend)).unwrap();
-    for name in ["a", "w"] {
-        assert_eq!(
-            gp.aval(const_id(&gp, name)).dtype,
-            GDt::BF16,
-            "WMMA operand {name} must stay BF16 on {backend:?}"
-        );
-    }
-    assert_eq!(gp.eqns().len(), gm.eqns().len(), "no eqns added");
-    assert!(
-        is_tensor_core(&matmul_choice(&gp, backend)),
-        "a widened WMMA-eligible matmul must still take the tensor-core arm"
-    );
-}
-
-/// Card 298, Card 1011: SPIR-V has no bf16 compute (RADV has no `SPV_KHR_bfloat16`), so even a bf16 x bf16
-/// pair no tensor-core gate admits is widened by explicit casts that read the packed lanes. The consts keep
+/// Card 298, Card 1011: SPIR-V has no bf16 compute (RADV has no `SPV_KHR_bfloat16`), so a bf16 x bf16 pair is
+/// widened by explicit casts that read the packed lanes. The consts keep
 /// their BF16 dtype; nothing reaches codegen as a BF16 matmul.
 #[test]
 fn card298_spirv_widens_bf16_pairs_with_casts_not_retypes() {
@@ -5852,9 +5683,9 @@ fn try_dense_contraction_plan_planned(
 
 /// Card 380 FR-009, narrowed by cards 450 ROCm and 450 PTX; the body is Card 1024's. The lowering is scoped by
 /// name to the backends that have a typed packed walk: wgpu's (card 380), ROCm's (card 450 ROCm) and PTX's
-/// (card 450 PTX). Above M == 1 all three plan the same generated `[N, K]` Tiled body over the packed-BF16
-/// lanes; the tile edge (and so the workgroup count) is each device class's calibrated one
-/// (`caps.gemm_launch`, POOT-1233), the one field they may differ in.
+/// (card 450 PTX). Above M == 1 all three plan the same register-tiled `[N, K]` body over the packed-BF16 lanes
+/// with the same shape metadata; the tiling (and so the workgroup count) is each device's own
+/// (`RegisterTiling::choose` reads its compute units and launch figures), the one field they may differ in.
 #[test]
 fn card450_dense_contraction_plans_on_nvptx_with_the_wgpu_key() {
     let g = dense_contraction_graph(2, 32, 16);
@@ -5868,25 +5699,27 @@ fn card450_dense_contraction_plans_on_nvptx_with_the_wgpu_key() {
         let Ok((_, choice)) = try_dense_contraction_plan_planned(&g, backend) else {
             panic!("the packed-BF16 contraction must plan on {backend:?}");
         };
-        let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled {
-            m,
-            k,
-            n,
-            tile,
-            weight,
-            epilogue,
-            ..
-        })) = choice
+        let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(
+            DenseTiledContraction {
+                weight,
+                schedule,
+                epilogue,
+                meta,
+                ..
+            },
+        ))) = choice
         else {
             panic!("{backend:?}: expected the generated dense Tiled body, got {choice:?}");
         };
-        assert_eq!(weight, poot_target::BufferStorage::bf16_packed());
         assert_eq!(
-            tile,
-            default_caps_for(backend).gemm_launch().tile_edge as usize,
-            "{backend:?}: the tile is the caps' calibrated edge"
+            weight,
+            DenseTiledWeight::Nk(poot_target::BufferStorage::bf16_packed())
         );
-        format!("{m} {k} {n} {weight:?} {epilogue:?}")
+        assert!(
+            matches!(schedule, Schedule::RegisterTiled { .. }),
+            "{backend:?}: {schedule:?}"
+        );
+        format!("{:?} {weight:?} {epilogue:?}", &meta[..3])
     })
     .collect();
     assert!(
@@ -5918,9 +5751,13 @@ fn an_m1_dense_bf16_contraction_plans_the_generated_gemv_on_every_backend() {
             ..
         } = into_with_meta(planned_plan);
         assert_eq!(meta, vec![32, 16], "{backend:?}: metadata is [K, N]");
-        let KernelChoice::Generated(KernelRequest::Contraction(
-            request @ ContractionSpec::DenseGemv { weight, .. },
-        )) = choice
+        let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseGemv {
+            weight,
+            schedule,
+            k,
+            n,
+            epilogue,
+        })) = choice
         else {
             panic!("{backend:?}: expected the generated dense Gemv, got {choice:?}");
         };
@@ -5929,7 +5766,23 @@ fn an_m1_dense_bf16_contraction_plans_the_generated_gemv_on_every_backend() {
             poot_target::BufferStorage::bf16_packed(),
             "{backend:?}"
         );
-        format!("{request:?}")
+        // POOT-1405: the one request differs only in how the target reads the activation (both reads give the
+        // same bits; `a_gemv_reads_activation_vectors_only_where_every_run_is_a_whole_aligned_group`).
+        let kg::Schedule::Gemv {
+            width,
+            cols,
+            unroll,
+            activation,
+        } = schedule
+        else {
+            panic!("{backend:?}: the Gemv schedule, got {schedule:?}");
+        };
+        assert_eq!(
+            activation,
+            crate::predicates::gemv_activation(backend, k, unroll),
+            "{backend:?}"
+        );
+        format!("{weight:?} {width} {cols} {unroll} {k} {n} {epilogue:?}")
     })
     .collect();
     assert!(
@@ -6293,8 +6146,7 @@ fn card381_row_gather_plan_key_names_the_source_dtype() {
 }
 
 /// Card 380. The plan key must name the operand dtype, so a packed-BF16 kernel never shares a cache entry
-/// or disk artifact with an f32-operand kernel of the same shapes (the card-128 Bug-1 class the
-/// tensor-core keys guard against).
+/// or disk artifact with an f32-operand kernel of the same shapes (the card-128 Bug-1 class).
 ///
 /// At M == 1 the plan is the generated dense Gemv (see [`dense_bf16_decode_gemv_selection_rows`]), whose
 /// request names the packed-BF16 weight storage, so the key this row pins is that body's; the
@@ -6339,6 +6191,175 @@ fn card380_dense_contraction_plan_key_names_the_operand_dtype() {
     assert_ne!(key, f32_key);
 }
 
+/// POOT-1405: the planner reads a Gemv's activation in 4-lane vector groups exactly where it can prove every full
+/// run starts on a group and the target lowers a mixed vector and scalar read of one param: on NVPTX for a dense
+/// contraction whose `K` is a multiple of four (the dense run is four), never for `K = 30`, and never on SPIR-V or
+/// AMDGPU; a packed contraction (its `K` a whole number of 32-value blocks) on NVPTX only. Driven through the
+/// planner's own entry: the planned kernel request carries the choice.
+///
+/// Mutation: drop the `k % 4` condition in `gemv_activation`; the `K = 30` NVPTX row goes red. Mutation: drop the
+/// `mixed_vector_reads` condition; the SPIR-V and AMDGPU rows go red.
+#[test]
+fn a_gemv_reads_activation_vectors_only_where_every_run_is_a_whole_aligned_group() {
+    use kg::GemvActivation::{Scalar, Vec4};
+    let planned_read = |choice: &KernelChoice| match choice {
+        KernelChoice::Generated(KernelRequest::Contraction(
+            ContractionSpec::DenseGemv { schedule, .. }
+            | ContractionSpec::Packed(kg::PackedContraction { schedule, .. }),
+        )) => match schedule {
+            kg::Schedule::Gemv { activation, .. } => *activation,
+            other => panic!("a decode contraction plans the Gemv, got {other:?}"),
+        },
+        other => panic!("a generated contraction, got {other:?}"),
+    };
+    for (backend, k, want) in [
+        (Backend::Nvptx, 32, Vec4),
+        (Backend::Nvptx, 30, Scalar),
+        (Backend::SpirvVulkan, 32, Scalar),
+        (Backend::AmdGcn(AmdArch::gfx1151()), 32, Scalar),
+    ] {
+        let g = dense_contraction_graph(1, k, 16);
+        let (_, choice) = try_dense_contraction_plan_planned(&g, backend).unwrap();
+        assert_eq!(planned_read(&choice), want, "dense {backend:?} K={k}");
+    }
+    for (backend, want) in [
+        (Backend::Nvptx, Vec4),
+        (Backend::SpirvVulkan, Scalar),
+        (Backend::AmdGcn(AmdArch::gfx1151()), Scalar),
+    ] {
+        let builder = Builder::for_tests();
+        let x = builder
+            .slot_named(
+                poot_graph_ir::Slot::Activation,
+                "x",
+                TensorType::f32(vec![1, 256]),
+            )
+            .unwrap();
+        let weight =
+            poot_quant::PackedWeight::try_new(poot_quant::format::WeightFormat::Q4_K, [64, 256])
+                .unwrap();
+        let out = poot_graph_ir::test_support::packed_graphs::packed_linear(
+            &builder, x, "layer", weight, None, None,
+        )
+        .unwrap();
+        let target = Target::Gpu {
+            backend,
+            caps: default_caps_for(backend),
+        };
+        let program = compile(
+            &builder.finish(out).unwrap(),
+            &target,
+            &CompileOptions::new(CompileLimits::STANDARD),
+        )
+        .unwrap_or_else(|error| panic!("packed {backend:?}: {error}"));
+        let (eqn, _) = program
+            .planned()
+            .find(|(eqn, _)| matches!(eqn.op, OpKind::PackedContraction { .. }))
+            .expect("a planned packed contraction");
+        assert_eq!(
+            planned_read(program.kernel_choice(eqn)),
+            want,
+            "packed {backend:?}"
+        );
+    }
+}
+
+/// POOT-1405: the planner narrows a Gemv dispatch to 32-bit index math exactly where it proves the generator's
+/// index bound keeps every index of the longest planned binding within the 32-bit range and the target lowers
+/// that: a Q4_K `[64, 256]` and a packed-BF16 `[16, 32]` Gemv on NVPTX narrow (each under its generator's bound,
+/// with a key of its own), as does a Q4_K `[65536, 5120]` (47.2 M words, so 1.51 G bit offsets: the bound counts the
+/// source's words, not its carrier's graph shape); a Q4_K `[65536, 8192]` (75.5 M words, 2.4 G bit offsets) stays
+/// native on NVPTX; nothing
+/// narrows on SPIR-V or AMDGPU. Driven through `compile` and the planner's own dense entry.
+///
+/// Mutation: drop the `fits_u32` condition in `build`; the `[65536, 8192]` NVPTX row goes red. Mutation: drop the
+/// `narrow_index` condition; the SPIR-V and AMDGPU rows go red. Mutation: count the carrier operands in
+/// `try_plan_contraction`'s longest binding; the `[65536, 5120]` row goes red.
+#[test]
+fn the_planner_narrows_index_math_only_where_its_proof_holds_on_a_target_that_lowers_it() {
+    let packed_dispatch = |backend: Backend, n: usize, k: usize| -> Dispatch {
+        let builder = Builder::for_tests();
+        let x = builder
+            .slot_named(
+                poot_graph_ir::Slot::Activation,
+                "x",
+                TensorType::f32(vec![1, k]),
+            )
+            .unwrap();
+        let weight =
+            poot_quant::PackedWeight::try_new(poot_quant::format::WeightFormat::Q4_K, [n, k])
+                .unwrap();
+        let out = poot_graph_ir::test_support::packed_graphs::packed_linear(
+            &builder, x, "layer", weight, None, None,
+        )
+        .unwrap();
+        let target = Target::Gpu {
+            backend,
+            caps: default_caps_for(backend),
+        };
+        let program = compile(
+            &builder.finish(out).unwrap(),
+            &target,
+            &CompileOptions::new(CompileLimits::STANDARD),
+        )
+        .unwrap_or_else(|error| panic!("packed {backend:?} [{n}, {k}]: {error}"));
+        let (_, plan) = program
+            .planned()
+            .find(|(eqn, _)| matches!(eqn.op, OpKind::PackedContraction { .. }))
+            .expect("a planned packed contraction");
+        plan.single()
+            .unwrap_or_else(|| panic!("one Gemv dispatch, got {plan:?}"))
+            .clone()
+    };
+    // The generator's Gemv overshoot at the CUDA class's 256 lanes and 16-element run.
+    let gemv_slack = 256 * 16 + 16 + 256 + 64;
+    let narrowed = packed_dispatch(Backend::Nvptx, 64, 256);
+    assert_eq!(
+        narrowed.body().index_width,
+        poot_kernel_ir::IndexWidth::U32(poot_kernel_ir::IndexBound {
+            scale: 32,
+            slack: gemv_slack
+        }),
+        "Q4_K [64, 256] on NVPTX"
+    );
+    assert!(narrowed.key().ends_with(":u32"), "{}", narrowed.key());
+    let wide = packed_dispatch(Backend::Nvptx, 65536, 8192);
+    assert_eq!(
+        wide.body().index_width,
+        poot_kernel_ir::IndexWidth::Native,
+        "Q4_K [65536, 8192] on NVPTX: its bit offsets pass 2^31"
+    );
+    assert!(!wide.key().ends_with(":u32"), "{}", wide.key());
+    // 47.2 M words, 1.51 G bit offsets: its graph-shaped carrier is far longer than that, its binding is not.
+    assert!(
+        matches!(
+            packed_dispatch(Backend::Nvptx, 65536, 5120)
+                .body()
+                .index_width,
+            poot_kernel_ir::IndexWidth::U32(_)
+        ),
+        "Q4_K [65536, 5120] on NVPTX narrows on its source's word count"
+    );
+    for backend in [Backend::SpirvVulkan, Backend::AmdGcn(AmdArch::gfx1151())] {
+        assert_eq!(
+            packed_dispatch(backend, 64, 256).body().index_width,
+            poot_kernel_ir::IndexWidth::Native,
+            "Q4_K [64, 256] on {backend:?}"
+        );
+    }
+    let g = dense_contraction_graph(1, 32, 16);
+    let (plan, _) = try_dense_contraction_plan_planned(&g, Backend::Nvptx).unwrap();
+    let dense = into_with_meta(plan);
+    assert!(
+        matches!(
+            dense.body().index_width,
+            poot_kernel_ir::IndexWidth::U32(poot_kernel_ir::IndexBound { scale: 2, .. })
+        ),
+        "packed-BF16 [16, 32] on NVPTX: {:?}",
+        dense.body().index_width
+    );
+}
+
 /// Body, launch and selection for one packed-BF16 `DenseContraction` are chosen together (Card 727): at
 /// M == 1, on every backend, the generated dense Gemv takes it with the launch `dense_gemv_launch` picks,
 /// its workgroup the schedule's `width` and its grid the schedule's own `grid_threads`, `[K, N]` riding in
@@ -6365,23 +6386,24 @@ fn dense_bf16_decode_gemv_selection_rows() {
         let out_shape = g.aval(eqn.out).shape.clone();
         let out_numel = numel(&out_shape);
         assert_eq!(out_numel, n, "M == 1: one row of {n} outputs");
-        let schedule =
-            dense_decode_gemv_in(eqn, &out_shape, out_numel, &caps).unwrap_or_else(|| {
-                panic!("{backend:?}: the dense Gemv must take the M == 1 contraction")
-            });
-        let DenseGemvLaunch {
+        let launch = dense_decode_gemv_in(eqn, &out_shape, out_numel, &caps).unwrap_or_else(|| {
+            panic!("{backend:?}: the dense Gemv must take the M == 1 contraction")
+        });
+        assert_eq!(launch, dense_gemv_launch(n, caps.compute_units));
+        let DenseGemvLaunch { width, unroll, .. } = launch;
+        // K = 32 and the 4-element run put every run on a 16-byte group: NVPTX reads them as vectors.
+        let activation = if backend == Backend::Nvptx {
+            poot_kernelgen::GemvActivation::Vec4
+        } else {
+            poot_kernelgen::GemvActivation::Scalar
+        };
+        let schedule = poot_kernelgen::Schedule::Gemv {
             width,
-            cols,
+            cols: launch.cols,
             unroll,
-        } = dense_gemv_launch(n, caps.compute_units);
-        assert_eq!(
-            schedule,
-            poot_kernelgen::Schedule::Gemv {
-                width,
-                cols,
-                unroll
-            }
-        );
+            activation,
+        };
+        assert_eq!(launch.schedule(backend, k), schedule, "{backend:?}");
 
         let (planned_plan, choice) = try_dense_contraction_plan_planned(&g, backend).unwrap();
         let Dispatch {
@@ -6408,7 +6430,7 @@ fn dense_bf16_decode_gemv_selection_rows() {
         assert_eq!(meta, vec![k as u32, n as u32], "{backend:?}: [K, N]");
     }
 
-    // M > 1 runs the generated `[N, K]` Tiled body on every backend: no Gemv, no imported kernel.
+    // M > 1 runs the register-tiled `[N, K]` body on every backend: no Gemv, no imported kernel.
     for backend in [
         Backend::SpirvVulkan,
         Backend::AmdGcn(AmdArch::gfx1151()),
@@ -6432,11 +6454,13 @@ fn dense_bf16_decode_gemv_selection_rows() {
         assert!(
             matches!(
                 &choice,
-                KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled {
-                    m: 2,
-                    weight,
-                    ..
-                })) if *weight == poot_target::BufferStorage::bf16_packed()
+                KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(
+                    DenseTiledContraction {
+                        weight: DenseTiledWeight::Nk(storage),
+                        meta,
+                        ..
+                    }
+                ))) if *storage == poot_target::BufferStorage::bf16_packed() && meta[2] == 2
             ),
             "{backend:?}: M > 1 must plan the generated dense Tiled body: {choice:?}"
         );
@@ -6581,8 +6605,8 @@ fn bf16_projection_contraction_choice(
 /// POOT-739 SC-006, at planning: through `compile`, a BF16 decode projection (M == 1) whose weight is held in
 /// checkpoint `[N, K]` order plans the generated dense Gemv on every backend. The same projection over a
 /// `[K, N]` weight is a typed `DtypeLowering` refusal on SPIR-V and ROCm (the retired column-tile body was its
-/// only lowering; a per-column Gemv would read `[K, N]` at a stride of `N` per lane), and on NVPTX it plans a
-/// non-Gemv body. Mutation: in `dtype_widen::matmul_bf16_column_gemv` return `false`; the weight is widened by a
+/// only lowering; a per-column Gemv over BF16 would read `[K, N]` at a stride of `N` per lane), and on NVPTX the
+/// weight is widened to f32 and the projection plans the f32 decode GEMV, never the BF16 dense Gemv. Mutation: in `dtype_widen::matmul_bf16_column_gemv` return `false`; the weight is widened by a
 /// Cast, the projection plans the f32 decode GEMV and this row goes red.
 #[test]
 fn a_k_by_n_bf16_decode_projection_is_refused_on_the_packed_lane_backends() {
@@ -6607,10 +6631,10 @@ fn a_k_by_n_bf16_decode_projection_is_refused_on_the_packed_lane_backends() {
         if backend == Backend::Nvptx {
             let kn = kn.unwrap_or_else(|e| panic!("{backend:?} [K, N]: {e}"));
             assert!(
-                !matches!(
+                matches!(
                     kn,
                     KernelChoice::Generated(KernelRequest::Contraction(
-                        ContractionSpec::DenseGemv { .. } | ContractionSpec::GemvChunk { .. }
+                        ContractionSpec::GemvChunk { .. }
                     ))
                 ),
                 "{backend:?} [K, N]: {kn:?}"
@@ -6849,24 +6873,32 @@ mod family_dtype_admission {
         refusal_of(result, what).missing
     }
 
-    /// Mutation: drop `ScatterUpdate` from the half refusal in `movement::admits_dtypes`; the F16 scatter
-    /// plans a 2-byte row write it has no body for and the first assertion goes red.
+    /// A scatter writes in its buffer's element type: F16 (the paged KV write, POOT-1395) is native on
+    /// SPIR-V, BF16 is not, so the BF16 scatter is refused there by name. Mutation: drop the bf16-write
+    /// refusal in `movement::admits_dtypes`; the BF16 scatter plans a row write SPIR-V has no type for and
+    /// the BF16 assertion goes red.
     #[test]
-    fn movement_refuses_a_half_scatter_and_a_native_less_e4m3_and_admits_a_half_slice() {
+    fn movement_refuses_a_bf16_scatter_and_a_native_less_e4m3_and_admits_a_half_slice() {
         let caps = default_caps_for(Backend::SpirvVulkan);
-        let b = Builder::for_tests();
-        let base = b
-            .constant("base", TensorType::new(vec![2, 5], GDt::F16))
-            .unwrap();
-        let src = b
-            .constant("src", TensorType::new(vec![1, 5], GDt::F16))
-            .unwrap();
-        let slots = b.constant("s", TensorType::new(vec![1], GDt::I32)).unwrap();
-        let scatter = b.scatter_update(base, src, slots).unwrap();
-        let g = b.finish(scatter).unwrap();
+        let scatter = |dtype| {
+            let b = Builder::for_tests();
+            let base = b
+                .constant("base", TensorType::new(vec![2, 5], dtype))
+                .unwrap();
+            let src = b
+                .constant("src", TensorType::new(vec![1, 5], dtype))
+                .unwrap();
+            let slots = b.constant("s", TensorType::new(vec![1], GDt::I32)).unwrap();
+            let scatter = b.scatter_update(base, src, slots).unwrap();
+            b.finish(scatter).unwrap()
+        };
         assert_eq!(
-            missing(plan_first(&g, &caps), "F16 ScatterUpdate"),
+            missing(plan_first(&scatter(GDt::BF16), &caps), "BF16 ScatterUpdate"),
             Capability::DtypeLowering
+        );
+        assert!(
+            plan_first(&scatter(GDt::F16), &caps).is_ok(),
+            "an F16 scatter writes native 2-byte elements"
         );
 
         let b = Builder::for_tests();

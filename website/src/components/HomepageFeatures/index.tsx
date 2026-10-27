@@ -20,9 +20,9 @@ function DevelopIcon(props: React.ComponentProps<"svg">) {
       strokeWidth="2"
       {...props}
     >
-      <rect x="8" y="14" width="48" height="36" rx="2" />
-      <path d="M16 24h32M16 32h20M16 40h28" strokeLinecap="round" />
-      <path d="M44 38l8 6-8 6" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M22 20L9 32L22 44" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M42 20L55 32L42 44" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M37 14L27 50" strokeLinecap="round" />
     </svg>
   );
 }
@@ -36,11 +36,13 @@ function ServeIcon(props: React.ComponentProps<"svg">) {
       strokeWidth="2"
       {...props}
     >
-      <rect x="10" y="12" width="44" height="14" rx="2" />
-      <rect x="10" y="38" width="44" height="14" rx="2" />
-      <circle cx="20" cy="19" r="2" fill="currentColor" stroke="none" />
-      <circle cx="20" cy="45" r="2" fill="currentColor" stroke="none" />
-      <path d="M32 26v12M40 26v12M48 26v12" strokeLinecap="round" />
+      <rect x="10" y="10" width="44" height="12" rx="2" />
+      <rect x="10" y="26" width="44" height="12" rx="2" />
+      <rect x="10" y="42" width="44" height="12" rx="2" />
+      <circle cx="18" cy="16" r="1.6" fill="currentColor" stroke="none" />
+      <circle cx="18" cy="32" r="1.6" fill="currentColor" stroke="none" />
+      <circle cx="18" cy="48" r="1.6" fill="currentColor" stroke="none" />
+      <path d="M30 16h16M30 32h16M30 48h16" strokeLinecap="round" />
     </svg>
   );
 }
@@ -54,11 +56,14 @@ function ArchitectureIcon(props: React.ComponentProps<"svg">) {
       strokeWidth="2"
       {...props}
     >
-      <circle cx="32" cy="12" r="6" />
-      <circle cx="14" cy="48" r="6" />
-      <circle cx="50" cy="48" r="6" />
-      <path d="M32 18v14M20 42l8-12M44 42l-8-12" strokeLinecap="round" />
-      <rect x="24" y="28" width="16" height="10" rx="1" />
+      <path
+        d="M28.7 14.8L17.3 28.2M35.3 14.8L46.7 28.2M17.3 35.8L28.7 49.2M46.7 35.8L35.3 49.2"
+        strokeLinecap="round"
+      />
+      <circle cx="32" cy="11" r="5" />
+      <circle cx="14" cy="32" r="5" />
+      <circle cx="50" cy="32" r="5" />
+      <circle cx="32" cy="53" r="5" />
     </svg>
   );
 }

@@ -1,0 +1,179 @@
+{
+  "backend": "rocm",
+  "case": "prefill-attention-8192",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 175121.65
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 198713.34600000002
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 195024.865
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 197816.388
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 198778.388
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 196615.19999999998
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 194141.852
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 192002.59
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 196375.191
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 134217728,
+      "peak_bytes": 134217728,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 67108864,
+      "peak_bytes": 67108864,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 65536,
+      "peak_bytes": 65536,
+      "role": "Input"
+    },
+    {
+      "live_bytes": 80,
+      "peak_bytes": 80,
+      "role": "Meta"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 8192,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 8192
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 67108864,
+    "weight_copies": 1
+  },
+  "plan": [
+    "attention [19520b1288fffec5bb2f6c7a3a62fc582908a1a477df507c2cad80a611523c90]"
+  ],
+  "plan_id": "b1de208e1f3e1b7afc2306cc25e02409c4299a0f3cd0454db02ac6cb7676a10d",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 1.6799183880282588e-07,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-rocm-device",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "prefill-attention-8192",
+    "--out",
+    "benchmarks/performance-bank/receipts/rocm/prefill-attention-8192.json"
+  ],
+  "parent_revision": "21da98dafbdbc5887ce2943f1e7609381412b01c",
+  "binary_sha256": "fa7cc4a1a9eed9df3b6d92017c74dca3232fb97ed7f7a979028b73f4895caf65",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "bhsd",
+    "dimensions": {
+      "hq": 16,
+      "hkv": 8,
+      "d": 128,
+      "lq": 8192,
+      "cap": 8192
+    },
+    "prompt_tokens": 1,
+    "live_context": 8192,
+    "max_context": 8192,
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "prefill-attention-8192"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "rocm",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.3.0"
+  },
+  "identity_digest": "979524a18e965f318da65ceff507991d2eb5b734218604833aed3cc09ab47e3f",
+  "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"
+}

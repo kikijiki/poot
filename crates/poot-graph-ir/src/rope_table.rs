@@ -9,7 +9,60 @@
 //! length that HF reads per forward call (dynamic NTK's base, LongRoPE's regime); a static table stands
 //! in with its own `positions`, the largest position it can serve.
 
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
+
 use crate::graph::ComputedConst;
+
+/// One LongRoPE per-frequency divisor table, interned for the life of the process so a
+/// [`RopeSpec`] (and the [`ComputedConst`] holding it) stays `Copy + Eq + Hash`. Equality and hashing
+/// are by `f32` bit pattern, so two specs are the same constant exactly when their tables are bit
+/// for bit equal. A process interns one table per distinct checkpoint config, a few hundred bytes each.
+#[derive(Clone, Copy, Debug)]
+pub struct RopeFactors(&'static [f32]);
+
+static INTERNED_FACTORS: Mutex<Vec<&'static [f32]>> = Mutex::new(Vec::new());
+
+fn same_bits(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
+}
+
+impl RopeFactors {
+    /// The interned copy of `values`: the table already interned when one is bit for bit equal.
+    pub fn intern(values: &[f32]) -> Self {
+        let mut interned = INTERNED_FACTORS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(found) = interned.iter().find(|t| same_bits(t, values)) {
+            return Self(found);
+        }
+        let leaked: &'static [f32] = Box::leak(values.to_vec().into_boxed_slice());
+        interned.push(leaked);
+        Self(leaked)
+    }
+
+    /// The divisors, one per frequency pair.
+    pub fn as_slice(self) -> &'static [f32] {
+        self.0
+    }
+}
+
+impl PartialEq for RopeFactors {
+    fn eq(&self, other: &Self) -> bool {
+        same_bits(self.0, other.0)
+    }
+}
+
+impl Eq for RopeFactors {}
+
+impl Hash for RopeFactors {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for v in self.0 {
+            v.to_bits().hash(state);
+        }
+    }
+}
 
 /// How a table's inverse frequencies are derived from the base. Every flavor is fully determined by
 /// a checkpoint config; [`rope_tables`] also takes GGUF's per-frequency factors separately.
@@ -293,8 +346,7 @@ pub enum RopeTable {
 /// A [`RopeFlavor`] whose parameters are all scalars, floats stored as `f32` bit patterns so a
 /// [`ComputedConst`] stays `Copy + Eq + Hash` (graph identity folds it) and small (it sits in every
 /// value's [`Storage`](crate::Storage)): extents are `u32`, and YaRN's attention factor is resolved
-/// when the spec is made. LongRoPE's per-frequency arrays have no scalar form; they stay a
-/// [`rope_tables`] input.
+/// when the spec is made. LongRoPE's per-frequency arrays are interned ([`RopeFactors`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RopeScaling {
     /// [`RopeFlavor::Plain`].
@@ -340,6 +392,17 @@ pub enum RopeScaling {
         /// The number of leading frequency pairs that rotate.
         rotated: u32,
     },
+    /// [`RopeFlavor::LongRope`], its factor tables interned.
+    LongRope {
+        /// The trained position count.
+        original: u32,
+        /// The longest supported position, which sets the attention scale.
+        max_positions: u32,
+        /// The short regime's divisors.
+        short: Option<RopeFactors>,
+        /// The long regime's divisors.
+        long: Option<RopeFactors>,
+    },
 }
 
 /// The config facts of one RoPE table: rotary width, base and scaling. With a table and a position
@@ -354,11 +417,18 @@ pub struct RopeSpec {
 /// Why a [`RopeSpec`] or its computed constant cannot be made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RopeSpecError {
-    /// The flavor is LongRoPE, whose per-frequency factor arrays cannot sit in a `Copy` spec.
+    /// A LongRoPE factor table does not have one divisor per frequency pair.
     #[error(
-        "LongRoPE's per-frequency factors have no scalar form, so a computed RoPE constant cannot hold them"
+        "the {regime} LongRoPE factor table has {got} entries, but the rotary width has {expected} pairs"
     )]
-    FactorArrays,
+    FactorLength {
+        /// Which table: `short` or `long`.
+        regime: &'static str,
+        /// The frequency pairs of the rotary width.
+        expected: usize,
+        /// The entries the table holds.
+        got: usize,
+    },
     /// A width, position count or other extent exceeds `u32`.
     #[error("RoPE {what} {value} does not fit a computed constant's u32 extent")]
     Extent {
@@ -412,7 +482,34 @@ impl RopeSpec {
             RopeFlavor::Proportional { rotated } => RopeScaling::Proportional {
                 rotated: extent("rotated pairs", rotated)?,
             },
-            RopeFlavor::LongRope { .. } => return Err(RopeSpecError::FactorArrays),
+            RopeFlavor::LongRope {
+                original,
+                max_positions,
+                short,
+                long,
+            } => {
+                let table = |regime, values: Option<&[f32]>| {
+                    values
+                        .map(|values| {
+                            if values.len() == dim / 2 {
+                                Ok(RopeFactors::intern(values))
+                            } else {
+                                Err(RopeSpecError::FactorLength {
+                                    regime,
+                                    expected: dim / 2,
+                                    got: values.len(),
+                                })
+                            }
+                        })
+                        .transpose()
+                };
+                RopeScaling::LongRope {
+                    original: extent("original context", original)?,
+                    max_positions: extent("maximum context", max_positions)?,
+                    short: table("short", short)?,
+                    long: table("long", long)?,
+                }
+            }
         };
         Ok(Self {
             dim: extent("rotary width", dim)?,
@@ -472,6 +569,17 @@ impl RopeSpec {
             },
             RopeScaling::Proportional { rotated } => RopeFlavor::Proportional {
                 rotated: rotated as usize,
+            },
+            RopeScaling::LongRope {
+                original,
+                max_positions,
+                short,
+                long,
+            } => RopeFlavor::LongRope {
+                original: original as usize,
+                max_positions: max_positions as usize,
+                short: short.map(RopeFactors::as_slice),
+                long: long.map(RopeFactors::as_slice),
             },
         }
     }
@@ -683,25 +791,60 @@ mod tests {
     }
 
     #[test]
-    fn longrope_and_gguf_freq_factor_tables_equal_master() {
-        // The two array-parameterized inputs have no computed-constant form; the one formula still
-        // reproduces master's tables for them.
+    fn computed_longrope_equals_master_table() {
+        // Four positions past an original context of two: the long regime, scaled by the attention
+        // factor of `max_positions / original`.
         let longrope = RopeFlavor::LongRope {
             original: 2,
             max_positions: 4,
             short: Some(&[1.0, 1.25]),
             long: Some(&[2.0, 2.5]),
         };
-        let t = rope_tables(4, 4, 10_000.0, &longrope, None);
-        assert_table("longrope cos", &t.cos, &LONGROPE_COS);
-        assert_table("longrope sin", &t.sin, &LONGROPE_SIN);
+        assert_computed(
+            "longrope",
+            spec(4, 10_000.0, longrope),
+            &LONGROPE_COS,
+            &LONGROPE_SIN,
+        );
+    }
+
+    #[test]
+    fn longrope_factor_tables_are_interned_and_keyed_by_content() {
+        let flavor = |long: &'static [f32]| RopeFlavor::LongRope {
+            original: 2,
+            max_positions: 4,
+            short: Some(&[1.0, 1.25]),
+            long: Some(long),
+        };
+        let a = spec(4, 10_000.0, flavor(&[2.0, 2.5]));
+        assert_eq!(a, spec(4, 10_000.0, flavor(&[2.0, 2.5])));
+        assert_ne!(a, spec(4, 10_000.0, flavor(&[2.0, 2.75])));
+        assert_eq!(a.flavor(), flavor(&[2.0, 2.5]));
+    }
+
+    #[test]
+    fn a_longrope_table_off_the_rotary_width_is_refused() {
+        let longrope = RopeFlavor::LongRope {
+            original: 2,
+            max_positions: 4,
+            short: Some(&[1.0, 1.25, 1.5]),
+            long: None,
+        };
+        assert_eq!(
+            RopeSpec::new(4, 10_000.0, &longrope),
+            Err(RopeSpecError::FactorLength {
+                regime: "short",
+                expected: 2,
+                got: 3
+            })
+        );
+    }
+
+    #[test]
+    fn gguf_freq_factor_table_equals_master() {
         let t = rope_tables(4, 4, 10_000.0, &RopeFlavor::Plain, Some(&[1.0, 4.0]));
         assert_table("freq_factors cos", &t.cos, &FREQ_FACTORS_COS);
         assert_table("freq_factors sin", &t.sin, &FREQ_FACTORS_SIN);
-        assert_eq!(
-            RopeSpec::new(4, 10_000.0, &longrope),
-            Err(RopeSpecError::FactorArrays)
-        );
     }
 
     #[test]

@@ -336,7 +336,6 @@ impl Context {
             matrix_lowering: poot_target::MatrixLowering::vulkan(tensor_core),
             native_two_byte_floats: false,
             widens_bf16_decode_weight: false,
-            imported_lds_array_bodies: true,
             peer_transport: false,
             decode_gemv_max_out_cols: None,
             launch_class: poot_target::calibration::LaunchClass::Vulkan,
@@ -397,6 +396,35 @@ impl Context {
         let bytes: &[u8] = bytemuck_cast_i8_to_u8(&props.device_name);
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         String::from_utf8_lossy(&bytes[..end]).into_owned()
+    }
+
+    /// The adapter this context opened and the driver the Vulkan loader reports for it
+    /// (`VkPhysicalDeviceDriverProperties`, core in the 1.2 instance this context creates: `radv` and its
+    /// `Mesa` build string), the form wgpu's adapter info takes for the same device.
+    pub fn identity(&self) -> poot_runtime_common::DeviceIdentity {
+        let mut driver = vk::PhysicalDeviceDriverProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
+        // SAFETY: `self.physical_device` is valid for `self.instance`'s whole lifetime, and the 1.2 instance
+        // this context creates provides `vkGetPhysicalDeviceProperties2` with the driver-properties struct.
+        unsafe {
+            self.instance
+                .get_physical_device_properties2(self.physical_device, &mut props2)
+        };
+        let text = |s: &[std::ffi::c_char]| {
+            let bytes = bytemuck_cast_i8_to_u8(s);
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        };
+        poot_runtime_common::DeviceIdentity {
+            adapter: self.device_name(),
+            driver: format!(
+                "{} {}",
+                text(&driver.driver_name),
+                text(&driver.driver_info)
+            )
+            .trim()
+            .to_string(),
+        }
     }
 
     /// The device-capability descriptor the planner reads (card 522), measured once at construction and
@@ -609,7 +637,9 @@ mod launch_caps_device_receipt {
     #[test]
     fn a_live_vulkan_device_reports_its_own_launch_limits() {
         let Ok(ctx) = Context::new() else {
-            eprintln!("SKIP a_live_vulkan_device_reports_its_own_launch_limits: no Vulkan device");
+            eprintln!(
+                "POOT-SKIP a_live_vulkan_device_reports_its_own_launch_limits: no Vulkan device"
+            );
             return;
         };
         let live = ctx.device_caps();

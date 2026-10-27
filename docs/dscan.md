@@ -1,6 +1,6 @@
 # The recurrence scan contract (GDN delta rule and Mamba2 SSD)
 
-Status: accepted (phase A gate), implemented. Owner card: POOT-634. Prototype and receipts: Backstage
+Status: accepted (phase A gate), implemented. Prototype and receipts: Backstage
 `research/634-scan-contract-prototype/`.
 
 ## Problem
@@ -73,7 +73,7 @@ whole-sequence prefill within tier 2 (bitwise when the sequence fits one chunk).
 
 ## Limits and what is not here
 
-- **A chunk-parallel (matmul-form) kernel was built, measured and removed: it is not faster.** POOT-1052 built the
+- **A chunk-parallel (matmul-form) kernel is not faster, so none ships.** The prototype is the
   UT/WY form of both recurrences (per chunk of 16 tokens, pairwise `k . k` / `q . k` tables built cooperatively in
   workgroup memory, in-chunk forward substitution per state column, one pass writing the new column). It matched the
   recurrence and, on wgpu and ROCm, the oracle and the streaming kernel at `L` in 64, 1024, 4096. Timed against
@@ -81,7 +81,7 @@ whole-sequence prefill within tier 2 (bitwise when the sequence fits one chunk).
   `P = 64, N = 128` SSD; schedules alternated in one process) it was 0-10% slower on the delta rule and equal on SSD
   on both wgpu and ROCm: the scan is bound by how few threads (heads times column blocks) fill the device and by
   the `q`/`k` row loads, and the chunk form issues more of them. A kernel no planner rule selects is dead code, so
-  it was deleted. The patch, the measurement harness and the receipts are in Backstage
+  it is not in the tree. The patch, the measurement harness and the receipts are in Backstage
   `research/1052-chunk-parallel-scan-prototype/`; revisit only if a device (PTX has no number) shows a win.
   Streaming time is linear in `L`: 3.9 ms at `L = 64`, 60 ms at `L = 1024` (wgpu, 32 heads, `D = 128`; the
   unrolled primitive chain is 7.2 and 113 ms with 107 and 1577 dispatches).

@@ -8,6 +8,11 @@ poot-rocm-device::bin/rocm-check	tests::pcie_receipt_skip_is_decided_by_the_rocm
 poot-rocm-device::pcie_receipt	pcie_receipt_without_the_env_reaches_the_device_checks	runs rocm-check's PCIe receipt mode, which skips by design on an APU; the discrete-GPU receipt is a pod row
 poot-rocm-runtime	context::caps_tests::a_failed_query_stays_unknown_not_a_guessed_default	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	context::caps_tests::agent_values_come_out_in_their_own_caps_fields	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	host_memory::tests::a_host_below_its_floor_leaves_the_device_nothing	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	host_memory::tests::a_meminfo_without_a_readable_mem_available_is_none	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	host_memory::tests::a_pool_below_the_host_bound_stands	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	host_memory::tests::mem_available_is_read_in_bytes	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	host_memory::tests::the_host_floor_bounds_a_pool_that_reports_more	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	publication::tests::admitted_359_packet_graph_reports_one_successful_production_submission	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	publication::tests::coherent_device_ring_has_no_pcie_fence	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	publication::tests::empty_replay_has_no_reservation_or_publication	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
@@ -17,6 +22,7 @@ poot-rocm-runtime	publication::tests::single_packet_dispatch_orders_body_then_fe
 poot-rocm-runtime	publication::tests::unknown_ring_or_device_link_rejects_before_reservation	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	publication::tests::unsupported_pcie_host_rejects_before_reservation	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	tests::allocation_arithmetic_is_checked_before_native_allocation	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	tests::allocation_layout_accepts_an_element_count_past_u32	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	tests::bf16_packed_word_rejected_by_dense_i32_bind	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	tests::completion_wait_policy_spins_before_it_blocks	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	tests::completion_wait_policy_stops_at_a_reported_device_fault	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`

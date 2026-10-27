@@ -15,6 +15,7 @@
 //! The binary is a thin `main`; the crate is a library so the pod-name types have doctests that prove a
 //! pod cannot be created under a name `reap` does not own.
 
+mod cuda;
 mod db;
 mod image_resolve;
 mod runpod;
@@ -23,6 +24,9 @@ mod web;
 
 mod cli;
 mod clock;
+mod gather;
+mod hardware;
+mod heal;
 mod logging;
 mod manifest;
 mod workflow;
@@ -51,7 +55,10 @@ fn run(cli: Cli) -> Result<()> {
         .unwrap_or_else(|| state_dir().join("state.db").to_string_lossy().into_owned());
     let db = Db::open(&state_db)?;
     match cli.command {
-        Command::Status => cmd_status(&db, &state_db),
+        Command::Status => {
+            workflow::gc_zombies(&db);
+            cmd_status(&db, &state_db)
+        }
         Command::Reap(a) => {
             let rp = RunPod::new(runpod_api_key()?)?;
             let n = reap(&db, &rp, a.all)?;
@@ -59,7 +66,10 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Run(a) => cmd_run(db, state_db, a),
-        Command::Serve(s) => web::serve(db, &s.addr),
+        Command::Serve(s) => {
+            workflow::gc_zombies(&db);
+            web::serve(db, &s.addr)
+        }
         Command::Image(a) => cmd_image(&a),
         Command::Logs(a) => cmd_logs(&a),
         Command::Exec(a) => cmd_exec(&db, &state_db, a),
@@ -69,13 +79,13 @@ fn run(cli: Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::{exec_run_id_from, iso_from_secs, iso_in_minutes, now_iso};
+    use crate::clock::{exec_run_id_from, iso_from_secs, iso_in_minutes, now_iso, secs_from_iso};
     use crate::logging::{
         LogKind, LogState, classify_log_kind, classify_log_state, safe_log_name, state_dir_from,
     };
     use crate::manifest::{parse_manifest_models, select_models};
     use crate::workflow::{
-        Resume, build_exec_create_env, cuda_floor_to_allowed, finish_status_output, parse_env_pair,
+        PodState, Resume, build_exec_create_env, finish_status_output, parse_env_pair,
         reap_targets, resume_decision,
     };
     use std::path::PathBuf;
@@ -137,6 +147,8 @@ frameworks.transformers = { support = true, precision = "bf16" }
             public_ip: ip.map(String::from),
             port_mappings: if port22.is_some() { Some(pm) } else { None },
             machine: serde_json::Value::Null,
+            cuda_version: None,
+            cost_per_hr: None,
         }
     }
 
@@ -271,7 +283,6 @@ frameworks.transformers = { support = true, precision = "bf16" }
             env: &env,
             network_volume_id: None,
             data_center_ids: &[],
-            allowed_cuda_versions: &[],
         };
         let body = create_pod_body(&spec);
         let env_val = &body["env"];
@@ -506,12 +517,29 @@ frameworks.transformers = { support = true, precision = "bf16" }
             pod_id: Some("p".into()),
         };
         assert_eq!(
-            resume_decision(&r, Some(("h".into(), 22))),
+            resume_decision(&r, PodState::Ready("h".into(), 22)),
             Resume::Reattach("h".into(), 22)
         );
-        assert_eq!(resume_decision(&r, None), Resume::AbortStale);
+        assert_eq!(resume_decision(&r, PodState::Gone), Resume::AbortStale);
+        // Booting or unknowable is not gone.
+        assert_eq!(resume_decision(&r, PodState::Booting), Resume::Leave);
+        assert_eq!(resume_decision(&r, PodState::Unknown), Resume::Leave);
         r.pod_id = None;
-        assert_eq!(resume_decision(&r, None), Resume::Reprovision);
+        assert_eq!(resume_decision(&r, PodState::Gone), Resume::Reprovision);
+    }
+
+    /// The one resumable run of `run`'s request, as another process would see it once `run`'s owner died.
+    fn resumable(db: &Db, run: &Run) -> Option<Run> {
+        db.set_owner(&run.id, &ExecOwner::current().unwrap())
+            .unwrap();
+        let asker = Run {
+            id: "asker".into(),
+            ..run.clone()
+        };
+        db.resumable_runs(&asker, |_| db::runs::OwnerLiveness::Dead)
+            .unwrap()
+            .into_iter()
+            .next()
     }
 
     #[test]
@@ -543,7 +571,7 @@ frameworks.transformers = { support = true, precision = "bf16" }
             assert_eq!(actual.pod_id.as_deref(), pod_id);
             assert_eq!(actual.kind, run.kind);
         };
-        let active = db.active_run().unwrap().unwrap();
+        let active = resumable(&db, &run).unwrap();
         assert_run_fields(&active, None);
         // pod recorded -> shows up as a live id
         db.set_pod(
@@ -553,7 +581,7 @@ frameworks.transformers = { support = true, precision = "bf16" }
             Some(40000),
         )
         .unwrap();
-        assert_run_fields(&db.active_run().unwrap().unwrap(), Some("pod-id-column"));
+        assert_run_fields(&resumable(&db, &run).unwrap(), Some("pod-id-column"));
         assert_eq!(
             db.live_pod_ids().unwrap(),
             vec!["pod-id-column".to_string()]
@@ -582,7 +610,7 @@ frameworks.transformers = { support = true, precision = "bf16" }
         assert_eq!(st.pod_run_id.as_deref(), Some("result-dir-column"));
         // terminal status -> no longer active, no longer a live pod id
         db.set_status("run-id-column", "done").unwrap();
-        assert!(db.active_run().unwrap().is_none());
+        assert!(resumable(&db, &run).is_none());
         assert!(db.live_pod_ids().unwrap().is_empty());
         let _ = std::fs::remove_file(&tmp);
     }
@@ -652,7 +680,7 @@ frameworks.transformers = { support = true, precision = "bf16" }
         assert_eq!(view.len(), 1);
         assert_eq!(view[0].kind, "exec");
         // Not eligible for sweep-resume even while non-terminal (kind filter).
-        assert!(db.active_run().unwrap().is_none());
+        assert!(resumable(&db, &exec).is_none());
 
         // A killed exec leaves a non-terminal row; abort_stale_execs finalizes it and frees its pod for
         // reaping, while a non-terminal sweep is left alone.
@@ -678,7 +706,7 @@ frameworks.transformers = { support = true, precision = "bf16" }
             1
         ); // only the exec row
         assert_eq!(db.live_pod_ids().unwrap().len(), 0); // exec pod no longer protected
-        assert!(db.active_run().unwrap().is_some()); // the sweep is still resumable
+        assert!(resumable(&db, &sweep).is_some()); // the sweep is still resumable
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -710,8 +738,10 @@ frameworks.transformers = { support = true, precision = "bf16" }
         // Warm in-window: adoptable and protected from reap.
         db.set_warm("exec-warm", &iso_in_minutes(30)).unwrap();
         let w = db
-            .find_warm_exec("ghcr-img")
+            .find_warm_execs("ghcr-img")
             .unwrap()
+            .into_iter()
+            .next()
             .expect("warm pod found");
         assert_eq!(w.pod_id, "pod-warm");
         assert_eq!((w.host.as_str(), w.port), ("1.2.3.4", 40000));
@@ -724,7 +754,7 @@ frameworks.transformers = { support = true, precision = "bf16" }
         );
         assert_eq!(db.live_pod_ids().unwrap(), vec!["pod-warm".to_string()]);
         // A different image must not adopt this warm pod.
-        assert!(db.find_warm_exec("other-img").unwrap().is_none());
+        assert!(db.find_warm_execs("other-img").unwrap().is_empty());
 
         // Expired warm: abort_stale_execs finalizes it, freeing its pod for reaping.
         db.set_warm("exec-warm", &iso_in_minutes(0)).unwrap(); // warm_until == ~now, not strictly > now
@@ -765,22 +795,22 @@ frameworks.transformers = { support = true, precision = "bf16" }
     }
 
     /// Card 437 (1 of 2): a terminal `set_status` must not make a live keep-warm row unadoptable.
-    /// `set_warm` stores warm-ness in `status`, and `find_warm_exec` filters `status='warm'`. Kept
+    /// `set_warm` stores warm-ness in `status`, and `find_warm_execs` filters `status='warm'`. Kept
     /// separate from half 2 so each claim can fail independently.
     #[test]
     fn card437_terminal_status_must_not_make_a_live_warm_row_unadoptable() {
         let (db, tmp) = card437_warm_row("adopt");
         assert!(
-            db.find_warm_exec("ghcr-img").unwrap().is_some(),
+            !db.find_warm_execs("ghcr-img").unwrap().is_empty(),
             "precondition: a freshly warmed row is adoptable"
         );
 
         db.set_status("exec-437", "failed").unwrap();
 
         assert!(
-            db.find_warm_exec("ghcr-img").unwrap().is_some(),
+            !db.find_warm_execs("ghcr-img").unwrap().is_empty(),
             "a terminal status write must not make a live warm row unadoptable - \
-             find_warm_exec filters status='warm', so clobbering that column hides the pod"
+             find_warm_execs filters status='warm', so clobbering that column hides the pod"
         );
         let _ = std::fs::remove_file(&tmp);
     }
@@ -1029,6 +1059,24 @@ frameworks.transformers = { support = true, precision = "bf16" }
         assert_eq!(iso_from_secs(1_709_208_000), "2024-02-29T12:00:00Z");
     }
 
+    /// `secs_from_iso` inverts `iso_from_secs` across leap days, century years and the epoch, and refuses other shapes.
+    #[test]
+    fn secs_from_iso_inverts_iso_from_secs() {
+        for secs in [
+            0,
+            86_399,
+            951_782_400,
+            1_000_000_000,
+            1_709_208_000,
+            4_102_444_799,
+        ] {
+            assert_eq!(secs_from_iso(&iso_from_secs(secs)), Some(secs), "{secs}");
+        }
+        assert_eq!(secs_from_iso("2026-10-23T15:39:26"), None);
+        assert_eq!(secs_from_iso("2026-13-23T15:39:26Z"), None);
+        assert_eq!(secs_from_iso("not a time at all!!"), None);
+    }
+
     #[test]
     fn iso_from_secs_string_order_matches_time_order() {
         // The `--keep-warm` expiry compares `warm_until > now_iso()` as plain strings, so the ISO strings
@@ -1049,29 +1097,5 @@ frameworks.transformers = { support = true, precision = "bf16" }
         }
         // Month boundary (Jan 31 vs Feb 1, 2023).
         assert!(iso_from_secs(1_675_209_599) < iso_from_secs(1_675_209_600));
-    }
-
-    #[test]
-    fn cuda_floor_to_allowed_filters_orders_and_guards() {
-        // The default cu1281 image needs CUDA >= 12.8.
-        assert_eq!(
-            cuda_floor_to_allowed("12.8"),
-            vec!["13.0", "12.9", "12.8"],
-            "12.8 floor -> the >=12.8 hosts, newest-first"
-        );
-        // Top version -> itself; a floor above every valid version -> empty.
-        assert_eq!(cuda_floor_to_allowed("13.0"), vec!["13.0"]);
-        assert!(cuda_floor_to_allowed("14.0").is_empty());
-        // A version between valid entries (12.10 > 12.9) still filters.
-        assert_eq!(cuda_floor_to_allowed("12.10"), vec!["13.0"]);
-        // Empty or unparseable floor -> no filter (empty list), not a panic or a full list.
-        assert!(cuda_floor_to_allowed("").is_empty());
-        assert!(cuda_floor_to_allowed("garbage").is_empty());
-        assert!(
-            cuda_floor_to_allowed("12").is_empty(),
-            "no minor -> unparseable -> no filter"
-        );
-        // The oldest floor includes everything.
-        assert_eq!(cuda_floor_to_allowed("11.8").len(), 12);
     }
 }

@@ -9,12 +9,13 @@
 //! resolves metadata), so `begin`/`dispatch`/`copy`/`finish` failing can never have mutated device
 //! state, and `abort` only needs to drop the attempted recording's buffered metadata.
 
+use poot_codegen::CompiledKernel;
 use poot_executor::{
     Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, FlushPolicy, LaunchKind,
     MeasuredDeviceTime,
 };
 use poot_graph_plan::Target;
-use poot_runtime_common::{BufferRole, CompiledKernel, DeviceIdentity};
+use poot_runtime_common::{BufferRole, DeviceIdentity};
 use poot_target::{Backend, BufferStorage, TargetId};
 use poot_wgpu_runtime::{CachedDispatch, Context, ContextOptions, DeviceBuffer, RuntimeError};
 use std::num::NonZeroUsize;
@@ -200,7 +201,7 @@ impl Device for WgpuDevice {
     }
 
     fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
-        buffer.elem_count() as usize
+        buffer.elem_count()
     }
 
     fn load_kernel(
@@ -241,7 +242,7 @@ impl Device for WgpuDevice {
             d.inputs.iter().map(|a: &Arg<'_, Self>| a.buffer).collect();
         // Card 547b: each argument's own logical element count from the plan, never
         // the bound buffer's capacity.
-        let input_lens: Vec<u32> = d.inputs.iter().map(|a: &Arg<'_, Self>| a.elems).collect();
+        let input_lens: Vec<usize> = d.inputs.iter().map(|a: &Arg<'_, Self>| a.elems).collect();
         let cached = self.ctx.build_cached_dispatch(
             &d.kernel.key,
             &d.kernel.key,

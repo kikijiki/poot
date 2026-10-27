@@ -1279,7 +1279,7 @@ fn bf16_bits(x: f32) -> u16 {
 /// POOT-1032 (PTX, the generated tiled GEMM): a dense head over an F32 and a packed-BF16 `[N, K]` weight at
 /// `M > 1` (a single partial row-tile at `M == 5`, many at `M == 160`) with a bias and a residual fuses into one
 /// `ContractionEpilogue { head: Dense }`, and the device result meets the CPU oracle. Mutation: drop the epilogue from the tiled store in
-/// `tiled_region`; the nonzero inputs then differ and this row goes red. Runs on the PTX pod.
+/// `tiled_body` (`contraction/tiled.rs`); the nonzero inputs then differ and this row goes red. Runs on the PTX pod.
 #[test]
 fn a_dense_tiled_epilogue_matches_the_oracle_on_ptx() {
     use poot_graph_plan::{CompileLimits, CompileOptions, Target, compile};

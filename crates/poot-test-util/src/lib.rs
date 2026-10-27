@@ -14,6 +14,38 @@ pub mod device_caps;
 pub mod qwen_vl;
 pub mod smolvlm;
 
+/// The manifest directory of the package whose test is running, read from `CARGO_MANIFEST_DIR` at run time.
+///
+/// Never capture the manifest directory with the `env!` macro in a test: it is baked into the test binary at compile time, and the
+/// shared target directories reuse a binary across worktrees by content, so the baked path can name a checkout
+/// that no longer exists or a different one (POOT-1354). `cargo test` and `cargo nextest` set the variable for
+/// every run from the invoking workspace. Outside both (a bare run of the binary) the nearest ancestor of the
+/// current directory holding a `Cargo.toml` stands in.
+pub fn manifest_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("CARGO_MANIFEST_DIR") {
+        return dir.into();
+    }
+    let cwd = std::env::current_dir().expect("the current directory");
+    cwd.ancestors()
+        .find(|dir| dir.join("Cargo.toml").is_file())
+        .unwrap_or_else(|| panic!("no Cargo.toml at or above {}", cwd.display()))
+        .to_path_buf()
+}
+
+/// The workspace root of the checkout the running test was invoked from: the nearest ancestor of
+/// [`manifest_dir`] whose `Cargo.toml` declares `[workspace]`.
+pub fn repo_root() -> std::path::PathBuf {
+    let manifest = manifest_dir();
+    manifest
+        .ancestors()
+        .find(|dir| {
+            std::fs::read_to_string(dir.join("Cargo.toml"))
+                .is_ok_and(|text| text.lines().any(|line| line.trim() == "[workspace]"))
+        })
+        .unwrap_or_else(|| panic!("no workspace Cargo.toml at or above {}", manifest.display()))
+        .to_path_buf()
+}
+
 /// The directory NVPTX kernels are staged into for `ptx-check`: `$POOT_PTX_STAGE_DIR` when the PTX lane sets it (to a
 /// directory it makes fresh for the run), else a per-process directory under the temp dir that nothing else reads.
 pub fn ptx_stage_dir() -> std::path::PathBuf {
@@ -21,6 +53,15 @@ pub fn ptx_stage_dir() -> std::path::PathBuf {
         || std::env::temp_dir().join(format!("poot-ptx-stage-{}", std::process::id())),
         std::path::PathBuf::from,
     )
+}
+
+/// Report the running test as skipped with the reserved `POOT-SKIP` token, the one skip channel the required-case
+/// gate reads: `POOT-SKIP <owner>: <test> (<reason>)`. `owner` names the crate whose test skips; the test is
+/// named by its thread (the test harness names it after the test's path). A test calls this and returns.
+pub fn skip_report(owner: &str, reason: &dyn std::fmt::Display) {
+    let thread = std::thread::current();
+    let test = thread.name().unwrap_or("unnamed test");
+    eprintln!("POOT-SKIP {owner}: {test} ({reason})");
 }
 
 /// Declare a device row once and run it on every backend that can host it: `per_backend!(BackendChoice, row, a_wgpu,
@@ -189,7 +230,7 @@ pub fn model_path_with(
             "{MODELS_DIR_VARIABLE} is unset but {REQUIRE_MODELS_VARIABLE}=1: set {MODELS_DIR_VARIABLE} to the \
              directory that holds the checkpoints (model {checkpoint})"
         );
-        eprintln!("SKIP: model {checkpoint} needs {MODELS_DIR_VARIABLE}, which is unset");
+        eprintln!("POOT-SKIP: model {checkpoint} needs {MODELS_DIR_VARIABLE}, which is unset");
         return None;
     };
     let path = std::path::Path::new(&models_dir).join(checkpoint.path);
@@ -199,7 +240,9 @@ pub fn model_path_with(
             "model {checkpoint} not found under {MODELS_DIR_VARIABLE}={models_dir} but \
              {REQUIRE_MODELS_VARIABLE}=1: a checkpoint lane fails on a missing model"
         );
-        eprintln!("SKIP: model {checkpoint} not found under {MODELS_DIR_VARIABLE}={models_dir}");
+        eprintln!(
+            "POOT-SKIP: model {checkpoint} not found under {MODELS_DIR_VARIABLE}={models_dir}"
+        );
         return None;
     }
     Some(path)
@@ -816,7 +859,7 @@ mod tests {
                 }
             }
         }
-        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let crates = crate::manifest_dir().join("..");
         let mut files = Vec::new();
         rust_files(&crates, &mut files);
         assert!(

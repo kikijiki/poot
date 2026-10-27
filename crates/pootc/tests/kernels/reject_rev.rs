@@ -2,10 +2,10 @@
 //! `a..=b` are; `.rev()`, `.step_by()` and `for x in slice` are not). Must be rejected with a clear
 //! diagnostic, never miscompiled into a wrong iteration order.
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 const N: usize = 3;
 pub fn __poot_kernel_rev(x: &[f32], out: &mut [f32]) {
-    let r = thread_index();
+    let r = thread_index_x();
     if r < out.len() {
         let mut acc = 0.0f32;
         for j in (0..N).rev() {

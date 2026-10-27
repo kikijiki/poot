@@ -1,0 +1,82 @@
+---
+id: registry
+title: Models and the Registry
+sidebar_position: 3.4
+---
+
+# Models and the Registry
+
+A `Model` traces one step of a family's forward pass. The `Registry` names which families exist, and a `ModelHandle` loads one from a checkpoint. None of them knows a backend. [The Driver](./driver.mdx) turns a handle and an executor into generation.
+
+## From checkpoint to graph
+
+1. `Registry::resolve` reads the config and picks the family, before any weight is read.
+2. `FamilyEntry::build` returns the `Model`; `ModelHandle` bundles it with its weights and text codec.
+3. `Model::trace` builds the graph of one step, which [the Driver](./driver.mdx) compiles and runs.
+
+## The Model
+
+A family implements `poot_models::model::Model`. Its members:
+
+- `config`: vocab, EOS ids, chat format, tool codec.
+- `schema`: programs, request inputs and states, the contract with the driver.
+- `weights`: which checkpoint tensors feed which typed role.
+- `trace_into`: the family's tracer body.
+- `trace`: provided. It checks the step, admits the token count and calls `trace_into`.
+
+A `StepSpec` names the program, the `StepShape` and the carriable inputs. A `StepShape` is the semantic shape of a step: rows, tokens per row, cache capacity, a contiguous or paged KV layout, last-token or all-token logits, and an optional hidden-state carry. Positions are absolute, so a prefill is a step that continues from a position.
+
+The graph names consts by the weight map, never by checkpoint tensor name.
+
+### Programs
+
+A model has at most three programs. A request for one the family lacks is a typed `TraceError`.
+
+- `step` continues a sequence's carried state and returns logits. Prefill and decode are one program.
+- `encode` is one stateless pass over whole rows, for embeddings, rerankers and vision towers.
+- `draft` is a multi-token-prediction layer over the hidden-state carry. Only a family with such a layer has one.
+
+### Limits
+
+A shape a family cannot trace, or a step over the caller's `TraceLimits`, is a typed `TraceError`, never a panic. `TraceError::Budget` names the exhausted resource, the limit and the attempted total. A refused step builds nothing past the limit.
+
+A routed model's graph also declares its router witnesses as validation outputs, which the executor checks before any readback.
+
+## The input schema
+
+`ModelSchema` lists everything a step reads besides weights:
+
+- **Step inputs** come from the driver's own geometry, the same for every family: token ids, positions, the real-token mask, KV read and write maps, recurrent state rows.
+- **Request inputs** come from the request, produced by family code: embedding rows, a sectioned-RoPE position table, segment ids, vision pixels. Each declares its slot, type, shape, pad value and whether it is required, defaulted or optional.
+- **States** are carried between steps: KV cache, recurrent state, hidden-state carry. The traced graph must carry exactly the states its program declares.
+
+The driver binds every slot once, when it prepares an entry, and a slot nothing binds is a typed refusal. A family that declares a new request input needs no driver change.
+
+A request input that applies only to some steps is a **carried** input: the step runs the program variant that declares it, warmed by `Driver::prepare_carried`. Admission checks a request's values against the schema and refuses a bad one with a typed `InputError`.
+
+## Shared components
+
+Families are short because they share `poot_models::components`: embedding and head, norms, rotary embeddings, projections, attention, feed-forwards, the MoE router and experts, MLA, Mamba2, GDN, KDA and DSA mixers, and per-layer embeddings.
+
+`standard_stack` and `standard_layer` are the residual pair almost every decoder repeats. A family passes its own mixer and feed-forward as closures, and a norm after the block, sandwich norms, residual scales and a softcap are options of the component.
+
+Adding a model touches only the model: config, name table, tracer and one row in the registry's list. [Supported models and formats](../develop/supported-models.md#model-families) lists them. A change needed in the driver, planner or an executor is a missing general capability, not a family edit.
+
+## The Registry
+
+`Registry::builtin()` indexes `SHIPPED`, the one slice of every shipped family. A `FamilyEntry` is three fields:
+
+```rust
+pub struct FamilyEntry {
+    pub family: FamilyKey,
+    pub keys: &'static [(ConfigSource, &'static str)],
+    pub build: fn(&RawConfig, &WeightStore)
+        -> Result<ModelParts, ModelError>,
+}
+```
+
+`keys` pairs a config source with its key: `model_type` for a Hugging Face directory, `general.architecture` for a GGUF. Every key resolves to exactly one family, and a duplicate is an error. A key no family holds is a typed `Unregistered` error, reported as an unsupported model before any tensor is loaded.
+
+## ModelHandle
+
+`ModelHandle::load(path, &registry, &options)` resolves the family, reads the safetensors or GGUF into a `WeightStore`, builds the model, and builds the tokenizer and chat template from the model's config. GPTQ, AWQ and FP8 linears are packed from their stored bytes and never decoded. One handle can back several drivers.

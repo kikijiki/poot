@@ -1,18 +1,20 @@
 //! Card 559: the one authoring route and one asset manifest for kernels authored in ordinary Rust
 //! (`pootc/kernels/<family>/*.rs`), imported by `pootc` to a [`Body`], shipped as a committed
 //! `assets/*.kir.json` and parsed once per process via `OnceLock`. One file per family
-//! ([`contraction`], [`packed`], [`sampling`], [`probe`]) so a later card
-//! that retires a whole family (560a/560b/561a) deletes one file plus its lines here, never a
+//! ([`packed`], [`sampling`], [`state`], and the test-only [`probe`]) so a later card
+//! that retires a whole family deletes one file plus its lines here, never a
 //! scattered edit. [`MANIFEST`] is the single source of truth `pootc/tests/import_run.rs`'s
 //! `committed_assets_match_their_kernel_sources` iterates: every committed asset has exactly one entry,
 //! and every entry's source regenerates its committed bytes exactly (`just regen-kernel-assets`, card
 //! 559 R-559-1..2).
 //!
-//! [`ImportedKernel`] is the one production accessor: `ImportedKernel::GemvCoalesced.body()`. Each
-//! family file defines its own slice of `ImportedKernel` variants (via `kernel_assets!`) plus the
-//! matching [`AssetEntry`] table; [`ImportedKernel::body`] tries each family's generated `body_*` arm in
-//! turn. The macro also emits each family's own equivalence tests (name, param count, distinct
-//! `OnceLock` cells), so no family file hand-duplicates that test module.
+//! [`ImportedKernel`] is the one production accessor: `ImportedKernel::ArgmaxChunk.body()`. It holds only
+//! kernels with a production consumer. The executor-contract fixtures (a device trap, a busy-spin, an
+//! atomic counter, importer-capability probes) are [`ProbeKernel`]s, test support the crates that
+//! load them reach through `poot-graph-plan`'s `test-support` feature. Each family file defines its own slice of
+//! its kernel enum's variants (via `kernel_assets!`) plus the matching [`AssetEntry`] table. The macro also
+//! emits each family's own equivalence tests (name, param count, distinct `OnceLock` cells), so no family
+//! file hand-duplicates that test module.
 
 use std::sync::OnceLock;
 
@@ -69,8 +71,8 @@ pub struct AssetEntry {
     pub params: u32,
     /// Which crate's asset directory holds the committed `.kir.json`.
     pub dest: AssetDest,
-    /// The kernel this row ships, so a consumer walks the variants through the one manifest.
-    pub kernel: ImportedKernel,
+    /// The row's parsed body, so a consumer walks the variants through the one manifest.
+    pub body: fn() -> &'static Body,
 }
 
 /// `AssetDest::GraphPlan` or `AssetDest::Crate(dir)` from the same `GraphPlan`/`Crate(..)` token shape
@@ -101,15 +103,16 @@ macro_rules! kernel_asset_json {
 }
 pub(crate) use kernel_asset_json;
 
-/// Define one family's [`ImportedKernel`] variants, their [`AssetEntry`] table, and the family's
-/// `ImportedKernel::body_<family>` arm (the entry/param-count, parse-once and pairwise-distinct body
-/// checks over every family's entries live in `needs_tests`). `family` names the generated method
-/// (`body_contraction`, `body_probe`, ...), dispatched from [`ImportedKernel::body`] below. `dest` is
+/// Define one family's variants of the kernel enum `kind` ([`ImportedKernel`] or [`ProbeKernel`]), their
+/// [`AssetEntry`] table, and the family's `<kind>::body_<family>` arm (the entry/param-count, parse-once and
+/// pairwise-distinct body checks over every family's entries live in `manifest_tests`). `family` names the
+/// generated method (`body_packed`, `body_probe`, ...), dispatched from the kind's `body` below. `dest` is
 /// `GraphPlan` or `Crate("<dir>")` (bare tokens, not `AssetDest::..`): [`kernel_asset_dest`] and
 /// [`kernel_asset_json`] both build from it, so the entry's `dest` and its embedded JSON's path can
 /// never name two different files (review F7).
 macro_rules! kernel_assets {
     (
+        kind = $kind:ident;
         family = $family:ident;
         $(
             $variant:ident {
@@ -130,52 +133,41 @@ macro_rules! kernel_assets {
                     entry: $entry,
                     params: $params,
                     dest: $crate::imported::kernel_asset_dest!($dest_kind $(($dir))?),
-                    kernel: $crate::imported::ImportedKernel::$variant,
+                    body: || $crate::imported::$kind::$variant.body(),
                 }
             ),+
         ];
 
-        impl $crate::imported::ImportedKernel {
+        impl $crate::imported::$kind {
             pub(crate) fn $family(self) -> ::std::option::Option<&'static ::poot_kernel_ir::Body> {
-                match self {
-                    $(
-                        $crate::imported::ImportedKernel::$variant => {
-                            static BODY: ::std::sync::OnceLock<::poot_kernel_ir::Body> =
-                                ::std::sync::OnceLock::new();
-                            ::std::option::Option::Some($crate::imported::parse_once(
-                                &BODY,
-                                $crate::imported::kernel_asset_json!($dest_kind $(($dir))?, $name),
-                                $name,
-                            ))
-                        }
-                    )+
-                    _ => ::std::option::Option::None,
-                }
+                $(
+                    if self == $crate::imported::$kind::$variant {
+                        static BODY: ::std::sync::OnceLock<::poot_kernel_ir::Body> =
+                            ::std::sync::OnceLock::new();
+                        return ::std::option::Option::Some($crate::imported::parse_once(
+                            &BODY,
+                            $crate::imported::kernel_asset_json!($dest_kind $(($dir))?, $name),
+                            $name,
+                        ));
+                    }
+                )+
+                ::std::option::Option::None
             }
         }
     };
 }
 
-mod contraction;
 mod packed;
+#[cfg(any(test, feature = "test-support"))]
 mod probe;
 mod sampling;
+mod state;
 
-/// The one kernel-authoring accessor: `ImportedKernel::GemvCoalesced.body()`. One variant per shipped
-/// kernel, contributed by its family file's `kernel_assets!` invocation. `pub`, not `pub(crate)`: the
-/// `probe` family's kernels are each consumed by a different crate (`poot-rocm-device`, `poot-wgpu-device`), never
-/// by this crate's own planner, so this is the one route every crate reaches a shipped kernel through.
+/// The one kernel-authoring accessor: `ImportedKernel::ArgmaxChunk.body()`. One variant per shipped
+/// kernel with a production consumer, contributed by its family file's `kernel_assets!` invocation. `pub`,
+/// not `pub(crate)`: the executor engine reaches `CopyWords` through it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportedKernel {
-    // contraction.rs
-    /// Decode GEMV over an f32 `[K, N]` weight: a workgroup owns a tile of output columns and adjacent lanes read adjacent columns.
-    GemvCoalesced,
-    /// The coalesced decode GEMV over B rows that share one weight.
-    GemvBatchedCoalesced,
-    /// Thread-coarsened workgroup-tiled GEMM; shapes ride in `dims = [M, K, N]`.
-    TiledGemm,
-    /// Tiled GEMM with a weight per batch entry (per-expert MoE GEMM, per-head attention matmuls); shapes ride in `dims = [E, M, K, N]`.
-    TiledGemmBatched,
     // packed.rs
     /// Axis-0 embedding gather over a dense BF16 table read as packed `u32` lanes, widened to F32 in the kernel.
     PackedBf16RowGather,
@@ -196,20 +188,10 @@ pub enum ImportedKernel {
     SampleToppGumbelArgmaxBatched,
     /// Exact uniform noise for `OpKind::RandomUniform`, one thread per output element.
     RandomUniform,
-    // probe.rs
-    /// Probe: a reachable bounds-check `Assert`, to prove it lowers to a real device trap.
-    AssertTrap,
-    /// Probe: every lane atomically adds 1 into one `u32` counter, an exact order-independent reduction.
-    AtomicAddSumSmoke,
-    /// Probe: a raw word-for-word copy, the engine's state-copy kernel for a device with no native buffer
-    /// copy (`CopyMechanism::Kernel`).
+    // state.rs
+    /// A raw word-for-word copy, the engine's state-copy kernel for a device with no native buffer copy
+    /// (`CopyMechanism::Kernel`).
     CopyWords,
-    /// Probe: a finite busy-spin of a caller-chosen length, used to force a real completion-wait timeout.
-    SpinBusy,
-    /// Probe: row sums over a constant column count, a loop with a compile-time bound.
-    RowsumFor,
-    /// Probe: RMSNorm whose hidden width is a runtime value from `dims`.
-    RmsnormDyn,
 }
 
 impl ImportedKernel {
@@ -217,11 +199,38 @@ impl ImportedKernel {
     /// generated arm in turn; exactly one ever matches (`kernel_assets!`'s per-family match is
     /// exhaustive over that family's own variants).
     pub fn body(self) -> &'static Body {
-        self.body_contraction()
-            .or_else(|| self.body_packed())
+        self.body_packed()
             .or_else(|| self.body_sampling())
-            .or_else(|| self.body_probe())
+            .or_else(|| self.body_state())
             .unwrap_or_else(|| unreachable!("{self:?} has no family body() arm"))
+    }
+}
+
+/// A kernel authored in Rust for a test: an executor-contract fixture or an importer-capability probe. None
+/// has a planner call site; each is loaded directly by the crate whose test needs it (`poot-rocm-device`'s
+/// contract rows, `poot-wgpu-device`'s importer probes, `pootc`'s import-and-run rows). Not part of the shipped
+/// [`ImportedKernel`] menu.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeKernel {
+    /// A reachable bounds-check `Assert`, to prove it lowers to a real device trap.
+    AssertTrap,
+    /// Every lane atomically adds 1 into one `u32` counter, an exact order-independent reduction.
+    AtomicAddSumSmoke,
+    /// A finite busy-spin of a caller-chosen length, used to force a real completion-wait timeout.
+    SpinBusy,
+    /// Row sums over a constant column count, a loop with a compile-time bound.
+    RowsumFor,
+    /// RMSNorm whose hidden width is a runtime value from `dims`.
+    RmsnormDyn,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ProbeKernel {
+    /// Parse (once per process) and return this probe's imported `Body`.
+    pub fn body(self) -> &'static Body {
+        self.body_probe()
+            .unwrap_or_else(|| unreachable!("{self:?} has no probe body() arm"))
     }
 }
 
@@ -231,9 +240,9 @@ impl ImportedKernel {
 /// from its `pootc/kernels/<family>/<source>.rs`.
 #[cfg(any(test, feature = "test-support"))]
 pub const MANIFEST: &[&[AssetEntry]] = &[
-    contraction::ENTRIES,
     packed::ENTRIES,
     sampling::ENTRIES,
+    state::ENTRIES,
     probe::ENTRIES,
 ];
 
@@ -241,17 +250,17 @@ pub const MANIFEST: &[&[AssetEntry]] = &[
 mod manifest_tests {
     use super::*;
 
-    fn all_kernels() -> impl Iterator<Item = ImportedKernel> {
+    fn all_bodies() -> impl Iterator<Item = &'static Body> {
         MANIFEST
             .iter()
-            .flat_map(|family| family.iter().map(|entry| entry.kernel))
+            .flat_map(|family| family.iter().map(|entry| (entry.body)()))
     }
 
     /// Every manifest row's body is the entry point and arity the row declares, with blocks.
     #[test]
     fn each_body_matches_its_manifest_entry() {
         for entry in MANIFEST.iter().flat_map(|family| family.iter()) {
-            let body = entry.kernel.body();
+            let body = (entry.body)();
             assert_eq!(body.name, entry.entry, "asset {}", entry.name);
             assert_eq!(
                 body.params().count() as u32,
@@ -265,28 +274,27 @@ mod manifest_tests {
 
     #[test]
     fn each_body_is_parsed_once_and_static() {
-        for kernel in all_kernels() {
+        for entry in MANIFEST.iter().flat_map(|family| family.iter()) {
             assert!(
-                std::ptr::eq(kernel.body(), kernel.body()),
-                "{kernel:?} reparsed"
+                std::ptr::eq((entry.body)(), (entry.body)()),
+                "{} reparsed",
+                entry.name
             );
         }
     }
 
     #[test]
     fn bodies_do_not_share_a_cell_or_a_kernel_name() {
-        let kernels: Vec<_> = all_kernels().collect();
-        for (i, a) in kernels.iter().enumerate() {
-            for b in &kernels[i + 1..] {
+        let bodies: Vec<_> = all_bodies().collect();
+        for (i, a) in bodies.iter().enumerate() {
+            for b in &bodies[i + 1..] {
                 assert!(
-                    !std::ptr::eq(a.body(), b.body()),
-                    "{a:?} and {b:?} share a Body"
+                    !std::ptr::eq(*a, *b),
+                    "{} and {} share a Body",
+                    a.name,
+                    b.name
                 );
-                assert_ne!(
-                    a.body().name,
-                    b.body().name,
-                    "{a:?} and {b:?} share a kernel name"
-                );
+                assert_ne!(a.name, b.name, "two bodies share a kernel name");
             }
         }
     }

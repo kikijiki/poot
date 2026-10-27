@@ -34,6 +34,7 @@ members = [
     "crates/poot-wgpu-device",
     "crates/poot-ptx-device",
     "crates/poot-npu",
+    "crates/poot-npu-artifacts",
     "crates/pootc",
     "crates/poot-kernel-attr",
     "crates/poot-kernel-intrinsics",
@@ -107,6 +108,8 @@ poot-target = { path = "crates/poot-target" }
 poot-graph-plan = { path = "crates/poot-graph-plan" }
 poot-wgpu-runtime = { path = "crates/poot-wgpu-runtime" }
 poot-runtime-common = { path = "crates/poot-runtime-common" }
+poot-npu = { path = "crates/poot-npu" }
+poot-npu-artifacts = { path = "crates/poot-npu-artifacts" }
 poot-ptx-runtime = { path = "crates/poot-ptx-runtime" }
 poot-rocm-runtime = { path = "crates/poot-rocm-runtime" }
 poot-rocm-device = { path = "crates/poot-rocm-device" }

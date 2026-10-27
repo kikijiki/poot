@@ -5,8 +5,8 @@
 //! the loader's count stays zero. The kernel's resources are read here by walking the planned `Body`
 //! independently of the validator, so a refusal's reported numbers are checked against a second reading.
 //!
-//! Generated kernels (a contraction, the tensor-core and cooperative-matrix fragment kernels) and an
-//! imported one (the coalesced GEMV) take the same path and fail with the same typed refusal.
+//! Generated kernels (a contraction) and an
+//! imported one (a shipped sampler) take the same path and fail with the same typed refusal.
 
 use poot_graph_ir::{Builder, TensorType};
 use poot_graph_plan::device_validation::ResourceRefusal;
@@ -15,10 +15,9 @@ use poot_graph_plan::{
     Capability, CompileError, CompileLimits, CompileOptions, KernelChoice, Plan, PlanError,
     Program, Target, compile,
 };
-use poot_kernel_ir::{Body, Ty, WmmaDtype, WmmaShape};
-use poot_kernelgen::{ContractionSpec, FragmentUse, KernelRequest};
-use poot_target::{AmdArch, Backend, DeviceCaps, Queried, SubgroupSupport, TensorCoreSupport};
-use poot_tensor::DType;
+use poot_kernel_ir::{Body, Ty};
+use poot_kernelgen::{ContractionSpec, KernelRequest};
+use poot_target::{Backend, DeviceCaps};
 use poot_test_util::device_caps::default_caps_for;
 
 fn options() -> CompileOptions {
@@ -135,12 +134,22 @@ fn generated_lds_graph() -> poot_graph_ir::Graph {
     b.finish(out).unwrap()
 }
 
-/// The imported fixture: a decode GEMV (`M = 1`) on the wgpu target plans the shipped coalesced GEMV.
-fn imported_gemv_graph() -> poot_graph_ir::Graph {
+/// The imported fixture: a temperature draw over one row plans the shipped Gumbel sampler, one 64-lane
+/// workgroup with workgroup-local arrays.
+fn imported_sampler_graph() -> poot_graph_ir::Graph {
     let b = Builder::for_tests();
-    let a = b.constant("a", TensorType::f32(vec![1, 1, 256])).unwrap();
-    let w = b.constant("w", TensorType::f32(vec![256, 512])).unwrap();
-    let out = b.matmul(a, w).unwrap();
+    let logits = b.constant("logits", TensorType::f32(vec![1, 256])).unwrap();
+    let noise = b.constant("noise", TensorType::f32(vec![1, 256])).unwrap();
+    let params = b.constant("params", TensorType::f32(vec![1, 3])).unwrap();
+    let out = b
+        .sample_token(
+            poot_graph_ir::op::SampleRule::Gumbel,
+            logits,
+            Some(noise),
+            Some(params),
+            None,
+        )
+        .unwrap();
     b.finish(out).unwrap()
 }
 
@@ -200,7 +209,7 @@ fn static_lds_over_the_budget_is_refused_before_any_load() {
 }
 
 /// SC-001 and SC-003, workgroup shape: an overlarge workgroup (total invocations, then one axis) is
-/// refused for the generated contraction and for the imported GEMV alike, by the same finalizer, with the
+/// refused for the generated contraction and for the imported sampler alike, by the same finalizer, with the
 /// body's own measured shape in the refusal.
 ///
 /// Mutation: `finalize` stops calling `validate_planned_resources` (bypassing finalization). Every
@@ -209,7 +218,7 @@ fn static_lds_over_the_budget_is_refused_before_any_load() {
 fn an_overlarge_workgroup_is_refused_for_generated_and_imported_kernels_alike() {
     let fixtures = [
         ("generated", Backend::Nvptx, generated_lds_graph()),
-        ("imported", Backend::SpirvVulkan, imported_gemv_graph()),
+        ("imported", Backend::SpirvVulkan, imported_sampler_graph()),
     ];
     for (what, backend, graph) in fixtures {
         let roomy = target(backend, default_caps_for(backend));
@@ -266,7 +275,7 @@ fn an_overlarge_workgroup_is_refused_for_generated_and_imported_kernels_alike() 
     }
 }
 
-/// SC-003, imported static LDS: the shipped GEMV's workgroup memory is held to the device budget by the
+/// SC-003, imported static LDS: the shipped sampler's workgroup memory is held to the device budget by the
 /// same finalizer as a generated body.
 ///
 /// Mutation: `finalize` skips imported choices (return early for `KernelChoice::Imported`) and the
@@ -275,7 +284,7 @@ fn an_overlarge_workgroup_is_refused_for_generated_and_imported_kernels_alike() 
 fn an_imported_kernel_over_the_lds_budget_is_refused_before_any_load() {
     let backend = Backend::SpirvVulkan;
     let roomy = target(backend, default_caps_for(backend));
-    let (_, result) = compile_and_load(&imported_gemv_graph(), &roomy);
+    let (_, result) = compile_and_load(&imported_sampler_graph(), &roomy);
     let program = result.expect("the roomy device plans it");
     assert!(matches!(choice_of(&program), KernelChoice::Imported { .. }));
     let lds = lds_bytes(the_body(&program).0);
@@ -283,154 +292,13 @@ fn an_imported_kernel_over_the_lds_budget_is_refused_before_any_load() {
 
     let mut short = roomy;
     gpu_caps_mut(&mut short).lds_bytes = u32::try_from(lds).unwrap() - 1;
-    let (loader, result) = compile_and_load(&imported_gemv_graph(), &short);
+    let (loader, result) = compile_and_load(&imported_sampler_graph(), &short);
     assert_eq!(
         resource_refusal(result, "imported, one byte of LDS short"),
         ResourceRefusal::StaticLds {
             needed: lds,
             available: gpu_caps(&short).lds_bytes,
         }
-    );
-    assert!(loader.loaded.is_empty());
-}
-
-/// A matmul whose operands are 16-aligned bf16 and whose output is f32 plans the matrix-fragment kernel
-/// on a WMMA-capable AMD arch.
-fn bf16_fragment_graph() -> poot_graph_ir::Graph {
-    let b = Builder::for_tests();
-    let a = b
-        .constant("a", TensorType::new(vec![1, 16, 32], DType::BF16))
-        .unwrap();
-    let w = b
-        .constant("w", TensorType::new(vec![32, 16], DType::BF16))
-        .unwrap();
-    let out = b.matmul_f32_accumulate(a, w).unwrap();
-    b.finish(out).unwrap()
-}
-
-/// One degraded-device row: what changed, how, and the refusal it must produce.
-type DegradedRow = (&'static str, Box<dyn Fn(&mut DeviceCaps)>, ResourceRefusal);
-
-/// SC-001 and SC-003, fragment and subgroup features: the tensor-core kernel declares a 32-lane subgroup
-/// and uses a bf16 16x16x16 fragment. A device that reports no subgroups, subgroups of another size, no
-/// matrix hardware, or matrix hardware its API does not expose, refuses it with the matching typed
-/// reason; `Unknown` is never read as "present". The device that reports 32-lane subgroups and the WMMA
-/// family admits it.
-///
-/// Mutation: in `validate_kernel_resources`, replace the `match caps.subgroup` with `Ok` for `Unknown`
-/// (treat an unreported capability as present) and the `Unknown` row fails with "the program compiled".
-#[test]
-fn fragment_kernels_need_the_subgroup_and_matrix_hardware_the_device_reports() {
-    let arch = AmdArch::gfx1151();
-    let backend = Backend::AmdGcn(arch);
-    let roomy = target(backend, default_caps_for(backend));
-    let graph = bf16_fragment_graph();
-    let (loader, result) = compile_and_load(&graph, &roomy);
-    let program = result.expect("gfx1151 reports wave32 and WMMA");
-    assert!(matches!(
-        generated_contraction(&program),
-        ContractionSpec::TensorCore { .. }
-    ));
-    let (body, _) = the_body(&program);
-    assert!(
-        invocations(body).is_multiple_of(32),
-        "a fragment kernel's workgroup is whole subgroups"
-    );
-    assert_eq!(loader.loaded.len(), 1);
-
-    let rows: [DegradedRow; 5] = [
-        (
-            "no subgroup support",
-            Box::new(|caps| caps.subgroup = Queried::Known(SubgroupSupport::Absent)),
-            ResourceRefusal::SubgroupAbsent { lanes: 32 },
-        ),
-        (
-            "subgroup support not exposed",
-            Box::new(|caps| caps.subgroup = Queried::Unknown),
-            ResourceRefusal::SubgroupUnknown { lanes: 32 },
-        ),
-        (
-            "64-lane subgroups only",
-            Box::new(|caps| {
-                caps.subgroup = Queried::Known(SubgroupSupport::Present {
-                    min_size: 64,
-                    max_size: 64,
-                });
-            }),
-            ResourceRefusal::SubgroupSize {
-                lanes: 32,
-                min_size: 64,
-                max_size: 64,
-            },
-        ),
-        (
-            "no matrix hardware",
-            Box::new(|caps| caps.tensor_core = TensorCoreSupport::None),
-            ResourceRefusal::FragmentUnsupported {
-                fragment: FragmentUse {
-                    dtype: WmmaDtype::Bf16,
-                    shape: WmmaShape::M16N16K16,
-                },
-                tensor_core: TensorCoreSupport::None,
-            },
-        ),
-        (
-            "matrix hardware not exposed",
-            Box::new(|caps| caps.tensor_core = TensorCoreSupport::UnknownNotExposedByApi),
-            ResourceRefusal::FragmentCapabilityUnknown {
-                fragment: FragmentUse {
-                    dtype: WmmaDtype::Bf16,
-                    shape: WmmaShape::M16N16K16,
-                },
-            },
-        ),
-    ];
-    for (what, degrade, expected) in rows {
-        let mut degraded = roomy;
-        degrade(gpu_caps_mut(&mut degraded));
-        let (loader, result) = compile_and_load(&graph, &degraded);
-        assert_eq!(resource_refusal(result, what), expected, "{what}");
-        assert!(
-            loader.loaded.is_empty(),
-            "{what}: a refused plan reached the loader"
-        );
-    }
-}
-
-/// The wgpu cooperative-matrix kernel: one 32-lane subgroup per 16x16 tile, f16 operands.
-fn f16_coopmat_graph() -> poot_graph_ir::Graph {
-    let b = Builder::for_tests();
-    let a = b
-        .constant("a", TensorType::new(vec![1, 16, 16], DType::F16))
-        .unwrap();
-    let w = b
-        .constant("w", TensorType::new(vec![16, 16], DType::F16))
-        .unwrap();
-    let out = b.matmul_f32_accumulate(a, w).unwrap();
-    b.finish(out).unwrap()
-}
-
-/// SC-001, the same rule for the SPIR-V cooperative-matrix kernel: a Vulkan device with no subgroup
-/// support refuses it before load. Mutation: as above (skip the subgroup check).
-#[test]
-fn the_cooperative_matrix_kernel_is_refused_without_subgroups() {
-    let backend = Backend::SpirvVulkan;
-    let roomy = target(backend, default_caps_for(backend));
-    let graph = f16_coopmat_graph();
-    let (loader, result) = compile_and_load(&graph, &roomy);
-    let program = result.expect("the RADV fixture reports subgroups and WMMA");
-    assert!(matches!(
-        generated_contraction(&program),
-        ContractionSpec::Coopmat { .. }
-    ));
-    assert_eq!(loader.loaded.len(), 1);
-
-    let mut no_subgroups = roomy;
-    gpu_caps_mut(&mut no_subgroups).subgroup = Queried::Known(SubgroupSupport::Absent);
-    let (loader, result) = compile_and_load(&graph, &no_subgroups);
-    assert_eq!(
-        resource_refusal(result, "no subgroups"),
-        ResourceRefusal::SubgroupAbsent { lanes: 32 }
     );
     assert!(loader.loaded.is_empty());
 }

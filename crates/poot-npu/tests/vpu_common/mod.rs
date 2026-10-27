@@ -159,7 +159,10 @@ pub(crate) fn refusal_of(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(CompileLimits::STANDARD),
+        &CompileOptions {
+            npu: Some(poot_npu::npu_lowering()),
+            ..CompileOptions::new(CompileLimits::STANDARD)
+        },
     ) else {
         panic!("the equation is refused for the NPU");
     };
@@ -175,11 +178,9 @@ pub(crate) fn refusal_of(
 /// The region of `a + b` over two F16 `[1, 16]` tensors, emitted for the Intel NPU: the IR and ABI the
 /// engine would hand the device. `a_name` is the first input's declared name, which a row changes to make the
 /// artifact's ABI disagree with the IR.
-pub(crate) fn add_artifact(a_name: &str, shape: &[usize]) -> poot_runtime_common::VpuGraphArtifact {
-    use poot_codegen::{
-        VpuElem, VpuInput, VpuNode, VpuOp, VpuRegion, VpuTensor, VpuValue, emit_vpu,
-    };
-    use poot_runtime_common::{VpuBinding, VpuGraphArtifact, VpuLayer};
+pub(crate) fn add_artifact(a_name: &str, shape: &[usize]) -> poot_npu_artifacts::VpuGraphArtifact {
+    use poot_npu::{VpuElem, VpuInput, VpuNode, VpuOp, VpuRegion, VpuTensor, VpuValue, emit_vpu};
+    use poot_npu_artifacts::{VpuBinding, VpuGraphArtifact, VpuLayer};
     use poot_target::{BufferStorage, VpuTargetId};
     let tensor = VpuTensor {
         elem: VpuElem::F16,

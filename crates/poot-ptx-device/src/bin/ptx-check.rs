@@ -10,8 +10,12 @@
 
 use std::cell::{Cell, RefCell};
 
+use poot_codegen::{
+    ArgSchema, CompiledKernel, KernelCode, NVPTX_COMPILE_ONLY_FIXTURES as COMPILE_ONLY,
+};
 use poot_ptx_runtime::PtxContext;
-use poot_runtime_common::{ArgAccess, ArgSchema, CompiledKernel, DeviceBackend, KernelCode};
+use poot_runtime_common::DeviceBackend;
+use poot_target::ArgAccess;
 use poot_target::{Backend, ElementKind, TargetId};
 
 /// Wrap a poot-codegen-emitted `.ptx` file's text as a dispatchable [`CompiledKernel`] (card 608's
@@ -63,8 +67,8 @@ fn main() {
     let fixtures = Fixtures::new(&dir);
     let mut failures = 0;
 
-    // Base fixtures (add/square/matmul/exp/silu/reduce/bcast/gather/dus): each is individually
-    // staged-gated (`Fixtures`) so a partial PTX dir prints a SKIP line instead of panicking; a staged but
+    // Base fixtures (add/square/matmul/tanh/erf/reduce/bcast/gather/dus): each is individually
+    // staged-gated (`Fixtures`) so a partial PTX dir is reported as not staged instead of panicking; a staged but
     // wrong fixture still runs and can still fail the check.
     // add: c = a + b
     if fixtures.staged("add") {
@@ -136,24 +140,25 @@ fn main() {
     }
 
     // generated kernels (from kernelgen): exercise the NVPTX emitter paths.
-    if fixtures.staged("exp") {
+    if fixtures.staged("tanh") {
         let x: Vec<f32> = vec![0.0, 1.0, -1.0, 2.0];
-        let e = run(&ctx, &dir, "exp", "exp", &[&x], 4, [64, 1, 1], [4, 1, 1]);
+        let t = run(&ctx, &dir, "tanh", "tanh", &[&x], 4, [64, 1, 1], [4, 1, 1]);
         report_close(
-            "exp",
-            &e,
-            &x.iter().map(|v| v.exp()).collect::<Vec<_>>(),
+            "tanh",
+            &t,
+            &x.iter().map(|v| v.tanh()).collect::<Vec<_>>(),
             2e-3,
             &mut failures,
         );
     }
-    if fixtures.staged("silu") {
-        let x: Vec<f32> = vec![0.0, 1.0, -1.0, 2.0];
-        let s = run(&ctx, &dir, "silu", "silu", &[&x], 4, [64, 1, 1], [4, 1, 1]);
+    if fixtures.staged("erf") {
+        // erf(0.5) = 0.5204999 and erf(1.5) = 0.9661051 (f32 literals; std has no erf).
+        let x: Vec<f32> = vec![0.0, 0.5, -0.5, 1.5];
+        let e = run(&ctx, &dir, "erf", "erf", &[&x], 4, [64, 1, 1], [4, 1, 1]);
         report_close(
-            "silu",
-            &s,
-            &x.iter().map(|v| v / (1.0 + (-v).exp())).collect::<Vec<_>>(),
+            "erf",
+            &e,
+            &[0.0, 0.5204999, -0.5204999, 0.9661051],
             2e-3,
             &mut failures,
         );
@@ -193,21 +198,22 @@ fn main() {
             &mut failures,
         );
     }
-    // gather_axis0: data[3,2], index[2,0,1]
+    // gather_axis0: the staged kernel gathers two rows of a four-row [4,2] table through an I32 index
+    // (`support/gather.rs::gather_axis0_dt`); the kernel's argument schema is (F32 table, I32 index, F32 out).
     if fixtures.staged("gather") {
-        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let index: Vec<f32> = vec![2.0, 0.0, 1.0];
-        let g = run(
+        let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let index: Vec<i32> = vec![3, 1];
+        let g = run_inputs(
             &ctx,
             &dir,
             "gather",
             "gather",
-            &[&data, &index],
-            6,
+            &[Input::F32(&data), Input::I32(&index)],
+            4,
             [64, 1, 1],
-            [6, 1, 1],
+            [4, 1, 1],
         );
-        report("gather", &g, &[5.0, 6.0, 1.0, 2.0, 3.0, 4.0], &mut failures);
+        report("gather", &g, &[6.0, 7.0, 2.0, 3.0], &mut failures);
     }
     // DynamicUpdateSlice (KV slot write): operand[2,4,3]=0..24, write update[2,1,3] at slot idx=2
     // on axis 1; slot 2 (flat 6..9 and 18..21) is overwritten, the rest preserved.
@@ -228,142 +234,6 @@ fn main() {
         want_dus[6..9].copy_from_slice(&[100.0, 200.0, 300.0]);
         want_dus[18..21].copy_from_slice(&[400.0, 500.0, 600.0]);
         report("dus", &dus, &want_dus, &mut failures);
-    }
-
-    // Kernels authored in ordinary Rust and compiled by pootc (Stable MIR -> Body -> PTX), if staged.
-    // Entry names are the mangled `__poot_kernel_*`.
-    if fixtures.staged("imported_add") {
-        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let b: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0];
-        let c = run(
-            &ctx,
-            &dir,
-            "imported_add",
-            "__poot_kernel_add",
-            &[&a, &b],
-            5,
-            [64, 1, 1],
-            [5, 1, 1],
-        );
-        report(
-            "imported_add",
-            &c,
-            &[11.0, 22.0, 33.0, 44.0, 55.0],
-            &mut failures,
-        );
-
-        // imported matmul: C[2,3] = A[2,4] @ B[4,3] (dims baked in; 1D grid over m*n outputs).
-        let (m, n, k) = (2usize, 3, 4);
-        let am: Vec<f32> = (0..m * k).map(|i| i as f32).collect();
-        let bm: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.5).collect();
-        let cm = run(
-            &ctx,
-            &dir,
-            "imported_matmul",
-            "__poot_kernel_matmul",
-            &[&am, &bm],
-            m * n,
-            [64, 1, 1],
-            [(m * n) as u32, 1, 1],
-        );
-        let mut wantm = vec![0.0f32; m * n];
-        for r in 0..m {
-            for col in 0..n {
-                let mut acc = 0.0;
-                for kk in 0..k {
-                    acc += am[r * k + kk] * bm[kk * n + col];
-                }
-                wantm[r * n + col] = acc;
-            }
-        }
-        report("imported_matmul", &cm, &wantm, &mut failures);
-    }
-
-    // Imported kernels on the PTX path: the decode GEMV (+ bias), the on-device argmax, and the coarsened
-    // tiled GEMM. Shapes mirror the wgpu import_run tests. Each block runs only if its .ptx is staged.
-    if fixtures.staged("gemv") {
-        // decode GEMV: out[col] = sum_k x[k] * w[k*N+col]. 128 lanes/output (one block per output column).
-        let (k, n) = (4usize, 8usize);
-        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1 - 0.2).collect();
-        let w: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.05 - 0.3).collect();
-        let got = run(
-            &ctx,
-            &dir,
-            "gemv",
-            "__poot_kernel_gemv",
-            &[&x, &w],
-            n,
-            [128, 1, 1],
-            [(n * 128) as u32, 1, 1],
-        );
-        let want: Vec<f32> = (0..n)
-            .map(|col| (0..k).map(|kk| x[kk] * w[kk * n + col]).sum())
-            .collect();
-        report_close("imported_gemv", &got, &want, 1e-5, &mut failures);
-    }
-    if fixtures.staged("gemv_bias") {
-        let (k, n) = (4usize, 8usize);
-        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1 - 0.2).collect();
-        let w: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.05 - 0.3).collect();
-        let bias: Vec<f32> = (0..n).map(|i| (i as f32) * 0.2 - 0.5).collect();
-        let got = run(
-            &ctx,
-            &dir,
-            "gemv_bias",
-            "__poot_kernel_gemv_bias",
-            &[&x, &w, &bias],
-            n,
-            [128, 1, 1],
-            [(n * 128) as u32, 1, 1],
-        );
-        let want: Vec<f32> = (0..n)
-            .map(|col| (0..k).map(|kk| x[kk] * w[kk * n + col]).sum::<f32>() + bias[col])
-            .collect();
-        report_close("imported_gemv_bias", &got, &want, 1e-5, &mut failures);
-    }
-    if fixtures.staged("argmax") {
-        // on-device greedy argmax: 64 lanes scan the logits, lane 0 writes the winning index into out[0].
-        let vocab = 64usize;
-        let mut logits: Vec<f32> = (0..vocab).map(|i| (i as f32) * 0.01).collect();
-        logits[42] = 99.0; // the clear max
-        let got = run(
-            &ctx,
-            &dir,
-            "argmax",
-            "__poot_kernel_argmax",
-            &[&logits],
-            1,
-            [64, 1, 1],
-            [64, 1, 1],
-        );
-        report("imported_argmax", &got, &[42.0], &mut failures);
-    }
-    if fixtures.staged("tiled_gemm") {
-        // coarsened tiled GEMM: C[M,N] = A[M,K] @ B[K,N], dims = [M,K,N,offset]. One TSxTS tile per block,
-        // 64 lanes; grid = ceil(M/16)*ceil(N/8) blocks. M=16,K=8,N=8 -> 1 tile.
-        let (m, k, n) = (16usize, 8usize, 8usize);
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32) * 0.1 - 0.7).collect();
-        let b: Vec<f32> = (0..k * n).map(|i| ((i % 11) as f32) * 0.07 - 0.3).collect();
-        let dims = [m as u32, k as u32, n as u32, 0u32];
-        let tiles = m.div_ceil(16) * n.div_ceil(8);
-        let got = run_dims(
-            &ctx,
-            &dir,
-            "tiled_gemm",
-            "__poot_kernel_tiled_gemm_coarsened",
-            &[&a, &b],
-            &dims,
-            m * n,
-            [64, 1, 1],
-            [(tiles * 64) as u32, 1, 1],
-        );
-        let want: Vec<f32> = (0..m * n)
-            .map(|idx| {
-                let (r, c) = (idx / n, idx % n);
-                (0..k).map(|j| a[r * k + j] * b[j * n + c]).sum()
-            })
-            .collect();
-        report_close("imported_tiled_gemm", &got, &want, 1e-4, &mut failures);
     }
 
     // Attention decode: the generated online-softmax kernel, 4 lanes per head. Dims match the staged kernel
@@ -404,9 +274,13 @@ fn main() {
     }
 }
 
-/// Load `<dir>/<file>.ptx`, dispatch `entry` through the PtxContext with read-only `inputs` (uploaded)
-/// and one writable output of `out_len` (allocated), and return the output. `label` names it for the
-/// profiler + the per-kernel device-time line.
+/// One kernel input: the host data and, through its variant, the element kind the kernel's schema declares.
+enum Input<'a> {
+    F32(&'a [f32]),
+    I32(&'a [i32]),
+}
+
+/// [`run_inputs`] over all-F32 inputs.
 #[expect(clippy::too_many_arguments)]
 fn run(
     ctx: &PtxContext,
@@ -418,60 +292,45 @@ fn run(
     block: [u32; 3],
     threads: [u32; 3],
 ) -> Vec<f32> {
-    let path = format!("{dir}/{label}.ptx");
-    let ptx = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    let in_bufs: Vec<_> = inputs
-        .iter()
-        .map(|d| ctx.upload_f32(d).expect("upload"))
-        .collect();
-    let in_refs: Vec<_> = in_bufs.iter().collect();
-    let in_lens: Vec<u32> = in_bufs.iter().map(|b| b.elem_count()).collect();
-    let out = ctx.alloc_f32(out_len).expect("alloc out");
-    let elements: Vec<ElementKind> = (0..=inputs.len()).map(|_| ElementKind::F32).collect();
-    let kernel = ptx_kernel(&ptx, entry, &elements);
-    ctx.dispatch_dev(
-        label,
-        &kernel,
-        block,
-        threads,
-        &in_refs,
-        &in_lens,
-        &out,
-        out.elem_count(),
-    )
-    .expect("dispatch");
-    ctx.download_f32(&out).expect("download")
+    let inputs: Vec<Input> = inputs.iter().map(|d| Input::F32(d)).collect();
+    run_inputs(ctx, dir, label, entry, &inputs, out_len, block, threads)
 }
 
-/// Like [`run`], but binds an extra `u32` metadata buffer (e.g. a tiled GEMM's `dims = [M,K,N,offset]`)
-/// between the f32 data inputs and the output - the imported shape-generic kernels read their shape from it.
-/// Uploaded via `upload_i32` (the bytes are identical for the small non-negative dims).
+/// Load `<dir>/<label>.ptx`, dispatch `entry` through the PtxContext with read-only `inputs` (uploaded as
+/// their own element kind) and one writable F32 output of `out_len` (allocated), and return the output. `label`
+/// names it for the profiler + the per-kernel device-time line.
 #[expect(clippy::too_many_arguments)]
-fn run_dims(
+fn run_inputs(
     ctx: &PtxContext,
     dir: &str,
     label: &str,
     entry: &str,
-    f32_inputs: &[&[f32]],
-    dims: &[u32],
+    inputs: &[Input],
     out_len: usize,
     block: [u32; 3],
     threads: [u32; 3],
 ) -> Vec<f32> {
     let path = format!("{dir}/{label}.ptx");
     let ptx = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    let mut in_bufs: Vec<_> = f32_inputs
+    let in_bufs: Vec<_> = inputs
         .iter()
-        .map(|d| ctx.upload_f32(d).expect("upload f32"))
-        .collect();
-    let dims_i32: Vec<i32> = dims.iter().map(|&x| x as i32).collect();
-    in_bufs.push(ctx.upload_i32(&dims_i32).expect("upload dims"));
+        .map(|input| match input {
+            Input::F32(d) => ctx.upload_f32(d),
+            Input::I32(d) => ctx.upload_i32(d),
+        })
+        .collect::<Result<_, _>>()
+        .expect("upload");
     let in_refs: Vec<_> = in_bufs.iter().collect();
-    let in_lens: Vec<u32> = in_bufs.iter().map(|b| b.elem_count()).collect();
+    let in_lens: Vec<usize> = in_bufs.iter().map(|b| b.elem_count()).collect();
     let out = ctx.alloc_f32(out_len).expect("alloc out");
-    let mut elements: Vec<ElementKind> = f32_inputs.iter().map(|_| ElementKind::F32).collect();
-    elements.push(ElementKind::I32); // dims
-    elements.push(ElementKind::F32); // out
+    let elements: Vec<ElementKind> = inputs
+        .iter()
+        .map(|input| match input {
+            Input::F32(_) => ElementKind::F32,
+            Input::I32(_) => ElementKind::I32,
+        })
+        .chain(std::iter::once(ElementKind::F32))
+        .collect();
     let kernel = ptx_kernel(&ptx, entry, &elements);
     ctx.dispatch_dev(
         label,
@@ -653,6 +512,8 @@ struct Fixtures<'a> {
     dir: &'a str,
     staged: Cell<u32>,
     missing: RefCell<Vec<String>>,
+    /// Every label [`Self::staged`] was asked about: the fixtures this binary has a case for.
+    looked_for: RefCell<Vec<String>>,
 }
 
 impl<'a> Fixtures<'a> {
@@ -661,17 +522,37 @@ impl<'a> Fixtures<'a> {
             dir,
             staged: Cell::new(0),
             missing: RefCell::new(Vec::new()),
+            looked_for: RefCell::new(Vec::new()),
         }
     }
 
-    /// True when `{dir}/{label}.ptx` is staged. A missing one prints a SKIP line and is remembered for
+    /// The labels of the `.ptx` files in the directory, sorted. An unreadable directory has none.
+    fn on_disk(&self) -> Vec<String> {
+        let mut labels: Vec<String> = std::fs::read_dir(self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension()? == "ptx")
+                    .then(|| path.file_stem()?.to_str().map(str::to_string))
+                    .flatten()
+            })
+            .collect();
+        labels.sort();
+        labels
+    }
+
+    /// True when `{dir}/{label}.ptx` is staged. A missing one is reported as not staged (never with a skip marker: the required-case gate reads a skip report in
+    /// any test's captured output as a skipped row, and the host tests below call this) and is remembered for
     /// [`Self::verdict`]. A staged fixture runs and can still fail the check.
     fn staged(&self, label: &str) -> bool {
+        self.looked_for.borrow_mut().push(label.to_string());
         if std::path::Path::new(&format!("{}/{label}.ptx", self.dir)).exists() {
             self.staged.set(self.staged.get() + 1);
             true
         } else {
-            println!("  {label}: SKIP (not staged)");
+            println!("  {label}: not staged");
             self.missing.borrow_mut().push(label.to_string());
             false
         }
@@ -692,12 +573,38 @@ impl<'a> Fixtures<'a> {
                 missing.len()
             ));
         }
+        let on_disk = self.on_disk();
+        let looked_for = self.looked_for.borrow();
+        let unchecked: Vec<&str> = on_disk
+            .iter()
+            .map(String::as_str)
+            .filter(|label| !looked_for.iter().any(|l| l == label) && !COMPILE_ONLY.contains(label))
+            .collect();
+        if !unchecked.is_empty() {
+            return Err(format!(
+                "staged in {} but neither checked nor listed in COMPILE_ONLY: {}",
+                self.dir,
+                unchecked.join(", ")
+            ));
+        }
         if required && !missing.is_empty() {
             return Err(format!(
                 "POOT_REQUIRE_PTX=1 and {} fixture(s) not staged in {}: {}",
                 missing.len(),
                 self.dir,
                 missing.join(", ")
+            ));
+        }
+        let stale: Vec<&str> = COMPILE_ONLY
+            .iter()
+            .copied()
+            .filter(|label| !on_disk.iter().any(|l| l == label))
+            .collect();
+        if required && !stale.is_empty() {
+            return Err(format!(
+                "POOT_REQUIRE_PTX=1 and COMPILE_ONLY lists fixture(s) nothing staged in {}: {}",
+                self.dir,
+                stale.join(", ")
             ));
         }
         Ok(format!(
@@ -770,6 +677,73 @@ mod tests {
             error.contains("POOT_REQUIRE_PTX=1") && error.contains("square"),
             "{error}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A kernel staged by the emit tests that this binary neither checks nor lists as compile-only is a failed run,
+    /// required or not: the directory is the source of truth for what exists.
+    #[test]
+    fn a_staged_fixture_nobody_checks_fails_the_run() {
+        let dir = stage("unchecked", &["add", "a_new_kernel"]);
+        let fixtures = Fixtures::new(dir.to_str().unwrap());
+        assert!(fixtures.staged("add"));
+        for required in [false, true] {
+            let error = fixtures.verdict(0, required).unwrap_err();
+            assert!(
+                error.contains("neither checked nor listed") && error.contains("a_new_kernel"),
+                "{error}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A compile-only fixture is no unchecked one; a required run whose directory lacks one is stale.
+    #[test]
+    fn compile_only_fixtures_are_allowed_and_must_exist_when_required() {
+        let mut files = vec!["add"];
+        files.extend(super::COMPILE_ONLY);
+        let dir = stage("compile-only", &files);
+        let fixtures = Fixtures::new(dir.to_str().unwrap());
+        assert!(fixtures.staged("add"));
+        assert!(fixtures.verdict(0, false).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = stage("compile-only-stale", &["add"]);
+        let fixtures = Fixtures::new(dir.to_str().unwrap());
+        assert!(fixtures.staged("add"));
+        let error = fixtures.verdict(0, true).unwrap_err();
+        assert!(
+            error.contains("COMPILE_ONLY") && error.contains("wg_sum"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_required_run_fails_for_each_compile_only_fixture_left_unstaged() {
+        for left_out in super::COMPILE_ONLY {
+            let mut files = vec!["add"];
+            files.extend(
+                super::COMPILE_ONLY
+                    .iter()
+                    .filter(|label| *label != left_out),
+            );
+            let dir = stage(&format!("unstaged-{left_out}"), &files);
+            let fixtures = Fixtures::new(dir.to_str().unwrap());
+            assert!(fixtures.staged("add"));
+            let error = fixtures.verdict(0, true).unwrap_err();
+            assert!(
+                error.contains("COMPILE_ONLY") && error.ends_with(left_out),
+                "{left_out}: {error}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        let mut files = vec!["add"];
+        files.extend(super::COMPILE_ONLY);
+        let dir = stage("all-staged", &files);
+        let fixtures = Fixtures::new(dir.to_str().unwrap());
+        assert!(fixtures.staged("add"));
+        assert!(fixtures.verdict(0, true).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -310,7 +310,7 @@ fn a_dense_bf16_weight_epilogue_matches_the_oracle_on_wgpu() {
 /// POOT-1032 (wgpu, the generated tiled GEMM): the dense head at `M > 1` over an F32 and a packed-BF16 `[N, K]`
 /// weight, with the same four-step chain, fuses into one `ContractionEpilogue { head: Dense }` dispatch, at a
 /// single partial row-tile (`M == 5`) and at many (`M == 160`); the device result meets the oracle. Mutation: omit the residual or the bias leaf in `emit_epilogue`,
-/// or drop the epilogue from the tiled store in `tiled_region`; the nonzero inputs then differ and this row goes red.
+/// or drop the epilogue from the store chain of `tiled_body` (`contraction/tiled.rs`); the nonzero inputs then differ and this row goes red.
 #[test]
 fn a_dense_tiled_epilogue_matches_the_oracle_on_wgpu() {
     let _gpu_guard = gpu_lock();

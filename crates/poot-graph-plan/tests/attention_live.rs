@@ -646,7 +646,8 @@ fn a_narrow_live_composite_evaluates_to_the_first_keys_oracle_with_a_poisoned_ta
 /// POOT-1041, the planner: a BF16 or F16 live graph never fuses into the F32 attention kernel (the guarded
 /// graph keeps its primitives), and its float selects plan as pointwise kernels over native two-byte branch
 /// leaves on ROCm and PTX. SPIR-V has no native two-byte lane, so the same graph is refused there with the
-/// typed `DtypeLowering` on the select. Mutations: drop the `NotF32` decline in `match_attention` (the BF16
+/// typed `DtypeLowering` on its first two-byte equation it cannot lower (the F16 select; the BF16 narrowing
+/// cast). Mutations: drop the `NotF32` decline in `match_attention` (the BF16
 /// capacity row fuses to an `Attention` op); drop the BF16/F16 arm of the `Select` planning in
 /// `planner/elementwise.rs` (the ROCm and PTX plans fail `DtypeLowering`, and the SPIR-V refusal row stays).
 #[test]
@@ -675,10 +676,18 @@ fn a_narrow_live_graph_plans_its_selects_natively_and_spirv_refuses_them() {
                     panic!("{dtype:?} {name}: expected a typed refusal, got {error:?}");
                 };
                 assert_eq!(refusal.missing, Capability::DtypeLowering, "{dtype:?}");
-                assert!(
-                    matches!(refusal.op, OpKind::Select),
-                    "{dtype:?}: {refusal:?}"
-                );
+                // A BF16 graph is refused at its first bf16 equation, the cast narrowing into it (SPIR-V
+                // has no bf16 type to store, POOT-1395); an F16 one at the select.
+                let first = match dtype {
+                    poot_tensor::DType::BF16 => matches!(
+                        refusal.op,
+                        OpKind::Cast {
+                            to: poot_tensor::DType::BF16
+                        }
+                    ),
+                    _ => matches!(refusal.op, OpKind::Select),
+                };
+                assert!(first, "{dtype:?}: {refusal:?}");
                 continue;
             }
             let program = result.unwrap_or_else(|e| panic!("{dtype:?} {name}: must plan: {e}"));

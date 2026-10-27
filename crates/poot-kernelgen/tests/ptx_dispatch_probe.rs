@@ -31,7 +31,7 @@ fn wmma_tile_dispatches_and_matches_cpu_on_ptx() {
     let ctx = match PtxContext::new() {
         Ok(ctx) => ctx,
         Err(e) => {
-            eprintln!("SKIP wmma_tile_dispatches_and_matches_cpu_on_ptx: no PTX device ({e})");
+            eprintln!("POOT-SKIP wmma_tile_dispatches_and_matches_cpu_on_ptx: no PTX device ({e})");
             return;
         }
     };
@@ -149,7 +149,7 @@ fn run_attention_over_keys_on_ptx(
     let mut buffers = vec![&q_buf, &k_buf, &v_buf, &mask_buf];
     buffers.extend(shared_buf.as_ref());
     buffers.extend(len_buf.as_ref());
-    let counts: Vec<u32> = buffers.iter().map(|buffer| buffer.elem_count()).collect();
+    let counts: Vec<usize> = buffers.iter().map(|buffer| buffer.elem_count()).collect();
     ctx.dispatch_dev(
         name,
         &kernel,
@@ -184,6 +184,7 @@ fn attention_spec(
     score: kg::ScoreTransform,
 ) -> kg::AttentionSpec {
     kg::AttentionSpec {
+        kv: poot_kernelgen::KvLane::F32,
         batch,
         hq,
         n_rep,
@@ -210,7 +211,7 @@ fn attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx() {
         Ok(ctx) => ctx,
         Err(e) => {
             eprintln!(
-                "SKIP attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx: no PTX device ({e})"
+                "POOT-SKIP attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx: no PTX device ({e})"
             );
             return;
         }
@@ -252,7 +253,7 @@ fn attention_fixture_bank_matches_cpu_on_ptx() {
     let ctx = match PtxContext::new() {
         Ok(ctx) => ctx,
         Err(e) => {
-            eprintln!("SKIP attention_fixture_bank_matches_cpu_on_ptx: no PTX device ({e})");
+            eprintln!("POOT-SKIP attention_fixture_bank_matches_cpu_on_ptx: no PTX device ({e})");
             return;
         }
     };
@@ -371,7 +372,7 @@ fn attention_split_key_and_live_bound_match_cpu_on_ptx() {
         Ok(ctx) => ctx,
         Err(e) => {
             eprintln!(
-                "SKIP attention_split_key_and_live_bound_match_cpu_on_ptx: no PTX device ({e})"
+                "POOT-SKIP attention_split_key_and_live_bound_match_cpu_on_ptx: no PTX device ({e})"
             );
             return;
         }
@@ -379,6 +380,7 @@ fn attention_split_key_and_live_bound_match_cpu_on_ptx() {
     let (batch, hq, lk, dk, dv, shared) = (4usize, 2usize, 100usize, 192usize, 128usize, 64usize);
     let head = dk - shared;
     let spec = kg::AttentionSpec {
+        kv: poot_kernelgen::KvLane::F32,
         batch,
         hq,
         n_rep: 1,

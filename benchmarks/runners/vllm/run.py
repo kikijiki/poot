@@ -27,6 +27,8 @@ os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 import vllm
 from vllm import LLM, SamplingParams
 
+from stream_itl import TokenStream, fixed_length_kwargs
+
 
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
@@ -63,22 +65,12 @@ def run_decode_curve(args):
         enable_prefix_caching=False))
 
     async def gen_once(ids):
-        sp = SamplingParams(min_tokens=osl, max_tokens=osl, temperature=0.0, ignore_eos=True)
+        sp = SamplingParams(**fixed_length_kwargs(osl))
         prompt = TokensPrompt(prompt_token_ids=ids) if TokensPrompt else {"prompt_token_ids": ids}
-        t0 = time.perf_counter()
-        ttft, last, prev, itls = None, None, 0, []
+        stream = TokenStream(time.perf_counter())
         async for out in engine.generate(prompt, sp, request_id=str(uuid.uuid4())):
-            now = time.perf_counter()
-            n = len(out.outputs[0].token_ids)
-            if n > prev:
-                if ttft is None:
-                    ttft, last = (now - t0) * 1000.0, now
-                else:
-                    new = n - prev
-                    itls.extend([(now - last) * 1000.0 / new] * new)
-                    last = now
-                prev = n
-        return ttft, (time.perf_counter() - t0) * 1000.0, itls
+            stream.observe(time.perf_counter(), len(out.outputs[0].token_ids))
+        return stream.finish(time.perf_counter(), osl)
 
     async def run():
         curve = []
@@ -96,7 +88,7 @@ def run_decode_curve(args):
 
     curve = asyncio.run(run())
     print(json.dumps({
-        "framework": "vllm", "framework_version": vllm.__version__, "precision": args.precision,
+        "framework": "vllm", "backend": "cuda", "framework_version": vllm.__version__, "precision": args.precision,
         "mode": "decode-curve", "osl": osl,
         "self_reported_vram_bytes": int(torch.cuda.memory_allocated()),
         "caveats": caveats, "curve": curve}))
@@ -147,7 +139,7 @@ def main():
     weights_vram = int(torch.cuda.memory_allocated())
 
     n = args.gen_tokens
-    sp = SamplingParams(min_tokens=n, max_tokens=n, temperature=0.0, ignore_eos=True)
+    sp = SamplingParams(**fixed_length_kwargs(n))
     sp_prefill = SamplingParams(max_tokens=1, temperature=0.0)
 
     def full():
@@ -180,6 +172,7 @@ def main():
     sd = lambda xs: statistics.pstdev(xs) if len(xs) > 1 else 0.0
     out = {
         "framework": "vllm",
+        "backend": "cuda",
         "framework_version": vllm.__version__,
         "precision": args.precision,
         "prompt_tokens": prompt_tokens,

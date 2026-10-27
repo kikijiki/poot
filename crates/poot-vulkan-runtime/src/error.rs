@@ -41,7 +41,7 @@ pub enum RuntimeError {
         /// Requested buffer size in bytes.
         bytes: usize,
     },
-    /// A dispatch was given a [`poot_runtime_common::CompiledKernel`] compiled for a different backend
+    /// A dispatch was given a [`poot_codegen::CompiledKernel`] compiled for a different backend
     /// (card 608): this runtime only ever dispatches a `SpirvVulkan` kernel.
     #[error(
         "Vulkan dispatch requires a SpirvVulkan-compiled kernel, got one compiled for {actual:?}"
@@ -53,7 +53,7 @@ pub enum RuntimeError {
     /// The bound buffers did not meet the compiled kernel's argument schema (card 608, SC-002): a typed
     /// release-build error before any submission.
     #[error("kernel argument schema violation: {0}")]
-    KernelArgs(#[from] poot_runtime_common::KernelArgError),
+    KernelArgs(#[from] poot_codegen::KernelArgError),
     /// A dispatch argument told the kernel it holds more elements than its buffer does. The kernel trusts
     /// the length it is published, so the dispatch is refused before anything is recorded.
     #[error("dispatch argument {arg} asserts {elems} elements, its buffer holds {capacity}")]
@@ -61,7 +61,7 @@ pub enum RuntimeError {
         /// Position of the argument in the dispatch.
         arg: usize,
         /// The element count the dispatch asserted.
-        elems: u32,
+        elems: usize,
         /// The element count the buffer holds.
         capacity: usize,
     },
@@ -137,6 +137,12 @@ pub enum RuntimeError {
     #[error("a {elems}-element f32 buffer overflows usize bytes")]
     ElementCountOverflow {
         /// The element count that overflowed.
+        elems: usize,
+    },
+    /// A dispatch argument's element count does not fit the `u32` length the SPIR-V kernel ABI passes.
+    #[error("dispatch argument asserts {elems} elements, past the 32-bit Vulkan kernel-length ABI")]
+    KernelLengthTooLarge {
+        /// The element count that does not fit in `u32`.
         elems: usize,
     },
     /// A host write larger than the destination buffer.

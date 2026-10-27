@@ -3,7 +3,7 @@ use poot_target::BufferStorage;
 /// host transfers. Typed so a caller matches on the variant, never on message text.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
-    /// A dispatch was given a [`poot_runtime_common::CompiledKernel`] compiled for a different backend
+    /// A dispatch was given a [`poot_codegen::CompiledKernel`] compiled for a different backend
     /// (card 608): wgpu only ever dispatches a `SpirvVulkan` kernel.
     #[error(
         "wgpu dispatch requires a SpirvVulkan-compiled kernel, got one compiled for {actual:?}"
@@ -15,7 +15,7 @@ pub enum RuntimeError {
     /// The bound buffers did not meet the compiled kernel's argument schema (card 608, SC-002): a typed
     /// release-build error before any submission.
     #[error("kernel argument schema violation: {0}")]
-    KernelArgs(#[from] poot_runtime_common::KernelArgError),
+    KernelArgs(#[from] poot_codegen::KernelArgError),
     /// wgpu found no adapter it can drive; the payload is the request failure's message.
     #[error("no Vulkan adapter: {0}")]
     NoAdapter(String),
@@ -56,6 +56,12 @@ pub enum RuntimeError {
     Poisoned {
         /// The refused operation, for the message.
         op: &'static str,
+    },
+    /// A dispatch argument's element count does not fit the `u32` length the WGSL kernel ABI passes.
+    #[error("dispatch argument asserts {elems} elements, past the 32-bit wgpu kernel-length ABI")]
+    KernelLengthTooLarge {
+        /// The element count that does not fit in `u32`.
+        elems: usize,
     },
     /// An allocation larger than the device's `max_buffer_size`, refused before wgpu sees it.
     #[error("a {bytes}-byte {role:?} allocation exceeds the device's {limit}-byte buffer limit")]
@@ -151,6 +157,20 @@ pub enum RuntimeError {
         /// Byte offset of the write.
         offset: usize,
         /// Byte length of the write.
+        len: usize,
+    },
+    /// wgpu returned no staging view for a range that was in bounds and word aligned: the device refused the
+    /// staging allocation, typically because it is already gone (POOT-1313: a dispatch past the display
+    /// watchdog reset the context, and the next upload surfaced as a misalignment).
+    #[error(
+        "{op} could not stage {len} bytes at byte offset {offset}: the device refused the allocation"
+    )]
+    StagingRefused {
+        /// The transfer entry point that refused, for the message.
+        op: &'static str,
+        /// Byte offset of the write.
+        offset: usize,
+        /// Byte length of the staging allocation.
         len: usize,
     },
     /// Offset or length arithmetic overflowed before the write (card 527 review G2).

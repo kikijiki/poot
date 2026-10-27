@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::db::PodOwnerPrefix;
 
 const BASE: &str = "https://rest.runpod.io/v1";
+/// The GraphQL endpoint: the only RunPod API that lists what a GPU type costs per cloud (REST v1 has no price
+/// before a pod exists).
+const GRAPHQL: &str = "https://api.runpod.io/graphql";
 
 pub(crate) struct RunPod {
     client: reqwest::blocking::Client,
@@ -16,6 +19,8 @@ pub(crate) struct RunPod {
     /// REST v1 origin. Production always uses [`BASE`]; host tests may point at a
     /// loopback fixture with [`RunPod::with_base`] to observe real request paths.
     base: String,
+    /// GraphQL origin for the GPU catalog; [`RunPod::with_base`] points it at the same loopback fixture.
+    graphql: String,
 }
 
 /// A pod as the REST API returns it. `public_ip` and `port_mappings` populate only once the pod has
@@ -36,7 +41,51 @@ pub(crate) struct Pod {
     /// community machine).
     #[serde(default)]
     pub machine: serde_json::Value,
+    /// The CUDA version the pod reports, once the API knows it (not part of RunPod's documented Pod schema).
+    #[serde(rename = "cudaVersion")]
+    pub cuda_version: Option<String>,
+    /// What the pod bills per hour (USD): `costPerHr` in the create response, `cost` on a read of the pod.
+    #[serde(rename = "costPerHr", alias = "cost")]
+    pub cost_per_hr: Option<f64>,
 }
+
+impl Pod {
+    /// The CUDA version the pod reports: the pod's own `cudaVersion`, else its machine's. `None` while the API has
+    /// not assigned a host yet (or does not report one), which is not "below any floor".
+    pub(crate) fn reported_cuda(&self) -> Option<String> {
+        self.cuda_version
+            .clone()
+            .or_else(|| self.machine.get("cudaVersion")?.as_str().map(String::from))
+            .filter(|v| !v.trim().is_empty())
+    }
+}
+
+/// RunPod refused a create call with this HTTP status and body.
+#[derive(Debug, thiserror::Error)]
+#[error("create_pod failed ({status}): {body}")]
+pub(crate) struct CreateError {
+    pub(crate) status: u16,
+    pub(crate) body: String,
+}
+
+impl CreateError {
+    /// Whether waiting could fix this refusal: a server error, or a body carrying one of RunPod's no-capacity
+    /// messages. Any other 4xx (a bad GPU type or cloud value, auth, an unknown or unavailable image or template)
+    /// never fixes itself.
+    pub(crate) fn is_capacity(&self) -> bool {
+        const NO_CAPACITY: [&str; 2] = [
+            "no instances currently available",
+            "does not have the resources to deploy your pod",
+        ];
+        let body = self.body.to_lowercase();
+        self.status >= 500 || NO_CAPACITY.iter().any(|message| body.contains(message))
+    }
+}
+
+/// RunPod answered 404: the pod does not exist (any other `get_pod` failure says nothing about the pod).
+#[derive(Debug, thiserror::Error)]
+#[error("pod {0} does not exist (404)")]
+pub(crate) struct PodNotFound(pub String);
 
 impl Pod {
     /// True once a host machine has been assigned (the `machine` object is non-empty).
@@ -106,11 +155,6 @@ pub struct CreateSpec<'a> {
     pub network_volume_id: Option<&'a str>,
     /// Data centers to pin the pod to (`dataCenterIds`). Empty means no pin (field omitted).
     pub data_center_ids: &'a [&'a str],
-    /// Host CUDA versions to place on (`allowedCudaVersions`, e.g. `["12.8","12.9","13.0"]`); empty means
-    /// no filter. Must cover the image's requirement (the default `cu1281` image needs >= 12.8), else an
-    /// older-driver host fails the nvidia-container-cli hook (`unsatisfied condition: cuda>=12.8`) with an
-    /// OCI start error or a pod that never gets a machine. Build from a floor with `cuda_floor_to_allowed`.
-    pub allowed_cuda_versions: &'a [String],
 }
 
 /// ONE table of RunPod GPU types this orchestrator provisions: (catalog id spelling, REST display
@@ -163,10 +207,78 @@ pub(crate) fn create_pod_body(spec: &CreateSpec<'_>) -> serde_json::Value {
     if !spec.data_center_ids.is_empty() {
         body["dataCenterIds"] = serde_json::json!(spec.data_center_ids);
     }
-    if !spec.allowed_cuda_versions.is_empty() {
-        body["allowedCudaVersions"] = serde_json::json!(spec.allowed_cuda_versions);
-    }
     body
+}
+
+/// One GPU type of RunPod's catalog with its hourly price per GPU in each cloud (`None`: not offered there).
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct GpuPrice {
+    pub id: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(rename = "communityPrice")]
+    pub community: Option<f64>,
+    #[serde(rename = "securePrice")]
+    pub secure: Option<f64>,
+}
+
+/// What the catalog says one GPU type costs in one cloud.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum CatalogPrice {
+    /// The catalog does not list this GPU type at all: it says nothing about price.
+    Unlisted,
+    /// The catalog lists the type but the cloud does not offer it.
+    NotOffered,
+    /// USD per hour for the whole pod (per-GPU price times the GPU count).
+    PerHour(f64),
+}
+
+/// RunPod's GPU catalog, as far as pricing goes.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GpuCatalog {
+    pub(crate) gpus: Vec<GpuPrice>,
+}
+
+impl GpuCatalog {
+    /// The hourly price of a pod of `gpu_count` `gpu` GPUs in `cloud`. `gpu` is a `--gpu-types` token: a catalog
+    /// id or a display name.
+    pub(crate) fn price(&self, gpu: &str, cloud: CloudType, gpu_count: u32) -> CatalogPrice {
+        let display = normalize_gpu_type_id(gpu);
+        let Some(entry) = self
+            .gpus
+            .iter()
+            .find(|g| g.id == gpu || g.display_name == display)
+        else {
+            return CatalogPrice::Unlisted;
+        };
+        let per_gpu = match cloud {
+            CloudType::Community => entry.community,
+            CloudType::Secure => entry.secure,
+        };
+        // The catalog spells "not offered" as null or 0.
+        match per_gpu.filter(|price| *price > 0.0) {
+            Some(price) => CatalogPrice::PerHour(price * f64::from(gpu_count)),
+            None => CatalogPrice::NotOffered,
+        }
+    }
+}
+
+/// Parse the `gpuTypes` GraphQL answer.
+pub(crate) fn parse_gpu_catalog(text: &str) -> Result<GpuCatalog> {
+    #[derive(Deserialize)]
+    struct Data {
+        #[serde(rename = "gpuTypes")]
+        gpu_types: Vec<GpuPrice>,
+    }
+    #[derive(Deserialize)]
+    struct Answer {
+        data: Data,
+    }
+    serde_json::from_str::<Answer>(text)
+        .map(|answer| GpuCatalog {
+            gpus: answer.data.gpu_types,
+        })
+        .with_context(|| format!("parse gpu catalog: {text}"))
 }
 
 /// Parse a `list_pods` body: a bare `[...]` array (what `GET /pods` returns) or a `{ "pods": [...] }`
@@ -195,10 +307,17 @@ impl RunPod {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()?;
+        let base = base.into();
+        let graphql = if base == BASE {
+            GRAPHQL.to_string()
+        } else {
+            format!("{base}/graphql")
+        };
         Ok(RunPod {
             client,
             key,
-            base: base.into(),
+            base,
+            graphql,
         })
     }
 
@@ -216,10 +335,31 @@ impl RunPod {
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow!("create_pod failed ({status}): {text}"));
+            return Err(CreateError {
+                status: status.as_u16(),
+                body: text,
+            }
+            .into());
         }
         serde_json::from_str::<Pod>(&text)
             .with_context(|| format!("parse create_pod response: {text}"))
+    }
+
+    /// The GPU catalog with each cloud's hourly price per GPU.
+    pub(crate) fn gpu_catalog(&self) -> Result<GpuCatalog> {
+        let resp = self
+            .auth(self.client.post(&self.graphql))
+            .json(&serde_json::json!({
+                "query": "{ gpuTypes { id displayName communityPrice securePrice } }"
+            }))
+            .send()
+            .context("gpu catalog request")?;
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("gpu catalog failed ({status}): {text}"));
+        }
+        parse_gpu_catalog(&text)
     }
 
     pub(crate) fn get_pod(&self, id: &str) -> Result<Pod> {
@@ -229,6 +369,9 @@ impl RunPod {
             .context("get_pod request")?;
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(PodNotFound(id.to_string()).into());
+        }
         if !status.is_success() {
             return Err(anyhow!("get_pod {id} failed ({status}): {text}"));
         }
@@ -279,6 +422,42 @@ mod tests {
 
     fn owner() -> PodOwnerPrefix {
         Db::open(":memory:").unwrap().pod_owner_prefix().unwrap()
+    }
+
+    /// The catalog answer parses, and a null or zero price reads as "not offered".
+    #[test]
+    fn the_gpu_catalog_parses_and_reads_null_or_zero_as_not_offered() {
+        let catalog = parse_gpu_catalog(
+            r#"{"data":{"gpuTypes":[
+                {"id":"NVIDIA GeForce RTX 3090","displayName":"RTX 3090","communityPrice":0.22,"securePrice":0.5},
+                {"id":"NVIDIA H100 80GB HBM3","displayName":"H100 SXM","communityPrice":null,"securePrice":2.69},
+                {"id":"AMD Instinct MI300X OAM","displayName":"MI300X","communityPrice":0,"securePrice":1.99}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog.price("NVIDIA GeForce RTX 3090", CloudType::Community, 1),
+            CatalogPrice::PerHour(0.22)
+        );
+        assert_eq!(
+            catalog.price("NVIDIA H100 80GB HBM3", CloudType::Community, 1),
+            CatalogPrice::NotOffered
+        );
+        assert_eq!(
+            catalog.price("MI300X", CloudType::Community, 1),
+            CatalogPrice::NotOffered
+        );
+        assert!(parse_gpu_catalog(r#"{"errors":[{"message":"unauthorized"}]}"#).is_err());
+    }
+
+    /// The price is `costPerHr` on a create response and `cost` on a pod read.
+    #[test]
+    fn a_pod_price_is_costperhr_or_cost() {
+        let create: Pod = serde_json::from_str(r#"{"id":"a","costPerHr":0.22}"#).unwrap();
+        let read: Pod = serde_json::from_str(r#"{"id":"a","cost":2.49}"#).unwrap();
+        assert_eq!(
+            (create.cost_per_hr, read.cost_per_hr),
+            (Some(0.22), Some(2.49))
+        );
     }
 
     /// A running pod deserializes, and `ssh_endpoint`/`machine_ready` reflect a booted pod.
@@ -375,7 +554,6 @@ mod tests {
             env: &env,
             network_volume_id: None,
             data_center_ids: &[],
-            allowed_cuda_versions: &[],
         };
         let body = create_pod_body(&spec);
         assert_eq!(
@@ -397,7 +575,6 @@ mod tests {
         assert!(body.get("networkVolumeId").is_none());
         assert!(body.get("volumeMountPath").is_none());
         assert!(body.get("dataCenterIds").is_none());
-        assert!(body.get("allowedCudaVersions").is_none());
         let env_val = body.get("env").expect("create body must include env");
         assert!(
             env_val.is_object(),
@@ -438,7 +615,6 @@ mod tests {
             env: &env,
             network_volume_id: None,
             data_center_ids: &[],
-            allowed_cuda_versions: &[],
         };
         let body = create_pod_body(&unset);
         assert!(
@@ -447,10 +623,8 @@ mod tests {
         );
         assert!(body.get("volumeMountPath").is_none());
         assert!(body.get("dataCenterIds").is_none());
-        assert!(body.get("allowedCudaVersions").is_none());
         assert!(body["env"].is_object());
 
-        let cuda = vec!["12.8".to_string(), "12.9".to_string()];
         let set = CreateSpec {
             owner: &owner,
             run_id: "n",
@@ -464,16 +638,14 @@ mod tests {
             env: &env,
             network_volume_id: Some("vol-1"),
             data_center_ids: &["US-CA-2"],
-            allowed_cuda_versions: &cuda,
         };
         let body = create_pod_body(&set);
         assert_eq!(body["networkVolumeId"], "vol-1");
         assert_eq!(body["volumeMountPath"], "/workspace");
         assert_eq!(body["dataCenterIds"], serde_json::json!(["US-CA-2"]));
-        assert_eq!(
-            body["allowedCudaVersions"],
-            serde_json::json!(["12.8", "12.9"])
-        );
+        // RunPod's `allowedCudaVersions` enum stops at 13.0, so no CUDA filter is ever sent: a floor is checked
+        // against the pod's reported version after the create.
+        assert!(body.get("allowedCudaVersions").is_none());
         assert!(body["env"].is_object());
     }
 
@@ -496,7 +668,6 @@ mod tests {
             env: &env,
             network_volume_id: None,
             data_center_ids: dcs,
-            allowed_cuda_versions: &[],
         };
 
         // Absent: field must not appear (keeps existing behavior when no --data-center).
@@ -566,7 +737,6 @@ mod tests {
             env: &env,
             network_volume_id: None,
             data_center_ids: &[],
-            allowed_cuda_versions: &[],
         };
         let body = create_pod_body(&spec);
         assert_eq!(

@@ -6,63 +6,63 @@
       "repeats": [
         {
           "metrics": {
-            "step_us": 2987.545
+            "step_us": 2964.808
           },
           "slot": 0,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2916.632
+            "step_us": 2936.735
           },
           "slot": 1,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2738.449
+            "step_us": 3201.701
           },
           "slot": 2,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2706.899
+            "step_us": 3204.6969999999997
           },
           "slot": 3,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2802.118
+            "step_us": 3312.498
           },
           "slot": 4,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2834.158
+            "step_us": 3402.747
           },
           "slot": 5,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2764.016
+            "step_us": 2967.5130000000004
           },
           "slot": 6,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2815.6740000000004
+            "step_us": 2857.567
           },
           "slot": 7,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2848.364
+            "step_us": 2816.059
           },
           "slot": 8,
           "status": "ok"
@@ -101,9 +101,9 @@
     "weight_copies": 1
   },
   "plan": [
-    "scan [5121a7beb7d57f34cba39028370bd0d087324e85509c5d5093b789ad64ffd19d]"
+    "scan [d3885d4387d9ed8dea301b6f9c87efc016cb8c5f00cb57b316df16287a564cb7]"
   ],
-  "plan_id": "bb09b35bd028045e3599fcf0abbdbdc55f7653cdf8bcdd7c8ab60ab8d6dd0a4a",
+  "plan_id": "afadb7d4aa92abd596ad46ca4bc5c796ca3dfeb664dc642b2e226927ddccbc93",
   "recordings": 1,
   "reference": {
     "agrees": true,
@@ -120,7 +120,7 @@
     "run",
     "--release",
     "-p",
-    "poot-gpu",
+    "poot-wgpu-device",
     "--example",
     "performance_bank",
     "--",
@@ -131,8 +131,8 @@
     "--out",
     "benchmarks/performance-bank/receipts/wgpu/ssd-recurrence-scan-many-heads.json"
   ],
-  "parent_revision": "2f1101ab3028740aed658e1068aa6638d2328447",
-  "binary_sha256": "4be305c1c3c2c541b1ad2401348c8c89f72f1d5b4fadb058862f5a87b77d7fe9",
+  "parent_revision": "21da98dafbdbc5887ce2943f1e7609381412b01c",
+  "binary_sha256": "59fb25d4b5612f6e7fff1a8733ea1d5fe6fd175eb42fe4ece8f827d434b78935",
   "identity": {
     "checkpoint_digest": "synthetic-no-checkpoint",
     "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
@@ -167,7 +167,7 @@
     },
     "backend": "wgpu",
     "device": "AMD Radeon 8060S Graphics",
-    "driver": "host kernel 7.2.9"
+    "driver": "host kernel 7.3.0"
   },
   "identity_digest": "2698bba5df4640b6b876582f425d998530c0f8bcf680d225fa632825a5aa79ce",
   "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb"

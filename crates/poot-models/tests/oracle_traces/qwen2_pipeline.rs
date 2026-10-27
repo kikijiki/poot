@@ -130,7 +130,7 @@ pub(super) fn eval_step(
     }
     for (i, (si, _)) in g.state().enumerate() {
         let carried = match state {
-            None => HostTensor::zeros(g.aval(si).shape.clone()),
+            None => HostTensor::zeros_of(g.aval(si).dtype, g.aval(si).shape.clone()),
             Some(prev) => prev[i].clone(),
         };
         inputs.insert(si, Value::from(carried));

@@ -2,9 +2,9 @@
 //! importer reuses the loop var as a `0..x.len()` counter and rewrites `*v` to `x[counter]`. out[r] = sum
 //! of every element of x (same for each row), so a wrong bound would undercount.
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 pub fn __poot_kernel_for_slice(x: &[f32], out: &mut [f32]) {
-    let r = thread_index();
+    let r = thread_index_x();
     if r < out.len() {
         let mut acc = 0.0f32;
         for v in x {

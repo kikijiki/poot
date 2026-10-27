@@ -4,10 +4,10 @@
 
 use std::path::PathBuf;
 
+use poot_codegen::CompiledKernel;
 use poot_codegen::{Target, compile_kernel, kernel_handle};
 use poot_kernel_ir::fixtures;
 use poot_kernel_ir::test_support::{matmul_kernel, square_kernel};
-use poot_runtime_common::CompiledKernel;
 use poot_wgpu_runtime::{Context, KernelBuffer};
 
 fn spv_for(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel {

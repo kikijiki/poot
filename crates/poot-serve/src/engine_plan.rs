@@ -25,7 +25,7 @@ use poot_graph_plan::{
 use poot_llm::driver::block_table::BLOCK_SIZE;
 use poot_llm::driver::capacity::{
     Budget, CapacityRefusal, EncodeNeed, Fit, FitError, Observation, PlanError, PlanFailure,
-    Planner, prepare_encode, verify_prepared,
+    Planner, SUPPORT_RESERVE_BYTES, prepare_encode, verify_prepared,
 };
 use poot_llm::driver::error::{DriverError, Unsupported};
 use poot_llm::driver::placement::{BalanceError, LayerBytes, Placement, balance_layers};
@@ -34,14 +34,10 @@ use poot_llm::driver::{
     ModelHandle, PoolShape, PreparedSetLimits, Serving, ServingShapes, Warm,
 };
 use poot_models::io::ModelSchema;
+use poot_models::model::KvDtype;
 use poot_target::{Backend as TargetBackend, TargetId};
 
 use crate::config::{DEFAULT_ENCODE_ROWS, DEFAULT_MAX_SEQ, DEFAULT_ROWS, PlacementSpec};
-
-/// Bytes kept back on every device for allocations the planner cannot see: recordings, staging and
-/// driver state a runtime makes on its own. A bound, not a measurement; the live counters are checked
-/// against the budget less this after prepare.
-pub(crate) const SUPPORT_RESERVE_BYTES: u64 = 256 << 20;
 
 /// The fewest positions per sequence the fit will offer.
 const MIN_MAX_SEQ: usize = 128;
@@ -68,6 +64,9 @@ pub(crate) struct EngineArgs {
     pub(crate) embeds: bool,
     /// Pool rows per routed selection when experts are paged ([`Driver::with_expert_pool`]).
     pub(crate) expert_pool: Option<NonZeroUsize>,
+    /// The KV cache dtype the operator asked for ([`DriverOptions::kv_dtype`]); `None` takes the model's
+    /// preference or the engine default.
+    pub(crate) kv_dtype: Option<KvDtype>,
 }
 
 impl EngineArgs {
@@ -78,9 +77,15 @@ impl EngineArgs {
             draft,
             embeds: false,
             expert_pool: None,
+            kv_dtype: None,
             rows: None,
             max_seq: DEFAULT_MAX_SEQ,
         }
+    }
+
+    /// Store the KV cache as `kv_dtype` when it is `Some`.
+    pub(crate) fn with_kv_dtype(self, kv_dtype: Option<KvDtype>) -> Self {
+        Self { kv_dtype, ..self }
     }
 
     /// The rows and positions to ask the fit for first.
@@ -424,7 +429,12 @@ fn domain(rows: NonZeroUsize, max_seq: NonZeroUsize) -> Vec<Candidate> {
     }
 }
 
-fn driver_options(handle: &ModelHandle, workload: Workload, draft: DraftPolicy) -> DriverOptions {
+fn driver_options(
+    handle: &ModelHandle,
+    workload: Workload,
+    draft: DraftPolicy,
+    kv_dtype: Option<KvDtype>,
+) -> DriverOptions {
     let max_seq = workload.max_seq();
     // The largest granule multiple within the chunk budget and the capacity, and never below one granule.
     let granule = handle.config().prefill_granule.get();
@@ -447,6 +457,7 @@ fn driver_options(handle: &ModelHandle, workload: Workload, draft: DraftPolicy) 
             max_entries: NonZeroUsize::new(MAX_ENTRIES).expect("nonzero"),
             max_retained_bytes: NonZeroU64::new(MAX_RETAINED_BYTES).expect("nonzero"),
         },
+        kv_dtype,
         ..DriverOptions::generation(max_seq, chunk).with_draft(draft)
     }
 }
@@ -730,7 +741,12 @@ fn fit_and_prepare(
         |candidate| {
             let rows = [candidate.rows];
             let carried = carried_inputs(args, handle);
-            let options = driver_options(handle, workload.fitted(candidate), args.draft.clone());
+            let options = driver_options(
+                handle,
+                workload.fitted(candidate),
+                args.draft.clone(),
+                args.kv_dtype,
+            );
             let encode = encode_shapes_of(candidate);
             match workload {
                 Workload::Generate { .. } => planner.plan_workload(
@@ -773,7 +789,12 @@ fn fit_and_prepare(
         .collect::<Result<Vec<_>, _>>()?;
     let mut driver = launch.driver(
         Arc::clone(handle),
-        driver_options(handle, workload.fitted(&chosen), args.draft.clone()),
+        driver_options(
+            handle,
+            workload.fitted(&chosen),
+            args.draft.clone(),
+            args.kv_dtype,
+        ),
         placement.clone(),
     )?;
     if let Some(slots) = args.expert_pool {

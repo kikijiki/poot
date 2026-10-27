@@ -25,6 +25,13 @@ def manifest():
 
 
 class ManifestTests(unittest.TestCase):
+    def test_a_model_id_is_declared_once(self):
+        ids = [model["id"] for model in manifest()["model"]]
+        self.assertEqual(
+            sorted({i for i in ids if ids.count(i) > 1}), [],
+            "a model declared twice runs every one of its cells twice per repeat, and the rows pool into one cell",
+        )
+
     def test_no_poot_entry_carries_a_hand_written_support_list(self):
         for model in manifest()["model"]:
             entry = model["frameworks"].get("poot")

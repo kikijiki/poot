@@ -1,136 +1,79 @@
 ---
 id: serving-design
 title: Serving design
-sidebar_position: 10
+sidebar_position: 11
 ---
 
 import ContinuousBatchingDiagram from "@site/src/components/architecture/ContinuousBatchingDiagram";
 
 # Serving design
 
-`poot-serve` is an OpenAI-compatible HTTP server. It parses and bounds requests, loads any registered
-model as a `ModelHandle`, and serves `/v1/completions` and `/v1/chat/completions` from one scheduling loop
-over the driver's `step`. `/v1/embeddings`, `/v1/rerank` and the LoRA administration routes run on the same
-engine thread, as `encode` steps and adapter operations between requests. Operator guides live under
-[Serving](../serve/index.md).
+`poot-serve` is an OpenAI-compatible HTTP server. It parses and bounds requests, loads any registered model as a `ModelHandle`, and serves completions and chat from one scheduling loop over the driver's `step`. Embeddings, rerank and LoRA administration run on the same engine thread, between requests. Operator guides live under [Serving](../serve/index.md).
 
 ## API
 
-| Endpoint                    | Description                                       |
-| --------------------------- | ------------------------------------------------- |
+| Endpoint | Description |
+| --- | --- |
 | `POST /v1/chat/completions` | Chat completion, streaming (SSE) or buffered JSON |
-| `POST /v1/completions`      | Raw text completion                               |
-| `POST /v1/embeddings`       | Embedding vectors (an encoder, or a decoder's embedding pass) |
-| `POST /v1/rerank`           | Reranking scores (an encoder, or a decoder's embedding pass) |
-| `GET /v1/models`            | List the served model(s)                          |
-| `GET /v1/models/{id}`       | Describe one served model                         |
-| `/v1/lora_adapters`         | LoRA administration: list, hot-load, unload       |
-| `GET /metrics`              | Server metrics as JSON                            |
-| `GET /metrics/prometheus`   | Server metrics in Prometheus exposition format    |
-| `GET /health`               | Liveness probe                                    |
+| `POST /v1/completions` | Raw text completion |
+| `POST /v1/embeddings`, `POST /v1/rerank` | Vectors and scores (an encoder, or a decoder's embedding pass) |
+| `GET /v1/models`, `GET /v1/models/{id}` | The served model(s) |
+| `/v1/lora_adapters` | LoRA administration: list, hot-load, unload |
+| `GET /metrics`, `GET /metrics/prometheus` | Server metrics as JSON, or in Prometheus format |
+| `GET /health` | Liveness probe |
 
 ## The scheduling loop
 
-**Continuous batching** [^orca] [^vllm]. In-flight requests share one batch per token; when one
-finishes, a waiting request takes its slot before the next step, so the batch never drains.
+**Continuous batching** [^orca] [^vllm]. In-flight requests share one batch per token. When one finishes, a waiting request takes its slot before the next step, so the batch never drains.
 
 <ContinuousBatchingDiagram />
 
-Because the graph has static shapes, the prepared entries are sized to the engine's row capacity and
-every step runs at that width, with empty rows masked out, so a changing batch composition compiles
-nothing. The driver reserves a request's paged KV blocks for its whole `max_tokens` when the loop opens
-the sequence, so a running request is never starved and none is preempted; a request that finds no room
-waits for a running one to finish. The loop (`batch/engine.rs`) is the only scheduler: admission, the
-per-step prefill token budget, token commit (end-of-sequence, stop strings, `max_tokens`) and terminal
-delivery; see [Continuous batching](../serve/continuous-batching.md).
+Graph shapes are static, so prepared entries are sized to the engine's row capacity and every step runs at that width, with empty rows masked. A changing batch compiles nothing.
 
-**Streaming.** Tokens are emitted as SSE events through a bounded channel, so a slow client applies
-back-pressure.
+The driver reserves a request's paged KV blocks for its whole `max_tokens` when it opens the sequence, so a running request is never starved and none is preempted. A request that finds no room waits. The loop (`batch/engine.rs`) is the only scheduler: admission, the per-step prefill budget, token commit and delivery. See [Continuous batching](../serve/continuous-batching.md).
 
-**Sampling.** Greedy, temperature, top-k and top-p [^topp], with logit bias, penalties and logprobs.
-Generation picks the next token on-device for every request (a sampling step appended to the decode
-graph itself, reading back only the chosen token, a non-finite flag and any top-n logprob
-alternatives); full logits come back only when a caller asks for them.
+**Streaming.** Tokens go out as SSE events through a bounded channel, so a slow client applies back-pressure.
 
-**Guided decoding.** Regex, JSON schema (`guided_json`, `response_format`), GBNF grammar, choice lists
-and forced tool calls are parsed and validated. They constrain sampling with a CPU automaton that masks
-disallowed tokens. The mask is built on the host while the forward pass runs and applied in the
-on-device sampling step.
+**Sampling.** Greedy, temperature, top-k and top-p [^topp], with logit bias, penalties and logprobs. Every request picks its token on the device, in a step appended to the decode graph. The host reads back the token, a non-finite flag and any top-n logprobs; full logits only on request.
 
-**Speculative decoding** is a policy of the driver: a decode row proposes drafts (prompt lookup or a second model)
-and verifies them in one step, and the scheduling loop does not change. `poot-serve` takes the policy with
-`--draft-lookup` or `--draft-model`. See [Speculative decoding](../serve/speculative-decoding.md).
+**Guided decoding.** Regex, JSON schema, GBNF grammar, choice lists and forced tool calls constrain sampling with a CPU automaton. The host builds the token mask while the forward pass runs, and the device applies it.
+
+**Speculative decoding** is a driver policy: a decode row proposes drafts (prompt lookup or a second model) and verifies them in one step. `poot-serve` takes it with `--draft-lookup` or `--draft-model`; see [Speculative decoding](../serve/speculative-decoding.md).
 
 ## Weights, adapters and multiple GPUs
 
-**Quantized checkpoints.** The library loads a single GGUF file or a safetensors directory. Packed
-projections stay packed at load time. Dense packed contractions and embedding gathers decode as they
-consume the weight, and a packed MoE expert stack is read by one indexed packed contraction that decodes only the selected experts' blocks; no expert table is materialized.
+**Quantized checkpoints.** The library loads one GGUF file or a safetensors directory, and packed projections stay packed. Dense contractions and embedding gathers decode as they consume the weight. A packed MoE expert stack is read by one indexed contraction that decodes only the selected experts.
 
-| Format                                  | Packed on GPU                                                         |
-| --------------------------------------- | --------------------------------------------------------------------- |
-| GGUF K-quants and Q4_0/Q8_0-style quants [^gguf] | Yes, by default                                                       |
-| MXFP4 (routed MoE experts)              | Packed at load; read in place by the indexed packed contraction       |
-| GPTQ [^gptq], AWQ [^awq]                | Packed 4-bit projections by default                                   |
-| FP8 (`compressed-tensors`)              | Packed E4M3 per-channel projections on the supported loader path          |
+| Format | Packed on GPU |
+| --- | --- |
+| GGUF K-quants and Q4_0/Q8_0-style quants [^gguf] | Yes, by default |
+| MXFP4 (routed MoE experts) | Packed at load, read in place |
+| GPTQ [^gptq], AWQ [^awq] | Packed 4-bit projections by default |
+| FP8 (`compressed-tensors`) | Packed E4M3 per-channel projections |
 
-Mixed K-quant files such as `Q4_K_M` widen some layers, as the ggml quantizer writes them. KV-cache
-quantization is not implemented. Operator detail: [Using quantized checkpoints](../serve/quantized-checkpoints.md).
+Mixed K-quant files such as `Q4_K_M` widen some layers. KV-cache quantization is not implemented. See [Using quantized checkpoints](../serve/quantized-checkpoints.md).
 
-**LoRA adapters** [^lora] use the PEFT [^peft] layout. `poot-serve` loads, selects and unloads them while it runs. Adapters apply to the seven attention
-and MLP projections of dense decoder families that use those projections (the [feature matrix](../reference/feature-matrix.md) lists the families). See [Using LoRA adapters](../serve/lora-adapters.md).
+**LoRA adapters** [^lora] use the PEFT [^peft] layout and are loaded, selected and unloaded while the server runs. They apply to the seven attention and MLP projections of dense decoder families. See [Using LoRA adapters](../serve/lora-adapters.md).
 
-**Tensor parallelism** divides the weights by role and the paged KV pool by KV heads over the ranks
-of a group. A multi-device coordinator in `poot-executor` runs pipeline and tensor-parallel programs
-over PTX peer-to-peer copies, and the server plans and fits each rank against its own GPU. A tensor group
-and a layer pipeline have served requests on a two-GPU NVLink A100 PTX pair (greedy and sampled requests match
-single-GPU, with per-rank admission), and world-4 tensor-parallel decode matched the single-device oracle on a
-four-GPU A100 pod. Not covered: serving a group of four through the server, a real checkpoint, and GPUs reachable
-only across CPU sockets. Backends other than PTX are not supported. See
-[Tensor parallelism](../serve/tensor-parallelism.md).
+**Tensor parallelism** divides the weights by role and the paged KV pool by KV heads over a group's ranks, over PTX peer-to-peer copies. Only PTX is supported.
+
+- **Verified:** a tensor group and a layer pipeline served requests on a two-GPU NVLink A100 pair, with greedy and sampled output matching single-GPU. World-4 decode matched the single-device oracle on a four-GPU A100 pod.
+- **Not covered:** serving a group of four through the server, a real checkpoint, and GPUs reachable only across CPU sockets.
+
+See [Tensor parallelism](../serve/tensor-parallelism.md).
 
 ## Metrics
 
-Every value is produced by poot itself, never read from sysfs or a vendor CLI. The
-generation counters, the batching and KV-pool gauges and the device-bytes gauge
-(the executor's live accounting of weights, KV pool and workspace) come from its loop.
+Every value is produced by poot itself, never read from sysfs or a vendor CLI. They cover latency histograms (TTFT, inter-token, end-to-end, queue wait), request and token counters, batching and KV-pool gauges, prefix-cache hit rate, device-memory gauges from the executor's live accounting, and host CPU and memory.
 
-| Metric                                 | Type      | Description                                                              |
-| -------------------------------------- | --------- | ------------------------------------------------------------------------ |
-| `poot_ttft_ms`                         | Histogram | Time to first token (streaming requests)                                 |
-| `poot_itl_ms`                          | Histogram | Inter-token latency                                                      |
-| `poot_request_e2e_ms`                  | Histogram | End-to-end request latency                                               |
-| `poot_queue_wait_ms`                   | Histogram | Time a request waited for a free decode slot                             |
-| `poot_requests_total`                  | Counter   | Generation requests served                                               |
-| `poot_requests_completed_total`        | Counter   | Requests that finished normally                                          |
-| `poot_requests_cancelled_total`        | Counter   | Requests evicted on client disconnect                                    |
-| `poot_requests_errored_total`          | Counter   | Requests that ended in an engine error                                   |
-| `poot_prompt_tokens_total`             | Counter   | Prompt (prefill) tokens processed                                        |
-| `poot_completion_tokens_total`         | Counter   | Completion (decode) tokens generated                                     |
-| `poot_inflight_requests`               | Gauge     | Requests currently being processed                                       |
-| `poot_queue_depth`                     | Gauge     | Requests waiting for a free decode slot                                  |
-| `poot_batch_size`                      | Gauge     | Active batched-decode slots in the last engine step                      |
-| `poot_slot_capacity`                   | Gauge     | Batched-decode slot capacity                                             |
-| `poot_kv_cache_usage_ratio`            | Gauge     | Paged KV-cache block utilization (0..1)                                  |
-| `poot_kv_cache_blocks_used`            | Gauge     | Paged KV-cache blocks in use                                             |
-| `poot_kv_cache_blocks_total`           | Gauge     | Paged KV-cache blocks in the shared pool                                 |
-| `poot_prefix_cache_hit_rate`           | Gauge     | Cumulative prefix-cache hit rate (0..1)                                  |
-| `poot_prefix_cache_hit_tokens_total`   | Counter   | Prompt tokens served from a cached prefix                                |
-| `poot_prefix_cache_query_tokens_total` | Counter   | Prompt tokens looked up against the prefix cache                         |
-| `poot_gpu_active_ratio`                | Gauge     | GPU-active fraction (GPU-step / total decode-step wall time, 0..1)       |
-| `poot_gpu_weight_bytes`                | Gauge     | Model weight bytes resident in GPU memory                                |
-| `poot_gpu_kv_cache_bytes`              | Gauge     | KV-pool bytes resident in GPU memory                                     |
-| `poot_gpu_resident_bytes`              | Gauge     | Resident GPU memory the engine tracks (weights + KV pool)                |
-| `poot_gpu_vram_used_bytes`             | Gauge     | Device bytes the engine holds (weights, KV pool, workspace), from the executor's live accounting |
-| `poot_gpu_vram_total_bytes`            | Gauge     | Device memory the engine plan found available at start                   |
-| `poot_decode_dispatch_count`           | Gauge     | Per-token GPU dispatch count of the optimized decode graph               |
-| `poot_decode_activation_peak_bytes`    | Gauge     | Peak transient activation bytes of the decode graph                      |
-| `poot_prefill_dispatch_count`          | Gauge     | GPU dispatch count of the optimized prefill (TTFT) graph                 |
-| `poot_prefill_activation_peak_bytes`   | Gauge     | Peak transient activation bytes of the prefill graph                     |
-| `poot_cpu_percent`                     | Gauge     | System CPU utilization since the last scrape                             |
-| `poot_mem_used_megabytes`              | Gauge     | Used system memory                                                       |
-| `poot_mem_total_megabytes`             | Gauge     | Total system memory                                                      |
-| `poot_uptime_seconds`                  | Gauge     | Server uptime                                                            |
+<details>
+<summary>All metrics by type</summary>
+
+- **Histograms:** `poot_ttft_ms`, `poot_itl_ms`, `poot_request_e2e_ms`, `poot_queue_wait_ms`
+- **Counters:** `poot_requests_total`, `poot_requests_completed_total`, `poot_requests_cancelled_total`, `poot_requests_errored_total`, `poot_prompt_tokens_total`, `poot_completion_tokens_total`, `poot_prefix_cache_hit_tokens_total`, `poot_prefix_cache_query_tokens_total`
+- **Gauges:** `poot_inflight_requests`, `poot_queue_depth`, `poot_batch_size`, `poot_slot_capacity`, `poot_kv_cache_usage_ratio`, `poot_kv_cache_blocks_used`, `poot_kv_cache_blocks_total`, `poot_prefix_cache_hit_rate`, `poot_gpu_active_ratio`, `poot_gpu_weight_bytes`, `poot_gpu_kv_cache_bytes`, `poot_gpu_resident_bytes`, `poot_gpu_vram_used_bytes`, `poot_gpu_vram_total_bytes`, `poot_decode_dispatch_count`, `poot_decode_activation_peak_bytes`, `poot_prefill_dispatch_count`, `poot_prefill_activation_peak_bytes`, `poot_cpu_percent`, `poot_mem_used_megabytes`, `poot_mem_total_megabytes`, `poot_uptime_seconds`
+
+</details>
 
 ---
 

@@ -68,12 +68,7 @@ fn prompt() -> Step {
 fn is_tiled(choice: &KernelChoice) -> bool {
     matches!(
         choice,
-        KernelChoice::Generated(KernelRequest::Contraction(
-            ContractionSpec::TiledRegion { .. }
-                | ContractionSpec::DenseTiled { .. }
-                | ContractionSpec::TensorCore { .. }
-                | ContractionSpec::Coopmat { .. },
-        ))
+        KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(_)))
     )
 }
 
@@ -121,7 +116,7 @@ fn oracle_logits(fixture: &Fixture, graph: &Graph, step: &Step) -> HostTensor {
                 poot_tensor::DType::I32 => {
                     HostTensor::i32(aval.shape.clone(), vec![0; aval.numel()])
                 }
-                _ => HostTensor::zeros(aval.shape.clone()),
+                _ => HostTensor::zeros_of(aval.dtype, aval.shape.clone()),
             }
         })
         .collect();
@@ -232,7 +227,7 @@ fn routed_prefill_unguarded_rocm() {
     // The plan rows run before anything executes: a plan without the passes is a red row without a launch.
     let facts = plan(&graph, &target, 4);
     // The QSA layer's attention is the block-selected op, planned straight to its kernel: no dense attention
-    // for `flash_attention_capped` to fuse, which the dense families' rows still assert.
+    // for `flash_attention` to fuse, which the dense families' rows still assert.
     assert!(facts.passes.contains(&"fuse"), "fuse: the program runs it");
     assert!(
         facts.tiled_routers > 0,

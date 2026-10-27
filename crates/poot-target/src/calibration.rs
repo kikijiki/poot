@@ -5,8 +5,8 @@
 //! ceiling nobody observed on it.
 
 use crate::{
-    AMD_RADV_SAFE_MAX_BUFFER_BYTES, DECODE_GEMV_CHUNK_TRIGGER, KnownMiscompiles,
-    PACKED_TILED_CHUNK_WORK, Queried, WatchdogBudget,
+    AMD_RADV_SAFE_MAX_BUFFER_BYTES, ATTENTION_CHUNK_WORK, DECODE_GEMV_CHUNK_TRIGGER,
+    KnownMiscompiles, PACKED_TILED_CHUNK_WORK, Queried, WatchdogBudget,
 };
 
 /// The kind of device a launch figure is calibrated for: the runtime family that drives it, since the same
@@ -22,56 +22,68 @@ pub enum LaunchClass {
     Cuda,
 }
 
-/// The tile edge of the LDS-staged M>1 contraction (an indexed `Tiled` tile, or the generated dense one): a
-/// workgroup of `edge * edge` lanes. 8 is 64 lanes, one wave64, the edge every Vulkan device is known to run;
-/// a Vulkan device nobody measured keeps it, and only a measured part gets a wider one.
-pub const PORTABLE_TILE_EDGE: u32 = 8;
-
-/// The tile edge the HSA runtime launches: 16x16 is a 256-lane workgroup, within the 1024 every AMDGPU part
-/// allows, measured on gfx1151 (see the provenance table in the tests). The RADV defect lives in the Vulkan
-/// driver stack ([`KnownMiscompiles::lds_stale_above_wave64`]).
-pub const HSA_TILE_EDGE: u32 = 16;
-
-/// The lane-grid edge of the narrow register-tiled schedule: 64 lanes, one wave64, the grid a row count below
-/// the wide one's threshold runs.
+/// The lane-grid edge of the narrow register-tiled schedule: 64 lanes, one wave64, the widest workgroup every
+/// device is known to run.
 pub const REGISTER_LANE_EDGE: u32 = 8;
 
-/// The lane-grid edge of the wide register-tiled schedule: 256 lanes, chosen once there are 128 rows and the
-/// device fits its two LDS tiles.
+/// The lane-grid edge of the wide register-tiled schedule: 256 lanes, offered to the cost model on a device whose
+/// workgroup and LDS hold it.
 pub const REGISTER_LANE_EDGE_WIDE: u32 = 16;
 
-/// The launch edges of the M>1 contraction schedules on one device: the tile edge of the LDS-staged `Tiled`
-/// schedule and the narrow and wide lane grids of the register-tiled one. Resolved once from the device
-/// class and its [`KnownMiscompiles`]; the planner reads the fields and holds no tile literal of its own.
+/// The longest contiguous run of K elements one lane of the packed decode Gemv decodes per trip on a class
+/// nobody measured: the run every class launched before POOT-1398.
+pub const PORTABLE_PACKED_GEMV_RUN: u32 = 8;
+
+/// The packed decode Gemv's longest lane run on the HSA and Vulkan classes, measured on gfx1151 (POOT-1390):
+/// a 32-element run (one Q4_K/Q5_K sub-block) amortises the block addressing and the factor decode over
+/// four times the weights of the portable run and keeps the body within the register file on both
+/// compilers.
+pub const MEASURED_PACKED_GEMV_RUN: u32 = 32;
+
+/// The packed decode Gemv's longest lane run on the CUDA class: a calibration measured on one part, the RTX PRO
+/// 6000 Blackwell Server (sm_120), not a rule derived for every NVIDIA GPU (POOT-1405). With the activation read
+/// in 16-byte groups and 32-bit index math, a 16-element run amortises a K-quant's block decode over twice the
+/// weights of the 8-element one, while a 32-element run spreads each warp-wide activation load over 16 cache lines
+/// and loses (Q4_K 980 at run 16 against 665 at 32 and 721 at 8 GB/s). Other NVIDIA parts are unmeasured and take
+/// it as the class figure until a pod sweep says otherwise.
+pub const CUDA_PACKED_GEMV_RUN: u32 = 16;
+
+/// The resident lanes per compute unit the register-tiled schedule's occupancy model treats as saturating it:
+/// eight 32-lane waves, four per SIMD of an RDNA compute unit (two SIMD32s) or two per partition of an NVIDIA SM
+/// (four), the residency at which a unit hides its LDS and memory latency behind other waves' FMAs. Structural,
+/// not measured per device.
+pub const SATURATING_LANES: u32 = 256;
+
+/// The launch figures of the contraction schedules on one device: the narrow and wide lane grids of the
+/// register-tiled one and the residency its occupancy model saturates a compute unit at, and the longest lane run
+/// of the packed decode Gemv. Resolved once from the device class and its [`KnownMiscompiles`]; the planner reads
+/// the fields and holds no tile or run literal of its own.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GemmLaunch {
-    /// The edge of the square tile one `Tiled` workgroup computes, in lanes per side.
-    pub tile_edge: u32,
     /// The narrow register-tiled lane-grid edge.
     pub register_lane_edge: u32,
-    /// The wide register-tiled lane-grid edge, used once the rows fill its tile.
+    /// The wide register-tiled lane-grid edge.
     pub register_lane_edge_wide: u32,
+    /// The longest run of contiguous K elements a packed decode Gemv lane decodes per trip: the register and
+    /// issue budget of the class's compiler. The planner runs the format's factor run up to this cap.
+    pub packed_gemv_max_run: u32,
+    /// Resident lanes that saturate one compute unit, in the register-tiled schedule's occupancy model.
+    pub saturating_lanes: u32,
 }
 
 impl GemmLaunch {
-    /// The launch of a device of `class` whose confirmed defects are `known`. A device with
-    /// [`KnownMiscompiles::lds_stale_above_wave64`] runs the portable 64-lane tile, whatever its class would
-    /// otherwise launch.
-    pub const fn resolve(class: LaunchClass, known: &KnownMiscompiles) -> Self {
-        let class_edge = match class {
-            LaunchClass::Vulkan => PORTABLE_TILE_EDGE,
-            LaunchClass::Hsa => HSA_TILE_EDGE,
-            // Unmeasured on CUDA: the portable edge until a pod sweep says otherwise.
-            LaunchClass::Cuda => PORTABLE_TILE_EDGE,
-        };
+    /// The launch of a device of `class`. No device has a confirmed defect that narrows the register-tiled lane
+    /// grids (the RADV wave64 LDS defect of update 0169 does not reproduce, see `REGISTER_LANE_EDGE_WIDE`'s
+    /// provenance); the packed decode Gemv's lane run is the class's.
+    pub const fn resolve(class: LaunchClass) -> Self {
         Self {
-            tile_edge: if known.lds_stale_above_wave64 {
-                PORTABLE_TILE_EDGE
-            } else {
-                class_edge
-            },
             register_lane_edge: REGISTER_LANE_EDGE,
             register_lane_edge_wide: REGISTER_LANE_EDGE_WIDE,
+            packed_gemv_max_run: match class {
+                LaunchClass::Vulkan | LaunchClass::Hsa => MEASURED_PACKED_GEMV_RUN,
+                LaunchClass::Cuda => CUDA_PACKED_GEMV_RUN,
+            },
+            saturating_lanes: SATURATING_LANES,
         }
     }
 }
@@ -103,7 +115,6 @@ impl Calibration {
     /// bounded the buffer size.
     const STRIX_HALO_MISCOMPILES: KnownMiscompiles = KnownMiscompiles {
         tiled_gemm_max_workgroups: Some(1 << 15),
-        lds_stale_above_wave64: true,
     };
 
     pub(crate) const STRIX_HALO_RADV: Self = Self {
@@ -113,6 +124,9 @@ impl Calibration {
             scatter_update_work: 1_000_000,
             indexed_dequant_work: 800_000_000,
             packed_tiled_work: PACKED_TILED_CHUNK_WORK,
+            // Measured on Strix Halo behind RADV only (POOT-1313); another RADV or display-attached device has
+            // no calibration, so no `watchdog_budget` and an unsplit 8192-token prefill.
+            attention_work: ATTENTION_CHUNK_WORK,
         }),
         known_miscompiles: Self::STRIX_HALO_MISCOMPILES,
         safe_max_buffer_bytes: Some(AMD_RADV_SAFE_MAX_BUFFER_BYTES),
@@ -183,18 +197,8 @@ mod tests {
         source: &'static str,
     }
 
-    /// The provenance of each figure [`GemmLaunch`] resolves from.
+    /// The provenance of each figure [`GemmLaunch::resolve`] resolves from.
     const LAUNCH_PROVENANCE: &[Provenance] = &[
-        Provenance {
-            name: "PORTABLE_TILE_EDGE",
-            value: PORTABLE_TILE_EDGE as u64,
-            source: "card 095: a 256-lane workgroup miscomputes on wgpu/RADV (Strix Halo); 8x8 = one wave64 is the edge every Vulkan device is known to run. Also the CUDA edge: unmeasured on CUDA, sweep owed on a pod",
-        },
-        Provenance {
-            name: "HSA_TILE_EDGE",
-            value: HSA_TILE_EDGE as u64,
-            source: "measured: gfx1151 ROCm, tile 16 bit-identical to 8 and 1.3-3.6x faster on the routed contraction, backstage updates/1343-poot-1233-rocm-gemm-tile-edge-sweep-receipt.md",
-        },
         Provenance {
             name: "REGISTER_LANE_EDGE",
             value: REGISTER_LANE_EDGE as u64,
@@ -203,45 +207,41 @@ mod tests {
         Provenance {
             name: "REGISTER_LANE_EDGE_WIDE",
             value: REGISTER_LANE_EDGE_WIDE as u64,
-            source: "POOT-1193: the 16x16 lane grid for 128-row tiles",
+            source: "POOT-1193: the 16x16 lane grid, 256 lanes. POOT-1403: runs on RADV too; the wave64 LDS defect (update 0169: a 256-lane LDS-tiled GEMM read stale upper-wave LDS) does not reproduce on Strix Halo RADV Mesa 26.1.3, on the register-tiled body at 16x16 (16.5 KiB LDS; poot-kernelgen the_register_tiled_body_runs_256_lane_workgroups_on_radv, mutation-proven) nor on the deleted one-output-per-lane Tiled body at 16x16 (bit-exact); master already ran the packed register-tiled 16x16 there",
+        },
+        Provenance {
+            name: "SATURATING_LANES",
+            value: SATURATING_LANES as u64,
+            source: "structural (POOT-1403): eight wave32s per compute unit, four per RDNA SIMD32 or two per NVIDIA SM partition; the register-tiled cost model's residency, not a per-device measurement",
+        },
+        Provenance {
+            name: "PORTABLE_PACKED_GEMV_RUN",
+            value: PORTABLE_PACKED_GEMV_RUN as u64,
+            source: "card 653: the 8-element run every class launched before POOT-1398; the run of a decode that addresses each element on its own (gemv_run's Elementwise arm)",
+        },
+        Provenance {
+            name: "MEASURED_PACKED_GEMV_RUN",
+            value: MEASURED_PACKED_GEMV_RUN as u64,
+            source: "measured: gfx1151 ROCm and RADV at 17408 x 5120, run 32 vs 8: Q4_K 120 -> 195 GB/s, Q5_K 119 -> 190 (ROCm), Q4_K 143 -> 171-184 (Vulkan); backstage designs/quant-matmul-1390.md section 5 and the POOT-1398 receipt",
+        },
+        Provenance {
+            name: "CUDA_PACKED_GEMV_RUN",
+            value: CUDA_PACKED_GEMV_RUN as u64,
+            source: "measured on one part only, RTX PRO 6000 Blackwell Server (sm_120), at 17408 x 5120 with the vector activation read and 32-bit index math, run 8 / 16 / 32 GB/s: Q4_K 721/980/665, Q5_K 747/955/741, Q6_K 861/1254/1253 (factor run 16), Q3_K 567/710/711, Q2_K 539/695/695, Q4_0 1026/1094/751, Q8_0 1383/1402/1260, IQ4_XS 894/856/601, IQ4_NL 998/911/641; POOT-1405 receipts. Other NVIDIA parts unmeasured",
         },
     ];
-
-    /// The tile edge is the class's calibrated one unless the device has the LDS-visibility defect: the HSA and
-    /// class launches 16; a Vulkan device, the unmeasured CUDA class and any defective one 8. Mutation: drop the
-    /// `lds_stale_above_wave64` gate in [`GemmLaunch::resolve`]; the RADV row reads 16.
-    #[test]
-    fn the_tile_edge_is_the_class_figure_gated_by_the_lds_defect() {
-        let defect = KnownMiscompiles {
-            lds_stale_above_wave64: true,
-            ..KnownMiscompiles::NONE
-        };
-        let edge = |class, known: &KnownMiscompiles| GemmLaunch::resolve(class, known).tile_edge;
-        assert_eq!(
-            edge(LaunchClass::Hsa, &KnownMiscompiles::NONE),
-            HSA_TILE_EDGE
-        );
-        assert_eq!(
-            edge(LaunchClass::Cuda, &KnownMiscompiles::NONE),
-            PORTABLE_TILE_EDGE
-        );
-        assert_eq!(
-            edge(LaunchClass::Vulkan, &KnownMiscompiles::NONE),
-            PORTABLE_TILE_EDGE
-        );
-        assert_eq!(edge(LaunchClass::Hsa, &defect), PORTABLE_TILE_EDGE);
-        assert_eq!(edge(LaunchClass::Cuda, &defect), PORTABLE_TILE_EDGE);
-    }
 
     /// Every launch figure `GemmLaunch` resolves from has a provenance entry whose value is the constant's and
     /// whose source is stated. Mutation: change a constant without its entry; the value check fails.
     #[test]
     fn every_gemm_launch_figure_has_provenance() {
         let figures = [
-            ("PORTABLE_TILE_EDGE", PORTABLE_TILE_EDGE),
-            ("HSA_TILE_EDGE", HSA_TILE_EDGE),
             ("REGISTER_LANE_EDGE", REGISTER_LANE_EDGE),
             ("REGISTER_LANE_EDGE_WIDE", REGISTER_LANE_EDGE_WIDE),
+            ("PORTABLE_PACKED_GEMV_RUN", PORTABLE_PACKED_GEMV_RUN),
+            ("MEASURED_PACKED_GEMV_RUN", MEASURED_PACKED_GEMV_RUN),
+            ("CUDA_PACKED_GEMV_RUN", CUDA_PACKED_GEMV_RUN),
+            ("SATURATING_LANES", SATURATING_LANES),
         ];
         assert_eq!(LAUNCH_PROVENANCE.len(), figures.len());
         for (name, value) in figures {

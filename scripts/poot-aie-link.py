@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The poot AIE link driver: core objects plus a typed link recipe, to an xclbin and an instruction stream.
 
-poot-codegen (crates/poot-codegen/src/aie.rs, POOT-664/POOT-1118/POOT-1160) compiles the sequential Bodies of
+poot-npu (crates/poot-npu/src/aie_compile.rs, POOT-664/POOT-1118/POOT-1160) compiles the sequential Bodies of
 one region to Peano core objects and writes the region's link recipe as canonical text. This driver is the
 IRON side of that boundary: it builds the IRON program the recipe describes, one worker per tile and one
 object FIFO per value, and links it with `aiecc` (mlir-aie). It is a thin driver over the real tool, not a
@@ -44,10 +44,10 @@ PLATFORMS = {"npu2": "NPU2"}
 RECIPE_HEADER = "poot-aie-recipe-v2"
 
 # poot ElementKind (Debug spelling in the recipe) -> numpy dtype name. The core ABI moves 32-bit words only
-# (poot-codegen's CORE_ABI_REVISION 1), so anything else is a refusal, not a silent rewrite.
+# (poot-npu's CORE_ABI_REVISION 1), so anything else is a refusal, not a silent rewrite.
 ELEMENTS = {"F32": "float32", "I32": "int32"}
 
-# The kernel name aiecc gives the one kernel of the xclbin; poot-codegen's IRON_KERNEL_NAME pins the same.
+# The kernel name aiecc gives the one kernel of the xclbin; poot-npu's IRON_KERNEL_NAME pins the same.
 XCLBIN_KERNEL_NAME = "MLIR_AIE"
 
 SYMBOL = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -322,7 +322,7 @@ def link(platform, objects_dir, recipe_path, xclbin_path, insts_path):
 
         object_fifos = [ObjectFifo(fifo_type(f), name=f"v{i}", depth=f["depth"]) for i, f in enumerate(fifos)]
 
-        # One worker per tile. The core ABI (poot-codegen CORE_ABI_REVISION 1): interleaved (ptr, i32 len)
+        # One worker per tile. The core ABI (poot-npu CORE_ABI_REVISION 1): interleaved (ptr, i32 len)
         # pairs in body-parameter order, one pair per port.
         workers = []
         kernels = {}

@@ -75,8 +75,8 @@ impl Transport {
     }
 }
 
-/// What the operator asked of the engine plan: the backend, the placement, the draft policy and the
-/// expert pool. A device group records no device timing, so asking for both is refused here, before
+/// What the operator asked of the engine plan: the backend, the placement, the draft policy, the expert
+/// pool and the KV cache dtype. A device group records no device timing, so asking for both is refused here, before
 /// anything loads.
 pub(crate) fn engine_args(config: &ServeConfig, draft: DraftPolicy) -> Result<EngineArgs> {
     anyhow::ensure!(
@@ -86,7 +86,8 @@ pub(crate) fn engine_args(config: &ServeConfig, draft: DraftPolicy) -> Result<En
     Ok(EngineArgs::new(config.backend, draft)
         .with_shape(config.rows, config.max_seq)
         .with_placement(config.placement.clone())
-        .with_expert_pool(config.expert_pool))
+        .with_expert_pool(config.expert_pool)
+        .with_kv_dtype(config.kv_dtype))
 }
 
 /// The draft policy the flags name: `Off` with none of the three. A `--draft-model` checkpoint is loaded

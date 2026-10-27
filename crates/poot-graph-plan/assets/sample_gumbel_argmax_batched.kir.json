@@ -62,6 +62,18 @@
       "mutable": false
     },
     {
+      "ty": "Unit",
+      "mutable": false
+    },
+    {
+      "ty": "Unit",
+      "mutable": false
+    },
+    {
+      "ty": "Unit",
+      "mutable": false
+    },
+    {
       "ty": "Usize",
       "mutable": false
     },
@@ -632,16 +644,46 @@
     {
       "statements": [],
       "terminator": {
+        "Goto": {
+          "target": {
+            "index": 1
+          }
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 2
+          }
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 3
+          }
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
         "ThreadIndexCall": {
           "destination": {
             "local": {
-              "index": 6
+              "index": 9
             },
             "projection": []
           },
           "dim": "GroupX",
           "target": {
-            "index": 1
+            "index": 4
           }
         }
       }
@@ -652,7 +694,7 @@
           "Assign": [
             {
               "local": {
-                "index": 9
+                "index": 12
               },
               "projection": []
             },
@@ -669,7 +711,7 @@
           "Assign": [
             {
               "local": {
-                "index": 10
+                "index": 13
               },
               "projection": []
             },
@@ -687,13 +729,141 @@
           "Assign": [
             {
               "local": {
-                "index": 11
+                "index": 14
               },
               "projection": []
             },
             {
               "BinaryOp": [
                 "Lt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 12
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 13
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 14
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 75
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 5
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 11
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 4
+                  },
+                  "projection": [
+                    "Deref",
+                    {
+                      "Index": {
+                        "index": 12
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 10
+              },
+              "projection": []
+            },
+            {
+              "Cast": {
+                "to": "Usize",
+                "operand": {
+                  "Move": {
+                    "local": {
+                      "index": 11
+                    },
+                    "projection": []
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "ThreadIndexCall": {
+          "destination": {
+            "local": {
+              "index": 15
+            },
+            "projection": []
+          },
+          "dim": "LocalX",
+          "target": {
+            "index": 6
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 16
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Mul",
                 {
                   "Copy": {
                     "local": {
@@ -713,109 +883,12 @@
               ]
             }
           ]
-        }
-      ],
-      "terminator": {
-        "SwitchInt": {
-          "discr": {
-            "Move": {
-              "local": {
-                "index": 11
-              },
-              "projection": []
-            }
-          },
-          "targets": {
-            "branches": [
-              [
-                0,
-                {
-                  "index": 72
-                }
-              ]
-            ],
-            "otherwise": {
-              "index": 2
-            }
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 8
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 4
-                  },
-                  "projection": [
-                    "Deref",
-                    {
-                      "Index": {
-                        "index": 9
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          ]
         },
         {
           "Assign": [
             {
               "local": {
-                "index": 7
-              },
-              "projection": []
-            },
-            {
-              "Cast": {
-                "to": "Usize",
-                "operand": {
-                  "Move": {
-                    "local": {
-                      "index": 8
-                    },
-                    "projection": []
-                  }
-                }
-              }
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "ThreadIndexCall": {
-          "destination": {
-            "local": {
-              "index": 12
-            },
-            "projection": []
-          },
-          "dim": "LocalX",
-          "target": {
-            "index": 3
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 13
+                "index": 18
               },
               "projection": []
             },
@@ -825,171 +898,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 6
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 7
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 15
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Mul",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 6
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Const": {
-                    "Usize": 3
-                  }
-                }
-              ]
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 16
-              },
-              "projection": []
-            },
-            {
-              "Len": {
-                "local": {
-                  "index": 3
-                },
-                "projection": []
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 17
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Lt",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 15
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 16
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "SwitchInt": {
-          "discr": {
-            "Move": {
-              "local": {
-                "index": 17
-              },
-              "projection": []
-            }
-          },
-          "targets": {
-            "branches": [
-              [
-                0,
-                {
-                  "index": 73
-                }
-              ]
-            ],
-            "otherwise": {
-              "index": 4
-            }
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 14
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 3
-                  },
-                  "projection": [
-                    "Deref",
-                    {
-                      "Index": {
-                        "index": 15
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 20
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Mul",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 6
+                      "index": 9
                     },
                     "projection": []
                   }
@@ -1012,34 +921,6 @@
               "projection": []
             },
             {
-              "BinaryOp": [
-                "Add",
-                {
-                  "Move": {
-                    "local": {
-                      "index": 20
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Const": {
-                    "Usize": 1
-                  }
-                }
-              ]
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 21
-              },
-              "projection": []
-            },
-            {
               "Len": {
                 "local": {
                   "index": 3
@@ -1053,7 +934,7 @@
           "Assign": [
             {
               "local": {
-                "index": 22
+                "index": 20
               },
               "projection": []
             },
@@ -1063,7 +944,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 19
+                      "index": 18
                     },
                     "projection": []
                   }
@@ -1071,7 +952,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 21
+                      "index": 19
                     },
                     "projection": []
                   }
@@ -1086,7 +967,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 22
+                "index": 20
               },
               "projection": []
             }
@@ -1096,12 +977,12 @@
               [
                 0,
                 {
-                  "index": 74
+                  "index": 76
                 }
               ]
             ],
             "otherwise": {
-              "index": 5
+              "index": 7
             }
           }
         }
@@ -1113,7 +994,7 @@
           "Assign": [
             {
               "local": {
-                "index": 18
+                "index": 17
               },
               "projection": []
             },
@@ -1127,7 +1008,7 @@
                     "Deref",
                     {
                       "Index": {
-                        "index": 19
+                        "index": 18
                       }
                     }
                   ]
@@ -1140,7 +1021,7 @@
           "Assign": [
             {
               "local": {
-                "index": 25
+                "index": 23
               },
               "projection": []
             },
@@ -1150,7 +1031,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 6
+                      "index": 9
                     },
                     "projection": []
                   }
@@ -1168,7 +1049,7 @@
           "Assign": [
             {
               "local": {
-                "index": 24
+                "index": 22
               },
               "projection": []
             },
@@ -1178,14 +1059,14 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 25
+                      "index": 23
                     },
                     "projection": []
                   }
                 },
                 {
                   "Const": {
-                    "Usize": 2
+                    "Usize": 1
                   }
                 }
               ]
@@ -1196,7 +1077,7 @@
           "Assign": [
             {
               "local": {
-                "index": 26
+                "index": 24
               },
               "projection": []
             },
@@ -1214,7 +1095,7 @@
           "Assign": [
             {
               "local": {
-                "index": 27
+                "index": 25
               },
               "projection": []
             },
@@ -1224,7 +1105,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 24
+                      "index": 22
                     },
                     "projection": []
                   }
@@ -1232,7 +1113,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 26
+                      "index": 24
                     },
                     "projection": []
                   }
@@ -1247,7 +1128,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 27
+                "index": 25
               },
               "projection": []
             }
@@ -1257,12 +1138,12 @@
               [
                 0,
                 {
-                  "index": 75
+                  "index": 77
                 }
               ]
             ],
             "otherwise": {
-              "index": 6
+              "index": 8
             }
           }
         }
@@ -1274,7 +1155,7 @@
           "Assign": [
             {
               "local": {
-                "index": 23
+                "index": 21
               },
               "projection": []
             },
@@ -1288,7 +1169,7 @@
                     "Deref",
                     {
                       "Index": {
-                        "index": 24
+                        "index": 22
                       }
                     }
                   ]
@@ -1306,11 +1187,50 @@
               "projection": []
             },
             {
-              "Use": {
-                "Const": {
-                  "F32": -3.4028235e+38
+              "BinaryOp": [
+                "Mul",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 9
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 3
+                  }
                 }
-              }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 27
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 28
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 2
+                  }
+                }
+              ]
             }
           ]
         },
@@ -1323,16 +1243,11 @@
               "projection": []
             },
             {
-              "Cast": {
-                "to": "F32",
-                "operand": {
-                  "Copy": {
-                    "local": {
-                      "index": 7
-                    },
-                    "projection": []
-                  }
-                }
+              "Len": {
+                "local": {
+                  "index": 3
+                },
+                "projection": []
               }
             }
           ]
@@ -1346,63 +1261,12 @@
               "projection": []
             },
             {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 12
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "Goto": {
-          "target": {
-            "index": 7
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 32
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 30
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 31
-              },
-              "projection": []
-            },
-            {
               "BinaryOp": [
                 "Lt",
                 {
-                  "Move": {
+                  "Copy": {
                     "local": {
-                      "index": 32
+                      "index": 27
                     },
                     "projection": []
                   }
@@ -1410,7 +1274,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 7
+                      "index": 29
                     },
                     "projection": []
                   }
@@ -1425,7 +1289,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 31
+                "index": 30
               },
               "projection": []
             }
@@ -1435,13 +1299,111 @@
               [
                 0,
                 {
-                  "index": 16
+                  "index": 78
                 }
               ]
             ],
             "otherwise": {
-              "index": 8
+              "index": 9
             }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 26
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 3
+                  },
+                  "projection": [
+                    "Deref",
+                    {
+                      "Index": {
+                        "index": 27
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 31
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Const": {
+                  "F32": -3.4028235e+38
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 32
+              },
+              "projection": []
+            },
+            {
+              "Cast": {
+                "to": "F32",
+                "operand": {
+                  "Copy": {
+                    "local": {
+                      "index": 10
+                    },
+                    "projection": []
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 33
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 15
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 10
           }
         }
       }
@@ -1460,7 +1422,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 30
+                    "index": 33
                   },
                   "projection": []
                 }
@@ -1478,11 +1440,91 @@
             },
             {
               "BinaryOp": [
+                "Lt",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 35
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 10
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 34
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 19
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 11
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 38
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 33
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 37
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
                 "Add",
                 {
                   "Copy": {
                     "local": {
-                      "index": 13
+                      "index": 16
                     },
                     "projection": []
                   }
@@ -1490,7 +1532,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 35
+                      "index": 38
                     },
                     "projection": []
                   }
@@ -1503,7 +1545,7 @@
           "Assign": [
             {
               "local": {
-                "index": 36
+                "index": 39
               },
               "projection": []
             },
@@ -1521,7 +1563,7 @@
           "Assign": [
             {
               "local": {
-                "index": 37
+                "index": 40
               },
               "projection": []
             },
@@ -1531,7 +1573,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 34
+                      "index": 37
                     },
                     "projection": []
                   }
@@ -1539,7 +1581,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 36
+                      "index": 39
                     },
                     "projection": []
                   }
@@ -1554,7 +1596,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 37
+                "index": 40
               },
               "projection": []
             }
@@ -1564,12 +1606,12 @@
               [
                 0,
                 {
-                  "index": 76
+                  "index": 79
                 }
               ]
             ],
             "otherwise": {
-              "index": 9
+              "index": 12
             }
           }
         }
@@ -1581,7 +1623,7 @@
           "Assign": [
             {
               "local": {
-                "index": 33
+                "index": 36
               },
               "projection": []
             },
@@ -1595,7 +1637,7 @@
                     "Deref",
                     {
                       "Index": {
-                        "index": 34
+                        "index": 37
                       }
                     }
                   ]
@@ -1608,7 +1650,7 @@
           "Assign": [
             {
               "local": {
-                "index": 38
+                "index": 41
               },
               "projection": []
             },
@@ -1618,7 +1660,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 33
+                      "index": 36
                     },
                     "projection": []
                   }
@@ -1638,7 +1680,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 38
+                "index": 41
               },
               "projection": []
             }
@@ -1648,12 +1690,12 @@
               [
                 0,
                 {
-                  "index": 13
+                  "index": 16
                 }
               ]
             ],
             "otherwise": {
-              "index": 10
+              "index": 13
             }
           }
         }
@@ -1665,7 +1707,7 @@
           "Assign": [
             {
               "local": {
-                "index": 39
+                "index": 42
               },
               "projection": []
             },
@@ -1675,7 +1717,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 33
+                      "index": 36
                     },
                     "projection": []
                   }
@@ -1695,7 +1737,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 39
+                "index": 42
               },
               "projection": []
             }
@@ -1705,124 +1747,13 @@
               [
                 0,
                 {
-                  "index": 13
+                  "index": 16
                 }
               ]
             ],
             "otherwise": {
-              "index": 11
+              "index": 14
             }
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 41
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 28
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 40
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Gt",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 33
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Move": {
-                    "local": {
-                      "index": 41
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "SwitchInt": {
-          "discr": {
-            "Move": {
-              "local": {
-                "index": 40
-              },
-              "projection": []
-            }
-          },
-          "targets": {
-            "branches": [
-              [
-                0,
-                {
-                  "index": 15
-                }
-              ]
-            ],
-            "otherwise": {
-              "index": 12
-            }
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 28
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 33
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "Goto": {
-          "target": {
-            "index": 15
           }
         }
       }
@@ -1841,7 +1772,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 30
+                    "index": 31
                   },
                   "projection": []
                 }
@@ -1858,55 +1789,12 @@
               "projection": []
             },
             {
-              "Cast": {
-                "to": "F32",
-                "operand": {
-                  "Move": {
-                    "local": {
-                      "index": 44
-                    },
-                    "projection": []
-                  }
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 45
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 29
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 42
-              },
-              "projection": []
-            },
-            {
               "BinaryOp": [
-                "Lt",
+                "Gt",
                 {
-                  "Move": {
+                  "Copy": {
                     "local": {
-                      "index": 43
+                      "index": 36
                     },
                     "projection": []
                   }
@@ -1914,7 +1802,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 45
+                      "index": 44
                     },
                     "projection": []
                   }
@@ -1929,7 +1817,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 42
+                "index": 43
               },
               "projection": []
             }
@@ -1939,12 +1827,12 @@
               [
                 0,
                 {
-                  "index": 15
+                  "index": 18
                 }
               ]
             ],
             "otherwise": {
-              "index": 14
+              "index": 15
             }
           }
         }
@@ -1956,7 +1844,7 @@
           "Assign": [
             {
               "local": {
-                "index": 46
+                "index": 31
               },
               "projection": []
             },
@@ -1964,32 +1852,9 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 30
+                    "index": 36
                   },
                   "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 29
-              },
-              "projection": []
-            },
-            {
-              "Cast": {
-                "to": "F32",
-                "operand": {
-                  "Move": {
-                    "local": {
-                      "index": 46
-                    },
-                    "projection": []
-                  }
                 }
               }
             }
@@ -1999,7 +1864,7 @@
       "terminator": {
         "Goto": {
           "target": {
-            "index": 15
+            "index": 18
           }
         }
       }
@@ -2018,7 +1883,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 30
+                    "index": 33
                   },
                   "projection": []
                 }
@@ -2030,24 +1895,70 @@
           "Assign": [
             {
               "local": {
-                "index": 30
+                "index": 46
               },
               "projection": []
             },
             {
-              "BinaryOp": [
-                "Add",
-                {
+              "Cast": {
+                "to": "F32",
+                "operand": {
                   "Move": {
                     "local": {
                       "index": 47
                     },
                     "projection": []
                   }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 48
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 32
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 45
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 46
+                    },
+                    "projection": []
+                  }
                 },
                 {
-                  "Const": {
-                    "Usize": 64
+                  "Move": {
+                    "local": {
+                      "index": 48
+                    },
+                    "projection": []
                   }
                 }
               ]
@@ -2056,9 +1967,27 @@
         }
       ],
       "terminator": {
-        "Goto": {
-          "target": {
-            "index": 7
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 45
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 18
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 17
+            }
           }
         }
       }
@@ -2077,7 +2006,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 28
+                    "index": 33
                   },
                   "projection": []
                 }
@@ -2085,78 +2014,28 @@
             }
           ]
         },
-        {
-          "WorkgroupLocalWrite": {
-            "idx": {
-              "Copy": {
-                "local": {
-                  "index": 12
-                },
-                "projection": []
-              }
-            },
-            "value": {
-              "Move": {
-                "local": {
-                  "index": 49
-                },
-                "projection": []
-              }
-            },
-            "array": 0
-          }
-        }
-      ],
-      "terminator": {
-        "Goto": {
-          "target": {
-            "index": 17
-          }
-        }
-      }
-    },
-    {
-      "statements": [
         {
           "Assign": [
             {
               "local": {
-                "index": 51
+                "index": 32
               },
               "projection": []
             },
             {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 29
-                  },
-                  "projection": []
+              "Cast": {
+                "to": "F32",
+                "operand": {
+                  "Move": {
+                    "local": {
+                      "index": 49
+                    },
+                    "projection": []
+                  }
                 }
               }
             }
           ]
-        },
-        {
-          "WorkgroupLocalWrite": {
-            "idx": {
-              "Copy": {
-                "local": {
-                  "index": 12
-                },
-                "projection": []
-              }
-            },
-            "value": {
-              "Move": {
-                "local": {
-                  "index": 51
-                },
-                "projection": []
-              }
-            },
-            "array": 1
-          }
         }
       ],
       "terminator": {
@@ -2168,11 +2047,60 @@
       }
     },
     {
-      "statements": [],
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 50
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 33
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 33
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 50
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 64
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
       "terminator": {
-        "Barrier": {
+        "Goto": {
           "target": {
-            "index": 19
+            "index": 10
           }
         }
       }
@@ -2183,7 +2111,121 @@
           "Assign": [
             {
               "local": {
-                "index": 53
+                "index": 52
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 31
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "WorkgroupLocalWrite": {
+            "idx": {
+              "Copy": {
+                "local": {
+                  "index": 15
+                },
+                "projection": []
+              }
+            },
+            "value": {
+              "Move": {
+                "local": {
+                  "index": 52
+                },
+                "projection": []
+              }
+            },
+            "array": 0
+          }
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 20
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 54
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 32
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "WorkgroupLocalWrite": {
+            "idx": {
+              "Copy": {
+                "local": {
+                  "index": 15
+                },
+                "projection": []
+              }
+            },
+            "value": {
+              "Move": {
+                "local": {
+                  "index": 54
+                },
+                "projection": []
+              }
+            },
+            "array": 1
+          }
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 21
+          }
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Barrier": {
+          "target": {
+            "index": 22
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 56
               },
               "projection": []
             },
@@ -2193,7 +2235,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 12
+                      "index": 15
                     },
                     "projection": []
                   }
@@ -2213,7 +2255,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 53
+                "index": 56
               },
               "projection": []
             }
@@ -2223,12 +2265,12 @@
               [
                 0,
                 {
-                  "index": 31
+                  "index": 34
                 }
               ]
             ],
             "otherwise": {
-              "index": 20
+              "index": 23
             }
           }
         }
@@ -2240,7 +2282,7 @@
           "Assign": [
             {
               "local": {
-                "index": 54
+                "index": 57
               },
               "projection": []
             },
@@ -2257,7 +2299,7 @@
           "Assign": [
             {
               "local": {
-                "index": 55
+                "index": 58
               },
               "projection": []
             },
@@ -2267,7 +2309,7 @@
                 "operand": {
                   "Copy": {
                     "local": {
-                      "index": 7
+                      "index": 10
                     },
                     "projection": []
                   }
@@ -2280,7 +2322,7 @@
           "Assign": [
             {
               "local": {
-                "index": 56
+                "index": 59
               },
               "projection": []
             },
@@ -2297,7 +2339,7 @@
       "terminator": {
         "Goto": {
           "target": {
-            "index": 21
+            "index": 24
           }
         }
       }
@@ -2308,7 +2350,7 @@
           "Assign": [
             {
               "local": {
-                "index": 58
+                "index": 61
               },
               "projection": []
             },
@@ -2316,7 +2358,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 56
+                    "index": 59
                   },
                   "projection": []
                 }
@@ -2328,7 +2370,7 @@
           "Assign": [
             {
               "local": {
-                "index": 57
+                "index": 60
               },
               "projection": []
             },
@@ -2338,7 +2380,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 58
+                      "index": 61
                     },
                     "projection": []
                   }
@@ -2358,143 +2400,9 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 57
-              },
-              "projection": []
-            }
-          },
-          "targets": {
-            "branches": [
-              [
-                0,
-                {
-                  "index": 29
-                }
-              ]
-            ],
-            "otherwise": {
-              "index": 22
-            }
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
                 "index": 60
               },
               "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 56
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 59
-              },
-              "projection": []
-            },
-            {
-              "WorkgroupLocalRead": {
-                "idx": {
-                  "Move": {
-                    "local": {
-                      "index": 60
-                    },
-                    "projection": []
-                  }
-                },
-                "array": 0
-              }
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "Goto": {
-          "target": {
-            "index": 23
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 62
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 54
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 61
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Gt",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 59
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Move": {
-                    "local": {
-                      "index": 62
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "SwitchInt": {
-          "discr": {
-            "Move": {
-              "local": {
-                "index": 61
-              },
-              "projection": []
             }
           },
           "targets": {
@@ -2502,12 +2410,12 @@
               [
                 0,
                 {
-                  "index": 25
+                  "index": 32
                 }
               ]
             ],
             "otherwise": {
-              "index": 24
+              "index": 25
             }
           }
         }
@@ -2519,7 +2427,7 @@
           "Assign": [
             {
               "local": {
-                "index": 54
+                "index": 63
               },
               "projection": []
             },
@@ -2534,43 +2442,12 @@
               }
             }
           ]
-        }
-      ],
-      "terminator": {
-        "Goto": {
-          "target": {
-            "index": 25
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 64
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 56
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
         },
         {
           "Assign": [
             {
               "local": {
-                "index": 63
+                "index": 62
               },
               "projection": []
             },
@@ -2579,12 +2456,12 @@
                 "idx": {
                   "Move": {
                     "local": {
-                      "index": 64
+                      "index": 63
                     },
                     "projection": []
                   }
                 },
-                "array": 1
+                "array": 0
               }
             }
           ]
@@ -2604,7 +2481,7 @@
           "Assign": [
             {
               "local": {
-                "index": 66
+                "index": 65
               },
               "projection": []
             },
@@ -2612,7 +2489,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 55
+                    "index": 57
                   },
                   "projection": []
                 }
@@ -2624,17 +2501,17 @@
           "Assign": [
             {
               "local": {
-                "index": 65
+                "index": 64
               },
               "projection": []
             },
             {
               "BinaryOp": [
-                "Lt",
+                "Gt",
                 {
                   "Copy": {
                     "local": {
-                      "index": 63
+                      "index": 62
                     },
                     "projection": []
                   }
@@ -2642,7 +2519,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 66
+                      "index": 65
                     },
                     "projection": []
                   }
@@ -2657,7 +2534,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 65
+                "index": 64
               },
               "projection": []
             }
@@ -2684,7 +2561,7 @@
           "Assign": [
             {
               "local": {
-                "index": 55
+                "index": 57
               },
               "projection": []
             },
@@ -2692,7 +2569,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 63
+                    "index": 62
                   },
                   "projection": []
                 }
@@ -2723,7 +2600,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 56
+                    "index": 59
                   },
                   "projection": []
                 }
@@ -2735,14 +2612,13 @@
           "Assign": [
             {
               "local": {
-                "index": 56
+                "index": 66
               },
               "projection": []
             },
             {
-              "BinaryOp": [
-                "Add",
-                {
+              "WorkgroupLocalRead": {
+                "idx": {
                   "Move": {
                     "local": {
                       "index": 67
@@ -2750,12 +2626,8 @@
                     "projection": []
                   }
                 },
-                {
-                  "Const": {
-                    "Usize": 1
-                  }
-                }
-              ]
+                "array": 1
+              }
             }
           ]
         }
@@ -2763,7 +2635,7 @@
       "terminator": {
         "Goto": {
           "target": {
-            "index": 21
+            "index": 29
           }
         }
       }
@@ -2782,7 +2654,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 54
+                    "index": 58
                   },
                   "projection": []
                 }
@@ -2791,28 +2663,59 @@
           ]
         },
         {
-          "WorkgroupLocalWrite": {
-            "idx": {
-              "Const": {
-                "Usize": 0
-              }
+          "Assign": [
+            {
+              "local": {
+                "index": 68
+              },
+              "projection": []
             },
-            "value": {
-              "Move": {
-                "local": {
-                  "index": 69
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 66
+                    },
+                    "projection": []
+                  }
                 },
-                "projection": []
-              }
-            },
-            "array": 0
-          }
+                {
+                  "Move": {
+                    "local": {
+                      "index": 69
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
         }
       ],
       "terminator": {
-        "Goto": {
-          "target": {
-            "index": 30
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 68
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 31
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 30
+            }
           }
         }
       }
@@ -2823,7 +2726,7 @@
           "Assign": [
             {
               "local": {
-                "index": 71
+                "index": 58
               },
               "projection": []
             },
@@ -2831,31 +2734,13 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 55
+                    "index": 66
                   },
                   "projection": []
                 }
               }
             }
           ]
-        },
-        {
-          "WorkgroupLocalWrite": {
-            "idx": {
-              "Const": {
-                "Usize": 0
-              }
-            },
-            "value": {
-              "Move": {
-                "local": {
-                  "index": 71
-                },
-                "projection": []
-              }
-            },
-            "array": 1
-          }
         }
       ],
       "terminator": {
@@ -2867,11 +2752,60 @@
       }
     },
     {
-      "statements": [],
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 70
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 59
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 59
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 70
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 1
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
       "terminator": {
-        "Barrier": {
+        "Goto": {
           "target": {
-            "index": 32
+            "index": 24
           }
         }
       }
@@ -2882,21 +2816,39 @@
           "Assign": [
             {
               "local": {
-                "index": 73
+                "index": 72
               },
               "projection": []
             },
             {
-              "WorkgroupLocalRead": {
-                "idx": {
-                  "Const": {
-                    "Usize": 0
-                  }
-                },
-                "array": 0
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 57
+                  },
+                  "projection": []
+                }
               }
             }
           ]
+        },
+        {
+          "WorkgroupLocalWrite": {
+            "idx": {
+              "Const": {
+                "Usize": 0
+              }
+            },
+            "value": {
+              "Move": {
+                "local": {
+                  "index": 72
+                },
+                "projection": []
+              }
+            },
+            "array": 0
+          }
         }
       ],
       "terminator": {
@@ -2918,6 +2870,96 @@
               "projection": []
             },
             {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 58
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "WorkgroupLocalWrite": {
+            "idx": {
+              "Const": {
+                "Usize": 0
+              }
+            },
+            "value": {
+              "Move": {
+                "local": {
+                  "index": 74
+                },
+                "projection": []
+              }
+            },
+            "array": 1
+          }
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 34
+          }
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Barrier": {
+          "target": {
+            "index": 35
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 76
+              },
+              "projection": []
+            },
+            {
+              "WorkgroupLocalRead": {
+                "idx": {
+                  "Const": {
+                    "Usize": 0
+                  }
+                },
+                "array": 0
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 36
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 77
+              },
+              "projection": []
+            },
+            {
               "WorkgroupLocalRead": {
                 "idx": {
                   "Const": {
@@ -2933,7 +2975,7 @@
       "terminator": {
         "Goto": {
           "target": {
-            "index": 34
+            "index": 37
           }
         }
       }
@@ -2944,7 +2986,7 @@
           "Assign": [
             {
               "local": {
-                "index": 75
+                "index": 78
               },
               "projection": []
             },
@@ -2954,7 +2996,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 73
+                      "index": 76
                     },
                     "projection": []
                   }
@@ -2962,7 +3004,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 18
+                      "index": 21
                     },
                     "projection": []
                   }
@@ -2975,7 +3017,7 @@
           "Assign": [
             {
               "local": {
-                "index": 76
+                "index": 79
               },
               "projection": []
             },
@@ -2992,7 +3034,7 @@
           "Assign": [
             {
               "local": {
-                "index": 77
+                "index": 80
               },
               "projection": []
             },
@@ -3009,7 +3051,7 @@
           "Assign": [
             {
               "local": {
-                "index": 78
+                "index": 81
               },
               "projection": []
             },
@@ -3017,7 +3059,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 12
+                    "index": 15
                   },
                   "projection": []
                 }
@@ -3029,87 +3071,7 @@
       "terminator": {
         "Goto": {
           "target": {
-            "index": 35
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 80
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 78
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 79
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Lt",
-                {
-                  "Move": {
-                    "local": {
-                      "index": 80
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 7
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "SwitchInt": {
-          "discr": {
-            "Move": {
-              "local": {
-                "index": 79
-              },
-              "projection": []
-            }
-          },
-          "targets": {
-            "branches": [
-              [
-                0,
-                {
-                  "index": 44
-                }
-              ]
-            ],
-            "otherwise": {
-              "index": 36
-            }
+            "index": 38
           }
         }
       }
@@ -3128,7 +3090,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 78
+                    "index": 81
                   },
                   "projection": []
                 }
@@ -3146,11 +3108,91 @@
             },
             {
               "BinaryOp": [
+                "Lt",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 83
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 10
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 82
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 47
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 39
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 86
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 81
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 85
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
                 "Add",
                 {
                   "Copy": {
                     "local": {
-                      "index": 13
+                      "index": 16
                     },
                     "projection": []
                   }
@@ -3158,7 +3200,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 83
+                      "index": 86
                     },
                     "projection": []
                   }
@@ -3171,7 +3213,7 @@
           "Assign": [
             {
               "local": {
-                "index": 84
+                "index": 87
               },
               "projection": []
             },
@@ -3189,7 +3231,7 @@
           "Assign": [
             {
               "local": {
-                "index": 85
+                "index": 88
               },
               "projection": []
             },
@@ -3199,7 +3241,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 82
+                      "index": 85
                     },
                     "projection": []
                   }
@@ -3207,7 +3249,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 84
+                      "index": 87
                     },
                     "projection": []
                   }
@@ -3222,7 +3264,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 85
+                "index": 88
               },
               "projection": []
             }
@@ -3232,12 +3274,12 @@
               [
                 0,
                 {
-                  "index": 77
+                  "index": 80
                 }
               ]
             ],
             "otherwise": {
-              "index": 37
+              "index": 40
             }
           }
         }
@@ -3249,7 +3291,7 @@
           "Assign": [
             {
               "local": {
-                "index": 81
+                "index": 84
               },
               "projection": []
             },
@@ -3263,7 +3305,7 @@
                     "Deref",
                     {
                       "Index": {
-                        "index": 82
+                        "index": 85
                       }
                     }
                   ]
@@ -3276,7 +3318,7 @@
           "Assign": [
             {
               "local": {
-                "index": 86
+                "index": 89
               },
               "projection": []
             },
@@ -3286,7 +3328,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 81
+                      "index": 84
                     },
                     "projection": []
                   }
@@ -3294,7 +3336,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 75
+                      "index": 78
                     },
                     "projection": []
                   }
@@ -3309,7 +3351,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 86
+                "index": 89
               },
               "projection": []
             }
@@ -3319,12 +3361,12 @@
               [
                 0,
                 {
-                  "index": 43
+                  "index": 46
                 }
               ]
             ],
             "otherwise": {
-              "index": 38
+              "index": 41
             }
           }
         }
@@ -3332,57 +3374,6 @@
     },
     {
       "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 87
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Mul",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 81
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 14
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 91
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 78
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
         {
           "Assign": [
             {
@@ -3393,155 +3384,19 @@
             },
             {
               "BinaryOp": [
-                "Add",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 13
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Move": {
-                    "local": {
-                      "index": 91
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 92
-              },
-              "projection": []
-            },
-            {
-              "Len": {
-                "local": {
-                  "index": 2
-                },
-                "projection": []
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 93
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Lt",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 90
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 92
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "SwitchInt": {
-          "discr": {
-            "Move": {
-              "local": {
-                "index": 93
-              },
-              "projection": []
-            }
-          },
-          "targets": {
-            "branches": [
-              [
-                0,
-                {
-                  "index": 78
-                }
-              ]
-            ],
-            "otherwise": {
-              "index": 39
-            }
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 89
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 2
-                  },
-                  "projection": [
-                    "Deref",
-                    {
-                      "Index": {
-                        "index": 90
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 88
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
                 "Mul",
                 {
                   "Copy": {
                     "local": {
-                      "index": 23
+                      "index": 84
                     },
                     "projection": []
                   }
                 },
                 {
-                  "Move": {
+                  "Copy": {
                     "local": {
-                      "index": 89
+                      "index": 17
                     },
                     "projection": []
                   }
@@ -3559,56 +3414,45 @@
               "projection": []
             },
             {
-              "BinaryOpNoContract": [
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 81
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 93
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
                 "Add",
                 {
                   "Copy": {
                     "local": {
-                      "index": 87
+                      "index": 16
                     },
                     "projection": []
                   }
                 },
                 {
-                  "Copy": {
+                  "Move": {
                     "local": {
-                      "index": 88
+                      "index": 94
                     },
                     "projection": []
                   }
                 }
               ]
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "Goto": {
-          "target": {
-            "index": 40
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 96
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 77
-                  },
-                  "projection": []
-                }
-              }
             }
           ]
         },
@@ -3621,12 +3465,210 @@
               "projection": []
             },
             {
+              "Len": {
+                "local": {
+                  "index": 2
+                },
+                "projection": []
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 96
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 93
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 95
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 96
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 81
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 42
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 92
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 2
+                  },
+                  "projection": [
+                    "Deref",
+                    {
+                      "Index": {
+                        "index": 93
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 91
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Mul",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 26
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 92
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 97
+              },
+              "projection": []
+            },
+            {
+              "BinaryOpNoContract": [
+                "Add",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 90
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 91
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 43
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 99
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 80
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 98
+              },
+              "projection": []
+            },
+            {
               "BinaryOp": [
                 "Lt",
                 {
                   "Move": {
                     "local": {
-                      "index": 96
+                      "index": 99
                     },
                     "projection": []
                   }
@@ -3646,7 +3688,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 95
+                "index": 98
               },
               "projection": []
             }
@@ -3656,12 +3698,12 @@
               [
                 0,
                 {
-                  "index": 41
+                  "index": 44
                 }
               ]
             ],
             "otherwise": {
-              "index": 42
+              "index": 45
             }
           }
         }
@@ -3673,7 +3715,7 @@
           "Assign": [
             {
               "local": {
-                "index": 98
+                "index": 101
               },
               "projection": []
             },
@@ -3681,7 +3723,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 76
+                    "index": 79
                   },
                   "projection": []
                 }
@@ -3693,7 +3735,7 @@
           "Assign": [
             {
               "local": {
-                "index": 97
+                "index": 100
               },
               "projection": []
             },
@@ -3703,7 +3745,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 94
+                      "index": 97
                     },
                     "projection": []
                   }
@@ -3711,7 +3753,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 98
+                      "index": 101
                     },
                     "projection": []
                   }
@@ -3726,7 +3768,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 97
+                "index": 100
               },
               "projection": []
             }
@@ -3736,12 +3778,12 @@
               [
                 0,
                 {
-                  "index": 43
+                  "index": 46
                 }
               ]
             ],
             "otherwise": {
-              "index": 42
+              "index": 45
             }
           }
         }
@@ -3753,7 +3795,7 @@
           "Assign": [
             {
               "local": {
-                "index": 76
+                "index": 79
               },
               "projection": []
             },
@@ -3761,7 +3803,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 94
+                    "index": 97
                   },
                   "projection": []
                 }
@@ -3773,7 +3815,7 @@
           "Assign": [
             {
               "local": {
-                "index": 99
+                "index": 102
               },
               "projection": []
             },
@@ -3781,7 +3823,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 78
+                    "index": 81
                   },
                   "projection": []
                 }
@@ -3793,7 +3835,7 @@
           "Assign": [
             {
               "local": {
-                "index": 77
+                "index": 80
               },
               "projection": []
             },
@@ -3803,7 +3845,7 @@
                 "operand": {
                   "Move": {
                     "local": {
-                      "index": 99
+                      "index": 102
                     },
                     "projection": []
                   }
@@ -3816,7 +3858,7 @@
       "terminator": {
         "Goto": {
           "target": {
-            "index": 43
+            "index": 46
           }
         }
       }
@@ -3827,7 +3869,7 @@
           "Assign": [
             {
               "local": {
-                "index": 100
+                "index": 103
               },
               "projection": []
             },
@@ -3835,7 +3877,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 78
+                    "index": 81
                   },
                   "projection": []
                 }
@@ -3847,7 +3889,7 @@
           "Assign": [
             {
               "local": {
-                "index": 78
+                "index": 81
               },
               "projection": []
             },
@@ -3857,7 +3899,7 @@
                 {
                   "Move": {
                     "local": {
-                      "index": 100
+                      "index": 103
                     },
                     "projection": []
                   }
@@ -3875,7 +3917,7 @@
       "terminator": {
         "Goto": {
           "target": {
-            "index": 35
+            "index": 38
           }
         }
       }
@@ -3886,7 +3928,7 @@
           "Assign": [
             {
               "local": {
-                "index": 102
+                "index": 105
               },
               "projection": []
             },
@@ -3894,7 +3936,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 76
+                    "index": 79
                   },
                   "projection": []
                 }
@@ -3907,7 +3949,7 @@
             "idx": {
               "Copy": {
                 "local": {
-                  "index": 12
+                  "index": 15
                 },
                 "projection": []
               }
@@ -3915,7 +3957,7 @@
             "value": {
               "Move": {
                 "local": {
-                  "index": 102
+                  "index": 105
                 },
                 "projection": []
               }
@@ -3927,7 +3969,7 @@
       "terminator": {
         "Goto": {
           "target": {
-            "index": 45
+            "index": 48
           }
         }
       }
@@ -3938,7 +3980,7 @@
           "Assign": [
             {
               "local": {
-                "index": 104
+                "index": 107
               },
               "projection": []
             },
@@ -3946,7 +3988,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 77
+                    "index": 80
                   },
                   "projection": []
                 }
@@ -3959,7 +4001,7 @@
             "idx": {
               "Copy": {
                 "local": {
-                  "index": 12
+                  "index": 15
                 },
                 "projection": []
               }
@@ -3967,7 +4009,7 @@
             "value": {
               "Move": {
                 "local": {
-                  "index": 104
+                  "index": 107
                 },
                 "projection": []
               }
@@ -3979,7 +4021,7 @@
       "terminator": {
         "Goto": {
           "target": {
-            "index": 46
+            "index": 49
           }
         }
       }
@@ -3989,7 +4031,7 @@
       "terminator": {
         "Barrier": {
           "target": {
-            "index": 47
+            "index": 50
           }
         }
       }
@@ -4000,7 +4042,7 @@
           "Assign": [
             {
               "local": {
-                "index": 106
+                "index": 109
               },
               "projection": []
             },
@@ -4010,7 +4052,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 12
+                      "index": 15
                     },
                     "projection": []
                   }
@@ -4030,7 +4072,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 106
+                "index": 109
               },
               "projection": []
             }
@@ -4040,12 +4082,12 @@
               [
                 0,
                 {
-                  "index": 71
+                  "index": 74
                 }
               ]
             ],
             "otherwise": {
-              "index": 48
+              "index": 51
             }
           }
         }
@@ -4057,7 +4099,7 @@
           "Assign": [
             {
               "local": {
-                "index": 107
+                "index": 110
               },
               "projection": []
             },
@@ -4074,7 +4116,7 @@
           "Assign": [
             {
               "local": {
-                "index": 108
+                "index": 111
               },
               "projection": []
             },
@@ -4091,7 +4133,7 @@
           "Assign": [
             {
               "local": {
-                "index": 109
+                "index": 112
               },
               "projection": []
             },
@@ -4100,191 +4142,6 @@
                 "Const": {
                   "Usize": 0
                 }
-              }
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "Goto": {
-          "target": {
-            "index": 49
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 111
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 109
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 110
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Lt",
-                {
-                  "Move": {
-                    "local": {
-                      "index": 111
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Const": {
-                    "Usize": 64
-                  }
-                }
-              ]
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "SwitchInt": {
-          "discr": {
-            "Move": {
-              "local": {
-                "index": 110
-              },
-              "projection": []
-            }
-          },
-          "targets": {
-            "branches": [
-              [
-                0,
-                {
-                  "index": 59
-                }
-              ]
-            ],
-            "otherwise": {
-              "index": 50
-            }
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 113
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 109
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 112
-              },
-              "projection": []
-            },
-            {
-              "WorkgroupLocalRead": {
-                "idx": {
-                  "Move": {
-                    "local": {
-                      "index": 113
-                    },
-                    "projection": []
-                  }
-                },
-                "array": 0
-              }
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "Goto": {
-          "target": {
-            "index": 51
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 115
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 109
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 114
-              },
-              "projection": []
-            },
-            {
-              "WorkgroupLocalRead": {
-                "idx": {
-                  "Move": {
-                    "local": {
-                      "index": 115
-                    },
-                    "projection": []
-                  }
-                },
-                "array": 1
               }
             }
           ]
@@ -4304,381 +4161,7 @@
           "Assign": [
             {
               "local": {
-                "index": 116
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Ge",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 114
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Const": {
-                    "F32": 0.0
-                  }
-                }
-              ]
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "SwitchInt": {
-          "discr": {
-            "Move": {
-              "local": {
-                "index": 116
-              },
-              "projection": []
-            }
-          },
-          "targets": {
-            "branches": [
-              [
-                0,
-                {
-                  "index": 58
-                }
-              ]
-            ],
-            "otherwise": {
-              "index": 53
-            }
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 118
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 108
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 117
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Lt",
-                {
-                  "Move": {
-                    "local": {
-                      "index": 118
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Const": {
-                    "F32": 0.0
-                  }
-                }
-              ]
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "SwitchInt": {
-          "discr": {
-            "Move": {
-              "local": {
-                "index": 117
-              },
-              "projection": []
-            }
-          },
-          "targets": {
-            "branches": [
-              [
-                0,
-                {
-                  "index": 54
-                }
-              ]
-            ],
-            "otherwise": {
-              "index": 57
-            }
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 120
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 107
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 119
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Gt",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 112
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Move": {
-                    "local": {
-                      "index": 120
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "SwitchInt": {
-          "discr": {
-            "Move": {
-              "local": {
-                "index": 119
-              },
-              "projection": []
-            }
-          },
-          "targets": {
-            "branches": [
-              [
-                0,
-                {
-                  "index": 55
-                }
-              ]
-            ],
-            "otherwise": {
-              "index": 57
-            }
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 122
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 107
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 121
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Eq",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 112
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Move": {
-                    "local": {
-                      "index": 122
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "SwitchInt": {
-          "discr": {
-            "Move": {
-              "local": {
-                "index": 121
-              },
-              "projection": []
-            }
-          },
-          "targets": {
-            "branches": [
-              [
-                0,
-                {
-                  "index": 58
-                }
-              ]
-            ],
-            "otherwise": {
-              "index": 56
-            }
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 124
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 108
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 123
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Lt",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 114
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Move": {
-                    "local": {
-                      "index": 124
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "SwitchInt": {
-          "discr": {
-            "Move": {
-              "local": {
-                "index": 123
-              },
-              "projection": []
-            }
-          },
-          "targets": {
-            "branches": [
-              [
-                0,
-                {
-                  "index": 58
-                }
-              ]
-            ],
-            "otherwise": {
-              "index": 57
-            }
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 107
+                "index": 114
               },
               "projection": []
             },
@@ -4698,75 +4181,24 @@
           "Assign": [
             {
               "local": {
-                "index": 108
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 114
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "Goto": {
-          "target": {
-            "index": 58
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 125
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 109
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 109
+                "index": 113
               },
               "projection": []
             },
             {
               "BinaryOp": [
-                "Add",
+                "Lt",
                 {
                   "Move": {
                     "local": {
-                      "index": 125
+                      "index": 114
                     },
                     "projection": []
                   }
                 },
                 {
                   "Const": {
-                    "Usize": 1
+                    "Usize": 64
                   }
                 }
               ]
@@ -4775,9 +4207,27 @@
         }
       ],
       "terminator": {
-        "Goto": {
-          "target": {
-            "index": 49
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 113
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 62
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 53
+            }
           }
         }
       }
@@ -4788,61 +4238,7 @@
           "Assign": [
             {
               "local": {
-                "index": 127
-              },
-              "projection": []
-            },
-            {
-              "Cast": {
-                "to": "F32",
-                "operand": {
-                  "Copy": {
-                    "local": {
-                      "index": 7
-                    },
-                    "projection": []
-                  }
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 126
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Lt",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 74
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Move": {
-                    "local": {
-                      "index": 127
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 130
+                "index": 116
               },
               "projection": []
             },
@@ -4850,7 +4246,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 108
+                    "index": 112
                   },
                   "projection": []
                 }
@@ -4862,17 +4258,105 @@
           "Assign": [
             {
               "local": {
-                "index": 129
+                "index": 115
+              },
+              "projection": []
+            },
+            {
+              "WorkgroupLocalRead": {
+                "idx": {
+                  "Move": {
+                    "local": {
+                      "index": 116
+                    },
+                    "projection": []
+                  }
+                },
+                "array": 0
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 54
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 118
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 112
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 117
+              },
+              "projection": []
+            },
+            {
+              "WorkgroupLocalRead": {
+                "idx": {
+                  "Move": {
+                    "local": {
+                      "index": 118
+                    },
+                    "projection": []
+                  }
+                },
+                "array": 1
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 55
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 119
               },
               "projection": []
             },
             {
               "BinaryOp": [
-                "Lt",
+                "Ge",
                 {
-                  "Move": {
+                  "Copy": {
                     "local": {
-                      "index": 130
+                      "index": 117
                     },
                     "projection": []
                   }
@@ -4892,7 +4376,324 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 129
+                "index": 119
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 61
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 56
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 121
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 111
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 120
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 121
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "F32": 0.0
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 120
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 57
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 60
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 123
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 110
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 122
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Gt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 115
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 123
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 122
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 58
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 60
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 125
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 110
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 124
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Eq",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 115
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 125
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 124
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 61
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 59
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 127
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 111
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 126
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 117
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 127
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 126
               },
               "projection": []
             }
@@ -4919,14 +4720,37 @@
           "Assign": [
             {
               "local": {
-                "index": 128
+                "index": 110
               },
               "projection": []
             },
             {
               "Use": {
-                "Const": {
-                  "F32": 0.0
+                "Copy": {
+                  "local": {
+                    "index": 115
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 111
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 117
+                  },
+                  "projection": []
                 }
               }
             }
@@ -4936,7 +4760,7 @@
       "terminator": {
         "Goto": {
           "target": {
-            "index": 62
+            "index": 61
           }
         }
       }
@@ -4955,11 +4779,39 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 108
+                    "index": 112
                   },
                   "projection": []
                 }
               }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 112
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 128
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 1
+                  }
+                }
+              ]
             }
           ]
         }
@@ -4967,19 +4819,122 @@
       "terminator": {
         "Goto": {
           "target": {
-            "index": 62
+            "index": 52
           }
         }
       }
     },
     {
-      "statements": [],
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 130
+              },
+              "projection": []
+            },
+            {
+              "Cast": {
+                "to": "F32",
+                "operand": {
+                  "Copy": {
+                    "local": {
+                      "index": 10
+                    },
+                    "projection": []
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 129
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 77
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 130
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 133
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 111
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 132
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 133
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "F32": 0.0
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
       "terminator": {
         "SwitchInt": {
           "discr": {
-            "Copy": {
+            "Move": {
               "local": {
-                "index": 126
+                "index": 132
               },
               "projection": []
             }
@@ -5042,7 +4997,7 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 128
+                    "index": 111
                   },
                   "projection": []
                 }
@@ -5066,7 +5021,7 @@
           "discr": {
             "Copy": {
               "local": {
-                "index": 126
+                "index": 129
               },
               "projection": []
             }
@@ -5093,45 +5048,14 @@
           "Assign": [
             {
               "local": {
-                "index": 132
-              },
-              "projection": []
-            },
-            {
-              "Use": {
-                "Copy": {
-                  "local": {
-                    "index": 74
-                  },
-                  "projection": []
-                }
-              }
-            }
-          ]
-        }
-      ],
-      "terminator": {
-        "Goto": {
-          "target": {
-            "index": 68
-          }
-        }
-      }
-    },
-    {
-      "statements": [
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 132
+                "index": 134
               },
               "projection": []
             },
             {
               "Use": {
                 "Const": {
-                  "F32": -1.0
+                  "F32": 0.0
                 }
               }
             }
@@ -5152,7 +5076,7 @@
           "Assign": [
             {
               "local": {
-                "index": 133
+                "index": 134
               },
               "projection": []
             },
@@ -5167,93 +5091,24 @@
               }
             }
           ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 134
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Mul",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 6
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Const": {
-                    "Usize": 2
-                  }
-                }
-              ]
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 136
-              },
-              "projection": []
-            },
-            {
-              "Len": {
-                "local": {
-                  "index": 5
-                },
-                "projection": [
-                  "Deref"
-                ]
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 137
-              },
-              "projection": []
-            },
-            {
-              "BinaryOp": [
-                "Lt",
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 134
-                    },
-                    "projection": []
-                  }
-                },
-                {
-                  "Copy": {
-                    "local": {
-                      "index": 136
-                    },
-                    "projection": []
-                  }
-                }
-              ]
-            }
-          ]
         }
       ],
       "terminator": {
+        "Goto": {
+          "target": {
+            "index": 68
+          }
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
         "SwitchInt": {
           "discr": {
-            "Move": {
+            "Copy": {
               "local": {
-                "index": 137
+                "index": 129
               },
               "projection": []
             }
@@ -5263,7 +5118,7 @@
               [
                 0,
                 {
-                  "index": 79
+                  "index": 70
                 }
               ]
             ],
@@ -5280,37 +5135,7 @@
           "Assign": [
             {
               "local": {
-                "index": 5
-              },
-              "projection": [
-                "Deref",
-                {
-                  "Index": {
-                    "index": 134
-                  }
-                }
-              ]
-            },
-            {
-              "Cast": {
-                "to": "I32",
-                "operand": {
-                  "Move": {
-                    "local": {
-                      "index": 133
-                    },
-                    "projection": []
-                  }
-                }
-              }
-            }
-          ]
-        },
-        {
-          "Assign": [
-            {
-              "local": {
-                "index": 138
+                "index": 135
               },
               "projection": []
             },
@@ -5318,7 +5143,66 @@
               "Use": {
                 "Copy": {
                   "local": {
-                    "index": 132
+                    "index": 77
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 71
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 135
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Const": {
+                  "F32": -1.0
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 71
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 136
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 134
                   },
                   "projection": []
                 }
@@ -5330,7 +5214,7 @@
           "Assign": [
             {
               "local": {
-                "index": 140
+                "index": 137
               },
               "projection": []
             },
@@ -5340,7 +5224,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 6
+                      "index": 9
                     },
                     "projection": []
                   }
@@ -5363,12 +5247,170 @@
               "projection": []
             },
             {
+              "Len": {
+                "local": {
+                  "index": 5
+                },
+                "projection": [
+                  "Deref"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 140
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 137
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 139
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 140
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 82
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 72
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 5
+              },
+              "projection": [
+                "Deref",
+                {
+                  "Index": {
+                    "index": 137
+                  }
+                }
+              ]
+            },
+            {
+              "Cast": {
+                "to": "I32",
+                "operand": {
+                  "Move": {
+                    "local": {
+                      "index": 136
+                    },
+                    "projection": []
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 141
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 135
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 143
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Mul",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 9
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 2
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 142
+              },
+              "projection": []
+            },
+            {
               "BinaryOp": [
                 "Add",
                 {
                   "Move": {
                     "local": {
-                      "index": 140
+                      "index": 143
                     },
                     "projection": []
                   }
@@ -5386,7 +5428,7 @@
           "Assign": [
             {
               "local": {
-                "index": 142
+                "index": 145
               },
               "projection": []
             },
@@ -5406,7 +5448,7 @@
           "Assign": [
             {
               "local": {
-                "index": 143
+                "index": 146
               },
               "projection": []
             },
@@ -5416,7 +5458,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 139
+                      "index": 142
                     },
                     "projection": []
                   }
@@ -5424,7 +5466,7 @@
                 {
                   "Copy": {
                     "local": {
-                      "index": 142
+                      "index": 145
                     },
                     "projection": []
                   }
@@ -5439,7 +5481,7 @@
           "discr": {
             "Move": {
               "local": {
-                "index": 143
+                "index": 146
               },
               "projection": []
             }
@@ -5449,12 +5491,12 @@
               [
                 0,
                 {
-                  "index": 80
+                  "index": 83
                 }
               ]
             ],
             "otherwise": {
-              "index": 70
+              "index": 73
             }
           }
         }
@@ -5472,7 +5514,7 @@
                 "Deref",
                 {
                   "Index": {
-                    "index": 139
+                    "index": 142
                   }
                 }
               ]
@@ -5483,7 +5525,7 @@
                 "operand": {
                   "Move": {
                     "local": {
-                      "index": 138
+                      "index": 141
                     },
                     "projection": []
                   }
@@ -5496,7 +5538,7 @@
       "terminator": {
         "Goto": {
           "target": {
-            "index": 71
+            "index": 74
           }
         }
       }

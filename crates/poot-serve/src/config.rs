@@ -13,6 +13,7 @@ use std::time::Duration;
 use clap::Parser;
 use poot_executor::DetailedTiming;
 use poot_llm::driver::{BackendChoice, LoadOptions};
+use poot_models::model::KvDtype;
 use poot_text::ChatTemplateOverride;
 
 use crate::admin::{AdminKey, LoraAdminPolicy};
@@ -155,6 +156,10 @@ pub(crate) struct ServeConfig {
     /// and below the model's expert count; a model with no routed experts is refused at startup.
     #[arg(long, value_name = "ROWS", value_parser = parse_expert_pool)]
     pub(crate) expert_pool: Option<NonZeroUsize>,
+    /// The dtype the KV cache stores: f16, bf16 or f32 (the exact reference, twice the bytes). Without it the
+    /// model's own preference applies, else f16. Attention computes in f32 whichever is stored.
+    #[arg(long, value_name = "DTYPE", value_parser = parse_kv_dtype)]
+    pub(crate) kv_dtype: Option<KvDtype>,
     /// Render chats through this jinja template instead of the model's own. A value with no jinja
     /// syntax names a built-in template, which poot lacks, and is refused.
     #[arg(long, value_name = "JINJA", conflicts_with = "chat_template_file")]
@@ -438,6 +443,11 @@ fn parse_max_seq(raw: &str) -> Result<NonZeroUsize, String> {
 
 fn parse_expert_pool(raw: &str) -> Result<NonZeroUsize, String> {
     positive(raw, "the pool row count")
+}
+
+fn parse_kv_dtype(raw: &str) -> Result<KvDtype, String> {
+    raw.parse()
+        .map_err(|error: poot_models::model::UnknownKvDtype| error.to_string())
 }
 
 fn parse_draft_mtp(raw: &str) -> Result<NonZeroUsize, String> {

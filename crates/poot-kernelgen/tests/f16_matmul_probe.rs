@@ -85,7 +85,7 @@ fn f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv() {
             String::from_utf8_lossy(&v.stderr)
         );
     } else {
-        eprintln!("spirv-val not on PATH; skipping the validity check");
+        poot_test_util::skip_report("poot-kernelgen", &"spirv-val not on PATH");
     }
 
     // (2) SC-002 half 2: the GPU dispatch matches the CPU f32 oracle within f16 tolerance. This is
@@ -93,7 +93,10 @@ fn f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv() {
     let ctx = match Context::new() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch half");
+            poot_test_util::skip_report(
+                "poot-kernelgen",
+                &format_args!("no wgpu context, dispatch half: {e}"),
+            );
             return;
         }
     };

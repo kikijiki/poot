@@ -195,9 +195,10 @@ fn a_chain_region_returns_one_value_and_allocates_nothing_for_the_rest() {
             poot_executor_parity::fixture_weights(&fixture),
         )
         .expect("the weights load");
+    let program = poot_executor_parity::staged_on(&npu.engine, &fixture, target);
     let entry = npu
         .engine
-        .add_entry(exe, &poot_executor_parity::staged(&fixture, target))
+        .add_entry(exe, &program)
         .expect("the chain loads");
     assert_eq!(contexts(&npu.engine), 1, "six equations, one artifact");
     let live = |engine: &Engine<XdnaDevice>, role: BufferRole| -> u64 {
@@ -299,9 +300,10 @@ fn a_six_equation_region_is_one_run_per_step() {
                 poot_executor_parity::fixture_weights(fixture),
             )
             .expect("the weights load");
+        let program = poot_executor_parity::staged_on(&npu.engine, fixture, target);
         let entry = npu
             .engine
-            .add_entry(exe, &poot_executor_parity::staged(fixture, target))
+            .add_entry(exe, &program)
             .expect("the entry loads");
         (exe, entry)
     };
@@ -354,18 +356,24 @@ fn body_of(op: poot_kernel_ir::BinOp, dims: &[u64]) -> poot_kernel_ir::Body {
         shape: shape.clone(),
         layout: poot_kernelgen::Layout::contiguous(&shape),
     };
-    let request =
-        poot_kernelgen::KernelRequest::Elementwise(poot_kernelgen::ElementwiseSpec::Binary {
-            op: poot_kernelgen::ValueBinary::Basic(op, poot_kernel_ir::Ty::F32),
-            out_shape: shape.clone(),
-            a: operand(),
-            b: operand(),
+    let leaf = |index| poot_kernelgen::FusedInput::Leaf(poot_kernelgen::LeafId::new(index));
+    let request = poot_kernelgen::KernelRequest::Pointwise(poot_kernelgen::PointwiseSpec {
+        out_shape: shape.clone(),
+        numel: shape.iter().product(),
+        leaves: vec![operand(), operand()],
+        kernel: poot_kernelgen::FusedKernel::one_step(
+            poot_kernelgen::FusedScalarOp::Binary(op),
+            vec![poot_kernelgen::LeafTy::F32; 2],
+            vec![leaf(0), leaf(1)],
+        ),
+        form: poot_kernelgen::PointwiseForm::Float {
             fold: poot_kernelgen::Fold {
                 numel: shape.iter().product(),
                 two_d: false,
                 width: 256,
             },
-        });
+        },
+    });
     let limits = poot_kernelgen::BodyLimits {
         max_instructions: std::num::NonZeroUsize::new(4096).unwrap(),
         max_locals: std::num::NonZeroUsize::new(256).unwrap(),
@@ -378,27 +386,25 @@ fn body_of(op: poot_kernel_ir::BinOp, dims: &[u64]) -> poot_kernel_ir::Body {
 /// A region wired by hand, below `package`: the bodies in tile order and the recipe linking them.
 struct Region {
     bodies: Vec<poot_kernel_ir::Body>,
-    recipe: poot_codegen::AieLinkRecipe,
+    recipe: poot_npu::AieLinkRecipe,
 }
 
 /// A host-side description of region wiring: each tensor is `[2, 3]` F32.
 const ELEMENTS: u64 = 6;
 
-fn fifo(
-    producer: poot_codegen::FifoEnd,
-    consumers: Vec<poot_codegen::FifoEnd>,
-) -> poot_codegen::AieFifo {
-    poot_codegen::AieFifo {
+fn fifo(producer: poot_npu::FifoEnd, consumers: Vec<poot_npu::FifoEnd>) -> poot_npu::AieFifo {
+    poot_npu::AieFifo {
         producer,
         consumers,
-        depth: poot_codegen::AieLinkRecipe::FIFO_DEPTH,
+        depth: poot_npu::AieLinkRecipe::FIFO_DEPTH,
         elements: ELEMENTS,
         element: poot_target::ElementKind::F32,
     }
 }
 
-fn abi(reads: usize, writes: usize) -> poot_runtime_common::AieShapeAbi {
-    use poot_runtime_common::{AieBinding, ArgAccess};
+fn abi(reads: usize, writes: usize) -> poot_npu_artifacts::AieShapeAbi {
+    use poot_npu_artifacts::AieBinding;
+    use poot_target::ArgAccess;
     let binding = |i, access| {
         AieBinding::new(
             i,
@@ -409,7 +415,7 @@ fn abi(reads: usize, writes: usize) -> poot_runtime_common::AieShapeAbi {
         )
         .unwrap()
     };
-    poot_runtime_common::AieShapeAbi::new(
+    poot_npu_artifacts::AieShapeAbi::new(
         (0..reads)
             .map(|i| binding(i, ArgAccess::Read))
             .chain((0..writes).map(|i| binding(reads + i, ArgAccess::Write)))
@@ -422,7 +428,7 @@ fn abi(reads: usize, writes: usize) -> poot_runtime_common::AieShapeAbi {
 /// and each returns its own result: `n` host streams out, two in. Otherwise each reads its own two tensors:
 /// `2n` streams in, `n` out.
 fn independent_adds(n: usize, shared: bool) -> Region {
-    use poot_codegen::{AieLinkRecipe, AieTile, FifoEnd};
+    use poot_npu::{AieLinkRecipe, AieTile, FifoEnd};
     let tile = |tile, port| FifoEnd::Tile { tile, port };
     let host = |binding| FifoEnd::Host { binding };
     let (mut fifos, mut tiles) = (Vec::new(), Vec::new());
@@ -455,7 +461,7 @@ fn independent_adds(n: usize, shared: bool) -> Region {
 /// `n` adds chained over on-chip links: tile `i` adds the host tensor `c`, which every tile reads (one
 /// broadcast stream), to what tile `i - 1` produced; tile 0 reads the host tensor `x`.
 fn broadcast_chain(n: usize) -> Region {
-    use poot_codegen::{AieLinkRecipe, AieTile, FifoEnd};
+    use poot_npu::{AieLinkRecipe, AieTile, FifoEnd};
     let tile = |tile, port| FifoEnd::Tile { tile, port };
     let host = |binding| FifoEnd::Host { binding };
     // FIFO 0 is x, 1 is c, 2 + i is tile i's output.
@@ -482,11 +488,11 @@ fn broadcast_chain(n: usize) -> Region {
 /// What `aiecc` does with `region`, with no packaging in front of it: the artifact it links, or the error.
 fn link(
     region: &Region,
-) -> Result<poot_runtime_common::AieLinkedArtifact, poot_codegen::AieCompileError> {
+) -> Result<poot_npu_artifacts::AieLinkedArtifact, poot_npu::AieCompileError> {
     let dir = poot_test_util::unique_temp_path("npu-region-link");
     std::fs::create_dir_all(&*dir).unwrap();
     let bodies: Vec<&poot_kernel_ir::Body> = region.bodies.iter().collect();
-    poot_codegen::compile_aie(
+    poot_npu::compile_aie(
         &bodies,
         &region.recipe,
         &poot_codegen::Toolchain::from_env(),
@@ -496,10 +502,10 @@ fn link(
     .map(|compiled| compiled.artifact)
 }
 
-fn iron_failure(error: poot_codegen::AieCompileError) -> String {
+fn iron_failure(error: poot_npu::AieCompileError) -> String {
     match error {
-        poot_codegen::AieCompileError::Tool {
-            stage: poot_codegen::AieStage::Iron,
+        poot_npu::AieCompileError::Tool {
+            stage: poot_npu::AieStage::Iron,
             stderr,
             ..
         } => stderr,
@@ -520,7 +526,9 @@ fn a_region_at_every_declared_limit_links_and_one_past_is_refused() {
     let Some((_lock, device)) = device(XdnaConfig::default()) else {
         return;
     };
-    let poot_graph_plan::Target::Aie { caps, .. } = device.target() else {
+    let poot_graph_plan::Target::Npu(poot_graph_plan::NpuTarget::Aie { caps, .. }) =
+        device.target()
+    else {
         panic!("the device's target is an AIE target");
     };
     let limits = caps.region;
@@ -599,9 +607,10 @@ fn packaging_splits_at_the_declared_bounds_and_each_split_program_runs() {
 /// assertion fails.
 #[test]
 fn a_reordered_chain_is_its_own_artifact_and_computes_its_own_function() {
-    use poot_codegen::{AieFifo, AieLinkRecipe, AieTile, FifoEnd};
-    use poot_executor::{AieInvocation, Arg, Dispatch, LaunchKind};
+    use poot_executor::{Arg, Dispatch, LaunchKind};
     use poot_kernel_ir::BinOp::{Add, Sub};
+    use poot_npu::{AieFifo, AieLinkRecipe, AieTile, FifoEnd};
+    use poot_npu_artifacts::AieInvocation;
     use poot_runtime_common::BufferRole;
     use poot_target::{AieTargetId, BufferStorage};
 
@@ -639,7 +648,7 @@ fn a_reordered_chain_is_its_own_artifact_and_computes_its_own_function() {
     };
     let run = |device: &mut XdnaDevice, region: &Region| -> Vec<f32> {
         let bodies: Vec<&poot_kernel_ir::Body> = region.bodies.iter().collect();
-        let compiled = poot_codegen::compile_aie(
+        let compiled = poot_npu::compile_aie(
             &bodies,
             &region.recipe,
             &toolchain,
@@ -650,7 +659,7 @@ fn a_reordered_chain_is_its_own_artifact_and_computes_its_own_function() {
         let words =
             std::num::NonZeroU32::new((compiled.artifact.instructions().len() / 4) as u32).unwrap();
         let kernel = device
-            .load_kernel("chain", poot_codegen::aie_kernel_handle(compiled.artifact))
+            .load_kernel("chain", poot_npu::aie_kernel_handle(compiled.artifact))
             .expect("the chain loads");
         let alloc = |device: &mut XdnaDevice, role| {
             device
@@ -676,7 +685,7 @@ fn a_reordered_chain_is_its_own_artifact_and_computes_its_own_function() {
             .iter()
             .map(|buffer| Arg {
                 buffer,
-                elems: ELEMENTS as u32,
+                elems: ELEMENTS as usize,
             })
             .collect();
         device.begin().unwrap();
@@ -686,7 +695,7 @@ fn a_reordered_chain_is_its_own_artifact_and_computes_its_own_function() {
                 inputs: &args[..3],
                 output: Arg {
                     buffer: &buffers[3],
-                    elems: ELEMENTS as u32,
+                    elems: ELEMENTS as usize,
                 },
                 launch: LaunchKind::Aie(AieInvocation::new(AieTargetId::Xdna2, words)),
                 work: 0,

@@ -134,7 +134,7 @@ fn the_kernel_lowers_to_spirv_and_ptx() {
         .output()
         .is_err()
     {
-        eprintln!("llc not on PATH; skipping");
+        poot_test_util::skip_report("poot-kernelgen", &"llc not on PATH");
         return;
     }
     let dir = std::env::temp_dir().join("poot-block-top-k-lowering");

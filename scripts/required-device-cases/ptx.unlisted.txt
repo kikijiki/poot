@@ -4,13 +4,18 @@
 poot-ptx-device::bin/ptx-check	tests::a_directory_with_no_fixture_is_not_a_pass	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
 poot-ptx-device::bin/ptx-check	tests::a_failed_comparison_fails_the_run	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
 poot-ptx-device::bin/ptx-check	tests::a_partial_directory_fails_only_when_ptx_is_required	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
+poot-ptx-device::bin/ptx-check	tests::a_required_run_fails_for_each_compile_only_fixture_left_unstaged	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
+poot-ptx-device::bin/ptx-check	tests::a_staged_fixture_nobody_checks_fails_the_run	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
+poot-ptx-device::bin/ptx-check	tests::compile_only_fixtures_are_allowed_and_must_exist_when_required	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
 poot-ptx-device::bin/ptx-check	tests::missing_fixture_is_skipped_not_run	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
 poot-ptx-device::bin/ptx-check	tests::staged_fixture_is_run_not_skipped	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
 poot-ptx-runtime	context::caps_tests::a_pre_ampere_device_has_no_matrix_hardware_for_poots_kernels	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	context::caps_tests::every_attribute_lands_in_its_own_caps_field	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	context::caps_tests::the_gemv_width_ceiling_is_reported_only_for_the_measured_generation	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	tests::a_sticky_device_fault_is_device_lost_and_the_next_call_is_poisoned	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	tests::allocation_arithmetic_is_checked_before_native_allocation	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	tests::allocation_initialization_failure_frees_before_returning	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::allocation_layout_accepts_an_element_count_past_u32	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	tests::bf16_packed_word_rejected_by_dense_i32_bind	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	tests::captured_graph_owns_dispatched_buffers_until_it_drops	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	tests::children_delay_context_cleanup_and_preserve_dependency_order	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
@@ -24,6 +29,8 @@ poot-ptx-runtime	tests::final_owner_release_unbinds_owner_or_restores_prior_cont
 poot-ptx-runtime	tests::final_owner_restore_failure_suppresses_primary_release	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	tests::graph_instantiate_failure_destroys_partial_exec_then_graph	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	tests::immutable_metadata_and_valid_copy_share_one_allocation_contract	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::kernel_args_refuse_a_binding_past_a_narrowed_kernels_index_bound	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
+poot-ptx-runtime	tests::kernel_args_refuse_a_buffer_off_the_binding_alignment	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	tests::module_lookup_failure_unloads_the_loaded_module	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	tests::narrow_buffer_rejected_by_f32_operation_before_copy	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	tests::native_counters_count_instantiations_launches_and_events	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`

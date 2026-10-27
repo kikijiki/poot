@@ -6,63 +6,63 @@
       "repeats": [
         {
           "metrics": {
-            "step_us": 89.48
+            "step_us": 55.744
           },
           "slot": 0,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 89.849
+            "step_us": 55.393
           },
           "slot": 1,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 90.01
+            "step_us": 56.004
           },
           "slot": 2,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 90.13000000000001
+            "step_us": 55.333
           },
           "slot": 3,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 89.839
+            "step_us": 55.974000000000004
           },
           "slot": 4,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 89.52
+            "step_us": 55.263000000000005
           },
           "slot": 5,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 90.03
+            "step_us": 55.294000000000004
           },
           "slot": 6,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 89.269
+            "step_us": 55.203
           },
           "slot": 7,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 89.85000000000001
+            "step_us": 55.583
           },
           "slot": 8,
           "status": "ok"
@@ -94,13 +94,13 @@
     "weight_copies": 16
   },
   "plan": [
-    "contraction:serial [f013784abf9b5067dff849b9e17d4d81d34e172154e2206c8586ffff1de09dd0]"
+    "contraction:gemv_chunk [95d7d74a7715f0049d2c4705551290856f8e58c36bbc07e9a6cc790d9c3840ae]"
   ],
-  "plan_id": "392e1288c9db7534bc6eb495af5bbf0ba6653066dc7e069203a180a3ab3471fd",
+  "plan_id": "486fd59912b77c5d0daa0833d6b8e86236aec629463b9c9ae077f333ec7299be",
   "recordings": 16,
   "reference": {
     "agrees": true,
-    "max_relative_error": 3.423499811131652e-05,
+    "max_relative_error": 4.792419894831075e-06,
     "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
     "provenance": "independent-golden",
     "tolerance": 0.002
@@ -113,7 +113,7 @@
     "run",
     "--release",
     "-p",
-    "poot-ptx-gpu",
+    "poot-ptx-device",
     "--example",
     "performance_bank",
     "--",
@@ -124,8 +124,8 @@
     "--out",
     "benchmarks/performance-bank/receipts/ptx/dense-decode-gemv.json"
   ],
-  "parent_revision": "e178f51722183668cf2f554e21b0dca17d3b0caf",
-  "binary_sha256": "f03b4e410ae08055bb6182e107411087d132ac4ff8db8e61de347c3bb4c3eec1",
+  "parent_revision": "ce0d5a1ec6adf1a248789951101210d9493c4762",
+  "binary_sha256": "f3d48cded04c71a1e921a19a9b78d949e6587f9090f8feb6726c4ae41ff1ac57",
   "identity": {
     "checkpoint_digest": "synthetic-no-checkpoint",
     "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
@@ -157,8 +157,8 @@
       "profiled": false
     },
     "backend": "ptx",
-    "device": "NVIDIA GeForce RTX 3090",
-    "driver": "driver 580.65.06"
+    "device": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "driver": "595.91.07"
   },
   "identity_digest": "ddf91990536c590e6c03a698de2f57569f07b1e6cb7ef9307e494694d835d35f",
   "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"

@@ -4,7 +4,7 @@
 
 use poot_eval::test_support::StepFixture;
 use poot_graph_ir::test_support::block_top_k::{grid_scores, reference_row};
-use poot_graph_ir::test_support::selected_attention::{Case, cases};
+use poot_graph_ir::test_support::selected_attention::{Case, cases, selected_ids};
 use poot_graph_ir::{Builder, IndexRange, Outputs, Slot, TensorType, ops};
 use poot_graph_plan::{KernelChoice, Target};
 use poot_tensor::{DType, HostTensor};
@@ -32,6 +32,7 @@ pub fn all() -> Vec<SelectedAttentionCase> {
             "selected_attention_decode",
             "selected_attention_prefill_short_selections",
             "selected_attention_every_block",
+            "selected_attention_prefill_wide_gqa_group",
         ])
         .map(|(case, name)| build(name, &case, true))
         .collect();
@@ -272,6 +273,37 @@ pub fn deep_decode_pair(lk: usize) -> (Fixture, Fixture) {
     (selected, dense)
 }
 
+/// The prefill chunk of the perf receipt: the last 1024 queries of a prompt of `lk` stored positions (24 query
+/// heads over 2 key/value heads of 256, blocks of four, 512 selected by the plain selection of per-query random
+/// scores), the shape Flash-Next runs at chunk 1024 of a long prompt. Past the first few blocks every query
+/// visits its full 2052 candidates, so the cost per chunk is flat in `lk`. No reference output is computed.
+pub fn prefill_chunk_fixture(lk: usize) -> Fixture {
+    let (ratio, k, chunk) = (4, 512, 1024);
+    let pos: Vec<i32> = ((lk - chunk) as i32..lk as i32).collect();
+    let case = Case {
+        label: "prefill chunk".into(),
+        batch: 1,
+        hq: 24,
+        n_rep: 12,
+        lq: chunk,
+        lk,
+        d: 256,
+        ratio,
+        k,
+        ids: selected_ids(&pos, lk / ratio, ratio, k, 1 << 20),
+        pos,
+    };
+    let operands = case.operands(33);
+    build_with(
+        "selected_attention_prefill_chunk",
+        &case,
+        operands,
+        Vec::new(),
+        false,
+    )
+    .fixture
+}
+
 /// One TSV line of a perf receipt: `receipt backend fixture median_us min_us max_us samples`.
 fn print_receipt_line(backend: &str, name: &str, mut samples: Vec<std::time::Duration>) {
     samples.sort();
@@ -326,4 +358,20 @@ pub fn print_attention_receipt(
         print_receipt_line(backend, &format!("{}_{lk}", fixture.name), samples);
     }
     fixtures.len()
+}
+
+/// The perf receipt of the selected attention over the prefill chunk of [`prefill_chunk_fixture`] at `lk`
+/// stored positions (device timestamps). Prints a line, returns how many.
+pub fn print_prefill_receipt(
+    exec: &mut dyn poot_executor::Executor,
+    target: Target,
+    backend: &str,
+    lk: usize,
+) -> usize {
+    let fixture = prefill_chunk_fixture(lk);
+    let samples = crate::receipt(exec, target, &[&fixture], 4, 8).unwrap_or_else(|e| panic!("{e}"));
+    for samples in samples {
+        print_receipt_line(backend, &format!("{}_{lk}", fixture.name), samples);
+    }
+    1
 }

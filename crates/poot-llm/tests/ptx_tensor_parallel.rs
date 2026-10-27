@@ -60,7 +60,7 @@ fn open_devices(count: usize, require: &str) -> Option<Vec<PtxDevice>> {
                     "{count} NVIDIA devices are required ({require}) and device {ordinal} is \
                      unavailable: {error}"
                 );
-                eprintln!("SKIP: NVIDIA device {ordinal} is unavailable: {error}");
+                eprintln!("POOT-SKIP: NVIDIA device {ordinal} is unavailable: {error}");
                 return None;
             }
         }

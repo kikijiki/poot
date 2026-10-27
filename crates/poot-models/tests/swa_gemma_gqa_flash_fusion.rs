@@ -8,7 +8,7 @@
 //! poot-eval API at all).
 
 use poot_graph_ir::op::OpKind;
-use poot_graph_plan::{cse, dce, flash_attention_capped};
+use poot_graph_plan::{cse, dce, flash_attention};
 use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 
@@ -31,7 +31,7 @@ fn swa_gqa_prefill_reaches_the_grouped_flash_path() {
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
-    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap().0).unwrap();
+    let fused = dce(&flash_attention(&cse(&g).unwrap()).unwrap().0).unwrap();
     let reps: Vec<usize> = fused
         .eqns()
         .iter()

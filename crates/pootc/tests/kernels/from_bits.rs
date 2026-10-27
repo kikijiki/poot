@@ -3,10 +3,10 @@
 //! importer maps `from_bits` to a `Bitcast` (a reinterpret, not an `as` cast). card 044 / spec 055.
 
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 
 pub fn __poot_kernel_from_bits(inp: &[f32], bits: &[u32], out: &mut [f32]) {
-    let i = thread_index();
+    let i = thread_index_x();
     if i < out.len() {
         let scale = f32::from_bits(bits[0]);
         out[i] = inp[i] * scale;

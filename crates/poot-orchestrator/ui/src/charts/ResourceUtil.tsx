@@ -6,13 +6,12 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
-  Legend,
   ResponsiveContainer,
 } from 'recharts';
 import type {Run, ResultRow, UtilSample} from './types';
 import {frameworkColor, frameworkLabel, bytesToGiB} from './types';
 import {rowsFor, frameworksInRows} from './data';
-import {ChartCard, Empty, ControlWrap, ToggleGroup} from './ui';
+import {ChartCard, ChartLegend, Empty, ControlWrap, ToggleGroup} from './ui';
 import styles from './styles.module.css';
 
 // Rows in this run and model with resource-utilization summaries (recorded on every ok cell).
@@ -178,15 +177,23 @@ export default function ResourceUtil(props: {run: Run; model: string}) {
           {seriesData.length === 0 ? (
             <Empty>No time-series samples for this engine.</Empty>
           ) : (
+            <>
+            <ChartLegend
+              items={[
+                {label: 'GPU %', color: frameworkColor(effFw)},
+                {label: 'CPU % (100% = 1 core)', color: '#888888', dashed: true},
+              ]}
+            />
             <ResponsiveContainer width="100%" height={320}>
-              <LineChart data={seriesData} margin={{top: 8, right: 24, bottom: 24, left: 8}}>
+              <LineChart data={seriesData} margin={{top: 4, right: 24, bottom: 4, left: 8}}>
                 <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
                 <XAxis
                   dataKey="t"
                   type="number"
                   domain={['auto', 'auto']}
                   tickFormatter={(v) => `${Math.round(Number(v))}s`}
-                  label={{value: 'time since cell start (s)', position: 'bottom', offset: 8}}
+                  height={52}
+                  label={{value: 'time since cell start (s)', position: 'insideBottom', offset: 0}}
                 />
                 <YAxis
                   label={{
@@ -204,7 +211,6 @@ export default function ResourceUtil(props: {run: Run; model: string}) {
                   ]) as never}
                   labelFormatter={(l) => `t = ${Number(l).toFixed(1)}s`}
                 />
-                <Legend formatter={(v) => (String(v) === 'gpu' ? 'GPU %' : 'CPU % (100% = 1 core)')} />
                 <Line
                   type="monotone"
                   dataKey="gpu"
@@ -228,6 +234,7 @@ export default function ResourceUtil(props: {run: Run; model: string}) {
                 />
               </LineChart>
             </ResponsiveContainer>
+            </>
           )}
         </>
       ) : null}

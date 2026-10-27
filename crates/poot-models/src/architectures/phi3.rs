@@ -1,9 +1,10 @@
 //! phi3: the Phi-3 / Phi-4-mini dense decoder. It is the plain GQA + RoPE + SwiGLU decoder with two
 //! differences: the checkpoint fuses `q|k|v` into one `qkv_proj` and `gate|up` into one
 //! `gate_up_proj` (read here as row ranges of the stored tensors, so a packed checkpoint stays
-//! packed), and RoPE rotates only the leading `partial_rotary_factor` of each head. LongRoPE
-//! (`rope_scaling.type == longrope`, and a GGUF's `rope_factors_*` tensors) is a typed refusal: its
-//! per-frequency factors need a computed constant that names a weight.
+//! packed), and RoPE rotates only the leading `partial_rotary_factor` of each head. An HF config's
+//! LongRoPE block (`rope_scaling.type == longrope`: Phi-3.5-mini, Phi-4-mini) is read into the RoPE
+//! tables like any other scaling. A GGUF's `rope_factors_*` tensors are a typed refusal: they are
+//! weights, and the tables are computed from the config alone.
 //!
 //! A phi3 GGUF stores Q/K in HF row order (no llama.cpp permutation), so both formats use the
 //! half-split rotation.
@@ -41,7 +42,7 @@ const SPEC: DenseSpec = DenseSpec {
 const ROTARY_FACTOR: Field = Field::hf("partial_rotary_factor");
 const GGUF_ROTARY_DIM: &str = "phi3.rope.dimension_count";
 
-/// Tensors a LongRoPE GGUF carries: per-frequency factors a computed table cannot hold.
+/// Tensors a LongRoPE GGUF carries: per-frequency factors the config-computed tables cannot read.
 const GGUF_LONGROPE_FACTORS: [&str; 2] = ["rope_factors_long.weight", "rope_factors_short.weight"];
 
 /// The leading head dims that rotate: HF rounds `head_dim * partial_rotary_factor` down to even;
@@ -367,7 +368,16 @@ mod tests {
             ("sliding_window", json!(0), "window", ConfigReason::Zero),
             (
                 "rope_scaling",
-                json!({"type": "longrope", "short_factor": [1.0], "long_factor": [1.0]}),
+                json!({"type": "longrope", "short_factor": [1.0], "long_factor": [1.0, 1.0, 1.0, 1.0]}),
+                "rope_scaling.short_factor",
+                ConfigReason::Mismatch {
+                    expected: 4,
+                    found: 1,
+                },
+            ),
+            (
+                "rope_scaling",
+                json!({"type": "madeup"}),
                 "rope_scaling.rope_type",
                 ConfigReason::Unsupported,
             ),
@@ -380,6 +390,76 @@ mod tests {
                 (*field, *reason),
                 "{key} = {value}"
             );
+        }
+    }
+
+    fn longrope_config(original: u64, short: f32, long: f32) -> serde_json::Value {
+        let mut config = fixture_config();
+        config["original_max_position_embeddings"] = json!(original);
+        config["rope_scaling"] = json!({
+            "type": "longrope",
+            "short_factor": vec![short; 4],
+            "long_factor": vec![long; 4],
+        });
+        config
+    }
+
+    fn logits_of(config: &serde_json::Value) -> Vec<f32> {
+        let fx = fixture();
+        let model = model_of(config, &fx.store);
+        run_step(&*model, &fx.store, CAP, &[3, 17, 40, 8], 0, &[]).0
+    }
+
+    /// A table that stays in the short regime (the step capacity is within the trained context) with
+    /// uniform divisors `k` is linear position interpolation by `k`, which an independent flavor
+    /// computes: the config's `short_factor` is applied to every frequency. Mutation: ignore the
+    /// factors in `rope_tables` (plain table); red.
+    #[test]
+    fn longrope_short_regime_is_linear_interpolation_by_its_factors() {
+        let mut linear = fixture_config();
+        linear["rope_scaling"] = json!({"type": "linear", "factor": 4.0});
+        let longrope = longrope_config(64, 4.0, 9.0);
+        close(&logits_of(&longrope), &logits_of(&linear));
+        assert_ne!(
+            logits_of(&longrope),
+            logits_of(&fixture_config()),
+            "the factors change the model"
+        );
+    }
+
+    /// Past the trained context the long table and the attention factor apply: the capacity-8 step of
+    /// a model trained for 4 positions differs from the short regime, and from the same long factors
+    /// without the attention scale (maximum context equal to the trained one is not reachable at
+    /// capacity 8, so the short factors stand in). Mutation: always pick the short table; red.
+    #[test]
+    fn longrope_past_the_trained_context_uses_the_long_table() {
+        let past = logits_of(&longrope_config(4, 1.0, 9.0));
+        let within = logits_of(&longrope_config(64, 1.0, 9.0));
+        assert_ne!(past, within);
+        assert!(past.iter().all(|v| v.is_finite()));
+    }
+
+    /// The real Phi-3.5-mini and Phi-4-mini configs (both `longrope`) read through the production
+    /// reader: the factor tables match the rotary width (Phi-4-mini rotates 3/4 of each head), so
+    /// the config is accepted whole. Mutation: skip the `longrope` arm of `hf_rope_flavor`; red.
+    #[test]
+    fn the_real_longrope_configs_configure() {
+        for (checkpoint, max_positions) in [
+            (poot_test_util::checkpoint!("phi-3.5-mini"), 131_072),
+            (poot_test_util::checkpoint!("phi-4-mini"), 131_072),
+        ] {
+            let Some(dir) = poot_test_util::model_path(checkpoint) else {
+                continue;
+            };
+            let config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+            let raw = RawConfig::HfJson {
+                config: &config,
+                generation: None,
+                preprocessor: None,
+            };
+            let params = Phi3::configure(&raw).unwrap_or_else(|e| panic!("{checkpoint}: {e}"));
+            assert_eq!(params.max_positions, max_positions, "{checkpoint}");
         }
     }
 

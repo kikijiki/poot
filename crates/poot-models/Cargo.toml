@@ -18,6 +18,7 @@ test-support = [
     "dep:poot-graph-plan",
     "dep:poot-profile",
     "dep:poot-runtime-common",
+    "dep:poot-codegen",
     "dep:bytemuck",
     "poot-graph-ir/test-support",
     "poot-graph-plan/test-support",
@@ -45,6 +46,7 @@ poot-test-util = { workspace = true, optional = true }
 poot-graph-plan = { workspace = true, optional = true }
 poot-profile = { workspace = true, optional = true }
 poot-runtime-common = { workspace = true, optional = true }
+poot-codegen = { workspace = true, optional = true }
 poot-target.workspace = true
 bytemuck = { workspace = true, optional = true }
 
@@ -64,6 +66,8 @@ poot-runtime-common.workspace = true
 # reachable only through compile. The planner's pass-soundness tests that trace models live
 # here (POOT-755): a model crate sits above the planner, never the reverse.
 poot-graph-plan = { workspace = true, features = ["test-support"] }
+# The NPU lowering the NPU columns of the support table and the Qwen refusal rows compile through.
+poot-npu = { workspace = true, features = ["test-support"] }
 poot-kernel-ir.workspace = true
 poot-kernelgen.workspace = true
 criterion.workspace = true

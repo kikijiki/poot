@@ -9,6 +9,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# `CompiledKernel`, the one handle a dispatch takes, and the compiler its tests build fixture kernels with.
+poot-codegen.workspace = true
 object.workspace = true
 poot-runtime-common.workspace = true
 poot-target.workspace = true
@@ -16,9 +18,6 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# SC-002/SC-003 (card 608): compiles real AMDGCN fixture kernels to exercise
-# the schema check and entry-point selection on the production dispatch path, not a hand-rolled artifact.
-poot-codegen.workspace = true
 poot-kernel-ir = { workspace = true, features = ["test-support"] }
 
 [lints]

@@ -36,7 +36,7 @@ use poot_llm::driver::{
     ServingShapes, SpeculationStats, StepRow, Warm, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
-use poot_models::model::{LogitRows, StepShape, StepSpec};
+use poot_models::model::{KvDtype, LogitRows, StepShape, StepSpec};
 use poot_models::registry::{Fixture, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::{BufferRole, DeviceBackend};
@@ -204,7 +204,7 @@ impl Device for FakeDevice {
     fn load_kernel(
         &mut self,
         _key: &str,
-        _kernel: poot_runtime_common::CompiledKernel,
+        _kernel: poot_codegen::CompiledKernel,
     ) -> Result<(), FakeError> {
         Ok(())
     }
@@ -329,6 +329,7 @@ impl Executor for Counting {
 fn options(draft: DraftPolicy) -> DriverOptions {
     let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(CAPACITY),
@@ -613,7 +614,11 @@ fn oracle_rows(store: &WeightStore, tokens: &[u32]) -> Vec<Vec<f32>> {
     let n = tokens.len();
     let fixture = family::fixture();
     let model = registry().build(&fixture.raw(), store).unwrap();
-    let shape = StepShape::new(NonZeroUsize::MIN, nz(n), nz(CAPACITY)).with_logits(LogitRows::All);
+    // The KV dtype the drivers under test resolve: the host replay evaluates the cache the device stores.
+    let kv = KvDtype::resolve(None, model.model.config().kv_dtype);
+    let shape = StepShape::new(NonZeroUsize::MIN, nz(n), nz(CAPACITY))
+        .with_logits(LogitRows::All)
+        .with_kv_dtype(kv);
     let graph = model
         .model
         .trace(
@@ -623,7 +628,9 @@ fn oracle_rows(store: &WeightStore, tokens: &[u32]) -> Vec<Vec<f32>> {
         .unwrap();
     let state: Vec<HostTensor> = graph
         .state()
-        .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+        .map(|(input, _)| {
+            HostTensor::zeros_of(graph.aval(input).dtype, graph.aval(input).shape.clone())
+        })
         .collect();
     let slots = [
         (

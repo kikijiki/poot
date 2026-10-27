@@ -5,9 +5,8 @@
 //! global layers decomposed and the count short of the layer count.
 //!
 //! Mutation: cap the flash matcher's admitted head dim below Gemma4's global head dim. In
-//! `attention_match`'s `flash_attention_capped`, the `fits` closure returns early for a decode
-//! match and checks `max_prefill_groups` after that, so put the cap first: `if
-//! g.aval(m.q).shape[3] > 16 { return false; }` as its first statement. The global layers
+//! `attention_match`'s `flash_attention`, decline a match whose head dim is over 16: `Ok(m) if
+//! g.aval(m.q).shape[3] <= 16 => ...` ahead of the fusing arm. The global layers
 //! (32-wide heads) fall back, the fused count drops to the local layers' and each row fails.
 
 use poot_graph_ir::op::OpKind;

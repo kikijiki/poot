@@ -14,6 +14,7 @@ rust-version.workspace = true
 test-support = ["poot-wgpu-runtime/test-support"]
 
 [dependencies]
+poot-codegen.workspace = true
 poot-target.workspace = true
 poot-graph-plan.workspace = true
 poot-wgpu-runtime.workspace = true
@@ -47,7 +48,6 @@ poot-runtime-common = { workspace = true, features = ["test-support"] }
 # it directly against poot-codegen's on-disk kernel cache; tests/buffer_plan.rs compiles its length
 # probe the same way.
 poot-kernel-ir = { workspace = true, features = ["serde", "test-support"] }
-poot-codegen.workspace = true
 
 [[bench]]
 name = "op_dispatch"

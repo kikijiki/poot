@@ -404,3 +404,78 @@ fn mb5_a_truncated_safetensors_shard_is_refused_at_the_end_of_load() {
         Err(LoadError::SourceChanged(_))
     ));
 }
+
+/// `RssFile` of this process in bytes: the file-backed pages (a mapped checkpoint's) in its page tables.
+fn rss_file_bytes() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    let kib: u64 = status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("RssFile:")?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .expect("RssFile in /proc/self/status");
+    kib * 1024
+}
+
+/// MB-8: a load validates every byte of a mapped checkpoint and then leaves none of it in the process's
+/// resident set: the store holds the mapping, not the pages. The payload is 64 MiB of Q8_0 tensors, each
+/// larger than the 64 KiB rounding of a release, so a load that kept its pages would show all of it.
+/// The bytes are still readable afterwards and equal the file's.
+///
+/// Mutation: drop the `advise(Access::Release)` in `plan::TensorJob::run`; `RssFile` grows by the payload.
+#[test]
+fn mb8_a_loaded_checkpoint_is_not_resident() {
+    const TENSORS: usize = 16;
+    const ROWS: usize = 4096;
+    const K: usize = 4096;
+    let block = zero_blocks(WeightFormat::Q8_0, ROWS, K);
+    let payload = TENSORS * block.len();
+    assert_eq!(payload, 16 * 4096 * (4096 / 32) * 34);
+    let path = poot_test_util::unique_temp_path("mb8.gguf");
+    {
+        let names: Vec<String> = (0..TENSORS)
+            .map(|i| format!("blk.{i}.attn_q.weight"))
+            .collect();
+        let tensors: Vec<(&str, Vec<u64>, u32, Vec<u8>)> = names
+            .iter()
+            .map(|name| {
+                (
+                    name.as_str(),
+                    vec![K as u64, ROWS as u64],
+                    GGML_Q8_0,
+                    block.clone(),
+                )
+            })
+            .collect();
+        std::fs::write(&*path, write_gguf(&[], &tensors)).unwrap();
+    }
+
+    let file = map_path(&path);
+    let before = rss_file_bytes();
+    let index = GgufIndex::parse(&file).unwrap();
+    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
+    let resident = rss_file_bytes().saturating_sub(before);
+    assert!(
+        resident < payload as u64 / 8,
+        "a loaded {payload}-byte checkpoint left {resident} bytes of it resident"
+    );
+
+    // Releasing dropped page-table entries, not bytes: a read faults the same content back in.
+    let reader = File::open(&*path).unwrap();
+    let len = entry_bytes(&store, "blk.3.attn_q.weight").len();
+    let offset = index.tensors["blk.3.attn_q.weight"].offset;
+    let data_start = std::fs::metadata(&*path).unwrap().len()
+        - (index.tensors.values().map(|t| t.offset).max().unwrap() + len as u64);
+    let mut expected = vec![0u8; len];
+    reader
+        .read_exact_at(&mut expected, data_start + offset)
+        .unwrap();
+    assert_eq!(
+        entry_bytes(&store, "blk.3.attn_q.weight"),
+        expected.as_slice()
+    );
+}

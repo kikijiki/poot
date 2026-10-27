@@ -179,6 +179,7 @@ fn build_tiny(raw: &RawConfig<'_>) -> Result<ModelParts, ModelError> {
             bos: None,
             prompt_bos: None,
             prefill_granule: NonZeroUsize::MIN,
+            kv_dtype: None,
             chat: ChatFormat::ChatML,
             tool_codec: Some(Arc::new(HermesToolCodec)),
         },
@@ -243,6 +244,8 @@ struct FakeError;
 
 struct CountingDevice {
     memory: MemoryCounters,
+    /// What the device reports it can still allocate; `None` where it cannot say.
+    free: Option<u64>,
 }
 
 impl Device for CountingDevice {
@@ -267,6 +270,9 @@ impl Device for CountingDevice {
     fn memory(&self) -> Vec<(BufferRole, poot_runtime_common::MemoryCounterSnapshot)> {
         self.memory.snapshot_all()
     }
+    fn free_memory_bytes(&self) -> Option<u64> {
+        self.free
+    }
     fn allocate(
         &mut self,
         role: BufferRole,
@@ -286,7 +292,7 @@ impl Device for CountingDevice {
     fn load_kernel(
         &mut self,
         _key: &str,
-        _kernel: poot_runtime_common::CompiledKernel,
+        _kernel: poot_codegen::CompiledKernel,
     ) -> Result<(), FakeError> {
         Ok(())
     }
@@ -331,6 +337,7 @@ impl Device for CountingDevice {
 fn options(capacity: usize) -> DriverOptions {
     let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(capacity),
@@ -373,6 +380,7 @@ fn planned_and_live(
 ) -> (RoleBytes, RoleBytes) {
     let device = CountingDevice {
         memory: MemoryCounters::new(),
+        free: None,
     };
     let executor = Engine::new(device);
     let planner = {
@@ -463,4 +471,112 @@ fn a_paged_pool_plans_by_its_blocks() {
             "{blocks} blocks: the pool's slots times a position"
         );
     }
+}
+
+/// POOT-1327: the prefill chunk is the largest candidate whose plan fits the device, and the first
+/// candidate unchanged when it fits. Rows: a device with room for the first candidate keeps it; room for
+/// only a smaller plan shrinks to exactly the largest fitting candidate; no room for the smallest is the
+/// typed over-budget refusal naming the largest allocations, before the executor held a byte; a device
+/// that cannot report free memory keeps the first candidate and admits nothing.
+/// Mutation: make `fit_prefill_chunk` always return the last candidate; the first row goes red.
+#[test]
+fn the_prefill_chunk_is_the_largest_that_fits_the_device() {
+    use poot_executor::Executor;
+    use poot_llm::driver::capacity::{
+        AdmitError, CapacityRefusal, Observation, SUPPORT_RESERVE_BYTES, chunk_candidates,
+        fit_prefill_chunk,
+    };
+
+    assert_eq!(chunk_candidates(nz(8), nz(1)), [nz(8), nz(4), nz(2), nz(1)]);
+    assert_eq!(chunk_candidates(nz(10), nz(2)), [nz(10), nz(4), nz(2)]);
+
+    let (_dir, handle) = checkpoint(Variant::Dense);
+    let handle = Arc::new(handle);
+    let engine = |free: Option<u64>| {
+        Engine::new(CountingDevice {
+            memory: MemoryCounters::new(),
+            free,
+        })
+    };
+    let candidates = chunk_candidates(nz(8), nz(1));
+    let planner = Planner::new(
+        Arc::clone(&handle),
+        &engine(None).target_set(),
+        Placement::Single,
+    )
+    .unwrap();
+    let need = |chunk: usize| {
+        let options = DriverOptions {
+            prefill_chunk: nz(chunk),
+            ..options(64)
+        };
+        let planned = planner
+            .plan(options, &shapes(Layout::Contiguous), &[])
+            .unwrap();
+        planned.footprint.device_bytes(DeviceId(0)).unwrap()
+    };
+    let needs: Vec<u64> = candidates.iter().map(|c| need(c.get())).collect();
+    assert!(
+        needs.windows(2).all(|pair| pair[0] > pair[1]),
+        "a smaller chunk plans a smaller footprint: {needs:?}"
+    );
+    let fit = |free: Option<u64>| {
+        let executor = engine(free);
+        let fitted = fit_prefill_chunk(
+            &handle,
+            &executor.target_set(),
+            || Observation::of(&executor),
+            &options(64),
+            &shapes(Layout::Contiguous),
+            &candidates,
+        );
+        let held = executor.device_memory().iter().all(|memory| {
+            memory
+                .live
+                .iter()
+                .all(|(_, snapshot)| snapshot.live_bytes == 0)
+        });
+        assert!(held, "planning allocated nothing on the executor");
+        fitted
+    };
+
+    // Room for the first candidate: it is kept, with its plan.
+    let fitted = fit(Some(needs[0] + SUPPORT_RESERVE_BYTES)).unwrap();
+    assert_eq!(fitted.chunk, candidates[0]);
+    assert_eq!(
+        fitted.footprint.unwrap().device_bytes(DeviceId(0)).unwrap(),
+        needs[0]
+    );
+    // Room for the second only: the first is a byte short.
+    let fitted = fit(Some(needs[1] + SUPPORT_RESERVE_BYTES)).unwrap();
+    assert_eq!(fitted.chunk, candidates[1]);
+    // Room for the smallest only.
+    let fitted = fit(Some(needs[3] + SUPPORT_RESERVE_BYTES)).unwrap();
+    assert_eq!(fitted.chunk, candidates[3]);
+    // Not even the smallest: the typed refusal, the smallest chunk's, naming its biggest allocation.
+    let Err(AdmitError::NoChunkFits {
+        chunk,
+        refusal:
+            CapacityRefusal::OverBudget {
+                required,
+                available,
+                largest,
+                ..
+            },
+    }) = fit(Some(needs[3] + SUPPORT_RESERVE_BYTES - 1))
+    else {
+        panic!("a device short of the smallest chunk must be refused over budget");
+    };
+    assert_eq!(
+        (chunk, required, available),
+        (candidates[3], needs[3], needs[3] - 1)
+    );
+    assert!(
+        largest
+            .windows(2)
+            .all(|pair| pair[0].bytes >= pair[1].bytes)
+    );
+    // A device that cannot say how much it has: nothing admitted, the first candidate kept.
+    let fitted = fit(None).unwrap();
+    assert_eq!((fitted.chunk, fitted.footprint), (candidates[0], None));
 }

@@ -437,13 +437,17 @@ impl PackedWeight {
     }
 
     /// The most experts one stacked table of this weight holds with every source addressable: the indexed kernels
-    /// reach expert `e`'s slab at bit offset `e * slab_words(role) * 32` held in 32 bits, so a table of `E` experts
-    /// needs `E * slab_words(role) * 32 <= u32::MAX` for every [`Self::sources`] role (512 MiB of one source). A
-    /// larger stack is split into expert ranges, each its own table.
-    pub fn max_stack_experts(self) -> usize {
+    /// reach expert `e`'s slab at bit offset `e * slab_words(role) * 32` held in the backend's index type, so a
+    /// table of `E` experts needs `E * slab_words(role) * 32 <= max_bit_offset` for every [`Self::sources`] role
+    /// (512 MiB of one source on a 32-bit backend; `max_bit_offset` is the backend's own bound). A larger stack is
+    /// split into expert ranges, each its own table.
+    pub fn max_stack_experts(self, max_bit_offset: u64) -> usize {
         self.sources()
             .into_iter()
-            .map(|role| u32::MAX as usize / (self.slab_words(role) * 32).max(1))
+            .map(|role| {
+                let per_expert_bits = (self.slab_words(role) as u64 * 32).max(1);
+                usize::try_from(max_bit_offset / per_expert_bits).unwrap_or(usize::MAX)
+            })
             .min()
             .unwrap_or(0)
     }
@@ -745,6 +749,12 @@ impl PackedPayload {
     /// [`PackedWeight::sources`]).
     pub fn bytes(&self, role: SourceRole) -> &[u8] {
         self.source(role).bytes.as_slice()
+    }
+
+    /// A paging hint over `range` of `role`'s source bytes ([`StoredBytes::advise_range`]). Panics if
+    /// `role` is not one of this payload's sources.
+    pub fn advise(&self, role: SourceRole, range: std::ops::Range<usize>, access: Access) {
+        self.source(role).bytes.advise_range(range, access);
     }
 
     /// Every source's owner, in [`PackedWeight::sources`] order.

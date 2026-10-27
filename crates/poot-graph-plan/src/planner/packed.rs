@@ -3,11 +3,10 @@
 
 use super::{
     BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, ImportedKernel,
-    KernelRequest, MatmulShapes, OpKind, PlanError, Planned, ValueId, WeightLayout, kg, matmul,
-    value_ids,
+    KernelRequest, OpKind, PlanError, Planned, ValueId, WeightLayout, kg, matmul, value_ids,
 };
 use crate::planner::{GraphTables, StorageDtypes, finalize};
-use crate::predicates::{dense_decode_gemv_in, elementwise_fold};
+use crate::predicates::dense_decode_gemv_in;
 use crate::refusal::Site;
 use crate::storage_analysis::dense_contraction_weight_storage;
 use crate::types::{StorageKind, ValueStorage};
@@ -48,10 +47,10 @@ pub(super) fn plan(
         //
         // - M == 1: the generated dense Gemv (Card 727). A column's
         //   lanes read contiguous runs of its weight row (the `[N, K]` layout is already the coalesced one).
-        // - M > 1: the generated tiled GEMM reading B through `[N, K]` strides.
+        // - M > 1: the register-tiled GEMM (POOT-1403), staging runs of the weight's rows.
         //
         // Every body is generated from a request that records the weight layout, so no key is shared with the
-        // `[K, N]` matmul bodies. No tensor-core `[N, K]` body exists here (Card 727).
+        // `[K, N]` matmul bodies.
         //
         // Card 1007: an F16 weight takes the same bodies. Its buffer is packed two binary16 elements per `u32`
         // word (`StorageKind::F16Packed` on every backend), and each request names that storage, so the body
@@ -76,26 +75,29 @@ pub(super) fn plan(
             let r = out_shape.len();
             let n = out_shape[r - 1];
             let k = shape(ids[1])[1];
-            if let Some(schedule) = dense_decode_gemv_in(eqn, out_shape, out_numel, caps) {
+            if let Some(launch) = dense_decode_gemv_in(eqn, out_shape, out_numel, caps) {
+                let schedule = launch.schedule(backend, k);
                 dense_gemv(site, backend, weight, schedule, k, n, None, caps)?
             } else {
-                matmul::tiled_region_plan(
+                matmul::dense_tiled_plan(
                     site,
                     backend,
-                    matmul::TiledGemm {
-                        m: out_numel / n.max(1),
+                    kg::TiledShape {
+                        blocks: 1,
+                        m_per_block: out_numel / n.max(1),
+                        out_per_block: n,
                         k,
-                        n,
                         layout: WeightLayout::Nk,
-                        weight,
+                        segments: 1,
                     },
+                    kg::DenseTiledWeight::Nk(weight),
                     None,
                     caps,
                 )?
             }
         }
         // A dense contraction followed by its pointwise epilogue (`fuse_contraction_epilogues`): the same
-        // weight storage (BF16 included) and Gemv as above at `M == 1`, else the generated tiled GEMM, each applying
+        // weight storage (BF16 included) and Gemv as above at `M == 1`, else the register-tiled GEMM, each applying
         // the epilogue to the head's f32 result before the store.
         OpKind::ContractionEpilogue {
             head: ContractionHead::Dense { weight: dtype },
@@ -119,46 +121,51 @@ pub(super) fn plan(
             )?;
             let k = shape(ids[1])[1];
             let n = out_shape[out_shape.len() - 1];
-            if let Some(schedule) = dense_decode_gemv_in(eqn, out_shape, out_numel, caps) {
+            if let Some(launch) = dense_decode_gemv_in(eqn, out_shape, out_numel, caps) {
+                let schedule = launch.schedule(backend, k);
                 dense_gemv(site, backend, weight, schedule, k, n, Some(epilogue), caps)?
             } else {
-                matmul::tiled_region_plan(
+                matmul::dense_tiled_plan(
                     site,
                     backend,
-                    matmul::TiledGemm {
-                        m: out_numel / n.max(1),
+                    kg::TiledShape {
+                        blocks: 1,
+                        m_per_block: out_numel / n.max(1),
+                        out_per_block: n,
                         k,
-                        n,
                         layout: WeightLayout::Nk,
-                        weight,
+                        segments: 1,
                     },
+                    kg::DenseTiledWeight::Nk(weight),
                     Some(epilogue),
                     caps,
                 )?
             }
         }
         // The grouped contraction (`fold_dense_contractions`' `[0, 2, 1]` spelling): `groups` independent
-        // `[M, K] x [N, K]^T` products over row blocks of one `[groups * N, K]` weight. No gemv or tiled body
-        // batches over a weight, so it takes the one-thread-per-output dense body, which reads the weight as the
-        // `[groups, N, K]` batch of blocks it is, in packed-BF16 storage (the only dtype with grouped rows).
+        // `[M, K] x [N, K]^T` products over row blocks of one `[groups * N, K]` weight, in packed-BF16 storage
+        // (the only dtype with grouped rows). That is the register-tiled GEMM's block-diagonal form: group `g`'s
+        // rows read weight rows `g * N ..`, so it takes the same body as the plain dense contraction.
         OpKind::GroupedDenseContraction {
             weight: DType::BF16,
             groups,
         } => {
-            let weight_shape = shape(ids[1]);
-            let (k, n) = (weight_shape[1], out_shape[2]);
-            Planned::generated(
+            let k = shape(ids[1])[1];
+            matmul::dense_tiled_plan(
                 site,
-                KernelRequest::Contraction(ContractionSpec::DenseSerial {
-                    weight: ValueStorage::new(StorageKind::Bf16Packed).buffer_storage(),
-                    shapes: MatmulShapes {
-                        out_shape: out_shape.to_vec(),
-                        a_shape: shape(ids[0]),
-                        b_shape: vec![*groups, n, k],
-                    },
-                    fold: elementwise_fold(g, eqn, out_shape, out_numel, caps),
-                }),
                 backend,
+                kg::TiledShape {
+                    blocks: *groups,
+                    m_per_block: out_shape[1],
+                    out_per_block: out_shape[2],
+                    k,
+                    layout: WeightLayout::Nk,
+                    segments: 1,
+                },
+                kg::DenseTiledWeight::Nk(
+                    ValueStorage::new(StorageKind::Bf16Packed).buffer_storage(),
+                ),
+                None,
                 caps,
             )?
         }
@@ -257,7 +264,14 @@ fn dense_gemv(
     epilogue: Option<kg::Epilogue>,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
-    Planned::generated(
+    // The longest binding: the `[N, K]` weight counted in elements (at least its words), above the `K` activation,
+    // the `N` output, an epilogue leaf of at most `N` and the two metadata words.
+    let longest = (n as u64)
+        .saturating_mul(k as u64)
+        .max(k as u64)
+        .max(n as u64)
+        .max(2);
+    Planned::generated_bounded(
         site,
         KernelRequest::Contraction(ContractionSpec::DenseGemv {
             weight,
@@ -268,5 +282,6 @@ fn dense_gemv(
         }),
         backend,
         caps,
+        longest,
     )
 }

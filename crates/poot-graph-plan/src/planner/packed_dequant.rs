@@ -14,18 +14,21 @@
 //! out)` (activation is `eqn.inputs[0]`, the carrier is `eqn.inputs[1]`). A standalone `PackedDequant`
 //! has no kernel: nothing materializes a packed weight.
 
-use super::matmul::{FoldedTileGrid, folded_tile_grid};
+use super::matmul::TiledDispatch;
 use super::{
     BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, FusedRegion,
     KernelRequest, OpKind, PackedRequest, PlanError, Planned, matmul, value_ids,
 };
 use crate::planner::{GraphTables, finalize};
-use crate::predicates::{INDEXED_GEMV_MAX_ROWS, packed_contraction_m_per_block};
+use crate::predicates::{INDEXED_GEMV_MAX_ROWS, gemv_activation, packed_contraction_m_per_block};
 use crate::refusal::Site;
 use poot_graph_ir::ContractionRows;
 use poot_kernelgen::{
-    PackedContraction, PackedKernelOp, PackedKernelSpec, PackedRows, RegisterTiling, Schedule,
+    PackedContraction, PackedKernelOp, PackedKernelSpec, PackedRows, PackedRunSharing, Schedule,
+    TiledShape, WeightLayout,
 };
+use poot_quant::format::WeightFormat;
+use poot_target::calibration::PORTABLE_PACKED_GEMV_RUN;
 use poot_target::{Backend, DeviceCaps};
 
 /// Plan one imported packed equation. A descriptor card 542a's table does not admit for this op is
@@ -120,6 +123,8 @@ fn try_plan_row_gather(
         caps,
     )
     .map_err(|missing| site.refuse(missing))?;
+    crate::packed_block_float::check_source_addressable(descriptor, backend)
+        .map_err(|missing| site.refuse(missing))?;
     let spec = PackedKernelSpec {
         format,
         op: PackedKernelOp::RowGather,
@@ -130,8 +135,15 @@ fn try_plan_row_gather(
         KernelRequest::Packed(PackedRequest {
             name: "packed_row_gather",
             spec,
-            grid: [out_numel as u32, 1, 1],
-            meta: vec![k as u32],
+            grid: [
+                u32::try_from(out_numel)
+                    .map_err(|_| site.refuse(Capability::DispatchSizeOverflow))?,
+                1,
+                1,
+            ],
+            meta: vec![
+                u32::try_from(k).map_err(|_| site.refuse(Capability::DispatchSizeOverflow))?,
+            ],
         }),
         backend,
         caps,
@@ -203,6 +215,12 @@ fn try_plan_contraction(
         caps,
     )
     .map_err(|missing| site.refuse(missing))?;
+    // An indexed table's source is bounded by `max_stack_experts` (the stack's bit offsets), a plain one by
+    // its own size.
+    if matches!(rows, ContractionRows::Blocks(_)) {
+        crate::packed_block_float::check_source_addressable(descriptor, backend)
+            .map_err(|missing| site.refuse(missing))?;
+    }
     let k = descriptor.shape()[1];
     let out = descriptor.shape()[0];
     let (schedule, launches) = match rows {
@@ -211,7 +229,7 @@ fn try_plan_contraction(
             let m_per_block = packed_contraction_m_per_block(g, eqn, descriptor, blocks);
             let rows = blocks * m_per_block;
             if m_per_block == 1 {
-                let schedule = gemv_schedule(rows * out_per_block, caps.compute_units);
+                let schedule = gemv_schedule(site, backend, rows * out_per_block, k, format, caps)?;
                 let grid = [
                     schedule.grid_threads(blocks, m_per_block, out_per_block) as u32,
                     1,
@@ -223,37 +241,27 @@ fn try_plan_contraction(
                 };
                 (schedule, vec![launch])
             } else {
-                let tiling = RegisterTiling::choose(m_per_block, k, caps);
-                let (tile_rows, tile_cols) = tiling.output_tile();
-                let tiles = blocks
-                    .checked_mul(m_per_block.div_ceil(tile_rows))
-                    .and_then(|v| v.checked_mul(out_per_block.div_ceil(tile_cols)))
-                    .ok_or_else(|| site.refuse(Capability::DispatchSizeOverflow))?;
-                let per_dispatch = tiles_per_dispatch(tiles, tile_rows * tile_cols, k, caps);
-                let launches = (0..tiles)
-                    .step_by(per_dispatch)
-                    .map(|offset| {
-                        let count = (tiles - offset).min(per_dispatch);
-                        let FoldedTileGrid { x_groups, grid } =
-                            folded_tile_grid(site, count, tiling.lanes(), caps)?;
-                        let overflow = || site.refuse(Capability::DispatchSizeOverflow);
-                        let offset = u32::try_from(offset).map_err(|_| overflow())?;
-                        let meta = vec![
-                            k as u32,
-                            out_per_block as u32,
-                            m_per_block as u32,
-                            x_groups,
-                            offset,
-                        ];
-                        Ok(PackedLaunch { grid, meta })
-                    })
-                    .collect::<Result<Vec<_>, PlanError>>()?;
+                let (tiling, dispatches) = matmul::register_tiled_launch(
+                    site,
+                    TiledShape {
+                        blocks,
+                        m_per_block,
+                        out_per_block,
+                        k,
+                        layout: WeightLayout::Nk,
+                        segments: 1,
+                    },
+                    caps,
+                )?;
+                let launches = dispatches
+                    .into_iter()
+                    .map(|TiledDispatch { grid, meta }| PackedLaunch { grid, meta })
+                    .collect();
                 (tiling.schedule(), launches)
             }
         }
         ContractionRows::Indexed { experts } => {
-            let (schedule, meta, grid) = plan_indexed(site, g, eqn, descriptor, experts, caps)?;
-            (schedule, vec![PackedLaunch { grid, meta }])
+            plan_indexed(site, g, eqn, descriptor, experts, backend, caps)?
         }
     };
     let epilogue = match epilogue {
@@ -284,12 +292,45 @@ fn try_plan_contraction(
             meta,
         }))
     };
+    // The longest binding a dispatch makes: each weight source at its uploaded word count (the guard word
+    // included), every other value operand (the activation, an epilogue leaf) at its element count, the output
+    // and the metadata. The operands are the activation, one carrier per source, then the leaves; a carrier binds
+    // its source's words, so its graph shape is not its length.
+    let carriers = 1..=descriptor.sources().len();
+    let operand_elems: Vec<u64> = value_ids(eqn)
+        .into_iter()
+        .enumerate()
+        .filter(|(position, _)| !carriers.contains(position))
+        .map(|(_, id)| g.aval(id).shape.iter().map(|&d| d as u64).product())
+        .collect();
+    let longest = |meta: &[u32]| -> u64 {
+        descriptor
+            .sources()
+            .into_iter()
+            .map(|role| descriptor.slab_words(role) as u64 + 1)
+            .chain(operand_elems.iter().copied())
+            .chain([out_numel as u64, meta.len() as u64])
+            .max()
+            .unwrap_or(0)
+    };
     let mut planned = match <[PackedLaunch; 1]>::try_from(launches) {
-        Ok([launch]) => Planned::generated(site, request(launch), backend, caps)?,
+        Ok([launch]) => {
+            let longest = longest(&launch.meta);
+            Planned::generated_bounded(site, request(launch), backend, caps, longest)?
+        }
         Err(launches) => Planned::split(
             launches
                 .into_iter()
-                .map(|launch| Planned::generated_dispatch(site, request(launch), backend, caps))
+                .map(|launch| {
+                    let longest = longest(&launch.meta);
+                    Planned::generated_dispatch_bounded(
+                        site,
+                        request(launch),
+                        backend,
+                        caps,
+                        longest,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         )?,
     };
@@ -312,27 +353,6 @@ struct PackedLaunch {
     meta: Vec<u32>,
 }
 
-/// How many tiles of a block-diagonal packed tiled contraction one dispatch covers: all of them on a device
-/// with no watchdog budget, else as many as keep a dispatch within `packed_tiled_work` multiply-accumulates
-/// (one tile is `tile_outputs * k` of them, `tile_outputs` the outputs one workgroup computes), and at least one; a chunk that folds is whole rows of the X grid.
-fn tiles_per_dispatch(tiles: usize, tile_outputs: usize, k: usize, caps: &DeviceCaps) -> usize {
-    let Some(budget) = caps.watchdog_budget else {
-        return tiles;
-    };
-    let per_tile = (tile_outputs * k).max(1) as u64;
-    let within_budget = usize::try_from(budget.packed_tiled_work / per_tile)
-        .unwrap_or(usize::MAX)
-        .clamp(1, tiles.max(1));
-    // A chunk that folds onto several grid rows is a whole number of them: the folded grid launches full rows,
-    // and a partial one would launch (and redo) the next chunk's first tiles.
-    let row = caps.max_grid[0].max(1) as usize;
-    if within_budget < tiles && within_budget > row {
-        within_budget - within_budget % row
-    } else {
-        within_budget
-    }
-}
-
 /// The `Schedule::Gemv` launch policy for a packed contraction with `outputs` output columns (card
 /// 653): the widest candidate `cols` that still launches at least two
 /// workgroups per compute unit (S60-3), else the narrowest - over this arm's own measured table.
@@ -343,38 +363,76 @@ fn tiles_per_dispatch(tiles: usize, tile_outputs: usize, k: usize, caps: &Device
 /// GGUF projection shapes (card 653's receipt): {16, 8} with 8-element runs was 3.7 ms of Gemv
 /// device time per Q4_K_M token against 4.2 ms for the dense table and 9.7 ms for the pre-card
 /// one-column-per-workgroup body.
-fn gemv_schedule(outputs: usize, compute_units: u32) -> Schedule {
-    let min_workgroups = 2 * compute_units as usize;
+///
+/// A lane's run (`unroll`, the contiguous K elements it decodes per trip) is [`gemv_run`], from what the
+/// format's decode shares across a run and the class's calibrated cap (POOT-1398); the activation read over rows
+/// of `k` values is [`gemv_activation`]'s (POOT-1405).
+fn gemv_schedule(
+    site: Site<'_>,
+    backend: Backend,
+    outputs: usize,
+    k: usize,
+    format: WeightFormat,
+    caps: &DeviceCaps,
+) -> Result<Schedule, PlanError> {
+    let min_workgroups = 2 * caps.compute_units as usize;
     let cols = [16, 8]
         .into_iter()
         .find(|&cols| outputs.div_ceil(cols) >= min_workgroups)
         .unwrap_or(8);
-    Schedule::Gemv {
+    let sharing = poot_kernelgen::packed_run_sharing(format)
+        .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
+    let unroll = gemv_run(sharing, caps.gemm_launch().packed_gemv_max_run);
+    Ok(Schedule::Gemv {
         width: 256,
         cols: cols as u32,
-        unroll: 8,
+        unroll,
+        activation: gemv_activation(backend, k, unroll),
+    })
+}
+
+/// The packed decode Gemv's lane run (POOT-1398, B1 of designs/quant-matmul-1390.md), at most `max_run`, the
+/// class's register and issue budget ([`poot_target::calibration::GemmLaunch::packed_gemv_max_run`]).
+///
+/// A decode that shares a run's block address, factors and code windows up to the factor run
+/// ([`PackedRunSharing::FactorRun`]) runs the longest divisor of the factor run within `max_run`: a longer run
+/// amortises the shared decode over more weights (gfx1151 at 17408 x 5120: Q4_K 101-110 -> 171-195 GB/s from run 8 to
+/// its factor run 32), and a run that does not divide the factor run decodes every element's factors, a cliff
+/// this never plans (Q6_K at run 32: 60 GB/s against 190 at its factor run 16).
+///
+/// A decode that addresses each element on its own ([`PackedRunSharing::Elementwise`]) gains nothing from a
+/// longer run, which only spreads a lane's loads (GPTQ group 128 on gfx1151: 110-129 GB/s at run 8, 59 at 32;
+/// GPTQ act-order 29-32 at run 8, 17 at run 1), so it runs the portable run within `max_run`.
+fn gemv_run(sharing: PackedRunSharing, max_run: u32) -> u32 {
+    let max_run = max_run.max(1);
+    match sharing {
+        PackedRunSharing::FactorRun { factor_run } => (1..=max_run)
+            .rev()
+            .find(|&run| factor_run.is_multiple_of(run as usize))
+            .unwrap_or(1),
+        PackedRunSharing::Elementwise => max_run.min(PORTABLE_PACKED_GEMV_RUN),
     }
 }
 
 /// The launch of an indexed packed contraction, chosen from shapes and the device alone, as the dense indexed
 /// contraction's is ([`indexed_gemv_in`]): the packed Gemv over `M * N` flat output columns at decode row counts
-/// (flat column `m * N + n` reads weight row `n` of expert `ids[m]`), else the segmented Tiled schedule, whose
-/// tiles share each expert's decoded weight tile across the rows that selected it and whose grid is folded onto
-/// `GroupY` above the device's X extent and refused with a typed error beyond that too. Metadata: `[K, N, E, M,
-/// x_groups]`, then each source's per-expert slab stride in words ([`poot_quant::PackedWeight::slab_words`]).
+/// (flat column `m * N + n` reads weight row `n` of expert `ids[m]`), else the register-tiled schedule inside an
+/// expert walk ([`matmul::register_tiled_launch`] over one block of `M` rows in `experts` segments), whose tiles
+/// share each expert's decoded weight tile across the rows that selected it and whose dispatches split and fold
+/// as every register-tiled contraction's do. Metadata: `[K, N, M, x_groups, tile_offset, E]`, then each source's
+/// per-expert slab stride in words ([`poot_quant::PackedWeight::slab_words`]).
 ///
 /// The decode/prefill threshold ([`INDEXED_GEMV_MAX_ROWS`]) is shared with the dense indexed contraction and is
-/// UNTUNED for packed weights. Measured on wgpu (gfx1151, `[rows, 2048, 256]`, a noisy box, ms per step, Tiled vs
-/// Gemv): Q8_0 0.74 vs 1.31 at 64 rows, 3.07 vs 3.92 at 1024; Q4_K 0.92 vs 0.96 at 64, 5.73 vs 4.35 at 1024 (Tiled
-/// slower). ROCm and PTX are unmeasured.
+/// UNTUNED for packed weights.
 fn plan_indexed(
     site: Site<'_>,
     g: GraphTables<'_>,
     eqn: &Eqn,
     descriptor: poot_quant::PackedWeight,
     experts: usize,
+    backend: Backend,
     caps: &DeviceCaps,
-) -> Result<(Schedule, Vec<u32>, [u32; 3]), PlanError> {
+) -> Result<(Schedule, Vec<PackedLaunch>), PlanError> {
     let ids = value_ids(eqn);
     if g.aval(ids[1]).dtype != DType::I32 {
         return Err(site.refuse(Capability::IndexOperand));
@@ -382,70 +440,95 @@ fn plan_indexed(
     let [out, k] = descriptor.shape();
     let m = g.aval(ids[0]).shape[0];
     let overflow = || site.refuse(Capability::DispatchSizeOverflow);
-    // The kernel addresses a source by 32-bit bit offsets (`expert * slab_words * 32` plus the in-slab bit): a
-    // source of more than 2^32 bits (512 MiB) cannot be addressed, so it is refused, never wrapped. `legalize`
-    // splits a larger stack into expert ranges that each pass this; what reaches here over the bound is a single
-    // expert's slab beyond it.
-    if experts > descriptor.max_stack_experts() {
+    // The kernel addresses a source by bit offsets in the backend's index type (`expert * slab_words * 32` plus
+    // the in-slab bit): a source past `max_bit_offset` (2^32 bits, 512 MiB, on a 32-bit backend) cannot be
+    // addressed, so it is refused, never wrapped. `legalize` splits a larger stack into expert ranges that each
+    // pass this; what reaches here over the bound is a single expert's slab beyond it.
+    if experts > descriptor.max_stack_experts(backend.max_bit_offset()) {
         return Err(overflow());
     }
-    let (schedule, x_groups, grid) = match packed_indexed_gemv(m, out, caps) {
+    let word = |extent: usize| u32::try_from(extent).map_err(|_| overflow());
+    let mut tail = vec![word(experts)?];
+    for role in descriptor.sources() {
+        tail.push(word(descriptor.slab_words(role))?);
+    }
+    match packed_indexed_gemv(site, backend, m, out, k, descriptor.format(), caps)? {
         Some(schedule) => {
-            let threads =
-                u32::try_from(schedule.grid_threads(1, m, out)).map_err(|_| overflow())?;
-            (schedule, 0, [threads, 1, 1])
+            let threads = word(schedule.grid_threads(1, m, out))?;
+            let mut meta = vec![word(k)?, word(out)?, word(m)?, 0, 0];
+            meta.extend(&tail);
+            Ok((
+                schedule,
+                vec![PackedLaunch {
+                    grid: [threads, 1, 1],
+                    meta,
+                }],
+            ))
         }
         None => {
-            let tile = poot_kernelgen::TileSize::new(caps.gemm_launch().tile_edge)
-                .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
-            let ts = tile.get() as usize;
-            let tiles = m
-                .div_ceil(ts)
-                .checked_mul(out.div_ceil(ts))
-                .ok_or_else(overflow)?;
-            let FoldedTileGrid { x_groups, grid } = folded_tile_grid(site, tiles, ts, caps)?;
-            (Schedule::Tiled { tile }, x_groups, grid)
-        }
-    };
-    let meta = [k, out, experts, m]
-        .into_iter()
-        .map(|extent| u32::try_from(extent).map_err(|_| overflow()))
-        .chain([Ok(x_groups)])
-        .chain(
-            descriptor
-                .sources()
+            let (tiling, dispatches) = matmul::register_tiled_launch(
+                site,
+                TiledShape {
+                    blocks: 1,
+                    m_per_block: m,
+                    out_per_block: out,
+                    k,
+                    layout: WeightLayout::Nk,
+                    segments: experts,
+                },
+                caps,
+            )?;
+            let launches = dispatches
                 .into_iter()
-                .map(|role| u32::try_from(descriptor.slab_words(role)).map_err(|_| overflow())),
-        )
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((schedule, meta, grid))
+                .map(|TiledDispatch { grid, mut meta }| {
+                    meta.extend(&tail);
+                    PackedLaunch { grid, meta }
+                })
+                .collect();
+            Ok((tiling.schedule(), launches))
+        }
+    }
 }
 
 /// The packed Gemv of an indexed contraction of `m` rows and `n` columns, or `None` when it is not a decode shape
 /// ([`INDEXED_GEMV_MAX_ROWS`]) or its launch would not fit the device's X grid even at one lane per column:
 /// [`gemv_schedule`]'s table, widening `cols` (columns per workgroup) until the workgroup count fits.
-fn packed_indexed_gemv(m: usize, n: usize, caps: &DeviceCaps) -> Option<Schedule> {
+fn packed_indexed_gemv(
+    site: Site<'_>,
+    backend: Backend,
+    m: usize,
+    n: usize,
+    k: usize,
+    format: WeightFormat,
+    caps: &DeviceCaps,
+) -> Result<Option<Schedule>, PlanError> {
     if m == 0 || n == 0 || m > INDEXED_GEMV_MAX_ROWS {
-        return None;
+        return Ok(None);
     }
-    let outputs = m.checked_mul(n)?;
+    let Some(outputs) = m.checked_mul(n) else {
+        return Ok(None);
+    };
     let Schedule::Gemv {
         width,
         cols,
         unroll,
-    } = gemv_schedule(outputs, caps.compute_units)
+        activation,
+    } = gemv_schedule(site, backend, outputs, k, format, caps)?
     else {
         unreachable!("gemv_schedule returns a Gemv")
     };
     let limit = caps.max_grid[0].max(1) as usize;
-    std::iter::successors(Some(cols), |&cols| cols.checked_mul(2))
-        .take_while(|&cols| cols <= width)
-        .find(|&cols| outputs.div_ceil(cols as usize) <= limit)
-        .map(|cols| Schedule::Gemv {
-            width,
-            cols,
-            unroll,
-        })
+    Ok(
+        std::iter::successors(Some(cols), |&cols| cols.checked_mul(2))
+            .take_while(|&cols| cols <= width)
+            .find(|&cols| outputs.div_ceil(cols as usize) <= limit)
+            .map(|cols| Schedule::Gemv {
+                width,
+                cols,
+                unroll,
+                activation,
+            }),
+    )
 }
 
 #[cfg(test)]
@@ -453,7 +536,8 @@ mod tests {
     use crate::types::Launch;
     use poot_graph_ir::{Builder, OpKind, Slot, TensorType};
     use poot_kernelgen::{
-        ContractionSpec, KernelRequest, PackedContraction, RegisterTiling, Schedule,
+        ContractionSpec, KernelRequest, PackedContraction, PackedRunSharing, RegisterTiling,
+        Schedule, TiledShape, WeightLayout,
     };
     use poot_quant::PackedWeight;
     use poot_quant::format::WeightFormat;
@@ -466,7 +550,7 @@ mod tests {
     /// SC-003 (card 653): a decode (`M == 1`) packed contraction compiled for a device with a
     /// fixture `DeviceCaps::compute_units` plans the Gemv launch of `gemv_schedule`'s table - 16
     /// columns per workgroup while that still launches `2 x compute_units` workgroups, else 8,
-    /// 256 lanes, 8-element runs - in the plan key, the grid and the body's workgroup. `N = 1280`
+    /// 256 lanes, 32-element runs (POOT-1398: Q8_0's factor run) - in the plan key, the grid and the body's workgroup. `N = 1280`
     /// and `1264` straddle the 80-workgroup floor at 40 compute units; the same `N = 896` flips
     /// with the compute units alone. Driven through `compile`. Mutation: pin
     /// `cols` to 16 in `gemv_schedule`; every row whose entry is 8 goes red.
@@ -511,10 +595,12 @@ mod tests {
                 panic!("{what}: expected a single dispatch, got {plan:?}");
             };
             let grid = launch.grid;
+            // Q8_0's factor run is its 32-value block, the Vulkan class's cap.
             let schedule = Schedule::Gemv {
                 width: 256,
                 cols,
-                unroll: 8,
+                unroll: 32,
+                activation: poot_kernelgen::GemvActivation::Scalar,
             };
             let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(
                 PackedContraction {
@@ -538,6 +624,187 @@ mod tests {
                 "{what}"
             );
             assert_eq!(body.workgroup_size, [256, 1, 1], "{what}");
+        }
+    }
+
+    /// Every packed format the Gemv admits, with the planar formats' parameters spelled out.
+    fn packed_gemv_formats() -> Vec<WeightFormat> {
+        use poot_quant::format::{GroupMap, ScaleEncoding};
+        use std::num::NonZeroUsize;
+        let size = |n: usize| NonZeroUsize::new(n).unwrap();
+        vec![
+            WeightFormat::Q4_0,
+            WeightFormat::Q4_1,
+            WeightFormat::Q5_0,
+            WeightFormat::Q5_1,
+            WeightFormat::Q8_0,
+            WeightFormat::Q2_K,
+            WeightFormat::Q3_K,
+            WeightFormat::Q4_K,
+            WeightFormat::Q5_K,
+            WeightFormat::Q6_K,
+            WeightFormat::Iq4_Nl,
+            WeightFormat::Iq4_Xs,
+            WeightFormat::Iq2_Xs,
+            WeightFormat::Iq3_Xxs,
+            WeightFormat::Iq3_S,
+            WeightFormat::Mxfp4,
+            WeightFormat::E4m3PerChannel {
+                scale: ScaleEncoding::Bf16,
+            },
+            WeightFormat::E4m3Block128 {
+                scale: ScaleEncoding::F32,
+            },
+            WeightFormat::E2m1Row32,
+            WeightFormat::Gptq {
+                groups: GroupMap::Contiguous { size: size(128) },
+            },
+            WeightFormat::Gptq {
+                groups: GroupMap::Indexed { groups: size(4) },
+            },
+            WeightFormat::Awq {
+                group_size: size(64),
+            },
+        ]
+    }
+
+    /// The `unroll` (a lane's contiguous run of K elements per trip) of the decode Gemv `compile` plans for a
+    /// `[n, 512]` packed linear of `format` on `target`.
+    fn planned_gemv_run(format: WeightFormat, target: &Target) -> u32 {
+        let (n, k) = (4096, 512);
+        let builder = Builder::for_tests();
+        let x = builder
+            .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, k]))
+            .unwrap();
+        let weight = PackedWeight::try_new(format, [n, k]).unwrap();
+        let out = poot_graph_ir::test_support::packed_graphs::packed_linear(
+            &builder, x, "layer", weight, None, None,
+        )
+        .unwrap();
+        let options = CompileOptions::new(crate::CompileLimits::STANDARD);
+        let program = compile(&builder.finish(out).unwrap(), target, &options)
+            .unwrap_or_else(|error| panic!("{format:?}: {error}"));
+        let (eqn, _) = program
+            .planned()
+            .find(|(eqn, _)| matches!(eqn.op, OpKind::PackedContraction { .. }))
+            .unwrap_or_else(|| panic!("{format:?}: no PackedContraction planned"));
+        let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(
+            PackedContraction {
+                schedule: Schedule::Gemv { unroll, .. },
+                ..
+            },
+        ))) = program.kernel_choice(eqn)
+        else {
+            panic!("{format:?}: a decode packed contraction is a generated Gemv request");
+        };
+        *unroll
+    }
+
+    /// POOT-1398 (B1 of designs/quant-matmul-1390.md), GPU-free: the decode Gemv's lane run is the format's
+    /// factor run (the aligned elements that share one decoded scale/min), capped by the device class's
+    /// calibrated `packed_gemv_max_run`. For every block-storage format (whose decode shares a run's block
+    /// address, factors and code windows) and every launch class the planned run divides the factor run, never
+    /// exceeds it or the cap, and is the largest such run, so a run never straddles a factor boundary (the 1390
+    /// cliff: Q6_K at run 32 decodes every element's factors, 60 GB/s against 190 at 16). A planar format,
+    /// whose decode addresses each element on its own, runs the portable run within the cap. The measured rows
+    /// are pinned as literals on the HSA class (cap 32): 32 for the formats whose sub-block is 32 values (Q4_K,
+    /// Q5_K, IQ4_XS, Q4_0, Q8_0), 16 for the 16-value ones (Q6_K, Q2_K, Q3_K), 8 for GPTQ and FP8; the
+    /// CUDA class caps it at its measured 16 (POOT-1405). Driven through `compile`. Mutation: plan run 32 for Q6_K in
+    /// `gemv_schedule`; the divisibility and the pinned Q6_K row go red.
+    #[test]
+    fn the_packed_decode_gemv_run_is_the_factor_run_capped_by_the_launch_class() {
+        let targets = [
+            (
+                "hsa",
+                Target::Gpu {
+                    backend: Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
+                    caps: DeviceCaps::rocm_default(),
+                },
+            ),
+            (
+                "vulkan",
+                Target::Gpu {
+                    backend: Backend::SpirvVulkan,
+                    caps: DeviceCaps {
+                        memory_budget_bytes: None,
+                        ..DeviceCaps::wgpu_rdna3_igpu()
+                    },
+                },
+            ),
+            (
+                "cuda",
+                Target::Gpu {
+                    backend: Backend::Nvptx,
+                    caps: DeviceCaps::ptx_default(),
+                },
+            ),
+        ];
+        use poot_quant::format::{GroupMap, ScaleEncoding};
+        let size = |n: usize| std::num::NonZeroUsize::new(n).unwrap();
+        let mut planned = std::collections::HashMap::new();
+        for (class, target) in &targets {
+            let Target::Gpu { caps, .. } = target else {
+                unreachable!("every target is a GPU");
+            };
+            let cap = caps.gemm_launch().packed_gemv_max_run as usize;
+            for format in packed_gemv_formats() {
+                let what = format!("{class} {format:?}");
+                let run = planned_gemv_run(format, target) as usize;
+                let sharing = poot_kernelgen::packed_run_sharing(format)
+                    .unwrap_or_else(|error| panic!("{what}: {error}"));
+                assert!(run <= cap, "{what}: run {run} exceeds the class cap {cap}");
+                match sharing {
+                    PackedRunSharing::FactorRun { factor_run } => {
+                        assert!(
+                            factor_run.is_multiple_of(run),
+                            "{what}: run {run} does not divide the factor run {factor_run}"
+                        );
+                        let longer = (run + 1..=cap.min(factor_run))
+                            .find(|&longer| factor_run.is_multiple_of(longer));
+                        assert_eq!(
+                            longer, None,
+                            "{what}: run {run} is shorter than the factor run {factor_run} allows"
+                        );
+                    }
+                    PackedRunSharing::Elementwise => assert_eq!(
+                        run,
+                        cap.min(8),
+                        "{what}: an elementwise decode runs the portable run"
+                    ),
+                }
+                planned.insert((*class, format), run);
+            }
+        }
+        for (format, run) in [
+            (WeightFormat::Q4_K, 32),
+            (WeightFormat::Q5_K, 32),
+            (WeightFormat::Iq4_Xs, 32),
+            (WeightFormat::Q4_0, 32),
+            (WeightFormat::Q8_0, 32),
+            (WeightFormat::Q6_K, 16),
+            (WeightFormat::Q2_K, 16),
+            (WeightFormat::Q3_K, 16),
+            (
+                WeightFormat::E4m3PerChannel {
+                    scale: ScaleEncoding::Bf16,
+                },
+                8,
+            ),
+            (
+                WeightFormat::Gptq {
+                    groups: GroupMap::Contiguous { size: size(128) },
+                },
+                8,
+            ),
+            (
+                WeightFormat::Gptq {
+                    groups: GroupMap::Indexed { groups: size(4) },
+                },
+                8,
+            ),
+        ] {
+            assert_eq!(planned[&("hsa", format)], run, "hsa {format:?}");
+            assert_eq!(planned[&("cuda", format)], run.min(16), "cuda {format:?}");
         }
     }
 
@@ -582,8 +849,18 @@ mod tests {
             panic!("expected a single dispatch, got {plan:?}");
         };
         let grid = launch.grid;
-        let schedule =
-            RegisterTiling::choose(m_per_block, k, &DeviceCaps::wgpu_rdna3_igpu()).schedule();
+        let schedule = RegisterTiling::choose(
+            TiledShape {
+                blocks,
+                m_per_block,
+                out_per_block,
+                k,
+                layout: WeightLayout::Nk,
+                segments: 1,
+            },
+            &DeviceCaps::wgpu_rdna3_igpu(),
+        )
+        .schedule();
         let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(
             PackedContraction {
                 format,
@@ -608,11 +885,12 @@ mod tests {
 
     /// POOT-1193, GPU-free: the FP8 prefill linear of Qwen3.8-27B on gfx1151 (`[128, 5120] x [17408, 5120]^T`,
     /// block-scaled E4M3 with bf16 scales) plans the register-tiled GEMM and not the one-output-per-lane tile
-    /// that ran it at ~12 tok/s: a 16x16 lane grid (a 256-lane workgroup) whose lanes each own an 8x4 register
-    /// tile, so the 128 rows are one row-tile of [`Schedule::output_tile`] and the 17408 columns 272 column-tiles, and
-    /// `K = 5120` stages as four-value runs.
-    /// Driven through `compile` with the real ROCm capabilities. Mutation: plan the 8x8 output tile again
-    /// (the old `Schedule::Tiled` edge) - the schedule, the 272-tile grid and this row go red.
+    /// that ran it at ~12 tok/s. POOT-1403's occupancy model sizes it: a 16x16 lane grid whose lanes each own an
+    /// 8x8 register tile, so the 128 rows are one row-tile of [`Schedule::output_tile`] and the 17408 columns
+    /// 136 column-tiles (enough to fill the device three times over, so the tile that stages least per FMA
+    /// wins), and `K = 5120` stages as four-value runs.
+    /// Driven through `compile` with the real ROCm capabilities. Mutation: drop the launch-lanes factor from
+    /// `RegisterTiling::cost` (cost the lane step alone); the smallest tile wins and this row goes red.
     #[test]
     fn a_fp8_prefill_linear_plans_the_register_tiled_gemm_on_gfx1151() {
         let (m, k, n) = (128usize, 5120usize, 17408usize);
@@ -627,16 +905,23 @@ mod tests {
             workgroup,
         } = plan_fp8_prefill_linear(&target, m, k, n);
         assert_eq!(workgroup, [256, 1, 1]);
-        let Schedule::RegisterTiled { lanes, rows, run } = schedule else {
+        let Schedule::RegisterTiled {
+            lanes,
+            rows,
+            cols,
+            run,
+        } = schedule
+        else {
             panic!("a prefill linear is the register-tiled GEMM, got {schedule:?}");
         };
         assert_eq!(
-            (lanes.get(), rows.get(), run.get()),
-            (16, 8, 4),
-            "128 rows fill the 16x16 lane grid's 128-row tile; K = 5120 stages as word-sized runs of byte codes"
+            (lanes.get(), rows.get(), cols.get(), run.get()),
+            (16, 8, 8, 4),
+            "128 rows by 17408 columns fill the device three times over at 128 x 128 tiles, the tile that stages \
+             least per FMA; K = 5120 stages as word-sized runs of byte codes"
         );
-        assert_eq!(schedule.output_tile(), Some((128, 64)));
-        assert_eq!(tiles, 272, "one row-tile of 128 by 272 column-tiles of 64");
+        assert_eq!(schedule.output_tile(), Some((128, 128)));
+        assert_eq!(tiles, 136, "one row-tile of 128 by 136 column-tiles of 128");
         let [(grid, meta)] = &launches[..] else {
             panic!("expected a single dispatch, got {launches:?}");
         };
@@ -645,10 +930,10 @@ mod tests {
     }
 
     /// POOT-1264 (GPU-free): the same FP8 prefill linear on the wgpu device (Vulkan, RDNA3 iGPU caps) plans the
-    /// same register-tiled 16x16-lane GEMM as ROCm, not the one-output-per-lane tile that ran it at 3.9 tok/s,
-    /// and, under wgpu's watchdog budget, as contiguous tile ranges that together cover all 272 tiles. Driven
-    /// through `compile`. Mutation: make `RegisterTiling::choose` always pick the 8x8 grid; the lane grid, tile
-    /// and tile count go red.
+    /// same register-tiled GEMM as ROCm, not the one-output-per-lane tile that ran it at 3.9 tok/s, and, under
+    /// wgpu's watchdog budget, as contiguous tile ranges that together cover all 136 tiles. Driven through
+    /// `compile`. Mutation: make `RegisterTiling::choose` always pick the narrow grid's smallest tile; the
+    /// register tile, output tile and tile count go red.
     #[test]
     fn a_fp8_prefill_linear_plans_the_register_tiled_gemm_on_wgpu() {
         let (m, k, n) = (128usize, 5120usize, 17408usize);
@@ -663,12 +948,21 @@ mod tests {
             workgroup,
         } = plan_fp8_prefill_linear(&target, m, k, n);
         assert_eq!(workgroup, [256, 1, 1]);
-        let Schedule::RegisterTiled { lanes, rows, run } = schedule else {
+        let Schedule::RegisterTiled {
+            lanes,
+            rows,
+            cols,
+            run,
+        } = schedule
+        else {
             panic!("a wgpu prefill linear is the register-tiled GEMM, got {schedule:?}");
         };
-        assert_eq!((lanes.get(), rows.get(), run.get()), (16, 8, 4));
-        assert_eq!(schedule.output_tile(), Some((128, 64)));
-        assert_eq!(tiles, 272);
+        assert_eq!(
+            (lanes.get(), rows.get(), cols.get(), run.get()),
+            (16, 8, 8, 4)
+        );
+        assert_eq!(schedule.output_tile(), Some((128, 128)));
+        assert_eq!(tiles, 136);
         let mut next = 0usize;
         for (grid, meta) in &launches {
             let [kk, nn, mm, x_groups, offset] = meta[..] else {
@@ -748,7 +1042,15 @@ mod tests {
     fn a_packed_tiled_contraction_over_the_watchdog_budget_splits_into_tile_ranges() {
         let (m, n, k) = (2048usize, 16_384usize, 512usize);
         let caps = DeviceCaps::wgpu_rdna3_igpu();
-        let (tile_rows, tile_cols) = RegisterTiling::choose(m, k, &caps).output_tile();
+        let shape = TiledShape {
+            blocks: 1,
+            m_per_block: m,
+            out_per_block: n,
+            k,
+            layout: WeightLayout::Nk,
+            segments: 1,
+        };
+        let (tile_rows, tile_cols) = RegisterTiling::choose(shape, &caps).output_tile();
         let tiles = m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
         let format = WeightFormat::E4m3Block128 {
             scale: poot_quant::format::ScaleEncoding::Bf16,
@@ -860,18 +1162,36 @@ mod tests {
         }
     }
 
-    /// SC-001 (card 658 review F1/F2, GPU-free): `tiles = ceil(640/128) * ceil(8/64) = 5` exceeds a fixture
-    /// `max_grid[0] = 4`, so `try_plan_contraction` folds onto `(x_groups, y_groups) = (4, 2)` rather
+    /// SC-001 (card 658 review F1/F2, GPU-free): a contraction of `80 x 8` outputs takes the register tiling's
+    /// smallest tile (16 x 32, a 64-lane grid), so `tiles = ceil(80/16) * ceil(8/32) = 5` exceeds a fixture
+    /// `max_grid[0] = 4`, and `try_plan_contraction` folds onto `(x_groups, y_groups) = (4, 2)` rather
     /// than refusing or truncating - `y_groups <= max_grid[1] = 4`, so the fold fits. The plan's `grid`
     /// carries the folded dims and `body.workgroup_size` stays the tiled body's baked `[64, 1, 1]`:
-    /// `finalize`'s generic wg-bump never corrupts the 64-lane LDS tile for this arm
-    /// (`kernel_mapping::shape_launch` exempts every packed contraction request by type).
+    /// `finalize`'s generic wg-bump never corrupts the LDS tile for this arm
+    /// (`kernel_mapping::shape_launch` exempts every contraction request by type).
     ///
-    /// Mutation: in `try_plan_contraction`, drop the `tiles_u32 <= limit_x` fold and always use
+    /// Mutation: in `folded_tile_grid`, drop the `tiles_u32 <= limit_x` fold and always use
     /// `(tiles_u32, 1)` - `grid` goes from `[256, 2, 1]` to `[320, 1, 1]` and this test goes red.
     #[test]
     fn over_cap_tiled_contraction_folds_onto_a_2d_grid_not_the_wg_bump() {
-        let (graph, index) = over_cap_tiled_eqn(1, 640, 8);
+        let (m, out) = (80usize, 8usize);
+        let tiling = RegisterTiling::choose(
+            TiledShape {
+                blocks: 1,
+                m_per_block: m,
+                out_per_block: out,
+                k: 32,
+                layout: WeightLayout::Nk,
+                segments: 1,
+            },
+            &tiny_grid_caps(),
+        );
+        assert_eq!(
+            (tiling.lanes(), tiling.output_tile()),
+            (8, (16, 32)),
+            "the fixture's tile"
+        );
+        let (graph, index) = over_cap_tiled_eqn(1, m, out);
         let eqn = &graph.eqns()[index];
         let plan = crate::plan_eqn(
             &graph,
@@ -890,11 +1210,11 @@ mod tests {
             panic!("expected a single dispatch, got {plan:?}");
         };
         let grid = *grid;
-        assert_eq!(grid, [4 * 256, 2, 1], "folded grid: x_groups=4, y_groups=2");
+        assert_eq!(grid, [4 * 64, 2, 1], "folded grid: x_groups=4, y_groups=2");
         assert_eq!(
             body.workgroup_size,
-            [256, 1, 1],
-            "the wg-bump must not touch this arm's baked 256-lane workgroup"
+            [64, 1, 1],
+            "the wg-bump must not touch this arm's baked 64-lane workgroup"
         );
         assert_eq!(
             meta.get(3),
@@ -1057,7 +1377,7 @@ mod tests {
     }
 
     /// A decode-sized indexed packed contraction (`M <= INDEXED_GEMV_MAX_ROWS`) is the Gemv. Its metadata is `[K,
-    /// N, E, M, x_groups, slab_words..]` (the planner's stride is the descriptor's word-padded slab), and a row
+    /// N, M, x_groups, tile_offset, E, slab_words..]` (the planner's stride is the descriptor's word-padded slab), and a row
     /// count whose workgroups exceed the device's X extent widens `cols` (columns per workgroup) until the grid
     /// fits, rather than folding or refusing. Mutation: leave `cols` at the occupancy choice (`find(|_| true)`);
     /// the grid exceeds the fixture limit of 4 and this row goes red.
@@ -1076,8 +1396,8 @@ mod tests {
         let slab = descriptor.slab_words(poot_quant::SourceRole::Blocks) as u32;
         assert_eq!(
             meta.as_slice(),
-            [64, 8, 4, 5, 0, slab],
-            "[K, N, E, M, x_groups, slab_words]"
+            [64, 8, 5, 0, 0, 4, slab],
+            "[K, N, M, x_groups, tile_offset, E, slab_words]"
         );
         let workgroups = grid[0] / 256;
         assert!(
@@ -1086,7 +1406,7 @@ mod tests {
         );
     }
 
-    /// Tiles past what the folded grid can address (here 32 tiles against a 4 x 4 fixture grid) are a typed
+    /// Tiles past what the folded grid can address (here 63 tiles of 16 rows against a 4 x 4 fixture grid) are a typed
     /// `DispatchGridLimit` refusal naming the equation, never a truncated launch; a source whose expert slabs
     /// exceed 32-bit bit offsets is a typed `DispatchSizeOverflow`, never wrapped offsets. Mutation: drop the
     /// bit-offset check in `plan_indexed`; the 570 MB table plans and this row goes red.
@@ -1106,7 +1426,7 @@ mod tests {
                 }
                 other => panic!("expected a refusal, got {other:?}"),
             };
-        let (graph, index) = indexed_eqn(250, 4, 8, 64);
+        let (graph, index) = indexed_eqn(1000, 4, 8, 64);
         assert!(matches!(
             refusal(&graph, index, &tiny_grid_caps()),
             Capability::DispatchGridLimit { .. }
@@ -1125,12 +1445,13 @@ mod tests {
     }
 
     /// SC-001 (card 658, GPU-free): the real `wgpu_rdna3_igpu` grid cap, not a
-    /// fixture - `blocks = 8, m_per_block = 65536, out_per_block = 1024` is `out_numel = 536,870,912 >
-    /// 4,194,240`, the exact `out_numel.div_ceil(64) > 65_535` threshold where `finalize`'s generic
+    /// fixture - `blocks = 8, m_per_block = 65536, out_per_block = 2048` is `out_numel = 1,073,741,824 >
+    /// 4,194,240`, past the `out_numel.div_ceil(64) > 65_535` threshold where `finalize`'s generic
     /// wg-bump would rewrite a one-thread-per-output body's workgroup from 64 to 256 - round 1's own
     /// reproduction showed a bumped Tiled body computes wrong values at this scale (`element 0: got
-    /// 120.47945 want 570.88153`). `tiles = 8 * ceil(65536/128) * ceil(1024/64) = 65,536` exceeds
-    /// `max_grid[0] = 65_535`, folding to `(x_groups, y_groups) = (65_535, 2)`. This is the one test
+    /// 120.47945 want 570.88153`). `tiles = 8 * ceil(65536/128) * ceil(2048/128) = 65,536` (the 128 x 128
+    /// tile the occupancy model gives so long a contraction) exceeds `max_grid[0] = 65_535`, folding to
+    /// `(x_groups, y_groups) = (65_535, 2)`. This is the one test
     /// that actually exercises `kernel_mapping::shape_launch`'s contraction exemption at the scale the
     /// hazard fires at - the fold-success/refusal rows above use a `max_grid: [4, 4, 4]` fixture four
     /// orders of magnitude below it, so disabling the exemption left them green.
@@ -1140,7 +1461,7 @@ mod tests {
     /// not `[64, 1, 1]` - the generic bump fired on the 256-lane-baked tiled body. Restored; green.
     #[test]
     fn over_cap_tiled_contraction_at_real_wgpu_caps_keeps_the_baked_workgroup() {
-        let (blocks, m_per_block, out_per_block) = (8usize, 65536usize, 1024usize);
+        let (blocks, m_per_block, out_per_block) = (8usize, 65536usize, 2048usize);
         let out_numel = blocks * m_per_block * out_per_block;
         assert!(
             out_numel > 4_194_240,
@@ -1152,10 +1473,11 @@ mod tests {
             &graph,
             eqn,
             Backend::SpirvVulkan,
-            // No watchdog budget: this row is the fold at real grid scale as one dispatch, not the budget split
-            // (`a_packed_tiled_contraction_over_the_watchdog_budget_splits_into_tile_ranges`).
+            // No watchdog budget and no tile ceiling: this row is the fold at real grid scale as one dispatch,
+            // not a split (`a_packed_tiled_contraction_over_the_watchdog_budget_splits_into_tile_ranges`).
             &DeviceCaps {
                 watchdog_budget: None,
+                known_miscompiles: poot_target::KnownMiscompiles::NONE,
                 ..DeviceCaps::wgpu_rdna3_igpu()
             },
             &crate::test_support::roomy_body_limits(),
@@ -1187,18 +1509,24 @@ mod tests {
         );
     }
 
-    /// An indexed packed contraction above the decode row count is the segmented Tiled schedule, and above the
+    /// An indexed packed contraction above the decode row count is the register-tiled expert walk, and above the
     /// device's X extent its grid folds onto `GroupY` (the wgpu Gemv-body route refused such a prefill as
-    /// `DispatchGridLimit` once it passed 16.7M outputs): `M = 4096` rows of an `N = 8192` Q8_0 table at the real
-    /// wgpu caps is 33.5M outputs and 524,288 tiles, folded to `(65_535, 9)`, the workgroup staying the baked
-    /// 64 lanes and the metadata carrying `M` and `x_groups`. Mutation: in `plan_indexed` drop the Tiled arm
-    /// (`packed_indexed_gemv` answering `Some` for every `m`); the plan is a Gemv whose grid is refused or
-    /// whose schedule is not `Tiled`, and this row goes red.
+    /// `DispatchGridLimit` once it passed 16.7M outputs): `M = 4096` rows of an `N = 8192` Q8_0 table is 33.5M
+    /// outputs and 2048 tiles of 128 x 128 (the 16x16 lane grid of 8x8 register tiles), folded onto a fixture X
+    /// extent of 1024 as `(1024, 2)`, the workgroup staying the baked 256 lanes and the metadata carrying
+    /// `M`, `x_groups` and `E`. The fixture drops the watchdog budget and the workgroup ceiling, so the fold is one
+    /// dispatch rather than a split. Mutation: in `plan_indexed` answer `packed_indexed_gemv` with `Some` for every
+    /// `m`; the plan is a Gemv whose grid is refused, and this row goes red.
     #[test]
     fn a_prefill_indexed_contraction_above_the_gemv_grid_plans_a_folded_tiled_schedule() {
         let (rows, out) = (4096usize, 8192usize);
         let (graph, index) = indexed_eqn(rows, 4, out, 64);
-        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let caps = DeviceCaps {
+            max_grid: [1024, 65_535, 65_535],
+            watchdog_budget: None,
+            known_miscompiles: poot_target::KnownMiscompiles::NONE,
+            ..DeviceCaps::wgpu_rdna3_igpu()
+        };
         assert!(
             rows * out > 65_535 * 256,
             "the fixture is past the Gemv-body route's {} outputs",
@@ -1213,22 +1541,22 @@ mod tests {
         else {
             panic!("expected a single dispatch, got {plan:?}");
         };
-        let tiles = rows.div_ceil(8) * out.div_ceil(8);
-        let y_groups = tiles.div_ceil(65_535) as u32;
-        assert_eq!(grid, &[65_535 * 64, y_groups, 1], "folded grid");
-        assert_eq!(body.workgroup_size, [64, 1, 1], "the baked tile workgroup");
+        let tiles = rows.div_ceil(128) * out.div_ceil(128);
+        assert_eq!(tiles, 2048);
+        assert_eq!(grid, &[1024 * 256, 2, 1], "folded grid");
+        assert_eq!(body.workgroup_size, [256, 1, 1], "the baked tile workgroup");
         let descriptor = PackedWeight::try_new(WeightFormat::Q8_0, [out, 64]).unwrap();
         let slab = descriptor.slab_words(poot_quant::SourceRole::Blocks) as u32;
         assert_eq!(
             meta.as_slice(),
-            [64, out as u32, 4, rows as u32, 65_535, slab],
-            "[K, N, E, M, x_groups, slab_words]"
+            [64, out as u32, rows as u32, 1024, 0, 4, slab],
+            "[K, N, M, x_groups, tile_offset, E, slab_words]"
         );
     }
 
     /// The decode/prefill split follows the row count: `INDEXED_GEMV_MAX_ROWS` rows is the Gemv and one row more is
-    /// the segmented Tiled schedule, unfolded while its tiles fit the X extent (`x_groups` is the tile count,
-    /// `ceil(33/8) * ceil(11/8) = 10`). Mutation: compare `m >= INDEXED_GEMV_MAX_ROWS` in `packed_indexed_gemv`;
+    /// the register-tiled expert walk, unfolded while its tiles fit the X extent (`x_groups` is the tile count,
+    /// `ceil(33/16) * ceil(11/32) = 3` of the smallest 16 x 32 tile). Mutation: compare `m >= INDEXED_GEMV_MAX_ROWS` in `packed_indexed_gemv`;
     /// the 32-row Gemv becomes Tiled and this row goes red.
     #[test]
     fn an_indexed_contraction_is_a_gemv_up_to_the_decode_row_count_and_tiled_above_it() {
@@ -1246,10 +1574,10 @@ mod tests {
             (grid.to_vec(), meta.clone())
         };
         let (gemv_grid, gemv_meta) = schedule_of(crate::predicates::INDEXED_GEMV_MAX_ROWS);
-        assert_eq!(gemv_meta[4], 0, "a Gemv carries no x_groups: {gemv_meta:?}");
+        assert_eq!(gemv_meta[3], 0, "a Gemv carries no x_groups: {gemv_meta:?}");
         assert_eq!(gemv_grid[1], 1);
         let (tiled_grid, tiled_meta) = schedule_of(crate::predicates::INDEXED_GEMV_MAX_ROWS + 1);
-        assert_eq!(tiled_meta[3..5], [33, 10], "[M, x_groups]: {tiled_meta:?}");
-        assert_eq!(tiled_grid, [10 * 64, 1, 1]);
+        assert_eq!(tiled_meta[2..4], [33, 3], "[M, x_groups]: {tiled_meta:?}");
+        assert_eq!(tiled_grid, [3 * 64, 1, 1]);
     }
 }

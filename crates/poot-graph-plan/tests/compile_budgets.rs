@@ -110,7 +110,7 @@ fn oversized_weight() -> (Graph, Target) {
 #[test]
 fn a_transform_that_would_append_a_ninth_equation_is_refused_before_appending_it() {
     let (g, target) = oversized_weight();
-    let caps = gpu_caps(&target);
+    let (backend, caps) = (gpu_backend(&target), gpu_caps(&target));
 
     let refusal = expansion(
         compile(&g, &target, &options(graph_limits(1 << 20, 8))),
@@ -128,11 +128,11 @@ fn a_transform_that_would_append_a_ninth_equation_is_refused_before_appending_it
         "the ninth equation is never appended"
     );
 
-    let whole = legalize(&g, &caps, &CompileLimits::STANDARD).unwrap();
+    let whole = legalize(&g, backend, &caps, &CompileLimits::STANDARD).unwrap();
     // The pass appends the original transpose too; dead-code elimination drops it from the result.
     let n = whole.eqns().len() + 1;
     assert!(n > 9, "the fixture expands past the card's limit: {n}");
-    let fits = legalize(&g, &caps, &graph_limits(1 << 20, n)).unwrap();
+    let fits = legalize(&g, backend, &caps, &graph_limits(1 << 20, n)).unwrap();
     assert_eq!(
         fits.eqns().len(),
         n - 1,
@@ -140,7 +140,7 @@ fn a_transform_that_would_append_a_ninth_equation_is_refused_before_appending_it
     );
     assert!(
         matches!(
-            legalize(&g, &caps, &graph_limits(1 << 20, n - 1)).unwrap_err(),
+            legalize(&g, backend, &caps, &graph_limits(1 << 20, n - 1)).unwrap_err(),
             LegalizeError::Expansion(error) if error == ExpansionError {
                 stage: LEGALIZE,
                 resource: GraphResource::Eqns,
@@ -336,6 +336,7 @@ fn a_real_fused_region_is_refused_before_it_is_generated_under_small_body_limits
             },
             &HashMap::new(),
             limits,
+            None,
         )
     };
     let limits = |instructions, locals| BodyLimits {

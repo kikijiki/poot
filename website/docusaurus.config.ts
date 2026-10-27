@@ -55,6 +55,8 @@ const config: Config = {
       {
         docs: {
           sidebarPath: './sidebars.ts',
+          // The navbar lists the top-level sections; breadcrumbs would repeat it.
+          breadcrumbs: false,
           editUrl: 'https://github.com/kikijiki/poot/tree/master/website/',
         },
         // The website is the user-facing manual only (getting started, architecture, usage, examples).
@@ -109,31 +111,14 @@ const config: Config = {
         src: 'img/logo.svg',
         srcDark: 'img/logo-dark.svg',
       },
+      // One entry per top-level section, in position order (`bun scripts/check-navbar.mjs` checks it): a folder with
+      // a _category_.json is a `docSidebar` item, a single page is a `doc` item.
       items: [
-        {
-          type: 'docSidebar',
-          sidebarId: 'docs',
-          position: 'left',
-          label: 'Docs',
-        },
-        {
-          type: 'doc',
-          docId: 'develop/index',
-          position: 'left',
-          label: 'Develop',
-        },
-        {
-          type: 'doc',
-          docId: 'serve/index',
-          position: 'left',
-          label: 'Serve',
-        },
-        {
-          type: 'doc',
-          docId: 'architecture/index',
-          position: 'left',
-          label: 'Architecture',
-        },
+        {type: 'docSidebar', sidebarId: 'develop', position: 'left', label: 'Develop'},
+        {type: 'docSidebar', sidebarId: 'serve', position: 'left', label: 'Serving'},
+        {type: 'docSidebar', sidebarId: 'architecture', position: 'left', label: 'Architecture'},
+        {type: 'doc', docId: 'performance/index', position: 'left', label: 'Performance'},
+        {type: 'doc', docId: 'status', position: 'left', label: 'Status'},
         {
           href: 'https://github.com/kikijiki/poot',
           label: 'GitHub',
@@ -141,32 +126,10 @@ const config: Config = {
         },
       ],
     },
-    footer: {
-      style: 'dark',
-      links: [
-        {
-          title: 'Docs',
-          items: [
-            {label: 'Develop', to: '/docs/develop'},
-            {label: 'Serve', to: '/docs/serve'},
-            {label: 'Architecture', to: '/docs/architecture'},
-            {label: 'Feature matrix', to: '/docs/reference/feature-matrix'},
-            {label: 'FAQ', to: '/docs/reference/faq'},
-          ],
-        },
-        {
-          title: 'Project',
-          items: [
-            {label: 'GitHub', href: 'https://github.com/kikijiki/poot'},
-          ],
-        },
-      ],
-      copyright: `Built with Docusaurus.`,
-    },
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
-      additionalLanguages: ['rust', 'bash', 'toml', 'nix', 'diff', 'json'],
+      additionalLanguages: ['rust', 'bash', 'toml', 'nix', 'diff', 'json', 'llvm', 'nasm'],
     },
   } satisfies Preset.ThemeConfig,
 };

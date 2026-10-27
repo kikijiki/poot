@@ -5,7 +5,7 @@
 //! body this replaces scanned the whole row with 64 lanes (about 750 us at that width on gfx1151).
 //!
 //! `logits` is flat `[B, vocab]` row-major; `dims = [vocab, chunk, groups]` with `groups = ceil(vocab /
-//! chunk)` (at least one). The grid is `groups` workgroups along X and `B` along Y: `group_index()` is
+//! chunk)` (at least one). The grid is `groups` workgroups along X and `B` along Y: `group_index_x()` is
 //! the chunk, `group_index_y()` the row. Group `g` of row `b` owns `[g * chunk, min((g + 1) * chunk,
 //! vocab))` and writes its three words at `partials[(b * groups + g) * 3 ..]`.
 //!
@@ -22,18 +22,20 @@
 //!
 //! Indices travel as `f32` (LDS and the partials are `f32`-only), exact below 2^24 logits.
 #![crate_type = "lib"]
+use poot_kernel_attr::kernel;
 use poot_kernel_intrinsics::{
-    group_index, group_index_y, local_index, wg_read, wg_write, workgroup_barrier,
+    group_index_x, group_index_y, local_index_x, wg_read, wg_write, workgroup_barrier,
 };
 const W: usize = 64;
 
-pub fn __poot_kernel_argmax_chunk(logits: &[f32], dims: &[u32], partials: &mut [f32]) {
+#[kernel(workgroup(64), lds(f32, 64), lds(f32, 64), lds(f32, 64))]
+pub fn argmax_chunk(logits: &[f32], dims: &[u32], partials: &mut [f32]) {
     let vocab = dims[0] as usize;
     let chunk = dims[1] as usize;
     let groups = dims[2] as usize;
     let row = group_index_y();
-    let part = group_index();
-    let lane = local_index();
+    let part = group_index_x();
+    let lane = local_index_x();
     let start = part * chunk;
     let mut end = start + chunk;
     if end > vocab {
@@ -57,9 +59,9 @@ pub fn __poot_kernel_argmax_chunk(logits: &[f32], dims: &[u32], partials: &mut [
         }
         j = j + W;
     }
-    wg_write(0, lane, best_val);
-    wg_write(1, lane, best_idx);
-    wg_write(2, lane, bad_idx);
+    wg_write::<f32>(0, lane, best_val);
+    wg_write::<f32>(1, lane, best_idx);
+    wg_write::<f32>(2, lane, bad_idx);
     workgroup_barrier();
     if lane == 0 {
         let mut bv = 0.0f32;
@@ -67,13 +69,13 @@ pub fn __poot_kernel_argmax_chunk(logits: &[f32], dims: &[u32], partials: &mut [
         let mut nb = vocab as f32;
         let mut k = 0usize;
         while k < W {
-            let cv = wg_read(0, k);
-            let ci = wg_read(1, k);
+            let cv = wg_read::<f32>(0, k);
+            let ci = wg_read::<f32>(1, k);
             if ci >= 0.0 && (bi < 0.0 || cv > bv || (cv == bv && ci < bi)) {
                 bv = cv;
                 bi = ci;
             }
-            let cb = wg_read(2, k);
+            let cb = wg_read::<f32>(2, k);
             if cb < nb {
                 nb = cb;
             }

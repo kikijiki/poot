@@ -12,9 +12,11 @@
 
 use crate::compile::SlotSchema;
 use crate::kernel_mapping::{finalize, finalize_aie};
+use crate::npu::{NpuLowering, NpuTarget};
 use crate::planner::kg::Layout;
 use crate::predicates::GraphTables;
-use crate::refusal::Site;
+use crate::refusal::{Site, refusal_at};
+use crate::state_commit::{StateCommitPlan, state_commit_from_aliases};
 use crate::storage_analysis::{check_kv_head_strides, value_storage_of_plans};
 use crate::types::GraphStorage;
 use poot_kernelgen::BodyLimits;
@@ -40,12 +42,9 @@ use poot_graph_ir::op::RowStep;
 use poot_graph_ir::op::UnOp as GUnOp;
 use poot_kernel_ir::BinOp;
 use poot_kernel_ir::Ty;
-use poot_kernel_ir::UnOp;
 use poot_kernelgen as kg;
 use poot_kernelgen::CastSpec;
 use poot_kernelgen::ContractionSpec;
-use poot_kernelgen::ElementwiseSpec;
-use poot_kernelgen::I32Binary;
 use poot_kernelgen::KernelRequest;
 use poot_kernelgen::MatmulShapes;
 use poot_kernelgen::PackedRequest;
@@ -54,8 +53,6 @@ use poot_kernelgen::PointwiseSpec;
 use poot_kernelgen::RopeSpec;
 use poot_kernelgen::RowSpec;
 use poot_kernelgen::TopKSpec;
-use poot_kernelgen::UnaryOp;
-use poot_kernelgen::ValueBinary;
 use poot_kernelgen::ViewOperand;
 use poot_kernelgen::WeightLayout;
 use poot_tensor::DType;
@@ -97,6 +94,7 @@ macro_rules! moe_ops {
                 ..
             }
             | OpKind::ArgTopK { .. }
+            | OpKind::ExpertGroup { .. }
     };
 }
 
@@ -210,15 +208,11 @@ mod packed;
 mod packed_dequant;
 mod sampling;
 mod scan;
-mod vpu;
 
 pub use choice::Planned;
 pub(crate) use choice::PlannedDispatch;
 pub use choice::{KernelChoice, NoDispatch};
 pub(crate) use matmul::epilogue_head_lowers;
-#[cfg(any(test, feature = "test-support"))]
-pub use vpu::vpu_refusals;
-pub(crate) use vpu::{narrow_to_device_precision, plan_vpu_region};
 
 use std::cell::Cell;
 
@@ -231,33 +225,82 @@ pub(crate) struct PlannedGraph {
     pub(crate) choices: Vec<KernelChoice>,
     pub(crate) storage: GraphStorage,
     pub(crate) slots: Vec<SlotSchema>,
+    /// Which state each update writes in place and which the backend commits by copy.
+    pub(crate) state_commit: StateCommitPlan,
+}
+
+/// What an equation's output buffer holds when its kernel starts: the graph-level donation decision
+/// ([`StateCommitPlan::inplace`]) the per-equation planner reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum OutputBuffer {
+    /// A buffer of its own, whose contents the kernel must write in full.
+    Fresh,
+    /// The buffer of the state its update's base is, donated in place: it already holds the base, so an
+    /// update writes only the positions it changes (POOT-1389).
+    HoldsBase,
+}
+
+/// Whether an equation's lowering depends on [`OutputBuffer`]: a `DynamicUpdateSlice` writes only its
+/// window into a donated base and the whole output otherwise. Such an equation always materializes (it is
+/// never an alias or a view), so the donation decision, which reads only aliasing, is made without it.
+fn plans_by_donation(op: &OpKind) -> bool {
+    matches!(op, OpKind::DynamicUpdateSlice { .. })
 }
 
 /// Plan a whole graph for `target`: the one planner entry per graph. The graph-level decisions run in one
-/// fixed order: strided views, every equation's plan (kernel, launch grid, alias or view), every value's
-/// storage and the slot schema. Only [`crate::compile`] calls it, after the graph
-/// passes.
-///
-/// `compile` derives the native state-commit plan from this call's own `plans`
-/// (`crate::state_commit::state_commit_from_plans`) rather than planning the graph a
-/// second time.
+/// fixed order: strided views, every equation's plan (kernel, launch grid, alias or view) but the updates,
+/// the native state commit (which state each update writes in place, read from those plans' aliasing), the
+/// updates under that decision, every value's storage and the slot schema. Each equation is planned once.
+/// Only [`crate::compile`] calls it, after the graph passes.
 pub(crate) fn plan_graph(
     g: &Graph,
     target: &Target,
     limits: &BodyLimits,
+    npu: Option<&dyn NpuLowering>,
 ) -> Result<PlannedGraph, CompileError> {
     let id = target.id();
     check_kv_head_strides(g, target)?;
     let views = compute_views(g, id);
-    let (plans, choices): (Vec<_>, Vec<_>) = g
+    let plan = |eqn: &Eqn, output| plan_eqn_compiled(g, eqn, target, &views, limits, npu, output);
+    let mut planned: Vec<Option<Planned>> = g
         .eqns()
         .iter()
         .map(|eqn| {
-            plan_eqn_compiled(g, eqn, target, &views, limits)
-                .map(|Planned { plan, choice }| (plan, choice))
+            (!plans_by_donation(&eqn.op))
+                .then(|| plan(eqn, OutputBuffer::Fresh))
+                .transpose()
         })
-        .collect::<Result<Vec<_>, _>>()?
+        .collect::<Result<_, _>>()?;
+    // An update not planned yet materializes its output: it aliases nothing.
+    let aliases: Vec<Option<ValueId>> = planned
+        .iter()
+        .map(|slot| {
+            slot.as_ref()
+                .and_then(|planned| planned.plan.aliased_source())
+        })
+        .collect();
+    let state_commit = state_commit_from_aliases(g, &aliases)?;
+    for (slot, eqn) in planned.iter_mut().zip(g.eqns()) {
+        if slot.is_none() {
+            let output = if state_commit.inplace.contains_key(&eqn.out) {
+                OutputBuffer::HoldsBase
+            } else {
+                OutputBuffer::Fresh
+            };
+            let update = plan(eqn, output)?;
+            assert!(
+                update.plan.aliased_source().is_none(),
+                "an update materializes its output, as the state commit was decided"
+            );
+            *slot = Some(update);
+        }
+    }
+    let (plans, choices): (Vec<_>, Vec<_>) = planned
         .into_iter()
+        .map(|slot| {
+            let Planned { plan, choice } = slot.expect("every equation is planned");
+            (plan, choice)
+        })
         .unzip();
     // Storage reads the plans just made: no equation is planned a second time.
     let storage = value_storage_of_plans(g, target, plans.iter().map(Some))?;
@@ -275,6 +318,7 @@ pub(crate) fn plan_graph(
         choices,
         storage,
         slots,
+        state_commit,
     })
 }
 
@@ -369,7 +413,7 @@ pub fn plan_eqn_views(
         backend,
         caps: *caps,
     };
-    plan_eqn_choice(g, eqn, &target, views, limits).map(|planned| planned.plan)
+    plan_eqn_choice(g, eqn, &target, views, limits, None).map(|planned| planned.plan)
 }
 
 /// [`plan_eqn_views`] for any [`Target`], keeping the [`KernelChoice`] the plan was built from: the one
@@ -383,20 +427,33 @@ pub fn plan_eqn_choice(
     target: &Target,
     views: &HashMap<ValueId, Layout>,
     limits: &BodyLimits,
+    npu: Option<&dyn NpuLowering>,
 ) -> Result<Planned, PlanError> {
-    plan_eqn_policy(g, eqn, target, views, limits, false)
+    plan_eqn_policy(
+        g,
+        eqn,
+        target,
+        views,
+        limits,
+        npu,
+        OutputBuffer::Fresh,
+        false,
+    )
 }
 
 /// The single-device per-equation plan [`crate::compile`] makes, in [`plan_graph`] and in its rewrite
-/// legality probes: `target` and the graph's strided `views`.
+/// legality probes: `target`, the graph's strided `views` and what the output buffer holds (`output`; a
+/// probe plans before any donation is decided, with [`OutputBuffer::Fresh`]).
 pub(crate) fn plan_eqn_compiled(
     g: &Graph,
     eqn: &Eqn,
     target: &Target,
     views: &HashMap<ValueId, Layout>,
     limits: &BodyLimits,
+    npu: Option<&dyn NpuLowering>,
+    output: OutputBuffer,
 ) -> Result<Planned, PlanError> {
-    plan_eqn_policy(g, eqn, target, views, limits, true)
+    plan_eqn_policy(g, eqn, target, views, limits, npu, output, true)
 }
 
 /// Whether `op` can read a BF16 const operand through a packed lane: the `Cast` kernel, and the fused regions
@@ -408,12 +465,15 @@ fn reads_narrow_operands(op: &OpKind) -> bool {
     )
 }
 
+#[expect(clippy::too_many_arguments)]
 fn plan_eqn_policy(
     g: &Graph,
     eqn: &Eqn,
     target: &Target,
     views: &HashMap<ValueId, Layout>,
     limits: &BodyLimits,
+    npu: Option<&dyn NpuLowering>,
+    output: OutputBuffer,
     compiled: bool,
 ) -> Result<Planned, PlanError> {
     observe_plan(compiled);
@@ -439,7 +499,7 @@ fn plan_eqn_policy(
         Vec::new()
     };
     plan_eqn_views_impl(
-        GraphTables::from(g),
+        g,
         eqn,
         &out_shape,
         out_numel,
@@ -447,6 +507,8 @@ fn plan_eqn_policy(
         views,
         &packed_operands,
         *limits,
+        npu,
+        output,
     )
 }
 
@@ -471,7 +533,7 @@ fn out_numel_saturating(shape: &[usize]) -> usize {
 /// over the validation channel and is compiled once in this crate.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn plan_eqn_views_impl(
-    g: GraphTables<'_>,
+    graph: &Graph,
     eqn: &Eqn,
     out_shape: &[usize],
     out_numel: usize,
@@ -479,7 +541,10 @@ pub(crate) fn plan_eqn_views_impl(
     views: &HashMap<ValueId, Layout>,
     packed_operands: &[bool],
     limits: BodyLimits,
+    npu: Option<&dyn NpuLowering>,
+    output: OutputBuffer,
 ) -> Result<Planned, PlanError> {
+    let g = GraphTables::from(graph);
     let mut planned = match target {
         Target::Gpu { backend, caps } => plan_gpu_eqn(
             g,
@@ -491,8 +556,9 @@ pub(crate) fn plan_eqn_views_impl(
             caps,
             packed_operands,
             limits,
+            output,
         ),
-        Target::Aie { target, caps } => plan_aie_eqn(
+        Target::Npu(NpuTarget::Aie { target, caps }) => plan_aie_eqn(
             g,
             eqn,
             out_shape,
@@ -502,11 +568,39 @@ pub(crate) fn plan_eqn_views_impl(
             views,
             packed_operands,
             limits,
+            npu.ok_or(PlanError::NpuLoweringMissing {
+                target: (*target).into(),
+            })?,
         ),
-        Target::Vpu { caps, .. } => vpu::plan_eqn(g, eqn, caps),
+        // An Intel NPU runs whole graphs a vendor compiler builds: an equation launches nothing of its own, it
+        // is a node of the program's one graph artifact, so only the NPU's table says whether it lowers.
+        Target::Npu(NpuTarget::Vpu { target, caps }) => npu
+            .ok_or(PlanError::NpuLoweringMissing {
+                target: (*target).into(),
+            })?
+            .supports_eqn(graph, eqn, caps)
+            .map(|()| Planned::graph())
+            .map_err(|missing| refusal_at(g, eqn, *target, missing)),
     }?;
     if let Plan::Dispatches(dispatches) = &mut planned.plan {
-        dispatches.apportion_work(out_numel as u64);
+        // The default weight is the output element count. A split attention weighs what its rows walk instead:
+        // the runs share the flush unit by their key-value work, so a submit holds one budget's worth.
+        let attention_work = match (&planned.choice, target) {
+            (
+                KernelChoice::Generated(KernelRequest::AttentionRows(run)),
+                Target::Gpu { caps, .. },
+            ) => crate::predicates::attention_watchdog_work(&run.spec, caps),
+            _ => None,
+        };
+        // An in-place movement (a donated update's window, a paged row scatter) writes only the units it
+        // launches over, never the whole output it lands in: it weighs what it writes.
+        let in_place_work = match &planned.choice {
+            KernelChoice::Generated(KernelRequest::Movement(spec)) if spec.op.writes_in_place() => {
+                Some(dispatches.launched_threads())
+            }
+            _ => None,
+        };
+        dispatches.apportion_work(attention_work.or(in_place_work).unwrap_or(out_numel as u64));
     }
     Ok(planned)
 }
@@ -528,6 +622,7 @@ fn plan_aie_eqn(
     views: &HashMap<ValueId, Layout>,
     packed_operands: &[bool],
     limits: BodyLimits,
+    npu: &dyn NpuLowering,
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, target, limits);
     // An AIE core has no E4M3FN storage lane: refused before scalar type selection can reinterpret it.
@@ -566,7 +661,7 @@ fn plan_aie_eqn(
             return Err(site.refuse(Capability::GpuOnly));
         }
     };
-    finalize_aie(&planned, g, eqn, target, caps)?;
+    finalize_aie(&planned, g, eqn, target, caps, npu)?;
     Ok(planned)
 }
 
@@ -638,6 +733,7 @@ fn plan_gpu_eqn(
     caps: &DeviceCaps,
     packed_operands: &[bool],
     limits: BodyLimits,
+    output: OutputBuffer,
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
     if matches!(eqn.op, imported_ops!()) {
@@ -749,7 +845,7 @@ fn plan_gpu_eqn(
             packed_operands.first().copied().unwrap_or(false),
         )?,
         movement_ops!() => movement::plan(
-            g, eqn, out_shape, out_numel, backend, views, odt, caps, limits,
+            g, eqn, out_shape, out_numel, backend, views, odt, caps, limits, output,
         )?,
         sampling_ops!() => sampling::plan(g, eqn, out_shape, out_numel, backend, odt, caps)?,
         imported_ops!() => {

@@ -18,13 +18,8 @@ use poot_graph_ir::{
     BinOp, BlockTopKAttrs, Builder, Eqn, Graph, OpKind, Operand, Scalar, TensorType,
 };
 use poot_graph_plan::test_support::roomy_body_limits;
-use poot_graph_plan::{
-    AieAbiRefusal, Capability, FusedStepGap, PlanError, Target, plan_eqn_choice,
-};
-use poot_runtime_common::AieArtifactError;
+use poot_graph_plan::{Capability, FusedStepGap, PlanError, Target, plan_eqn_choice};
 use poot_target::DeviceCaps;
-use poot_target::aie::RegionLimits;
-use poot_target::{AieCaps, AieTargetId, Queried};
 use poot_tensor::DType;
 
 fn wgpu() -> Target {
@@ -42,7 +37,7 @@ fn refusal_on(g: &Graph, target: &Target) -> Capability {
 
 /// The capability the planner refuses `eqn` of `g` for, on `target`.
 fn refusal_of(g: &Graph, eqn: &Eqn, target: &Target) -> Capability {
-    match plan_eqn_choice(g, eqn, target, &HashMap::new(), &roomy_body_limits()) {
+    match plan_eqn_choice(g, eqn, target, &HashMap::new(), &roomy_body_limits(), None) {
         Err(PlanError::Refused(refusal)) => refusal.missing,
         Err(other) => panic!("expected a typed refusal, got {other:?}"),
         Ok(_) => panic!("the equation must be refused"),
@@ -52,7 +47,7 @@ fn refusal_of(g: &Graph, eqn: &Eqn, target: &Target) -> Capability {
 /// The capability the planner refuses the last equation of `g` for, or `None` when it plans.
 fn refusal_or_ok(g: &Graph) -> Option<Capability> {
     let eqn = g.eqns().last().expect("the graph has an equation");
-    match plan_eqn_choice(g, eqn, &wgpu(), &HashMap::new(), &roomy_body_limits()) {
+    match plan_eqn_choice(g, eqn, &wgpu(), &HashMap::new(), &roomy_body_limits(), None) {
         Err(PlanError::Refused(refusal)) => Some(refusal.missing),
         Err(other) => panic!("expected a typed refusal or a plan, got {other:?}"),
         Ok(_) => None,
@@ -106,8 +101,15 @@ fn an_i32_remainder_by_literal_zero_is_an_exact_i32_op_refusal() {
     let rem = b.binary_scalar(BinOp::RemU, x, Scalar::I32(3)).unwrap();
     let g = b.finish(rem).unwrap();
     let eqn = g.eqns().last().unwrap();
-    plan_eqn_choice(&g, eqn, &wgpu(), &HashMap::new(), &roomy_body_limits())
-        .expect("a nonzero literal divisor plans");
+    plan_eqn_choice(
+        &g,
+        eqn,
+        &wgpu(),
+        &HashMap::new(),
+        &roomy_body_limits(),
+        None,
+    )
+    .expect("a nonzero literal divisor plans");
 }
 
 /// A dynamic-update-slice whose literal start index is negative has no static window. The Builder takes a
@@ -286,52 +288,4 @@ fn a_float_region_step_the_kernel_cannot_compute_is_a_fused_step_refusal() {
         refusal(&region(narrowing)),
         Capability::FusedStep(FusedStepGap::OpInFloatRegion(narrowing))
     );
-}
-
-/// An AIE core binds each tensor as a flat word buffer of at least one element; a zero-element tensor has
-/// no such buffer, and the shape ABI the planner derives refuses it, naming the binding.
-///
-/// Mutation: make the `dims.contains(&0)` check in `AieShapeAbi::new` never fire; the empty add plans for
-/// the core and this row goes red (the `AieAbi` match fails).
-#[test]
-fn a_zero_element_tensor_on_an_aie_core_is_an_aie_abi_refusal() {
-    let target = Target::Aie {
-        target: AieTargetId::Xdna2,
-        caps: AieCaps {
-            target: AieTargetId::Xdna2,
-            tile_local_bytes: Queried::Known(1 << 16),
-            host_bindings: Queried::Known(8),
-            instruction_bytes: Queried::Known(1 << 20),
-            memory_budget_bytes: Queried::Known(1 << 30),
-            region: RegionLimits {
-                compute_tiles: Queried::Known(32),
-                tile_input_channels: Queried::Known(2),
-                tile_output_channels: Queried::Known(2),
-                host_input_streams: Queried::Known(16),
-                host_output_streams: Queried::Known(16),
-            },
-        },
-    };
-    let add = |rows: usize| {
-        let b = Builder::for_tests();
-        let x = b.constant("x", TensorType::f32(vec![rows, 4])).unwrap();
-        let y = b.constant("y", TensorType::f32(vec![rows, 4])).unwrap();
-        let sum = b.binary(BinOp::Add, x, y).unwrap();
-        b.finish(sum).unwrap()
-    };
-    let control = add(2);
-    plan_eqn_choice(
-        &control,
-        control.eqns().last().unwrap(),
-        &target,
-        &HashMap::new(),
-        &roomy_body_limits(),
-    )
-    .expect("a non-empty add plans for the core");
-    assert!(matches!(
-        refusal_on(&add(0), &target),
-        Capability::AieAbi(AieAbiRefusal::Abi(AieArtifactError::ZeroDimension {
-            index: 0
-        }))
-    ));
 }

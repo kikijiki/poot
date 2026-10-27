@@ -542,7 +542,7 @@ mod tests {
             ),
             (
                 "rope_scaling",
-                json!({"type": "longrope", "short_factor": [1.0]}),
+                json!({"type": "madeup"}),
                 "rope_scaling.rope_type",
                 ConfigReason::Unsupported,
             ),

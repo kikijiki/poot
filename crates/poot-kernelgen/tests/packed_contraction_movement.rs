@@ -218,11 +218,11 @@ struct Launch {
 /// A backend that runs one movement and returns the output buffer's words.
 type Device<'a> = dyn FnMut(&Launch) -> Vec<u32> + 'a;
 
-/// The launch of `spec` over `inputs` and `index`, with an all-ones output buffer. A row scatter writes in
-/// place: its first input is the base, which becomes the output buffer's initial words (the kernel never
-/// reads it), and only the rest are the kernel's data inputs.
+/// The launch of `spec` over `inputs` and `index`, with an all-ones output buffer. A row scatter and an
+/// in-place update write in place: the first input is the base, which becomes the output buffer's initial
+/// words (the kernel never reads it as an input), and only the rest are the kernel's data inputs.
 fn launch(kind: Kind, spec: &MovementSpec, inputs: &[Tensor], index: Option<&[i32]>) -> Launch {
-    let in_place = matches!(spec.op, MovementOp::ScatterRows { .. });
+    let in_place = spec.op.writes_in_place();
     let (seed, data) = match inputs.split_first() {
         Some((base, rest)) if in_place => (Some(base), rest),
         _ => (None, inputs),
@@ -521,35 +521,96 @@ fn bank(width: u32) -> Vec<Case> {
         ("update last axis, odd rows", vec![3, 7], vec![3, 2], 1, 3),
         ("update one slot", vec![2, 4, 3], vec![2, 1, 3], 1, 2),
         ("update whole axis", vec![2, 3], vec![2, 3], 1, 0),
+        ("update first axis", vec![4, 3], vec![2, 3], 0, 1),
+        (
+            "update last axis inside one word",
+            vec![2, 9],
+            vec![2, 1],
+            1,
+            6,
+        ),
+        (
+            "update last axis, a word's tail and head",
+            vec![2, 11],
+            vec![2, 6],
+            1,
+            3,
+        ),
     ] {
         let operand = t(&operand_shape, 20);
         let new = t(&update_shape, 21);
         let expected = update(&operand, &new, axis, start);
-        let op_static = MovementOp::UpdateSlice {
-            update_shape: update_shape.clone(),
-            axis,
-            index: UpdateIndex::Static(start),
-        };
-        cases.push(Case {
-            name,
-            out_shape: operand_shape.clone(),
-            op: op_static,
-            inputs: vec![operand.clone(), new.clone()],
-            index: None,
-            expected: expected.clone(),
-        });
-        cases.push(Case {
-            name,
-            out_shape: operand_shape.clone(),
-            op: MovementOp::UpdateSlice {
+        // The copy form and the in-place form (whose output buffer already holds the operand) of one update.
+        type Form = fn(Vec<usize>, usize, UpdateIndex) -> MovementOp;
+        let forms: [Form; 2] = [
+            |update_shape, axis, index| MovementOp::UpdateSlice {
+                update_shape,
+                axis,
+                index,
+            },
+            |update_shape, axis, index| MovementOp::WriteSlice {
+                update_shape,
+                axis,
+                index,
+            },
+        ];
+        for form in forms {
+            cases.push(Case {
+                name,
+                out_shape: operand_shape.clone(),
+                op: form(update_shape.clone(), axis, UpdateIndex::Static(start)),
+                inputs: vec![operand.clone(), new.clone()],
+                index: None,
+                expected: expected.clone(),
+            });
+            cases.push(Case {
+                name,
+                out_shape: operand_shape.clone(),
+                op: form(update_shape.clone(), axis, UpdateIndex::Runtime),
+                inputs: vec![operand.clone(), new.clone()],
+                index: Some(vec![start as i32]),
+                expected: expected.clone(),
+            });
+        }
+    }
+
+    // A runtime index too large for the window: both forms write only the positions inside the axis and keep
+    // the operand everywhere else, so a too-large index never writes past its row.
+    for (name, operand_shape, update_shape, axis, start) in [
+        ("update past the end, clipped", vec![2, 5], vec![2, 3], 1, 4),
+        ("update wholly past the end", vec![2, 5], vec![2, 3], 1, 7),
+        (
+            "update past the end of an outer axis",
+            vec![3, 2, 3],
+            vec![3, 2, 3],
+            1,
+            1,
+        ),
+    ] {
+        let operand = t(&operand_shape, 22);
+        let new = t(&update_shape, 23);
+        let expected = update(&operand, &new, axis, start);
+        for op in [
+            MovementOp::UpdateSlice {
                 update_shape: update_shape.clone(),
                 axis,
                 index: UpdateIndex::Runtime,
             },
-            inputs: vec![operand.clone(), new.clone()],
-            index: Some(vec![start as i32]),
-            expected: expected.clone(),
-        });
+            MovementOp::WriteSlice {
+                update_shape: update_shape.clone(),
+                axis,
+                index: UpdateIndex::Runtime,
+            },
+        ] {
+            cases.push(Case {
+                name,
+                out_shape: operand_shape.clone(),
+                op,
+                inputs: vec![operand.clone(), new.clone()],
+                index: Some(vec![start as i32]),
+                expected: expected.clone(),
+            });
+        }
     }
 
     for (name, base_shape, src_shape, slots) in [
@@ -867,7 +928,7 @@ fn device_bank(device: &mut Device<'_>) {
 fn the_movement_bank_matches_the_reference_on_wgpu() {
     use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
     let Ok(ctx) = poot_wgpu_runtime::Context::new() else {
-        eprintln!("no wgpu device; skipping");
+        poot_test_util::skip_report("poot-kernelgen", &"no wgpu context");
         return;
     };
     let dir = std::env::temp_dir().join("poot-kernelgen-movement-wgpu");
@@ -918,7 +979,7 @@ fn the_movement_bank_matches_the_reference_on_rocm() {
     let ctx = match RocmContext::new() {
         Ok(ctx) => ctx,
         Err(RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent) => {
-            eprintln!("no ROCm device; skipping");
+            poot_test_util::skip_report("poot-kernelgen", &"no ROCm device");
             return;
         }
         Err(error) => panic!("{error}"),
@@ -959,7 +1020,7 @@ fn the_movement_bank_matches_the_reference_on_rocm() {
         elements.push(ElementKind::F32);
         let slots: Vec<_> = owned
             .iter()
-            .map(|buffer| (buffer, u64::from(buffer.elem_count())))
+            .map(|buffer| (buffer, buffer.elem_count() as u64))
             .collect();
         let kernarg = ctx.bind_kernarg(&kernel, &slots).unwrap();
         let block_x = body.workgroup_size[0];
@@ -984,7 +1045,7 @@ fn the_movement_bank_matches_the_reference_on_ptx() {
     use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
     use poot_ptx_runtime::PtxContext;
     let Ok(ctx) = PtxContext::new() else {
-        eprintln!("no PTX device; skipping");
+        poot_test_util::skip_report("poot-kernelgen", &"no PTX device");
         return;
     };
     let dir = std::env::temp_dir().join("poot-kernelgen-movement-ptx");
@@ -1006,7 +1067,7 @@ fn the_movement_bank_matches_the_reference_on_ptx() {
         if let Some(words) = &launch.index {
             owned.push(upload(words));
         }
-        let lengths: Vec<u32> = owned.iter().map(|b| b.elem_count()).collect();
+        let lengths: Vec<usize> = owned.iter().map(|b| b.elem_count()).collect();
         let refs: Vec<_> = owned.iter().collect();
         // The output starts as `launch.out`: an in-place scatter updates the pool it is handed.
         let seed: Vec<f32> = launch.out.iter().map(|&w| f32::from_bits(w)).collect();

@@ -1,13 +1,13 @@
 //! Card 559 (R468-016): the two importer-capability probes shipped as committed assets - `rowsum_for`
 //! (a fixed-bound `for` loop) and `rmsnorm_dyn` (a runtime-value loop bound read from a metadata
-//! buffer) - loaded through `ImportedKernel::{RowsumFor,RmsnormDyn}` and dispatched on wgpu through the
+//! buffer) - loaded through `ProbeKernel::{RowsumFor,RmsnormDyn}` and dispatched on wgpu through the
 //! public `Device` trait, the same low-level path `poot-llm/tests/wgpu_executor_contract.rs`'s `assert_trap` probe uses.
 //! `pootc/tests/import_run.rs` separately proves pootc can import each kernel fresh from source
 //! (`rowsum_for_loop_kernel_imported_from_mir_runs_on_gpu`, `rmsnorm_dyn_...`); this proves the
 //! committed asset itself is the one every other crate would load.
 
 use poot_executor::{Arg, Device};
-use poot_graph_plan::ImportedKernel;
+use poot_graph_plan::ProbeKernel;
 use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::BufferStorage;
 
@@ -39,7 +39,7 @@ fn rowsum_for_asset_matches_cpu_on_wgpu() {
     let Some(mut device) = wgpu() else {
         return;
     };
-    let body = ImportedKernel::RowsumFor.body().clone();
+    let body = ProbeKernel::RowsumFor.body().clone();
     let kernel = load(&mut device, "rowsum_for_probe", &body);
 
     const COLS: usize = 4; // matches the kernel's own baked COLS constant.
@@ -63,11 +63,11 @@ fn rowsum_for_asset_matches_cpu_on_wgpu() {
             kernel: &kernel,
             inputs: &[Arg {
                 buffer: &x_buf,
-                elems: x.len() as u32,
+                elems: x.len(),
             }],
             output: Arg {
                 buffer: &out_buf,
-                elems: rows as u32,
+                elems: rows,
             },
             launch: poot_executor::LaunchKind::Grid {
                 threads: [rows as u32, 1, 1],
@@ -101,7 +101,7 @@ fn rmsnorm_dyn_asset_matches_cpu_on_wgpu() {
     let Some(mut device) = wgpu() else {
         return;
     };
-    let body = ImportedKernel::RmsnormDyn.body().clone();
+    let body = ProbeKernel::RmsnormDyn.body().clone();
     let kernel = load(&mut device, "rmsnorm_dyn_probe", &body);
 
     let (rows, d) = (3usize, 6usize);
@@ -147,20 +147,20 @@ fn rmsnorm_dyn_asset_matches_cpu_on_wgpu() {
             inputs: &[
                 Arg {
                     buffer: &x_buf,
-                    elems: x.len() as u32,
+                    elems: x.len(),
                 },
                 Arg {
                     buffer: &w_buf,
-                    elems: w.len() as u32,
+                    elems: w.len(),
                 },
                 Arg {
                     buffer: &dims_buf,
-                    elems: dims.len() as u32,
+                    elems: dims.len(),
                 },
             ],
             output: Arg {
                 buffer: &out_buf,
-                elems: (rows * d) as u32,
+                elems: rows * d,
             },
             launch: poot_executor::LaunchKind::Grid {
                 threads: [rows as u32, 1, 1],

@@ -463,6 +463,7 @@ mod tests {
             workgroup_size: [64, 1, 1],
             workgroup_locals: Vec::new(),
             constant_tables: Vec::new(),
+            index_width: poot_kernel_ir::IndexWidth::Native,
         }
     }
     fn succ_of(b: &Body, i: usize) -> Vec<usize> {

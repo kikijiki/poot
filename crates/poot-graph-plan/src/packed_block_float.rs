@@ -98,6 +98,30 @@ pub fn admit_packed(
     Ok(format)
 }
 
+/// Refuse (by name, at claim time) a packed `weight` whose uploaded source is larger than `backend`'s
+/// kernels can address by bit offset: a kernel reads a block at `block * block_bits` in `usize`
+/// ([`poot_target::Backend::index_bits`]), so on a 32-bit backend a source past `u32::MAX` bits would wrap
+/// and silently read the wrong rows. The bound is the backend's own: a 64-bit backend admits every size its
+/// device holds (`max_buffer_bytes` bounds that). The source is the uploaded word transport, guard word
+/// included ([`PackedWeight::slab_words`] plus one).
+pub fn check_source_addressable(
+    weight: PackedWeight,
+    backend: poot_target::Backend,
+) -> Result<(), crate::refusal::Capability> {
+    let max_bits = backend.max_bit_offset();
+    for role in weight.sources() {
+        let source_bits = (weight.slab_words(role) as u64 + 1) * 32;
+        if source_bits > max_bits {
+            return Err(crate::refusal::Capability::PackedSourceAddressing {
+                format: weight.format(),
+                source_bits,
+                max_bits,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod packed_lowering_tests {
     use poot_quant::format::{GroupMap, ScaleEncoding, WeightFormat};

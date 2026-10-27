@@ -1,8 +1,8 @@
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 const COLS: usize = 4;
 pub fn __poot_kernel_rowsum_for(x: &[f32], out: &mut [f32]) {
-    let r = thread_index();
+    let r = thread_index_x();
     if r < out.len() {
         let mut acc = 0.0f32;
         for j in 0..COLS {

@@ -40,16 +40,16 @@ use super::{BackendChoice, ModelHandle, open_executor, serving_trace_limits};
 const LLAMA_CPP_COMMIT: &str = "d812350";
 
 /// The text both engines score: prose and one line of code, five windows of [`N_CTX`] tokens.
-const CORPUS: &str = include_str!("../../tests/fixtures/kl_corpus.txt");
+pub(super) const CORPUS: &str = include_str!("../../tests/fixtures/kl_corpus.txt");
 
 /// The window llama.cpp scores in: 128 tokens, the second half scored.
 const N_CTX: usize = 128;
 
-/// The flags every reference run uses, after `-m <model> -f <corpus> --save-all-logits <out>`: CPU only
+/// The flags every reference run uses for windows of `n_ctx` tokens, after `-m <model> -f <corpus> --save-all-logits <out>`: CPU only
 /// (`-dev none`, no offload) so the reference does not depend on a GPU backend, no warmup run, one window per
 /// batch.
-fn reference_flags() -> Vec<String> {
-    let n_ctx = N_CTX.to_string();
+fn reference_flags(n_ctx: usize) -> Vec<String> {
+    let n_ctx = n_ctx.to_string();
     [
         "-c",
         &n_ctx,
@@ -69,7 +69,7 @@ fn reference_flags() -> Vec<String> {
 
 /// A malformed llama.cpp logits file.
 #[derive(Debug, thiserror::Error, PartialEq)]
-enum ReferenceError {
+pub(super) enum ReferenceError {
     #[error("not a llama.cpp logits file (magic {0:?})")]
     Magic(Vec<u8>),
     #[error("the file ends inside {0}")]
@@ -79,17 +79,17 @@ enum ReferenceError {
 }
 
 /// A llama.cpp `--save-all-logits` file, read in place.
-struct Reference<'a> {
-    n_ctx: usize,
-    n_vocab: usize,
-    chunks: usize,
+pub(super) struct Reference<'a> {
+    pub(super) n_ctx: usize,
+    pub(super) n_vocab: usize,
+    pub(super) chunks: usize,
     tokens: Vec<i32>,
     /// The records, back to back: `chunks * scored()` of `record_u16s()` values each.
     records: &'a [u8],
 }
 
 impl<'a> Reference<'a> {
-    fn parse(bytes: &'a [u8]) -> Result<Self, ReferenceError> {
+    pub(super) fn parse(bytes: &'a [u8]) -> Result<Self, ReferenceError> {
         const MAGIC: &[u8] = b"_logits_";
         let head = bytes
             .get(..MAGIC.len())
@@ -158,7 +158,7 @@ impl<'a> Reference<'a> {
         2 * self.n_vocab.div_ceil(2) + 4
     }
 
-    fn window_tokens(&self, chunk: usize) -> &[i32] {
+    pub(super) fn window_tokens(&self, chunk: usize) -> &[i32] {
         &self.tokens[chunk * self.n_ctx..][..self.n_ctx]
     }
 
@@ -196,6 +196,24 @@ fn log_softmax(logits: &[f32]) -> Vec<f64> {
     logits.iter().map(|&x| f64::from(x) - log_sum).collect()
 }
 
+/// The indices of the five largest values.
+fn top5(values: &[f64]) -> [usize; 5] {
+    let mut best = [(f64::NEG_INFINITY, 0usize); 5];
+    for (i, &v) in values.iter().enumerate() {
+        if v > best[4].0 {
+            best[4] = (v, i);
+            best.sort_by(|a, b| b.0.total_cmp(&a.0));
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
+/// The fraction of `a`'s five largest entries that `b`'s five largest also hold.
+pub(super) fn top5_overlap(a: &[f64], b: &[f64]) -> f64 {
+    let (a, b) = (top5(a), top5(b));
+    a.iter().filter(|i| b.contains(i)).count() as f64 / 5.0
+}
+
 fn argmax(values: &[f64]) -> usize {
     values
         .iter()
@@ -208,24 +226,44 @@ fn argmax(values: &[f64]) -> usize {
 
 /// How closely poot's next-token distributions follow llama.cpp's over every scored position.
 #[derive(Clone, Debug, PartialEq)]
-struct Agreement {
-    positions: usize,
+pub(super) struct Agreement {
+    pub(super) positions: usize,
     /// Mean of KL(llama.cpp || poot), in nats.
-    mean_kl: f64,
+    pub(super) mean_kl: f64,
     /// Largest KL at one position.
-    max_kl: f64,
+    pub(super) max_kl: f64,
     /// Mean negative log-likelihood of the followed token under poot, minus llama.cpp's.
-    nll_delta: f64,
+    pub(super) nll_delta: f64,
     /// Fraction of positions where both engines rank the same token first.
-    top1: f64,
+    pub(super) top1: f64,
+    /// Mean fraction of llama.cpp's five most likely tokens that poot's five also hold.
+    pub(super) top5_overlap: f64,
+    /// Largest difference of one token's log-probability, over the tokens the reference represents.
+    pub(super) max_abs_logprob: f64,
+    /// The five positions of largest KL as (window, position, KL), largest first.
+    pub(super) worst: Vec<(usize, usize, f64)>,
 }
 
 /// Compare `reference` with the logits `poot` returns for a window's tokens (`n_ctx * n_vocab` values, one
 /// row per position).
-fn compare(reference: &Reference<'_>, mut poot: impl FnMut(&[i32]) -> Vec<f32>) -> Agreement {
+pub(super) fn compare(
+    reference: &Reference<'_>,
+    poot: impl FnMut(&[i32]) -> Vec<f32>,
+) -> Agreement {
+    compare_chunks(reference, reference.chunks, poot)
+}
+
+/// [`compare`] over the first `chunks` windows of the reference only.
+pub(super) fn compare_chunks(
+    reference: &Reference<'_>,
+    chunks: usize,
+    mut poot: impl FnMut(&[i32]) -> Vec<f32>,
+) -> Agreement {
     let (mut kl_sum, mut kl_max, mut nll_delta, mut nll_positions, mut agree, mut positions) =
         (0.0, 0.0f64, 0.0, 0usize, 0, 0);
-    for chunk in 0..reference.chunks {
+    let (mut overlap, mut max_abs_logprob) = (0.0, 0.0f64);
+    let mut worst: Vec<(usize, usize, f64)> = Vec::new();
+    for chunk in 0..chunks {
         let window = reference.window_tokens(chunk);
         let logits = poot(window);
         assert_eq!(
@@ -259,6 +297,9 @@ fn compare(reference: &Reference<'_>, mut poot: impl FnMut(&[i32]) -> Vec<f32>) 
                 .map(|(&b, &o)| b.exp() * (b - o))
                 .sum();
             kl_sum += kl;
+            worst.push((chunk, position, kl));
+            worst.sort_by(|a, b| b.2.total_cmp(&a.2));
+            worst.truncate(5);
             kl_max = kl_max.max(kl);
             // A followed token below the clamp has no reference value: it adds no NLL term.
             if base[next] > f64::NEG_INFINITY {
@@ -266,6 +307,12 @@ fn compare(reference: &Reference<'_>, mut poot: impl FnMut(&[i32]) -> Vec<f32>) 
                 nll_positions += 1;
             }
             agree += usize::from(argmax(&base) == argmax(&ours));
+            overlap += top5_overlap(&base, &ours);
+            for (b, o) in base.iter().zip(&ours) {
+                if *b > f64::NEG_INFINITY {
+                    max_abs_logprob = max_abs_logprob.max((b - o).abs());
+                }
+            }
             positions += 1;
         }
     }
@@ -276,21 +323,24 @@ fn compare(reference: &Reference<'_>, mut poot: impl FnMut(&[i32]) -> Vec<f32>) 
         max_kl: kl_max,
         nll_delta: nll_delta / nll_positions as f64,
         top1: agree as f64 / n,
+        top5_overlap: overlap / n,
+        max_abs_logprob,
+        worst,
     }
 }
 
 /// The thresholds an [`Agreement`] must meet.
 #[derive(Clone, Copy, Debug)]
-struct Gate {
-    max_mean_kl: f64,
-    max_max_kl: f64,
-    max_abs_nll_delta: f64,
-    min_top1: f64,
+pub(super) struct Gate {
+    pub(super) max_mean_kl: f64,
+    pub(super) max_max_kl: f64,
+    pub(super) max_abs_nll_delta: f64,
+    pub(super) min_top1: f64,
 }
 
 /// A threshold an [`Agreement`] missed.
 #[derive(Debug, thiserror::Error, PartialEq)]
-enum GateFailure {
+pub(super) enum GateFailure {
     #[error("mean KL {got:.6} nats exceeds the gate {limit:.6}")]
     MeanKl { got: f64, limit: f64 },
     #[error("max KL {got:.6} nats exceeds the gate {limit:.6}")]
@@ -302,7 +352,7 @@ enum GateFailure {
 }
 
 impl Gate {
-    fn check(&self, a: &Agreement) -> Result<(), GateFailure> {
+    pub(super) fn check(&self, a: &Agreement) -> Result<(), GateFailure> {
         // A NaN measurement misses every threshold.
         let above = |got: f64, limit: f64| got.is_nan() || got > limit;
         let below = |got: f64, limit: f64| got.is_nan() || got < limit;
@@ -334,12 +384,12 @@ impl Gate {
     }
 }
 
-fn nz(n: usize) -> NonZeroUsize {
+pub(super) fn nz(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).unwrap()
 }
 
 /// poot's logits for whole windows: one prefill program with logits at every row, replayed per window.
-struct TeacherForced {
+pub(super) struct TeacherForced {
     exec: Box<dyn Executor>,
     exe: ExecutableId,
     entry: EntryId,
@@ -347,7 +397,7 @@ struct TeacherForced {
 }
 
 impl TeacherForced {
-    fn new(handle: &ModelHandle, mut exec: Box<dyn Executor>, n_ctx: usize) -> Self {
+    pub(super) fn new(handle: &ModelHandle, mut exec: Box<dyn Executor>, n_ctx: usize) -> Self {
         let model = handle.model();
         let shape = StepShape::new(nz(1), nz(n_ctx), nz(n_ctx)).with_logits(LogitRows::All);
         let graph = model
@@ -381,7 +431,7 @@ impl TeacherForced {
     }
 
     /// The logits of every position of `window`, `[n_ctx, n_vocab]` row-major.
-    fn logits(&mut self, window: &[i32]) -> Vec<f32> {
+    pub(super) fn logits(&mut self, window: &[i32]) -> Vec<f32> {
         assert_eq!(window.len(), self.n_ctx);
         self.exec
             .reset_state(self.exe, StateScope::All)
@@ -410,11 +460,11 @@ impl Drop for TeacherForced {
 
 /// The reference's tokens, scored by `llama-perplexity` on `model` and `corpus`, written to `out`. `None`
 /// (after saying why) when the binary is not on `PATH`.
-fn run_reference(model: &Path, corpus: &Path, out: &Path) -> Option<()> {
+pub(super) fn run_reference(model: &Path, corpus: &Path, n_ctx: usize, out: &Path) -> Option<()> {
     let version = match Command::new("llama-perplexity").arg("--version").output() {
         Ok(output) => output,
         Err(error) => {
-            eprintln!("SKIP: llama-perplexity is not on PATH ({error})");
+            eprintln!("POOT-SKIP: llama-perplexity is not on PATH ({error})");
             return None;
         }
     };
@@ -429,7 +479,7 @@ fn run_reference(model: &Path, corpus: &Path, out: &Path) -> Option<()> {
         .arg(model)
         .arg("-f")
         .arg(corpus)
-        .args(reference_flags())
+        .args(reference_flags(n_ctx))
         .arg("--save-all-logits")
         .arg(out)
         .output()
@@ -793,7 +843,7 @@ mod checkpoint_rows {
         let scratch = poot_test_util::unique_temp_path("reference.bin");
         let corpus = scratch.with_file_name("corpus.txt");
         std::fs::write(&corpus, CORPUS).unwrap();
-        run_reference(reference, &corpus, &scratch)?;
+        run_reference(reference, &corpus, N_CTX, &scratch)?;
         let bytes = std::fs::read(&scratch).unwrap();
         let reference = Reference::parse(&bytes).expect("parse the reference");
         assert_eq!(reference.n_ctx, N_CTX);

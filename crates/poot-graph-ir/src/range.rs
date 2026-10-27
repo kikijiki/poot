@@ -363,6 +363,15 @@ fn equation_range(
                 .unwrap_or(IndexRange::I32),
             _ => IndexRange::I32,
         },
+        OpKind::ExpertGroup { .. } => match inputs.first() {
+            Some(Operand::Value(id)) => graph
+                .aval(*id)
+                .shape
+                .first()
+                .and_then(|&rows| IndexRange::below(rows.max(1)))
+                .unwrap_or(IndexRange::I32),
+            _ => IndexRange::I32,
+        },
         // The packed ids and indicator: ids `-1..blocks`, the indicator `0` or `1`.
         OpKind::BlockTopK(_) => inputs
             .first()

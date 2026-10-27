@@ -1,0 +1,29 @@
+# poot benchmark report
+
+- GPU: AMD Radeon 8060S Graphics (driver None, None)
+- captured: 2026-10-26T18:50:17.021615+00:00
+
+- poot build: f2936210
+
+## qwen3-0.6b - decode-curve
+
+| framework | precision | status | TTFT ms | TPOT ms | decode tok/s | peak VRAM GiB | peak RSS GiB | peak power W | energy Wh | notes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| poot (wgpu) | bf16 | ok | 142.9 | 11.9 | 83.8 | 7.02 | 1.06 | 113.1 | 0.959 |  |
+
+
+**Decode degradation - steady decode tok/s vs context length (ISL), higher is better:**
+
+| framework | ISL 128 | ISL 2048 | ISL 8192 |
+|---|---|---|---|
+| poot (wgpu) | 83.8 | 68.8 | 57.0 |
+
+**TPOT p50 ms (per-token decode cost, prefill excluded) vs ISL, lower is better:**
+
+| framework | ISL 128 | ISL 2048 | ISL 8192 |
+|---|---|---|---|
+| poot (wgpu) | 11.9 | 14.5 | 17.5 |
+
+---
+
+_Memory numbers come from one external sampler (total device VRAM, process-tree RSS) under the one-engine-per-GPU assumption. Peak power W and energy Wh come from the same sampler (NVML board power draw, or amdgpu hwmon power on AMD, integrated over wall-clock time); omitted when the device exposes none. Timing comes from each runner. Cells with a precision or format mismatch vs the matched target carry a note; vLLM VRAM reflects its KV-pool reservation unless run at a low gpu_memory_utilization. See benchmarks/README.md._

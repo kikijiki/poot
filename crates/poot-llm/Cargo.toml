@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+poot-codegen.workspace = true
 poot-graph-ir.workspace = true
 poot-tensor.workspace = true
 poot-models.workspace = true
@@ -49,6 +50,8 @@ poot-kernel-ir.workspace = true
 poot-profile.workspace = true
 
 [dev-dependencies]
+# A launch of another device's kind (`LaunchKind::Aie`), which the device must refuse.
+poot-npu-artifacts.workspace = true
 poot-text = { workspace = true, features = ["test-support"] }
 # The sampler tests check guided masks against a reference regex engine.
 regex-automata.workspace = true
@@ -75,9 +78,6 @@ poot-test-util.workspace = true
 poot-executor-parity.workspace = true
 # The dense family fixtures (`poot_models::test_support::dense`): the graphs the plan and equivalence tests trace.
 poot-models = { workspace = true, features = ["test-support"] }
-# `AmdArch` (poot-codegen) for a CPU-only test that classifies prefill-graph eqns without touching a GPU
-# (no HSA/driver linkage).
-poot-codegen.workspace = true
 # The boxed-cause chain test constructs each backend's runtime error type to check that `source()` reaches
 # it. Already transitive dependencies of the backend crates; listed only so the test can name the types.
 # No driver linkage; construction touches no device.

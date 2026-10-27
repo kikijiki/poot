@@ -1,0 +1,174 @@
+{
+  "backend": "ptx",
+  "case": "prefill-attention-2048",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 7993.32
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 7909.915
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 7832.469
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 7901.192
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 7869.284000000001
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 7867.431
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 7834.281
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 7804.577
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 7785.739
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 33554432,
+      "peak_bytes": 33554432,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 16777216,
+      "peak_bytes": 16777216,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 16384,
+      "peak_bytes": 16384,
+      "role": "Input"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 2048,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 2048
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 16777216,
+    "weight_copies": 1
+  },
+  "plan": [
+    "attention [8f733498daa61ded9c79f75ebd90915154fca26767d095f9dfb9e858f4faa9d3]"
+  ],
+  "plan_id": "298add2bfee5447b7f8bcc7d390efc18d98add1893c4474f1bd3c7eb59373964",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 1.7175233905660067e-07,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-ptx-device",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "prefill-attention-2048",
+    "--out",
+    "benchmarks/performance-bank/receipts/ptx/prefill-attention-2048.json"
+  ],
+  "parent_revision": "ce0d5a1ec6adf1a248789951101210d9493c4762",
+  "binary_sha256": "f3d48cded04c71a1e921a19a9b78d949e6587f9090f8feb6726c4ae41ff1ac57",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "bhsd",
+    "dimensions": {
+      "hq": 16,
+      "hkv": 8,
+      "d": 128,
+      "lq": 2048,
+      "cap": 2048
+    },
+    "prompt_tokens": 1,
+    "live_context": 2048,
+    "max_context": 2048,
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "prefill-attention-2048"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "ptx",
+    "device": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "driver": "595.91.07"
+  },
+  "identity_digest": "85738fd589aaa7d2b842026f16ae4cc73b8877d05c3a0d375037a668478899fa",
+  "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"
+}

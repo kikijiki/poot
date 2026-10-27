@@ -10,11 +10,18 @@ rust-version.workspace = true
 
 [dependencies]
 blake3 = { workspace = true, optional = true }
+poot-codegen.workspace = true
 poot-executor.workspace = true
-poot-l0-runtime = { workspace = true, optional = true }
+poot-graph-ir.workspace = true
 poot-graph-plan.workspace = true
+poot-kernel-ir.workspace = true
+poot-kernelgen.workspace = true
+poot-l0-runtime = { workspace = true, optional = true }
+poot-npu-artifacts.workspace = true
+poot-quant.workspace = true
 poot-runtime-common.workspace = true
 poot-target.workspace = true
+poot-tensor.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
@@ -32,11 +39,10 @@ poot-executor-parity.workspace = true
 # `Program::kernel_choice`: the rows read the numerical contract the planner attached to the equation.
 poot-graph-plan = { workspace = true, features = ["test-support"] }
 poot-graph-ir = { workspace = true, features = ["test-support"] }
-poot-kernel-ir.workspace = true
-poot-kernelgen.workspace = true
-poot-quant.workspace = true
-poot-tensor.workspace = true
+# The AIE bind-check the device rows drive (`check_aie_bindings`).
+poot-npu-artifacts = { workspace = true, features = ["test-support"] }
 poot-test-util.workspace = true
+poot-weights.workspace = true
 
 [features]
 # The Intel NPU device over Level Zero (POOT-1164): the vendor graph compiler, the blob cache and the `Device`.
@@ -48,7 +54,7 @@ vpu = ["dep:blake3", "dep:poot-l0-runtime"]
 # crate to its documentation. The device lane builds it with `--features xdna` (spec 1002, POOT-1118).
 xdna = ["dep:cc"]
 # The device's run and load counters (see the dev-dependency self edge above).
-test-support = []
+test-support = ["poot-graph-plan/test-support"]
 
 [lints]
 workspace = true

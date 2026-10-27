@@ -1,5 +1,5 @@
 use crate::{Binding, Context, DeviceBuffer, GraphTiming, RuntimeError};
-use poot_runtime_common::CompiledKernel;
+use poot_codegen::CompiledKernel;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,9 +24,7 @@ impl Context {
             .iter()
             .map(|&buffer| Binding {
                 buffer,
-                elems: u32::try_from(buffer.native_elems()).expect(
-                    "allocate_buffer_resources refuses a buffer whose element count exceeds u32",
-                ),
+                elems: buffer.native_elems(),
             })
             .collect();
         // Refuse a bad dispatch before any pipeline is built.

@@ -36,7 +36,7 @@ pub enum RocmError {
     /// The kernel name passed to `lookup_kernel` contained an embedded NUL byte.
     #[error("invalid kernel name (NUL byte)")]
     InvalidKernelName,
-    /// [`RocmContext::load_hsaco`] was given a [`poot_runtime_common::CompiledKernel`] compiled for a
+    /// [`RocmContext::load_hsaco`] was given a [`poot_codegen::CompiledKernel`] compiled for a
     /// different backend (card 608): this runtime only ever loads an `AmdGcn`-compiled kernel.
     #[error("ROCm load_hsaco requires an AmdGcn-compiled kernel, got one compiled for {actual:?}")]
     WrongKernelTarget {
@@ -48,7 +48,7 @@ pub enum RocmError {
     /// any submission, checked against the schema `load_hsaco`/`lookup_kernel` carried from the
     /// `CompiledKernel`.
     #[error("kernel argument schema violation: {0}")]
-    KernelArgs(#[from] poot_runtime_common::KernelArgError),
+    KernelArgs(#[from] poot_codegen::KernelArgError),
     /// A GPU queue wait (`synchronize` / upload back-pressure) spun past the wall-clock guard without
     /// the dispatch completing. Fails with a clean error instead of an infinite 99%-CPU busy-spin. The
     /// bound is generous (see [`crate::RocmContextOptions::wait_timeout`]). The context is poisoned
@@ -100,14 +100,6 @@ pub enum RocmError {
     /// Restricted replay unexpectedly produced a number of physical submissions other than one.
     #[error("restricted replay required one physical AQL submission, got {0}")]
     RestrictedReplaySubmissions(usize),
-    /// A logical element count cannot be represented by the native u32 kernel-length ABI.
-    #[error("{op} element count {elements} exceeds the native u32 kernel-length ABI")]
-    ElementCountTooLarge {
-        /// The runtime entry point that refused.
-        op: &'static str,
-        /// The element count that does not fit in `u32`.
-        elements: usize,
-    },
     /// Element-to-byte conversion overflowed before allocation or transfer.
     #[error("{op} byte size overflow: {elements} elements * {element_bytes} bytes")]
     ByteSizeOverflow {

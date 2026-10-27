@@ -170,6 +170,7 @@ fn build_carrier(raw: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, Mod
             bos: None,
             prompt_bos: None,
             prefill_granule: nz(1),
+            kv_dtype: None,
             chat: ChatFormat::ChatML,
             tool_codec: Some(Arc::new(HermesToolCodec)),
         },
@@ -246,7 +247,7 @@ impl Device for FakeDevice {
     fn load_kernel(
         &mut self,
         _key: &str,
-        _kernel: poot_runtime_common::CompiledKernel,
+        _kernel: poot_codegen::CompiledKernel,
     ) -> Result<(), FakeError> {
         Ok(())
     }
@@ -301,6 +302,7 @@ fn driver_of(kind: Kind, k: usize, carry: bool) -> Driver {
         handle_of(kind),
         Box::new(Engine::new(FakeDevice)),
         DriverOptions {
+            kv_dtype: None,
             prefill: compile.clone(),
             decode: compile,
             capacity: nz(CAPACITY),

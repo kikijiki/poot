@@ -22,6 +22,7 @@ impl<'a> Emitter<'a> {
             Rvalue::Use(op) => self.operand(op, w),
             Rvalue::BinaryOp(op, a, b) => self.emit_binop(*op, a, b, w),
             Rvalue::BinaryOpNoContract(op, a, b) => self.emit_binop_no_contract(*op, a, b, w),
+            Rvalue::MulAdd(a, b, c) => self.emit_mul_add(a, b, c, w),
             Rvalue::UnaryOp(op, a) => self.emit_unary(*op, a, w),
             Rvalue::MathUnary(op, a) => self.emit_mathunary(*op, a, w),
             Rvalue::IntScalarUnary(op, a) => self.emit_int_scalar_unary(*op, a, w),
@@ -305,16 +306,10 @@ impl<'a> Emitter<'a> {
                         "VectorSplat requires a Ty::Vec destination local".into(),
                     ));
                 };
-                if self.target != Target::SpirvVulkan {
-                    return Err(EmitError::Unsupported(format!(
-                        "VectorSplat on {:?}: vector codegen is SpirvVulkan-only in this increment \
-                         (spec 134 P1)",
-                        self.target
-                    )));
-                }
+                // `scalar_llty` refuses `Ty::Vec` on a target without vector codegen.
+                let vecty = self.scalar_llty(dest_ty)?;
                 // The operand's llty (`sllty`) already reflects `dest_ty`'s scalar elem type.
                 let (v, sllty) = self.operand(op, w)?;
-                let vecty = format!("<{lanes} x {sllty}>");
                 let tmp = self.fresh();
                 let _ = writeln!(
                     w,
@@ -327,6 +322,18 @@ impl<'a> Emitter<'a> {
                     "  {out} = shufflevector {vecty} {tmp}, {vecty} poison, {mask}"
                 );
                 Ok((out, vecty))
+            }
+            Rvalue::VectorExtract { vector, lane } => {
+                let (v, vecty) = self.operand(vector, w)?;
+                let Ty::Vec { elem, .. } = self.operand_ty(vector)? else {
+                    return Err(EmitError::Unsupported(
+                        "VectorExtract requires a Ty::Vec operand".into(),
+                    ));
+                };
+                let elem_llty = self.scalar_llty(&elem)?;
+                let out = self.fresh();
+                let _ = writeln!(w, "  {out} = extractelement {vecty} {v}, i32 {lane}");
+                Ok((out, elem_llty))
             }
         }
     }
@@ -577,7 +584,7 @@ impl<'a> Emitter<'a> {
         match op {
             poot_kernel_ir::IntScalarOp::LeadingZeros => match self.target {
                 Target::SpirvVulkan | Target::AieCore => self.emit_clz_i32_software(&va, w),
-                Target::Nvptx | Target::SpirvOpenCl | Target::AmdGcn(_) => {
+                Target::Nvptx | Target::AmdGcn(_) => {
                     self.declares
                         .insert("declare i32 @llvm.ctlz.i32(i32, i1)".into());
                     let t = self.fresh();
@@ -701,7 +708,7 @@ impl<'a> Emitter<'a> {
         w: &mut String,
     ) -> Result<(String, String), EmitError> {
         match self.target {
-            Target::SpirvVulkan | Target::SpirvOpenCl => {
+            Target::SpirvVulkan => {
                 self.declares
                     .insert(format!("declare {ty} @llvm.exp.f32({ty})"));
                 let t = self.fresh();
@@ -825,7 +832,7 @@ impl<'a> Emitter<'a> {
         w: &mut String,
     ) -> Result<(String, String), EmitError> {
         match self.target {
-            Target::SpirvVulkan | Target::SpirvOpenCl => {
+            Target::SpirvVulkan => {
                 self.declares
                     .insert(format!("declare {ty} @llvm.log.f32({ty})"));
                 let t = self.fresh();
@@ -1053,15 +1060,6 @@ impl<'a> Emitter<'a> {
                     .into(),
             ));
         }
-        // The backend translates no fast-math flag into a `NoContraction` decoration, and the stub-call
-        // rewrite that carries it on Vulkan (`spirv_postprocess::fix_no_contraction`) is not wired for the
-        // OpenCL module shape. Refuse rather than emit an unmarked subtract.
-        if self.target == Target::SpirvOpenCl {
-            return Err(EmitError::Unsupported(
-                "BinaryOpNoContract on SpirvOpenCl: no NoContraction decoration is emitted for OpenCL SPIR-V"
-                    .into(),
-            ));
-        }
         let (va, tya) = self.operand(a, w)?;
         let (vb, _tyb) = self.operand(b, w)?;
         let (inst, _) = binop_inst(op, true, false);
@@ -1088,5 +1086,33 @@ impl<'a> Emitter<'a> {
             );
         }
         Ok((t, tya))
+    }
+
+    /// Emit a fused multiply-add `a * b + c` ([`Rvalue::MulAdd`]): `llvm.fma.f32`, one rounding, on every GPU
+    /// target (`v_fma_f32`/`v_fmac_f32` on AMDGCN, `fma.rn.f32` on NVPTX, `OpExtInst Fma` on SPIR-V).
+    fn emit_mul_add(
+        &mut self,
+        a: &Operand,
+        b: &Operand,
+        c: &Operand,
+        w: &mut String,
+    ) -> Result<(String, String), EmitError> {
+        if self.target == Target::AieCore {
+            return Err(EmitError::Unsupported(
+                "MulAdd on AieCore: the fused multiply-add is lowered for the GPU targets only"
+                    .into(),
+            ));
+        }
+        let (va, ty) = self.operand(a, w)?;
+        let (vb, _) = self.operand(b, w)?;
+        let (vc, _) = self.operand(c, w)?;
+        self.declares
+            .insert(format!("declare {ty} @llvm.fma.f32({ty}, {ty}, {ty})"));
+        let t = self.fresh();
+        let _ = writeln!(
+            w,
+            "  {t} = call {ty} @llvm.fma.f32({ty} {va}, {ty} {vb}, {ty} {vc})"
+        );
+        Ok((t, ty))
     }
 }

@@ -42,6 +42,7 @@ pub const CHECKPOINTS: &[&str] = &[
     "olmo2-1b-gguf",
     "olmoe-1b-7b",
     "olmoe-tiny",
+    "phi-3.5-mini",
     "phi-3.5-mini-gguf",
     "phi-3-mini-gguf",
     "phi-4-mini",

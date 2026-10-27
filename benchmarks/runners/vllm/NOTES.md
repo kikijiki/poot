@@ -1,7 +1,7 @@
 # vLLM runner notes (research 2026-06-12, vLLM 0.22.1 / V1 engine)
 
 > Status: snapshot. Pins as of 2026-06; spot-checked 2026-09-19 against `benchmarks/docker/Dockerfile`
-> (llama.cpp b9601, vLLM 0.22.1, transformers 5.0.0, candle 0.10.2 match). The image is the source of truth and
+> (llama.cpp v0.4.1, vLLM 0.22.1, transformers 5.0.0, candle 0.10.2 match). The image is the source of truth and
 > is now Ubuntu 24.04 / CUDA 12.6.3, so CUDA 12.4 / Ubuntu 22.04 mentions below are stale.
 
 Pinned: `vllm==0.22.1` (V1 engine). Install with `uv pip install "vllm==0.22.1" --torch-backend=auto`
@@ -87,3 +87,11 @@ an `ENV` in `docker/Dockerfile` and defensively in `runners/vllm/run.py` (`os.en
 Verified on a RunPod RTX 3090 with the rebuilt `ghcr.io/kikijiki/poot-bench:latest`: `qwen2.5-0.5b-instruct`
 bf16 single-shot, 469 tok/s decode (vs 487 tok/s on 2026-06-15, within noise); decode-curve mode also passes at
 isl=128/512 with real per-token ITL data. Both failed before the fix.
+
+## ITL from a streamed framework is a delivery distribution
+
+The decode-curve `itl_ms` is built from AsyncLLM stream chunks (`stream_itl.py`). A chunk may carry several tokens:
+the tokens that arrive with the first chunk get zero-length gaps and the tokens of a later chunk share that chunk's
+gap. So `itl_ms` is a distribution of delivery gaps, not per-token latency; TPOT, `(e2e - ttft) / (osl - 1)`, is the
+number comparable across frameworks. The sample count is always `osl - 1`: a stream that generated another number of
+tokens is an error naming vllm and the count (`StoppedEarly`).

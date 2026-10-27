@@ -23,10 +23,10 @@
 //! planner's shape contract cannot produce.
 
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 
 pub fn __poot_kernel_packed_bf16_row_gather(table_words: &[u32], index: &[i32], out: &mut [f32]) {
-    let i = thread_index();
+    let i = thread_index_x();
     // `index.len() > 0` rather than `!index.is_empty()`: the importer admits `len()` but rejects a call to
     // `is_empty`. An empty index with a non-empty output cannot be planned, so this only guards the
     // division below.

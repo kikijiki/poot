@@ -39,10 +39,9 @@ pub(super) fn run_step(
         inputs.insert(id, Value::from(t));
     }
     for (i, (input, _)) in g.state().enumerate() {
-        let t = state
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| HostTensor::zeros(g.aval(input).shape.clone()));
+        let t = state.get(i).cloned().unwrap_or_else(|| {
+            HostTensor::zeros_of(g.aval(input).dtype, g.aval(input).shape.clone())
+        });
         inputs.insert(input, Value::from(t));
     }
     let evaluation = poot_eval::eval(g, &inputs, EvalOptions::default()).unwrap();

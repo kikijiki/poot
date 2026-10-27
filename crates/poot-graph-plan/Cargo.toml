@@ -26,7 +26,7 @@ poot-kernel-ir = { workspace = true, features = ["serde"] }
 poot-kernelgen.workspace = true
 poot-quant.workspace = true
 poot-weights.workspace = true
-poot-runtime-common.workspace = true
+poot-npu-artifacts.workspace = true
 poot-target.workspace = true
 poot-tensor.workspace = true
 thiserror.workspace = true
@@ -53,6 +53,7 @@ poot-eval = { workspace = true, features = ["test-support"] }
 # item in `src/` (predicates.rs's own twin) is invisible to those (card 522).
 poot-test-util.workspace = true
 # The AIE bind-check fixtures `kernel_mapping`'s tests drive (`check_aie_bindings`, `core_lengths`).
+poot-npu-artifacts = { workspace = true, features = ["test-support"] }
 poot-runtime-common = { workspace = true, features = ["test-support"] }
 
 [lints]

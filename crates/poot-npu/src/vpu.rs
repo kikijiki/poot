@@ -29,16 +29,15 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
-use poot_executor::{Arg, Device, DeviceTime, Dispatch, LaunchKind, VpuInvocation};
-use poot_graph_plan::Target;
+use poot_codegen::{CompiledKernel, KernelCode};
+use poot_executor::{Arg, Device, DeviceTime, Dispatch, LaunchKind, RegionLoader};
+use poot_graph_plan::{NpuTarget, Target};
 use poot_l0_runtime::{
     GraphDirection, GraphIr, GraphPrecision, L0Context, L0Error, L0Graph, L0HostBuffer,
     L0Recording, L0RecordingBuilder,
 };
-use poot_runtime_common::{
-    AllocGuard, BufferRole, CompiledKernel, KernelCode, MemoryCounterSnapshot, MemoryCounters,
-    VpuBinding, VpuGraphArtifact, VpuLayer,
-};
+use poot_npu_artifacts::{VpuBinding, VpuGraphArtifact, VpuInvocation, VpuLayer};
+use poot_runtime_common::{AllocGuard, BufferRole, MemoryCounterSnapshot, MemoryCounters};
 use poot_target::{
     BufferStorage, ElementKind, NarrowingContract, Queried, TargetId, VendorCompilerId, VpuCaps,
     VpuTargetId,
@@ -46,6 +45,7 @@ use poot_target::{
 
 use crate::blob_cache::{BlobCache, BlobKey};
 use crate::range_guard::{Direction, GuardArg, RangeCheck, RangeGuard, RangeViolation};
+use crate::region_loader::VpuRegionLoader;
 
 /// The PCI vendor id of Intel.
 const INTEL_VENDOR_ID: u32 = 0x8086;
@@ -361,6 +361,8 @@ pub struct VpuRecording {
 pub struct VpuDevice {
     context: L0Context,
     caps: VpuCaps,
+    /// Builds this device's graph artifacts for the engine (see [`RegionLoader`]).
+    loader: VpuRegionLoader,
     counters: MemoryCounters,
     config: VpuConfig,
     cache: BlobCache,
@@ -419,6 +421,7 @@ impl VpuDevice {
         Ok(Self {
             context,
             caps,
+            loader: VpuRegionLoader::new(caps.target),
             counters: MemoryCounters::new(),
             config,
             cache,
@@ -610,10 +613,14 @@ impl Device for VpuDevice {
     }
 
     fn target(&self) -> Target {
-        Target::Vpu {
+        Target::Npu(NpuTarget::Vpu {
             target: self.caps.target,
             caps: self.caps,
-        }
+        })
+    }
+
+    fn region_loader(&self) -> Option<&dyn RegionLoader> {
+        Some(&self.loader)
     }
 
     fn memory(&self) -> Vec<(BufferRole, MemoryCounterSnapshot)> {
@@ -998,7 +1005,7 @@ fn check_bindings(kernel: &LoadedKernel, args: &[&Arg<'_, VpuDevice>]) -> Result
                 binding.storage, arg.buffer.0.storage
             )));
         }
-        if u64::from(arg.elems) != binding.elements {
+        if arg.elems as u64 != binding.elements {
             return Err(refuse(format!(
                 "argument {index} is {} elements, the dispatch binds {}",
                 binding.elements, arg.elems

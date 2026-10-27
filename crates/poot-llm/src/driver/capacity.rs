@@ -24,17 +24,17 @@
 //! role counters against the plan and the budget before anything serves.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
+use poot_codegen::CompiledKernel;
 use poot_executor::{
     Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine, ExecError, Executor,
     NativeCounters, SharedKernels, SharedKernelsMismatch, SupportBound, WeightUpload,
 };
 use poot_graph_plan::{Target, multi_device::topology::DeviceId, staged::TargetSet};
 use poot_models::io::InputId;
-use poot_runtime_common::{
-    AllocGuard, BufferRole, CompiledKernel, MemoryCounterSnapshot, MemoryCounters,
-};
+use poot_runtime_common::{AllocGuard, BufferRole, MemoryCounterSnapshot, MemoryCounters};
 use poot_target::BufferStorage;
 
 use super::error::DriverError;
@@ -53,6 +53,31 @@ pub struct AllocationOwner {
     pub role: BufferRole,
     /// The allocation's size in bytes.
     pub bytes: u64,
+    /// What one buffer holds, or `None` for a total over several buffers.
+    pub lane: Option<Lane>,
+}
+
+/// The element lane and count of one device buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lane {
+    /// The lane the engine allocated it in: its dtype and packing.
+    pub storage: BufferStorage,
+    /// Native device elements of `storage` it holds.
+    pub elems: u64,
+}
+
+impl AllocationOwner {
+    /// The owner as one line of a budget report: size, role, lane, element count and name.
+    pub fn describe(&self) -> String {
+        let gib = self.bytes as f64 / (1u64 << 30) as f64;
+        match self.lane {
+            Some(Lane { storage, elems }) => format!(
+                "{gib:.2} GiB {:?} {storage:?} x {elems} {}",
+                self.role, self.id
+            ),
+            None => format!("{gib:.2} GiB {:?} {}", self.role, self.id),
+        }
+    }
 }
 
 /// A footprint that cannot be composed.
@@ -285,7 +310,9 @@ pub enum CapacityRefusal {
     /// A device's owned bytes plus what the ledger still charges are over its budget less its
     /// reserve.
     #[error(
-        "{device:?} needs {required} bytes plus {charged} still charged, over the {available} bytes available"
+        "{device:?} needs {required} bytes plus {charged} still charged, {} over the {available} bytes available; largest allocations:{}",
+        required.saturating_add(*charged).saturating_sub(*available),
+        LargestAllocations(largest)
     )]
     OverBudget {
         /// The device that is over.
@@ -296,6 +323,8 @@ pub enum CapacityRefusal {
         charged: u64,
         /// Bytes its budget leaves after the reserve.
         available: u64,
+        /// The biggest allocations the footprint owns on the device, largest first.
+        largest: Vec<AllocationOwner>,
     },
     /// A role holds more live bytes than its plan allocated: the plan under-counted, so its admission
     /// proved nothing.
@@ -313,6 +342,34 @@ pub enum CapacityRefusal {
     /// The footprint itself could not be composed.
     #[error(transparent)]
     Footprint(#[from] CapacityError),
+}
+
+/// How many allocations an over-budget refusal names.
+const LARGEST_NAMED: usize = 8;
+
+/// The allocations of an over-budget refusal, one per line.
+struct LargestAllocations<'a>(&'a [AllocationOwner]);
+
+impl std::fmt::Display for LargestAllocations<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for owner in self.0 {
+            write!(f, "\n  {}", owner.describe())?;
+        }
+        Ok(())
+    }
+}
+
+impl Footprint {
+    /// The `count` biggest allocations `device` owns, largest first.
+    pub fn largest(&self, device: DeviceId, count: usize) -> Vec<AllocationOwner> {
+        let mut owned: Vec<&AllocationOwner> = self
+            .owners
+            .values()
+            .filter(|owner| owner.device == device)
+            .collect();
+        owned.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.id.cmp(&b.id)));
+        owned.into_iter().take(count).cloned().collect()
+    }
 }
 
 impl Budget {
@@ -388,6 +445,7 @@ impl Budget {
                     required,
                     charged,
                     available,
+                    largest: footprint.largest(device, LARGEST_NAMED),
                 });
             }
         }
@@ -559,6 +617,7 @@ pub fn verify_prepared(
                 device,
                 role,
                 bytes,
+                lane: None,
             })?;
         }
     }
@@ -653,6 +712,137 @@ pub enum PlanError {
     SharedKernels(#[from] SharedKernelsMismatch),
 }
 
+/// Bytes kept back on every device for allocations the planner cannot see: recordings, staging and
+/// driver state a runtime makes on its own. A bound, not a measurement; the live counters are checked
+/// against the budget less this after prepare.
+pub const SUPPORT_RESERVE_BYTES: u64 = 256 << 20;
+
+/// The environment variable that makes the driver log the device memory at each phase of its lifetime.
+pub const DEVICE_MEMORY_LOG_ENV: &str = "POOT_DEVICE_MEMORY_LOG";
+
+/// With [`DEVICE_MEMORY_LOG_ENV`] set (read once), log one `device_memory` event per device at `phase`: what
+/// the runtime reports free and what the process holds by its own counters. Reading these in order finds the
+/// phase where a plan and the device part ways (POOT-1347); the events are `info` on target
+/// `poot_llm::device_memory`, and nothing is read or formatted when the variable is unset.
+pub(crate) fn log_device_memory(executor: &dyn Executor, phase: &str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os(DEVICE_MEMORY_LOG_ENV).is_some()) {
+        return;
+    }
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    for observed in Observation::of(executor).devices {
+        tracing::info!(
+            target: "poot_llm::device_memory",
+            phase,
+            device = ?observed.device,
+            free_gib = observed.free_bytes.map(gib),
+            held_gib = gib(observed.held_bytes),
+            "device_memory"
+        );
+    }
+}
+
+/// Why a workload was not admitted before anything was allocated.
+#[derive(Debug, thiserror::Error)]
+pub enum AdmitError {
+    /// The workload could not be planned.
+    #[error(transparent)]
+    Plan(#[from] PlanError),
+    /// Not even the smallest prefill chunk fits the device: the refusal is that chunk's, naming the
+    /// biggest allocations and the shortfall.
+    #[error("no prefill chunk fits the device; at the smallest, {chunk} tokens: {refusal}")]
+    NoChunkFits {
+        /// The smallest chunk tried.
+        chunk: NonZeroUsize,
+        /// Why its footprint was refused.
+        refusal: CapacityRefusal,
+    },
+    /// A footprint could not be composed.
+    #[error(transparent)]
+    Footprint(#[from] CapacityError),
+}
+
+/// The prefill chunks to try for a prompt of up to `desired` tokens, largest first: `desired`, then each
+/// half rounded down to a multiple of `granule` (a chunk is a granule multiple), down to one granule.
+pub fn chunk_candidates(desired: NonZeroUsize, granule: NonZeroUsize) -> Vec<NonZeroUsize> {
+    let granule = granule.get();
+    let mut chunks = vec![desired];
+    let mut chunk = desired.get();
+    while chunk > granule {
+        chunk = (chunk / 2 / granule).max(1) * granule;
+        chunks.push(NonZeroUsize::new(chunk).expect("a granule multiple"));
+    }
+    chunks
+}
+
+/// The prefill chunk a workload runs with, and the footprint that chunk plans.
+#[derive(Debug)]
+pub struct FittedChunk {
+    /// The largest candidate whose footprint fits the device (the first candidate when it fits, or
+    /// when the device cannot say how much memory it has).
+    pub chunk: NonZeroUsize,
+    /// What the chunk allocates, or `None` where the device's budget is unknown and nothing was admitted.
+    pub footprint: Option<Footprint>,
+}
+
+/// Choose the prefill chunk of `shapes` on the one device of `targets` before the driver allocates a
+/// byte: each candidate (largest first, see [`chunk_candidates`]) is planned over a recording device,
+/// nothing uploaded, and the first whose footprint fits what the device reports it can allocate now (`observe`, read once per candidate), less
+/// [`SUPPORT_RESERVE_BYTES`], is chosen. A workload that fits at the first candidate runs with it, exactly
+/// as without this call. A device that cannot report its free memory admits nothing and keeps the first
+/// candidate. When no candidate fits the smallest one's [`CapacityRefusal::OverBudget`] names the largest
+/// allocations and the shortfall. `options.prefill_chunk` is replaced by each candidate; the caller
+/// prepares the chosen chunk with the same `shapes`.
+pub fn fit_prefill_chunk(
+    handle: &Arc<ModelHandle>,
+    targets: &TargetSet,
+    mut observe: impl FnMut() -> Observation,
+    options: &DriverOptions,
+    shapes: &ServingShapes<'_>,
+    candidates: &[NonZeroUsize],
+) -> Result<FittedChunk, AdmitError> {
+    let planner =
+        Planner::new(Arc::clone(handle), targets, Placement::Single).map_err(PlanError::from)?;
+    let observe = || Budget::observed(&observe(), SUPPORT_RESERVE_BYTES);
+    let fit = fit(
+        candidates,
+        |&chunk| {
+            let options = DriverOptions {
+                prefill_chunk: chunk,
+                ..options.clone()
+            };
+            planner
+                .plan(options, shapes, &[])
+                .map_err(PlanFailure::Fatal)
+        },
+        observe,
+    );
+    match fit {
+        Ok(fit) => Ok(FittedChunk {
+            chunk: fit.chosen,
+            footprint: Some(fit.footprint),
+        }),
+        Err(FitError::Plan(error)) => Err(error.into()),
+        Err(FitError::Footprint(error)) => Err(error.into()),
+        Err(FitError::NoCandidateFits { mut rejected }) => {
+            let Some(Rejected { candidate, why }) = rejected.pop() else {
+                unreachable!("a candidate list is not empty");
+            };
+            match why {
+                Rejection::Capacity(CapacityRefusal::UnknownBudget { .. }) => Ok(FittedChunk {
+                    chunk: candidates[0],
+                    footprint: None,
+                }),
+                Rejection::Capacity(refusal) => Err(AdmitError::NoChunkFits {
+                    chunk: candidate,
+                    refusal,
+                }),
+                Rejection::Shape(error) => Err(error.into()),
+            }
+        }
+    }
+}
+
 /// Plans candidate footprints for one model on its target devices without touching one.
 pub struct Planner {
     handle: Arc<ModelHandle>,
@@ -661,7 +851,7 @@ pub struct Planner {
     /// kernel. A coordinator builds its engines itself, so a placed plan resolves its own kernels.
     kernels: SharedKernels,
     /// Pool rows per routed selection when the planned drivers page their experts.
-    pool: Option<std::num::NonZeroUsize>,
+    pool: Option<NonZeroUsize>,
 }
 
 impl Planner {
@@ -686,7 +876,7 @@ impl Planner {
     /// ([`Driver::with_expert_pool`]): the pool rows, the maps and the entries' arenas are what the
     /// production preparation allocates, so the footprint carries them. The refills write through the
     /// device's own staging, which the budget's runtime reserve covers.
-    pub fn with_expert_pool(mut self, slots_per_layer: std::num::NonZeroUsize) -> Self {
+    pub fn with_expert_pool(mut self, slots_per_layer: NonZeroUsize) -> Self {
         self.pool = Some(slots_per_layer);
         self
     }
@@ -797,6 +987,10 @@ impl Planner {
                     device: record.device,
                     role: record.role,
                     bytes: record.bytes,
+                    lane: Some(Lane {
+                        storage: record.storage,
+                        elems: record.elems,
+                    }),
                 })?;
             }
         }
@@ -822,6 +1016,8 @@ struct Record {
     device: DeviceId,
     role: BufferRole,
     bytes: u64,
+    storage: BufferStorage,
+    elems: u64,
     live: bool,
 }
 
@@ -895,15 +1091,29 @@ impl Device for PlanningDevice {
         storage: BufferStorage,
         elems: usize,
     ) -> Result<PlanningBuffer, PlanningOnly> {
+        self.allocate_named("unnamed", role, storage, elems)
+    }
+
+    /// Keeps the engine's name for the allocation, so a footprint and a budget refusal name the weight,
+    /// state or arena slot rather than a position.
+    fn allocate_named(
+        &mut self,
+        name: &str,
+        role: BufferRole,
+        storage: BufferStorage,
+        elems: usize,
+    ) -> Result<PlanningBuffer, PlanningOnly> {
         let bytes = (elems as u64).saturating_mul(storage.element().byte_width() as u64);
         let guard = self.counters.record_alloc(role, bytes);
         let mut records = self.records.lock().expect("planning records");
         let index = records.len();
         records.push(Record {
-            id: format!("{role:?}#{index}"),
+            id: format!("{name} #{index}"),
             device: self.id,
             role,
             bytes,
+            storage,
+            elems: elems as u64,
             live: true,
         });
         Ok(PlanningBuffer {
@@ -1023,6 +1233,7 @@ mod tests {
             device,
             role,
             bytes,
+            lane: None,
         }
     }
 
@@ -1160,6 +1371,7 @@ mod tests {
                 required: DRAFT_WEIGHTS,
                 charged: 0,
                 available: DRAFT_WEIGHTS - 1,
+                largest: footprint.largest(D1, LARGEST_NAMED),
             })
         );
     }
@@ -1420,6 +1632,7 @@ mod tests {
                 required: 100,
                 charged: 0,
                 available: 90,
+                largest: vec![owner("live State", D1, BufferRole::State, 100)],
             })
         );
     }
@@ -1480,6 +1693,10 @@ mod tests {
                 required: 150,
                 charged: 0,
                 available: 120,
+                largest: vec![
+                    owner("live State", D0, BufferRole::State, 100),
+                    owner("live Staging", D0, BufferRole::Staging, 50),
+                ],
             })
         );
     }
@@ -1607,6 +1824,7 @@ mod tests {
                 required: need,
                 charged: 0,
                 available: need - 1,
+                largest: pooled.footprint.largest(D0, LARGEST_NAMED),
             })
         );
         assert!(

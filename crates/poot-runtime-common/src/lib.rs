@@ -4,43 +4,41 @@
 pub mod device_skip;
 mod dl;
 mod identity;
-mod kernel;
 mod memory;
 mod ring;
 pub mod telemetry;
-mod vpu;
 pub mod vulkan_probe;
 pub use dl::{DlError, Library, LoadScope};
 pub use identity::DeviceIdentity;
-pub use kernel::{
-    AieArena, AieArtifactError, AieBinding, AieLinkedArtifact, AieShapeAbi, ArgAccess, ArgSchema,
-    CompiledKernel, KernelArgError, KernelCode, check_element_schema, check_kernel_args,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use kernel::{AieBindError, AieBound, check_aie_bindings};
 pub use memory::{AllocGuard, BufferRole, MemoryCounterSnapshot, MemoryCounters};
 pub use ring::{RING_SLOTS, RingCursor, UPLOAD_CHUNK_BYTES, chunks, overlaps, slot_bytes};
 pub use telemetry::{
     CallCounts, CallPurpose, Coverage, ExecutionCounters, TransferCounts, TransferDirection,
 };
-pub use vpu::{VpuArtifactError, VpuBinding, VpuGraphArtifact, VpuLayer};
 
 /// Failure while converting a logical element count into a native buffer layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutError {
-    /// The logical element count does not fit the native u32 length ABI.
+    /// The logical element count does not fit a backend's 32-bit kernel-length ABI
+    /// ([`kernel_len_u32`]); only a backend whose kernels take `u32` lengths raises it.
     ElementCountTooLarge,
     /// Multiplying the element count by its storage width overflowed `usize`.
     ByteSizeOverflow,
 }
 
-/// Validate the native u32 element-count ABI and compute the allocation size in bytes.
-pub fn checked_layout(elements: usize, element_bytes: usize) -> Result<(u32, usize), LayoutError> {
-    let elem_count = u32::try_from(elements).map_err(|_| LayoutError::ElementCountTooLarge)?;
-    let byte_capacity = elements
+/// The allocation size in bytes of `elements` elements of `element_bytes` each. The element count
+/// itself is 64-bit everywhere: the only bound a count has here is the byte size it implies.
+pub fn checked_byte_capacity(elements: usize, element_bytes: usize) -> Result<usize, LayoutError> {
+    elements
         .checked_mul(element_bytes)
-        .ok_or(LayoutError::ByteSizeOverflow)?;
-    Ok((elem_count, byte_capacity))
+        .ok_or(LayoutError::ByteSizeOverflow)
+}
+
+/// `elements` as the `u32` length a 32-bit kernel ABI (WGSL/SPIR-V storage arrays) passes. A backend
+/// with 64-bit kernel lengths (PTX, ROCm) never calls this; one without it refuses a larger buffer
+/// with a typed error instead of truncating the length.
+pub fn kernel_len_u32(elements: usize) -> Result<u32, LayoutError> {
+    u32::try_from(elements).map_err(|_| LayoutError::ElementCountTooLarge)
 }
 
 /// A validated byte range inside a native buffer: the span a backend copy may touch.
@@ -85,12 +83,12 @@ pub fn checked_copy_range(
     elements: usize,
     element_bytes: usize,
     whole_buffer: bool,
-    elem_count: u32,
+    elem_count: usize,
     byte_capacity: usize,
 ) -> Result<CopyRange, CopyRangeError> {
-    if whole_buffer && (element_offset != 0 || elements != elem_count as usize) {
+    if whole_buffer && (element_offset != 0 || elements != elem_count) {
         return Err(CopyRangeError::SizeMismatch {
-            have: elem_count as usize,
+            have: elem_count,
             got: elements,
         });
     }
@@ -266,16 +264,19 @@ mod tests {
         assert_eq!(fnv1a_bytes(b"foobar"), 0x85944171f73967e8);
     }
 
+    /// A count past `u32` is a valid 64-bit layout (the byte size is the only bound); only the 32-bit
+    /// kernel-length conversion refuses it, and a byte-size overflow is its own error.
     #[test]
-    fn checked_layout_reports_each_overflow() {
-        if let Some(elements) = (u32::MAX as usize).checked_add(1) {
-            assert_eq!(
-                checked_layout(elements, 1),
-                Err(LayoutError::ElementCountTooLarge)
-            );
-        }
+    fn layout_bounds_bytes_and_only_the_u32_kernel_length_bounds_the_count() {
+        let past_u32 = u32::MAX as usize + 1;
+        assert_eq!(checked_byte_capacity(past_u32, 4), Ok(past_u32 * 4));
         assert_eq!(
-            checked_layout(2, usize::MAX),
+            kernel_len_u32(past_u32),
+            Err(LayoutError::ElementCountTooLarge)
+        );
+        assert_eq!(kernel_len_u32(u32::MAX as usize), Ok(u32::MAX));
+        assert_eq!(
+            checked_byte_capacity(2, usize::MAX),
             Err(LayoutError::ByteSizeOverflow)
         );
     }

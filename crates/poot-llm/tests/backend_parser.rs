@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 
 /// The workspace root: this package is `crates/poot-llm`.
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
+    poot_test_util::repo_root()
         .canonicalize()
         .expect("the workspace root")
 }

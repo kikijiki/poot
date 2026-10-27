@@ -82,7 +82,7 @@ export default function FusionDiagram(): React.ReactElement {
           <div style={{ fontSize: '0.74rem', color: 'var(--ifm-color-emphasis-600)', marginBottom: 8, textAlign: 'center' }}>
             9 primitive eqns -&gt; 9 separate kernel dispatches. Hover to highlight.
           </div>
-          <svg width={SVG_W} height={SVG_H} viewBox={`0 0 ${SVG_W} ${SVG_H}`} style={{ display: 'block', margin: '0 auto', maxWidth: '100%' }}>
+          <svg role="img" aria-label="The attention subgraph unfused: nine primitive eqns, nine dispatches" width={SVG_W} height={SVG_H} viewBox={`0 0 ${SVG_W} ${SVG_H}`} style={{ display: 'block', margin: '0 auto', maxWidth: '100%' }}>
             <defs>
               <marker id="arr2" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
                 <polygon points="0 0, 7 2.5, 0 5" fill="#bbb" />
@@ -133,7 +133,7 @@ export default function FusionDiagram(): React.ReactElement {
           <div style={{ fontSize: '0.74rem', color: 'var(--ifm-color-emphasis-600)', marginBottom: 8, textAlign: 'center' }}>
             After compile's flash-attention rewrite: both matmuls, scale, mask, and softmax -&gt; one fused dispatch.
           </div>
-          <svg width={SVG_W} height={FUSED_SVG_H} viewBox={`0 0 ${SVG_W} ${FUSED_SVG_H}`} style={{ display: 'block', margin: '0 auto', maxWidth: '100%' }}>
+          <svg role="img" aria-label="The attention subgraph fused: one flash attention eqn, one dispatch" width={SVG_W} height={FUSED_SVG_H} viewBox={`0 0 ${SVG_W} ${FUSED_SVG_H}`} style={{ display: 'block', margin: '0 auto', maxWidth: '100%' }}>
             <defs>
               <marker id="arr3" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
                 <polygon points="0 0, 7 2.5, 0 5" fill="#bbb" />

@@ -570,7 +570,8 @@ fn equations_the_npu_cannot_lower_are_refused_with_typed_capabilities() {
     use poot_graph_plan::Capability;
     let Some(npu) = npu() else { return };
     let target = npu.engine.device().target();
-    let poot_graph_plan::Target::Vpu { target: id, caps } = target else {
+    let poot_graph_plan::Target::Npu(poot_graph_plan::NpuTarget::Vpu { target: id, caps }) = target
+    else {
         panic!("the NPU device plans for a Vpu target");
     };
     let add_of = |dtype: DType| {
@@ -589,13 +590,13 @@ fn equations_the_npu_cannot_lower_are_refused_with_typed_capabilities() {
         refusal.target,
         poot_target::TargetId::Vpu(poot_target::VpuTargetId::Npu4)
     );
-    let uncontracted = poot_graph_plan::Target::Vpu {
+    let uncontracted = poot_graph_plan::Target::Npu(poot_graph_plan::NpuTarget::Vpu {
         target: id,
         caps: poot_target::VpuCaps {
             narrowing: None,
             ..caps
         },
-    };
+    });
     assert_eq!(
         refusal_of(add_of(DType::F32), uncontracted).missing,
         Capability::NarrowingContract { dtype: DType::F32 }
@@ -664,9 +665,10 @@ fn every_buffer_is_released_when_the_executable_is_unloaded() {
             poot_executor_parity::fixture_weights(fixture),
         )
         .expect("the weights load");
+    let program = poot_executor_parity::staged_on(&npu.engine, fixture, target);
     let entry = npu
         .engine
-        .add_entry(exe, &poot_executor_parity::staged(fixture, target))
+        .add_entry(exe, &program)
         .expect("the entry compiles and loads");
     let mut inputs = StepInputs::new();
     for step in &fixture.steps[0] {

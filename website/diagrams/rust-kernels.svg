@@ -46,7 +46,7 @@
   <text class="code" xml:space="preserve" x="60" y="256">    b: &amp;[f32],</text>
   <text class="code" xml:space="preserve" x="60" y="278">    out: &amp;mut [f32],</text>
   <text class="code" xml:space="preserve" x="60" y="300">) {</text>
-  <text class="code" xml:space="preserve" x="60" y="322">    let i = thread_index();</text>
+  <text class="code" xml:space="preserve" x="60" y="322">    let i = thread_index_x();</text>
   <text class="code" xml:space="preserve" x="60" y="344">    if i &lt; out.len() {</text>
   <text class="code" xml:space="preserve" x="60" y="366">        out[i] = a[i] + b[i];</text>
   <text class="code" xml:space="preserve" x="60" y="388">    }</text>
@@ -74,26 +74,22 @@
 
   <text class="n" x="40" y="496">Kernels written this way</text>
   <g class="teal" fill="none">
-    <rect class="box teal" x="40" y="514" width="150" height="36" rx="8"/>
-    <text class="m" style="font-size:14px" x="115" y="537">gemv_coalesced</text>
-    <rect class="box teal" x="202" y="514" width="217" height="36" rx="8"/>
-    <text class="m" style="font-size:14px" x="310" y="537">gemv_batched_coalesced</text>
-    <rect class="box teal" x="431" y="514" width="200" height="36" rx="8"/>
-    <text class="m" style="font-size:14px" x="531" y="537">tiled_gemm_coarsened</text>
-    <rect class="box teal" x="643" y="514" width="183" height="36" rx="8"/>
-    <text class="m" style="font-size:14px" x="734" y="537">tiled_gemm_batched</text>
-    <rect class="box teal" x="838" y="514" width="217" height="36" rx="8"/>
-    <text class="m" style="font-size:14px" x="946" y="537">packed_bf16_row_gather</text>
-    <rect class="box teal" x="40" y="562" width="217" height="36" rx="8"/>
-    <text class="m" style="font-size:14px" x="148" y="585">packed_e4m3_row_gather</text>
-    <rect class="box teal" x="269" y="562" width="133" height="36" rx="8"/>
-    <text class="m" style="font-size:14px" x="335" y="585">argmax_chunk</text>
-    <rect class="box teal" x="414" y="562" width="150" height="36" rx="8"/>
-    <text class="m" style="font-size:14px" x="489" y="585">argmax_combine</text>
-    <rect class="box teal" x="576" y="562" width="150" height="36" rx="8"/>
-    <text class="m" style="font-size:14px" x="651" y="585">random_uniform</text>
-    <rect class="box teal" x="738" y="562" width="268" height="36" rx="8"/>
-    <text class="m" style="font-size:14px" x="872" y="585">sample_gumbel_argmax_batched</text>
+    <rect class="box teal" x="40" y="514" width="217" height="36" rx="8"/>
+    <text class="m" style="font-size:14px" x="148" y="537">packed_bf16_row_gather</text>
+    <rect class="box teal" x="269" y="514" width="217" height="36" rx="8"/>
+    <text class="m" style="font-size:14px" x="377" y="537">packed_e4m3_row_gather</text>
+    <rect class="box teal" x="498" y="514" width="183" height="36" rx="8"/>
+    <text class="m" style="font-size:14px" x="589" y="537">packed_bf16_to_f32</text>
+    <rect class="box teal" x="693" y="514" width="133" height="36" rx="8"/>
+    <text class="m" style="font-size:14px" x="759" y="537">argmax_chunk</text>
+    <rect class="box teal" x="838" y="514" width="150" height="36" rx="8"/>
+    <text class="m" style="font-size:14px" x="913" y="537">argmax_combine</text>
+    <rect class="box teal" x="40" y="562" width="150" height="36" rx="8"/>
+    <text class="m" style="font-size:14px" x="115" y="585">random_uniform</text>
+    <rect class="box teal" x="202" y="562" width="268" height="36" rx="8"/>
+    <text class="m" style="font-size:14px" x="336" y="585">sample_gumbel_argmax_batched</text>
+    <rect class="box teal" x="482" y="562" width="116" height="36" rx="8"/>
+    <text class="m" style="font-size:14px" x="540" y="585">copy_words</text>
   </g>
   <text class="n" x="40" y="640">Anything outside the accepted Rust subset gets a named diagnostic, never a silent miscompile.</text>
 </svg>

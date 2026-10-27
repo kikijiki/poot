@@ -6,63 +6,63 @@
       "repeats": [
         {
           "metrics": {
-            "step_us": 84.5
+            "step_us": 180.732
           },
           "slot": 0,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 85.819
+            "step_us": 177.187
           },
           "slot": 1,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 84.35000000000001
+            "step_us": 176.044
           },
           "slot": 2,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 84.5
+            "step_us": 177.456
           },
           "slot": 3,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 84.169
+            "step_us": 176.014
           },
           "slot": 4,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 85.22
+            "step_us": 176.095
           },
           "slot": 5,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 90.25
+            "step_us": 180.251
           },
           "slot": 6,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 86.479
+            "step_us": 181.493
           },
           "slot": 7,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 84.71
+            "step_us": 179.379
           },
           "slot": 8,
           "status": "ok"
@@ -80,6 +80,11 @@
       "live_bytes": 1048576,
       "peak_bytes": 1048576,
       "role": "Activation"
+    },
+    {
+      "live_bytes": 320,
+      "peak_bytes": 320,
+      "role": "Meta"
     }
   ],
   "observed": {
@@ -94,13 +99,13 @@
     "weight_copies": 16
   },
   "plan": [
-    "contraction:tiled_region [b31ddc7486f253dedf6bbfaa598ab37099223efe5c7cc9f991f2d5a9aec0fcdf]"
+    "contraction:dense_tiled [e75fbc3f8a6ade0adda4fca9b0875fddb0ebe148fe7d808b2382384b956e31b9]"
   ],
-  "plan_id": "a875523b76f016fd6d38028c60d54b5b2502b02781d44ddc2782685d86e8cfb2",
+  "plan_id": "1ae023d19980ec59e1ef7aab0ceb718f4fef3cfb25cb7db9adb0cfb65368cef7",
   "recordings": 16,
   "reference": {
     "agrees": true,
-    "max_relative_error": 3.450093914121139e-05,
+    "max_relative_error": 3.6710963312382336e-05,
     "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
     "provenance": "independent-golden",
     "tolerance": 0.002
@@ -113,7 +118,7 @@
     "run",
     "--release",
     "-p",
-    "poot-ptx-gpu",
+    "poot-ptx-device",
     "--example",
     "performance_bank",
     "--",
@@ -124,8 +129,8 @@
     "--out",
     "benchmarks/performance-bank/receipts/ptx/batched-decode-gemm.json"
   ],
-  "parent_revision": "e178f51722183668cf2f554e21b0dca17d3b0caf",
-  "binary_sha256": "f03b4e410ae08055bb6182e107411087d132ac4ff8db8e61de347c3bb4c3eec1",
+  "parent_revision": "ce0d5a1ec6adf1a248789951101210d9493c4762",
+  "binary_sha256": "f3d48cded04c71a1e921a19a9b78d949e6587f9090f8feb6726c4ae41ff1ac57",
   "identity": {
     "checkpoint_digest": "synthetic-no-checkpoint",
     "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
@@ -157,8 +162,8 @@
       "profiled": false
     },
     "backend": "ptx",
-    "device": "NVIDIA GeForce RTX 3090",
-    "driver": "driver 580.65.06"
+    "device": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "driver": "595.91.07"
   },
   "identity_digest": "f3f5253f9609272ca971cc3f5f97383f79217d3c74c17be0284c97cc08ec5dd6",
   "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"

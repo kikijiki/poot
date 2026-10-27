@@ -8,7 +8,7 @@
 //! (the rare layout-op fallback), or alias an input buffer (reshape). The wgpu, PTX, ROCm, and restricted
 //! raw-Vulkan GPU executors consume this planner with `Backend::SpirvVulkan`, `Backend::Nvptx`, or
 //! `Backend::AmdGcn`; target compilation and recorder dispatch remain runtime-specific. An AIE target
-//! (`Target::Aie`, carrying `AieCaps`, never GPU caps) plans the same requests under a sequential one-core schedule instead of a thread grid
+//! (`Target::Npu` carrying `AieCaps`, never GPU caps) plans the same requests under a sequential one-core schedule instead of a thread grid
 //! (POOT-664); a plan that is not that schedule is refused with `Capability::AieSchedule`. The generated
 //! `Body` is named `"k"`, the
 //! shared entry point used by the GPU emitters.
@@ -63,6 +63,7 @@ mod buffer_plan;
 mod compile;
 mod graph_validation;
 mod kernel_mapping;
+mod npu;
 /// Graph-to-graph transforms (card 626): private, so [`compile`] is their only caller anywhere outside
 /// this crate. `packed_bind`'s weight-binding API is the one carve-out, re-exported `pub` below (it is
 /// checkpoint-loading machinery, not a `compile` pass).
@@ -79,8 +80,8 @@ pub use compile::{
 };
 pub use imported::ImportedKernel;
 #[cfg(any(test, feature = "test-support"))]
-pub use imported::{AssetDest, AssetEntry, MANIFEST};
-pub use kernel_mapping::{AieAbiRefusal, AieLimitRefusal, aie_shape_abi, validate_linked_artifact};
+pub use imported::{AssetDest, AssetEntry, MANIFEST, ProbeKernel};
+pub use npu::{AieAbiRefusal, NpuHandle, NpuLowering, NpuRegionRefusal, NpuTarget};
 pub use passes::{
     AttentionDecline, BoundaryDescriptor, EXPERT_POOL, EXPERT_POOL_MAP, ExpertStackRefusal,
     FusionDecline, FusionDeclineReason, LORA_IDX, LegalizeError, PackedBindError, PackedConst,
@@ -97,12 +98,12 @@ pub use graph_validation::{ValidationPacketPlan, ValidationPacketSource};
 #[cfg(any(test, feature = "test-support"))]
 pub use passes::{
     RoutedExpertSite, canonicalize, collapse_reshape_chains, cse, dce, elide_noop_transposes,
-    flash_attention_capped, fold_iota, fuse, legalize, passes_without_target, rope_fusion,
+    flash_attention, fold_iota, fuse, legalize, passes_without_target, rope_fusion,
     routed_expert_sites,
 };
 pub use planner::{KernelChoice, NoDispatch, Planned, region_member_work};
 #[cfg(any(test, feature = "test-support"))]
-pub use planner::{plan_eqn, plan_eqn_choice, plan_eqn_views, vpu_refusals};
+pub use planner::{plan_eqn, plan_eqn_choice, plan_eqn_views};
 pub use predicates::{compute_views, numel, value_ids};
 pub use refusal::{Capability, FusedStepGap, Refusal, RefusalDtypes, StorageGap};
 pub use types::{
@@ -113,9 +114,9 @@ pub use types::{
 #[cfg(test)]
 mod tests;
 
-/// CPU-oracle workgroup-interp tests for the coalesced decode-GEMV bodies (tile-ragged N/K, batched).
+/// Reference-interpreter parity of the generated decode GEMV and tiled GEMM across their launch-size triggers.
 #[cfg(test)]
-mod tests_gemv_coalesced;
+mod tests_contraction_parity;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

@@ -20,7 +20,7 @@ list, or a scripts/required-device-cases/<lane>.txt list), or be deleted: an ign
 
 The classes are scripts/test-model-free-inventory.tsv's. The required-checkpoint list is hand-maintained
 (`lane<TAB>binary id<TAB>test name`, sorted) and never generated from a run, and so are the device lanes'
-`checkpoint-*` lists: a row that names no test of the workspace is stale and fails, so a renamed or deleted
+device lanes' lists, required and unlisted alike (a moved test is a row of the lane that now runs it): a row that names no test of the workspace is stale and fails, so a renamed or deleted
 test cannot leave a lane selecting nothing. `--lane-filter <lane>` prints the nextest filterset of one lane's
 rows, the exact names the recipe runs (an ignored row is run by exact name only). The lane selections, the
 inventory and the lists are independent of each other, so a gate that read them from one source would pass
@@ -119,7 +119,7 @@ def load_device_cases(directory: Path) -> tuple[dict[tuple[str, str], str], dict
     return every, checkpoint
 
 
-def stale_checkpoint_cases(listing: dict, cases: dict[tuple[str, str], str]) -> list[str]:
+def stale_list_cases(listing: dict, cases: dict[tuple[str, str], str]) -> list[str]:
     """`lane binary test` for each list row that names no test of the workspace, ignored or not."""
     existing = {
         (binary, name) for binary, suite in listing["rust-suites"].items() for name in suite["testcases"]
@@ -253,13 +253,13 @@ def check(selections: list[str]) -> int:
     union = " | ".join(f"({selection})" for selection in selections)
     listing = nextest_listing(union)
     cases, problems = load_checkpoint_cases(REQUIRED_CHECKPOINTS)
-    every_device, checkpoint_device = load_device_cases(REQUIRED_DEVICE_CASES)
-    problems += stale_checkpoint_cases(listing, {**cases, **checkpoint_device})
+    every_device, _ = load_device_cases(REQUIRED_DEVICE_CASES)
+    problems += stale_list_cases(listing, {**cases, **every_device})
     inventory = load_inventory(INVENTORY)
     unselected = uncovered(listing, inventory, cases, every_device)
     escaped = ungrouped(listing, nextest_listing(gpu_group_filter(NEXTEST_CONFIG)), inventory)
     if problems:
-        print("required-checkpoint lists (scripts/required-checkpoint-cases.txt, required-device-cases/checkpoint-*.txt):")
+        print("required-case lists (scripts/required-checkpoint-cases.txt, scripts/required-device-cases/*.txt):")
         for problem in problems:
             print(f"  {problem}")
     if unselected:
@@ -311,7 +311,7 @@ def self_test() -> int:
     if clean:
         print(f"self-test: a covered workspace was reported: {clean}", file=sys.stderr)
         return 1
-    stale = stale_checkpoint_cases(fixture(base), cases)
+    stale = stale_list_cases(fixture(base), cases)
     if stale:
         print(f"self-test: a list naming an existing test was reported stale: {stale}", file=sys.stderr)
         return 1
@@ -347,7 +347,7 @@ def self_test() -> int:
         print(f"mutation rejected: {label}: {found[0]}")
 
     stale_cases = {**cases, ("pkg", "renamed_away"): "checkpoint"}
-    found = stale_checkpoint_cases(fixture(base), stale_cases)
+    found = stale_list_cases(fixture(base), stale_cases)
     if not any("renamed_away" in line for line in found):
         print(f"self-test: a list row naming no test was not reported (got {found})", file=sys.stderr)
         return 1

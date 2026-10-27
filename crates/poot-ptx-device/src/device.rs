@@ -11,10 +11,11 @@
 //! ([`PtxContext::copy_buffer`], `cuMemcpyDtoDAsync` on the capturing stream), ordered like any dispatch
 //! and byte-exact for any length and element kind: the device generates no kernel.
 
+use poot_codegen::CompiledKernel;
 use poot_executor::{Arg, Device, DeviceTime, Dispatch, LaunchKind, MeasuredDeviceTime};
 use poot_graph_plan::Target;
 use poot_ptx_runtime::{PtxBuffer, PtxContext, PtxError, PtxGraphExec, PtxSpan};
-use poot_runtime_common::{BufferRole, CompiledKernel, DeviceIdentity};
+use poot_runtime_common::{BufferRole, DeviceIdentity};
 use poot_target::{Backend, BufferStorage, TargetId};
 
 use crate::PtxGpuError;
@@ -116,7 +117,7 @@ impl Device for PtxDevice {
     }
 
     fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
-        buffer.elem_count() as usize
+        buffer.elem_count()
     }
 
     fn load_kernel(&mut self, key: &str, kernel: CompiledKernel) -> Result<PtxKernel, PtxGpuError> {
@@ -152,7 +153,7 @@ impl Device for PtxDevice {
         // the bound buffer's capacity (an arena slot's buffer is sized to its largest occupant,
         // which can exceed this particular dispatch's operand).
         let ins: Vec<&PtxBuffer> = d.inputs.iter().map(|a: &Arg<'_, Self>| a.buffer).collect();
-        let in_lens: Vec<u32> = d.inputs.iter().map(|a: &Arg<'_, Self>| a.elems).collect();
+        let in_lens: Vec<usize> = d.inputs.iter().map(|a: &Arg<'_, Self>| a.elems).collect();
         Ok(self.ctx.dispatch_dev(
             &d.kernel.key,
             &d.kernel.compiled,

@@ -164,6 +164,37 @@ impl Buffer {
         }
     }
 
+    /// A buffer of two-byte float elements, `elem` being `Ty::F16` or `Ty::BF16`, holding `values` rounded to
+    /// that format (a value read from such storage is already representable, so it is kept exactly).
+    ///
+    /// # Panics
+    ///
+    /// When `elem` is not a two-byte float.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_halves(elem: Ty, values: &[f32]) -> Self {
+        let scalar = match elem {
+            Ty::F16 => |v: f32| Scalar::F16(round_to_f16(v)),
+            Ty::BF16 => |v: f32| Scalar::BF16(round_to_bf16(v)),
+            other => panic!("{other:?} is not a two-byte float"),
+        };
+        Buffer {
+            elem,
+            data: values.iter().map(|&v| scalar(v)).collect(),
+        }
+    }
+
+    /// The values of an f16 or bf16 buffer, or [`InterpError::NotHalf`] for any other element type.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn to_halves(&self) -> Result<Vec<f32>, InterpError> {
+        self.data
+            .iter()
+            .map(|v| match v {
+                Scalar::F16(v) | Scalar::BF16(v) => Ok(*v),
+                _ => Err(InterpError::NotHalf(self.elem.clone())),
+            })
+            .collect()
+    }
+
     /// The elements of a `u32` buffer, or [`InterpError::NotU32`] for any other element type.
     #[cfg(any(test, feature = "test-support"))]
     pub fn to_u32s(&self) -> Result<Vec<u32>, InterpError> {
@@ -294,6 +325,9 @@ pub enum InterpError {
     #[error("expected an f32 buffer, found {0:?} elements")]
     /// A buffer read back as `f32` holds another element type.
     NotF32(Ty),
+    #[error("expected an f16 or bf16 buffer, found {0:?} elements")]
+    /// A buffer read back as two-byte floats holds another element type.
+    NotHalf(Ty),
     #[error("expected a u32 buffer, found {0:?} elements")]
     /// A buffer read back as `u32` holds another element type.
     NotU32(Ty),
@@ -700,6 +734,16 @@ impl Workgroup<'_> {
                 let a = self.scalar_operand(lane, operand)?;
                 bitcast(to, a).map(Value::Scalar)
             }
+            Rvalue::MulAdd(a, b, c) => {
+                let (Scalar::F32(a), Scalar::F32(b), Scalar::F32(c)) = (
+                    self.scalar_operand(lane, a)?,
+                    self.scalar_operand(lane, b)?,
+                    self.scalar_operand(lane, c)?,
+                ) else {
+                    return Err(Fault::IllTyped("a multiply-add reads three f32 operands"));
+                };
+                Ok(Value::Scalar(Scalar::F32(a.mul_add(b, c))))
+            }
             Rvalue::Select {
                 condition,
                 if_true,
@@ -797,6 +841,16 @@ impl Workgroup<'_> {
                 let lanes = lanes_of(dest)?;
                 let value = self.scalar_operand(lane, operand)?;
                 Ok(Value::Vector(vec![value; lanes]))
+            }
+            Rvalue::VectorExtract { vector, lane: at } => {
+                let Value::Vector(lanes) = self.operand(lane, vector)? else {
+                    return Err(Fault::IllTyped("a vector extract reads a vector"));
+                };
+                lanes
+                    .get(*at as usize)
+                    .copied()
+                    .map(Value::Scalar)
+                    .ok_or(Fault::IllTyped("a vector extract lane past the vector"))
             }
         }
     }
@@ -2226,5 +2280,36 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    /// `Rvalue::MulAdd` rounds once: on operands where `a * b` is inexact in f32, the fused probe stores
+    /// `a.mul_add(b, c)` bit for bit and the unfused one `(a * b) + c`, and the two differ. Mutation: compute the
+    /// interpreter's `MulAdd` as `a * b + c`; the fused probe reads the unfused value and this row goes red.
+    #[test]
+    fn a_mul_add_rounds_once() {
+        let a = [1.0 + f32::EPSILON, 3.0, 0.1];
+        let b = [1.0 - f32::EPSILON, 1.0 / 3.0, 10.0];
+        let c = [-1.0, -1.0, -1.0];
+        let run_probe = |fused: bool| {
+            let body = crate::test_support::mul_add_probe_kernel(fused);
+            let mut buffers = [
+                Buffer::from_f32s(&a),
+                Buffer::from_f32s(&b),
+                Buffer::from_f32s(&c),
+                Buffer::from_f32s(&[0.0; 3]),
+            ];
+            run(&body, [3, 1, 1], &mut buffers).expect("the probe runs");
+            buffers[3].to_f32s().unwrap()
+        };
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let fused: Vec<f32> = (0..3).map(|i| a[i].mul_add(b[i], c[i])).collect();
+        let unfused: Vec<f32> = (0..3).map(|i| a[i] * b[i] + c[i]).collect();
+        assert_ne!(
+            bits(&fused),
+            bits(&unfused),
+            "the fixture separates the two"
+        );
+        assert_eq!(bits(&run_probe(true)), bits(&fused));
+        assert_eq!(bits(&run_probe(false)), bits(&unfused));
     }
 }

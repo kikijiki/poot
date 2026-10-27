@@ -171,7 +171,7 @@ fn gemma2_geglu_fused_decode_matches_the_cpu_oracle_ptx() {
     // matches `ptx_common::run_resident`'s state exactly with no seeding of its own.
     let zero_state: Vec<HostTensor> = g
         .state()
-        .map(|(si, _)| HostTensor::zeros(g.aval(si).shape.clone()))
+        .map(|(si, _)| HostTensor::zeros_of(g.aval(si).dtype, g.aval(si).shape.clone()))
         .collect();
 
     let mut cpu_inputs = inputs.clone();

@@ -8,15 +8,6 @@
 
 use crate::Queried;
 
-/// The float width a VPU target computes in natively. An equation in a wider float is a narrowing of its
-/// semantics, not a schedule reassociation, so the planner computes it narrower only inside a region that
-/// carries a [`NarrowingContract`], and refuses it otherwise.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum VpuArithmetic {
-    /// IEEE binary16 arithmetic (NPU4). F32 and BF16 arithmetic is not native.
-    F16,
-}
-
 /// A VPU compilation target's identity. A closed enum: each variant fixes the platform and the
 /// driver-compiler ABI poot lowers to, so adding one forces every match on it. A product or model name
 /// never chooses a lowering; this does. A runtime device instance's identity is separate.
@@ -31,13 +22,6 @@ impl VpuTargetId {
     pub const fn platform(self) -> &'static str {
         match self {
             VpuTargetId::Npu4 => "NPU4000",
-        }
-    }
-
-    /// What this part computes in natively.
-    pub const fn arithmetic(self) -> VpuArithmetic {
-        match self {
-            VpuTargetId::Npu4 => VpuArithmetic::F16,
         }
     }
 
@@ -108,16 +92,9 @@ pub struct VpuCaps {
     pub compiler: Queried<VendorCompilerId>,
     /// Bytes of device-visible host memory the program's arenas may total.
     pub memory_budget_bytes: Queried<u64>,
-    /// The contract F32 values are narrowed to [`VpuCaps::arithmetic`] under; `None` when none is recorded,
+    /// The contract F32 values are narrowed to the part's native float width under; `None` when none is recorded,
     /// which makes every F32 arithmetic equation a typed refusal naming the missing contract.
     pub narrowing: Option<NarrowingContract>,
-}
-
-impl VpuCaps {
-    /// The float width this device computes in natively (a property of the part, not measured).
-    pub const fn arithmetic(&self) -> VpuArithmetic {
-        self.target.arithmetic()
-    }
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ fn limits() -> kg::BodyLimits {
 fn interpret(
     case: &Case,
     lanes: usize,
+    grouped: bool,
     splits: Option<usize>,
     q: &[f32],
     k: &[f32],
@@ -34,6 +35,7 @@ fn interpret(
 ) -> Vec<f32> {
     let d = case.d;
     let spec = kg::AttentionSpec {
+        kv: poot_kernelgen::KvLane::F32,
         batch: case.batch,
         hq: case.hq,
         n_rep: case.n_rep,
@@ -48,6 +50,7 @@ fn interpret(
         mask: kg::MaskKind::Blocks {
             ratio: case.ratio,
             k: case.k,
+            grouped,
         },
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
@@ -112,9 +115,14 @@ fn generate_request(spec: &kg::AttentionSpec) -> kg::Generated {
     .expect("the selected attention request generates")
 }
 
-fn assert_matches_reference(label: &str, case: &Case, lanes: usize, splits: Option<usize>) {
+fn assert_matches_reference(
+    label: &str,
+    case: &Case,
+    (lanes, grouped): (usize, bool),
+    splits: Option<usize>,
+) {
     let [q, k, v] = case.operands(1);
-    let got = interpret(case, lanes, splits, &q, &k, &v);
+    let got = interpret(case, lanes, grouped, splits, &q, &k, &v);
     let want = case.reference(&q, &k, &v);
     assert_eq!(got.len(), want.len(), "{label}: output length");
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -130,28 +138,120 @@ fn assert_matches_reference(label: &str, case: &Case, lanes: usize, splits: Opti
 /// SC-1143-10, the kernel against the independent selection-restricted softmax (design section 5, tier 2):
 /// decode and prefill queries, GQA, positions that put the query on a block boundary, inside a block and before
 /// the first block completes (an empty selection), `-1` padding after the last selected block, and a
-/// selection of every complete block (the dense causal case), at the lane counts of the planner.
+/// selection of every complete block (the dense causal case). A workgroup serves the `n_rep` heads of a
+/// key/value head (POOT-1338), `slices` lanes each walking a share of the candidates: one slice (the
+/// planner's width at a wide head), several, and more slices than a short row has candidates.
 #[test]
 fn the_kernel_attends_over_exactly_the_selected_blocks() {
     for case in cases() {
+        // One head per workgroup (the planner's schedule while the rows alone fill the device).
         for lanes in [8, 16, 64] {
             assert_matches_reference(
                 &format!("{} on {lanes} lanes", case.label),
                 &case,
-                lanes,
+                (lanes, false),
+                None,
+            );
+        }
+        for slices in [1, 2, 5, 16] {
+            assert_matches_reference(
+                &format!("{} grouped on {slices} slices", case.label),
+                &case,
+                (case.n_rep * slices, true),
                 None,
             );
         }
         // The candidates divided across workgroups, the last chunk ragged and (with few candidates) empty.
         for splits in [2, 3, 5] {
+            for (lanes, grouped) in [(8, false), (case.n_rep * 2, true)] {
+                assert_matches_reference(
+                    &format!("{} on {splits} splits, grouped {grouped}", case.label),
+                    &case,
+                    (lanes, grouped),
+                    Some(splits),
+                );
+            }
+        }
+    }
+}
+
+/// A grouped step reads the largest of 4, 2 and 1 keys of a block that divides it: blocks of 3 (one key), 6 (two)
+/// and 8 (four) all equal the reference, the unfinished block ragged inside a step. Mutation: let a step read
+/// four keys whatever the block size; the blocks of 3 and 6 read past their block and go red.
+#[test]
+fn a_grouped_step_never_crosses_a_block() {
+    for ratio in [3, 6, 8] {
+        let (blocks, k) = (6, 3);
+        let lk = ratio * blocks;
+        let pos: Vec<i32> = vec![0, 2, 7, 11, 13, lk as i32 - 1, 5, 9, 16, lk as i32 - 2];
+        let case = Case {
+            label: format!("ratio {ratio}"),
+            batch: 2,
+            hq: 6,
+            n_rep: 3,
+            lq: 5,
+            lk,
+            d: 8,
+            ratio,
+            k,
+            ids: poot_graph_ir::test_support::selected_attention::selected_ids(
+                &pos,
+                blocks,
+                ratio,
+                k,
+                1 << 20,
+            ),
+            pos,
+        };
+        for slices in [1, 3] {
             assert_matches_reference(
-                &format!("{} on {splits} splits", case.label),
+                &format!("ratio {ratio} on {slices} slices"),
                 &case,
-                8,
-                Some(splits),
+                (case.n_rep * slices, true),
+                None,
             );
         }
     }
+}
+
+/// A head width that is a multiple of the 32 workgroup-memory banks swizzles each lane's partial `o` by the lane
+/// (`channel ^ lane % 32`, see `OSlots`): the output equals the reference at 64 channels with more than 32 lanes
+/// (the lane index wraps the 32 banks) and with a combine over slices that read other lanes' swizzled
+/// partials. Mutation: swizzle by `lane` instead of `lane % 32`; the channels of lane 33 and up leave
+/// their 32-aligned group and the rows go red.
+#[test]
+fn a_bank_swizzled_partial_equals_the_reference() {
+    let (ratio, blocks, k) = (4, 6, 3);
+    let lk = ratio * blocks;
+    let pos: Vec<i32> = vec![3, 9, 14, 20, 23, 7, 17];
+    let case = Case {
+        label: "d 64".into(),
+        batch: 1,
+        hq: 4,
+        n_rep: 2,
+        lq: pos.len(),
+        lk,
+        d: 64,
+        ratio,
+        k,
+        ids: poot_graph_ir::test_support::selected_attention::selected_ids(
+            &pos,
+            blocks,
+            ratio,
+            k,
+            1 << 20,
+        ),
+        pos,
+    };
+    for (lanes, grouped) in [(40, false), (64, false), (2 * 20, true), (2 * 33, true)] {
+        assert_matches_reference(
+            &format!("d 64 on {lanes} lanes, grouped {grouped}"),
+            &case,
+            (lanes, grouped),
+            None,
+        );
+    }
+    assert_matches_reference("d 64 split", &case, (2 * 20, true), Some(3));
 }
 
 /// The stored key extent past the last block (a cache padded off the channel period stores one position
@@ -173,7 +273,7 @@ fn a_padded_cache_and_a_stray_id_read_no_key_past_the_stored_extent() {
         ids: vec![0, 2, 99],
         pos: vec![ratio as i32 * blocks as i32 - 1],
     };
-    assert_matches_reference("stray id", &case, 8, None);
+    assert_matches_reference("stray id", &case, (8, false), None);
 }
 
 /// An `ids` entry naming a block the query has not reached (its positions are after the query) reads no key
@@ -195,7 +295,7 @@ fn an_id_naming_a_future_block_reads_no_key_after_the_query() {
         ids: vec![0, 3, 4],
         pos: vec![9],
     };
-    assert_matches_reference("future block", &case, 8, None);
+    assert_matches_reference("future block", &case, (8, false), None);
 }
 
 /// The generated body lowers to a real SPIR-V module that `spirv-val` accepts and to PTX through `llc`
@@ -209,53 +309,64 @@ fn the_kernel_lowers_to_spirv_and_ptx() {
         .output()
         .is_err()
     {
-        eprintln!("llc not on PATH; skipping");
+        poot_test_util::skip_report("poot-kernelgen", &"llc not on PATH");
         return;
     }
     let dir = std::env::temp_dir().join("poot-selected-attention-lowering");
     std::fs::create_dir_all(&dir).unwrap();
-    let spec = kg::AttentionSpec {
-        batch: 1,
-        hq: 4,
-        n_rep: 2,
-        lq: 2,
-        lk: 64,
-        dk: 32,
-        dv: 32,
-        key: kg::KeyLayout::Single,
-        score: kg::ScoreTransform::Scale {
-            scale_bits: 0.25f32.to_bits(),
-        },
-        mask: kg::MaskKind::Blocks { ratio: 4, k: 8 },
-        bound: kg::KeyBound::Static,
-        sink: kg::AttentionSink::Absent,
-        schedule: kg::AttentionSchedule::Streaming { lanes: 64 },
-    };
-    let generated = generate_request(&spec);
-    for target in [Target::SpirvVulkan, Target::Nvptx] {
-        let out = poot_codegen::artifact_path(&dir, "selected_attention", target);
-        compile(&generated.body, target, &out).unwrap_or_else(|e| panic!("{target:?}: {e}"));
-        assert!(
-            std::fs::metadata(&out).unwrap().len() > 0,
-            "{target:?}: empty artifact"
-        );
-        if target == Target::SpirvVulkan
-            && std::process::Command::new("spirv-val")
-                .arg("--version")
-                .output()
-                .is_ok()
-        {
-            let verdict = std::process::Command::new("spirv-val")
-                .args(["--relax-block-layout", "--target-env", "vulkan1.2"])
-                .arg(&out)
-                .output()
-                .unwrap();
-            assert!(
-                verdict.status.success(),
-                "spirv-val rejects the module {}: {}",
-                out.display(),
-                String::from_utf8_lossy(&verdict.stderr)
+    for grouped in [false, true] {
+        let spec = kg::AttentionSpec {
+            kv: poot_kernelgen::KvLane::F32,
+            batch: 1,
+            hq: 4,
+            n_rep: 2,
+            lq: 2,
+            lk: 64,
+            dk: 32,
+            dv: 32,
+            key: kg::KeyLayout::Single,
+            score: kg::ScoreTransform::Scale {
+                scale_bits: 0.25f32.to_bits(),
+            },
+            mask: kg::MaskKind::Blocks {
+                ratio: 4,
+                k: 8,
+                grouped,
+            },
+            bound: kg::KeyBound::Static,
+            sink: kg::AttentionSink::Absent,
+            schedule: kg::AttentionSchedule::Streaming { lanes: 64 },
+        };
+        let generated = generate_request(&spec);
+        for target in [Target::SpirvVulkan, Target::Nvptx] {
+            let out = poot_codegen::artifact_path(
+                &dir,
+                &format!("selected_attention_grouped_{grouped}"),
+                target,
             );
+            compile(&generated.body, target, &out).unwrap_or_else(|e| panic!("{target:?}: {e}"));
+            assert!(
+                std::fs::metadata(&out).unwrap().len() > 0,
+                "{target:?}: empty artifact"
+            );
+            if target == Target::SpirvVulkan
+                && std::process::Command::new("spirv-val")
+                    .arg("--version")
+                    .output()
+                    .is_ok()
+            {
+                let verdict = std::process::Command::new("spirv-val")
+                    .args(["--relax-block-layout", "--target-env", "vulkan1.2"])
+                    .arg(&out)
+                    .output()
+                    .unwrap();
+                assert!(
+                    verdict.status.success(),
+                    "spirv-val rejects the module {}: {}",
+                    out.display(),
+                    String::from_utf8_lossy(&verdict.stderr)
+                );
+            }
         }
     }
 }
