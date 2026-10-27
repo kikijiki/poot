@@ -5,7 +5,8 @@ use crate::graph::{
 };
 use crate::{Context, DeviceBuffer, Pipeline, RuntimeError};
 use ash::vk;
-use poot_runtime_common::{BufferRole, CompiledKernel};
+use poot_codegen::CompiledKernel;
+use poot_runtime_common::BufferRole;
 use poot_target::{BufferStorage, ElementKind, LogicalDType};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -30,7 +31,7 @@ pub struct Binding<'a> {
     pub buffer: &'a DeviceBuffer,
     /// Element count the kernel is told the buffer holds, in the argument schema's element kind. It must be at most the
     /// buffer's capacity, else the dispatch is refused.
-    pub elems: u32,
+    pub elems: usize,
 }
 
 impl Context {
@@ -154,7 +155,7 @@ impl Context {
         let groups = self.check_bindings(&pipeline.shape.args, wg, threads, args)?;
 
         let n = args.len();
-        let mut lengths: Vec<u8> = args.iter().flat_map(|a| a.elems.to_le_bytes()).collect();
+        let mut lengths = kernel_length_bytes(args.iter().map(|a| a.elems))?;
         lengths.extend_from_slice(&crate::util::x_extent(groups, wg).to_le_bytes());
         let lengths_block = graph.core.reserve_meta(self, lengths.len())?;
         let offset = lengths_block.offset;
@@ -494,5 +495,41 @@ impl GraphCore {
                 end,
             );
         }
+    }
+}
+
+/// The little-endian `u32` lengths the SPIR-V kernel ABI reads, one per argument. A count past `u32::MAX`
+/// is a typed [`RuntimeError::KernelLengthTooLarge`], never a truncated length the kernel would trust as
+/// its bound.
+fn kernel_length_bytes(lens: impl IntoIterator<Item = usize>) -> Result<Vec<u8>, RuntimeError> {
+    let mut bytes = Vec::new();
+    for elems in lens {
+        let len = poot_runtime_common::kernel_len_u32(elems)
+            .map_err(|_| RuntimeError::KernelLengthTooLarge { elems })?;
+        bytes.extend_from_slice(&len.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod length_tests {
+    use super::*;
+
+    /// POOT-1317: the lengths a Vulkan dispatch publishes are the `u32` the SPIR-V ABI reads; one past
+    /// `u32::MAX` is refused with its count instead of wrapping to 0.
+    ///
+    /// Mutation: build the length with `elems as u32`; the oversize count wraps to 0 and the second
+    /// assertion goes red.
+    #[test]
+    fn kernel_lengths_past_u32_are_a_typed_refusal() {
+        assert_eq!(
+            kernel_length_bytes([1, u32::MAX as usize]).unwrap(),
+            [1, 0, 0, 0, 255, 255, 255, 255]
+        );
+        let past = u32::MAX as usize + 1;
+        assert!(matches!(
+            kernel_length_bytes([4, past]),
+            Err(RuntimeError::KernelLengthTooLarge { elems }) if elems == past
+        ));
     }
 }

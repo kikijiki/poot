@@ -26,7 +26,7 @@ fn workspace_sources() -> Vec<(PathBuf, String)> {
             }
         }
     }
-    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let crates = poot_test_util::manifest_dir().join("..");
     let mut out = Vec::new();
     for krate in std::fs::read_dir(crates).unwrap().flatten() {
         for part in ["src", "tests", "benches", "examples"] {
@@ -220,7 +220,7 @@ fn surviving_contracts_have_a_production_call_site() {
         ),
         ("PACKED_LOWERING", "the packed lowering table"),
         (
-            "flash_attention_capped(",
+            "flash_attention(",
             "the attention matcher `compile` runs, which yields the declines",
         ),
         (

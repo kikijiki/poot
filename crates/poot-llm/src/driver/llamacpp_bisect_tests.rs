@@ -261,6 +261,77 @@ impl fmt::Display for Bisect {
     }
 }
 
+/// The value of every input of the traced, packed-bound prefill `graph` of `ids`: dense weights as f32 host
+/// tensors, packed weights by reference, zeroed state, computed constants and the step's slots.
+pub(super) fn oracle_inputs(
+    handle: &ModelHandle,
+    graph: &poot_graph_ir::Graph,
+    ids: &[i32],
+) -> HashMap<ValueId, Value> {
+    let model = handle.model();
+    let (store, map) = (handle.shared_store(), model.weights());
+    let ids_by_const: HashMap<String, WeightId> =
+        map.iter().map(|(id, _, _)| (id.const_name(), id)).collect();
+    let mut inputs: HashMap<ValueId, Value> = HashMap::new();
+    for &id in graph.inputs() {
+        let meta = graph.meta(id);
+        let value: Value = match meta.storage {
+            Storage::Const => {
+                let name = meta.name().expect("a const has a name");
+                let name = name.as_ref();
+                match ids_by_const.get(name) {
+                    Some(&weight) => {
+                        let WeightEntry::Dense(dense) = map.materialize(weight, store).unwrap()
+                        else {
+                            panic!("{name} is packed but the graph declares it dense")
+                        };
+                        let mut one = WeightStore::builder();
+                        one.insert("w", WeightEntry::Dense(dense)).unwrap();
+                        Value::Host(materialize_dense(&one.build(), "w").unwrap())
+                    }
+                    None => {
+                        let source = PackedSourceName::parse(name)
+                            .unwrap_or_else(|| panic!("the map names no const {name}"));
+                        let weight = ids_by_const[source.linear_id()];
+                        let WeightEntry::Packed(payload) = map.materialize(weight, store).unwrap()
+                        else {
+                            panic!("{name} names a dense weight")
+                        };
+                        Value::Packed(PackedComponentRef::new(Arc::clone(&payload), source.role()))
+                    }
+                }
+            }
+            Storage::State => HostTensor::zeros_of(meta.aval.dtype, meta.aval.shape.clone()).into(),
+            Storage::Computed(c) => c.tensor().into(),
+            Storage::Slot(_) => continue,
+            Storage::Device => unreachable!("a graph input is never a device intermediate"),
+        };
+        inputs.insert(id, value);
+    }
+    inputs.extend(slot_inputs(graph, ids));
+    inputs
+}
+
+/// The step slots of `ids` as values, by the graph input each fills: what changes between two windows over
+/// the same graph, so a caller keeps the weights of [`oracle_inputs`] and replaces only these.
+pub(super) fn slot_inputs(graph: &poot_graph_ir::Graph, ids: &[i32]) -> Vec<(ValueId, Value)> {
+    let step = Step::new(ids, 0);
+    let slots = step.slots();
+    graph
+        .inputs()
+        .iter()
+        .filter_map(|&id| {
+            let meta = graph.meta(id);
+            let Storage::Slot(_) = meta.storage else {
+                return None;
+            };
+            let key = meta.slot_key().expect("a slot has a key");
+            let (_, tensor) = slots.iter().find(|(k, _)| k == key).expect("slot value");
+            Some((id, tensor.clone().into()))
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------------------------
 // Model-free: the dump format, the metric and the bisection, on tensors built in the test.
 // ---------------------------------------------------------------------------------------------
@@ -400,7 +471,7 @@ mod checkpoint_rows {
             Ok(_) => Some(tool),
             Err(error) => {
                 eprintln!(
-                    "SKIP: {} is not runnable ({error}); build it with scripts/llamacpp-dump/build.sh",
+                    "POOT-SKIP: {} is not runnable ({error}); build it with scripts/llamacpp-dump/build.sh",
                     tool.display()
                 );
                 None
@@ -446,55 +517,7 @@ mod checkpoint_rows {
             .expect("bind the packed weights");
         let runs = graph.layer_runs().expect("one run per decoder layer");
 
-        let (store, map) = (handle.shared_store(), model.weights());
-        let ids_by_const: HashMap<String, WeightId> =
-            map.iter().map(|(id, _, _)| (id.const_name(), id)).collect();
-        let step = Step::new(ids, 0);
-        let slots = step.slots();
-        let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-        for &id in graph.inputs() {
-            let meta = graph.meta(id);
-            let value: Value = match meta.storage {
-                Storage::Const => {
-                    let name = meta.name().expect("a const has a name");
-                    let name = name.as_ref();
-                    match ids_by_const.get(name) {
-                        Some(&weight) => {
-                            let WeightEntry::Dense(dense) = map.materialize(weight, store).unwrap()
-                            else {
-                                panic!("{name} is packed but the graph declares it dense")
-                            };
-                            let mut one = WeightStore::builder();
-                            one.insert("w", WeightEntry::Dense(dense)).unwrap();
-                            Value::Host(materialize_dense(&one.build(), "w").unwrap())
-                        }
-                        None => {
-                            let source = PackedSourceName::parse(name)
-                                .unwrap_or_else(|| panic!("the map names no const {name}"));
-                            let weight = ids_by_const[source.linear_id()];
-                            let WeightEntry::Packed(payload) =
-                                map.materialize(weight, store).unwrap()
-                            else {
-                                panic!("{name} names a dense weight")
-                            };
-                            Value::Packed(PackedComponentRef::new(
-                                Arc::clone(&payload),
-                                source.role(),
-                            ))
-                        }
-                    }
-                }
-                Storage::State => HostTensor::zeros(meta.aval.shape.clone()).into(),
-                Storage::Computed(c) => c.tensor().into(),
-                Storage::Slot(_) => {
-                    let key = meta.slot_key().expect("a slot has a key");
-                    let (_, tensor) = slots.iter().find(|(k, _)| k == key).expect("slot value");
-                    tensor.clone().into()
-                }
-                Storage::Device => unreachable!("a graph input is never a device intermediate"),
-            };
-            inputs.insert(id, value);
-        }
+        let inputs = oracle_inputs(handle, &graph, ids);
         let evaluation = eval(&graph, &inputs, EvalOptions::default().keep_environment())
             .expect("evaluate the prefill");
         let environment = evaluation.environment.as_ref().expect("kept environment");
@@ -555,7 +578,7 @@ mod checkpoint_rows {
         match quantize {
             Ok(output) if output.status.success() => {}
             other => {
-                eprintln!("SKIP: llama-quantize did not make the F16 copy: {other:?}");
+                eprintln!("POOT-SKIP: llama-quantize did not make the F16 copy: {other:?}");
                 return;
             }
         }

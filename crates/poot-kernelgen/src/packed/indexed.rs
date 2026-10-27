@@ -7,8 +7,8 @@
 //! column `m * N + n` is the "weight row" of the Gemv; this module turns it into the weight row `n` of expert
 //! `ids[m]`, each source's slab bit offset (`expert * slab_words * 32`), and the NaN poison of an invalid id.
 //!
-//! Metadata, in order: `K`, `N`, `E` (the expert count), `M` and `x_groups` (the segmented Tiled schedule's row
-//! count and grid X extent, as the dense indexed contraction carries them; the Gemv ignores both), then one word per
+//! Metadata, in order: the dense indexed contraction's `K`, `N`, `M`, `x_groups`, `tile_offset` and `E` (the
+//! register-tiled schedule's words, then the expert count; the Gemv reads `K`, `N` and `E`), then one word per
 //! source, in [`poot_quant::PackedWeight::sources`] order, holding that source's slab stride in `u32` words
 //! ([`poot_quant::PackedWeight::slab_words`], the per-expert word padding of the uploaded table).
 
@@ -16,13 +16,12 @@ use poot_kernel_ir::{BinOp, Body, Local, Ty};
 use poot_quant::format::Storage;
 
 use super::decode_plan::DecodePlan;
-use super::kernel::emit_block_address;
 use super::planar::PlanarPlan;
 use super::source::Source;
 use crate::KernelGenError;
 use crate::contraction::{
-    Epilogue, IndexedTiledBody, IndexedTiledWeight, META_EXPERTS, META_N, META_PACKED_SLAB_WORDS,
-    RowExpert, TileSize, emit_poison, emit_row_expert, indexed_tiled_body,
+    Epilogue, ExpertWalk, META_EXPERTS, META_N, META_PACKED_SLAB_WORDS, RowExpert, TiledBody,
+    TiledLaunch, TiledWeight, emit_poison, emit_row_expert, tiled_body,
 };
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
 use crate::helpers::{ld, local, slice_dtype, slice_f32};
@@ -103,56 +102,14 @@ impl Decode {
     }
 }
 
-/// A stacked packed table as the segmented Tiled body reads it: each lane decodes one weight element of the
-/// step's expert, relative to that expert's slab in each source.
-struct PackedExperts {
-    decode: Decode,
-    words: Vec<Local>,
-    metadata: Local,
-}
-
-impl IndexedTiledWeight for PackedExperts {
-    fn step(&self, e: &mut Emit, expert: Local, _extents: (Local, Local)) -> Vec<Local> {
-        slab_bits(e, self.metadata, expert, self.words.len())
-    }
-
-    fn load(
-        &self,
-        e: &mut Emit,
-        step: &[Local],
-        (k_at, row): (Local, Local),
-        (k, n): (Local, Local),
-    ) -> Local {
-        let sources: Vec<Source> = self
-            .words
-            .iter()
-            .zip(step)
-            .map(|(&words, &slab_bit)| Source {
-                words,
-                slab_bit: Some(slab_bit),
-            })
-            .collect();
-        match &self.decode {
-            Decode::Block(plan) => {
-                let (block, i_in_block) = emit_block_address(e, plan.values(), row, k_at, k);
-                let factors = plan.emit_factors(e, sources[0], block, i_in_block);
-                plan.emit_value(e, sources[0], block, i_in_block, &factors)
-            }
-            Decode::Planar(plan) => {
-                let factors = plan.emit_factors(e, &sources, row, k_at, k, n);
-                plan.emit_value(e, &sources, row, k_at, k, n, &factors)
-            }
-        }
-    }
-}
-
-/// The segmented Tiled schedule of an indexed packed contraction (prefill, many rows): params `(activation, ids,
-/// sources.., epilogue leaves.., metadata, out)` like the Gemv, the body [`indexed_tiled_body`] shares with the
-/// dense indexed contraction, and each lane decoding the packed weight element of the step's expert.
-pub(super) fn indexed_tiled(
+/// The register-tiled schedule of an indexed packed contraction (prefill, many rows): params `(activation, ids,
+/// sources.., epilogue leaves.., metadata, out)` like the Gemv, the body [`tiled_body`] inside an [`ExpertWalk`]
+/// that the dense indexed contraction shares, each walk step reading its expert's slab in every source and each
+/// staged run decoding weight row `n` of that slab.
+pub(super) fn indexed_register_tiled(
     name: &str,
     format: poot_quant::format::WeightFormat,
-    tile: TileSize,
+    launch: TiledLaunch,
     epilogue: Option<&Epilogue>,
 ) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
@@ -186,27 +143,49 @@ pub(super) fn indexed_tiled(
         .collect();
     let metadata = local(3 + (sources + leaf_count) as u32);
     let tables = decode.constant_tables();
-    let mut body = indexed_tiled_body(
-        IndexedTiledBody {
-            name,
-            tile,
-            params,
-            x: local(1),
+    let mut slabs = |e: &mut Emit, expert: Local| slab_bits(e, metadata, expert, sources);
+    // Each source read relative to the step's expert slab (`step`, one bit offset per source).
+    let in_slab = |step: &[Local]| -> Vec<Source> {
+        words
+            .iter()
+            .zip(step)
+            .map(|(&words, &slab_bit)| Source {
+                words,
+                slab_bit: Some(slab_bit),
+            })
+            .collect()
+    };
+    let mut run = |e: &mut Emit,
+                   step: &[Local],
+                   row: Local,
+                   k0: Local,
+                   count: usize,
+                   k: Local,
+                   weight_rows: Local| {
+        let sources = in_slab(step);
+        match &decode {
+            Decode::Block(plan) => plan.emit_run(e, sources[0], row, k0, count, k),
+            Decode::Planar(plan) => plan.emit_run(e, &sources, row, k0, count, k, weight_rows),
+        }
+    };
+    let spec = TiledBody {
+        name,
+        params,
+        activation: local(1),
+        metadata,
+        out: local(4 + (sources + leaf_count) as u32),
+        epilogue: epilogue.map(|epilogue| crate::contraction::BoundEpilogue {
+            epilogue,
+            leaves: &leaves,
+            lanes: &lanes,
+        }),
+        walk: Some(ExpertWalk {
             ids: local(2),
-            metadata,
-            out: local(4 + (sources + leaf_count) as u32),
-            epilogue: epilogue.map(|epilogue| crate::contraction::GemvEpilogue {
-                epilogue,
-                leaves: &leaves,
-                lanes: &lanes,
-            }),
-        },
-        &PackedExperts {
-            decode,
-            words,
-            metadata,
-        },
-    );
+            experts_word: META_EXPERTS,
+            step: &mut slabs,
+        }),
+    };
+    let mut body = tiled_body(spec, launch, TiledWeight::Rows(&mut run));
     body.constant_tables = tables;
     Ok(body)
 }
@@ -276,7 +255,7 @@ mod tests {
         fn metadata(&self, rows: usize, x_groups: usize) -> Vec<u32> {
             let weight = self.stack.weight();
             let [out, k] = weight.shape();
-            [k, out, EXPERTS, rows, x_groups]
+            [k, out, rows, x_groups, 0, EXPERTS]
                 .into_iter()
                 .chain(
                     weight
@@ -318,16 +297,24 @@ mod tests {
         Case { stack, sources }
     }
 
-    /// Every launch shape the indexed rows run: the Gemv shapes and the segmented Tiled schedule at two tile
-    /// edges (4: several tiles per row and column group at the fixtures' `N = 5, 6`, so tiles have edge columns;
-    /// 8: one tile spans all the fixture rows, so it holds every expert).
+    /// The register tiling of `rows x cols` per lane on the 8x8 lane grid, `K` staged in runs of 4: a 16-row or
+    /// 32-row tile over 32 columns.
+    fn tiled(rows: u32) -> Schedule {
+        Schedule::RegisterTiled {
+            lanes: TileSize::new(8).unwrap(),
+            rows: crate::LaneRows(rows),
+            cols: crate::MicroCols::new(4),
+            run: crate::contraction::RunLength::dividing(64),
+        }
+    }
+
+    /// Every launch shape the indexed rows run: the Gemv shapes and the register-tiled expert walk at two tile
+    /// heights (16 rows: the fixtures' rows past 16 are a second tile; 32: one tile spans all the fixture rows, so
+    /// it holds every expert). Every tile has edge columns at the fixtures' `N = 4..6`.
     fn schedules() -> Vec<Schedule> {
-        let tiled = |edge| Schedule::Tiled {
-            tile: TileSize::new(edge).unwrap(),
-        };
         GEMV_SCHEDULES
             .into_iter()
-            .chain([tiled(4), tiled(8)])
+            .chain([tiled(2), tiled(4)])
             .collect()
     }
 
@@ -364,21 +351,19 @@ mod tests {
         .unwrap_or_else(|error| panic!("{format:?}: {error}"));
         let (grid, x_groups) = match schedule {
             Schedule::Gemv { .. } => ([schedule.grid_threads(1, m, out) as u32, 1, 1], 0),
-            Schedule::Tiled { tile } => {
-                let ts = tile.get() as usize;
-                let tiles = m.div_ceil(ts) * out.div_ceil(ts);
+            Schedule::RegisterTiled { lanes, .. } => {
+                let (tile_rows, tile_cols) = schedule.output_tile().unwrap();
+                let lanes = lanes.get() as usize;
+                let tiles = m.div_ceil(tile_rows) * out.div_ceil(tile_cols);
                 let x_groups = fold.unwrap_or(tiles);
                 (
                     [
-                        (x_groups * ts * ts) as u32,
+                        (x_groups * lanes * lanes) as u32,
                         tiles.div_ceil(x_groups) as u32,
                         1,
                     ],
                     x_groups,
                 )
-            }
-            Schedule::RegisterTiled { .. } => {
-                panic!("an indexed contraction is never RegisterTiled")
             }
         };
         let mut buffers = vec![Buffer::from_f32s(x), Buffer::from_i32s(ids)];
@@ -621,9 +606,9 @@ mod tests {
 
     /// The segmented walk: a tile whose rows select a subset of the experts with a gap (here experts 0 and 2 of
     /// three, in an order that is neither sorted nor grouped) reads each row's own expert slab at every step.
-    /// With edge-4 tiles the 8 rows are two tiles, and the first holds ids `{2, 0, 2, 0}`: the step after expert 0
-    /// must land on expert 2, not on the next integer. Mutation: in `indexed_tiled_body` take the step's slab
-    /// from `lo` instead of `next`; the rows routed to expert 2 read expert 1 and go red.
+    /// The 8 rows are one 16-row tile holding ids `{2, 0, 2, 0, 0, 2, 2, 0}`: the step after expert 0 must land on
+    /// expert 2, not on the next integer. Mutation: in `tiled_body` hand the walk's step `lo`
+    /// instead of `next`; the rows routed to expert 2 read expert 1 and go red.
     #[test]
     fn a_tile_whose_rows_skip_an_expert_reads_each_rows_own_slab() {
         let (out, k) = (5, 64);
@@ -635,9 +620,7 @@ mod tests {
             let x: Vec<f32> = (0..rows * k)
                 .map(|i| ((i * 11 % 29) as f32 - 14.0) * 0.03125)
                 .collect();
-            let schedule = Schedule::Tiled {
-                tile: TileSize::new(4).unwrap(),
-            };
+            let schedule = tiled(2);
             let got = launch(
                 &case,
                 schedule,
@@ -661,22 +644,20 @@ mod tests {
         }
     }
 
-    /// A tiled grid folded onto `GroupY` (here 3 tiles wide over 4 tiles) computes what the unfolded grid does,
-    /// bit for bit: `g = gy * x_groups + gx` recovers the tile, and the padding workgroups of the last fold row
-    /// store nothing. Mutation: read `g` from `GroupX` alone; the tile past the first fold row is never computed
+    /// A tiled grid folded onto `GroupY` (here 2 tiles wide over 3 tiles) computes what the unfolded grid does,
+    /// bit for bit: `g = gy * x_groups + gx` recovers the tile, and the padding workgroup of the last fold row
+    /// stores nothing. Mutation: read `g` from `GroupX` alone; the tile past the first fold row is never computed
     /// (its outputs stay `f32::MIN`) and this row goes red.
     #[test]
     fn a_folded_tiled_grid_equals_the_unfolded_one() {
-        let (out, rows, k) = (6, 8, 64);
+        let (out, rows, k) = (6, 40, 64);
         let format = WeightFormat::Q8_0;
         let case = case(format, out, k);
         let ids: Vec<i32> = (0..rows).map(|m| ((m * 2 + 1) % EXPERTS) as i32).collect();
         let x: Vec<f32> = (0..rows * k)
             .map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.0625)
             .collect();
-        let schedule = Schedule::Tiled {
-            tile: TileSize::new(4).unwrap(),
-        };
+        let schedule = tiled(2);
         let run_with = |fold| {
             launch_with(
                 &case,
@@ -688,7 +669,7 @@ mod tests {
                 None,
             )
         };
-        let (unfolded, folded) = (run_with(None), run_with(Some(3)));
+        let (unfolded, folded) = (run_with(None), run_with(Some(2)));
         let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&folded), bits(&unfolded));
         assert!(

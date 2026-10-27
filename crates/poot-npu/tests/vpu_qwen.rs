@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::{Device, NoSync};
-use poot_executor_parity::{Fixture, fixture_weights, staged};
+use poot_executor_parity::{Fixture, fixture_weights, staged_on};
 use poot_graph_ir::{BinOp, Builder, Slot, TensorType, Traced, UnOp};
 use poot_tensor::DType;
 
@@ -197,7 +197,8 @@ fn run_fragment(fixture: &Fixture) {
     )
     .unwrap();
     let compile_started = Instant::now();
-    let entry = poot_executor::Executor::add_entry(exec, exe, &staged(fixture, target)).unwrap();
+    let program = staged_on(&*exec, fixture, target);
+    let entry = poot_executor::Executor::add_entry(exec, exe, &program).unwrap();
     let compile = compile_started.elapsed();
     let mut oracle = oracle_for(&fixture.graph, &fixture.store);
     let mut worst = 0.0f32;

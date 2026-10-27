@@ -15,45 +15,37 @@
 //! function and cannot disagree.
 
 use poot_kernel_ir::serialize::{Grid, serialize_grid};
-use poot_kernel_ir::{
-    BinOp, Body, FRAGMENT_COLLECTIVE_LANES, MathOp, Statement, Ty, UnOp, WmmaDtype, WmmaShape,
-};
+use poot_kernel_ir::{BinOp, Body, MathOp, Statement, Ty, UnOp, WmmaDtype, WmmaShape};
 use poot_target::{BufferStorage, DeviceCaps, ElementKind};
 
 use crate::KernelGenError;
 use crate::aie_row::row_contract;
 use crate::attention::{
-    AttentionCombineSpec, AttentionSpec, attention_body, attention_combine_body,
+    AttentionCombineSpec, AttentionRows, AttentionSpec, attention_body, attention_combine_body,
 };
 use crate::block_top_k::{BlockTopKSpec, block_top_k_body};
-use crate::contraction::{Epilogue, Schedule, dense_contraction, indexed_contraction};
+use crate::contraction::{
+    DenseTiledWeight, Epilogue, GemvActivation, Schedule, dense_contraction,
+    dense_tiled_contraction, indexed_contraction,
+};
 use crate::data_movement::{
-    MovementOp, MovementSpec, Storage, arg_top_k_dt, movement_body, rope_dt,
+    MovementOp, MovementSpec, Storage, arg_top_k_dt, expert_group, movement_body, rope_dt,
 };
 use crate::elementwise::{
-    binary_broadcast_dt_views_grid, binary_broadcast_i32_geu_views_grid,
-    binary_broadcast_i32_remu_views_grid, binary_scalar_dt_grid, binary_scalar_i32_geu_grid,
-    binary_scalar_i32_grid, binary_scalar_i32_remu_grid, cast_bf16_to_f32, cast_f16_to_f32,
-    cast_f32_to_bf16, cast_f32_to_f16, cast_i32_to_f32, erf_dt, math_unary_dt_grid,
-    math_unary_dt_views_grid, recip_dt_grid, recip_dt_views_grid, tanh_dt, unary_dt_grid,
-    unary_dt_views_grid, unary_i32_clz_grid, unary_i32_clz_views_grid,
+    cast_bf16_to_f32, cast_f16_to_f32, cast_f32_to_bf16, cast_f32_to_f16, cast_i32_to_f32,
 };
 use crate::error::BodyStage;
 use crate::fp8::{e4m3fn_packed_to_f32, f32_to_e4m3fn_packed};
 use crate::fused::{
-    FusedInput, FusedKernel, RowKernel, fused_i32_views_grid, fused_i32_views_grid_pack,
-    fused_row_parallel_views, fused_views, pointwise_size, row_size,
+    FusedInput, FusedKernel, FusedScalarOp, LeafTy, RowKernel, fused_i32_views_grid,
+    fused_i32_views_grid_pack, fused_row_parallel_views, fused_views, pointwise_size, row_size,
 };
 use crate::gemv::{attn_scores_v_gemv_lds, gemv_lds};
 use crate::helpers::{BodyBudget, BodyLimits, BodySize, Layout, WeightLayout};
-use crate::matmul::{
-    matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid, matmul_batched_nk_grid,
-};
+use crate::matmul::{matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid};
 use crate::packed::{PackedKernelSpec, packed_contraction, packed_kernel};
 use crate::reduce::reduce_last_dt;
 use crate::scan::{ScanSpec, scan_body};
-use crate::tiled_region::tiled_region;
-use crate::wmma::{matmul_tensorcore, matmul_tensorcore_coopmat};
 use poot_quant::format::WeightFormat;
 
 /// The entry-point name every generated body but the named ones below carries; the shared name the GPU
@@ -273,9 +265,10 @@ pub struct ViewOperand {
 /// One generation request. See the module docs.
 #[derive(Clone, Debug)]
 pub enum KernelRequest {
-    /// A one- or two-operand per-element kernel, a scalar-literal kernel or a dtype cast.
-    Elementwise(ElementwiseSpec),
-    /// A fused pointwise region over leaves.
+    /// A dtype cast between two storage types.
+    Cast(CastSpec),
+    /// A pointwise region over leaves: any number of per-element steps, one thread per output element. A
+    /// single unary, binary or scalar-literal op is the region of one step.
     Pointwise(PointwiseSpec),
     /// A row-wise fused region or a last-axis reduction.
     Row(RowSpec),
@@ -283,6 +276,8 @@ pub enum KernelRequest {
     Contraction(ContractionSpec),
     /// The online-softmax attention generator, in its streaming or split-KV stage-one schedule.
     Attention(AttentionSpec),
+    /// A run of rows of a streaming attention: one watchdog-sized dispatch of a prefill split by rows.
+    AttentionRows(AttentionRows),
     /// The combine stage of a split-KV attention ([`AttentionSchedule::SplitKv`]).
     AttentionCombine(AttentionCombineSpec),
     /// A streaming recurrence over the sequence axis (delta rule or SSD).
@@ -295,6 +290,8 @@ pub enum KernelRequest {
     Rope(RopeSpec),
     /// Batched argtop-k index extraction.
     TopK(TopKSpec),
+    /// The permutation that groups MoE rows by expert, and its inverse.
+    ExpertGroup(ExpertGroupSpec),
     /// The per-query block selection of a sparse-attention indexer: a radix select over block scores.
     BlockTopK(BlockTopKSpec),
 }
@@ -302,14 +299,9 @@ pub enum KernelRequest {
 impl KernelRequest {
     /// What this request's kernel needs from the device beyond its body (see [`KernelRequirements`]).
     pub fn requirements(&self) -> KernelRequirements {
-        match self {
-            Self::Contraction(
-                ContractionSpec::TensorCore { .. } | ContractionSpec::Coopmat { .. },
-            ) => KernelRequirements {
-                subgroup_lanes: Some(FRAGMENT_COLLECTIVE_LANES),
-            },
-            _ => KernelRequirements::default(),
-        }
+        // No generated request runs a matrix-fragment collective: every M > 1 contraction is the register-tiled
+        // GEMM (POOT-1403). A fragment schedule declares its subgroup lanes here.
+        KernelRequirements::default()
     }
 
     /// A human-readable name for this kernel: family, form and, for a dense contraction, its storage, launch and
@@ -329,11 +321,26 @@ impl KernelRequest {
                         width,
                         cols,
                         unroll,
-                    } => format!("w{width}c{cols}u{unroll}"),
-                    Schedule::Tiled { tile } => format!("tiled{}", tile.get()),
-                    Schedule::RegisterTiled { lanes, rows, run } => {
-                        format!("register_tiled{}x{}r{}", lanes.get(), rows.get(), run.get())
+                        activation,
+                    } => {
+                        let read = match activation {
+                            GemvActivation::Scalar => "",
+                            GemvActivation::Vec4 => "v4",
+                        };
+                        format!("w{width}c{cols}u{unroll}{read}")
                     }
+                    Schedule::RegisterTiled {
+                        lanes,
+                        rows,
+                        cols,
+                        run,
+                    } => format!(
+                        "register_tiled{}x{}x{}r{}",
+                        lanes.get(),
+                        rows.get(),
+                        cols.get(),
+                        run.get()
+                    ),
                 };
                 let epilogue = epilogue.as_ref().map_or_else(String::new, |epilogue| {
                     format!(":epilogue{}", epilogue.steps.len())
@@ -348,59 +355,21 @@ impl KernelRequest {
     /// The family name, for diagnostics and the plan summary's `choice` column.
     pub fn family(&self) -> &'static str {
         match self {
-            Self::Elementwise(_) => "elementwise",
+            Self::Cast(_) => "cast",
             Self::Pointwise(_) => "pointwise",
             Self::Row(_) => "row",
             Self::Contraction(_) => "contraction",
-            Self::Attention(_) => "attention",
+            Self::Attention(_) | Self::AttentionRows(_) => "attention",
             Self::AttentionCombine(_) => "attention_combine",
             Self::Scan(_) => "scan",
             Self::Movement(_) => "movement",
             Self::Packed(_) => "packed",
             Self::Rope(_) => "rope",
             Self::TopK(_) => "topk",
+            Self::ExpertGroup(_) => "expert_group",
             Self::BlockTopK(_) => "block_top_k",
         }
     }
-}
-
-/// A unary kernel's operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnaryOp {
-    /// A kernel-ir unary operation.
-    Basic(UnOp),
-    /// Reciprocal `1 / x`.
-    Recip,
-    /// A kernel-ir math intrinsic.
-    Math(MathOp),
-    /// Hyperbolic tangent.
-    Tanh,
-    /// Error function.
-    Erf,
-    /// Leading-zero count of an I32 word.
-    ClzI32,
-}
-
-/// A binary kernel's operation over exact I32 storage with a literal operand.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum I32Binary {
-    /// Unsigned `>=` over the I32 words, writing I32 0 or 1.
-    GeU,
-    /// Unsigned remainder over the I32 words.
-    RemU,
-    /// A kernel-ir binary operation, in I32 arithmetic.
-    Basic(BinOp),
-}
-
-/// A two-value binary kernel's operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ValueBinary {
-    /// The element type the operation runs in (`Ty::I32` for an exact-I32 value).
-    Basic(BinOp, Ty),
-    /// Unsigned `>=` over the I32 words, writing I32 0 or 1.
-    GeU,
-    /// Unsigned remainder over the I32 words.
-    RemU,
 }
 
 /// A dtype cast between two storage types.
@@ -445,57 +414,6 @@ pub enum CastSpec {
         /// Output elements, one thread each.
         numel: usize,
     },
-}
-
-/// A per-element kernel over one or two operands.
-#[derive(Clone, Debug)]
-pub enum ElementwiseSpec {
-    /// One operand, optionally read through a view of `view.shape` (the output shape).
-    Unary {
-        /// The operation.
-        op: UnaryOp,
-        /// The element type the operation runs in.
-        dt: Ty,
-        /// A view the operand is read through, or `None` for a dense row-major operand.
-        view: Option<ViewOperand>,
-        /// How the launch folds past the device's x-grid cap.
-        fold: Fold,
-    },
-    /// `value op literal` in float arithmetic; `lit_bits` is the literal's `f32` bits.
-    ScalarFloat {
-        /// The binary operation.
-        op: BinOp,
-        /// The element type the operation runs in.
-        dt: Ty,
-        /// The literal operand's `f32` bit pattern.
-        lit_bits: u32,
-        /// How the launch folds past the device's x-grid cap.
-        fold: Fold,
-    },
-    /// `value op literal` over exact I32 storage.
-    ScalarI32 {
-        /// The operation.
-        op: I32Binary,
-        /// The literal operand.
-        lit: i32,
-        /// How the launch folds past the device's x-grid cap.
-        fold: Fold,
-    },
-    /// `a op b` with broadcasting, each operand read through its layout.
-    Binary {
-        /// The operation and its element type.
-        op: ValueBinary,
-        /// The broadcast output shape.
-        out_shape: Vec<usize>,
-        /// The left operand and the layout it is read through.
-        a: ViewOperand,
-        /// The right operand and the layout it is read through.
-        b: ViewOperand,
-        /// How the launch folds past the device's x-grid cap.
-        fold: Fold,
-    },
-    /// A dtype cast between two storage types.
-    Cast(CastSpec),
 }
 
 /// Which element form a pointwise region computes in.
@@ -590,31 +508,9 @@ pub enum ContractionSpec {
         /// How the launch folds past the device's x-grid cap.
         fold: Fold,
     },
-    /// The one-thread-per-output kernel over a weight in checkpoint `[N, K]` order (`shapes.b_shape` is `[N, K]`):
-    /// `DenseContraction` where the tiled GEMM is not taken. The activation and output are f32; `weight` is the
-    /// weight's planned storage, `BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`.
-    DenseSerial {
-        /// The weight's planned storage: `BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`.
-        weight: BufferStorage,
-        /// The matmul's shapes; `b_shape` is `[N, K]`.
-        shapes: MatmulShapes,
-        /// How the launch folds past the device's x-grid cap.
-        fold: Fold,
-    },
-    /// Matrix-core fragments (WMMA m16n16k16): one 256-thread block per 16x16 output tile per batch.
-    TensorCore {
-        /// The element type of the fragments.
-        dt: Ty,
-        /// The matmul's shapes; the output extents are multiples of 16.
-        shapes: MatmulShapes,
-    },
-    /// RADV cooperative matrix: one 32-invocation subgroup per 16x16 output tile.
-    Coopmat {
-        /// The matmul's shapes; the output extents are multiples of 16.
-        shapes: MatmulShapes,
-    },
-    /// One range of a watchdog-split decode GEMV: `elems` workgroups of `width` lanes starting at output
-    /// element `offset`.
+    /// A range of a decode GEMV over a `[K, N]` weight: `elems` workgroups of `width` lanes starting at output
+    /// element `offset`, one workgroup per output element, folded onto a 2-D grid past the device's X cap. The
+    /// whole output is one range; a watchdog-split output is several, all this one body.
     GemvChunk {
         /// Reduction length (the `[K, N]` weight's rows).
         k: usize,
@@ -638,12 +534,12 @@ pub enum ContractionSpec {
     /// field and a `[K, N]` Gemv cannot be written down.
     ///
     /// ```
-    /// use poot_kernelgen::{ContractionSpec, Schedule};
+    /// use poot_kernelgen::{ContractionSpec, GemvActivation, Schedule};
     /// use poot_target::BufferStorage;
     ///
     /// let _gemv_over_n_by_k = ContractionSpec::DenseGemv {
     ///     weight: BufferStorage::f32(),
-    ///     schedule: Schedule::Gemv { width: 256, cols: 4, unroll: 4 },
+    ///     schedule: Schedule::Gemv { width: 256, cols: 4, unroll: 4, activation: GemvActivation::Scalar },
     ///     k: 896,
     ///     n: 4864,
     ///     epilogue: None,
@@ -651,13 +547,13 @@ pub enum ContractionSpec {
     /// ```
     ///
     /// ```compile_fail,E0559
-    /// use poot_kernelgen::{ContractionSpec, Schedule, WeightLayout};
+    /// use poot_kernelgen::{ContractionSpec, GemvActivation, Schedule, WeightLayout};
     /// use poot_target::BufferStorage;
     ///
     /// let _gemv_over_k_by_n = ContractionSpec::DenseGemv {
     ///     weight: BufferStorage::f32(),
     ///     layout: WeightLayout::Kn,
-    ///     schedule: Schedule::Gemv { width: 256, cols: 4, unroll: 4 },
+    ///     schedule: Schedule::Gemv { width: 256, cols: 4, unroll: 4, activation: GemvActivation::Scalar },
     ///     k: 896,
     ///     n: 4864,
     ///     epilogue: None,
@@ -686,44 +582,8 @@ pub enum ContractionSpec {
         /// Outputs, one workgroup each.
         numel: usize,
     },
-    /// The synthesized tiled GEMM: `groups` workgroups of `tile * tile` lanes starting at tile `offset`, with
-    /// `epilogue` (f32) applied to each output element's sum before its store.
-    TiledRegion {
-        /// Activation rows.
-        m: usize,
-        /// Reduction length.
-        k: usize,
-        /// Output columns.
-        n: usize,
-        /// The tile edge; a workgroup is `tile * tile` lanes.
-        tile: usize,
-        /// First tile of this range, in the grid's tile order.
-        offset: usize,
-        /// Workgroups in this range.
-        groups: usize,
-        /// Pointwise steps applied to each output before the store, if any.
-        epilogue: Option<Epilogue>,
-    },
-    /// [`ContractionSpec::TiledRegion`] reading its weight in checkpoint `[N, K]` order: the `DenseContraction`
-    /// prefill GEMM. `weight` as in [`ContractionSpec::DenseSerial`].
-    DenseTiled {
-        /// Activation rows.
-        m: usize,
-        /// Reduction length.
-        k: usize,
-        /// Output columns, the weight's rows.
-        n: usize,
-        /// The tile edge; a workgroup is `tile * tile` lanes.
-        tile: usize,
-        /// First tile of this range, in the grid's tile order.
-        offset: usize,
-        /// Workgroups in this range.
-        groups: usize,
-        /// The weight's planned storage: `BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`.
-        weight: BufferStorage,
-        /// Pointwise steps applied to each output before the store, if any.
-        epilogue: Option<Epilogue>,
-    },
+    /// An `M > 1` contraction over a dense weight: the register-tiled loop nest ([`DenseTiledContraction`]).
+    DenseTiled(DenseTiledContraction),
     /// A contraction over a packed weight: the descriptor-driven decode of `format` served to the planner's
     /// schedule ([`PackedContraction`]).
     Packed(PackedContraction),
@@ -737,18 +597,33 @@ impl ContractionSpec {
     fn form(&self) -> &'static str {
         match self {
             Self::Serial { .. } => "serial",
-            Self::DenseSerial { .. } => "dense_serial",
-            Self::TensorCore { .. } => "tensor_core",
-            Self::Coopmat { .. } => "coopmat",
             Self::GemvChunk { .. } => "gemv_chunk",
             Self::DenseGemv { .. } => "dense_gemv",
             Self::AttnScoresVGemv { .. } => "attn_scores_v_gemv",
-            Self::TiledRegion { .. } => "tiled_region",
-            Self::DenseTiled { .. } => "dense_tiled",
+            Self::DenseTiled(_) => "dense_tiled",
             Self::Packed(_) => "packed",
             Self::Indexed(_) => "indexed",
         }
     }
+}
+
+/// An `M > 1` contraction over a dense weight: [`Schedule::RegisterTiled`]'s block-diagonal loop nest over `weight`
+/// (an `[N, K]` weight in any dense storage, or an f32 `[K, N]` one), with `epilogue` (f32) applied to each output
+/// before its store. The body is shape-generic; the planner chooses the tiling and the launch (the tiles folded
+/// onto the grid and split into tile ranges, each its own request), so `grid` and `meta` ride in the request.
+/// `meta` is `[K, out_per_block, m_per_block, x_groups, tile_offset]`.
+#[derive(Clone, Debug)]
+pub struct DenseTiledContraction {
+    /// The weight's orientation and planned storage.
+    pub weight: DenseTiledWeight,
+    /// The loop nest (a [`Schedule::RegisterTiled`]).
+    pub schedule: Schedule,
+    /// Pointwise steps applied to each output before the store, if any.
+    pub epilogue: Option<Epilogue>,
+    /// Total threads `[x, y, z]` the planner chose for the launch.
+    pub grid: [u32; 3],
+    /// The metadata buffer's contents.
+    pub meta: Vec<u32>,
 }
 
 /// A contraction over a packed weight in `format`: `schedule`'s loop nest over the weight's descriptor-driven
@@ -795,13 +670,14 @@ impl PackedRows {
 
 /// A contraction over a stacked `[E, K, N]` weight, `out[m, n] = sum over k of x[m, k] * W[ids[m], k, n]`: output
 /// row `m` reads expert slab `ids[m]`, and an id outside `0..E` makes that row NaN. `schedule` is
-/// [`Schedule::Gemv`] (decode) or [`Schedule::Tiled`], which is segmented here: a tile whose rows select several
-/// experts walks them. The activation and output are f32, the ids are `I32`, and the weight is read in `weight` storage (f32 or
+/// [`Schedule::Gemv`] (decode) or [`Schedule::RegisterTiled`], which is segmented here: a tile whose rows select
+/// several experts walks them. The activation and output are f32, the ids are `I32`, and the weight is read in `weight` storage (f32 or
 /// packed BF16); `epilogue` (f32) runs over each output element's sum before its store. The planner chooses the
-/// launch (the grid folded and checked against the device's limits) and the metadata `[K, N, E, M, x_groups]`.
+/// launch (the grid folded and checked against the device's limits) and the metadata `[K, N, M, x_groups,
+/// tile_offset, E]`.
 #[derive(Clone, Debug)]
 pub struct IndexedContraction {
-    /// [`Schedule::Gemv`] for decode or [`Schedule::Tiled`] for prefill.
+    /// [`Schedule::Gemv`] for decode or [`Schedule::RegisterTiled`] for prefill.
     pub schedule: Schedule,
     /// How each expert slab of the weight is stored: [`WeightLayout::Kn`] `[K, N]` or [`WeightLayout::Nk`] `[N, K]`.
     pub layout: WeightLayout,
@@ -812,7 +688,7 @@ pub struct IndexedContraction {
     pub epilogue: Option<Epilogue>,
     /// Total threads `[x, y, z]` the planner chose for the launch.
     pub grid: [u32; 3],
-    /// The metadata buffer's contents: `[K, N, E, M, x_groups]`.
+    /// The metadata buffer's contents: `[K, N, M, x_groups, tile_offset, E]`.
     pub meta: Vec<u32>,
 }
 
@@ -856,6 +732,14 @@ pub struct TopKSpec {
     pub numel: usize,
 }
 
+/// The grouping of MoE rows by expert: `ids [M]` to `out [2, M]` (the sorted order and its inverse), one thread
+/// per expert plus one for the rows whose id is outside `0..experts`.
+#[derive(Clone, Debug)]
+pub struct ExpertGroupSpec {
+    /// The expert count; ids in `0..experts` are valid.
+    pub experts: usize,
+}
+
 fn leaf_shapes(leaves: &[ViewOperand]) -> Vec<&[usize]> {
     leaves.iter().map(|leaf| leaf.shape.as_slice()).collect()
 }
@@ -870,6 +754,56 @@ fn unsupported(request: &'static str, reason: &'static str) -> KernelGenError {
 
 fn with(body: Body, launch: Launch) -> Result<Generated, KernelGenError> {
     Ok(Generated { body, launch })
+}
+
+/// The bound every [`poot_kernel_ir::Ty::Usize`] value of `req`'s generated body stays under, as a function of the
+/// longest element count bound to any of its params (POOT-1405), or `None` for a body that forms an index from a
+/// value it reads out of a buffer, or whose index structure no generator here vouches for. The planner narrows a
+/// dispatch's index math to 32 bits only under such a bound ([`poot_kernel_ir::IndexWidth::U32`]).
+///
+/// The decode Gemv over a dense weight or a block-format packed one (`PackedRows::Blocks`) forms every index from
+/// its launch, its metadata (`K`, the outputs per block) and its buffers' lengths: an element of the activation,
+/// the output or an epilogue leaf, a weight element (`per_word` of them in a dense weight's word) or a packed word's
+/// bit (32 per word). Past `scale * n` it overshoots by at most a run that starts beyond `K` (`k0 + unroll` with
+/// `k0` below `K + width * unroll`), the last workgroup's columns past the output (below `width`) and a 32-bit
+/// window read past the last word's bit (64). A planar packed format (GPTQ act-order reads its group ids from a
+/// buffer) and a row-selected (`PackedRows::Indexed`) contraction (it reads expert ids) make no claim.
+pub fn index_bound(req: &KernelRequest) -> Option<poot_kernel_ir::IndexBound> {
+    let gemv_slack = |width: u32, unroll: u32| {
+        width
+            .checked_mul(unroll)?
+            .checked_add(unroll)?
+            .checked_add(width)?
+            .checked_add(64)
+    };
+    match req {
+        KernelRequest::Contraction(ContractionSpec::DenseGemv {
+            weight,
+            schedule: Schedule::Gemv { width, unroll, .. },
+            ..
+        }) => Some(poot_kernel_ir::IndexBound {
+            scale: crate::helpers::WeightLane::of("index_bound", *weight)
+                .ok()?
+                .per_word() as u32,
+            slack: gemv_slack(*width, *unroll)?,
+        }),
+        KernelRequest::Contraction(ContractionSpec::Packed(PackedContraction {
+            format,
+            rows: PackedRows::Blocks,
+            schedule: Schedule::Gemv { width, unroll, .. },
+            ..
+        })) if matches!(
+            format.descriptor().storage,
+            poot_quant::format::Storage::Blocks(_)
+        ) =>
+        {
+            Some(poot_kernel_ir::IndexBound {
+                scale: 32,
+                slack: gemv_slack(*width, *unroll)?,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Generate the kernel `req` names.
@@ -925,11 +859,16 @@ fn recipe_size(req: &KernelRequest) -> Option<BodySize> {
 
 fn build(req: &KernelRequest, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
     match req {
-        KernelRequest::Elementwise(spec) => elementwise(spec, Placement::Grid(caps)),
+        KernelRequest::Cast(spec) => cast(spec),
         KernelRequest::Pointwise(spec) => pointwise(spec, caps),
         KernelRequest::Row(spec) => row(spec, caps),
         KernelRequest::Contraction(spec) => contraction(spec, caps),
-        KernelRequest::Attention(spec) => attention(spec, caps),
+        KernelRequest::Attention(spec) => attention(spec, 0..spec.workgroups(), caps),
+        KernelRequest::AttentionRows(run) => attention(
+            &run.spec,
+            run.first..run.first.saturating_add(run.count),
+            caps,
+        ),
         KernelRequest::AttentionCombine(spec) => attention_combine(spec, caps),
         KernelRequest::Scan(spec) => scan(spec, caps),
         KernelRequest::BlockTopK(spec) => block_top_k(spec, caps),
@@ -958,112 +897,27 @@ fn build(req: &KernelRequest, caps: &DeviceCaps) -> Result<Generated, KernelGenE
             arg_top_k_dt(ENTRY, spec.e, spec.k),
             Launch::flat(spec.numel),
         ),
+        KernelRequest::ExpertGroup(spec) => with(
+            expert_group(ENTRY, spec.experts),
+            Launch::flat(spec.experts + 1),
+        ),
     }
 }
 
-fn elementwise(
-    spec: &ElementwiseSpec,
-    placement: Placement<'_>,
-) -> Result<Generated, KernelGenError> {
+fn cast(spec: &CastSpec) -> Result<Generated, KernelGenError> {
     match spec {
-        ElementwiseSpec::Unary { op, dt, view, fold } => {
-            let xg = placement.x_groups(*fold);
-            let dt = dt.clone();
-            let body = match (op, view) {
-                (UnaryOp::Basic(op), None) => unary_dt_grid(ENTRY, dt, *op, xg),
-                (UnaryOp::Basic(op), Some(v)) => {
-                    unary_dt_views_grid(ENTRY, dt, *op, &v.shape, &v.layout, xg)
-                }
-                (UnaryOp::Recip, None) => recip_dt_grid(ENTRY, dt, xg),
-                (UnaryOp::Recip, Some(v)) => {
-                    recip_dt_views_grid(ENTRY, dt, &v.shape, &v.layout, xg)
-                }
-                (UnaryOp::Math(op), None) => math_unary_dt_grid(ENTRY, dt, *op, xg),
-                (UnaryOp::Math(op), Some(v)) => {
-                    math_unary_dt_views_grid(ENTRY, dt, *op, &v.shape, &v.layout, xg)
-                }
-                (UnaryOp::ClzI32, None) => unary_i32_clz_grid(ENTRY, xg),
-                (UnaryOp::ClzI32, Some(v)) => {
-                    unary_i32_clz_views_grid(ENTRY, &v.shape, &v.layout, xg)
-                }
-                (UnaryOp::Tanh, None) => tanh_dt(ENTRY, dt),
-                (UnaryOp::Erf, None) => erf_dt(ENTRY, dt),
-                (UnaryOp::Tanh | UnaryOp::Erf, Some(_)) => {
-                    return Err(unsupported(
-                        "unary",
-                        "no view-capable body for this transcendental",
-                    ));
-                }
-            };
-            with(body, placement.launch(*fold))
-        }
-        ElementwiseSpec::ScalarFloat {
-            op,
-            dt,
-            lit_bits,
-            fold,
-        } => with(
-            binary_scalar_dt_grid(
-                ENTRY,
-                *op,
-                dt.clone(),
-                f32::from_bits(*lit_bits),
-                placement.x_groups(*fold),
-            ),
-            placement.launch(*fold),
+        CastSpec::F32ToBf16 { numel } => with(cast_f32_to_bf16(ENTRY), Launch::flat(*numel)),
+        CastSpec::F32ToF16 { numel } => with(cast_f32_to_f16(ENTRY), Launch::flat(*numel)),
+        CastSpec::F16ToF32 { numel } => with(cast_f16_to_f32(ENTRY), Launch::flat(*numel)),
+        CastSpec::Bf16ToF32 { numel } => with(cast_bf16_to_f32(ENTRY), Launch::flat(*numel)),
+        CastSpec::I32ToF32 { numel } => with(cast_i32_to_f32(ENTRY), Launch::flat(*numel)),
+        CastSpec::F32ToE4m3 { out_shape, row_len } => with(
+            f32_to_e4m3fn_packed(ENTRY, *row_len)?,
+            Launch::flat(Storage::BYTE_LANES.units(out_shape)),
         ),
-        ElementwiseSpec::ScalarI32 { op, lit, fold } => {
-            let xg = placement.x_groups(*fold);
-            let body = match op {
-                I32Binary::GeU => binary_scalar_i32_geu_grid(ENTRY, *lit, xg),
-                I32Binary::RemU => binary_scalar_i32_remu_grid(ENTRY, *lit, xg),
-                I32Binary::Basic(op) => binary_scalar_i32_grid(ENTRY, *op, *lit, xg),
-            };
-            with(body, placement.launch(*fold))
+        CastSpec::E4m3ToF32 { row_len, numel } => {
+            with(e4m3fn_packed_to_f32(ENTRY, *row_len)?, Launch::flat(*numel))
         }
-        ElementwiseSpec::Binary {
-            op,
-            out_shape,
-            a,
-            b,
-            fold,
-        } => {
-            let xg = placement.x_groups(*fold);
-            let body = match op {
-                ValueBinary::GeU => binary_broadcast_i32_geu_views_grid(
-                    ENTRY, out_shape, &a.shape, &a.layout, &b.shape, &b.layout, xg,
-                ),
-                ValueBinary::RemU => binary_broadcast_i32_remu_views_grid(
-                    ENTRY, out_shape, &a.shape, &a.layout, &b.shape, &b.layout, xg,
-                ),
-                ValueBinary::Basic(op, dt) => binary_broadcast_dt_views_grid(
-                    ENTRY,
-                    *op,
-                    dt.clone(),
-                    out_shape,
-                    &a.shape,
-                    &a.layout,
-                    &b.shape,
-                    &b.layout,
-                    xg,
-                ),
-            };
-            with(body, placement.launch(*fold))
-        }
-        ElementwiseSpec::Cast(cast) => match cast {
-            CastSpec::F32ToBf16 { numel } => with(cast_f32_to_bf16(ENTRY), Launch::flat(*numel)),
-            CastSpec::F32ToF16 { numel } => with(cast_f32_to_f16(ENTRY), Launch::flat(*numel)),
-            CastSpec::F16ToF32 { numel } => with(cast_f16_to_f32(ENTRY), Launch::flat(*numel)),
-            CastSpec::Bf16ToF32 { numel } => with(cast_bf16_to_f32(ENTRY), Launch::flat(*numel)),
-            CastSpec::I32ToF32 { numel } => with(cast_i32_to_f32(ENTRY), Launch::flat(*numel)),
-            CastSpec::F32ToE4m3 { out_shape, row_len } => with(
-                f32_to_e4m3fn_packed(ENTRY, *row_len)?,
-                Launch::flat(Storage::BYTE_LANES.units(out_shape)),
-            ),
-            CastSpec::E4m3ToF32 { row_len, numel } => {
-                with(e4m3fn_packed_to_f32(ENTRY, *row_len)?, Launch::flat(*numel))
-            }
-        },
     }
 }
 
@@ -1179,66 +1033,30 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             };
             fold.contraction(body, caps)
         }
-        ContractionSpec::DenseSerial {
-            weight,
-            shapes,
-            fold,
-        } => {
-            let body = matmul_batched_nk_grid(
-                ENTRY,
-                *weight,
-                &shapes.out_shape,
-                &shapes.a_shape,
-                &shapes.b_shape,
-                fold.x_groups(caps),
-            )?;
-            fold.contraction(body, caps)
-        }
-        ContractionSpec::TensorCore { dt, shapes } => {
-            let body = matmul_tensorcore(
-                ENTRY,
-                dt.clone(),
-                &shapes.out_shape,
-                &shapes.a_shape,
-                &shapes.b_shape,
-            )?;
-            let r = shapes.out_shape.len();
-            let (mm, nn) = (shapes.out_shape[r - 2], shapes.out_shape[r - 1]);
-            let batch: usize = shapes.out_shape[..r - 2].iter().product();
-            let tiles = (mm / 16) * (nn / 16);
-            with(body, Launch::flat(batch * tiles * 256))
-        }
-        ContractionSpec::Coopmat { shapes } => {
-            let body = matmul_tensorcore_coopmat(
-                ENTRY,
-                &shapes.out_shape,
-                &shapes.a_shape,
-                &shapes.b_shape,
-            )?;
-            let r = shapes.out_shape.len();
-            let batch: usize = shapes.out_shape[..r - 2].iter().product();
-            let tiles = (shapes.out_shape[r - 2] / 16) * (shapes.out_shape[r - 1] / 16);
-            with(body, Launch::flat(batch * tiles * 32))
-        }
         ContractionSpec::GemvChunk {
             k,
             n,
             width,
             elems,
             offset,
-        } => with(
-            gemv_lds(
-                ENTRY,
-                *k,
-                *n,
-                *width,
-                *elems,
-                *offset,
-                WeightLayout::Kn,
-                BufferStorage::f32(),
-            )?,
-            Launch::flat(elems * width),
-        ),
+        } => {
+            // One workgroup per output element, X filling to the device's cap and the rest spilling onto Y: the
+            // same body whether the planner launches the whole output or one watchdog-sized range of it.
+            let (x, y) = fold_within_grid("gemv_lds", *elems, caps)?;
+            with(
+                gemv_lds(
+                    ENTRY,
+                    *k,
+                    *n,
+                    *width,
+                    x,
+                    *offset,
+                    WeightLayout::Kn,
+                    BufferStorage::f32(),
+                )?,
+                Launch::grid([(x * width) as u32, y as u32, 1]),
+            )
+        }
         ContractionSpec::DenseGemv {
             weight,
             schedule,
@@ -1291,51 +1109,31 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                 Launch::grid([(x * width) as u32, y as u32, 1]),
             )
         }
-        ContractionSpec::TiledRegion {
-            m,
-            k,
-            n,
-            tile,
-            offset,
-            groups,
-            epilogue,
-        } => with(
-            tiled_region(
-                "tiled_region",
-                *m,
-                *k,
-                *n,
-                *tile,
-                *offset,
-                WeightLayout::Kn,
-                BufferStorage::f32(),
-                epilogue.as_ref(),
-            )?,
-            Launch::flat(groups * tile * tile),
-        ),
-        ContractionSpec::DenseTiled {
-            m,
-            k,
-            n,
-            tile,
-            offset,
-            groups,
+        ContractionSpec::DenseTiled(DenseTiledContraction {
             weight,
+            schedule,
             epilogue,
-        } => with(
-            tiled_region(
-                "dense_tiled",
-                *m,
-                *k,
-                *n,
-                *tile,
-                *offset,
-                WeightLayout::Nk,
-                *weight,
-                epilogue.as_ref(),
-            )?,
-            Launch::flat(groups * tile * tile),
-        ),
+            grid,
+            meta,
+        }) => {
+            let k = meta.first().copied().ok_or(KernelGenError::Unsupported {
+                request: "dense_tiled_contraction",
+                reason: "the tiled metadata starts with K",
+            })?;
+            with(
+                dense_tiled_contraction(
+                    "dense_tiled",
+                    *weight,
+                    *schedule,
+                    k as usize,
+                    epilogue.as_ref(),
+                )?,
+                Launch {
+                    grid: *grid,
+                    meta: Some(meta.clone()),
+                },
+            )
+        }
         ContractionSpec::Indexed(IndexedContraction {
             schedule,
             layout,
@@ -1344,7 +1142,14 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             grid,
             meta,
         }) => with(
-            indexed_contraction(ENTRY, *schedule, *layout, *weight, epilogue.as_ref())?,
+            indexed_contraction(
+                ENTRY,
+                *schedule,
+                *layout,
+                *weight,
+                meta.first().map_or(0, |&k| k as usize),
+                epilogue.as_ref(),
+            )?,
             Launch {
                 grid: *grid,
                 meta: Some(meta.clone()),
@@ -1372,12 +1177,17 @@ fn fold_within_grid(
     Ok((x, y))
 }
 
-fn attention(spec: &AttentionSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
+fn attention(
+    spec: &AttentionSpec,
+    rows: std::ops::Range<usize>,
+    caps: &DeviceCaps,
+) -> Result<Generated, KernelGenError> {
     let lanes = spec.schedule.lanes();
-    // One workgroup of `lanes` threads per (batch, head, row[, split]), folded onto a 2-D grid past the X cap.
-    let (x, y) = fold_within_grid("attention_body", spec.workgroups(), caps)?;
+    // One workgroup of `lanes` threads per (batch, head, row[, split]) of the run, folded onto a 2-D grid past
+    // the X cap.
+    let (x, y) = fold_within_grid("attention_body", rows.len(), caps)?;
     with(
-        attention_body(ENTRY, spec, x)?,
+        attention_body(ENTRY, spec, rows, x)?,
         Launch::grid([(x * lanes) as u32, y as u32, 1]),
     )
 }
@@ -1415,32 +1225,6 @@ fn movement(spec: &MovementSpec, caps: &DeviceCaps) -> Result<Generated, KernelG
         movement_body(ENTRY, spec, spec.fold.x_groups(caps))?,
         spec.fold.launch(caps),
     )
-}
-
-/// How an elementwise kernel's threads are placed: on a device's thread grid, or run one after another by a
-/// single core.
-#[derive(Clone, Copy)]
-enum Placement<'a> {
-    /// A thread grid bounded by the device's caps (the 2-D fold reads them).
-    Grid(&'a DeviceCaps),
-    /// One core, no grid cap: the planner never folds a kernel it serializes.
-    Serial,
-}
-
-impl Placement<'_> {
-    fn x_groups(self, fold: Fold) -> Option<usize> {
-        match self {
-            Placement::Grid(caps) => fold.x_groups(caps),
-            Placement::Serial => None,
-        }
-    }
-
-    fn launch(self, fold: Fold) -> Launch {
-        match self {
-            Placement::Grid(caps) => fold.launch(caps),
-            Placement::Serial => Launch::flat(fold.numel),
-        }
-    }
 }
 
 /// How far an AIE op's F32 result may be from the exact (infinitely precise) result, for finite operands
@@ -1488,8 +1272,8 @@ pub struct NumericalContract {
 pub enum AieOp {
     /// `a <op> b` over F32.
     Binary(BinOp),
-    /// `<op>(x)` over F32.
-    Unary(UnaryOp),
+    /// `<op>(x)` over F32: a unary [`FusedScalarOp`] (`Unary`, `Math`, `Recip`, `Tanh` or `Erf`).
+    Unary(FusedScalarOp),
 }
 
 /// The relative error of the core's software square root over positive normal numbers
@@ -1530,17 +1314,17 @@ impl AieOp {
             // A compare and select (the core aborts Peano's `llvm.maxnum`), so the result is one of the
             // operands, exactly. NaN operands are outside the contract.
             AieOp::Binary(BinOp::Max) => exact("f32-max-select-v1"),
-            AieOp::Unary(UnaryOp::Basic(UnOp::Neg)) => exact("f32-neg-v1"),
-            AieOp::Unary(UnaryOp::Recip) => exact("f32-recip-rne-v1"),
+            AieOp::Unary(FusedScalarOp::Unary(UnOp::Neg)) => exact("f32-neg-v1"),
+            AieOp::Unary(FusedScalarOp::Recip) => exact("f32-recip-rne-v1"),
             // The software sequences (`poot-codegen`'s AIE core lowering): exp clamps its argument to
             // [-88, 88], log is the atanh series, tanh and erf are the devices' shared closed forms.
-            AieOp::Unary(UnaryOp::Math(MathOp::Exp)) => {
+            AieOp::Unary(FusedScalarOp::Math(MathOp::Exp)) => {
                 software("f32-exp-software-v1", (-87.0, 88.0))
             }
-            AieOp::Unary(UnaryOp::Math(MathOp::Log)) => {
+            AieOp::Unary(FusedScalarOp::Math(MathOp::Log)) => {
                 software("f32-log-software-v1", (f32::MIN_POSITIVE, f32::MAX))
             }
-            AieOp::Unary(UnaryOp::Math(MathOp::Sqrt)) => NumericalContract {
+            AieOp::Unary(FusedScalarOp::Math(MathOp::Sqrt)) => NumericalContract {
                 id: "f32-sqrt-software-v1",
                 bound: ErrorBound::Result {
                     abs: 0.0,
@@ -1548,8 +1332,8 @@ impl AieOp {
                 },
                 domain: (f32::MIN_POSITIVE, f32::MAX),
             },
-            AieOp::Unary(UnaryOp::Tanh) => software("f32-tanh-software-v1", FINITE),
-            AieOp::Unary(UnaryOp::Erf) => software("f32-erf-software-v1", FINITE),
+            AieOp::Unary(FusedScalarOp::Tanh) => software("f32-tanh-software-v1", FINITE),
+            AieOp::Unary(FusedScalarOp::Erf) => software("f32-erf-software-v1", FINITE),
             AieOp::Binary(_) | AieOp::Unary(_) => return None,
         })
     }
@@ -1566,7 +1350,7 @@ const AIE_ENTRY: &str = "poot_aie_kernel";
 /// one-lane form of the same generator instead) and its ops have a [`NumericalContract`]. The iteration
 /// count and the proved access ranges come back in [`SerializedGenerated`].
 ///
-/// Three families have an AIE schedule: a dense equal-shape F32 elementwise unary or binary op, a last-axis
+/// Three families have an AIE schedule: a dense equal-shape F32 one-step pointwise unary or binary op, a last-axis
 /// row reduction or fused row kernel (a norm) over dense F32, and a gather of F32 or I32 elements. Any other
 /// request is a typed [`KernelGenError::Unsupported`] (no emulated grid, no host fallback).
 pub fn serialized_schedule(
@@ -1575,7 +1359,7 @@ pub fn serialized_schedule(
 ) -> Result<SerializedGenerated, KernelGenError> {
     const GENERATOR: &str = "serialized_schedule";
     let scheduled = match req {
-        KernelRequest::Elementwise(spec) => serialized_elementwise(spec)?,
+        KernelRequest::Pointwise(spec) => serialized_pointwise(spec)?,
         KernelRequest::Row(spec) => serialized_row(spec)?,
         KernelRequest::Movement(spec) => serialized_movement(spec)?,
         _ => {
@@ -1627,29 +1411,39 @@ fn read_f32(accessed: u64) -> SerializedAccess {
     }
 }
 
-/// A dense, equal-shape F32 elementwise unary or binary op with a contract.
-fn serialized_elementwise(spec: &ElementwiseSpec) -> Result<Scheduled, KernelGenError> {
+/// A dense, equal-shape F32 pointwise region of one unary or binary step with a contract.
+fn serialized_pointwise(spec: &PointwiseSpec) -> Result<Scheduled, KernelGenError> {
     const GENERATOR: &str = "serialized_schedule";
-    let (op, out_shape, operands, fold) = match spec {
-        ElementwiseSpec::Binary {
-            op: ValueBinary::Basic(op, Ty::F32),
-            out_shape,
-            a,
-            b,
-            fold,
-        } => (AieOp::Binary(*op), out_shape.clone(), vec![a, b], fold),
-        ElementwiseSpec::Unary {
-            op,
-            dt: Ty::F32,
-            view: None,
-            fold,
-        } => (AieOp::Unary(*op), vec![fold.numel], Vec::new(), fold),
-        _ => {
-            return Err(unsupported(
-                GENERATOR,
-                "only F32 elementwise unary and binary ops have an AIE schedule",
-            ));
-        }
+    let only_f32_ops = || {
+        unsupported(
+            GENERATOR,
+            "only F32 elementwise unary and binary ops have an AIE schedule",
+        )
+    };
+    let (PointwiseForm::Float { fold }, [step]) = (&spec.form, spec.kernel.steps.as_slice()) else {
+        return Err(only_f32_ops());
+    };
+    let reads_leaves_in_order = step.inputs.iter().enumerate().all(
+        |(position, input)| matches!(input, FusedInput::Leaf(leaf) if leaf.index() == position),
+    );
+    if !reads_leaves_in_order
+        || spec.kernel.leaf_tys.iter().any(|&leaf| leaf != LeafTy::F32)
+        || spec.kernel.leaf_tys.len() != step.inputs.len()
+        || !matches!(spec.kernel.output, FusedInput::Step(step) if step.index() == 0)
+    {
+        return Err(only_f32_ops());
+    }
+    let op = match (step.op, step.inputs.len()) {
+        (FusedScalarOp::Binary(op), 2) => AieOp::Binary(op),
+        (
+            op @ (FusedScalarOp::Unary(_)
+            | FusedScalarOp::Math(_)
+            | FusedScalarOp::Recip
+            | FusedScalarOp::Tanh
+            | FusedScalarOp::Erf),
+            1,
+        ) => AieOp::Unary(op),
+        _ => return Err(only_f32_ops()),
     };
     let contract = op.contract().ok_or_else(|| {
         unsupported(
@@ -1657,8 +1451,8 @@ fn serialized_elementwise(spec: &ElementwiseSpec) -> Result<Scheduled, KernelGen
             "the AIE core has no proved lowering and numerical contract for this op",
         )
     })?;
-    for operand in &operands {
-        if operand.shape != out_shape {
+    for operand in &spec.leaves {
+        if operand.shape != spec.out_shape {
             return Err(unsupported(
                 GENERATOR,
                 "an operand is broadcast against the output; the AIE shape ABI binds dense equal-shape buffers",
@@ -1677,7 +1471,18 @@ fn serialized_elementwise(spec: &ElementwiseSpec) -> Result<Scheduled, KernelGen
             "a 2-D folded launch has no AIE schedule; the core loops the whole tensor",
         ));
     }
-    let generated = elementwise(spec, Placement::Serial)?;
+    // One core, no grid cap: the planner never folds a kernel it serializes.
+    let generated = with(
+        fused_views(
+            ENTRY,
+            &spec.out_shape,
+            &leaf_shapes(&spec.leaves),
+            &leaf_layouts(&spec.leaves),
+            &spec.kernel,
+            None,
+        )?,
+        Launch::flat(fold.numel),
+    )?;
     let iterations = generated
         .launch
         .grid
@@ -1692,7 +1497,7 @@ fn serialized_elementwise(spec: &ElementwiseSpec) -> Result<Scheduled, KernelGen
             bound: u32::MAX as usize,
         });
     }
-    let accesses = std::iter::repeat_n(read_f32(iterations), operands.len().max(1))
+    let accesses = std::iter::repeat_n(read_f32(iterations), step.inputs.len())
         .chain([SerializedAccess {
             writes: true,
             ..read_f32(iterations)
@@ -1975,6 +1780,7 @@ mod tests {
                         width: 256,
                         cols: 4,
                         unroll: 4,
+                        activation: crate::GemvActivation::Scalar,
                     },
                     k: 896,
                     n: 4864,
@@ -2008,13 +1814,12 @@ mod tests {
                 "contraction:attn_scores_v_gemv".to_string(),
             ),
             (
-                KernelRequest::Elementwise(ElementwiseSpec::Unary {
-                    op: UnaryOp::Basic(UnOp::Neg),
-                    dt: Ty::F32,
-                    view: None,
-                    fold,
-                }),
-                "elementwise".to_string(),
+                KernelRequest::Cast(CastSpec::F32ToBf16 { numel: 4 }),
+                "cast".to_string(),
+            ),
+            (
+                dense_unary(FusedScalarOp::Unary(UnOp::Neg), 4),
+                "pointwise".to_string(),
             ),
             (
                 KernelRequest::TopK(TopKSpec {
@@ -2023,6 +1828,10 @@ mod tests {
                     numel: 2,
                 }),
                 "topk".to_string(),
+            ),
+            (
+                KernelRequest::ExpertGroup(ExpertGroupSpec { experts: 8 }),
+                "expert_group".to_string(),
             ),
         ];
         for (request, want) in cases {
@@ -2056,6 +1865,37 @@ mod tests {
             "one {width}-lane workgroup per output element of all {batch} rows, not per column"
         );
         assert_eq!(generated.launch.meta, None);
+    }
+
+    /// A one-dispatch [`ContractionSpec::DenseTiled`] of `m` rows over an `[N, K]` (or `[K, N]`) `weight`, the
+    /// tiling the planner would choose on `caps` and every tile on the X grid (the shapes here are small).
+    fn dense_tiled(
+        weight: DenseTiledWeight,
+        (m, k, n): (usize, usize, usize),
+        epilogue: Option<Epilogue>,
+        caps: &DeviceCaps,
+    ) -> ContractionSpec {
+        let tiling = crate::RegisterTiling::choose(
+            crate::TiledShape {
+                blocks: 1,
+                m_per_block: m,
+                out_per_block: n,
+                k,
+                layout: weight.layout(),
+                segments: 1,
+            },
+            caps,
+        );
+        let (tile_rows, tile_cols) = tiling.output_tile();
+        let tiles = m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
+        let lanes = tiling.lanes() * tiling.lanes();
+        ContractionSpec::DenseTiled(DenseTiledContraction {
+            weight,
+            schedule: tiling.schedule(),
+            epilogue,
+            grid: [(tiles * lanes) as u32, 1, 1],
+            meta: vec![k as u32, n as u32, m as u32, tiles as u32, 0],
+        })
     }
 
     /// Finite BF16 bit patterns (both signs, exponents around zero) from a fixed xorshift stream.
@@ -2168,6 +2008,7 @@ mod tests {
                             width: 16,
                             cols: 2,
                             unroll: 2,
+                            activation: crate::GemvActivation::Scalar,
                         },
                         k,
                         n,
@@ -2176,16 +2017,12 @@ mod tests {
                     weight_values.clone(),
                 ),
                 (
-                    ContractionSpec::DenseTiled {
-                        m: 1,
-                        k,
-                        n,
-                        tile: 8,
-                        offset: 0,
-                        groups: n.div_ceil(8),
-                        weight: BufferStorage::f32(),
-                        epilogue: Some(epilogue(storage)),
-                    },
+                    dense_tiled(
+                        DenseTiledWeight::Nk(BufferStorage::f32()),
+                        (1, k, n),
+                        Some(epilogue(storage)),
+                        &DeviceCaps::wgpu_rdna3_igpu(),
+                    ),
                     weight_values.clone(),
                 ),
                 (
@@ -2231,7 +2068,7 @@ mod tests {
     fn packed_spec_name(spec: &ContractionSpec) -> &'static str {
         match spec {
             ContractionSpec::DenseGemv { .. } => "dense gemv",
-            ContractionSpec::DenseTiled { .. } => "dense tiled",
+            ContractionSpec::DenseTiled(_) => "dense tiled",
             _ => "serial",
         }
     }
@@ -2282,8 +2119,8 @@ mod tests {
         buffers.last().unwrap().to_f32s().unwrap()
     }
 
-    /// Card 1007: every `DenseContraction` body (the M == 1 GEMV, the tiled GEMM at M = 4 and 33, with and
-    /// without the K-unrolled slab path, and the one-thread-per-output kernel) reads a packed-F16 `[N, K]` weight
+    /// Card 1007: every `DenseContraction` body (the M == 1 GEMV and the register-tiled GEMM at M = 4 and 33, with
+    /// an odd `K` read element by element and an even one in whole words) reads a packed-F16 `[N, K]` weight
     /// to the bit what it reads from an f32 buffer holding the same weight's decoded values, and that f32 body
     /// matches a host dot product. The weights are odd-sized, so the last packed word carries one element and a
     /// zero pad. Mutation: in `WeightLane::read` take the half at `(1 - idx % 2) * 16` (the other element of each
@@ -2293,7 +2130,7 @@ mod tests {
         use poot_kernel_ir::interp::Buffer;
         let f16 = BufferStorage::f16_packed();
         let f32_storage = BufferStorage::f32();
-        // (m, k, n): GEMV; tiled (K not a slab multiple, then a multiple of the 4 x 8 slab); serial.
+        // (m, k, n): GEMV; register-tiled (odd K read element by element, then even K in whole words).
         for (m, k, n) in [
             (1usize, 37usize, 5usize),
             (4, 37, 5),
@@ -2310,7 +2147,6 @@ mod tests {
                 .map(|&b| poot_quant::scalar::f16_to_f32(b))
                 .collect();
             let request = |weight: BufferStorage| {
-                let tile = 8;
                 KernelRequest::Contraction(match (m, k) {
                     (1, _) => ContractionSpec::DenseGemv {
                         weight,
@@ -2318,34 +2154,18 @@ mod tests {
                             width: 16,
                             cols: 2,
                             unroll: 2,
+                            activation: crate::GemvActivation::Scalar,
                         },
                         k,
                         n,
                         epilogue: None,
                     },
-                    (4, 19) => ContractionSpec::DenseSerial {
-                        weight,
-                        shapes: MatmulShapes {
-                            out_shape: vec![m, n],
-                            a_shape: vec![m, k],
-                            b_shape: vec![n, k],
-                        },
-                        fold: Fold {
-                            numel: m * n,
-                            two_d: false,
-                            width: 64,
-                        },
-                    },
-                    _ => ContractionSpec::DenseTiled {
-                        m,
-                        k,
-                        n,
-                        tile,
-                        offset: 0,
-                        groups: m.div_ceil(2 * tile) * n.div_ceil(tile),
-                        weight,
-                        epilogue: None,
-                    },
+                    _ => dense_tiled(
+                        DenseTiledWeight::Nk(weight),
+                        (m, k, n),
+                        None,
+                        &DeviceCaps::wgpu_rdna3_igpu(),
+                    ),
                 })
             };
             let packed = interpret(
@@ -2397,6 +2217,7 @@ mod tests {
                     width: 16,
                     cols: 2,
                     unroll: 2,
+                    activation: crate::GemvActivation::Scalar,
                 },
                 k: 8,
                 n: 4,
@@ -2476,6 +2297,7 @@ mod tests {
                             width,
                             cols,
                             unroll,
+                            activation: crate::GemvActivation::Scalar,
                         },
                         k,
                         n,
@@ -2693,35 +2515,42 @@ mod tests {
 
     // ---- POOT-1161: the AIE schedule is the ordinary body with its grid serialized -----------------------
 
-    fn dense_binary(op: BinOp, shape: &[usize]) -> KernelRequest {
-        let operand = || ViewOperand {
-            shape: shape.to_vec(),
-            layout: Layout::contiguous(shape),
-        };
-        KernelRequest::Elementwise(ElementwiseSpec::Binary {
-            op: ValueBinary::Basic(op, Ty::F32),
+    /// The pointwise region of one F32 `op` step over `operands` dense leaves of `shape`: the request the planner
+    /// builds for a unary or binary equation.
+    fn pointwise_request(op: FusedScalarOp, shape: &[usize], operands: usize) -> KernelRequest {
+        let numel = shape.iter().product();
+        KernelRequest::Pointwise(PointwiseSpec {
             out_shape: shape.to_vec(),
-            a: operand(),
-            b: operand(),
-            fold: Fold {
-                numel: shape.iter().product(),
-                two_d: false,
-                width: 256,
+            numel,
+            leaves: (0..operands)
+                .map(|_| ViewOperand {
+                    shape: shape.to_vec(),
+                    layout: Layout::contiguous(shape),
+                })
+                .collect(),
+            kernel: FusedKernel::one_step(
+                op,
+                vec![LeafTy::F32; operands],
+                (0..operands)
+                    .map(|leaf| FusedInput::Leaf(crate::fused::LeafId::new(leaf)))
+                    .collect(),
+            ),
+            form: PointwiseForm::Float {
+                fold: Fold {
+                    numel,
+                    two_d: false,
+                    width: 256,
+                },
             },
         })
     }
 
-    fn dense_unary(op: UnaryOp, numel: usize) -> KernelRequest {
-        KernelRequest::Elementwise(ElementwiseSpec::Unary {
-            op,
-            dt: Ty::F32,
-            view: None,
-            fold: Fold {
-                numel,
-                two_d: false,
-                width: 256,
-            },
-        })
+    fn dense_binary(op: BinOp, shape: &[usize]) -> KernelRequest {
+        pointwise_request(FusedScalarOp::Binary(op), shape, 2)
+    }
+
+    fn dense_unary(op: FusedScalarOp, numel: usize) -> KernelRequest {
+        pointwise_request(op, &[numel], 1)
     }
 
     /// Every op with a contract, as the request the planner builds for it.
@@ -2736,13 +2565,13 @@ mod tests {
         ]
         .map(|op| (AieOp::Binary(op), dense_binary(op, &[numel])));
         let unary = [
-            UnaryOp::Basic(UnOp::Neg),
-            UnaryOp::Recip,
-            UnaryOp::Math(MathOp::Exp),
-            UnaryOp::Math(MathOp::Log),
-            UnaryOp::Math(MathOp::Sqrt),
-            UnaryOp::Tanh,
-            UnaryOp::Erf,
+            FusedScalarOp::Unary(UnOp::Neg),
+            FusedScalarOp::Recip,
+            FusedScalarOp::Math(MathOp::Exp),
+            FusedScalarOp::Math(MathOp::Log),
+            FusedScalarOp::Math(MathOp::Sqrt),
+            FusedScalarOp::Tanh,
+            FusedScalarOp::Erf,
         ]
         .map(|op| (AieOp::Unary(op), dense_unary(op, numel)));
         binary.into_iter().chain(unary).collect()
@@ -3169,7 +2998,8 @@ mod tests {
         );
         assert!(binary.body.verify().is_ok());
 
-        let unary = serialized_schedule(&dense_unary(UnaryOp::Tanh, 5), &aie_limits()).unwrap();
+        let unary =
+            serialized_schedule(&dense_unary(FusedScalarOp::Tanh, 5), &aie_limits()).unwrap();
         assert_eq!(unary.iterations, 5);
         assert_eq!(
             unary.accesses.iter().map(|a| a.writes).collect::<Vec<_>>(),
@@ -3193,8 +3023,8 @@ mod tests {
         let without = [
             dense_binary(BinOp::BitAnd, &[4]),
             dense_binary(BinOp::Rem, &[4]),
-            dense_unary(UnaryOp::Math(MathOp::Round), 4),
-            dense_unary(UnaryOp::Math(MathOp::Sin), 4),
+            dense_unary(FusedScalarOp::Math(MathOp::Round), 4),
+            dense_unary(FusedScalarOp::Math(MathOp::Sin), 4),
         ];
         for request in without {
             let error = serialized_schedule(&request, &aie_limits()).unwrap_err();
@@ -3211,7 +3041,8 @@ mod tests {
     /// `unsupported(..)` in `serialized_schedule`; the match below fails.
     #[test]
     fn a_grid_the_serializer_refuses_is_its_own_typed_error() {
-        let error = serialized_schedule(&dense_unary(UnaryOp::Tanh, 0), &aie_limits()).unwrap_err();
+        let error =
+            serialized_schedule(&dense_unary(FusedScalarOp::Tanh, 0), &aie_limits()).unwrap_err();
         let KernelGenError::Serialize { generator, source } = error else {
             panic!("expected Serialize, got {error:?}");
         };
@@ -3243,78 +3074,60 @@ mod tests {
                 other => panic!("expected Unsupported, got {other:?}"),
             }
         };
-        let KernelRequest::Elementwise(ElementwiseSpec::Binary {
-            op,
-            out_shape,
-            a,
-            b,
-            fold,
-        }) = dense_binary(BinOp::Add, &[2, 3])
-        else {
+        let KernelRequest::Pointwise(base) = dense_binary(BinOp::Add, &[2, 3]) else {
             unreachable!()
         };
-        let binary = |a: ViewOperand, b: ViewOperand, fold: Fold| {
-            KernelRequest::Elementwise(ElementwiseSpec::Binary {
-                op: op.clone(),
-                out_shape: out_shape.clone(),
-                a,
-                b,
-                fold,
-            })
+        let fold = Fold {
+            numel: 6,
+            two_d: false,
+            width: 256,
+        };
+        let edited = |edit: &dyn Fn(&mut PointwiseSpec)| {
+            let mut spec = base.clone();
+            edit(&mut spec);
+            KernelRequest::Pointwise(spec)
         };
         refused(
-            binary(
-                ViewOperand {
+            edited(&|spec| {
+                spec.leaves[0] = ViewOperand {
                     shape: vec![1, 3],
                     layout: Layout::contiguous(&[1, 3]),
-                },
-                b.clone(),
-                fold,
-            ),
+                }
+            }),
             "broadcast",
         );
         refused(
-            binary(
-                ViewOperand {
-                    shape: vec![2, 3],
-                    layout: Layout {
-                        strides: vec![1, 2],
-                        offset: 0,
-                    },
-                },
-                b.clone(),
-                fold,
-            ),
+            edited(&|spec| {
+                spec.leaves[0].layout = Layout {
+                    strides: vec![1, 2],
+                    offset: 0,
+                }
+            }),
             "strided",
         );
         refused(
-            binary(
-                a.clone(),
-                b.clone(),
-                Fold {
-                    two_d: true,
-                    ..fold
-                },
-            ),
+            edited(&|spec| {
+                spec.form = PointwiseForm::Float {
+                    fold: Fold {
+                        two_d: true,
+                        ..fold
+                    },
+                }
+            }),
             "2-D folded",
         );
-        let ints = KernelRequest::Elementwise(ElementwiseSpec::Binary {
-            op: ValueBinary::Basic(BinOp::Add, Ty::I32),
-            out_shape: vec![2, 3],
-            a: a.clone(),
-            b: b.clone(),
-            fold,
-        });
-        refused(ints, "only F32");
         refused(
-            KernelRequest::Elementwise(ElementwiseSpec::Unary {
-                op: UnaryOp::Tanh,
-                dt: Ty::F32,
-                view: Some(a),
-                fold,
-            }),
+            edited(&|spec| spec.form = PointwiseForm::ExactI32 { fold }),
             "only F32",
         );
+        let KernelRequest::Pointwise(mut view) = dense_unary(FusedScalarOp::Tanh, 6) else {
+            unreachable!()
+        };
+        view.leaves[0].layout = Layout {
+            strides: vec![2],
+            offset: 0,
+        };
+        refused(KernelRequest::Pointwise(view), "strided");
         refused(
             KernelRequest::TopK(TopKSpec {
                 e: 8,
@@ -3323,7 +3136,11 @@ mod tests {
             }),
             "no AIE schedule",
         );
-        let huge = dense_unary(UnaryOp::Tanh, u32::MAX as usize + 1);
+        refused(
+            KernelRequest::ExpertGroup(ExpertGroupSpec { experts: 8 }),
+            "no AIE schedule",
+        );
+        let huge = dense_unary(FusedScalarOp::Tanh, u32::MAX as usize + 1);
         assert!(matches!(
             serialized_schedule(&huge, &aie_limits()),
             Err(KernelGenError::ExceedsBound { .. })

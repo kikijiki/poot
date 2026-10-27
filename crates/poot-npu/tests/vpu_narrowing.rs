@@ -20,7 +20,7 @@ mod vpu_common;
 use poot_eval::test_support::StepFixture;
 use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::{Device, NoSync};
-use poot_executor_parity::{Fixture, fixture_weights, staged};
+use poot_executor_parity::{Fixture, fixture_weights, staged_on};
 use poot_graph_ir::{BinOp, Builder, Scalar, Slot, TensorType, Traced, UnOp};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore, WeightStoreBuilder};
@@ -171,7 +171,7 @@ fn attention_fragment() -> Fixture {
 fn measure(fixture: &Fixture) -> Option<(f32, f32)> {
     let mut npu = npu()?;
     let target = npu.engine.device().target();
-    let poot_graph_plan::Target::Vpu { caps, .. } = target else {
+    let poot_graph_plan::Target::Npu(poot_graph_plan::NpuTarget::Vpu { caps, .. }) = target else {
         panic!("the NPU device plans for a Vpu target");
     };
     let recorded = caps.narrowing.expect("the device records its contract");
@@ -183,7 +183,8 @@ fn measure(fixture: &Fixture) -> Option<(f32, f32)> {
         fixture_weights(fixture),
     )
     .unwrap();
-    let entry = poot_executor::Executor::add_entry(exec, exe, &staged(fixture, target)).unwrap();
+    let program = staged_on(&*exec, fixture, target);
+    let entry = poot_executor::Executor::add_entry(exec, exe, &program).unwrap();
     let mut oracle = oracle_for(&fixture.graph, &fixture.store);
     let mut worst = 0.0f32;
     for (i, step) in fixture.steps.iter().enumerate() {
@@ -300,7 +301,7 @@ fn an_f32_value_outside_the_narrowing_range_is_a_typed_error() {
         return;
     };
     let target = npu.engine.device().target();
-    let poot_graph_plan::Target::Vpu { caps, .. } = target else {
+    let poot_graph_plan::Target::Npu(poot_graph_plan::NpuTarget::Vpu { caps, .. }) = target else {
         panic!("the NPU device plans for a Vpu target");
     };
     let contract = caps.narrowing.expect("the device records its contract");
@@ -311,8 +312,8 @@ fn an_f32_value_outside_the_narrowing_range_is_a_typed_error() {
         fixture_weights(&fixture),
     )
     .unwrap();
-    let entry = poot_executor::Executor::add_entry(&mut npu.engine, exe, &staged(&fixture, target))
-        .unwrap();
+    let program = staged_on(&npu.engine, &fixture, target);
+    let entry = poot_executor::Executor::add_entry(&mut npu.engine, exe, &program).unwrap();
 
     let range_error = |result: Result<Vec<f32>, poot_executor::ExecError>| {
         let poot_executor::ExecError::Device(device) =

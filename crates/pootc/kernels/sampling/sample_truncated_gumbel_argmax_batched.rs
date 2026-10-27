@@ -29,12 +29,14 @@
 //! index sentinels for the non-finite-index and perturbed-argmax reduces. Finiteness is the bounds check
 //! `v >= f32::MIN && v <= f32::MAX` (see `argmax_batched.rs`).
 #![crate_type = "lib"]
+use poot_kernel_attr::kernel;
 use poot_kernel_intrinsics::{
-    group_index, local_index, no_contract_add, wg_read, wg_write, workgroup_barrier,
+    group_index_x, local_index_x, no_contract_add, wg_read, wg_write, workgroup_barrier,
 };
 const W: usize = 64;
 
-pub fn __poot_kernel_sample_truncated_gumbel_argmax_batched(
+#[kernel(workgroup(64), lds(f32, 64), lds(f32, 64), lds(f32, 64), lds(f32, 64))]
+pub fn sample_truncated_gumbel_argmax_batched(
     logits: &[f32],
     noise: &[f32],
     params: &[f32],
@@ -42,9 +44,9 @@ pub fn __poot_kernel_sample_truncated_gumbel_argmax_batched(
     dims: &[u32],
     out: &mut [i32],
 ) {
-    let b = group_index();
+    let b = group_index_x();
     let vocab = dims[0] as usize;
-    let lane = local_index();
+    let lane = local_index_x();
     let base = b * vocab;
     let inv_temp = params[b * 3];
     let floor_offset = params[b * 3 + 1];
@@ -72,9 +74,9 @@ pub fn __poot_kernel_sample_truncated_gumbel_argmax_batched(
         }
         j = j + W;
     }
-    wg_write(0, lane, local_max);
-    wg_write(1, lane, local_min);
-    wg_write(2, lane, local_bad);
+    wg_write::<f32>(0, lane, local_max);
+    wg_write::<f32>(1, lane, local_min);
+    wg_write::<f32>(2, lane, local_bad);
     workgroup_barrier();
     if lane == 0 {
         let mut m = -3.4028235e38f32;
@@ -82,28 +84,28 @@ pub fn __poot_kernel_sample_truncated_gumbel_argmax_batched(
         let mut nb = vocab as f32;
         let mut k = 0usize;
         while k < W {
-            let cv = wg_read(0, k);
+            let cv = wg_read::<f32>(0, k);
             if cv > m {
                 m = cv;
             }
-            let cn = wg_read(1, k);
+            let cn = wg_read::<f32>(1, k);
             if cn < n {
                 n = cn;
             }
-            let cb = wg_read(2, k);
+            let cb = wg_read::<f32>(2, k);
             if cb < nb {
                 nb = cb;
             }
             k = k + 1;
         }
-        wg_write(0, 0, m);
-        wg_write(1, 0, n);
-        wg_write(2, 0, nb);
+        wg_write::<f32>(0, 0, m);
+        wg_write::<f32>(1, 0, n);
+        wg_write::<f32>(2, 0, nb);
     }
     workgroup_barrier();
-    let max_logit = wg_read(0, 0);
-    let min_logit = wg_read(1, 0);
-    let non_finite_idx = wg_read(2, 0);
+    let max_logit = wg_read::<f32>(0, 0);
+    let min_logit = wg_read::<f32>(1, 0);
+    let non_finite_idx = wg_read::<f32>(2, 0);
 
     // Pass 2: bisect for t_k (the k-th largest logit) on [min_logit, max_logit]. Skipped (lo stays
     // min_logit, no truncation) when top_k <= 0.
@@ -121,26 +123,26 @@ pub fn __poot_kernel_sample_truncated_gumbel_argmax_batched(
                 }
                 jc = jc + W;
             }
-            wg_write(3, lane, local_count);
+            wg_write::<f32>(3, lane, local_count);
             workgroup_barrier();
             if lane == 0 {
                 let mut total = 0.0f32;
                 let mut kk = 0usize;
                 while kk < W {
-                    total = total + wg_read(3, kk);
+                    total = total + wg_read::<f32>(3, kk);
                     kk = kk + 1;
                 }
-                wg_write(3, 0, total);
+                wg_write::<f32>(3, 0, total);
             }
             workgroup_barrier();
-            let total_count = wg_read(3, 0);
+            let total_count = wg_read::<f32>(3, 0);
             if total_count >= k_limit {
                 lo = mid;
             } else {
                 hi = mid;
             }
-            // Guard array 3 against a write-after-read hazard: the next iteration's wg_write(3, lane, ..)
-            // must not race this iteration's wg_read(3, 0) above.
+            // Guard array 3 against a write-after-read hazard: the next iteration's wg_write::<f32>(3, lane, ..)
+            // must not race this iteration's wg_read::<f32>(3, 0) above.
             workgroup_barrier();
             iter = iter + 1;
         }
@@ -169,16 +171,16 @@ pub fn __poot_kernel_sample_truncated_gumbel_argmax_batched(
         }
         j2 = j2 + W;
     }
-    wg_write(0, lane, best_val);
-    wg_write(1, lane, best_idx);
+    wg_write::<f32>(0, lane, best_val);
+    wg_write::<f32>(1, lane, best_idx);
     workgroup_barrier();
     if lane == 0 {
         let mut bv = 0.0f32;
         let mut bi = -1.0f32;
         let mut k2 = 0usize;
         while k2 < W {
-            let cv = wg_read(0, k2);
-            let ci = wg_read(1, k2);
+            let cv = wg_read::<f32>(0, k2);
+            let ci = wg_read::<f32>(1, k2);
             if ci >= 0.0 && (bi < 0.0 || cv > bv || (cv == bv && ci < bi)) {
                 bv = cv;
                 bi = ci;

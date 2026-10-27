@@ -4,26 +4,63 @@
 //! the device cannot run, or workgroup memory past the device's budget.
 #![allow(dead_code, reason = "shared by test binaries; each uses part of it")]
 use poot_graph_plan::{Dispatch, KernelChoice, Plan, Program, test_support::gpu_caps};
-use poot_kernelgen::{BodyUse, KernelRequest};
+use poot_kernelgen::{BodyUse, KernelRequest, PointwiseForm};
 use poot_target::DeviceCaps;
 
 /// Whether one thread of `dispatch` writes at most one output element, so that the launched threads
 /// must number at least the output's elements. A row or attention kernel strides its lanes over a row or a head, a
-/// contraction, a fused pointwise region and a scan give a thread several outputs (a register tile, a
+/// contraction, a packed pointwise region and a scan give a thread several outputs (a register tile, a
 /// vector pair, a state row) or a workgroup one (a lane tree per column), and an imported template is
 /// a shipped body of its own contract; their coverage is the kernel's, and the rest of these
 /// invariants still bind them.
+///
+/// An in-place movement (a donated update's window, a paged row scatter) writes one element of its update
+/// per thread into an output that already holds the rest, so it must cover its update, not its output
+/// ([`coverage`]).
 pub(crate) fn writes_one_element_per_thread(dispatch: &Dispatch) -> bool {
+    match dispatch.choice() {
+        // A packed exact-I32 region launches one thread per packed word.
+        KernelChoice::Generated(KernelRequest::Pointwise(spec)) => {
+            !matches!(spec.form, PointwiseForm::ExactI32Packed { .. })
+        }
+        KernelChoice::Generated(
+            KernelRequest::Cast(_)
+            | KernelRequest::Movement(_)
+            | KernelRequest::Rope(_)
+            | KernelRequest::TopK(_)
+            | KernelRequest::BlockTopK(_),
+        ) => true,
+        _ => false,
+    }
+}
+
+/// Whether `dispatch` writes in place into an output that already holds its base: one thread per element of
+/// its update (operand 1), not of its output.
+fn writes_in_place(dispatch: &Dispatch) -> bool {
     matches!(
         dispatch.choice(),
-        KernelChoice::Generated(
-            KernelRequest::Elementwise(_)
-                | KernelRequest::Movement(_)
-                | KernelRequest::Rope(_)
-                | KernelRequest::TopK(_)
-                | KernelRequest::BlockTopK(_)
-        )
+        KernelChoice::Generated(KernelRequest::Movement(spec)) if spec.op.writes_in_place()
     )
+}
+
+/// The elements the threads of `dispatches` must cover: the update an in-place movement writes (its operand
+/// 1, read from the graph), else the whole output.
+pub(crate) fn coverage(
+    program: &Program,
+    eqn: &poot_graph_ir::Eqn,
+    dispatches: &[Dispatch],
+) -> u64 {
+    let value = match (dispatches.iter().all(writes_in_place), eqn.inputs.get(1)) {
+        (true, Some(poot_graph_ir::Operand::Value(update))) => *update,
+        _ => eqn.out,
+    };
+    program
+        .graph()
+        .aval(value)
+        .shape
+        .iter()
+        .map(|&d| d as u64)
+        .product()
 }
 
 /// Every way the plans of `program` break a launch invariant on the caps of its own target, one
@@ -33,7 +70,7 @@ pub(crate) fn writes_one_element_per_thread(dispatch: &Dispatch) -> bool {
 /// grid ceiling; the workgroup shape fits the device's per-dimension and total invocation limits; the
 /// workgroup memory the body declares fits the device's budget. Per equation whose kernel writes one
 /// element per thread: the threads launched, summed over its launches, number at least the elements of
-/// its output.
+/// its output (of its update, for an in-place movement).
 pub(crate) fn violations(program: &Program) -> Vec<String> {
     let caps = gpu_caps(program.target());
     let mut found = Vec::new();
@@ -53,13 +90,7 @@ pub(crate) fn violations(program: &Program) -> Vec<String> {
                 .product::<u64>();
         }
         if dispatches.iter().all(writes_one_element_per_thread) {
-            let elements = program
-                .graph()
-                .aval(eqn.out)
-                .shape
-                .iter()
-                .map(|&d| d as u64)
-                .product::<u64>();
+            let elements = coverage(program, eqn, dispatches);
             if threads < elements {
                 found.push(format!(
                     "{}: {threads} threads launched for an output of {elements} elements",

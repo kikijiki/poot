@@ -31,7 +31,7 @@ pub fn open_or_skip_with<T, E: std::fmt::Display>(
         Ok(device) => Some(device),
         Err(error) => {
             let error = backend.fail_if_required(get, error);
-            eprintln!("SKIP: {} device unavailable: {error}", backend.label());
+            eprintln!("POOT-SKIP: {} device unavailable: {error}", backend.label());
             None
         }
     }
@@ -50,7 +50,7 @@ pub fn skip_unsupported_with(
     what: &str,
 ) {
     let what = backend.fail_if_required(get, what);
-    eprintln!("SKIP: {} device lacks {what}", backend.label());
+    eprintln!("POOT-SKIP: {} device lacks {what}", backend.label());
 }
 
 #[cfg(test)]

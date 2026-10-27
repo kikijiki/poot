@@ -26,6 +26,7 @@ fn movement(name: &str, out_shape: Vec<usize>, op: kg::MovementOp) -> poot_kerne
 /// The attention generator's decode body through the one generation seam, on a PTX device.
 fn attention_decode_body() -> poot_kernel_ir::Body {
     let spec = kg::AttentionSpec {
+        kv: poot_kernelgen::KvLane::F32,
         batch: 1,
         hq: 4,
         n_rep: 2,
@@ -67,7 +68,7 @@ fn emit_nvptx_kernel_set() {
             .is_ok()
     }
     if !have_llc() {
-        eprintln!("llc not on PATH; skipping");
+        poot_test_util::skip_report("poot-kernelgen", &"llc not on PATH");
         return;
     }
     let dir = poot_test_util::ptx_stage_dir();
@@ -91,8 +92,8 @@ fn emit_nvptx_kernel_set() {
         },
     )
     .expect("fused precondition");
-    // `fused_row`/`fused_row_parallel_views` (rmsnorm+softmax row kernels), `math_unary_dt` (transcendental
-    // exp), `reduce_last_lds` and `array_sum_probe` are this crate's own `#[cfg(test)]`-only kernels (card
+    // `fused_row`/`fused_row_parallel_views` (rmsnorm+softmax row kernels), `reduce_last_lds` and
+    // `array_sum_probe` are this crate's own `#[cfg(test)]`-only kernels (card
     // 622: no cross-crate caller), so their NVPTX staging to this same drop point
     // lives in their own in-crate unit tests (`unit_helpers::stage_nvptx`) instead of here.
     let fused_unary = |name: &str, op| {

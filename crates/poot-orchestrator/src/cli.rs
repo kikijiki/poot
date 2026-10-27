@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::cuda::CudaVersion;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::runpod::CloudType;
@@ -18,7 +19,9 @@ pub(crate) const MAX_CMD_CEILING: Duration = Duration::from_secs(12 * 3600);
 pub(crate) enum CloudChoice {
     Secure,
     Community,
-    /// Try SECURE first, then COMMUNITY.
+    /// Try COMMUNITY first, then SECURE. The order is fixed, not computed per GPU type: COMMUNITY hosts
+    /// undercut SECURE for the GPUs this orchestrator rents (RTX 3090 0.22 against 0.50 per hour). A GPU type
+    /// only one cloud offers is a capacity miss on the other cloud, never an error.
     All,
 }
 
@@ -28,7 +31,7 @@ impl CloudChoice {
         match self {
             CloudChoice::Secure => &[CloudType::Secure],
             CloudChoice::Community => &[CloudType::Community],
-            CloudChoice::All => &[CloudType::Secure, CloudType::Community],
+            CloudChoice::All => &[CloudType::Community, CloudType::Secure],
         }
     }
 }
@@ -55,6 +58,10 @@ pub(crate) enum CliError {
     Duration(String),
     #[error("duration {0:?} must be longer than zero and at most 12h")]
     DurationRange(String),
+    #[error(
+        "invalid --max-price-per-hour {0:?}: expected a positive number of USD per hour (e.g. 0.50)"
+    )]
+    MaxPrice(String),
 }
 
 /// Parse `--max-cmd`: a whole number of seconds, minutes or hours, above zero and at most
@@ -93,6 +100,15 @@ pub(crate) fn parse_data_center_id(raw: &str) -> Result<String, CliError> {
         return Err(CliError::DataCenter(raw.to_string()));
     }
     Ok(id.to_string())
+}
+
+/// Parse `--max-price-per-hour`: a finite number above zero.
+pub(crate) fn parse_max_price(raw: &str) -> Result<f64, CliError> {
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|price| price.is_finite() && *price > 0.0)
+        .ok_or_else(|| CliError::MaxPrice(raw.to_string()))
 }
 
 #[derive(Parser)]
@@ -177,11 +193,19 @@ pub(crate) struct ExecArgs {
     pub(crate) image: String,
     #[arg(long, value_enum, ignore_case = true, default_value_t = CloudChoice::Secure)]
     pub(crate) cloud: CloudChoice,
-    /// Minimum host CUDA version; expands to RunPod `allowedCudaVersions` (all valid versions >= this).
-    /// The default `cu1281` image needs >= 12.8; older-driver hosts fail the nvidia-container-cli
-    /// `cuda>=12.8` hook. Empty disables the filter.
-    #[arg(long, default_value = "12.8")]
-    pub(crate) min_cuda_version: Option<String>,
+    /// Refuse a pod that bills more than this per hour (USD). RunPod reports the price only on the created pod, so
+    /// a pod above the cap is deleted at once and counts as a capacity miss for that cloud (`--cloud all` then
+    /// tries the next one). Optional: no cap by default.
+    #[arg(long, value_name = "USD", value_parser = parse_max_price)]
+    pub(crate) max_price_per_hour: Option<f64>,
+    /// Minimum host CUDA version, `major.minor[.patch]` compared as numbers (13.10 > 13.9). Optional: with no
+    /// value there is no CUDA filter. The driver, and so the host's CUDA version, is the host's, while the CUDA
+    /// toolkit is the image's, so a floor only means "a host driver new enough for the image's CUDA"; an image
+    /// that declares what it needs (label `org.poot.bench.min-cuda`) sets the default floor for itself. RunPod's
+    /// `allowedCudaVersions` stops at 13.0, so the floor is checked on the pod's reported `cudaVersion` right
+    /// after the create: a pod below it is terminated and the attempt continues.
+    #[arg(long, value_name = "VERSION")]
+    pub(crate) min_cuda_version: Option<CudaVersion>,
     #[arg(long, default_value_t = 30)]
     pub(crate) container_disk_gb: u32,
     /// Create-time container env `KEY=VAL` (repeatable), merged into the RunPod create `env` with
@@ -191,8 +215,9 @@ pub(crate) struct ExecArgs {
     pub(crate) env: Vec<String>,
     #[arg(long, default_value = "~/.ssh/id_ed25519")]
     pub(crate) ssh_key: String,
-    #[arg(long, default_value_t = 3)]
-    pub(crate) provision_attempts: u32,
+    /// stop waiting for capacity after this many minutes (default: wait for as long as it takes).
+    #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) give_up_after_min: Option<u64>,
     #[arg(long, default_value_t = 600)]
     pub(crate) provision_timeout_s: u64,
     #[arg(long, default_value_t = 600)]
@@ -266,12 +291,21 @@ pub(crate) struct RunArgs {
     /// SECURE by default: COMMUNITY hosts time out mid-pull on the large image.
     #[arg(long, value_enum, ignore_case = true, default_value_t = CloudChoice::Secure)]
     pub(crate) cloud: CloudChoice,
+    /// Refuse a pod that bills more than this per hour (USD). RunPod reports the price only on the created pod, so
+    /// a pod above the cap is deleted at once and counts as a capacity miss for that cloud (`--cloud all` then
+    /// tries the next one). Optional: no cap by default.
+    #[arg(long, value_name = "USD", value_parser = parse_max_price)]
+    pub(crate) max_price_per_hour: Option<f64>,
     #[arg(long, default_value = "ghcr.io/kikijiki/poot-bench:latest")]
     pub(crate) image: String,
-    /// Minimum host CUDA version; expands to RunPod `allowedCudaVersions` (all valid versions >= this).
-    /// The bench image is built on CUDA 12.6.3. Empty disables the filter.
-    #[arg(long, default_value = "12.6")]
-    pub(crate) min_cuda_version: Option<String>,
+    /// Minimum host CUDA version, `major.minor[.patch]` compared as numbers (13.10 > 13.9). Optional: with no
+    /// value there is no CUDA filter. The driver, and so the host's CUDA version, is the host's, while the CUDA
+    /// toolkit is the image's, so a floor only means "a host driver new enough for the image's CUDA"; an image
+    /// that declares what it needs (label `org.poot.bench.min-cuda`) sets the default floor for itself. RunPod's
+    /// `allowedCudaVersions` stops at 13.0, so the floor is checked on the pod's reported `cudaVersion` right
+    /// after the create: a pod below it is terminated and the attempt continues.
+    #[arg(long, value_name = "VERSION")]
+    pub(crate) min_cuda_version: Option<CudaVersion>,
     #[arg(long, default_value_t = 40)]
     pub(crate) container_disk_gb: u32,
     /// RunPod network volume to mount at /workspace as the model-weight cache; setup fetches only
@@ -284,8 +318,27 @@ pub(crate) struct RunArgs {
     /// SSH private key (its .pub is injected as the pod PUBLIC_KEY).
     #[arg(long, default_value = "~/.ssh/id_ed25519")]
     pub(crate) ssh_key: String,
-    #[arg(long, default_value_t = 4)]
-    pub(crate) provision_attempts: u32,
+    /// stop waiting for capacity after this many minutes and end the run as cancelled (default: wait for as long
+    /// as it takes; a run only ends when it is done, cancelled, or hits an error waiting cannot fix).
+    #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) give_up_after_min: Option<u64>,
+    /// run on this existing pod (one of this state database's, alive, not driven by a live run) instead of
+    /// provisioning: the upload and setup still run, models already on its disk are not fetched again.
+    #[arg(long, value_name = "POD_ID")]
+    pub(crate) reuse_pod: Option<String>,
+    /// add repeats to the result sets of an earlier run, named by its set id (`run-<epoch>-<pid>`, the prefix of
+    /// the set's pod-side name): use a larger `--repeats`; repeats 1..N already gathered are not run again and the
+    /// new ones join the same sets. Every selected model must already have a gathered set of it. Run it with the
+    /// same `--poot-bin` as the first run, or the sets mix binaries. The pod must have the sets' hardware (GPU name,
+    /// driver and host CPU model, from their `env.json`): TTFT and per-point times depend on the host CPU, so
+    /// repeats from another host are another cell. After the pod is up the run compares them, and on a mismatch
+    /// ends and terminates the pod. A rented pod's host CPU cannot be chosen, so in practice only the pod the sets
+    /// ran on (`--reuse-pod`, kept with `--keep-pod` on the first run) can extend them.
+    #[arg(long, value_name = "SET_ID")]
+    pub(crate) extend_set: Option<String>,
+    /// replace a lost pod at most this many times, then end the run as cancelled (default: unlimited).
+    #[arg(long, value_name = "N")]
+    pub(crate) max_replacements: Option<u32>,
     /// seconds to wait for a pod's SSH endpoint. The poot-bench image is ~34 GB, so a cold pull takes minutes.
     #[arg(long, default_value_t = 600)]
     pub(crate) provision_timeout_s: u64,

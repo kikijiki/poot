@@ -388,6 +388,11 @@ fn rewrite_rvalue(rv: &mut Rvalue, aliases: &HashMap<u32, Place>) {
             rewrite_operand(a, aliases);
             rewrite_operand(b, aliases);
         }
+        Rvalue::MulAdd(a, b, c) => {
+            rewrite_operand(a, aliases);
+            rewrite_operand(b, aliases);
+            rewrite_operand(c, aliases);
+        }
         Rvalue::Select {
             condition,
             if_true,
@@ -430,7 +435,9 @@ fn rewrite_rvalue(rv: &mut Rvalue, aliases: &HashMap<u32, Place>) {
         }
         // Spec 134 P1: vector ops are hand-built in kernelgen (like WMMA), never produced by MIR lowering; rewritten for completeness.
         Rvalue::VectorLoad { place } => rewrite_place(place, aliases),
-        Rvalue::VectorSplat(op) => rewrite_operand(op, aliases),
+        Rvalue::VectorSplat(op) | Rvalue::VectorExtract { vector: op, .. } => {
+            rewrite_operand(op, aliases)
+        }
     }
 }
 

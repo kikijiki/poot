@@ -9,7 +9,7 @@ use poot_graph_ir::{BinOp, Builder, Graph, OpKind, Operand, RedOp, StateRole, Te
 use poot_graph_plan::{
     CompileError, CompileOptions, KernelChoice, PlanError, Program, StorageGap, Target, compile,
 };
-use poot_kernelgen::{ContractionSpec, KernelRequest};
+use poot_kernelgen::{ContractionSpec, DenseTiledContraction, DenseTiledWeight, KernelRequest};
 use poot_target::{AmdArch, Backend, BufferStorage, DeviceCaps};
 use poot_tensor::DType;
 
@@ -103,7 +103,7 @@ fn checkpoint_orientation_projection_plans_one_dense_contraction_and_no_transpos
             assert!(
                 match request {
                     KernelRequest::Contraction(ContractionSpec::DenseGemv { .. }) => gemv,
-                    KernelRequest::Contraction(ContractionSpec::DenseTiled { .. }) => !gemv,
+                    KernelRequest::Contraction(ContractionSpec::DenseTiled(_)) => !gemv,
                     _ => false,
                 },
                 "{label}: {request:?}"
@@ -221,8 +221,10 @@ fn weight_storages(program: &Program) -> (BufferStorage, BufferStorage) {
     let named = match request(program, is_dense_f16) {
         KernelRequest::Contraction(
             ContractionSpec::DenseGemv { weight, .. }
-            | ContractionSpec::DenseTiled { weight, .. }
-            | ContractionSpec::DenseSerial { weight, .. },
+            | ContractionSpec::DenseTiled(DenseTiledContraction {
+                weight: DenseTiledWeight::Nk(weight),
+                ..
+            }),
         ) => *weight,
         other => panic!("expected a dense-contraction request, got {other:?}"),
     };
@@ -259,7 +261,7 @@ fn an_f16_checkpoint_projection_plans_one_packed_dense_contraction_and_no_transp
             assert!(
                 match request {
                     KernelRequest::Contraction(ContractionSpec::DenseGemv { .. }) => gemv,
-                    KernelRequest::Contraction(ContractionSpec::DenseTiled { .. }) => !gemv,
+                    KernelRequest::Contraction(ContractionSpec::DenseTiled(_)) => !gemv,
                     _ => false,
                 },
                 "{label}: {request:?}"
@@ -426,10 +428,12 @@ fn a_biased_residual_dense_head_is_one_epilogue_contraction_at_every_m() {
                         epilogue: Some(epilogue),
                         ..
                     }) if m == 1 => assert_eq!(epilogue.steps.len(), 2, "{label}"),
-                    KernelRequest::Contraction(ContractionSpec::DenseTiled {
-                        epilogue: Some(epilogue),
-                        ..
-                    }) if m > 1 => {
+                    KernelRequest::Contraction(ContractionSpec::DenseTiled(
+                        DenseTiledContraction {
+                            epilogue: Some(epilogue),
+                            ..
+                        },
+                    )) if m > 1 => {
                         assert_eq!(epilogue.steps.len(), 2, "{label}");
                         assert_eq!(epilogue.leaves.len(), 2, "{label}");
                     }
@@ -442,7 +446,7 @@ fn a_biased_residual_dense_head_is_one_epilogue_contraction_at_every_m() {
 
 /// POOT-1036: a plain `MatMul` head over an f32 `[K, N]` weight at `M > 1` (the non-checkpoint route, the
 /// generated tiled GEMM) with a bias and a residual plans ONE `ContractionEpilogue { head: MatMul }` whose
-/// `TiledRegion` carries both steps and both leaves, on every backend.
+/// the register-tiled `[K, N]` GEMM carries both steps and both leaves, on every backend.
 ///
 /// Mutation: make `epilogue_head_lowers` accept only `MatMulRoute::Serial` for a `MatMul` head (the pre-1036
 /// gate); the head and both adds stay apart and this row goes red.
@@ -478,10 +482,13 @@ fn a_biased_residual_tiled_matmul_head_is_one_epilogue_contraction() {
             assert_eq!(fused.planned().count(), 1, "{label}");
             assert_eq!(count(&fused, is_head), 1, "{label}");
             match request(&fused, is_head) {
-                KernelRequest::Contraction(ContractionSpec::TiledRegion {
-                    epilogue: Some(epilogue),
-                    ..
-                }) => {
+                KernelRequest::Contraction(ContractionSpec::DenseTiled(
+                    DenseTiledContraction {
+                        weight: DenseTiledWeight::KnF32,
+                        epilogue: Some(epilogue),
+                        ..
+                    },
+                )) => {
                     assert_eq!(epilogue.steps.len(), 2, "{label}");
                     assert_eq!(epilogue.leaves.len(), 2, "{label}");
                 }
@@ -523,13 +530,13 @@ fn biased_residual_matmul(xs: Vec<usize>, ws: Vec<usize>, head_dtype: DType) -> 
 /// POOT-1036: only an f32 `[K, N]` `MatMul` head above one row takes the generated tiled GEMM with an epilogue.
 /// Every other `MatMul` head keeps the plan it would get without one, so no head loses its schedule to a fused store:
 /// an F16 or BF16 head is not tileable (the body is f32-only) and fuses on its serial dtype-generic body (BF16 is
-/// refused on SPIR-V, which has no scalar bf16); a rank-3 weight takes the imported batched tiled GEMM on SPIR-V and
-/// PTX, which carries no epilogue, so its chain stays apart there (AMD plans it serially, fused); `M == 1` is the
-/// decode GEMV and keeps its chain everywhere.
+/// refused on SPIR-V, which has no scalar bf16); a rank-3 weight takes the generated batched-weight tiled GEMM on
+/// every backend, which carries no epilogue, so its chain stays apart; `M == 1` is the decode GEMV and keeps its
+/// chain everywhere.
 ///
 /// Mutation: drop the F32-operand clause, the rank-2-weight clause or the `M > 1` clause of
 /// `is_tileable_matmul_in` (each lets the matcher admit the head onto the tiled GEMM); the matching case then plans
-/// a `TiledRegion` or loses its kept chain and this row goes red.
+/// the register-tiled `[K, N]` GEMM or loses its kept chain and this row goes red.
 #[test]
 fn a_matmul_head_off_the_tiled_route_never_takes_the_tiled_epilogue() {
     /// What a case plans on a backend.
@@ -556,7 +563,7 @@ fn a_matmul_head_off_the_tiled_route_never_takes_the_tiled_epilogue() {
         (
             "rank-3 weight",
             biased_residual_matmul(vec![2, 5, K], vec![2, K, N], DType::F32),
-            [ChainKept, ChainKept, SerialEpilogue],
+            [ChainKept, ChainKept, ChainKept],
         ),
         (
             "M == 1",
@@ -574,16 +581,20 @@ fn a_matmul_head_off_the_tiled_route_never_takes_the_tiled_epilogue() {
                 (other, _) => panic!("{label}: unexpected compile result {:?}", other.err()),
             };
             for (eqn, _) in program.planned() {
-                assert!(
-                    !matches!(
-                        program.kernel_choice(eqn),
-                        KernelChoice::Generated(KernelRequest::Contraction(
-                            ContractionSpec::TiledRegion { .. }
-                        ))
-                    ),
-                    "{label}: {:?} took the generated tiled GEMM",
-                    op_names(&program)
-                );
+                // Only the batched-weight GEMM (no epilogue) is a tiled head here; the shared-weight GEMM with an
+                // epilogue is what these cases must never plan.
+                if let KernelChoice::Generated(KernelRequest::Contraction(
+                    ContractionSpec::DenseTiled(spec),
+                )) = program.kernel_choice(eqn)
+                {
+                    let out_numel: usize = program.graph().aval(eqn.out).shape.iter().product();
+                    let per_block = (spec.meta[1] * spec.meta[2]) as usize;
+                    assert!(
+                        spec.epilogue.is_none() && out_numel > per_block,
+                        "{label}: {:?} took the shared-weight tiled GEMM or an epilogue on it",
+                        op_names(&program)
+                    );
+                }
             }
             let fused = count(&program, |op| {
                 matches!(op, OpKind::ContractionEpilogue { .. })
@@ -681,21 +692,22 @@ fn a_grouped_bf16_projection_plans_one_grouped_dense_contraction_and_no_transpos
                 panic!("the weight operand is a value");
             };
             match request(&program, is_grouped_bf16) {
-                KernelRequest::Contraction(ContractionSpec::DenseSerial {
-                    weight: named,
-                    shapes,
-                    ..
-                }) => {
+                KernelRequest::Contraction(ContractionSpec::DenseTiled(
+                    DenseTiledContraction {
+                        weight: DenseTiledWeight::Nk(named),
+                        meta,
+                        ..
+                    },
+                )) => {
                     assert_eq!(*named, BufferStorage::bf16_packed(), "{label}");
                     assert_eq!(
                         *named,
                         program.storage().storage(weight).buffer_storage(),
                         "{label}: the request and the weight value share one storage"
                     );
-                    assert_eq!(shapes.b_shape, [GROUPS, N, K], "{label}");
-                    assert_eq!(shapes.out_shape, [GROUPS, m, N], "{label}");
+                    assert_eq!(meta[..3], [K as u32, N as u32, m as u32], "{label}");
                 }
-                other => panic!("{label}: expected the dense serial body, got {other:?}"),
+                other => panic!("{label}: expected the register-tiled body, got {other:?}"),
             }
         }
     }
@@ -723,16 +735,18 @@ fn a_blocked_weight_with_a_second_consumer_is_not_folded() {
     });
     let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     for backend in backends() {
-        // Unfolded, the BF16 transposed view has no lowering on the packed-lane wgpu target (a typed refusal of
-        // the transpose); the native-BF16 targets plan the chain as traced. Never a grouped contraction.
+        // Unfolded, the BF16 chain has no lowering on the packed-lane wgpu target (a typed refusal of a bf16
+        // equation of it); the native-BF16 targets plan the chain as traced. Never a grouped contraction.
         match (backend, compile(&g, &target(backend), &options)) {
-            (Backend::SpirvVulkan, Err(CompileError::Plan(plan))) => assert!(
-                plan.to_string()
-                    .contains("transpose [0, 2, 1] (bf16 -> bf16) is refused"),
-                "{backend:?}: {plan}"
-            ),
+            (Backend::SpirvVulkan, Err(CompileError::Plan(plan))) => {
+                let plan = plan.to_string();
+                assert!(
+                    plan.contains("bf16") && plan.contains("is refused on Gpu(SpirvVulkan)"),
+                    "{backend:?}: {plan}"
+                )
+            }
             (Backend::SpirvVulkan, other) => {
-                panic!("{backend:?}: expected the transpose refusal, got {other:?}")
+                panic!("{backend:?}: expected a bf16 refusal, got {other:?}")
             }
             (_, Ok(program)) => {
                 let label = format!("{backend:?}: {:?}", op_names(&program));

@@ -122,11 +122,11 @@ pub struct HsacoModule {
     pub(crate) owner: Arc<dyn ResourceOwner>,
     /// Set once a timed-out submission of the originating runtime may still run this code object.
     pub(crate) poison: DevicePoison,
-    /// The argument schema copied from the [`poot_runtime_common::CompiledKernel`] `load_hsaco` loaded
+    /// The argument schema copied from the [`poot_codegen::CompiledKernel`] `load_hsaco` loaded
     /// this module from (card 608): `lookup_kernel` carries it into
     /// [`KernelHandle`], the only place this crate can still check a dispatch's bound buffers against it,
     /// since a ROCm kernarg is one opaque byte blob by the time it reaches [`RocmContext::dispatch`].
-    pub(crate) args: Arc<[poot_runtime_common::ArgSchema]>,
+    pub(crate) args: Arc<[poot_codegen::ArgSchema]>,
 }
 
 impl std::fmt::Debug for HsacoModule {
@@ -177,7 +177,7 @@ impl ModuleConstruction {
         group_segment_size: u32,
         private_segment_size: u32,
         kernel_symbol: String,
-        args: Arc<[poot_runtime_common::ArgSchema]>,
+        args: Arc<[poot_codegen::ArgSchema]>,
     ) -> HsacoModule {
         let exec = self
             .executable
@@ -304,15 +304,15 @@ impl RocmContext {
     ///
     /// The returned `HsacoModule` owns the `hsa_executable_t`; `Drop` destroys it.
     ///
-    /// `kernel` must be a compiler-produced [`poot_runtime_common::CompiledKernel`] (card 608): the only
+    /// `kernel` must be a compiler-produced [`poot_codegen::CompiledKernel`] (card 608): the only
     /// safe way to reach this call with kernel bytes at all, since a `CompiledKernel`'s only constructor
     /// is `unsafe` and `poot-codegen` is its one caller (see the crate doc for the compile-fail proof).
     /// Returns [`RocmError::WrongKernelTarget`] if `kernel` was compiled for another backend.
     pub fn load_hsaco(
         &self,
-        kernel: &poot_runtime_common::CompiledKernel,
+        kernel: &poot_codegen::CompiledKernel,
     ) -> Result<Arc<HsacoModule>, RocmError> {
-        let poot_runtime_common::KernelCode::Hsaco(hsaco) = kernel.code() else {
+        let poot_codegen::KernelCode::Hsaco(hsaco) = kernel.code() else {
             return Err(RocmError::WrongKernelTarget {
                 actual: kernel.target(),
             });
@@ -607,7 +607,7 @@ impl RocmContext {
         grid: (u32, u32, u32),
         block: (u32, u32, u32),
     ) -> Result<(), RocmError> {
-        poot_runtime_common::check_element_schema(kernel.args(), elements)?;
+        poot_codegen::check_element_schema(kernel.args(), elements)?;
         self.enqueue(
             &[(kernel.clone(), kernarg.clone(), grid, block)],
             "dispatch",
@@ -649,7 +649,7 @@ impl RocmContext {
             "enqueue_graph_batched: dispatches and elements must be reported pairwise (caller bug)"
         );
         for ((kernel, _, _, _), &elems) in dispatches.iter().zip(elements) {
-            poot_runtime_common::check_element_schema(kernel.args(), elems)?;
+            poot_codegen::check_element_schema(kernel.args(), elems)?;
         }
         self.enqueue(dispatches, "enqueue_graph_batched")
     }
@@ -998,7 +998,7 @@ impl KernelHandle {
 
     /// This kernel's argument schema, one entry per data buffer it binds, in binding order (card 608):
     /// copied from the `CompiledKernel` `load_hsaco` loaded it from.
-    pub fn args(&self) -> &[poot_runtime_common::ArgSchema] {
+    pub fn args(&self) -> &[poot_codegen::ArgSchema] {
         &self.module.args
     }
 }
@@ -1107,7 +1107,7 @@ pub(crate) mod test_only {
             kernarg_size: u32,
             group_segment_size: u32,
             private_segment_size: u32,
-            args: &[poot_runtime_common::ArgSchema],
+            args: &[poot_codegen::ArgSchema],
         ) -> Self {
             let mut construction =
                 ModuleConstruction::new(Arc::new(NoopOwner), DevicePoison::default());

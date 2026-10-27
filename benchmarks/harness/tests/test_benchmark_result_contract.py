@@ -178,6 +178,7 @@ class BenchmarkResultContractTests(unittest.TestCase):
         row, _ = self.run_payload(payload, scenario=self.curve_scenario, framework="vllm")
         self.assertEqual(row["status"], "error")
         self.assertIn("must contain 2 samples", row["reason"])
+        self.assertIn("vllm generated 2, expected 3 tokens", row["reason"])
 
     def test_invalid_single_results_are_error_rows(self):
         cases = (

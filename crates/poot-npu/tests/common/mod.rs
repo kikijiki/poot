@@ -47,7 +47,7 @@ pub(crate) fn device(config: XdnaConfig) -> Option<(File, XdnaDevice)> {
         if get(variable).is_none() {
             let missing = format!("${variable} is unset (run under `nix develop .#npu`)");
             let reason = DeviceBackend::Npu.fail_if_required(get, missing);
-            eprintln!("SKIP: NPU toolchain unavailable: {reason}");
+            eprintln!("POOT-SKIP: NPU toolchain unavailable: {reason}");
             return None;
         }
     }
@@ -150,7 +150,10 @@ pub(crate) fn refusal_of(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(CompileLimits::STANDARD),
+        &CompileOptions {
+            npu: Some(poot_npu::npu_lowering()),
+            ..CompileOptions::new(CompileLimits::STANDARD)
+        },
     ) else {
         panic!("the equation is admitted for the NPU");
     };

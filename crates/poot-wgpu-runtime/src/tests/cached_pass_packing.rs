@@ -3,10 +3,11 @@
 //! timing baseline.
 
 use crate::{CachedDispatch, Context, DeviceBuffer, RuntimeError};
+use poot_codegen::CompiledKernel;
 use poot_kernel_ir::test_support::square_kernel;
 use poot_kernel_ir::{Body, fixtures};
 use poot_runtime_common::device_skip::open_or_skip;
-use poot_runtime_common::{BufferRole, CompiledKernel, DeviceBackend};
+use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::BufferStorage;
 
 fn kernel(body: &Body, name: &str) -> CompiledKernel {
@@ -27,7 +28,7 @@ fn cached(
     output: &DeviceBuffer,
     threads: u32,
 ) -> CachedDispatch {
-    let input_lens: Vec<u32> = inputs.iter().map(|b| b.elem_count()).collect();
+    let input_lens: Vec<usize> = inputs.iter().map(|b| b.elem_count()).collect();
     ctx.build_cached_dispatch(
         label,
         key,
@@ -151,11 +152,8 @@ fn dependency_chain(ctx: &Context, passes: usize) -> Vec<Vec<f32>> {
             ctx.write_f32(buffer, data).unwrap();
         }
         for (i, output) in outputs.iter().enumerate() {
-            ctx.write_f32(
-                output,
-                &vec![-1000.0 - i as f32; output.elem_count() as usize],
-            )
-            .unwrap();
+            ctx.write_f32(output, &vec![-1000.0 - i as f32; output.elem_count()])
+                .unwrap();
         }
         let x: Vec<_> = c.iter().zip(&d).map(|(c, d)| c + d).collect();
         let y: Vec<_> = a.iter().zip(&b).map(|(a, b)| (a + b) * (a + b)).collect();
@@ -188,11 +186,8 @@ fn dependency_chain(ctx: &Context, passes: usize) -> Vec<Vec<f32>> {
     // A final submission outlives the caller's cached objects and input handles. wgpu must retain
     // their submitted uses until the ordinary output readback completes. No native pool is touched.
     for (i, output) in outputs.iter().enumerate() {
-        ctx.write_f32(
-            output,
-            &vec![-2000.0 - i as f32; output.elem_count() as usize],
-        )
-        .unwrap();
+        ctx.write_f32(output, &vec![-2000.0 - i as f32; output.elem_count()])
+            .unwrap();
     }
     ctx.submit_cached(&dispatches.iter().collect::<Vec<_>>())
         .unwrap();
@@ -226,6 +221,51 @@ fn grouped_cached_dependencies_bindings_grids_and_lifetime_gpu() {
     let expected_passes = if control.timestamps_available() { 6 } else { 1 };
     let per_dispatch = dependency_chain(&control, expected_passes);
     arrays_equal(&grouped, &per_dispatch, "grouped versus per-dispatch");
+}
+
+/// POOT-1317: the WGSL kernel ABI passes `u32` lengths, so a dispatch argument asserting more than
+/// `u32::MAX` elements is a typed [`RuntimeError::KernelLengthTooLarge`] naming the count, never a
+/// truncated length the kernel would trust as its bound; the same dispatch at the limit builds.
+///
+/// Mutation: make `kernel_lens` cast with `as u32`; the oversize length wraps to 0, the dispatch builds
+/// and the first assertion goes red.
+#[test]
+fn a_dispatch_length_past_u32_is_a_typed_refusal_gpu() {
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
+    };
+    let add = kernel(&fixtures::add_kernel(), "packing-length-add");
+    let a = ctx
+        .alloc_storage(BufferRole::Input, BufferStorage::f32(), 8)
+        .expect("alloc");
+    let b = ctx
+        .alloc_storage(BufferRole::Input, BufferStorage::f32(), 8)
+        .expect("alloc");
+    let out = ctx
+        .alloc_storage(BufferRole::Output, BufferStorage::f32(), 8)
+        .expect("alloc");
+    let build = |out_len: usize| {
+        ctx.build_cached_dispatch(
+            "packing-length",
+            "packing-length-add",
+            &add,
+            [64, 1, 1],
+            [8, 1, 1],
+            &[&a, &b],
+            &[8, 8],
+            &out,
+            out_len,
+        )
+    };
+    let past = u32::MAX as usize + 1;
+    assert!(
+        matches!(
+            build(past),
+            Err(RuntimeError::KernelLengthTooLarge { elems }) if elems == past
+        ),
+        "a length past u32 must be refused, not truncated"
+    );
+    build(u32::MAX as usize).expect("a length of exactly u32::MAX is the largest the ABI carries");
 }
 
 #[test]

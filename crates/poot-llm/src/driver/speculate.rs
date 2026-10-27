@@ -630,13 +630,11 @@ impl Driver<Serving> {
             chain: 0,
             role,
             program: Program::Step,
-            shape: StepShape::new(
-                NonZeroUsize::MIN,
-                NonZeroUsize::MIN,
-                self.settings.options.capacity,
-            )
-            .with_kv(kv)
-            .with_hidden(self.hidden_of(role)),
+            shape: self
+                .settings
+                .step_shape(NonZeroUsize::MIN, NonZeroUsize::MIN)
+                .with_kv(kv)
+                .with_hidden(self.hidden_of(role)),
             head: Head::GREEDY,
             adapters,
             carried: InputSet::EMPTY,
@@ -693,7 +691,7 @@ impl Driver<Serving> {
                     self.prepared(self.rollback_key(role, kv, adapters))?;
                 }
             }
-            let capacity = self.settings.options.capacity;
+            let (capacity, kv_dtype) = (self.settings.options.capacity, self.settings.kv_dtype);
             let hidden = self.hidden_of(ModelRole::Target);
             for &rows in shapes.rows {
                 let key = |width: usize, logits: LogitRows, head: Head| EntryKey {
@@ -705,6 +703,7 @@ impl Driver<Serving> {
                         NonZeroUsize::new(width).expect("a width is at least one"),
                         capacity,
                     )
+                    .with_kv_dtype(kv_dtype)
                     .with_kv(kv)
                     .with_logits(logits)
                     .with_hidden(hidden),
@@ -771,13 +770,14 @@ impl Driver<Serving> {
                     chain: 0,
                     role: ModelRole::Mtp,
                     program: Program::Draft,
-                    shape: StepShape::new(
-                        rows,
-                        NonZeroUsize::new(width).expect("a width is at least one"),
-                        self.settings.options.capacity,
-                    )
-                    .with_kv(kv)
-                    .with_hidden(hidden),
+                    shape: self
+                        .settings
+                        .step_shape(
+                            rows,
+                            NonZeroUsize::new(width).expect("a width is at least one"),
+                        )
+                        .with_kv(kv)
+                        .with_hidden(hidden),
                     head: Head::GREEDY,
                     adapters: None,
                     carried: InputSet::EMPTY,

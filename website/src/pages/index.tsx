@@ -22,12 +22,11 @@ function HomepageHeader() {
         <Heading as="h1" className={clsx('hero__title', styles.heroTitle)}>
           {siteConfig.title}
         </Heading>
+        <p className={styles.heroQuote}>I-I need to, I need to COMPOOOOT</p>
         <p className="hero__subtitle">{TAGLINE}</p>
-        <div className={styles.buttons}>
-          <Link className="button button--primary button--lg" to="/docs">
-            Documentation
-          </Link>
-        </div>
+        <p className={styles.heroBackends}>
+          Runs on <Link to="/docs/serve/choosing-a-backend#supported-backends">wgpu, Vulkan, ROCm and PTX</Link>.
+        </p>
       </div>
     </header>
   );

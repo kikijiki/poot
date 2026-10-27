@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
+import CodeBlock from '@theme/CodeBlock';
 
 type StepDef = {
   title: string;
   artifact: string;
   code: string;
-  lang: 'rust' | 'json' | 'llvm' | 'ptx' | 'text';
+  lang: 'rust' | 'json' | 'llvm' | 'nasm' | 'text';
   note: string;
 };
 
@@ -19,7 +20,7 @@ pub fn elementwise_add(
     b: &[f32],
     out: &mut [f32],
 ) {
-    let i = thread_index();
+    let i = thread_index_x();
     if i < out.len() {
         out[i] = a[i] + b[i];
     }
@@ -52,9 +53,12 @@ pub fn elementwise_add(
     code: `{
   "name": "__poot_kernel_elementwise_add",
   "param_count": 3,
-  "locals": [ {"ty":"Unit","mutable":true},
-              {"ty":{"Ref":{"mutable":false,"pointee":{"Slice":"F32"}}},"mutable":false},
-              ... ],
+  "locals": [
+    {"ty": "Unit", "mutable": true},
+    {"ty": {"Ref": {"mutable": false, "pointee": {"Slice": "F32"}}},
+     "mutable": false},
+    ...
+  ],
   "blocks": [ ... ]
 }`,
     note: 'Committed to the repo. Drift-guarded: test fails if source changes without regen.',
@@ -83,7 +87,7 @@ live:
   {
     title: '5. GPU binary',
     artifact: '.spv, .ptx, or .hsaco',
-    lang: 'ptx',
+    lang: 'nasm',
     code: `; nvptx64 output (illustrative excerpt):
 .visible .entry elementwise_add(
     .param .u64 a, .param .u64 a_len,
@@ -133,13 +137,7 @@ export default function KernelPipelineDiagram(): React.ReactElement {
         <div style={{ fontSize: '0.78rem', color: 'var(--ifm-color-emphasis-600)', marginBottom: '0.5rem', fontFamily: 'monospace' }}>
           {s.artifact}
         </div>
-        <pre style={{
-          background: 'var(--ifm-color-emphasis-100)', borderRadius: 6, padding: '0.75rem 1rem',
-          fontSize: '0.75rem', overflow: 'auto', margin: '0 0 0.75rem 0', lineHeight: 1.5,
-          border: '1px solid var(--ifm-color-emphasis-200)', maxHeight: 260,
-        }}>
-          <code>{s.code}</code>
-        </pre>
+        <CodeBlock language={s.lang}>{s.code}</CodeBlock>
         <div style={{ fontSize: '0.82rem', color: 'var(--ifm-color-emphasis-700)', background: 'color-mix(in srgb, var(--ifm-color-primary) 6%, transparent)', borderLeft: '3px solid var(--ifm-color-primary)', padding: '0.5rem 0.75rem', borderRadius: '0 4px 4px 0' }}>
           {s.note}
         </div>

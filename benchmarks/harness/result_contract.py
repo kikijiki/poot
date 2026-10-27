@@ -138,7 +138,7 @@ _REQUEST_FIELDS = (
 )
 
 
-def _row_level_errors(iteration, osl, prefix):
+def _row_level_errors(iteration, osl, prefix, framework):
     """A row-level runner's iteration: ttft, e2e and the osl - 1 inter-token gaps."""
     errors = _check_fields(iteration, _ROW_LEVEL_ITERATION_RULES, prefix)
     ttft, e2e = iteration.get("ttft_ms"), iteration.get("e2e_ms")
@@ -150,7 +150,10 @@ def _row_level_errors(iteration, osl, prefix):
     itls = iteration.get("itl_ms")
     if isinstance(itls, list):
         if len(itls) != osl - 1:
-            errors.append(f"{prefix}itl_ms must contain {osl - 1} samples; got {len(itls)}")
+            errors.append(
+                f"{prefix}itl_ms must contain {osl - 1} samples; got {len(itls)}: "
+                f"{framework} generated {len(itls) + 1}, expected {osl} tokens"
+            )
         for index, sample in enumerate(itls):
             if not (_is_finite_number(sample) and sample >= 0):
                 errors.append(f"{prefix}itl_ms[{index}] must be a finite nonnegative number; got {sample!r}")
@@ -270,7 +273,7 @@ def validate_runner_result(result, *, framework, precision, scenario, gen_tokens
 
     curve = None
     if _is_curve(scenario):
-        curve_errors, curve = _validate_curve_result(result, scenario, timing_claim(framework))
+        curve_errors, curve = _validate_curve_result(result, scenario, timing_claim(framework), framework)
         errors.extend(curve_errors)
     else:
         errors.extend(_check_fields(result, _SINGLE_FIELD_RULES))
@@ -400,6 +403,9 @@ def _measurement_identity_errors(result):
     errors = _identity_field_errors(result, MEASUREMENT_IDENTITY_FIELDS)
     if "profiled" not in result:
         errors.append("missing required identity field 'profiled'")
+    chunk = result.get("prefill_chunk")
+    if not _is_int(chunk) or chunk <= 0:
+        errors.append(f"prefill_chunk must be a positive integer; got {chunk!r}")
     return errors
 
 
@@ -427,7 +433,7 @@ def committed_row_errors(row):
     return errors
 
 
-def _validate_curve_result(result, scenario, claim):
+def _validate_curve_result(result, scenario, claim, framework):
     errors = []
     requested_osl = scenario.get("osl", 128)
     requested_isls = list(scenario.get("isl", []))
@@ -517,7 +523,7 @@ def _validate_curve_result(result, scenario, claim):
                 if not window and not _is_finite_positive_number(request_tpot_ms(iteration)):
                     errors.append(f"{iter_prefix}token-to-token TPOT must be a finite positive number")
             else:
-                errors.extend(_row_level_errors(iteration, requested_osl, iter_prefix))
+                errors.extend(_row_level_errors(iteration, requested_osl, iter_prefix, framework))
     if errors:
         return errors, None
 

@@ -98,7 +98,9 @@ fn oracle_logits(
     ];
     let zeros: Vec<poot_tensor::HostTensor> = g
         .state()
-        .map(|(si, _)| poot_tensor::HostTensor::zeros(g.aval(si).shape.clone()))
+        .map(|(si, _)| {
+            poot_tensor::HostTensor::zeros_of(g.aval(si).dtype, g.aval(si).shape.clone())
+        })
         .collect();
     let (out, _) =
         poot_eval::test_support::weight_map_oracle::eval_mapped(g, store, map, &slots, &zeros);
@@ -110,11 +112,7 @@ fn ran(program: &Program, pass: &str) -> bool {
     program.passes().any(|ran| ran == pass)
 }
 
-const PIPELINE_PASSES: [&str; 3] = [
-    "flash_attention_capped",
-    "fuse_contraction_epilogues",
-    "fuse",
-];
+const PIPELINE_PASSES: [&str; 3] = ["flash_attention", "fuse_contraction_epilogues", "fuse"];
 
 /// SC-002 (ruling XC2-05, production presets, no synthetic `Target`): the granitemoe prefill, whose two
 /// routers contract more than one row, runs the whole pipeline on the ROCm, PTX and wgpu presets exactly as
@@ -180,7 +178,7 @@ fn routed_expert_prefill_runs_the_full_pipeline_on_every_preset() {
 /// for the ROCm preset, runs the full pass list, and `routed_expert_sites` (which POOT-746's pool transform
 /// reads in production) finds the family's routed experts: each family routes them through `components::moe`,
 /// never a dense broadcast over all `E` experts. (`tile_matmuls` is gone: the planner makes that choice, so
-/// the contraction and pointwise passes are `fuse_contraction_epilogues` and `fuse`. `flash_attention_capped`
+/// the contraction and pointwise passes are `fuse_contraction_epilogues` and `fuse`. `flash_attention`
 /// is not asserted: deepseek4's compressed-sparse and gpt_oss's sink attention have no flash form.)
 ///
 /// Mutation (observed red, restored; see the card record): restore deepseek3's broadcast form (the routed
@@ -231,14 +229,14 @@ fn every_moe_family_prefill_has_routed_expert_sites_and_runs_every_pass_on_rocm(
 }
 
 /// SC-001 (POOT-575, ruling XC2-05): the Qwen3-Next prefill, whose four routers contract eight rows, compiles
-/// for the ROCm, PTX and wgpu presets with every pass (`flash_attention_capped`, both fuses) and plans each
+/// for the ROCm, PTX and wgpu presets with every pass (`flash_attention`, both fuses) and plans each
 /// router contraction on a generated tiled schedule, never the one-thread-per-output serial kernel; each
 /// compiled program computes what the traced graph computes (ADR-0101 tier 2). The decode step, whose
 /// router has one row, runs the same passes.
 ///
 /// Mutation (observed red, restored; see the card record): skip the three passes in `compile` whenever
 /// `routed_expert_sites(g)` is non-empty; the pass check fails with "ROCm prefill skipped
-/// flash_attention_capped". The router contraction's own schedule is guarded by the serial-kernel
+/// flash_attention". The router contraction's own schedule is guarded by the serial-kernel
 /// assertion: planning it on the one-thread-per-output kernel instead of a generated tiled schedule
 /// fails the `routers` check.
 #[test]
@@ -313,9 +311,7 @@ fn router_choices_are_serial(program: &Program, tokens: usize, experts: usize) -
         .map(|eqn| {
             matches!(
                 program.kernel_choice(eqn),
-                KernelChoice::Generated(KernelRequest::Contraction(
-                    ContractionSpec::Serial { .. } | ContractionSpec::DenseSerial { .. }
-                ))
+                KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Serial { .. }))
             )
         })
         .collect()

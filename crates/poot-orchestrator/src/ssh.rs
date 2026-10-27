@@ -188,6 +188,16 @@ pub(crate) fn output_until(
     }
 }
 
+/// ssh's exit status when it cannot connect.
+pub(crate) const SSH_UNREACHABLE: i32 = 255;
+
+/// The exact commands that open a shell on a pod and copy `remote` off it into `local` by hand.
+pub(crate) fn pull_hint(key: &str, host: &str, port: u16, remote: &str, local: &str) -> String {
+    format!(
+        "ssh -i {key} -p {port} root@{host}\nscp -r -i {key} -P {port} root@{host}:{remote} {local}"
+    )
+}
+
 impl Endpoint {
     pub(crate) fn new(
         host: impl Into<String>,
@@ -349,6 +359,45 @@ impl Remote for Endpoint {
 
 #[cfg(test)]
 mod tests {
+    /// The by-hand pull commands name the key, port, host and both paths exactly.
+    #[test]
+    fn the_pull_hint_is_the_exact_ssh_and_scp_command_lines() {
+        assert_eq!(
+            pull_hint(
+                "/keys/id",
+                "203.0.113.7",
+                2222,
+                "/opt/benchmarks/results/run-1-2-m",
+                "benchmarks/results/"
+            ),
+            "ssh -i /keys/id -p 2222 root@203.0.113.7\n\
+             scp -r -i /keys/id -P 2222 root@203.0.113.7:/opt/benchmarks/results/run-1-2-m benchmarks/results/"
+        );
+    }
+
+    /// The mirror command goes to the pod as the one argument ssh hands the remote shell, after the options and the
+    /// target: the exact command line `Endpoint::ssh` would run. Mutation: split the command on spaces into several
+    /// arguments and the last assertion goes red.
+    #[test]
+    fn the_mirror_command_is_one_argument_of_the_ssh_command_line() {
+        let endpoint = Endpoint::new("203.0.113.7", 2222, "/keys/id", "/tmp/known_hosts");
+        let cmd = crate::gather::partial::mirror_command(
+            crate::gather::POD_RESULTS,
+            &["run-1-2-m-r1".to_string(), "run-1-2-m-r2".to_string()],
+        );
+        let command = endpoint.ssh_command(&cmd);
+        assert_eq!(command.get_program(), "ssh");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args[args.len() - 4..],
+            ["-p", "2222", "root@203.0.113.7", cmd.as_str()]
+        );
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+    }
+
     use super::*;
 
     /// R4/N1: the production plain helper (`output_plain`, used by `Endpoint::ssh` /

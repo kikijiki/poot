@@ -97,8 +97,8 @@ fn fake_target() -> Target {
 /// One `Device::dispatch` call's recorded argument lengths, inputs then output, in binding order.
 #[derive(Debug, Clone)]
 struct DispatchRecord {
-    input_elems: Vec<u32>,
-    output_elems: u32,
+    input_elems: Vec<usize>,
+    output_elems: usize,
 }
 
 #[derive(Clone, Default)]
@@ -166,7 +166,7 @@ impl Device for RecordingDevice {
     fn load_kernel(
         &mut self,
         _key: &str,
-        _kernel: poot_runtime_common::CompiledKernel,
+        _kernel: poot_codegen::CompiledKernel,
     ) -> Result<(), std::convert::Infallible> {
         Ok(())
     }
@@ -253,7 +253,7 @@ fn dispatch_args_carry_the_values_own_length_never_the_slots_capacity() {
         4,
         "four equations (`c + c` is folded into its reduce), four dispatches"
     );
-    let expected: [(&[u32], u32); 4] = [
+    let expected: [(&[usize], usize); 4] = [
         (&[64, 64], 64), // eqn 0: v1 = a + b
         (&[64], 1),      // eqn 1: s1 = reduce_sum(v1)
         (&[1], 1),       // eqn 2: s2 = reduce_sum(c + c) (output shares v1's freed [64] slot)

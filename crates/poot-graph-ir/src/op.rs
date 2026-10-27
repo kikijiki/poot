@@ -1031,6 +1031,16 @@ pub enum OpKind {
     /// per-row; the kernel reads the selected expert's rows in-kernel through `ContractionSpec::Indexed`). An id
     /// outside `0..E` is a typed oracle error and a NaN output row on every device.
     IndexedMatMul,
+    /// The permutation that groups MoE rows by expert: `ids [M]` (I32, the per-row expert ids of an
+    /// [`OpKind::IndexedMatMul`]) to `[2, M]` I32, where row 0 is `order` (`order[r]` is the row sorted position `r`
+    /// holds) and row 1 is `dest` (`dest[m]` is the sorted position of row `m`, the inverse permutation). Rows sort by
+    /// expert ascending and by row index within an expert (stable). A row whose id is outside `0..experts` sorts
+    /// after every expert, so both rows stay permutations of `0..M`: a bad id is carried to the contraction that
+    /// fails it closed (a NaN row), never dropped or routed to another expert. `experts` is a trace-time constant.
+    ExpertGroup {
+        /// The expert count; ids in `0..experts` are valid.
+        experts: usize,
+    },
     /// Write `update` (input 1) into a copy of `operand` (input 0) starting at the scalar index `index` (input 2)
     /// along `axis`, leaving the rest unchanged (XLA DynamicUpdateSlice, single axis). The KV-cache slot write:
     /// `operand[.., index..index+update.shape[axis], ..] = update`. Result type == `operand`'s type. The index is
@@ -1217,6 +1227,19 @@ fn cast_admitted(from: DType, to: DType) -> bool {
 /// The operands of an op that move or combine values of one dtype (`Concat`'s parts, `ScatterUpdate`'s base and
 /// source rows, `DynamicUpdateSlice`'s operand and update, a `Binary` pair of values) must agree on it: the
 /// result has one dtype, and a lowering reads every part as that dtype.
+/// The dtype rule of a write into a carried buffer (`DynamicUpdateSlice`, `ScatterUpdate`): the written values
+/// are the buffer's dtype, or f32 values a two-byte float buffer stores narrowed to its dtype (round to nearest
+/// even), a narrow KV cache's new entries (POOT-1395). The narrowing is the write's own: one write, no
+/// intermediate narrowed copy of the update.
+pub(crate) fn stores_as(base: &TensorType, update: &TensorType) -> Result<(), ShapeError> {
+    let narrowing = update.dtype == DType::F32 && matches!(base.dtype, DType::F16 | DType::BF16);
+    if narrowing {
+        Ok(())
+    } else {
+        check_same_dtype(base, update)
+    }
+}
+
 fn check_same_dtype(a: &TensorType, b: &TensorType) -> Result<(), ShapeError> {
     if a.dtype == b.dtype {
         Ok(())
@@ -1563,13 +1586,24 @@ impl OpKind {
                 *extent = *k;
                 Ok(TensorType::new(shape, DType::I32))
             }
+            OpKind::ExpertGroup { experts } => {
+                arity(ins, 1)?;
+                check_index_dtype("ExpertGroup", ins[0].dtype)?;
+                if ins[0].rank() != 1 || *experts == 0 {
+                    return Err(ShapeError::ExpertGroup {
+                        experts: *experts,
+                        ids: ins[0].shape.clone(),
+                    });
+                }
+                Ok(TensorType::new(vec![2, ins[0].shape[0]], DType::I32))
+            }
             OpKind::ScatterUpdate => {
                 // base[POOL,..rest], src[N,..rest], slots[N] -> base's type. Source row t is written to
                 // pool slot slots[t]; every other pool row passes through from base.
                 arity(ins, 3)?;
                 let (base, src, slots) = (&ins[0], &ins[1], &ins[2]);
                 check_index_dtype("ScatterUpdate", slots.dtype)?;
-                check_same_dtype(base, src)?;
+                stores_as(base, src)?;
                 let Some((_, rest)) = base.shape.split_first() else {
                     return Err(ShapeError::RankTooLow {
                         op: "ScatterUpdate",
@@ -1987,7 +2021,7 @@ impl OpKind {
                 arity(ins, 3)?;
                 let (operand, update, index) = (&ins[0], &ins[1], &ins[2]);
                 check_index_dtype("DynamicUpdateSlice", index.dtype)?;
-                check_same_dtype(operand, update)?;
+                stores_as(operand, update)?;
                 check_axis(*axis, operand.rank())?;
                 if update.rank() != operand.rank() {
                     return Err(ShapeError::OperandRank {
@@ -2081,7 +2115,7 @@ impl OpKind {
     ///
     /// | Op | Formed by |
     /// | --- | --- |
-    /// | `Attention` | `flash_attention_capped` from the attention chain |
+    /// | `Attention` | `flash_attention` from the attention chain |
     /// | `Rope` | `rope_fusion` from the half-split rotation chain |
     /// | `BlockTopK` | `form_selection` from [`crate::ops::block_top_k_packed`], the rank chain a sparse indexer's tracer states |
     /// | `SelectedAttention` | `form_selection` from an additive `Attention` whose mask is [`crate::ops::selected_block_mask`] |
@@ -2119,6 +2153,7 @@ impl OpKind {
             | Self::DynamicUpdateSlice { .. }
             | Self::PackedDequant { .. }
             | Self::ArgTopK { .. }
+            | Self::ExpertGroup { .. }
             | Self::AllReduce { .. }
             | Self::AllGather { .. }
             | Self::IndexedMatMul
@@ -2193,6 +2228,7 @@ impl OpKind {
             Self::DenseRowGather { .. } => "dense_row_gather",
             Self::ContractionEpilogue { .. } => "contraction_epilogue",
             Self::ArgTopK { .. } => "arg_top_k",
+            Self::ExpertGroup { .. } => "expert_group",
             Self::IndexedMatMul => "indexed_matmul",
             Self::DynamicUpdateSlice { .. } => "dynamic_update_slice",
             Self::Fused(_) => "fused",
@@ -2266,6 +2302,7 @@ impl OpKind {
             | OpKind::GroupedDenseContraction { .. }
             | OpKind::DenseRowGather { .. }
             | OpKind::ArgTopK { .. }
+            | OpKind::ExpertGroup { .. }
             | OpKind::IndexedMatMul
             | OpKind::DynamicUpdateSlice { .. }
             | OpKind::Attention(_)
@@ -2301,6 +2338,7 @@ impl OpKind {
             OpKind::Iota { len, dtype } => format!("iota len={len} {dtype}"),
             OpKind::Gather { axis } => format!("gather ax={axis}"),
             OpKind::ArgTopK { k } => format!("arg_top_k k={k}"),
+            OpKind::ExpertGroup { experts } => format!("expert_group experts={experts}"),
             OpKind::ScatterUpdate => "scatter_update".to_string(),
             OpKind::MatMul { accumulate } => match accumulate {
                 MatMulAccumulate::Operand => "matmul".to_string(),
@@ -2381,6 +2419,13 @@ fn reject_i32_region(op: &'static str, output: TensorType) -> Result<TensorType,
 /// (`Lq == Lk`) and a prefill into a cache (`1 < Lq < Lk`) all type here, at every float dtype and either
 /// bound: a live bound's decomposition selects inactive keys with a bit-moving `Select`, which every float width
 /// has.
+/// Whether an attention key or value stored as `stored` is read by a query of `query`: the query's own dtype,
+/// or a two-byte float under an f32 query, which the attention widens to f32 on load (a narrow KV cache,
+/// POOT-1395). The decomposition states the widening as a `Cast` of the operand.
+pub(crate) fn stored_kv_reads_as(stored: DType, query: DType) -> bool {
+    stored == query || (query == DType::F32 && matches!(stored, DType::F16 | DType::BF16))
+}
+
 fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorType, ShapeError> {
     let split = matches!(attrs.key, KeyLayout::Split { .. });
     let paged = matches!(attrs.key, KeyLayout::Paged);
@@ -2405,8 +2450,19 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
     let additive = matches!(attrs.mask, MaskOperand::Additive);
     for (operand, t) in [("k", k), ("v", v)]
         .into_iter()
-        .chain(additive.then_some(("mask", mask)))
         .chain(shared.map(|t| ("k_shared", t)))
+    {
+        if !stored_kv_reads_as(t.dtype, q.dtype) {
+            return Err(ShapeError::AttentionDtype {
+                operand,
+                expected: q.dtype,
+                actual: t.dtype,
+            });
+        }
+    }
+    for (operand, t) in additive
+        .then_some(("mask", mask))
+        .into_iter()
         .chain(sinks.map(|t| ("sinks", t)))
     {
         if t.dtype != q.dtype {
@@ -2822,7 +2878,7 @@ impl SelectedAttentionAttrs {
             });
         }
         for (operand, t) in [("k", k), ("v", v)] {
-            if t.dtype != q.dtype {
+            if !stored_kv_reads_as(t.dtype, q.dtype) {
                 return Err(ShapeError::AttentionDtype {
                     operand,
                     expected: q.dtype,
@@ -4207,23 +4263,45 @@ mod tests {
                 .is_ok()
         );
 
-        let bf16_k = TensorType::new(vec![1, 1, 3, 4], DType::BF16);
+        // POOT-1395: an F32 attention reads a half-width cache, widening on load; any other key or value
+        // dtype is a typed refusal naming the operand.
+        let narrow = |dtype| TensorType::new(vec![1, 1, 3, 4], dtype);
+        for dtype in [DType::F16, DType::BF16] {
+            assert!(
+                op.infer(&[q.clone(), narrow(dtype), narrow(dtype), mask.clone()])
+                    .is_ok(),
+                "{dtype:?} cache"
+            );
+        }
         assert!(matches!(
-            op.infer(&[q.clone(), bf16_k, v.clone(), mask.clone()]),
+            op.infer(&[q.clone(), narrow(DType::I32), v.clone(), mask.clone()]),
             Err(ShapeError::AttentionDtype {
                 operand: "k",
                 expected: DType::F32,
-                actual: DType::BF16
+                actual: DType::I32
             })
         ));
-
-        let bf16_v = TensorType::new(vec![1, 1, 3, 4], DType::BF16);
         assert!(matches!(
-            op.infer(&[q.clone(), k.clone(), bf16_v, mask.clone()]),
+            op.infer(&[q.clone(), k.clone(), narrow(DType::F64), mask.clone()]),
             Err(ShapeError::AttentionDtype {
                 operand: "v",
                 expected: DType::F32,
-                actual: DType::BF16
+                actual: DType::F64
+            })
+        ));
+        // Only an F32 query widens: a BF16 query reads no F16 cache.
+        let bf16_q = TensorType::new(vec![1, 1, 1, 4], DType::BF16);
+        assert!(matches!(
+            op.infer(&[
+                bf16_q,
+                narrow(DType::F16),
+                narrow(DType::BF16),
+                narrow(DType::BF16)
+            ]),
+            Err(ShapeError::AttentionDtype {
+                operand: "k",
+                expected: DType::BF16,
+                actual: DType::F16
             })
         ));
 
@@ -5408,6 +5486,7 @@ mod tests {
                 }
                 OpKind::DenseRowGather { source } => source.hash(h),
                 OpKind::ArgTopK { k } => k.hash(h),
+                OpKind::ExpertGroup { experts } => experts.hash(h),
                 OpKind::DynamicUpdateSlice { axis } => axis.hash(h),
                 OpKind::Fused(region) => {
                     region.n_inputs.hash(h);

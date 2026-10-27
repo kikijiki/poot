@@ -24,13 +24,13 @@ use std::sync::Arc;
 use poot_graph_ir::{
     IndexRange, PackedSourceName, SlotKey, TensorType, ValueId, WeightRef, packed_stack_source_type,
 };
-use poot_quant::SourceRole;
 use poot_quant::weights::{StoreGeneration, WeightEntry, WeightKey, WeightStore};
+use poot_quant::{Access, SourceRole};
 use poot_target::BufferStorage;
 use poot_tensor::{DType, HostView};
 use poot_weights::{HandleFormat, WeightId, WeightMap, WeightView};
 
-use crate::error::{BindError, LoadError};
+use crate::error::{BindError, ExecError, LoadError};
 use crate::lanes::{EncodeError, Encoding, first_non_finite_f16};
 
 /// A position in an entry's `locals`: the buffers the entry owns outright. Distinct from an arena slot, a weight,
@@ -411,9 +411,27 @@ impl WeightBinder {
     /// The store's mapped checkpoint files are still the files that were loaded (one `fstat` per
     /// file). `Engine::add_part` runs it on both sides of the load-time upload's reads: before, so no
     /// page of a changed file is read; after, so the bytes that upload read are the bytes the load
-    /// validated. The runtime reads (embed rows, expert refills) are not followed by it.
+    /// validated. `WeightBinder::embed` and the expert refills run it around their runtime reads of the same mapping.
     pub(crate) fn check_sources(&self) -> Result<(), LoadError> {
         Ok(self.store.check_sources()?)
+    }
+
+    /// The stored bytes `bytes` read have been uploaded: the process drops its mapped pages of them
+    /// ([`Access::Release`]); a later read faults them in again.
+    pub(crate) fn release(&self, bytes: &ConstBytes) {
+        for span in &bytes.spans {
+            match (self.store.get(span.key.as_str()), span.role) {
+                (Some(WeightEntry::Dense(dense)), None) => {
+                    dense
+                        .bytes()
+                        .advise_range(span.bytes.clone(), Access::Release);
+                }
+                (Some(WeightEntry::Packed(payload)), Some(role)) => {
+                    payload.advise(role, span.bytes.clone(), Access::Release);
+                }
+                _ => unreachable!("a span is built from the store it reads"),
+            }
+        }
     }
 
     fn entry(&self, value: ValueId, name: &str, key: &str) -> Result<&WeightEntry, LoadError> {
@@ -912,7 +930,10 @@ impl WeightBinder {
         rows: &EmbedRows,
         tokens: &[i32],
         storage: BufferStorage,
-    ) -> Result<Vec<u8>, BindError> {
+    ) -> Result<Vec<u8>, ExecError> {
+        // ADR-0103 amendment: no page of a changed file is read, and the rows read are the validated bytes
+        // only if the file did not change while they were read.
+        self.check_sources()?;
         let total: usize = rows.runs.iter().map(|run| run.rows.len()).sum();
         let mut dense = Vec::new();
         let mut decoded = Vec::new();
@@ -950,27 +971,48 @@ impl WeightBinder {
                     let start = decoded.len();
                     decoded.resize(start + rows.width, 0.0f32);
                     // `load_weights` matched the payload to the map's `[rows, width]`, and `embed_rows` cut the
-                    // runs inside its rows, so the decode cannot leave the payload's shape.
-                    // Guarded by `WeightMap::check_store`'s tests (`check_store_refuses_a_packed_entry_of_another_width`).
+                    // runs inside its rows, so the decode stays inside the payload's shape; a decode failure
+                    // is typed all the same, never a panic on bytes a file can change.
                     payload
                         .decode_row(stored_row, &mut decoded[start..])
-                        .expect("a mapped row of a checked payload decodes");
+                        .map_err(|source| BindError::EmbedDecode {
+                            name: rows.name.clone(),
+                            token,
+                            source,
+                        })?;
                 }
                 None => unreachable!("load_weights checked every mapped key against this store"),
             }
         }
         // `embed_rows` admitted this lane for these rows: a dense table's encoding exists and cannot fail on
         // its data (the finite-F16 lane is not admitted), and a packed table's F32 rows land verbatim.
-        Ok(match rows.format {
+        let encoded = match rows.format {
             HandleFormat::Dense(dtype) => {
-                crate::lanes::encode_stored(dtype, &[rows.width], &dense, storage)
-                    .expect("embed_rows admitted a lane whose encoding cannot fail on data")
+                crate::lanes::encode_stored(dtype, &[rows.width], &dense, storage).map_err(
+                    |error| match error {
+                        EncodeError::NoEncoding => LoadError::WeightFormat {
+                            name: rows.name.clone(),
+                            stored: format!("{dtype:?}"),
+                            planned: storage,
+                        },
+                        EncodeError::NonFiniteF16 { index, bits } => {
+                            LoadError::NonFiniteF16Weight {
+                                name: rows.name.clone(),
+                                index,
+                                bits,
+                            }
+                        }
+                    },
+                )?
             }
             HandleFormat::Packed(_) => {
                 crate::lanes::encode_host(DType::F32, bytemuck::cast_slice(&decoded), storage)
                     .expect("embed_rows admitted a lane that holds F32 rows")
             }
-        })
+        };
+        // The same check after the reads: a file modified while its rows were read is refused, not encoded.
+        self.check_sources()?;
+        Ok(encoded)
     }
 }
 

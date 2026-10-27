@@ -133,8 +133,16 @@ fn attention_detail(eqn: &Eqn, choice: &KernelChoice, dispatch: &Dispatch) -> St
             unreachable!("a live bound reads its length operand")
         }
     };
+    let schedule = match spec.schedule {
+        poot_kernelgen::AttentionSchedule::Streaming { .. } => "streaming".to_string(),
+        poot_kernelgen::AttentionSchedule::SplitKv { splits, .. } => format!("split({splits})"),
+        poot_kernelgen::AttentionSchedule::Tiled { br, bc, micro, .. } => format!(
+            "tiled(br={br} bc={bc} score={}x{} out={}x{})",
+            micro.score.rows, micro.score.cols, micro.out.rows, micro.out.cols
+        ),
+    };
     format!(
-        "schedule=streaming lanes={lanes} lds={} key={key} bound={bound}",
+        "schedule={schedule} lanes={lanes} lds={} key={key} bound={bound}",
         used.lds_bytes
     )
 }
@@ -343,13 +351,7 @@ fn render_dump(registry: &Registry, reference: &RefTarget) -> String {
 }
 
 fn digests_path() -> PathBuf {
-    // `std::env::var`, not `env!`: the latter bakes the path into this test binary's compiled object code
-    // at build time, and a shared compile cache (kache) that reuses that object across worktrees by
-    // source-content hash would then serve whichever worktree's path happened to compile it first.
-    // `std::env::var` reads the environment cargo sets fresh for every test-binary invocation.
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR must be set by cargo for test binaries");
-    PathBuf::from(manifest_dir)
+    poot_test_util::manifest_dir()
         .join("tests")
         .join("plan_summary")
         .join("digests.tsv")
@@ -584,13 +586,10 @@ fn every_corpus_plan_satisfies_the_launch_invariants() {
 
 /// The same invariants at real dimensions, on the targets' preset caps: a launch grid, a workgroup
 /// memory budget or a limit that only a real width reaches. A graph the planner refuses at these
-/// dimensions is a matrix cell (`feature_matrix`), not an invariant violation.
+/// dimensions is a matrix cell (`supported_models`), not an invariant violation.
 #[test]
 fn every_real_dimension_plan_satisfies_the_launch_invariants() {
-    let root = std::path::Path::new(
-        &std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
-    )
-    .join("../..");
+    let root = poot_test_util::repo_root();
     let mut planned = 0usize;
     for model in real_dims::real_models(&root) {
         for &shape in model.shapes() {
@@ -618,57 +617,50 @@ fn every_real_dimension_plan_satisfies_the_launch_invariants() {
 }
 
 /// The first equation of `program` whose only launch writes one element per thread and whose grid has
-/// no slack: one workgroup fewer cannot cover its output.
-fn tight_launch(program: &Program) -> usize {
-    program
-        .planned()
-        .position(|(eqn, plan)| {
-            let [dispatch] = plan.dispatches() else {
-                return false;
-            };
-            let workgroup = u64::from(dispatch.body().workgroup_size[0]);
-            let threads = dispatch
-                .launch()
-                .grid
-                .iter()
-                .map(|&x| u64::from(x))
-                .product::<u64>();
-            let elements = program
-                .graph()
-                .aval(eqn.out)
-                .shape
-                .iter()
-                .map(|&d| d as u64)
-                .product::<u64>();
-            invariants::writes_one_element_per_thread(dispatch)
-                && dispatch.launch().grid[1] == 1
-                && dispatch.launch().grid[2] == 1
-                && threads > workgroup
-                && threads - workgroup < elements
-        })
-        .expect("the corpus holds a tight one-element-per-thread launch")
+/// no slack: one workgroup fewer cannot cover what it writes.
+fn tight_launch(program: &Program) -> Option<usize> {
+    program.planned().position(|(eqn, plan)| {
+        let [dispatch] = plan.dispatches() else {
+            return false;
+        };
+        let workgroup = u64::from(dispatch.body().workgroup_size[0]);
+        let threads = dispatch
+            .launch()
+            .grid
+            .iter()
+            .map(|&x| u64::from(x))
+            .product::<u64>();
+        let elements = invariants::coverage(program, eqn, plan.dispatches());
+        invariants::writes_one_element_per_thread(dispatch)
+            && dispatch.launch().grid[1] == 1
+            && dispatch.launch().grid[2] == 1
+            && threads > workgroup
+            && threads - workgroup < elements
+    })
 }
 
 /// SC-003 control: a plan whose launch grid is one workgroup short of covering its output fails the
-/// invariants, naming the equation. Without it the rows above would pass whatever the checker did.
+/// invariants, naming the equation. Without it the rows above would pass whatever the checker did. The
+/// plan is the first corpus graph's (in corpus order) that holds such a launch.
 /// Mutation: drop the grid-covers-output check in `support/invariants.rs`; this row goes red on
 /// `a grid one workgroup short went undetected`.
 #[test]
 fn a_launch_grid_one_workgroup_short_is_caught() {
     let wgpu = preset("wgpu", "spirv_vulkan", Backend::SpirvVulkan);
-    let graph = corpus(&registry())
+    let (mut program, index) = corpus(&registry())
         .into_iter()
-        .find(|row| row.name == "parity.qwen2.decode")
-        .expect("the parity corpus has a qwen2 decode graph")
-        .graph();
-    let mut program = compile(&graph, &wgpu.target, &targets::options()).expect("qwen2 plans");
+        .find_map(|row| {
+            let program = compile(&row.graph(), &wgpu.target, &targets::options()).ok()?;
+            let index = tight_launch(&program)?;
+            Some((program, index))
+        })
+        .expect("the corpus holds a tight one-element-per-thread launch");
     assert_eq!(
         invariants::violations(&program),
         Vec::<String>::new(),
         "the unmodified plan is sound"
     );
 
-    let index = tight_launch(&program);
     program
         .shrink_first_launch_by_one_workgroup(index)
         .expect("a shorter grid is still a valid dispatch plan");

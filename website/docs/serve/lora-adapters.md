@@ -6,50 +6,37 @@ sidebar_position: 11
 
 # Using LoRA adapters
 
-Adapters load and unload while the server runs, through `/v1/lora_adapters`, and a request selects one by name.
-The driver runs every adapter of one load together as one generation of weights beside the base weights, so a
-request that names no adapter runs the base model unchanged.
+Adapters load and unload while the server runs, through `/v1/lora_adapters`, and a request selects one by name. A request that names no adapter runs the base model unchanged.
 
 ## Administration routes
 
-| Request                                          | Effect                                                                                                        |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
-| `GET /v1/lora_adapters`                          | Lists the loaded adapters: `{"object": "list", "data": [{"name", "index"}]}`.                                 |
-| `POST /v1/lora_adapters` with `{"name", "path"}` | Loads the PEFT adapter directory at `path` (`adapter_config.json` and `adapter_model.safetensors`) as `name`. |
-| `DELETE /v1/lora_adapters/{name}`                | Unloads `name`.                                                                                               |
+| Request                                          | Effect                                                                                  |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `GET /v1/lora_adapters`                          | Lists the loaded adapters: `{"object": "list", "data": [{"name", "index"}]}`.          |
+| `POST /v1/lora_adapters` with `{"name", "path"}` | Loads the PEFT adapter directory at `path` (`adapter_config.json`, `adapter_model.safetensors`) as `name`. |
+| `DELETE /v1/lora_adapters/{name}`                | Unloads `name`.                                                                         |
 
-The operations run on the engine thread, which runs them with no request in flight. A load captures every loaded
-adapter plus the new one as a new generation and prepares its entries for the shapes the server prepared; the
-adapter indices are positions in that set, so unloading one shifts the indices of the ones after it. A request
-already running on the replaced generation finishes on it. Statuses: `400` for a name already loaded, an adapter
-that does not fit the model or an unreadable directory; `404` for an unknown name; `409` when the last adapter
-cannot be unloaded because running requests hold it (retry later); `503` when the prepared-entry limits cannot
-take the new generation.
+Operations run on the engine thread with no request in flight. A load makes every loaded adapter plus the new one a new generation of weights. A request already running on the replaced generation finishes on it. Adapter indices are positions in the set, so unloading one shifts the indices after it.
 
-The routes keep their trust policy: on a loopback listener they are open to local processes, on a non-loopback
-listener they are disabled unless `--lora-admin-key-file` names a file holding a bearer token, and then every
-request under `/v1/lora_adapters` needs that token, on a loopback listener too. The key is read from the file once
-at startup, so it never appears in the process arguments. Inference stays unauthenticated.
+| Status | Cause                                                                                    |
+| ------ | ---------------------------------------------------------------------------------------- |
+| `400`  | A name already loaded, an adapter that does not fit the model, or an unreadable directory |
+| `404`  | An unknown name                                                                          |
+| `409`  | The last adapter cannot be unloaded because running requests hold it (retry later)      |
+| `503`  | The prepared-entry limits cannot take the new generation                                 |
+
+On a loopback listener the routes are open to local processes. On a non-loopback listener they are disabled unless `--lora-admin-key-file` names a file holding a bearer token. Then every request under `/v1/lora_adapters` needs that token, on loopback too. The key is read once at startup and never appears in the process arguments. Inference stays unauthenticated.
 
 ## Selecting an adapter
 
-A completion or chat request sets `lora_adapter` to a loaded name. A name no loaded adapter has is a `400`, never
-a silent fall back to the base model. An adapter unloaded between the request's validation and its start fails
-the request with a `400` too.
+A completion or chat request sets `lora_adapter` to a loaded name. An unknown name is a `400`, never a fall back to the base model. So is an adapter unloaded between validation and start.
 
 ## Scope
 
-- **Model family:** dense decoders whose attention and MLP projections carry the module names below, served
-  through the driver; the [feature matrix](../reference/feature-matrix.md) lists the families.
-- **Target modules:** the seven attention and MLP projections (`q_proj`, `k_proj`, `v_proj`,
-  `o_proj`, `gate_proj`, `up_proj`, `down_proj`). An adapter that targets any other module is refused
-  outright at load time; poot does not partially apply an adapter.
-- **DoRA:** not supported. A DoRA checkpoint (LoRA plus a magnitude vector) is rejected with a clear error
-  rather than loaded as a plain LoRA with the magnitude term dropped.
-- **Adapter dtype:** F32, F16 or BF16 factors, uploaded in the dtype the adapter file stores them in (a BF16
-  adapter takes half the device memory of its F32 twin) and widened on the device by the correction. The
-  adapters of one load must share one stored dtype; a mixed set is refused at load.
-- **Backends:** the adapter path is backend-independent driver code, and its device tests run on wgpu, ROCm and PTX (the
-  PTX test skips without an NVIDIA GPU); no device test covers adapters on raw Vulkan.
+- **Models:** dense decoders whose attention and MLP projections carry the module names below; see [Models](../develop/models.md).
+- **Target modules:** `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`. An adapter that targets any other module is refused at load; poot does not partially apply an adapter.
+- **DoRA:** not supported; a DoRA checkpoint is rejected with an error.
+- **Dtype:** F32, F16 or BF16 factors, uploaded as stored. The adapters of one load must share one stored dtype; a mixed set is refused.
+- **Backends:** device tests cover wgpu, ROCm and PTX; none covers adapters on raw Vulkan.
 
-Design and primary sources: [Architecture: Serving design](../architecture/serving-design.mdx).
+Design: [Serving design](../architecture/serving-design.mdx).

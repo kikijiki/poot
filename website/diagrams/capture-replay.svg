@@ -34,9 +34,10 @@
     <path d="M270 194 L340 235" marker-end="url(#arrow)"/>
     <path d="M270 272 H340" marker-end="url(#arrow)"/>
     <path d="M270 350 L340 309" marker-end="url(#arrow)"/>
-    <path d="M645 272 L700 196" marker-end="url(#arrow)"/>
-    <path d="M645 272 H700" marker-end="url(#arrow)"/>
-    <path d="M645 272 L700 350" marker-end="url(#arrow)"/>
+    <path d="M645 272 L700 190" marker-end="url(#arrow)"/>
+    <path d="M645 272 L700 252" marker-end="url(#arrow)"/>
+    <path d="M645 272 L700 314" marker-end="url(#arrow)"/>
+    <path d="M645 272 L700 376" marker-end="url(#arrow)"/>
   </g>
 
   <rect class="box blue" x="40" y="166" width="230" height="56" rx="10"/>
@@ -52,15 +53,18 @@
   <text class="m" x="495" y="284">mask computed from Pos</text>
   <text class="d" x="495" y="326">same shape every token</text>
 
-  <rect class="box amber" x="704" y="166" width="456" height="56" rx="10"/>
-  <text class="l tx-amber" x="724" y="190">PTX</text>
-  <text class="n" x="724" y="210">CUDA graph: cuGraphLaunch, one call</text>
-  <rect class="box purple" x="704" y="244" width="456" height="56" rx="10"/>
-  <text class="l tx-purple" x="724" y="268">wgpu</text>
-  <text class="n" x="724" y="288">cached pipelines, re-encode, one submit</text>
-  <rect class="box red" x="704" y="322" width="456" height="56" rx="10"/>
-  <text class="l tx-red" x="724" y="346">ROCm</text>
-  <text class="n" x="724" y="366">recorded HSA AQL packets, resubmitted</text>
+  <rect class="box amber" x="704" y="166" width="456" height="50" rx="10"/>
+  <text class="l tx-amber" x="724" y="188">PTX</text>
+  <text class="n" x="724" y="206">CUDA graph: cuGraphLaunch, one call</text>
+  <rect class="box purple" x="704" y="228" width="456" height="50" rx="10"/>
+  <text class="l tx-purple" x="724" y="250">wgpu</text>
+  <text class="n" x="724" y="268">cached pipelines, re-encode, one submit</text>
+  <rect class="box purple" x="704" y="290" width="456" height="50" rx="10"/>
+  <text class="l tx-purple" x="724" y="312">raw Vulkan</text>
+  <text class="n" x="724" y="330">recorded command buffers, resubmitted</text>
+  <rect class="box red" x="704" y="352" width="456" height="50" rx="10"/>
+  <text class="l tx-red" x="724" y="374">ROCm</text>
+  <text class="n" x="724" y="392">recorded HSA AQL packets, resubmitted</text>
 
   <text class="n" x="40" y="441">host driver calls per token</text>
   <text class="m" style="text-anchor:start" x="40" y="500">naive</text>

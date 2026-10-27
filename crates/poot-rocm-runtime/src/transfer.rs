@@ -18,6 +18,7 @@ use crate::discovery::{
 };
 use crate::error::check;
 use crate::ffi::Hsa;
+use crate::host_memory::{host_available_bytes, unified_free_bytes};
 use crate::owner::{HsaRuntimeOwner, ResourceOwner};
 use crate::queue::{
     DEVICE_RING_OVERRIDE_AT_FIRST_HSA_LOAD, QueueCreationPlan, QueueLayout, QueueProperties,
@@ -350,6 +351,8 @@ impl RocmContext {
 
         // SAFETY: discovery contract (above).
         let vram_total_bytes = unsafe { amd_pool_size(&hsa.funcs, gpu_coarse_pool) }.unwrap_or(0);
+        // SAFETY: discovery contract (above).
+        let unified_memory = unsafe { amd_agent_is_apu(&hsa.funcs, gpu_agent)? };
         // SAFETY: discovery contract (above); the attribute's value is a `uint32_t`.
         let compute_units = unsafe {
             amd_agent_u32_info(&hsa.funcs, gpu_agent, HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT)
@@ -380,6 +383,7 @@ impl RocmContext {
             queue_publication,
             device_ring_receipt,
             vram_total_bytes,
+            unified_memory,
             compute_units,
             limits,
             timeouts,
@@ -413,13 +417,20 @@ impl RocmContext {
     /// `HSA_AMD_AGENT_INFO_MEMORY_AVAIL` read, so other HSA processes' allocations since the device
     /// opened are out of it. Card 268: it covers only memory allocated through HSA/KFD's own pool
     /// accounting and does not see non-HSA GPU clients, so on a shared unified-memory box it can overstate
-    /// the headroom. `None` if the query fails.
+    /// the headroom. On an APU the device's memory is the host's RAM, so the figure is further bounded by
+    /// what the host reports available less the host floor ([`unified_free_bytes`]): a
+    /// device allocation that fits the pool but leaves the host nothing starves the box. `None` if the
+    /// query fails.
     pub fn vram_free_bytes(&self) -> Option<u64> {
         if self.vram_total_bytes == 0 {
             return None;
         }
         // SAFETY: discovery contract: the context keeps its runtime initialized.
-        unsafe { amd_agent_memory_avail(&self.hsa.funcs, self.gpu_agent) }.ok()
+        let pool = unsafe { amd_agent_memory_avail(&self.hsa.funcs, self.gpu_agent) }.ok()?;
+        if !self.unified_memory {
+            return Some(pool);
+        }
+        Some(unified_free_bytes(pool, host_available_bytes()?))
     }
 
     /// Card 125 (FR-004/SC-004): a device DMA transfer (`hsa_amd_memory_async_copy` + completion
@@ -684,7 +695,7 @@ impl RocmContext {
         storage: BufferStorage,
         role: BufferRole,
     ) -> Result<RocmBuffer, RocmError> {
-        let (elem_count, element_bytes) = checked_layout(op, elems, storage)?;
+        let element_bytes = checked_layout(op, elems, storage)?;
         // Whole 4-byte words: a kernel addresses storage by word (the device's state copy among them), so
         // an odd-width buffer (3 bf16, 5 raw bytes) owns the word its last element sits in, as wgpu and
         // Vulkan allocate.
@@ -692,7 +703,7 @@ impl RocmContext {
         let pool = Pool::for_role(role);
         let native_pool = self.native_pool(pool);
         let ptr = self.pool_alloc(native_pool, bytes)?;
-        Ok(self.own_buffer(ptr, elem_count, bytes, storage, role, pool))
+        Ok(self.own_buffer(ptr, elems, bytes, storage, role, pool))
     }
 
     pub(crate) fn allocate_zeroed(
@@ -957,7 +968,7 @@ impl RocmContext {
     pub(crate) fn own_buffer(
         &self,
         ptr: *mut c_void,
-        elem_count: u32,
+        elem_count: usize,
         byte_capacity: usize,
         storage: BufferStorage,
         role: BufferRole,

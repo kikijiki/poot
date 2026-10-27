@@ -56,7 +56,7 @@ impl Context {
         self.readbacks.set(self.readbacks.get() + 1);
         self.readback_staging_allocs
             .set(self.readback_staging_allocs.get() + 1);
-        let size = (b.elem_count as usize * 4) as wgpu::BufferAddress;
+        let size = (b.elem_count * 4) as wgpu::BufferAddress;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging"),
             size,
@@ -119,7 +119,7 @@ impl Context {
         self.readbacks.set(self.readbacks.get() + 1);
         self.readback_staging_allocs
             .set(self.readback_staging_allocs.get() + 1);
-        let byte_capacity = b.elem_count() as usize * b.storage().element().byte_width();
+        let byte_capacity = b.elem_count() * b.storage().element().byte_width();
         let padded_capacity = byte_capacity.div_ceil(4) * 4;
         let size = (out.len().div_ceil(4) * 4).min(padded_capacity) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -188,7 +188,7 @@ impl Context {
     /// different byte lengths.
     pub fn copy_bytes(&self, dst: &DeviceBuffer, src: &DeviceBuffer) -> Result<u64, RuntimeError> {
         let bytes = |buffer: &DeviceBuffer| {
-            (u64::from(buffer.elem_count) * buffer.storage.element().byte_width() as u64)
+            (buffer.elem_count as u64 * buffer.storage.element().byte_width() as u64)
                 .next_multiple_of(4)
         };
         let (dst_bytes, src_bytes) = (bytes(dst), bytes(src));
@@ -260,7 +260,7 @@ pub(crate) mod test_only {
             let (offsets, size) = segment_byte_layout(
                 segments
                     .iter()
-                    .map(|segment| (segment.words, segment.buffer.elem_count as usize)),
+                    .map(|segment| (segment.words, segment.buffer.elem_count)),
             )?;
             if size == 0 {
                 return Ok(Vec::new());

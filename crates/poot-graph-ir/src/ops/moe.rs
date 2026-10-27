@@ -197,7 +197,7 @@ pub fn top_k_gate(b: &Builder, x: Traced, k: usize) -> Result<Traced, BuilderErr
 /// in-kernel, no weight-gather copy). Measured on RADV STRIX_HALO (`moe_sparse_vs_dense_decode_timing`,
 /// resident path, E=32/k=8/H=1024/I=512): sparse 1.49 vs dense 1.73 ms/fwd = 1.16x with identical
 /// output (`moe_sparse_gpu_matches_dense`); the win grows with E/k. The indexed contraction runs the
-/// Gemv at decode row counts on every backend and a segmented Tiled schedule above them. One MoE
+/// Gemv at decode row counts on every backend and a register-tiled expert walk above them. One MoE
 /// definition shared by every arch's tracer.
 ///
 /// Shapes: `x[1, L, H]`; `router_w[H, E]`; `w_in[E, H, 2*I]` (fused gate||up); `w_out[E, I, H]` (per-expert

@@ -1,0 +1,408 @@
+The harbour town of Veldmark sits where the river Aun meets the northern sea, and for most of the year the morning begins with fog. Fishermen walk down to the quay before the bells ring, carrying nets over their shoulders and thermos flasks in their coat pockets. By seven the fog lifts from the water in long grey strips, and the gulls, which have been waiting on the roofs, descend on the boats as if they had been called.
+
+The town archive keeps a ledger from the year the first lighthouse was built. It lists the cost of every barrel of lime, every iron bolt and every day of work, written in a small careful hand. The keeper at the time, a woman named Ilse Brandt, added a note at the bottom of each page: the weather, the wind, and how many ships passed. On the day the lamp was lit for the first time she wrote only three words, "It is done."
+
+Mathematics is often described as the language of nature, but it is better understood as a habit of care. To prove that the sum of two even numbers is even, one writes each as twice an integer, adds them, and factors out the two. Nothing in the argument depends on which numbers were chosen. This is the whole appeal of a proof: it replaces a thousand examples with a single reason, and the reason keeps working long after the examples are forgotten.
+
+A simple program that reads a file and counts its lines can still go wrong in several ways. The file might not exist, or it might be too large to read at once, or it might use a different line ending than the one the author expected. A careful programmer checks each case and returns a clear error rather than a wrong number. In Rust, this usually means a function that returns a Result, where the caller must decide what to do with the failure before the code will compile.
+
+fn count_lines(text: &str) -> usize {
+    text.lines().count()
+}
+
+Cooking rice well is mostly a matter of patience. Rinse the grains until the water runs clear, add one and a half parts of water to one part of rice, bring the pot to a boil, then lower the heat as far as it will go and cover it tightly. Do not lift the lid. After fifteen minutes, turn off the heat and let the pot rest for ten more. The steam finishes the work, and the rice comes out separate and soft rather than wet.
+
+In the early days of aviation, pilots navigated by following railway lines and rivers, since few of them could afford instruments that would work in cloud. A wrong turn at a junction meant landing in a field and asking a farmer for directions. Today a passenger jet crosses the ocean guided by satellites, and the crew spends most of the flight watching systems that rarely fail. The skill that matters has shifted from steering to judgment, from the hands to the head.
+
+When the power went out across the valley, the neighbours gathered on the porch of the old schoolhouse, because it was the only building with a wood stove. Someone brought candles, someone else brought a pot of soup, and a boy of about ten produced a deck of cards from his jacket. They played until midnight. Nobody remembered afterwards who had won, but everyone remembered the soup, and the way the snow looked in the light of the windows.
+---
+id: compute-engine
+title: Compute engine
+sidebar_position: 3
+---
+
+# Compute engine
+
+poot is a tensor compute stack first. `poot-llm` sits on top of it. If you want matmuls, norms, custom
+graphs, or your own `#[kernel]`s without loading an LLM, use the crates below.
+
+There are two entry points:
+
+1. **Graph IR**: build a primitive tensor graph, optionally fuse it, run it on the CPU oracle or on a
+   GPU through the executor contract.
+2. **Imported kernels**: write ordinary Rust `#[kernel]` functions and dispatch them through
+   `poot-wgpu-runtime` (see [Authoring kernels](./authoring-kernels.md)).
+
+LLM generation uses the same engine: trace a model into a graph, then run that graph with capture/replay.
+
+## Crates
+
+| Crate                            | Role                                                             |
+| -------------------------------- | ---------------------------------------------------------------- |
+| `poot-graph-ir`                  | `Builder`, `ops::*`, `Graph`                                     |
+| `poot-eval`                      | CPU oracle: `eval(&graph, &inputs, EvalOptions) -> Evaluation`   |
+| `poot-executor`                  | Executor contract: `Engine<D>` over a per-backend `Device` trait |
+| `poot-wgpu-device`                       | wgpu/Vulkan: `WgpuDevice`, the contract's wgpu `Device`          |
+| `poot-ptx-device` / `poot-rocm-device` | NVIDIA / AMD: `PtxDevice` / `RocmDevice` on the same contract    |
+| `poot-vulkan-device`             | Raw Vulkan: `VulkanDevice` on the same contract, no wgpu         |
+| `poot-kernel-attr` + `pootc`     | `#[kernel]` import: `pootc` lowers marked fns to GPU code        |
+| `poot-wgpu-runtime`                   | Host `Context` + typed launchers for imported kernels            |
+
+`poot-graph-plan::compile` owns optimization, legalization and planning. It returns a `Program` for a
+typed target. The executor contract consumes that program: `staged::compile_staged` wraps `compile` for one
+device, `Executor::add_entry` loads the staged program, the first `step` records it, and every later
+`step` replays it.
+
+## Build a graph
+
+High-level ops (`rmsnorm`, `linear`, attention helpers, ...) are compositions of primitives. You never need
+an LLM checkpoint to use them:
+
+```rust
+use std::collections::HashMap;
+use std::num::{NonZeroU64, NonZeroUsize};
+
+use poot_eval::{EvalOptions, Value, eval};
+use poot_graph_ir::{Builder, TensorType, TraceLimits, ops};
+use poot_tensor::HostTensor;
+
+let n = 8usize;
+let limits = TraceLimits {
+    max_tokens: NonZeroUsize::MIN, // a model trace's per-step bound; a bare builder never reads it
+    max_values: NonZeroUsize::new(1 << 10).unwrap(),
+    max_eqns: NonZeroUsize::new(1 << 10).unwrap(),
+    max_literal_bytes: NonZeroU64::new(1 << 12).unwrap(),
+    max_owned_bytes: NonZeroU64::new(1 << 20).unwrap(),
+};
+let b = Builder::new(limits);
+let x = b.constant("x", TensorType::f32(vec![1, 1, n]))?;
+let w = b.constant("w", TensorType::f32(vec![n]))?;
+let out = ops::rmsnorm(&b, x, w, 1e-6)?;
+let g = b.finish(out)?;
+
+let mut inputs = HashMap::new();
+inputs.insert(x.id(), Value::from(HostTensor::f32(vec![1, 1, n], vec![1.0; n])));
+inputs.insert(w.id(), Value::from(HostTensor::f32(vec![n], vec![1.0; n])));
+let y = eval(&g, &inputs, EvalOptions::default())?;
+```
+
+A `Builder` is created with the limits its caller states (`TraceLimits`: values, equations, bytes of scalar
+literals and of owned storage; there is no default and no unlimited builder), and every builder call and every
+op composition returns a typed `BuilderError`: a shape or dtype an operation does not admit, a handle from
+another builder, or a request past a limit. A request past a limit is refused before it allocates or appends,
+and the error names the resource, the limit and the attempted total. The limits bound the storage the
+builder itself requests, not allocator overhead or device memory.
+
+`Builder::constant` registers a named const/input binder. At eval time you supply a `HashMap<ValueId,
+Value>` keyed by those ids (`Value::from(HostTensor::f32(shape, data))` for an F32 tensor). A bound tensor must have exactly the
+dtype the graph declares for that input: the evaluator never narrows or widens at bind, so a BF16 input
+is bound from BF16 words (`HostTensor::bf16`). Shapes are static on the graph. `EvalOptions` carries an optional observer and whether to keep the environment. The result is
+an `Evaluation`; its `.output` is the primary output `Value`.
+
+Try it:
+
+```bash
+cargo run -p poot-llm --release --example build_and_eval
+```
+
+## Compile for a target
+
+`compile` is the compiler entry and runs the production pass sequence:
+
+```rust
+use poot_executor::Device;
+use poot_graph_plan::{compile, CompileLimits, CompileOptions, Target};
+use poot_wgpu_device::device::WgpuDevice;
+
+let device = WgpuDevice::new()?;
+let target: Target = device.target(); // a GPU target: backend plus measured DeviceCaps
+let program = compile(&g, &target, &CompileOptions::new(CompileLimits::STANDARD))?;
+```
+
+`CompileLimits` bounds what one compile may construct: the value and equation counts of every graph a
+pass produces, the instruction and local counts of one generated kernel, and the byte size of one
+compiled kernel artifact. Every field is finite and nonzero, and there is no unlimited setting;
+`CompileLimits::STANDARD` is the production policy. A compile that would pass a limit returns a typed
+error before it builds the excess: `CompileError::Expansion` for a graph, a planner refusal carrying
+`KernelGenError::BodyLimit` for a kernel body, and a load error for an oversize artifact. The artifact
+limit bounds the artifact's bytes only, not the memory or time the external compiler uses.
+
+The program exposes its graph, equation plans, storage/slot decisions and numerics. The executor
+contract consumes the staged form: `staged::compile_staged` wraps `compile` for one device and hands the
+`StagedProgram` to `Executor::add_entry`. For a CPU-only illustration of individual fusion passes:
+
+```bash
+cargo run -p poot-llm --release --example trace_and_fuse
+```
+
+## Run on GPU (wgpu)
+
+The wgpu backend runs the same contract as PTX, ROCm and raw Vulkan: build a `WgpuDevice`, wrap it in an
+`Engine`, load the weights, add an entry per graph, then step it.
+
+```rust
+use std::sync::Arc;
+
+use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
+use poot_tensor::HostView;
+use poot_wgpu_device::device::WgpuDevice;
+use poot_graph_plan::staged::{
+    compile_staged, DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet,
+};
+use poot_graph_plan::{CompileLimits, CompileOptions};
+use poot_quant::weights::WeightStore;
+use poot_weights::WeightMap;
+
+// use Builder / ops::* to trace the graph, as above; each Storage::Const the graph declares is a
+// WeightId::const_name, `store` holds the stored tensors and `map` (a WeightMap built over it)
+// names the store entries each weight reads.
+
+let device = WgpuDevice::new()?; // Err if no Vulkan adapter
+let target = device.target();
+
+// Stage the graph for one device: compile runs the passes, then planning.
+let staged = compile_staged(
+    &g,
+    &TargetSet::single(DeviceId(0), target),
+    &Partition {
+        experts: ExpertPlacement::AllResident,
+        devices: DevicePlacement::Single(DeviceId(0)),
+    },
+    &CompileOptions::new(CompileLimits::STANDARD),
+)?;
+
+let mut exec = Engine::new(device);
+// One load, reused by every entry. A `Model`'s graph passes its own weight map.
+let exe = exec.load_weights(Arc::new(store), Arc::new(map))?;
+let entry = exec.add_entry(exe, &staged)?; // binds consts, loads plans
+
+// Bind this step's slot inputs (consts come from the store through the weight source), then run:
+// let mut inputs = StepInputs::new();
+// inputs.push(slot_key, &shape, HostView::new(...)?);
+let out = exec.step(exe, entry, &StepInputs::new(), &mut NoSync)?.read()?;
+```
+
+The first `step` on an entry records the dispatch sequence; every later `step` replays it. Drop the
+entry with `Executor::remove_entry` when the graph shape changes, and `Executor::unload` to free the
+executable. `Engine<PtxDevice>`, `Engine<RocmDevice>` and `Engine<VulkanDevice>` take the same `Graph` and the same calls;
+that is the engine the `poot-llm` driver runs on.
+
+## Direct `#[kernel]` dispatch
+
+When you do not want a graph at all, author a kernel and launch it with a `poot_wgpu_runtime::Context`:
+
+```rust
+use poot_wgpu_runtime::{Context, KernelBuffer};
+
+let ctx = Context::new()?;
+let a = [1.0f32, 2.0, 3.0];
+let b = [10.0f32, 20.0, 30.0];
+let mut bufs = [
+    KernelBuffer::read_only_f32(&a),
+    KernelBuffer::read_only_f32(&b),
+    KernelBuffer::write_f32(a.len()),
+];
+// `kernel` is a CompiledKernel for this body and target, produced by poot-codegen.
+ctx.dispatch("add", &kernel, [64, 1, 1], [a.len() as u32, 1, 1], &mut bufs)?;
+assert_eq!(bufs[2].as_f32(), &[11.0, 22.0, 33.0]);
+```
+
+Dispatch requires a `CompiledKernel` with its argument schema, not raw SPIR-V bytes. Prefer the typed
+launcher emitted by `#[kernel]`; a low-level caller must pair the exact compiled body, target and
+artifact when creating a handle through `poot-codegen`.
+
+Full workflow (attribute, `pootc`, accepted Rust subset): [Authoring kernels](./authoring-kernels.md).
+
+## How this relates to `poot-llm`
+
+| Layer   | What you call                                                                 |
+| ------- | ----------------------------------------------------------------------------- |
+| Compute | `Builder` / `ops` / `eval` / `Engine<D>` / `#[kernel]`                        |
+| Models  | `poot-models` tracers produce a `Graph` from a config                         |
+| LLM API | `ModelHandle::load` then `Driver::generate` (loads weights, traces, runs GPU) |
+| HTTP    | `poot-serve`                                                                  |
+
+For in-process LLM use, see [Embedding poot](./embedding.md). For IR design depth, see
+[Architecture](../architecture/index.mdx) (Graph IR, Fusion, Kernel import, Execution).
+---
+id: models
+title: Models
+sidebar_position: 7
+---
+
+# Models
+
+poot traces model forwards into a primitive graph and runs them on its own kernels. Which model families plan
+on which backends is listed per family in [Supported models and formats](./supported-models.md);
+this page describes what a checkpoint must look like and what the library does with each kind of model.
+
+## Checkpoint formats
+
+- **Safetensors**: a Hugging Face directory (`config.json`, `tokenizer.json`, the weight files). Dense, GPTQ, AWQ
+  and FP8 layouts load; quantized projections stay packed as stored, and dense BF16/F16 weights stay BF16/F16.
+- **GGUF**: one file, or a split set named by any of its `-0000N-of-0000M.gguf` shards, with the config and
+  tokenizer embedded. K-quant and IQ tensor types stay packed. A tensor of a type poot has no format for is refused
+  by tensor name and type.
+
+The checkpoint's config decides the family: `ModelHandle::load` resolves it through the model registry, and a
+family the registry does not know is a typed refusal. `poot-serve` serves the same families through the same
+driver. A value in a config that a family cannot trace (an unsupported scaling mode, per-layer input embeddings)
+is refused with an unsupported-config error that names it. Layer, expert and head counts come from the config, so
+a checkpoint with other counts loads the same way.
+
+## Kinds of model
+
+### Dense decoders
+
+A standard causal stack: normalization, position embeddings, a gated or plain MLP and multi-head or
+grouped-query attention, with optional sliding-window layers. They load with `ModelHandle::load` and generate
+with `Driver`.
+
+### Mixture-of-experts
+
+A router plus sparse expert MLPs. Every expert's weights stay resident unless expert pooling is asked for
+(`Driver::with_expert_pool`, `--expert-pool` on the server). Experts are read as the checkpoint stores them
+(per-expert tensors or a stored stack, dense or packed); nothing is fused at load. A NaN or infinite router logit
+stops the step with a validation error naming the layer.
+
+### Latent attention and hybrid models
+
+Latent-attention models keep their compressed latent and rope key as the KV cache. A hybrid model mixes
+attention layers with state-space or linear-attention layers and carries each recurrent layer's convolution
+window and state next to the attention caches, so a prompt prefilled in chunks continues exactly.
+
+### Models with a block indexer or compressed attention
+
+Some families attend only to cached blocks or compression windows that a small indexer selects. Their prefill
+step covers whole blocks or windows: the driver's prefill granule is the least common multiple of the layers'
+rates, and the tokens after the last whole window run as decode steps. An indexer that keeps a per-row cache of
+block keys generates through `Driver`, but `poot-serve` refuses to start on it under the paged KV pool (a typed
+refusal) until paged block-key caching lands. A token outside the vocabulary stops a step with a validation error.
+
+### Multi-stream residuals
+
+Some families carry several parallel residual streams per token and mix them with learned weights around each
+block. They load and generate like any other family. A family whose recurrence is traced token by token makes a
+prefill step cost graph size in proportion to its tokens: use a modest prefill chunk.
+
+### Embeddings and reranking
+
+Encoder models for sentence embeddings and cross-encoder reranking load with `ModelHandle::load` and run on the
+driver's `encode` step; `poot_llm::encoders` is the library path. `poot-serve` starts on an encoder checkpoint and
+serves `/v1/embeddings` and `/v1/rerank` from it, and from a decoder's embedding pass.
+
+### Vision-language
+
+A vision-language family is one registry entry whose build function returns a model container: the text decoder,
+one or more `encode`-only vision towers and the family's front end. The front end preprocesses the images (and
+video frames where the family takes them), runs the tower on each item and renders the conversation through the
+checkpoint's own chat template. It returns the prompt's tokens and the request inputs the text model declares, such
+as the embedding rows at the image placeholders (see [Multimodal](../serve/multimodal.md)). `poot-llm` keeps only
+what is not family-specific: decoding an image's bytes, decoding an animated PNG's frames, and `FrontEndSession`,
+which runs a loaded model's front end on one driver per tower. The library path is `ModelHandle::load`,
+`ModelHandle::front_end` and `FrontEndSession`, and the `poot caption` command. Check
+[Supported models and formats](./supported-models.md) before relying on a modality on a backend.
+
+## Adding a model
+
+A new family touches only its own code. The driver, planner, executors and serve code do not change. The
+repository checks this with a test (`crates/poot-llm/tests/add_a_model/`) that defines small decoder families
+inside the test, outside the model crate, and serves them through the public API: `family.rs` is a decoder
+with biased LayerNorm, partial RoPE and one fused QKV tensor read as three row ranges, `parallel.rs` the same
+with the parallel residual and a per-head interleaved fused QKV, and `tagged.rs` adds a request input the driver
+has never heard of.
+
+A family is a file under `crates/poot-models/src/architectures/` and one row of the `SHIPPED` slice in
+`registry.rs`; nothing else names it. A decoder of the standard shape implements `StandardFamily`
+(`poot_models::components::standard_family`), which is three things plus a checkpoint to load:
+
+1. **Keys.** The `model_type` values (and GGUF architecture names) that select the family.
+2. **A config reader.** `configure` reads the checkpoint's `config.json` once, checks every value and returns the
+   typed `StandardParams`: the dimensions, the attention and the feed-forward of each layer (gated, GeGLU,
+   plain or routed), how the layer's norms sit around its blocks (pre, post, sandwich or the parallel
+   residual), the chat format, the tool-call codec (none for a family without a tool format) and the end-of-sequence
+   ids. `StandardFamily` is the public interface. Inside the crate, a dense decoder with the usual HF fields
+   uses the crate-private `DenseFamily` shorthand instead: its keys, its defaults and one attention option,
+   such as a Q/K norm.
+3. **A weight-name table.** `weights` maps each role of the model (embedding, a layer's query rows, a norm
+   bias, the head) to a tensor of the checkpoint with `WeightMap::builder`. A fused tensor such as
+   `query_key_value` is read whole when its rows interleave per head, or through `WeightView::RowRange`
+   views when `q | k | v` are contiguous, so a packed checkpoint stays packed.
+
+The stack, the layers, the `Model` implementation and its input schema are the shared `StandardModel`; the
+family writes none of them. A family whose layers are not of this shape (a latent attention, a state-space
+mixer, an encoder) implements `Model` itself: `Model::trace_into` is plain Rust over the shared components
+(`standard_stack` for the embedding, the layers, the final norm and the head; `standard_layer` for the
+residual pair), and `Model::schema` returns a `ModelSchema`: the programs the model offers, the states each
+carries, and the request inputs it reads. A family that needs a value no shipped family does (a tag per
+token, a per-row tensor) declares it there and traces it as a slot; the driver binds it from the request's
+`RequestInputs` with no driver change.
+
+A registry is the shipped families: there is no registration from outside the model crate. A test that serves
+a family of its own builds its registry with `Registry::builtin_plus`, which the `test-support` feature
+enables, and passes it to `ModelHandle::load`.
+
+The checkpoint directory that `ModelHandle::load` reads holds `config.json`, the safetensors weights and a
+`tokenizer.json`: the loader builds the text services from the tokenizer, so a checkpoint without one is
+refused. The worked examples write a small word-level tokenizer for their fixtures.
+
+There is no support list to edit. A family runs on a backend when its graph compiles for that backend, and a
+refusal is a typed error that names the equation and the missing capability.
+
+### Adding a vision-language model
+
+A vision-language family adds two parts to its container, both built by the same registry entry and both its own
+code: the vision towers (each an `encode`-only `Model`, added with `ModelParts::with_tower`) and a front end
+(`ModelParts::with_front_end`). The front end implements `FrontEnd::prepare`: it receives the conversation's
+turns, the decoded images (or video clips) in the order of the turns, a `Towers` handle that runs a tower on one
+row of request inputs and returns its embedding rows, and the model's text codec. It returns the prompt's token
+ids and the `RequestInputs` the text model declares. The image resize, patching, chat assembly and position
+tables all live in the family's module, beside its tracer; `poot-llm` and `poot-serve` name no family. The test
+`crates/poot-llm/tests/add_a_model/vlm.rs` defines such a family outside the model crate and serves
+an image request through `FrontEndSession` with no edit to `poot-llm`.
+
+## Next steps
+
+- Library generation: [Run a model (library)](./run-a-model.md)
+- HTTP serving: [Serving your first model](../serve/serving-your-first-model.md)
+- Backend choice: [Picking a backend](../serve/choosing-a-backend.md)
+- Planner coverage by family and backend: [Supported models and formats](./supported-models.md)
+---
+id: build-and-test
+title: Build and test
+sidebar_position: 2
+---
+
+# Build and test
+
+poot is a Rust workspace. The repo pins nightly Rust, LLVM (for kernel lowering), and Vulkan through Nix.
+
+## Prerequisites
+
+```bash
+nix develop
+```
+
+That drops you into a shell with the right `rustc`, `llc`, and Vulkan loader. Sanity-check it:
+
+```bash
+llc --version | grep -iE 'spirv|nvptx'   # both targets present
+vulkaninfo | grep -i 'deviceName'         # a GPU is visible
+```
+
+## Common tasks
+
+The common tasks are wrapped as `just` recipes (run `just` with no args to list them):
+
+```bash
+just build     # cargo build --workspace
+just gate      # the local merge gate: fmt-check, clippy with -D warnings, then just test
+just test      # dead-pub/dependency gates, self-tests, model-free test inventory and doctests; includes crates-standalone (every library builds alone)
+just check     # cargo check
+just clippy    # lints
+just fmt       # format every crate
+```
+
+`just gate` is the merge gate, and it runs on your own machine: there is no CI. It stops at the first of its three
+steps that fails. `just npu-build` (part of `just test`) needs the `nix develop .#npu` shell and fails without it; on
+a host that has none (a laptop), set `POOT_

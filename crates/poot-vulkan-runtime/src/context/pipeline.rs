@@ -2,7 +2,7 @@ use crate::kernel::spirv_words;
 use crate::owner::PipelineShape;
 use crate::{Binding, Context, Pipeline, RuntimeError};
 use ash::vk;
-use poot_runtime_common::CompiledKernel;
+use poot_codegen::CompiledKernel;
 use poot_target::ElementKind;
 use std::sync::Arc;
 
@@ -16,20 +16,20 @@ impl Context {
     /// path (`poot_executor::DispatchError::ArgExceedsBuffer`).
     pub(crate) fn check_bindings(
         &self,
-        schema: &[poot_runtime_common::ArgSchema],
+        schema: &[poot_codegen::ArgSchema],
         wg: [u32; 3],
         threads: [u32; 3],
         args: &[Binding<'_>],
     ) -> Result<[u32; 3], RuntimeError> {
         self.owner.check_live("dispatch")?;
         let elements: Vec<ElementKind> = args.iter().map(|a| a.buffer.element()).collect();
-        poot_runtime_common::check_element_schema(schema, &elements)?;
+        poot_codegen::check_element_schema(schema, &elements)?;
         if args.iter().any(|a| !a.buffer.belongs_to(&self.owner)) {
             return Err(RuntimeError::ForeignObject("buffer"));
         }
         for (arg, bound) in args.iter().enumerate() {
             let capacity = bound.buffer.native_elems();
-            if bound.elems as usize > capacity {
+            if bound.elems > capacity {
                 return Err(RuntimeError::ArgExceedsBuffer {
                     arg,
                     elems: bound.elems,

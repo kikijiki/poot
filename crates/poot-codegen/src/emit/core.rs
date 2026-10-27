@@ -1,13 +1,21 @@
 use std::fmt::Write as _;
 
-/// SPIR-V memory semantics of the OpenCL workgroup barrier: `AcquireRelease` (0x8) ordering over
-/// `WorkgroupMemory` (0x100) and `CrossWorkgroupMemory` (0x200).
-const OPENCL_BARRIER_SEMANTICS: u32 = 0x8 | 0x100 | 0x200;
-
 use super::{
     BTreeSet, BlockId, Body, EmitError, Emitter, Local, MemoryOrdering, MemoryScope, Operand,
     Place, Statement, Target, Terminator, Ty, align_of,
 };
+
+/// The LLVM integer type of `usize` on `target`: `i32` on SPIR-V for Vulkan and the AIE core, `i64` on NVPTX,
+/// OpenCL-flavoured SPIR-V and AMDGPU (the flat kernarg ABI declares lengths as `i64`, see `emit_signature`).
+/// Every element, word and bit offset a kernel computes in `usize` is this wide, so a `u32` here wraps a
+/// bit offset past `u32::MAX` (a packed source past 512 MiB). The planner reads the same fact as
+/// [`poot_target::Backend::index_bits`], and a test keeps the two equal.
+pub(super) fn usize_llty_of(target: Target) -> &'static str {
+    match target {
+        Target::SpirvVulkan | Target::AieCore => "i32",
+        Target::Nvptx | Target::AmdGcn(_) => "i64",
+    }
+}
 
 impl<'a> Emitter<'a> {
     pub(super) fn new(body: &'a Body, target: Target, error_accum: Option<Local>) -> Self {
@@ -36,19 +44,14 @@ impl<'a> Emitter<'a> {
         Ok(match ty {
             Ty::Bool => "i1".into(),
             Ty::I32 | Ty::U32 => "i32".into(),
-            Ty::Usize => match self.target {
-                // AIE is a 32-bit core, so usize is i32 (as on SPIR-V). NVPTX is the 64-bit outlier; AMDGPU follows NVPTX
-                // (the flat kernarg ABI uses i64 lengths, see `emit_signature`).
-                Target::SpirvVulkan | Target::AieCore => "i32".into(),
-                Target::Nvptx | Target::SpirvOpenCl | Target::AmdGcn(_) => "i64".into(),
-            },
+            Ty::Usize => self.usize_llty().into(),
             Ty::F16 => "half".into(),
             // bf16 is NVPTX-only: the LLVM SPIR-V backend rejects `bfloat` without SPV_KHR_bfloat16, which the
             // Vulkan target does not implement (spec 024 probe). Reject with a diagnostic instead of an opaque
             // llc error; the SPIR-V/wgpu path stays f32/f16.
             Ty::BF16 => match self.target {
                 Target::Nvptx => "bfloat".into(),
-                Target::SpirvVulkan | Target::SpirvOpenCl => {
+                Target::SpirvVulkan => {
                     return Err(EmitError::Unsupported(
                         "bf16 compute is NVPTX-only (SPIR-V needs SPV_KHR_bfloat16, unsupported on the Arc)"
                             .into(),
@@ -68,19 +71,19 @@ impl<'a> Emitter<'a> {
             },
             Ty::F32 => "float".into(),
             Ty::F64 => "double".into(),
-            // spec 134 P1: `Ty::Vec` is SpirvVulkan-only for now (the `<lanes x elem>`-typed-resource path, `spirv_buf`).
-            // NVPTX/AMDGCN vector lowering (`ld.global.v4` / `global_load_dwordx4`) is a later phase; reject by name (as
+            // spec 134 P1: `Ty::Vec` lowers on SpirvVulkan (the `<lanes x elem>`-typed-resource path, `spirv_buf`) and
+            // NVPTX (`ld.global.v4` through `vector_element_ptr`, POOT-1405). AMDGCN vector lowering is not built (its
+            // backend already merges dword-aligned scalar loads into `global_load_b128`, POOT-1390); reject by name (as
             // for bf16 above) rather than let an un-lowered vector rvalue reach llc.
             Ty::Vec { elem, lanes } => match self.target {
-                Target::SpirvVulkan => {
+                Target::SpirvVulkan | Target::Nvptx => {
                     let inner = self.scalar_llty(elem)?;
                     format!("<{lanes} x {inner}>")
                 }
-                Target::Nvptx | Target::SpirvOpenCl | Target::AmdGcn(_) | Target::AieCore => {
+                Target::AmdGcn(_) | Target::AieCore => {
                     return Err(EmitError::Unsupported(format!(
-                        "Ty::Vec{{elem={elem:?}, lanes={lanes}}} on {:?}: vector codegen is \
-                         SpirvVulkan-only in this increment (spec 134 P1); NVPTX/AMDGCN lowering is a \
-                         later phase",
+                        "Ty::Vec{{elem={elem:?}, lanes={lanes}}} on {:?}: vector codegen lowers on \
+                         SpirvVulkan and NVPTX only (spec 134 P1)",
                         self.target
                     )));
                 }
@@ -89,13 +92,20 @@ impl<'a> Emitter<'a> {
         })
     }
 
+    /// The body's `usize` type: the target's own ([`usize_llty_of`]), or i32 for a body the planner narrowed on
+    /// a target that lowers that ([`crate::Capability::narrow_index`]).
     pub(super) fn usize_llty(&self) -> &'static str {
-        match self.target {
-            Target::SpirvVulkan | Target::AieCore => "i32",
-            // NVPTX and AMDGPU both use i64 for `usize`; the flat kernarg ABI declares lengths as i64 (see
-            // `emit_signature`; the AMDGPU signature mirrors NVPTX).
-            Target::Nvptx | Target::SpirvOpenCl | Target::AmdGcn(_) => "i64",
+        if self.narrowed() {
+            "i32"
+        } else {
+            usize_llty_of(self.target)
         }
+    }
+
+    /// Whether this body's `usize` is i32 on a target whose own index type is i64.
+    pub(super) fn narrowed(&self) -> bool {
+        matches!(self.body.index_width, poot_kernel_ir::IndexWidth::U32(_))
+            && crate::capability(self.target).narrow_index
     }
 
     /// The `atomicrmw` syncscope prefix (with trailing space) spliced in before the ordering keyword, per target.
@@ -107,7 +117,7 @@ impl<'a> Emitter<'a> {
     /// correctly.
     pub(super) fn atomic_syncscope(&self) -> &'static str {
         match self.target {
-            Target::SpirvVulkan | Target::SpirvOpenCl => "syncscope(\"device\") ",
+            Target::SpirvVulkan => "syncscope(\"device\") ",
             Target::Nvptx | Target::AmdGcn(_) | Target::AieCore => "",
         }
     }
@@ -119,7 +129,7 @@ impl<'a> Emitter<'a> {
     pub(super) fn workgroup_atomic_syncscope(&self) -> String {
         match self.target {
             Target::AieCore => String::new(),
-            Target::Nvptx | Target::AmdGcn(_) | Target::SpirvVulkan | Target::SpirvOpenCl => {
+            Target::Nvptx | Target::AmdGcn(_) | Target::SpirvVulkan => {
                 format!(
                     "syncscope(\"{}\") ",
                     self.fence_syncscope(MemoryScope::Workgroup)
@@ -149,8 +159,8 @@ impl<'a> Emitter<'a> {
             (Target::Nvptx, MemoryScope::Device) => "device",
             (Target::AmdGcn(_), MemoryScope::Workgroup) => "workgroup",
             (Target::AmdGcn(_), MemoryScope::Device) => "agent",
-            (Target::SpirvVulkan | Target::SpirvOpenCl, MemoryScope::Workgroup) => "workgroup",
-            (Target::SpirvVulkan | Target::SpirvOpenCl, MemoryScope::Device) => "device",
+            (Target::SpirvVulkan, MemoryScope::Workgroup) => "workgroup",
+            (Target::SpirvVulkan, MemoryScope::Device) => "device",
             // AieCore never reaches here - Statement::Fence rejects it before calling this.
             (Target::AieCore, _) => "singlethread",
         }
@@ -238,10 +248,6 @@ impl<'a> Emitter<'a> {
                 self.out
                     .push_str("target triple = \"nvptx64-nvidia-cuda\"\n\n");
             }
-            Target::SpirvOpenCl => {
-                self.out
-                    .push_str("target triple = \"spirv64-unknown-unknown\"\n\n");
-            }
             // AIE core: no datalayout/triple in the IR text; Peano supplies them from `--march=aie2p` (plain scalar IR
             // with no triple lowers cleanly). A comment marks the target.
             Target::AieCore => {
@@ -292,13 +298,18 @@ impl<'a> Emitter<'a> {
     }
 
     /// The LLVM address space a constant table lives in, per target: the backend's constant space on
-    /// AMDGPU and NVPTX (`addrspace(4)`), UniformConstant on OpenCL SPIR-V (`addrspace(2)`), and the
-    /// Private storage class on Vulkan SPIR-V (`addrspace(10)`), whose `OpVariable` initializer is
-    /// the table. Vulkan has no constant memory a shader can index dynamically by other means.
+    /// AMDGPU (`addrspace(4)`), the global space on NVPTX (`addrspace(1)`), and
+    /// the Private storage class on Vulkan SPIR-V (`addrspace(10)`), whose `OpVariable` initializer is the table.
+    /// Vulkan has no constant memory a shader can index dynamically by other means.
+    ///
+    /// NVPTX's `.const` space is served by the constant cache, which broadcasts one address per
+    /// warp and replays the load once per distinct address: a table every lane indexes by its own
+    /// decoded code (the lattice grids of the i-quants) serializes up to 32-fold. An initialized
+    /// `.global` read is a parallel `ld.global.nc` through the L1/texture path.
     pub(super) fn constant_table_addrspace(&self) -> Result<u32, EmitError> {
         match self.target {
-            Target::AmdGcn(_) | Target::Nvptx => Ok(4),
-            Target::SpirvOpenCl => Ok(2),
+            Target::AmdGcn(_) => Ok(4),
+            Target::Nvptx => Ok(1),
             Target::SpirvVulkan => Ok(10),
             Target::AieCore => Err(EmitError::Unsupported(
                 "constant tables on AIE-core: a single AIE core reads its operands from the tile's \
@@ -344,29 +355,18 @@ impl<'a> Emitter<'a> {
             Target::SpirvVulkan => {
                 self.out.push_str("define void @main() #0 {\n");
             }
-            // The PTX argument ABI (a global pointer and an `i64` length per slice) under the OpenCL kernel
-            // calling convention; the workgroup size rides `!reqd_work_group_size` (see `emit_footer`).
-            Target::SpirvOpenCl => {
-                let mut args = Vec::new();
-                for p in self.body.params() {
-                    args.push(format!("ptr addrspace(1) %p{}, i64 %n{}", p.index, p.index));
-                }
-                let _ = writeln!(
-                    self.out,
-                    "define spir_kernel void @{}({}) !reqd_work_group_size !0 {{",
-                    self.body.name,
-                    args.join(", ")
-                );
-            }
             Target::Nvptx => {
                 let mut args = Vec::new();
                 for p in self.body.params() {
                     args.push(format!("ptr addrspace(1) %p{}, i64 %n{}", p.index, p.index));
                 }
                 let attr = self.strictfp_attr_suffix();
+                let [x, y, z] = self.body.workgroup_size;
+                // The body's workgroup is the largest block it is launched with: without the bound, ptxas
+                // budgets registers for a 1024-thread block and spills a register-tiled body.
                 let _ = writeln!(
                     self.out,
-                    "define ptx_kernel void @{}({}){attr} {{",
+                    "define ptx_kernel void @{}({}) \"nvvm.maxntid\"=\"{x},{y},{z}\"{attr} {{",
                     self.body.name,
                     args.join(", ")
                 );
@@ -398,9 +398,13 @@ impl<'a> Emitter<'a> {
                     args.push(format!("ptr addrspace(1) %p{}, i64 %n{}", p.index, p.index));
                 }
                 let attr = self.strictfp_attr_suffix();
+                // The body's workgroup is the largest it is launched with: without the bound, the AMDGPU
+                // backend budgets registers for a 1024-lane workgroup (192 VGPRs on gfx11) and spills a
+                // register-tiled body to scratch.
+                let lanes: u32 = self.body.workgroup_size.iter().product();
                 let _ = writeln!(
                     self.out,
-                    "define amdgpu_kernel void @{}({}){attr} {{",
+                    "define amdgpu_kernel void @{}({}) \"amdgpu-flat-work-group-size\"=\"1,{lanes}\"{attr} {{",
                     self.body.name,
                     args.join(", ")
                 );
@@ -752,18 +756,6 @@ impl<'a> Emitter<'a> {
                             .insert("declare void @llvm.nvvm.barrier0()".into());
                         let _ = writeln!(w, "  call void @llvm.nvvm.barrier0()");
                     }
-                    // `__spirv_ControlBarrier(Workgroup, Workgroup, AcquireRelease | WorkgroupMemory |
-                    // CrossWorkgroupMemory)` orders shared and global accesses within the workgroup, as PTX
-                    // `bar.sync` does. Convergent, like the Vulkan barrier.
-                    Target::SpirvOpenCl => {
-                        self.declares.insert(
-                            "declare void @_Z22__spirv_ControlBarrierjjj(i32, i32, i32) #1".into(),
-                        );
-                        let _ = writeln!(
-                            w,
-                            "  call void @_Z22__spirv_ControlBarrierjjj(i32 2, i32 2, i32 {OPENCL_BARRIER_SEMANTICS}) #1"
-                        );
-                    }
                     // A single AIE core has no workgroup to synchronize; a barrier is a GPU/SPMD construct. Reject by name:
                     // an AIE kernel must be a barrier-free sequential loop.
                     Target::AieCore => {
@@ -819,13 +811,6 @@ impl<'a> Emitter<'a> {
                     w.push_str("  unreachable\n");
                     Ok(())
                 }
-                // OpenCL SPIR-V has no device trap: the backend lowers `llvm.trap` to `OpUnreachable`, which is
-                // undefined behaviour, not a fault. Refuse by name instead of emitting a check that does nothing.
-                Target::SpirvOpenCl => Err(EmitError::Unsupported(
-                    "Assert/Unreachable trap on SpirvOpenCl: OpenCL SPIR-V has no device trap (llvm.trap \
-                     lowers to OpUnreachable, which is undefined behaviour)"
-                        .into(),
-                )),
                 Target::SpirvVulkan => Err(EmitError::Unsupported(
                     "internal error: a Trap terminator reached SpirvVulkan emission; debranch_traps_for_spirv \
                      should have removed every one (card 531c)"
@@ -840,5 +825,33 @@ impl<'a> Emitter<'a> {
 
     pub(super) fn finish(self) -> String {
         self.out
+    }
+}
+
+#[cfg(test)]
+mod usize_width_tests {
+    use super::usize_llty_of;
+    use crate::Target;
+    use poot_target::{AmdArch, Backend};
+
+    /// POOT-1317: the width the planner refuses a packed source against ([`Backend::index_bits`]) is the
+    /// width the emitter gives `usize`, for every GPU backend. A kernel's bit offset is `usize` arithmetic,
+    /// so the two disagreeing is a silent wrap (or a refusal the backend does not need).
+    ///
+    /// Mutation: lower `usize` to `i32` on NVPTX in [`usize_llty_of`]; the NVPTX assertion goes red.
+    #[test]
+    fn the_planners_index_width_is_the_emitters_usize_width() {
+        for backend in [
+            Backend::Nvptx,
+            Backend::SpirvVulkan,
+            Backend::AmdGcn(AmdArch::gfx1151()),
+        ] {
+            let emitted = match usize_llty_of(Target::from(backend)) {
+                "i32" => 32,
+                "i64" => 64,
+                other => panic!("{backend:?}: usize lowers to {other}"),
+            };
+            assert_eq!(backend.index_bits(), emitted, "{backend:?}");
+        }
     }
 }

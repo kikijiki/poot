@@ -1,7 +1,8 @@
 //! Crate dependency direction (POOT-755, R463-004/006/017): the workspace's crates form a declared ranking, and
 //! every manifest edge points strictly down it.
 //!
-//! The check runs `cargo metadata --locked --offline` over the real workspace and enforces six rules:
+//! The check runs `cargo metadata --locked --offline` over the real workspace and enforces six rules, plus a
+//! seventh about where NPU code may live:
 //!
 //! 1. [`RANKS`] and the workspace members agree: a member without a row, or a row naming no member, fails, so a
 //!    new crate declares its place.
@@ -16,6 +17,11 @@
 //!    when an upstream upgrade lands.
 //! 6. No member declares a test-only feature other than the one ADR-0113 sanctions (`test-support`): a
 //!    `test-hooks`-style feature puts test-only API into the production crate behind a switch (ruling XC2-06).
+//!
+//! 7. No foundation crate ([`FOUNDATION_CRATES`]: the shared runtime helpers, the compiler, the planner and the
+//!    executor) contains a module named after an NPU vendor ([`NPU_MODULE_NAMES`]). The AMD and Intel NPU artifact
+//!    types, ABI and lowering belong to `poot-npu-artifacts` and `poot-npu`, behind capability objects the
+//!    foundation crates define (POOT-1244).
 //!
 //! `cargo` and the manifest directory are read at run time (`CARGO`, `CARGO_MANIFEST_DIR`), never with `env!`:
 //! the compile cache reuses compile-time values across worktrees.
@@ -34,7 +40,7 @@
 //! MLIR/LLVM layering docs were looked for and not found to state a layering rule; none is cited.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
@@ -50,8 +56,9 @@ const RANKS: &[(&str, u8)] = &[
     ("poot-orchestrator", 0),
     ("poot-tensor", 0),
     ("poot-text", 0),
-    // 1: shared runtime helpers, test helpers, kernel attributes
+    // 1: shared runtime helpers, the NPU artifact types, test helpers, kernel attributes
     ("poot-runtime-common", 1),
+    ("poot-npu-artifacts", 1),
     ("poot-test-util", 1),
     ("poot-kernel-attr", 1),
     // 2: storage formats, code generation, the profiling reports (they key on runtime-common's counters)
@@ -131,6 +138,17 @@ const FORBIDDEN_NORMAL: &[(&[&str], &str, &str)] = &[
          build never links wgpu (POOT-1231)",
     ),
 ];
+
+/// The crates every device and every product builds on. Rule 7: none of them holds NPU vendor code.
+const FOUNDATION_CRATES: &[&str] = &[
+    "poot-runtime-common",
+    "poot-codegen",
+    "poot-graph-plan",
+    "poot-executor",
+];
+
+/// Module names that are an NPU vendor's: AMD's AIE and Intel's VPU.
+const NPU_MODULE_NAMES: &[&str] = &["aie", "vpu"];
 
 /// Lockfile names allowed more than one version, each with what pulls the extra one. A duplicate with no row
 /// fails; a row whose name is no longer duplicated fails.
@@ -468,6 +486,81 @@ fn violations(graph: &Graph, policy: &Policy<'_>) -> Vec<String> {
     out
 }
 
+/// Every NPU vendor module under `src`: a file or directory named after one, or a `mod` declaration of one
+/// (inline, out of line or `pub`), as paths relative to `src`.
+fn npu_modules(src: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![src.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let shown = path
+                .strip_prefix(src)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            if path.is_dir() {
+                if NPU_MODULE_NAMES.contains(&stem.as_str()) {
+                    found.push(format!("{shown}/"));
+                }
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                if NPU_MODULE_NAMES.contains(&stem.as_str()) {
+                    found.push(shown.clone());
+                }
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                for line in text.lines() {
+                    let line = line.trim_start();
+                    let line = line
+                        .strip_prefix("pub(crate) ")
+                        .or_else(|| line.strip_prefix("pub "))
+                        .unwrap_or(line);
+                    let Some(rest) = line.strip_prefix("mod ") else {
+                        continue;
+                    };
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if NPU_MODULE_NAMES.contains(&name.as_str()) {
+                        found.push(format!("{shown}: mod {name}"));
+                    }
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Rule 7 over the real workspace: each foundation crate's `src` tree holds no NPU vendor module.
+fn foundation_npu_modules(metadata: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for package in metadata["packages"].as_array().expect("packages") {
+        let name = package["name"].as_str().expect("name");
+        if !FOUNDATION_CRATES.contains(&name) {
+            continue;
+        }
+        let manifest = PathBuf::from(package["manifest_path"].as_str().expect("manifest_path"));
+        let src = manifest.parent().expect("manifest dir").join("src");
+        for module in npu_modules(&src) {
+            out.push(format!(
+                "rule 7: foundation crate `{name}` contains the NPU module `{module}`; NPU code belongs to \
+                 poot-npu-artifacts or poot-npu"
+            ));
+        }
+    }
+    out
+}
+
 /// `cargo metadata` of the real workspace.
 fn workspace_metadata() -> Value {
     let manifest_dir = PathBuf::from(
@@ -499,6 +592,44 @@ fn the_workspace_points_down_the_declared_ranks() {
         "{} dependency-direction violation(s):\n  {}",
         found.len(),
         found.join("\n  ")
+    );
+}
+
+/// Rule 7: no foundation crate (runtime-common, codegen, graph-plan, executor) contains an `aie` or `vpu` module.
+/// Mutation: add `mod vpu;` (and an empty `vpu.rs`) to any of them; this row names the module.
+#[test]
+fn no_foundation_crate_contains_an_aie_or_vpu_module() {
+    let found = foundation_npu_modules(&workspace_metadata());
+    assert!(
+        found.is_empty(),
+        "{} NPU module(s) in foundation crates:\n  {}",
+        found.len(),
+        found.join("\n  ")
+    );
+}
+
+/// The rule-7 scan finds a vendor module however it is declared: a file, a directory, an inline module and a
+/// `pub` out-of-line declaration, and nothing named like one but not one.
+#[test]
+fn the_npu_module_scan_finds_every_spelling() {
+    let root = std::env::temp_dir().join(format!("poot-npu-module-scan-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("planner/vpu")).unwrap();
+    std::fs::write(root.join("aie.rs"), "").unwrap();
+    std::fs::write(root.join("lib.rs"), "pub mod vpu;\nmod aiec_not_it;\n").unwrap();
+    std::fs::write(root.join("planner/mod.rs"), "    mod aie {\n    }\n").unwrap();
+    std::fs::write(root.join("planner/vpu/region.rs"), "").unwrap();
+    std::fs::write(root.join("planner/vpuish.rs"), "").unwrap();
+    let found = npu_modules(&root);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        found,
+        [
+            "aie.rs",
+            "lib.rs: mod vpu",
+            "planner/mod.rs: mod aie",
+            "planner/vpu/",
+        ]
     );
 }
 

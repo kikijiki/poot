@@ -6,48 +6,47 @@ sidebar_position: 6
 
 # Guided decoding
 
-The server validates the constraint before it asks the engine: an invalid `guided_regex`, `guided_json`, `guided_choice`, `guided_grammar` or `response_format` is a `400`. Every one of a request's `n` choices carries the constraint.
+The completion and chat endpoints can constrain the output so it is guaranteed well-formed. The engine compiles the constraint to a per-step token mask, and the sampler only picks an allowed token. Every one of a request's `n` choices carries the constraint.
 
-Constraints are bounded so one request cannot exhaust the server. A `guided_regex` longer than 4096 bytes, a
-`guided_grammar` longer than 16 KiB, or a `guided_json` or `response_format` schema whose JSON text is longer than
-16 KiB is a `400`. So is a pattern whose compiled automaton is too large, for example a long counted repetition
-over an alternation such as `(a|b)*a(a|b){17}`; the error names the regex and the size limit it hit. The
-automaton is built within 256 KiB of working memory, so a pattern that needs more is refused rather than slowly
-built. A `guided_json` schema is compiled to a regex first, and that regex may not pass 256 KiB: a schema that
-repeats its parts, such as arrays nested many levels deep or many optional properties, is a `400` when it
-compiles past that bound.
+## Request fields
 
-The constraint applies to the bytes each token adds to the output, read from the model's vocabulary. A
-word-initial token of a SentencePiece model counts as its leading space plus the word, so a pattern that starts
-with a space, such as `guided_regex: " the [a-z]+"`, constrains the tokens the model emits. The `bytes` of a
-logprob entry include that space. The returned text of a whole (non-streamed) reply is decoded as one sequence,
-and that decode drops the single leading space a SentencePiece model adds to the start of text.
+Four fields, checked in this order:
 
-The completion and chat endpoints can constrain the output so it is guaranteed well-formed. The
-engine compiles the constraint to a per-step token mask and the sampler only ever picks an allowed
-token. Four request fields, checked in this order (`guided_choice`, then `guided_regex`, then
-`guided_grammar`, then `guided_json`):
+- `guided_choice: ["yes", "no", "maybe"]`: the output is exactly one of the strings.
+- `guided_regex: "[0-9]{4}-[0-9]{2}-[0-9]{2}"`: the output matches the regex.
+- `guided_grammar: "root ::= ..."`: the output is a sentence of a context-free grammar in GBNF (the llama.cpp grammar syntax). It can be recursive. Rules use `::=`, `|`, `[...]`, `.`, `"..."`, `()` groups and `* + ? {m} {m,} {m,n}`; the entry rule is `root`.
+- `guided_json: <JSON Schema>`: the output is JSON conforming to the schema.
 
-- `guided_choice: ["yes", "no", "maybe"]`, the output is exactly one of the listed strings.
-- `guided_regex: "[0-9]{4}-[0-9]{2}-[0-9]{2}"`, the output matches the regex (a byte-level anchored
-  DFA).
-- `guided_grammar: "root ::= ..."`, the output is a sentence of a context-free grammar written in
-  GBNF (the llama.cpp grammar syntax). Because it is a pushdown engine, not a regex, the grammar can
-  be recursive and balanced (nested brackets, arithmetic expressions, a small DSL). Rules use `::=`,
-  `|` for alternation, `[...]` char classes, `.` for any character, `"..."` literals, `()` groups,
-  and `* + ? {m} {m,} {m,n}` repetition; the entry rule is `root`.
-- `guided_json: <JSON Schema>`, the output is JSON conforming to the schema.
+An invalid constraint is a `400` before the engine is asked.
 
-The `guided_json` compiler supports the regex-expressible subset of JSON Schema: `object` (with
-`properties` and a `required` list; listed keys are mandatory, the rest optional), `array` (`items`,
-`minItems`/`maxItems`), `string` (`pattern` to a regex, or `minLength`/`maxLength`), `integer`
-(`minimum`/`maximum`, inclusive or exclusive, two-sided or one-sided, constrained to the exact
-range), `number`, `boolean`, `enum` and `const` (scalar OR composite; a fixed object/array is matched
-structurally with sorted keys and optional whitespace), `oneOf`/`anyOf`, and local `$ref` (a
-`"#/$defs/Name"` reference into the same document, resolved and inlined, the shape Pydantic and the
-OpenAI SDK emit). Object keys are emitted in sorted order (still valid JSON). Unsupported constructs
-(recursive or external `$ref`, `number` bounds) return an error rather than silently
-under-constraining.
+## Limits
+
+Each of these is a `400`:
+
+| Input                                                            | Limit      |
+| ---------------------------------------------------------------- | ---------- |
+| `guided_regex`                                                   | 4096 bytes |
+| `guided_grammar`                                                 | 16 KiB     |
+| `guided_json` or `response_format` schema, as JSON text          | 16 KiB     |
+| A regex whose automaton needs more working memory                | 256 KiB    |
+| A `guided_json` schema whose compiled regex is larger            | 256 KiB    |
+
+The error names the regex and the limit it hit. A large automaton, such as a counted repetition over an alternation like `(a|b)*a(a|b){17}`, is refused rather than slowly built. Deeply nested arrays or many optional properties can pass the schema bound.
+
+## The `guided_json` subset
+
+| Construct           | Support                                                                    |
+| ------------------- | -------------------------------------------------------------------------- |
+| `object`            | `properties` and `required`; listed keys are mandatory, the rest optional  |
+| `array`             | `items`, `minItems`/`maxItems`                                             |
+| `string`            | `pattern`, or `minLength`/`maxLength`                                      |
+| `integer`           | `minimum`/`maximum`, inclusive or exclusive, one- or two-sided             |
+| `number`, `boolean` | Plain types                                                                |
+| `enum`, `const`     | Scalar or composite                                                        |
+| `oneOf`, `anyOf`    | Alternation                                                                |
+| local `$ref`        | `"#/$defs/Name"` into the same document, inlined                           |
+
+Object keys are emitted in sorted order. Unsupported constructs (recursive or external `$ref`, `number` bounds) return an error rather than silently under-constraining.
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
@@ -67,39 +66,36 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-The response content is then guaranteed to parse and conform, e.g.
-`{"age":42,"class":"mage","name":"Bel"}`.
+The content is then guaranteed to parse and conform, for example `{"age":42,"class":"mage","name":"Bel"}`.
 
-OpenAI clients usually send the standard `response_format` field instead of poot's `guided_json`
-extension; poot accepts it and maps it to the same constraint:
+## `response_format`
 
-- `response_format: {"type": "json_schema", "json_schema": {"name": "...", "schema": <JSON Schema>}}`,
-  the output conforms to the inner `schema` (the same subset `guided_json` supports). The
-  `name`/`strict` keys are accepted and ignored.
-- `response_format: {"type": "text"}`, unconstrained (the default).
-- `response_format: {"type": "json_object"}`, the output is a single well-formed JSON value of any
-  shape and any nesting depth. This uses a pushdown (stack) acceptor, not the regex/DFA engine, so it
-  counts brackets and never blocks a deeply nested value. It constrains only the JSON grammar, not
-  the keys or types; pass a concrete `json_schema` when you need those constrained too.
+OpenAI clients send `response_format` instead of `guided_json`. poot maps it to the same constraint:
 
-When both are present `guided_json` wins. The explicit `guided_choice`/`guided_regex`/
-`guided_grammar`/`guided_json` fields all take precedence over `response_format`.
+- `{"type": "json_schema", "json_schema": {"name": "...", "schema": <JSON Schema>}}`: the output conforms to `schema`. `name` and `strict` are accepted and ignored.
+- `{"type": "json_object"}`: the output is one well-formed JSON value of any shape and depth. Keys and types are not constrained; use `json_schema` for that.
+- `{"type": "text"}`: unconstrained (the default).
+
+The explicit `guided_*` fields take precedence over `response_format`.
+
+## Token bytes
+
+The constraint applies to the bytes each token adds to the output.
+
+- A word-initial token of a SentencePiece model counts as its leading space plus the word. A pattern that starts with a space, such as `" the [a-z]+"`, constrains the tokens the model emits.
+- The `bytes` of a logprob entry include that space.
+- A whole (non-streamed) reply is decoded as one sequence, which drops the single leading space a SentencePiece model adds to the start of text.
 
 ## Forcing a tool call
 
-On the chat endpoint, OpenAI `tool_choice` can require the model to call a tool, and poot then
-constrains generation to a valid, schema-conforming call (it reuses the guided-decoding engine, so
-the reply is guaranteed to parse):
+On the chat endpoint, `tool_choice` can require a tool call. poot then constrains generation to a valid call whose `arguments` conform to the tool's `parameters` schema.
 
-- `tool_choice: "required"`, the reply must be a call to one of the `tools`.
-- `tool_choice: {"type": "function", "function": {"name": "get_weather"}}`, the reply must call that
-  specific tool, with `arguments` conforming to its `parameters` schema.
-- `tool_choice: "auto"` / `"none"` (or omitted), the model and template decide, unconstrained.
+| `tool_choice`                                        | Effect                                     |
+| ---------------------------------------------------- | ------------------------------------------ |
+| `"required"`                                         | The reply must call one of the `tools`     |
+| `{"type": "function", "function": {"name": "..."}}`  | The reply must call that tool              |
+| `"auto"`, `"none"`, or omitted                       | The model and template decide, unconstrained |
 
-Each model names its own tool-call format, and both the parsing of its calls into `tool_calls` and
-forcing go through it. Forcing applies to models whose tool-call codec emits the ChatML `<tool_call>` markup; the
-`[TOOL_CALLS]` and `<|python_tag|>` formats are parsed but left to the template when forced, and a model with no
-tool-call codec returns its reply as plain content. The [feature matrix](../reference/feature-matrix.md) lists the
-codec of each family. This takes precedence over the `guided_*` fields.
+Forcing applies to models whose tool-call codec emits the ChatML `<tool_call>` markup. The `[TOOL_CALLS]` and `<|python_tag|>` formats are parsed but left to the template when forced, and a model with no codec returns plain content. Forcing takes precedence over the `guided_*` fields.
 
-Design notes: [Architecture: Serving design](../architecture/serving-design.mdx#the-scheduling-loop).
+Design notes: [Serving design](../architecture/serving-design.mdx#the-scheduling-loop).

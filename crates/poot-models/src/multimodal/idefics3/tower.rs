@@ -336,6 +336,7 @@ pub(super) fn build(
         bos: None,
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
+        kv_dtype: None,
         chat: ChatFormat::ChatML,
         tool_codec: Some(Arc::new(HermesToolCodec)),
     };

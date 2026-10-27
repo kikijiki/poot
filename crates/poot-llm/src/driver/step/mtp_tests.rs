@@ -205,6 +205,7 @@ fn build_toy(raw: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, ModelEr
             bos: None,
             prompt_bos: None,
             prefill_granule: nz(1),
+            kv_dtype: None,
             chat: ChatFormat::ChatML,
             tool_codec: Some(Arc::new(HermesToolCodec)),
         },
@@ -282,7 +283,7 @@ impl Device for FakeDevice {
     fn load_kernel(
         &mut self,
         _key: &str,
-        _kernel: poot_runtime_common::CompiledKernel,
+        _kernel: poot_codegen::CompiledKernel,
     ) -> Result<(), FakeError> {
         Ok(())
     }
@@ -338,6 +339,7 @@ fn mtp(k: usize) -> DraftPolicy {
 fn toy_options(draft: DraftPolicy) -> DriverOptions {
     let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(TOY_CAPACITY),
@@ -874,7 +876,7 @@ fn oracle_drafts(handle: &ModelHandle, tokens: &[u32], k: usize) -> Vec<u32> {
                     let aval = graph.aval(input);
                     match aval.dtype {
                         DType::I32 => HostTensor::i32(aval.shape.clone(), vec![0; aval.numel()]),
-                        _ => HostTensor::zeros(aval.shape.clone()),
+                        _ => HostTensor::zeros_of(aval.dtype, aval.shape.clone()),
                     }
                 })
             })

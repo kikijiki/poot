@@ -7,6 +7,8 @@ pub(crate) struct Pod {
     pub id: String,
     pub gpu_type: String,
     pub cloud: String,
+    /// What the pod bills per hour (USD), as RunPod reported it at create.
+    pub cost_per_hr: Option<f64>,
     pub image: String,
     pub status: String, // provisioning | idle | busy | terminated
     pub ssh_host: Option<String>,
@@ -34,13 +36,14 @@ impl Db {
         id: &str,
         gpu_type: &str,
         cloud: &str,
+        cost_per_hr: Option<f64>,
         image: &str,
     ) -> Result<()> {
         let now = now_iso();
         self.conn.execute(
-            "INSERT OR REPLACE INTO pods (id, gpu_type, cloud, image, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'provisioning', ?5, ?5)",
-            params![id, gpu_type, cloud, image, now],
+            "INSERT OR REPLACE INTO pods (id, gpu_type, cloud, cost_per_hr, image, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'provisioning', ?6, ?6)",
+            params![id, gpu_type, cloud, cost_per_hr, image, now],
         )?;
         Ok(())
     }
@@ -79,10 +82,20 @@ impl Db {
         Ok(())
     }
 
+    /// One pod record by id, whatever its status.
+    pub(crate) fn pod_record(&self, id: &str) -> Result<Option<Pod>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, gpu_type, cloud, image, status, ssh_host, ssh_port, current_run, created_at, updated_at, cost_per_hr
+             FROM pods WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id], Self::row_to_pod)?;
+        Ok(rows.next().transpose()?)
+    }
+
     /// All pods not yet `terminated`.
     pub(crate) fn live_pods(&self) -> Result<Vec<Pod>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, gpu_type, cloud, image, status, ssh_host, ssh_port, current_run, created_at, updated_at
+            "SELECT id, gpu_type, cloud, image, status, ssh_host, ssh_port, current_run, created_at, updated_at, cost_per_hr
              FROM pods WHERE status != 'terminated' ORDER BY created_at",
         )?;
         let rows = stmt
@@ -94,7 +107,7 @@ impl Db {
     /// All pods (any status), newest first.
     pub(crate) fn all_pods(&self, limit: i64) -> Result<Vec<Pod>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, gpu_type, cloud, image, status, ssh_host, ssh_port, current_run, created_at, updated_at
+            "SELECT id, gpu_type, cloud, image, status, ssh_host, ssh_port, current_run, created_at, updated_at, cost_per_hr
              FROM pods ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -115,6 +128,7 @@ impl Db {
             current_run: row.get(7)?,
             created_at: row.get(8)?,
             updated_at: row.get(9)?,
+            cost_per_hr: row.get(10)?,
         })
     }
 }

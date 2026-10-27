@@ -1169,6 +1169,17 @@ pub enum ShapeError {
         extent: usize,
     },
 
+    /// The expert grouping needs rank-1 ids and at least one expert.
+    #[error(
+        "expert_group needs rank-1 ids and at least one expert, got {experts} experts and ids {ids:?}"
+    )]
+    ExpertGroup {
+        /// The expert count.
+        experts: usize,
+        /// The ids' shape.
+        ids: Vec<usize>,
+    },
+
     /// The query is not rank-4 `[B, Hq, Lq, D]` with `n_rep` dividing `Hq`.
     #[error(
         "attention q must be rank-4 [B, Hq, Lq, D] with n_rep={n_rep} dividing Hq, got {actual:?}"
@@ -1200,8 +1211,9 @@ pub enum ShapeError {
         k: usize,
     },
 
-    /// An attention operand's dtype differs from the query's.
-    #[error("attention {operand} dtype {actual} must match q's {expected}")]
+    /// An attention operand's dtype is not the query's (for a key or value: nor a two-byte storage of an f32
+    /// query's).
+    #[error("attention {operand} dtype {actual} does not read as q's {expected}")]
     AttentionDtype {
         /// The operand's role name.
         operand: &'static str,

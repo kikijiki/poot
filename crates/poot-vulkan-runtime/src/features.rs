@@ -245,7 +245,7 @@ mod tests {
     fn the_enabled_core_features_include_robust_buffer_access() {
         let Ok(ctx) = crate::Context::new() else {
             eprintln!(
-                "SKIP the_enabled_core_features_include_robust_buffer_access: no Vulkan device"
+                "POOT-SKIP the_enabled_core_features_include_robust_buffer_access: no Vulkan device"
             );
             return;
         };

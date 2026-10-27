@@ -21,33 +21,32 @@ and **`results/INDEX.md`** is the progress index. The report tool renders the de
 builds"). The index is generated from the snapshots: regenerate it with `bench index` after each new run;
 the harness tests fail when `results/INDEX.md` differs from what `bench index` writes.
 
-Tracking restarted on 2026-10-20: every earlier snapshot was recorded before the identity contract (a result
-states its build, profile, adapter, driver and checkpoint digest, and its precision is what the loaded store
-holds), so none is attributable. They remain in git history; the working tree holds only rows the harness tests
-accept. The older restart, 2026-06-13: the earlier `decode-128` snapshots are not compatible with the
-`decode-curve` methodology (different scenario, prefill-amortized vs prefill-excluded decode metric, text
-vs fixed-token input). They remain in git history (the 2026-06-12 commits) but not in the working tree.
+A committed row states its build, profile, adapter, driver and checkpoint digest, and its precision is what the
+loaded store holds (the identity contract); the harness tests accept only rows that carry it.
 
 ## Layout
 
 ```
 benchmarks/
   manifest.toml        the model x framework x scenario matrix (what gets benchmarked; precision per cell)
+  grid.toml            the standing grid: the cells the Performance page must show (machine, model, engine, scenario),
+                       each verified, pending or not run with a reason (`just grid-check`, `--strict` at release)
   runners.toml         how the harness invokes each runner (argv templates, env-overridable binaries)
   prompts/             fixed prompt + image inputs (short.txt, long.txt, test-image.jpg)
   schema/              result.schema.json - the one record shape every row conforms to
   pyproject.toml       the harness deps (uv); requirements are light (pynvml, psutil) and degrade gracefully
   harness/
     bench.py           the orchestrator CLI: matrix / run / report / compare / index
+    grid.py            the grid's completeness check against website/src/data/performance.json
     observer.py        the external sampler (uniform VRAM + RSS) every runner is wrapped with
     fixtures/          a synthetic run snapshot for the hermetic `report` self-check
     tests/             the harness's own tests (`just test-bench-harness`, part of the model-free gate)
   runners/
     poot/              the poot runner: root-workspace crate `poot-bench-runner`, one measure loop over
-                       the ptx, rocm and wgpu backends
+                       the ptx, rocm, wgpu and vulkan backends
     candle/  torch/  vllm/  llamacpp/    one runner + a NOTES.md (pinned versions, gotchas) each
   setup/               per-framework, pinned, on-pod install scripts (the "pull everything" part)
-  docker/              the pre-baked image: Dockerfile (bakes the 5 engines, sm_86) + README
+  docker/              the pre-baked image: Dockerfile (bakes the 5 engines, sm_80 + sm_86) + README
   flake.nix            a separate devshell with the image build/push tooling (podman, skopeo, gh, uv)
   justfile             image-build / image-smoke / harness commands (run in `nix develop`)
   results/             committed run snapshots: results/<date>-<gpu>-<sha>/{env.json,results.jsonl,report.md}
@@ -55,8 +54,7 @@ benchmarks/
 
 ## The measurement contract (why the numbers are fair)
 
-The metric definitions follow MLPerf Inference, vLLM `bench serve`, NVIDIA GenAI-Perf, and Anyscale LLMPerf. The older `decode-128` contract, which
-amortized prefill into the decode rate, is superseded.
+The metric definitions follow MLPerf Inference, vLLM `bench serve`, NVIDIA GenAI-Perf, and Anyscale LLMPerf.
 
 **Scenario `decode-curve`.** For each context length ISL in {128, 512, 2048, 8192, 16384, ...}, prefill
 exactly ISL tokens, then decode a fixed small OSL (large enough for a >1s window and a stable per-token
@@ -95,8 +93,17 @@ order-dependent TTFT variance).
 (single-process load generators saturate at high QPS). vLLM's batching advantage is a caveat, not exercised.
 
 Memory is NOT self-reported. The harness wraps each runner with `observer.py`, which samples total device
-VRAM (NVML, else `nvidia-smi`) and process-tree RSS (psutil, else /proc) at a fixed interval and keeps the
-peaks. Self-reported numbers do not compare across engines (torch's
+VRAM (NVML, else `nvidia-smi`; on an AMD device the amdgpu sysfs `mem_info_vram_used` + `mem_info_gtt_used`, with power from hwmon `power1_average`) and process-tree RSS (psutil, else a /proc walk of the descendants) at a fixed interval and keeps the
+peaks, and stores the 1 Hz trace of both (`util_series`). The peaks and the trace cover the whole process lifetime, so they include
+loading the checkpoint (VmRSS counts the file-backed pages of the mapped file; staging buffers count as device memory). What the
+reports, `results/INDEX.md` and the Performance page chart is the **peak at inference**: the highest host and GPU memory after the
+model is loaded and the warmup request has run (allocator, KV cache and kernels at steady state), with the **load peak** stated
+beside it. Both are derived from the stored trace (`harness/memory_phases.py`), so a result needs no re-run: the load ends at the
+engine's recorded `preparation.open_ms`, else at the last fall of host RSS by a quarter of its peak (llama.cpp restarts its server per
+context length, so the last load bounds the window), and the warmup adds the duration of the manifest's `warmup_iters` requests of
+the first context length. A run whose trace shows no boundary keeps its lifetime peak and is labelled "includes load". The trace is
+sampled at 1 Hz, the lifetime peak at the sampler interval, so a phase peak can sit slightly below the lifetime peak it belongs to.
+Self-reported numbers do not compare across engines (torch's
 allocator, vLLM's KV pool, and llama.cpp's buffer report measure different things). The
 assumption is **one engine per GPU, GPU otherwise idle**, so "peak device used minus the pre-launch
 baseline" is the footprint. Run one cell at a time on a dedicated pod.
@@ -166,6 +173,9 @@ A speed change is only real if it clears the noise, so `compare` takes repeats, 
 `min_trials` (manifest `[performance]`, 5) run directories per side, each a full run of the same matrix, all
 of one binary per side. Run the matrix 5 times per build with distinct run ids, then:
 
+`bench run` refuses a repeat on a host where neither `nvidia-smi` nor `rocminfo` lists a GPU (a pod whose GPU died
+would otherwise write a set of errors and a CPU-fallback row); there is no CPU-only run.
+
 ```bash
 for i in 1 2 3 4 5; do uv run bench run --framework poot --model qwen2.5-0.5b --run-id base-$i; done
 # ... rebuild, then the same loop with --run-id cand-$i ...
@@ -177,8 +187,19 @@ baseline: with no argument it compares that set with itself, which fails unless 
 model-free gate runs it), and `just bench-compare benchmarks/results <candidate run directories>` judges fresh
 repeats against it. `bench run --repeats 5` writes the five run directories.
 
-A cell is keyed by `(model, scenario, framework, backend, device)`, and rows that state different workloads
-(precision, prompt length, output length) are `incomparable`. One comparator, `harness/performance_receipt.py`,
+A committed cell whose repeats stay unverified (a band over `max_uncertainty` that more repeats do not narrow) is
+committed anyway only when `benchmarks/known-unverified.toml` lists it: the cell key, the widest pair and its band, the
+repeat count (and `failed_repeats`), the reason and the follow-up card. `bench compare-committed` then reports it as
+`known unverified` and passes; an unverified cell that is not listed is red as before, and a listed cell that now
+verifies, whose measurement no longer matches the entry, or that has gone is a `stale exception` and fails. The list
+applies to the committed set compared with itself, not to a candidate. The Performance page shows a listed cell's measured median muted and
+labelled unverified, never ranked and never in a ratio, and `bench index` lists it in INDEX.md. Rows are never edited.
+
+A cell is keyed by `(model, scenario, framework, backend, device, host CPU, GPU driver)`, and rows that state different workloads
+(precision, prompt length, output length) are `incomparable`. The host CPU and driver come from the `env.json` of the
+run directory a row was recorded in, so repeats recorded on two hosts of the same GPU (host-side launch overhead
+makes time metrics differ between hosts) are two cells and never one band. A run directory that recorded no CPU or
+driver is an unknown identity: its cell is distinct from every known one, never pooled with it. One comparator, `harness/performance_receipt.py`,
 judges every required pair of a cell: the smallest-context headline and, for a decode-curve cell, TPOT and
 TTFT at every context the baseline measured. The cell's verdict is the most serious pair, so a good headline
 never hides a slower long-context token, a context the candidate did not run (`not run`) or a failed repeat
@@ -186,10 +207,12 @@ never hides a slower long-context token, a context the candidate did not run (`n
 higher, throughput worse when lower.
 
 The uncertainty rule is bounded and declared in `manifest.toml` `[performance]`: the band is twice the larger
-observed range of the two sides; a candidate further outside it is a regression (or improvement); inside it
-the cell is within noise only if the band is narrower than the metric's `max_uncertainty` and cannot hide a
-loss of its `practical_threshold`. A band too wide, too few repeats, or an exhausted `max_trials` budget that
-never narrowed it is `unverified`, never success. The exit code is 1 for a regression, a failed or incomparable
+noise of the two sides, where a side's noise is 2.33 robust sigmas (its interquartile range divided by 1.349)
+at the minimum repeat count and narrows as 1 / sqrt(n) with more repeats; a candidate further outside it is a
+regression (or improvement); inside it the cell is within noise only if the band is narrower than the metric's
+`max_uncertainty` and cannot hide a loss of its `practical_threshold`. A band too wide, too few repeats, or an
+exhausted `max_trials` budget whose robust band is still too wide
+is `unverified`, never success. The exit code is 1 for a regression, a failed or incomparable
 cell or a non-finite sample, 2 when any cell is unverified, not run, refused or has no baseline, and 0 only
 when every cell the baseline measured was compared without a regression: a partial comparison never passes.
 
@@ -232,6 +255,9 @@ flock /tmp/poot-gpu.lock python3 harness/performance_bank.py --record dense-deco
 Receipts are hardware measurements under `performance-bank/receipts/<backend>/`, kept apart from the
 model-free fixtures in `harness/tests`. A receipt names the commit its binary was built from (the tree must be
 clean), the device and driver, the realized plan, the observed workload, and an independent f64 reference.
+A verified claim in `receipts.json` also states what it derives from its receipt: the repeats' `spread` and, for
+a case with a FLOP model (`work_flop`: contractions, and attention over the keys its mask leaves visible), the
+`tflop_per_s` of the median repeat; validation recomputes both.
 `receipts/request-level/` holds the poot runner's own decode-curve lines from the three preparation states on one device (qwen2.5-0.5b, wgpu): measurements, not claims, so `receipts.json` does not list them.
 Hardware numbers are recorded with their noise: a baseline taken next to other GPU work shows it, and the
 uncertainty rule above then calls a later comparison unverified instead of passing it.
@@ -254,9 +280,9 @@ to retarget a build.
 
 ### Backends and the local AMD box
 
-The poot runner has three backends, chosen per run by `POOT_BENCH_BACKEND=ptx|rocm|wgpu` (default `ptx`,
+The poot runner has four backends, chosen per run by `POOT_BENCH_BACKEND=ptx|rocm|wgpu|vulkan` (default `ptx`,
 passed to the runner as `--backend`); the result row records the backend and the device it ran on, and a
-compare never merges two of them. `ptx` needs NVIDIA hardware and libcuda. `rocm` and `wgpu` run on the AMD
+compare never merges two of them. `ptx` needs NVIDIA hardware and libcuda. `rocm`, `wgpu` and `vulkan` (raw Vulkan, no wgpu) run on the AMD
 dev box (Strix Halo: ROCm/HSA and Vulkan), where VRAM is shared host memory, so the memory numbers read
 differently from a discrete GPU. On such a box:
 
@@ -283,14 +309,14 @@ Docker image** and a pod boots ready in ~1 minute.
 RunPod always pulls the container image from a registry; the container disk and any volume are separate
 storage. The image is published **public on GHCR** (`ghcr.io/<owner>/poot-bench`): public packages have no
 storage or egress bill, and the standard RunPod MCP `create-pod` pulls it via `imageName` with no
-credential or network volume. The source repo stays private; only the benchmark tooling and public engine
-installs are in the image (no poot codegen core, no poot binary). Build and push it from the bench devshell
+credential or network volume. The image holds only the benchmark tooling and public engine installs (no poot
+binary). Build and push it from the bench devshell
 (`nix develop ./benchmarks`): `just image-build-push` builds, smokes, and pushes locally (or
 `just sweep-image --push` via the orchestrator); `just image-build` builds only, to validate the Dockerfile. There is no CI workflow that builds the image.
 The one-time public-visibility flip and details are in [`docker/`](docker/).
 
-**Baked:** a slim NVIDIA CUDA runtime base with the reimplemented `/start.sh` SSH/`PUBLIC_KEY` machinery,
-the five engines pinned to sm_86, the harness venv, Vulkan loader/diagnostic tools for NVIDIA wgpu, and the
+**Baked:** a slim NVIDIA CUDA runtime base with its `/start.sh` SSH/`PUBLIC_KEY` machinery,
+the five engines (llama.cpp for sm_80 and sm_86, candle as compute_80 PTX that runs on both), the harness venv, Vulkan loader/diagnostic tools for NVIDIA wgpu, and the
 suite source. **Not baked:** the model weights (fetched at runtime on the pod; avoids CI disk limits and
 model-redistribution licensing) and the poot binary (changes every version; scp'd fresh per run, then
 `patchelf`'d). The `setup/*.sh` scripts remain the source of truth for
@@ -322,8 +348,10 @@ env vars, and run `uv run bench run ...`.
   scp): `uv pip install --python /opt/tf-venv/bin/python gguf sentencepiece`, then
   `/opt/tf-venv/bin/python /opt/llama.cpp/convert_hf_to_gguf.py <model_dir> --outtype f16 --outfile <model_dir>/<id>-f16.gguf`.
   The harness passes `--gguf <model_dir>` and expects exactly one `.gguf` there.
-- **poot needs `warmup >= 2`.** With `warmup 1`, one-time CUDA module-load / PTX JIT leaks into the timed
-  runs and reads a fraction of the true tok/s. On a pod the runner runs its `ptx` backend (NVIDIA
+- **The suite is 1 warmup + 3 timed iterations per cell** (`[suite]` in `manifest.toml`). On the `ptx` backend
+  one warmup may leave one-time CUDA module-load / PTX JIT in the timed runs (it read a fraction of the true tok/s
+  at `warmup 1` before this suite change; not re-checked on a pod), so a pod run passes `--warmup 2` until a pod
+  run shows otherwise; the AMD backends are unaffected. On a pod the runner runs its `ptx` backend (NVIDIA
   capture/replay) and needs libcuda (the pod driver) at runtime; the backend is
   `POOT_BENCH_BACKEND`. Per-call CUDA-graph capture lands in TTFT, not in decode tok/s.
 - **poot prefill is naive and serial; cap the ISL if the top point is impractical.** TTFT is super-linear in
@@ -340,7 +368,10 @@ once a clean baseline curve is committed, a poot-only re-run is a single ~30-40 
 - **A model:** add a `[[model]]` block to `manifest.toml` with `hf_repo`, `local_dir`, `size_class`,
   `match_precision`, and a `frameworks.<fw>` entry per engine (`support` + `precision`, or `support=false`
   - `reason`, for the external engines; a `frameworks.poot` entry is `precision` and an optional `caveat`,
-    never `support`). The harness enumerates it automatically.
+    never `support`). The harness enumerates it automatically. A pre-quantized model (a repo holding many GGUF
+    quants) adds `hf_include` (the `hf download --include` patterns, so only the wanted files are fetched) and
+    `weights_file` (relative to `local_dir`: the first shard of the split GGUF, which every runner is handed
+    instead of the directory). poot's `precision` there is the dtype most of the file's bytes are stored in.
 - **A scenario:** add a `[[scenario]]`. A single-point scenario takes a `prompt_file` + `gen_tokens`; a
   `decode-curve` scenario takes a context-length list (`isl`), a fixed `osl`, and the synthetic-token flag
   (see spec 115).
@@ -351,7 +382,7 @@ once a clean baseline curve is committed, a poot-only re-run is a single ~30-40 
 ## Per-framework gotchas (full detail in each `runners/<fw>/NOTES.md`)
 
 - **poot** - built with `cargo build --release -p poot-bench-runner` (a root-workspace member; GPU kernels are
-  generated at runtime). One measure loop serves the `ptx`, `rocm` and `wgpu` backends (`--backend`), all
+  generated at runtime). One measure loop serves the `ptx`, `rocm`, `wgpu` and `vulkan` backends (`--backend`), all
   over the driver. Decode-curve contexts are prefilled in one batched
   forward and decoded with EOS ignored for a fixed token count. The runner takes only measurement flags, and
   its one output line is the result: it has no probe or receipt modes. A refused model is reported as an
@@ -361,5 +392,5 @@ once a clean baseline curve is committed, a poot-only re-run is a single ~30-40 
   sm_90+ only (bf16 fallback elsewhere - record the caveat). NVML is the fair VRAM number.
 - **vLLM 0.22.1** - offline `metrics` is `None` (TTFT via a prefill-only request); pre-allocated KV pool
   inflates VRAM - run at a low `gpu_memory_utilization` with `max_model_len` pinned, and keep the caveat.
-- **llama.cpp b9601** - GGUF-only, needs nvcc; k-quants are not GPTQ/AWQ (bit-width parity only); f16/bf16
+- **llama.cpp v0.4.1** - GGUF-only, needs nvcc; k-quants are not GPTQ/AWQ (bit-width parity only); f16/bf16
   GGUF is the fair full-precision anchor; gpt-oss native MXFP4 GGUF is the one exact match; `-ngl 99`.

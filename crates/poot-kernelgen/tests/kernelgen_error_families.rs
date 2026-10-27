@@ -8,34 +8,6 @@ use poot_kernel_ir::Ty;
 use poot_kernelgen::KernelGenError;
 
 #[test]
-fn wmma_family_rejects_non_divisible_dim_and_k_tail() {
-    // Mutation target: matmul_tensorcore's M/N/K %16 check.
-    let err = poot_kernelgen::matmul_tensorcore("t", Ty::F32, &[17, 16], &[17, 16], &[16, 16])
-        .expect_err("M=17 is not a multiple of 16");
-    assert_eq!(
-        err,
-        KernelGenError::NotDivisible {
-            generator: "matmul_tensorcore",
-            dim: "M".to_string(),
-            value: 17,
-            divisor: 16,
-        }
-    );
-    // Same family, the coopmat sibling: a ragged K tail is refused, never padded (card 663).
-    let err = poot_kernelgen::matmul_tensorcore_coopmat("t", &[16, 16], &[16, 17], &[17, 16])
-        .expect_err("K=17 is not a multiple of 16");
-    assert_eq!(
-        err,
-        KernelGenError::NotDivisible {
-            generator: "matmul_tensorcore_coopmat",
-            dim: "K".to_string(),
-            value: 17,
-            divisor: 16,
-        }
-    );
-}
-
-#[test]
 fn fused_family_rejects_leaf_count_mismatch_and_zero_width() {
     // Mutation target: fused_views's `leaf_shapes.len() == k.n_leaves` check.
     let kfk = poot_kernelgen::FusedKernel {

@@ -1,0 +1,50 @@
+# Committed cells that stay unverified (harness/known_unverified.py, POOT-ADR-0120).
+# A cell is listed only if its repeats do not verify under the manifest's [performance] policy, and each entry states
+# the measurement it was reviewed at: `bench compare-committed` fails when the cell verifies, when the pair, band
+# or repeat count differ, or when the cell is gone. The Performance page shows a listed cell's measured median muted and
+# labelled unverified, never ranked and never in a ratio. Raw rows are never edited. `band` is the widest unverified pair's band over its median.
+
+
+# qwen3-0.6b on the RunPod RTX PRO 6000 Server (EPYC 9355, driver 595.91.07): two full sweeps (2026-10-26, sets 143238 and
+# 153650) were both unverified, on different pairs and different engines, so the spread belongs to the small model's
+# millisecond-scale points on this host class, not to one binary. More repeats on the same host would be the remedy.
+[[cell]]
+model = "qwen3-0.6b"
+scenario = "decode-curve"
+framework = "candle"
+device = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+host_cpu = "AMD EPYC 9355 32-Core Processor"
+driver = "595.91.07"
+pair = "isl=128 tpot_ms"
+band = 0.1914
+repeats = 5
+reason = "two modes in the five repeats of a 0.6b bf16 decode (about 3 ms per token): the spread, not the repeat count, is the limit"
+follow_up = "POOT-1412"
+
+[[cell]]
+model = "qwen3-0.6b"
+scenario = "decode-curve"
+framework = "poot"
+backend = "ptx"
+device = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+host_cpu = "AMD EPYC 9355 32-Core Processor"
+driver = "595.91.07"
+pair = "isl=2048 tpot_ms"
+band = 0.118
+repeats = 5
+reason = "one slow repeat of a 0.6b decode at 2048 tokens (about 3 ms per token); the first sweep of the same binary on this host was unverified at isl=128 ttft_ms instead"
+follow_up = "POOT-1412"
+
+[[cell]]
+model = "qwen3-0.6b"
+scenario = "decode-curve"
+framework = "transformers"
+backend = "cuda"
+device = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+host_cpu = "AMD EPYC 9355 32-Core Processor"
+driver = "595.91.07"
+pair = "isl=128 ttft_ms"
+band = 0.1525
+repeats = 5
+reason = "host-launch jitter on a first-token latency of a few tens of milliseconds"
+follow_up = "POOT-1412"

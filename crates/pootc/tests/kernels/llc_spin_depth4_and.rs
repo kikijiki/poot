@@ -42,10 +42,10 @@
 //! `if`s. This file keeps the original failing shape as the in-repo reproducer.
 
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 
 pub fn __poot_kernel_llc_spin_depth4_and(table_words: &[u32], index: &[i32], out: &mut [f32]) {
-    let i = thread_index();
+    let i = thread_index_x();
     if i < out.len() && index.len() > 0 {
         let row_width = out.len() / index.len();
         if row_width > 0 {

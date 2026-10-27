@@ -1,5 +1,5 @@
 //! Checkpoints at a real model's dimensions with all-zero weights, for tests that read only the traced
-//! graph (the feature matrix, the plan-invariant rows): the planner decides on shapes, dtypes and caps,
+//! graph (the supported-models tables, the plan-invariant rows): the planner decides on shapes, dtypes and caps,
 //! not on weight values.
 
 use crate::architectures::qwen38_27b;

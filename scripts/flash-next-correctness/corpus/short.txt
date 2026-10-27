@@ -1,0 +1,17 @@
+The harbour town of Veldmark sits where the river Aun meets the northern sea, and for most of the year the morning begins with fog. Fishermen walk down to the quay before the bells ring, carrying nets over their shoulders and thermos flasks in their coat pockets. By seven the fog lifts from the water in long grey strips, and the gulls, which have been waiting on the roofs, descend on the boats as if they had been called.
+
+The town archive keeps a ledger from the year the first lighthouse was built. It lists the cost of every barrel of lime, every iron bolt and every day of work, written in a small careful hand. The keeper at the time, a woman named Ilse Brandt, added a note at the bottom of each page: the weather, the wind, and how many ships passed. On the day the lamp was lit for the first time she wrote only three words, "It is done."
+
+Mathematics is often described as the language of nature, but it is better understood as a habit of care. To prove that the sum of two even numbers is even, one writes each as twice an integer, adds them, and factors out the two. Nothing in the argument depends on which numbers were chosen. This is the whole appeal of a proof: it replaces a thousand examples with a single reason, and the reason keeps working long after the examples are forgotten.
+
+A simple program that reads a file and counts its lines can still go wrong in several ways. The file might not exist, or it might be too large to read at once, or it might use a different line ending than the one the author expected. A careful programmer checks each case and returns a clear error rather than a wrong number. In Rust, this usually means a function that returns a Result, where the caller must decide what to do with the failure before the code will compile.
+
+fn count_lines(text: &str) -> usize {
+    text.lines().count()
+}
+
+Cooking rice well is mostly a matter of patience. Rinse the grains until the water runs clear, add one and a half parts of water to one part of rice, bring the pot to a boil, then lower the heat as far as it will go and cover it tightly. Do not lift the lid. After fifteen minutes, turn off the heat and let the pot rest for ten more. The steam finishes the work, and the rice comes out separate and soft rather than wet.
+
+In the early days of aviation, pilots navigated by following railway lines and rivers, since few of them could afford instruments that would work in cloud. A wrong turn at a junction meant landing in a field and asking a farmer for directions. Today a passenger jet crosses the ocean guided by satellites, and the crew spends most of the flight watching systems that rarely fail. The skill that matters has shifted from steering to judgment, from the hands to the head.
+
+When the power went out across the valley, the neighbours gathered on the porch of the old schoolhouse, because it was the only building with a wood stove. Someone brought candles, someone else brought a pot of soup, and a boy of about ten produced a deck of cards from his jacket. They played until midnight. Nobody remembered afterwards who had won, but everyone remembered the soup, and the way the snow looked in the light of the windows.

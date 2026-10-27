@@ -1,5 +1,5 @@
 use crate::RuntimeError;
-use poot_runtime_common::CompiledKernel;
+use poot_codegen::CompiledKernel;
 use poot_target::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
 
 use std::sync::Arc;
@@ -74,8 +74,8 @@ impl KernelBuffer {
         self.element
     }
 
-    pub(crate) fn elem_count(&self) -> u32 {
-        (self.bytes.len() / self.element.byte_width()) as u32
+    pub(crate) fn elem_count(&self) -> usize {
+        self.bytes.len() / self.element.byte_width()
     }
 
     pub(crate) fn writable(&self) -> bool {
@@ -130,6 +130,17 @@ pub(crate) fn resolve_groups(
     Ok(folded)
 }
 
+/// The `u32` lengths the WGSL kernel ABI passes for `lens` element counts: a count past `u32::MAX` is a
+/// typed [`RuntimeError::KernelLengthTooLarge`], never a truncated length (a kernel trusts it as a bound).
+pub(crate) fn kernel_lens(lens: impl IntoIterator<Item = usize>) -> Result<Vec<u32>, RuntimeError> {
+    lens.into_iter()
+        .map(|elems| {
+            poot_runtime_common::kernel_len_u32(elems)
+                .map_err(|_| RuntimeError::KernelLengthTooLarge { elems })
+        })
+        .collect()
+}
+
 /// The X-thread extent of a folded (or 1-D) launch: `groups[0] * wg[0]`. Shared codegen reconstructs
 /// the linear index as `group_y * x_extent + global_id.x` from this value, which the runtime appends
 /// to the length buffer at slot `param_count`.
@@ -142,7 +153,7 @@ pub(crate) fn x_extent(groups: [u32; 3], wg: [u32; 3]) -> u32 {
 #[derive(Clone)]
 pub struct DeviceBuffer {
     pub(crate) buf: wgpu::Buffer,
-    pub(crate) elem_count: u32,
+    pub(crate) elem_count: usize,
     /// A cheap identity tag distinct on every allocation (see [`next_buffer_id`]) and shared across
     /// clones. Card 156 phase 3: the cached-decode ping-pong KV recovery pointer-compares it against its
     /// two held physical buffers to recover parity / detect a new seed (spec 137 B2), without wgpu-internal
@@ -167,7 +178,7 @@ impl DeviceBuffer {
 
     /// The number of native elements this buffer holds (card 608: private field, no setter, mirroring
     /// `poot-vulkan-runtime`'s `DeviceBuffer::elem_count`).
-    pub fn elem_count(&self) -> u32 {
+    pub fn elem_count(&self) -> usize {
         self.elem_count
     }
 
@@ -230,7 +241,7 @@ pub(crate) fn check_device_args(
         .map(|b| b.element())
         .chain(std::iter::once(out.element()))
         .collect();
-    poot_runtime_common::check_kernel_args(kernel, &elements)?;
+    poot_codegen::check_kernel_args(kernel, &elements)?;
     Ok(())
 }
 
@@ -241,7 +252,7 @@ pub(crate) fn check_kernel_buffer_args(
     buffers: &[KernelBuffer],
 ) -> Result<(), RuntimeError> {
     let elements: Vec<ElementKind> = buffers.iter().map(KernelBuffer::element).collect();
-    poot_runtime_common::check_kernel_args(kernel, &elements)?;
+    poot_codegen::check_kernel_args(kernel, &elements)?;
     Ok(())
 }
 
@@ -259,7 +270,7 @@ pub(crate) fn checked_write_range(
     elements: usize,
     element_bytes: usize,
 ) -> Result<(), RuntimeError> {
-    let byte_capacity = buf.elem_count as usize * buf.storage().element().byte_width();
+    let byte_capacity = buf.elem_count * buf.storage().element().byte_width();
     poot_runtime_common::checked_copy_range(
         element_offset,
         elements,
@@ -312,7 +323,7 @@ mod kernel_buffer_tests {
         ];
         for kb in &cases {
             assert_eq!(
-                kb.elem_count() as usize * kb.element().byte_width(),
+                kb.elem_count() * kb.element().byte_width(),
                 kb.bytes().len(),
                 "elem_count * element width must equal the byte storage exactly"
             );

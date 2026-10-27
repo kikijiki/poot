@@ -1,8 +1,9 @@
 //! SC-001, the large-grid row: a dispatch wider than wgpu's 65535-workgroup grid runs as the one 1-D
 //! dispatch the device's measured `DeviceCaps::max_grid` allows, and matches the CPU oracle.
 //!
-//! Flash prefill over `Hq * L = 512 * 130 = 66560` query groups (the staged prefill `Attention`, as a
-//! pass would form it). The planner reads `caps.max_grid[0]` to choose between one 1-D launch and the 2-D
+//! Flash prefill over `Hq = 66560` heads of a two-token prompt (the staged prefill `Attention`, as a pass
+//! would form it). Every attention schedule runs at least one workgroup per head, so the grid is past
+//! 65535 whichever one the planner picks. The planner reads `caps.max_grid[0]` to choose between one 1-D launch and the 2-D
 //! fold, so this row holds only while the caps are the physical limit: it asserts the program really
 //! dispatches more than 65535 workgroups on x, then compares the output to `eval` of the same graph.
 //!
@@ -41,7 +42,7 @@ fn flash_prefill_over_65535_workgroups_is_one_wide_dispatch_and_matches_the_orac
         return;
     };
     let target = device.target();
-    let (hq, l, d) = (512usize, 130usize, 4usize);
+    let (hq, l, d) = (66_560usize, 2usize, 4usize);
     let scale = 0.3f32;
     let b = Builder::for_tests();
     let q = b.constant("q", TensorType::f32(vec![1, hq, l, d])).unwrap();

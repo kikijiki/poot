@@ -31,21 +31,23 @@
 //! Precondition (host-enforced, not checked here): `inv_temp > 0` for every row (a `0`-noise_scale row
 //! stays well-defined with `inv_temp = 1`).
 #![crate_type = "lib"]
+use poot_kernel_attr::kernel;
 use poot_kernel_intrinsics::{
-    group_index, local_index, no_contract_add, wg_read, wg_write, workgroup_barrier,
+    group_index_x, local_index_x, no_contract_add, wg_read, wg_write, workgroup_barrier,
 };
 const W: usize = 64;
 
-pub fn __poot_kernel_sample_gumbel_argmax_batched(
+#[kernel(workgroup(64), lds(f32, 64), lds(f32, 64))]
+pub fn sample_gumbel_argmax_batched(
     logits: &[f32],
     noise: &[f32],
     params: &[f32],
     dims: &[u32],
     out: &mut [i32],
 ) {
-    let b = group_index();
+    let b = group_index_x();
     let vocab = dims[0] as usize;
-    let lane = local_index();
+    let lane = local_index_x();
     let base = b * vocab;
     let inv_temp = params[b * 3];
     let floor_offset = params[b * 3 + 1];
@@ -67,30 +69,30 @@ pub fn __poot_kernel_sample_gumbel_argmax_batched(
         }
         j = j + W;
     }
-    wg_write(0, lane, local_max);
-    wg_write(1, lane, local_bad);
+    wg_write::<f32>(0, lane, local_max);
+    wg_write::<f32>(1, lane, local_bad);
     workgroup_barrier();
     if lane == 0 {
         let mut m = -3.4028235e38f32;
         let mut nb = vocab as f32;
         let mut k = 0usize;
         while k < W {
-            let cv = wg_read(0, k);
+            let cv = wg_read::<f32>(0, k);
             if cv > m {
                 m = cv;
             }
-            let cb = wg_read(1, k);
+            let cb = wg_read::<f32>(1, k);
             if cb < nb {
                 nb = cb;
             }
             k = k + 1;
         }
-        wg_write(0, 0, m);
-        wg_write(1, 0, nb);
+        wg_write::<f32>(0, 0, m);
+        wg_write::<f32>(1, 0, nb);
     }
     workgroup_barrier();
-    let max_logit = wg_read(0, 0);
-    let non_finite_idx = wg_read(1, 0);
+    let max_logit = wg_read::<f32>(0, 0);
+    let non_finite_idx = wg_read::<f32>(1, 0);
     let floor = max_logit + floor_offset;
 
     // Pass 2: Gumbel-perturbed argmax over the kept (>= floor) indices. `noise` is an input (no in-kernel
@@ -112,16 +114,16 @@ pub fn __poot_kernel_sample_gumbel_argmax_batched(
         }
         j2 = j2 + W;
     }
-    wg_write(0, lane, best_val);
-    wg_write(1, lane, best_idx);
+    wg_write::<f32>(0, lane, best_val);
+    wg_write::<f32>(1, lane, best_idx);
     workgroup_barrier();
     if lane == 0 {
         let mut bv = 0.0f32;
         let mut bi = -1.0f32;
         let mut k2 = 0usize;
         while k2 < W {
-            let cv = wg_read(0, k2);
-            let ci = wg_read(1, k2);
+            let cv = wg_read::<f32>(0, k2);
+            let ci = wg_read::<f32>(1, k2);
             if ci >= 0.0 && (bi < 0.0 || cv > bv || (cv == bv && ci < bi)) {
                 bv = cv;
                 bi = ci;

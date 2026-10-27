@@ -59,6 +59,28 @@ fn local_process_identity_uses_start_ticks_not_pid_alone() {
     );
 }
 
+/// A peer exec in another pid namespace (sandbox, container) shares hostname and boot id but its
+/// `/proc/<pid>` is invisible here: a missing pid there is no proof of death.
+#[test]
+fn an_owner_in_another_pid_namespace_is_never_dead() {
+    let mut hidden = ExecOwner::current().unwrap();
+    hidden.pid = i64::from(i32::MAX); // not visible in this namespace's /proc
+    assert_eq!(
+        hidden.local_liveness(),
+        OwnerLiveness::Dead,
+        "in the owner's own namespace a missing pid is proof of death"
+    );
+    hidden.pid_ns = "pid:[1]".into();
+    assert_eq!(
+        hidden.local_liveness(),
+        OwnerLiveness::Unknown,
+        "in another namespace the same missing pid proves nothing"
+    );
+    let mut live = ExecOwner::current().unwrap();
+    live.pid_ns = "pid:[1]".into();
+    assert_eq!(live.local_liveness(), OwnerLiveness::Unknown);
+}
+
 #[test]
 fn process_start_tick_failures_are_conservative_except_missing_process() {
     assert_eq!(
@@ -279,7 +301,7 @@ fn warm_exec_adoption_is_single_winner() {
     db.create_run_with_owner(&exec_run("exec-new-b", "new"), Some(&owner(3, "30")))
         .unwrap();
 
-    let observed_by_a = db.find_warm_exec("img").unwrap().unwrap();
+    let observed_by_a = db.find_warm_execs("img").unwrap().remove(0);
     let observed_by_b = observed_by_a.clone();
     assert!(
         db.try_adopt_warm_exec(&observed_by_a, "exec-new-a", &owner(2, "20"))
@@ -315,7 +337,7 @@ fn warm_exec_cleanup_is_cas_protected() {
     db.create_run_with_owner(&exec_run("exec-new", "new"), Some(&owner(2, "20")))
         .unwrap();
 
-    let stale_cleanup_view = db.find_warm_exec("img").unwrap().unwrap();
+    let stale_cleanup_view = db.find_warm_execs("img").unwrap().remove(0);
     assert!(
         db.try_adopt_warm_exec(&stale_cleanup_view, "exec-new", &owner(2, "20"))
             .unwrap()
@@ -369,7 +391,6 @@ fn a_run_of_three_repeats_has_three_snapshot_dirs_per_model() {
             "run-1-m2-r3"
         ]
     );
-    assert_eq!(db.active_run().unwrap().unwrap().repeats, 3);
     assert_eq!(
         run.model_snapshot_dirs("run-1-m1"),
         ["run-1-m1-r1", "run-1-m1-r2", "run-1-m1-r3"]
@@ -397,4 +418,26 @@ fn a_single_repeat_run_has_one_snapshot_dir_per_model() {
         .unwrap();
 
     assert_eq!(db.snapshot_dirs("run-1").unwrap(), ["run-1-m1"]);
+}
+
+/// A run in any terminal status is neither an unfinished sweep nor a claim on its pod; an active one is both.
+/// Mutation: drop one status from the `unfinished!` list in `db/runs.rs` and its case goes red.
+#[test]
+fn every_terminal_status_releases_its_pod_claim() {
+    for status in ["done", "failed", "aborted", "cancelled", "abandoned"] {
+        let db = Db::open(":memory:").unwrap();
+        let mut run = exec_run("run-1", status);
+        run.kind = "sweep".into();
+        db.create_run(&run).unwrap();
+        db.set_pod("run-1", "pod-1", None, None).unwrap();
+        assert!(db.unfinished_sweeps().unwrap().is_empty(), "{status}");
+        assert!(db.live_pod_ids().unwrap().is_empty(), "{status}");
+    }
+    let db = Db::open(":memory:").unwrap();
+    let mut run = exec_run("run-1", "sweeping");
+    run.kind = "sweep".into();
+    db.create_run(&run).unwrap();
+    db.set_pod("run-1", "pod-1", None, None).unwrap();
+    assert_eq!(db.unfinished_sweeps().unwrap().len(), 1);
+    assert_eq!(db.live_pod_ids().unwrap(), ["pod-1"]);
 }

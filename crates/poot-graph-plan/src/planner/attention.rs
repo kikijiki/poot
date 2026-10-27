@@ -7,20 +7,25 @@ use super::{
 };
 use crate::graph_validation::flash_mask_per_head;
 use crate::planner::{GraphTables, StorageDtypes};
-use crate::predicates::{attention_lanes, attention_splits};
+use crate::predicates::{
+    SelectedSchedule, attention_lanes, attention_rows_per_dispatch, attention_splits,
+    attention_tiling, selected_attention_schedule,
+};
 use crate::refusal::Site;
 use crate::types::ScratchDecl;
 use poot_graph_ir::{
     AttentionAttrs, KeyLayout, KvBound, MaskOperand, SelectedAttentionAttrs, SinkOperand,
 };
 use poot_kernelgen::{
-    AttentionCombineSpec, AttentionSchedule, AttentionSink, AttentionSpec, KeyBound,
-    KeyLayout as KernelKeyLayout, MaskKind, ScoreTransform,
+    AttentionCombineSpec, AttentionRows, AttentionSchedule, AttentionSink, AttentionSpec, KeyBound,
+    KeyLayout as KernelKeyLayout, KvLane, MaskKind, ScoreTransform,
 };
 use poot_target::{Backend, BufferStorage, DeviceCaps};
+use poot_tensor::DType;
 
-/// Whether this family lowers these storage dtypes: its bodies are f32/i32 only, so a 2-byte float or a
-/// packed E4M3FN payload is refused by name.
+/// Whether this family lowers these storage dtypes: its output is f32, so a 2-byte float output or a packed
+/// E4M3FN payload is refused by name. A two-byte key or value is admitted here and given its lane by
+/// [`kv_lane`].
 pub(super) fn admits_dtypes(dtypes: StorageDtypes) -> Result<(), Capability> {
     dtypes.refuse_unwired()
 }
@@ -30,9 +35,10 @@ pub(super) fn admits_dtypes(dtypes: StorageDtypes) -> Result<(), Capability> {
 /// `q[B,Hq,Lq,Dk]`, `k[B,Hkv,Lk,Dk]` (or its split parts), `v[B,Hkv,Lk,Dv]` (or the `[S,Hkv,D]` pools a paged key
 /// reads through its `[B,Lk]` slot map), `mask[B,Hm,Lq,Lk]`: `Lq` and `Lk` are
 /// independent (decode `Lq == 1`, prefill `Lq == Lk`, prefill into a cache `1 < Lq < Lk`), and all are the same
-/// request. A live bound reads the `len [B]` operand at run time; the grid never depends on it. The streaming
-/// schedule runs one workgroup of `lanes` threads per `(b, h, i)`; `lanes` is the widest power of two whose
-/// partials fit the device's workgroup memory, and the equation is refused only when not even one lane's fit.
+/// request. A live bound reads the `len [B]` operand at run time; the grid never depends on it. A multi-row
+/// attention whose rows fill the device takes the tiled schedule ([`attention_tiling`]); otherwise the streaming
+/// schedule runs one workgroup of `lanes` threads per `(b, h, i)`, `lanes` the widest power of two whose partials
+/// fit the device's workgroup memory, and the equation is refused only when not even one lane's fit.
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -59,6 +65,7 @@ pub(super) fn plan(
     let ids = value_ids(eqn);
     let shape = |operand: usize| g.aval(ids[operand]).shape.clone();
     let (q, k, v, mask) = (shape(0), shape(1), shape(2), shape(3));
+    let k_dtype = |operand: usize| g.aval(ids[operand]).dtype;
     let [batch, hq, lq, dk] = q[..] else {
         unreachable!("`infer` types attention over a rank-4 query")
     };
@@ -87,7 +94,14 @@ pub(super) fn plan(
             cap_bits: cap.to_bits(),
         },
     };
+    // The key, the value and (a split key's) shared key part are read through one lane.
+    let mut stored = vec![k_dtype(1), k_dtype(2)];
+    if let KeyLayout::Split { .. } = key {
+        stored.push(k_dtype(4));
+    }
+    let kv = kv_lane(&site, &stored, caps)?;
     let streaming = AttentionSpec {
+        kv,
         batch,
         hq,
         n_rep: *n_rep,
@@ -114,10 +128,19 @@ pub(super) fn plan(
         },
         schedule: AttentionSchedule::Streaming { lanes },
     };
-    // This is the GPU planner: an AIE target never reaches it (`Target::Aie` plans through the AIE schedule).
+    // This is the GPU planner: an AIE target never reaches it (an NPU target plans through its own schedule).
+    // A multi-row attention whose rows can share staged key blocks takes the tiled schedule; a decode row may
+    // split its keys instead.
+    if let Some(schedule) = attention_tiling(&streaming, caps) {
+        let tiled = AttentionSpec {
+            schedule,
+            ..streaming
+        };
+        return row_runs(site, tiled, backend, caps);
+    }
     let splits = attention_splits(&streaming, caps);
     match splits {
-        None => Planned::generated(site, KernelRequest::Attention(streaming), backend, caps),
+        None => row_runs(site, streaming, backend, caps),
         Some(splits) => split_kv(
             site,
             streaming,
@@ -130,8 +153,12 @@ pub(super) fn plan(
 }
 
 /// Plan a block-selected attention: the streaming kernel with its mask derived from the selection operands.
-/// Each row visits `(K + 1) * ratio` candidate positions, so there is no split-KV schedule to choose: the
-/// lanes are the widest the device's workgroup memory takes, as for a dense row.
+/// The `n_rep` query heads of a key/value head read the same selected keys (the ids are per query, not per
+/// head), so where the rows keep the device full a workgroup serves all of them: each key and value row is
+/// loaded once for the group, not once per head ([`selected_attention_schedule`]; the group-centric loading of Native
+/// Sparse Attention, arXiv 2502.11089 section 3.4). The lanes of a group are `n_rep` head lanes times the slices
+/// the device's workgroup memory takes; a decode row, or a device that cannot hold the head lanes, keeps the lanes of
+/// a dense one ([`selected_attention_schedule`]).
 fn plan_selected(
     g: GraphTables<'_>,
     eqn: &Eqn,
@@ -148,7 +175,13 @@ fn plan_selected(
     let layout = attrs
         .layout(&operand_types)
         .map_err(|e| PlanError::BadShape(format!("selected attention: {e}")))?;
-    let lanes = attention_lanes(layout.dv, caps).ok_or_else(|| {
+    let SelectedSchedule { grouped, lanes } = selected_attention_schedule(
+        layout.batch * layout.hq * layout.lq,
+        attrs.n_rep,
+        layout.dv,
+        caps,
+    )
+    .ok_or_else(|| {
         site.refuse(Capability::AttentionLds {
             dv: layout.dv,
             lds_bytes: caps.lds_bytes,
@@ -163,7 +196,13 @@ fn plan_selected(
             cap_bits: cap.to_bits(),
         },
     };
+    let kv = kv_lane(
+        &site,
+        &[operand_types[1].dtype, operand_types[2].dtype],
+        caps,
+    )?;
     let spec = AttentionSpec {
+        kv,
         batch: layout.batch,
         hq: layout.hq,
         n_rep: attrs.n_rep,
@@ -176,6 +215,7 @@ fn plan_selected(
         mask: MaskKind::Blocks {
             ratio: attrs.ratio,
             k: attrs.k,
+            grouped,
         },
         bound: KeyBound::Static,
         sink: AttentionSink::Absent,
@@ -184,7 +224,7 @@ fn plan_selected(
     // A decode row considers `(K + 1) * ratio` positions however deep the cache is, but a few heads still leave a
     // many-CU device idle: the same split-KV rule divides the candidates.
     match attention_splits(&spec, caps) {
-        None => Planned::generated(site, KernelRequest::Attention(spec), backend, caps),
+        None => row_runs(site, spec, backend, caps),
         Some(splits) => split_kv(
             site,
             spec,
@@ -194,6 +234,53 @@ fn plan_selected(
             caps,
         ),
     }
+}
+
+/// The lane the kernel reads the key and value operands (`dtypes`, the shared key part's too) through: f32,
+/// or a two-byte float widened on load (a narrow KV cache, POOT-1395). The operands must share one dtype. An
+/// F16 lane is native on every GPU; a BF16 lane needs the device's native two-byte lanes, so a BF16 cache on
+/// SPIR-V (no bf16 type) is refused by name.
+fn kv_lane(site: &Site<'_>, dtypes: &[DType], caps: &DeviceCaps) -> Result<KvLane, PlanError> {
+    let Some((&first, rest)) = dtypes.split_first() else {
+        unreachable!("an attention reads a key and a value")
+    };
+    if rest.iter().any(|&dtype| dtype != first) {
+        return Err(site.refuse(Capability::DtypeLowering));
+    }
+    match (first, caps.native_two_byte_floats) {
+        (DType::F32, _) => Ok(KvLane::F32),
+        (DType::F16, _) => Ok(KvLane::F16),
+        (DType::BF16, true) => Ok(KvLane::Bf16),
+        _ => Err(site.refuse(Capability::DtypeLowering)),
+    }
+}
+
+/// A streaming or tiled attention as one dispatch, or, where its whole grid would run past the device's display
+/// watchdog ([`attention_rows_per_dispatch`]), as dispatches over disjoint runs of its row groups: one body, each
+/// writing its own rows of the output.
+fn row_runs(
+    site: Site<'_>,
+    spec: AttentionSpec,
+    backend: Backend,
+    caps: &DeviceCaps,
+) -> Result<Planned, PlanError> {
+    let Some(per_dispatch) = attention_rows_per_dispatch(&spec, caps) else {
+        return Planned::generated(site, KernelRequest::Attention(spec), backend, caps);
+    };
+    let groups = spec.row_groups();
+    let runs = (0..groups.div_ceil(per_dispatch))
+        .map(|run| {
+            let first = run * per_dispatch;
+            let count = per_dispatch.min(groups - first);
+            let request = KernelRequest::AttentionRows(AttentionRows {
+                spec: spec.clone(),
+                first,
+                count,
+            });
+            Planned::generated_dispatch(site, request, backend, caps)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Planned::split(runs)
 }
 
 /// The lanes and key chunks of a split-KV attention.

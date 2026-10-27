@@ -144,7 +144,6 @@ mod tests {
         };
         for (target, scope) in [
             (Target::SpirvVulkan, "workgroup"),
-            (Target::SpirvOpenCl, "workgroup"),
             (Target::Nvptx, "block"),
             (Target::AmdGcn(poot_target::AmdArch::gfx1151()), "workgroup"),
         ] {
@@ -231,7 +230,7 @@ mod tests {
                 String::from_utf8_lossy(&v.stderr)
             );
         } else {
-            eprintln!("spirv-val not on PATH; skipping the validity check");
+            poot_test_util::skip_report("poot-kernelgen", &"spirv-val not on PATH");
         }
     }
 

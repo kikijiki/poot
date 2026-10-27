@@ -30,6 +30,13 @@ pub enum PlanError {
         /// What about the dtype the executor entry point cannot carry.
         gap: StorageGap,
     },
+    /// The target is an NPU and the compile was given no lowering for it: the NPU crate's
+    /// [`NpuLowering`](crate::NpuLowering) is an explicit argument of [`CompileOptions`](crate::CompileOptions).
+    #[error("{target:?} is an NPU target and the compile was given no NPU lowering")]
+    NpuLoweringMissing {
+        /// The NPU the program was to be compiled for.
+        target: poot_target::TargetId,
+    },
     /// The op is valid but a static shape it depends on violates its precondition (e.g. an `ArgTopK`
     /// whose rank operand is 0-D). A caller-triggerable shape mismatch is a typed error, not a panic.
     #[error("bad shape for planning: {0}")]
@@ -68,7 +75,7 @@ pub enum PlanError {
         /// Why the value is not a canonical device witness.
         reason: DeviceWitnessRejection,
     },
-    /// `state_commit_from_plans` donated `state_input`, but a native transaction's rollback journal needs
+    /// `state_commit_from_aliases` donated `state_input`, but a native transaction's rollback journal needs
     /// the exact bytes the donation overwrote, known without inspecting device data. Only
     /// `DynamicUpdateSlice` provides that; `op` names the producing equation that does not. There is no
     /// whole-buffer snapshot fallback.
@@ -187,6 +194,15 @@ impl Dispatch {
     /// The launch geometry and metadata.
     pub fn launch(&self) -> &Launch {
         &self.launch
+    }
+
+    /// The threads the launch's grid holds.
+    fn threads(&self) -> u128 {
+        self.launch
+            .grid
+            .iter()
+            .map(|&extent| u128::from(extent))
+            .product()
     }
 
     /// The planner's launch shaping: bump the workgroup's x extent. Params are unchanged.
@@ -557,22 +573,20 @@ impl DispatchPlan {
     /// to the threads each dispatch launches, so a chunked plan's last, smaller chunk weighs less than a full
     /// one. A plan whose dispatches launch no threads splits `total` evenly.
     pub(crate) fn apportion_work(&mut self, total: u64) {
-        let threads = |dispatch: &Dispatch| {
-            dispatch
-                .launch
-                .grid
-                .iter()
-                .map(|&extent| u128::from(extent))
-                .product::<u128>()
-        };
-        let launched: u128 = self.dispatches.iter().map(threads).sum();
+        let launched: u128 = self.dispatches.iter().map(Dispatch::threads).sum();
         let count = self.dispatches.len() as u128;
         for dispatch in &mut self.dispatches {
-            let share = (u128::from(total) * threads(dispatch))
+            let share = (u128::from(total) * dispatch.threads())
                 .checked_div(launched)
                 .unwrap_or(u128::from(total) / count);
             dispatch.work = Some(u64::try_from(share).expect("a share of a u64 total fits a u64"));
         }
+    }
+
+    /// The threads every dispatch of the plan launches, summed (saturating at `u64::MAX`).
+    pub(crate) fn launched_threads(&self) -> u64 {
+        let launched: u128 = self.dispatches.iter().map(Dispatch::threads).sum();
+        u64::try_from(launched).unwrap_or(u64::MAX)
     }
 
     pub(crate) fn single_mut(&mut self) -> Option<&mut Dispatch> {
@@ -671,6 +685,15 @@ impl Plan {
         match self {
             Plan::Dispatches(dispatches) => dispatches,
             _ => &[],
+        }
+    }
+
+    /// The value whose buffer this plan's output shares (an alias or a strided view); `None` when the plan
+    /// materializes its output.
+    pub(crate) fn aliased_source(&self) -> Option<ValueId> {
+        match self {
+            Plan::Alias(source) | Plan::View { src: source, .. } => Some(*source),
+            Plan::Dispatches(_) | Plan::Graph => None,
         }
     }
 

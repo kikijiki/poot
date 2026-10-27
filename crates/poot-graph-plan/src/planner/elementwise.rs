@@ -1,20 +1,20 @@
 //! Elementwise, reduction, fused-region and fused-RoPE equation planning.
 
 use super::{
-    BinOp, BodyLimits, Capability, ContractionHead, DType, ElementwiseSpec, Eqn, GBinOp, GUnOp,
-    HashMap, I32Binary, KernelRequest, Lowering, OpKind, Operand, PlanError, Planned,
-    PointwiseForm, PointwiseSpec, RedOp, RopeSpec, RowSpec, RowStep, Scalar, Ty, UnOp, UnaryOp,
-    ValueBinary, ValueId, ViewOperand, fty_ty, kg, value_ids,
+    BinOp, BodyLimits, Capability, ContractionHead, DType, Eqn, GBinOp, GUnOp, HashMap,
+    KernelRequest, Lowering, OpKind, Operand, PlanError, Planned, PointwiseForm, PointwiseSpec,
+    RedOp, RopeSpec, RowSpec, RowStep, Scalar, ValueId, ViewOperand, fty_ty, kg, value_ids,
 };
 use crate::kernel_mapping::{
-    check_widening_step, float_region_leaf_storage, map_binop, map_fused_input,
-    map_fused_input_i32, map_fused_local, map_fused_op, map_mixed_input_i32, map_pointwise_step,
+    check_widening_step, float_region_leaf_storage, map_fused_input, map_fused_input_i32,
+    map_fused_local, map_fused_op, map_fused_op_i32, map_mixed_input_i32, map_pointwise_step,
     map_row_value, map_unary,
 };
 use crate::planner::{GraphTables, Layout, StorageDtypes};
 use crate::predicates::{ELEMENTWISE_2D_WIDTH, elementwise_fold, row_parallel_width};
 use crate::refusal::Site;
 use poot_graph_ir::LocalId;
+use poot_graph_ir::op::FusedOp;
 
 /// Whether this family lowers `op` over these storage dtypes. A packed E4M3FN payload is never an
 /// elementwise operand; a 2-byte float output is wired for the pointwise and reduce bodies but not for the
@@ -28,6 +28,18 @@ pub(super) fn admits_dtypes(op: &OpKind, dtypes: StorageDtypes) -> Result<(), Ca
             Err(Capability::DtypeLowering)
         }
         _ => Ok(()),
+    }
+}
+
+/// The element type a one-step pointwise kernel reads its leaves as: the equation's own dtype (an exact-I32
+/// word, an F32, or a two-byte float computed in F32 and rounded back). Any other dtype has no lowering.
+fn leaf_ty_of(site: Site<'_>, dtype: DType) -> Result<kg::LeafTy, PlanError> {
+    match dtype {
+        DType::F32 => Ok(kg::LeafTy::F32),
+        DType::I32 => Ok(kg::LeafTy::I32),
+        DType::BF16 => Ok(kg::LeafTy::BF16),
+        DType::F16 => Ok(kg::LeafTy::F16),
+        _ => Err(site.refuse(Capability::DtypeLowering)),
     }
 }
 
@@ -105,74 +117,42 @@ pub(super) fn plan(
             {
                 return Err(site.refuse(Capability::ExactI32Op));
             }
-            let kb = (!matches!(*bop, GBinOp::GeU | GBinOp::RemU)).then(|| map_binop(*bop));
-            match &eqn.inputs[1] {
+            // The equation is one pointwise step: `op` over the first operand and the second, which is another
+            // leaf (broadcast into the output, each read through its layout) or an inline literal (card 181 Bug 2:
+            // the scalar form, e.g. the attention-score `* scale`, folds onto the same 2-D grid).
+            let op = if exact_i32 {
+                map_fused_op_i32(site, FusedOp::Binary(*bop))?
+            } else {
+                map_fused_op(site, FusedOp::Binary(*bop))?
+            };
+            let leaf_ty = leaf_ty_of(site, odt)?;
+            let (second, leaf_count) = match &eqn.inputs[1] {
                 Operand::Lit(Scalar::F32(_)) if exact_i32 => {
                     return Err(site.refuse(Capability::DtypeLowering));
                 }
-                // card 181 Bug 2: the scalar/literal form (e.g. the attention-score `* scale`) gets the
-                // same 2-D fold as the broadcast-value form below.
-                Operand::Lit(Scalar::F32(v)) => {
-                    generate(KernelRequest::Elementwise(ElementwiseSpec::ScalarFloat {
-                        op: kb.expect("float GeU/RemU is rejected by graph inference"),
-                        dt: fty(odt),
-                        lit_bits: v.to_bits(),
-                        fold,
-                    }))?
-                }
-                Operand::Lit(Scalar::I32(v)) if exact_i32 => {
-                    generate(KernelRequest::Elementwise(ElementwiseSpec::ScalarI32 {
-                        op: match bop {
-                            GBinOp::GeU => I32Binary::GeU,
-                            GBinOp::RemU => I32Binary::RemU,
-                            _ => I32Binary::Basic(
-                                kb.expect("non-unsigned I32 op has a direct kernel op"),
-                            ),
-                        },
-                        lit: *v,
-                        fold,
-                    }))?
-                }
-                Operand::Lit(Scalar::I32(v)) => {
-                    generate(KernelRequest::Elementwise(ElementwiseSpec::ScalarFloat {
-                        op: kb.expect("float GeU/RemU is rejected by graph inference"),
-                        dt: fty(odt),
-                        lit_bits: (*v as f32).to_bits(),
-                        fold,
-                    }))?
-                }
-                Operand::Value(_) => {
-                    // Layout safety (spec 132): a's/b's strides and offset are baked into the generated
-                    // body, so they are part of the request: two equations with the same shapes but a
-                    // different source layout (one a plain buffer, one a view) are different kernels.
-                    let mut operands = leaves(&ids[..2]).into_iter();
-                    let (a, b) = (operands.next().unwrap(), operands.next().unwrap());
-                    let op = match bop {
-                        GBinOp::GeU => {
-                            debug_assert!(
-                                exact_i32,
-                                "float GeU/RemU is rejected by graph inference"
-                            );
-                            ValueBinary::GeU
-                        }
-                        GBinOp::RemU => {
-                            debug_assert!(exact_i32, "float RemU is rejected by graph inference");
-                            ValueBinary::RemU
-                        }
-                        _ => ValueBinary::Basic(
-                            kb.expect("unsigned I32 binary has a typed kernel path"),
-                            if exact_i32 { Ty::I32 } else { fty(odt) },
-                        ),
-                    };
-                    generate(KernelRequest::Elementwise(ElementwiseSpec::Binary {
-                        op,
-                        out_shape: out_shape.to_vec(),
-                        a,
-                        b,
-                        fold,
-                    }))?
-                }
-            }
+                Operand::Lit(Scalar::F32(v)) => (kg::FusedInput::Lit(*v), 1),
+                Operand::Lit(Scalar::I32(v)) if exact_i32 => (kg::FusedInput::LitI32(*v), 1),
+                Operand::Lit(Scalar::I32(v)) => (kg::FusedInput::Lit(*v as f32), 1),
+                Operand::Value(_) => (kg::FusedInput::Leaf(kg::LeafId::new(1)), 2),
+            };
+            // Layout safety (spec 132): each operand's strides and offset are baked into the generated body,
+            // so they are part of the request: two equations with the same shapes but a different source
+            // layout (one a plain buffer, one a view) are different kernels.
+            generate(KernelRequest::Pointwise(PointwiseSpec {
+                out_shape: out_shape.to_vec(),
+                numel: out_numel,
+                leaves: leaves(&ids[..leaf_count]),
+                kernel: kg::FusedKernel::one_step(
+                    op,
+                    vec![leaf_ty; leaf_count],
+                    vec![kg::FusedInput::Leaf(kg::LeafId::new(0)), second],
+                ),
+                form: if exact_i32 {
+                    PointwiseForm::ExactI32 { fold }
+                } else {
+                    PointwiseForm::Float { fold }
+                },
+            }))?
         }
         OpKind::Select => {
             // The condition leaf is an I32 word; the branches are I32 (exact-I32 form), F32 or a two-byte
@@ -247,14 +227,9 @@ pub(super) fn plan(
             }))?
         }
         OpKind::Unary(uop) => {
-            let view = views.get(&ids[0]).map(|layout| ViewOperand {
-                shape: out_shape.to_vec(),
-                layout: layout.clone(),
-            });
-            let (op, dt) = if odt == DType::I32 {
+            let op = if odt == DType::I32 {
                 match uop {
-                    GUnOp::Not => (UnaryOp::Basic(UnOp::Not), Ty::I32),
-                    GUnOp::Clz => (UnaryOp::ClzI32, Ty::I32),
+                    GUnOp::Not | GUnOp::Clz => map_fused_op_i32(site, FusedOp::Unary(*uop))?,
                     GUnOp::Neg
                     | GUnOp::Recip
                     | GUnOp::Sqrt
@@ -266,13 +241,23 @@ pub(super) fn plan(
                     }
                 }
             } else {
-                (map_unary(site, *uop)?, fty(odt))
+                map_unary(site, *uop)?
             };
-            generate(KernelRequest::Elementwise(ElementwiseSpec::Unary {
-                op,
-                dt,
-                view,
-                fold,
+            // A unary op never broadcasts: its operand has the output's shape, read through its layout.
+            generate(KernelRequest::Pointwise(PointwiseSpec {
+                out_shape: out_shape.to_vec(),
+                numel: out_numel,
+                leaves: leaves(&ids[..1]),
+                kernel: kg::FusedKernel::one_step(
+                    op,
+                    vec![leaf_ty_of(site, odt)?],
+                    vec![kg::FusedInput::Leaf(kg::LeafId::new(0))],
+                ),
+                form: if odt == DType::I32 {
+                    PointwiseForm::ExactI32 { fold }
+                } else {
+                    PointwiseForm::Float { fold }
+                },
             }))?
         }
         OpKind::Rope { rot } => {

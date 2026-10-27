@@ -193,6 +193,8 @@ mod tests {
             },
             &HashMap::new(),
             &crate::test_support::roomy_body_limits(),
+            None,
+            crate::planner::OutputBuffer::Fresh,
         )
         .unwrap_or_else(|e| panic!("{backend:?}: {e}"))
     }
@@ -311,6 +313,8 @@ mod tests {
                     &Target::Gpu { backend, caps },
                     &HashMap::new(),
                     &crate::test_support::roomy_body_limits(),
+                    None,
+                    crate::planner::OutputBuffer::Fresh,
                 )
             };
             plan_vocab(1 << 24).unwrap_or_else(|e| panic!("{backend:?}: 2^24 plans: {e}"));
@@ -355,6 +359,8 @@ mod tests {
                 &Target::Gpu { backend, caps },
                 &HashMap::new(),
                 &crate::test_support::roomy_body_limits(),
+                None,
+                crate::planner::OutputBuffer::Fresh,
             )
         };
         let refused = |result: Result<Planned, crate::PlanError>| match result {

@@ -450,15 +450,33 @@ fn experts_of(
     let k = p.top_k();
     let rows = tokens * k;
 
-    let ids = b.reshape(routes.ids, vec![rows])?;
+    let routed_ids = b.reshape(routes.ids, vec![rows])?;
     // Row `t * k + r` is token `t` at its slot `r`.
-    let x_rows = b.reshape(
+    let token_rows = b.reshape(
         b.broadcast(
             b.reshape(x, vec![tokens, 1, width])?,
             vec![tokens, k, width],
         )?,
         vec![rows, width],
     )?;
+    // A prefill step sorts the rows by expert, so a tile of the indexed contraction holds the rows of one or two
+    // experts instead of a dozen and shares each expert's weight tile; a single token is a Gemv that reads each
+    // row's expert directly and gains nothing. The sort is a row permutation: every row is contracted exactly as
+    // before, and `dest` puts the results back in row order.
+    let (x_rows, ids, dest) = if tokens > 1 {
+        let group = b.expert_group(routed_ids, p.experts())?;
+        let row_of = |i| -> Result<Traced, TraceError> {
+            Ok(b.reshape(b.slice(group, 0, i, i + 1)?, vec![rows])?)
+        };
+        let (order, dest) = (row_of(0)?, row_of(1)?);
+        (
+            b.gather(token_rows, 0, order)?,
+            b.gather(routed_ids, 0, order)?,
+            Some(dest),
+        )
+    } else {
+        (token_rows, routed_ids, None)
+    };
 
     let (gate, up) = match &w.gate_up {
         GateUp::Split { gate, up } => (gate.project(b, x_rows, ids)?, up.project(b, x_rows, ids)?),
@@ -484,6 +502,10 @@ fn experts_of(
     };
     let hidden = glu(b, gate, up, &p.glu)?;
     let out = w.down.project(b, hidden, ids)?;
+    let out = match dest {
+        Some(dest) => b.gather(out, 0, dest)?,
+        None => out,
+    };
 
     // Weight each row, then sum each token's `k` rows (the executors reduce the last axis only).
     let weighted = b.binary(BinOp::Mul, out, b.reshape(routes.weights, vec![rows, 1])?)?;
@@ -612,6 +634,61 @@ mod tests {
             &[],
         )
         .0
+    }
+
+    /// The block's graph for `tokens` tokens.
+    fn traced(fx: &Fx, tokens: usize) -> poot_graph_ir::Graph {
+        let p = params();
+        let map = fx.map();
+        let w = MoeWeights::new(&map, 0, &p).unwrap();
+        let b = Builder::for_tests();
+        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All)).unwrap();
+        let xs = b
+            .constant("x", TensorType::f32(vec![1, tokens, WIDTH]))
+            .unwrap();
+        let y = moe(&b, &step, 0, xs, None, &w, &p).unwrap();
+        b.finish(y).unwrap()
+    }
+
+    /// A prefill step groups the routed rows by expert once and every indexed contraction reads the grouped ids; a
+    /// single token (the Gemv) does not group.
+    ///
+    /// Mutation (observed red): group only when `tokens > 100` in `experts_of`; the prefill row finds 0 groupings
+    /// where it expects 1 (`one grouping per layer, shared by every projection`).
+    #[test]
+    fn a_prefill_step_groups_the_rows_by_expert_and_a_decode_step_does_not() {
+        use poot_graph_ir::graph::Operand;
+        use poot_graph_ir::op::OpKind;
+        let fx = fixture(Storage::Stack3);
+        let count = |g: &poot_graph_ir::Graph| {
+            g.eqns()
+                .iter()
+                .filter(|e| matches!(e.op, OpKind::ExpertGroup { .. }))
+                .count()
+        };
+        assert_eq!(count(&traced(&fx, 1)), 0, "a decode step");
+        let g = traced(&fx, TOKENS);
+        assert_eq!(
+            count(&g),
+            1,
+            "one grouping per layer, shared by every projection"
+        );
+        let grouped_ids = g
+            .eqns()
+            .iter()
+            .filter(|e| matches!(e.op, OpKind::IndexedMatMul))
+            .map(|e| match e.inputs[2] {
+                Operand::Value(id) => g.eqns().iter().find(|p| p.out == id).map(|p| p.op.clone()),
+                Operand::Lit(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(grouped_ids.len(), 3, "gate, up and down");
+        assert!(
+            grouped_ids
+                .iter()
+                .all(|producer| matches!(producer, Some(OpKind::Gather { axis: 0 }))),
+            "every indexed contraction reads ids gathered into expert order: {grouped_ids:?}"
+        );
     }
 
     /// The block in f64: each token to its `TOP_K` best experts, each expert `down(silu(gate x) *

@@ -646,7 +646,7 @@ mod tests {
     /// `".ssm_beta"` stem table to `architectures/qwen3next.rs`; this test names the file and needle.
     #[test]
     fn no_architecture_keeps_its_own_gdn_names_reorder_or_nextn_rule() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/architectures");
+        let root = poot_test_util::manifest_dir().join("src/architectures");
         let needles = [
             "\".linear_attn.",
             "\".attn_qkv\"",

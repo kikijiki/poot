@@ -9,14 +9,16 @@
 //! forced to `0` when the row has a non-finite logit or no finite candidate, so the output is fully
 //! determined even though the driver never commits it (R482-005).
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::{group_index, local_index, wg_read, wg_write, workgroup_barrier};
+use poot_kernel_attr::kernel;
+use poot_kernel_intrinsics::{group_index_x, local_index_x, wg_read, wg_write, workgroup_barrier};
 const W: usize = 64;
 
-pub fn __poot_kernel_argmax_combine(partials: &[f32], dims: &[u32], out: &mut [i32]) {
+#[kernel(workgroup(64), lds(f32, 64), lds(f32, 64), lds(f32, 64))]
+pub fn argmax_combine(partials: &[f32], dims: &[u32], out: &mut [i32]) {
     let groups = dims[0] as usize;
     let vocab = dims[1] as usize;
-    let b = group_index();
-    let lane = local_index();
+    let b = group_index_x();
+    let lane = local_index_x();
 
     let mut best_val = 0.0f32;
     let mut best_idx = -1.0f32;
@@ -36,9 +38,9 @@ pub fn __poot_kernel_argmax_combine(partials: &[f32], dims: &[u32], out: &mut [i
         }
         g = g + W;
     }
-    wg_write(0, lane, best_val);
-    wg_write(1, lane, best_idx);
-    wg_write(2, lane, bad_idx);
+    wg_write::<f32>(0, lane, best_val);
+    wg_write::<f32>(1, lane, best_idx);
+    wg_write::<f32>(2, lane, bad_idx);
     workgroup_barrier();
     if lane == 0 {
         let mut bv = 0.0f32;
@@ -46,13 +48,13 @@ pub fn __poot_kernel_argmax_combine(partials: &[f32], dims: &[u32], out: &mut [i
         let mut nb = vocab as f32;
         let mut k = 0usize;
         while k < W {
-            let cv = wg_read(0, k);
-            let ci = wg_read(1, k);
+            let cv = wg_read::<f32>(0, k);
+            let ci = wg_read::<f32>(1, k);
             if ci >= 0.0 && (bi < 0.0 || cv > bv || (cv == bv && ci < bi)) {
                 bv = cv;
                 bi = ci;
             }
-            let cb = wg_read(2, k);
+            let cb = wg_read::<f32>(2, k);
             if cb < nb {
                 nb = cb;
             }

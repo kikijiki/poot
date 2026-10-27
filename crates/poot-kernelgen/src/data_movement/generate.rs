@@ -1,6 +1,7 @@
 //! The one data-movement generator: one thread owns one output buffer unit (an element, or a `u32` word of
 //! packed lanes), computes the logical input element each of its lanes copies, and stores the unit. The
-//! storage decides how a lane is read and written; the op decides which element a lane copies.
+//! storage decides how a lane is read and written; the op decides which element a lane copies. An in-place
+//! write (a row scatter, a donated update's window) owns only the units it writes.
 
 use poot_kernel_ir::{BinOp, Body, Local, LocalDecl, Operand, Place, Rvalue, Ty};
 
@@ -51,6 +52,15 @@ pub fn movement_body(
             data_shapes.push(update_shape.clone());
             reads_index = matches!(index, UpdateIndex::Runtime);
         }
+        // The output buffer already holds the operand: the kernel reads only the update (and its index).
+        MovementOp::WriteSlice {
+            update_shape,
+            index,
+            ..
+        } => {
+            data_shapes.push(update_shape.clone());
+            reads_index = matches!(index, UpdateIndex::Runtime);
+        }
         // The rows are written in place into the output buffer, which already holds the base: the
         // kernel reads the source rows and the slot map, never the base.
         MovementOp::ScatterRows { src_shape, .. } => {
@@ -58,9 +68,19 @@ pub fn movement_body(
             reads_index = true;
         }
     }
+    // The input an update or a row scatter writes from: its element type is `written` when the write converts.
+    let written_input = match &spec.op {
+        MovementOp::UpdateSlice { .. } => Some(1),
+        MovementOp::WriteSlice { .. } | MovementOp::ScatterRows { .. } => Some(0),
+        _ => None,
+    };
     let mut inputs = Vec::new();
-    for shape in data_shapes {
-        params.push(slice(&unit_ty, false));
+    for (position, shape) in data_shapes.into_iter().enumerate() {
+        let ty = match &spec.written {
+            Some(written) if written_input == Some(position) => written,
+            _ => &unit_ty,
+        };
+        params.push(slice(ty, false));
         inputs.push(Buf {
             param: local(params.len() as u32 - 1),
             shape,
@@ -115,12 +135,33 @@ pub fn movement_body(
                     );
                     let first = cfg.bin(Ty::Usize, BinOp::Mul, copy(slot), cu(per_slot));
                     let destination = cfg.bin(Ty::Usize, BinOp::Add, copy(first), copy(column));
-                    let value = cfg.let_(
-                        storage.unit_ty(),
-                        Rvalue::Use(Operand::Copy(elem(inputs[0].param, unit))),
-                    );
+                    let value = read_written(cfg, spec, inputs[0].param, unit);
                     cfg.assign(elem(out.param, destination), Rvalue::Use(copy(value)));
                 });
+            });
+        }
+        MovementOp::WriteSlice {
+            update_shape,
+            axis,
+            index: update_index,
+        } => {
+            let window = Window {
+                spec,
+                storage,
+                out: &out,
+                update: &inputs[0],
+                axis: *axis,
+            };
+            let in_bounds = cfg.bin(Ty::Bool, BinOp::Lt, copy(thread), cu(spec.threads()));
+            cfg.if_then(in_bounds, |cfg| {
+                let start = update_start(cfg, update_index, index);
+                if spec.updates_inside_words(*axis) {
+                    let extent = update_shape[*axis];
+                    let span = spec.row_window_words(extent);
+                    window.write_row_word(cfg, thread, start, extent, span);
+                } else {
+                    window.write_unit(cfg, thread, start);
+                }
             });
         }
         _ => {
@@ -309,14 +350,7 @@ impl Source<'_> {
                 let extent = update_shape[*axis];
                 let kept = read_lane(cfg, storage, &self.inputs[0], flat);
                 let value = cfg.var(storage.unit_ty(), Rvalue::Use(copy(kept)));
-                let start = match update_index {
-                    UpdateIndex::Static(start) => cfg.usize_const(*start),
-                    UpdateIndex::Runtime => {
-                        let index = self.index.expect("a runtime update reads an index");
-                        let first = cfg.usize_const(0);
-                        read_index(cfg, index, first)
-                    }
-                };
+                let start = update_start(cfg, update_index, self.index);
                 let end = cfg.bin(Ty::Usize, BinOp::Add, copy(start), cu(extent));
                 let at_least = cfg.bin(Ty::Bool, BinOp::Ge, copy(a), copy(start));
                 let below = cfg.bin(Ty::Bool, BinOp::Lt, copy(a), copy(end));
@@ -324,15 +358,150 @@ impl Source<'_> {
                 cfg.if_then(inside, |cfg| {
                     let within = cfg.bin(Ty::Usize, BinOp::Sub, copy(a), copy(start));
                     let src = axis_split.source(cfg, outer, within, inner_i, extent);
-                    let written = read_lane(cfg, storage, &self.inputs[1], src);
+                    let written = match self.spec.written {
+                        Some(_) => read_written(cfg, self.spec, self.inputs[1].param, src),
+                        None => read_lane(cfg, storage, &self.inputs[1], src),
+                    };
                     cfg.assign(Place::local(value), Rvalue::Use(copy(written)));
                 });
                 value
             }
-            MovementOp::ScatterRows { .. } => {
-                unreachable!("a row scatter writes by source unit, not by output lane")
+            MovementOp::ScatterRows { .. } | MovementOp::WriteSlice { .. } => {
+                unreachable!(
+                    "an in-place write is planned by the units it writes, not by output lane"
+                )
             }
         }
+    }
+}
+
+/// Unit `unit` of the buffer `written` an update or a row scatter writes from, as the output's carrier: the
+/// value itself, or (when `spec.written` names the buffer's element type) that value converted, the narrowing
+/// store of f32 values into a two-byte buffer.
+fn read_written(cfg: &mut Cfg, spec: &MovementSpec, written: Local, unit: Local) -> Local {
+    let carrier = spec.storage.unit_ty();
+    let Some(source) = &spec.written else {
+        return cfg.let_(carrier, Rvalue::Use(Operand::Copy(elem(written, unit))));
+    };
+    let value = cfg.let_(
+        source.clone(),
+        Rvalue::Use(Operand::Copy(elem(written, unit))),
+    );
+    cfg.let_(
+        carrier.clone(),
+        Rvalue::Cast {
+            to: carrier,
+            operand: copy(value),
+        },
+    )
+}
+
+/// Where an update starts on its axis: the baked position, or the first element of the `I32` index buffer.
+fn update_start(cfg: &mut Cfg, update_index: &UpdateIndex, index: Option<Local>) -> Local {
+    match update_index {
+        UpdateIndex::Static(start) => cfg.usize_const(*start),
+        UpdateIndex::Runtime => {
+            let index = index.expect("a runtime update reads an index");
+            let first = cfg.usize_const(0);
+            read_index(cfg, index, first)
+        }
+    }
+}
+
+/// An in-place update's window of the output buffer, which already holds the operand: the update is
+/// copied into it and nothing else of the output is read or written.
+struct Window<'a> {
+    spec: &'a MovementSpec,
+    storage: &'a Storage,
+    out: &'a Buf,
+    update: &'a Buf,
+    axis: usize,
+}
+
+impl Window<'_> {
+    /// The buffer-unit shape of a tensor of logical `shape`: the shape itself, with the last axis counted in
+    /// words for packed lanes.
+    fn unit_shape(&self, shape: &[usize]) -> Vec<usize> {
+        let mut units = shape.to_vec();
+        if let Some(row_len) = units.last_mut() {
+            *row_len = row_len.div_ceil(self.storage.lanes());
+        }
+        units
+    }
+
+    /// Copy update unit `unit` to its place in the output, `start` positions along the axis. Off the row axis
+    /// of packed lanes the update's units are whole output units: the copy moves a unit's bits unchanged.
+    fn write_unit(&self, cfg: &mut Cfg, unit: Local, start: Local) {
+        let update_units = self.unit_shape(&self.update.shape);
+        let out_extent = self.out.shape[self.axis];
+        let split = AxisSplit::of(&update_units, self.axis);
+        let (outer, within, inner_i) = split.coords(cfg, unit);
+        let at = cfg.bin(Ty::Usize, BinOp::Add, copy(within), copy(start));
+        let inside = cfg.bin(Ty::Bool, BinOp::Lt, copy(at), cu(out_extent));
+        cfg.if_then(inside, |cfg| {
+            let destination = split.source(cfg, outer, at, inner_i, out_extent);
+            let value = read_written(cfg, self.spec, self.update.param, unit);
+            cfg.assign(elem(self.out.param, destination), Rvalue::Use(copy(value)));
+        });
+    }
+
+    /// Write word `thread` of the window of `extent` lanes along the row axis of packed lanes: thread
+    /// `row * span + j` owns word `start / lanes + j` of output row `row`. The window can start and end
+    /// inside a word, so the word keeps the lanes the output already holds outside it. One thread owns each
+    /// word, so no two write one.
+    fn write_row_word(
+        &self,
+        cfg: &mut Cfg,
+        thread: Local,
+        start: Local,
+        extent: usize,
+        span: usize,
+    ) {
+        let Storage::PackedRows { lane_bits } = *self.storage else {
+            unreachable!("only packed lanes share a word along the row axis")
+        };
+        let lanes = self.storage.lanes();
+        let (_, row_len) = rows_of(&self.out.shape);
+        let words_per_row = row_len.div_ceil(lanes);
+        let row = cfg.bin(Ty::Usize, BinOp::Div, copy(thread), cu(span));
+        let j = cfg.bin(Ty::Usize, BinOp::Rem, copy(thread), cu(span));
+        let first = cfg.bin(Ty::Usize, BinOp::Div, copy(start), cu(lanes));
+        let word_col = cfg.bin(Ty::Usize, BinOp::Add, copy(first), copy(j));
+        let end = cfg.bin(Ty::Usize, BinOp::Add, copy(start), cu(extent));
+        let first_lane = cfg.bin(Ty::Usize, BinOp::Mul, copy(word_col), cu(lanes));
+        let in_row = cfg.bin(Ty::Bool, BinOp::Lt, copy(word_col), cu(words_per_row));
+        let before_end = cfg.bin(Ty::Bool, BinOp::Lt, copy(first_lane), copy(end));
+        let overlaps = cfg.both(in_row, before_end);
+        cfg.if_then(overlaps, |cfg| {
+            let row_base = cfg.bin(Ty::Usize, BinOp::Mul, copy(row), cu(words_per_row));
+            let word_index = cfg.bin(Ty::Usize, BinOp::Add, copy(row_base), copy(word_col));
+            let held = cfg.let_(
+                Ty::U32,
+                Rvalue::Use(Operand::Copy(elem(self.out.param, word_index))),
+            );
+            let word = cfg.var(Ty::U32, Rvalue::Use(copy(held)));
+            let update_row = cfg.bin(Ty::Usize, BinOp::Mul, copy(row), cu(extent));
+            for lane in 0..lanes {
+                let col = cfg.bin(Ty::Usize, BinOp::Add, copy(first_lane), cu(lane));
+                let at_least = cfg.bin(Ty::Bool, BinOp::Ge, copy(col), copy(start));
+                let below_end = cfg.bin(Ty::Bool, BinOp::Lt, copy(col), copy(end));
+                let in_window = cfg.both(at_least, below_end);
+                let in_row = cfg.bin(Ty::Bool, BinOp::Lt, copy(col), cu(row_len));
+                let writes = cfg.both(in_window, in_row);
+                cfg.if_then(writes, |cfg| {
+                    let within = cfg.bin(Ty::Usize, BinOp::Sub, copy(col), copy(start));
+                    let flat = cfg.bin(Ty::Usize, BinOp::Add, copy(update_row), copy(within));
+                    let value = read_lane(cfg, self.storage, self.update, flat);
+                    let shift = lane as u32 * lane_bits;
+                    let mask = ((1u32 << lane_bits) - 1) << shift;
+                    let kept = cfg.bin(Ty::U32, BinOp::BitAnd, copy(word), c32(!mask));
+                    let moved = cfg.bin(Ty::U32, BinOp::Shl, copy(value), c32(shift));
+                    let combined = cfg.bin(Ty::U32, BinOp::BitOr, copy(kept), copy(moved));
+                    cfg.assign(Place::local(word), Rvalue::Use(copy(combined)));
+                });
+            }
+            cfg.assign(elem(self.out.param, word_index), Rvalue::Use(copy(word)));
+        });
     }
 }
 

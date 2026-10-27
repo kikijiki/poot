@@ -105,7 +105,10 @@ impl TensorJob {
                 have: files[self.file].len(),
             }
         })?;
-        match &self.kind {
+        // Building the entry reads every byte (its content checks); the pages leave this process's
+        // resident set once it has, so a load does not hold the whole checkpoint mapped until the upload.
+        let read = bytes.clone();
+        let entry = match &self.kind {
             JobKind::Dense { dtype, shape } => DenseWeight::try_new(*dtype, shape.clone(), bytes)
                 .map(WeightEntry::Dense)
                 .map_err(|error| match container {
@@ -119,7 +122,9 @@ impl TensorJob {
                     .map(|payload| WeightEntry::Packed(std::sync::Arc::new(payload)))
                     .map_err(LoadError::from)
             }
-        }
+        };
+        read.advise(Access::Release);
+        entry
     }
 }
 

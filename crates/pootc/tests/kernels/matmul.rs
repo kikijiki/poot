@@ -2,14 +2,14 @@
 //! index math and a `for k in 0..K` accumulation loop (kernelgen's `matmul_batched` shape).
 
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 
 const M: usize = 2;
 const N: usize = 3;
 const K: usize = 4;
 
 pub fn __poot_kernel_matmul(a: &[f32], b: &[f32], c: &mut [f32]) {
-    let idx = thread_index();
+    let idx = thread_index_x();
     if idx < c.len() {
         let row = idx / N;
         let col = idx % N;

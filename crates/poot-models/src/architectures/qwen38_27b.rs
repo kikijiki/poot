@@ -513,6 +513,7 @@ fn assemble(p: Qwen35Params, store: &WeightStore) -> Result<ModelParts, ModelErr
         bos: p.bos,
         prompt_bos: None,
         prefill_granule: NonZeroUsize::MIN,
+        kv_dtype: None,
         chat: ChatFormat::ChatML,
         tool_codec: Some(Arc::new(HermesToolCodec)),
     };
@@ -2006,7 +2007,7 @@ mod tests {
     /// The committed llama.cpp activation `name` (`attn_norm-0` or `linear_attn_out-0`) of the real
     /// file's first block: eight tokens by `width` f32, token-major.
     fn llama_cpp_activation(name: &str) -> Vec<f32> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = poot_test_util::manifest_dir()
             .join("../../scripts/llamacpp-dump/reference")
             .join(format!("qwen35_gdn_layer0_{name}.f32"));
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -2108,7 +2109,7 @@ mod tests {
             return;
         };
         type Row = (String, u32, usize, [f64; 4], f64, f64, f64);
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = poot_test_util::manifest_dir()
             .join("../../scripts/llamacpp-dump/reference/qwen35_dequant_rows.tsv");
         let table =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));

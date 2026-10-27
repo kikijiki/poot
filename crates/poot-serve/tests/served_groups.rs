@@ -244,6 +244,7 @@ struct Reference {
 fn driver_options() -> DriverOptions {
     let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(CAPACITY),

@@ -62,6 +62,7 @@ readonly gate_policy=(
   "poot-kernelgen|reviewed|"
   "poot-l0-runtime|host|"
   "poot-npu|host|"
+  "poot-npu-artifacts|host|"
   "poot-llm|reviewed|"
   "poot-load|reviewed|"
   "poot-models|reviewed|"

@@ -19,41 +19,14 @@ mod pods;
 pub(crate) mod runs;
 
 pub(crate) use core::Db;
-pub(crate) use pods::pick_idle_pod;
-pub(crate) use runs::{ExecOwner, ExecReapReport, ReapProtection, Run};
+pub(crate) use pods::{Pod, pick_idle_pod};
+pub(crate) use runs::{ExecOwner, ExecReapReport, ReapProtection, Run, WarmExec};
 
 /// Every pod this orchestrator creates is named `poot-orch-<state id>-<run id>-a<attempt>`.
 const POD_NAME_PREFIX: &str = "poot-orch-";
 
-/// The schema version this build writes. Version 1 is the first without the verify-batch tables.
-const SCHEMA_VERSION: i64 = 1;
-
-/// The tables the removed verify-batch command kept. Nothing reads them, and a state database created
-/// before they were removed still holds them.
-const DROPPED_BATCH_TABLES: [&str; 5] = [
-    "batches",
-    "batch_jobs",
-    "batch_steps",
-    "device_leases",
-    "batch_phase_intervals",
-];
-
-/// Bring a state database's schema up to [`SCHEMA_VERSION`]. The `runs`, `model_runs` and `pods` rows
-/// are untouched; a database already at the version is not written to.
-fn migrate(conn: &Connection) -> Result<()> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version >= SCHEMA_VERSION {
-        return Ok(());
-    }
-    let tx = conn.unchecked_transaction()?;
-    for table in DROPPED_BATCH_TABLES {
-        // Dropping a table drops its indexes with it.
-        tx.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
-    }
-    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
-    tx.commit()?;
-    Ok(())
-}
+/// The schema version this build writes. A database with another version is rejected (no migrations).
+const SCHEMA_VERSION: i64 = 4;
 
 /// The name prefix of every pod created against one state database: the only thing `reap` selects by.
 ///
@@ -88,7 +61,6 @@ fn migrate(conn: &Connection) -> Result<()> {
 ///     env: &env,
 ///     network_volume_id: None,
 ///     data_center_ids: &[],
-///     allowed_cuda_versions: &[],
 /// };
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]

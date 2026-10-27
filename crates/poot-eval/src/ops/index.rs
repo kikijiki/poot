@@ -2,6 +2,7 @@
 //! `DenseRowGather`.
 
 use poot_graph_ir::ValueId;
+use poot_tensor::HostData;
 
 use super::index_rule::{IndexValue, index_at};
 use poot_tensor::HostTensor;
@@ -39,4 +40,30 @@ pub(crate) fn arg_top_k(
         }
     }
     Ok(HostTensor::i32(out_shape, data))
+}
+
+/// `ExpertGroup`: `ids [M]` to `[2, M]`, the stable sort of the rows by expert (`order`) and its inverse
+/// (`dest`). A row whose id is outside `0..experts` sorts after every expert, so a bad id is carried to the
+/// contraction that rejects it instead of being dropped here.
+pub(crate) fn expert_group(ids: &HostTensor, experts: usize) -> Result<HostTensor, EvalError> {
+    let HostData::I32(words) = ids.data() else {
+        return Err(EvalError::unsupported(
+            "expert_group",
+            format!("the ids are I32, got {}", ids.dtype()),
+        ));
+    };
+    let bucket = |id: i32| {
+        usize::try_from(id)
+            .ok()
+            .filter(|&e| e < experts)
+            .unwrap_or(experts)
+    };
+    let mut order: Vec<usize> = (0..words.len()).collect();
+    order.sort_by_key(|&row| bucket(words[row]));
+    let mut dest = vec![0i32; words.len()];
+    for (position, &row) in order.iter().enumerate() {
+        dest[row] = position as i32;
+    }
+    let data = order.iter().map(|&row| row as i32).chain(dest).collect();
+    Ok(HostTensor::i32(vec![2, words.len()], data))
 }

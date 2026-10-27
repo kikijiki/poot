@@ -292,10 +292,9 @@ fn sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 /// vocabulary is found and this goes red.
 #[test]
 fn no_model_code_names_the_dram_channel_rule() {
-    // `std::env::var`, not `env!`: see plan_summary.rs (a shared compile cache must not bake a worktree path).
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+    let manifest = poot_test_util::manifest_dir();
     let mut files = Vec::new();
-    sources(&Path::new(&manifest).join("src"), &mut files);
+    sources(&manifest.join("src"), &mut files);
     assert!(files.len() > 50, "the model sources were found");
     let forbidden = [
         "dram",

@@ -98,8 +98,8 @@ mod segment_layout_tests {
 mod pending_fault_tests {
     use crate::buffer::test_only::BufferSegment;
     use crate::{Context, RuntimeError};
+    use poot_codegen::CompiledKernel;
     use poot_kernel_ir::Body;
-    use poot_runtime_common::CompiledKernel;
 
     /// Compile `poot-rocm-device`'s committed `assert_trap.kir.json` fixture (card 531c: `out[i] =
     /// data[idx[i]]`, a real rustc-inserted bounds check, not a hand-built `Body`) to SpirV.
@@ -137,7 +137,9 @@ mod pending_fault_tests {
         let ctx = match Context::new() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("SKIP dispatch_dev_fault_surfaces_at_the_next_download: no GPU ({e})");
+                eprintln!(
+                    "POOT-SKIP dispatch_dev_fault_surfaces_at_the_next_download: no GPU ({e})"
+                );
                 return;
             }
         };
@@ -209,7 +211,7 @@ mod pending_fault_tests {
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
-                    "SKIP submit_cached_error_word_is_rezeroed_and_rechecked_every_step: no GPU ({e})"
+                    "POOT-SKIP submit_cached_error_word_is_rezeroed_and_rechecked_every_step: no GPU ({e})"
                 );
                 return;
             }
@@ -317,7 +319,7 @@ mod pending_fault_tests {
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
-                    "SKIP warm_decode_staging_allocation_increments_the_memory_service_independent_of_alloc_f32: no GPU ({e})"
+                    "POOT-SKIP warm_decode_staging_allocation_increments_the_memory_service_independent_of_alloc_f32: no GPU ({e})"
                 );
                 return;
             }
@@ -480,7 +482,7 @@ mod storage_checked_write_tests {
 /// In-crate (not `tests/`) because it drives `Context::timestamps_available`, `pub(crate)` only.
 mod profiled_dispatch_tests {
     use crate::Context;
-    use poot_runtime_common::CompiledKernel;
+    use poot_codegen::CompiledKernel;
 
     fn spv_for(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel {
         let dir = std::env::temp_dir().join("poot-wgpu-runtime-test");
@@ -620,7 +622,7 @@ mod profiled_dispatch_tests {
 /// the decoration worked, not a coincidence of rows where fusion would not have mattered anyway.
 mod no_contract_tests {
     use crate::{Context, KernelBuffer};
-    use poot_runtime_common::CompiledKernel;
+    use poot_codegen::CompiledKernel;
 
     fn spv_for(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel {
         let dir = std::env::temp_dir().join("poot-wgpu-runtime-test");
@@ -787,12 +789,13 @@ mod require_backend_tests {
 /// convention as `poot-codegen/tests/llc.rs`; `tests/dispatch_probe.rs` keeps the other two (negative and
 /// mixed-scalar-vec4) cases, which need no `read_write_f32`.
 mod vec4_probe_tests {
-    use poot_runtime_common::{ArgAccess, ArgSchema, CompiledKernel};
+    use poot_codegen::{ArgSchema, CompiledKernel};
+    use poot_target::ArgAccess;
     use std::path::PathBuf;
     use std::process::Command;
 
     use crate::{Context, KernelBuffer};
-    use poot_runtime_common::KernelCode;
+    use poot_codegen::KernelCode;
 
     fn have(bin: &str) -> bool {
         Command::new(bin).arg("--version").output().is_ok()
@@ -1013,8 +1016,9 @@ fn read_bytes_past_the_buffers_end_is_a_typed_refusal_not_a_wgpu_panic_gpu() {
 /// same `queue.submit` as its compute dispatch) counts once in the physical submit total.
 mod exec_counters_tests {
     use crate::{Context, KernelBuffer};
+    use poot_codegen::CompiledKernel;
     use poot_runtime_common::device_skip::open_or_skip;
-    use poot_runtime_common::{CallPurpose, CompiledKernel, DeviceBackend, TransferDirection};
+    use poot_runtime_common::{CallPurpose, DeviceBackend, TransferDirection};
 
     fn spv_for(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel {
         let dir = std::env::temp_dir().join("poot-wgpu-runtime-test");
@@ -1121,8 +1125,9 @@ mod exec_counters_tests {
 /// prevents a failed step's registrations from leaking into the next one's drain.
 mod device_timing_tests {
     use crate::{CachedDispatch, Context, DeviceBuffer};
+    use poot_codegen::CompiledKernel;
+    use poot_runtime_common::DeviceBackend;
     use poot_runtime_common::device_skip::open_or_skip;
-    use poot_runtime_common::{CompiledKernel, DeviceBackend};
 
     fn kernel(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel {
         let dir = std::env::temp_dir().join("poot-wgpu-runtime-device-timing-test");
@@ -1142,7 +1147,7 @@ mod device_timing_tests {
         output: &DeviceBuffer,
         threads: u32,
     ) -> CachedDispatch {
-        let input_lens: Vec<u32> = inputs.iter().map(|b| b.elem_count()).collect();
+        let input_lens: Vec<usize> = inputs.iter().map(|b| b.elem_count()).collect();
         ctx.build_cached_dispatch(
             label,
             key,
@@ -1451,4 +1456,35 @@ fn write_host_bytes(
     ctx.write_with(buf, offset, bytes.len(), &mut |range, out| {
         out.copy_from_slice(&bytes[range.start - offset..range.end - offset]);
     })
+}
+
+/// POOT-1313: an upload to a device that is gone names the device. wgpu returns no staging view then, and the
+/// write used to report it as a misaligned range (`write_with at byte offset 0 of 8397824 bytes is not word
+/// aligned`, a length that is a multiple of four). Driven through the production `write_with` on a device the
+/// test destroyed, the stand-in for the context a dispatch past the display watchdog resets.
+/// Mutation: map the missing staging view back to `RuntimeError::Misaligned`; the match goes red.
+#[test]
+fn an_upload_to_a_lost_device_is_a_device_loss_not_a_misaligned_range() {
+    use crate::{Context, RuntimeError};
+    use poot_runtime_common::device_skip::open_or_skip;
+    use poot_runtime_common::{BufferRole, DeviceBackend};
+
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
+    };
+    let buf = ctx
+        .alloc_storage(BufferRole::State, BufferStorage::f32(), 4)
+        .expect("alloc");
+    ctx.device.destroy();
+    let error = write_host_bytes(&ctx, &buf, 0, &[0u8; 16]).unwrap_err();
+    // Either is right and wgpu decides which: a destroyed device reports its loss through the lost callback
+    // when that has fired by now (`DeviceLost`), and otherwise the refused allocation is all the write can name
+    // (`StagingRefused`). The row pins what matters: neither is `Misaligned`.
+    assert!(
+        matches!(
+            error,
+            RuntimeError::DeviceLost { .. } | RuntimeError::StagingRefused { .. }
+        ),
+        "a write to a destroyed device: {error:?}"
+    );
 }

@@ -18,7 +18,7 @@
 
 [poot]
 # Built from benchmarks/runners/poot/ with `cargo build --release` (kernels are generated at runtime by
-# kernelgen). See setup/poot.sh. Backend is selected via POOT_BENCH_BACKEND (ptx|rocm|wgpu, default ptx).
+# kernelgen). See setup/poot.sh. Backend is selected via POOT_BENCH_BACKEND (ptx|rocm|wgpu|vulkan, default ptx).
 bin_env = "POOT_BENCH_POOT_BIN"
 bin = "poot-bench-runner"
 # --prefill fills a single-mode prompt in one forward (the driver's whole-prompt chunk) instead of one token at a

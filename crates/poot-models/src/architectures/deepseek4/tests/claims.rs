@@ -15,17 +15,17 @@ const LOADER_CLAIMS: [&str; 3] = [
 #[test]
 fn no_source_or_doc_claims_a_v4_packed_loader() {
     let names = include_str!("../names.rs");
-    // The public pages that could state a V4 loader: the models page (model-neutral) and the feature matrix
-    // (the per-model support table). The claims are specific sentences, so the whole page is scanned.
+    // The public pages that could state a V4 loader: the models page (model-neutral) and the supported-models
+    // page (the per-model support tables). The claims are specific sentences, so the whole page is scanned.
     let page = |path: &str| {
         std::fs::read_to_string(format!(
             "{}/../../website/docs/{path}",
-            env!("CARGO_MANIFEST_DIR")
+            poot_test_util::manifest_dir().display()
         ))
         .unwrap_or_else(|e| panic!("the public docs page {path}: {e}"))
     };
     let models = page("develop/models.md");
-    let matrix = page("reference/feature-matrix.md");
+    let supported = page("develop/supported-models.md");
     assert!(
         names.contains("No loader produces the packed form"),
         "names.rs must state that no loader builds V4's packed entries"
@@ -33,7 +33,7 @@ fn no_source_or_doc_claims_a_v4_packed_loader() {
     for (file, text) in [
         ("names.rs", names.to_string()),
         ("develop/models.md", models),
-        ("reference/feature-matrix.md", matrix),
+        ("develop/supported-models.md", supported),
     ] {
         for claim in LOADER_CLAIMS {
             assert!(

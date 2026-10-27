@@ -20,7 +20,7 @@ use poot_graph_plan::Target;
 use poot_quant::weights::WeightStore;
 use poot_tensor::{DType, HostTensor};
 
-use crate::{Fixture, fixture_weights, staged};
+use crate::{Fixture, fixture_weights, staged_on};
 
 /// Rows of the carried pool: the sequences a driver could hold open.
 const SLOTS: usize = 4;
@@ -169,7 +169,7 @@ fn run_dtype(exec: &mut dyn Executor, target: Target, dtype: DType) -> Result<()
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(&fixture))
         .map_err(|e| format!("load_weights: {e}"))?;
     let entry = exec
-        .add_entry(exe, &staged(&fixture, target))
+        .add_entry(exe, &staged_on(exec, &fixture, target))
         .map_err(|e| format!("add_entry: {e}"))?;
     let mut model = Model {
         pool: [[0; WIDTH]; SLOTS],

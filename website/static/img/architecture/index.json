@@ -5,9 +5,9 @@
       "file": "capture-replay.png",
       "width": 2400,
       "height": 1270,
-      "sha256": "d6e118c561bf9926c5234ab8a2699d814af904293db39eba736428d5ad7c7a31",
+      "sha256": "e84cc17743b93e35084278ed79fe3f3218f6e174f66b3a147b6d38ce7c5c85ee",
       "source": "website/diagrams/capture-replay.svg",
-      "sourceSha256": "92f3db45e1a6b6967127d9a14a1df881805aefd54fd1046cc5b178478dc13814",
+      "sourceSha256": "8aa26dc0876c92dfa94e9c6aedce1a04cd255f80a472fed8fded1067341f4fb4",
       "alt": "Capture the decode step once and replay it every token, one host call per token"
     },
     {
@@ -15,10 +15,10 @@
       "file": "compilation-pipeline.png",
       "width": 2400,
       "height": 2350,
-      "sha256": "54ae803b718fe8048552de472074e90f6f7c479455822fa9ef2cd0d7a98f59ba",
+      "sha256": "1fc2f44180d686f0a7f249c3f4d8c2f48eb99ea82bc9542e1e02e8a94dad7b3c",
       "source": "website/diagrams/compilation-pipeline.svg",
-      "sourceSha256": "ec87b5dbc413f3c9cbd248ca10862896d6929ec6c85677961d464c08b6925e2d",
-      "alt": "From model code to GPU: graph IR, graph passes, kernel planning, one shared LLVM emitter, three backends"
+      "sourceSha256": "85586bb33368c8146f7292d5b951ad4ae5e546fc969cec60865374d23ae6509a",
+      "alt": "From model code to GPU: graph IR, graph passes, kernel planning, one shared LLVM emitter, four backends"
     },
     {
       "name": "model-tracing",
@@ -35,9 +35,9 @@
       "file": "rust-kernels.png",
       "width": 2400,
       "height": 1374,
-      "sha256": "74acf7cb9e46bd51054da50ac670ab88d21b239900e0b597929ed4ed489ce628",
+      "sha256": "640ed6c767ba2a72bdb406ae738747845facd9199bb9552bc8126297c5b62c71",
       "source": "website/diagrams/rust-kernels.svg",
-      "sourceSha256": "0cc0a677b244e019f534970cb001090b2953aeb785dda07e9e5cb8b61286cfc1",
+      "sourceSha256": "e6d38c43c067de25146ed42d394302ce56efd890879cdeb554c2dc981d209eff",
       "alt": "One Rust kernel compiled to SPIR-V, PTX and AMDGCN"
     }
   ]

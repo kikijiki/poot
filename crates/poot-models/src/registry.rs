@@ -616,7 +616,7 @@ mod tests {
             "multimodal/mod.rs",
             "multimodal/idefics3/mod.rs",
         ];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let root = poot_test_util::manifest_dir().join("src");
         let mut files = Vec::new();
         sources(&root, &root, &mut files);
         let naming: Vec<&str> = files
@@ -800,6 +800,7 @@ mod tests {
             bos: Some(151643),
             prompt_bos: None,
             prefill_granule: NonZeroUsize::MIN,
+            kv_dtype: None,
             chat: ChatFormat::ChatML,
             tool_codec: Some(Arc::new(HermesToolCodec)),
         };

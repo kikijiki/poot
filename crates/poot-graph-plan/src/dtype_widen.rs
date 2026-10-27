@@ -1,22 +1,16 @@
 //! Card 235: the mixed-operand-dtype decode `MatMul` planner gap.
 //!
-//! `plan_eqn`'s `OpKind::MatMul` arm reject any matmul whose operand dtype does not
-//! match the output dtype unless a tensor-core arm (`amd_tc` on AmdGcn/RDNA3, `tc` on Nvptx) fires;
-//! both require bf16 operands with 16-aligned M/N/K and no batch dims. Decode is always a GEMV
-//! (`M == 1`), never 16-aligned, so a decode-time mixed-dtype matmul can never take the tensor-core
-//! path. The loader types every projection weight `DType::BF16` for any natively-bf16 safetensors
-//! checkpoint (independent of `to_mixed_bf16`), so a decode matmul's weight is BF16 while the
+//! `plan_eqn`'s `OpKind::MatMul` arm rejects any matmul whose operand dtype does not
+//! match the output dtype: every matmul body reads one element type. The loader types every
+//! projection weight `DType::BF16` for any natively-bf16 safetensors checkpoint (independent of `to_mixed_bf16`), so a decode matmul's weight is BF16 while the
 //! activation/output stay F32, and the planner's guard panics on every backend for such a checkpoint.
 //!
 //! [`widen_mismatched_matmul_dtypes`] fixes this: a graph transform that inserts an explicit `Cast`
-//! widening a mismatched operand back to the output dtype wherever the tensor-core arm would not fire.
-//! It mirrors the mixed-bf16 narrowing cast insertion's pass in reverse and reuses the
-//! eligibility predicate `plan_eqn` computes ([`matmul_tensor_core_eligible`]) so the two cannot
-//! drift: a mismatched matmul is either widened by this pass or left for the tensor-core arm, so
-//! `plan_eqn`'s guard should never fire on a graph this pass has run over.
+//! widening a mismatched operand back to the output dtype, so `plan_eqn`'s guard fires only on the one
+//! mismatch this pass leaves on purpose ([`matmul_bf16_column_gemv`]).
 //!
-//! This lives in `poot-graph-plan`, not `poot-graph-ir`, because the eligibility check needs
-//! [`poot_target::DeviceCaps`] (the device's matrix lowering) and `poot-graph-ir` cannot depend on this crate
+//! This lives in `poot-graph-plan`, not `poot-graph-ir`, because the decode-projection check needs
+//! [`poot_target::DeviceCaps`] and `poot-graph-ir` cannot depend on this crate
 //! (`poot-graph-plan` already depends on it).
 //!
 //! Card 1011: a BF16 const is never retyped. Its declared dtype is its stored dtype on every backend, and
@@ -30,91 +24,10 @@ use poot_graph_ir::op::{ContractionHead, LocalId, OpKind};
 use poot_graph_ir::types::{DTypeClass, DTypeClassExt, TensorType};
 use poot_graph_ir::{EditError, Eqn, Graph, GraphEdit, Operand, ValueId, ValueTable};
 use poot_kernelgen::Layout;
-use poot_target::{DeviceCaps, MatrixLowering};
+use poot_target::DeviceCaps;
 use poot_tensor::DType;
 
 use std::collections::{HashMap, HashSet};
-
-/// Whether the matmul operands are both `dtype` and M/N/K are all 16-aligned: the shape every tensor-core body
-/// below is written for (any batch dims; the tile kernels index each batch element and loop K in 16-wide blocks,
-/// device-checked on gfx1151 at a batched three-block shape, card 663).
-fn aligned_operands(
-    dtype: DType,
-    a_dtype: DType,
-    b_dtype: DType,
-    m: usize,
-    n: usize,
-    k: usize,
-) -> bool {
-    a_dtype == dtype
-        && b_dtype == dtype
-        && m.is_multiple_of(16)
-        && n.is_multiple_of(16)
-        && k.is_multiple_of(16)
-}
-
-/// Whether `OpKind::MatMul`'s AMD WMMA tensor-core arm fires on the device `caps` describes (spec 130 FR-004:
-/// RDNA3 WMMA over bf16 operands; CDNA and unknown arch fall through) for these operand dtypes and shape.
-pub fn matmul_amd_tc_eligible(
-    caps: &DeviceCaps,
-    a_dtype: DType,
-    b_dtype: DType,
-    m: usize,
-    n: usize,
-    k: usize,
-) -> bool {
-    caps.matrix_lowering == MatrixLowering::AmdWmmaBf16
-        && aligned_operands(DType::BF16, a_dtype, b_dtype, m, n, k)
-}
-
-/// Whether `OpKind::MatMul`'s NVPTX tensor-core arm fires on the device `caps` describes (spec 025: bf16
-/// operands with 16-aligned M/N/K, any batch dims).
-pub fn matmul_nvptx_tc_eligible(
-    caps: &DeviceCaps,
-    a_dtype: DType,
-    b_dtype: DType,
-    m: usize,
-    n: usize,
-    k: usize,
-) -> bool {
-    caps.matrix_lowering == MatrixLowering::NvidiaWmmaBf16
-        && aligned_operands(DType::BF16, a_dtype, b_dtype, m, n, k)
-}
-
-/// Whether `OpKind::MatMul`'s SPIR-V cooperative-matrix arm (`plan_eqn`'s local `coopmat`, card 154) fires on
-/// the device `caps` describes. RADV coopmat config 13: F16 operands (RADV has no `VK_KHR_shader_bfloat16`),
-/// 16x16x16 Subgroup scope, 16-aligned M/N/K, any batch dims. The kernel carries its accumulator fragment across
-/// a K-loop of 16-wide blocks and indexes each batch element (card 663). A ragged K, M or N is not padded: it is
-/// not eligible and plans the serial kernel. The accumulator is always F32 (RADV has no f16-accumulate config),
-/// so this only fires for a mixed f16-in/f32-out matmul; a pure f16-output matmul would need an extra narrowing
-/// store that is not implemented.
-pub fn matmul_spirv_coopmat_eligible(
-    caps: &DeviceCaps,
-    a_dtype: DType,
-    b_dtype: DType,
-    m: usize,
-    n: usize,
-    k: usize,
-) -> bool {
-    caps.matrix_lowering == MatrixLowering::CooperativeMatrixF16
-        && aligned_operands(DType::F16, a_dtype, b_dtype, m, n, k)
-}
-
-/// True if any tensor-core/coopmat arm fires, i.e. `plan_eqn`'s mixed-operand-dtype guard would not
-/// reject this matmul. The single source of truth for `widen_mismatched_matmul_dtypes` and `plan_eqn`,
-/// so they cannot disagree about which matmuls need widening.
-pub fn matmul_tensor_core_eligible(
-    caps: &DeviceCaps,
-    a_dtype: DType,
-    b_dtype: DType,
-    m: usize,
-    n: usize,
-    k: usize,
-) -> bool {
-    matmul_amd_tc_eligible(caps, a_dtype, b_dtype, m, n, k)
-        || matmul_nvptx_tc_eligible(caps, a_dtype, b_dtype, m, n, k)
-        || matmul_spirv_coopmat_eligible(caps, a_dtype, b_dtype, m, n, k)
-}
 
 /// Card 1011: whether the device buffer that holds BF16 const `id` on `target` is the packed `u32` lanes
 /// (two little-endian elements per word, [`poot_target::BufferStorage::bf16_packed`]) rather than native
@@ -140,7 +53,7 @@ pub(crate) fn bf16_const_is_packed(
         Target::Gpu { caps, .. } if !caps.native_two_byte_floats => true,
         Target::Gpu { .. } => bf16_const_feeds_only_packed_readers(g, views, id),
         // An AIE core has no BF16 lane: the const stays unpacked and the BF16 consumers refuse; neither does a VPU.
-        Target::Aie { .. } | Target::Vpu { .. } => false,
+        Target::Npu(_) => false,
     }
 }
 
@@ -764,19 +677,15 @@ pub(crate) fn lower_nonlast_reduces(g: &Graph) -> Result<Graph, EditError> {
 }
 
 /// Widen a `MatMul`/`Binary` operand whose dtype does not match the eqn's output dtype
-/// back to the output dtype via an explicit `Cast`, whenever [`matmul_tensor_core_eligible`] says the
-/// tensor-core arm will not fire for `backend` (a `Binary` eqn never has a tensor-core arm, so its
-/// mismatches are always widened). Tensor-core-eligible matmuls (e.g. prefill matmuls narrowed by
-/// `to_mixed_bf16`, always 16-aligned) are left untouched, since `matmul_tensorcore` reads bf16
-/// operands directly and widening them would cost an extra cast and lose the tensor-core dispatch.
+/// back to the output dtype via an explicit `Cast`: every matmul and binary body reads one element type. The
+/// one mismatch left in place is the BF16 `[K, N]` decode projection ([`matmul_bf16_column_gemv`]).
 ///
 /// Idempotent and a no-op on any graph with no mismatched-dtype eqn. The pass only inserts `Cast`
 /// equations; it never changes a value's declared dtype, and no other pass retypes a const either (Card
 /// 1011). A BF16 const stays BF16 on every backend, and the `Cast{BF16 -> F32}` this pass puts in front of
 /// it reads the lane the storage plan gave the const ([`bf16_const_is_packed`]).
 ///
-/// Card 235: needed before decode capture on every backend, since decode (`M == 1`) is never
-/// 16-aligned and so never takes the tensor-core path; a mismatched-dtype decode matmul is always
+/// Card 235: needed before decode capture on every backend: a mismatched-dtype decode matmul is always
 /// widened by this pass (except the BF16-weight decode GEMV, which reads the weight packed).
 ///
 /// `Binary` is covered because a bf16 decode graph's RMSNorm `x * gamma` compiles to a plain
@@ -871,12 +780,7 @@ pub fn widen_mismatched_matmul_dtypes(g: &Graph, caps: &DeviceCaps) -> Result<Gr
                 out.eqns_mut().push(eqn.clone());
                 continue;
             }
-            let (m, n) = (out_shape[r - 2], out_shape[r - 1]);
-            let k = g.aval(a_id).shape.last().copied().unwrap_or(0);
-            if matmul_tensor_core_eligible(caps, a_dt, b_dt, m, n, k) {
-                out.eqns_mut().push(eqn.clone());
-                continue;
-            }
+            let m = out_shape[r - 2];
             // A BF16 `[K, N]` decode projection has no lowering: a widening Cast would materialize an F32
             // copy of the weight, so it stays mixed and `plan_eqn` refuses it by name.
             if matmul_bf16_column_gemv(caps, a_dt, b_dt, odt, m, g.aval(b_id).shape.len()) {
@@ -1014,75 +918,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-}
-
-/// Card 278, moved from `poot-ptx-device` in Card 534a: the tensor-core choice keeps a BF16 matmul weight
-/// narrow and inserts no widening cast.
-#[cfg(test)]
-mod tensor_core_weight_tests {
-    use crate::KernelChoice;
-    use crate::planner::Planned;
-    use poot_graph_ir::{Builder, Slot, TensorType};
-    use poot_kernelgen::{ContractionSpec, KernelRequest};
-    use poot_target::Backend;
-    use poot_tensor::DType;
-
-    use super::widen_mismatched_matmul_dtypes;
-
-    #[test]
-    fn card278_existing_tensor_core_choice_keeps_eligible_bf16_weight_narrow() {
-        let b = Builder::for_tests();
-        let x = b
-            .slot(
-                Slot::Owned(crate::TOKEN_EMBED),
-                TensorType::new(vec![16, 16], DType::BF16),
-            )
-            .unwrap();
-        let weight = b
-            .constant("weight", TensorType::new(vec![16, 16], DType::BF16))
-            .unwrap();
-        let out = b.matmul(x, weight).unwrap();
-        let g = b.finish(out).unwrap();
-
-        let widened = widen_mismatched_matmul_dtypes(
-            &g,
-            &poot_test_util::device_caps::default_caps_for(Backend::Nvptx),
-        )
-        .unwrap();
-        assert_eq!(widened.aval(weight.id()).dtype, DType::BF16);
-        assert!(
-            !widened
-                .eqns()
-                .iter()
-                .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::Cast { .. }))
-        );
-        let eqn = widened
-            .eqns()
-            .iter()
-            .find(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::MatMul { .. }))
-            .expect("matmul remains");
-        match crate::plan_eqn_choice(
-            &widened,
-            eqn,
-            &crate::Target::Gpu {
-                backend: Backend::Nvptx,
-                caps: poot_test_util::device_caps::default_caps_for(Backend::Nvptx),
-            },
-            &std::collections::HashMap::new(),
-            &crate::test_support::roomy_body_limits(),
-        )
-        .expect("eligible BF16 matmul plans")
-        {
-            Planned {
-                plan,
-                choice:
-                    KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::TensorCore {
-                        ..
-                    })),
-            } if plan.single().is_some() => {}
-            other => panic!("eligible BF16 matmul chose {:?}", other.choice),
         }
     }
 }

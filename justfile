@@ -68,7 +68,7 @@ test: test-model-free
 
 # the model-free gate: dead-pub and unused-dependency checks, docs-path references, the inventory and lane self-tests, device-probe
 # self-test, then every model-free test and doctest
-test-model-free: gate-check dead-pub machete docs-paths variant-coverage mutation-sample-report diagrams-check aie-link-driver npu-build vpu-build crates-stale-names cargo-freshness crates-standalone test-model-free-inventory test-lane-coverage test-bench-runner test-bench-harness
+test-model-free: gate-check dead-pub machete docs-paths variant-coverage mutation-sample-report diagrams-check aie-link-driver npu-build vpu-build crates-stale-names merge-lost-lines-check cargo-freshness crates-standalone test-model-free-inventory test-lane-coverage test-bench-runner test-bench-harness
     scripts/with-required-backend.sh --self-test
     scripts/test-model-free.sh run
 
@@ -86,6 +86,8 @@ test-bench-runner:
 test-bench-harness: bench-compare
     python3 -m unittest discover -s benchmarks/harness/tests -p 'test_*.py'
     python3 benchmarks/harness/performance_bank.py
+    python3 -I scripts/flash-next-correctness/test_compare.py
+    just grid-check
 
 # The noise-aware comparator (benchmarks/harness/bench.py compare-committed) on the committed results: the baseline is
 # the last committed set of each cell. With no candidate the set is compared with itself, which proves it is a
@@ -96,10 +98,10 @@ test-bench-harness: bench-compare
 bench-compare results='benchmarks/results' *candidate:
     python3 benchmarks/harness/bench.py compare-committed --results-dir {{results}} --candidate {{candidate}}
 
-# Record the dense cell of one local backend: 5 repeats of qwen2.5-0.5b decode-128 through the release runner, one run
+# Record the dense cell of one local backend: 5 repeats of qwen3-0.6b decode-128 through the release runner, one run
 # directory per repeat under benchmarks/results/. Holds the GPU: run it as `flock /tmp/poot-gpu.lock just
 # bench-record wgpu`, with the box otherwise idle, and commit the directories with `bench index` regenerated.
-bench-record backend model='qwen2.5-0.5b' scenario='decode-128':
+bench-record backend model='qwen3-0.6b' scenario='decode-128':
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release -p poot-bench-runner
@@ -206,6 +208,11 @@ crates-stale-names:
     python3 scripts/crates-stale-names.py --self-test
     python3 scripts/crates-stale-names.py
 
+# the lost-hunk audit for a merge (lane-merge runs `scripts/merge-lost-lines <merge>` after every merge); the gate proves
+# it finds a hunk a conflict resolution dropped and names the card that added it
+merge-lost-lines-check:
+    scripts/merge-lost-lines --self-test
+
 # fail on a dependency a manifest declares and its crate never uses
 machete:
     cargo machete crates benchmarks/runners/poot
@@ -226,11 +233,11 @@ test-model-free-inventory-regen:
 test-plan-summary-regen:
     POOT_PLAN_SUMMARY_REGEN=1 cargo nextest run -p poot-models --test plan_summary plan_digests_match_the_checked_in_file
 
-# rewrite the generated region of website/docs/reference/feature-matrix.md from what `compile` says about every
-# registered family's fixture graphs and every weight format on each reference target. The matrix test fails
-# when the page differs from the generator, so a planner or registry change that moves a cell runs this.
-feature-matrix-regen:
-    POOT_FEATURE_MATRIX_REGEN=1 cargo nextest run -p poot-models --test feature_matrix the_page_is_what_the_generator_renders
+# rewrite the generated region of website/docs/develop/supported-models.md from what `compile` says about every
+# registered family's fixture graphs and every weight format on each reference target. The supported_models test
+# fails when the page differs from the generator, so a planner or registry change that moves a cell runs this.
+supported-models-regen:
+    POOT_SUPPORTED_MODELS_REGEN=1 cargo nextest run -p poot-models --test supported_models the_page_is_what_the_generator_renders
 
 # tests that build real model dimensions, in the release profile (too slow for the debug default lane)
 test-real-dims:
@@ -247,7 +254,7 @@ test-real-dims:
 # checkpoint lane: CPU rows over the small checkpoints in the models directory; a missing model fails
 test-checkpoint:
     POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
-        {{nextest}} --run-ignored all -p poot-llm -p poot-load -p poot-serve \
+        {{nextest}} --run-ignored all -p poot-llm -p poot-load -p poot-models -p poot-serve \
         -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint)"
 
 # rows that read a 20B+ checkpoint (never on the dev box: a pod or host that holds the checkpoints and the memory)
@@ -344,7 +351,7 @@ test-npu-toolchain:
 # A `package(...)` selection also runs that package's model-free tests (poot-wgpu-runtime, poot-rocm-runtime), which
 # `just test` runs too: the repeat is harmless and costs seconds.
 wgpu_selection := 'package(poot-wgpu-runtime) | (binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-llm::add_a_model) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_wgpu$/)) | (binary_id(=poot-llm::beam) & test(/_wgpu$/)) | (binary_id(=poot-llm::timed_executor) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_wgpu$/)) | (binary_id(=poot-llm::recurrent_snapshot_cost) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_wgpu$/)) | (binary_id(=poot-llm::staged_timing) & test(/_wgpu$/)) | binary_id(=poot-executor) | binary_id(=poot-executor::cr30_lifecycle) | binary_id(=poot-executor::staged_pipeline) | package(poot-wgpu-device) | binary_id(=poot-llm::wgpu_qwen2) | binary_id(=poot-llm::wgpu_gemma2) | binary_id(=poot-llm::wgpu_executor_contract) | binary_id(=poot-llm::wgpu_weight_map_binding) | binary_id(=poot-llm::wgpu_parity_models) | binary_id(=poot-llm::wgpu_staged_pipeline) | binary_id(=poot-serve::bounded_drain_production) | (binary_id(=poot-serve::served_loop) & test(/_wgpu$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-serve::served_groups) & test(/_wgpu$/)) | test(/^prefill_kv_shared_pool_matches_contiguous$/) | test(/^qwen2_decode_gpu_matches_cpu$/)'
-vulkan_selection := 'package(poot-vulkan-runtime) | package(poot-vulkan-device) | (binary_id(=poot-llm) & test(/^driver::device_tests::(recorded_[a-z_0-9]+|attached_device_limit_refuses_an_oversized_constant)_vulkan$/)) | binary_id(=poot-llm::vulkan_generate) | binary_id(=poot-llm::vulkan_cross_backend) | binary_id(=poot-llm::vulkan_parity_models) | (binary_id(=poot-serve::served_groups) & test(/_vulkan$/)) | (binary_id(=poot-serve::served_loop) & test(/_vulkan$/))'
+vulkan_selection := 'package(poot-vulkan-runtime) | package(poot-vulkan-device) | (binary_id(=poot-llm) & test(/^driver::device_tests::(recorded_[a-z_0-9]+|chunked_prefill_matches_one_shot_[a-z_0-9]+|attached_device_limit_refuses_an_oversized_constant)_vulkan$/)) | binary_id(=poot-llm::vulkan_generate) | binary_id(=poot-llm::vulkan_cross_backend) | binary_id(=poot-llm::vulkan_parity_models) | (binary_id(=poot-serve::served_groups) & test(/_vulkan$/)) | (binary_id(=poot-serve::served_loop) & test(/_vulkan$/))'
 rocm_selection := 'package(poot-rocm-runtime) | (binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-llm::add_a_model) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_rocm$/)) | package(poot-rocm-device) | binary_id(=poot-llm::rocm_executor_contract) | binary_id(=poot-llm::rocm_executor_coverage) | binary_id(=poot-llm::rocm_routed_prefill_unguarded) | binary_id(=poot-llm::rocm_parity_models) | binary_id(=poot-llm::rocm_staged_pipeline) | binary_id(=poot-llm::rocm_weight_map_binding) | (binary_id(=poot-llm::beam) & test(/_rocm$/)) | (binary_id(=poot-llm::timed_executor) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_rocm$/)) | (binary_id(=poot-llm::recurrent_snapshot_cost) & test(/_rocm$/)) | (binary_id(=poot-llm::speculate) & test(/_rocm$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_rocm$/)) | binary_id(=poot-llm::rocm_batched_decode_plan_classify) | (binary_id(=poot-serve::served_loop) & test(/_rocm$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-serve::served_groups) & test(/_rocm$/))'
 ptx_single_device_rows := '(binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_ptx$/)) | (binary_id(=poot-llm::add_a_model) & test(/_ptx$/)) | (binary_id(=poot-llm::beam) & test(/_ptx$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_ptx$/)) | (binary_id(=poot-llm::speculate) & test(/_ptx$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_ptx$/)) | (binary_id(=poot-llm::staged_timing) & test(/_ptx$/)) | (binary_id(=poot-llm::timed_executor) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_ptx$/)) | (binary_id(=poot-serve::served_groups) & test(/_ptx$/)) | package(poot-ptx-device) | binary_id(=poot-llm::ptx_gemma2_geglu) | binary_id(=poot-llm::ptx_sc_acceptance) | binary_id(=poot-llm::ptx_routed_prefill_unguarded) | binary_id(=poot-llm::ptx_parity_models) | binary_id(=poot-llm::ptx_staged_pipeline) | binary_id(=poot-llm::ptx_weight_map_binding) | package(poot-ptx-runtime)' + ' | (' + kernels_package_selection + ' & ' + ptx_named_rows + ')'
 # The multi-device rows (two NVIDIA GPUs, and the four-way tensor-parallel row) live in three test binaries, and a
@@ -573,6 +580,16 @@ docs-check:
 docs-fix:
     prettier --write $(git ls-files '*.md' ':!website' ':!benchmarks/results')
 
+# the standing grid (benchmarks/grid.toml): every required cell is verified in website/src/data/performance.json, pending or has
+# a reason; the pending cells are listed. `just grid-check --strict` (the release gate) fails on pending cells.
+grid-check *args:
+    python3 benchmarks/harness/grid.py check {{args}}
+
+# rewrite website/src/data/performance.json, the data of the Performance pages, from benchmarks/results and the performance bank
+# (`test-bench-harness` fails when the committed file differs from what the generator derives)
+perf-page-regen:
+    python3 benchmarks/harness/perf_page.py
+
 # ---- website: the Docusaurus docs site in ./website -------------------------
 # Runs bun via the devshell. The site is the user-facing manual only (getting started, architecture,
 # usage, examples); internal project tracking lives in Backstage.
@@ -586,7 +603,8 @@ site-install:
 _site-deps:
     #!/usr/bin/env bash
     set -euo pipefail
-    [ -d website/node_modules ] || (cd website && bun install)
+    # always sync with bun.lock (a no-op when current): a lane that adds a dependency must not leave the next checkout with stale node_modules
+    (cd website && bun install --frozen-lockfile)
 
 # run the live dev server with hot reload (http://localhost:3000)
 site-dev: _site-deps
@@ -600,6 +618,14 @@ site-build: _site-deps
 site-serve: _site-deps
     cd website && bun run serve
 
+# audit every built page in headless Chromium at 1440 and 500 px (overflow, scrolling or unhighlighted code, scrolling tables, walls of
+# text, heading skips, unlabelled images, console errors); the rules are mutation-checked on website/scripts/audit-fixtures first.
+# Failures are grouped by the lane that owns the page. CHROMIUM overrides the browser binary.
+site-audit: _site-deps
+    cd website && bun run build
+    cd website && nix shell nixpkgs#chromium -c node scripts/audit-pages.mjs --self-test
+    cd website && nix shell nixpkgs#chromium -c node scripts/audit-pages.mjs --lanes
+
 # the site's checks: TypeScript typecheck, a production build (broken links), names the code no longer has, the develop/ Rust snippets, and the ascii rule over
 # tracked text sources. git grep ignores untracked build/vendor files; bun.lock is generated metadata.
 site-check: _site-deps
@@ -608,16 +634,26 @@ site-check: _site-deps
     rc=0
     echo "-- typecheck --"
     (cd website && bun run typecheck) || rc=1
+    echo "-- component tests (the Performance page's selection logic, the navbar check) --"
+    (cd website && bun test) || rc=1
+    echo "-- benchmark grid (every required cell is verified, pending or has a reason) --"
+    just grid-check || rc=1
+    echo "-- navbar (every top-level docs section has a navbar entry and its sidebar, every item a doc) --"
+    (cd website && bun scripts/check-navbar.mjs) || rc=1
     echo "-- build (broken-link check) --"
     (cd website && bun run build) || rc=1
     echo "-- stale names (identifiers, variables, crates, paths, recipes, flags the code no longer has) --"
     scripts/site-stale-names.sh || rc=1
     echo "-- rust snippets (the develop/ pages' code compiles) --"
     scripts/site-rust-snippets.sh || rc=1
+    echo "-- edge bars (no coloured bar on the left edge of a card, callout, alert or active item) --"
+    scripts/site-edge-bars.sh || rc=1
     echo "-- card numbers (the site never names an internal card or board id) --"
     scripts/site-card-numbers.sh || rc=1
     echo "-- NPU summaries (what an NPU runs is stated on architecture/npu.mdx only) --"
     scripts/site-npu-summaries.sh || rc=1
+    echo "-- readability (no prose paragraph over the word limit) --"
+    scripts/site-readability.sh || rc=1
     echo "-- ascii (no em-dashes / non-ascii) --"
     ascii_rc=0
     git grep -nIP '[^\x00-\x7F]' -- website ':!website/bun.lock' || ascii_rc=$?

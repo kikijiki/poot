@@ -19,6 +19,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStream
 
 _TF_MAJOR = int(transformers.__version__.split(".")[0])
 DTYPE_KW = "dtype" if _TF_MAJOR >= 5 else "torch_dtype"  # v5 renamed torch_dtype -> dtype
+# The torch build is part of what was measured (cu124 vs cu130 kernels), so the row names it with transformers.
+FRAMEWORK_VERSION = f"{transformers.__version__} (torch {torch.__version__})"
 DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16, "f16": torch.float16,
          "fp32": torch.float32, "f32": torch.float32}
 
@@ -73,7 +75,8 @@ def run_decode_curve(model, tok, device, args, caveats):
 
     print(json.dumps({
         "framework": "transformers",
-        "framework_version": transformers.__version__,
+        "backend": "cuda",
+        "framework_version": FRAMEWORK_VERSION,
         "precision": args.precision,
         "mode": "decode-curve",
         "osl": osl,
@@ -165,7 +168,8 @@ def main():
     sd = lambda xs: statistics.pstdev(xs) if len(xs) > 1 else 0.0
     out = {
         "framework": "transformers",
-        "framework_version": transformers.__version__,
+        "backend": "cuda",
+        "framework_version": FRAMEWORK_VERSION,
         "precision": args.precision,
         "prompt_tokens": prompt_tokens,
         "gen_tokens": n,

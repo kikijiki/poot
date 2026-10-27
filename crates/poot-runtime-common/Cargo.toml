@@ -8,8 +8,6 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-# poot-target (card 608): a leaf crate every other poot crate may depend on (card 522),
-# not a backend runtime/driver/executor/graph/planner, so this stays within ADR-0097's boundary.
 [features]
 # ADR-0113: `device_skip` holds the device-test skip helpers no production code calls (card 671). Enabled only
 # from `[dev-dependencies]` edges.
@@ -18,7 +16,6 @@ test-support = []
 [dependencies]
 # Dynamically loaded (no Vulkan SDK at build time); only the property structs of `vulkan_probe`.
 ash.workspace = true
-poot-target.workspace = true
 libc.workspace = true
 
 [lints]

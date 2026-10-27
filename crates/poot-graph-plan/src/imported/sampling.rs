@@ -8,6 +8,7 @@
 //! of each asset. See `planner::sampling` for their metadata-launch lowering.
 
 kernel_assets! {
+    kind = ImportedKernel;
     family = body_sampling;
 
     ArgmaxChunk {

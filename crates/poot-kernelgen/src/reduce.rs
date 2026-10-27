@@ -143,7 +143,7 @@ mod tests {
     use super::*;
     use crate::helpers::test_only::arr_elem;
     use crate::helpers::{Alloc, slice_f32};
-    use crate::unit_helpers::{ctx, spv, stage_nvptx};
+    use crate::unit_helpers::{assert_staged, ctx, spv, stage_nvptx};
     use poot_kernel_ir::{Local, WorkgroupLocalDecl};
 
     #[test]
@@ -158,7 +158,6 @@ mod tests {
 
         // sum
         let body = reduce_last_lds("rsum", BinOp::Add, cols, 0.0, w);
-        stage_nvptx(&body);
         let s = spv(&body, "rsum_lds");
         let mut bufs = [
             KernelBuffer::read_only_f32(&x),
@@ -210,10 +209,18 @@ mod tests {
     }
 
     #[test]
+    fn reduce_last_lds_emits_valid_nvptx() {
+        // staged for `ptx-check` with no wgpu context: the staging must not depend on a graphics device.
+        stage_nvptx(&reduce_last_lds("rsum", BinOp::Add, 100, 0.0, 32));
+        assert_staged(&["rsum"]);
+    }
+
+    #[test]
     fn array_sum_probe_emits_valid_nvptx() {
         // the private fixed-size array for flash attention's o[D] accumulator: dynamically-indexed store +
         // load into a per-thread alloca [n x f32], NVPTX-only.
         stage_nvptx(&array_sum_probe("array_sum_probe", 8));
+        assert_staged(&["array_sum_probe"]);
     }
 
     #[test]

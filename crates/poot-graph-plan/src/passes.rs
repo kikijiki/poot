@@ -61,9 +61,9 @@ pub use attention_match::canonicalize;
 pub(crate) use attention_match::canonicalize_with_declines;
 pub use attention_match::{AttentionDecline, FusionDecline, FusionDeclineReason, RopeDecline};
 #[cfg(any(test, feature = "test-support"))]
-pub use attention_match::{flash_attention_capped, rope_fusion};
+pub use attention_match::{flash_attention, rope_fusion};
 #[cfg(not(any(test, feature = "test-support")))]
-pub(crate) use attention_match::{flash_attention_capped, rope_fusion};
+pub(crate) use attention_match::{flash_attention, rope_fusion};
 #[cfg(any(test, feature = "test-support"))]
 pub use cse_dce::cse;
 #[cfg(not(any(test, feature = "test-support")))]
@@ -120,7 +120,7 @@ pub(crate) use widen::{fuse_index_casts, fuse_widening_casts};
 #[cfg(any(test, feature = "test-support"))]
 pub fn passes_without_target(g: &Graph) -> Result<Graph, EditError> {
     let g = cse(&canonicalize(g)?)?;
-    let g = flash_attention_capped(&rope_fusion(&fold_iota(&g)?)?.0, Some(65_535))?.0;
+    let g = flash_attention(&rope_fusion(&fold_iota(&g)?)?.0)?.0;
     let g = form_selection(&g)?;
     let g = fuse_contraction_epilogues(&dce(&g)?, |_, _| true)?;
     fuse_index_casts(&fuse_widening_casts(&fuse(&g)?)?)

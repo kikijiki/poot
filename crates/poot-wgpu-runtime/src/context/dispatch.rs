@@ -1,4 +1,6 @@
-use crate::buffer::{check_device_args, check_kernel_buffer_args, resolve_groups, x_extent};
+use crate::buffer::{
+    check_device_args, check_kernel_buffer_args, kernel_lens, resolve_groups, x_extent,
+};
 use crate::context::readback::MapSet;
 use crate::pipeline::{DeviceTimingResult, EncodeItem, spirv_words};
 use crate::timestamps::storage_entry;
@@ -6,7 +8,8 @@ use crate::{
     CachedDispatch, Context, DeviceBuffer, KernelBuffer, PendingDeviceTiming, PendingFault,
     RuntimeError,
 };
-use poot_runtime_common::{BufferRole, CompiledKernel};
+use poot_codegen::CompiledKernel;
+use poot_runtime_common::BufferRole;
 use std::borrow::Cow;
 use std::time::Duration;
 use wgpu::util::DeviceExt;
@@ -129,9 +132,9 @@ impl Context {
         wg: [u32; 3],
         threads: [u32; 3],
         ins: &[&DeviceBuffer],
-        ins_lens: &[u32],
+        ins_lens: &[usize],
         out: &DeviceBuffer,
-        out_len: u32,
+        out_len: usize,
     ) -> Result<DispatchObjects, RuntimeError> {
         check_device_args(kernel, ins, out)?;
         debug_assert_eq!(
@@ -145,8 +148,7 @@ impl Context {
         // the linear index under a 2-D launch (shared codegen, see poot-codegen emit_thread_index).
         let groups = resolve_groups(threads, wg, self.max_workgroups)?;
         let (pipeline, bgl) = self.cached_pipeline(key, kernel)?;
-        let mut lengths: Vec<u32> = ins_lens.to_vec();
-        lengths.push(out_len);
+        let mut lengths = kernel_lens(ins_lens.iter().copied().chain([out_len]))?;
         lengths.push(x_extent(groups, wg));
         let len_buf = self
             .device
@@ -239,9 +241,9 @@ impl Context {
         wg: [u32; 3],
         threads: [u32; 3],
         ins: &[&DeviceBuffer],
-        ins_lens: &[u32],
+        ins_lens: &[usize],
         out: &DeviceBuffer,
-        out_len: u32,
+        out_len: usize,
     ) -> Result<CachedDispatch, RuntimeError> {
         let (pipeline, bind_group, groups, error_storage, length_buffer_guard, error_storage_guard) =
             self.build_dispatch_objects(key, kernel, wg, threads, ins, ins_lens, out, out_len)?;
@@ -565,7 +567,7 @@ impl Context {
         // length buffer [u32; n+1] at binding n: one slot per data buffer, then the folded X-thread
         // extent for `thread_index` reconstruction (shared codegen).
         let groups = resolve_groups(threads, wg, self.max_workgroups)?;
-        let mut lengths: Vec<u32> = buffers.iter().map(KernelBuffer::elem_count).collect();
+        let mut lengths = kernel_lens(buffers.iter().map(KernelBuffer::elem_count))?;
         lengths.push(x_extent(groups, wg));
         self.length_buffer_creates
             .set(self.length_buffer_creates.get() + 1);
@@ -777,8 +779,8 @@ impl Context {
         // kernel), so a per-step caller builds it once, not on every call.
         let (pipeline, bgl) = self.cached_pipeline(label, kernel)?;
         let groups = resolve_groups(threads, wg, self.max_workgroups)?;
-        let mut lengths: Vec<u32> = ins.iter().map(|b| b.elem_count()).collect();
-        lengths.push(out.elem_count());
+        let mut lengths =
+            kernel_lens(ins.iter().map(|b| b.elem_count()).chain([out.elem_count()]))?;
         lengths.push(x_extent(groups, wg));
         self.length_buffer_creates
             .set(self.length_buffer_creates.get() + 1);
@@ -892,7 +894,7 @@ mod step_encode_allocation_tests {
         output: &DeviceBuffer,
         threads: u32,
     ) -> CachedDispatch {
-        let input_lens: Vec<u32> = inputs.iter().map(|b| b.elem_count()).collect();
+        let input_lens: Vec<usize> = inputs.iter().map(|b| b.elem_count()).collect();
         ctx.build_cached_dispatch(
             label,
             key,

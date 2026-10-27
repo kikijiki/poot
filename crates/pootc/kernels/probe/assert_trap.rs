@@ -6,10 +6,10 @@
 //! completion normally (no trap fires); with one index at or past `data.len()`, that lane's `data[j]`
 //! bounds check fails.
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 
 pub fn __poot_kernel_assert_trap(idx: &[u32], data: &[f32], out: &mut [f32]) {
-    let i = thread_index();
+    let i = thread_index_x();
     if i < out.len() {
         let j = idx[i] as usize;
         out[i] = data[j];

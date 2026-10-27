@@ -15,12 +15,13 @@
 //!
 //! `copy` is `vkCmdCopyBuffer` in the same command stream, ordered by the barrier every command carries.
 
+use poot_codegen::CompiledKernel;
 use poot_executor::{
     Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, FlushPolicy, LaunchKind,
     MeasuredDeviceTime,
 };
 use poot_graph_plan::Target;
-use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot};
+use poot_runtime_common::{BufferRole, DeviceIdentity, MemoryCounterSnapshot};
 use poot_target::{Backend, BufferStorage, TargetId};
 use poot_vulkan_runtime::{
     Binding, Context, ContextOptions, DeviceBuffer, GraphDeviceTime, GraphTiming, KernelFault,
@@ -173,6 +174,10 @@ impl Device for VulkanDevice {
 
     fn free_memory_bytes(&self) -> Option<u64> {
         self.ctx.free_memory_bytes()
+    }
+
+    fn identity(&self) -> Option<DeviceIdentity> {
+        Some(self.ctx.identity())
     }
 
     fn allocate(

@@ -32,6 +32,7 @@ poot-ptx-runtime = { workspace = true, features = ["test-support"] }
 # ROCm/HSA hardware, the same real-executable-path proof card 628's no_contract tests use.
 poot-rocm-runtime.workspace = true
 # The AIE bind-check fixtures the NPU artifact rows drive (`check_aie_bindings`, `core_lengths`).
+poot-npu-artifacts = { workspace = true, features = ["test-support"] }
 poot-runtime-common = { workspace = true, features = ["test-support"] }
 poot-test-util.workspace = true
 

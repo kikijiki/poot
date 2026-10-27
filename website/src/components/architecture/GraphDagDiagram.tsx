@@ -67,7 +67,7 @@ export default function GraphDagDiagram(): React.ReactElement {
       <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--ifm-color-emphasis-600)', textAlign: 'center', marginBottom: '0.5rem' }}>
         Primitive eqns for one attention layer (decode step): hover a node for details
       </div>
-      <svg width={SVG_W} height={SVG_H} viewBox={`0 0 ${SVG_W} ${SVG_H}`} style={{ display: 'block', margin: '0 auto', maxWidth: '100%' }}>
+      <svg role="img" aria-label="Example dataflow graph: eqns as nodes, values as edges" width={SVG_W} height={SVG_H} viewBox={`0 0 ${SVG_W} ${SVG_H}`} style={{ display: 'block', margin: '0 auto', maxWidth: '100%' }}>
         <defs>
           <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
             <polygon points="0 0, 8 3, 0 6" fill="#aaa" />

@@ -16,14 +16,16 @@
 //! [`storage`]: a device buffer's storage contract (element kind, logical dtype, layout), shared by
 //! every runtime's buffer handle and by the planner's per-value storage record (card 527).
 
+mod access;
 pub mod aie;
 pub mod calibration;
 pub mod dram_channels;
 pub mod storage;
 pub mod vpu;
+pub use access::ArgAccess;
 pub use aie::{AieCaps, AieIsa, AiePlatform, AieTargetId};
 pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
-pub use vpu::{NarrowingContract, VendorCompilerId, VpuArithmetic, VpuCaps, VpuTargetId};
+pub use vpu::{NarrowingContract, VendorCompilerId, VpuCaps, VpuTargetId};
 
 /// The GPU lowering backend. Most of `plan_eqn` is backend-neutral; the NVPTX-only kernels (tensor-core
 /// gemm, spec 025) are gated on this so the SPIR-V/wgpu path keeps the portable kernel.
@@ -45,6 +47,28 @@ pub enum Backend {
     /// ROCm/AMDGPU executor. Carries the per-device arch (gfx code, wavefront, tensor-core family) so
     /// `plan_eqn` can gate the WMMA path on `TensorCoreSupport::Wmma16x16x16Rdna3` (spec 130).
     AmdGcn(AmdArch),
+}
+
+impl Backend {
+    /// The width in bits of the `usize` this backend's generated kernels index with: every element, word
+    /// and bit offset a kernel computes is that wide. PTX and AMDGPU kernels index with `i64`; SPIR-V for
+    /// Vulkan lowers `usize` to `i32` (`poot-codegen`'s `usize_llty`, which a codegen test keeps equal to
+    /// this), so a bit offset past `u32::MAX` wraps there.
+    pub const fn index_bits(self) -> u32 {
+        match self {
+            Backend::Nvptx | Backend::AmdGcn(_) => 64,
+            Backend::SpirvVulkan => 32,
+        }
+    }
+
+    /// The largest bit offset a kernel of this backend holds in its index type
+    /// ([`Self::index_bits`]): `2^32 - 1` on Vulkan, the whole `u64` range on PTX and ROCm.
+    pub const fn max_bit_offset(self) -> u64 {
+        match self.index_bits() {
+            64 => u64::MAX,
+            bits => (1u64 << bits) - 1,
+        }
+    }
 }
 
 /// What a kernel, a plan or a refusal is for, by identity: a GPU lowering backend, an AIE target or a VPU target. The
@@ -352,6 +376,9 @@ pub struct WatchdogBudget {
     /// Multiply-accumulates (`rows * out * K`) for an unsplit packed tiled contraction. Above it the plan is
     /// several dispatches over disjoint tile ranges (POOT-1263).
     pub packed_tiled_work: u64,
+    /// Key-value multiply-accumulates (`rows * keys * (dk + dv)`) for an unsplit streaming attention. Above it
+    /// the plan is several dispatches over disjoint runs of rows (POOT-1313).
+    pub attention_work: u64,
 }
 
 /// Hardware/driver defects the planner must route around by construction. `None` means "not known to be
@@ -362,17 +389,12 @@ pub struct KnownMiscompiles {
     /// RADV: the LDS-cooperative tiled GEMM produces wrong, non-deterministic output at or above this
     /// many workgroups in one dispatch (card 095). `None` on a device with no confirmed ceiling.
     pub tiled_gemm_max_workgroups: Option<u32>,
-    /// RADV: a workgroup wider than one wave64 miscomputes, because the upper waves' workgroup-local writes
-    /// are not visible after the barrier (output rows come back about zero) even though the SPIR-V is valid.
-    /// Gates the LDS tile edge to the 64-lane one ([`calibration::GemmLaunch::resolve`]).
-    pub lds_stale_above_wave64: bool,
 }
 
 impl KnownMiscompiles {
     /// No confirmed defect: the state of a device nobody found one on.
     pub const NONE: Self = Self {
         tiled_gemm_max_workgroups: None,
-        lds_stale_above_wave64: false,
     };
 }
 
@@ -518,10 +540,6 @@ pub struct DeviceCaps {
     /// two-byte storage and no packed reader for it) instead of being refused (the lane is packed and
     /// a widening copy of the weight would double its bytes).
     pub widens_bf16_decode_weight: bool,
-    /// Whether the Rust-compiled imported bodies that declare workgroup-local arrays compile for this device's
-    /// code generator (R468-015: the AMDGPU LLVM rejects their Rust-compiled `zeroinitializer` in addrspace 3). Without it the
-    /// generated tiled GEMM is the tiled path.
-    pub imported_lds_array_bodies: bool,
     /// Whether the device's runtime has a peer-to-peer transport to another device of its kind (point-to-point
     /// copies and the collectives built on them). Without it a stage cut between two such devices has nothing
     /// to carry its boundary.
@@ -529,16 +547,17 @@ pub struct DeviceCaps {
     /// The output-column count above which a decode GEMV is measured slower than the batched matmul on this
     /// device; `None` where nobody measured one (the GEMV is kept at any width).
     pub decode_gemv_max_out_cols: Option<u32>,
-    /// The kind of device the launch figures are calibrated for. The M>1 launch is derived from it and
+    /// The kind of device the launch figures are calibrated for. The launch is derived from it and
     /// `known_miscompiles` by [`DeviceCaps::gemm_launch`], so the two cannot disagree.
     pub launch_class: calibration::LaunchClass,
 }
 
 impl DeviceCaps {
-    /// The tile edge and lane grids the M>1 contraction schedules launch with on this device: the class figure
-    /// with the `known_miscompiles` gate applied ([`calibration::GemmLaunch::resolve`]).
+    /// The lane grids the M>1 register-tiled contraction launches with and the packed decode Gemv's lane run on this
+    /// device, the figures of its class ([`calibration::GemmLaunch::resolve`]); which lane grid a contraction runs is
+    /// the cost model's choice under this device's workgroup and LDS limits.
     pub const fn gemm_launch(&self) -> calibration::GemmLaunch {
-        calibration::GemmLaunch::resolve(self.launch_class, &self.known_miscompiles)
+        calibration::GemmLaunch::resolve(self.launch_class)
     }
 }
 
@@ -574,6 +593,23 @@ pub const DECODE_GEMV_CHUNK_TRIGGER: u64 = 220_000;
 /// projection split on this box (`a_packed_tiled_contraction_over_the_watchdog_budget_matches_the_oracle_on_wgpu`);
 /// the full 2048-token forward was not run. It is not tuned: a slower body or device wants a smaller value.
 pub const PACKED_TILED_CHUNK_WORK: u64 = 8_000_000_000;
+
+/// POOT-1313: key-value multiply-accumulates (`rows * keys * (dk + dv)`, the keys a row considers bounded by
+/// the cache length or its sliding window) one streaming-attention dispatch may carry on a device with the
+/// display watchdog ([`WatchdogBudget::attention_work`]).
+///
+/// Calibration, Strix Halo behind RADV (gemma-3-1b-it, wgpu, 2026-10-23): the global-attention layer of an
+/// 8192-token prefill (32768 rows of 8192 keys at `dk + dv` 512, 1.4e11 by this unit) ran as one dispatch
+/// that took 2.0 s and lost the device; the same layer at 6144 tokens (7.7e10) completed. The unit counts
+/// every key a row could see, so a causal row (about half of them) runs at roughly 7e10 per second here.
+/// 1e10 is ~0.15 s per dispatch, an order below the ~1.5 s window cards 163/258 measured. It is not tuned: a
+/// slower device wants a smaller value.
+pub const ATTENTION_CHUNK_WORK: u64 = 10_000_000_000;
+
+/// The dispatch work one submit may carry on a device with the display watchdog: the executor's flush bound,
+/// and the weight a dispatch at its family's budget (for attention, [`WatchdogBudget::attention_work`]) is
+/// given, so a submit holds one such dispatch.
+pub const SUBMIT_WORK: u64 = 4_000_000;
 
 /// Safe single-buffer cap for AMD RADV (Vulkan), in bytes: 1.25 GiB.
 ///
@@ -630,7 +666,6 @@ impl DeviceCaps {
             matrix_lowering: MatrixLowering::CooperativeMatrixF16,
             native_two_byte_floats: false,
             widens_bf16_decode_weight: false,
-            imported_lds_array_bodies: true,
             peer_transport: false,
             decode_gemv_max_out_cols: None,
             launch_class: calibration::LaunchClass::Vulkan,
@@ -664,7 +699,6 @@ impl DeviceCaps {
             matrix_lowering: MatrixLowering::None,
             native_two_byte_floats: true,
             widens_bf16_decode_weight: false,
-            imported_lds_array_bodies: false,
             peer_transport: false,
             decode_gemv_max_out_cols: None,
             launch_class: calibration::LaunchClass::Hsa,
@@ -695,7 +729,6 @@ impl DeviceCaps {
             matrix_lowering: MatrixLowering::NvidiaWmmaBf16,
             native_two_byte_floats: true,
             widens_bf16_decode_weight: true,
-            imported_lds_array_bodies: true,
             peer_transport: true,
             decode_gemv_max_out_cols: calibration::nvidia_decode_gemv_max_out_cols(8).known(),
             launch_class: calibration::LaunchClass::Cuda,
@@ -706,38 +739,6 @@ impl DeviceCaps {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The launch edge is derived from the class and `known_miscompiles`, never stored beside them: hand-built
-    /// caps that set the LDS defect launch the portable 8 whatever their class, and the RADV preset does too.
-    /// Mutation: drop the `lds_stale_above_wave64` gate in `GemmLaunch::resolve`; the hand-built HSA row reads 16.
-    #[test]
-    fn a_hand_built_caps_with_the_lds_defect_clamps_the_tile_to_the_portable_edge() {
-        let defect = KnownMiscompiles {
-            lds_stale_above_wave64: true,
-            ..KnownMiscompiles::NONE
-        };
-        let edge = |caps: &DeviceCaps| caps.gemm_launch().tile_edge;
-        let rocm = DeviceCaps::rocm_default();
-        assert_eq!(edge(&rocm), calibration::HSA_TILE_EDGE);
-        assert_eq!(
-            edge(&DeviceCaps {
-                known_miscompiles: defect,
-                ..rocm
-            }),
-            calibration::PORTABLE_TILE_EDGE
-        );
-        assert_eq!(
-            edge(&DeviceCaps {
-                known_miscompiles: defect,
-                ..DeviceCaps::ptx_default()
-            }),
-            calibration::PORTABLE_TILE_EDGE
-        );
-        assert_eq!(
-            edge(&DeviceCaps::wgpu_rdna3_igpu()),
-            calibration::PORTABLE_TILE_EDGE
-        );
-    }
 
     /// A calibration table keys a device class by this label: each GPU backend has its own, an AMD part
     /// carries its gfx code, and an NPU has none. Mutation: drop the arch from the amdgcn label.
@@ -765,7 +766,6 @@ mod tests {
         let target = TargetId::from(VpuTargetId::Npu4);
         assert_eq!(target.calibration_label(), None);
         assert_eq!(VpuTargetId::Npu4.canonical(), "vpu:platform=NPU4000");
-        assert_eq!(VpuTargetId::Npu4.arithmetic(), VpuArithmetic::F16);
         assert_eq!(
             VendorCompilerId { major: 7, minor: 5 }.canonical(),
             "vcl=7.5"

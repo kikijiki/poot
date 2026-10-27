@@ -97,9 +97,10 @@
     "adapter": { "type": "string", "description": "poot: the adapter name the executor reported for the device it opened (not the host's first GPU). Part of a cell's comparable identity." },
     "driver_version": { "type": "string", "description": "poot: the driver stack the executor's runtime reported (Mesa/Vulkan, HSA, CUDA). Part of a cell's comparable identity." },
     "checkpoint_digest": { "type": "string", "pattern": "^blake3:[0-9a-f]{64}$", "description": "poot: blake3 over the stored weights the driver loaded (name, shape, stored dtype and bytes in key order). Two checkpoints under one model id digest differently. Part of a cell's comparable identity." },
+    "prefill_chunk": { "type": ["integer", "null"], "minimum": 1, "description": "poot: the prefill chunk the cell ran with, in tokens: the whole longest prompt when its plan fits the device, else the largest smaller chunk that does (null in a row recorded before the field: whole prompts). Chunked and whole-prompt prefill time differently, so it is part of a cell's comparable identity; a chunk that holds the longest prompt is the whole-prompt prefill." },
     "compute_dtype": { "type": "string", "description": "poot: the dtype the engine computes in; `precision` is the dtype the weights are stored in. Part of a cell's comparable identity." },
     "engine": { "type": "string", "description": "poot: what generated the result (the driver's one loop)." },
-    "driver": { "type": "object", "description": "poot: the driver loop's own counters for the cell (prepared entries, retained bytes, compiles, steps, host picks, recordings and replays): a regression in compile or replay count shows in a stored row." },
+    "driver": { "type": "object", "description": "poot: the driver loop's own counters for the cell (prepared entries, retained bytes, compiles, steps, host picks, recordings and replays, and the live, peak and allocation count of its device memory by buffer role): a regression in compile or replay count shows in a stored row." },
     "profiled": { "type": "boolean", "description": "poot: whether the runner timed the device (`--profile`). A profiled run is a diagnostic, never throughput evidence: it is stored apart (results/diagnostics/) and compares only with another profiled run." },
     "binary_sha256": {
       "type": ["string", "null"],
@@ -112,7 +113,7 @@
     },
     "backend": {
       "type": "string",
-      "description": "The backend the cell ran on (poot: ptx, rocm or wgpu, as requested through POOT_BENCH_BACKEND and reported back by the runner; other engines: what they report, e.g. vulkan)."
+      "description": "The backend the cell ran on (poot: ptx, rocm, wgpu or vulkan, as requested through POOT_BENCH_BACKEND and reported back by the runner; other engines: what they report, e.g. vulkan)."
     },
     "device": {
       "type": ["string", "null"],
@@ -127,14 +128,15 @@
     "iterations": { "type": "integer", "minimum": 1, "description": "Number of timed iterations the median/stats are over." },
     "ttft_ms_stdev": { "type": "number", "minimum": 0, "description": "Stdev of TTFT across iterations (noise indicator)." },
     "decode_tok_s_stdev": { "type": "number", "minimum": 0 },
-    "peak_vram_bytes": { "type": "integer", "description": "Peak GPU memory used during the runner's lifetime, from the harness NVML/nvidia-smi sampler (external, uniform across frameworks). Omitted when unavailable, including shared-memory iGPUs." },
+    "peak_vram_bytes": { "type": "integer", "description": "Peak GPU memory used during the runner's lifetime, from the harness NVML/nvidia-smi sampler (external, uniform across frameworks). Omitted when unavailable. On an AMD GPU it is the sum of amdgpu sysfs mem_info_vram_used and mem_info_gtt_used (the GTT pool is the system memory a unified-memory APU holds), see peak_gtt_bytes." },
     "vram_baseline_bytes": { "type": "integer", "description": "GPU memory used just before the runner started (other processes), subtracted is left to the report; recorded raw." },
+    "peak_gtt_bytes": { "type": "integer", "description": "Peak GTT (system memory mapped for the GPU) in use, from amdgpu sysfs mem_info_gtt_used; a component of peak_vram_bytes on AMD GPUs. Omitted on NVIDIA." },
     "peak_rss_bytes": { "type": "integer", "description": "Peak process resident set size during the runner's lifetime, from /proc (external)." },
     "gpu_util_mean_pct": { "type": "number", "description": "Mean GPU compute utilization (% of sample periods the SMs were busy) over the cell, from the external sampler. Low = headroom (idle GPU between launches/syncs)." },
     "gpu_util_peak_pct": { "type": "number", "description": "Peak GPU compute utilization over the cell, from the external sampler." },
     "cpu_util_mean_pct": { "type": "number", "description": "Mean process-tree CPU utilization (%, 100% == one full core) over the cell, from psutil. Near 100% while GPU util is low points to a single-thread host bottleneck feeding the GPU." },
     "cpu_util_peak_pct": { "type": "number", "description": "Peak process-tree CPU utilization (%, 100% == one full core) over the cell." },
-    "peak_power_w": { "type": "number", "description": "Peak instantaneous GPU board power draw (watts) during the runner's lifetime, from the harness NVML/nvidia-smi sampler (external, uniform across frameworks). Omitted when unavailable." },
+    "peak_power_w": { "type": "number", "description": "Peak instantaneous GPU board power draw (watts) during the runner's lifetime, from the harness sampler (NVML/nvidia-smi, or amdgpu hwmon power1_average on AMD; external, uniform across frameworks). Omitted when unavailable." },
     "energy_j": { "type": "number", "description": "Total GPU energy consumed over the cell (joules), integrated from the same power samples as peak_power_w (power_w * wall-clock dt per sample, summed). Omitted when unavailable." },
     "energy_wh": { "type": "number", "description": "energy_j converted to watt-hours (energy_j / 3600), for readability at bench-cell scale." },
     "util_series": { "type": "array", "description": "Downsampled (~1 Hz) utilization trace over the cell for plotting util-over-time. Each entry is [t_s, gpu_pct, cpu_pct, vram_bytes, rss_bytes, power_w]; spans all ISLs of a decode-curve cell (no per-ISL markers).", "items": { "type": "array" } },

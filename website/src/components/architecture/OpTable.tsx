@@ -107,6 +107,14 @@ const OPS: Op[] = [
     outputShape: "[..., k]",
     notes: "Expert ids from a stable rank tensor (MoE routing)",
   },
+  {
+    name: "ExpertGroup(experts)",
+    category: "data",
+    inputs: "ids: [M]",
+    outputShape: "[2, M]",
+    notes:
+      "Rows sorted by expert (stable) and the inverse permutation; an id outside the table sorts last (MoE prefill)",
+  },
   // Reduce
   {
     name: "Reduce(op, axis, keepdim)",

@@ -19,6 +19,7 @@
 //! and a word copy covers it. The device compiles nothing: the engine owns the kernel and hands it over
 //! through [`Device::copy_mechanism`].
 
+use poot_codegen::CompiledKernel;
 use poot_executor::{
     Arg, CopyKernel, CopyKernelSink, CopyMechanism, Device, DeviceTime, Dispatch,
     DispatchDeviceTime, LaunchKind, MeasuredDeviceTime,
@@ -28,7 +29,7 @@ use poot_rocm_runtime::{
     BoundKernarg, DispatchSpan, KernelHandle, RocmBuffer, RocmContext, RocmContextOptions,
     RocmError,
 };
-use poot_runtime_common::{BufferRole, CompiledKernel, DeviceIdentity, MemoryCounterSnapshot};
+use poot_runtime_common::{BufferRole, DeviceIdentity, MemoryCounterSnapshot};
 use poot_target::{AmdArch, Backend, BufferStorage, ElementKind, TargetId};
 
 use crate::error::RocmGpuError;
@@ -232,7 +233,7 @@ impl Device for RocmDevice {
     }
 
     fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
-        buffer.elem_count() as usize
+        buffer.elem_count()
     }
 
     fn load_kernel(
@@ -281,13 +282,13 @@ impl Device for RocmDevice {
         let in_pairs: Vec<(&RocmBuffer, u64)> = d
             .inputs
             .iter()
-            .map(|a: &Arg<'_, Self>| (a.buffer, u64::from(a.elems)))
+            .map(|a: &Arg<'_, Self>| (a.buffer, a.elems as u64))
             .collect();
         let out_buf = d.output.buffer;
         let kernarg = self.bind_kernarg(
             &d.kernel.kernel,
             &in_pairs,
-            (out_buf, u64::from(d.output.elems)),
+            (out_buf, d.output.elems as u64),
         )?;
         let mut elements: Vec<ElementKind> = in_bufs.iter().map(|b| b.element()).collect();
         elements.push(d.output.buffer.element());

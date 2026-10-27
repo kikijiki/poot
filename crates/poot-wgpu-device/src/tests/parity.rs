@@ -89,7 +89,7 @@ fn f16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
 /// (the generated tiled GEMM), compiled for wgpu: the program
 /// holds one `DenseContraction` and no `Transpose`, and every replayed step matches `eval(g)` of the traced graph
 /// within the parity tolerance (ADR-0101 tier 2). The weight lives on the device as packed bfloat16 words.
-/// Mutation: in `tiled_region`'s `WeightLayout::Nk` arm index the weight as `[K, N]`; the `M = 4` and `M = 33`
+/// Mutation: in `dense_tiled_contraction`, read the `[N, K]` weight as `TiledWeight::Columns`; the `M = 4` and `M = 33`
 /// rows go red.
 #[test]
 fn bf16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
@@ -235,6 +235,20 @@ fn packed_linears_and_the_indexed_expert_contraction_match_the_oracle_on_wgpu() 
         poot_executor_parity::run_parity(exec.as_mut(), t, &fixture, &mut oracle)
             .unwrap_or_else(|e| panic!("{e}"));
     }
+}
+
+/// POOT-1337: the decode Gemv decodes the real Flash-Next blocks (Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XS, IQ3_XXS, IQ4_NL)
+/// to llama.cpp's gguf-py values bit for bit (`poot_executor_parity::reference_blocks`). The oracle rows above compare
+/// the device with poot's own CPU decode; this row's reference is independent of it.
+/// Mutation: swap two entries of the IQ2_XS grid in `poot_quant::grids`; the `reference_iq2_xs` rows go red.
+#[test]
+fn packed_decode_gemv_matches_llama_cpp_dequantisation_on_real_blocks_on_wgpu() {
+    let Some(device) = wgpu() else {
+        return;
+    };
+    let target = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::reference_blocks::assert_reference_blocks(exec.as_mut(), target);
 }
 
 /// POOT-1074: a recurrent state pool addressed by slot (rows in any order, a masked row committing
@@ -411,4 +425,22 @@ fn selected_attention_reads_exactly_the_selected_blocks_on_wgpu() {
                 .unwrap_or_else(|e| panic!("{e}"));
         }
     }
+}
+
+/// Prefill MoE rows are sorted by expert before the indexed contraction (POOT-1336). The grouping equals a stable
+/// sort by expert and its inverse at every replayed step, on routings that break a naive grouping (every row on one
+/// expert, experts without rows, ties, ids outside the table sorted last, a partial last workgroup, more experts than
+/// rows); a contraction through it is bit-identical per row to the direct one; and an invalid id is a NaN row in
+/// both halves, never another expert's result.
+///
+/// Mutation: in `expert_group` count a bucket's start with `Le` instead of `Lt`; the order and its inverse differ
+/// from the stable sort on the first case.
+#[test]
+fn expert_grouping_is_the_stable_sort_and_changes_no_row_on_wgpu() {
+    let Some(device) = wgpu() else {
+        return;
+    };
+    let t = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::routing::assert_expert_grouping_on_device(exec.as_mut(), t);
 }

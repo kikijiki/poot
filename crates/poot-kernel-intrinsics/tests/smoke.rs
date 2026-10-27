@@ -5,13 +5,27 @@
 
 #[test]
 fn every_intrinsic_is_callable() {
-    assert_eq!(poot_kernel_intrinsics::thread_index(), 0);
-    assert_eq!(poot_kernel_intrinsics::local_index(), 0);
-    assert_eq!(poot_kernel_intrinsics::group_index(), 0);
-    assert_eq!(poot_kernel_intrinsics::group_index_y(), 0);
-    poot_kernel_intrinsics::workgroup_barrier();
-    poot_kernel_intrinsics::wg_write(0, 0, 1.0);
-    assert_eq!(poot_kernel_intrinsics::wg_read(0, 0), 0.0);
+    use poot_kernel_intrinsics as k;
+    for axis in [
+        k::thread_index_x(),
+        k::thread_index_y(),
+        k::thread_index_z(),
+        k::local_index_x(),
+        k::local_index_y(),
+        k::local_index_z(),
+        k::group_index_x(),
+        k::group_index_y(),
+        k::group_index_z(),
+    ] {
+        assert_eq!(axis, 0);
+    }
+    k::workgroup_barrier();
+    k::declare_workgroup(64, 1, 1);
+    k::declare_lds::<f32>(64);
+    k::declare_lds::<u32>(64);
+    k::wg_write(0, 0, 1.0f32);
+    assert_eq!(k::wg_read::<f32>(0, 0), 0.0);
+    assert_eq!(k::wg_read::<u32>(1, 0), 0);
     let mut buf = [0u32];
-    assert_eq!(poot_kernel_intrinsics::atomic_add(&mut buf, 0, 1), 0);
+    assert_eq!(k::atomic_add(&mut buf, 0, 1), 0);
 }

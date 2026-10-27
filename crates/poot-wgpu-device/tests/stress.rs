@@ -1125,7 +1125,7 @@ fn wgpu_scatter_shared_pool_chained_dus_grid_over_65535_workgroups() {
 /// Card 159 Inc 3 repro: a `Binary` broadcast op past the 65535-workgroup ceiling. This is the op family that
 /// crashed the gemma4-dense batched decode step, via the same `Binary`-broadcast mechanism `attention_masked`
 /// composes with (the additive mask add itself is 32768 elements at real gemma4 config, under the cap) and the
-/// family `is_elementwise_2d`/`binary_broadcast_dt_views_grid` covers. Shape: `[1, hq, 1, cap] + [1, 1, 1, cap]`
+/// family `is_elementwise_2d` and the pointwise synthesizer's fold cover. Shape: `[1, hq, 1, cap] + [1, 1, 1, cap]`
 /// at `hq=1024, cap=16384` -> `out_numel = 16_777_216`, one workgroup (256 elements) over the
 /// `65535*256 = 16_776_960` ceiling, the same margin as the real crash (`Broadcast`/`Transpose` at
 /// `1*32*512*1024` elements, see `poot-graph-plan::is_elementwise_2d`). Small buffers (~64MB).

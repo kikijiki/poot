@@ -403,7 +403,8 @@ mod reference {
                     let ms = o.iter().map(|v| v * v).sum::<f64>() / d as f64;
                     let inv = 1.0 / (ms + c.eps).sqrt();
                     for j in 0..d {
-                        row[vh * d + j] = o[j] * inv * norm_scale[j] * silu(z[t][vh * d + j]);
+                        // `output_gate_type: "sigmoid"`: Qwen4ExpTextRMSNormGated gates with a sigmoid.
+                        row[vh * d + j] = o[j] * inv * norm_scale[j] * sigmoid(z[t][vh * d + j]);
                     }
                 }
                 out.push(matvec(
@@ -1395,6 +1396,68 @@ fn from_raw_refuses_what_the_family_cannot_configure() {
         )),
         ("linear_value_head_dim", ConfigReason::Unsupported)
     );
+    // The GDN output gate is SiLU or a sigmoid; another activation is not guessed at.
+    assert_eq!(
+        field(refuse(
+            &|c| c["text_config"]["output_gate_type"] = serde_json::json!("gelu")
+        )),
+        ("output_gate_type", ConfigReason::Unsupported)
+    );
+}
+
+/// The GDN output gate's source in an HF config: `output_gate_type`, else `hidden_act`, else SiLU (HF
+/// `config.output_gate_type or config.hidden_act`); the fixture says `"sigmoid"` like the release. Mutation:
+/// drop the `hidden_act` fallback in `output_gate`; the second and third rows go red.
+#[test]
+fn the_hf_output_gate_follows_output_gate_type_then_hidden_act() {
+    use crate::components::gdn::OutputGate;
+
+    let gate = |edit: &dyn Fn(&mut serde_json::Map<String, serde_json::Value>)| {
+        let mut config = super::fixture_config();
+        edit(config["text_config"].as_object_mut().unwrap());
+        let params = Qwen4ExpParams::from_raw(&RawConfig::HfJson {
+            config: &config,
+            generation: None,
+            preprocessor: None,
+        })
+        .expect("the config loads");
+        // `GdnParams` has no accessor: the gate is the only field that differs between these.
+        [OutputGate::Silu, OutputGate::Sigmoid]
+            .into_iter()
+            .find(|&g| params.gdn == params.gdn.with_output_gate(g))
+            .expect("one of the two gates")
+    };
+    assert_eq!(gate(&|_| {}), OutputGate::Sigmoid);
+    // Absent: SiLU.
+    assert_eq!(
+        gate(&|t| {
+            t.remove("output_gate_type");
+        }),
+        OutputGate::Silu
+    );
+    // `output_gate_type` absent or null: `hidden_act` names the gate.
+    assert_eq!(
+        gate(&|t| {
+            t.remove("output_gate_type");
+            t.insert("hidden_act".into(), "sigmoid".into());
+        }),
+        OutputGate::Sigmoid
+    );
+    assert_eq!(
+        gate(&|t| {
+            t.insert("output_gate_type".into(), serde_json::Value::Null);
+            t.insert("hidden_act".into(), "sigmoid".into());
+        }),
+        OutputGate::Sigmoid
+    );
+    // `output_gate_type` wins over `hidden_act`.
+    assert_eq!(
+        gate(&|t| {
+            t.insert("output_gate_type".into(), "silu".into());
+            t.insert("hidden_act".into(), "sigmoid".into());
+        }),
+        OutputGate::Silu
+    );
 }
 
 /// The prompt every driver row feeds the families, and the greedy tokens the independent reference
@@ -1404,13 +1467,13 @@ fn from_raw_refuses_what_the_family_cannot_configure() {
 /// prompt as whole-granule prefill plus decode steps: SC-008's row on the real family.
 const PROMPT: [i32; 7] = [3, 17, 40, 8, 25, 11, 2];
 const GREEDY: [u32; 24] = [
-    38, 45, 2, 44, 16, 27, 35, 25, 34, 10, 28, 16, 14, 10, 15, 35, 36, 3, 38, 30, 4, 39, 18, 21,
+    22, 6, 32, 38, 38, 29, 17, 14, 41, 19, 40, 32, 12, 10, 33, 36, 42, 33, 1, 29, 24, 15, 8, 47,
 ];
 const GREEDY_PACKED: [u32; 24] = [
-    22, 22, 46, 11, 6, 18, 7, 22, 26, 28, 45, 9, 11, 13, 30, 33, 28, 30, 12, 31, 11, 5, 11, 11,
+    22, 22, 0, 21, 36, 11, 3, 43, 19, 19, 36, 14, 22, 26, 33, 22, 41, 29, 26, 16, 29, 26, 22, 31,
 ];
 const GREEDY_FINETUNE: [u32; 24] = [
-    12, 6, 34, 37, 30, 7, 38, 40, 18, 38, 7, 40, 7, 6, 34, 21, 38, 46, 27, 7, 43, 31, 28, 28,
+    5, 38, 7, 12, 33, 8, 31, 15, 5, 7, 7, 5, 7, 7, 7, 38, 7, 40, 40, 18, 37, 32, 16, 32,
 ];
 
 /// The greedy argmax of `logits` (one position).
@@ -1502,25 +1565,25 @@ const HISTORIES: [[i32; 6]; 3] = [
 ];
 const HISTORIES_TOP5: [[(u32, f64); 5]; 3] = [
     [
-        (25, -1.903_203_6),
-        (33, -2.256_853_4),
-        (15, -3.129_722),
-        (21, -3.237_417),
-        (1, -3.352_075_7),
+        (8, -2.235_063_5),
+        (30, -2.696_976_8),
+        (40, -3.029_003_7),
+        (23, -3.061_339_9),
+        (25, -3.124_625),
     ],
     [
-        (35, -2.689_749_4),
-        (25, -2.868_450_9),
-        (30, -2.914_160_6),
-        (26, -2.922_117_3),
-        (2, -3.010_46),
+        (2, -2.744_261_7),
+        (40, -3.040_147_7),
+        (25, -3.060_595_2),
+        (3, -3.182_795_8),
+        (23, -3.196_833_6),
     ],
     [
-        (32, -2.643_691_5),
-        (21, -2.647_688_7),
-        (38, -2.836_676_7),
-        (23, -2.846_178_8),
-        (29, -2.876_545),
+        (7, -2.550_995_5),
+        (34, -2.828_969_5),
+        (23, -2.847_241),
+        (13, -2.861_092_5),
+        (46, -2.909_138_8),
     ],
 ];
 

@@ -25,7 +25,7 @@ use super::qsa::QsaParams;
 use super::{FAMILY, LayerKind};
 use crate::components::attention::{AttentionParams, QkNorm};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
-use crate::components::gdn::GdnParams;
+use crate::components::gdn::{GdnParams, OutputGate};
 use crate::components::gdn_names::GdnTable;
 use crate::components::moe::{GateUpForm, MoeParams};
 use crate::components::norm::NormParams;
@@ -263,7 +263,8 @@ impl Qwen4ExpParams {
                 fields.count(CONV_KERNEL, None)?,
                 NormParams::new(dims.eps).map_err(param_error)?,
             )
-            .map_err(param_error)?;
+            .map_err(param_error)?
+            .with_output_gate(output_gate(raw, text, &fields)?);
 
         let renormalize = fields.flag(NORM_TOPK_PROB, true)?;
         let moe = MoeParams::new(
@@ -313,6 +314,26 @@ impl Qwen4ExpParams {
             eos: dims.eos,
             bos: dims.bos,
         })
+    }
+}
+
+/// The GDN output gate's activation. HF names it: `output_gate_type`, else `hidden_act` (SiLU when
+/// both are absent); the shipped Flash-Next config says `"sigmoid"`. A GGUF has no key for it:
+/// llama.cpp's `qwen4exp` graph (`build_norm_gated`) is a sigmoid gate by construction.
+fn output_gate(
+    raw: &RawConfig<'_>,
+    text: &serde_json::Value,
+    fields: &Fields<'_>,
+) -> Result<OutputGate, ModelError> {
+    if matches!(raw, RawConfig::Gguf(_)) {
+        return Ok(OutputGate::Sigmoid);
+    }
+    let named = |key: &str| text.get(key).filter(|v| !v.is_null());
+    match named("output_gate_type").or_else(|| named("hidden_act")) {
+        None => Ok(OutputGate::Silu),
+        Some(serde_json::Value::String(act)) if act == "silu" => Ok(OutputGate::Silu),
+        Some(serde_json::Value::String(act)) if act == "sigmoid" => Ok(OutputGate::Sigmoid),
+        Some(_) => Err(fields.error("output_gate_type", ConfigReason::Unsupported)),
     }
 }
 

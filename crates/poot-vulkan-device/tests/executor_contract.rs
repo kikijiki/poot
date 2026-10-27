@@ -7,11 +7,12 @@
 //! Vulkan device opens (`POOT_REQUIRE_VULKAN=1` turns that into a failure); rows run serially under
 //! `/tmp/poot-gpu.lock`.
 
+use poot_codegen::CompiledKernel;
 use poot_executor::{Arg, Device, Dispatch};
-use poot_graph_plan::ImportedKernel;
+use poot_graph_plan::ProbeKernel;
 use poot_graph_plan::test_support::gpu_caps;
 use poot_runtime_common::device_skip::open_or_skip;
-use poot_runtime_common::{BufferRole, CompiledKernel, DeviceBackend};
+use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::{BufferStorage, ElementKind, LogicalDType};
 use poot_vulkan_device::{VulkanDevice, VulkanGpuError, VulkanKernel};
 use std::path::PathBuf;
@@ -112,14 +113,14 @@ fn record_add(
     dst: &poot_vulkan_runtime::DeviceBuffer,
     n: usize,
 ) {
-    let elems = n as u32;
+    let elems = n;
     device
         .dispatch(Dispatch {
             kernel,
             inputs: &[Arg { buffer: lhs, elems }, Arg { buffer: rhs, elems }],
             output: Arg { buffer: dst, elems },
             launch: poot_executor::LaunchKind::Grid {
-                threads: [elems, 1, 1],
+                threads: [n as u32, 1, 1],
                 workgroup: [64, 1, 1],
             },
             work: n as u64,
@@ -212,7 +213,7 @@ fn an_aie_launch_is_a_typed_refusal_on_vulkan() {
                 buffer: &out,
                 elems: 4,
             },
-            launch: poot_executor::LaunchKind::Aie(poot_executor::AieInvocation::new(
+            launch: poot_executor::LaunchKind::Aie(poot_npu_artifacts::AieInvocation::new(
                 AieTargetId::Xdna2,
                 std::num::NonZeroU32::new(1).unwrap(),
             )),
@@ -395,7 +396,7 @@ fn a_kernel_assert_is_a_fault_raised_at_synchronize() {
     let Some(mut device) = vulkan() else {
         return;
     };
-    let body = ImportedKernel::AssertTrap.body().clone();
+    let body = ProbeKernel::AssertTrap.body().clone();
     let kernel = device
         .load_kernel("assert_trap", compile_for_vulkan(&body, "assert_trap"))
         .expect("load assert_trap");
@@ -469,6 +470,24 @@ fn a_kernel_assert_is_a_fault_raised_at_synchronize() {
     device.replay(&recording).unwrap();
     device.synchronize().expect("no fault on in-range indices");
     assert_eq!(read_f32(&mut device, &out), [40.0, 10.0, 30.0, 20.0]);
+}
+
+/// POOT-1308: the raw Vulkan device names its adapter and driver (a benchmark row cannot be attributed
+/// without them): the adapter is the physical device's name and the driver is the loader's driver name and
+/// build string, not empty.
+///
+/// Mutation: `identity` returns `None` and the first expectation goes red; it returns an empty driver string
+/// and the driver assertion goes red.
+#[test]
+fn the_vulkan_device_names_its_adapter_and_driver() {
+    let Some(device) = vulkan() else {
+        return;
+    };
+    let identity = device
+        .identity()
+        .expect("the raw Vulkan device names its adapter and driver");
+    assert!(!identity.adapter.is_empty(), "adapter: {identity:?}");
+    assert!(!identity.driver.is_empty(), "driver: {identity:?}");
 }
 
 /// POOT-1081: the raw Vulkan device reports what it could still allocate right now, read from

@@ -84,6 +84,26 @@ pub struct ServingShapes<'a> {
     pub chain: Option<NonZeroUsize>,
 }
 
+impl<'a> ServingShapes<'a> {
+    /// The shapes [`Driver::generate_turn`] serves for `heads`: one row, every admitted piece
+    /// ([`Warm::Admitted`]), no windows, adapters or chain. A turn extends the prepared set to exactly
+    /// these, so a caller that plans or prepares a driver it will run turns on takes its shapes from here:
+    /// the footprint the chunk was fitted for is then the one the first turn allocates, and the turn adds no
+    /// entry the plan never counted.
+    #[must_use]
+    pub fn turn(layout: Layout, heads: &'a [Head]) -> Self {
+        Self {
+            layout,
+            rows: &[NonZeroUsize::MIN],
+            heads,
+            warm: Warm::Admitted,
+            windows: &[],
+            adapters: &[],
+            chain: None,
+        }
+    }
+}
+
 /// Whether a model's carried state is only positional KV (a rejected token's write is harmless) or
 /// folds every token into a value the driver cannot roll back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -511,14 +531,15 @@ impl<S: State> Driver<S> {
             } else {
                 Program::Step
             },
-            shape: StepShape::new(
-                rows,
-                NonZeroUsize::new(tokens).expect("a piece carries at least one token"),
-                self.settings.options.capacity,
-            )
-            .with_kv(kv)
-            .with_logits(logits)
-            .with_hidden(self.hidden_of(role)),
+            shape: self
+                .settings
+                .step_shape(
+                    rows,
+                    NonZeroUsize::new(tokens).expect("a piece carries at least one token"),
+                )
+                .with_kv(kv)
+                .with_logits(logits)
+                .with_hidden(self.hidden_of(role)),
             head,
             adapters,
             carried,

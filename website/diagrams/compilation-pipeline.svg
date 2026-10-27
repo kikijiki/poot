@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1175" viewBox="0 0 1200 1175">
   <title>From model code to GPU</title>
-  <desc>From model code to GPU: graph IR, graph passes, kernel planning, one shared LLVM emitter, three backends</desc>
+  <desc>From model code to GPU: graph IR, graph passes, kernel planning, one shared LLVM emitter, four backends</desc>
   <style>
     text { font-family: "DejaVu Sans Mono", monospace; fill: #e8eaf0; }
     .bg { fill: #0d1017; }
@@ -27,7 +27,7 @@
   </defs>
   <rect class="bg" width="1200" height="1175"/>
   <text class="title" x="40" y="52">From model code to GPU</text>
-  <text class="sub" x="40" y="82">One graph, three backends, one host call per token</text>
+  <text class="sub" x="40" y="82">One graph, four backends, one host call per token</text>
 
   <g class="link" marker-end="url(#arrow)">
     <path d="M600 192 V222" marker-end="url(#arrow)"/>
@@ -38,15 +38,18 @@
     <path d="M340 620 L480 660" marker-end="url(#arrow)"/>
     <path d="M860 620 L720 660" marker-end="url(#arrow)"/>
     <path d="M600 722 V752" marker-end="url(#arrow)"/>
-    <path d="M440 814 L227 842" marker-end="url(#arrow)"/>
-    <path d="M600 814 V842" marker-end="url(#arrow)"/>
-    <path d="M760 814 L972 842" marker-end="url(#arrow)"/>
-    <path d="M227 940 V974" marker-end="url(#arrow)"/>
-    <path d="M600 940 V974" marker-end="url(#arrow)"/>
-    <path d="M972 940 V974" marker-end="url(#arrow)"/>
-    <path d="M227 1040 L480 1070" marker-end="url(#arrow)"/>
-    <path d="M600 1040 V1070" marker-end="url(#arrow)"/>
-    <path d="M972 1040 L720 1070" marker-end="url(#arrow)"/>
+    <path d="M360 814 L187 842" marker-end="url(#arrow)"/>
+    <path d="M500 814 L462 842" marker-end="url(#arrow)"/>
+    <path d="M700 814 L737 842" marker-end="url(#arrow)"/>
+    <path d="M840 814 L1012 842" marker-end="url(#arrow)"/>
+    <path d="M187 940 V974" marker-end="url(#arrow)"/>
+    <path d="M462 940 V974" marker-end="url(#arrow)"/>
+    <path d="M737 940 V974" marker-end="url(#arrow)"/>
+    <path d="M1012 940 V974" marker-end="url(#arrow)"/>
+    <path d="M187 1040 L480 1070" marker-end="url(#arrow)"/>
+    <path d="M462 1040 L540 1070" marker-end="url(#arrow)"/>
+    <path d="M737 1040 L660 1070" marker-end="url(#arrow)"/>
+    <path d="M1012 1040 L720 1070" marker-end="url(#arrow)"/>
   </g>
 
   <rect class="box teal" x="365" y="130" width="470" height="62" rx="10"/>
@@ -82,32 +85,41 @@
   <text class="h" x="600" y="780">emit_llvm_ir(body, target)</text>
   <text class="d" x="600" y="800">one shared emitter</text>
 
-  <rect class="box purple" x="60" y="842" width="335" height="98" rx="10"/>
-  <text class="h tx-purple" x="227" y="874">Vulkan / SPIR-V</text>
-  <text class="d" x="227" y="898">LLVM IR -&gt; llc -&gt; .spv</text>
-  <text class="d" x="227" y="920">barrier fixup -&gt; wgpu</text>
+  <rect class="box purple" x="60" y="842" width="255" height="98" rx="10"/>
+  <text class="h tx-purple" x="187" y="874">wgpu / SPIR-V</text>
+  <text class="d" x="187" y="898">LLVM IR -&gt; llc -&gt; .spv</text>
+  <text class="d" x="187" y="920">barrier fixup -&gt; wgpu</text>
 
-  <rect class="box amber" x="432" y="842" width="335" height="98" rx="10"/>
-  <text class="h tx-amber" x="600" y="874">NVIDIA / PTX</text>
-  <text class="d" x="600" y="898">LLVM IR -&gt; llc -&gt; .ptx</text>
-  <text class="d" x="600" y="920">CUDA JIT -&gt; .cubin</text>
+  <rect class="box purple" x="335" y="842" width="255" height="98" rx="10"/>
+  <text class="h tx-purple" x="462" y="874">Vulkan / SPIR-V</text>
+  <text class="d" x="462" y="898">LLVM IR -&gt; llc -&gt; .spv</text>
+  <text class="d" x="462" y="920">-&gt; Vulkan shader module</text>
 
-  <rect class="box red" x="805" y="842" width="335" height="98" rx="10"/>
-  <text class="h tx-red" x="972" y="874">AMD / ROCm</text>
-  <text class="d" x="972" y="898">LLVM IR -&gt; amdclang</text>
-  <text class="d" x="972" y="920">-&gt; .hsaco -&gt; HSA load</text>
+  <rect class="box amber" x="610" y="842" width="255" height="98" rx="10"/>
+  <text class="h tx-amber" x="737" y="874">NVIDIA / PTX</text>
+  <text class="d" x="737" y="898">LLVM IR -&gt; llc -&gt; .ptx</text>
+  <text class="d" x="737" y="920">CUDA JIT -&gt; .cubin</text>
 
-  <rect class="box purple" x="60" y="974" width="335" height="66" rx="10"/>
-  <text class="m" x="227" y="1002">wgpu: cached re-encode,</text>
-  <text class="m" x="227" y="1024">one submit per token</text>
+  <rect class="box red" x="885" y="842" width="255" height="98" rx="10"/>
+  <text class="h tx-red" x="1012" y="874">AMD / ROCm</text>
+  <text class="d" x="1012" y="898">LLVM IR -&gt; amdclang</text>
+  <text class="d" x="1012" y="920">-&gt; .hsaco -&gt; HSA load</text>
 
-  <rect class="box amber" x="432" y="974" width="335" height="66" rx="10"/>
-  <text class="m" x="600" y="1002">CUDA graph capture,</text>
-  <text class="m" x="600" y="1024">one launch per token</text>
+  <rect class="box purple" x="60" y="974" width="255" height="66" rx="10"/>
+  <text class="m" x="187" y="1002">wgpu: cached re-encode,</text>
+  <text class="m" x="187" y="1024">one submit per token</text>
 
-  <rect class="box red" x="805" y="974" width="335" height="66" rx="10"/>
-  <text class="m" x="972" y="1002">HSA: batched AQL,</text>
-  <text class="m" x="972" y="1024">one doorbell per token</text>
+  <rect class="box purple" x="335" y="974" width="255" height="66" rx="10"/>
+  <text class="m" x="462" y="1002">Vulkan: recorded command</text>
+  <text class="m" x="462" y="1024">buffers, resubmitted</text>
+
+  <rect class="box amber" x="610" y="974" width="255" height="66" rx="10"/>
+  <text class="m" x="737" y="1002">CUDA graph capture,</text>
+  <text class="m" x="737" y="1024">one launch per token</text>
+
+  <rect class="box red" x="885" y="974" width="255" height="66" rx="10"/>
+  <text class="m" x="1012" y="1002">HSA: batched AQL,</text>
+  <text class="m" x="1012" y="1024">one doorbell per token</text>
 
   <rect class="box teal" x="415" y="1070" width="370" height="50" rx="10"/>
   <text class="h tx-teal" x="600" y="1101">Output tensor: token logits</text>

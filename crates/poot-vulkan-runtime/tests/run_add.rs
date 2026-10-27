@@ -6,10 +6,11 @@
 
 use std::path::PathBuf;
 
+use poot_codegen::CompiledKernel;
 use poot_codegen::{Target, compile_kernel, kernel_handle};
 use poot_kernel_ir::fixtures;
 use poot_kernel_ir::test_support::square_kernel;
-use poot_runtime_common::{BufferRole, CompiledKernel};
+use poot_runtime_common::BufferRole;
 use poot_target::BufferStorage;
 use poot_vulkan_runtime::{Context, DeviceBuffer};
 

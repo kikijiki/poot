@@ -9,118 +9,63 @@ import ExecutionTimeline from "@site/src/components/architecture/ExecutionTimeli
 
 # Architecture Overview
 
-poot is a from-scratch LLM inference engine in Rust. It runs its own GPU kernels, lowered from
-ordinary Rust source, on four GPU backends: wgpu (Vulkan/SPIR-V), raw Vulkan (SPIR-V through its own
-runtime), ROCm (AMD, raw HSA) and PTX (NVIDIA). It uses no cuBLAS, cuDNN or other vendor math libraries.
+poot is a from-scratch LLM inference engine in Rust. It runs its own GPU kernels, lowered from ordinary Rust source, on wgpu (Vulkan/SPIR-V), raw Vulkan, ROCm (AMD, raw HSA) and PTX (NVIDIA), with no cuBLAS, cuDNN or other vendor math libraries.
 
-The problem it targets: small-batch decode is dominated by host overhead. A naive loop issues
-hundreds of tiny dispatches per token, each costing microseconds of driver time before the GPU does
-any work. poot answers with two mechanisms:
+Small-batch decode is dominated by host overhead: a naive loop issues hundreds of tiny dispatches per token. poot answers with two mechanisms:
 
-- **Automatic fusion.** The IR is finer-grained than the kernels it produces: attention, RMSNorm,
-  RoPE and SwiGLU are compositions of primitives, not opcodes. A compiler pass synthesizes one kernel
-  per fusable region instead of picking from a menu of hand-written fused kernels.
-- **Capture and replay.** The decode graph has a constant shape (fixed-capacity KV plus masking), so
-  its dispatch sequence is recorded once and replayed per token: CUDA graphs on PTX, recorded HSA AQL
-  packets on ROCm, recorded Vulkan command buffers on raw Vulkan, and cached re-encode on wgpu, with
-  submits split where required.
+- **Automatic fusion.** The IR is finer-grained than its kernels, so a compiler pass synthesizes one kernel per fusable region instead of choosing from hand-written fused kernels.
+- **Capture and replay.** The decode graph has a constant shape (fixed-capacity KV plus masking), so its dispatch sequence is recorded once and replayed per token. PTX uses CUDA graphs, ROCm recorded AQL packets, raw Vulkan recorded command buffers, and wgpu a cached re-encode.
 
 ## The one pipeline
 
-The pipeline is one path for every model and backend: the registry finds the family, the family's `Model`
-traces a step, `compile` is the shared compiler entry, `poot-executor`'s `Engine<D>` is the shared executor, and
-the driver runs the token loop over it.
-
-```text
-checkpoint -> loader -> typed weights
-config     -> Registry -> Model (a family: config, weight map, tracer)
-Model::trace(step spec: program, shape, carried inputs) -> Graph (primitives and compositions)
-Graph + target + options -> compile -> Program, or a typed refusal
-program + weights -> executor: load, capture, replay per step
-Driver: token loop, sampling suffix, stops, KV slots  ->  serve: one scheduling loop
-```
+One path serves every model and backend.
 
 <PipelineDiagram />
 
-1. **Tracing.** A model family implements `Model`. Its `trace` is plain Rust over a `Builder`, calling the
-   composite helpers in `poot_graph_ir::ops` and the shared components, once per step shape, with data-free
-   handles. It produces a flat SSA graph. See [Tracing a Model](./tracing.mdx) and
-   [Models, Registry and the Driver](./driver.mdx).
-2. **Optimization.** Graph transforms (CSE, RoPE fusion, the flash-attention rewrite, pointwise and
-   reduction fusion, matmul tiling) rewrite the graph without changing its meaning. See
-   [Fusion](./fusion.mdx).
-3. **Planning.** `plan_eqn` in `poot-graph-plan` gives each equation a plan: an imported or
-   synthesized kernel, a view or alias, or a refusal. `compile` runs this planning as its last step.
-4. **Capture.** The executor allocates stable buffers for weights, intermediates and per-step inputs
-   and records the dispatch sequence once per model and KV capacity.
-5. **Decode.** The driver steps the executor. Per token the host writes the token id and position into their
-   slot buffers and replays or re-encodes the dispatches; logits or the sampled id come back.
+1. **Tracing.** A family's `Model::trace` is plain Rust over a `Builder`, once per step shape. See [Tracing a Model](./tracing.mdx) and [Models and the Registry](./registry.mdx).
+2. **Optimization.** Transforms (CSE, RoPE fusion, the flash-attention rewrite, pointwise and reduction fusion, matmul tiling) rewrite the graph without changing its meaning. See [Fusion](./fusion.mdx).
+3. **Planning.** `plan_eqn` gives each equation a plan: an imported or synthesized kernel, a view or alias, or a refusal. `compile` runs it last.
+4. **Capture.** The executor allocates stable buffers and records the dispatch sequence once per model and KV capacity.
+5. **Decode.** [The Driver](./driver.mdx) steps the executor. Per token the host writes the token id and position into slot buffers and replays or re-encodes; logits or the sampled id come back.
 
 <ExecutionTimeline />
 
 ## Design principles
 
-These rules describe how the code is organized.
-
-- **One pipeline.** Every model is traced, compiled, executed through one executor contract and driven
-  by one generation loop. A family or backend never gets a private route.
-- **Primitive IR.** The IR is elementwise, reduce, broadcast, matmul, gather and view. Attention, norms,
-  RoPE and MoE routing are compositions. A new primitive needs a stated reason a composition cannot serve.
-- **General optimization.** A rewrite fires on any graph with the right semantics, not on one tracer's
-  spelling or op order. Fusion is codegen from the graph, not a catalogue of fused kernels.
-- **Capability is decided by planning.** A model runs on a backend if its graph compiles for that
-  target. Otherwise the planner returns a typed refusal naming the equation and the missing
-  capability. There is no support list.
-- **One semantic definition.** Each op is defined once and shared by tracing, the CPU oracle and every
-  lowering. No second evaluator or hand kernel redefines it.
-- **Backend-neutral above the planner, family-neutral below the model.** Nothing above planning
-  branches on a backend; nothing outside model definitions names a model family. A backend's limits
-  are handled inside that backend's lowering.
-- **Adding a model is writing a graph.** A family is a config type, a weight-name table, a fixture and a
-  tracer over shared components, registered in the model registry. Nothing in the driver, planner, executors
-  or server changes.
-- **Types carry invariants.** Ownership, residency, dtype, layout, launch geometry and capability are
-  types, not comments, names or string matches.
-- **Verification proves behavior.** Tests exercise behavior and can fail. Device results match the
-  CPU oracle within a stated tolerance, real checkpoints match an independent reference on tokens, and
-  a skipped device test is reported as a skip.
+- **One pipeline.** Every model is traced, compiled, executed through one executor contract and driven by one generation loop. No family or backend gets a private route.
+- **Primitive IR.** Attention, norms, RoPE and MoE routing are compositions. A new primitive needs a stated reason a composition cannot serve.
+- **General optimization.** A rewrite fires on any graph with the right semantics, not on one tracer's spelling. Fusion is codegen from the graph, not a catalogue of fused kernels.
+- **Capability is decided by planning.** A model runs on a backend if its graph compiles for that target; otherwise the planner returns a typed refusal naming the equation and the missing capability. There is no support list.
+- **One semantic definition.** Each op is defined once, shared by tracing, the CPU oracle and every lowering.
+- **Backend-neutral above the planner, family-neutral below the model.** A backend's limits are handled inside its lowering.
+- **Adding a model is writing a graph.** A config type, a weight-name table, a fixture and a tracer over shared components, registered in the model registry. Nothing in the driver, planner, executors or server changes.
+- **Types carry invariants.** Ownership, residency, dtype, layout, launch geometry and capability are types, not comments or string matches.
+- **Verification proves behavior.** Device results match the CPU oracle within a stated tolerance, real checkpoints match an independent reference on tokens, and a skipped device test is reported as a skip.
 
 ## Current state
 
-The code runs on one pipeline: a target descriptor, a single `compile` entry, and a shared executor
-contract.
+- **Backends.** Tracing, optimization, planning, kernel import, codegen and capture/replay work on wgpu, raw Vulkan, ROCm and PTX, for any family the registry holds.
+- **Compile.** `compile` owns the pass sequence and returns a `Program` with plans, storage, slots and numerics. Runtime `DeviceCaps` and typed planner refusals are implemented.
+- **Executor.** `Engine<D>` runs over a per-backend `Device`; the first step on an entry records, later steps replay.
+- **Serving.** `poot-serve` serves every registered model through the driver on one engine thread. See [Serving design](./serving-design.mdx).
+- **Weights.** Packed projections keep their stored representation through loading. Dense BF16/F16 weights stay as stored words with no host f32 copy, and packed MoE experts are read in place, so no expert table is materialized.
 
-- Tracing, optimization, planning, kernel import and codegen, and capture/replay work on wgpu, raw Vulkan,
-  ROCm and PTX. Generation runs through the `poot-llm` library driver, over any family the model registry holds.
-- `poot-serve` starts, bounds requests, loads any registered model and serves it through the driver on one
-  engine thread: generation, embeddings, rerank and LoRA administration are messages on one queue. See
-  [Serving design](./serving-design.mdx).
-- `compile` owns the pass sequence and returns a `Program` with plans, storage, slots and numerics.
-  Runtime `DeviceCaps` and typed planner refusals are implemented.
-- One executor contract serves every backend: `poot-executor`'s `Engine<D>` over a per-backend
-  `Device` trait (`WgpuDevice`, `RocmDevice`, `PtxDevice`, `VulkanDevice`). The driver drives it for every registered
-  family; the first step on an entry records, later steps replay.
-- Packed projections keep their stored representation through loading. Dense BF16/F16 weights are kept
-  as stored words with no host f32 copy, and packed MoE experts are read in place by an indexed packed
-  contraction, so no expert table is materialized on the device.
-- There is no megakernel: it is a possible future execution strategy, not code.
-
-For models and features by backend, use the [feature matrix](../reference/feature-matrix.md).
+Models and features per backend: [Supported models and formats](../develop/supported-models.md) and [Serving capabilities](../serve/capabilities.md).
 
 ## Pages in this section
 
-| Page                                                  | What it covers                                       |
-| ----------------------------------------------------- | ---------------------------------------------------- |
-| [The Graph IR](./graph-ir.mdx)                            | The flat SSA primitive graph                         |
-| [Tracing a Model](./tracing.mdx)                          | How a model definition becomes a graph               |
-| [Models, Registry and the Driver](./driver.mdx)           | `Model`, the family registry, the driver's token loop |
-| [Kernels from Rust](./kernel-import.mdx)                  | `#[kernel]` functions, pootc, Stable MIR, lowering   |
-| [Fusion and Planning](./fusion.mdx)                       | Optimization passes, imported vs synthesized kernels |
-| [Backends](./backends.mdx)                                | wgpu, ROCm, PTX and raw Vulkan codegen and dispatch              |
-| [Execution](./execution.mdx)                              | Capture/replay, slot buffers, the CPU oracle         |
-| [Attention and KV Cache](./attention.mdx)                 | Flash-attention rewrite, paged KV, prefix caching    |
-| [Serving design](./serving-design.mdx)                    | HTTP API and the serving design                      |
-| [Crates and implementation details](./implementation.mdx) | Crate map and cross-cutting notes                    |
-| [The Megakernel](./megakernel.mdx)                        | Not implemented; a possible future execution strategy |
-| [NPU Offload](./npu.mdx)                                  | Experimental XDNA2 and Intel NPU4 devices            |
-| [Glossary](./glossary.mdx)                                | Terms used in this section                           |
+| Page | What it covers |
+| --- | --- |
+| [The Graph IR](./graph-ir.mdx) | The flat SSA primitive graph |
+| [Tracing a Model](./tracing.mdx) | How a model definition becomes a graph |
+| [Models and the Registry](./registry.mdx) | `Model`, the input schema, the family registry |
+| [The Driver](./driver.mdx) | The token loop, entries, sampling, the serving surface |
+| [Kernels from Rust](./kernel-import.mdx) | `#[kernel]` functions, pootc, lowering |
+| [Fusion and Planning](./fusion.mdx) | Optimization passes, imported vs synthesized kernels |
+| [Backends](./backends.mdx) | wgpu, raw Vulkan, ROCm and PTX codegen and dispatch |
+| [Execution](./execution.mdx) | Capture/replay, slot buffers, the CPU oracle |
+| [Attention and KV Cache](./attention.mdx) | Flash attention, paged KV, prefix caching |
+| [Serving design](./serving-design.mdx) | The HTTP server and its scheduling loop |
+| [Crates and implementation details](./implementation.mdx) | Crate map and cross-cutting notes |
+| [NPU Offload](./npu.mdx) | Experimental XDNA2 and Intel NPU4 devices |
+| [Glossary](./glossary.mdx) | Terms used in this section |

@@ -4,10 +4,12 @@
 //! `f32`) to `out[0]`. No candidate anywhere (every logit NaN or `-inf`) yields index 0, as the CPU oracle's
 //! scan from `-inf` does. See `argmax_partials.rs` for the tie and NaN contract.
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::{local_index, wg_read, wg_write, workgroup_barrier};
+use poot_kernel_attr::kernel;
+use poot_kernel_intrinsics::{local_index_x, wg_read, wg_write, workgroup_barrier};
 const WORKGROUP_SIZE: usize = 256;
-pub fn __poot_kernel_argmax_finalize(partials: &[f32], out: &mut [f32]) {
-    let lane = local_index();
+#[kernel(workgroup(256), lds(f32, 256), lds(f32, 256))]
+pub fn argmax_finalize(partials: &[f32], out: &mut [f32]) {
+    let lane = local_index_x();
     let groups = partials.len() / 2;
     let mut bv = 0.0f32;
     let mut bi = -1.0f32;
@@ -21,16 +23,16 @@ pub fn __poot_kernel_argmax_finalize(partials: &[f32], out: &mut [f32]) {
         }
         k = k + WORKGROUP_SIZE;
     }
-    wg_write(0, lane, bv);
-    wg_write(1, lane, bi);
+    wg_write::<f32>(0, lane, bv);
+    wg_write::<f32>(1, lane, bi);
     workgroup_barrier();
     if lane == 0 {
         let mut fv = 0.0f32;
         let mut fi = -1.0f32;
         let mut m = 0usize;
         while m < WORKGROUP_SIZE {
-            let cv = wg_read(0, m);
-            let ci = wg_read(1, m);
+            let cv = wg_read::<f32>(0, m);
+            let ci = wg_read::<f32>(1, m);
             if ci >= 0.0 && (fi < 0.0 || cv > fv || (cv == fv && ci < fi)) {
                 fv = cv;
                 fi = ci;

@@ -9,19 +9,33 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::cli::CloudChoice;
 use crate::cli::{ExecArgs, ImageArgs, LogsArgs, RunArgs};
-use crate::clock::{iso_in_minutes, new_exec_run_id, now_iso};
-use crate::db::{Db, ExecOwner, ExecReapReport, PodOwnerPrefix, ReapProtection, Run};
-use crate::image_resolve::{DigestResolver, RegistryV2Resolver, pin_image};
+use crate::clock::{Clock, SystemClock, iso_from_secs, iso_in_minutes, new_exec_run_id, now_iso};
+use crate::cuda::CudaVersion;
+use crate::db::runs::OwnerLiveness;
+use crate::db::{Db, ExecOwner, ExecReapReport, PodOwnerPrefix, ReapProtection, Run, WarmExec};
+use crate::gather::{self, Gathered};
+use crate::hardware;
+use crate::heal::{
+    self, Cancelled, Cursor, Healing, HostFault, LocalFault, Outcome, PodLost, Replacement,
+    SetupFault, Unrecoverable,
+};
+use crate::image_resolve::{
+    DigestResolver, ImageLabels, RegistryV2Resolver, image_min_cuda, pin_image,
+};
 use crate::logging::{list_logs, log, logs_dir, read_log_tail, run_streaming, set_log_sink};
 use crate::manifest::{Model, parse_manifest_models, select_models};
-use crate::runpod::{CloudType, CreateSpec, Pod, RunPod};
-use crate::ssh::{self, Remote};
+use crate::runpod::{
+    CatalogPrice, CloudType, CreateError, CreateSpec, GpuCatalog, Pod, PodNotFound, RunPod,
+};
+use crate::ssh::{self, Remote, SSH_UNREACHABLE};
 
 /// The RunPod operations the orchestrator uses. Production is [`RunPod`]; tests fake it.
 pub(crate) trait PodApi {
     fn create_pod(&self, spec: &CreateSpec<'_>) -> Result<Pod>;
     fn get_pod(&self, id: &str) -> Result<Pod>;
     fn list_pods(&self) -> Result<Vec<Pod>>;
+    /// The GPU catalog with each cloud's hourly price, for pricing a cloud before a create.
+    fn gpu_catalog(&self) -> Result<GpuCatalog>;
     /// A pod that is already gone counts as deleted.
     fn delete_pod(&self, id: &str) -> Result<()>;
 }
@@ -35,6 +49,9 @@ impl PodApi for RunPod {
     }
     fn list_pods(&self) -> Result<Vec<Pod>> {
         RunPod::list_pods(self)
+    }
+    fn gpu_catalog(&self) -> Result<GpuCatalog> {
+        RunPod::gpu_catalog(self)
     }
     fn delete_pod(&self, id: &str) -> Result<()> {
         RunPod::delete_pod(self, id)
@@ -82,6 +99,18 @@ fn delete_pod_confirmed<P: PodApi + ?Sized>(pods: &P, pod_id: &str) -> Result<()
     })
 }
 
+/// The recorded hourly price when it is above `max`. A pod with no recorded price is never over: the cap is not
+/// enforced on a price nobody knows.
+fn over_price_cap(cost_per_hr: Option<f64>, max: Option<f64>) -> Option<f64> {
+    cost_per_hr.filter(|cost| max.is_some_and(|max| *cost > max))
+}
+
+/// Whether the kept-warm pod `pod_id` bills above `max`, by the price its `pods` record kept.
+fn warm_pod_over_cap(db: &Db, pod_id: &str, max: Option<f64>) -> Result<bool> {
+    let cost = db.pod_record(pod_id)?.and_then(|pod| pod.cost_per_hr);
+    Ok(over_price_cap(cost, max).is_some())
+}
+
 /// Delete a pod, then mark its `pods` record terminated. If the API refuses the delete the record stays
 /// live and the error is returned.
 fn terminate_recorded_pod<P: PodApi + ?Sized>(db: &Db, pods: &P, pod_id: &str) -> Result<()> {
@@ -95,15 +124,50 @@ pub(crate) enum Resume {
     Reattach(String, u16),
     /// reuse this run; it never provisioned a (live) pod - start the pod phase fresh.
     Reprovision,
-    /// the run had a pod that is gone; the in-flight sweep is lost - abort it and start a new run.
+    /// the run had a pod that RunPod says is gone; the in-flight sweep is lost - abort it and go on.
     AbortStale,
+    /// the pod is booting, or RunPod could not say: it is not gone, so the run and its pod are left alone.
+    Leave,
 }
 
-/// Decide how to handle an existing in-progress run, given whether its recorded pod is alive.
-pub(crate) fn resume_decision(run: &Run, pod_alive_endpoint: Option<(String, u16)>) -> Resume {
-    match (&run.pod_id, pod_alive_endpoint) {
-        (Some(_), Some((h, p))) => Resume::Reattach(h, p),
-        (Some(_), None) => Resume::AbortStale,
+/// What RunPod says about a run's recorded pod.
+#[derive(Debug, PartialEq)]
+pub(crate) enum PodState {
+    /// Running with its SSH endpoint published.
+    Ready(String, u16),
+    /// Running without an endpoint yet, inside its provision window: still booting.
+    Booting,
+    /// RunPod says 404, or the pod is EXITED/TERMINATED, or it never published an endpoint in its window.
+    Gone,
+    /// The API call failed for any other reason: nothing is known about the pod.
+    Unknown,
+}
+
+/// Classify a recorded pod. Only a definite answer makes it [`PodState::Gone`]; a pod that is still inside
+/// `within_provision_window` and has no endpoint yet is booting, not gone.
+pub(crate) fn pod_state<P: PodApi + ?Sized>(
+    api: &P,
+    pod_id: &str,
+    within_provision_window: bool,
+) -> PodState {
+    match api.get_pod(pod_id) {
+        Err(e) if e.downcast_ref::<PodNotFound>().is_some() => PodState::Gone,
+        Err(_) => PodState::Unknown,
+        Ok(pod) if matches!(pod.desired_status.as_str(), "EXITED" | "TERMINATED") => PodState::Gone,
+        Ok(pod) => match pod.ssh_endpoint() {
+            Some((host, port)) => PodState::Ready(host, port),
+            None if within_provision_window => PodState::Booting,
+            None => PodState::Gone,
+        },
+    }
+}
+
+/// Decide how to handle a resumable run, given what RunPod says about its recorded pod.
+pub(crate) fn resume_decision(run: &Run, pod: PodState) -> Resume {
+    match (&run.pod_id, pod) {
+        (Some(_), PodState::Ready(h, p)) => Resume::Reattach(h, p),
+        (Some(_), PodState::Gone) => Resume::AbortStale,
+        (Some(_), PodState::Booting | PodState::Unknown) => Resume::Leave,
         (None, _) => Resume::Reprovision,
     }
 }
@@ -317,7 +381,7 @@ pub(crate) fn cmd_exec(db: &Db, state_db: &str, a: ExecArgs) -> Result<()> {
     let env = build_exec_create_env(pubkey.trim(), &a.env)?;
 
     // Track the exec like a sweep: a `runs` row (kind='exec') records the pod at creation and shows the
-    // job on the dashboard, plus a tailable log. `active_run` filters kind='sweep', so it is never
+    // job on the dashboard, plus a tailable log. `resumable_runs` filters kind='sweep', so it is never
     // resumed; reap protects its pod while the row is non-terminal.
     let run_id = new_exec_run_id();
     let logpath = logs_dir().join(format!("{run_id}.log"));
@@ -355,8 +419,14 @@ pub(crate) fn cmd_exec(db: &Db, state_db: &str, a: ExecArgs) -> Result<()> {
         &resolver,
         &a,
         &run_id,
-        &ssh_key,
-        &scratch.known_hosts(),
+        &WarmProbe {
+            reachable: &|host, port| {
+                ssh::Endpoint::new(host.to_string(), port, &ssh_key, scratch.known_hosts())
+                    .wait_ssh(WARM_PROBE_TIMEOUT)
+                    .is_ok()
+            },
+            pause: WARM_PROBE_PAUSE,
+        },
         &env,
         PROVISION_POLL_INTERVAL,
     )?;
@@ -441,18 +511,20 @@ fn exec_on_pod<P: PodApi + ?Sized, R: Remote + ?Sized>(
                 } else {
                     m.min(KEEP_WARM_RED_CEILING_MINUTES)
                 };
-                let until = iso_in_minutes(minutes);
+                let until = iso_in_minutes(minutes as i64);
                 db.set_warm(run_id, &until).ok();
                 if *command_ok {
                     log(format!(
-                        "--keep-warm: pod {pod_id} kept warm until {until} ({minutes} min); the next exec with image {} adopts it",
+                        "--keep-warm: pod {pod_id} kept warm until {until} ({minutes} min); the next exec with image {} adopts it. \
+                         The next exec or reap deletes it after that time even if you are still using it by ssh",
                         a.image
                     ));
                 } else {
                     log(format!(
                         "--keep-warm: command exited non-zero, but the pod's control plane answered - \
                          pod {pod_id} kept warm until {until} ({minutes} min, capped from {m}); the next \
-                         exec with image {} adopts it",
+                         exec with image {} adopts it. The next exec or reap deletes it after that time \
+                         even if you are still using it by ssh",
                         a.image
                     ));
                     // Card 437: do not set_status("failed") here. `set_warm` stores warm-ness in `status`,
@@ -588,6 +660,172 @@ fn exec_body<R: Remote + ?Sized>(remote: &R, a: &ExecArgs, logpath: &Path) -> Re
     Ok(run.ok())
 }
 
+/// How a kept-warm pod is probed before `exec` adopts it.
+struct WarmProbe<'a> {
+    /// One attempt to reach the pod's ssh endpoint (host, port).
+    reachable: &'a dyn Fn(&str, u16) -> bool,
+    /// The wait between two attempts.
+    pause: Duration,
+}
+
+/// Attempts to reach a kept-warm pod before it counts as not answering: one failed probe is a busy host, not a
+/// dead one (sshd is slow while a large model loads).
+const WARM_PROBES: u32 = 4;
+/// Time one attempt waits for ssh, and the pause between attempts: about four minutes of trying in all.
+const WARM_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const WARM_PROBE_PAUSE: Duration = Duration::from_secs(45);
+
+/// How long an unresponsive kept-warm pod is not probed again: every probe round costs minutes, and the pod is
+/// not likely to recover within a few more.
+const WARM_MISS_MINUTES: i64 = 10;
+
+/// What the probes of a kept-warm pod found.
+#[derive(Debug, PartialEq, Eq)]
+enum WarmVerdict {
+    /// ssh answered: the pod can be adopted.
+    Reachable,
+    /// RunPod says the pod no longer exists: only its record is left to close.
+    Gone,
+    /// RunPod lists the pod running but publishes no ssh endpoint for it, so it cannot be adopted. Its record is
+    /// closed; the pod itself is left for `reap`.
+    NoEndpoint,
+    /// RunPod lists the pod but ssh did not answer in any attempt. Whoever holds it may be busy with it, so it
+    /// is left alone: never adopted, never deleted, not probed again for [`WARM_MISS_MINUTES`].
+    Unresponsive,
+}
+
+/// Judge a kept-warm pod. RunPod is asked first and last (a pod it no longer lists is gone whatever ssh says,
+/// and needs no delete call); ssh is tried [`WARM_PROBES`] times in between.
+fn judge_warm_pod<P: PodApi + ?Sized>(
+    pods: &P,
+    warm: &WarmExec,
+    probe: &WarmProbe<'_>,
+) -> WarmVerdict {
+    let listed = || match pod_state(pods, &warm.pod_id, true) {
+        PodState::Gone => Some(WarmVerdict::Gone),
+        PodState::Booting => Some(WarmVerdict::NoEndpoint),
+        PodState::Ready(..) | PodState::Unknown => None,
+    };
+    for attempt in 1..=WARM_PROBES {
+        if let Some(verdict) = listed() {
+            return verdict;
+        }
+        if (probe.reachable)(&warm.host, warm.port) {
+            return WarmVerdict::Reachable;
+        }
+        log(format!(
+            "  warm pod {} (kept by {}): ssh probe {attempt}/{WARM_PROBES} failed",
+            warm.pod_id, warm.run_id
+        ));
+        if attempt < WARM_PROBES {
+            std::thread::sleep(probe.pause);
+        }
+    }
+    listed().unwrap_or(WarmVerdict::Unresponsive)
+}
+
+/// Was the kept-warm pod found unresponsive within [`WARM_MISS_MINUTES`]? (Recorded as the pod's status.)
+fn missed_recently(db: &Db, pod_id: &str) -> Result<bool> {
+    Ok(db.pod_record(pod_id)?.is_some_and(|pod| {
+        pod.status == "unresponsive"
+            && pod.updated_at > crate::clock::iso_in_minutes(-WARM_MISS_MINUTES)
+    }))
+}
+
+/// Try to adopt a kept-warm pod (a prior `--keep-warm` exec with the same image); it already has the image
+/// pulled. Candidates are tried newest first, so one stuck pod does not hide an older reachable one. Adoption moves
+/// the pod claim in one DB transaction, so two concurrent execs cannot take the same pod. A pod past its window is
+/// reaped; a pod RunPod no longer lists only has its record closed; a listed pod that does not answer is left
+/// alone and not probed again for a while. Pods of running jobs are never candidates.
+fn adopt_warm_pod<P: PodApi + ?Sized>(
+    db: &Db,
+    pods: &P,
+    a: &ExecArgs,
+    warm: &WarmProbe<'_>,
+    image: &str,
+    run_id: &str,
+    owner: &ExecOwner,
+) -> Result<Option<ExecPod>> {
+    for w in db.find_warm_execs(image)? {
+        if w.warm_until.as_str() <= now_iso().as_str() {
+            log(format!(
+                "warm pod {} (kept by {}) expired (until {}); reaping it",
+                w.pod_id, w.run_id, w.warm_until
+            ));
+            if db.try_abort_warm_exec(&w)? {
+                delete_pod_confirmed(pods, &w.pod_id)?;
+            } else {
+                log(format!(
+                    "warm pod {} changed before expired cleanup; not deleting it",
+                    w.pod_id
+                ));
+            }
+            continue;
+        }
+        if warm_pod_over_cap(db, &w.pod_id, a.max_price_per_hour)? {
+            log(format!(
+                "warm pod {} is over --max-price-per-hour; not reusing it (it stays until it expires)",
+                w.pod_id
+            ));
+            continue;
+        }
+        if missed_recently(db, &w.pod_id)? {
+            log(format!(
+                "warm pod {} (kept by {}) did not answer ssh in the last {WARM_MISS_MINUTES} minutes; not probing it again yet",
+                w.pod_id, w.run_id
+            ));
+            continue;
+        }
+        match judge_warm_pod(pods, &w, warm) {
+            WarmVerdict::Reachable => {
+                if db.try_adopt_warm_exec(&w, run_id, owner)? {
+                    db.set_pod_status(&w.pod_id, "busy")?;
+                    log(format!(
+                        "reusing warm pod {} at {}:{} (warm until {}) - skipping provision + image pull",
+                        w.pod_id, w.host, w.port, w.warm_until
+                    ));
+                    if !a.env.is_empty() {
+                        log("note: --env is create-time only; ignored when adopting a warm pod");
+                    }
+                    return Ok(Some(ExecPod {
+                        pod_id: w.pod_id,
+                        host: w.host,
+                        port: w.port,
+                    }));
+                }
+                log(format!("warm pod {} changed before adoption", w.pod_id));
+            }
+            WarmVerdict::Gone => {
+                log(format!(
+                    "warm pod {} (kept by {}) no longer exists on RunPod; closing its record",
+                    w.pod_id, w.run_id
+                ));
+                if db.try_abort_warm_exec(&w)? {
+                    db.set_pod_status(&w.pod_id, "terminated")?;
+                }
+            }
+            WarmVerdict::NoEndpoint => {
+                log(format!(
+                    "warm pod {} (kept by {}) is running on RunPod but publishes no ssh endpoint; it cannot be adopted, closing its record (reap takes the pod)",
+                    w.pod_id, w.run_id
+                ));
+                if db.try_abort_warm_exec(&w)? {
+                    db.set_pod_status(&w.pod_id, "terminated")?;
+                }
+            }
+            WarmVerdict::Unresponsive => {
+                log(format!(
+                    "warm pod {} (kept by {}) is listed by RunPod but did not answer ssh {WARM_PROBES} times; \
+                     leaving it alone (it is not mine to delete, it expires {})",
+                    w.pod_id, w.run_id, w.warm_until
+                ));
+                db.set_pod_status(&w.pod_id, "unresponsive")?;
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// The pod an `exec` runs on.
 struct ExecPod {
     pod_id: String,
@@ -608,8 +846,7 @@ fn acquire_exec_pod<P: PodApi + ?Sized>(
     resolver: &dyn DigestResolver,
     a: &ExecArgs,
     run_id: &str,
-    ssh_key: &str,
-    known_hosts: &Path,
+    warm: &WarmProbe<'_>,
     env: &HashMap<String, String>,
     poll_interval: Duration,
 ) -> Result<ExecPod> {
@@ -648,98 +885,64 @@ fn acquire_exec_pod<P: PodApi + ?Sized>(
     // Try to adopt a kept-warm pod (a prior `--keep-warm` exec with the same image); it already has the
     // image pulled. An expired or unreachable warm pod is reaped, then we provision fresh. Adoption moves
     // the pod claim in one DB transaction, so two concurrent execs cannot take the same pod.
-    let adopted: Option<ExecPod> = match db.find_warm_exec(&image)? {
-        Some(w) if w.warm_until.as_str() > now_iso().as_str() => {
-            let ep = ssh::Endpoint::new(w.host.clone(), w.port, ssh_key, known_hosts);
-            if ep.wait_ssh(Duration::from_secs(20)).is_ok() {
-                if db.try_adopt_warm_exec(&w, run_id, &owner)? {
-                    log(format!(
-                        "reusing warm pod {} at {}:{} (warm until {}) - skipping provision + image pull",
-                        w.pod_id, w.host, w.port, w.warm_until
-                    ));
-                    if !a.env.is_empty() {
-                        log("note: --env is create-time only; ignored when adopting a warm pod");
-                    }
-                    Some(ExecPod {
-                        pod_id: w.pod_id,
-                        host: w.host,
-                        port: w.port,
-                    })
-                } else {
-                    log(format!(
-                        "warm pod {} changed before adoption; provisioning fresh",
-                        w.pod_id
-                    ));
-                    None
-                }
-            } else {
-                log(format!(
-                    "warm pod {} unreachable; reaping it and provisioning fresh",
-                    w.pod_id
-                ));
-                if db.try_abort_warm_exec(&w)? {
-                    delete_pod_confirmed(pods, &w.pod_id)?;
-                } else {
-                    log(format!(
-                        "warm pod {} changed before unreachable cleanup; not deleting it",
-                        w.pod_id
-                    ));
-                }
-                None
-            }
-        }
-        Some(w) => {
-            log(format!(
-                "warm pod {} expired (until {}); reaping it and provisioning fresh",
-                w.pod_id, w.warm_until
-            ));
-            if db.try_abort_warm_exec(&w)? {
-                delete_pod_confirmed(pods, &w.pod_id)?;
-            } else {
-                log(format!(
-                    "warm pod {} changed before expired cleanup; not deleting it",
-                    w.pod_id
-                ));
-            }
-            None
-        }
-        None => None,
-    };
+    let adopted = adopt_warm_pod(db, pods, a, warm, &image, run_id, &owner)?;
 
     if let Some(pod) = adopted {
         return Ok(pod);
     }
     // Same provisioning as the sweep. The on-create hook records the pod id first,
     // so a crash cannot leak the pod.
-    let allowed_cuda = cuda_floor_to_allowed(a.min_cuda_version.as_deref().unwrap_or(""));
+    let min_cuda = cuda_floor(a.min_cuda_version, &image);
     let data_center_ids: Vec<&str> = a.data_center.iter().map(String::as_str).collect();
     let owner_prefix = db.pod_owner_prefix()?;
     let cfg = ProvisionCfg {
         gpu_types: &a.gpu_types,
         gpu_count: a.gpu_count,
         cloud: a.cloud,
+        max_price_per_hour: a.max_price_per_hour,
         image: &image,
         container_disk_gb: a.container_disk_gb,
         network_volume_id: None,
         data_center_ids: &data_center_ids,
-        attempts: a.provision_attempts,
+        give_up_after: a.give_up_after_min.map(|m| Duration::from_secs(m * 60)),
         timeout_s: a.provision_timeout_s,
         poll_interval,
         owner: &owner_prefix,
         run_id,
-        allowed_cuda_versions: &allowed_cuda,
+        min_cuda,
     };
-    let (pod_id, host, port) = match provision_pod(pods, &cfg, env, |pid, _gpu, _cloud| {
-        db.set_pod(run_id, pid, None, None)
-    }) {
+    let (pod_id, host, port) = match provision_pod(
+        pods,
+        &cfg,
+        env,
+        |pid, gpu, placement| {
+            db.create_pod_record(
+                pid,
+                gpu,
+                &placement.cloud.to_string(),
+                placement.cost_per_hr,
+                &image,
+            )?;
+            db.set_pod(run_id, pid, None, None)
+        },
+        |_| {},
+        &SystemClock::start(),
+    ) {
         Ok(v) => v,
         Err(e) => {
-            db.set_status(run_id, "failed").ok();
+            let status = if e.downcast_ref::<Cancelled>().is_some() {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            db.set_status(run_id, status).ok();
             log(format!("EXEC_EXIT=1 (provision failed: {e})"));
             return Err(e);
         }
     };
     db.set_pod(run_id, &pod_id, Some(&host), Some(port)).ok();
+    db.set_pod_endpoint(&pod_id, &host, port).ok();
+    db.assign_pod(&pod_id, run_id).ok();
     db.set_status(run_id, "running").ok();
     log(format!("endpoint up: {host}:{port} (pod {pod_id})"));
     Ok(ExecPod { pod_id, host, port })
@@ -756,6 +959,7 @@ fn finish_exec_pod<P: PodApi + ?Sized>(
     status: &str,
 ) -> Result<()> {
     delete_pod_confirmed(pods, pod_id)?;
+    db.set_pod_status(pod_id, "terminated")?;
     db.set_status(run_id, status)
 }
 
@@ -882,26 +1086,55 @@ pub(crate) fn cmd_status(db: &Db, state_db: &str) -> Result<()> {
     use std::io::Write as _;
 
     let runs = db.recent_runs(20)?;
+    let pods = db.live_pods()?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let write_result = (|| -> std::io::Result<()> {
         // Print the resolved DB path so a split-state bug is visible.
         writeln!(out, "state db: {state_db}")?;
         for (run, updated) in runs {
+            let owner = match db.run_owner(&run.id) {
+                Ok(Some(o)) => format!(
+                    "pid {} ({})",
+                    o.pid,
+                    match o.local_liveness() {
+                        crate::db::runs::OwnerLiveness::Live => "live",
+                        crate::db::runs::OwnerLiveness::Dead => "dead",
+                        crate::db::runs::OwnerLiveness::Unknown => "unknown",
+                    }
+                ),
+                _ => "none".to_string(),
+            };
             writeln!(
                 out,
-                "{}  {:11}  {:20}  pod={}  models={}  (updated {})",
+                "{}  {:11}  {:20}  pod={}  owner={}  models={}  (updated {})",
                 run.id,
                 run.status,
                 run.git_ref,
                 run.pod_id.as_deref().unwrap_or("-"),
+                owner,
                 run.models.join(","),
                 updated
             )?;
         }
+        for pod in &pods {
+            writeln!(out, "{}", pod_status_line(pod))?;
+        }
         Ok(())
     })();
     finish_status_output(write_result)
+}
+
+/// One live pod as `status` prints it: its cloud and what it bills per hour.
+fn pod_status_line(pod: &crate::db::Pod) -> String {
+    let price = pod.cost_per_hr.map_or_else(
+        || "price unknown".to_string(),
+        |cost| format!("{cost:.2} per hour"),
+    );
+    format!(
+        "pod {}  {:11}  {}  {}  {price}",
+        pod.id, pod.status, pod.gpu_type, pod.cloud
+    )
 }
 
 pub(crate) fn finish_status_output(write_result: std::io::Result<()>) -> Result<()> {
@@ -993,6 +1226,10 @@ pub(crate) fn cmd_run(db: Db, state_db: String, a: RunArgs) -> Result<()> {
         "models: {:?}",
         models.iter().map(|m| &m.id).collect::<Vec<_>>()
     ));
+    // Refused here, before anything is built or rented (and by `--dry-run`).
+    if let Some(set) = a.extend_set.as_deref() {
+        extension_set(&results_dir()?, set, &models)?;
+    }
 
     // Build the poot runner locally, always (cheap; a resume picks up local fixes).
     let sha = sh(
@@ -1026,7 +1263,7 @@ pub(crate) fn cmd_run(db: Db, state_db: String, a: RunArgs) -> Result<()> {
     reap(&db, &rp, false)?;
 
     // Resume an in-progress run or create a new one.
-    let (run, mut endpoint) = resolve_run(&db, &rp, &a, &models, &sha)?;
+    let (run, endpoint) = resolve_run(&db, &rp, &a, &models, &sha)?;
     // Tee progress to a log file for the dashboard and `logs`.
     set_log_sink(&logs_dir().join(format!("{}.log", run.id)));
 
@@ -1042,24 +1279,22 @@ pub(crate) fn cmd_run(db: Db, state_db: String, a: RunArgs) -> Result<()> {
         let run_id = run.id.clone();
         let keep_pod = a.keep_pod;
         if let Err(e) = ctrlc::set_handler(move || {
-            if !keep_pod && let Ok(hdb) = Db::open(&state_db) {
-                if let Ok(Some(pid)) = hdb.pod_id_for_run(&run_id) {
-                    log(format!(
-                        "signal received: tearing down pod {pid} for run {run_id} (was mid-sweep)"
-                    ));
-                    match RunPod::new(key.clone()) {
-                        Ok(hrp) => {
-                            if let Err(e) = terminate_recorded_pod(&hdb, &hrp, &pid) {
-                                log(format!("  {e:#}"));
-                            }
-                        }
-                        Err(e) => log(format!(
-                            "  pod {pid} was not deleted and may still be billing: RunPod client: {e:#}"
-                        )),
+            log(format!(
+                "signal received: finalizing run {run_id} as cancelled"
+            ));
+            match (Db::open(&state_db), RunPod::new(key.clone())) {
+                (Ok(hdb), Ok(hrp)) => {
+                    if let Err(e) = finalize_on_signal(&hdb, &hrp, &run_id, keep_pod) {
+                        log(format!("  {e:#}"));
                     }
-                } else {
-                    log("signal received: no pod to tear down (not yet provisioned)");
                 }
+                (Ok(hdb), Err(e)) => {
+                    log(format!(
+                        "  RunPod client: {e:#}; the pod was not deleted and may still be billing"
+                    ));
+                    let _ = hdb.set_status(&run_id, "cancelled");
+                }
+                _ => log("  could not open the state database to finalize the run"),
             }
             std::process::exit(130);
         }) {
@@ -1070,27 +1305,240 @@ pub(crate) fn cmd_run(db: Db, state_db: String, a: RunArgs) -> Result<()> {
         }
     }
 
-    // Run the phases; always attempt teardown afterwards.
-    let result = run_phases(&db, &rp, &run, &models, &scratch, &a, &mut endpoint);
-    // With --keep-pod the pod is released to idle for a later run to adopt; otherwise it is terminated.
+    let mut guard = RunGuard {
+        state_db: state_db.clone(),
+        key: key.clone(),
+        run_id: run.id.clone(),
+        keep_pod: a.keep_pod,
+        armed: true,
+    };
+    // Zombies of earlier processes are cleaned up now that this run has its pod or resumed run.
+    gc_zombies(&db);
+    gc_orphan_partials(&db);
+    // Supervise the run: a lost pod is replaced and only the missing cells are run again; the run ends when it
+    // is done, when the user bounds it, or on an error waiting cannot fix. Teardown always follows.
+    let cursor = Cursor::default();
+    let mut live = LiveRun {
+        db: &db,
+        rp: &rp,
+        run: &run,
+        models: &models,
+        scratch: &scratch,
+        a: &a,
+        endpoint,
+        cursor: &cursor,
+        clock: SystemClock::start(),
+    };
+    let result = heal::supervise(&mut live, &cursor, a.max_replacements);
+    // With --keep-pod the pod is released to idle for a later run to adopt; otherwise it is terminated. A failure of
+    // this machine (not the pod) keeps the pod too: it may hold the only copy of the results.
+    let keep_pod = keep_pod_after(&result, a.keep_pod);
+    if keep_pod
+        && !a.keep_pod
+        && let Some((host, port)) = &live.endpoint
+    {
+        log(format!(
+            "the pod is kept (released to idle) so the results can be pulled by hand; pull the sets with:\n{}",
+            ssh::pull_hint(
+                &a.ssh_key,
+                host,
+                *port,
+                &format!("{}/run-*", gather::POD_RESULTS),
+                "benchmarks/results/"
+            )
+        ));
+    }
     let pid = run.pod_id_now(&db);
-    let status = match &result {
-        Ok(()) => "done",
-        Err(e) => {
+    // A run whose supervision ended is only DONE when every requested model has all its valid sets.
+    let incomplete = match &result {
+        Ok(Outcome::Done) => incomplete_models(&run, &models, &results_dir()?, &db)?,
+        _ => None,
+    };
+    let status = match (&result, &incomplete) {
+        (Ok(Outcome::Done), None) => "done".to_string(),
+        (Ok(Outcome::Done), Some(missing)) => {
+            log(format!("run incomplete: {missing}"));
+            format!("incomplete: {missing}")
+        }
+        (Ok(Outcome::Cancelled(why)), _) => {
+            log(format!("run cancelled: {why}"));
+            "cancelled".to_string()
+        }
+        (Err(e), _) => {
             log(format!("run failed: {e:#}"));
-            "failed"
+            "failed".to_string()
         }
     };
-    if let Err(teardown_error) = finish_run(&db, &rp, &run.id, pid.as_deref(), a.keep_pod, status) {
+    let finished = finish_run(&db, &rp, &run.id, pid.as_deref(), keep_pod, &status);
+    guard.armed = false;
+    if let Err(teardown_error) = finished {
         return Err(match result {
-            Ok(()) => teardown_error,
+            Ok(_) => teardown_error,
             Err(e) => teardown_error.context(format!("the run also failed: {e:#}")),
         });
     }
-    if result.is_ok() {
-        log("DONE");
+    match result {
+        Ok(Outcome::Done) => match incomplete {
+            None => {
+                log("DONE");
+                Ok(())
+            }
+            Some(missing) => bail!("run incomplete: {missing}"),
+        },
+        Ok(Outcome::Cancelled(why)) => bail!("run cancelled: {why}"),
+        Err(e) => Err(e),
     }
-    result
+}
+
+/// The requested models that lack valid sets, as `model valid/requested` joined by commas, or `None` when each
+/// has all of its repeats under `results`. A set recorded as failed is not a valid one.
+fn incomplete_models(
+    run: &Run,
+    models: &[Model],
+    results: &Path,
+    db: &Db,
+) -> Result<Option<String>> {
+    let mut missing = Vec::new();
+    for m in models {
+        let dirs = run.model_snapshot_dirs(&sweep_run_id(db, run, &m.id)?);
+        let valid = dirs
+            .iter()
+            .filter(|dir| gather::local_set(results, dir).is_some())
+            .count();
+        if valid < dirs.len() {
+            missing.push(format!("{} {valid}/{}", m.id, dirs.len()));
+        }
+    }
+    Ok((!missing.is_empty()).then(|| missing.join(", ")))
+}
+
+/// Does the run's pod outlive it? With `--keep-pod`, and after a failure of this machine ([`LocalFault`]): then the
+/// pod is fine and may hold results that were not copied.
+fn keep_pod_after(result: &Result<Outcome>, keep_pod: bool) -> bool {
+    keep_pod || matches!(result, Err(e) if e.downcast_ref::<LocalFault>().is_some())
+}
+
+/// A run that is being interrupted (SIGINT/SIGTERM, a panic, an early return): delete or release its pod and
+/// record it `cancelled`. A pod the API will not delete is logged and left to `reap`, which takes it as soon
+/// as its run is terminal; the run is `cancelled` either way, never left looking busy.
+pub(crate) fn finalize_on_signal<P: PodApi + ?Sized>(
+    db: &Db,
+    pods: &P,
+    run_id: &str,
+    keep_pod: bool,
+) -> Result<()> {
+    if let Some(pid) = db.pod_id_for_run(run_id)? {
+        if keep_pod {
+            db.release_pod(&pid)?;
+        } else if let Err(e) = terminate_recorded_pod(db, pods, &pid) {
+            log(format!("  {e:#}"));
+        }
+    }
+    db.set_status(run_id, "cancelled")
+}
+
+/// Why a run that ended without finishing is shown greyed on the dashboard.
+pub(crate) const ABANDONED_REASON: &str = "owner exited without finalizing";
+
+/// Abandon the unfinished sweeps nobody drives any more: owner provably dead, and nothing to resume onto
+/// (no pod, or RunPod says it is gone) or older than the resume window (its pod, if alive, is terminated).
+/// A run with a live, unknown or unrecorded owner is never touched, nor a dead-owner run whose pod is alive
+/// inside the window (a matching `run` reattaches to it), nor a run whose pod RunPod cannot be asked about.
+pub(crate) fn abandon_zombies<P: PodApi + ?Sized>(
+    db: &Db,
+    pods: Option<&P>,
+    now_epoch_s: u64,
+    window_s: u64,
+    liveness: impl Fn(&ExecOwner) -> OwnerLiveness,
+) -> Result<usize> {
+    let mut abandoned = 0;
+    for (run, owner) in db.unfinished_sweeps()? {
+        if !owner
+            .as_ref()
+            .is_some_and(|o| liveness(o) == OwnerLiveness::Dead)
+        {
+            continue;
+        }
+        let too_old = run
+            .id
+            .strip_prefix("run-")
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|secs| secs.parse::<u64>().ok())
+            .is_some_and(|started| now_epoch_s.saturating_sub(started) > window_s);
+        if let Some(pid) = &run.pod_id {
+            let Some(pods) = pods else { continue };
+            match pod_state(pods, pid, true) {
+                PodState::Unknown => continue,
+                PodState::Gone => {
+                    let _ = db.set_pod_status(pid, "terminated");
+                }
+                PodState::Ready(..) | PodState::Booting => {
+                    if !too_old {
+                        continue;
+                    }
+                    if let Err(e) = terminate_recorded_pod(db, pods, pid) {
+                        log(format!("  {e:#}"));
+                        continue;
+                    }
+                }
+            }
+        }
+        db.set_status(&run.id, "abandoned")?;
+        log(format!("run {} abandoned: {ABANDONED_REASON}", run.id));
+        abandoned += 1;
+    }
+    Ok(abandoned)
+}
+
+/// [`abandon_zombies`] for the CLI: asks RunPod about pods when an API key is set.
+pub(crate) fn gc_zombies(db: &Db) {
+    let rp = runpod_api_key().ok().and_then(|key| RunPod::new(key).ok());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if let Err(e) = abandon_zombies(db, rp.as_ref(), now, RESUME_WINDOW_S, |o| {
+        o.local_liveness()
+    }) {
+        log(format!("zombie cleanup: {e:#}"));
+    }
+}
+
+/// Remove the live-results mirrors (`results/*.partial`) that no run still in flight is sweeping: a run that
+/// crashed or was killed leaves its mirror behind and nothing would ever gather or clear it.
+fn gc_orphan_partials(db: &Db) {
+    let removed = (|| -> Result<Vec<String>> {
+        let mut active = Vec::new();
+        for id in db.unfinished_run_ids()? {
+            active.extend(db.snapshot_dirs(&id)?);
+        }
+        gather::remove_orphan_partials(&results_dir()?, &active)
+    })();
+    match removed {
+        Ok(names) => names
+            .iter()
+            .for_each(|name| log(format!("removed orphan live-results mirror {name}"))),
+        Err(e) => log(format!("orphan mirrors: {e:#}")),
+    }
+}
+
+/// Finalizes the run as `cancelled` if `cmd_run` is left any way but the normal end (a panic, an early `?`).
+struct RunGuard {
+    state_db: String,
+    key: String,
+    run_id: String,
+    keep_pod: bool,
+    armed: bool,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let (Ok(db), Ok(rp)) = (Db::open(&self.state_db), RunPod::new(self.key.clone())) {
+            let _ = finalize_on_signal(&db, &rp, &self.run_id, self.keep_pod);
+        }
+    }
 }
 
 /// Release (`--keep-pod`) or delete the run's pod, then record the run's final `status`. The run and its
@@ -1129,52 +1577,34 @@ fn abort_stale_run<P: PodApi + ?Sized>(db: &Db, pods: &P, run: &Run) -> Result<(
 }
 
 /// Resolve which run to operate on (resume or new), plus the live SSH endpoint if reattaching.
-fn resolve_run<P: PodApi + ?Sized>(
-    db: &Db,
-    rp: &P,
-    a: &RunArgs,
-    models: &[Model],
-    sha: &str,
-) -> Result<(Run, Option<(String, u16)>)> {
-    if let Some(active) = db.active_run()? {
-        let alive = match &active.pod_id {
-            Some(pid) => rp.get_pod(pid).ok().and_then(|p| p.ssh_endpoint()),
-            None => None,
-        };
-        match resume_decision(&active, alive.clone()) {
-            Resume::Reattach(h, p) => {
-                log(format!(
-                    "resuming run {} (reattaching to pod {} at {h}:{p})",
-                    active.id,
-                    active.pod_id.as_deref().unwrap_or("?")
-                ));
-                return Ok((active, Some((h, p))));
-            }
-            Resume::Reprovision => {
-                log(format!(
-                    "resuming run {} (no live pod yet; will provision)",
-                    active.id
-                ));
-                return Ok((active, None));
-            }
-            Resume::AbortStale => {
-                log(format!(
-                    "run {}'s pod is gone/unreachable; aborting it and starting fresh",
-                    active.id
-                ));
-                // Terminate the stale pod now rather than waiting for reap.
-                abort_stale_run(db, rp, &active)?;
-            }
+/// How long after a failed run's start a new run of the same request continues its result set.
+const RESUME_WINDOW_S: u64 = 24 * 3600;
+
+/// The set id `--extend-set` names, if every model already has a gathered repeat of it under `results`: extending
+/// sets that are not here would silently start new ones.
+fn extension_set(results: &Path, set: &str, models: &[Model]) -> Result<String> {
+    for model in models {
+        // A run of one repeat names its set without the `-r<N>` suffix.
+        let bare = format!("{set}-{}", model.id);
+        if !gather::set_is_complete(results, &bare)
+            && !(1..=gather::MAX_EXTENDED_REPEATS)
+                .any(|n| gather::set_is_complete(results, &format!("{bare}-r{n}")))
+        {
+            bail!(
+                "--extend-set {set}: no gathered set of {} under {} (expected <date>-<gpu>-{}-<time>-r<N>)",
+                model.id,
+                results.display(),
+                model.id
+            );
         }
     }
-    let run = Run {
-        id: format!(
-            "run-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        ),
+    Ok(set.to_string())
+}
+
+/// The run a `run` command line asks for, under `id`.
+fn requested_run(a: &RunArgs, models: &[Model], sha: &str, id: String) -> Run {
+    Run {
+        id,
         kind: "sweep".into(),
         git_ref: format!("{}={sha}", a.git_ref),
         scenario: a.scenario.clone(),
@@ -1184,13 +1614,130 @@ fn resolve_run<P: PodApi + ?Sized>(
         image: a.image.clone(),
         status: "new".into(),
         pod_id: None,
-    };
-    db.create_run(&run)?;
+    }
+}
+
+fn resolve_run<P: PodApi + ?Sized>(
+    db: &Db,
+    rp: &P,
+    a: &RunArgs,
+    models: &[Model],
+    sha: &str,
+) -> Result<(Run, Option<(String, u16)>)> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let run = requested_run(a, models, sha, format!("run-{now}-{}", std::process::id()));
+    let owner = ExecOwner::current().context("claim run owner identity")?;
+    // Another process's run is never touched: only an unfinished run of this same request whose owner process
+    // is gone is resumed. A different request, or a live owner, gets this process its own run.
+    let provision_window = a.provision_timeout_s.saturating_add(a.ssh_timeout_s);
+    let cutoff = iso_from_secs(i64::try_from(now.saturating_sub(provision_window)).unwrap_or(0));
+    for candidate in db.resumable_runs(&run, |o| o.local_liveness())? {
+        let state = match &candidate.pod_id {
+            Some(pid) => {
+                let within = db
+                    .pod_created_at(pid)?
+                    .is_none_or(|created| created > cutoff);
+                pod_state(rp, pid, within)
+            }
+            None => PodState::Unknown,
+        };
+        match resume_decision(&candidate, state) {
+            Resume::Reattach(h, p) => {
+                log(format!(
+                    "resuming run {} (reattaching to pod {} at {h}:{p})",
+                    candidate.id,
+                    candidate.pod_id.as_deref().unwrap_or("?")
+                ));
+                db.set_owner(&candidate.id, &owner)?;
+                return Ok((candidate, Some((h, p))));
+            }
+            Resume::Reprovision => {
+                log(format!(
+                    "resuming run {} (no live pod yet; will provision)",
+                    candidate.id
+                ));
+                db.set_owner(&candidate.id, &owner)?;
+                return Ok((candidate, None));
+            }
+            Resume::AbortStale => {
+                log(format!(
+                    "run {}'s pod is gone per RunPod; aborting it",
+                    candidate.id
+                ));
+                abort_stale_run(db, rp, &candidate)?;
+            }
+            Resume::Leave => log(format!(
+                "run {}'s pod is booting or RunPod could not be asked; leaving it alone",
+                candidate.id
+            )),
+        }
+    }
+    db.create_run_with_owner(&run, Some(&owner))?;
     log(format!("created run {}", run.id));
+    // A failed or aborted run of the same request in the last day is the one this resumes: its result sets and
+    // this run's are one set (`<set>-<model>-rN`), and the repeats already gathered are not run again.
+    // `--extend-set` names the sets instead: a finished run's, to which this run adds repeats.
+    let set = match a.extend_set.as_deref() {
+        Some(set) => Some(extension_set(&results_dir()?, set, models)?),
+        None => db.resumable_set_id(&run, now, RESUME_WINDOW_S)?,
+    };
+    if let Some(set) = set {
+        db.set_set_id(&run.id, &set)?;
+        log(format!(
+            "continuing result set {set}: repeats already gathered are skipped"
+        ));
+    }
     // Adopt a live idle pod with the same image instead of provisioning (spec 030); this skips the image
     // pull and model download. If RunPod no longer has it, mark the record terminated and provision.
     let live = db.live_pods()?;
-    if let Some(pod) = crate::db::pick_idle_pod(&live, &run.image) {
+    // `--reuse-pod ID` names the pod instead: one of this database's, alive, and not driven by a live run.
+    let wanted = match a.reuse_pod.as_deref() {
+        Some(id) => {
+            let pod = live.iter().find(|p| p.id == id).ok_or_else(|| {
+                Unrecoverable(format!(
+                    "--reuse-pod {id}: this state database has no such live pod"
+                ))
+            })?;
+            if let Some(user) = pod.current_run.as_deref().filter(|_| pod.status == "busy") {
+                let driven = db
+                    .run_owner(user)?
+                    .is_none_or(|o| o.local_liveness() != OwnerLiveness::Dead);
+                if driven {
+                    return Err(Unrecoverable(format!(
+                        "--reuse-pod {id}: run {user} is still driving it"
+                    ))
+                    .into());
+                }
+            }
+            Some(pod)
+        }
+        None => crate::db::pick_idle_pod(&live, &run.image),
+    };
+    let wanted = match wanted {
+        Some(pod) if over_price_cap(pod.cost_per_hr, a.max_price_per_hour).is_some() => {
+            let (cost, max) = (
+                pod.cost_per_hr.unwrap_or_default(),
+                a.max_price_per_hour.unwrap_or_default(),
+            );
+            if a.reuse_pod.is_some() {
+                return Err(Unrecoverable(format!(
+                    "--reuse-pod {}: it bills {cost:.2} per hour, over --max-price-per-hour {max}",
+                    pod.id
+                ))
+                .into());
+            }
+            log(format!(
+                "idle pod {} bills {cost:.2} per hour, over --max-price-per-hour {max}; not adopting it",
+                pod.id
+            ));
+            None
+        }
+        wanted => wanted,
+    };
+    if let Some(pod) = wanted {
         match rp.get_pod(&pod.id).ok().and_then(|x| x.ssh_endpoint()) {
             Some((h, p)) => {
                 log(format!(
@@ -1202,6 +1749,13 @@ fn resolve_run<P: PodApi + ?Sized>(
                 adopted.pod_id = Some(pod.id.clone());
                 return Ok((adopted, Some((h, p))));
             }
+            None if a.reuse_pod.is_some() => {
+                return Err(Unrecoverable(format!(
+                    "--reuse-pod {}: RunPod has no running pod with an SSH endpoint under that id",
+                    pod.id
+                ))
+                .into());
+            }
             None => {
                 log(format!("idle pod {} is gone; dropping it", pod.id));
                 let _ = db.set_pod_status(&pod.id, "terminated");
@@ -1211,29 +1765,37 @@ fn resolve_run<P: PodApi + ?Sized>(
     Ok((run, None))
 }
 
-fn run_phases(
-    db: &Db,
-    rp: &RunPod,
-    run: &Run,
-    models: &[Model],
-    scratch: &Scratch,
-    a: &RunArgs,
-    endpoint: &mut Option<(String, u16)>,
-) -> Result<()> {
+fn run_phases(live: &mut LiveRun<'_>) -> Result<()> {
+    let (db, rp, run, models, scratch, a, cursor) = (
+        live.db,
+        live.rp,
+        live.run,
+        live.models,
+        live.scratch,
+        live.a,
+        live.cursor,
+    );
+    let (endpoint, clock) = (&mut live.endpoint, &live.clock);
     let ssh_key = expand_tilde(&a.ssh_key);
-    // Pod id for the active endpoint: a resumed run carries it on `run`; a fresh one is only written to
-    // the DB, so capture it here for the sweep watchdog's liveness probe.
-    let mut pod_id = run.pod_id.clone();
     // Provision if there is no live endpoint.
+    cursor.set(None, "provision");
     if endpoint.is_none() {
         db.set_status(&run.id, "provisioning")?;
         let pubkey = std::fs::read_to_string(expand_tilde(&format!("{}.pub", a.ssh_key)))
-            .context("read SSH public key")?;
-        let (pid, host, port) = provision(rp, a, pubkey.trim(), &run.id, db)?;
+            .map_err(|e| Unrecoverable(format!("read SSH public key {}.pub: {e}", a.ssh_key)))?;
+        let (pid, host, port) = provision(
+            rp,
+            a,
+            pubkey.trim(),
+            &run.id,
+            db,
+            clock,
+            PROVISION_POLL_INTERVAL,
+        )?;
         db.set_pod(&run.id, &pid, Some(&host), Some(port))?;
-        pod_id = Some(pid);
         *endpoint = Some((host, port));
     }
+    let pod_id = db.pod_id_for_run(&run.id)?;
     let (host, port) = endpoint.clone().unwrap();
     // This run now holds the pod: record its endpoint and mark it busy (from `provisioning` or `idle`).
     if let Some(pid) = &pod_id {
@@ -1241,6 +1803,7 @@ fn run_phases(
         let _ = db.assign_pod(pid, &run.id);
     }
     let ep = ssh::Endpoint::new(host, port, ssh_key, scratch.known_hosts());
+    cursor.set(None, "ready");
     ready_pod(
         &ep,
         Duration::from_secs(a.ssh_timeout_s),
@@ -1251,18 +1814,177 @@ fn run_phases(
         .map(|r| r.stdout.trim().to_string())
         .unwrap_or_default();
     log(format!("pod GPU: {gpu}"));
+    // An extension adds repeats to sets measured elsewhere: on other hardware they would be another population.
+    if let Some(set) = a.extend_set.as_deref() {
+        hardware::require_same_hardware(&ep, &results_dir()?, set, models)?;
+    }
 
     db.set_status(&run.id, "setup")?;
-    setup_pod(db, run, models, &scratch.runner(), &ep, a)?;
+    setup_pod(db, run, models, &scratch.runner(), &ep, a, cursor)?;
 
     db.set_status(&run.id, "sweeping")?;
-    sweep(db, rp, run, models, &ep, a, pod_id.as_deref())?;
+    let watch = Watch {
+        pod_id: pod_id.as_deref(),
+        cursor,
+    };
+    sweep(db, rp, run, models, &ep, a, &watch)?;
 
     db.set_status(&run.id, "gathering")?;
+    cursor.set(None, "gather");
     gather(db, run, models, &ep)?;
 
     postprocess(run, db, a)?;
     Ok(())
+}
+
+/// The production [`Healing`]: one `run`'s pod, phases and local result sets.
+struct LiveRun<'a> {
+    db: &'a Db,
+    rp: &'a RunPod,
+    run: &'a Run,
+    models: &'a [Model],
+    scratch: &'a Scratch,
+    a: &'a RunArgs,
+    endpoint: Option<(String, u16)>,
+    cursor: &'a Cursor,
+    clock: SystemClock,
+}
+
+impl LiveRun<'_> {
+    /// Repeats gathered locally and repeats wanted, over all models.
+    fn gathered(&self) -> (usize, usize) {
+        let results = results_dir().unwrap_or_default();
+        self.models.iter().fold((0, 0), |(have, want), m| {
+            let dirs = sweep_run_id(self.db, self.run, &m.id)
+                .map(|base| self.run.model_snapshot_dirs(&base))
+                .unwrap_or_default();
+            (
+                have + gather::repeats_present(&results, &dirs).len(),
+                want + dirs.len(),
+            )
+        })
+    }
+}
+
+impl Healing for LiveRun<'_> {
+    fn attempt(&mut self, fresh_pod: bool) -> Result<()> {
+        if fresh_pod {
+            self.endpoint = None;
+        }
+        run_phases(self)
+    }
+
+    fn pod_reachable(&mut self) -> bool {
+        let Some((host, port)) = self.endpoint.clone() else {
+            return false;
+        };
+        let Ok(Some(pid)) = self.db.pod_id_for_run(&self.run.id) else {
+            return false;
+        };
+        let ep = ssh::Endpoint::new(
+            host,
+            port,
+            expand_tilde(&self.a.ssh_key),
+            self.scratch.known_hosts(),
+        );
+        let mut wait = Duration::from_secs(10);
+        let mut waited = Duration::ZERO;
+        loop {
+            if matches!(pod_state(self.rp, &pid, false), PodState::Gone) {
+                return false;
+            }
+            if ep.ssh("true").is_ok_and(|r| r.ok()) {
+                return true;
+            }
+            if waited >= SSH_GRACE {
+                return false;
+            }
+            log(format!(
+                "  pod {pid} not answering ssh; retrying in {}s",
+                wait.as_secs()
+            ));
+            std::thread::sleep(wait);
+            waited += wait;
+            wait = (wait * 3 / 2).min(Duration::from_secs(60));
+        }
+    }
+
+    fn reset_setup(&mut self, model: Option<&str>) -> Result<()> {
+        let Some(model) = model else { return Ok(()) };
+        self.db.set_model_setup(&self.run.id, model, false)?;
+        // The sweep that hit the missing model keeps running on the pod: stop it and drop its log, so the next
+        // attempt starts it again after the setup.
+        if let Some((host, port)) = self.endpoint.clone() {
+            let ep = ssh::Endpoint::new(
+                host,
+                port,
+                expand_tilde(&self.a.ssh_key),
+                self.scratch.known_hosts(),
+            );
+            let _ = ep.ssh(&stop_sweep_command(model));
+        }
+        Ok(())
+    }
+
+    fn discard_pod(&mut self, why: Replacement) {
+        // A new pod has none of the models: every model's setup is done again before any repeat.
+        for m in self.models {
+            if let Err(e) = self.db.set_model_setup(&self.run.id, &m.id, false) {
+                log(format!("  could not re-arm the setup of {}: {e:#}", m.id));
+            }
+        }
+        let (have, want) = self.gathered();
+        let (what, status) = match why {
+            Replacement::Lost => ("lost", "provisioning (replacing a lost pod)"),
+            Replacement::HostFault => ("has no working GPU", "provisioning (host fault, replaced)"),
+        };
+        if let Ok(Some(pid)) = self.db.pod_id_for_run(&self.run.id) {
+            log(format!(
+                "pod {pid} {what}, provisioning replacement, {have} of {want} repeats already gathered"
+            ));
+            for _ in 0..3 {
+                match terminate_recorded_pod(self.db, self.rp, &pid) {
+                    Ok(()) => break,
+                    Err(e) => {
+                        log(format!("  {e:#}"));
+                        std::thread::sleep(Duration::from_secs(10));
+                    }
+                }
+            }
+        }
+        let _ = self.db.clear_run_pod(&self.run.id);
+        self.endpoint = None;
+        let _ = self.db.set_status(&self.run.id, status);
+    }
+
+    fn skip_cell(&mut self, model: Option<&str>, phase: &str, reason: &str) -> Result<()> {
+        let Some(model) = model else {
+            return Ok(());
+        };
+        let results = results_dir()?;
+        let dirs = self
+            .run
+            .model_snapshot_dirs(&sweep_run_id(self.db, self.run, model)?);
+        let missing: Vec<&String> = dirs
+            .iter()
+            .filter(|dir| !gather::set_is_complete(&results, dir))
+            .collect();
+        // A sweep failure is one repeat's; a setup failure leaves every repeat of the model unrunnable.
+        let doomed = if phase == "sweep" {
+            &missing[..missing.len().min(1)]
+        } else {
+            &missing[..]
+        };
+        for dir in doomed {
+            log(format!("recording {dir} as failed: {reason}"));
+            heal::record_failed_cell(&results, dir, model, &self.run.scenario, reason)?;
+        }
+        Ok(())
+    }
+
+    fn pause(&mut self, d: Duration) {
+        std::thread::sleep(d);
+    }
 }
 
 /// A detached git worktree of the requested ref, removed when dropped.
@@ -1435,58 +2157,138 @@ struct ProvisionCfg<'a> {
     /// GPUs per pod (multi-GPU, e.g. tensor-parallel).
     pub(crate) gpu_count: u32,
     pub(crate) cloud: CloudChoice,
+    /// The most a pod may bill per hour (USD); `None` has no cap. A pod RunPod prices above it is deleted at
+    /// once and the cloud counts as a capacity miss.
+    pub(crate) max_price_per_hour: Option<f64>,
     pub(crate) image: &'a str,
     pub(crate) container_disk_gb: u32,
     pub(crate) network_volume_id: Option<&'a str>,
     /// Data centers to pin the pod to (`dataCenterIds`); empty means no pin.
     pub(crate) data_center_ids: &'a [&'a str],
-    pub(crate) attempts: u32,
+    /// Stop waiting for capacity after this long; `None` waits as long as it takes.
+    pub(crate) give_up_after: Option<Duration>,
     pub(crate) timeout_s: u64,
     /// How often to ask whether the pod's SSH endpoint is published.
     pub(crate) poll_interval: Duration,
     /// The state database's pod prefix and the run the pods belong to; each attempt is one pod.
     pub(crate) owner: &'a PodOwnerPrefix,
     pub(crate) run_id: &'a str,
-    /// whitelist of host CUDA versions (RunPod allowedCudaVersions); empty = no filter. Build with
-    /// `cuda_floor_to_allowed` from a minimum version.
-    pub(crate) allowed_cuda_versions: &'a [String],
+    /// The lowest host CUDA version a pod may report, or `None` for no filter (the default). RunPod's
+    /// `allowedCudaVersions` enum stops at 13.0, so this is checked on the pod's reported `cudaVersion` after the
+    /// create, not sent.
+    pub(crate) min_cuda: Option<CudaVersion>,
 }
 
 /// The interval production waits between endpoint checks.
 const PROVISION_POLL_INTERVAL: Duration = Duration::from_secs(8);
 
-/// The RunPod `allowedCudaVersions` values >= `floor`, newest first. An empty or unparseable `floor`
-/// yields an empty list (no filter). Sending the whole tail lets the pod land on any new-enough host: a
-/// floor of 12.8 becomes ["12.8","12.9","13.0"].
-pub(crate) fn cuda_floor_to_allowed(floor: &str) -> Vec<String> {
-    // RunPod's accepted versions (POST /pods), oldest first, as (major, minor).
-    const VALID: &[(u32, u32)] = &[
-        (11, 8),
-        (12, 0),
-        (12, 1),
-        (12, 2),
-        (12, 3),
-        (12, 4),
-        (12, 5),
-        (12, 6),
-        (12, 7),
-        (12, 8),
-        (12, 9),
-        (13, 0),
-    ];
-    let parse = |s: &str| -> Option<(u32, u32)> {
-        let (a, b) = s.trim().split_once('.')?;
-        Some((a.parse().ok()?, b.parse().ok()?))
+/// How long to wait after terminating a pod that reports less CUDA than the floor, before the next attempt.
+const BELOW_FLOOR_PAUSE: Duration = Duration::from_secs(10);
+
+/// A pod's reported CUDA version against the floor.
+#[derive(Debug, PartialEq, Eq)]
+enum CudaVerdict {
+    /// No floor, or the pod reports at least the floor.
+    Fine,
+    /// The pod reports no (readable) CUDA version yet: the floor cannot be judged.
+    Unknown,
+    /// The pod reports this version, which is below the floor.
+    Below(String),
+}
+
+/// Read the pod back from the API, log its GPU and reported CUDA version, and judge it against `floor`.
+fn pod_cuda_verdict<P: PodApi + ?Sized>(
+    pods: &P,
+    pod_id: &str,
+    gpu: &str,
+    floor: Option<CudaVersion>,
+) -> CudaVerdict {
+    let reported = match pods.get_pod(pod_id) {
+        Ok(pod) => pod.reported_cuda(),
+        Err(e) => {
+            log(format!("  get_pod {pod_id}: {e}"));
+            None
+        }
     };
-    let Some(min) = parse(floor) else {
-        return Vec::new();
+    log(format!(
+        "  pod {pod_id}: {gpu}, CUDA {}",
+        reported.as_deref().unwrap_or("not reported yet")
+    ));
+    let Some(floor) = floor else {
+        return CudaVerdict::Fine;
     };
-    VALID
-        .iter()
-        .filter(|&&v| v >= min)
-        .rev() // newest-first (cosmetic; RunPod treats the list as a set)
-        .map(|(a, b)| format!("{a}.{b}"))
-        .collect()
+    let Some(text) = reported else {
+        return CudaVerdict::Unknown;
+    };
+    match text.parse::<CudaVersion>() {
+        Ok(found) if found >= floor => CudaVerdict::Fine,
+        Ok(_) => CudaVerdict::Below(text),
+        Err(e) => {
+            log(format!("  {e}; the floor {floor} is not checked"));
+            CudaVerdict::Unknown
+        }
+    }
+}
+
+/// Terminate the pod when it reports less CUDA than the floor, record that as a capacity miss and pause briefly.
+/// Returns whether the pod was rejected (the caller then goes on to the next attempt).
+fn reject_below_floor<P: PodApi + ?Sized>(
+    pods: &P,
+    pod_id: &str,
+    verdict: &CudaVerdict,
+    floor: Option<CudaVersion>,
+    clock: &dyn Clock,
+    last: &mut anyhow::Error,
+) -> Result<bool> {
+    let (CudaVerdict::Below(found), Some(floor)) = (verdict, floor) else {
+        return Ok(false);
+    };
+    log(format!(
+        "  pod {pod_id} reports CUDA {found}, below the floor {floor}: terminating it and trying again"
+    ));
+    // A pod the API will not delete is still billing: stop here, do not open another.
+    delete_pod_confirmed(pods, pod_id)?;
+    *last = anyhow!("pod {pod_id} reports CUDA {found}, below the floor {floor}");
+    clock.sleep(BELOW_FLOOR_PAUSE);
+    Ok(true)
+}
+
+/// The host CUDA floor of a run: `--min-cuda-version` when given, else what the image declares through its
+/// `org.poot.bench.min-cuda` label, else none. An unreachable registry or an unreadable label is logged and means
+/// no floor: the check is an optimisation of where the pod lands, not a precondition.
+fn cuda_floor(explicit: Option<CudaVersion>, image: &str) -> Option<CudaVersion> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    match RegistryV2Resolver::new() {
+        Ok(registry) => floor_for(None, image, &registry),
+        Err(e) => {
+            log(format!("  image labels unavailable ({e}); no CUDA floor"));
+            None
+        }
+    }
+}
+
+/// [`cuda_floor`] with the label source given.
+fn floor_for(
+    explicit: Option<CudaVersion>,
+    image: &str,
+    labels: &dyn ImageLabels,
+) -> Option<CudaVersion> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    match image_min_cuda(labels, image) {
+        Ok(Some(floor)) => {
+            log(format!("  {image} declares a host CUDA floor of {floor}"));
+            Some(floor)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            log(format!("  image CUDA floor: {e}; no floor"));
+            None
+        }
+    }
 }
 
 /// Poll until a pod publishes its direct-TCP SSH endpoint (`publicIp` + port 22 map).
@@ -1533,18 +2335,139 @@ pub(crate) fn wait_for_ssh_endpoint(
     Err(anyhow!("no SSH endpoint within {}s", timeout.as_secs()))
 }
 
+/// Where a created pod landed: the cloud and the hourly price RunPod reported for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Placement {
+    pub(crate) cloud: CloudType,
+    /// USD per hour; `None` when the create response carried no price.
+    pub(crate) cost_per_hr: Option<f64>,
+}
+
+impl std::fmt::Display for Placement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.cost_per_hr {
+            Some(cost) => write!(f, "{} {cost:.2} per hour", self.cloud),
+            None => write!(f, "{} (no price reported)", self.cloud),
+        }
+    }
+}
+
+/// A cloud bills more per hour than `--max-price-per-hour` allows, by the catalog before a create or by the
+/// created pod's own price after one. Waiting can fix it (another cloud, or the same one later), so it counts
+/// as a capacity miss.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "price cap: {cloud} bills {price:.2} per hour, over --max-price-per-hour {max} ({})",
+    .pod_id.as_ref().map_or_else(|| "catalog price, nothing created".to_string(), |id| format!("pod {id} deleted"))
+)]
+struct OverPriceCap {
+    cloud: CloudType,
+    price: f64,
+    max: f64,
+    /// The pod that was created and deleted; `None` when the catalog refused the cloud before any create.
+    pod_id: Option<String>,
+}
+
+/// How often a refused delete of an over-cap pod is tried, with 2 s, 4 s, 8 s between the tries.
+const OVER_CAP_DELETE_ATTEMPTS: u32 = 4;
+
+/// Delete `pod_id`, retrying with backoff. `false` when the API never confirmed it: the pod may still bill.
+fn delete_with_backoff<P: PodApi + ?Sized>(pods: &P, pod_id: &str, clock: &dyn Clock) -> bool {
+    for attempt in 1..=OVER_CAP_DELETE_ATTEMPTS {
+        match pods.delete_pod(pod_id) {
+            Ok(()) => return true,
+            Err(e) => log(format!(
+                "  delete of pod {pod_id} failed (try {attempt}): {e}"
+            )),
+        }
+        if attempt < OVER_CAP_DELETE_ATTEMPTS {
+            clock.sleep(Duration::from_secs(1 << attempt));
+        }
+    }
+    false
+}
+
+/// Try once more to delete every pod an earlier delete failed on; the ones still refusing stay listed.
+fn retry_strays<P: PodApi + ?Sized>(pods: &P, strays: &mut Vec<String>) {
+    strays.retain(|id| match pods.delete_pod(id) {
+        Ok(()) => {
+            log(format!(
+                "  pod {id} deleted after an earlier refused delete"
+            ));
+            false
+        }
+        Err(e) => {
+            log(format!("  pod {id} is still not deletable: {e}"));
+            true
+        }
+    });
+}
+
+/// The hourly price of a freshly created pod. The create response carries it, but when it does not and a cap
+/// needs it, one read of the pod does. `None` is "RunPod did not say", never a price.
+fn created_pod_price<P: PodApi + ?Sized>(pods: &P, pod: &Pod, capped: bool) -> Option<f64> {
+    if pod.cost_per_hr.is_some() || !capped {
+        return pod.cost_per_hr;
+    }
+    match pods.get_pod(&pod.id) {
+        Ok(read) => read.cost_per_hr,
+        Err(e) => {
+            log(format!("  get_pod {} for its price: {e}", pod.id));
+            None
+        }
+    }
+}
+
+/// What `--max-price-per-hour` needs besides the config: the catalog (when it could be read), the pods an
+/// over-cap delete failed on, and the clock the delete backoff sleeps on.
+struct PriceCheck<'a> {
+    catalog: Option<&'a GpuCatalog>,
+    strays: &'a mut Vec<String>,
+    clock: &'a dyn Clock,
+}
+
 /// Create the pod of one attempt in the first of `cfg.cloud`'s clouds that accepts it, and return it
-/// with that cloud. RunPod has no "any cloud" value, so `--cloud all` is this ordered fallback; the
-/// error is the last cloud's refusal.
+/// with where it landed. RunPod has no "any cloud" value, so `--cloud all` is this ordered fallback
+/// ([`CloudChoice::tiers`]); the error is the last cloud's refusal.
+///
+/// Under `--max-price-per-hour`: a `catalog` price above the cap refuses the cloud before any create (and a
+/// type the catalog says the cloud does not offer is skipped the same way), and a created pod whose own
+/// price is above it is deleted as the backstop. Both are that cloud's capacity miss. A pod whose price
+/// RunPod never reports is kept: the cap is not enforced on a price nobody knows. A refused delete of an
+/// over-cap pod never aborts the run: it goes on `strays`, which the caller keeps deleting.
 fn create_in_first_cloud<P: PodApi + ?Sized>(
     pods: &P,
     cfg: &ProvisionCfg,
     env: &HashMap<String, String>,
     gpu: &str,
     attempt: u32,
-) -> Result<(Pod, CloudType)> {
+    checks: &mut PriceCheck<'_>,
+) -> Result<(Pod, Placement)> {
     let mut last = anyhow!("no cloud to rent from");
+    let mut refused_for_good = true;
     for &cloud_type in cfg.cloud.tiers() {
+        if let (Some(max), Some(catalog)) = (cfg.max_price_per_hour, checks.catalog) {
+            match catalog.price(gpu, cloud_type, cfg.gpu_count) {
+                CatalogPrice::PerHour(price) if price > max => {
+                    let refusal = OverPriceCap {
+                        cloud: cloud_type,
+                        price,
+                        max,
+                        pod_id: None,
+                    };
+                    log(format!("  {gpu} in {cloud_type}: {refusal}"));
+                    refused_for_good = false;
+                    last = refusal.into();
+                    continue;
+                }
+                CatalogPrice::NotOffered => {
+                    log(format!("  {gpu} is not offered in {cloud_type}; skipped"));
+                    last = anyhow!("{gpu} is not offered in {cloud_type}");
+                    continue;
+                }
+                CatalogPrice::PerHour(_) | CatalogPrice::Unlisted => {}
+            }
+        }
         let spec = CreateSpec {
             owner: cfg.owner,
             run_id: cfg.run_id,
@@ -1558,29 +2481,151 @@ fn create_in_first_cloud<P: PodApi + ?Sized>(
             env,
             network_volume_id: cfg.network_volume_id,
             data_center_ids: cfg.data_center_ids,
-            allowed_cuda_versions: cfg.allowed_cuda_versions,
         };
         match pods.create_pod(&spec) {
-            Ok(pod) => return Ok((pod, cloud_type)),
+            Ok(pod) => {
+                let placement = Placement {
+                    cloud: cloud_type,
+                    cost_per_hr: created_pod_price(pods, &pod, cfg.max_price_per_hour.is_some()),
+                };
+                log(format!("  pod {} created: {placement}", pod.id));
+                let (Some(max), Some(price)) = (cfg.max_price_per_hour, placement.cost_per_hr)
+                else {
+                    return Ok((pod, placement));
+                };
+                if price <= max {
+                    return Ok((pod, placement));
+                }
+                let refusal = OverPriceCap {
+                    cloud: cloud_type,
+                    price,
+                    max,
+                    pod_id: Some(pod.id.clone()),
+                };
+                if delete_with_backoff(pods, &pod.id, checks.clock) {
+                    log(format!("  {refusal}"));
+                } else {
+                    log(format!(
+                        "  WARNING: over-cap pod {} could not be deleted and may still be billing {price:.2} per hour; \
+                         it is named under this state database's prefix, so `reap` removes it, and it is retried here",
+                        pod.id
+                    ));
+                    checks.strays.push(pod.id);
+                }
+                refused_for_good = false;
+                last = refusal.into();
+            }
             Err(e) => {
                 log(format!("  create in {cloud_type} failed: {e}"));
+                refused_for_good &= !is_capacity_error(&e);
                 last = e;
             }
         }
     }
+    if refused_for_good {
+        return Err(Unrecoverable(format!("{last}")).into());
+    }
     Err(last)
 }
 
-/// Provision one GPU pod, rotating over `cfg.gpu_types` for up to `cfg.attempts` tries, and return its
-/// SSH endpoint. `on_create` gets the pod id right after creation (before the SSH wait) so callers can
-/// persist it and never leak a pod on a crash. A timed-out attempt deletes its pod before the next try.
+/// Can waiting fix this create failure? A refusal that is not a capacity one (bad GPU type, cloud value, auth,
+/// image) never can; a transport failure and a capacity refusal can.
+fn is_capacity_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<CreateError>()
+        .is_none_or(CreateError::is_capacity)
+}
+
+/// The seconds to wait after the `pass`-th full pass over the GPU types found no capacity: 20 s, then x1.5 per
+/// pass, capped at five minutes.
+pub(crate) fn capacity_backoff_secs(pass: u32) -> u64 {
+    let mut secs = 20.0_f64;
+    for _ in 1..pass {
+        secs = (secs * 1.5).min(300.0);
+    }
+    secs.round().min(300.0) as u64
+}
+
+/// A little jitter on top of the backoff, up to a tenth of it, so concurrent runs do not retry in step.
+fn jittered(base: u64) -> Duration {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
+    Duration::from_millis(base * 1000 + nanos % (base * 100 + 1))
+}
+
+/// Provision one GPU pod and return its SSH endpoint. It cycles over `cfg.gpu_types` (each tried in `cfg.cloud`'s
+/// clouds, cheapest first) and, while the only trouble is capacity (a refusal, or a pod that does not boot in time), waits
+/// ([`capacity_backoff_secs`]) and cycles again, for as long as it takes or until `cfg.give_up_after`. A refusal
+/// that waiting cannot fix fails at once as [`Unrecoverable`]. `on_create` gets the pod id right after creation
+/// (before the SSH wait) so callers can persist it and never leak a pod on a crash; a pod that does not boot in
+/// time is deleted before the next try. `waiting` is told the pass number whenever it starts waiting.
 fn provision_pod<P: PodApi + ?Sized>(
     pods: &P,
     cfg: &ProvisionCfg,
     env: &HashMap<String, String>,
-    // Called with (pod_id, gpu_type, cloud) right after creation; both are the attempt's actual values.
-    on_create: impl Fn(&str, &str, CloudType) -> Result<()>,
+    // Called with (pod_id, gpu_type, placement) right after creation; all are the attempt's actual values.
+    on_create: impl Fn(&str, &str, Placement) -> Result<()>,
+    waiting: impl Fn(u32),
+    clock: &dyn Clock,
 ) -> Result<(String, String, u16)> {
+    let mut strays = Vec::new();
+    let result = provision_attempts(pods, cfg, env, on_create, waiting, clock, &mut strays);
+    retry_strays(pods, &mut strays);
+    for id in &strays {
+        log(format!(
+            "WARNING: pod {id} was over the price cap and RunPod would not delete it: delete it on the RunPod \
+             dashboard or with `reap`"
+        ));
+    }
+    result
+}
+
+/// The line logged before a capacity wait. It names the price cap when the last miss was one, so a run that
+/// sits waiting on `--max-price-per-hour` says so.
+fn wait_line(
+    last: &anyhow::Error,
+    gpus: &[&str],
+    pause: Duration,
+    pass: u32,
+    waited: Duration,
+) -> String {
+    let why = match last.downcast_ref::<OverPriceCap>() {
+        Some(cap) => format!("price cap (--max-price-per-hour {})", cap.max),
+        None => "capacity".to_string(),
+    };
+    format!(
+        "no {why} for any of {}, waiting {}s (pass {pass}, waiting {} min so far)",
+        gpus.join(", "),
+        pause.as_secs(),
+        waited.as_secs() / 60
+    )
+}
+
+/// The pass loop of [`provision_pod`]; `strays` collects over-cap pods whose delete was refused.
+fn provision_attempts<P: PodApi + ?Sized>(
+    pods: &P,
+    cfg: &ProvisionCfg,
+    env: &HashMap<String, String>,
+    on_create: impl Fn(&str, &str, Placement) -> Result<()>,
+    waiting: impl Fn(u32),
+    clock: &dyn Clock,
+    strays: &mut Vec<String>,
+) -> Result<(String, String, u16)> {
+    // The catalog prices a cloud before anything is created. It only matters under a cap, and a catalog that
+    // cannot be read leaves the post-create check to enforce the cap.
+    let catalog = match cfg.max_price_per_hour {
+        Some(_) => match pods.gpu_catalog() {
+            Ok(catalog) => Some(catalog),
+            Err(e) => {
+                log(format!(
+                    "gpu catalog unavailable ({e:#}); the price cap is checked on the created pod only"
+                ));
+                None
+            }
+        },
+        None => None,
+    };
     let gpus: Vec<&str> = cfg
         .gpu_types
         .split(',')
@@ -1588,52 +2633,94 @@ fn provision_pod<P: PodApi + ?Sized>(
         .filter(|s| !s.is_empty())
         .collect();
     if gpus.is_empty() {
-        bail!("no gpu types given");
+        return Err(Unrecoverable("no gpu types given".into()).into());
     }
-    let mut last = anyhow!("no attempts");
-    for attempt in 1..=cfg.attempts {
-        let gpu = gpus[(attempt as usize - 1) % gpus.len()];
-        log(format!(
-            "provision {attempt}/{}: {gpu} ({}) image={}",
-            cfg.attempts, cfg.cloud, cfg.image
-        ));
-        match create_in_first_cloud(pods, cfg, env, gpu, attempt) {
-            Ok((pod, cloud)) => {
-                // Hand the id to the caller immediately so a crash cannot leak the pod.
-                on_create(&pod.id, gpu, cloud)?;
-                log(format!(
-                    "  pod {} created; waiting up to {}s for SSH endpoint (large image - be patient)",
-                    pod.id, cfg.timeout_s
-                ));
-                match wait_for_ssh_endpoint(
-                    |id| pods.get_pod(id),
-                    &pod.id,
-                    Duration::from_secs(cfg.timeout_s),
-                    cfg.poll_interval,
-                ) {
-                    Ok((h, p)) => return Ok((pod.id, h, p)),
-                    Err(e) => {
-                        last = e;
-                        log(format!(
-                            "  attempt {attempt} timed out; terminating pod {}",
-                            pod.id
-                        ));
-                        // A pod the API will not delete is still billing: stop here, do not open another.
-                        delete_pod_confirmed(pods, &pod.id)?;
+    let mut attempt = 0u32;
+    let mut last = anyhow!("no attempt made");
+    for pass in 1u32.. {
+        for gpu in &gpus {
+            attempt += 1;
+            log(format!(
+                "provision pass {pass}, try {attempt}: {gpu} ({}) image={}",
+                cfg.cloud, cfg.image
+            ));
+            retry_strays(pods, strays);
+            let mut checks = PriceCheck {
+                catalog: catalog.as_ref(),
+                strays: &mut *strays,
+                clock,
+            };
+            match create_in_first_cloud(pods, cfg, env, gpu, attempt, &mut checks) {
+                Ok((pod, placement)) => {
+                    // Hand the id to the caller immediately so a crash cannot leak the pod.
+                    on_create(&pod.id, gpu, placement)?;
+                    // What the API says about the pod it just created: logged on every create, and held
+                    // against the CUDA floor when there is one.
+                    let mut verdict = pod_cuda_verdict(pods, &pod.id, gpu, cfg.min_cuda);
+                    if reject_below_floor(pods, &pod.id, &verdict, cfg.min_cuda, clock, &mut last)?
+                    {
+                        continue;
+                    }
+                    log(format!(
+                        "  pod {} created; waiting up to {}s for SSH endpoint (large image - be patient)",
+                        pod.id, cfg.timeout_s
+                    ));
+                    match wait_for_ssh_endpoint(
+                        |id| pods.get_pod(id),
+                        &pod.id,
+                        Duration::from_secs(cfg.timeout_s),
+                        cfg.poll_interval,
+                    ) {
+                        Ok((h, p)) => {
+                            // The API reports no CUDA version until a host picks the pod up: ask again now that one has.
+                            if matches!(verdict, CudaVerdict::Unknown) {
+                                verdict = pod_cuda_verdict(pods, &pod.id, gpu, cfg.min_cuda);
+                                if reject_below_floor(
+                                    pods,
+                                    &pod.id,
+                                    &verdict,
+                                    cfg.min_cuda,
+                                    clock,
+                                    &mut last,
+                                )? {
+                                    continue;
+                                }
+                            }
+                            return Ok((pod.id, h, p));
+                        }
+                        Err(e) => {
+                            last = e;
+                            log(format!(
+                                "  try {attempt} did not boot in time; terminating pod {}",
+                                pod.id
+                            ));
+                            // A pod the API will not delete is still billing: stop here, do not open another.
+                            delete_pod_confirmed(pods, &pod.id)?;
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                log(format!("  create failed: {e}"));
-                last = e;
+                Err(e) if e.downcast_ref::<Unrecoverable>().is_some() => return Err(e),
+                Err(e) => {
+                    log(format!("  create failed: {e}"));
+                    last = e;
+                }
             }
         }
-        std::thread::sleep(Duration::from_secs(5));
+        let waited = clock.elapsed();
+        if cfg.give_up_after.is_some_and(|limit| waited >= limit) {
+            return Err(Cancelled(format!(
+                "gave up on capacity after {} min and {pass} pass(es) over {}: {last}",
+                waited.as_secs() / 60,
+                gpus.join(", ")
+            ))
+            .into());
+        }
+        let pause = jittered(capacity_backoff_secs(pass));
+        log(wait_line(&last, &gpus, pause, pass, waited));
+        waiting(pass);
+        clock.sleep(pause);
     }
-    Err(anyhow!(
-        "could not provision a pod after {} attempts: {last}",
-        cfg.attempts
-    ))
+    unreachable!("the pass loop only ends by returning")
 }
 
 fn provision<P: PodApi + ?Sized>(
@@ -1642,10 +2729,12 @@ fn provision<P: PodApi + ?Sized>(
     pubkey: &str,
     run_id: &str,
     db: &Db,
+    clock: &dyn Clock,
+    poll_interval: Duration,
 ) -> Result<(String, String, u16)> {
     let mut env = HashMap::new();
     env.insert("PUBLIC_KEY".to_string(), pubkey.to_string());
-    let allowed_cuda = cuda_floor_to_allowed(a.min_cuda_version.as_deref().unwrap_or(""));
+    let min_cuda = cuda_floor(a.min_cuda_version, &a.image);
     // Single optional pin from `run --data-center`; empty means the field stays off the body.
     let data_center_ids: Vec<&str> = a.data_center.as_deref().into_iter().collect();
     // The prefix is minted here, before the first create call, so a pod created and then lost to a
@@ -1655,23 +2744,67 @@ fn provision<P: PodApi + ?Sized>(
         gpu_types: &a.gpu_types,
         gpu_count: 1,
         cloud: a.cloud,
+        max_price_per_hour: a.max_price_per_hour,
         image: &a.image,
         container_disk_gb: a.container_disk_gb,
         network_volume_id: a.network_volume_id.as_deref(),
         data_center_ids: &data_center_ids,
-        attempts: a.provision_attempts,
+        give_up_after: a.give_up_after_min.map(|m| Duration::from_secs(m * 60)),
         timeout_s: a.provision_timeout_s,
-        poll_interval: PROVISION_POLL_INTERVAL,
+        poll_interval,
         owner: &owner,
         run_id,
-        allowed_cuda_versions: &allowed_cuda,
+        min_cuda,
     };
     // Persist the pod id right away so reap can find it after a crash, and record it in the `pods` table
     // as `provisioning` (spec 030); run_phases promotes it to `busy`.
-    provision_pod(rp, &cfg, &env, |id, gpu, cloud| {
-        db.create_pod_record(id, gpu, &cloud.to_string(), &a.image)?;
-        db.set_pod(run_id, id, None, None)
-    })
+    provision_pod(
+        rp,
+        &cfg,
+        &env,
+        |id, gpu, placement| {
+            db.create_pod_record(
+                id,
+                gpu,
+                &placement.cloud.to_string(),
+                placement.cost_per_hr,
+                &a.image,
+            )?;
+            db.set_pod(run_id, id, None, None)
+        },
+        |pass| {
+            let _ = db.set_status(
+                run_id,
+                &format!("provisioning (waiting for capacity, pass {pass})"),
+            );
+        },
+        clock,
+    )
+}
+
+/// The python runners are baked into the image too; sync every file of each runner's directory (its `run.py` and
+/// the helper modules and data beside it) so a runner fixed after the image build is the one that runs. Only the
+/// files directly in a runner directory go up; `__pycache__` and `tests/` are subdirectories and stay behind.
+/// (The binary runners, candle and poot, are not scripts.)
+fn sync_python_runners<R: Remote + ?Sized>(remote: &R, bench: &Path) -> Result<()> {
+    for runner in ["llamacpp", "vllm", "torch"] {
+        let dir = bench.join("runners").join(runner);
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let path = entry?.path();
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+        files.sort();
+        for file in files {
+            remote.scp_up(
+                file.to_str().unwrap(),
+                &format!("/opt/benchmarks/runners/{runner}/"),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn setup_pod(
@@ -1681,7 +2814,9 @@ fn setup_pod(
     poot_bin: &Path,
     ep: &ssh::Endpoint,
     a: &RunArgs,
+    cursor: &Cursor,
 ) -> Result<()> {
+    cursor.set(None, "upload");
     log("uploading the poot runner + syncing the current harness...");
     ep.scp_up(poot_bin.to_str().unwrap(), "/root/poot-bench-runner")?;
     ep.ssh_checked("chmod +x /root/poot-bench-runner")?;
@@ -1698,6 +2833,7 @@ fn setup_pod(
             ep.scp_up(src.to_str().unwrap(), "/opt/benchmarks/")?;
         }
     }
+    sync_python_runners(ep, &bench)?;
     for dir in ["harness", "schema", "prompts"] {
         let src = bench.join(dir);
         if src.exists() {
@@ -1720,9 +2856,16 @@ fn setup_pod(
     }
 
     for m in models {
+        cursor.set(Some(&m.id), "setup");
         let st = db.model_state(&run.id, &m.id)?;
         if st.setup_done {
             log(format!("  {} already set up", m.id));
+            continue;
+        }
+        let base = sweep_run_id(db, run, &m.id)?;
+        let dirs = run.model_snapshot_dirs(&base);
+        if gather::repeats_present(&results_dir()?, &dirs).len() == dirs.len() {
+            log(format!("  {} is fully gathered locally; no setup", m.id));
             continue;
         }
         let repo = m
@@ -1731,10 +2874,10 @@ fn setup_pod(
             .ok_or_else(|| anyhow!("{} has no hf_repo", m.id))?;
         // Download to the dir the harness reads (local_dir, else id).
         let dst = format!("{}/{}", a.models_root(), m.dir_name());
-        // Skip the download if the attached volume already holds the weights (config.json present).
+        // Skip the download if the attached volume already holds the weights.
         let cached = a.network_volume_id.is_some()
             && ep
-                .ssh(&format!("test -f {dst}/config.json && echo Y || echo N"))?
+                .ssh(&format!("{} && echo Y || echo N", cached_probe(m, &dst)))?
                 .stdout
                 .contains('Y');
         if cached {
@@ -1744,19 +2887,12 @@ fn setup_pod(
             ));
         } else {
             log(format!("  fetching {} ({repo}) -> {dst}", m.id));
-            ep.ssh_checked(&format!(
-                "{POD_PATH} hf download {repo} --local-dir {dst} >/tmp/dl-{}.log 2>&1",
-                m.id
-            ))?;
+            ep.ssh_checked(&download_command(m, repo, &dst))?;
         }
         // GGUF for llama.cpp (best-effort; a failure just makes that cell unsupported).
-        let gguf = format!("{dst}/{}-f16.gguf", m.id);
-        let conv = format!(
-            "test -f /opt/llama.cpp/convert_hf_to_gguf.py && /opt/tf-venv/bin/python \
-             /opt/llama.cpp/convert_hf_to_gguf.py {dst} --outfile {gguf} --outtype f16 >/tmp/gguf-{}.log 2>&1",
-            m.id
-        );
-        if !ep.ssh(&conv)?.ok() {
+        if let Some(conv) = preconvert_command(m, &dst)
+            && !ep.ssh(&conv)?.ok()
+        {
             log(format!(
                 "  GGUF convert for {} failed (llama.cpp cell will be skipped)",
                 m.id
@@ -1767,20 +2903,66 @@ fn setup_pod(
     Ok(())
 }
 
+/// The `hf download` of one model into `dst`: its `hf_include` files only, or the whole repo when it names none.
+fn download_command(m: &Model, repo: &str, dst: &str) -> String {
+    let include: String = m
+        .hf_include
+        .iter()
+        .map(|pattern| format!(" --include '{pattern}'"))
+        .collect();
+    format!(
+        "{POD_PATH} hf download {repo} --local-dir {dst}{include} >/tmp/dl-{}.log 2>&1",
+        m.id
+    )
+}
+
+/// A shell test that `dst` already holds the model: its `weights_file`, else the HF `config.json`.
+fn cached_probe(m: &Model, dst: &str) -> String {
+    let marker = m.weights_file.as_deref().unwrap_or("config.json");
+    format!("test -f {dst}/{marker}")
+}
+
+/// The f16 GGUF conversion run on the pod for llama.cpp, for a model that needs one
+/// ([`Model::needs_gguf_preconversion`]).
+fn preconvert_command(m: &Model, dst: &str) -> Option<String> {
+    m.needs_gguf_preconversion().then(|| {
+        format!(
+            "test -f /opt/llama.cpp/convert_hf_to_gguf.py && /opt/tf-venv/bin/python \
+             /opt/llama.cpp/convert_hf_to_gguf.py {dst} --outfile {dst}/{id}-f16.gguf --outtype f16 >/tmp/gguf-{id}.log 2>&1",
+            id = m.id
+        )
+    })
+}
+
 /// Is the pod alive per the RunPod API? Needed because `ssh::Endpoint::ssh` returns `Ok` with empty
 /// output for an unreachable host, so a pod deleted out-of-band would leave the sweep polling an empty
 /// log until the hours-long timeout. `get_pod` errs on 404; a non-`RUNNING` desired status means
 /// stopped or terminated. Callers require consecutive failures to ride out API blips.
-fn pod_alive(rp: &RunPod, pid: &str) -> bool {
-    match rp.get_pod(pid) {
-        Ok(p) => p.desired_status == "RUNNING",
-        Err(_) => false,
-    }
+fn pod_alive<P: PodApi + ?Sized>(rp: &P, pid: &str) -> bool {
+    // Only a definite answer (404, EXITED, TERMINATED) is "not alive"; an API blip is not.
+    !matches!(pod_state(rp, pid, true), PodState::Gone)
 }
 
-/// The `bench run --run-id` of one model's sweep on the pod: the run and the model name it.
-fn sweep_run_id(run: &Run, model: &str) -> String {
-    format!("{}-{model}", run.id)
+/// The `bench run --run-id` of one model's sweep on the pod, and the stem of its result sets: the run's set id
+/// (its own id, or the failed run it resumes) and the model.
+fn sweep_run_id(db: &Db, run: &Run, model: &str) -> Result<String> {
+    Ok(format!("{}-{model}", db.set_id(&run.id)?))
+}
+
+/// The local `benchmarks/results` directory.
+fn results_dir() -> Result<PathBuf> {
+    Ok(repo_root()?.join("benchmarks").join("results"))
+}
+
+/// One incremental gather pass over `dirs`: the complete sets on the pod that are not yet local are copied,
+/// each checked with the harness's identity rule.
+fn gather_pass(ep: &dyn gather::PodFiles, dirs: &[String]) -> Result<Gathered> {
+    let results = results_dir()?;
+    let harness = repo_root()?.join("benchmarks").join("harness");
+    let (staging, rejected) = gather::side_dirs(&results);
+    gather::gather_sets(ep, &results, &staging, &rejected, dirs, &|set| {
+        gather::harness_identity_errors(&harness, set)
+    })
 }
 
 /// The shell command that sweeps one model on the pod. Provenance is not passed in: the poot runner embeds its
@@ -1792,11 +2974,43 @@ fn sweep_command(
     run_id: &str,
     scenario: &str,
     repeats: u32,
+    present: &[u32],
 ) -> String {
+    // Repeats whose sets are already local are not run again: the sets of a resumed run are one set.
+    let skip = if present.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = present.iter().map(u32::to_string).collect();
+        format!(" --skip-repeats {}", list.join(","))
+    };
     format!(
         "{POD_PATH} cd /opt/benchmarks && MODELS_DIR={models_root} POOT_BENCH_POOT_BIN=/root/poot-bench-runner \
-         ./run-sweep.sh --model {model} --scenario {scenario} --run-id {run_id} --repeats {repeats} --skip-unsupported"
+         ./run-sweep.sh --model {model} --scenario {scenario} --run-id {run_id} --repeats {repeats}{skip} --skip-unsupported"
     )
+}
+
+/// The tmux session and the log file of one model's sweep on the pod.
+fn sweep_session(model: &str) -> String {
+    format!("sweep_{}", model.replace(['.', '-'], "_"))
+}
+
+fn sweep_log(model: &str) -> String {
+    format!("/tmp/sweep-{model}.log")
+}
+
+/// The shell command that stops a model's sweep on the pod and drops its log, so the sweep starts again from scratch.
+fn stop_sweep_command(model: &str) -> String {
+    format!(
+        "tmux kill-session -t {} 2>/dev/null; rm -f {}",
+        sweep_session(model),
+        sweep_log(model)
+    )
+}
+
+/// What the sweep loop reports to and reads about the pod it watches.
+struct Watch<'a> {
+    pod_id: Option<&'a str>,
+    cursor: &'a Cursor,
 }
 
 fn sweep(
@@ -1806,16 +3020,32 @@ fn sweep(
     models: &[Model],
     ep: &ssh::Endpoint,
     a: &RunArgs,
-    pod_id: Option<&str>,
+    watch: &Watch<'_>,
 ) -> Result<()> {
+    let (pod_id, cursor) = (watch.pod_id, watch.cursor);
     for m in models {
+        cursor.set(Some(&m.id), "sweep");
         let st = db.model_state(&run.id, &m.id)?;
         if st.sweep_done {
             log(format!("  {} sweep already done", m.id));
             continue;
         }
-        let sess = format!("sweep_{}", m.id.replace(['.', '-'], "_"));
-        let logf = format!("/tmp/sweep-{}.log", m.id);
+        let base = sweep_run_id(db, run, &m.id)?;
+        let dirs = run.model_snapshot_dirs(&base);
+        let present = gather::repeats_present(&results_dir()?, &dirs);
+        if present.len() == dirs.len() {
+            log(format!(
+                "  {}: all {} repeat(s) already gathered locally; nothing to sweep",
+                m.id,
+                dirs.len()
+            ));
+            db.set_model_sweep(&run.id, &m.id, true, Some(&base))?;
+            db.set_model_gathered(&run.id, &m.id)?;
+            continue;
+        }
+        let remaining = u64::try_from(dirs.len() - present.len()).unwrap_or(1);
+        let sess = sweep_session(&m.id);
+        let logf = sweep_log(&m.id);
         // Done only if the wrapper appended SWEEP_EXIT=0. A non-zero marker is a failed prior attempt and
         // is re-run, not reported as complete.
         let succeeded = ep
@@ -1834,17 +3064,15 @@ fn sweep(
         if !succeeded {
             if !running {
                 log(format!("=== sweep: {} (tmux {sess}) ===", m.id));
-                // `tee` truncates a stale failed log; pipefail makes SWEEP_EXIT=$? the sweep's exit, not tee's.
                 let cmd = sweep_command(
                     a.models_root(),
                     &m.id,
-                    &sweep_run_id(run, &m.id),
+                    &base,
                     &run.scenario,
                     run.repeats,
+                    &present,
                 );
-                ep.ssh_checked(&format!(
-                    "tmux new-session -d -s {sess} 'set -o pipefail; {cmd} 2>&1 | tee {logf}; echo SWEEP_EXIT=$? >> {logf}'"
-                ))?;
+                start_sweep(ep, &sess, &logf, &cmd)?;
             } else {
                 log(format!(
                     "=== sweep: {} (reattaching to live tmux {sess}) ===",
@@ -1856,22 +3084,35 @@ fn sweep(
         }
         // Poll the logfile for progress and completion (skipped if the sweep already succeeded).
         if !succeeded {
-            let deadline = Instant::now()
-                + Duration::from_secs(a.sweep_timeout_s.saturating_mul(u64::from(run.repeats)));
+            let deadline =
+                Instant::now() + Duration::from_secs(a.sweep_timeout_s.saturating_mul(remaining));
             let mut offset = 0usize;
             // Pod-liveness watchdog: probe the RunPod API every PROBE_EVERY iterations (20s each, ~3 min)
             // and abort after MAX_STRIKES consecutive down readings (~9 min), so a deleted pod fails
             // fast while a transient API blip is forgiven.
             const PROBE_EVERY: u32 = 9;
             const MAX_STRIKES: u32 = 3;
+            // Copy the sets the harness has finished every GATHER_EVERY iterations (~2 min), so a pod that
+            // vanishes loses only the repeat in flight.
+            const GATHER_EVERY: u32 = 6;
             let mut iters = 0u32;
             let mut strikes = 0u32;
+            let mut unreachable_since: Option<Instant> = None;
+            let mut mirroring = gather::Mirroring::default();
             loop {
                 if Instant::now() >= deadline {
-                    bail!("{} sweep exceeded {}s", m.id, a.sweep_timeout_s);
+                    gather_quietly(ep, &dirs)?;
+                    return Err(PodLost {
+                        pod_id: pod_id.unwrap_or("?").to_string(),
+                        reason: "the sweep timed out",
+                    }
+                    .into());
                 }
                 std::thread::sleep(Duration::from_secs(20));
                 iters += 1;
+                if iters.is_multiple_of(GATHER_EVERY) {
+                    gather_and_probe(ep, &dirs)?;
+                }
                 if iters.is_multiple_of(PROBE_EVERY)
                     && let Some(pid) = pod_id
                 {
@@ -1884,17 +3125,42 @@ fn sweep(
                             m.id
                         ));
                         if strikes >= MAX_STRIKES {
-                            bail!(
-                                "{} sweep aborted: pod {pid} is gone/not RUNNING per the RunPod API; not waiting out the {}s timeout",
-                                m.id,
-                                a.sweep_timeout_s
-                            );
+                            // The pod is gone: nothing more to copy, and a fault in what it wrote changes nothing.
+                            let _ = gather_quietly(ep, &dirs);
+                            return Err(PodLost {
+                                pod_id: pid.to_string(),
+                                reason: "RunPod says it is not running",
+                            }
+                            .into());
                         }
                     }
                 }
-                let tail = ep
-                    .ssh(&format!("tail -c +{} {logf} 2>/dev/null", offset + 1))?
-                    .stdout;
+                let polled = ep.ssh(&format!("tail -c +{} {logf} 2>/dev/null", offset + 1))?;
+                // ssh exits 255 when it cannot connect. A pod that stays unreachable past the grace window is
+                // lost; shorter trouble is waited out.
+                if polled.code == SSH_UNREACHABLE {
+                    let since = *unreachable_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= SSH_GRACE {
+                        let _ = gather_quietly(ep, &dirs);
+                        return Err(PodLost {
+                            pod_id: pod_id.unwrap_or("?").to_string(),
+                            reason: "ssh unreachable beyond the grace window",
+                        }
+                        .into());
+                    }
+                    if let Some(line) = mirroring.tick(ep, &results_dir()?, &dirs, &polled) {
+                        log(line);
+                    }
+                    log(format!(
+                        "  {}: ssh unreachable for {}s (grace {}s)",
+                        m.id,
+                        since.elapsed().as_secs(),
+                        SSH_GRACE.as_secs()
+                    ));
+                    continue;
+                }
+                unreachable_since = None;
+                let tail = polled.stdout.as_str();
                 for line in tail.lines() {
                     if line.contains("[progress]")
                         || line.contains("[run]")
@@ -1902,8 +3168,15 @@ fn sweep(
                     {
                         log(format!("  {}: {}", m.id, line.trim()));
                     }
+                    if line.contains("[progress]") {
+                        record_progress(&run.id, &m.id, line.trim());
+                    }
                 }
                 offset += tail.len();
+                // The cells finished so far, for the dashboard: after the poll, only when the pod answered it.
+                if let Some(line) = mirroring.tick(ep, &results_dir()?, &dirs, &polled) {
+                    log(line);
+                }
                 let done = ep
                     .ssh(&format!("grep -q SWEEP_EXIT {logf} && echo Y || echo N"))?
                     .stdout
@@ -1920,18 +3193,81 @@ fn sweep(
                         );
                     }
                     log(format!("  {} sweep finished ({exit})", m.id));
+                    // A host that cannot run CUDA fails every cell with an error row, and the sweep still exits 0:
+                    // read the log before gathering sets of errors, and replace the pod.
+                    let tail = ep.ssh(&format!("tail -n 400 {logf} 2>/dev/null"))?.stdout;
+                    if let Some(fault) = heal::host_fault_in(&tail) {
+                        return Err(fault.into());
+                    }
+                    gather_quietly(ep, &dirs)?;
                     break;
                 }
             }
         }
         // The harness wrote the run directories named by `sweep_run_id` (see `Run::model_snapshot_dirs`).
-        db.set_model_sweep(&run.id, &m.id, true, Some(&sweep_run_id(run, &m.id)))?;
+        db.set_model_sweep(&run.id, &m.id, true, Some(&base))?;
     }
     Ok(())
 }
 
+/// How long a pod may stay unreachable over ssh before it counts as lost.
+const SSH_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// Start a model's sweep in a detached tmux session on the pod. A dead GPU is caught here, before a repeat starts,
+/// not after the harness has swept a repeat of errors.
+fn start_sweep(pod: &dyn gather::PodFiles, sess: &str, logf: &str, cmd: &str) -> Result<()> {
+    heal::require_gpu(pod)?;
+    // `tee` truncates a stale failed log; pipefail makes SWEEP_EXIT=$? the sweep's exit, not tee's.
+    let launch = format!(
+        "tmux new-session -d -s {sess} 'set -o pipefail; {cmd} 2>&1 | tee {logf}; echo SWEEP_EXIT=$? >> {logf}'"
+    );
+    let started = pod.ssh(&launch)?;
+    if !started.ok() {
+        bail!(
+            "remote command failed (rc={}): {launch}\n{}",
+            started.code,
+            started.stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+/// The periodic step of the sweep loop: copy the finished sets, then check the pod still has its GPU.
+fn gather_and_probe(pod: &dyn gather::PodFiles, dirs: &[String]) -> Result<()> {
+    gather_quietly(pod, dirs)?;
+    heal::require_gpu(pod)
+}
+
+/// A gather pass during the sweep: a failure is logged, not fatal (the final gather reports what is missing),
+/// except a [`HostFault`] in a copied set (the pod's GPU is gone: the sweep ends there and the pod is replaced) or a
+/// [`SetupFault`] (the model is not on the pod: the sweep ends there and the model is set up again).
+fn gather_quietly(ep: &dyn gather::PodFiles, dirs: &[String]) -> Result<()> {
+    match gather_pass(ep, dirs) {
+        Err(e)
+            if e.downcast_ref::<HostFault>().is_some()
+                || e.downcast_ref::<SetupFault>().is_some() =>
+        {
+            Err(e)
+        }
+        Err(e) => {
+            log(format!("  incremental gather: {e:#}"));
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+    }
+}
+
+/// Keep the harness's latest progress line where the dashboard can read it.
+fn record_progress(run_id: &str, model: &str, line: &str) {
+    let written = results_dir()
+        .and_then(|results| gather::write_progress(&results, run_id, &format!("{model}: {line}")));
+    if let Err(e) = written {
+        log(format!("  progress line: {e:#}"));
+    }
+}
+
 fn gather(db: &Db, run: &Run, models: &[Model], ep: &ssh::Endpoint) -> Result<()> {
-    let results = repo_root()?.join("benchmarks").join("results");
+    let results = results_dir()?;
     std::fs::create_dir_all(&results)?;
     for m in models {
         let st = db.model_state(&run.id, &m.id)?;
@@ -1939,12 +3275,19 @@ fn gather(db: &Db, run: &Run, models: &[Model], ep: &ssh::Endpoint) -> Result<()
         if st.gathered {
             continue;
         }
-        for dir in run.model_snapshot_dirs(&base) {
-            log(format!("copying snapshot {dir} back"));
-            ep.scp_down(
-                &format!("/opt/benchmarks/results/{dir}"),
-                &(results.to_string_lossy().to_string() + "/"),
-            )?;
+        // Sets the sweep loop already copied are skipped; this pass takes what is left.
+        let dirs = run.model_snapshot_dirs(&base);
+        let got = gather_pass(ep, &dirs)?;
+        let missing: Vec<&String> = dirs
+            .iter()
+            .filter(|dir| !gather::set_is_complete(&results, dir))
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "{}: sets {missing:?} are not gathered (rejected by the identity check: {:?})",
+                m.id,
+                got.rejected
+            );
         }
         db.set_model_gathered(&run.id, &m.id)?;
     }
@@ -1961,7 +3304,12 @@ fn postprocess(run: &Run, db: &Db, a: &RunArgs) -> Result<()> {
         "bench index",
     );
     if a.commit {
-        let rids = db.snapshot_dirs(&run.id)?;
+        let results = results_dir()?;
+        let rids: Vec<String> = db
+            .snapshot_dirs(&run.id)?
+            .into_iter()
+            .filter_map(|pod_dir| gather::local_set(&results, &pod_dir))
+            .collect();
         let repo = repo_root()?;
         let _ = sh(
             std::process::Command::new("git")
@@ -1984,11 +3332,9 @@ fn postprocess(run: &Run, db: &Db, a: &RunArgs) -> Result<()> {
 // The pod id may have been set mid-run, so re-read it from the DB.
 impl Run {
     pub(crate) fn pod_id_now(&self, db: &Db) -> Option<String> {
-        db.active_run()
+        db.pod_id_for_run(&self.id)
             .ok()
             .flatten()
-            .filter(|r| r.id == self.id)
-            .and_then(|r| r.pod_id)
             .or_else(|| self.pod_id.clone())
     }
 }
@@ -2000,6 +3346,60 @@ mod tests {
     use crate::image_resolve::ImageResolveError;
     use clap::Parser as _;
     use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+
+    /// A machine that records what is uploaded to it.
+    #[derive(Default)]
+    struct UploadLog(RefCell<Vec<(String, String)>>);
+
+    impl Remote for UploadLog {
+        fn wait_ssh(&self, _timeout: Duration) -> Result<()> {
+            Ok(())
+        }
+
+        fn scp_up(&self, local: &str, remote: &str) -> Result<()> {
+            self.0.borrow_mut().push((local.into(), remote.into()));
+            Ok(())
+        }
+
+        fn ssh_until(
+            &self,
+            _cmd: &str,
+            _deadline: Instant,
+        ) -> Result<ssh::Run, ssh::DeadlineError> {
+            unreachable!("syncing the runners runs no command")
+        }
+    }
+
+    #[test]
+    fn python_runner_sync_uploads_helper_modules_beside_run_py() {
+        let bench = repo_root().unwrap().join("benchmarks");
+        let pod = UploadLog::default();
+        sync_python_runners(&pod, &bench).unwrap();
+        let uploaded = pod.0.borrow();
+        let to_vllm: Vec<&str> = uploaded
+            .iter()
+            .filter(|(_, remote)| remote == "/opt/benchmarks/runners/vllm/")
+            .map(|(local, _)| local.rsplit('/').next().unwrap())
+            .collect();
+        assert!(to_vllm.contains(&"run.py"), "{to_vllm:?}");
+        assert!(to_vllm.contains(&"stream_itl.py"), "{to_vllm:?}");
+        for runner in ["llamacpp", "torch"] {
+            let dir = format!("/opt/benchmarks/runners/{runner}/");
+            assert!(
+                uploaded
+                    .iter()
+                    .any(|(local, remote)| *remote == dir && local.ends_with("/run.py")),
+                "{runner} run.py not uploaded"
+            );
+        }
+        assert!(
+            uploaded
+                .iter()
+                .all(|(local, _)| !local.contains("__pycache__") && !local.contains("/tests/")),
+            "{uploaded:?}"
+        );
+    }
 
     fn exec_run(id: &str) -> Run {
         Run {
@@ -2024,6 +3424,7 @@ mod tests {
             pid,
             boot_id: "boot-elsewhere".into(),
             start_ticks: format!("{pid}00"),
+            pid_ns: "pid:[host-elsewhere]".into(),
         }
     }
 
@@ -2063,6 +3464,35 @@ mod tests {
         bodies: RefCell<Vec<serde_json::Value>>,
         /// Makes every SECURE create fail the way RunPod does when that cloud has no capacity.
         refuse_secure: Cell<bool>,
+        /// Refuse this many create calls (whatever the cloud) with a capacity error, then accept.
+        refuse_creates: Cell<u32>,
+        /// Refuse every create call with this HTTP status and body.
+        refuse_with: RefCell<Option<(u16, String)>>,
+        /// Refuse every SECURE create call with this HTTP status and body (COMMUNITY is unaffected).
+        refuse_secure_with: RefCell<Option<(u16, String)>>,
+        /// Refuse every COMMUNITY create call with this HTTP status and body (SECURE is unaffected).
+        refuse_community_with: RefCell<Option<(u16, String)>>,
+        creates: Cell<u32>,
+        /// The hourly price a SECURE / COMMUNITY pod reports on create (`None`: no price reported).
+        secure_cost: Cell<Option<f64>>,
+        community_cost: Cell<Option<f64>>,
+        /// What a read of a pod reports as its price (the create response may omit it).
+        read_cost: Cell<Option<f64>>,
+        /// The GPU catalog `gpu_catalog` answers with; `None` makes the call fail.
+        catalog: RefCell<Option<GpuCatalog>>,
+        catalog_reads: Cell<u32>,
+        /// The CUDA version the API reports for each pod created next, in order (`None`: not reported yet). A
+        /// pod created with none queued reports nothing.
+        next_cuda: RefCell<std::collections::VecDeque<Option<String>>>,
+        /// The version reported for each pod created so far.
+        reported_cuda: RefCell<HashMap<String, String>>,
+        /// Ids of the pods deleted, in order.
+        deleted: RefCell<Vec<String>>,
+        /// For the pods created next: a version the API only reports from the third read of the pod on (it has no
+        /// host at first), in order; consumed together with `next_cuda`.
+        late_cuda: RefCell<std::collections::VecDeque<Option<String>>>,
+        late_reported: RefCell<HashMap<String, String>>,
+        reads: RefCell<HashMap<String, u32>>,
     }
 
     impl FakePods {
@@ -2088,6 +3518,8 @@ mod tests {
                 public_ip: ssh.then(|| "1.2.3.4".to_string()),
                 port_mappings: ssh.then(|| HashMap::from([("22".to_string(), 40022)])),
                 machine: serde_json::Value::Null,
+                cuda_version: None,
+                cost_per_hr: None,
             }
         }
     }
@@ -2100,30 +3532,94 @@ mod tests {
             self.bodies
                 .borrow_mut()
                 .push(crate::runpod::create_pod_body(spec));
+            self.creates.set(self.creates.get() + 1);
+            if let Some((status, body)) = self.refuse_with.borrow().clone() {
+                return Err(CreateError { status, body }.into());
+            }
+            if spec.cloud_type == CloudType::Secure
+                && let Some((status, body)) = self.refuse_secure_with.borrow().clone()
+            {
+                return Err(CreateError { status, body }.into());
+            }
+            if spec.cloud_type == CloudType::Community
+                && let Some((status, body)) = self.refuse_community_with.borrow().clone()
+            {
+                return Err(CreateError { status, body }.into());
+            }
+            if self.refuse_creates.get() > 0 {
+                self.refuse_creates.set(self.refuse_creates.get() - 1);
+                return Err(CreateError {
+                    status: 500,
+                    body: "There are no instances currently available".into(),
+                }
+                .into());
+            }
             if self.refuse_secure.get() && spec.cloud_type == CloudType::Secure {
-                bail!("create_pod failed (500): no SECURE capacity");
+                return Err(CreateError {
+                    status: 500,
+                    body: "no SECURE capacity".into(),
+                }
+                .into());
             }
             let entry = (
                 format!("fake-pod-{n}"),
                 spec.owner.pod_name(spec.run_id, spec.attempt),
                 true,
             );
-            let pod = Self::to_pod(&entry);
+            let pod = Pod {
+                cost_per_hr: match spec.cloud_type {
+                    CloudType::Secure => self.secure_cost.get(),
+                    CloudType::Community => self.community_cost.get(),
+                },
+                ..Self::to_pod(&entry)
+            };
+            if let Some(Some(version)) = self.next_cuda.borrow_mut().pop_front() {
+                self.reported_cuda
+                    .borrow_mut()
+                    .insert(entry.0.clone(), version);
+            }
+            if let Some(Some(version)) = self.late_cuda.borrow_mut().pop_front() {
+                self.late_reported
+                    .borrow_mut()
+                    .insert(entry.0.clone(), version);
+            }
             self.cloud.borrow_mut().push(entry);
             Ok(pod)
         }
 
         fn get_pod(&self, id: &str) -> Result<Pod> {
+            let reads = {
+                let mut reads = self.reads.borrow_mut();
+                let n = reads.entry(id.to_string()).or_default();
+                *n += 1;
+                *n
+            };
             self.cloud
                 .borrow()
                 .iter()
                 .find(|p| p.0 == id)
-                .map(Self::to_pod)
-                .ok_or_else(|| anyhow!("get_pod {id} failed (404)"))
+                .map(|entry| Pod {
+                    cost_per_hr: self.read_cost.get(),
+                    cuda_version: self.reported_cuda.borrow().get(id).cloned().or_else(|| {
+                        (reads >= 3)
+                            .then(|| self.late_reported.borrow().get(id).cloned())
+                            .flatten()
+                    }),
+                    ..Self::to_pod(entry)
+                })
+                .ok_or_else(|| PodNotFound(id.to_string()).into())
         }
 
         fn list_pods(&self) -> Result<Vec<Pod>> {
             Ok(self.cloud.borrow().iter().map(Self::to_pod).collect())
+        }
+
+        fn gpu_catalog(&self) -> Result<GpuCatalog> {
+            self.catalog_reads.set(self.catalog_reads.get() + 1);
+            self.catalog
+                .borrow()
+                .clone()
+                .ok_or_else(|| anyhow!("catalog unreachable"))
         }
 
         fn delete_pod(&self, id: &str) -> Result<()> {
@@ -2131,8 +3627,19 @@ mod tests {
                 return Err(anyhow!("delete_pod {id} failed (500): refused"));
             }
             self.cloud.borrow_mut().retain(|p| p.0 != id);
+            self.deleted.borrow_mut().push(id.to_string());
             Ok(())
         }
+    }
+
+    /// A scratch directory and, inside it, an empty `results` directory. Failed sets live beside `results`
+    /// (`gather::failed_dir`), so keeping `results` one level down keeps them out of the shared temp dir, where a
+    /// run's leftovers would make the next run see repeats as present.
+    fn scratch_results(tag: &str) -> (PathBuf, PathBuf) {
+        let root = unique_temp_dir(tag);
+        let results = root.join("results");
+        std::fs::create_dir_all(&results).unwrap();
+        (root, results)
     }
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
@@ -2153,16 +3660,17 @@ mod tests {
             gpu_types: "NVIDIA L40S",
             gpu_count: 1,
             cloud: CloudChoice::Secure,
+            max_price_per_hour: None,
             image: "img",
             container_disk_gb: 10,
             network_volume_id: None,
             data_center_ids: &[],
-            attempts: 1,
+            give_up_after: None,
             timeout_s: 1,
             poll_interval: Duration::ZERO,
             owner,
             run_id,
-            allowed_cuda_versions: &[],
+            min_cuda: None,
         }
     }
 
@@ -2196,6 +3704,8 @@ mod tests {
             &provision_cfg(&owner, "run-1"),
             &HashMap::new(),
             |_, _, _| bail!("crashed before the pod was recorded"),
+            |_| {},
+            &FakeClock::default(),
         )
         .unwrap_err();
         assert!(format!("{crash:#}").contains("crashed before"), "{crash:#}");
@@ -2302,7 +3812,7 @@ mod tests {
         let db = Db::open(":memory:").unwrap();
         db.create_run(&sweep_run("run-1", "gathering", None))
             .unwrap();
-        db.create_pod_record("pod-1", "L40S", "SECURE", "img")
+        db.create_pod_record("pod-1", "L40S", "SECURE", None, "img")
             .unwrap();
         db.set_pod("run-1", "pod-1", None, None).unwrap();
         db.assign_pod("pod-1", "run-1").unwrap();
@@ -2326,27 +3836,73 @@ mod tests {
         assert!(cloud.ids().is_empty());
     }
 
-    /// SC-002, site 3 (`resolve_run` on a stale run): the recorded pod exists but has no SSH endpoint,
-    /// so the run is judged stale; a refused delete returns the error and neither the run nor the pod
-    /// record changes. `let _ = delete_pod(..)` aborts the run and forgets the pod.
+    fn run_args(extra: &[&str]) -> RunArgs {
+        let mut argv = vec!["poot-orchestrator", "run"];
+        argv.extend_from_slice(extra);
+        let Command::Run(args) = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("`run` parses to Command::Run");
+        };
+        args
+    }
+
+    fn named_models(ids: &[&str]) -> Vec<Model> {
+        let toml: String = ids
+            .iter()
+            .map(|id| {
+                format!("[[model]]\nid = \"{id}\"\nframeworks.poot = {{ precision = \"bf16\" }}\n")
+            })
+            .collect();
+        parse_manifest_models(&toml).unwrap()
+    }
+
+    /// An unfinished sweep of exactly what `args` and `models` ask for, owned by `owner`, holding `pod`.
+    fn stored_sweep(
+        db: &Db,
+        id: &str,
+        args: &RunArgs,
+        models: &[Model],
+        owner: &ExecOwner,
+        pod: Option<&str>,
+    ) {
+        let run = requested_run(args, models, "abc", id.into());
+        db.create_run_with_owner(
+            &Run {
+                status: "sweeping".into(),
+                ..run
+            },
+            Some(owner),
+        )
+        .unwrap();
+        if let Some(pod) = pod {
+            db.create_pod_record(pod, "L40S", "SECURE", None, "img")
+                .unwrap();
+            db.set_pod(id, pod, None, None).unwrap();
+            db.assign_pod(pod, id).unwrap();
+        }
+    }
+
+    fn live_owner() -> ExecOwner {
+        ExecOwner::current().unwrap()
+    }
+
+    /// An owner process that no longer exists: this process's identity with another start time.
+    fn dead_owner() -> ExecOwner {
+        ExecOwner {
+            start_ticks: "1".into(),
+            ..ExecOwner::current().unwrap()
+        }
+    }
+
+    /// SC-002, site 3 (`resolve_run` on a stale run): RunPod says the recorded pod does not exist, so the dead
+    /// owner's run is aborted; a refused delete returns the error and neither the run nor the pod record
+    /// changes. `let _ = delete_pod(..)` aborts the run and forgets the pod.
     #[test]
     fn stale_run_abort_failure_keeps_the_pod_recorded_live() {
         let db = Db::open(":memory:").unwrap();
-        db.create_run(&sweep_run("run-1", "sweeping", None))
-            .unwrap();
-        db.create_pod_record("pod-1", "L40S", "SECURE", "img")
-            .unwrap();
-        db.set_pod("run-1", "pod-1", None, None).unwrap();
-        db.assign_pod("pod-1", "run-1").unwrap();
-        let Command::Run(args) = Cli::try_parse_from(["poot-orchestrator", "run"])
-            .unwrap()
-            .command
-        else {
-            panic!("`run` parses to Command::Run");
-        };
+        let args = run_args(&[]);
+        stored_sweep(&db, "run-1", &args, &[], &dead_owner(), Some("pod-1"));
 
         let stuck = FakePods::refusing_deletes();
-        stuck.seed("pod-1", "poot-orch-x-run-1-a1", false);
         let err = resolve_run(&db, &stuck, &args, &[], "abc").unwrap_err();
         assert!(format!("{err:#}").contains("pod-1"), "{err:#}");
         assert_eq!(db.run_status("run-1").unwrap().as_deref(), Some("sweeping"));
@@ -2356,16 +3912,144 @@ mod tests {
         );
 
         let cloud = FakePods::default();
-        cloud.seed("pod-1", "poot-orch-x-run-1-a1", false);
         let (fresh, endpoint) = resolve_run(&db, &cloud, &args, &[], "abc").unwrap();
         assert_ne!(fresh.id, "run-1", "a new run replaces the aborted one");
         assert_eq!(endpoint, None);
         assert_eq!(db.run_status("run-1").unwrap().as_deref(), Some("aborted"));
-        assert!(cloud.ids().is_empty());
         assert!(
             db.live_pods().unwrap().is_empty(),
             "the pod record is terminated"
         );
+    }
+
+    /// A pod RunPod reports RUNNING without an SSH endpoint yet is booting, not gone: a second `run` of the same
+    /// request leaves the run and its pod alone and starts its own. Mutation: judge a no-endpoint pod gone
+    /// (`None if within_provision_window => Gone`) and the pod is deleted and the run aborted.
+    #[test]
+    fn a_booting_pod_is_not_aborted() {
+        let db = Db::open(":memory:").unwrap();
+        let args = run_args(&[]);
+        stored_sweep(&db, "run-1", &args, &[], &dead_owner(), Some("pod-1"));
+        let cloud = FakePods::default();
+        cloud.seed("pod-1", "poot-orch-x-run-1-a1", false);
+
+        let (fresh, _) = resolve_run(&db, &cloud, &args, &[], "abc").unwrap();
+
+        assert_ne!(fresh.id, "run-1");
+        assert_eq!(db.run_status("run-1").unwrap().as_deref(), Some("sweeping"));
+        assert_eq!(cloud.ids(), ["pod-1"]);
+    }
+
+    /// Two `run`s with different models in one state database each get their own run, and neither touches the
+    /// other's pod, booting or not. Mutation: drop the request filter from `resumable_runs` (the old
+    /// "the one active run") and the second run attaches to, then aborts, the first's.
+    #[test]
+    fn concurrent_runs_of_different_models_never_touch_each_other() {
+        let db = Db::open(":memory:").unwrap();
+        let a_models = named_models(&["a"]);
+        let args = run_args(&[]);
+        stored_sweep(&db, "run-a", &args, &a_models, &dead_owner(), Some("pod-a"));
+        let cloud = FakePods::default();
+        cloud.seed("pod-a", "poot-orch-x-run-a-a1", true);
+
+        let (b, endpoint) = resolve_run(&db, &cloud, &args, &named_models(&["b"]), "abc").unwrap();
+
+        assert_ne!(b.id, "run-a");
+        assert_eq!(endpoint, None);
+        assert_eq!(db.run_status("run-a").unwrap().as_deref(), Some("sweeping"));
+        assert_eq!(cloud.ids(), ["pod-a"]);
+        assert_eq!(
+            db.pod_id_for_run("run-a").unwrap().as_deref(),
+            Some("pod-a")
+        );
+    }
+
+    /// A run whose owner process is alive is never resumed, even by the identical request, and reap never
+    /// selects its pod. Mutation: drop the owner filter from `resumable_runs` and the identical request attaches.
+    #[test]
+    fn a_run_with_a_live_owner_is_not_resumed_and_its_pod_is_not_reaped() {
+        let db = Db::open(":memory:").unwrap();
+        let args = run_args(&[]);
+        stored_sweep(&db, "run-1", &args, &[], &live_owner(), Some("pod-1"));
+        let cloud = FakePods::default();
+        let name = db.pod_owner_prefix().unwrap().pod_name("run-1", 1);
+        cloud.seed("pod-1", &name, true);
+
+        let (fresh, _) = resolve_run(&db, &cloud, &args, &[], "abc").unwrap();
+
+        assert_ne!(fresh.id, "run-1");
+        let targets = reap_targets(
+            &cloud.list_pods().unwrap(),
+            &db.pod_owner_prefix().unwrap(),
+            &db.reap_protection().unwrap(),
+            false,
+        );
+        assert!(targets.is_empty(), "{targets:?}");
+    }
+
+    /// The same request whose owner is dead is resumed: onto its live pod if there is one, else it provisions.
+    #[test]
+    fn a_matching_request_resumes_a_run_whose_owner_is_dead() {
+        let db = Db::open(":memory:").unwrap();
+        let args = run_args(&[]);
+        stored_sweep(&db, "run-1", &args, &[], &dead_owner(), Some("pod-1"));
+        let cloud = FakePods::default();
+        cloud.seed("pod-1", "poot-orch-x-run-1-a1", true);
+
+        let (resumed, endpoint) = resolve_run(&db, &cloud, &args, &[], "abc").unwrap();
+
+        assert_eq!(resumed.id, "run-1");
+        assert!(endpoint.is_some());
+        let owner = live_owner();
+        let req = requested_run(&args, &[], "abc", "x".into());
+        assert!(
+            db.resumable_runs(&req, |o| if *o == owner {
+                OwnerLiveness::Live
+            } else {
+                OwnerLiveness::Dead
+            })
+            .unwrap()
+            .is_empty(),
+            "the resuming process now owns it"
+        );
+    }
+
+    /// Another model set, repeat count, GPU list or ref is another request: never resumed.
+    #[test]
+    fn a_non_matching_request_never_resumes() {
+        let args = run_args(&[]);
+
+        for (case, other, models) in [
+            ("models", run_args(&[]), named_models(&["b"])),
+            (
+                "repeats",
+                run_args(&["--repeats", "5"]),
+                named_models(&["a"]),
+            ),
+            (
+                "gpus",
+                run_args(&["--gpu-types", "NVIDIA H200"]),
+                named_models(&["a"]),
+            ),
+            ("ref", run_args(&["--git-ref", "v1"]), named_models(&["a"])),
+        ] {
+            let db = Db::open(":memory:").unwrap();
+            stored_sweep(
+                &db,
+                "run-1",
+                &args,
+                &named_models(&["a"]),
+                &dead_owner(),
+                None,
+            );
+            let (run, _) = resolve_run(&db, &FakePods::default(), &other, &models, "abc").unwrap();
+            assert_ne!(run.id, "run-1", "{case}");
+            assert_eq!(
+                db.run_status("run-1").unwrap().as_deref(),
+                Some("sweeping"),
+                "{case}"
+            );
+        }
     }
 
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2436,8 +4120,7 @@ mod tests {
             &registry,
             &exec_args(tag),
             "exec-1",
-            "no-key",
-            Path::new("no-known-hosts"),
+            &no_warm_probe(),
             &HashMap::new(),
             Duration::ZERO,
         )
@@ -2454,53 +4137,944 @@ mod tests {
         assert_eq!(runs[0].0.pod_id.as_deref(), Some(pod.pod_id.as_str()));
     }
 
-    /// `--cloud all` is not a RunPod value (it answers 400 to `cloudType: ALL`): provisioning sends SECURE,
-    /// and COMMUNITY only after SECURE is refused, and records the cloud the pod really landed in.
-    #[test]
-    fn cloud_all_falls_back_from_secure_to_community_on_the_wire() {
+    /// `provision_pod` for `--cloud all` against `cloud` with the given clock; returns where the pod landed.
+    fn provision_all_on(
+        cloud: &FakePods,
+        max_price_per_hour: Option<f64>,
+        clock: &FakeClock,
+    ) -> Result<Placement> {
         let owner = Db::open(":memory:").unwrap().pod_owner_prefix().unwrap();
-        let cloud = FakePods::default();
-        cloud.refuse_secure.set(true);
         let cfg = ProvisionCfg {
             cloud: CloudChoice::All,
+            max_price_per_hour,
+            give_up_after: Some(Duration::ZERO),
             ..provision_cfg(&owner, "run-1")
         };
         let landed = RefCell::new(None);
+        provision_pod(
+            cloud,
+            &cfg,
+            &HashMap::new(),
+            |_, _, placement| {
+                *landed.borrow_mut() = Some(placement);
+                Ok(())
+            },
+            |_| {},
+            clock,
+        )?;
+        Ok(landed.into_inner().expect("on_create ran"))
+    }
 
-        provision_pod(&cloud, &cfg, &HashMap::new(), |_, _, cloud| {
-            *landed.borrow_mut() = Some(cloud);
-            Ok(())
-        })
-        .unwrap();
+    fn provision_all(cloud: &FakePods, max_price_per_hour: Option<f64>) -> Result<Placement> {
+        provision_all_on(cloud, max_price_per_hour, &FakeClock::default())
+    }
 
-        let sent: Vec<_> = cloud
+    /// The `cloudType` of every create request sent, in order.
+    fn sent_clouds(cloud: &FakePods) -> Vec<String> {
+        cloud
             .bodies
             .borrow()
             .iter()
-            .map(|b| b["cloudType"].clone())
-            .collect();
+            .map(|b| b["cloudType"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// A catalog pricing `NVIDIA L40S` (the GPU `provision_cfg` rents) per GPU and cloud.
+    fn l40s_catalog(community: Option<f64>, secure: Option<f64>) -> GpuCatalog {
+        GpuCatalog {
+            gpus: vec![crate::runpod::GpuPrice {
+                id: "NVIDIA_L40S".into(),
+                display_name: "NVIDIA L40S".into(),
+                community,
+                secure,
+            }],
+        }
+    }
+
+    /// POOT-1326 SC-001: with `--cloud all` COMMUNITY (the cheaper cloud) is asked first, and when it has
+    /// stock SECURE is never asked. Mutation: put SECURE first in `CloudChoice::All.tiers()` -> red.
+    #[test]
+    fn cloud_all_asks_community_first_and_stops_there() {
+        let cloud = FakePods::default();
+        cloud.community_cost.set(Some(0.22));
+        cloud.secure_cost.set(Some(0.50));
+
+        let landed = provision_all(&cloud, None).unwrap();
+
+        assert_eq!(sent_clouds(&cloud), ["COMMUNITY"]);
         assert_eq!(
-            sent,
-            [serde_json::json!("SECURE"), serde_json::json!("COMMUNITY")]
+            landed,
+            Placement {
+                cloud: CloudType::Community,
+                cost_per_hr: Some(0.22)
+            }
         );
-        assert_eq!(*landed.borrow(), Some(CloudType::Community));
+        assert_eq!(landed.to_string(), "COMMUNITY 0.22 per hour");
+    }
+
+    /// POOT-1326 SC-002: `--cloud all` is not a RunPod value (it answers 400 to `cloudType: ALL`): provisioning
+    /// sends COMMUNITY, and SECURE only after COMMUNITY has no capacity, and records the cloud and the price
+    /// the pod really landed at.
+    #[test]
+    fn cloud_all_falls_back_from_community_to_secure_on_the_wire() {
+        let cloud = FakePods::default();
+        cloud.refuse_community_with.replace(Some((
+            500,
+            "There are no instances currently available".into(),
+        )));
+        cloud.secure_cost.set(Some(2.49));
+
+        let landed = provision_all(&cloud, None).unwrap();
+
+        assert_eq!(sent_clouds(&cloud), ["COMMUNITY", "SECURE"]);
+        assert_eq!(landed.to_string(), "SECURE 2.49 per hour");
         assert_eq!(cloud.ids().len(), 1);
     }
 
-    /// When SECURE has capacity, `--cloud all` never asks COMMUNITY.
+    /// POOT-1326 SC-003: the catalog prices COMMUNITY over the cap, so it is refused BEFORE any create: no
+    /// pod is made, billed or deleted, and SECURE (within the cap) is the only create. Mutation: skip the
+    /// catalog pre-check in `create_in_first_cloud` -> red (COMMUNITY is created and deleted first).
     #[test]
-    fn cloud_all_stops_at_the_first_cloud_that_accepts() {
-        let owner = Db::open(":memory:").unwrap().pod_owner_prefix().unwrap();
+    fn the_catalog_refuses_an_over_cap_cloud_before_any_create() {
         let cloud = FakePods::default();
-        let cfg = ProvisionCfg {
-            cloud: CloudChoice::All,
-            ..provision_cfg(&owner, "run-1")
+        *cloud.catalog.borrow_mut() = Some(l40s_catalog(Some(1.69), Some(0.5)));
+        cloud.community_cost.set(Some(1.69));
+        cloud.secure_cost.set(Some(0.5));
+
+        let landed = provision_all(&cloud, Some(1.0)).unwrap();
+
+        assert_eq!(
+            sent_clouds(&cloud),
+            ["SECURE"],
+            "COMMUNITY was never created"
+        );
+        assert!(
+            cloud.deleted.borrow().is_empty(),
+            "nothing was created to delete"
+        );
+        assert_eq!(landed.to_string(), "SECURE 0.50 per hour");
+        assert_eq!(cloud.catalog_reads.get(), 1);
+    }
+
+    /// The catalog price is per GPU: a two-GPU pod is priced at twice it against the cap.
+    #[test]
+    fn the_catalog_price_is_per_gpu_times_the_gpu_count() {
+        let catalog = l40s_catalog(Some(0.6), Some(0.7));
+        assert_eq!(
+            catalog.price("NVIDIA L40S", CloudType::Community, 2),
+            CatalogPrice::PerHour(1.2)
+        );
+        assert_eq!(
+            catalog.price("NVIDIA_L40S", CloudType::Secure, 1),
+            CatalogPrice::PerHour(0.7),
+            "the catalog id spelling finds the type too"
+        );
+        assert_eq!(
+            catalog.price("NVIDIA H100", CloudType::Secure, 1),
+            CatalogPrice::Unlisted
+        );
+    }
+
+    /// POOT-1326 SC-003: a catalog that omits the GPU type (or cannot be read) says nothing, so the price of
+    /// the created pod decides: the dear pod is deleted and the next cloud is tried. A clean answer from the
+    /// catalog is not needed for the cap to hold.
+    #[test]
+    fn without_a_catalog_price_the_created_pod_decides() {
+        for catalog in [None, Some(GpuCatalog::default())] {
+            let cloud = FakePods::default();
+            *cloud.catalog.borrow_mut() = catalog;
+            cloud.community_cost.set(Some(1.69));
+            cloud.secure_cost.set(Some(0.5));
+
+            let landed = provision_all(&cloud, Some(1.0)).unwrap();
+
+            assert_eq!(sent_clouds(&cloud), ["COMMUNITY", "SECURE"]);
+            assert_eq!(landed.cloud, CloudType::Secure);
+            assert_eq!(
+                *cloud.deleted.borrow(),
+                ["fake-pod-1"],
+                "the dear pod is gone"
+            );
+            assert_eq!(cloud.ids(), ["fake-pod-2"]);
+        }
+    }
+
+    /// POOT-1326 SC-003: every cloud over the cap by the catalog creates nothing and waits (a capacity miss,
+    /// not an unrecoverable refusal), here until `give_up_after`, and the reason is the price cap.
+    #[test]
+    fn a_catalog_over_the_cap_everywhere_creates_nothing_and_waits() {
+        let cloud = FakePods::default();
+        *cloud.catalog.borrow_mut() = Some(l40s_catalog(Some(1.69), Some(2.49)));
+
+        let err = provision_all(&cloud, Some(1.0)).unwrap_err();
+
+        assert!(err.downcast_ref::<Cancelled>().is_some(), "{err:#}");
+        assert!(format!("{err:#}").contains("price cap"), "{err:#}");
+        assert_eq!(cloud.created.get(), 0);
+    }
+
+    /// POOT-1326 SC-003: when the created pod of every cloud is over the cap nothing is kept.
+    #[test]
+    fn max_price_over_every_created_pod_keeps_no_pod() {
+        let cloud = FakePods::default();
+        cloud.community_cost.set(Some(1.69));
+        cloud.secure_cost.set(Some(2.49));
+
+        let err = provision_all(&cloud, Some(1.0)).unwrap_err();
+
+        assert!(err.downcast_ref::<Cancelled>().is_some(), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("over --max-price-per-hour 1"),
+            "{err:#}"
+        );
+        assert!(cloud.ids().is_empty(), "no over-cap pod is left billing");
+    }
+
+    /// A create response without a price is read once more for it (a pod read carries `cost`), and that price
+    /// decides.
+    #[test]
+    fn a_create_response_without_a_price_falls_back_to_reading_the_pod() {
+        let cloud = FakePods::default();
+        cloud.read_cost.set(Some(1.69));
+
+        let err = provision_all(&cloud, Some(1.0)).unwrap_err();
+        assert!(format!("{err:#}").contains("price cap"), "{err:#}");
+        assert!(cloud.ids().is_empty(), "the read price was over the cap");
+
+        cloud.read_cost.set(Some(0.5));
+        let landed = provision_all(&cloud, Some(1.0)).unwrap();
+        assert_eq!(landed.cost_per_hr, Some(0.5));
+        assert_eq!(cloud.ids().len(), 1);
+    }
+
+    /// A pod whose price RunPod never reports is kept, never deleted for it: the cap cannot judge it.
+    #[test]
+    fn a_pod_with_no_price_anywhere_is_kept() {
+        let cloud = FakePods::default();
+
+        let landed = provision_all(&cloud, Some(1.0)).unwrap();
+
+        assert_eq!(landed.cost_per_hr, None);
+        assert_eq!(cloud.ids().len(), 1);
+        assert!(cloud.deleted.borrow().is_empty());
+    }
+
+    /// POOT-1326: an over-cap pod RunPod will not delete does not abort the run: the delete is retried with
+    /// backoff (2, 4, 8 s), the run goes on in the next cloud, and the stray stays for `reap`.
+    #[test]
+    fn a_refused_delete_of_an_over_cap_pod_does_not_abort_the_run() {
+        let cloud = FakePods::refusing_deletes();
+        cloud.community_cost.set(Some(1.69));
+        cloud.secure_cost.set(Some(0.5));
+        let clock = FakeClock::default();
+
+        let landed = provision_all_on(&cloud, Some(1.0), &clock).unwrap();
+
+        assert_eq!(landed.cloud, CloudType::Secure);
+        assert_eq!(
+            cloud.ids(),
+            ["fake-pod-1", "fake-pod-2"],
+            "the stray is still there"
+        );
+        assert_eq!(
+            *clock.sleeps.borrow(),
+            [2, 4, 8].map(Duration::from_secs),
+            "backoff between the four delete tries"
+        );
+    }
+
+    /// POOT-1326 SC-002: a GPU type only one cloud offers is a capacity miss on the other, not an error: the
+    /// catalog says COMMUNITY does not offer it, so only SECURE is asked, and when SECURE has no capacity the
+    /// run waits (here until `give_up_after`) instead of failing as unrecoverable.
+    #[test]
+    fn a_type_only_one_cloud_offers_is_a_miss_on_the_other_not_an_error() {
+        let cloud = FakePods::default();
+        *cloud.catalog.borrow_mut() = Some(l40s_catalog(None, Some(0.5)));
+
+        let landed = provision_all(&cloud, Some(5.0)).unwrap();
+        assert_eq!(sent_clouds(&cloud), ["SECURE"]);
+        assert_eq!(landed.cloud, CloudType::Secure);
+
+        let none = FakePods::default();
+        *none.catalog.borrow_mut() = Some(l40s_catalog(None, Some(0.5)));
+        none.refuse_secure.set(true);
+        let err = provision_all(&none, Some(5.0)).unwrap_err();
+        assert!(err.downcast_ref::<Cancelled>().is_some(), "{err:#}");
+        assert!(err.downcast_ref::<Unrecoverable>().is_none(), "{err:#}");
+    }
+
+    /// The wait line names the price cap when the last miss was one, and plain capacity otherwise.
+    #[test]
+    fn the_wait_line_says_price_cap_when_the_last_miss_was_one() {
+        let cap: anyhow::Error = OverPriceCap {
+            cloud: CloudType::Community,
+            price: 1.69,
+            max: 1.0,
+            pod_id: None,
+        }
+        .into();
+        let line = |last: &anyhow::Error| {
+            wait_line(
+                last,
+                &["NVIDIA L40S"],
+                Duration::from_secs(20),
+                1,
+                Duration::ZERO,
+            )
+        };
+        assert!(
+            line(&cap).starts_with("no price cap (--max-price-per-hour 1) for any of NVIDIA L40S"),
+            "{}",
+            line(&cap)
+        );
+        assert!(line(&anyhow!("no SECURE capacity")).starts_with("no capacity for any of"));
+    }
+
+    /// POOT-1326: a capped `run` end to end through `provision`: the dear COMMUNITY pod is refused, the SECURE
+    /// pod lands, and the `pods` record keeps its cloud and price.
+    #[test]
+    fn a_capped_run_records_the_pod_it_kept_with_its_cloud_and_price() {
+        let db = Db::open(":memory:").unwrap();
+        let cloud = FakePods::default();
+        cloud.community_cost.set(Some(1.69));
+        cloud.secure_cost.set(Some(0.5));
+        let args = run_args(&["--cloud", "all", "--max-price-per-hour", "1.0"]);
+
+        let (pod_id, _, _) = provision(
+            &cloud,
+            &args,
+            "ssh-ed25519 AAAA",
+            "run-1",
+            &db,
+            &FakeClock::default(),
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let record = db.pod_record(&pod_id).unwrap().expect("pod recorded");
+        assert_eq!(
+            (record.cloud.as_str(), record.cost_per_hr),
+            ("SECURE", Some(0.5))
+        );
+        assert_eq!(cloud.ids(), [pod_id]);
+    }
+
+    /// POOT-1326: a capped `exec` end to end through `acquire_exec_pod`: the pod is refused above the cap,
+    /// the kept one is recorded with its cloud and price and held busy by the exec run, and finishing the
+    /// exec marks the record terminated.
+    #[test]
+    fn a_capped_exec_records_its_pod_cloud_and_price() {
+        let db = Db::open(":memory:").unwrap();
+        let cloud = FakePods::default();
+        cloud.community_cost.set(Some(1.69));
+        cloud.secure_cost.set(Some(0.5));
+        let a = exec_args_with(&[
+            "--cmd",
+            "true",
+            "--cloud",
+            "all",
+            "--max-price-per-hour",
+            "1.0",
+        ]);
+
+        let pod = acquire_exec_pod(
+            &db,
+            &cloud,
+            &MockRegistry::resolving_to(DIGEST),
+            &a,
+            "exec-1",
+            &no_warm_probe(),
+            &HashMap::new(),
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let record = db
+            .pod_record(&pod.pod_id)
+            .unwrap()
+            .expect("exec pod recorded");
+        assert_eq!(
+            (record.cloud.as_str(), record.cost_per_hr),
+            ("SECURE", Some(0.5))
+        );
+        assert_eq!(record.status, "busy");
+        assert_eq!(record.current_run.as_deref(), Some("exec-1"));
+        assert_eq!(
+            *cloud.deleted.borrow(),
+            ["fake-pod-1"],
+            "the dear pod was refused"
+        );
+
+        finish_exec_pod(&db, &cloud, "exec-1", &pod.pod_id, "done").unwrap();
+        assert_eq!(
+            db.pod_record(&pod.pod_id).unwrap().unwrap().status,
+            "terminated"
+        );
+    }
+
+    /// POOT-1326: `--max-price-per-hour` also holds for reuse: an idle pod whose recorded price is over the
+    /// cap is not adopted (a fresh pod is provisioned), and an explicit `--reuse-pod` of it is refused. A pod
+    /// within the cap, or with no recorded price, is adopted. Mutation: skip the adoption cap check in
+    /// `resolve_run` -> red.
+    #[test]
+    fn reuse_cannot_bypass_the_price_cap() {
+        let image = run_args(&[]).image;
+        let reuse = |cost: Option<f64>, extra: &[&str]| {
+            let db = Db::open(":memory:").unwrap();
+            db.create_pod_record("pod-warm", "H100", "SECURE", cost, &image)
+                .unwrap();
+            db.set_pod_endpoint("pod-warm", "1.2.3.4", 40022).unwrap();
+            db.set_pod_status("pod-warm", "idle").unwrap();
+            let cloud = FakePods::default();
+            cloud.seed("pod-warm", "poot-orch-x-old-a1", true);
+            let mut argv = vec!["--max-price-per-hour", "1.0"];
+            argv.extend_from_slice(extra);
+            resolve_run(&db, &cloud, &run_args(&argv), &named_models(&["m"]), "abc")
+                .map(|(_, endpoint)| endpoint.is_some())
         };
 
-        provision_pod(&cloud, &cfg, &HashMap::new(), |_, _, _| Ok(())).unwrap();
+        assert!(!reuse(Some(2.0), &[]).unwrap(), "over the cap: not adopted");
+        let err = reuse(Some(2.0), &["--reuse-pod", "pod-warm"]).unwrap_err();
+        assert!(err.downcast_ref::<Unrecoverable>().is_some(), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("over --max-price-per-hour"),
+            "{err:#}"
+        );
+        assert!(reuse(Some(0.5), &[]).unwrap(), "within the cap: adopted");
+        assert!(reuse(None, &[]).unwrap(), "no recorded price: adopted");
+    }
 
-        assert_eq!(cloud.bodies.borrow().len(), 1);
-        assert_eq!(cloud.bodies.borrow()[0]["cloudType"], "SECURE");
+    /// POOT-1326: a kept-warm exec pod over the cap is not reused by `exec`: a fresh pod is created and the
+    /// warm one is left alone until it expires. Mutation: drop the `warm_pod_over_cap` arm in
+    /// `acquire_exec_pod` -> red (the exec tries to reach the warm pod's SSH).
+    #[test]
+    fn a_warm_exec_pod_over_the_cap_is_not_reused() {
+        let image = format!("ghcr.io/kikijiki/poot-bench@{DIGEST}");
+        let db = Db::open(":memory:").unwrap();
+        let mut warm = exec_run("exec-warm");
+        warm.image = image.clone();
+        warm.status = "running".into();
+        db.create_run_with_owner(&warm, Some(&ExecOwner::current().unwrap()))
+            .unwrap();
+        db.set_pod("exec-warm", "pod-warm", Some("1.2.3.4"), Some(40000))
+            .unwrap();
+        db.set_warm("exec-warm", &crate::clock::iso_in_minutes(30))
+            .unwrap();
+        db.create_pod_record("pod-warm", "H100", "SECURE", Some(2.0), &image)
+            .unwrap();
+        let cloud = FakePods::default();
+        cloud.seed("pod-warm", "poot-orch-x-exec-warm-a1", true);
+        let a = exec_args_with(&["--cmd", "true", "--max-price-per-hour", "1.0"]);
+
+        let pod = acquire_exec_pod(
+            &db,
+            &cloud,
+            &MockRegistry::resolving_to(DIGEST),
+            &a,
+            "exec-1",
+            &no_warm_probe(),
+            &HashMap::new(),
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        assert_ne!(pod.pod_id, "pod-warm");
+        assert_eq!(cloud.created.get(), 1);
+        assert!(
+            cloud.deleted.borrow().is_empty(),
+            "the warm pod is left alone"
+        );
+    }
+
+    /// A finished run is only DONE when every requested model has all its valid sets: the qwen3-4b run ended
+    /// DONE with 0 of 15. The summary names each short model with its valid and requested counts; a set recorded as
+    /// failed is not valid. Mutation: count `local_failed_set` as valid and the first model drops out of the line.
+    #[test]
+    fn a_model_with_no_valid_sets_makes_the_run_incomplete() {
+        let db = Db::open(":memory:").unwrap();
+        let args = run_args(&["--repeats", "3"]);
+        let models = named_models(&["qwen3-4b", "qwen3-0.6b", "gemma"]);
+        let run = Run {
+            repeats: 3,
+            ..requested_run(&args, &models, "abc", "run-1".into())
+        };
+        db.create_run_with_owner(&run, Some(&live_owner())).unwrap();
+        let (scratch, results) = scratch_results("incomplete");
+        for m in &models {
+            let dirs = run.model_snapshot_dirs(&sweep_run_id(&db, &run, &m.id).unwrap());
+            for (n, dir) in dirs.iter().enumerate() {
+                let valid = m.id == "gemma" || (m.id == "qwen3-0.6b" && n == 0);
+                if valid {
+                    let name = gather::canonical_dir(dir, Some("NVIDIA GeForce RTX 3090")).unwrap();
+                    std::fs::create_dir_all(results.join(&name)).unwrap();
+                    std::fs::write(
+                        results.join(&name).join("env.json"),
+                        r#"{"gpu_name":"NVIDIA GeForce RTX 3090"}"#,
+                    )
+                    .unwrap();
+                    for file in ["results.jsonl", "report.md"] {
+                        std::fs::write(results.join(&name).join(file), "x").unwrap();
+                    }
+                } else {
+                    heal::record_failed_cell(&results, dir, &m.id, "decode-curve", "setup failed")
+                        .unwrap();
+                }
+            }
+        }
+
+        let summary = incomplete_models(&run, &models, &results, &db).unwrap();
+
+        assert_eq!(summary.as_deref(), Some("qwen3-4b 0/3, qwen3-0.6b 1/3"));
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// A `LiveRun` over an in-memory db with `models` set up, holding no pod (so replacing it calls no API).
+    fn with_live_run<R>(models: &[&str], f: impl FnOnce(&mut LiveRun<'_>, &Db) -> R) -> R {
+        let db = Db::open(":memory:").unwrap();
+        let args = run_args(&[]);
+        let models = named_models(models);
+        let run = requested_run(&args, &models, "abc", "run-1".into());
+        db.create_run_with_owner(&run, Some(&live_owner())).unwrap();
+        for m in &models {
+            db.set_model_setup(&run.id, &m.id, true).unwrap();
+        }
+        let rp = RunPod::with_base("key".into(), "http://127.0.0.1:1").unwrap();
+        let scratch = Scratch::new("live").unwrap();
+        let cursor = Cursor::default();
+        let mut live = LiveRun {
+            db: &db,
+            rp: &rp,
+            run: &run,
+            models: &models,
+            scratch: &scratch,
+            a: &args,
+            endpoint: None,
+            cursor: &cursor,
+            clock: SystemClock::start(),
+        };
+        f(&mut live, &db)
+    }
+
+    /// POOT-1351: a replaced pod has none of the models, so every model's setup is done again (the qwen3-4b run
+    /// kept `setup_done` across the replacement and swept 15 repeats without the model). Mutation: drop the loop
+    /// in `LiveRun::discard_pod` and both flags stay set.
+    #[test]
+    fn replacing_a_pod_rearms_the_setup_of_every_model() {
+        with_live_run(&["qwen3-4b", "qwen3-0.6b"], |live, db| {
+            live.discard_pod(Replacement::Lost);
+
+            for model in ["qwen3-4b", "qwen3-0.6b"] {
+                assert!(
+                    !db.model_state("run-1", model).unwrap().setup_done,
+                    "{model}"
+                );
+            }
+        });
+    }
+
+    /// POOT-1351: the dashboard says why a pod is being replaced; a host fault reads 'host fault, replaced'.
+    /// Mutation: map `Replacement::HostFault` to the lost-pod status and the second assertion goes red.
+    #[test]
+    fn the_stored_status_says_whether_the_pod_was_lost_or_had_a_host_fault() {
+        with_live_run(&["m"], |live, db| {
+            live.discard_pod(Replacement::HostFault);
+            assert_eq!(
+                db.run_status("run-1").unwrap().as_deref(),
+                Some("provisioning (host fault, replaced)")
+            );
+            live.discard_pod(Replacement::Lost);
+            assert_eq!(
+                db.run_status("run-1").unwrap().as_deref(),
+                Some("provisioning (replacing a lost pod)")
+            );
+        });
+    }
+
+    /// POOT-1351: setting a model up again clears its flag, so the next attempt fetches it.
+    #[test]
+    fn resetting_a_models_setup_clears_its_flag() {
+        with_live_run(&["a", "b"], |live, db| {
+            live.reset_setup(Some("a")).unwrap();
+
+            assert!(!db.model_state("run-1", "a").unwrap().setup_done);
+            assert!(
+                db.model_state("run-1", "b").unwrap().setup_done,
+                "only that model"
+            );
+        });
+    }
+
+    /// Setting a model up again stops that model's sweep session and removes its log: the log's absence is what makes
+    /// the next attempt start the sweep (a stale `SWEEP_EXIT=0` would read as done). Mutation: kill another
+    /// model's session name and the assertion goes red.
+    #[test]
+    fn stopping_a_sweep_kills_its_tmux_session_and_drops_its_log() {
+        assert_eq!(
+            stop_sweep_command("qwen3-0.6b"),
+            "tmux kill-session -t sweep_qwen3_0_6b 2>/dev/null; rm -f /tmp/sweep-qwen3-0.6b.log"
+        );
+    }
+
+    /// A pod that answers the commands it is given, listing a GPU or not, remembering what it was asked.
+    struct ScriptedPod {
+        has_gpu: bool,
+        asked: RefCell<Vec<String>>,
+    }
+
+    impl gather::PodFiles for ScriptedPod {
+        fn ssh(&self, cmd: &str) -> Result<ssh::Run> {
+            self.asked.borrow_mut().push(cmd.to_string());
+            let listing = cmd.contains("nvidia-smi -L");
+            Ok(ssh::Run {
+                code: i32::from(listing && !self.has_gpu),
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+        fn scp_down(&self, _: &str, _: &str) -> Result<()> {
+            unreachable!("no copy")
+        }
+    }
+
+    /// POOT-1351: a dead GPU is caught before a repeat starts: the sweep is not launched on a pod that lists no
+    /// GPU, and is launched (after the probe) on one that does. Mutation: remove `heal::require_gpu` from
+    /// `start_sweep` and the dead pod is handed the tmux launch.
+    #[test]
+    fn a_sweep_is_not_started_on_a_pod_without_a_gpu() {
+        let dead = ScriptedPod {
+            has_gpu: false,
+            asked: RefCell::new(Vec::new()),
+        };
+        let error = start_sweep(&dead, "sweep_m", "/tmp/sweep-m.log", "run-sweep").unwrap_err();
+        assert!(error.downcast_ref::<HostFault>().is_some(), "{error:#}");
+        assert!(
+            dead.asked
+                .borrow()
+                .iter()
+                .all(|c| !c.contains("tmux new-session")),
+            "{:?}",
+            dead.asked
+        );
+
+        let live = ScriptedPod {
+            has_gpu: true,
+            asked: RefCell::new(Vec::new()),
+        };
+        start_sweep(&live, "sweep_m", "/tmp/sweep-m.log", "run-sweep").unwrap();
+        let asked = live.asked.borrow();
+        assert!(asked[0].contains("nvidia-smi -L"), "{asked:?}");
+        assert!(
+            asked[1].contains("tmux new-session -d -s sweep_m"),
+            "{asked:?}"
+        );
+    }
+
+    /// POOT-1351: while a sweep runs, every periodic gather also checks the GPU is still there.
+    /// Mutation: drop the probe from `gather_and_probe` and a pod that lost its GPU passes.
+    #[test]
+    fn the_periodic_gather_step_faults_a_pod_that_lost_its_gpu() {
+        let dead = ScriptedPod {
+            has_gpu: false,
+            asked: RefCell::new(Vec::new()),
+        };
+        // No set is complete on the fake pod, so the gather itself copies nothing.
+        let error = gather_and_probe(&dead, &[]).unwrap_err();
+        assert!(error.downcast_ref::<HostFault>().is_some(), "{error:#}");
+    }
+
+    /// A db holding exec `exec-warm`'s kept-warm pod `pod-warm` (inside its window) and, when `listed`, RunPod
+    /// listing it.
+    fn warm_pod_fixture(listed: bool) -> (Db, FakePods, String) {
+        let image = format!("ghcr.io/kikijiki/poot-bench@{DIGEST}");
+        let db = Db::open(":memory:").unwrap();
+        let mut warm = exec_run("exec-warm");
+        warm.image = image.clone();
+        warm.status = "running".into();
+        db.create_run_with_owner(&warm, Some(&ExecOwner::current().unwrap()))
+            .unwrap();
+        db.set_pod("exec-warm", "pod-warm", Some("1.2.3.4"), Some(40000))
+            .unwrap();
+        db.set_warm("exec-warm", &crate::clock::iso_in_minutes(30))
+            .unwrap();
+        db.create_pod_record("pod-warm", "H100", "SECURE", None, &image)
+            .unwrap();
+        let cloud = FakePods::default();
+        if listed {
+            cloud.seed("pod-warm", "poot-orch-x-exec-warm-a1", true);
+        }
+        (db, cloud, image)
+    }
+
+    /// `exec` with a warm probe that answers per `answers` (true = ssh answered), counting the attempts.
+    fn exec_with_probe(db: &Db, cloud: &FakePods, answers: &[bool]) -> (ExecPod, usize) {
+        let attempts = std::cell::Cell::new(0usize);
+        let reachable = |_: &str, _: u16| {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            answers.get(n).copied().unwrap_or(false)
+        };
+        let pod = acquire_exec_pod(
+            db,
+            cloud,
+            &MockRegistry::resolving_to(DIGEST),
+            &exec_args_with(&["--cmd", "true"]),
+            "exec-1",
+            &WarmProbe {
+                reachable: &reachable,
+                pause: Duration::ZERO,
+            },
+            &HashMap::new(),
+            Duration::ZERO,
+        )
+        .unwrap();
+        (pod, attempts.get())
+    }
+
+    /// POOT-1350: another job's warm pod that looks unreachable (RunPod lists it, ssh never answers) is neither
+    /// adopted nor deleted: the exec creates its own pod and the warm pod stays warm for its owner's window.
+    /// Mutation: delete the pod in the `Unresponsive` arm of `acquire_exec_pod` and `deleted` is not empty.
+    #[test]
+    fn an_unreachable_looking_warm_pod_of_another_job_is_left_alone() {
+        let (db, cloud, _) = warm_pod_fixture(true);
+
+        let (pod, attempts) = exec_with_probe(&db, &cloud, &[]);
+
+        assert_ne!(pod.pod_id, "pod-warm");
+        assert_eq!(cloud.created.get(), 1, "its own pod");
+        assert_eq!(attempts, 4, "four probes before it counts as not answering");
+        assert!(cloud.deleted.borrow().is_empty(), "{:?}", cloud.deleted);
+        assert!(
+            !db.find_warm_execs(&format!("ghcr.io/kikijiki/poot-bench@{DIGEST}"))
+                .unwrap()
+                .is_empty(),
+            "still kept warm for its owner"
+        );
+    }
+
+    /// POOT-1350: one failed ssh probe is a busy host, not a dead pod: the next answer adopts it.
+    /// Mutation: `WARM_PROBES = 1` -> a fresh pod is created and the warm one is not adopted.
+    #[test]
+    fn one_failed_ssh_probe_does_not_make_a_warm_pod_unreachable() {
+        let (db, cloud, _) = warm_pod_fixture(true);
+
+        let (pod, attempts) = exec_with_probe(&db, &cloud, &[false, true]);
+
+        assert_eq!(pod.pod_id, "pod-warm");
+        assert_eq!(attempts, 2);
+        assert_eq!(cloud.created.get(), 0);
+        assert!(cloud.deleted.borrow().is_empty());
+    }
+
+    /// POOT-1350 (the c1337 case): the kept pod is already gone from RunPod. The exec closes the record, issues no
+    /// delete for a pod it does not need to touch, and provisions its own. Mutation: delete in the `Gone` arm and
+    /// `deleted` lists `pod-warm`.
+    #[test]
+    fn a_warm_pod_runpod_no_longer_lists_is_closed_without_a_delete() {
+        let (db, cloud, image) = warm_pod_fixture(false);
+
+        let (pod, attempts) = exec_with_probe(&db, &cloud, &[]);
+
+        assert_ne!(pod.pod_id, "pod-warm");
+        assert_eq!(attempts, 0, "no ssh to a pod RunPod says is gone");
+        assert!(cloud.deleted.borrow().is_empty(), "{:?}", cloud.deleted);
+        assert!(
+            db.find_warm_execs(&image).unwrap().is_empty(),
+            "no longer adoptable"
+        );
+        assert_eq!(
+            db.pod_record("pod-warm").unwrap().unwrap().status,
+            "terminated"
+        );
+    }
+
+    /// Another kept-warm exec `run` for the fixture's image, holding `pod` at `host`, kept warm for 30 minutes.
+    /// `updated` orders it: the larger sorts newer.
+    fn add_warm_pod(db: &Db, cloud: &FakePods, run: &str, pod: &str, host: &str, listed: bool) {
+        let image = format!("ghcr.io/kikijiki/poot-bench@{DIGEST}");
+        let mut warm = exec_run(run);
+        warm.image = image.clone();
+        warm.status = "running".into();
+        db.create_run_with_owner(&warm, Some(&ExecOwner::current().unwrap()))
+            .unwrap();
+        db.set_pod(run, pod, Some(host), Some(40000)).unwrap();
+        db.set_warm(run, &crate::clock::iso_in_minutes(30)).unwrap();
+        db.create_pod_record(pod, "H100", "SECURE", None, &image)
+            .unwrap();
+        if listed {
+            cloud.seed(pod, &format!("poot-orch-x-{run}-a1"), true);
+        }
+    }
+
+    /// `exec` whose warm probe answers only for the hosts in `reachable`, counting the attempts per host.
+    fn exec_probing_hosts(
+        db: &Db,
+        cloud: &FakePods,
+        exec_id: &str,
+        reachable: &[&str],
+    ) -> (ExecPod, Vec<String>) {
+        let probed = RefCell::new(Vec::new());
+        let probe = |host: &str, _: u16| {
+            probed.borrow_mut().push(host.to_string());
+            reachable.contains(&host)
+        };
+        let pod = acquire_exec_pod(
+            db,
+            cloud,
+            &MockRegistry::resolving_to(DIGEST),
+            &exec_args_with(&["--cmd", "true"]),
+            exec_id,
+            &WarmProbe {
+                reachable: &probe,
+                pause: Duration::ZERO,
+            },
+            &HashMap::new(),
+            Duration::ZERO,
+        )
+        .unwrap();
+        (pod, probed.into_inner())
+    }
+
+    /// Two concurrent execs, one pod each. Exec 1 is RUNNING on a pod RunPod lists whose ssh looks dead; exec 2
+    /// provisions its own pod without probing, adopting or deleting exec 1's, and a `reap` keeps both. Mutation:
+    /// let `find_warm_execs` return running rows and exec 2 reaches the panicking probe.
+    #[test]
+    fn a_second_exec_never_touches_the_first_execs_running_pod() {
+        let image = format!("ghcr.io/kikijiki/poot-bench@{DIGEST}");
+        let db = Db::open(":memory:").unwrap();
+        let cloud = FakePods::default();
+        let mut first = exec_run("exec-first");
+        first.image = image.clone();
+        first.status = "running".into();
+        db.create_run_with_owner(&first, Some(&ExecOwner::current().unwrap()))
+            .unwrap();
+        db.set_pod("exec-first", "pod-first", Some("10.0.0.1"), Some(40000))
+            .unwrap();
+        db.create_pod_record("pod-first", "H100", "SECURE", None, &image)
+            .unwrap();
+        db.assign_pod("pod-first", "exec-first").unwrap();
+        cloud.seed(
+            "pod-first",
+            &db.pod_owner_prefix().unwrap().pod_name("exec-first", 1),
+            true,
+        );
+
+        let second = acquire_exec_pod(
+            &db,
+            &cloud,
+            &MockRegistry::resolving_to(DIGEST),
+            &exec_args_with(&["--cmd", "true"]),
+            "exec-2",
+            &no_warm_probe(),
+            &HashMap::new(),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let reaped = reap(&db, &cloud, false).unwrap();
+
+        assert_ne!(second.pod_id, "pod-first");
+        assert_eq!(cloud.created.get(), 1, "exec 2 has its own pod");
+        assert_eq!(reaped, 0, "reap keeps both execs' pods");
+        assert!(cloud.deleted.borrow().is_empty(), "{:?}", cloud.deleted);
+        let row = db.pod_record("pod-first").unwrap().unwrap();
+        assert_eq!(
+            (row.status.as_str(), row.current_run.as_deref()),
+            ("busy", Some("exec-first"))
+        );
+        assert_eq!(
+            db.run_status("exec-first").unwrap().as_deref(),
+            Some("running")
+        );
+    }
+
+    /// One stuck newest warm pod does not hide an older reachable one: the newest is probed and left alone, the
+    /// older is adopted. Mutation: take only the first candidate and a fresh pod is created.
+    #[test]
+    fn a_stuck_newest_warm_pod_does_not_hide_an_older_reachable_one() {
+        let (db, cloud, _) = warm_pod_fixture(true);
+        add_warm_pod(&db, &cloud, "exec-newer", "pod-stuck", "9.9.9.9", true);
+        // `updated_at` has second resolution: make the stuck pod unambiguously the newest.
+        db.set_warm("exec-newer", &crate::clock::iso_in_minutes(31))
+            .unwrap();
+
+        let (pod, probed) = exec_probing_hosts(&db, &cloud, "exec-1", &["1.2.3.4"]);
+
+        assert_eq!(pod.pod_id, "pod-warm", "the older one is adopted");
+        assert_eq!(cloud.created.get(), 0);
+        assert!(cloud.deleted.borrow().is_empty());
+        assert_eq!(probed.iter().filter(|h| *h == "9.9.9.9").count(), 4);
+    }
+
+    /// An unresponsive warm pod is recorded as missed: the next exec does not spend another probe round on it.
+    /// Mutation: skip the `missed_recently` check and the second exec probes it four more times.
+    #[test]
+    fn an_unresponsive_warm_pod_is_not_probed_again_within_the_miss_window() {
+        let (db, cloud, _) = warm_pod_fixture(true);
+
+        let (_, first) = exec_probing_hosts(&db, &cloud, "exec-1", &[]);
+        let (_, second) = exec_probing_hosts(&db, &cloud, "exec-2", &[]);
+
+        assert_eq!(first.len(), 4);
+        assert!(second.is_empty(), "no probes the second time: {second:?}");
+        assert_eq!(
+            db.pod_record("pod-warm").unwrap().unwrap().status,
+            "unresponsive"
+        );
+        assert!(cloud.deleted.borrow().is_empty());
+    }
+
+    /// A pod RunPod lists as running but without an ssh endpoint cannot be adopted; it is closed with its own
+    /// reason (it still exists), not as "no longer exists", and not deleted.
+    #[test]
+    fn a_warm_pod_without_an_ssh_endpoint_is_distinguished_from_a_gone_one() {
+        let (db, cloud, _) = warm_pod_fixture(false);
+        cloud.seed("pod-warm", "poot-orch-x-exec-warm-a1", false);
+
+        let (pod, probed) = exec_probing_hosts(&db, &cloud, "exec-1", &[]);
+
+        assert_ne!(pod.pod_id, "pod-warm");
+        assert!(probed.is_empty(), "no ssh to a pod with no endpoint");
+        assert!(cloud.deleted.borrow().is_empty());
+        assert_eq!(
+            db.pod_record("pod-warm").unwrap().unwrap().status,
+            "terminated"
+        );
+        assert_eq!(
+            judge_warm_pod(
+                &cloud,
+                &WarmExec {
+                    run_id: "exec-warm".into(),
+                    image: String::new(),
+                    pod_id: "pod-warm".into(),
+                    host: "1.2.3.4".into(),
+                    port: 40000,
+                    warm_until: String::new(),
+                },
+                &no_warm_probe()
+            ),
+            WarmVerdict::NoEndpoint
+        );
+    }
+
+    /// `--max-price-per-hour` takes a positive finite number and nothing else.
+    #[test]
+    fn max_price_flag_parses_positive_numbers_only() {
+        let parse = |v: &str| {
+            Cli::try_parse_from([
+                "poot-orchestrator",
+                "exec",
+                "--cmd",
+                "true",
+                "--max-price-per-hour",
+                v,
+            ])
+        };
+        let Command::Exec(args) = parse("0.5").unwrap().command else {
+            panic!("not exec");
+        };
+        assert_eq!(args.max_price_per_hour, Some(0.5));
+        for bad in ["0", "-1", "abc", "inf", "NaN"] {
+            assert!(parse(bad).is_err(), "{bad} must be refused");
+        }
     }
 
     /// A single-cloud choice does not fall back: a refused SECURE stays refused.
@@ -2510,11 +5084,17 @@ mod tests {
         let cloud = FakePods::default();
         cloud.refuse_secure.set(true);
 
+        let cfg = ProvisionCfg {
+            give_up_after: Some(Duration::ZERO),
+            ..provision_cfg(&owner, "run-1")
+        };
         let err = provision_pod(
             &cloud,
-            &provision_cfg(&owner, "run-1"),
+            &cfg,
             &HashMap::new(),
             |_, _, _| Ok(()),
+            |_| {},
+            &FakeClock::default(),
         )
         .unwrap_err();
 
@@ -2554,8 +5134,7 @@ mod tests {
             &MockRegistry::refusing(),
             &exec_args("ghcr.io/kikijiki/poot-bench:latest"),
             "exec-1",
-            "no-key",
-            Path::new("no-known-hosts"),
+            &no_warm_probe(),
             &HashMap::new(),
             Duration::ZERO,
         )
@@ -2615,6 +5194,17 @@ mod tests {
         assert!(dir.join("known_hosts").exists());
         drop(scratch);
         assert!(!dir.exists());
+    }
+
+    /// A warm probe for tests that never reach a warm pod's ssh.
+    fn no_warm_probe() -> WarmProbe<'static> {
+        fn never_reached(_: &str, _: u16) -> bool {
+            panic!("this test never probes a warm pod over ssh")
+        }
+        WarmProbe {
+            reachable: &never_reached,
+            pause: Duration::ZERO,
+        }
     }
 
     fn exec_args_with(extra: &[&str]) -> ExecArgs {
@@ -2798,6 +5388,9 @@ mod tests {
         fn list_pods(&self) -> Result<Vec<Pod>> {
             unimplemented!("not used")
         }
+        fn gpu_catalog(&self) -> Result<GpuCatalog> {
+            unimplemented!("not used")
+        }
         fn delete_pod(&self, id: &str) -> Result<()> {
             self.deleted.lock().unwrap().push(id.to_string());
             Ok(())
@@ -2979,6 +5572,7 @@ mod tests {
             "run-1-qwen3-0.6b",
             "decode-curve",
             5,
+            &[],
         );
 
         assert!(cmd.contains("MODELS_DIR=/root/models "), "{cmd}");
@@ -2989,30 +5583,6 @@ mod tests {
         for provenance in ["POOT_GIT_SHA", "POOT_TARGET"] {
             assert!(!cmd.contains(provenance), "{provenance} in {cmd}");
         }
-    }
-
-    /// M2: repeats belongs to the run. A run started with `--repeats 5` and resumed by a plain `run` still
-    /// sweeps, gathers and reports five, not the one the resuming command line defaults to.
-    #[test]
-    fn a_resumed_run_keeps_the_repeats_it_started_with() {
-        let db = Db::open(":memory:").unwrap();
-        let mut started = sweep_run("run-1", "sweeping", None);
-        started.repeats = 5;
-        db.create_run(&started).unwrap();
-        let Command::Run(args) = Cli::try_parse_from(["poot-orchestrator", "run"])
-            .unwrap()
-            .command
-        else {
-            panic!("`run` parses to Command::Run");
-        };
-        assert_eq!(args.repeats, 1);
-
-        let (resumed, endpoint) =
-            resolve_run(&db, &FakePods::default(), &args, &[], "abc").unwrap();
-
-        assert_eq!(resumed.id, "run-1");
-        assert_eq!(resumed.repeats, 5);
-        assert_eq!(endpoint, None);
     }
 
     /// A new run records the repeats it was asked for.
@@ -3030,7 +5600,6 @@ mod tests {
         let (run, _) = resolve_run(&db, &FakePods::default(), &args, &[], "abc").unwrap();
 
         assert_eq!(run.repeats, 5);
-        assert_eq!(db.active_run().unwrap().unwrap().repeats, 5);
     }
 
     #[test]
@@ -3051,5 +5620,910 @@ mod tests {
         };
         assert_eq!(args.repeats, 5);
         assert!(Cli::try_parse_from(["poot-orchestrator", "run", "--repeats", "0"]).is_err());
+    }
+    const GGUF_MANIFEST: &str = r#"
+[[model]]
+id = "big-gguf"
+hf_repo = "org/big-GGUF"
+local_dir = "big-gguf"
+hf_include = ["Q4/*.gguf", "tok.json"]
+weights_file = "Q4/big-00001-of-00004.gguf"
+frameworks.poot = { precision = "q4_k" }
+frameworks.llamacpp = { support = true, precision = "q4_k_xl" }
+[[model]]
+id = "fp8"
+hf_repo = "org/fp8"
+frameworks.poot = { precision = "e4m3block128" }
+frameworks.llamacpp = { support = false, reason = "no GGUF" }
+[[model]]
+id = "dense"
+hf_repo = "org/dense"
+frameworks.poot = { precision = "bf16" }
+frameworks.llamacpp = { support = true, precision = "f16" }
+"#;
+
+    fn manifest_model(id: &str) -> Model {
+        parse_manifest_models(GGUF_MANIFEST)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap()
+    }
+
+    /// A model that names `hf_include` downloads those files only; one that names none downloads the repo.
+    #[test]
+    fn the_download_fetches_only_the_included_files() {
+        let big = download_command(
+            &manifest_model("big-gguf"),
+            "org/big-GGUF",
+            "/root/models/big-gguf",
+        );
+        assert!(
+            big.contains("hf download org/big-GGUF --local-dir /root/models/big-gguf --include 'Q4/*.gguf' --include 'tok.json' >"),
+            "{big}"
+        );
+        let dense = download_command(&manifest_model("dense"), "org/dense", "/root/models/dense");
+        assert!(!dense.contains("--include"), "{dense}");
+    }
+
+    /// The volume cache probe looks for the file the runners are handed, not a `config.json` a GGUF repo lacks.
+    #[test]
+    fn the_cache_probe_looks_for_the_weights_file() {
+        assert_eq!(
+            cached_probe(&manifest_model("big-gguf"), "/workspace/models/big-gguf"),
+            "test -f /workspace/models/big-gguf/Q4/big-00001-of-00004.gguf"
+        );
+        assert_eq!(
+            cached_probe(&manifest_model("dense"), "/workspace/models/dense"),
+            "test -f /workspace/models/dense/config.json"
+        );
+    }
+
+    /// The f16 pre-conversion runs for a safetensors model llama.cpp runs, and for no other: not for a GGUF
+    /// download, not for a model the manifest marks llama.cpp-unsupported.
+    #[test]
+    fn the_f16_gguf_is_made_only_for_a_llamacpp_model_that_downloads_as_safetensors() {
+        let dense = preconvert_command(&manifest_model("dense"), "/root/models/dense").unwrap();
+        assert!(dense.contains("convert_hf_to_gguf.py /root/models/dense --outfile /root/models/dense/dense-f16.gguf --outtype f16"), "{dense}");
+        assert_eq!(preconvert_command(&manifest_model("big-gguf"), "/d"), None);
+        assert_eq!(preconvert_command(&manifest_model("fp8"), "/d"), None);
+    }
+
+    /// There is no CUDA floor unless one is given: the flag has no default, and it takes a version.
+    #[test]
+    fn a_run_has_no_cuda_floor_unless_told() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["poot-orchestrator", "run"];
+            argv.extend_from_slice(extra);
+            let Command::Run(args) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!("`run` parses to Command::Run");
+            };
+            args.min_cuda_version
+        };
+        assert_eq!(parse(&[]), None);
+        assert_eq!(
+            parse(&["--min-cuda-version", "13.0"]),
+            Some("13.0".parse().unwrap())
+        );
+        assert!(
+            Cli::try_parse_from(["poot-orchestrator", "run", "--min-cuda-version", "thirteen"])
+                .is_err()
+        );
+    }
+
+    fn request(id: &str, status: &str, repeats: u32) -> Run {
+        Run {
+            models: vec!["qwen3-0.6b".into()],
+            repeats,
+            ..sweep_run(id, status, None)
+        }
+    }
+
+    /// A second `run` of the request a failed run made continues its result set: it is named by the failed run,
+    /// so the repeats the failed run gathered and the ones this run adds are one `<set>-<model>-rN` set.
+    /// Mutation: ignore the status filter in `resumable_set_id` and the "done run" case goes red.
+    #[test]
+    fn a_rerun_of_a_failed_request_continues_its_result_set() {
+        let db = Db::open(":memory:").unwrap();
+        db.create_run(&request("run-1000", "failed", 5)).unwrap();
+        let again = request("run-9000", "new", 5);
+        db.create_run(&again).unwrap();
+
+        let set = db.resumable_set_id(&again, 9_000, 24 * 3600).unwrap();
+
+        assert_eq!(set.as_deref(), Some("run-1000"));
+        db.set_set_id(&again.id, "run-1000").unwrap();
+        assert_eq!(db.set_id("run-9000").unwrap(), "run-1000");
+        assert_eq!(db.set_id("run-1000").unwrap(), "run-1000");
+    }
+
+    /// Only the same request resumes: another repeat count, an older failure, or a finished run does not.
+    #[test]
+    fn a_different_or_stale_or_finished_request_is_not_resumed() {
+        let db = Db::open(":memory:").unwrap();
+        db.create_run(&request("run-99500", "failed", 3)).unwrap();
+        db.create_run(&request("run-99600", "done", 5)).unwrap();
+        db.create_run(&request("run-100", "failed", 5)).unwrap();
+        let again = request("run-100000", "new", 5);
+        db.create_run(&again).unwrap();
+
+        // run-99500 asked for 3 repeats, run-99600 finished, run-100 is older than the window.
+        assert_eq!(db.resumable_set_id(&again, 100_000, 3600).unwrap(), None);
+    }
+
+    /// The body of a gathered set's file: its `env.json` names the GPU, which is part of the committed name.
+    fn local_body(file: &str) -> &'static str {
+        if file == "env.json" {
+            r#"{"gpu_name":"NVIDIA GeForce RTX 3090"}"#
+        } else {
+            "x"
+        }
+    }
+
+    /// Five repeats gathered under their committed names, `--extend-set` and `--repeats 10`: the run takes the
+    /// first run's set id, finds repeats 1-5 local, and its sweep command runs only 6-10. Mutation: ignore
+    /// `a.extend_set` in `resolve_run` and the run gets a set id of its own (red on the first assertion).
+    #[test]
+    fn extending_the_sets_of_a_finished_run_runs_only_the_new_repeats() {
+        let tmp = std::env::temp_dir().join(format!("poot-extend-test-{}", std::process::id()));
+        let results = tmp.join("results");
+        let set = "run-1792632197-3202502";
+        for n in 1..=5 {
+            let dir = results.join(format!("2026-10-22-geforce-rtx-3090-dense-012317-r{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for file in ["env.json", "results.jsonl", "report.md"] {
+                std::fs::write(dir.join(file), local_body(file)).unwrap();
+            }
+        }
+        let models = [manifest_model("dense")];
+        assert_eq!(extension_set(&results, set, &models).unwrap(), set);
+        let err = extension_set(&results, set, &[manifest_model("fp8")]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no gathered set of fp8"),
+            "{err:#}"
+        );
+        assert!(extension_set(&results, "run-1-1", &models).is_err());
+
+        let db = Db::open(":memory:").unwrap();
+        let args = run_args(&["--repeats", "10", "--extend-set", set]);
+        let (run, _) = resolve_run(&db, &FakePods::default(), &args, &[], "abc").unwrap();
+        assert_eq!(db.set_id(&run.id).unwrap(), set);
+
+        let dirs = run.model_snapshot_dirs(&format!("{set}-dense"));
+        let present = gather::repeats_present(&results, &dirs);
+        let cmd = sweep_command(
+            "/root/models",
+            "dense",
+            &format!("{set}-dense"),
+            "decode-curve",
+            10,
+            &present,
+        );
+        assert_eq!(dirs.len(), 10);
+        assert_eq!(present, [1, 2, 3, 4, 5]);
+        assert!(
+            cmd.contains("--run-id run-1792632197-3202502-dense --repeats 10 --skip-repeats 1,2,3,4,5 --skip-unsupported"),
+            "{cmd}"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The repeats already local are not asked of the new pod: the sweep command skips them, and a model whose
+    /// repeats are all local runs nothing. Mutation: drop `--skip-repeats` from `sweep_command` and this goes red.
+    #[test]
+    fn the_resumed_sweep_skips_the_repeats_already_gathered() {
+        let tmp = std::env::temp_dir().join(format!("poot-resume-test-{}", std::process::id()));
+        let results = tmp.join("results");
+        let dirs: Vec<String> = (1..=5)
+            .map(|n| format!("run-1000-qwen3-0.6b-r{n}"))
+            .collect();
+        // Gathered sets are on disk under their committed names, not the pod's.
+        let local = |dir: &String| {
+            results.join(gather::canonical_dir(dir, Some("NVIDIA GeForce RTX 3090")).unwrap())
+        };
+        for dir in &dirs[..3] {
+            std::fs::create_dir_all(local(dir)).unwrap();
+            for file in ["env.json", "results.jsonl", "report.md"] {
+                std::fs::write(local(dir).join(file), local_body(file)).unwrap();
+            }
+        }
+        // r4 is on disk but unfinished (no report.md): it is run again.
+        std::fs::create_dir_all(local(&dirs[3])).unwrap();
+        std::fs::write(local(&dirs[3]).join("results.jsonl"), "x").unwrap();
+
+        let present = gather::repeats_present(&results, &dirs);
+        let cmd = sweep_command(
+            "/root/models",
+            "qwen3-0.6b",
+            "run-1000-qwen3-0.6b",
+            "decode-curve",
+            5,
+            &present,
+        );
+
+        assert_eq!(present, [1, 2, 3]);
+        assert!(
+            cmd.contains("--repeats 5 --skip-repeats 1,2,3 --skip-unsupported"),
+            "{cmd}"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+    /// Time that passes only when `sleep` is called, and records every sleep. A runaway loop ends in a panic
+    /// instead of hanging the suite.
+    #[derive(Default)]
+    struct FakeClock {
+        now: Cell<Duration>,
+        sleeps: RefCell<Vec<Duration>>,
+    }
+
+    impl Clock for FakeClock {
+        fn elapsed(&self) -> Duration {
+            self.now.get()
+        }
+        fn sleep(&self, d: Duration) {
+            assert!(self.sleeps.borrow().len() < 500, "runaway retry loop");
+            self.sleeps.borrow_mut().push(d);
+            self.now.set(self.now.get() + d);
+        }
+    }
+
+    fn two_gpu_cfg<'a>(owner: &'a PodOwnerPrefix) -> ProvisionCfg<'a> {
+        ProvisionCfg {
+            gpu_types: "NVIDIA H100 80GB HBM3,NVIDIA H200",
+            ..provision_cfg(owner, "run-1")
+        }
+    }
+
+    /// Capacity refused for four full passes, then granted: exactly one pod is created, and the waits between
+    /// passes grow 20, 30, 45, 68 s (each with up to a tenth of jitter on top). Mutations: no sleep (empty
+    /// list), a fixed interval (not growing), a hard cap on passes (the fifth pass never comes) each go red.
+    #[test]
+    fn capacity_refused_for_several_passes_is_waited_out_with_growing_pauses() {
+        let owner = Db::open(":memory:").unwrap().pod_owner_prefix().unwrap();
+        let cloud = FakePods::default();
+        cloud.refuse_creates.set(8);
+        let clock = FakeClock::default();
+        let waiting = RefCell::new(Vec::new());
+
+        provision_pod(
+            &cloud,
+            &two_gpu_cfg(&owner),
+            &HashMap::new(),
+            |_, _, _| Ok(()),
+            |pass| waiting.borrow_mut().push(pass),
+            &clock,
+        )
+        .unwrap();
+
+        assert_eq!(cloud.ids().len(), 1, "exactly one pod");
+        let sleeps: Vec<u64> = clock.sleeps.borrow().iter().map(|d| d.as_secs()).collect();
+        assert_eq!(sleeps.len(), 4, "{sleeps:?}");
+        for (got, base) in sleeps.iter().zip([20u64, 30, 45, 68]) {
+            assert!(*got >= base && *got <= base + base / 10 + 1, "{sleeps:?}");
+        }
+        assert_eq!(*waiting.borrow(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn the_backoff_grows_by_half_each_pass_and_stops_at_five_minutes() {
+        let got: Vec<u64> = (1..=10).map(capacity_backoff_secs).collect();
+        assert_eq!(got, [20, 30, 45, 68, 101, 152, 228, 300, 300, 300]);
+    }
+
+    /// A refusal waiting cannot fix (a 4xx that is not about capacity) fails at once with its message, after one
+    /// try per cloud and no waiting. Mutation: treat every create error as capacity and the clock panics as runaway.
+    #[test]
+    fn a_non_capacity_refusal_fails_at_once() {
+        let owner = Db::open(":memory:").unwrap().pod_owner_prefix().unwrap();
+        let cloud = FakePods::default();
+        *cloud.refuse_with.borrow_mut() = Some((400, "gpuTypeIds: unknown GPU type".into()));
+        let clock = FakeClock::default();
+
+        let err = provision_pod(
+            &cloud,
+            &two_gpu_cfg(&owner),
+            &HashMap::new(),
+            |_, _, _| Ok(()),
+            |_| {},
+            &clock,
+        )
+        .unwrap_err();
+
+        assert!(err.downcast_ref::<Unrecoverable>().is_some(), "{err:#}");
+        assert!(format!("{err:#}").contains("unknown GPU type"), "{err:#}");
+        assert_eq!(cloud.creates.get(), 1);
+        assert!(clock.sleeps.borrow().is_empty());
+    }
+
+    /// A 400 saying an image or template is "not available" is a permanent refusal, not a capacity one: it fails at
+    /// once. Mutation: restore the broad "not available" text match in `CreateError::is_capacity` and the clock
+    /// panics as runaway.
+    #[test]
+    fn a_400_saying_the_image_is_not_available_fails_at_once() {
+        let owner = Db::open(":memory:").unwrap().pod_owner_prefix().unwrap();
+        let cloud = FakePods::default();
+        *cloud.refuse_with.borrow_mut() =
+            Some((400, "image poot-bench:missing is not available".into()));
+        let clock = FakeClock::default();
+
+        let err = provision_pod(
+            &cloud,
+            &provision_cfg(&owner, "run-1"),
+            &HashMap::new(),
+            |_, _, _| Ok(()),
+            |_| {},
+            &clock,
+        )
+        .unwrap_err();
+
+        assert!(err.downcast_ref::<Unrecoverable>().is_some(), "{err:#}");
+        assert!(format!("{err:#}").contains("not available"), "{err:#}");
+        assert_eq!(cloud.creates.get(), 1);
+        assert!(clock.sleeps.borrow().is_empty());
+    }
+
+    /// `--cloud all`: one cloud refusing for good while the other only lacks capacity keeps waiting, then rents,
+    /// whichever cloud is which. Mutation: let the last cloud's answer decide (`refused_for_good = !is_capacity_error(&e)`)
+    /// and the COMMUNITY-refuses case goes red; let any refusal decide and both do.
+    #[test]
+    fn one_cloud_refusing_for_good_does_not_end_the_wait_while_the_other_lacks_capacity() {
+        for refusing in [CloudType::Secure, CloudType::Community] {
+            let owner = Db::open(":memory:").unwrap().pod_owner_prefix().unwrap();
+            let cloud = FakePods::default();
+            let refusal = Some((400, "unknown GPU type".to_string()));
+            match refusing {
+                CloudType::Secure => *cloud.refuse_secure_with.borrow_mut() = refusal,
+                CloudType::Community => *cloud.refuse_community_with.borrow_mut() = refusal,
+            }
+            // The other cloud has no capacity once, then accepts.
+            cloud.refuse_creates.set(1);
+            let cfg = ProvisionCfg {
+                cloud: CloudChoice::All,
+                ..provision_cfg(&owner, "run-1")
+            };
+            let clock = FakeClock::default();
+
+            provision_pod(
+                &cloud,
+                &cfg,
+                &HashMap::new(),
+                |_, _, _| Ok(()),
+                |_| {},
+                &clock,
+            )
+            .unwrap_or_else(|e| panic!("{refusing}: {e:#}"));
+
+            assert_eq!(clock.sleeps.borrow().len(), 1, "{refusing}");
+            assert_eq!(cloud.ids().len(), 1, "{refusing}");
+        }
+    }
+
+    /// `--cloud all` with every cloud refusing for good fails at once as Unrecoverable.
+    #[test]
+    fn every_cloud_refusing_for_good_is_unrecoverable() {
+        let owner = Db::open(":memory:").unwrap().pod_owner_prefix().unwrap();
+        let cloud = FakePods::default();
+        *cloud.refuse_with.borrow_mut() = Some((400, "unknown GPU type".into()));
+        let cfg = ProvisionCfg {
+            cloud: CloudChoice::All,
+            ..provision_cfg(&owner, "run-1")
+        };
+
+        let err = provision_pod(
+            &cloud,
+            &cfg,
+            &HashMap::new(),
+            |_, _, _| Ok(()),
+            |_| {},
+            &FakeClock::default(),
+        )
+        .unwrap_err();
+
+        assert!(err.downcast_ref::<Unrecoverable>().is_some(), "{err:#}");
+        assert_eq!(cloud.creates.get(), 2);
+    }
+
+    /// `give_up_after` bounds the wait: the run is cancelled with a message listing the GPU types it tried.
+    #[test]
+    fn giving_up_names_the_gpu_types_tried() {
+        let owner = Db::open(":memory:").unwrap().pod_owner_prefix().unwrap();
+        let cloud = FakePods::default();
+        cloud.refuse_creates.set(u32::MAX);
+        let clock = FakeClock::default();
+        let cfg = ProvisionCfg {
+            give_up_after: Some(Duration::from_secs(5 * 60)),
+            ..two_gpu_cfg(&owner)
+        };
+
+        let err = provision_pod(
+            &cloud,
+            &cfg,
+            &HashMap::new(),
+            |_, _, _| Ok(()),
+            |_| {},
+            &clock,
+        )
+        .unwrap_err();
+
+        let cancelled = err.downcast_ref::<Cancelled>().expect("cancelled");
+        assert!(
+            cancelled.0.contains("NVIDIA H100 80GB HBM3, NVIDIA H200"),
+            "{}",
+            cancelled.0
+        );
+        assert!(clock.now.get() >= Duration::from_secs(5 * 60));
+        assert!(cloud.ids().is_empty());
+    }
+
+    /// One `run`'s pod vanishes after repeat 2 of 5: a second pod is provisioned and runs repeats 3-5 only, the
+    /// run record is one and never 'failed'. Mutation: `repeats_present` returning nothing re-runs 1-5 on pod two.
+    #[test]
+    fn a_pod_lost_after_repeat_two_is_replaced_and_only_the_rest_runs() {
+        struct Sim<'a> {
+            db: &'a Db,
+            cloud: &'a FakePods,
+            run: Run,
+            results: PathBuf,
+            owner: PodOwnerPrefix,
+            pod: Option<String>,
+            ran: Vec<Vec<u32>>,
+            statuses: Vec<String>,
+        }
+        impl Healing for Sim<'_> {
+            fn attempt(&mut self, fresh: bool) -> Result<()> {
+                if fresh {
+                    self.pod = None;
+                }
+                if self.pod.is_none() {
+                    let cfg = ProvisionCfg {
+                        run_id: "run-1",
+                        ..provision_cfg(&self.owner, "run-1")
+                    };
+                    let (id, _, _) = provision_pod(
+                        self.cloud,
+                        &cfg,
+                        &HashMap::new(),
+                        |id, gpu, placement| {
+                            self.db.create_pod_record(
+                                id,
+                                gpu,
+                                &placement.cloud.to_string(),
+                                placement.cost_per_hr,
+                                "img",
+                            )?;
+                            self.db.set_pod("run-1", id, None, None)
+                        },
+                        |_| {},
+                        &FakeClock::default(),
+                    )?;
+                    self.pod = Some(id);
+                }
+                self.statuses
+                    .push(self.db.run_status("run-1")?.unwrap_or_default());
+                let dirs = self.run.model_snapshot_dirs("run-1-m");
+                let present = gather::repeats_present(&self.results, &dirs);
+                let todo: Vec<u32> = (1..=5).filter(|n| !present.contains(n)).collect();
+                self.ran.push(todo.clone());
+                for n in todo {
+                    heal::record_failed_cell(
+                        &self.results,
+                        &dirs[n as usize - 1],
+                        "m",
+                        "decode-curve",
+                        "stand-in",
+                    )?;
+                    if n == 2 && self.ran.len() == 1 {
+                        // The pod disappears from RunPod right after repeat 2 is gathered.
+                        self.cloud.cloud.borrow_mut().clear();
+                        return Err(PodLost {
+                            pod_id: self.pod.clone().unwrap(),
+                            reason: "gone",
+                        }
+                        .into());
+                    }
+                }
+                Ok(())
+            }
+            fn pod_reachable(&mut self) -> bool {
+                false
+            }
+            fn reset_setup(&mut self, _: Option<&str>) -> Result<()> {
+                Ok(())
+            }
+            fn discard_pod(&mut self, _: Replacement) {
+                let _ = self.db.clear_run_pod("run-1");
+            }
+            fn skip_cell(&mut self, _: Option<&str>, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn pause(&mut self, _: Duration) {}
+        }
+
+        let db = Db::open(":memory:").unwrap();
+        let args = run_args(&["--repeats", "5"]);
+        let run = Run {
+            repeats: 5,
+            ..requested_run(&args, &named_models(&["m"]), "abc", "run-1".into())
+        };
+        db.create_run_with_owner(&run, Some(&live_owner())).unwrap();
+        let cloud = FakePods::default();
+        let (scratch, results) = scratch_results("heal-results");
+        let mut sim = Sim {
+            db: &db,
+            cloud: &cloud,
+            owner: db.pod_owner_prefix().unwrap(),
+            run,
+            results: results.clone(),
+            pod: None,
+            ran: Vec::new(),
+            statuses: Vec::new(),
+        };
+
+        let outcome = heal::supervise(&mut sim, &Cursor::default(), None).unwrap();
+
+        assert_eq!(outcome, Outcome::Done);
+        assert_eq!(sim.ran, [vec![1, 2, 3, 4, 5], vec![3, 4, 5]]);
+        assert_eq!(cloud.created.get(), 2, "a second pod, once");
+        assert_eq!(db.recent_runs(10).unwrap().len(), 1, "one run record");
+        assert!(
+            sim.statuses.iter().all(|s| s != "failed"),
+            "{:?}",
+            sim.statuses
+        );
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// `--reuse-pod` attaches the run to the named live pod and creates none. Mutation: ignore `a.reuse_pod`
+    /// (provision anyway) and the pod count is one.
+    #[test]
+    fn a_reused_pod_is_not_reprovisioned() {
+        let db = Db::open(":memory:").unwrap();
+        db.create_pod_record("pod-warm", "H100", "SECURE", None, &run_args(&[]).image)
+            .unwrap();
+        db.set_pod_endpoint("pod-warm", "1.2.3.4", 40022).unwrap();
+        let cloud = FakePods::default();
+        cloud.seed("pod-warm", "poot-orch-x-old-a1", true);
+        let args = run_args(&["--reuse-pod", "pod-warm"]);
+
+        let (run, endpoint) =
+            resolve_run(&db, &cloud, &args, &named_models(&["m"]), "abc").unwrap();
+
+        assert_eq!(cloud.created.get(), 0);
+        assert_eq!(run.pod_id.as_deref(), Some("pod-warm"));
+        assert!(endpoint.is_some());
+        let missing = run_args(&["--reuse-pod", "pod-nope"]);
+        let err = resolve_run(
+            &Db::open(":memory:").unwrap(),
+            &cloud,
+            &missing,
+            &named_models(&["m"]),
+            "abc",
+        )
+        .unwrap_err();
+        assert!(err.downcast_ref::<Unrecoverable>().is_some(), "{err:#}");
+    }
+    /// SIGINT/SIGTERM: the run ends 'cancelled', its pod is deleted and recorded terminated. Mutation: leave the
+    /// status alone in `finalize_on_signal` and the run stays 'sweeping' (a zombie on the dashboard).
+    #[test]
+    fn a_signal_ends_the_run_cancelled_with_its_pod_terminated() {
+        let db = Db::open(":memory:").unwrap();
+        stored_sweep(
+            &db,
+            "run-1",
+            &run_args(&[]),
+            &[],
+            &live_owner(),
+            Some("pod-1"),
+        );
+        let cloud = FakePods::default();
+        cloud.seed("pod-1", "poot-orch-x-run-1-a1", true);
+
+        finalize_on_signal(&db, &cloud, "run-1", false).unwrap();
+
+        assert_eq!(
+            db.run_status("run-1").unwrap().as_deref(),
+            Some("cancelled")
+        );
+        assert!(cloud.ids().is_empty());
+        assert!(db.live_pods().unwrap().is_empty());
+    }
+
+    /// Even when the API refuses the delete the run is 'cancelled', so `reap` (which spares only unfinished
+    /// runs' pods) takes the pod.
+    #[test]
+    fn a_refused_delete_still_cancels_the_run() {
+        let db = Db::open(":memory:").unwrap();
+        stored_sweep(
+            &db,
+            "run-1",
+            &run_args(&[]),
+            &[],
+            &live_owner(),
+            Some("pod-1"),
+        );
+        let stuck = FakePods::refusing_deletes();
+        stuck.seed("pod-1", "poot-orch-x-run-1-a1", true);
+
+        finalize_on_signal(&db, &stuck, "run-1", false).unwrap();
+
+        assert_eq!(
+            db.run_status("run-1").unwrap().as_deref(),
+            Some("cancelled")
+        );
+    }
+
+    fn zombie_pass(db: &Db, cloud: &FakePods, now: u64) -> usize {
+        let owner = live_owner();
+        abandon_zombies(db, Some(cloud), now, 24 * 3600, |o| {
+            if *o == owner {
+                OwnerLiveness::Live
+            } else {
+                OwnerLiveness::Dead
+            }
+        })
+        .unwrap()
+    }
+
+    /// A dead owner's run is abandoned when it has nothing to resume onto (its pod is gone) or is past the
+    /// resume window (its live pod is terminated); a dead owner's run with a live pod inside the window stays
+    /// resumable; a live owner's run is never touched. Mutation: also abandon live-owner runs (judge
+    /// `!= Unknown`) and the live-owner assertions go red.
+    #[test]
+    fn dead_owner_zombies_are_abandoned_and_live_owners_are_never_touched() {
+        let db = Db::open(":memory:").unwrap();
+        let args = run_args(&[]);
+        // Started at epoch 1000; `now` is far past the window for the old ones, close for the fresh one.
+        stored_sweep(
+            &db,
+            "run-1000-1",
+            &args,
+            &named_models(&["gone"]),
+            &dead_owner(),
+            Some("pod-gone"),
+        );
+        stored_sweep(
+            &db,
+            "run-1000-2",
+            &args,
+            &named_models(&["old"]),
+            &dead_owner(),
+            Some("pod-old"),
+        );
+        stored_sweep(
+            &db,
+            "run-1000-3",
+            &args,
+            &named_models(&["live"]),
+            &live_owner(),
+            Some("pod-live"),
+        );
+        stored_sweep(
+            &db,
+            "run-1000-4",
+            &args,
+            &named_models(&["bare"]),
+            &dead_owner(),
+            None,
+        );
+        stored_sweep(
+            &db,
+            "run-900000-5",
+            &args,
+            &named_models(&["fresh"]),
+            &dead_owner(),
+            Some("pod-fresh"),
+        );
+        let cloud = FakePods::default();
+        for pod in ["pod-old", "pod-live", "pod-fresh"] {
+            cloud.seed(pod, &format!("poot-orch-x-{pod}-a1"), true);
+        }
+
+        let n = zombie_pass(&db, &cloud, 900_100);
+
+        let status = |id: &str| db.run_status(id).unwrap().unwrap();
+        assert_eq!(status("run-1000-1"), "abandoned", "its pod is gone");
+        assert_eq!(status("run-1000-2"), "abandoned", "past the window");
+        assert_eq!(status("run-1000-4"), "abandoned", "no pod to resume onto");
+        assert_eq!(
+            status("run-1000-3"),
+            "sweeping",
+            "a live owner is never touched"
+        );
+        assert_eq!(
+            status("run-900000-5"),
+            "sweeping",
+            "resumable inside the window"
+        );
+        assert_eq!(n, 3);
+        let mut left = cloud.ids();
+        left.sort();
+        assert_eq!(
+            left,
+            ["pod-fresh", "pod-live"],
+            "only the unowned old pod was terminated"
+        );
+    }
+
+    /// A capacity wait inside one `run` makes no run rows of its own (the old per-attempt noise): one `run`
+    /// invocation is one run. Mutation: create a row per waiting pass and the count is more than one.
+    #[test]
+    fn a_capacity_wait_creates_exactly_one_run_row() {
+        let db = Db::open(":memory:").unwrap();
+        let args = run_args(&[]);
+        let run = requested_run(&args, &named_models(&["m"]), "abc", "run-1".into());
+        db.create_run_with_owner(&run, Some(&live_owner())).unwrap();
+        let cloud = FakePods::default();
+        cloud.refuse_creates.set(6);
+        let clock = FakeClock::default();
+
+        provision(
+            &cloud,
+            &args,
+            "ssh-ed25519 AAAA",
+            "run-1",
+            &db,
+            &clock,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        assert_eq!(clock.sleeps.borrow().len(), 3, "three passes waited");
+        assert_eq!(db.recent_runs(10).unwrap().len(), 1);
+        assert_eq!(cloud.ids().len(), 1);
+    }
+    fn floor_cfg<'a>(owner: &'a PodOwnerPrefix, floor: Option<&str>) -> ProvisionCfg<'a> {
+        ProvisionCfg {
+            min_cuda: floor.map(|f| f.parse().unwrap()),
+            ..provision_cfg(owner, "run-1")
+        }
+    }
+
+    fn provision_with(cloud: &FakePods, floor: Option<&str>) -> (String, FakeClock) {
+        let owner = Db::open(":memory:").unwrap().pod_owner_prefix().unwrap();
+        let clock = FakeClock::default();
+        let (id, _, _) = provision_pod(
+            cloud,
+            &floor_cfg(&owner, floor),
+            &HashMap::new(),
+            |_, _, _| Ok(()),
+            |_| {},
+            &clock,
+        )
+        .unwrap();
+        (id, clock)
+    }
+
+    /// A numeric floor: a 13.2 host passes a 13.0 floor, and 13.10 passes 13.9 (as numbers). Nothing is
+    /// terminated. Mutation: compare the version text and 13.10 against 13.9 goes red.
+    #[test]
+    fn a_pod_at_or_above_the_floor_is_kept_comparing_numbers() {
+        for (reported, floor) in [
+            ("13.2", "13.0"),
+            ("13.0", "13.0"),
+            ("13.10", "13.9"),
+            ("12.8", "12.8"),
+        ] {
+            let cloud = FakePods::default();
+            cloud
+                .next_cuda
+                .borrow_mut()
+                .push_back(Some(reported.into()));
+            let (id, clock) = provision_with(&cloud, Some(floor));
+            assert_eq!(id, "fake-pod-1", "{reported} vs {floor}");
+            assert!(cloud.deleted.borrow().is_empty(), "{reported} vs {floor}");
+            assert!(clock.sleeps.borrow().is_empty());
+        }
+    }
+
+    /// A pod below the floor is terminated at once and the next attempt continues (a short pause, no capacity
+    /// backoff); the second pod, at the floor, is kept. Mutation: keep a below-floor pod and the first assertion goes red.
+    #[test]
+    fn a_pod_below_the_floor_is_terminated_and_the_next_attempt_continues() {
+        let cloud = FakePods::default();
+        cloud
+            .next_cuda
+            .borrow_mut()
+            .extend([Some("12.4".to_string()), Some("13.2".to_string())]);
+
+        let (id, clock) = provision_with(&cloud, Some("13.0"));
+
+        assert_eq!(id, "fake-pod-2", "the 12.4 pod is not the one kept");
+        assert_eq!(*cloud.deleted.borrow(), ["fake-pod-1"]);
+        assert_eq!(cloud.ids(), ["fake-pod-2"]);
+        // The short fixed pause comes first; with one GPU type the pass then ends like any capacity miss, so the
+        // ordinary backoff follows it.
+        let sleeps = clock.sleeps.borrow();
+        assert_eq!(sleeps[0], BELOW_FLOOR_PAUSE);
+        assert_eq!(sleeps.len(), 2, "{sleeps:?}");
+    }
+
+    /// No floor is no filter and no check: a 12.4 pod is kept, and the API is not asked about its CUDA to decide.
+    #[test]
+    fn no_floor_means_no_filter_and_no_check() {
+        let cloud = FakePods::default();
+        cloud.next_cuda.borrow_mut().push_back(Some("11.8".into()));
+        let (id, _) = provision_with(&cloud, None);
+        assert_eq!(id, "fake-pod-1");
+        assert!(cloud.deleted.borrow().is_empty());
+        // And no CUDA list is ever sent to RunPod, floor or not.
+        let cloud = FakePods::default();
+        cloud.next_cuda.borrow_mut().push_back(Some("13.2".into()));
+        provision_with(&cloud, Some("13.0"));
+        assert!(
+            cloud
+                .bodies
+                .borrow()
+                .iter()
+                .all(|b| b.get("allowedCudaVersions").is_none())
+        );
+    }
+
+    /// A pod that reports no version when created is judged once it has a host (the endpoint is up): the floor is not
+    /// skipped just because the API was early. Here the first pod only reveals 12.4 on a later read.
+    /// Mutation: skip the second look and the below-floor pod is kept.
+    #[test]
+    fn a_pod_reporting_no_version_yet_is_checked_again_once_it_has_a_host() {
+        let cloud = FakePods::default();
+        cloud.late_cuda.borrow_mut().push_back(Some("12.4".into()));
+        cloud
+            .next_cuda
+            .borrow_mut()
+            .extend([None, Some("13.2".to_string())]);
+
+        let (id, _) = provision_with(&cloud, Some("13.0"));
+
+        assert_eq!(id, "fake-pod-2");
+        assert_eq!(*cloud.deleted.borrow(), ["fake-pod-1"]);
+    }
+
+    /// An image's label is the default floor; the explicit flag wins; an image with no label has none.
+    #[test]
+    fn an_image_label_sets_the_default_floor_and_the_flag_overrides_it() {
+        use crate::image_resolve::{ImageResolveError, MIN_CUDA_LABEL};
+        struct Labels(BTreeMap<String, String>);
+        impl ImageLabels for Labels {
+            fn labels(&self, _: &str) -> Result<BTreeMap<String, String>, ImageResolveError> {
+                Ok(self.0.clone())
+            }
+        }
+        let labelled = Labels(BTreeMap::from([(
+            MIN_CUDA_LABEL.to_string(),
+            "13.0".to_string(),
+        )]));
+        let bare = Labels(BTreeMap::new());
+        let v = |t: &str| Some(t.parse::<CudaVersion>().unwrap());
+        assert_eq!(floor_for(None, "img", &labelled), v("13.0"));
+        assert_eq!(floor_for(v("12.8"), "img", &labelled), v("12.8"));
+        assert_eq!(floor_for(None, "img", &bare), None);
+        assert_eq!(floor_for(v("13.2"), "img", &bare), v("13.2"));
+    }
+    /// A failure of this machine keeps the pod; so does `--keep-pod`; an ordinary failure or a clean run does not.
+    /// Mutation: treat a local fault like any failure (return only the flag) and the first case goes red.
+    #[test]
+    fn a_local_fault_keeps_the_pod_up() {
+        let fault: Result<Outcome> = Err(LocalFault("unparseable".into()).into());
+        assert!(keep_pod_after(&fault, false));
+        let other: Result<Outcome> = Err(anyhow!("boom"));
+        assert!(!keep_pod_after(&other, false));
+        assert!(!keep_pod_after(&Ok(Outcome::Done), false));
+        assert!(keep_pod_after(&Ok(Outcome::Done), true));
+    }
+
+    /// `--extend-set` finds the set of a one-repeat run, which has no `-r<N>` in its name.
+    #[test]
+    fn extending_the_set_of_a_one_repeat_run_is_found() {
+        let tmp = unique_temp_dir("extend-one");
+        let set = "run-1792632197-3202502";
+        let models = vec![manifest_model("dense")];
+        assert!(extension_set(&tmp, set, &models).is_err());
+        let dir = tmp.join(
+            gather::canonical_dir(&format!("{set}-dense"), Some("NVIDIA GeForce RTX 3090"))
+                .unwrap(),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in ["env.json", "results.jsonl", "report.md"] {
+            std::fs::write(dir.join(file), r#"{"gpu_name":"NVIDIA GeForce RTX 3090"}"#).unwrap();
+        }
+        assert_eq!(extension_set(&tmp, set, &models).unwrap(), set);
     }
 }

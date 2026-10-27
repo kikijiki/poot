@@ -305,7 +305,7 @@ fn main() -> Result<()> {
             curve.push(serde_json::json!({"isl": isl, "prompt_tokens": ids.len(), "iters": samples}));
         }
         let out = serde_json::json!({
-            "framework": "candle", "framework_version": "0.10.2", "precision": precision,
+            "framework": "candle", "backend": "cuda", "framework_version": "0.10.2", "precision": precision,
             "mode": "decode-curve", "osl": osl, "curve": curve,
         });
         println!("{}", serde_json::to_string(&out)?);
@@ -349,7 +349,7 @@ fn main() -> Result<()> {
         (xs.iter().map(|x| (x - m).powi(2)).sum::<f64>() / xs.len() as f64).sqrt()
     };
     println!(
-        "{{\"framework\":\"candle\",\"framework_version\":\"0.10.2\",\"precision\":\"{}\",\
+        "{{\"framework\":\"candle\",\"backend\":\"cuda\",\"framework_version\":\"0.10.2\",\"precision\":\"{}\",\
 \"prompt_tokens\":{},\"gen_tokens\":{},\"iterations\":{},\"ttft_ms\":{:.3},\"tpot_ms\":{:.3},\
 \"e2e_ms\":{:.3},\"decode_tok_s\":{:.3},\"ttft_ms_stdev\":{:.3},\"decode_tok_s_stdev\":{:.3}}}",
         precision, prompt_ids.len(), gen_tokens, iters,

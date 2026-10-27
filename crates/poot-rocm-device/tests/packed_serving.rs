@@ -24,7 +24,7 @@ use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
 use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{Builder, Graph, PackedSourceName, Slot, SlotKey, StateRole, TensorType};
-use poot_graph_plan::test_support::gpu_caps;
+use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
 use poot_graph_plan::{
     CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
     staged::ExpertPlacement, staged::Partition, staged::TargetSet, staged::compile_staged,
@@ -499,7 +499,7 @@ fn a_swapped_packed_role_is_refused_before_upload() {
 
 const EXPERTS: usize = 3;
 const ROWS: usize = 5;
-/// Rows past `INDEXED_GEMV_MAX_ROWS` (32), so an indexed contraction of them runs the segmented Tiled schedule.
+/// Rows past `INDEXED_GEMV_MAX_ROWS` (32), so an indexed contraction of them runs the register-tiled expert walk.
 const PREFILL_ROWS: usize = 70;
 const PREFILL_OUT: usize = 11;
 /// Row `m` routed to expert `(2m + 1) % EXPERTS`: every window of rows holds all the experts.
@@ -516,6 +516,16 @@ fn gapped(m: usize) -> usize {
     } else {
         interleaved(m)
     }
+}
+
+/// POOT-1323: 17 Q8_0 `[4096, 8192]` experts are 606 MB of one source, past the 2^32 bits a 32-bit backend's kernels
+/// address; the last expert's slab starts at bit 4.56e9. A 64-bit backend keeps the table whole (one carrier per
+/// source), and the rows routed to the first, a middle and the last expert are bit-exact against the oracle decoder.
+const WIDE_EXPERTS: usize = 17;
+
+/// Rows 0, 1 and 2 routed to the first, a middle and the last expert of the [`WIDE_EXPERTS`] table.
+fn across_the_wide_table(m: usize) -> usize {
+    [0, WIDE_EXPERTS / 2, WIDE_EXPERTS - 1][m]
 }
 
 /// 17.0M outputs: past the 65,535 x 256 the packed Gemv body can address on wgpu.
@@ -582,9 +592,13 @@ impl StackBuffers {
                     max_buffer_bytes: 2 * slab,
                     ..gpu_caps(&target)
                 };
-                let split =
-                    poot_graph_plan::legalize(g, &caps, &poot_graph_plan::CompileLimits::STANDARD)
-                        .expect("the stacked table splits");
+                let split = poot_graph_plan::legalize(
+                    g,
+                    gpu_backend(&target),
+                    &caps,
+                    &poot_graph_plan::CompileLimits::STANDARD,
+                )
+                .expect("the stacked table splits");
                 let carriers: Vec<usize> = split
                     .consts()
                     .iter()
@@ -592,7 +606,7 @@ impl StackBuffers {
                     .collect();
                 assert_eq!(
                     carriers,
-                    self.carrier_experts(descriptor.sources().len()),
+                    self.carrier_experts(descriptor.sources().len(), EXPERTS),
                     "the experts each stacked carrier holds after the split"
                 );
                 split
@@ -602,9 +616,9 @@ impl StackBuffers {
 
     /// The leading extents of the compiled graph's stacked carriers: one buffer of every expert, or the 2 + 1
     /// split with every source's piece 0 before its piece 1.
-    fn carrier_experts(self, sources: usize) -> Vec<usize> {
+    fn carrier_experts(self, sources: usize, experts: usize) -> Vec<usize> {
         match self {
-            Self::One => vec![EXPERTS; sources],
+            Self::One => vec![experts; sources],
             Self::Split => [[2].repeat(sources), [1].repeat(sources)].concat(),
         }
     }
@@ -617,11 +631,12 @@ fn run_indexed_case(
     engine: &mut Engine<RocmDevice>,
     target: Target,
     format: WeightFormat,
+    experts: usize,
     (rows, out, k): (usize, usize, usize),
     expert_of: fn(usize) -> usize,
     buffers: StackBuffers,
 ) {
-    let owners_vec: Vec<Arc<PackedPayload>> = (0..EXPERTS)
+    let owners_vec: Vec<Arc<PackedPayload>> = (0..experts)
         .map(|e| {
             Arc::new(poot_quant::test_support::packed::prescribed_scale_payload(
                 format,
@@ -633,7 +648,7 @@ fn run_indexed_case(
     let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
         stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
         descriptor: owners_vec[0].weight(),
-        experts: EXPERTS,
+        experts,
     };
     let what = format!("{format:?}");
     let b = Builder::for_tests();
@@ -645,7 +660,7 @@ fn run_indexed_case(
             Slot::Activation,
             "moe-ids",
             TensorType::new(vec![rows], DType::I32),
-            poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
+            poot_graph_ir::IndexRange::below(experts).unwrap(),
         )
         .unwrap();
     let y = poot_graph_ir::test_support::packed_graphs::packed_indexed_linear(&b, x, ids, &table)
@@ -654,7 +669,7 @@ fn run_indexed_case(
     let x_key = graph.meta(x.id()).slot_key().unwrap().clone();
     let ids_key = graph.meta(ids.id()).slot_key().unwrap().clone();
 
-    let owners: HashMap<String, Arc<PackedPayload>> = (0..EXPERTS)
+    let owners: HashMap<String, Arc<PackedPayload>> = (0..experts)
         .map(|e| {
             let stack = poot_graph_ir::test_support::packed_graphs::TEST_STACK.const_name();
             (format!("{stack}.{e}"), Arc::clone(&owners_vec[e]))
@@ -676,7 +691,7 @@ fn run_indexed_case(
         .collect();
     assert_eq!(
         carriers,
-        buffers.carrier_experts(table.descriptor.sources().len()),
+        buffers.carrier_experts(table.descriptor.sources().len(), experts),
         "{what}: the experts each stacked carrier holds"
     );
     if buffers == StackBuffers::One {
@@ -685,11 +700,11 @@ fn run_indexed_case(
                 compiled.eqns(),
                 [poot_graph_ir::Eqn {
                     op: poot_graph_ir::OpKind::PackedContraction {
-                        rows: poot_graph_ir::ContractionRows::Indexed { experts: EXPERTS },
+                        rows: poot_graph_ir::ContractionRows::Indexed { experts: stacked },
                         ..
                     },
                     ..
-                }]
+                }] if *stacked == experts
             ),
             "{what}: {:?}",
             compiled.eqns()
@@ -715,11 +730,15 @@ fn run_indexed_case(
             .read()
             .unwrap(),
     );
-    let decoded: Vec<Vec<f32>> = owners_vec.iter().map(|owner| decoded_rows(owner)).collect();
+    // Only the routed experts are decoded: a stack past 512 MiB must not cost a host decode of every expert.
+    let decoded: HashMap<usize, Vec<f32>> = (0..rows)
+        .map(expert_of)
+        .map(|e| (e, decoded_rows(&owners_vec[e])))
+        .collect();
     for m in 0..rows {
         assert_indexed_row(
             &format!("{what} row {m} expert {}", expert_of(m)),
-            &decoded[expert_of(m)],
+            &decoded[&expert_of(m)],
             k,
             &got[m * out..(m + 1) * out],
             column_of(m, k),
@@ -744,6 +763,7 @@ fn packed_indexed_contraction_runs_bit_exact() {
             &mut engine,
             target,
             format,
+            EXPERTS,
             (ROWS, OUT, K),
             interleaved,
             StackBuffers::One,
@@ -769,11 +789,34 @@ fn a_split_expert_stack_runs_bit_exact() {
             &mut engine,
             target,
             format,
+            EXPERTS,
             (ROWS, 2, K),
             interleaved,
             StackBuffers::Split,
         );
     }
+}
+
+/// POOT-1323 (ROCm): a stacked table past 512 MiB stays one buffer per source and runs bit-exact, including the
+/// expert whose slab offset passes `u32::MAX` bits: the 64-bit `usize` offset chain of the indexed kernel is honoured
+/// end to end. Mutation: bound `legalize`'s `expert_ranges` by `u32::MAX` bits again; the table splits 15 + 2 and the
+/// carrier-extent assertion goes red.
+#[test]
+fn a_stack_past_512_mib_runs_whole_and_bit_exact() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = Engine::new(device);
+    run_indexed_case(
+        &mut engine,
+        target,
+        WeightFormat::Q8_0,
+        WIDE_EXPERTS,
+        (3, 4096, 8192),
+        across_the_wide_table,
+        StackBuffers::One,
+    );
 }
 
 /// SC-002 (ROCm): a Q8_0 table with `out = 3, K = 32` is 102 bytes per expert, not a whole number of words,
@@ -791,6 +834,7 @@ fn an_unaligned_expert_slab_table_runs_bit_exact() {
         &mut engine,
         target,
         WeightFormat::Q8_0,
+        EXPERTS,
         (ROWS, 3, 32),
         interleaved,
         StackBuffers::One,
@@ -798,10 +842,10 @@ fn an_unaligned_expert_slab_table_runs_bit_exact() {
 }
 
 /// A prefill-sized routed table (ROCm): `PREFILL_ROWS` rows is past the decode row count, so the indexed packed
-/// contraction runs the segmented Tiled schedule (rows routed by `gapped`, so a tile holds several
+/// contraction runs the register-tiled expert walk (rows routed by `gapped`, so a tile holds several
 /// experts and may skip one) over every format, with `N = 11` leaving edge columns in the last column tile. One-hot rows bit-exact
 /// against the oracle decoder. Mutation: take the Tiled step's slab from the wrong segment (`weight.step(.., lo,
-/// ..)` in `indexed_tiled_body`); rows routed to an expert after a gap read another expert and go red.
+/// ..)` in `tiled_body`); rows routed to an expert after a gap read another expert and go red.
 #[test]
 fn packed_indexed_prefill_runs_bit_exact() {
     let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
@@ -814,6 +858,7 @@ fn packed_indexed_prefill_runs_bit_exact() {
             &mut engine,
             target,
             format,
+            EXPERTS,
             (PREFILL_ROWS, PREFILL_OUT, K),
             gapped,
             StackBuffers::One,
@@ -822,9 +867,9 @@ fn packed_indexed_prefill_runs_bit_exact() {
 }
 
 /// A routed prefill above the wgpu grid limit (ROCm): `4096 x 4160` outputs of a Q8_0 table is 17.0M, past
-/// 65,535 x 256, which the Gemv-body route refused; the Tiled schedule plans it (folded onto `GroupY` where the
+/// 65,535 x 256, which the Gemv-body route refused; the register-tiled schedule plans it (folded onto `GroupY` where the
 /// device's X extent is smaller than the tile count) and every one of the 17M outputs is bit-exact against the
-/// oracle decoder. Mutation: read the tile index from `GroupX` alone in `indexed_tiled_body`; every tile past
+/// oracle decoder. Mutation: read the tile index from `GroupX` alone in `tiled_body`; every tile past
 /// the first fold row is never computed and goes red.
 #[test]
 fn packed_indexed_prefill_above_the_gemv_grid_limit_runs_bit_exact() {
@@ -837,6 +882,7 @@ fn packed_indexed_prefill_above_the_gemv_grid_limit_runs_bit_exact() {
         &mut engine,
         target,
         WeightFormat::Q8_0,
+        EXPERTS,
         (GRID_LIMIT_ROWS, GRID_LIMIT_OUT, 64),
         gapped,
         StackBuffers::One,
@@ -1113,7 +1159,7 @@ fn run_dense_activation(
 
 /// SC-001: Q4_K, Q8_0 and FP8 contractions through the packed loaders meet their tier-2 oracle contract. A
 /// dense activation makes every output a sum over every `K` block, so a dropped block or a wrong scale moves
-/// every element; `m == 1` takes the Gemv schedule and `m == 17` the Tiled schedule (ragged against its tile),
+/// every element; `m == 1` takes the Gemv schedule and `m == 17` the register-tiled schedule (ragged against its tile),
 /// and every output element is compared. Mutation: omit one block's contribution in `DecodePlan`'s address or
 /// scale a factor by a nonzero constant; every row goes red.
 #[test]

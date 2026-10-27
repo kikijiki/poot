@@ -26,8 +26,8 @@ use poot_llm::{GenerationControl, Sampler};
 use poot_models::components::standard::Step;
 use poot_models::io::{ModelSchema, ProgramId, ProgramSpec, StateSpec};
 use poot_models::model::{
-    ConfigReason, FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
-    ShapeReason, StepShape, StepSpec, TraceError,
+    ConfigReason, FamilyKey, KvDtype, KvLayout, LogitRows, Model, ModelConfig, ModelError,
+    ModelOutput, ShapeReason, StepShape, StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
 use poot_quant::weights::WeightStore;
@@ -169,6 +169,7 @@ fn build_tiny(raw: &RawConfig<'_>, log: TraceLog) -> Result<ModelParts, ModelErr
             bos: None,
             prompt_bos: None,
             prefill_granule: granule,
+            kv_dtype: None,
             chat: ChatFormat::ChatML,
             tool_codec: Some(Arc::new(HermesToolCodec)),
         },
@@ -260,7 +261,7 @@ impl Device for FakeDevice {
     fn load_kernel(
         &mut self,
         _key: &str,
-        _kernel: poot_runtime_common::CompiledKernel,
+        _kernel: poot_codegen::CompiledKernel,
     ) -> Result<(), FakeError> {
         Ok(())
     }
@@ -494,6 +495,7 @@ fn rig(options: RigOptions) -> Rig {
         Arc::new(handle),
         Box::new(executor),
         DriverOptions {
+            kv_dtype: None,
             prefill: compile.clone(),
             decode: compile,
             capacity: nz(32),
@@ -1050,6 +1052,7 @@ fn qwen2_rig(trace: poot_graph_ir::TraceLimits) -> Qwen2Rig {
         handle,
         Box::new(Engine::new(FakeDevice)),
         DriverOptions {
+            kv_dtype: None,
             prefill: compile.clone(),
             decode: compile,
             capacity: nz(16),
@@ -1124,8 +1127,11 @@ fn the_shipped_qwen2_path_consumes_the_callers_limits_and_refuses_with_the_exact
     assert!(entries >= 2, "a decode entry and a 3-token window");
 
     // Adequate finite limits: exactly the graphs' sizes, the same prepared set.
-    let shape = |tokens: usize| StepShape::new(NonZeroUsize::MIN, nz(tokens), nz(16));
     let model = &reference.model;
+    // The KV dtype the driver resolves: the model's own trace is the driver's.
+    let kv = KvDtype::resolve(None, model.config().kv_dtype);
+    let shape =
+        |tokens: usize| StepShape::new(NonZeroUsize::MIN, nz(tokens), nz(16)).with_kv_dtype(kv);
     let biggest = model.trace(&StepSpec::step(shape(3)), roomy).unwrap();
     let decode = model.trace(&StepSpec::step(shape(1)), roomy).unwrap();
     let adequate = TraceLimits {

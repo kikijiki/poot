@@ -1,8 +1,8 @@
 //! Dtype Cast equation planning.
 
 use super::{
-    BodyLimits, Capability, CastSpec, ContractionHead, DType, ElementwiseSpec, Eqn, ImportedKernel,
-    KernelRequest, OpKind, PlanError, Planned, ValueId, value_ids,
+    BodyLimits, Capability, CastSpec, ContractionHead, DType, Eqn, ImportedKernel, KernelRequest,
+    OpKind, PlanError, Planned, ValueId, value_ids,
 };
 use crate::planner::{GraphTables, StorageDtypes};
 use crate::refusal::Site;
@@ -43,14 +43,8 @@ pub(super) fn plan(
             // the same way. A same-dtype cast is the identity, so it aliases like Reshape. Unwired
             // pairs are rejected by name.
             let in_dt = g.aval(ids[0]).dtype;
-            let cast = |spec: CastSpec| {
-                Planned::generated(
-                    site,
-                    KernelRequest::Elementwise(ElementwiseSpec::Cast(spec)),
-                    backend,
-                    caps,
-                )
-            };
+            let cast =
+                |spec: CastSpec| Planned::generated(site, KernelRequest::Cast(spec), backend, caps);
             match (in_dt, *to) {
                 (a, b) if a == b => Planned::alias(ids[0]),
                 (DType::F32, DType::E4M3FN) => {
@@ -76,6 +70,12 @@ pub(super) fn plan(
                         numel: out_numel,
                     })?
                 }
+                // SPIR-V has no bf16 type: a device without native two-byte lanes has no native bf16 cast
+                // body (a packed const's widening below is the one bf16 reader it has), so the pair is
+                // refused here by name instead of failing in code generation.
+                (DType::F32, DType::BF16) if !caps.native_two_byte_floats => {
+                    return Err(site.refuse(Capability::DtypeLowering));
+                }
                 (DType::F32, DType::BF16) => cast(CastSpec::F32ToBf16 { numel: out_numel })?,
                 (DType::F32, DType::F16) => cast(CastSpec::F32ToF16 { numel: out_numel })?,
                 (DType::F16, DType::F32) => cast(CastSpec::F16ToF32 { numel: out_numel })?,
@@ -89,6 +89,9 @@ pub(super) fn plan(
                     None,
                     [out_numel as u32, 1, 1],
                 )?,
+                (DType::BF16, DType::F32) if !caps.native_two_byte_floats => {
+                    return Err(site.refuse(Capability::DtypeLowering));
+                }
                 (DType::BF16, DType::F32) => cast(CastSpec::Bf16ToF32 { numel: out_numel })?,
                 // Card 372c: the guarded selector Cast and the witness flag Cast. Exact for every lane
                 // at or below 2^24, which the guard's bound and the device witness admission both hold.

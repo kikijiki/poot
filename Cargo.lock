@@ -1805,8 +1805,10 @@ dependencies = [
  "poot-runtime-common",
  "poot-target",
  "poot-tensor",
+ "poot-test-util",
  "serde_json",
  "tokenizers",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1815,6 +1817,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "poot-kernel-ir",
+ "poot-npu-artifacts",
  "poot-runtime-common",
  "poot-target",
  "thiserror 2.0.18",
@@ -1845,6 +1848,7 @@ dependencies = [
  "poot-graph-plan",
  "poot-kernel-ir",
  "poot-kernelgen",
+ "poot-npu-artifacts",
  "poot-profile",
  "poot-quant",
  "poot-runtime-common",
@@ -1894,6 +1898,7 @@ dependencies = [
  "poot-graph-plan",
  "poot-kernel-ir",
  "poot-kernelgen",
+ "poot-npu-artifacts",
  "poot-quant",
  "poot-runtime-common",
  "poot-target",
@@ -1934,6 +1939,7 @@ dependencies = [
  "poot-codegen",
  "poot-graph-ir",
  "poot-kernel-ir",
+ "poot-npu-artifacts",
  "poot-ptx-runtime",
  "poot-quant",
  "poot-rocm-runtime",
@@ -1948,7 +1954,6 @@ dependencies = [
 name = "poot-l0-runtime"
 version = "0.0.0"
 dependencies = [
- "poot-codegen",
  "poot-quant",
  "poot-runtime-common",
  "thiserror 2.0.18",
@@ -1975,6 +1980,7 @@ dependencies = [
  "poot-llm",
  "poot-load",
  "poot-models",
+ "poot-npu-artifacts",
  "poot-profile",
  "poot-ptx-device",
  "poot-ptx-runtime",
@@ -2020,6 +2026,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "image",
+ "poot-codegen",
  "poot-eval",
  "poot-executor",
  "poot-executor-parity",
@@ -2029,6 +2036,7 @@ dependencies = [
  "poot-kernelgen",
  "poot-load",
  "poot-models",
+ "poot-npu",
  "poot-profile",
  "poot-quant",
  "poot-runtime-common",
@@ -2058,13 +2066,23 @@ dependencies = [
  "poot-kernelgen",
  "poot-l0-runtime",
  "poot-npu",
+ "poot-npu-artifacts",
  "poot-quant",
  "poot-runtime-common",
  "poot-target",
  "poot-tensor",
  "poot-test-util",
+ "poot-weights",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "poot-npu-artifacts"
+version = "0.0.0"
+dependencies = [
+ "poot-target",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2105,6 +2123,7 @@ dependencies = [
  "poot-kernel-ir",
  "poot-kernelgen",
  "poot-load",
+ "poot-npu-artifacts",
  "poot-ptx-runtime",
  "poot-quant",
  "poot-runtime-common",
@@ -2150,6 +2169,7 @@ dependencies = [
  "poot-kernel-ir",
  "poot-kernelgen",
  "poot-load",
+ "poot-npu-artifacts",
  "poot-quant",
  "poot-rocm-runtime",
  "poot-runtime-common",
@@ -2179,7 +2199,6 @@ version = "0.0.0"
 dependencies = [
  "ash",
  "libc",
- "poot-target",
 ]
 
 [[package]]
@@ -2191,6 +2210,7 @@ dependencies = [
  "clap",
  "image",
  "libc",
+ "poot-codegen",
  "poot-executor",
  "poot-graph-ir",
  "poot-graph-plan",
@@ -2266,6 +2286,7 @@ dependencies = [
  "poot-graph-plan",
  "poot-kernel-ir",
  "poot-kernelgen",
+ "poot-npu-artifacts",
  "poot-quant",
  "poot-runtime-common",
  "poot-target",

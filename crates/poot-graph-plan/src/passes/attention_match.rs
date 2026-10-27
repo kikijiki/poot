@@ -79,9 +79,6 @@ pub enum AttentionDecline {
     LiveLengthUnproved,
     /// The fused op's own typing rule disagrees with the region it would replace (infer-and-compare).
     TypeMismatch,
-    /// A prefill-shaped attention whose `Hq * Lq` workgroup count is over the target's grid cap: the fused
-    /// kernel launches one workgroup per query row and the target has no plan-time fallback for a larger grid.
-    PrefillGrid,
 }
 
 /// Why the rope matcher did not fuse a candidate equation. The same first-failing-check contract as
@@ -234,7 +231,6 @@ pub(super) struct AttnMatch {
     pub(super) sinks: Option<ValueId>,
     pub(super) n_rep: usize,
     pub(super) scale: f32,
-    pub(super) decode: bool, // M==1 (decode) vs M>1 (prefill)
     /// `Some(c)` when the scaled `Q K^T` passes through a Gemma2/Grok attention-logit softcap
     /// (`c * tanh(scores / c)`, [`poot_graph_ir::ops::softcap`]) before the mask-add.
     pub(super) softcap: Option<f32>,
@@ -449,6 +445,23 @@ fn peel_key(
             guards,
         }),
     }
+}
+
+/// `value` as the stored source a widening `Cast` to F32 reads, when it is one of a two-byte float (a narrow KV
+/// cache read at f32, POOT-1395); `value` itself otherwise. The fused op's typing rule admits exactly those
+/// stored dtypes and its decomposition restates the cast.
+fn peel_widen(g: &Graph, prod: &HashMap<ValueId, usize>, value: ValueId) -> ValueId {
+    prod.get(&value)
+        .map(|&i| &g.eqns()[i])
+        .and_then(|eqn| match (&eqn.op, eqn.inputs.as_slice()) {
+            (OpKind::Cast { to: DType::F32 }, [Operand::Value(stored)])
+                if matches!(g.aval(*stored).dtype, DType::F16 | DType::BF16) =>
+            {
+                Some(*stored)
+            }
+            _ => None,
+        })
+        .unwrap_or(value)
 }
 
 /// A key or value view of a paged pool, as [`poot_graph_ir::ops::paged_view`] traces it.
@@ -845,7 +858,14 @@ pub(super) fn match_attention(
         }
     }
 
-    let decode = g.aval(q).shape.get(2).copied() == Some(1);
+    // A key or value read from a narrow cache is the widening of what it stores: the fused op reads the
+    // stored dtype and widens on load, so the cast is part of the region it replaces.
+    let key = PeeledKey {
+        head: peel_widen(g, prod, key.head),
+        shared: key.shared.map(|shared| peel_widen(g, prod, shared)),
+        ..key
+    };
+    let v = peel_widen(g, prod, v);
     // A key and value that are views of one paged pool read it in place.
     let paged = match key.shared {
         None => peel_paged_kv(g, prod, facts, key.head, v),
@@ -880,7 +900,6 @@ pub(super) fn match_attention(
         sinks,
         n_rep: key.n_rep,
         scale,
-        decode,
         softcap,
     };
     // Shape proof (R467-001). The decomposition broadcasts its MatMul batch axes, so a valid chain can
@@ -1011,17 +1030,15 @@ impl AttnMatch {
     }
 }
 
-/// Flash-attention fusion (automatic fusion as a compiler pass), capped by `max_prefill_groups`: a
-/// prefill-shaped `Attention` is emitted only when its `Hq*L` workgroup count is `<= max_prefill_groups`
-/// (decode, `B*Hq` workgroups, is always emitted); `None` means no cap. Pattern-match the materialized
+/// Flash-attention fusion (automatic fusion as a compiler pass). Pattern-match the materialized
 /// `softmax(scale * Q Kᵀ + mask) @ V` subgraph (with GQA repeat) that `ops::attention_masked` /
 /// `ops::attention_prefill` produce, and replace its root with the fused `Attention` op, which the planner lowers to the generated
 /// attention kernel (online softmax, never materializing the `[.,.,L,L]` scores). The replaced intermediates become
 /// dead; run `dce` after. Conservative (only the exact chain matches) and result-preserving (one
 /// semantic definition shared by tracing, the oracle and every lowering), so every attention tracer
-/// gets flash without a separate `_flash` variant. Best run on a `cse`'d graph. `compile` passes its own
-/// measured `target.caps.max_grid[0]` (wgpu's `gridDim.x` caps at 65535 and has no plan-time fallback
-/// from the op to the decomposition).
+/// gets flash without a separate `_flash` variant. Best run on a `cse`'d graph. The pass knows no device: a
+/// launch the target cannot make (the 2-D fold of `B*Hq*L` workgroups past its Y cap) is refused by the planner
+/// and `revert_unplannable_rewrites` restores the decomposition.
 ///
 /// Also returns the near-miss candidates it left alone, each with its first failing check. A candidate that is
 /// not the softmax-normalized matmul shape at all (an ordinary matmul) is no near-miss and is not reported.
@@ -1032,46 +1049,24 @@ impl AttnMatch {
         reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
     )
 )]
-pub fn flash_attention_capped(
-    g: &Graph,
-    max_prefill_groups: Option<usize>,
-) -> Result<(Graph, Vec<FusionDecline>), EditError> {
+pub fn flash_attention(g: &Graph) -> Result<(Graph, Vec<FusionDecline>), EditError> {
     let mut prod: HashMap<ValueId, usize> = HashMap::new();
     for (i, e) in g.eqns().iter().enumerate() {
         prod.insert(e.out, i);
     }
     // One range analysis per pass run: every live candidate reads its length from it.
     let facts = value_ranges(g);
-    let fits = |m: &AttnMatch| -> bool {
-        if m.decode {
-            return true; // decode grid = Hq, always tiny
-        }
-        match max_prefill_groups {
-            None => true,
-            Some(cap) => {
-                let s = &g.aval(m.q).shape; // [1, Hq, L, D]
-                s.get(1).copied().unwrap_or(1) * s.get(2).copied().unwrap_or(1) <= cap
-            }
-        }
-    };
     let mut declines = Vec::new();
     let eqns: Vec<Eqn> = g
         .eqns()
         .iter()
         .map(|e| match match_attention(g, &prod, &facts, e) {
-            Ok(m) if fits(&m) => Eqn {
+            Ok(m) => Eqn {
                 op: m.op(),
                 inputs: m.operands().into_iter().map(Operand::Value).collect(),
                 out: e.out,
                 layer: e.layer,
             },
-            Ok(_) => {
-                declines.push(FusionDecline {
-                    value: e.out,
-                    reason: FusionDeclineReason::Attention(AttentionDecline::PrefillGrid),
-                });
-                e.clone()
-            }
             Err(reason) => {
                 if attention_near_miss(g, &prod, e, reason) {
                     declines.push(FusionDecline {

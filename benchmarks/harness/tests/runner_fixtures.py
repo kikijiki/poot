@@ -22,6 +22,7 @@ POOT_IDENTITY = {
     "driver_version": "fixture-driver 1.0",
     "checkpoint_digest": CHECKPOINT_DIGEST,
     "compute_dtype": "f32",
+    "prefill_chunk": 4,
 }
 
 OPTIONAL_OBSERVER_FIELDS = (

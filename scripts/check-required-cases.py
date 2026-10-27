@@ -26,13 +26,15 @@ A skip is never a pass. nextest reports a runtime skip as a passing testcase - t
 its skip report and returned - so the gate reads the captured output (`store-success-output = true`
 in the lane profile) and classifies a testcase whose output carries a skip report as skipped:
 
-    SKIP: wgpu device unavailable: no adapter      (DeviceBackend::skip_unavailable)
-    skip: no wgpu adapter                          (a guard that opens without the requirement)
-    poot-kernelgen: SKIP case (no GPU agent)       (a runtime's own report)
+    POOT-SKIP: wgpu device unavailable: no adapter          (DeviceBackend::skip_unavailable)
+    POOT-SKIP poot-kernelgen: case (no GPU agent)           (a runtime's own report)
 
-A skip report is a line where the word `skip` (any case) is followed by `:` or whitespace and is
-not part of a longer word; `skipping ...` and `foo_skips_bar` are ordinary output. A `<skipped>`
-testcase (a test the runner itself did not run) is a skip too.
+A skip report is a line carrying the reserved token `POOT-SKIP`, at the start of the line or after
+whitespace and followed by `:` or whitespace. The token is the one skip channel of the workspace: every
+test that skips prints it, and nothing else is read as a skip. Free text that merely mentions a skip
+(`add: SKIP (not staged)`, `skip: ...`, `skipping ...`, `foo_skips_bar`) is ordinary output, so a host
+test of a tool that talks about skipped inputs is not mistaken for a skipped row (cards 1125, 1218, 1325).
+A `<skipped>` testcase (a test the runner itself did not run) is a skip too.
 """
 
 from __future__ import annotations
@@ -49,7 +51,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 REQUIRED_DIR = ROOT / "scripts" / "required-device-cases"
 
-SKIP_REPORT = re.compile(r"(?:^|[^A-Za-z0-9_])skip(?::|[ \t])", re.IGNORECASE)
+SKIP_REPORT = re.compile(r"(?:^|\s)POOT-SKIP(?::|\s|$)")
 
 
 class Problem(Exception):
@@ -364,6 +366,25 @@ def self_test() -> int:
         return 1
     print("required-case check accepted: every required case ran and passed")
 
+    # Free text that mentions a skip is ordinary output, not a skip report (card 1325): the ptx-check host tests
+    # print `add: SKIP (not staged)` for a fixture they deliberately leave out, and a lane must pass them.
+    for ordinary in (
+        "  add: SKIP (not staged)",
+        "SKIP: wgpu device unavailable: no adapter",
+        "skip: no wgpu adapter",
+        "SKIP case (no GPU agent)",
+        "skipping the dispatch",
+        "foo_skips_bar",
+    ):
+        status, output = run_fixture(
+            FIXTURE_LIST_AB, fixture_with_alpha(f"      <system-out>{ordinary}\n</system-out>")
+        )
+        if status != 0:
+            print(f"required-case check read ordinary output as a skip: {ordinary!r}", file=sys.stderr)
+            print(output, file=sys.stderr)
+            return 1
+    print("required-case check accepted: free text mentioning a skip is ordinary output")
+
     cases = [
         (
             "required case absent from the results",
@@ -373,21 +394,21 @@ def self_test() -> int:
         ),
         (
             "runtime skip reported on stderr",
-            "required case skipped: poot-wgpu-device::fixture alpha_case: SKIP: wgpu device unavailable: no adapter",
+            "required case skipped: poot-wgpu-device::fixture alpha_case: POOT-SKIP: wgpu device unavailable: no adapter",
             FIXTURE_LIST_AB,
-            fixture_with_alpha("      <system-err>SKIP: wgpu device unavailable: no adapter\n</system-err>"),
+            fixture_with_alpha("      <system-err>POOT-SKIP: wgpu device unavailable: no adapter\n</system-err>"),
         ),
         (
-            "runtime skip reported in the lowercase form",
-            "required case skipped: poot-wgpu-device::fixture alpha_case: skip: no wgpu adapter",
+            "runtime skip reported after a crate prefix",
+            "required case skipped: poot-wgpu-device::fixture alpha_case: POOT-SKIP poot-wgpu-device: no adapter",
             FIXTURE_LIST_AB,
-            fixture_with_alpha("      <system-err>skip: no wgpu adapter\n</system-err>"),
+            fixture_with_alpha("      <system-err>  POOT-SKIP poot-wgpu-device: no adapter\n</system-err>"),
         ),
         (
             "runtime skip reported on stdout",
-            "required case skipped: poot-wgpu-device::fixture alpha_case: SKIP case (no GPU agent)",
+            "required case skipped: poot-wgpu-device::fixture alpha_case: POOT-SKIP case (no GPU agent)",
             FIXTURE_LIST_AB,
-            fixture_with_alpha("      <system-out>SKIP case (no GPU agent)\n</system-out>"),
+            fixture_with_alpha("      <system-out>POOT-SKIP case (no GPU agent)\n</system-out>"),
         ),
         (
             "testcase the runner skipped",
@@ -487,16 +508,16 @@ def self_test() -> int:
     for label, needle, list_text, results_xml, unlisted_text in classification:
         if not expect_rejection(label, needle, list_text, results_xml, unlisted_text):
             return 1
-    # Unlisted rows are no escape from a skip, in any lane (card 1218, SC-002): a wgpu row that printed SKIP
+    # Unlisted rows are no escape from a skip, in any lane (card 1218, SC-002): a wgpu row that printed POOT-SKIP
     # fails the gate though the lane's unlisted list names it.
     skipped_beta = FIXTURE_GREEN.replace(
         '<testcase name="beta_case" classname="poot-wgpu-device::fixture" time="0.001"/>',
         '<testcase name="beta_case" classname="poot-wgpu-device::fixture" time="0.001">'
-        "<system-err>SKIP: wgpu device unavailable: no adapter\n</system-err></testcase>",
+        "<system-err>POOT-SKIP: wgpu device unavailable: no adapter\n</system-err></testcase>",
     )
     if not expect_rejection(
         "unlisted passing row that printed SKIP",
-        "unlisted case skipped: poot-wgpu-device::fixture beta_case: SKIP: wgpu device unavailable: no adapter",
+        "unlisted case skipped: poot-wgpu-device::fixture beta_case: POOT-SKIP: wgpu device unavailable: no adapter",
         only_alpha,
         skipped_beta,
         beta_unlisted,

@@ -16,11 +16,12 @@ use super::source::Source;
 use crate::KernelGenError;
 use crate::PackedRows;
 use crate::contraction::{
-    Epilogue, GemvEpilogue, GemvLaunch, LaneRows, RunLength, Schedule, TileSize, TiledBody,
-    TiledLaunch, gemv_body, tiled_body,
+    BoundEpilogue, Epilogue, GemvLaunch, RunLength, Schedule, TileSize, TiledBody, TiledLaunch,
+    TiledWeight, gemv_body, tiled_body,
 };
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
-use crate::helpers::{Alloc, elem, guard, ld, local, slice_dtype, slice_f32};
+use crate::helpers::{Alloc, WeightLayout, elem, guard, ld, local, slice_dtype, slice_f32};
+use crate::microtile::{LaneRows, MicroCols};
 
 /// What one generated packed kernel computes (dquant.md 3.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -49,12 +50,44 @@ pub fn packed_kernel(name: &str, spec: PackedKernelSpec) -> Result<Body, KernelG
     }
 }
 
+/// What the elements of one Gemv lane run (`count` aligned `K` elements of one weight row) share in a packed
+/// decode: the fact the planner sizes the run from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackedRunSharing {
+    /// The decode addresses the run's block once, decodes its factors (scale, sub-scale, min, sub-min) once and
+    /// reads its codes through shared 32-bit windows, when `count` divides `factor_run` (the aligned elements
+    /// whose factor bits are all the same); a run that does not divide it decodes every element's factors.
+    /// Block storage.
+    FactorRun {
+        /// The length of the aligned runs that share one set of factors.
+        factor_run: usize,
+    },
+    /// The decode addresses every element's codes through its own chain (a float run of at most 32 code bits
+    /// is one read), so a run shares at most its scale. Planar storage.
+    Elementwise,
+}
+
+/// What a Gemv lane run of `format`'s decode shares ([`PackedRunSharing`]). A descriptor the decode cannot
+/// state is the typed error its kernel would be.
+pub fn packed_run_sharing(format: WeightFormat) -> Result<PackedRunSharing, KernelGenError> {
+    let descriptor = format.descriptor();
+    Ok(match descriptor.storage {
+        Storage::Planar(_) => {
+            PlanarPlan::of(&descriptor)?;
+            PackedRunSharing::Elementwise
+        }
+        Storage::Blocks(_) => PackedRunSharing::FactorRun {
+            factor_run: DecodePlan::of(&descriptor)?.factor_run(),
+        },
+    })
+}
+
 /// The packed operand load of a [`crate::ContractionSpec`]: `format`'s descriptor-driven decode served to
 /// `schedule`'s loop nest, with `epilogue` applied to each column's sum before its store. The Gemv carries an
 /// epilogue (its leaves ride between the weight sources and the metadata); the block-diagonal tiled schedule has
 /// none yet, so an epilogue on it is a typed refusal. `rows` says how output rows meet weight rows: an
-/// [`PackedRows::Indexed`] table is a Gemv (decode) or the segmented Tiled schedule (prefill), both with an
-/// epilogue.
+/// [`PackedRows::Indexed`] table is a Gemv (decode) or the register-tiled schedule inside an expert walk
+/// (prefill), both with an epilogue.
 pub(crate) fn packed_contraction(
     name: &str,
     format: WeightFormat,
@@ -70,33 +103,35 @@ pub(crate) fn packed_contraction(
             width,
             cols,
             unroll,
+            activation,
         } => contraction_gemv(
             name,
             format,
-            GemvLaunch::new(width, cols, unroll)?,
+            GemvLaunch::new(width, cols, unroll, activation)?,
             epilogue,
             rows,
         ),
-        Schedule::Tiled { tile } if rows == PackedRows::Indexed => {
-            super::indexed::indexed_tiled(name, format, tile, epilogue)
-        }
-        Schedule::Tiled { .. } => Err(KernelGenError::Unsupported {
-            request: "packed_contraction",
-            reason: "a block-diagonal packed contraction is RegisterTiled, not Tiled",
-        }),
-        Schedule::RegisterTiled { .. } if rows == PackedRows::Indexed => {
-            Err(KernelGenError::Unsupported {
-                request: "packed_contraction",
-                reason: "an indexed packed contraction is Tiled, not RegisterTiled",
-            })
-        }
+        Schedule::RegisterTiled {
+            lanes,
+            rows: lane_rows,
+            cols,
+            run,
+        } if rows == PackedRows::Indexed => super::indexed::indexed_register_tiled(
+            name,
+            format,
+            TiledLaunch::new(lanes, lane_rows, cols, run, WeightLayout::Nk)?,
+            epilogue,
+        ),
         Schedule::RegisterTiled { .. } if epilogue.is_some() => Err(KernelGenError::Unsupported {
             request: "packed_contraction",
             reason: "a packed RegisterTiled contraction has no epilogue",
         }),
-        Schedule::RegisterTiled { lanes, rows, run } => {
-            contraction_register_tiled(name, format, lanes, rows, run)
-        }
+        Schedule::RegisterTiled {
+            lanes,
+            rows,
+            cols,
+            run,
+        } => contraction_register_tiled(name, format, lanes, rows, cols, run),
     }
 }
 
@@ -273,7 +308,7 @@ fn contraction_gemv(
         lead + 2 + leaf_count as u32,
         [activation, metadata, out],
         launch,
-        epilogue.map(|epilogue| GemvEpilogue {
+        epilogue.map(|epilogue| BoundEpilogue {
             epilogue,
             leaves: &leaves,
             lanes: &lanes,
@@ -378,7 +413,7 @@ fn contraction_gemv_planar(
         lead + 1 + (n + leaf_count) as u32,
         [activation, metadata, out],
         launch,
-        epilogue.map(|epilogue| GemvEpilogue {
+        epilogue.map(|epilogue| BoundEpilogue {
             epilogue,
             leaves: &leaves,
             lanes: &lanes,
@@ -400,9 +435,10 @@ fn contraction_register_tiled(
     format: WeightFormat,
     lanes: TileSize,
     rows: LaneRows,
+    cols: MicroCols,
     run: RunLength,
 ) -> Result<Body, KernelGenError> {
-    let launch = TiledLaunch::new(lanes, rows, run)?;
+    let launch = TiledLaunch::new(lanes, rows, cols, run, WeightLayout::Nk)?;
     let descriptor = format.descriptor();
     let (source_count, block_plan, planar_plan) = match descriptor.storage {
         Storage::Planar(_) => {
@@ -426,14 +462,24 @@ fn contraction_register_tiled(
         activation: local(1),
         metadata: local(2 + source_count as u32),
         out: local(3 + source_count as u32),
+        epilogue: None,
+        walk: None,
     };
     let mut body = match (&block_plan, &planar_plan) {
-        (Some(plan), _) => tiled_body(spec, launch, |e, row, k0, count, k, _weight_rows| {
-            plan.emit_run(e, sources[0], row, k0, count, k)
-        }),
-        (None, Some(plan)) => tiled_body(spec, launch, |e, row, k0, count, k, weight_rows| {
-            plan.emit_run(e, &sources, row, k0, count, k, weight_rows)
-        }),
+        (Some(plan), _) => tiled_body(
+            spec,
+            launch,
+            TiledWeight::Rows(&mut |e, _step, row, k0, count, k, _weight_rows| {
+                plan.emit_run(e, sources[0], row, k0, count, k)
+            }),
+        ),
+        (None, Some(plan)) => tiled_body(
+            spec,
+            launch,
+            TiledWeight::Rows(&mut |e, _step, row, k0, count, k, weight_rows| {
+                plan.emit_run(e, &sources, row, k0, count, k, weight_rows)
+            }),
+        ),
         (None, None) => unreachable!("a storage is block or planar"),
     };
     if let Some(plan) = &block_plan {
@@ -456,9 +502,6 @@ mod tile_size_tests {
             TileSize::new(0),
             Err(KernelGenError::BelowMinimum { .. })
         ));
-        assert_eq!(
-            format!("{:?}", Schedule::Tiled { tile: TileSize(8) }),
-            "Tiled { tile: 8 }"
-        );
+        assert_eq!(format!("{:?}", TileSize(8)), "8");
     }
 }

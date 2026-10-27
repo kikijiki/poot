@@ -80,7 +80,7 @@ impl Context {
         self.record_upload_transfer(std::mem::size_of_val(data));
         DeviceBuffer {
             buf,
-            elem_count: data.len() as u32,
+            elem_count: data.len(),
             id: next_buffer_id(),
             storage: BufferStorage::f32(),
             _guard: self.tag_alloc(
@@ -105,7 +105,7 @@ impl Context {
         self.record_upload_transfer(std::mem::size_of_val(data));
         DeviceBuffer {
             buf,
-            elem_count: data.len() as u32,
+            elem_count: data.len(),
             id: next_buffer_id(),
             storage: BufferStorage::i32(),
             _guard: self.tag_alloc(
@@ -132,7 +132,7 @@ impl Context {
         self.record_upload_transfer(std::mem::size_of_val(data));
         DeviceBuffer {
             buf,
-            elem_count: data.len() as u32,
+            elem_count: data.len(),
             id: next_buffer_id(),
             storage: BufferStorage::f16(),
             _guard: self.tag_alloc(
@@ -156,7 +156,7 @@ impl Context {
         self.record_upload_transfer(std::mem::size_of_val(data));
         DeviceBuffer {
             buf,
-            elem_count: data.len() as u32,
+            elem_count: data.len(),
             id: next_buffer_id(),
             // No fixed tensor dtype: this generic word buffer serves dims metadata, seeds, scratch
             // and packed rows alike, each named by the caller, not this allocation (card 527).
@@ -197,7 +197,7 @@ impl Context {
         self.buffer_allocs.set(self.buffer_allocs.get() + 1);
         DeviceBuffer {
             buf,
-            elem_count: elems as u32,
+            elem_count: elems,
             id: next_buffer_id(),
             storage: BufferStorage::f32(),
             _guard: self.tag_alloc(poot_runtime_common::BufferRole::Output, elems * 4),
@@ -216,7 +216,7 @@ impl Context {
     pub fn write_f32(&self, buf: &DeviceBuffer, data: &[f32]) -> Result<(), RuntimeError> {
         checked_storage("write_f32", buf, BufferStorage::f32())?;
         debug_assert_eq!(
-            buf.elem_count as usize,
+            buf.elem_count,
             data.len(),
             "write_f32: buffer/data length mismatch"
         );
@@ -296,11 +296,21 @@ impl Context {
         self.buffer_allocs.set(self.buffer_allocs.get() + 1);
         Ok(DeviceBuffer {
             buf,
-            elem_count: elems.max(1) as u32,
+            elem_count: elems.max(1),
             id: next_buffer_id(),
             storage,
             _guard: self.tag_alloc(role, bytes),
         })
+    }
+
+    /// Why `Queue::write_buffer_with` returned no staging view for `len` bytes at `offset`. The range was
+    /// checked before the call, so what is left is the device: a device wgpu reported lost (the typed
+    /// [`RuntimeError::DeviceLost`]) or one that refused the staging allocation.
+    fn staging_refused(&self, op: &'static str, offset: usize, len: usize) -> RuntimeError {
+        match self.health.check_not_lost() {
+            Err(lost) => lost,
+            Ok(()) => RuntimeError::StagingRefused { op, offset, len },
+        }
     }
 
     /// Overwrite `len` bytes of `buf` from byte `offset` (a whole number of its elements, padded to a
@@ -320,7 +330,7 @@ impl Context {
         fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), RuntimeError> {
         checked_write_range("write_with", buf, offset, len, 1)?;
-        let capacity = buf.elem_count as usize * buf.storage().element().byte_width();
+        let capacity = buf.elem_count * buf.storage().element().byte_width();
         let reaches_end = offset + len == capacity;
         if !offset.is_multiple_of(4) || (!len.is_multiple_of(4) && !reaches_end) {
             return Err(RuntimeError::Misaligned {
@@ -339,11 +349,7 @@ impl Context {
             let mut view = self
                 .queue
                 .write_buffer_with(&buf.buf, (offset + done) as wgpu::BufferAddress, size)
-                .ok_or(RuntimeError::Misaligned {
-                    op: "write_with",
-                    offset: offset + done,
-                    len: padded,
-                })?;
+                .ok_or_else(|| self.staging_refused("write_with", offset + done, padded))?;
             // wgpu's staging view is write-only (it may be write-combined memory): the caller's encoder
             // fills a cache-sized scratch, and each scratch run is copied into the view.
             let mut at = 0;
@@ -412,7 +418,7 @@ pub(crate) mod test_only {
             self.record_upload_transfer(std::mem::size_of_val(data));
             DeviceBuffer {
                 buf,
-                elem_count: data.len() as u32,
+                elem_count: data.len(),
                 id: next_buffer_id(),
                 // Card 527: E4M3FN packed rows are this function's documented caller; other packed or
                 // metadata payloads may reuse it too, so the logical dtype stays opaque here as well.
@@ -440,7 +446,7 @@ pub(crate) mod test_only {
             self.record_upload_transfer(std::mem::size_of_val(data));
             DeviceBuffer {
                 buf,
-                elem_count: data.len() as u32,
+                elem_count: data.len(),
                 id: next_buffer_id(),
                 storage: BufferStorage::i32(),
                 _guard: self.tag_alloc(
@@ -466,7 +472,7 @@ pub(crate) mod test_only {
                 BufferStorage::dense(ElementKind::I32, LogicalDType::RawBytes),
             )?;
             debug_assert_eq!(
-                buf.elem_count as usize,
+                buf.elem_count,
                 data.len(),
                 "write_u32: buffer/data length mismatch"
             );

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use poot_graph_ir::{Graph, OpKind, Operand, ValueId, ValueTable};
 
-use crate::{Plan, PlanError, value_ids};
+use crate::{PlanError, value_ids};
 
 /// One explicit state assignment that the backend must commit after graph equations finish.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,30 +45,31 @@ fn update_base(eqn: &poot_graph_ir::Eqn) -> Option<ValueId> {
     }
 }
 
-/// Derive donation and explicit-commit decisions from the program's own plans, index-aligned with
-/// `g.eqns` (`compile` already planned every equation once via `plan_graph`; a second independent
-/// planning pass here broke `compile_plans_each_equation_exactly_once`, spike-546 F7). `compile` calls
-/// this to fill `Program::state_commit`.
+/// Derive donation and explicit-commit decisions from the program's own aliasing, index-aligned with
+/// `g.eqns`: `aliases[i]` is the value whose buffer equation `i`'s output shares (a planned alias or
+/// strided view, [`crate::Plan::aliased_source`]), `None` when it materializes its output. `plan_graph` calls
+/// this between planning every other equation and planning the updates, whose lowering reads the
+/// decision (an update always materializes, so its aliasing is known before it is planned); no equation
+/// is planned twice (spike-546 F7).
 ///
 /// State outputs are pinned by `compute_views`, so strided views materialize before this boundary (the
-/// plans this takes were planned against those views). Planner aliases such as `Reshape` and
+/// plans this reads were planned against those views). Planner aliases such as `Reshape` and
 /// same-dtype `Cast` are followed to their storage root. Donation is narrow: only DynamicUpdateSlice
 /// and ScatterUpdate have an overlapping base/output kernel contract, and for ScatterUpdate it is a
 /// precondition: a graph whose scatter cannot be donated is refused with [`PlanError::ScatterNotInPlace`].
-pub(crate) fn state_commit_from_plans(
+pub(crate) fn state_commit_from_aliases(
     g: &Graph,
-    plans: &[Plan],
+    aliases: &[Option<ValueId>],
 ) -> Result<StateCommitPlan, PlanError> {
     check_state_shapes(g)?;
 
     let mut roots: ValueTable<ValueId> = g.values().ids().collect();
     let mut producers: HashMap<ValueId, usize> = HashMap::new();
 
-    for (eqn_idx, (eqn, plan)) in g.eqns().iter().zip(plans).enumerate() {
-        match plan {
-            Plan::Alias(source) => roots[eqn.out] = roots[*source],
-            Plan::View { src, .. } => roots[eqn.out] = roots[*src],
-            _ => {
+    for (eqn_idx, (eqn, alias)) in g.eqns().iter().zip(aliases).enumerate() {
+        match alias {
+            Some(source) => roots[eqn.out] = roots[*source],
+            None => {
                 roots[eqn.out] = eqn.out;
                 producers.insert(eqn.out, eqn_idx);
             }
@@ -102,7 +103,7 @@ fn check_state_shapes(g: &Graph) -> Result<(), PlanError> {
     Ok(())
 }
 
-/// [`state_commit_from_plans`]'s tail: donation and explicit-commit decisions from each state edge's
+/// [`state_commit_from_aliases`]'s tail: donation and explicit-commit decisions from each state edge's
 /// alias root and producer.
 fn commit_from_roots(
     g: &Graph,
@@ -456,18 +457,18 @@ mod tests {
     }
 
     /// Card 626 deleted `plan_native_state_commit`, the production executors' own
-    /// re-planning entry point: `state_commit_from_plans` (the live `compile` path) takes plans
-    /// `plan_graph` already computed instead of planning each equation again. This module's fixtures want
-    /// "plan a graph and derive its state-commit plan" in one call, so this re-plans each equation here
-    /// (test-only; `compile` itself never does this twice) and routes the result through the real
-    /// production function instead of restating `commit_from_roots`'s logic a second time.
+    /// re-planning entry point: `state_commit_from_aliases` (the live `compile` path) reads the aliasing of
+    /// the plans `plan_graph` computed instead of planning each equation again. This module's fixtures want
+    /// "plan a graph and derive its state-commit plan" in one call, so this plans each equation here
+    /// (test-only) and routes the plans' aliasing through the real production function instead of
+    /// restating `commit_from_roots`'s logic a second time.
     fn commit_for_test(
         g: &Graph,
         backend: Backend,
         caps: &DeviceCaps,
     ) -> Result<StateCommitPlan, PlanError> {
         let views = compute_views(g, backend);
-        let plans: Vec<Plan> = g
+        let aliases: Vec<Option<ValueId>> = g
             .eqns()
             .iter()
             .map(|eqn| {
@@ -479,8 +480,9 @@ mod tests {
                     caps,
                     &crate::test_support::roomy_body_limits(),
                 )
+                .map(|plan| plan.aliased_source())
             })
             .collect::<Result<_, _>>()?;
-        state_commit_from_plans(g, &plans)
+        state_commit_from_aliases(g, &aliases)
     }
 }

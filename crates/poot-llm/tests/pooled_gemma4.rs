@@ -89,6 +89,7 @@ fn moe_handle() -> Arc<ModelHandle> {
 fn options() -> DriverOptions {
     let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(CAPACITY),

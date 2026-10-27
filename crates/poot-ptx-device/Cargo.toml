@@ -19,6 +19,8 @@ poot-runtime-common.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# A launch of another device's kind (`LaunchKind::Aie`), which the device must refuse.
+poot-npu-artifacts.workspace = true
 poot-graph-plan = { workspace = true, features = ["test-support"] }
 poot-graph-ir = { workspace = true, features = ["test-support"] }
 poot-runtime-common = { workspace = true, features = ["test-support"] }

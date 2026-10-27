@@ -23,7 +23,7 @@ use poot_executor::{Device, Engine};
 use poot_executor_parity::Fixture;
 use poot_graph_ir::{BinOp, Builder, TensorType, UnOp};
 use poot_kernel_ir::MathOp;
-use poot_kernelgen::{AieOp, UnaryOp};
+use poot_kernelgen::{AieOp, FusedScalarOp};
 use poot_npu::{XdnaConfig, XdnaDevice};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -61,7 +61,7 @@ fn engine() -> Option<Engine<XdnaDevice>> {
         if get(variable).is_none() {
             let missing = format!("${variable} is unset (run under `nix develop .#npu`)");
             let reason = DeviceBackend::Npu.fail_if_required(get, missing);
-            eprintln!("SKIP: NPU toolchain unavailable: {reason}");
+            eprintln!("POOT-SKIP: NPU toolchain unavailable: {reason}");
             return None;
         }
     }
@@ -90,7 +90,7 @@ enum Case {
 }
 
 impl Case {
-    fn unary(op: UnOp, aie: UnaryOp, x: Vec<f32>) -> Self {
+    fn unary(op: UnOp, aie: FusedScalarOp, x: Vec<f32>) -> Self {
         Case::Unary(op, AieOp::Unary(aie), x)
     }
 
@@ -139,7 +139,7 @@ impl Case {
 fn cases() -> Vec<(&'static str, Case)> {
     use poot_kernel_ir::BinOp as K;
     let mut s = Stream(0x9E37_79B9_7F4A_7C15);
-    let math = UnaryOp::Math;
+    let math = FusedScalarOp::Math;
     vec![
         (
             "add",
@@ -226,13 +226,17 @@ fn cases() -> Vec<(&'static str, Case)> {
             "neg",
             Case::unary(
                 UnOp::Neg,
-                UnaryOp::Basic(poot_kernel_ir::UnOp::Neg),
+                FusedScalarOp::Unary(poot_kernel_ir::UnOp::Neg),
                 s.linear(N, -1e30, 1e30),
             ),
         ),
         (
             "recip",
-            Case::unary(UnOp::Recip, UnaryOp::Recip, s.logarithmic(N, 1e-30, 1e30)),
+            Case::unary(
+                UnOp::Recip,
+                FusedScalarOp::Recip,
+                s.logarithmic(N, 1e-30, 1e30),
+            ),
         ),
         (
             "exp",
@@ -268,27 +272,27 @@ fn cases() -> Vec<(&'static str, Case)> {
         ),
         (
             "tanh",
-            Case::unary(UnOp::Tanh, UnaryOp::Tanh, s.linear(N, -60.0, 60.0)),
+            Case::unary(UnOp::Tanh, FusedScalarOp::Tanh, s.linear(N, -60.0, 60.0)),
         ),
         (
             "tanh (near zero)",
-            Case::unary(UnOp::Tanh, UnaryOp::Tanh, s.linear(N, -1e-3, 1e-3)),
+            Case::unary(UnOp::Tanh, FusedScalarOp::Tanh, s.linear(N, -1e-3, 1e-3)),
         ),
         (
             "tanh (saturated)",
-            Case::unary(UnOp::Tanh, UnaryOp::Tanh, s.linear(N, -1e30, 1e30)),
+            Case::unary(UnOp::Tanh, FusedScalarOp::Tanh, s.linear(N, -1e30, 1e30)),
         ),
         (
             "erf",
-            Case::unary(UnOp::Erf, UnaryOp::Erf, s.linear(N, -6.0, 6.0)),
+            Case::unary(UnOp::Erf, FusedScalarOp::Erf, s.linear(N, -6.0, 6.0)),
         ),
         (
             "erf (near zero)",
-            Case::unary(UnOp::Erf, UnaryOp::Erf, s.linear(N, -1e-3, 1e-3)),
+            Case::unary(UnOp::Erf, FusedScalarOp::Erf, s.linear(N, -1e-3, 1e-3)),
         ),
         (
             "erf (saturated)",
-            Case::unary(UnOp::Erf, UnaryOp::Erf, s.linear(N, -1e30, 1e30)),
+            Case::unary(UnOp::Erf, FusedScalarOp::Erf, s.linear(N, -1e30, 1e30)),
         ),
     ]
 }

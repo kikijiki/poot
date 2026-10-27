@@ -46,7 +46,7 @@ pub fn plan_eqn(
 pub fn gpu_caps(target: &Target) -> DeviceCaps {
     match target {
         Target::Gpu { caps, .. } => *caps,
-        Target::Aie { .. } | Target::Vpu { .. } => {
+        Target::Npu(_) => {
             panic!("{target:?} is an NPU target: it has no GPU DeviceCaps")
         }
     }
@@ -56,7 +56,7 @@ pub fn gpu_caps(target: &Target) -> DeviceCaps {
 pub fn gpu_caps_mut(target: &mut Target) -> &mut DeviceCaps {
     match target {
         Target::Gpu { caps, .. } => caps,
-        Target::Aie { .. } | Target::Vpu { .. } => {
+        Target::Npu(_) => {
             panic!("an NPU target has no GPU DeviceCaps")
         }
     }
@@ -66,7 +66,7 @@ pub fn gpu_caps_mut(target: &mut Target) -> &mut DeviceCaps {
 pub fn gpu_backend(target: &Target) -> Backend {
     match target {
         Target::Gpu { backend, .. } => *backend,
-        Target::Aie { .. } | Target::Vpu { .. } => {
+        Target::Npu(_) => {
             panic!("{target:?} is an NPU target: it has no GPU backend")
         }
     }

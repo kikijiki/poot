@@ -14,7 +14,7 @@ const FAMILY_NAMES: [&str; 5] = ["bert", "idefics", "qwen", "mrope", "pixels"];
 
 /// The driver's source directory.
 fn driver_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/driver")
+    poot_test_util::manifest_dir().join("src/driver")
 }
 
 /// Whether `path` is a test module of the driver: its fixtures and device rows name real families.

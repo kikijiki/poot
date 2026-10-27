@@ -1,7 +1,7 @@
-# Pre-baked poot benchmark image (spec 112/115/117). Multi-stage to stay lean (18.2 GB on disk):
+# Pre-baked poot benchmark image (spec 112/115/117). Multi-stage to stay lean:
 #   1. compiles llama.cpp + the candle runner in a throwaway `-devel` builder stage (nvcc lives only here),
 #   2. ships only the built artifacts into a slim `nvidia/cuda:...-cudnn-runtime` final base (2.14 GB),
-#   3. reimplements the minimal PUBLIC_KEY -> sshd `/start.sh` the orchestrator depends on.
+#   3. provides the minimal PUBLIC_KEY -> sshd `/start.sh` the orchestrator depends on.
 # The torch venvs (vLLM / transformers) bundle their own CUDA libs; only candle + llama.cpp link the
 # system cublas/cudart, which the cudnn-runtime base carries. Pushed to GHCR, pulled by `create-pod` via
 # imageName.
@@ -14,7 +14,7 @@ FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/usr/local/cuda/bin:/root/.cargo/bin:$PATH \
-    CUDA_COMPUTE_CAP=86
+    CUDA_COMPUTE_CAP=80
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential pkg-config curl git cmake libssl-dev ninja-build ca-certificates \
@@ -23,23 +23,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # rust toolchain (candle); stays in the builder.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 
-# llama.cpp (CUDA, sm_86). ggml-cuda links the driver stub, so libggml-cuda.so gets NEEDED=libcuda.so.1,
+# llama.cpp (CUDA, sm_80 + sm_86: A100 and the 3090). ggml-cuda links the driver stub, so libggml-cuda.so gets NEEDED=libcuda.so.1,
 # but the toolkit's stubs/ dir only has libcuda.so. Symlink it to the .1 soname so the link resolves; at
 # runtime the pod injects the real driver.
 RUN ln -sf libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-RUN git clone --depth 1 --branch b9601 https://github.com/ggml-org/llama.cpp.git /opt/llama.cpp \
+RUN git clone --depth 1 --branch v0.4.1 https://github.com/ggml-org/llama.cpp.git /opt/llama.cpp \
     && cd /opt/llama.cpp \
     && cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release \
-       -DCMAKE_CUDA_ARCHITECTURES=86 \
+       -DCMAKE_CUDA_ARCHITECTURES="80;86" \
        -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs" \
     && cmake --build build -j"$(nproc)" --target llama-bench llama-server llama-cli
 
-# candle runner (compiles CUDA kernels for sm_86). Needs the suite source.
+# candle runner. candle-kernels takes ONE compute capability (CUDA_COMPUTE_CAP above) and loads its kernels as PTX, which
+# the driver JITs for the card: PTX built for compute_80 runs on the A100 (sm_80) and on the 3090 (sm_86), PTX built for
+# compute_86 does not run on sm_80. Needs the suite source.
 COPY . /opt/benchmarks
 RUN cd /opt/benchmarks/runners/candle && cargo build --release --features cuda
 
 # --- runtime: slim cuda runtime base
 FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+
+# The host driver must support CUDA 13.0: the CUDA 13 toolchain installed below and vLLM's cu130 FP8 JIT need it.
+# The orchestrator reads this label as the image's default `--min-cuda-version`; an image with no label has no floor.
+LABEL org.poot.bench.min-cuda="13.0"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/usr/local/cuda/bin:/root/.local/bin:$PATH \
@@ -100,7 +106,7 @@ RUN printf '%s\n' \
     > /start.sh && chmod +x /start.sh
 
 # Built artifacts only. Copy llama.cpp's whole build/bin (binaries and libggml*.so; found via $ORIGIN
-# rpath) plus the HF->GGUF converter the llamacpp runner invokes on demand. b9601 split the converter into a
+# rpath) plus the HF->GGUF converter the llamacpp runner invokes on demand. llama.cpp split the converter into a
 # `conversion/` package that convert_hf_to_gguf.py imports; without it the converter dies with
 # ModuleNotFoundError: No module named 'conversion'.
 COPY --from=builder /opt/llama.cpp/build/bin/ /opt/llama.cpp/build/bin/
@@ -132,11 +138,13 @@ RUN uv venv /opt/vllm-venv --python 3.11 \
 ENV VLLM_USE_FLASHINFER_SAMPLER=0
 
 # transformers v5 in its own venv (separate from vLLM's pinned deps; also runs the GGUF converter).
-# --torch-backend=cu124 is required: without it uv resolves the CPU wheel on the GPU-less build host and the
-# transformers cell errors with "no CUDA device". sentencepiece/protobuf (some tokenizers) and pyyaml/tqdm
+# --torch-backend=cu130 is required: without it uv resolves the CPU wheel on the GPU-less build host and the
+# transformers cell errors with "no CUDA device"; cu130 keeps sm_80/86 and adds Blackwell sm_120 (cu124 has no
+# sm_120 kernels). An older image gets the same torch on a Blackwell pod from runners/torch/blackwell-torch.sh.
+# sentencepiece/protobuf (some tokenizers) and pyyaml/tqdm
 # (gguf-py) let this venv run convert_hf_to_gguf.py for the llama.cpp runner.
 RUN uv venv /opt/tf-venv --python 3.11 \
-    && uv pip install --python /opt/tf-venv/bin/python --torch-backend=cu124 "transformers==5.0.0" accelerate safetensors pillow torch sentencepiece protobuf pyyaml tqdm
+    && uv pip install --python /opt/tf-venv/bin/python --torch-backend=cu130 "transformers==5.0.0" accelerate safetensors pillow torch sentencepiece protobuf pyyaml tqdm
 
 # Binary paths the harness reads via env (the poot binary is set per run).
 ENV POOT_BENCH_CANDLE_BIN=/opt/benchmarks/runners/candle/target/release/bench-candle-runner \

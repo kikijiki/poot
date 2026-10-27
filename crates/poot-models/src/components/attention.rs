@@ -17,6 +17,7 @@
 //! is the planner's decision from the device's data, never the tracer's.
 
 use poot_graph_ir::{BinOp, Builder, ComputedConst, Scalar, StateRole, TensorType, Traced, ops};
+use poot_tensor::DType;
 use poot_weights::{AttnRole, WeightId, WeightMap, WeightRole};
 
 use super::linear::{Weight, WeightError, linear};
@@ -25,7 +26,7 @@ use super::rope::{RopeParams, apply_rope, apply_rope_sectioned, rope_rows};
 use super::standard::{PagedMaps, ParamError, Step};
 use crate::model::TraceError;
 use crate::model::WiringError;
-use crate::model::{ConfigReason, KvLayout};
+use crate::model::{ConfigReason, KvDtype, KvLayout};
 
 /// Where a Q/K RMSNorm normalizes (applied before RoPE).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -472,7 +473,10 @@ fn write_contiguous(
     let CacheDims { kv_heads, head_dim } = dims;
     let input = b.state_input(
         name,
-        TensorType::f32(vec![rows, kv_heads, step.shape().capacity.get(), head_dim]),
+        TensorType::new(
+            vec![rows, kv_heads, step.shape().capacity.get(), head_dim],
+            step.shape().kv_dtype.dtype(),
+        ),
         StateRole::Positional { axis: 2 },
     )?;
     let output = if rows == 1 {
@@ -515,7 +519,10 @@ fn write_paged(
     };
     let input = b.state_input(
         name,
-        TensorType::f32(vec![pool_slots.get(), hkv, d]),
+        TensorType::new(
+            vec![pool_slots.get(), hkv, d],
+            step.shape().kv_dtype.dtype(),
+        ),
         StateRole::Positional { axis: 0 },
     )?;
     let flat = b.reshape(b.transpose(new, vec![0, 2, 1, 3])?, vec![rows * t, hkv, d])?;
@@ -531,6 +538,13 @@ pub(crate) fn first_writes(b: &Builder, step: &Step) -> Result<Vec<Traced>, Trac
         Some(_) => Ok(Vec::new()),
     }
 }
+
+/// The KV dtype a family whose caches [`carried_cache`] serves to contractions (an MLA latent cache, a DSA
+/// index cache) prefers ([`ModelConfig::kv_dtype`](crate::model::ModelConfig::kv_dtype)): f32. Attention reads
+/// a two-byte cache in place, but no contraction body reads a two-byte operand yet, so a narrow cache there
+/// would be widened into an f32 copy of the whole cache every step, more traffic than the f32 cache it saves.
+/// A user's explicit dtype still overrides it.
+pub(crate) const CONTRACTION_READ_KV: KvDtype = KvDtype::F32;
 
 /// The step's cache `name` of `layer` (`[rows, hkv, capacity, d]` contiguous, or one
 /// `[pool_slots, hkv, d]` pool under a paged layout) with the new `[rows, hkv, tokens, d]` values
@@ -566,6 +580,9 @@ fn carried(
     new: Traced,
     dims: CacheDims,
 ) -> Result<Traced, TraceError> {
+    // The cache stores the step's KV dtype: the write stores the f32 values narrowed (the update op's own
+    // conversion, so no narrowed copy of them exists), and the read widens back to f32, which attention
+    // folds into its own loads (narrow storage, f32 compute).
     let ((input, output), read) = match step.paged() {
         None => write_contiguous(b, step, write_at, &format!("kv.l{layer}.{name}"), new, dims)?,
         Some(maps) => {
@@ -574,7 +591,17 @@ fn carried(
         }
     };
     step.carry(input, output);
-    Ok(read)
+    cast_to(b, read, DType::F32)
+}
+
+/// `x` as `dtype`: a `Cast` when it is stored in another dtype, `x` itself when not, so an f32 cache's read
+/// traces exactly the graph it did before narrow storage existed.
+fn cast_to(b: &Builder, x: Traced, dtype: DType) -> Result<Traced, TraceError> {
+    Ok(if b.aval(x)?.dtype == dtype {
+        x
+    } else {
+        b.cast(x, dtype)?
+    })
 }
 
 /// Self-attention of `x` (`[rows, tokens, width]`) at layer `layer`; returns `[rows, tokens, width]`.

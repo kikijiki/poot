@@ -6,15 +6,15 @@ pulled by the standard RunPod MCP `create-pod` via `imageName`, with no registry
 
 ## What is / isn't in the image
 
-Multi-stage build (18.2 GB on disk, down from 30 GB): a throwaway `nvidia/cuda:...-cudnn-devel` builder
+Multi-stage build (about 35 GB on disk): a throwaway `nvidia/cuda:...-cudnn-devel` builder
 compiles llama.cpp and the candle runner, and only the artifacts ship into a slim
-`nvidia/cuda:...-cudnn-runtime` base. A reimplemented `/start.sh` provides the `PUBLIC_KEY` -> sshd contract
-the orchestrator needs (the runpod base used to provide it).
+`nvidia/cuda:...-cudnn-runtime` base. Its `/start.sh` provides the `PUBLIC_KEY` -> sshd contract
+the orchestrator needs.
 
-- **In:** all five engines pinned to sm_86 (vLLM 0.22.1, transformers 5.0.0, candle 0.10.2 + CUDA, llama.cpp
-  b9601 + CUDA), the harness venv, `hf` + `uv` + `tmux` + sshd, the Vulkan loader/diagnostic tools needed by
+- **In:** the five engines (vLLM 0.22.1, transformers 5.0.0, candle 0.10.2 + CUDA, llama.cpp
+  v0.4.1 + CUDA), built for the A100 (sm_80) and the 3090 (sm_86): llama.cpp for both, candle as compute_80 PTX that the driver JITs for either, the torch wheels multi-arch (cu130 adds Blackwell sm_120); the harness venv, `hf` + `uv` + `tmux` + sshd, the Vulkan loader/diagnostic tools needed by
   NVIDIA wgpu (`libvulkan1`, `vulkan-tools`), and the benchmark suite source. The torch venvs pin an explicit
-  `--torch-backend` (cu130 for vLLM, cu124 for transformers) so they are CUDA builds, not the CPU wheel uv
+  `--torch-backend` (cu130 for both vLLM and transformers) so they are CUDA builds, not the CPU wheel uv
   picks on the GPU-less build host.
 - **Out:** the model weights (fetched on the pod, or read from an attached network volume) and the poot
   binary (changes every version; scp'd fresh per run, then `patchelf`'d). `.dockerignore` also excludes
@@ -49,8 +49,7 @@ Record every pushed build (digest, source commit, changes) in [RELEASES.md](RELE
 
 The first push creates the GHCR package **private**. Flip it once: GitHub -> your packages ->
 `poot-bench` -> Package settings -> Danger Zone -> Change visibility -> Public. After that pods pull it
-with no credential and it costs nothing. The source repo stays private; only the image is public, so only
-the benchmark tooling and public engine installs are exposed (no poot codegen core, no poot binary).
+with no credential and it costs nothing. The image holds only the benchmark tooling and public engine installs (no poot binary).
 
 ## Use it in a sweep
 

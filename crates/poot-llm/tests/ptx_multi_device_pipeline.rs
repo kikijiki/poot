@@ -65,7 +65,7 @@ fn open_two() -> Option<(PtxDevice, PtxDevice)> {
                 std::env::var_os("POOT_REQUIRE_PTX_2GPU").is_none(),
                 "a second NVIDIA device is required (POOT_REQUIRE_PTX_2GPU) and unavailable: {error}"
             );
-            eprintln!("SKIP: a second NVIDIA device is unavailable: {error}");
+            eprintln!("POOT-SKIP: a second NVIDIA device is unavailable: {error}");
             None
         }
     }
@@ -488,7 +488,7 @@ impl Device for FailingFinish {
     fn load_kernel(
         &mut self,
         key: &str,
-        kernel: poot_runtime_common::CompiledKernel,
+        kernel: poot_codegen::CompiledKernel,
     ) -> Result<Self::Kernel, PtxGpuError> {
         self.inner.load_kernel(key, kernel)
     }

@@ -66,10 +66,10 @@ pub(crate) fn check_kv_head_strides(g: &Graph, target: &Target) -> Result<(), Pl
     };
     for (state, extent) in kv_extents(g, channels) {
         if extent == KvExtent::Camps {
-            let shape = &g.aval(state).shape;
+            let aval = g.aval(state);
             return Err(PlanError::KvHeadStrideCamps {
                 state,
-                stride_bytes: shape[2] * shape[3] * size_of::<f32>(),
+                stride_bytes: aval.shape[2] * aval.shape[3] * aval.dtype.byte_size(),
             });
         }
     }
@@ -1023,9 +1023,7 @@ mod kv_stride_tests {
     fn fused(g: &Graph) -> Graph {
         let (canonical, _) = crate::passes::canonicalize_with_declines(g).unwrap();
         let folded = crate::passes::fold_iota(&crate::passes::cse(&canonical).unwrap()).unwrap();
-        let fused = crate::passes::flash_attention_capped(&folded, None)
-            .unwrap()
-            .0;
+        let fused = crate::passes::flash_attention(&folded).unwrap().0;
         assert!(
             fused
                 .eqns()
@@ -1057,7 +1055,7 @@ mod kv_stride_tests {
         // 512 positions of a 128-wide head: a 2048 B stride, whole channel periods.
         let g = decode(512, 128, Reader::Attention);
         let limits = CompileLimits::STANDARD.body();
-        let Err(refused) = plan_graph(&fused(&g), &with_channels(), &limits) else {
+        let Err(refused) = plan_graph(&fused(&g), &with_channels(), &limits, None) else {
             panic!("a camping cache the legalizer could pad was planned");
         };
         assert!(
@@ -1072,7 +1070,7 @@ mod kv_stride_tests {
             stored(&compile(&g, &with_channels(), &options()).expect("the legalizer pads it")),
             [513, 513]
         );
-        assert!(plan_graph(&fused(&g), &without_channels(), &limits).is_ok());
+        assert!(plan_graph(&fused(&g), &without_channels(), &limits, None).is_ok());
         assert_eq!(
             stored(&compile(&g, &without_channels(), &options()).unwrap()),
             [512, 512]
@@ -1087,7 +1085,7 @@ mod kv_stride_tests {
         let limits = CompileLimits::STANDARD.body();
         // 512 f32 per head row is 2048 B: no whole-position pad escapes the period.
         let whole_period = decode(4, 512, Reader::Attention);
-        assert!(plan_graph(&fused(&whole_period), &with_channels(), &limits).is_ok());
+        assert!(plan_graph(&fused(&whole_period), &with_channels(), &limits, None).is_ok());
         assert_eq!(
             stored(&compile(&whole_period, &with_channels(), &options()).unwrap()),
             [4, 4]
@@ -1113,6 +1111,6 @@ mod kv_stride_tests {
         let g = b
             .finish(Outputs::new(next).with_state(&[(pool, next)]))
             .unwrap();
-        assert!(plan_graph(&g, &with_channels(), &limits).is_ok());
+        assert!(plan_graph(&g, &with_channels(), &limits, None).is_ok());
     }
 }

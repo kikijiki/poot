@@ -14,6 +14,12 @@ publish = false
 name = "poot-bench-runner"
 path = "src/main.rs"
 
+# POOT-1333: the poot side of the llama.cpp correctness comparison (teacher-forced top-k log-probabilities and the
+# greedy continuation of a token sequence).
+[[bin]]
+name = "poot-score"
+path = "src/bin/score.rs"
+
 [dependencies]
 poot-llm.workspace = true
 poot-executor.workspace = true
@@ -23,12 +29,14 @@ poot-quant.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 serde_json.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 poot-models = { workspace = true, features = ["test-support"] }
 poot-quant = { workspace = true, features = ["test-support"] }
 poot-runtime-common.workspace = true
 poot-target.workspace = true
+poot-test-util.workspace = true
 poot-tensor.workspace = true
 tokenizers.workspace = true
 

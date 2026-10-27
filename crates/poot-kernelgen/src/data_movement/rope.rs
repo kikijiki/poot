@@ -25,7 +25,7 @@ pub fn rope(
 /// The float ops mirror the decomposition (`xc = x*cos`, `rs = rotate_half*sin`, `xc + rs`), so the result
 /// matches the un-fused chain to float-reorder tolerance. `x`'s last-axis stride is 1, so the partner
 /// element is at linear index `i +/- half`. Coord unravel uses div/mul/sub, never `urem` (the NVPTX i64
-/// remainder miscompiles for a large dividend; see `binary_broadcast_dt_views`).
+/// remainder miscompiles for a large dividend; see `emit_view_offset`).
 pub fn rope_dt(
     name: &str,
     dt: Ty,

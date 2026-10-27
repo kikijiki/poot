@@ -13,30 +13,14 @@ use std::process::Command;
 use poot_kernel_ir::Body;
 use poot_wgpu_runtime::{Context, KernelBuffer};
 
-/// `CARGO_MANIFEST_DIR`, read at runtime (not baked via `env!`): the compile-time macro's value is
-/// embedded into this test binary's compiled object code at build time, and a shared compile cache (kache)
-/// that reuses that object across worktrees by source-content hash would then serve whichever worktree's
-/// path happened to compile it first (card 530's build.rs fix; card 543 review). `std::env::var` reads the
-/// environment cargo sets fresh for every test-binary invocation, so it is correct regardless of which
-/// worktree compiled the binary.
-fn manifest_dir() -> &'static Path {
-    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
-        PathBuf::from(
-            std::env::var("CARGO_MANIFEST_DIR")
-                .expect("CARGO_MANIFEST_DIR must be set by cargo for test binaries"),
-        )
-    })
-}
-
-/// `<CARGO_MANIFEST_DIR>/<rel>`, leaked to `&'static str` to match the call-site type these tests need
+/// `<manifest dir>/<rel>`, leaked to `&'static str` to match the call-site type these tests need
 /// (`concat!(env!(...), ..)`'s old return type); test binaries exit after the process runs, so the leak is
 /// bounded and cheap.
 fn manifest_path(rel: &str) -> &'static str {
-    Box::leak(format!("{}/{rel}", manifest_dir().display()).into_boxed_str())
+    Box::leak(format!("{}/{rel}", poot_test_util::manifest_dir().display()).into_boxed_str())
 }
 
-/// `CARGO_BIN_EXE_pootc`, read at runtime for the same reason as [`manifest_dir`].
+/// `CARGO_BIN_EXE_pootc`, read at runtime for the same reason as [`poot_test_util::manifest_dir`].
 fn pootc_exe() -> &'static str {
     static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     EXE.get_or_init(|| {
@@ -61,7 +45,7 @@ fn pootc_exe() -> &'static str {
 /// `compiler-artifact` message; a build that fails, or reports no or several proc-macro libraries, fails the
 /// test with cargo's output.
 fn build_proc_macro(device_pass: bool) -> PathBuf {
-    let manifest_dir = manifest_dir();
+    let manifest_dir = poot_test_util::manifest_dir();
     let mut checkout = DefaultHasher::new();
     manifest_dir.hash(&mut checkout);
     device_pass.hash(&mut checkout);
@@ -117,7 +101,7 @@ fn build_proc_macro(device_pass: bool) -> PathBuf {
 /// embedded metadata, so the metadata a `--crate-type lib` compile reads lives in the `.rmeta`): `add_macro.rs` calls
 /// `poot_kernel_intrinsics::thread_index` (card 531c), which needs `--extern` alongside the proc-macro.
 fn build_kernel_intrinsics_rmeta() -> PathBuf {
-    let manifest_dir = manifest_dir();
+    let manifest_dir = poot_test_util::manifest_dir();
     let mut checkout = DefaultHasher::new();
     manifest_dir.hash(&mut checkout);
     let target_dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -252,7 +236,7 @@ fn kernel_attribute_is_discovered_by_pootc() {
 /// 608 host-pass probe below `--extern`-links its generated wrapper's
 /// `poot_wgpu_runtime`/`poot_codegen`/`poot_kernel_ir`/`serde_json` (transitive) references against these.
 fn build_host_pass_rlibs() -> HashMap<String, Vec<PathBuf>> {
-    let manifest_dir = manifest_dir();
+    let manifest_dir = poot_test_util::manifest_dir();
     let mut checkout = DefaultHasher::new();
     manifest_dir.hash(&mut checkout);
     let target_dir = Path::new(env!("CARGO_TARGET_TMPDIR"))

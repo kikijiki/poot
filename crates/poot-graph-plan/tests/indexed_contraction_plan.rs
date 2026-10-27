@@ -1,5 +1,5 @@
 //! POOT-761: an `IndexedMatMul` compiles to one generated indexed contraction on every backend, the Gemv at a decode
-//! row count and the segmented Tiled above it, and a routed gate weighting fuses into it as one
+//! row count and the register-tiled expert walk above it, and a routed gate weighting fuses into it as one
 //! `ContractionEpilogue { head: Indexed }`.
 //!
 //! Every row drives the production `compile` for each backend and reads what `Program::planned()` holds.
@@ -100,12 +100,12 @@ fn indexed_request(program: &Program) -> &IndexedContraction {
 }
 
 /// SC-003: the decode shape (`M = 5`) plans `Schedule::Gemv` on wgpu, ROCm and PTX, and the prefill shape
-/// (`M = 160`) the segmented `Schedule::Tiled`.
+/// (`M = 160`) the register-tiled expert walk (`Schedule::RegisterTiled`).
 ///
 /// Mutation: restore the `SpirvVulkan`-only condition on the Gemv choice (`indexed_gemv_in` gated on the backend);
-/// ROCm and PTX plan the Tiled schedule at `M = 5` and the decode row goes red.
+/// ROCm and PTX plan the register-tiled schedule at `M = 5` and the decode row goes red.
 #[test]
-fn decode_shape_plans_the_gemv_on_every_backend_and_prefill_the_segmented_tiled() {
+fn decode_shape_plans_the_gemv_on_every_backend_and_prefill_the_register_tiled_walk() {
     for backend in backends() {
         for (m, gemv) in [(5, true), (160, false)] {
             let label = format!("{backend:?} M={m}");
@@ -114,16 +114,15 @@ fn decode_shape_plans_the_gemv_on_every_backend_and_prefill_the_segmented_tiled(
             assert!(
                 match request.schedule {
                     Schedule::Gemv { .. } => gemv,
-                    Schedule::Tiled { .. } => !gemv,
-                    Schedule::RegisterTiled { .. } => false,
+                    Schedule::RegisterTiled { .. } => !gemv,
                 },
                 "{label}: {:?}",
                 request.schedule
             );
-            // `[K, N, E, M, x_groups]`: the shapes the shape-generic body reads.
+            // `[K, N, M, x_groups, tile_offset, E]`: the shapes the shape-generic body reads.
             assert_eq!(
-                &request.meta[..4],
-                [K as u32, N as u32, EXPERTS as u32, m as u32]
+                [&request.meta[..3], &request.meta[5..6]].concat(),
+                [K as u32, N as u32, m as u32, EXPERTS as u32]
             );
         }
     }
@@ -229,7 +228,7 @@ fn transposes(program: &Program) -> usize {
 }
 
 /// POOT-646 SC-002: the checkpoint-order program plans one indexed contraction reading the stored `[E, N, K]`
-/// weight (`WeightLayout::Nk`) and no `transpose` dispatch, on every backend, at the Gemv and the Tiled shapes.
+/// weight (`WeightLayout::Nk`) and no `transpose` dispatch, on every backend, at the Gemv and the register-tiled shapes.
 ///
 /// Mutation: drop the indexed arm of `is_strided_capable` (`predicates.rs`); the `Transpose` is materialized, a
 /// `transpose` dispatch appears, the request reads `Kn` and this row goes red.
@@ -404,7 +403,7 @@ fn bf16_experts(m: usize, checkpoint_order: bool, gate: bool) -> Graph {
 }
 
 /// POOT-1028: a BF16 expert stack plans one indexed contraction that reads it as packed BF16 lanes, on every
-/// backend, at the Gemv and the Tiled shapes, in both orientations and under the gate epilogue, and the stack's
+/// backend, at the Gemv and the register-tiled shapes, in both orientations and under the gate epilogue, and the stack's
 /// buffer is the packed lane the request reads: no f32 copy of the stack and no `Cast` over it exists. The
 /// checkpoint-order spelling still plans no `transpose` dispatch (the const is packed through its view).
 ///

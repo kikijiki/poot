@@ -1,5 +1,5 @@
 //! Body -> textual LLVM IR, for the SPIR-V (Vulkan resource shape) and NVPTX (raw-pointer shape)
-//! targets, plus AMDGPU and AIE core (the `AieCore` branches are live: `crate::compile_aie` compiles every
+//! targets, plus AMDGPU and AIE core (the `AieCore` branches are live: `poot-npu` compiles every
 //! tile body of an XDNA2 region through them, POOT-641). One target-branched walk: the block/statement/operand/binop logic is
 //! shared; the leaves that differ (usize width, buffer access, thread-id intrinsics, the length source, the
 //! signature, the footer) branch on `Target`. Alloca-form + plain branches throughout (llc's mem2reg/SROA does
@@ -22,6 +22,17 @@ pub fn emit_llvm_ir(body: &Body, target: Target) -> Result<String, EmitError> {
     // Every stage below indexes locals, blocks and workgroup arrays directly; a malformed body must be rejected
     // as a typed error first, not panic or reach llc.
     body.verify()?;
+    // A planner-narrowed body (POOT-1405) lowers its `usize` as i32 on NVPTX, where the native index is i64;
+    // SPIR-V and the AIE core already index in 32 bits. AMDGPU has no narrowed lowering
+    // (`Capability::narrow_index`).
+    if matches!(body.index_width, poot_kernel_ir::IndexWidth::U32(_))
+        && self::core::usize_llty_of(target) == "i64"
+        && !crate::capability(target).narrow_index
+    {
+        return Err(EmitError::Unsupported(format!(
+            "a 32-bit index width on {target:?}: narrowed index math lowers on NVPTX only"
+        )));
+    }
     let mut structured = body.clone();
     // SpirvVulkan only, and in this order: first remove every Assert/Unreachable-derived Trap branch
     // (card 531c) - Vulkan compute has no trap instruction, so a failed assert accumulates a fault bit and

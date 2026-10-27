@@ -76,7 +76,7 @@ fn gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle() {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "SKIP gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle: no PTX device ({e})"
+                "POOT-SKIP gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle: no PTX device ({e})"
             );
             return;
         }

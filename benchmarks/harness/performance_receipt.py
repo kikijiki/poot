@@ -32,9 +32,11 @@ NEW = "new"
 NOT_RUN = "not run"
 REFUSED = "refused"
 INCOMPARABLE = "incomparable"
+KNOWN_UNVERIFIED = "known unverified"
+STALE_EXCEPTION = "stale exception"
 
 COMPARED_VERDICTS = frozenset({REGRESSION, IMPROVEMENT, WITHIN_NOISE})
-FAILING_VERDICTS = frozenset({REGRESSION, INVALID, CANDIDATE_FAILED, REPEAT_FAILED, INCOMPARABLE})
+FAILING_VERDICTS = frozenset({REGRESSION, INVALID, CANDIDATE_FAILED, REPEAT_FAILED, INCOMPARABLE, STALE_EXCEPTION})
 
 COMPLETE = "complete"
 INCOMPLETE = "incomplete"
@@ -132,15 +134,53 @@ def is_finite(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+# The expected range of five normal samples is 2.33 sigma: the width the comparator always gave a five-repeat
+# cell, kept as the design point so a robust estimate sizes the same band the old range did at `min_trials`.
+FIVE_SAMPLE_RANGE_IN_SIGMA = 2.33
+# The interquartile range of a normal distribution is 1.349 sigma.
+IQR_IN_SIGMA = 1.349
+
+
+def robust_sigma(samples):
+    """The spread of one run, from the interquartile range of `samples` (inclusive quartiles).
+
+    Unlike the sample range it does not grow with the number of repeats, and one wild repeat does not set it;
+    unlike the MAD it still sees a slow mode holding a quarter or more of the repeats, which is the shape a shared
+    device produces. It is 0 when the middle half of the repeats are identical.
+    """
+    q1, _, q3 = statistics.quantiles(samples, n=4, method="inclusive")
+    return (q3 - q1) / IQR_IN_SIGMA
+
+
+def noise(samples, min_trials):
+    """The noise one side contributes to a band: the expected range of `min_trials` normal samples of the
+    side's robust sigma, narrowed by sqrt(min_trials / n) because the median's standard error falls as
+    1 / sqrt(n). At `min_trials` repeats it is 2.33 robust sigmas; more repeats narrow it."""
+    return FIVE_SAMPLE_RANGE_IN_SIGMA * robust_sigma(samples) * math.sqrt(min_trials / len(samples))
+
+
+def _needs(band, limit, n, max_trials):
+    """What a band over its `limit` needs, given that it narrows as 1 / sqrt(n): the repeat count at which a
+    spread that holds would fit, or that no count in the budget would."""
+    if limit > 0:
+        needed = math.ceil(n * (band / limit) ** 2)
+        if needed <= max_trials:
+            return f"; a stable cell narrows with repeats: about {needed} per side would fit (have {n})"
+    return (
+        f"; {max_trials} repeats per side would not fit it: the spread, not the repeat count, is the limit"
+        " (a cell with two modes does not narrow)"
+    )
+
+
 def metric_verdict(samples_a, samples_b, policy, metric, *, failed_a=0, failed_b=0):
     """Judge one metric: baseline samples against candidate samples, each one repeat's value.
 
     `policy` is the manifest's `[performance]` table and `metric` names its entry. The rule: the band is twice
-    the larger observed range of the two sides. A candidate further outside it than the band is a regression
-    (or improvement). Inside it the result is within noise only when the band is narrow enough
-    (`max_uncertainty`) to exclude a loss of `practical_threshold`; a band too wide, or too few repeats, or an
-    exhausted repeat budget that never narrowed it, is unverified, never success. A failed repeat on either
-    side prevents any pass. Returns a dict with `verdict`, `note` and the statistics.
+    the larger `noise` of the two sides (2.33 robust sigmas at `min_trials` repeats, narrowing as
+    1 / sqrt(n)). A candidate further outside it than the band is a regression (or improvement). Inside it the
+    result is within noise only when the band is narrow enough (`max_uncertainty`) to exclude a loss of
+    `practical_threshold`; a band too wide, or too few repeats, or an exhausted repeat budget whose robust band
+    stays too wide, is unverified, never success. A failed repeat on either side prevents any pass. Returns a dict with `verdict`, `note` and the statistics.
     """
     tolerances = policy["metrics"][metric]
     direction = tolerances["direction"]
@@ -154,6 +194,7 @@ def metric_verdict(samples_a, samples_b, policy, metric, *, failed_a=0, failed_b
         "median_b": None,
         "range_b": None,
         "budget_exhausted": False,
+        "relative_band": None,
     }
 
     def settle(verdict, note=""):
@@ -183,12 +224,14 @@ def metric_verdict(samples_a, samples_b, policy, metric, *, failed_a=0, failed_b
     if len(samples_a) < min_trials or len(samples_b) < min_trials:
         return settle(UNVERIFIED, f"needs {min_trials} runs per side, have {len(samples_a)} and {len(samples_b)}")
 
-    # Identical runs on both sides show no noise to size a band from (a real measurement is never that
-    # steady): any difference would be judged against a zero-width band.
-    noise = max(result["range_a"], result["range_b"])
-    if not noise:
+    # No spread to size a band from (a real measurement is never that steady): any difference would be judged
+    # against a zero-width band. Identical runs show no noise at all; a nonzero range with a zero robust spread
+    # means the middle half of the runs are identical and only outliers differ.
+    if not (result["range_a"] or result["range_b"]):
         return settle(UNVERIFIED, "the runs of both sides are identical, so no noise was observed")
-    band = 2 * noise
+    band = 2 * max(noise(samples_a, min_trials), noise(samples_b, min_trials))
+    if not band:
+        return settle(UNVERIFIED, "the middle half of the runs are identical, so the robust spread sizes no band")
     loss = result["median_a"] - result["median_b"]
     if direction == LOWER_IS_BETTER:
         loss = -loss
@@ -198,18 +241,23 @@ def metric_verdict(samples_a, samples_b, policy, metric, *, failed_a=0, failed_b
         return settle(IMPROVEMENT)
 
     scale = abs(result["median_a"])
-    exhausted = min(len(samples_a), len(samples_b)) >= max_trials
-    result["budget_exhausted"] = exhausted
-    suffix = "; the repeat budget is exhausted" if exhausted else "; more repeats may narrow it"
+    n = min(len(samples_a), len(samples_b))
+    result["budget_exhausted"] = n >= max_trials
     if scale == 0:
         return settle(UNVERIFIED, "a zero baseline median has no relative band")
+    result["relative_band"] = band / scale
     if band / scale > tolerances["max_uncertainty"]:
         return settle(
             UNVERIFIED,
-            f"band {band / scale:.1%} exceeds the tolerated uncertainty {tolerances['max_uncertainty']:.1%}{suffix}",
+            f"band {band / scale:.2%} exceeds the tolerated uncertainty {tolerances['max_uncertainty']:.2%}"
+            + _needs(band, tolerances["max_uncertainty"] * scale, n, max_trials),
         )
     if (max(loss, 0) + band) / scale >= tolerances["practical_threshold"]:
-        return settle(UNVERIFIED, f"a loss of {tolerances['practical_threshold']:.1%} cannot be excluded{suffix}")
+        return settle(
+            UNVERIFIED,
+            f"a loss of {tolerances['practical_threshold']:.1%} cannot be excluded"
+            + _needs(band, tolerances["practical_threshold"] * scale - max(loss, 0), n, max_trials),
+        )
     return settle(WITHIN_NOISE)
 
 
@@ -529,8 +577,9 @@ BUILD_IDENTITY_FRAMEWORKS = frozenset({"poot"})
 # What a results.jsonl row states about the workload and the build and platform that ran it. Backend and device
 # are the cell key, not identity. Every field here must agree between baseline and candidate or the cell is
 # incomparable: a debug-profile runner, other cargo features or compiler, a different checkpoint under one model
-# id, another adapter or driver stack, a device-timed (profiled) run, or a dtype the weights are not stored in
-# is not the cell it is compared with. `build_sha` is deliberately absent: it is what a comparison varies.
+# id, another adapter or driver stack, a device-timed (profiled) run, a dtype the weights are not stored in, or a
+# different prefill chunk (chunked and whole-prompt prefill time differently) is not the cell it is compared with.
+# `build_sha` is deliberately absent: it is what a comparison varies.
 # These are the fields of a row of a repository-built runner (poot); the runner states every one of them.
 ROW_IDENTITY_FIELDS = (
     "precision",
@@ -543,6 +592,7 @@ ROW_IDENTITY_FIELDS = (
     "driver_version",
     "checkpoint_digest",
     "compute_dtype",
+    "prefill_chunk",
     "profiled",
 )
 # An external tool states its workload and the version of the engine that ran it, and nothing of a build or a
@@ -556,12 +606,43 @@ def row_identity_fields(framework):
 HEADLINE_CELL = "headline"
 
 
+# What a row's `prefill_chunk` identity is when its prompts prefill whole, in one chunk each.
+WHOLE_PROMPT_PREFILL = "whole"
+
+# What a curve row's `prompt_tokens` identity is when every point prefills exactly its context length.
+CURVE_PROMPT_IS_ISL = "isl"
+
+
+def row_workload_field(row, field):
+    """One workload field of a stored row.
+
+    A decode-curve row states its prompt length per curve point, not at the top, and the result contract
+    pins each point's prompt to its context length: the curve's prompt identity is that agreement
+    (`CURVE_PROMPT_IS_ISL`), or the points that break it. Which context lengths ran is cell coverage, judged
+    by the cells and not by identity.
+    """
+    if field == "requested_output":
+        return row.get("osl", row.get("gen_tokens"))
+    if field == "prefill_chunk":
+        # A row stated the chunk it prefilled in; one that did not (a row recorded before the field, or a
+        # curve run without `--prefill-chunk`: null) prefilled each prompt whole. A chunk that holds the
+        # longest prompt is that same whole-prompt prefill, whatever its number.
+        longest = max((point.get("isl", 0) for point in row.get("curve") or []), default=row.get("prompt_tokens"))
+        chunk = row.get("prefill_chunk")
+        return WHOLE_PROMPT_PREFILL if chunk is None or (longest is not None and chunk >= longest) else chunk
+    if field == "prompt_tokens" and row.get("curve"):
+        broken = sorted(
+            [point.get("isl"), point.get("prompt_tokens")]
+            for point in row["curve"]
+            if point.get("prompt_tokens") != point.get("isl")
+        )
+        return broken or CURVE_PROMPT_IS_ISL
+    return row.get(field)
+
+
 def row_identity(row):
     """What one stored row states about the workload and the build and platform that ran it."""
-    return {
-        field: row.get("osl", row.get("gen_tokens")) if field == "requested_output" else row.get(field)
-        for field in row_identity_fields(row.get("framework"))
-    }
+    return {field: row_workload_field(row, field) for field in row_identity_fields(row.get("framework"))}
 
 
 def rows_receipt(rows, policy):

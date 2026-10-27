@@ -1,37 +1,28 @@
 ---
 id: recurrence-scan
 title: Recurrence Scan
-sidebar_position: 14
+sidebar_position: 10
 ---
 
 # Recurrence Scan
 
-Gated delta rule (GDN) layers and Mamba2 layers replace attention with a
-recurrence over the sequence: each token updates a per-head state matrix, and the state is carried from one
-step to the next. Prefill traced as primitive equations is one unrolled chunk body per chunk, so the graph grows
-with the prompt length.
+Gated delta rule (GDN) and Mamba2 layers replace attention with a recurrence: each token updates a per-head state matrix, carried from step to step. Unrolled as primitives, the graph would grow with the prompt, so one `Scan` equation stands for it.
 
 ## One equation, one packed result
 
-The tracer emits a single `Scan` equation, of the `DeltaRule` or the `Ssd` family. An equation has one result,
-so the scan's result is one packed tensor `[1, H, L + S, W]`: the first `L` rows are the sequence output `y`,
-the following `S` rows are the carried state `s_out`. A typed layout names the two row ranges, and the builder
-returns `y` and `s_out` as slices of that one result. The state is published by pairing `s_out` with its input
-state, like any other carried state.
+The tracer emits a single `Scan` equation of the `DeltaRule` or `Ssd` family. Its one result is a packed tensor `[1, H, L + S, W]`: the first `L` rows are the output `y`, the next `S` rows the carried state `s_out`. A typed layout names the ranges, and the state is published by pairing `s_out` with its input state like any other.
 
-The scan is defined by its decomposition into primitives: the chunked delta-rule chain, or the Mamba2 SSD run
-chunk by chunk, each chunk continuing from the previous chunk's state. The CPU oracle evaluates exactly that,
-one chunk window at a time, so it has no sequence-length ceiling. A device kernel is compared with it within the
-reassociating tolerance, every element of the output and of the state.
+The scan is defined by its decomposition into primitives, run chunk by chunk with each chunk continuing from the previous state. The CPU oracle evaluates exactly that, so it has no sequence-length ceiling. A device kernel is compared with it within the reassociating tolerance, on every element of `y` and `s_out`.
+
+## The output gate
+
+A gated delta layer multiplies the RMS-normed scan output by a gate of its `z` projection. The gate belongs to the architecture, not the scan: SiLU for most, a sigmoid where the config names one (`output_gate_type`, read before `hidden_act`). Any other named gate is refused at load.
 
 ## The schedule
 
-The planner records a generated schedule: one streaming kernel with a workgroup per head and column block, each
-lane owning one state column in workgroup memory. For a long delta-rule sequence over too few heads to fill the
-device, the rows of a column are shared between several lanes that sum their partial dot products through workgroup
-memory each token; every other scan keeps one lane per column. The loop over the sequence is a runtime loop, so the kernel
-and the graph stay the same size at every prompt length. When a device reports a bound on the work of one
-dispatch, the sequence is split into launches that each stay within it, handing the state on through the result.
-A state column that does not fit the device's workgroup memory is refused at plan time.
+The planner records one streaming kernel with a workgroup per head and column block, each lane owning one state column in workgroup memory. Time grows linearly with the prompt.
 
-The kernel is the streaming recurrence, so its time grows linearly with the prompt length.
+- **Few heads.** A long delta-rule sequence over too few heads shares a column's rows between several lanes, which sum partial dot products through workgroup memory each token.
+- **Fixed size.** The sequence loop runs at run time, so kernel and graph size do not change with the prompt.
+- **Dispatch bound.** If a device bounds the work of one dispatch, the sequence is split into launches that hand the state on.
+- **Refusal.** A state column that does not fit workgroup memory is refused at plan time.

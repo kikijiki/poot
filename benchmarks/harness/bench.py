@@ -9,7 +9,9 @@ Subcommands:
   compare-committed
            The same comparison with the last committed set of each cell as the baseline (`just bench-compare`).
            With no candidate the committed set is compared with itself, which proves it is a verifiable
-           baseline: enough repeats, one binary, a band narrow enough to exclude a practical loss.
+           baseline: enough repeats, one binary, a band narrow enough to exclude a practical loss. A cell
+           unverified for a measured spread passes only when benchmarks/known-unverified.toml lists it with
+           the band measured; an unlisted unverified cell, and a listed cell that verifies, are red.
   compare  Diff a baseline against a candidate (each one or more run directories, ideally NOISE_REPEATS
            repeats of the same matrix), cell by cell. A cell is (model, scenario, framework, backend,
            device); each is judged on every required pair (headline and every curve point) by
@@ -48,6 +50,8 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 try:
+    from . import known_unverified
+    from . import memory_phases
     from . import performance_receipt as receipts
     from .result_contract import (
         BUILD_IDENTITY_FIELDS,
@@ -59,6 +63,8 @@ try:
         validate_runner_result,
     )
 except ImportError:  # direct `python harness/bench.py` execution
+    import known_unverified
+    import memory_phases
     import performance_receipt as receipts
     from result_contract import (
         BUILD_IDENTITY_FIELDS,
@@ -189,12 +195,33 @@ def resolve_cmd(runner, subst):
 _ISL_DONE_RE = re.compile(r"isl=(\d+)\s+done")
 
 
+def _predict_increment(points, x):
+    """Time one more context length `x` will take, extrapolated from the (isl, seconds) points measured so far.
+
+    The cost of a curve point is a fixed part (model load on the first point, the decode window) plus a part
+    that grows with the context (prefill, attention over the cache), so it is neither constant nor proportional
+    to the ISL. Newton/Lagrange extrapolation through the last three points captures the fixed part, the slope
+    and the curvature; it is clamped to the last measured point, since a longer context never gets cheaper."""
+    pts = points[-3:]
+    total = 0.0
+    for i, (xi, yi) in enumerate(pts):
+        term = yi
+        for j, (xj, _) in enumerate(pts):
+            if i != j:
+                term *= (x - xj) / (xi - xj)
+        total += term
+    return max(total, pts[-1][1])
+
+
 def _curve_progress(fw, isls):
     """Callback for the observer's live stream: runners print `isl=<N> done ...` per context length; this
-    reports progress (k/total, elapsed) and a rough ETA. The ETA assumes per-ISL cost is linear in ISL
-    (prefill dominates slow cells), using the latest ISL's incremental time as the rate."""
+    reports progress (k/total, elapsed) and an ETA for the remaining context lengths. The ETA needs three finished
+    points: one cannot separate the fixed cost from the growth with context, and two give a straight line that
+    underestimates a curve which bends upward. It fits the cost of a point as a polynomial in the ISL (see
+    `_predict_increment`)."""
     start = time.time()
-    done = []  # (isl, cumulative_elapsed_s)
+    done = []     # (isl, cumulative_elapsed_s)
+    points = []   # (isl, seconds this point took)
     total = len(isls)
 
     def cb(line):
@@ -205,19 +232,26 @@ def _curve_progress(fw, isls):
         if any(d[0] == isl for d in done):   # dedupe: a runner may echo the line on both streams
             return
         el = time.time() - start
+        points.append((isl, max(el - (done[-1][1] if done else 0.0), 1e-6)))
         done.append((isl, el))
         remaining = [s for s in isls if s not in {d[0] for d in done}]
         eta = ""
-        if remaining:
-            prev_cum = done[-2][1] if len(done) >= 2 else 0.0
-            inc = max(el - prev_cum, 1e-6)
-            rate = inc / max(isl, 1)            # seconds per prompt token at the last ISL
-            est = sum(rate * s for s in remaining)
+        if remaining and len(points) >= 3:
+            est = sum(_predict_increment(points, s) for s in remaining)
             eta = f", eta ~{est / 60:.1f}m"
         print(f"      [progress] {fw}: isl {isl} done ({len(done)}/{total}), elapsed {el / 60:.1f}m{eta}",
               file=sys.stderr, flush=True)
 
     return cb
+
+
+def model_path(models_dir, model):
+    """What a runner is handed as `{model_dir}`: the checkpoint directory, or for a model that names a
+    `weights_file` (a pre-quantized GGUF, the first shard of a split set) that file inside it."""
+    if not model.get("local_dir"):
+        return model["id"]
+    root = Path(models_dir) / model["local_dir"]
+    return str(root / model["weights_file"]) if model.get("weights_file") else str(root)
 
 
 def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, overrides=None,
@@ -241,7 +275,7 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
 
     from observer import NO_JSON_RESULT, parse_last_json_line, run_observed
 
-    model_dir = str(Path(models_dir) / model["local_dir"]) if model.get("local_dir") else model["id"]
+    model_dir = model_path(models_dir, model)
     # decode-curve uses synthetic tokens; fall back to short.txt so {prompt_file} still substitutes
     # (ignored under --synthetic, but candle/llamacpp need a real path).
     prompt_file = str(BENCH_ROOT / "prompts" / scen.get("prompt_file", "short.txt"))
@@ -253,12 +287,12 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
         "model_dir": model_dir,
         "prompt_file": prompt_file,
         "gen_tokens": overrides.get("gen_tokens") or scen.get("gen_tokens", suite.get("default_gen_tokens", 128)),
-        "warmup": overrides.get("warmup") if overrides.get("warmup") is not None else suite.get("warmup_iters", 2),
-        "iters": overrides.get("iters") or suite.get("timed_iters", 5),
+        "warmup": overrides.get("warmup") if overrides.get("warmup") is not None else suite.get("warmup_iters", 1),
+        "iters": overrides.get("iters") or suite.get("timed_iters", 3),
         "precision": base["precision"],
         "image": image,
         "bench_root": str(BENCH_ROOT),
-        # poot backend: ptx by default; a dev-box run sets POOT_BENCH_BACKEND=rocm|wgpu. Only the poot cmd
+        # poot backend: ptx by default; a dev-box run sets POOT_BENCH_BACKEND=rocm|wgpu|vulkan. Only the poot cmd
         # references {backend}.
         "backend": os.environ.get("POOT_BENCH_BACKEND", "ptx"),
     }
@@ -290,7 +324,7 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
         if fw == "poot" and scen.get("prefill_chunk") is not None:
             cmd += ["--prefill-chunk", str(scen["prefill_chunk"])]
         on_line = _curve_progress(fw, isls)
-    obs = run_observed(cmd, interval_s=interval_ms / 1000.0, on_line=on_line)
+    obs = run_observed(cmd, device=device, interval_s=interval_ms / 1000.0, on_line=on_line)
     timing = parse_last_json_line(obs["stdout"])
     caveats = _merge_caveats(_caveats(model, fw_cfg), _runner_caveats(timing))
 
@@ -342,7 +376,8 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
     row = {**base, "status": "ok", "timing_claim": timing_claim(fw)}
     # Timing fields come from the runner; copy only the schema-known keys for this scenario.
     timing_fields = [*BUILD_IDENTITY_FIELDS, *MEASUREMENT_IDENTITY_FIELDS, "framework_version", "family",
-                     "engine", "profiled", "driver", "backend", "self_reported_vram_bytes", "preparation"]
+                     "engine", "profiled", "prefill_chunk", "kv_dtype", "driver", "backend", "self_reported_vram_bytes",
+                     "preparation"]
     if not curve:
         timing_fields += [
             "prompt_tokens", "gen_tokens", "ttft_ms", "tpot_ms", "e2e_ms",
@@ -373,6 +408,7 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
 _OBSERVER_RESULT_FIELDS = (
     "peak_vram_bytes",
     "vram_baseline_bytes",
+    "peak_gtt_bytes",
     "peak_rss_bytes",
     "gpu_util_mean_pct",
     "gpu_util_peak_pct",
@@ -464,6 +500,18 @@ def cmd_matrix(args):
     print(f"\n{n_ok} runnable cells, {n_unsup} unsupported.")
 
 
+class NoGpuError(RuntimeError):
+    """The host lists no GPU: every cell of a GPU matrix would error or silently run on the CPU."""
+
+
+def require_gpu(env):
+    """Refuse a repeat on a host whose GPU is gone. A pod's GPU can die between repeats; the matrix then errors
+    on every CUDA framework while llama.cpp falls back to the CPU, and the set looks like a result. The text names
+    the CUDA marker the orchestrator reads as a host fault, so the pod is replaced at the first such repeat."""
+    if not env["gpu_name"]:
+        raise NoGpuError("no CUDA-capable device is detected: neither nvidia-smi nor rocminfo lists a GPU")
+
+
 def cmd_run(args):
     if args.repeats < 1:
         sys.exit("bench run: --repeats must be at least 1")
@@ -484,8 +532,17 @@ def cmd_run(args):
         # committed-set check never read it.
         results_root = results_root / DIAGNOSTICS_DIR
     run_id = args.run_id
+    skipped = {int(n) for n in args.skip_repeats.split(",") if n.strip()} if args.skip_repeats else set()
     for repeat in range(1, args.repeats + 1):
+        if repeat in skipped:
+            # A resumed sweep: this repeat's set was gathered from an earlier pod; it stays one set with the rest.
+            print(f"[run] repeat {repeat}/{args.repeats}: skipped (already gathered)", file=sys.stderr, flush=True)
+            continue
         env = capture_env(args.manifest)
+        try:
+            require_gpu(env)
+        except NoGpuError as e:
+            sys.exit(f"bench run: repeat {repeat}/{args.repeats}: {e}")
         # A poot-only run names its backend: two backends on one machine are two sets of the same date and model.
         backend = os.environ.get("POOT_BENCH_BACKEND", "ptx") if args.framework == "poot" else None
         run_id = run_id or _default_run_id(env, args.model, backend)
@@ -515,11 +572,16 @@ def _run_matrix(args, manifest, runners, suite, models_dir, env, run_dir):
                 continue
             label = f"{model['id']} / {scen['id']} / {fw}"
             print(f"[run] {label} ...", file=sys.stderr, flush=True)
-            row = run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite,
-                           interval_ms=args.sample_interval_ms, device=env["gpu_name"],
-                           overrides={"gen_tokens": args.gen_tokens, "warmup": args.warmup,
-                                      "iters": args.iters},
-                           diagnostic=args.diagnostic)
+            try:
+                row = run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite,
+                               interval_ms=args.sample_interval_ms, device=env["gpu_name"],
+                               overrides={"gen_tokens": args.gen_tokens, "warmup": args.warmup,
+                                          "iters": args.iters},
+                               diagnostic=args.diagnostic)
+            except Exception as exc:  # one cell's failure is that cell's error row, never the whole sweep's end
+                row = {"framework": fw, "model": model["id"], "scenario": scen["id"],
+                       "precision": fw_cfg.get("precision", model.get("match_precision", "")),
+                       "status": "error", "reason": f"harness exception: {exc!r}"[:1200]}
             out.write(json.dumps(row) + "\n")
             out.flush()
             rows.append(row)
@@ -553,10 +615,21 @@ def cmd_report(args):
     print(render_report(env, rows))
 
 
+# A directory the orchestrator mirrors a set's in-progress rows into while the sweep runs, named
+# `<set name>.partial`. It is not a result: it may hold a half-finished cell list, so no tool that reads the
+# results directory (index, committed sets, the performance page) may see it. It is also git-ignored.
+PARTIAL_SUFFIX = ".partial"
+
+
+def result_dirs(results_dir):
+    """The result directories under `results_dir`, in name order: everything but a `.partial` mirror."""
+    return [d for d in sorted(Path(results_dir).iterdir()) if not d.name.endswith(PARTIAL_SUFFIX)]
+
+
 def load_runs(results_dir):
     """Every snapshot under `results_dir` as (run id, env, rows), in run-id order."""
     runs = []
-    for d in sorted(Path(results_dir).iterdir()):
+    for d in result_dirs(results_dir):
         rj = d / "results.jsonl"
         if not rj.is_dir() and rj.exists():
             env = json.loads((d / "env.json").read_text()) if (d / "env.json").exists() else {}
@@ -574,11 +647,11 @@ def _run_date(env):
         return None
 
 
-def render_index(runs):
+def render_index(runs, known=()):
     """The progress index for `runs` (see `load_runs`), a pure function of the results.
 
     Staleness is measured against the newest run in the results, never the clock, so the index only changes
-    when a result does.
+    when a result does. `known` is the known-unverified list (`known_unverified.load`), shown as its own table.
     """
     dates = [d for d in (_run_date(env) for _, env, _ in runs) if d]
     newest = max(dates) if dates else None
@@ -599,9 +672,9 @@ def render_index(runs):
     for (model, scenario), per_run in sorted(groups.items()):
         env_by_run = per_run.pop("_env", {})
         out += [f"## {model} - {scenario}", "",
-                "| run | date | behind | backend | poot commit | GPU | poot tok/s | poot TTFT ms | "
-                "poot VRAM GiB | fastest baseline | poot vs fastest |",
-                "|---|---|---|---|---|---|---|---|---|---|---|"]
+                "| run | date | behind | backend | poot commit | GPU | host CPU | poot tok/s | poot TTFT ms | "
+                "poot GPU GiB at inference | fastest baseline | poot vs fastest |",
+                "|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for run_id in sorted(per_run):
             cells = per_run[run_id]
             env = env_by_run.get(run_id, {})
@@ -617,10 +690,22 @@ def render_index(runs):
             out.append(
                 f"| {run_id} | {date or ''} | {behind} | {(poot.get('backend') or '-') if poot else '-'} | "
                 f"{_short_sha(commit)} | "
-                f"{(env.get('gpu_name') or '').replace('NVIDIA ', '')} | "
+                f"{(env.get('gpu_name') or '').replace('NVIDIA ', '')} | {host_identity(env)['host_cpu'] or '-'} | "
                 f"{_num(ptoks) if poot else '-'} | {_num(poot.get('ttft_ms')) if poot else '-'} | "
-                f"{_gib(poot.get('peak_vram_bytes')) if poot else '-'} | "
+                f"{_memory_gib(poot, 'vram') if poot else '-'} | "
                 f"{(best[0] + ' ' + _num(best[1]['decode_tok_s']) + ' tok/s') if best else '-'} | {ratio} |")
+        out.append("")
+    if known:
+        out += ["## Known-unverified cells", "",
+                "Committed cells whose repeats do not verify (`benchmarks/known-unverified.toml`). The page shows their "
+                "measured median muted and labelled unverified, never ranked and never in a ratio; "
+                "`bench compare-committed` fails when an entry goes stale.", "",
+                "| model | scenario | framework | backend | device | host CPU | driver | pair | band | repeats | follow-up | reason |",
+                "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        for entry in sorted(known.values(), key=lambda e: tuple(e.get(f) or "" for f in known_unverified.KEY_FIELDS)):
+            out.append("| " + " | ".join(
+                [str(entry.get(f) or "-") for f in known_unverified.KEY_FIELDS]
+                + [entry["pair"], f"{entry['band']:.2%}", str(entry["repeats"]), entry["follow_up"], entry["reason"]]) + " |")
         out.append("")
     return "\n".join(out)
 
@@ -629,7 +714,7 @@ def cmd_index(args):
     """Scan every results/<run>/ snapshot into results/INDEX.md."""
     results_dir = Path(args.results_dir or (BENCH_ROOT / "results"))
     runs = load_runs(results_dir)
-    text = render_index(runs)
+    text = render_index(runs, known_unverified.load(known_unverified.beside(results_dir)))
     (results_dir / "INDEX.md").write_text(text)
     print(f"wrote {results_dir / 'INDEX.md'} ({len(runs)} run(s))")
     print(text)
@@ -648,7 +733,7 @@ def committed_sets(results_dir):
     (`<run-id>-r1` ... `<run-id>-rN`), or the single directory of a run with one repeat. The diagnostics
     directory holds no `results.jsonl` of its own and is never a set."""
     sets = {}
-    for run_dir in sorted(Path(results_dir).iterdir()):
+    for run_dir in result_dirs(results_dir):
         if run_dir.is_dir() and (run_dir / "results.jsonl").is_file():
             sets.setdefault(_REPEAT_SUFFIX.sub("", run_dir.name), []).append(run_dir)
     return dict(sorted(sets.items()))
@@ -681,14 +766,47 @@ def cmd_compare_committed(args):
         sys.exit(f"bench compare-committed: no committed run under {results_dir}")
     candidate_dirs = [Path(d) for d in args.candidate] or baseline_dirs
     candidate_rows = [row for run_dir in candidate_dirs for row in _load_rows(run_dir)]
-    cells = compare_cells(baseline_rows, candidate_rows, receipts.load_policy(args.manifest))
+    policy = receipts.load_policy(args.manifest)
+    cells = compare_cells(baseline_rows, candidate_rows, policy)
+    cells = _without_error_only_cells(cells, baseline_rows + candidate_rows)
+    if not args.candidate:
+        # Only the committed set judged against itself is a statement about the set; a candidate's band is
+        # also the candidate's, so the exceptions say nothing about it.
+        cells = known_unverified.apply(
+            cells, known_unverified.load(args.known_unverified or known_unverified.beside(results_dir)),
+            lambda key: _compare_cell(key, None, None, policy))
     print(render_compare(baseline_dirs, candidate_dirs, cells))
     return compare_exit_code(cells)
 
 
+def _without_error_only_cells(cells, rows):
+    """The cells minus those whose every committed row is an error: such a cell has no throughput to judge (owner
+    decision 2026-10-24). That a required cell was never measured is the grid check's job (`grid.py check`), not this
+    comparator's: a required cell with no verified data fails there."""
+    by_cell = _rows_by_cell(rows)
+    return [cell for cell in cells if any(r.get("status") == "ok" for r in by_cell[cell["key"]])]
+
+
+def host_identity(env):
+    """The hardware a run's `env.json` states beyond the accelerator: the host CPU model and the GPU driver
+    (both part of a cell's identity), and the host kernel (shown, not part of the identity).
+
+    A field the capture did not record is None: unknown, which is its own identity and never a wildcard.
+    """
+    return {"host_cpu": env.get("cpu") or None, "gpu_driver": env.get("gpu_driver") or None,
+            "host_kernel": env.get("host_kernel") or None}
+
+
 def _load_rows(run_dir):
-    p = Path(run_dir) / "results.jsonl"
-    return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    """The rows of one run directory, each stamped with the host identity of that directory's `env.json`.
+
+    The stamp is per run directory, so repeats recorded on different hosts keep their own identity.
+    """
+    run_dir = Path(run_dir)
+    env_path = run_dir / "env.json"
+    host = host_identity(json.loads(env_path.read_text()) if env_path.exists() else {})
+    lines = (run_dir / "results.jsonl").read_text().splitlines()
+    return [{**host, **json.loads(l)} for l in lines if l.strip()]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -699,11 +817,15 @@ NOISE_REPEATS = receipts.POLICY["min_trials"]
 
 
 def cell_key(row):
-    """What makes two rows the same cell: the same model and scenario on the same engine, backend and device.
+    """What makes two rows the same cell: the same model and scenario on the same engine, backend and hardware.
 
-    A backend or device the row does not record is part of the key as None, never a wildcard.
+    The hardware is the accelerator, the host CPU model and the GPU driver: time metrics that include host-side
+    launch work differ between hosts of one GPU, so repeats from two hosts are never one band. A backend, device,
+    host CPU or driver the row does not record is part of the key as None (unknown), never a wildcard, so a row
+    of unknown hardware is never pooled with one of known hardware.
     """
-    return (row["model"], row["scenario"], row["framework"], row.get("backend"), row.get("device"))
+    return (row["model"], row["scenario"], row["framework"], row.get("backend"), row.get("device"),
+            row.get("host_cpu"), row.get("gpu_driver"))
 
 
 def _is_finite(value):
@@ -744,7 +866,8 @@ def _distinct(rows, field):
 def _compare_cell(key, rows_a, rows_b, policy):
     cell = {"key": key, "verdict": None, "note": "", "n_a": 0, "n_b": 0,
             "median_a": None, "range_a": None, "median_b": None, "range_b": None,
-            "vram_a": None, "vram_b": None, "builds_a": [], "builds_b": [], "entries": []}
+            "vram_a": None, "vram_b": None, "builds_a": [], "builds_b": [], "entries": [],
+            "band": None, "band_pair": None, "failed_repeats": 0}
     ok_a = [r for r in rows_a or [] if r.get("status") == "ok"]
     ok_b = [r for r in rows_b or [] if r.get("status") == "ok"]
     cell.update(n_a=len(ok_a), n_b=len(ok_b),
@@ -790,8 +913,26 @@ def _compare_cell(key, rows_a, rows_b, policy):
     if report["verdict"] in (receipts.WITHIN_NOISE, receipts.IMPROVEMENT):
         return settle(report["verdict"])
     worst = next(e for e in report["entries"] if e["verdict"] == report["verdict"])
+    if report["verdict"] == receipts.UNVERIFIED:
+        _record_band(cell, [e for e in report["entries"] if e["verdict"] == receipts.UNVERIFIED])
+    elif report["verdict"] == receipts.REPEAT_FAILED:
+        # The spread of the repeats that did run is what a listing states, beside how many failed.
+        spread = _compare_cell(key, ok_a, ok_a, policy)
+        cell.update(band=spread["band"], band_pair=spread["band_pair"], failed_repeats=len(rows_a) - len(ok_a))
     detail = f": {worst['note']}" if worst["note"] else ""
     return settle(report["verdict"], f"{worst['cell']} {worst['metric']}{detail}")
+
+
+def _record_band(cell, unverified):
+    """The spread an unverified cell is unverified for: the widest relative band over its unverified pairs.
+
+    Only a cell whose every unverified pair is a measured spread has one (too few repeats or identical runs
+    size no band); only such a cell can be listed as a known-unverified exception.
+    """
+    if any(e["relative_band"] is None for e in unverified):
+        return
+    widest = max(unverified, key=lambda e: e["relative_band"])
+    cell.update(band=widest["relative_band"], band_pair=f"{widest['cell']} {widest['metric']}")
 
 
 def _median_of(rows, field):
@@ -806,7 +947,7 @@ def compare_exit_code(cells):
     verdicts = [cell["verdict"] for cell in cells if cell["verdict"] != receipts.NEW]
     if any(v in receipts.FAILING_VERDICTS for v in verdicts):
         return 1
-    if not verdicts or any(v not in receipts.COMPARED_VERDICTS for v in verdicts):
+    if not verdicts or any(v not in receipts.COMPARED_VERDICTS | {receipts.KNOWN_UNVERIFIED} for v in verdicts):
         return 2
     return 0
 
@@ -820,6 +961,15 @@ def _gib(b):
 
 def _num(x, fmt="{:.1f}"):
     return fmt.format(x) if isinstance(x, (int, float)) else "-"
+
+
+def _memory_gib(row, kind):
+    """A row's `kind` ("vram" or "rss") memory in GiB at inference, the peak after the load and the warmup (memory_phases.py),
+    with the load peak in parentheses; "incl. load" marks a row whose series shows no boundary, so its lifetime peak is shown."""
+    phases = memory_phases.memory_phases(row, memory_phases.warmup_iters(BENCH_ROOT / "manifest.toml"))
+    if phases is None:
+        return f"{_gib(row.get(f'peak_{kind}_bytes'))} incl. load"
+    return f"{_gib(phases['inference'][f'{kind}_bytes'])} (load {_gib(phases['load'][f'{kind}_bytes'])})"
 
 
 def render_curve(grp):
@@ -872,7 +1022,7 @@ def render_report(env, rows):
     for (model, scenario), grp in sorted(groups.items()):
         lines += [f"## {model} - {scenario}", "",
                   "| framework | precision | status | TTFT ms | TPOT ms | decode tok/s | "
-                  "peak VRAM GiB | peak RSS GiB | peak power W | energy Wh | notes |",
+                  "GPU GiB at inference | host GiB at inference | peak power W | energy Wh | notes |",
                   "|---|---|---|---|---|---|---|---|---|---|---|"]
         for r in sorted(grp, key=lambda x: x["framework"]):
             if r["status"] == "ok":
@@ -880,7 +1030,7 @@ def render_report(env, rows):
                 lines.append(
                     f"| {_framework_label(r)} | {r['precision']} | ok | {_num(r.get('ttft_ms'))} | "
                     f"{_num(r.get('tpot_ms'))} | {_num(r.get('decode_tok_s'))} | "
-                    f"{_gib(r.get('peak_vram_bytes'))} | {_gib(r.get('peak_rss_bytes'))} | "
+                    f"{_memory_gib(r, 'vram')} | {_memory_gib(r, 'rss')} | "
                     f"{_num(r.get('peak_power_w'))} | {_num(r.get('energy_wh'), '{:.3f}')} | {notes} |")
             else:
                 lines.append(
@@ -891,8 +1041,10 @@ def render_report(env, rows):
     # Footer.
     lines += ["---", "",
               "_Memory numbers come from one external sampler (total device VRAM, process-tree RSS) under "
-              "the one-engine-per-GPU assumption. Peak power W and energy Wh come from the same sampler "
-              "(NVML board power draw, integrated over wall-clock time); NVIDIA-only, omitted elsewhere. "
+              "the one-engine-per-GPU assumption. Memory is the peak at inference, after the model is loaded and the warmup "
+              "request has run, cut from the 1 Hz trace stored with the run; the load peak is in parentheses, and \"incl. load\" "
+              "marks a run whose trace shows no load boundary (its lifetime peak). Peak power W and energy Wh come from the same sampler "
+              "(NVML board power draw, or amdgpu hwmon power on AMD, integrated over wall-clock time); omitted when the device exposes none. "
               "Timing comes from each runner. Cells with a precision or "
               "format mismatch vs the matched target carry a note; vLLM VRAM reflects its KV-pool "
               "reservation unless run at a low gpu_memory_utilization. See benchmarks/README.md._"]
@@ -918,15 +1070,17 @@ def render_compare(baseline_dirs, candidate_dirs, cells):
     lines = ["# benchmark diff", "",
              *(f"- baseline: `{d}`" for d in baseline_dirs),
              *(f"- candidate: `{d}`" for d in candidate_dirs), "",
-             f"A cell is (model, scenario, framework, backend, device) and needs {NOISE_REPEATS} runs per "
-             "side. tok/s is the median +/- the range (max - min) over those runs. Every required pair (the "
+             f"A cell is (model, scenario, framework, backend, device, host CPU, GPU driver) and needs "
+             f"{NOISE_REPEATS} runs per side; hardware a run did not record is shown as `-` and is never pooled with "
+             "hardware it did. tok/s is the median +/- the range (max - min) over those runs. Every required pair (the "
              "headline and each curve point's TPOT and TTFT) is judged against a band of twice the larger "
-             "range, within the manifest's uncertainty limits; the verdict is the most serious pair.", "",
-             "| model | scenario | framework | backend | device | runs A/B | tok/s A | tok/s B | delta % | "
+             "robust noise (2.33 interquartile-range sigmas at the minimum repeats, narrowing as 1 / sqrt(n)), "
+             "within the manifest's uncertainty limits; the verdict is the most serious pair.", "",
+             "| model | scenario | framework | backend | device | host CPU | driver | runs A/B | tok/s A | tok/s B | delta % | "
              "verdict | build A | build B | VRAM A GiB | VRAM B GiB |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for cell in cells:
-        model, scenario, framework, backend, device = cell["key"]
+        model, scenario, framework, backend, device, host_cpu, driver = cell["key"]
         delta = (
             f"{100.0 * (cell['median_b'] - cell['median_a']) / cell['median_a']:+.1f}"
             if cell["median_a"] and cell["median_b"] is not None else "-"
@@ -934,6 +1088,7 @@ def render_compare(baseline_dirs, candidate_dirs, cells):
         verdict = cell["verdict"] + (f" ({cell['note']})" if cell["note"] else "")
         lines.append(
             f"| {model} | {scenario} | {framework} | {backend or '-'} | {device or '-'} | "
+            f"{host_cpu or '-'} | {driver or '-'} | "
             f"{cell['n_a']}/{cell['n_b']} | {_band(cell['median_a'], cell['range_a'])} | "
             f"{_band(cell['median_b'], cell['range_b'])} | {delta} | {verdict} | "
             f"{', '.join(_short_sha(b) for b in cell['builds_a']) or '-'} | "
@@ -964,6 +1119,9 @@ def main():
     r.add_argument("--repeats", type=int, default=1, metavar="N",
                    help="run the whole matrix N times, one run directory per repeat (`<run-id>-r1` ...); "
                         f"`compare` needs {NOISE_REPEATS} repeats of a side")
+    r.add_argument("--skip-repeats", metavar="N,N",
+                   help="repeat numbers not to run (their sets exist from an earlier pod); the others keep their "
+                        "`<run-id>-rN` names so all repeats stay one set")
     r.add_argument("--diagnostic", action="store_true",
                    help="run the poot runner with device timing (--profile) and store the run under "
                         "results/diagnostics/: where the time goes, never throughput evidence")
@@ -992,6 +1150,8 @@ def main():
     cc.add_argument("--results-dir")
     cc.add_argument("--candidate", nargs="*", default=[], metavar="RUN_DIR",
                     help=f"run directories of the candidate: repeats of one matrix, at least {NOISE_REPEATS}")
+    cc.add_argument("--known-unverified",
+                    help="the reviewed list of committed cells that stay unverified (default: known-unverified.toml next to the results directory)")
     cc.set_defaults(func=cmd_compare_committed)
 
     ix = sub.add_parser("index", help="regenerate results/INDEX.md from all snapshots (progress view)")

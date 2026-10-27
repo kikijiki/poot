@@ -3,7 +3,7 @@
 
 use poot_kernel_ir::{BinOp, Local, Ty};
 
-use crate::emit::{Emit, bin, copy, emit_read_bits};
+use crate::emit::{Emit, bin, copy, emit_read_bits, emit_read_windows};
 
 /// One source buffer of `u32` words. `slab_bit` is the bit offset of the slab (one expert's copy of this
 /// source in a stacked table, [`poot_quant::PackedWeight::slab_words`] words per expert) that every read
@@ -30,5 +30,15 @@ impl Source {
             None => bit,
         };
         emit_read_bits(e, self.words, bit, width)
+    }
+
+    /// `chunks` consecutive 32-bit windows starting at bit `bit` of this source's slab
+    /// ([`emit_read_windows`]).
+    pub(crate) fn read_windows(self, e: &mut Emit, bit: Local, chunks: usize) -> Vec<Local> {
+        let bit = match self.slab_bit {
+            Some(slab) => bin(e, Ty::Usize, BinOp::Add, copy(slab), copy(bit)),
+            None => bit,
+        };
+        emit_read_windows(e, self.words, bit, chunks)
     }
 }

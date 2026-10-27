@@ -36,7 +36,6 @@ use std::sync::Arc;
 
 use poot_executor::NoLate;
 use poot_models::io::{InputSet, ProgramId, RequestInputs};
-use poot_models::model::StepShape;
 
 use super::bind::{self, RequestFrame, RowFeed, Side, StepColumns};
 use super::chunks::Piece;
@@ -300,10 +299,9 @@ impl<S: State> Driver<S> {
             chain: 0,
             role: ModelRole::Beam,
             program: Program::Step,
-            shape: StepShape::new(
+            shape: self.settings.step_shape(
                 rows,
                 NonZeroUsize::new(tokens).expect("a step carries a token"),
-                self.settings.options.capacity,
             ),
             head: Head::Logits,
             adapters: None,

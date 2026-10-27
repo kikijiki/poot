@@ -22,7 +22,7 @@ use super::helpers::*;
 use poot_test_util::{assert_close_rel, max_abs_error};
 
 /// Stage one flash-attention `op` over `[q, k, v, mask]`. Card 557: `Builder` has no method for a
-/// composite (`compile`'s `flash_attention_capped` forms it from the traced chain), so a test of the
+/// composite (`compile`'s `flash_attention` forms it from the traced chain), so a test of the
 /// op's own eval stages it through an append plan, as `e4m3_per_channel.rs` stages a
 /// `PackedContraction`.
 fn stage_flash(b: &Builder, op: OpKind, [q, k, v, mask]: [Traced; 4]) -> Traced {

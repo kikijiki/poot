@@ -240,6 +240,84 @@ fn a_paged_decode_of_the_real_qwen2_config_dispatches_no_gather_or_transpose_of_
     }
 }
 
+/// The threads every launch of an equation donated in place launches and the watchdog weight the planner gives
+/// them, in equation order: the state writes of a step (the contiguous K/V appends of a decode).
+fn in_place_write_launches(program: &Program) -> Vec<(u128, u64)> {
+    let donated = &program.state_commit().inplace;
+    program
+        .graph()
+        .eqns()
+        .iter()
+        .zip(program.plans())
+        .filter(|(eqn, _)| donated.contains_key(&eqn.out))
+        .map(|(_, plan)| {
+            let threads = plan
+                .dispatches()
+                .iter()
+                .map(|dispatch| {
+                    dispatch
+                        .launch()
+                        .grid
+                        .iter()
+                        .map(|&extent| u128::from(extent))
+                        .product::<u128>()
+                })
+                .sum();
+            let work = plan
+                .dispatches()
+                .iter()
+                .map(|dispatch| dispatch.work())
+                .sum();
+            (threads, work)
+        })
+        .collect()
+}
+
+/// POOT-1389: a decode step's state writes cost what they write, not what the state holds. Every K/V append of
+/// the real Qwen3-0.6B decode graph is donated to its cache and launches the same threads at a 256- and an
+/// 8320-position cache (the capacity A/B POOT-1388 timed at 10.2 vs 28.9 ms per token on ROCm), on every
+/// planner family, and no more threads than the token's own K/V row. The watchdog weight follows: an append
+/// weighs the threads it launches, not the cache it lands in.
+///
+/// Mutation: plan a donated `DynamicUpdateSlice` with the copy form (in `plan_graph`'s update phase, add
+/// `&& eqn.out != eqn.out` to the `state_commit.inplace` test); each write launches one thread per cache element
+/// and the row goes red with "SpirvVulkan: a KV append's launch depends on the cache capacity" (263168 threads
+/// per append at capacity 256, 8520704 at 8320). Dropping `in_place_work` in `plan_eqn_views_impl` (the weight
+/// falls back to the output element count) fails the weight row the same way.
+#[test]
+fn a_decode_steps_kv_appends_launch_independently_of_the_cache_capacity() {
+    let (layers, kv_row) = (28usize, 8 * 128);
+    for backend in [
+        Backend::SpirvVulkan,
+        Backend::Nvptx,
+        Backend::AmdGcn(AmdArch::gfx1151()),
+    ] {
+        let [small, large] = [256usize, 8320].map(|cap| {
+            in_place_write_launches(&compiled(&real_decode_graph(qwen3_0_6b(), cap), backend))
+        });
+        assert_eq!(
+            small.len(),
+            2 * layers,
+            "{backend:?}: one donated K and V append per layer"
+        );
+        assert_eq!(
+            small, large,
+            "{backend:?}: a KV append's launch depends on the cache capacity"
+        );
+        for &(threads, work) in &small {
+            assert!(
+                threads < 2 * kv_row as u128,
+                "{backend:?}: an append launches {threads} threads for a {kv_row}-element row"
+            );
+            assert_eq!(
+                u128::from(work),
+                threads,
+                "{backend:?}: an append weighs what it launches"
+            );
+        }
+    }
+}
+
 /// A copy of `g` with every renamable named value renamed by `rename(value_index, old_name)`. Ids, shapes,
 /// storage and equations are untouched, so only the strings differ. A mapped weight and a keyed slot have no
 /// name to vary: their spelling is their identity.

@@ -1,6 +1,7 @@
 # Deliberately unlisted rows of `just test-device-vulkan`, one per line: binary_id<TAB>test_name<TAB>reason.
 # A row the lane runs and passes that is in neither vulkan.txt nor here fails scripts/check-required-cases.py;
 # a row that prints a skip report fails whether listed or not. Sorted in canonical (LC_ALL=C) order; every row must run in the lane or the gate fails.
+poot-vulkan-runtime	context::graph::length_tests::kernel_lengths_past_u32_are_a_typed_refusal	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	context::init::launch_caps_tests::a_fixed_size_and_a_missing_feature_are_reported_as_such	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	context::init::launch_caps_tests::launch_caps_carry_the_reported_limits_and_the_subgroup_range	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	context::select::tests::a_device_without_a_compute_queue_is_skipped	raw Vulkan runtime row; selected by package so none goes unrun

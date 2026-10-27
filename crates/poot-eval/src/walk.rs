@@ -1379,11 +1379,15 @@ fn evaluate_dense(
         }
         OpKind::ScatterUpdate => {
             let base = get(&eqn.inputs[0])?;
-            let src = get(&eqn.inputs[1])?;
+            // An f32 source written into a two-byte buffer is stored narrowed (`stores_as`).
+            let src = ops::cast::store_as(get(&eqn.inputs[1])?, base.dtype())?;
             let slots = get(&eqn.inputs[2])?;
             ops::movement::scatter_update(&base, &src, &slots, &out_shape, eqn.out)?
         }
         OpKind::ArgTopK { k } => ops::index::arg_top_k(&get(&eqn.inputs[0])?, *k, eqn.out)?,
+        OpKind::ExpertGroup { experts } => {
+            ops::index::expert_group(&get(&eqn.inputs[0])?, *experts)?
+        }
         OpKind::Iota { len, dtype } => ComputedConst::Iota {
             len: *len,
             dtype: *dtype,
@@ -1402,7 +1406,8 @@ fn evaluate_dense(
         }
         OpKind::DynamicUpdateSlice { axis } => {
             let operand = get(&eqn.inputs[0])?;
-            let update = get(&eqn.inputs[1])?;
+            // An f32 update written into a two-byte buffer is stored narrowed (`stores_as`).
+            let update = ops::cast::store_as(get(&eqn.inputs[1])?, operand.dtype())?;
             let index_t = get(&eqn.inputs[2])?;
             let index_value = match index_t.data() {
                 HostData::I32(words) => ops::index_rule::IndexValue::I32(words[0]),

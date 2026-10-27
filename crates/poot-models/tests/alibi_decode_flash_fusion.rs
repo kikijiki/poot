@@ -1,5 +1,5 @@
 //! Card 259 fusion pass: the flash-attention matcher's mask-shape gate admits the per-head
-//! `[B,Hq,1,cap]` / `[1,Hq,L,L]` shapes as well as the broadcast ones, so `flash_attention_capped`
+//! `[B,Hq,1,cap]` / `[1,Hq,L,L]` shapes as well as the broadcast ones, so `flash_attention`
 //! fuses the decomposed ALiBi decode chain to one `Attention` per layer without changing
 //! the logits.
 //!
@@ -10,7 +10,7 @@
 use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::{Graph, Slot, Storage};
-use poot_graph_plan::{cse, dce, flash_attention_capped};
+use poot_graph_plan::{cse, dce, flash_attention};
 use poot_models::model::{LogitRows, StepSpec};
 use poot_models::registry::Registry;
 use poot_models::test_support::dense::step;
@@ -135,7 +135,7 @@ fn bind(
                 let values = fill(numel, 91).into_iter().map(|v| v * gain).collect();
                 HostTensor::f32(m.aval.shape.clone(), values)
             }
-            Storage::State => HostTensor::zeros(m.aval.shape.clone()),
+            Storage::State => HostTensor::zeros_of(m.aval.dtype, m.aval.shape.clone()),
             Storage::Device => continue,
         };
         inputs.insert(id, Value::from(t));
@@ -182,7 +182,7 @@ fn count(g: &Graph, is: fn(&OpKind) -> bool) -> usize {
 fn alibi_decode_chain_fuses_to_flash_without_changing_logits() {
     let (pos, cap) = (3usize, 8usize);
     let g = mpt_graph(1, cap);
-    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap().0).unwrap();
+    let fused = dce(&flash_attention(&cse(&g).unwrap()).unwrap().0).unwrap();
     let n_flash = count(&fused, |op| matches!(op, OpKind::Attention(_)));
     assert_eq!(
         n_flash, LAYERS,
@@ -215,7 +215,7 @@ fn alibi_decode_chain_fuses_to_flash_without_changing_logits() {
 fn alibi_prefill_chain_fuses_to_flash_without_changing_logits() {
     let l = 5usize;
     let g = mpt_graph(l, l);
-    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap().0).unwrap();
+    let fused = dce(&flash_attention(&cse(&g).unwrap()).unwrap().0).unwrap();
     let n_flash = count(&fused, |op| matches!(op, OpKind::Attention(_)));
     assert_eq!(
         n_flash, LAYERS,

@@ -12,7 +12,8 @@
 //! o      = S^T (q / sqrt(head_dim))
 //! ```
 //!
-//! The output is `rmsnorm(o, scale) * silu(z)` and the output projection. The state is a
+//! The output is `rmsnorm(o, scale) * gate(z)` (`gate` is [`OutputGate`]: SiLU, or sigmoid for
+//! Qwen4Exp) and the output projection. The state is a
 //! `[head_dim, head_dim]` matrix per value head carried across steps, and the conv carries its input
 //! window ([`super::conv::causal_conv`]), so a chunk continues the previous one exactly and one token
 //! is a decode step. A single token runs the recurrence ([`ops::gated_delta_net_decode`]); more run
@@ -58,6 +59,28 @@ impl GdnHeadOrder {
         match self {
             Self::Tiled => Ok(ops::repeat_kv_tiled(b, x, n_rep)?),
             Self::Grouped => Ok(ops::repeat_kv(b, x, n_rep)?),
+        }
+    }
+}
+
+/// The activation of the output gate `z` that multiplies the normed recurrence output.
+///
+/// It belongs to the architecture: Qwen3-Next and Qwen3.5 gate with SiLU, Qwen4Exp (HF
+/// `output_gate_type: "sigmoid"`; llama.cpp's `qwen4exp` `build_norm_gated`) with a sigmoid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputGate {
+    /// `z * sigmoid(z)`.
+    #[default]
+    Silu,
+    /// `sigmoid(z)`.
+    Sigmoid,
+}
+
+impl OutputGate {
+    fn apply(self, b: &Builder, z: Traced) -> Result<Traced, TraceError> {
+        match self {
+            Self::Silu => Ok(ops::silu(b, z)?),
+            Self::Sigmoid => Ok(ops::sigmoid(b, z)?),
         }
     }
 }
@@ -130,6 +153,7 @@ pub struct GdnParams {
     chunk: usize,
     fused_projections: bool,
     log_decay: bool,
+    output_gate: OutputGate,
 }
 
 impl GdnParams {
@@ -155,6 +179,7 @@ impl GdnParams {
             chunk: DEFAULT_CHUNK,
             fused_projections: false,
             log_decay: false,
+            output_gate: OutputGate::Silu,
         })
     }
 
@@ -171,6 +196,14 @@ impl GdnParams {
     pub fn with_log_decay(self) -> Self {
         Self {
             log_decay: true,
+            ..self
+        }
+    }
+
+    /// The output gate's activation, SiLU unless the architecture says otherwise.
+    pub fn with_output_gate(self, output_gate: OutputGate) -> Self {
+        Self {
+            output_gate,
             ..self
         }
     }
@@ -385,6 +418,7 @@ struct Recurrence {
     order: GdnHeadOrder,
     eps: f32,
     chunk: usize,
+    output_gate: OutputGate,
 }
 
 /// The recurrence and the gated norm over the conv's SiLU output.
@@ -413,6 +447,7 @@ fn gdn_scan(
         order,
         eps,
         chunk,
+        output_gate,
     } = *recurrence;
     let d = &d;
     let shape = b.aval(conv_out)?.shape;
@@ -479,7 +514,7 @@ fn gdn_scan(
     };
 
     let normed = ops::rmsnorm(b, o, norm_scale, eps)?;
-    let gate = ops::silu(b, heads_first(b, z, hv, hd)?)?;
+    let gate = output_gate.apply(b, heads_first(b, z, hv, hd)?)?;
     let gated = b.binary(BinOp::Mul, normed, gate)?;
     let flat = b.reshape(
         b.transpose(gated, vec![0, 2, 1, 3])?,
@@ -543,6 +578,7 @@ pub fn gdn(
             order: p.order,
             eps: p.norm.eps(),
             chunk: p.chunk,
+            output_gate: p.output_gate,
         },
     )?;
     step.carry_recurrent(b, state, next)?;
@@ -574,12 +610,13 @@ mod tests {
     const CHUNK: usize = 4;
 
     /// One checkpoint spelling of a layer: the head order, whether the projections are fused and
-    /// whether the stored decay is `A_log`.
+    /// whether the stored decay is `A_log`, and the output gate's activation.
     #[derive(Clone, Copy, Debug)]
     struct Case {
         order: GdnHeadOrder,
         fused: bool,
         log_decay: bool,
+        gate: OutputGate,
     }
 
     /// A GGUF layer: tiled heads, separate projections, the decay itself.
@@ -587,18 +624,26 @@ mod tests {
         order: GdnHeadOrder::Tiled,
         fused: false,
         log_decay: false,
+        gate: OutputGate::Silu,
+    };
+    /// A Qwen4Exp GGUF layer: the GGUF spelling with the sigmoid output gate.
+    const GGUF_SIGMOID: Case = Case {
+        gate: OutputGate::Sigmoid,
+        ..GGUF
     };
     /// An HF `qwen3_next` layer: grouped heads, fused projections, `A_log`.
     const HF: Case = Case {
         order: GdnHeadOrder::Grouped,
         fused: true,
         log_decay: true,
+        gate: OutputGate::Silu,
     };
     /// Separate projections over grouped heads (Qwen3.5).
     const HF_SPLIT: Case = Case {
         order: GdnHeadOrder::Grouped,
         fused: false,
         log_decay: true,
+        gate: OutputGate::Silu,
     };
 
     fn id(role: GdnRole) -> WeightId {
@@ -616,7 +661,8 @@ mod tests {
         )
         .unwrap()
         .with_chunk(CHUNK)
-        .unwrap();
+        .unwrap()
+        .with_output_gate(c.gate);
         if c.fused {
             p = p.with_fused_projections();
         }
@@ -833,8 +879,12 @@ mod tests {
                     / (o.iter().map(|x| x * x).sum::<f64>() / HEAD_DIM as f64 + f64::from(EPS))
                         .sqrt();
                 for e in 0..HEAD_DIM {
-                    o_flat[j * HEAD_DIM + e] =
-                        o[e] * inv * f64::from(norm_w[e]) * silu(z[j * HEAD_DIM + e]);
+                    let z = z[j * HEAD_DIM + e];
+                    let gate = match c.gate {
+                        OutputGate::Silu => silu(z),
+                        OutputGate::Sigmoid => 1.0 / (1.0 + (-z).exp()),
+                    };
+                    o_flat[j * HEAD_DIM + e] = o[e] * inv * f64::from(norm_w[e]) * gate;
                 }
             }
             out.extend(matvec(&v(GdnRole::Out), WIDTH, &o_flat));
@@ -857,7 +907,7 @@ mod tests {
     /// and the chunked form's gate), or swap the head order in `GdnHeadOrder::expand`; each goes red.
     #[test]
     fn the_mixer_matches_the_recurrence_and_continues_across_chunks_for_every_spelling() {
-        for c in [GGUF, HF, HF_SPLIT] {
+        for c in [GGUF, GGUF_SIGMOID, HF, HF_SPLIT] {
             let fx = fixture(c);
             let x = inputs();
             let (want, window, state) = reference(&fx, c, &x);
@@ -893,6 +943,19 @@ mod tests {
                 oracle::assert_differs(&run(&perturbed, c, &x, 0, &[]).out, &whole.out, id(role));
             }
         }
+    }
+
+    /// The output gate is a different layer: the same weights give different outputs gated by SiLU
+    /// and by a sigmoid, and each equals its own hand-written reference (the case loop above), so a
+    /// family that picked the wrong gate could not pass its reference. Mutation: ignore the gate in
+    /// `gdn` (always SiLU); this and the Qwen4Exp whole-model references go red, Qwen3-Next's stay green.
+    #[test]
+    fn the_output_gate_changes_the_output() {
+        let fx = fixture(GGUF);
+        let x = inputs();
+        let silu = run(&fx, GGUF, &x, 0, &[]).out;
+        let sigmoid = run(&fx, GGUF_SIGMOID, &x, 0, &[]).out;
+        oracle::assert_differs(&sigmoid, &silu, id(GdnRole::Z));
     }
 
     /// The head order is a different layer: the same weights give different outputs tiled and

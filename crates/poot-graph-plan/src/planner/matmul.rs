@@ -2,18 +2,15 @@
 
 use super::{
     BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, FusedOperand,
-    FusedRegion, Graph, ImportedKernel, KernelRequest, MatmulShapes, OpKind, Operand, PlanError,
-    Planned, Scalar, Ty, ValueId, WeightLayout, fty_ty, kg, out_numel_saturating, value_ids,
-};
-use crate::dtype_widen::{
-    matmul_amd_tc_eligible, matmul_nvptx_tc_eligible, matmul_spirv_coopmat_eligible,
+    FusedRegion, Graph, KernelRequest, MatmulShapes, OpKind, Operand, PlanError, Planned, Scalar,
+    ValueId, WeightLayout, fty_ty, kg, out_numel_saturating, value_ids,
 };
 use crate::kernel_mapping::{check_widening_step, float_region_leaf_storage, map_fused_op};
 use crate::planner::{GraphTables, StorageDtypes};
 use crate::predicates::{
-    GEMV_WIDTH, IMPORTED_TILED_GEMM_TILE, decode_gemv_plan, elementwise_fold,
-    indexed_matmul_lowers, is_batched_tiled_gemm_in, is_decode_attn_gemv_in, is_decode_gemv_in,
-    is_tileable_matmul_in, is_tiled_gemm_in, packed_contraction_m_per_block, tiled_gemm_plan,
+    GEMV_WIDTH, decode_gemv_plan, indexed_matmul_lowers, is_batched_tileable_matmul_in,
+    is_decode_attn_gemv_in, is_decode_gemv_in, is_tileable_matmul_in,
+    packed_contraction_m_per_block, serial_matmul_fold,
 };
 use crate::refusal::{FusedStepGap, Site};
 use poot_graph_ir::{ContractionRows, LocalId};
@@ -66,37 +63,23 @@ pub(super) fn folded_tile_grid(
 }
 
 /// How a plain `MatMul` is lowered. The one decision [`plan`] and the contraction-epilogue fuse rule
-/// ([`epilogue_head_lowers`]) share, so a head fuses exactly when the serial kernel is its plan anyway.
+/// ([`epilogue_head_lowers`]) share, so a head fuses exactly when the serial kernel is its plan anyway. Every
+/// route is a generated contraction: the request in the plan's `KernelChoice` is the route, and the launch
+/// shaping reads that, not a second derivation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MatMulRoute {
-    /// The generated tiled GEMM (`kg::tiled_region`) over an f32 `[K, N]` weight.
+    /// The register-tiled GEMM (`kg::DenseTiledWeight::KnF32`) over an f32 `[K, N]` weight shared by every row.
     Tileable,
+    /// The register-tiled GEMM with a `[K, N]` weight slab per batch entry (block): the per-expert MoE GEMM and
+    /// the prefill attention matmuls.
+    BatchedTileable,
     /// The decode GEMV (`M == 1`, rank-2 `[K, N]` f32 weight). A BF16 `[K, N]` weight lands here too and is
     /// refused by the mixed-dtype guard in `plan_eqn`: its only lowering is the dense Gemv over `[N, K]`.
     DecodeGemv,
-    /// RDNA3 WMMA tensor cores (bf16 operands, 16-aligned dims).
-    AmdTensorCore,
-    /// NVPTX WMMA tensor cores.
-    NvptxTensorCore,
-    /// RADV cooperative matrix.
-    Coopmat,
-    /// The imported tiled GEMM (wgpu prefill).
-    TiledGemm,
-    /// The imported batched tiled GEMM.
-    BatchedTiledGemm,
     /// The decode attention `scores @ V` GEMV.
     AttnGemv,
     /// The one-thread-per-output kernel every other `MatMul` lands on.
     Serial,
-}
-
-/// A `MatMul`'s route and whether its mixed operand/output dtypes have a lowering on it.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct RoutedMatMul {
-    pub(super) route: MatMulRoute,
-    /// A mixed operand and output dtype pairing lowers only through the tensor-core kernels and the coopmat
-    /// kernel.
-    pub(super) lowers_mixed_dtypes: bool,
 }
 
 /// Choose `eqn`'s `MatMul` route.
@@ -105,73 +88,25 @@ pub(super) fn matmul_route(
     eqn: &Eqn,
     out_shape: &[usize],
     out_numel: usize,
-    odt: DType,
     caps: &DeviceCaps,
-) -> RoutedMatMul {
-    let ids = value_ids(eqn);
-    let tileable = RoutedMatMul {
-        route: MatMulRoute::Tileable,
-        lowers_mixed_dtypes: false,
-    };
-    if is_tileable_matmul_in(g, eqn) {
-        return tileable;
-    }
-    let a = g.aval(ids[0]).shape.clone();
-    let r = out_shape.len();
-    let (mm, nn, kk) = (out_shape[r - 2], out_shape[r - 1], a[a.len() - 1]);
-    // spec 025: on NVPTX, a bf16 matmul whose M, N, K are all 16-aligned runs on tensor cores
-    // (WMMA m16n16k16). Otherwise (SPIR-V, f32, or a non-aligned dim) the serial kernel is the
-    // reference + fallback. The `tc:` cache tag keeps the tensor-core kernel from colliding with it.
-    // spec 130 FR-004: on AmdGcn, a bf16 matmul with 16-aligned M/N/K (any batch dims) runs on
-    // AMD WMMA tensor cores (RDNA3: llvm.amdgcn.wmma.*). Gate on Wmma16x16x16Rdna3 only; CDNA
-    // (gfx9xx / CdnaMfma) and unknown arch fall through to the serial imported kernel. Gate on
-    // operand dtype, not output dtype: for mixed-precision matmul (bf16 operands, f32 output)
-    // the output dtype is F32, so odt-gating would skip the tensor-core path. matmul_tensorcore
-    // always reads bf16 inputs; `dt` only controls the output/epilogue.
-    // spec 135: F16 deliberately does not join this operand-dtype gate. `matmul_tensorcore` (both
-    // the AMD WMMA and NVPTX `tc` arms) hard-codes BF16 tensor-core fragment loads; F16 and
-    // BF16 are different 2-byte bit layouts, so routing F16 operands through it would reinterpret
-    // f16 bits as bf16 (wrong numerics, not a crash). F16 tensor-core lowering is card 154
-    // (blocked on the SPIR-V/Vulkan coopmat path). A whole-graph F16 matmul (odt = F16) falls
-    // through the `operands_bf16 == false` gate to the serial `matmul_batched_dt` fallback, which is
-    // dtype-generic (`fty(odt) = Ty::F16`).
-    // Card 235: factored into `dtype_widen::matmul_{amd_tc,nvptx_tc}_eligible` so the
-    // widen-mismatched-dtype-operand transform reuses the same eligibility decision.
-    let (a_dt, b_dt) = (g.aval(ids[0]).dtype, g.aval(ids[1]).dtype);
-    let amd_tc = matmul_amd_tc_eligible(caps, a_dt, b_dt, mm, nn, kk);
-    let tc = matmul_nvptx_tc_eligible(caps, a_dt, b_dt, mm, nn, kk);
-    // Card 154: RADV cooperative-matrix (SPIR-V/Vulkan tensor cores). F16 operands (RADV has no
-    // VK_KHR_shader_bfloat16), 16-aligned M/N/K, any batch dims (see `matmul_spirv_coopmat_eligible`). F32
-    // output only (config 13 has no f16-accumulate variant).
-    let coopmat = odt == DType::F32 && matmul_spirv_coopmat_eligible(caps, a_dt, b_dt, mm, nn, kk);
-    let lowers_mixed_dtypes = amd_tc || tc || coopmat;
-    let route = if is_decode_gemv_in(g, eqn, out_shape, out_numel, caps) {
+) -> MatMulRoute {
+    if is_decode_gemv_in(g, eqn, out_shape, out_numel, caps) {
         MatMulRoute::DecodeGemv
-    } else if amd_tc {
-        MatMulRoute::AmdTensorCore
-    } else if tc {
-        MatMulRoute::NvptxTensorCore
-    } else if coopmat {
-        MatMulRoute::Coopmat
-    } else if is_tiled_gemm_in(g, eqn, out_shape, out_numel, caps) {
-        MatMulRoute::TiledGemm
-    } else if is_batched_tiled_gemm_in(g, eqn, out_shape, out_numel, caps) {
-        MatMulRoute::BatchedTiledGemm
+    } else if is_tileable_matmul_in(g, eqn) {
+        MatMulRoute::Tileable
+    } else if is_batched_tileable_matmul_in(g, eqn) {
+        MatMulRoute::BatchedTileable
     } else if is_decode_attn_gemv_in(g, eqn, out_shape, out_numel, caps) {
         MatMulRoute::AttnGemv
     } else {
         MatMulRoute::Serial
-    };
-    RoutedMatMul {
-        route,
-        lowers_mixed_dtypes,
     }
 }
 
 /// Whether `eqn`, a contraction head, has an epilogue lowering that is also the plan it would get without one:
 /// the epilogue fuse rule forms a [`OpKind::ContractionEpilogue`] only over such a head, so no head loses a faster schedule (a tensor-core,
 /// tiled or decode-GEMV `MatMul`) to gain a fused store. The generated Gemv, serial and tiled bodies carry an
-/// epilogue; a `MatMul` head's fragment, GEMV and imported schedules do not.
+/// epilogue; a `MatMul` head's fragment, GEMV and batched-weight tiled schedules do not.
 pub(crate) fn epilogue_head_lowers(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> bool {
     let tables = GraphTables::from(g);
     let out_shape = &g.aval(eqn.out).shape;
@@ -180,22 +115,14 @@ pub(crate) fn epilogue_head_lowers(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> b
         OpKind::MatMul { .. } => {
             out_shape.len() >= 2
                 && matches!(
-                    matmul_route(
-                        tables,
-                        eqn,
-                        out_shape,
-                        out_numel,
-                        g.aval(eqn.out).dtype,
-                        caps,
-                    )
-                    .route,
+                    matmul_route(tables, eqn, out_shape, out_numel, caps),
                     MatMulRoute::Tileable | MatMulRoute::Serial
                 )
         }
         // A dense head takes the generated Gemv at `M == 1` and the generated tiled GEMM above it, and both carry
         // an epilogue, so every dense head lowers (the weight dtypes the dense planner admits).
         OpKind::DenseContraction { .. } => true,
-        // Every indexed schedule (Gemv and segmented Tiled) carries an epilogue.
+        // Every indexed schedule (Gemv and the register-tiled expert walk) carries an epilogue.
         OpKind::IndexedMatMul => indexed_matmul_lowers(tables, eqn),
         // The packed Gemv (one activation row per block) carries an epilogue; the block-diagonal tiled schedule does not.
         OpKind::PackedContraction { descriptor, rows } => {
@@ -210,7 +137,7 @@ pub(crate) fn epilogue_head_lowers(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> b
                     ContractionRows::Blocks(blocks) => {
                         packed_contraction_m_per_block(tables, eqn, *descriptor, *blocks) == 1
                     }
-                    // An indexed table carries an epilogue on both its schedules (Gemv and segmented Tiled).
+                    // An indexed table carries an epilogue on both its schedules (Gemv and the register-tiled expert walk).
                     ContractionRows::Indexed { .. } => true,
                 }
         }
@@ -330,7 +257,7 @@ pub(super) fn plan(
             let (a, b) = (shape(ids[0]), shape(ids[1]));
             let r = out_shape.len();
             let (nn, kk) = (out_shape[r - 1], a[a.len() - 1]);
-            let routed = matmul_route(g, eqn, out_shape, out_numel, odt, caps);
+            let route = matmul_route(g, eqn, out_shape, out_numel, caps);
             let shapes = || MatmulShapes {
                 out_shape: out_shape.to_vec(),
                 a_shape: a.clone(),
@@ -343,126 +270,66 @@ pub(super) fn plan(
                     dt: fty(odt),
                     epilogue: None,
                     shapes: shapes(),
-                    fold: elementwise_fold(g, eqn, out_shape, out_numel, caps),
+                    fold: serial_matmul_fold(out_numel, caps),
                 }))
             };
-            // Every arm below except the tensor-core ones (`amd_tc`/`tc`, which read bf16 operands by
-            // construction) plans a kernel whose single element type `fty(odt)` covers operands and
-            // output. A mixed operand/output matmul (`to_mixed_bf16`: bf16 operands, f32 output) is only
-            // correct when a tensor-core arm fires; on any other route (e.g. AmdGcn with a non-RDNA3 arch
-            // such as CDNA or RDNA4, where `amd_tc` declines and the eqn falls to the serial
-            // `matmul_batched_dt`) the planned f32 kernel would read the 2-byte operand buffers as f32
-            // words: silent garbage plus OOB reads, with a cache key colliding with the actual f32
-            // matmul of the same shapes. Reject by name instead; `to_mixed_bf16` has no
-            // "RDNA3+ hardware" gate of its own to rely on.
-            let operand_dts = (g.aval(ids[0]).dtype, g.aval(ids[1]).dtype);
-            if routed.route != MatMulRoute::Tileable
-                && (operand_dts.0 != odt || operand_dts.1 != odt)
-                && !routed.lowers_mixed_dtypes
-            {
-                // Mixed operand and output dtypes lower only through the tensor-core kernels (bf16
-                // operands, 16-aligned M/N/K, RDNA3 or NVPTX), the SPIR-V coopmat kernel (f16 operands,
-                // 16-aligned M/N/K). A BF16 `[K, N]` decode projection has no lowering and lands here.
+            // Every route plans a kernel whose single element type covers operands and output, so a mixed
+            // operand/output matmul has no lowering: `widen_mismatched_matmul_dtypes` casts every such operand
+            // before planning, and one that reaches here (a BF16 `[K, N]` decode projection) is refused by name
+            // rather than read as f32 words.
+            if ids[..2].iter().any(|&id| g.aval(id).dtype != odt) {
                 return Err(site.refuse(Capability::DtypeLowering));
             }
-            match routed.route {
+            match route {
                 MatMulRoute::Tileable => {
-                    // card 099b / spec 060: the synthesizer generates the tiled-GEMM Body
-                    // element-by-element from the tile descriptor (`kg::tiled_region`) instead of reusing
-                    // a hand-authored kernel. Dims are baked as consts, so this is a plain
-                    // a single plain dispatch (no metadata buffer). f32 / 2-D: `is_tileable_matmul_in` gates the
-                    // shapes (M>1, rank-2 [K,N] weight) and the F32 operands this f32-only body reads.
-                    // `ceil(M/2ts) * ceil(N/ts)` workgroups of `ts*ts` lanes.
-                    tiled_region_plan(
+                    // The register-tiled GEMM over the f32 `[K, N]` weight, staged along `N` (POOT-1403).
+                    // `is_tileable_matmul_in` gates the shapes (M > 1, rank-2 `[K, N]` weight) and the F32
+                    // operands this f32 body reads.
+                    dense_tiled_plan(
                         site,
                         backend,
-                        TiledGemm {
-                            m: out_numel / nn.max(1),
+                        kg::TiledShape {
+                            blocks: 1,
+                            m_per_block: out_numel / nn.max(1),
+                            out_per_block: nn,
                             k: kk,
-                            n: nn,
                             layout: WeightLayout::Kn,
-                            weight: poot_target::BufferStorage::f32(),
+                            segments: 1,
                         },
+                        kg::DenseTiledWeight::KnF32,
+                        None,
+                        caps,
+                    )?
+                }
+                MatMulRoute::BatchedTileable => {
+                    // A[..,M,K] @ B[..,K,N] -> [..,M,N], one block of the register-tiled GEMM per batch entry
+                    // over its own weight slab: E for the MoE per-expert GEMM (rank-3), or B*H for the prefill
+                    // attention matmuls (rank-4). The same body as the shared-weight GEMM, block-major in its
+                    // tile order, so the same dispatch splitting covers it.
+                    dense_tiled_plan(
+                        site,
+                        backend,
+                        kg::TiledShape {
+                            blocks: out_shape[..r - 2].iter().product(),
+                            m_per_block: out_shape[r - 2],
+                            out_per_block: nn,
+                            k: kk,
+                            layout: WeightLayout::Kn,
+                            segments: 1,
+                        },
+                        kg::DenseTiledWeight::KnF32,
                         None,
                         caps,
                     )?
                 }
                 MatMulRoute::DecodeGemv => {
-                    // wgpu decode GEMV (M=1 shared-weight matmul, single-seq or batched): the coalesced
-                    // imported body - one workgroup owns GEMV_TILE output columns and reads
-                    // W[k, col0:col0+TILE] contiguously per k (card 035 raised occupancy with a strided
-                    // per-column workgroup; the stride-N read then dominated decode bandwidth at ~20 GB/s
-                    // vs the ~215 GB/s floor, so the tile-of-columns reshape). Same Body for any batch B
-                    // (B is via the grid / the batched twin). card 044: for single-sequence decode (B=1,
-                    // out_numel == N), dispatch the GEMV authored in Rust and imported by pootc
-                    // (`crates/pootc/tests/kernels/gemv_coalesced.rs`). It is shape-generic
-                    // (k = x.len(), N = out.len()) with the same [x, weight, out] buffers and 2-D grid
-                    // contract as `gemv_lds`, so no dims buffer or executor change is needed. Batched
-                    // decode (B>1) runs the imported batched kernel, with its `dims = [B]` bound as a
-                    // launch metadata buffer (kernelgen bakes B as a const).
-                    // card 258: `decode_gemv_plan` also owns the large-N watchdog-safety chunking
-                    // (SpirvVulkan only); see its doc comment - that arm still generates a `GemvChunk`
-                    // (one workgroup per output element), the shape gate that keeps the old stride-N
-                    // access pattern.
+                    // Decode GEMV (M=1 shared-weight matmul, single-seq or batched): the one generated
+                    // `gemv_lds` body, one workgroup of GEMV_WIDTH lanes per output element, B baked as a
+                    // const and the batch read from the flat output index, so the dispatch binds
+                    // [x, weight, out] with no metadata buffer. `decode_gemv_plan` also owns the large-N
+                    // watchdog-safety chunking (card 258): above the trigger it launches the same body over
+                    // disjoint ranges of the output, never a different body.
                     decode_gemv_plan(site, backend, kk, nn, out_numel, caps)?
-                }
-                MatMulRoute::AmdTensorCore => {
-                    // The tensor-core body bakes one block (8 warps, 256 threads) per 16x16 output tile.
-                    // spec 130 FR-004: AMD WMMA tensor cores (RDNA3 / gfx11xx). For mixed-precision (bf16
-                    // operands -> f32 output), matmul_tensorcore with Ty::F32 uses only WmmaStore
-                    // (AMD-supported), not WmmaStoreLds (NVPTX-only). For pure-bf16 (bf16 operands -> bf16
-                    // output), matmul_tensorcore with Ty::BF16 needs WmmaStoreLds for the f32->bf16 LDS
-                    // narrowing, which is not wired for AMDGPU in emit.rs; fall back to the serial bf16
-                    // kernel.
-                    if odt == DType::F32 {
-                        generate(KernelRequest::Contraction(ContractionSpec::TensorCore {
-                            dt: Ty::F32,
-                            shapes: shapes(),
-                        }))?
-                    } else {
-                        serial()?
-                    }
-                }
-                MatMulRoute::NvptxTensorCore => {
-                    // The NVPTX WMMA body bakes one 256-thread block per 16x16 output tile, per batch
-                    // element (`matmul_nvptx_tc_eligible` allows batch dims, unlike the AMD arm above):
-                    // `batch_count * tiles_m * tiles_n` blocks total (wmma.rs).
-                    generate(KernelRequest::Contraction(ContractionSpec::TensorCore {
-                        dt: fty(odt),
-                        shapes: shapes(),
-                    }))?
-                }
-                MatMulRoute::Coopmat => {
-                    // card 154 / R469-003: RADV coopmat bakes one subgroup (32 invocations) per 16x16
-                    // output tile, not the 256-thread WMMA block above.
-                    generate(KernelRequest::Contraction(ContractionSpec::Coopmat {
-                        shapes: shapes(),
-                    }))?
-                }
-                MatMulRoute::TiledGemm => {
-                    // wgpu prefill tiled GEMM (M>1 shared-weight projection): LDS ts x ts tile reuse so
-                    // each weight element is read O(M/ts) times instead of O(M) (card 035). Split over
-                    // sub-2^15 dispatches above the RADV miscompile threshold (card 096). f32 on
-                    // SpirvVulkan.
-                    tiled_gemm_plan(backend, out_numel / nn.max(1), kk, nn, caps)?
-                }
-                MatMulRoute::BatchedTiledGemm => {
-                    // wgpu batched tiled GEMM: A[..,M,K] @ B[..,K,N] -> [..,M,N], one tiled GEMM per
-                    // batch with per-batch buffer offsets. batch = product of the leading dims: E for the
-                    // MoE per-expert GEMM (rank-3), or B*H for the prefill attention matmuls (rank-4).
-                    // card 044: runs the imported batched-weight coarsened tiled GEMM (per-batch bases).
-                    // Drop-in for kernelgen's `tiled_gemm_dt(b_count>1)`: same grid + buffers; the
-                    // `[E,M,K,N]` it bakes as consts ride in a metadata buffer (launch metadata).
-                    let ec: usize = out_shape[..r - 2].iter().product();
-                    let mm = out_shape[r - 2];
-                    let tile = IMPORTED_TILED_GEMM_TILE;
-                    let groups = mm.div_ceil(2 * tile) * nn.div_ceil(tile);
-                    Planned::imported(
-                        ImportedKernel::TiledGemmBatched,
-                        backend,
-                        Some(vec![ec as u32, mm as u32, kk as u32, nn as u32]),
-                        [(ec * groups * tile * tile) as u32, 1, 1],
-                    )?
                 }
                 MatMulRoute::AttnGemv => {
                     // decode attention scores@V: LDS-parallel reduction over cap (card 143 Lever 1b), the
@@ -507,20 +374,22 @@ pub(super) fn plan(
                 odt,
                 packed_operands,
             )?;
-            if is_tileable_matmul_in(g, eqn) {
+            if matmul_route(g, eqn, out_shape, out_numel, caps) == MatMulRoute::Tileable {
                 // The route `matmul_route` gives the unfused head: the generated tiled GEMM, storing the
                 // epilogue's result per output element.
                 let (a, nn) = (shape(ids[0]), out_shape[out_shape.len() - 1]);
-                return tiled_region_plan(
+                return dense_tiled_plan(
                     site,
                     backend,
-                    TiledGemm {
-                        m: out_numel / nn.max(1),
+                    kg::TiledShape {
+                        blocks: 1,
+                        m_per_block: out_numel / nn.max(1),
+                        out_per_block: nn,
                         k: a[a.len() - 1],
-                        n: nn,
                         layout: WeightLayout::Kn,
-                        weight: poot_target::BufferStorage::f32(),
+                        segments: 1,
                     },
+                    kg::DenseTiledWeight::KnF32,
                     Some(epilogue),
                     caps,
                 );
@@ -533,7 +402,7 @@ pub(super) fn plan(
                     a_shape: shape(ids[0]),
                     b_shape: shape(ids[1]),
                 },
-                fold: elementwise_fold(g, eqn, out_shape, out_numel, caps),
+                fold: serial_matmul_fold(out_numel, caps),
             }))?
         }
         OpKind::Iota { .. } => {
@@ -553,90 +422,125 @@ pub(super) fn plan(
     Ok(planned)
 }
 
-/// One generated tiled GEMM: `m` rows of an `[m, k]` activation against an `n`-column weight read in `layout`
-/// from `weight` storage.
-#[derive(Clone, Copy)]
-pub(super) struct TiledGemm {
-    pub(super) m: usize,
-    pub(super) k: usize,
-    pub(super) n: usize,
-    pub(super) layout: WeightLayout,
-    pub(super) weight: poot_target::BufferStorage,
+/// One dispatch of a register-tiled contraction: its thread grid and metadata buffer (`[K, out_per_block,
+/// m_per_block, x_groups, tile_offset]`).
+pub(super) struct TiledDispatch {
+    pub(super) grid: [u32; 3],
+    pub(super) meta: Vec<u32>,
 }
 
-/// Plan the generated tiled GEMM over `m` rows of an `[m, k]` activation and a weight in `layout`:
-/// `ceil(m/2ts) * ceil(n/ts)` workgroups of `ts*ts` lanes, dims baked as consts (a single plain dispatch, no
-/// metadata buffer), f32 / 2-D. Like `tiled_gemm_plan`, a GEMM at or above
-/// `caps.known_miscompiles.tiled_gemm_max_workgroups` tiles is split into sub-cap dispatches (card 096), each a
-/// baked tile-offset variant covering a disjoint tile range; a device with no confirmed ceiling (`None`) has no
-/// such cap (single dispatch).
-///
-/// `gemm.weight` is the weight buffer's planned storage. The `[K, N]` matmul body reads an f32 weight only; the
-/// checkpoint-order `[N, K]` body also reads a packed-F16 one (Card 1007), decoding it in-register.
-///
-/// `epilogue` (f32) is applied to each output element's sum before its store, in every chunk.
-pub(super) fn tiled_region_plan(
+/// The register tiling of `shape` on `caps` ([`kg::RegisterTiling::choose`]) and its launch: the tiles in
+/// dispatches over disjoint, contiguous tile ranges, each folded onto the device's grid ([`folded_tile_grid`]),
+/// with metadata `[K, out_per_block, m_per_block, x_groups, tile_offset]` (an indexed contraction appends its own).
+/// One range covers every tile unless the device bounds a dispatch: its watchdog budget
+/// (`packed_tiled_work` multiply-accumulates, [`tiles_per_dispatch`]) and its confirmed tiled-GEMM workgroup
+/// ceiling (`known_miscompiles.tiled_gemm_max_workgroups`: a dispatch stays below it). Every `usize -> u32` step
+/// is checked: an overflow is a typed refusal naming the equation, before any dispatch.
+pub(super) fn register_tiled_launch(
+    site: Site<'_>,
+    shape: kg::TiledShape,
+    caps: &DeviceCaps,
+) -> Result<(kg::RegisterTiling, Vec<TiledDispatch>), PlanError> {
+    let overflow = || site.refuse(Capability::DispatchSizeOverflow);
+    let tiling = kg::RegisterTiling::choose(shape, caps);
+    let (tile_rows, tile_cols) = tiling.output_tile();
+    let tiles = shape
+        .blocks
+        .checked_mul(shape.m_per_block.div_ceil(tile_rows))
+        .and_then(|v| v.checked_mul(shape.out_per_block.div_ceil(tile_cols)))
+        .ok_or_else(overflow)?;
+    // A tile of an expert walk runs its `K` loop once per expert its rows select; the expected passes of
+    // expert-sorted rows ([`kg::TiledShape::passes_per_tile`]) size its share of the watchdog budget.
+    let passes = shape.passes_per_tile(tile_rows).ceil() as usize;
+    let mut per_dispatch = tiles_per_dispatch(tiles, tile_rows * tile_cols * passes, shape.k, caps);
+    if let Some(ceiling) = caps.known_miscompiles.tiled_gemm_max_workgroups {
+        per_dispatch = per_dispatch.min((ceiling as usize).saturating_sub(1).max(1));
+    }
+    let extents = [shape.k, shape.out_per_block, shape.m_per_block]
+        .into_iter()
+        .map(|extent| u32::try_from(extent).map_err(|_| overflow()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let dispatches = (0..tiles)
+        .step_by(per_dispatch.max(1))
+        .map(|offset| {
+            let count = (tiles - offset).min(per_dispatch);
+            let FoldedTileGrid { x_groups, grid } =
+                folded_tile_grid(site, count, tiling.lanes(), caps)?;
+            let offset = u32::try_from(offset).map_err(|_| overflow())?;
+            let mut meta = extents.clone();
+            meta.extend([x_groups, offset]);
+            Ok(TiledDispatch { grid, meta })
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    Ok((tiling, dispatches))
+}
+
+/// How many tiles of a register-tiled contraction one dispatch covers: all of them on a device with no watchdog
+/// budget, else as many as keep a dispatch within `packed_tiled_work` multiply-accumulates (one tile is
+/// `tile_outputs * k` of them, `tile_outputs` the outputs one workgroup computes), and at least one; a chunk that
+/// folds is whole rows of the X grid.
+fn tiles_per_dispatch(tiles: usize, tile_outputs: usize, k: usize, caps: &DeviceCaps) -> usize {
+    let Some(budget) = caps.watchdog_budget else {
+        return tiles;
+    };
+    let per_tile = (tile_outputs * k).max(1) as u64;
+    let within_budget = usize::try_from(budget.packed_tiled_work / per_tile)
+        .unwrap_or(usize::MAX)
+        .clamp(1, tiles.max(1));
+    // A chunk that folds onto several grid rows is a whole number of them: the folded grid launches full rows,
+    // and a partial one would launch (and redo) the next chunk's first tiles.
+    let row = caps.max_grid[0].max(1) as usize;
+    if within_budget < tiles && within_budget > row {
+        within_budget - within_budget % row
+    } else {
+        within_budget
+    }
+}
+
+/// Plan an `M > 1` dense contraction over `weight` as the register-tiled GEMM ([`register_tiled_launch`]), with
+/// `epilogue` (f32) applied to each output before its store: one generated request per dispatch, a split plan when
+/// the launch is several.
+pub(super) fn dense_tiled_plan(
     site: Site<'_>,
     backend: Backend,
-    gemm: TiledGemm,
+    shape: kg::TiledShape,
+    weight: kg::DenseTiledWeight,
     epilogue: Option<kg::Epilogue>,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
-    let TiledGemm {
-        m,
-        k,
-        n,
-        layout,
-        weight,
-    } = gemm;
-    if layout == WeightLayout::Kn && weight != poot_target::BufferStorage::f32() {
-        return Err(site.refuse(Capability::DtypeLowering));
-    }
-    let tile = caps.gemm_launch().tile_edge as usize;
-    let groups = m.div_ceil(2 * tile) * n.div_ceil(tile);
-    let over_cap = caps
-        .known_miscompiles
-        .tiled_gemm_max_workgroups
-        .is_some_and(|max| groups >= max as usize);
-    let region = |offset: usize, groups: usize| {
-        KernelRequest::Contraction(match layout {
-            WeightLayout::Kn => ContractionSpec::TiledRegion {
-                m,
-                k,
-                n,
-                tile,
-                offset,
-                groups,
-                epilogue: epilogue.clone(),
-            },
-            WeightLayout::Nk => ContractionSpec::DenseTiled {
-                m,
-                k,
-                n,
-                tile,
-                offset,
-                groups,
+    let (tiling, dispatches) = register_tiled_launch(site, shape, caps)?;
+    planned_dispatches(
+        site,
+        backend,
+        caps,
+        dispatches,
+        |TiledDispatch { grid, meta }| {
+            KernelRequest::Contraction(ContractionSpec::DenseTiled(kg::DenseTiledContraction {
                 weight,
+                schedule: tiling.schedule(),
                 epilogue: epilogue.clone(),
-            },
-        })
-    };
-    if !over_cap {
-        return Planned::generated(site, region(0, groups), backend, caps);
+                grid,
+                meta,
+            }))
+        },
+    )
+}
+
+/// One generated request per dispatch: the plain plan of one, or a split plan of several.
+pub(super) fn planned_dispatches(
+    site: Site<'_>,
+    backend: Backend,
+    caps: &DeviceCaps,
+    dispatches: Vec<TiledDispatch>,
+    request: impl Fn(TiledDispatch) -> KernelRequest,
+) -> Result<Planned, PlanError> {
+    match <[TiledDispatch; 1]>::try_from(dispatches) {
+        Ok([dispatch]) => Planned::generated(site, request(dispatch), backend, caps),
+        Err(dispatches) => Planned::split(
+            dispatches
+                .into_iter()
+                .map(|dispatch| Planned::generated_dispatch(site, request(dispatch), backend, caps))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
     }
-    // `over_cap` is only true when a cap exists, so this is always `Some`.
-    let chunk = caps.known_miscompiles.tiled_gemm_max_workgroups.unwrap() as usize - 1;
-    let n_chunks = groups.div_ceil(chunk);
-    let chunks = (0..n_chunks)
-        .map(|ci| {
-            let offset = ci * chunk;
-            Planned::generated_dispatch(
-                site,
-                region(offset, (groups - offset).min(chunk)),
-                backend,
-                caps,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Planned::split(chunks)
 }

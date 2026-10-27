@@ -1,4 +1,4 @@
-//! The fixture corpus the plan-summary gate and the feature matrix compile.
+//! The fixture corpus the plan-summary gate and the supported-models tables compile.
 //!
 //! The registered part is not a list: it is `Registry::builtin().entries()` crossed with each entry's
 //! fixture (and its option fixtures), the towers of the model container each fixture builds
@@ -9,14 +9,14 @@
 //! registered fixtures do not cover (a bias, a mixed-width bf16 upload, a batched decode).
 #![allow(
     dead_code,
-    reason = "shared by two test binaries (plan_summary, feature_matrix); each uses part of it"
+    reason = "shared by two test binaries (plan_summary, supported_models); each uses part of it"
 )]
 use std::sync::Arc;
 
 use poot_graph_ir::Graph;
 use poot_models::io::ProgramId;
 use poot_models::model::{
-    LogitRows, Model, ModelOutput, ShapeReason, StepShape, StepSpec, TraceError,
+    KvDtype, LogitRows, Model, ModelOutput, ShapeReason, StepShape, StepSpec, TraceError,
 };
 use poot_models::registry::{FamilyEntry, Registry};
 use poot_models::test_support::dense::{Dense, Family, step};
@@ -183,7 +183,7 @@ impl Fixtured {
             .trace(
                 &StepSpec::new(
                     shape.program,
-                    step(1, shape.tokens, shape.capacity, LogitRows::Last),
+                    driver_step(&*self.model, 1, shape.tokens, shape.capacity),
                 ),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
@@ -197,6 +197,15 @@ impl Fixtured {
     }
 }
 
+/// The shape a driver with default options traces for `model`: `rows` sequences of `tokens` over `capacity`
+/// positions, the last position's logits, the KV cache in the dtype that driver resolves (the model's
+/// preference, else [`KvDtype::DEFAULT`]). The tables and the digests show what a default driver compiles.
+fn driver_step(model: &dyn Model, rows: usize, tokens: usize, capacity: usize) -> StepShape {
+    step(rows, tokens, capacity, LogitRows::Last)
+        .with_kv_dtype(KvDtype::resolve(None, model.config().kv_dtype))
+}
+
+/// An encode step of `tokens`: stateless, so no cache dtype applies.
 fn encode_step(tokens: usize) -> StepShape {
     step(1, tokens, tokens, LogitRows::Last)
 }
@@ -307,11 +316,10 @@ fn parity_rows() -> Vec<Row> {
             rows.push(Row::new(
                 format!("parity.{checkpoint}.{shape}"),
                 move || {
-                    make()
-                        .f32_model()
-                        .model
+                    let model = make().f32_model().model;
+                    model
                         .trace(
-                            &StepSpec::new(program, step(batch, tokens, cap, LogitRows::Last)),
+                            &StepSpec::new(program, driver_step(&*model, batch, tokens, cap)),
                             poot_graph_ir::TraceLimits::for_tests(),
                         )
                         .unwrap()
@@ -324,11 +332,12 @@ fn parity_rows() -> Vec<Row> {
         ("prefill", ProgramId::STEP, PROMPT, PROMPT),
     ] {
         rows.push(Row::new(format!("parity.qwen2_bf16.{shape}"), move || {
-            dense(Family::Qwen2)
+            let model = dense(Family::Qwen2)
                 .build(Projections::Bf16, poot_tensor::DType::F32, None)
-                .model
+                .model;
+            model
                 .trace(
-                    &StepSpec::new(program, step(1, tokens, cap, LogitRows::Last)),
+                    &StepSpec::new(program, driver_step(&*model, 1, tokens, cap)),
                     poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .unwrap()

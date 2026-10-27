@@ -1,15 +1,15 @@
 //! The reference targets every poot-models planning test compiles for: the plan-summary gate and the
-//! feature matrix share them, so a column of the matrix and the checked-in digests name one target.
+//! supported-models tables share them, so a column of the tables and the checked-in digests name one target.
 #![allow(
     dead_code,
-    reason = "shared by two test binaries (plan_summary, feature_matrix); each uses part of it"
+    reason = "shared by two test binaries (plan_summary, supported_models); each uses part of it"
 )]
 use poot_graph_plan::{CompileLimits, CompileOptions, Target};
 use poot_target::{AmdArch, Backend};
 
 /// One planner target with the name its matrix column and its plan digests carry.
 pub(crate) struct RefTarget {
-    /// The column heading in the generated feature matrix.
+    /// The column heading in the generated supported-models tables.
     pub column: &'static str,
     /// The target's id in the checked-in plan digests.
     pub id: &'static str,

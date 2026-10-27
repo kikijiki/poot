@@ -162,7 +162,10 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
     for (si, _) in gd.state() {
         di.insert(
             si,
-            Value::from(HostTensor::zeros(gd.aval(si).shape.clone())),
+            Value::from(HostTensor::zeros_of(
+                gd.aval(si).dtype,
+                gd.aval(si).shape.clone(),
+            )),
         );
     }
     let hidden_dense = eval(&gd, &di, EvalOptions::default())
@@ -216,7 +219,10 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
     for (si, _) in gh.state() {
         hi.insert(
             si,
-            Value::from(HostTensor::zeros(gh.aval(si).shape.clone())),
+            Value::from(HostTensor::zeros_of(
+                gh.aval(si).dtype,
+                gh.aval(si).shape.clone(),
+            )),
         );
     }
     let hidden_host = eval(gh, &hi, EvalOptions::default())
@@ -278,7 +284,10 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
     for (si, _) in gd.state() {
         di.insert(
             si,
-            Value::from(HostTensor::zeros(gd.aval(si).shape.clone())),
+            Value::from(HostTensor::zeros_of(
+                gd.aval(si).dtype,
+                gd.aval(si).shape.clone(),
+            )),
         );
     }
     let hidden_dense = eval(&gd, &di, EvalOptions::default())
@@ -329,7 +338,10 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
     for (si, _) in gh.state() {
         hi.insert(
             si,
-            Value::from(HostTensor::zeros(gh.aval(si).shape.clone())),
+            Value::from(HostTensor::zeros_of(
+                gh.aval(si).dtype,
+                gh.aval(si).shape.clone(),
+            )),
         );
     }
     let hidden_host = eval(gh, &hi, EvalOptions::default())

@@ -295,7 +295,7 @@ fn optimize_matches_oracle_on_real_qwen2_decode_configs_real_dims() {
     // `optimize_preserves_results_over_random_configs` only exercises toy shapes (head_dim <= 8,
     // hidden <= 24), so a mis-fusion that appears at real width (row-region axis at hidden=896, GQA
     // repeat at n_rep=7) would pass. Run the full pass pipeline (canonicalize -> cse ->
-    // fold_iota -> rope_fusion -> flash_attention_capped -> dce -> fuse_contraction_epilogues -> fuse; Card
+    // fold_iota -> rope_fusion -> flash_attention -> dce -> fuse_contraction_epilogues -> fuse; Card
     // 557 moved the tiling and region-flash choices into the planner) against the CPU oracle on the
     // real configs of `real_configs`; eval(raw) must equal eval(optimize) bit for bit (Card 556:
     // the oracle evaluates the flash op from its decomposition, so nothing reassociates).
@@ -371,10 +371,10 @@ fn flash_default_cuts_prefill_dispatch_count() {
     // driver's prefill graph cost path at a representative seq_len.
     use poot_graph_ir::analysis::dispatch_count;
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::{cse, flash_attention_capped, fuse};
+    use poot_graph_plan::{cse, flash_attention, fuse};
     let layers = 4;
     let g = trace(&tiny_qwen2(layers, 64), 1, 16, 16);
-    let n_flash = flash_attention_capped(&cse(&g).unwrap(), None)
+    let n_flash = flash_attention(&cse(&g).unwrap())
         .unwrap()
         .0
         .eqns()
@@ -423,14 +423,13 @@ fn flash_attention_shrinks_prefill_peak_memory_quadratically() {
     // at growing L: materialized grows ~quadratically, flash ~linearly, so the win ratio widens with
     // context length. No GPU.
     use poot_graph_ir::analysis::peak_transient_bytes;
-    use poot_graph_plan::{cse, dce, flash_attention_capped};
+    use poot_graph_plan::{cse, dce, flash_attention};
     let m = tiny_qwen2(2, 256);
     let measure = |l: usize| -> (usize, usize) {
         let g = trace(&m, 1, l, l);
         let mat = peak_transient_bytes(&g);
-        let flash = peak_transient_bytes(
-            &dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap().0).unwrap(),
-        );
+        let flash =
+            peak_transient_bytes(&dce(&flash_attention(&cse(&g).unwrap()).unwrap().0).unwrap());
         (mat, flash)
     };
     let (m16, f16) = measure(16);
@@ -471,12 +470,12 @@ fn flash_attention_pass_fuses_prefill_attention() {
     // softmax-attention subgraph in a raw prefill trace and rewrites it to Attention, once
     // per layer, without changing the logits. cse -> flash_attention -> dce; tiny config, synthetic weights.
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::{cse, dce, flash_attention_capped};
+    use poot_graph_plan::{cse, dce, flash_attention};
     let layers = 2;
     let tokens: Vec<i32> = vec![5, 9, 2, 14, 7, 1];
     let l = tokens.len();
     let g = trace(&tiny_qwen2(layers, 16), 1, l, l);
-    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap().0).unwrap();
+    let fused = dce(&flash_attention(&cse(&g).unwrap()).unwrap().0).unwrap();
     let n_flash = fused
         .eqns()
         .iter()
@@ -494,14 +493,11 @@ fn flash_attention_pass_fuses_batched_decode() {
     // card 038: a batched decode trace (q [B,Hq,1,D], B>1) flashes too: Attention carries the
     // batch (one workgroup per (batch,head)). One op per layer.
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::{cse, flash_attention_capped};
+    use poot_graph_plan::{cse, flash_attention};
     let layers = 2;
-    let g = flash_attention_capped(
-        &cse(&trace(&tiny_qwen2(layers, 16), 3, 1, 5)).unwrap(),
-        None,
-    )
-    .unwrap()
-    .0;
+    let g = flash_attention(&cse(&trace(&tiny_qwen2(layers, 16), 3, 1, 5)).unwrap())
+        .unwrap()
+        .0;
     let n_dec = g
         .eqns()
         .iter()
@@ -516,12 +512,12 @@ fn flash_attention_pass_fuses_decode_attention() {
     // and the rewritten graph evals identically across a carried decode. The decode/prefill split is by
     // q's M dim (1 vs L).
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::{cse, dce, flash_attention_capped};
+    use poot_graph_plan::{cse, dce, flash_attention};
     let layers = 2;
     let tokens: Vec<i32> = vec![5, 9, 2, 14, 7];
     let cap = tokens.len();
     let g = trace(&tiny_qwen2(layers, 16), 1, 1, cap);
-    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap().0).unwrap();
+    let fused = dce(&flash_attention(&cse(&g).unwrap()).unwrap().0).unwrap();
     let n_flash = fused
         .eqns()
         .iter()
@@ -531,11 +527,11 @@ fn flash_attention_pass_fuses_decode_attention() {
 
     let mut base_caches: Vec<HostTensor> = g
         .state()
-        .map(|(si, _)| HostTensor::zeros(g.aval(si).shape.clone()))
+        .map(|(si, _)| HostTensor::zeros_of(g.aval(si).dtype, g.aval(si).shape.clone()))
         .collect();
     let mut fused_caches: Vec<HostTensor> = fused
         .state()
-        .map(|(si, _)| HostTensor::zeros(fused.aval(si).shape.clone()))
+        .map(|(si, _)| HostTensor::zeros_of(fused.aval(si).dtype, fused.aval(si).shape.clone()))
         .collect();
     for (pos, &token) in tokens.iter().enumerate() {
         let token = [token];

@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use poot_runtime_common::VpuGraphArtifact;
+use poot_npu_artifacts::VpuGraphArtifact;
 use poot_target::VendorCompilerId;
 
 /// The magic that opens every cache file; a different layout would change it.
@@ -125,7 +125,7 @@ fn decode<'a>(key: &BlobKey, bytes: &'a [u8]) -> Option<&'a [u8]> {
 
 #[cfg(test)]
 mod tests {
-    use poot_runtime_common::{VpuBinding, VpuLayer};
+    use poot_npu_artifacts::{VpuBinding, VpuLayer};
     use poot_target::{BufferStorage, VpuTargetId};
 
     use super::*;

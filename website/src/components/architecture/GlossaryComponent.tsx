@@ -10,12 +10,12 @@ type Entry = {
 const ENTRIES: Entry[] = [
   {
     term: "AQL (Architected Queue Language)",
-    def: "The packet format AMD HSA runtimes use to submit work to a GPU queue. poot-rocm-runtime records AQL kernel-dispatch packets and replays them for capture/replay decode.",
+    def: "The packet format AMD HSA runtimes use to submit work to a GPU queue. poot.rocm-runtime records AQL kernel-dispatch packets and replays them for capture/replay decode.",
     see: "backends",
   },
   {
     term: "ash",
-    def: "A Rust crate of low-level Vulkan API bindings (unsafe, close to the C API). poot-vulkan-runtime uses ash to record and resubmit command buffers without going through wgpu.",
+    def: "A Rust crate of low-level Vulkan API bindings (unsafe, close to the C API). poot.vulkan-runtime uses ash to record and resubmit command buffers without going through wgpu.",
     see: "backends",
   },
   {
@@ -56,7 +56,6 @@ const ENTRIES: Entry[] = [
   {
     term: "Cooperative kernel",
     def: "A kernel launched so that all workgroups are co-resident (cuLaunchCooperativeKernel on PTX, an HSA cooperative queue on ROCm). A persistent-grid kernel relies on this to coordinate across workgroups with event counters.",
-    see: "megakernel",
   },
   {
     term: "cudarc",
@@ -119,7 +118,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "HSA",
-    def: "Heterogeneous System Architecture: AMD's low-level runtime model. poot-rocm-runtime talks HSA directly (hsa-runtime64) rather than HIP/rocBLAS.",
+    def: "Heterogeneous System Architecture: AMD's low-level runtime model. poot.rocm-runtime talks HSA directly (hsa-runtime64) rather than HIP/rocBLAS.",
     see: "backends",
   },
   {
@@ -155,11 +154,6 @@ const ENTRIES: Entry[] = [
     term: "LoRA",
     def: "Low-Rank Adaptation (Hu et al., 2021): fine-tune small rank adapters instead of full weights. The driver keeps adapter sets; poot-serve loads, selects and unloads them through its LoRA administration routes.",
     see: "serving-design",
-  },
-  {
-    term: "Megakernel",
-    def: "A persistent device launch combining work from several kernels. poot has no megakernel. A bounded single-step implementation needs compiler lowering and a co-residency proof; an entire token loop needs additional contracts. The required grid-wide synchronization is unavailable on the SPIR-V backends (wgpu and raw Vulkan).",
-    see: "megakernel",
   },
   {
     term: "Megatron",

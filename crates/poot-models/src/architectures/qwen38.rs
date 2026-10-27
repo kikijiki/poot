@@ -126,6 +126,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         bos: p.bos,
         prompt_bos: None,
         prefill_granule: p.ratio,
+        kv_dtype: None,
         chat: ChatFormat::ChatML,
         tool_codec: Some(Arc::new(HermesToolCodec)),
     };
@@ -201,6 +202,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
             "linear_key_head_dim": 8,
             "linear_value_head_dim": 8,
             "linear_conv_kernel_dim": 4,
+            "output_gate_type": "sigmoid",
             "num_experts": 4,
             "num_experts_per_tok": 2,
             "moe_intermediate_size": 16,

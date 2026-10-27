@@ -30,7 +30,7 @@ fn pcie_receipt_without_the_env_reaches_the_device_checks() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     let skipped_on_apu = output.status.success()
-        && stdout.contains("SKIP: --pcie-publication-receipt requires a discrete PCIe GPU");
+        && stdout.contains("POOT-SKIP: --pcie-publication-receipt requires a discrete PCIe GPU");
     let receipt_passed = output.status.success() && stdout.contains("OK: pcie-publication-receipt");
     // The binary's own typed no-device exit: status 2 and the `no ROCm device:` message, which it
     // emits for a missing HSA library, no GPU agent, or no /dev/kfd (hsa_init OUT_OF_RESOURCES).

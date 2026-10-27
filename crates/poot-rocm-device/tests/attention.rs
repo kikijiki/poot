@@ -1,14 +1,16 @@
 //! The generated attention kernel on ROCm, one fixture per phase, each through the one contract path
 //! (`compile`, `load_weights`, `add_entry`, `step`) against the CPU oracle's evaluation of the same graph.
 //!
-//! Every fixture has more keys than the kernel has lanes, so each lane walks several keys and the running
-//! maximum, denominator and output are rescaled between them: a kernel that skipped the running-sum rescale
-//! passes only a fixture whose lanes see one key each. Decode is D = 512 (the head width that fixes the
-//! lane count lowest, 16 lanes on this device) over 96 keys with a per-batch-row visible length; prefill is a
-//! softcapped D = 128 over 80 rows (64 lanes), each row attending its causal prefix.
+//! Every fixture has more keys than one pass of the planned kernel covers (a key per lane, or a staged key
+//! block for the tiled schedule), so the running maximum, denominator and output are rescaled between passes:
+//! a kernel that skipped the running-sum rescale passes only a fixture one pass covers. Decode is D = 512 (the
+//! head width that fixes the lane count lowest, 16 lanes on this device) over 96 keys with a per-batch-row
+//! visible length; prefill is a softcapped D = 128 over 80 rows, each row attending its causal prefix.
 //!
 //! Mutation (guards `poot-kernelgen`'s `attention.rs`, applied once, observed red, restored): drop the
-//! `l *= exp(m_old - m_new)` rescale; both rows go red with the worst absolute error against the oracle.
+//! `l *= exp(m_old - m_new)` rescale; the decode row goes red with the worst absolute error against the oracle.
+//! The prefill row plans the tiled schedule: a rescale factor of 1 in `attention/tiled.rs`'s `rescale` turns it
+//! red (3.954e-3 against the oracle, POOT-1402).
 
 use poot_eval::test_support::StepFixture;
 use poot_eval::{EvalOptions, Value, eval};
@@ -96,8 +98,8 @@ fn check(name: &str, case: &Case) {
 }
 
 /// `graph` through the contract on ROCm against the oracle, its operands `ids` bound to `consts` and its slot
-/// inputs `slots` (a value and the tensor its step binds), with `lk` keys that must exceed the lanes of the
-/// planned attention kernel.
+/// inputs `slots` (a value and the tensor its step binds), with `lk` keys that must exceed one pass of the
+/// planned attention kernel (a key per lane, or a staged key block for the tiled schedule).
 fn check_operands(
     name: &str,
     graph: &Graph,
@@ -123,9 +125,14 @@ fn check_operands(
     };
     let spec = spec.clone();
     let lanes = spec.schedule.lanes();
+    // One pass of the walk covers a key per lane (streaming, split) or a staged key block (tiled).
+    let pass = match spec.schedule {
+        kg::AttentionSchedule::Tiled { bc, .. } => bc,
+        _ => lanes,
+    };
     assert!(
-        lk > lanes,
-        "{name}: {lk} keys must exceed the {lanes} lanes so lanes walk several keys"
+        lk > pass,
+        "{name}: {lk} keys must exceed the {pass} keys of one pass so the running state is rescaled"
     );
 
     let inputs: HashMap<_, Value> = ids

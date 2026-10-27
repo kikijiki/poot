@@ -5,10 +5,10 @@
 //! dispatch), rather than reaching into private queue internals to fake one.
 
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 
 pub fn __poot_kernel_spin_busy(n: &[u32], out: &mut [f32]) {
-    let i = thread_index();
+    let i = thread_index_x();
     if i < out.len() {
         let mut acc: u32 = 0;
         let mut k: u32 = 0;

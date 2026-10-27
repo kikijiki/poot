@@ -19,11 +19,11 @@
 //! constructor is `unsafe`, called only by `poot-codegen`, so safe code here cannot mint one.
 //!
 //! ```compile_fail,E0133
-//! fn from_any_bytes(bytes: &[u8]) -> poot_runtime_common::CompiledKernel {
-//!     poot_runtime_common::CompiledKernel::new(
+//! fn from_any_bytes(bytes: &[u8]) -> poot_codegen::CompiledKernel {
+//!     poot_codegen::CompiledKernel::new(
 //!         poot_target::TargetId::Gpu(poot_target::Backend::AmdGcn(poot_target::AmdArch::gfx1151())),
 //!         "add",
-//!         poot_runtime_common::KernelCode::Hsaco(bytes.to_vec().into_boxed_slice()),
+//!         poot_codegen::KernelCode::Hsaco(bytes.to_vec().into_boxed_slice()),
 //!         Vec::new(),
 //!         false,
 //!     )
@@ -31,13 +31,14 @@
 //! ```
 //!
 //! ```compile_fail,E0451
-//! fn forge(code: poot_runtime_common::KernelCode) -> poot_runtime_common::CompiledKernel {
-//!     poot_runtime_common::CompiledKernel {
+//! fn forge(code: poot_codegen::KernelCode) -> poot_codegen::CompiledKernel {
+//!     poot_codegen::CompiledKernel {
 //!         target: poot_target::TargetId::Gpu(poot_target::Backend::AmdGcn(poot_target::AmdArch::gfx1151())),
 //!         entry_point: "add".into(),
 //!         code,
 //!         args: Vec::new().into(),
 //!         has_trap: false,
+//!         index_width: poot_kernel_ir::IndexWidth::Native,
 //!     }
 //! }
 //! ```
@@ -55,6 +56,7 @@ mod buffer;
 mod context;
 mod discovery;
 mod error;
+mod host_memory;
 mod hsaco;
 mod owner;
 mod queue;

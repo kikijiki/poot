@@ -8,23 +8,7 @@ use std::sync::{Arc, Barrier, OnceLock};
 
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
-/// `CARGO_MANIFEST_DIR`, read at runtime (not baked via `env!`): the compile-time macro's value is
-/// embedded into this test binary's compiled object code at build time, and a shared compile cache (kache)
-/// that reuses that object across worktrees by source-content hash would then serve whichever worktree's
-/// path happened to compile it first (card 530's build.rs fix; card 543 review). `std::env::var` reads the
-/// environment cargo sets fresh for every test-binary invocation, so it is correct regardless of which
-/// worktree compiled the binary.
-fn manifest_dir() -> &'static Path {
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
-    DIR.get_or_init(|| {
-        PathBuf::from(
-            std::env::var("CARGO_MANIFEST_DIR")
-                .expect("CARGO_MANIFEST_DIR must be set by cargo for test binaries"),
-        )
-    })
-}
-
-/// `CARGO_BIN_EXE_pootc`, read at runtime for the same reason as [`manifest_dir`].
+/// `CARGO_BIN_EXE_pootc`, read at runtime for the same reason as [`poot_test_util::manifest_dir`].
 fn pootc_exe() -> &'static str {
     static EXE: OnceLock<String> = OnceLock::new();
     EXE.get_or_init(|| {
@@ -46,7 +30,7 @@ fn kernel_intrinsics_rmeta() -> &'static Path {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let manifest_dir = manifest_dir();
+        let manifest_dir = poot_test_util::manifest_dir();
         let mut checkout = DefaultHasher::new();
         manifest_dir.hash(&mut checkout);
         let target_dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -125,7 +109,7 @@ impl Drop for TestDir {
 }
 
 fn kernel(stem: &str) -> PathBuf {
-    manifest_dir()
+    poot_test_util::manifest_dir()
         .join("tests/kernels")
         .join(format!("{stem}.rs"))
 }
@@ -293,6 +277,33 @@ fn rejection_fixtures_exit_nonzero_with_named_diagnostics_and_no_cache() {
             "__poot_kernel_fake_workgroup_barrier",
             "workgroup_barrier",
         ),
+        // POOT-1237 (R2-L03-008): the launch is a declaration, never inferred. An LDS array nobody declared,
+        // one accessed as another element type than it was declared with, and a lane index with no declared
+        // workgroup shape are each a named rejection. Mutation: have the importer size an undeclared array
+        // from the workgroup width again (or default the shape), and the matching row imports and goes red.
+        (
+            "lds_undeclared",
+            "__poot_kernel_lds_undeclared",
+            "workgroup-local array 0 is used but not declared",
+        ),
+        (
+            "lds_type_mismatch",
+            "__poot_kernel_lds_type_mismatch",
+            "workgroup-local array 0 is declared U32 but accessed as F32",
+        ),
+        (
+            "workgroup_undeclared",
+            "__poot_kernel_workgroup_undeclared",
+            "needs a declared workgroup shape",
+        ),
+        // POOT-1237 (R2-L03-007): iterator plumbing is recognized by the `core` item's exact path, never by a
+        // word in a type's name. Mutation: match `Range`/`Option`/`Iter` by substring in
+        // `is_iter_support_ty` again; the local is mapped to nothing and this row no longer names the type.
+        (
+            "range_like_type",
+            "__poot_kernel_range_like_type",
+            "RangeOptionIter",
+        ),
     ];
     for (fixture, kernel_name, reason) in cases {
         let work = TestDir::new(fixture);
@@ -312,6 +323,32 @@ fn rejection_fixtures_exit_nonzero_with_named_diagnostics_and_no_cache() {
         );
         assert_no_success_cache(work.path());
     }
+}
+
+/// POOT-1237 (R2-L03-008): a kernel's workgroup shape and workgroup-local arrays are exactly what it declared,
+/// including a 2-D workgroup and arrays of different element types and lengths.
+///
+/// Mutation: read `declare_lds` as `f32` regardless of its type argument, or fix every array's length to the
+/// first one's; the declared `u32`/32 and `f32`/16 arrays no longer come back.
+#[test]
+fn a_declared_launch_is_the_launch_of_the_imported_body() {
+    let work = TestDir::new("declared-launch");
+    let output = run_pootc(&kernel("declare_launch"), &work, Some(work.path()), None);
+    let stderr = stderr(&output);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+    let json = std::fs::read_to_string(work.path().join("declare_launch.kir.json"))
+        .unwrap_or_else(|error| panic!("declare_launch.kir.json: {error}\nstderr:\n{stderr}"));
+    let body: poot_kernel_ir::Body = serde_json::from_str(&json).expect("the staged Body parses");
+    assert_eq!(body.workgroup_size, [8, 4, 1]);
+    let arrays: Vec<_> = body
+        .workgroup_locals
+        .iter()
+        .map(|array| (array.elem_ty.clone(), array.len))
+        .collect();
+    assert_eq!(
+        arrays,
+        [(poot_kernel_ir::Ty::U32, 32), (poot_kernel_ir::Ty::F32, 16)]
+    );
 }
 
 #[test]

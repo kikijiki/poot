@@ -163,6 +163,19 @@ pub enum MovementOp {
         /// Where the update starts on `axis`.
         index: UpdateIndex,
     },
+    /// [`MovementOp::UpdateSlice`] written in place: the kernel's output buffer already holds the operand
+    /// (a state donated to its update), so only the update and, for a runtime index, the `I32` index buffer
+    /// are inputs. A thread owns one unit of the window the update covers and nothing outside it is read
+    /// or written, so the launch is `O(update)`, not `O(out)`. Positions of the window past the end of
+    /// `axis` (a runtime index too large) are not written, as the copy form keeps the operand there.
+    WriteSlice {
+        /// The shape of the update tensor.
+        update_shape: Vec<usize>,
+        /// The axis the update is written along.
+        axis: usize,
+        /// Where the update starts on `axis`.
+        index: UpdateIndex,
+    },
     /// `out[slots[t], ..] = src[t, ..]` for each source row `t` with `slots[t] >= 0`: the paged-KV append,
     /// written in place. The kernel's output buffer is the pool itself (it already holds the base), so only
     /// the `src` rows and the `I32` `slots` buffer of `src_shape[0]` entries are inputs; `out_shape` is the
@@ -177,6 +190,18 @@ pub enum MovementOp {
     },
 }
 
+impl MovementOp {
+    /// Whether the kernel writes into an output buffer that already holds its base, launching over the
+    /// units it writes rather than the whole output: [`MovementOp::ScatterRows`] and
+    /// [`MovementOp::WriteSlice`].
+    pub fn writes_in_place(&self) -> bool {
+        matches!(
+            self,
+            MovementOp::ScatterRows { .. } | MovementOp::WriteSlice { .. }
+        )
+    }
+}
+
 /// A data-movement kernel: the storage its tensors share, the output shape, the index mapping and how the
 /// launch folds past the device's x-grid cap. `fold.numel` is [`MovementSpec::threads`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +214,10 @@ pub struct MovementSpec {
     pub op: MovementOp,
     /// How the launch folds past the device's x-grid cap; `fold.numel` is the thread count.
     pub fold: Fold,
+    /// The element type of the values an update or a row scatter writes, when it is not the output's
+    /// carrier: f32 values a two-byte buffer stores narrowed on the write (a narrow KV cache's new entries,
+    /// POOT-1395). `None` when the written values are stored as they are.
+    pub written: Option<Ty>,
 }
 
 impl MovementSpec {
@@ -198,6 +227,7 @@ impl MovementSpec {
             storage,
             out_shape,
             op,
+            written: None,
             fold: Fold {
                 numel: 0,
                 two_d: false,
@@ -208,6 +238,13 @@ impl MovementSpec {
         spec
     }
 
+    /// This request writing values of `written` that it stores converted to the output's carrier (an update or a
+    /// row scatter of f32 values into a two-byte buffer).
+    pub fn writing(mut self, written: Ty) -> Self {
+        self.written = Some(written);
+        self
+    }
+
     /// This request launched on a 2-D grid of [`ELEMENTWISE_2D_WORKGROUP_SIZE`]-lane workgroups when `two_d`.
     pub fn folded(mut self, two_d: bool) -> Self {
         self.fold.two_d = two_d;
@@ -216,7 +253,7 @@ impl MovementSpec {
 
     /// Threads the dispatch launches: one per output buffer unit (one per source unit for
     /// [`MovementOp::ScatterRows`], one per window thread for a windowed
-    /// scatter).
+    /// scatter, one per unit of the written window for [`MovementOp::WriteSlice`]).
     pub fn threads(&self) -> usize {
         match &self.op {
             MovementOp::ScatterRows {
@@ -227,13 +264,63 @@ impl MovementSpec {
                 src_shape,
                 window: None,
             } => self.storage.units(src_shape),
+            MovementOp::WriteSlice {
+                update_shape, axis, ..
+            } => self.write_window_units(update_shape, *axis),
             _ => self.storage.units(&self.out_shape),
         }
+    }
+
+    /// The output units an in-place update of `update_shape` along `axis` covers. Off the row axis of
+    /// packed lanes the update's rows are whole output rows, so it covers its own units; along it, each
+    /// output row covers [`Self::row_window_words`] words.
+    fn write_window_units(&self, update_shape: &[usize], axis: usize) -> usize {
+        if !self.updates_inside_words(axis) {
+            return self.storage.units(update_shape);
+        }
+        let (rows, _) = rows_of(&self.out_shape);
+        rows.saturating_mul(self.row_window_words(update_shape[axis]))
+    }
+
+    /// Whether an update along `axis` can start or end inside a buffer unit: along the row axis of packed
+    /// lanes, where a word holds several positions of the axis.
+    pub(super) fn updates_inside_words(&self, axis: usize) -> bool {
+        matches!(self.storage, Storage::PackedRows { .. }) && axis + 1 == self.out_shape.len()
+    }
+
+    /// The words of one output row an update of `extent` lanes along the row axis can touch: the window can
+    /// start inside a word, so at most one word more than its lanes fill, and never more than the row holds.
+    pub(super) fn row_window_words(&self, extent: usize) -> usize {
+        let (_, row_len) = rows_of(&self.out_shape);
+        let lanes = self.storage.lanes();
+        (extent.div_ceil(lanes) + 1).min(row_len.div_ceil(lanes))
     }
 
     /// The generator's own preconditions on the request, checked before a statement exists.
     pub(super) fn validate(&self) -> Result<(), KernelGenError> {
         self.storage.check()?;
+        if let Some(written) = &self.written {
+            let writes = matches!(
+                self.op,
+                MovementOp::UpdateSlice { .. }
+                    | MovementOp::WriteSlice { .. }
+                    | MovementOp::ScatterRows { .. }
+            );
+            let narrowing = *written == Ty::F32
+                && matches!(
+                    self.storage,
+                    Storage::Elements {
+                        carrier: Ty::F16 | Ty::BF16
+                    }
+                );
+            if !(writes && narrowing) {
+                return Err(KernelGenError::Unsupported {
+                    request: G,
+                    reason: "only an update or a row scatter converts, and only f32 values into a \
+                             two-byte element buffer",
+                });
+            }
+        }
         if self.fold.numel != self.threads() {
             return Err(KernelGenError::NotEqualTo {
                 generator: G,
@@ -400,6 +487,11 @@ impl MovementSpec {
                 Ok(())
             }
             MovementOp::UpdateSlice {
+                update_shape,
+                axis,
+                index,
+            }
+            | MovementOp::WriteSlice {
                 update_shape,
                 axis,
                 index,

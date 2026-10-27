@@ -1,0 +1,368 @@
+{
+  "columns": [
+    {
+      "id": "works",
+      "title": "Works"
+    },
+    {
+      "id": "building",
+      "title": "Building now"
+    },
+    {
+      "id": "next",
+      "title": "Next"
+    }
+  ],
+  "later": "Other hardware targets, deeper decode fusion, release packaging and an API stability promise.",
+  "limitations": [
+    "Behind llama.cpp in every measured cell: decode up to 5x slower, first token up to 100x slower. Holds up to 2x the GPU memory of llama.cpp at inference.",
+    "The benchmark grid is two machines and six models, with llama.cpp as the reference.",
+    "There is no compatibility guarantee: APIs and formats change without notice.",
+    "Benchmark cells that fail the noise contract are marked unverified and never counted."
+  ],
+  "cards": [
+    {
+      "id": "serving",
+      "column": "works",
+      "icon": "server",
+      "title": "OpenAI-compatible serving",
+      "line": "Chat, completions, embeddings and reranking.",
+      "badge": "works",
+      "link": "/docs/serve/capabilities"
+    },
+    {
+      "id": "features",
+      "column": "works",
+      "icon": "bolt",
+      "title": "Serving features",
+      "line": "What the server does beyond plain generation.",
+      "badge": "works",
+      "link": "/docs/serve",
+      "groups": [
+        {
+          "label": "Guided output",
+          "items": [
+            {
+              "name": "JSON schema"
+            },
+            {
+              "name": "regex"
+            },
+            {
+              "name": "GBNF grammar"
+            },
+            {
+              "name": "choice"
+            }
+          ]
+        },
+        {
+          "label": "Speculative",
+          "items": [
+            {
+              "name": "n-gram lookup"
+            },
+            {
+              "name": "draft model"
+            },
+            {
+              "name": "MTP"
+            }
+          ]
+        },
+        {
+          "label": "Also",
+          "items": [
+            {
+              "name": "continuous batching"
+            },
+            {
+              "name": "prefix reuse"
+            },
+            {
+              "name": "LoRA adapters"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tensor-parallel",
+      "column": "works",
+      "icon": "grid",
+      "title": "Tensor parallelism",
+      "line": "Served on two NVIDIA GPUs of one node.",
+      "badge": "partial",
+      "link": "/docs/serve/tensor-parallelism"
+    },
+    {
+      "id": "models",
+      "column": "works",
+      "icon": "cube",
+      "title": "Broad model families",
+      "line": "Registered families that plan on at least one backend.",
+      "badge": "works",
+      "link": "/docs/develop/supported-models",
+      "groups": [
+        {
+          "label": "Dense",
+          "items": [
+            {
+              "name": "Llama",
+              "ref": "llama"
+            },
+            {
+              "name": "Qwen3",
+              "ref": "qwen3"
+            },
+            {
+              "name": "Gemma 3",
+              "ref": "gemma3"
+            },
+            {
+              "name": "Gemma 4",
+              "ref": "gemma4"
+            },
+            {
+              "name": "Phi-3",
+              "ref": "phi3"
+            }
+          ]
+        },
+        {
+          "label": "MoE",
+          "items": [
+            {
+              "name": "Mixtral",
+              "ref": "llama/mixtral"
+            },
+            {
+              "name": "Qwen3 MoE",
+              "ref": "qwen3moe"
+            },
+            {
+              "name": "DeepSeek V4",
+              "ref": "deepseek4"
+            }
+          ]
+        },
+        {
+          "label": "Hybrid",
+          "items": [
+            {
+              "name": "Qwen3-Next",
+              "ref": "qwen3next"
+            },
+            {
+              "name": "Nemotron-H",
+              "ref": "nemotron_h"
+            }
+          ]
+        },
+        {
+          "label": "Encoders",
+          "items": [
+            {
+              "name": "BERT",
+              "ref": "bert"
+            },
+            {
+              "name": "Cross-encoder rerank",
+              "ref": "bert/cross_encoder"
+            }
+          ]
+        },
+        {
+          "label": "Vision-language",
+          "items": [
+            {
+              "name": "Idefics3",
+              "ref": "idefics3"
+            },
+            {
+              "name": "Qwen2.5-VL",
+              "ref": "qwen2_5_vl"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "formats",
+      "column": "works",
+      "icon": "file",
+      "title": "GGUF and safetensors",
+      "line": "Quantized weights stay packed in memory.",
+      "badge": "works",
+      "link": "/docs/serve/quantized-checkpoints",
+      "groups": [
+        {
+          "label": "GGUF",
+          "items": [
+            {
+              "name": "K-quants",
+              "ref": "GGUF Q4_K"
+            },
+            {
+              "name": "I-quants",
+              "ref": "GGUF IQ4_XS"
+            },
+            {
+              "name": "MXFP4",
+              "ref": "GGUF MXFP4"
+            }
+          ]
+        },
+        {
+          "label": "Packed checkpoints",
+          "items": [
+            {
+              "name": "GPTQ",
+              "ref": "GPTQ int4"
+            },
+            {
+              "name": "AWQ",
+              "ref": "AWQ int4"
+            },
+            {
+              "name": "FP8",
+              "ref": "FP8 E4M3, per-channel F32 scale"
+            },
+            {
+              "name": "FP4",
+              "ref": "E2M1 (FP4), per-32 E8M0 scale"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "backends",
+      "column": "works",
+      "icon": "chip",
+      "title": "Four GPU backends",
+      "line": "Kernels are written in Rust.",
+      "badge": "works",
+      "link": "/docs/serve/choosing-a-backend",
+      "groups": [
+        {
+          "label": "Any Vulkan GPU",
+          "items": [
+            {
+              "name": "wgpu"
+            },
+            {
+              "name": "Vulkan"
+            }
+          ]
+        },
+        {
+          "label": "AMD",
+          "items": [
+            {
+              "name": "ROCm"
+            }
+          ]
+        },
+        {
+          "label": "NVIDIA",
+          "items": [
+            {
+              "name": "PTX"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "benchmarks",
+      "column": "works",
+      "icon": "chart",
+      "title": "Public benchmarks",
+      "line": "Verified runs next to llama.cpp, on two machines and six models.",
+      "badge": "works",
+      "link": "/docs/performance"
+    },
+    {
+      "id": "performance",
+      "column": "building",
+      "icon": "bolt",
+      "title": "Performance: decode, prefill and memory",
+      "line": "Behind llama.cpp on decode, first-token time and GPU memory at inference in every measured cell; host memory is lower on most Strix Halo cells.",
+      "badge": "in-progress",
+      "link": "/docs/performance"
+    },
+    {
+      "id": "performance-work",
+      "column": "building",
+      "icon": "chart",
+      "title": "Where the speed work goes",
+      "line": "Bandwidth-bound GEMV and tensor-core attention on NVIDIA, then prefill kernels and large-MoE memory.",
+      "badge": "in-progress",
+      "link": "/docs/performance"
+    },
+    {
+      "id": "large-moe",
+      "column": "building",
+      "icon": "cube",
+      "title": "Very large MoE",
+      "line": "Memory footprint and long-context prefill.",
+      "badge": "in-progress",
+      "link": "/docs/develop/supported-models"
+    },
+    {
+      "id": "multi-gpu",
+      "column": "building",
+      "icon": "grid",
+      "title": "Multi-GPU PTX validation",
+      "line": "Real checkpoints on two and four GPUs.",
+      "badge": "in-progress",
+      "link": "/docs/serve/tensor-parallelism"
+    },
+    {
+      "id": "coverage",
+      "column": "building",
+      "icon": "chart",
+      "title": "Wider benchmark coverage",
+      "line": "The standing grid is filling in: two machines (Strix Halo and one RTX PRO 6000 cloud GPU), six models.",
+      "badge": "in-progress",
+      "link": "/docs/performance"
+    },
+    {
+      "id": "serve-throughput",
+      "column": "next",
+      "icon": "server",
+      "title": "Serve-throughput benchmarks",
+      "line": "Concurrent requests against the server.",
+      "badge": "planned",
+      "link": "/docs/performance"
+    },
+    {
+      "id": "megakernel",
+      "column": "next",
+      "icon": "bolt",
+      "title": "Megakernel decode",
+      "line": "A whole decode step as one persistent GPU launch. Researched; not in the code yet.",
+      "badge": "planned",
+      "link": "/docs/architecture/execution"
+    },
+    {
+      "id": "npu",
+      "column": "next",
+      "icon": "chip",
+      "title": "NPU backends",
+      "line": "AMD XDNA2 and Intel NPU4; a few ops run today.",
+      "badge": "experimental",
+      "link": "/docs/architecture/npu"
+    },
+    {
+      "id": "more-models",
+      "column": "next",
+      "icon": "cube",
+      "title": "More families and baselines",
+      "line": "Further model families and comparison engines.",
+      "badge": "planned",
+      "link": "/docs/develop/supported-models"
+    }
+  ]
+}

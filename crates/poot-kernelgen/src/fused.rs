@@ -22,7 +22,7 @@ use poot_kernel_ir::{
 /// `Cast` to F32, `Recip`, `Tanh` and `Erf` are the unary ops with a synthesized body). Kernelgen does not
 /// depend on the graph IR, and the one translation, `poot_graph_plan`'s `map_fused_op`, is total over the graph
 /// ops: each is lowered or refused by name (`FusedStepGap`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FusedScalarOp {
     /// A kernel-ir unary op.
     Unary(UnOp),
@@ -303,10 +303,10 @@ pub enum LeafTy {
     F32,
     /// A 32-bit integer leaf (a `Select` condition in a float region, any operand in an exact-I32 region).
     I32,
-    /// A two-byte float leaf, read as stored. Only a `Select` step may read it (it moves the element, it
-    /// never computes on it), and a float region's output may be such a `Select`.
+    /// A two-byte float leaf, read as stored. A `Select` step moves it; any other step reads it widened to
+    /// F32 and rounds its result back to this type (every value operand of such a step has this one type).
     BF16,
-    /// A two-byte float leaf in IEEE half format, read as stored.
+    /// A two-byte float leaf in IEEE half format, read as stored (see [`LeafTy::BF16`]).
     F16,
 }
 
@@ -418,6 +418,16 @@ impl FusedKernel {
     pub fn n_leaves(&self) -> usize {
         self.leaf_tys.len()
     }
+
+    /// The region of one step, `op` over `inputs`, whose result is the output: what every unary, binary and
+    /// scalar-literal equation lowers to. `leaf_tys` types the leaves the inputs name.
+    pub fn one_step(op: FusedScalarOp, leaf_tys: Vec<LeafTy>, inputs: Vec<FusedInput>) -> Self {
+        Self {
+            leaf_tys,
+            steps: vec![FusedStep { op, inputs }],
+            output: FusedInput::Step(StepId::new(0)),
+        }
+    }
 }
 
 impl FusedScalarOp {
@@ -472,6 +482,113 @@ const PACKED_LANE_READ: BodySize = BodySize {
     locals: 32,
 };
 
+/// The scratch locals [`emit_view_offset`] reuses across the leaves of one body.
+struct OffsetScratch {
+    rem: Local,
+    div: Local,
+    md: Local,
+    term: Local,
+    off_new: Local,
+}
+
+impl OffsetScratch {
+    fn new(al: &mut Alloc) -> Self {
+        Self {
+            rem: al.add(Ty::Usize, false),
+            div: al.add(Ty::Usize, false),
+            md: al.add(Ty::Usize, false),
+            term: al.add(Ty::Usize, false),
+            off_new: al.add(Ty::Usize, false),
+        }
+    }
+}
+
+/// Emit `off = base + sum over d of coord_d * eff[d]` for the output element `i`: where a leaf is read in a
+/// body whose output has row-major `out_strides`, and `eff` is the leaf's effective strides (zero on a broadcast
+/// axis, see [`view_eff_strides`]). A leaf that is not broadcast and not strided differently from the output
+/// reads at `i + base`. Otherwise the output coordinates are unraveled by a running remainder (div, mul, sub),
+/// never `urem`: NVPTX software-emulates the i64 remainder and miscompiles it for a large dividend, which
+/// corrupted broadcast reads at large `N` (prefill garbled at n=864; power-of-2 dims lower to AND and were safe).
+fn emit_view_offset(
+    scratch: &OffsetScratch,
+    out_strides: &[usize],
+    eff: &[usize],
+    base: usize,
+    i: Local,
+    off: Local,
+    body: &mut Vec<Statement>,
+) {
+    let OffsetScratch {
+        rem,
+        div,
+        md,
+        term,
+        off_new,
+    } = *scratch;
+    let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
+    body.push(Statement::Assign(Place::local(off), Rvalue::Use(cu(base))));
+    if eff == out_strides {
+        if base == 0 {
+            body.push(Statement::Assign(
+                Place::local(off),
+                Rvalue::Use(copy(Place::local(i))),
+            ));
+        } else {
+            body.push(Statement::Assign(
+                Place::local(off_new),
+                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(i)), copy(Place::local(off))),
+            ));
+            body.push(Statement::Assign(
+                Place::local(off),
+                Rvalue::Use(copy(Place::local(off_new))),
+            ));
+        }
+        return;
+    }
+    body.push(Statement::Assign(
+        Place::local(rem),
+        Rvalue::Use(copy(Place::local(i))),
+    ));
+    for (d, &stride) in eff.iter().enumerate() {
+        body.push(Statement::Assign(
+            Place::local(div),
+            Rvalue::BinaryOp(BinOp::Div, copy(Place::local(rem)), cu(out_strides[d])),
+        ));
+        if stride != 0 {
+            body.push(Statement::Assign(
+                Place::local(term),
+                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(div)), cu(stride)),
+            ));
+            body.push(Statement::Assign(
+                Place::local(off_new),
+                Rvalue::BinaryOp(
+                    BinOp::Add,
+                    copy(Place::local(off)),
+                    copy(Place::local(term)),
+                ),
+            ));
+            body.push(Statement::Assign(
+                Place::local(off),
+                Rvalue::Use(copy(Place::local(off_new))),
+            ));
+        }
+        if d + 1 < eff.len() {
+            body.push(Statement::Assign(
+                Place::local(md),
+                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(div)), cu(out_strides[d])),
+            ));
+            body.push(Statement::Assign(
+                Place::local(off_new),
+                Rvalue::BinaryOp(BinOp::Sub, copy(Place::local(rem)), copy(Place::local(md))),
+            ));
+            body.push(Statement::Assign(
+                Place::local(rem),
+                Rvalue::Use(copy(Place::local(off_new))),
+            ));
+        }
+    }
+}
+
 /// A checked upper bound on the body [`fused_views`], [`fused_i32_views_grid_pack`] build for `k` over
 /// an output of `rank` axes and a `pack_lanes`-wide packed store. Computed from the recipe alone, so a
 /// caller can refuse a region before any statement is built; `fused_size_bounds_the_generated_bodies`
@@ -496,8 +613,22 @@ pub(crate) fn pointwise_size(k: &FusedKernel, rank: usize, pack_lanes: usize) ->
         instructions: 0,
         locals: k.n_leaves(),
     };
+    // A two-byte float region widens each value operand of a step and narrows its result.
+    let narrow = k
+        .leaf_tys
+        .iter()
+        .any(|leaf| matches!(leaf, LeafTy::BF16 | LeafTy::F16));
     let steps = k.steps.iter().fold(BodySize::default(), |sum, step| {
-        sum.plus(step.op.step_size())
+        let widening = if narrow {
+            let casts = step.inputs.len().saturating_add(1);
+            BodySize {
+                instructions: casts,
+                locals: casts,
+            }
+        } else {
+            BodySize::default()
+        };
+        sum.plus(step.op.step_size()).plus(widening)
     });
     FIXED
         .plus(params)
@@ -584,9 +715,9 @@ struct FloatRegionTys {
 /// 0 or 1) that only a `Select` or an `I32ToF32` step turns into a float. So an I32 producer chain and the
 /// float chain that consumes it are one region, with the cast between them. An I32 leaf feeds an I32 step,
 /// a `Select` condition or a cast; mixing I32 and F32 operands in one arithmetic step has no meaning and is
-/// refused. A two-byte float leaf or step is moved, never computed on, so only a `Select`'s branches (and
-/// the region output) may be one; a `Select` over words of one type is itself that type, its two branches
-/// agree. The region output is a float: an I32 result is the exact-I32 synthesizer's.
+/// refused. A two-byte float step (every value operand of one type, an F32 literal allowed) computes in F32 on
+/// the widened operands and rounds its result to that type; a `Select` moves its branches, which agree in type,
+/// and is itself that type. The region output is a float: an I32 result is the exact-I32 synthesizer's.
 fn check_float_region_tys(
     generator: &'static str,
     k: &FusedKernel,
@@ -656,12 +787,30 @@ fn check_float_region_tys(
             {
                 Ty::I32
             }
-            _ => {
-                // A float step: an I32 or a two-byte operand has no float meaning here.
-                if let Some(position) = operand_tys.iter().position(|ty| ty != &Ty::F32) {
+            op => {
+                // A float step. Its value operands are all F32, and it computes in F32; or all one two-byte float
+                // type `T`, and it computes in F32 on their widened values and rounds back to `T`, as the unfused
+                // op does (spec 024). An F32 literal is a constant of either. An I32 operand, or operands of
+                // mixed widths, has no float meaning here, and nor has the widening cast of a leaf's lane.
+                let narrow = match op {
+                    FusedScalarOp::Widen => None,
+                    _ => step
+                        .inputs
+                        .iter()
+                        .zip(&operand_tys)
+                        .find(|(input, _)| !matches!(input, FusedInput::Lit(_)))
+                        .and_then(|(_, ty)| matches!(ty, Ty::BF16 | Ty::F16).then(|| ty.clone())),
+                };
+                let expected = narrow.clone().unwrap_or(Ty::F32);
+                if let Some(position) = step
+                    .inputs
+                    .iter()
+                    .zip(&operand_tys)
+                    .position(|(input, ty)| !matches!(input, FusedInput::Lit(_)) && ty != &expected)
+                {
                     return Err(refuse(position));
                 }
-                Ty::F32
+                expected
             }
         };
         steps.push(result);
@@ -706,7 +855,6 @@ pub fn fused_views(
         });
     }
     let region_tys = check_float_region_tys("fused_views", k)?;
-    let r = out_shape.len();
     let out_strides = row_major_strides(out_shape);
     let n = k.n_leaves();
 
@@ -723,10 +871,7 @@ pub fn fused_views(
     let len = al.add(Ty::Usize, false);
     let cmp = al.add(Ty::Bool, false);
     // index-math scratch, reused across leaves.
-    let div = al.add(Ty::Usize, false);
-    let md = al.add(Ty::Usize, false);
-    let term = al.add(Ty::Usize, false);
-    let off_new = al.add(Ty::Usize, false);
+    let scratch = OffsetScratch::new(&mut al);
     // per-leaf running offset + the read value register.
     let leaf_off: Vec<Local> = (0..n).map(|_| al.add(Ty::Usize, true)).collect();
     let leaf_val: Vec<Local> = k
@@ -740,43 +885,13 @@ pub fn fused_views(
         .iter()
         .map(|ty| al.add(ty.clone(), false))
         .collect();
-    let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
 
     let mut body: Vec<Statement> = Vec::new();
     // read each leaf at its view-mapped offset (base 0, row-major eff strides, for a plain buffer).
     for (li, lshape) in leaf_shapes.iter().enumerate() {
         let (eff, base) = view_eff_strides(out_shape, lshape, &leaf_layouts[li]);
         let off = leaf_off[li];
-        body.push(Statement::Assign(Place::local(off), Rvalue::Use(cu(base))));
-        for (d, &e) in eff.iter().enumerate().take(r) {
-            if e == 0 {
-                continue; // broadcast dim
-            }
-            body.push(Statement::Assign(
-                Place::local(div),
-                Rvalue::BinaryOp(BinOp::Div, copy(Place::local(i)), cu(out_strides[d])),
-            ));
-            body.push(Statement::Assign(
-                Place::local(md),
-                Rvalue::BinaryOp(BinOp::Rem, copy(Place::local(div)), cu(out_shape[d])),
-            ));
-            body.push(Statement::Assign(
-                Place::local(term),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(md)), cu(e)),
-            ));
-            body.push(Statement::Assign(
-                Place::local(off_new),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(off)),
-                    copy(Place::local(term)),
-                ),
-            ));
-            body.push(Statement::Assign(
-                Place::local(off),
-                Rvalue::Use(copy(Place::local(off_new))),
-            ));
-        }
+        emit_view_offset(&scratch, &out_strides, &eff, base, i, off, &mut body);
         body.push(Statement::Assign(
             Place::local(leaf_val[li]),
             Rvalue::Use(copy(elem(local((li + 1) as u32), off))),
@@ -798,9 +913,35 @@ pub fn fused_views(
     // evaluate the steps in order (each references only earlier leaves/steps); a step over I32 words is
     // emitted by the exact-integer emitter.
     for (s, step) in k.steps.iter().enumerate() {
-        let operands: Vec<Operand> = step.inputs.iter().map(&resolve).collect();
-        if region_tys.steps[s] == Ty::I32 {
+        let mut operands: Vec<Operand> = step.inputs.iter().map(&resolve).collect();
+        let step_ty = &region_tys.steps[s];
+        if *step_ty == Ty::I32 {
             emit_scalar_op_i32(step_reg[s], step.op, &operands, &mut al, &mut body);
+        } else if matches!(step_ty, Ty::BF16 | Ty::F16) && step.op != FusedScalarOp::Select {
+            // A two-byte float step: widen each value operand to F32, compute, round the result to the step's type.
+            for (operand, input) in operands.iter_mut().zip(&step.inputs) {
+                if matches!(input, FusedInput::Lit(_)) {
+                    continue;
+                }
+                let widened = al.add(Ty::F32, false);
+                body.push(Statement::Assign(
+                    Place::local(widened),
+                    Rvalue::Cast {
+                        to: Ty::F32,
+                        operand: operand.clone(),
+                    },
+                ));
+                *operand = copy(Place::local(widened));
+            }
+            let computed = al.add(Ty::F32, false);
+            emit_scalar_op(computed, step.op, &operands, &mut al, &mut body);
+            body.push(Statement::Assign(
+                Place::local(step_reg[s]),
+                Rvalue::Cast {
+                    to: step_ty.clone(),
+                    operand: copy(Place::local(computed)),
+                },
+            ));
         } else {
             emit_scalar_op(step_reg[s], step.op, &operands, &mut al, &mut body);
         }
@@ -920,7 +1061,6 @@ pub fn fused_i32_views_grid_pack(
         }
         shape
     };
-    let r = index_shape.len();
     let out_strides = row_major_strides(&index_shape);
     let n = k.n_leaves();
 
@@ -935,10 +1075,7 @@ pub fn fused_i32_views_grid_pack(
     let i = al.add(Ty::Usize, false);
     let len = al.add(Ty::Usize, false);
     let cmp = al.add(Ty::Bool, false);
-    let div = al.add(Ty::Usize, false);
-    let md = al.add(Ty::Usize, false);
-    let term = al.add(Ty::Usize, false);
-    let off_new = al.add(Ty::Usize, false);
+    let scratch = OffsetScratch::new(&mut al);
     let leaf_off: Vec<Local> = (0..n).map(|_| al.add(Ty::Usize, true)).collect();
     let leaf_val: Vec<Local> = (0..n).map(|_| al.add(Ty::I32, false)).collect();
     let step_reg: Vec<Local> = (0..k.steps.len()).map(|_| al.add(Ty::I32, false)).collect();
@@ -979,36 +1116,7 @@ pub fn fused_i32_views_grid_pack(
         }
         let (eff, base) = view_eff_strides(&index_shape, lshape, &leaf_layouts[li]);
         let off = leaf_off[li];
-        body.push(Statement::Assign(Place::local(off), Rvalue::Use(cu(base))));
-        for (d, &e) in eff.iter().enumerate().take(r) {
-            if e == 0 {
-                continue;
-            }
-            body.push(Statement::Assign(
-                Place::local(div),
-                Rvalue::BinaryOp(BinOp::Div, copy(Place::local(i)), cu(out_strides[d])),
-            ));
-            body.push(Statement::Assign(
-                Place::local(md),
-                Rvalue::BinaryOp(BinOp::Rem, copy(Place::local(div)), cu(index_shape[d])),
-            ));
-            body.push(Statement::Assign(
-                Place::local(term),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(md)), cu(e)),
-            ));
-            body.push(Statement::Assign(
-                Place::local(off_new),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(off)),
-                    copy(Place::local(term)),
-                ),
-            ));
-            body.push(Statement::Assign(
-                Place::local(off),
-                Rvalue::Use(copy(Place::local(off_new))),
-            ));
-        }
+        emit_view_offset(&scratch, &out_strides, &eff, base, i, off, &mut body);
         body.push(Statement::Assign(
             Place::local(leaf_val[li]),
             Rvalue::Use(copy(elem(local((li + 1) as u32), off))),
@@ -1019,36 +1127,7 @@ pub fn fused_i32_views_grid_pack(
         let layout = &leaf_layouts[leaf.index()];
         let (eff, base) = view_eff_strides(&index_shape, lshape, layout);
         let off = leaf_off[leaf.index()];
-        body.push(Statement::Assign(Place::local(off), Rvalue::Use(cu(base))));
-        for (d, &e) in eff.iter().enumerate().take(r) {
-            if e == 0 {
-                continue;
-            }
-            body.push(Statement::Assign(
-                Place::local(div),
-                Rvalue::BinaryOp(BinOp::Div, copy(Place::local(i)), cu(out_strides[d])),
-            ));
-            body.push(Statement::Assign(
-                Place::local(md),
-                Rvalue::BinaryOp(BinOp::Rem, copy(Place::local(div)), cu(index_shape[d])),
-            ));
-            body.push(Statement::Assign(
-                Place::local(term),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(md)), cu(e)),
-            ));
-            body.push(Statement::Assign(
-                Place::local(off_new),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(off)),
-                    copy(Place::local(term)),
-                ),
-            ));
-            body.push(Statement::Assign(
-                Place::local(off),
-                Rvalue::Use(copy(Place::local(off_new))),
-            ));
-        }
+        emit_view_offset(&scratch, &out_strides, &eff, base, i, off, &mut body);
         let last_stride = layout.strides.last().copied().unwrap_or(1);
         if lane.index() != 0 && last_stride != 0 {
             body.push(Statement::Assign(
@@ -2048,7 +2127,7 @@ mod tests {
     use poot_wgpu_runtime::KernelBuffer;
 
     use super::*;
-    use crate::unit_helpers::{ctx, spv, stage_nvptx};
+    use crate::unit_helpers::{assert_staged, ctx, spv, stage_nvptx};
 
     /// Build the one-pass RMSNorm RowKernel (leaves x, w) for `n_cols` columns. Shared by the serial and
     /// parallel equivalence test.
@@ -2103,6 +2182,46 @@ mod tests {
         }
     }
 
+    /// Stage the row kernels' NVPTX for `ptx-check`. It needs no wgpu context, so a machine without a graphics
+    /// device (a PTX pod) still stages them; the dispatching tests below only run on a wgpu device.
+    #[test]
+    fn fused_row_kernels_emit_valid_nvptx() {
+        let rmsnorm = fused_row(
+            "rmsnorm",
+            &[1, 1, 4],
+            &[&[1, 1, 4], &[4]],
+            &rmsnorm_kernel(4, 1e-6),
+        )
+        .expect("fused_row precondition");
+        stage_nvptx(&rmsnorm);
+        let softmax = fused_row(
+            "softmax",
+            &[1, 1, 1, 4],
+            &[&[1, 1, 1, 4]],
+            &softmax_kernel(4),
+        )
+        .expect("fused_row precondition");
+        stage_nvptx(&softmax);
+        let (num_rows, n_cols) = (3usize, 8usize);
+        let leaves: [&[usize]; 2] = [&[num_rows, n_cols], &[n_cols]];
+        let layouts = [
+            Layout::contiguous(&[num_rows, n_cols]),
+            Layout::contiguous(&[n_cols]),
+        ];
+        let parallel = fused_row_parallel_views(
+            "rms_par",
+            &[num_rows, n_cols],
+            &leaves,
+            &layouts,
+            &rmsnorm_kernel(n_cols, 1e-6),
+            4,
+            1,
+        )
+        .expect("fused_row_parallel_views precondition");
+        stage_nvptx(&parallel);
+        assert_staged(&["rmsnorm", "softmax", "rms_par"]);
+    }
+
     #[test]
     fn fused_row_rmsnorm_one_pass() {
         // One-pass RMSNorm as a row-wise fused kernel. Region (leaves x[1,1,N], w[N]):
@@ -2115,7 +2234,6 @@ mod tests {
         let k = rmsnorm_kernel(n, eps);
         let body = fused_row("rmsnorm", &[1, 1, n], &[&[1, 1, n], &[n]], &k)
             .expect("fused_row precondition");
-        stage_nvptx(&body);
         let s = spv(&body, "rmsnorm");
         let x = [1.0f32, 2.0, 3.0, 4.0];
         let w = [2.0f32, 0.5, 1.0, 1.5];
@@ -2183,7 +2301,6 @@ mod tests {
         let k = softmax_kernel(sz);
         let body = fused_row("softmax", &[1, 1, 1, sz], &[&[1, 1, 1, sz]], &k)
             .expect("fused_row precondition");
-        stage_nvptx(&body);
         let s = spv(&body, "softmax");
         let scores = [1.0f32, 2.0, 3.0, 4.0];
         let mut bufs = [
@@ -2270,14 +2387,10 @@ mod tests {
         let serial = fused_row("rms_ser", &out_shape, &leaves, &k).expect("fused_row precondition");
         let parallel = fused_row_parallel_views("rms_par", &out_shape, &leaves, &layouts, &k, w, 1)
             .expect("fused_row_parallel_views precondition");
-        stage_nvptx(&parallel);
         let s_ser = spv(&serial, "rms_ser");
         let s_par = spv(&parallel, "rms_par");
 
-        let run = |s: &poot_runtime_common::CompiledKernel,
-                   wg: [u32; 3],
-                   threads: [u32; 3]|
-         -> Vec<f32> {
+        let run = |s: &poot_codegen::CompiledKernel, wg: [u32; 3], threads: [u32; 3]| -> Vec<f32> {
             let mut bufs = [
                 KernelBuffer::read_only_f32(&x),
                 KernelBuffer::read_only_f32(&wt),
@@ -2337,10 +2450,7 @@ mod tests {
             .expect("fused_row_parallel_views precondition");
         let s_ser = spv(&serial, "sm_ser");
         let s_par = spv(&parallel, "sm_par");
-        let run = |s: &poot_runtime_common::CompiledKernel,
-                   wg: [u32; 3],
-                   threads: [u32; 3]|
-         -> Vec<f32> {
+        let run = |s: &poot_codegen::CompiledKernel, wg: [u32; 3], threads: [u32; 3]| -> Vec<f32> {
             let mut bufs = [
                 KernelBuffer::read_only_f32(&scores),
                 KernelBuffer::write_f32(num_rows * sz),

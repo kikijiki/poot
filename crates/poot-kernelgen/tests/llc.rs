@@ -27,7 +27,7 @@ fn out_dir(tag: &str) -> PathBuf {
 #[test]
 fn add_lowers_to_spirv_and_ptx() {
     if !have("llc") {
-        eprintln!("llc not on PATH; skipping");
+        poot_test_util::skip_report("poot-kernelgen", &"llc not on PATH");
         return;
     }
     let dir = out_dir("lower");
@@ -54,64 +54,93 @@ fn add_lowers_to_spirv_and_ptx() {
     }
 }
 
+/// The exact-I32 body of one `op` step over a `[4]` leaf, with the literal as its second operand when given.
+fn one_step_i32(
+    name: &str,
+    op: poot_kernelgen::FusedScalarOp,
+    lit: Option<i32>,
+) -> poot_kernel_ir::Body {
+    let mut inputs = vec![poot_kernelgen::FusedInput::Leaf(
+        poot_kernelgen::LeafId::new(0),
+    )];
+    inputs.extend(lit.map(poot_kernelgen::FusedInput::LitI32));
+    poot_kernelgen::fused_i32_views_grid(
+        name,
+        &[4],
+        &[&[4]],
+        &[poot_kernelgen::Layout::contiguous(&[4])],
+        &poot_kernelgen::FusedKernel {
+            leaf_tys: vec![poot_kernelgen::LeafTy::I32],
+            steps: vec![poot_kernelgen::FusedStep { op, inputs }],
+            output: poot_kernelgen::FusedInput::Step(poot_kernelgen::StepId::new(0)),
+        },
+        None,
+    )
+    .expect("an exact-I32 step generates")
+}
+
 #[test]
 fn exact_i32_arithmetic_lowers_without_float_conversion() {
     if !have("llc") {
-        eprintln!("llc not on PATH; skipping exact-I32 lowering");
+        poot_test_util::skip_report("poot-kernelgen", &"llc not on PATH");
         return;
     }
     let dir = out_dir("exact-i32");
     let bodies = [
         (
-            poot_kernelgen::binary_scalar_i32_grid(
+            one_step_i32(
                 "exact_i32_add",
-                poot_kernel_ir::BinOp::Add,
-                1,
-                None,
+                poot_kernelgen::FusedScalarOp::Binary(poot_kernel_ir::BinOp::Add),
+                Some(1),
             ),
             "add",
             "add i32",
         ),
         (
-            poot_kernelgen::binary_scalar_i32_geu_grid("exact_i32_geu", i32::MIN, None),
+            one_step_i32(
+                "exact_i32_geu",
+                poot_kernelgen::FusedScalarOp::GeU,
+                Some(i32::MIN),
+            ),
             "geu",
             "icmp uge i32",
         ),
         (
-            poot_kernelgen::binary_scalar_i32_remu_grid("exact_i32_remu", 0x7fff_ffff, None),
+            one_step_i32(
+                "exact_i32_remu",
+                poot_kernelgen::FusedScalarOp::RemU,
+                Some(0x7fff_ffff),
+            ),
             "remu",
             "urem i32",
         ),
         (
-            poot_kernelgen::binary_scalar_i32_grid(
+            one_step_i32(
                 "exact_i32_and",
-                poot_kernel_ir::BinOp::BitAnd,
-                -1,
-                None,
+                poot_kernelgen::FusedScalarOp::Binary(poot_kernel_ir::BinOp::BitAnd),
+                Some(-1),
             ),
             "and",
             "and i32",
         ),
         (
-            poot_kernelgen::binary_scalar_i32_grid(
+            one_step_i32(
                 "exact_i32_shr",
-                poot_kernel_ir::BinOp::Shr,
-                1,
-                None,
+                poot_kernelgen::FusedScalarOp::Binary(poot_kernel_ir::BinOp::Shr),
+                Some(1),
             ),
             "shr",
             "lshr i32",
         ),
         (
-            poot_kernelgen::unary_i32_clz_grid("exact_i32_clz", None),
+            one_step_i32("exact_i32_clz", poot_kernelgen::FusedScalarOp::Clz, None),
             "clz",
             "llvm.ctlz.i32",
         ),
         (
-            poot_kernelgen::unary_dt_grid(
+            one_step_i32(
                 "exact_i32_not",
-                poot_kernel_ir::Ty::I32,
-                poot_kernel_ir::UnOp::Not,
+                poot_kernelgen::FusedScalarOp::Unary(poot_kernel_ir::UnOp::Not),
                 None,
             ),
             "not",
@@ -204,7 +233,7 @@ fn packed_movement(name: &str, out_shape: Vec<usize>, op: MovementOp) -> poot_ke
 #[test]
 fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
     if !have("llc") {
-        eprintln!("llc not on PATH; skipping FP8 conversion lowering");
+        poot_test_util::skip_report("poot-kernelgen", &"llc not on PATH");
         return;
     }
     let dir = out_dir("e4m3fn");
@@ -333,7 +362,7 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
             compile(&body, target, &out).unwrap_or_else(|e| panic!("{name} {target:?}: {e}"));
             assert!(std::fs::metadata(&out).unwrap().len() > 0);
         } else {
-            eprintln!("no AMD toolchain; skipping {name} AMDGPU lowering");
+            poot_test_util::skip_report("poot-kernelgen", &"no AMD toolchain");
         }
     }
 }
@@ -348,7 +377,7 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
 #[test]
 fn concurrent_same_body_compiles_do_not_corrupt_the_shared_artifact() {
     if !have("llc") {
-        eprintln!("llc not on PATH; skipping concurrent-compile race test");
+        poot_test_util::skip_report("poot-kernelgen", &"llc not on PATH");
         return;
     }
     let dir = out_dir("race");
@@ -440,7 +469,7 @@ fn aie_kernels_lower_to_aie2p_via_peano() {
 #[test]
 fn add_spirv_validates() {
     if !have("llc") || !have("spirv-val") {
-        eprintln!("llc/spirv-val not on PATH; skipping");
+        poot_test_util::skip_report("poot-kernelgen", &"llc/spirv-val not on PATH");
         return;
     }
     let dir = out_dir("val");
@@ -468,46 +497,12 @@ fn add_spirv_validates() {
 #[test]
 fn coopmat_tile_spirv_validates() {
     if !have("llc") || !have("spirv-val") {
-        eprintln!("llc/spirv-val not on PATH; skipping");
+        poot_test_util::skip_report("poot-kernelgen", &"llc/spirv-val not on PATH");
         return;
     }
     let dir = out_dir("coopmat");
     let out = poot_codegen::artifact_path(&dir, "wmma_coopmat_tile", Target::SpirvVulkan);
     let body = poot_kernel_ir::test_support::wmma_tile("wmma_coopmat_tile");
-    compile(&body, Target::SpirvVulkan, &out).unwrap();
-    let v = Command::new("spirv-val")
-        .arg("--target-env")
-        .arg("vulkan1.3")
-        .arg(&out)
-        .output()
-        .unwrap();
-    assert!(
-        v.status.success(),
-        "spirv-val failed:\n{}",
-        String::from_utf8_lossy(&v.stderr)
-    );
-}
-
-/// Card 663 SC-003: the K-loop cooperative-matrix matmul (`K = 48`, three 16-wide blocks, batched) lowers through
-/// the real `compile()` path (`llc`, the `fix_coopmat_calls` post-process) to SPIR-V that `spirv-val` accepts: the
-/// accumulator fragment is a `Function` variable the loop reads and writes on every iteration, not a value that
-/// dies at the back-edge. The device result of the same kernel is the multi-block row in
-/// `poot-vulkan-device`'s parity table.
-#[test]
-fn coopmat_k_loop_spirv_validates() {
-    if !have("llc") || !have("spirv-val") {
-        eprintln!("llc/spirv-val not on PATH; skipping");
-        return;
-    }
-    let dir = out_dir("coopmat-k-loop");
-    let out = poot_codegen::artifact_path(&dir, "coopmat_k_loop", Target::SpirvVulkan);
-    let body = poot_kernelgen::matmul_tensorcore_coopmat(
-        "coopmat_k_loop",
-        &[2, 32, 32],
-        &[2, 32, 48],
-        &[2, 48, 32],
-    )
-    .expect("a 16-aligned batched shape");
     compile(&body, Target::SpirvVulkan, &out).unwrap();
     let v = Command::new("spirv-val")
         .arg("--target-env")
@@ -659,7 +654,7 @@ fn swapped_matrix_operands_are_refused_before_codegen() {
 #[test]
 fn whole_subgroup_selection_lowers_to_valid_spirv() {
     if !have("llc") || !have("spirv-val") {
-        eprintln!("llc/spirv-val not on PATH; skipping");
+        poot_test_util::skip_report("poot-kernelgen", &"llc/spirv-val not on PATH");
         return;
     }
     let dir = out_dir("coopmat-warp-select");
@@ -678,6 +673,116 @@ fn whole_subgroup_selection_lowers_to_valid_spirv() {
     );
 }
 
+/// POOT-1237: the per-element ops and the batched-weight tiled GEMM are generated bodies, so each lowers on every
+/// GPU target without a device: a broadcast binary over strided leaves, a two-byte float step (widen, compute, round
+/// back) and the batched tiled GEMM. A two-byte float body needs a native two-byte lane, which SPIR-V has none of
+/// (the planner refuses it there before it generates), so it is lowered on NVPTX and AMDGCN only.
+///
+/// Mutation: in `check_float_region_tys`, type a two-byte step as `F32`; the narrow body no longer generates (its
+/// step register and its operands disagree), and this row and `a_two_byte_float_step_computes_in_f32_and_rounds_back`
+/// go red.
+#[test]
+fn generated_pointwise_and_batched_tiled_bodies_lower_on_every_gpu_target() {
+    if !have("llc") {
+        poot_test_util::skip_report("poot-kernelgen", &"llc not on PATH");
+        return;
+    }
+    use poot_kernelgen::{
+        ContractionSpec, DenseTiledContraction, DenseTiledWeight, FusedInput, FusedKernel,
+        FusedScalarOp, KernelRequest, Layout, LeafId, LeafTy, RegisterTiling, TiledShape,
+        WeightLayout, fused_views,
+    };
+    let leaf = |index| FusedInput::Leaf(LeafId::new(index));
+    let (a_shape, b_shape, out_shape) = ([2usize, 1, 4], [3usize, 1], [2usize, 3, 4]);
+    let broadcast = |tys: Vec<LeafTy>, op, lit: Option<f32>| {
+        let mut inputs = vec![leaf(0), leaf(1)];
+        inputs.extend(lit.map(FusedInput::Lit));
+        let kernel = FusedKernel::one_step(op, tys, inputs);
+        fused_views(
+            "k",
+            &out_shape,
+            &[&a_shape, &b_shape],
+            &[Layout::contiguous(&a_shape), Layout::contiguous(&b_shape)],
+            &kernel,
+            None,
+        )
+        .expect("a broadcast binary generates")
+    };
+    let add = FusedScalarOp::Binary(poot_kernel_ir::BinOp::Add);
+    // Three `[17, 24] x [24, 21]` products, one `[K, N]` weight slab each: the register-tiled GEMM's blocks.
+    let batched_tiled = || {
+        let caps = poot_target::DeviceCaps::wgpu_rdna3_igpu();
+        let (blocks, m, k, n) = (3usize, 17usize, 24usize, 21usize);
+        let tiling = RegisterTiling::choose(
+            TiledShape {
+                blocks,
+                m_per_block: m,
+                out_per_block: n,
+                k,
+                layout: WeightLayout::Kn,
+                segments: 1,
+            },
+            &caps,
+        );
+        let (tile_rows, tile_cols) = tiling.output_tile();
+        let tiles = blocks * m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
+        let lanes = tiling.lanes() * tiling.lanes();
+        let request =
+            KernelRequest::Contraction(ContractionSpec::DenseTiled(DenseTiledContraction {
+                weight: DenseTiledWeight::KnF32,
+                schedule: tiling.schedule(),
+                epilogue: None,
+                grid: [(tiles * lanes) as u32, 1, 1],
+                meta: vec![k as u32, n as u32, m as u32, tiles as u32, 0],
+            }));
+        let limits = poot_kernelgen::BodyLimits {
+            max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),
+            max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),
+        };
+        poot_kernelgen::generate(&request, &caps, &limits)
+            .expect("a batched tiled GEMM generates")
+            .body
+    };
+    // (name, body, lowers on SPIR-V).
+    let bodies = [
+        (
+            "bcast_f32",
+            broadcast(vec![LeafTy::F32; 2], add, None),
+            true,
+        ),
+        (
+            "bcast_bf16",
+            broadcast(vec![LeafTy::BF16; 2], add, None),
+            false,
+        ),
+        (
+            "bcast_f16",
+            broadcast(vec![LeafTy::F16; 2], add, None),
+            false,
+        ),
+        ("tiled_batched", batched_tiled(), true),
+    ];
+    let dir = out_dir("pointwise-lowers");
+    let mut targets = vec![Target::SpirvVulkan, Target::Nvptx];
+    if amd_toolchain_available() {
+        targets.push(Target::AmdGcn(poot_target::AmdArch::gfx1151()));
+    }
+    for (name, body, on_spirv) in &bodies {
+        for &target in &targets {
+            if target == Target::SpirvVulkan && !on_spirv {
+                continue;
+            }
+            let out = poot_codegen::artifact_path(&dir, name, target);
+            compile(body, target, &out)
+                .unwrap_or_else(|error| panic!("{name} {target:?}: {error}"));
+            assert!(
+                std::fs::metadata(&out).unwrap().len() > 0,
+                "{name} {target:?}"
+            );
+        }
+    }
+}
+
 /// Whether an AMDGPU-capable toolchain is available. `compile()` for `Target::AmdGcn` needs a runnable
 /// `$POOT_AMD_CLANG` (the AMD-flavored clang that adds the HSA load headers) and has no fallback.
 fn amd_toolchain_available() -> bool {
@@ -694,7 +799,7 @@ fn amd_toolchain_available() -> bool {
 #[test]
 fn add_lowers_to_amdgpu() {
     if !amd_toolchain_available() {
-        eprintln!("no AMD toolchain (POOT_AMD_CLANG) available; skipping AMDGPU lowering test");
+        poot_test_util::skip_report("poot-kernelgen", &"no AMD toolchain");
         return;
     }
     let target = Target::AmdGcn(poot_target::AmdArch::gfx1151());
@@ -745,7 +850,7 @@ fn add_lowers_to_amdgpu() {
 #[test]
 fn fence_lowers_to_amdgpu_both_scopes() {
     if !amd_toolchain_available() {
-        eprintln!("no AMD toolchain (POOT_AMD_CLANG) available; skipping AMDGCN fence test");
+        poot_test_util::skip_report("poot-kernelgen", &"no AMD toolchain");
         return;
     }
     let target = Target::AmdGcn(poot_target::AmdArch::gfx1151());
@@ -780,7 +885,7 @@ fn fence_lowers_to_amdgpu_both_scopes() {
 #[test]
 fn second_amd_target_follows_mach() {
     if !amd_toolchain_available() {
-        eprintln!("no AMD toolchain (POOT_AMD_CLANG) available; skipping second-target test");
+        poot_test_util::skip_report("poot-kernelgen", &"no AMD toolchain");
         return;
     }
     let target = Target::AmdGcn(poot_target::AmdArch::new("gfx1100", 32));
@@ -805,26 +910,20 @@ fn second_amd_target_follows_mach() {
     );
 }
 
-/// Card 145 follow-on (spec 130 FR-004): the AMD WMMA tensor-core matmul body lowers to the RDNA3 WMMA
-/// intrinsic for `Target::AmdGcn(gfx1151)`. This is the body `plan_eqn` selects for a mixed
-/// bf16-in/f32-out matmul, the only shape that reaches AMD WMMA (see the plan-side test
-/// `amd_wmma_reached_only_by_mixed_bf16_in_f32_out`). `emit_llvm_ir` is pure Rust (no llc, no GPU), so
-/// this always runs. It guards that WMMA selection codegens the intrinsic, not a serial fallback or an
-/// unresolved extern. With the AMD toolchain present it also lowers the IR through llc to an HSACO;
-/// otherwise it skips only that half.
+/// Card 145 follow-on (spec 130 FR-004): a Bf16 fragment tile lowers to the RDNA3 bf16 WMMA intrinsic for
+/// `Target::AmdGcn(gfx1151)`. `emit_llvm_ir` is pure Rust (no llc, no GPU), so this always runs. It guards
+/// that a Bf16 fragment codegens the intrinsic, not an unresolved extern. With the AMD toolchain present it
+/// also lowers the IR through llc to an HSACO; otherwise it skips only that half.
 #[test]
-fn amd_wmma_matmul_lowers_to_wmma_intrinsic() {
-    use poot_kernel_ir::Ty;
+fn amd_wmma_bf16_tile_lowers_to_the_bf16_intrinsic() {
     use poot_target::AmdArch;
     let target = Target::AmdGcn(AmdArch::gfx1151());
-    // bf16 operands, f32 output: the mixed-precision matmul the plan routes to AMD WMMA.
-    let body = poot_kernelgen::matmul_tensorcore("k", Ty::F32, &[16, 16], &[16, 32], &[32, 16])
-        .expect("matmul_tensorcore precondition");
+    let body = poot_kernel_ir::test_support::wmma_tile_of("k", poot_kernel_ir::WmmaDtype::Bf16);
     let ir = emit_llvm_ir(&body, target).expect("emit AMD WMMA IR");
     // The RDNA3 WMMA 16x16x16 bf16-in/f32-accumulate intrinsic (emit.rs `emit_wmma_mma_amdgcn`).
     assert!(
         ir.contains("llvm.amdgcn.wmma.f32.16x16x16.bf16"),
-        "AMD WMMA matmul must lower to the RDNA3 WMMA intrinsic; IR:\n{ir}"
+        "a Bf16 fragment tile must lower to the RDNA3 bf16 WMMA intrinsic; IR:\n{ir}"
     );
     // The NVPTX tensor-core intrinsic must not leak into the AMD lowering.
     assert!(

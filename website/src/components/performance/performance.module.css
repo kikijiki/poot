@@ -1,0 +1,315 @@
+/* Chart palette: the site theme (ink and surface purples, coral primary, mint accent), one fixed slot per series
+   (see format.ts). Surfaces and lines come from the theme tokens in css/custom.css. */
+.root {
+  color-scheme: light;
+  --surface: #fffcfc;
+  --text-primary: #1f1620;
+  --text-secondary: #54454f;
+  --text-muted: #75666f;
+  --grid: #ece1e5;
+  --border: #e4d7dd;
+  --series-1: #d1344f;
+  --series-2: #0f9d8a;
+  --series-3: #7a5cc7;
+  --series-4: #d98a00;
+  --series-5: #2e7bd6;
+  --series-6: #3a9a3a;
+  --series-7: #b0623a;
+  --series-8: #5d6b85;
+  --series-9: #8a8590;
+  margin: 1.5rem 0;
+}
+
+:global([data-theme='dark']) .root {
+  color-scheme: dark;
+  --surface: var(--poot-surface);
+  --text-primary: #f3eaf0;
+  --text-secondary: #cdbfcb;
+  --text-muted: #a898a6;
+  --grid: #3a2f44;
+  --border: #3a2f44;
+  --series-1: #ff8fa3;
+  --series-2: #5eead4;
+  --series-3: #b79cff;
+  --series-4: #ffc15e;
+  --series-5: #6fb4ff;
+  --series-6: #8bd17c;
+  --series-7: #ffb38a;
+  --series-8: #9db0d6;
+  --series-9: #a79fb0;
+}
+
+.pickerLabel {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.charts {
+  display: grid;
+  gap: 0.8rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-bottom: 0.8rem;
+}
+
+@media (max-width: 1200px) {
+  .charts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
+  .charts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.charts > .frame {
+  margin: 0;
+}
+
+.frameSub {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  margin-bottom: 0.2rem;
+}
+
+.frameNote {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  margin-top: 0.3rem;
+}
+
+.valueTextMuted {
+  fill: var(--text-muted);
+  font-size: 12px;
+  font-style: italic;
+  font-variant-numeric: tabular-nums;
+}
+
+.swatch {
+  border-radius: 2px;
+  display: inline-block;
+  height: 0.7rem;
+  margin-right: 0.4rem;
+  width: 0.7rem;
+}
+
+.frame {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  margin: 1rem 0;
+  padding: 0.9rem 1rem 0.75rem;
+}
+
+.frameTitle {
+  color: var(--text-primary);
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 0;
+}
+
+.select {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.3rem;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 0.15rem 0.35rem;
+}
+
+.legend {
+  color: var(--text-secondary);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 0.8rem;
+  gap: 0.25rem 1rem;
+  margin: 0.4rem 0 0.2rem;
+}
+
+.plot {
+  overflow-x: clip;
+  position: relative;
+  width: 100%;
+}
+
+.svg {
+  display: block;
+  font-family: var(--ifm-font-family-base);
+  overflow: visible;
+}
+
+.axisText {
+  fill: var(--text-muted);
+  font-size: 11px;
+}
+
+.labelText {
+  fill: var(--text-secondary);
+  font-size: 12px;
+}
+
+.groupText {
+  fill: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.valueText {
+  fill: var(--text-primary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.gridLine {
+  stroke: var(--grid);
+  stroke-width: 1;
+}
+
+.whisker {
+  stroke: var(--text-secondary);
+  stroke-width: 1.5;
+}
+
+/* A range whisker of a line chart is drawn in its series colour: a grey one reads as a stray axis line. */
+.whiskerSeries {
+  opacity: 0.55;
+  stroke-width: 1.5;
+}
+
+.tooltip {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  color: var(--text-primary);
+  font-size: 0.75rem;
+  line-height: 1.35;
+  padding: 0.35rem 0.55rem;
+  white-space: nowrap;
+}
+
+.tooltipTitle {
+  font-weight: 600;
+  margin-bottom: 0.2rem;
+}
+
+.tooltipRow {
+  align-items: center;
+  display: flex;
+  gap: 0.75rem;
+}
+
+.tooltipRow .swatch {
+  flex: none;
+  margin-right: 0;
+}
+
+.tooltipLabel {
+  flex: 1;
+}
+
+.tooltipValue {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.sentence {
+  color: var(--text-secondary);
+}
+
+/* The controls of the page: the top row holds the pickers of a single column on the left and the Compare switch on the right. */
+.top {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  justify-content: space-between;
+  margin-bottom: 0.8rem;
+}
+
+.knobs {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.2rem;
+}
+
+.knob {
+  align-items: center;
+  display: inline-flex;
+  gap: 0.5rem;
+}
+
+.switch {
+  align-items: center;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 0.85rem;
+  gap: 0.4rem;
+  margin-left: auto;
+}
+
+/* Comparison: both columns are spans of one grid (each column's rows are subgrid rows), so row n holds the same kind of chart on both sides
+   at one height. An empty `.slot` keeps a row when a side lacks that chart. */
+.sides {
+  column-gap: 1.2rem;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  row-gap: 0.8rem;
+}
+
+.column {
+  min-width: 0;
+}
+
+.sides > .column {
+  display: grid;
+  grid-row: span var(--rows);
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: subgrid;
+}
+
+.sides > .column > .knobs,
+.sides > .column > .legend {
+  margin: 0;
+}
+
+.chartsHalf {
+  display: contents;
+}
+
+.chartsHalf > .frame {
+  margin: 0;
+}
+
+/* Sides stacked: each column is its own flow again. */
+@media (max-width: 700px) {
+  .sides {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 1.2rem;
+  }
+
+  .sides > .column {
+    display: block;
+    grid-row: auto;
+  }
+
+  .sides > .column > .knobs {
+    margin-bottom: 0.6rem;
+  }
+
+  .chartsHalf {
+    display: grid;
+    gap: 0.8rem;
+    margin: 0.8rem 0;
+  }
+
+  .slot {
+    display: none;
+  }
+}

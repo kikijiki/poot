@@ -1,5 +1,5 @@
 //! POOT-761 acceptance on ROCm: `IndexedMatMul` through `compile` and the executor contract, on the indexed
-//! contraction (`ContractionSpec::Indexed`: the Gemv at a decode row count, the segmented Tiled above it).
+//! contraction (`ContractionSpec::Indexed`: the Gemv at a decode row count, the register-tiled expert walk above it).
 //!
 //! Operands are integer-valued with `K * 3 * 3` far below `2^24`, so every partial sum is exact and every summation
 //! order and fused multiply-add gives the same bits: the device output equals the oracle `to_bits` on every element,
@@ -266,7 +266,7 @@ fn routed_gate_weighting_fused_equals_the_oracle_bit_for_bit() {
 
 /// POOT-646 SC-001: experts held in checkpoint `[E, N, K]` order and read through `transpose(w, [0, 2, 1])` equal
 /// the oracle `to_bits` on every element: `M = 1` and `M = 5` (the Gemv, ids unsorted with repeats) and a prefill
-/// shape (the segmented Tiled, shuffled ids).
+/// shape (the register-tiled expert walk, shuffled ids).
 #[test]
 fn indexed_matmul_checkpoint_order_experts_match_the_oracle_bit_for_bit() {
     let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
@@ -378,7 +378,7 @@ fn bf16_program(ids: &[i32], checkpoint_order: bool, gate: Option<Vec<f32>>) -> 
 
 /// POOT-1028: `IndexedMatMul` over a BF16-resident expert stack equals the oracle `to_bits` on every element, in
 /// both orientations, with and without the gate epilogue, at a decode shape (the Gemv) and a prefill shape whose
-/// tiles cross expert boundaries (the segmented Tiled): the packed lanes are widened in-register and no f32 copy of
+/// tiles cross expert boundaries (the register-tiled expert walk): the packed lanes are widened in-register and no f32 copy of
 /// the stack exists.
 ///
 /// Mutation (`WeightLane::decode_low_half`, `poot-kernelgen/src/helpers.rs`): shift the BF16 bits by 15 instead of

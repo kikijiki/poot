@@ -16,6 +16,7 @@ test-support = []
 [dependencies]
 blake3.workspace = true
 poot-kernel-ir.workspace = true
+poot-npu-artifacts.workspace = true
 poot-runtime-common.workspace = true
 poot-target.workspace = true
 thiserror.workspace = true

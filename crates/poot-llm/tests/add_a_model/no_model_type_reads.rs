@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 /// The source directories that may not read `model_type`.
 fn source_dirs() -> [PathBuf; 2] {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = poot_test_util::manifest_dir();
+    let manifest = manifest.as_path();
     [manifest.join("src"), manifest.join("../poot-load/src")]
 }
 

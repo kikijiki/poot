@@ -6,7 +6,9 @@
 //! absolute positions in `Slot::Pos`, so a chunk continuing a sequence rotates at its true
 //! positions.
 
-use poot_graph_ir::rope_table::{RopeFlavor, RopeSpec, RopeSpecError, RopeTable, rope_tables};
+use poot_graph_ir::rope_table::{
+    RopeFactors, RopeFlavor, RopeSpec, RopeSpecError, RopeTable, rope_tables,
+};
 use poot_graph_ir::{BinOp, Builder, Slot, SlotKey, Traced, UnOp, ops};
 
 use poot_quant::weights::WeightEntry;
@@ -114,9 +116,21 @@ impl RopeParams {
             }
         }
         let spec = RopeSpec::new(rotary_dim, theta, flavor).map_err(|e| match e {
-            RopeSpecError::FactorArrays => {
-                ParamError::new("rope_scaling", ConfigReason::Unsupported)
-            }
+            RopeSpecError::FactorLength {
+                regime,
+                expected,
+                got,
+            } => ParamError::new(
+                if regime == "short" {
+                    "rope_scaling.short_factor"
+                } else {
+                    "rope_scaling.long_factor"
+                },
+                ConfigReason::Mismatch {
+                    expected,
+                    found: got,
+                },
+            ),
             RopeSpecError::Extent { what, .. } => ParamError::new(
                 what,
                 ConfigReason::Exceeds {
@@ -327,11 +341,14 @@ fn llama3_flavor_from_factors(
 /// The flavor an HF `rope_scaling` block names (`rope_type`, or Phi's `type`): absent, `null` or
 /// `default` is plain; `linear`, `dynamic`, `yarn` and `llama3` read their HF fields (YaRN's
 /// `beta_fast`/`beta_slow` default to HF's 32 and 1; dynamic NTK's and an omitted YaRN original
-/// context are `max_positions`, as HF reads them). Any other type, including `longrope` (whose
-/// per-frequency arrays a computed table cannot hold), is a typed refusal.
+/// context are `max_positions`, as HF reads them); `longrope` reads its `short_factor` and
+/// `long_factor` arrays, and its trained context from the block, else `config_original` (the
+/// config's own `original_max_position_embeddings`), else `max_positions`. Any other type is a typed
+/// refusal.
 pub fn hf_rope_flavor(
     scaling: Option<&serde_json::Value>,
     max_positions: usize,
+    config_original: Option<usize>,
 ) -> Result<RopeFlavor<'static>, ParamError> {
     let wrong = |field| ParamError::new(field, ConfigReason::WrongType);
     let missing = |field| ParamError::new(field, ConfigReason::Missing);
@@ -385,6 +402,29 @@ pub fn hf_rope_flavor(
                 beta_fast: float("rope_scaling.beta_fast", "beta_fast")?.unwrap_or(32.0),
                 beta_slow: float("rope_scaling.beta_slow", "beta_slow")?.unwrap_or(1.0),
                 attention_factor: float("rope_scaling.attention_factor", "attention_factor")?,
+            }
+        }
+        "longrope" => {
+            if scaling.contains_key("attention_factor") {
+                return Err(ParamError::new(
+                    "rope_scaling.attention_factor",
+                    ConfigReason::Unsupported,
+                ));
+            }
+            let table = |field: &'static str, key: &str| -> Result<&'static [f32], ParamError> {
+                let values = scaling.get(key).ok_or(missing(field))?;
+                let values = values.as_array().ok_or(wrong(field))?;
+                let values = values
+                    .iter()
+                    .map(|v| v.as_f64().map(|v| v as f32).ok_or(wrong(field)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(RopeFactors::intern(&values).as_slice())
+            };
+            RopeFlavor::LongRope {
+                original: original()?.or(config_original).unwrap_or(max_positions),
+                max_positions,
+                short: Some(table("rope_scaling.short_factor", "short_factor")?),
+                long: Some(table("rope_scaling.long_factor", "long_factor")?),
             }
         }
         "llama3" => RopeFlavor::Llama3 {
@@ -890,9 +930,15 @@ mod tests {
                     original: 8,
                     max_positions: 16,
                     short: None,
-                    long: None,
+                    long: Some(&[1.0; 3]),
                 },
-                ParamError::new("rope_scaling", ConfigReason::Unsupported),
+                ParamError::new(
+                    "rope_scaling.long_factor",
+                    ConfigReason::Mismatch {
+                        expected: 4,
+                        found: 3,
+                    },
+                ),
             ),
         ];
         for (rotary, theta, flavor, want) in cases {
@@ -906,8 +952,8 @@ mod tests {
 
     #[test]
     fn hf_rope_scaling_reads_each_table_flavor_and_refuses_the_rest() {
-        let flavor = |v: serde_json::Value| hf_rope_flavor(Some(&v), 4096);
-        assert_eq!(hf_rope_flavor(None, 4096), Ok(RopeFlavor::Plain));
+        let flavor = |v: serde_json::Value| hf_rope_flavor(Some(&v), 4096, None);
+        assert_eq!(hf_rope_flavor(None, 4096, None), Ok(RopeFlavor::Plain));
         assert_eq!(flavor(json!(null)), Ok(RopeFlavor::Plain));
         assert_eq!(
             flavor(json!({"type": "linear", "factor": 2.0})),
@@ -944,11 +990,46 @@ mod tests {
                 original: 8192
             })
         );
+        let longrope = |original, max_positions| RopeFlavor::LongRope {
+            original,
+            max_positions,
+            short: Some(&[1.0, 1.5]),
+            long: Some(&[2.0, 3.0]),
+        };
+        let block =
+            json!({"type": "longrope", "short_factor": [1.0, 1.5], "long_factor": [2.0, 3.0]});
+        assert_eq!(flavor(block.clone()), Ok(longrope(4096, 4096)));
+        assert_eq!(
+            hf_rope_flavor(Some(&block), 8192, Some(2048)),
+            Ok(longrope(2048, 8192))
+        );
+        let own = json!({"type": "longrope", "short_factor": [1.0, 1.5],
+            "long_factor": [2.0, 3.0], "original_max_position_embeddings": 1024});
+        assert_eq!(
+            hf_rope_flavor(Some(&own), 8192, Some(2048)),
+            Ok(longrope(1024, 8192))
+        );
         let refused = |v, field, reason| {
             assert_eq!(flavor(v), Err(ParamError::new(field, reason)));
         };
         refused(
             json!({"type": "longrope", "short_factor": [1.0]}),
+            "rope_scaling.long_factor",
+            ConfigReason::Missing,
+        );
+        refused(
+            json!({"type": "longrope", "short_factor": [1.0, "x"], "long_factor": [1.0, 1.0]}),
+            "rope_scaling.short_factor",
+            ConfigReason::WrongType,
+        );
+        refused(
+            json!({"type": "longrope", "short_factor": [1.0], "long_factor": [1.0],
+            "attention_factor": 1.2}),
+            "rope_scaling.attention_factor",
+            ConfigReason::Unsupported,
+        );
+        refused(
+            json!({"type": "madeup"}),
             "rope_scaling.rope_type",
             ConfigReason::Unsupported,
         );

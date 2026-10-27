@@ -1,7 +1,7 @@
 # candle runner notes (research 2026-06-12, candle 0.10.2)
 
 > Status: snapshot. Pins as of 2026-06; spot-checked 2026-09-19 against `benchmarks/docker/Dockerfile`
-> (llama.cpp b9601, vLLM 0.22.1, transformers 5.0.0, candle 0.10.2 match). The image is the source of truth and
+> (llama.cpp v0.4.1, vLLM 0.22.1, transformers 5.0.0, candle 0.10.2 match). The image is the source of truth and
 > is now Ubuntu 24.04 / CUDA 12.6.3, so CUDA 12.4 / Ubuntu 22.04 mentions below are stale.
 
 Rust peer. Pin published crates `=0.10.2` (candle-core / candle-nn / candle-transformers all on the SAME

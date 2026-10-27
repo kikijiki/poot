@@ -5,17 +5,20 @@
 # a skip is never a pass. Sorted in canonical (LC_ALL=C) order.
 #
 # Card 553: the raw-Vulkan add dispatch and the live device caps receipts in poot-vulkan-runtime (the
-# RADV WMMA row is how a device that stops reporting its matrix hardware is caught: the cooperative-matrix
-# row below would only skip), and the whole poot-vulkan-device suite: the parity table and executor-coverage
+# RADV WMMA row is how a device that stops reporting its matrix hardware is caught), and the whole
+# poot-vulkan-device suite: the parity table and executor-coverage
 # rows (parity), the executor-contract rows (executor_contract: one recording over 16 steps, buffers across
 # threads, argument element counts, copy, submission cuts, kernel faults, device time, memory by role),
-# driver generation against wgpu (generate), the wide dispatch (large_grid) and the cooperative-matrix
-# matmul (coopmat). POOT-1081: the live memory budget row (executor_contract) and the served dense row
+# driver generation against wgpu (generate) and the wide dispatch (large_grid). POOT-1081: the live memory budget row (executor_contract) and the served dense row
 # (poot-serve served_groups: startup admits raw Vulkan on its VK_EXT_memory_budget figure). The Qwen2.5-0.5B
 # row is #[ignore]d (it loads a checkpoint: run by exact name). POOT-1231: every recorded family's fixture row
 # (`recorded_<family>_tokens_vulkan`), the attached-device limit row, and the receipt that the raw Vulkan
 # reference caps are the device's own.
 poot-llm	driver::device_tests::attached_device_limit_refuses_an_oversized_constant_vulkan
+poot-llm	driver::device_tests::chunked_prefill_matches_one_shot_dense_vulkan
+poot-llm	driver::device_tests::chunked_prefill_matches_one_shot_moe_vulkan
+poot-llm	driver::device_tests::chunked_prefill_matches_one_shot_recurrent_vulkan
+poot-llm	driver::device_tests::chunked_prefill_matches_one_shot_sliding_window_vulkan
 poot-llm	driver::device_tests::recorded_bloom_tokens_vulkan
 poot-llm	driver::device_tests::recorded_deepseek2_tokens_vulkan
 poot-llm	driver::device_tests::recorded_deepseek32_tokens_vulkan
@@ -56,7 +59,6 @@ poot-llm::vulkan_parity_models	sixteen_replayed_steps_record_once
 poot-llm::vulkan_parity_models	softcapped_qwen2_matches_the_oracle_on_vulkan
 poot-serve::served_groups	served_qwen2_vulkan
 poot-serve::served_loop	served_device_timing_flag_reports_unknown_device_time_on_raw_vulkan_vulkan
-poot-vulkan-device::coopmat	coopmat_matmul_plans_the_coopmat_arm_and_matches_the_cpu_product_on_vulkan
 poot-vulkan-device::copy	copy_between_unequal_lengths_is_refused_on_vulkan
 poot-vulkan-device::copy	copy_of_an_odd_byte_length_is_exact_on_vulkan
 poot-vulkan-device::copy	transaction_misuse_is_a_typed_error_on_vulkan
@@ -70,21 +72,23 @@ poot-vulkan-device::executor_contract	an_over_length_dispatch_is_refused_by_the_
 poot-vulkan-device::executor_contract	copy_round_trips_every_element_width_with_no_sentinel_left
 poot-vulkan-device::executor_contract	dispatch_reads_the_argument_element_count_not_the_buffer_capacity
 poot-vulkan-device::executor_contract	lp3_vulkan_write_with_is_exact_into_the_mapping
+poot-vulkan-device::executor_contract	the_vulkan_device_names_its_adapter_and_driver
 poot-vulkan-device::executor_contract	the_vulkan_device_reports_live_free_memory_within_its_open_time_ceiling
 poot-vulkan-device::large_grid	flash_prefill_over_65535_workgroups_is_one_wide_dispatch_and_matches_the_oracle_on_vulkan
 poot-vulkan-device::parity	a_one_dispatch_grid_past_255_workgroups_matches_the_oracle_on_vulkan
 poot-vulkan-device::parity	adjusted_sampling_head_matches_the_oracle_on_vulkan
 poot-vulkan-device::parity	alibi_slopes_attention_matches_the_oracle_and_the_reference_on_vulkan
 poot-vulkan-device::parity	arg_top_k_over_a_partial_last_workgroup_matches_the_oracle_on_vulkan
-poot-vulkan-device::parity	batched_multi_block_coopmat_matmul_matches_the_oracle_on_vulkan
 poot-vulkan-device::parity	bf16_const_cast_is_bit_exact_on_vulkan
 poot-vulkan-device::parity	block_top_k_selects_what_the_plain_selection_selects_on_vulkan
 poot-vulkan-device::parity	captured_replay_of_the_toy_graphs_equals_the_recording_step_on_vulkan
 poot-vulkan-device::parity	checkpoint_orientation_projection_matches_the_oracle_on_vulkan
 poot-vulkan-device::parity	chunked_gdn_prefill_matches_the_sequential_recurrence_on_vulkan
+poot-vulkan-device::parity	expert_grouping_is_the_stable_sort_and_changes_no_row_on_vulkan
 poot-vulkan-device::parity	f16_checkpoint_orientation_projection_matches_the_oracle_on_vulkan
 poot-vulkan-device::parity	flash_attention_with_a_per_head_alibi_mask_matches_the_oracle_on_vulkan
 poot-vulkan-device::parity	greedy_sample_token_is_exact_on_vulkan
+poot-vulkan-device::parity	packed_decode_gemv_matches_llama_cpp_dequantisation_on_real_blocks_on_vulkan
 poot-vulkan-device::parity	packed_linears_and_the_indexed_expert_contraction_match_the_oracle_on_vulkan
 poot-vulkan-device::parity	paged_attention_reads_the_pools_in_place_and_matches_the_oracle_on_vulkan
 poot-vulkan-device::parity	select_is_bitwise_on_vulkan
@@ -92,7 +96,7 @@ poot-vulkan-device::parity	selected_attention_reads_exactly_the_selected_blocks_
 poot-vulkan-device::parity	split_kv_decode_matches_the_oracle_on_vulkan
 poot-vulkan-device::parity	split_kv_decode_replay_equals_the_recording_step_on_vulkan
 poot-vulkan-device::parity	tied_moe_routing_picks_the_lowest_index_first_on_vulkan
-poot-vulkan-device::parity	tiled_region_with_a_remainder_tile_matches_the_oracle_on_vulkan
+poot-vulkan-device::parity	tiled_gemm_with_a_remainder_tile_matches_the_oracle_on_vulkan
 poot-vulkan-runtime	context::init::launch_caps_device_receipt::a_live_vulkan_device_reports_its_own_launch_limits
 poot-vulkan-runtime::device_caps	device_caps_is_plausible_on_the_real_device
 poot-vulkan-runtime::device_caps	raw_vulkan_reports_wmma_class_support_on_this_box

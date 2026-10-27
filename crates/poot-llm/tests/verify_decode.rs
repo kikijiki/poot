@@ -337,7 +337,7 @@ fn verify_forward_is_causally_invariant_to_later_draft_tokens() {
 
 /// Card 094 bug 2 root cause: the verify step's raw decomposition (`ops::attention_masked`) is
 /// causally correct (`verify_forward_is_causally_invariant_to_later_draft_tokens`), but serving
-/// lowers through `compile`'s pass pipeline, which includes `flash_attention_capped`. The verify step's
+/// lowers through `compile`'s pass pipeline, which includes `flash_attention`. The verify step's
 /// K/V is the full `[.,.,cap,.]` carried cache (`cap > L` once a prefix exists) with a `[L,cap]` mask,
 /// so the fused `Attention` op must index its keys by their own length, not by the query's `L`: a kernel
 /// that attended only the first `L` cache slots corrupted every row (including row 0) once any prefix

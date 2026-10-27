@@ -22,12 +22,6 @@ use poot_kernel_ir::Body;
 use crate::{CompileError, CompiledArtifact, Target, Toolchain, capability, compile};
 use poot_target::Backend;
 
-/// The 64-bit content fingerprint of a kernel `Body` (a hash of its `Debug` form). Only the AIE identity
-/// text still names a body this way; every byte-artifact kernel is named by its [`KernelId`].
-pub(crate) fn body_fingerprint(body: &Body) -> u64 {
-    poot_runtime_common::fnv1a_bytes(format!("{body:?}").as_bytes())
-}
-
 /// The 128-bit content identity of one compiled kernel: a blake3 hash over the target (its whole `Debug`
 /// form, so an AMD arch's wavefront width counts), the target's [`Capability`](crate::Capability) (what
 /// shapes a body for it) and the body's `Debug` text. Two bodies with equal text for different targets are
@@ -46,14 +40,6 @@ impl KernelId {
         Self::truncated(hasher.finalize())
     }
 
-    /// The id of a linked AIE artifact: its core-object and link identity digests, side by side.
-    fn of_aie(core_digest: u64, link_digest: u64) -> Self {
-        let mut bytes = [0; 16];
-        bytes[..8].copy_from_slice(&core_digest.to_be_bytes());
-        bytes[8..].copy_from_slice(&link_digest.to_be_bytes());
-        Self(bytes)
-    }
-
     fn truncated(hash: blake3::Hash) -> Self {
         Self(
             hash.as_bytes()[..16]
@@ -64,6 +50,14 @@ impl KernelId {
 
     fn from_bytes(bytes: &[u8]) -> Option<Self> {
         Some(Self(bytes.try_into().ok()?))
+    }
+}
+
+/// The id of an artifact an external compiler (the NPU's linker) names itself, as the 128 bits of its own
+/// identity digest.
+impl From<[u8; 16]> for KernelId {
+    fn from(bytes: [u8; 16]) -> Self {
+        Self(bytes)
     }
 }
 
@@ -82,7 +76,9 @@ impl std::fmt::Debug for KernelId {
 /// The `poot-codegen` source-tree hash, computed at build time by `build.rs` from `src/**/*.rs` and
 /// exported as `POOT_CODEGEN_SRC_HASH`. Folding it into the epoch makes an emitter change (e.g. to
 /// `src/emit.rs`) invalidate the cache; the `Body`+arch half of the key cannot see such a change.
-const CODEGEN_SRC_HASH: &str = env!("POOT_CODEGEN_SRC_HASH");
+/// The 16-hex-digit hash of `poot-codegen`'s own source, folded into every cache epoch, and into the identity of
+/// every artifact an external compiler builds from this crate's output (the NPU's core objects).
+pub const CODEGEN_SRC_HASH: &str = env!("POOT_CODEGEN_SRC_HASH");
 
 /// Resolve which compiler binary [`compile`] would invoke for `target`, without running it. `"unset"` when the
 /// target's toolchain is not configured: `compile` fails for it, so the epoch only needs a stable value.
@@ -128,7 +124,8 @@ fn epoch_canonical(target: Target) -> String {
     let device_libs = std::env::var("POOT_ROCM_DEVICE_LIBS").unwrap_or_default();
     let flags = target.llc_args().join(" ");
     format!(
-        "poot-kernel-cache-v1\ncodegen_src={CODEGEN_SRC_HASH}\ntool={tool}\ntool_version={tool_version}\ndevice_libs={device_libs}\nflags={flags}"
+        "poot-kernel-cache-v1\ncodegen_src={}\ntool={tool}\ntool_version={tool_version}\ndevice_libs={device_libs}\nflags={flags}",
+        CODEGEN_SRC_HASH
     )
 }
 
@@ -454,25 +451,8 @@ fn cache_kind(target: Target) -> &'static str {
     match target {
         Target::Nvptx => "ptx",
         Target::SpirvVulkan => "spirv",
-        Target::SpirvOpenCl => "spirv-opencl",
         Target::AmdGcn(_) => "rocm",
         Target::AieCore => "aie",
-    }
-}
-
-/// The `poot-codegen` source hash folded into every AIE identity (see [`CODEGEN_SRC_HASH`]).
-pub(crate) fn codegen_src_hash() -> &'static str {
-    CODEGEN_SRC_HASH
-}
-
-/// The entry key of a linked AIE artifact: the digests of its core-object identity and its link identity
-/// (both over canonical, length-tagged text), so a changed Body, shape, layout, recipe, platform or
-/// toolchain names a different entry. The epoch is not part of the name: every input to the compiler's
-/// output is in the identities.
-pub(crate) fn aie_entry_key(core_digest: u64, link_digest: u64) -> KernelKey {
-    KernelKey {
-        name: format!("a{core_digest:016x}{link_digest:016x}.aie"),
-        id: KernelId::of_aie(core_digest, link_digest),
     }
 }
 
@@ -492,6 +472,13 @@ pub struct KernelKey {
 }
 
 impl KernelKey {
+    /// The key of an artifact an external compiler (the NPU's linker) builds and names itself: `name` is the
+    /// entry's file name and `id` its identity. The epoch is not part of it, so every input to that
+    /// compiler's output must be in `id`.
+    pub fn artifact(name: String, id: KernelId) -> Self {
+        Self { name, id }
+    }
+
     /// The entry's file name (`k<epoch>-<kernel id>.<ext>`).
     pub fn as_str(&self) -> &str {
         &self.name
@@ -572,13 +559,14 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Result<Vec<u8>, Arti
 }
 
 /// A cache entry's bytes and whether this call had to build them (a build, as opposed to a verified hit).
-/// Only the cache's own callers see it: a byte kernel leaves this crate as a [`CompiledArtifact`], which
-/// carries the id of the body it was compiled from.
+/// What an external compiler (the NPU's linker) reads back from [`KernelCache::load_or_build`]; a byte
+/// kernel leaves this crate as a [`CompiledArtifact`], which carries the id of the body it was compiled from.
 #[derive(Debug)]
-pub(crate) struct Artifact {
-    pub(crate) bytes: Vec<u8>,
+pub struct CachedArtifact {
+    /// The artifact bytes.
+    pub bytes: Vec<u8>,
     /// `true` when this call ran the builder, `false` when a verified cache entry was served.
-    pub(crate) built: bool,
+    pub built: bool,
 }
 
 /// One target's persistent kernel artifact cache, scoped by the codegen [`epoch`] both by directory (an
@@ -722,36 +710,22 @@ impl KernelCache {
         body: &Body,
         max_artifact_bytes: NonZeroU64,
     ) -> Result<Vec<u8>, CompileError> {
-        let private;
-        let dir = match &self.dir {
-            Some(dir) => {
-                std::fs::create_dir_all(dir)?;
-                dir.as_path()
-            }
-            None => {
-                private = WorkDir::private()?;
-                private.path()
-            }
-        };
-        let scratch = self.scratch_path(dir, &self.key(body), "out");
-        let compiled = compile(body, self.target, &scratch);
-        let bytes = compiled.and_then(|_| {
-            read_bounded(&scratch, max_artifact_bytes.get())?.map_err(CompileError::from)
-        });
-        let _ = std::fs::remove_file(&scratch);
-        bytes
+        let work = self.work_dir(&self.key(body))?;
+        let scratch = work.path().join("out");
+        compile(body, self.target, &scratch)?;
+        read_bounded(&scratch, max_artifact_bytes.get())?.map_err(CompileError::from)
     }
 
     /// The artifact for `key`: a verified hit, else `build`'s output, stored before it is returned. A hit
     /// or a build longer than `max_artifact_bytes` is [`ArtifactTooLarge`] and nothing is published.
-    pub(crate) fn load_or_build<E: From<std::io::Error> + From<ArtifactTooLarge>>(
+    pub fn load_or_build<E: From<std::io::Error> + From<ArtifactTooLarge>>(
         &self,
         key: &KernelKey,
         max_artifact_bytes: NonZeroU64,
         build: impl FnOnce() -> Result<Vec<u8>, E>,
-    ) -> Result<Artifact, E> {
+    ) -> Result<CachedArtifact, E> {
         if let Some(bytes) = self.load(key, max_artifact_bytes)? {
-            return Ok(Artifact {
+            return Ok(CachedArtifact {
                 bytes,
                 built: false,
             });
@@ -759,7 +733,7 @@ impl KernelCache {
         let bytes = build()?;
         ArtifactTooLarge::check(bytes.len() as u64, max_artifact_bytes)?;
         self.store(key, &bytes)?;
-        Ok(Artifact { bytes, built: true })
+        Ok(CachedArtifact { bytes, built: true })
     }
 
     /// The compiled kernel for `body`: a verified hit, else an `llc` compile, stored before it is
@@ -787,7 +761,7 @@ impl KernelCache {
 
     /// A private working directory for the build of `key`: beside the entries when the cache is enabled,
     /// else a [`WorkDir::private`] one. Removed when dropped.
-    pub(crate) fn work_dir(&self, key: &KernelKey) -> std::io::Result<WorkDir> {
+    pub fn work_dir(&self, key: &KernelKey) -> std::io::Result<WorkDir> {
         match &self.dir {
             Some(dir) => {
                 let path = self.scratch_path(dir, key, "work");
@@ -811,7 +785,7 @@ impl KernelCache {
 }
 
 /// A working directory for one build, removed when dropped.
-pub(crate) struct WorkDir(PathBuf);
+pub struct WorkDir(PathBuf);
 
 impl WorkDir {
     /// A fresh directory only this user can enter, for a build whose cache is disabled.
@@ -826,7 +800,8 @@ impl WorkDir {
         Ok(Self(path))
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    /// The directory.
+    pub fn path(&self) -> &Path {
         &self.0
     }
 }
@@ -1240,7 +1215,7 @@ mod tests {
     }
 
     /// SC-003: one body on two targets is two kernels. The caches share an epoch string and a file
-    /// extension, so only the target half of the id tells the Vulkan and OpenCL SPIR-V keys apart; and
+    /// extension, so only the target half of the id tells two AMD arches' keys apart; and
     /// different bodies on one target differ. Mutation: leave the target out of `KernelId::of`; the keys
     /// are equal.
     #[test]
@@ -1248,18 +1223,20 @@ mod tests {
         let dir = unique_tmp("target-in-key");
         let body = sample_body("target_in_key");
         let epoch = "0000000000000001";
-        let vulkan = KernelCache::with_epoch(dir.clone(), epoch.into(), Target::SpirvVulkan);
-        let opencl = KernelCache::with_epoch(dir.clone(), epoch.into(), Target::SpirvOpenCl);
+        let gfx1100 = Target::AmdGcn(AmdArch::new("gfx1100", 32));
+        let gfx1151 = Target::AmdGcn(AmdArch::gfx1151());
+        let first = KernelCache::with_epoch(dir.clone(), epoch.into(), gfx1100);
+        let second = KernelCache::with_epoch(dir.clone(), epoch.into(), gfx1151);
         assert_eq!(
-            Target::SpirvVulkan.output_ext(),
-            Target::SpirvOpenCl.output_ext(),
+            gfx1100.output_ext(),
+            gfx1151.output_ext(),
             "the fixture needs two targets that share an extension"
         );
 
-        assert_ne!(vulkan.key(&body).id(), opencl.key(&body).id());
-        assert_ne!(vulkan.key(&body), opencl.key(&body));
-        let other = vulkan.key(&sample_body("some_other_kernel"));
-        assert_ne!(vulkan.key(&body).id(), other.id());
+        assert_ne!(first.key(&body).id(), second.key(&body).id());
+        assert_ne!(first.key(&body), second.key(&body));
+        let other = first.key(&sample_body("some_other_kernel"));
+        assert_ne!(first.key(&body).id(), other.id());
         let gfx1100 = KernelId::of(&body, Target::AmdGcn(AmdArch::new("gfx1100", 32)));
         let gfx1151 = KernelId::of(&body, Target::AmdGcn(AmdArch::gfx1151()));
         assert_ne!(gfx1100, gfx1151, "an AMD arch is part of the target");

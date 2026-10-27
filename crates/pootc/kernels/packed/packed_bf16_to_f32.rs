@@ -9,10 +9,10 @@
 //! Decode is `f32::from_bits(word << 16)`, exact.
 
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 
 pub fn __poot_kernel_packed_bf16_to_f32(words: &[u32], out: &mut [f32]) {
-    let i = thread_index();
+    let i = thread_index_x();
     if i < out.len() && i / 2 < words.len() {
         let shift = ((i % 2) * 16) as u32;
         let word = (words[i / 2] >> shift) & 0xffff;

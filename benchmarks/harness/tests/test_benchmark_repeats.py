@@ -15,6 +15,9 @@ import performance_receipt as receipts  # noqa: E402
 import observer  # noqa: E402
 from runner_fixtures import run_fixture_runner, valid_single  # noqa: E402
 
+# The host a run is on: `bench run` refuses a host that lists no GPU, whatever box the suite runs on.
+HOST_WITH_GPU = {"gpu_name": "NVIDIA GeForce RTX 3090", "gpu_driver": None}
+
 MANIFEST = """
 [suite]
 default_gen_tokens = 4
@@ -64,6 +67,7 @@ def bench_run(directory, results, *extra):
             "--framework", "poot", "--models-dir", str(directory), "--results-dir", str(results), *extra]
     with (
         mock.patch.object(sys, "argv", argv),
+        mock.patch.object(bench, "capture_env", side_effect=lambda manifest: HOST_WITH_GPU),
         mock.patch.object(observer, "run_observed", side_effect=run_fixture_runner),
         mock.patch("sys.stdout"),
         mock.patch("sys.stderr"),

@@ -136,7 +136,7 @@ fn driver_compile_splits_transposed_weights_under_a_small_buffer_limit() {
     let state: Vec<HostTensor> = d
         .graph
         .state()
-        .map(|(si, _)| HostTensor::zeros(d.graph.aval(si).shape.clone()))
+        .map(|(si, _)| HostTensor::zeros_of(d.graph.aval(si).dtype, d.graph.aval(si).shape.clone()))
         .collect();
     let (dense, _) = eval_mapped(&d.graph, &d.store, &d.map, &slot_values(), &state);
 
@@ -152,7 +152,13 @@ fn driver_compile_splits_transposed_weights_under_a_small_buffer_limit() {
     let mut next: HashMap<String, (usize, usize)> = HashMap::new();
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     for (si, _) in g.state() {
-        inputs.insert(si, Value::from(HostTensor::zeros(g.aval(si).shape.clone())));
+        inputs.insert(
+            si,
+            Value::from(HostTensor::zeros_of(
+                g.aval(si).dtype,
+                g.aval(si).shape.clone(),
+            )),
+        );
     }
     for &id in g.inputs() {
         let meta = g.meta(id);

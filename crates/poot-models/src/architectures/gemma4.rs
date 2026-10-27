@@ -317,6 +317,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelEr
         // Gemma is trained with a mandatory BOS.
         prompt_bos: Some(p.bos.unwrap_or(GEMMA_BOS)),
         prefill_granule: NonZeroUsize::MIN,
+        kv_dtype: None,
         chat: ChatFormat::Gemma,
         tool_codec: None,
     };

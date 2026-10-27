@@ -11,12 +11,14 @@ use poot_kernel_ir::{
 };
 
 mod builder;
+mod expert_group;
 mod generate;
 mod rope;
 mod spec;
 mod topk;
 
 pub(crate) use builder::Cfg;
+pub(crate) use expert_group::expert_group;
 pub use generate::movement_body;
 pub(crate) use generate::{Buf, read_lane, write_packed_word};
 pub use rope::{rope, rope_dt};

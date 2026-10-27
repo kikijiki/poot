@@ -9,10 +9,10 @@
 //! every backend (tier 1, ADR-0101) - always nonzero and never 1, so a later `log(-log(u))` (the Gumbel
 //! transform, an ordinary graph composition) stays finite.
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 
 pub fn __poot_kernel_random_uniform(seed: &[i32], dims: &[u32], out: &mut [f32]) {
-    let i = thread_index();
+    let i = thread_index_x();
     if i < out.len() {
         let cols = dims[0] as usize;
         let r = i / cols;

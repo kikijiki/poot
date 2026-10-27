@@ -326,7 +326,10 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
         };
     }
     for (si, _) in gd.state() {
-        di.insert(si, HostTensor::zeros(gd.aval(si).shape.clone()));
+        di.insert(
+            si,
+            HostTensor::zeros_of(gd.aval(si).dtype, gd.aval(si).shape.clone()),
+        );
     }
     let (hidden_dense, _) = {
         let values: HashMap<ValueId, Value> = di
@@ -345,6 +348,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
 
     let gh = legalize(
         &gd,
+        poot_target::Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
         &caps_hosting_only_the_tiny_embed(),
         &poot_graph_plan::CompileLimits::STANDARD,
     )
@@ -379,7 +383,10 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
         };
     }
     for (si, _) in gh.state() {
-        hi.insert(si, HostTensor::zeros(gh.aval(si).shape.clone()));
+        hi.insert(
+            si,
+            HostTensor::zeros_of(gh.aval(si).dtype, gh.aval(si).shape.clone()),
+        );
     }
     let (hidden_host, _) = {
         let values: HashMap<ValueId, Value> = hi
@@ -445,7 +452,10 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
         };
     }
     for (si, _) in gd.state() {
-        di.insert(si, HostTensor::zeros(gd.aval(si).shape.clone()));
+        di.insert(
+            si,
+            HostTensor::zeros_of(gd.aval(si).dtype, gd.aval(si).shape.clone()),
+        );
     }
     let hidden_dense = {
         let values: HashMap<ValueId, Value> = di
@@ -461,6 +471,7 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
 
     let gh = legalize(
         &gd,
+        poot_target::Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
         &caps_hosting_only_the_tiny_embed(),
         &poot_graph_plan::CompileLimits::STANDARD,
     )
@@ -493,7 +504,10 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
         };
     }
     for (si, _) in gh.state() {
-        hi.insert(si, HostTensor::zeros(gh.aval(si).shape.clone()));
+        hi.insert(
+            si,
+            HostTensor::zeros_of(gh.aval(si).dtype, gh.aval(si).shape.clone()),
+        );
     }
     let hidden_host = {
         let values: HashMap<ValueId, Value> = hi

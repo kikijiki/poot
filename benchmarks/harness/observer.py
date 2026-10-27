@@ -9,7 +9,8 @@ Assumes one engine per pod with the GPU otherwise idle (see the README), so "pea
 minus the pre-launch baseline" is the engine-agnostic footprint. The baseline is recorded raw so the report
 can subtract it or not.
 
-Prefers pynvml, falls back to `nvidia-smi`; prefers psutil for the process tree, falls back to /proc VmRSS
+On an AMD device (named by the runner's reported GPU) the same quantities come from the amdgpu sysfs files
+(VRAM+GTT used, gpu_busy_percent, hwmon power1_average). Otherwise prefers pynvml, falls back to `nvidia-smi`; prefers psutil for the process tree, falls back to /proc VmRSS
 for the main pid. With no GPU (e.g. the dev Arc or a CPU box) VRAM is None and only RSS is reported.
 """
 
@@ -17,6 +18,7 @@ import json
 import locale
 import multiprocessing
 import os
+from pathlib import Path
 import selectors
 import signal
 import subprocess
@@ -52,8 +54,88 @@ def _nvml_handle(index):
         return None
 
 
+_AMD_PCI_VENDOR = "0x1002"
+_DRM_ROOT = Path("/sys/class/drm")
+
+
+class AmdgpuDevice:
+    """One amdgpu card read through its sysfs files; every read returns None when the file is absent.
+
+    Memory is the sum of `mem_info_vram_used` and `mem_info_gtt_used`: on a unified-memory APU (Strix Halo)
+    the dedicated VRAM carve-out is small and the GTT pool is the system memory the GPU actually holds, so
+    only the sum is the footprint. GTT alone is kept separately as `peak_gtt_bytes`. Power is the hwmon
+    `power1_average` (falling back to `power1_input`), both in microwatts.
+    """
+
+    def __init__(self, device_dir):
+        self.device_dir = Path(device_dir)
+
+    def _read_int(self, path):
+        try:
+            return int(path.read_text().strip())
+        except (OSError, ValueError):
+            return None
+
+    def gtt_used_bytes(self):
+        return self._read_int(self.device_dir / "mem_info_gtt_used")
+
+    def used_bytes(self):
+        vram = self._read_int(self.device_dir / "mem_info_vram_used")
+        gtt = self.gtt_used_bytes()
+        if vram is None or gtt is None:
+            return None
+        return vram + gtt
+
+    def util_pct(self):
+        return self._read_int(self.device_dir / "gpu_busy_percent")
+
+    def power_w(self):
+        for hwmon in sorted(self.device_dir.glob("hwmon/hwmon*")):
+            for name in ("power1_average", "power1_input"):
+                microwatts = self._read_int(hwmon / name)
+                if microwatts is not None:
+                    return microwatts / 1_000_000.0
+        return None
+
+
+def _amdgpu_device(index, drm_root=_DRM_ROOT):
+    """The index-th amdgpu card (by card number) under drm_root, or None. Cards of other vendors are skipped."""
+    cards = []
+    for entry in Path(drm_root).iterdir() if Path(drm_root).is_dir() else ():
+        number = entry.name[4:]
+        if not (entry.name.startswith("card") and number.isdigit()):
+            continue
+        try:
+            vendor = (entry / "device" / "vendor").read_text().strip()
+        except OSError:
+            continue
+        if vendor == _AMD_PCI_VENDOR:
+            cards.append((int(number), entry / "device"))
+    cards.sort()
+    return AmdgpuDevice(cards[index][1]) if index < len(cards) else None
+
+
+def _is_amd_device(device):
+    """True when the device name the runner reports (env gpu_name) is an AMD GPU; None means unreported."""
+    return device is not None and any(tag in device.lower() for tag in ("amd", "radeon"))
+
+
+def _gpu_handle(device, index):
+    """The sampling handle for the device the cell runs on: an AmdgpuDevice for AMD, else NVML (or None)."""
+    if _is_amd_device(device):
+        return _amdgpu_device(index)
+    return _nvml_handle(index)
+
+
+def _device_gtt_bytes(handle):
+    """GTT bytes in use (AMD only), or None."""
+    return handle.gtt_used_bytes() if isinstance(handle, AmdgpuDevice) else None
+
+
 def _device_used_bytes(handle):
     """Total bytes in use on the GPU right now, or None if no GPU/tooling."""
+    if isinstance(handle, AmdgpuDevice):
+        return handle.used_bytes()
     if handle is not None:
         kind, pynvml, h = handle
         try:
@@ -73,7 +155,7 @@ def _device_used_bytes(handle):
 
 
 def _tree_rss_bytes(pid):
-    """Resident bytes of pid + its descendants, or the main pid's peak (VmHWM) as a fallback."""
+    """Resident bytes of pid + its descendants (psutil, else a /proc walk), or None if pid is gone."""
     try:
         import psutil  # type: ignore
 
@@ -85,19 +167,59 @@ def _tree_rss_bytes(pid):
             return None
     except Exception:
         pass
-    # /proc fallback: VmRSS of the main pid (children not counted without psutil).
+    return _proc_tree_rss_bytes(pid)
+
+
+def _proc_vmrss_bytes(pid, proc_root):
+    """VmRSS of one process in bytes, or None if it is gone or has none (a kernel thread)."""
     try:
-        with open(f"/proc/{pid}/status") as f:
+        with open(proc_root / str(pid) / "status") as f:
             for line in f:
                 if line.startswith("VmRSS:"):
                     return int(line.split()[1]) * 1024
-    except Exception:
-        return None
+    except (OSError, ValueError):
+        pass
     return None
+
+
+def _proc_tree_rss_bytes(root_pid, proc_root=Path("/proc")):
+    """Resident bytes of root_pid and every descendant, walked through /proc/<pid>/stat parent links.
+
+    The psutil-free path: a runner that forks the real work (llama-bench) is measured by its children, not by
+    the python parent. A process that exits mid-walk is skipped; None when the root itself is gone.
+    """
+    children = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            # "pid (comm) state ppid ...": comm may hold spaces and parentheses, so split after the last ")".
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(entry.name))
+    if _proc_vmrss_bytes(root_pid, proc_root) is None:
+        return None
+    total, pending, seen = 0, [root_pid], set()
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        total += _proc_vmrss_bytes(pid, proc_root) or 0
+        pending.extend(children.get(pid, ()))
+    return total
 
 
 def _device_util_pct(handle):
     """GPU compute utilization 0-100 right now (% of the last sample period the SMs were busy), or None."""
+    if isinstance(handle, AmdgpuDevice):
+        return handle.util_pct()
     if handle is not None:
         kind, pynvml, h = handle
         try:
@@ -120,6 +242,8 @@ def _device_power_w(handle):
 
     nvmlDeviceGetPowerUsage returns milliwatts; nvidia-smi's power.draw is already watts (e.g. "123.45").
     """
+    if isinstance(handle, AmdgpuDevice):
+        return handle.power_w()
     if handle is not None:
         kind, pynvml, h = handle
         try:
@@ -180,6 +304,7 @@ def _empty_sample_result(baseline_vram):
     return {
         "peak_vram_bytes": baseline_vram,
         "vram_baseline_bytes": baseline_vram,
+        "peak_gtt_bytes": None,
         "peak_rss_bytes": None,
         "gpu_util_mean_pct": None,
         "gpu_util_peak_pct": None,
@@ -193,7 +318,7 @@ def _empty_sample_result(baseline_vram):
     }
 
 
-def _sampler_worker(gpu_index, interval_s, stop, result_conn):
+def _sampler_worker(device, gpu_index, interval_s, stop, result_conn):
     """Collect samples in an owned session so stuck tool descendants remain cancellable."""
     os.setsid()
     signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -206,7 +331,7 @@ def _sampler_worker(gpu_index, interval_s, stop, result_conn):
 
     signal.signal(signal.SIGTERM, interrupt_blocking_tool)
     try:
-        handle = _nvml_handle(gpu_index)
+        handle = _gpu_handle(device, gpu_index)
         baseline_vram = _device_used_bytes(handle)
         result_conn.send(("ready", baseline_vram))
         command = result_conn.recv()
@@ -217,7 +342,7 @@ def _sampler_worker(gpu_index, interval_s, stop, result_conn):
             raise RuntimeError(f"unexpected sampler command: {command[0]}")
         pid = command[1]
 
-        peak = {"vram": baseline_vram or 0, "rss": 0, "n": 0, "power_w": 0.0}
+        peak = {"vram": baseline_vram or 0, "gtt": 0, "rss": 0, "n": 0, "power_w": 0.0}
         gpu_acc = {"sum": 0.0, "n": 0, "peak": 0}
         cpu_acc = {"sum": 0.0, "n": 0, "peak": 0.0}
         energy_acc = {"joules": 0.0, "n": 0, "last_t": None}
@@ -229,6 +354,9 @@ def _sampler_worker(gpu_index, interval_s, stop, result_conn):
             v = _device_used_bytes(handle)
             if v is not None and v > peak["vram"]:
                 peak["vram"] = v
+            gtt = _device_gtt_bytes(handle)
+            if gtt is not None and gtt > peak["gtt"]:
+                peak["gtt"] = gtt
             if stop.is_set():
                 break
 
@@ -287,6 +415,7 @@ def _sampler_worker(gpu_index, interval_s, stop, result_conn):
                 {
                     "peak_vram_bytes": peak["vram"] if baseline_vram is not None else None,
                     "vram_baseline_bytes": baseline_vram,
+                    "peak_gtt_bytes": peak["gtt"] or None,
                     "peak_rss_bytes": peak["rss"] or None,
                     "gpu_util_mean_pct": (
                         gpu_acc["sum"] / gpu_acc["n"] if gpu_acc["n"] else None
@@ -507,12 +636,15 @@ def _finish_pipe_readers(threads, streams, stop, timeout_s):
         raise RuntimeError(f"benchmark pipe readers did not finish: {', '.join(alive)}")
 
 
-def run_observed(cmd, env=None, cwd=None, gpu_index=0, interval_s=0.05,
+def run_observed(cmd, env=None, cwd=None, device=None, gpu_index=0, interval_s=0.05,
                  timeout_s=int(os.environ.get("POOT_BENCH_CELL_TIMEOUT_S", "5400")),
                  on_line=None, termination_grace_s=_PROCESS_TERM_GRACE_S,
                  reader_join_timeout_s=_READER_JOIN_TIMEOUT_S,
                  sampler_join_timeout_s=_SAMPLER_JOIN_TIMEOUT_S):
     """Run cmd, sampling device VRAM + host RSS + GPU/CPU utilization + GPU power until it exits.
+
+    `device` is the accelerator name the runner reports (env gpu_name, the cell key's device): an AMD name
+    samples the amdgpu sysfs files, anything else (including None) samples NVIDIA through NVML/nvidia-smi.
 
     stdout and stderr are read line by line and each line is passed to the optional on_line callback, so
     per-ISL progress is parsed live whichever stream the runner uses (candle/transformers/vLLM print
@@ -591,7 +723,7 @@ def run_observed(cmd, env=None, cwd=None, gpu_index=0, interval_s=0.05,
         sampler_conn, worker_conn = mp.Pipe(duplex=True)
         sampler = mp.Process(
             target=_sampler_worker,
-            args=(gpu_index, interval_s, sampler_stop, worker_conn),
+            args=(device, gpu_index, interval_s, sampler_stop, worker_conn),
             name="poot-observer-sampler",
             daemon=True,
         )

@@ -1,16 +1,21 @@
 use super::*;
-use poot_graph_plan::{ImportedKernel, KernelChoice};
+use poot_graph_plan::KernelChoice;
 
-/// Whether a plan's choice is the shipped kernel `kernel`.
-fn is_imported(choice: &KernelChoice, kernel: ImportedKernel) -> bool {
-    matches!(choice, KernelChoice::Imported { kernel: k, .. } if *k == kernel)
+/// Whether a plan's choice is the generated decode GEMV (`kg::gemv_lds`), the one body every decode `[K, N]`
+/// projection runs, single-sequence or batched.
+fn is_decode_gemv(choice: &KernelChoice) -> bool {
+    matches!(
+        choice,
+        KernelChoice::Generated(poot_kernelgen::KernelRequest::Contraction(
+            poot_kernelgen::ContractionSpec::GemvChunk { .. }
+        ))
+    )
 }
 
 #[test]
 fn nvptx_decode_gemv_plan_selection() {
-    // Card 044 PTX swap: on the NVPTX path the B=1 decode GEMV is the imported kernel (a plain single dispatch), while batched B>1
-    // stays on kernelgen (NVPTX has no stable-buffer dims path for metadata launches yet). Pure planner test (no GPU); also checks
-    // wgpu is unchanged.
+    // The decode GEMV is one generated body on every backend: B=1 and batched B>1 are both a plain single dispatch
+    // with the dims baked (no metadata buffer, so NVPTX needs no stable-buffer dims path). Pure planner test (no GPU).
     use poot_graph_ir::op::OpKind;
     use poot_target::Backend;
     let (k, n) = (4usize, 8usize);
@@ -33,37 +38,19 @@ fn nvptx_decode_gemv_plan_selection() {
         )
         .unwrap()
     };
-    // B=1 on NVPTX -> the coalesced imported GEMV (single dispatch, key "matmul:gemv:coalesced").
-    let (plan_, choice_) = plan_for(1, Backend::Nvptx);
-    match (single_meta(&plan_), choice_) {
-        (Some([]), choice) => {
+    for backend in [Backend::Nvptx, Backend::SpirvVulkan] {
+        for bsz in [1, 2] {
+            let (plan_, choice) = plan_for(bsz, backend);
             assert!(
-                is_imported(&choice, ImportedKernel::GemvCoalesced),
-                "B=1 NVPTX -> coalesced gemv: {choice:?}"
-            )
-        }
-        _ => panic!("B=1 NVPTX decode GEMV should be a Compute plan"),
-    }
-    // B>1 on NVPTX -> the imported batched gemv metadata launch (the executor binds the dims=[B] buffer).
-    let (plan_, choice_) = plan_for(2, Backend::Nvptx);
-    match (single_meta(&plan_), choice_) {
-        (Some(meta @ [_, ..]), choice) => {
-            assert!(
-                is_imported(&choice, ImportedKernel::GemvBatchedCoalesced),
-                "B>1 NVPTX -> batched gemv metadata launch: {choice:?}"
+                single_meta(&plan_).is_some_and(|meta| meta.is_empty()),
+                "B={bsz} {backend:?}: one plain dispatch"
             );
-            assert_eq!(meta, vec![2], "dims = [B]");
+            assert!(
+                is_decode_gemv(&choice),
+                "B={bsz} {backend:?} -> the generated decode GEMV: {choice:?}"
+            );
         }
-        _ => panic!("B>1 NVPTX decode GEMV should be a metadata launch now"),
     }
-    // wgpu unchanged: B=1 coalesced single dispatch, B>1 metadata launch (the batched coalesced gemv).
-    assert!(
-        matches!(plan_for(1, Backend::SpirvVulkan), (plan_, choice) if single_meta(&plan_).is_some_and(|meta| meta.is_empty()) && is_imported(&choice, ImportedKernel::GemvCoalesced))
-    );
-    assert!(matches!(
-        plan_for(2, Backend::SpirvVulkan),
-        (plan_, _) if single_meta(&plan_).is_some_and(|meta| !meta.is_empty())
-    ));
 }
 
 #[test]
@@ -150,7 +137,7 @@ fn decode_gemv_random_shapes_gpu_matches_cpu() {
             _ => panic!("seed {seed}: decode GEMV should be one dispatch without metadata"),
         };
         assert!(
-            is_imported(choice, ImportedKernel::GemvCoalesced),
+            is_decode_gemv(choice),
             "seed {seed} (K={k},N={n}): expected the decode GEMV path, got {choice:?}"
         );
         gemv_count += 1;
@@ -269,18 +256,13 @@ fn batched_decode_gemv_gpu_matches_cpu() {
             usize::from(with_bias),
             "seed {seed}: the traced bias add stays one equation beside the GEMV"
         );
-        let (choice, meta) = match single_meta(plan) {
-            Some(meta @ [_, ..]) => (program.kernel_choice(eqn), meta),
-            _ => panic!("seed {seed}: batched GEMV should be a metadata launch"),
+        let choice = match single_meta(plan) {
+            Some([]) => program.kernel_choice(eqn),
+            _ => panic!("seed {seed}: batched GEMV should be one dispatch without metadata"),
         };
         assert!(
-            is_imported(choice, ImportedKernel::GemvBatchedCoalesced),
+            is_decode_gemv(choice),
             "seed {seed} (B={bsz},K={k},N={n}): expected the batched GEMV path, got {choice:?}"
-        );
-        assert_eq!(
-            meta,
-            &vec![bsz as u32],
-            "seed {seed}: dims metadata must be [B]"
         );
         batched += 1;
 

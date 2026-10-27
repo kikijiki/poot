@@ -83,7 +83,7 @@ fn f16_checkpoint_orientation_projection_matches_the_oracle_on_rocm() {
 /// (the generated tiled GEMM), compiled for rocm: the program
 /// holds one `DenseContraction` and no `Transpose`, and every replayed step matches `eval(g)` of the traced graph
 /// within the parity tolerance (ADR-0101 tier 2). The weight lives on the device as packed bfloat16 words.
-/// Mutation: in `tiled_region`'s `WeightLayout::Nk` arm index the weight as `[K, N]`; the `M = 4` and `M = 33`
+/// Mutation: in `dense_tiled_contraction`, read the `[N, K]` weight as `TiledWeight::Columns`; the `M = 4` and `M = 33`
 /// rows go red.
 #[test]
 fn bf16_checkpoint_orientation_projection_matches_the_oracle_on_rocm() {

@@ -28,6 +28,8 @@ export POOT_BENCH_VLLM_PYTHON="${POOT_BENCH_VLLM_PYTHON:-/opt/vllm-venv/bin/pyth
 export POOT_BENCH_LLAMACPP_PYTHON="${POOT_BENCH_LLAMACPP_PYTHON:-/opt/tf-venv/bin/python}"
 
 cd "$(dirname "$0")"
+# The baked transformers venv has a cu124 torch with no Blackwell kernels; this swaps in cu130 on sm_120 only.
+./runners/torch/blackwell-torch.sh
 echo "== decode-curve sweep: models=$MODELS_DIR poot_bin=$POOT_BENCH_POOT_BIN =="
 nvidia-smi --query-gpu=name,uuid,power.limit --format=csv,noheader || true
 exec uv run bench run --scenario decode-curve --models-dir "$MODELS_DIR" "$@"

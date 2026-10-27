@@ -62,27 +62,11 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(w, "  {v} = tail call i32 @{intrin}(i32 {axis})");
                 Ok(v) // i32 == usize on spirv
             }
-            // The OpenCL builtins return `size_t` (i64 on spirv64), the width of `usize` here, and take the axis
-            // as their operand. `get_global_id` is the global work-item id, so no assembly in IR is needed.
-            Target::SpirvOpenCl => {
-                let (builtin, axis) = match dim {
-                    IndexAxis::X => ("_Z13get_global_idj", 0),
-                    IndexAxis::Y => ("_Z13get_global_idj", 1),
-                    IndexAxis::Z => ("_Z13get_global_idj", 2),
-                    IndexAxis::LocalX => ("_Z12get_local_idj", 0),
-                    IndexAxis::LocalY => ("_Z12get_local_idj", 1),
-                    IndexAxis::LocalZ => ("_Z12get_local_idj", 2),
-                    IndexAxis::GroupX => ("_Z12get_group_idj", 0),
-                    IndexAxis::GroupY => ("_Z12get_group_idj", 1),
-                    IndexAxis::GroupZ => ("_Z12get_group_idj", 2),
-                };
-                self.declares.insert(format!("declare i64 @{builtin}(i32)"));
-                let v = self.fresh();
-                let _ = writeln!(w, "  {v} = tail call i64 @{builtin}(i32 {axis})");
-                Ok(v)
-            }
             Target::Nvptx => {
                 let r = self.emit_nvptx_index(dim, w)?;
+                if self.narrowed() {
+                    return Ok(r); // i32 == usize in a narrowed body
+                }
                 // zext i32 -> i64 (usize on nvptx).
                 let z = self.fresh();
                 let _ = writeln!(w, "  {z} = zext i32 {r} to i64");
@@ -284,11 +268,6 @@ impl<'a> Emitter<'a> {
                 "\nattributes #0 = {{ \"hlsl.numthreads\"=\"{x},{y},{z}\" \"hlsl.shader\"=\"compute\" }}"
             );
             // #1: the workgroup barrier's convergence attributes (see the Barrier emit).
-            let _ = writeln!(self.out, "attributes #1 = {{ convergent nounwind }}");
-        } else if self.target == Target::SpirvOpenCl {
-            let [x, y, z] = self.body.workgroup_size;
-            let _ = writeln!(self.out, "\n!0 = !{{i32 {x}, i32 {y}, i32 {z}}}");
-            // #1: the workgroup barrier is convergent, as on Vulkan.
             let _ = writeln!(self.out, "attributes #1 = {{ convergent nounwind }}");
         } else if self.strictfp_needed {
             // card 628: Nvptx/AmdGcn's `#0` is unused otherwise (see `strictfp_attr_suffix`).

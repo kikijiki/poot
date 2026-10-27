@@ -1,6 +1,7 @@
-//! The one place a [`poot_runtime_common::CompiledKernel`] is built (ADR-0102 amendment): every
+//! The one place a [`CompiledKernel`] is built (ADR-0102 amendment): every
 //! runtime dispatch, launch, load and replay entry point takes a `&CompiledKernel` instead of raw kernel
-//! bytes, and this crate is the sole caller of its `unsafe` constructor. The bytes reach [`kernel_handle`]
+//! bytes, and this crate is the only caller of its `unsafe` constructor for a byte artifact (an NPU region's
+//! validated artifact is wrapped by `poot-npu`). The bytes reach [`kernel_handle`]
 //! only inside a [`CompiledArtifact`], the sealed token [`compile_kernel`] and
 //! [`crate::KernelCache::load_or_compile`] return: it carries the [`KernelId`] of the body and target it was
 //! compiled for, and nothing outside this crate can build one from bytes. [`kernel_handle`] refuses a token
@@ -11,12 +12,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use poot_kernel_ir::{Body, Ty};
-use poot_runtime_common::{
-    AieLinkedArtifact, ArgAccess, ArgSchema, CompiledKernel, KernelCode, VpuGraphArtifact,
-};
-use poot_target::{AieTargetId, Backend, ElementKind, TargetId};
+use poot_target::{AieTargetId, ArgAccess, Backend, ElementKind, TargetId};
 
-use crate::{CompileError, KernelId, Target, compile};
+use crate::{ArgSchema, CompileError, CompiledKernel, KernelCode, KernelId, Target, compile};
 
 /// The native [`ElementKind`] a kernel buffer parameter's slice element type lowers to, or `None` for a
 /// type no runtime buffer carries. Every buffer parameter emitted for wgpu/Vulkan/ROCm/PTX dispatch is one
@@ -38,7 +36,7 @@ fn element_kind_of(ty: &Ty) -> Option<ElementKind> {
 /// dispatched through the runtimes' `CompiledKernel` entry points takes only buffer-slice parameters
 /// (`&[T]`/`&mut [T]`), inputs first and (for these entry points) a single output last. `Err(index)` names
 /// the first parameter that is not a buffer slice of a runtime-representable element type.
-pub(crate) fn try_arg_schema(body: &Body) -> Result<Box<[ArgSchema]>, usize> {
+pub fn try_arg_schema(body: &Body) -> Result<Box<[ArgSchema]>, usize> {
     body.params()
         .enumerate()
         .map(|(index, local)| {
@@ -73,9 +71,7 @@ fn arg_schema(body: &Body) -> Box<[ArgSchema]> {
     })
 }
 
-/// A target with no byte-artifact kernel handle: an AIE core's kernel is a linked artifact, and
-/// [`Target::SpirvOpenCl`] has no runtime [`Backend`] to dispatch it (no Level Zero GPU consumer exists; an Intel
-/// GPU backend is a future card).
+/// A target with no byte-artifact kernel handle: an AIE core's kernel is a linked artifact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0:?} has no byte-artifact kernel handle")]
 pub struct NotAByteTarget(pub Target);
@@ -91,7 +87,7 @@ impl TryFrom<Target> for Backend {
             Target::SpirvVulkan => Ok(Backend::SpirvVulkan),
             Target::Nvptx => Ok(Backend::Nvptx),
             Target::AmdGcn(arch) => Ok(Backend::AmdGcn(arch)),
-            Target::AieCore | Target::SpirvOpenCl => Err(NotAByteTarget(target)),
+            Target::AieCore => Err(NotAByteTarget(target)),
         }
     }
 }
@@ -131,7 +127,8 @@ impl From<Backend> for Target {
     }
 }
 
-/// The codegen [`Target`] of an AIE target (a closed enum, so no id is dropped).
+/// The codegen [`Target`] of an AIE target (a closed enum, so no id is dropped): the one the planner keys an AIE
+/// core's kernel digest by.
 impl From<AieTargetId> for Target {
     fn from(target: AieTargetId) -> Target {
         match target {
@@ -140,21 +137,24 @@ impl From<AieTargetId> for Target {
     }
 }
 
-/// A target identity with no codegen [`Target`]: a VPU compiles a graph the vendor lowers, not a `Body`.
+/// A target identity with no codegen [`Target`]: an NPU's artifacts are regions its own crate builds (an AMD
+/// core object is compiled for a region, not for a dispatch; an Intel NPU compiles a graph the vendor lowers),
+/// not a kernel `Body` per dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{0:?} compiles no kernel Body: its regions go through `emit_vpu`")]
+#[error(
+    "{0:?} compiles no per-dispatch kernel bodies: its artifacts are regions its own crate builds"
+)]
 pub struct NoBodyTarget(pub TargetId);
 
-/// The codegen [`Target`] of a target identity that compiles kernel bodies (a GPU backend or an AIE
-/// target). A VPU target is the typed [`NoBodyTarget`]: its regions are emitted by [`crate::emit_vpu`].
+/// The codegen [`Target`] of a target identity whose dispatches are kernel bodies: a GPU backend. An NPU is
+/// the typed [`NoBodyTarget`].
 impl TryFrom<TargetId> for Target {
     type Error = NoBodyTarget;
 
     fn try_from(target: TargetId) -> Result<Target, NoBodyTarget> {
         match target {
             TargetId::Gpu(backend) => Ok(backend.into()),
-            TargetId::Aie(target) => Ok(target.into()),
-            TargetId::Vpu(_) => Err(NoBodyTarget(target)),
+            TargetId::Aie(_) | TargetId::Vpu(_) => Err(NoBodyTarget(target)),
         }
     }
 }
@@ -238,7 +238,8 @@ pub struct ArtifactMismatch {
 }
 
 /// Build the dispatchable [`CompiledKernel`] for `body` from the sealed `artifact` compiled for it. This
-/// is the one place in the workspace that calls [`CompiledKernel::new`] for a byte artifact; every field it
+/// is the one place in the workspace that calls [`CompiledKernel::new`] for a byte artifact (an NPU artifact is
+/// not bytes, and `poot-npu` wraps its own); every field it
 /// fills is read straight from `body`, so the handle's schema can never drift from what the emitter
 /// actually compiled. An artifact compiled from a different body (or for a different target) is an
 /// [`ArtifactMismatch`], never a handle.
@@ -278,61 +279,12 @@ pub fn kernel_handle(
     // SAFETY: `artifact` is only constructible inside this crate, from the compiler's output for a body and
     // target or from a cache entry whose recorded id matched, and it carries the id of that body and
     // target; the id was just checked equal to `body`'s on that target, so `code` is the artifact compiled
-    // from this exact `body`. `entry_point`, `args` and `has_trap` are read straight from that same
-    // `body`, so they describe the compiled code exactly, not a caller-guessed shape.
-    Ok(unsafe { CompiledKernel::new(TargetId::Gpu(gpu), entry_point, code, args, has_trap) })
-}
-
-/// The [`CompiledKernel`] for an AIE region's linked `artifact`. Its arguments are the artifact's shape
-/// ABI, binding for binding: the host side of the region. Which core runs which body was checked tile by
-/// tile when the artifact was compiled (`compile_aie`), and the artifact itself is only constructible
-/// through the validator, so there is nothing left to refuse here.
-pub fn aie_kernel_handle(artifact: AieLinkedArtifact) -> CompiledKernel {
-    let args: Box<[ArgSchema]> = artifact
-        .abi()
-        .bindings()
-        .iter()
-        .map(|binding| ArgSchema::new(binding.storage().element(), binding.access()))
-        .collect();
-    let entry_point: Box<str> = artifact.entry().into();
-    let target = TargetId::Aie(artifact.target());
-    // SAFETY: `artifact` came out of the artifact validator (an xclbin, a whole instruction stream and a
-    // self-consistent shape ABI), and `args` is that ABI's bindings in order with their element kinds and
-    // write flags, so the schema describes the artifact exactly. Every tile body was checked against the
-    // recipe the ABI belongs to at compile time, and a trapping body was refused there, so `has_trap` is
-    // false. The generator's proved access ranges are inside every binding's extent (checked at
-    // construction).
-    unsafe { CompiledKernel::new(target, entry_point, KernelCode::Aie(artifact), args, false) }
-}
-
-/// The [`CompiledKernel`] for an Intel NPU region's `artifact`. Its arguments are the artifact's inputs and then
-/// its outputs: the region reads the first and writes the rest.
-pub fn vpu_kernel_handle(artifact: VpuGraphArtifact) -> CompiledKernel {
-    let args: Box<[ArgSchema]> = artifact
-        .inputs()
-        .iter()
-        .map(|b| ArgSchema::new(b.storage().element(), ArgAccess::Read))
-        .chain(
-            artifact
-                .outputs()
-                .iter()
-                .map(|b| ArgSchema::new(b.storage().element(), ArgAccess::Write)),
-        )
-        .collect();
-    let target = TargetId::Vpu(artifact.target());
-    // SAFETY: `artifact` is only constructible through `VpuGraphArtifact::new`, which admits only dense F16,
-    // F32 and I32 bindings of non-empty shape, and `args` is exactly its inputs (read) then outputs
-    // (written) in order, so the schema describes the artifact. The graph has no trap word, and the device
-    // checks the compiled graph's own argument list against these bindings before it executes.
-    unsafe {
-        CompiledKernel::new(
-            target,
-            "poot_region",
-            KernelCode::Vpu(artifact),
-            args,
-            false,
-        )
-    }
+    // from this exact `body`. `entry_point`, `args`, `has_trap` and the index width are read straight
+    // from that same `body`, so they describe the compiled code exactly, not a caller-guessed shape.
+    Ok(unsafe {
+        CompiledKernel::new(TargetId::Gpu(gpu), entry_point, code, args, has_trap)
+            .with_index_width(body.index_width)
+    })
 }
 
 #[cfg(test)]
@@ -340,9 +292,9 @@ mod tests {
     use std::num::NonZeroU64;
 
     use super::*;
+    use crate::KernelArgError;
     use crate::KernelCache;
     use poot_kernel_ir::fixtures::add_kernel;
-    use poot_runtime_common::KernelArgError;
 
     /// The sealed artifact a cache hands out for `body` when `bytes` were stored under its key: the same
     /// path every production handle takes (`load_or_compile`), served from the cache so no toolchain is
@@ -396,11 +348,11 @@ mod tests {
         let artifact = cached_artifact("elements", &body, Backend::SpirvVulkan, &[0u8; 4]);
         let handle = kernel_handle(&body, &artifact).unwrap();
         // F32 and I32 share a 4-byte native word and are schema-compatible by design (see
-        // `poot_runtime_common::kernel::element_kinds_compatible`); Bf16's 2-byte word is a genuine
+        // `crate::kernel::element_kinds_compatible`); Bf16's 2-byte word is a genuine
         // width mismatch against this kernel's F32 schema.
         let wrong = [ElementKind::F32, ElementKind::Bf16, ElementKind::F32];
         assert_eq!(
-            poot_runtime_common::check_kernel_args(&handle, &wrong),
+            crate::check_kernel_args(&handle, &wrong),
             Err(KernelArgError::ElementKind {
                 index: 1,
                 expected: ElementKind::F32,

@@ -206,7 +206,7 @@ pub struct Pipeline {
 /// The identity a cached pipeline answers for: the full SPIR-V module plus the binding shape its
 /// descriptor-set layout was built from. Two kernels with equal shapes build equal pipelines.
 pub(crate) struct PipelineShape {
-    pub(crate) args: Box<[poot_runtime_common::ArgSchema]>,
+    pub(crate) args: Box<[poot_codegen::ArgSchema]>,
     pub(crate) has_trap: bool,
     pub(crate) words: Box<[u32]>,
 }

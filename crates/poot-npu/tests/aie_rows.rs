@@ -41,7 +41,10 @@ fn planned_contract(
     let program = compile(
         &fixture.graph,
         target,
-        &CompileOptions::new(CompileLimits::STANDARD),
+        &CompileOptions {
+            npu: Some(poot_npu::npu_lowering()),
+            ..CompileOptions::new(CompileLimits::STANDARD)
+        },
     )
     .expect("the graph compiles for the NPU");
     let selected: Vec<&Eqn> = program

@@ -502,7 +502,7 @@ fn flash_attention_fuses_a_distinct_value_head_width() {
         .unwrap();
     let out = attention_masked(&b, q, k, v, 1, 1.0, mask).unwrap();
     let g = b.finish(out).unwrap();
-    let optimized = flash_attention_capped(&g, None).unwrap().0;
+    let optimized = flash_attention(&g).unwrap().0;
 
     assert_eq!(optimized.aval(optimized.result()).shape, vec![1, 2, 1, 2]);
     assert!(
@@ -541,7 +541,7 @@ fn sink_attention_graph() -> Graph {
 #[test]
 fn flash_attention_fuses_a_sink_attention_to_the_sink_variant() {
     let g = sink_attention_graph();
-    let (optimized, declines) = flash_attention_capped(&g, None).unwrap();
+    let (optimized, declines) = flash_attention(&g).unwrap();
     assert_eq!(declines, []);
     let fused: Vec<&Eqn> = optimized
         .eqns()
@@ -593,7 +593,7 @@ fn masked_attention_graph(
 
 /// The fused attention of `g` and its positions slot.
 fn fused_attention(g: &Graph) -> (poot_graph_ir::AttentionAttrs, Vec<Operand>) {
-    let (optimized, declines) = flash_attention_capped(g, None).unwrap();
+    let (optimized, declines) = flash_attention(g).unwrap();
     assert_eq!(declines, []);
     let fused: Vec<&Eqn> = optimized
         .eqns()
@@ -682,7 +682,7 @@ fn a_mask_that_is_no_causal_mask_stays_additive() {
     let broadcast = masked_attention_graph(1, |b, pos| {
         poot_graph_ir::ops::causal_mask_from_pos(b, pos, 6, None).unwrap()
     });
-    let (_, declines) = flash_attention_capped(&broadcast, None).unwrap();
+    let (_, declines) = flash_attention(&broadcast).unwrap();
     assert!(matches!(
         declines[..],
         [FusionDecline {
@@ -744,7 +744,7 @@ fn a_sink_chain_off_the_exact_spelling_declines_with_the_failing_check() {
         b.reshape(sinks, vec![1, hq, 1, 1]).unwrap()
     };
     let decline = |g: &Graph| {
-        let (optimized, declines) = flash_attention_capped(g, None).unwrap();
+        let (optimized, declines) = flash_attention(g).unwrap();
         let fused = optimized.eqns().iter().any(|eqn| is_flash(&eqn.op));
         (fused, declines.iter().map(|d| d.reason).collect::<Vec<_>>())
     };
@@ -804,9 +804,7 @@ fn flash_attention_declines_broadcast_kv() {
         let v = b.constant("v", TensorType::f32(kvs.to_vec())).unwrap();
         let mask = b.constant("mask", TensorType::f32(ms.to_vec())).unwrap();
         let out = attention_masked(&b, q, k, v, 1, 0.25, mask).unwrap();
-        let optimized = flash_attention_capped(&b.finish(out).unwrap(), None)
-            .unwrap()
-            .0;
+        let optimized = flash_attention(&b.finish(out).unwrap()).unwrap().0;
         let flash: Vec<String> = optimized
             .eqns()
             .iter()
@@ -845,10 +843,7 @@ fn flash_graph(decode: bool) -> (Graph, [ValueId; 3]) {
         poot_graph_ir::ops::attention_prefill(&b, q, k, v, 1, 0.25, mask).unwrap()
     };
     // A tracer states attention as primitives; the flash op is the matcher's.
-    let g = dce(&flash_attention_capped(&b.finish(out).unwrap(), None)
-        .unwrap()
-        .0)
-    .unwrap();
+    let g = dce(&flash_attention(&b.finish(out).unwrap()).unwrap().0).unwrap();
     let flash = g.eqns().last().expect("the flash equation");
     assert!(
         matches!(flash.op, OpKind::Attention(_)),
@@ -2606,9 +2601,7 @@ fn card533_optimize_passes_keep_witness_outputs() {
     let passes: [(&str, PassFn); 6] = [
         ("cse", cse),
         ("rope_fusion", |g| rope_fusion(g).map(|(g, _)| g)),
-        ("flash_attention_capped", |g| {
-            flash_attention_capped(g, None).map(|(g, _)| g)
-        }),
+        ("flash_attention", |g| flash_attention(g).map(|(g, _)| g)),
         ("dce", dce),
         ("fuse_contraction_epilogues", |g| {
             fuse_contraction_epilogues(g, |_, _| true)

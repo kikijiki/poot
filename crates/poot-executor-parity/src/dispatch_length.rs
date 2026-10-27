@@ -13,6 +13,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use poot_codegen::CompiledKernel;
 use poot_executor::{
     Arg, Device, DeviceTime, Dispatch, DispatchError, Engine, ExecError, Executor, NoSync,
     StepInputs, WeightUpload,
@@ -26,7 +27,7 @@ use poot_graph_plan::{
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
-use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot};
+use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
 use poot_target::BufferStorage;
 use poot_tensor::DType;
 
@@ -223,7 +224,7 @@ pub fn over_length_dispatch_is_refused<D: Device + 'static>(device: D) {
         elems, capacity, ..
     } = *refusal;
     assert_eq!(
-        elems as usize,
+        elems,
         capacity + 1,
         "the asserted length is one element beyond the buffer bound to it"
     );

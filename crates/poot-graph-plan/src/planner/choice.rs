@@ -18,7 +18,7 @@ use crate::{
     AieAbiRefusal, Binding, Capability, Dispatch, DispatchPlan, ImportedKernel, Plan, PlanError,
 };
 use poot_graph_ir::ValueId;
-use poot_kernel_ir::Body;
+use poot_kernel_ir::{Body, IndexWidth};
 use poot_tensor::DType;
 
 /// An equation that plans no kernel launch.
@@ -190,19 +190,36 @@ impl Built {
     }
 }
 
+/// Generate `request` for `backend`. With `longest`, the longest element count the plan binds to any param of the
+/// dispatch, the body runs 32-bit index math ([`IndexWidth::U32`]) where the target lowers it
+/// (`poot_codegen::Capability::narrow_index`) and the generator's index bound keeps every index of a binding that
+/// long within the 32-bit range ([`poot_kernelgen::index_bound`], POOT-1405): the planner's proof, which the
+/// runtime checks again against the lengths it binds. The narrowed body is a different kernel, so its key says so.
 fn build(
     site: Site<'_>,
     request: KernelRequest,
     backend: Backend,
     caps: &DeviceCaps,
+    longest: Option<u64>,
 ) -> Result<Built, PlanError> {
     let generated = generate(&request, caps, site.limits())
         .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
+    let narrowed = longest
+        .zip(poot_kernelgen::index_bound(&request))
+        .filter(|&(longest, bound)| {
+            poot_codegen::capability(backend.into()).narrow_index && bound.fits_u32(longest)
+        })
+        .map(|(_, bound)| bound);
+    let mut body = generated.body;
     let choice = KernelChoice::Generated(request);
-    let key = choice.digest(backend.into()).to_string();
+    let mut key = choice.digest(backend.into()).to_string();
+    if let Some(bound) = narrowed {
+        body.index_width = IndexWidth::U32(bound);
+        key.push_str(":u32");
+    }
     let label = choice.display_label();
     Ok(Built {
-        body: generated.body,
+        body,
         launch: generated.launch,
         choice,
         key,
@@ -270,6 +287,36 @@ impl Planned {
         })
     }
 
+    /// [`Planned::generated`] for a dispatch whose longest binding the plan site knows: `longest` elements, the
+    /// most it binds to any param. That is what lets [`build`] narrow the body's index math.
+    pub(crate) fn generated_bounded(
+        site: Site<'_>,
+        request: KernelRequest,
+        backend: Backend,
+        caps: &DeviceCaps,
+        longest: u64,
+    ) -> Result<Self, PlanError> {
+        let PlannedDispatch { dispatch } =
+            Self::generated_dispatch_bounded(site, request, backend, caps, longest)?;
+        let choice = dispatch.choice().clone();
+        Ok(Self {
+            plan: single_plan(dispatch)?,
+            choice,
+        })
+    }
+
+    /// [`Planned::generated_dispatch`] for a dispatch whose longest binding is `longest` elements
+    /// ([`Planned::generated_bounded`]).
+    pub(crate) fn generated_dispatch_bounded(
+        site: Site<'_>,
+        request: KernelRequest,
+        backend: Backend,
+        caps: &DeviceCaps,
+        longest: u64,
+    ) -> Result<PlannedDispatch, PlanError> {
+        Ok(build(site, request, backend, caps, Some(longest))?.into_dispatch())
+    }
+
     /// Generate `request` under `lowering`'s schedule: a thread grid for a GPU backend, the sequential
     /// one-core loop for an AIE target. The request is the same either way.
     pub(crate) fn lowered(
@@ -304,7 +351,7 @@ impl Planned {
         backend: Backend,
         caps: &DeviceCaps,
     ) -> Result<PlannedDispatch, PlanError> {
-        Ok(build(site, request, backend, caps)?.into_dispatch())
+        Ok(build(site, request, backend, caps, None)?.into_dispatch())
     }
 
     /// Plan a shipped template. `meta` is its metadata buffer (`None` for a kernel that takes none). A
@@ -620,11 +667,11 @@ mod tests {
     fn every_request_family_has_a_field_that_changes_the_digest() {
         use poot_kernel_ir::{BinOp, Ty};
         use poot_kernelgen::{
-            ContractionSpec, ElementwiseSpec, Fold, FusedInput, FusedKernel, FusedScalarOp,
-            FusedStep, LeafId, LeafTy, MatmulShapes, MovementOp, MovementSpec, PackedContraction,
+            CastSpec, ContractionSpec, Fold, FusedInput, FusedKernel, FusedScalarOp, FusedStep,
+            LeafId, LeafTy, MatmulShapes, MovementOp, MovementSpec, PackedContraction,
             PackedKernelOp, PackedKernelSpec, PackedRequest, PointwiseForm, PointwiseSpec,
             RopeSpec, RowKernel, RowOp, RowSpec, RowValue, ScanKernel, ScanSpec, Schedule, StepId,
-            Storage, TileSize, TopKSpec, UnaryOp, ViewOperand,
+            Storage, TopKSpec, ViewOperand,
         };
         use poot_quant::format::WeightFormat;
 
@@ -686,6 +733,7 @@ mod tests {
         };
         let attention = |scale: f32| {
             KernelRequest::Attention(AttentionSpec {
+                kv: poot_kernelgen::KvLane::F32,
                 batch: 1,
                 hq: 2,
                 n_rep: 1,
@@ -734,22 +782,28 @@ mod tests {
                 meta: vec![32, 4],
             }))
         };
-        let tiled = |edge: u32| Schedule::Tiled {
-            tile: TileSize::new(edge).expect("a valid tile edge"),
+        // The register tilings of a short and a long contraction: two lane grids and register tiles.
+        let tiled = |rows: usize| {
+            poot_kernelgen::RegisterTiling::choose(
+                poot_kernelgen::TiledShape {
+                    blocks: 1,
+                    m_per_block: rows,
+                    out_per_block: 1024,
+                    k: 1024,
+                    layout: poot_kernelgen::WeightLayout::Nk,
+                    segments: 1,
+                },
+                &DeviceCaps::rocm_default(),
+            )
+            .schedule()
         };
         let gemv = |cols: u32| Schedule::Gemv {
             width: 256,
             cols,
             unroll: 8,
+            activation: poot_kernelgen::GemvActivation::Scalar,
         };
-        let unary = |numel: usize| {
-            KernelRequest::Elementwise(ElementwiseSpec::Unary {
-                op: UnaryOp::Basic(poot_kernel_ir::UnOp::Neg),
-                dt: Ty::F32,
-                view: None,
-                fold: fold(numel),
-            })
-        };
+        let cast = |numel: usize| KernelRequest::Cast(CastSpec::F32ToBf16 { numel });
         let rope = |rot: usize| {
             KernelRequest::Rope(RopeSpec {
                 dt: Ty::F32,
@@ -775,7 +829,7 @@ mod tests {
         };
 
         let pairs = [
-            ("elementwise", unary(8), unary(9)),
+            ("cast", cast(8), cast(9)),
             ("pointwise f32 literal", pointwise(1.0), pointwise(2.0)),
             (
                 "pointwise f32 sign of zero",
@@ -791,9 +845,9 @@ mod tests {
             ("topk", topk(2), topk(3)),
             ("scan row split", scan(1), scan(2)),
             (
-                "packed tiled tile edge",
-                packed_contraction(tiled(8)),
+                "packed tiled lane grid",
                 packed_contraction(tiled(16)),
+                packed_contraction(tiled(2048)),
             ),
             (
                 "packed gemv cols",

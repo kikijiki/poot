@@ -1,7 +1,9 @@
 """What the recipes, the README and the devshell banner name exists, and the index matches the results."""
 
+import json
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -9,6 +11,7 @@ HARNESS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARNESS_DIR))
 
 import bench  # noqa: E402
+import known_unverified  # noqa: E402
 
 BENCH_ROOT = bench.BENCH_ROOT
 REPO_ROOT = BENCH_ROOT.parent
@@ -97,7 +100,7 @@ class NamedFilesExistTests(unittest.TestCase):
 class IndexTests(unittest.TestCase):
     def test_the_committed_index_is_the_index_the_results_generate(self):
         results = BENCH_ROOT / "results"
-        regenerated = bench.render_index(bench.load_runs(results))
+        regenerated = bench.render_index(bench.load_runs(results), known_unverified.load(known_unverified.beside(results)))
 
         self.assertEqual(
             (results / "INDEX.md").read_text(),
@@ -112,6 +115,53 @@ class IndexTests(unittest.TestCase):
             if any(row.get("status") == "ok" for row in rows):
                 with self.subTest(run=run_id):
                     self.assertIn(f"| {run_id} |", index)
+
+
+class PartialSetTests(unittest.TestCase):
+    """A `<set>.partial` directory is the orchestrator's mirror of a sweep in flight, never a result."""
+
+    ROW = {"model": "m", "scenario": "decode-curve", "framework": "poot", "backend": "ptx", "status": "ok"}
+
+    def results_with_a_partial(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for name in ("2026-10-22-gpu-m-000000-r1", "2026-10-22-gpu-m-000000-r2.partial"):
+            d = Path(tmp.name) / name
+            d.mkdir()
+            (d / "results.jsonl").write_text(json.dumps(self.ROW) + "\n")
+            (d / "env.json").write_text("{}")
+        return Path(tmp.name)
+
+    def test_the_index_does_not_list_a_partial(self):
+        """Mutation: load_runs iterates every directory and the index lists the in-progress mirror."""
+        results = self.results_with_a_partial()
+        self.assertEqual([run for run, _env, _rows in bench.load_runs(results)], ["2026-10-22-gpu-m-000000-r1"])
+        self.assertNotIn(".partial", bench.render_index(bench.load_runs(results)))
+
+    def test_a_partial_is_not_part_of_a_committed_set(self):
+        """Mutation: committed_sets iterates every directory and the half-finished repeat joins the baseline."""
+        results = self.results_with_a_partial()
+        (dirs,) = bench.committed_sets(results).values()
+        self.assertEqual([d.name for d in dirs], ["2026-10-22-gpu-m-000000-r1"])
+
+    def test_the_index_ignores_the_failed_results_beside_results(self):
+        """Sets with no ok row are gathered into `failed-results/`, a sibling of `results/` the harness never reads.
+
+        Mutation: gather such a set into `results/` and the index test (every run needs an ok row) is red."""
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(root))
+        failed = root / "failed-results" / "2026-10-22-gpu-m-000000-r1"
+        failed.mkdir(parents=True)
+        (failed / "results.jsonl").write_text(json.dumps({**self.ROW, "status": "error"}) + "\n")
+        (root / "results").mkdir()
+        self.assertEqual(bench.load_runs(root / "results"), [])
+        self.assertEqual(bench.committed_sets(root / "results"), {})
+        ignore = (BENCH_ROOT / ".gitignore").read_text().splitlines()
+        self.assertIn("failed-results/", ignore)
+
+    def test_git_ignores_a_partial(self):
+        ignore = (BENCH_ROOT / ".gitignore").read_text().splitlines()
+        self.assertIn(f"results/*{bench.PARTIAL_SUFFIX}/", ignore)
 
 
 if __name__ == "__main__":

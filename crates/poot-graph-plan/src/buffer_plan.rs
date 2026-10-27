@@ -165,7 +165,7 @@ impl SlotInfo {
 ///
 /// A value's lifetime spans the equation index that materializes it (`Plan::Dispatches`;
 /// `Alias`/`View` never materialize - a read of them extends their
-/// root's lifetime instead, the same alias resolution [`crate::state_commit::state_commit_from_plans`]
+/// root's lifetime instead, the same alias resolution [`crate::state_commit::state_commit_from_aliases`]
 /// already runs) to the last equation that reads it, inclusive: an equation that both reads a value
 /// last and produces a new one is one dispatch with distinct input/output buffers, so the two are
 /// always treated as live at once and never share a slot.

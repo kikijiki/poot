@@ -1,6 +1,6 @@
 # poot
 
-> *I-I need to, I need to COMPOOOOT*
+> _I-I need to, I need to COMPOOOOT_
 
 poot is an LLM inference engine written from scratch in Rust. A model is an ordinary Rust function that is
 traced once into a backend-neutral graph of primitive tensor ops. A shared planner and code generator
@@ -11,7 +11,7 @@ decode step once per token. There is no cuBLAS and no cuDNN: every kernel is gen
 
 ## How it works
 
-![From model code to GPU: graph IR, graph passes, kernel planning, one shared LLVM emitter, three backends](website/static/img/architecture/compilation-pipeline.png)
+![From model code to GPU: graph IR, graph passes, kernel planning, one shared LLVM emitter, four backends](website/static/img/architecture/compilation-pipeline.png)
 
 1. **Model code.** A model family is a config, a weight-name map and a tracer function over shared
    components (`poot-models`). Tracing records equations through `poot_graph_ir::Builder`:

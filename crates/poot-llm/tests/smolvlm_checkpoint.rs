@@ -33,6 +33,7 @@ fn text_options(capacity: usize, chunk: usize) -> DriverOptions {
     let compile = CompileOptions::new(CompileLimits::STANDARD);
     let nz = |n: usize| NonZeroUsize::new(n).unwrap();
     DriverOptions {
+        kv_dtype: None,
         prefill: compile.clone(),
         decode: compile,
         capacity: nz(capacity),

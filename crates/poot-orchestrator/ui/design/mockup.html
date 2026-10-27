@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orchestrator dashboard mockup (POOT-1359)</title>
+<style>
+:root{--bg:#0e1217;--panel:#19202a;--panel2:#11161d;--fg:#e3e9f2;--muted:#8b97a8;--line:#283342;--accent:#62b0ef;--ok:#5bc492;--warn:#e0b04a;--fail:#ef6e78;--idle:#7d8aa0;--mono:ui-monospace,Menlo,Consolas,monospace}
+:root[data-theme=light]{--bg:#f5f7fa;--panel:#fff;--panel2:#eef1f5;--fg:#18202b;--muted:#5d6b7e;--line:#d5dce6;--accent:#1c6fb8;--ok:#177a4d;--warn:#8f6400;--fail:#b3261e;--idle:#5d6b7e}
+@media(prefers-color-scheme:light){:root:not([data-theme=dark]){--bg:#f5f7fa;--panel:#fff;--panel2:#eef1f5;--fg:#18202b;--muted:#5d6b7e;--line:#d5dce6;--accent:#1c6fb8;--ok:#177a4d;--warn:#8f6400;--fail:#b3261e;--idle:#5d6b7e}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif}
+h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:1.2rem 0 .5rem}
+.shell{max-width:1280px;margin:0 auto}
+.top{display:flex;gap:.5rem;align-items:center;padding:.6rem 1rem;background:var(--panel2);border-bottom:1px solid var(--line);flex-wrap:wrap}
+.top b{font-size:1.05rem}.top nav{display:flex;gap:.25rem;flex:1;flex-wrap:wrap}
+.top a{padding:.4rem .7rem;border-radius:6px;color:var(--muted);text-decoration:none}
+.top a.on{background:var(--panel);color:var(--fg);box-shadow:inset 0 -2px var(--accent)}
+.top a.slot{border:1px dashed var(--line)}
+.pill{font-size:.72rem;padding:.1rem .5rem;border-radius:99px;border:1px solid currentColor;font-weight:700;white-space:nowrap}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.fail{color:var(--fail)}.idle{color:var(--idle)}
+main{padding:0 1rem 2rem}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.6rem;margin-top:1rem}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.7rem .9rem}
+.kpi small{color:var(--muted);display:block}.kpi strong{font-size:1.5rem}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:auto}
+table{border-collapse:collapse;width:100%}th,td{padding:.45rem .7rem;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-weight:600;font-size:.78rem}td.n{font-variant-numeric:tabular-nums;text-align:right}
+tr:last-child td{border-bottom:0}.mono{font-family:var(--mono);font-size:.82rem}
+.bar{height:6px;border-radius:3px;background:var(--line);min-width:90px}.bar i{display:block;height:100%;border-radius:3px;background:var(--accent)}
+.banner{border-left:4px solid var(--fail);background:var(--panel);padding:.6rem .9rem;border-radius:0 8px 8px 0;margin-top:.8rem}
+.banner.warn{border-color:var(--warn)}
+.cols{display:grid;grid-template-columns:2fr 1fr;gap:1rem}@media(max-width:900px){.cols{grid-template-columns:1fr}}
+.slotbox{border:1px dashed var(--line);border-radius:8px;padding:.8rem;color:var(--muted);margin-top:1rem}
+.tabs{display:flex;gap:.2rem;border-bottom:1px solid var(--line);margin:1rem 0 .8rem;overflow:auto}
+.tabs a{padding:.5rem .9rem;color:var(--muted);white-space:nowrap}.tabs a.on{color:var(--fg);box-shadow:inset 0 -2px var(--accent)}
+.hdr{display:flex;flex-wrap:wrap;gap:.4rem 1rem;align-items:center;margin-top:1rem}.hdr h1{font-size:1.25rem;margin:0}
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:.4rem 1rem;margin:.6rem 0}.facts span{color:var(--muted);display:block;font-size:.75rem}
+pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:.7rem;overflow:auto;margin:0;font:.8rem/1.5 var(--mono)}
+.chart{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.7rem}
+.sec{padding:3rem 1rem 0;max-width:1280px;margin:0 auto;color:var(--muted)}.sec h1{color:var(--fg);font-size:1rem;border-top:1px solid var(--line);padding-top:1rem}
+.phone{max-width:390px;border:1px solid var(--line);margin:1rem auto;border-radius:12px;overflow:hidden}
+</style>
+</head>
+<body>
+<div class="sec"><h1>1 · Overview (landing page: <code>?view=overview</code>)</h1></div>
+<div class="shell">
+<header class="top"><b><span style="color:#25c2a0">poot</span> orchestrator</b>
+<nav aria-label="Primary"><a class="on" href="#">Overview</a><a href="#">Runs <span class="pill idle">15</span></a><a href="#">Pods <span class="pill idle">4</span></a><a href="#">Compare</a><a href="#">Images</a><a href="#">Serve</a><a class="slot" href="#" title="reserved: POOT-1358">Scheduler ▸</a></nav>
+<span class="pill ok">● live · 2s</span><button aria-label="theme">◐</button></header>
+<main>
+<div class="banner"><b class="fail">2 failures in the last 6 h</b> · exec …852189228 cancelled (no capacity after 23 min) · run …3593265 cancelled · <a href="#" style="color:var(--accent)">see all</a></div>
+<div class="kpis">
+<div class="kpi"><small>Running now</small><strong>2</strong> runs · 1 pod busy</div>
+<div class="kpi"><small>Waiting / queued</small><strong class="warn">1</strong> capacity pass 4 · 85 min</div>
+<div class="kpi"><small>Spend (24 h)</small><strong>$7.84</strong> <small>estimated from pod price × uptime</small></div>
+<div class="kpi"><small>Burn rate</small><strong>$1.61/h</strong> <small>2 live pods</small></div>
+<div class="kpi"><small>Failures (24 h)</small><strong class="fail">5</strong> 2 host-fault replaced</div>
+</div>
+<div class="cols">
+<div>
+<h2>Running now</h2>
+<div class="card"><table><thead><tr><th>Run</th><th>Model</th><th>GPU</th><th>Progress</th><th>Cost</th><th>Started / ETA</th></tr></thead><tbody>
+<tr><td><span class="pill ok">RUNNING</span> <a href="#">decode-curve · qwen3-4b</a></td><td>qwen3-4b</td><td>RTX 3090 · community</td><td><div class="bar"><i style="width:62%"></i></div> repeat 2/3 · 5 of 8 cells</td><td class="n">$0.31</td><td>14:13 · ETA ~26 min</td></tr>
+<tr><td><span class="pill ok">RUNNING</span> <a href="#">exec · pod.sh (A100)</a></td><td>—</td><td>A100-SXM4-80GB</td><td>step: ssh up, copying files</td><td class="n">$0.54</td><td>00:39 · no ETA</td></tr>
+</tbody></table></div>
+<h2>Waiting for capacity</h2>
+<div class="card"><table><thead><tr><th>Run</th><th>Wanted</th><th>Pass</th><th>Waited</th><th>Price cap</th><th>Next try</th></tr></thead><tbody>
+<tr><td><span class="pill warn">WAITING</span> <a href="#">decode-curve · qwen3-4b</a></td><td>RTX 3090</td><td class="n">4</td><td class="n">85 min</td><td class="n">≤ $0.50/h</td><td>in 3 min</td></tr></tbody></table></div>
+<h2>Pods</h2>
+<div class="card"><table><thead><tr><th>Pod</th><th>State</th><th>GPU</th><th class="n">$/h</th><th class="n">Uptime</th><th>Owner run</th><th>Verified</th></tr></thead><tbody>
+<tr><td class="mono">vaxd5jho90zbk6</td><td><span class="pill ok">BUSY</span></td><td>A100-SXM4-80GB</td><td class="n">1.39</td><td class="n">9 min</td><td><a href="#">exec …1690479</a></td><td>RunPod 20 s ago</td></tr>
+<tr><td class="mono">zvvftp2c3m33hz</td><td><span class="pill warn">PROVISIONING</span></td><td>RTX 3090</td><td class="n">0.22</td><td class="n">85 min</td><td><a href="#">run …744667</a></td><td>RunPod 20 s ago</td></tr>
+<tr><td class="mono">ed2s23b4z3zlj4</td><td><span class="pill idle">UNVERIFIED · was provisioning</span></td><td>RTX 3090</td><td class="n">0.22</td><td class="n">—</td><td>none</td><td>RunPod does not list it · reap?</td></tr>
+</tbody></table></div>
+</div>
+<div>
+<h2>Recent outcomes</h2>
+<div class="card"><table><tbody>
+<tr><td><span class="pill ok">OK</span></td><td><a href="#">qwen3-0.6b · 3090</a></td><td class="n">1 h ago</td></tr>
+<tr><td><span class="pill warn">INCOMPLETE 6/8 models valid</span></td><td><a href="#">decode-curve · H200</a></td><td class="n">2 h ago</td></tr>
+<tr><td><span class="pill fail">ERRORS 3 cells</span></td><td><a href="#">decode-curve · RTX PRO 6000</a></td><td class="n">3 h ago</td></tr>
+<tr><td><span class="pill fail">HOST FAULT → replaced</span></td><td><a href="#">exec · legA (…1042183)</a></td><td class="n">4 h ago</td></tr>
+<tr><td><span class="pill idle">CANCELLED</span></td><td><a href="#">exec · pod.sh</a></td><td class="n">5 h ago</td></tr>
+</tbody></table></div>
+<div class="slotbox"><b>Scheduler slot (POOT-1358)</b><br>Job queue · attempts · pool leases render as extra panels here and a "Scheduler" nav entry; the page registry (<code>views.ts</code>) takes one record per view.</div>
+</div></div>
+</main></div>
+
+<div class="sec"><h1>2 · Run detail (<code>?run=ID&amp;view=runs&amp;tab=results&amp;sub=charts</code>)</h1></div>
+<div class="shell"><main>
+<div class="hdr"><h1>decode-curve · qwen3-4b · RTX 3090</h1><span class="pill warn">INCOMPLETE · 1/2 models valid</span><span class="pill idle">repeat 2/3</span></div>
+<div class="facts">
+<div><span>Run id</span><b class="mono">run-1792764802-744667</b> <button>copy</button></div>
+<div><span>Pod</span>zvvftp2c3m33hz · COMMUNITY · $0.22/h</div>
+<div><span>Host CPU</span>AMD EPYC 7742 · 32 vCPU</div>
+<div><span>Cost so far</span>$0.31 (uptime 1 h 25)</div>
+<div><span>Started / ETA</span>14:13 · ~26 min left</div>
+<div><span>Ref</span>master 55d3fa180</div>
+</div>
+<nav class="tabs" role="tablist"><a href="#">Summary</a><a href="#">Log</a><a class="on" href="#">Results <span class="pill idle">live</span></a><a href="#">Pod</a></nav>
+<div style="display:flex;gap:.5rem;margin-bottom:.6rem"><a class="pill idle" href="#">Table</a><a class="pill ok" href="#">Charts</a><a class="pill idle" href="#">Failures (0)</a><span style="flex:1"></span><span class="pill warn">partial: mirrored 40 s ago, 5 of 8 cells</span></div>
+<div class="chart"><svg viewBox="0 0 640 220" width="100%" role="img" aria-label="decode tokens per second versus context length"><g stroke="var(--line)"><line x1="40" y1="190" x2="620" y2="190"/><line x1="40" y1="10" x2="40" y2="190"/><line x1="40" y1="100" x2="620" y2="100" stroke-dasharray="3"/></g><polyline fill="none" stroke="var(--accent)" stroke-width="2.5" points="40,40 150,48 260,62 370,84 480,118 580,150"/><polyline fill="none" stroke="var(--warn)" stroke-width="2.5" stroke-dasharray="6 3" points="40,60 150,70 260,88 370,110 480,140"/><text x="590" y="150" fill="var(--accent)" font-size="12">run A</text><text x="490" y="140" fill="var(--warn)" font-size="12">run B</text><text x="40" y="208" fill="var(--muted)" font-size="11">context 128 → 32k tokens · y: tok/s (higher is better)</text></svg>Direct labels, not a legend; dashes plus colour so it survives colour-blindness; one chart per card with a text summary below for screen readers.</div>
+</main></div>
+
+<div class="sec"><h1>3 · Exec run with no sets: says why (no empty Results tab)</h1></div>
+<div class="shell"><main><div class="card" style="padding:1.2rem"><b>Exec runs have no result sets.</b> This run executed <code class="mono">bash /root/pod.sh</code> on a pod and produced a log, not a benchmark. The Results tab is hidden for exec runs; open <a href="#" style="color:var(--accent)">Log</a>. Sweeps that finish with no sets show instead: "Run ended before any cell finished (cancelled while waiting for capacity)".</div></main></div>
+
+<div class="sec"><h1>4 · Narrow (≤ 640 px): nav becomes a bottom bar, tables become stacked cards</h1></div>
+<div class="phone"><header class="top"><b><span style="color:#25c2a0">poot</span> orchestrator</b><span class="pill ok">● live</span></header>
+<main><div class="kpis" style="grid-template-columns:1fr 1fr"><div class="kpi"><small>Running</small><strong>2</strong></div><div class="kpi"><small>Burn</small><strong>$1.61/h</strong></div></div>
+<h2>Running now</h2><div class="card" style="padding:.7rem"><span class="pill ok">RUNNING</span> <b>qwen3-4b · 3090</b><br><small style="color:var(--muted)">repeat 2/3 · $0.31 · ETA 26 min</small><div class="bar" style="margin-top:.4rem"><i style="width:62%"></i></div></div>
+<div class="top" style="margin-top:1rem;border:1px solid var(--line);border-radius:8px;justify-content:space-around"><a class="on">Overview</a><a>Runs</a><a>Pods</a><a>More</a></div></main></div>
+</body></html>

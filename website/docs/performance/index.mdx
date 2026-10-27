@@ -1,0 +1,58 @@
+---
+title: Performance
+sidebar_position: 6
+hide_table_of_contents: true
+description: Decode and prefill throughput, latency and memory of poot and of llama.cpp (the reference), per hardware, model and backend, from the committed benchmark runs.
+---
+
+import PerformanceView from "@site/src/components/performance/PerformanceView";
+
+# Performance
+
+<PerformanceView />
+
+<details>
+<summary>Methodology</summary>
+
+Every number is the median over the repeats of a committed run set; the whiskers are the minimum and maximum of a point measured on one host. These are single-request measurements, not continuous-batching throughput. The standing grid is two machines (the local AMD Strix Halo box and one RTX PRO 6000 Blackwell cloud GPU), six models and llama.cpp as the reference; transformers and candle appear only on the bf16 qwen3 rows. Hardware and models outside the grid are not shown, and a cell the grid requires but has not been run yet is simply absent. Supported families, formats and backends are in [Supported models and formats](../develop/supported-models.md).
+
+**Input tokens.** Rate and latency charts have the number of input tokens on their x axis, every length at once. Memory and energy are one value per run, so they are one bar per framework and backend. A chart appears only when every hardware entry has data for its metric.
+
+- A context sweep prefills 128 to 8192 tokens of synthetic random text (no tokenizer, no prefix cache), then times 128 generated tokens at each length. A short prompt and a prompt of about 1000 tokens are two more points on the same axis.
+- Decode tok/s is the rate of the 128 generated tokens. Prefill tok/s is the input tokens divided by the first-token time, stated from 128 input tokens up.
+- A decode series only holds runs that generated 128 tokens. The run with a prompt of about 1000 tokens generates 32, so it contributes prefill, first-token time and memory only.
+- Time per output token is 1000 divided by the decode rate. End-to-end time is the first-token time plus 128 output tokens.
+- A sweep's memory and energy are peaks and totals over every length, drawn as one bar per series.
+
+**Verification.** A cell is five to fifteen repeats. It is verified when every row states a clean release build with its adapter, driver, checkpoint digest and compute dtype, one binary produced all repeats, every identity field agrees, and the noise band is within 10% of the median. The band is twice the noise of the repeats (2.33 robust sigmas at five repeats, narrowing with the square root of the repeat count).
+
+A verified cell is drawn solid. A cell that does not verify is shown only when it is on the reviewed list of known-unverified cells, drawn dashed with hollow markers and labelled "unverified: noisy host". Other failing run sets are not shown.
+
+**Hardware.** One entry per GPU model; editions of one chip (workstation and server) are one entry, Max-Q is its own. A cell still pools repeats only from the same accelerator, host CPU and GPU driver, and the harness verifies it on its own host. A point on several hosts is the median of the per-host medians over the verified cells (all cells, drawn unverified, when none verifies).
+
+**Backends.** Every series names its framework and backend. poot runs record PTX, ROCm, Vulkan or wgpu. The NVIDIA llama.cpp baseline runs from the benchmark image (CUDA) and the AMD llama.cpp rows are a Vulkan build.
+
+**What poot computes.** A dense bf16 safetensors run records compute dtype `f32`: the checkpoint is read as bf16 and computed in f32. Packed GGUF, GPTQ/AWQ and supported FP8 projections stay packed and are decoded by the generated kernels (see [Using quantized checkpoints](../serve/quantized-checkpoints.md)). A quantized run has its own identity and is not comparable to a dense run.
+
+**Request timing.**
+
+- TTFT ends at the first token. TPOT is the mean of all inter-token gaps, including the first. E2E includes the first-token, token-to-token and finish windows.
+- Preparing wgpu decode before the first token (pending uploads after a cache build or a request-state reset) counts towards TTFT and E2E.
+- Unprofiled wgpu execution groups a submission's dispatches into one compute pass; use unprofiled wall time for latency comparisons.
+
+**Memory.** The memory bars show the peak at inference: the highest host resident set (process tree) and GPU memory in use after the model is loaded and the warmup request has run, so the weights, KV cache and scratch at steady state. The peak while loading is stated beside each bar; loading a checkpoint reads the whole file through the resident set, so it is a start-up cost and not what inference holds. Both are derived from the 1 Hz memory trace stored with every run, cut at the end of the load plus the warmup (the engine's recorded open time, or the last load ramp the trace shows; llama.cpp restarts its server per context length, so the last load bounds the window). A run whose trace shows no boundary keeps the peak over the whole process lifetime and its bar says "includes model load". GPU memory is shown for runs whose device reports it, minus what the device held before the run. On a unified-memory device the weights count towards the resident set.
+
+**Reproducing.**
+
+```bash
+# 5 repeats of one cell on the local backend, then regenerate the index
+just bench-record rocm qwen3-0.6b prefill-1k
+python3 benchmarks/harness/bench.py index
+# regenerate the data of this page
+just perf-page-regen
+```
+
+`just bench-record <backend> <model> <workload>` takes `decode-128`, `prefill-1k` and `decode-curve`.
+`just bench-compare` judges a new set of repeats against the committed one with the harness's noise-aware comparator.
+
+</details>

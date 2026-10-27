@@ -224,7 +224,15 @@ impl<'a> Fields<'a> {
         let scaling = self
             .hf_value("rope_scaling")
             .or_else(|| self.hf_value("rope_parameters"));
-        hf_rope_flavor(scaling, max_positions).map_err(|e| e.for_family(self.family))
+        let original = self
+            .opt_u64(Field::hf("original_max_position_embeddings"))?
+            .map(|n| {
+                usize::try_from(n).map_err(|_| {
+                    self.error("original_max_position_embeddings", ConfigReason::WrongType)
+                })
+            })
+            .transpose()?;
+        hf_rope_flavor(scaling, max_positions, original).map_err(|e| e.for_family(self.family))
     }
 }
 

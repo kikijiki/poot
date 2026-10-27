@@ -9,7 +9,6 @@ use poot_kernel_ir::{
     BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Local, Operand, Place, Rvalue,
     Statement, Terminator, Ty,
 };
-use poot_target::BufferStorage;
 
 /// Batched matmul `C[..,M,N] = A[..,M,K] @ B[..,K,N]` (row-major), batch dims broadcast. One thread per
 /// output element; a serial K-loop accumulates. Dims (M,N,K) and all strides are baked from the static
@@ -33,17 +32,7 @@ pub fn matmul_batched_dt_grid(
     b_shape: &[usize],
     x_groups: Option<usize>,
 ) -> Body {
-    matmul_batched_impl(
-        name,
-        dt,
-        out_shape,
-        a_shape,
-        b_shape,
-        WeightRead::Kn,
-        None,
-        &[],
-        x_groups,
-    )
+    matmul_batched_impl(name, dt, out_shape, a_shape, b_shape, None, &[], x_groups)
 }
 
 /// [`matmul_batched_dt_grid`] with a pointwise epilogue applied to each output element in registers before the
@@ -66,46 +55,10 @@ pub fn matmul_batched_epilogue_dt_grid(
         out_shape,
         a_shape,
         b_shape,
-        WeightRead::Kn,
         Some(epilogue),
         &lanes,
         x_groups,
     ))
-}
-
-/// [`matmul_batched_dt_grid`] over a weight held in checkpoint `[N, K]` order (`w_shape` is `[N, K]`, rank 2):
-/// `C[..,M,N] = A[..,M,K] @ W[N,K]^T`, without materializing the transpose. The one-thread-per-output
-/// fallback of `DenseContraction` where the tiled GEMM is not taken. The activation and output are f32; the
-/// weight is read in its planned `weight` storage (`BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`).
-pub(crate) fn matmul_batched_nk_grid(
-    name: &str,
-    weight: BufferStorage,
-    out_shape: &[usize],
-    a_shape: &[usize],
-    w_shape: &[usize],
-    x_groups: Option<usize>,
-) -> Result<Body, KernelGenError> {
-    let lane = WeightLane::of("matmul_batched_nk_grid", weight)?;
-    Ok(matmul_batched_impl(
-        name,
-        Ty::F32,
-        out_shape,
-        a_shape,
-        w_shape,
-        WeightRead::Nk(lane),
-        None,
-        &[],
-        x_groups,
-    ))
-}
-
-/// How [`matmul_batched_impl`] reads its weight operand.
-#[derive(Clone, Copy)]
-enum WeightRead {
-    /// `[K, N]` (the `MatMul` weight) in the body's own storage dtype `dt`.
-    Kn,
-    /// `[N, K]` (the checkpoint orientation) through a weight lane; the body's `dt` is f32.
-    Nk(WeightLane),
 }
 
 #[expect(clippy::too_many_arguments)] // shapes plus the epilogue/weight/fold modes the public entry points fix
@@ -115,7 +68,6 @@ fn matmul_batched_impl(
     out_shape: &[usize],
     a_shape: &[usize],
     b_shape: &[usize],
-    weight: WeightRead,
     epilogue: Option<&Epilogue>,
     lanes: &[Option<WeightLane>],
     x_groups: Option<usize>,
@@ -127,11 +79,8 @@ fn matmul_batched_impl(
     let b_strides = row_major_strides(b_shape);
     // a's M-stride (the dim before K) and b's N-stride (the last dim).
     let a_m_stride = a_strides[a_shape.len() - 2];
-    // b's K-stride and N-stride: `[K, N]` has K first, the checkpoint `[N, K]` has N first.
-    let (b_k_stride, b_n_stride) = match weight {
-        WeightRead::Kn => (b_strides[b_shape.len() - 2], b_strides[b_shape.len() - 1]),
-        WeightRead::Nk(_) => (b_strides[b_shape.len() - 1], b_strides[b_shape.len() - 2]),
-    };
+    // b's K-stride and N-stride: `[K, N]`, K first.
+    let (b_k_stride, b_n_stride) = (b_strides[b_shape.len() - 2], b_strides[b_shape.len() - 1]);
     // batch-effective strides aligned to out's batch dims [0..r-2].
     let a_beff = batch_eff(r - 2, a_shape, &a_strides);
     let b_beff = batch_eff(r - 2, b_shape, &b_strides);
@@ -141,10 +90,7 @@ fn matmul_batched_impl(
     let mut params = vec![
         ld(Ty::Unit, false),
         ld(slice_dtype(dt.clone(), false), false),
-        match weight {
-            WeightRead::Kn => ld(slice_dtype(dt.clone(), false), false),
-            WeightRead::Nk(lane) => lane.param(),
-        },
+        ld(slice_dtype(dt.clone(), false), false),
     ];
     if let Some(epilogue) = epilogue {
         params.extend(lanes.iter().map(|&lane| epilogue.leaf_param(lane)));
@@ -304,20 +250,17 @@ fn matmul_batched_impl(
     // bb4: pa = a_base + kk*a_k_stride; kn = kk*b_k_stride; pb = b_base + kn; acc += a[pa]*b[pb]; kk++
     // The weight read: a native `dt` element, widened when `dt` is bf16 (a no-op for f32), or the checkpoint
     // weight's lane read.
-    let read_vb = match weight {
-        WeightRead::Kn => vec![Statement::Assign(
-            Place::local(vb),
-            if dt == Ty::F32 {
-                Rvalue::Use(copy(elem(b, pb)))
-            } else {
-                Rvalue::Cast {
-                    to: Ty::F32,
-                    operand: copy(elem(b, pb)),
-                }
-            },
-        )],
-        WeightRead::Nk(lane) => lane.read(&mut al, b, pb, vb),
-    };
+    let read_vb = vec![Statement::Assign(
+        Place::local(vb),
+        if dt == Ty::F32 {
+            Rvalue::Use(copy(elem(b, pb)))
+        } else {
+            Rvalue::Cast {
+                to: Ty::F32,
+                operand: copy(elem(b, pb)),
+            }
+        },
+    )];
     let bb4 = BasicBlock {
         statements: [
             // a's K-stride is 1 (K is A's last dim), so pa = a_base + kk.
@@ -428,7 +371,7 @@ fn matmul_batched_impl(
             )
         }
         Some(xg) => {
-            // 2-D grid fold, same convention as `build_unary_dt_grid`/`binary_broadcast_dt_views_grid`: gx=GroupX ->
+            // 2-D grid fold, same convention as the pointwise synthesizer's `pointwise_body`: gx=GroupX ->
             // gy=GroupY -> group_id=gy*xg+gx, lane=LocalX -> i=group_id*WORKGROUP_SIZE+lane -> bb1 (the tail-length
             // guard). This kernel already uses blocks 0-6, so the fold blocks land at 7-9. The caller MUST bake
             // `body.workgroup_size[0] = ELEMENTWISE_2D_WORKGROUP_SIZE`.

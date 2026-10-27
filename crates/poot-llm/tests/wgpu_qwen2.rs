@@ -302,7 +302,7 @@ fn bind(g: &Graph, feed: &Feed, seed_state: bool) -> HashMap<ValueId, Value> {
                 weight(&meta.name().expect("a named const"), &shape)
             }
             Storage::Computed(c) => c.tensor(),
-            Storage::State if seed_state => HostTensor::zeros(shape),
+            Storage::State if seed_state => HostTensor::zeros_of(meta.aval.dtype, shape),
             Storage::State => continue,
             Storage::Device => unreachable!(),
         };
@@ -323,7 +323,7 @@ fn cpu_step(
         let carried = state
             .get(ci)
             .cloned()
-            .unwrap_or_else(|| HostTensor::zeros(g.aval(si).shape.clone()));
+            .unwrap_or_else(|| HostTensor::zeros_of(g.aval(si).dtype, g.aval(si).shape.clone()));
         cpu_inputs.insert(si, carried.into());
     }
     let r = eval(g, &cpu_inputs, EvalOptions::default()).unwrap();
@@ -407,7 +407,7 @@ fn flash_attention_pass_prefill_gpu_matches_cpu() {
     // un-rewritten prefill on CPU. Pipeline: canonicalize -> cse -> fold_iota -> rope_fusion -> flash_attention -> dce
     // -> GPU (the mask is a graph computation over `Slot::Pos`, so the flash pass needs it folded).
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::{canonicalize, cse, dce, flash_attention_capped, fold_iota, rope_fusion};
+    use poot_graph_plan::{canonicalize, cse, dce, flash_attention, fold_iota, rope_fusion};
     let _gpu_guard = gpu_lock();
     let Some(device) = open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new()) else {
         return;
@@ -419,11 +419,10 @@ fn flash_attention_pass_prefill_gpu_matches_cpu() {
     // cap == the prompt: the flash pass recognises the square causal prefill, not a prompt over a longer cache.
     let g = trace(&tiny(), step(1, l, l, LogitRows::Last));
     let feed = Feed::new(tokens.to_vec(), (0..l as i32).collect());
-    let fused = dce(&flash_attention_capped(
+    let fused = dce(&flash_attention(
         &rope_fusion(&fold_iota(&cse(&canonicalize(&g).unwrap()).unwrap()).unwrap())
             .unwrap()
             .0,
-        None,
     )
     .unwrap()
     .0)

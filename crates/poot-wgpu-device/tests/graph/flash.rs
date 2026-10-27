@@ -29,13 +29,11 @@ fn is_softcapped_attention(choice: &KernelChoice) -> bool {
         .is_some_and(|spec| matches!(spec.score, ScoreTransform::ScaleSoftcap { .. }))
 }
 
-/// Whether a choice is the generated tiled GEMM (`kg::tiled_region`), one dispatch or split.
-fn is_tiled_region(choice: &KernelChoice) -> bool {
+/// Whether a choice is the register-tiled GEMM, one dispatch or split.
+fn is_register_tiled(choice: &KernelChoice) -> bool {
     matches!(
         choice,
-        KernelChoice::Generated(KernelRequest::Contraction(
-            ContractionSpec::TiledRegion { .. }
-        ))
+        KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(_)))
     )
 }
 
@@ -190,21 +188,27 @@ fn attention_decode_matches_cpu() {
     eprintln!("synthesized flash region decode (graph path) runs GPU==CPU");
 }
 
-/// Every row below has more keys than the kernel has lanes, so each lane walks several keys and the running
-/// maximum, denominator and output are rescaled between them (a kernel that skipped the rescale only passes a
-/// fixture whose lanes see one key each). Decode at `B = 1` over a long cache (64 wide: 32 lanes, 200 keys),
-/// decode at D = 512 (4 lanes, 48 keys, the head width SPIR-V used to refuse), batched decode at `B = 4`
-/// (D = 128: 16 lanes, 96 keys) and a prefill over 100 rows (D = 64), each against the CPU oracle with a
-/// mask that hides a different tail per batch row.
+/// Every row walks its keys in several passes of the kernel the device plans for it (a key per lane for the
+/// streaming and split schedules, a staged key block for the tiled one), so the running maximum, denominator and
+/// output are rescaled between passes: a kernel that skipped the rescale, or walked only its first pass, passes
+/// only a fixture one pass covers. The key count is derived from that pass: a probe of the row's shape is
+/// planned on the device, the row takes three and a half of its passes (the last one partial), and the planned
+/// row is checked to still need at least three. The rows: decode at `B = 1` (64 wide), decode at D = 512 (the
+/// head width SPIR-V used to refuse), batched decode at `B = 4` (D = 128) and a causal prefill (D = 64, the
+/// tiled schedule), each against the CPU oracle with a mask that hides a different tail per batch row.
+///
+/// Mutation: in `attention/tiled.rs`, end the key-block walk after its first block (`count_to` over
+/// `keys.first..keys.first + bc`); the prefill row goes red against the oracle (112 keys over 32-key blocks on a
+/// 128-lane tiling: max abs diff 0.149).
 #[test]
 fn attention_over_many_key_tiles_matches_cpu() {
     use poot_graph_ir::builder::Builder;
-    // (batch, hq, hkv, lq, lk, d): decode has lq == 1, prefill lq == lk (prefill into a cache has its own row).
-    let rows: [(usize, usize, usize, usize, usize, usize); 4] = [
-        (1, 4, 2, 1, 200, 64),
-        (1, 2, 1, 1, 48, 512),
-        (4, 4, 2, 1, 96, 128),
-        (1, 2, 2, 100, 100, 64),
+    // (batch, hq, hkv, prefill, d): a decode row has one query; a prefill row has as many queries as keys.
+    let rows: [(usize, usize, usize, bool, usize); 4] = [
+        (1, 4, 2, false, 64),
+        (1, 2, 1, false, 512),
+        (4, 4, 2, false, 128),
+        (1, 2, 2, true, 64),
     ];
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
@@ -221,33 +225,55 @@ fn attention_over_many_key_tiles_matches_cpu() {
             })
             .collect()
     };
-    for (batch, hq, hkv, lq, lk, d) in rows {
+    for (batch, hq, hkv, prefill, d) in rows {
         let n_rep = hq / hkv;
         let scale = 1.0 / (d as f32).sqrt();
-        let b = Builder::for_tests();
-        let q = b
-            .constant("q", TensorType::f32(vec![batch, hq, lq, d]))
-            .unwrap();
-        let k = b
-            .constant("k", TensorType::f32(vec![batch, hkv, lk, d]))
-            .unwrap();
-        let v = b
-            .constant("v", TensorType::f32(vec![batch, hkv, lk, d]))
-            .unwrap();
-        let mask = b
-            .constant("mask", TensorType::f32(vec![batch, 1, lq, lk]))
-            .unwrap();
-        let ids = [q.id(), k.id(), v.id(), mask.id()];
-        let y = attention_masked(&b, q, k, v, n_rep, scale, mask).unwrap();
-        let g = b.finish(y).unwrap();
-        let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
-            matches!(op, OpKind::Attention(_))
-        });
-        let lanes = generated_attention(&choice)
-            .unwrap_or_else(|| panic!("d={d}: expected the generated attention, got {choice:?}"))
-            .schedule
-            .lanes();
-        assert!(lk > lanes, "d={d}: {lk} keys must exceed the {lanes} lanes");
+        // The traced chain over `lk` keys, its operand ids, and the keys of one pass of the kernel the device
+        // plans for it.
+        let traced = |lk: usize| {
+            let lq = if prefill { lk } else { 1 };
+            let b = Builder::for_tests();
+            let q = b
+                .constant("q", TensorType::f32(vec![batch, hq, lq, d]))
+                .unwrap();
+            let k = b
+                .constant("k", TensorType::f32(vec![batch, hkv, lk, d]))
+                .unwrap();
+            let v = b
+                .constant("v", TensorType::f32(vec![batch, hkv, lk, d]))
+                .unwrap();
+            let mask = b
+                .constant("mask", TensorType::f32(vec![batch, 1, lq, lk]))
+                .unwrap();
+            let ids = [q.id(), k.id(), v.id(), mask.id()];
+            let y = attention_masked(&b, q, k, v, n_rep, scale, mask).unwrap();
+            let g = b.finish(y).unwrap();
+            let choice = compiled_choice(&g, &target, |op| matches!(op, OpKind::Attention(_)));
+            let schedule = generated_attention(&choice)
+                .unwrap_or_else(|| {
+                    panic!("d={d}: expected the generated attention, got {choice:?}")
+                })
+                .schedule;
+            let pass = match schedule {
+                kg::AttentionSchedule::Tiled { bc, .. } => bc,
+                _ => schedule.lanes(),
+            };
+            (g, ids, schedule, pass)
+        };
+        let (_, _, _, probe_pass) = traced(256);
+        let lk = 3 * probe_pass + probe_pass / 2;
+        let (g, ids, schedule, pass) = traced(lk);
+        let lq = if prefill { lk } else { 1 };
+        assert!(
+            lk > 3 * pass,
+            "d={d}: {lk} keys must take at least three passes of {pass} ({schedule:?})"
+        );
+        if prefill {
+            assert!(
+                matches!(schedule, kg::AttentionSchedule::Tiled { .. }),
+                "the prefill row plans the tiled schedule, got {schedule:?}"
+            );
+        }
 
         // Batch row `bi` shows its first `lk - 7 * bi` keys (decode), or the causal prefix (prefill).
         let md: Vec<f32> = (0..batch * lq * lk)
@@ -289,7 +315,7 @@ fn attention_over_many_key_tiles_matches_cpu() {
         let max_abs = max_abs_error(got.as_f32().unwrap(), cpu.as_f32().unwrap());
         assert!(
             max_abs <= 1e-3,
-            "B={batch} Hq={hq} Lq={lq} Lk={lk} D={d} ({lanes} lanes): max abs diff {max_abs}"
+            "B={batch} Hq={hq} Lq={lq} Lk={lk} D={d} ({schedule:?}): max abs diff {max_abs}"
         );
     }
 }
@@ -707,7 +733,7 @@ fn synthesized_production_kernels_random_shapes_match_cpu() {
         }
     };
 
-    // dense tiled GEMM (the generated `tiled_region` choice): random partial-tile M/K/N.
+    // dense tiled GEMM (the register-tiled choice): random partial-tile M/K/N.
     for seed in 0u64..30 {
         let mut rng = rng_for(seed);
         let (m, k, n) = (
@@ -724,7 +750,7 @@ fn synthesized_production_kernels_random_shapes_match_cpu() {
             matches!(op, OpKind::MatMul { .. })
         });
         assert!(
-            is_tiled_region(&choice),
+            is_register_tiled(&choice),
             "seed {seed}: an M>1 matmul should choose the tiled GEMM, got {choice:?}"
         );
         let mut inputs = HashMap::new();
@@ -1182,9 +1208,8 @@ fn flash_decode_gpu_matches_cpu_over_random_shapes() {
 fn flash_prefill_gpu_2d_grid_over_65535_workgroups() {
     // Flash prefill with Hq*L > 65535 (the wgpu gridDim.x cap) runs via the 2-D workgroup grid
     // (gi = GroupY*x_groups + GroupX). Hq=512, L=130 -> Hq*L = 66560 (y_groups=2); the planner chooses the
-    // generated region prefill (B=1, D=4, no softcap). gpu.run == CPU eval (== attention_prefill). Card 557:
-    // `compile`'s `flash_attention_capped` declines a prefill wider than the target's grid, so the composite
-    // is staged directly, as a pass would form it.
+    // generated region prefill (B=1, D=4, no softcap). gpu.run == CPU eval (== attention_prefill). The
+    // composite is staged directly; the traced chain through `compile` is the next test.
     use poot_graph_ir::builder::Builder;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
@@ -1268,10 +1293,10 @@ fn flash_prefill_gpu_2d_grid_over_65535_workgroups() {
 }
 
 #[test]
-fn decomposed_prefill_attention_over_65535_query_groups_matches_cpu() {
-    // The traced prefill attention chain at Hq*L = 66560 > 65535: `flash_attention_capped` declines the shape
-    // on a 65535-wide grid, so the unfused softmax chain reaches the executor. gpu.run == CPU eval
-    // (== attention_prefill). Card 1006.
+fn traced_prefill_attention_over_65535_query_groups_fuses_and_matches_cpu() {
+    // The traced prefill attention chain at Hq*L = 66560 > 65535: `compile` fuses it to the flash kernel,
+    // which folds its rows onto a 2-D grid (POOT-1308: declining it kept the whole `[Hq, L, capacity]`
+    // scores, 3.8 GB at an 8192-token prefill). gpu.run == CPU eval (== attention_prefill).
     use poot_graph_ir::builder::Builder;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
@@ -1298,12 +1323,12 @@ fn decomposed_prefill_attention_over_65535_query_groups_matches_cpu() {
     let o = attention_prefill(&b, q, k, v, 1, 0.3, mask).unwrap();
     let g = b.finish(o).unwrap();
     assert!(
-        !compile_full(&g, &target)
+        compile_full(&g, &target)
             .graph()
             .eqns()
             .iter()
             .any(|e| matches!(e.op, OpKind::Attention(_))),
-        "the over-grid prefill stays the decomposed chain"
+        "the over-grid prefill fuses onto the folded grid"
     );
     let maskd: Vec<f32> = (0..l * l)
         .map(|i| if i % l <= i / l { 0.0 } else { -1.0e9 })
@@ -1336,7 +1361,7 @@ fn decomposed_prefill_attention_over_65535_query_groups_matches_cpu() {
     let max_abs = max_abs_error(got.as_f32().unwrap(), cpu.as_f32().unwrap());
     assert!(
         max_abs <= 2e-3,
-        "decomposed over-grid prefill attention max abs diff {max_abs}"
+        "fused over-grid prefill attention max abs diff {max_abs}"
     );
 }
 
@@ -1450,12 +1475,10 @@ fn flash_prefill_gpu_matches_cpu_over_random_shapes() {
 }
 
 #[test]
-fn synthesized_tiled_region_element_by_element_matches_cpu() {
-    // A bare M>1 F32 MatMul compiles to the synthesizer's tile-IR Body generator `kg::tiled_region` (Card 557: the
-    // planner's contraction choice), which generates the LDS-staged tiled GEMM from the (M,K,N,tile) descriptor
-    // instead of reusing the hand-authored kernel. Confirm the compiled choice is the synthesized kernel and it
-    // runs GPU==CPU over partial-tile shapes in all three dims (RADV safety and masking). Foundation for the dequant
-    // load and online-softmax accumulation variants.
+fn synthesized_tiled_gemm_matches_cpu_over_partial_tiles() {
+    // A bare M>1 F32 MatMul compiles to the register-tiled GEMM (Card 557: the planner's contraction choice).
+    // Confirm the compiled choice is that kernel and it runs GPU==CPU over partial-tile shapes in all three dims
+    // (RADV safety and masking).
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
         return;
@@ -1471,8 +1494,8 @@ fn synthesized_tiled_region_element_by_element_matches_cpu() {
             })
             .collect()
     };
-    // partial tiles in all dims (GEMM_TILE=8, coarsened 2 rows/lane -> 16-row tiles): M not a mult of 16,
-    // N not a mult of 8, K not a mult of 8; plus an exact-tile case and a tall/narrow one.
+    // partial tiles in all dims: M not a multiple of 16, N not a multiple of 32, K not a multiple of the 16-value
+    // stage; plus an exact-tile case and a tall/narrow one.
     for (seed, (m, k, n)) in [
         (2usize, 16usize, 8usize),
         (17, 32, 24),
@@ -1505,11 +1528,9 @@ fn synthesized_tiled_region_element_by_element_matches_cpu() {
         assert!(
             matches!(
                 choice,
-                KernelChoice::Generated(KernelRequest::Contraction(
-                    ContractionSpec::TiledRegion { .. }
-                ))
+                KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(_)))
             ),
-            "expected the single-dispatch synthesized tiled_region choice, got {choice:?}"
+            "expected the register-tiled GEMM choice, got {choice:?}"
         );
 
         let eval_inputs: HashMap<_, Value> = inputs
@@ -1538,69 +1559,7 @@ fn synthesized_tiled_region_element_by_element_matches_cpu() {
             );
         }
     }
-    eprintln!("synthesized tiled GEMM (element-by-element kg::tiled_region) runs GPU==CPU");
-}
-
-#[test]
-fn synthesized_tiled_region_chunked_large_matches_cpu() {
-    // The synthesized tiled GEMM (`kg::tiled_region`) also chunks a >= 2^15-tile GEMM into sub-2^15 dispatches (each a baked
-    // `tile_offset` variant), so the synthesized path handles any size on RADV. Same 544x8192 shape as the imported chunked
-    // test (34816 tiles -> 2 chunks); the planner's contraction choice (Card 557) takes the synthesized tiled GEMM, and
-    // this asserts the compiled plan is split and `gpu.run == CPU eval`.
-    let _gpu_guard = gpu_lock();
-    let Some((mut gpu, target)) = open_engine_or_skip() else {
-        return;
-    };
-    let (m, k, n) = (544usize, 32usize, 8192usize);
-    let b = Builder::for_tests();
-    let x = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
-    let w = b.constant("w", TensorType::f32(vec![k, n])).unwrap();
-    let out = b.matmul(x, w).unwrap();
-    let g = b.finish(out).unwrap();
-    let program = compile_full(&g, &spirv_fixture_target());
-    let (eqn, plan) = program
-        .planned()
-        .find(|(eqn, _)| matches!(eqn.op, OpKind::MatMul { .. }))
-        .expect("the compiled graph holds the matmul");
-    let choice = program.kernel_choice(eqn);
-    assert!(
-        is_tiled_region(choice),
-        "chunks should be the synthesized tiled_region kernel: {choice:?}"
-    );
-    let n_chunks = plan.dispatches().len();
-    assert_eq!(n_chunks, 2, "34816 tiles / 32767-per-chunk = 2 chunks");
-
-    let xd: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) * 0.1 - 0.3).collect();
-    let wd: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32) * 0.08 - 0.16).collect();
-    let mut inputs = HashMap::new();
-    inputs.insert(x.id(), HostTensor::f32(vec![m, k], xd));
-    inputs.insert(w.id(), HostTensor::f32(vec![k, n], wd));
-    let eval_inputs: HashMap<_, Value> = inputs
-        .iter()
-        .map(|(&id, t)| (id, Value::from(t.clone())))
-        .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
-        .unwrap()
-        .output
-        .into_host()
-        .unwrap();
-    let got = run_via_contract(&mut gpu, target, &g, &inputs);
-    assert_eq!(got.shape(), vec![m, n]);
-    for (i, (a, c)) in got
-        .as_f32()
-        .unwrap()
-        .iter()
-        .zip(cpu.as_f32().unwrap().iter())
-        .enumerate()
-    {
-        assert!(
-            (a - c).abs() < 1e-4,
-            "elem {i} (row {}, col {}): gpu {a} vs cpu {c}",
-            i / n,
-            i % n
-        );
-    }
-    eprintln!("synthesized chunked tiled GEMM: {m}x{k}x{n} -> 2 chunks, GPU==CPU");
+    eprintln!("register-tiled GEMM runs GPU==CPU");
 }
 
 /// Card 259: real-wgpu dispatch of the per-head attention mask, the layout ALiBi needs. Covers the generated
@@ -2182,4 +2141,102 @@ fn deepseek_v2_mla_split_key_decode_gpu_matches_cpu() {
         worst <= 1e-4,
         "device differs from the oracle by {worst:.3e}"
     );
+}
+
+/// POOT-1313: the gemma-3-1b-it global-attention prefill at 8192 tokens (4 query heads over one key/value
+/// head of width 256) completes on the device. As one dispatch it ran about 2 s, the display watchdog reset
+/// the context, and the next upload failed ("write_with ... is not word aligned"). The planner now splits it
+/// into runs of rows under the budget; this row drives the real compile and executor, requires the split, and
+/// checks sampled rows against a host softmax (the full CPU eval is minutes).
+///
+/// Mutation: set `ATTENTION_CHUNK_WORK` to `u64::MAX`; the plan-split assertion goes red before any launch.
+/// (Unsplit, the launch itself loses the device, which can wedge the iGPU, so the launch is not mutated.)
+#[test]
+fn gemma_global_attention_prefill_at_8192_tokens_runs_split_and_matches_a_host_reference() {
+    use poot_graph_ir::builder::Builder;
+    let _gpu_guard = gpu_lock();
+    let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let (hq, hkv, l, d) = (4usize, 1usize, 8192usize, 256usize);
+    let scale = 1.0 / (d as f32).sqrt();
+    let fill = |seed: u64, n: usize| -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 24) as f32) * 1.2 - 0.6
+            })
+            .collect()
+    };
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, l, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, l, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, l, d]))
+        .unwrap();
+    let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l])).unwrap();
+    let ids = [q.id(), k.id(), v.id(), mask.id()];
+    let o = attention_prefill(&b, q, k, v, hq / hkv, scale, mask).unwrap();
+    let g = b.finish(o).unwrap();
+    let choice = compiled_choice(&g, &target, |op| matches!(op, OpKind::Attention(_)));
+    assert!(
+        matches!(
+            choice,
+            KernelChoice::Generated(KernelRequest::AttentionRows(_))
+        ),
+        "an 8192-token global prefill plans as runs of rows on a watchdog device: {choice:?}"
+    );
+    let (qd, kd, vd) = (
+        fill(1, hq * l * d),
+        fill(2, hkv * l * d),
+        fill(3, hkv * l * d),
+    );
+    let maskd: Vec<f32> = (0..l * l)
+        .map(|i| if i % l <= i / l { 0.0 } else { -1.0e9 })
+        .collect();
+    let mut inputs = HashMap::new();
+    inputs.insert(ids[0], HostTensor::f32(vec![1, hq, l, d], qd.clone()));
+    inputs.insert(ids[1], HostTensor::f32(vec![1, hkv, l, d], kd.clone()));
+    inputs.insert(ids[2], HostTensor::f32(vec![1, hkv, l, d], vd.clone()));
+    inputs.insert(ids[3], HostTensor::f32(vec![1, 1, l, l], maskd));
+    let got = run_via_contract(&mut gpu, target, &g, &inputs);
+    assert_eq!(got.shape(), vec![1, hq, l, d]);
+    let got = got.as_f32().unwrap();
+    for h in 0..hq {
+        for i in [0usize, 4097, l - 1] {
+            let qrow = &qd[(h * l + i) * d..][..d];
+            let scores: Vec<f64> = (0..=i)
+                .map(|j| {
+                    let krow = &kd[j * d..][..d];
+                    f64::from(scale)
+                        * qrow
+                            .iter()
+                            .zip(krow)
+                            .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                            .sum::<f64>()
+                })
+                .collect();
+            let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+            let total: f64 = weights.iter().sum();
+            for c in 0..d {
+                let want: f64 = weights
+                    .iter()
+                    .enumerate()
+                    .map(|(j, w)| w * f64::from(vd[j * d + c]))
+                    .sum::<f64>()
+                    / total;
+                let have = f64::from(got[(h * l + i) * d + c]);
+                assert!(
+                    (have - want).abs() < 2e-3,
+                    "head {h} row {i} col {c}: gpu {have} vs host {want}"
+                );
+            }
+        }
+    }
 }

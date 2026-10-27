@@ -12,11 +12,13 @@
 //!
 //! Indices travel as `f32` (LDS is `f32`-only), exact below 2^24 logits.
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::{group_index, local_index, wg_read, wg_write, workgroup_barrier};
+use poot_kernel_attr::kernel;
+use poot_kernel_intrinsics::{group_index_x, local_index_x, wg_read, wg_write, workgroup_barrier};
 const WORKGROUP_SIZE: usize = 256;
-pub fn __poot_kernel_argmax_partials(logits: &[f32], partials: &mut [f32]) {
-    let lane = local_index();
-    let g = group_index();
+#[kernel(workgroup(256), lds(f32, 256), lds(f32, 256))]
+pub fn argmax_partials(logits: &[f32], partials: &mut [f32]) {
+    let lane = local_index_x();
+    let g = group_index_x();
     let n = logits.len();
     let groups = partials.len() / 2;
     let divisor = groups.max(1);
@@ -40,11 +42,11 @@ pub fn __poot_kernel_argmax_partials(logits: &[f32], partials: &mut [f32]) {
         }
         j = j + WORKGROUP_SIZE;
     }
-    wg_write(0, lane, best_val);
+    wg_write::<f32>(0, lane, best_val);
     if found {
-        wg_write(1, lane, best_idx as f32);
+        wg_write::<f32>(1, lane, best_idx as f32);
     } else {
-        wg_write(1, lane, -1.0);
+        wg_write::<f32>(1, lane, -1.0);
     }
     workgroup_barrier();
     if lane == 0 && g < groups {
@@ -52,8 +54,8 @@ pub fn __poot_kernel_argmax_partials(logits: &[f32], partials: &mut [f32]) {
         let mut bi = -1.0f32;
         let mut k = 0usize;
         while k < WORKGROUP_SIZE {
-            let cv = wg_read(0, k);
-            let ci = wg_read(1, k);
+            let cv = wg_read::<f32>(0, k);
+            let ci = wg_read::<f32>(1, k);
             if ci >= 0.0 && (bi < 0.0 || cv > bv || (cv == bv && ci < bi)) {
                 bv = cv;
                 bi = ci;

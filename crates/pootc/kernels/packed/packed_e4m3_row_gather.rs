@@ -28,10 +28,10 @@
 //! count rather than proved, because the index is computed on the device like every other wgpu `Gather`.
 
 #![crate_type = "lib"]
-use poot_kernel_intrinsics::thread_index;
+use poot_kernel_intrinsics::thread_index_x;
 
 pub fn __poot_kernel_packed_e4m3_row_gather(table_words: &[u32], index: &[i32], out: &mut [f32]) {
-    let i = thread_index();
+    let i = thread_index_x();
     // `index.len() > 0` rather than `!index.is_empty()`: the importer admits `len()` but rejects a call to
     // `is_empty`. `row_width > 0` keeps the division below defined for a shape the planner should not
     // produce (an output shorter than its own index).

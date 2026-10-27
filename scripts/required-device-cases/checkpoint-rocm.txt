@@ -60,6 +60,13 @@ poot-llm	driver::device_tests::checkpoint::smollm2_gguf_coherent::rocm
 poot-llm	driver::device_tests::checkpoint::smollm3_coherent::rocm
 poot-llm	driver::device_tests::checkpoint::smollm3_gguf_oracle::rocm
 poot-llm	driver::device_tests::checkpoint::tinyllama_coherent::rocm
+poot-llm	driver::llamacpp_longrope_tests::phi_3_5_mini_long_window_follows_llamacpp_rocm
+poot-llm	driver::llamacpp_longrope_tests::phi_3_5_mini_short_window_follows_llamacpp_rocm
+poot-llm	driver::llamacpp_longrope_tests::phi_4_mini_long_window_follows_llamacpp_rocm
+poot-llm	driver::llamacpp_longrope_tests::phi_4_mini_long_window_with_swapped_tables_leaves_the_gate_rocm
+poot-llm	driver::llamacpp_longrope_tests::phi_4_mini_short_window_follows_llamacpp_rocm
+poot-llm	driver::llamacpp_longrope_tests::phi_4_mini_short_window_rocm_matches_the_cpu_oracle
+poot-llm	driver::llamacpp_longrope_tests::phi_4_mini_short_window_without_the_attention_scale_leaves_the_gate_rocm
+poot-llm::rocm_executor_coverage	qwen2_5_0_5b_real_weights_match_the_oracle_logits_at_every_prompt_position_on_rocm
 poot-llm::smolvlm_checkpoint	caption_matches_the_recorded_vlm_runner_tokens_rocm
 poot-llm::smolvlm_checkpoint	two_captions_on_one_front_end_are_not_stale_rocm
-poot-llm::rocm_executor_coverage	qwen2_5_0_5b_real_weights_match_the_oracle_logits_at_every_prompt_position_on_rocm

@@ -5,8 +5,13 @@
 //! inverse of a rank permutation; a stable descending sort), so a row can assert the selection
 //! itself and not only agreement with `eval`.
 
-use poot_graph_ir::{Builder, TensorType, ops};
+use poot_eval::test_support::StepFixture;
+use poot_graph_ir::{Builder, Graph, TensorType, ops};
 use poot_tensor::HostTensor;
+
+use poot_eval::test_support::weight_map_oracle::oracle_for;
+use poot_executor::Executor;
+use poot_graph_plan::Target;
 
 use crate::{Fixture, const_fixture};
 
@@ -145,5 +150,242 @@ fn tie_case(name: &'static str, rows: &[[f32; 5]], k: usize) -> TieCase {
         ),
         k,
         expected_ids,
+    }
+}
+
+/// The expert ids of a routing: an `I32` step input, since the weight store holds floats only. `experts` declares
+/// the ids in `0..experts`, as a router's `ArgTopK` proves them; `compile` refuses an indexed contraction whose ids
+/// it cannot prove in range, so an invalid id never reaches a compiled contraction, only the grouping on its own.
+fn ids_slot(b: &Builder, rows: usize, experts: Option<usize>) -> poot_graph_ir::Traced {
+    let aval = TensorType::new(vec![rows], poot_tensor::DType::I32);
+    match experts {
+        Some(experts) => b.slot_named_ranged(
+            poot_graph_ir::Slot::Activation,
+            "ids",
+            aval,
+            poot_graph_ir::IndexRange::below(experts)
+                .expect("an expert count fits the index range"),
+        ),
+        None => b.slot_named(poot_graph_ir::Slot::Activation, "ids", aval),
+    }
+    .unwrap()
+}
+
+/// A fixture with named float constants and the expert `ids` bound at each of two steps (the entry records on
+/// the first and replays on the second).
+fn ids_fixture(
+    name: &'static str,
+    graph: Graph,
+    ids_in: poot_graph_ir::Traced,
+    consts: Vec<(&str, HostTensor)>,
+    ids: Vec<i32>,
+) -> Fixture {
+    let key = graph
+        .meta(ids_in.id())
+        .slot_key()
+        .expect("a slot input has a key")
+        .clone();
+    let step = || {
+        vec![StepFixture {
+            key: key.clone(),
+            tensor: HostTensor::i32(vec![ids.len()], ids.clone()),
+        }]
+    };
+    Fixture {
+        name,
+        graph,
+        store: crate::store_from_tensors(consts),
+        steps: vec![step(), step()],
+    }
+}
+
+/// One expert-grouping case: `ids [rows]` through `ExpertGroup`, whose `[2, rows]` output is the sorted order and
+/// its inverse.
+pub struct ExpertGroupCase {
+    /// The grouping program over the ids.
+    pub fixture: Fixture,
+    /// The `[2, rows]` output the device must produce, row-major: the stable order by expert, then each row's
+    /// sorted position. Derived here by a stable sort, not by the oracle.
+    pub expected: Vec<i32>,
+}
+
+/// The routings that break a naive grouping: every row on one expert, experts without rows, tied rows
+/// (a repeated expert keeps its row order), ids outside the table (sorted after every expert, never dropped), a
+/// length that leaves a partial last workgroup of rows, and more experts than rows.
+pub fn expert_group_cases() -> Vec<ExpertGroupCase> {
+    let cycle = |rows: usize, experts: i32| -> Vec<i32> {
+        (0..rows as i32).map(|r| (r * 5 + 3) % experts).collect()
+    };
+    vec![
+        expert_group_case("expert_group_one_expert", vec![2; 37], 4),
+        expert_group_case(
+            "expert_group_empty_experts",
+            vec![3, 3, 0, 3, 0, 0, 3, 5, 5],
+            6,
+        ),
+        expert_group_case("expert_group_ties", vec![1, 0, 1, 0, 1, 0, 1, 0], 2),
+        expert_group_case("expert_group_mixed", cycle(301, 7), 7),
+        expert_group_case("expert_group_more_experts_than_rows", cycle(5, 40), 40),
+        expert_group_case(
+            "expert_group_invalid_ids",
+            vec![2, -1, 0, 4, i32::MIN, 1, i32::MAX, 0, 1_000_000_000, 3, -7],
+            4,
+        ),
+    ]
+}
+
+fn expert_group_case(name: &'static str, ids: Vec<i32>, experts: usize) -> ExpertGroupCase {
+    let bucket = |id: i32| {
+        usize::try_from(id)
+            .ok()
+            .filter(|&e| e < experts)
+            .unwrap_or(experts)
+    };
+    let mut order: Vec<usize> = (0..ids.len()).collect();
+    order.sort_by_key(|&row| bucket(ids[row]));
+    let mut dest = vec![0i32; ids.len()];
+    for (position, &row) in order.iter().enumerate() {
+        dest[row] = position as i32;
+    }
+    let expected = order
+        .into_iter()
+        .map(|row| row as i32)
+        .chain(dest)
+        .collect();
+
+    let b = Builder::for_tests();
+    let ids_in = ids_slot(&b, ids.len(), None);
+    let out = b.expert_group(ids_in, experts).unwrap();
+    let graph = b.finish(out).unwrap();
+    ExpertGroupCase {
+        fixture: ids_fixture(name, graph, ids_in, Vec::new(), ids),
+        expected,
+    }
+}
+
+/// One routed-contraction case: the indexed contraction of `rows` activation rows through their expert ids, run
+/// twice in one program, directly and through the expert grouping (rows gathered into expert order, contracted,
+/// gathered back). The `[rows, 2 * N]` output is the direct result, then the grouped one.
+pub struct GroupedContractionCase {
+    /// The program holding both contractions.
+    pub fixture: Fixture,
+    /// The output columns of one contraction (`N`).
+    pub n: usize,
+}
+
+/// More rows than a Gemv serves (so the register-tiled expert walk runs on every device), over routings where a tile
+/// holds one expert, many, or none of an expert.
+pub fn grouped_contraction_cases() -> Vec<GroupedContractionCase> {
+    const EXPERTS: usize = 8;
+    let rows = 100usize;
+    let mixed: Vec<i32> = (0..rows as i32).map(|r| (r * 5 + 3) % 8).collect();
+    vec![
+        grouped_contraction_case("grouped_one_expert", vec![5; rows], EXPERTS),
+        grouped_contraction_case(
+            "grouped_empty_experts",
+            (0..rows as i32).map(|r| [1, 6][(r % 2) as usize]).collect(),
+            EXPERTS,
+        ),
+        grouped_contraction_case("grouped_mixed", mixed, EXPERTS),
+    ]
+}
+
+fn grouped_contraction_case(
+    name: &'static str,
+    ids: Vec<i32>,
+    experts: usize,
+) -> GroupedContractionCase {
+    let (rows, k, n) = (ids.len(), 12usize, 20usize);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![rows, k])).unwrap();
+    let w = b
+        .constant("w", TensorType::f32(vec![experts, k, n]))
+        .unwrap();
+    let ids_in = ids_slot(&b, rows, Some(experts));
+    let direct = b.indexed_matmul(x, w, ids_in).unwrap();
+    let group = b.expert_group(ids_in, experts).unwrap();
+    let row_of = |i| {
+        b.reshape(b.slice(group, 0, i, i + 1).unwrap(), vec![rows])
+            .unwrap()
+    };
+    let (order, dest) = (row_of(0), row_of(1));
+    let sorted = b
+        .indexed_matmul(
+            b.gather(x, 0, order).unwrap(),
+            w,
+            b.gather(ids_in, 0, order).unwrap(),
+        )
+        .unwrap();
+    let grouped = b.gather(sorted, 0, dest).unwrap();
+    let out = b.concat(1, &[direct, grouped]).unwrap();
+    let graph = b.finish(out).unwrap();
+    let x_data: Vec<f32> = (0..rows * k).map(|i| ((i * 7) % 11) as f32 - 5.0).collect();
+    let w_data: Vec<f32> = (0..experts * k * n)
+        .map(|i| ((i * 13) % 9) as f32 * 0.25 - 1.0)
+        .collect();
+    GroupedContractionCase {
+        fixture: ids_fixture(
+            name,
+            graph,
+            ids_in,
+            vec![
+                ("x", HostTensor::f32(vec![rows, k], x_data)),
+                ("w", HostTensor::f32(vec![experts, k, n], w_data)),
+            ],
+            ids,
+        ),
+        n,
+    }
+}
+
+/// Assert the two halves of a grouped-contraction output (`[rows, 2 * n]`) are bit-identical row by row: grouping
+/// changes no row's dot product.
+pub fn assert_grouping_changes_no_row(case: &GroupedContractionCase, got: &HostTensor) {
+    let name = case.fixture.name;
+    let width = 2 * case.n;
+    let values = got.as_f32().expect("the contraction output is F32");
+    for (row, pair) in values.chunks(width).enumerate() {
+        let (direct, grouped) = pair.split_at(case.n);
+        for (col, (d, g)) in direct.iter().zip(grouped).enumerate() {
+            assert_eq!(
+                d.to_bits(),
+                g.to_bits(),
+                "{name} row {row} col {col}: direct {d} vs grouped {g}"
+            );
+        }
+    }
+}
+
+/// The expert grouping on a device, over [`expert_group_cases`] and [`grouped_contraction_cases`]: the grouping
+/// equals a stable sort derived here and the oracle at every replayed step; a contraction through the grouping is
+/// bit-identical per row to the direct one and equals the oracle. (An id outside the table never reaches a compiled
+/// contraction: `compile` refuses ids it cannot prove in range, so the invalid-id contraction is covered on the
+/// kernel interpreter, `poot-kernelgen/tests/expert_group_interp.rs`.)
+pub fn assert_expert_grouping_on_device(exec: &mut dyn Executor, target: Target) {
+    for case in expert_group_cases() {
+        let name = case.fixture.name;
+        let outputs =
+            crate::run_outputs(exec, target, &case.fixture).unwrap_or_else(|e| panic!("{e}"));
+        for (step, got) in outputs.iter().enumerate() {
+            assert_eq!(
+                got.as_i32().expect("the grouping is I32"),
+                case.expected.as_slice(),
+                "{name} step {step}: the order and its inverse differ from a stable sort by expert"
+            );
+        }
+        let mut oracle = oracle_for(&case.fixture.graph, &case.fixture.store);
+        crate::run_parity(exec, target, &case.fixture, &mut oracle)
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+    for case in grouped_contraction_cases() {
+        let name = case.fixture.name;
+        let outputs =
+            crate::run_outputs(exec, target, &case.fixture).unwrap_or_else(|e| panic!("{e}"));
+        for got in &outputs {
+            assert_grouping_changes_no_row(&case, got);
+        }
+        let mut oracle = oracle_for(&case.fixture.graph, &case.fixture.store);
+        crate::run_parity(exec, target, &case.fixture, &mut oracle)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
 }

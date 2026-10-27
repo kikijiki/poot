@@ -9,7 +9,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-# Test-only API: `HostTensor::reshaped`, used by the CPU oracle and tests (POOT-ADR-0113).
+# Test-only API: `HostTensor::reshaped`, used by the CPU oracle and tests, and `HostTensor::zeros_of`, a test's
+# zero state in its declared dtype (POOT-ADR-0113).
 test-support = []
 # Counts `HostTensor::to_f32` calls (`read_counter::reads`), for the test that proves a bind path never widens.
 read-counter = []

@@ -1219,14 +1219,22 @@ pub(crate) mod oracle {
         let mut stacks: HashMap<WeightId, Arc<PackedStack>> = HashMap::new();
         let mut inputs: HashMap<ValueId, Value> = HashMap::new();
         // The harness carries every state as f32; an integer state (a token history) is exact
-        // below 2^24 and is bound at its own dtype.
+        // below 2^24 and a two-byte KV cache holds values it stored, so each is bound at its own
+        // dtype without loss.
         for (i, (si, _)) in g.state().enumerate() {
             let aval = g.aval(si);
+            let halves = |narrow: fn(f32) -> u16| state[i].iter().map(|&v| narrow(v)).collect();
             let tensor = match aval.dtype {
                 DType::I32 => HostTensor::i32(
                     aval.shape.clone(),
                     state[i].iter().map(|&v| v as i32).collect(),
                 ),
+                DType::F16 => {
+                    HostTensor::f16(aval.shape.clone(), halves(poot_quant::scalar::f32_to_f16))
+                }
+                DType::BF16 => {
+                    HostTensor::bf16(aval.shape.clone(), halves(poot_quant::scalar::f32_to_bf16))
+                }
                 _ => HostTensor::f32(aval.shape.clone(), state[i].to_vec()),
             };
             inputs.insert(si, tensor.into());
@@ -1342,7 +1350,7 @@ pub(crate) mod oracle {
             let host = v.into_host().unwrap();
             match host.as_i32() {
                 Some(words) => words.iter().map(|&w| w as f32).collect(),
-                None => host.as_f32().unwrap().to_vec(),
+                None => host.to_f32().unwrap().into_owned(),
             }
         };
         (

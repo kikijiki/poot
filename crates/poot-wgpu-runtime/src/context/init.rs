@@ -3,7 +3,7 @@ use crate::timestamps::storage_entry;
 use crate::{
     CachedPipeline, Context, ContextOptions, DeviceHealth, DeviceTimingAccumulator, RuntimeError,
 };
-use poot_runtime_common::CompiledKernel;
+use poot_codegen::CompiledKernel;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -120,7 +120,6 @@ impl Context {
             matrix_lowering: poot_target::MatrixLowering::vulkan(self.tensor_core),
             native_two_byte_floats: false,
             widens_bf16_decode_weight: false,
-            imported_lds_array_bodies: true,
             peer_transport: false,
             decode_gemv_max_out_cols: None,
             launch_class: poot_target::calibration::LaunchClass::Vulkan,
@@ -325,7 +324,7 @@ impl Context {
         key: &str,
         kernel: &CompiledKernel,
     ) -> Result<(wgpu::ComputePipeline, wgpu::BindGroupLayout), RuntimeError> {
-        let poot_runtime_common::KernelCode::SpirvWords(words) = kernel.code() else {
+        let poot_codegen::KernelCode::SpirvWords(words) = kernel.code() else {
             return Err(RuntimeError::WrongKernelTarget {
                 actual: kernel.target(),
             });
@@ -596,13 +595,13 @@ mod launch_caps_device_receipt {
     fn a_live_amd_device_reports_the_launch_limits_the_fixture_documents() {
         let Ok(ctx) = Context::new() else {
             eprintln!(
-                "SKIP a_live_amd_device_reports_the_launch_limits_the_fixture_documents: no GPU"
+                "POOT-SKIP a_live_amd_device_reports_the_launch_limits_the_fixture_documents: no GPU"
             );
             return;
         };
         if ctx.calibration.known().is_none() {
             eprintln!(
-                "SKIP a_live_amd_device_reports_the_launch_limits_the_fixture_documents: not the calibrated device"
+                "POOT-SKIP a_live_amd_device_reports_the_launch_limits_the_fixture_documents: not the calibrated device"
             );
             return;
         }
@@ -650,7 +649,7 @@ mod card537_wgpu_debug_tests {
             Ok(ctx) => ctx,
             Err(e) => {
                 eprintln!(
-                    "SKIP wgpu_debug_never_downgrades_a_fatal_uncaptured_error: no GPU ({e})"
+                    "POOT-SKIP wgpu_debug_never_downgrades_a_fatal_uncaptured_error: no GPU ({e})"
                 );
                 // SAFETY: see the set_var above.
                 unsafe {

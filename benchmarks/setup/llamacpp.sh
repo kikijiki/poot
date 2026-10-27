@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # llama.cpp baseline: clone a pinned tag + build with CUDA (needs nvcc -> -devel image). Run on the pod.
 # Set CUDA arch list to the pod GPU. GGUF-only: convert/download GGUFs separately (see NOTES.md). Pinned
-# to tag b9601 (date-stamped rolling tags, not semver).
+# to release v0.4.1 (first release with qwen4exp and the GDN normalization fix, POOT-1318).
 set -euo pipefail
-LLAMACPP_TAG="${LLAMACPP_TAG:-b9601}"
+LLAMACPP_TAG="${LLAMACPP_TAG:-v0.4.1}"
 ARCHES="${CMAKE_CUDA_ARCHITECTURES:-80;86;89;90}"
 DEST="${LLAMACPP_DIR:-/opt/llama.cpp}"
 

@@ -6,120 +6,99 @@ sidebar_position: 3
 
 # Tracing a Model
 
-A poot model definition is an ordinary Rust function that takes a `Builder` and builds a
-graph. The same graph runs two ways: the CPU oracle (`poot_eval::eval`) evaluates it tensor
-by tensor, and the planner lowers it to GPU kernels. This follows the functional
-transformations pattern of JAX [^jax], where one traced program can be interpreted as
-computation, JIT-compilation, or another transformation.
+A model is an ordinary Rust function that takes a `Builder` and records a graph. The CPU oracle (`poot_eval::eval`) evaluates
+that graph tensor by tensor, and the planner lowers it to GPU kernels. This follows JAX's functional-transformations
+pattern [^jax].
 
 ## The Builder and Traced handles
 
-`poot_graph_ir::Builder` records equations. A `Traced` value is a type-only handle: a
-`ValueId` plus a brand identifying the builder that minted it, with no data; its host-computed
-`TensorType` is read through `Builder::aval`. Using a handle with a different builder is a typed
-`BuilderError` (`ForeignHandle`), not a panic. Every builder call returns a `Result`, and so does every
-helper in `poot_graph_ir::ops`. Model code creates inputs with
-`Builder::constant` (weights and tables), `Builder::slot` / `slot_named` (per-step inputs),
-and `Builder::state_input` (the KV cache), then calls the composite helpers in
-`poot_graph_ir::ops`:
+`poot_graph_ir::Builder` records equations. A `Traced` value is a type-only handle (a `ValueId` plus the minting builder's
+brand); its `TensorType` is read through `Builder::aval`. A handle from another builder is a typed `BuilderError`
+(`ForeignHandle`). Every builder call and every `poot_graph_ir::ops` helper returns a `Result`.
+
+| Input | Builder call |
+| --- | --- |
+| Weights and tables | `Builder::constant` |
+| Per-step inputs | `Builder::slot` / `slot_named` |
+| KV cache | `Builder::state_input` |
+
+Helpers in `poot_graph_ir::ops` append primitive eqns; none is an opcode:
 
 ```rust
-let h  = ops::rmsnorm(b, x, attn_norm, eps)?;
-let q  = ops::linear(b, h, q_proj, q_bias)?;
-let q  = ops::rope(b, q, cos_table, sin_table, pos)?;
-let o  = ops::attention_masked(b, q, k_cache, v_cache, n_rep, scale, mask)?;
+let h = ops::rmsnorm(b, x, attn_norm, eps)?;
+let q = ops::linear(b, h, q_proj, q_bias)?;
+let q = ops::rope(b, q, cos, sin, pos)?;
+let o = ops::attention_masked(b, q, k, v, n_rep, scale, mask)?;
 let ff = ops::swiglu(b, gate, up)?;
 ```
 
-Each helper appends primitive eqns; none of them is an opcode. `Builder::finish(out)` closes the graph; to carry
-state or declare validation witnesses it takes `Outputs::new(out).with_state(&[(state_in, state_out)])`. A
-finished `Graph` is always well formed, and a pass changes it only through an edit that is checked again.
+`Builder::finish(out)` closes the graph; `Outputs::new(out).with_state(&[(state_in, state_out)])` carries state or declares
+validation witnesses. A finished `Graph` is always well formed, and a pass changes it only through a re-checked edit.
 
 ## From a family to a step
 
-A model family lives in `poot-models` and implements the `Model` trait. Its `trace_into(spec, builder)` builds the
-graph of one step (callers use `trace(spec, limits)`, which checks the step against the model's schema and its token count before the body runs and hands it a builder that charges the caller's limits): a `StepSpec` names the program and the carried inputs, and its `StepShape` gives the rows, the new tokens per row, the cache capacity, the KV layout
-(contiguous or paged), whether logits come back for the last token or every token and, when asked, a
-hidden-state carry. A dense decoder is a
-short call of the shared residual pair in `poot_models::components::standard`:
+A model family lives in `poot-models` and implements `Model::trace_into(spec, builder)`, which builds one step. Callers use
+`trace(spec, limits)`, which checks the step against the schema and token count first. A `StepSpec` names the program and
+carried inputs; its `StepShape` gives:
+
+- rows, new tokens per row and cache capacity;
+- the KV layout (contiguous or paged);
+- logits for the last token or every token;
+- an optional hidden-state carry.
+
+A dense decoder is a short call of the shared pair in `poot_models::components::standard`:
 
 ```rust
 let step = Step::new(&b, shape)?;
 let logits = standard_stack(&b, &step, &stack, &params, layers, |b, l, x| {
     standard_layer(
         b, x, &layers[l].norms, &layer_params,
-        |b, h| attention(b, &step, l, h, &layers[l].attn, &attn_params),   // the mixer
-        |b, input| gated_ffn(b, input.block, &layers[l].ffn),              // the feed-forward
+        // the mixer
+        |b, h| attention(b, &step, l, h, &layers[l].attn, &attn_params),
+        // the feed-forward
+        |b, input| gated_ffn(b, input.block, &layers[l].ffn),
     )
 })?;
 step.finish(b, logits)?
 ```
 
-`standard_stack` embeds the step's tokens, runs one `layer_scope` per layer and applies the final norm and the
-head. `standard_layer` is `x += mixer(norm(x)); x += ffn(norm(x))`. A mixture-of-experts family passes a routed
-feed-forward, a latent-attention or Mamba2 family passes another mixer, and the shared pieces (attention, norms,
-rotary embeddings, projections, routers) are reused rather than copied. The pieces are described on
-[Models, Registry and the Driver](./driver.mdx).
+`standard_stack` embeds the tokens, runs one `layer_scope` per layer, then applies the final norm and head. `standard_layer` is
+`x += mixer(norm(x)); x += ffn(norm(x))`. MoE, latent-attention and Mamba2 families pass a different feed-forward or mixer;
+shared pieces are reused ([Models, Registry and the Driver](./driver.mdx)).
 
-Prefill and decode are one body. The step's token and position inputs are typed slots with absolute
-positions, so a prefill is a step that continues from a position, and a decode is the same graph with one
-new token.
+Prefill and decode are one body: positions are absolute typed slots, so prefill continues from a position and decode is the
+same graph with one new token.
 
-**Adding a model is writing a graph.** A family is a config reader for the checkpoint, a table
-mapping weight names to `(layer, role)`, and, when its layers are not of the standard shape, a tracer over
-shared components; a standard decoder gets its tracer from the shared wrapper. KV layout,
-batching, paging, weight format and device limits are not the tracer's business: they are binding
-choices, graph transforms or planner legalization, and nothing in the driver, the planner or an executor
-changes when a family is added. The family has one row in the registry's `SHIPPED` slice, which is how the driver finds it.
+**Adding a model is writing a graph.** A family is a checkpoint config reader, a table from weight names to `(layer, role)`,
+and a tracer over shared components when its layers are non-standard. It gets one row in the registry's `SHIPPED` slice. KV
+layout, batching, paging, weight format and device limits are binding choices, transforms or planner legalization, so nothing
+else changes.
 
 ## How the tracer records eqns
 
-Each builder call:
-
-1. Allocates a new `ValueId` for the output.
-2. Calls `OpKind::infer` to compute the output `TensorType` (shape + dtype) from the input
-   types. No data is touched.
-3. Appends an `Eqn { op, inputs, out }` to the growing eqn list.
-4. Returns the output as a `Traced` handle.
-
-Because a `Traced` carries no data, model code cannot make host-side decisions based on
-activation values. That keeps the graph identical every token, which capture and replay
-require.
+Each builder call allocates a `ValueId`, infers the output `TensorType` with `OpKind::infer` (no data touched), appends an
+`Eqn { op, inputs, out }`, and returns a `Traced`. Handles carry no data, so model code cannot branch on activations. That keeps
+the graph identical every token, which capture and replay need.
 
 ## Consts, slots, state, and values
 
-Four kinds of values appear as eqn inputs (see [The Graph IR](./graph-ir#storage-classes)):
+Eqn inputs have four kinds (see [The Graph IR](./graph-ir#storage-classes)):
 
-**Consts** (`Storage::Const`). Weight matrices, embedding tables, RoPE tables. Declared by
-name with `Builder::constant`. The checkpoint loader binds device buffers to those names at
-close. Const buffers never move.
+| Kind | Holds |
+| --- | --- |
+| **Const** (`Storage::Const`) | Weights, embeddings, RoPE tables, declared by name; the loader binds buffers that never move. |
+| **Slot** (`Storage::Slot`) | `Slot::Token`, `Slot::Pos`, and for paged decode `Slot::SlotMap` / `Slot::WriteMap` (word ranges checked at bind), rewritten in place each step. |
+| **State** (`Storage::State`) | The KV cache; each `state_in` pairs with a `state_out` the executor overwrites. |
+| **Device** (`Storage::Device`) | Every activation, at stable addresses fixed at plan time. |
 
-**Slots** (`Storage::Slot`). Per-step inputs such as the token id and position
-(`Slot::Token`, `Slot::Pos`; paged decode adds `Slot::SlotMap` and `Slot::WriteMap`, whose declared
-word ranges are checked at the bind). The attention mask is built in-graph
-from `Slot::Pos`; no slot carries it. Each slot is
-bound to a stable device buffer that the host rewrites in place every step.
+The attention mask is built in-graph from `Slot::Pos`; no slot carries it.
 
-**State** (`Storage::State`). The KV cache. Each `state_in` binder is paired with a
-`state_out` value; the executor feeds the buffer in and overwrites it with the output.
-
-**Device intermediates** (`Storage::Device`). Every activation produced by an eqn.
-Allocated once at stable addresses determined at plan time, which recorded replay
-requires.
-
-## What a full trace looks like
-
-A decode step of a 24-layer dense decoder traces to
-a flat graph of primitive eqns, on the order of a thousand or more. Count it with
-`poot_graph_ir::analysis::dispatch_count` on the traced decode graph.
-Every shape is known statically at trace time. The trace takes a few milliseconds and
-happens once at model load.
+A 24-layer dense decode step traces to a flat graph of roughly a thousand primitive eqns (count with
+`poot_graph_ir::analysis::dispatch_count`). Shapes are static, and the trace takes milliseconds once at load.
 
 ## GQA and MQA: no special opcode
 
-For grouped-query attention (GQA) [^gqa] and multi-query attention (MQA) [^mqa], the
-K and V projections produce fewer heads than Q. `ops::repeat_kv` expands them to Q's head
-count with `Reshape`, `Broadcast`, `Reshape` before the score matmul:
+For GQA [^gqa] and MQA [^mqa], `ops::repeat_kv` expands K and V to Q's head count before the score matmul:
 
 ```rust
 // k: [1, H_kv, cap, D]  ->  [1, H_kv * n_rep, cap, D]
@@ -128,47 +107,37 @@ let r = b.broadcast(r, vec![bsz, h_kv, n_rep, seq, d])?;
 b.reshape(r, vec![bsz, h_kv * n_rep, seq, d])
 ```
 
-GQA and MQA fall out of the primitives without special casing. When the flash attention
-rewrite fires, the fused op takes `n_rep` as a parameter and reads the shared K/V rows
-directly (`kv_head = q_head / n_rep`).
+When the flash rewrite fires, the fused op takes `n_rep` and reads the shared K/V rows directly (`kv_head = q_head / n_rep`).
 
 ## SwiGLU and GeLU FFN
 
-The SwiGLU [^swiglu] activation of a gated feed-forward:
-
-```
-ffn(x) = (SiLU(gate_proj(x)) * up_proj(x)) @ down_proj
-```
-
-`ops::swiglu` is `silu(gate) * up` between the gate/up and down `MatMul`s, where `silu` is
-itself a composition, `x / (1 + exp(-x))`, over the `Neg`, `Exp`, `Add` and `Div` primitives.
-The GeLU [^gelu] variants replace `silu` with another composition: the tanh approximation
-(the `geglu` variant) is the same sigmoid form over `Exp` and `Div`, and the exact erf form
-(used by encoder feed-forwards) is built on the `Erf` primitive. No activation unary and no
-special FFN opcode exists.
+SwiGLU [^swiglu] is `ffn(x) = (SiLU(gate_proj(x)) * up_proj(x)) @ down_proj`. `ops::swiglu` is `silu(gate) * up` between the
+`MatMul`s, with `silu(x) = x / (1 + exp(-x))` built from `Neg`, `Exp`, `Add` and `Div`. GeLU [^gelu] variants swap in another
+composition: `geglu` uses the tanh approximation over `Exp` and `Div`; encoder feed-forwards use the exact form on `Erf`. There
+is no activation unary or FFN opcode.
 
 ## Checkpoint loading
 
-`poot-load` reads safetensors directories and GGUF files into a weight store, and the family's weight map
-binds tensors to the graph's named consts. Supported quantized formats bind packed constants. Dense projections decode them in the
-consuming contraction, and a packed expert stack is read by one indexed packed contraction. Fused QKV tensors are split, and
-transposed layouts corrected, at load time. Packed projections stay packed. Dense BF16/F16 tensors are
-loaded as stored BF16/F16 words; there is one loader and no widened f32 copy of any tensor. The bound
-graph reads a stored BF16/F16 norm scale, bias or embedding through an explicit cast to f32 (a gather
-casts only the gathered rows), and a contraction reads its weight as stored. A stored dtype the graph
-cannot read this way is a typed error at bind.
+`poot-load` reads safetensors directories and GGUF files into a weight store; the family's weight map binds tensors to named
+consts.
+
+- **Quantized formats** bind packed constants that stay packed. Dense projections decode in the consuming contraction; a packed
+  expert stack is read by one indexed packed contraction.
+- **Fused QKV** is split and transposed layouts corrected at load.
+- **Dense BF16/F16** load as stored words, with one loader and no widened f32 copy. The graph casts norm scales, biases and
+  embeddings to f32 (a gather casts only gathered rows); contractions read weights as stored.
+- A stored dtype the graph cannot read is a typed error at bind.
 
 ## Mixture-of-experts routing
 
-MoE layers (`ops::moe`, `moe_sparse`, `moe_grouped`) compute router scores, select the
-top-k expert ids with `ArgTopK`, and contract each row against its own expert with
-`IndexedMatMul`. Dense expert tables are read in place. A packed expert stack is rewritten when its
-weights are bound into one indexed packed contraction over the stored blocks, one buffer per source
-role with each expert padded to whole words; only the selected experts' blocks are decoded, and no
-expert table is materialized.
+MoE layers (`ops::moe`, `moe_sparse`, `moe_grouped`) score experts, pick the top-k ids with `ArgTopK`, and contract each row
+against its own expert with `IndexedMatMul`. Expert ids are runtime values computed in-graph each token; the structure is fixed.
 
-Expert ids are runtime values, not slots. The graph structure (which ops run) is fixed;
-the ids are computed inside the graph each token.
+- **Prefill** groups `(token, slot)` rows by expert: `ExpertGroup` returns the stable sort and its inverse, rows are gathered
+  into expert order, contracted, then gathered back. A tile then shares each expert's weight tile across rows.
+- **Decode** has too few rows to gain, so it contracts directly.
+- **Weights:** dense expert tables are read in place. A packed stack becomes one indexed packed contraction over the stored
+  blocks (one buffer per source role, experts padded to whole words); only selected experts' blocks are decoded.
 
 ---
 

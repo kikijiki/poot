@@ -53,7 +53,7 @@ pub(crate) fn slot_maps(
 /// Zero carried state, in `g.state` order.
 pub(crate) fn zero_state(g: &Graph) -> Vec<HostTensor> {
     g.state()
-        .map(|(input, _)| HostTensor::zeros(g.aval(input).shape.clone()))
+        .map(|(input, _)| HostTensor::zeros_of(g.aval(input).dtype, g.aval(input).shape.clone()))
         .collect()
 }
 

@@ -15,7 +15,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use poot_runtime_common::{ArgAccess, ArgSchema, CompiledKernel, KernelCode};
+use poot_codegen::{ArgSchema, CompiledKernel, KernelCode};
+use poot_target::ArgAccess;
 use poot_target::ElementKind;
 use poot_wgpu_runtime::{Context, DeviceBuffer};
 

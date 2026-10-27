@@ -4,14 +4,15 @@
 //! never asked of the device.
 
 use poot_runtime_common::{BufferRole, DeviceIdentity, MemoryCounterSnapshot};
-use std::num::NonZeroU32;
+use std::num::NonZeroU64;
 use std::ops::Range;
 use std::time::Duration;
 
-use poot_graph_plan::{ImportedKernel, Target};
+use poot_codegen::CompiledKernel;
+use poot_graph_plan::{ImportedKernel, NpuHandle, Program, Region, Target};
 use poot_kernel_ir::Body;
-use poot_runtime_common::CompiledKernel;
-use poot_target::{AieTargetId, BufferStorage, VpuTargetId};
+use poot_npu_artifacts::{AieInvocation, VpuInvocation};
+use poot_target::BufferStorage;
 
 /// One dispatch's device duration within a step's recording, in replay order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,7 +116,7 @@ pub struct Arg<'a, D: Device + ?Sized> {
     /// The device buffer the kernel reads or writes.
     pub buffer: &'a D::Buffer,
     /// Native device-element count of this value (lane-encoded words for a packed source), not the buffer's capacity.
-    pub elems: u32,
+    pub elems: usize,
 }
 
 /// How a dispatch launches: the execution domain of its kernel (POOT-1117). The engine is one engine over
@@ -138,65 +139,42 @@ pub enum LaunchKind {
     VpuGraph(VpuInvocation),
 }
 
-/// One execution of an Intel NPU graph: the graph runs once over the dispatch's host buffers (the `inputs`
-/// then the `output`, in the graph's argument order: its inputs, then its results) and ends; there is no
-/// grid. It names the target the graph was compiled for and the digest of the artifact the engine loaded
-/// (the IR and argument ABI, [`poot_runtime_common::VpuGraphArtifact::digest`]). A device implementation
-/// must refuse an invocation that disagrees with the kernel it carries; the other devices read only the
-/// variant, to refuse the launch kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VpuInvocation {
-    target: VpuTargetId,
-    digest: u64,
+/// What a device whose artifacts are whole regions (an NPU) compiles a program's regions with: its own
+/// toolchain, caches and limits, behind one capability the device owns (POOT-1244). The engine knows no vendor:
+/// it asks for the region's kernel and the launch its dispatches carry, loads the kernel on the device and
+/// records the dispatch. A device that runs only per-equation kernels has none.
+pub trait RegionLoader {
+    /// What a compile for this device is handed so the planner can lower to it ([`CompileOptions::npu`]): the
+    /// device that loads a program's regions is the one that knows how they are lowered.
+    fn lowering(&self) -> NpuHandle;
+
+    /// `region` of `program` compiled for this device, or served from the loader's cache. The kernel is the
+    /// artifact the device loads; the launch is the invocation every dispatch of it carries.
+    ///
+    /// # Errors
+    ///
+    /// A [`RegionLoadError`] naming the stage that refused the region. Nothing is loaded on any of them.
+    fn compile_region(
+        &self,
+        program: &Program,
+        region: &Region,
+        max_artifact_bytes: NonZeroU64,
+    ) -> Result<CompiledRegion, RegionLoadError>;
 }
 
-impl VpuInvocation {
-    /// An invocation of the graph with `digest` compiled for `target`.
-    pub const fn new(target: VpuTargetId, digest: u64) -> Self {
-        Self { target, digest }
-    }
+/// Why a region could not be compiled for a device: the loader's own typed cause.
+pub type RegionLoadError = Box<dyn std::error::Error + Send + Sync>;
 
-    /// The target the graph was compiled for.
-    pub const fn target(&self) -> VpuTargetId {
-        self.target
-    }
-
-    /// The digest of the artifact the engine loaded.
-    pub const fn digest(&self) -> u64 {
-        self.digest
-    }
-}
-
-/// One run of an AIE kernel: its instruction stream executes once over the dispatch's host buffer objects
-/// (the `inputs` then the `output`, in the kernel's shape-ABI binding order) and ends; there is no grid.
-/// It names the target the kernel was linked for and the stream's length in 32-bit instruction words (a
-/// loaded artifact's stream is validated non-empty and word-aligned). A device implementation (POOT-641)
-/// must read `instruction_words` and refuse an invocation that disagrees with the stream of the kernel it
-/// loaded; the GPU devices read only `target`, to refuse the launch kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AieInvocation {
-    target: AieTargetId,
-    instruction_words: NonZeroU32,
-}
-
-impl AieInvocation {
-    /// An invocation of a stream of `instruction_words` words linked for `target`.
-    pub const fn new(target: AieTargetId, instruction_words: NonZeroU32) -> Self {
-        Self {
-            target,
-            instruction_words,
-        }
-    }
-
-    /// The target the kernel was linked for.
-    pub const fn target(&self) -> AieTargetId {
-        self.target
-    }
-
-    /// The instruction stream's length, in 32-bit words.
-    pub const fn instruction_words(&self) -> NonZeroU32 {
-        self.instruction_words
-    }
+/// One region a [`RegionLoader`] compiled.
+#[derive(Debug)]
+pub struct CompiledRegion {
+    /// What names this artifact: two regions with one identity are one kernel, loaded once per engine.
+    pub identity: String,
+    /// The artifact the device loads.
+    pub kernel: CompiledKernel,
+    /// The invocation every dispatch of the loaded kernel carries ([`LaunchKind::Aie`] or
+    /// [`LaunchKind::VpuGraph`]).
+    pub launch: LaunchKind,
 }
 
 /// One kernel launch. `inputs` are the kernel's read operands in parameter order (including a metadata
@@ -233,7 +211,7 @@ impl FlushPolicy {
     /// [`Dispatch::work`] of the run. Measured against the Strix Halo display watchdog (cards 163, 258, 546a).
     const WATCHDOG: Self = Self {
         max_dispatches: 1024,
-        max_work: 4_000_000,
+        max_work: poot_target::SUBMIT_WORK,
     };
 
     /// The policy of the device `caps` describes: `None` where it has no watchdog budget, so its stage goes
@@ -293,6 +271,12 @@ pub trait Device {
         WeightUpload::Bytes
     }
 
+    /// How this device compiles the regions of a program whose artifacts are regions (an NPU). `None` for a
+    /// device that runs per-equation kernels: the engine then refuses a region program as a typed load error.
+    fn region_loader(&self) -> Option<&dyn RegionLoader> {
+        None
+    }
+
     /// Live/peak bytes and allocation count by role, read from this device's own runtime counters
     /// (Card 547a: `Engine::stats().memory` reads this, not an engine-side tally over its own
     /// bookkeeping, so cross-backend equality is not equal by construction).
@@ -328,6 +312,21 @@ pub trait Device {
         storage: BufferStorage,
         elems: usize,
     ) -> Result<Self::Buffer, Self::Error>;
+
+    /// [`Self::allocate`] for the buffer the engine calls `name` (a weight's const name, a state's name, an
+    /// arena slot's position). The name is for diagnostics only: a device that records or reports its
+    /// allocations (a planning device, a budget refusal) keeps it, every other device allocates as
+    /// `allocate` does.
+    fn allocate_named(
+        &mut self,
+        name: &str,
+        role: BufferRole,
+        storage: BufferStorage,
+        elems: usize,
+    ) -> Result<Self::Buffer, Self::Error> {
+        let _ = name;
+        self.allocate(role, storage, elems)
+    }
 
     /// The number of native elements `buffer` holds: its allocated capacity, in units of the element kind it
     /// was allocated with (what [`Arg::elems`] counts). The engine refuses a dispatch whose asserted

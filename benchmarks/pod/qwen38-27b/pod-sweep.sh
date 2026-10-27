@@ -33,7 +33,7 @@ CONCS="${CONCS:-4 16 32}"                  # concurrent requests of the batched 
 BATCH_PROMPTS="${BATCH_PROMPTS:-64}"       # requests per batched cell
 MAX_CTX=$((8192 + OSL + 64))               # per-sequence context every server is sized to
 MAX_SEQS=32                                # most concurrent sequences every server is sized to
-LLAMACPP_TAG="${LLAMACPP_TAG:-b9601}"      # the tag benchmarks/docker/Dockerfile pins
+LLAMACPP_TAG="${LLAMACPP_TAG:-v0.4.1}"      # the tag benchmarks/docker/Dockerfile pins
 VLLM_VERSION="${VLLM_VERSION:-0.22.1}"     # the version benchmarks/docker/Dockerfile pins
 ROW_CAP_S="${ROW_CAP_S:-300}"              # hard cap of every serve row (a capped row is rc=124 in phases.tsv, never a stall)
 # poot-serve plans 4 rows x 4096 positions (see logs/serve_poot.out), so its grid is cut to what it can hold, at a
@@ -224,7 +224,7 @@ wants vllm && [ "$FP8_OK" = 1 ] && with_server vllm "$PORT_VLLM" 2400 -- "$VLLM"
 # --- 3. llama.cpp CUDA (Q4_K_XL GGUF) ------------------------------------------------------------------------
 LCPP="${LCPP:-$WORK/llama.cpp}"
 if wants llamacpp && [ "$GGUF_OK" = 1 ] && budget_ok; then
-  # The image's baked llama.cpp is sm_86 only: build the pod's own arch with the image's CUDA 13 toolkit. Same
+  # The image's baked llama.cpp is sm_80 and sm_86 only: build the pod's own arch with the image's CUDA 13 toolkit. Same
   # pinned tag as the image.
   phase llamacpp_build 3000 -- bash -c "set -e
     [ -d '$LCPP' ] || git clone --depth 1 --branch '$LLAMACPP_TAG' https://github.com/ggml-org/llama.cpp.git '$LCPP'

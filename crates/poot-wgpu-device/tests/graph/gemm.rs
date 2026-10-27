@@ -1,30 +1,25 @@
 use super::*;
 
-use poot_graph_plan::{ImportedKernel, KernelChoice};
+use poot_graph_plan::KernelChoice;
 use poot_kernelgen::{ContractionSpec, KernelRequest};
 
 // ADR-0113: a test checks the production kernel choice instead of calling the deleted test-only predicates
 // `is_decode_gemv`/`is_tiled_gemm`.
 
-/// The generated tiled GEMM (`kg::tiled_region`), the planner's choice for an M>1 F32 matmul against a rank-2
-/// weight (Card 557).
+/// The register-tiled GEMM over an f32 `[K, N]` weight, the planner's choice for an M>1 F32 matmul against a
+/// rank-2 weight (Card 557).
 fn is_generated_tiled_gemm(choice: &KernelChoice) -> bool {
     matches!(
         choice,
-        KernelChoice::Generated(KernelRequest::Contraction(
-            ContractionSpec::TiledRegion { .. }
-        ))
+        KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(_)))
     )
 }
 
-/// The decode GEMV: a shipped coalesced body, or one range of a watchdog-split generated one.
+/// The decode GEMV: the generated `gemv_lds` body, whole or one range of a watchdog-split output.
 fn is_decode_gemv_kernel(choice: &KernelChoice) -> bool {
     matches!(
         choice,
-        KernelChoice::Imported {
-            kernel: ImportedKernel::GemvCoalesced | ImportedKernel::GemvBatchedCoalesced,
-            ..
-        } | KernelChoice::Generated(KernelRequest::Contraction(
+        KernelChoice::Generated(KernelRequest::Contraction(
             ContractionSpec::GemvChunk { .. }
         ))
     )
@@ -83,13 +78,30 @@ fn tiled_gemm_large_n_under_tile_threshold_matches_cpu() {
     assert_close(got.as_f32().unwrap(), cpu.as_f32().unwrap(), 1e-3);
 }
 
+/// The output tile the register-tiled GEMM plans for an `[m, k] x [k, n]` f32 matmul on the RADV caps.
+fn planned_tile(m: usize, k: usize, n: usize) -> (usize, usize) {
+    poot_kernelgen::RegisterTiling::choose(
+        poot_kernelgen::TiledShape {
+            blocks: 1,
+            m_per_block: m,
+            out_per_block: n,
+            k,
+            layout: poot_kernelgen::WeightLayout::Kn,
+            segments: 1,
+        },
+        &poot_test_util::device_caps::default_caps_for(poot_target::Backend::SpirvVulkan),
+    )
+    .output_tile()
+}
+
 #[test]
 fn tiled_gemm_tile_count_threshold_gated_and_correct() {
-    // Card 095: the wgpu tiled GEMM (`kernelgen::tiled_gemm_dt`) miscompiles on RADV at >= 2^15 = 32768 dispatched workgroups
-    // (output tiles): every element is wrong and non-deterministic; at 32767 it is exact. Card 096 chunks larger GEMMs into
-    // sub-2^15 dispatches. This pins both sides:
-    //  (a) just under (M=16, N=262136 -> 32767 tiles): single-dispatch tiled path;
-    //  (b) just over (M=16, N=262144 -> 32768 tiles): chunked tiled path;
+    // Card 095: an LDS-cooperative tiled GEMM miscompiles on RADV at >= 2^15 = 32768 workgroups in one dispatch: every
+    // element is wrong and non-deterministic; at 32767 it is exact. Card 096 / POOT-1403: the register-tiled GEMM's launch
+    // splits a larger contraction into dispatches below that ceiling. This pins both sides at the tile the cost model
+    // plans for the shape (16 rows, `tile_cols` columns):
+    //  (a) 32767 tiles: one dispatch;
+    //  (b) 32768 tiles: two;
     //  both GPU==CPU and deterministic across runs.
     use poot_graph_ir::op::OpKind;
     use poot_target::Backend;
@@ -97,18 +109,21 @@ fn tiled_gemm_tile_count_threshold_gated_and_correct() {
     let Some((mut gpu, target)) = open_engine_or_skip() else {
         return;
     };
-    let k = 16usize;
+    let (m, k) = (16usize, 16usize);
+    let (tile_rows, tile_cols) = planned_tile(m, k, 32_767 * 64);
+    assert_eq!(tile_rows, 16, "sixteen rows are one row-tile");
     let r = |s: usize, num: usize| -> Vec<f32> {
         (0..num)
             .map(|i| ((i + s) as f32 * 0.0007).sin() * 0.1)
             .collect()
     };
-    // (m, n, expect_chunked): tiles = ceil(m/16)*ceil(n/8). 262136 -> 32767 (single), 262144 -> 32768 (chunked).
-    let cases = [
-        (16usize, 262_136usize, false),
-        (16usize, 262_144usize, true),
-    ];
-    for (m, n, expect_chunked) in cases {
+    let cases = [(32_767 * tile_cols, false), (32_768 * tile_cols, true)];
+    for (n, expect_chunked) in cases {
+        assert_eq!(
+            planned_tile(m, k, n),
+            (tile_rows, tile_cols),
+            "both sides of the ceiling plan the same tile"
+        );
         let b = Builder::for_tests();
         let a = b.constant("a", TensorType::f32(vec![m, k])).unwrap();
         let wt = b.constant("w", TensorType::f32(vec![k, n])).unwrap();
@@ -136,7 +151,7 @@ fn tiled_gemm_tile_count_threshold_gated_and_correct() {
             chunked,
             expect_chunked,
             "m={m} n={n} (tiles={}): single-vs-chunked dispatch wrong",
-            m.div_ceil(16) * n.div_ceil(8)
+            n / tile_cols
         );
         let mut inp = HashMap::new();
         inp.insert(a.id(), HostTensor::f32(vec![m, k], r(1, m * k)));
@@ -587,7 +602,7 @@ fn bits(t: &HostTensor) -> Vec<u32> {
 }
 
 /// SC-001, SC-002: `IndexedMatMul` through `compile` equals the oracle `to_bits` on every element at a decode
-/// shape (`M = 5`, the Gemv) and at prefill shapes (`M = 160`, the segmented Tiled) whose tiles cross expert
+/// shape (`M = 5`, the Gemv) and at prefill shapes (`M = 160`, the register-tiled expert walk) whose tiles cross expert
 /// boundaries, with the ids sorted, shuffled and tile-aligned. A wrong expert changes a value by an integer, so
 /// the comparison is exact.
 ///
@@ -628,7 +643,7 @@ fn indexed_matmul_matches_the_oracle_bit_for_bit() {
 
 /// POOT-646 SC-001: experts held in checkpoint `[E, N, K]` order and read through `transpose(w, [0, 2, 1])` equal
 /// the oracle `to_bits` on every element (`E = 8`): `M = 1` and `M = 5` (the Gemv, ids unsorted with repeats) and a
-/// prefill shape (the segmented Tiled, shuffled ids). `compile` folds the transpose into the contraction.
+/// prefill shape (the register-tiled expert walk, shuffled ids). `compile` folds the transpose into the contraction.
 ///
 /// Mutation (`weight_layout` in `planner/moe.rs`): return `WeightLayout::Kn` for the view; the weight is read as
 /// `[E, K, N]` and every case goes red.
@@ -774,7 +789,7 @@ fn routed_gate_weighting_checkpoint_order_equals_the_oracle_bit_for_bit() {
 /// POOT-1028: `IndexedMatMul` over a BF16-resident expert stack (a BF16 const, `[E, K, N]` or the checkpoint's
 /// `[E, N, K]` behind `transpose(w, [0, 2, 1])`; f32 activation and output) equals the oracle `to_bits` on every
 /// element, with and without the routed gate epilogue, at a decode shape (the Gemv) and a prefill shape whose tiles
-/// cross expert boundaries (the segmented Tiled). The fill is integer-valued, so each element is exactly a BF16 and
+/// cross expert boundaries (the register-tiled expert walk). The fill is integer-valued, so each element is exactly a BF16 and
 /// the widened sums are exact in any order. The packed lanes are widened in-register: no f32 copy of the stack
 /// exists.
 ///
@@ -1013,9 +1028,7 @@ fn tiled_gemm_random_shapes_gpu_matches_cpu() {
         assert!(
             matches!(
                 choice,
-                KernelChoice::Generated(KernelRequest::Contraction(
-                    ContractionSpec::TiledRegion { .. }
-                ))
+                KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(_)))
             ),
             "seed {seed} (M={m},K={k},N={n}): expected the generated tiled path, got {choice:?}"
         );
@@ -1060,7 +1073,7 @@ fn tiled_gemm_random_shapes_gpu_matches_cpu() {
 fn synthesized_tiled_gemm_choice_matches_cpu() {
     // A bare M>1 MatMul compiles to the synthesized element-by-element tiled GEMM (the default): confirm the planner's
     // recorded choice is the generated tiled-GEMM request and the path runs GPU==CPU. The planner's contraction choice
-    // owns the tiling decision (Card 557), and the Body is generated by `kg::tiled_region`, not hand-authored.
+    // owns the tiling decision (Card 557), and the Body is the register-tiled GEMM, not hand-authored.
     use poot_graph_ir::op::OpKind;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
@@ -1103,11 +1116,9 @@ fn synthesized_tiled_gemm_choice_matches_cpu() {
         assert!(
             matches!(
                 choice,
-                KernelChoice::Generated(KernelRequest::Contraction(
-                    ContractionSpec::TiledRegion { .. }
-                ))
+                KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(_)))
             ),
-            "expected the synthesized tiled_region choice, got {choice:?}"
+            "expected the register-tiled GEMM choice, got {choice:?}"
         );
 
         let eval_inputs: HashMap<_, Value> = inputs
@@ -1138,17 +1149,19 @@ fn synthesized_tiled_gemm_choice_matches_cpu() {
 
 #[test]
 fn chunked_large_tiled_gemm_gpu_matches_cpu() {
-    // Card 096: a tiled GEMM whose tile count crosses the RADV 2^15-workgroup miscompile threshold is dispatched as several
-    // sub-2^15 chunks (each a baked-offset kernel variant covering a disjoint tile range) instead of the slow naive kernel.
-    // M=544 (34 row-tiles, 2*GEMM_TILE=16 rows each) x N=8192 (1024 col-tiles, GEMM_TILE=8 cols each) = 34816 tiles > 32768
-    // -> 2 chunks. Assert the plan is split and `gpu.run == CPU eval` (the chunks reconstruct the full result).
+    // Card 096 / POOT-1403: a tiled GEMM whose tile count crosses the RADV 2^15-workgroup miscompile threshold is
+    // dispatched as several sub-2^15 ranges of one register-tiled body (each its own `tile_offset`) instead of one
+    // launch. 16 rows over 70000 column-tiles of the planned tile = 70000 tiles -> 3 ranges of at most 32767. Assert the
+    // plan is split and `gpu.run == CPU eval` (the ranges reconstruct the full result).
     use poot_graph_ir::op::OpKind;
     use poot_target::Backend;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
         return;
     };
-    let (m, k, n) = (544usize, 32usize, 8192usize);
+    let (m, k) = (16usize, 32usize);
+    let n = 70_000 * planned_tile(m, k, 70_000 * 64).1;
+    let tiles = n / planned_tile(m, k, n).1;
     let b = Builder::for_tests();
     let x = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
     let w = b.constant("w", TensorType::f32(vec![k, n])).unwrap();
@@ -1167,7 +1180,11 @@ fn chunked_large_tiled_gemm_gpu_matches_cpu() {
     )
     .unwrap();
     let n_chunks = plan.dispatches().len();
-    assert_eq!(n_chunks, 2, "34816 tiles / 32767-per-chunk = 2 chunks");
+    assert_eq!(
+        n_chunks,
+        tiles.div_ceil(32_767),
+        "{tiles} tiles in ranges of at most 32767"
+    );
 
     let xd: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) * 0.1 - 0.3).collect();
     let wd: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32) * 0.08 - 0.16).collect();
@@ -1205,7 +1222,7 @@ fn chunked_large_tiled_gemm_gpu_matches_cpu() {
     // contract has one execution path (`add_entry`/`step`, via `run_via_contract` above), already
     // GPU-resident across replays, so there is no second path left to separately re-check here.
     eprintln!(
-        "chunked large tiled GEMM: {m}x{k}x{n} = 34816 tiles -> 2 chunks; GPU==CPU (max_abs {max_abs:.2e})"
+        "chunked large tiled GEMM: {m}x{k}x{n} = {tiles} tiles -> {n_chunks} chunks; GPU==CPU (max_abs {max_abs:.2e})"
     );
 }
 
@@ -1277,7 +1294,8 @@ fn batched_tiled_gemm_random_shapes_gpu_matches_cpu() {
             .iter()
             .find(|e| matches!(e.op, OpKind::MatMul { .. }))
             .unwrap();
-        // the batched-weight tiled GEMM is the imported kernel, dispatched with a metadata buffer (the `[E,M,K,N]` dims buffer) rather than a kernelgen launch with none.
+        // the batched-weight tiled GEMM is the register-tiled body with a `[K, N]` weight slab per block, its shape
+        // in its metadata buffer.
         let (plan, choice) = plan_eqn_with_choice(
             &g,
             eqn,
@@ -1285,19 +1303,19 @@ fn batched_tiled_gemm_random_shapes_gpu_matches_cpu() {
             &poot_test_util::device_caps::default_caps_for(Backend::SpirvVulkan),
         )
         .unwrap();
-        match single_meta(&plan) {
-            Some(meta @ [_, ..]) => {
-                assert_eq!(meta.len(), 4, "seed {seed}: batched dims [E,M,K,N]")
-            }
-            _ => panic!("seed {seed}: batched tiled GEMM should be a metadata launch"),
-        }
+        assert!(
+            single_meta(&plan).is_some_and(|meta| !meta.is_empty()),
+            "seed {seed}: batched tiled GEMM should be one metadata dispatch"
+        );
         assert!(
             matches!(
-                choice,
-                KernelChoice::Imported {
-                    kernel: ImportedKernel::TiledGemmBatched,
-                    ..
-                }
+                &choice,
+                KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(
+                    poot_kernelgen::DenseTiledContraction {
+                        weight: poot_kernelgen::DenseTiledWeight::KnF32,
+                        ..
+                    }
+                )))
             ),
             "seed {seed} (rank4={rank4}, x={xshape:?}): expected the batched tiled path, got {choice:?}"
         );
@@ -1516,9 +1534,9 @@ fn rank4_batched_tiled_gemm_gpu_matches_cpu() {
 
 #[test]
 fn nvptx_prefill_tiled_gemm_plan_selection() {
-    // Card 557: the M>1 shared-weight F32 projection matmul takes the generated tiled GEMM (`kg::tiled_region`, a
-    // single dispatch) on NVPTX as on wgpu. The chunked case (a large GEMM that would trip the RADV 2^15 cap on
-    // wgpu) stays a single dispatch on NVPTX: NVPTX has no cap, and the PTX executor `unreachable!`s on split plans.
+    // Card 557: the M>1 shared-weight F32 projection matmul takes the register-tiled GEMM (a single dispatch) on
+    // NVPTX as on wgpu. The chunked case (a large GEMM that would trip the RADV 2^15 cap on wgpu) stays a single
+    // dispatch on NVPTX: NVPTX has no cap, and the PTX executor `unreachable!`s on split plans.
     // Pure planner test (no GPU).
     use poot_graph_ir::op::OpKind;
     use poot_target::Backend;
@@ -1541,28 +1559,29 @@ fn nvptx_prefill_tiled_gemm_plan_selection() {
         )
         .unwrap()
     };
-    // small M>1 GEMM -> the generated tiled GEMM, one Compute, on both backends.
-    let is_tiled_region = |choice: &KernelChoice| {
+    // small M>1 GEMM -> the register-tiled GEMM, one metadata dispatch, on both backends.
+    let is_tiled = |choice: &KernelChoice| {
         matches!(
             choice,
-            KernelChoice::Generated(KernelRequest::Contraction(
-                ContractionSpec::TiledRegion { .. }
-            ))
+            KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(_)))
         )
     };
+    let one_dispatch =
+        |plan: &poot_graph_plan::Plan| single_meta(plan).is_some_and(|meta| !meta.is_empty());
     assert!(
-        matches!(plan_for(8, 8, Backend::Nvptx), (plan_, choice) if single_meta(&plan_).is_some_and(|meta| meta.is_empty()) && is_tiled_region(&choice))
+        matches!(plan_for(8, 8, Backend::Nvptx), (plan_, choice) if one_dispatch(&plan_) && is_tiled(&choice))
     );
     assert!(
-        matches!(plan_for(8, 8, Backend::SpirvVulkan), (plan_, choice) if single_meta(&plan_).is_some_and(|meta| meta.is_empty()) && is_tiled_region(&choice))
+        matches!(plan_for(8, 8, Backend::SpirvVulkan), (plan_, choice) if one_dispatch(&plan_) && is_tiled(&choice))
     );
-    // a GEMM large enough to chunk on wgpu: split on SpirvVulkan, but a single dispatch on NVPTX.
-    let big_n = 8 * 40_000; // groups = ceil(8/16)*ceil(N/8) = 1 * 40000 > 2^15 (RADV chunk threshold)
+    // A GEMM large enough to chunk on wgpu: split on SpirvVulkan, but a single dispatch on NVPTX. No tile the
+    // planner weighs is wider than 128 columns, so `N = 128 * 40000` is at least 40000 tiles, past 2^15.
+    let big_n = 128 * 40_000;
     assert!(matches!(
         plan_for(8, big_n, Backend::SpirvVulkan),
-        (plan, choice) if plan.dispatches().len() > 1 && is_tiled_region(&choice)
+        (plan, choice) if plan.dispatches().len() > 1 && is_tiled(&choice)
     ));
     assert!(
-        matches!(plan_for(8, big_n, Backend::Nvptx), (plan_, choice) if single_meta(&plan_).is_some_and(|meta| meta.is_empty()) && is_tiled_region(&choice))
+        matches!(plan_for(8, big_n, Backend::Nvptx), (plan_, choice) if one_dispatch(&plan_) && is_tiled(&choice))
     );
 }

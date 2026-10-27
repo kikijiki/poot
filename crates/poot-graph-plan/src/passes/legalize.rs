@@ -26,7 +26,7 @@
 //!   each chunk is a `DenseContraction` over its stored rows) or through a `[1, 0]` transpose into a `MatMul`
 //!   (the form the fold declines; each chunk keeps its own transpose).
 //! - [`split_oversized_expert_stacks`]: an indexed packed contraction whose stacked expert table is over the single
-//!   buffer limit, or over what the kernels' 32-bit bit offsets address, splits into expert ranges that each fit
+//!   buffer limit, or over what the backend's kernels' bit offsets address, splits into expert ranges that each fit
 //!   (see its doc for how the ranges recombine).
 //! - [`pad_kv_extents`]: stored KV extent (POOT-1229). On a target whose [`DeviceCaps::dram_channels`] says a
 //!   contiguous cache's head stride camps, the cache stores one position past its logical capacity and each
@@ -36,8 +36,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use poot_target::DeviceCaps;
 use poot_target::dram_channels::DramChannels;
+use poot_target::{Backend, DeviceCaps};
 
 use poot_graph_ir::graph::{
     EditError, Eqn, Graph, LayerIndex, Operand, Slot, SlotKey, Storage, ValueId, ValueMeta,
@@ -130,13 +130,14 @@ impl From<poot_graph_ir::EditError> for LegalizeError {
 )]
 pub fn legalize(
     g: &Graph,
+    backend: Backend,
     caps: &DeviceCaps,
     limits: &CompileLimits,
 ) -> Result<Graph, LegalizeError> {
     let limit = caps.max_buffer_bytes;
     let g = host_oversized_token_gathers(g, limit)?;
     let g = split_oversized_matmul_weights(&g, limit, GraphBudget::of(limits))?;
-    let g = split_oversized_expert_stacks(&g, limit, GraphBudget::of(limits))?;
+    let g = split_oversized_expert_stacks(&g, backend, limit, GraphBudget::of(limits))?;
     let g = pad_kv_extents(&g, caps, GraphBudget::of(limits))?;
     refuse_oversized_constants(&g, limit)?;
     Ok(g)
@@ -604,17 +605,19 @@ fn split_oversized_matmul_weights(
 }
 
 /// The expert ranges an indexed packed contraction of `experts` experts splits into so that each range's sources
-/// are single buffers within `limit` bytes, addressable by the kernels' 32-bit bit offsets
-/// ([`PackedWeight::max_stack_experts`]); `None` when the stack fits whole, or when one expert's slab alone is over
-/// the buffer limit (no split helps: `refuse_oversized_constants` names the carrier, and an expert past the address
-/// range is the planner's typed `DispatchSizeOverflow`).
+/// are single buffers within `limit` bytes, addressable by the bit offsets of `backend`'s kernels
+/// ([`PackedWeight::max_stack_experts`]; a 64-bit backend keeps a stack whole up to the buffer limit); `None` when
+/// the stack fits whole, or when one expert's slab alone is over the buffer limit (no split helps:
+/// `refuse_oversized_constants` names the carrier, and an expert past the address range is the planner's typed
+/// `DispatchSizeOverflow`).
 fn expert_ranges(
     descriptor: PackedWeight,
     experts: usize,
+    backend: Backend,
     limit: u64,
 ) -> Option<Vec<std::ops::Range<usize>>> {
     let usable = usable_bytes(limit);
-    let mut per_chunk = descriptor.max_stack_experts();
+    let mut per_chunk = descriptor.max_stack_experts(backend.max_bit_offset());
     for role in descriptor.sources() {
         let slab = descriptor.slab_bytes(role) as u64;
         if slab > limit {
@@ -727,6 +730,7 @@ impl Appender<'_> {
 /// contraction makes of it.
 fn split_oversized_expert_stacks(
     g: &Graph,
+    backend: Backend,
     limit: u64,
     budget: GraphBudget,
 ) -> Result<Graph, LegalizeError> {
@@ -742,7 +746,7 @@ fn split_oversized_expert_stacks(
             ids,
             carriers,
             ranges,
-        }) = splittable_stack(g, eqn, limit)
+        }) = splittable_stack(g, eqn, backend, limit)
         else {
             budget.push_eqn(STAGE, &mut eqns, eqn.clone())?;
             continue;
@@ -861,7 +865,7 @@ fn split_oversized_expert_stacks(
 
 /// The split of `eqn` when it is an indexed packed contraction over named constant carriers and I32 ids whose
 /// stacked table [`expert_ranges`] splits.
-fn splittable_stack(g: &Graph, eqn: &Eqn, limit: u64) -> Option<StackSplit> {
+fn splittable_stack(g: &Graph, eqn: &Eqn, backend: Backend, limit: u64) -> Option<StackSplit> {
     let OpKind::PackedContraction {
         descriptor,
         rows: ContractionRows::Indexed { experts },
@@ -869,7 +873,7 @@ fn splittable_stack(g: &Graph, eqn: &Eqn, limit: u64) -> Option<StackSplit> {
     else {
         return None;
     };
-    let ranges = expert_ranges(*descriptor, *experts, limit)?;
+    let ranges = expert_ranges(*descriptor, *experts, backend, limit)?;
     let operands: Vec<ValueId> = eqn
         .inputs
         .iter()
@@ -929,9 +933,14 @@ struct KvCache {
     padded: bool,
 }
 
-/// The bytes of one stored head: `positions * head_dim` f32 elements.
-fn head_stride_bytes(positions: usize, head_dim: usize) -> usize {
-    positions * head_dim * size_of::<f32>()
+/// The bytes of one stored head: `positions * head_dim` elements of the cache's `dtype`.
+fn head_stride_bytes(positions: usize, head_dim: usize, dtype: DType) -> usize {
+    positions * head_dim * dtype.byte_size()
+}
+
+/// Whether a KV cache stores `dtype`: f32, or a two-byte float a narrow cache stores (POOT-1395).
+fn is_kv_dtype(dtype: DType) -> bool {
+    matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
 }
 
 /// The root of `i` in a union-find over `group`.
@@ -957,8 +966,11 @@ fn kv_caches(g: &Graph, channels: DramChannels) -> Vec<KvCache> {
     let mut admits: Vec<bool> = Vec::new();
     for pair in g.state_pairs() {
         let aval = g.aval(pair.input);
-        match (pair.role, aval.shape.as_slice(), aval.dtype) {
-            (StateRole::Positional { axis: 2 }, &[_, _, positions, head_dim], DType::F32) => {
+        let dtype = aval.dtype;
+        match (pair.role, aval.shape.as_slice()) {
+            (StateRole::Positional { axis: 2 }, &[_, _, positions, head_dim])
+                if is_kv_dtype(dtype) =>
+            {
                 let mut chain = HashSet::from([pair.input]);
                 let mut readers = Vec::new();
                 let mut admit = true;
@@ -996,9 +1008,9 @@ fn kv_caches(g: &Graph, channels: DramChannels) -> Vec<KvCache> {
                     }
                 }
                 admit &= chain.contains(&pair.output);
-                let extent = if !channels.camps(head_stride_bytes(positions, head_dim)) {
+                let extent = if !channels.camps(head_stride_bytes(positions, head_dim, dtype)) {
                     KvExtent::Clear
-                } else if channels.camps(head_stride_bytes(positions + 1, head_dim)) {
+                } else if channels.camps(head_stride_bytes(positions + 1, head_dim, dtype)) {
                     KvExtent::Exempt(KvExemption::WholePeriodRow)
                 } else {
                     KvExtent::Camps
@@ -1012,8 +1024,8 @@ fn kv_caches(g: &Graph, channels: DramChannels) -> Vec<KvCache> {
                 });
                 admits.push(admit);
             }
-            (StateRole::Positional { axis: 0 }, &[_, kv_heads, head_dim], DType::F32) => {
-                let extent = if channels.camps(head_stride_bytes(kv_heads, head_dim)) {
+            (StateRole::Positional { axis: 0 }, &[_, kv_heads, head_dim]) if is_kv_dtype(dtype) => {
+                let extent = if channels.camps(head_stride_bytes(kv_heads, head_dim, dtype)) {
                     KvExtent::Exempt(KvExemption::PagedView)
                 } else {
                     KvExtent::Clear
@@ -1249,6 +1261,9 @@ mod tests {
         b.weight(WeightRef::whole(weight), aval).unwrap()
     }
 
+    /// The backend of the cases below: the caps they shrink are `wgpu_rdna3_igpu`'s.
+    const BACKEND: Backend = Backend::SpirvVulkan;
+
     fn caps_with_limit(max_buffer_bytes: u64) -> DeviceCaps {
         DeviceCaps {
             max_buffer_bytes,
@@ -1276,8 +1291,8 @@ mod tests {
     fn legalize_hosts_an_embed_gather_over_the_limit() {
         let g = embed_gather_graph(152_064, 3584); // ~2.18 GB f32, qwen2.5-7b's shape
         let caps = caps_with_limit(2_147_483_647); // wgpu's maxBufferSize
-        let legalized =
-            legalize(&g, &caps, &CompileLimits::STANDARD).expect("an embed table always hosts");
+        let legalized = legalize(&g, BACKEND, &caps, &CompileLimits::STANDARD)
+            .expect("an embed table always hosts");
 
         assert!(
             !legalized
@@ -1319,6 +1334,7 @@ mod tests {
 
         let err = legalize(
             &g,
+            BACKEND,
             &caps_with_limit(2_147_483_647),
             &CompileLimits::STANDARD,
         )
@@ -1339,7 +1355,7 @@ mod tests {
     fn legalize_leaves_a_small_embed_dense() {
         let g = embed_gather_graph(151_936, 896); // qwen2.5-0.5b, ~544 MB
         let caps = caps_with_limit(2_147_483_647);
-        let legalized = legalize(&g, &caps, &CompileLimits::STANDARD)
+        let legalized = legalize(&g, BACKEND, &caps, &CompileLimits::STANDARD)
             .expect("under the limit, no rewrite needed");
         assert_eq!(legalized.eqns().len(), g.eqns().len());
         assert!(
@@ -1361,7 +1377,7 @@ mod tests {
     fn legalize_keeps_a_7b_embed_dense_on_a_device_with_real_headroom() {
         let g = embed_gather_graph(152_064, 3584);
         let rocm_like_caps = caps_with_limit(64 << 30); // 64 GiB unified memory, not wgpu's ~2 GiB
-        let legalized = legalize(&g, &rocm_like_caps, &CompileLimits::STANDARD)
+        let legalized = legalize(&g, BACKEND, &rocm_like_caps, &CompileLimits::STANDARD)
             .expect("ROCm's real limit holds this table");
         assert!(
             legalized
@@ -1390,7 +1406,7 @@ mod tests {
         let g = b.finish(out).unwrap();
 
         let caps = caps_with_limit(2_147_483_647);
-        let legalized = legalize(&g, &caps, &CompileLimits::STANDARD)
+        let legalized = legalize(&g, BACKEND, &caps, &CompileLimits::STANDARD)
             .expect("an oversized matmul weight always splits");
 
         assert!(
@@ -1450,8 +1466,13 @@ mod tests {
         );
 
         let limit = 1_000_000_000;
-        let legalized = legalize(&g, &caps_with_limit(limit), &CompileLimits::STANDARD)
-            .expect("an oversized dense weight always splits");
+        let legalized = legalize(
+            &g,
+            BACKEND,
+            &caps_with_limit(limit),
+            &CompileLimits::STANDARD,
+        )
+        .expect("an oversized dense weight always splits");
         let chunks = legalized
             .eqns()
             .iter()
@@ -1505,7 +1526,7 @@ mod tests {
         let caps = caps_with_limit(64);
 
         let g = build(false);
-        let legalized = legalize(&g, &caps, &CompileLimits::STANDARD)
+        let legalized = legalize(&g, BACKEND, &caps, &CompileLimits::STANDARD)
             .expect("a transposed oversized weight splits");
         let chunks: Vec<(String, Vec<usize>)> = legalized
             .consts()
@@ -1529,7 +1550,7 @@ mod tests {
         assert_eq!(count(|op| matches!(op, OpKind::Transpose { .. })), 3);
         assert_eq!(count(|op| matches!(op, OpKind::Concat { .. })), 1);
 
-        let error = legalize(&build(true), &caps, &CompileLimits::STANDARD)
+        let error = legalize(&build(true), BACKEND, &caps, &CompileLimits::STANDARD)
             .expect_err("the shared transpose still reads the whole const");
         assert!(matches!(
             error,
@@ -1546,7 +1567,7 @@ mod tests {
         let w = declare(&b, HEAD, TensorType::f32(vec![4, 10]));
         let out = b.matmul(x, w).unwrap();
         let g = b.finish(out).unwrap();
-        let error = legalize(&g, &caps_with_limit(64), &CompileLimits::STANDARD)
+        let error = legalize(&g, BACKEND, &caps_with_limit(64), &CompileLimits::STANDARD)
             .expect_err("a direct oversized weight has no split");
         assert!(matches!(
             error,
@@ -1567,7 +1588,7 @@ mod tests {
         let w = b.weight(carrier, TensorType::f32(vec![10, 4])).unwrap();
         let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
         let g = b.finish(out).unwrap();
-        let error = legalize(&g, &caps_with_limit(64), &CompileLimits::STANDARD)
+        let error = legalize(&g, BACKEND, &caps_with_limit(64), &CompileLimits::STANDARD)
             .expect_err("a packed source never splits");
         assert!(matches!(
             error,
@@ -1586,7 +1607,7 @@ mod tests {
         let g = b.finish(out).unwrap();
 
         let caps = caps_with_limit(2_147_483_647);
-        let legalized = legalize(&g, &caps, &CompileLimits::STANDARD)
+        let legalized = legalize(&g, BACKEND, &caps, &CompileLimits::STANDARD)
             .expect("under the limit, no rewrite needed");
         assert_eq!(legalized.consts(), g.consts());
         assert_eq!(legalized.eqns().len(), g.eqns().len());
@@ -1613,7 +1634,7 @@ mod tests {
         let g = b.finish(out).unwrap();
 
         let caps = caps_with_limit(2_147_483_647);
-        let error = legalize(&g, &caps, &CompileLimits::STANDARD).expect_err(
+        let error = legalize(&g, BACKEND, &caps, &CompileLimits::STANDARD).expect_err(
             "no rewrite hosts a matmul weight whose single row already exceeds the limit",
         );
         assert_eq!(
@@ -1654,7 +1675,7 @@ mod tests {
         let g = edit.commit().unwrap();
 
         let caps = caps_with_limit(2_147_483_647);
-        let legalized = legalize(&g, &caps, &CompileLimits::STANDARD)
+        let legalized = legalize(&g, BACKEND, &caps, &CompileLimits::STANDARD)
             .expect("a dead oversized const must not be refused");
         assert_eq!(legalized.result(), g.result());
     }
@@ -1679,7 +1700,7 @@ mod tests {
             b.finish(out).unwrap()
         };
         let caps = caps_with_limit(64);
-        let legalized = legalize(&build(true), &caps, &CompileLimits::STANDARD).unwrap();
+        let legalized = legalize(&build(true), BACKEND, &caps, &CompileLimits::STANDARD).unwrap();
         let chunks: Vec<WeightRef> = legalized
             .consts()
             .iter()
@@ -1691,7 +1712,7 @@ mod tests {
                 .map(|i| WeightRef::whole(HEAD).with_chunk(i))
                 .collect::<Vec<_>>()
         );
-        let error = legalize(&build(false), &caps, &CompileLimits::STANDARD)
+        let error = legalize(&build(false), BACKEND, &caps, &CompileLimits::STANDARD)
             .expect_err("a constant that is no weight has no parent to chunk");
         assert!(
             matches!(error, LegalizeError::OversizedConstant { .. }),

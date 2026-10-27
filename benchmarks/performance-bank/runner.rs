@@ -304,6 +304,192 @@ fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
     })
 }
 
+/// A dense contraction over a checkpoint-order `[N, K]` BF16 weight, in the form a model's `linear` traces
+/// (`MatMul(x, Transpose(w))`, which compile folds into one `DenseContraction` reading `w` as stored). The
+/// f32 activation `x` is `[M, K]`. Each weight is the fixture's f32 draw truncated to its top 16 bits, so the
+/// stored BF16 value is exact and the reference reads it back by the same bit shift, with no engine code.
+fn dense_contraction(bank: &Value, case: &Value) -> Result<Prepared, String> {
+    let shape = &case["shape"];
+    let (m, k, n) = (dim(shape, "m")?, dim(shape, "k")?, dim(shape, "n")?);
+    if case["storage"] != "bf16" || case["layout"] != "nk" {
+        return Err("dense_contraction measures a bf16 [N, K] weight".into());
+    }
+    let copies = weight_copies(bank, case, n * k * 2)?;
+    let mut stream = SplitMix64(
+        bank["token_fixtures"][case["token_fixture"].as_str().unwrap()]["seed"]
+            .as_u64()
+            .ok_or("fixture has no seed")?,
+    );
+    let x = stream.tensor(m * k);
+    let mut consts = vec![("x".to_string(), HostTensor::f32(vec![m, k], x.clone()))];
+    let (mut graphs, mut references) = (Vec::new(), Vec::new());
+    for copy in 0..copies {
+        let words: Vec<u16> = stream
+            .tensor(n * k)
+            .into_iter()
+            .map(|v| (v.to_bits() >> 16) as u16)
+            .collect();
+        let w: Vec<f64> = words
+            .iter()
+            .map(|&bits| f64::from(f32::from_bits(u32::from(bits) << 16)))
+            .collect();
+        let mut want = vec![0.0f64; m * n];
+        for row in 0..m {
+            let xs = &x[row * k..(row + 1) * k];
+            for (col, acc) in want[row * n..(row + 1) * n].iter_mut().enumerate() {
+                *acc = xs
+                    .iter()
+                    .zip(&w[col * k..(col + 1) * k])
+                    .map(|(&a, &b)| f64::from(a) * b)
+                    .sum();
+            }
+        }
+        references.push(want);
+        let name = format!("w{copy}");
+        let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
+        let xi = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
+        let wi = b
+            .constant(&name, TensorType::new(vec![n, k], poot_tensor::DType::BF16))
+            .unwrap();
+        let y = b.matmul(xi, b.transpose(wi, vec![1, 0]).unwrap()).unwrap();
+        graphs.push(b.finish(y).unwrap());
+        consts.push((name, HostTensor::bf16(vec![n, k], words)));
+    }
+    Ok(Prepared {
+        graphs,
+        consts,
+        references,
+        out_shape: vec![m, n],
+        slots: Vec::new(),
+        observed: json!({
+            "shape": { "m": m, "k": k, "n": n },
+            "storage": "bf16",
+            "layout": "nk",
+            "weight_copies": copies,
+            "weight_bytes_per_copy": n * k * 2,
+        }),
+    })
+}
+
+/// Causal prefill attention: `lq` query rows at the last `lq` positions of a `cap`-key context, under the
+/// causal mask a model derives from `Slot::Pos` (`causal_mask_from_pos`), so the planner sees the prefill
+/// graph a model traces. GQA with `hq / hkv` query heads per KV head. The f64 reference attends each query at
+/// position `p` to keys `0..=p`, one thread per head.
+fn attention_prefill(bank: &Value, case: &Value) -> Result<Prepared, String> {
+    let shape = &case["shape"];
+    let (hq, hkv, d, lq, cap) = (
+        dim(shape, "hq")?,
+        dim(shape, "hkv")?,
+        dim(shape, "d")?,
+        dim(shape, "lq")?,
+        dim(shape, "cap")?,
+    );
+    if !(1..=cap).contains(&lq) || hkv == 0 || hq % hkv != 0 {
+        return Err("attention_prefill needs 1 <= lq <= cap and hkv dividing hq".into());
+    }
+    let copies = weight_copies(bank, case, 2 * hkv * cap * d * 4)?;
+    if copies != 1 {
+        return Err(
+            "attention_prefill holds its KV resident: use a single-copy cache condition".into(),
+        );
+    }
+    let n_rep = hq / hkv;
+    let scale = 1.0 / (d as f32).sqrt();
+    let first = cap - lq;
+    let mut stream = SplitMix64(
+        bank["token_fixtures"][case["token_fixture"].as_str().unwrap()]["seed"]
+            .as_u64()
+            .ok_or("fixture has no seed")?,
+    );
+    let q = stream.tensor(hq * lq * d);
+    let k = stream.tensor(hkv * cap * d);
+    let v = stream.tensor(hkv * cap * d);
+    let mut want = vec![0.0f64; hq * lq * d];
+    std::thread::scope(|scope| {
+        for (head, out) in want.chunks_mut(lq * d).enumerate() {
+            let (q, k, v) = (&q, &k, &v);
+            scope.spawn(move || {
+                let kv = head / n_rep;
+                let mut scores = vec![0.0f64; cap];
+                for row in 0..lq {
+                    let visible = first + row + 1;
+                    let qr = &q[(head * lq + row) * d..(head * lq + row + 1) * d];
+                    for (t, score) in scores[..visible].iter_mut().enumerate() {
+                        let kr = &k[(kv * cap + t) * d..(kv * cap + t + 1) * d];
+                        let dot: f64 = qr
+                            .iter()
+                            .zip(kr)
+                            .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                            .sum();
+                        *score = dot * f64::from(scale);
+                    }
+                    let peak = scores[..visible]
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let mut total = 0.0;
+                    let o = &mut out[row * d..(row + 1) * d];
+                    for (t, score) in scores[..visible].iter().enumerate() {
+                        let weight = (score - peak).exp();
+                        total += weight;
+                        let vr = &v[(kv * cap + t) * d..(kv * cap + t + 1) * d];
+                        for (acc, &value) in o.iter_mut().zip(vr) {
+                            *acc += weight * f64::from(value);
+                        }
+                    }
+                    o.iter_mut().for_each(|acc| *acc /= total);
+                }
+            });
+        }
+    });
+    let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
+    let qi = b
+        .constant("q", TensorType::f32(vec![1, hq, lq, d]))
+        .unwrap();
+    let ki = b
+        .constant("k", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let vi = b
+        .constant("v", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let pos = b
+        .slot_ranged(
+            poot_graph_ir::Slot::Pos,
+            TensorType::new(vec![1, lq], poot_tensor::DType::I32),
+            poot_graph_ir::IndexRange::below(cap).ok_or("cap must be non-zero")?,
+        )
+        .unwrap();
+    let mask = ops::causal_mask_from_pos(&b, pos, cap, None).unwrap();
+    let y = ops::attention_masked(&b, qi, ki, vi, n_rep, scale, mask).unwrap();
+    let graph = b.finish(y).unwrap();
+    let key = graph
+        .meta(pos.id())
+        .slot_key()
+        .cloned()
+        .ok_or("Slot::Pos has no slot key")?;
+    let positions: Vec<u8> = (first..cap)
+        .flat_map(|p| (p as i32).to_le_bytes())
+        .collect();
+    Ok(Prepared {
+        graphs: vec![graph],
+        consts: vec![
+            ("q".into(), HostTensor::f32(vec![1, hq, lq, d], q)),
+            ("k".into(), HostTensor::f32(vec![1, hkv, cap, d], k)),
+            ("v".into(), HostTensor::f32(vec![1, hkv, cap, d], v)),
+        ],
+        references: vec![want],
+        out_shape: vec![1, hq, lq, d],
+        slots: vec![(key, vec![1, lq], positions)],
+        observed: json!({
+            "shape": { "hq": hq, "hkv": hkv, "d": d, "lq": lq, "cap": cap },
+            "storage": "f32",
+            "layout": "bhsd",
+            "weight_copies": 1,
+            "weight_bytes_per_copy": 2 * hkv * cap * d * 4,
+        }),
+    })
+}
+
 /// The recurrence scan of one family. A case's shape names `"family": "ssd"` for the Mamba2 SSD (`p` head
 /// width, `n` state rows); a shape without a family is the gated delta rule (`d`).
 fn recurrence_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
@@ -535,7 +721,9 @@ fn prepare(bank: &Value, case: &Value) -> Result<Prepared, String> {
     }
     match case["producer"].as_str() {
         Some("dense_matmul") => dense_matmul(bank, case),
+        Some("dense_contraction") => dense_contraction(bank, case),
         Some("attention_decode") => attention_decode(bank, case),
+        Some("attention_prefill") => attention_prefill(bank, case),
         Some("recurrence_scan") => recurrence_scan(bank, case),
         other => Err(format!("no runner for producer {other:?}")),
     }

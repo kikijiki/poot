@@ -99,16 +99,14 @@ fn run_indexed(
     };
     let (grid, x_groups) = match schedule {
         kg::Schedule::Gemv { .. } => ([schedule.grid_threads(1, m, N) as u32, 1, 1], 0),
-        kg::Schedule::Tiled { tile } => {
-            let ts = tile.get() as usize;
-            let tiles = (m.div_ceil(ts) * N.div_ceil(ts)) as u32;
+        kg::Schedule::RegisterTiled { lanes, .. } => {
+            let (tile_rows, tile_cols) = schedule.output_tile().unwrap();
+            let tiles = (m.div_ceil(tile_rows) * N.div_ceil(tile_cols)) as u32;
+            let lanes = lanes.get();
             // A folded grid when asked: `x_groups` tiles along X and as many rows of them as cover the rest.
             let x_groups = x_groups.unwrap_or(tiles);
             let y_groups = tiles.div_ceil(x_groups);
-            ([x_groups * (ts * ts) as u32, y_groups, 1], x_groups)
-        }
-        kg::Schedule::RegisterTiled { .. } => {
-            panic!("an indexed contraction is never RegisterTiled")
+            ([x_groups * lanes * lanes, y_groups, 1], x_groups)
         }
     };
     let request =
@@ -118,7 +116,7 @@ fn run_indexed(
             weight,
             epilogue: None,
             grid,
-            meta: vec![K as u32, N as u32, EXPERTS as u32, m as u32, x_groups],
+            meta: vec![K as u32, N as u32, m as u32, x_groups, 0, EXPERTS as u32],
         }));
     let generated = kg::generate(&request, &caps, &limits).unwrap();
     let wg = generated.body.workgroup_size[0];
@@ -163,8 +161,8 @@ fn assert_rows(label: &str, got: &[f32], m: usize) {
     }
 }
 
-/// Every refusal id yields a NaN row and no read leaves the table, on the Gemv and on the segmented Tiled schedule
-/// (the latter also over a folded grid, which the device rows never reach), over an f32 weight and over a BF16 one
+/// Every refusal id yields a NaN row and no read leaves the table, on the Gemv and on the register-tiled schedule's
+/// expert walk (the latter also over a folded grid, which the device rows never reach), over an f32 weight and over a BF16 one
 /// held packed two per word (the weight buffer then has half the words, so the clamp bounds a word read too), in
 /// both expert layouts, and every valid row is bit-exact with the sequential f32 sum over the widened weights.
 ///
@@ -177,12 +175,24 @@ fn an_invalid_expert_id_is_a_nan_row_and_never_an_out_of_range_read() {
         width: 16,
         cols: 2,
         unroll: 2,
-    };
-    let tiled = kg::Schedule::Tiled {
-        tile: kg::TileSize::new(4).unwrap(),
+        activation: poot_kernelgen::GemvActivation::Scalar,
     };
     for weight in [BufferStorage::f32(), BufferStorage::bf16_packed()] {
         for layout in [kg::WeightLayout::Kn, kg::WeightLayout::Nk] {
+            // The cost model's tiling for this small shape: one 16-row tile per 16 rows.
+            let tiled = kg::RegisterTiling::choose(
+                kg::TiledShape {
+                    blocks: 1,
+                    m_per_block: 21,
+                    out_per_block: N,
+                    k: K,
+                    layout,
+                    segments: EXPERTS,
+                },
+                &DeviceCaps::wgpu_rdna3_igpu(),
+            )
+            .schedule();
+            assert_eq!(tiled.output_tile(), Some((16, 32)), "{tiled:?}");
             let label = |schedule: &str| format!("{schedule} {weight:?} {layout:?}");
             let m = 14;
             assert_rows(
@@ -195,12 +205,11 @@ fn an_invalid_expert_id_is_a_nan_row_and_never_an_out_of_range_read() {
                 &run_indexed(tiled, m, None, layout, weight),
                 m,
             );
-            // 6 row-tiles x 3 column tiles = 18 workgroups folded onto a 5-wide X grid: the body rebuilds
-            // `gy * x_groups + gx`.
+            // 2 row-tiles folded onto a 1-wide X grid: the body rebuilds `gy * x_groups + gx`.
             let m = 21;
             assert_rows(
                 &label("tiled folded"),
-                &run_indexed(tiled, m, Some(5), layout, weight),
+                &run_indexed(tiled, m, Some(1), layout, weight),
                 m,
             );
         }
@@ -219,12 +228,13 @@ fn an_f16_packed_indexed_weight_is_refused_by_name() {
                 width: 16,
                 cols: 2,
                 unroll: 2,
+                activation: poot_kernelgen::GemvActivation::Scalar,
             },
             layout: kg::WeightLayout::Kn,
             weight: BufferStorage::f16_packed(),
             epilogue: None,
             grid: [16, 1, 1],
-            meta: vec![K as u32, N as u32, EXPERTS as u32, 1, 0],
+            meta: vec![K as u32, N as u32, 1, 0, 0, EXPERTS as u32],
         }));
     let limits = kg::BodyLimits {
         max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),

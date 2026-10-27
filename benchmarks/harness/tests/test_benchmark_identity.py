@@ -22,7 +22,7 @@ from result_contract import (  # noqa: E402
     committed_row_errors,
 )
 from runner_fixtures import POOT_IDENTITY, run_fixture_runner, valid_single  # noqa: E402
-from test_benchmark_compare import BASELINE, repeats  # noqa: E402
+from test_benchmark_compare import BASELINE, repeats, result_row  # noqa: E402
 from test_benchmark_manifest import refusing_runner, run_poot_cell  # noqa: E402
 
 RESULTS = bench.BENCH_ROOT / "results"
@@ -40,6 +40,7 @@ COMPARED_IDENTITY = (
     "driver_version",
     "checkpoint_digest",
     "compute_dtype",
+    "prefill_chunk",
     "profiled",
 )
 # The local backends a dense cell is committed for (the PTX backend needs an NVIDIA device).
@@ -168,6 +169,7 @@ class IdentityComparisonTests(unittest.TestCase):
             "driver_version": "other driver 2.0",
             "checkpoint_digest": "blake3:" + "00" * 32,
             "compute_dtype": "bf16",
+            "prefill_chunk": 2,
             "profiled": True,
         }
         self.assertEqual(set(changed), set(COMPARED_IDENTITY))
@@ -175,6 +177,18 @@ class IdentityComparisonTests(unittest.TestCase):
             with self.subTest(field=field):
                 candidate = [{**row, field: value} for row in repeats(BASELINE)]
                 self.assertEqual(self.verdict(repeats(BASELINE), candidate), receipts.INCOMPARABLE)
+
+    def test_a_chunked_prefill_is_another_workload_than_the_whole_prompt(self):
+        """The fixture prompt is 3 tokens. A row that states no chunk (recorded before the field) and one whose
+        chunk holds the prompt prefilled it whole, so they compare; a chunk below the prompt does not.
+        Mutation: drop `prefill_chunk` from `ROW_IDENTITY_FIELDS`; the chunk-2 candidate compares as noise."""
+        whole = repeats(BASELINE, prefill_chunk=None)
+        self.assertEqual(self.verdict(whole, repeats(BASELINE, prefill_chunk=3)), "within noise")
+        self.assertEqual(self.verdict(whole, repeats(BASELINE, prefill_chunk=2)), receipts.INCOMPARABLE)
+        self.assertEqual(
+            self.verdict(repeats(BASELINE, prefill_chunk=1), repeats(BASELINE, prefill_chunk=2)),
+            receipts.INCOMPARABLE,
+        )
 
     def test_the_build_sha_is_what_a_comparison_varies_not_identity(self):
         candidate = [
@@ -241,10 +255,16 @@ class BenchCompareRecipeTests(unittest.TestCase):
         cls.work = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.work.cleanup)
 
-    def committed_copy(self):
-        """The committed results in a scratch directory, and the repeat directories of the cell to plant a change in."""
+    def fixture_results(self):
+        """A controlled results directory: two cells, each five repeats of `BASELINE` in its own run set (the
+        older one recorded a day before), so the recipe contract does not depend on the noise of measured data."""
         results = Path(tempfile.mkdtemp(dir=self.work.name)) / "results"
-        shutil.copytree(RESULTS, results, ignore=shutil.ignore_patterns("INDEX.md"))
+        for day, model in (("2026-10-20", "older"), ("2026-10-21", "newer")):
+            for i, tok_s in enumerate(BASELINE, 1):
+                run = results / f"{day}-fixture-gpu-{model}-r{i}"
+                run.mkdir(parents=True)
+                (run / "results.jsonl").write_text(json.dumps(result_row(tok_s, model=model)) + "\n")
+                (run / "env.json").write_text(json.dumps({"captured_at_utc": f"{day}T00:00:00+00:00"}))
         return results
 
     def recipe(self, results, *candidate):
@@ -279,14 +299,22 @@ class BenchCompareRecipeTests(unittest.TestCase):
                 dirs.append(target)
         return dirs
 
-    def test_the_committed_set_is_a_verifiable_baseline(self):
+    def test_a_verifiable_set_is_a_verifiable_baseline(self):
+        done = self.recipe(self.fixture_results())
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn(receipts.WITHIN_NOISE, done.stdout)
+
+    def test_the_committed_results_are_a_verifiable_baseline(self):
+        # The data gate `just test` runs through `test-bench-harness`, on the real measurements: a cell whose
+        # robust band stays over its limit (a two-mode cell) fails it until it is re-recorded, by design.
         done = self.recipe(RESULTS)
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn(receipts.WITHIN_NOISE, done.stdout)
 
     def test_a_twenty_percent_regression_in_the_candidate_exits_non_zero(self):
-        results = self.committed_copy()
+        results = self.fixture_results()
 
         done = self.recipe(results, *self.planted(results, 0.8))
 
@@ -294,7 +322,7 @@ class BenchCompareRecipeTests(unittest.TestCase):
         self.assertIn(receipts.REGRESSION, done.stdout)
 
     def test_the_same_candidate_unchanged_passes(self):
-        results = self.committed_copy()
+        results = self.fixture_results()
 
         done = self.recipe(results, *self.planted(results, 1.0))
 

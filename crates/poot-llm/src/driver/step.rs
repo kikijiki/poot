@@ -1615,14 +1615,15 @@ impl Driver<Serving> {
         candidates.first().copied().ok_or_else(|| {
             PreparedSetRefusal::NotAdmitted {
                 program,
-                shape: StepShape::new(
-                    std::num::NonZeroUsize::new(live).expect("a step has a row"),
-                    std::num::NonZeroUsize::new(width).expect("a step has a token"),
-                    self.settings.options.capacity,
-                )
-                .with_kv(kv)
-                .with_logits(logits)
-                .with_hidden(self.hidden_of(role)),
+                shape: self
+                    .settings
+                    .step_shape(
+                        std::num::NonZeroUsize::new(live).expect("a step has a row"),
+                        std::num::NonZeroUsize::new(width).expect("a step has a token"),
+                    )
+                    .with_kv(kv)
+                    .with_logits(logits)
+                    .with_hidden(self.hidden_of(role)),
                 head: head.unwrap_or(Head::GREEDY),
                 adapters,
             }

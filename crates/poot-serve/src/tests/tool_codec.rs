@@ -111,7 +111,7 @@ fn a_model_with_no_tool_codec_is_not_forced() {
 /// `chat_format()` branch; the model's codec decides. Mutation: add any of those to a serve source file.
 #[test]
 fn serve_never_branches_on_the_chat_format() {
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = poot_test_util::manifest_dir().join("src");
     // Split so this file does not match itself.
     let needles = [["Chat", "Format"].concat(), ["chat_", "format"].concat()];
     let mut stack = vec![src.clone()];

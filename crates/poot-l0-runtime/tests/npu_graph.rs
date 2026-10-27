@@ -6,36 +6,51 @@
 
 use std::time::Duration;
 
-use poot_codegen::{VpuElem, VpuInput, VpuNode, VpuOp, VpuRegion, VpuTensor, VpuValue, emit_vpu};
 use poot_l0_runtime::{GraphDirection, GraphIr, GraphPrecision, L0Context, L0Error};
 use poot_quant::scalar::f32_to_f16;
 
 const N: usize = 16;
 
-/// The IR of `a + b` over two F16 `[1, 16]` inputs.
-fn add_ir() -> poot_codegen::VpuIr {
-    let tensor = VpuTensor {
-        elem: VpuElem::F16,
-        shape: vec![1, N],
+/// An OpenVINO IR model and the constant blob it points into.
+struct Ir {
+    xml: String,
+    weights: Vec<u8>,
+}
+
+/// The IR of `a + b` over two F16 `[1, 16]` inputs, written out the way the NPU crate's emitter spells it (the
+/// emitter's own rows pin that text; this runtime's rows only need a graph the driver's compiler accepts).
+fn add_ir() -> Ir {
+    let port = |id: u32, names: &str| {
+        format!(r#"<port id="{id}" precision="FP16"{names}><dim>1</dim><dim>{N}</dim></port>"#)
     };
-    let region = VpuRegion {
-        name: "add".into(),
-        inputs: ["a", "b"]
-            .into_iter()
-            .map(|name| VpuInput {
-                name: name.into(),
-                tensor: tensor.clone(),
-            })
-            .collect(),
-        nodes: vec![VpuNode {
-            origin: 2,
-            op: VpuOp::Add,
-            inputs: vec![VpuValue(0), VpuValue(1)],
-            out: tensor,
-        }],
-        outputs: vec![VpuValue(2)],
+    let parameter = |id: u32, name: &str| {
+        format!(
+            r#"<layer id="{id}" name="{name}" type="Parameter" version="opset1"><data shape="1,{N}" element_type="f16"/><output>{}</output></layer>"#,
+            port(0, &format!(r#" names="{name}""#))
+        )
     };
-    emit_vpu(&region).expect("the add region is well formed")
+    let xml = format!(
+        concat!(
+            r#"<?xml version="1.0"?><net name="add" version="11"><layers>"#,
+            "{a}{b}",
+            r#"<layer id="2" name="v2" type="Add" version="opset1"><data auto_broadcast="numpy"/><input>{p0}{p1}</input><output>{out}</output></layer>"#,
+            r#"<layer id="3" name="result_0" type="Result" version="opset1"><input>{res}</input></layer>"#,
+            r#"</layers><edges>"#,
+            r#"<edge from-layer="0" from-port="0" to-layer="2" to-port="0"/><edge from-layer="1" from-port="0" to-layer="2" to-port="1"/>"#,
+            r#"<edge from-layer="2" from-port="2" to-layer="3" to-port="0"/>"#,
+            r#"</edges></net>"#
+        ),
+        a = parameter(0, "a"),
+        b = parameter(1, "b"),
+        p0 = port(0, ""),
+        p1 = port(1, ""),
+        out = port(2, r#" names="v2""#),
+        res = port(0, ""),
+    );
+    Ir {
+        xml,
+        weights: Vec::new(),
+    }
 }
 
 fn words(values: impl Iterator<Item = f32>) -> Vec<u8> {
