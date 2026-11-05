@@ -76,7 +76,7 @@ test: test-model-free
 
 # the model-free gate: dead-pub and unused-dependency checks, docs-path references, the inventory and lane self-tests, device-probe
 # self-test, then every model-free test and doctest
-test-model-free: gate-check dead-pub machete docs-paths receipts-guard variant-coverage mutation-sample-report diagrams-check aie-link-driver npu-build vpu-build crates-stale-names merge-lost-lines-check cargo-freshness wgpu-hal-patch crates-standalone test-model-free-inventory test-lane-coverage test-bench-runner test-bench-harness
+test-model-free: gate-check dead-pub machete docs-paths receipts-guard home-paths-guard variant-coverage mutation-sample-report diagrams-check aie-link-driver npu-build vpu-build crates-stale-names merge-lost-lines-check cargo-freshness wgpu-hal-patch crates-standalone test-model-free-inventory test-lane-coverage test-bench-runner test-bench-harness
     scripts/with-required-backend.sh --self-test
     scripts/test-model-free.sh run
 
@@ -156,6 +156,11 @@ docs-paths:
 receipts-guard:
     scripts/check-no-receipts.py --self-test
     scripts/check-no-receipts.py
+
+# fail when a tracked file contains a home-directory path: receipts record repo-relative paths (POOT-1495)
+home-paths-guard:
+    scripts/check-home-paths.py --self-test
+    scripts/check-home-paths.py --check
 
 # every variant of the registered error and refusal enums names a covering test in scripts/variant-coverage.tsv (or is a
 # listed gap), and each listed test still exists and still names its variant (POOT-1221)

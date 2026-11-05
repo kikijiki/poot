@@ -123,6 +123,10 @@ class BinaryProvenanceTests(unittest.TestCase):
         self.assertEqual(row["device"], "fixture-gpu")
         self.assertNotIn("build_sha", row)
 
+    def test_env_capture_records_a_repo_relative_manifest_never_a_checkout_path(self):
+        self.assertEqual(bench.capture_env(bench.BENCH_ROOT / "manifest.toml")["manifest"], "benchmarks/manifest.toml")
+        self.assertEqual(bench.capture_env("/elsewhere/other.toml")["manifest"], "other.toml")
+
     def test_env_capture_does_not_claim_a_commit_for_the_binary(self):
         env = bench.capture_env("manifest.toml")
 

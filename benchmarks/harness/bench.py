@@ -133,6 +133,15 @@ def _rocm_gpu_name():
     return None
 
 
+def repo_relative(path):
+    """`path` as the receipt records it: relative to the repository root, never an absolute checkout location."""
+    resolved = Path(path).resolve()
+    try:
+        return str(resolved.relative_to(BENCH_ROOT.parent))
+    except ValueError:
+        return resolved.name
+
+
 def capture_env(manifest_path):
     smi = sh(["nvidia-smi", "--query-gpu=name,driver_version,memory.total",
               "--format=csv,noheader"])
@@ -156,7 +165,7 @@ def capture_env(manifest_path):
         "image_digest": os.environ.get("POOT_BENCH_IMAGE_DIGEST"),
         "host_kernel": sh(["uname", "-r"]),
         "cpu": sh(["bash", "-lc", "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2"]),
-        "manifest": str(manifest_path),
+        "manifest": repo_relative(manifest_path),
         "harness_version": "0.1.0",
     }
 

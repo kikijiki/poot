@@ -16,11 +16,11 @@ cd "$(dirname "$0")/.."
 out="${1:-target/mutation-sample}"
 rm -rf "$out"; mkdir -p "$out/shard-0" "$out/shard-1" "$out/ranges"
 for shard in 0 1; do
-  /home/kikijiki/.local/bin/poot-cargo nix develop -c nix shell nixpkgs#cargo-mutants -c \
+  poot-cargo nix develop -c nix shell nixpkgs#cargo-mutants -c \
     cargo mutants -p poot-load -f crates/poot-load/src/gguf/format.rs \
     --shard "$shard/2" --timeout 120 --no-times --output "$out/shard-$shard" || true
 done
-/home/kikijiki/.local/bin/poot-cargo nix develop -c nix shell nixpkgs#cargo-mutants -c \
+poot-cargo nix develop -c nix shell nixpkgs#cargo-mutants -c \
   cargo mutants -p poot-load -f crates/poot-load/src/safetensors.rs -f crates/poot-load/src/dtype.rs \
   -f crates/poot-load/src/gguf.rs \
   --re 'parse_tensor_header_entry|plan_header_entries|plan_file|parse_safetensors_header|checked_header_end|tensor_range|shard_paths|split_name|gguf_plan|is_plain_file_name|shard_files' \

@@ -21,7 +21,7 @@ repeats = 5
 [[machine]]
 id = "strix-halo"
 hardware = "amd-radeon-8060s-graphics"
-label = "Strix Halo, the local box (pause combeanie first: it shares the GPU)"
+label = "Strix Halo, the local box"
 
 # One RunPod machine, SECURE cloud only (community hosts are unstable: dead GPUs, slow uplinks). The orchestrator
 # reads these three fields through `grid.py machine nvidia-rtx-pro-6000`.
