@@ -1004,7 +1004,8 @@ fn tiled_gemm_random_shapes_gpu_matches_cpu() {
         let program = compile(
             &g,
             &spirv_fixture_target(),
-            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
         )
         .unwrap();
         let (eqn, _) = program

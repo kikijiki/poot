@@ -236,7 +236,9 @@ fn run_projection(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(CompileLimits::STANDARD).with_lora(plan),
+        &CompileOptions::new(CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact)
+            .with_lora(plan),
     )
     .unwrap_or_else(|e| panic!("{lora_target:?}: compile_staged: {e}"));
     let exe = exec

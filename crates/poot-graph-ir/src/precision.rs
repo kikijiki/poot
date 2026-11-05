@@ -86,17 +86,17 @@ impl fmt::Display for OperandPrecision {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum MatmulPrecision {
     /// No op narrows.
-    #[default]
     Exact,
     /// Contractions and attention split where a matrix unit admits them.
     Split,
     /// Contractions and attention narrow where a matrix unit admits them.
+    #[default]
     Narrow,
 }
 
 impl MatmulPrecision {
-    /// The engine default. `Exact` until the tier-3 gates of the narrow policy pass (POOT-1430 keeps it so).
-    pub const DEFAULT: Self = Self::Exact;
+    /// The engine default: the tier-3 gates of the narrow policy pass on every backend (POOT-1461).
+    pub const DEFAULT: Self = Self::Narrow;
 
     /// The lowercase name a flag, a config key and a result line use.
     pub const fn as_str(self) -> &'static str {

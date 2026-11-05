@@ -15,12 +15,12 @@ use crate::{Fixture, const_fixture};
 
 /// Query heads, key/value heads and head width of the small fixtures; [`FRAGMENT_HEADS`] is the shape whose rows
 /// fill a tiled fragment attention.
-type Heads = (usize, usize, usize);
-const SMALL_HEADS: Heads = (4, 2, 16);
+pub(crate) type Heads = (usize, usize, usize);
+pub(crate) const SMALL_HEADS: Heads = (4, 2, 16);
 /// 16 query heads over 4 key/value heads of width 64: four query heads per key/value head pack a block of four
 /// positions into the 16 rows of a fragment, and 160 positions give a device's compute units more blocks than it
 /// has.
-const FRAGMENT_HEADS: Heads = (16, 4, 64);
+pub(crate) const FRAGMENT_HEADS: Heads = (16, 4, 64);
 
 fn centered(seed: u64, n: usize, scale: f32) -> Vec<f32> {
     let mut s = seed | 1;
@@ -69,17 +69,20 @@ pub fn attention_fixtures(precision: OperandPrecision) -> Vec<Fixture> {
     ]
     .into_iter()
     .map(|(name, heads, lq, lk, scales)| {
-        attention_fixture(name, precision, heads, (lq, lk), scales)
+        attention_fixture(name, precision, heads, (lq, lk), scales, 0.25)
     })
     .collect()
 }
 
-fn attention_fixture(
+/// One attention over a query of magnitude up to `q_scale / 2` and an F16 key/value cache of magnitude up to
+/// `kv_scale / 2`, its scores multiplied by `score_scale`.
+pub(crate) fn attention_fixture(
     name: &'static str,
     precision: OperandPrecision,
     (hq, hkv, d): Heads,
     (lq, lk): (usize, usize),
     (q_scale, kv_scale): (f32, f32),
+    score_scale: f32,
 ) -> Fixture {
     let b = Builder::for_tests();
     let q = b
@@ -96,7 +99,7 @@ fn attention_fixture(
         .equation(
             OpKind::Attention(AttentionAttrs {
                 precision,
-                ..AttentionAttrs::new(hq / hkv, 0.25, None)
+                ..AttentionAttrs::new(hq / hkv, score_scale, None)
             }),
             [q, k, v, mask].map(|t| Operand::Value(t.id())).to_vec(),
         )

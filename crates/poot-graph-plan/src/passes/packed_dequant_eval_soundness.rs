@@ -2161,6 +2161,9 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderError> {
                 activation.id(),
                 Value::Host(HostTensor::f32(vec![2, k], vec![0.5; 2 * k])),
             );
+            // The oracle's contraction thread pool is built on first use and lives for the process: that
+            // one-time allocation is not the decode work this row bounds, so build it before measuring.
+            eval(&graph, &inputs, EvalOptions::default()).unwrap();
             let (result, contraction_bytes) =
                 allocated_bytes(|| eval(&graph, &inputs, EvalOptions::default()).map(|r| r.output));
             assert!(matches!(result.unwrap(), Value::Host(_)));

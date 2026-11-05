@@ -10,8 +10,11 @@
 //!
 //! Mutations (applied by hand, shown red, restored; recorded in the POOT-1221 report):
 //! HG-1 `MAX_SCHEMA_REGEX_BYTES` raised to 2 GiB (the nested-schema row goes red on its memory bound);
-//! HG-2 `DETERMINIZE_SIZE_LIMIT` raised back to 1 MiB (the random-pattern row goes red on its CPU-time
-//! budget: one pattern takes 7 s to refuse).
+//! HG-2 `DFA_SIZE_LIMIT` and `DETERMINIZE_SIZE_LIMIT` both raised 4096-fold (the blow-up row goes red on
+//! "the pattern must be refused" and the random-pattern row on its CPU-time budget: round 698 used 5.29 s).
+//! The dependencies that build the automaton run optimized in the dev profile (workspace `Cargo.toml`), so the
+//! budget measures the speed the server runs them at: the slowest random pattern takes about 0.1 s here, and
+//! at opt-level 0 one refusal took 1.5 s alone and 5.45 s of CPU on a loaded box.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +22,7 @@ use std::time::Duration;
 use poot_text::{ChatFormat, Constraint, GgufVocab, HermesToolCodec, TextCodec};
 
 /// Most CPU time a build or a refusal may use. The bounded builds finish in milliseconds (the slowest
-/// random pattern takes about 1.3 s); an unbounded build uses seconds to minutes. It is CPU time of the
+/// random pattern takes about 0.1 s); an unbounded build uses seconds to minutes. It is CPU time of the
 /// building thread, not wall-clock, so a loaded box that deschedules the test cannot fail it.
 const BUDGET: Duration = Duration::from_secs(5);
 

@@ -67,7 +67,6 @@ poot-llm	driver::llamacpp_longrope_tests::phi_4_mini_long_window_with_swapped_ta
 poot-llm	driver::llamacpp_longrope_tests::phi_4_mini_short_window_follows_llamacpp_rocm
 poot-llm	driver::llamacpp_longrope_tests::phi_4_mini_short_window_rocm_matches_the_cpu_oracle
 poot-llm	driver::llamacpp_longrope_tests::phi_4_mini_short_window_without_the_attention_scale_leaves_the_gate_rocm
-poot-llm	driver::narrow_gate_tests::rocm_bf16::gemma_3_1b_it
 poot-llm	driver::narrow_gate_tests::rocm_bf16::llama_3_2_1b_instruct
 poot-llm	driver::narrow_gate_tests::rocm_bf16::qwen2_5_1_5b_q4_k_m
 poot-llm	driver::narrow_gate_tests::rocm_bf16::qwen3_0_6b

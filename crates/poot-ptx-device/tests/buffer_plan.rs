@@ -104,7 +104,8 @@ fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-const REPLAY: CompileOptions = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
+const REPLAY: CompileOptions = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+    .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
 
 fn staged(g: &Graph, target: Target) -> StagedProgram {
     compile_staged(

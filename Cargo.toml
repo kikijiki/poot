@@ -50,6 +50,22 @@ members = [
 [profile.dev]
 debug = "line-tables-only"
 
+# The CPU oracle runs real checkpoints in the checkpoint lanes (a 3.8B model's prefill is trillions of scalar
+# multiply-adds), and at opt-level 0 each is a function call. Optimization does not change a float result
+# (no fast-math, no FMA contraction in Rust), so the oracle stays bit-for-bit what the debug build computes.
+[profile.dev.package.poot-eval]
+opt-level = 3
+
+# Guided decoding builds a client's regex into a DFA inside the request path. At opt-level 0 the determinizer is
+# an order of magnitude slower than the shipped build (one refusal took 1.5 s, and 5.5 s of CPU on a loaded box),
+# so the CPU budget of poot-text's hostile_guided rows measured the debug build and not the bound the size
+# limits set. The size limits count work; these two crates run at the speed the server runs them.
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.regex-syntax]
+opt-level = 3
+
 [workspace.package]
 edition = "2024"
 version = "0.0.0"
@@ -168,6 +184,8 @@ subtle = "2.6"
 libc = "0.2"
 # Correctly rounded libm functions for the CPU oracle's transcendental ops (poot-eval).
 libm = "0.2.16"
+# Row-parallel CPU oracle contractions (poot-eval); the same 1.12 line the tokenizers crate already locks.
+rayon = "1.12"
 # Vulkan device-memory budget query (poot-wgpu-runtime), pinned to the versions wgpu 29 itself uses.
 ash = "0.38"
 wgpu-hal = { version = "29.0.3", features = ["vulkan"] }

@@ -133,6 +133,21 @@ fn is_attention(op: &OpKind) -> bool {
     matches!(op, OpKind::Attention(_))
 }
 
+/// POOT-1461: options that name no policy compile under `Narrow`. The row compiles with `CompileOptions::new` and
+/// reads what the program holds: the projection reads f16 operands on ROCm, and compiling the same graph under
+/// `Exact` does not, so the default is the narrow one and `Exact` stays selectable. Mutation: set
+/// `MatmulPrecision::DEFAULT` back to `Exact`; the first assertion goes red.
+#[test]
+fn options_that_name_no_policy_compile_under_narrow() {
+    let default = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
+    assert_eq!(default.matmul_precision, MatmulPrecision::Narrow);
+    assert_eq!(MatmulPrecision::default(), MatmulPrecision::DEFAULT);
+    let program = compile(&projection(), &rocm_wmma(), &default).expect("the graph compiles");
+    assert_eq!(precision_of(&program, is_dense), F16);
+    let exact = compiled(&projection(), &rocm_wmma(), MatmulPrecision::Exact);
+    assert!(precision_of(&exact, is_dense).is_exact());
+}
+
 /// `Exact` never narrows: whatever the target's units, no equation reads a narrowed operand and the pass leaves
 /// no trace in the compiled program. Mutation: in `select_operand_precision` ignore the policy (drop the early
 /// return, and let a `Narrow` choice stand for an `Exact` driver); the ROCm row publishes `Narrow` ops and goes red.
@@ -219,18 +234,19 @@ fn caps_without_a_matrix_unit_give_exact() {
     }
 }
 
-/// An attention takes the dtype its keys are stored in where the target has a fragment for it (f16 is the
-/// default KV dtype, so K and V enter exactly and only Q and P round): bf16 KV is bf16 on ROCm and f16 on RADV (no
-/// bf16 fragments; the SPIR-V planner has no bf16 cache lane to compile it), f32 KV is f16 on both. Mutation: ignore the KV dtype in `fragment_dtype` (always f16); the
-/// bf16-on-ROCm row goes red.
+/// An attention takes f16 only over keys and values stored f16 (the default KV dtype), which enter exactly while its
+/// query is row-scaled (POOT-1455). A bf16 or f32 cache takes bf16, whose range is f32's: its keys and values would
+/// round to f16 unscaled and could overflow. So f32 KV is bf16 on ROCm and exact on RADV (no bf16 fragments; the
+/// SPIR-V planner has no bf16 cache lane, so bf16 KV does not compile there). Mutation: in `fragment_dtype` let an
+/// f32 cache take f16 again (`&[Bf16, F16]`); the f32-on-RADV row narrows to f16 and goes red.
 #[test]
-fn attention_takes_the_kv_storage_dtype() {
+fn attention_takes_f16_only_over_an_f16_cache() {
     let cases = [
         (rocm_wmma(), DType::F16, F16),
         (rocm_wmma(), DType::BF16, BF16),
-        (rocm_wmma(), DType::F32, F16),
+        (rocm_wmma(), DType::F32, BF16),
         (radv(), DType::F16, F16),
-        (radv(), DType::F32, F16),
+        (radv(), DType::F32, OperandPrecision::Exact),
     ];
     for (target, kv, want) in cases {
         let program = compiled(&attention(kv), &target, MatmulPrecision::Narrow);

@@ -35,9 +35,9 @@ mod vec4_probe;
 mod wmma;
 
 pub use attention::{
-    AttentionCombineSpec, AttentionMicro, AttentionRows, AttentionSchedule, AttentionSink,
-    AttentionSpec, KeyBound, KeyLayout, KvLane, LaneTile, MaskKind, QOperand, ScoreTransform,
-    WaveTile,
+    AttentionCombineSpec, AttentionMicro, AttentionQueryScale, AttentionRows, AttentionSchedule,
+    AttentionSink, AttentionSpec, KeyBound, KeyLayout, KvLane, LaneTile, MaskKind, QOperand,
+    ScoreTransform, WaveTile,
 };
 
 // The one generation seam. `poot-graph-plan` plans every generated kernel through `generate` and the request

@@ -202,6 +202,7 @@ fn bf16_prefill_and_decode_graphs_plan_on_wgpu_and_rocm() {
                 g,
                 backend,
                 &poot_test_util::device_caps::default_caps_for(backend),
+                poot_graph_ir::MatmulPrecision::Exact,
             )
             .unwrap();
             let failures = plan_failures(&prepared, backend);

@@ -93,8 +93,9 @@ let options = DriverOptions {
     // KV cache storage dtype: None takes the model's preference, else f16;
     // Some(KvDtype::F32) is the exact reference
     kv_dtype: None,
-    // Operand precision of matrix products: None takes the default, exact;
-    // Some(MatmulPrecision::Narrow) rounds operands where a matrix unit admits it
+    // Operand precision of matrix products: None takes the default, narrow
+    // (operands rounded where a matrix unit admits it);
+    // Some(MatmulPrecision::Exact) reads them as the graph declares them
     matmul_precision: None,
 };
 let executor = open_executor(BackendChoice::Auto)?;

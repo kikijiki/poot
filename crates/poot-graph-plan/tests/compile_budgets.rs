@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use poot_graph_ir::op::SampleRule;
-use poot_graph_ir::{BinOp, Builder, Graph, OpKind, RedOp, TensorType, UnOp, WeightRef};
+use poot_graph_ir::{
+    BinOp, Builder, Graph, MatmulPrecision, OpKind, RedOp, TensorType, UnOp, WeightRef,
+};
 use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
 use poot_graph_plan::{
     Capability, CompileError, CompileLimits, CompileOptions, ExpansionError, GraphResource,
@@ -28,7 +30,7 @@ fn wgpu() -> Target {
 }
 
 fn options(limits: CompileLimits) -> CompileOptions {
-    CompileOptions::new(limits)
+    CompileOptions::new(limits).with_matmul_precision(MatmulPrecision::Exact)
 }
 
 fn nz(n: usize) -> NonZeroUsize {

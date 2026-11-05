@@ -34,7 +34,7 @@ use poot_graph_plan::{
         DevicePlacement, ExpertPlacement, Partition, StagedProgram, TargetSet, compile_staged,
     },
 };
-use poot_models::model::{LogitRows, StepShape, StepSpec};
+use poot_models::model::{KvDtype, LogitRows, StepShape, StepSpec};
 use poot_models::test_support::weight_map::Step;
 
 use super::{BackendChoice, ModelHandle, open_executor, serving_trace_limits};
@@ -418,7 +418,11 @@ fn compile_window(graph: &Graph, targets: &TargetSet, options: &CompileOptions) 
 impl TeacherForced {
     pub(super) fn new(handle: &ModelHandle, mut exec: Box<dyn Executor>, n_ctx: usize) -> Self {
         let model = handle.model();
-        let shape = StepShape::new(nz(1), nz(n_ctx), nz(n_ctx)).with_logits(LogitRows::All);
+        // The cache dtype the driver would run (its default, f16): the dtype decides which operand dtype the
+        // attention narrows to, so the gate must trace the production program, not `StepShape`'s f32 default.
+        let shape = StepShape::new(nz(1), nz(n_ctx), nz(n_ctx))
+            .with_logits(LogitRows::All)
+            .with_kv_dtype(KvDtype::resolve(None, handle.config().kv_dtype));
         let graph = model
             .trace(&StepSpec::step(shape), serving_trace_limits(nz(n_ctx)))
             .expect("trace the teacher-forced prefill");

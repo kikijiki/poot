@@ -573,7 +573,8 @@ pub fn assert_split_kv_pipeline_matches_the_oracle(
                 devices: devices.to_vec(),
             },
         },
-        &CompileOptions::new(CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .map_err(|e| format!("compile_staged: {e}"))?;
     let mut planned = Vec::new();

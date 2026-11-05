@@ -8,7 +8,7 @@
 //! Generated kernels (a contraction) and an
 //! imported one (a shipped sampler) take the same path and fail with the same typed refusal.
 
-use poot_graph_ir::{Builder, TensorType};
+use poot_graph_ir::{Builder, MatmulPrecision, TensorType};
 use poot_graph_plan::device_validation::ResourceRefusal;
 use poot_graph_plan::test_support::{gpu_caps, gpu_caps_mut};
 use poot_graph_plan::{
@@ -21,7 +21,7 @@ use poot_target::{Backend, DeviceCaps};
 use poot_test_util::device_caps::default_caps_for;
 
 fn options() -> CompileOptions {
-    CompileOptions::new(CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD).with_matmul_precision(MatmulPrecision::Exact)
 }
 
 fn target(backend: Backend, caps: DeviceCaps) -> Target {

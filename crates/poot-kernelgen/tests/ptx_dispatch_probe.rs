@@ -197,6 +197,7 @@ fn attention_spec(
         mask,
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
+        query: kg::AttentionQueryScale::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes },
         precision: poot_graph_ir::OperandPrecision::Exact,
     }
@@ -397,6 +398,7 @@ fn attention_split_key_and_live_bound_match_cpu_on_ptx() {
         mask: kg::MaskKind::Broadcast,
         bound: kg::KeyBound::Live,
         sink: kg::AttentionSink::Absent,
+        query: kg::AttentionQueryScale::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes: 8 },
         precision: poot_graph_ir::OperandPrecision::Exact,
     };

@@ -105,7 +105,8 @@ fn gemv_case(dtype: DType, k: usize, n: usize) -> GemvCase {
     }
 }
 
-const OPTIONS: CompileOptions = CompileOptions::new(CompileLimits::STANDARD);
+const OPTIONS: CompileOptions = CompileOptions::new(CompileLimits::STANDARD)
+    .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
 
 /// Output widths `N` that reach every launch the planner admits on a device with `compute_units` compute units
 /// (at least two), none a multiple of its `cols`: `cols` 4 while `ceil(N / 4)` still launches `2 x compute_units`

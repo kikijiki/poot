@@ -282,7 +282,8 @@ fn the_kernel_choice_names_generated_imported_and_no_dispatch_equations() {
         backend,
         caps: poot_test_util::device_caps::default_caps_for(backend),
     };
-    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
     let program = compile(&g, &target, &options).expect("the fixture compiles for AMDGCN");
     let choice_of = |want: fn(&OpKind) -> bool| {
         let (eqn, _) = program

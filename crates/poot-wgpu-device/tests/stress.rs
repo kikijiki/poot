@@ -48,7 +48,8 @@ fn staged(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("compile the graph")
 }

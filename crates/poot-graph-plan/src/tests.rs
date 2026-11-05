@@ -1122,7 +1122,8 @@ fn a_biased_checkpoint_orientation_projection_is_one_contraction_with_bias_and_n
                     backend,
                     caps: default_caps_for(backend),
                 },
-                &CompileOptions::new(CompileLimits::STANDARD),
+                &CompileOptions::new(CompileLimits::STANDARD)
+                    .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
             )
             .unwrap_or_else(|e| panic!("{backend:?} {weight:?}: {e}"));
             let ops: Vec<&OpKind> = program.graph().eqns().iter().map(|e| &e.op).collect();
@@ -3451,7 +3452,8 @@ fn compiled(g: &Graph, backend: Backend) -> Program {
         backend,
         caps: default_caps_for(backend),
     };
-    let options = CompileOptions::new(crate::CompileLimits::STANDARD);
+    let options = CompileOptions::new(crate::CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
     compile(g, &target, &options).expect("the matmul compiles")
 }
 
@@ -3480,7 +3482,8 @@ fn is_kn_tiled(choice: &KernelChoice) -> bool {
 
 /// `g` compiled for `backend` on `caps` through the full pipeline.
 fn compiled_on(g: &Graph, backend: Backend, caps: DeviceCaps) -> Program {
-    let options = CompileOptions::new(crate::CompileLimits::STANDARD);
+    let options = CompileOptions::new(crate::CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
     compile(g, &Target::Gpu { backend, caps }, &options).expect("the matmul compiles")
 }
 
@@ -5190,6 +5193,7 @@ fn selected_attention_planned(
             softcap: None,
             ratio: 4,
             k: 512,
+            query: poot_graph_ir::QueryScale::Absent,
             precision: poot_graph_ir::OperandPrecision::Exact,
         },
         [q, k, v, ids, pos],
@@ -6334,7 +6338,8 @@ fn a_gemv_reads_activation_vectors_only_where_every_run_is_a_whole_aligned_group
         let program = compile(
             &builder.finish(out).unwrap(),
             &target,
-            &CompileOptions::new(CompileLimits::STANDARD),
+            &CompileOptions::new(CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
         )
         .unwrap_or_else(|error| panic!("packed {backend:?}: {error}"));
         let (eqn, _) = program
@@ -6385,7 +6390,8 @@ fn the_planner_narrows_index_math_only_where_its_proof_holds_on_a_target_that_lo
         let program = compile(
             &builder.finish(out).unwrap(),
             &target,
-            &CompileOptions::new(CompileLimits::STANDARD),
+            &CompileOptions::new(CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
         )
         .unwrap_or_else(|error| panic!("packed {backend:?} [{n}, {k}]: {error}"));
         let (_, plan) = program
@@ -6668,7 +6674,8 @@ fn bf16_projection_contraction_choice(
         b.matmul(x, w).unwrap()
     };
     let graph = b.finish(out).unwrap();
-    let options = CompileOptions::new(CompileLimits::STANDARD);
+    let options = CompileOptions::new(CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
     let target = Target::Gpu {
         backend,
         caps: default_caps_for(backend),
@@ -7165,4 +7172,66 @@ mod family_dtype_admission {
             Capability::DtypeLowering
         );
     }
+}
+
+/// POOT-1434: a tiling is dropped only when NO micro-tile of it fits the workgroup memory, not when the most
+/// square one overflows. The bank's 2048-row prefill on the Vulkan caps plans `br 32, bc 32, 256 lanes` with
+/// score tiles of 4x2 (63616 B of workgroup memory); the 2x4 score tile of the same tiling needs 61568 B. On a
+/// device with 62000 B the tiling stays, with the 2x4 tile, where the old tie-break micro dropped it.
+///
+/// Mutation: in `attention_lane_tiles` keep only the most square tile (`min_by_key(|t| (t.rows + t.cols,
+/// t.cols))`); the planner falls to another tiling and the row goes red. Mutation: drop the `lds <=
+/// caps.lds_bytes` test in `attention_tiling_of`; the 4x2 tile is planned on the 62000 B device and it goes red.
+#[test]
+fn a_tiling_whose_most_square_micro_overflows_keeps_a_feasible_one() {
+    let wgpu = Backend::SpirvVulkan;
+    let caps = default_caps_for(wgpu);
+    let fixture = AttentionFixture::prefill("bank prefill 2048", 16, 2, 2048, 128);
+    let tiling_of = |caps: &DeviceCaps| {
+        let (_, choice) = attention_planned(fixture, wgpu, caps).expect("the prefill plans");
+        let spec = first_attention_spec(&choice);
+        (spec.schedule, spec.tiled_lds_bytes())
+    };
+    let (roomy, _) = tiling_of(&caps);
+    let kg::AttentionSchedule::Tiled {
+        br,
+        bc,
+        lanes,
+        micro,
+    } = roomy
+    else {
+        panic!("the bank prefill plans a tiled schedule, got {roomy:?}");
+    };
+    assert_eq!(
+        (br, bc, lanes, micro),
+        (
+            32,
+            32,
+            256,
+            kg::AttentionMicro::Scalar {
+                score: kg::LaneTile { rows: 4, cols: 2 },
+                out: kg::LaneTile { rows: 8, cols: 4 },
+            }
+        ),
+        "the roomy device's plan"
+    );
+    let tight = DeviceCaps {
+        lds_bytes: 62_000,
+        ..caps
+    };
+    let (schedule, lds) = tiling_of(&tight);
+    assert_eq!(
+        schedule,
+        kg::AttentionSchedule::Tiled {
+            br,
+            bc,
+            lanes,
+            micro: kg::AttentionMicro::Scalar {
+                score: kg::LaneTile { rows: 2, cols: 4 },
+                out: kg::LaneTile { rows: 8, cols: 4 },
+            },
+        },
+        "the tiling keeps its feasible micro-tile"
+    );
+    assert_eq!(lds, Some(Ok(61_568)));
 }

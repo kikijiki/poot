@@ -865,7 +865,7 @@ fn options() -> DriverOptions {
         charge: record_bodies,
         draft: DraftPolicy::Off,
         hidden_window: None,
-        matmul_precision: None,
+        matmul_precision: Some(poot_graph_ir::MatmulPrecision::Exact),
     }
 }
 

@@ -1326,8 +1326,13 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_ptx() {
                 ),
             ]);
             let g = b.finish(out).unwrap();
-            let fused_graph = compile(&g, &target, &CompileOptions::new(CompileLimits::STANDARD))
-                .expect("the graph compiles");
+            let fused_graph = compile(
+                &g,
+                &target,
+                &CompileOptions::new(CompileLimits::STANDARD)
+                    .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
+            )
+            .expect("the graph compiles");
             let heads: Vec<_> = fused_graph
                 .graph()
                 .eqns()
@@ -1401,8 +1406,13 @@ fn a_tiled_matmul_epilogue_matches_the_oracle_on_ptx() {
             ),
         ]);
         let g = b.finish(out).unwrap();
-        let fused_graph = compile(&g, &target, &CompileOptions::new(CompileLimits::STANDARD))
-            .expect("the graph compiles");
+        let fused_graph = compile(
+            &g,
+            &target,
+            &CompileOptions::new(CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
+        )
+        .expect("the graph compiles");
         let heads: Vec<_> = fused_graph
             .graph()
             .eqns()

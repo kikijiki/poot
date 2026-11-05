@@ -5,7 +5,7 @@
 //! Every row drives the production `compile` for each backend and reads what `Program::planned()` holds.
 
 use poot_graph_ir::op::{BinOp, ContractionHead, RedOp};
-use poot_graph_ir::{Builder, Graph, OpKind, TensorType};
+use poot_graph_ir::{Builder, Graph, MatmulPrecision, OpKind, TensorType};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, KernelChoice, Plan, Program, Target, compile,
 };
@@ -37,7 +37,7 @@ fn target(backend: Backend) -> Target {
 }
 
 fn options() -> CompileOptions {
-    CompileOptions::new(CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD).with_matmul_precision(MatmulPrecision::Exact)
 }
 
 /// `g` compiled for `backend` through the full pipeline.

@@ -291,3 +291,20 @@ fn a_grouped_moe_prefill_runs_the_fragment_tile_on_ptx() {
         target,
     );
 }
+
+/// POOT-1455 on PTX: an f16 attention reads its query row-scaled, so a query past f16's range gives a finite output
+/// on the oracle, and an in-range query bit for bit the unguarded f16 attention's
+/// (`poot_executor_parity::attention_f16_range`). Mutation: in `emit_score` ignore `row_scale`; the past-range rows
+/// score at the wrong temperature and leave the oracle.
+#[test]
+fn the_attention_f16_range_guard_holds_on_ptx() {
+    let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::attention_f16_range::run_past_range(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+    poot_executor_parity::attention_f16_range::run_in_range_identity(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+}

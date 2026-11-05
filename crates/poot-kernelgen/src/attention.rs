@@ -89,6 +89,8 @@ pub struct AttentionSpec {
     pub bound: KeyBound,
     /// Whether the row's softmax carries a per-head sink logit.
     pub sink: AttentionSink,
+    /// Whether the query arrives divided by a per-row scale the raw products are multiplied by.
+    pub query: AttentionQueryScale,
     /// How the keys are walked and across how many workgroups.
     pub schedule: AttentionSchedule,
     /// How the key and value elements (the shared key part too) are stored.
@@ -413,6 +415,17 @@ pub enum AttentionSink {
     /// running state of the row's first lane (of its first split): `m = sink`, `l = 1` (`exp(sink - m)`),
     /// `o = 0`, so admitting the keys, the lane combine and the split combine need no sink case of their own.
     PerHead,
+}
+
+/// Whether the query arrives divided by a per-row scale (POOT-1455, `poot_graph_ir::QueryScale`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttentionQueryScale {
+    /// The raw `q . k` products are the scores' input as they are.
+    Absent,
+    /// An `F32 [B, Hq, Lq]` parameter, after the sinks and the last before `out`, holds each query row's scale `s`:
+    /// every raw `q . k` product of row `(b, h, i)` is multiplied by `s[(b * Hq + h) * Lq + i]` before the score
+    /// transform. A row whose scale is 1 computes bit for bit what it would without it.
+    PerRow,
 }
 
 /// How the region's keys are walked.
@@ -944,6 +957,7 @@ pub(crate) fn attention_body(
         mask: mask_kind,
         bound,
         sink,
+        query,
         schedule,
         kv,
         precision,
@@ -1003,6 +1017,10 @@ pub(crate) fn attention_body(
     let sinks = match sink {
         AttentionSink::Absent => None,
         AttentionSink::PerHead => Some(next_param(ld(slice_f32(false), false))),
+    };
+    let query_scales = match query {
+        AttentionQueryScale::Absent => None,
+        AttentionQueryScale::PerRow => Some(next_param(ld(slice_f32(false), false))),
     };
     let out = next_param(ld(slice_f32(true), true));
     let (q, k, v, mask) = (
@@ -1066,6 +1084,9 @@ pub(crate) fn attention_body(
         };
         let kv_head = uc(c, BinOp::Div, h, n_rep);
         let qbase = uc(c, BinOp::Mul, row, dk);
+        // The row's query scale, read once for all of its keys.
+        let row_scale =
+            query_scales.map(|scales| c.let_(Ty::F32, Rvalue::Use(copy(elem(scales, row)))));
         let kv_row = {
             let by_batch = uc(c, BinOp::Mul, b, hkv);
             ubin(c, BinOp::Add, by_batch, kv_head)
@@ -1285,7 +1306,7 @@ pub(crate) fn attention_body(
                 accumulate(c, k_shared, shared_row, shared_dim, head_dim);
             }
 
-            let s = score_of(c, score, dot);
+            let s = score_of(c, score, row_scale, dot);
             // A block-selected or causal row visits only keys it can see, so there is no mask to add.
             let s = match (mask_kind, maskbase) {
                 (MaskKind::Broadcast | MaskKind::PerHead, Some(maskbase)) => {
@@ -1382,7 +1403,7 @@ pub(crate) fn attention_body(
                 .iter()
                 .zip(&dots)
                 .map(|(&(_, _, valid), &dot)| {
-                    let s = score_of(c, score, dot);
+                    let s = score_of(c, score, row_scale, dot);
                     crate::block_top_k::select(
                         c,
                         Ty::F32,
@@ -1656,20 +1677,24 @@ fn lane_weight(
     weight
 }
 
-/// The score a raw dot product becomes: `dot * scale`, then the softcap `cap * tanh(. / cap)` when asked.
-/// The softcap multiplies by the reciprocal `1 / cap`, as `ops::softcap` does, so the bits agree.
+/// The score a raw dot product becomes: `dot * row_scale` under [`AttentionQueryScale::PerRow`] (the row's
+/// query scale), then `* scale`, then the softcap `cap * tanh(. / cap)` when asked. The products are in the
+/// decomposition's order (`ops::attention_over_keys`), and the softcap multiplies by the reciprocal `1 / cap`, as
+/// `ops::softcap` does, so the bits agree.
 fn score_of(
     c: &mut Cfg,
     score: ScoreTransform,
+    row_scale: Option<poot_kernel_ir::Local>,
     dot: poot_kernel_ir::Local,
 ) -> poot_kernel_ir::Local {
-    c.emit(|e| emit_score(e, score, dot))
+    c.emit(|e| emit_score(e, score, row_scale, dot))
 }
 
 /// [`score_of`] into straight-line statements.
 fn emit_score(
     e: &mut crate::emit::Emit,
     score: ScoreTransform,
+    row_scale: Option<poot_kernel_ir::Local>,
     dot: poot_kernel_ir::Local,
 ) -> poot_kernel_ir::Local {
     let (scale_bits, softcap) = match score {
@@ -1678,6 +1703,10 @@ fn emit_score(
             scale_bits,
             cap_bits,
         } => (scale_bits, Some(f32::from_bits(cap_bits))),
+    };
+    let dot = match row_scale {
+        Some(s) => crate::emit::bin(e, Ty::F32, BinOp::Mul, local_op(dot), local_op(s)),
+        None => dot,
     };
     let scaled = crate::emit::bin(
         e,
@@ -1726,6 +1755,7 @@ mod tests {
             mask: MaskKind::Broadcast,
             bound: KeyBound::Static,
             sink: AttentionSink::Absent,
+            query: AttentionQueryScale::Absent,
             schedule: AttentionSchedule::Streaming { lanes: 4 },
         }
     }

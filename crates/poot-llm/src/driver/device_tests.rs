@@ -458,7 +458,8 @@ fn attached_device_limit_refuses_an_oversized_constant(choice: BackendChoice) {
             .unwrap();
         b.finish(out).unwrap()
     };
-    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+        .with_matmul_precision(crate::driver::MatmulPrecision::Exact);
 
     let over = limit / row_bytes + 1;
     let error = compile(&tied(over), target, &options)
@@ -4701,7 +4702,8 @@ fn glm53_flash_mtp_chain_matches_the_reference(choice: BackendChoice) {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(crate::driver::MatmulPrecision::Exact),
         )
         .unwrap_or_else(|e| panic!("{program} at {tokens} tokens on {choice:?}: {e}"));
         exec.add_entry(exe, &program).unwrap()

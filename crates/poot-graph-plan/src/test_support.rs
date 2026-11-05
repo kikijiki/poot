@@ -12,7 +12,7 @@
 //! through that feature, not through a forwarder here (a forwarder whose only purpose is to be a non-test
 //! reference is laundering, ADR-0113's Context).
 
-use poot_graph_ir::{Eqn, Graph};
+use poot_graph_ir::{Eqn, Graph, MatmulPrecision};
 use poot_target::{Backend, DeviceCaps};
 
 use crate::{Plan, PlanError, Target};
@@ -82,16 +82,18 @@ pub fn wgpu_rdna3_target() -> Target {
 }
 
 /// The graph `compile` hands the planner for `g` on the GPU target `backend` with `caps`: the one preparation
-/// pipeline every target runs, for tests that assert on the prepared graph.
+/// pipeline every target runs under `policy`, for tests that assert on the prepared graph.
 pub fn compiled_graph(
     g: &Graph,
     backend: Backend,
     caps: &DeviceCaps,
+    policy: MatmulPrecision,
 ) -> Result<Graph, crate::CompileError> {
     let target = Target::Gpu {
         backend,
         caps: *caps,
     };
-    let options = crate::CompileOptions::new(crate::CompileLimits::STANDARD);
+    let options =
+        crate::CompileOptions::new(crate::CompileLimits::STANDARD).with_matmul_precision(policy);
     Ok(crate::compile(g, &target, &options)?.graph().clone())
 }

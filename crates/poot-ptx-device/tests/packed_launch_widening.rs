@@ -39,7 +39,8 @@ fn compiled(gpu: &PtxDevice, graph: &Graph) -> Graph {
             backend: Backend::Nvptx,
             caps: gpu_caps(&Device::target(gpu)),
         },
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("compile the packed graph")
     .graph()

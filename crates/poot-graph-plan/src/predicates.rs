@@ -715,22 +715,27 @@ const TILED_ACCUMULATORS_PER_LANE: usize = 64;
 /// The widest lane tile column count a tiled attention considers: a lane's columns are one register each.
 const TILED_MAX_LANE_COLS: usize = 16;
 
-/// The register tile one lane of a `lanes`-lane workgroup holds over a `rows x cols` tile, or `None` when no
-/// grid of whole tiles covers it: every `r x c` with `(rows / r) * (cols / c) == lanes`, the most square (the
-/// fewest LDS reads per FMA, `(r + c) / (r * c)` at a fixed `r * c`), ties to fewer columns.
-fn attention_lane_tile(rows: usize, cols: usize, lanes: usize) -> Option<poot_kernelgen::LaneTile> {
+/// The register tiles one lane of a `lanes`-lane workgroup can hold over a `rows x cols` tile: every `r x c` with
+/// `(rows / r) * (cols / c) == lanes`, none when no grid of whole tiles covers it. Which one is best depends on
+/// what the whole schedule costs (the workgroup memory its layout takes, the LDS reads per FMA), so the planner
+/// weighs them all ([`attention_tiling_of`]).
+fn attention_lane_tiles(
+    rows: usize,
+    cols: usize,
+    lanes: usize,
+) -> impl Iterator<Item = poot_kernelgen::LaneTile> {
     let cells = rows * cols;
-    if !cells.is_multiple_of(lanes) {
-        return None;
-    }
-    let per_lane = cells / lanes;
+    let per_lane = if cells.is_multiple_of(lanes) {
+        cells / lanes
+    } else {
+        0
+    };
     (1..=per_lane.min(rows))
-        .filter(|r| rows.is_multiple_of(*r) && per_lane.is_multiple_of(*r))
-        .map(|r| (r, per_lane / r))
-        .filter(|&(r, c)| {
+        .filter(move |r| rows.is_multiple_of(*r) && per_lane.is_multiple_of(*r))
+        .map(move |r| (r, per_lane / r))
+        .filter(move |&(r, c)| {
             c <= TILED_MAX_LANE_COLS && cols.is_multiple_of(c) && (rows / r) * (cols / c) == lanes
         })
-        .min_by_key(|&(r, c)| (r + c, c))
         .map(|(rows, cols)| poot_kernelgen::LaneTile { rows, cols })
 }
 
@@ -792,38 +797,44 @@ fn attention_held_wave_tile(
 /// The micro-tiles of a tile of `rows` and the schedule's `bc`, `dv` and `dk` widths over `lanes` lanes with Q
 /// where `q` says, and the registers each lane holds for them across the key loop: matrix fragments of `config`
 /// (one wave per 32 lanes) where `fragment` names it (the f32 accumulator fragments of both products and, with Q
-/// held, its operand fragments), else register tiles (their f32 accumulators; Q is always staged).
-fn attention_micro(
+/// held, its operand fragments), else register tiles (their f32 accumulators; Q is always staged). A register
+/// tiling has a micro-tile for every pair of lane tiles ([`attention_lane_tiles`]); a fragment tiling the one
+/// wave grid per product its weighing picks.
+fn attention_micros(
     fragment: Option<poot_target::FragmentConfig>,
     (rows, bc, dv, dk): (usize, usize, usize, usize),
     lanes: usize,
     q: poot_kernelgen::QOperand,
-) -> Option<(poot_kernelgen::AttentionMicro, usize)> {
+) -> Vec<(poot_kernelgen::AttentionMicro, usize)> {
     match fragment {
         None => {
             if q == poot_kernelgen::QOperand::Held {
-                return None;
+                return Vec::new();
             }
-            let (score, out) = (
-                attention_lane_tile(rows, bc, lanes)?,
-                attention_lane_tile(rows, dv, lanes)?,
-            );
-            Some((
-                poot_kernelgen::AttentionMicro::Scalar { score, out },
-                score.cells() + out.cells(),
-            ))
+            attention_lane_tiles(rows, bc, lanes)
+                .flat_map(|score| {
+                    attention_lane_tiles(rows, dv, lanes).map(move |out| {
+                        (
+                            poot_kernelgen::AttentionMicro::Scalar { score, out },
+                            score.cells() + out.cells(),
+                        )
+                    })
+                })
+                .collect()
         }
         Some(config) => {
             let lane_count = config.subgroup as usize;
             let waves = lanes / lane_count;
             if !lanes.is_multiple_of(lane_count) || waves > config.waves as usize {
-                return None;
+                return Vec::new();
             }
             let score = match q {
-                poot_kernelgen::QOperand::Staged => attention_wave_tile(rows, bc, waves)?,
-                poot_kernelgen::QOperand::Held => attention_held_wave_tile(rows, bc, waves)?,
+                poot_kernelgen::QOperand::Staged => attention_wave_tile(rows, bc, waves),
+                poot_kernelgen::QOperand::Held => attention_held_wave_tile(rows, bc, waves),
             };
-            let out = attention_wave_tile(rows, dv, waves)?;
+            let (Some(score), Some(out)) = (score, attention_wave_tile(rows, dv, waves)) else {
+                return Vec::new();
+            };
             let fragments = (score.rows * score.cols + out.rows * out.cols) as usize;
             let accumulators =
                 fragments * poot_kernel_ir::accumulator_map::ELEMENTS_PER_LANE as usize;
@@ -835,7 +846,7 @@ fn attention_micro(
                         * config.operand_registers() as usize
                 }
             };
-            Some((
+            vec![(
                 poot_kernelgen::AttentionMicro::Fragment {
                     dtype: config.dtype,
                     layout: config.layout,
@@ -844,7 +855,7 @@ fn attention_micro(
                     q,
                 },
                 accumulators + held_q,
-            ))
+            )]
         }
     }
 }
@@ -949,9 +960,15 @@ fn attention_tiling_of(
             })
     });
     candidates
-        .filter_map(|(br, lanes, bc, q)| {
+        .flat_map(|(br, lanes, bc, q)| {
             let rows = br * spec.n_rep;
-            let (micro, held) = attention_micro(fragment, (rows, bc, spec.dv, spec.dk), lanes, q)?;
+            let micros = attention_micros(fragment, (rows, bc, spec.dv, spec.dk), lanes, q);
+            micros
+                .into_iter()
+                .map(move |(micro, held)| (br, lanes, bc, q, micro, held))
+        })
+        .filter_map(|(br, lanes, bc, q, micro, held)| {
+            let rows = br * spec.n_rep;
             if held > budget(lanes)? {
                 return None;
             }
@@ -967,20 +984,45 @@ fn attention_tiling_of(
             };
             let lds = tiled.tiled_lds_bytes()?.ok()?;
             let fills = tiled.row_groups() >= caps.compute_units as usize;
-            // Larger ranks first; a fragment tiling's width counts down (the narrowest wins).
+            // Larger ranks first; a fragment tiling's width counts down (the narrowest wins). Among the
+            // micro-tiles of one register tiling the fewest LDS reads per lane and key block win, then the
+            // narrower tiles: the pairs the workgroup memory rejects are not candidates.
             let rank = match fragment {
                 Some(_) => (
                     rows,
                     usize::MAX - lanes,
                     bc,
                     usize::from(q == QOperand::Held),
+                    0,
                 ),
-                None => (lanes, rows, bc, 0),
+                None => (
+                    lanes,
+                    rows,
+                    bc,
+                    0,
+                    usize::MAX - attention_lds_reads(micro, spec, bc),
+                ),
             };
             (lds <= caps.lds_bytes as usize && fills).then_some((rank, schedule))
         })
         .max_by_key(|&(rank, _)| rank)
         .map(|(_, schedule)| schedule)
+}
+
+/// The operand elements one lane reads from workgroup memory per key block of a register tiling: the score
+/// product steps `dk` times over `rows + cols` of its tile, the output product `bc` times over those of its own.
+/// The FMAs are the tiling's, so fewer reads is a better micro-tile (the most square). Fragment tilings: 0.
+fn attention_lds_reads(
+    micro: poot_kernelgen::AttentionMicro,
+    spec: &poot_kernelgen::AttentionSpec,
+    bc: usize,
+) -> usize {
+    match micro {
+        poot_kernelgen::AttentionMicro::Scalar { score, out } => {
+            (score.rows + score.cols) * spec.dk + (out.rows + out.cols) * bc
+        }
+        poot_kernelgen::AttentionMicro::Fragment { .. } => 0,
+    }
 }
 
 /// The most row groups one dispatch of the streaming attention `spec` may run, or `None` when the device has no

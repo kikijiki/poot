@@ -22,7 +22,9 @@ use poot_graph_plan::{CompileOptions, Plan, Program, ScratchId, Target, compile,
 use poot_target::{AmdArch, Backend};
 use poot_test_util::device_caps::default_caps_for;
 
-const OPTIONS: CompileOptions = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
+/// The planner's structure is asserted on the exact lowering; the narrow default is its own tier-3 gate.
+const OPTIONS: CompileOptions = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+    .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
 
 fn targets() -> Vec<(&'static str, Target)> {
     [

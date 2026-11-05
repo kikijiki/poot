@@ -26,7 +26,8 @@ pub fn compile_live(graph: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("the live-attention graph compiles")
 }

@@ -78,7 +78,8 @@ fn the_tiled_attention_runs_workgroups_wider_than_one_wave64_on_radv() {
     let program = compile(
         &graph,
         &target,
-        &CompileOptions::new(CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("the attention graph compiles for wgpu");
     let (eqn, _) = program

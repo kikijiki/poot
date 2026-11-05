@@ -176,7 +176,8 @@ fn hosted_hidden_equals_unhosted(tokens: &[i32], pos: i32, cap: usize) -> usize 
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("the embed table hosts; nothing else in this fixture is oversized");
     let stages: Vec<&poot_graph_ir::Graph> = program

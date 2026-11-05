@@ -44,7 +44,8 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
             ..gpu_caps(&target)
         },
     };
-    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
     let program =
         compile(&g, &split_target, &options).expect("an oversized matmul weight always splits");
     let gh = program.graph();

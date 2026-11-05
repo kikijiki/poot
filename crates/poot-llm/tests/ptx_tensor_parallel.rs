@@ -74,6 +74,7 @@ fn open_two() -> Option<Vec<PtxDevice>> {
 
 fn options() -> CompileOptions {
     CompileOptions::new(CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact)
 }
 
 fn logits<E: Executor>(

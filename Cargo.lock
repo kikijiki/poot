@@ -1836,6 +1836,7 @@ dependencies = [
  "poot-tensor",
  "poot-test-util",
  "poot-weights",
+ "rayon",
  "thiserror 2.0.18",
 ]
 

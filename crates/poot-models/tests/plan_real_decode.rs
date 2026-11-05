@@ -20,7 +20,8 @@ fn compiled(g: &Graph, backend: Backend) -> Program {
         backend,
         caps: default_caps_for(backend),
     };
-    let options = CompileOptions::new(CompileLimits::STANDARD);
+    let options = CompileOptions::new(CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
     compile(g, &target, &options).expect("the graph compiles")
 }
 

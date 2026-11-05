@@ -111,9 +111,9 @@ impl StrideRates {
         sorted[sorted.len() / 2]
     }
 
-    /// The fastest run: contention from another process on the shared device only lowers a run's rate, so the
-    /// peak is the estimate that survives it (the median does not: a run-5 hold on wgpu read 7.4 GB/s at the
-    /// unaliased stride while a second process held the GPU, with a peak of the usual 50).
+    /// The fastest run. A report column only: it is an extreme of the sample, so one run whose timestamps span
+    /// far less than the dispatch (an outlier of 115 GB/s at the one-channel stride, above the 105 GB/s the
+    /// contiguous read reaches, under CPU load) moves it arbitrarily, and the order check does not use it.
     pub fn peak(&self) -> f64 {
         self.gbps.iter().copied().fold(0.0, f64::max)
     }
@@ -154,12 +154,13 @@ pub fn measure_strides(
         .collect()
 }
 
-/// The smallest ratio between the peak read rate of a stride that reaches more channels and one that reaches
+/// The smallest ratio between the median read rate of a stride that reaches more channels and one that reaches
 /// fewer, per step of the order the probe asserts: 2 over 1 channel, 4 over 2, and all 16 over 1. Each is below
-/// the smallest per-run ratio of five clean holds on both backends (2 over 1: 1.68; 4 over 2: 1.44; 16 over 1:
-/// 3.09), so the order is the robust part of the channel model. The fitted rates are printed by [`report`],
-/// never asserted: the box is shared with a model server, and a hold that overlapped another GPU user read 7.4
-/// GB/s where 50 is usual (the peak over nine runs ignores such a run; a median does not).
+/// the smallest ratio of the recorded medians on both backends (2 over 1: 1.78; 4 over 2: 1.84; 16 over 1:
+/// 8.7), so the order is the robust part of the channel model. The fitted rates are printed by [`report`],
+/// never asserted. The median of nine runs ignores up to four runs that read wrongly in either direction (a
+/// run slowed by another GPU user, a run whose timestamps span far less than its dispatch); the peak or the
+/// minimum of the sample takes one such run as the estimate.
 pub const ORDER_FLOORS: [(usize, usize, f64); 3] = [(1, 2, 1.3), (2, 4, 1.2), (1, 16, 2.0)];
 
 fn median_at(rates: &[StrideRates], channels: usize) -> &StrideRates {
@@ -169,21 +170,21 @@ fn median_at(rates: &[StrideRates], channels: usize) -> &StrideRates {
         .unwrap_or_else(|| panic!("the probe measures a stride that reaches {channels} channels"))
 }
 
-/// The order the channel model implies, in terms that survive noise: a stride that reaches more channels peaks
-/// at least [`ORDER_FLOORS`] times faster than one that reaches fewer. `Err` names each broken step.
+/// The order the channel model implies, in terms that survive noise: a stride that reaches more channels reads
+/// at least [`ORDER_FLOORS`] times faster (median rate) than one that reaches fewer. `Err` names each broken step.
 pub fn check_order(rates: &[StrideRates]) -> Result<(), String> {
     let broken: Vec<String> = ORDER_FLOORS
         .iter()
         .filter_map(|&(few, many, floor)| {
             let (slow, fast) = (median_at(rates, few), median_at(rates, many));
-            let ratio = fast.peak() / slow.peak();
+            let ratio = fast.median() / slow.median();
             (ratio < floor).then(|| {
                 format!(
-                    "{} B ({many} channels) peaks at {:.1} GB/s against {:.1} GB/s at {} B ({few} channels): \
+                    "{} B ({many} channels) reads a median {:.1} GB/s against {:.1} GB/s at {} B ({few} channels): \
                      ratio {ratio:.2}, floor {floor:.1}",
                     fast.stride_bytes,
-                    fast.peak(),
-                    slow.peak(),
+                    fast.median(),
+                    slow.median(),
                     slow.stride_bytes
                 )
             })
@@ -217,4 +218,55 @@ pub fn report(rates: &[StrideRates]) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rates for the strides the order check reads: the median of `runs` per stride, nothing else.
+    fn rates(channels: usize, gbps: Vec<f64>) -> StrideRates {
+        StrideRates {
+            stride_bytes: 4096 * channels,
+            channels,
+            gbps,
+        }
+    }
+
+    fn model_rates(one_channel: Vec<f64>) -> Vec<StrideRates> {
+        vec![
+            rates(1, one_channel),
+            rates(2, vec![21.5; 9]),
+            rates(4, vec![39.6; 9]),
+            rates(16, vec![104.9; 9]),
+        ]
+    }
+
+    /// A single run whose timestamps span far less than its dispatch (115 GB/s at the one-channel stride, seen
+    /// under CPU load on wgpu, above the contiguous ceiling) must not decide the order. Mutation: take
+    /// `peak()` in `check_order`; the one-channel stride then reads 115 GB/s and this goes red on
+    /// "ratio 0.19, floor 1.3".
+    #[test]
+    fn one_outlier_run_does_not_decide_the_order() {
+        let mut one = vec![12.1; 9];
+        one[4] = 115.0;
+        check_order(&model_rates(one)).expect("eight clean runs of nine hold the order");
+    }
+
+    /// The other side: when the one-channel stride reads as fast as the others in every run, the order is
+    /// broken and `check_order` names it.
+    #[test]
+    fn a_stride_set_with_no_channel_effect_is_refused() {
+        let flat = vec![
+            rates(1, vec![40.0; 9]),
+            rates(2, vec![40.0; 9]),
+            rates(4, vec![40.0; 9]),
+            rates(16, vec![40.0; 9]),
+        ];
+        let broken = check_order(&flat).expect_err("a flat read rate breaks the channel order");
+        assert!(
+            broken.contains("floor 1.3"),
+            "names the broken step: {broken}"
+        );
+    }
 }

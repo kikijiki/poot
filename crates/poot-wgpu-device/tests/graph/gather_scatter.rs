@@ -804,7 +804,8 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
         // `StagedProgram` for the engine, mirroring `legalize.rs`'s already-landed split test (compile
         // once to inspect/bind, `run_via_contract`/`staged_replay` compiles again to execute).
         let options =
-            poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
+            poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
         let program = poot_graph_plan::compile(&variant.graph, &target, &options)
             .map_err(|e| format!("compile: {e}"))?;
         let graph = program.graph().clone();

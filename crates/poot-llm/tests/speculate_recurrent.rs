@@ -122,7 +122,8 @@ fn fixture_handle(family: FamilyKey) -> (Arc<ModelHandle>, poot_test_util::Uniqu
 }
 
 fn options(draft: DraftPolicy) -> DriverOptions {
-    let compile = CompileOptions::new(CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
     DriverOptions {
         kv_dtype: None,
         prefill: compile.clone(),
@@ -137,7 +138,7 @@ fn options(draft: DraftPolicy) -> DriverOptions {
         charge: program_retention,
         draft,
         hidden_window: None,
-        matmul_precision: None,
+        matmul_precision: Some(poot_graph_ir::MatmulPrecision::Exact),
     }
 }
 
@@ -803,7 +804,8 @@ impl Probed {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         };
-        let options = CompileOptions::new(CompileLimits::STANDARD);
+        let options = CompileOptions::new(CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
         let program = compile_staged(&graph, &self.inner.target_set(), &partition, &options)
             .unwrap_or_else(|e| panic!("the probe of {name} compiles: {e}"));
         let entry = self.inner.add_entry(exe, &program)?;

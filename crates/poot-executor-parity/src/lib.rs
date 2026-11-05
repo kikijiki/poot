@@ -30,6 +30,7 @@
 
 pub mod alibi;
 pub mod attention;
+pub mod attention_f16_range;
 pub mod bf16_cast;
 pub mod block_top_k;
 pub mod capture;
@@ -565,7 +566,8 @@ pub fn staged(fixture: &Fixture, target: Target) -> StagedProgram {
     compile_fixture(
         fixture,
         target,
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
 }
 
@@ -770,7 +772,9 @@ pub fn run_once(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &exec.compile_options(poot_graph_plan::CompileLimits::STANDARD),
+        &exec
+            .compile_options(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(MatmulPrecision::Exact),
     )
     .map_err(|e| format!("run_once: compile_staged: {e}"))?;
     let entry = exec

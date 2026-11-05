@@ -449,7 +449,8 @@ mod value_storage_tests {
                     backend,
                     caps: poot_test_util::device_caps::default_caps_for(backend),
                 };
-                let options = crate::CompileOptions::new(crate::CompileLimits::STANDARD);
+                let options = crate::CompileOptions::new(crate::CompileLimits::STANDARD)
+                    .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
                 let program = match crate::compile(g, &target, &options) {
                     Ok(program) => program,
                     Err(crate::CompileError::Plan(error))
@@ -796,7 +797,8 @@ mod value_storage_tests {
                     experts: ExpertPlacement::AllResident,
                     devices: DevicePlacement::Single(DeviceId(0)),
                 },
-                &CompileOptions::new(crate::CompileLimits::STANDARD),
+                &CompileOptions::new(crate::CompileLimits::STANDARD)
+                    .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
             )
             .unwrap();
             let (_, _, program) = staged.stages().next().unwrap();

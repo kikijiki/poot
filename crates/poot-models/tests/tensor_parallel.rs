@@ -14,7 +14,7 @@ use std::sync::Arc;
 use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::builder::Builder;
-use poot_graph_ir::{BinOp, RedOp};
+use poot_graph_ir::{BinOp, MatmulPrecision, RedOp};
 use poot_graph_ir::{ComputedConst, Graph, Slot, SlotKey, Storage, TensorType, ValueId};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, LoraPlan, ShardError, ShardRule, Target,
@@ -56,8 +56,10 @@ fn target(backend: Backend) -> Target {
     Target::Gpu { backend, caps }
 }
 
+/// The sharded and whole graphs are compared against the numerics class tolerance, which
+/// is the exact lowering's: the policy is named, not left to the engine default.
 fn options() -> CompileOptions {
-    CompileOptions::new(CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD).with_matmul_precision(MatmulPrecision::Exact)
 }
 
 fn devices() -> Vec<DeviceId> {

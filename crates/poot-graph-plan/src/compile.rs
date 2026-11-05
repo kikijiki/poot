@@ -204,7 +204,7 @@ impl CompileOptions {
     }
 
     /// These options narrowing operands as `policy` says.
-    pub fn with_matmul_precision(mut self, policy: MatmulPrecision) -> Self {
+    pub const fn with_matmul_precision(mut self, policy: MatmulPrecision) -> Self {
         self.matmul_precision = policy;
         self
     }
@@ -1508,7 +1508,8 @@ mod tests {
         }
     }
 
-    const REPLAY: CompileOptions = CompileOptions::new(crate::CompileLimits::STANDARD);
+    const REPLAY: CompileOptions = CompileOptions::new(crate::CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
 
     fn refusal(result: Result<Program, CompileError>, what: &str) -> Refusal {
         match result {

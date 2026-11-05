@@ -25,7 +25,7 @@ The command-line options of `poot-serve`. Every setting is a flag: no environmen
 | `--max-seq N` | `4096` | Positions per sequence, or tokens per text of an embedding or reranking model, capped at the model's own limit. At least 1. |
 | `--expert-pool ROWS` | off | Page every routed expert table through a pool of `ROWS` resident rows per layer. |
 | `--kv-dtype DTYPE` | model's preference, else `f16` | What the KV cache stores: `f16`, `bf16` or `f32` (the exact reference, twice the bytes). Attention computes in f32 either way. See [KV cache storage dtype](../architecture/attention.mdx#storage-dtype). |
-| `--matmul-precision POLICY` | `exact` | How contraction and attention operands are read: `exact` (as the graph declares them), `narrow` (rounded to the target's matrix-unit dtype where it has one, accumulated in f32) or `split` (high and low parts of that dtype, near-f32 accuracy). A target with no matrix unit runs `exact` whichever is asked. See [Operand precision](../architecture/graph-ir.mdx#operand-precision). |
+| `--matmul-precision POLICY` | `narrow` | How contraction and attention operands are read: `exact` (as the graph declares them), `narrow` (rounded to the target's matrix-unit dtype where it has one, accumulated in f32) or `split` (high and low parts of that dtype, near-f32 accuracy). A target with no matrix unit runs `exact` whichever is asked; pass `exact` for the graph's own precision. See [Operand precision](../architecture/graph-ir.mdx#operand-precision). |
 
 Refusals at startup:
 

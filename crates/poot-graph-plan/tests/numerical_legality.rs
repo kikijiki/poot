@@ -15,7 +15,9 @@ use poot_tensor::HostTensor;
 /// back, inlined at each call site below rather than kept behind a renamed `eval_all` shim - the
 /// deleted convenience's call shape (`env[value_id]` as `&Tensor`), rebuilt from
 /// `eval(..).environment` plus `Value::into_dense`.
-const OPTIONS: CompileOptions = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
+/// Bitwise corner corpora and literal-shape assertions hold under the exact lowering, never the narrow default.
+const OPTIONS: CompileOptions = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+    .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
 
 fn target(backend: Backend) -> Target {
     Target::Gpu {

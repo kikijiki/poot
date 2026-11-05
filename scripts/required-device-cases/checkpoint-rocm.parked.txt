@@ -1,0 +1,4 @@
+# Parked rows of `just test-checkpoint-rocm`: binary_id<TAB>test_name<TAB>reason. A parked row is measured and does not pass
+# yet; the test is #[ignore]d with the same reason, the lane does not run it, and the reason names the card that
+# makes it pass (scripts/check-required-cases.py). When that card lands, the row moves back to checkpoint-rocm.txt.
+poot-llm	driver::narrow_gate_tests::rocm_bf16::gemma_3_1b_it	POOT-1463: with the driver's f16 KV cache traced (the production program) the bf16 shift on ROCm is 3.87 > 2.1 and the mean KL 1.2e-3 > 1e-3 (gfx1151; 1.26 with the f32-cache trace it was recorded on): the Gemma 3 bf16 rounding-boundary amplification parked on PTX by POOT-1459; f16 (the ROCm default) passes at 0.40

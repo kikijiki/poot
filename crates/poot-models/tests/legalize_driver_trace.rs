@@ -43,6 +43,7 @@ fn caps(max_buffer_bytes: u64) -> DeviceCaps {
 
 fn options() -> CompileOptions {
     CompileOptions::new(CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact)
 }
 
 /// `graph` compiled for `target` on one device, through the production entry that hosts the embed gather.

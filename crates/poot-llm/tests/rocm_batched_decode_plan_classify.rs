@@ -63,6 +63,7 @@ fn rocm_batched_decode_plan_classify_qwen2_n_slots_2() {
         &g,
         backend,
         &poot_test_util::device_caps::default_caps_for(backend),
+        poot_graph_ir::MatmulPrecision::Exact,
     )
     .unwrap();
     let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();

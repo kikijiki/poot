@@ -520,7 +520,8 @@ fn differs(a: &Reference, b: &Reference) -> bool {
 // ---------------------------------------------------------------------------------------------
 
 fn options() -> DriverOptions {
-    let compile = CompileOptions::new(CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
     DriverOptions {
         kv_dtype: None,
         prefill: compile.clone(),
@@ -535,7 +536,7 @@ fn options() -> DriverOptions {
         charge: program_retention,
         draft: DraftPolicy::Off,
         hidden_window: None,
-        matmul_precision: None,
+        matmul_precision: Some(poot_graph_ir::MatmulPrecision::Exact),
     }
 }
 

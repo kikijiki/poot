@@ -163,7 +163,7 @@ pub(crate) struct ServeConfig {
     pub(crate) kv_dtype: Option<KvDtype>,
     /// How contraction and attention operands are read: `exact` (as the graph declares them), `narrow` (rounded
     /// to the target's matrix-unit dtype where it has one, accumulated in f32) or `split` (hi + lo parts of that
-    /// dtype, near-f32 accuracy). Without it the engine default applies. A target with no matrix unit runs
+    /// dtype, near-f32 accuracy). Without it the engine default (`narrow`) applies. A target with no matrix unit runs
     /// `exact` whichever is asked.
     #[arg(long, value_name = "POLICY", value_parser = parse_matmul_precision)]
     pub(crate) matmul_precision: Option<MatmulPrecision>,

@@ -5,7 +5,8 @@
 //! The choice reads the equation's operand precision, the target's matrix units and the shapes, and nothing else.
 
 use poot_graph_ir::{
-    AttentionAttrs, Builder, FragmentDtype, Graph, OpKind, Operand, OperandPrecision, TensorType,
+    AttentionAttrs, Builder, FragmentDtype, Graph, MatmulPrecision, OpKind, Operand,
+    OperandPrecision, TensorType,
 };
 use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Program, Target, compile};
 use poot_kernelgen::{
@@ -93,8 +94,12 @@ fn attention_of(precision: OperandPrecision, hq: usize, d: usize) -> Graph {
     b.finish(out).unwrap()
 }
 
+/// `g` compiled under the exact policy: each graph declares its own per-equation precision, which the narrow
+/// policy would otherwise override.
 fn compiled(g: &Graph, target: &Target) -> Program {
-    compile(g, target, &CompileOptions::new(CompileLimits::STANDARD)).expect("the graph compiles")
+    let options =
+        CompileOptions::new(CompileLimits::STANDARD).with_matmul_precision(MatmulPrecision::Exact);
+    compile(g, target, &options).expect("the graph compiles")
 }
 
 /// The attention kernel request behind the plan's one attention equation.

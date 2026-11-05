@@ -178,6 +178,23 @@ fn declared_attention_precision_matches_the_oracle_on_rocm() {
     }
 }
 
+/// POOT-1455 on rocm: an f16 attention reads its query row-scaled, so a query past f16's range gives a finite output
+/// on the oracle, and an in-range query bit for bit the unguarded f16 attention's
+/// (`poot_executor_parity::attention_f16_range`). Mutation: in `emit_score` ignore `row_scale`; the past-range rows
+/// score at the wrong temperature and leave the oracle.
+#[test]
+fn the_attention_f16_range_guard_holds_on_rocm() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::attention_f16_range::run_past_range(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+    poot_executor_parity::attention_f16_range::run_in_range_identity(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
 /// Card 736: the ALiBi attention BLOOM and MPT trace (`alibi_mask_from_pos` over a
 /// `ComputedConst::AlibiSlopes` of 6 heads, decode at three positions and a 4-token prefill), compiled for
 /// ROCm, matches `eval(g)` at every replayed step (ADR-0101 tier 1) AND an f64 reference that writes the

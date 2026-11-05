@@ -1561,7 +1561,8 @@ pub(crate) mod oracle {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
         )
         .unwrap_or_else(|e| panic!("hosted compile: {e}"));
         let stages: Vec<&Graph> = program

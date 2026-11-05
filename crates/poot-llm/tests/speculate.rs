@@ -331,7 +331,8 @@ impl Executor for Counting {
 }
 
 fn options(draft: DraftPolicy) -> DriverOptions {
-    let compile = CompileOptions::new(CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
     DriverOptions {
         kv_dtype: None,
         prefill: compile.clone(),
@@ -346,7 +347,7 @@ fn options(draft: DraftPolicy) -> DriverOptions {
         charge: program_retention,
         draft,
         hidden_window: None,
-        matmul_precision: None,
+        matmul_precision: Some(poot_graph_ir::MatmulPrecision::Exact),
     }
 }
 

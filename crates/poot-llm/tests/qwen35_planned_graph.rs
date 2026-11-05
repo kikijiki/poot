@@ -117,6 +117,7 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_lm_head_weight() {
         &traced,
         Backend::SpirvVulkan,
         &poot_test_util::device_caps::default_caps_for(Backend::SpirvVulkan),
+        poot_graph_ir::MatmulPrecision::Exact,
     )
     .unwrap();
 
@@ -204,6 +205,7 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_embedding_table() {
         &traced,
         Backend::SpirvVulkan,
         &poot_test_util::device_caps::default_caps_for(Backend::SpirvVulkan),
+        poot_graph_ir::MatmulPrecision::Exact,
     )
     .unwrap();
 

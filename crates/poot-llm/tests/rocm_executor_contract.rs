@@ -134,7 +134,8 @@ fn decode_staged(
                 poot_graph_plan::multi_device::topology::DeviceId(0),
             ),
         },
-        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .unwrap()
 }

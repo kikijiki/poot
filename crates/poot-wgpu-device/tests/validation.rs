@@ -41,7 +41,8 @@ fn staged(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("compile the validation graph")
 }
@@ -377,7 +378,8 @@ fn wgpu_validation_prefill_refuses_noncanonical_witness_at_compile_staged() {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect_err("a noncanonical witness must be refused at compile_staged");
     match error {
@@ -660,7 +662,8 @@ fn wgpu_live_attention_two_byte_branches_are_a_typed_refusal() {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
         );
         let Err(StagedCompileError::Compile(CompileError::Plan(error))) = refused else {
             panic!("{dtype:?}: the two-byte select must be refused, got {refused:?}");

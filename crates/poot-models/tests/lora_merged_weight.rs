@@ -28,6 +28,7 @@ fn target() -> Target {
 
 fn options() -> CompileOptions {
     CompileOptions::new(CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact)
 }
 
 /// Deterministic fill in [-1, 1) keyed by `seed`.

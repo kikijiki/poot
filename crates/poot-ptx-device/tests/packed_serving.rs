@@ -112,7 +112,8 @@ fn compiled_graph(ptx: &PtxDevice, graph: &Graph) -> Graph {
     compile(
         graph,
         &target(ptx),
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("compile the packed graph")
     .graph()

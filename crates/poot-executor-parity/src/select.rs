@@ -423,7 +423,8 @@ pub fn assert_two_byte_select_is_refused(target: Target) {
         let refused = poot_graph_plan::compile(
             &fixture.graph,
             &target,
-            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
         );
         let Err(CompileError::Plan(error)) = refused else {
             panic!("{}: the two-byte select must be refused", fixture.name);

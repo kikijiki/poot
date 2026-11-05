@@ -44,7 +44,8 @@ fn qwen2_5_0_5b_decode() -> poot_graph_ir::Graph {
 #[test]
 fn the_tied_head_decode_runs_the_bf16_gemv_over_bf16_resident_weight() {
     let graph = qwen2_5_0_5b_decode();
-    let options = CompileOptions::new(CompileLimits::STANDARD);
+    let options = CompileOptions::new(CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
     for backend in [Backend::SpirvVulkan, Backend::AmdGcn(AmdArch::gfx1151())] {
         let target = Target::Gpu {
             backend,

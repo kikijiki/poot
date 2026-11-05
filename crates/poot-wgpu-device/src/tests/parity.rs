@@ -571,3 +571,20 @@ fn the_f16_range_guard_holds_on_wgpu() {
     poot_executor_parity::f16_range_guard::run_in_range_identity(exec.as_mut(), t)
         .unwrap_or_else(|e| panic!("{e}"));
 }
+
+/// POOT-1455 on wgpu: an f16 attention reads its query row-scaled, so a query past f16's range gives a finite output
+/// on the oracle, and an in-range query bit for bit the unguarded f16 attention's
+/// (`poot_executor_parity::attention_f16_range`). Mutation: in `emit_score` ignore `row_scale`; the past-range rows
+/// score at the wrong temperature and leave the oracle.
+#[test]
+fn the_attention_f16_range_guard_holds_on_wgpu() {
+    let Some(device) = wgpu() else {
+        return;
+    };
+    let t = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::attention_f16_range::run_past_range(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+    poot_executor_parity::attention_f16_range::run_in_range_identity(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+}

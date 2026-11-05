@@ -66,7 +66,8 @@ fn planned_split(fixture: &ScanFixture, target: &Target) -> usize {
     let program = compile(
         &fixture.graph().graph,
         target,
-        &CompileOptions::new(CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("the scan compiles");
     let (eqn, _) = program

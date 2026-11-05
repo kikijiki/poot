@@ -103,7 +103,8 @@ fn compile(g: &Graph, target: Target, devices: DevicePlacement) -> StagedProgram
             experts: ExpertPlacement::AllResident,
             devices,
         },
-        &CompileOptions::new(CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .unwrap_or_else(|error| panic!("compile_staged: {error}"))
 }

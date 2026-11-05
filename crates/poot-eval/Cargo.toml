@@ -25,6 +25,7 @@ poot-quant = { workspace = true, features = ["test-support"] }
 poot-weights = { workspace = true, features = ["test-support"] }
 poot-tensor = { workspace = true, features = ["test-support"] }
 libm.workspace = true
+rayon.workspace = true
 # `fill`, the seeded fill the live-attention fixture draws its operands from; present only under `test-support`.
 poot-test-util = { workspace = true, optional = true }
 thiserror.workspace = true

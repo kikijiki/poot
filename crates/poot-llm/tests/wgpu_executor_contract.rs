@@ -139,7 +139,8 @@ fn staged(g: &Graph, target: Target) -> poot_graph_plan::staged::StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .unwrap()
 }
@@ -1413,7 +1414,8 @@ fn planted_bad_validation_packet_fails_before_any_output_readback() {
                 poot_graph_plan::multi_device::topology::DeviceId(0),
             ),
         },
-        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .unwrap();
 

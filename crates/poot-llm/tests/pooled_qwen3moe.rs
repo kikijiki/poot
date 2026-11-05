@@ -100,7 +100,8 @@ fn write_checkpoint(
 }
 
 fn options() -> DriverOptions {
-    let compile = CompileOptions::new(CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
     DriverOptions {
         kv_dtype: None,
         prefill: compile.clone(),
@@ -115,7 +116,7 @@ fn options() -> DriverOptions {
         charge: program_retention,
         draft: poot_llm::driver::DraftPolicy::Off,
         hidden_window: None,
-        matmul_precision: None,
+        matmul_precision: Some(poot_graph_ir::MatmulPrecision::Exact),
     }
 }
 
@@ -242,7 +243,8 @@ fn pooled_qwen3moe_stages_run_the_contraction_and_pointwise_passes() {
                     experts,
                     devices: DevicePlacement::Single(device),
                 },
-                &CompileOptions::new(CompileLimits::STANDARD),
+                &CompileOptions::new(CompileLimits::STANDARD)
+                    .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
             )
             .unwrap_or_else(|e| panic!("{label}: {FAMILY} compiles: {e}"))
         };

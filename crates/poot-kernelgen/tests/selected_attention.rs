@@ -54,6 +54,7 @@ fn interpret(
         },
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
+        query: kg::AttentionQueryScale::Absent,
         schedule: match splits {
             None => kg::AttentionSchedule::Streaming { lanes },
             Some(splits) => kg::AttentionSchedule::SplitKv { lanes, splits },
@@ -336,6 +337,7 @@ fn the_kernel_lowers_to_spirv_and_ptx() {
             },
             bound: kg::KeyBound::Static,
             sink: kg::AttentionSink::Absent,
+            query: kg::AttentionQueryScale::Absent,
             schedule: kg::AttentionSchedule::Streaming { lanes: 64 },
             precision: poot_graph_ir::OperandPrecision::Exact,
         };

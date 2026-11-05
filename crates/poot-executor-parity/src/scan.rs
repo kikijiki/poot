@@ -30,7 +30,8 @@ use poot_test_util::assert_close_scaled;
 /// The oracle's evaluation of a graph over bound host tensors: its one output.
 pub type Oracle<'a> = dyn Fn(&Graph, &HashMap<ValueId, HostTensor>) -> HostTensor + 'a;
 
-const OPTIONS: CompileOptions = CompileOptions::new(CompileLimits::STANDARD);
+const OPTIONS: CompileOptions = CompileOptions::new(CompileLimits::STANDARD)
+    .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
 
 /// The scan `whole` stepped in pieces of `piece` positions through one entry of `target` and assembled into the one packed result a single step over the
 /// whole sequence has: per head, the `y` rows of every piece then the last piece's state rows.  The pieces are not

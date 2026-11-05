@@ -776,7 +776,8 @@ fn backends() -> [Backend; 3] {
     ]
 }
 
-const REPLAY: CompileOptions = CompileOptions::new(CompileLimits::STANDARD);
+const REPLAY: CompileOptions = CompileOptions::new(CompileLimits::STANDARD)
+    .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
 
 /// The traced and weight-bound graph of one step of `tokens` tokens.
 fn bound_step(model: &dyn Model, tokens: usize) -> poot_graph_ir::Graph {

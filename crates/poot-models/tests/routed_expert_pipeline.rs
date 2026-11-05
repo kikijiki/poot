@@ -21,7 +21,8 @@ fn wgpu() -> Target {
     }
 }
 
-const REPLAY: CompileOptions = CompileOptions::new(CompileLimits::STANDARD);
+const REPLAY: CompileOptions = CompileOptions::new(CompileLimits::STANDARD)
+    .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
 
 /// The first step of the granitemoe registry fixture (two routed layers, four experts) at
 /// `tokens` tokens: the production family's own trace, not a hand-built graph.

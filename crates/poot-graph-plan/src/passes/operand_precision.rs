@@ -7,8 +7,9 @@
 //! What the planner then makes of a narrowed op (a fragment micro-tile, a scalar micro-tile, a GEMV) is the
 //! planner's business; every schedule computes the same declared rounding.
 //!
-//! A contraction narrowed to f16 reads its activation row-scaled (POOT-1457, [`emit_row_scaled`]), so the
-//! rounding cannot overflow whatever the data (`receipts/1457-f16-range-guard/design.md`).
+//! A contraction narrowed to f16 reads its activation row-scaled (POOT-1457, [`emit_row_scaled`]), and an attention
+//! narrowed to f16 its query (POOT-1455, [`emit_query_scaled`]), so no rounding to f16 can overflow whatever the
+//! data (`receipts/1457-f16-range-guard/design.md`, `receipts/1455-attention-f16-range/design.md`).
 
 use std::collections::HashMap;
 
@@ -17,7 +18,8 @@ use poot_graph_ir::graph::{
 };
 use poot_graph_ir::op::{BinOp, ContractionHead, OpKind, RedOp, UnOp};
 use poot_graph_ir::{
-    FragmentDtype, MatmulPrecision, OperandPrecision, Scalar, TensorType, ValueId,
+    FragmentDtype, KeyLayout, MatmulPrecision, OperandPrecision, QueryScale, Scalar, TensorType,
+    ValueId,
 };
 use poot_target::{DeviceCaps, FragmentShape, MatrixUnits};
 
@@ -104,7 +106,11 @@ pub(crate) fn select_operand_precision(
             .with_operand_precision(policy.operand_precision(dtype));
         match guard {
             Some(F16Guard::RowScale) if dtype == FragmentDtype::F16 => {
-                emit_row_scaled(&mut edit, &mut eqns, &mut scaled, eqn);
+                if is_attention(&eqn.op) {
+                    emit_query_scaled(&mut edit, &mut eqns, &mut scaled, eqn);
+                } else {
+                    emit_row_scaled(&mut edit, &mut eqns, &mut scaled, eqn);
+                }
             }
             _ => eqns.push(eqn),
         }
@@ -122,8 +128,15 @@ const F16_MAX: f32 = 65504.0;
 enum F16Guard {
     /// The activation is stored f16 already: narrowing it rounds nothing.
     Stored,
-    /// The f32 activation is read row-scaled ([`emit_row_scaled`]).
+    /// The f32 activation is read row-scaled ([`emit_row_scaled`]), or an attention's f32 query
+    /// ([`emit_query_scaled`]).
     RowScale,
+    /// The attention's query arrives row-scaled already: its graph carries the query scale.
+    QueryScaled,
+}
+
+fn is_attention(op: &OpKind) -> bool {
+    matches!(op, OpKind::Attention(_) | OpKind::SelectedAttention(_))
 }
 
 /// The values a pass may treat as weights: values fixed before the program runs. That is bound bytes
@@ -169,7 +182,23 @@ impl Weights {
 ///   the per-row scale `[.., M, 1]` multiplies the f32 result back ([`F16Guard::RowScale`]). A bf16 activation
 ///   would be rounded in bf16 by the scaling itself, and an activation whose rows are not the result's (a
 ///   broadcast batch) cannot take the scale back; neither is guarded.
+/// - An attention's f32 query is read row-scaled ([`emit_query_scaled`], POOT-1455), or arrives so already
+///   ([`F16Guard::QueryScaled`]). Its keys and values are not scaled: [`fragment_dtype`] takes f16 for an
+///   attention only where they are stored f16, so they enter its products exactly. The probabilities lie in
+///   `[0, 1]`.
 fn f16_guard(g: &Graph, eqn: &Eqn, weights: &Weights) -> Option<F16Guard> {
+    let query_scale = match &eqn.op {
+        OpKind::Attention(attrs) => Some(attrs.query),
+        OpKind::SelectedAttention(attrs) => Some(attrs.query),
+        _ => None,
+    };
+    if let Some(query_scale) = query_scale {
+        return match (query_scale, value_dtype(g, eqn, 0)?) {
+            (QueryScale::PerRow, _) => Some(F16Guard::QueryScaled),
+            (QueryScale::Absent, DType::F32) => Some(F16Guard::RowScale),
+            (QueryScale::Absent, _) => None,
+        };
+    }
     if !matches!(
         eqn.op,
         OpKind::MatMul { .. }
@@ -229,11 +258,67 @@ fn emit_row_scaled(
     scaled: &mut HashMap<ValueId, (ValueId, ValueId)>,
     mut eqn: Eqn,
 ) {
+    let (s, x_scaled) = row_scale(edit, eqns, scaled, &eqn);
+    eqn.inputs[0] = Operand::Value(x_scaled);
+    // The contraction writes a fresh value and the multiply writes the original result, so every reader keeps it.
+    let layer = eqn.layer;
+    let result = eqn.out;
+    let result_type = edit.aval(result).clone();
+    let product = edit
+        .values_mut()
+        .push(ValueMeta::new(result_type, Storage::Device, None));
+    eqn.out = product;
+    eqns.push(eqn);
+    eqns.push(Eqn {
+        op: OpKind::Binary(BinOp::Mul),
+        inputs: vec![Operand::Value(product), Operand::Value(s)],
+        out: result,
+        layer,
+    });
+}
+
+/// Push attention `eqn` reading its query `q [B,Hq,Lq,D]` row-scaled, with the scale as its last operand
+/// ([`QueryScale::PerRow`]):
+///
+/// ```text
+/// s     = max(rowmax(max(q, -q)) / 65504, 1)                 [B,Hq,Lq,1]
+/// score = ((q / s) . k) * s * scale
+/// ```
+///
+/// The scale is [`emit_row_scaled`]'s, by the same steps; only where it is multiplied back differs. The attention's
+/// scores feed its softmax inside the op, so the op multiplies each row's raw products by `s` itself, before its
+/// score scale (`ops::attention_over_keys`, and every attention kernel). A row in range has `s` exactly 1 and
+/// computes bit for bit what it would without the scale (`receipts/1455-attention-f16-range/design.md`).
+fn emit_query_scaled(
+    edit: &mut GraphEdit,
+    eqns: &mut Vec<Eqn>,
+    scaled: &mut HashMap<ValueId, (ValueId, ValueId)>,
+    mut eqn: Eqn,
+) {
+    let (s, q_scaled) = row_scale(edit, eqns, scaled, &eqn);
+    eqn.inputs[0] = Operand::Value(q_scaled);
+    eqn.inputs.push(Operand::Value(s));
+    match &mut eqn.op {
+        OpKind::Attention(attrs) => attrs.query = QueryScale::PerRow,
+        OpKind::SelectedAttention(attrs) => attrs.query = QueryScale::PerRow,
+        op => unreachable!("emit_query_scaled scales an attention's query only, not {op:?}"),
+    }
+    eqns.push(eqn);
+}
+
+/// Push the steps that scale `eqn`'s operand 0, `x [.., M, K]`, by its rows, and return the scale `s [.., M, 1]`
+/// and the scaled `x / s`. An operand already scaled reuses its steps.
+fn row_scale(
+    edit: &mut GraphEdit,
+    eqns: &mut Vec<Eqn>,
+    scaled: &mut HashMap<ValueId, (ValueId, ValueId)>,
+    eqn: &Eqn,
+) -> (ValueId, ValueId) {
     let layer = eqn.layer;
     let Operand::Value(x) = eqn.inputs[0] else {
-        unreachable!("f16_guard scales a value activation only");
+        unreachable!("f16_guard scales a value operand only");
     };
-    let (s, x_scaled) = *scaled.entry(x).or_insert_with(|| {
+    *scaled.entry(x).or_insert_with(|| {
         let shape = edit.aval(x).shape.clone();
         let mut rows = shape.clone();
         let axis = rows.len() - 1;
@@ -283,22 +368,7 @@ fn emit_row_scaled(
             &shape,
         );
         (s, x_scaled)
-    });
-    eqn.inputs[0] = Operand::Value(x_scaled);
-    // The contraction writes a fresh value and the multiply writes the original result, so every reader keeps it.
-    let result = eqn.out;
-    let result_type = edit.aval(result).clone();
-    let product = edit
-        .values_mut()
-        .push(ValueMeta::new(result_type, Storage::Device, None));
-    eqn.out = product;
-    eqns.push(eqn);
-    eqns.push(Eqn {
-        op: OpKind::Binary(BinOp::Mul),
-        inputs: vec![Operand::Value(product), Operand::Value(s)],
-        out: result,
-        layer,
-    });
+    })
 }
 
 /// The fragment dtype `eqn`'s products run in on `units`, or `None` when no unit admits the equation. `guarded`
@@ -312,9 +382,11 @@ fn emit_row_scaled(
 ///   at bind (`receipts/1458-f16-rounding/design.md` section 6). An operand stored as f16 forces f16 (rounding it
 ///   to bf16 would lose bits it holds), and an unguarded contraction takes bf16 where there is a unit, else stays
 ///   exact.
-/// - Attention takes the dtype its keys are stored in when the target has a fragment for it (f16 is the default
-///   KV dtype), so K and V enter exactly and only Q and P round. A bf16 cache takes bf16 where there is a unit
-///   and f16 otherwise; an f32 cache takes f16. Its range is POOT-1455's.
+/// - Attention takes f16 when its keys and values are stored f16 (the default KV dtype) and its query is guarded
+///   ([`f16_guard`]): K and V enter exactly, Q is row-scaled, and P lies in `[0, 1]`, so no operand can overflow
+///   (POOT-1455). A bf16 or f32 cache takes bf16, whose range is f32's: rounding a key or value it holds to f16
+///   could overflow, and nothing scales them (`receipts/1455-attention-f16-range/design.md`). So on a target with
+///   f16 fragments alone (RADV) such an attention stays exact.
 fn fragment_dtype(
     g: &Graph,
     eqn: &Eqn,
@@ -323,10 +395,17 @@ fn fragment_dtype(
 ) -> Option<FragmentDtype> {
     use FragmentDtype::{Bf16, F16};
     let candidates: &[FragmentDtype] = match &eqn.op {
-        OpKind::Attention(_) | OpKind::SelectedAttention(_) => match value_dtype(g, eqn, 1)? {
-            DType::BF16 => &[Bf16, F16],
-            _ => &[F16],
-        },
+        OpKind::Attention(_) | OpKind::SelectedAttention(_) => {
+            let stored = key_value_dtypes(g, eqn)?;
+            let all = |dtype: DType| stored.iter().all(|&d| d == dtype);
+            if all(DType::F16) {
+                if guarded { &[F16] } else { &[] }
+            } else if all(DType::BF16) || all(DType::F32) {
+                &[Bf16]
+            } else {
+                &[]
+            }
+        }
         _ => {
             let operands = contraction_operands(g, eqn)?;
             match (guarded, operands.contains(&DType::F16)) {
@@ -358,6 +437,18 @@ fn contraction_operands(g: &Graph, eqn: &Eqn) -> Option<Vec<DType>> {
         .iter()
         .all(|dtype| matches!(dtype, DType::F32 | DType::BF16 | DType::F16))
         .then_some(dtypes)
+}
+
+/// The dtypes an attention's keys and values are stored in: the key, the value and a split key's shared part
+/// (a paged key's operand 4 is its I32 slot map).
+fn key_value_dtypes(g: &Graph, eqn: &Eqn) -> Option<Vec<DType>> {
+    let shared =
+        matches!(&eqn.op, OpKind::Attention(attrs) if matches!(attrs.key, KeyLayout::Split { .. }));
+    let positions: &[usize] = if shared { &[1, 2, 4] } else { &[1, 2] };
+    positions
+        .iter()
+        .map(|&position| value_dtype(g, eqn, position))
+        .collect()
 }
 
 /// The head a bare contraction equation stands for.

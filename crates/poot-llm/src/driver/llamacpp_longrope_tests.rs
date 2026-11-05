@@ -74,7 +74,9 @@ const LONG_CTX: usize = 6144;
 /// Windows scored in the short regime on the device (the corpus holds five).
 const SHORT_WINDOWS: usize = 5;
 
-/// Windows the CPU oracle scores: one is about half an hour on a single thread, five are hours.
+/// Windows the CPU oracle scores: one is about five minutes (POOT-1406: row-parallel matmul on 16 threads, the
+/// oracle crate optimized in the dev profile; the Phi-4-mini 128-token window measured 265 s), five are
+/// half an hour.
 const ORACLE_WINDOWS: usize = 1;
 
 /// Windows scored in the long regime: one, since a window is a 6144-token prefill on the CPU.
@@ -210,7 +212,8 @@ fn required() -> bool {
 /// Which engine computes poot's logits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Engine {
-    /// The CPU oracle: f32 activations, the strict reference, a single thread.
+    /// The CPU oracle: f32 activations, the strict reference (its matmul is row-parallel and bit-identical to the
+    /// serial loop).
     Oracle,
     /// The ROCm executor on the local GPU. The caller holds `/tmp/poot-gpu.lock`.
     Rocm,
@@ -408,7 +411,7 @@ fn short_row(models: (Checkpoint, Checkpoint), engine: Engine, windows: usize, n
 }
 
 #[test]
-#[ignore = "loads Phi-4-mini (bf16, 3.8B) on the CPU oracle, about half an hour; the checkpoint lane runs it by name"]
+#[ignore = "loads Phi-4-mini (bf16, 3.8B) on the CPU oracle, about five minutes; the checkpoint lane runs it by name"]
 fn phi_4_mini_short_window_follows_llamacpp() {
     short_row(
         PHI_4_MINI,
@@ -444,7 +447,7 @@ fn phi_3_5_mini_short_window_follows_llamacpp_rocm() {
 /// same tokens. Both run f32 activations; the device differs in accumulation order and in how it reads the
 /// bf16 weights.
 #[test]
-#[ignore = "needs the ROCm device and /tmp/poot-gpu.lock; one CPU-oracle window (~30 min) plus the device; the checkpoint-rocm lane runs it by name"]
+#[ignore = "needs the ROCm device and /tmp/poot-gpu.lock; one CPU-oracle window (~5 min) plus the device; the checkpoint-rocm lane runs it by name"]
 fn phi_4_mini_short_window_rocm_matches_the_cpu_oracle() {
     let (Some(hf), Some(gguf)) = (
         poot_test_util::model_path(PHI_4_MINI.0),

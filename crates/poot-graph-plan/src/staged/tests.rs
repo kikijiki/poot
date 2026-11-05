@@ -25,8 +25,11 @@ fn target() -> Target {
     }
 }
 
+/// The staged programs below are compared bit for bit against the evaluator, which only the exact lowering
+/// reproduces.
 pub(super) fn options() -> CompileOptions {
     CompileOptions::new(CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact)
 }
 
 fn partition(devices: DevicePlacement) -> Partition {
@@ -967,6 +970,7 @@ fn a_block_selected_cache_is_counted_at_its_selected_positions() {
             softcap: None,
             ratio: 4,
             k: 2,
+            query: poot_graph_ir::QueryScale::Absent,
             precision: poot_graph_ir::OperandPrecision::Exact,
         },
         [q, k, v, ids, pos],

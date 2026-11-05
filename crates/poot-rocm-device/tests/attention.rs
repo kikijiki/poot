@@ -113,7 +113,8 @@ fn check_operands(
     let program = compile(
         graph,
         &target,
-        &CompileOptions::new(CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .unwrap_or_else(|e| panic!("{name}: the attention graph compiles for ROCm: {e}"));
     let (eqn, _) = program
@@ -462,7 +463,8 @@ fn deepseek_v2_mla_split_key_decode_matches_the_oracle_on_rocm() {
     let program = compile(
         &graph,
         &target,
-        &CompileOptions::new(CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("the MLA graph compiles for ROCm");
     let (eqn, _) = program

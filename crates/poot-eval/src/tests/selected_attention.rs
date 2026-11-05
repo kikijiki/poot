@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use poot_graph_ir::test_support::composites;
 use poot_graph_ir::test_support::selected_attention::{Case, cases, fill};
 use poot_graph_ir::{
-    Builder, Outputs, SelectedAttentionAttrs, ShapeError, TensorType, ValueId, ops,
+    Builder, Outputs, QueryScale, SelectedAttentionAttrs, ShapeError, TensorType, ValueId, ops,
 };
 use poot_tensor::{DType, HostTensor};
 
@@ -27,6 +27,7 @@ fn attrs(case: &Case) -> SelectedAttentionAttrs {
         softcap: None,
         ratio: case.ratio,
         k: case.k,
+        query: QueryScale::Absent,
         precision: poot_graph_ir::OperandPrecision::Exact,
     }
 }
@@ -191,6 +192,7 @@ fn the_typing_rule_refuses_what_it_cannot_read() {
         softcap: None,
         ratio: 4,
         k: 3,
+        query: QueryScale::Absent,
         precision: poot_graph_ir::OperandPrecision::Exact,
     };
     let ok = [

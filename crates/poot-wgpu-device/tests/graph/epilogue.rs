@@ -99,7 +99,8 @@ fn compiled(g: &poot_graph_ir::Graph, target: &Target) -> poot_graph_plan::Progr
     compile(
         g,
         target,
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("the graph compiles")
 }
@@ -392,7 +393,8 @@ fn a_narrow_head_is_refused_by_name_on_wgpu() {
     let Err(error) = poot_graph_plan::compile(
         &g,
         &spirv_fixture_target(),
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     ) else {
         panic!("a bf16 head must not plan on wgpu");
     };

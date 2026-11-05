@@ -140,7 +140,8 @@ fn gemma2_geglu_fused_decode_matches_the_cpu_oracle_ptx() {
     let fused = compile(
         &g,
         &target,
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("compile the gemma2 GeGLU decode graph, full pipeline");
     assert!(

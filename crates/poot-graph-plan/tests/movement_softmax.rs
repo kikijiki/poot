@@ -431,7 +431,8 @@ fn compile_chooses_the_generated_tiled_gemm_for_m_over_one_only() {
     use poot_kernelgen::{ContractionSpec, KernelRequest};
     use poot_target::{AmdArch, Backend};
 
-    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let target = Target::Gpu {
         backend,

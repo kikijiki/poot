@@ -86,35 +86,59 @@ path = "results.xml"
 report-name = "device-l0"
 store-success-output = true
 
+# A checkpoint row that outlives its budget is killed: the box-wide GPU lock is held for the whole lane, so a row
+# stuck on a CPU oracle or a hung device would block every other lane (POOT-1406: one row held it for ~80 min).
+# The budget is `period x terminate-after`: an hour for a checkpoint row, two for a large one.
+[profile.device-checkpoint-wgpu]
+slow-timeout = { period = "15m", terminate-after = 4 }
+
 [profile.device-checkpoint-wgpu.junit]
 path = "results.xml"
 report-name = "device-checkpoint-wgpu"
 store-success-output = true
+
+[profile.device-checkpoint-rocm]
+slow-timeout = { period = "15m", terminate-after = 4 }
 
 [profile.device-checkpoint-rocm.junit]
 path = "results.xml"
 report-name = "device-checkpoint-rocm"
 store-success-output = true
 
+[profile.device-checkpoint-ptx]
+slow-timeout = { period = "15m", terminate-after = 4 }
+
 [profile.device-checkpoint-ptx.junit]
 path = "results.xml"
 report-name = "device-checkpoint-ptx"
 store-success-output = true
+
+[profile.device-checkpoint-vulkan]
+slow-timeout = { period = "15m", terminate-after = 4 }
 
 [profile.device-checkpoint-vulkan.junit]
 path = "results.xml"
 report-name = "device-checkpoint-vulkan"
 store-success-output = true
 
+[profile.device-checkpoint-large-wgpu]
+slow-timeout = { period = "15m", terminate-after = 8 }
+
 [profile.device-checkpoint-large-wgpu.junit]
 path = "results.xml"
 report-name = "device-checkpoint-large-wgpu"
 store-success-output = true
 
+[profile.device-checkpoint-large-rocm]
+slow-timeout = { period = "15m", terminate-after = 8 }
+
 [profile.device-checkpoint-large-rocm.junit]
 path = "results.xml"
 report-name = "device-checkpoint-large-rocm"
 store-success-output = true
+
+[profile.device-checkpoint-large-ptx]
+slow-timeout = { period = "15m", terminate-after = 8 }
 
 [profile.device-checkpoint-large-ptx.junit]
 path = "results.xml"

@@ -73,7 +73,8 @@ fn run_once_rocm(
                     poot_graph_plan::multi_device::topology::DeviceId(0),
                 ),
             },
-            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
         )
         .expect("compile_staged")
     };
@@ -748,7 +749,8 @@ fn i32_table_gather_is_exact_beyond_f32_rocm() {
                     poot_graph_plan::multi_device::topology::DeviceId(0),
                 ),
             },
-            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
         )
         .expect("compile_staged")
     };
@@ -1205,7 +1207,8 @@ fn sample_token_greedy_rocm_matches_cpu() {
                     poot_graph_plan::multi_device::topology::DeviceId(0),
                 ),
             },
-            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
         )
         .expect("compile_staged")
     };
@@ -1282,7 +1285,8 @@ fn random_uniform_rocm_matches_cpu() {
                     poot_graph_plan::multi_device::topology::DeviceId(0),
                 ),
             },
-            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
         )
         .expect("compile_staged")
     };
@@ -1351,7 +1355,8 @@ fn run_gumbel_family_contract_rocm(
                     poot_graph_plan::multi_device::topology::DeviceId(0),
                 ),
             },
-            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
         )
         .expect("compile_staged")
     };
@@ -1929,7 +1934,8 @@ fn run_under(
                 poot_graph_plan::multi_device::topology::DeviceId(0),
             ),
         },
-        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("compile_staged");
     let entry = engine.add_entry(exe, &staged).unwrap();
@@ -1975,7 +1981,8 @@ fn assert_fuses_into_one_epilogue(
     let fused = poot_graph_plan::compile(
         g,
         target,
-        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("the graph compiles");
     let heads: Vec<_> = fused

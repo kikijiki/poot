@@ -85,7 +85,8 @@ fn plan(graph: &Graph, target: &Target, experts: usize) -> PlanFacts {
     let program = poot_graph_plan::compile(
         graph,
         target,
-        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("the prefill compiles");
     let router_shape = [PROMPT, experts];

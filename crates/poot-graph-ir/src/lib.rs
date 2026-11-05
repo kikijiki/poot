@@ -60,8 +60,8 @@ pub use index_guard::{
 };
 pub use op::{
     AttentionAttrs, BinOp, BlockTopKAttrs, BlockTopKLayout, ContractionRows, ExpertGrouping,
-    ExpertRows, KeyLayout, KvBound, LaneId, LocalId, MaskOperand, OpClass, OpKind, RedOp,
-    ScanAttrs, ScanFamily, ScanLayout, SelectedAttentionAttrs, SelectedAttentionLayout,
+    ExpertRows, KeyLayout, KvBound, LaneId, LocalId, MaskOperand, OpClass, OpKind, QueryScale,
+    RedOp, ScanAttrs, ScanFamily, ScanLayout, SelectedAttentionAttrs, SelectedAttentionLayout,
     SinkOperand, UnOp,
 };
 #[cfg(any(test, feature = "test-support"))]

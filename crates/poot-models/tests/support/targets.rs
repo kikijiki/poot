@@ -82,7 +82,10 @@ pub(crate) fn compile_production(
     })
 }
 
-/// The compile options every reference compile uses: replayed submission under the standard limits.
+/// The compile options every reference compile uses: replayed submission under the standard limits and the exact
+/// lowering, whose plan shapes the digests and the literal launch counts record (the narrow default has its own
+/// tier-3 gates).
 pub(crate) fn options() -> CompileOptions {
     CompileOptions::new(CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact)
 }

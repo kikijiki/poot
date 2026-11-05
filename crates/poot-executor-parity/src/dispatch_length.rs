@@ -217,7 +217,8 @@ pub fn over_length_dispatch_is_refused<D: Device + 'static>(device: D) {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
     )
     .expect("the fixture compiles");
     let mut engine = Engine::new(device);

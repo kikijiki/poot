@@ -990,7 +990,12 @@ mod tests {
         for backend in backends {
             for (label, g, must_plan) in &graphs {
                 let caps = poot_test_util::device_caps::default_caps_for(backend);
-                let prepared = match compiled_graph(g, backend, &caps) {
+                let prepared = match compiled_graph(
+                    g,
+                    backend,
+                    &caps,
+                    poot_graph_ir::MatmulPrecision::Exact,
+                ) {
                     Ok(prepared) => prepared,
                     Err(crate::CompileError::Plan(error))
                         if !must_plan && matches!(*error, crate::PlanError::Refused(_)) =>
@@ -1049,6 +1054,7 @@ mod compile_preparation_tests {
                 &moe_gate_reduce_graph(),
                 backend,
                 &poot_test_util::device_caps::default_caps_for(backend),
+                poot_graph_ir::MatmulPrecision::Exact,
             )
             .unwrap();
             assert!(
@@ -1088,6 +1094,7 @@ mod compile_preparation_tests {
                 &g,
                 backend,
                 &poot_test_util::device_caps::default_caps_for(backend),
+                poot_graph_ir::MatmulPrecision::Exact,
             )
             .unwrap();
             assert_eq!(prepared.aval(weight.id()).dtype, DType::BF16, "{backend:?}");

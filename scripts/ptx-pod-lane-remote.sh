@@ -42,7 +42,26 @@ if [ -s /root/checkpoint-filter.txt ]; then
   echo
   echo ===CHECKPOINT-RESULTS-END===
 fi
+# the same-pod speed check (--speed): ABBA of the two policies on one model, decode-curve mode
+if [ -s /root/speed-model ]; then
+  mkdir -p /root/speed; chmod +x /root/poot-bench-runner; n=0
+  model=/root/models/$(cat /root/speed-model)
+  for policy in exact narrow narrow exact; do
+    n=$((n + 1))
+    /root/poot-bench-runner --backend ptx --mode decode-curve --model-dir "$model" --matmul-precision "$policy" --precision bf16 \
+      --isl-list 128,1024,4096 --osl 64 --warmup 2 --iters 5 --json \
+      > "/root/speed/$n.$policy.json" 2> "/root/speed/$n.$policy.log"; echo "speed $n $policy exit $?"
+  done
+  echo ===SPEED-BEGIN===; tar -C /root/speed -czf - . | base64 -w0; echo; echo ===SPEED-END===
+fi
 if [ -e /root/no-device-lane ]; then exit 0; fi
+if [ -e /root/two-gpu ]; then
+  nvidia-smi -L
+  POOT_REQUIRE_PTX_2GPU=1 $nx --profile device-ptx-2gpu -E "$(cat /root/selection.txt)" > /root/lane.log 2>&1; rc=$?
+  tail -300 /root/lane.log; echo "NEXTEST_EXIT=$rc"
+  echo ===RESULTS-BEGIN===; gzip -c /root/ws/target/nextest/device-ptx-2gpu/results.xml | base64 -w0; echo; echo ===RESULTS-END===
+  exit 0
+fi
 $nx --profile device-ptx -E "$(cat /root/selection.txt)" > /root/lane.log 2>&1; rc=$?
 tail -400 /root/lane.log; echo "NEXTEST_EXIT=$rc"
 # the kernels `ptx-check` runs, staged fresh for this run (the justfile's recipe does the same)

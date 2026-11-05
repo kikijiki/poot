@@ -10,6 +10,12 @@
 # sha256 there before a row runs. The checkpoint rows' results come back as
 # target/nextest/device-checkpoint-ptx/results.xml; they are a subset of the checkpoint-ptx lane, so the lane's
 # required-case gate does not judge them: a failure, an error or a skip report among them fails this script.
+# --speed MODEL runs the release poot-bench-runner on the pod in decode-curve mode over models/MODEL (a directory the
+# manifest provides), ABBA of --matmul-precision exact and narrow, and brings the raw JSON lines back as speed/. It needs
+# --models. Same-pod, same-GPU, so the ratio is the policy's.
+# --two-gpu rents a two-GPU pod and runs `test-device-ptx-2gpu` (the justfile's multi-device selection without the
+# four-way row, POOT_REQUIRE_PTX_2GPU=1) in place of the single-device lane, then its required-case gate; it excludes
+# the other modes. PTX_POD_MAX_PRICE then bounds the whole pod's hourly price.
 # --no-device-lane runs only the checkpoint rows (no `test-device-ptx`, kernelgen emit, ptx-check or gate).
 #
 # The pod has no `just`, cargo or python, so this driver builds everything here and ships it:
@@ -40,6 +46,8 @@ max_cmd=${PTX_POD_MAX_CMD:-3h}
 work=${PTX_POD_WORK:-target/ptx-pod-lane}
 disk_gb=${PTX_POD_DISK_GB:-40}
 passes=3
+speed_model=
+two_gpu=
 bank_cases=()
 models=
 checkpoint_filter=
@@ -50,23 +58,34 @@ while [ $# -gt 0 ]; do
     --passes) passes=$2; shift 2 ;;
     --models) models=$2; shift 2 ;;
     --checkpoint-filter) checkpoint_filter=$2; shift 2 ;;
+    --speed) speed_model=$2; shift 2 ;;
+    --two-gpu) two_gpu=1; device_lane=; shift ;;
     --no-device-lane) device_lane=; shift ;;
-    *) echo "usage: $0 [--bank-case ID]... [--passes N] [--models MANIFEST --checkpoint-filter FILTERSET] [--no-device-lane]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--bank-case ID]... [--passes N] [--models MANIFEST --checkpoint-filter FILTERSET] [--speed MODEL] [--no-device-lane]" >&2; exit 2 ;;
   esac
 done
 if { [ -n "$models" ] && [ -z "$checkpoint_filter" ]; } || { [ -z "$models" ] && [ -n "$checkpoint_filter" ]; }; then
   echo "--models and --checkpoint-filter go together" >&2; exit 2
 fi
-if [ -z "$device_lane" ] && [ -z "$checkpoint_filter" ]; then
+if [ -n "$two_gpu" ] && { [ -n "$models" ] || [ -n "$speed_model" ] || [ ${#bank_cases[@]} -gt 0 ]; }; then
+  echo "--two-gpu excludes --models, --speed and --bank-case" >&2; exit 2
+fi
+if [ -n "$speed_model" ] && [ -z "$models" ]; then echo "--speed needs --models" >&2; exit 2; fi
+if [ -z "$device_lane" ] && [ -z "$checkpoint_filter" ] && [ -z "$speed_model" ] && [ -z "$two_gpu" ]; then
   echo "--no-device-lane needs --checkpoint-filter: nothing would run" >&2; exit 2
 fi
 
 results=target/nextest/device-ptx/results.xml
+results_2gpu=target/nextest/device-ptx-2gpu/results.xml
 checkpoint_results=target/nextest/device-checkpoint-ptx/results.xml
 rm -rf "$work"; mkdir -p "$work/stage"
 if [ -n "$device_lane" ]; then
   scripts/check-required-cases.py --self-test
   scripts/check-required-cases.py begin ptx "$results"
+fi
+if [ -n "$two_gpu" ]; then
+  scripts/check-required-cases.py --self-test
+  scripts/check-required-cases.py begin ptx-2gpu "$results_2gpu"
 fi
 
 # the checkpoints: the `ship` files, checked here against the manifest before they leave, and the download list
@@ -101,6 +120,13 @@ if [ ${#bank_cases[@]} -gt 0 ]; then
   chmod u+w "$work/performance_bank"; patch_elf "$work/performance_bank"
 fi
 
+# 3b. the bench runner
+if [ -n "$speed_model" ]; then
+  RUSTC_WRAPPER= cargo build --release -p poot-bench-runner --bin poot-bench-runner
+  cp "${CARGO_TARGET_DIR:-target}/release/poot-bench-runner" "$work/poot-bench-runner"
+  chmod u+w "$work/poot-bench-runner"; patch_elf "$work/poot-bench-runner"
+fi
+
 # 4. the toolchain closure, at its own store paths
 rust=$(dirname "$(dirname "$(readlink -f "$(command -v rustc)")")")
 nix-store -qR "$rust" | sed 's|^/||' | tar -C / -czf "$work/toolchain.tar.gz" -T -
@@ -109,6 +135,10 @@ echo "$rust" > "$work/rust-path"
 flock -u 8
 # 5. the pod
 just --evaluate ptx_selection > "$work/selection.txt"
+if [ -n "$two_gpu" ]; then
+  echo "($(just --evaluate ptx_multi_device_selection)) & not test(/four_way/)" > "$work/selection.txt"
+  : > "$work/two-gpu"; uploads_two_gpu=(--upload "$work/two-gpu:/root/two-gpu")
+fi
 printf '%s\n' "${bank_cases[@]+"${bank_cases[@]}"}" | sed '/^$/d' > "$work/bank-cases.txt"
 echo "$passes" > "$work/bank-passes"
 git archive HEAD --format=tar.gz -o "$work/src.tar.gz"
@@ -119,25 +149,30 @@ uploads=(--upload "$work/archive.tar.zst:/root/archive.tar.zst" --upload "$work/
   --upload "$work/rust-path:/root/rust-path" --upload "$work/selection.txt:/root/selection.txt"
   --upload "$work/bank-cases.txt:/root/bank-cases.txt" --upload "$work/bank-passes:/root/bank-passes"
   --upload "$work/src.tar.gz:/root/src.tar.gz" --upload "$nextest_bin:/root/cargo-nextest"
-  --upload scripts/ptx-pod-lane-remote.sh:/root/ptx-pod-lane-remote.sh)
+  --upload scripts/ptx-pod-lane-remote.sh:/root/ptx-pod-lane-remote.sh ${uploads_two_gpu[@]+"${uploads_two_gpu[@]}"})
 [ ${#bank_cases[@]} -gt 0 ] && uploads+=(--upload "$work/performance_bank:/root/performance_bank")
 if [ -n "$models" ]; then
   printf '%s\n' "$checkpoint_filter" > "$work/checkpoint-filter.txt"
   uploads+=(--upload "$work/models.tar.gz:/root/models.tar.gz" --upload "$work/models.tsv:/root/models.tsv"
     --upload "$work/checkpoint-filter.txt:/root/checkpoint-filter.txt")
 fi
-if [ -z "$device_lane" ]; then
+if [ -n "$speed_model" ]; then
+  printf '%s\n' "$speed_model" > "$work/speed-model"
+  uploads+=(--upload "$work/poot-bench-runner:/root/poot-bench-runner" --upload "$work/speed-model:/root/speed-model")
+fi
+if [ -z "$device_lane" ] && [ -z "$two_gpu" ]; then
   : > "$work/no-device-lane"
   uploads+=(--upload "$work/no-device-lane:/root/no-device-lane")
 fi
 cargo run -q --release -p poot-orchestrator -- exec --image ghcr.io/kikijiki/poot-bench:latest --cloud secure \
-  --gpu-types "$gpu_types" --max-price-per-hour "$max_price" --max-cmd "$max_cmd" --container-disk-gb "$disk_gb" \
+  --gpu-types "$gpu_types" --max-price-per-hour "$max_price" --gpu-count "$([ -n "$two_gpu" ] && echo 2 || echo 1)" --max-cmd "$max_cmd" --container-disk-gb "$disk_gb" \
   "${uploads[@]}" --cmd 'bash /root/ptx-pod-lane-remote.sh' | tee "$work/exec.log"
 
 # 6. the results come back between markers
 extract() { sed -n "/===$1-BEGIN===/,/===$1-END===/p" "$work/exec.log" | sed '1d;$d'; }
 if [ ${#bank_cases[@]} -gt 0 ]; then mkdir -p "$work/bank"; extract BANK | base64 -d | tar -C "$work/bank" -xzf -; fi
 status=0
+if [ -n "$speed_model" ]; then mkdir -p "$work/speed"; extract SPEED | base64 -d | tar -C "$work/speed" -xzf -; fi
 if [ -n "$models" ]; then
   mkdir -p "$(dirname "$checkpoint_results")"
   extract CHECKPOINT-RESULTS | base64 -d | gunzip > "$checkpoint_results"
@@ -147,6 +182,11 @@ if [ -n "$models" ]; then
   skips=$(grep -c 'POOT-SKIP' "$checkpoint_results" || true)
   echo "checkpoint rows: $ran ran, $bad failed or errored, $skips skip reports"
   if [ "$ran" -eq 0 ] || [ "$bad" -ne 0 ] || [ "$skips" -ne 0 ]; then status=1; fi
+fi
+if [ -n "$two_gpu" ]; then
+  mkdir -p "$(dirname "$results_2gpu")"
+  extract RESULTS | base64 -d | gunzip > "$results_2gpu"
+  scripts/check-required-cases.py check ptx-2gpu "$results_2gpu" || status=1
 fi
 if [ -n "$device_lane" ]; then
   extract RESULTS | base64 -d | gunzip > "$results"

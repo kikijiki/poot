@@ -678,7 +678,8 @@ mod tests {
                     ..DeviceCaps::wgpu_rdna3_igpu()
                 },
             };
-            let options = CompileOptions::new(crate::CompileLimits::STANDARD);
+            let options = CompileOptions::new(crate::CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
             let program = compile(&builder.finish(out).unwrap(), &target, &options)
                 .unwrap_or_else(|error| panic!("{what}: {error}"));
             let (eqn, plan) = program
@@ -775,7 +776,8 @@ mod tests {
             &builder, x, "layer", weight, None, None,
         )
         .unwrap();
-        let options = CompileOptions::new(crate::CompileLimits::STANDARD);
+        let options = CompileOptions::new(crate::CompileLimits::STANDARD)
+            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact);
         let program = compile(&builder.finish(out).unwrap(), target, &options)
             .unwrap_or_else(|error| panic!("{format:?}: {error}"));
         let (eqn, _) = program

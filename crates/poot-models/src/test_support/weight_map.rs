@@ -424,6 +424,7 @@ pub fn compile(g: &Graph, target: Target, options: &CompileOptions) -> StagedPro
 /// The options every fixture run compiles with unless it states a buffer limit.
 pub fn standard_options() -> CompileOptions {
     CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+        .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact)
 }
 
 /// The cache capacity every fixture step traces with.

@@ -95,7 +95,7 @@ impl KernelChoice {
 
     /// The canonical encoding of this choice: its `Debug` text, without the `precision: Exact` a request carries
     /// by default. An exact request is the one that existed before the field did, so a plan compiled under the
-    /// default policy keeps the key it always had; a narrowed one names its precision and keys differently.
+    /// exact policy keeps the key it always had; a narrowed one names its precision and keys differently.
     pub fn canonical_text(&self) -> String {
         // The defaults a later field added are omitted, so a request that does not use the field keeps the text
         // (and the plan digest) it had: an exact precision (POOT-1430), an f32 activation (POOT-1448).
@@ -521,8 +521,8 @@ mod tests {
     use crate::types::DispatchPlanError;
     use poot_graph_ir::{AttentionAttrs, Builder, TensorType};
     use poot_kernelgen::{
-        AttentionSchedule, AttentionSink, AttentionSpec, KeyBound, KeyLayout, MaskKind,
-        ScoreTransform,
+        AttentionQueryScale, AttentionSchedule, AttentionSink, AttentionSpec, KeyBound, KeyLayout,
+        MaskKind, ScoreTransform,
     };
     use poot_tensor::DType;
     use poot_test_util::device_caps::default_caps_for;
@@ -832,6 +832,7 @@ mod tests {
                 mask: MaskKind::Broadcast,
                 bound: KeyBound::Static,
                 sink: AttentionSink::Absent,
+                query: AttentionQueryScale::Absent,
                 schedule: AttentionSchedule::Streaming { lanes: 4 },
                 precision: poot_graph_ir::OperandPrecision::Exact,
             })
