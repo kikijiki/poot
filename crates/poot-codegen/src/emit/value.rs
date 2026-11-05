@@ -28,6 +28,7 @@ impl<'a> Emitter<'a> {
             Rvalue::IntScalarUnary(op, a) => self.emit_int_scalar_unary(*op, a, w),
             Rvalue::Len(place) => self.emit_len(place.local, w),
             Rvalue::Cast { to, operand } => self.emit_cast(to, operand, w),
+            Rvalue::Narrow { to, operand } => self.emit_narrow(to, operand, w),
             Rvalue::Bitcast { to, operand } => self.emit_bitcast(to, operand, w),
             Rvalue::Select {
                 condition,
@@ -455,6 +456,34 @@ impl<'a> Emitter<'a> {
         let t = self.fresh();
         let _ = writeln!(w, "  {t} = {op} {from_llty} {v} to {to_llty}");
         Ok((t, to_llty))
+    }
+
+    /// [`Rvalue::Narrow`]: an f32 that holds a value of `to`, as that value. A value of the narrow type converts
+    /// exactly under any rounding mode, so `fptrunc` is exact on every target that lowers it to a conversion
+    /// instruction. AMDGCN has none for bf16 (the `fptrunc` is the rounding sequence of [`Self::emit_cast`]), and a
+    /// bf16 value is the top half of its f32, so the narrowing there is that half.
+    pub(super) fn emit_narrow(
+        &mut self,
+        to: &Ty,
+        operand: &Operand,
+        w: &mut String,
+    ) -> Result<(String, String), EmitError> {
+        let (v, from_llty) = self.operand(operand, w)?;
+        let to_llty = self.scalar_llty(to)?;
+        if matches!(self.target, Target::AmdGcn(_)) && to_llty == "bfloat" {
+            let bits = self.fresh();
+            let _ = writeln!(w, "  {bits} = bitcast float {v} to i32");
+            let top = self.fresh();
+            let _ = writeln!(w, "  {top} = lshr i32 {bits}, 16");
+            let half = self.fresh();
+            let _ = writeln!(w, "  {half} = trunc i32 {top} to i16");
+            let res = self.fresh();
+            let _ = writeln!(w, "  {res} = bitcast i16 {half} to bfloat");
+            return Ok((res, to_llty));
+        }
+        let res = self.fresh();
+        let _ = writeln!(w, "  {res} = fptrunc {from_llty} {v} to {to_llty}");
+        Ok((res, to_llty))
     }
 
     pub(super) fn emit_fp8_encode(

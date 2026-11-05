@@ -130,6 +130,14 @@ impl FragmentConfig {
     /// No bound on the subgroups of a workgroup but its size limits.
     pub const ANY_WAVES: u32 = u32::MAX;
 
+    /// The 32-bit registers one lane holds of an A or B operand fragment, at most: a lane holds no more than one
+    /// row (A) or column (B) of the fragment's `k` two-byte values. gfx11 WMMA holds exactly that (its two
+    /// half-waves hold the same 16 values: 8 VGPRs), as does NVPTX's `wmma` m16n16k16 f16 operand (8 registers);
+    /// an opaque layout that spreads the fragment wider holds fewer.
+    pub const fn operand_registers(&self) -> u32 {
+        self.shape.k * 2 / 4
+    }
+
     /// A 16x16x16 config of `dtype` held across `subgroup` lanes, `waves` of them at most per workgroup.
     pub const fn m16n16k16(
         dtype: FragmentDtype,

@@ -110,6 +110,20 @@
           '';
         };
 
+        # TheRock's hardware-counter tools (POOT-1443). Its rocprofv3 and rocprofv3-avail link libatomic.so.1 and
+        # libstdc++.so.6, which the tarball does not ship and a nix shell does not expose, so a bare run fails at
+        # load time. They also need TheRock's own libhsa-runtime64 and libhsa-amd-aqlprofile64: the shell puts
+        # nixpkgs's older rocm-runtime on the library path, and against that the profiler sees mismatched HSA
+        # tables ("aqlprofile API table load failed"). The wrapper sets both for the tool and the program it
+        # profiles, and nothing else: the shell's own library path is untouched.
+        rocprofTools = pkgs.runCommand "therock-rocprof-tools" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
+          for tool in rocprofv3 rocprofv3-avail; do
+            makeWrapper ${therockRocm}/bin/$tool $out/bin/$tool \
+              --prefix LD_LIBRARY_PATH : ${therockRocm}/lib \
+              --suffix LD_LIBRARY_PATH : ${pkgs.stdenv.cc.cc.lib}/lib
+          done
+        '';
+
         # Environment shared by every devShell that builds the workspace.
         #
         # Card 395: one Cargo target dir shared across every worktree, so cargo's own file lock serializes
@@ -166,6 +180,7 @@
             # libs) is TheRock's; see POOT_AMD_CLANG below.
             rocm.rocm-runtime        # libhsa-runtime64.so.1: HSA runtime + KFD
             rocm.rocminfo            # rocminfo CLI, confirms gfx1151 iGPU visibility
+            rocprofTools             # rocprofv3 / rocprofv3-avail: hardware counters (`just profile-rocm-kernel`)
 
             pkgs.just          # task runner, recipes in ./justfile
             pkgs.jq            # JSON queries in scripts/test-model-free.sh

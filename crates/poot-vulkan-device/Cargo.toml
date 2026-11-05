@@ -29,7 +29,8 @@ poot-executor-parity.workspace = true
 poot-graph-ir = { workspace = true, features = ["test-support"] }
 poot-kernel-ir.workspace = true
 poot-kernelgen.workspace = true
-poot-quant.workspace = true
+poot-quant = { workspace = true, features = ["test-support"] }
+poot-load = { workspace = true, features = ["test-support"] }
 poot-test-util.workspace = true
 poot-tensor.workspace = true
 serde_json.workspace = true

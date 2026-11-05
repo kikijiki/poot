@@ -406,6 +406,20 @@ ir_node! {
             /// The value converted.
             operand: Operand,
         },
+        /// The `F32` operand, which holds a value of the two-byte float `to` (`F16` or `BF16`) widened to f32,
+        /// as that `to` value: an exact narrowing that never rounds, unlike a [`Rvalue::Cast`] to `to`, which
+        /// rounds to nearest even and so lowers to a rounding sequence on a target without a native rounding
+        /// conversion (the AMDGCN bf16 cast). A producer narrows this way a value it has rounded itself (the
+        /// operand rounding of `poot-kernelgen`'s `precision` module), so the value is rounded once. A NaN is a
+        /// value of `to` only with its payload in the bits `to` keeps (the canonical quiet NaN `0x7fc0_0000` is).
+        /// An operand that is not a `to` value is a kernel bug: the interpreter faults on it, a device keeps
+        /// some nearby bits.
+        Narrow {
+            /// The two-byte float type narrowed to.
+            to: Ty,
+            /// The `F32` value narrowed.
+            operand: Operand,
+        },
         /// Bit reinterpret (`f32::from_bits`), no value conversion.
         Bitcast {
             /// The type reinterpreted as.
@@ -847,6 +861,15 @@ ir_node! {
             /// The ordering established.
             ordering: MemoryOrdering,
         },
+        /// An instruction-scheduling boundary: the target compiler keeps every instruction of the statements
+        /// before it ahead of every instruction of the statements after it in its schedule. It orders issue
+        /// only: it is not a memory fence (no access becomes visible earlier), not a barrier (no lane waits)
+        /// and changes no value, so it may sit anywhere, under divergent control flow included. A schedule
+        /// states with it an order the compiler's own latency and register heuristics would undo, such as the
+        /// next round's loads issued ahead of the current round's multiplies (`poot-kernelgen`'s pipelined
+        /// contraction). AMDGCN lowers it to `llvm.amdgcn.sched.barrier(0)`; a target whose compiler takes no
+        /// such order (NVPTX's `ptxas`, a SPIR-V driver, the AIE core) and the interpreter run it as nothing.
+        SchedulingBoundary,
     }
 }
 
@@ -1135,6 +1158,20 @@ impl Body {
         self.blocks
             .iter()
             .any(|b| matches!(b.terminator, Terminator::Trap { .. }))
+    }
+}
+
+impl Statement {
+    /// Every local this statement reads: its operands, the base and indexes of the places it reads or writes
+    /// through, and the fragments it consumes (an in-place element write reads its accumulator).
+    pub fn for_each_read(&self, mut f: impl FnMut(Local)) {
+        verify::stmt_uses(self, &mut f);
+    }
+
+    /// Every local this statement defines as a whole: the bare local an `Assign` writes, or the fragment a
+    /// `Wmma*` statement fills. A store through a projection defines none.
+    pub fn for_each_def(&self, mut f: impl FnMut(Local)) {
+        verify::stmt_defs(self, &mut f);
     }
 }
 
@@ -1723,7 +1760,7 @@ mod verify {
                     self.check_accumulator_element(*dst, *idx)?;
                     expect_ty("fragment element", &Ty::F32, &self.operand_ty(value)?)
                 }
-                Statement::Fence { .. } => Ok(()),
+                Statement::Fence { .. } | Statement::SchedulingBoundary => Ok(()),
             }
         }
 
@@ -1893,6 +1930,17 @@ mod verify {
                     } else {
                         Err(VerifyErrorKind::InvalidOperandType {
                             what: "cast target",
+                            found: to.clone(),
+                        })
+                    }
+                }
+                Rvalue::Narrow { to, operand } => {
+                    expect_ty("narrow operand", &Ty::F32, &self.operand_ty(operand)?)?;
+                    if matches!(to, Ty::F16 | Ty::BF16) {
+                        Ok(to.clone())
+                    } else {
+                        Err(VerifyErrorKind::InvalidOperandType {
+                            what: "narrow target",
                             found: to.clone(),
                         })
                     }
@@ -2554,6 +2602,7 @@ mod verify {
                 .join(operand_class(b, flow).opaque())
                 .join(operand_class(c, flow).opaque()),
             Rvalue::Cast { operand, .. }
+            | Rvalue::Narrow { operand, .. }
             | Rvalue::Bitcast { operand, .. }
             | Rvalue::Fp8Encode { operand, .. } => operand_class(operand, flow).opaque(),
             Rvalue::Select {
@@ -2684,7 +2733,7 @@ mod verify {
         }
     }
 
-    fn stmt_defs(stmt: &Statement, f: &mut dyn FnMut(Local)) {
+    pub(crate) fn stmt_defs(stmt: &Statement, f: &mut dyn FnMut(Local)) {
         match stmt {
             Statement::Assign(place, _) => place_def(place, f),
             Statement::WmmaLoad { dst, .. }
@@ -2711,6 +2760,7 @@ mod verify {
             | Rvalue::VectorSplat(a)
             | Rvalue::VectorExtract { vector: a, .. } => operand_reads(a, f),
             Rvalue::Cast { operand, .. }
+            | Rvalue::Narrow { operand, .. }
             | Rvalue::Bitcast { operand, .. }
             | Rvalue::Fp8Encode { operand, .. } => operand_reads(operand, f),
             Rvalue::BinaryOp(_, a, b) | Rvalue::BinaryOpNoContract(_, a, b) => {
@@ -2765,7 +2815,7 @@ mod verify {
         }
     }
 
-    fn stmt_uses(stmt: &Statement, f: &mut dyn FnMut(Local)) {
+    pub(crate) fn stmt_uses(stmt: &Statement, f: &mut dyn FnMut(Local)) {
         match stmt {
             Statement::Assign(place, rvalue) => {
                 // Storing to a bare local reads nothing; storing to an element reads the base and index.
@@ -2774,7 +2824,10 @@ mod verify {
                 }
                 rvalue_reads(rvalue, f);
             }
-            Statement::StorageLive(_) | Statement::StorageDead(_) | Statement::Fence { .. } => {}
+            Statement::StorageLive(_)
+            | Statement::StorageDead(_)
+            | Statement::Fence { .. }
+            | Statement::SchedulingBoundary => {}
             Statement::WorkgroupLocalWrite { idx, value, .. } => {
                 operand_reads(idx, f);
                 operand_reads(value, f);
@@ -3048,6 +3101,58 @@ mod tests {
             block: BlockId { index: block },
             index,
         }
+    }
+
+    /// An exact narrowing reads an f32 and writes a two-byte float: a narrowing to f32 and one of a u32 are
+    /// rejected at their statement, and the f32-to-bf16 one passes. Mutation: accept any target in
+    /// `rvalue_ty`'s `Narrow` arm; the f32 target passes and this row goes red.
+    #[test]
+    fn an_exact_narrowing_reads_an_f32_and_writes_a_two_byte_float() {
+        let narrow = |operand: Constant, to: Ty| {
+            let operand_ty = match operand {
+                Constant::F32(_) => Ty::F32,
+                _ => Ty::U32,
+            };
+            straight_line(
+                vec![operand_ty, to.clone()],
+                vec![
+                    Statement::Assign(Place::local(l(2)), constant(operand)),
+                    Statement::Assign(
+                        Place::local(l(3)),
+                        Rvalue::Narrow {
+                            to,
+                            operand: copy(2),
+                        },
+                    ),
+                ],
+            )
+        };
+        narrow(Constant::F32(1.0), Ty::BF16)
+            .verify()
+            .expect("an f32 narrowed to bf16 verifies");
+        let (site, kind) = rejection(&narrow(Constant::F32(1.0), Ty::F32));
+        assert_eq!(site, at_statement(0, 1));
+        assert!(
+            matches!(
+                kind,
+                VerifyErrorKind::InvalidOperandType {
+                    what: "narrow target",
+                    ..
+                }
+            ),
+            "{kind:?}"
+        );
+        let (_, kind) = rejection(&narrow(Constant::U32(1), Ty::F16));
+        assert!(
+            matches!(
+                kind,
+                VerifyErrorKind::TypeMismatch {
+                    what: "narrow operand",
+                    ..
+                }
+            ),
+            "{kind:?}"
+        );
     }
 
     fn at_terminator(block: u32) -> Site {

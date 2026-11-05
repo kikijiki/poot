@@ -52,17 +52,31 @@ pub unsafe fn device_local_heap_budget(
     )
 }
 
-/// A Vulkan device's active compute units from AMD's shader-core properties:
-/// `VK_AMD_shader_core_properties2`'s `activeComputeUnitCount`, else `VK_AMD_shader_core_properties`'
-/// engine x array x per-array product; `None` when the driver exposes neither (every non-AMD device).
+/// What AMD's shader-core properties say about a Vulkan device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AmdShaderCore {
+    /// Active compute units: `VK_AMD_shader_core_properties2`'s `activeComputeUnitCount`, else
+    /// `VK_AMD_shader_core_properties`' engine x array x per-array product.
+    pub compute_units: u32,
+    /// `maxVgprAllocation`: the VGPRs one lane addresses.
+    pub max_vgpr_allocation: u32,
+    /// `vgprsPerSimd`: the SIMD's VGPRs, counted in wave64 registers.
+    pub vgprs_per_simd: u32,
+    /// `simdPerComputeUnit`.
+    pub simd_per_compute_unit: u32,
+}
+
+/// A Vulkan device's AMD shader-core properties (`VK_AMD_shader_core_properties`, with
+/// `VK_AMD_shader_core_properties2`'s active compute-unit count where the driver has it); `None` when the
+/// driver exposes neither (every non-AMD device).
 ///
 /// # Safety
 ///
 /// `physical_device` must come from `instance`'s own enumeration, and `instance` must be live.
-pub unsafe fn amd_vulkan_compute_units(
+pub unsafe fn amd_vulkan_shader_core(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
-) -> Option<u32> {
+) -> Option<AmdShaderCore> {
     // SAFETY: the caller's contract makes both handles valid; the enumeration and property queries
     // only read, and each property struct is chained only when its extension is listed as supported.
     unsafe {
@@ -74,22 +88,31 @@ pub unsafe fn amd_vulkan_compute_units(
                 .iter()
                 .any(|ext| ext.extension_name_as_c_str() == Ok(name))
         };
-        if supports(amd::shader_core_properties2::NAME) {
-            let mut core = vk::PhysicalDeviceShaderCoreProperties2AMD::default();
-            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut core);
-            instance.get_physical_device_properties2(physical_device, &mut props);
-            Some(core.active_compute_unit_count)
-        } else if supports(amd::shader_core_properties::NAME) {
-            let mut core = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
-            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut core);
-            instance.get_physical_device_properties2(physical_device, &mut props);
-            Some(
-                core.shader_engine_count
-                    * core.shader_arrays_per_engine_count
-                    * core.compute_units_per_shader_array,
-            )
-        } else {
-            None
+        if !supports(amd::shader_core_properties::NAME) {
+            return None;
         }
+        let mut core = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
+        let mut core2 = vk::PhysicalDeviceShaderCoreProperties2AMD::default();
+        let has_core2 = supports(amd::shader_core_properties2::NAME);
+        {
+            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut core);
+            if has_core2 {
+                props = props.push_next(&mut core2);
+            }
+            instance.get_physical_device_properties2(physical_device, &mut props);
+        }
+        let compute_units = if has_core2 {
+            core2.active_compute_unit_count
+        } else {
+            core.shader_engine_count
+                * core.shader_arrays_per_engine_count
+                * core.compute_units_per_shader_array
+        };
+        Some(AmdShaderCore {
+            compute_units,
+            max_vgpr_allocation: core.max_vgpr_allocation,
+            vgprs_per_simd: core.vgprs_per_simd,
+            simd_per_compute_unit: core.simd_per_compute_unit,
+        })
     }
 }

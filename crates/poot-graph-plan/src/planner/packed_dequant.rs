@@ -263,6 +263,7 @@ fn try_plan_contraction(
                         layout: WeightLayout::Nk,
                         segments: 1,
                         terms: poot_kernelgen::StagedTerms::of(precision, None, None),
+                        weight_bits: poot_kernelgen::packed_value_bits(descriptor.format()),
                     },
                     caps,
                 )?;
@@ -496,6 +497,7 @@ fn plan_indexed(
                     layout: WeightLayout::Nk,
                     segments: experts,
                     terms: poot_kernelgen::StagedTerms::of(precision, None, None).scalar_only(),
+                    weight_bits: poot_kernelgen::packed_value_bits(descriptor.format()),
                 },
                 caps,
             )?;
@@ -879,6 +881,7 @@ mod tests {
                 layout: WeightLayout::Nk,
                 segments: 1,
                 terms: poot_kernelgen::StagedTerms::ONE,
+                weight_bits: poot_kernelgen::packed_value_bits(WeightFormat::E2m1Row32),
             },
             &DeviceCaps::wgpu_rdna3_igpu(),
         )
@@ -1064,6 +1067,9 @@ mod tests {
     fn a_packed_tiled_contraction_over_the_watchdog_budget_splits_into_tile_ranges() {
         let (m, n, k) = (2048usize, 16_384usize, 512usize);
         let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let format = WeightFormat::E4m3Block128 {
+            scale: poot_quant::format::ScaleEncoding::Bf16,
+        };
         let shape = TiledShape {
             blocks: 1,
             m_per_block: m,
@@ -1072,12 +1078,10 @@ mod tests {
             layout: WeightLayout::Nk,
             segments: 1,
             terms: poot_kernelgen::StagedTerms::ONE,
+            weight_bits: poot_kernelgen::packed_value_bits(format),
         };
         let (tile_rows, tile_cols) = RegisterTiling::choose(shape, &caps).output_tile();
         let tiles = m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
-        let format = WeightFormat::E4m3Block128 {
-            scale: poot_quant::format::ScaleEncoding::Bf16,
-        };
         let descriptor = PackedWeight::try_new(format, [n, k]).unwrap();
         let plan_for = |caps: DeviceCaps| {
             let builder = Builder::for_tests();
@@ -1207,6 +1211,7 @@ mod tests {
                 layout: WeightLayout::Nk,
                 segments: 1,
                 terms: poot_kernelgen::StagedTerms::ONE,
+                weight_bits: 32,
             },
             &tiny_grid_caps(),
         );

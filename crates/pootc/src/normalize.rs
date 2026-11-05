@@ -381,7 +381,8 @@ fn rewrite_rvalue(rv: &mut Rvalue, aliases: &HashMap<u32, Place>) {
         | Rvalue::IntScalarUnary(_, op)
         | Rvalue::Cast { operand: op, .. }
         | Rvalue::Bitcast { operand: op, .. }
-        | Rvalue::Fp8Encode { operand: op, .. } => rewrite_operand(op, aliases),
+        | Rvalue::Fp8Encode { operand: op, .. }
+        | Rvalue::Narrow { operand: op, .. } => rewrite_operand(op, aliases),
         // Card 628: hand-built in kernelgen (like the vector ops below), never produced by MIR lowering;
         // rewritten for completeness.
         Rvalue::BinaryOp(_, a, b) | Rvalue::BinaryOpNoContract(_, a, b) => {
@@ -471,6 +472,8 @@ fn rewrite_statement(s: &mut Statement, aliases: &HashMap<u32, Place>) {
         | Statement::WmmaZero { .. } => {}
         // Spec 138 Phase 2: a Fence has no operand or place to rewrite; like WMMA/CAS it is hand-built in kernelgen.
         Statement::Fence { .. } => {}
+        // A scheduling boundary has no operand either; kernelgen's pipelined schedules place it.
+        Statement::SchedulingBoundary => {}
     }
 }
 

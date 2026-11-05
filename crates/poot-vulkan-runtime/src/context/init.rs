@@ -6,7 +6,7 @@ use crate::util::bytemuck_cast_i8_to_u8;
 use crate::validation::Validation;
 use crate::{Context, DeviceOwner, RuntimeError, validation};
 use ash::vk;
-use poot_runtime_common::vulkan_probe::{amd_vulkan_compute_units, device_local_heap_budget};
+use poot_runtime_common::vulkan_probe::{amd_vulkan_shader_core, device_local_heap_budget};
 use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -285,10 +285,21 @@ impl Context {
         // Channel data is per part, read from the device's own name (RADV names Strix Halo in it).
         let dram_channels = poot_target::dram_channels::DramChannels::of_device_name(&device_name);
         // Card 653: AMD's shader-core properties where the driver exposes them, else
-        // the RDNA3 default, as the wgpu runtime does.
+        // the RDNA3 default, as the wgpu runtime does. The same properties give the register file
+        // (POOT-1447), unknown on any other device.
         // SAFETY: `physical_device` is from this instance's own enumeration.
-        let compute_units = unsafe { amd_vulkan_compute_units(&owner.instance, physical_device) }
-            .unwrap_or(poot_target::DeviceCaps::wgpu_rdna3_igpu().compute_units);
+        let shader_core = unsafe { amd_vulkan_shader_core(&owner.instance, physical_device) };
+        let compute_units = shader_core.map_or(
+            poot_target::DeviceCaps::wgpu_rdna3_igpu().compute_units,
+            |core| core.compute_units,
+        );
+        let register_file = shader_core.map_or(poot_target::Queried::Unknown, |core| {
+            poot_target::Queried::Known(poot_target::RegisterFile::amd_shader_core(
+                core.max_vgpr_allocation,
+                core.vgprs_per_simd,
+                core.simd_per_compute_unit,
+            ))
+        });
         // SAFETY: `physical_device` is from this instance's own enumeration; the extension list was
         // read from the same device.
         let subgroup = unsafe {
@@ -327,6 +338,7 @@ impl Context {
             max_grid: max_workgroup_count,
             watchdog_budget,
             matrix_units: poot_target::Queried::Known(matrix_units),
+            register_file,
             known_miscompiles,
             compute_units,
             memory_budget_bytes: features.memory_budget().then(|| {

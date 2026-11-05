@@ -267,6 +267,16 @@ cell and states none.
 Hardware numbers are recorded with their noise: a baseline taken next to other GPU work shows it, and the
 uncertainty rule above then calls a later comparison unverified instead of passing it.
 
+**Hardware counters for a bank case (ROCm).** A device time says how long a kernel took, not why. `just profile-rocm-kernel
+<case> [out dir]` runs one bank case on the local ROCm device under TheRock's `rocprofv3` (the devshell wraps it: it
+needs the gcc runtime and TheRock's own HSA library on the path, see `flake.nix`), one profiler pass per counter group
+(waves and busy cycles, VALU/SALU/LDS/memory instruction counts, LDS bank conflicts, occupancy, memory-unit busy, L2 and
+memory traffic), and writes `<out>/<case>/summary.{md,json}` for the case's hot kernel (`scripts/profile-rocm-kernel`).
+It takes `/tmp/poot-gpu.lock`. Counter passes serialize dispatches and perturb clocks, so they are a diagnostic like any
+profiled time: they never supply a speed metric. gfx1151 offers no WMMA-busy, instruction-cache or `s_waitcnt` counters
+and `--kernel-trace` crashes against the runtime's raw HSA queues; `receipts/1443-rocm-counters/` records both and the
+limiter each fragment-contraction cell shows.
+
 ### Run it (needs a GPU + the runners built/installed)
 
 ```bash

@@ -672,6 +672,18 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(w, "  fence syncscope(\"{scope_kw}\") {ord_kw}");
                 Ok(())
             }
+            // An instruction-scheduling boundary. AMDGCN: `sched.barrier` with an empty mask lets no instruction
+            // cross it in the machine scheduler. No other target's compiler takes such an order from the IR
+            // (NVPTX's `ptxas` schedules the PTX itself, a SPIR-V driver its own ISA, the AIE core runs one scalar
+            // loop), and the boundary changes no value, so they emit nothing.
+            Statement::SchedulingBoundary => {
+                if matches!(self.target, Target::AmdGcn(_)) {
+                    self.declares
+                        .insert("declare void @llvm.amdgcn.sched.barrier(i32 immarg)".into());
+                    let _ = writeln!(w, "  call void @llvm.amdgcn.sched.barrier(i32 0)");
+                }
+                Ok(())
+            }
         }
     }
 

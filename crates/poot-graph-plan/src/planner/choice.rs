@@ -857,6 +857,7 @@ mod tests {
                     layout: poot_kernelgen::WeightLayout::Nk,
                     segments: 1,
                     terms: poot_kernelgen::StagedTerms::ONE,
+                    weight_bits: 32,
                 },
                 &DeviceCaps::rocm_default(),
             )

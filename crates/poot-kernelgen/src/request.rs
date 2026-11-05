@@ -25,7 +25,7 @@ use crate::attention::{
 };
 use crate::block_top_k::{BlockTopKSpec, block_top_k_body};
 use crate::contraction::{
-    DenseTiledWeight, Epilogue, GemvActivation, Schedule, dense_contraction,
+    DenseTiledWeight, Epilogue, GemvActivation, Schedule, TiledExtents, dense_contraction,
     dense_tiled_contraction, indexed_contraction,
 };
 use crate::data_movement::{
@@ -363,8 +363,9 @@ impl KernelRequest {
                         waves_n,
                         tile,
                         run,
+                        depth,
                     } => format!(
-                        "fragment_tiled{}x{}x{}x{}r{}",
+                        "fragment_tiled{}x{}x{}x{}r{}d{depth}",
                         waves_m.get(),
                         waves_n.get(),
                         tile.rows,
@@ -1145,6 +1146,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                 "packed_contraction",
                 *format,
                 *schedule,
+                meta,
                 epilogue.as_ref(),
                 *rows,
                 *precision,
@@ -1178,16 +1180,13 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             meta,
             precision,
         }) => {
-            let k = meta.first().copied().ok_or(KernelGenError::Unsupported {
-                request: "dense_tiled_contraction",
-                reason: "the tiled metadata starts with K",
-            })?;
+            let extents = TiledExtents::of_meta("dense_tiled_contraction", meta)?;
             with(
                 dense_tiled_contraction(
                     "dense_tiled",
                     *weight,
                     *schedule,
-                    k as usize,
+                    extents,
                     epilogue.as_ref(),
                     *precision,
                 )?,
@@ -1211,7 +1210,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                 *schedule,
                 *layout,
                 *weight,
-                meta.first().map_or(0, |&k| k as usize),
+                meta,
                 epilogue.as_ref(),
                 *precision,
             )?,
@@ -1953,6 +1952,7 @@ mod tests {
                 layout: weight.layout(),
                 segments: 1,
                 terms: crate::precision::StagedTerms::ONE,
+                weight_bits: weight.bits(),
             },
             caps,
         );

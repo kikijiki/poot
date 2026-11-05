@@ -6,8 +6,10 @@
 //! `kv_head * n_rep + r / br` at query row `first + r % br`. A padded row of the last block (past `lq`) reads the
 //! last real query and is never stored.
 //!
-//! The query tile is staged in workgroup memory once, transposed (`Q^T [dk][rows + 1]`). The keys are walked in
-//! blocks of `bc`; per block:
+//! The query tile is staged in workgroup memory once, transposed (`Q^T [dk][rows + 1]`). A fragment schedule that
+//! holds Q ([`QOperand::Held`], POOT-1447) instead stages it through the key/value array a chunk of channels at a
+//! time before the walk, each wave loading its A fragments of the chunk into registers it keeps for the whole walk;
+//! its score product then loads only K. The keys are walked in blocks of `bc`; per block:
 //!
 //! 1. stage `K^T` (`[dk][bc + 1]`, or `[bc][dk + 8]` for fragments); barrier;
 //! 2. `S = Q K^T` into each lane's score register tile; score transform and additive mask; on a block some row
@@ -46,8 +48,8 @@ use poot_kernel_ir::{
 
 use super::{
     AttentionMicro, AttentionSchedule, AttentionSink, AttentionSpec, GENERATOR, KeyBound,
-    KeyLayout, KvLane, LaneTile, MaskKind, WaveTile, count, count_to, emit_score, f32_array, f32c,
-    local_op,
+    KeyLayout, KvLane, LaneTile, MaskKind, QOperand, WaveTile, count, count_to, emit_score,
+    f32_array, f32c, local_op,
 };
 use crate::KernelGenError;
 use crate::data_movement::Cfg;
@@ -59,24 +61,26 @@ use crate::microtile::{
 use crate::precision::narrowed;
 use poot_graph_ir::OperandPrecision;
 
-/// `Q^T`: element `(channel d, row r)` at `d * (rows + 1) + r`.
-const Q_ARRAY: u8 = 0;
 /// `K^T` (element `(d, key j)` at `d * (bc + 1) + j`) for the score product, then `V` (element `(j, channel c)`
-/// at `j * dv + c`) for the value product: one region, staged in turn.
-const KV_ARRAY: u8 = 1;
-/// `P^T`: element `(key j, row r)` at `j * (rows + 1) + r`.
-const P_ARRAY: u8 = 2;
-/// The rows' partial maxima and partial sums of a block: row `r`'s owner `o` at `r * owners + o`.
-const RED_MAX_ARRAY: u8 = 3;
-const RED_SUM_ARRAY: u8 = 4;
+/// at `j * dv + c`) for the value product: one region, staged in turn. A fragment tile has `K` as `[key][d]` and `V`
+/// as `[channel][key]`, the depth of each product adjacent. A held Q ([`QOperand::Held`]) passes through it in
+/// depth chunks before the key loop.
+const KV_ARRAY: u8 = 0;
+/// `P^T`: element `(key j, row r)` at `j * (rows + 1) + r`; a fragment tile has the keys of a row adjacent, at
+/// `r * (bc + 8) + j`.
+const P_ARRAY: u8 = 1;
+/// The rows' partial maxima, then (once the new maxima are folded and read) their partial sums, of a block: row
+/// `r`'s owner `o` at `r * owners + o`. The two are never live together, so they share one array.
+const RED_ARRAY: u8 = 2;
 /// The running maximum `m` and the running sum `l` of each row.
-const M_ARRAY: u8 = 5;
-const L_ARRAY: u8 = 6;
+const M_ARRAY: u8 = 3;
+const L_ARRAY: u8 = 4;
 /// The running maximum each row moves to in a block and the factor its state is rescaled by.
-const NEW_M_ARRAY: u8 = 7;
-const ALPHA_ARRAY: u8 = 8;
-/// The f32 scratch an `Opaque` fragment accumulator is spilled to (absent for any other micro-tile).
-const SCRATCH_ARRAY: u8 = 9;
+const NEW_M_ARRAY: u8 = 5;
+const ALPHA_ARRAY: u8 = 6;
+/// The arrays every tiled body declares; a staged Q tile ([`TiledLayout::q_array`]) and the scratch of an `Opaque`
+/// fragment accumulator ([`TiledLayout::scratch_array`]) follow, each only where the schedule has it.
+const FIXED_ARRAYS: u8 = 7;
 
 /// Depth steps one trip of a scalar product's run-time loop unrolls.
 const UNROLL: usize = 8;
@@ -94,6 +98,7 @@ pub(super) struct TiledLayout {
     lanes: usize,
     score: Grid,
     out: Grid,
+    q: QOperand,
 }
 
 /// One product's register tile and its `lanes_m x lanes_n` lane grid.
@@ -259,16 +264,18 @@ impl TiledLayout {
                 });
             }
         }
-        let (score, out) = match micro {
+        let (score, out, q) = match micro {
             AttentionMicro::Scalar { score, out } => (
                 Grid::scalar("score", score, (rows, bc), lanes)?,
                 Grid::scalar("output", out, (rows, spec.dv), lanes)?,
+                QOperand::Staged,
             ),
             AttentionMicro::Fragment {
                 dtype,
                 layout,
                 score,
                 out,
+                q,
             } => {
                 // The operands are staged already narrowed, so the dtype the fragments multiply in is the
                 // precision's.
@@ -287,6 +294,7 @@ impl TiledLayout {
                 (
                     Grid::fragment("score", tile(score), score, (rows, bc), lanes)?,
                     Grid::fragment("output", tile(out), out, (rows, spec.dv), lanes)?,
+                    q,
                 )
             }
         };
@@ -305,22 +313,74 @@ impl TiledLayout {
                 });
             }
         }
-        Ok(Self {
+        let layout = Self {
             rows,
             br,
             bc,
             lanes,
             score,
             out,
-        })
+            q,
+        };
+        if q == QOperand::Held && layout.q_chunk(spec.dk, spec.dv).is_none() {
+            return Err(KernelGenError::NotDivisible {
+                generator: GENERATOR,
+                dim: "a held query's depth chunks through the key/value array".into(),
+                value: spec.dk,
+                divisor: micro_edge(),
+            });
+        }
+        Ok(layout)
+    }
+
+    /// The depth a held Q is staged in per pass through the key/value array before the key loop: the widest
+    /// multiple of the fragment depth dividing `dk` whose `rows x (chunk + FRAGMENT_PAD)` elements fit the array and
+    /// split evenly over the lanes. `None` for a staged Q, or where not even one fragment depth fits.
+    fn q_chunk(&self, dk: usize, dv: usize) -> Option<usize> {
+        if self.q != QOperand::Held {
+            return None;
+        }
+        let edge = micro_edge();
+        let capacity = self.kv_len(dk, dv);
+        (1..=dk / edge)
+            .rev()
+            .map(|steps| steps * edge)
+            .find(|&chunk| {
+                dk.is_multiple_of(chunk)
+                    && self.rows * (chunk + FRAGMENT_PAD) <= capacity
+                    && (self.rows * chunk).is_multiple_of(self.lanes)
+            })
+    }
+
+    /// The elements of the key/value array: the larger of the staged `K` and `V` tiles.
+    fn kv_len(&self, dk: usize, dv: usize) -> usize {
+        let Self { bc, score, .. } = *self;
+        match score.micro {
+            MicroTile::Scalar { .. } => (dk * (bc + 1)).max(bc * dv),
+            MicroTile::Fragment(_) => (bc * (dk + FRAGMENT_PAD)).max(dv * (bc + FRAGMENT_PAD)),
+        }
+    }
+
+    /// The array of a staged Q tile, `None` for a held one.
+    fn q_array(&self) -> Option<u8> {
+        (self.q == QOperand::Staged).then_some(FIXED_ARRAYS)
+    }
+
+    /// The array an `Opaque` fragment accumulator spills to, after a staged Q's; `None` for any other micro-tile.
+    fn scratch_array(&self) -> Option<u8> {
+        (self.score.scratch_words().max(self.out.scratch_words()) > 0)
+            .then(|| FIXED_ARRAYS + u8::from(self.q_array().is_some()))
     }
 
     /// The staged operand tiles of the two products and the elements of each one's array.
     ///
     /// A scalar tile is `K`-major throughout, rows padded by one word where lanes read adjacent ones. A fragment
-    /// lane loads 16 consecutive depth values of its row, so Q and K (whose rows are the query and key
-    /// positions, the depth the head width) are `X`-major, V and P (whose depth is the key position) `K`-major,
-    /// every row padded by [`FRAGMENT_PAD`].
+    /// lane loads 16 consecutive depth values of its row (or column), so every tile is `X`-major: Q and K (whose
+    /// rows are the query and key positions, the depth the head width), and P (a row per query, the keys along it)
+    /// and V (a row per channel, the keys along it), whose depth is the key position. A `K`-major P and V would
+    /// read each fragment lane's 16 depth values as 16 separate 2-byte loads. Every row is padded by
+    /// [`FRAGMENT_PAD`]. A held Q is staged in depth chunks through the key/value array with K's layout
+    /// ([`Self::q_chunk`]).
     fn tiles(&self, dk: usize, dv: usize) -> StagedTiles {
         let Self {
             rows, bc, score, ..
@@ -330,31 +390,39 @@ impl TiledLayout {
             stride,
             major: StagedMajor::X,
         };
+        let kv_len = self.kv_len(dk, dv);
         match score.micro {
             MicroTile::Scalar { .. } => StagedTiles {
-                q: Staged::k_major(Q_ARRAY, rows + 1),
+                q: QTile::Staged(Staged::k_major(FIXED_ARRAYS, rows + 1)),
                 k: Staged::k_major(KV_ARRAY, bc + 1),
                 p: Staged::k_major(P_ARRAY, rows + 1),
                 v: Staged::k_major(KV_ARRAY, dv),
                 q_len: dk * (rows + 1),
-                kv_len: (dk * (bc + 1)).max(bc * dv),
+                kv_len,
                 p_len: bc * (rows + 1),
             },
             MicroTile::Fragment(_) => StagedTiles {
-                q: x_major(Q_ARRAY, dk + FRAGMENT_PAD),
+                q: match self.q_chunk(dk, dv) {
+                    None => QTile::Staged(x_major(FIXED_ARRAYS, dk + FRAGMENT_PAD)),
+                    Some(chunk) => QTile::Held {
+                        through: x_major(KV_ARRAY, chunk + FRAGMENT_PAD),
+                        chunk,
+                    },
+                },
                 k: x_major(KV_ARRAY, dk + FRAGMENT_PAD),
-                p: Staged::k_major(P_ARRAY, rows + FRAGMENT_PAD),
-                v: Staged::k_major(KV_ARRAY, dv + FRAGMENT_PAD),
+                p: x_major(P_ARRAY, bc + FRAGMENT_PAD),
+                v: x_major(KV_ARRAY, bc + FRAGMENT_PAD),
                 q_len: rows * (dk + FRAGMENT_PAD),
-                kv_len: (bc * (dk + FRAGMENT_PAD)).max(bc * (dv + FRAGMENT_PAD)),
-                p_len: bc * (rows + FRAGMENT_PAD),
+                kv_len,
+                p_len: rows * (bc + FRAGMENT_PAD),
             },
         }
     }
 
-    /// The workgroup-memory arrays the body declares, in array order: the three staged tiles (in the micro-tile's
-    /// operand type), the rows' partial maxima and sums, the running `m` and `l`, then the scratch of an `Opaque`
-    /// fragment accumulator.
+    /// The workgroup-memory arrays the body declares, in array order: the key/value and P tiles (in the
+    /// micro-tile's operand type), the rows' partial maxima and sums (one array), the running `m` and `l`, the new
+    /// maxima and rescale factors, then a staged Q tile and the scratch of an `Opaque` fragment accumulator where
+    /// the schedule has them.
     fn locals(&self, dk: usize, dv: usize) -> Vec<WorkgroupLocalDecl> {
         let Self {
             rows, score, out, ..
@@ -365,19 +433,19 @@ impl TiledLayout {
             len: len as u32,
         };
         let mut locals = vec![
-            staged(tiles.q_len),
             staged(tiles.kv_len),
             staged(tiles.p_len),
-            f32_array(rows * score.row_owners()),
             f32_array(rows * score.row_owners()),
             f32_array(rows),
             f32_array(rows),
             f32_array(rows),
             f32_array(rows),
         ];
-        let scratch = score.scratch_words().max(out.scratch_words());
-        if scratch > 0 {
-            locals.push(f32_array(scratch));
+        if self.q_array().is_some() {
+            locals.push(staged(tiles.q_len));
+        }
+        if self.scratch_array().is_some() {
+            locals.push(f32_array(score.scratch_words().max(out.scratch_words())));
         }
         locals
     }
@@ -403,13 +471,28 @@ pub(super) fn lds_bytes(spec: &AttentionSpec) -> Result<usize, KernelGenError> {
 
 /// The staged operand tiles of the two products ([`TiledLayout::tiles`]) and the elements of each array.
 struct StagedTiles {
-    q: Staged,
+    q: QTile,
     k: Staged,
     p: Staged,
     v: Staged,
     q_len: usize,
     kv_len: usize,
     p_len: usize,
+}
+
+/// Where the score product reads Q from.
+#[derive(Clone, Copy)]
+enum QTile {
+    /// Its own array, for the whole key loop.
+    Staged(Staged),
+    /// Held fragments, staged `chunk` channels at a time through `through` (the key/value array, K's layout)
+    /// before the key loop.
+    Held { through: Staged, chunk: usize },
+}
+
+/// The depth one fragment step consumes (every fragment config lowers 16x16x16).
+const fn micro_edge() -> usize {
+    poot_target::FragmentShape::M16N16K16.k as usize
 }
 
 fn op(local: Local) -> Operand {
@@ -476,7 +559,7 @@ fn running_max(e: &mut Emit, row: Local, owners: usize) -> (Local, Local) {
     let base = un(e, BinOp::Mul, row, owners);
     let new = (0..owners).fold(old, |max, o| {
         let at = un(e, BinOp::Add, base, o);
-        let part = e.read_lds(Ty::F32, RED_MAX_ARRAY, op(at));
+        let part = e.read_lds(Ty::F32, RED_ARRAY, op(at));
         bin(e, Ty::F32, BinOp::Max, op(max), op(part))
     });
     (old, new)
@@ -618,6 +701,7 @@ pub(super) fn tiled_body(
         lanes,
         score: score_grid,
         out: out_grid,
+        q: _,
     } = layout;
     let AttentionSpec {
         batch: _,
@@ -645,8 +729,7 @@ pub(super) fn tiled_body(
         });
     }
     let tiles = layout.tiles(dk, dv);
-    let scratch =
-        (score_grid.scratch_words().max(out_grid.scratch_words()) > 0).then_some(SCRATCH_ARRAY);
+    let scratch = layout.scratch_array();
     let hkv = hq / n_rep;
     let blocks_per_head = lq.div_ceil(br);
     let shared_dim = match key {
@@ -727,26 +810,33 @@ pub(super) fn tiled_body(
             (tile, kv_head)
         });
 
-        // Stage Q^T once, adjacent lanes on adjacent channels of a query row.
-        stage_strided(
-            c,
-            (lane, lanes),
-            (tile_rows, dk),
-            |e, r, d| {
-                let h = tile.head(e, r);
-                let i = tile.clamped_query(e, r);
-                let row = tile.flat(e, h, i);
-                let base = un(e, BinOp::Mul, row, dk);
-                let at = uu(e, BinOp::Add, base, d);
-                let raw = e.let_(Ty::F32, Rvalue::Use(crate::helpers::copy(elem(q, at))));
-                narrowed(e, precision, None, raw)
-            },
-            |e, r, d, value| {
-                let slot = staged_word(e, tiles.q, d, r);
-                let value = score_grid.micro.stage_value(e, value);
-                e.write_lds(Q_ARRAY, op(slot), op(value));
-            },
-        );
+        // Channel `d` of tile row `r`'s query, rounded to the operand precision.
+        let load_q = |e: &mut Emit, r: Local, d: Local| {
+            let h = tile.head(e, r);
+            let i = tile.clamped_query(e, r);
+            let row = tile.flat(e, h, i);
+            let base = un(e, BinOp::Mul, row, dk);
+            let at = uu(e, BinOp::Add, base, d);
+            let raw = e.let_(Ty::F32, Rvalue::Use(crate::helpers::copy(elem(q, at))));
+            narrowed(e, precision, None, raw)
+        };
+        // Stage Q once, adjacent lanes on adjacent channels of a query row, into its own array for the whole loop. A
+        // held Q is staged after the geometry below.
+        if let QTile::Staged(staged) = tiles.q {
+            stage_strided(
+                c,
+                (lane, lanes),
+                (tile_rows, dk),
+                std::mem::size_of::<f32>(),
+                StageOrder::AlongColumns,
+                load_q,
+                |e, r, d, value| {
+                    let slot = staged_word(e, staged, d, r);
+                    let value = score_grid.micro.stage_value(e, value);
+                    e.write_lds(staged.array, op(slot), op(value));
+                },
+            );
+        }
         // Each row's running state: empty, or the head's sink logit with its unit mass.
         count(c, op(lane), tile_rows, lanes, |c, r| {
             c.emit(|e| {
@@ -766,6 +856,45 @@ pub(super) fn tiled_body(
 
         let keys = key_range(c, (tile, mask, len), (mask_kind, lk, bc));
         let (gs, go) = c.emit(|e| (score_grid.geometry(e, lane), out_grid.geometry(e, lane)));
+        // A held Q is staged through the key/value array a chunk of channels at a time, each wave loading its A
+        // fragments of the chunk's depth steps before the next chunk overwrites it.
+        let held = match tiles.q {
+            QTile::Staged(_) => None,
+            QTile::Held { through, chunk } => {
+                let kappa = score_grid.micro.kappa();
+                let mut held = Vec::with_capacity(dk / kappa);
+                for d0 in (0..dk).step_by(chunk) {
+                    stage_strided(
+                        c,
+                        (lane, lanes),
+                        (tile_rows, chunk),
+                        std::mem::size_of::<f32>(),
+                        StageOrder::AlongColumns,
+                        |e, r, d| {
+                            let channel = un(e, BinOp::Add, d, d0);
+                            load_q(e, r, channel)
+                        },
+                        |e, r, d, value| {
+                            let slot = staged_word(e, through, d, r);
+                            let value = score_grid.micro.stage_value(e, value);
+                            e.write_lds(through.array, op(slot), op(value));
+                        },
+                    );
+                    c.barrier();
+                    held.extend(c.emit(|e| {
+                        (0..chunk / kappa)
+                            .map(|step| score_grid.micro.hold_a(e, &gs, through, step * kappa))
+                            .collect::<Vec<_>>()
+                    }));
+                    // The last chunk's loads are ordered before the first key block's staging by the barrier
+                    // that publishes the rows' state below.
+                    if d0 + chunk < dk {
+                        c.barrier();
+                    }
+                }
+                Some(held)
+            }
+        };
         // The score rows' query positions (causal) or additive-mask rows (`(plane * lq + i) * lk`).
         let row_positions = match mask_kind {
             MaskKind::Causal { .. } => Some(c.emit(|e| {
@@ -849,6 +978,7 @@ pub(super) fn tiled_body(
             stage.run(
                 c,
                 (k, head_dim),
+                StageOrder::AlongColumns,
                 |e, t| key_rows(e, t).0,
                 |e, j, d, value| {
                     let slot = staged_word(e, tiles.k, d, j);
@@ -861,6 +991,7 @@ pub(super) fn tiled_body(
                 stage.run(
                     c,
                     (k_shared, shared_dim),
+                    StageOrder::AlongColumns,
                     |e, t| key_rows(e, t).1,
                     |e, j, d, value| {
                         let channel = un(e, BinOp::Add, d, head_dim);
@@ -879,7 +1010,21 @@ pub(super) fn tiled_body(
                 score_grid.micro.zero(e, &mut acc);
                 acc
             });
-            product(c, score_grid.micro, &gs, &mut acc_s, (tiles.q, tiles.k), dk);
+            match (&held, tiles.q) {
+                (None, QTile::Staged(q_tile)) => {
+                    product(c, score_grid.micro, &gs, &mut acc_s, (q_tile, tiles.k), dk);
+                }
+                // A held fragment is a register: its depth step is a compile-time one, so the product is unrolled.
+                (Some(held), QTile::Held { .. }) => c.emit(|e| {
+                    let kappa = score_grid.micro.kappa();
+                    for (step, a) in held.iter().enumerate() {
+                        score_grid
+                            .micro
+                            .step_held(e, &gs, &mut acc_s, a, tiles.k, step * kappa);
+                    }
+                }),
+                _ => unreachable!("Q is held exactly when its tile is"),
+            }
             // An opaque fragment's elements are read back from workgroup memory, once every wave has stored its own.
             if score_grid.micro.needs_spill() {
                 c.emit(|e| score_grid.micro.spill(e, &gs, &acc_s, scratch));
@@ -936,7 +1081,7 @@ pub(super) fn tiled_body(
                     }
                 });
             });
-            c.emit(|e| s.row_reduce(e, BinOp::Max).publish(e, &gs, RED_MAX_ARRAY));
+            c.emit(|e| s.row_reduce(e, BinOp::Max).publish(e, &gs, RED_ARRAY));
             c.barrier();
 
             // 3. V over K's storage. Every lane folds the published maxima of the rows it owns into their running
@@ -945,6 +1090,11 @@ pub(super) fn tiled_body(
             stage.run(
                 c,
                 (v, dv),
+                // A fragment tile stores V transposed, `[channel][key]`.
+                match tiles.v.major {
+                    StagedMajor::X => StageOrder::AlongRows,
+                    StagedMajor::K => StageOrder::AlongColumns,
+                },
                 |e, t| key_rows(e, t).0,
                 |e, j, d, value| {
                     let slot = staged_word(e, tiles.v, j, d);
@@ -972,7 +1122,7 @@ pub(super) fn tiled_body(
                     let rounded = narrowed(e, precision, None, p);
                     out_grid.micro.stage_value(e, rounded)
                 });
-                s.row_reduce(e, BinOp::Add).publish(e, &gs, RED_SUM_ARRAY);
+                s.row_reduce(e, BinOp::Add).publish(e, &gs, RED_ARRAY);
                 go.row_values(e, |e, row| e.read_lds(Ty::F32, ALPHA_ARRAY, op(row)))
             });
             if out_grid.micro.needs_spill() {
@@ -1000,7 +1150,7 @@ pub(super) fn tiled_body(
                     let base = un(e, BinOp::Mul, r, owners);
                     let sum = (0..owners).fold(decayed, |sum, o| {
                         let at = un(e, BinOp::Add, base, o);
-                        let part = e.read_lds(Ty::F32, RED_SUM_ARRAY, op(at));
+                        let part = e.read_lds(Ty::F32, RED_ARRAY, op(at));
                         bin(e, Ty::F32, BinOp::Add, op(sum), op(part))
                     });
                     e.write_lds(L_ARRAY, op(r), op(sum));
@@ -1071,6 +1221,7 @@ impl StageKeys {
         self,
         c: &mut Cfg,
         (part, width): (Local, usize),
+        order: StageOrder,
         row_of: impl Fn(&mut Emit, Local) -> Local,
         write: impl Fn(&mut Emit, Local, Local, Local),
     ) {
@@ -1078,6 +1229,8 @@ impl StageKeys {
             c,
             (self.lane, self.lanes),
             (self.bc, width),
+            self.kv.bytes(),
+            order,
             |e, j, d| {
                 let t = uu(e, BinOp::Add, self.k0, j);
                 let real = bin(e, Ty::Bool, BinOp::Lt, op(t), op(self.end));
@@ -1093,14 +1246,38 @@ impl StageKeys {
     }
 }
 
-/// The most loads one lane holds in flight in [`stage_strided`].
-const STAGE_BATCH: usize = 4;
+/// The most bytes one lane holds in flight in [`stage_strided`]: 8 f32 or 16 two-byte elements. Measured on the bank's
+/// `prefill-attention-8192` fragment cell (ROCm, gfx1151, POOT-1440): 16 two-byte loads in flight are 10% faster than
+/// 4, where 16 f32 loads are 12% slower than 4.
+const STAGE_BYTES: usize = 32;
+
+/// Which of a staged tile's axes is contiguous in workgroup memory, and so which way one lane's batch of elements
+/// runs (adjacent lanes stay on adjacent columns either way, so the global loads coalesce).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StageOrder {
+    /// The columns are contiguous where they are stored: a lane's batch strides the rows, adjacent lanes store
+    /// adjacent words.
+    AlongColumns,
+    /// The rows are contiguous where they are stored (a tile staged transposed, like a fragment's `V`
+    /// `[channel][key]`): a lane's batch is a run of consecutive rows of its column, so its stores are adjacent
+    /// and aligned and can merge into one wide store per 16 bytes, instead of one 2-byte store per element at a
+    /// lane stride that lands lanes on a repeating subset of the LDS banks.
+    AlongRows,
+}
 
 /// Where a lane's elements of a `rows x width` tile sit when `lanes` lanes stage it, lane `l` taking flat elements
 /// `l, l + lanes, ..` (adjacent lanes on adjacent columns, so the loads coalesce). Its `u`-th element is a
 /// lane-dependent base plus a compile-time offset, so the addresses of a batch share one or two registers.
 #[derive(Clone, Copy)]
 enum Strided {
+    /// `lanes` is a multiple of `width` and the order is [`StageOrder::AlongRows`]: the lane keeps column `col`;
+    /// its rows are `start + n * groups + u` for its batch `n` (a multiple of the batch) and `u` below the batch,
+    /// `start` its row group (of `groups = lanes / width`) times the batch.
+    Runs {
+        start: Local,
+        col: Local,
+        groups: usize,
+    },
     /// `lanes` is a multiple of `width`: the lane keeps column `col` and steps `rows_per_trip` rows.
     Column {
         row: Local,
@@ -1114,8 +1291,20 @@ enum Strided {
 }
 
 impl Strided {
-    fn new(e: &mut Emit, (lane, lanes): (Local, usize), width: usize) -> Self {
-        if lanes.is_multiple_of(width) {
+    fn new(
+        e: &mut Emit,
+        (lane, lanes): (Local, usize),
+        width: usize,
+        (order, batch): (StageOrder, usize),
+    ) -> Self {
+        if order == StageOrder::AlongRows && lanes.is_multiple_of(width) {
+            let group = un(e, BinOp::Div, lane, width);
+            Self::Runs {
+                start: un(e, BinOp::Mul, group, batch),
+                col: un(e, BinOp::Rem, lane, width),
+                groups: lanes / width,
+            }
+        } else if lanes.is_multiple_of(width) {
             Self::Column {
                 row: un(e, BinOp::Div, lane, width),
                 col: un(e, BinOp::Rem, lane, width),
@@ -1150,6 +1339,17 @@ impl Strided {
             }
         };
         match self {
+            Self::Runs { start, col, groups } => {
+                // The batch's first row, then the element's compile-time offset in the run.
+                let first_row = match first {
+                    None => start,
+                    Some(first) => {
+                        let by = un(e, BinOp::Mul, first, groups);
+                        uu(e, BinOp::Add, by, start)
+                    }
+                };
+                (un(e, BinOp::Add, first_row, u), col)
+            }
             Self::Column {
                 row,
                 col,
@@ -1174,7 +1374,8 @@ impl Strided {
 }
 
 /// Stage a `rows x width` tile cooperatively over `lanes` lanes ([`Strided`]), in batches of up to
-/// [`STAGE_BATCH`] elements whose loads are all emitted before their stores, so their latencies overlap.
+/// [`STAGE_BYTES`] bytes of `elem_bytes`-byte elements whose loads are all emitted before their stores, so their
+/// latencies overlap.
 /// `load(e, row, col)` must be safe for every element (no branch guards it); `store(e, row, col, value)` places it.
 /// The tile is a multiple of `lanes` elements ([`TiledLayout::of`] checks it), so every lane stages the same
 /// count and no element needs a guard.
@@ -1182,15 +1383,17 @@ fn stage_strided(
     c: &mut Cfg,
     (lane, lanes): (Local, usize),
     (rows, width): (usize, usize),
+    elem_bytes: usize,
+    order: StageOrder,
     load: impl Fn(&mut Emit, Local, Local) -> Local,
     store: impl Fn(&mut Emit, Local, Local, Local),
 ) {
     let per_lane = rows * width / lanes;
-    let batch = (1..=STAGE_BATCH.min(per_lane))
+    let batch = (1..=(STAGE_BYTES / elem_bytes).min(per_lane))
         .rev()
         .find(|b| per_lane.is_multiple_of(*b))
         .expect("1 divides every count");
-    let strided = c.emit(|e| Strided::new(e, (lane, lanes), width));
+    let strided = c.emit(|e| Strided::new(e, (lane, lanes), width, (order, batch)));
     let emit_batch = |e: &mut Emit, first: Option<Local>| {
         let places: Vec<(Local, Local)> = (0..batch)
             .map(|u| strided.at(e, (lanes, width), first, u))

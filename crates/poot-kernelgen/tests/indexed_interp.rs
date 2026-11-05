@@ -190,6 +190,7 @@ fn an_invalid_expert_id_is_a_nan_row_and_never_an_out_of_range_read() {
                     layout,
                     segments: EXPERTS,
                     terms: poot_kernelgen::StagedTerms::ONE,
+                    weight_bits: kg::DenseTiledWeight::Nk(weight).bits(),
                 },
                 &DeviceCaps::wgpu_rdna3_igpu(),
             )

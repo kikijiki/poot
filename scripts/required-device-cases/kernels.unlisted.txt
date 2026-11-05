@@ -4,10 +4,13 @@
 poot-kernelgen	attention::tests::a_spec_outside_the_generators_contract_is_a_typed_error	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::dense::tests::the_dense_tiled_body_matches_a_host_product_at_every_planned_tiling	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_contraction_below_the_device_takes_the_cheapest_lane_step	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::tests::a_fragment_round_stages_whole_requests_of_every_operand_row	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::tests::a_fragment_tile_of_one_wave_loses_to_the_scalar_tiling	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_long_prefill_takes_the_widest_tile	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_tiles_passes_count_the_segment_boundaries_it_spans	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::an_expert_walk_takes_shorter_tiles_than_the_same_dense_shape	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::the_candidates_are_the_tilings_the_device_runs	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::tiled::tests::a_split_moves_the_reads_ahead_and_keeps_their_uses	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	emit::tests::reads_a_full_word_at_a_word_boundary	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	emit::tests::reads_spanning_a_word_boundary	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	emit::tests::reads_the_last_bit_of_a_word_without_touching_the_guard	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -86,6 +89,7 @@ poot-kernelgen	packed::row_gather_tests::row_gather_matches_decode_blocks_rows_f
 poot-kernelgen	packed::row_gather_tests::row_gather_matches_decode_blocks_rows_for_every_kquant_format	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::row_gather_tests::row_gather_matches_decode_blocks_rows_on_wgpu	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::row_gather_tests::row_gather_matches_decode_blocks_rows_on_wgpu_kquant	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	precision::tests::a_staged_operand_is_rounded_once_and_narrowed_exactly	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	reduce::tests::array_sum_probe_emits_valid_nvptx	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	reduce::tests::array_sum_probe_rejected_on_spirv	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	reduce::tests::reduce_last_lds_emits_valid_nvptx	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case

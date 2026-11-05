@@ -17,6 +17,7 @@ mod source;
 pub(crate) use kernel::packed_contraction;
 pub use kernel::{
     PackedKernelOp, PackedKernelSpec, PackedRunSharing, packed_kernel, packed_run_sharing,
+    packed_value_bits,
 };
 
 #[cfg(test)]
@@ -168,8 +169,9 @@ mod fixtures {
                 waves_n,
                 tile,
                 run,
+                depth,
             } => format!(
-                "fragment_tiled{}x{}x{}x{}r{}",
+                "fragment_tiled{}x{}x{}x{}r{}d{depth}",
                 waves_m.get(),
                 waves_n.get(),
                 tile.rows,
@@ -747,6 +749,7 @@ mod planar_fixtures {
             layout: WeightLayout::Nk,
             segments: 1,
             terms: StagedTerms::ONE,
+            weight_bits: crate::packed_value_bits(format),
         };
         let tiling = RegisterTiling::candidates(shape, caps)
             .max_by_key(|tiling| {
@@ -1216,6 +1219,7 @@ mod contraction_tests {
             &format!("contraction_{format:?}_{}_{blocks}", schedule_tag(schedule)),
             format,
             schedule,
+            &[k as u32, out_per_block as u32],
             None,
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
@@ -1298,6 +1302,7 @@ mod contraction_tests {
                                 layout: crate::WeightLayout::Nk,
                                 segments: 1,
                                 terms: crate::StagedTerms::ONE,
+                                weight_bits: crate::packed_value_bits(format),
                             },
                             &poot_target::DeviceCaps::wgpu_rdna3_igpu(),
                         )
@@ -1318,6 +1323,7 @@ mod contraction_tests {
                         "narrowed",
                         format,
                         schedule,
+                        &[k as u32, out_per_block as u32],
                         None,
                         crate::PackedRows::Blocks,
                         precision,
@@ -1414,6 +1420,7 @@ mod contraction_tests {
             "contraction_vec4_unroll6",
             poot_quant::format::WeightFormat::Q8_0,
             schedule,
+            &[],
             None,
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
@@ -1522,6 +1529,7 @@ mod contraction_tests {
                     &format!("epilogue_{format:?}_{}", schedule_tag(schedule)),
                     format,
                     schedule,
+                    &[],
                     Some(&epilogue),
                     crate::PackedRows::Blocks,
                     poot_graph_ir::OperandPrecision::Exact,
@@ -1561,6 +1569,7 @@ mod contraction_tests {
             "tiled_epilogue",
             poot_quant::format::WeightFormat::Q8_0,
             register_tiled(2, 32),
+            &[],
             Some(&epilogue),
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
@@ -1652,6 +1661,7 @@ mod contraction_tests {
                 &format!("contraction_folded_interp_{format:?}"),
                 format,
                 schedule,
+                &[k as u32, out_per_block as u32],
                 None,
                 crate::PackedRows::Blocks,
                 poot_graph_ir::OperandPrecision::Exact,
@@ -1703,6 +1713,7 @@ mod contraction_tests {
                     &name,
                     format,
                     schedule,
+                    &[],
                     None,
                     crate::PackedRows::Blocks,
                     poot_graph_ir::OperandPrecision::Exact,
@@ -1736,6 +1747,7 @@ mod contraction_tests {
                     &name,
                     format,
                     schedule,
+                    &[],
                     None,
                     crate::PackedRows::Blocks,
                     poot_graph_ir::OperandPrecision::Exact,
@@ -1758,6 +1770,7 @@ mod contraction_tests {
                 &name,
                 format,
                 schedule,
+                &[32, 32],
                 None,
                 crate::PackedRows::Blocks,
                 poot_graph_ir::OperandPrecision::Exact,
@@ -1798,6 +1811,7 @@ mod contraction_tests {
             &name,
             format,
             schedule,
+            &[k as u32, out_per_block as u32],
             None,
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
@@ -1973,6 +1987,7 @@ mod contraction_tests {
                 &name,
                 format,
                 schedule,
+                &[k as u32, out_per_block as u32],
                 None,
                 crate::PackedRows::Blocks,
                 poot_graph_ir::OperandPrecision::Exact,
@@ -2090,6 +2105,7 @@ mod planar_contraction_tests {
             ),
             format,
             schedule,
+            &[k as u32, out_rows as u32],
             None,
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
@@ -2159,6 +2175,7 @@ mod planar_contraction_tests {
                     layout: WeightLayout::Nk,
                     segments: 1,
                     terms: crate::StagedTerms::ONE,
+                    weight_bits: crate::packed_value_bits(format),
                 };
                 for tiling in RegisterTiling::candidates(shape, &caps) {
                     run_case(format, k, 6, m, tiling.schedule());
@@ -2214,6 +2231,7 @@ mod planar_contraction_tests {
                 ),
                 format,
                 schedule,
+                &[k as u32, out_per_block as u32],
                 None,
                 crate::PackedRows::Blocks,
                 poot_graph_ir::OperandPrecision::Exact,
@@ -2506,6 +2524,7 @@ mod rocm_tests {
             &name,
             format,
             schedule,
+            &[k as u32, out_per_block as u32],
             None,
             crate::PackedRows::Blocks,
             precision,
@@ -2572,6 +2591,7 @@ mod rocm_tests {
                 cols: 2,
             },
             run: crate::contraction::RunLength::dividing(k),
+            depth: 32,
         };
         for format in BLOCK32.into_iter().chain(KQUANT) {
             for precision in [
@@ -2764,6 +2784,7 @@ mod rocm_tests {
                     &name,
                     format,
                     schedule,
+                    &[k as u32, out_rows as u32],
                     None,
                     crate::PackedRows::Blocks,
                     poot_graph_ir::OperandPrecision::Exact,
@@ -2807,6 +2828,7 @@ mod rocm_tests {
                 &name,
                 case.format,
                 case.schedule,
+                &[k as u32, case.out_rows as u32],
                 None,
                 crate::PackedRows::Blocks,
                 poot_graph_ir::OperandPrecision::Exact,
@@ -2869,6 +2891,7 @@ mod planar_wgpu_tests {
                 &name,
                 case.format,
                 case.schedule,
+                &[k as u32, case.out_rows as u32],
                 None,
                 crate::PackedRows::Blocks,
                 poot_graph_ir::OperandPrecision::Exact,
@@ -3060,6 +3083,7 @@ mod ptx_tests {
             &name,
             format,
             schedule,
+            &[k as u32, out_per_block as u32],
             None,
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
@@ -3325,6 +3349,7 @@ mod planar_ptx_tests {
             &name,
             format,
             schedule,
+            &[k as u32, out_rows as u32],
             None,
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,

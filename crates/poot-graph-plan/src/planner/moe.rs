@@ -200,6 +200,7 @@ fn plan_indexed(
                     segments: experts,
                     terms: kg::StagedTerms::of(precision, None, kg::stored_fragment_dtype(weight))
                         .scalar_only(),
+                    weight_bits: kg::dense_value_bits(weight),
                 },
                 caps,
             )?;

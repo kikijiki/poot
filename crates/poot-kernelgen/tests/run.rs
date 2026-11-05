@@ -738,6 +738,7 @@ fn indexed_tiling((m, k, n, experts): (usize, usize, usize, usize)) -> kg::Sched
             layout: kg::WeightLayout::Kn,
             segments: experts,
             terms: poot_kernelgen::StagedTerms::ONE,
+            weight_bits: 32,
         },
         &poot_target::DeviceCaps::wgpu_rdna3_igpu(),
     )
@@ -1964,6 +1965,7 @@ fn dense_tiled(
             layout,
             segments: 1,
             terms: poot_kernelgen::StagedTerms::ONE,
+            weight_bits: weight.bits(),
         },
         caps,
     );

@@ -150,11 +150,15 @@ fn attention_detail(eqn: &Eqn, choice: &KernelChoice, dispatch: &Dispatch) -> St
             bc,
             micro:
                 poot_kernelgen::AttentionMicro::Fragment {
-                    dtype, score, out, ..
+                    dtype,
+                    score,
+                    out,
+                    q,
+                    ..
                 },
             ..
         } => format!(
-            "tiled(br={br} bc={bc} fragment={dtype:?} score={}x{}w{}x{}f out={}x{}w{}x{}f)",
+            "tiled(br={br} bc={bc} fragment={dtype:?} q={q:?} score={}x{}w{}x{}f out={}x{}w{}x{}f)",
             score.waves_m,
             score.waves_n,
             score.rows,

@@ -108,7 +108,8 @@ fn declared_attention_precision_matches_the_oracle_on_vulkan() {
     };
     let t = device.target();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-    // The 160-row fixture must run on the matrix unit, not the register tiles.
+    // The 160-row fixture must run on the matrix unit, not the register tiles, with its Q fragments held in
+    // registers across the key loop (POOT-1447): the parity below checks that body.
     let micro = poot_executor_parity::precision::planned_fragment_attention(
         exec.as_ref(),
         t,
@@ -120,6 +121,7 @@ fn declared_attention_precision_matches_the_oracle_on_vulkan() {
             micro,
             poot_kernelgen::AttentionMicro::Fragment {
                 layout: poot_target::FragmentLayout::Opaque,
+                q: poot_kernelgen::QOperand::Held,
                 ..
             }
         ),

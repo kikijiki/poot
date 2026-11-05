@@ -127,6 +127,9 @@ pub struct Context {
     /// Active compute units, probed from AMD's Vulkan shader-core properties at init (card 653); the
     /// RDNA3 default where the driver exposes no such query. Feeds [`Context::device_caps`].
     compute_units: u32,
+    /// The register file, from the same AMD shader-core properties (POOT-1447); `Unknown` where the driver
+    /// exposes none. Feeds [`Context::device_caps`].
+    register_file: poot_target::Queried<poot_target::RegisterFile>,
     /// The device-local memory budget the process had when the context opened
     /// ([`Context::vram_budget_bytes`], `VK_EXT_memory_budget`). Fixed at open: it is part of the
     /// planner's [`poot_target::Target`] identity, which a later query must not change under a program

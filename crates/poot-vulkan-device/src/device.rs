@@ -112,6 +112,12 @@ impl VulkanDevice {
         Self::with_timing(GraphTiming::Off, options)
     }
 
+    /// Like [`Self::new`], but every replay writes per-dispatch timestamps, so [`Device::device_time`] is
+    /// `Measured`; fails with `TimestampsUnavailable` on a queue that cannot timestamp.
+    pub fn new_with_device_timing() -> Result<Self, VulkanGpuError> {
+        Self::with_timing(GraphTiming::PerDispatch, ContextOptions::default())
+    }
+
     fn with_timing(timing: GraphTiming, options: ContextOptions) -> Result<Self, VulkanGpuError> {
         let ctx = Context::new_with_options(options)?;
         if timing == GraphTiming::PerDispatch && !ctx.timestamps_supported() {

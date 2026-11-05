@@ -129,6 +129,7 @@ fn run_indexed(x: &[f32], ids: &[i32]) -> Vec<f32> {
             layout: kg::WeightLayout::Kn,
             segments: EXPERTS,
             terms: poot_kernelgen::StagedTerms::ONE,
+            weight_bits: 32,
         },
         &caps,
     )

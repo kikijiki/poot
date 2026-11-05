@@ -707,12 +707,6 @@ const FRAGMENT_KEY_BLOCKS: [usize; 3] = [64, 32, 16];
 /// Workgroup widths the fragment schedule considers, widest first: whole waves of 32 lanes, down to the one wave a
 /// runtime that cannot widen its subgroups allows.
 const FRAGMENT_LANES: [usize; 5] = [512, 256, 128, 64, 32];
-/// The `f32` accumulator registers (both products' fragments) one lane of a fragment attention holds. The staged
-/// tiles of a tiling take most of a compute unit's workgroup memory, so one workgroup is resident per unit and its
-/// registers are not shared with a second workgroup's: the 256 a wave32 lane can address are the file, half for
-/// accumulators. Measured on the bank's `prefill-attention-*` cells (POOT-1437): a 64-register budget keeps 64 tile
-/// rows (the K/V block is restaged for every 64 rows); 128 registers hold 128 and the cell takes 0.7 of the time.
-const FRAGMENT_ACCUMULATORS_PER_LANE: usize = 128;
 /// The `f32` accumulators (score tile plus output tile) one lane of a tiled attention holds: half of the 128
 /// registers below which RDNA3 keeps 12 waves per SIMD resident (1536 VGPRs per lane slot) and an NVIDIA SM 16
 /// warps (65536 registers), the other half going to the step's staged operands, the addresses and the row state.
@@ -756,15 +750,16 @@ fn attention_fragment_config(
         .then_some(config)
 }
 
-/// The fragments one wave holds over a `rows x cols` tile that `waves` waves cover: every grid of `waves_m x
-/// waves_n` waves whose share is whole 16x16 fragments, the most square (the fewest operand fragment loads per
-/// multiply, as [`attention_lane_tile`] weighs lane tiles), ties to fewer wave columns (fewer lanes to combine a
-/// row over).
-fn attention_wave_tile(rows: usize, cols: usize, waves: usize) -> Option<poot_kernelgen::WaveTile> {
+/// The wave grids `waves` waves form over a `rows x cols` tile whose share is whole 16x16 fragments.
+fn attention_wave_grids(
+    rows: usize,
+    cols: usize,
+    waves: usize,
+) -> impl Iterator<Item = poot_kernelgen::WaveTile> {
     let edge = poot_target::FragmentShape::M16N16K16.m as usize;
     (1..=waves)
-        .filter(|waves_m| waves.is_multiple_of(*waves_m))
-        .filter_map(|waves_m| {
+        .filter(move |waves_m| waves.is_multiple_of(*waves_m))
+        .filter_map(move |waves_m| {
             let waves_n = waves / waves_m;
             let (m, n) = (edge * waves_m, edge * waves_n);
             (rows.is_multiple_of(m) && cols.is_multiple_of(n)).then_some(poot_kernelgen::WaveTile {
@@ -774,19 +769,41 @@ fn attention_wave_tile(rows: usize, cols: usize, waves: usize) -> Option<poot_ke
                 cols: (cols / n) as u32,
             })
         })
-        .min_by_key(|tile| (tile.rows + tile.cols, tile.waves_n))
 }
 
-/// The micro-tiles of a tile of `rows` and the schedule's `bc` and `dv` widths over `lanes` lanes, and the f32
-/// accumulators each lane holds for them: matrix fragments of `config` (one wave per 32 lanes) where `fragment`
-/// names it, else register tiles.
+/// The fragments one wave holds over a `rows x cols` tile that `waves` waves cover, where both operands are
+/// loaded every step: the most square grid (the fewest operand fragment loads per multiply, as
+/// [`attention_lane_tile`] weighs lane tiles), ties to fewer wave columns (fewer lanes to combine a row over).
+fn attention_wave_tile(rows: usize, cols: usize, waves: usize) -> Option<poot_kernelgen::WaveTile> {
+    attention_wave_grids(rows, cols, waves).min_by_key(|tile| (tile.rows + tile.cols, tile.waves_n))
+}
+
+/// The fragments one wave holds over a `rows x cols` score tile whose A operand (Q) the wave holds in registers:
+/// the grid with the fewest fragment rows per wave (each holds `dk / 16` A fragments for the whole key loop, and
+/// a step loads only the B fragments, `1 / rows` a multiply), ties to fewer wave columns.
+fn attention_held_wave_tile(
+    rows: usize,
+    cols: usize,
+    waves: usize,
+) -> Option<poot_kernelgen::WaveTile> {
+    attention_wave_grids(rows, cols, waves).min_by_key(|tile| (tile.rows, tile.waves_n))
+}
+
+/// The micro-tiles of a tile of `rows` and the schedule's `bc`, `dv` and `dk` widths over `lanes` lanes with Q
+/// where `q` says, and the registers each lane holds for them across the key loop: matrix fragments of `config`
+/// (one wave per 32 lanes) where `fragment` names it (the f32 accumulator fragments of both products and, with Q
+/// held, its operand fragments), else register tiles (their f32 accumulators; Q is always staged).
 fn attention_micro(
     fragment: Option<poot_target::FragmentConfig>,
-    (rows, bc, dv): (usize, usize, usize),
+    (rows, bc, dv, dk): (usize, usize, usize, usize),
     lanes: usize,
+    q: poot_kernelgen::QOperand,
 ) -> Option<(poot_kernelgen::AttentionMicro, usize)> {
     match fragment {
         None => {
+            if q == poot_kernelgen::QOperand::Held {
+                return None;
+            }
             let (score, out) = (
                 attention_lane_tile(rows, bc, lanes)?,
                 attention_lane_tile(rows, dv, lanes)?,
@@ -802,19 +819,31 @@ fn attention_micro(
             if !lanes.is_multiple_of(lane_count) || waves > config.waves as usize {
                 return None;
             }
-            let (score, out) = (
-                attention_wave_tile(rows, bc, waves)?,
-                attention_wave_tile(rows, dv, waves)?,
-            );
+            let score = match q {
+                poot_kernelgen::QOperand::Staged => attention_wave_tile(rows, bc, waves)?,
+                poot_kernelgen::QOperand::Held => attention_held_wave_tile(rows, bc, waves)?,
+            };
+            let out = attention_wave_tile(rows, dv, waves)?;
             let fragments = (score.rows * score.cols + out.rows * out.cols) as usize;
+            let accumulators =
+                fragments * poot_kernel_ir::accumulator_map::ELEMENTS_PER_LANE as usize;
+            let held_q = match q {
+                poot_kernelgen::QOperand::Staged => 0,
+                poot_kernelgen::QOperand::Held => {
+                    score.rows as usize
+                        * (dk / config.shape.k as usize)
+                        * config.operand_registers() as usize
+                }
+            };
             Some((
                 poot_kernelgen::AttentionMicro::Fragment {
                     dtype: config.dtype,
                     layout: config.layout,
                     score,
                     out,
+                    q,
                 },
-                fragments * poot_kernel_ir::accumulator_map::ELEMENTS_PER_LANE as usize,
+                accumulators + held_q,
             ))
         }
     }
@@ -827,20 +856,33 @@ fn attention_micro(
 /// choice maximizes that reuse within what the device holds, from the shapes and caps alone:
 ///
 /// - the workgroup is at most the device's widest;
-/// - each lane's two accumulator tiles hold at most [`TILED_ACCUMULATORS_PER_LANE`] f32 registers;
+/// - each lane holds at most its register budget across the key loop: a register tile's two accumulator tiles at
+///   most [`TILED_ACCUMULATORS_PER_LANE`] f32 registers; a fragment tiling's accumulator fragments, and its held
+///   Q fragments, at most half of what one lane of the workgroup keeps resident of the device's register file
+///   ([`poot_target::RegisterFile::per_lane_of`]: the addressing limit or the workgroup's share of the file), the
+///   other half carrying a step's loaded operands, the staging and the softmax's row state;
 /// - the staged tiles fit `caps.lds_bytes`;
 /// - the row groups (`batch * hkv * ceil(lq / br)` workgroups) give every compute unit at least one.
 ///
-/// Where the operands narrow to a dtype the device has a matrix unit for ([`attention_fragment_config`]) the
-/// candidates are matrix fragments: waves of 32 lanes over the 16-row, 16-key and 16-channel fragments of
-/// the two products, a workgroup of `lanes / 32` waves. Where no fragment tiling fits, or the operands are exact,
-/// they are register tiles. A fragment tiling runs no fewer lanes than the register tiles would.
+/// Where the operands narrow to a dtype the device has a matrix unit for ([`attention_fragment_config`]) and the
+/// device reports its register file, the candidates are matrix fragments: waves of 32 lanes over the 16-row,
+/// 16-key and 16-channel fragments of the two products, a workgroup of `lanes / 32` waves, with Q staged in
+/// workgroup memory or held in registers ([`poot_kernelgen::QOperand`]). Where no fragment tiling fits, or the
+/// operands are exact, they are register tiles. A fragment tiling runs no fewer lanes than the register tiles would.
 ///
-/// Among the tilings that pass, the widest workgroup wins, then the most tile rows (reuse), then the widest key
-/// block (fewer barriers per FLOP). The staged tiles take most of a compute unit's workgroup memory, so one
+/// Among the register tilings that pass, the widest workgroup wins, then the most tile rows (reuse), then the widest
+/// key block (fewer barriers per FLOP). The staged tiles take most of a compute unit's workgroup memory, so one
 /// workgroup is resident per compute unit and its lanes are all the latency hiding the unit has: 256 lanes over
-/// 32 rows ran 30-40% faster than 128 lanes over 64 rows on ROCm (POOT-1402 bank sweep). A block-selected attention
-/// and a single-row (decode) one are not tiled: their rows share no key blocks.
+/// 32 rows ran 30-40% faster than 128 lanes over 64 rows on ROCm (POOT-1402 bank sweep). Among the fragment tilings
+/// the most tile rows win, then the narrowest workgroup, then the widest key block, then a held Q. The rows set how
+/// often every key block is restaged. At equal rows more waves split the same fragments into smaller wave tiles
+/// (more operand loads per multiply, more owners per row to combine) and measured slower every time, more than a
+/// wider key block repays (ROCm, the bank's 8192-position cell, f16 cache: 64 rows over 256 lanes 23.3 ms against
+/// 25.2 over 512, POOT-1440; 128 rows with Q held over 256 lanes 17.5 ms, over 512 lanes 25.0 at the same 32-key
+/// block and 20.5 at a 64-key one, POOT-1447). The block sets how many barriers and softmax combines a key costs.
+/// A held Q drops the Q fragment loads of every key block (at equal tiling 17.5 against 18.2 ms) and frees its
+/// workgroup memory. A block-selected attention and a single-row (decode) one are not tiled: their rows share no
+/// key blocks.
 pub(crate) fn attention_tiling(
     spec: &poot_kernelgen::AttentionSpec,
     caps: &DeviceCaps,
@@ -863,39 +905,54 @@ pub(crate) fn attention_tiling(
 }
 
 /// [`attention_tiling`]'s best tiling over the micro-tiles `fragment` selects (`None`: register tiles), of workgroups
-/// of at least `min_lanes` lanes.
+/// of at least `min_lanes` lanes. A fragment tiling needs the device's register file: without it no budget is
+/// known and none is chosen.
 fn attention_tiling_of(
     spec: &poot_kernelgen::AttentionSpec,
     caps: &DeviceCaps,
     fragment: Option<poot_target::FragmentConfig>,
     min_lanes: usize,
 ) -> Option<poot_kernelgen::AttentionSchedule> {
+    use poot_kernelgen::QOperand;
     let lanes_limit =
         (caps.max_workgroup_size[0] as usize).min(caps.max_workgroup_invocations as usize);
     let positions = std::iter::successors(Some(1usize), |br| Some(br * 2))
         .take_while(|br| br * spec.n_rep <= TILED_MAX_ROWS && *br < 2 * spec.lq);
     // A fragment workgroup is whole waves, down to the one wave a runtime that cannot widen its subgroups allows.
-    let (widths, key_blocks, budget): (&[usize], &[usize], usize) = if fragment.is_some() {
-        (
+    let (widths, key_blocks, operands): (&[usize], &[usize], &[QOperand]) = match fragment {
+        Some(_) => (
             &FRAGMENT_LANES,
             &FRAGMENT_KEY_BLOCKS,
-            FRAGMENT_ACCUMULATORS_PER_LANE,
-        )
-    } else {
-        (&TILED_LANES, &TILED_KEY_BLOCKS, TILED_ACCUMULATORS_PER_LANE)
+            &[QOperand::Staged, QOperand::Held],
+        ),
+        None => (&TILED_LANES, &TILED_KEY_BLOCKS, &[QOperand::Staged]),
+    };
+    // The registers one lane of a `lanes`-lane workgroup may hold across the key loop.
+    let budget = |lanes: usize| -> Option<usize> {
+        match fragment {
+            None => Some(TILED_ACCUMULATORS_PER_LANE),
+            Some(_) => {
+                let file = caps.register_file.known()?;
+                Some(file.per_lane_of(u32::try_from(lanes).ok()?) as usize / 2)
+            }
+        }
     };
     let candidates = positions.flat_map(|br| {
         widths
             .iter()
             .copied()
             .filter(move |&lanes| (min_lanes..=lanes_limit).contains(&lanes))
-            .flat_map(move |lanes| key_blocks.iter().map(move |&bc| (br, lanes, bc)))
+            .flat_map(move |lanes| {
+                key_blocks
+                    .iter()
+                    .flat_map(move |&bc| operands.iter().map(move |&q| (br, lanes, bc, q)))
+            })
     });
     candidates
-        .filter_map(|(br, lanes, bc)| {
+        .filter_map(|(br, lanes, bc, q)| {
             let rows = br * spec.n_rep;
-            let (micro, accumulators) = attention_micro(fragment, (rows, bc, spec.dv), lanes)?;
-            if accumulators > budget {
+            let (micro, held) = attention_micro(fragment, (rows, bc, spec.dv, spec.dk), lanes, q)?;
+            if held > budget(lanes)? {
                 return None;
             }
             let schedule = poot_kernelgen::AttentionSchedule::Tiled {
@@ -910,7 +967,17 @@ fn attention_tiling_of(
             };
             let lds = tiled.tiled_lds_bytes()?.ok()?;
             let fills = tiled.row_groups() >= caps.compute_units as usize;
-            (lds <= caps.lds_bytes as usize && fills).then_some(((lanes, rows, bc), schedule))
+            // Larger ranks first; a fragment tiling's width counts down (the narrowest wins).
+            let rank = match fragment {
+                Some(_) => (
+                    rows,
+                    usize::MAX - lanes,
+                    bc,
+                    usize::from(q == QOperand::Held),
+                ),
+                None => (lanes, rows, bc, 0),
+            };
+            (lds <= caps.lds_bytes as usize && fills).then_some((rank, schedule))
         })
         .max_by_key(|&(rank, _)| rank)
         .map(|(_, schedule)| schedule)

@@ -664,8 +664,10 @@ pub(crate) fn caps_from_agent(probe: &AgentProbe<'_>) -> poot_target::DeviceCaps
     let defaults = poot_target::DeviceCaps::rocm_default();
     // An agent whose ISA name carries no gfx code, or whose wavefront is unknown, has no matrix unit the
     // code generator can target.
-    let matrix_units = poot_target::AmdArch::from_isa_name(probe.isa_name, probe.wavefront)
-        .map_or(poot_target::MatrixUnits::NONE, |arch| arch.matrix_units());
+    let arch = poot_target::AmdArch::from_isa_name(probe.isa_name, probe.wavefront).ok();
+    let matrix_units = arch.map_or(poot_target::MatrixUnits::NONE, |arch| arch.matrix_units());
+    // POOT-1447: like the matrix units, the register file is the gfx code's.
+    let register_file = arch.map_or(poot_target::Queried::Unknown, |arch| arch.register_file());
     poot_target::DeviceCaps {
         max_buffer_bytes: if probe.vram_total_bytes == 0 {
             defaults.max_buffer_bytes
@@ -685,6 +687,7 @@ pub(crate) fn caps_from_agent(probe: &AgentProbe<'_>) -> poot_target::DeviceCaps
             })
         },
         matrix_units: poot_target::Queried::Known(matrix_units),
+        register_file,
         compute_units: probe.compute_units.unwrap_or(defaults.compute_units),
         // 0 is the failed one-time pool query: unknown, not an empty device.
         memory_budget_bytes: (probe.vram_total_bytes != 0).then_some(probe.vram_total_bytes),
@@ -764,6 +767,31 @@ mod caps_tests {
         assert_eq!(caps.max_workgroup_size, [1000, 500, 60]);
         assert_eq!(caps.max_workgroup_invocations, 777);
         assert_eq!(caps.max_grid, [11, 22, 33]);
+        assert_eq!(
+            caps.register_file,
+            Queried::Unknown,
+            "a wave64 CDNA part's file is not recorded"
+        );
+    }
+
+    /// POOT-1447: a gfx1151 agent reports the full RDNA3 register file of its gfx code, which the planner sizes
+    /// held fragments against. Mutation: report `Queried::Unknown` in `caps_from_agent`; this row reads `Unknown`.
+    #[test]
+    fn a_gfx11_agent_reports_its_register_file() {
+        let caps = caps_from_agent(&AgentProbe {
+            vram_total_bytes: 12_345,
+            isa_name: "amdgcn-amd-amdhsa--gfx1151",
+            wavefront: 32,
+            compute_units: Some(40),
+            limits: SENTINEL_LIMITS,
+        });
+        assert_eq!(
+            caps.register_file,
+            Queried::Known(poot_target::RegisterFile {
+                per_lane: 256,
+                per_workgroup: 196_608,
+            })
+        );
     }
 
     /// The text of the first GPU agent in `rocminfo`'s output: from its `Device Type: GPU` line to the next

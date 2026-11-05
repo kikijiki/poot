@@ -110,6 +110,7 @@ impl Context {
             max_grid: [self.max_workgroups; 3],
             watchdog_budget: calibration.watchdog_budget,
             matrix_units: self.matrix_units,
+            register_file: self.register_file,
             known_miscompiles: calibration.known_miscompiles,
             compute_units: self.compute_units,
             memory_budget_bytes: self.memory_budget_bytes,
@@ -235,8 +236,19 @@ impl Context {
         // shader-core properties through the wgpu-hal adapter where the driver exposes them; any other
         // device plans against the RDNA3 default, the one device family this backend's launch policy
         // is measured on.
-        let compute_units = probe_amd_compute_units(&adapter)
-            .unwrap_or(poot_target::DeviceCaps::wgpu_rdna3_igpu().compute_units);
+        // POOT-1447: the same properties give the register file; any other device reports it unknown.
+        let shader_core = probe_amd_shader_core(&adapter);
+        let compute_units = shader_core.map_or(
+            poot_target::DeviceCaps::wgpu_rdna3_igpu().compute_units,
+            |core| core.compute_units,
+        );
+        let register_file = shader_core.map_or(poot_target::Queried::Unknown, |core| {
+            poot_target::Queried::Known(poot_target::RegisterFile::amd_shader_core(
+                core.max_vgpr_allocation,
+                core.vgprs_per_simd,
+                core.simd_per_compute_unit,
+            ))
+        });
         // Card 158 diagnostic (debug-only, off by default): a deferred wgpu validation error (e.g. one
         // surfacing only on `Device::poll`, like the real-35B batched-prefill panic) shows as a bare
         // "Validation Error" if the failing resource has no debug label. This handler covers the other
@@ -286,6 +298,7 @@ impl Context {
             effective_max_buffer_size,
             lds_bytes,
             matrix_units,
+            register_file,
             compute_units,
             memory_budget_bytes: None,
             calibration,
@@ -461,13 +474,16 @@ fn granted_shader_features(granted: wgpu::Features) -> poot_target::ShaderFeatur
     }
 }
 
-/// The adapter's compute units through [`poot_runtime_common::vulkan_probe::amd_vulkan_compute_units`]; `None` off Vulkan.
-fn probe_amd_compute_units(adapter: &wgpu::Adapter) -> Option<u32> {
+/// The adapter's AMD shader-core properties through
+/// [`poot_runtime_common::vulkan_probe::amd_vulkan_shader_core`]; `None` off Vulkan or off AMD.
+fn probe_amd_shader_core(
+    adapter: &wgpu::Adapter,
+) -> Option<poot_runtime_common::vulkan_probe::AmdShaderCore> {
     // SAFETY: `as_hal` yields the live wgpu-hal Vulkan adapter for the guard's lifetime, so its
     // instance and physical device are valid for the call.
     unsafe {
         let hal = adapter.as_hal::<wgpu_hal::vulkan::Api>()?;
-        poot_runtime_common::vulkan_probe::amd_vulkan_compute_units(
+        poot_runtime_common::vulkan_probe::amd_vulkan_shader_core(
             hal.shared_instance().raw_instance(),
             hal.raw_physical_device(),
         )

@@ -363,6 +363,7 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
                 max_grid: [65_535, 65_535, 65_535],
                 watchdog_budget: None,
                 matrix_units: poot_target::Queried::Unknown,
+                register_file: poot_target::Queried::Unknown,
                 known_miscompiles: poot_target::KnownMiscompiles::default(),
                 compute_units: poot_target::STRIX_HALO_COMPUTE_UNITS,
                 memory_budget_bytes: None,

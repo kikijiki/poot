@@ -999,6 +999,160 @@
       "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
       "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
       "identity_digest": "4fa9759938b54bb74856e4bbe3779521d60d4aea31f9df25b32a65928b7c0202"
+    },
+    {
+      "id": "prefill-attention-2048-kvf16",
+      "regime": "causal prefill attention, GQA, f16 KV cache",
+      "level": "kernel",
+      "producer": "attention_prefill",
+      "shape": {
+        "hq": 16,
+        "hkv": 8,
+        "d": 128,
+        "lq": 2048,
+        "cap": 2048
+      },
+      "storage": "f16",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "scale": "1/sqrt(d)",
+        "mask": "causal from Slot::Pos",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "fixture_id": "1737e01de9e003f6036184f3293257977ae0599847a4dc8858817a311e518873",
+      "identity_digest": "9e5185309666ad98f605e6a5fc7ff2effe353c1d42f2c0fa1a43af7b6f726d00"
+    },
+    {
+      "id": "prefill-attention-8192-kvf16",
+      "regime": "causal prefill attention, GQA, f16 KV cache",
+      "level": "kernel",
+      "producer": "attention_prefill",
+      "shape": {
+        "hq": 16,
+        "hkv": 8,
+        "d": 128,
+        "lq": 8192,
+        "cap": 8192
+      },
+      "storage": "f16",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "scale": "1/sqrt(d)",
+        "mask": "causal from Slot::Pos",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "fixture_id": "ce26b2cd3ded556d0c20e279cdbdd3c533cfebadafeec02371b589b59c5291a3",
+      "identity_digest": "4950c353601ea79b4a5035a22947aa2e16ce653665738cd992ae914c9a73d7b7"
+    },
+    {
+      "id": "prefill-attention-2048-kvf16-narrow",
+      "regime": "causal prefill attention, GQA, narrow operands on matrix units, f16 KV cache",
+      "level": "kernel",
+      "producer": "attention_prefill",
+      "shape": {
+        "hq": 16,
+        "hkv": 8,
+        "d": 128,
+        "lq": 2048,
+        "cap": 2048
+      },
+      "storage": "f16",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "scale": "1/sqrt(d)",
+        "mask": "causal from Slot::Pos",
+        "reference": "f64 loop",
+        "operand_precision": "narrow"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "fixture_id": "cca490d415c60d20e2a09cf6abc6df99ae80e07afcf250d53a279a1414a49713",
+      "identity_digest": "4a24d948fcfcc140496a6a6c34757ea5b181fb4659eccb98f419983d53e62fb4"
+    },
+    {
+      "id": "prefill-attention-8192-kvf16-narrow",
+      "regime": "causal prefill attention, GQA, narrow operands on matrix units, f16 KV cache",
+      "level": "kernel",
+      "producer": "attention_prefill",
+      "shape": {
+        "hq": 16,
+        "hkv": 8,
+        "d": 128,
+        "lq": 8192,
+        "cap": 8192
+      },
+      "storage": "f16",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "scale": "1/sqrt(d)",
+        "mask": "causal from Slot::Pos",
+        "reference": "f64 loop",
+        "operand_precision": "narrow"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "fixture_id": "652a9aa3225d42b9ebf52f7eedb17ff7eb908bf904cd6e8929cc33735e665548",
+      "identity_digest": "ff57e37f6f77ff162a30f0a34d034605ec049e7892012a708c9f153454004d47"
     }
   ]
 }

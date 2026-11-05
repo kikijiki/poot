@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Hardware counters for one performance-bank case on a ROCm device (POOT-1443).
+
+    scripts/profile-rocm-kernel <performance_bank binary> <case id> <out dir>
+
+Runs the bank runner of `poot-rocm-device` under TheRock's `rocprofv3` (the devshell wrapper, see flake.nix), once
+per counter group, and writes `<out dir>/<case>/summary.md` and `summary.json`. Counter collection serializes
+dispatches, so these runs say what a kernel does, never how fast it is: device time stays the bank's `device_us`.
+
+Hold `/tmp/poot-gpu.lock` around the call (`just profile-rocm-kernel` does). One group is one run because a
+rocprofv3 pass can only read as many hardware counters as the block has; a group the hardware refuses is recorded
+with the profiler's error text, never dropped, so an unsupported counter is visible in the summary. Kernel tracing
+(`--kernel-trace`) segfaults with poot's raw HSA queues on this ROCm build, so the per-dispatch time comes from the
+counter CSV's own start and end timestamps.
+
+Per-dispatch values are the profiler's sums over the whole device. The summary reports, for the kernel with the most
+total device time in the run (the case's hot kernel), the median over its dispatches.
+"""
+
+import csv
+import json
+import os
+import statistics
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+BANK = REPO / "benchmarks/performance-bank/cases.json"
+
+# One entry per rocprofv3 pass. Names are gfx1151's `rocprofv3-avail info --pmc`; the "what" is what the counters
+# are read for. WMMA issue, instruction-cache and s_waitcnt counters are not offered on this chip (the receipt
+# records the avail listing), so wave residency and stall time are read from SQ_WAVE_CYCLES / SQ_BUSY_CYCLES.
+GROUPS = [
+    ("waves", ["SQ_WAVES", "SQ_BUSY_CYCLES", "SQ_WAVE_CYCLES", "GRBM_GUI_ACTIVE"]),
+    ("valu-salu", ["SQ_INSTS_VALU", "SQ_INSTS_SALU"]),
+    ("lds-smem", ["SQ_INSTS_LDS", "SQ_INSTS_SMEM"]),
+    ("mem-insts", ["SQ_INSTS_FLAT", "SQ_INSTS_TEX_LOAD", "SQ_INSTS_TEX_STORE"]),
+    ("lds-conflict", ["SQC_LDS_BANK_CONFLICT", "SQC_LDS_IDX_ACTIVE"]),
+    ("lds-conflict-pct", ["LDSBankConflict"]),
+    ("occupancy", ["OccupancyPercent", "MeanOccupancyPerCU", "MeanOccupancyPerActiveCU"]),
+    ("mem-unit", ["MemUnitBusy", "TA_BUSY_avr", "WriteUnitStalled"]),
+    ("l2", ["L2CacheHit", "GL2C_HIT", "GL2C_MISS"]),
+    ("fetch", ["FETCH_SIZE"]),
+    ("write", ["WRITE_SIZE"]),
+    ("l2-stall", ["GL2C_MC_WRREQ_STALL", "GL2C_EA_RDREQ_32B", "GL2C_EA_RDREQ_64B", "GL2C_EA_RDREQ_128B"]),
+]
+
+
+def run_group(binary, case, out, tag, counters):
+    """Run the bank case under one counter group; returns (rows, error)."""
+    directory = out / "raw" / tag
+    env = dict(os.environ, POOT_BANK_DEVICE="Strix Halo gfx1151", POOT_BANK_DRIVER="local",
+               POOT_KERNEL_CACHE_DIR=str(out / "kernel-cache"))
+    command = ["rocprofv3", "--pmc", *counters, "--output-format", "csv", "-d", ".", "-o", "p", "--",
+               str(binary), "--bank", str(BANK), "--case", case, "--out", str(directory / "bank.json")]
+    directory.mkdir(parents=True, exist_ok=True)
+    done = subprocess.run(command, env=env, capture_output=True, text=True, timeout=900, check=False,
+                          cwd=directory)  # rocprofv3 leaves a .rocprofv3/ scratch directory in its cwd
+    log = done.stdout + done.stderr
+    (directory / "log.txt").write_text(log)
+    csv_path = directory / "p_counter_collection.csv"
+    if done.returncode != 0 or not csv_path.exists():
+        # The profiler's own reason ("Could not construct profile cfg ... Request exceeds the capabilities of the
+        # hardware") comes before its signal handler's chatter, so look for it first.
+        reasons = [line.strip() for line in log.splitlines() if "Could not construct" in line or "API table" in line]
+        lines = reasons or [line for line in log.splitlines() if "SIG" in line or "failed" in line]
+        return [], f"exit {done.returncode}: " + " | ".join(lines[-3:] or log.splitlines()[-3:])
+    with csv_path.open() as handle:
+        return list(csv.DictReader(handle)), None
+
+
+def main(argv):
+    if len(argv) != 4:
+        sys.exit(__doc__)
+    binary, case, out = Path(argv[1]).resolve(), argv[2], Path(argv[3]).resolve() / argv[2]
+    out.mkdir(parents=True, exist_ok=True)
+    # counters[kernel][counter] -> per-dispatch values; spans[kernel] -> per-dispatch device ns (from one group)
+    values = defaultdict(lambda: defaultdict(list))
+    spans = defaultdict(list)
+    shape = {}
+    errors = {}
+    for tag, counters in GROUPS:
+        rows, error = run_group(binary, case, out, tag, counters)
+        if error:
+            errors[tag] = {"counters": counters, "error": error}
+            print(f"group {tag}: FAILED {error}", file=sys.stderr)
+            continue
+        seen = set()
+        for row in rows:
+            kernel = row["Kernel_Name"]
+            values[kernel][row["Counter_Name"]].append(float(row["Counter_Value"]))
+            if row["Dispatch_Id"] not in seen:
+                seen.add(row["Dispatch_Id"])
+                spans[(tag, kernel)].append(int(row["End_Timestamp"]) - int(row["Start_Timestamp"]))
+            shape[kernel] = {key: row[key] for key in ("Grid_Size", "Workgroup_Size", "LDS_Block_Size", "Scratch_Size",
+                                                       "VGPR_Count", "Accum_VGPR_Count", "SGPR_Count")}
+        print(f"group {tag}: {len(seen)} dispatches", file=sys.stderr)
+    total = defaultdict(int)
+    for (_, kernel), samples in spans.items():
+        total[kernel] += sum(samples)
+    hot = max(total, key=total.get, default=None)
+    agent = {}
+    with (out / "raw" / GROUPS[0][0] / "p_agent_info.csv").open() as handle:
+        for row in csv.DictReader(handle):
+            if row["Agent_Type"] == "GPU":
+                agent = {key: row[key] for key in ("Name", "Cu_Count", "Simd_Count", "Simd_Per_Cu", "Max_Waves_Per_Simd",
+                                                   "Wave_Front_Size", "Lds_Size_In_Kb", "Max_Engine_Clk_Ccompute")}
+    summary = {"case": case, "agent": agent, "hot_kernel": hot, "kernels": sorted(values), "shape": shape.get(hot),
+               "counters": {}, "device_ns": {}, "unsupported": errors}
+    if hot:
+        for counter, samples in sorted(values[hot].items()):
+            summary["counters"][counter] = {"median": statistics.median(samples), "min": min(samples),
+                                            "max": max(samples), "dispatches": len(samples)}
+        for (tag, kernel), samples in spans.items():
+            if kernel == hot:
+                summary["device_ns"][tag] = statistics.median(samples)
+    (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    lines = [f"# {case}", "", f"Hot kernel `{hot}`; all kernels in the run: {', '.join(summary['kernels'])}.", ""]
+    if agent:
+        lines += ["Device: " + ", ".join(f"{k}={v}" for k, v in agent.items()), ""]
+    if summary["shape"]:
+        lines += ["Launch: " + ", ".join(f"{k}={v}" for k, v in summary["shape"].items()), ""]
+    lines += ["| counter | median per dispatch | min | max | dispatches |", "| --- | ---: | ---: | ---: | ---: |"]
+    for counter, stat in summary["counters"].items():
+        lines.append(f"| {counter} | {stat['median']:.6g} | {stat['min']:.6g} | {stat['max']:.6g} | {stat['dispatches']} |")
+    if errors:
+        lines += ["", "Groups the profiler refused:", ""]
+        lines += [f"- `{', '.join(e['counters'])}`: {e['error']}" for e in errors.values()]
+    (out / "summary.md").write_text("\n".join(lines) + "\n")
+    print((out / "summary.md").read_text())
+
+
+main(sys.argv)

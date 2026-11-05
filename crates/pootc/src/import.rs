@@ -414,7 +414,8 @@ fn rewrite_slice_reads(blocks: &mut [kir::BasicBlock], loopvar: kir::Local, slic
             | kir::Rvalue::IntScalarUnary(_, op)
             | kir::Rvalue::Cast { operand: op, .. }
             | kir::Rvalue::Bitcast { operand: op, .. }
-            | kir::Rvalue::Fp8Encode { operand: op, .. } => fix_operand(op, loopvar, slice),
+            | kir::Rvalue::Fp8Encode { operand: op, .. }
+            | kir::Rvalue::Narrow { operand: op, .. } => fix_operand(op, loopvar, slice),
             kir::Rvalue::BinaryOp(_, a, b) => {
                 fix_operand(a, loopvar, slice);
                 fix_operand(b, loopvar, slice);

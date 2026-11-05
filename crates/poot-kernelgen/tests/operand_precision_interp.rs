@@ -158,6 +158,7 @@ fn run_dense_tiled(
             layout: kg::WeightLayout::Nk,
             segments: 1,
             terms,
+            weight_bits: kg::DenseTiledWeight::Nk(storage).bits(),
         },
         &caps(),
     )

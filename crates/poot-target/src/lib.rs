@@ -21,6 +21,7 @@ pub mod aie;
 pub mod calibration;
 pub mod dram_channels;
 mod matrix;
+mod register_file;
 pub mod storage;
 pub mod vpu;
 pub use access::ArgAccess;
@@ -29,6 +30,7 @@ pub use matrix::{
     CooperativeMatrixConfig, FragmentConfig, FragmentDtype, FragmentLayout, FragmentShape, LaneMap,
     MatrixUnits, OperandNarrowing,
 };
+pub use register_file::RegisterFile;
 pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
 pub use vpu::{NarrowingContract, VendorCompilerId, VpuCaps, VpuTargetId};
 
@@ -197,6 +199,12 @@ impl AmdArch {
         MatrixUnits::amd(self.mcpu(), self.wave)
     }
 
+    /// The register file of this gfx code and wavefront size ([`RegisterFile::amd`]), `Unknown` for a part it
+    /// does not record.
+    pub fn register_file(&self) -> Queried<RegisterFile> {
+        RegisterFile::amd(self.mcpu(), self.wave).map_or(Queried::Unknown, Queried::Known)
+    }
+
     /// Derive a descriptor from an HSA-reported ISA name (`"amdgcn-amd-amdhsa--gfx1151"` or a bare
     /// `"gfx1151"`) plus the wavefront size. Returns [`ArchError::NoGfxCode`] if no `gfx<...>` token is
     /// present.
@@ -357,6 +365,9 @@ pub struct DeviceCaps {
     pub watchdog_budget: Option<WatchdogBudget>,
     /// The matrix units this device exposes to the planner, `Unknown` where the API cannot tell.
     pub matrix_units: Queried<MatrixUnits>,
+    /// The registers a lane and a workgroup hold, `Unknown` where the API cannot tell. The planner sizes what a
+    /// tiled kernel keeps in registers across its loops against it (POOT-1447).
+    pub register_file: Queried<RegisterFile>,
     /// Confirmed hardware/driver defects this device is known to have.
     pub known_miscompiles: KnownMiscompiles,
     /// Compute units (AMD CUs, NVIDIA SMs): how many workgroups the device runs side by side. Probed
@@ -513,6 +524,9 @@ impl DeviceCaps {
                 32,
                 1,
             )])),
+            // RADV's `VK_AMD_shader_core_properties` on Strix Halo: 256 VGPRs a lane, 768 wave64 VGPRs per SIMD,
+            // two SIMDs a compute unit.
+            register_file: Queried::Known(RegisterFile::amd_shader_core(256, 768, 2)),
             known_miscompiles: calibration.known_miscompiles,
             compute_units: STRIX_HALO_COMPUTE_UNITS,
             memory_budget_bytes: None,
@@ -543,6 +557,8 @@ impl DeviceCaps {
             max_grid: [u32::MAX, u32::MAX, u32::MAX],
             watchdog_budget: None,
             matrix_units: Queried::Known(MatrixUnits::NONE),
+            // Like the matrix units, only the agent's gfx code says ([`AmdArch::register_file`]).
+            register_file: Queried::Unknown,
             known_miscompiles: KnownMiscompiles::default(),
             compute_units: STRIX_HALO_COMPUTE_UNITS,
             memory_budget_bytes: None,
@@ -573,6 +589,7 @@ impl DeviceCaps {
             max_grid: [u32::MAX, 65_535, 65_535],
             watchdog_budget: None,
             matrix_units: Queried::Known(MatrixUnits::nvidia(8)),
+            register_file: RegisterFile::nvidia(8).map_or(Queried::Unknown, Queried::Known),
             known_miscompiles: KnownMiscompiles::default(),
             compute_units: SM80_A100_COMPUTE_UNITS,
             memory_budget_bytes: None,

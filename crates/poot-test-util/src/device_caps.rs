@@ -20,6 +20,7 @@ pub fn default_caps_for(backend: Backend) -> DeviceCaps {
         // A live ROCm context reads both from its agent: the arch carries the same values.
         Backend::AmdGcn(arch) => DeviceCaps {
             matrix_units: Queried::Known(arch.matrix_units()),
+            register_file: arch.register_file(),
             subgroup: Queried::Known(SubgroupSupport::Present {
                 min_size: arch.wave,
                 max_size: arch.wave,

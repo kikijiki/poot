@@ -21,7 +21,7 @@ pub(crate) use indexed::{
     indexed_contraction,
 };
 
-pub(crate) use tiled::{ExpertWalk, TiledBody, TiledLaunch, TiledWeight, tiled_body};
+pub(crate) use tiled::{ExpertWalk, TiledBody, TiledExtents, TiledLaunch, TiledWeight, tiled_body};
 
 use poot_graph_ir::FragmentDtype;
 use poot_target::FragmentLayout;
@@ -101,6 +101,9 @@ pub enum Schedule {
         tile: FragmentTile,
         /// Consecutive `K` values one lane loads and decodes at a time; divides `K`.
         run: RunLength,
+        /// The `K` values one barrier round stages: a whole number of fragment steps, sized so a round reads whole
+        /// global requests of every operand row ([`RegisterTiling::choose`]).
+        depth: u32,
     },
 }
 
@@ -203,8 +206,22 @@ const MAX_LANE_ACCUMULATORS: u32 = 64;
 const FMA_COST: f64 = 1.0;
 const LDS_READ_COST: f64 = 1.0;
 const STAGED_VALUE_COST: f64 = 8.0;
-/// The vector reads a lane issues to load one operand fragment: its 16 values of 2 bytes, as two 16-byte reads.
+/// The reads a lane issues to load one operand fragment, 16 values of 2 bytes adjacent in an `X`-major staged tile
+/// (every fragment operand is staged so, [`MicroTile::staged_major`]): two 16-byte reads.
 const FRAGMENT_LOAD_READS: f64 = 2.0;
+
+/// The bytes one global memory request reads: the cache line of every target poot generates for (the L2 and L0/L1
+/// lines of AMD gfx9-12, NVIDIA's lines). A round whose segment of an operand row is shorter pays a whole request
+/// for part of a line, and the vector memory path is bound by requests, not bytes (`receipts/1445-fragment-traffic`:
+/// halving the bytes of every activation request left the cycles where they were; halving the requests per multiply
+/// took a third of them).
+const GLOBAL_REQUEST_BYTES: usize = 128;
+
+/// The round depths a fragment tiling may stage, shallowest first: one and two pairs of fragment steps. The
+/// pipelined loop holds one round's loaded values in registers while it multiplies the previous one, so a deeper
+/// round holds more: at 64 the 128 x 128 tile of a narrowed bf16 projection is 225 VGPRs on gfx1151, near the 256 a
+/// wave32 lane holds (`register_budget` guards the planner's tilings against spills).
+const FRAGMENT_DEPTHS: [usize; 2] = [32, 64];
 
 /// The shape of an `M > 1` contraction: `blocks` independent products of `m_per_block` activation rows against
 /// `out_per_block` weight rows of `k` values (one block is a plain GEMM), the weight read in `layout`, the rows of a
@@ -227,6 +244,10 @@ pub struct TiledShape {
     pub segments: usize,
     /// The f32 tiles staged per operand: more than one for a split operand, which stages its `hi` and `lo` parts.
     pub terms: StagedTerms,
+    /// The bits one weight element occupies in global memory, rounded up: 32 for f32, 16 for a packed half, a
+    /// packed format's bits per value ([`crate::packed_value_bits`]). What decides how deep a fragment round must
+    /// be to read whole requests of a weight row.
+    pub weight_bits: u32,
 }
 
 impl TiledShape {
@@ -256,10 +277,13 @@ pub struct RegisterTiling {
     owners_n: TileSize,
     micro: MicroTile,
     run: RunLength,
+    /// The `K` values one barrier round stages ([`Self::depth`]).
+    depth: usize,
 }
 
-/// The wave grids a fragment tiling may run, `(waves along rows, waves along columns)`: one to eight waves, with the
-/// long side along the rows (an activation tile is staged once for all the wave columns that read it).
+/// The wave grids a fragment tiling may run, `(waves along rows, waves along columns)`: one to eight waves. Two
+/// grids of one output tile load alike (every fragment operand is staged `X`-major), so they cost the same and the
+/// earlier grid here wins the tie.
 const WAVE_GRIDS: [(u32, u32); 6] = [(1, 1), (2, 1), (1, 2), (2, 2), (4, 2), (2, 4)];
 /// The fragments a wave may accumulate along each axis.
 const WAVE_FRAGMENTS: [u32; 3] = [1, 2, 4];
@@ -279,12 +303,16 @@ impl RegisterTiling {
     /// - Fragment, where the operands narrow to a dtype the device has a matrix unit for
     ///   ([`StagedTerms::fragment`]): every wave grid of [`WAVE_GRIDS`] with every [`WAVE_FRAGMENTS`] tile of at
     ///   most [`MAX_WAVE_FRAGMENTS`] fragments. An expert walk asks for scalar tiles only
-    ///   ([`StagedTerms::scalar_only`]): the rows of a fragment must share one weight tile.
+    ///   ([`StagedTerms::scalar_only`]): the rows of a fragment must share one weight tile. Its round depth is the
+    ///   shallowest of [`FRAGMENT_DEPTHS`] at which one round's segment of every operand row is a whole global
+    ///   request ([`GLOBAL_REQUEST_BYTES`]; the deepest when none is), or the deepest shallower one its LDS holds
+    ///   ([`Self::fragment_depth`]).
     ///
     /// A candidate must have a workgroup that fits the device, two staged tiles that fit its LDS and stage in whole
     /// slots ([`tiled::stages_evenly`]). Each is costed by [`Self::cost`] and the cheapest wins, a tie going to the
-    /// larger output tile. Chosen from shapes and device limits alone, never from the format or a model; the run is
-    /// the longest that divides `k`.
+    /// larger output tile and then to the earlier candidate (the scalar grids, then [`WAVE_GRIDS`] in order: two wave
+    /// grids of one output tile load alike and tie). Chosen from shapes, storage widths and device limits alone, never
+    /// from the format or a model; the run is the longest that divides `k`.
     pub fn choose(shape: TiledShape, caps: &poot_target::DeviceCaps) -> Self {
         let launch = caps.gemm_launch();
         let run = RunLength::dividing(shape.k);
@@ -314,11 +342,13 @@ impl RegisterTiling {
     }
 
     fn scalar(lanes: TileSize, rows: LaneRows, cols: MicroCols, run: RunLength) -> Self {
+        let micro = MicroTile::Scalar { rows, cols };
         Self {
             owners_m: lanes,
             owners_n: lanes,
-            micro: MicroTile::Scalar { rows, cols },
+            micro,
             run,
+            depth: micro.block_k(),
         }
     }
 
@@ -337,11 +367,13 @@ impl RegisterTiling {
                 waves_n,
                 tile,
                 run,
+                depth,
             } => Some(Self {
                 owners_m: waves_m,
                 owners_n: waves_n,
                 micro: MicroTile::Fragment(tile),
                 run,
+                depth: depth as usize,
             }),
         }
     }
@@ -396,7 +428,9 @@ impl RegisterTiling {
                                         cols,
                                     }),
                                     run,
+                                    depth: FRAGMENT_DEPTHS[0],
                                 })
+                                .and_then(|tiling| tiling.fragment_depth(shape, caps))
                         })
                     })
                 })
@@ -404,6 +438,31 @@ impl RegisterTiling {
         scalar
             .chain(fragment)
             .filter(move |tiling| tiling.runs_on(shape, caps))
+    }
+
+    /// The `K` values one barrier round of this tiling stages.
+    pub fn depth(self) -> usize {
+        self.depth
+    }
+
+    /// This fragment geometry at its round depth, or `None` when the device runs it at none: the shallowest of
+    /// [`FRAGMENT_DEPTHS`] whose round segment of every operand row (the activation's f32 rows, the weight's rows
+    /// at `shape.weight_bits` per value) is at least one [`GLOBAL_REQUEST_BYTES`] request, the deepest when none
+    /// is; and if [`Self::runs_on`] refuses that depth (its staged tiles outgrow the LDS), the deepest shallower
+    /// one it runs. A 32-deep round of a bf16 weight row reads half a line per request: the vector memory path
+    /// pays a request for it, so the round doubles; an f32 activation row is a whole line at 32 already.
+    fn fragment_depth(self, shape: TiledShape, caps: &poot_target::DeviceCaps) -> Option<Self> {
+        const ACTIVATION_BITS: usize = 32;
+        let narrowest = ACTIVATION_BITS.min(shape.weight_bits.max(1) as usize);
+        let whole = FRAGMENT_DEPTHS
+            .iter()
+            .position(|&depth| depth * narrowest >= GLOBAL_REQUEST_BYTES * 8)
+            .unwrap_or(FRAGMENT_DEPTHS.len() - 1);
+        FRAGMENT_DEPTHS[..=whole]
+            .iter()
+            .rev()
+            .map(|&depth| Self { depth, ..self })
+            .find(|tiling| tiling.runs_on(shape, caps))
     }
 
     /// Whether `caps` runs this tiling over `shape`: its workgroup fits, its staged tiles (and the scratch an
@@ -418,9 +477,13 @@ impl RegisterTiling {
         accumulators <= MAX_LANE_ACCUMULATORS
             && lane_count <= caps.max_workgroup_invocations as usize
             && lane_count <= caps.max_workgroup_size[0] as usize
-            && tiled::lds_bytes(self.launch_shape(), shape.layout, shape.terms)
-                <= caps.lds_bytes as usize
-            && tiled::stages_evenly(self.launch_shape(), self.run.get() as usize, shape.layout)
+            && tiled::lds_bytes(self.launch_shape(), shape.terms) <= caps.lds_bytes as usize
+            && tiled::stages_evenly(
+                self.launch_shape(),
+                self.run.get() as usize,
+                shape.layout,
+                shape.out_per_block,
+            )
     }
 
     fn run(self) -> RunLength {
@@ -431,6 +494,7 @@ impl RegisterTiling {
         tiled::LaunchShape {
             owners: (self.owners_m.get() as usize, self.owners_n.get() as usize),
             micro: self.micro,
+            depth: self.depth,
         }
     }
 
@@ -456,8 +520,8 @@ impl RegisterTiling {
                 (rows * cols * FMA_COST, (rows + cols) * LDS_READ_COST)
             }
             MicroTile::Fragment(tile) => {
-                // A fragment multiply per 16 values, and a lane loads 16 values of each operand fragment: two
-                // vector reads per fragment.
+                // A fragment multiply per 16 values, and a lane loads 16 values of each operand fragment in
+                // `FRAGMENT_LOAD_READS` reads.
                 let kappa = self.micro.kappa() as f64;
                 let loads = f64::from(tile.rows + tile.cols) * FRAGMENT_LOAD_READS;
                 (
@@ -466,7 +530,12 @@ impl RegisterTiling {
                 )
             }
         };
-        let lane_step = (compute + reads + staged_per_lane * STAGED_VALUE_COST)
+        // A staged value of a narrowed operand also takes its rounding (and, into a fragment tile, the narrowing cast).
+        let narrowing = shape.terms.rounding_ops() as f64
+            + f64::from(u8::from(
+                matches!(self.micro, MicroTile::Fragment(_)) && shape.terms.fragment.is_some(),
+            ));
+        let lane_step = (compute + reads + staged_per_lane * (STAGED_VALUE_COST + narrowing))
             * shape.passes_per_tile(tile_rows);
         let tiles = shape.blocks
             * shape.m_per_block.div_ceil(tile_rows)
@@ -490,6 +559,7 @@ impl RegisterTiling {
                 waves_n: self.owners_n,
                 tile,
                 run: self.run,
+                depth: self.depth as u32,
             },
         }
     }
@@ -521,6 +591,7 @@ impl std::fmt::Debug for TileSize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use poot_target::FragmentConfig;
 
     fn shape(m: usize, k: usize, n: usize) -> TiledShape {
         TiledShape {
@@ -531,6 +602,7 @@ mod tests {
             layout: WeightLayout::Nk,
             segments: 1,
             terms: crate::precision::StagedTerms::ONE,
+            weight_bits: 32,
         }
     }
 
@@ -612,6 +684,106 @@ mod tests {
         );
     }
 
+    /// A narrowed contraction on a device whose fragment workgroup is one wave (wgpu: the runtime cannot make the
+    /// pipeline's subgroups 32 lanes wide) takes the scalar tiling, and the same device with several waves per
+    /// workgroup takes the fragments: a one-wave tile is small, so it stages many values per multiply, and each is
+    /// rounded to the narrow dtype. Mutation: drop the `narrowing` term from `RegisterTiling::cost`; the one-wave
+    /// device plans a fragment tile and this row goes red.
+    #[test]
+    fn a_fragment_tile_of_one_wave_loses_to_the_scalar_tiling() {
+        use poot_target::{CooperativeMatrixConfig, FragmentShape, MatrixUnits, Queried};
+        let device = |waves| poot_target::DeviceCaps {
+            matrix_units: Queried::Known(MatrixUnits::cooperative_matrix(
+                [CooperativeMatrixConfig {
+                    shape: FragmentShape::M16N16K16,
+                    ab_f16: true,
+                    result_f32: true,
+                }],
+                32,
+                waves,
+            )),
+            ..poot_target::DeviceCaps::wgpu_rdna3_igpu()
+        };
+        let narrow = TiledShape {
+            terms: crate::precision::StagedTerms {
+                fragment: Some(FragmentDtype::F16),
+                ..crate::precision::StagedTerms::ONE
+            },
+            ..shape(2048, 1024, 3072)
+        };
+        let one_wave = RegisterTiling::choose(narrow, &device(1));
+        assert!(
+            matches!(one_wave.micro, MicroTile::Scalar { .. }),
+            "{one_wave:?}"
+        );
+        let many_waves = RegisterTiling::choose(narrow, &device(FragmentConfig::ANY_WAVES));
+        assert!(
+            matches!(many_waves.micro, MicroTile::Fragment(_))
+                && many_waves.workgroup_lanes() > FRAGMENT_LANES,
+            "{many_waves:?}"
+        );
+    }
+
+    /// A fragment round stages whole global requests of every operand row: over a bf16 `[N, K]` weight (64 bytes a
+    /// row at 32 values) the round is 64 deep, over an f32 `[K, N]` weight (128 bytes at 32) it stays 32; and a
+    /// device whose LDS cannot hold the 64-deep tiles takes the deepest that fits. The planner's long-prefill tile is
+    /// the same 128 x 128 of 4 x 2 waves for both layouts: every fragment operand is staged `X`-major, so the two
+    /// grids of that tile load alike and the first wins. Mutation: size the depth from the activation alone (drop
+    /// `shape.weight_bits` from `fragment_depth`'s `narrowest`); the bf16 row takes 32 and goes red.
+    #[test]
+    fn a_fragment_round_stages_whole_requests_of_every_operand_row() {
+        let caps = poot_target::DeviceCaps {
+            matrix_units: poot_target::Queried::Known(poot_target::MatrixUnits::amd("gfx1151", 32)),
+            ..poot_target::DeviceCaps::rocm_default()
+        };
+        let narrow = |stored| {
+            crate::precision::StagedTerms::of(
+                poot_graph_ir::OperandPrecision::Narrow(FragmentDtype::Bf16),
+                None,
+                stored,
+            )
+        };
+        let planned = |layout, weight_bits, stored, caps: &poot_target::DeviceCaps| {
+            RegisterTiling::choose(
+                TiledShape {
+                    layout,
+                    terms: narrow(stored),
+                    weight_bits,
+                    ..shape(2048, 1024, 3072)
+                },
+                caps,
+            )
+        };
+        for (layout, weight_bits, stored, depth) in [
+            (WeightLayout::Nk, 16, Some(FragmentDtype::Bf16), 64),
+            (WeightLayout::Kn, 32, None, 32),
+        ] {
+            let tiling = planned(layout, weight_bits, stored, &caps);
+            let MicroTile::Fragment(tile) = tiling.micro else {
+                panic!("{layout:?}: {tiling:?}");
+            };
+            assert_eq!(
+                (
+                    tiling.depth(),
+                    (tiling.owners_m.get(), tiling.owners_n.get()),
+                    (tile.rows, tile.cols)
+                ),
+                (depth, (4, 2), (2, 4)),
+                "{layout:?}: {tiling:?}"
+            );
+        }
+        // The 36 KiB of a 128 x 128 tile 64 deep do not fit a 32 KiB LDS; its 20 KiB 32 deep do.
+        let small_lds = poot_target::DeviceCaps {
+            lds_bytes: 32 * 1024,
+            ..caps
+        };
+        let tiling = planned(WeightLayout::Nk, 16, Some(FragmentDtype::Bf16), &small_lds);
+        assert!(
+            matches!(tiling.micro, MicroTile::Fragment(_)) && tiling.depth() == 32,
+            "{tiling:?}"
+        );
+    }
+
     /// The candidates are the tilings the device runs: a device whose workgroup holds 64 invocations is offered
     /// only the narrow (8x8) lane grid, and one whose LDS holds 8 KiB none whose two staged tiles need more.
     /// Mutation: drop the `lds_bytes` clause of `RegisterTiling::runs_on`; the 64 x 64 tiles (8.3 KiB) are
@@ -635,8 +807,7 @@ mod tests {
         assert!(!offered.is_empty());
         for tiling in offered {
             assert!(
-                tiled::lds_bytes(tiling.launch_shape(), WeightLayout::Nk, StagedTerms::ONE)
-                    <= 8 * 1024,
+                tiled::lds_bytes(tiling.launch_shape(), StagedTerms::ONE) <= 8 * 1024,
                 "{tiling:?}"
             );
         }

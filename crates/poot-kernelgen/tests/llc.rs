@@ -722,6 +722,7 @@ fn generated_pointwise_and_batched_tiled_bodies_lower_on_every_gpu_target() {
                 layout: WeightLayout::Kn,
                 segments: 1,
                 terms: poot_kernelgen::StagedTerms::ONE,
+                weight_bits: 32,
             },
             &caps,
         );

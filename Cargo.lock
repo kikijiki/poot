@@ -2293,6 +2293,7 @@ dependencies = [
  "poot-graph-plan",
  "poot-kernel-ir",
  "poot-kernelgen",
+ "poot-load",
  "poot-npu-artifacts",
  "poot-quant",
  "poot-runtime-common",

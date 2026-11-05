@@ -336,9 +336,11 @@ fn reject_cooperation(body: &Body) -> Result<(), SerializeError> {
                     }
                     _ => {}
                 },
+                // A scheduling boundary orders one thread's instructions, which a serial loop keeps in order.
                 Statement::StorageLive(_)
                 | Statement::StorageDead(_)
-                | Statement::VectorStore { .. } => {}
+                | Statement::VectorStore { .. }
+                | Statement::SchedulingBoundary => {}
             }
         }
     }

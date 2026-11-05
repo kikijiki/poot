@@ -110,6 +110,14 @@ pub enum KvLane {
 }
 
 impl KvLane {
+    /// Bytes one element takes in its buffer.
+    pub(crate) const fn bytes(self) -> usize {
+        match self {
+            KvLane::F32 => 4,
+            KvLane::F16 | KvLane::Bf16 => 2,
+        }
+    }
+
     /// The fragment dtype this lane stores its elements in, `None` for f32: a stored element is exact in it.
     pub(crate) const fn fragment(self) -> Option<FragmentDtype> {
         match self {
@@ -476,7 +484,20 @@ pub enum AttentionMicro {
         score: WaveTile,
         /// The waves and fragments of the `(br * n_rep) x dv` output accumulator.
         out: WaveTile,
+        /// Where the score product's Q operand lives during the key loop.
+        q: QOperand,
     },
+}
+
+/// Where a fragment attention keeps the score product's Q operand during the key loop (POOT-1447).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum QOperand {
+    /// A tile in workgroup memory, staged once; every key block loads each wave's A fragments from it again.
+    Staged,
+    /// Each wave's A fragments, loaded once before the key loop and held in registers across it
+    /// (`score.rows x dk / 16` fragments). Q takes no workgroup memory during the loop: it is staged through the
+    /// key/value array in depth chunks before it.
+    Held,
 }
 
 /// The wave grid over one product's tile and the fragments each wave accumulates.

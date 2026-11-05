@@ -36,7 +36,7 @@ use poot_kernel_ir::{
 use poot_target::{FragmentDtype, FragmentLayout};
 
 use crate::emit::{Emit, bin, copy, cu};
-use crate::helpers::{Alloc, WeightLayout, elem, guard};
+use crate::helpers::{Alloc, elem, guard};
 
 /// Lanes in one fragment collective: the wave (or subgroup) a fragment is held across.
 pub(crate) const FRAGMENT_LANES: usize = FRAGMENT_COLLECTIVE_LANES as usize;
@@ -105,6 +105,14 @@ impl StagedMajor {
         match self {
             Self::K => stride,
             Self::X => 1,
+        }
+    }
+
+    /// The words between element `x` and `x + 1` of one `k`.
+    pub(crate) const fn x_step(self, stride: usize) -> usize {
+        match self {
+            Self::K => 1,
+            Self::X => stride,
         }
     }
 }
@@ -275,8 +283,10 @@ impl MicroTile {
         }
     }
 
-    /// The depth a schedule stages per barrier round: a whole number of [`Self::kappa`] steps, 16 values for a
-    /// scalar tile and two fragment steps for a fragment tile.
+    /// The depth a schedule stages per barrier round unless it chooses its own: a whole number of [`Self::kappa`]
+    /// steps, 16 values for a scalar tile and two fragment steps for a fragment tile. A fragment contraction sizes
+    /// its round from its operands' global requests instead (`RegisterTiling`'s depth, POOT-1445); the tiled
+    /// attention stages this one.
     pub(crate) const fn block_k(self) -> usize {
         match self {
             Self::Scalar { .. } => 16,
@@ -305,15 +315,16 @@ impl MicroTile {
     }
 
     /// The value `x` (an f32 already rounded to the operand's declared precision) as a staged tile stores it: as is
-    /// for an f32 tile, converted to the fragment dtype for a narrow one. The conversion is exact, because the
-    /// rounding was done before it, on the integer bits ([`crate::precision`]): it must not be the rounding, which
-    /// a driver compiler may drop from a narrow-and-widen pair.
+    /// for an f32 tile, narrowed to the fragment dtype for a narrow one. The narrowing is exact
+    /// ([`Rvalue::Narrow`]), because the rounding was done before it, on the integer bits ([`crate::precision`]):
+    /// it must not round again (a second rounding costs a rounding sequence on a target with no native
+    /// conversion), and must not be the rounding, which a driver compiler may drop from a narrow-and-widen pair.
     pub(crate) fn stage_value(self, e: &mut Emit, x: Local) -> Local {
         match self {
             Self::Scalar { .. } => x,
             Self::Fragment(_) => e.let_(
                 self.staged_ty(),
-                Rvalue::Cast {
+                Rvalue::Narrow {
                     to: self.staged_ty(),
                     operand: copy(x),
                 },
@@ -321,26 +332,31 @@ impl MicroTile {
         }
     }
 
-    /// How the activation and the weight tile are laid out in workgroup memory for a weight stored in `weight`:
-    /// a scalar tile reads adjacent lanes' words, so both are `K`-major. A fragment lane loads 16 consecutive
-    /// depth values of its row (activation) or column (an `[N, K]` weight), so those are `X`-major; a `[K, N]`
-    /// weight is staged along `N` (its coalesced direction) and a fragment loads it `K`-major.
-    pub(crate) const fn staged_majors(self, weight: WeightLayout) -> (StagedMajor, StagedMajor) {
-        match (self, weight) {
-            (Self::Scalar { .. }, _) => (StagedMajor::K, StagedMajor::K),
-            (Self::Fragment(_), WeightLayout::Nk) => (StagedMajor::X, StagedMajor::X),
-            (Self::Fragment(_), WeightLayout::Kn) => (StagedMajor::X, StagedMajor::K),
+    /// How both operand tiles of a contraction are laid out in workgroup memory, whatever the weight's order in
+    /// global memory: a scalar tile reads adjacent lanes' words, so `K`-major; a fragment lane loads 16
+    /// consecutive depth values of its row (activation) or column (weight) in two 16-byte reads, so `X`-major.
+    /// A `[K, N]` weight is transposed as it is staged (POOT-1445: staged `K`-major, a weight fragment was 16
+    /// two-byte loads and the VALU that packs them).
+    pub(crate) const fn staged_major(self) -> StagedMajor {
+        match self {
+            Self::Scalar { .. } => StagedMajor::K,
+            Self::Fragment(_) => StagedMajor::X,
         }
     }
 
-    /// Words a row of a staged tile of `edge` rows or columns is padded to, past its `block_k` depth values
-    /// (`X`-major) or its `edge` values (`K`-major), so cooperative stores and tile loads spread over the banks.
-    /// A fragment's pad keeps every row 16-byte aligned for a vector load.
-    pub(crate) const fn staged_stride(self, major: StagedMajor, edge: usize) -> usize {
+    /// Words a row of a staged tile of `edge` rows or columns is padded to, past its `depth` values (`X`-major,
+    /// `depth` the round's) or its `edge` values (`K`-major), so cooperative stores and tile loads spread over the
+    /// banks. A fragment's pad keeps every row 16-byte aligned for a vector load.
+    pub(crate) const fn staged_stride(
+        self,
+        major: StagedMajor,
+        edge: usize,
+        depth: usize,
+    ) -> usize {
         let (pad, extent) = match (self, major) {
             (Self::Scalar { .. }, _) => (1, edge),
             (Self::Fragment(_), StagedMajor::K) => (8, edge),
-            (Self::Fragment(_), StagedMajor::X) => (8, self.block_k()),
+            (Self::Fragment(_), StagedMajor::X) => (8, depth),
         };
         extent + pad
     }
@@ -849,52 +865,72 @@ impl FragmentTile {
     /// of A and `cols` of B loaded from workgroup memory at the wave's origins, then one multiply per accumulator.
     fn step(self, e: &mut Emit, g: &Geometry, acc: &mut Acc, a: Staged, b: Staged, k: Operand) {
         let wave = g.wave.as_ref().expect("a fragment geometry has a wave");
+        let a_frags = self.load(e, WmmaMat::A, a, wave.row_origin, k.clone());
+        let b_frags = self.load(e, WmmaMat::B, b, wave.col_origin, k);
+        self.multiply(e, acc, &a_frags, &b_frags);
+    }
+
+    /// The wave's operand fragments of `mat` at staged depth `k` of `operand`: one per fragment row (A) or column
+    /// (B), from the wave's `origin`.
+    fn load(
+        self,
+        e: &mut Emit,
+        mat: WmmaMat,
+        operand: Staged,
+        origin: Local,
+        k: Operand,
+    ) -> Vec<Local> {
         let (dtype, shape) = (self.wmma_dtype(), Self::shape());
-        let load = |e: &mut Emit, mat: WmmaMat, operand: Staged, origin: Local, count: u32| {
-            // The tile is `m x k` (A) or `k x n` (B): `X`-major puts its rows (A) or columns (B) contiguous.
-            let major = match (mat, operand.major) {
-                (WmmaMat::A, StagedMajor::X) | (WmmaMat::B, StagedMajor::K) => FragmentMajor::Row,
-                (WmmaMat::A, StagedMajor::K) | (WmmaMat::B, StagedMajor::X) => FragmentMajor::Col,
-            };
-            (0..count as usize)
-                .map(|f| {
-                    let x = bin(
-                        e,
-                        Ty::Usize,
-                        BinOp::Add,
-                        copy(origin),
-                        cu(f * FRAGMENT_EDGE),
-                    );
-                    let base = match operand.major {
-                        StagedMajor::X => {
-                            let by_x = bin(e, Ty::Usize, BinOp::Mul, copy(x), cu(operand.stride));
-                            bin(e, Ty::Usize, BinOp::Add, copy(by_x), k.clone())
-                        }
-                        StagedMajor::K => {
-                            let by_k = bin(e, Ty::Usize, BinOp::Mul, k.clone(), cu(operand.stride));
-                            bin(e, Ty::Usize, BinOp::Add, copy(by_k), copy(x))
-                        }
-                    };
-                    let fragment = e.fresh(
-                        Ty::Fragment(FragmentTy::matrix_major(mat, dtype, shape, major)),
-                        false,
-                    );
-                    e.push(Statement::WmmaLoadLds {
-                        role: FragmentRole::Matrix(mat),
-                        dtype,
-                        shape,
-                        array: operand.array,
-                        base: copy(base),
-                        major,
-                        stride: operand.stride as u32,
-                        dst: fragment,
-                    });
-                    fragment
-                })
-                .collect::<Vec<Local>>()
+        // The tile is `m x k` (A) or `k x n` (B): `X`-major puts its rows (A) or columns (B) contiguous.
+        let major = match (mat, operand.major) {
+            (WmmaMat::A, StagedMajor::X) | (WmmaMat::B, StagedMajor::K) => FragmentMajor::Row,
+            (WmmaMat::A, StagedMajor::K) | (WmmaMat::B, StagedMajor::X) => FragmentMajor::Col,
         };
-        let a_frags = load(e, WmmaMat::A, a, wave.row_origin, self.rows);
-        let b_frags = load(e, WmmaMat::B, b, wave.col_origin, self.cols);
+        let count = match mat {
+            WmmaMat::A => self.rows,
+            WmmaMat::B => self.cols,
+        };
+        (0..count as usize)
+            .map(|f| {
+                let x = bin(
+                    e,
+                    Ty::Usize,
+                    BinOp::Add,
+                    copy(origin),
+                    cu(f * FRAGMENT_EDGE),
+                );
+                let base = match operand.major {
+                    StagedMajor::X => {
+                        let by_x = bin(e, Ty::Usize, BinOp::Mul, copy(x), cu(operand.stride));
+                        bin(e, Ty::Usize, BinOp::Add, copy(by_x), k.clone())
+                    }
+                    StagedMajor::K => {
+                        let by_k = bin(e, Ty::Usize, BinOp::Mul, k.clone(), cu(operand.stride));
+                        bin(e, Ty::Usize, BinOp::Add, copy(by_k), copy(x))
+                    }
+                };
+                let fragment = e.fresh(
+                    Ty::Fragment(FragmentTy::matrix_major(mat, dtype, shape, major)),
+                    false,
+                );
+                e.push(Statement::WmmaLoadLds {
+                    role: FragmentRole::Matrix(mat),
+                    dtype,
+                    shape,
+                    array: operand.array,
+                    base: copy(base),
+                    major,
+                    stride: operand.stride as u32,
+                    dst: fragment,
+                });
+                fragment
+            })
+            .collect()
+    }
+
+    /// One multiply per accumulator fragment: `acc[i][j] += a_frags[i] * b_frags[j]`.
+    fn multiply(self, e: &mut Emit, acc: &mut Acc, a_frags: &[Local], b_frags: &[Local]) {
+        let (dtype, shape) = (self.wmma_dtype(), Self::shape());
         for (i, &a_frag) in a_frags.iter().enumerate() {
             for (j, &b_frag) in b_frags.iter().enumerate() {
                 let cell = acc.cells[i * b_frags.len() + j];
@@ -908,6 +944,46 @@ impl FragmentTile {
                 });
             }
         }
+    }
+}
+
+/// The A fragments of one step a wave holds in registers across a loop ([`MicroTile::hold_a`]), one per fragment
+/// row of its tile.
+pub(crate) struct HeldA {
+    fragments: Vec<Local>,
+}
+
+impl MicroTile {
+    /// Load the wave's A fragments of staged depth `k` from `a` to hold them: the operand of every later
+    /// [`Self::step_held`] at the same depth, however often `a`'s workgroup memory is reused in between. Only a
+    /// fragment tile holds operands in registers.
+    pub(crate) fn hold_a(self, e: &mut Emit, g: &Geometry, a: Staged, k: usize) -> HeldA {
+        let Self::Fragment(tile) = self else {
+            unreachable!("only a fragment tile holds its operands");
+        };
+        let wave = g.wave.as_ref().expect("a fragment geometry has a wave");
+        HeldA {
+            fragments: tile.load(e, WmmaMat::A, a, wave.row_origin, cu(k)),
+        }
+    }
+
+    /// [`Self::step`] against held A fragments: `acc += held * B[k..k + 16, :]`, only `b` read from workgroup
+    /// memory.
+    pub(crate) fn step_held(
+        self,
+        e: &mut Emit,
+        g: &Geometry,
+        acc: &mut Acc,
+        held: &HeldA,
+        b: Staged,
+        k: usize,
+    ) {
+        let Self::Fragment(tile) = self else {
+            unreachable!("only a fragment tile holds its operands");
+        };
+        let wave = g.wave.as_ref().expect("a fragment geometry has a wave");
+        let b_frags = tile.load(e, WmmaMat::B, b, wave.col_origin, cu(k));
+        tile.multiply(e, acc, &held.fragments, &b_frags);
     }
 }
 
@@ -984,8 +1060,9 @@ impl Elements {
         }
     }
 
-    /// Write every element `(row, col)` to `into` as element `(k = col, x = row)`: word `col * stride + row`, the
-    /// `A` operand of a product whose depth is this tile's columns (the `P` of attention's `P * V`).
+    /// Write every element `(row, col)` to `into` as element `(k = col, x = row)`: word `col * stride + row` of a
+    /// `K`-major tile, `row * stride + col` of an `X`-major one. It is the `A` operand of a product whose depth is
+    /// this tile's columns (the `P` of attention's `P * V`).
     ///
     /// `stored` turns each element into the value that is written (the narrowing of the operand it becomes).
     pub(crate) fn stage(
@@ -995,8 +1072,12 @@ impl Elements {
         mut stored: impl FnMut(&mut Emit, Local) -> Local,
     ) {
         for &(coord, cell) in &self.cells {
-            let by_col = bin(e, Ty::Usize, BinOp::Mul, copy(coord.col), cu(into.stride));
-            let idx = bin(e, Ty::Usize, BinOp::Add, copy(by_col), copy(coord.row));
+            let (outer, inner) = match into.major {
+                StagedMajor::K => (coord.col, coord.row),
+                StagedMajor::X => (coord.row, coord.col),
+            };
+            let by_outer = bin(e, Ty::Usize, BinOp::Mul, copy(outer), cu(into.stride));
+            let idx = bin(e, Ty::Usize, BinOp::Add, copy(by_outer), copy(inner));
             let value = stored(e, cell);
             e.write_lds(into.array, copy(idx), copy(value));
         }

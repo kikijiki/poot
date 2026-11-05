@@ -130,6 +130,8 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
         matrix_units: poot_target::Queried::Known(poot_target::MatrixUnits::nvidia(
             attrs.compute_capability_major,
         )),
+        register_file: poot_target::RegisterFile::nvidia(attrs.compute_capability_major)
+            .map_or(poot_target::Queried::Unknown, poot_target::Queried::Known),
         // A device's miscompiles are the target family's known facts, not something CUDA reports.
         known_miscompiles: poot_target::DeviceCaps::ptx_default().known_miscompiles,
         compute_units: attrs.multiprocessor_count,

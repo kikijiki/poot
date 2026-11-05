@@ -342,12 +342,13 @@ mod tests {
         fold: Option<usize>,
         epilogue: Option<(&crate::contraction::Epilogue, &[f32])>,
     ) -> Vec<f32> {
-        let [out, _] = case.stack.weight().shape();
+        let [out, depth] = case.stack.weight().shape();
         let m = ids.len();
         let body = packed_contraction(
             name,
             format,
             schedule,
+            &[depth as u32, out as u32],
             epilogue.map(|(epilogue, _)| epilogue),
             PackedRows::Indexed,
             poot_graph_ir::OperandPrecision::Exact,

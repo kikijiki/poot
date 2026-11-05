@@ -1,5 +1,5 @@
 //! The performance bank's measurement, shared by the backend examples (`performance_bank.rs` in poot-wgpu-device,
-//! poot-rocm-device and poot-ptx-device include this file by path; each supplies only its device).
+//! poot-rocm-device, poot-vulkan-device and poot-ptx-device include this file by path; each supplies only its device).
 //!
 //! One invocation measures one case of `cases.json` through the executor contract: it builds the case's
 //! graph and deterministic inputs, loads and compiles it for the device's target, adds one entry per weight
@@ -22,6 +22,7 @@ use poot_graph_plan::staged::{
 use poot_graph_plan::{CompileOptions, Target};
 use poot_load::packed_safetensors::sha256_digest;
 use poot_quant::StoredBytes;
+use poot_quant::scalar;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{HostTensor, HostView};
 use serde_json::{Value, json};
@@ -91,7 +92,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The operand rounding a case declares in `numerics.operand_precision` (`"exact"`, or `"narrow"`: operands enter
 /// the products rounded to the fragment dtype of the backend's matrix unit, accumulated in f32). The dtype is the
-/// backend's: bf16 where the unit takes it (ROCm, PTX), f16 on the Vulkan cooperative matrix. A narrow case
+/// backend's: bf16 where the unit takes it (ROCm, PTX), f16 on the Vulkan cooperative matrix (wgpu, raw Vulkan). A narrow case
 /// compares with a reference that rounds the same operands, so its tolerance is the narrow-storage one ([`NARROW_REFERENCE_TOLERANCE`]).
 #[derive(Clone, Copy)]
 struct Operands {
@@ -102,7 +103,7 @@ impl Operands {
     fn of(backend: &str, case: &Value) -> Result<Self, String> {
         let narrow = match case["numerics"]["operand_precision"].as_str() {
             None | Some("exact") => None,
-            Some("narrow") => Some(if backend == "wgpu" {
+            Some("narrow") => Some(if matches!(backend, "wgpu" | "vulkan") {
                 FragmentDtype::F16
             } else {
                 FragmentDtype::Bf16
@@ -453,7 +454,18 @@ fn attention_prefill(bank: &Value, case: &Value) -> Result<Prepared, String> {
     if !(1..=cap).contains(&lq) || hkv == 0 || hq % hkv != 0 {
         return Err("attention_prefill needs 1 <= lq <= cap and hkv dividing hq".into());
     }
-    let copies = weight_copies(bank, case, 2 * hkv * cap * d * 4)?;
+    // The case's `storage` is the key/value cache's dtype: f32, or the engine's default f16.
+    let kv_f16 = match case["storage"].as_str() {
+        Some("f32") => false,
+        Some("f16") => true,
+        other => {
+            return Err(format!(
+                "attention_prefill stores its KV as f32 or f16, not {other:?}"
+            ));
+        }
+    };
+    let kv_bytes = if kv_f16 { 2 } else { 4 };
+    let copies = weight_copies(bank, case, 2 * hkv * cap * d * kv_bytes)?;
     if copies != 1 {
         return Err(
             "attention_prefill holds its KV resident: use a single-copy cache condition".into(),
@@ -468,8 +480,23 @@ fn attention_prefill(bank: &Value, case: &Value) -> Result<Prepared, String> {
             .ok_or("fixture has no seed")?,
     );
     let q = stream.tensor(hq * lq * d);
-    let k = stream.tensor(hkv * cap * d);
-    let v = stream.tensor(hkv * cap * d);
+    let mut k = stream.tensor(hkv * cap * d);
+    let mut v = stream.tensor(hkv * cap * d);
+    // An f16 cache holds the rounded values: the reference reads exactly what the device reads.
+    let k_words: Vec<u16> = if kv_f16 {
+        k.iter().map(|&x| scalar::f32_to_f16(x)).collect()
+    } else {
+        Vec::new()
+    };
+    let v_words: Vec<u16> = if kv_f16 {
+        v.iter().map(|&x| scalar::f32_to_f16(x)).collect()
+    } else {
+        Vec::new()
+    };
+    if kv_f16 {
+        k = k_words.iter().map(|&w| scalar::f16_to_f32(w)).collect();
+        v = v_words.iter().map(|&w| scalar::f16_to_f32(w)).collect();
+    }
     let mut want = vec![0.0f64; hq * lq * d];
     std::thread::scope(|scope| {
         for (head, out) in want.chunks_mut(lq * d).enumerate() {
@@ -512,12 +539,15 @@ fn attention_prefill(bank: &Value, case: &Value) -> Result<Prepared, String> {
     let qi = b
         .constant("q", TensorType::f32(vec![1, hq, lq, d]))
         .unwrap();
-    let ki = b
-        .constant("k", TensorType::f32(vec![1, hkv, cap, d]))
-        .unwrap();
-    let vi = b
-        .constant("v", TensorType::f32(vec![1, hkv, cap, d]))
-        .unwrap();
+    let kv_type = |shape: Vec<usize>| {
+        if kv_f16 {
+            TensorType::f16(shape)
+        } else {
+            TensorType::f32(shape)
+        }
+    };
+    let ki = b.constant("k", kv_type(vec![1, hkv, cap, d])).unwrap();
+    let vi = b.constant("v", kv_type(vec![1, hkv, cap, d])).unwrap();
     let pos = b
         .slot_ranged(
             poot_graph_ir::Slot::Pos,
@@ -540,18 +570,32 @@ fn attention_prefill(bank: &Value, case: &Value) -> Result<Prepared, String> {
         graphs: vec![graph],
         consts: vec![
             ("q".into(), HostTensor::f32(vec![1, hq, lq, d], q)),
-            ("k".into(), HostTensor::f32(vec![1, hkv, cap, d], k)),
-            ("v".into(), HostTensor::f32(vec![1, hkv, cap, d], v)),
+            (
+                "k".into(),
+                if kv_f16 {
+                    HostTensor::f16(vec![1, hkv, cap, d], k_words)
+                } else {
+                    HostTensor::f32(vec![1, hkv, cap, d], k)
+                },
+            ),
+            (
+                "v".into(),
+                if kv_f16 {
+                    HostTensor::f16(vec![1, hkv, cap, d], v_words)
+                } else {
+                    HostTensor::f32(vec![1, hkv, cap, d], v)
+                },
+            ),
         ],
         references: vec![want],
         out_shape: vec![1, hq, lq, d],
         slots: vec![(key, vec![1, lq], positions)],
         observed: json!({
             "shape": { "hq": hq, "hkv": hkv, "d": d, "lq": lq, "cap": cap },
-            "storage": "f32",
+            "storage": if kv_f16 { "f16" } else { "f32" },
             "layout": "bhsd",
             "weight_copies": 1,
-            "weight_bytes_per_copy": 2 * hkv * cap * d * 4,
+            "weight_bytes_per_copy": 2 * hkv * cap * d * kv_bytes,
         }),
     })
 }

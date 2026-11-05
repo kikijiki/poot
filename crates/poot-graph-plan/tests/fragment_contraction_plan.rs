@@ -231,16 +231,18 @@ fn a_split_policy_plans_the_fragment_tiling_too() {
 }
 
 /// RADV has an opaque f16 unit. wgpu leaves the pipeline's subgroup size to the driver, so its workgroup is one
-/// subgroup; raw Vulkan requires 32-lane subgroups, so its workgroup is several. Mutation: ignore
-/// `FragmentConfig::waves` in `candidates`; the wgpu row plans several waves and goes red.
+/// subgroup, and a fragment tile of one wave stages too many values per multiply to beat the scalar tiling (bank
+/// `prefill-dense-bf16-nk-narrow`: 0.61x of f32 on device time with the fragment tiling): the planner takes the
+/// scalar one. Raw Vulkan requires 32-lane subgroups, so its workgroup is several waves and takes the fragments.
+/// Mutation: drop the `narrowing` term from `RegisterTiling::cost`; the wgpu row plans the single-wave fragment and
+/// goes red.
 #[test]
-fn radv_plans_f16_with_the_waves_its_runtime_can_make_collectives() {
+fn radv_plans_f16_fragments_only_where_a_workgroup_has_several_waves() {
     let program = compiled(&dense_bf16(), &wgpu(), MatmulPrecision::Narrow);
-    let (dtype, layout, waves) = fragment(schedule_of(&program, is_dense));
-    assert_eq!(
-        (dtype, layout, waves),
-        (FragmentDtype::F16, FragmentLayout::Opaque, 1),
-        "wgpu"
+    let schedule = schedule_of(&program, is_dense);
+    assert!(
+        matches!(schedule, Schedule::RegisterTiled { .. }),
+        "wgpu runs one wave per workgroup: {schedule:?}"
     );
 
     let program = compiled(&dense_bf16(), &vulkan(), MatmulPrecision::Narrow);

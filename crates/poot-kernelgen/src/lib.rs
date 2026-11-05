@@ -36,7 +36,8 @@ mod wmma;
 
 pub use attention::{
     AttentionCombineSpec, AttentionMicro, AttentionRows, AttentionSchedule, AttentionSink,
-    AttentionSpec, KeyBound, KeyLayout, KvLane, LaneTile, MaskKind, ScoreTransform, WaveTile,
+    AttentionSpec, KeyBound, KeyLayout, KvLane, LaneTile, MaskKind, QOperand, ScoreTransform,
+    WaveTile,
 };
 
 // The one generation seam. `poot-graph-plan` plans every generated kernel through `generate` and the request
@@ -66,7 +67,7 @@ pub use fused::{
 pub use helpers::{BodyBudget, BodyLimits, BodySize, Layout, WeightLayout, view_eff_strides};
 pub use microtile::{FragmentTile, LaneRows, MicroCols};
 pub use packed::{PackedKernelOp, PackedKernelSpec};
-pub use precision::{StagedTerms, stored_fragment_dtype};
+pub use precision::{StagedTerms, dense_value_bits, stored_fragment_dtype};
 
 // Generators still called by name outside `generate`, each for a recorded reason (card 636 census, at
 // dispatch the planner calls none of them):
@@ -86,7 +87,7 @@ pub use fused::{
 };
 pub use gemv::{attn_scores_v_gemv_lds, gemv_lds};
 pub use matmul::{matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid};
-pub use packed::{PackedRunSharing, packed_kernel, packed_run_sharing};
+pub use packed::{PackedRunSharing, packed_kernel, packed_run_sharing, packed_value_bits};
 pub use reduce::reduce_last_dt;
 
 /// Shared compile-and-check helpers for this crate's own unit tests (card 622): the crate's `pub(crate)`

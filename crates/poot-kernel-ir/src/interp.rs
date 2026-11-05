@@ -293,6 +293,14 @@ pub enum Fault {
     #[error("ill-typed operation that the verifier accepts: {0}")]
     /// An operation whose operand types the verifier accepted but the interpreter cannot evaluate.
     IllTyped(&'static str),
+    #[error("narrowing {value:?} to {to:?} would round it: it is not a value of {to:?}")]
+    /// An [`Rvalue::Narrow`] of an f32 that is not a value of the narrow type.
+    InexactNarrow {
+        /// The narrow type.
+        to: Ty,
+        /// The f32 operand.
+        value: f32,
+    },
     #[error("kernel trap: a failed Assert or a reached Unreachable terminator ran (code {0})")]
     /// A lane reached a [`Terminator::Trap`] with this code.
     Trap(u32),
@@ -663,8 +671,9 @@ impl Workgroup<'_> {
                 self.store(lane, &cell, value)
             }
             Statement::StorageLive(_) | Statement::StorageDead(_) => Ok(()),
-            // Lockstep execution is sequentially consistent: there is nothing to order.
-            Statement::Fence { .. } => Ok(()),
+            // Lockstep execution is sequentially consistent: there is nothing to order, and no instruction
+            // schedule to bound.
+            Statement::Fence { .. } | Statement::SchedulingBoundary => Ok(()),
             Statement::WorkgroupLocalWrite { idx, value, array } => {
                 let index = self.index_operand(lane, idx)?;
                 let value = self.scalar_operand(lane, value)?;
@@ -731,6 +740,12 @@ impl Workgroup<'_> {
             Rvalue::Cast { to, operand } => {
                 let a = self.scalar_operand(lane, operand)?;
                 cast(to, a).map(Value::Scalar)
+            }
+            Rvalue::Narrow { to, operand } => {
+                let Scalar::F32(value) = self.scalar_operand(lane, operand)? else {
+                    return Err(Fault::IllTyped("a narrowing reads an f32"));
+                };
+                narrow(to, value).map(Value::Scalar)
             }
             Rvalue::Bitcast { to, operand } => {
                 let a = self.scalar_operand(lane, operand)?;
@@ -1240,6 +1255,33 @@ fn round_to_f16(x: f32) -> f32 {
         (magnitude / quantum).round_ties_even() * quantum
     };
     rounded.copysign(x)
+}
+
+/// `value` as a value of the two-byte float `to`, when it is one: the f32 bits `to` drops are zero (for a NaN, so
+/// that the payload `to` keeps is still a NaN) and, for any other value, rounding to `to` leaves it unchanged.
+fn narrow(to: &Ty, value: f32) -> Result<Scalar, Fault> {
+    // The f32 bits the narrow type drops, and the value rounded to it.
+    let (dropped, rounded) = match to {
+        Ty::BF16 => (0xffff, round_to_bf16(value)),
+        Ty::F16 => (0x1fff, round_to_f16(value)),
+        _ => return Err(Fault::IllTyped("a narrowing targets f16 or bf16")),
+    };
+    let exact = if value.is_nan() {
+        value.to_bits() & dropped == 0
+    } else {
+        rounded.to_bits() == value.to_bits()
+    };
+    if exact {
+        Ok(match to {
+            Ty::BF16 => Scalar::BF16(value),
+            _ => Scalar::F16(value),
+        })
+    } else {
+        Err(Fault::InexactNarrow {
+            to: to.clone(),
+            value,
+        })
+    }
 }
 
 /// Round to the nearest `bfloat16` (ties to even).
@@ -1937,6 +1979,94 @@ mod tests {
         assert_eq!(fp8_encode(Fp8Format::E4M3Fn, f32::INFINITY), 0x7e);
         assert_eq!(fp8_encode(Fp8Format::E4M3Fn, f32::NAN), 0x7f);
         assert_eq!(fp8_encode(Fp8Format::E4M3Fn, 1.0625), 0x38);
+    }
+
+    /// `out[i] = Narrow(to, input[i])` for one lane per element, a scheduling boundary between the read and the
+    /// narrowing: `_1` input (f32), `_2` out (`to`), `_3` lane, `_4` value, `_5` narrowed.
+    fn narrow_body(to: Ty, lanes: u32) -> Body {
+        body_of(
+            2,
+            vec![
+                buffer_ty(Ty::F32),
+                buffer_ty(to.clone()),
+                Ty::Usize,
+                Ty::F32,
+                to.clone(),
+            ],
+            vec![
+                block(vec![], thread_index(3, IndexAxis::X, 1)),
+                block(
+                    vec![
+                        assign(4, Rvalue::Use(Operand::Copy(element_of(1, 3)))),
+                        Statement::SchedulingBoundary,
+                        assign(
+                            5,
+                            Rvalue::Narrow {
+                                to,
+                                operand: copy(4),
+                            },
+                        ),
+                        Statement::Assign(element_of(2, 3), Rvalue::Use(copy(5))),
+                    ],
+                    Terminator::Return,
+                ),
+            ],
+            [lanes, 1, 1],
+        )
+    }
+
+    /// An exact narrowing keeps every value of the narrow type bit for bit (a subnormal, the largest finite
+    /// value, an infinity, the canonical quiet NaN) and faults on a value the narrowing would have to round,
+    /// naming it; a scheduling boundary changes nothing. Mutation: make `narrow` skip its exactness test (accept
+    /// any value); the inexact rows run to completion and this test goes red.
+    #[test]
+    fn an_exact_narrowing_keeps_narrow_values_and_faults_on_any_other() {
+        let quiet_nan = f32::from_bits(0x7fc0_0000);
+        for (to, exact, inexact) in [
+            (
+                Ty::BF16,
+                vec![
+                    1.0,
+                    -3.140625,
+                    f32::from_bits(0x0001_0000),
+                    f32::INFINITY,
+                    quiet_nan,
+                ],
+                [1.0 + 2.0f32.powi(-9), f32::from_bits(0x7f80_0001)],
+            ),
+            (
+                Ty::F16,
+                vec![1.0, 65504.0, 2.0f32.powi(-24), f32::NEG_INFINITY, quiet_nan],
+                [65519.0, 2.0f32.powi(-25)],
+            ),
+        ] {
+            let lanes = exact.len() as u32;
+            let mut buffers = [
+                Buffer::from_f32s(&exact),
+                Buffer::from_halves(to.clone(), &vec![0.0; exact.len()]),
+            ];
+            run(&narrow_body(to.clone(), lanes), [1, 1, 1], &mut buffers).unwrap();
+            let got = buffers[1].to_halves().unwrap();
+            for (want, got) in exact.iter().zip(&got) {
+                assert_eq!(
+                    want.to_bits(),
+                    got.to_bits(),
+                    "{to:?}: {want:e} narrowed to {got:e}"
+                );
+            }
+            for value in inexact {
+                let mut buffers = [
+                    Buffer::from_f32s(&[value]),
+                    Buffer::from_halves(to.clone(), &[0.0]),
+                ];
+                let err = run(&narrow_body(to.clone(), 1), [1, 1, 1], &mut buffers).unwrap_err();
+                assert!(
+                    matches!(&err, InterpError::Fault { fault: Fault::InexactNarrow { to: t, value: v }, .. }
+                        if *t == to && v.to_bits() == value.to_bits()),
+                    "{to:?} {value:e}: {err}"
+                );
+            }
+        }
     }
 
     #[test]

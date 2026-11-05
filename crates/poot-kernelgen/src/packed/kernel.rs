@@ -16,8 +16,8 @@ use super::source::Source;
 use crate::KernelGenError;
 use crate::PackedRows;
 use crate::contraction::{
-    BoundEpilogue, Epilogue, GemvLaunch, Schedule, TiledBody, TiledLaunch, TiledWeight, gemv_body,
-    tiled_body,
+    BoundEpilogue, Epilogue, GemvLaunch, Schedule, TiledBody, TiledExtents, TiledLaunch,
+    TiledWeight, gemv_body, tiled_body,
 };
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
 use crate::helpers::{Alloc, WeightLayout, elem, guard, ld, local, slice_dtype, slice_f32};
@@ -83,20 +83,36 @@ pub fn packed_run_sharing(format: WeightFormat) -> Result<PackedRunSharing, Kern
     })
 }
 
+/// The bits one value of `format` occupies in global memory, rounded up ([`crate::TiledShape::weight_bits`]): a
+/// block format's block bits over its values, a planar one's code width.
+pub fn packed_value_bits(format: WeightFormat) -> u32 {
+    match format.descriptor().storage {
+        Storage::Blocks(layout) => (layout.bytes * 8).div_ceil(layout.values.max(1)) as u32,
+        Storage::Planar(layout) => layout
+            .operands
+            .iter()
+            .find(|operand| operand.role == poot_quant::format::OperandRole::Codes)
+            .map_or(32, |operand| operand.bits),
+    }
+}
+
 /// The packed operand load of a [`crate::ContractionSpec`]: `format`'s descriptor-driven decode served to
 /// `schedule`'s loop nest, with `epilogue` applied to each column's sum before its store. The Gemv carries an
 /// epilogue (its leaves ride between the weight sources and the metadata); the block-diagonal tiled schedule has
 /// none yet, so an epilogue on it is a typed refusal. `rows` says how output rows meet weight rows: an
 /// [`PackedRows::Indexed`] table is a Gemv (decode) or the register-tiled schedule inside an expert walk
-/// (prefill), both with an epilogue.
+/// (prefill), both with an epilogue. `meta` is the request's metadata; a tiled body reads its extents from it
+/// ([`TiledExtents::of_meta`]).
 pub(crate) fn packed_contraction(
     name: &str,
     format: WeightFormat,
     schedule: Schedule,
+    meta: &[u32],
     epilogue: Option<&Epilogue>,
     rows: PackedRows,
     precision: OperandPrecision,
 ) -> Result<Body, KernelGenError> {
+    const GENERATOR: &str = "packed_contraction";
     if let Some(epilogue) = epilogue {
         epilogue.require_f32("packed_contraction")?;
     }
@@ -122,8 +138,13 @@ pub(crate) fn packed_contraction(
             super::indexed::indexed_register_tiled(
                 name,
                 format,
-                TiledLaunch::of(schedule, WeightLayout::Nk, precision)?
-                    .scalar_only("packed_contraction")?,
+                TiledLaunch::of(
+                    schedule,
+                    WeightLayout::Nk,
+                    precision,
+                    TiledExtents::of_meta(GENERATOR, meta)?,
+                )?
+                .scalar_only(GENERATOR)?,
                 epilogue,
                 read,
             )
@@ -138,7 +159,12 @@ pub(crate) fn packed_contraction(
             contraction_register_tiled(
                 name,
                 format,
-                TiledLaunch::of(schedule, WeightLayout::Nk, precision)?,
+                TiledLaunch::of(
+                    schedule,
+                    WeightLayout::Nk,
+                    precision,
+                    TiledExtents::of_meta(GENERATOR, meta)?,
+                )?,
                 read,
             )
         }

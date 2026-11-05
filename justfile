@@ -527,6 +527,15 @@ bench:
     cargo bench -p poot-models --bench decode
     scripts/with-required-backend.sh POOT_REQUIRE_WGPU cargo bench -p poot-wgpu-device --bench op_dispatch
 
+# hardware counters (rocprofv3, TheRock's, wrapped by the devshell) for one performance-bank case on the local ROCm
+# device: waves, VALU/LDS/memory instruction counts, LDS bank conflicts, occupancy, memory-unit busy and L2 traffic,
+# one profiler pass per counter group, summarized for the case's hot kernel in <out>/<case>/summary.{md,json}
+# (scripts/profile-rocm-kernel). Takes the GPU lock; counter runs serialize dispatches, so they say what a kernel
+# does, not how fast it is (device time is the bank's). Example: `just profile-rocm-kernel prefill-dense-bf16-nk-narrow`.
+profile-rocm-kernel case out='target/rocm-counters':
+    cargo build --release -p poot-rocm-device --example performance_bank
+    flock /tmp/poot-gpu.lock scripts/profile-rocm-kernel "${CARGO_TARGET_DIR:-target}/release/examples/performance_bank" {{case}} {{out}}
+
 # ---- kernel assets ----------------------------------------------------------
 
 # regenerate the committed imported-kernel assets (pootc/kernels/<family>/*.rs) from

@@ -7,7 +7,7 @@ use poot_target::BufferStorage;
 use super::Schedule;
 use super::epilogue::{BoundEpilogue, Epilogue};
 use super::gemv::{GemvLaunch, gemv_body};
-use super::tiled::{TiledBody, TiledLaunch, TiledWeight, tiled_body};
+use super::tiled::{TiledBody, TiledExtents, TiledLaunch, TiledWeight, tiled_body};
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, copy};
 use crate::helpers::{Alloc, WeightLane, WeightLayout, ld, local, slice_dtype, slice_f32};
@@ -31,6 +31,15 @@ impl DenseTiledWeight {
         match self {
             Self::Nk(_) => WeightLayout::Nk,
             Self::KnF32 => WeightLayout::Kn,
+        }
+    }
+
+    /// The bits one weight element occupies in global memory ([`crate::TiledShape::weight_bits`]): 16 for a packed
+    /// half, 32 for an f32 word.
+    pub fn bits(self) -> u32 {
+        match self {
+            Self::Nk(storage) => crate::dense_value_bits(storage),
+            Self::KnF32 => crate::dense_value_bits(BufferStorage::f32()),
         }
     }
 
@@ -89,21 +98,22 @@ pub(crate) fn dense_contraction(
 /// `out[row, n] = sum over k of activation[row, k] * weight(n, k)`, `M > 1`: [`Schedule::RegisterTiled`], the
 /// block-diagonal loop nest of [`tiled_body`] over a dense weight, with `epilogue` (f32) applied to each output
 /// before its store. Params `(activation, weight, epilogue leaves.., metadata, out)`, `metadata = [K,
-/// out_per_block, m_per_block, x_groups, tile_offset]`. An `[N, K]` weight stages runs of its rows through
-/// [`WeightLane::emit_run`]: row `n` starts at element `n * K`, so with `K` a multiple of the lane's elements per
-/// word every run (a multiple of the word too) starts on a word boundary and loads whole words. A `[K, N]` weight
-/// stages its f32 elements along `N`.
+/// out_per_block, m_per_block, x_groups, tile_offset]`, of which `extents` are the first two. An `[N, K]` weight
+/// stages runs of its rows through [`WeightLane::emit_run`]: row `n` starts at element `n * K`, so with `K` a
+/// multiple of the lane's elements per word every run (a multiple of the word too) starts on a word boundary and
+/// loads whole words. A `[K, N]` weight stages its f32 elements in blocks along `N` ([`tiled_body`]).
 pub(crate) fn dense_tiled_contraction(
     name: &str,
     weight: DenseTiledWeight,
     schedule: Schedule,
-    k: usize,
+    extents: TiledExtents,
     epilogue: Option<&Epilogue>,
     precision: OperandPrecision,
 ) -> Result<Body, KernelGenError> {
     const GENERATOR: &str = "dense_tiled_contraction";
     let lane = weight.lane(GENERATOR)?;
-    let launch = TiledLaunch::of(schedule, weight.layout(), precision)?;
+    let launch = TiledLaunch::of(schedule, weight.layout(), precision, extents)?;
+    let k = extents.k;
     let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
     let leaf_lanes = match epilogue {
         Some(epilogue) => {
@@ -273,14 +283,16 @@ mod tests {
 
     /// Every tiling the planner weighs, over every dense weight storage in both orientations: two blocks of 37
     /// rows by 41 columns (ragged in both, a block-diagonal product whose blocks read their own weight rows or
-    /// slab), with a `K` that stages as whole four-value runs (20) and one whose runs are single values with a
-    /// tail past the last 16-value stage (17), match a host dot product. Mutation: in `tiled_body`'s `[K, N]`
-    /// staging, drop the block's slab from `source`; every `KnF32` case goes red at the second block's rows.
+    /// slab), with a `K` that stages as whole four-value runs (20), one whose runs are single values with a tail
+    /// past the last 16-value round (17) and one of whole rounds (32: no tail mask, the round the pipeline issues
+    /// past the last clamped), match a host dot product. Mutation: in `tiled_body`'s `[K, N]` staging, drop the
+    /// block's slab from `source`; every `KnF32` case goes red at the second block's rows. Mutation: drop the
+    /// `min(round, last_round)` clamp in `stage_round`; the `K = 32` cases read past the activation.
     #[test]
     fn the_dense_tiled_body_matches_a_host_product_at_every_planned_tiling() {
         let caps = DeviceCaps::rocm_default();
         let (blocks, m, n) = (2usize, 37usize, 41usize);
-        for k in [20usize, 17] {
+        for k in [20usize, 17, 32] {
             let activation = values(blocks * m * k, 1);
             let weights = values(blocks * n * k, 2);
             for weight in [
@@ -309,13 +321,17 @@ mod tests {
                     layout: weight.layout(),
                     segments: 1,
                     terms: StagedTerms::ONE,
+                    weight_bits: weight.bits(),
                 };
                 for tiling in RegisterTiling::candidates(tiled_shape, &caps) {
                     let body = dense_tiled_contraction(
                         "t",
                         weight,
                         tiling.schedule(),
-                        k,
+                        super::TiledExtents {
+                            k,
+                            out_per_block: n,
+                        },
                         None,
                         poot_graph_ir::OperandPrecision::Exact,
                     )

@@ -402,7 +402,8 @@ fn bound_weight(kind: WeightKind, shape: Shape, w: &[f32]) -> Vec<u32> {
 }
 
 /// The fragment schedules a device can run, as `(wave grid, fragments per wave)`: the smallest, a square one, and the
-/// large tile the planner picks for a long prefill. Each is offered with the layout and dtype the device reports.
+/// large tile the planner picks for a long prefill, each at both round depths the planner chooses from (32 and 64
+/// `K` values a round). Each is offered with the layout and dtype the device reports.
 fn schedules(device: &Device, dtype: FragmentDtype, shape: Shape) -> Vec<kg::Schedule> {
     let k = shape.k;
     let units = device
@@ -420,8 +421,8 @@ fn schedules(device: &Device, dtype: FragmentDtype, shape: Shape) -> Vec<kg::Sch
         ((4, 2), (2, 4)),
     ]
     .into_iter()
-    .map(
-        |((waves_m, waves_n), (rows, cols))| kg::Schedule::FragmentTiled {
+    .flat_map(|((waves_m, waves_n), (rows, cols))| {
+        [32, 64].map(|depth| kg::Schedule::FragmentTiled {
             waves_m: kg::TileSize::new(waves_m).unwrap(),
             waves_n: kg::TileSize::new(waves_n).unwrap(),
             tile: kg::FragmentTile {
@@ -431,8 +432,9 @@ fn schedules(device: &Device, dtype: FragmentDtype, shape: Shape) -> Vec<kg::Sch
                 cols,
             },
             run,
-        },
-    )
+            depth,
+        })
+    })
     .filter(|schedule| {
         let lanes = kg::RegisterTiling::of(*schedule).unwrap().workgroup_lanes();
         lanes <= device.caps.max_workgroup_invocations as usize
@@ -520,19 +522,46 @@ fn residual(
 const ORACLE_BOUND: f64 = 1.0 / 131072.0;
 
 /// Every schedule, precision, weight kind and ragged edge of a small contraction matches the declared oracle.
-/// `K = 45` stages in single values with a tail past the last 32-value round; `M = 37`, `N = 41` are ragged in
-/// every tile.
+/// `K = 45` stages in single values with a tail past the last round; `M = 37`, `N = 41` are ragged in every tile, so
+/// a `[K, N]` weight is staged one column a block.
 #[test]
 fn fragment_contractions_match_the_declared_oracle_on_every_device() {
-    let shape = Shape {
-        m: 37,
-        n: 41,
-        k: 45,
-    };
+    let mut failures = Vec::new();
+    oracle_rows(
+        Shape {
+            m: 37,
+            n: 41,
+            k: 45,
+        },
+        &mut failures,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// [`fragment_contractions_match_the_declared_oracle_on_every_device`] at an aligned shape: `K = 128` is whole
+/// rounds at both depths (the body emits no tail mask, and the round the pipeline issues past the last is clamped),
+/// and `N = 44` stages a `[K, N]` weight in four-column blocks. Its own row: one process runs a bounded number of
+/// ROCm dispatches (`HSA_STATUS_ERROR_OUT_OF_RESOURCES` past a few hundred in one). Mutation: drop the
+/// `min(round, last_round)` clamp in `tiled_body`'s `stage_round`; the rows read past the buffers.
+#[test]
+fn fragment_contractions_at_whole_rounds_match_the_declared_oracle_on_every_device() {
+    let mut failures = Vec::new();
+    oracle_rows(
+        Shape {
+            m: 37,
+            n: 44,
+            k: 128,
+        },
+        &mut failures,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// [`fragment_contractions_match_the_declared_oracle_on_every_device`] at one shape.
+fn oracle_rows(shape: Shape, failures: &mut Vec<String>) {
     let a = activations(Dist::Gauss, shape.m, shape.k, 1);
     let w = weights(shape.n, shape.k, 2);
     let points = sample(shape.m, shape.n, 200, 3);
-    let mut failures = Vec::new();
     for device in devices() {
         for &dtype in &device.dtypes {
             for precision in [
@@ -542,7 +571,7 @@ fn fragment_contractions_match_the_declared_oracle_on_every_device() {
                 for kind in [WeightKind::NkF32, WeightKind::NkBf16, WeightKind::KnF32] {
                     let weight = bound_weight(kind, shape, &w);
                     for (i, schedule) in schedules(&device, dtype, shape).into_iter().enumerate() {
-                        let name = format!("frag_parity_{dtype:?}_{i}_{kind:?}");
+                        let name = format!("frag_parity_{dtype:?}_{i}_{kind:?}_k{}", shape.k);
                         let (body, launch) =
                             generate(&device.caps, &name, shape, kind, schedule, precision)
                                 .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -575,7 +604,6 @@ fn fragment_contractions_match_the_declared_oracle_on_every_device() {
             }
         }
     }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// A fragment schedule needs operands narrowed or split to its dtype, and a device that does not offer a dtype
@@ -667,10 +695,35 @@ fn narrow_contractions_stay_within_the_recorded_contract_on_the_bank_shapes() {
                             layout: kg::WeightLayout::Nk,
                             segments: 1,
                             terms: kg::StagedTerms::of(precision, None, Some(FragmentDtype::Bf16)),
+                            weight_bits: 16,
                         },
                         &device.caps,
                     );
-                    let schedule = tiling.schedule();
+                    // A device whose workgroup is one wave (wgpu) is planned the scalar tiling, which a
+                    // single-wave fragment tile loses to; its fragment kernel still has to meet the contract, so
+                    // the row builds that tile itself. Every other device must be planned a fragment tiling.
+                    let config = device
+                        .caps
+                        .matrix_units
+                        .known()
+                        .and_then(|u| u.config(dtype).copied());
+                    let single_wave = config.is_some_and(|c| c.waves == 1);
+                    let schedule = if single_wave {
+                        kg::Schedule::FragmentTiled {
+                            waves_m: kg::TileSize::new(1).expect("one wave"),
+                            waves_n: kg::TileSize::new(1).expect("one wave"),
+                            tile: kg::FragmentTile {
+                                dtype,
+                                layout: config.expect("a single-wave device has a unit").layout,
+                                rows: 2,
+                                cols: 4,
+                            },
+                            run: kg::RunLength::dividing(shape.k),
+                            depth: 32,
+                        }
+                    } else {
+                        tiling.schedule()
+                    };
                     assert!(
                         matches!(schedule, kg::Schedule::FragmentTiled { .. }),
                         "{}: the planner takes a fragment tiling for {label}: {schedule:?}",

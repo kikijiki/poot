@@ -25,7 +25,9 @@ use poot_target::BufferStorage;
 use super::Schedule;
 use super::epilogue::{BoundEpilogue, Epilogue};
 use super::gemv::{GemvLaunch, gemv_body};
-use super::tiled::{ExpertWalk, TiledBody, TiledLaunch, TiledWeight, WalkStep, tiled_body};
+use super::tiled::{
+    ExpertWalk, TiledBody, TiledExtents, TiledLaunch, TiledWeight, WalkStep, tiled_body,
+};
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy, cu, emit_read_meta, select_u32};
 use crate::helpers::{Alloc, WeightLane, WeightLayout, elem, ld, local, slice_dtype, slice_f32};
@@ -167,15 +169,16 @@ fn emit_in_slab(
 /// The body of an indexed contraction over f32 activation and output and a stacked weight held in `weight`'s
 /// storage (f32, or BF16 packed two per `u32` word and widened in-register: no f32 copy of an expert stack ever
 /// exists) under `schedule`, with the weight's experts read as `layout` says, params `(x, w, ids, epilogue leaves..,
-/// metadata, out)`; `ids` is `I32` and `metadata` is `[K, N, M, x_groups, tile_offset, E]`. `k` is the `K` the
-/// planner generates for (it decides only whether a packed row's runs start on a word boundary). `epilogue` (f32)
-/// runs over each output element's sum before its store.
+/// metadata, out)`; `ids` is `I32` and `metadata` is `[K, N, M, x_groups, tile_offset, E]`. `meta` is that
+/// metadata as the request carries it: a tiled body's extents ([`TiledExtents::of_meta`]; `K` also decides whether
+/// a packed row's runs start on a word boundary). `epilogue` (f32) runs over each output element's sum before its
+/// store.
 pub(crate) fn indexed_contraction(
     name: &str,
     schedule: Schedule,
     layout: WeightLayout,
     weight: BufferStorage,
-    k: usize,
+    meta: &[u32],
     epilogue: Option<&Epilogue>,
     precision: OperandPrecision,
 ) -> Result<Body, KernelGenError> {
@@ -205,15 +208,19 @@ pub(crate) fn indexed_contraction(
             epilogue,
             ProductRead::dense(precision, lane),
         ),
-        Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => indexed_register_tiled(
-            name,
-            TiledLaunch::of(schedule, layout, precision)?.scalar_only("indexed_contraction")?,
-            layout,
-            lane,
-            k,
-            epilogue,
-            ProductRead::dense(precision, lane),
-        ),
+        Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => {
+            let extents = TiledExtents::of_meta("indexed_contraction", meta)?;
+            indexed_register_tiled(
+                name,
+                TiledLaunch::of(schedule, layout, precision, extents)?
+                    .scalar_only("indexed_contraction")?,
+                layout,
+                lane,
+                extents.k,
+                epilogue,
+                ProductRead::dense(precision, lane),
+            )
+        }
     }
 }
 
