@@ -5,7 +5,9 @@ use super::{
     FusedRegion, Graph, KernelRequest, MatmulShapes, OpKind, Operand, PlanError, Planned, Scalar,
     ValueId, WeightLayout, fty_ty, kg, out_numel_saturating, value_ids,
 };
-use crate::kernel_mapping::{check_widening_step, float_region_leaf_storage, map_fused_op};
+use crate::kernel_mapping::{
+    check_widening_step, float_region_leaf_storage, map_fused_op, narrowing_store_op,
+};
 use crate::planner::{GraphTables, StorageDtypes};
 use crate::predicates::{
     GEMV_WIDTH, decode_gemv_plan, indexed_matmul_lowers, is_batched_tileable_matmul_in,
@@ -13,7 +15,7 @@ use crate::predicates::{
     packed_contraction_m_per_block, serial_matmul_fold,
 };
 use crate::refusal::{FusedStepGap, Site};
-use poot_graph_ir::{ContractionRows, LocalId, OperandPrecision};
+use poot_graph_ir::{ContractionRows, FragmentDtype, LocalId, OperandPrecision};
 use poot_target::{Backend, DeviceCaps};
 
 /// The launch of a `Tiled` contraction of `tiles` workgroups of `tile * tile` threads: the tiles laid out on the X
@@ -121,7 +123,7 @@ pub(crate) fn epilogue_head_lowers(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> b
         // A dense head takes the generated Gemv at `M == 1` and the generated tiled GEMM above it, and both carry
         // an epilogue, so every dense head lowers (the weight dtypes the dense planner admits).
         OpKind::DenseContraction { .. } => true,
-        // Every indexed schedule (Gemv and the register-tiled expert walk) carries an epilogue.
+        // Every indexed schedule (Gemv and the register-tiled schedule over the grouped rows) carries an epilogue.
         OpKind::IndexedMatMul { .. } => indexed_matmul_lowers(tables, eqn),
         // The packed Gemv (one activation row per block) carries an epilogue; the block-diagonal tiled schedule does not.
         OpKind::PackedContraction {
@@ -138,7 +140,7 @@ pub(crate) fn epilogue_head_lowers(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> b
                     ContractionRows::Blocks(blocks) => {
                         packed_contraction_m_per_block(tables, eqn, *descriptor, *blocks) == 1
                     }
-                    // An indexed table carries an epilogue on both its schedules (Gemv and the register-tiled expert walk).
+                    // An indexed table carries an epilogue on both its schedules (Gemv and the register-tiled schedule over the grouped rows).
                     ContractionRows::Indexed { .. } => true,
                 }
         }
@@ -150,7 +152,9 @@ pub(crate) fn epilogue_head_lowers(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> b
 /// dtype `odt`: local 0 is the head result, locals `1..n_inputs` the eqn's extra inputs (leaves), later locals
 /// the steps. A leaf has the head's dtype (a float the generated bodies round through), or, under an f32
 /// epilogue, is a BF16 weight (a bias) that a `Cast` step widens by reading it through its packed lane
-/// (`packed_operands[position]`, the storage plan's choice); anything else is a typed refusal.
+/// (`packed_operands[position]`, the storage plan's choice); anything else is a typed refusal. A region whose last
+/// step narrows its f32 result (POOT-1448) is an f32 epilogue with a narrow store, which `stores_narrow` says the
+/// body that runs it has; without it the step is refused.
 #[expect(clippy::too_many_arguments)]
 pub(super) fn epilogue_of(
     site: Site<'_>,
@@ -161,11 +165,16 @@ pub(super) fn epilogue_of(
     out_shape: &[usize],
     odt: DType,
     packed_operands: &[bool],
+    stores_narrow: bool,
 ) -> Result<kg::Epilogue, PlanError> {
+    // A region whose last step narrows its f32 result (POOT-1448) computes in f32 and stores the narrow dtype.
+    let narrowed = region.narrowed_output();
+    let odt = if narrowed.is_some() { DType::F32 } else { odt };
     let dt = match odt {
         DType::F32 | DType::BF16 | DType::F16 => fty_ty(odt),
         _ => return Err(site.refuse(Capability::DtypeLowering)),
     };
+    let last_step = region.steps.len().checked_sub(1);
     let mut leaves = Vec::new();
     for (position, operand) in eqn.inputs.iter().enumerate().skip(head_operands) {
         let Operand::Value(value) = operand else {
@@ -194,12 +203,19 @@ pub(super) fn epilogue_of(
     let steps = region
         .steps
         .iter()
-        .map(|step| {
-            check_widening_step(site, step.op, &step.inputs, |id| {
-                (1..n_inputs).contains(&id.index())
-            })?;
+        .enumerate()
+        .map(|(j, step)| {
+            let op = match narrowed {
+                Some(to) if Some(j) == last_step => narrowing_store_op(site, to, stores_narrow)?,
+                _ => {
+                    check_widening_step(site, step.op, &step.inputs, |id| {
+                        (1..n_inputs).contains(&id.index())
+                    })?;
+                    map_fused_op(site, step.op)?
+                }
+            };
             Ok(kg::EpilogueStep {
-                op: map_fused_op(site, step.op)?,
+                op,
                 inputs: step
                     .inputs
                     .iter()
@@ -298,13 +314,15 @@ pub(super) fn plan(
                             out_per_block: nn,
                             k: kk,
                             layout: WeightLayout::Kn,
-                            segments: 1,
+                            rows: poot_kernelgen::TiledRows::Dense,
                             terms: kg::StagedTerms::of(precision, None, None),
                             weight_bits: kg::DenseTiledWeight::KnF32.bits(),
+                            activation_bits: kg::activation_bits(None),
                         },
                         kg::DenseTiledWeight::KnF32,
                         None,
                         precision,
+                        None,
                         caps,
                     )?
                 }
@@ -322,13 +340,15 @@ pub(super) fn plan(
                             out_per_block: nn,
                             k: kk,
                             layout: WeightLayout::Kn,
-                            segments: 1,
+                            rows: poot_kernelgen::TiledRows::Dense,
                             terms: kg::StagedTerms::of(precision, None, None),
                             weight_bits: kg::DenseTiledWeight::KnF32.bits(),
+                            activation_bits: kg::activation_bits(None),
                         },
                         kg::DenseTiledWeight::KnF32,
                         None,
                         precision,
+                        None,
                         caps,
                     )?
                 }
@@ -384,6 +404,8 @@ pub(super) fn plan(
                 out_shape,
                 odt,
                 packed_operands,
+                // Only the dense tiled body stores a narrowed output (POOT-1448).
+                false,
             )?;
             if matmul_route(g, eqn, out_shape, out_numel, caps) == MatMulRoute::Tileable {
                 // The route `matmul_route` gives the unfused head: the generated tiled GEMM, storing the
@@ -398,13 +420,15 @@ pub(super) fn plan(
                         out_per_block: nn,
                         k: a[a.len() - 1],
                         layout: WeightLayout::Kn,
-                        segments: 1,
+                        rows: poot_kernelgen::TiledRows::Dense,
                         terms: kg::StagedTerms::of(precision, None, None),
                         weight_bits: kg::DenseTiledWeight::KnF32.bits(),
+                        activation_bits: kg::activation_bits(None),
                     },
                     kg::DenseTiledWeight::KnF32,
                     Some(epilogue),
                     precision,
+                    None,
                     caps,
                 );
             }
@@ -459,15 +483,23 @@ pub(super) fn register_tiled_launch(
     let overflow = || site.refuse(Capability::DispatchSizeOverflow);
     let tiling = kg::RegisterTiling::choose(shape, caps);
     let (tile_rows, tile_cols) = tiling.output_tile();
+    // A grouping's tile is one output tile: a tiling of other rows would read two buckets' rows as one expert's.
+    if !shape.admits_tile_rows(tile_rows) {
+        return Err(site.refuse(Capability::GroupedTileRows {
+            block: match shape.rows {
+                kg::TiledRows::Grouped { block, .. } => block,
+                kg::TiledRows::Dense => tile_rows,
+            },
+            tile_rows,
+        }));
+    }
+    let grid_rows = shape.grid_rows();
     let tiles = shape
         .blocks
-        .checked_mul(shape.m_per_block.div_ceil(tile_rows))
+        .checked_mul(grid_rows.div_ceil(tile_rows))
         .and_then(|v| v.checked_mul(shape.out_per_block.div_ceil(tile_cols)))
         .ok_or_else(overflow)?;
-    // A tile of an expert walk runs its `K` loop once per expert its rows select; the expected passes of
-    // expert-sorted rows ([`kg::TiledShape::passes_per_tile`]) size its share of the watchdog budget.
-    let passes = shape.passes_per_tile(tile_rows).ceil() as usize;
-    let mut per_dispatch = tiles_per_dispatch(tiles, tile_rows * tile_cols * passes, shape.k, caps);
+    let mut per_dispatch = tiles_per_dispatch(tiles, tile_rows * tile_cols, shape.k, caps);
     if let Some(ceiling) = caps.known_miscompiles.tiled_gemm_max_workgroups {
         per_dispatch = per_dispatch.min((ceiling as usize).saturating_sub(1).max(1));
     }
@@ -477,7 +509,7 @@ pub(super) fn register_tiled_launch(
         caps.compute_units as usize,
         caps.max_grid[0].max(1) as usize,
     );
-    let extents = [shape.k, shape.out_per_block, shape.m_per_block]
+    let extents = [shape.k, shape.out_per_block, grid_rows]
         .into_iter()
         .map(|extent| u32::try_from(extent).map_err(|_| overflow()))
         .collect::<Result<Vec<_>, _>>()?;
@@ -540,6 +572,7 @@ fn wave_aligned_chunk(tiles: usize, max_per_dispatch: usize, units: usize, row: 
 /// Plan an `M > 1` dense contraction over `weight` as the register-tiled GEMM ([`register_tiled_launch`]), with
 /// `epilogue` (f32) applied to each output before its store: one generated request per dispatch, a split plan when
 /// the launch is several.
+#[expect(clippy::too_many_arguments)] // the shape, both operands' storage, the epilogue and the device
 pub(super) fn dense_tiled_plan(
     site: Site<'_>,
     backend: Backend,
@@ -547,6 +580,7 @@ pub(super) fn dense_tiled_plan(
     weight: kg::DenseTiledWeight,
     epilogue: Option<kg::Epilogue>,
     precision: OperandPrecision,
+    activation_stored: Option<FragmentDtype>,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
     let (tiling, dispatches) = register_tiled_launch(site, shape, caps)?;
@@ -563,6 +597,7 @@ pub(super) fn dense_tiled_plan(
                 grid,
                 meta,
                 precision,
+                activation_stored,
             }))
         },
     )

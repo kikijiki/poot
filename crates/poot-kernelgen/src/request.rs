@@ -25,11 +25,12 @@ use crate::attention::{
 };
 use crate::block_top_k::{BlockTopKSpec, block_top_k_body};
 use crate::contraction::{
-    DenseTiledWeight, Epilogue, GemvActivation, Schedule, TiledExtents, dense_contraction,
-    dense_tiled_contraction, indexed_contraction,
+    DenseTiledWeight, Epilogue, GemvActivation, Schedule, TiledExtents, TiledRead,
+    dense_contraction, dense_tiled_contraction, indexed_contraction,
 };
 use crate::data_movement::{
-    MovementOp, MovementSpec, Storage, arg_top_k_dt, expert_group, movement_body, rope_dt,
+    MovementOp, MovementSpec, Storage, arg_top_k_dt, expert_group, expert_group_lanes,
+    movement_body, rope_dt,
 };
 use crate::elementwise::{
     cast_bf16_to_f32, cast_f16_to_f32, cast_f32_to_bf16, cast_f32_to_f16, cast_i32_to_f32,
@@ -46,7 +47,7 @@ use crate::matmul::{matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid};
 use crate::packed::{PackedKernelSpec, packed_contraction, packed_kernel};
 use crate::reduce::reduce_last_dt;
 use crate::scan::{ScanSpec, scan_body};
-use poot_graph_ir::OperandPrecision;
+use poot_graph_ir::{FragmentDtype, OperandPrecision};
 use poot_quant::format::WeightFormat;
 
 /// The entry-point name every generated body but the named ones below carries; the shared name the GPU
@@ -672,6 +673,9 @@ pub struct DenseTiledContraction {
     pub meta: Vec<u32>,
     /// How the activation and the weight are read.
     pub precision: OperandPrecision,
+    /// The fragment dtype the activation buffer holds its values in, when the planner stored the activation narrow
+    /// because every reader narrows it to that dtype (POOT-1448); `None` for an f32 activation.
+    pub activation_stored: Option<FragmentDtype>,
 }
 
 /// A contraction over a packed weight in `format`: `schedule`'s loop nest over the weight's descriptor-driven
@@ -784,12 +788,14 @@ pub struct TopKSpec {
     pub numel: usize,
 }
 
-/// The grouping of MoE rows by expert: `ids [M]` to `out [2, M]` (the sorted order and its inverse), one thread
-/// per expert plus one for the rows whose id is outside `0..experts`.
+/// The block-aligned grouping of MoE rows by expert (POOT-1451): `ids [M]` to the
+/// [`poot_graph_ir::ExpertGrouping`] layout, one workgroup.
 #[derive(Clone, Debug)]
 pub struct ExpertGroupSpec {
     /// The expert count; ids in `0..experts` are valid.
     pub experts: usize,
+    /// Positions per tile.
+    pub block: usize,
 }
 
 fn leaf_shapes(leaves: &[ViewOperand]) -> Vec<&[usize]> {
@@ -950,8 +956,8 @@ fn build(req: &KernelRequest, caps: &DeviceCaps) -> Result<Generated, KernelGenE
             Launch::flat(spec.numel),
         ),
         KernelRequest::ExpertGroup(spec) => with(
-            expert_group(ENTRY, spec.experts),
-            Launch::flat(spec.experts + 1),
+            expert_group(ENTRY, spec.experts, spec.block),
+            Launch::flat(expert_group_lanes()),
         ),
     }
 }
@@ -1179,6 +1185,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             grid,
             meta,
             precision,
+            activation_stored,
         }) => {
             let extents = TiledExtents::of_meta("dense_tiled_contraction", meta)?;
             with(
@@ -1188,7 +1195,10 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                     *schedule,
                     extents,
                     epilogue.as_ref(),
-                    *precision,
+                    TiledRead {
+                        precision: *precision,
+                        activation_stored: *activation_stored,
+                    },
                 )?,
                 Launch {
                     grid: *grid,
@@ -1897,7 +1907,10 @@ mod tests {
                 "topk".to_string(),
             ),
             (
-                KernelRequest::ExpertGroup(ExpertGroupSpec { experts: 8 }),
+                KernelRequest::ExpertGroup(ExpertGroupSpec {
+                    experts: 8,
+                    block: 16,
+                }),
                 "expert_group".to_string(),
             ),
         ];
@@ -1950,9 +1963,10 @@ mod tests {
                 out_per_block: n,
                 k,
                 layout: weight.layout(),
-                segments: 1,
+                rows: crate::TiledRows::Dense,
                 terms: crate::precision::StagedTerms::ONE,
                 weight_bits: weight.bits(),
+                activation_bits: 32,
             },
             caps,
         );
@@ -1966,6 +1980,7 @@ mod tests {
             grid: [(tiles * lanes) as u32, 1, 1],
             meta: vec![k as u32, n as u32, m as u32, tiles as u32, 0],
             precision: poot_graph_ir::OperandPrecision::Exact,
+            activation_stored: None,
         })
     }
 
@@ -3213,7 +3228,10 @@ mod tests {
             "no AIE schedule",
         );
         refused(
-            KernelRequest::ExpertGroup(ExpertGroupSpec { experts: 8 }),
+            KernelRequest::ExpertGroup(ExpertGroupSpec {
+                experts: 8,
+                block: 16,
+            }),
             "no AIE schedule",
         );
         let huge = dense_unary(FusedScalarOp::Tanh, u32::MAX as usize + 1);

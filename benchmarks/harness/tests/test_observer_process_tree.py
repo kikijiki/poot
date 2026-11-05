@@ -517,19 +517,22 @@ class Process:
     def __init__(self, pid):
         self.pid = pid
 
+    calls = 0
+
     def children(self, recursive=True):
         return []
 
     def cpu_percent(self, interval=None):
+        # The first calls prime the meter before the sampling loop starts; a later one blocks inside the loop.
+        Process.calls += 1
+        if Process.calls > 2:
+            Path(os.environ["POOT_BLOCKING_SAMPLER_MARKER"]).write_text("entered", encoding="ascii")
+            while True:
+                time.sleep(60)
         return 0.0
 
     def is_running(self):
         return True
-
-    def memory_info(self):
-        Path(os.environ["POOT_BLOCKING_SAMPLER_MARKER"]).write_text("entered", encoding="ascii")
-        while True:
-            time.sleep(60)
 """
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -542,7 +545,7 @@ class Process:
                 finish_sampler = observer._finish_sampler
 
                 def finish_after_short_deadline(sampler, conn, stop, _timeout_s):
-                    # The sampler is blocked in memory_info forever (the marker proves it is there), so a
+                    # The sampler is blocked in cpu_percent forever (the marker proves it is there), so a
                     # short deadline always expires, at any load. Only the startup wait needs to be long.
                     return finish_sampler(sampler, conn, stop, 0.2)
 

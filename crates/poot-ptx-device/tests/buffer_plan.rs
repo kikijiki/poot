@@ -306,3 +306,26 @@ fn an_over_length_dispatch_is_refused_by_the_engine_on_ptx() {
     };
     poot_executor_parity::dispatch_length::over_length_dispatch_is_refused(device);
 }
+
+/// POOT-1450: an untyped arena slot reaches a kernel only through a typed view its bytes admit, on a real NVIDIA
+/// device (`poot_executor_parity::view_probe`). Mutations: `BufferStorage::view_elems` admits any view of a typed
+/// buffer; drop its whole-elements check; `PtxBuffer::view` keeps the allocation's storage.
+#[test]
+fn an_arena_slot_is_bound_only_through_a_view_it_admits_on_ptx() {
+    let Some(mut device) = require_ptx() else {
+        return;
+    };
+    let body = poot_kernel_ir::test_support::len_probe_kernel();
+    let artifact = poot_codegen::KernelCache::open(poot_codegen::Target::Nvptx)
+        .load_or_compile(
+            &body,
+            poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
+        )
+        .expect("len_probe must compile to PTX");
+    let compiled = poot_codegen::kernel_handle(&body, &artifact).unwrap();
+    let kernel = device.load_kernel("poot1450_len_probe", compiled).unwrap();
+    poot_executor_parity::view_probe::an_arena_slot_is_bound_only_through_a_view_it_admits(
+        &mut device,
+        &kernel,
+    );
+}

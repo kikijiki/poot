@@ -308,7 +308,7 @@ pub fn bind_packed_weights(g: &Graph, formats: &WeightFormats) -> Result<Graph, 
                 Eqn {
                     op: OpKind::PackedContraction {
                         descriptor: packed.weight,
-                        rows: ContractionRows::Indexed { experts },
+                        rows: ContractionRows::per_row(experts),
                         precision: poot_graph_ir::OperandPrecision::Exact,
                     },
                     inputs,
@@ -752,7 +752,7 @@ mod tests {
                 eqn.op,
                 OpKind::PackedContraction {
                     descriptor: q8(8, 64),
-                    rows: ContractionRows::Indexed { experts },
+                    rows: ContractionRows::per_row(experts),
                     precision: poot_graph_ir::OperandPrecision::Exact
                 }
             );

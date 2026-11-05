@@ -111,6 +111,28 @@ pub(crate) fn map_fused_op(site: Site<'_>, op: FusedOp) -> Result<kg::FusedScala
     })
 }
 
+/// The kernel op of a float region's last step when it narrows the region's f32 result to the two-byte float `to`
+/// (POOT-1448, [`poot_graph_ir::FusedRegion::narrowed_output`]): [`kg::FusedScalarOp::Narrow`], whose body rounds the
+/// value once and stores it narrow. `stores` says whether the body the region runs in has that store: a target
+/// with native two-byte elements, and a body that writes one. Without it the step is refused by name
+/// ([`Capability::DtypeLowering`]), so a value the planner cannot store narrow stays f32.
+pub(crate) fn narrowing_store_op(
+    site: Site<'_>,
+    to: DType,
+    stores: bool,
+) -> Result<kg::FusedScalarOp, PlanError> {
+    let dtype = match to {
+        DType::BF16 => poot_target::FragmentDtype::Bf16,
+        DType::F16 => poot_target::FragmentDtype::F16,
+        _ => return Err(site.refuse(Capability::DtypeLowering)),
+    };
+    if stores {
+        Ok(kg::FusedScalarOp::Narrow(dtype))
+    } else {
+        Err(site.refuse(Capability::DtypeLowering))
+    }
+}
+
 /// The kernel op of one step of a pointwise region (`OpKind::Fused`): the one place `Select` is admitted
 /// into a float region, whose I32 condition leaf only a pointwise kernel reads, and where a `Cast` of an I32
 /// value to f32 is a step (`local_dtype` is the region's type of a local). A row or epilogue region reads

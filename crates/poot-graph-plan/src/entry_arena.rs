@@ -3,10 +3,11 @@
 //!
 //! Each stage's [`BufferPlan`] colors that stage's values onto its own slots. The stages of an entry run
 //! one after another, so a slot that is dead once its stage has run (every slot but the ones
-//! [`BufferPlan::slot_outlives_stage`] names) is free for the next stage: the entry needs, per storage
-//! class, as many shared buffers as its most demanding stage has slots, each as large as the largest
-//! slot that ever sits in it. Matching the slots of every stage largest-first onto the shared buffers by
-//! rank gives the smallest such sum.
+//! [`BufferPlan::slot_outlives_stage`] names) is free for the next stage: the entry needs as many shared
+//! buffers as its most demanding stage has slots, each as large as the largest slot that ever sits in it.
+//! Matching the slots of every stage largest-first onto the shared buffers by rank gives the smallest such
+//! sum. Such a slot is untyped bytes (POOT-1450), so a shared buffer is too, whatever storages its values
+//! have: each binding views it as its own.
 //!
 //! A slot that outlives its stage (an export a later stage binds, the primary output, a state-commit
 //! source, a validation witness) keeps a buffer of its own for the whole entry, sized exactly to its one
@@ -17,8 +18,6 @@
 //! replay ordered after the previous one with its writes visible to it, the same ordering that already
 //! lets a stage read the state and the exports an earlier stage wrote. A later stage's write to a
 //! shared buffer is therefore ordered after the earlier stage's last read of it.
-
-use std::collections::HashMap;
 
 use poot_target::BufferStorage;
 
@@ -35,39 +34,32 @@ impl EntryArena {
     /// The arena for stages that run in the order `stages` lists their buffer plans.
     pub fn plan<'a>(stages: impl IntoIterator<Item = &'a BufferPlan>) -> Self {
         let mut buffers: Vec<(BufferStorage, usize)> = Vec::new();
-        // The shared buffers of each storage class, in rank order (largest first within a stage).
-        let mut shared: HashMap<BufferStorage, Vec<usize>> = HashMap::new();
+        // The shared untyped buffers, in rank order (largest first within a stage).
+        let mut ranks: Vec<usize> = Vec::new();
         let mut stage_buffers = Vec::new();
         for plan in stages {
             let mut placed = vec![usize::MAX; plan.slot_count()];
-            // In order of each class's first slot, so the buffer indices do not depend on hash order.
-            let mut by_class: Vec<(BufferStorage, Vec<(usize, ArenaSlotId)>)> = Vec::new();
+            let mut shared: Vec<(usize, ArenaSlotId)> = Vec::new();
             for (slot, storage, elems) in plan.slots() {
-                if plan.slot_outlives_stage(slot) {
+                if storage == BufferStorage::untyped() && !plan.slot_outlives_stage(slot) {
+                    shared.push((elems, slot));
+                } else {
                     placed[slot.index()] = buffers.len();
                     buffers.push((storage, elems));
-                } else {
-                    match by_class.iter_mut().find(|(class, _)| *class == storage) {
-                        Some((_, slots)) => slots.push((elems, slot)),
-                        None => by_class.push((storage, vec![(elems, slot)])),
-                    }
                 }
             }
-            for (storage, mut slots) in by_class {
-                slots.sort_by_key(|&(elems, slot)| (std::cmp::Reverse(elems), slot.index()));
-                let ranks = shared.entry(storage).or_default();
-                for (rank, (elems, slot)) in slots.into_iter().enumerate() {
-                    let buffer = match ranks.get(rank) {
-                        Some(&buffer) => buffer,
-                        None => {
-                            buffers.push((storage, 0));
-                            ranks.push(buffers.len() - 1);
-                            buffers.len() - 1
-                        }
-                    };
-                    buffers[buffer].1 = buffers[buffer].1.max(elems);
-                    placed[slot.index()] = buffer;
-                }
+            shared.sort_by_key(|&(bytes, slot)| (std::cmp::Reverse(bytes), slot.index()));
+            for (rank, (bytes, slot)) in shared.into_iter().enumerate() {
+                let buffer = match ranks.get(rank) {
+                    Some(&buffer) => buffer,
+                    None => {
+                        buffers.push((BufferStorage::untyped(), 0));
+                        ranks.push(buffers.len() - 1);
+                        buffers.len() - 1
+                    }
+                };
+                buffers[buffer].1 = buffers[buffer].1.max(bytes);
+                placed[slot.index()] = buffer;
             }
             stage_buffers.push(placed);
         }

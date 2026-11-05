@@ -12,7 +12,7 @@ mod indexed;
 mod tiled;
 
 pub use dense::DenseTiledWeight;
-pub(crate) use dense::{dense_contraction, dense_tiled_contraction};
+pub(crate) use dense::{TiledRead, dense_contraction, dense_tiled_contraction};
 pub(crate) use epilogue::{BoundEpilogue, emit_epilogue};
 pub use epilogue::{Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep};
 pub(crate) use gemv::{GemvLaunch, gemv_body};
@@ -21,7 +21,9 @@ pub(crate) use indexed::{
     indexed_contraction,
 };
 
-pub(crate) use tiled::{ExpertWalk, TiledBody, TiledExtents, TiledLaunch, TiledWeight, tiled_body};
+pub(crate) use tiled::{
+    GroupedRows, TiledBody, TiledExtents, TiledLaunch, TiledWeight, tiled_body,
+};
 
 use poot_graph_ir::FragmentDtype;
 use poot_target::FragmentLayout;
@@ -223,11 +225,26 @@ const GLOBAL_REQUEST_BYTES: usize = 128;
 /// wave32 lane holds (`register_budget` guards the planner's tilings against spills).
 const FRAGMENT_DEPTHS: [usize; 2] = [32, 64];
 
+/// How the activation rows of a [`TiledShape`]'s blocks meet the tiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TiledRows {
+    /// A block's rows are contiguous activation rows, every tile reading its block's weight.
+    Dense,
+    /// One block of rows grouped by expert in tiles of `block` positions (POOT-1451,
+    /// [`poot_graph_ir::ExpertGrouping`]): `groups` buckets (the experts and the invalid one), each tile one bucket's.
+    /// Only a tiling whose output tile is `block` rows runs it.
+    Grouped {
+        /// The buckets, `experts + 1`.
+        groups: usize,
+        /// The positions of one tile.
+        block: usize,
+    },
+}
+
 /// The shape of an `M > 1` contraction: `blocks` independent products of `m_per_block` activation rows against
-/// `out_per_block` weight rows of `k` values (one block is a plain GEMM), the weight read in `layout`, the rows of a
-/// block in `segments` contiguous runs that each read their own weight (an indexed contraction's expert-sorted
-/// rows: `segments` is the expert count; 1 for a block-diagonal one). What [`RegisterTiling::choose`] sizes a tiling
-/// for.
+/// `out_per_block` weight rows of `k` values (one block is a plain GEMM), the weight read in `layout`, and how the
+/// rows meet the tiles (`rows`: contiguous, or an indexed contraction's rows grouped by expert). What
+/// [`RegisterTiling::choose`] sizes a tiling for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TiledShape {
     /// Independent products, one weight block (or slab) each.
@@ -240,30 +257,54 @@ pub struct TiledShape {
     pub k: usize,
     /// How the weight is stored, which decides how its tile is staged.
     pub layout: WeightLayout,
-    /// Contiguous row runs of a block that read different weights: an expert walk's keys (1 for none).
-    pub segments: usize,
+    /// How the rows meet the tiles.
+    pub rows: TiledRows,
     /// The f32 tiles staged per operand: more than one for a split operand, which stages its `hi` and `lo` parts.
     pub terms: StagedTerms,
     /// The bits one weight element occupies in global memory, rounded up: 32 for f32, 16 for a packed half, a
     /// packed format's bits per value ([`crate::packed_value_bits`]). What decides how deep a fragment round must
     /// be to read whole requests of a weight row.
     pub weight_bits: u32,
+    /// The bits one activation element occupies in global memory: 32 for f32, 16 for an activation the planner
+    /// stored in its fragment dtype (POOT-1448). The activation's side of the same round depth rule.
+    pub activation_bits: u32,
 }
 
 impl TiledShape {
-    /// The expected `K` passes of one tile of `tile_rows` rows: a tile spans its first segment plus every segment
-    /// boundary inside it, and `segments` runs over `m_per_block` sorted rows put a boundary after about every
-    /// `m_per_block / segments` rows, so a tile takes `1 + (tile_rows - 1) * (segments - 1) / m_per_block` passes,
-    /// never more than its rows or the segments. 1 for a block-diagonal contraction. An expert walk's steps for
-    /// expert-sorted rows; the model of their cost, from the shape alone.
-    pub fn passes_per_tile(self, tile_rows: usize) -> f64 {
-        let segments = self.segments.max(1);
-        if segments == 1 {
-            return 1.0;
+    /// Whether a tiling whose output tile is `tile_rows` rows runs these rows: any for dense rows, exactly `block`
+    /// for grouped ones (a tile of the grouping is one output tile).
+    pub fn admits_tile_rows(self, tile_rows: usize) -> bool {
+        match self.rows {
+            TiledRows::Dense => true,
+            TiledRows::Grouped { block, .. } => tile_rows == block,
         }
-        let boundaries =
-            (tile_rows.saturating_sub(1) * (segments - 1)) as f64 / self.m_per_block.max(1) as f64;
-        (1.0 + boundaries).min(tile_rows.min(segments) as f64)
+    }
+
+    /// The rows of one block's tile grid: its activation rows, or the grouping's padded positions (the bound the
+    /// launch covers; a tile past the padded total returns at once).
+    pub fn grid_rows(self) -> usize {
+        match self.rows {
+            TiledRows::Dense => self.m_per_block,
+            TiledRows::Grouped { groups, block } => poot_graph_ir::ExpertGrouping {
+                rows: self.m_per_block,
+                experts: groups.saturating_sub(1),
+                block,
+            }
+            .positions(),
+        }
+    }
+
+    /// The row tiles of one block that compute, at `tile_rows` rows a tile: the rows' tiles, or for grouped rows
+    /// spread evenly over `min(groups, rows)` non-empty buckets, each bucket's whole tiles. The model of the cost,
+    /// from the shape alone.
+    pub fn working_row_tiles(self, tile_rows: usize) -> usize {
+        match self.rows {
+            TiledRows::Dense => self.m_per_block.div_ceil(tile_rows),
+            TiledRows::Grouped { groups, .. } => {
+                let buckets = groups.min(self.m_per_block).max(1);
+                buckets * self.m_per_block.div_ceil(buckets).div_ceil(tile_rows)
+            }
+        }
     }
 }
 
@@ -302,20 +343,37 @@ impl RegisterTiling {
     ///   [`LANE_ROWS`] x [`LANE_COLS`] up to [`MAX_LANE_ACCUMULATORS`].
     /// - Fragment, where the operands narrow to a dtype the device has a matrix unit for
     ///   ([`StagedTerms::fragment`]): every wave grid of [`WAVE_GRIDS`] with every [`WAVE_FRAGMENTS`] tile of at
-    ///   most [`MAX_WAVE_FRAGMENTS`] fragments. An expert walk asks for scalar tiles only
-    ///   ([`StagedTerms::scalar_only`]): the rows of a fragment must share one weight tile. Its round depth is the
+    ///   most [`MAX_WAVE_FRAGMENTS`] fragments. Its round depth is the
     ///   shallowest of [`FRAGMENT_DEPTHS`] at which one round's segment of every operand row is a whole global
     ///   request ([`GLOBAL_REQUEST_BYTES`]; the deepest when none is), or the deepest shallower one its LDS holds
     ///   ([`Self::fragment_depth`]).
     ///
     /// A candidate must have a workgroup that fits the device, two staged tiles that fit its LDS and stage in whole
-    /// slots ([`tiled::stages_evenly`]). Each is costed by [`Self::cost`] and the cheapest wins, a tie going to the
+    /// slots ([`tiled::stages_evenly`]), and an output tile the shape's rows admit (a grouping's block,
+    /// [`TiledShape::admits_tile_rows`]). Each is costed by [`Self::cost`] and the cheapest wins, a tie going to the
     /// larger output tile and then to the earlier candidate (the scalar grids, then [`WAVE_GRIDS`] in order: two wave
     /// grids of one output tile load alike and tie). Chosen from shapes, storage widths and device limits alone, never
     /// from the format or a model; the run is the longest that divides `k`.
     pub fn choose(shape: TiledShape, caps: &poot_target::DeviceCaps) -> Self {
         let launch = caps.gemm_launch();
         let run = RunLength::dividing(shape.k);
+        // The narrow grid's smallest tile stages evenly at any run and fits every device that runs a 64-lane
+        // workgroup; it is the tiling of a device the filter leaves nothing for (a grouped shape's planner then
+        // refuses it unless its rows are the block).
+        Self::cheapest(shape, caps).map_or(
+            Self::scalar(
+                TileSize(launch.register_lane_edge),
+                LaneRows(LANE_ROWS[0]),
+                MicroCols::new(LANE_COLS[0]),
+                run,
+            ),
+            |(_, tiling)| tiling,
+        )
+    }
+
+    /// The cheapest candidate of `shape` on `caps` and its modelled cost, as [`Self::choose`] ranks them; `None`
+    /// when the device runs none.
+    fn cheapest(shape: TiledShape, caps: &poot_target::DeviceCaps) -> Option<(f64, Self)> {
         let mut best: Option<(f64, Self)> = None;
         for tiling in Self::candidates(shape, caps) {
             let cost = tiling.cost(shape, caps);
@@ -328,17 +386,49 @@ impl RegisterTiling {
                 best = Some((cost, tiling));
             }
         }
-        // The narrow grid's smallest tile stages evenly at any run and fits every device that runs a 64-lane
-        // workgroup; it is the tiling of a device the filter leaves nothing for.
-        best.map_or(
-            Self::scalar(
-                TileSize(launch.register_lane_edge),
-                LaneRows(LANE_ROWS[0]),
-                MicroCols::new(LANE_COLS[0]),
-                run,
-            ),
-            |(_, tiling)| tiling,
-        )
+        best
+    }
+
+    /// The block of one expert grouping several contractions read (POOT-1451): the output-tile rows for which the
+    /// sum of the contractions' cheapest tilings with exactly that many rows ([`Self::choose`]'s cost model over
+    /// each `shape` grouped at that block) is least, a tie going to the larger block (fewer tiles). Only rows every
+    /// contraction has a tiling for are weighed; `None` when there are none. Each shape's `rows` gives the buckets
+    /// (`TiledRows::Grouped { groups, .. }`; a dense shape counts one bucket); its block is replaced.
+    pub fn grouped_block(shapes: &[TiledShape], caps: &poot_target::DeviceCaps) -> Option<usize> {
+        let grouped = |shape: TiledShape, block: usize| TiledShape {
+            rows: TiledRows::Grouped {
+                groups: match shape.rows {
+                    TiledRows::Grouped { groups, .. } => groups,
+                    TiledRows::Dense => 1,
+                },
+                block,
+            },
+            ..shape
+        };
+        let mut blocks: Vec<usize> = shapes
+            .iter()
+            .flat_map(|&shape| {
+                let free = TiledShape {
+                    rows: TiledRows::Dense,
+                    ..shape
+                };
+                Self::candidates(free, caps).map(|tiling| tiling.output_tile().0)
+            })
+            .collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        let mut best: Option<(f64, usize)> = None;
+        for block in blocks {
+            let total = shapes.iter().try_fold(0.0, |total, &shape| {
+                Self::cheapest(grouped(shape, block), caps).map(|(cost, _)| total + cost)
+            });
+            if let Some(total) = total
+                && best.is_none_or(|(best_total, _)| total <= best_total)
+            {
+                best = Some((total, block));
+            }
+        }
+        best.map(|(_, block)| block)
     }
 
     fn scalar(lanes: TileSize, rows: LaneRows, cols: MicroCols, run: RunLength) -> Self {
@@ -435,9 +525,9 @@ impl RegisterTiling {
                     })
                 })
             });
-        scalar
-            .chain(fragment)
-            .filter(move |tiling| tiling.runs_on(shape, caps))
+        scalar.chain(fragment).filter(move |tiling| {
+            tiling.runs_on(shape, caps) && shape.admits_tile_rows(tiling.output_tile().0)
+        })
     }
 
     /// The `K` values one barrier round of this tiling stages.
@@ -446,14 +536,14 @@ impl RegisterTiling {
     }
 
     /// This fragment geometry at its round depth, or `None` when the device runs it at none: the shallowest of
-    /// [`FRAGMENT_DEPTHS`] whose round segment of every operand row (the activation's f32 rows, the weight's rows
-    /// at `shape.weight_bits` per value) is at least one [`GLOBAL_REQUEST_BYTES`] request, the deepest when none
-    /// is; and if [`Self::runs_on`] refuses that depth (its staged tiles outgrow the LDS), the deepest shallower
-    /// one it runs. A 32-deep round of a bf16 weight row reads half a line per request: the vector memory path
-    /// pays a request for it, so the round doubles; an f32 activation row is a whole line at 32 already.
+    /// [`FRAGMENT_DEPTHS`] whose round segment of every operand row (the activation's rows at
+    /// `shape.activation_bits` per value, the weight's at `shape.weight_bits`) is at least one
+    /// [`GLOBAL_REQUEST_BYTES`] request, the deepest when none is; and if [`Self::runs_on`] refuses that depth (its
+    /// staged tiles outgrow the LDS), the deepest shallower one it runs. A 32-deep round of a bf16 row reads half a
+    /// line per request: the vector memory path pays a request for it, so the round doubles; an f32 activation row
+    /// is a whole line at 32 already.
     fn fragment_depth(self, shape: TiledShape, caps: &poot_target::DeviceCaps) -> Option<Self> {
-        const ACTIVATION_BITS: usize = 32;
-        let narrowest = ACTIVATION_BITS.min(shape.weight_bits.max(1) as usize);
+        let narrowest = shape.activation_bits.min(shape.weight_bits).max(1) as usize;
         let whole = FRAGMENT_DEPTHS
             .iter()
             .position(|&depth| depth * narrowest >= GLOBAL_REQUEST_BYTES * 8)
@@ -503,8 +593,8 @@ impl RegisterTiling {
     ///
     /// One lane's work per `K` value is its [`FMA_COST`]s (a scalar tile) or its share of the fragment multiplies
     /// ([`WMMA_COST`] per 16 values), its [`LDS_READ_COST`]s and its share of the tile's staged values
-    /// ([`STAGED_VALUE_COST`]), once per `K` pass of the tile ([`TiledShape::passes_per_tile`]: more than one for a
-    /// tile whose rows read several experts). The device runs `caps.compute_units` units, each saturated by
+    /// ([`STAGED_VALUE_COST`]), over the tiles that compute ([`TiledShape::working_row_tiles`]: a grouped tile is
+    /// one expert's, whole tiles per bucket). The device runs `caps.compute_units` units, each saturated by
     /// `caps.gemm_launch().saturating_lanes` resident lanes: the launch's lanes (padded up to whole tiles: a
     /// ragged edge computes the full tile) share them, so the time is the lane step times the launch's lanes over
     /// the device's saturating lanes, but never less than one lane's own sequence of steps. This is what makes a
@@ -535,10 +625,9 @@ impl RegisterTiling {
             + f64::from(u8::from(
                 matches!(self.micro, MicroTile::Fragment(_)) && shape.terms.fragment.is_some(),
             ));
-        let lane_step = (compute + reads + staged_per_lane * (STAGED_VALUE_COST + narrowing))
-            * shape.passes_per_tile(tile_rows);
+        let lane_step = compute + reads + staged_per_lane * (STAGED_VALUE_COST + narrowing);
         let tiles = shape.blocks
-            * shape.m_per_block.div_ceil(tile_rows)
+            * shape.working_row_tiles(tile_rows)
             * shape.out_per_block.div_ceil(tile_cols);
         let device_lanes = f64::from(caps.compute_units.max(1))
             * f64::from(caps.gemm_launch().saturating_lanes.max(1));
@@ -600,9 +689,10 @@ mod tests {
             out_per_block: n,
             k,
             layout: WeightLayout::Nk,
-            segments: 1,
+            rows: crate::TiledRows::Dense,
             terms: crate::precision::StagedTerms::ONE,
             weight_bits: 32,
+            activation_bits: 32,
         }
     }
 
@@ -626,44 +716,55 @@ mod tests {
         }
     }
 
-    /// Expert-sorted rows put a segment boundary after about every `m / segments` rows, so a tile's expected `K`
-    /// passes grow with its height: one for a block-diagonal contraction at any height, `1 + 127 * 63 / 4096` for a
-    /// 128-row tile of 4096 rows over 64 experts, and never more than the tile's rows or the segments.
+    /// Grouped rows compute whole tiles per bucket and launch the grouping's padded positions: 4096 rows over 64
+    /// experts (65 buckets) at a 128-row block are 65 working tiles (63 rows a bucket, one tile each), against 32 for
+    /// the same rows dense, and a grid of `(4096 + 65 * 127) / 128 * 128` positions. Mutation: count a grouped
+    /// shape's working tiles as the dense rows' in `TiledShape::working_row_tiles`; this row goes red.
     #[test]
-    fn a_tiles_passes_count_the_segment_boundaries_it_spans() {
-        let walk = |segments| TiledShape {
-            segments,
+    fn grouped_rows_count_whole_tiles_per_bucket() {
+        let grouped = TiledShape {
+            rows: TiledRows::Grouped {
+                groups: 65,
+                block: 128,
+            },
             ..shape(4096, 2048, 1024)
         };
-        assert_eq!(walk(1).passes_per_tile(128), 1.0);
-        assert_eq!(walk(64).passes_per_tile(1), 1.0);
-        assert!((walk(64).passes_per_tile(128) - (1.0 + 127.0 * 63.0 / 4096.0)).abs() < 1e-12);
-        let dense_segments = TiledShape {
-            segments: 4096,
-            ..shape(64, 2048, 1024)
-        };
-        assert_eq!(dense_segments.passes_per_tile(16), 16.0);
+        assert_eq!(grouped.working_row_tiles(128), 65);
+        assert_eq!(shape(4096, 2048, 1024).working_row_tiles(128), 32);
+        assert_eq!(grouped.grid_rows(), (4096 + 65 * 127) / 128 * 128);
+        assert!(grouped.admits_tile_rows(128) && !grouped.admits_tile_rows(64));
     }
 
-    /// An expert walk pays a `K` pass per expert a tile's rows span, so with few rows per expert it takes shorter
-    /// tiles than the block-diagonal contraction of the same shape: 512 rows over 128 experts (four rows each) on the
-    /// ROCm caps. Mutation: drop the `passes_per_tile` factor in `RegisterTiling::cost`; the walk takes the dense
-    /// shape's tile and this row goes red.
+    /// A grouping's block is the tile rows its contractions run cheapest together, and every tiling of a grouped
+    /// shape has exactly those rows: with four rows per expert (512 rows over 128 experts) the block is shorter than
+    /// the dense shape's tile, since a taller tile computes mostly padding. Mutation: as above (count a grouped
+    /// shape's working tiles as the dense rows'); the block becomes the dense tile and this row goes red.
     #[test]
-    fn an_expert_walk_takes_shorter_tiles_than_the_same_dense_shape() {
+    fn a_grouping_with_few_rows_per_expert_takes_a_short_block() {
         let caps = poot_target::DeviceCaps::rocm_default();
         let dense = RegisterTiling::choose(shape(512, 2048, 1024), &caps);
-        let walk = RegisterTiling::choose(
-            TiledShape {
-                segments: 128,
-                ..shape(512, 2048, 1024)
+        let shapes = [shape(512, 2048, 1024), shape(512, 1024, 2048)].map(|shape| TiledShape {
+            rows: TiledRows::Grouped {
+                groups: 129,
+                block: 0,
             },
-            &caps,
-        );
+            ..shape
+        });
+        let block = RegisterTiling::grouped_block(&shapes, &caps).expect("a block");
         assert!(
-            walk.output_tile().0 < dense.output_tile().0,
-            "walk {walk:?} vs dense {dense:?}"
+            block < dense.output_tile().0,
+            "block {block} vs dense {dense:?}"
         );
+        for shape in shapes {
+            let tiling = RegisterTiling::choose(
+                TiledShape {
+                    rows: TiledRows::Grouped { groups: 129, block },
+                    ..shape
+                },
+                &caps,
+            );
+            assert_eq!(tiling.output_tile().0, block, "{tiling:?}");
+        }
     }
 
     /// A contraction too small to fill the device costs one lane's own steps whatever its tile, so the cheapest
@@ -728,8 +829,11 @@ mod tests {
     /// row at 32 values) the round is 64 deep, over an f32 `[K, N]` weight (128 bytes at 32) it stays 32; and a
     /// device whose LDS cannot hold the 64-deep tiles takes the deepest that fits. The planner's long-prefill tile is
     /// the same 128 x 128 of 4 x 2 waves for both layouts: every fragment operand is staged `X`-major, so the two
-    /// grids of that tile load alike and the first wins. Mutation: size the depth from the activation alone (drop
-    /// `shape.weight_bits` from `fragment_depth`'s `narrowest`); the bf16 row takes 32 and goes red.
+    /// grids of that tile load alike and the first wins. An activation the planner stored bf16 (POOT-1448) is a
+    /// 64-byte row at 32 values too, so over an f32 `[N, K]` weight its round is 64 deep. Mutation: size the depth from
+    /// the activation alone (drop `shape.weight_bits` from `fragment_depth`'s `narrowest`); the bf16 weight row takes
+    /// 32 and goes red. Mutation: size it from the weight alone (drop `shape.activation_bits`); the bf16 activation
+    /// row takes 32 and goes red.
     #[test]
     fn a_fragment_round_stages_whole_requests_of_every_operand_row() {
         let caps = poot_target::DeviceCaps {
@@ -743,22 +847,25 @@ mod tests {
                 stored,
             )
         };
-        let planned = |layout, weight_bits, stored, caps: &poot_target::DeviceCaps| {
-            RegisterTiling::choose(
-                TiledShape {
-                    layout,
-                    terms: narrow(stored),
-                    weight_bits,
-                    ..shape(2048, 1024, 3072)
-                },
-                caps,
-            )
-        };
-        for (layout, weight_bits, stored, depth) in [
-            (WeightLayout::Nk, 16, Some(FragmentDtype::Bf16), 64),
-            (WeightLayout::Kn, 32, None, 32),
+        let planned =
+            |layout, (weight_bits, activation_bits), stored, caps: &poot_target::DeviceCaps| {
+                RegisterTiling::choose(
+                    TiledShape {
+                        layout,
+                        terms: narrow(stored),
+                        weight_bits,
+                        activation_bits,
+                        ..shape(2048, 1024, 3072)
+                    },
+                    caps,
+                )
+            };
+        for (layout, bits, stored, depth) in [
+            (WeightLayout::Nk, (16, 32), Some(FragmentDtype::Bf16), 64),
+            (WeightLayout::Kn, (32, 32), None, 32),
+            (WeightLayout::Nk, (32, 16), None, 64),
         ] {
-            let tiling = planned(layout, weight_bits, stored, &caps);
+            let tiling = planned(layout, bits, stored, &caps);
             let MicroTile::Fragment(tile) = tiling.micro else {
                 panic!("{layout:?}: {tiling:?}");
             };
@@ -777,7 +884,12 @@ mod tests {
             lds_bytes: 32 * 1024,
             ..caps
         };
-        let tiling = planned(WeightLayout::Nk, 16, Some(FragmentDtype::Bf16), &small_lds);
+        let tiling = planned(
+            WeightLayout::Nk,
+            (16, 32),
+            Some(FragmentDtype::Bf16),
+            &small_lds,
+        );
         assert!(
             matches!(tiling.micro, MicroTile::Fragment(_)) && tiling.depth() == 32,
             "{tiling:?}"

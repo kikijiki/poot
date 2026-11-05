@@ -91,25 +91,24 @@ impl DeviceOwner {
         Ok(())
     }
 
-    /// Submit `command_buffer` on the device queue, signalling `fence`, and wait for the fence: the one
-    /// synchronous submission path every dispatch and replay uses.
+    /// Submit `command_buffer` on the device queue, signalling `fence`. The submission is pending until
+    /// [`Self::wait_submission`] returns for the same fence.
     ///
     /// A submit that fails with `VK_ERROR_OUT_OF_HOST_MEMORY` or `VK_ERROR_OUT_OF_DEVICE_MEMORY`
     /// leaves every referenced object unaffected (the `vkQueueSubmit` spec guarantees it), so it returns
     /// [`RuntimeError::Vk`] and the caller may destroy what it built. Any other submit failure
-    /// (`VK_ERROR_DEVICE_LOST` is the spec's signal that it could not keep that guarantee) and any failed
-    /// fence wait after a successful submit leave the work possibly pending: the device is poisoned and
-    /// the call returns [`RuntimeError::SubmissionLost`] (or [`RuntimeError::WaitTimeout`] when the fence
-    /// outlasted the configured bound), after which the caller must destroy nothing.
+    /// (`VK_ERROR_DEVICE_LOST` is the spec's signal that it could not keep that guarantee) leaves the
+    /// work possibly pending: the device is poisoned and the call returns
+    /// [`RuntimeError::SubmissionLost`], after which the caller must destroy nothing.
     ///
     /// # Safety
     ///
-    /// `queue` is this device's guard (`self.lock_queue()`), held for the whole call and the fence wait in
-    /// it. `command_buffer` and `fence` are children of this device; `command_buffer` is executable and not
-    /// pending, `fence` is unsignaled and not in use by another submission, and every object the
-    /// command buffer references stays alive until this call returns (and forever after, when it
-    /// returns `SubmissionLost`).
-    pub(crate) unsafe fn submit_and_wait(
+    /// `queue` is this device's guard (`self.lock_queue()`). `command_buffer` and `fence` are children of
+    /// this device; `command_buffer` is executable and not pending, `fence` is unsignaled and not in use
+    /// by another submission, and every object the command buffer references stays alive until
+    /// [`Self::wait_submission`] returns for `fence` (and forever after, when either call fails past an
+    /// out-of-memory submit).
+    pub(crate) unsafe fn submit(
         &self,
         queue: &QueueGuard<'_>,
         command_buffer: vk::CommandBuffer,
@@ -117,25 +116,36 @@ impl DeviceOwner {
     ) -> Result<(), RuntimeError> {
         let command_buffers = [command_buffer];
         let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
-        let submitted = {
-            // SAFETY: the caller upholds the command-buffer, fence and lifetime contract above, and
-            // the queue (this device's own) is externally synchronized by the guard `queue` holds.
-            unsafe {
-                self.dispatch
-                    .queue_submit(&self.device, *queue.0, &[submit_info], fence)
-            }
+        // SAFETY: the caller upholds the command-buffer, fence and lifetime contract above, and
+        // the queue (this device's own) is externally synchronized by the guard `queue` holds.
+        let submitted = unsafe {
+            self.dispatch
+                .queue_submit(&self.device, *queue.0, &[submit_info], fence)
         };
         match submitted {
-            Ok(()) => {}
+            Ok(()) => Ok(()),
             Err(
                 e @ (vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
-            ) => return Err(e.into()),
+            ) => Err(e.into()),
             Err(e) => {
                 self.poisoned.store(true, Ordering::Release);
-                return Err(RuntimeError::SubmissionLost(e));
+                Err(RuntimeError::SubmissionLost(e))
             }
         }
-        // SAFETY: `fence` is a child of this device that the submission above signals.
+    }
+
+    /// Wait for the submission that signals `fence`, bounded by the configured wait timeout. A failed
+    /// wait leaves the work possibly pending: the device is poisoned and the call returns
+    /// [`RuntimeError::SubmissionLost`] (or [`RuntimeError::WaitTimeout`] when the fence outlasted the
+    /// bound), after which the caller must destroy nothing.
+    ///
+    /// # Safety
+    ///
+    /// `fence` is a child of this device that a submission made through [`Self::submit`] signals, and
+    /// the device's queue guard is held by the caller for the whole wait, so no host copy overlaps the
+    /// submission's GPU access.
+    pub(crate) unsafe fn wait_submission(&self, fence: vk::Fence) -> Result<(), RuntimeError> {
+        // SAFETY: the caller guarantees `fence` is this device's and has a submission signalling it.
         if let Err(e) = unsafe {
             self.dispatch
                 .wait_for_fences(&self.device, &[fence], self.wait_timeout)

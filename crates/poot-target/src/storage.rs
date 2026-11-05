@@ -89,6 +89,11 @@ pub enum StorageLayout {
     /// starts at word `r * ceil(width / 4)`. The checkpoint's own bytes, `poot_eval::fp8::PortableE4m3FnLayout`'s
     /// device layout, so the generated row gather decodes each byte in-register.
     E4m3Packed,
+    /// No typed layout: an arena slot of bytes (POOT-1450). No value is of this storage; every access goes
+    /// through a typed view of the buffer ([`BufferStorage::view_elems`]), whose storage is the accessing
+    /// value's own. Always paired with [`ElementKind::RawBytes`], so a buffer's native element count is its
+    /// byte size.
+    Untyped,
 }
 
 impl std::fmt::Display for StorageLayout {
@@ -98,6 +103,7 @@ impl std::fmt::Display for StorageLayout {
             StorageLayout::Bf16Packed => write!(f, "bf16-packed"),
             StorageLayout::F16Packed => write!(f, "f16-packed"),
             StorageLayout::E4m3Packed => write!(f, "e4m3-packed"),
+            StorageLayout::Untyped => write!(f, "untyped"),
         }
     }
 }
@@ -190,6 +196,58 @@ impl BufferStorage {
         Self::dense(ElementKind::RawBytes, LogicalDType::RawBytes)
     }
 
+    /// An arena slot of bytes (POOT-1450): a buffer counted in bytes that no value is ever stored *as*.
+    /// Values of any device-encoded storage share it over disjoint lifetimes, each reaching it only through
+    /// a typed view ([`Self::view_elems`]). Distinct from [`Self::raw_bytes`], which is a typed buffer of
+    /// metadata words that admits only a view of itself.
+    pub const fn untyped() -> Self {
+        Self::new(
+            ElementKind::RawBytes,
+            LogicalDType::RawBytes,
+            StorageLayout::Untyped,
+        )
+    }
+
+    /// The byte multiple an untyped buffer is planned in: one 32-bit word, which every element width
+    /// divides, so a planned slot never refuses a planned view. wgpu and Vulkan bind and copy whole words,
+    /// and the copy kernel moves words.
+    pub const UNTYPED_ALIGN: usize = 4;
+
+    /// The native element count of a view of storage `view` over a buffer of this storage holding `elems`
+    /// native elements (POOT-1450): the storage contract checked per binding, not per allocation.
+    ///
+    /// A typed buffer admits only a view of its own storage (R484-001: its storage was fixed at
+    /// allocation). An untyped buffer admits a view of any storage with a device encoding whose element
+    /// width divides the buffer's bytes; the view starts at byte 0, the allocation's base, which every
+    /// runtime aligns to at least 256 bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`ViewError::Storage`] for another storage over a typed buffer, [`ViewError::Untypable`] for a view
+    /// that is itself untyped or has no device encoding, [`ViewError::Misaligned`] when the bytes are not
+    /// whole elements of the view.
+    pub fn view_elems(self, elems: usize, view: BufferStorage) -> Result<usize, ViewError> {
+        if self.layout != StorageLayout::Untyped {
+            return if view == self {
+                Ok(elems)
+            } else {
+                Err(ViewError::Storage { buffer: self, view })
+            };
+        }
+        if view.layout == StorageLayout::Untyped || view.device_elems(&[1]).is_none() {
+            return Err(ViewError::Untypable { view });
+        }
+        let bytes = elems * self.element.byte_width();
+        let width = view.element.byte_width();
+        if !bytes.is_multiple_of(width) {
+            return Err(ViewError::Misaligned {
+                bytes,
+                element: view.element,
+            });
+        }
+        Ok(bytes / width)
+    }
+
     /// The native device-word representation: what a copy's byte-range math must use.
     pub const fn element(&self) -> ElementKind {
         self.element
@@ -224,8 +282,36 @@ impl BufferStorage {
                 LogicalDType::E4M3FN | LogicalDType::RawBytes | LogicalDType::I8 => None,
                 _ => Some(numel),
             },
+            StorageLayout::Untyped => None,
         }
     }
+}
+
+/// Why a buffer refuses a typed view ([`BufferStorage::view_elems`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
+pub enum ViewError {
+    /// A typed buffer viewed as another storage.
+    #[error("a buffer of storage {buffer} cannot be viewed as {view}")]
+    Storage {
+        /// The buffer's storage, fixed at allocation.
+        buffer: BufferStorage,
+        /// The storage the view asked for.
+        view: BufferStorage,
+    },
+    /// A view no value can have: untyped itself, or a lane with no device encoding.
+    #[error("no binding can view a buffer as {view}")]
+    Untypable {
+        /// The storage the view asked for.
+        view: BufferStorage,
+    },
+    /// The untyped buffer's bytes are not whole elements of the view.
+    #[error("an untyped buffer of {bytes} bytes is not whole {element} elements")]
+    Misaligned {
+        /// The untyped buffer's byte size.
+        bytes: usize,
+        /// The view's element kind.
+        element: ElementKind,
+    },
 }
 
 impl std::fmt::Display for BufferStorage {
@@ -274,6 +360,58 @@ mod tests {
         assert_ne!(packed, BufferStorage::f16());
         assert_eq!(packed.device_elems(&[7]), Some(4));
         assert_eq!(packed.device_elems(&[2, 4]), Some(4));
+    }
+
+    /// POOT-1450: a typed buffer admits only a view of its own storage, whatever the element width: an f32
+    /// buffer viewed as i32 (same word) is refused as surely as one viewed as bf16.
+    /// Mutation: admit any view on a typed buffer; both refusals go red.
+    #[test]
+    fn a_typed_buffer_admits_only_its_own_storage() {
+        assert_eq!(
+            BufferStorage::f32().view_elems(6, BufferStorage::f32()),
+            Ok(6)
+        );
+        for view in [BufferStorage::i32(), BufferStorage::bf16()] {
+            assert_eq!(
+                BufferStorage::f32().view_elems(6, view),
+                Err(ViewError::Storage {
+                    buffer: BufferStorage::f32(),
+                    view
+                })
+            );
+        }
+        assert_eq!(
+            BufferStorage::bf16_packed().view_elems(3, BufferStorage::i32()),
+            Err(ViewError::Storage {
+                buffer: BufferStorage::bf16_packed(),
+                view: BufferStorage::i32()
+            })
+        );
+    }
+
+    /// POOT-1450: an untyped buffer admits every device-encoded storage, counted in the view's own
+    /// elements, and refuses a view that is not whole elements of its bytes or has no encoding.
+    /// Mutation: drop the whole-elements check; the 6-byte f32 view is admitted with 1 element.
+    #[test]
+    fn an_untyped_buffer_admits_any_encoded_storage_in_whole_elements() {
+        let slot = BufferStorage::untyped();
+        assert_eq!(slot.element().byte_width(), 1, "elems are bytes");
+        assert_eq!(slot.device_elems(&[8]), None, "no value is untyped");
+        assert_eq!(slot.view_elems(8, BufferStorage::f32()), Ok(2));
+        assert_eq!(slot.view_elems(8, BufferStorage::bf16()), Ok(4));
+        assert_eq!(slot.view_elems(8, BufferStorage::bf16_packed()), Ok(2));
+        assert_eq!(slot.view_elems(6, BufferStorage::f16()), Ok(3));
+        assert_eq!(
+            slot.view_elems(6, BufferStorage::f32()),
+            Err(ViewError::Misaligned {
+                bytes: 6,
+                element: ElementKind::F32
+            })
+        );
+        for view in [BufferStorage::untyped(), BufferStorage::raw_bytes()] {
+            assert_eq!(slot.view_elems(8, view), Err(ViewError::Untypable { view }));
+        }
+        assert!(BufferStorage::UNTYPED_ALIGN.is_multiple_of(ElementKind::F32.byte_width()));
     }
 
     /// POOT-1060: packed E4M3FN is its own record on the packed word, and its word count pads each row of

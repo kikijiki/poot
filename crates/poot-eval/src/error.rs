@@ -61,6 +61,39 @@ pub struct SlotRangeFault {
     pub range: IndexRange,
 }
 
+/// How an expert grouping fails to be a partition of its rows ([`EvalError::ExpertGrouping`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum GroupingFault {
+    /// The operand is not the length the rows, experts and block lay out.
+    #[error("{actual} words, the layout has {expected}")]
+    Length {
+        /// The layout's words.
+        expected: usize,
+        /// The operand's.
+        actual: usize,
+    },
+    /// A padded-order word is neither a row nor the sentinel.
+    #[error("position {position} holds {word}")]
+    Word {
+        /// The padded position.
+        position: usize,
+        /// The word it holds.
+        word: i32,
+    },
+    /// A row is placed at two positions.
+    #[error("row {row} is placed twice")]
+    Repeated {
+        /// The row.
+        row: usize,
+    },
+    /// A row is placed at none.
+    #[error("row {row} is never placed")]
+    Missing {
+        /// The row.
+        row: usize,
+    },
+}
+
 /// One evaluator, one error type. Every walk refusal is one of these.
 #[derive(Debug, thiserror::Error)]
 pub enum EvalError {
@@ -112,6 +145,18 @@ pub enum EvalError {
     /// of each restating their own rounding and bounds check.
     #[error(transparent)]
     Index(Box<IndexFault>),
+    /// A grouped indexed contraction's [`poot_graph_ir::OpKind::ExpertGroup`] operand does not lay its `rows` rows
+    /// out as a partition (POOT-1451): the device follows the table, so a table that covers a row twice or never,
+    /// or holds a word outside `0..=rows`, has no defined result.
+    #[error("eqn {eqn}: the expert grouping of {rows} rows is not a partition: {fault}")]
+    ExpertGrouping {
+        /// The contraction reading the grouping.
+        eqn: ValueId,
+        /// The rows the grouping must cover.
+        rows: usize,
+        /// What is wrong with it.
+        fault: GroupingFault,
+    },
     /// `shape`'s element count overflows `usize` (554c/554d: the one lane-neutral
     /// check every `element_count`/`row_major_strides`/`checked_numel` call site shares, instead of
     /// a per-lane copy that mislabels the overflow as its own lane's error).

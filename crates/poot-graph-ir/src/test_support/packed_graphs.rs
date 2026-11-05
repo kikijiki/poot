@@ -191,9 +191,7 @@ pub fn packed_indexed_linear(
     let output = plan.equation(
         crate::op::OpKind::PackedContraction {
             descriptor: table.descriptor,
-            rows: crate::op::ContractionRows::Indexed {
-                experts: table.experts,
-            },
+            rows: crate::op::ContractionRows::per_row(table.experts),
             precision: crate::precision::OperandPrecision::Exact,
         },
         operands,
@@ -532,7 +530,7 @@ mod tests {
                 eqn.op,
                 OpKind::PackedContraction {
                     descriptor,
-                    rows: crate::op::ContractionRows::Indexed { experts: 3 },
+                    rows: crate::op::ContractionRows::per_row(3),
                     precision: crate::precision::OperandPrecision::Exact
                 },
                 "{format:?}"

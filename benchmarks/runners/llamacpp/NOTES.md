@@ -81,3 +81,18 @@ Runner: a `run.py` here wraps llama-bench (json) + llama-cli (stderr TTFT) and e
 - Build worked from the cuda12.4.1-devel image with `-DCMAKE_CUDA_ARCHITECTURES=86` (sm_86 = 3090).
 - GGUF conversion: `python llama.cpp/convert_hf_to_gguf.py <hf_dir> --outfile m-f16.gguf --outtype f16`
   needs the `gguf` python pkg (ships in the vLLM venv). The runner finds the single .gguf in the model dir.
+
+## Memory breakdown and marks
+
+`llama-bench` prints no memory table, and loads, warms up and measures inside processes the runner cannot see into, so the
+runner prints no `POOT_BENCH_MARK` lines and a row's load/inference split is the inferred one (`harness/memory_phases.py`;
+the probe below runs first, so the last load the inference reads is still the measured one).
+
+`memory_classes` comes from `probe_memory_classes`: one extra `llama-bench -v -r 1` of the deepest test of the run
+(`-p 0 -n OSL -d MAX_ISL`), whose log lists every buffer llama.cpp allocates for that process: `load_tensors: <dev> model
+buffer size`, `llama_kv_cache: <dev> KV buffer size` (`llama_memory_recurrent: ... RS buffer size` for state),
+`sched_reserve: <dev> compute buffer size` (`llama_context:` in older builds). Device buffers are summed into weights, KV and
+workspace; host buffers (`CPU*`, `*_Host`) are left out. Verified on llama.cpp 0.6.0 (Vulkan); the image's v0.4.1 log was not
+available to check, so a build whose log lacks one of the three lines records a caveat and no breakdown. llama-cli's
+`memory breakdown [MiB]` table (`common_memory_breakdown_print`, `-v`) has the same columns but is for llama-cli's own
+context and batch (its compute buffer was 24 MiB against llama-bench's 77 MiB on Qwen3-0.6B), so it is not read.

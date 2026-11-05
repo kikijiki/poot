@@ -300,7 +300,10 @@ mod operand_precision_tests {
                     weight: DType::BF16,
                     precision,
                 },
-                ContractionHead::Indexed { precision },
+                ContractionHead::Indexed {
+                    rows: crate::op::ExpertRows::PerRow,
+                    precision,
+                },
             ];
             for head in heads {
                 assert_eq!(head.op().operand_precision(), Some(precision));

@@ -747,9 +747,10 @@ mod planar_fixtures {
             out_per_block: out_rows,
             k,
             layout: WeightLayout::Nk,
-            segments: 1,
+            rows: crate::TiledRows::Dense,
             terms: StagedTerms::ONE,
             weight_bits: crate::packed_value_bits(format),
+            activation_bits: 32,
         };
         let tiling = RegisterTiling::candidates(shape, caps)
             .max_by_key(|tiling| {
@@ -1300,9 +1301,10 @@ mod contraction_tests {
                                 out_per_block,
                                 k,
                                 layout: crate::WeightLayout::Nk,
-                                segments: 1,
+                                rows: crate::TiledRows::Dense,
                                 terms: crate::StagedTerms::ONE,
                                 weight_bits: crate::packed_value_bits(format),
+                                activation_bits: 32,
                             },
                             &poot_target::DeviceCaps::wgpu_rdna3_igpu(),
                         )
@@ -2173,9 +2175,10 @@ mod planar_contraction_tests {
                     out_per_block: 6,
                     k,
                     layout: WeightLayout::Nk,
-                    segments: 1,
+                    rows: crate::TiledRows::Dense,
                     terms: crate::StagedTerms::ONE,
                     weight_bits: crate::packed_value_bits(format),
+                    activation_bits: 32,
                 };
                 for tiling in RegisterTiling::candidates(shape, &caps) {
                     run_case(format, k, 6, m, tiling.schedule());

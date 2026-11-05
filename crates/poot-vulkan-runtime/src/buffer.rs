@@ -27,6 +27,9 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct DeviceBuffer {
     pub(crate) inner: Arc<DeviceBufferInner>,
+    /// The storage this handle records: the allocation's, or a typed view's ([`Self::view`],
+    /// POOT-1450). Handle-level, so one view never changes another clone's.
+    storage: BufferStorage,
 }
 
 pub(crate) struct DeviceBufferInner {
@@ -34,9 +37,6 @@ pub(crate) struct DeviceBufferInner {
     pub(crate) memory: vk::DeviceMemory,
     pub(crate) ptr: *mut u8,
     pub(crate) byte_len: usize,
-    /// Element kind, logical dtype and layout, set at allocation (card 527, R471-009/R484-001): before
-    /// this field, a Vulkan buffer carried no element kind at all (unlike ROCm/PTX's `BufferElement`).
-    pub(crate) storage: BufferStorage,
     /// Role-tagged live-bytes guard (Card 547a: the one memory service), held only for its `Drop`, run
     /// manually in `Drop for DeviceBufferInner`, never twice (leaked, like the native allocation, when
     /// the device is poisoned).
@@ -52,8 +52,8 @@ pub(crate) struct DeviceBufferInner {
 unsafe impl Send for DeviceBufferInner {}
 // SAFETY: a shared reference reaches `ptr` only through `read_bytes_at`/`write_with_at`/`zero_at`, which
 // take the device's `QueueGuard` as an argument and hold it for the whole copy, so no two host copies
-// overlap. The guard is the lock `DeviceOwner::submit_and_wait` is given and holds across a submit and its
-// fence wait, so a host copy racing a GPU access of the same bytes is excluded by type, whichever threads
+// overlap. The guard is the lock `VulkanGraph::replay` holds across its submits and their
+// fence waits, so a host copy racing a GPU access of the same bytes is excluded by type, whichever threads
 // the buffer, the graph and the context are on. The native handles are never mutated after construction.
 unsafe impl Sync for DeviceBufferInner {}
 
@@ -75,17 +75,17 @@ impl DeviceBuffer {
                 memory: resources.memory,
                 ptr: resources.ptr,
                 byte_len,
-                storage,
                 guard,
                 owner: Arc::clone(owner),
             }),
+            storage,
         }
     }
 
     /// The number of native elements ([`Self::element`]) this buffer holds: the bound a dispatch may tell
     /// a kernel it has, in the unit of [`crate::Binding::elems`].
     pub fn native_elems(&self) -> usize {
-        self.inner.byte_len / self.inner.storage.element().byte_width()
+        self.inner.byte_len / self.storage.element().byte_width()
     }
 
     /// The number of 4-byte words this buffer holds, whatever its element kind; not the unit of a dispatch
@@ -102,18 +102,35 @@ impl DeviceBuffer {
 
     /// The native device-word representation this buffer was allocated with (card 527).
     pub fn element(&self) -> ElementKind {
-        self.inner.storage.element()
+        self.storage.element()
     }
 
     /// How [`Self::element`] packs the buffer's logical dtype (card 527).
     pub fn layout(&self) -> StorageLayout {
-        self.inner.storage.layout()
+        self.storage.layout()
     }
 
     /// The full storage contract (card 527, R471-009/R484-001): element kind, logical dtype and layout
     /// together, set at allocation.
     pub fn storage(&self) -> BufferStorage {
-        self.inner.storage
+        self.storage
+    }
+
+    /// This buffer's bytes typed as `storage` (POOT-1450): a handle sharing the allocation (nothing is
+    /// allocated or charged) whose storage is the view's, so [`Self::native_elems`] and every check that
+    /// reads a handle's storage (a dispatch's element schema and length, a typed transfer) check the view.
+    /// A typed buffer admits only its own storage; an arena slot of bytes any encoded storage in whole
+    /// elements.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::View`] when [`BufferStorage::view_elems`] refuses the view.
+    pub fn view(&self, storage: BufferStorage) -> Result<Self, RuntimeError> {
+        self.storage.view_elems(self.native_elems(), storage)?;
+        Ok(Self {
+            inner: Arc::clone(&self.inner),
+            storage,
+        })
     }
 
     /// Whether this buffer is a child of `owner`'s device (a dispatch may bind only its own buffers).
@@ -200,8 +217,8 @@ impl DeviceBuffer {
         self.checked_range(offset, len)?;
         // SAFETY: `self.inner.ptr` is mapped HOST_COHERENT for `self.inner.byte_len` bytes for this
         // buffer's whole lifetime (see `Context::alloc_storage`); `offset + len <= byte_len` was just
-        // checked. No GPU submission can still be reading/writing this buffer's memory: every submission
-        // fence-waits before returning (`DeviceOwner::submit_and_wait`), and one whose wait failed
+        // checked. No GPU submission can still be reading/writing this buffer's memory: every replay
+        // fence-waits every submission before returning (`VulkanGraph::replay`), and one whose wait failed
         // poisoned the device, which `check_live` refused above. No other host access overlaps this one:
         // the caller's `QueueGuard` is held, so this is the only reference to the range while `fill` runs.
         let out = unsafe { std::slice::from_raw_parts_mut(self.inner.ptr.add(offset), len) };

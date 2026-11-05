@@ -230,6 +230,7 @@ pub fn decompose(
             let &[activation, weight] = inputs.as_slice() else {
                 return Ok(None);
             };
+            let activation = widened_activation(&b, activation)?;
             b.matmul_as(activation, b.transpose(weight, vec![1, 0])?, *precision)?
         }
         OpKind::GroupedDenseContraction {
@@ -242,6 +243,7 @@ pub fn decompose(
                 return Ok(None);
             };
             let blocks = b.reshape(weight, vec![*groups, rows / groups, k])?;
+            let activation = widened_activation(&b, activation)?;
             b.matmul_as(activation, b.transpose(blocks, vec![0, 2, 1])?, *precision)?
         }
         OpKind::DenseRowGather { .. } => {
@@ -310,6 +312,17 @@ fn ill_typed_is_none(
         ) => Err(error),
         Err(_) => Ok(None),
         Ok(result) => Ok(result),
+    }
+}
+
+/// A dense contraction's activation as the `MatMul` of its definition reads it: f32, widened exactly from the
+/// fragment dtype a narrowed contraction's activation may be stored in (POOT-1448). The narrowed product rounds a
+/// value already exact in that dtype to itself, so the definition computes what it computed over the f32 value.
+fn widened_activation(b: &Builder, activation: Traced) -> Result<Traced, BuilderError> {
+    if b.aval(activation)?.dtype == DType::F32 {
+        Ok(activation)
+    } else {
+        b.cast(activation, DType::F32)
     }
 }
 
@@ -790,7 +803,13 @@ pub(crate) mod tests {
                 vec![f32(&[2, 3]), f32(&[3, 4]), f32(&[4]), f32(&[2, 4])],
             ),
             (OpKind::ArgTopK { k: 2 }, vec![f32(&[2, 5])]),
-            (OpKind::ExpertGroup { experts: 4 }, vec![typed(&[6], i32)]),
+            (
+                OpKind::ExpertGroup {
+                    experts: 4,
+                    block: 2,
+                },
+                vec![typed(&[6], i32)],
+            ),
             (
                 OpKind::indexed_matmul(),
                 vec![f32(&[2, 3]), f32(&[4, 3, 5]), typed(&[2], i32)],

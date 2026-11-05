@@ -58,7 +58,7 @@ pub use scan::{ScanKernel, ScanSpec};
 // legality predicate shares with the generators.
 pub use contraction::{
     DenseTiledWeight, Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep, GemvActivation,
-    RegisterTiling, RunLength, Schedule, TileSize, TiledShape,
+    RegisterTiling, RunLength, Schedule, TileSize, TiledRows, TiledShape,
 };
 pub use fused::{
     FusedInput, FusedKernel, FusedScalarOp, FusedStep, LaneId, LeafId, LeafTy, RowKernel, RowOp,
@@ -67,7 +67,7 @@ pub use fused::{
 pub use helpers::{BodyBudget, BodyLimits, BodySize, Layout, WeightLayout, view_eff_strides};
 pub use microtile::{FragmentTile, LaneRows, MicroCols};
 pub use packed::{PackedKernelOp, PackedKernelSpec};
-pub use precision::{StagedTerms, dense_value_bits, stored_fragment_dtype};
+pub use precision::{StagedTerms, activation_bits, dense_value_bits, stored_fragment_dtype};
 
 // Generators still called by name outside `generate`, each for a recorded reason (card 636 census, at
 // dispatch the planner calls none of them):

@@ -67,11 +67,15 @@ fn staged_on_wgpu(ctx: &Context, precision: OperandPrecision, probes: &[f32]) ->
             out_per_block: 1,
             k: STAGE,
             layout: kg::WeightLayout::Nk,
-            segments: 1,
+            rows: poot_kernelgen::TiledRows::Dense,
             // The scalar tiling: this row holds the staging to the oracle; the fragment tiling has its own rows
             // (`fragment_contraction.rs`).
-            terms: kg::StagedTerms::of(precision, None, None).scalar_only(),
+            terms: kg::StagedTerms {
+                fragment: None,
+                ..kg::StagedTerms::of(precision, None, None)
+            },
             weight_bits: 32,
+            activation_bits: 32,
         },
         &caps,
     )
@@ -89,6 +93,7 @@ fn staged_on_wgpu(ctx: &Context, precision: OperandPrecision, probes: &[f32]) ->
             grid: [tiles as u32 * lanes.get() * lanes.get(), 1, 1],
             meta: vec![STAGE as u32, 1, m as u32, tiles as u32, 0],
             precision,
+            activation_stored: None,
         },
     ));
     let limits = kg::BodyLimits {

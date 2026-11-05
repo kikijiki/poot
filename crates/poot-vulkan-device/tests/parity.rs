@@ -625,16 +625,15 @@ fn selected_attention_reads_exactly_the_selected_blocks_on_vulkan() {
     }
 }
 
-/// Prefill MoE rows are sorted by expert before the indexed contraction (POOT-1336). The grouping equals a stable
-/// sort by expert and its inverse at every replayed step, on routings that break a naive grouping (every row on one
-/// expert, experts without rows, ties, ids outside the table sorted last, a partial last workgroup, more experts than
-/// rows); a contraction through it is bit-identical per row to the direct one; and an invalid id is a NaN row in
-/// both halves, never another expert's result.
+/// Prefill MoE rows are grouped by expert, block-aligned, for the tiled indexed contraction (POOT-1451). The
+/// grouping equals the layout at every replayed step and block, on routings that break a naive grouping (every row on
+/// one expert, experts without rows, ties, ids outside the table in the last bucket, partial tiles, more experts than
+/// rows, more buckets than the kernel's lanes); a contraction `compile` groups writes every row's own product.
 ///
-/// Mutation: in `expert_group` count a bucket's start with `Le` instead of `Lt`; the order and its inverse differ
-/// from the stable sort on the first case.
+/// Mutation: round a bucket's padded size down in `expert_group` (drop `padded`'s `block - 1`); the grouping differs
+/// from the layout on the first case at block 4.
 #[test]
-fn expert_grouping_is_the_stable_sort_and_changes_no_row_on_vulkan() {
+fn expert_grouping_is_block_aligned_and_keeps_every_row_on_vulkan() {
     let Some((mut exec, target)) = vulkan() else {
         return;
     };

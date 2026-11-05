@@ -2239,12 +2239,6 @@ impl Builder {
         self.emit(OpKind::ArgTopK { k }, vec![self.operand(rank)?])
     }
 
-    /// The permutation that groups `ids [M]` by expert and its inverse: `[2, M]`, row 0 the sorted order and row 1
-    /// each row's sorted position. See [`OpKind::ExpertGroup`].
-    pub fn expert_group(&self, ids: Traced, experts: usize) -> Result<Traced, BuilderError> {
-        self.emit(OpKind::ExpertGroup { experts }, vec![self.operand(ids)?])
-    }
-
     /// Exact uniform noise from an integer seed (card 551a, R472-007): `seed` is any-shape I32; output
     /// is `seed`'s shape with one trailing `cols` axis appended. See [`OpKind::RandomUniform`] and
     /// [`crate::ops::sampling`].
@@ -2422,6 +2416,40 @@ impl Builder {
         self.emit(
             OpKind::matmul_f32_accumulate(),
             vec![self.operand(a)?, self.operand(b)?],
+        )
+    }
+
+    /// The compiler-only [`OpKind::ExpertGroup`] over `ids`: the oracle rows and device rows of the grouping
+    /// build it directly; no tracer does (the `group_expert_rows` pass forms it).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn expert_group(
+        &self,
+        ids: Traced,
+        experts: usize,
+        block: usize,
+    ) -> Result<Traced, BuilderError> {
+        self.emit(
+            OpKind::ExpertGroup { experts, block },
+            vec![self.operand(ids)?],
+        )
+    }
+
+    /// [`Builder::indexed_matmul`] whose rows name their experts by `groups`, an [`OpKind::ExpertGroup`] value of
+    /// `block` ([`crate::ExpertRows::Grouped`]); compiler-formed, built directly by the rows that test it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn grouped_indexed_matmul(
+        &self,
+        x: Traced,
+        w: Traced,
+        groups: Traced,
+        block: usize,
+    ) -> Result<Traced, BuilderError> {
+        self.emit(
+            OpKind::IndexedMatMul {
+                rows: crate::ExpertRows::Grouped { block },
+                precision: crate::OperandPrecision::Exact,
+            },
+            vec![self.operand(x)?, self.operand(w)?, self.operand(groups)?],
         )
     }
 

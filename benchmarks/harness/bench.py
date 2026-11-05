@@ -327,6 +327,7 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
     obs = run_observed(cmd, device=device, interval_s=interval_ms / 1000.0, on_line=on_line)
     timing = parse_last_json_line(obs["stdout"])
     caveats = _merge_caveats(_caveats(model, fw_cfg), _runner_caveats(timing))
+    caveats += [f"memory split unavailable: {error}" for error in obs["memory_mark_errors"]]
 
     if obs["timed_out"] or obs["returncode"] != 0:
         failure = f"timeout (rc={obs['returncode']})" if obs["timed_out"] else f"rc={obs['returncode']}"
@@ -377,7 +378,7 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
     # Timing fields come from the runner; copy only the schema-known keys for this scenario.
     timing_fields = [*BUILD_IDENTITY_FIELDS, *MEASUREMENT_IDENTITY_FIELDS, "framework_version", "family",
                      "engine", "profiled", "prefill_chunk", "kv_dtype", "driver", "backend", "self_reported_vram_bytes",
-                     "preparation"]
+                     "preparation", "memory_classes"]
     if not curve:
         timing_fields += [
             "prompt_tokens", "gen_tokens", "ttft_ms", "tpot_ms", "e2e_ms",
@@ -410,6 +411,9 @@ _OBSERVER_RESULT_FIELDS = (
     "vram_baseline_bytes",
     "peak_gtt_bytes",
     "peak_rss_bytes",
+    "peak_rss_anon_bytes",
+    "peak_rss_file_bytes",
+    "memory_phases",
     "gpu_util_mean_pct",
     "gpu_util_peak_pct",
     "cpu_util_mean_pct",
@@ -966,7 +970,7 @@ def _num(x, fmt="{:.1f}"):
 def _memory_gib(row, kind):
     """A row's `kind` ("vram" or "rss") memory in GiB at inference, the peak after the load and the warmup (memory_phases.py),
     with the load peak in parentheses; "incl. load" marks a row whose series shows no boundary, so its lifetime peak is shown."""
-    phases = memory_phases.memory_phases(row, memory_phases.warmup_iters(BENCH_ROOT / "manifest.toml"))
+    phases = memory_phases.row_phases(row, memory_phases.warmup_iters(BENCH_ROOT / "manifest.toml"))
     if phases is None:
         return f"{_gib(row.get(f'peak_{kind}_bytes'))} incl. load"
     return f"{_gib(phases['inference'][f'{kind}_bytes'])} (load {_gib(phases['load'][f'{kind}_bytes'])})"

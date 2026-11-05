@@ -310,7 +310,7 @@ export const CATEGORIES: Category[] = [
         "notes": "Expert ids from a stable rank tensor (MoE routing)"
       },
       {
-        "name": "ExpertGroup(experts)",
+        "name": "ExpertGroup(experts, block)",
         "inputs": [
           {
             "name": "ids",
@@ -320,10 +320,10 @@ export const CATEGORIES: Category[] = [
         ],
         "output": {
           "name": "out",
-          "shape": "I32",
-          "meaning": "row 0 order: row at each sorted position; row 1 dest: sorted position of each row"
+          "shape": "I32 [P + T]",
+          "meaning": "the padded order (each expert's rows in row order, padded to whole tiles of block rows), then each tile's expert"
         },
-        "notes": "Rows sorted by expert (stable) and the inverse permutation; an id outside the table sorts last (MoE prefill)"
+        "notes": "Compiler-only: groups the rows of a tiled indexed contraction by expert so every tile is one expert's rows; an id outside the table lands in a last bucket whose rows the contraction makes NaN"
       }
     ]
   },
@@ -396,7 +396,7 @@ export const CATEGORIES: Category[] = [
           "shape": "[M, N]",
           "meaning": "each row contracted against its own expert W[idx[m]]"
         },
-        "notes": "Each row contracts against its own expert; no weight copy"
+        "notes": "Each row contracts against its own expert; no weight copy. For a tiled schedule the compiler replaces idx with the rows' ExpertGroup grouping"
       },
       {
         "name": "PackedDequant",

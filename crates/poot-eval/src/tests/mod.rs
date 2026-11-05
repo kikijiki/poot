@@ -12,6 +12,7 @@ mod contraction_composites;
 mod e4m3_per_channel;
 mod exact_bf16;
 mod exact_i32;
+mod expert_grouping;
 mod fuzz_primitives;
 mod helpers;
 mod i32_semantics;

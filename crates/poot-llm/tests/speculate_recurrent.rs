@@ -333,6 +333,10 @@ impl Device for FakeDevice {
     ) -> Result<(), FakeError> {
         Ok(())
     }
+    fn view(&self, _buffer: &(), _storage: poot_target::BufferStorage) -> Result<(), Self::Error> {
+        // This fake keeps no storage: a view is the same nothing.
+        Ok(())
+    }
     /// This fake keeps no storage, so it states no bound: the engine's length check passes every
     /// dispatch it records.
     fn buffer_elems(&self, _buffer: &()) -> usize {

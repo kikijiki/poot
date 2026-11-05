@@ -301,7 +301,7 @@ pub(crate) fn pool_experts(
                 } => {
                     eqn.op = OpKind::PackedContraction {
                         descriptor,
-                        rows: ContractionRows::Indexed { experts: slots },
+                        rows: ContractionRows::per_row(slots),
                         precision,
                     };
                     1

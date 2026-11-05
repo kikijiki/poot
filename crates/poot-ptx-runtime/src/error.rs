@@ -94,6 +94,9 @@ pub enum PtxError {
         /// Bytes per element.
         element_bytes: usize,
     },
+    /// A buffer refused a typed view (POOT-1450, [`poot_target::BufferStorage::view_elems`]).
+    #[error("view refused: {0}")]
+    View(#[from] poot_target::ViewError),
     /// The buffer's storage representation is not the one the operation requires.
     #[error("{op} requires {expected} storage, but the buffer stores {actual}")]
     RepresentationMismatch {

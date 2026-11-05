@@ -87,6 +87,9 @@ impl Default for VpuConfig {
 /// Why a [`VpuDevice`] call failed. Every refusal that does not need the driver is raised before it is touched.
 #[derive(Debug, thiserror::Error)]
 pub enum VpuError {
+    /// A buffer refused a typed view (POOT-1450, [`poot_target::BufferStorage::view_elems`]).
+    #[error("view refused: {0}")]
+    View(#[from] poot_target::ViewError),
     /// Level Zero failed: opening the device, allocating, compiling, loading, recording or running.
     #[error("Level Zero {operation}: {source}")]
     L0 {
@@ -310,14 +313,14 @@ fn l0(operation: &'static str) -> impl FnOnce(L0Error) -> VpuError {
 /// at runtime.
 struct BufferCell {
     host: RefCell<L0HostBuffer>,
-    storage: BufferStorage,
     role: BufferRole,
     _charge: AllocGuard,
 }
 
-/// A buffer of the Intel NPU device: host memory the NPU addresses. Cloning shares it.
+/// A buffer of the Intel NPU device: host memory the NPU addresses. Cloning shares it. The second field is
+/// the storage this handle records: the allocation's or a typed view's (POOT-1450).
 #[derive(Clone)]
-pub struct VpuBuffer(Rc<BufferCell>);
+pub struct VpuBuffer(Rc<BufferCell>, BufferStorage);
 
 impl PartialEq for VpuBuffer {
     fn eq(&self, other: &Self) -> bool {
@@ -641,16 +644,24 @@ impl Device for VpuDevice {
         })?;
         let host = self.context.alloc_host(bytes).map_err(l0("host alloc"))?;
         let charge = self.counters.record_alloc(role, bytes as u64);
-        Ok(VpuBuffer(Rc::new(BufferCell {
-            host: RefCell::new(host),
+        Ok(VpuBuffer(
+            Rc::new(BufferCell {
+                host: RefCell::new(host),
+                role,
+                _charge: charge,
+            }),
             storage,
-            role,
-            _charge: charge,
-        })))
+        ))
+    }
+
+    fn view(&self, buffer: &VpuBuffer, storage: BufferStorage) -> Result<VpuBuffer, VpuError> {
+        let elems = self.buffer_elems(buffer);
+        buffer.1.view_elems(elems, storage)?;
+        Ok(VpuBuffer(Rc::clone(&buffer.0), storage))
     }
 
     fn buffer_elems(&self, buffer: &VpuBuffer) -> usize {
-        buffer.bytes() / buffer.0.storage.element().byte_width()
+        buffer.bytes() / buffer.1.element().byte_width()
     }
 
     fn load_kernel(&mut self, key: &str, kernel: CompiledKernel) -> Result<VpuKernel, VpuError> {
@@ -774,7 +785,7 @@ impl Device for VpuDevice {
             .copy(&dst.0.host.borrow(), &src.0.host.borrow())
             .map_err(l0("append copy"))?;
         if let Some(guard) = &mut self.guard {
-            guard.copied(dst, dst.0.storage.element(), dst.bytes() / size_of::<f32>());
+            guard.copied(dst, dst.1.element(), dst.bytes() / size_of::<f32>());
         }
         Ok(())
     }
@@ -832,7 +843,7 @@ impl Device for VpuDevice {
             })?;
         // The buffer is the NPU's own pages: the whole range is one chunk, no staging copy. A constant's range
         // is read from these bytes, once, as they are written.
-        let (role, element) = (dst.0.role, dst.0.storage.element());
+        let (role, element) = (dst.0.role, dst.1.element());
         let mut admitted = Ok(());
         let guard = &mut self.guard;
         dst.0
@@ -999,10 +1010,10 @@ fn check_bindings(kernel: &LoadedKernel, args: &[&Arg<'_, VpuDevice>]) -> Result
         )));
     }
     for (index, (arg, binding)) in args.iter().zip(&kernel.bindings).enumerate() {
-        if arg.buffer.0.storage != binding.storage {
+        if arg.buffer.1 != binding.storage {
             return Err(refuse(format!(
                 "argument {index} is {:?}, the bound buffer is {:?}",
-                binding.storage, arg.buffer.0.storage
+                binding.storage, arg.buffer.1
             )));
         }
         if arg.elems as u64 != binding.elements {

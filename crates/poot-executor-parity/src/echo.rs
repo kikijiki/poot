@@ -90,6 +90,10 @@ impl Device for EchoDevice {
         Ok(())
     }
 
+    fn view(&self, _buffer: &(), _storage: BufferStorage) -> Result<(), Self::Error> {
+        // This fake keeps no storage: a view is the same nothing.
+        Ok(())
+    }
     fn buffer_elems(&self, _buffer: &()) -> usize {
         usize::MAX
     }

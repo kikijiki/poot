@@ -878,8 +878,7 @@
         "rocm",
         "ptx"
       ],
-      "status": "planned",
-      "planned_reason": "the grouped-expert bank producer is not in the backend runners yet",
+      "status": "runnable",
       "fixture_id": "002580dc406bf89b90ac095e27e11c8ad028aac9575049016f4f6741e6d8b41c",
       "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
       "cache_id": "6f9c88e074c47ba8a55bcb66180a49c8d849dec363867775261398cb2d0fecd1",
@@ -915,12 +914,53 @@
         "rocm",
         "ptx"
       ],
-      "status": "planned",
-      "planned_reason": "the grouped-expert bank producer is not in the backend runners yet",
+      "status": "runnable",
       "fixture_id": "708d6ef3e5ed3a011dae1bf8d88c8b47b089a8d2d790da3154be34e5936846ec",
       "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
       "cache_id": "6f9c88e074c47ba8a55bcb66180a49c8d849dec363867775261398cb2d0fecd1",
       "identity_digest": "fbcc9e47f31f99fa7a7c20631f84b79490e213d09e0f0e335471e429607db1c9"
+    },
+    {
+      "id": "expert-prefill-qwen3moe-up-narrow",
+      "regime": "MoE prefill routed expert projection at Qwen3-MoE dimensions (512 tokens, each to 8 of 128 experts) over a checkpoint-order bf16 expert stack, narrow operands",
+      "level": "kernel",
+      "producer": "grouped_experts",
+      "shape": {
+        "tokens": 512,
+        "top_k": 8,
+        "experts": 128,
+        "k": 2048,
+        "n": 768,
+        "order": "routed"
+      },
+      "storage": "bf16",
+      "layout": "nk",
+      "numerics": {
+        "accumulate": "f32",
+        "activation": "f32, one row per token, broadcast over the token's top_k routed rows as the MoE block traces it",
+        "weight": "each f32 draw truncated to its top 16 bits",
+        "routing": "each routed row's expert drawn uniformly from the fixture stream after the activation, rows in row order",
+        "reference": "f64 loop over each row's own expert",
+        "operand_precision": "narrow",
+        "operand_rounding": "activation and weight operands rounded to nearest even to the backend matrix unit dtype (bf16 on ROCm and PTX, f16 on Vulkan), products accumulated in f32; the reference rounds the same operands"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "0ff78e1a448f167e3bd7d3914d2a1e96f62cc1ddfaf784e4b7117f353de6dfa6",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "8221b7414273460fe0cfb75b1722b0f39f49cbd503cdff4ea27de63e9b0e7202"
     },
     {
       "id": "prefill-attention-2048-narrow",

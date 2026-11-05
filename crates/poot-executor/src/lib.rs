@@ -96,8 +96,9 @@ pub enum StateScope {
     /// Every carried value of the executable; the only scope that clears a failed step's
     /// [`ExecError::NeedsReset`].
     All,
-    /// Row `n` of the leading axis of every carried value that has a row axis: a recurrent state
-    /// pool's sequence slot, a private KV cache's row. A paged KV pool has none and is left alone.
+    /// Row `n` of the leading axis of every carried value a new sequence must start from zero: a
+    /// recurrent state pool's sequence slot. A KV cache (private or paged) is left alone: its readers
+    /// hide an entry past the committed length by position ([`poot_graph_ir::StatePolicy::stale_hidden`]).
     /// A row beyond a value's leading axis is a [`BindError::StateRow`] and nothing is zeroed.
     Row(usize),
 }

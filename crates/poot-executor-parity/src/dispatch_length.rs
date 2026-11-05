@@ -3,9 +3,9 @@
 //!
 //! The fixture is the arena program (`a + b` reduced, then added to a reduced `c + c`; four dispatches,
 //! the first writing a 64-element activation). [`ShortActivations`] wraps the caller's device and
-//! allocates every multi-element activation buffer one element short of what the plan asks, as a device whose
-//! allocation disagrees with the plan would; the length a dispatch then asserts for it is one element
-//! more than its buffer holds. The device is real, so its `buffer_elems` reports the real (short)
+//! allocates every multi-element activation buffer one element short of what the plan asks (an untyped arena
+//! slot one word short), as a device whose allocation disagrees with the plan would; the length a dispatch then
+//! asserts for it is one element more than its buffer holds. The device is real, so its `buffer_elems` reports the real (short)
 //! capacity, and the wrapper counts the dispatches that reach the device.
 
 use std::cell::Cell;
@@ -71,14 +71,27 @@ impl<D: Device> Device for ShortActivations<D> {
         storage: BufferStorage,
         elems: usize,
     ) -> Result<Self::Buffer, Self::Error> {
-        // A one-element buffer stays whole: a zero-byte allocation is a driver error, not the short buffer
-        // under test.
-        let short = if role == BufferRole::Activation && elems > 1 {
-            elems - 1
+        // One element short: an untyped arena slot (POOT-1450) is counted in bytes, and its values' views are
+        // whole words of it, so it is one word short. A one-element buffer stays whole: a zero-byte allocation
+        // is a driver error, not the short buffer under test.
+        let unit = if storage == BufferStorage::untyped() {
+            BufferStorage::UNTYPED_ALIGN
+        } else {
+            1
+        };
+        let short = if role == BufferRole::Activation && elems > unit {
+            elems - unit
         } else {
             elems
         };
         self.inner.allocate(role, storage, short)
+    }
+    fn view(
+        &self,
+        buffer: &Self::Buffer,
+        storage: BufferStorage,
+    ) -> Result<Self::Buffer, Self::Error> {
+        self.inner.view(buffer, storage)
     }
     fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
         self.inner.buffer_elems(buffer)

@@ -205,3 +205,154 @@ pub fn planned_fragment_attention(
         other => Err(format!("the planner picked {other:?}, not fragments")),
     }
 }
+
+/// POOT-1448: a transformer block's projections over a norm, each reading the normed activation narrowed, with `m`
+/// rows: `h = rmsnorm(x)`, `q = h Wq^T`, `gate = h Wg^T`, `up = h Wu^T`, `out = x + q + (silu(gate) * up) Wd^T`,
+/// every weight a checkpoint-order BF16 `[N, K]` matrix. Under a narrowed policy every reader of `h` and of
+/// `silu(gate) * up` narrows it, so `compile` stores both narrow on a target that has the store, and the residual,
+/// which f32 arithmetic reads, stays f32. Two steps with different activations.
+fn narrowed_block_fixture(name: &'static str, m: usize) -> Fixture {
+    const K: usize = 64;
+    const F: usize = 96;
+    let b = Builder::for_tests();
+    let x = b
+        .slot_named(
+            poot_graph_ir::Slot::Activation,
+            "x",
+            TensorType::f32(vec![m, K]),
+        )
+        .unwrap();
+    let norm = b.constant("norm", TensorType::f32(vec![K])).unwrap();
+    let weight = |name: &str, rows: usize, cols: usize| {
+        let w = b
+            .constant(name, TensorType::new(vec![rows, cols], DType::BF16))
+            .unwrap();
+        b.transpose(w, vec![1, 0]).unwrap()
+    };
+    let h = poot_graph_ir::ops::rmsnorm(&b, x, norm, 1e-6).unwrap();
+    let q = b.matmul(h, weight("wq", K, K)).unwrap();
+    let gate = b.matmul(h, weight("wg", F, K)).unwrap();
+    let up = b.matmul(h, weight("wu", F, K)).unwrap();
+    let act = b
+        .binary(
+            poot_graph_ir::op::BinOp::Mul,
+            poot_graph_ir::ops::silu(&b, gate).unwrap(),
+            up,
+        )
+        .unwrap();
+    let down = b.matmul(act, weight("wd", K, F)).unwrap();
+    let residual = b.binary(poot_graph_ir::op::BinOp::Add, x, q).unwrap();
+    let out = b
+        .binary(poot_graph_ir::op::BinOp::Add, residual, down)
+        .unwrap();
+    let graph = b.finish(out).unwrap();
+    let key = graph.meta(x.id()).slot_key().unwrap().clone();
+    let steps = (0..2u64)
+        .map(|step| {
+            vec![crate::StepFixture {
+                key: key.clone(),
+                tensor: HostTensor::f32(vec![m, K], crate::fill(m * K, 0x1448 + step)),
+            }]
+        })
+        .collect();
+    Fixture {
+        name,
+        store: crate::store_with_bf16(&graph, &["wq", "wg", "wu", "wd"]),
+        graph,
+        steps,
+    }
+}
+
+/// POOT-1448: [`narrowed_block_fixture`] at a few rows (`M = 5`, the register tiles) and a prefill whose tiles fill a
+/// matrix unit (`M = 160`).
+pub fn narrowed_block_fixtures() -> Vec<Fixture> {
+    vec![
+        narrowed_block_fixture("narrowed_block_m5", 5),
+        narrowed_block_fixture("narrowed_block_m160", 160),
+    ]
+}
+
+/// POOT-1448: the dtype of every value `fixture`'s program, compiled for the device `exec` drives under `policy`,
+/// stores in a two-byte float that the traced graph computes in f32, with the op that produces it: the values the
+/// planner stored narrow.
+pub fn narrow_stored_values(
+    exec: &dyn poot_executor::Executor,
+    target: poot_graph_plan::Target,
+    fixture: &Fixture,
+    policy: MatmulPrecision,
+) -> Vec<(String, DType)> {
+    crate::staged_under(exec, fixture, target, policy)
+        .stages()
+        .flat_map(|(_, _, program)| {
+            program
+                .planned()
+                .filter_map(|(eqn, _)| {
+                    let dtype = program.graph().aval(eqn.out).dtype;
+                    matches!(dtype, DType::BF16 | DType::F16)
+                        .then(|| (eqn.op.kind_name().to_string(), dtype))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// POOT-1448: an activation whose every value lies just above a bf16 rounding midpoint, produced on the device by a
+/// pointwise kernel (`x * ones * ones`, which computes `x`) and read by one projection over positive BF16 weights:
+/// `out = (x * ones * ones) W^T`, `M = 160`, `K = 64`, `N = 64`. Rounded to nearest even, every value rounds up a bf16
+/// ulp; a store that truncated would round every value down, and over positive weights the outputs would move by
+/// about 7.8e-3 of their size, past the narrow-storage tolerance (5e-3): the row that the producer's narrow store
+/// rounds, not only that it narrows.
+pub fn narrowed_rounding_fixture() -> Fixture {
+    const M: usize = 160;
+    const K: usize = 64;
+    const N: usize = 64;
+    let b = Builder::for_tests();
+    let x = b
+        .slot_named(
+            poot_graph_ir::Slot::Activation,
+            "x",
+            TensorType::f32(vec![M, K]),
+        )
+        .unwrap();
+    let ones = b.constant("ones", TensorType::f32(vec![K])).unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![N, K], DType::BF16))
+        .unwrap();
+    let mul = poot_graph_ir::op::BinOp::Mul;
+    let scaled = b
+        .binary(mul, b.binary(mul, x, ones).unwrap(), ones)
+        .unwrap();
+    let out = b
+        .matmul(scaled, b.transpose(w, vec![1, 0]).unwrap())
+        .unwrap();
+    let graph = b.finish(out).unwrap();
+    let key = graph.meta(x.id()).slot_key().unwrap().clone();
+    // `1 + (1/2 + u/4) ulp` for a bf16 ulp of 2^-7 at 1, `u` in [0, 1): strictly above the midpoint.
+    let above_midpoints = |seed: u64| -> Vec<f32> {
+        crate::fill(M * K, seed)
+            .iter()
+            .map(|v| 1.0 + (0.5 + 0.125 * (v + 1.0)) * 2f32.powi(-7))
+            .collect()
+    };
+    let steps = (0..2u64)
+        .map(|step| {
+            vec![crate::StepFixture {
+                key: key.clone(),
+                tensor: HostTensor::f32(vec![M, K], above_midpoints(0x1448 + step)),
+            }]
+        })
+        .collect();
+    let weights: Vec<f32> = crate::fill(N * K, 0x5EED)
+        .iter()
+        .map(|v| f32::from_bits((0.5 + 0.25 * v).to_bits() & 0xffff_0000))
+        .collect();
+    Fixture {
+        name: "narrowed_rounding",
+        store: crate::store_of(vec![
+            ("ones", vec![K], DType::F32, vec![1.0; K]),
+            ("w", vec![N, K], DType::BF16, weights),
+        ]),
+        graph,
+        steps,
+    }
+}

@@ -48,3 +48,9 @@ NVML (`nvml-wrapper` crate, `device.memory_info().used`, ~50-100ms, keep max). R
 Runner: a small Rust bin in this dir (the loop above) emitting the suite JSON line; VRAM is left to the
 harness external sampler. The quant baseline for candle is GGUF only, matched on bit-width with a caveat (as
 for llama.cpp).
+
+## Memory marks
+
+The runner prints no `POOT_BENCH_MARK` lines: it rebuilds the model inside every request (`run_model`, `run_model_curve`), so
+there is no point at which the model is loaded and the process is at steady state. Its rows keep the lifetime peak and the
+inferred split of `harness/memory_phases.py`, and carry no `memory_classes` (candle reports no allocation breakdown).

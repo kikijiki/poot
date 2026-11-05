@@ -10,19 +10,39 @@ use crate::predicates::dense_decode_gemv_in;
 use crate::refusal::Site;
 use crate::storage_analysis::dense_contraction_weight_storage;
 use crate::types::{StorageKind, ValueStorage};
-use poot_graph_ir::OperandPrecision;
+use poot_graph_ir::{FragmentDtype, OperandPrecision};
 use poot_target::{Backend, DeviceCaps};
 
 /// Whether this family lowers `op` over these storage dtypes. The E4M3FN table row gather reads the
 /// payload as row-padded u32 words on every device (so it needs no native E4M3FN storage); no other dense
-/// reader takes an E4M3FN operand, and none produces a 2-byte float (a dense contraction is F32 out).
+/// reader takes an E4M3FN operand, and none produces a 2-byte float (a dense contraction is F32 out) but a dense
+/// contraction epilogue whose region narrows its f32 result (POOT-1448), whose lowering decides whether its body
+/// stores one.
 pub(super) fn admits_dtypes(op: &OpKind, dtypes: StorageDtypes) -> Result<(), Capability> {
     match op {
         OpKind::DenseRowGather {
             source: DType::E4M3FN,
         } => Ok(()),
+        OpKind::ContractionEpilogue { region, .. }
+            if region.narrowed_output() == Some(dtypes.out) && !dtypes.touches_e4m3fn() =>
+        {
+            Ok(())
+        }
         _ => dtypes.refuse_unwired(),
     }
+}
+
+/// The dense contractions, the ops whose activation may be stored in its fragment dtype (POOT-1448).
+fn is_dense_contraction(op: &OpKind) -> bool {
+    matches!(
+        op,
+        OpKind::DenseContraction { .. }
+            | OpKind::GroupedDenseContraction { .. }
+            | OpKind::ContractionEpilogue {
+                head: ContractionHead::Dense { .. },
+                ..
+            }
+    )
 }
 
 /// Plan one packed-reader equation (DenseContraction/DenseRowGather).
@@ -43,8 +63,25 @@ pub(super) fn plan(
     let ids = value_ids(eqn);
     // How the equation reads its operands, and the tiles a split one stages for a weight in `weight`'s storage.
     let precision = eqn.op.operand_precision().unwrap_or_default();
+    // The fragment dtype the activation is stored in, when the planner stored it narrow (POOT-1448): read as stored
+    // by the tiled body, which needs native two-byte elements for it.
+    let activation_stored = match ids.first() {
+        Some(&activation) if is_dense_contraction(&eqn.op) => match g.aval(activation).dtype {
+            DType::BF16 | DType::F16 if !caps.native_two_byte_floats => {
+                return Err(site.refuse(Capability::DtypeLowering));
+            }
+            DType::BF16 => Some(FragmentDtype::Bf16),
+            DType::F16 => Some(FragmentDtype::F16),
+            _ => None,
+        },
+        _ => None,
+    };
     let terms = |weight: poot_target::BufferStorage| {
-        kg::StagedTerms::of(precision, None, kg::stored_fragment_dtype(weight))
+        kg::StagedTerms::of(
+            precision,
+            activation_stored,
+            kg::stored_fragment_dtype(weight),
+        )
     };
     let mut planned = match &eqn.op {
         // Card 645: the contraction over a weight in checkpoint `[N, K]` order, so a family written against the
@@ -83,6 +120,9 @@ pub(super) fn plan(
             let n = out_shape[r - 1];
             let k = shape(ids[1])[1];
             if let Some(launch) = dense_decode_gemv_in(eqn, out_shape, out_numel, caps) {
+                if activation_stored.is_some() {
+                    return Err(site.refuse(Capability::DtypeLowering));
+                }
                 let schedule = launch.schedule(backend, k);
                 dense_gemv(site, backend, weight, schedule, k, n, None, precision, caps)?
             } else {
@@ -95,13 +135,15 @@ pub(super) fn plan(
                         out_per_block: n,
                         k,
                         layout: WeightLayout::Nk,
-                        segments: 1,
+                        rows: poot_kernelgen::TiledRows::Dense,
                         terms: terms(weight),
                         weight_bits: kg::dense_value_bits(weight),
+                        activation_bits: kg::activation_bits(activation_stored),
                     },
                     kg::DenseTiledWeight::Nk(weight),
                     None,
                     precision,
+                    activation_stored,
                     caps,
                 )?
             }
@@ -119,6 +161,7 @@ pub(super) fn plan(
                     .ok_or_else(|| site.refuse(Capability::DtypeLowering))?,
             };
             let weight = ValueStorage::new(storage).buffer_storage();
+            let gemv = dense_decode_gemv_in(eqn, out_shape, out_numel, caps);
             let epilogue = matmul::epilogue_of(
                 site,
                 g,
@@ -128,10 +171,15 @@ pub(super) fn plan(
                 out_shape,
                 odt,
                 packed_operands,
+                // The tiled body stores a narrowed output into a buffer of native two-byte elements.
+                gemv.is_none() && caps.native_two_byte_floats,
             )?;
             let k = shape(ids[1])[1];
             let n = out_shape[out_shape.len() - 1];
-            if let Some(launch) = dense_decode_gemv_in(eqn, out_shape, out_numel, caps) {
+            if let Some(launch) = gemv {
+                if activation_stored.is_some() {
+                    return Err(site.refuse(Capability::DtypeLowering));
+                }
                 let schedule = launch.schedule(backend, k);
                 dense_gemv(
                     site,
@@ -154,13 +202,15 @@ pub(super) fn plan(
                         out_per_block: n,
                         k,
                         layout: WeightLayout::Nk,
-                        segments: 1,
+                        rows: poot_kernelgen::TiledRows::Dense,
                         terms: terms(weight),
                         weight_bits: kg::dense_value_bits(weight),
+                        activation_bits: kg::activation_bits(activation_stored),
                     },
                     kg::DenseTiledWeight::Nk(weight),
                     Some(epilogue),
                     precision,
+                    activation_stored,
                     caps,
                 )?
             }
@@ -185,13 +235,15 @@ pub(super) fn plan(
                     out_per_block: out_shape[2],
                     k,
                     layout: WeightLayout::Nk,
-                    segments: 1,
+                    rows: poot_kernelgen::TiledRows::Dense,
                     terms: terms(weight),
                     weight_bits: kg::dense_value_bits(weight),
+                    activation_bits: kg::activation_bits(activation_stored),
                 },
                 kg::DenseTiledWeight::Nk(weight),
                 None,
                 precision,
+                activation_stored,
                 caps,
             )?
         }

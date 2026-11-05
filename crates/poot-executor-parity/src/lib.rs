@@ -53,6 +53,7 @@ pub mod select;
 pub mod selected_attention;
 pub mod state_row;
 pub mod strided_read;
+pub mod view_probe;
 pub mod write_probe;
 
 use std::collections::HashMap;
@@ -221,8 +222,66 @@ fn checkpoint_projection_fixture(
 /// A store holding one 2-byte float weight `name` of `shape` and `dtype` (F16 or BF16): finite words of both
 /// signs with magnitudes in `[2^-8, 2^-1)`, generated as bits (so no f32 rounding step decides them).
 fn narrow_weight_store(name: &str, shape: Vec<usize>, dtype: DType) -> WeightStore {
+    let mut builder = WeightStore::builder();
+    builder
+        .insert(
+            name.to_string(),
+            WeightEntry::Dense(narrow_weight(shape, dtype, 0x0F16)),
+        )
+        .unwrap();
+    builder.build()
+}
+
+/// A store for every `Storage::Const` input of `g`: the ones named in `narrow` as BF16 weights of
+/// [`narrow_weight`]'s words (each from its own seed), every other as the f32 data of [`store_for`].
+pub(crate) fn store_with_bf16(g: &Graph, narrow: &[&str]) -> WeightStore {
+    let mut builder = WeightStore::builder();
+    for (seed, &id) in (0x1448_u64..).zip(g.inputs()) {
+        let meta = g.meta(id);
+        if meta.storage != Storage::Const {
+            continue;
+        }
+        let name = meta.name().unwrap().into_owned();
+        let shape = meta.aval.shape.clone();
+        let dense = if narrow.contains(&name.as_str()) {
+            narrow_weight(shape, DType::BF16, seed)
+        } else {
+            let bytes: Vec<u8> = const_data(&name, &shape)
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).unwrap()
+        };
+        builder.insert(name, WeightEntry::Dense(dense)).unwrap();
+    }
+    builder.build()
+}
+
+/// A store of these named weights, each an f32 or BF16 dense weight of the given shape and values (a BF16 value must
+/// be exact in BF16: it is stored as its top 16 bits).
+pub(crate) fn store_of(weights: Vec<(&str, Vec<usize>, DType, Vec<f32>)>) -> WeightStore {
+    let mut builder = WeightStore::builder();
+    for (name, shape, dtype, values) in weights {
+        let bytes: Vec<u8> = match dtype {
+            DType::BF16 => values
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect(),
+            _ => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        };
+        let dense = DenseWeight::try_new(dtype, shape, StoredBytes::from(bytes)).unwrap();
+        builder
+            .insert(name.to_string(), WeightEntry::Dense(dense))
+            .unwrap();
+    }
+    builder.build()
+}
+
+/// A 2-byte float weight of `shape` and `dtype` (F16 or BF16): finite words of both signs with magnitudes in
+/// `[2^-8, 2^-1)`, generated as bits from `seed` (so no f32 rounding step decides them).
+fn narrow_weight(shape: Vec<usize>, dtype: DType, seed: u64) -> DenseWeight {
     let numel = shape.iter().product::<usize>();
-    let mut s = 0x0F16_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let bytes: Vec<u8> = (0..numel)
         .flat_map(|_| {
             s ^= s << 13;
@@ -243,12 +302,7 @@ fn narrow_weight_store(name: &str, shape: Vec<usize>, dtype: DType) -> WeightSto
             word.to_le_bytes()
         })
         .collect();
-    let mut builder = WeightStore::builder();
-    let dense = DenseWeight::try_new(dtype, shape, StoredBytes::from(bytes)).unwrap();
-    builder
-        .insert(name.to_string(), WeightEntry::Dense(dense))
-        .unwrap();
-    builder.build()
+    DenseWeight::try_new(dtype, shape, StoredBytes::from(bytes)).unwrap()
 }
 
 /// Card 645 SC-001: [`checkpoint_projection_fixture`] at the decode GEMV (`M = 1`), a few rows (`M = 4`) and a
@@ -823,11 +877,21 @@ pub fn run_outputs(
     target: Target,
     fixture: &Fixture,
 ) -> Result<Vec<HostTensor>, String> {
+    run_outputs_under(exec, target, fixture, MatmulPrecision::Exact)
+}
+
+/// [`run_outputs`] with the fixture compiled under the operand-precision policy `policy` ([`staged_under`]).
+pub fn run_outputs_under(
+    exec: &mut dyn Executor,
+    target: Target,
+    fixture: &Fixture,
+    policy: MatmulPrecision,
+) -> Result<Vec<HostTensor>, String> {
     let exe = exec
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
     let entry = exec
-        .add_entry(exe, &staged_on(exec, fixture, target))
+        .add_entry(exe, &staged_under(exec, fixture, target, policy))
         .map_err(|e| format!("{}: add_entry: {e}", fixture.name))?;
     let mut outputs = Vec::with_capacity(fixture.steps.len());
     for (i, step) in fixture.steps.iter().enumerate() {

@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use poot_tensor::DType;
+
 pub use poot_target::FragmentDtype;
 
 /// The lowercase name a program dump and a result line print.
@@ -47,6 +49,25 @@ impl OperandPrecision {
     /// Whether the operands enter unrounded.
     pub const fn is_exact(self) -> bool {
         matches!(self, Self::Exact)
+    }
+
+    /// The dtype a contraction's activation may be stored in under this precision besides f32 (POOT-1448): the
+    /// fragment dtype of a narrowed read, whose products read the activation in that dtype anyway, so a value
+    /// stored in it enters unrounded and the product is the same. `None` for an exact or split read, which needs
+    /// the f32 value (`x` itself, or `x - hi`).
+    pub const fn stored_activation(self) -> Option<DType> {
+        match self {
+            Self::Narrow(dtype) => Some(fragment_storage_dtype(dtype)),
+            Self::Exact | Self::Split(_) => None,
+        }
+    }
+}
+
+/// The tensor dtype that holds values of a fragment dtype.
+const fn fragment_storage_dtype(dtype: FragmentDtype) -> DType {
+    match dtype {
+        FragmentDtype::Bf16 => DType::BF16,
+        FragmentDtype::F16 => DType::F16,
     }
 }
 

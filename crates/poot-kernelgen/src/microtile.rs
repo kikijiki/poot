@@ -299,10 +299,7 @@ impl MicroTile {
     pub(crate) const fn staged_ty(self) -> Ty {
         match self {
             Self::Scalar { .. } => Ty::F32,
-            Self::Fragment(tile) => match tile.dtype {
-                FragmentDtype::Bf16 => Ty::BF16,
-                FragmentDtype::F16 => Ty::F16,
-            },
+            Self::Fragment(tile) => crate::precision::fragment_ty(tile.dtype),
         }
     }
 

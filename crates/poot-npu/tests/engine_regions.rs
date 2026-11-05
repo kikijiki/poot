@@ -89,6 +89,10 @@ mod aie_engine {
             self.buffers += 1;
             Ok(self.buffers - 1)
         }
+        fn view(&self, buffer: &usize, _storage: BufferStorage) -> Result<usize, Self::Error> {
+            // This fake keeps no storage: a view is the same allocation.
+            Ok(*buffer)
+        }
         fn buffer_elems(&self, _buffer: &usize) -> usize {
             // This fake keeps no storage, so it states no bound: the length check passes every dispatch.
             usize::MAX
@@ -473,6 +477,10 @@ mod vpu_engine {
             self.roles.push(role);
             self.buffers += 1;
             Ok(self.buffers - 1)
+        }
+        fn view(&self, buffer: &usize, _storage: BufferStorage) -> Result<usize, Self::Error> {
+            // This fake keeps no storage: a view is the same allocation.
+            Ok(*buffer)
         }
         fn buffer_elems(&self, _buffer: &usize) -> usize {
             // This fake keeps no storage, so it states no bound: the length check passes every dispatch.

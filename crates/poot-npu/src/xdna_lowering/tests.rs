@@ -366,12 +366,12 @@ fn a_gpu_only_lowering_is_a_typed_refusal_for_an_aie_target() {
         b.matmul(x, w).unwrap()
     });
     assert_eq!(aie_refusal(&contraction), Capability::GpuOnly);
-    // The expert grouping of the routed MoE rows is a GPU kernel too: refused, never run unsorted.
+    // The expert grouping of the routed MoE rows is a GPU kernel too: refused by name.
     let grouping = graph_of(|b| {
         let ids = b
             .constant("ids", TensorType::new(vec![6], DType::I32))
             .unwrap();
-        b.expert_group(ids, 4).unwrap()
+        b.expert_group(ids, 4, 2).unwrap()
     });
     assert_eq!(aie_refusal(&grouping), Capability::GpuOnly);
 }

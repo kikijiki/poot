@@ -8,13 +8,13 @@ use super::{
 use crate::kernel_mapping::{
     check_widening_step, float_region_leaf_storage, map_fused_input, map_fused_input_i32,
     map_fused_local, map_fused_op, map_fused_op_i32, map_mixed_input_i32, map_pointwise_step,
-    map_row_value, map_unary,
+    map_row_value, map_unary, narrowing_store_op,
 };
 use crate::planner::{GraphTables, Layout, StorageDtypes};
 use crate::predicates::{ELEMENTWISE_2D_WIDTH, elementwise_fold, row_parallel_width};
 use crate::refusal::Site;
 use poot_graph_ir::LocalId;
-use poot_graph_ir::op::FusedOp;
+use poot_graph_ir::op::{FusedOp, FusedOperand};
 
 /// Whether this family lowers `op` over these storage dtypes. A packed E4M3FN payload is never an
 /// elementwise operand; a 2-byte float output is wired for the pointwise and reduce bodies but not for the
@@ -24,6 +24,10 @@ pub(super) fn admits_dtypes(op: &OpKind, dtypes: StorageDtypes) -> Result<(), Ca
         return Err(Capability::E4m3Storage);
     }
     match op {
+        // A row or pointwise region whose last step narrows its f32 result stores a two-byte float (POOT-1448); its
+        // lowering decides whether the target has the store.
+        OpKind::FusedRow(region) if region.narrowed_output() == Some(dtypes.out) => Ok(()),
+        OpKind::Fused(region) if region.narrowed_output() == Some(dtypes.out) => Ok(()),
         OpKind::Rope { .. } | OpKind::Fused(_) | OpKind::FusedRow(_) if dtypes.out_is_half() => {
             Err(Capability::DtypeLowering)
         }
@@ -299,14 +303,30 @@ pub(super) fn plan(
                 .local_types(&input_tys)
                 .expect("a validated fused region infers");
             let local_dtype = |local: LocalId| locals[local.index()].dtype;
+            // A last step that narrows the region's f32 result is the body's narrow store (POOT-1448), which needs
+            // native two-byte elements.
+            let narrowed = region.narrowed_output();
+            let stores_narrow =
+                matches!(lowering, Lowering::Gpu { caps, .. } if caps.native_two_byte_floats);
+            let last_step = region.steps.len().checked_sub(1);
             let steps = region
                 .steps
                 .iter()
                 .enumerate()
                 .map(|(j, st)| {
                     let exact_step = local_dtype(LocalId::new(region.n_inputs + j)) == DType::I32;
+                    let narrows_f32 = matches!(
+                        st.inputs.as_slice(),
+                        [FusedOperand::Local(input)] if local_dtype(*input) == DType::F32
+                    );
+                    let op = match narrowed {
+                        Some(to) if Some(j) == last_step && narrows_f32 => {
+                            narrowing_store_op(site, to, stores_narrow)?
+                        }
+                        _ => map_pointwise_step(site, st.op, &st.inputs, exact_step, local_dtype)?,
+                    };
                     Ok(kg::FusedStep {
-                        op: map_pointwise_step(site, st.op, &st.inputs, exact_step, local_dtype)?,
+                        op,
                         inputs: st
                             .inputs
                             .iter()
@@ -354,17 +374,29 @@ pub(super) fn plan(
             }))?
         }
         OpKind::FusedRow(region) => {
+            // A last step that narrows the region's f32 result is the body's narrow store (POOT-1448), which needs
+            // native two-byte elements.
+            let narrowed = region.narrowed_output();
+            let stores_narrow =
+                matches!(lowering, Lowering::Gpu { caps, .. } if caps.native_two_byte_floats);
+            let last_step = region.steps.len().checked_sub(1);
             let steps = region
                 .steps
                 .iter()
-                .map(|st| {
+                .enumerate()
+                .map(|(j, st)| {
                     Ok(match st {
                         RowStep::Pointwise { op, inputs } => kg::RowOp::Pointwise {
-                            op: {
-                                check_widening_step(site, *op, inputs, |id| {
-                                    id.index() < region.n_inputs
-                                })?;
-                                map_fused_op(site, *op)?
+                            op: match narrowed {
+                                Some(to) if Some(j) == last_step => {
+                                    narrowing_store_op(site, to, stores_narrow)?
+                                }
+                                _ => {
+                                    check_widening_step(site, *op, inputs, |id| {
+                                        id.index() < region.n_inputs
+                                    })?;
+                                    map_fused_op(site, *op)?
+                                }
                             },
                             inputs: inputs
                                 .iter()

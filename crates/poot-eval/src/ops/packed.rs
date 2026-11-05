@@ -303,7 +303,7 @@ pub(crate) fn packed_stack_components<'a>(
 /// sequential `k` sum of the dense `IndexedMatMul` oracle over the same decoded weight, bit for bit.
 pub(crate) fn evaluate_packed_indexed(
     x: &HostTensor,
-    ids: &HostTensor,
+    (ids, select): (&HostTensor, poot_graph_ir::ExpertRows),
     stack: &PackedStack,
     out_shape: &[usize],
     eqn: ValueId,
@@ -319,11 +319,7 @@ pub(crate) fn evaluate_packed_indexed(
     } else {
         super::precision::operand_terms(&x_view, x.dtype(), precision)
     };
-    let selected: Vec<usize> = super::movement::index_values(ids)?
-        .into_iter()
-        .enumerate()
-        .map(|(position, value)| super::index_rule::index_at(value, position, stack.experts(), eqn))
-        .collect::<Result<_, _>>()?;
+    let selected = super::index::row_experts(ids, select, m, stack.experts(), eqn)?;
     let mut by_expert: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
     for (row, &expert) in selected.iter().enumerate() {
         by_expert.entry(expert).or_default().push(row);

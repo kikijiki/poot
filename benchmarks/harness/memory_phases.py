@@ -1,4 +1,18 @@
-"""Splits a stored run's memory into what loading the model took and what inference holds.
+"""Splits a run's memory into what loading the model took and what inference holds.
+
+There are two sources, one per kind of row.
+
+A new run of a runner that loads its model once (poot, transformers, vLLM) is cut exactly. The runner prints two marks on its
+own clock (`POOT_BENCH_MARK <event> <unix seconds>`): the model is loaded (`load_end`) and the first warmup generation has
+finished (`warmup_end`, after which the allocator, the KV cache and the compiled kernels are at steady state and the timed
+iterations run). The observer keeps every sampler tick with
+its wall-clock time, so `exact_phases` takes the peak of each part at the sampler's own resolution: the load is everything up
+to `load_end`, inference everything after `warmup_end`. The warmup itself belongs to neither. The runner's clock and the
+sampler's are the same host's wall clock, so no alignment is estimated.
+
+A stored run predates the marks, and candle (which rebuilds its model in every request) and llama.cpp (whose llama-bench loads
+and warms up inside processes the runner cannot see into) cannot print them. Such a row has only the observer's 1 Hz series,
+and the rest of this docstring is how its split is inferred.
 
 The observer's `peak_rss_bytes` and `peak_vram_bytes` are maxima over the whole process lifetime, so they include the
 load of the checkpoint (file-backed pages, staging buffers). Every result also stores the observer's 1 Hz `util_series`
@@ -22,7 +36,7 @@ lifetime peak it belongs to.
 """
 
 import tomllib
-from pathlib import Path
+from typing import NamedTuple
 
 # A finished load shows as host RSS falling by at least this fraction of the series' peak between two consecutive samples (the
 # mapped checkpoint is released once its tensors are on the device, or the staging buffers are freed)...
@@ -33,6 +47,79 @@ LOAD_DROP_MIN_BYTES = 512 * 2**20
 MIN_INFERENCE_SAMPLES = 3
 
 T, VRAM, RSS = 0, 3, 4
+
+MARK_PREFIX = "POOT_BENCH_MARK"
+LOAD_END = "load_end"
+WARMUP_END = "warmup_end"
+MARK_EVENTS = (LOAD_END, WARMUP_END)
+
+
+class HostMemory(NamedTuple):
+    """Resident host memory of a process tree in bytes, split by what backs the pages (`/proc/<pid>/status`): anonymous
+    memory (heap, allocator arenas, staging buffers), file-backed pages (a mapped checkpoint, shared libraries) and shared
+    memory. `rss` is their sum (VmRSS)."""
+
+    rss: int
+    anon: int
+    file: int
+    shmem: int
+
+
+class Sample(NamedTuple):
+    """One sampler tick: wall-clock unix seconds, device bytes used, GTT bytes used (AMD) and the tree's host memory.
+    Any reading the machine cannot give is None."""
+
+    t: float
+    vram: int | None
+    gtt: int | None
+    host: HostMemory | None
+
+
+def mark_line(event, unix_s):
+    """The line a runner prints for `event` at `unix_s` (the runners' python side; the Rust runner formats the same)."""
+    return f"{MARK_PREFIX} {event} {unix_s:.6f}"
+
+
+def parse_mark(line):
+    """`(event, unix_s)` for a mark line, None for any other line. An unknown event or a malformed time is an error: a
+    runner that misspells a mark must not silently produce a row with no exact split."""
+    words = line.split()
+    if len(words) < 1 or words[0] != MARK_PREFIX:
+        return None
+    if len(words) != 3 or words[1] not in MARK_EVENTS:
+        raise ValueError(f"malformed benchmark mark: {line.strip()!r}")
+    return words[1], float(words[2])
+
+
+def exact_phases(samples, marks, vram_baseline):
+    """`{"load": {...}, "inference": {...}}` from the sampler's own ticks and the runner's marks, or None when a mark is
+    missing, they are out of order, or either part has no tick. Each part holds the peaks of `rss_bytes`, `rss_anon_bytes`,
+    `rss_file_bytes`, `vram_bytes` (less the device use before the run, as the lifetime peak is) and `gtt_bytes`. The peaks
+    of one part need not fall on the same tick, so anon + file can sit above the part's `rss_bytes`."""
+    load_end, warmup_end = marks.get(LOAD_END), marks.get(WARMUP_END)
+    if load_end is None or warmup_end is None or warmup_end < load_end:
+        return None
+    load = [s for s in samples if s.t <= load_end]
+    inference = [s for s in samples if s.t > warmup_end]
+    if not load or not inference:
+        return None
+
+    def peak(values):
+        values = [v for v in values if v is not None]
+        return max(values) if values else None
+
+    def peaks(part):
+        hosts = [s.host for s in part if s.host is not None]
+        vram = peak(s.vram for s in part)
+        return {
+            "rss_bytes": peak(h.rss for h in hosts),
+            "rss_anon_bytes": peak(h.anon for h in hosts),
+            "rss_file_bytes": peak(h.file for h in hosts),
+            "vram_bytes": None if vram is None else max(0, vram - (vram_baseline or 0)),
+            "gtt_bytes": peak(s.gtt for s in part),
+        }
+
+    return {"load": peaks(load), "inference": peaks(inference)}
 
 
 def warmup_iters(manifest):
@@ -81,7 +168,13 @@ def last_load(series, end, recorded):
     return ramp
 
 
-def memory_phases(row, warmup_iters_count):
+def row_phases(row, warmup_iters_count):
+    """The split of one row: the exact one its run recorded (`memory_phases`), else the one inferred from its 1 Hz series
+    (a stored row from before the marks). None when neither gives a usable boundary."""
+    return row.get("memory_phases") or inferred_phases(row, warmup_iters_count)
+
+
+def inferred_phases(row, warmup_iters_count):
     """`{"load": {...}, "inference": {...}}` with `rss_bytes` and `vram_bytes` peaks of each part, or None when the run
     has no usable boundary. The device use before the run (`vram_baseline_bytes`) is not the run's and is subtracted
     from the GPU figures, as the page does for the lifetime peak."""

@@ -305,3 +305,31 @@ fn an_over_length_dispatch_is_refused_by_the_engine_on_rocm() {
     };
     poot_executor_parity::dispatch_length::over_length_dispatch_is_refused(device);
 }
+
+/// POOT-1450: an untyped arena slot reaches a kernel only through a typed view its bytes admit, on the real ROCm
+/// device (`poot_executor_parity::view_probe`). Mutations: `BufferStorage::view_elems` admits any view of a typed
+/// buffer (the bf16 view of the f32 buffer is admitted); drop its whole-elements check (the 6-byte f32 view is
+/// admitted); `RocmBuffer::view` keeps the allocation's storage (the f32 view's dispatch is refused).
+#[test]
+fn an_arena_slot_is_bound_only_through_a_view_it_admits_on_rocm() {
+    let Some(mut device) = require_rocm() else {
+        return;
+    };
+    let target = device.target();
+    let poot_target::Backend::AmdGcn(arch) = gpu_backend(&target) else {
+        panic!("RocmDevice::target must report AmdGcn");
+    };
+    let body = poot_kernel_ir::test_support::len_probe_kernel();
+    let artifact = poot_codegen::KernelCache::open(poot_codegen::Target::AmdGcn(arch))
+        .load_or_compile(
+            &body,
+            poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
+        )
+        .expect("len_probe must compile to HSACO");
+    let compiled = poot_codegen::kernel_handle(&body, &artifact).unwrap();
+    let kernel = device.load_kernel("poot1450_len_probe", compiled).unwrap();
+    poot_executor_parity::view_probe::an_arena_slot_is_bound_only_through_a_view_it_admits(
+        &mut device,
+        &kernel,
+    );
+}

@@ -25,6 +25,11 @@ use poot_runtime_common::CopyRange;
 #[derive(Clone)]
 pub struct PtxBuffer {
     pub(crate) alloc: Arc<PtxAlloc>,
+    /// Native element count passed to the slice ABI: the allocation's, or a typed view's
+    /// ([`Self::view`], POOT-1450). Handle-level, so one view never changes another clone's.
+    elem_count: usize,
+    /// The storage this handle records: the allocation's, or a typed view's. Handle-level, as `elem_count`.
+    storage: BufferStorage,
 }
 
 impl PtxBuffer {
@@ -32,9 +37,25 @@ impl PtxBuffer {
         self.alloc.ptr
     }
 
+    /// This buffer's bytes typed as `storage` (POOT-1450): a handle sharing the allocation (nothing is
+    /// allocated or charged) whose storage and element count are the view's, so every check that reads a
+    /// handle's storage (a launch's element schema, a typed transfer) checks the view. A typed buffer
+    /// admits only its own storage; an arena slot of bytes any encoded storage in whole elements.
+    ///
+    /// # Errors
+    ///
+    /// [`PtxError::View`] when [`BufferStorage::view_elems`] refuses the view.
+    pub fn view(&self, storage: BufferStorage) -> Result<Self, PtxError> {
+        Ok(Self {
+            alloc: Arc::clone(&self.alloc),
+            elem_count: self.storage.view_elems(self.elem_count, storage)?,
+            storage,
+        })
+    }
+
     /// Immutable logical element count passed to the native slice ABI.
     pub fn elem_count(&self) -> usize {
-        self.alloc.elem_count
+        self.elem_count
     }
 
     /// Immutable byte capacity established before the native allocation call.
@@ -44,32 +65,30 @@ impl PtxBuffer {
 
     /// Immutable native element representation (card 527: the physical word of [`Self::storage`]).
     pub fn element(&self) -> ElementKind {
-        self.alloc.storage.element()
+        self.storage.element()
     }
 
     /// Immutable logical dtype this buffer represents (card 527): may differ from [`Self::element`] for
     /// a packed or widened value.
     pub fn dtype(&self) -> LogicalDType {
-        self.alloc.storage.dtype()
+        self.storage.dtype()
     }
 
     /// Immutable layout (card 527): how [`Self::element`] packs [`Self::dtype`].
     pub fn layout(&self) -> StorageLayout {
-        self.alloc.storage.layout()
+        self.storage.layout()
     }
 
     /// Immutable full storage contract (card 527, R471-009/R484-001): element kind, logical dtype and
     /// layout together, set at allocation from the plan's storage record.
     pub fn storage(&self) -> BufferStorage {
-        self.alloc.storage
+        self.storage
     }
 }
 
 pub(crate) struct PtxAlloc {
     pub(crate) ptr: sys::CUdeviceptr,
-    pub(crate) elem_count: usize,
     pub(crate) byte_capacity: usize,
-    pub(crate) storage: BufferStorage,
     pub(crate) owner: Option<Arc<PtxOwner>>,
     /// Role-tagged live-bytes guard (Card 547a: the one memory service), `Some` iff `owner` is (a
     /// buffer with no owner frees nothing, so nothing is charged either); run manually alongside the
@@ -107,12 +126,12 @@ pub(crate) fn allocate_owned(
     let buffer = PtxBuffer {
         alloc: Arc::new(PtxAlloc {
             ptr,
-            elem_count: elements,
             byte_capacity: bytes,
-            storage,
             owner: Some(owner),
             guard: Some(guard),
         }),
+        elem_count: elements,
+        storage,
     };
     initialize(ptr, bytes)?;
     Ok(buffer)
@@ -239,12 +258,12 @@ pub(crate) mod test_only {
         Ok(PtxBuffer {
             alloc: Arc::new(PtxAlloc {
                 ptr,
-                elem_count: elements,
                 byte_capacity,
-                storage,
                 owner,
                 guard,
             }),
+            elem_count: elements,
+            storage,
         })
     }
 }

@@ -8,10 +8,13 @@
 //! - that half of the fix is [`crate::Program::planned`]'s callers reading each
 //! argument's own element count instead of the bound buffer's, never this module's concern.
 //!
-//! Two values never share a slot unless their planned [`poot_target::BufferStorage`] is identical: a
-//! device buffer's storage is fixed at allocation, and binding one value's bytes through another's
-//! `BufferStorage` is exactly the representation mismatch `poot_target::BufferStorage` exists to catch
-//! (R484-001/R471-009) - so the arena coloring below runs independently per storage class.
+//! A slot shared by values is an untyped slot of bytes ([`poot_target::BufferStorage::untyped`],
+//! POOT-1450): values of any storage (f32, a narrowed bf16 activation, i32 indices, packed words) share
+//! it over disjoint lifetimes, and the executor binds each through a typed view of the slot whose storage
+//! is the value's own ([`poot_target::BufferStorage::view_elems`]), so the storage contract of R484-001
+//! is checked per binding, not per allocation. A slot's size is its largest occupant's bytes, in whole
+//! words ([`poot_target::BufferStorage::UNTYPED_ALIGN`]). The one coloring class this gives every
+//! non-export value is what lets a narrowed value give its slot back to the f32 values around it.
 //!
 //! A value the engine commits with a whole-buffer `Device::copy`, reads back with a whole-buffer
 //! `Device::read`, or hands to a later stage (the primary output, a state-commit source, a validation
@@ -19,12 +22,13 @@
 //! buffer's capacity to equal its own logical size exactly: those two primitives have no per-call
 //! length, unlike a kernel dispatch's [`crate::Plan`]-carried argument. Such a value always gets a
 //! freshly allocated, never-reused slot (see `is_export` below), so nothing it was never sized for can
-//! ever widen it.
+//! ever widen it, and that slot is typed with the value's own storage: a whole-buffer transfer carries
+//! no per-call storage, so it addresses only a typed buffer.
 //!
 //! A plan-local scratch buffer ([`crate::ScratchDecl`], POOT-1113) is a second kind of buffer in the same
 //! plan, keyed by [`BufferKey::Scratch`]: its lifetime is exactly its equation's index (it is written
 //! and read by that equation's dispatches and nothing else), it is never an export, and it is colored
-//! in its own storage class beside the values. The equation's operands and output are alive at that same
+//! in the same untyped class as the values. The equation's operands and output are alive at that same
 //! index, so a scratch never shares a slot with them; it does share with any earlier or later
 //! equation's scratch or temporary.
 
@@ -70,11 +74,11 @@ pub(crate) enum BufferKey {
 
 #[derive(Clone, Copy, Debug)]
 struct SlotInfo {
+    /// [`BufferStorage::untyped`] for a shared slot; an export's own storage for its own slot.
     storage: BufferStorage,
-    /// The largest occupant's native device-element count (post lane-encoding, e.g. two BF16 logical
-    /// elements per packed `u32`: the same unit [`crate::Program::storage`] consumers already pass to
-    /// `Device::allocate`), never a logical tensor `numel` this slot's smaller occupants may fall short
-    /// of.
+    /// The native device-element count of `storage` the slot is allocated with (the unit
+    /// `Device::allocate` takes): bytes for an untyped slot (its largest occupant's, in whole words), an
+    /// export's own lane-encoded element count otherwise.
     elems: usize,
     /// Whether the slot's one occupant outlives the program's dispatch loop (an export, see the module
     /// doc): a staged entry keeps the slot's buffer past its stage.
@@ -299,11 +303,29 @@ pub(crate) fn plan_buffers(
         export(source.value);
     }
 
-    // Linear-scan arena coloring (Card 547b), independently per `BufferStorage` class (a slot never
-    // mixes two - module doc), birth order within a class, ties by [`BufferKey`] for a deterministic plan.
+    // What each buffer's slot is allocated as (module doc): an export its own storage at exactly its own
+    // native element count; every other buffer an untyped slot of bytes, in whole words.
+    let mut need: HashMap<BufferKey, (BufferStorage, usize)> = HashMap::new();
+    for (&key, &value_elems) in &elems {
+        let storage = store_of[&key];
+        let slot = if is_export.contains(&key) {
+            (storage, value_elems)
+        } else {
+            let bytes = value_elems * storage.element().byte_width();
+            (
+                BufferStorage::untyped(),
+                bytes.next_multiple_of(BufferStorage::UNTYPED_ALIGN),
+            )
+        };
+        need.insert(key, slot);
+    }
+
+    // Linear-scan arena coloring (Card 547b) per slot class: the one untyped class every non-export shares
+    // (POOT-1450), and the exports' typed classes, whose members never share. Birth order within a class,
+    // ties by [`BufferKey`] for a deterministic plan.
     let mut groups: HashMap<BufferStorage, Vec<BufferKey>> = HashMap::new();
     for &value in birth.keys() {
-        groups.entry(store_of[&value]).or_default().push(value);
+        groups.entry(need[&value].0).or_default().push(value);
     }
     let mut group_keys: Vec<BufferStorage> = groups.keys().copied().collect();
     group_keys.sort_by_key(|key| {
@@ -321,12 +343,12 @@ pub(crate) fn plan_buffers(
         let mut members = groups.remove(&key).expect("key came from this map");
         // Largest first (best-fit decreasing, ggml-alloc / XLA's heap simulator): a big value claims a slot
         // while no smaller occupant has stretched another, so a slot only grows to a size some value needs.
-        members.sort_by_key(|&v| (Reverse(elems[&v]), birth[&v], v));
+        members.sort_by_key(|&v| (Reverse(need[&v].1), birth[&v], v));
 
         // The slots of this class and the lifetimes of their occupants.
         let mut class: Vec<(ArenaSlotId, Vec<(usize, usize)>)> = Vec::new();
         for value in members {
-            let (b, d, needed) = (birth[&value], death[&value], elems[&value]);
+            let (b, d, needed) = (birth[&value], death[&value], need[&value].1);
             // A slot whose occupants all end before `b` or start after `d`; the one that grows least, and
             // among those that need no growth the tightest. An export takes none: its slot is its own.
             let fit = if is_export.contains(&value) {

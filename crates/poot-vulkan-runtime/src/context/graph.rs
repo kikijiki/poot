@@ -36,9 +36,10 @@ pub struct Binding<'a> {
 
 impl Context {
     /// Begin recording a new graph (spec 133 P2 slice 2a, FR-008 step 2): allocate a command pool,
-    /// the first command buffer and a fence, then `vkBeginCommandBuffer` without `ONE_TIME_SUBMIT` (the
-    /// buffers are submitted many times). `SIMULTANEOUS_USE` is not needed because every
-    /// [`VulkanGraph::replay`] fence-waits, so two submissions are never in flight at once. Each
+    /// the first command buffer and its fences, then `vkBeginCommandBuffer` without `ONE_TIME_SUBMIT` (the
+    /// buffers are submitted many times). `SIMULTANEOUS_USE` is not needed because a
+    /// replay submits each command buffer once and fence-waits all of them before returning, so a command
+    /// buffer is never pending twice. Each
     /// following [`Context::record_dispatch`] or [`Context::record_copy`] records one command; call
     /// [`Context::end_graph`] to finish and obtain the replayable [`VulkanGraph`].
     ///
@@ -54,7 +55,7 @@ impl Context {
         let mut core = GraphCore {
             command_pool: resources.command_pool,
             segments: vec![resources.command_buffer],
-            fence: resources.fence,
+            fences: resources.fences,
             desc_pools: Vec::new(),
             held: Vec::new(),
             pipelines: Vec::new(),
@@ -315,8 +316,9 @@ impl Context {
     }
 
     /// End the graph's open command buffer and start a new one, so a replay submits the commands
-    /// before and after as two submissions with a fence wait between them (the display watchdog bounds
-    /// one submission's duration, so a caller cuts long graphs by the work it records). A no-op while
+    /// before and after as two submissions, a bounded window of them pending at once (the
+    /// display watchdog bounds one submission's duration, so a caller cuts long graphs by the work it
+    /// records). The next command carries a barrier against everything before the cut. A no-op while
     /// the open command buffer is empty.
     pub fn cut_graph(&self, graph: &mut RecordingGraph) -> Result<(), RuntimeError> {
         self.owner.check_live("cut_graph")?;
@@ -423,10 +425,13 @@ impl GraphCore {
         Ok(unsafe { ctx.device.allocate_descriptor_sets(&info)? }[0])
     }
 
-    /// Order this command after every earlier one of the segment: a conservative full barrier (every
+    /// Order this command after every earlier one of the graph: a conservative full barrier (every
     /// prior shader or transfer write visible to every later shader or transfer access).
     fn barrier_before_command(&self, ctx: &Context, command_buffer: vk::CommandBuffer) {
-        if self.commands_in_segment == 0 {
+        // A later segment's first command needs it too: the submission before it may still be running
+        // (see `IN_FLIGHT_SUBMITS`), and submission order alone orders nothing. The barrier's first scope
+        // covers every earlier command of the queue.
+        if self.commands_in_segment == 0 && self.segments.len() == 1 {
             return;
         }
         let writes = vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE;

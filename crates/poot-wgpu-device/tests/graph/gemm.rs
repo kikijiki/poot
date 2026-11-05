@@ -87,9 +87,10 @@ fn planned_tile(m: usize, k: usize, n: usize) -> (usize, usize) {
             out_per_block: n,
             k,
             layout: poot_kernelgen::WeightLayout::Kn,
-            segments: 1,
+            rows: poot_kernelgen::TiledRows::Dense,
             terms: poot_kernelgen::StagedTerms::ONE,
             weight_bits: 32,
+            activation_bits: 32,
         },
         &poot_test_util::device_caps::default_caps_for(poot_target::Backend::SpirvVulkan),
     )
@@ -604,7 +605,7 @@ fn bits(t: &HostTensor) -> Vec<u32> {
 }
 
 /// SC-001, SC-002: `IndexedMatMul` through `compile` equals the oracle `to_bits` on every element at a decode
-/// shape (`M = 5`, the Gemv) and at prefill shapes (`M = 160`, the register-tiled expert walk) whose tiles cross expert
+/// shape (`M = 5`, the Gemv) and at prefill shapes (`M = 160`, the register-tiled schedule over the grouped rows) whose tiles cross expert
 /// boundaries, with the ids sorted, shuffled and tile-aligned. A wrong expert changes a value by an integer, so
 /// the comparison is exact.
 ///
@@ -645,7 +646,7 @@ fn indexed_matmul_matches_the_oracle_bit_for_bit() {
 
 /// POOT-646 SC-001: experts held in checkpoint `[E, N, K]` order and read through `transpose(w, [0, 2, 1])` equal
 /// the oracle `to_bits` on every element (`E = 8`): `M = 1` and `M = 5` (the Gemv, ids unsorted with repeats) and a
-/// prefill shape (the register-tiled expert walk, shuffled ids). `compile` folds the transpose into the contraction.
+/// prefill shape (the register-tiled schedule over the grouped rows, shuffled ids). `compile` folds the transpose into the contraction.
 ///
 /// Mutation (`weight_layout` in `planner/moe.rs`): return `WeightLayout::Kn` for the view; the weight is read as
 /// `[E, K, N]` and every case goes red.
@@ -791,7 +792,7 @@ fn routed_gate_weighting_checkpoint_order_equals_the_oracle_bit_for_bit() {
 /// POOT-1028: `IndexedMatMul` over a BF16-resident expert stack (a BF16 const, `[E, K, N]` or the checkpoint's
 /// `[E, N, K]` behind `transpose(w, [0, 2, 1])`; f32 activation and output) equals the oracle `to_bits` on every
 /// element, with and without the routed gate epilogue, at a decode shape (the Gemv) and a prefill shape whose tiles
-/// cross expert boundaries (the register-tiled expert walk). The fill is integer-valued, so each element is exactly a BF16 and
+/// cross expert boundaries (the register-tiled schedule over the grouped rows). The fill is integer-valued, so each element is exactly a BF16 and
 /// the widened sums are exact in any order. The packed lanes are widened in-register: no f32 copy of the stack
 /// exists.
 ///

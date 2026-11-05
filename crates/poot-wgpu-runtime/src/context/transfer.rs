@@ -6,6 +6,16 @@ use poot_target::BufferStorage;
 use poot_target::{ElementKind, LogicalDType};
 use wgpu::util::DeviceExt;
 
+/// One `queue.submit` the context made, to wait for with [`Context::wait_submission`]. Returned by
+/// [`Context::submit_cached`]; it can only name a submission of the queue that made it.
+pub struct QueuedWork(wgpu::SubmissionIndex);
+
+impl QueuedWork {
+    pub(crate) fn new(index: wgpu::SubmissionIndex) -> Self {
+        Self(index)
+    }
+}
+
 /// Construction-time options for [`Context::new_with_options`]: typed configuration, never an
 /// environment read in library code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,24 +236,29 @@ impl Context {
         Ok(())
     }
 
-    /// Block until every submitted GPU command has completed, draining the queue (card 158). The
-    /// resident prefill executor calls this after each batched `submit_cached` flush so the submitted
-    /// work retires and its transient per-dispatch resources (length buffers, bind groups held by the
-    /// flushed `CachedDispatch`es) are freed, bounding in-flight submissions and live objects over a very
-    /// large prefill (~1e5 dispatches). Nothing is read back. Bounded like every wait on the device.
-    pub fn poll_wait(&self) -> Result<(), RuntimeError> {
+    /// Block until `submission`, and every submission before it, has completed. A caller that keeps a
+    /// bounded window of submissions in flight (a long prefill cut into several, ~1e5 dispatches) waits
+    /// for the oldest one here, so the device keeps the newer ones to run while the host encodes the next:
+    /// the submitted work retires and its transient per-dispatch resources are freed without ever
+    /// draining the queue. Nothing is read back. Bounded like every wait on the device.
+    pub fn wait_submission(&self, submission: &QueuedWork) -> Result<(), RuntimeError> {
         self.waits.set(self.waits.get() + 1);
-        self.wait_idle()
+        self.wait(Some(submission.0.clone()))
     }
 
-    /// The one wait for the device: drains the queue for at most the configured bound. A bound that
-    /// passes poisons the context and fails with [`RuntimeError::WaitTimeout`]; a device wgpu reported
-    /// lost while waiting fails with [`RuntimeError::DeviceLost`]. Every later call is refused as
-    /// [`RuntimeError::Poisoned`].
+    /// Drain the queue: [`Self::wait`] for every submission.
     pub(crate) fn wait_idle(&self) -> Result<(), RuntimeError> {
+        self.wait(None)
+    }
+
+    /// The one wait for the device: blocks until `submission` (`None`: every submission) has completed,
+    /// for at most the configured bound. A bound that passes poisons the context and fails with
+    /// [`RuntimeError::WaitTimeout`]; a device wgpu reported lost while waiting fails with
+    /// [`RuntimeError::DeviceLost`]. Every later call is refused as [`RuntimeError::Poisoned`].
+    fn wait(&self, submission: Option<wgpu::SubmissionIndex>) -> Result<(), RuntimeError> {
         self.health.check_live("wait")?;
         let polled = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
+            submission_index: submission,
             timeout: Some(self.wait_timeout),
         });
         match polled {
@@ -480,6 +495,13 @@ pub(crate) mod test_only {
                 .write_buffer(&buf.buf, 0, bytemuck::cast_slice(data));
             self.record_upload_transfer(std::mem::size_of_val(data));
             Ok(())
+        }
+
+        /// Block until every submitted GPU command has completed, draining the queue. Test-only:
+        /// production waits name a [`QueuedWork`] or are a readback's own sync.
+        pub(crate) fn poll_wait(&self) -> Result<(), RuntimeError> {
+            self.waits.set(self.waits.get() + 1);
+            self.wait_idle()
         }
 
         /// Submit and complete this queue's pending uploads without encoding compute work or checking

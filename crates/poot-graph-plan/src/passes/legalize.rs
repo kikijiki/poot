@@ -686,9 +686,7 @@ fn split_oversized_expert_stacks(
             }
             let contraction = OpKind::PackedContraction {
                 descriptor,
-                rows: ContractionRows::Indexed {
-                    experts: range.len(),
-                },
+                rows: ContractionRows::per_row(range.len()),
                 precision,
             };
             let last = index + 1 == ranges.len();
@@ -723,9 +721,15 @@ fn split_oversized_expert_stacks(
 /// The split of `eqn` when it is an indexed packed contraction over named constant carriers and I32 ids whose
 /// stacked table [`expert_ranges`] splits.
 fn splittable_stack(g: &Graph, eqn: &Eqn, backend: Backend, limit: u64) -> Option<StackSplit> {
+    // Legalize runs before `group_expert_rows`: an indexed table it splits reads per-row ids, and each piece's
+    // remapped ids are grouped afterwards like any other.
     let OpKind::PackedContraction {
         descriptor,
-        rows: ContractionRows::Indexed { experts },
+        rows:
+            ContractionRows::Indexed {
+                experts,
+                rows: poot_graph_ir::ExpertRows::PerRow,
+            },
         precision,
     } = &eqn.op
     else {

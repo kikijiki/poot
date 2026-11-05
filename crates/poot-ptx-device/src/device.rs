@@ -116,6 +116,10 @@ impl Device for PtxDevice {
         Ok(self.ctx.alloc_storage(role, storage, elems)?)
     }
 
+    fn view(&self, buffer: &PtxBuffer, storage: BufferStorage) -> Result<PtxBuffer, PtxGpuError> {
+        Ok(buffer.view(storage)?)
+    }
+
     fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
         buffer.elem_count()
     }

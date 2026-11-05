@@ -2,13 +2,14 @@
 # A row the lane runs and passes that is in neither kernels.txt nor here fails scripts/check-required-cases.py;
 # a row that prints a skip report fails whether listed or not. Sorted in canonical (LC_ALL=C) order; every row must run in the lane or the gate fails.
 poot-kernelgen	attention::tests::a_spec_outside_the_generators_contract_is_a_typed_error	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::dense::tests::a_narrow_stored_activation_and_a_narrowed_store_match_the_f32_body	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::dense::tests::the_dense_tiled_body_matches_a_host_product_at_every_planned_tiling	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_contraction_below_the_device_takes_the_cheapest_lane_step	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_fragment_round_stages_whole_requests_of_every_operand_row	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_fragment_tile_of_one_wave_loses_to_the_scalar_tiling	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::tests::a_grouping_with_few_rows_per_expert_takes_a_short_block	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_long_prefill_takes_the_widest_tile	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
-poot-kernelgen	contraction::tests::a_tiles_passes_count_the_segment_boundaries_it_spans	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
-poot-kernelgen	contraction::tests::an_expert_walk_takes_shorter_tiles_than_the_same_dense_shape	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::tests::grouped_rows_count_whole_tiles_per_bucket	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::the_candidates_are_the_tilings_the_device_runs	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tiled::tests::a_split_moves_the_reads_ahead_and_keeps_their_uses	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	emit::tests::reads_a_full_word_at_a_word_boundary	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -18,6 +19,7 @@ poot-kernelgen	emit::tests::reads_within_one_word	kernelgen unit row (emitters, 
 poot-kernelgen	emit::tests::windows_equal_the_scalar_read_at_every_start_bit	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	fp8::tests::pack_round_trips_every_finite_code_and_zeroes_padding	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	fp8::tests::unpack_matches_the_scalar_decode_for_every_byte_and_row_width	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	fused::tests::a_narrowed_row_output_is_stored_rounded_once	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	fused::tests::fused_row_kernels_emit_valid_nvptx	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	fused::tests::fused_row_parallel_matches_serial_rmsnorm	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	fused::tests::fused_row_parallel_matches_serial_softmax	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -150,9 +152,9 @@ poot-kernelgen::emit_golden_ir	wmma_dtype_tile_mismatch_is_typed_error	kernelgen
 poot-kernelgen::emit_golden_ir	wmma_tile_is_one_body_lowered_on_every_target	kernelgen `emit_golden_ir` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::emit_golden_ir	wmma_unsupported_amd_family_is_typed_error	kernelgen `emit_golden_ir` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::emit_nvptx	emit_nvptx_kernel_set	kernelgen `emit_nvptx` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
-poot-kernelgen::expert_group_interp	a_contraction_through_the_grouping_is_bit_identical_and_an_invalid_id_stays_a_nan_row	kernelgen `expert_group_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
-poot-kernelgen::expert_group_interp	an_invalid_expert_id_sorts_last_and_is_never_dropped	kernelgen `expert_group_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
-poot-kernelgen::expert_group_interp	the_grouping_is_the_stable_sort_by_expert_and_its_inverse	kernelgen `expert_group_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::expert_group_interp	a_grouped_contraction_writes_each_rows_own_product_and_an_invalid_id_stays_a_nan_row	kernelgen `expert_group_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::expert_group_interp	an_invalid_expert_id_lands_in_the_last_bucket_and_is_never_dropped	kernelgen `expert_group_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::expert_group_interp	the_grouping_pads_each_experts_rows_to_whole_tiles	kernelgen `expert_group_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::f16_matmul_probe	f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv	kernelgen `f16_matmul_probe` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_bank_swizzled_dense_partial_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_causal_mask_is_the_additive_mask_of_its_positions	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole

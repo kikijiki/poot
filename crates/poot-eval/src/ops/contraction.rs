@@ -4,11 +4,10 @@
 //! term (exact, or narrowed once) or two (a split f32 operand), and a product is summed for every pair of terms,
 //! one from each operand, into one f32 accumulator in `k` order.
 
-use poot_graph_ir::{OperandPrecision, ValueId};
+use poot_graph_ir::{ExpertRows, OperandPrecision, ValueId};
 use poot_tensor::{DType, HostTensor};
 
-use super::index_rule::index_at;
-use super::movement::index_values;
+use super::index::row_experts;
 use super::precision::operand_terms;
 use crate::{EvalError, broadcast_flat, strides, unravel};
 
@@ -25,19 +24,21 @@ pub(crate) fn matmul_to(
     matmul(a, b, out_shape, precision)
 }
 
-/// `IndexedMatMul`: `out[m, n] = sum_k x[m, k] * W[idx[m], k, n]`, each row contracting against its own
+/// `IndexedMatMul`: `out[m, n] = sum_k x[m, k] * W[e(m), k, n]`, each row contracting against its own
 /// expert (the eager oracle for the generated indexed contraction). `x` and `w` are read through
-/// [`HostTensor::to_f32`] (either may be BF16/F16); `idx` is F32 or I32 words.
+/// [`HostTensor::to_f32`] (either may be BF16/F16); the expert operand is the per-row ids or their grouping, as
+/// `select` says ([`row_experts`]).
 pub(crate) fn indexed_matmul(
     x: &HostTensor,
     w: &HostTensor,
-    idx: &HostTensor,
+    (operand, select): (&HostTensor, ExpertRows),
     out_shape: &[usize],
     eqn: ValueId,
     precision: OperandPrecision,
 ) -> Result<HostTensor, EvalError> {
     let (m, k, n) = (x.shape()[0], x.shape()[1], w.shape()[2]);
     let experts = w.shape()[0];
+    let idx_rows = row_experts(operand, select, m, experts, eqn)?;
     let (x_view, w_view) = (x.to_f32()?, w.to_f32()?);
     let (x_terms, w_terms) = if precision.is_exact() {
         (vec![x_view.to_vec()], vec![w_view.to_vec()])
@@ -47,12 +48,6 @@ pub(crate) fn indexed_matmul(
             operand_terms(&w_view, w.dtype(), precision),
         )
     };
-    let idx_values = index_values(idx)?;
-    let idx_rows: Vec<usize> = idx_values
-        .iter()
-        .enumerate()
-        .map(|(position, &value)| index_at(value, position, experts, eqn))
-        .collect::<Result<_, _>>()?;
     let mut data = vec![0.0f32; m * n];
     for mm in 0..m {
         let ebase = idx_rows[mm] * k * n;

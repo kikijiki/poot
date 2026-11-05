@@ -13,10 +13,13 @@ poot-vulkan-runtime	features::tests::the_enabled_core_features_include_robust_bu
 poot-vulkan-runtime	spirv::tests::a_malformed_instruction_ends_the_scan_without_reading_past_it	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	spirv::tests::capabilities_and_local_size_are_read_from_the_instruction_stream	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	tests::a_cached_key_answers_for_one_kernel_only	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::a_cut_replay_keeps_two_submissions_pending	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	tests::a_dispatch_length_beyond_its_buffer_is_refused	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	tests::a_dispatch_length_is_bounded_in_the_buffers_native_elements	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	tests::a_fence_that_never_signals_times_out_within_the_bound_and_poisons	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	tests::a_grid_over_the_device_limit_is_refused_not_folded	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::a_refused_submit_retires_the_pending_ones_first	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	tests::a_replay_inside_the_window_waits_once_at_the_end	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	tests::a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	tests::bf16_packed_word_rejected_by_dense_i32_bind	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	tests::buffer_and_clone_outlive_context_and_readback_does_not_alias_writes	raw Vulkan runtime row; selected by package so none goes unrun

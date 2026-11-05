@@ -33,13 +33,19 @@
 //! `build_features`, `rustc_version`); a measurement also names the adapter and driver it ran on and the
 //! digest of the checkpoint's stored weights. The runner measures only when built with the release profile.
 //! Built with a plain `cargo build --release -p poot-bench-runner` (kernels are generated at runtime).
+//!
+//! Memory is measured by the harness's observer, from outside; the runner tells it where to cut. It prints
+//! `POOT_BENCH_MARK load_end <unix seconds>` when the model is open and `POOT_BENCH_MARK warmup_end <unix seconds>` when the
+//! first warmup generation is done (the first point's, for a curve), so the observer's load and inference peaks are exact
+//! (`harness/memory_phases.py`). The result line also carries `memory_classes`: the device bytes the engine itself
+//! allocated, by what the buffers are for (see [`memory_classes`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde_json::{json, Value};
@@ -58,6 +64,7 @@ use poot_models::model::KvDtype;
 use poot_models::registry::Registry;
 use poot_profile::{Ceiling, Fit, GB};
 use poot_quant::weights::{WeightEntry, WeightStore};
+use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
 
 /// The git sha this binary was built from (`build.rs`); the harness records it with every result.
 const BUILD_SHA: &str = env!("POOT_BUILD_SHA");
@@ -456,8 +463,60 @@ trait Generate {
         None
     }
 
+    /// The device memory this engine itself allocated, by what the buffers are for ([`memory_classes`]);
+    /// `None` for an engine that counts none.
+    fn memory_classes(&self) -> Option<Value> {
+        None
+    }
+
     /// What generates.
     fn engine(&self) -> Engine;
+}
+
+/// What a memory mark is called in the observer's protocol (`harness/memory_phases.py`): one line on stderr,
+/// `POOT_BENCH_MARK <event> <unix seconds>`, read on the observer's own clock so the memory it samples is cut exactly
+/// where this process says the model finished loading and the first warmup generation finished.
+const MARK_PREFIX: &str = "POOT_BENCH_MARK";
+const LOAD_END: &str = "load_end";
+const WARMUP_END: &str = "warmup_end";
+
+fn mark_line(event: &str, unix_seconds: f64) -> String {
+    format!("{MARK_PREFIX} {event} {unix_seconds:.6}")
+}
+
+/// Print the mark for `event` now.
+fn mark(event: &str) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the system clock is after 1970")
+        .as_secs_f64();
+    eprintln!("{}", mark_line(event, now));
+}
+
+/// The peak device bytes the engine allocated, by what the buffers are for: the model's `weights_bytes`, the
+/// KV cache and recurrent state (`kv_bytes`), the `workspace_bytes` a step runs in (intermediate values, the
+/// inputs it is bound and the outputs it is read) and the `staging_bytes` that bridge host transfers. Each class
+/// is the sum over its roles of the highest live bytes that role reached; the classes' peaks need not fall at
+/// the same moment.
+fn memory_classes(memory: &[(BufferRole, MemoryCounterSnapshot)]) -> Value {
+    let class_peak = |roles: &[BufferRole]| -> u64 {
+        memory
+            .iter()
+            .filter(|(role, _)| roles.contains(role))
+            .map(|(_, counters)| counters.peak_bytes)
+            .sum()
+    };
+    json!({
+        "weights_bytes": class_peak(&[BufferRole::Weight]),
+        "kv_bytes": class_peak(&[BufferRole::State]),
+        "workspace_bytes": class_peak(&[
+            BufferRole::Activation,
+            BufferRole::Input,
+            BufferRole::Output,
+            BufferRole::Meta,
+        ]),
+        "staging_bytes": class_peak(&[BufferRole::Staging]),
+    })
 }
 
 /// `ms_per_token = a * GB_per_token + b` over the measured rooflines in `rooflines` (a decode-curve's
@@ -662,6 +721,10 @@ impl Generate for DriverCell {
 
     fn ceiling(&self) -> Option<Ceiling> {
         self.driver.ceiling()
+    }
+
+    fn memory_classes(&self) -> Option<Value> {
+        Some(memory_classes(&self.driver.executor_stats().memory))
     }
 
     fn engine(&self) -> Engine {
@@ -1280,6 +1343,9 @@ fn measure(
     line["matmul_precision"] = json!(resolved.matmul_precision.as_str());
     line["profiled"] = json!(config.profile);
     line["preparation"] = probe.receipt();
+    if let Some(classes) = engine.memory_classes() {
+        line["memory_classes"] = classes;
+    }
     if let Some(receipt) = engine.engine_receipt() {
         line["driver"] = receipt;
     }
@@ -1368,6 +1434,7 @@ fn measure_single(
         }
     }
     probe.prepared(&*engine);
+    mark(WARMUP_END);
     // Reset after warmup (compiles, cache fills) so the report covers only the timed iterations.
     if config.profile {
         engine.reset_profile();
@@ -1434,6 +1501,7 @@ fn measure_isl(
     engine: &mut dyn Generate,
     base: &[u32],
     isl: usize,
+    first: bool,
     probe: &mut PreparationProbe,
 ) -> anyhow::Result<Value> {
     let context: Vec<u32> = (0..isl).map(|i| base[i % base.len()]).collect();
@@ -1453,6 +1521,10 @@ fn measure_isl(
         }
     }
     probe.prepared(&*engine);
+    if first {
+        // The first point's warmup is the one that brings the process to steady state; later points add context.
+        mark(WARMUP_END);
+    }
     // Card 552: a fresh mark after this ISL's own warmup (not once for the whole sweep), since each
     // ISL's prefill/warmup cost differs and must not leak into another ISL's window.
     if config.profile {
@@ -1522,7 +1594,7 @@ fn measure_curve(
         // is not scoped per model. An uncaught panic would abort the process and discard every smaller
         // measured ISL, so it takes the same path as any per-ISL error.
         let point = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            measure_isl(config, engine, &base, isl, probe)
+            measure_isl(config, engine, &base, isl, index == 0, probe)
         }))
         .unwrap_or_else(|payload| {
             let message = payload
@@ -1627,6 +1699,7 @@ fn run(config: &Config) -> anyhow::Result<Value> {
     let open_start = Instant::now();
     let (family, outcome) = match open(config) {
         Ok(mut opened) => {
+            mark(LOAD_END);
             let open_ms = round3(ms(open_start.elapsed()));
             let outcome =
                 measure(config, opened.engine.as_mut(), &opened.resolved).map(|mut line| {
@@ -3174,5 +3247,64 @@ mod prefill_chunk_tests {
         let mut zero = curve.to_vec();
         zero.extend(["--prefill-chunk", "0"]);
         assert!(parse(&zero).is_err(), "a chunk holds a token");
+    }
+}
+
+#[cfg(test)]
+mod memory_report_tests {
+    use super::*;
+
+    /// A role that peaked at `peak` and has since freed half of it.
+    fn counters(peak: u64) -> MemoryCounterSnapshot {
+        MemoryCounterSnapshot {
+            live_bytes: peak / 2,
+            peak_bytes: peak,
+            allocations: 1,
+        }
+    }
+
+    #[test]
+    fn a_mark_is_the_line_the_observer_parses() {
+        assert_eq!(
+            mark_line(LOAD_END, 1_730_000_000.5),
+            "POOT_BENCH_MARK load_end 1730000000.500000"
+        );
+        assert_eq!(
+            mark_line(WARMUP_END, 12.000_000_25),
+            "POOT_BENCH_MARK warmup_end 12.000000"
+        );
+    }
+
+    #[test]
+    fn buffer_roles_group_into_the_four_classes_by_their_peak() {
+        // Every role peaks at a different power of two, so a role in the wrong class changes a sum, and each has
+        // freed half of its peak, so reading live bytes in place of the peak changes it too.
+        let memory = [
+            (BufferRole::Weight, counters(2)),
+            (BufferRole::State, counters(4)),
+            (BufferRole::Activation, counters(8)),
+            (BufferRole::Input, counters(16)),
+            (BufferRole::Output, counters(32)),
+            (BufferRole::Meta, counters(64)),
+            (BufferRole::Staging, counters(128)),
+        ];
+        assert_eq!(
+            memory_classes(&memory),
+            json!({
+                "weights_bytes": 2,
+                "kv_bytes": 4,
+                "workspace_bytes": 8 + 16 + 32 + 64,
+                "staging_bytes": 128,
+            })
+        );
+    }
+
+    #[test]
+    fn a_role_that_never_allocated_is_a_zero_class() {
+        let classes = memory_classes(&[(BufferRole::Weight, counters(10))]);
+        assert_eq!(classes["weights_bytes"], 10);
+        for absent in ["kv_bytes", "workspace_bytes", "staging_bytes"] {
+            assert_eq!(classes[absent], 0, "{absent}");
+        }
     }
 }

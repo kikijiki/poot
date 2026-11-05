@@ -31,7 +31,7 @@ pub use matrix::{
     MatrixUnits, OperandNarrowing,
 };
 pub use register_file::RegisterFile;
-pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
+pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout, ViewError};
 pub use vpu::{NarrowingContract, VendorCompilerId, VpuCaps, VpuTargetId};
 
 /// The GPU lowering backend. Most of `plan_eqn` is backend-neutral; the NVPTX-only kernels (tensor-core

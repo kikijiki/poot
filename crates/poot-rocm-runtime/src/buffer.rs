@@ -47,15 +47,14 @@ impl Pool {
 pub struct RocmBuffer {
     pub(crate) alloc: Arc<RocmAlloc>,
     /// Logical element count passed to the native slice ABI. Handle-level, like [`Self::storage`]
-    /// (Card 547a: moved out of the shared [`RocmAlloc`] so [`Self::with_storage`] can retag a clone
-    /// without needing sole ownership of the physical allocation).
+    /// (Card 547a: moved out of the shared [`RocmAlloc`] so a typed view ([`Self::view`], POOT-1450) is
+    /// a clone with its own count, without needing sole ownership of the physical allocation).
     pub(crate) elem_count: usize,
     /// Byte capacity established before the native allocation call. Handle-level; see
     /// [`Self::elem_count`].
     pub(crate) byte_capacity: usize,
-    /// The storage this handle currently records (card 527). Handle-level: a caller that legitimately
-    /// changes what a reused buffer holds retags one handle via [`Self::with_storage`] without
-    /// affecting any other clone's view, exactly like `poot-wgpu-runtime`'s `DeviceBuffer`.
+    /// The storage this handle records (card 527): the allocation's, or a typed view's ([`Self::view`]).
+    /// Handle-level, so one view never changes another clone's.
     pub(crate) storage: BufferStorage,
 }
 
@@ -95,6 +94,24 @@ impl RocmBuffer {
     /// layout together, set at allocation from the plan's storage record.
     pub fn storage(&self) -> BufferStorage {
         self.storage
+    }
+
+    /// This buffer's bytes typed as `storage` (POOT-1450): a handle sharing the allocation (nothing is
+    /// allocated or charged) whose storage and element count are the view's, so every check that reads a
+    /// handle's storage (a dispatch's element schema, a typed transfer) checks the view. A typed buffer
+    /// admits only its own storage; an arena slot of bytes any encoded storage in whole elements.
+    ///
+    /// # Errors
+    ///
+    /// [`RocmError::View`] when [`BufferStorage::view_elems`] refuses the view.
+    pub fn view(&self, storage: BufferStorage) -> Result<Self, RocmError> {
+        let elem_count = self.storage.view_elems(self.elem_count, storage)?;
+        Ok(Self {
+            alloc: Arc::clone(&self.alloc),
+            elem_count,
+            byte_capacity: self.byte_capacity,
+            storage,
+        })
     }
 
     /// Which native pool this allocation lives in (Card 547a).

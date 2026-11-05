@@ -42,8 +42,8 @@ use poot_graph_ir::analysis::{
     implied_numerics,
 };
 use poot_graph_ir::{
-    BoundaryId, ContractionRows, EditError, Eqn, Export, Graph, IndexRange, MatmulPrecision,
-    OpKind, Operand, Slot, ValueId, ValueTable, value_ranges,
+    BoundaryId, ContractionRows, EditError, Eqn, ExpertRows, Export, Graph, IndexRange,
+    MatmulPrecision, OpKind, Operand, Slot, ValueId, ValueTable, value_ranges,
 };
 use poot_target::{Backend, DeviceCaps, Queried, TargetId};
 use poot_tensor::DType;
@@ -448,17 +448,36 @@ fn refuse_unproven_expert_ids(g: &Graph) -> Result<(), ExpertIdsError> {
         // `g.validate()` (run by `compile` before the adapters and this check, and by the adapter itself)
         // infers every equation, and `OpKind::infer` gives each of these operands a rank (w rank 3, ids
         // rank 1), so none of them is a literal.
+        // A grouped contraction reads the grouping of its ids, not the ids. `compile` forms it (`group_expert_rows`)
+        // from a per-row contraction this check has already proven; an `ExpertGroup` itself takes any id (an invalid
+        // one lands in its last bucket).
         let (ids, experts) = match (&eqn.op, eqn.inputs.as_slice()) {
-            (OpKind::IndexedMatMul { .. }, [_, Operand::Value(weight), Operand::Value(ids)]) => {
-                (*ids, g.aval(*weight).shape.first().copied().unwrap_or(0))
-            }
+            (
+                OpKind::IndexedMatMul {
+                    rows: ExpertRows::PerRow,
+                    ..
+                },
+                [_, Operand::Value(weight), Operand::Value(ids)],
+            ) => (*ids, g.aval(*weight).shape.first().copied().unwrap_or(0)),
             (
                 OpKind::PackedContraction {
-                    rows: ContractionRows::Indexed { experts },
+                    rows:
+                        ContractionRows::Indexed {
+                            experts,
+                            rows: ExpertRows::PerRow,
+                        },
                     ..
                 },
                 [_, Operand::Value(ids), ..],
             ) => (*ids, *experts),
+            (
+                OpKind::IndexedMatMul { .. }
+                | OpKind::PackedContraction {
+                    rows: ContractionRows::Indexed { .. },
+                    ..
+                },
+                [_, _, Operand::Value(_)] | [_, Operand::Value(_), ..],
+            ) => continue,
             (OpKind::IndexedMatMul { .. } | OpKind::PackedContraction { .. }, operands) => {
                 unreachable!(
                     "equation {}: {} has operands {operands:?}; infer gives its weight and ids a rank, \
@@ -924,6 +943,25 @@ pub fn compile(
             transform::select_operand_precision(g, options.matmul_precision, units)
         })?;
     }
+    // POOT-1451: the rows of every indexed contraction the target tiles are grouped by expert, block-aligned, so a
+    // tile is one expert's rows. After the precision is selected (the block's cost model reads it) and before the
+    // epilogue rule (a fused head carries the grouping). Required: the planner refuses a per-row indexed
+    // contraction past the Gemv rows, so a target that tiles must group.
+    if let Some((backend, caps)) = gpu {
+        let limits = options.limits.body();
+        pipeline.require("group_expert_rows", |g| {
+            let views = compute_views(g, target.id());
+            transform::group_expert_rows(
+                g,
+                |graph, eqn| {
+                    planner::grouping_candidate(graph, eqn, &views, caps).or_else(|| {
+                        planner::packed_grouping_candidate(graph, eqn, backend, caps, limits)
+                    })
+                },
+                |shapes| poot_kernelgen::RegisterTiling::grouped_block(shapes, caps),
+            )
+        })?;
+    }
     // The contraction epilogue rule runs on the typed, dtype-prepared graph, right before `fuse` would claim
     // the same pointwise chains for a standalone region: a head fuses only where the planner's generated
     // lowering carries an epilogue (`epilogue_head_lowers`), so no head trades a faster schedule for it. Like
@@ -943,6 +981,29 @@ pub fn compile(
     // (a `ge` over an I32 and an F32 operand) instead of leaving the planner its typed refusal (POOT-1176).
     if gpu.is_some() {
         pipeline.run("fuse_index_casts", transform::fuse_index_casts)?;
+    }
+    // POOT-1448: a value whose every reader narrows it is stored narrow, rounded once by the region that computes
+    // it, on the final regions (after every fusion). It probes the planner before it commits each value, so its
+    // graph is final: a value the target cannot store narrow stays f32, and nothing is reverted.
+    if gpu.is_some() {
+        let limits = options.limits.body();
+        pipeline.require("store_narrowed_activations", |g| {
+            transform::store_narrowed_activations(g, |graph, eqns| {
+                let views = compute_views(graph, target.id());
+                eqns.iter().all(|eqn| {
+                    plan_eqn_compiled(
+                        graph,
+                        eqn,
+                        target,
+                        &views,
+                        &limits,
+                        npu,
+                        OutputBuffer::Fresh,
+                    )
+                    .is_ok()
+                })
+            })
+        })?;
     }
     let (graph, numerics, passes) = pipeline.finish()?;
     // `legalize` fitted every constant, but a later pass's revert of an unplannable split (`after_apply`) can
@@ -2307,7 +2368,8 @@ mod tests {
                         contraction.op,
                         OpKind::PackedContraction {
                             rows: poot_graph_ir::ContractionRows::Indexed {
-                                experts: MOE_EXPERTS
+                                experts: MOE_EXPERTS,
+                                ..
                             },
                             ..
                         }

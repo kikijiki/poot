@@ -6,7 +6,7 @@ use crate::pipeline::{DeviceTimingResult, EncodeItem, spirv_words};
 use crate::timestamps::storage_entry;
 use crate::{
     CachedDispatch, Context, DeviceBuffer, KernelBuffer, PendingDeviceTiming, PendingFault,
-    RuntimeError,
+    QueuedWork, RuntimeError,
 };
 use poot_codegen::CompiledKernel;
 use poot_runtime_common::BufferRole;
@@ -274,7 +274,10 @@ impl Context {
     /// does not reach every dispatch, though: a trap-bearing one still costs one `label.to_string()`
     /// per replayed step, inside `record_pending_fault` above (review F5) - a known remaining
     /// per-dispatch allocation, out of SC-003's measured surface (its fixture has no trap kernel).
-    pub fn submit_cached(&self, dispatches: &[&CachedDispatch]) -> Result<(), RuntimeError> {
+    pub fn submit_cached(
+        &self,
+        dispatches: &[&CachedDispatch],
+    ) -> Result<QueuedWork, RuntimeError> {
         for d in dispatches {
             if let Some(err) = &d.error_storage {
                 self.queue
@@ -358,7 +361,7 @@ impl Context {
     pub(crate) fn submit_encoded<'a>(
         &self,
         items: impl ExactSizeIterator<Item = EncodeItem<'a>> + Clone,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<QueuedWork, RuntimeError> {
         self.health.check_live("submit")?;
         let mut enc = self
             .device
@@ -446,7 +449,7 @@ impl Context {
 
         self.native_submits.set(self.native_submits.get() + 1);
         self.record_submit(poot_runtime_common::CallPurpose::Compute);
-        self.queue.submit(Some(enc.finish()));
+        let submission = QueuedWork::new(self.queue.submit(Some(enc.finish())));
         self.submits.set(self.submits.get() + 1);
 
         if let Some(read) = ts_read {
@@ -468,7 +471,7 @@ impl Context {
                     _guard: ts_guard.expect("query_set implies a Staging guard"),
                 });
         }
-        Ok(())
+        Ok(submission)
     }
 
     /// Dispatch a compiler-produced `kernel` (card 608). `wg` is the workgroup shape (must match the
@@ -871,7 +874,7 @@ impl Context {
 mod step_encode_allocation_tests {
     use crate::context::dispatch::CompiledKernel;
     use crate::pipeline::EncodeItem;
-    use crate::{CachedDispatch, Context, DeviceBuffer};
+    use crate::{CachedDispatch, Context, DeviceBuffer, QueuedWork};
     use poot_kernel_ir::fixtures;
     use poot_runtime_common::DeviceBackend;
     use poot_runtime_common::device_skip::open_or_skip;
@@ -1008,7 +1011,7 @@ mod step_encode_allocation_tests {
     fn submit_cached_pre_fix_shape(
         ctx: &Context,
         dispatches: &[&CachedDispatch],
-    ) -> Result<(), crate::RuntimeError> {
+    ) -> Result<QueuedWork, crate::RuntimeError> {
         let items: Vec<EncodeItem> = dispatches
             .iter()
             .map(|d| EncodeItem {
@@ -1064,8 +1067,12 @@ mod step_encode_allocation_tests {
         }
         const REPS: usize = 64;
         let [fixed_allocs, pre_fix_allocs] = super::alloc_counting::paired_allocation_counts(
-            || ctx.submit_cached(&refs).unwrap(),
-            || submit_cached_pre_fix_shape(&ctx, &refs).unwrap(),
+            || {
+                ctx.submit_cached(&refs).unwrap();
+            },
+            || {
+                submit_cached_pre_fix_shape(&ctx, &refs).unwrap();
+            },
             REPS,
         );
         let delta = pre_fix_allocs.saturating_sub(fixed_allocs);

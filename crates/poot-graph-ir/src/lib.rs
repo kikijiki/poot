@@ -59,9 +59,10 @@ pub use index_guard::{
     GuardValues, GuardedIndex, IndexGuardEmitError, IndexGuardError, emit_index_guard,
 };
 pub use op::{
-    AttentionAttrs, BinOp, BlockTopKAttrs, BlockTopKLayout, ContractionRows, KeyLayout, KvBound,
-    LaneId, LocalId, MaskOperand, OpClass, OpKind, RedOp, ScanAttrs, ScanFamily, ScanLayout,
-    SelectedAttentionAttrs, SelectedAttentionLayout, SinkOperand, UnOp,
+    AttentionAttrs, BinOp, BlockTopKAttrs, BlockTopKLayout, ContractionRows, ExpertGrouping,
+    ExpertRows, KeyLayout, KvBound, LaneId, LocalId, MaskOperand, OpClass, OpKind, RedOp,
+    ScanAttrs, ScanFamily, ScanLayout, SelectedAttentionAttrs, SelectedAttentionLayout,
+    SinkOperand, UnOp,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use packed_source::packed_source_constants;

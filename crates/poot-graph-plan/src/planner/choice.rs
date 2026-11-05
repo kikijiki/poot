@@ -95,7 +95,11 @@ impl KernelChoice {
     /// by default. An exact request is the one that existed before the field did, so a plan compiled under the
     /// default policy keeps the key it always had; a narrowed one names its precision and keys differently.
     pub fn canonical_text(&self) -> String {
-        format!("{self:?}").replace(", precision: Exact", "")
+        // The defaults a later field added are omitted, so a request that does not use the field keeps the text
+        // (and the plan digest) it had: an exact precision (POOT-1430), an f32 activation (POOT-1448).
+        format!("{self:?}")
+            .replace(", precision: Exact", "")
+            .replace(", activation_stored: None", "")
     }
 
     /// The digest of this choice's canonical encoding for `target`'s codegen epoch.
@@ -855,9 +859,10 @@ mod tests {
                     out_per_block: 1024,
                     k: 1024,
                     layout: poot_kernelgen::WeightLayout::Nk,
-                    segments: 1,
+                    rows: poot_kernelgen::TiledRows::Dense,
                     terms: poot_kernelgen::StagedTerms::ONE,
                     weight_bits: 32,
+                    activation_bits: 32,
                 },
                 &DeviceCaps::rocm_default(),
             )

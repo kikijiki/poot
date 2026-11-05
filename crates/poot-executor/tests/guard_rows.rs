@@ -81,6 +81,13 @@ impl Device for Recorder {
         self.allocations.push((role, storage, elems));
         Ok(self.allocations.len() - 1)
     }
+    fn view(&self, buffer: &usize, storage: BufferStorage) -> Result<usize, Self::Error> {
+        // A view is the allocation's own id, admitted by the one storage rule.
+        let (_, slot, elems) = self.allocations[*buffer];
+        slot.view_elems(elems, storage)
+            .expect("the engine views an arena slot it allocated");
+        Ok(*buffer)
+    }
     fn buffer_elems(&self, buffer: &usize) -> usize {
         self.allocations[*buffer].2
     }

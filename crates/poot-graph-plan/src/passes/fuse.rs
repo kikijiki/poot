@@ -795,7 +795,7 @@ fn epilogue_head(g: &Graph, eqn: &Eqn) -> Option<ContractionHead> {
             rows: *rows,
             precision: *precision,
         }),
-        OpKind::IndexedMatMul { precision } => {
+        OpKind::IndexedMatMul { rows, precision } => {
             let [Operand::Value(x), Operand::Value(w), Operand::Value(_)] = eqn.inputs.as_slice()
             else {
                 return None;
@@ -806,6 +806,7 @@ fn epilogue_head(g: &Graph, eqn: &Eqn) -> Option<ContractionHead> {
                 || (dtype == DType::F32 && g.aval(*w).dtype == DType::BF16);
             (is_float(dtype) && g.aval(*x).dtype == dtype && weight_fits).then_some(
                 ContractionHead::Indexed {
+                    rows: *rows,
                     precision: *precision,
                 },
             )

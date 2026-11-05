@@ -28,11 +28,13 @@ mod budget;
 mod cse_dce;
 mod dtype;
 pub(crate) mod fuse;
+mod group_expert_rows;
 mod guard_witness;
 mod hosted_gather;
 mod iota;
 mod legalize;
 mod lora;
+mod narrow_storage;
 mod operand_precision;
 mod packed;
 mod packed_bind;
@@ -87,6 +89,7 @@ pub use fuse::fuse;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) use fuse::fuse;
 pub(crate) use fuse::fuse_contraction_epilogues;
+pub(crate) use group_expert_rows::group_expert_rows;
 pub(crate) use guard_witness::first_unobserved_clamp;
 pub use hosted_gather::{HOSTED_ROWS, HostedGather, HostedRows, IndexSource};
 pub(crate) use hosted_gather::{HostedSite, host_gather_tables};
@@ -94,6 +97,7 @@ pub(crate) use hosted_gather::{HostedSite, host_gather_tables};
 pub use iota::fold_iota;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) use iota::fold_iota;
+pub(crate) use narrow_storage::store_narrowed_activations;
 #[cfg(any(test, feature = "test-support"))]
 pub use operand_precision::with_operand_precision;
 pub(crate) use operand_precision::{FragmentUnits, select_operand_precision};

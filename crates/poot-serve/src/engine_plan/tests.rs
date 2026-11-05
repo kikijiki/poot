@@ -265,6 +265,10 @@ impl Device for FixtureDevice {
         std::mem::forget(self.memory.record_alloc(role, bytes));
         Ok(())
     }
+    fn view(&self, _buffer: &(), _storage: poot_target::BufferStorage) -> Result<(), Self::Error> {
+        // This fake keeps no storage: a view is the same nothing.
+        Ok(())
+    }
     /// This fake keeps no storage, so it states no bound: the engine's length check passes every
     /// dispatch it records.
     fn buffer_elems(&self, _buffer: &()) -> usize {
@@ -805,6 +809,12 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
 /// POOT-1423 hosts the fixture's gather-only tables: `Weight` 5344 -> 5216 (128 bytes of table stay in the mapping),
 /// `Activation` drops by the gather outputs the arena no longer holds, and `Input` grows by the hosted rows slots
 /// (stored rows of the step's tokens, one slot per carrier).
+/// POOT-1450 colors every arena value that is not an export into untyped slots of bytes, so the i32 values (ids,
+/// positions, the expert grouping) share slots with the f32 values instead of keeping slots of their own:
+/// `Activation` 1252436 -> 1155988 at four rows (626428 -> 578148 at two, 313584 -> 289592 at one).
+/// POOT-1451 groups the routed rows in the compiler instead of the tracer: a prefill's routed experts read their rows
+/// in place, so the sorted copy of the rows and the sorted copy of the result leave the arena: on top of POOT-1450,
+/// `Activation` 1155988 -> 1151108, 578148 -> 575708 and 289592 -> 288408 at four, two and one rows.
 ///
 /// Mutation: size a dense weight from `shape[..1]` in `Engine::weight_buffer`'s size-only path; `Weight`
 /// is no longer 5216 and this row goes red.
@@ -822,17 +832,17 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         (
             4,
             64,
-            "Activation=1252436 Input=189100 Meta=16884 State=12416 Weight=5216",
+            "Activation=1151108 Input=189100 Meta=16884 State=12416 Weight=5216",
         ),
         (
             2,
             64,
-            "Activation=626428 Input=117748 Meta=16884 State=6208 Weight=5216",
+            "Activation=575708 Input=117748 Meta=16884 State=6208 Weight=5216",
         ),
         (
             1,
             64,
-            "Activation=313584 Input=82072 Meta=15564 State=3104 Weight=5216",
+            "Activation=288408 Input=82072 Meta=15564 State=3104 Weight=5216",
         ),
     ];
     let domain = candidates(&handle, &args);

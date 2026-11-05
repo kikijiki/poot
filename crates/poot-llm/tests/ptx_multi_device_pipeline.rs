@@ -482,6 +482,13 @@ impl Device for FailingFinish {
         self.inner.allocate(role, storage, elems)
     }
 
+    fn view(
+        &self,
+        buffer: &Self::Buffer,
+        storage: poot_target::BufferStorage,
+    ) -> Result<Self::Buffer, Self::Error> {
+        self.inner.view(buffer, storage)
+    }
     fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
         self.inner.buffer_elems(buffer)
     }

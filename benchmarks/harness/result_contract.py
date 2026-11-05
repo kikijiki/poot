@@ -48,6 +48,23 @@ WINDOW_CLAIMING_FRAMEWORKS = frozenset({"poot"})
 DEVICE_TIME_CLAIMING_FRAMEWORKS = frozenset({"poot"})
 
 
+# The device memory a runner reports from its engine, by what the buffer is for: the model's weights, the KV cache and
+# recurrent state, the workspace (activations, scratch, compute buffers, per-step inputs and outputs) and the staging
+# buffers that bridge host transfers. poot counts these by buffer role; llama.cpp's own memory table gives the first three
+# (model, context, compute). A runner states the classes its engine counts.
+MEMORY_CLASS_FIELDS = ("weights_bytes", "kv_bytes", "workspace_bytes", "staging_bytes")
+
+
+def memory_class_errors(value):
+    """Why a runner's `memory_classes` is not a map of known classes to nonnegative integer byte counts, or an empty list."""
+    if not isinstance(value, dict) or not value:
+        return [f"memory_classes must be a nonempty object; got {value!r}"]
+    errors = [f"memory_classes names an unknown class {key!r}" for key in value if key not in MEMORY_CLASS_FIELDS]
+    errors += [f"memory_classes.{key} must be a nonnegative integer; got {v!r}"
+               for key, v in value.items() if key in MEMORY_CLASS_FIELDS and not (_is_int(v) and v >= 0)]
+    return errors
+
+
 def timing_claim(framework):
     """The timing capability `framework`'s runner claims."""
     return REQUEST_WINDOW if framework in WINDOW_CLAIMING_FRAMEWORKS else ROW_LEVEL
@@ -262,6 +279,8 @@ def validate_runner_result(result, *, framework, precision, scenario, gen_tokens
             errors.append(
                 f"{field} must be a finite nonnegative number; got {result[field]!r}"
             )
+    if "memory_classes" in result:
+        errors.extend(memory_class_errors(result["memory_classes"]))
     if "self_reported_vram_bytes" in result and not (
         _is_int(result["self_reported_vram_bytes"])
         and result["self_reported_vram_bytes"] >= 0

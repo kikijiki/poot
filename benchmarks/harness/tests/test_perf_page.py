@@ -385,6 +385,35 @@ class PerfPageTest(unittest.TestCase):
         self.assertEqual(cell["metrics"]["peak_rss_bytes"]["median"], 6 * gib)
         self.assertEqual(cell["metrics"]["load_rss_bytes"]["median"], 26 * gib)
 
+    def test_a_run_with_exact_phases_charts_them_and_the_host_split_and_the_engine_memory_classes(self):
+        gib = 2**30
+        phases = {
+            "load": {"rss_bytes": 26 * gib, "rss_anon_bytes": 1 * gib, "rss_file_bytes": 25 * gib, "vram_bytes": 9 * gib, "gtt_bytes": None},
+            "inference": {"rss_bytes": 6 * gib, "rss_anon_bytes": 5 * gib, "rss_file_bytes": 1 * gib, "vram_bytes": 12 * gib, "gtt_bytes": None},
+        }
+        classes = {"weights_bytes": 8 * gib, "kv_bytes": 2 * gib, "workspace_bytes": 1 * gib, "staging_bytes": 0}
+        # No util_series and no open time: only the exact phases can say where the load ended.
+        rows = repeats(peak_rss_bytes=26 * gib, memory_phases=phases, memory_classes=classes)
+        (cell,) = self.derive({"set": rows})[0]
+        metrics = cell["metrics"]
+        self.assertEqual(cell["memory_scope"], "inference")
+        self.assertEqual(metrics["peak_rss_bytes"]["median"], 6 * gib)
+        self.assertEqual(metrics["load_rss_bytes"]["median"], 26 * gib)
+        self.assertEqual(metrics["rss_anon_bytes"]["median"], 5 * gib)
+        self.assertEqual(metrics["rss_file_bytes"]["median"], 1 * gib)
+        self.assertEqual(metrics["peak_vram_bytes"]["median"], 12 * gib)
+        for name, value in classes.items():
+            self.assertEqual(metrics[name]["median"], value, name)
+
+    def test_a_stored_run_states_no_class_or_split_it_never_recorded(self):
+        gib = 2**30
+        rss = [4, 26, 26, 5, 5, 6, 5, 5, 1]
+        series = [[t, 0, 0, 0, int(r * gib), 0.0] for t, r in enumerate(rss, 1)]
+        rows = repeats(peak_rss_bytes=26 * gib, util_series=series, preparation={"open_ms": 3000})
+        (cell,) = self.derive({"set": rows})[0]
+        for absent in ("rss_anon_bytes", "rss_file_bytes", "weights_bytes", "kv_bytes", "workspace_bytes", "staging_bytes"):
+            self.assertNotIn(absent, cell["metrics"], absent)
+
     def test_one_repeat_without_a_boundary_keeps_the_lifetime_peak_of_the_whole_cell(self):
         gib = 2**30
         rss = [4, 26, 26, 5, 5, 6, 5, 5, 1]

@@ -9,6 +9,7 @@ use super::{
 use crate::planner::{GraphTables, Layout, StorageDtypes, finalize};
 use crate::predicates::{indexed_gemv_in, indexed_matmul_lowers, view_source};
 use crate::refusal::Site;
+use poot_graph_ir::ExpertRows;
 use poot_target::{Backend, BufferStorage, DeviceCaps};
 
 /// Whether this family lowers these storage dtypes: the indexed matmul and the rank inversion are f32/i32
@@ -51,6 +52,8 @@ pub(super) fn plan(
                 out_shape,
                 odt,
                 packed_operands,
+                // Only the dense tiled body stores a narrowed output (POOT-1448).
+                false,
             )?;
             plan_indexed(site, g, eqn, backend, views, caps, Some(epilogue))?
         }
@@ -75,9 +78,12 @@ pub(super) fn plan(
                 caps,
             )?
         }
-        OpKind::ExpertGroup { experts } => Planned::generated(
+        OpKind::ExpertGroup { experts, block } => Planned::generated(
             site,
-            KernelRequest::ExpertGroup(kg::ExpertGroupSpec { experts: *experts }),
+            KernelRequest::ExpertGroup(kg::ExpertGroupSpec {
+                experts: *experts,
+                block: *block,
+            }),
             backend,
             caps,
         )?,
@@ -117,26 +123,114 @@ fn weight_layout(
     shape: &[usize],
     views: &HashMap<ValueId, Layout>,
 ) -> Result<kg::WeightLayout, PlanError> {
+    stored_layout(value, shape, views)
+        .ok_or_else(|| site.refuse(Capability::OperandLayout { value }))
+}
+
+/// [`weight_layout`]'s layout, `None` for a view it refuses.
+fn stored_layout(
+    value: ValueId,
+    shape: &[usize],
+    views: &HashMap<ValueId, Layout>,
+) -> Option<kg::WeightLayout> {
     let Some(view) = views.get(&value) else {
-        return Ok(kg::WeightLayout::Kn);
+        return Some(kg::WeightLayout::Kn);
     };
     let (k, n) = (shape[1], shape[2]);
     let stored_nk = Layout {
         strides: vec![k * n, 1, k],
         offset: 0,
     };
-    if *view == stored_nk {
-        Ok(kg::WeightLayout::Nk)
-    } else {
-        Err(site.refuse(Capability::OperandLayout { value }))
+    (*view == stored_nk).then_some(kg::WeightLayout::Nk)
+}
+
+/// The storage the stacked weight `w` is read in: f32, or BF16 packed lanes, which only a const upload (or a view
+/// of one, read in place) has; `None` for any other.
+fn stack_storage(
+    g: GraphTables<'_>,
+    views: &HashMap<ValueId, Layout>,
+    w: ValueId,
+) -> Option<BufferStorage> {
+    match g.aval(w).dtype {
+        DType::F32 => Some(BufferStorage::f32()),
+        DType::BF16
+            if g.values[view_source(g, views, w)]
+                .storage
+                .holds_weight_bytes() =>
+        {
+            Some(BufferStorage::bf16_packed())
+        }
+        _ => None,
     }
 }
 
+/// The tiled shape of a dense indexed contraction of `m` rows of `k` against `experts` stacked `[K, n]` weights
+/// stored in `layout` and `weight`, its rows meeting the tiles as `rows` says. The one description both the planner
+/// and the `group_expert_rows` pass's block choice read.
+fn indexed_tiled_shape(
+    (m, k, n, _experts): (usize, usize, usize, usize),
+    layout: kg::WeightLayout,
+    weight: BufferStorage,
+    precision: poot_graph_ir::OperandPrecision,
+    rows: kg::TiledRows,
+) -> kg::TiledShape {
+    kg::TiledShape {
+        blocks: 1,
+        m_per_block: m,
+        out_per_block: n,
+        k,
+        layout,
+        rows,
+        terms: kg::StagedTerms::of(precision, None, kg::stored_fragment_dtype(weight)),
+        weight_bits: kg::dense_value_bits(weight),
+        activation_bits: kg::activation_bits(None),
+    }
+}
+
+/// The tiled shape of a per-row dense indexed contraction (`IndexedMatMul`) the planner would tile on `caps` (its
+/// rows past the Gemv's), as grouped rows over its `experts + 1` buckets (the block is the caller's to choose);
+/// `None` for one it runs as a Gemv or cannot plan. What the `group_expert_rows` pass groups.
+pub(crate) fn grouping_candidate(
+    g: &poot_graph_ir::Graph,
+    eqn: &Eqn,
+    views: &HashMap<ValueId, Layout>,
+    caps: &DeviceCaps,
+) -> Option<kg::TiledShape> {
+    let OpKind::IndexedMatMul {
+        rows: ExpertRows::PerRow,
+        precision,
+    } = eqn.op
+    else {
+        return None;
+    };
+    let tables = GraphTables::from(g);
+    let ids = value_ids(eqn);
+    if !indexed_matmul_lowers(tables, eqn) {
+        return None;
+    }
+    let (x, w) = (&tables.aval(ids[0]).shape, &tables.aval(ids[1]).shape);
+    let (m, k, experts, n) = (x[0], x[1], w[0], w[2]);
+    if experts == 0 || indexed_gemv_in(m, n, caps).is_some() {
+        return None;
+    }
+    Some(indexed_tiled_shape(
+        (m, k, n, experts),
+        stored_layout(ids[1], w, views)?,
+        stack_storage(tables, views, ids[1])?,
+        precision,
+        kg::TiledRows::Grouped {
+            groups: experts + 1,
+            block: 0,
+        },
+    ))
+}
+
 /// One generated indexed contraction ([`ContractionSpec::Indexed`]): `x[M, K]` against the stacked `W[E, K, N]`
-/// (or its checkpoint `[E, N, K]` view) with row `m` reading slab `idx[m]`, optionally with an epilogue over each
-/// sum. The schedule is chosen from shapes and the device alone ([`indexed_gemv_in`]): the Gemv at decode row
-/// counts, else the register-tiled schedule inside an expert walk ([`register_tiled_launch`] over one block of `M`
-/// rows in `E` segments), split and folded as every register-tiled contraction is.
+/// (or its checkpoint `[E, N, K]` view), optionally with an epilogue over each sum. Per-row ids run the Gemv at
+/// decode row counts ([`indexed_gemv_in`], from shapes and the device alone) and are refused past them; rows grouped
+/// by expert ([`ExpertRows::Grouped`]) run the tiled schedule over the grouping ([`register_tiled_launch`] over one
+/// block of the grouping's positions, the tiling's output tile the grouping's block), split and folded as every
+/// tiled contraction is.
 fn plan_indexed(
     site: Site<'_>,
     g: GraphTables<'_>,
@@ -154,18 +248,8 @@ fn plan_indexed(
     let (x, w) = (g.aval(ids[0]).shape.clone(), g.aval(ids[1]).shape.clone());
     let (m, k, experts, n) = (x[0], x[1], w[0], w[2]);
     let layout = weight_layout(site, ids[1], &w, views)?;
-    // The BF16 stack is read as packed lanes, which only a const upload (or a view of one, read in place) has.
-    let weight = match g.aval(ids[1]).dtype {
-        DType::F32 => BufferStorage::f32(),
-        DType::BF16
-            if g.values[view_source(g, views, ids[1])]
-                .storage
-                .holds_weight_bytes() =>
-        {
-            BufferStorage::bf16_packed()
-        }
-        _ => return Err(site.refuse(Capability::DtypeLowering)),
-    };
+    let weight =
+        stack_storage(g, views, ids[1]).ok_or_else(|| site.refuse(Capability::DtypeLowering))?;
     if experts == 0 {
         return Err(site.refuse(Capability::OperandShape {
             value: ids[1],
@@ -175,8 +259,16 @@ fn plan_indexed(
     }
     let overflow = || site.refuse(Capability::DispatchSizeOverflow);
     let word = |extent: usize| u32::try_from(extent).map_err(|_| overflow());
-    let (schedule, dispatches) = match indexed_gemv_in(m, n, caps) {
-        Some(launch) => {
+    let rows = match &eqn.op {
+        OpKind::IndexedMatMul { rows, .. }
+        | OpKind::ContractionEpilogue {
+            head: ContractionHead::Indexed { rows, .. },
+            ..
+        } => *rows,
+        _ => unreachable!("plan_indexed plans an indexed head"),
+    };
+    let (schedule, dispatches) = match (rows, indexed_gemv_in(m, n, caps)) {
+        (ExpertRows::PerRow, Some(launch)) => {
             let schedule = launch.schedule(backend, k);
             let threads = word(schedule.grid_threads(1, m, n))?;
             let meta = vec![word(k)?, word(n)?, word(m)?, 0, 0, word(experts)?];
@@ -188,22 +280,19 @@ fn plan_indexed(
                 }],
             )
         }
-        None => {
-            let (tiling, mut dispatches) = register_tiled_launch(
-                site,
-                kg::TiledShape {
-                    blocks: 1,
-                    m_per_block: m,
-                    out_per_block: n,
-                    k,
-                    layout,
-                    segments: experts,
-                    terms: kg::StagedTerms::of(precision, None, kg::stored_fragment_dtype(weight))
-                        .scalar_only(),
-                    weight_bits: kg::dense_value_bits(weight),
+        (ExpertRows::PerRow, None) => return Err(site.refuse(Capability::UngroupedExpertRows)),
+        (ExpertRows::Grouped { block }, _) => {
+            let shape = indexed_tiled_shape(
+                (m, k, n, experts),
+                layout,
+                weight,
+                precision,
+                kg::TiledRows::Grouped {
+                    groups: experts + 1,
+                    block,
                 },
-                caps,
-            )?;
+            );
+            let (tiling, mut dispatches) = register_tiled_launch(site, shape, caps)?;
             let experts = word(experts)?;
             for dispatch in &mut dispatches {
                 dispatch.meta.push(experts);

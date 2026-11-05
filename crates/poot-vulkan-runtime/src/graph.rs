@@ -7,14 +7,20 @@ use std::time::Duration;
 pub(crate) struct GraphResources {
     pub(crate) command_pool: vk::CommandPool,
     pub(crate) command_buffer: vk::CommandBuffer,
-    pub(crate) fence: vk::Fence,
+    pub(crate) fences: [vk::Fence; IN_FLIGHT_SUBMITS],
 }
+
+/// How many of a replay's submissions are in flight at once: the device runs one while the next waits
+/// behind it, so a segment boundary no longer leaves it idle for the host's wait-reset-submit turnaround,
+/// and no more than this much work is ever queued behind the display watchdog (the flush policy bounds
+/// each submission, this bounds how many). Each in-flight submission signals its own fence.
+pub(crate) const IN_FLIGHT_SUBMITS: usize = 2;
 
 /// Owns an in-progress graph's native resources until construction succeeds.
 pub(crate) struct PendingGraph<'a> {
     pub(crate) owner: &'a DeviceOwner,
     pub(crate) command_pool: Option<vk::CommandPool>,
-    pub(crate) fence: Option<vk::Fence>,
+    pub(crate) fences: Vec<vk::Fence>,
 }
 
 impl PendingGraph<'_> {
@@ -25,7 +31,9 @@ impl PendingGraph<'_> {
                 .take()
                 .expect("command pool acquired before finish"),
             command_buffer,
-            fence: self.fence.take().expect("fence acquired before finish"),
+            fences: std::mem::take(&mut self.fences)
+                .try_into()
+                .expect("every fence acquired before finish"),
         }
     }
 }
@@ -35,7 +43,7 @@ impl Drop for PendingGraph<'_> {
         // SAFETY: the guard owns every populated handle; destroying the command pool implicitly frees its
         // command buffer.
         unsafe {
-            if let Some(fence) = self.fence.take() {
+            for fence in self.fences.drain(..) {
                 self.owner.dispatch.destroy_fence(&self.owner.device, fence);
             }
             if let Some(pool) = self.command_pool.take() {
@@ -54,7 +62,7 @@ pub(crate) fn create_graph_resources(
     let mut pending = PendingGraph {
         owner,
         command_pool: None,
-        fence: None,
+        fences: Vec::with_capacity(IN_FLIGHT_SUBMITS),
     };
     let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
     // SAFETY: the owner is valid and outlives the pending resources.
@@ -66,9 +74,11 @@ pub(crate) fn create_graph_resources(
     pending.command_pool = Some(command_pool);
     let command_buffer = allocate_command_buffer(owner, command_pool)?;
     let fence_info = vk::FenceCreateInfo::default();
-    // SAFETY: the owner remains alive and the returned fence transfers to `pending` immediately.
-    let fence = unsafe { owner.dispatch.create_fence(&owner.device, &fence_info)? };
-    pending.fence = Some(fence);
+    for _ in 0..IN_FLIGHT_SUBMITS {
+        // SAFETY: the owner remains alive and the returned fence transfers to `pending` immediately.
+        let fence = unsafe { owner.dispatch.create_fence(&owner.device, &fence_info)? };
+        pending.fences.push(fence);
+    }
     begin_command_buffer(owner, command_buffer)?;
     Ok(pending.finish(command_buffer))
 }
@@ -212,14 +222,15 @@ pub(crate) struct MetaBlock {
 
 /// The native objects and retained children of one graph, in either state. Its `Drop` releases them;
 /// destroying the command pool is valid whether its command buffers are recording or executable, since
-/// no submission is ever pending when a graph drops (every [`VulkanGraph::replay`] fence-waits).
+/// no submission is ever pending when a graph drops (every [`VulkanGraph::replay`] fence-waits every submission).
 pub(crate) struct GraphCore {
     pub(crate) command_pool: vk::CommandPool,
-    /// The graph's command buffers in submission order. Each replay submits them one by one, waiting
-    /// between them, so a long graph is never one past-watchdog submission. The last one is the one a
+    /// The graph's command buffers in submission order. Each replay submits them one by one, keeping at
+    /// most [`IN_FLIGHT_SUBMITS`] pending, so a long graph is never one past-watchdog submission. The last one is the one a
     /// [`RecordingGraph`] is still recording into.
     pub(crate) segments: Vec<vk::CommandBuffer>,
-    pub(crate) fence: vk::Fence,
+    /// One fence per in-flight submission slot: submission `i` of a replay signals `fences[i % IN_FLIGHT_SUBMITS]`.
+    pub(crate) fences: [vk::Fence; IN_FLIGHT_SUBMITS],
     /// Descriptor pools in creation order; the last is the one new sets come from.
     pub(crate) desc_pools: Vec<vk::DescriptorPool>,
     /// Buffers the recorded command buffers reference, kept alive for the graph's lifetime: every
@@ -231,8 +242,9 @@ pub(crate) struct GraphCore {
     pub(crate) traps: Vec<TrapSlot>,
     /// Number of dispatches recorded; constant across replays.
     pub(crate) dispatch_count: usize,
-    /// Commands recorded into the open segment: a barrier precedes every command but a segment's first
-    /// (a fence wait separates segments).
+    /// Commands recorded into the open segment: a barrier precedes every command but the graph's first
+    /// (a segment's first command is ordered after the earlier segments by that barrier, since their
+    /// submissions may still be running).
     pub(crate) commands_in_segment: usize,
     pub(crate) timestamps: Option<Timestamps>,
     /// Last so graph children, held buffers, and retained pipelines drop before the device owner.
@@ -258,7 +270,7 @@ pub struct RecordingGraph {
 /// [`Context`] is gone.
 pub struct VulkanGraph {
     core: GraphCore,
-    /// Held for a whole replay: the graph's one fence, trap words and timestamp pool serve one replay
+    /// Held for a whole replay: the graph's fences, trap words and timestamp pool serve one replay
     /// at a time, however many threads share the graph.
     replaying: Mutex<()>,
 }
@@ -277,13 +289,17 @@ impl VulkanGraph {
         self.core.dispatch_count
     }
 
-    /// Number of command buffers a replay submits, one fence wait after each.
+    /// Number of command buffers a replay submits, [`IN_FLIGHT_SUBMITS`] of them in flight at once.
     #[cfg(any(test, feature = "test-support"))]
     pub fn segment_count(&self) -> usize {
         self.core.segments.len()
     }
 
-    /// Re-submit the recorded command buffers in order, fence-waiting after each (spec 133 FR-009).
+    /// Re-submit the recorded command buffers in order, keeping at most [`IN_FLIGHT_SUBMITS`] pending
+    /// (spec 133 FR-009): before a submission would exceed the window the host waits for the oldest, so
+    /// the device runs one segment while the next is already queued behind it. Waiting after every
+    /// segment left the device idle for the host's wake-reset-submit turnaround once per segment
+    /// (POOT-1449). The last submissions are waited out before the call returns.
     /// Write new per-replay input data into the bound persistent buffers (via
     /// [`DeviceBuffer::write_with`]) before calling. Nothing is re-recorded.
     ///
@@ -293,9 +309,10 @@ impl VulkanGraph {
     ///
     /// A replay whose fence wait fails (or whose submit is lost) returns
     /// [`RuntimeError::SubmissionLost`] and poisons the device: a command buffer may still be pending,
-    /// so every later replay is refused ([`RuntimeError::Poisoned`]) before it touches the fence, and
-    /// dropping the graph leaks its objects. Replays of one graph serialize on its lock (the one fence
-    /// is reused by every submit).
+    /// so every later replay is refused ([`RuntimeError::Poisoned`]) before it touches a fence, and
+    /// dropping the graph leaks its objects. A submit refused for memory leaves the device usable, so the
+    /// submissions already pending are waited out before the error returns. Replays of one graph
+    /// serialize on its lock (the fences are reused by every replay).
     pub fn replay(&self) -> Result<Replay, RuntimeError> {
         let core = &self.core;
         core.owner.check_live("replay")?;
@@ -310,27 +327,13 @@ impl VulkanGraph {
             trap.chunk
                 .write_with_at(&queue, "replay", trap.offset, 4, &mut |_, out| out.fill(0))?;
         }
-        for &command_buffer in &core.segments {
-            // SAFETY: `core.fence` is this graph's own fence, and no submission signalling it is
-            // pending: each earlier submit's wait either succeeded or poisoned the device, which
-            // `check_live` refused above or `submit_and_wait` reports below. Resetting an
-            // already-unsignaled fence (the first call) is a valid no-op. `owner` retains the complete
-            // native parent chain.
-            unsafe {
-                core.owner
-                    .dispatch
-                    .reset_fences(&core.owner.device, &[core.fence])?;
-            }
-            // SAFETY: `command_buffer` is executable, since a `VulkanGraph` is only built by
-            // `end_graph` after `vkEndCommandBuffer` closed the last segment (and every earlier one was
-            // closed by the cut that opened its successor), and it is not pending (as for the fence
-            // above); `core.fence` was just reset. Every buffer and pipeline the command buffers
-            // reference is retained by `core`, and leaked with it if the submission is lost.
-            unsafe {
-                core.owner
-                    .submit_and_wait(&queue, command_buffer, core.fence)?
-            };
-        }
+        // A refused submit queued nothing, but the earlier ones are still running; the caller may destroy
+        // the graph on that error, so they are retired either way.
+        let mut submitted = 0;
+        let outcome = core.submit_segments(&queue, &mut submitted);
+        let retired = core.wait_pending(submitted);
+        outcome?;
+        retired?;
         Ok(Replay {
             fault: core.read_fault(&queue)?,
             time: core.read_time()?,
@@ -339,6 +342,65 @@ impl VulkanGraph {
 }
 
 impl GraphCore {
+    /// Submit every segment in order, retiring the oldest submission first whenever the window is full.
+    /// `submitted` counts the segments queued so far, also when a later one fails.
+    ///
+    /// Submission `i` signals `fences[i % IN_FLIGHT_SUBMITS]`, so the fence a submission reuses belongs to
+    /// the one retired just before it.
+    fn submit_segments(
+        &self,
+        queue: &QueueGuard<'_>,
+        submitted: &mut usize,
+    ) -> Result<(), RuntimeError> {
+        for (index, &command_buffer) in self.segments.iter().enumerate() {
+            let fence = self.fences[index % IN_FLIGHT_SUBMITS];
+            if index >= IN_FLIGHT_SUBMITS {
+                // SAFETY: `fence` signals submission `index - IN_FLIGHT_SUBMITS` of this replay, queued
+                // below; the caller holds the device's queue guard.
+                unsafe { self.owner.wait_submission(fence)? };
+            }
+            // SAFETY: `fence` is this graph's own, and no submission signalling it is pending: the one
+            // that used it last (the previous replay's, or `index - IN_FLIGHT_SUBMITS`'s) was waited just
+            // above or before the previous replay returned, or poisoned the device, which `check_live`
+            // refused in `replay` and `wait_submission` reports. Resetting an already-unsignaled fence
+            // (the first replay) is a valid no-op. `owner` retains the complete native parent chain.
+            unsafe {
+                self.owner
+                    .dispatch
+                    .reset_fences(&self.owner.device, &[fence])?;
+            }
+            // SAFETY: `command_buffer` is executable, since a `VulkanGraph` is only built by
+            // `end_graph` after `vkEndCommandBuffer` closed the last segment (and every earlier one was
+            // closed by the cut that opened its successor), and it is not pending: each segment is
+            // submitted once per replay and every submission of an earlier replay was waited out;
+            // `fence` was just reset. Every buffer and pipeline the command buffers reference is
+            // retained by `self`, and leaked with it if a submission is lost.
+            unsafe { self.owner.submit(queue, command_buffer, fence)? };
+            *submitted += 1;
+        }
+        Ok(())
+    }
+
+    /// Wait for the submissions still pending after `submitted` of this replay's segments were queued: the
+    /// last [`IN_FLIGHT_SUBMITS`] of them. Nothing is waited for once the device is poisoned: a lost
+    /// submission or a failed wait already reported, and waiting again would only outlast the bound once
+    /// more.
+    fn wait_pending(&self, submitted: usize) -> Result<(), RuntimeError> {
+        if self.owner.is_poisoned() {
+            return Ok(());
+        }
+        for index in submitted.saturating_sub(IN_FLIGHT_SUBMITS)..submitted {
+            // SAFETY: submission `index` of this replay was queued with `fences[index %
+            // IN_FLIGHT_SUBMITS]` and has not been waited yet (only earlier ones were); the caller holds
+            // the device's queue guard.
+            unsafe {
+                self.owner
+                    .wait_submission(self.fences[index % IN_FLIGHT_SUBMITS])?
+            };
+        }
+        Ok(())
+    }
+
     /// The first trapping kernel whose error word is nonzero.
     fn read_fault(&self, queue: &QueueGuard<'_>) -> Result<Option<KernelFault>, RuntimeError> {
         for trap in &self.traps {
@@ -409,7 +471,7 @@ impl Drop for GraphCore {
             return;
         }
         // SAFETY: no GPU work referencing this graph's objects can be in flight (every `replay()`
-        // fence-waits, and a failed wait poisoned the device, which returned above), so every object
+        // fence-waits every submission, and a failed wait poisoned the device, which returned above), so every object
         // below is safe to destroy, and command buffers still in the recording state (a dropped
         // `RecordingGraph`) may be freed with their pool. `owner` keeps the device alive through these
         // calls. `desc_pools` and the query pool go before `command_pool` (whose destruction frees the
@@ -417,9 +479,9 @@ impl Drop for GraphCore {
         // field-drop order, each buffer via its own `Drop`; the order against the destroys below does
         // not matter since nothing is pending.
         unsafe {
-            self.owner
-                .dispatch
-                .destroy_fence(&self.owner.device, self.fence);
+            for &fence in &self.fences {
+                self.owner.dispatch.destroy_fence(&self.owner.device, fence);
+            }
             for &pool in &self.desc_pools {
                 self.owner
                     .dispatch

@@ -1134,8 +1134,8 @@ pub(crate) fn is_decode_attn_gemv_in(
 }
 
 /// The most activation rows an `IndexedMatMul` runs as the Gemv (`M` rows are the `k` selected experts of a
-/// decode step, or a few such steps batched): above it the register-tiled expert walk shares each expert's weight
-/// tile across the rows that selected it.
+/// decode step, or a few such steps batched): above it `compile` groups the rows by expert and the tiled schedule
+/// shares each expert's weight tile across the rows that selected it.
 pub(crate) const INDEXED_GEMV_MAX_ROWS: usize = 32;
 
 /// The launch an `IndexedMatMul` of `m` rows and `n` columns runs as a [`kg::Schedule::Gemv`] on every backend, or

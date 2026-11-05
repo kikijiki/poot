@@ -67,6 +67,17 @@ pub enum Capability {
     ZeroElementE4m3,
     /// The packed E4M3FN dispatch size overflows the host's accounting.
     DispatchSizeOverflow,
+    /// An indexed contraction over rows grouped by expert in tiles of `block` positions, on a device whose cheapest
+    /// tiling of it has `tile_rows`-row output tiles (POOT-1451): a tile must be one bucket's.
+    GroupedTileRows {
+        /// The grouping's positions per tile.
+        block: usize,
+        /// The tiling's output tile rows.
+        tile_rows: usize,
+    },
+    /// An indexed contraction past the Gemv rows whose rows name their experts per row: the tiled schedule reads
+    /// rows grouped by expert, which the `group_expert_rows` pass forms (POOT-1451).
+    UngroupedExpertRows,
     /// The packed E4M3FN dispatch needs more x-workgroups than the target's grid allows.
     DispatchGridLimit {
         /// Threads the dispatch needs.
@@ -418,6 +429,13 @@ impl fmt::Display for Capability {
             Capability::DispatchSizeOverflow => {
                 f.write_str("the packed E4M3FN dispatch size overflows host accounting")
             }
+            Capability::GroupedTileRows { block, tile_rows } => write!(
+                f,
+                "no tiling runs rows grouped in tiles of {block} positions (the cheapest has {tile_rows}-row tiles)"
+            ),
+            Capability::UngroupedExpertRows => f.write_str(
+                "a tiled indexed contraction reads rows grouped by expert, not per-row expert ids",
+            ),
             Capability::DispatchGridLimit {
                 threads,
                 workgroups_x,

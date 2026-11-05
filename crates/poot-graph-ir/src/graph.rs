@@ -784,6 +784,10 @@ pub struct StatePolicy {
     pub rollback: bool,
     /// Whether one program writes the value for a later program of the same driver step to read.
     pub handoff: bool,
+    /// Whether every reader hides an entry past the committed length by position, so a new sequence
+    /// reuses the value's row without clearing it: clearing is work proportional to the capacity
+    /// where the sequence needs only its own positions.
+    pub stale_hidden: bool,
 }
 
 impl StateRole {
@@ -794,26 +798,31 @@ impl StateRole {
                 rows: StateRows::PoolSlots,
                 rollback: false,
                 handoff: false,
+                stale_hidden: true,
             },
             StateRole::Positional { .. } | StateRole::Blocked { .. } => StatePolicy {
                 rows: StateRows::StepRows,
                 rollback: false,
                 handoff: false,
+                stale_hidden: true,
             },
             StateRole::Recurrent => StatePolicy {
                 rows: StateRows::PoolSeqs,
                 rollback: true,
                 handoff: false,
+                stale_hidden: false,
             },
             StateRole::Handoff => StatePolicy {
                 rows: StateRows::PoolSeqs,
                 rollback: false,
                 handoff: true,
+                stale_hidden: false,
             },
             StateRole::Sampler => StatePolicy {
                 rows: StateRows::PoolSeqs,
                 rollback: false,
                 handoff: false,
+                stale_hidden: false,
             },
         }
     }

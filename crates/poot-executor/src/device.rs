@@ -335,8 +335,24 @@ pub trait Device {
         self.allocate(role, storage, elems)
     }
 
+    /// `buffer`'s bytes typed as `storage` (POOT-1450): a handle sharing `buffer`'s allocation (nothing is
+    /// allocated or counted in [`Self::memory`]) whose storage and capacity are the view's, so every check
+    /// the device runs on a bound handle (a dispatch's element schema, [`Self::buffer_elems`], a transfer)
+    /// reads the view. A typed buffer admits only its own storage; an untyped arena slot any device-encoded
+    /// storage in whole elements: [`BufferStorage::view_elems`], the one rule every device applies to its
+    /// own record of the buffer. The engine binds every arena value through one.
+    ///
+    /// # Errors
+    ///
+    /// The device's error for a view [`BufferStorage::view_elems`] refuses.
+    fn view(
+        &self,
+        buffer: &Self::Buffer,
+        storage: BufferStorage,
+    ) -> Result<Self::Buffer, Self::Error>;
+
     /// The number of native elements `buffer` holds: its allocated capacity, in units of the element kind it
-    /// was allocated with (what [`Arg::elems`] counts). The engine refuses a dispatch whose asserted
+    /// was allocated with, or of a view's storage (what [`Arg::elems`] counts). The engine refuses a dispatch whose asserted
     /// length exceeds it before any device sees the dispatch ([`crate::DispatchError::ArgExceedsBuffer`]),
     /// so a kernel may trust the lengths it is handed.
     fn buffer_elems(&self, buffer: &Self::Buffer) -> usize;

@@ -90,6 +90,9 @@ const REGION_LIMITS: RegionLimits = RegionLimits {
 /// Why a [`XdnaDevice`] call failed. Every refusal that does not need XRT is raised before XRT is touched.
 #[derive(Debug, thiserror::Error)]
 pub enum XdnaError {
+    /// A buffer refused a typed view (POOT-1450, [`poot_target::BufferStorage::view_elems`]).
+    #[error("view refused: {0}")]
+    View(#[from] poot_target::ViewError),
     /// XRT failed: opening the device, allocating, syncing, loading or running.
     #[error("XRT {operation}: {source}")]
     Xrt {
@@ -215,14 +218,14 @@ fn xrt(operation: &'static str) -> impl FnOnce(XrtError) -> XdnaError {
 /// the buffer.
 struct BufferCell {
     bo: XrtBo,
-    storage: BufferStorage,
     _charge: AllocGuard,
 }
 
 /// A buffer of the XDNA device. Cloning shares the buffer object: a recording holds clones of the buffers
 /// its dispatches name, so the buffer outlives the engine's own handle for as long as a replay can run.
+/// The second field is the storage this handle records: the allocation's or a typed view's (POOT-1450).
 #[derive(Clone)]
-pub struct XdnaBuffer(Rc<BufferCell>);
+pub struct XdnaBuffer(Rc<BufferCell>, BufferStorage);
 
 impl XdnaBuffer {
     fn bytes(&self) -> usize {
@@ -558,15 +561,23 @@ impl Device for XdnaDevice {
         })?;
         let bo = self.device.alloc(bytes).map_err(xrt("bo alloc"))?;
         let charge = self.counters.record_alloc(role, bytes as u64);
-        Ok(XdnaBuffer(Rc::new(BufferCell {
-            bo,
+        Ok(XdnaBuffer(
+            Rc::new(BufferCell {
+                bo,
+                _charge: charge,
+            }),
             storage,
-            _charge: charge,
-        })))
+        ))
+    }
+
+    fn view(&self, buffer: &XdnaBuffer, storage: BufferStorage) -> Result<XdnaBuffer, XdnaError> {
+        let elems = self.buffer_elems(buffer);
+        buffer.1.view_elems(elems, storage)?;
+        Ok(XdnaBuffer(Rc::clone(&buffer.0), storage))
     }
 
     fn buffer_elems(&self, buffer: &XdnaBuffer) -> usize {
-        buffer.bytes() / buffer.0.storage.element().byte_width()
+        buffer.bytes() / buffer.1.element().byte_width()
     }
 
     fn load_kernel(&mut self, key: &str, kernel: CompiledKernel) -> Result<XdnaKernel, XdnaError> {
@@ -851,10 +862,10 @@ fn check_bindings(kernel: &LoadedKernel, args: &[&Arg<'_, XdnaDevice>]) -> Resul
         )));
     }
     for (index, (arg, binding)) in args.iter().zip(&kernel.bindings).enumerate() {
-        if arg.buffer.0.storage != binding.storage {
+        if arg.buffer.1 != binding.storage {
             return Err(refuse(format!(
                 "binding {index} is {:?}, the bound buffer is {:?}",
-                binding.storage, arg.buffer.0.storage
+                binding.storage, arg.buffer.1
             )));
         }
         if arg.elems as u64 != binding.elements {

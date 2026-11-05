@@ -360,6 +360,28 @@ impl FusedRegion {
         })
     }
 
+    /// The two-byte float the region's result is narrowed to by its last step (POOT-1448): a `Cast` to `BF16` or
+    /// `F16` of the region's f32 result, which [`Self::narrowing_output`] appends so that the kernel computing the
+    /// value rounds it once and stores it narrow. `None` for a region whose output is not that last step.
+    pub fn narrowed_output(&self) -> Option<DType> {
+        let last = self.steps.last()?;
+        if !self.pack.is_empty() || self.output.index() != self.n_inputs + self.steps.len() - 1 {
+            return None;
+        }
+        narrowing_cast(last.op)
+    }
+
+    /// This region with its result narrowed to `to` (`BF16` or `F16`) by a final `Cast` step
+    /// ([`Self::narrowed_output`]).
+    pub fn narrowing_output(mut self, to: DType) -> Self {
+        self.steps.push(FusedStep {
+            op: FusedOp::Cast { to },
+            inputs: vec![FusedOperand::Local(self.output)],
+        });
+        self.output = LocalId::new(self.n_inputs + self.steps.len() - 1);
+        self
+    }
+
     /// The type of every local, threading the input types through the steps: the `n_inputs` external inputs
     /// first (`ins`, in order), then each step's result. Mirrors how the un-fused chain would infer.
     #[deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -515,6 +537,27 @@ impl RowRegion {
         })
     }
 
+    /// The two-byte float the region's result is narrowed to by its last step, as [`FusedRegion::narrowed_output`].
+    pub fn narrowed_output(&self) -> Option<DType> {
+        let RowStep::Pointwise { op, .. } = self.steps.last()? else {
+            return None;
+        };
+        if self.output.index() != self.n_inputs + self.steps.len() - 1 {
+            return None;
+        }
+        narrowing_cast(*op)
+    }
+
+    /// This region with its result narrowed to `to` by a final `Cast` step, as [`FusedRegion::narrowing_output`].
+    pub fn narrowing_output(mut self, to: DType) -> Self {
+        self.steps.push(RowStep::Pointwise {
+            op: FusedOp::Cast { to },
+            inputs: vec![FusedOperand::Local(self.output)],
+        });
+        self.output = LocalId::new(self.n_inputs + self.steps.len() - 1);
+        self
+    }
+
     /// The output type, threading input types through the steps (the un-fused chain's inference).
     #[deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
     pub fn infer(&self, ins: &[TensorType]) -> Result<TensorType, ShapeError> {
@@ -584,10 +627,114 @@ pub enum ContractionRows {
     Indexed {
         /// The number of experts stacked in the table; row ids index `0..experts`.
         experts: usize,
+        /// How each row names its expert: the ids, or an [`OpKind::ExpertGroup`] grouping of them.
+        rows: ExpertRows,
     },
 }
 
+/// How the rows of an indexed contraction ([`OpKind::IndexedMatMul`], [`ContractionRows::Indexed`]) name the expert
+/// they read: the operand after the activation (and, for a dense stack, the weight) is either the per-row ids or
+/// their block-aligned grouping (POOT-1451).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum ExpertRows {
+    /// `ids [M]` (I32): row `m` reads expert `ids[m]`.
+    #[default]
+    PerRow,
+    /// An [`OpKind::ExpertGroup`] value of the same `experts` and `block`: row `r` reads the expert of the tile its
+    /// padded position is in, and the result is in row order ([`ExpertGrouping`] has the layout). A compile pass
+    /// forms it for a contraction the planner tiles, so every tile reads one expert's weight.
+    Grouped {
+        /// The positions of one tile: the output tile rows of the contraction's tiling.
+        block: usize,
+    },
+}
+
+impl ExpertRows {
+    /// The length of the expert operand of `rows` rows over `experts` experts: `rows` ids, or the grouping's words.
+    ///
+    /// # Errors
+    /// [`ShapeError::ExpertGroup`] for a zero block.
+    pub fn operand_len(self, rows: usize, experts: usize) -> Result<usize, ShapeError> {
+        match self {
+            Self::PerRow => Ok(rows),
+            Self::Grouped { block: 0 } => Err(ShapeError::ExpertGroup {
+                experts,
+                block: 0,
+                ids: vec![rows],
+            }),
+            Self::Grouped { block } => Ok(ExpertGrouping {
+                rows,
+                experts,
+                block,
+            }
+            .len()),
+        }
+    }
+
+    /// The suffix an op's dump carries: none for per-row ids (the op's name says it all), ` grouped block=B`.
+    pub fn label(self) -> String {
+        match self {
+            Self::PerRow => String::new(),
+            Self::Grouped { block } => format!(" grouped block={block}"),
+        }
+    }
+}
+
+/// The layout of an [`OpKind::ExpertGroup`] value for `rows` rows over `experts` experts in tiles of `block`
+/// positions: `positions()` words of padded order (the rows of each bucket in row order, bucket `experts` holding the
+/// ids outside `0..experts`, each bucket's run padded with the sentinel `rows` to whole tiles, and every position past
+/// the last run the sentinel), then `tiles()` words, tile `t`'s bucket (`experts` for the invalid bucket and the
+/// empty tiles at the end).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExpertGrouping {
+    /// The rows grouped, `M`.
+    pub rows: usize,
+    /// The expert count `E`; `E + 1` buckets.
+    pub experts: usize,
+    /// Positions per tile.
+    pub block: usize,
+}
+
+impl ExpertGrouping {
+    /// The most tiles any ids can fill: each of at most `min(experts + 1, rows)` non-empty buckets pads at most
+    /// `block - 1` positions, and the padded total is a whole number of tiles.
+    pub const fn tiles(self) -> usize {
+        if self.block == 0 {
+            return 0;
+        }
+        let buckets = if self.experts + 1 < self.rows {
+            self.experts + 1
+        } else {
+            self.rows
+        };
+        (self.rows + buckets * (self.block - 1)) / self.block
+    }
+
+    /// The padded positions, `tiles() * block`.
+    pub const fn positions(self) -> usize {
+        self.tiles() * self.block
+    }
+
+    /// The words of the value: the padded order, then the tile buckets.
+    pub const fn len(self) -> usize {
+        self.positions() + self.tiles()
+    }
+
+    /// Whether the value has no words (no rows).
+    pub const fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+}
+
 impl ContractionRows {
+    /// A stacked table of `experts` whose rows name their experts by per-row ids.
+    pub const fn per_row(experts: usize) -> Self {
+        Self::Indexed {
+            experts,
+            rows: ExpertRows::PerRow,
+        }
+    }
+
     /// The operands before the carriers: the activation, and the row ids for an indexed table.
     pub const fn leading_operands(self) -> usize {
         match self {
@@ -676,6 +823,7 @@ impl OpKind {
     /// An indexed matmul over exact operands.
     pub const fn indexed_matmul() -> Self {
         OpKind::IndexedMatMul {
+            rows: ExpertRows::PerRow,
             precision: OperandPrecision::Exact,
         }
     }
@@ -688,7 +836,7 @@ impl OpKind {
             | OpKind::PackedContraction { precision, .. }
             | OpKind::DenseContraction { precision, .. }
             | OpKind::GroupedDenseContraction { precision, .. }
-            | OpKind::IndexedMatMul { precision } => Some(*precision),
+            | OpKind::IndexedMatMul { precision, .. } => Some(*precision),
             OpKind::ContractionEpilogue { head, .. } => Some(head.precision()),
             OpKind::Attention(attrs) => Some(attrs.precision),
             OpKind::SelectedAttention(attrs) => Some(attrs.precision),
@@ -705,7 +853,7 @@ impl OpKind {
             | OpKind::PackedContraction { precision: p, .. }
             | OpKind::DenseContraction { precision: p, .. }
             | OpKind::GroupedDenseContraction { precision: p, .. }
-            | OpKind::IndexedMatMul { precision: p } => *p = precision,
+            | OpKind::IndexedMatMul { precision: p, .. } => *p = precision,
             OpKind::ContractionEpilogue { head, .. } => *head = head.with_precision(precision),
             OpKind::Attention(attrs) => attrs.precision = precision,
             OpKind::SelectedAttention(attrs) => attrs.precision = precision,
@@ -745,6 +893,8 @@ pub enum ContractionHead {
     /// [`OpKind::IndexedMatMul`] over an activation `x [M, K]`, a stacked weight `W [E, K, N]` and the per-row
     /// expert ids `idx [M]`: a routed expert matmul followed by its gate weighting.
     Indexed {
+        /// How each row names its expert.
+        rows: ExpertRows,
         /// How the activation and the weight are read.
         precision: OperandPrecision,
     },
@@ -768,7 +918,7 @@ impl ContractionHead {
         match self {
             Self::MatMul { precision } => OpKind::matmul().with_operand_precision(precision),
             Self::Dense { weight, precision } => OpKind::DenseContraction { weight, precision },
-            Self::Indexed { precision } => OpKind::IndexedMatMul { precision },
+            Self::Indexed { rows, precision } => OpKind::IndexedMatMul { rows, precision },
             Self::Packed {
                 descriptor,
                 rows,
@@ -787,7 +937,7 @@ impl ContractionHead {
             Self::MatMul { precision }
             | Self::Dense { precision, .. }
             | Self::Packed { precision, .. }
-            | Self::Indexed { precision } => precision,
+            | Self::Indexed { precision, .. } => precision,
         }
     }
 
@@ -804,7 +954,7 @@ impl ContractionHead {
                 rows,
                 precision,
             },
-            Self::Indexed { .. } => Self::Indexed { precision },
+            Self::Indexed { rows, .. } => Self::Indexed { rows, precision },
         }
     }
 }
@@ -1053,6 +1203,8 @@ pub enum OpKind {
     /// Compiler-only replacement for an activation matmul against a dense weight (BF16, F32 or F16) held in checkpoint
     /// `[N, K]` order: `out[.., m, n] = sum over k of activation[.., m, k] * decode(weight[n, k])`. Inputs are the
     /// activation `[.., M, K]` (F32) and the weight `[N, K]` (`weight` dtype); the output is `[.., M, N]` F32.
+    /// Under a narrowed precision the activation may also be stored in its fragment dtype (POOT-1448,
+    /// [`OperandPrecision::stored_activation`]): the products read it unrounded, so they are the same.
     ///
     /// Card 380. Builders do not expose it; like [`OpKind::PackedContraction`], it exists so a recognizer can fold
     /// `MatMul(a, Transpose([1, 0], w))` into one equation that reads the weight in checkpoint order
@@ -1159,18 +1311,26 @@ pub enum OpKind {
     /// per-row; the kernel reads the selected expert's rows in-kernel through `ContractionSpec::Indexed`). An id
     /// outside `0..E` is a typed oracle error and a NaN output row on every device.
     IndexedMatMul {
+        /// How each row names its expert: the `idx [M]` operand above ([`ExpertRows::PerRow`]), or an
+        /// [`OpKind::ExpertGroup`] grouping in its place ([`ExpertRows::Grouped`], compiler-formed, POOT-1451).
+        rows: ExpertRows,
         /// How the activation and the stacked weight are read (POOT-1430).
         precision: OperandPrecision,
     },
-    /// The permutation that groups MoE rows by expert: `ids [M]` (I32, the per-row expert ids of an
-    /// [`OpKind::IndexedMatMul`]) to `[2, M]` I32, where row 0 is `order` (`order[r]` is the row sorted position `r`
-    /// holds) and row 1 is `dest` (`dest[m]` is the sorted position of row `m`, the inverse permutation). Rows sort by
-    /// expert ascending and by row index within an expert (stable). A row whose id is outside `0..experts` sorts
-    /// after every expert, so both rows stay permutations of `0..M`: a bad id is carried to the contraction that
-    /// fails it closed (a NaN row), never dropped or routed to another expert. `experts` is a trace-time constant.
+    /// The block-aligned grouping of MoE rows by expert (POOT-1451, vLLM's `moe_align_block_size`): `ids [M]`
+    /// (I32, the per-row expert ids of an indexed contraction) to the I32 vector [`ExpertGrouping`] lays out, the
+    /// padded order (bucket by bucket, each bucket's rows in row order and its run padded with the sentinel `M` to
+    /// whole tiles of `block` positions) and then each tile's bucket. A row whose id is outside `0..experts` falls
+    /// in bucket `experts`, after every expert, whose tiles name no expert: the contraction that reads the grouping
+    /// fails those rows closed (NaN), never drops or reroutes them.
+    ///
+    /// Compiler-only: the `group_expert_rows` pass forms it, with the block the planner's tiling of the
+    /// contractions that read it wants, for a contraction the planner tiles ([`ExpertRows::Grouped`]).
     ExpertGroup {
         /// The expert count; ids in `0..experts` are valid.
         experts: usize,
+        /// Positions per tile.
+        block: usize,
     },
     /// Write `update` (input 1) into a copy of `operand` (input 0) starting at the scalar index `index` (input 2)
     /// along `axis`, leaving the rest unchanged (XLA DynamicUpdateSlice, single axis). The KV-cache slot write:
@@ -1326,6 +1486,23 @@ fn reject_non_arithmetic(op: &'static str, dtype: DType) -> Result<(), ShapeErro
         DTypeClass::StorageOnly | DTypeClass::Packed => Err(ShapeError::DtypeOp { op, dtype }),
         DTypeClass::Arithmetic | DTypeClass::Index => Ok(()),
     }
+}
+
+/// The two-byte float a region step narrows to, if it is a `Cast` to one.
+fn narrowing_cast(op: FusedOp) -> Option<DType> {
+    match op {
+        FusedOp::Cast {
+            to: to @ (DType::BF16 | DType::F16),
+        } => Some(to),
+        _ => None,
+    }
+}
+
+/// Whether a dense contraction read at `precision` takes an activation of `dtype`: f32, or the fragment dtype of a
+/// narrowed read (POOT-1448: [`OperandPrecision::stored_activation`], a value the planner stores narrow because every
+/// reader narrows it).
+fn admits_activation(precision: OperandPrecision, dtype: DType) -> bool {
+    dtype == DType::F32 || precision.stored_activation() == Some(dtype)
 }
 
 /// Card 529 (R466-010), POOT-725: reject an index-role operand (`Gather`'s index,
@@ -1717,16 +1894,22 @@ impl OpKind {
                 *extent = *k;
                 Ok(TensorType::new(shape, DType::I32))
             }
-            OpKind::ExpertGroup { experts } => {
+            OpKind::ExpertGroup { experts, block } => {
                 arity(ins, 1)?;
                 check_index_dtype("ExpertGroup", ins[0].dtype)?;
-                if ins[0].rank() != 1 || *experts == 0 {
+                if ins[0].rank() != 1 || *experts == 0 || *block == 0 {
                     return Err(ShapeError::ExpertGroup {
                         experts: *experts,
+                        block: *block,
                         ids: ins[0].shape.clone(),
                     });
                 }
-                Ok(TensorType::new(vec![2, ins[0].shape[0]], DType::I32))
+                let grouping = ExpertGrouping {
+                    rows: ins[0].shape[0],
+                    experts: *experts,
+                    block: *block,
+                };
+                Ok(TensorType::new(vec![grouping.len()], DType::I32))
             }
             OpKind::ScatterUpdate => {
                 // base[POOL,..rest], src[N,..rest], slots[N] -> base's type. Source row t is written to
@@ -1873,7 +2056,7 @@ impl OpKind {
                         }
                         .infer(carriers)?;
                     }
-                    ContractionRows::Indexed { experts } => {
+                    ContractionRows::Indexed { experts, .. } => {
                         check_packed_stack(*descriptor, *experts, carriers)?;
                     }
                 }
@@ -1914,7 +2097,10 @@ impl OpKind {
                             Ok(TensorType::f32(vec![blocks, shape[1], block_out]))
                         }
                     }
-                    ContractionRows::Indexed { .. } => {
+                    ContractionRows::Indexed {
+                        experts,
+                        rows: expert_rows,
+                    } => {
                         let ids = &ins[1];
                         check_index_dtype("PackedContraction", ids.dtype)?;
                         let &[rows, activation_k] = activation.shape.as_slice() else {
@@ -1937,12 +2123,13 @@ impl OpKind {
                                 actual: ids.rank(),
                             });
                         };
-                        if ids_len != rows {
+                        let expected = expert_rows.operand_len(rows, experts)?;
+                        if ids_len != expected {
                             return Err(ShapeError::OperandDim {
                                 op: "PackedContraction",
                                 operand: "ids",
                                 dim: 0,
-                                expected: rows,
+                                expected,
                                 actual: ids_len,
                             });
                         }
@@ -1963,7 +2150,7 @@ impl OpKind {
                 shape.push(descriptor.shape()[1]);
                 Ok(TensorType::f32(shape))
             }
-            OpKind::DenseContraction { weight, .. } => {
+            OpKind::DenseContraction { weight, precision } => {
                 // activation [..,M,K] F32 x weight [N,K] (`weight` dtype) -> [..,M,N] F32. The weight is in checkpoint order,
                 // so its contraction axis is the last one, not the second to last.
                 arity(ins, 2)?;
@@ -1971,7 +2158,7 @@ impl OpKind {
                     return Err(ShapeError::DenseContractionWeightDtype { actual: *weight });
                 }
                 let (activation, source) = (&ins[0], &ins[1]);
-                if activation.dtype != DType::F32 {
+                if !admits_activation(*precision, activation.dtype) {
                     return Err(ShapeError::DenseContractionDtype {
                         operand: "activation",
                         actual: activation.dtype,
@@ -2005,14 +2192,18 @@ impl OpKind {
                 }
                 Ok(TensorType::f32(shape))
             }
-            OpKind::GroupedDenseContraction { weight, groups, .. } => {
+            OpKind::GroupedDenseContraction {
+                weight,
+                groups,
+                precision,
+            } => {
                 // activation [G, M, K] F32 x weight [G * N, K] (an arithmetic float) -> [G, M, N] F32.
                 arity(ins, 2)?;
                 if weight.class() != DTypeClass::Arithmetic {
                     return Err(ShapeError::DenseContractionWeightDtype { actual: *weight });
                 }
                 let (activation, source) = (&ins[0], &ins[1]);
-                if activation.dtype != DType::F32 {
+                if !admits_activation(*precision, activation.dtype) {
                     return Err(ShapeError::DenseContractionDtype {
                         operand: "activation",
                         actual: activation.dtype,
@@ -2102,8 +2293,9 @@ impl OpKind {
                 }
                 Ok(out)
             }
-            OpKind::IndexedMatMul { .. } => {
-                // x[M,K], W[E,K,N], idx[M] -> [M,N]. Each row m contracts x[m] against expert W[idx[m]].
+            OpKind::IndexedMatMul { rows, .. } => {
+                // x[M,K], W[E,K,N], idx[M] -> [M,N]. Each row m contracts x[m] against expert W[idx[m]] (or, grouped,
+                // the expert of its tile: idx is then the ExpertGroup value of the same E and block).
                 arity(ins, 3)?;
                 let (x, w, idx) = (&ins[0], &ins[1], &ins[2]);
                 check_index_dtype("IndexedMatMul", idx.dtype)?;
@@ -2124,7 +2316,7 @@ impl OpKind {
                 let &[m, k] = x.shape.as_slice() else {
                     return Err(rank_error("x", 2, x.rank()));
                 };
-                let &[_, w_k, n] = w.shape.as_slice() else {
+                let &[experts, w_k, n] = w.shape.as_slice() else {
                     return Err(rank_error("w", 3, w.rank()));
                 };
                 let &[idx_len] = idx.shape.as_slice() else {
@@ -2139,12 +2331,13 @@ impl OpKind {
                         actual: w_k,
                     });
                 }
-                if idx_len != m {
+                let expected = rows.operand_len(m, experts)?;
+                if idx_len != expected {
                     return Err(ShapeError::OperandDim {
                         op: "IndexedMatMul",
                         operand: "idx",
                         dim: 0,
-                        expected: m,
+                        expected,
                         actual: idx_len,
                     });
                 }
@@ -2480,7 +2673,9 @@ impl OpKind {
             OpKind::Iota { len, dtype } => format!("iota len={len} {dtype}"),
             OpKind::Gather { axis } => format!("gather ax={axis}"),
             OpKind::ArgTopK { k } => format!("arg_top_k k={k}"),
-            OpKind::ExpertGroup { experts } => format!("expert_group experts={experts}"),
+            OpKind::ExpertGroup { experts, block } => {
+                format!("expert_group experts={experts} block={block}")
+            }
             OpKind::ScatterUpdate => "scatter_update".to_string(),
             OpKind::MatMul { accumulate, .. } => match accumulate {
                 MatMulAccumulate::Operand => "matmul".to_string(),
@@ -2496,7 +2691,9 @@ impl OpKind {
                 match rows {
                     ContractionRows::Blocks(1) => base,
                     ContractionRows::Blocks(blocks) => format!("{base} blocks={blocks}"),
-                    ContractionRows::Indexed { experts } => format!("{base} experts={experts}"),
+                    ContractionRows::Indexed { experts, rows } => {
+                        format!("{base} experts={experts}{}", rows.label())
+                    }
                 }
             }
             OpKind::PackedRowGather { descriptor } => {
@@ -2515,12 +2712,14 @@ impl OpKind {
             OpKind::ContractionEpilogue { head, region } => format!(
                 "contraction_epilogue {} n_in={} steps={}",
                 format!("{:?}", head.with_precision(OperandPrecision::Exact))
+                    .replace(" { rows: PerRow, precision: Exact }", "")
+                    .replace(", rows: PerRow", "")
                     .replace(" { precision: Exact }", "")
                     .replace(", precision: Exact", ""),
                 region.n_inputs,
                 region.steps.len()
             ),
-            OpKind::IndexedMatMul { .. } => "indexed_matmul".to_string(),
+            OpKind::IndexedMatMul { rows, .. } => format!("indexed_matmul{}", rows.label()),
             OpKind::DynamicUpdateSlice { axis } => format!("dyn_update_slice ax={axis}"),
             OpKind::Fused(r) => format!("fused n_in={} steps={}", r.n_inputs, r.steps.len()),
             OpKind::FusedRow(r) => format!("fused_row n_in={} steps={}", r.n_inputs, r.steps.len()),
@@ -4218,7 +4417,7 @@ mod tests {
         let stacked = TensorType::new(vec![experts, slab], DType::I8);
         let operation = OpKind::PackedContraction {
             descriptor,
-            rows: ContractionRows::Indexed { experts },
+            rows: ContractionRows::per_row(experts),
             precision: crate::precision::OperandPrecision::Exact,
         };
         let x = TensorType::f32(vec![5, 32]);
@@ -4261,7 +4460,7 @@ mod tests {
         assert_eq!(
             OpKind::PackedContraction {
                 descriptor,
-                rows: ContractionRows::Indexed { experts: 0 },
+                rows: ContractionRows::per_row(0),
                 precision: crate::precision::OperandPrecision::Exact
             }
             .infer(&[x, ids, stacked]),
@@ -5642,7 +5841,10 @@ mod tests {
                     accumulate.hash(h);
                     precision.hash(h);
                 }
-                OpKind::IndexedMatMul { precision } => precision.hash(h),
+                OpKind::IndexedMatMul { rows, precision } => {
+                    rows.hash(h);
+                    precision.hash(h);
+                }
                 OpKind::Select | OpKind::ScatterUpdate => {} // no params beyond the discriminant already hashed
                 OpKind::ContractionEpilogue { head, region } => {
                     head.hash(h);
@@ -5680,7 +5882,10 @@ mod tests {
                 }
                 OpKind::DenseRowGather { source } => source.hash(h),
                 OpKind::ArgTopK { k } => k.hash(h),
-                OpKind::ExpertGroup { experts } => experts.hash(h),
+                OpKind::ExpertGroup { experts, block } => {
+                    experts.hash(h);
+                    block.hash(h);
+                }
                 OpKind::DynamicUpdateSlice { axis } => axis.hash(h),
                 OpKind::Fused(region) => {
                     region.n_inputs.hash(h);

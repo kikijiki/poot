@@ -6,7 +6,7 @@
 //! itself and not only agreement with `eval`.
 
 use poot_eval::test_support::StepFixture;
-use poot_graph_ir::{Builder, Graph, TensorType, ops};
+use poot_graph_ir::{Builder, ExpertGrouping, Graph, TensorType, ops};
 use poot_tensor::HostTensor;
 
 use poot_eval::test_support::weight_map_oracle::oracle_for;
@@ -199,24 +199,27 @@ fn ids_fixture(
     }
 }
 
-/// One expert-grouping case: `ids [rows]` through `ExpertGroup`, whose `[2, rows]` output is the sorted order and
-/// its inverse.
+/// One expert-grouping case: `ids [rows]` through `ExpertGroup` in tiles of `block`, whose output is the
+/// [`ExpertGrouping`] layout (POOT-1451).
 pub struct ExpertGroupCase {
     /// The grouping program over the ids.
     pub fixture: Fixture,
-    /// The `[2, rows]` output the device must produce, row-major: the stable order by expert, then each row's
-    /// sorted position. Derived here by a stable sort, not by the oracle.
+    /// The positions per tile.
+    pub block: usize,
+    /// The output the device must produce: the padded order, then each tile's bucket. Derived here bucket by
+    /// bucket, not by the oracle.
     pub expected: Vec<i32>,
 }
 
-/// The routings that break a naive grouping: every row on one expert, experts without rows, tied rows
-/// (a repeated expert keeps its row order), ids outside the table (sorted after every expert, never dropped), a
-/// length that leaves a partial last workgroup of rows, and more experts than rows.
+/// The routings that break a naive grouping, each at every [`GROUPING_BLOCKS`] size: every row on one expert,
+/// experts without rows, tied rows (a repeated expert keeps its row order), ids outside the table (in the last
+/// bucket, never dropped), a length that leaves partial tiles, more experts than rows, and more buckets than the
+/// grouping kernel's lanes.
 pub fn expert_group_cases() -> Vec<ExpertGroupCase> {
     let cycle = |rows: usize, experts: i32| -> Vec<i32> {
         (0..rows as i32).map(|r| (r * 5 + 3) % experts).collect()
     };
-    vec![
+    let cases = [
         expert_group_case("expert_group_one_expert", vec![2; 37], 4),
         expert_group_case(
             "expert_group_empty_experts",
@@ -231,50 +234,78 @@ pub fn expert_group_cases() -> Vec<ExpertGroupCase> {
             vec![2, -1, 0, 4, i32::MIN, 1, i32::MAX, 0, 1_000_000_000, 3, -7],
             4,
         ),
-    ]
+        expert_group_case("expert_group_more_buckets_than_lanes", cycle(700, 300), 300),
+    ];
+    cases.into_iter().flatten().collect()
 }
 
-fn expert_group_case(name: &'static str, ids: Vec<i32>, experts: usize) -> ExpertGroupCase {
+/// The tile sizes every grouping case runs at: one row a tile, a few, and a fragment tile's 16.
+const GROUPING_BLOCKS: [usize; 3] = [1, 4, 16];
+
+/// The block-aligned grouping of `ids` over `experts` in tiles of `block` ([`ExpertGrouping`]), built bucket by
+/// bucket: each bucket's rows in row order, padded with the sentinel `rows` to whole tiles, then each tile's bucket.
+fn grouping_layout(ids: &[i32], experts: usize, block: usize) -> Vec<i32> {
+    let layout = ExpertGrouping {
+        rows: ids.len(),
+        experts,
+        block,
+    };
     let bucket = |id: i32| {
         usize::try_from(id)
             .ok()
             .filter(|&e| e < experts)
             .unwrap_or(experts)
     };
-    let mut order: Vec<usize> = (0..ids.len()).collect();
-    order.sort_by_key(|&row| bucket(ids[row]));
-    let mut dest = vec![0i32; ids.len()];
-    for (position, &row) in order.iter().enumerate() {
-        dest[row] = position as i32;
+    let (mut order, mut tiles) = (Vec::new(), Vec::new());
+    for b in 0..=experts {
+        let rows: Vec<i32> = (0..ids.len())
+            .filter(|&r| bucket(ids[r]) == b)
+            .map(|r| r as i32)
+            .collect();
+        for chunk in rows.chunks(block) {
+            order.extend_from_slice(chunk);
+            order.resize(order.len() + block - chunk.len(), ids.len() as i32);
+            tiles.push(b as i32);
+        }
     }
-    let expected = order
+    order.resize(layout.positions(), ids.len() as i32);
+    tiles.resize(layout.tiles(), experts as i32);
+    order.extend(tiles);
+    order
+}
+
+fn expert_group_case(name: &'static str, ids: Vec<i32>, experts: usize) -> Vec<ExpertGroupCase> {
+    GROUPING_BLOCKS
         .into_iter()
-        .map(|row| row as i32)
-        .chain(dest)
-        .collect();
-
-    let b = Builder::for_tests();
-    let ids_in = ids_slot(&b, ids.len(), None);
-    let out = b.expert_group(ids_in, experts).unwrap();
-    let graph = b.finish(out).unwrap();
-    ExpertGroupCase {
-        fixture: ids_fixture(name, graph, ids_in, Vec::new(), ids),
-        expected,
-    }
+        .map(|block| {
+            let b = Builder::for_tests();
+            let ids_in = ids_slot(&b, ids.len(), None);
+            let out = b.expert_group(ids_in, experts, block).unwrap();
+            let graph = b.finish(out).unwrap();
+            ExpertGroupCase {
+                fixture: ids_fixture(name, graph, ids_in, Vec::new(), ids.clone()),
+                block,
+                expected: grouping_layout(&ids, experts, block),
+            }
+        })
+        .collect()
 }
 
-/// One routed-contraction case: the indexed contraction of `rows` activation rows through their expert ids, run
-/// twice in one program, directly and through the expert grouping (rows gathered into expert order, contracted,
-/// gathered back). The `[rows, 2 * N]` output is the direct result, then the grouped one.
+/// One routed-contraction case: the indexed contraction of `rows` activation rows through their expert ids, more
+/// rows than a Gemv serves, so `compile` groups them by expert (`group_expert_rows`) and the device runs the tiled
+/// contraction over the grouping. The `[rows, N]` output is in row order.
 pub struct GroupedContractionCase {
-    /// The program holding both contractions.
+    /// The program holding the contraction.
     pub fixture: Fixture,
-    /// The output columns of one contraction (`N`).
+    /// The output columns (`N`).
     pub n: usize,
+    /// Each row's own product `x[r] . W[ids[r]]`, `[rows, N]` row-major, summed here (the operands are small
+    /// multiples of a quarter, so every summation order gives these bits).
+    pub expected: Vec<f32>,
 }
 
-/// More rows than a Gemv serves (so the register-tiled expert walk runs on every device), over routings where a tile
-/// holds one expert, many, or none of an expert.
+/// More rows than a Gemv serves (so every device runs the tiled contraction over the rows' grouping), over routings
+/// where a tile holds one expert's rows, one expert takes every row, or experts take none.
 pub fn grouped_contraction_cases() -> Vec<GroupedContractionCase> {
     const EXPERTS: usize = 8;
     let rows = 100usize;
@@ -290,6 +321,116 @@ pub fn grouped_contraction_cases() -> Vec<GroupedContractionCase> {
     ]
 }
 
+/// A routed prefill projection under the narrow policy (POOT-1451): 512 rows over 8 experts of a checkpoint-order
+/// BF16 `[E, N, K]` stack read through its transposed view. `compile` groups the rows once, the tiling's tile rows
+/// are the grouping's block (every tile one expert's rows), and on a matrix unit that takes BF16 the tile is the
+/// fragment one; the output is each row's own product, bit for bit. The operands are integers in `[-3, 3]`, exact in BF16 and F16, and every partial sum is an
+/// exact integer, so the narrowing changes nothing and every accumulation order gives the expected bits.
+pub fn assert_grouped_fragment_contraction_on_device(exec: &mut dyn Executor, target: Target) {
+    const EXPERTS: usize = 8;
+    let (rows, k, n) = (512usize, 64usize, 48usize);
+    let ids: Vec<i32> = (0..rows as i32)
+        .map(|r| (r * 5 + 3) % 7 + (r % 3 == 0) as i32)
+        .collect();
+    let int = |seed: usize, count: usize| -> Vec<f32> {
+        (0..count)
+            .map(|i| ((i * 7 + seed * 3) % 7) as f32 - 3.0)
+            .collect()
+    };
+    let (x_data, w_data) = (int(1, rows * k), int(2, EXPERTS * n * k));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![rows, k])).unwrap();
+    let stack = b
+        .constant(
+            "w",
+            TensorType::new(vec![EXPERTS, n, k], poot_tensor::DType::BF16),
+        )
+        .unwrap();
+    let ids_in = ids_slot(&b, rows, Some(EXPERTS));
+    let out = b
+        .indexed_matmul(x, b.transpose(stack, vec![0, 2, 1]).unwrap(), ids_in)
+        .unwrap();
+    let graph = b.finish(out).unwrap();
+    let words: Vec<u16> = w_data.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+    let fixture = ids_fixture(
+        "grouped_fragment_bf16",
+        graph,
+        ids_in,
+        vec![
+            ("x", HostTensor::f32(vec![rows, k], x_data.clone())),
+            ("w", HostTensor::bf16(vec![EXPERTS, n, k], words)),
+        ],
+        ids.clone(),
+    );
+    let policy = poot_graph_ir::MatmulPrecision::Narrow;
+    // A matrix unit that takes the stack's BF16 (ROCm WMMA, NVPTX `wmma`) runs the fragment tile; an F16-only one
+    // (a Vulkan cooperative matrix) leaves the tiling to the cost model.
+    let bf16_units = match target {
+        Target::Gpu { caps, .. } => caps
+            .matrix_units
+            .known()
+            .is_some_and(|units| units.config(poot_graph_ir::FragmentDtype::Bf16).is_some()),
+        Target::Npu(_) => false,
+    };
+    let program = crate::staged_under(exec, &fixture, target, policy);
+    let (_, _, stage) = program.stages().next().expect("one stage");
+    let blocks: Vec<usize> = stage
+        .planned()
+        .filter_map(|(eqn, _)| match eqn.op {
+            poot_graph_ir::OpKind::ExpertGroup { block, .. } => Some(block),
+            _ => None,
+        })
+        .collect();
+    let schedules: Vec<poot_kernelgen::Schedule> = stage
+        .planned()
+        .filter_map(|(eqn, _)| match stage.kernel_choice(eqn) {
+            poot_graph_plan::KernelChoice::Generated(
+                poot_kernelgen::KernelRequest::Contraction(
+                    poot_kernelgen::ContractionSpec::Indexed(request),
+                ),
+            ) => Some(request.schedule),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(schedules.len(), 1, "one indexed contraction: {schedules:?}");
+    assert_eq!(
+        blocks,
+        [schedules[0].output_tile().expect("a tiled schedule").0],
+        "one grouping, its block the tiling's tile rows: {schedules:?}"
+    );
+    if bf16_units {
+        assert!(
+            matches!(schedules[0], poot_kernelgen::Schedule::FragmentTiled { .. }),
+            "the grouped rows run the fragment tile on a BF16 matrix unit: {schedules:?}"
+        );
+    }
+    let expected: Vec<f32> = (0..rows)
+        .flat_map(|row| {
+            let (x, w, e) = (&x_data, &w_data, ids[row] as usize);
+            (0..n).map(move |col| {
+                (0..k)
+                    .map(|kk| x[row * k + kk] * w[(e * n + col) * k + kk])
+                    .sum::<f32>()
+            })
+        })
+        .collect();
+    let outputs =
+        crate::run_outputs_under(exec, target, &fixture, policy).unwrap_or_else(|e| panic!("{e}"));
+    for (step, got) in outputs.iter().enumerate() {
+        let got = got.as_f32().expect("the contraction output is F32");
+        if let Some(at) = (0..got.len()).find(|&i| got[i].to_bits() != expected[i].to_bits()) {
+            panic!(
+                "step {step}: row {} col {} (expert {}) is {} on the device, {} its expert's product",
+                at / n,
+                at % n,
+                ids[at / n],
+                got[at],
+                expected[at]
+            );
+        }
+    }
+}
+
 fn grouped_contraction_case(
     name: &'static str,
     ids: Vec<i32>,
@@ -302,26 +443,21 @@ fn grouped_contraction_case(
         .constant("w", TensorType::f32(vec![experts, k, n]))
         .unwrap();
     let ids_in = ids_slot(&b, rows, Some(experts));
-    let direct = b.indexed_matmul(x, w, ids_in).unwrap();
-    let group = b.expert_group(ids_in, experts).unwrap();
-    let row_of = |i| {
-        b.reshape(b.slice(group, 0, i, i + 1).unwrap(), vec![rows])
-            .unwrap()
-    };
-    let (order, dest) = (row_of(0), row_of(1));
-    let sorted = b
-        .indexed_matmul(
-            b.gather(x, 0, order).unwrap(),
-            w,
-            b.gather(ids_in, 0, order).unwrap(),
-        )
-        .unwrap();
-    let grouped = b.gather(sorted, 0, dest).unwrap();
-    let out = b.concat(1, &[direct, grouped]).unwrap();
+    let out = b.indexed_matmul(x, w, ids_in).unwrap();
     let graph = b.finish(out).unwrap();
     let x_data: Vec<f32> = (0..rows * k).map(|i| ((i * 7) % 11) as f32 - 5.0).collect();
     let w_data: Vec<f32> = (0..experts * k * n)
         .map(|i| ((i * 13) % 9) as f32 * 0.25 - 1.0)
+        .collect();
+    let expected = (0..rows)
+        .flat_map(|row| {
+            let (x, w, expert) = (&x_data, &w_data, ids[row] as usize);
+            (0..n).map(move |col| {
+                (0..k)
+                    .map(|kk| x[row * k + kk] * w[(expert * k + kk) * n + col])
+                    .sum::<f32>()
+            })
+        })
         .collect();
     GroupedContractionCase {
         fixture: ids_fixture(
@@ -335,30 +471,30 @@ fn grouped_contraction_case(
             ids,
         ),
         n,
+        expected,
     }
 }
 
-/// Assert the two halves of a grouped-contraction output (`[rows, 2 * n]`) are bit-identical row by row: grouping
-/// changes no row's dot product.
-pub fn assert_grouping_changes_no_row(case: &GroupedContractionCase, got: &HostTensor) {
+/// Assert a grouped-contraction output (`[rows, N]`) is each row's own product, bit for bit: the grouping drops,
+/// moves and reroutes no row.
+pub fn assert_every_row_is_its_experts_product(case: &GroupedContractionCase, got: &HostTensor) {
     let name = case.fixture.name;
-    let width = 2 * case.n;
     let values = got.as_f32().expect("the contraction output is F32");
-    for (row, pair) in values.chunks(width).enumerate() {
-        let (direct, grouped) = pair.split_at(case.n);
-        for (col, (d, g)) in direct.iter().zip(grouped).enumerate() {
-            assert_eq!(
-                d.to_bits(),
-                g.to_bits(),
-                "{name} row {row} col {col}: direct {d} vs grouped {g}"
-            );
-        }
+    assert_eq!(values.len(), case.expected.len(), "{name}");
+    for (at, (g, want)) in values.iter().zip(&case.expected).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            want.to_bits(),
+            "{name} row {} col {}: device {g} vs its expert's product {want}",
+            at / case.n,
+            at % case.n
+        );
     }
 }
 
 /// The expert grouping on a device, over [`expert_group_cases`] and [`grouped_contraction_cases`]: the grouping
-/// equals a stable sort derived here and the oracle at every replayed step; a contraction through the grouping is
-/// bit-identical per row to the direct one and equals the oracle. (An id outside the table never reaches a compiled
+/// equals the layout derived here and the oracle at every replayed step; a contraction `compile` groups writes every
+/// row's own product in row order and equals the oracle. (An id outside the table never reaches a compiled
 /// contraction: `compile` refuses ids it cannot prove in range, so the invalid-id contraction is covered on the
 /// kernel interpreter, `poot-kernelgen/tests/expert_group_interp.rs`.)
 pub fn assert_expert_grouping_on_device(exec: &mut dyn Executor, target: Target) {
@@ -370,7 +506,8 @@ pub fn assert_expert_grouping_on_device(exec: &mut dyn Executor, target: Target)
             assert_eq!(
                 got.as_i32().expect("the grouping is I32"),
                 case.expected.as_slice(),
-                "{name} step {step}: the order and its inverse differ from a stable sort by expert"
+                "{name} block {} step {step}: the grouping differs from the layout",
+                case.block
             );
         }
         let mut oracle = oracle_for(&case.fixture.graph, &case.fixture.store);
@@ -382,7 +519,7 @@ pub fn assert_expert_grouping_on_device(exec: &mut dyn Executor, target: Target)
         let outputs =
             crate::run_outputs(exec, target, &case.fixture).unwrap_or_else(|e| panic!("{e}"));
         for got in &outputs {
-            assert_grouping_changes_no_row(&case, got);
+            assert_every_row_is_its_experts_product(&case, got);
         }
         let mut oracle = oracle_for(&case.fixture.graph, &case.fixture.store);
         crate::run_parity(exec, target, &case.fixture, &mut oracle)

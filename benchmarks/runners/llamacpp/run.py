@@ -28,6 +28,56 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+# The memory llama.cpp itself allocates is on its log, one line per buffer, from the same process that is measured:
+#   load_tensors:      Vulkan0 model buffer size =  1137.00 MiB
+#   llama_kv_cache:    Vulkan0 KV buffer size =    28.00 MiB            (llama_memory_recurrent: ... RS buffer size)
+#   sched_reserve:    Vulkan0 compute buffer size =    77.25 MiB        (llama_context: ... in older builds)
+# llama-bench prints them only with -v. llama-cli's "memory breakdown" table has the same three columns but is for llama-cli's
+# own context and batch, whose compute buffer differs from llama-bench's, so it is not the table of the measured process.
+_BUFFER_LINE = re.compile(
+    r"^(?P<source>load_tensors|llama_kv_cache\w*|llama_memory_recurrent\w*|sched_reserve|llama_context):\s+"
+    r"(?P<buffer>\S+)\s+(?P<kind>model|KV|RS|compute) buffer size =\s+(?P<mib>\d+(?:\.\d+)?) MiB\s*$", re.M)
+_CLASS_OF_KIND = {"model": "weights_bytes", "KV": "kv_bytes", "RS": "kv_bytes", "compute": "workspace_bytes"}
+
+
+def is_host_buffer(name):
+    """A llama.cpp buffer name on the host (`CPU`, `CPU_Mapped`, `Vulkan_Host`, `CUDA_Host`), not on a device."""
+    return name.startswith("CPU") or name.endswith("_Host")
+
+
+def parse_memory_classes(log):
+    """The device memory llama.cpp allocated, by class, from a `llama-bench -v` log: the model's weights, the KV cache and
+    recurrent state, and the compute buffers, summed over the device buffers (host buffers are not the GPU's). A buffer line
+    appears twice only where llama.cpp itself repeats it, so the first sight of (kind, buffer) per source is kept. None when
+    any of the three classes has no device line: a build whose log differs must not produce a partial breakdown."""
+    seen, classes = set(), {}
+    for found in _BUFFER_LINE.finditer(log):
+        key = (found["source"], found["kind"], found["buffer"])
+        if key in seen or is_host_buffer(found["buffer"]):
+            continue
+        seen.add(key)
+        name = _CLASS_OF_KIND[found["kind"]]
+        classes[name] = classes.get(name, 0) + round(float(found["mib"]) * 2**20)
+    if set(classes) != {"weights_bytes", "kv_bytes", "workspace_bytes"}:
+        return None
+    return classes
+
+
+def probe_memory_classes(gguf, test_args):
+    """`(classes, caveat)`: llama-bench's own device memory for the test `test_args` (the largest context of the run, whose
+    KV cache is the largest), read from a separate verbose run. It runs before the measured invocations, so the observer's
+    last load is still the measured one, and verbose logging never touches a timed run."""
+    cmd = [BENCH, "-m", gguf, "-ngl", "99", "-r", "1", "-o", "json", "-v"] + test_args
+    log("llamacpp memory probe:", " ".join(cmd))
+    r = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if r.returncode != 0:
+        return None, f"llama.cpp memory breakdown unavailable: the probe run exited rc={r.returncode}"
+    classes = parse_memory_classes(r.stderr)
+    if classes is None:
+        return None, "llama.cpp memory breakdown unavailable: this build's log has no model, KV and compute buffer lines"
+    return classes, None
+
+
 def cpu_fallback(rows):
     """The reason llama-bench ran on the CPU although `-ngl 99` asked for the GPU, or None. With no usable GPU
     the tool still exits 0 and prints CPU numbers; a GPU cell must not report them. Each row names the backends
@@ -153,6 +203,9 @@ def run_decode_curve(args):
     if args.precision.startswith("q") or "k_m" in args.precision:
         caveats.append(f"{args.precision} is a llama.cpp k-quant, not GPTQ/AWQ - bit-width parity only")
     curve, version, backend = [], "unknown", None
+    memory_classes, memory_caveat = probe_memory_classes(gguf, ["-p", "0", "-n", str(osl), "-d", str(max(isls))])
+    if memory_caveat:
+        caveats.append(memory_caveat)
 
     def bench(extra):
         cmd = [BENCH, "-m", gguf, "-ngl", "99", "-r", reps, "-o", "json"] + extra
@@ -188,7 +241,8 @@ def run_decode_curve(args):
         curve.append({"isl": isl, "prompt_tokens": isl,
                       "iters": [{"ttft_ms": ttft, "e2e_ms": e2e, "itl_ms": [tpot] * max(osl - 1, 0)}]})
     print(json.dumps({"framework": "llamacpp", **({"backend": backend} if backend else {}), "framework_version": version,
-                      "precision": args.precision, "mode": "decode-curve", "osl": osl, "caveats": caveats, "curve": curve}))
+                      "precision": args.precision, "mode": "decode-curve", "osl": osl, "caveats": caveats, "curve": curve,
+                      **({"memory_classes": memory_classes} if memory_classes else {})}))
 
 
 def main():
@@ -224,6 +278,10 @@ def main():
                "TTFT derived from pp (prefill) rate - a proxy, not a measured first-token time"]
     if args.precision.startswith("q") or "k_m" in args.precision:
         caveats.append(f"{args.precision} is a llama.cpp k-quant, not GPTQ/AWQ - bit-width parity only")
+
+    memory_classes, memory_caveat = probe_memory_classes(gguf, ["-p", str(p_tokens), "-n", str(n)])
+    if memory_caveat:
+        caveats.append(memory_caveat)
 
     cmd = [BENCH, "-m", gguf, "-ngl", "99", "-p", str(p_tokens), "-n", str(n),
            "-r", str(max(args.iters, 1)), "-o", "json"]
@@ -265,6 +323,7 @@ def main():
         "decode_tok_s": round(tg_ts, 3) if tg_ts else None,
         "decode_tok_s_stdev": round(tg_sd, 3),
         "caveats": caveats,
+        **({"memory_classes": memory_classes} if memory_classes else {}),
     }
     print(json.dumps(out))
 

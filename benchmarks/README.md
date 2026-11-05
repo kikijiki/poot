@@ -38,7 +38,8 @@ benchmarks/
   harness/
     bench.py           the orchestrator CLI: matrix / run / report / compare / index
     grid.py            the grid's completeness check against website/src/data/performance.json
-    observer.py        the external sampler (uniform VRAM + RSS) every runner is wrapped with
+    observer.py        the external sampler (uniform VRAM + RSS, cut into load and inference at the runners' marks) every runner is wrapped with
+    memory_phases.py   the mark protocol, the exact split and the inferred split of a stored run
     fixtures/          a synthetic run snapshot for the hermetic `report` self-check
     tests/             the harness's own tests (`just test-bench-harness`, part of the model-free gate)
   runners/
@@ -93,16 +94,32 @@ order-dependent TTFT variance).
 (single-process load generators saturate at high QPS). vLLM's batching advantage is a caveat, not exercised.
 
 Memory is NOT self-reported. The harness wraps each runner with `observer.py`, which samples total device
-VRAM (NVML, else `nvidia-smi`; on an AMD device the amdgpu sysfs `mem_info_vram_used` + `mem_info_gtt_used`, with power from hwmon `power1_average`) and process-tree RSS (psutil, else a /proc walk of the descendants) at a fixed interval and keeps the
-peaks, and stores the 1 Hz trace of both (`util_series`). The peaks and the trace cover the whole process lifetime, so they include
-loading the checkpoint (VmRSS counts the file-backed pages of the mapped file; staging buffers count as device memory). What the
+VRAM (NVML, else `nvidia-smi`; on an AMD device the amdgpu sysfs `mem_info_vram_used` + `mem_info_gtt_used`, with power from hwmon `power1_average`) and the host memory of the process tree (a /proc walk of the descendants: `VmRSS` split into `RssAnon`, the heap and staging buffers, and `RssFile`, a mapped checkpoint and libraries) at a fixed interval, keeps the
+peaks, and stores the 1 Hz trace (`util_series`). The lifetime peaks (`peak_vram_bytes`, `peak_rss_bytes`, `peak_rss_anon_bytes`, `peak_rss_file_bytes`) include
+loading the checkpoint (file-backed pages of the mapped file; staging buffers). What the
 reports, `results/INDEX.md` and the Performance page chart is the **peak at inference**: the highest host and GPU memory after the
 model is loaded and the warmup request has run (allocator, KV cache and kernels at steady state), with the **load peak** stated
-beside it. Both are derived from the stored trace (`harness/memory_phases.py`), so a result needs no re-run: the load ends at the
-engine's recorded `preparation.open_ms`, else at the last fall of host RSS by a quarter of its peak (llama.cpp restarts its server per
+beside it. The runners that load a model once (poot, transformers, vLLM) print two marks on stderr on their own wall clock,
+`POOT_BENCH_MARK load_end <unix seconds>` when the model is loaded and `POOT_BENCH_MARK warmup_end <unix seconds>` when the first
+warmup generation is done (`harness/memory_phases.py` defines the line). The observer keeps every sampler tick (50 ms by
+default) with its wall-clock time and cuts it at those marks, so the load peak (everything up to `load_end`) and the inference peak
+(everything after `warmup_end`) are exact: the result row's `memory_phases` holds the peaks of each part, with the host figure
+split anonymous/file-backed and the device figure in VRAM+GTT. Two runners cannot mark: candle rebuilds the model in every request, and
+llama-bench loads, warms up and measures inside processes the runner cannot see into. A stored run from before the marks, or
+one of those two, has only the 1 Hz trace, and its split is inferred from it as before: the load ends at the
+engine's recorded `preparation.open_ms`, else at the last fall of host RSS by a quarter of its peak (llama.cpp restarts per
 context length, so the last load bounds the window), and the warmup adds the duration of the manifest's `warmup_iters` requests of
-the first context length. A run whose trace shows no boundary keeps its lifetime peak and is labelled "includes load". The trace is
-sampled at 1 Hz, the lifetime peak at the sampler interval, so a phase peak can sit slightly below the lifetime peak it belongs to.
+the first context length. A run with no boundary keeps its lifetime peak and is labelled "includes load".
+
+The device memory is also stated **by buffer class**, from the engine itself (`memory_classes` in the row): poot counts its live
+device buffers by role and reports each class's peak (`weights_bytes`; `kv_bytes`, the KV cache and recurrent state;
+`workspace_bytes`, intermediate values, step inputs and outputs and metadata; `staging_bytes`, the buffers that bridge host
+transfers), and the llama.cpp runner reads the same three columns of llama.cpp's memory breakdown (model, context, compute) from a
+separate `llama-bench -v` run of the largest context, made before the measured invocations (`llama-bench` itself prints no table,
+and `llama-cli`'s table is for its own batch size, whose compute buffer differs). A build whose log lacks any of the three
+lines gives a caveat and no breakdown, never a partial one. The classes' peaks need not fall at the same moment, and the
+engines count differently (poot's staging and llama.cpp's host-side buffers are outside the weights/KV/workspace columns),
+so the page puts weights, KV and workspace side by side and does not sum them.
 Self-reported numbers do not compare across engines (torch's
 allocator, vLLM's KV pool, and llama.cpp's buffer report measure different things). The
 assumption is **one engine per GPU, GPU otherwise idle**, so "peak device used minus the pre-launch

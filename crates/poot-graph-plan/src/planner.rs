@@ -213,6 +213,8 @@ pub use choice::Planned;
 pub(crate) use choice::PlannedDispatch;
 pub use choice::{KernelChoice, NoDispatch};
 pub(crate) use matmul::epilogue_head_lowers;
+pub(crate) use moe::grouping_candidate;
+pub(crate) use packed_dequant::packed_grouping_candidate;
 
 use std::cell::Cell;
 

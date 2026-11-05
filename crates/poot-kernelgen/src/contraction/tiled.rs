@@ -2,7 +2,7 @@
 //! A front end supplies only how the weight tile is read ([`TiledWeight`]): runs of decoded values along a
 //! weight row for an `[N, K]` weight (the dense loader in every storage, the packed descriptor decode), or the
 //! elements of a `[K, N]` weight, staged along `N`. An indexed contraction (each row reading its own expert's
-//! weight) is the same nest inside an [`ExpertWalk`] over the experts its tile's rows select.
+//! weight) is the same nest over its rows grouped by expert ([`GroupedRows`]): a tile is one expert's.
 //!
 //! A workgroup of `lanes x lanes` lanes owns a `(lanes * rows) x (lanes * cols)` output tile, and each lane
 //! accumulates a `rows x cols` register tile of it ([`MicroTile::Scalar`], which owns the dot step, the owner map
@@ -21,16 +21,16 @@ use poot_kernel_ir::{
     Statement, Terminator, Ty, WorkgroupLocalDecl,
 };
 
-use poot_graph_ir::OperandPrecision;
+use poot_graph_ir::{FragmentDtype, OperandPrecision};
 
 use super::epilogue::BoundEpilogue;
-use super::indexed::{RowExpert, emit_poison, emit_row_expert, emit_row_key};
+use super::indexed::{RowExpert, emit_poison, emit_row_expert};
 use super::{RegisterTiling, Schedule};
 use crate::KernelGenError;
-use crate::emit::{Emit, bin, c32, copy, cu, emit_read_meta, select_u32};
+use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
 use crate::helpers::{Alloc, WeightLane, WeightLayout, elem, guard};
 use crate::microtile::{MicroTile, Staged, StagedMajor, StoreAt};
-use crate::precision::{ProductRead, StagedTerms};
+use crate::precision::{ProductRead, StagedTerms, store_value, stored_ty};
 
 /// The CFG [`tiled_body`] builds: the `GroupX`, `GroupY` and `LocalX` reads, the setup block, the pipelined `K`
 /// loop (its prologue and first multiply, then per round: use, write, issue, multiply), the drain (an `Opaque`
@@ -251,18 +251,6 @@ impl TiledLaunch {
         })
     }
 
-    /// This launch if it computes with the scalar micro-tile, which an expert walk requires: the rows of one tile
-    /// select different weight tiles, so no fragment can span them.
-    pub(crate) fn scalar_only(self, generator: &'static str) -> Result<Self, KernelGenError> {
-        match self.shape.micro {
-            MicroTile::Scalar { .. } => Ok(self),
-            MicroTile::Fragment(_) => Err(KernelGenError::Unsupported {
-                request: generator,
-                reason: "an expert walk keeps the scalar micro-tile",
-            }),
-        }
-    }
-
     /// The consecutive `K` values a lane stages at a time.
     pub(crate) fn run(self) -> usize {
         self.run
@@ -279,7 +267,7 @@ impl TiledLaunch {
     }
 }
 
-/// The metadata words every [`tiled_body`] reads, in order. An expert walk ([`ExpertWalk`]) reads its expert count
+/// The metadata words every [`tiled_body`] reads, in order. A grouped body ([`GroupedRows`]) reads its expert count
 /// from a word of its own past these.
 pub(crate) const META_K: usize = 0;
 pub(crate) const META_OUT_PER_BLOCK: usize = 1;
@@ -296,39 +284,40 @@ pub(crate) enum TiledWeight<'f> {
     /// An `[N, K]` weight: `run(e, step, weight_row, k0, count, k, weight_rows)` emits the `count` logical f32
     /// weight values `k0 .. k0 + count` of row `weight_row` of a weight with `weight_rows` rows of `k` values, `k0` a
     /// multiple of `count`; it is only ever called with the whole run inside `0..k` (`k` is a multiple of the
-    /// launch's `run`, so a run is whole or wholly past the end). `step` is what the body's [`ExpertWalk`] emitted
-    /// for the current expert (empty without a walk), and `weight_row` is then a row of that expert's `[N, K]`
+    /// launch's `run`, so a run is whole or wholly past the end). `step` is what the body's [`GroupedRows`] emitted
+    /// for the tile's expert (empty without a grouping), and `weight_row` is then a row of that expert's `[N, K]`
     /// slab.
     Rows(&'f mut WeightRun<'f>),
     /// A `[K, N]` weight in `weight`, read through `lane`: block `b`'s `[K, out_per_block]` slab starts at element
-    /// `b * K * out_per_block`, and under an [`ExpertWalk`] the current expert's does.
+    /// `b * K * out_per_block`, and under a [`GroupedRows`] the tile's expert's does.
     Columns { weight: Local, lane: WeightLane },
 }
 
-/// What one key of an [`ExpertWalk`] emits for its `expert`: the weight state its runs read.
-pub(crate) type WalkStep<'f> = dyn FnMut(&mut Emit, Local) -> Vec<Local> + 'f;
+/// What a grouped tile emits for its `expert`: the weight state its runs read.
+pub(crate) type ExpertStep<'f> = dyn FnMut(&mut Emit, Local) -> Vec<Local> + 'f;
 
-/// The segmentation of an indexed contraction: output row `m` reads the weight of expert `ids[m]`, so one tile's
-/// rows may select several experts. The body then walks the distinct expert keys among its tile's rows in
-/// ascending order ([`emit_row_key`]: a row's expert, or `E` for a row past the end or with an invalid id), and per
-/// key runs the whole `K` loop over that expert's weight tile with the activation rows of every other key staged
-/// as exact zeros, so a row's sum is its own expert's product. The accumulators carry across the walk: a row adds
-/// exact zero products on every other key's pass. The body has one block (`blocks == 1`); `metadata` word
-/// `experts_word` is `E`.
-pub(crate) struct ExpertWalk<'f> {
-    /// The `I32` expert id of each output row.
-    pub(crate) ids: Local,
+/// The rows of an indexed contraction grouped by expert (POOT-1451, [`poot_graph_ir::ExpertGrouping`]): the grid's
+/// rows are the grouping's `P` padded positions (`metadata` word [`META_M_PER_BLOCK`]) in one block, the output is
+/// `[M, out_per_block]` in row order, and one output tile of rows is one tile of the grouping (the launch's tile
+/// rows are the grouping's block), so all its rows read one expert's weight and the tile runs one `K` loop. Each
+/// staged activation slot reads the row its position holds (a sentinel position re-reads a real row, whose output is
+/// never stored), each store writes the row its position holds and skips a sentinel, and a tile whose first
+/// position is the sentinel is past every bucket, so its workgroup returns before it stages anything. `metadata`
+/// word `experts_word` is `E`; a tile whose expert word is outside `0..E` (the bucket of invalid ids) stores NaN in
+/// each of its rows.
+pub(crate) struct GroupedRows<'f> {
+    /// The `I32` grouping: the padded order, then each tile's expert.
+    pub(crate) groups: Local,
     /// The metadata word holding the expert count `E`.
     pub(crate) experts_word: usize,
-    /// What one key of the walk needs from the weight, emitted once per step for that `expert` and handed to
-    /// every [`TiledWeight::Rows`] run of the step (a packed stack's per-source slab offsets; the slab's first row
-    /// for a dense one).
-    pub(crate) step: &'f mut WalkStep<'f>,
+    /// What the tile's expert needs from the weight, emitted once and handed to every [`TiledWeight::Rows`] run (a
+    /// packed stack's per-source slab offsets; the slab's first row for a dense one).
+    pub(crate) step: &'f mut ExpertStep<'f>,
 }
 
-/// The body's buffers: the full parameter list (`unit`, the activation, the weight sources, the `ids` of a walk,
-/// epilogue leaves, `metadata`, `out`), where the ones the loop nest itself reads sit, the epilogue each output runs
-/// through before its store, and the expert walk of an indexed contraction.
+/// The body's buffers: the full parameter list (`unit`, the activation, the weight sources, the grouping of an
+/// indexed contraction, epilogue leaves, `metadata`, `out`), where the ones the loop nest itself reads sit, the
+/// epilogue each output runs through before its store, and the expert grouping of an indexed contraction.
 pub(crate) struct TiledBody<'a> {
     pub(crate) name: &'a str,
     pub(crate) params: Vec<LocalDecl>,
@@ -336,9 +325,36 @@ pub(crate) struct TiledBody<'a> {
     pub(crate) metadata: Local,
     pub(crate) out: Local,
     pub(crate) epilogue: Option<BoundEpilogue<'a>>,
-    pub(crate) walk: Option<ExpertWalk<'a>>,
+    pub(crate) grouped: Option<GroupedRows<'a>>,
     /// How the two staged tiles are read: the declared operand precision, applied where each value is staged.
     pub(crate) read: ProductRead,
+}
+
+/// What the setup of a grouped body ([`GroupedRows`]) knows about its tile, loop-invariant.
+#[derive(Clone, Copy)]
+struct GroupedTile {
+    /// The grouping.
+    groups: Local,
+    /// The last padded position, `P - 1`: every position read is clamped to it.
+    last_position: Local,
+    /// The word of the tile's expert, `P + tile` (the tile clamped to the last).
+    expert_at: Local,
+    /// Whether the workgroup is a tile of the grid's one block, not a folded grid's padding.
+    in_grid: Local,
+    /// Whether the tile holds a row: it is in the grid and its first position is not the sentinel.
+    occupied: Local,
+}
+
+/// The row padded position `position` of `groups` holds, as an index: the sentinel reads as the row count.
+fn emit_grouped_row(e: &mut Emit, groups: Local, position: Local) -> Local {
+    let word = e.let_(Ty::I32, Rvalue::Use(Operand::Copy(elem(groups, position))));
+    e.let_(
+        Ty::Usize,
+        Rvalue::Cast {
+            to: Ty::Usize,
+            operand: copy(word),
+        },
+    )
 }
 
 /// One staged slot of one operand's tile: where its values land in LDS and where they come from.
@@ -349,9 +365,6 @@ struct StagedSlot {
     lds_idx: Local,
     /// The activation row's first element (A), the weight row (`[N, K]` B), or the weight column (`[K, N]` B).
     source: Local,
-    /// The buffer row the slot stands for before the clamp: past the end for a slot of an edge tile's missing
-    /// rows (an expert walk keys the activation rows by it).
-    row: Local,
 }
 
 /// The [`super::Schedule::RegisterTiled`] loop nest, shared by every operand load.
@@ -370,10 +383,9 @@ struct StagedSlot {
 /// The `K` tail is zeroed on the weight tile only, so an activation `Inf`/`NaN` in the last real run reaches the
 /// tail slots as `Inf * 0 = NaN`; that output was already non-finite for any nonzero weight there.
 ///
-/// With an [`ExpertWalk`] the `K` loop runs once per distinct expert key among the tile's rows (see there), and
-/// each stored output adds its row's poison (`0.0`, or NaN for an id outside `0..E`) before the epilogue. The walk
-/// reads the tile's ids at tile-uniform indexes, so it is uniform control flow and the loop's barriers stay legal
-/// inside it.
+/// With a [`GroupedRows`] the rows are the grouping's positions (see there): each stored output adds its tile's
+/// poison (`0.0`, or NaN for an expert outside `0..E`) before the epilogue. The early return of an empty tile reads
+/// the grouping at a tile-uniform index, so it is uniform control flow ahead of the loop's barriers.
 pub(crate) fn tiled_body(
     spec: TiledBody<'_>,
     launch: TiledLaunch,
@@ -386,7 +398,7 @@ pub(crate) fn tiled_body(
         metadata,
         out,
         epilogue,
-        mut walk,
+        grouped,
         read,
     } = spec;
     debug_assert_eq!(
@@ -404,9 +416,8 @@ pub(crate) fn tiled_body(
     let (stride_a, stride_b) = (a_tile.stride, b_tile.stride);
     let lane_count = shape.lane_count();
     let depth = shape.depth;
-    // The block indexes past the store chain: its return, then the walk's own blocks.
+    // The block past the store chain: its return, where an empty grouped tile also goes.
     let ret = STORES + 2 * micro.accumulators() as u32;
-    let (walk_head, walk_step, walk_next) = (ret + 1, ret + 2, ret + 3);
     let n_inputs = (params.len() - 1) as u32;
     // The staged tiles' LDS arrays: the activation's and the weight's (`hi`) parts, then the `lo` part of each
     // operand that is split ([`StagedTerms`]), then the scratch an `Opaque` fragment spills to.
@@ -427,11 +438,8 @@ pub(crate) fn tiled_body(
     let gy = al.add(Ty::Usize, false);
     let l = al.add(Ty::Usize, false);
     let kt = al.add(Ty::Usize, true);
-    // The weight slab a `[K, N]` tile reads: its block's, or the walk's current expert's.
+    // The weight slab a `[K, N]` tile reads: its block's, or a grouped tile's expert's.
     let b_slab = al.add(Ty::Usize, true);
-    // The walk's current key and the least key it has not taken yet.
-    let next = al.add(Ty::Usize, true);
-    let lo = al.add(Ty::Usize, true);
     let mut acc = micro.accumulator(&mut al);
 
     let thread_index = |destination: Local, dim: IndexAxis, target: u32| BasicBlock {
@@ -467,7 +475,8 @@ pub(crate) fn tiled_body(
     );
 
     // `rows` and `blocks` come from `out`'s own length, never a metadata word: `out` is exactly
-    // `[rows, out_per_block]`.
+    // `[rows, out_per_block]`. A grouped body is one block whose `m_per_block` grid rows are the grouping's
+    // positions, not the output's rows.
     let out_len = setup.let_(Ty::Usize, Rvalue::Len(Place::local(out)));
     let rows = bin(
         &mut setup,
@@ -476,13 +485,16 @@ pub(crate) fn tiled_body(
         copy(out_len),
         copy(out_per_block),
     );
-    let blocks = bin(
-        &mut setup,
-        Ty::Usize,
-        BinOp::Div,
-        copy(rows),
-        copy(m_per_block),
-    );
+    let blocks = match grouped {
+        Some(_) => setup.let_(Ty::Usize, Rvalue::Use(cu(1))),
+        None => bin(
+            &mut setup,
+            Ty::Usize,
+            BinOp::Div,
+            copy(rows),
+            copy(m_per_block),
+        ),
+    };
     let weight_rows = bin(
         &mut setup,
         Ty::Usize,
@@ -574,19 +586,68 @@ pub(crate) fn tiled_body(
     // The owner map: which tile row and column each of this lane's accumulator elements is.
     let geometry = micro.geometry(&mut setup, l, owners.0, owners.1);
 
+    // A grouped tile: tile `tile_row` of the grouping, whose `edge_m` positions start at `row_base` (the grid's one
+    // block; a folded grid's padding workgroup, past it, stores nothing and its reads are clamped in range).
+    let grouped_tile = grouped.as_ref().map(|grouped| {
+        let groups = grouped.groups;
+        let last_position = bin(&mut setup, Ty::Usize, BinOp::Sub, copy(m_per_block), cu(1));
+        let last_tile = bin(&mut setup, Ty::Usize, BinOp::Sub, copy(tiles_row), cu(1));
+        let tile = bin(
+            &mut setup,
+            Ty::Usize,
+            BinOp::Min,
+            copy(tile_row),
+            copy(last_tile),
+        );
+        let expert_at = bin(
+            &mut setup,
+            Ty::Usize,
+            BinOp::Add,
+            copy(m_per_block),
+            copy(tile),
+        );
+        let in_grid = bin(&mut setup, Ty::Bool, BinOp::Eq, copy(block), cu(0));
+        let head_at = bin(
+            &mut setup,
+            Ty::Usize,
+            BinOp::Min,
+            copy(row_base),
+            copy(last_position),
+        );
+        let head = emit_grouped_row(&mut setup, groups, head_at);
+        let real = bin(&mut setup, Ty::Bool, BinOp::Lt, copy(head), copy(rows));
+        let occupied = bin(
+            &mut setup,
+            Ty::Bool,
+            BinOp::BitAnd,
+            copy(in_grid),
+            copy(real),
+        );
+        GroupedTile {
+            groups,
+            last_position,
+            expert_at,
+            in_grid,
+            occupied,
+        }
+    });
+    let row_map = grouped_tile.map(|tile| (tile.groups, tile.last_position));
+
     // Staged run `q` of a run tile of `edge` rows: run `r = q * lane_count + l` is row `r / runs_per_row`, `K`
     // offset `(r % runs_per_row) * run` (adjacent lanes adjacent in `K`: the coalesced direction of a row-major
     // operand). `base` is the tile's first row in its block; `source_row0` and `source_stride` turn the row into
     // the buffer row the run reads, clamped to the last real one. A row past the block (or the buffer) re-reads a
     // real row: its output is never stored, and each output depends on its own row and column alone, so no edge
-    // needs a mask.
+    // needs a mask. Under `row_map` (a grouping and its last position) the row is a padded position, and the run
+    // reads the row that position holds (a sentinel clamps to the last real row like any edge row).
     let stage_runs = |setup: &mut Emit,
                       edge: usize,
                       (stride, major): (usize, StagedMajor),
                       base: Local,
                       source_row0: Local,
                       max_source_row: Local,
-                      source_stride: Option<Local>|
+                      source_stride: Option<Local>,
+                      row_map: Option<(Local, Local)>|
      -> Vec<StagedSlot> {
         let runs_per_row = launch.runs_per_row();
         (0..launch.slots(edge))
@@ -605,6 +666,14 @@ pub(crate) fn tiled_body(
                     copy(source_row0),
                     copy(in_block),
                 );
+                let row = match row_map {
+                    Some((groups, last_position)) => {
+                        let position =
+                            bin(setup, Ty::Usize, BinOp::Min, copy(row), copy(last_position));
+                        emit_grouped_row(setup, groups, position)
+                    }
+                    None => row,
+                };
                 let source_row = bin(
                     setup,
                     Ty::Usize,
@@ -622,7 +691,6 @@ pub(crate) fn tiled_body(
                     k_offset,
                     lds_idx,
                     source,
-                    row,
                 }
             })
             .collect()
@@ -635,6 +703,7 @@ pub(crate) fn tiled_body(
         block_row0,
         max_row,
         Some(k),
+        row_map,
     );
     let b_slots = match weight {
         TiledWeight::Rows(_) => stage_runs(
@@ -645,6 +714,7 @@ pub(crate) fn tiled_body(
             block_weight_row0,
             max_weight_row,
             None,
+            None,
         ),
         // Staged block `q` of a `[K, N]` tile ([`ColumnBlock`]: `cols` columns by `deep` `K` values): block
         // `r = q * lane_count + l` starts at column `(r % (edge_n / cols)) * cols` and `K` offset
@@ -652,7 +722,7 @@ pub(crate) fn tiled_body(
         // the block ends at the block's last real column: `out_per_block` is a multiple of `cols`, so a block is
         // wholly in range or wholly past it, and one past it re-reads a real one (its outputs are never stored).
         // The slab it sits in is `b_slab`: the block's (a padding workgroup's block clamped to the last real one),
-        // or under a walk the step's expert's.
+        // or under a grouping the tile's expert's (set with the expert, below).
         TiledWeight::Columns { .. } => {
             let max_block = bin(&mut setup, Ty::Usize, BinOp::Sub, copy(blocks), cu(1));
             let real_block = bin(
@@ -695,118 +765,43 @@ pub(crate) fn tiled_body(
                         k_offset,
                         lds_idx,
                         source,
-                        row: col,
                     }
                 })
                 .collect()
         }
     };
 
-    // The walk's per-slot keys (each staged activation row's expert, or `E`), loop-invariant.
-    let walk_keys = walk.as_ref().map(|walk| {
-        let experts = emit_read_meta(&mut setup, metadata, walk.experts_word);
-        let keys: Vec<Local> = a_runs
-            .iter()
-            .map(|slot| emit_row_key(&mut setup, walk.ids, slot.row, (rows, experts)))
-            .collect();
-        (experts, keys)
-    });
-
-    micro.zero(&mut setup, &mut acc);
-    let setup_block = match walk_keys {
-        Some(_) => {
-            setup.assign(Place::local(lo), Rvalue::Use(cu(0)));
-            BasicBlock {
-                statements: setup.take(),
-                terminator: goto(walk_head),
-            }
-        }
-        None => {
-            setup.assign(Place::local(kt), Rvalue::Use(cu(0)));
-            BasicBlock {
-                statements: setup.take(),
-                terminator: goto(PROLOGUE),
-            }
-        }
-    };
-
-    // --- the walk: the least key at or above `lo` among the tile's rows, read from `ids` at tile-uniform indexes;
-    // `E` when none is left. Then one step: the expert's weight state, the `K` loop from 0, and `lo` past it ---
-    let mut walk_blocks = Vec::new();
+    // A grouped tile's expert: its weight state, the `[K, N]` slab it reads, and the poison its stores add.
     let mut step_state = Vec::new();
-    if let (Some(walk), Some((experts, _))) = (walk.as_mut(), walk_keys.as_ref()) {
-        let mut head = Emit::new(&mut al);
-        let mut least = head.let_(Ty::Usize, Rvalue::Use(copy(*experts)));
-        for r in 0..edge_m {
-            let tile_row = bin(&mut head, Ty::Usize, BinOp::Add, copy(row_base), cu(r));
-            let key = emit_row_key(&mut head, walk.ids, tile_row, (rows, *experts));
-            let at_or_above = bin(&mut head, Ty::Bool, BinOp::Ge, copy(key), copy(lo));
-            let above = head.let_(
-                Ty::Usize,
-                Rvalue::Cast {
-                    to: Ty::Usize,
-                    operand: copy(at_or_above),
-                },
-            );
-            let distance = bin(&mut head, Ty::Usize, BinOp::Sub, copy(*experts), copy(key));
-            let pulled = bin(
-                &mut head,
-                Ty::Usize,
-                BinOp::Mul,
-                copy(above),
-                copy(distance),
-            );
-            let candidate = bin(
-                &mut head,
-                Ty::Usize,
-                BinOp::Sub,
-                copy(*experts),
-                copy(pulled),
-            );
-            least = bin(
-                &mut head,
-                Ty::Usize,
-                BinOp::Min,
-                copy(least),
-                copy(candidate),
-            );
-        }
-        head.assign(Place::local(next), Rvalue::Use(copy(least)));
-        let more = bin(&mut head, Ty::Bool, BinOp::Lt, copy(next), copy(*experts));
-        walk_blocks.push(BasicBlock {
-            statements: head.take(),
-            terminator: guard(more, DRAIN, walk_step),
-        });
-
-        let mut step = Emit::new(&mut al);
-        step_state = (walk.step)(&mut step, next);
+    let poison = grouped_tile.map(|tile| {
+        let grouped = grouped.expect("a grouped tile has its grouping");
+        let experts = emit_read_meta(&mut setup, metadata, grouped.experts_word);
+        let RowExpert { expert, valid } =
+            emit_row_expert(&mut setup, tile.groups, tile.expert_at, experts);
+        step_state = (grouped.step)(&mut setup, expert);
         if matches!(weight, TiledWeight::Columns { .. }) {
-            let slab = bin(&mut step, Ty::Usize, BinOp::Mul, copy(next), copy(k));
+            let slab = bin(&mut setup, Ty::Usize, BinOp::Mul, copy(expert), copy(k));
             let slab = bin(
-                &mut step,
+                &mut setup,
                 Ty::Usize,
                 BinOp::Mul,
                 copy(slab),
                 copy(out_per_block),
             );
-            step.assign(Place::local(b_slab), Rvalue::Use(copy(slab)));
+            setup.assign(Place::local(b_slab), Rvalue::Use(copy(slab)));
         }
-        step.assign(Place::local(kt), Rvalue::Use(cu(0)));
-        walk_blocks.push(BasicBlock {
-            statements: step.take(),
-            terminator: goto(PROLOGUE),
-        });
+        emit_poison(&mut setup, valid)
+    });
 
-        let mut after = Emit::new(&mut al);
-        let lo_next = bin(&mut after, Ty::Usize, BinOp::Add, copy(next), cu(1));
-        after.assign(Place::local(lo), Rvalue::Use(copy(lo_next)));
-        // The `K` loop leaves right after its last multiply; every wave must be past it before the next step's
-        // prologue overwrites the tiles it reads.
-        walk_blocks.push(BasicBlock {
-            statements: after.take(),
-            terminator: barrier(walk_head),
-        });
-    }
+    micro.zero(&mut setup, &mut acc);
+    setup.assign(Place::local(kt), Rvalue::Use(cu(0)));
+    let setup_block = BasicBlock {
+        statements: setup.take(),
+        terminator: match grouped_tile {
+            Some(tile) => guard(tile.occupied, ret, PROLOGUE),
+            None => goto(PROLOGUE),
+        },
+    };
 
     // --- stage: every lane loads its activation runs and reads or decodes its weight slots of round `round`; the
     // values and the LDS slots they are written to come back, so a pipelined round writes them after its dot ---
@@ -843,7 +838,7 @@ pub(crate) fn tiled_body(
             Some(mask) => bin(load, Ty::F32, BinOp::Mul, copy(value), copy(mask)),
             None => value,
         };
-        for (slot, staged) in a_runs.iter().enumerate() {
+        for staged in &a_runs {
             let (_, start) = run_start(load, staged.k_offset);
             let first = bin(
                 load,
@@ -852,18 +847,9 @@ pub(crate) fn tiled_body(
                 copy(staged.source),
                 copy(start),
             );
-            // Under a walk, a row of another key stages exact zeros: a bit select, so a non-finite activation of
-            // another expert's row never reaches this step's products.
-            let mine = walk_keys
-                .as_ref()
-                .map(|(_, keys)| bin(load, Ty::Bool, BinOp::Eq, copy(keys[slot]), copy(next)));
             for j in 0..run {
                 let idx = bin(load, Ty::Usize, BinOp::Add, copy(first), cu(j));
-                let raw = load.let_(Ty::F32, Rvalue::Use(Operand::Copy(elem(activation, idx))));
-                let value = match mine {
-                    Some(mine) => zero_unless(load, mine, raw),
-                    None => raw,
-                };
+                let value = read_activation(load, read.activation_stored, activation, idx);
                 let slot = bin(
                     load,
                     Ty::Usize,
@@ -1002,11 +988,7 @@ pub(crate) fn tiled_body(
     // visible; the issue block issues the next round's loads; the multiply block multiplies round `kt` and leaves
     // when no next round exists. Two barriers per round. The last round's loads re-read the clamped tail, which
     // every round may read, and are not used.
-    let loop_done = if walk_keys.is_some() {
-        walk_next
-    } else {
-        DRAIN
-    };
+    let loop_done = DRAIN;
     // The round whose loads are in flight: `kt + 1`, set where they are issued.
     let ahead = al.add(Ty::Usize, true);
     let mut staged_e = Emit::new(&mut al);
@@ -1095,10 +1077,6 @@ pub(crate) fn tiled_body(
         finish,
     ];
     debug_assert_eq!(blocks_out.len() as u32, STORES);
-    let poison_of = walk
-        .as_ref()
-        .zip(walk_keys.as_ref())
-        .map(|(walk, (experts, _))| (walk.ids, *experts));
     let stores = elements.store(
         &mut al,
         STORES,
@@ -1114,6 +1092,24 @@ pub(crate) fn tiled_body(
                 copy(block_row0),
                 copy(row_in_block),
             );
+            // A grouped position stores the row it holds; a sentinel's row is `rows`, out of range. A padding
+            // workgroup past the grid's one block stores nothing.
+            let (row, in_grid) = match grouped_tile {
+                Some(tile) => {
+                    let position = bin(
+                        cond,
+                        Ty::Usize,
+                        BinOp::Min,
+                        copy(row),
+                        copy(tile.last_position),
+                    );
+                    (
+                        emit_grouped_row(cond, tile.groups, position),
+                        Some(tile.in_grid),
+                    )
+                }
+                None => (row, None),
+            };
             let row_ok = bin(
                 cond,
                 Ty::Bool,
@@ -1125,19 +1121,22 @@ pub(crate) fn tiled_body(
             let in_range = bin(cond, Ty::Bool, BinOp::Lt, copy(row), copy(rows));
             let tile_ok = bin(cond, Ty::Bool, BinOp::BitAnd, copy(row_ok), copy(col_ok));
             let ok = bin(cond, Ty::Bool, BinOp::BitAnd, copy(tile_ok), copy(in_range));
+            let ok = match in_grid {
+                Some(in_grid) => bin(cond, Ty::Bool, BinOp::BitAnd, copy(ok), copy(in_grid)),
+                None => ok,
+            };
             StoreAt { ok, row, col }
         },
-        |store, row, out_idx, sum| {
-            let sum = match poison_of {
-                Some((ids, experts)) => {
-                    let RowExpert { valid, .. } = emit_row_expert(store, ids, row, experts);
-                    let poison = emit_poison(store, valid);
-                    bin(store, Ty::F32, BinOp::Add, copy(sum), copy(poison))
-                }
+        |store, _row, out_idx, sum| {
+            let sum = match poison {
+                Some(poison) => bin(store, Ty::F32, BinOp::Add, copy(sum), copy(poison)),
                 None => sum,
             };
             match epilogue {
-                Some(epilogue) => epilogue.emit(store, out_idx, sum),
+                Some(epilogue) => {
+                    let value = epilogue.emit(store, out_idx, sum);
+                    store_value(store, epilogue.epilogue.store(), value)
+                }
                 None => sum,
             }
         },
@@ -1148,7 +1147,6 @@ pub(crate) fn tiled_body(
         statements: vec![],
         terminator: Terminator::Return,
     });
-    blocks_out.extend(walk_blocks);
 
     let mut body = Body::new(name, n_inputs, al.locals, blocks_out);
     body.workgroup_size = [lane_count as u32, 1, 1];
@@ -1256,25 +1254,28 @@ fn staged_word(e: &mut Emit, major: StagedMajor, stride: usize, k: Local, x: Loc
     bin(e, Ty::Usize, BinOp::Add, copy(row), copy(inner))
 }
 
-/// `value`, or exactly `0.0` unless `keep`: a bit-pattern select, so a masked value never multiplies into a sum
-/// whatever it holds.
-fn zero_unless(e: &mut Emit, keep: Local, value: Local) -> Local {
-    let bits = e.let_(
-        Ty::U32,
-        Rvalue::Bitcast {
-            to: Ty::U32,
-            operand: copy(value),
-        },
+/// Activation element `idx` as the f32 value the products read: the f32 element, or the element of the fragment
+/// dtype the planner stored the activation in (POOT-1448), widened exactly.
+fn read_activation(
+    e: &mut Emit,
+    stored: Option<FragmentDtype>,
+    activation: Local,
+    idx: Local,
+) -> Local {
+    let raw = e.let_(
+        stored_ty(stored),
+        Rvalue::Use(Operand::Copy(elem(activation, idx))),
     );
-    let zero = e.let_(Ty::U32, Rvalue::Use(c32(0)));
-    let kept = select_u32(e, keep, bits, zero);
-    e.let_(
-        Ty::F32,
-        Rvalue::Bitcast {
-            to: Ty::F32,
-            operand: copy(kept),
-        },
-    )
+    match stored {
+        None => raw,
+        Some(_) => e.let_(
+            Ty::F32,
+            Rvalue::Cast {
+                to: Ty::F32,
+                operand: copy(raw),
+            },
+        ),
+    }
 }
 
 #[cfg(test)]

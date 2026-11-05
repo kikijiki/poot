@@ -100,8 +100,8 @@ pub fn packed_value_bits(format: WeightFormat) -> u32 {
 /// `schedule`'s loop nest, with `epilogue` applied to each column's sum before its store. The Gemv carries an
 /// epilogue (its leaves ride between the weight sources and the metadata); the block-diagonal tiled schedule has
 /// none yet, so an epilogue on it is a typed refusal. `rows` says how output rows meet weight rows: an
-/// [`PackedRows::Indexed`] table is a Gemv (decode) or the register-tiled schedule inside an expert walk
-/// (prefill), both with an epilogue. `meta` is the request's metadata; a tiled body reads its extents from it
+/// [`PackedRows::Indexed`] table is a Gemv (decode, per-row ids) or the register-tiled schedule over the rows
+/// grouped by expert (prefill), both with an epilogue. `meta` is the request's metadata; a tiled body reads its extents from it
 /// ([`TiledExtents::of_meta`]).
 pub(crate) fn packed_contraction(
     name: &str,
@@ -115,6 +115,7 @@ pub(crate) fn packed_contraction(
     const GENERATOR: &str = "packed_contraction";
     if let Some(epilogue) = epilogue {
         epilogue.require_f32("packed_contraction")?;
+        epilogue.refuse_narrow_store("packed_contraction")?;
     }
     // A packed weight is decoded to f32 inside the nest, so a narrowed or split precision rounds it.
     let read = ProductRead::decoded(precision);
@@ -143,8 +144,7 @@ pub(crate) fn packed_contraction(
                     WeightLayout::Nk,
                     precision,
                     TiledExtents::of_meta(GENERATOR, meta)?,
-                )?
-                .scalar_only(GENERATOR)?,
+                )?,
                 epilogue,
                 read,
             )
@@ -500,7 +500,7 @@ fn contraction_register_tiled(
         metadata: local(2 + source_count as u32),
         out: local(3 + source_count as u32),
         epilogue: None,
-        walk: None,
+        grouped: None,
         read,
     };
     let mut body = match (&block_plan, &planar_plan) {

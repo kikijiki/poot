@@ -17,6 +17,9 @@ export const CHART_METRICS: { key: PointMetric; title: string; wholeRun?: true }
   { key: "e2e_ms", title: "End-to-end (128 tokens)" },
   { key: "peak_rss_bytes", title: "Host memory at inference", wholeRun: true },
   { key: "peak_vram_bytes", title: "GPU memory at inference", wholeRun: true },
+  { key: "weights_bytes", title: "GPU weights (engine-reported)", wholeRun: true },
+  { key: "kv_bytes", title: "GPU KV cache and state (engine-reported)", wholeRun: true },
+  { key: "workspace_bytes", title: "GPU workspace (engine-reported)", wholeRun: true },
   { key: "energy_j", title: "Energy (whole run)", wholeRun: true },
 ];
 
@@ -36,6 +39,12 @@ export const POINT_METRICS: MetricInfo[] = [
   { key: "peak_rss_bytes", label: "Host memory at inference", unit: GIB, higherIsBetter: false },
   { key: "load_vram_bytes", label: "GPU memory while loading", unit: GIB, higherIsBetter: false },
   { key: "load_rss_bytes", label: "Host memory while loading", unit: GIB, higherIsBetter: false },
+  { key: "rss_anon_bytes", label: "Host memory, anonymous (at inference)", unit: GIB, higherIsBetter: false },
+  { key: "rss_file_bytes", label: "Host memory, file-backed (at inference)", unit: GIB, higherIsBetter: false },
+  { key: "weights_bytes", label: "GPU weights, engine-reported", unit: GIB, higherIsBetter: false },
+  { key: "kv_bytes", label: "GPU KV cache and state, engine-reported", unit: GIB, higherIsBetter: false },
+  { key: "workspace_bytes", label: "GPU workspace, engine-reported", unit: GIB, higherIsBetter: false },
+  { key: "staging_bytes", label: "GPU staging, engine-reported", unit: GIB, higherIsBetter: false },
   { key: "energy_j", label: "Energy, whole run", unit: JOULE, higherIsBetter: false },
 ];
 

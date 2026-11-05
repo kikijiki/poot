@@ -116,6 +116,15 @@ fn an_export_keeps_a_buffer_of_its_own_to_the_end_of_the_entry() {
                 "stage {stage}: the export's buffer {buffer} is shared"
             );
             assert_eq!(arena.buffers()[buffer].1, plan.slot_elems(slot));
+            // POOT-1450: a whole-buffer transfer carries no storage, so an export's buffer is typed with its own.
+            assert_eq!(
+                arena.buffers()[buffer].0,
+                stage_program
+                    .storage()
+                    .storage(export.value)
+                    .buffer_storage(),
+                "stage {stage}: the export's buffer is typed"
+            );
         }
     }
     assert!(exports >= 2, "two cuts export the residual: {exports}");

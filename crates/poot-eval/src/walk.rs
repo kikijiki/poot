@@ -416,7 +416,7 @@ fn evaluate_equation(
         }
         OpKind::PackedContraction {
             descriptor,
-            rows: poot_graph_ir::ContractionRows::Indexed { experts },
+            rows: poot_graph_ir::ContractionRows::Indexed { experts, rows },
             precision,
         } => {
             let [x, ids] = [&eqn.inputs[0], &eqn.inputs[1]].map(|operand| match operand {
@@ -434,7 +434,7 @@ fn evaluate_equation(
             opts.allocated(eqn.out, idx, DType::F32, outputs * 4);
             Ok(Value::Host(ops::evaluate_packed_indexed(
                 &x,
-                &ids,
+                (&ids, rows),
                 stack,
                 &out_shape,
                 eqn.out,
@@ -1402,8 +1402,8 @@ fn evaluate_dense(
             ops::movement::scatter_update(&base, &src, &slots, &out_shape, eqn.out)?
         }
         OpKind::ArgTopK { k } => ops::index::arg_top_k(&get(&eqn.inputs[0])?, *k, eqn.out)?,
-        OpKind::ExpertGroup { experts } => {
-            ops::index::expert_group(&get(&eqn.inputs[0])?, *experts)?
+        OpKind::ExpertGroup { experts, block } => {
+            ops::index::expert_group(&get(&eqn.inputs[0])?, *experts, *block)?
         }
         OpKind::Iota { len, dtype } => ComputedConst::Iota {
             len: *len,
@@ -1415,11 +1415,18 @@ fn evaluate_dense(
             let b = get(&eqn.inputs[1])?;
             ops::contraction::matmul_to(&a, &b, &out_shape, *precision)?
         }
-        OpKind::IndexedMatMul { precision } => {
+        OpKind::IndexedMatMul { rows, precision } => {
             let x = get(&eqn.inputs[0])?;
             let w = get(&eqn.inputs[1])?;
             let idx = get(&eqn.inputs[2])?;
-            ops::contraction::indexed_matmul(&x, &w, &idx, &out_shape, eqn.out, *precision)?
+            ops::contraction::indexed_matmul(
+                &x,
+                &w,
+                (&idx, *rows),
+                &out_shape,
+                eqn.out,
+                *precision,
+            )?
         }
         OpKind::DynamicUpdateSlice { axis } => {
             let operand = get(&eqn.inputs[0])?;

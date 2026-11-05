@@ -153,6 +153,9 @@ pub enum RuntimeError {
         /// The buffer's capacity in bytes.
         capacity: usize,
     },
+    /// A buffer refused a typed view (POOT-1450, [`poot_target::BufferStorage::view_elems`]).
+    #[error("view refused: {0}")]
+    View(#[from] poot_target::ViewError),
     /// A typed transfer was requested against a differently represented allocation (card 527: checked
     /// against the buffer's full storage contract - element kind, logical dtype and layout - not just
     /// element kind).

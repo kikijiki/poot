@@ -131,7 +131,16 @@ describe("charts", () => {
       withMetrics("m", { decode_tok_s: stat(1) }, 128, "vulkan"),
     ];
     expect(runBars(points, "peak_rss_bytes").map((b) => [b.label, b.value])).toEqual([["poot (ptx)", 30], ["poot (rocm)", 20]]);
-    expect(CHART_METRICS.filter((m) => m.wholeRun).map((m) => m.key)).toEqual(["peak_rss_bytes", "peak_vram_bytes", "energy_j"]);
+    expect(CHART_METRICS.filter((m) => m.wholeRun).map((m) => m.key)).toEqual(["peak_rss_bytes", "peak_vram_bytes", "weights_bytes", "kv_bytes", "workspace_bytes", "energy_j"]);
+  });
+
+  test("the engine-reported memory classes are charted only for the hardware whose runs recorded them", () => {
+    const GiB = 2 ** 30;
+    const classes = { weights_bytes: stat(GiB), kv_bytes: stat(GiB / 4), workspace_bytes: stat(GiB / 8) };
+    const recorded = hw("full", [withMetrics("m", { decode_tok_s: stat(1), ...classes })]);
+    const stored = hw("old", [withMetrics("m", { decode_tok_s: stat(1) })]);
+    expect(commonMetrics(reportOf(recorded))).toEqual(["decode_tok_s", "weights_bytes", "kv_bytes", "workspace_bytes"]);
+    expect(commonMetrics(reportOf(recorded, stored))).toEqual(["decode_tok_s"]);
   });
 
   test("a memory bar says it includes the load only when the run has no load boundary", () => {

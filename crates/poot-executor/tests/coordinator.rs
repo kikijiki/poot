@@ -270,6 +270,10 @@ impl Device for FakeDevice {
         Ok(buf)
     }
 
+    fn view(&self, buffer: &Buf, _storage: poot_target::BufferStorage) -> Result<Buf, Self::Error> {
+        // A view shares the allocation; this fake states no per-storage bound.
+        Ok(Rc::clone(buffer))
+    }
     fn buffer_elems(&self, buffer: &Buf) -> usize {
         buffer.elems
     }

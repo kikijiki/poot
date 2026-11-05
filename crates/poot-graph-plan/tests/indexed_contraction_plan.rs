@@ -1,6 +1,6 @@
 //! POOT-761: an `IndexedMatMul` compiles to one generated indexed contraction on every backend, the Gemv at a decode
-//! row count and the register-tiled expert walk above it, and a routed gate weighting fuses into it as one
-//! `ContractionEpilogue { head: Indexed }`.
+//! row count and the tiled schedule over the rows grouped by expert above it (POOT-1451), and a routed gate weighting
+//! fuses into it as one `ContractionEpilogue { head: Indexed }`.
 //!
 //! Every row drives the production `compile` for each backend and reads what `Program::planned()` holds.
 
@@ -99,32 +99,48 @@ fn indexed_request(program: &Program) -> &IndexedContraction {
     }
 }
 
-/// SC-003: the decode shape (`M = 5`) plans `Schedule::Gemv` on wgpu, ROCm and PTX, and the prefill shape
-/// (`M = 160`) the register-tiled expert walk (`Schedule::RegisterTiled`).
+/// SC-003: the decode shape (`M = 5`) plans `Schedule::Gemv` over the per-row ids on wgpu, ROCm and PTX, and the
+/// prefill shape (`M = 160`) the register-tiled schedule (exact operands) over the rows grouped by expert: one
+/// `ExpertGroup` whose block is the tiling's tile rows, and the grid's rows its padded positions (POOT-1451).
 ///
 /// Mutation: restore the `SpirvVulkan`-only condition on the Gemv choice (`indexed_gemv_in` gated on the backend);
 /// ROCm and PTX plan the register-tiled schedule at `M = 5` and the decode row goes red.
 #[test]
-fn decode_shape_plans_the_gemv_on_every_backend_and_prefill_the_register_tiled_walk() {
+fn decode_shape_plans_the_gemv_on_every_backend_and_prefill_the_register_tiled_grouped_rows() {
     for backend in backends() {
         for (m, gemv) in [(5, true), (160, false)] {
             let label = format!("{backend:?} M={m}");
             let program = program(&indexed(m, false), backend);
             let request = indexed_request(&program);
-            assert!(
-                match request.schedule {
-                    Schedule::Gemv { .. } => gemv,
-                    Schedule::RegisterTiled { .. } => !gemv,
-                    Schedule::FragmentTiled { .. } =>
-                        panic!("an expert walk keeps the scalar tile"),
-                },
-                "{label}: {:?}",
-                request.schedule
-            );
-            // `[K, N, M, x_groups, tile_offset, E]`: the shapes the shape-generic body reads.
+            let groupings: Vec<usize> = program
+                .planned()
+                .filter_map(|(eqn, _)| match eqn.op {
+                    OpKind::ExpertGroup { block, .. } => Some(block),
+                    _ => None,
+                })
+                .collect();
+            let rows = match request.schedule {
+                Schedule::Gemv { .. } => {
+                    assert!(gemv && groupings.is_empty(), "{label}: {groupings:?}");
+                    m
+                }
+                Schedule::RegisterTiled { .. } => {
+                    let block = request.schedule.output_tile().unwrap().0;
+                    assert!(!gemv && groupings == [block], "{label}: {groupings:?}");
+                    poot_graph_ir::ExpertGrouping {
+                        rows: m,
+                        experts: EXPERTS,
+                        block,
+                    }
+                    .positions()
+                }
+                Schedule::FragmentTiled { .. } => panic!("{label}: exact operands tile scalar"),
+            };
+            // `[K, N, M, x_groups, tile_offset, E]`: the shapes the shape-generic body reads, `M` the grid's rows.
             assert_eq!(
                 [&request.meta[..3], &request.meta[5..6]].concat(),
-                [K as u32, N as u32, m as u32, EXPERTS as u32]
+                [K as u32, N as u32, rows as u32, EXPERTS as u32],
+                "{label}"
             );
         }
     }

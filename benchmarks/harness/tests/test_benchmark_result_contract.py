@@ -252,6 +252,26 @@ class BenchmarkResultContractTests(unittest.TestCase):
                 lambda row: row.pop("runs"),
                 "runs must be a non-empty array",
             ),
+            (
+                "an unknown memory class",
+                lambda row: row.update(memory_classes={"weights_bytes": 1, "heap_bytes": 2}),
+                "unknown class 'heap_bytes'",
+            ),
+            (
+                "a negative memory class",
+                lambda row: row.update(memory_classes={"kv_bytes": -1}),
+                "memory_classes.kv_bytes must be a nonnegative integer",
+            ),
+            (
+                "a fractional memory class",
+                lambda row: row.update(memory_classes={"workspace_bytes": 1.5}),
+                "memory_classes.workspace_bytes must be a nonnegative integer",
+            ),
+            (
+                "an empty memory class map",
+                lambda row: row.update(memory_classes={}),
+                "memory_classes must be a nonempty object",
+            ),
         )
         for name, mutate, expected in cases:
             with self.subTest(name=name):
@@ -265,6 +285,24 @@ class BenchmarkResultContractTests(unittest.TestCase):
                 self.assertEqual(row["peak_vram_bytes"], 101)
                 self.assertEqual(row["caveats"], ["manifest caveat", "runner caveat"])
                 self.assertIn("fixture stderr", row["reason"])
+
+    def test_the_engine_memory_classes_and_the_exact_phases_reach_a_schema_valid_row(self):
+        classes = {"weights_bytes": 8, "kv_bytes": 2, "workspace_bytes": 1, "staging_bytes": 0}
+        payload = {**valid_single(), "memory_classes": classes}
+        row, _ = self.run_payload(payload)
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["memory_classes"], classes)
+        self.assertEqual(row["memory_phases"]["inference"]["rss_anon_bytes"], 120)
+        self.assertEqual((row["peak_rss_anon_bytes"], row["peak_rss_file_bytes"]), (120, 82))
+        self.assert_schema_valid(row)
+
+    def test_a_row_names_the_marks_the_runner_printed_wrong(self):
+        result = observation(valid_single())
+        result.update(memory_phases=None, memory_mark_errors=["malformed benchmark mark: 'POOT_BENCH_MARK load-end 1.0'"])
+        row, _ = self.run_payload(valid_single(), result=result)
+        self.assertEqual(row["status"], "ok")
+        self.assertNotIn("memory_phases", row)
+        self.assertIn("memory split unavailable: malformed benchmark mark: 'POOT_BENCH_MARK load-end 1.0'", row["caveats"])
 
     def test_final_error_objects_are_authoritative_and_keep_diagnostics(self):
         valid = json.dumps(valid_single())

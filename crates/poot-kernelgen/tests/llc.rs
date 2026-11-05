@@ -720,9 +720,10 @@ fn generated_pointwise_and_batched_tiled_bodies_lower_on_every_gpu_target() {
                 out_per_block: n,
                 k,
                 layout: WeightLayout::Kn,
-                segments: 1,
+                rows: poot_kernelgen::TiledRows::Dense,
                 terms: poot_kernelgen::StagedTerms::ONE,
                 weight_bits: 32,
+                activation_bits: 32,
             },
             &caps,
         );
@@ -737,6 +738,7 @@ fn generated_pointwise_and_batched_tiled_bodies_lower_on_every_gpu_target() {
                 grid: [(tiles * lanes) as u32, 1, 1],
                 meta: vec![k as u32, n as u32, m as u32, tiles as u32, 0],
                 precision: poot_graph_ir::OperandPrecision::Exact,
+                activation_stored: None,
             }));
         let limits = poot_kernelgen::BodyLimits {
             max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),

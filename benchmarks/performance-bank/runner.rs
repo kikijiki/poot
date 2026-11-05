@@ -438,6 +438,152 @@ fn dense_contraction(bank: &Value, case: &Value, ops: Operands) -> Result<Prepar
     })
 }
 
+/// One routed expert projection of a MoE prefill: `tokens * top_k` rows (each a token at one of its slots) through
+/// the indexed contraction against a stack of `experts` weights, the rows in row order as a model traces them
+/// (`compile` groups them by expert for a tiled contraction). Each row's expert is drawn from the fixture stream,
+/// uniform over the experts (`order: "routed"` or `"shuffled"`), or the same draws sorted ascending (`"sorted"`).
+/// The stack is f32 `[E, K, N]` (`kn`) or the checkpoint's bf16 `[E, N, K]` (`nk`, read through its transposed
+/// view). The f64 reference contracts each row against its own expert.
+fn grouped_experts(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String> {
+    let shape = &case["shape"];
+    let (tokens, experts, k, n) = (
+        dim(shape, "tokens")?,
+        dim(shape, "experts")?,
+        dim(shape, "k")?,
+        dim(shape, "n")?,
+    );
+    let top_k = shape["top_k"].as_u64().map_or(1, |v| v as usize);
+    let rows = tokens * top_k;
+    let nk = match (case["storage"].as_str(), case["layout"].as_str()) {
+        (Some("f32"), Some("kn")) => false,
+        (Some("bf16"), Some("nk")) => true,
+        other => {
+            return Err(format!(
+                "grouped_experts measures f32 kn or bf16 nk, got {other:?}"
+            ));
+        }
+    };
+    let elem_bytes = if nk { 2 } else { 4 };
+    let copies = weight_copies(bank, case, experts * k * n * elem_bytes)?;
+    let mut stream = SplitMix64(
+        bank["token_fixtures"][case["token_fixture"].as_str().unwrap()]["seed"]
+            .as_u64()
+            .ok_or("fixture has no seed")?,
+    );
+    // One activation row per token; routed row `r` is token `r / top_k` at its slot `r % top_k`.
+    let x = stream.tensor(tokens * k);
+    let x_read: Vec<f64> = x.iter().map(|&v| ops.round(v)).collect();
+    let mut ids: Vec<i32> = stream
+        .tensor(rows)
+        .into_iter()
+        .map(|u| ((((u + 1.0) * 0.5) * experts as f32) as usize).min(experts - 1) as i32)
+        .collect();
+    match shape["order"].as_str() {
+        Some("routed" | "shuffled") => {}
+        Some("sorted") => ids.sort_unstable(),
+        other => return Err(format!("unknown routing order {other:?}")),
+    }
+    let mut consts = vec![("x".to_string(), HostTensor::f32(vec![tokens, k], x.clone()))];
+    let (mut graphs, mut references, mut slots) = (Vec::new(), Vec::new(), Vec::new());
+    for copy in 0..copies {
+        let draws = stream.tensor(experts * k * n);
+        let name = format!("w{copy}");
+        // `w_read(e, kk, col)`: the weight value the products read, from the stored layout.
+        let (stored, w_read): (HostTensor, Vec<f64>) = if nk {
+            let words: Vec<u16> = draws.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+            let read = words
+                .iter()
+                .map(|&bits| ops.round(f32::from_bits(u32::from(bits) << 16)))
+                .collect();
+            (HostTensor::bf16(vec![experts, n, k], words), read)
+        } else {
+            let read = draws.iter().map(|&v| ops.round(v)).collect();
+            (HostTensor::f32(vec![experts, k, n], draws), read)
+        };
+        let at = |e: usize, kk: usize, col: usize| {
+            if nk {
+                (e * n + col) * k + kk
+            } else {
+                (e * k + kk) * n + col
+            }
+        };
+        let mut want = vec![0.0f64; rows * n];
+        for row in 0..rows {
+            let (e, token) = (ids[row] as usize, row / top_k);
+            let xs = &x_read[token * k..(token + 1) * k];
+            for (col, acc) in want[row * n..(row + 1) * n].iter_mut().enumerate() {
+                *acc = xs
+                    .iter()
+                    .enumerate()
+                    .map(|(kk, &a)| a * w_read[at(e, kk, col)])
+                    .sum();
+            }
+        }
+        references.push(want);
+        let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
+        // The routed rows as the MoE block traces them: each token's row broadcast over its `top_k` slots.
+        let tokens_x = b.constant("x", TensorType::f32(vec![tokens, k])).unwrap();
+        let xi = b
+            .reshape(
+                b.broadcast(
+                    b.reshape(tokens_x, vec![tokens, 1, k]).unwrap(),
+                    vec![tokens, top_k, k],
+                )
+                .unwrap(),
+                vec![rows, k],
+            )
+            .unwrap();
+        let wi = if nk {
+            let stack = b
+                .constant(
+                    &name,
+                    TensorType::new(vec![experts, n, k], poot_tensor::DType::BF16),
+                )
+                .unwrap();
+            b.transpose(stack, vec![0, 2, 1]).unwrap()
+        } else {
+            b.constant(&name, TensorType::f32(vec![experts, k, n]))
+                .unwrap()
+        };
+        let idi = b
+            .slot_named_ranged(
+                poot_graph_ir::Slot::Activation,
+                "ids",
+                TensorType::new(vec![rows], poot_tensor::DType::I32),
+                poot_graph_ir::IndexRange::below(experts).ok_or("experts must be non-zero")?,
+            )
+            .unwrap();
+        let y = b.indexed_matmul(xi, wi, idi).unwrap();
+        let graph = b.finish(y).unwrap();
+        // Every copy's graph declares the one ids slot alike; it is bound once per step.
+        if slots.is_empty() {
+            let key = graph
+                .meta(idi.id())
+                .slot_key()
+                .cloned()
+                .ok_or("the ids slot has no slot key")?;
+            let bytes = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+            slots.push((key, vec![rows], bytes));
+        }
+        graphs.push(graph);
+        consts.push((name, stored));
+    }
+    Ok(Prepared {
+        graphs,
+        consts,
+        references,
+        out_shape: vec![rows, n],
+        slots,
+        observed: json!({
+            "shape": shape.clone(),
+            "storage": case["storage"].clone(),
+            "layout": case["layout"].clone(),
+            "weight_copies": copies,
+            "weight_bytes_per_copy": experts * k * n * elem_bytes,
+        }),
+    })
+}
+
 /// Causal prefill attention: `lq` query rows at the last `lq` positions of a `cap`-key context, under the
 /// causal mask a model derives from `Slot::Pos` (`causal_mask_from_pos`), so the planner sees the prefill
 /// graph a model traces. GQA with `hq / hkv` query heads per KV head. The f64 reference attends each query at
@@ -835,6 +981,7 @@ fn prepare(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String
         Some("attention_decode") => attention_decode(bank, case),
         Some("attention_prefill") => attention_prefill(bank, case),
         Some("recurrence_scan") => recurrence_scan(bank, case),
+        Some("grouped_experts") => grouped_experts(bank, case, ops),
         other => Err(format!("no runner for producer {other:?}")),
     }
 }

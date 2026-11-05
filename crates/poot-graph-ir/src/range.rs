@@ -363,12 +363,13 @@ fn equation_range(
                 .unwrap_or(IndexRange::I32),
             _ => IndexRange::I32,
         },
-        OpKind::ExpertGroup { .. } => match inputs.first() {
+        // The padded order holds rows and the sentinel `rows`; the tile words hold buckets `0..=experts`.
+        OpKind::ExpertGroup { experts, .. } => match inputs.first() {
             Some(Operand::Value(id)) => graph
                 .aval(*id)
                 .shape
                 .first()
-                .and_then(|&rows| IndexRange::below(rows.max(1)))
+                .and_then(|&rows| IndexRange::below(rows.max(*experts) + 1))
                 .unwrap_or(IndexRange::I32),
             _ => IndexRange::I32,
         },

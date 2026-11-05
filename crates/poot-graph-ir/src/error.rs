@@ -1169,13 +1169,16 @@ pub enum ShapeError {
         extent: usize,
     },
 
-    /// The expert grouping needs rank-1 ids and at least one expert.
+    /// The expert grouping needs rank-1 ids, at least one expert and a non-empty tile.
     #[error(
-        "expert_group needs rank-1 ids and at least one expert, got {experts} experts and ids {ids:?}"
+        "expert_group needs rank-1 ids, at least one expert and a block of at least one row, got {experts} \
+         experts, block {block} and ids {ids:?}"
     )]
     ExpertGroup {
         /// The expert count.
         experts: usize,
+        /// The positions per tile.
+        block: usize,
         /// The ids' shape.
         ids: Vec<usize>,
     },

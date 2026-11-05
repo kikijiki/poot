@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 
-use poot_target::BufferStorage;
+use poot_target::{BufferStorage, FragmentDtype};
 
 use crate::KernelGenError;
+use crate::emit::Emit;
 use crate::helpers::{
     Alloc, BodySize, Layout, WeightLane, copy, elem, emit_lds_tree_blocks_at, guard, ld,
-    lds_tree_block_count, local, row_major_strides, slice_dtype, slice_f32, view_eff_strides,
+    lds_tree_block_count, local, row_major_strides, slice_dtype, view_eff_strides,
 };
+use crate::precision::{fragment_ty, round_to_fragment, store_value, stored_ty};
 
 use poot_kernel_ir::{
     BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, IntScalarOp, Local, MathOp, Operand,
@@ -58,6 +60,19 @@ pub enum FusedScalarOp {
     /// kernel. The one step that takes an I32 word into a float region: the words are read in place and
     /// converted in a register, so neither a producer nor a consumer of the cast needs a kernel for it.
     I32ToF32,
+    /// `Cast` of an f32 value to a fragment dtype (POOT-1448): the value rounded to nearest even, the rounding every
+    /// narrowed operand read applies (one emitter for both). A body whose output is this step stores elements of
+    /// the dtype, so the value is rounded once, where it is computed, and its readers read it as stored.
+    Narrow(FragmentDtype),
+}
+
+/// The fragment dtype a body whose output is `op` stores its elements in: `Some` exactly for a
+/// [`FusedScalarOp::Narrow`] output, `None` for an f32 store.
+pub(crate) fn narrow_store(op: FusedScalarOp) -> Option<FragmentDtype> {
+    match op {
+        FusedScalarOp::Narrow(dtype) => Some(dtype),
+        _ => None,
+    }
 }
 
 /// A kernel-ir comparison op: yields i1, so when it appears in an f32 pipeline its result is cast to f32
@@ -204,6 +219,13 @@ pub(crate) fn emit_scalar_op(
             operands[1].clone(),
             operands[2].clone(),
         ),
+        FusedScalarOp::Narrow(dtype) => {
+            let mut e = Emit::new(al);
+            let x = e.let_(Ty::F32, Rvalue::Use(operands[0].clone()));
+            let rounded = round_to_fragment(&mut e, dtype, x);
+            stmts.extend(e.take());
+            Rvalue::Use(copy(Place::local(rounded)))
+        }
         FusedScalarOp::Clz | FusedScalarOp::GeU | FusedScalarOp::RemU => {
             panic!("I32 fused op in the f32 synthesizer")
         }
@@ -411,6 +433,18 @@ impl RowKernel {
             RowValue::Step(step) => self.n_leaves + step.index(),
         }
     }
+
+    /// The fragment dtype the output is stored in: that of a [`FusedScalarOp::Narrow`] output step, `None` for an
+    /// f32 output.
+    pub(crate) fn store(&self) -> Option<FragmentDtype> {
+        match self.output {
+            RowValue::Step(step) => match &self.steps[step.index()] {
+                RowOp::Pointwise { op, .. } => narrow_store(*op),
+                RowOp::Reduce { .. } => None,
+            },
+            RowValue::Leaf(_) => None,
+        }
+    }
 }
 
 impl FusedKernel {
@@ -449,6 +483,12 @@ impl FusedScalarOp {
             Self::Erf => (24, 23),
             Self::Select => (2, 1),
             Self::GeU | Self::RemU => (4, 3),
+            // The operand's copy, the rounding's own statements and the copy of its result; the store's narrowing
+            // is one more, which a narrowed output step is the only one to need.
+            Self::Narrow(dtype) => {
+                let rounding = crate::precision::rounding_statements(dtype);
+                (rounding + 3, rounding + 2)
+            }
         };
         BodySize {
             instructions,
@@ -787,6 +827,13 @@ fn check_float_region_tys(
             {
                 Ty::I32
             }
+            // The rounding of an f32 value to a fragment dtype (POOT-1448): a value of that dtype.
+            FusedScalarOp::Narrow(dtype) => {
+                if operand_tys.first() != Some(&Ty::F32) {
+                    return Err(refuse(0));
+                }
+                fragment_ty(dtype)
+            }
             op => {
                 // A float step. Its value operands are all F32, and it computes in F32; or all one two-byte float
                 // type `T`, and it computes in F32 on their widened values and rounds back to `T`, as the unfused
@@ -917,6 +964,17 @@ pub fn fused_views(
         let step_ty = &region_tys.steps[s];
         if *step_ty == Ty::I32 {
             emit_scalar_op_i32(step_reg[s], step.op, &operands, &mut al, &mut body);
+        } else if let FusedScalarOp::Narrow(_) = step.op {
+            // Rounded once, then held as the two-byte value it is exact in.
+            let rounded = al.add(Ty::F32, false);
+            emit_scalar_op(rounded, step.op, &operands, &mut al, &mut body);
+            body.push(Statement::Assign(
+                Place::local(step_reg[s]),
+                Rvalue::Narrow {
+                    to: step_ty.clone(),
+                    operand: copy(Place::local(rounded)),
+                },
+            ));
         } else if matches!(step_ty, Ty::BF16 | Ty::F16) && step.op != FusedScalarOp::Select {
             // A two-byte float step: widen each value operand to F32, compute, round the result to the step's type.
             for (operand, input) in operands.iter_mut().zip(&step.inputs) {
@@ -1771,7 +1829,7 @@ pub fn fused_row_parallel_views(
     for lane in &lanes {
         locals.push(lane.param());
     }
-    locals.push(ld(slice_f32(true), true));
+    locals.push(ld(slice_dtype(stored_ty(k.store()), true), true));
     let mut al = Alloc::new(locals);
     let out_local = local((n + 1) as u32);
     let row = al.add(Ty::Usize, false);
@@ -2050,6 +2108,12 @@ pub fn fused_row_parallel_views(
         &mut body_stmts,
         &mut memo,
     );
+    let out_val = {
+        let mut e = Emit::new(&mut al);
+        let stored = store_value(&mut e, k.store(), out_val);
+        body_stmts.extend(e.take());
+        stored
+    };
     body_stmts.push(Statement::Assign(
         elem(out_local, i_local),
         Rvalue::Use(copy(Place::local(out_val))),
@@ -2127,10 +2191,69 @@ mod tests {
     use poot_wgpu_runtime::KernelBuffer;
 
     use super::*;
+    use crate::helpers::slice_f32;
     use crate::unit_helpers::{assert_staged, ctx, spv, stage_nvptx};
 
     /// Build the one-pass RMSNorm RowKernel (leaves x, w) for `n_cols` columns. Shared by the serial and
     /// parallel equivalence test.
+    /// POOT-1448: a row kernel whose output is a `Narrow` step stores its f32 result rounded once to the fragment
+    /// dtype (the oracle's `round_to_fragment`, bit for bit) into an output of that dtype. A one-pass RMSNorm over rows
+    /// wider than the workgroup, at both dtypes. Mutation: emit `FusedScalarOp::Narrow` as a plain copy (no
+    /// `round_to_fragment`); the store's exact narrowing then faults in the interpreter (`InexactNarrow`).
+    #[test]
+    fn a_narrowed_row_output_is_stored_rounded_once() {
+        use poot_kernel_ir::interp::{Buffer, run};
+        let (num_rows, n_cols, w) = (3usize, 40usize, 8usize);
+        let f32_kernel = rmsnorm_kernel(n_cols, 1e-6);
+        let out_shape = [num_rows, n_cols];
+        let leaves: [&[usize]; 2] = [&[num_rows, n_cols], &[n_cols]];
+        let layouts = [
+            Layout::contiguous(&[num_rows, n_cols]),
+            Layout::contiguous(&[n_cols]),
+        ];
+        let x: Vec<f32> = (0..num_rows * n_cols)
+            .map(|i| (i as f32 * 0.37).sin() * 3.0 + 0.25)
+            .collect();
+        let wt: Vec<f32> = (0..n_cols).map(|j| 0.5 + j as f32 * 0.013).collect();
+        let interpret = |kernel: &RowKernel, out: Buffer| -> Buffer {
+            let body = fused_row_parallel_views("row", &out_shape, &leaves, &layouts, kernel, w, 1)
+                .expect("the row body generates");
+            let mut buffers = vec![Buffer::from_f32s(&x), Buffer::from_f32s(&wt), out];
+            run(&body, [num_rows as u32, 1, 1], &mut buffers).expect("interpreter");
+            buffers.pop().unwrap()
+        };
+        let wide = interpret(
+            &f32_kernel,
+            Buffer::from_f32s(&vec![0.0; num_rows * n_cols]),
+        )
+        .to_f32s()
+        .unwrap();
+        for (dtype, ty) in [
+            (FragmentDtype::Bf16, Ty::BF16),
+            (FragmentDtype::F16, Ty::F16),
+        ] {
+            let mut narrowed = f32_kernel.clone();
+            narrowed.steps.push(RowOp::Pointwise {
+                op: FusedScalarOp::Narrow(dtype),
+                inputs: vec![FusedInput::Step(StepId::new(6))],
+            });
+            narrowed.output = RowValue::Step(StepId::new(7));
+            let got = interpret(
+                &narrowed,
+                Buffer::from_halves(ty.clone(), &vec![0.0; num_rows * n_cols]),
+            )
+            .to_halves()
+            .unwrap();
+            for (i, (got, wide)) in got.iter().zip(&wide).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    poot_eval::round_to_fragment(dtype, *wide).to_bits(),
+                    "{dtype:?} element {i}: {got} from {wide}"
+                );
+            }
+        }
+    }
+
     fn rmsnorm_kernel(n_cols: usize, eps: f32) -> RowKernel {
         RowKernel {
             n_leaves: 2, // x, w

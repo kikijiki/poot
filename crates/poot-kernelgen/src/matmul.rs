@@ -63,6 +63,7 @@ pub fn matmul_batched_epilogue_dt_grid(
     x_groups: Option<usize>,
     precision: OperandPrecision,
 ) -> Result<Body, KernelGenError> {
+    epilogue.refuse_narrow_store("matmul_batched_epilogue_dt_grid")?;
     let lanes = epilogue.lanes("matmul_batched_epilogue_dt_grid")?;
     Ok(matmul_batched_impl(
         name,

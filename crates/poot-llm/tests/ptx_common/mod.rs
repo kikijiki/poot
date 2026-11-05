@@ -245,6 +245,13 @@ impl Device for PtxDeviceProxy<'_> {
     ) -> Result<Self::Buffer, Self::Error> {
         self.0.allocate(role, storage, elems)
     }
+    fn view(
+        &self,
+        buffer: &Self::Buffer,
+        storage: poot_target::BufferStorage,
+    ) -> Result<Self::Buffer, Self::Error> {
+        self.0.view(buffer, storage)
+    }
     fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
         self.0.buffer_elems(buffer)
     }

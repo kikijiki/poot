@@ -11,8 +11,8 @@ use super::tiled::{TiledBody, TiledExtents, TiledLaunch, TiledWeight, tiled_body
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, copy};
 use crate::helpers::{Alloc, WeightLane, WeightLayout, ld, local, slice_dtype, slice_f32};
-use crate::precision::ProductRead;
-use poot_graph_ir::OperandPrecision;
+use crate::precision::{ProductRead, stored_ty};
+use poot_graph_ir::{FragmentDtype, OperandPrecision};
 
 /// The weight of a dense `M > 1` contraction: its orientation and its planned storage. Only the checkpoint's
 /// `[N, K]` order reads a narrow (packed) weight; a `[K, N]` weight (the operand of a traced `MatMul`) is f32, so a
@@ -71,6 +71,7 @@ pub(crate) fn dense_contraction(
     let lane = WeightLane::of("dense_contraction", weight)?;
     if let Some(epilogue) = epilogue {
         epilogue.require_f32("dense_contraction")?;
+        epilogue.refuse_narrow_store("dense_contraction")?;
     }
     match schedule {
         Schedule::Gemv {
@@ -108,8 +109,12 @@ pub(crate) fn dense_tiled_contraction(
     schedule: Schedule,
     extents: TiledExtents,
     epilogue: Option<&Epilogue>,
-    precision: OperandPrecision,
+    read: TiledRead,
 ) -> Result<Body, KernelGenError> {
+    let TiledRead {
+        precision,
+        activation_stored,
+    } = read;
     const GENERATOR: &str = "dense_tiled_contraction";
     let lane = weight.lane(GENERATOR)?;
     let launch = TiledLaunch::of(schedule, weight.layout(), precision, extents)?;
@@ -122,16 +127,17 @@ pub(crate) fn dense_tiled_contraction(
         }
         None => Vec::new(),
     };
+    let store = epilogue.and_then(Epilogue::store);
     let mut params = vec![
         ld(Ty::Unit, false),
-        ld(slice_f32(false), false),
+        ld(slice_dtype(stored_ty(activation_stored), false), false),
         lane.param(),
     ];
     if let Some(epilogue) = epilogue {
         params.extend(leaf_lanes.iter().map(|&lane| epilogue.leaf_param(lane)));
     }
     params.push(ld(slice_dtype(Ty::U32, false), false));
-    params.push(ld(slice_f32(true), true));
+    params.push(ld(slice_dtype(stored_ty(store), true), true));
     let (activation, weight_buffer) = (local(1), local(2));
     let leaves: Vec<Local> = (0..leaf_count).map(|j| local(3 + j as u32)).collect();
     let spec = TiledBody {
@@ -145,8 +151,11 @@ pub(crate) fn dense_tiled_contraction(
             leaves: &leaves,
             lanes: &leaf_lanes,
         }),
-        walk: None,
-        read: ProductRead::dense(precision, lane),
+        grouped: None,
+        read: ProductRead {
+            activation_stored,
+            ..ProductRead::dense(precision, lane)
+        },
     };
     let rows_aligned = k.is_multiple_of(lane.per_word());
     let word_aligned = rows_aligned && launch.run().is_multiple_of(lane.per_word());
@@ -168,6 +177,15 @@ pub(crate) fn dense_tiled_contraction(
             },
         ),
     })
+}
+
+/// How a dense tiled contraction reads its activation (POOT-1448): the declared precision of its products, and the
+/// fragment dtype the activation buffer holds its values in, if the planner stored it narrow (`None`: f32). An
+/// activation stored in the fragment dtype of a narrowed read is exact in it and enters unrounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TiledRead {
+    pub(crate) precision: OperandPrecision,
+    pub(crate) activation_stored: Option<FragmentDtype>,
 }
 
 /// The element index of value `k0` of weight row `row` in a row-major `[_, k]` weight.
@@ -319,9 +337,10 @@ mod tests {
                     out_per_block: n,
                     k,
                     layout: weight.layout(),
-                    segments: 1,
+                    rows: crate::TiledRows::Dense,
                     terms: StagedTerms::ONE,
                     weight_bits: weight.bits(),
+                    activation_bits: 32,
                 };
                 for tiling in RegisterTiling::candidates(tiled_shape, &caps) {
                     let body = dense_tiled_contraction(
@@ -333,7 +352,10 @@ mod tests {
                             out_per_block: n,
                         },
                         None,
-                        poot_graph_ir::OperandPrecision::Exact,
+                        super::TiledRead {
+                            precision: poot_graph_ir::OperandPrecision::Exact,
+                            activation_stored: None,
+                        },
                     )
                     .expect("a planned tiling generates");
                     let (tile_rows, tile_cols) = tiling.output_tile();
@@ -355,6 +377,119 @@ mod tests {
                             i % n
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// POOT-1448: under a narrowed precision, an activation the planner stored in the fragment dtype is read as stored
+    /// (the products read the same values as when the body rounds an f32 activation itself), and an epilogue whose
+    /// output is a `Narrow` step stores each sum rounded once: at every planned tiling, over a bf16 `[N, K]` weight,
+    /// with a `K` tail and with whole rounds, the narrow body's output is the f32 body's, rounded to nearest even.
+    /// Mutation: in `tiled_body` read the activation as f32 whatever its storage (`read_activation(load, None, ..)`);
+    /// the interpreter faults on the bf16 buffer read as f32.
+    #[test]
+    fn a_narrow_stored_activation_and_a_narrowed_store_match_the_f32_body() {
+        use crate::{Epilogue, EpilogueInput, EpilogueStep, FusedScalarOp};
+        use poot_graph_ir::{FragmentDtype, OperandPrecision};
+        use poot_kernel_ir::Ty;
+        let caps = DeviceCaps::rocm_default();
+        let precision = OperandPrecision::Narrow(FragmentDtype::Bf16);
+        let weight = DenseTiledWeight::Nk(BufferStorage::bf16_packed());
+        let (m, n) = (37usize, 41usize);
+        for k in [20usize, 64] {
+            // Activation values that are not bf16 values, so the f32 body rounds them where it stages them.
+            let activation: Vec<f32> = values(m * k, 1)
+                .iter()
+                .enumerate()
+                .map(|(i, v)| v + (i % 7) as f32 * 1.0e-3)
+                .collect();
+            let weights = values(n * k, 2);
+            let narrow_store = Epilogue {
+                dt: Ty::F32,
+                out_shape: vec![m, n],
+                leaves: Vec::new(),
+                steps: vec![EpilogueStep {
+                    op: FusedScalarOp::Narrow(FragmentDtype::Bf16),
+                    inputs: vec![EpilogueInput::Head],
+                }],
+                output: EpilogueInput::Step(0),
+            };
+            let shape = |activation_bits| TiledShape {
+                blocks: 1,
+                m_per_block: m,
+                out_per_block: n,
+                k,
+                layout: weight.layout(),
+                rows: crate::TiledRows::Dense,
+                terms: StagedTerms::of(precision, None, Some(FragmentDtype::Bf16)),
+                weight_bits: weight.bits(),
+                activation_bits,
+            };
+            for tiling in RegisterTiling::candidates(shape(16), &caps) {
+                let (tile_rows, tile_cols) = tiling.output_tile();
+                let tiles = m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
+                let meta = [k as u32, n as u32, m as u32, tiles as u32, 0];
+                let extents = super::TiledExtents {
+                    k,
+                    out_per_block: n,
+                };
+                let interpret = |body: &poot_kernel_ir::Body, activation: Buffer, out: Buffer| {
+                    let mut buffers = vec![
+                        activation,
+                        stored(weight, &weights),
+                        Buffer::from_u32s(&meta),
+                        out,
+                    ];
+                    run(body, [tiles as u32, 1, 1], &mut buffers).expect("interpreter");
+                    buffers.pop().unwrap()
+                };
+                let wide = dense_tiled_contraction(
+                    "wide",
+                    weight,
+                    tiling.schedule(),
+                    extents,
+                    None,
+                    super::TiledRead {
+                        precision,
+                        activation_stored: None,
+                    },
+                )
+                .expect("a planned tiling generates");
+                let narrow = dense_tiled_contraction(
+                    "narrow",
+                    weight,
+                    tiling.schedule(),
+                    extents,
+                    Some(&narrow_store),
+                    super::TiledRead {
+                        precision,
+                        activation_stored: Some(FragmentDtype::Bf16),
+                    },
+                )
+                .expect("a planned tiling generates");
+                let want = interpret(
+                    &wide,
+                    Buffer::from_f32s(&activation),
+                    Buffer::from_f32s(&vec![0.0; m * n]),
+                )
+                .to_f32s()
+                .unwrap();
+                let got = interpret(
+                    &narrow,
+                    Buffer::from_halves(Ty::BF16, &activation),
+                    Buffer::from_halves(Ty::BF16, &vec![0.0; m * n]),
+                )
+                .to_halves()
+                .unwrap();
+                for (i, (got, want)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        got.to_bits(),
+                        poot_eval::round_to_fragment(FragmentDtype::Bf16, *want).to_bits(),
+                        "K={k} {tiling:?} [{}, {}]: {got} from {want}",
+                        i / n,
+                        i % n
+                    );
                 }
             }
         }

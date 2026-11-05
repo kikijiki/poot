@@ -84,6 +84,33 @@ fn weight_buffer(storage: BufferStorage, layout: kg::WeightLayout) -> Buffer {
     Buffer::from_u32s(&words)
 }
 
+/// The block-aligned grouping of `ids` in tiles of `block` ([`poot_graph_ir::ExpertGrouping`]), built bucket by
+/// bucket on the host: what an `ExpertGroup` computes.
+fn grouping(ids: &[i32], block: usize) -> Vec<i32> {
+    let layout = poot_graph_ir::ExpertGrouping {
+        rows: ids.len(),
+        experts: EXPERTS,
+        block,
+    };
+    let bucket = |id: i32| if valid(id) { id as usize } else { EXPERTS };
+    let (mut order, mut tiles) = (Vec::new(), Vec::new());
+    for b in 0..=EXPERTS {
+        let rows: Vec<i32> = (0..ids.len())
+            .filter(|&r| bucket(ids[r]) == b)
+            .map(|r| r as i32)
+            .collect();
+        for chunk in rows.chunks(block) {
+            order.extend_from_slice(chunk);
+            order.resize(order.len() + block - chunk.len(), ids.len() as i32);
+            tiles.push(b as i32);
+        }
+    }
+    order.resize(layout.positions(), ids.len() as i32);
+    tiles.resize(layout.tiles(), EXPERTS as i32);
+    order.extend(tiles);
+    order
+}
+
 /// The generated request for `m` rows under `schedule`, its kernel run on the interpreter, the `[m, N]` output.
 fn run_indexed(
     schedule: kg::Schedule,
@@ -97,16 +124,25 @@ fn run_indexed(
         max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),
         max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),
     };
-    let (grid, x_groups) = match schedule {
-        kg::Schedule::Gemv { .. } => ([schedule.grid_threads(1, m, N) as u32, 1, 1], 0),
+    // The Gemv reads the ids; a tiled schedule reads their grouping in tiles of its output rows, whose positions
+    // are its grid rows.
+    let (grid, x_groups, rows, experts) = match schedule {
+        kg::Schedule::Gemv { .. } => ([schedule.grid_threads(1, m, N) as u32, 1, 1], 0, m, ids(m)),
         kg::Schedule::RegisterTiled { .. } | kg::Schedule::FragmentTiled { .. } => {
             let (tile_rows, tile_cols) = schedule.output_tile().unwrap();
-            let tiles = (m.div_ceil(tile_rows) * N.div_ceil(tile_cols)) as u32;
+            let groups = grouping(&ids(m), tile_rows);
+            let positions = poot_graph_ir::ExpertGrouping {
+                rows: m,
+                experts: EXPERTS,
+                block: tile_rows,
+            }
+            .positions();
+            let tiles = (positions.div_ceil(tile_rows) * N.div_ceil(tile_cols)) as u32;
             let lanes = kg::RegisterTiling::of(schedule).unwrap().workgroup_lanes() as u32;
             // A folded grid when asked: `x_groups` tiles along X and as many rows of them as cover the rest.
             let x_groups = x_groups.unwrap_or(tiles);
             let y_groups = tiles.div_ceil(x_groups);
-            ([x_groups * lanes, y_groups, 1], x_groups)
+            ([x_groups * lanes, y_groups, 1], x_groups, positions, groups)
         }
     };
     let request =
@@ -116,7 +152,7 @@ fn run_indexed(
             weight,
             epilogue: None,
             grid,
-            meta: vec![K as u32, N as u32, m as u32, x_groups, 0, EXPERTS as u32],
+            meta: vec![K as u32, N as u32, rows as u32, x_groups, 0, EXPERTS as u32],
             precision: poot_graph_ir::OperandPrecision::Exact,
         }));
     let generated = kg::generate(&request, &caps, &limits).unwrap();
@@ -124,7 +160,7 @@ fn run_indexed(
     let mut buffers = [
         Buffer::from_f32s(&fill(1, m * K)),
         weight_buffer(weight, layout),
-        Buffer::from_i32s(&ids(m)),
+        Buffer::from_i32s(&experts),
         Buffer::from_u32s(generated.launch.meta.as_ref().unwrap()),
         Buffer::from_f32s(&vec![f32::MIN; m * N]),
     ];
@@ -162,8 +198,8 @@ fn assert_rows(label: &str, got: &[f32], m: usize) {
     }
 }
 
-/// Every refusal id yields a NaN row and no read leaves the table, on the Gemv and on the register-tiled schedule's
-/// expert walk (the latter also over a folded grid, which the device rows never reach), over an f32 weight and over a BF16 one
+/// Every refusal id yields a NaN row and no read leaves the table, on the Gemv (per-row ids) and on the register-tiled
+/// schedule over the rows' grouping (also over a folded grid, which the device rows never reach), over an f32 weight and over a BF16 one
 /// held packed two per word (the weight buffer then has half the words, so the clamp bounds a word read too), in
 /// both expert layouts, and every valid row is bit-exact with the sequential f32 sum over the widened weights.
 ///
@@ -188,9 +224,13 @@ fn an_invalid_expert_id_is_a_nan_row_and_never_an_out_of_range_read() {
                     out_per_block: N,
                     k: K,
                     layout,
-                    segments: EXPERTS,
+                    rows: kg::TiledRows::Grouped {
+                        groups: EXPERTS + 1,
+                        block: 16,
+                    },
                     terms: poot_kernelgen::StagedTerms::ONE,
                     weight_bits: kg::DenseTiledWeight::Nk(weight).bits(),
+                    activation_bits: 32,
                 },
                 &DeviceCaps::wgpu_rdna3_igpu(),
             )
@@ -208,7 +248,7 @@ fn an_invalid_expert_id_is_a_nan_row_and_never_an_out_of_range_read() {
                 &run_indexed(tiled, m, None, layout, weight),
                 m,
             );
-            // 2 row-tiles folded onto a 1-wide X grid: the body rebuilds `gy * x_groups + gx`.
+            // The grouping's row tiles folded onto a 1-wide X grid: the body rebuilds `gy * x_groups + gx`.
             let m = 21;
             assert_rows(
                 &label("tiled folded"),

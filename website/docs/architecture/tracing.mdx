@@ -133,8 +133,10 @@ consts.
 MoE layers (`ops::moe`, `moe_sparse`, `moe_grouped`) score experts, pick the top-k ids with `ArgTopK`, and contract each row
 against its own expert with `IndexedMatMul`. Expert ids are runtime values computed in-graph each token; the structure is fixed.
 
-- **Prefill** groups `(token, slot)` rows by expert: `ExpertGroup` returns the stable sort and its inverse, rows are gathered
-  into expert order, contracted, then gathered back. A tile then shares each expert's weight tile across rows.
+- The tracer contracts the `(token, slot)` rows in row order. Grouping them is the compiler's: when the target tiles an
+  indexed contraction (prefill), `compile` inserts an `ExpertGroup` that pads each expert's rows to whole tiles, and the
+  contraction reads its rows through it, so every tile is one expert's rows and runs on the matrix units where the
+  device has them. The result stays in row order.
 - **Decode** has too few rows to gain, so it contracts directly.
 - **Weights:** dense expert tables are read in place. A packed stack becomes one indexed packed contraction over the stored
   blocks (one buffer per source role, experts padded to whole words); only selected experts' blocks are decoded.

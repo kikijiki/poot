@@ -162,7 +162,7 @@ fn fragment(schedule: Schedule) -> (FragmentDtype, FragmentLayout, u32) {
     }
 }
 
-/// A `Narrow` policy on ROCm plans every prefill-shaped contraction family that is not an expert walk on the
+/// A `Narrow` policy on ROCm plans every prefill-shaped dense and packed contraction family on the
 /// bf16 fragment with the declared lane map: a dense contraction over a bf16 weight, a plain matmul over an
 /// f32 `[K, N]` weight, and a packed (quantized) contraction. Mutation: in `RegisterTiling::candidates`, drop the
 /// fragment chain; every row plans the scalar tiling and goes red with `expected a fragment tiling`.
@@ -254,16 +254,24 @@ fn radv_plans_f16_fragments_only_where_a_workgroup_has_several_waves() {
     assert!(waves > 1, "raw Vulkan runs several subgroups: {waves}");
 }
 
-/// An indexed contraction (each row reads its own expert's slab) keeps the scalar tiling under any policy: the
-/// rows of one fragment must share a weight tile. Its numerics still follow the declared precision (the request
-/// carries it), only its schedule is scalar. Mutation: drop `scalar_only` from the indexed planner's terms; the
-/// request then asks for a fragment and generation refuses it (`an expert walk keeps the scalar micro-tile`).
+/// An indexed prefill (each row reads its own expert's slab) runs the fragment tiling under a narrow policy: compile
+/// groups its rows by expert (POOT-1451), so every fragment's rows share one expert's weight tile, and the tiling's
+/// output tile is the grouping's block. Mutation: drop the fragment dtype from the indexed planner's terms
+/// (`fragment: None` in `indexed_tiled_shape`); the request keeps the scalar tiling and this row goes red.
 #[test]
-fn an_expert_walk_keeps_the_scalar_tiling_under_a_narrow_policy() {
+fn an_indexed_prefill_runs_the_fragment_tiling_over_its_grouped_rows_under_a_narrow_policy() {
     let program = compiled(&indexed(), &rocm_wmma(), MatmulPrecision::Narrow);
     let schedule = schedule_of(&program, is_indexed);
     assert!(
-        matches!(schedule, Schedule::RegisterTiled { .. }),
+        matches!(schedule, Schedule::FragmentTiled { .. }),
         "{schedule:?}"
     );
+    let block = program
+        .planned()
+        .find_map(|(eqn, _)| match eqn.op {
+            OpKind::ExpertGroup { block, .. } => Some(block),
+            _ => None,
+        })
+        .expect("the rows are grouped");
+    assert_eq!(schedule.output_tile().map(|(rows, _)| rows), Some(block));
 }

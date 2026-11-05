@@ -1036,27 +1036,39 @@ struct PlanningBuffer {
     records: Records,
     index: usize,
     elems: usize,
-    _guard: AllocGuard,
+    storage: BufferStorage,
+    /// The allocation's live-bytes charge: `None` for a typed view ([`Device::view`]), which shares the
+    /// record and charges nothing.
+    guard: Option<AllocGuard>,
 }
 
 impl Drop for PlanningBuffer {
     fn drop(&mut self) {
+        if self.guard.is_none() {
+            return;
+        }
         if let Ok(mut records) = self.records.lock() {
             records[self.index].live = false;
         }
     }
 }
 
-/// A planning device does not execute: only loading an entry is asked of it.
+/// Why a planning device refused a call.
 #[derive(Debug, thiserror::Error)]
-#[error("a planning device executes nothing")]
-struct PlanningOnly;
+enum PlanningError {
+    /// A planning device does not execute: only loading an entry is asked of it.
+    #[error("a planning device executes nothing")]
+    Executes,
+    /// An arena buffer refused a typed view, as an executing device would.
+    #[error("view refused: {0}")]
+    View(#[from] poot_target::ViewError),
+}
 
 impl Device for PlanningDevice {
     type Buffer = PlanningBuffer;
     type Kernel = ();
     type Recording = ();
-    type Error = PlanningOnly;
+    type Error = PlanningError;
 
     fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
         poot_executor::CopyMechanism::Native
@@ -1090,7 +1102,7 @@ impl Device for PlanningDevice {
         role: BufferRole,
         storage: BufferStorage,
         elems: usize,
-    ) -> Result<PlanningBuffer, PlanningOnly> {
+    ) -> Result<PlanningBuffer, PlanningError> {
         self.allocate_named("unnamed", role, storage, elems)
     }
 
@@ -1102,7 +1114,7 @@ impl Device for PlanningDevice {
         role: BufferRole,
         storage: BufferStorage,
         elems: usize,
-    ) -> Result<PlanningBuffer, PlanningOnly> {
+    ) -> Result<PlanningBuffer, PlanningError> {
         let bytes = (elems as u64).saturating_mul(storage.element().byte_width() as u64);
         let guard = self.counters.record_alloc(role, bytes);
         let mut records = self.records.lock().expect("planning records");
@@ -1120,7 +1132,22 @@ impl Device for PlanningDevice {
             records: Arc::clone(&self.records),
             index,
             elems,
-            _guard: guard,
+            storage,
+            guard: Some(guard),
+        })
+    }
+
+    fn view(
+        &self,
+        buffer: &PlanningBuffer,
+        storage: BufferStorage,
+    ) -> Result<PlanningBuffer, PlanningError> {
+        Ok(PlanningBuffer {
+            records: Arc::clone(&buffer.records),
+            index: buffer.index,
+            elems: buffer.storage.view_elems(buffer.elems, storage)?,
+            storage,
+            guard: None,
         })
     }
 
@@ -1128,28 +1155,28 @@ impl Device for PlanningDevice {
         buffer.elems
     }
 
-    fn load_kernel(&mut self, _key: &str, _kernel: CompiledKernel) -> Result<(), PlanningOnly> {
+    fn load_kernel(&mut self, _key: &str, _kernel: CompiledKernel) -> Result<(), PlanningError> {
         Ok(())
     }
 
-    fn begin(&mut self) -> Result<(), PlanningOnly> {
+    fn begin(&mut self) -> Result<(), PlanningError> {
         Ok(())
     }
 
-    fn dispatch(&mut self, _dispatch: Dispatch<'_, Self>) -> Result<(), PlanningOnly> {
+    fn dispatch(&mut self, _dispatch: Dispatch<'_, Self>) -> Result<(), PlanningError> {
         Ok(())
     }
 
-    fn copy(&mut self, _src: &PlanningBuffer, _dst: &PlanningBuffer) -> Result<(), PlanningOnly> {
+    fn copy(&mut self, _src: &PlanningBuffer, _dst: &PlanningBuffer) -> Result<(), PlanningError> {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<(), PlanningOnly> {
+    fn finish(&mut self) -> Result<(), PlanningError> {
         Ok(())
     }
 
-    fn replay(&mut self, _recording: &()) -> Result<(), PlanningOnly> {
-        Err(PlanningOnly)
+    fn replay(&mut self, _recording: &()) -> Result<(), PlanningError> {
+        Err(PlanningError::Executes)
     }
 
     /// Loading an entry uploads constants; the planning device drops the bytes.
@@ -1159,23 +1186,23 @@ impl Device for PlanningDevice {
         _offset: usize,
         _len: usize,
         _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
-    ) -> Result<(), PlanningOnly> {
+    ) -> Result<(), PlanningError> {
         Ok(())
     }
 
-    fn read(&mut self, _src: &PlanningBuffer, _out: &mut [u8]) -> Result<(), PlanningOnly> {
-        Err(PlanningOnly)
+    fn read(&mut self, _src: &PlanningBuffer, _out: &mut [u8]) -> Result<(), PlanningError> {
+        Err(PlanningError::Executes)
     }
 
-    fn synchronize(&mut self) -> Result<(), PlanningOnly> {
-        Err(PlanningOnly)
+    fn synchronize(&mut self) -> Result<(), PlanningError> {
+        Err(PlanningError::Executes)
     }
 
     fn device_time(&self) -> DeviceTime {
         DeviceTime::Unknown
     }
 
-    fn abort(&mut self) -> Result<(), PlanningOnly> {
+    fn abort(&mut self) -> Result<(), PlanningError> {
         Ok(())
     }
 }
@@ -1193,19 +1220,19 @@ impl Collectives for PlanningDevice {
         SupportBound::default()
     }
 
-    fn open_route(&mut self, _peer: &Self) -> Result<(), PlanningOnly> {
+    fn open_route(&mut self, _peer: &Self) -> Result<(), PlanningError> {
         Ok(())
     }
 
-    fn create_event(&mut self) -> Result<(), PlanningOnly> {
+    fn create_event(&mut self) -> Result<(), PlanningError> {
         Ok(())
     }
 
-    fn record_event(&mut self, _event: &()) -> Result<(), PlanningOnly> {
+    fn record_event(&mut self, _event: &()) -> Result<(), PlanningError> {
         Ok(())
     }
 
-    fn wait_event(&mut self, _event: &()) -> Result<(), PlanningOnly> {
+    fn wait_event(&mut self, _event: &()) -> Result<(), PlanningError> {
         Ok(())
     }
 
@@ -1214,7 +1241,7 @@ impl Collectives for PlanningDevice {
         _src: &PlanningBuffer,
         _dst: &PlanningBuffer,
         _bytes: usize,
-    ) -> Result<(), PlanningOnly> {
+    ) -> Result<(), PlanningError> {
         Ok(())
     }
 }

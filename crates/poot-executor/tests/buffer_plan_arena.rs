@@ -99,6 +99,8 @@ fn fake_target() -> Target {
 struct DispatchRecord {
     input_elems: Vec<usize>,
     output_elems: usize,
+    /// The storage of every bound handle, inputs then the output.
+    storages: Vec<poot_target::BufferStorage>,
 }
 
 #[derive(Clone, Default)]
@@ -110,9 +112,17 @@ struct Recorder {
     /// assert the exact per-slot sizes an independently hand-traced plan predicts, never a number
     /// re-derived from `BufferPlan` itself.
     activation_allocs: Rc<RefCell<Vec<usize>>>,
-    /// How many elements short of the asked count each `BufferRole::Activation` buffer is really
+    /// How many bytes short of the asked count each untyped arena buffer (POOT-1450) is really
     /// allocated: a device whose allocation disagrees with the plan's lengths.
     activation_shortfall: usize,
+}
+
+/// What the device really allocated, or a typed view of it: what [`Device::buffer_elems`] reports, in
+/// units of `storage`.
+#[derive(Clone, Copy, Debug)]
+struct Buf {
+    elems: usize,
+    storage: poot_target::BufferStorage,
 }
 
 struct RecordingDevice {
@@ -120,8 +130,7 @@ struct RecordingDevice {
 }
 
 impl Device for RecordingDevice {
-    /// The native elements the device really allocated: what [`Device::buffer_elems`] reports.
-    type Buffer = usize;
+    type Buffer = Buf;
     type Kernel = ();
     type Recording = ();
     type Error = std::convert::Infallible;
@@ -146,21 +155,38 @@ impl Device for RecordingDevice {
         role: BufferRole,
         storage: poot_target::BufferStorage,
         elems: usize,
-    ) -> Result<usize, std::convert::Infallible> {
+    ) -> Result<Buf, std::convert::Infallible> {
         let mut capacity = elems;
         if role == BufferRole::Activation {
             self.recorder.activation_allocs.borrow_mut().push(elems);
+        }
+        if storage == poot_target::BufferStorage::untyped() {
             capacity -= self.recorder.activation_shortfall;
         }
         let bytes = (elems * storage.element().byte_width()) as u64;
         // `Buffer = ()` has no `Drop` to tie the guard's live-bytes decrement to (mirrors
         // `cr30_lifecycle.rs`'s `FaultyDevice`): leaked on purpose, read back via `snapshot_all`.
         std::mem::forget(self.recorder.memory.record_alloc(role, bytes));
-        Ok(capacity)
+        Ok(Buf {
+            elems: capacity,
+            storage,
+        })
     }
 
-    fn buffer_elems(&self, buffer: &usize) -> usize {
-        *buffer
+    fn view(
+        &self,
+        buffer: &Buf,
+        storage: poot_target::BufferStorage,
+    ) -> Result<Buf, std::convert::Infallible> {
+        let elems = buffer
+            .storage
+            .view_elems(buffer.elems, storage)
+            .expect("the engine views an arena buffer as a storage it admits");
+        Ok(Buf { elems, storage })
+    }
+
+    fn buffer_elems(&self, buffer: &Buf) -> usize {
+        buffer.elems
     }
 
     fn load_kernel(
@@ -179,11 +205,17 @@ impl Device for RecordingDevice {
         self.recorder.dispatches.borrow_mut().push(DispatchRecord {
             input_elems: d.inputs.iter().map(|a: &Arg<'_, Self>| a.elems).collect(),
             output_elems: d.output.elems,
+            storages: d
+                .inputs
+                .iter()
+                .chain(std::iter::once(&d.output))
+                .map(|a: &Arg<'_, Self>| a.buffer.storage)
+                .collect(),
         });
         Ok(())
     }
 
-    fn copy(&mut self, _src: &usize, _dst: &usize) -> Result<(), std::convert::Infallible> {
+    fn copy(&mut self, _src: &Buf, _dst: &Buf) -> Result<(), std::convert::Infallible> {
         Ok(())
     }
 
@@ -197,7 +229,7 @@ impl Device for RecordingDevice {
 
     fn write_with(
         &mut self,
-        _dst: &usize,
+        _dst: &Buf,
         _offset: usize,
         _len: usize,
         _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
@@ -205,7 +237,7 @@ impl Device for RecordingDevice {
         Ok(())
     }
 
-    fn read(&mut self, _src: &usize, out: &mut [u8]) -> Result<(), std::convert::Infallible> {
+    fn read(&mut self, _src: &Buf, out: &mut [u8]) -> Result<(), std::convert::Infallible> {
         out.fill(0);
         Ok(())
     }
@@ -526,8 +558,8 @@ fn state_commit_export_keeps_its_own_slot_through_the_epilogue() {
 
 /// POOT-1205 SC-001: a dispatch whose asserted length exceeds its bound buffer by one element is refused
 /// with the shared typed error by the engine, before `Device::dispatch` is called. The device allocates
-/// every activation buffer one element short of what the plan asked, so eqn 0's output (`v1`, 64
-/// elements) asserts 64 against a buffer of 63; the same fixture and device allocate exactly and step
+/// every untyped arena buffer one f32 (four bytes) short of what the plan asked, so eqn 0's output (`v1`,
+/// 64 elements) asserts 64 against its view of 63; the same fixture and device allocate exactly and step
 /// cleanly when no buffer is short.
 ///
 /// Mutation: remove the `check_arg_lengths` call in `Engine::walk` (`crates/poot-executor/src/engine.rs`);
@@ -536,7 +568,7 @@ fn state_commit_export_keeps_its_own_slot_through_the_epilogue() {
 fn a_dispatch_longer_than_its_buffer_is_refused_before_the_device_sees_it() {
     let (g, store, map) = fixture();
     let recorder = Recorder {
-        activation_shortfall: 1,
+        activation_shortfall: 4,
         ..Recorder::default()
     };
     let mut engine = Engine::new(RecordingDevice {
@@ -567,4 +599,35 @@ fn a_dispatch_longer_than_its_buffer_is_refused_before_the_device_sees_it() {
         "the device must never see the refused dispatch: {:?}",
         recorder.dispatches.borrow()
     );
+}
+
+/// POOT-1450: the engine binds every arena value through a view of its buffer as the value's own storage,
+/// never the untyped slot itself: the device sees an f32 handle for each f32 operand, including `s2`, whose
+/// output shares `v1`'s untyped slot. Mutation: make `StageArena::bind` view each buffer as the raw untyped
+/// slot (`BufferStorage::untyped()` for the value's storage); the device refuses that view
+/// (`Untypable { view: .. Untyped }`) and the row goes red.
+#[test]
+fn every_arena_binding_is_a_view_of_the_values_own_storage() {
+    let (g, store, map) = fixture();
+    let recorder = Recorder::default();
+    let mut engine = Engine::new(RecordingDevice {
+        recorder: recorder.clone(),
+    });
+    let exe = engine.load_weights(store, map).unwrap();
+    let entry = engine.add_entry(exe, &staged(&g, fake_target())).unwrap();
+    engine
+        .step(exe, entry, &StepInputs::new(), &mut NoSync)
+        .unwrap();
+    let dispatches = recorder.dispatches.borrow();
+    assert_eq!(dispatches.len(), 4);
+    for (i, record) in dispatches.iter().enumerate() {
+        assert!(
+            record
+                .storages
+                .iter()
+                .all(|&storage| storage == poot_target::BufferStorage::f32()),
+            "eqn {i}: every operand of the f32 fixture is bound as f32: {:?}",
+            record.storages
+        );
+    }
 }

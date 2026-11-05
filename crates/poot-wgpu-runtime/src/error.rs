@@ -36,7 +36,8 @@ pub enum RuntimeError {
         /// The configured bound, in whole seconds.
         secs: u64,
     },
-    /// A wait named a submission wgpu never returned; unreachable while waits take no index.
+    /// A wait named a submission wgpu never returned; unreachable while a [`crate::QueuedWork`] can only
+    /// come from this context's own queue.
     #[error("waited on submission {requested}, but the last successful one is {successful}")]
     WrongSubmissionIndex {
         /// The submission index waited on.
@@ -121,6 +122,9 @@ pub enum RuntimeError {
         /// Body-local trap id the kernel wrote.
         code: u32,
     },
+    /// A buffer refused a typed view (POOT-1450, [`poot_target::BufferStorage::view_elems`]).
+    #[error("view refused: {0}")]
+    View(#[from] poot_target::ViewError),
     /// A typed transfer was requested against a differently represented allocation (card 527:
     /// R471-009/R484-001 - checked against the buffer's full storage contract, element kind, logical
     /// dtype and layout together, not element kind alone).

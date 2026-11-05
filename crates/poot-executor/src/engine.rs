@@ -130,10 +130,11 @@ enum Loc {
     /// An ad hoc buffer this entry owns outright: a metadata buffer, or the `preserve_output`
     /// snapshot (Card 547b: never arena-shared - each is sized and used exactly once per entry).
     Local(LocalBuffer),
-    /// An arena slot (Card 547b): the buffer at this index of `Entry::arena`, shared
-    /// across every value [`Program::buffer_plan`] assigned to this slot. The slot's capacity may
-    /// exceed this particular value's own logical size; a dispatch using it carries its own element
-    /// count separately (`LoadedStep`'s `(Loc, usize)` pairs), never reads the buffer's capacity.
+    /// An arena slot (Card 547b): the typed view at this index of `Entry::arena` (POOT-1450), one per
+    /// arena buffer and storage, through which every value [`Program::buffer_plan`] assigned to the slot
+    /// of that storage is bound. The view's capacity may exceed this particular value's own logical size;
+    /// a dispatch using it carries its own element count separately (`LoadedStep`'s `(Loc, usize)` pairs),
+    /// never reads the buffer's capacity.
     Arena(usize),
     Weight(usize),
     State(usize),
@@ -259,8 +260,13 @@ struct StateBuffer<D: Device> {
 /// An entry while its stages load: the buffers they share and what each has exported so far.
 struct EntryBuild<D: Device> {
     locals: Vec<D::Buffer>,
+    /// The entry's arena buffers, as allocated (untyped bytes, or an export's own storage).
+    arena_slots: Vec<D::Buffer>,
+    /// The typed views [`Loc::Arena`] names, made on first use by [`StageArena::bind`].
     arena: Vec<D::Buffer>,
-    /// Which of `arena`'s buffers each stage's buffer-plan slots live in.
+    /// The index in `arena` of the view of each arena buffer as each storage.
+    arena_views: HashMap<(usize, BufferStorage), usize>,
+    /// Which of `arena_slots`' buffers each stage's buffer-plan slots live in.
     arena_plan: poot_graph_plan::EntryArena,
     slots: Vec<BoundSlot>,
     /// The hosted gather slots the loaded stages declared so far, one per [`HOSTED_ROWS`] key.
@@ -312,10 +318,12 @@ struct Entry<D: Device> {
     /// Buffers shared by every stage of the entry: a stage binds a boundary to the producing stage's
     /// buffer by index, so no link copies. Index-aligned with [`Loc::Local`].
     locals: Vec<D::Buffer>,
-    /// One buffer per [`poot_graph_plan::BufferPlan`] arena slot of each stage (Card 547b), allocated
-    /// once up front and index-aligned with [`Loc::Arena`] (a stage's slots follow the previous
-    /// stage's).
+    /// The typed views of the entry's arena buffers (POOT-1450), index-aligned with [`Loc::Arena`]: every
+    /// value in the arena is bound through the view of its buffer as the value's own storage.
     arena: Vec<D::Buffer>,
+    /// The entry's arena buffers as allocated (POOT-1433: shared by every stage), held for their
+    /// lifetime; never bound directly.
+    _arena_slots: Vec<D::Buffer>,
     slots: Vec<BoundSlot>,
     /// The [`HOSTED_ROWS`] buffers of the entry's hosted gathers, filled by the engine from the checkpoint
     /// mapping, never supplied by the caller.
@@ -982,7 +990,9 @@ impl<D: Device> Engine<D> {
     ) -> Result<Entry<D>, ExecError> {
         let mut build = EntryBuild {
             locals: Vec::new(),
+            arena_slots: Vec::new(),
             arena: Vec::new(),
+            arena_views: HashMap::new(),
             arena_plan: poot_graph_plan::EntryArena::plan(
                 part.stages.iter().map(|&(_, stage)| stage.buffer_plan()),
             ),
@@ -1010,7 +1020,7 @@ impl<D: Device> Engine<D> {
                 storage,
                 elems,
             )?;
-            build.arena.push(buffer);
+            build.arena_slots.push(buffer);
         }
         for &(id, stage) in &part.stages {
             self.load_stage(exe, id, stage, part, &mut build)?;
@@ -1019,6 +1029,7 @@ impl<D: Device> Engine<D> {
         let syncs = self.entry_syncs(exe, part, &build, &hosted)?;
         let EntryBuild {
             locals,
+            arena_slots,
             arena,
             slots,
             hosted_slots,
@@ -1050,6 +1061,7 @@ impl<D: Device> Engine<D> {
             replays: 0,
             locals,
             arena,
+            _arena_slots: arena_slots,
             slots,
             hosted_slots,
             hosted,
@@ -1432,7 +1444,9 @@ impl<D: Device> Engine<D> {
     ) -> Result<(), ExecError> {
         let EntryBuild {
             locals,
+            arena_slots,
             arena,
+            arena_views,
             arena_plan,
             slots,
             hosted_slots,
@@ -1476,7 +1490,12 @@ impl<D: Device> Engine<D> {
         // one buffer per computed value. `load_entry` allocated the entry's shared buffers (POOT-1433); this
         // stage's slots live in the ones `arena_plan` assigned them.
         let buffer_plan = program.buffer_plan();
-        let arena_buffers = arena_plan.stage_buffers(stages.len());
+        let mut stage_arena = StageArena {
+            slots: arena_slots,
+            stage_buffers: arena_plan.stage_buffers(stages.len()),
+            views: arena,
+            made: arena_views,
+        };
 
         macro_rules! push_local {
             ($name:expr, $role:expr, $storage:expr, $shape:expr) => {{
@@ -1539,7 +1558,7 @@ impl<D: Device> Engine<D> {
                     );
                     crate::device::write_slice(
                         &mut self.device,
-                        resolve::<D>(loc, locals, arena, &Held::none()),
+                        resolve::<D>(loc, locals, stage_arena.views, &Held::none()),
                         0,
                         &encoded,
                     )
@@ -1748,11 +1767,13 @@ impl<D: Device> Engine<D> {
                     let loc = out_loc(
                         OutLocArgs {
                             out: write,
+                            storage: storage_of(write),
                             commit_plan,
                             buffer_plan,
-                            arena_buffers,
                         },
                         &values,
+                        &self.device,
+                        &mut stage_arena,
                     )?;
                     let placed = (loc, elems_of(write)?);
                     values[write] = Some(placed);
@@ -1793,28 +1814,36 @@ impl<D: Device> Engine<D> {
                     let output_loc = out_loc(
                         OutLocArgs {
                             out: eqn.out,
+                            storage: storage_of(eqn.out),
                             commit_plan,
                             buffer_plan,
-                            arena_buffers,
                         },
                         &values,
+                        &self.device,
+                        &mut stage_arena,
                     )?;
                     let output = (output_loc, elems_of(eqn.out)?);
                     let operands = operands_with_elems(&values, eqn)?;
-                    // A scratch buffer is an arena slot of this equation's own index; its element count
-                    // is the declared one, never the slot's capacity (the slot is shared with other
-                    // layers' scratch).
+                    // A scratch buffer is an arena slot of this equation's own index, bound through the view
+                    // of its slot as its declared storage; its element count is the declared one, never the
+                    // slot's capacity (the slot is shared with other layers' scratch and values).
+                    let mut scratch = Vec::with_capacity(dispatches.scratch().len());
+                    for (index, decl) in dispatches.scratch().iter().enumerate() {
+                        let id = poot_graph_plan::ScratchId::new(index as u32);
+                        let slot = buffer_plan.scratch_slot(eqn_index, id).ok_or(
+                            LoadError::Unimplemented(
+                                "a scratch buffer the buffer plan never colored",
+                            ),
+                        )?;
+                        let loc = stage_arena.bind(&self.device, slot, decl.storage())?;
+                        scratch.push((loc, decl.elems()));
+                    }
                     let scratch_of =
                         |id: poot_graph_plan::ScratchId| -> Result<(Loc, usize), ExecError> {
-                            let decl = dispatches.scratch().get(id.index() as usize).ok_or(
-                                LoadError::Unimplemented("a dispatch binds an undeclared scratch"),
-                            )?;
-                            let slot = buffer_plan.scratch_slot(eqn_index, id).ok_or(
-                                LoadError::Unimplemented(
-                                    "a scratch buffer the buffer plan never colored",
-                                ),
-                            )?;
-                            Ok((Loc::Arena(arena_buffers[slot.index()]), decl.elems()))
+                            scratch.get(id.index() as usize).copied().ok_or(
+                                LoadError::Unimplemented("a dispatch binds an undeclared scratch")
+                                    .into(),
+                            )
                         };
                     for dispatch in dispatches.iter() {
                         let (body, launch) = (dispatch.body(), dispatch.launch());
@@ -3156,19 +3185,57 @@ impl<D: Device> Engine<D> {
     }
 }
 
-/// The output location for one computed equation: the paired state input's buffer when
-/// `commit_plan` donates this output in place, or its arena slot otherwise (Card 547b).
-struct OutLocArgs<'a> {
-    out: ValueId,
-    commit_plan: &'a poot_graph_plan::state_commit::StateCommitPlan,
-    buffer_plan: &'a poot_graph_plan::BufferPlan,
+/// The entry arena as one stage binds it while it loads (POOT-1450): the buffer each of the stage's
+/// buffer-plan slots lives in, and the typed views of the entry's buffers made so far.
+struct StageArena<'a, D: Device> {
+    /// The entry's arena buffers as allocated.
+    slots: &'a [D::Buffer],
     /// The entry's shared arena buffer each of this stage's buffer-plan slots lives in.
-    arena_buffers: &'a [usize],
+    stage_buffers: &'a [usize],
+    views: &'a mut Vec<D::Buffer>,
+    made: &'a mut HashMap<(usize, BufferStorage), usize>,
 }
 
-fn out_loc(
+impl<D: Device> StageArena<'_, D> {
+    /// Where a value or scratch of `storage` in the stage's `slot` is bound: the view of the slot's buffer
+    /// as `storage`, made by the device on first use. The storage contract is the device's own check of
+    /// the view against the buffer ([`Device::view`]), so a refused view is the device's typed error,
+    /// before anything runs.
+    fn bind(
+        &mut self,
+        device: &D,
+        slot: poot_graph_plan::ArenaSlotId,
+        storage: BufferStorage,
+    ) -> Result<Loc, ExecError> {
+        let buffer = self.stage_buffers[slot.index()];
+        if let Some(&view) = self.made.get(&(buffer, storage)) {
+            return Ok(Loc::Arena(view));
+        }
+        let view = device
+            .view(&self.slots[buffer], storage)
+            .map_err(device_error(device.backend_name()))?;
+        self.views.push(view);
+        let index = self.views.len() - 1;
+        self.made.insert((buffer, storage), index);
+        Ok(Loc::Arena(index))
+    }
+}
+
+/// The output location for one computed equation: the paired state input's buffer when
+/// `commit_plan` donates this output in place, or the view of its arena slot as its own `storage`
+/// otherwise (Card 547b, POOT-1450).
+struct OutLocArgs<'a> {
+    out: ValueId,
+    storage: BufferStorage,
+    commit_plan: &'a poot_graph_plan::state_commit::StateCommitPlan,
+    buffer_plan: &'a poot_graph_plan::BufferPlan,
+}
+
+fn out_loc<D: Device>(
     args: OutLocArgs<'_>,
     values: &ValueTable<Option<(Loc, usize)>>,
+    device: &D,
+    arena: &mut StageArena<'_, D>,
 ) -> Result<Loc, ExecError> {
     if let Some(&state_input) = args.commit_plan.inplace.get(&args.out) {
         return Ok(values[state_input].expect("state bound").0);
@@ -3177,7 +3244,7 @@ fn out_loc(
         .buffer_plan
         .slot(args.out)
         .ok_or(LoadError::Unimplemented("E4M3/raw-byte device lanes"))?;
-    Ok(Loc::Arena(args.arena_buffers[slot.index()]))
+    arena.bind(device, slot, args.storage)
 }
 
 impl<D: Device> Engine<D> {
@@ -3761,10 +3828,10 @@ impl<D: Device> Executor for Engine<D> {
                 loaded.needs_reset = false;
             }
             StateScope::Row(row) => {
-                // A paged KV pool is the one carried value without a row axis: no row of it is
-                // this sequence's.
-                let rowed =
-                    |state: &&StateBuffer<D>| state.role != StateRole::Positional { axis: 0 };
+                // A value whose stale entries every reader hides by position (a KV cache, the
+                // paged pool with no row axis included) needs no clearing for a new sequence:
+                // zeroing it costs the capacity, not the prompt.
+                let rowed = |state: &&StateBuffer<D>| !state.role.policy().stale_hidden;
                 // Check every buffer before writing any: a refused reset leaves the state as it was.
                 let mut rows = Vec::new();
                 for state in loaded.state.iter().filter(rowed) {
@@ -3978,6 +4045,10 @@ mod kernel_identity_tests {
         ) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
+        fn view(&self, _buffer: &(), _storage: BufferStorage) -> Result<(), Self::Error> {
+            // This fake keeps no storage: a view is the same nothing.
+            Ok(())
+        }
         fn buffer_elems(&self, _buffer: &()) -> usize {
             // This fake keeps no storage, so it states no bound: the length check passes every dispatch.
             usize::MAX
@@ -4067,6 +4138,10 @@ mod kernel_identity_tests {
             _storage: BufferStorage,
             _elems: usize,
         ) -> Result<(), std::convert::Infallible> {
+            Ok(())
+        }
+        fn view(&self, _buffer: &(), _storage: BufferStorage) -> Result<(), Self::Error> {
+            // This fake keeps no storage: a view is the same nothing.
             Ok(())
         }
         fn buffer_elems(&self, _buffer: &()) -> usize {
@@ -4337,6 +4412,10 @@ mod arena_slot_alloc_tests {
             self.seen_elems.push(elems);
             Ok(())
         }
+        fn view(&self, _buffer: &(), _storage: BufferStorage) -> Result<(), Self::Error> {
+            // This fake keeps no storage: a view is the same nothing.
+            Ok(())
+        }
         fn buffer_elems(&self, _buffer: &()) -> usize {
             // This fake keeps no storage, so it states no bound: the length check passes every dispatch.
             usize::MAX
@@ -4484,6 +4563,13 @@ mod f16_packed_weight_upload_tests {
         ) -> Result<usize, std::convert::Infallible> {
             self.allocations.push((role, storage, elems));
             Ok(self.allocations.len() - 1)
+        }
+        fn view(&self, buffer: &usize, storage: BufferStorage) -> Result<usize, Self::Error> {
+            // A view is the allocation's own id, admitted by the one storage rule.
+            let (_, slot, elems) = self.allocations[*buffer];
+            slot.view_elems(elems, storage)
+                .expect("the engine views an arena slot it allocated");
+            Ok(*buffer)
         }
         fn buffer_elems(&self, buffer: &usize) -> usize {
             self.allocations[*buffer].2
@@ -5221,6 +5307,13 @@ mod weight_source_tests {
             std::mem::forget(self.memory.record_alloc(role, bytes));
             self.allocations.push((role, storage, elems));
             Ok(self.allocations.len() - 1)
+        }
+        fn view(&self, buffer: &usize, storage: BufferStorage) -> Result<usize, Self::Error> {
+            // A view is the allocation's own id, admitted by the one storage rule.
+            let (_, slot, elems) = self.allocations[*buffer];
+            slot.view_elems(elems, storage)
+                .expect("the engine views an arena slot it allocated");
+            Ok(*buffer)
         }
         fn buffer_elems(&self, buffer: &usize) -> usize {
             self.allocations[*buffer].2
@@ -6745,6 +6838,66 @@ mod weight_source_tests {
         assert!(engine.device().writes.len() > writes_before);
     }
 
+    /// POOT-1452: `reset_state(Row(r))` zeroes the recurrent pool's row and leaves a private KV cache
+    /// alone. The cache's readers hide an entry past the committed length by position, so clearing it
+    /// for a new sequence costs the capacity (the whole `[kv_heads, capacity, head_dim]` row, every
+    /// layer) where the prompt needs only its own positions.
+    ///
+    /// Mutation: in `Engine::reset_state` select the rows with `state.role != StateRole::Positional { axis: 0 }`
+    /// again; the cache row is written too and this row goes red (`left: 2, right: 1`).
+    #[test]
+    fn a_row_reset_zeroes_the_recurrent_row_and_leaves_the_kv_cache_alone() {
+        use poot_graph_ir::StateRole;
+        const POOL: usize = 3;
+        const CAPACITY: usize = 64;
+        let mut engine = Engine::new(Recorder::default());
+        let b = Builder::for_tests();
+        let pool = b
+            .state_input("pool", TensorType::f32(vec![POOL, K]), StateRole::Recurrent)
+            .unwrap();
+        let cache = b
+            .state_input(
+                "cache",
+                TensorType::f32(vec![POOL, 2, CAPACITY, 4]),
+                StateRole::Positional { axis: 2 },
+            )
+            .unwrap();
+        let src = b
+            .slot_named(Slot::Activation, "src", TensorType::f32(vec![2, K]))
+            .unwrap();
+        let slots = b.write_map("write", 2, POOL).unwrap();
+        let pool_out = b.scatter_update(pool, src, slots).unwrap();
+        let new = b
+            .slot_named(
+                Slot::Activation,
+                "new",
+                TensorType::f32(vec![POOL, 2, 1, 4]),
+            )
+            .unwrap();
+        let at = b
+            .slot_named(Slot::Activation, "at", TensorType::new(vec![], DType::I32))
+            .unwrap();
+        let cache_out = b.dynamic_update_slice_dyn(cache, new, at, 2).unwrap();
+        let graph = b
+            .finish(
+                poot_graph_ir::Outputs::new(pool_out)
+                    .with_state(&[(pool, pool_out), (cache, cache_out)]),
+            )
+            .unwrap();
+        let program = compile(&engine, &graph);
+        let weights = store(vec![]);
+        let exe = engine
+            .load_weights(Arc::clone(&weights), map(&weights, vec![]))
+            .unwrap();
+        engine.add_entry(exe, &program).unwrap();
+
+        let writes_before = engine.device().writes.len();
+        engine.reset_state(exe, StateScope::Row(1)).unwrap();
+        let writes = &engine.device().writes[writes_before..];
+        assert_eq!(writes.len(), 1, "only the recurrent pool's row is written");
+        assert_eq!(writes[0].1.len(), K * 4, "one pool row of f32");
+    }
+
     /// POOT-1289, POOT-1292: `load_weights` takes the store and the map separately, so a map built over one
     /// store can meet another whose packed entry under the same key is a different width. That pairing is
     /// refused at `load_weights` with both handles, so no embed row is decoded into a buffer of the map's
@@ -7953,6 +8106,9 @@ mod weight_source_tests {
         ) -> Result<usize, WriteFault> {
             Ok(self.inner.allocate(role, storage, elems).unwrap())
         }
+        fn view(&self, buffer: &usize, storage: BufferStorage) -> Result<usize, Self::Error> {
+            Ok(self.inner.view(buffer, storage).unwrap())
+        }
         fn buffer_elems(&self, buffer: &usize) -> usize {
             self.inner.buffer_elems(buffer)
         }
@@ -8197,6 +8353,12 @@ mod weight_source_tests {
                 .push(vec![0; elems * storage.element().byte_width()]);
             Ok(Held {
                 index: self.contents.len() - 1,
+                freed: Arc::clone(&self.freed),
+            })
+        }
+        fn view(&self, buffer: &Held, _storage: BufferStorage) -> Result<Held, Fault> {
+            Ok(Held {
+                index: buffer.index,
                 freed: Arc::clone(&self.freed),
             })
         }

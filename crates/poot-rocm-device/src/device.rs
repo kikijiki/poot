@@ -236,6 +236,14 @@ impl Device for RocmDevice {
         Ok(self.ctx.allocate(role, storage, elems)?)
     }
 
+    fn view(
+        &self,
+        buffer: &RocmBuffer,
+        storage: BufferStorage,
+    ) -> Result<RocmBuffer, RocmGpuError> {
+        Ok(buffer.view(storage)?)
+    }
+
     fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
         buffer.elem_count()
     }

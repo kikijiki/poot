@@ -6,11 +6,10 @@
 //! - [`Schedule::Gemv`] (decode, few rows): the shared Gemv loop nest ([`gemv_body`]) with an indexed run
 //!   read. Flat output column `m * N + n` is the "weight row"; its run read takes the expert slab of row `m`
 //!   and the `[K, N]` weight at stride `N`.
-//! - [`Schedule::RegisterTiled`] (prefill, many rows) is *segmented*: the rows of one tile may select different
-//!   experts, so the tile walks the distinct expert ids among its rows in ascending order ([`ExpertWalk`]). Each
-//!   step stages that expert's weight tile once through LDS with the other experts' rows zeroed, so the weight tile
-//!   is shared by every row of an expert-sorted tile (the whole gain of grouping) and the result is correct for
-//!   any id order.
+//! - [`Schedule::RegisterTiled`] and [`Schedule::FragmentTiled`] (prefill, many rows) read the rows grouped by
+//!   expert ([`poot_graph_ir::ExpertRows::Grouped`], [`GroupedRows`]): the expert operand is the grouping, a tile
+//!   is one expert's rows, so it stages that expert's weight tile once for every row and runs one `K` loop, and the
+//!   fragment micro-tile applies. The rows are read and stored in row order through the grouping's padded order.
 //!
 //! A [`WeightLayout::Nk`] weight is the same stack with each expert stored `[N, K]` (the checkpoint order): the
 //! slab stride is still `K * N` and only the in-slab index swaps, so no transpose of the experts ever runs.
@@ -26,7 +25,7 @@ use super::Schedule;
 use super::epilogue::{BoundEpilogue, Epilogue};
 use super::gemv::{GemvLaunch, gemv_body};
 use super::tiled::{
-    ExpertWalk, TiledBody, TiledExtents, TiledLaunch, TiledWeight, WalkStep, tiled_body,
+    ExpertStep, GroupedRows, TiledBody, TiledExtents, TiledLaunch, TiledWeight, tiled_body,
 };
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy, cu, emit_read_meta, select_u32};
@@ -123,32 +122,6 @@ fn emit_row_slab(e: &mut Emit, ids: Local, row: Local, experts: Local, stride: L
     RowSlab { base, poison }
 }
 
-/// The key a row walks under: its expert when `row` is a real row (`< rows`) with a valid id, else `experts`,
-/// which no step selects. Reads `ids[min(row, rows - 1)]`, a read at an index every lane of a tile computes alike
-/// when `row` is tile-uniform.
-pub(crate) fn emit_row_key(
-    e: &mut Emit,
-    ids: Local,
-    row: Local,
-    (rows, experts): (Local, Local),
-) -> Local {
-    let last_row = bin(e, Ty::Usize, BinOp::Sub, copy(rows), cu(1));
-    let row_c = bin(e, Ty::Usize, BinOp::Min, copy(row), copy(last_row));
-    let row_ok = bin(e, Ty::Bool, BinOp::Lt, copy(row), copy(rows));
-    let RowExpert { expert, valid } = emit_row_expert(e, ids, row_c, experts);
-    let real = bin(e, Ty::Bool, BinOp::BitAnd, copy(row_ok), copy(valid));
-    let real_u = e.let_(
-        Ty::Usize,
-        Rvalue::Cast {
-            to: Ty::Usize,
-            operand: copy(real),
-        },
-    );
-    let gap = bin(e, Ty::Usize, BinOp::Sub, copy(experts), copy(expert));
-    let pull = bin(e, Ty::Usize, BinOp::Mul, copy(real_u), copy(gap));
-    bin(e, Ty::Usize, BinOp::Sub, copy(experts), copy(pull))
-}
-
 /// The element offset of weight element `(k, n)` inside one expert slab: `k * N + n` for a [`WeightLayout::Kn`]
 /// slab and `n * K + k` for an [`WeightLayout::Nk`] one (the checkpoint's `[N, K]` expert, read in place). The
 /// slab stride is `K * N` either way.
@@ -193,6 +166,7 @@ pub(crate) fn indexed_contraction(
     };
     if let Some(epilogue) = epilogue {
         epilogue.require_f32("indexed_contraction")?;
+        epilogue.refuse_narrow_store("indexed_contraction")?;
     }
     match schedule {
         Schedule::Gemv {
@@ -212,8 +186,7 @@ pub(crate) fn indexed_contraction(
             let extents = TiledExtents::of_meta("indexed_contraction", meta)?;
             indexed_register_tiled(
                 name,
-                TiledLaunch::of(schedule, layout, precision, extents)?
-                    .scalar_only("indexed_contraction")?,
+                TiledLaunch::of(schedule, layout, precision, extents)?,
                 layout,
                 lane,
                 extents.k,
@@ -293,10 +266,10 @@ fn indexed_gemv(
     ))
 }
 
-/// The register-tiled indexed contraction (prefill, many rows): [`tiled_body`] with one block of `M` rows over
-/// `N` weight rows, inside an [`ExpertWalk`] over the experts the tile's rows select. Each walk step reads its
-/// expert's slab: an `[N, K]` expert's rows `expert * N ..` of the stack read as `[E * N, K]` rows, or a `[K, N]`
-/// one's slab at `expert * K * N`. Params as [`indexed_gemv`]'s.
+/// The tiled indexed contraction (prefill, many rows): [`tiled_body`] over the grouping's padded positions in one
+/// block of `N` weight rows ([`GroupedRows`]). Each tile reads its expert's slab: an `[N, K]` expert's rows
+/// `expert * N ..` of the stack read as `[E * N, K]` rows, or a `[K, N]` one's slab at `expert * K * N`. Params as
+/// [`indexed_gemv`]'s, the third the grouping.
 fn indexed_register_tiled(
     name: &str,
     launch: TiledLaunch,
@@ -345,7 +318,7 @@ fn indexed_register_tiled(
         let first = bin(e, Ty::Usize, BinOp::Add, copy(row_base), copy(k0));
         lane.emit_run(e, weight, first, count, word_aligned)
     };
-    let (step, weight_read): (&mut WalkStep<'_>, _) = match layout {
+    let (step, weight_read): (&mut ExpertStep<'_>, _) = match layout {
         WeightLayout::Nk => (&mut first_row, TiledWeight::Rows(&mut row_run)),
         WeightLayout::Kn => (&mut no_state, TiledWeight::Columns { weight, lane }),
     };
@@ -360,8 +333,8 @@ fn indexed_register_tiled(
             leaves: &leaves,
             lanes: &lanes,
         }),
-        walk: Some(ExpertWalk {
-            ids,
+        grouped: Some(GroupedRows {
+            groups: ids,
             experts_word: META_EXPERTS,
             step,
         }),

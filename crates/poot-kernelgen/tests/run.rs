@@ -727,22 +727,58 @@ fn matmul_bias_epilogue() {
     assert_eq!(bufs[3].as_f32(), &want[..]);
 }
 
-/// The cost model's register tiling of an indexed `[E, K, N]` (`Kn`) contraction of `m` rows, on the wgpu caps.
+/// The cost model's register tiling of an indexed `[E, K, N]` (`Kn`) contraction of `m` rows grouped by expert, on
+/// the wgpu caps: the grouping's block, and the tiling of exactly those rows.
 fn indexed_tiling((m, k, n, experts): (usize, usize, usize, usize)) -> kg::Schedule {
-    kg::RegisterTiling::choose(
-        kg::TiledShape {
-            blocks: 1,
-            m_per_block: m,
-            out_per_block: n,
-            k,
-            layout: kg::WeightLayout::Kn,
-            segments: experts,
-            terms: poot_kernelgen::StagedTerms::ONE,
-            weight_bits: 32,
+    let caps = poot_target::DeviceCaps::wgpu_rdna3_igpu();
+    let shape = |block| kg::TiledShape {
+        blocks: 1,
+        m_per_block: m,
+        out_per_block: n,
+        k,
+        layout: kg::WeightLayout::Kn,
+        rows: kg::TiledRows::Grouped {
+            groups: experts + 1,
+            block,
         },
-        &poot_target::DeviceCaps::wgpu_rdna3_igpu(),
-    )
-    .schedule()
+        terms: poot_kernelgen::StagedTerms::ONE,
+        weight_bits: 32,
+        activation_bits: 32,
+    };
+    let block = kg::RegisterTiling::grouped_block(&[shape(0)], &caps).expect("a block");
+    kg::RegisterTiling::choose(shape(block), &caps).schedule()
+}
+
+/// The block-aligned grouping of `ids` over `experts` in tiles of `block` ([`poot_graph_ir::ExpertGrouping`]), built
+/// on the host bucket by bucket: what an `ExpertGroup` computes.
+fn grouping(ids: &[i32], experts: usize, block: usize) -> Vec<i32> {
+    let layout = poot_graph_ir::ExpertGrouping {
+        rows: ids.len(),
+        experts,
+        block,
+    };
+    let bucket = |id: i32| {
+        usize::try_from(id)
+            .ok()
+            .filter(|&e| e < experts)
+            .unwrap_or(experts)
+    };
+    let (mut order, mut tiles) = (Vec::new(), Vec::new());
+    for b in 0..=experts {
+        let rows: Vec<i32> = (0..ids.len())
+            .filter(|&r| bucket(ids[r]) == b)
+            .map(|r| r as i32)
+            .collect();
+        for chunk in rows.chunks(block) {
+            order.extend_from_slice(chunk);
+            order.resize(order.len() + block - chunk.len(), ids.len() as i32);
+            tiles.push(b as i32);
+        }
+    }
+    order.resize(layout.positions(), ids.len() as i32);
+    tiles.resize(layout.tiles(), experts as i32);
+    order.extend(tiles);
+    order
 }
 
 /// The generated indexed contraction for `(m, k, n, experts)` under `schedule`, with the unfolded launch the planner
@@ -759,7 +795,17 @@ fn indexed_kernel(
         max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),
         max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),
     };
-    let threads = schedule.grid_threads(1, m, n);
+    // A tiled schedule's grid rows are the grouping's padded positions (its tiles are the grouping's).
+    let rows = match schedule.output_tile() {
+        Some((block, _)) => poot_graph_ir::ExpertGrouping {
+            rows: m,
+            experts,
+            block,
+        }
+        .positions(),
+        None => m,
+    };
+    let threads = schedule.grid_threads(1, rows, n);
     let x_groups = match schedule {
         kg::Schedule::Gemv { .. } => 0,
         kg::Schedule::RegisterTiled { .. } | kg::Schedule::FragmentTiled { .. } => {
@@ -767,6 +813,7 @@ fn indexed_kernel(
             (threads / tiling.workgroup_lanes()) as u32
         }
     };
+    let m = rows;
     let request =
         kg::KernelRequest::Contraction(kg::ContractionSpec::Indexed(kg::IndexedContraction {
             schedule,
@@ -859,9 +906,9 @@ fn indexed_gemv_selects_expert_in_kernel() {
 
 #[test]
 fn indexed_matmul_routes_rows_to_experts() {
-    // M>1 indexed GEMM on the register-tiled schedule's expert walk: out[m,n] = sum_k x[m,k] * W[idx[m],k,n], each
-    // row routed to its own expert in-kernel. E=3, M=3, K=4, N=2; rows pick experts 2, 0, 1, so one tile holds rows
-    // of three experts and the kernel reads a different weight block per row.
+    // M>1 indexed GEMM on the register-tiled schedule over the rows grouped by expert: out[m,n] = sum_k x[m,k] *
+    // W[idx[m],k,n], each row routed to its own expert in-kernel. E=3, M=3, K=4, N=2; rows pick experts 2, 0, 1, so
+    // each lands in its own expert's tile and the kernel reads a different weight block per tile.
     let Some(ctx) = ctx() else { return };
     let (e, m, k, n) = (3usize, 3usize, 4usize, 2usize);
     let x: Vec<f32> = (0..m * k).map(|v| (v as f32) - 5.0).collect();
@@ -869,7 +916,8 @@ fn indexed_matmul_routes_rows_to_experts() {
     let ids = [2i32, 0, 1];
     let tiled = indexed_tiling((m, k, n, e));
     let kernel = indexed_kernel(tiled, (m, k, n, e), "igemm");
-    let got = run_indexed(&ctx, &kernel, (&x, &w, &ids), m * n);
+    let groups = grouping(&ids, e, tiled.output_tile().unwrap().0);
+    let got = run_indexed(&ctx, &kernel, (&x, &w, &groups), m * n);
     let want = indexed_oracle((&x, &w, &ids), (k, n, e));
     assert_eq!(
         got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -879,7 +927,7 @@ fn indexed_matmul_routes_rows_to_experts() {
 
 #[test]
 fn indexed_bodies_compile_to_valid_spirv_and_nvptx() {
-    // The Gemv and the register-tiled expert walk, each bare and with an epilogue, build, verify and compile on both
+    // The Gemv and the register-tiled schedule over the grouped rows, each bare and with an epilogue, build, verify and compile on both
     // SPIR-V and NVPTX.
     use kg::{ContractionSpec, IndexedContraction, KernelRequest, Schedule};
     use poot_target::DeviceCaps;
@@ -1963,9 +2011,10 @@ fn dense_tiled(
             out_per_block: n,
             k,
             layout,
-            segments: 1,
+            rows: poot_kernelgen::TiledRows::Dense,
             terms: poot_kernelgen::StagedTerms::ONE,
             weight_bits: weight.bits(),
+            activation_bits: 32,
         },
         caps,
     );
@@ -1979,6 +2028,7 @@ fn dense_tiled(
         grid: [(tiles * lanes) as u32, 1, 1],
         meta: vec![k as u32, n as u32, m as u32, tiles as u32, 0],
         precision: poot_graph_ir::OperandPrecision::Exact,
+        activation_stored: None,
     }))
 }
 

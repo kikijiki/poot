@@ -26,6 +26,11 @@ pub struct WgpuKernel {
     kernel: CompiledKernel,
 }
 
+/// How many submits one replay keeps queued on a device with a watchdog budget: the device runs one while
+/// the next waits behind it, so the host never leaves the queue empty between runs, and no more than this
+/// much work is ever queued behind the display watchdog.
+const IN_FLIGHT_SUBMITS: usize = 2;
+
 enum Recorded {
     /// Each dispatch with its planner-owned watchdog work weight: on a device with a watchdog budget `submit`
     /// splits a long run into several `submit_cached` calls once either of its [`FlushPolicy`] bounds is hit.
@@ -114,9 +119,12 @@ impl WgpuDevice {
     }
 
     /// Submit `dispatches`: one `submit_cached` for the whole run on a device with no watchdog budget; on a
-    /// device with one, split into runs bounded by the [`FlushPolicy`], one `submit_cached` per run, polling
-    /// between runs so in-flight work stays bounded (SC-008). A long prefill's one recorded run still issues
-    /// as several real submits there, never one past-watchdog submission.
+    /// device with one, split into runs bounded by the [`FlushPolicy`], one `submit_cached` per run, keeping
+    /// at most [`IN_FLIGHT_SUBMITS`] of them in flight so queued work stays bounded (SC-008): before a run
+    /// would exceed the window, the host waits for the oldest. The device always has the next run queued
+    /// while it executes the previous one; draining the queue after every run left it idle for the host's
+    /// whole encode-and-submit turnaround, once per run (POOT-1435). A long prefill's one recorded run still
+    /// issues as several real submits there, never one past-watchdog submission.
     ///
     /// Card 552: always the one `submit_cached` method - whether it requests per-dispatch
     /// timestamps is `Context::device_timing`'s own decision, and the dispatch-index each chunk's
@@ -126,8 +134,9 @@ impl WgpuDevice {
     fn submit_chunked(&self, dispatches: &[(CachedDispatch, u64)]) -> Result<(), RuntimeError> {
         let Some(policy) = self.flush else {
             let refs: Vec<&CachedDispatch> = dispatches.iter().map(|(d, _)| d).collect();
-            return self.ctx.submit_cached(&refs);
+            return self.ctx.submit_cached(&refs).map(drop);
         };
+        let mut in_flight = std::collections::VecDeque::with_capacity(IN_FLIGHT_SUBMITS);
         let mut start = 0;
         while start < dispatches.len() {
             let mut end = start;
@@ -138,10 +147,11 @@ impl WgpuDevice {
             }
             let refs: Vec<&CachedDispatch> =
                 dispatches[start..end].iter().map(|(d, _)| d).collect();
-            self.ctx.submit_cached(&refs)?;
-            if end < dispatches.len() {
-                self.ctx.poll_wait()?;
+            if in_flight.len() == IN_FLIGHT_SUBMITS {
+                let oldest = in_flight.pop_front().expect("a full window has an oldest");
+                self.ctx.wait_submission(&oldest)?;
             }
+            in_flight.push_back(self.ctx.submit_cached(&refs)?);
             start = end;
         }
         Ok(())
@@ -198,6 +208,14 @@ impl Device for WgpuDevice {
         elems: usize,
     ) -> Result<DeviceBuffer, RuntimeError> {
         self.ctx.alloc_storage(role, storage, elems)
+    }
+
+    fn view(
+        &self,
+        buffer: &DeviceBuffer,
+        storage: BufferStorage,
+    ) -> Result<DeviceBuffer, RuntimeError> {
+        buffer.view(storage)
     }
 
     fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {

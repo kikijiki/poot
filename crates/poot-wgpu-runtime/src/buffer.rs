@@ -200,9 +200,28 @@ impl DeviceBuffer {
     }
 
     /// The full storage contract (card 527, R471-009/R484-001): element kind, logical dtype and layout
-    /// together, set at allocation.
+    /// together, set at allocation, or a typed view's ([`Self::view`]).
     pub fn storage(&self) -> BufferStorage {
         self.storage
+    }
+
+    /// This buffer's bytes typed as `storage` (POOT-1450): a handle sharing the `wgpu::Buffer`, its id and
+    /// its memory guard (nothing is allocated or charged) whose storage and element count are the view's,
+    /// so every check that reads a handle's storage (a dispatch's element schema, a typed transfer)
+    /// checks the view. A typed buffer admits only its own storage; an arena slot of bytes any encoded
+    /// storage in whole elements.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::View`] when [`BufferStorage::view_elems`] refuses the view.
+    pub fn view(&self, storage: BufferStorage) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            buf: self.buf.clone(),
+            elem_count: self.storage.view_elems(self.elem_count, storage)?,
+            id: self.id,
+            storage,
+            _guard: Arc::clone(&self._guard),
+        })
     }
 }
 

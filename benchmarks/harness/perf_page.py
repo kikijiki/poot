@@ -41,7 +41,8 @@ SCHEMA = 5
 
 # Memory is charted at inference: the peak after the model is loaded and the warmup request has run (memory_phases.py).
 # The load peak is stated beside it. A cell none of whose runs has a usable load boundary keeps the lifetime peak and says
-# it includes the load.
+# it includes the load. The host figure is split by what backs the pages (RssAnon, RssFile) and the device figure by the
+# engine's own buffer classes (weights, KV and state, workspace, staging), where the runs recorded them.
 WARMUP_ITERS = phases.warmup_iters(receipts.MANIFEST)
 MEMORY_SCOPE_INFERENCE = "inference"
 MEMORY_SCOPE_LIFETIME = "includes_load"
@@ -79,6 +80,8 @@ IDENTITY_FIELDS = (
     "build_sha", "adapter", "driver_version", "compute_dtype", "checkpoint_digest", "rustc_version", "framework_version",
 )
 ROW_METRICS = ("decode_tok_s", "ttft_ms", "tpot_ms", "e2e_ms", "peak_rss_bytes", "peak_vram_bytes", "energy_j")
+# The engine-reported device memory classes (result_contract.MEMORY_CLASS_FIELDS) the page states per cell.
+MEMORY_CLASS_METRICS = ("weights_bytes", "kv_bytes", "workspace_bytes", "staging_bytes")
 
 
 def _round(value):
@@ -182,13 +185,17 @@ def cell_record(set_name, date, rows, policy, known=None):
     `unverified` (the band and the reason) and the page draws its numbers muted, never as a verified result."""
     first = rows[0]
     metrics = {m: _stat([row_value(row, m) for row in rows]) for m in (*ROW_METRICS, "prefill_tok_s")}
-    split = [phases.memory_phases(row, WARMUP_ITERS) for row in rows]
+    split = [phases.row_phases(row, WARMUP_ITERS) for row in rows]
     inferred = all(split)
     if inferred:
         # One repeat without a boundary would mix two meanings in one median, so the whole cell keeps the lifetime peak.
         for key, part, field in (("peak_rss_bytes", "inference", "rss_bytes"), ("peak_vram_bytes", "inference", "vram_bytes"),
-                                 ("load_rss_bytes", "load", "rss_bytes"), ("load_vram_bytes", "load", "vram_bytes")):
-            metrics[key] = _stat([s[part][field] for s in split])
+                                 ("load_rss_bytes", "load", "rss_bytes"), ("load_vram_bytes", "load", "vram_bytes"),
+                                 ("rss_anon_bytes", "inference", "rss_anon_bytes"), ("rss_file_bytes", "inference", "rss_file_bytes")):
+            # A stored row's inferred split has no anon/file figures; a run with the marks has them.
+            metrics[key] = _stat([s[part].get(field) for s in split])
+    for key in MEMORY_CLASS_METRICS:
+        metrics[key] = _stat([(row.get("memory_classes") or {}).get(key) for row in rows])
     backend = row_backend(first)
     record = {
         "set": set_name,
@@ -321,7 +328,8 @@ def collect_kernels(bank_root):
 # context lengths of its curve; a single-point cell (decode-128, prefill-1k) is one point of the same axis at the prompt
 # length its rows record. The scenario names stay internal to this module.
 CURVE_METRICS = ("decode_tok_s", "ttft_ms", "tpot_ms", "prefill_tok_s")
-CELL_LEVEL_METRICS = ("peak_vram_bytes", "peak_rss_bytes", "load_vram_bytes", "load_rss_bytes", "energy_j")
+CELL_LEVEL_METRICS = ("peak_vram_bytes", "peak_rss_bytes", "load_vram_bytes", "load_rss_bytes", "rss_anon_bytes", "rss_file_bytes",
+                      *MEMORY_CLASS_METRICS, "energy_j")
 # Decode throughput, time per output token and end-to-end time depend on how many tokens are generated, so a point carries them
 # only when its run generated DECODE_GEN_TOKENS, the length of every decode series (a context sweep and the short run). The
 # 1000-token prefill run generates 32 tokens: it feeds prefill, first-token time and memory, never a decode series.

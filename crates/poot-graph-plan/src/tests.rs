@@ -3682,7 +3682,7 @@ const LAUNCH_PROVENANCE: &[Provenance] = &[
     prov(
         "INDEXED_GEMV_MAX_ROWS",
         32,
-        "design bound, not swept: a decode step's selected experts or a few steps batched; above it the register-tiled expert walk shares expert weight tiles",
+        "design bound, not swept: a decode step's selected experts or a few steps batched; above it the register-tiled schedule over the grouped rows shares expert weight tiles",
     ),
     prov(
         "TILED_MAX_ROWS",
@@ -3800,18 +3800,18 @@ fn indexed_lane_edge(backend: Backend, caps: &DeviceCaps, packed: bool) -> usize
         b.indexed_matmul(x, w, ids).unwrap()
     };
     let g = b.finish(out).unwrap();
-    let eqn = g
-        .eqns()
-        .iter()
-        .find(|e| {
+    // The contraction as `compile` plans it: its rows grouped by expert (POOT-1451).
+    let program = compiled_on(&g, backend, *caps);
+    let (eqn, _) = program
+        .planned()
+        .find(|(e, _)| {
             matches!(
                 e.op,
                 OpKind::IndexedMatMul { .. } | OpKind::PackedContraction { .. }
             )
         })
         .expect("a routed contraction eqn");
-    let (_, choice) = planned_with_choice_caps(&g, eqn, backend, caps)
-        .unwrap_or_else(|error| panic!("{backend:?} packed={packed}: {error}"));
+    let choice = program.kernel_choice(eqn).clone();
     let KernelChoice::Generated(KernelRequest::Contraction(spec)) = choice else {
         panic!("{backend:?} packed={packed}: not a generated contraction: {choice:?}");
     };

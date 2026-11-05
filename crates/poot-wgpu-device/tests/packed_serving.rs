@@ -484,7 +484,7 @@ fn packed_prefill_through_serving_paths_is_bit_exact() {
 
 const EXPERTS: usize = 3;
 const ROWS: usize = 5;
-/// Rows past `INDEXED_GEMV_MAX_ROWS` (32), so an indexed contraction of them runs the register-tiled expert walk.
+/// Rows past `INDEXED_GEMV_MAX_ROWS` (32), so an indexed contraction of them runs the register-tiled schedule over the grouped rows.
 const PREFILL_ROWS: usize = 70;
 const PREFILL_OUT: usize = 11;
 /// Row `m` routed to expert `(2m + 1) % EXPERTS`: every window of rows holds all the experts.
@@ -684,14 +684,24 @@ fn run_indexed_case(
         "{what}: the experts each stacked carrier holds"
     );
     if buffers == StackBuffers::One {
-        let [contraction] = compiled.eqns() else {
-            panic!("{what}: one equation, got {:?}", compiled.eqns());
+        // The contraction, after the grouping of its rows when the target tiles them (POOT-1451).
+        let contraction = match compiled.eqns() {
+            [contraction] => contraction,
+            [grouping, contraction]
+                if matches!(grouping.op, poot_graph_ir::OpKind::ExpertGroup { .. }) =>
+            {
+                contraction
+            }
+            eqns => panic!("{what}: one contraction, got {eqns:?}"),
         };
         assert!(
             matches!(
                 contraction.op,
                 poot_graph_ir::OpKind::PackedContraction {
-                    rows: poot_graph_ir::ContractionRows::Indexed { experts: EXPERTS },
+                    rows: poot_graph_ir::ContractionRows::Indexed {
+                        experts: EXPERTS,
+                        ..
+                    },
                     ..
                 }
             ),
@@ -801,7 +811,7 @@ fn an_unaligned_expert_slab_table_runs_bit_exact() {
 }
 
 /// A prefill-sized routed table (wgpu): `PREFILL_ROWS` rows is past the decode row count, so the indexed packed
-/// contraction runs the register-tiled expert walk (rows routed by `gapped`, so a tile holds several
+/// contraction runs the register-tiled schedule over the grouped rows (rows routed by `gapped`, so a tile holds several
 /// experts and may skip one) over every format, with `N = 11` leaving edge columns in the last column tile. One-hot rows bit-exact
 /// against the oracle decoder. Mutation: take the Tiled step's slab from the wrong segment (`weight.step(.., lo,
 /// ..)` in `tiled_body`); rows routed to an expert after a gap read another expert and go red.

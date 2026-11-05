@@ -8,7 +8,7 @@ const page = readFileSync(join(import.meta.dir, "../../../docs/architecture/grap
 const EXPECTED_OPS: Record<string, string[]> = {
   elementwise: ["Unary(op)", "Binary(op)", "Select", "Cast(to)"],
   shape: ["Broadcast", "Reshape", "Transpose", "Slice", "Concat"],
-  data: ["Gather", "ScatterUpdate", "DynamicUpdateSlice", "ArgTopK(k)", "ExpertGroup(experts)"],
+  data: ["Gather", "ScatterUpdate", "DynamicUpdateSlice", "ArgTopK(k)", "ExpertGroup(experts, block)"],
   reduce: ["Reduce(op, axis, keepdim)"],
   compute: [
     "MatMul", "IndexedMatMul", "PackedDequant", "PackedContraction / PackedRowGather",

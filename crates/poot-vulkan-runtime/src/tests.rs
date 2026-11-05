@@ -32,6 +32,8 @@ enum FailPoint {
     BeginCommandBuffer,
     /// `vkQueueSubmit` fails with out-of-memory: the spec guarantees nothing was queued.
     QueueSubmitOutOfMemory,
+    /// The second `vkQueueSubmit` of the run fails with out-of-memory, after the first was accepted.
+    SecondQueueSubmitOutOfMemory,
     /// `vkQueueSubmit` fails with device loss: no guarantee that nothing was queued.
     QueueSubmitDeviceLost,
     /// The submission is accepted but its fence is never signalled (a hung device).
@@ -227,7 +229,15 @@ impl ResourceDispatch for MockDispatch {
         _fence: ash::vk::Fence,
     ) -> Result<(), ash::vk::Result> {
         self.event("queue_submit");
+        let submits = self
+            .events()
+            .iter()
+            .filter(|&&e| e == "queue_submit")
+            .count();
         match self.fail_at() {
+            Some(FailPoint::SecondQueueSubmitOutOfMemory) if submits == 2 => {
+                Err(ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+            }
             Some(FailPoint::QueueSubmitOutOfMemory) => {
                 Err(ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
             }
@@ -542,8 +552,9 @@ fn recorded_graph_directly_retains_owner_and_replays_after_context_drop() {
 
     drop(graph);
     assert_eq!(
-        &mock.events()[mock.events().len() - 5..],
+        &mock.events()[mock.events().len() - 6..],
         [
+            "destroy_fence",
             "destroy_fence",
             "destroy_command_pool",
             "destroy_device",
@@ -575,8 +586,9 @@ fn recorded_graph_retains_buffers_and_pipelines_after_context_drop() {
     );
     drop(graph);
     assert_eq!(
-        &mock.events()[mock.events().len() - 12..],
+        &mock.events()[mock.events().len() - 13..],
         [
+            "destroy_fence",
             "destroy_fence",
             "destroy_command_pool",
             "unmap_memory",
@@ -675,7 +687,9 @@ fn graph_partial_failures_clean_up_exactly_acquired_resources() {
                 "create_command_pool",
                 "allocate_command_buffers",
                 "create_fence",
+                "create_fence",
                 "begin_command_buffer",
+                "destroy_fence",
                 "destroy_fence",
                 "destroy_command_pool",
             ],
@@ -833,8 +847,9 @@ fn submit_refused_for_memory_is_retired_not_poisoned() {
     assert!(buffer.read_bytes(&mut [0u8; 4]).is_ok());
     drop((graph, buffer, context));
     assert_eq!(
-        &mock.events()[mock.events().len() - 8..],
+        &mock.events()[mock.events().len() - 9..],
         [
+            "destroy_fence",
             "destroy_fence",
             "destroy_command_pool",
             "unmap_memory",
@@ -845,6 +860,140 @@ fn submit_refused_for_memory_is_retired_not_poisoned() {
             "release_loader",
         ]
     );
+}
+
+/// A graph of `segments` command buffers, finished and ready to replay on a mock device. The mock records no
+/// commands, so each cut is preceded by the one count a recorded command would have set; the cut, the end and
+/// the replay are the production paths.
+fn mock_segmented_graph(segments: usize) -> (Context, Arc<MockDispatch>, VulkanGraph) {
+    let (context, mock) = mock_context(None);
+    let mut graph = context.begin_graph(GraphTiming::Off).expect("mock graph");
+    for _ in 1..segments {
+        graph.core.commands_in_segment = 1;
+        context.cut_graph(&mut graph).expect("mock cut");
+    }
+    let graph = context.end_graph(graph).expect("end mock graph");
+    assert_eq!(graph.segment_count(), segments);
+    (context, mock, graph)
+}
+
+/// The submissions pending after each native call of `events`: a submit queues one, a fence wait retires the
+/// oldest.
+fn pending_after_each(events: &[&str]) -> Vec<usize> {
+    let mut pending = 0usize;
+    events
+        .iter()
+        .map(|&event| {
+            match event {
+                "queue_submit" => pending += 1,
+                "wait_for_fences" => pending -= 1,
+                _ => {}
+            }
+            pending
+        })
+        .collect()
+}
+
+/// POOT-1449: a replay cut into several submissions keeps two pending and waits only for the oldest, so the
+/// device always has the next segment queued while it runs the previous one; the host waits out the last two
+/// before returning. Five segments are five submits; the third needs the first retired, the fourth the second,
+/// the fifth the third, and two waits close the replay. Waiting after every segment (the pre-1449 replay) never
+/// holds two pending.
+///
+/// Mutation: `IN_FLIGHT_SUBMITS` of 1 in `graph.rs` (one fence, a wait after every submit): the pending peak is
+/// 1 and the first assertion goes red.
+#[test]
+fn a_cut_replay_keeps_two_submissions_pending() {
+    let (_context, mock, graph) = mock_segmented_graph(5);
+    let before = mock.events().len();
+    graph.replay().expect("mock replay");
+    let events = mock.events()[before..].to_vec();
+    let pending = pending_after_each(&events);
+    assert_eq!(
+        pending.iter().max(),
+        Some(&2),
+        "two submissions in flight: {events:?}"
+    );
+    assert_eq!(
+        events.iter().filter(|&&e| e == "queue_submit").count(),
+        5,
+        "every segment is submitted once"
+    );
+    assert_eq!(
+        events.iter().filter(|&&e| e == "wait_for_fences").count(),
+        5,
+        "every submission is waited exactly once"
+    );
+    assert_eq!(
+        pending.last(),
+        Some(&0),
+        "nothing pending when replay returns"
+    );
+    // The window is full from the second submit on, and the third submit is preceded by the wait that
+    // makes room for it.
+    assert_eq!(
+        &events[..8],
+        [
+            "reset_fences",
+            "queue_submit",
+            "reset_fences",
+            "queue_submit",
+            "wait_for_fences",
+            "reset_fences",
+            "queue_submit",
+            "wait_for_fences",
+        ]
+    );
+}
+
+/// A graph shorter than the window waits only at the end: the device is never asked to idle for it.
+#[test]
+fn a_replay_inside_the_window_waits_once_at_the_end() {
+    let (_context, mock, graph) = mock_segmented_graph(2);
+    let before = mock.events().len();
+    graph.replay().expect("mock replay");
+    assert_eq!(
+        &mock.events()[before..],
+        [
+            "reset_fences",
+            "queue_submit",
+            "reset_fences",
+            "queue_submit",
+            "wait_for_fences",
+            "wait_for_fences",
+        ]
+    );
+}
+
+/// A submit refused for memory after an earlier segment was accepted: the accepted one is still running, so the
+/// replay waits it out before the error returns (the caller may drop the graph on that error), and the device
+/// stays usable.
+///
+/// Mutation: skip `wait_pending` when `submit_segments` failed (`VulkanGraph::replay`): the event list ends at
+/// the refused submit and the assertion goes red.
+#[test]
+fn a_refused_submit_retires_the_pending_ones_first() {
+    let (context, mock, graph) = mock_segmented_graph(3);
+    mock.set_fail_at(Some(FailPoint::SecondQueueSubmitOutOfMemory));
+    let before = mock.events().len();
+    assert!(matches!(
+        graph.replay(),
+        Err(RuntimeError::Vk(
+            ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+        ))
+    ));
+    assert_eq!(
+        &mock.events()[before..],
+        [
+            "reset_fences",
+            "queue_submit",
+            "reset_fences",
+            "queue_submit",
+            "wait_for_fences",
+        ],
+        "the first submission is retired before the error returns"
+    );
+    assert!(!context.is_poisoned());
 }
 
 /// SC-003: a zero-size buffer request is refused with a typed error before `vkCreateBuffer`.

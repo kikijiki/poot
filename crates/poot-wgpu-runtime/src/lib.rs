@@ -195,4 +195,4 @@ mod tests;
 
 pub use context::counters::{RuntimeCounterSnapshot, RuntimeCounters};
 pub(crate) use context::transfer::DeviceHealth;
-pub use context::transfer::{ContextOptions, WRITE_CHUNK_BYTES};
+pub use context::transfer::{ContextOptions, QueuedWork, WRITE_CHUNK_BYTES};

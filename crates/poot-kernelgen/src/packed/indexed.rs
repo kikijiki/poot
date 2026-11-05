@@ -20,7 +20,7 @@ use super::planar::PlanarPlan;
 use super::source::Source;
 use crate::KernelGenError;
 use crate::contraction::{
-    Epilogue, ExpertWalk, META_EXPERTS, META_N, META_PACKED_SLAB_WORDS, RowExpert, TiledBody,
+    Epilogue, GroupedRows, META_EXPERTS, META_N, META_PACKED_SLAB_WORDS, RowExpert, TiledBody,
     TiledLaunch, TiledWeight, emit_poison, emit_row_expert, tiled_body,
 };
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
@@ -103,10 +103,11 @@ impl Decode {
     }
 }
 
-/// The register-tiled schedule of an indexed packed contraction (prefill, many rows): params `(activation, ids,
-/// sources.., epilogue leaves.., metadata, out)` like the Gemv, the body [`tiled_body`] inside an [`ExpertWalk`]
-/// that the dense indexed contraction shares, each walk step reading its expert's slab in every source and each
-/// staged run decoding weight row `n` of that slab.
+/// The register-tiled schedule of an indexed packed contraction (prefill, many rows): params `(activation, groups,
+/// sources.., epilogue leaves.., metadata, out)` like the Gemv's (the expert operand is the rows' grouping,
+/// [`poot_graph_ir::ExpertRows::Grouped`]), the body [`tiled_body`] over the grouped rows ([`GroupedRows`]) that the
+/// dense indexed contraction shares, each tile reading its expert's slab in every source and each staged run
+/// decoding weight row `n` of that slab.
 pub(super) fn indexed_register_tiled(
     name: &str,
     format: poot_quant::format::WeightFormat,
@@ -125,7 +126,10 @@ pub(super) fn indexed_register_tiled(
     };
     let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
     let lanes = match epilogue {
-        Some(epilogue) => epilogue.lanes("packed_contraction")?,
+        Some(epilogue) => {
+            epilogue.refuse_narrow_store("packed_contraction")?;
+            epilogue.lanes("packed_contraction")?
+        }
         None => Vec::new(),
     };
     let mut params = vec![
@@ -181,8 +185,8 @@ pub(super) fn indexed_register_tiled(
             leaves: &leaves,
             lanes: &lanes,
         }),
-        walk: Some(ExpertWalk {
-            ids: local(2),
+        grouped: Some(GroupedRows {
+            groups: local(2),
             experts_word: META_EXPERTS,
             step: &mut slabs,
         }),
@@ -311,9 +315,41 @@ mod tests {
         }
     }
 
-    /// Every launch shape the indexed rows run: the Gemv shapes and the register-tiled expert walk at two tile
-    /// heights (16 rows: the fixtures' rows past 16 are a second tile; 32: one tile spans all the fixture rows, so
-    /// it holds every expert). Every tile has edge columns at the fixtures' `N = 4..6`.
+    /// The block-aligned grouping of `ids` in tiles of `block` ([`poot_graph_ir::ExpertGrouping`]), built on the
+    /// host bucket by bucket: what an `ExpertGroup` computes.
+    fn grouping(ids: &[i32], block: usize) -> Vec<i32> {
+        let layout = poot_graph_ir::ExpertGrouping {
+            rows: ids.len(),
+            experts: EXPERTS,
+            block,
+        };
+        let bucket = |id: i32| {
+            usize::try_from(id)
+                .ok()
+                .filter(|&e| e < EXPERTS)
+                .unwrap_or(EXPERTS)
+        };
+        let (mut order, mut tiles) = (Vec::new(), Vec::new());
+        for b in 0..=EXPERTS {
+            let rows: Vec<i32> = (0..ids.len())
+                .filter(|&r| bucket(ids[r]) == b)
+                .map(|r| r as i32)
+                .collect();
+            for chunk in rows.chunks(block) {
+                order.extend_from_slice(chunk);
+                order.resize(order.len() + block - chunk.len(), ids.len() as i32);
+                tiles.push(b as i32);
+            }
+        }
+        order.resize(layout.positions(), ids.len() as i32);
+        tiles.resize(layout.tiles(), EXPERTS as i32);
+        order.extend(tiles);
+        order
+    }
+
+    /// Every launch shape the indexed rows run: the Gemv shapes and the register-tiled schedule over the rows'
+    /// grouping at two tile heights (16 and 32 rows: an expert's rows fill a tile or part of one). Every tile has
+    /// edge columns at the fixtures' `N = 4..6`.
     fn schedules() -> Vec<Schedule> {
         GEMV_SCHEDULES
             .into_iter()
@@ -354,14 +390,27 @@ mod tests {
             poot_graph_ir::OperandPrecision::Exact,
         )
         .unwrap_or_else(|error| panic!("{format:?}: {error}"));
-        let (grid, x_groups) = match schedule {
-            Schedule::Gemv { .. } => ([schedule.grid_threads(1, m, out) as u32, 1, 1], 0),
+        // The Gemv reads the ids; a tiled schedule reads their grouping in tiles of its rows, over the grouping's
+        // positions.
+        let (grid, x_groups, rows, experts) = match schedule {
+            Schedule::Gemv { .. } => (
+                [schedule.grid_threads(1, m, out) as u32, 1, 1],
+                0,
+                m,
+                ids.to_vec(),
+            ),
             Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => {
                 let (tile_rows, tile_cols) = schedule.output_tile().unwrap();
                 let lanes = crate::RegisterTiling::of(schedule)
                     .unwrap()
                     .workgroup_lanes();
-                let tiles = m.div_ceil(tile_rows) * out.div_ceil(tile_cols);
+                let positions = poot_graph_ir::ExpertGrouping {
+                    rows: m,
+                    experts: EXPERTS,
+                    block: tile_rows,
+                }
+                .positions();
+                let tiles = positions.div_ceil(tile_rows) * out.div_ceil(tile_cols);
                 let x_groups = fold.unwrap_or(tiles);
                 (
                     [
@@ -370,15 +419,17 @@ mod tests {
                         1,
                     ],
                     x_groups,
+                    positions,
+                    grouping(ids, tile_rows),
                 )
             }
         };
-        let mut buffers = vec![Buffer::from_f32s(x), Buffer::from_i32s(ids)];
+        let mut buffers = vec![Buffer::from_f32s(x), Buffer::from_i32s(&experts)];
         buffers.extend(case.sources.iter().map(|words| Buffer::from_u32s(words)));
         if let Some((_, leaf)) = epilogue {
             buffers.push(Buffer::from_f32s(leaf));
         }
-        buffers.push(Buffer::from_u32s(&case.metadata(m, x_groups)));
+        buffers.push(Buffer::from_u32s(&case.metadata(rows, x_groups)));
         buffers.push(Buffer::from_f32s(&vec![f32::MIN; m * out]));
         let last = buffers.len() - 1;
         let wg = body.workgroup_size[0];
@@ -611,11 +662,11 @@ mod tests {
         }
     }
 
-    /// The segmented walk: a tile whose rows select a subset of the experts with a gap (here experts 0 and 2 of
-    /// three, in an order that is neither sorted nor grouped) reads each row's own expert slab at every step.
-    /// The 8 rows are one 16-row tile holding ids `{2, 0, 2, 0, 0, 2, 2, 0}`: the step after expert 0 must land on
-    /// expert 2, not on the next integer. Mutation: in `tiled_body` hand the walk's step `lo`
-    /// instead of `next`; the rows routed to expert 2 read expert 1 and go red.
+    /// Rows that select a subset of the experts with a gap (here experts 0 and 2 of three, in an order that is
+    /// neither sorted nor grouped) each read their own expert's slab through the grouping: ids `{2, 0, 2, 0, 0, 2,
+    /// 2, 0}` group into 16-row tiles 0 (expert 0) and 1 (expert 2), so a tile's expert is its word, not its index.
+    /// Mutation: in `tiled_body` hand the grouped step the tile index instead of the tile's expert word; the rows
+    /// routed to expert 2 read expert 1 and go red.
     #[test]
     fn a_tile_whose_rows_skip_an_expert_reads_each_rows_own_slab() {
         let (out, k) = (5, 64);

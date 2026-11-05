@@ -353,6 +353,10 @@ impl Device for CountingDevice {
         std::mem::forget(self.memory.record_alloc(role, bytes));
         Ok(())
     }
+    fn view(&self, _buffer: &(), _storage: poot_target::BufferStorage) -> Result<(), Self::Error> {
+        // This fake keeps no storage: a view is the same nothing.
+        Ok(())
+    }
     /// This fake keeps no storage, so it states no bound: the engine's length check passes every
     /// dispatch it records.
     fn buffer_elems(&self, _buffer: &()) -> usize {

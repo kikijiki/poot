@@ -4,6 +4,19 @@
   "title": "poot benchmark result record",
   "description": "One record per (framework, model, precision, scenario) cell. The harness writes one JSON object per line into results.jsonl. Timing fields come from the runner; memory fields come from the harness external sampler; the env block is written once per run into env.json (not repeated per row). Which binary, on which backend, adapter and device, produced a row is on the row itself: a poot row names its build (build_sha, build_profile, build_features, rustc_version), the adapter and driver the executor reported, the digest of the checkpoint it loaded and the dtype its weights are stored in (precision); an external tool row names its framework_version.",
   "definitions": {
+    "memoryPhase": {
+      "description": "The peaks of one memory phase, each over the phase alone. A figure the machine could not read is null. vram_bytes is device use less the use before the run; on an AMD device it is VRAM plus GTT, of which gtt_bytes is the GTT part.",
+      "type": "object",
+      "required": ["rss_bytes", "rss_anon_bytes", "rss_file_bytes", "vram_bytes", "gtt_bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "rss_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "rss_anon_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "rss_file_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "vram_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "gtt_bytes": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
     "deviceTime": {
       "description": "The device's own time for a profiled window (poot --profile): null when not profiled, `unknown` when the device reports none (ROCm, an untimed device), else measured milliseconds with at least one measure present. Never a zero standing for unknown.",
       "type": ["object", "null"],
@@ -132,6 +145,29 @@
     "vram_baseline_bytes": { "type": "integer", "description": "GPU memory used just before the runner started (other processes), subtracted is left to the report; recorded raw." },
     "peak_gtt_bytes": { "type": "integer", "description": "Peak GTT (system memory mapped for the GPU) in use, from amdgpu sysfs mem_info_gtt_used; a component of peak_vram_bytes on AMD GPUs. Omitted on NVIDIA." },
     "peak_rss_bytes": { "type": "integer", "description": "Peak process resident set size during the runner's lifetime, from /proc (external)." },
+    "peak_rss_anon_bytes": { "type": "integer", "description": "Peak anonymous resident memory (RssAnon of /proc/<pid>/status, summed over the runner's process tree) during the runner's lifetime: heap, allocator arenas, staging buffers. With peak_rss_file_bytes it splits peak_rss_bytes by what backs the pages; the two peaks need not fall on the same tick." },
+    "peak_rss_file_bytes": { "type": "integer", "description": "Peak file-backed resident memory (RssFile, summed over the process tree) during the runner's lifetime: a mapped checkpoint, shared libraries. Pages the kernel can drop and re-read." },
+    "memory_phases": {
+      "type": "object",
+      "description": "Exact memory phases of a run whose runner printed both marks (POOT_BENCH_MARK load_end / warmup_end, unix seconds). The observer keeps every sampler tick with its wall-clock time and cuts it at the runner's own marks: load = up to load_end, inference = after the first warmup generation (warmup_end). Each part holds the peaks of that part alone. Absent for a run without both marks.",
+      "required": ["load", "inference"],
+      "properties": {
+        "load": { "$ref": "#/definitions/memoryPhase" },
+        "inference": { "$ref": "#/definitions/memoryPhase" }
+      },
+      "additionalProperties": false
+    },
+    "memory_classes": {
+      "type": "object",
+      "description": "Device memory the engine itself reports, by what the buffer is for. poot counts live buffers by role (weights; KV cache and recurrent state; activations, inputs, outputs and metadata; staging) and reports each class's peak; llama.cpp's memory breakdown table gives weights (model), KV and state (context) and workspace (compute). A class the engine does not count is absent.",
+      "properties": {
+        "weights_bytes": { "type": "integer", "minimum": 0 },
+        "kv_bytes": { "type": "integer", "minimum": 0 },
+        "workspace_bytes": { "type": "integer", "minimum": 0 },
+        "staging_bytes": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
     "gpu_util_mean_pct": { "type": "number", "description": "Mean GPU compute utilization (% of sample periods the SMs were busy) over the cell, from the external sampler. Low = headroom (idle GPU between launches/syncs)." },
     "gpu_util_peak_pct": { "type": "number", "description": "Peak GPU compute utilization over the cell, from the external sampler." },
     "cpu_util_mean_pct": { "type": "number", "description": "Mean process-tree CPU utilization (%, 100% == one full core) over the cell, from psutil. Near 100% while GPU util is low points to a single-thread host bottleneck feeding the GPU." },

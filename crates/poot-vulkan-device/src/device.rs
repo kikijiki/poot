@@ -5,13 +5,14 @@
 //! A recording is a [`VulkanGraph`]: `begin` opens a [`RecordingGraph`]; `dispatch` and `copy` each append
 //! one command (a pipeline bind, a descriptor bind and `vkCmdDispatch`, or `vkCmdCopyBuffer`, behind a
 //! memory barrier) and never submit; `finish` closes it. `replay` is the one method that touches the
-//! queue: it resubmits the recorded command buffers verbatim, fence-waiting after each, so by the time
-//! `replay` returns `Ok` the work is done (`synchronize` only raises the replay's staged kernel fault).
+//! queue: it resubmits the recorded command buffers verbatim, keeping a bounded window of them pending and
+//! fence-waiting the rest before it returns, so by the time `replay` returns `Ok` the work is done
+//! (`synchronize` only raises the replay's staged kernel fault).
 //!
 //! On a device with a watchdog budget a long recording is cut into several command buffers by the planner's
 //! `Dispatch::work` weight ([`FlushPolicy`], the bounds `WgpuDevice` flushes on), so a replay is several
-//! submissions with a fence wait between them, never one past-watchdog submission. A device with no budget
-//! records a stage as one command buffer.
+//! submissions, never one past-watchdog submission, with the next already queued behind the one running. A
+//! device with no budget records a stage as one command buffer.
 //!
 //! `copy` is `vkCmdCopyBuffer` in the same command stream, ordered by the barrier every command carries.
 
@@ -84,8 +85,8 @@ impl OpenStep {
 }
 
 /// The raw-Vulkan [`Device`]: owns one [`Context`], records each step as a [`VulkanGraph`] of command
-/// buffers and replays it with fence waits. Single-threaded like the contract; see the module docs for
-/// how a recording is cut into submissions.
+/// buffers and replays it with a bounded window of submissions in flight. Single-threaded like the contract;
+/// see the module docs for how a recording is cut into submissions.
 pub struct VulkanDevice {
     ctx: Context,
     /// How a long recording is cut into command buffers; `None` on a device with no watchdog budget. Derived
@@ -194,6 +195,14 @@ impl Device for VulkanDevice {
     ) -> Result<DeviceBuffer, VulkanGpuError> {
         // A zero-element value still owns one element: a Vulkan buffer holds at least one byte.
         Ok(self.ctx.alloc_storage(role, storage, elems.max(1))?)
+    }
+
+    fn view(
+        &self,
+        buffer: &DeviceBuffer,
+        storage: BufferStorage,
+    ) -> Result<DeviceBuffer, VulkanGpuError> {
+        Ok(buffer.view(storage)?)
     }
 
     fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {

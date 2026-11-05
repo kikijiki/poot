@@ -34,6 +34,12 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+def mark(event):
+    """Tell the observer the model is loaded (`load_end`) or the first warmup generation is done (`warmup_end`), on this
+    process's wall clock: it cuts its memory samples there (harness/memory_phases.py defines the line)."""
+    print(f"POOT_BENCH_MARK {event} {time.time():.6f}", file=sys.stderr, flush=True)
+
+
 def run_decode_curve(args):
     """decode-curve (spec 115): per-token ITL via AsyncLLMEngine streaming (offline LLM.generate has no
     per-token timing). Prefix caching disabled; synthetic fixed-N token prompts."""
@@ -63,6 +69,7 @@ def run_decode_curve(args):
         model=args.model_dir, dtype=dtype, quantization=quant, tensor_parallel_size=1,
         gpu_memory_utilization=args.gpu_mem_util, max_model_len=max(isls) + osl + 16,
         enable_prefix_caching=False))
+    mark("load_end")
 
     async def gen_once(ids):
         sp = SamplingParams(**fixed_length_kwargs(osl))
@@ -74,10 +81,12 @@ def run_decode_curve(args):
 
     async def run():
         curve = []
-        for isl in isls:
+        for index, isl in enumerate(isls):
             ids = [rng.randrange(0, vocab) for _ in range(isl)]
             for _ in range(args.warmup):
                 await gen_once(ids)
+            if index == 0:
+                mark("warmup_end")
             iters = []
             for _ in range(args.iters):
                 ttft, e2e, gaps = await gen_once(ids)
@@ -137,6 +146,7 @@ def main():
     llm = LLM(model=args.model_dir, dtype=dtype, quantization=quant, tensor_parallel_size=1,
               gpu_memory_utilization=args.gpu_mem_util, max_model_len=args.max_model_len)
     weights_vram = int(torch.cuda.memory_allocated())
+    mark("load_end")
 
     n = args.gen_tokens
     sp = SamplingParams(**fixed_length_kwargs(n))
@@ -156,6 +166,7 @@ def main():
     for w in range(args.warmup):
         full()
         log(f"vllm: warmup {w + 1}/{args.warmup}")
+    mark("warmup_end")
 
     ttfts, tpots, e2es, decs = [], [], [], []
     prompt_tokens = gen = n

@@ -15,11 +15,11 @@
 //! accumulate); an epilogue after a K loop would silently remove the loop's contraction instead of its own.
 
 use poot_kernel_ir::{Constant, Local, LocalDecl, Operand, Rvalue, Ty};
-use poot_target::BufferStorage;
+use poot_target::{BufferStorage, FragmentDtype};
 
 use crate::KernelGenError;
 use crate::emit::{Emit, copy};
-use crate::fused::{FusedScalarOp, emit_leaf_offset, emit_scalar_op};
+use crate::fused::{FusedScalarOp, emit_leaf_offset, emit_scalar_op, narrow_store};
 use crate::helpers::{
     Layout, WeightLane, elem, ld, row_major_strides, slice_dtype, view_eff_strides,
 };
@@ -107,6 +107,30 @@ impl Epilogue {
                 request: generator,
                 reason: "an epilogue over an f32 head must itself be f32",
             })
+        }
+    }
+
+    /// The fragment dtype the output is stored in (POOT-1448): that of a [`FusedScalarOp::Narrow`] output step,
+    /// `None` for an output stored as `dt`.
+    pub(crate) fn store(&self) -> Option<FragmentDtype> {
+        match self.output {
+            EpilogueInput::Step(step) => narrow_store(self.steps[step].op),
+            EpilogueInput::Head | EpilogueInput::Leaf(_) | EpilogueInput::Lit(_) => None,
+        }
+    }
+
+    /// Refuses an epilogue whose output is stored narrow, for a generator whose output buffer is f32 (every body
+    /// but the dense register-tiled one).
+    pub(crate) fn refuse_narrow_store(
+        &self,
+        generator: &'static str,
+    ) -> Result<(), KernelGenError> {
+        match self.store() {
+            None => Ok(()),
+            Some(_) => Err(KernelGenError::Unsupported {
+                request: generator,
+                reason: "this body stores an f32 output; only the dense tiled body stores a narrowed one",
+            }),
         }
     }
 

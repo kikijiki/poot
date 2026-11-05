@@ -43,15 +43,6 @@ impl StagedTerms {
         fragment: None,
     };
 
-    /// These terms for a contraction that keeps the scalar micro-tile (an expert walk, whose rows select different
-    /// weight tiles): the same tiles, no fragment dtype.
-    pub const fn scalar_only(self) -> Self {
-        Self {
-            fragment: None,
-            ..self
-        }
-    }
-
     /// The Kernel IR operations a staged f32 value takes to become the operand a tile stores: the rounding to the
     /// fragment dtype ([`round_to_fragment`], counted from the statements it emits), once more for each extra part of
     /// a split operand, `0` for exact operands. What a tiling's cost model adds to every staged value, so a tile
@@ -60,12 +51,7 @@ impl StagedTerms {
         let Some(dtype) = self.fragment else {
             return 0;
         };
-        let mut al = Alloc::new(Vec::new());
-        let mut e = Emit::new(&mut al);
-        let x = e.fresh(Ty::F32, false);
-        round_to_fragment(&mut e, dtype, x);
-        let one_part = e.take().len();
-        one_part * (self.activation + self.weight) / 2
+        rounding_statements(dtype) * (self.activation + self.weight) / 2
     }
 
     /// The tiles `precision` stages for a weight held as `weight_stored` (a weight stored in the fragment dtype is
@@ -94,6 +80,15 @@ impl StagedTerms {
 /// ([`crate::TiledShape::weight_bits`]): 16 for a packed half, 32 for an f32 word.
 pub fn dense_value_bits(storage: poot_target::BufferStorage) -> u32 {
     match stored_fragment_dtype(storage) {
+        Some(_) => 16,
+        None => 32,
+    }
+}
+
+/// The bits one activation value occupies in global memory ([`crate::TiledShape::activation_bits`]): 32 for an f32
+/// activation, 16 for one the planner stored in a fragment dtype (POOT-1448).
+pub const fn activation_bits(stored: Option<FragmentDtype>) -> u32 {
+    match stored {
         Some(_) => 16,
         None => 32,
     }
@@ -163,6 +158,50 @@ impl ProductRead {
     /// The terms of a decoded weight value.
     pub(crate) fn weight_terms(self, e: &mut Emit, x: Local) -> Vec<Local> {
         operand_terms(e, self.precision, self.weight_stored, x)
+    }
+}
+
+/// The statements [`round_to_fragment`] emits for one value of `dtype`, each into a fresh local: counted from the
+/// emitter itself, so a size or cost bound cannot drift from it.
+pub(crate) fn rounding_statements(dtype: FragmentDtype) -> usize {
+    let mut al = Alloc::new(Vec::new());
+    let mut e = Emit::new(&mut al);
+    let x = e.fresh(Ty::F32, false);
+    round_to_fragment(&mut e, dtype, x);
+    e.take().len()
+}
+
+/// The Kernel IR element type that holds values of `dtype`.
+pub(crate) const fn fragment_ty(dtype: FragmentDtype) -> Ty {
+    match dtype {
+        FragmentDtype::Bf16 => Ty::BF16,
+        FragmentDtype::F16 => Ty::F16,
+    }
+}
+
+/// The element type of an output stored as `store` says (POOT-1448): f32, or the fragment dtype of a body whose
+/// output is a [`crate::FusedScalarOp::Narrow`] step.
+pub(crate) const fn stored_ty(store: Option<FragmentDtype>) -> Ty {
+    match store {
+        Some(dtype) => fragment_ty(dtype),
+        None => Ty::F32,
+    }
+}
+
+/// The element a body stores for its f32 output `x` under `store`: `x` itself, or `x` narrowed to the fragment
+/// dtype. A narrowed output is a [`crate::FusedScalarOp::Narrow`] step, already rounded by [`round_to_fragment`]
+/// and so exact in the dtype: the narrowing drops zero bits ([`Rvalue::Narrow`]; the interpreter faults on one that
+/// would round).
+pub(crate) fn store_value(e: &mut Emit, store: Option<FragmentDtype>, x: Local) -> Local {
+    match store {
+        Some(dtype) => e.let_(
+            fragment_ty(dtype),
+            Rvalue::Narrow {
+                to: fragment_ty(dtype),
+                operand: copy(x),
+            },
+        ),
+        None => x,
     }
 }
 

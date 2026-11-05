@@ -139,7 +139,10 @@ fn head_of(op: &OpKind) -> Option<ContractionHead> {
             rows: *rows,
             precision,
         },
-        OpKind::IndexedMatMul { .. } => ContractionHead::Indexed { precision },
+        OpKind::IndexedMatMul { rows, .. } => ContractionHead::Indexed {
+            rows: *rows,
+            precision,
+        },
         _ => return None,
     })
 }

@@ -372,6 +372,11 @@ fn a_long_recording_is_cut_into_several_submissions_and_replays_exactly() {
     device.synchronize().unwrap();
     // 1030 adds of 1: an even count ends back in `ping`.
     assert_eq!(read_f32(&mut device, &ping), vec![1030.0; 4]);
+    // The same graph again: its fences, left signaled by the first replay, are reset and reused.
+    poot_executor::write_slice(&mut device, &ping, 0, &f32_bytes(&[0.0; 4])).unwrap();
+    device.replay(&long).unwrap();
+    device.synchronize().unwrap();
+    assert_eq!(read_f32(&mut device, &ping), vec![1030.0; 4]);
 
     let heavy = chain(&mut device, 5, 3_000_000);
     assert_eq!(
@@ -611,5 +616,26 @@ fn a_real_fence_wait_past_its_bound_times_out_and_poisons() {
                 if matches!(**error, poot_vulkan_runtime::RuntimeError::Poisoned { .. })
         ),
         "got {refused:?}"
+    );
+}
+
+/// POOT-1450: an untyped arena slot reaches a kernel only through a typed view its bytes admit, on raw Vulkan
+/// (`poot_executor_parity::view_probe`). Mutations: `BufferStorage::view_elems` admits any view of a typed buffer;
+/// drop its whole-elements check; `DeviceBuffer::view` keeps the allocation's storage.
+#[test]
+fn an_arena_slot_is_bound_only_through_a_view_it_admits_on_vulkan() {
+    let Some(mut device) = vulkan() else {
+        return;
+    };
+    let body = poot_kernel_ir::test_support::len_probe_kernel();
+    let kernel = device
+        .load_kernel(
+            "poot1450_len_probe",
+            compile_for_vulkan(&body, "poot1450_len_probe"),
+        )
+        .unwrap();
+    poot_executor_parity::view_probe::an_arena_slot_is_bound_only_through_a_view_it_admits(
+        &mut device,
+        &kernel,
     );
 }

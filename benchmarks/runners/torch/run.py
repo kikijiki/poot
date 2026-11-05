@@ -29,6 +29,12 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+def mark(event):
+    """Tell the observer the model is loaded (`load_end`) or the first warmup generation is done (`warmup_end`), on this
+    process's wall clock: it cuts its memory samples there (harness/memory_phases.py defines the line)."""
+    print(f"POOT_BENCH_MARK {event} {time.time():.6f}", file=sys.stderr, flush=True)
+
+
 def run_decode_curve(model, tok, device, args, caveats):
     """decode-curve (spec 115): synthetic ISL prefill, fixed OSL decode, per-token timing. Emits raw
     per-iteration samples for the harness to aggregate. Decodes manually (past_key_values) to time each
@@ -61,10 +67,12 @@ def run_decode_curve(model, tok, device, args, caveats):
         return ttft, e2e, itls
 
     curve = []
-    for isl in isls:
+    for index, isl in enumerate(isls):
         ids = torch.randint(0, vocab, (1, isl), generator=gen).to(device)
         for _ in range(args.warmup):
             decode_once(ids)
+        if index == 0:
+            mark("warmup_end")
         torch.cuda.reset_peak_memory_stats(device)
         iters = []
         for _ in range(args.iters):
@@ -116,6 +124,7 @@ def main():
         tok.pad_token = tok.eos_token
     model = AutoModelForCausalLM.from_pretrained(
         args.model_dir, **{DTYPE_KW: dtype}, device_map={"": 0}, attn_implementation="sdpa").eval()
+    mark("load_end")
 
     if args.mode == "decode-curve":
         run_decode_curve(model, tok, device, args, caveats)
@@ -156,6 +165,7 @@ def main():
     for w in range(args.warmup):
         one()
         log(f"torch: warmup {w + 1}/{args.warmup}")
+    mark("warmup_end")
     torch.cuda.reset_peak_memory_stats(device)
 
     ttfts, tpots, e2es, decs = [], [], [], []

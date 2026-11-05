@@ -10,8 +10,12 @@ minus the pre-launch baseline" is the engine-agnostic footprint. The baseline is
 can subtract it or not.
 
 On an AMD device (named by the runner's reported GPU) the same quantities come from the amdgpu sysfs files
-(VRAM+GTT used, gpu_busy_percent, hwmon power1_average). Otherwise prefers pynvml, falls back to `nvidia-smi`; prefers psutil for the process tree, falls back to /proc VmRSS
-for the main pid. With no GPU (e.g. the dev Arc or a CPU box) VRAM is None and only RSS is reported.
+(VRAM+GTT used, gpu_busy_percent, hwmon power1_average). Otherwise prefers pynvml, falls back to `nvidia-smi`. Host memory
+is the sum over the runner's process tree from /proc/<pid>/status (VmRSS split into RssAnon and RssFile); psutil only meters
+CPU. With no GPU (e.g. the dev Arc or a CPU box) VRAM is None and only RSS is reported.
+
+A runner may print marks (`POOT_BENCH_MARK load_end|warmup_end <unix seconds>`, see memory_phases.py). The sampler keeps every
+tick with its wall-clock time, and the observer cuts the ticks at the marks into the load and inference phases.
 """
 
 import json
@@ -26,6 +30,8 @@ import sys
 import threading
 import time
 
+import memory_phases
+from memory_phases import HostMemory
 
 _PROCESS_TERM_GRACE_S = 2.0
 _PROCESS_KILL_WAIT_S = 5.0
@@ -154,39 +160,31 @@ def _device_used_bytes(handle):
         return None
 
 
-def _tree_rss_bytes(pid):
-    """Resident bytes of pid + its descendants (psutil, else a /proc walk), or None if pid is gone."""
-    try:
-        import psutil  # type: ignore
-
-        try:
-            proc = psutil.Process(pid)
-            procs = [proc] + proc.children(recursive=True)
-            return sum(p.memory_info().rss for p in procs if p.is_running())
-        except psutil.NoSuchProcess:
-            return None
-    except Exception:
-        pass
-    return _proc_tree_rss_bytes(pid)
+_STATUS_FIELDS = {"VmRSS:": "rss", "RssAnon:": "anon", "RssFile:": "file", "RssShmem:": "shmem"}
 
 
-def _proc_vmrss_bytes(pid, proc_root):
-    """VmRSS of one process in bytes, or None if it is gone or has none (a kernel thread)."""
+def _proc_status_memory(pid, proc_root):
+    """The `HostMemory` of one process, or None if it is gone or has no resident set (a kernel thread)."""
+    found = {}
     try:
         with open(proc_root / str(pid) / "status") as f:
             for line in f:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) * 1024
+                key = line.split(None, 1)[0] if line.strip() else ""
+                if key in _STATUS_FIELDS:
+                    found[_STATUS_FIELDS[key]] = int(line.split()[1]) * 1024
     except (OSError, ValueError):
-        pass
-    return None
+        return None
+    if "rss" not in found:
+        return None
+    return HostMemory(found["rss"], found.get("anon", 0), found.get("file", 0), found.get("shmem", 0))
 
 
-def _proc_tree_rss_bytes(root_pid, proc_root=Path("/proc")):
-    """Resident bytes of root_pid and every descendant, walked through /proc/<pid>/stat parent links.
+def _tree_memory(root_pid, proc_root=Path("/proc")):
+    """Resident host memory of root_pid and every descendant, walked through /proc/<pid>/stat parent links, or None if
+    the root itself is gone.
 
-    The psutil-free path: a runner that forks the real work (llama-bench) is measured by its children, not by
-    the python parent. A process that exits mid-walk is skipped; None when the root itself is gone.
+    A runner that forks the real work (llama-bench) is measured by its children, not by the python parent. A process
+    that exits mid-walk is skipped.
     """
     children = {}
     try:
@@ -203,15 +201,17 @@ def _proc_tree_rss_bytes(root_pid, proc_root=Path("/proc")):
         except (OSError, ValueError, IndexError):
             continue
         children.setdefault(ppid, []).append(int(entry.name))
-    if _proc_vmrss_bytes(root_pid, proc_root) is None:
+    if _proc_status_memory(root_pid, proc_root) is None:
         return None
-    total, pending, seen = 0, [root_pid], set()
+    total, pending, seen = HostMemory(0, 0, 0, 0), [root_pid], set()
     while pending:
         pid = pending.pop()
         if pid in seen:
             continue
         seen.add(pid)
-        total += _proc_vmrss_bytes(pid, proc_root) or 0
+        own = _proc_status_memory(pid, proc_root)
+        if own is not None:
+            total = HostMemory(*(a + b for a, b in zip(total, own)))
         pending.extend(children.get(pid, ()))
     return total
 
@@ -306,6 +306,9 @@ def _empty_sample_result(baseline_vram):
         "vram_baseline_bytes": baseline_vram,
         "peak_gtt_bytes": None,
         "peak_rss_bytes": None,
+        "peak_rss_anon_bytes": None,
+        "peak_rss_file_bytes": None,
+        "memory_samples": None,
         "gpu_util_mean_pct": None,
         "gpu_util_peak_pct": None,
         "cpu_util_mean_pct": None,
@@ -342,11 +345,12 @@ def _sampler_worker(device, gpu_index, interval_s, stop, result_conn):
             raise RuntimeError(f"unexpected sampler command: {command[0]}")
         pid = command[1]
 
-        peak = {"vram": baseline_vram or 0, "gtt": 0, "rss": 0, "n": 0, "power_w": 0.0}
+        peak = {"vram": baseline_vram or 0, "gtt": 0, "rss": 0, "anon": 0, "file": 0, "n": 0, "power_w": 0.0}
         gpu_acc = {"sum": 0.0, "n": 0, "peak": 0}
         cpu_acc = {"sum": 0.0, "n": 0, "peak": 0.0}
         energy_acc = {"joules": 0.0, "n": 0, "last_t": None}
         series = []
+        samples = []
         t0 = time.time()
         last_series_t = 0.0
         cpu_meter = _make_tree_cpu_sampler(pid)
@@ -360,9 +364,12 @@ def _sampler_worker(device, gpu_index, interval_s, stop, result_conn):
             if stop.is_set():
                 break
 
-            r = _tree_rss_bytes(pid)
-            if r is not None and r > peak["rss"]:
-                peak["rss"] = r
+            host = _tree_memory(pid)
+            r = host.rss if host else None
+            if host:
+                peak["rss"] = max(peak["rss"], host.rss)
+                peak["anon"] = max(peak["anon"], host.anon)
+                peak["file"] = max(peak["file"], host.file)
             if stop.is_set():
                 break
 
@@ -394,6 +401,8 @@ def _sampler_worker(device, gpu_index, interval_s, stop, result_conn):
                 energy_acc["n"] += 1
             energy_acc["last_t"] = now_p
             now = time.time() - t0
+            # Every sample is kept in memory with its wall-clock time so the runner's marks (unix time) cut it exactly.
+            samples.append(memory_phases.Sample(now_p, v, gtt, host))
             if now - last_series_t >= 1.0:
                 series.append(
                     [
@@ -417,6 +426,9 @@ def _sampler_worker(device, gpu_index, interval_s, stop, result_conn):
                     "vram_baseline_bytes": baseline_vram,
                     "peak_gtt_bytes": peak["gtt"] or None,
                     "peak_rss_bytes": peak["rss"] or None,
+                    "peak_rss_anon_bytes": peak["anon"] or None,
+                    "peak_rss_file_bytes": peak["file"] or None,
+                    "memory_samples": samples,
                     "gpu_util_mean_pct": (
                         gpu_acc["sum"] / gpu_acc["n"] if gpu_acc["n"] else None
                     ),
@@ -658,11 +670,23 @@ def run_observed(cmd, env=None, cwd=None, device=None, gpu_index=0, interval_s=0
     Returns a dict: stdout, stderr, returncode, timed_out, peak_vram_bytes, vram_baseline_bytes, peak_rss_bytes,
     gpu_util_{mean,peak}_pct, cpu_util_{mean,peak}_pct, peak_power_w, energy_j, energy_wh,
     util_series (downsampled ~1 Hz list of [t_s, gpu_pct, cpu_pct, vram_bytes, rss_bytes, power_w]),
-    sampler_interval_ms, samples (count). Fields may be None.
+    peak_rss_{anon,file}_bytes (the lifetime peaks of the resident set by backing), memory_marks (the first unix time of each
+    mark the runner printed), memory_phases (the load and inference peaks cut at the runner's marks, see memory_phases.py;
+    None without both marks), memory_mark_errors (marks the runner printed malformed), sampler_interval_ms, samples (count).
+    Fields may be None.
     """
     out_buf, err_buf = [], []
+    marks, mark_errors = {}, []
 
     def emit(line):
+        try:
+            mark = memory_phases.parse_mark(line)
+        except ValueError as exc:
+            mark_errors.append(str(exc))
+            mark = None
+        if mark:
+            # The first mark of an event bounds the phase; a runner that repeats one (a per-point restart) does not move it.
+            marks.setdefault(mark[0], mark[1])
         if on_line:
             try:
                 on_line(line)
@@ -869,12 +893,16 @@ def run_observed(cmd, env=None, cwd=None, device=None, gpu_index=0, interval_s=0
     if timed_out:
         err += f"\n[observer] killed after {timeout_s}s timeout"
 
+    samples = sample_result.pop("memory_samples")
     return {
         "stdout": out,
         "stderr": err,
         "returncode": proc.returncode,
         "timed_out": timed_out,
         "sampler_interval_ms": interval_s * 1000.0,
+        "memory_marks": marks,
+        "memory_phases": memory_phases.exact_phases(samples or [], marks, sample_result["vram_baseline_bytes"]),
+        "memory_mark_errors": mark_errors,
         **sample_result,
     }
 

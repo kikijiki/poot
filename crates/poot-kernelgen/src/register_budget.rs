@@ -364,9 +364,10 @@ fn the_dense_register_tiled_contraction_spills_no_register() {
             out_per_block: n,
             k,
             layout: WeightLayout::Nk,
-            segments: 1,
+            rows: crate::TiledRows::Dense,
             terms: crate::precision::StagedTerms::ONE,
             weight_bits: 16,
+            activation_bits: 32,
         };
         let tiling = RegisterTiling::choose(shape, &caps);
         let name = format!("budget_dense_{label}");
@@ -379,7 +380,10 @@ fn the_dense_register_tiled_contraction_spills_no_register() {
                 out_per_block: n,
             },
             None,
-            poot_graph_ir::OperandPrecision::Exact,
+            crate::contraction::TiledRead {
+                precision: poot_graph_ir::OperandPrecision::Exact,
+                activation_stored: None,
+            },
         )
         .unwrap();
         let Some((vgprs, spilled)) = compiled_registers(&body) else {
@@ -436,9 +440,10 @@ fn planned_fragment_contraction(
         out_per_block: n,
         k,
         layout,
-        segments: 1,
+        rows: crate::TiledRows::Dense,
         terms: crate::precision::StagedTerms::of(precision, None, stored),
         weight_bits: weight.bits(),
+        activation_bits: 32,
     };
     let tiling = RegisterTiling::choose(shape, &caps);
     assert!(
@@ -455,7 +460,10 @@ fn planned_fragment_contraction(
             out_per_block: n,
         },
         None,
-        precision,
+        crate::contraction::TiledRead {
+            precision,
+            activation_stored: None,
+        },
     )
     .unwrap()
 }
@@ -623,9 +631,10 @@ fn the_pipelined_fragment_contraction_loads_ahead_of_its_multiplies() {
             out_per_block: n,
             k,
             layout,
-            segments: 1,
+            rows: crate::TiledRows::Dense,
             terms: crate::precision::StagedTerms::of(precision, None, stored),
             weight_bits: weight.bits(),
+            activation_bits: 32,
         };
         let tiling = RegisterTiling::choose(shape, &caps);
         let name = format!("pipelined_{label}");
@@ -638,7 +647,10 @@ fn the_pipelined_fragment_contraction_loads_ahead_of_its_multiplies() {
                 out_per_block: n,
             },
             None,
-            precision,
+            crate::contraction::TiledRead {
+                precision,
+                activation_stored: None,
+            },
         )
         .unwrap();
         let Some(k_loop) = compiled_k_loop(&body) else {

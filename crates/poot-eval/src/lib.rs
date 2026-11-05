@@ -38,7 +38,7 @@ mod routing;
 mod value;
 mod walk;
 
-pub use error::{CastFault, CastOperand, EvalError, SlotRangeFault};
+pub use error::{CastFault, CastOperand, EvalError, GroupingFault, SlotRangeFault};
 pub use exact_value::{ExactI32TensorView, ExactValue};
 pub use ops::index_rule::{IndexFault, IndexFaultKind, IndexValue};
 #[cfg(any(test, feature = "test-support"))]

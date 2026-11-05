@@ -93,6 +93,18 @@ impl Device for LoggingDevice {
         })
     }
 
+    fn view(
+        &self,
+        buffer: &LoggedBuffer,
+        _storage: poot_target::BufferStorage,
+    ) -> Result<LoggedBuffer, Failed> {
+        // A view is a handle the engine holds and drops like any other.
+        Ok(LoggedBuffer {
+            role: buffer.role,
+            log: Rc::clone(&self.log),
+        })
+    }
+
     fn buffer_elems(&self, _buffer: &LoggedBuffer) -> usize {
         usize::MAX
     }
