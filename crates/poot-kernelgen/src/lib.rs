@@ -36,7 +36,7 @@ mod wmma;
 
 pub use attention::{
     AttentionCombineSpec, AttentionMicro, AttentionRows, AttentionSchedule, AttentionSink,
-    AttentionSpec, KeyBound, KeyLayout, KvLane, LaneTile, MaskKind, ScoreTransform,
+    AttentionSpec, KeyBound, KeyLayout, KvLane, LaneTile, MaskKind, ScoreTransform, WaveTile,
 };
 
 // The one generation seam. `poot-graph-plan` plans every generated kernel through `generate` and the request
@@ -64,7 +64,7 @@ pub use fused::{
     RowReduce, RowValue, StepId,
 };
 pub use helpers::{BodyBudget, BodyLimits, BodySize, Layout, WeightLayout, view_eff_strides};
-pub use microtile::{LaneRows, MicroCols};
+pub use microtile::{FragmentTile, LaneRows, MicroCols};
 pub use packed::{PackedKernelOp, PackedKernelSpec};
 pub use precision::{StagedTerms, stored_fragment_dtype};
 

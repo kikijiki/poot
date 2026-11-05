@@ -1,3 +1,4 @@
+use crate::context::init::COOPMAT_SUBGROUP_SIZE;
 use crate::kernel::spirv_words;
 use crate::owner::PipelineShape;
 use crate::{Binding, Context, Pipeline, RuntimeError};
@@ -49,14 +50,18 @@ impl Context {
     pub(crate) fn build_pipeline(&self, kernel: &CompiledKernel) -> Result<Pipeline, RuntimeError> {
         let shape = PipelineShape::of(kernel)?;
         let facts = crate::spirv::scan(&shape.words);
-        // A module with cooperative matrices needs full subgroups of the size its workgroup was written
-        // for (`REQUIRE_FULL_SUBGROUPS` and a required size equal to its `LocalSize` X): pre-1.6 modules
-        // cannot use the extension otherwise, and a workgroup that is not a multiple of the default
-        // subgroup size would not be one.
+        // A module with cooperative matrices needs full subgroups of the size its fragments are held across
+        // (`REQUIRE_FULL_SUBGROUPS` and a required size of `COOPMAT_SUBGROUP_SIZE`): pre-1.6 modules cannot
+        // use the extension otherwise. A workgroup of several fragment collectives (a multiple of that size in
+        // `LocalSize` X) is that many subgroups, not one wider one, so a schedule can give each wave its own
+        // output fragments.
         let required_subgroup_size = if facts.cooperative_matrix {
             match (self.coopmat_subgroup_sizes, facts.local_size_x) {
-                (Some((min, max)), Some(x)) if x.is_power_of_two() && (min..=max).contains(&x) => {
-                    Some(x)
+                (Some((min, max)), Some(x))
+                    if x.is_multiple_of(COOPMAT_SUBGROUP_SIZE)
+                        && (min..=max).contains(&COOPMAT_SUBGROUP_SIZE) =>
+                {
+                    Some(COOPMAT_SUBGROUP_SIZE)
                 }
                 (supported, local_size_x) => {
                     return Err(RuntimeError::CooperativeMatrixUnsupported {

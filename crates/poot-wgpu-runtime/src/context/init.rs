@@ -423,6 +423,11 @@ fn granted_matrix_units(
 /// Lanes per cooperative-matrix fragment: every fragment kernel the code generator emits fixes 32.
 const COOPMAT_SUBGROUP_SIZE: u32 = 32;
 
+/// Subgroups per workgroup of a fragment kernel on wgpu: one. wgpu creates the pipeline with the driver's own
+/// subgroup size (it has no required-size control), which on RADV is 64 for a larger workgroup: that is one
+/// 64-lane subgroup, not two fragment collectives.
+const COOPMAT_WORKGROUP_SUBGROUPS: u32 = 1;
+
 /// The units of a device's reported cooperative-matrix properties (the same data raw Vulkan reads).
 fn cooperative_matrix_units(
     properties: &[wgpu::CooperativeMatrixProperties],
@@ -440,6 +445,7 @@ fn cooperative_matrix_units(
                 result_f32: c.cr_type == wgpu::CooperativeScalarType::F32,
             }),
         COOPMAT_SUBGROUP_SIZE,
+        COOPMAT_WORKGROUP_SUBGROUPS,
     )
 }
 

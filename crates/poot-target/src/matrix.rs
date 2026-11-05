@@ -117,18 +117,32 @@ pub struct FragmentConfig {
     pub layout: FragmentLayout,
     /// Lanes per fragment collective (the subgroup the fragment is held across).
     pub subgroup: u32,
+    /// The most subgroups of a fragment kernel one workgroup may run: [`FragmentConfig::ANY_WAVES`] where the
+    /// device's workgroup limits are the only bound, 1 where the runtime cannot make the pipeline's subgroups
+    /// `subgroup` lanes wide (a workgroup of several would be one wider subgroup, which is not a fragment
+    /// collective).
+    pub waves: u32,
     /// What the operand rounding costs.
     pub contract: OperandNarrowing,
 }
 
 impl FragmentConfig {
-    /// A 16x16x16 config of `dtype` held across `subgroup` lanes.
-    pub const fn m16n16k16(dtype: FragmentDtype, layout: FragmentLayout, subgroup: u32) -> Self {
+    /// No bound on the subgroups of a workgroup but its size limits.
+    pub const ANY_WAVES: u32 = u32::MAX;
+
+    /// A 16x16x16 config of `dtype` held across `subgroup` lanes, `waves` of them at most per workgroup.
+    pub const fn m16n16k16(
+        dtype: FragmentDtype,
+        layout: FragmentLayout,
+        subgroup: u32,
+        waves: u32,
+    ) -> Self {
         FragmentConfig {
             dtype,
             shape: FragmentShape::M16N16K16,
             layout,
             subgroup,
+            waves,
             contract: OperandNarrowing::of(dtype),
         }
     }
@@ -192,7 +206,12 @@ impl MatrixUnits {
             return MatrixUnits::NONE;
         }
         Self::of(FragmentDtype::ALL.map(|dtype| {
-            FragmentConfig::m16n16k16(dtype, FragmentLayout::Declared(LaneMap::Rdna3), 32)
+            FragmentConfig::m16n16k16(
+                dtype,
+                FragmentLayout::Declared(LaneMap::Rdna3),
+                32,
+                FragmentConfig::ANY_WAVES,
+            )
         }))
     }
 
@@ -202,26 +221,32 @@ impl MatrixUnits {
         if compute_capability_major < 8 {
             return MatrixUnits::NONE;
         }
-        Self::of(
-            FragmentDtype::ALL
-                .map(|dtype| FragmentConfig::m16n16k16(dtype, FragmentLayout::Opaque, 32)),
-        )
+        Self::of(FragmentDtype::ALL.map(|dtype| {
+            FragmentConfig::m16n16k16(dtype, FragmentLayout::Opaque, 32, FragmentConfig::ANY_WAVES)
+        }))
     }
 
     /// A Vulkan device from its reported cooperative-matrix configurations: the f16-in f32-out 16x16x16
-    /// config is an `Opaque` f16 fragment held across `subgroup` lanes. The extension reports no bf16
+    /// config is an `Opaque` f16 fragment held across `subgroup` lanes, `waves` subgroups per workgroup at most
+    /// (the runtime's: see [`FragmentConfig::waves`]). The extension reports no bf16
     /// config poot lowers (Mesa disables `VK_KHR_shader_bfloat16` on gfx11), and any other shape or type is
     /// not a config the code generator has a body for.
     pub fn cooperative_matrix(
         reported: impl IntoIterator<Item = CooperativeMatrixConfig>,
         subgroup: u32,
+        waves: u32,
     ) -> Self {
         Self::of(
             reported
                 .into_iter()
                 .filter(|c| c.shape == FragmentShape::M16N16K16 && c.ab_f16 && c.result_f32)
                 .map(|_| {
-                    FragmentConfig::m16n16k16(FragmentDtype::F16, FragmentLayout::Opaque, subgroup)
+                    FragmentConfig::m16n16k16(
+                        FragmentDtype::F16,
+                        FragmentLayout::Opaque,
+                        subgroup,
+                        waves,
+                    )
                 }),
         )
     }
@@ -261,7 +286,7 @@ mod tests {
             ab_f16: true,
             result_f32: true,
         };
-        let units = MatrixUnits::cooperative_matrix([f16_f32], 32);
+        let units = MatrixUnits::cooperative_matrix([f16_f32], 32, 1);
         assert_eq!(dtypes(&units), [FragmentDtype::F16]);
         assert_eq!(
             units.config(FragmentDtype::F16).unwrap().layout,
@@ -284,11 +309,11 @@ mod tests {
             },
         ] {
             assert!(
-                MatrixUnits::cooperative_matrix([other], 32).is_empty(),
+                MatrixUnits::cooperative_matrix([other], 32, 1).is_empty(),
                 "{other:?}"
             );
         }
-        assert!(MatrixUnits::cooperative_matrix([], 32).is_empty());
+        assert!(MatrixUnits::cooperative_matrix([], 32, 1).is_empty());
     }
 
     /// sm_80 and newer have opaque bf16 and f16; older has none. Mutation: change the threshold to 9.

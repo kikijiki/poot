@@ -195,6 +195,7 @@ struct SyncCounters {
     read_bytes: u64,
     rows: u64,
     refill_bytes: u64,
+    wait_ns: u64,
 }
 
 /// The hosted-gather counters behind [`ExecutorStats::hosted_rows`] and [`ExecutorStats::hosted_bytes`].
@@ -202,6 +203,7 @@ struct SyncCounters {
 struct HostedCounters {
     rows: u64,
     bytes: u64,
+    sync_ns: u64,
 }
 
 /// What one resident buffer is, for finding it again from another entry: a table by the stored bytes
@@ -2731,7 +2733,10 @@ impl<D: Device> Engine<D> {
     ) -> Result<(), ExecError> {
         let label = self.device.backend_name();
         self.waits += 1;
-        if let Err(err) = self.device.synchronize() {
+        let drained = std::time::Instant::now();
+        let synchronized = self.device.synchronize();
+        self.sync_counters.wait_ns += drained.elapsed().as_nanos() as u64;
+        if let Err(err) = synchronized {
             if let Some((kernel, code)) = self.device.classify_fault(&err) {
                 return Err(ExecError::Fault { kernel, code });
             }
@@ -2808,6 +2813,7 @@ impl<D: Device> Engine<D> {
         ids: &[i32],
     ) -> Result<(), ExecError> {
         let label = self.device.backend_name();
+        let started = std::time::Instant::now();
         let Self {
             executables,
             device,
@@ -2831,6 +2837,7 @@ impl<D: Device> Engine<D> {
             hosted_counters.bytes += bytes.len() as u64;
         }
         hosted_counters.rows += ids.len() as u64;
+        hosted_counters.sync_ns += started.elapsed().as_nanos() as u64;
         Ok(())
     }
 
@@ -3894,10 +3901,12 @@ impl<D: Device> Executor for Engine<D> {
             weight_bytes_read: self.weight_bytes_read,
             syncs: self.sync_counters.syncs,
             sync_read_bytes: self.sync_counters.read_bytes,
+            sync_wait_ns: self.sync_counters.wait_ns,
             pool_rows_written: self.sync_counters.rows,
             pool_refill_bytes: self.sync_counters.refill_bytes,
             hosted_rows: self.hosted_counters.rows,
             hosted_bytes: self.hosted_counters.bytes,
+            hosted_sync_ns: self.hosted_counters.sync_ns,
             hosted_table_bytes: self.hosted_table_bytes(),
             host_write_bytes: self.host_write_bytes,
             output_read_bytes: self.output_read_bytes,
@@ -6386,6 +6395,10 @@ mod weight_source_tests {
         assert_eq!(stats.hosted_rows, ids.len() as u64);
         assert_eq!(stats.hosted_bytes, want.len() as u64);
         assert_eq!(stats.hosted_table_bytes, (6 * K * 4) as u64);
+        assert!(
+            stats.hosted_sync_ns > 0 && stats.sync_wait_ns > 0,
+            "the sync's wait and the rows' copy are timed"
+        );
     }
 
     /// SC-007 (sync half): an exported id past the table is the typed row-range refusal, before any row is
@@ -6592,10 +6605,10 @@ mod weight_source_tests {
     /// truncated after `add_entry` is refused by the step as the typed `LoadError::SourceChanged`, without a
     /// page of the truncated file being read, and no embed row is written to the device.
     ///
-    /// Mutation: delete the `check_sources` that opens `WeightBinder::gather_rows`; the row read touches the
-    /// truncated pages and the test process dies with `SIGBUS`. (The check that closes `gather_rows` guards a
-    /// file modified while the rows are read, which no device hook can interleave with; it is not exercised
-    /// here.)
+    /// Mutation: make `WeightBinder::check_table_sources`, the check that opens `gather_rows`, return `Ok`; the
+    /// row read meets the truncated file and the step fails with `LoadError::WeightRead` instead (observed on
+    /// 2026-10-28: `Io(UnexpectedEof)`). (The check that closes `gather_rows` guards a file modified while the
+    /// rows are read, which no device hook can interleave with; it is not exercised here.)
     #[test]
     fn a_hosted_embed_refuses_a_file_truncated_after_the_load() {
         let path = poot_test_util::unique_temp_path("embed_modified.bin");

@@ -257,7 +257,12 @@ model-free fixtures in `harness/tests`. A receipt names the commit its binary wa
 clean), the device and driver, the realized plan, the observed workload, and an independent f64 reference.
 A verified claim in `receipts.json` also states what it derives from its receipt: the repeats' `spread` and, for
 a case with a FLOP model (`work_flop`: contractions, and attention over the keys its mask leaves visible), the
-`tflop_per_s` of the median repeat; validation recomputes both.
+`tflop_per_s` of the median repeat; validation recomputes both. A receipt also carries a `device` cell beside the
+wall `kernel` cell when the device reports timestamps: `device_us`, the sum of the step's dispatch durations on the
+device clock, measured on a second engine over a device built with timing (so its per-dispatch timestamp work never
+lands in the wall numbers). A claim then states `device_tflop_per_s` too, the same work over the median
+`device_us`, which judges the kernel without the output readback; a device with no timestamps records no device
+cell and states none.
 `receipts/request-level/` holds the poot runner's own decode-curve lines from the three preparation states on one device (qwen2.5-0.5b, wgpu): measurements, not claims, so `receipts.json` does not list them.
 Hardware numbers are recorded with their noise: a baseline taken next to other GPU work shows it, and the
 uncertainty rule above then calls a later comparison unverified instead of passing it.

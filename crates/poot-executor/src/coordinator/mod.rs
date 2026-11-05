@@ -968,6 +968,8 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
             stats.load_memory.uploaded = device.load_memory.uploaded.or(stats.load_memory.uploaded);
             stats.hosted_rows += device.hosted_rows;
             stats.hosted_bytes += device.hosted_bytes;
+            stats.hosted_sync_ns += device.hosted_sync_ns;
+            stats.sync_wait_ns += device.sync_wait_ns;
             stats.hosted_table_bytes += device.hosted_table_bytes;
             stats.kernels_resolved += device.kernels_resolved;
             stats.recordings += device.recordings;

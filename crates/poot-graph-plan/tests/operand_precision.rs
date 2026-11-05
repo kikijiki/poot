@@ -20,6 +20,11 @@ const F16: OperandPrecision = OperandPrecision::Narrow(FragmentDtype::F16);
 fn rocm_wmma() -> Target {
     let mut caps = DeviceCaps::rocm_default();
     caps.matrix_units = Queried::Known(MatrixUnits::amd("gfx1151", 32));
+    // The wavefront is the device's: a live agent query reports it, the fixture states it.
+    caps.subgroup = Queried::Known(poot_target::SubgroupSupport::Present {
+        min_size: 32,
+        max_size: 32,
+    });
     Target::Gpu {
         backend: Backend::AmdGcn(AmdArch::gfx1151()),
         caps,

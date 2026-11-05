@@ -310,7 +310,11 @@ impl Context {
                 && (min..=max).contains(&COOPMAT_SUBGROUP_SIZE)
         });
         let matrix_units = if coopmat_subgroup_sizes.is_some() {
-            poot_target::MatrixUnits::cooperative_matrix(reported_configs, COOPMAT_SUBGROUP_SIZE)
+            poot_target::MatrixUnits::cooperative_matrix(
+                reported_configs,
+                COOPMAT_SUBGROUP_SIZE,
+                poot_target::FragmentConfig::ANY_WAVES,
+            )
         } else {
             poot_target::MatrixUnits::NONE
         };
@@ -472,7 +476,7 @@ unsafe fn max_memory_allocation_size(
 }
 
 /// The subgroup size every matrix-fragment (cooperative-matrix) kernel the codegen emits is written for.
-const COOPMAT_SUBGROUP_SIZE: u32 = 32;
+pub(super) const COOPMAT_SUBGROUP_SIZE: u32 = 32;
 
 /// What a physical device reports about its compute-stage subgroups (Vulkan 1.1 `subgroupProperties`,
 /// and the subgroup-size range where `VK_EXT_subgroup_size_control` or Vulkan 1.3 reports one).

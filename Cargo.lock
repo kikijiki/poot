@@ -1869,6 +1869,7 @@ dependencies = [
  "poot-executor",
  "poot-graph-ir",
  "poot-graph-plan",
+ "poot-kernelgen",
  "poot-quant",
  "poot-runtime-common",
  "poot-target",

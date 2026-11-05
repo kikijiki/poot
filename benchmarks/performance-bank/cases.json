@@ -200,6 +200,154 @@
       "identity_digest": "fbdfa37c3a5597a24509afb4d47b85e9888339110fbad0bac25be285f45bd05e"
     },
     {
+      "id": "prefill-long-gemm-narrow",
+      "regime": "compute-heavy long prefill on matrix units, narrow operands",
+      "level": "kernel",
+      "producer": "dense_matmul",
+      "shape": {
+        "m": 1024,
+        "k": 2048,
+        "n": 2048
+      },
+      "storage": "f32",
+      "layout": "kn",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop",
+        "operand_precision": "narrow",
+        "operand_rounding": "activation and weight operands rounded to nearest even to the backend matrix unit dtype (bf16 on ROCm and PTX, f16 on Vulkan), products accumulated in f32; the reference rounds the same operands"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "34824a3c162360ecedcacc5cd53dd4d4c2fef22a9980824908cfe6e7d580a5b1",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "d08ec43b67292546b9c1bb49224e6202dac7cecf7bec3ed29a479a3dcd245178"
+    },
+    {
+      "id": "prefill-dense-bf16-nk-narrow",
+      "regime": "compute-heavy prefill projection over a checkpoint-order bf16 weight, narrow operands",
+      "level": "kernel",
+      "producer": "dense_contraction",
+      "shape": {
+        "m": 2048,
+        "k": 1024,
+        "n": 3072
+      },
+      "storage": "bf16",
+      "layout": "nk",
+      "numerics": {
+        "accumulate": "f32",
+        "activation": "f32",
+        "weight": "each f32 draw truncated to its top 16 bits",
+        "reference": "f64 loop over the stored bf16 weights",
+        "operand_precision": "narrow",
+        "operand_rounding": "activation and weight operands rounded to nearest even to the backend matrix unit dtype (bf16 on ROCm and PTX, f16 on Vulkan), products accumulated in f32; the reference rounds the same operands"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "e8fd2f4c5447236ae0731ac6edf89c0069aa53d54f8674e30c68de88f2357715",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "d0dad29d0f51df635dad132d543acef38d89550ac982740d84cf420f7e40489e"
+    },
+    {
+      "id": "prefill-dense-bf16-nk-down-k9728",
+      "regime": "compute-heavy prefill down projection (K 9728) over a checkpoint-order bf16 weight",
+      "level": "kernel",
+      "producer": "dense_contraction",
+      "shape": {
+        "m": 2048,
+        "k": 9728,
+        "n": 2560
+      },
+      "storage": "bf16",
+      "layout": "nk",
+      "numerics": {
+        "accumulate": "f32",
+        "activation": "f32",
+        "weight": "each f32 draw truncated to its top 16 bits",
+        "reference": "f64 loop over the stored bf16 weights"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "7552b0a7d191c28a47a2c5e533df46c028bc9a540499ed61bb78018f71662590",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "0e7b476dc6dcc38fc75ac37caeab96ece44621f355c1ce6f321bc66b375a3d3e"
+    },
+    {
+      "id": "prefill-dense-bf16-nk-down-k9728-narrow",
+      "regime": "compute-heavy prefill down projection (K 9728), narrow operands",
+      "level": "kernel",
+      "producer": "dense_contraction",
+      "shape": {
+        "m": 2048,
+        "k": 9728,
+        "n": 2560
+      },
+      "storage": "bf16",
+      "layout": "nk",
+      "numerics": {
+        "accumulate": "f32",
+        "activation": "f32",
+        "weight": "each f32 draw truncated to its top 16 bits",
+        "reference": "f64 loop over the stored bf16 weights",
+        "operand_precision": "narrow",
+        "operand_rounding": "activation and weight operands rounded to nearest even to the backend matrix unit dtype (bf16 on ROCm and PTX, f16 on Vulkan), products accumulated in f32; the reference rounds the same operands"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "328ec1990b6e77b241d2fb8bbeddfb844b9e02134036263b77fbbf4a779a5ab4",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "bb94fc5f00b6db448518ac3f0567c6859b0e63956074ca5dea462da436e11887"
+    },
+    {
       "id": "prefill-attention-2048",
       "regime": "causal prefill attention, GQA",
       "level": "kernel",
@@ -773,6 +921,84 @@
       "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
       "cache_id": "6f9c88e074c47ba8a55bcb66180a49c8d849dec363867775261398cb2d0fecd1",
       "identity_digest": "fbcc9e47f31f99fa7a7c20631f84b79490e213d09e0f0e335471e429607db1c9"
+    },
+    {
+      "id": "prefill-attention-2048-narrow",
+      "regime": "causal prefill attention, GQA, narrow operands on matrix units",
+      "level": "kernel",
+      "producer": "attention_prefill",
+      "shape": {
+        "hq": 16,
+        "hkv": 8,
+        "d": 128,
+        "lq": 2048,
+        "cap": 2048
+      },
+      "storage": "f32",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "scale": "1/sqrt(d)",
+        "mask": "causal from Slot::Pos",
+        "reference": "f64 loop",
+        "operand_precision": "narrow"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "a0dd4657b0aab4ed2384aba211064386a40a13bb39ca1402af9a291ec6b34562",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "0dc376c73d7e126fe74405df5676fb52eebc28620eee9588c3b57e5331214eab"
+    },
+    {
+      "id": "prefill-attention-8192-narrow",
+      "regime": "causal prefill attention, GQA, narrow operands on matrix units",
+      "level": "kernel",
+      "producer": "attention_prefill",
+      "shape": {
+        "hq": 16,
+        "hkv": 8,
+        "d": 128,
+        "lq": 8192,
+        "cap": 8192
+      },
+      "storage": "f32",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "scale": "1/sqrt(d)",
+        "mask": "causal from Slot::Pos",
+        "reference": "f64 loop",
+        "operand_precision": "narrow"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "6a529eece6c3d5d6c69046a8638db8456f6be4130ef178fb290b2056d8f47e63",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "4fa9759938b54bb74856e4bbe3779521d60d4aea31f9df25b32a65928b7c0202"
     }
   ]
 }

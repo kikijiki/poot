@@ -3695,6 +3695,11 @@ const LAUNCH_PROVENANCE: &[Provenance] = &[
         "POOT-1402 bank sweep (Strix Halo wgpu): 40 accumulators beat 80; half of the 128-register occupancy point",
     ),
     prov(
+        "FRAGMENT_ACCUMULATORS_PER_LANE",
+        128,
+        "POOT-1437 bank cells (Strix Halo ROCm, prefill-attention-8192): 64 registers keep 64 rows and take 1.89x less than the f32 cell, 128 hold 128 rows and take 2.3x; half of the 256 a wave32 lane addresses, one workgroup resident per compute unit",
+    ),
+    prov(
         "TILED_MAX_LANE_COLS",
         16,
         "design bound, not swept: a lane's columns are one register each, as wide as the widest key block it splits",

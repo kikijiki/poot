@@ -355,14 +355,16 @@ mod tests {
         .unwrap_or_else(|error| panic!("{format:?}: {error}"));
         let (grid, x_groups) = match schedule {
             Schedule::Gemv { .. } => ([schedule.grid_threads(1, m, out) as u32, 1, 1], 0),
-            Schedule::RegisterTiled { lanes, .. } => {
+            Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => {
                 let (tile_rows, tile_cols) = schedule.output_tile().unwrap();
-                let lanes = lanes.get() as usize;
+                let lanes = crate::RegisterTiling::of(schedule)
+                    .unwrap()
+                    .workgroup_lanes();
                 let tiles = m.div_ceil(tile_rows) * out.div_ceil(tile_cols);
                 let x_groups = fold.unwrap_or(tiles);
                 (
                     [
-                        (x_groups * lanes * lanes) as u32,
+                        (x_groups * lanes) as u32,
                         tiles.div_ceil(x_groups) as u32,
                         1,
                     ],

@@ -16,12 +16,11 @@ use super::source::Source;
 use crate::KernelGenError;
 use crate::PackedRows;
 use crate::contraction::{
-    BoundEpilogue, Epilogue, GemvLaunch, RunLength, Schedule, TileSize, TiledBody, TiledLaunch,
-    TiledWeight, gemv_body, tiled_body,
+    BoundEpilogue, Epilogue, GemvLaunch, Schedule, TiledBody, TiledLaunch, TiledWeight, gemv_body,
+    tiled_body,
 };
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
 use crate::helpers::{Alloc, WeightLayout, elem, guard, ld, local, slice_dtype, slice_f32};
-use crate::microtile::{LaneRows, MicroCols};
 use crate::precision::ProductRead;
 use poot_graph_ir::OperandPrecision;
 
@@ -117,28 +116,32 @@ pub(crate) fn packed_contraction(
             rows,
             read,
         ),
-        Schedule::RegisterTiled {
-            lanes,
-            rows: lane_rows,
-            cols,
-            run,
-        } if rows == PackedRows::Indexed => super::indexed::indexed_register_tiled(
-            name,
-            format,
-            TiledLaunch::new(lanes, lane_rows, cols, run, WeightLayout::Nk)?,
-            epilogue,
-            read,
-        ),
-        Schedule::RegisterTiled { .. } if epilogue.is_some() => Err(KernelGenError::Unsupported {
-            request: "packed_contraction",
-            reason: "a packed RegisterTiled contraction has no epilogue",
-        }),
-        Schedule::RegisterTiled {
-            lanes,
-            rows,
-            cols,
-            run,
-        } => contraction_register_tiled(name, format, lanes, rows, cols, run, read),
+        Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. }
+            if rows == PackedRows::Indexed =>
+        {
+            super::indexed::indexed_register_tiled(
+                name,
+                format,
+                TiledLaunch::of(schedule, WeightLayout::Nk, precision)?
+                    .scalar_only("packed_contraction")?,
+                epilogue,
+                read,
+            )
+        }
+        Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } if epilogue.is_some() => {
+            Err(KernelGenError::Unsupported {
+                request: "packed_contraction",
+                reason: "a packed tiled contraction has no epilogue",
+            })
+        }
+        Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => {
+            contraction_register_tiled(
+                name,
+                format,
+                TiledLaunch::of(schedule, WeightLayout::Nk, precision)?,
+                read,
+            )
+        }
     }
 }
 
@@ -444,13 +447,9 @@ fn contraction_gemv_planar(
 fn contraction_register_tiled(
     name: &str,
     format: WeightFormat,
-    lanes: TileSize,
-    rows: LaneRows,
-    cols: MicroCols,
-    run: RunLength,
+    launch: TiledLaunch,
     read: ProductRead,
 ) -> Result<Body, KernelGenError> {
-    let launch = TiledLaunch::new(lanes, rows, cols, run, WeightLayout::Nk)?;
     let descriptor = format.descriptor();
     let (source_count, block_plan, planar_plan) = match descriptor.storage {
         Storage::Planar(_) => {
@@ -504,6 +503,7 @@ fn contraction_register_tiled(
 #[cfg(test)]
 mod tile_size_tests {
     use super::*;
+    use crate::TileSize;
 
     /// Card 658: `TileSize::new` no longer takes a `blocks` argument (the tiled body now serves any
     /// block count, `tiled_body`'s per-block grid doc) - a zero tile is the only refusal left.

@@ -44,6 +44,17 @@ impl<'a> Emit<'a> {
         self.stmts.push(Statement::Assign(place, rvalue));
     }
 
+    /// Mint a fresh local of `ty` that no statement assigns yet: the destination of a statement that fills it
+    /// itself (a matrix-fragment load or element read), or a register a later statement rewrites (`mutable`).
+    pub(crate) fn fresh(&mut self, ty: Ty, mutable: bool) -> Local {
+        self.al.add(ty, mutable)
+    }
+
+    /// Append `statement` as it is.
+    pub(crate) fn push(&mut self, statement: Statement) {
+        self.stmts.push(statement);
+    }
+
     /// `lds[array][idx] = value` (a workgroup-local write): the cooperative-load seam
     /// the register-tiled body (`crate::contraction`'s `tiled_body`) writes its decoded weight and activation tile elements
     /// through.

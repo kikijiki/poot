@@ -921,6 +921,13 @@ impl PackedPayload {
         }
     }
 
+    /// `Ok` when no file this payload's sources are read from changed since it was mapped
+    /// ([`StoredBytes::check_unchanged`]): the identity check of the bytes this payload reads, without the walk
+    /// over every other weight of a store that [`crate::WeightStore::check_sources`] makes.
+    pub fn check_unchanged(&self) -> Result<(), SourceChanged> {
+        self.stored().try_for_each(StoredBytes::check_unchanged)
+    }
+
     /// Every source's owner, in [`PackedWeight::sources`] order.
     pub(crate) fn stored(&self) -> impl Iterator<Item = &StoredBytes> {
         self.sources.iter().map(|source| &source.bytes)

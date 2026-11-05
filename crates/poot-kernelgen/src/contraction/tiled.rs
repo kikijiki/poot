@@ -9,7 +9,7 @@
 //! and the element view the store chain is written against). The registers are the point: a lane that owns one
 //! output decodes one weight element and reads two LDS values per FMA, so the decode and the LDS traffic bound
 //! the kernel; a lane that owns a register tile decodes each staged weight element once for all the tile's rows
-//! and reads `rows + cols` LDS values per `rows * cols` FMAs. `K` is staged `BLOCK_K` at a time. The activation
+//! and reads `rows + cols` LDS values per `rows * cols` FMAs. `K` is staged `MicroTile::block_k` at a time. The activation
 //! (and an `[N, K]` weight) is staged as runs of consecutive `K` values: a lane loads `run` activation values and
 //! decodes `run` weight values per slot, so a weight run's address chain, word loads and shared scale are
 //! emitted once. A `[K, N]` weight is staged one element per slot with adjacent lanes adjacent in `N`, its
@@ -20,20 +20,20 @@ use poot_kernel_ir::{
     Terminator, Ty, WorkgroupLocalDecl,
 };
 
+use poot_graph_ir::OperandPrecision;
+
 use super::epilogue::BoundEpilogue;
 use super::indexed::{RowExpert, emit_poison, emit_row_expert, emit_row_key};
-use super::{RegisterTiling, RunLength, TileSize};
+use super::{RegisterTiling, Schedule};
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy, cu, emit_read_meta, select_u32};
 use crate::helpers::{Alloc, WeightLane, WeightLayout, elem, guard};
-use crate::microtile::{LaneRows, MicroCols, MicroTile, Staged, StoreAt};
+use crate::microtile::{MicroTile, Staged, StagedMajor, StoreAt};
 use crate::precision::{ProductRead, StagedTerms};
 
-/// `K` elements staged in LDS per barrier round, and run in unrolled outer-product steps.
-pub(super) const BLOCK_K: usize = 16;
-
 /// The CFG [`tiled_body`] builds: the `GroupX`, `GroupY` and `LocalX` reads, the setup block, the K loop (guard,
-/// staged load, dot, latch) and then the store chain.
+/// staged load, dot, latch), the drain (an `Opaque` fragment's spill and barrier) and the finish (the element
+/// read), and then the store chain.
 const GROUP_Y: u32 = 1;
 const LANE: u32 = 2;
 const SETUP: u32 = 3;
@@ -41,81 +41,160 @@ const LOOP_GUARD: u32 = 4;
 const STAGE: u32 = 5;
 const DOT: u32 = 6;
 const LATCH: u32 = 7;
+const DRAIN: u32 = 8;
+const FINISH: u32 = 9;
 /// The first block of the store chain ([`crate::microtile::Elements::store`]): one guard block and one store
-/// block per register-tile element.
-const STORES: u32 = 8;
+/// block per owned accumulator element.
+const STORES: u32 = 10;
 
-/// The workgroup-local bytes one workgroup of `lanes x lanes` lanes of `micro` tiles stages its two tiles in.
-pub(super) const fn lds_bytes(lanes: usize, micro: MicroTile, terms: StagedTerms) -> usize {
-    let (tile_rows, tile_cols) = micro.output_tile(lanes, lanes);
-    BLOCK_K
-        * ((tile_rows + 1) * terms.activation + (tile_cols + 1) * terms.weight)
-        * std::mem::size_of::<f32>()
+/// The workgroup an owner grid of `owners` makes out of `micro` tiles: what decides the output tile, the staged
+/// tiles and how they are staged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LaunchShape {
+    /// Owners along the output rows and columns (lanes for a scalar tile, waves for a fragment one).
+    pub(super) owners: (usize, usize),
+    pub(super) micro: MicroTile,
 }
 
-/// Whether a workgroup of `lanes x lanes` lanes of `micro` tiles stages both tiles in whole slots: every lane
-/// stages the same number of runs of the activation tile and of an `[N, K]` weight tile (runs of `run` values),
-/// or of single values of a `[K, N]` one.
-pub(super) const fn stages_evenly(
-    lanes: usize,
-    micro: MicroTile,
-    run: usize,
+impl LaunchShape {
+    const fn lane_count(self) -> usize {
+        self.owners.0 * self.owners.1 * self.micro.owner_lanes()
+    }
+
+    /// The `(activation, weight)` staged tiles: the output tile rows and columns, and the stride, major and
+    /// element count of each.
+    const fn tiles(self, layout: WeightLayout) -> [StagedTile; 2] {
+        let (tile_rows, tile_cols) = self.micro.output_tile(self.owners.0, self.owners.1);
+        let (a_major, b_major) = self.micro.staged_majors(layout);
+        [
+            StagedTile::of(self.micro, a_major, tile_rows),
+            StagedTile::of(self.micro, b_major, tile_cols),
+        ]
+    }
+}
+
+/// One operand's staged tile: `edge` output rows (activation) or columns (weight) by the round's depth.
+#[derive(Clone, Copy)]
+struct StagedTile {
+    major: StagedMajor,
+    stride: usize,
+    /// Elements of one part's array.
+    len: usize,
+}
+
+impl StagedTile {
+    const fn of(micro: MicroTile, major: StagedMajor, edge: usize) -> Self {
+        let stride = micro.staged_stride(major, edge);
+        let rows = match major {
+            StagedMajor::K => micro.block_k(),
+            StagedMajor::X => edge,
+        };
+        Self {
+            major,
+            stride,
+            len: rows * stride,
+        }
+    }
+}
+
+/// The workgroup-local bytes one workgroup of `shape` stages its two tiles in (and spills an `Opaque` fragment
+/// accumulator to).
+pub(super) const fn lds_bytes(
+    shape: LaunchShape,
     layout: WeightLayout,
-) -> bool {
-    let (tile_rows, tile_cols) = micro.output_tile(lanes, lanes);
-    let lane_count = lanes * lanes;
+    terms: StagedTerms,
+) -> usize {
+    let [a, b] = shape.tiles(layout);
+    let staged = a.len * terms.activation + b.len * terms.weight;
+    staged * shape.micro.staged_elem_bytes()
+        + shape.micro.scratch_words(shape.owners.0 * shape.owners.1) * std::mem::size_of::<f32>()
+}
+
+/// Whether a workgroup of `shape` stages both tiles in whole slots: every lane stages the same number of runs of
+/// the activation tile and of an `[N, K]` weight tile (runs of `run` values), or of single values of a `[K, N]`
+/// one.
+pub(super) const fn stages_evenly(shape: LaunchShape, run: usize, layout: WeightLayout) -> bool {
+    let (tile_rows, tile_cols) = shape.micro.output_tile(shape.owners.0, shape.owners.1);
+    let block_k = shape.micro.block_k();
+    let lane_count = shape.lane_count();
     let weight_slots = match layout {
-        WeightLayout::Nk => tile_cols * (BLOCK_K / run),
-        WeightLayout::Kn => tile_cols * BLOCK_K,
+        WeightLayout::Nk => tile_cols * (block_k / run),
+        WeightLayout::Kn => tile_cols * block_k,
     };
-    (tile_rows * (BLOCK_K / run)).is_multiple_of(lane_count)
+    (tile_rows * (block_k / run)).is_multiple_of(lane_count)
         && weight_slots.is_multiple_of(lane_count)
 }
 
-/// A [`super::Schedule::RegisterTiled`]'s launch shape, checked once before emission ([`stages_evenly`]).
+/// A tiled schedule's launch shape, checked once before emission ([`stages_evenly`]).
 #[derive(Clone, Copy)]
 pub(crate) struct TiledLaunch {
-    lanes: usize,
-    micro: MicroTile,
+    shape: LaunchShape,
     run: usize,
     layout: WeightLayout,
 }
 
 impl TiledLaunch {
-    pub(crate) fn new(
-        lanes: TileSize,
-        rows: LaneRows,
-        cols: MicroCols,
-        run: RunLength,
+    /// The launch of a tiled `schedule` over a weight stored in `layout` whose operands are read at `precision`.
+    /// A fragment schedule multiplies operands narrowed to its dtype, so the precision must say that dtype.
+    pub(crate) fn of(
+        schedule: Schedule,
         layout: WeightLayout,
+        precision: OperandPrecision,
     ) -> Result<Self, KernelGenError> {
-        let micro = RegisterTiling::micro_tile_of(rows, cols);
-        let (lanes, run) = (lanes.get() as usize, run.get() as usize);
-        if !stages_evenly(lanes, micro, run, layout) {
-            let (tile_rows, tile_cols) = micro.output_tile(lanes, lanes);
-            return Err(KernelGenError::NotDivisible {
-                generator: "contraction_register_tiled",
-                dim: format!("staged slots of a {tile_rows}x{tile_cols} tile in runs of {run}"),
-                value: (tile_rows + tile_cols) * BLOCK_K,
-                divisor: lanes * lanes,
+        const GENERATOR: &str = "contraction_register_tiled";
+        let Some(tiling) = RegisterTiling::of(schedule) else {
+            return Err(KernelGenError::Unsupported {
+                request: GENERATOR,
+                reason: "an M > 1 contraction runs a tiled schedule",
+            });
+        };
+        let (shape, run) = (tiling.launch_shape(), tiling.run());
+        if let MicroTile::Fragment(tile) = shape.micro
+            && precision.fragment_dtype() != Some(tile.dtype)
+        {
+            return Err(KernelGenError::Unsupported {
+                request: GENERATOR,
+                reason: "a fragment schedule needs operands narrowed or split to its dtype",
             });
         }
-        Ok(Self {
-            lanes,
-            micro,
-            run,
-            layout,
-        })
+        let run = run.get() as usize;
+        if !stages_evenly(shape, run, layout) {
+            let (tile_rows, tile_cols) = shape.micro.output_tile(shape.owners.0, shape.owners.1);
+            return Err(KernelGenError::NotDivisible {
+                generator: GENERATOR,
+                dim: format!("staged slots of a {tile_rows}x{tile_cols} tile in runs of {run}"),
+                value: (tile_rows + tile_cols) * shape.micro.block_k(),
+                divisor: shape.lane_count(),
+            });
+        }
+        Ok(Self { shape, run, layout })
     }
 
-    /// Runs per row of a staged run tile: a row's `BLOCK_K` values are `BLOCK_K / run` runs.
+    /// This launch if it computes with the scalar micro-tile, which an expert walk requires: the rows of one tile
+    /// select different weight tiles, so no fragment can span them.
+    pub(crate) fn scalar_only(self, generator: &'static str) -> Result<Self, KernelGenError> {
+        match self.shape.micro {
+            MicroTile::Scalar { .. } => Ok(self),
+            MicroTile::Fragment(_) => Err(KernelGenError::Unsupported {
+                request: generator,
+                reason: "an expert walk keeps the scalar micro-tile",
+            }),
+        }
+    }
+
+    /// The consecutive `K` values a lane stages at a time.
+    pub(crate) fn run(self) -> usize {
+        self.run
+    }
+
+    /// Runs per row of a staged run tile: a row's depth is `block_k / run` runs.
     fn runs_per_row(self) -> usize {
-        BLOCK_K / self.run
+        self.shape.micro.block_k() / self.run
     }
 
     /// Runs of a staged run tile of `edge` rows each lane loads per round.
     fn slots(self, edge: usize) -> usize {
-        edge * self.runs_per_row() / (self.lanes * self.lanes)
+        edge * self.runs_per_row() / self.shape.lane_count()
     }
 }
 
@@ -234,20 +313,26 @@ pub(crate) fn tiled_body(
         launch.layout == WeightLayout::Kn,
         "the weight read is the launch's layout"
     );
-    let (lanes, micro, run) = (launch.lanes, launch.micro, launch.run);
-    let (edge_m, edge_n) = micro.output_tile(lanes, lanes);
-    // One LDS row of a staged tile is padded by one word, so the cooperative stores (adjacent lanes adjacent in
-    // the tile's rows or columns) and the dot reads (adjacent lanes adjacent in a register tile) both spread
-    // over the banks.
-    let (stride_a, stride_b) = (edge_m + 1, edge_n + 1);
-    let lane_count = lanes * lanes;
+    let (shape, run) = (launch.shape, launch.run);
+    let (owners, micro) = (shape.owners, shape.micro);
+    let (edge_m, edge_n) = micro.output_tile(owners.0, owners.1);
+    // One LDS row of a staged tile is padded, so the cooperative stores (adjacent lanes adjacent in the tile's
+    // rows or columns, or in a row's depth) and the dot reads (adjacent lanes adjacent in a register tile, or a
+    // fragment lane reading its row) spread over the banks.
+    let [a_tile, b_tile] = shape.tiles(launch.layout);
+    let (stride_a, stride_b) = (a_tile.stride, b_tile.stride);
+    let lane_count = shape.lane_count();
+    let block_k = micro.block_k();
     // The block indexes past the store chain: its return, then the walk's own blocks.
     let ret = STORES + 2 * micro.accumulators() as u32;
     let (walk_head, walk_step, walk_next) = (ret + 1, ret + 2, ret + 3);
     let n_inputs = (params.len() - 1) as u32;
     // The staged tiles' LDS arrays: the activation's and the weight's (`hi`) parts, then the `lo` part of each
-    // operand that is split ([`StagedTerms`]).
+    // operand that is split ([`StagedTerms`]), then the scratch an `Opaque` fragment spills to.
     let terms = read.staged_terms();
+    let scratch = micro
+        .needs_spill()
+        .then_some((terms.activation + terms.weight) as u8);
     let a_array = |term: usize| if term == 0 { 0 } else { 2 };
     let b_array = |term: usize| {
         if term == 0 {
@@ -336,7 +421,7 @@ pub(crate) fn tiled_body(
     };
     let tiles_col = ceil_div(&mut setup, out_per_block, edge_n);
     let tiles_row = ceil_div(&mut setup, m_per_block, edge_m);
-    let kt_count = ceil_div(&mut setup, k, BLOCK_K);
+    let kt_count = ceil_div(&mut setup, k, block_k);
     let tiles_per_block = bin(
         &mut setup,
         Ty::Usize,
@@ -402,7 +487,7 @@ pub(crate) fn tiled_body(
     );
 
     // The owner map: which tile row and column each of this lane's accumulator elements is.
-    let geometry = micro.geometry(&mut setup, l, lanes, lanes);
+    let geometry = micro.geometry(&mut setup, l, owners.0, owners.1);
 
     // Staged run `q` of a run tile of `edge` rows: run `r = q * lane_count + l` is row `r / runs_per_row`, `K`
     // offset `(r % runs_per_row) * run` (adjacent lanes adjacent in `K`: the coalesced direction of a row-major
@@ -412,7 +497,7 @@ pub(crate) fn tiled_body(
     // needs a mask.
     let stage_runs = |setup: &mut Emit,
                       edge: usize,
-                      stride: usize,
+                      (stride, major): (usize, StagedMajor),
                       base: Local,
                       source_row0: Local,
                       max_source_row: Local,
@@ -425,8 +510,7 @@ pub(crate) fn tiled_body(
                 let k_chunk = bin(setup, Ty::Usize, BinOp::Rem, copy(r), cu(runs_per_row));
                 let k_offset = bin(setup, Ty::Usize, BinOp::Mul, copy(k_chunk), cu(run));
                 let tile_idx = bin(setup, Ty::Usize, BinOp::Div, copy(r), cu(runs_per_row));
-                let lds_row = bin(setup, Ty::Usize, BinOp::Mul, copy(k_offset), cu(stride));
-                let lds_idx = bin(setup, Ty::Usize, BinOp::Add, copy(lds_row), copy(tile_idx));
+                let lds_idx = staged_word(setup, major, stride, k_offset, tile_idx);
 
                 let in_block = bin(setup, Ty::Usize, BinOp::Add, copy(base), copy(tile_idx));
                 let row = bin(
@@ -461,7 +545,7 @@ pub(crate) fn tiled_body(
     let a_runs = stage_runs(
         &mut setup,
         edge_m,
-        stride_a,
+        (stride_a, a_tile.major),
         row_base,
         block_row0,
         max_row,
@@ -471,7 +555,7 @@ pub(crate) fn tiled_body(
         TiledWeight::Rows(_) => stage_runs(
             &mut setup,
             edge_n,
-            stride_b,
+            (stride_b, b_tile.major),
             col_base,
             block_weight_row0,
             max_weight_row,
@@ -506,14 +590,13 @@ pub(crate) fn tiled_body(
                 copy(out_per_block),
                 cu(1),
             );
-            (0..edge_n * BLOCK_K / lane_count)
+            (0..edge_n * block_k / lane_count)
                 .map(|q| {
                     let setup = &mut setup;
                     let r = bin(setup, Ty::Usize, BinOp::Add, copy(l), cu(q * lane_count));
                     let col = bin(setup, Ty::Usize, BinOp::Rem, copy(r), cu(edge_n));
                     let k_offset = bin(setup, Ty::Usize, BinOp::Div, copy(r), cu(edge_n));
-                    let lds_row = bin(setup, Ty::Usize, BinOp::Mul, copy(k_offset), cu(stride_b));
-                    let lds_idx = bin(setup, Ty::Usize, BinOp::Add, copy(lds_row), copy(col));
+                    let lds_idx = staged_word(setup, b_tile.major, stride_b, k_offset, col);
                     let col = bin(setup, Ty::Usize, BinOp::Add, copy(col_base), copy(col));
                     let source = bin(setup, Ty::Usize, BinOp::Min, copy(col), copy(max_col));
                     StagedSlot {
@@ -600,7 +683,7 @@ pub(crate) fn tiled_body(
         let more = bin(&mut head, Ty::Bool, BinOp::Lt, copy(next), copy(*experts));
         walk_blocks.push(BasicBlock {
             statements: head.take(),
-            terminator: guard(more, STORES, walk_step),
+            terminator: guard(more, DRAIN, walk_step),
         });
 
         let mut step = Emit::new(&mut al);
@@ -636,7 +719,7 @@ pub(crate) fn tiled_body(
     let loop_done = if walk_keys.is_some() {
         walk_next
     } else {
-        STORES
+        DRAIN
     };
     let loop_guard = BasicBlock {
         statements: guard_e.take(),
@@ -645,7 +728,7 @@ pub(crate) fn tiled_body(
 
     // --- stage: every lane loads its activation runs and reads or decodes its weight slots into LDS ---
     let mut load = Emit::new(&mut al);
-    let kt_base = bin(&mut load, Ty::Usize, BinOp::Mul, copy(kt), cu(BLOCK_K));
+    let kt_base = bin(&mut load, Ty::Usize, BinOp::Mul, copy(kt), cu(block_k));
     // A run's start, clamped to the last whole run: a run past the end of `K` re-reads it. The weight tile is
     // zeroed there (`k_mask`), so the activation tile needs no mask of its own.
     let run_start = |load: &mut Emit, k_offset: Local| {
@@ -690,13 +773,14 @@ pub(crate) fn tiled_body(
                 Ty::Usize,
                 BinOp::Add,
                 copy(staged.lds_idx),
-                cu(j * stride_a),
+                cu(j * a_tile.major.k_step(stride_a)),
             );
             for (term, part) in read
                 .activation_terms(&mut load, value)
                 .into_iter()
                 .enumerate()
             {
+                let part = micro.stage_value(&mut load, part);
                 load.write_lds(a_array(term), copy(slot), copy(part));
             }
         }
@@ -721,7 +805,7 @@ pub(crate) fn tiled_body(
                         Ty::Usize,
                         BinOp::Add,
                         copy(staged.lds_idx),
-                        cu(j * stride_b),
+                        cu(j * b_tile.major.k_step(stride_b)),
                     );
                     for (term, part) in read
                         .weight_terms(&mut load, decoded)
@@ -729,6 +813,7 @@ pub(crate) fn tiled_body(
                         .enumerate()
                     {
                         let value = bin(&mut load, Ty::F32, BinOp::Mul, copy(part), copy(mask));
+                        let value = micro.stage_value(&mut load, value);
                         load.write_lds(b_array(term), copy(slot), copy(value));
                     }
                 }
@@ -770,6 +855,7 @@ pub(crate) fn tiled_body(
                 let raw = lane.emit_elem(&mut load, weight, idx);
                 for (term, part) in read.weight_terms(&mut load, raw).into_iter().enumerate() {
                     let value = bin(&mut load, Ty::F32, BinOp::Mul, copy(part), copy(mask));
+                    let value = micro.stage_value(&mut load, value);
                     load.write_lds(b_array(term), copy(staged.lds_idx), copy(value));
                 }
             }
@@ -780,19 +866,21 @@ pub(crate) fn tiled_body(
         terminator: barrier(DOT),
     };
 
-    // --- dot: `BLOCK_K` unrolled micro-tile steps over the two staged tiles ---
+    // --- dot: the round's unrolled micro-tile steps over the two staged tiles ---
     let staged_a = |term: usize| Staged {
         array: a_array(term),
         stride: stride_a,
+        major: a_tile.major,
     };
     let staged_b = |term: usize| Staged {
         array: b_array(term),
         stride: stride_b,
+        major: b_tile.major,
     };
     let (a_parts, b_parts): (Vec<usize>, Vec<usize>) =
         ((0..terms.activation).collect(), (0..terms.weight).collect());
     let mut dot = Emit::new(&mut al);
-    for k in 0..BLOCK_K {
+    for k in (0..block_k).step_by(micro.kappa()) {
         // A split operand adds a product per pair of parts, `a` parts outermost: the oracle's order.
         for (a, b) in a_parts
             .iter()
@@ -814,7 +902,26 @@ pub(crate) fn tiled_body(
         terminator: barrier(LOOP_GUARD),
     };
 
-    // --- stores: one guarded store per register-tile element, through the row's poison under a walk and the
+    // --- drain and finish: an `Opaque` fragment accumulator spills to workgroup memory and, once every wave has,
+    // is read back element by element; any other accumulator is read in place ---
+    let mut drain = Emit::new(&mut al);
+    micro.spill(&mut drain, &geometry, &acc, scratch);
+    let drain = BasicBlock {
+        statements: drain.take(),
+        terminator: if micro.needs_spill() {
+            barrier(FINISH)
+        } else {
+            goto(FINISH)
+        },
+    };
+    let mut finish = Emit::new(&mut al);
+    let elements = micro.elements(&mut finish, &geometry, acc, scratch);
+    let finish = BasicBlock {
+        statements: finish.take(),
+        terminator: goto(STORES),
+    };
+
+    // --- stores: one guarded store per accumulator element, through the row's poison under a walk and the
     // epilogue if any; a row or column past the block, or a block past the last (a folded grid's padding
     // workgroups), stores nothing ---
     let mut blocks_out = vec![
@@ -826,13 +933,15 @@ pub(crate) fn tiled_body(
         stage,
         dot,
         latch,
+        drain,
+        finish,
     ];
     debug_assert_eq!(blocks_out.len() as u32, STORES);
     let poison_of = walk
         .as_ref()
         .zip(walk_keys.as_ref())
         .map(|(walk, (experts, _))| (walk.ids, *experts));
-    let stores = micro.elements(&geometry, acc).store(
+    let stores = elements.store(
         &mut al,
         STORES,
         out,
@@ -885,22 +994,40 @@ pub(crate) fn tiled_body(
 
     let mut body = Body::new(name, n_inputs, al.locals, blocks_out);
     body.workgroup_size = [lane_count as u32, 1, 1];
-    // Array order: activation, weight, then the activation's `lo` part and the weight's, when split.
+    // Array order: activation, weight, then the activation's `lo` part and the weight's, when split, then the
+    // f32 scratch of an `Opaque` fragment.
     let arrays = [
-        (stride_a, 1),
-        (stride_b, 1),
-        (stride_a, terms.activation - 1),
-        (stride_b, terms.weight - 1),
+        (a_tile.len, 1),
+        (b_tile.len, 1),
+        (a_tile.len, terms.activation - 1),
+        (b_tile.len, terms.weight - 1),
     ];
     body.workgroup_locals = arrays
         .into_iter()
-        .flat_map(|(stride, count)| std::iter::repeat_n(stride, count))
-        .map(|stride| WorkgroupLocalDecl {
-            elem_ty: Ty::F32,
-            len: (BLOCK_K * stride) as u32,
+        .flat_map(|(len, count)| std::iter::repeat_n(len, count))
+        .map(|len| WorkgroupLocalDecl {
+            elem_ty: micro.staged_ty(),
+            len: len as u32,
         })
         .collect();
+    let scratch_words = micro.scratch_words(owners.0 * owners.1);
+    if scratch.is_some() {
+        body.workgroup_locals.push(WorkgroupLocalDecl {
+            elem_ty: Ty::F32,
+            len: scratch_words as u32,
+        });
+    }
     body
+}
+
+/// The word of element `(k, x)` of a staged tile of `stride`: `k` and `x` are run-time locals ([`StagedMajor`]).
+fn staged_word(e: &mut Emit, major: StagedMajor, stride: usize, k: Local, x: Local) -> Local {
+    let (outer, inner) = match major {
+        StagedMajor::K => (k, x),
+        StagedMajor::X => (x, k),
+    };
+    let row = bin(e, Ty::Usize, BinOp::Mul, copy(outer), cu(stride));
+    bin(e, Ty::Usize, BinOp::Add, copy(row), copy(inner))
 }
 
 /// `value`, or exactly `0.0` unless `keep`: a bit-pattern select, so a masked value never multiplies into a sum

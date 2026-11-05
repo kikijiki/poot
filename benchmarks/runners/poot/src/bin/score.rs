@@ -172,14 +172,18 @@ fn main() -> anyhow::Result<()> {
         args.start,
         tokens.len()
     );
-    let capacity = NonZeroUsize::new(tokens.len() + args.greedy).expect("nonzero");
+    // The capacity and a prefill chunk are multiples of the model's prefill granule; a tail below one granule runs
+    // as decode steps.
+    let granule = handle.config().prefill_granule;
+    let capacity = NonZeroUsize::new((tokens.len() + args.greedy).next_multiple_of(granule.get()))
+        .expect("nonzero");
     let executor = open_executor(args.backend).context("open the executor")?;
     let device = executor
         .device_identity()
         .context("the device cannot name its adapter and driver")?;
 
     let scored = || Sampler::greedy().with_logprobs(args.top);
-    let wanted = NonZeroUsize::new(tokens.len()).expect("nonzero");
+    let wanted = NonZeroUsize::new(tokens.len() / granule * granule.get()).unwrap_or(granule);
     let options = DriverOptions {
         trace: poot_llm::driver::serving_trace_limits(capacity),
         prepared: PreparedSetLimits {

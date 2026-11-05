@@ -68,7 +68,9 @@ fn staged_on_wgpu(ctx: &Context, precision: OperandPrecision, probes: &[f32]) ->
             k: STAGE,
             layout: kg::WeightLayout::Nk,
             segments: 1,
-            terms: kg::StagedTerms::of(precision, None, None),
+            // The scalar tiling: this row holds the staging to the oracle; the fragment tiling has its own rows
+            // (`fragment_contraction.rs`).
+            terms: kg::StagedTerms::of(precision, None, None).scalar_only(),
         },
         &caps,
     )

@@ -136,9 +136,33 @@ fn attention_detail(eqn: &Eqn, choice: &KernelChoice, dispatch: &Dispatch) -> St
     let schedule = match spec.schedule {
         poot_kernelgen::AttentionSchedule::Streaming { .. } => "streaming".to_string(),
         poot_kernelgen::AttentionSchedule::SplitKv { splits, .. } => format!("split({splits})"),
-        poot_kernelgen::AttentionSchedule::Tiled { br, bc, micro, .. } => format!(
+        poot_kernelgen::AttentionSchedule::Tiled {
+            br,
+            bc,
+            micro: poot_kernelgen::AttentionMicro::Scalar { score, out },
+            ..
+        } => format!(
             "tiled(br={br} bc={bc} score={}x{} out={}x{})",
-            micro.score.rows, micro.score.cols, micro.out.rows, micro.out.cols
+            score.rows, score.cols, out.rows, out.cols
+        ),
+        poot_kernelgen::AttentionSchedule::Tiled {
+            br,
+            bc,
+            micro:
+                poot_kernelgen::AttentionMicro::Fragment {
+                    dtype, score, out, ..
+                },
+            ..
+        } => format!(
+            "tiled(br={br} bc={bc} fragment={dtype:?} score={}x{}w{}x{}f out={}x{}w{}x{}f)",
+            score.waves_m,
+            score.waves_n,
+            score.rows,
+            score.cols,
+            out.waves_m,
+            out.waves_n,
+            out.rows,
+            out.cols
         ),
     };
     format!(

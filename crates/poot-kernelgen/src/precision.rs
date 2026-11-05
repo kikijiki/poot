@@ -22,22 +22,35 @@ pub(crate) struct ProductRead {
     pub(crate) weight_stored: Option<FragmentDtype>,
 }
 
-/// How many f32 tiles a register-tiled contraction stages for each operand: one, or two (`hi` and `lo`) for a
-/// split operand. What the tiling's LDS budget is sized for.
+/// What a register-tiled contraction stages for each operand: one tile, or two (`hi` and `lo`) for a split operand,
+/// and the fragment dtype the operands narrow to, if they do (a matrix unit multiplies them in it). What the
+/// tiling's LDS budget is sized for, and whether a fragment tiling is offered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StagedTerms {
     /// Tiles of the activation.
     pub activation: usize,
     /// Tiles of the weight.
     pub weight: usize,
+    /// The fragment dtype of a narrowed or split precision, `None` for an exact one.
+    pub fragment: Option<FragmentDtype>,
 }
 
 impl StagedTerms {
-    /// One tile per operand: an exact or narrowed contraction.
+    /// One tile per operand, exact operands.
     pub const ONE: Self = Self {
         activation: 1,
         weight: 1,
+        fragment: None,
     };
+
+    /// These terms for a contraction that keeps the scalar micro-tile (an expert walk, whose rows select different
+    /// weight tiles): the same tiles, no fragment dtype.
+    pub const fn scalar_only(self) -> Self {
+        Self {
+            fragment: None,
+            ..self
+        }
+    }
 
     /// The tiles `precision` stages for a weight held as `weight_stored` (a weight stored in the fragment dtype is
     /// exact in it and stages once; an activation is f32 and splits).
@@ -56,6 +69,7 @@ impl StagedTerms {
         Self {
             activation: split(activation_stored),
             weight: split(weight_stored),
+            fragment: precision.fragment_dtype(),
         }
     }
 }

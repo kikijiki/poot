@@ -72,6 +72,25 @@ fn declared_attention_precision_matches_the_oracle_on_rocm() {
     };
     let t = device.target();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    // The 160-row fixture must run on the matrix unit, not the register tiles, in both fragment dtypes.
+    for dtype in poot_target::FragmentDtype::ALL {
+        let micro = poot_executor_parity::precision::planned_fragment_attention(
+            exec.as_ref(),
+            t,
+            poot_graph_ir::OperandPrecision::Narrow(dtype),
+        )
+        .unwrap_or_else(|e| panic!("{dtype:?}: {e}"));
+        assert!(
+            matches!(
+                micro,
+                poot_kernelgen::AttentionMicro::Fragment {
+                    layout: poot_target::FragmentLayout::Declared(poot_target::LaneMap::Rdna3),
+                    ..
+                }
+            ),
+            "{micro:?}"
+        );
+    }
     for precision in [
         poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::F16),
         poot_graph_ir::OperandPrecision::Split(poot_graph_ir::FragmentDtype::F16),

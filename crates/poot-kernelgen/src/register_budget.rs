@@ -10,7 +10,7 @@ use poot_target::{AmdArch, BufferStorage, DeviceCaps};
 
 use crate::attention::{
     AttentionMicro, AttentionSchedule, AttentionSink, AttentionSpec, KeyBound, KeyLayout, LaneTile,
-    MaskKind, ScoreTransform, attention_body,
+    MaskKind, ScoreTransform, WaveTile, attention_body,
 };
 use crate::contraction::{DenseTiledWeight, RegisterTiling, TiledShape, dense_tiled_contraction};
 use crate::helpers::WeightLayout;
@@ -81,7 +81,7 @@ fn tiled_spec(br: usize, bc: usize, score: (usize, usize), out: (usize, usize)) 
             br,
             bc,
             lanes: 256,
-            micro: AttentionMicro {
+            micro: AttentionMicro::Scalar {
                 score: LaneTile {
                     rows: score.0,
                     cols: score.1,
@@ -124,6 +124,53 @@ fn the_tiled_attention_at_its_planned_tilings_spills_no_register() {
     }
 }
 
+/// The fragment tiled attention (f16 operands on the gfx11 matrix unit, a declared lane map) at the tilings the
+/// planner chooses for a 16-head, 8-key/value-head, 128-wide prefill spills no register: the score and output
+/// accumulator fragments, the operand fragments of a step and the softmax's per-row state fit the file beside
+/// each other. Mutation: raise `trip_steps` for a fragment to 8; the hoisted operand loads of eight steps read
+/// `spilled`.
+#[test]
+fn the_fragment_attention_at_its_planned_tilings_spills_no_register() {
+    let wave = |(waves_m, waves_n, rows, cols)| WaveTile {
+        waves_m,
+        waves_n,
+        rows,
+        cols,
+    };
+    // (br, bc, lanes, score waves, output waves) of n_rep = 2, each wave `(waves_m, waves_n, rows, cols)`.
+    let tilings = [
+        (32usize, 32usize, 256usize, (4, 2, 1, 1), (4, 2, 1, 4)),
+        (32, 16, 128, (4, 1, 1, 1), (2, 2, 2, 4)),
+        (16, 32, 128, (2, 2, 1, 1), (2, 2, 1, 4)),
+        // The planner's pick for the bank's 16-head, 8-key/value-head prefill (128 rows over 8 waves).
+        (64, 16, 256, (8, 1, 1, 1), (4, 2, 2, 4)),
+    ];
+    for (br, bc, lanes, score, out) in tilings {
+        let mut spec = tiled_spec(br, bc, (1, 1), (1, 1));
+        spec.precision = poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::F16);
+        spec.schedule = AttentionSchedule::Tiled {
+            br,
+            bc,
+            lanes,
+            micro: AttentionMicro::Fragment {
+                dtype: poot_target::FragmentDtype::F16,
+                layout: poot_target::FragmentLayout::Declared(poot_target::LaneMap::Rdna3),
+                score: wave(score),
+                out: wave(out),
+            },
+        };
+        let name = format!("budget_fragment_attention_br{br}_bc{bc}");
+        let body = attention_body(&name, &spec, 0..spec.workgroups(), 1).unwrap();
+        let Some((vgprs, spilled)) = compiled_registers(&body) else {
+            return;
+        };
+        assert_eq!(
+            spilled, 0,
+            "{name}: spilled {spilled} VGPRs of {vgprs} (the planner's tiling must fit the register file)"
+        );
+    }
+}
+
 /// The register-tiled dense contraction at the tiling the planner chooses for each projection of a prefill
 /// spills no register and keeps its occupancy-friendly register count.
 #[test]
@@ -151,6 +198,58 @@ fn the_dense_register_tiled_contraction_spills_no_register() {
             k,
             None,
             poot_graph_ir::OperandPrecision::Exact,
+        )
+        .unwrap();
+        let Some((vgprs, spilled)) = compiled_registers(&body) else {
+            return;
+        };
+        assert_eq!(spilled, 0, "{name}: spilled {spilled} VGPRs of {vgprs}");
+    }
+}
+
+/// The fragment dense contraction at the tiling the planner chooses for each narrowed prefill projection (bf16
+/// operands on the gfx11 matrix unit) spills no register: its accumulator fragments, the operand fragments of a step
+/// and the staging addresses fit the file. Mutation: raise `MAX_WAVE_FRAGMENTS` to 16; the planner's pick for the
+/// long projections holds 128 accumulator registers beside its operands and the row reads `spilled`.
+#[test]
+fn the_fragment_dense_contraction_spills_no_register() {
+    let caps = DeviceCaps {
+        matrix_units: poot_target::Queried::Known(poot_target::MatrixUnits::amd("gfx1151", 32)),
+        ..DeviceCaps::rocm_default()
+    };
+    let precision = poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::Bf16);
+    for (label, m, n, k) in [
+        ("qkv", 8192usize, 4096usize, 2560usize),
+        ("down", 8192, 2560, 9728),
+        ("short", 128, 2048, 2048),
+    ] {
+        let shape = TiledShape {
+            blocks: 1,
+            m_per_block: m,
+            out_per_block: n,
+            k,
+            layout: WeightLayout::Nk,
+            segments: 1,
+            terms: crate::precision::StagedTerms::of(
+                precision,
+                None,
+                Some(poot_graph_ir::FragmentDtype::Bf16),
+            ),
+        };
+        let tiling = RegisterTiling::choose(shape, &caps);
+        assert!(
+            matches!(tiling.schedule(), crate::Schedule::FragmentTiled { .. }),
+            "{label}: {:?}",
+            tiling.schedule()
+        );
+        let name = format!("budget_fragment_{label}");
+        let body = dense_tiled_contraction(
+            &name,
+            DenseTiledWeight::Nk(BufferStorage::bf16_packed()),
+            tiling.schedule(),
+            k,
+            None,
+            precision,
         )
         .unwrap();
         let Some((vgprs, spilled)) = compiled_registers(&body) else {

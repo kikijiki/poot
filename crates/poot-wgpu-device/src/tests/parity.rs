@@ -85,6 +85,17 @@ fn declared_attention_precision_matches_the_oracle_on_wgpu() {
     };
     let t = target(&device);
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    // wgpu runs one wave per workgroup, which is slower than the register tiles on attention: the planner keeps
+    // them, so this row holds the register-tiled kernel to the declared oracle.
+    assert!(
+        poot_executor_parity::precision::planned_fragment_attention(
+            exec.as_ref(),
+            t,
+            poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::F16),
+        )
+        .is_err(),
+        "a one-wave fragment attention was planned"
+    );
     for precision in [
         poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::F16),
         poot_graph_ir::OperandPrecision::Split(poot_graph_ir::FragmentDtype::F16),

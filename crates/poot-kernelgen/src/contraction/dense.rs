@@ -77,10 +77,12 @@ pub(crate) fn dense_contraction(
             epilogue,
             ProductRead::dense(precision, lane),
         ),
-        Schedule::RegisterTiled { .. } => Err(KernelGenError::Unsupported {
-            request: "dense_contraction",
-            reason: "a dense M > 1 contraction is the register-tiled DenseTiled request",
-        }),
+        Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => {
+            Err(KernelGenError::Unsupported {
+                request: "dense_contraction",
+                reason: "a dense M > 1 contraction is the register-tiled DenseTiled request",
+            })
+        }
     }
 }
 
@@ -101,19 +103,7 @@ pub(crate) fn dense_tiled_contraction(
 ) -> Result<Body, KernelGenError> {
     const GENERATOR: &str = "dense_tiled_contraction";
     let lane = weight.lane(GENERATOR)?;
-    let Schedule::RegisterTiled {
-        lanes,
-        rows,
-        cols,
-        run,
-    } = schedule
-    else {
-        return Err(KernelGenError::Unsupported {
-            request: GENERATOR,
-            reason: "a dense M > 1 contraction runs the RegisterTiled schedule",
-        });
-    };
-    let launch = TiledLaunch::new(lanes, rows, cols, run, weight.layout())?;
+    let launch = TiledLaunch::of(schedule, weight.layout(), precision)?;
     let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
     let leaf_lanes = match epilogue {
         Some(epilogue) => {
@@ -149,7 +139,7 @@ pub(crate) fn dense_tiled_contraction(
         read: ProductRead::dense(precision, lane),
     };
     let rows_aligned = k.is_multiple_of(lane.per_word());
-    let word_aligned = rows_aligned && (run.get() as usize).is_multiple_of(lane.per_word());
+    let word_aligned = rows_aligned && launch.run().is_multiple_of(lane.per_word());
     Ok(match weight {
         DenseTiledWeight::Nk(_) => tiled_body(
             spec,
@@ -240,7 +230,7 @@ mod tests {
 
     use super::{DenseTiledWeight, dense_tiled_contraction};
     use crate::StagedTerms;
-    use crate::contraction::RegisterTiling;
+    use crate::contraction::{RegisterTiling, TiledShape};
     use crate::helpers::WeightLayout;
 
     /// Values in `[-1, 1)` on a fixed xorshift stream, rounded to what a BF16 and an F16 store both hold exactly
@@ -311,9 +301,16 @@ mod tests {
                         (0..k).map(|d| activation[row * k + d] * at(b, c, d)).sum()
                     })
                     .collect();
-                for tiling in
-                    RegisterTiling::candidates(k, weight.layout(), StagedTerms::ONE, &caps)
-                {
+                let tiled_shape = TiledShape {
+                    blocks,
+                    m_per_block: m,
+                    out_per_block: n,
+                    k,
+                    layout: weight.layout(),
+                    segments: 1,
+                    terms: StagedTerms::ONE,
+                };
+                for tiling in RegisterTiling::candidates(tiled_shape, &caps) {
                     let body = dense_tiled_contraction(
                         "t",
                         weight,

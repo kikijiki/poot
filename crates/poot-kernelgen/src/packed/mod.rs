@@ -163,6 +163,19 @@ mod fixtures {
                 cols.get(),
                 run.get()
             ),
+            Schedule::FragmentTiled {
+                waves_m,
+                waves_n,
+                tile,
+                run,
+            } => format!(
+                "fragment_tiled{}x{}x{}x{}r{}",
+                waves_m.get(),
+                waves_n.get(),
+                tile.rows,
+                tile.cols,
+                run.get()
+            ),
         }
     }
 
@@ -726,15 +739,24 @@ mod planar_fixtures {
             scale: ScaleEncoding::F32,
         };
         let (m, out_rows) = (130, 130);
-        let tiling = RegisterTiling::candidates(k, WeightLayout::Nk, StagedTerms::ONE, caps)
+        let shape = crate::TiledShape {
+            blocks: 1,
+            m_per_block: m,
+            out_per_block: out_rows,
+            k,
+            layout: WeightLayout::Nk,
+            segments: 1,
+            terms: StagedTerms::ONE,
+        };
+        let tiling = RegisterTiling::candidates(shape, caps)
             .max_by_key(|tiling| {
                 let (rows, cols) = tiling.output_tile();
                 rows * cols
             })
             .expect("the caps run a register tiling");
         assert_eq!(
-            (tiling.lanes(), tiling.output_tile()),
-            (16, (128, 128)),
+            (tiling.workgroup_lanes(), tiling.output_tile()),
+            (256, (128, 128)),
             "these caps must run the 16x16 lane grid of 8x8 tiles"
         );
         let (sources, decoded) = fixture(format, out_rows, k, 11);
@@ -1543,12 +1565,12 @@ mod contraction_tests {
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
         )
-        .expect_err("a packed RegisterTiled contraction has no epilogue");
+        .expect_err("a packed tiled contraction has no epilogue");
         assert_eq!(
             error,
             crate::KernelGenError::Unsupported {
                 request: "packed_contraction",
-                reason: "a packed RegisterTiled contraction has no epilogue",
+                reason: "a packed tiled contraction has no epilogue",
             }
         );
     }
@@ -2129,9 +2151,16 @@ mod planar_contraction_tests {
         let k = 20;
         for format in every_planar_format() {
             for m in [9, 33, 70, 130] {
-                for tiling in
-                    RegisterTiling::candidates(k, WeightLayout::Nk, crate::StagedTerms::ONE, &caps)
-                {
+                let shape = crate::TiledShape {
+                    blocks: 1,
+                    m_per_block: m,
+                    out_per_block: 6,
+                    k,
+                    layout: WeightLayout::Nk,
+                    segments: 1,
+                    terms: crate::StagedTerms::ONE,
+                };
+                for tiling in RegisterTiling::candidates(shape, &caps) {
                     run_case(format, k, 6, m, tiling.schedule());
                 }
             }
@@ -2438,12 +2467,40 @@ mod rocm_tests {
         m_per_block: usize,
         out_per_block: usize,
     ) {
-        let (k, bytes, activation, expected) =
+        let (_, _, _, expected) = contraction_fixture(format, blocks, m_per_block, out_per_block);
+        let got = contraction_on_rocm(
+            ctx,
+            format,
+            schedule,
+            poot_graph_ir::OperandPrecision::Exact,
+            (blocks, m_per_block, out_per_block),
+        );
+        assert_close(
+            format,
+            &format!("Contraction {schedule:?} blocks={blocks} (ROCm)"),
+            &got,
+            &expected,
+        );
+    }
+
+    /// The outputs of the packed contraction `schedule` (reading its operands at `precision`) over
+    /// [`contraction_fixture`] on the device.
+    fn contraction_on_rocm(
+        ctx: &RocmContext,
+        format: poot_quant::format::WeightFormat,
+        schedule: Schedule,
+        precision: poot_graph_ir::OperandPrecision,
+        (blocks, m_per_block, out_per_block): (usize, usize, usize),
+    ) -> Vec<f32> {
+        let (k, bytes, activation, _) =
             contraction_fixture(format, blocks, m_per_block, out_per_block);
         let rows = blocks * m_per_block;
         let name = format!(
-            "contraction_rocm_{format:?}_{}_{blocks}",
-            schedule_tag(schedule)
+            "contraction_rocm_{format:?}_{}_{blocks}_{}",
+            schedule_tag(schedule),
+            precision
+                .to_string()
+                .replace(|c: char| !c.is_ascii_alphanumeric(), "_")
         );
         let body = packed_contraction(
             &name,
@@ -2451,7 +2508,7 @@ mod rocm_tests {
             schedule,
             None,
             crate::PackedRows::Blocks,
-            poot_graph_ir::OperandPrecision::Exact,
+            precision,
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let words = pack_words(&bytes);
@@ -2467,7 +2524,7 @@ mod rocm_tests {
             1,
         );
         let block = (body.workgroup_size[0], 1, 1);
-        let got = dispatch_and_download(
+        dispatch_and_download(
             ctx,
             &name,
             &body,
@@ -2479,13 +2536,78 @@ mod rocm_tests {
             ],
             grid,
             block,
-        );
-        assert_close(
-            format,
-            &format!("Contraction {schedule:?} blocks={blocks} (ROCm)"),
-            &got,
-            &expected,
-        );
+        )
+    }
+
+    /// POOT-1436 (device tier 2): a packed contraction on the matrix unit. The fragment schedule decodes each
+    /// block format into narrow operand tiles and multiplies them on the unit; it must agree with the scalar
+    /// tiling of the same `Narrow(bf16)` and `Split(bf16)` contraction (same declared rounding, the scalar
+    /// micro-tile's FMA order) to the matrix unit's accumulation order, for every block-32 and K-quant format at
+    /// ragged shapes and block-diagonal blocks. Mutation: in `MicroTile::spill`/`elements` swap a lane map
+    /// (`WmmaElemRead` index `ev ^ 1`); every format goes red.
+    #[test]
+    fn packed_fragment_contractions_match_the_scalar_tiling_of_the_same_precision_on_rocm() {
+        use crate::TileSize;
+        use poot_graph_ir::{FragmentDtype, OperandPrecision};
+        use poot_target::{FragmentLayout, LaneMap};
+        let Some(ctx) = open_or_skip(
+            "packed_fragment_contractions_match_the_scalar_tiling_of_the_same_precision_on_rocm",
+        ) else {
+            return;
+        };
+        // The gfx11 matrix unit: the declared RDNA3 lane map. A ROCm device without it has no fragment to run.
+        let has_unit = poot_target::AmdArch::from_isa_name(ctx.isa_name(), ctx.wavefront())
+            .is_ok_and(|arch| !arch.matrix_units().is_empty());
+        if !has_unit {
+            poot_test_util::skip_report("poot-kernelgen", &"the device has no matrix unit");
+            return;
+        }
+        let fragment = |k: usize| Schedule::FragmentTiled {
+            waves_m: TileSize::new(2).unwrap(),
+            waves_n: TileSize::new(1).unwrap(),
+            tile: crate::FragmentTile {
+                dtype: FragmentDtype::Bf16,
+                layout: FragmentLayout::Declared(LaneMap::Rdna3),
+                rows: 1,
+                cols: 2,
+            },
+            run: crate::contraction::RunLength::dividing(k),
+        };
+        for format in BLOCK32.into_iter().chain(KQUANT) {
+            for precision in [
+                OperandPrecision::Narrow(FragmentDtype::Bf16),
+                OperandPrecision::Split(FragmentDtype::Bf16),
+            ] {
+                for shape in [(1, 19, 21), (3, 7, 5)] {
+                    let (k, ..) = contraction_fixture(format, shape.0, shape.1, shape.2);
+                    let scalar =
+                        contraction_on_rocm(&ctx, format, register_tiled(2, k), precision, shape);
+                    let device = contraction_on_rocm(&ctx, format, fragment(k), precision, shape);
+                    // The same declared rounding, summed in two orders: the matrix unit's internal accumulation is
+                    // coarser than sequential f32 FMAs (the design's section 1.3 measured the same). Measured on
+                    // gfx1151: at most 5e-4 under `Narrow`, and 6e-3 under `Split` (Q6_K, one block, where a split
+                    // sum cancels to f32 accuracy and so shows the accumulation order most); the dense rows hold
+                    // the same two precisions to the declared oracle at 2e-7, so the bound here is 1e-2.
+                    let scaled = |values: &[f32]| -> Vec<f32> {
+                        values
+                            .iter()
+                            .zip(&scalar)
+                            .map(|(v, s)| v / s.abs().max(1.0))
+                            .collect()
+                    };
+                    let worst = poot_test_util::max_abs_error(&scaled(&device), &scaled(&scalar));
+                    eprintln!(
+                        "{format:?} {precision} blocks={}: fragment vs scalar {worst:.2e}",
+                        shape.0
+                    );
+                    assert!(
+                        worst <= 1e-2,
+                        "{format:?} fragment vs scalar {precision} blocks={}: {worst:.2e}",
+                        shape.0
+                    );
+                }
+            }
+        }
     }
 
     #[test]

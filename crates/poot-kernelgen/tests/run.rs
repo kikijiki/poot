@@ -761,8 +761,9 @@ fn indexed_kernel(
     let threads = schedule.grid_threads(1, m, n);
     let x_groups = match schedule {
         kg::Schedule::Gemv { .. } => 0,
-        kg::Schedule::RegisterTiled { lanes, .. } => {
-            (threads / (lanes.get() * lanes.get()) as usize) as u32
+        kg::Schedule::RegisterTiled { .. } | kg::Schedule::FragmentTiled { .. } => {
+            let tiling = kg::RegisterTiling::of(schedule).unwrap();
+            (threads / tiling.workgroup_lanes()) as u32
         }
     };
     let request =
@@ -1968,7 +1969,7 @@ fn dense_tiled(
     );
     let (tile_rows, tile_cols) = tiling.output_tile();
     let tiles = m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
-    let lanes = tiling.lanes() * tiling.lanes();
+    let lanes = tiling.workgroup_lanes();
     kg::KernelRequest::Contraction(kg::ContractionSpec::DenseTiled(kg::DenseTiledContraction {
         weight,
         schedule: tiling.schedule(),

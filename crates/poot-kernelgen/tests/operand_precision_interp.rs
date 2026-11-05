@@ -146,7 +146,9 @@ fn run_dense_tiled(
     weight: Buffer,
     storage: BufferStorage,
 ) -> Vec<f32> {
-    let terms = kg::StagedTerms::of(precision, None, kg::stored_fragment_dtype(storage));
+    // The interpreter runs the scalar tiling: a matrix fragment's layout is per target, so it refuses `Wmma*`.
+    let terms =
+        kg::StagedTerms::of(precision, None, kg::stored_fragment_dtype(storage)).scalar_only();
     let schedule = kg::RegisterTiling::choose(
         kg::TiledShape {
             blocks: 1,

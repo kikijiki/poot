@@ -247,6 +247,17 @@ impl AttentionSpec {
         }
     }
 
+    /// Whether the schedule multiplies on matrix fragments, which need their subgroup of lanes ([`AttentionMicro::Fragment`]).
+    pub fn uses_fragments(&self) -> bool {
+        matches!(
+            self.schedule,
+            AttentionSchedule::Tiled {
+                micro: AttentionMicro::Fragment { .. },
+                ..
+            }
+        )
+    }
+
     /// The `f32` elements the split schedule's partial state occupies: `(o[dv], m, l)` per `(row,
     /// split)`. `None` for the streaming and tiled schedules, which have no intermediate.
     pub fn partial_elems(&self) -> Option<usize> {
@@ -441,15 +452,44 @@ impl AttentionSchedule {
     }
 }
 
-/// The per-lane register tiles of a [`AttentionSchedule::Tiled`] workgroup: one for the score tile of a key
-/// block, one for the output accumulator. The lanes of a tile form a grid of `rows / tile.rows` by `cols /
-/// tile.cols` lanes, which must be the workgroup's `lanes`.
+/// The micro-tiles of a [`AttentionSchedule::Tiled`] workgroup: one for the score tile of a key block, one for
+/// the output accumulator (see [`crate::microtile`]). Both products use the same kind of arithmetic unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct AttentionMicro {
-    /// Each lane's part of the `(br * n_rep) x bc` score tile.
-    pub score: LaneTile,
-    /// Each lane's part of the `(br * n_rep) x dv` output accumulator.
-    pub out: LaneTile,
+pub enum AttentionMicro {
+    /// Each lane accumulates a register tile of f32 products. The lanes of a tile form a grid of `rows /
+    /// tile.rows` by `cols / tile.cols` lanes, which must be the workgroup's `lanes`.
+    Scalar {
+        /// Each lane's part of the `(br * n_rep) x bc` score tile.
+        score: LaneTile,
+        /// Each lane's part of the `(br * n_rep) x dv` output accumulator.
+        out: LaneTile,
+    },
+    /// Each wave of 32 lanes accumulates matrix fragments of 16x16 outputs from `dtype` operands staged in
+    /// workgroup memory (POOT-1437). The waves of a tile form a `waves_m x waves_n` grid, and both grids hold
+    /// the workgroup's `lanes / 32` waves. The schedule's operand precision must narrow to `dtype`.
+    Fragment {
+        /// The operand dtype of Q, K, P and V; the accumulators are f32.
+        dtype: poot_target::FragmentDtype,
+        /// Whether the accumulators' elements are addressable in place.
+        layout: poot_target::FragmentLayout,
+        /// The waves and fragments of the `(br * n_rep) x bc` score tile.
+        score: WaveTile,
+        /// The waves and fragments of the `(br * n_rep) x dv` output accumulator.
+        out: WaveTile,
+    },
+}
+
+/// The wave grid over one product's tile and the fragments each wave accumulates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WaveTile {
+    /// Waves along the tile's rows.
+    pub waves_m: usize,
+    /// Waves along the tile's columns.
+    pub waves_n: usize,
+    /// Fragments each wave accumulates along the rows.
+    pub rows: u32,
+    /// Fragments each wave accumulates along the columns.
+    pub cols: u32,
 }
 
 /// A lane's `rows x cols` register tile, interleaved over its tile (see [`crate::microtile`]).

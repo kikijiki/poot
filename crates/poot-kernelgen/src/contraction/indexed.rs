@@ -205,14 +205,9 @@ pub(crate) fn indexed_contraction(
             epilogue,
             ProductRead::dense(precision, lane),
         ),
-        Schedule::RegisterTiled {
-            lanes,
-            rows,
-            cols,
-            run,
-        } => indexed_register_tiled(
+        Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => indexed_register_tiled(
             name,
-            TiledLaunch::new(lanes, rows, cols, run, layout)?,
+            TiledLaunch::of(schedule, layout, precision)?.scalar_only("indexed_contraction")?,
             layout,
             lane,
             k,

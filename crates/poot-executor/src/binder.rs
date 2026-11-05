@@ -1079,6 +1079,18 @@ impl WeightBinder {
         }
     }
 
+    /// `Ok` when no file `table`'s rows are read from changed since it was mapped.
+    fn check_table_sources(&self, table: &HostedTable) -> Result<(), LoadError> {
+        for run in &table.runs {
+            match self.store.get(run.key.as_str()) {
+                Some(WeightEntry::Dense(entry)) => entry.bytes().check_unchanged()?,
+                Some(WeightEntry::Packed(payload)) => payload.check_unchanged()?,
+                None => unreachable!("load_weights checked every mapped key against this store"),
+            }
+        }
+        Ok(())
+    }
+
     /// The stored rows `ids` name of `table`, in order, in the lane `storage` the slot was planned in.
     ///
     /// An id outside the table is a typed [`BindError`] before a byte is returned, so nothing is written for a
@@ -1090,11 +1102,13 @@ impl WeightBinder {
         storage: BufferStorage,
     ) -> Result<HostedBytes, ExecError> {
         // ADR-0103 amendment: no page of a changed file is read, and the rows read are the validated bytes
-        // only if the file did not change while they were read.
-        self.check_sources()?;
+        // only if the file did not change while they were read. The check is of the files this table reads: a
+        // step gathers on every decode token, and a walk over every weight of the store costs milliseconds.
+        self.check_table_sources(table)?;
         let total: usize = table.runs.iter().map(|run| run.rows.len()).sum();
         debug_assert_eq!(total, table.rows);
-        let mut stored = Vec::new();
+        // Every id is checked before any row is read, and each row's place is resolved once.
+        let mut located = Vec::with_capacity(ids.len());
         for &id in ids {
             let mut row = usize::try_from(id)
                 .ok()
@@ -1116,7 +1130,26 @@ impl WeightBinder {
                     false
                 })
                 .expect("a row below the total lies in some run");
-            let stored_row = run.rows.start + row;
+            located.push((run, run.rows.start + row));
+        }
+        // Hashed ids have no locality: ask the kernel for every row's pages at once, so the reads of a cold table
+        // overlap on the disk instead of queueing one behind the other.
+        for &(run, stored_row) in &located {
+            match (self.store.get(run.key.as_str()), table.kind) {
+                (Some(WeightEntry::Dense(entry)), RowKind::Dense { .. }) => {
+                    let row_bytes = entry.bytes().len() / entry.shape()[0];
+                    entry
+                        .bytes()
+                        .prefetch(stored_row * row_bytes..(stored_row + 1) * row_bytes);
+                }
+                (Some(WeightEntry::Packed(payload)), RowKind::Packed { role, row_bytes }) => {
+                    payload.prefetch(role, stored_row * row_bytes..(stored_row + 1) * row_bytes);
+                }
+                _ => unreachable!("load_weights checked every mapped key against this store"),
+            }
+        }
+        let mut stored = Vec::new();
+        for (run, stored_row) in located {
             match (self.store.get(run.key.as_str()), table.kind) {
                 (Some(WeightEntry::Dense(entry)), RowKind::Dense { .. }) => {
                     let row_bytes = entry.bytes().len() / entry.shape()[0];
@@ -1180,7 +1213,7 @@ impl WeightBinder {
             RowKind::Packed { .. } => crate::lanes::encode_words(&stored),
         };
         // The same check after the reads: a file modified while its rows were read is refused, not encoded.
-        self.check_sources()?;
+        self.check_table_sources(table)?;
         Ok(encoded)
     }
 }

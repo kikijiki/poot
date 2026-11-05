@@ -23,9 +23,12 @@ pub(crate) use indexed::{
 
 pub(crate) use tiled::{ExpertWalk, TiledBody, TiledLaunch, TiledWeight, tiled_body};
 
+use poot_graph_ir::FragmentDtype;
+use poot_target::FragmentLayout;
+
 use crate::KernelGenError;
 use crate::helpers::WeightLayout;
-use crate::microtile::{LaneRows, MicroCols, MicroTile};
+use crate::microtile::{FRAGMENT_LANES, FragmentTile, LaneRows, MicroCols, MicroTile};
 use crate::precision::StagedTerms;
 
 /// How a [`Schedule::Gemv`] lane reads the `unroll` activation values of a full run. Both read the same values
@@ -80,6 +83,22 @@ pub enum Schedule {
         rows: LaneRows,
         /// Output columns each lane accumulates.
         cols: MicroCols,
+        /// Consecutive `K` values one lane loads and decodes at a time; divides `K`.
+        run: RunLength,
+    },
+    /// `M > 1` on matrix units (POOT-1436): the [`Schedule::RegisterTiled`] loop nest with a [`MicroTile::Fragment`].
+    /// A workgroup of `waves_m x waves_n` waves of 32 lanes computes the [`Schedule::output_tile`] its waves
+    /// interleave, each wave accumulating `tile.rows x tile.cols` fragments of 16x16 outputs from narrow operand
+    /// tiles in workgroup memory. The request's operand precision must narrow or split to `tile.dtype`
+    /// ([`TiledLaunch::of`]). `run` is as for `RegisterTiled`. [`RegisterTiling::choose`] picks it where the
+    /// device has a matrix unit for the operands.
+    FragmentTiled {
+        /// Waves along the output rows.
+        waves_m: TileSize,
+        /// Waves along the output columns.
+        waves_n: TileSize,
+        /// What each wave accumulates, and the fragment dtype and layout.
+        tile: FragmentTile,
         /// Consecutive `K` values one lane loads and decodes at a time; divides `K`.
         run: RunLength,
     },
@@ -152,28 +171,20 @@ impl Schedule {
         let outputs = rows * out_per_block;
         match self {
             Schedule::Gemv { width, cols, .. } => outputs.div_ceil(cols as usize) * width as usize,
-            Schedule::RegisterTiled {
-                lanes, rows, cols, ..
-            } => {
-                let (tile_rows, tile_cols) = RegisterTiling::output_tile_of(lanes, rows, cols);
-                let lanes = lanes.get() as usize;
+            Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => {
+                let tiling = RegisterTiling::of(self).expect("a tiled schedule has a tiling");
+                let (tile_rows, tile_cols) = tiling.output_tile();
                 blocks
                     * m_per_block.div_ceil(tile_rows)
                     * out_per_block.div_ceil(tile_cols)
-                    * lanes
-                    * lanes
+                    * tiling.workgroup_lanes()
             }
         }
     }
 
     /// The `(rows, columns)` of the output tile one workgroup of a tiled schedule computes, or `None` for the Gemv.
     pub fn output_tile(self) -> Option<(usize, usize)> {
-        match self {
-            Schedule::Gemv { .. } => None,
-            Schedule::RegisterTiled {
-                lanes, rows, cols, ..
-            } => Some(RegisterTiling::output_tile_of(lanes, rows, cols)),
-        }
+        RegisterTiling::of(self).map(RegisterTiling::output_tile)
     }
 }
 
@@ -192,6 +203,8 @@ const MAX_LANE_ACCUMULATORS: u32 = 64;
 const FMA_COST: f64 = 1.0;
 const LDS_READ_COST: f64 = 1.0;
 const STAGED_VALUE_COST: f64 = 8.0;
+/// The vector reads a lane issues to load one operand fragment: its 16 values of 2 bytes, as two 16-byte reads.
+const FRAGMENT_LOAD_READS: f64 = 2.0;
 
 /// The shape of an `M > 1` contraction: `blocks` independent products of `m_per_block` activation rows against
 /// `out_per_block` weight rows of `k` values (one block is a plain GEMM), the weight read in `layout`, the rows of a
@@ -233,29 +246,50 @@ impl TiledShape {
     }
 }
 
-/// The geometry of a [`Schedule::RegisterTiled`] contraction, chosen from the shapes and the device by
-/// [`RegisterTiling::choose`]. It is the schedule's fields before they are wrapped, so a planner reads the lane
-/// grid and output tile it launches without destructuring the [`Schedule`] again.
+/// The geometry of a [`Schedule::RegisterTiled`] or [`Schedule::FragmentTiled`] contraction, chosen from the shapes
+/// and the device by [`RegisterTiling::choose`]. It is the schedule's fields before they are wrapped, so a planner
+/// reads the workgroup and output tile it launches without destructuring the [`Schedule`] again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RegisterTiling {
-    lanes: TileSize,
-    rows: LaneRows,
-    cols: MicroCols,
+    /// Owners along the output rows and columns: lanes for a scalar micro-tile, waves for a fragment one.
+    owners_m: TileSize,
+    owners_n: TileSize,
+    micro: MicroTile,
     run: RunLength,
 }
 
+/// The wave grids a fragment tiling may run, `(waves along rows, waves along columns)`: one to eight waves, with the
+/// long side along the rows (an activation tile is staged once for all the wave columns that read it).
+const WAVE_GRIDS: [(u32, u32); 6] = [(1, 1), (2, 1), (1, 2), (2, 2), (4, 2), (2, 4)];
+/// The fragments a wave may accumulate along each axis.
+const WAVE_FRAGMENTS: [u32; 3] = [1, 2, 4];
+/// The most accumulator fragments one wave holds (8 f32 registers each): with the operand fragments of a step
+/// (8 registers each) and the staging addresses, within the 256 registers a wave32 lane holds.
+const MAX_WAVE_FRAGMENTS: u32 = 8;
+/// The issue cost, in lane FMAs, of one fragment multiply per lane: a 16x16x16 multiply is 4096 FMAs spread over 32
+/// lanes, and the matrix unit runs 4x the FMA rate (the measured gfx1151 peaks, 40-45 against 10.8 TFLOP/s:
+/// `receipts/1429-narrow-operands/design.md` section 1.1).
+const WMMA_COST: f64 = 4096.0 / FRAGMENT_LANES as f64 / 4.0;
+
 impl RegisterTiling {
-    /// The tiling of `shape` on `caps`, from an occupancy cost model over every geometry the device can run: the
-    /// narrow and wide lane grids of `caps.gemm_launch()`, each with every register tile of [`LANE_ROWS`] x
-    /// [`LANE_COLS`] up to [`MAX_LANE_ACCUMULATORS`], whose workgroup fits the device, whose two staged tiles fit
-    /// its LDS and stage in whole slots ([`tiled::stages_evenly`]). Each is costed by [`Self::cost`] and the
-    /// cheapest wins, a tie going to the larger output tile. Chosen from shapes and device limits alone, never
-    /// from the format or a model; the run is the longest that divides `k`.
+    /// The tiling of `shape` on `caps`, from an occupancy cost model over every geometry the device can run.
+    ///
+    /// - Scalar: the narrow and wide lane grids of `caps.gemm_launch()`, each with every register tile of
+    ///   [`LANE_ROWS`] x [`LANE_COLS`] up to [`MAX_LANE_ACCUMULATORS`].
+    /// - Fragment, where the operands narrow to a dtype the device has a matrix unit for
+    ///   ([`StagedTerms::fragment`]): every wave grid of [`WAVE_GRIDS`] with every [`WAVE_FRAGMENTS`] tile of at
+    ///   most [`MAX_WAVE_FRAGMENTS`] fragments. An expert walk asks for scalar tiles only
+    ///   ([`StagedTerms::scalar_only`]): the rows of a fragment must share one weight tile.
+    ///
+    /// A candidate must have a workgroup that fits the device, two staged tiles that fit its LDS and stage in whole
+    /// slots ([`tiled::stages_evenly`]). Each is costed by [`Self::cost`] and the cheapest wins, a tie going to the
+    /// larger output tile. Chosen from shapes and device limits alone, never from the format or a model; the run is
+    /// the longest that divides `k`.
     pub fn choose(shape: TiledShape, caps: &poot_target::DeviceCaps) -> Self {
         let launch = caps.gemm_launch();
         let run = RunLength::dividing(shape.k);
         let mut best: Option<(f64, Self)> = None;
-        for tiling in Self::candidates(shape.k, shape.layout, shape.terms, caps) {
+        for tiling in Self::candidates(shape, caps) {
             let cost = tiling.cost(shape, caps);
             let better = best.is_none_or(|(best_cost, best_tiling)| {
                 cost < best_cost
@@ -269,64 +303,144 @@ impl RegisterTiling {
         // The narrow grid's smallest tile stages evenly at any run and fits every device that runs a 64-lane
         // workgroup; it is the tiling of a device the filter leaves nothing for.
         best.map_or(
-            Self {
-                lanes: TileSize(launch.register_lane_edge),
-                rows: LaneRows(LANE_ROWS[0]),
-                cols: MicroCols::new(LANE_COLS[0]),
+            Self::scalar(
+                TileSize(launch.register_lane_edge),
+                LaneRows(LANE_ROWS[0]),
+                MicroCols::new(LANE_COLS[0]),
                 run,
-            },
+            ),
             |(_, tiling)| tiling,
         )
     }
 
-    /// Every tiling [`Self::choose`] weighs for a weight of `k`-value rows stored in `layout` on `caps`.
+    fn scalar(lanes: TileSize, rows: LaneRows, cols: MicroCols, run: RunLength) -> Self {
+        Self {
+            owners_m: lanes,
+            owners_n: lanes,
+            micro: MicroTile::Scalar { rows, cols },
+            run,
+        }
+    }
+
+    /// The tiling a tiled schedule runs, or `None` for a Gemv.
+    pub fn of(schedule: Schedule) -> Option<Self> {
+        match schedule {
+            Schedule::Gemv { .. } => None,
+            Schedule::RegisterTiled {
+                lanes,
+                rows,
+                cols,
+                run,
+            } => Some(Self::scalar(lanes, rows, cols, run)),
+            Schedule::FragmentTiled {
+                waves_m,
+                waves_n,
+                tile,
+                run,
+            } => Some(Self {
+                owners_m: waves_m,
+                owners_n: waves_n,
+                micro: MicroTile::Fragment(tile),
+                run,
+            }),
+        }
+    }
+
+    /// The fragment config `caps` offers for operands of `dtype`: a 16x16x16 multiply held across the 32 lanes of a
+    /// wave, the one shape and collective every fragment micro-tile lowers. Its layout, and the most waves of one
+    /// workgroup.
+    fn fragment_config(
+        dtype: FragmentDtype,
+        caps: &poot_target::DeviceCaps,
+    ) -> Option<(FragmentLayout, u32)> {
+        let units = caps.matrix_units.known()?;
+        let config = units.config(dtype)?;
+        (config.shape == poot_target::FragmentShape::M16N16K16
+            && config.subgroup as usize == FRAGMENT_LANES)
+            .then_some((config.layout, config.waves))
+    }
+
+    /// Every tiling [`Self::choose`] weighs for `shape` on `caps`.
     pub(crate) fn candidates(
-        k: usize,
-        layout: WeightLayout,
-        terms: StagedTerms,
+        shape: TiledShape,
         caps: &poot_target::DeviceCaps,
     ) -> impl Iterator<Item = Self> + '_ {
         let launch = caps.gemm_launch();
-        let run = RunLength::dividing(k);
-        [launch.register_lane_edge, launch.register_lane_edge_wide]
+        let run = RunLength::dividing(shape.k);
+        let scalar = [launch.register_lane_edge, launch.register_lane_edge_wide]
             .into_iter()
             .flat_map(move |lanes| {
                 LANE_ROWS.into_iter().flat_map(move |rows| {
-                    LANE_COLS.into_iter().map(move |cols| Self {
-                        lanes: TileSize(lanes),
-                        rows: LaneRows(rows),
-                        cols: MicroCols::new(cols),
-                        run,
+                    LANE_COLS.into_iter().map(move |cols| {
+                        Self::scalar(TileSize(lanes), LaneRows(rows), MicroCols::new(cols), run)
                     })
                 })
-            })
-            .filter(move |tiling| tiling.runs_on(layout, terms, caps))
+            });
+        let fragment = shape
+            .terms
+            .fragment
+            .and_then(|dtype| Some((dtype, Self::fragment_config(dtype, caps)?)))
+            .into_iter()
+            .flat_map(move |(dtype, (layout, waves))| {
+                WAVE_GRIDS.into_iter().flat_map(move |(waves_m, waves_n)| {
+                    WAVE_FRAGMENTS.into_iter().flat_map(move |rows| {
+                        WAVE_FRAGMENTS.into_iter().filter_map(move |cols| {
+                            (rows * cols <= MAX_WAVE_FRAGMENTS && waves_m * waves_n <= waves)
+                                .then_some(Self {
+                                    owners_m: TileSize(waves_m),
+                                    owners_n: TileSize(waves_n),
+                                    micro: MicroTile::Fragment(FragmentTile {
+                                        dtype,
+                                        layout,
+                                        rows,
+                                        cols,
+                                    }),
+                                    run,
+                                })
+                        })
+                    })
+                })
+            });
+        scalar
+            .chain(fragment)
+            .filter(move |tiling| tiling.runs_on(shape, caps))
     }
 
-    /// Whether `caps` runs this tiling over a weight stored in `layout`: its workgroup fits, its two staged tiles
-    /// fit the LDS and stage in whole slots, and its register tile is at most [`MAX_LANE_ACCUMULATORS`].
-    fn runs_on(
-        self,
-        layout: WeightLayout,
-        terms: StagedTerms,
-        caps: &poot_target::DeviceCaps,
-    ) -> bool {
-        let lanes = self.lanes();
-        let lane_count = lanes * lanes;
-        let micro = self.micro_tile();
-        self.rows.get() * self.cols.get() <= MAX_LANE_ACCUMULATORS
+    /// Whether `caps` runs this tiling over `shape`: its workgroup fits, its staged tiles (and the scratch an
+    /// `Opaque` fragment spills to) fit the LDS and stage in whole slots, and a scalar register tile is at most
+    /// [`MAX_LANE_ACCUMULATORS`].
+    fn runs_on(self, shape: TiledShape, caps: &poot_target::DeviceCaps) -> bool {
+        let lane_count = self.workgroup_lanes();
+        let accumulators = match self.micro {
+            MicroTile::Scalar { rows, cols } => rows.get() * cols.get(),
+            MicroTile::Fragment(_) => 0,
+        };
+        accumulators <= MAX_LANE_ACCUMULATORS
             && lane_count <= caps.max_workgroup_invocations as usize
             && lane_count <= caps.max_workgroup_size[0] as usize
-            && tiled::lds_bytes(lanes, micro, terms) <= caps.lds_bytes as usize
-            && tiled::stages_evenly(lanes, micro, self.run.get() as usize, layout)
+            && tiled::lds_bytes(self.launch_shape(), shape.layout, shape.terms)
+                <= caps.lds_bytes as usize
+            && tiled::stages_evenly(self.launch_shape(), self.run.get() as usize, shape.layout)
+    }
+
+    fn run(self) -> RunLength {
+        self.run
+    }
+
+    fn launch_shape(self) -> tiled::LaunchShape {
+        tiled::LaunchShape {
+            owners: (self.owners_m.get() as usize, self.owners_n.get() as usize),
+            micro: self.micro,
+        }
     }
 
     /// The modelled time of `shape` under this tiling, in FMA issues of one lane per staged `K` value (`K` is
     /// common to every tiling, so it is left out).
     ///
-    /// One lane's work per `K` value is its [`FMA_COST`]s, [`LDS_READ_COST`]s and its share of the tile's
-    /// staged values ([`STAGED_VALUE_COST`]), once per `K` pass of the tile ([`TiledShape::passes_per_tile`]: more
-    /// than one for a tile whose rows read several experts). The device runs `caps.compute_units` units, each saturated by
+    /// One lane's work per `K` value is its [`FMA_COST`]s (a scalar tile) or its share of the fragment multiplies
+    /// ([`WMMA_COST`] per 16 values), its [`LDS_READ_COST`]s and its share of the tile's staged values
+    /// ([`STAGED_VALUE_COST`]), once per `K` pass of the tile ([`TiledShape::passes_per_tile`]: more than one for a
+    /// tile whose rows read several experts). The device runs `caps.compute_units` units, each saturated by
     /// `caps.gemm_launch().saturating_lanes` resident lanes: the launch's lanes (padded up to whole tiles: a
     /// ragged edge computes the full tile) share them, so the time is the lane step times the launch's lanes over
     /// the device's saturating lanes, but never less than one lane's own sequence of steps. This is what makes a
@@ -334,12 +448,25 @@ impl RegisterTiling {
     /// least per FMA.
     fn cost(self, shape: TiledShape, caps: &poot_target::DeviceCaps) -> f64 {
         let (tile_rows, tile_cols) = self.output_tile();
-        let lane_count = (self.lanes() * self.lanes()) as f64;
-        let (rows, cols) = (f64::from(self.rows.get()), f64::from(self.cols.get()));
+        let lane_count = self.workgroup_lanes() as f64;
         let staged_per_lane = (tile_rows + tile_cols) as f64 / lane_count;
-        let lane_step = (rows * cols * FMA_COST
-            + (rows + cols) * LDS_READ_COST
-            + staged_per_lane * STAGED_VALUE_COST)
+        let (compute, reads) = match self.micro {
+            MicroTile::Scalar { rows, cols } => {
+                let (rows, cols) = (f64::from(rows.get()), f64::from(cols.get()));
+                (rows * cols * FMA_COST, (rows + cols) * LDS_READ_COST)
+            }
+            MicroTile::Fragment(tile) => {
+                // A fragment multiply per 16 values, and a lane loads 16 values of each operand fragment: two
+                // vector reads per fragment.
+                let kappa = self.micro.kappa() as f64;
+                let loads = f64::from(tile.rows + tile.cols) * FRAGMENT_LOAD_READS;
+                (
+                    f64::from(tile.rows * tile.cols) * WMMA_COST / kappa,
+                    loads * LDS_READ_COST / kappa,
+                )
+            }
+        };
+        let lane_step = (compute + reads + staged_per_lane * STAGED_VALUE_COST)
             * shape.passes_per_tile(tile_rows);
         let tiles = shape.blocks
             * shape.m_per_block.div_ceil(tile_rows)
@@ -351,41 +478,36 @@ impl RegisterTiling {
 
     /// The schedule that runs this tiling.
     pub fn schedule(self) -> Schedule {
-        Schedule::RegisterTiled {
-            lanes: self.lanes,
-            rows: self.rows,
-            cols: self.cols,
-            run: self.run,
+        match self.micro {
+            MicroTile::Scalar { rows, cols } => Schedule::RegisterTiled {
+                lanes: self.owners_m,
+                rows,
+                cols,
+                run: self.run,
+            },
+            MicroTile::Fragment(tile) => Schedule::FragmentTiled {
+                waves_m: self.owners_m,
+                waves_n: self.owners_n,
+                tile,
+                run: self.run,
+            },
         }
     }
 
-    /// The edge of the square lane grid one workgroup runs.
-    pub fn lanes(self) -> usize {
-        self.lanes.get() as usize
+    /// The lanes of the workgroup that computes one output tile.
+    pub fn workgroup_lanes(self) -> usize {
+        self.owners_m.get() as usize * self.owners_n.get() as usize * self.micro.owner_lanes()
     }
 
     /// The `(rows, columns)` of the output tile one workgroup computes.
     pub fn output_tile(self) -> (usize, usize) {
-        Self::output_tile_of(self.lanes, self.rows, self.cols)
+        self.micro
+            .output_tile(self.owners_m.get() as usize, self.owners_n.get() as usize)
     }
 
     fn outputs_per_tile(self) -> usize {
         let (rows, cols) = self.output_tile();
         rows * cols
-    }
-
-    fn micro_tile(self) -> MicroTile {
-        Self::micro_tile_of(self.rows, self.cols)
-    }
-
-    fn output_tile_of(lanes: TileSize, rows: LaneRows, cols: MicroCols) -> (usize, usize) {
-        let lanes = lanes.get() as usize;
-        Self::micro_tile_of(rows, cols).output_tile(lanes, lanes)
-    }
-
-    /// The micro-tile each lane of a tiling with `rows x cols` per lane accumulates.
-    pub(super) const fn micro_tile_of(rows: LaneRows, cols: MicroCols) -> MicroTile {
-        MicroTile::Scalar { rows, cols }
     }
 }
 
@@ -425,8 +547,8 @@ mod tests {
         ] {
             let tiling = RegisterTiling::choose(shape(2048, 1024, 3072), &caps);
             assert_eq!(
-                (tiling.lanes(), tiling.output_tile()),
-                (16, (128, 128)),
+                (tiling.workgroup_lanes(), tiling.output_tile()),
+                (256, (128, 128)),
                 "{tiling:?}"
             );
         }
@@ -484,8 +606,8 @@ mod tests {
             &poot_target::DeviceCaps::rocm_default(),
         );
         assert_eq!(
-            (tiling.lanes(), tiling.output_tile()),
-            (8, (16, 32)),
+            (tiling.workgroup_lanes(), tiling.output_tile()),
+            (64, (16, 32)),
             "{tiling:?}"
         );
     }
@@ -501,20 +623,20 @@ mod tests {
             ..poot_target::DeviceCaps::rocm_default()
         };
         assert!(
-            RegisterTiling::candidates(1024, WeightLayout::Nk, StagedTerms::ONE, &small_workgroup)
-                .all(|tiling| tiling.lanes() == 8)
+            RegisterTiling::candidates(shape(512, 1024, 1024), &small_workgroup)
+                .all(|tiling| tiling.workgroup_lanes() == 64)
         );
         let small_lds = poot_target::DeviceCaps {
             lds_bytes: 8 * 1024,
             ..poot_target::DeviceCaps::rocm_default()
         };
         let offered: Vec<RegisterTiling> =
-            RegisterTiling::candidates(1024, WeightLayout::Nk, StagedTerms::ONE, &small_lds)
-                .collect();
+            RegisterTiling::candidates(shape(512, 1024, 1024), &small_lds).collect();
         assert!(!offered.is_empty());
         for tiling in offered {
             assert!(
-                tiled::lds_bytes(tiling.lanes(), tiling.micro_tile(), StagedTerms::ONE) <= 8 * 1024,
+                tiled::lds_bytes(tiling.launch_shape(), WeightLayout::Nk, StagedTerms::ONE)
+                    <= 8 * 1024,
                 "{tiling:?}"
             );
         }

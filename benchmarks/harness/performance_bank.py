@@ -41,6 +41,7 @@ CLAIM_STATUSES = ("verified", "missing", "refused")
 # against itself on another backend or path) is a different claim and does not back a speed receipt.
 INDEPENDENT_REFERENCE = "independent-golden"
 KERNEL_METRIC = "step_us"
+DEVICE_METRIC = "device_us"
 BASELINE_ROLE = "baseline"
 
 _SHA256_HEX = set("0123456789abcdef")
@@ -261,6 +262,25 @@ def receipt_errors(bank, case, backend, receipt):
         value = repeat.get("metrics", {}).get(KERNEL_METRIC)
         if repeat.get("status") != "ok" or not (receipts.is_finite(value) and value > 0):
             errors.append(f"repeat {index} is not a finite successful {KERNEL_METRIC} sample: {repeat!r}")
+    errors.extend(device_cell_errors(receipt, len(repeats)))
+    return errors
+
+
+def device_cell_errors(receipt, wall_repeats):
+    """Why the receipt's optional `device` cell (the device-clock time of the same steps, beside the wall
+    `kernel` cell) is malformed; empty when it is sound or absent. A device that reports no timestamps
+    records no cell: an absent cell is not a zero."""
+    cell = receipt.get("cells", {}).get("device")
+    if cell is None:
+        return []
+    repeats = cell.get("repeats", [])
+    errors = []
+    if len(repeats) != wall_repeats:
+        errors.append(f"the device cell has {len(repeats)} repeats beside {wall_repeats} wall repeats")
+    for index, repeat in enumerate(repeats):
+        value = repeat.get("metrics", {}).get(DEVICE_METRIC)
+        if repeat.get("status") != "ok" or not (receipts.is_finite(value) and value > 0):
+            errors.append(f"device repeat {index} is not a finite successful {DEVICE_METRIC} sample: {repeat!r}")
     return errors
 
 
@@ -332,13 +352,23 @@ def work_flop(case):
 
 
 def throughput_of(case, receipt):
-    """`tflop_per_s` of a receipt: the case's work over its median repeat, or `None` when the case has no FLOP
-    model. Derived, like the spread, so the manifest states it and validation recomputes it."""
+    """`tflop_per_s` of a receipt: the case's work over its median wall repeat, and `device_tflop_per_s`: the
+    same work over the median device-clock repeat, which judges the kernel without the readback. Each is
+    `None` when the case has no FLOP model, or (device) when the receipt has no device cell. Derived, like
+    the spread, so the manifest states it and validation recomputes it."""
     flop = work_flop(case)
+    device_cell = receipt["cells"].get("device")
     if flop is None:
-        return {"tflop_per_s": None}
-    median_us = statistics.median(r["metrics"][KERNEL_METRIC] for r in receipt["cells"]["kernel"]["repeats"])
-    return {"tflop_per_s": round(flop / (median_us * 1e-6) / 1e12, 4)}
+        return {"tflop_per_s": None, "device_tflop_per_s": None}
+
+    def tflops(cell, metric):
+        median_us = statistics.median(r["metrics"][metric] for r in cell["repeats"])
+        return round(flop / (median_us * 1e-6) / 1e12, 4)
+
+    return {
+        "tflop_per_s": tflops(receipt["cells"]["kernel"], KERNEL_METRIC),
+        "device_tflop_per_s": tflops(device_cell, DEVICE_METRIC) if device_cell else None,
+    }
 
 
 def derived_of(case, receipt):

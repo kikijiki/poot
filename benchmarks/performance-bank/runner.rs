@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
+use poot_executor::{Device, DeviceTime, Engine, Executor, NoSync, StepInputs};
 use poot_graph_ir::test_support::const_weights::ConstWeights;
-use poot_graph_ir::{Builder, Graph, TensorType, ops};
+use poot_graph_ir::{Builder, FragmentDtype, Graph, MatmulPrecision, TensorType, ops};
 use poot_graph_plan::staged::{
     DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram, TargetSet, compile_staged,
 };
@@ -29,6 +29,11 @@ use serde_json::{Value, json};
 /// Largest `|got - want|` allowed against the f64 reference, relative to `1 + |want|`: f32 accumulation
 /// over a few thousand terms, reassociated differently by each backend's schedule.
 const REFERENCE_TOLERANCE: f64 = 2e-3;
+
+/// The same bound for a case whose operands are narrowed: a matrix unit sums its products in its own order and
+/// width (the measured residual against the rounding reference is a few times the f32 schedules'), so the
+/// elementwise bound near zero is the narrow-storage class's (ADR-0101), not the f32 schedules'.
+const NARROW_REFERENCE_TOLERANCE: f64 = 5e-3;
 
 struct Args {
     bank: PathBuf,
@@ -84,6 +89,65 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The operand rounding a case declares in `numerics.operand_precision` (`"exact"`, or `"narrow"`: operands enter
+/// the products rounded to the fragment dtype of the backend's matrix unit, accumulated in f32). The dtype is the
+/// backend's: bf16 where the unit takes it (ROCm, PTX), f16 on the Vulkan cooperative matrix. A narrow case
+/// compares with a reference that rounds the same operands, so its tolerance is the narrow-storage one ([`NARROW_REFERENCE_TOLERANCE`]).
+#[derive(Clone, Copy)]
+struct Operands {
+    narrow: Option<FragmentDtype>,
+}
+
+impl Operands {
+    fn of(backend: &str, case: &Value) -> Result<Self, String> {
+        let narrow = match case["numerics"]["operand_precision"].as_str() {
+            None | Some("exact") => None,
+            Some("narrow") => Some(if backend == "wgpu" {
+                FragmentDtype::F16
+            } else {
+                FragmentDtype::Bf16
+            }),
+            Some(other) => return Err(format!("unknown operand_precision {other:?}")),
+        };
+        Ok(Self { narrow })
+    }
+
+    fn tolerance(self) -> f64 {
+        match self.narrow {
+            Some(_) => NARROW_REFERENCE_TOLERANCE,
+            None => REFERENCE_TOLERANCE,
+        }
+    }
+
+    fn policy(self) -> MatmulPrecision {
+        match self.narrow {
+            Some(_) => MatmulPrecision::Narrow,
+            None => MatmulPrecision::Exact,
+        }
+    }
+
+    /// `v` as the products read it: rounded to nearest even to the fragment dtype, written here from the format
+    /// definitions and sharing no code with the engine.
+    fn round(self, v: f32) -> f64 {
+        match self.narrow {
+            None => f64::from(v),
+            Some(FragmentDtype::Bf16) => {
+                let bits = v.to_bits();
+                let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff_0000;
+                f64::from(f32::from_bits(rounded))
+            }
+            Some(FragmentDtype::F16) => {
+                // The inputs are in [-1, 1): a binary16 has a 2^-24 grid below 2^-14 and 11 significant bits
+                // above it.
+                let magnitude = f64::from(v.abs());
+                let exponent = magnitude.max(2f64.powi(-14)).log2().floor();
+                let step = 2f64.powf(exponent - 10.0);
+                (magnitude / step).round_ties_even() * step * f64::from(v.signum())
+            }
+        }
+    }
+}
+
 /// One case ready to run: graphs (one per weight copy), their consts, and the reference output per copy.
 struct Prepared {
     graphs: Vec<Graph>,
@@ -110,7 +174,7 @@ fn weight_copies(bank: &Value, case: &Value, weight_bytes: usize) -> Result<usiz
     }
 }
 
-fn dense_matmul(bank: &Value, case: &Value) -> Result<Prepared, String> {
+fn dense_matmul(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String> {
     let shape = &case["shape"];
     let (m, k, n) = (dim(shape, "m")?, dim(shape, "k")?, dim(shape, "n")?);
     let copies = weight_copies(bank, case, k * n * 4)?;
@@ -120,6 +184,7 @@ fn dense_matmul(bank: &Value, case: &Value) -> Result<Prepared, String> {
             .ok_or("fixture has no seed")?,
     );
     let x = stream.tensor(m * k);
+    let x_read: Vec<f64> = x.iter().map(|&v| ops.round(v)).collect();
     let mut consts = vec![("x".to_string(), HostTensor::f32(vec![m, k], x.clone()))];
     let (mut graphs, mut references) = (Vec::new(), Vec::new());
     for copy in 0..copies {
@@ -127,9 +192,9 @@ fn dense_matmul(bank: &Value, case: &Value) -> Result<Prepared, String> {
         let mut want = vec![0.0f64; m * n];
         for row in 0..m {
             for kk in 0..k {
-                let a = f64::from(x[row * k + kk]);
+                let a = x_read[row * k + kk];
                 for (col, acc) in want[row * n..(row + 1) * n].iter_mut().enumerate() {
-                    *acc += a * f64::from(w[kk * n + col]);
+                    *acc += a * ops.round(w[kk * n + col]);
                 }
             }
         }
@@ -308,7 +373,7 @@ fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
 /// (`MatMul(x, Transpose(w))`, which compile folds into one `DenseContraction` reading `w` as stored). The
 /// f32 activation `x` is `[M, K]`. Each weight is the fixture's f32 draw truncated to its top 16 bits, so the
 /// stored BF16 value is exact and the reference reads it back by the same bit shift, with no engine code.
-fn dense_contraction(bank: &Value, case: &Value) -> Result<Prepared, String> {
+fn dense_contraction(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String> {
     let shape = &case["shape"];
     let (m, k, n) = (dim(shape, "m")?, dim(shape, "k")?, dim(shape, "n")?);
     if case["storage"] != "bf16" || case["layout"] != "nk" {
@@ -321,6 +386,7 @@ fn dense_contraction(bank: &Value, case: &Value) -> Result<Prepared, String> {
             .ok_or("fixture has no seed")?,
     );
     let x = stream.tensor(m * k);
+    let x_read: Vec<f64> = x.iter().map(|&v| ops.round(v)).collect();
     let mut consts = vec![("x".to_string(), HostTensor::f32(vec![m, k], x.clone()))];
     let (mut graphs, mut references) = (Vec::new(), Vec::new());
     for copy in 0..copies {
@@ -331,16 +397,16 @@ fn dense_contraction(bank: &Value, case: &Value) -> Result<Prepared, String> {
             .collect();
         let w: Vec<f64> = words
             .iter()
-            .map(|&bits| f64::from(f32::from_bits(u32::from(bits) << 16)))
+            .map(|&bits| ops.round(f32::from_bits(u32::from(bits) << 16)))
             .collect();
         let mut want = vec![0.0f64; m * n];
         for row in 0..m {
-            let xs = &x[row * k..(row + 1) * k];
+            let xs = &x_read[row * k..(row + 1) * k];
             for (col, acc) in want[row * n..(row + 1) * n].iter_mut().enumerate() {
                 *acc = xs
                     .iter()
                     .zip(&w[col * k..(col + 1) * k])
-                    .map(|(&a, &b)| f64::from(a) * b)
+                    .map(|(&a, &b)| a * b)
                     .sum();
             }
         }
@@ -712,7 +778,7 @@ fn delta_rule_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
     })
 }
 
-fn prepare(bank: &Value, case: &Value) -> Result<Prepared, String> {
+fn prepare(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String> {
     let generator = &bank["token_fixtures"][case["token_fixture"]
         .as_str()
         .ok_or("case has no token_fixture")?]["generator"];
@@ -720,8 +786,8 @@ fn prepare(bank: &Value, case: &Value) -> Result<Prepared, String> {
         return Err(format!("unsupported token fixture generator {generator}"));
     }
     match case["producer"].as_str() {
-        Some("dense_matmul") => dense_matmul(bank, case),
-        Some("dense_contraction") => dense_contraction(bank, case),
+        Some("dense_matmul") => dense_matmul(bank, case, ops),
+        Some("dense_contraction") => dense_contraction(bank, case, ops),
         Some("attention_decode") => attention_decode(bank, case),
         Some("attention_prefill") => attention_prefill(bank, case),
         Some("recurrence_scan") => recurrence_scan(bank, case),
@@ -729,7 +795,7 @@ fn prepare(bank: &Value, case: &Value) -> Result<Prepared, String> {
     }
 }
 
-fn staged(g: &Graph, target: Target) -> Result<StagedProgram, String> {
+fn staged(g: &Graph, target: Target, policy: MatmulPrecision) -> Result<StagedProgram, String> {
     compile_staged(
         &g.clone(),
         &TargetSet::single(DeviceId(0), target),
@@ -737,7 +803,8 @@ fn staged(g: &Graph, target: Target) -> Result<StagedProgram, String> {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(policy),
     )
     .map_err(|e| format!("compile_staged: {e}"))
 }
@@ -755,13 +822,13 @@ fn plan_of(program: &StagedProgram) -> Vec<String> {
         .collect()
 }
 
-fn reference_check(got: &[f32], want: &[f64]) -> (f64, bool) {
+fn reference_check(got: &[f32], want: &[f64], tolerance: f64) -> (f64, bool) {
     let mut worst = 0.0f64;
     let mut agrees = got.len() == want.len();
     for (g, w) in got.iter().zip(want) {
         let err = (f64::from(*g) - w).abs() / (1.0 + w.abs());
         // NaN never agrees (ADR-0101).
-        if err.is_nan() || err > REFERENCE_TOLERANCE {
+        if err.is_nan() || err > tolerance {
             agrees = false;
         }
         worst = worst.max(if err.is_nan() { f64::INFINITY } else { err });
@@ -769,11 +836,30 @@ fn reference_check(got: &[f32], want: &[f64]) -> (f64, bool) {
     (worst, agrees)
 }
 
-fn run_case<D>(backend: &str, device: D, bank: &Value, case: &Value) -> Result<Value, String>
+/// What one device measured of a case: its per-repeat host wall time, the device time of the same steps
+/// when the device reports it, and the realized plan, counters and reference comparison.
+struct Measured {
+    wall_us: Vec<f64>,
+    /// Sum of the step's dispatch durations on the device clock, per repeat; `None` when the device
+    /// reports no timestamps (`DeviceTime::Unknown`), never a fabricated zero.
+    device_us: Option<Vec<f64>>,
+    plan: Vec<String>,
+    worst: f64,
+    agrees: bool,
+    memory: Vec<Value>,
+    recordings: u64,
+    replays: u64,
+}
+
+fn measure<D>(
+    device: D,
+    bank: &Value,
+    prepared: &Prepared,
+    ops: Operands,
+) -> Result<Measured, String>
 where
     D: Device + 'static,
 {
-    let prepared = prepare(bank, case)?;
     let target = device.target();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
 
@@ -798,7 +884,7 @@ where
     let mut entries = Vec::new();
     let mut plan = Vec::new();
     for g in &graphs {
-        let program = staged(g, target)?;
+        let program = staged(g, target, ops.policy())?;
         plan = plan_of(&program);
         entries.push(
             exec.add_entry(exe, &program)
@@ -809,7 +895,8 @@ where
     let timing = &bank["timing_policy"];
     let warmup = timing["warmup"].as_u64().ok_or("timing_policy.warmup")? as usize;
     let repeats = timing["repeats"].as_u64().ok_or("timing_policy.repeats")? as usize;
-    let mut step = |index: usize| -> Result<(f64, HostTensor), String> {
+    // One step: (wall microseconds, device microseconds when the device timed it, the read-back output).
+    let mut step = |index: usize| -> Result<(f64, Option<f64>, HostTensor), String> {
         let entry = entries[index % entries.len()];
         let mut inputs = StepInputs::new();
         for (key, shape, bytes) in &prepared.slots {
@@ -818,12 +905,17 @@ where
             inputs.push(key.clone(), shape, words);
         }
         let started = Instant::now();
-        let output = exec
+        let mut outputs = exec
             .step(exe, entry, &inputs, &mut NoSync)
-            .map_err(|e| format!("step: {e}"))?
-            .to_host()
-            .map_err(|e| format!("read: {e}"))?;
-        Ok((started.elapsed().as_secs_f64() * 1e6, output))
+            .map_err(|e| format!("step: {e}"))?;
+        let device_us = match outputs.device_time() {
+            DeviceTime::Measured(measured) => measured
+                .sum_of_dispatch_durations
+                .map(|sum| sum.as_secs_f64() * 1e6),
+            DeviceTime::Unknown => None,
+        };
+        let output = outputs.to_host().map_err(|e| format!("read: {e}"))?;
+        Ok((started.elapsed().as_secs_f64() * 1e6, device_us, output))
     };
 
     // The first pass over the copies records every entry and checks each copy's output against its own
@@ -831,7 +923,7 @@ where
     let mut worst = 0.0f64;
     let mut agrees = true;
     for (copy, want) in prepared.references.iter().enumerate() {
-        let (_, output) = step(copy)?;
+        let (_, _, output) = step(copy)?;
         if output.shape() != prepared.out_shape.as_slice() {
             return Err(format!(
                 "output shape {:?}, expected {:?}",
@@ -840,18 +932,28 @@ where
             ));
         }
         let got = output.as_f32().ok_or("the output is not F32")?;
-        let (err, ok) = reference_check(got, want);
+        let (err, ok) = reference_check(got, want, ops.tolerance());
         worst = worst.max(err);
         agrees &= ok;
     }
     for index in 0..warmup {
         step(prepared.references.len() + index)?;
     }
-    let mut samples = Vec::with_capacity(repeats);
+    let (mut wall_us, mut device_samples) =
+        (Vec::with_capacity(repeats), Vec::with_capacity(repeats));
     for index in 0..repeats {
-        let (micros, _) = step(prepared.references.len() + warmup + index)?;
-        samples.push(micros);
+        let (wall, device, _) = step(prepared.references.len() + warmup + index)?;
+        wall_us.push(wall);
+        device_samples.push(device);
     }
+    // A device either times every step or none: a partly timed run would mix two populations in one cell.
+    let device_us = if device_samples.iter().all(Option::is_some) {
+        Some(device_samples.into_iter().flatten().collect())
+    } else if device_samples.iter().all(Option::is_none) {
+        None
+    } else {
+        return Err("the device timed some steps and not others".into());
+    };
 
     let stats = exec.stats();
     let memory: Vec<Value> = stats
@@ -859,8 +961,54 @@ where
         .iter()
         .map(|(role, m)| json!({ "role": format!("{role:?}"), "live_bytes": m.live_bytes, "peak_bytes": m.peak_bytes }))
         .collect();
-    let digest = sha256_digest(plan.join("\n").as_bytes()).as_bytes();
+    Ok(Measured {
+        wall_us,
+        device_us,
+        plan,
+        worst,
+        agrees,
+        memory,
+        recordings: stats.recordings,
+        replays: stats.replays,
+    })
+}
+
+/// Measures the case twice: wall time on `wall_device` (built without device timing, so its per-dispatch
+/// timestamp work never lands in the wall numbers) and device time on `timed_device` (built to report
+/// timestamps), each in its own engine. The timed pass's output is checked against the same reference.
+fn run_case<D>(
+    backend: &str,
+    wall_device: D,
+    timed_device: D,
+    bank: &Value,
+    case: &Value,
+) -> Result<Value, String>
+where
+    D: Device + 'static,
+{
+    let ops = Operands::of(backend, case)?;
+    let prepared = prepare(bank, case, ops)?;
+    let wall = measure(wall_device, bank, &prepared, ops)?;
+    let timed = measure(timed_device, bank, &prepared, ops)?;
+    if timed.plan != wall.plan {
+        return Err("the timed device realized a different plan than the wall device".into());
+    }
+    let digest = sha256_digest(wall.plan.join("\n").as_bytes()).as_bytes();
     let exe_path = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let repeat_cell = |metric: &str, samples: &[f64]| {
+        json!({
+            "repeats": samples
+                .iter()
+                .enumerate()
+                .map(|(slot, micros)| json!({ "slot": slot, "status": "ok", "metrics": { metric: micros } }))
+                .collect::<Vec<_>>()
+        })
+    };
+    let mut cells = serde_json::Map::new();
+    cells.insert("kernel".into(), repeat_cell("step_us", &wall.wall_us));
+    if let Some(device_us) = &timed.device_us {
+        cells.insert("device".into(), repeat_cell("device_us", device_us));
+    }
     Ok(json!({
         "schema": 1,
         "case": case["id"],
@@ -873,32 +1021,24 @@ where
         },
         "binary": exe_path.display().to_string(),
         "observed": prepared.observed,
-        "plan": plan,
+        "plan": wall.plan,
         "plan_id": hex(&digest),
         "reference": {
             "provenance": "independent-golden",
             "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
-            "max_relative_error": worst,
-            "tolerance": REFERENCE_TOLERANCE,
-            "agrees": agrees,
+            "max_relative_error": wall.worst.max(timed.worst),
+            "tolerance": ops.tolerance(),
+            "agrees": wall.agrees && timed.agrees,
         },
-        "memory": memory,
-        "recordings": stats.recordings,
-        "replays": stats.replays,
-        "cells": {
-            "kernel": {
-                "repeats": samples
-                    .iter()
-                    .enumerate()
-                    .map(|(slot, micros)| json!({ "slot": slot, "status": "ok", "metrics": { "step_us": micros } }))
-                    .collect::<Vec<_>>()
-            }
-        },
+        "memory": wall.memory,
+        "recordings": wall.recordings,
+        "replays": wall.replays,
+        "cells": cells,
     }))
 }
 
-/// The example's whole `main`: measure the case `--case` of `--bank` on `device` and write `--out`.
-pub(crate) fn run<D>(backend: &str, device: D) -> Result<(), String>
+/// The example's whole `main`: measure the case `--case` of `--bank` on the two devices and write `--out`.
+pub(crate) fn run<D>(backend: &str, wall_device: D, timed_device: D) -> Result<(), String>
 where
     D: Device + 'static,
 {
@@ -917,7 +1057,7 @@ where
             args.case, case["status"]
         ));
     }
-    let receipt = run_case(backend, device, &bank, case)?;
+    let receipt = run_case(backend, wall_device, timed_device, &bank, case)?;
     if let Some(dir) = Path::new(&args.out).parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }

@@ -6,7 +6,10 @@
 //! production build.
 
 use poot_target::dram_channels::DramChannels;
-use poot_target::{Backend, DeviceCaps, Queried, ShaderFeatures, SubgroupSupport};
+use poot_target::{
+    Backend, CooperativeMatrixConfig, DeviceCaps, FragmentConfig, FragmentShape, MatrixUnits,
+    Queried, ShaderFeatures, SubgroupSupport,
+};
 
 /// The [`DeviceCaps`] a test should use for a given [`Backend`] when it has no real measured device to
 /// thread through: the values this box's own wgpu/RADV device measured (card 522), and the documented
@@ -42,6 +45,17 @@ pub fn vulkan_rdna3_igpu() -> DeviceCaps {
             atomic_float32: false,
             ..ShaderFeatures::ALL
         },
+        // Raw Vulkan requires 32-lane subgroups of its cooperative-matrix pipelines, so a workgroup runs
+        // several fragment collectives.
+        matrix_units: Queried::Known(MatrixUnits::cooperative_matrix(
+            [CooperativeMatrixConfig {
+                shape: FragmentShape::M16N16K16,
+                ab_f16: true,
+                result_f32: true,
+            }],
+            32,
+            FragmentConfig::ANY_WAVES,
+        )),
         ..DeviceCaps::wgpu_rdna3_igpu()
     }
 }

@@ -495,7 +495,7 @@ fn plan_indexed(
                     k,
                     layout: WeightLayout::Nk,
                     segments: experts,
-                    terms: poot_kernelgen::StagedTerms::of(precision, None, None),
+                    terms: poot_kernelgen::StagedTerms::of(precision, None, None).scalar_only(),
                 },
                 caps,
             )?;
@@ -1211,8 +1211,8 @@ mod tests {
             &tiny_grid_caps(),
         );
         assert_eq!(
-            (tiling.lanes(), tiling.output_tile()),
-            (8, (16, 32)),
+            (tiling.workgroup_lanes(), tiling.output_tile()),
+            (64, (16, 32)),
             "the fixture's tile"
         );
         let (graph, index) = over_cap_tiled_eqn(1, m, out);

@@ -6,14 +6,21 @@
 //! device compiles: the flash attention recognizer, the attention schedules and the scalar rounding of Q, K, V and
 //! the probabilities are what the row runs.
 
-use poot_graph_ir::{AttentionAttrs, Builder, OpKind, Operand, OperandPrecision, TensorType};
+use poot_graph_ir::{
+    AttentionAttrs, Builder, MatmulPrecision, OpKind, Operand, OperandPrecision, TensorType,
+};
 use poot_tensor::{DType, HostTensor};
 
 use crate::{Fixture, const_fixture};
 
-const HQ: usize = 4;
-const HKV: usize = 2;
-const D: usize = 16;
+/// Query heads, key/value heads and head width of the small fixtures; [`FRAGMENT_HEADS`] is the shape whose rows
+/// fill a tiled fragment attention.
+type Heads = (usize, usize, usize);
+const SMALL_HEADS: Heads = (4, 2, 16);
+/// 16 query heads over 4 key/value heads of width 64: four query heads per key/value head pack a block of four
+/// positions into the 16 rows of a fragment, and 160 positions give a device's compute units more blocks than it
+/// has.
+const FRAGMENT_HEADS: Heads = (16, 4, 64);
 
 fn centered(seed: u64, n: usize, scale: f32) -> Vec<f32> {
     let mut s = seed | 1;
@@ -35,30 +42,50 @@ fn causal_mask(lq: usize, lk: usize) -> Vec<f32> {
 }
 
 /// One attention equation over an F32 query and an F16 key/value cache (the engine's default KV dtype), reading
-/// its operands as `precision` says: a decode row against a 64-key cache, and a 33-row causal prefill. Both hold
-/// the keys and values as F16 constants, so the K and V a `Narrow(f16)` product reads are exact in the fragment
-/// dtype and only Q and the probabilities round.
+/// its operands as `precision` says: a decode row against a 64-key cache, a 33-row causal prefill, and a 160-row
+/// prefill of 16 heads whose rows share staged key blocks on the matrix unit of a device that has one (POOT-1437).
+/// All hold the keys and values as F16 constants, so the K and V a `Narrow(f16)` product reads are exact in the
+/// fragment dtype and only Q and the probabilities round.
 pub fn attention_fixtures(precision: OperandPrecision) -> Vec<Fixture> {
     [
-        ("attention_decode", 1usize, 64usize),
-        ("attention_prefill", 33, 33),
+        (
+            "attention_decode",
+            SMALL_HEADS,
+            1usize,
+            64usize,
+            (40.0, 4.0),
+        ),
+        ("attention_prefill", SMALL_HEADS, 33, 33, (40.0, 4.0)),
+        // Soft scores and small values: the probabilities of a key block are rounded against the running maximum, the
+        // oracle's against the final one, so the two differ by a bf16 ulp of the probabilities, times the values, in
+        // the output (6e-3 at values of 2 over 160 keys, outside the 5e-3 class).
+        (
+            "attention_prefill_fragment",
+            FRAGMENT_HEADS,
+            160,
+            160,
+            (4.0, 1.0),
+        ),
     ]
     .into_iter()
-    .map(|(name, lq, lk)| attention_fixture(name, precision, lq, lk))
+    .map(|(name, heads, lq, lk, scales)| {
+        attention_fixture(name, precision, heads, (lq, lk), scales)
+    })
     .collect()
 }
 
 fn attention_fixture(
     name: &'static str,
     precision: OperandPrecision,
-    lq: usize,
-    lk: usize,
+    (hq, hkv, d): Heads,
+    (lq, lk): (usize, usize),
+    (q_scale, kv_scale): (f32, f32),
 ) -> Fixture {
     let b = Builder::for_tests();
     let q = b
-        .constant("q", TensorType::f32(vec![1, HQ, lq, D]))
+        .constant("q", TensorType::f32(vec![1, hq, lq, d]))
         .unwrap();
-    let kv_type = TensorType::new(vec![1, HKV, lk, D], DType::F16);
+    let kv_type = TensorType::new(vec![1, hkv, lk, d], DType::F16);
     let k = b.constant("k", kv_type.clone()).unwrap();
     let v = b.constant("v", kv_type).unwrap();
     let mask = b
@@ -69,7 +96,7 @@ fn attention_fixture(
         .equation(
             OpKind::Attention(AttentionAttrs {
                 precision,
-                ..AttentionAttrs::new(HQ / HKV, 0.25, None)
+                ..AttentionAttrs::new(hq / hkv, 0.25, None)
             }),
             [q, k, v, mask].map(|t| Operand::Value(t.id())).to_vec(),
         )
@@ -80,8 +107,8 @@ fn attention_fixture(
     let graph = b.finish(out).unwrap();
     let f16 = |seed, n| {
         HostTensor::f16(
-            vec![1, HKV, lk, D],
-            centered(seed, n, 4.0)
+            vec![1, hkv, lk, d],
+            centered(seed, n, kv_scale)
                 .into_iter()
                 .map(poot_quant::scalar::f32_to_f16)
                 .collect::<Vec<u16>>(),
@@ -93,10 +120,10 @@ fn attention_fixture(
         vec![
             (
                 "q",
-                HostTensor::f32(vec![1, HQ, lq, D], centered(11, HQ * lq * D, 40.0)),
+                HostTensor::f32(vec![1, hq, lq, d], centered(11, hq * lq * d, q_scale)),
             ),
-            ("k", f16(12, HKV * lk * D)),
-            ("v", f16(13, HKV * lk * D)),
+            ("k", f16(12, hkv * lk * d)),
+            ("v", f16(13, hkv * lk * d)),
             (
                 "mask",
                 HostTensor::f32(vec![1, 1, lq, lk], causal_mask(lq, lk)),
@@ -142,4 +169,39 @@ pub fn run_parity_declared(
         crate::run_parity_under(exec, target, fixture, policy, &mut oracle)?;
     }
     Ok(())
+}
+
+/// The fragment micro-tile the planner picks for the `attention_prefill_fragment` fixture of `precision` on the device
+/// `exec` drives, or an error naming the schedule it picked instead: the row that proves the parity run exercised the
+/// matrix unit and not the register tiles.
+pub fn planned_fragment_attention(
+    exec: &dyn poot_executor::Executor,
+    target: poot_graph_plan::Target,
+    precision: OperandPrecision,
+) -> Result<poot_kernelgen::AttentionMicro, String> {
+    use poot_kernelgen::{AttentionMicro, AttentionSchedule, KernelRequest};
+    let fixture = attention_fixtures(precision)
+        .into_iter()
+        .find(|fixture| fixture.name == "attention_prefill_fragment")
+        .expect("the fragment fixture");
+    let staged = crate::staged_under(exec, &fixture, target, MatmulPrecision::Exact);
+    let (_, _, program) = staged.stages().next().ok_or("no stage")?;
+    let (eqn, _) = program
+        .planned()
+        .find(|(eqn, _)| matches!(eqn.op, OpKind::Attention(_)))
+        .ok_or("no attention equation")?;
+    let spec = match program.kernel_choice(eqn) {
+        poot_graph_plan::KernelChoice::Generated(KernelRequest::Attention(spec)) => spec.clone(),
+        poot_graph_plan::KernelChoice::Generated(KernelRequest::AttentionRows(rows)) => {
+            rows.spec.clone()
+        }
+        other => return Err(format!("not a generated attention: {other:?}")),
+    };
+    match spec.schedule {
+        AttentionSchedule::Tiled {
+            micro: micro @ AttentionMicro::Fragment { .. },
+            ..
+        } => Ok(micro),
+        other => Err(format!("the planner picked {other:?}, not fragments")),
+    }
 }

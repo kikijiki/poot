@@ -1215,7 +1215,7 @@ fn tiled(
             br,
             bc,
             lanes,
-            micro: kg::AttentionMicro {
+            micro: kg::AttentionMicro::Scalar {
                 score: tile(score),
                 out: tile(out),
             },

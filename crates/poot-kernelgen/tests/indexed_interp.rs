@@ -99,14 +99,14 @@ fn run_indexed(
     };
     let (grid, x_groups) = match schedule {
         kg::Schedule::Gemv { .. } => ([schedule.grid_threads(1, m, N) as u32, 1, 1], 0),
-        kg::Schedule::RegisterTiled { lanes, .. } => {
+        kg::Schedule::RegisterTiled { .. } | kg::Schedule::FragmentTiled { .. } => {
             let (tile_rows, tile_cols) = schedule.output_tile().unwrap();
             let tiles = (m.div_ceil(tile_rows) * N.div_ceil(tile_cols)) as u32;
-            let lanes = lanes.get();
+            let lanes = kg::RegisterTiling::of(schedule).unwrap().workgroup_lanes() as u32;
             // A folded grid when asked: `x_groups` tiles along X and as many rows of them as cover the rest.
             let x_groups = x_groups.unwrap_or(tiles);
             let y_groups = tiles.div_ceil(x_groups);
-            ([x_groups * lanes * lanes, y_groups, 1], x_groups)
+            ([x_groups * lanes, y_groups, 1], x_groups)
         }
     };
     let request =

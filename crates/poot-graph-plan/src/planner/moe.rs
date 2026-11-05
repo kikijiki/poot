@@ -198,7 +198,8 @@ fn plan_indexed(
                     k,
                     layout,
                     segments: experts,
-                    terms: kg::StagedTerms::of(precision, None, kg::stored_fragment_dtype(weight)),
+                    terms: kg::StagedTerms::of(precision, None, kg::stored_fragment_dtype(weight))
+                        .scalar_only(),
                 },
                 caps,
             )?;

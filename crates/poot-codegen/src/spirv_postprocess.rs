@@ -775,13 +775,44 @@ pub(crate) fn fix_coopmat_calls(words: Vec<u32>) -> Vec<u32> {
             *cast_uses.entry(pointer).or_default() += 1;
         }
     }
+    // The uses of every pointer cast, counted as operands of the instructions of function bodies: the module
+    // header and the types and constants hold literals (an array length, say) that equal an id by chance, and a
+    // value-level scan would count them as uses and keep a dead cast the validator then rejects.
+    let mut body_uses: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut at = 5;
+    let mut in_function = false;
+    while at < words.len() {
+        let header = words[at];
+        let wc = (header >> 16) as usize;
+        let op = (header & 0xFFFF) as u16;
+        if wc == 0 {
+            break;
+        }
+        in_function |= op == OP_FUNCTION;
+        // Opcodes with literal operands among the instructions of a function body: a composite index, a switch
+        // case, an extended instruction's number, a loop's control mask.
+        const OP_EXT_INST: u16 = 12;
+        const OP_COMPOSITE_EXTRACT: u16 = 81;
+        const OP_COMPOSITE_INSERT: u16 = 82;
+        const OP_LOOP_MERGE: u16 = 246;
+        const OP_SWITCH: u16 = 251;
+        let literal_operands = matches!(
+            op,
+            OP_EXT_INST | OP_COMPOSITE_EXTRACT | OP_COMPOSITE_INSERT | OP_LOOP_MERGE | OP_SWITCH
+        );
+        if in_function && !literal_operands {
+            for &word in &words[at + 1..at + wc] {
+                if cast_uses.contains_key(&word) {
+                    *body_uses.entry(word).or_default() += 1;
+                }
+            }
+        }
+        at += wc;
+    }
     for (&cast, &uses) in &cast_uses {
         let (span, _) = pointer_casts[&cast];
-        let mentions = words[5..]
-            .iter()
-            .enumerate()
-            .filter(|&(offset, &word)| word == cast && 5 + offset != span.0 + 2)
-            .count();
+        // The cast's own result id is one of its instruction's words, and the call(s) that took it are `uses`.
+        let mentions = body_uses.get(&cast).copied().unwrap_or(0).saturating_sub(1);
         if mentions == uses {
             spans_to_delete.push(span);
         }

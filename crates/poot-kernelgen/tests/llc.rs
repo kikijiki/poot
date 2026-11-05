@@ -727,7 +727,7 @@ fn generated_pointwise_and_batched_tiled_bodies_lower_on_every_gpu_target() {
         );
         let (tile_rows, tile_cols) = tiling.output_tile();
         let tiles = blocks * m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
-        let lanes = tiling.lanes() * tiling.lanes();
+        let lanes = tiling.workgroup_lanes();
         let request =
             KernelRequest::Contraction(ContractionSpec::DenseTiled(DenseTiledContraction {
                 weight: DenseTiledWeight::KnF32,

@@ -363,7 +363,7 @@ class ReceiptTests(BankRoot):
         self.assertTrue(any("claimed command is not the checked-in bank command" in e for e in self.errors()))
 
 
-def fake_runner(case, backend, *, observed=None):
+def fake_runner(case, backend, *, observed=None, device_us=None):
     """What a backend example writes: raw measurement and what it executed, with no identity of its own."""
 
     def run(command, *, cwd, env, check):
@@ -392,9 +392,14 @@ def fake_runner(case, backend, *, observed=None):
                     "plan": ["fixture kernel"],
                     "plan_id": "plan",
                     "reference": {"provenance": "independent-golden", "agrees": True},
-                    "cells": {"kernel": {"repeats": [
-                        {"slot": i, "status": "ok", "metrics": {bank.KERNEL_METRIC: 100.0 + i}} for i in range(9)
-                    ]}},
+                    "cells": {
+                        "kernel": {"repeats": [
+                            {"slot": i, "status": "ok", "metrics": {bank.KERNEL_METRIC: 100.0 + i}} for i in range(9)
+                        ]},
+                        **({"device": {"repeats": [
+                            {"slot": i, "status": "ok", "metrics": {bank.DEVICE_METRIC: v}} for i, v in enumerate(device_us)
+                        ]}} if device_us else {}),
+                    },
                 }
             )
         )
@@ -441,6 +446,33 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(entry["spread"], round(8 / 104, 4))
         # 2 * 1 * 2048 * 2048 FLOP over the 104 us median repeat.
         self.assertEqual(entry["tflop_per_s"], round(2 * 2048 * 2048 / 104e-6 / 1e12, 4))
+
+    def test_a_device_cell_derives_its_own_throughput_beside_the_wall_one(self):
+        self.record(run=fake_runner("dense-decode-gemv", "wgpu", device_us=[40.0 + i for i in range(9)]))
+
+        self.assertEqual(bank.validate_bank(self.root), [])
+        entry = next(e for e in bank.load_json(self.root / "receipts.json")["entries"]
+                     if (e["case"], e["backend"]) == ("dense-decode-gemv", "wgpu"))
+        flop = 2 * 2048 * 2048
+        self.assertEqual(entry["tflop_per_s"], round(flop / 104e-6 / 1e12, 4))
+        self.assertEqual(entry["device_tflop_per_s"], round(flop / 44e-6 / 1e12, 4))
+
+    def test_a_receipt_without_a_device_cell_states_no_device_throughput(self):
+        self.record()
+
+        entry = next(e for e in bank.load_json(self.root / "receipts.json")["entries"]
+                     if (e["case"], e["backend"]) == ("dense-decode-gemv", "wgpu"))
+        self.assertNotIn("device_tflop_per_s", entry)
+
+    def test_a_device_cell_that_does_not_match_the_wall_repeats_is_refused(self):
+        with self.assertRaises(SystemExit) as refused:
+            self.record(run=fake_runner("dense-decode-gemv", "wgpu", device_us=[40.0] * 8))
+        self.assertIn("the device cell has 8 repeats beside 9 wall repeats", str(refused.exception))
+
+    def test_a_non_positive_device_sample_is_refused(self):
+        with self.assertRaises(SystemExit) as refused:
+            self.record(run=fake_runner("dense-decode-gemv", "wgpu", device_us=[0.0] + [40.0] * 8))
+        self.assertIn("device repeat 0 is not a finite successful device_us sample", str(refused.exception))
 
     def test_a_runner_that_executed_another_workload_is_refused_and_registers_nothing(self):
         wrong = {"shape": {"m": 1, "k": 1024, "n": 2048}, "storage": "f32", "layout": "kn",

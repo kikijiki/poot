@@ -31,11 +31,10 @@ pub(super) struct FoldedTileGrid {
 pub(super) fn folded_tile_grid(
     site: Site<'_>,
     tiles: usize,
-    tile: usize,
+    width: usize,
     caps: &DeviceCaps,
 ) -> Result<FoldedTileGrid, PlanError> {
     let overflow = || site.refuse(Capability::DispatchSizeOverflow);
-    let width = tile * tile;
     let tiles_u32 = u32::try_from(tiles).map_err(|_| overflow())?;
     let limit_x = caps.max_grid[0].max(1);
     let (x_groups, y_groups) = if tiles_u32 <= limit_x {
@@ -484,7 +483,7 @@ pub(super) fn register_tiled_launch(
         .map(|offset| {
             let count = (tiles - offset).min(per_dispatch);
             let FoldedTileGrid { x_groups, grid } =
-                folded_tile_grid(site, count, tiling.lanes(), caps)?;
+                folded_tile_grid(site, count, tiling.workgroup_lanes(), caps)?;
             let offset = u32::try_from(offset).map_err(|_| overflow())?;
             let mut meta = extents.clone();
             meta.extend([x_groups, offset]);

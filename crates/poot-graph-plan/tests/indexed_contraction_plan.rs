@@ -115,6 +115,8 @@ fn decode_shape_plans_the_gemv_on_every_backend_and_prefill_the_register_tiled_w
                 match request.schedule {
                     Schedule::Gemv { .. } => gemv,
                     Schedule::RegisterTiled { .. } => !gemv,
+                    Schedule::FragmentTiled { .. } =>
+                        panic!("an expert walk keeps the scalar tile"),
                 },
                 "{label}: {:?}",
                 request.schedule

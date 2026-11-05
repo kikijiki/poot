@@ -92,7 +92,7 @@ pub enum RuntimeError {
         code: u32,
     },
     /// A kernel declares cooperative matrices, which this device cannot create a pipeline for, or whose
-    /// workgroup X is not a subgroup size it supports.
+    /// workgroup X is not a whole number of the fragment subgroups it supports.
     #[error(
         "a cooperative-matrix kernel with workgroup X {local_size_x:?} cannot run on this device (subgroup sizes {supported:?})"
     )]

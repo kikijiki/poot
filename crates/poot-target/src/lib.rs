@@ -505,10 +505,13 @@ impl DeviceCaps {
             }),
             max_grid: [65_535, 65_535, 65_535],
             watchdog_budget: calibration.watchdog_budget,
+            // wgpu leaves the pipeline's subgroup size to the driver, so only a one-subgroup workgroup is a
+            // fragment collective.
             matrix_units: Queried::Known(MatrixUnits::of([FragmentConfig::m16n16k16(
                 FragmentDtype::F16,
                 FragmentLayout::Opaque,
                 32,
+                1,
             )])),
             known_miscompiles: calibration.known_miscompiles,
             compute_units: STRIX_HALO_COMPUTE_UNITS,

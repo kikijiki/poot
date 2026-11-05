@@ -301,9 +301,23 @@ pub enum KernelRequest {
 impl KernelRequest {
     /// What this request's kernel needs from the device beyond its body (see [`KernelRequirements`]).
     pub fn requirements(&self) -> KernelRequirements {
-        // No generated request runs a matrix-fragment collective: every M > 1 contraction is the register-tiled
-        // GEMM (POOT-1403). A fragment schedule declares its subgroup lanes here.
-        KernelRequirements::default()
+        // A fragment schedule runs matrix-fragment collectives over subgroups of `FRAGMENT_LANES` lanes
+        // (POOT-1436, POOT-1437); every other generated request uses no subgroup collective.
+        let contraction = match self {
+            Self::Contraction(ContractionSpec::DenseTiled(spec)) => Some(spec.schedule),
+            Self::Contraction(ContractionSpec::Packed(spec)) => Some(spec.schedule),
+            Self::Contraction(ContractionSpec::Indexed(spec)) => Some(spec.schedule),
+            _ => None,
+        };
+        let fragments = matches!(contraction, Some(Schedule::FragmentTiled { .. }))
+            || match self {
+                Self::Attention(spec) => spec.uses_fragments(),
+                Self::AttentionRows(rows) => rows.spec.uses_fragments(),
+                _ => false,
+            };
+        KernelRequirements {
+            subgroup_lanes: fragments.then_some(crate::microtile::FRAGMENT_LANES as u32),
+        }
     }
 
     /// A human-readable name for this kernel: family, form and, for a dense contraction, its storage, launch and
@@ -342,6 +356,19 @@ impl KernelRequest {
                         lanes.get(),
                         rows.get(),
                         cols.get(),
+                        run.get()
+                    ),
+                    Schedule::FragmentTiled {
+                        waves_m,
+                        waves_n,
+                        tile,
+                        run,
+                    } => format!(
+                        "fragment_tiled{}x{}x{}x{}r{}",
+                        waves_m.get(),
+                        waves_n.get(),
+                        tile.rows,
+                        tile.cols,
                         run.get()
                     ),
                 };
@@ -1931,7 +1958,7 @@ mod tests {
         );
         let (tile_rows, tile_cols) = tiling.output_tile();
         let tiles = m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
-        let lanes = tiling.lanes() * tiling.lanes();
+        let lanes = tiling.workgroup_lanes();
         ContractionSpec::DenseTiled(DenseTiledContraction {
             weight,
             schedule: tiling.schedule(),

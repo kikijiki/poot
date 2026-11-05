@@ -375,6 +375,9 @@ pub struct ExecutorStats {
     pub syncs: u64,
     /// Bytes read back for those syncs (the ids a host decides residency from).
     pub sync_read_bytes: u64,
+    /// Nanoseconds the host spent blocked draining the device at those syncs: the stage timeline's bubble
+    /// the work in flight did not cover.
+    pub sync_wait_ns: u64,
     /// Pool rows refilled and the stored bytes they wrote, summed over every sync.
     pub pool_rows_written: u64,
     /// Stored bytes those rows wrote.
@@ -384,6 +387,9 @@ pub struct ExecutorStats {
     pub hosted_rows: u64,
     /// The stored bytes those rows wrote: as stored, never decoded on the host.
     pub hosted_bytes: u64,
+    /// Nanoseconds the host spent gathering and writing hosted rows at syncs (the copy from the mapping and
+    /// the device write, not the wait for the ids).
+    pub hosted_sync_ns: u64,
     /// The stored bytes of every hosted table, which stay in the checkpoint mapping instead of the device:
     /// the `Hosted` byte category beside the device's own `Weight` bytes in [`Self::memory`].
     pub hosted_table_bytes: u64,
@@ -412,10 +418,12 @@ impl ExecutorStats {
             weight_bytes_read: 0,
             syncs: 0,
             sync_read_bytes: 0,
+            sync_wait_ns: 0,
             pool_rows_written: 0,
             pool_refill_bytes: 0,
             hosted_rows: 0,
             hosted_bytes: 0,
+            hosted_sync_ns: 0,
             hosted_table_bytes: 0,
             kernels_resolved: 0,
             timing,
