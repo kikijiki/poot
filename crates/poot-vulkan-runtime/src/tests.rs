@@ -381,6 +381,7 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
                 shader_features: poot_target::ShaderFeatures::default(),
                 e4m3_storage: poot_target::E4m3Storage::None,
                 native_two_byte_floats: false,
+                rounding_conversions: poot_target::RoundingConversions::NONE,
                 widens_bf16_decode_weight: false,
                 peer_transport: false,
                 decode_gemv_max_out_cols: None,

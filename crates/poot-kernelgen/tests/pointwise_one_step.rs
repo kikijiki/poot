@@ -54,6 +54,7 @@ fn a_unary_op_reads_a_transposed_view() {
         &[layout],
         &kernel(FusedScalarOp::Unary(UnOp::Neg), vec![LeafTy::F32], None),
         None,
+        poot_target::RoundingConversions::NONE,
     )
     .unwrap();
     let got = run_f32(&body, groups_for(&body, 6), &[&x], 6);
@@ -74,6 +75,7 @@ fn contiguous_layouts_generate_the_plain_body() {
         &[Layout::contiguous(&shape)],
         &k,
         None,
+        poot_target::RoundingConversions::NONE,
     )
     .unwrap();
     assert_eq!(format!("{plain:?}"), format!("{viewed:?}"));
@@ -104,6 +106,7 @@ fn a_binary_op_broadcasts_and_reads_a_view_with_an_offset() {
             &[Layout::contiguous(&a_shape), b_layout.clone()],
             &kernel(FusedScalarOp::Binary(op), vec![LeafTy::F32; 2], None),
             None,
+            poot_target::RoundingConversions::NONE,
         )
         .unwrap();
         let got = run_f32(&body, groups_for(&body, 24), &[&a, &b_buffer], 24);
@@ -201,6 +204,7 @@ fn the_2d_grid_fold_covers_every_element() {
         &[Layout::contiguous(&[numel])],
         &k,
         Some(x_groups),
+        poot_target::RoundingConversions::NONE,
     )
     .unwrap();
     body.workgroup_size = [256, 1, 1];

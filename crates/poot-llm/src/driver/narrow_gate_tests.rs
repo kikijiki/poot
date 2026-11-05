@@ -349,8 +349,9 @@ fn row(
 }
 
 /// One module of rows per (backend, contraction dtype): every checkpoint on that device, each with the largest
-/// logit shift its narrow program measured on Strix Halo gfx1151 (POOT-1454; deterministic on the device), from
-/// which [`Gate::measured`] records the row's ceiling.
+/// logit shift its narrow program measured on its device (Strix Halo gfx1151 for the ROCm rows, POOT-1454 re-measured
+/// by POOT-1458; a RunPod Blackwell pod for the PTX rows, POOT-1459; deterministic on the device), from which
+/// [`Gate::measured`] records the row's ceiling.
 macro_rules! gate_rows {
     (
         $module:ident, $choice:expr, $backend:expr, $fragments:expr, $contraction:expr;
@@ -383,42 +384,58 @@ macro_rules! gate_rows {
 }
 
 gate_rows! {
-    // The contraction dtype on ROCm: bf16, range-safe (POOT-1454 decision).
-    rocm_bf16, BackendChoice::Rocm, DeviceBackend::Rocm, None, FragmentDtype::Bf16;
-    qwen3_0_6b => "qwen3-0.6b", 0.2046,
-    qwen3_4b => "qwen3-4b", 0.1503,
-    qwen3_0_6b_q8_0 => "qwen3-0.6b-gguf/Qwen3-0.6B-Q8_0.gguf", 0.3240,
-    qwen2_5_1_5b_q4_k_m => "qwen2.5-1.5b-q4km/qwen2.5-1.5b-instruct-q4_k_m.gguf", 0.4863,
-    gemma_3_1b_it => "gemma-3-1b-it", 2.3151,
-    llama_3_2_1b_instruct => "llama-3.2-1b-instruct", 0.1328,
+    // The bf16 contraction variant on ROCm, its units cut down to bf16: the ROCm policy until POOT-1458 (POOT-1454
+    // decision), kept as the record of the dtype comparison. With bf16 units alone the attention over the f16 KV
+    // cache has no fragment and stays exact, so its shifts are POOT-1458's measurement, not POOT-1454's.
+    rocm_bf16, BackendChoice::Rocm, DeviceBackend::Rocm, Some(FragmentDtype::Bf16), FragmentDtype::Bf16;
+    qwen3_0_6b => "qwen3-0.6b", 0.1596,
+    qwen3_4b => "qwen3-4b", 0.1813,
+    qwen3_0_6b_q8_0 => "qwen3-0.6b-gguf/Qwen3-0.6B-Q8_0.gguf", 0.3601,
+    qwen2_5_1_5b_q4_k_m => "qwen2.5-1.5b-q4km/qwen2.5-1.5b-instruct-q4_k_m.gguf", 0.4845,
+    gemma_3_1b_it => "gemma-3-1b-it", 0.8601,
+    llama_3_2_1b_instruct => "llama-3.2-1b-instruct", 0.1467,
 }
 
 gate_rows! {
-    // The f16 contraction variant on ROCm, kept as the record of the dtype comparison (1429 Q3). Its activations are
-    // row-scaled (POOT-1457); in range the scale is exactly 1, so the shifts are the unguarded f16 program's.
-    rocm_f16, BackendChoice::Rocm, DeviceBackend::Rocm, Some(FragmentDtype::F16), FragmentDtype::F16;
+    // The contraction dtype on ROCm: f16 (POOT-1458), its activations row-scaled (POOT-1457; in range the scale is
+    // exactly 1, so the shifts are the unguarded f16 program's), its bf16 weights rounded to f16 once at bind.
+    rocm_f16, BackendChoice::Rocm, DeviceBackend::Rocm, None, FragmentDtype::F16;
     qwen3_0_6b => "qwen3-0.6b", 0.0331,
     qwen3_4b => "qwen3-4b", 0.0326,
     qwen3_0_6b_q8_0 => "qwen3-0.6b-gguf/Qwen3-0.6B-Q8_0.gguf", 0.0693,
-    qwen2_5_1_5b_q4_k_m => "qwen2.5-1.5b-q4km/qwen2.5-1.5b-instruct-q4_k_m.gguf", 0.0690,
+    qwen2_5_1_5b_q4_k_m => "qwen2.5-1.5b-q4km/qwen2.5-1.5b-instruct-q4_k_m.gguf", 0.0778,
     gemma_3_1b_it => "gemma-3-1b-it", 0.6164,
     llama_3_2_1b_instruct => "llama-3.2-1b-instruct", 0.0257,
 }
 
 gate_rows! {
-    // NVPTX (sm_80+) has bf16 fragments: bf16 contractions, as on ROCm. Measured on a RunPod RTX 4090 pod
-    // (POOT-1454, scripts/ptx-pod-lane --models scripts/ptx-pod-models/narrow-gate.tsv). Gemma 3 misses the mean-KL
-    // ceiling here (1.86e-3) and is parked (checkpoint-ptx.parked.txt): receipts/1454-narrow-dtype-policy/design.md
-    // section 10.
-    ptx_bf16, BackendChoice::Ptx, DeviceBackend::Ptx, None, FragmentDtype::Bf16;
-    qwen3_0_6b => "qwen3-0.6b", 0.4419,
-    qwen3_4b => "qwen3-4b", 0.1410,
-    qwen3_0_6b_q8_0 => "qwen3-0.6b-gguf/Qwen3-0.6B-Q8_0.gguf", 0.4624,
-    qwen2_5_1_5b_q4_k_m => "qwen2.5-1.5b-q4km/qwen2.5-1.5b-instruct-q4_k_m.gguf", 0.4799,
-    #[ignore = "parked for POOT-1457 (f16 contractions with the row-scale guard): under bf16 on PTX the mean KL is \
-                1.86e-3 > 1e-3, bf16 rounding-boundary amplification (PTX/ROCm worst-logit ratio 3.4)"]
-    gemma_3_1b_it => "gemma-3-1b-it", 7.9349,
-    llama_3_2_1b_instruct => "llama-3.2-1b-instruct", 0.1344,
+    // NVPTX (sm_80+) with its units cut down to bf16: the PTX policy until POOT-1458, whose default is f16 since, kept
+    // as the record of the dtype comparison. Re-measured by POOT-1459 on two RunPod pods (an RTX PRO 4500 Blackwell and
+    // an RTX 4090; scripts/ptx-pod-lane --models scripts/ptx-pod-models/narrow-gate.tsv), each row's ceiling from the
+    // larger shift of the two (they differ per GPU model). With bf16 units alone the attention over the f16 KV cache
+    // has no fragment and stays exact, so these shifts replace POOT-1454's, which were measured with f16 attention.
+    ptx_bf16, BackendChoice::Ptx, DeviceBackend::Ptx, Some(FragmentDtype::Bf16), FragmentDtype::Bf16;
+    qwen3_0_6b => "qwen3-0.6b", 0.2422,
+    qwen3_4b => "qwen3-4b", 0.1673,
+    qwen3_0_6b_q8_0 => "qwen3-0.6b-gguf/Qwen3-0.6B-Q8_0.gguf", 0.4848,
+    qwen2_5_1_5b_q4_k_m => "qwen2.5-1.5b-q4km/qwen2.5-1.5b-instruct-q4_k_m.gguf", 0.4820,
+    #[ignore = "parked (POOT-1454 section 10): under bf16 on PTX the mean KL is 2.0e-3 > 1e-3 on an RTX 4090 and 2.7e-4 \
+                on an RTX PRO 4500 Blackwell, bf16 rounding-boundary amplification that depends on the device"]
+    gemma_3_1b_it => "gemma-3-1b-it", 4.2317,
+    llama_3_2_1b_instruct => "llama-3.2-1b-instruct", 0.1603,
+}
+
+gate_rows! {
+    // The contraction dtype on NVPTX (sm_80+): f16 (POOT-1458), `cvt.rn.f16.f32` and f16 weights at bind;
+    // shifts measured by POOT-1459 on two RunPod pods (an RTX PRO 4500 Blackwell and an RTX 4090), each row's the larger
+    // of the two (the shifts differ per GPU model); Gemma 3 meets the mean-KL ceiling on both.
+    ptx_f16, BackendChoice::Ptx, DeviceBackend::Ptx, None, FragmentDtype::F16;
+    qwen3_0_6b => "qwen3-0.6b", 0.0808,
+    qwen3_4b => "qwen3-4b", 0.0349,
+    qwen3_0_6b_q8_0 => "qwen3-0.6b-gguf/Qwen3-0.6B-Q8_0.gguf", 0.0524,
+    qwen2_5_1_5b_q4_k_m => "qwen2.5-1.5b-q4km/qwen2.5-1.5b-instruct-q4_k_m.gguf", 0.0697,
+    gemma_3_1b_it => "gemma-3-1b-it", 0.9102,
+    llama_3_2_1b_instruct => "llama-3.2-1b-instruct", 0.0336,
 }
 
 gate_rows! {

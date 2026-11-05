@@ -385,6 +385,78 @@ pub fn len_probe_kernel() -> Body {
     Body::new("len_probe", 2, locals, vec![bb0, bb1, bb2, bb3])
 }
 
+/// `float_ne(a: Slice<f32>, b: Slice<f32>, out: SliceMut<f32>)`: `let i = thread_index(); if i < out.len() {
+/// out[i] = (a[i] != b[i]) as f32; }` - the one float `Ne`, probed lane by lane. IEEE says `NaN != x` is true
+/// for every `x` including `NaN`, which the kernel interpreter implements and every backend must lower to
+/// (POOT-1460).
+pub fn float_ne_kernel() -> Body {
+    let locals = vec![
+        ld(Ty::Unit, false),
+        ld(slice_f32(false), false), // 1 a
+        ld(slice_f32(false), false), // 2 b
+        ld(slice_f32(true), true),   // 3 out
+        ld(Ty::Usize, false),        // 4 i
+        ld(Ty::Usize, false),        // 5 out_len
+        ld(Ty::Bool, false),         // 6 in bounds
+        ld(Ty::Bool, false),         // 7 differ
+        ld(Ty::F32, false),          // 8 differ as f32
+    ];
+    let (a, b, out, i, out_len, cmp, differ, differ_f32) = (
+        local(1),
+        local(2),
+        local(3),
+        local(4),
+        local(5),
+        local(6),
+        local(7),
+        local(8),
+    );
+    let bb0 = BasicBlock {
+        statements: vec![],
+        terminator: Terminator::ThreadIndexCall {
+            destination: Place::local(i),
+            dim: IndexAxis::X,
+            target: BlockId { index: 1 },
+        },
+    };
+    let bb1 = BasicBlock {
+        statements: vec![
+            Statement::Assign(Place::local(out_len), Rvalue::Len(Place::local(out))),
+            Statement::Assign(
+                Place::local(cmp),
+                Rvalue::BinaryOp(
+                    BinOp::Lt,
+                    copy(Place::local(i)),
+                    copy(Place::local(out_len)),
+                ),
+            ),
+        ],
+        terminator: guard(cmp, 3, 2),
+    };
+    let bb2 = BasicBlock {
+        statements: vec![
+            Statement::Assign(
+                Place::local(differ),
+                Rvalue::BinaryOp(BinOp::Ne, copy(elem(a, i)), copy(elem(b, i))),
+            ),
+            Statement::Assign(
+                Place::local(differ_f32),
+                Rvalue::Cast {
+                    to: Ty::F32,
+                    operand: copy(Place::local(differ)),
+                },
+            ),
+            Statement::Assign(elem(out, i), Rvalue::Use(copy(Place::local(differ_f32)))),
+        ],
+        terminator: Terminator::Return,
+    };
+    let bb3 = BasicBlock {
+        statements: vec![],
+        terminator: Terminator::Return,
+    };
+    Body::new("float_ne", 3, locals, vec![bb0, bb1, bb2, bb3])
+}
+
 /// `scale(x: Slice<f32>, y: SliceMut<f32>)`: `let i = thread_index(); if i < y.len() { y[i] = x[i] * x[i]; }`.
 /// Single-input elementwise kernel (one read slot, a self-multiply).
 pub fn square_kernel() -> Body {
@@ -1216,6 +1288,7 @@ mod tests {
             no_contract_probe_kernel(true),
             no_contract_probe_kernel(false),
             len_probe_kernel(),
+            float_ne_kernel(),
         ] {
             body.verify()
                 .unwrap_or_else(|e| panic!("fixture {} rejected: {e}", body.name));

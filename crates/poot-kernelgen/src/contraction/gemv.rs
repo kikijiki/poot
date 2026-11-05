@@ -372,7 +372,15 @@ pub(crate) fn gemv_body(
             epilogue,
             leaves,
             lanes,
-        }) => emit_epilogue(&mut store, epilogue, store_col, leaves, lanes, sum),
+        }) => emit_epilogue(
+            &mut store,
+            epilogue,
+            read.conversions,
+            store_col,
+            leaves,
+            lanes,
+            sum,
+        ),
         None => sum,
     };
     store.assign(elem(out, store_col), Rvalue::Use(copy(value)));

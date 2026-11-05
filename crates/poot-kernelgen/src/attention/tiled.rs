@@ -60,6 +60,7 @@ use crate::microtile::{
 };
 use crate::precision::narrowed;
 use poot_graph_ir::OperandPrecision;
+use poot_target::RoundingConversions;
 
 /// `K^T` (element `(d, key j)` at `d * (bc + 1) + j`) for the score product, then `V` (element `(j, channel c)`
 /// at `j * dv + c`) for the value product: one region, staged in turn. A fragment tile has `K` as `[key][d]` and `V`
@@ -692,6 +693,7 @@ pub(super) fn tiled_body(
     spec: &AttentionSpec,
     rows: std::ops::Range<usize>,
     x_groups: usize,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let layout = TiledLayout::of(spec)?;
     let TiledLayout {
@@ -818,7 +820,7 @@ pub(super) fn tiled_body(
             let base = un(e, BinOp::Mul, row, dk);
             let at = uu(e, BinOp::Add, base, d);
             let raw = e.let_(Ty::F32, Rvalue::Use(crate::helpers::copy(elem(q, at))));
-            narrowed(e, precision, None, raw)
+            narrowed(e, precision, None, conversions, raw)
         };
         // Stage Q once, adjacent lanes on adjacent channels of a query row, into its own array for the whole loop. A
         // held Q is staged after the geometry below.
@@ -982,7 +984,7 @@ pub(super) fn tiled_body(
                 |e, t| key_rows(e, t).0,
                 |e, j, d, value| {
                     let slot = staged_word(e, tiles.k, d, j);
-                    let value = narrowed(e, precision, kv.fragment(), value);
+                    let value = narrowed(e, precision, kv.fragment(), conversions, value);
                     let value = score_grid.micro.stage_value(e, value);
                     e.write_lds(KV_ARRAY, op(slot), op(value));
                 },
@@ -996,7 +998,7 @@ pub(super) fn tiled_body(
                     |e, j, d, value| {
                         let channel = un(e, BinOp::Add, d, head_dim);
                         let slot = staged_word(e, tiles.k, channel, j);
-                        let value = narrowed(e, precision, kv.fragment(), value);
+                        let value = narrowed(e, precision, kv.fragment(), conversions, value);
                         let value = score_grid.micro.stage_value(e, value);
                         e.write_lds(KV_ARRAY, op(slot), op(value));
                     },
@@ -1098,7 +1100,7 @@ pub(super) fn tiled_body(
                 |e, t| key_rows(e, t).0,
                 |e, j, d, value| {
                     let slot = staged_word(e, tiles.v, j, d);
-                    let value = narrowed(e, precision, kv.fragment(), value);
+                    let value = narrowed(e, precision, kv.fragment(), conversions, value);
                     let value = out_grid.micro.stage_value(e, value);
                     e.write_lds(KV_ARRAY, op(slot), op(value));
                 },
@@ -1119,7 +1121,7 @@ pub(super) fn tiled_body(
                 let maxima = gs.row_values(e, |e, row| e.read_lds(Ty::F32, NEW_M_ARRAY, op(row)));
                 s.map_rows(e, &maxima, |e, _, m, value| weight(e, value, m));
                 s.stage(e, tiles.p, |e, p| {
-                    let rounded = narrowed(e, precision, None, p);
+                    let rounded = narrowed(e, precision, None, conversions, p);
                     out_grid.micro.stage_value(e, rounded)
                 });
                 s.row_reduce(e, BinOp::Add).publish(e, &gs, RED_ARRAY);

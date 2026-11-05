@@ -135,9 +135,11 @@ Every op that multiplies two float operands (`MatMul`, the dense, grouped, packe
 
 The precision is part of the op, so the CPU oracle evaluates exactly what a device must compute, and every schedule (matrix-unit fragments, scalar micro-tiles, GEMV) reads its operands the same way. The published numerics class follows the ops: a program with a narrow op compares with the narrow-storage tolerance, a split one with the reassociating tolerance.
 
-One driver-wide policy, `--matmul-precision exact|split|narrow`, decides what `compile` writes. The `select_operand_precision` pass reads that policy, the target's matrix units and the operands' dtypes, and nothing else: contractions take bf16 where the target has bf16 fragments and f16 otherwise, attention takes the dtype its KV cache is stored in, and a target with no matrix unit for the operands compiles `exact` under any policy. The default is `exact`.
+One driver-wide policy, `--matmul-precision exact|split|narrow`, decides what `compile` writes. The `select_operand_precision` pass reads that policy, the target's matrix units and the operands' dtypes, and nothing else: contractions take f16 where the target has f16 fragments and bf16 otherwise, attention takes the dtype its KV cache is stored in, and a target with no matrix unit for the operands compiles `exact` under any policy. The default is `exact`.
 
 A contraction that rounds its activation to f16 reads it row-scaled: each row is divided by `s = max(1, max|x| / 65504)` before the rounding and the result is multiplied by `s` after, so the rounding cannot overflow. Where a row is inside f16's range, `s` is exactly 1 and the result is bit for bit the unscaled one. The scale steps are ordinary graph ops, so the CPU oracle evaluates them too, and fusion computes `s` in the row kernel that produces the activation (a norm), or in a row kernel of its own when a contraction produces it. A product of two runtime values (no weight) has no scale and does not narrow to f16.
+
+The generated kernels round to f16 and widen from it with the device's own conversion instructions on ROCm and NVIDIA. On Vulkan they round with integer arithmetic on the f32 bits, because the driver may drop a convert-and-convert-back pair. Both forms give the same bits for every f32 value. A bf16 weight read only by contractions that multiply in f16 is rounded to f16 once, when it is bound, so the kernels read it as stored. A weight that f16 cannot hold (beyond 65504, an infinity or a NaN) is refused at bind with a typed error naming the weight and the element.
 
 ### Measured agreement of narrow with exact
 
@@ -157,18 +159,18 @@ The top-1 fraction is reported, not gated. For scale, llama.cpp's own CPU and Vu
 
 | backend, contraction dtype | checkpoint                     | top-1  | mean KL       | max shift |
 | -------------------------- | ------------------------------ | ------ | ------------- | --------- |
-| ROCm, bf16                 | Qwen3 0.6B (bf16)              | 0.9953 | 4.8e-5        | 0.20      |
-|                            | Qwen3 4B (bf16)                | 0.9953 | 2.9e-5        | 0.15      |
-|                            | Qwen3 0.6B (Q8_0)              | 0.9969 | 1.1e-4        | 0.32      |
-|                            | Qwen2.5 1.5B Instruct (Q4_K_M) | 0.9906 | 1.0e-4        | 0.49      |
-|                            | Gemma 3 1B Instruct (bf16)     | 0.9891 | 5.5e-4        | 2.32      |
-|                            | Llama 3.2 1B Instruct (bf16)   | 0.9969 | 2.6e-5        | 0.13      |
 | ROCm, f16                  | Qwen3 0.6B (bf16)              | 1.0000 | 1.6e-6        | 0.03      |
 |                            | Qwen3 4B (bf16)                | 1.0000 | 8.7e-7        | 0.03      |
 |                            | Qwen3 0.6B (Q8_0)              | 1.0000 | 2.7e-6        | 0.07      |
-|                            | Qwen2.5 1.5B Instruct (Q4_K_M) | 1.0000 | 4.0e-6        | 0.07      |
+|                            | Qwen2.5 1.5B Instruct (Q4_K_M) | 1.0000 | 4.1e-6        | 0.08      |
 |                            | Gemma 3 1B Instruct (bf16)     | 0.9984 | 2.3e-5        | 0.62      |
 |                            | Llama 3.2 1B Instruct (bf16)   | 1.0000 | 1.0e-6        | 0.03      |
+| ROCm, bf16 (bf16 units)    | Qwen3 0.6B (bf16)              | 0.9938 | 4.3e-5        | 0.16      |
+|                            | Qwen3 4B (bf16)                | 0.9938 | 3.5e-5        | 0.18      |
+|                            | Qwen3 0.6B (Q8_0)              | 0.9922 | 1.1e-4        | 0.36      |
+|                            | Qwen2.5 1.5B Instruct (Q4_K_M) | 0.9875 | 9.5e-5        | 0.48      |
+|                            | Gemma 3 1B Instruct (bf16)     | 0.9922 | 4.2e-4        | 0.86      |
+|                            | Llama 3.2 1B Instruct (bf16)   | 1.0000 | 2.9e-5        | 0.15      |
 | wgpu (Vulkan), f16         | Qwen3 0.6B (bf16)              | 0.9984 | 1.6e-6        | 0.03      |
 |                            | Qwen3 4B (bf16)                | 1.0000 | 1.0e-6        | 0.03      |
 |                            | Qwen3 0.6B (Q8_0)              | 1.0000 | 2.6e-6        | 0.07      |
@@ -181,7 +183,7 @@ The top-1 fraction is reported, not gated. For scale, llama.cpp's own CPU and Vu
 |                            | Qwen2.5 1.5B Instruct (Q4_K_M) | 1.0000 | 3.9e-6        | 0.07      |
 |                            | Gemma 3 1B Instruct (bf16)     | 0.9984 | 1.4e-5        | 0.44      |
 |                            | Llama 3.2 1B Instruct (bf16)   | 1.0000 | 8.6e-7        | 0.02      |
-| NVIDIA (PTX), bf16         | Qwen3 0.6B (bf16)              | 0.9953 | 5.0e-5        | 0.44      |
+| NVIDIA (PTX), bf16 (old)   | Qwen3 0.6B (bf16)              | 0.9953 | 5.0e-5        | 0.44      |
 |                            | Qwen3 4B (bf16)                | 1.0000 | 2.7e-5        | 0.14      |
 |                            | Qwen3 0.6B (Q8_0)              | 0.9922 | 1.2e-4        | 0.46      |
 |                            | Qwen2.5 1.5B Instruct (Q4_K_M) | 0.9891 | 9.6e-5        | 0.48      |
@@ -190,9 +192,9 @@ The top-1 fraction is reported, not gated. For scale, llama.cpp's own CPU and Vu
 
 What the table says:
 
-- **Contractions use bf16 where the target has bf16 fragments (ROCm, NVIDIA), and f16 only where f16 is the only fragment (wgpu and raw Vulkan on RADV).** bf16 keeps the f32 exponent range, so narrowing an activation to it cannot overflow. f16 is more accurate (24 to 41 times lower mean KL on ROCm, which has both; the f16 rows there are a measured comparison, not the shipped choice). Its activations are row-scaled, so they cannot overflow: on wgpu and raw Vulkan the scale costs 1 to 4% of prefill on Qwen3 4B, and every f16 row above is unchanged by it. It is not used where bf16 exists because rounding to f16 costs the current kernels 23 to 60% of prefill on ROCm. A weight beyond 65504 rounded to f16 becomes infinity, never a clamped value, and serving refuses non-finite logits with a typed error.
-- **Gemma 3 is the sensitive family.** It has the largest logit shift under every dtype (0.4 to 7.9), and under bf16 a few positions move far: KL 0.07 at one position on ROCm and 0.33 on NVIDIA.
-- **Gemma 3 under bf16 on NVIDIA misses the mean-KL ceiling (1.9e-3).** The two exact programs agree across AMD and NVIDIA to within 0.005 (every 512th logit of every position compared), so the gap is the bf16 rounding itself: at the same sensitive positions, a different but correct accumulation order moves a bf16 result further. On NVIDIA, `narrow` is not yet within the gate for this family; `exact` (the default) is unaffected.
+- **Contractions use f16 wherever the target has f16 fragments (ROCm, NVIDIA, wgpu and raw Vulkan on RADV).** f16 is more accurate than bf16: 18 to 40 times lower mean KL on ROCm, which has both. Its activations are row-scaled, so they cannot overflow, and every f16 row above is unchanged by the scale. On ROCm, against bf16, f16 costs 3% of prefill time to first token and 2% of decode time per token on Qwen3 4B, and is faster on Qwen2.5 1.5B Q4_K_M (24% less to first token, 10% less per token). The ROCm bf16 rows are a measured comparison on the same device with its units cut down to bf16, where attention over the f16 KV cache stays exact. bf16 remains the dtype of a contraction with no row scale (a product of two runtime values) where the target has bf16 fragments.
+- **Gemma 3 is the sensitive family.** It has the largest logit shift under every dtype (0.4 to 7.9), and under bf16 a few positions move far: KL 0.02 at one position on ROCm and 0.33 on NVIDIA.
+- **Gemma 3 under bf16 on NVIDIA misses the mean-KL ceiling (1.9e-3).** The two exact programs agree across AMD and NVIDIA to within 0.005 (every 512th logit of every position compared), so the gap is the bf16 rounding itself: at the same sensitive positions, a different but correct accumulation order moves a bf16 result further. The NVIDIA rows above were measured when NVIDIA narrowed to bf16. It now narrows to f16 like the other targets, and its f16 rows have not been measured yet. `exact` (the default) is unaffected.
 - **The default stays `exact`.**
 
 ## Quantization

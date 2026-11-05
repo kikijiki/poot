@@ -388,6 +388,7 @@ mod tests {
             epilogue.map(|(epilogue, _)| epilogue),
             PackedRows::Indexed,
             poot_graph_ir::OperandPrecision::Exact,
+            poot_target::RoundingConversions::NONE,
         )
         .unwrap_or_else(|error| panic!("{format:?}: {error}"));
         // The Gemv reads the ids; a tiled schedule reads their grouping in tiles of its rows, over the grouping's

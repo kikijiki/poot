@@ -29,6 +29,7 @@ impl<'a> Emitter<'a> {
             Rvalue::Len(place) => self.emit_len(place.local, w),
             Rvalue::Cast { to, operand } => self.emit_cast(to, operand, w),
             Rvalue::Narrow { to, operand } => self.emit_narrow(to, operand, w),
+            Rvalue::FromLowBits { to, operand } => self.emit_from_low_bits(to, operand, w),
             Rvalue::Bitcast { to, operand } => self.emit_bitcast(to, operand, w),
             Rvalue::Select {
                 condition,
@@ -483,6 +484,30 @@ impl<'a> Emitter<'a> {
         }
         let res = self.fresh();
         let _ = writeln!(w, "  {res} = fptrunc {from_llty} {v} to {to_llty}");
+        Ok((res, to_llty))
+    }
+
+    /// [`Rvalue::FromLowBits`]: the two-byte float whose bits are the low half of a `u32`, as `trunc` to `i16`
+    /// and a `bitcast`. Emitted only for AMDGPU and NVPTX: a SPIR-V module would need the `Int16` capability for
+    /// the `i16`, which the Vulkan devices are not opened with, and the AIE core has no two-byte float.
+    pub(super) fn emit_from_low_bits(
+        &mut self,
+        to: &Ty,
+        operand: &Operand,
+        w: &mut String,
+    ) -> Result<(String, String), EmitError> {
+        if !matches!(self.target, Target::AmdGcn(_) | Target::Nvptx) {
+            return Err(EmitError::Unsupported(format!(
+                "FromLowBits to {to:?} on {:?}: no 16-bit integer to reinterpret",
+                self.target
+            )));
+        }
+        let (v, _) = self.operand(operand, w)?;
+        let to_llty = self.scalar_llty(to)?;
+        let half = self.fresh();
+        let _ = writeln!(w, "  {half} = trunc i32 {v} to i16");
+        let res = self.fresh();
+        let _ = writeln!(w, "  {res} = bitcast i16 {half} to {to_llty}");
         Ok((res, to_llty))
     }
 

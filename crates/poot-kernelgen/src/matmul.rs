@@ -11,6 +11,7 @@ use poot_kernel_ir::{
     BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Local, Operand, Place, Rvalue,
     Statement, Terminator, Ty,
 };
+use poot_target::RoundingConversions;
 
 /// Batched matmul `C[..,M,N] = A[..,M,K] @ B[..,K,N]` (row-major), batch dims broadcast. One thread per
 /// output element; a serial K-loop accumulates. Dims (M,N,K) and all strides are baked from the static
@@ -25,7 +26,9 @@ use poot_kernel_ir::{
 /// known-miscompile ceiling (`caps.known_miscompiles.tiled_gemm_max_workgroups`, 2^15 on the RADV default,
 /// card 095), a much lower bar than the `65535*256` wg-bump ceiling on output elements. Example:
 /// Qwen2.5-0.5B batched prefill at ISL=2048 computes `q[1,14,2048,64] @ kt[1,14,64,2048] -> [1,14,2048,2048]`
-/// (58,720,256 elements), `GridCap([229376,1,1])`. `x_groups: None` is the plain (non-folded) grid.
+/// (58,720,256 elements), `GridCap([229376,1,1])`. `x_groups: None` is the plain (non-folded) grid. A narrowed
+/// `precision` rounds as `conversions` says (the device's, POOT-1458).
+#[expect(clippy::too_many_arguments)] // the shapes, the fold and the operand rounding of one body
 pub fn matmul_batched_dt_grid(
     name: &str,
     dt: Ty,
@@ -34,6 +37,7 @@ pub fn matmul_batched_dt_grid(
     b_shape: &[usize],
     x_groups: Option<usize>,
     precision: OperandPrecision,
+    conversions: RoundingConversions,
 ) -> Body {
     matmul_batched_impl(
         name,
@@ -45,6 +49,7 @@ pub fn matmul_batched_dt_grid(
         &[],
         x_groups,
         precision,
+        conversions,
     )
 }
 
@@ -62,6 +67,7 @@ pub fn matmul_batched_epilogue_dt_grid(
     epilogue: &Epilogue,
     x_groups: Option<usize>,
     precision: OperandPrecision,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     epilogue.refuse_narrow_store("matmul_batched_epilogue_dt_grid")?;
     let lanes = epilogue.lanes("matmul_batched_epilogue_dt_grid")?;
@@ -75,6 +81,7 @@ pub fn matmul_batched_epilogue_dt_grid(
         &lanes,
         x_groups,
         precision,
+        conversions,
     ))
 }
 
@@ -89,6 +96,7 @@ fn matmul_batched_impl(
     lanes: &[Option<WeightLane>],
     x_groups: Option<usize>,
     precision: OperandPrecision,
+    conversions: RoundingConversions,
 ) -> Body {
     let r = out_shape.len();
     let k = a_shape[a_shape.len() - 1];
@@ -267,7 +275,7 @@ fn matmul_batched_impl(
     };
     // The products of one `k` step: `va * vb` read as stored, else the sum over every pair of operand terms
     // (`crate::precision`). The exact form keeps the hand-numbered locals, so its kernel key is unchanged.
-    let read = ProductRead::of_dtype(precision, &dt);
+    let read = ProductRead::of_dtype(precision, &dt, conversions);
     let product_stmts: Vec<Statement> = if precision.is_exact() {
         vec![
             Statement::Assign(
@@ -355,7 +363,7 @@ fn matmul_batched_impl(
     // bb5: store. The epilogue (if any) runs over the f32 accumulator, which it rounds through `dt` first.
     let mut e = Emit::new(&mut al);
     let to_store = match epilogue {
-        Some(epilogue) => emit_epilogue(&mut e, epilogue, i, &leaves, lanes, acc),
+        Some(epilogue) => emit_epilogue(&mut e, epilogue, conversions, i, &leaves, lanes, acc),
         None => acc,
     };
     let mut bb5_stmts = e.take();

@@ -2,7 +2,9 @@
 //! (`store_narrowed_activations`, `receipts/1448-activation-narrowed-once/design.md`).
 //!
 //! Every row drives the production `compile` on a transformer block (a norm, three projections of it, a gated MLP
-//! and the residual adds) and reads the program it returns.
+//! and the residual adds) and reads the program it returns. The bf16 rows run on a gfx11 device whose unit offers
+//! bf16 alone: where the unit also has f16 a guarded contraction takes f16 (POOT-1458), whose activations are
+//! row-scaled and stored by their scaling region (the f16 rows).
 
 use std::collections::HashMap;
 
@@ -12,7 +14,10 @@ use poot_graph_ir::ops::rmsnorm;
 use poot_graph_ir::ops::silu;
 use poot_graph_ir::{Builder, FragmentDtype, Graph, MatmulPrecision, OpKind, TensorType, ValueId};
 use poot_graph_plan::{CompileLimits, CompileOptions, Program, Target, compile};
-use poot_target::{AmdArch, Backend, DeviceCaps, MatrixUnits, Queried, SubgroupSupport};
+use poot_target::{
+    AmdArch, Backend, DeviceCaps, FragmentConfig, FragmentLayout, LaneMap, MatrixUnits, Queried,
+    SubgroupSupport,
+};
 use poot_tensor::{DType, HostTensor};
 
 const M: usize = 160;
@@ -33,10 +38,24 @@ fn rocm_wmma() -> Target {
     }
 }
 
-/// The same device with no native two-byte element (a SPIR-V device's buffers hold BF16 and F16 only as packed
-/// words): the planner has nowhere to store a narrowed value.
-fn rocm_wmma_without_two_byte_elements() -> Target {
+/// The same device whose matrix unit offers bf16 fragments alone, so the narrow policy multiplies in bf16.
+fn rocm_bf16() -> Target {
     let Target::Gpu { backend, mut caps } = rocm_wmma() else {
+        unreachable!("a GPU target")
+    };
+    caps.matrix_units = Queried::Known(MatrixUnits::of([FragmentConfig::m16n16k16(
+        FragmentDtype::Bf16,
+        FragmentLayout::Declared(LaneMap::Rdna3),
+        32,
+        FragmentConfig::ANY_WAVES,
+    )]));
+    Target::Gpu { backend, caps }
+}
+
+/// `target` with no native two-byte element (a SPIR-V device's buffers hold BF16 and F16 only as packed words): the
+/// planner has nowhere to store a narrowed value.
+fn without_two_byte_elements(target: Target) -> Target {
+    let Target::Gpu { backend, mut caps } = target else {
         unreachable!("a GPU target")
     };
     caps.native_two_byte_floats = false;
@@ -182,7 +201,7 @@ fn output_bits(g: &Graph, inputs: &HashMap<ValueId, Value>) -> Vec<u32> {
 #[test]
 fn a_value_every_reader_narrows_is_stored_narrow_by_its_producer() {
     let (g, _) = block(false);
-    let narrowed = compiled(&g, &rocm_wmma(), MatmulPrecision::Narrow);
+    let narrowed = compiled(&g, &rocm_bf16(), MatmulPrecision::Narrow);
     assert_eq!(
         narrow_values(&narrowed),
         vec![
@@ -198,7 +217,7 @@ fn a_value_every_reader_narrows_is_stored_narrow_by_its_producer() {
     );
     let unnarrowed = compiled(
         &g,
-        &rocm_wmma_without_two_byte_elements(),
+        &without_two_byte_elements(rocm_bf16()),
         MatmulPrecision::Narrow,
     );
     assert_eq!(
@@ -230,7 +249,7 @@ fn a_row_scaled_activation_is_stored_f16_by_the_region_that_scales_it() {
         ],
         "the two scaled activations are stored narrow, nothing else"
     );
-    let unnarrowed = compiled_f16(&g, &rocm_wmma_without_two_byte_elements());
+    let unnarrowed = compiled_f16(&g, &without_two_byte_elements(rocm_wmma()));
     assert_eq!(narrow_values(&unnarrowed), Vec::new());
     assert_eq!(
         (narrowed.graph().eqns().len(), dispatches(&narrowed)),
@@ -245,7 +264,7 @@ fn a_row_scaled_activation_is_stored_f16_by_the_region_that_scales_it() {
 #[test]
 fn a_value_an_f32_reader_reads_stays_f32() {
     let (g, _) = block(true);
-    let program = compiled(&g, &rocm_wmma(), MatmulPrecision::Narrow);
+    let program = compiled(&g, &rocm_bf16(), MatmulPrecision::Narrow);
     assert_eq!(
         narrow_values(&program),
         vec![("contraction_epilogue".to_string(), DType::BF16)],
@@ -256,20 +275,22 @@ fn a_value_an_f32_reader_reads_stays_f32() {
 /// The narrowed program computes what the declared semantics compute, bit for bit: the oracle of the compiled
 /// graph, whose values are stored narrow, equals the oracle of the traced graph under the same operand precision,
 /// whose values are f32 and rounded by each reader (the producer's `Cast` and the readers' narrowing are one
-/// rounding). Mutation: in `OperandPrecision::stored_activation` map `Narrow(Bf16)` to `F16`; the readers round an
-/// f16 value to bf16 again and the bits differ.
+/// rounding), on the bf16 device and on the gfx11 one, whose f16 contractions read their activations row-scaled.
+/// Mutation: in `OperandPrecision::stored_activation` map `Narrow(Bf16)` to `F16`; the readers round an f16 value
+/// to bf16 again and the bf16 device's bits differ.
 #[test]
 fn the_narrowed_program_evaluates_bit_for_bit_as_the_declared_one() {
     let (g, inputs) = block(false);
-    let target = rocm_wmma();
-    let program = compiled(&g, &target, MatmulPrecision::Narrow);
-    assert!(!narrow_values(&program).is_empty(), "the program narrows");
-    let declared =
-        poot_graph_plan::with_operand_precision(&g, &target, MatmulPrecision::Narrow).unwrap();
-    assert_eq!(
-        output_bits(program.graph(), &inputs),
-        output_bits(&declared, &inputs)
-    );
+    for target in [rocm_bf16(), rocm_wmma()] {
+        let program = compiled(&g, &target, MatmulPrecision::Narrow);
+        assert!(!narrow_values(&program).is_empty(), "the program narrows");
+        let declared =
+            poot_graph_plan::with_operand_precision(&g, &target, MatmulPrecision::Narrow).unwrap();
+        assert_eq!(
+            output_bits(program.graph(), &inputs),
+            output_bits(&declared, &inputs)
+        );
+    }
 }
 
 /// Under the exact policy no reader narrows, so nothing is stored narrow and the pass leaves no trace: the exact
@@ -302,7 +323,7 @@ fn an_exact_program_stores_nothing_narrow() {
 #[test]
 fn a_value_stored_narrow_shares_its_arena_slot_with_f32_values() {
     let (g, _) = blocks(2, false);
-    let program = compiled(&g, &rocm_wmma(), MatmulPrecision::Narrow);
+    let program = compiled(&g, &rocm_bf16(), MatmulPrecision::Narrow);
     let plan = program.buffer_plan();
     let slot_storage: HashMap<_, _> = plan
         .slots()

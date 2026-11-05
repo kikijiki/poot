@@ -17,6 +17,9 @@ use crate::contraction::{
 };
 use crate::helpers::WeightLayout;
 
+/// How a gfx1151 body rounds to a fragment dtype: the ROCm caps' kept conversions (POOT-1458).
+const ROCM_ROUNDING: poot_target::RoundingConversions = poot_target::RoundingConversions::F16;
+
 /// `(vgprs, spilled vgprs)` of the kernel in code object `hsaco`, from `llvm-readelf --notes` of the toolchain
 /// that compiled it (next to `$POOT_AMD_CLANG`), or `None` when that tool is absent.
 fn vgprs(hsaco: &Path) -> Option<(u32, u32)> {
@@ -132,7 +135,7 @@ fn the_tiled_attention_at_its_planned_tilings_spills_no_register() {
     for (br, bc, score, out) in tilings {
         let spec = tiled_spec(br, bc, score, out);
         let name = format!("budget_attention_br{br}_bc{bc}_s{}x{}", score.0, score.1);
-        let body = attention_body(&name, &spec, 0..spec.workgroups(), 1).unwrap();
+        let body = attention_body(&name, &spec, 0..spec.workgroups(), 1, ROCM_ROUNDING).unwrap();
         let Some((vgprs, spilled)) = compiled_registers(&body) else {
             return;
         };
@@ -226,7 +229,8 @@ fn the_fragment_attention_at_its_planned_tilings_spills_no_register() {
             ("row_state", with_row_state(fragment_spec(tiling))),
         ] {
             let name = format!("budget_fragment_attention_br{br}_bc{bc}_l{lanes}_{q:?}_{variant}");
-            let body = attention_body(&name, &spec, 0..spec.workgroups(), 1).unwrap();
+            let body =
+                attention_body(&name, &spec, 0..spec.workgroups(), 1, ROCM_ROUNDING).unwrap();
             let Some((vgprs, spilled)) = compiled_registers(&body) else {
                 return;
             };
@@ -262,6 +266,7 @@ fn a_held_query_the_planner_refuses_spills() {
         &spec,
         0..spec.workgroups(),
         1,
+        ROCM_ROUNDING,
     )
     .unwrap();
     let Some((vgprs, spilled)) = compiled_registers(&body) else {
@@ -286,6 +291,7 @@ fn the_fragment_attention_stages_v_in_wide_stores() {
             &spec,
             0..spec.workgroups(),
             1,
+            ROCM_ROUNDING,
         )
         .unwrap();
         let Some(hsaco) = compiled_code_object(&body) else {
@@ -320,6 +326,7 @@ fn the_fragment_attention_loads_every_operand_fragment_wide() {
         &spec,
         0..spec.workgroups(),
         1,
+        ROCM_ROUNDING,
     )
     .unwrap();
     let Some(hsaco) = compiled_code_object(&body) else {
@@ -383,6 +390,7 @@ fn the_dense_register_tiled_contraction_spills_no_register() {
             crate::contraction::TiledRead {
                 precision: poot_graph_ir::OperandPrecision::Exact,
                 activation_stored: None,
+                conversions: caps.rounding_conversions,
             },
         )
         .unwrap();
@@ -463,6 +471,7 @@ fn planned_fragment_contraction(
         crate::contraction::TiledRead {
             precision,
             activation_stored: None,
+            conversions: caps.rounding_conversions,
         },
     )
     .unwrap()
@@ -516,7 +525,8 @@ fn the_fragment_contraction_over_a_kn_weight_loads_every_operand_fragment_wide()
 fn only_a_body_the_generator_unrolled_carries_the_no_unroll_metadata() {
     let arch = AmdArch::gfx1151();
     let tiled = tiled_spec(32, 16, (2, 2), (8, 4));
-    let tiled_body = attention_body("tiled", &tiled, 0..tiled.workgroups(), 1).unwrap();
+    let tiled_body =
+        attention_body("tiled", &tiled, 0..tiled.workgroups(), 1, ROCM_ROUNDING).unwrap();
     let ir = poot_codegen::emit_llvm_ir(&tiled_body, Target::AmdGcn(arch)).unwrap();
     assert!(
         ir.contains(", !llvm.loop !0"),
@@ -531,8 +541,14 @@ fn only_a_body_the_generator_unrolled_carries_the_no_unroll_metadata() {
         schedule: AttentionSchedule::Streaming { lanes: 64 },
         ..tiled
     };
-    let streaming_body =
-        attention_body("streaming", &streaming, 0..streaming.workgroups(), 1).unwrap();
+    let streaming_body = attention_body(
+        "streaming",
+        &streaming,
+        0..streaming.workgroups(),
+        1,
+        ROCM_ROUNDING,
+    )
+    .unwrap();
     let ir = poot_codegen::emit_llvm_ir(&streaming_body, Target::AmdGcn(arch)).unwrap();
     assert!(
         !ir.contains("llvm.loop"),
@@ -650,6 +666,7 @@ fn the_pipelined_fragment_contraction_loads_ahead_of_its_multiplies() {
             crate::contraction::TiledRead {
                 precision,
                 activation_stored: None,
+                conversions: caps.rounding_conversions,
             },
         )
         .unwrap();

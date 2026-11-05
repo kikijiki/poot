@@ -9,7 +9,7 @@ use poot_kernel_ir::{
     BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Operand, Place, Rvalue, Statement,
     Terminator, Ty, WorkgroupLocalDecl,
 };
-use poot_target::BufferStorage;
+use poot_target::{BufferStorage, RoundingConversions};
 
 /// Decode GEMV via an LDS reduction: a shared-weight M=1 matmul `out[b,n] = sum_k a[b,k] * W[k*N + n]`,
 /// single-sequence (`a [1,1,K]`, out `[1,1,N]`) or batched (`a [B,1,K]`, out `[B,1,N]`; `W [K,N]` is shared
@@ -54,6 +54,7 @@ pub fn gemv_lds(
     layout: WeightLayout,
     weight: BufferStorage,
     precision: OperandPrecision,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let weight_lane = WeightLane::of("gemv_lds", weight)?;
     // params: _0 ret, _1 a, _2 b (weight), _3 out (LAST).
@@ -154,7 +155,7 @@ pub fn gemv_lds(
         terminator: guard(j_lt, 5, 4),
     };
     // bb4 (acc body): partial += a[b_off + j] * b[idx(j, n_col)]; j += w
-    let read_bv = weight_lane.read(&mut al, b, bidx, bv);
+    let read_bv = weight_lane.read(&mut al, conversions, b, bidx, bv);
     // The step's products: `av * bv` as read, else the sum over every pair of operand terms.
     let products = if precision.is_exact() {
         vec![
@@ -174,7 +175,7 @@ pub fn gemv_lds(
     } else {
         accumulate_statements(
             &mut al,
-            ProductRead::dense(precision, weight_lane),
+            ProductRead::dense(precision, weight_lane, conversions),
             (av, bv),
             partial,
             part_new,
@@ -350,6 +351,7 @@ pub fn attn_scores_v_gemv_lds(
     w: usize,
     x_groups: usize,
     precision: OperandPrecision,
+    conversions: RoundingConversions,
 ) -> Body {
     // params: _0 ret, _1 probs [rows, cap], _2 v [rows, cap, d], out [rows, d] (LAST).
     let mut al = Alloc::new(vec![
@@ -469,7 +471,7 @@ pub fn attn_scores_v_gemv_lds(
     } else {
         accumulate_statements(
             &mut al,
-            ProductRead::decoded(precision),
+            ProductRead::decoded(precision, conversions),
             (av, bv),
             partial,
             part_new,

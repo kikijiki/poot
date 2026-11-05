@@ -1,4 +1,4 @@
 # Parked rows of `just test-checkpoint-ptx`: binary_id<TAB>test_name<TAB>reason. A parked row is measured and does not pass
 # yet; the test is #[ignore]d with the same reason, the lane does not run it, and the reason names the card that
 # makes it pass (scripts/check-required-cases.py). When that card lands, the row moves back to checkpoint-ptx.txt.
-poot-llm	driver::narrow_gate_tests::ptx_bf16::gemma_3_1b_it	POOT-1457 (f16 contractions with the row-scale guard): under bf16 on PTX the mean KL is 1.86e-3 > 1e-3, bf16 rounding-boundary amplification (PTX/ROCm worst-logit ratio 3.4); measured POOT-1454, receipts/1454-narrow-dtype-policy/design.md section 10
+poot-llm	driver::narrow_gate_tests::ptx_bf16::gemma_3_1b_it	POOT-1454 section 10 (receipts/1454-narrow-dtype-policy/design.md): under bf16 on PTX the mean KL is 2.0e-3 > 1e-3 on an RTX 4090 (2.7e-4 on an RTX PRO 4500 Blackwell), bf16 rounding-boundary amplification that depends on the device; measured POOT-1459; f16 (the PTX default) passes on both

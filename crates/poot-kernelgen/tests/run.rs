@@ -207,6 +207,7 @@ fn synthesized_kernels_compile_to_valid_ptx() {
                 128,
                 n,
                 poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
             ),
         ),
     ];
@@ -617,6 +618,7 @@ fn matmul_gemv_and_batched() {
             &[4, 3],
             None,
             poot_graph_ir::OperandPrecision::Exact,
+            poot_target::RoundingConversions::NONE,
         ),
         "mm",
     );
@@ -647,6 +649,7 @@ fn matmul_gemv_and_batched() {
             &[1, 2, 4, 3],
             None,
             poot_graph_ir::OperandPrecision::Exact,
+            poot_target::RoundingConversions::NONE,
         ),
         "mmb",
     );
@@ -705,6 +708,7 @@ fn matmul_bias_epilogue() {
             &bias_epilogue(&[1, 1, 3], &[3]),
             None,
             poot_graph_ir::OperandPrecision::Exact,
+            poot_target::RoundingConversions::NONE,
         )
         .expect("the epilogue's leaf storage is valid"),
         "mmbias",
@@ -1544,6 +1548,7 @@ fn attn_scores_v_gemv_lds_matches_naive_batched_matmul() {
         w,
         x_groups,
         poot_graph_ir::OperandPrecision::Exact,
+        poot_target::RoundingConversions::NONE,
     );
     let spv_bytes = spv(&body, "attn_scores_v");
 
@@ -1609,6 +1614,7 @@ fn attn_scores_v_gemv_lds_matches_naive_batched_matmul() {
         &b_shape,
         None,
         poot_graph_ir::OperandPrecision::Exact,
+        poot_target::RoundingConversions::NONE,
     );
     let naive_bytes = spv(&naive_body, "attn_scores_v_naive");
     let out_numel = rows * d;
@@ -1744,6 +1750,7 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
                 kg::WeightLayout::Kn,
                 BufferStorage::f32(),
                 poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
             )
             .expect("f32 weight storage"),
         ),
@@ -1760,6 +1767,7 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
                 &rmsnorm_kernel(8, eps),
                 4,
                 1,
+                poot_target::RoundingConversions::NONE,
             )
             .expect("fused_row_parallel precondition"),
         ),
@@ -1773,6 +1781,7 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
                 &softmax_kernel(10),
                 4,
                 1,
+                poot_target::RoundingConversions::NONE,
             )
             .expect("fused_row_parallel precondition"),
         ),
@@ -1799,6 +1808,7 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
                 w,
                 n,
                 poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
             ),
         ),
         (
@@ -1816,6 +1826,7 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
                 &[8, 6],
                 None,
                 poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
             ),
         ),
         (
@@ -1828,6 +1839,7 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
                 &[8, 6],
                 None,
                 poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
             ),
         ),
         ("cast_f32_to_f16", kg::cast_f32_to_f16("cast_f32_f16_gate")),
@@ -1965,6 +1977,7 @@ fn matmul_epilogue_chain_matches_cpu() {
         &chain_epilogue(Ty::F32, &out_shape),
         None,
         poot_graph_ir::OperandPrecision::Exact,
+        poot_target::RoundingConversions::NONE,
     )
     .expect("the epilogue's leaf storage is valid");
     let s = spv(&body, "mm_epilogue");
@@ -2144,6 +2157,7 @@ fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
                 &chain_epilogue(dt.clone(), &[2, 3, 5]),
                 None,
                 poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
             )
             .expect("the epilogue's leaf storage is valid");
             let asm = ptx(&body, &format!("epilogue_serial_{dt:?}"));

@@ -350,6 +350,7 @@ impl Context {
             // SPIR-V holds E4M3FN in packed lanes and has no native two-byte float lane on any Vulkan device.
             e4m3_storage: poot_target::E4m3Storage::PackedLanes,
             native_two_byte_floats: false,
+            rounding_conversions: poot_target::RoundingConversions::NONE,
             widens_bf16_decode_weight: false,
             peer_transport: false,
             decode_gemv_max_out_cols: None,

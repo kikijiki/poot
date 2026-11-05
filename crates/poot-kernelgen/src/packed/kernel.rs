@@ -23,6 +23,7 @@ use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
 use crate::helpers::{Alloc, WeightLayout, elem, guard, ld, local, slice_dtype, slice_f32};
 use crate::precision::ProductRead;
 use poot_graph_ir::OperandPrecision;
+use poot_target::RoundingConversions;
 
 /// What one generated packed kernel computes (dquant.md 3.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -103,6 +104,7 @@ pub fn packed_value_bits(format: WeightFormat) -> u32 {
 /// [`PackedRows::Indexed`] table is a Gemv (decode, per-row ids) or the register-tiled schedule over the rows
 /// grouped by expert (prefill), both with an epilogue. `meta` is the request's metadata; a tiled body reads its extents from it
 /// ([`TiledExtents::of_meta`]).
+#[expect(clippy::too_many_arguments)] // the format, schedule, rows and epilogue of one body, and how it rounds
 pub(crate) fn packed_contraction(
     name: &str,
     format: WeightFormat,
@@ -111,14 +113,16 @@ pub(crate) fn packed_contraction(
     epilogue: Option<&Epilogue>,
     rows: PackedRows,
     precision: OperandPrecision,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     const GENERATOR: &str = "packed_contraction";
     if let Some(epilogue) = epilogue {
         epilogue.require_f32("packed_contraction")?;
         epilogue.refuse_narrow_store("packed_contraction")?;
     }
-    // A packed weight is decoded to f32 inside the nest, so a narrowed or split precision rounds it.
-    let read = ProductRead::decoded(precision);
+    // A packed weight is decoded to f32 inside the nest, so a narrowed or split precision rounds it: decoded
+    // directly to the fragment dtype through the device's rounding (POOT-1458).
+    let read = ProductRead::decoded(precision, conversions);
     match schedule {
         Schedule::Gemv {
             width,

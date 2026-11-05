@@ -19,6 +19,7 @@ use super::{
     BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, FusedRegion,
     KernelRequest, OpKind, PackedRequest, PlanError, Planned, matmul, value_ids,
 };
+use crate::dtype_widen::ConstLanes;
 use crate::planner::{GraphTables, finalize};
 use crate::predicates::{INDEXED_GEMV_MAX_ROWS, gemv_activation, packed_contraction_m_per_block};
 use crate::refusal::Site;
@@ -44,7 +45,7 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
-    packed_operands: &[bool],
+    const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
     match &eqn.op {
         // No standalone dequantize kernel exists: a `PackedDequant` that no contraction or row gather claims is
@@ -69,7 +70,7 @@ pub(super) fn plan(
             *rows,
             *precision,
             None,
-            packed_operands,
+            const_lanes,
         ),
         // A packed contraction followed by its pointwise epilogue (`fuse_contraction_epilogues`): the same
         // Gemv as above with the epilogue applied to each column's sum before its store.
@@ -94,7 +95,7 @@ pub(super) fn plan(
             *rows,
             *precision,
             Some(region),
-            packed_operands,
+            const_lanes,
         ),
         OpKind::PackedRowGather { descriptor } => try_plan_row_gather(
             g,
@@ -217,7 +218,7 @@ fn try_plan_contraction(
     rows: ContractionRows,
     precision: OperandPrecision,
     epilogue: Option<&FusedRegion>,
-    packed_operands: &[bool],
+    const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
     let format = crate::packed_block_float::admit_packed(
@@ -295,7 +296,7 @@ fn try_plan_contraction(
             region,
             out_shape,
             odt,
-            packed_operands,
+            const_lanes,
             // Only the dense tiled body stores a narrowed output (POOT-1448).
             false,
         )?),

@@ -187,3 +187,16 @@ fn rmsnorm_dyn_asset_matches_cpu_on_wgpu() {
         assert!((g - w).abs() < 1e-4, "rmsnorm_dyn[{i}]: {g} vs CPU ref {w}");
     }
 }
+
+/// POOT-1460: a float `Ne` compiled to SPIR-V is IEEE, `NaN != x` true for every `x` (`FUnordNotEqual`, not
+/// `FOrdNotEqual`). Mutation: lower float `Ne` to `fcmp one` in `poot-codegen/src/emit.rs`; the `NaN` lanes read
+/// back 0.0 and this row goes red.
+#[test]
+fn float_ne_is_ieee_on_nan_on_wgpu() {
+    let Some(mut device) = wgpu() else {
+        return;
+    };
+    let body = poot_kernel_ir::test_support::float_ne_kernel();
+    let kernel = load(&mut device, "float_ne", &body);
+    poot_executor_parity::float_ne::check("wgpu", &mut device, &kernel);
+}

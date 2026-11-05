@@ -766,8 +766,9 @@ pub(crate) enum StorageKind {
     /// `DenseContraction`, card 381's `DenseRowGather`, and the decode GEMV weight lane). Always BF16
     /// (see [`ValueStorage::dtype`]).
     Bf16Packed,
-    /// F16 checkpoint bytes packed two elements per device `u32` word (Card 1007): a `DenseContraction`
-    /// weight, which every backend's generated body decodes in-register. Always F16.
+    /// F16 values packed two elements per device `u32` word, which every backend's generated body decodes
+    /// in-register: an F16 `DenseContraction` weight's checkpoint bytes (Card 1007), or a BF16 weight of
+    /// contractions that multiply in f16, rounded to f16 once at bind (POOT-1458, `Bf16ConstLane::F16`).
     F16Packed,
     /// E4M3FN checkpoint bytes packed four elements per device `u32` word, each row of the last axis
     /// padded to a whole word (POOT-1060): a `DenseRowGather` table, which every backend's imported

@@ -194,8 +194,8 @@ fn fragment(schedule: Schedule) -> (FragmentDtype, FragmentLayout, u32) {
 }
 
 /// A `Narrow` policy on ROCm plans every prefill-shaped dense and packed contraction family on the
-/// bf16 fragment with the declared lane map: a dense contraction over a bf16 weight, a plain matmul over an
-/// f32 `[K, N]` weight, and a packed (quantized) contraction. Mutation: in `RegisterTiling::candidates`, drop the
+/// f16 fragment (POOT-1458: f16 first where the unit has it) with the declared lane map: a dense contraction over
+/// a bf16 weight, a plain matmul over an f32 `[K, N]` weight, and a packed (quantized) contraction. Mutation: in `RegisterTiling::candidates`, drop the
 /// fragment chain; every row plans the scalar tiling and goes red with `expected a fragment tiling`.
 #[test]
 fn a_narrow_policy_plans_the_fragment_tiling_on_rocm() {
@@ -215,7 +215,7 @@ fn a_narrow_policy_plans_the_fragment_tiling_on_rocm() {
         let (dtype, layout, waves) = fragment(schedule);
         assert_eq!(
             (dtype, layout),
-            (FragmentDtype::Bf16, declared),
+            (FragmentDtype::F16, declared),
             "{name}: {schedule:?}"
         );
         assert!(
@@ -258,7 +258,7 @@ fn an_exact_policy_or_a_device_without_units_plans_the_scalar_tiling() {
 fn a_split_policy_plans_the_fragment_tiling_too() {
     let program = compiled(&dense_bf16(), &rocm_wmma(), MatmulPrecision::Split);
     let (dtype, _, _) = fragment(schedule_of(&program, is_dense));
-    assert_eq!(dtype, FragmentDtype::Bf16);
+    assert_eq!(dtype, FragmentDtype::F16);
 }
 
 /// RADV has an opaque f16 unit. wgpu leaves the pipeline's subgroup size to the driver, so its workgroup is one

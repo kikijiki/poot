@@ -15,7 +15,7 @@
 //! accumulate); an epilogue after a K loop would silently remove the loop's contraction instead of its own.
 
 use poot_kernel_ir::{Constant, Local, LocalDecl, Operand, Rvalue, Ty};
-use poot_target::{BufferStorage, FragmentDtype};
+use poot_target::{BufferStorage, FragmentDtype, RoundingConversions};
 
 use crate::KernelGenError;
 use crate::emit::{Emit, copy};
@@ -35,9 +35,24 @@ pub(crate) struct BoundEpilogue<'a> {
 }
 
 impl BoundEpilogue<'_> {
-    /// The value to store for output element `out_index` whose sum is `acc` ([`emit_epilogue`]).
-    pub(crate) fn emit(self, e: &mut Emit, out_index: Local, acc: Local) -> Local {
-        emit_epilogue(e, self.epilogue, out_index, self.leaves, self.lanes, acc)
+    /// The value to store for output element `out_index` whose sum is `acc` ([`emit_epilogue`]), a `Narrow` step
+    /// rounded as `conversions` says.
+    pub(crate) fn emit(
+        self,
+        e: &mut Emit,
+        conversions: RoundingConversions,
+        out_index: Local,
+        acc: Local,
+    ) -> Local {
+        emit_epilogue(
+            e,
+            self.epilogue,
+            conversions,
+            out_index,
+            self.leaves,
+            self.lanes,
+            acc,
+        )
     }
 }
 
@@ -194,6 +209,7 @@ fn round_through(e: &mut Emit, dt: &Ty, value: Local) -> Local {
 pub(crate) fn emit_epilogue(
     e: &mut Emit,
     epilogue: &Epilogue,
+    conversions: RoundingConversions,
     out_index: Local,
     leaves: &[Local],
     lanes: &[Option<WeightLane>],
@@ -215,7 +231,16 @@ pub(crate) fn emit_epilogue(
                 EpilogueInput::Lit(value) => Operand::Const(Constant::F32(value)),
                 EpilogueInput::Leaf(j) => {
                     let value = *leaf_values[j].get_or_insert_with(|| {
-                        read_leaf(e, epilogue, j, lanes[j], &out_strides, out_index, leaves[j])
+                        read_leaf(
+                            e,
+                            epilogue,
+                            conversions,
+                            j,
+                            lanes[j],
+                            &out_strides,
+                            out_index,
+                            leaves[j],
+                        )
                     });
                     copy(value)
                 }
@@ -224,7 +249,7 @@ pub(crate) fn emit_epilogue(
         let result = {
             let (al, stmts) = e.parts();
             let result = al.add(Ty::F32, false);
-            emit_scalar_op(result, step.op, &operands, al, stmts);
+            emit_scalar_op(result, step.op, &operands, conversions, al, stmts);
             result
         };
         steps.push(round_through(e, &epilogue.dt, result));
@@ -233,7 +258,16 @@ pub(crate) fn emit_epilogue(
         EpilogueInput::Head => head,
         EpilogueInput::Step(s) => steps[s],
         EpilogueInput::Leaf(j) => *leaf_values[j].get_or_insert_with(|| {
-            read_leaf(e, epilogue, j, lanes[j], &out_strides, out_index, leaves[j])
+            read_leaf(
+                e,
+                epilogue,
+                conversions,
+                j,
+                lanes[j],
+                &out_strides,
+                out_index,
+                leaves[j],
+            )
         }),
         EpilogueInput::Lit(value) => {
             e.let_(Ty::F32, Rvalue::Use(Operand::Const(Constant::F32(value))))
@@ -241,11 +275,13 @@ pub(crate) fn emit_epilogue(
     }
 }
 
-/// Leaf `j` of `epilogue` (in `buffer`, read through `lane`) at the broadcast position of output element
-/// `out_index`, widened to f32.
+/// Leaf `j` of `epilogue` (in `buffer`, read through `lane`, a half decoded as `conversions` says) at the
+/// broadcast position of output element `out_index`, widened to f32.
+#[expect(clippy::too_many_arguments)] // the leaf, its lane and buffer, and the output position it broadcasts to
 fn read_leaf(
     e: &mut Emit,
     epilogue: &Epilogue,
+    conversions: RoundingConversions,
     j: usize,
     lane: Option<WeightLane>,
     out_strides: &[usize],
@@ -270,7 +306,7 @@ fn read_leaf(
         offset
     };
     if let Some(lane) = lane {
-        return lane.emit_elem(e, buffer, offset);
+        return lane.emit_elem(e, conversions, buffer, offset);
     }
     let raw = e.let_(dt.clone(), Rvalue::Use(Operand::Copy(elem(buffer, offset))));
     if matches!(dt, Ty::BF16 | Ty::F16) {

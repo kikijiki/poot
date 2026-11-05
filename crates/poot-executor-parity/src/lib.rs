@@ -39,6 +39,7 @@ pub mod device_sampling;
 pub mod dispatch_length;
 pub mod echo;
 pub mod f16_range_guard;
+pub mod float_ne;
 pub mod gdn;
 pub mod i32_gather;
 pub mod launch;
@@ -574,21 +575,62 @@ pub fn staged_on(exec: &dyn Executor, fixture: &Fixture, target: Target) -> Stag
     staged_under(exec, fixture, target, MatmulPrecision::Exact)
 }
 
+/// The operand precision a parity row compiles under: the driver policy, and optionally the one fragment dtype the
+/// precision pass may narrow to on a device with several (`CompileOptions::fragment_only`, POOT-1458: the bf16 path
+/// of a device whose default is f16).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Policy {
+    /// The driver's `--matmul-precision`.
+    pub precision: MatmulPrecision,
+    /// The one fragment dtype the pass may narrow to; `None` leaves the choice to the pass.
+    pub fragment_only: Option<poot_graph_ir::FragmentDtype>,
+}
+
+impl From<MatmulPrecision> for Policy {
+    fn from(precision: MatmulPrecision) -> Self {
+        Self {
+            precision,
+            fragment_only: None,
+        }
+    }
+}
+
+impl Policy {
+    /// `target` as the precision pass sees it under this policy: its matrix units cut down to `fragment_only`. What
+    /// the oracle of the declared semantics reads ([`poot_graph_plan::with_operand_precision`]), so it declares the
+    /// precision the compiled program narrows to.
+    pub fn declaring_target(self, target: Target) -> Target {
+        match (self.fragment_only, target) {
+            (Some(only), Target::Gpu { backend, mut caps }) => {
+                let config = caps
+                    .matrix_units
+                    .known()
+                    .and_then(|units| units.config(only).copied());
+                caps.matrix_units =
+                    poot_target::Queried::Known(poot_target::MatrixUnits::of(config));
+                Target::Gpu { backend, caps }
+            }
+            (_, target) => target,
+        }
+    }
+}
+
 /// [`staged_on`] under the operand-precision policy `policy` (POOT-1430): the program a driver with that policy
 /// compiles for the device `exec` drives.
 pub fn staged_under(
     exec: &dyn Executor,
     fixture: &Fixture,
     target: Target,
-    policy: MatmulPrecision,
+    policy: impl Into<Policy>,
 ) -> StagedProgram {
-    compile_fixture(
-        fixture,
-        target,
-        &exec
+    let policy = policy.into();
+    let options = CompileOptions {
+        fragment_only: policy.fragment_only,
+        ..exec
             .compile_options(poot_graph_plan::CompileLimits::STANDARD)
-            .with_matmul_precision(policy),
-    )
+            .with_matmul_precision(policy.precision)
+    };
+    compile_fixture(fixture, target, &options)
 }
 
 fn compile_fixture(fixture: &Fixture, target: Target, options: &CompileOptions) -> StagedProgram {
@@ -818,7 +860,7 @@ pub fn run_parity_under(
     exec: &mut dyn Executor,
     target: Target,
     fixture: &Fixture,
-    policy: MatmulPrecision,
+    policy: impl Into<Policy>,
     oracle: &mut Oracle<'_>,
 ) -> Result<(), String> {
     let exe = exec

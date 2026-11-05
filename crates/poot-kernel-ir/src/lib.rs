@@ -420,6 +420,16 @@ ir_node! {
             /// The `F32` value narrowed.
             operand: Operand,
         },
+        /// The two-byte float `to` (`F16` or `BF16`) whose bits are the low 16 bits of the `U32` operand, whose
+        /// high 16 bits are zero: an element of a packed word (POOT-1458). No value conversion: a following `Cast`
+        /// to f32 widens it, which a target with a native conversion lowers to one instruction. A target without
+        /// a 16-bit type to reinterpret into (SPIR-V) refuses it in codegen; the interpreter decodes the bits.
+        FromLowBits {
+            /// The two-byte float type reinterpreted as.
+            to: Ty,
+            /// The `U32` word whose low half is reinterpreted.
+            operand: Operand,
+        },
         /// Bit reinterpret (`f32::from_bits`), no value conversion.
         Bitcast {
             /// The type reinterpreted as.
@@ -1945,6 +1955,17 @@ mod verify {
                         })
                     }
                 }
+                Rvalue::FromLowBits { to, operand } => {
+                    expect_ty("low-bits operand", &Ty::U32, &self.operand_ty(operand)?)?;
+                    if matches!(to, Ty::F16 | Ty::BF16) {
+                        Ok(to.clone())
+                    } else {
+                        Err(VerifyErrorKind::InvalidOperandType {
+                            what: "low-bits target",
+                            found: to.clone(),
+                        })
+                    }
+                }
                 Rvalue::Bitcast { to, operand } => {
                     self.scalar_operand_ty("bitcast operand", operand)?;
                     if is_scalar(to) {
@@ -2603,6 +2624,7 @@ mod verify {
                 .join(operand_class(c, flow).opaque()),
             Rvalue::Cast { operand, .. }
             | Rvalue::Narrow { operand, .. }
+            | Rvalue::FromLowBits { operand, .. }
             | Rvalue::Bitcast { operand, .. }
             | Rvalue::Fp8Encode { operand, .. } => operand_class(operand, flow).opaque(),
             Rvalue::Select {
@@ -2761,6 +2783,7 @@ mod verify {
             | Rvalue::VectorExtract { vector: a, .. } => operand_reads(a, f),
             Rvalue::Cast { operand, .. }
             | Rvalue::Narrow { operand, .. }
+            | Rvalue::FromLowBits { operand, .. }
             | Rvalue::Bitcast { operand, .. }
             | Rvalue::Fp8Encode { operand, .. } => operand_reads(operand, f),
             Rvalue::BinaryOp(_, a, b) | Rvalue::BinaryOpNoContract(_, a, b) => {

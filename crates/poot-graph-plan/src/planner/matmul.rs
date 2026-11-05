@@ -5,6 +5,7 @@ use super::{
     FusedRegion, Graph, KernelRequest, MatmulShapes, OpKind, Operand, PlanError, Planned, Scalar,
     ValueId, WeightLayout, fty_ty, kg, out_numel_saturating, value_ids,
 };
+use crate::dtype_widen::ConstLanes;
 use crate::kernel_mapping::{
     check_widening_step, float_region_leaf_storage, map_fused_op, narrowing_store_op,
 };
@@ -152,7 +153,7 @@ pub(crate) fn epilogue_head_lowers(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> b
 /// dtype `odt`: local 0 is the head result, locals `1..n_inputs` the eqn's extra inputs (leaves), later locals
 /// the steps. A leaf has the head's dtype (a float the generated bodies round through), or, under an f32
 /// epilogue, is a BF16 weight (a bias) that a `Cast` step widens by reading it through its packed lane
-/// (`packed_operands[position]`, the storage plan's choice); anything else is a typed refusal. A region whose last
+/// (`const_lanes.packed(position)`, the storage plan's choice); anything else is a typed refusal. A region whose last
 /// step narrows its f32 result (POOT-1448) is an f32 epilogue with a narrow store, which `stores_narrow` says the
 /// body that runs it has; without it the step is refused.
 #[expect(clippy::too_many_arguments)]
@@ -164,7 +165,7 @@ pub(super) fn epilogue_of(
     region: &FusedRegion,
     out_shape: &[usize],
     odt: DType,
-    packed_operands: &[bool],
+    const_lanes: &ConstLanes,
     stores_narrow: bool,
 ) -> Result<kg::Epilogue, PlanError> {
     // A region whose last step narrows its f32 result (POOT-1448) computes in f32 and stores the narrow dtype.
@@ -184,7 +185,7 @@ pub(super) fn epilogue_of(
         let storage = if leaf_dtype == odt {
             None
         } else if odt == DType::F32 && leaf_dtype == DType::BF16 {
-            let packed = packed_operands.get(position).copied().unwrap_or(false);
+            let packed = const_lanes.packed(position);
             Some(float_region_leaf_storage(site, leaf_dtype, packed)?)
         } else {
             return Err(site.refuse(Capability::DtypeLowering));
@@ -262,7 +263,7 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
-    packed_operands: &[bool],
+    const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
@@ -403,7 +404,7 @@ pub(super) fn plan(
                 region,
                 out_shape,
                 odt,
-                packed_operands,
+                const_lanes,
                 // Only the dense tiled body stores a narrowed output (POOT-1448).
                 false,
             )?;

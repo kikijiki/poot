@@ -923,7 +923,7 @@ pub(crate) fn tiled_body(
                         let first = bin(load, Ty::Usize, BinOp::Add, copy(b_slab), copy(in_slab));
                         for c in 0..cols {
                             let idx = bin(load, Ty::Usize, BinOp::Add, copy(first), cu(c));
-                            let raw = lane.emit_elem(load, *weight, idx);
+                            let raw = lane.emit_elem(load, read.conversions, *weight, idx);
                             let at = kk * b_tile.major.k_step(stride_b)
                                 + c * b_tile.major.x_step(stride_b);
                             let slot =
@@ -1134,7 +1134,7 @@ pub(crate) fn tiled_body(
             };
             match epilogue {
                 Some(epilogue) => {
-                    let value = epilogue.emit(store, out_idx, sum);
+                    let value = epilogue.emit(store, read.conversions, out_idx, sum);
                     store_value(store, epilogue.epilogue.store(), value)
                 }
                 None => sum,

@@ -5,6 +5,7 @@ use super::{
     KernelRequest, Lowering, OpKind, Operand, PlanError, Planned, PointwiseForm, PointwiseSpec,
     RedOp, RopeSpec, RowSpec, RowStep, Scalar, ValueId, ViewOperand, fty_ty, kg, value_ids,
 };
+use crate::dtype_widen::ConstLanes;
 use crate::kernel_mapping::{
     check_widening_step, float_region_leaf_storage, map_fused_input, map_fused_input_i32,
     map_fused_local, map_fused_op, map_fused_op_i32, map_mixed_input_i32, map_pointwise_step,
@@ -58,7 +59,7 @@ pub(super) fn plan(
     views: &HashMap<ValueId, Layout>,
     odt: DType,
     limits: BodyLimits,
-    packed_operands: &[bool],
+    const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, lowering.id(), limits);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
@@ -417,7 +418,7 @@ pub(super) fn plan(
                 .iter()
                 .enumerate()
                 .map(|(j, &id)| {
-                    let packed = packed_operands.get(j).copied().unwrap_or(false);
+                    let packed = const_lanes.packed(j);
                     float_region_leaf_storage(site, g.aval(id).dtype, packed)
                 })
                 .collect::<Result<Vec<_>, PlanError>>()?;

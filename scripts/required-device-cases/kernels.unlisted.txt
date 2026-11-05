@@ -92,6 +92,7 @@ poot-kernelgen	packed::row_gather_tests::row_gather_matches_decode_blocks_rows_f
 poot-kernelgen	packed::row_gather_tests::row_gather_matches_decode_blocks_rows_on_wgpu	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::row_gather_tests::row_gather_matches_decode_blocks_rows_on_wgpu_kquant	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	precision::tests::a_staged_operand_is_rounded_once_and_narrowed_exactly	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	precision::tests::the_sweep_bodies_find_no_mismatch_on_the_interpreter	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	reduce::tests::array_sum_probe_emits_valid_nvptx	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	reduce::tests::array_sum_probe_rejected_on_spirv	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	reduce::tests::reduce_last_lds_emits_valid_nvptx	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case

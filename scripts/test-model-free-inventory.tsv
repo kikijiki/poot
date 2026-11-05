@@ -117,6 +117,8 @@ poot-codegen	poot-codegen::constant_table	model-free	every_target_declares_the_t
 poot-codegen	poot-codegen::constant_table	model-free	the_amdgcn_module_compiles
 poot-codegen	poot-codegen::constant_table	model-free	the_nvptx_module_reads_the_table_from_global_memory
 poot-codegen	poot-codegen::constant_table	model-free	the_vulkan_module_validates
+poot-codegen	poot-codegen::float_ne	model-free	float_eq_stays_ordered
+poot-codegen	poot-codegen::float_ne	model-free	float_ne_lowers_to_the_unordered_compare
 poot-codegen	poot-codegen::min_max_width	model-free	float_min_max_name_the_operand_width
 poot-codegen	poot-codegen::min_max_width	model-free	integer_min_max_name_the_operand_width
 poot-codegen	poot-codegen::min_max_width	model-free	usize_min_max_follow_the_target_pointer_width
@@ -401,6 +403,8 @@ poot-executor	poot-executor	model-free	device::flush_policy_tests::a_device_has_
 poot-executor	poot-executor	model-free	device::flush_policy_tests::a_run_is_cut_at_either_bound_and_never_when_empty
 poot-executor	poot-executor	model-free	engine::arena_slot_alloc_tests::arena_slot_native_elems_reach_device_allocate_unconverted
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_bf16_weight_declared_f32_is_a_typed_refusal_never_widened
+poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_bf16_weight_of_an_f16_contraction_uploads_rounded_to_f16_once
+poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_bf16_weight_past_the_f16_range_of_its_contraction_is_refused_at_bind
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_contraction_weight_declared_f32_but_stored_f16_is_a_typed_refusal
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_file_truncated_while_its_weight_uploads_is_a_typed_read_error
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_non_finite_packed_f16_weight_is_a_typed_refusal
@@ -464,6 +468,7 @@ poot-executor	poot-executor	model-free	engine::weight_source_tests::the_host_see
 poot-executor	poot-executor	model-free	host_memory::tests::a_status_text_is_read_in_bytes
 poot-executor	poot-executor	model-free	host_memory::tests::a_status_without_a_field_is_none
 poot-executor	poot-executor	model-free	host_memory::tests::the_live_reading_sees_anonymous_memory_the_process_touches
+poot-executor	poot-executor	model-free	lanes::tests::a_bf16_weight_in_the_f16_lane_is_rounded_once_and_refused_past_the_range
 poot-executor	poot-executor	model-free	lanes::tests::a_host_f16_view_lands_only_in_the_native_f16_lane
 poot-executor	poot-executor	model-free	lanes::tests::an_e4m3_table_pads_each_row_to_a_whole_word
 poot-executor	poot-executor	model-free	lanes::tests::dense_e4m3_storage_has_no_encoding
@@ -1268,6 +1273,7 @@ poot-graph-plan	poot-graph-plan::f16_range_guard	model-free	a_product_of_two_run
 poot-graph-plan	poot-graph-plan::f16_range_guard	model-free	activations_past_the_f16_range_give_a_finite_correct_output
 poot-graph-plan	poot-graph-plan::f16_range_guard	model-free	rows_in_range_compute_the_unguarded_f16_program_bit_for_bit
 poot-graph-plan	poot-graph-plan::f16_range_guard	model-free	the_oracle_graph_and_the_program_narrow_the_same_contractions
+poot-graph-plan	poot-graph-plan::f16_weight_lane	model-free	a_bf16_weight_of_f16_contractions_is_one_f16_lane_for_its_buffer_and_its_body
 poot-graph-plan	poot-graph-plan::flash_prefill_softcap_fusion	model-free	flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference
 poot-graph-plan	poot-graph-plan::fragment_attention_plan	model-free	a_bf16_narrowed_prefill_attention_plans_bf16_fragments_on_the_rocm_matrix_unit
 poot-graph-plan	poot-graph-plan::fragment_attention_plan	model-free	a_fragment_attention_holds_q_where_it_fits_the_register_file
@@ -1343,7 +1349,7 @@ poot-graph-plan	poot-graph-plan::operand_precision	model-free	an_exact_policy_ne
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	attention_takes_the_kv_storage_dtype
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	caps_without_a_matrix_unit_give_exact
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	radv_caps_give_f16
-poot-graph-plan	poot-graph-plan::operand_precision	model-free	rocm_caps_give_bf16_contractions_and_f16_attention
+poot-graph-plan	poot-graph-plan::operand_precision	model-free	rocm_caps_give_f16_contractions_and_f16_attention
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	the_kernel_request_carries_the_declared_precision
 poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_binary_equation_with_three_operands_is_an_operand_count_refusal
 poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_device_below_the_block_top_k_workgroup_is_refused_with_both_numbers
@@ -1379,6 +1385,7 @@ poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_constant_table_read_re
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_lane_that_returns_before_a_barrier_deadlocks_the_workgroup
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_mul_add_rounds_once
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_select_reads_only_the_picked_branch
+poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_two_byte_cast_of_a_nan_keeps_only_the_bits_the_type_holds
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_vector_group_index_that_overflows_is_an_out_of_bounds_fault
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_vector_load_at_a_near_usize_max_group_index_is_a_typed_fault
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::an_exact_narrowing_keeps_narrow_values_and_faults_on_any_other
@@ -1506,6 +1513,10 @@ poot-kernelgen	poot-kernelgen	device	packed::rocm_tests::row_gather_matches_deco
 poot-kernelgen	poot-kernelgen	device	packed::rocm_tests::row_gather_matches_decode_blocks_rows_on_rocm_kquant
 poot-kernelgen	poot-kernelgen	device	packed::row_gather_tests::row_gather_matches_decode_blocks_rows_on_wgpu
 poot-kernelgen	poot-kernelgen	device	packed::row_gather_tests::row_gather_matches_decode_blocks_rows_on_wgpu_kquant
+poot-kernelgen	poot-kernelgen	device	precision::ptx_sweep::the_f16_conversion_decodes_every_finite_f16_as_the_integer_form_on_ptx
+poot-kernelgen	poot-kernelgen	device	precision::ptx_sweep::the_f16_conversion_rounds_every_f32_as_the_integer_form_on_ptx
+poot-kernelgen	poot-kernelgen	device	precision::rocm_sweep::the_f16_conversion_decodes_every_finite_f16_as_the_integer_form_on_rocm
+poot-kernelgen	poot-kernelgen	device	precision::rocm_sweep::the_f16_conversion_rounds_every_f32_as_the_integer_form_on_rocm
 poot-kernelgen	poot-kernelgen	device	reduce::tests::reduce_last_lds_parallel
 poot-kernelgen	poot-kernelgen	device	synchronization::tests::global_atomic_add_counter_sums_across_threads
 poot-kernelgen	poot-kernelgen	device	vec4_probe::vec4_add_splat_validates_and_matches_cpu
@@ -1581,6 +1592,7 @@ poot-kernelgen	poot-kernelgen	model-free	packed::row_gather_tests::row_gather_bo
 poot-kernelgen	poot-kernelgen	model-free	packed::row_gather_tests::row_gather_matches_decode_blocks_rows_for_every_block32_format
 poot-kernelgen	poot-kernelgen	model-free	packed::row_gather_tests::row_gather_matches_decode_blocks_rows_for_every_kquant_format
 poot-kernelgen	poot-kernelgen	model-free	precision::tests::a_staged_operand_is_rounded_once_and_narrowed_exactly
+poot-kernelgen	poot-kernelgen	model-free	precision::tests::the_sweep_bodies_find_no_mismatch_on_the_interpreter
 poot-kernelgen	poot-kernelgen	model-free	reduce::tests::array_sum_probe_emits_valid_nvptx
 poot-kernelgen	poot-kernelgen	model-free	reduce::tests::array_sum_probe_rejected_on_spirv
 poot-kernelgen	poot-kernelgen	model-free	reduce::tests::reduce_last_lds_emits_valid_nvptx
@@ -1833,6 +1845,12 @@ poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::ptx_bf16::qwen2_5_1_5b_q
 poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::ptx_bf16::qwen3_0_6b
 poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::ptx_bf16::qwen3_0_6b_q8_0
 poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::ptx_bf16::qwen3_4b
+poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::ptx_f16::gemma_3_1b_it
+poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::ptx_f16::llama_3_2_1b_instruct
+poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::ptx_f16::qwen2_5_1_5b_q4_k_m
+poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::ptx_f16::qwen3_0_6b
+poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::ptx_f16::qwen3_0_6b_q8_0
+poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::ptx_f16::qwen3_4b
 poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::rocm_bf16::gemma_3_1b_it
 poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::rocm_bf16::llama_3_2_1b_instruct
 poot-llm	poot-llm	checkpoint	driver::narrow_gate_tests::rocm_bf16::qwen2_5_1_5b_q4_k_m
@@ -4177,6 +4195,7 @@ poot-ptx-device	poot-ptx-device::device_caps_planning	device	a_live_ptx_device_r
 poot-ptx-device	poot-ptx-device::device_caps_planning	device	the_ptx_device_reports_live_free_memory_within_its_open_time_ceiling
 poot-ptx-device	poot-ptx-device::device_timing	device	plain_ptx_device_reports_unknown_device_time
 poot-ptx-device	poot-ptx-device::device_timing	device	timed_ptx_device_reads_a_nonzero_device_time_for_a_known_kernel
+poot-ptx-device	poot-ptx-device::float_ne	device	float_ne_is_ieee_on_nan_on_ptx
 poot-ptx-device	poot-ptx-device::i32_index	device	gather_with_i32_indices_matches_the_oracle_bit_for_bit_on_ptx
 poot-ptx-device	poot-ptx-device::indexed_matmul	device	indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit
 poot-ptx-device	poot-ptx-device::indexed_matmul	device	indexed_matmul_checkpoint_order_experts_match_the_oracle_bit_for_bit
@@ -4425,6 +4444,7 @@ poot-rocm-device	poot-rocm-device::cross_backend	device	unary_tanh_rocm_matches_
 poot-rocm-device	poot-rocm-device::device_timing	device	plain_rocm_device_reports_unknown_device_time
 poot-rocm-device	poot-rocm-device::device_timing	device	timed_rocm_device_reads_a_nonzero_device_time_for_a_known_kernel
 poot-rocm-device	poot-rocm-device::device_timing	device	timing_does_not_change_the_rocm_scan_result
+poot-rocm-device	poot-rocm-device::float_ne	device	float_ne_is_ieee_on_nan_on_rocm
 poot-rocm-device	poot-rocm-device::i32_index	device	gather_with_i32_indices_matches_the_oracle_bit_for_bit_on_rocm
 poot-rocm-device	poot-rocm-device::indexed_matmul	device	indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit
 poot-rocm-device	poot-rocm-device::indexed_matmul	device	indexed_matmul_checkpoint_order_experts_match_the_oracle_bit_for_bit

@@ -3,7 +3,8 @@
 //! (`receipts/1457-f16-range-guard/design.md`).
 //!
 //! Every row drives the production `compile` on RADV caps (f16 fragments only, so the narrow policy rounds to f16)
-//! and on gfx1151 caps cut down to their f16 fragments (`fragment_only`: ROCm narrows to bf16 by default), and
+//! and on gfx1151 caps cut down to their f16 fragments (`fragment_only`; f16 is also ROCm's default since
+//! POOT-1458), and
 //! evaluates the compiled graph with the CPU oracle, which computes the program's declared rounding: the oracle of a
 //! narrowed op rounds its operands as the device does.
 

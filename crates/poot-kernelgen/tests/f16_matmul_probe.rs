@@ -73,6 +73,7 @@ fn f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv() {
         &b_shape,
         None,
         poot_graph_ir::OperandPrecision::Exact,
+        poot_target::RoundingConversions::NONE,
     );
 
     // (1) SC-002 half 1: F16 matmul lowers to valid SPIR-V and passes spirv-val on RADV. Build-time

@@ -58,6 +58,7 @@ fn fused_row_parallel_folded_grid_covers_every_row() {
         &softmax_kernel(n_cols),
         width,
         x_groups,
+        poot_target::RoundingConversions::NONE,
     )
     .expect("fused_row_parallel precondition");
     let scores: Vec<f32> = (0..num_rows * n_cols)
@@ -162,6 +163,7 @@ fn fused_row_reads_a_packed_bf16_leaf_as_its_widened_values() {
         &rmsnorm_with_packed_scale(n_cols, eps),
         width,
         num_rows,
+        poot_target::RoundingConversions::NONE,
     )
     .expect("a packed leaf is a stated lane");
     let mut buffers = [
@@ -264,6 +266,7 @@ fn a_row_kernel_writes_a_per_row_scale_and_two_rows_in_one_pass() {
             &norm_with_row_scale(n_cols, eps),
             width,
             num_rows,
+            poot_target::RoundingConversions::NONE,
         )
         .expect("a multi-output row kernel");
         let mut buffers = [
@@ -327,6 +330,7 @@ fn a_row_kernel_whose_result_is_a_per_row_scalar_reduces_the_full_row() {
             &kernel,
             width,
             num_rows,
+            poot_target::RoundingConversions::NONE,
         )
         .expect("a per-row scalar result");
         let mut buffers = [

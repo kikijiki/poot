@@ -705,6 +705,7 @@ fn generated_pointwise_and_batched_tiled_bodies_lower_on_every_gpu_target() {
             &[Layout::contiguous(&a_shape), Layout::contiguous(&b_shape)],
             &kernel,
             None,
+            poot_target::RoundingConversions::NONE,
         )
         .expect("a broadcast binary generates")
     };

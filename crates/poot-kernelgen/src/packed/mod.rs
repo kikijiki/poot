@@ -1224,6 +1224,7 @@ mod contraction_tests {
             None,
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
+            poot_target::RoundingConversions::NONE,
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -1255,9 +1256,10 @@ mod contraction_tests {
     /// and the weight, decoded to f32 inside the nest, is rounded after the decode (a packed weight is never
     /// stored in the fragment dtype), in the decode Gemv and the register-tiled schedule, for every block-32 and
     /// K-quant format. The output equals a host product over the same rounded terms (`poot_eval`'s rounding, the
-    /// oracle's definition) to the sum's own rounding error. Mutation: in `packed_contraction` read the weight
-    /// as `ProductRead::dense(.., WeightLane::Bf16Packed)` (as if stored narrow, so never rounded); the f16 rows
-    /// go red.
+    /// oracle's definition) to the sum's own rounding error, under the integer rounding and the kept f16
+    /// conversion alike (POOT-1458: the decode goes directly to the fragment dtype through the device's rounding).
+    /// Mutation: in `packed_contraction` read the weight as `ProductRead::dense(.., WeightLane::Bf16Packed)` (as if
+    /// stored narrow, so never rounded); the f16 rows go red.
     #[test]
     fn a_narrowed_packed_contraction_rounds_the_decoded_weight_and_the_activation() {
         use poot_graph_ir::{FragmentDtype, OperandPrecision};
@@ -1279,11 +1281,22 @@ mod contraction_tests {
                 }
             }
         };
-        for precision in [
+        let forms = [
+            poot_target::RoundingConversions::NONE,
+            poot_target::RoundingConversions::F16,
+        ];
+        for (precision, conversions) in [
             OperandPrecision::Narrow(FragmentDtype::F16),
             OperandPrecision::Narrow(FragmentDtype::Bf16),
             OperandPrecision::Split(FragmentDtype::F16),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|precision| forms.map(|conversions| (precision, conversions)))
+        // The kept conversion is f16's only: a bf16 precision rounds the same way under either.
+        .filter(|(precision, conversions)| {
+            *conversions == poot_target::RoundingConversions::NONE
+                || precision.fragment_dtype() == Some(FragmentDtype::F16)
+        }) {
             for format in BLOCK32.into_iter().chain(KQUANT) {
                 // Two blocks per row with a hand-made tiling, and eight (K = 256 for the 32-value formats) with the
                 // tiling the planner's cost model picks for the shape.
@@ -1329,6 +1342,7 @@ mod contraction_tests {
                         None,
                         crate::PackedRows::Blocks,
                         precision,
+                        conversions,
                     )
                     .unwrap();
                     let metadata = [k as u32, out_per_block as u32, m as u32, 0, 0];
@@ -1359,7 +1373,7 @@ mod contraction_tests {
                             assert!(
                                 !want.is_finite()
                                     || (got - want).abs() <= 1e-5 * magnitude.max(1.0),
-                                "{format:?} {precision} {schedule:?} [{row}, {col}]: {got} vs {want}"
+                                "{format:?} {precision} {conversions:?} {schedule:?} [{row}, {col}]: {got} vs {want}"
                             );
                         }
                     }
@@ -1426,6 +1440,7 @@ mod contraction_tests {
             None,
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
+            poot_target::RoundingConversions::NONE,
         );
         assert!(
             matches!(
@@ -1535,6 +1550,7 @@ mod contraction_tests {
                     Some(&epilogue),
                     crate::PackedRows::Blocks,
                     poot_graph_ir::OperandPrecision::Exact,
+                    poot_target::RoundingConversions::NONE,
                 )
                 .unwrap_or_else(|error| panic!("{format:?}: {error}"));
                 body.verify().expect("the epilogue body verifies");
@@ -1575,6 +1591,7 @@ mod contraction_tests {
             Some(&epilogue),
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
+            poot_target::RoundingConversions::NONE,
         )
         .expect_err("a packed tiled contraction has no epilogue");
         assert_eq!(
@@ -1667,6 +1684,7 @@ mod contraction_tests {
                 None,
                 crate::PackedRows::Blocks,
                 poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
             )
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -1719,6 +1737,7 @@ mod contraction_tests {
                     None,
                     crate::PackedRows::Blocks,
                     poot_graph_ir::OperandPrecision::Exact,
+                    poot_target::RoundingConversions::NONE,
                 )
                 .unwrap();
                 let _ = crate::unit_helpers::spv(&body, &format!("{name}_spv"));
@@ -1753,6 +1772,7 @@ mod contraction_tests {
                     None,
                     crate::PackedRows::Blocks,
                     poot_graph_ir::OperandPrecision::Exact,
+                    poot_target::RoundingConversions::NONE,
                 )
                 .unwrap();
                 let _ = crate::unit_helpers::spv(&body, &format!("{name}_spv"));
@@ -1776,6 +1796,7 @@ mod contraction_tests {
                 None,
                 crate::PackedRows::Blocks,
                 poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
             )
             .unwrap();
             let _ = crate::unit_helpers::spv(&body, &format!("{name}_spv"));
@@ -1817,6 +1838,7 @@ mod contraction_tests {
             None,
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
+            poot_target::RoundingConversions::NONE,
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let dir = std::env::temp_dir()
@@ -1993,6 +2015,7 @@ mod contraction_tests {
                 None,
                 crate::PackedRows::Blocks,
                 poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
             )
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
             let dir = std::env::temp_dir()
@@ -2111,6 +2134,7 @@ mod planar_contraction_tests {
             None,
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
+            poot_target::RoundingConversions::NONE,
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -2238,6 +2262,7 @@ mod planar_contraction_tests {
                 None,
                 crate::PackedRows::Blocks,
                 poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
             )
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -2531,6 +2556,7 @@ mod rocm_tests {
             None,
             crate::PackedRows::Blocks,
             precision,
+            poot_target::RoundingConversions::NONE,
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let words = pack_words(&bytes);
@@ -2791,6 +2817,7 @@ mod rocm_tests {
                     None,
                     crate::PackedRows::Blocks,
                     poot_graph_ir::OperandPrecision::Exact,
+                    poot_target::RoundingConversions::NONE,
                 )
                 .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
                 let metadata = [k as u32, out_rows as u32, m as u32, 0, 0]; // [3] x_groups unused (unfolded), [4] tile_offset 0
@@ -2835,6 +2862,7 @@ mod rocm_tests {
                 None,
                 crate::PackedRows::Blocks,
                 poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
             )
             .unwrap_or_else(|error| panic!("{:?}: packed_kernel: {error}", case.format));
             let metadata = [k as u32, case.out_rows as u32, case.m as u32, 0, 0]; // [3] x_groups unused (unfolded), [4] tile_offset 0
@@ -2898,6 +2926,7 @@ mod planar_wgpu_tests {
                 None,
                 crate::PackedRows::Blocks,
                 poot_graph_ir::OperandPrecision::Exact,
+                poot_target::RoundingConversions::NONE,
             )
             .unwrap_or_else(|error| panic!("{:?}: packed_kernel: {error}", case.format));
             assert_eq!(body.workgroup_size[0], lanes, "the case's lane grid");
@@ -3090,6 +3119,7 @@ mod ptx_tests {
             None,
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
+            poot_target::RoundingConversions::NONE,
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let kernel = compile_and_load(&name, &body);
@@ -3356,6 +3386,7 @@ mod planar_ptx_tests {
             None,
             crate::PackedRows::Blocks,
             poot_graph_ir::OperandPrecision::Exact,
+            poot_target::RoundingConversions::NONE,
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let kernel = compile_and_load(&name, &body);

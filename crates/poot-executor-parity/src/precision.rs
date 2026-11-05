@@ -144,9 +144,10 @@ pub fn run_parity_declared(
     exec: &mut dyn poot_executor::Executor,
     target: poot_graph_plan::Target,
     fixtures: &[Fixture],
-    policy: poot_graph_ir::MatmulPrecision,
+    policy: impl Into<crate::Policy>,
 ) -> Result<(), String> {
     use poot_eval::test_support::weight_map_oracle::oracle_for;
+    let policy = policy.into();
     for fixture in fixtures {
         let narrowed = crate::staged_under(exec, fixture, target, policy)
             .stages()
@@ -163,8 +164,12 @@ pub fn run_parity_declared(
                 fixture.name
             ));
         }
-        let declared = poot_graph_plan::with_operand_precision(&fixture.graph, &target, policy)
-            .map_err(|e| format!("{}: declare the precision: {e}", fixture.name))?;
+        let declared = poot_graph_plan::with_operand_precision(
+            &fixture.graph,
+            &policy.declaring_target(target),
+            policy.precision,
+        )
+        .map_err(|e| format!("{}: declare the precision: {e}", fixture.name))?;
         let mut oracle = oracle_for(&declared, &fixture.store);
         crate::run_parity_under(exec, target, fixture, policy, &mut oracle)?;
     }
@@ -279,7 +284,7 @@ pub fn narrow_stored_values(
     exec: &dyn poot_executor::Executor,
     target: poot_graph_plan::Target,
     fixture: &Fixture,
-    policy: MatmulPrecision,
+    policy: impl Into<crate::Policy>,
 ) -> Vec<(String, DType)> {
     crate::staged_under(exec, fixture, target, policy)
         .stages()

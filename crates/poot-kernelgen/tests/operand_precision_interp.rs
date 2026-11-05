@@ -6,6 +6,9 @@
 //!   and infinities, so a wrong rounding mode fails whatever the data.
 //! - The product rows: the register-tiled, GEMV, serial and indexed bodies equal a host product over the same
 //!   terms (`hi`, `lo` for a split operand) in the order the oracle sums them.
+//!
+//! Every row runs under the caps of each device family (POOT-1458): SPIR-V rounds in integer arithmetic, ROCm and
+//! PTX round to f16 with a kept conversion (`Cast` to f16 and back). Both forms must give the oracle's bits.
 
 use poot_eval::round_to_fragment;
 use poot_graph_ir::{FragmentDtype, OperandPrecision};
@@ -29,8 +32,30 @@ const LIMITS: kg::BodyLimits = kg::BodyLimits {
     max_locals: std::num::NonZeroUsize::new(1 << 18).unwrap(),
 };
 
-fn caps() -> DeviceCaps {
-    DeviceCaps::wgpu_rdna3_igpu()
+/// One device of each rounding form: SPIR-V (integer), ROCm and PTX (the kept f16 conversion).
+fn devices() -> [DeviceCaps; 3] {
+    [
+        DeviceCaps::wgpu_rdna3_igpu(),
+        DeviceCaps::rocm_default(),
+        DeviceCaps::ptx_default(),
+    ]
+}
+
+/// Whether `body` rounds by conversion: it holds a `Cast` to f16. What makes a row's device loop cover both forms
+/// rather than one of them three times.
+fn rounds_by_conversion(body: &poot_kernel_ir::Body) -> bool {
+    body.blocks.iter().flat_map(|b| &b.statements).any(|s| {
+        matches!(
+            s,
+            poot_kernel_ir::Statement::Assign(
+                _,
+                poot_kernel_ir::Rvalue::Cast {
+                    to: poot_kernel_ir::Ty::F16,
+                    ..
+                }
+            )
+        )
+    })
 }
 
 /// `n` f32 values in `[-scale, scale)` from a fixed xorshift stream.
@@ -137,9 +162,11 @@ fn bits_equal(got: f32, want: f32) -> bool {
     got.to_bits() == want.to_bits() || (!got.is_finite() && !want.is_finite())
 }
 
-/// The planner's launch for a `[m, k] x [n, k]^T` register-tiled dense contraction, generated and run on the
-/// interpreter: `weight` is an `[n, k]` buffer in `storage`.
+/// The planner's launch for a `[m, k] x [n, k]^T` register-tiled dense contraction on `caps`, generated and run on
+/// the interpreter: `weight` is an `[n, k]` buffer in `storage`. Asserts the body rounds f16 by conversion exactly
+/// where `caps` keeps it.
 fn run_dense_tiled(
+    caps: &DeviceCaps,
     precision: OperandPrecision,
     (m, k, n): (usize, usize, usize),
     x: &[f32],
@@ -163,7 +190,7 @@ fn run_dense_tiled(
             weight_bits: kg::DenseTiledWeight::Nk(storage).bits(),
             activation_bits: 32,
         },
-        &caps(),
+        caps,
     )
     .schedule();
     let (tile_rows, tile_cols) = schedule.output_tile().unwrap();
@@ -183,7 +210,15 @@ fn run_dense_tiled(
             activation_stored: None,
         },
     ));
-    let generated = kg::generate(&request, &caps(), &LIMITS).unwrap();
+    let generated = kg::generate(&request, caps, &LIMITS).unwrap();
+    // The activation is f32, so an f16 precision rounds it, whatever the weight's storage.
+    assert_eq!(
+        rounds_by_conversion(&generated.body),
+        precision.fragment_dtype() == Some(FragmentDtype::F16)
+            && caps.rounding_conversions.keeps(FragmentDtype::F16),
+        "{precision} on {:?}: the rounding form",
+        caps.rounding_conversions
+    );
     let workgroup = generated.body.workgroup_size[0];
     let mut buffers = [
         Buffer::from_f32s(x),
@@ -196,7 +231,7 @@ fn run_dense_tiled(
         [generated.launch.grid[0] / workgroup, 1, 1],
         &mut buffers,
     )
-    .unwrap_or_else(|e| panic!("{precision}: {e}"));
+    .unwrap_or_else(|e| panic!("{precision} {:?}: {e}", caps.rounding_conversions));
     buffers[3].to_f32s().unwrap()
 }
 
@@ -212,7 +247,10 @@ fn run_dense_tiled(
 fn staged_narrow_values_are_bit_identical_to_the_oracles_round_to_nearest_even() {
     let probes = probes();
     let m = probes.len();
-    for precision in PRECISIONS {
+    for (caps, precision) in devices()
+        .into_iter()
+        .flat_map(|caps| PRECISIONS.map(|precision| (caps, precision)))
+    {
         // One `K = 16` stage (a whole round, so no tail slot is masked): the row `[x, 0, ..]` against `[1, 0, ..]`.
         let spread = |value: f32, total: usize| -> Vec<f32> {
             (0..total * STAGE)
@@ -229,6 +267,7 @@ fn staged_narrow_values_are_bit_identical_to_the_oracles_round_to_nearest_even()
             })
             .collect();
         let got = run_dense_tiled(
+            &caps,
             precision,
             (m, STAGE, 1),
             &activations,
@@ -241,7 +280,8 @@ fn staged_narrow_values_are_bit_identical_to_the_oracles_round_to_nearest_even()
                 .fold(0.0f32, |sum, term| sum + term * 1.0);
             assert!(
                 bits_equal(got[i], want),
-                "{precision} activation {x:e} ({:#010x}): staged {:e}, oracle {:e}",
+                "{precision} {:?} activation {x:e} ({:#010x}): staged {:e}, oracle {:e}",
+                caps.rounding_conversions,
                 x.to_bits(),
                 got[i],
                 want
@@ -258,6 +298,7 @@ fn staged_narrow_values_are_bit_identical_to_the_oracles_round_to_nearest_even()
             })
             .collect();
         let got = run_dense_tiled(
+            &caps,
             precision,
             (1, STAGE, m),
             &spread(1.0, 1),
@@ -270,7 +311,8 @@ fn staged_narrow_values_are_bit_identical_to_the_oracles_round_to_nearest_even()
                 .fold(0.0f32, |sum, term| sum + 1.0 * term);
             assert!(
                 bits_equal(got[j], want),
-                "{precision} weight {x:e}: staged {:e}, oracle {:e}",
+                "{precision} {:?} weight {x:e}: staged {:e}, oracle {:e}",
+                caps.rounding_conversions,
                 got[j],
                 want
             );
@@ -279,41 +321,65 @@ fn staged_narrow_values_are_bit_identical_to_the_oracles_round_to_nearest_even()
 }
 
 /// A weight already stored in the fragment dtype is exact in it and enters once: a bf16-packed weight under
-/// `Narrow(bf16)` and `Split(bf16)` is read as stored (the bf16 values below are bf16-exact, so rounding them again
-/// is the identity and the check is on the term count: a split of a bf16-stored weight must not double it).
+/// `Narrow(bf16)` and `Split(bf16)`, and an f16-packed one under `Narrow(f16)` and `Split(f16)`, is read as stored
+/// (the values below are exact in their dtype, so rounding them again is the identity and the check is on the term
+/// count: a split of a stored weight must not double it). On ROCm and PTX caps the f16 weight is decoded by the
+/// device's conversion (`FromLowBits` and a `Cast`, POOT-1458), elsewhere in integer arithmetic; both give its
+/// value, subnormals included (the f16 weights reach below 2^-14).
 #[test]
 fn a_weight_stored_in_the_fragment_dtype_enters_once() {
-    let weights: Vec<f32> = (0..12)
-        .map(|i| f32::from_bits((((i as f32 * 0.37 - 2.0).to_bits()) >> 16) << 16))
+    let bf16: Vec<u16> = (0..12)
+        .map(|i| ((i as f32 * 0.37 - 2.0).to_bits() >> 16) as u16)
         .collect();
-    let words: Vec<u32> = weights
-        .chunks(2)
-        .map(|p| (p[0].to_bits() >> 16) | (p[1].to_bits() & 0xffff_0000))
+    let f16: Vec<u16> = (0..12u16)
+        .map(|i| (0x0200 + 0x0951 * i) | ((i & 1) << 15))
         .collect();
     let x = fill(3 * 12, 3, 1.0);
-    for precision in [
-        OperandPrecision::Narrow(FragmentDtype::Bf16),
-        OperandPrecision::Split(FragmentDtype::Bf16),
-    ] {
-        let got = run_dense_tiled(
-            precision,
-            (3, 12, 1),
-            &x,
-            Buffer::from_u32s(&words),
-            BufferStorage::bf16_packed(),
-        );
-        for row in 0..3 {
-            let (want, magnitude) = host_dot(
+    let cases = [
+        (FragmentDtype::Bf16, BufferStorage::bf16_packed(), &bf16),
+        (FragmentDtype::F16, BufferStorage::f16_packed(), &f16),
+    ];
+    for (caps, (dtype, storage, bits)) in devices()
+        .into_iter()
+        .flat_map(|caps| cases.map(|case| (caps, case)))
+    {
+        let weights: Vec<f32> = bits
+            .iter()
+            .map(|&b| match dtype {
+                FragmentDtype::Bf16 => f32::from_bits(u32::from(b) << 16),
+                FragmentDtype::F16 => poot_quant::scalar::f16_to_f32(b),
+            })
+            .collect();
+        let words: Vec<u32> = bits
+            .chunks(2)
+            .map(|p| u32::from(p[0]) | (u32::from(p[1]) << 16))
+            .collect();
+        for precision in [
+            OperandPrecision::Narrow(dtype),
+            OperandPrecision::Split(dtype),
+        ] {
+            let got = run_dense_tiled(
+                &caps,
                 precision,
-                (None, Some(FragmentDtype::Bf16)),
-                x[row * 12..(row + 1) * 12].iter().copied(),
-                weights.iter().copied(),
+                (3, 12, 1),
+                &x,
+                Buffer::from_u32s(&words),
+                storage,
             );
-            assert!(
-                (got[row] - want).abs() <= 1e-6 * magnitude.max(1.0),
-                "{precision} row {row}: {} vs {want}",
-                got[row]
-            );
+            for row in 0..3 {
+                let (want, magnitude) = host_dot(
+                    precision,
+                    (None, Some(dtype)),
+                    x[row * 12..(row + 1) * 12].iter().copied(),
+                    weights.iter().copied(),
+                );
+                assert!(
+                    (got[row] - want).abs() <= 1e-6 * magnitude.max(1.0),
+                    "{precision} {:?} row {row}: {} vs {want}",
+                    caps.rounding_conversions,
+                    got[row]
+                );
+            }
         }
     }
 }
@@ -327,9 +393,13 @@ fn every_contraction_body_equals_the_host_product_over_the_declared_terms() {
     let (m, k, n) = (13usize, 19usize, 11usize);
     let x = fill(m * k, 1, 3.0);
     let w = fill(n * k, 2, 3.0);
-    for precision in PRECISIONS {
+    for (caps, precision) in devices()
+        .into_iter()
+        .flat_map(|caps| PRECISIONS.map(|precision| (caps, precision)))
+    {
         // Register-tiled GEMM over an f32 `[N, K]` weight.
         let got = run_dense_tiled(
+            &caps,
             precision,
             (m, k, n),
             &x,
@@ -367,7 +437,7 @@ fn every_contraction_body_equals_the_host_product_over_the_declared_terms() {
             epilogue: None,
             precision,
         });
-        let generated = kg::generate(&request, &caps(), &LIMITS).unwrap();
+        let generated = kg::generate(&request, &caps, &LIMITS).unwrap();
         let workgroup = generated.body.workgroup_size[0];
         let mut buffers = [
             Buffer::from_f32s(&x[..k]),
@@ -413,7 +483,7 @@ fn every_contraction_body_equals_the_host_product_over_the_declared_terms() {
             },
             precision,
         });
-        let generated = kg::generate(&request, &caps(), &LIMITS).unwrap();
+        let generated = kg::generate(&request, &caps, &LIMITS).unwrap();
         let workgroup = generated.body.workgroup_size[0];
         let mut buffers = [
             Buffer::from_f32s(&x),

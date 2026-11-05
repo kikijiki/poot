@@ -639,3 +639,18 @@ fn an_arena_slot_is_bound_only_through_a_view_it_admits_on_vulkan() {
         &kernel,
     );
 }
+
+/// POOT-1460: a float `Ne` compiled to SPIR-V is IEEE, `NaN != x` true for every `x` (`FUnordNotEqual`, not
+/// `FOrdNotEqual`). Mutation: lower float `Ne` to `fcmp one` in `poot-codegen/src/emit.rs`; the `NaN` lanes read
+/// back 0.0 and this row goes red.
+#[test]
+fn float_ne_is_ieee_on_nan_on_vulkan() {
+    let Some(mut device) = vulkan() else {
+        return;
+    };
+    let body = poot_kernel_ir::test_support::float_ne_kernel();
+    let kernel = device
+        .load_kernel("float_ne", compile_for_vulkan(&body, "float_ne"))
+        .expect("load float_ne");
+    poot_executor_parity::float_ne::check("vulkan", &mut device, &kernel);
+}

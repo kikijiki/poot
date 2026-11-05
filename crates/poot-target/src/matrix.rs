@@ -169,6 +169,38 @@ pub struct CooperativeMatrixConfig {
     pub result_f32: bool,
 }
 
+/// The fragment dtypes a device's code generator rounds an f32 to with a conversion instruction it keeps
+/// (POOT-1458, `receipts/1458-f16-rounding/design.md` section 3.1): the round trip f32 -> dtype -> f32, written as
+/// two casts, reaches the device as a round-to-nearest-even conversion and a widening, never folded into the
+/// identity. For any other dtype a generated body rounds in integer arithmetic on the f32 bits, which every target
+/// keeps.
+///
+/// SPIR-V has none: the driver compiler may fold the pair (RADV keeps `f32(f16(65519.0))` as `65519.0`), and it
+/// has no bf16 type. AMDGPU and NVPTX lower an `fptrunc` to f16 to one RNE conversion through `llc`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct RoundingConversions {
+    kept: [bool; FragmentDtype::ALL.len()],
+}
+
+impl RoundingConversions {
+    /// No kept conversion: every rounding is integer arithmetic.
+    pub const NONE: RoundingConversions = RoundingConversions {
+        kept: [false; FragmentDtype::ALL.len()],
+    };
+
+    /// The f16 conversion, as AMDGPU (`v_cvt_f16_f32`, `v_cvt_f32_f16`) and NVPTX (`cvt.rn.f16.f32`,
+    /// `cvt.f32.f16`) keep it. Neither bf16: gfx11 has no f32 -> bf16 instruction, and no device row covers the
+    /// NVPTX one.
+    pub const F16: RoundingConversions = RoundingConversions {
+        kept: [false, true],
+    };
+
+    /// Whether rounding to `dtype` is a kept conversion.
+    pub const fn keeps(self, dtype: FragmentDtype) -> bool {
+        self.kept[dtype.slot()]
+    }
+}
+
 /// The matrix units of a device: empty when it has none poot's codegen drives.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MatrixUnits {

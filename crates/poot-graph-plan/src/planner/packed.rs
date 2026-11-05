@@ -5,6 +5,7 @@ use super::{
     BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, ImportedKernel,
     KernelRequest, OpKind, PlanError, Planned, ValueId, WeightLayout, kg, matmul, value_ids,
 };
+use crate::dtype_widen::{Bf16ConstLane, ConstLanes};
 use crate::planner::{GraphTables, StorageDtypes, finalize};
 use crate::predicates::dense_decode_gemv_in;
 use crate::refusal::Site;
@@ -45,6 +46,15 @@ fn is_dense_contraction(op: &OpKind) -> bool {
     )
 }
 
+/// The storage a dense contraction reads its BF16 weight (operand 1) in: f16 words when the storage plan rounds
+/// the const to f16 at bind (POOT-1458, [`Bf16ConstLane::F16`]), else the packed bf16 words (Card 1024).
+fn bf16_weight_storage(const_lanes: &ConstLanes) -> StorageKind {
+    match const_lanes.lane(1) {
+        Some(Bf16ConstLane::F16) => StorageKind::F16Packed,
+        _ => StorageKind::Bf16Packed,
+    }
+}
+
 /// Plan one packed-reader equation (DenseContraction/DenseRowGather).
 #[expect(clippy::too_many_arguments)]
 pub(super) fn plan(
@@ -56,7 +66,7 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
-    packed_operands: &[bool],
+    const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
@@ -104,12 +114,14 @@ pub(super) fn plan(
         // (the only portable BF16 read on wgpu, where SPIR-V rejects `Ty::BF16`; the ROCm and PTX typed walks
         // upload the same lanes), widened in-register, so the device buffer stays at two bytes per element.
         // Its storage is the BF16 const rule ([`value_storage_kind`]), so a BF16 weight may have other readers.
+        // POOT-1458: a BF16 weight whose every reader multiplies it in f16 is rounded to f16 once at bind instead
+        // (the lane `bf16_weight_storage` reads), and the body stages it as stored.
         OpKind::DenseContraction {
             weight: dtype @ (DType::F32 | DType::F16 | DType::BF16),
             ..
         } => {
             let kind = match dtype {
-                DType::BF16 => StorageKind::Bf16Packed,
+                DType::BF16 => bf16_weight_storage(const_lanes),
                 _ => match dense_contraction_weight_storage(*dtype) {
                     Some(kind) => kind,
                     None => return Err(site.refuse(Capability::DtypeLowering)),
@@ -156,7 +168,7 @@ pub(super) fn plan(
             region,
         } => {
             let storage = match dtype {
-                DType::BF16 => StorageKind::Bf16Packed,
+                DType::BF16 => bf16_weight_storage(const_lanes),
                 dtype => dense_contraction_weight_storage(*dtype)
                     .ok_or_else(|| site.refuse(Capability::DtypeLowering))?,
             };
@@ -170,7 +182,7 @@ pub(super) fn plan(
                 region,
                 out_shape,
                 odt,
-                packed_operands,
+                const_lanes,
                 // The tiled body stores a narrowed output into a buffer of native two-byte elements.
                 gemv.is_none() && caps.native_two_byte_floats,
             )?;
@@ -225,7 +237,7 @@ pub(super) fn plan(
             ..
         } => {
             let k = shape(ids[1])[1];
-            let weight = ValueStorage::new(StorageKind::Bf16Packed).buffer_storage();
+            let weight = ValueStorage::new(bf16_weight_storage(const_lanes)).buffer_storage();
             matmul::dense_tiled_plan(
                 site,
                 backend,

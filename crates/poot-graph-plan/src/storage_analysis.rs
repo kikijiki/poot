@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use poot_graph_ir::Storage;
 use poot_target::TargetId;
 
-use crate::dtype_widen::bf16_const_is_packed;
+use crate::dtype_widen::{Bf16ConstLane, bf16_const_lane};
 use crate::passes::{KvExtent, kv_extents};
 use crate::{Capability, Plan, PlanError, Source, StorageGap, Target, compute_views, value_ids};
 use poot_graph_ir::op::OpKind;
@@ -77,7 +77,8 @@ pub(crate) fn check_kv_head_strides(g: &Graph, target: &Target) -> Result<(), Pl
 }
 
 /// Card 1011: a BF16 const is never widened on upload, so the kernel param each reader binds it to must be
-/// the lane the storage plan gave it: `u32` words for a packed const ([`bf16_const_is_packed`]), BF16
+/// the lane the storage plan gave it ([`bf16_const_lane`]): `u32` words for a packed const (bf16, or f16
+/// converted at bind), BF16
 /// elements for a native one. A reader whose body has no such lane (a plain `Gather` over a packed table on
 /// wgpu, a packed-lane contraction sharing a native-lane weight) is refused by name, naming the equation,
 /// instead of reading the buffer at the wrong element width or failing later in codegen.
@@ -105,8 +106,9 @@ fn check_bf16_const_reads(
             if !g.meta(root).storage.holds_weight_bytes() || g.aval(root).dtype != DType::BF16 {
                 continue;
             }
-            let want = if storage.storage(root).buffer_storage()
-                == poot_target::BufferStorage::bf16_packed()
+            let lane = storage.storage(root).buffer_storage();
+            let want = if lane == poot_target::BufferStorage::bf16_packed()
+                || lane == poot_target::BufferStorage::f16_packed()
             {
                 poot_kernel_ir::Ty::U32
             } else {
@@ -311,8 +313,9 @@ fn slice_elem(ty: &poot_kernel_ir::Ty) -> Option<&poot_kernel_ir::Ty> {
 }
 
 /// One value's storage kind. A value keeps its declared dtype, densely stored, except a BF16 const: it is never
-/// widened (Card 1011), it is BF16 on every backend, and [`bf16_const_is_packed`] decides whether the buffer
-/// is packed two-per-`u32` word or native two-byte bf16, the one answer the cast planner reads too.
+/// widened (Card 1011), it is BF16 on every backend, and [`bf16_const_lane`] decides whether the buffer is packed
+/// two-per-`u32` word, native two-byte bf16, or f16 converted at bind and packed (POOT-1458), the one answer the
+/// planners read too.
 fn value_storage_kind(
     g: &Graph,
     views: &HashMap<ValueId, Layout>,
@@ -323,10 +326,10 @@ fn value_storage_kind(
     if !g.meta(id).storage.holds_weight_bytes() || declared != DType::BF16 {
         return StorageKind::Dense(declared);
     }
-    if bf16_const_is_packed(g, views, id, target) {
-        StorageKind::Bf16Packed
-    } else {
-        StorageKind::Dense(DType::BF16)
+    match bf16_const_lane(g, views, id, target) {
+        Bf16ConstLane::Packed => StorageKind::Bf16Packed,
+        Bf16ConstLane::F16 => StorageKind::F16Packed,
+        Bf16ConstLane::Native => StorageKind::Dense(DType::BF16),
     }
 }
 

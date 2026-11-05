@@ -14,47 +14,136 @@
 //! (`poot-graph-plan` already depends on it).
 //!
 //! Card 1011: a BF16 const is never retyped. Its declared dtype is its stored dtype on every backend, and
-//! the lane its bytes upload to (packed `u32` words or native two-byte BF16) is decided by
-//! [`bf16_const_is_packed`] and read by the storage plan and the cast planner alike. A reader with no body
-//! for that lane refuses at planning; nothing widens the weight on upload.
+//! the lane its bytes upload to (packed `u32` words, native two-byte BF16, or packed f16 words converted at bind,
+//! POOT-1458) is decided by [`bf16_const_lane`] and read by the storage plan and the planners alike. A reader with
+//! no body for that lane refuses at planning; nothing widens the weight on upload.
 
 use crate::Target;
 use poot_graph_ir::graph::{Storage, ValueMeta};
 use poot_graph_ir::op::{ContractionHead, LocalId, OpKind};
 use poot_graph_ir::types::{DTypeClass, DTypeClassExt, TensorType};
-use poot_graph_ir::{EditError, Eqn, Graph, GraphEdit, Operand, ValueId, ValueTable};
+use poot_graph_ir::{
+    EditError, Eqn, FragmentDtype, Graph, GraphEdit, Operand, OperandPrecision, ValueId, ValueTable,
+};
 use poot_kernelgen::Layout;
 use poot_target::DeviceCaps;
 use poot_tensor::DType;
 
 use std::collections::{HashMap, HashSet};
 
-/// Card 1011: whether the device buffer that holds BF16 const `id` on `target` is the packed `u32` lanes
-/// (two little-endian elements per word, [`poot_target::BufferStorage::bf16_packed`]) rather than native
-/// two-byte BF16. A BF16 const is never widened: its declared dtype is its stored dtype on every backend,
-/// and this decides only the lane its bytes upload to.
+/// The device lane a BF16 const's bytes land in (Card 1011, POOT-1458). Its declared dtype is its stored dtype
+/// on every backend; this decides only the buffer its bytes upload to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Bf16ConstLane {
+    /// Native two-byte BF16 elements, the lane the scalar-bf16 matmul bodies read.
+    Native,
+    /// The checkpoint bytes, two little-endian elements per `u32` word
+    /// ([`poot_target::BufferStorage::bf16_packed`]), widened in-register by every packed reader.
+    Packed,
+    /// Each element rounded to nearest even f16 once, at bind, two per `u32` word
+    /// ([`poot_target::BufferStorage::f16_packed`]): the weight of contractions that multiply in f16, which then
+    /// stage it as stored instead of rounding it per staged value. The conversion is where the weight's range is
+    /// checked: an element past f16's range is a typed error at bind (the ADR-0116 constant rule).
+    F16,
+}
+
+/// The lane of each operand of one equation that is a BF16 const ([`bf16_const_lane`]), `None` for any other
+/// operand: what a planner reads to bind such an operand in the buffer the storage plan gives it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ConstLanes(Vec<Option<Bf16ConstLane>>);
+
+impl ConstLanes {
+    /// The lanes of `eqn`'s operands on `target`.
+    pub(crate) fn of(
+        g: &Graph,
+        views: &HashMap<ValueId, Layout>,
+        eqn: &Eqn,
+        target: &Target,
+    ) -> Self {
+        Self(
+            eqn.inputs
+                .iter()
+                .map(|operand| match operand {
+                    Operand::Value(src)
+                        if g.meta(*src).storage.holds_weight_bytes()
+                            && g.aval(*src).dtype == DType::BF16 =>
+                    {
+                        Some(bf16_const_lane(g, views, *src, target))
+                    }
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
+    /// The lane of operand `position`, `None` when it is not a BF16 const.
+    pub(crate) fn lane(&self, position: usize) -> Option<Bf16ConstLane> {
+        self.0.get(position).copied().flatten()
+    }
+
+    /// Whether operand `position` is a BF16 const held in packed bf16 words.
+    pub(crate) fn packed(&self, position: usize) -> bool {
+        self.lane(position) == Some(Bf16ConstLane::Packed)
+    }
+}
+
+/// Card 1011 and POOT-1458: the lane of BF16 const `id` on `target`.
 ///
-/// - A device with no native two-byte floats (SPIR-V): always packed. There is no scalar bf16, so a packed
-///   reader is the only reader; an operation with no packed reader refuses at planning (the planner's typed
-///   `DtypeLowering`).
-/// - A device with native two-byte floats (ROCm, PTX): packed exactly when
-///   [`bf16_const_feeds_only_packed_readers`] holds; otherwise native, the lane the scalar-bf16 matmul bodies
-///   read.
+/// - [`Bf16ConstLane::F16`] on a GPU when every reader is a dense contraction that multiplies it, at its weight
+///   operand, in f16 ([`bf16_const_feeds_only_f16_contractions`]): the bytes the contractions would round to f16
+///   at every stage are rounded once.
+/// - Otherwise, on a device with no native two-byte floats (SPIR-V), always packed: there is no scalar bf16, so
+///   a packed reader is the only reader, and an operation with no packed reader refuses at planning (the
+///   planner's typed `DtypeLowering`).
+/// - On a device with native two-byte floats (ROCm, PTX), packed exactly when
+///   [`bf16_const_feeds_only_packed_readers`] holds; otherwise native.
 ///
-/// The one decision the storage plan (`value_storage_kind`) and the cast planner share, so the lane a
-/// `Cast` kernel reads and the lane its source uploads to cannot drift apart.
-pub(crate) fn bf16_const_is_packed(
+/// The one decision the storage plan (`value_storage_kind`) and the planners share, so the lane a kernel reads
+/// and the lane its source uploads to cannot drift apart.
+pub(crate) fn bf16_const_lane(
     g: &Graph,
     views: &HashMap<ValueId, Layout>,
     id: ValueId,
     target: &Target,
-) -> bool {
+) -> Bf16ConstLane {
     match target {
-        Target::Gpu { caps, .. } if !caps.native_two_byte_floats => true,
-        Target::Gpu { .. } => bf16_const_feeds_only_packed_readers(g, views, id),
+        Target::Gpu { .. } if bf16_const_feeds_only_f16_contractions(g, id) => Bf16ConstLane::F16,
+        Target::Gpu { caps, .. } if !caps.native_two_byte_floats => Bf16ConstLane::Packed,
+        Target::Gpu { .. } if bf16_const_feeds_only_packed_readers(g, views, id) => {
+            Bf16ConstLane::Packed
+        }
+        Target::Gpu { .. } => Bf16ConstLane::Native,
         // An AIE core has no BF16 lane: the const stays unpacked and the BF16 consumers refuse; neither does a VPU.
-        Target::Npu(_) => false,
+        Target::Npu(_) => Bf16ConstLane::Native,
     }
+}
+
+/// POOT-1458: whether every reader of `id` is a dense contraction (plain, grouped, or the head of a contraction
+/// epilogue) that reads it at its weight operand under `Narrow(F16)`, and `id` does not escape the graph. Such a
+/// weight enters every product it is in rounded to f16, so rounding it once at bind computes the same products.
+/// A `Split(F16)` reader is not one: its `lo` term needs the bf16 value. A value with no reader is not eligible
+/// (the condition must not hold vacuously), nor is one read through a view: a promoted view reads the const in
+/// place, in its own lane.
+fn bf16_const_feeds_only_f16_contractions(g: &Graph, id: ValueId) -> bool {
+    if g.liveness_roots().any(|root| root == id) {
+        return false;
+    }
+    let mut consumed = false;
+    for eqn in g.eqns() {
+        for (position, operand) in eqn.inputs.iter().enumerate() {
+            if !matches!(operand, Operand::Value(value) if *value == id) {
+                continue;
+            }
+            consumed = true;
+            let f16_weight = position == 1
+                && eqn.op.dense_weight() == Some(DType::BF16)
+                && eqn.op.operand_precision() == Some(OperandPrecision::Narrow(FragmentDtype::F16));
+            if !f16_weight {
+                return false;
+            }
+        }
+    }
+    consumed
 }
 
 /// Whether this matmul is a decode projection over a BF16 `[K, N]` weight on a device whose BF16 lane is packed
@@ -127,7 +216,7 @@ fn packed_bf16_reader(op: &OpKind, position: usize) -> bool {
 /// A value with no consumer is not eligible: "every consumer" must not be vacuously true for a const
 /// nothing reads, because the binder would then upload two-byte words no kernel can interpret.
 ///
-/// Lives here with [`bf16_const_is_packed`] for one reason: the uploaded lane and the kernel that reads it
+/// Lives here with [`bf16_const_lane`] for one reason: the uploaded lane and the kernel that reads it
 /// must be decided by one predicate, or a kernel silently reads a buffer at the wrong element width.
 ///
 /// Holding here is necessary but not sufficient for a narrow const to be safe: it is only safe on a

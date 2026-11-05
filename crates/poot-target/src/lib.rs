@@ -28,7 +28,7 @@ pub use access::ArgAccess;
 pub use aie::{AieCaps, AieIsa, AiePlatform, AieTargetId};
 pub use matrix::{
     CooperativeMatrixConfig, FragmentConfig, FragmentDtype, FragmentLayout, FragmentShape, LaneMap,
-    MatrixUnits, OperandNarrowing,
+    MatrixUnits, OperandNarrowing, RoundingConversions,
 };
 pub use register_file::RegisterFile;
 pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout, ViewError};
@@ -396,6 +396,10 @@ pub struct DeviceCaps {
     /// floats live as packed `u32` words, so a BF16 const is always packed there and the two-byte elementwise
     /// bodies do not exist.
     pub native_two_byte_floats: bool,
+    /// The fragment dtypes whose rounding from f32 the device's code generator keeps as a conversion instruction
+    /// (POOT-1458): a generated body rounds an operand to such a dtype with two casts, and to any other in integer
+    /// arithmetic. None on SPIR-V; f16 on AMDGPU and NVPTX.
+    pub rounding_conversions: RoundingConversions,
     /// Whether a BF16 `[K, N]` decode projection is widened to F32 before its GEMV (the device has native
     /// two-byte storage and no packed reader for it) instead of being refused (the lane is packed and
     /// a widening copy of the weight would double its bytes).
@@ -534,6 +538,7 @@ impl DeviceCaps {
             shader_features: ShaderFeatures::ALL,
             e4m3_storage: E4m3Storage::PackedLanes,
             native_two_byte_floats: false,
+            rounding_conversions: RoundingConversions::NONE,
             widens_bf16_decode_weight: false,
             peer_transport: false,
             decode_gemv_max_out_cols: None,
@@ -567,6 +572,7 @@ impl DeviceCaps {
             // HSA has no E4M3FN tensor storage: the packed-lane row gather is the only reader.
             e4m3_storage: E4m3Storage::None,
             native_two_byte_floats: true,
+            rounding_conversions: RoundingConversions::F16,
             widens_bf16_decode_weight: false,
             peer_transport: false,
             decode_gemv_max_out_cols: None,
@@ -597,6 +603,7 @@ impl DeviceCaps {
             shader_features: ShaderFeatures::ALL,
             e4m3_storage: E4m3Storage::Native,
             native_two_byte_floats: true,
+            rounding_conversions: RoundingConversions::F16,
             widens_bf16_decode_weight: true,
             peer_transport: true,
             decode_gemv_max_out_cols: calibration::nvidia_decode_gemv_max_out_cols(8).known(),

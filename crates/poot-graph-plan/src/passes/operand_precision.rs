@@ -305,12 +305,13 @@ fn emit_row_scaled(
 /// says whether the contraction keeps its activation in f16's range ([`f16_guard`]); f16 is a candidate for a
 /// contraction only then, so no contraction narrows to f16 unguarded.
 ///
-/// - A contraction takes bf16 where the target has it, else f16 (RADV): bf16 keeps the f32 exponent range at no
-///   cost, and f16's range is the row scale's job. f16 has three more mantissa bits (24-41x lower mean KL than
-///   bf16, `receipts/1454-narrow-dtype-policy/design.md` section 1), but its rounding costs the generated kernels
-///   23-60% of prefill on ROCm today (`receipts/1457-f16-range-guard/design.md` section 4), so it is not preferred
-///   where bf16 exists. An operand stored as f16 forces f16 (rounding it to bf16 would lose bits it holds), and an
-///   unguarded one leaves the contraction exact.
+/// - A guarded contraction takes f16 where the target has an f16 fragment, else bf16: f16 has three more mantissa
+///   bits (24-41x lower mean KL than bf16, `receipts/1454-narrow-dtype-policy/design.md` section 1), and the row
+///   scale keeps its activation in f16's range. It costs at most 3% of TTFT and TPOT over bf16 on ROCm since the
+///   generated kernels round and decode f16 with the device's conversion and bf16 weights are rounded to f16 once
+///   at bind (`receipts/1458-f16-rounding/design.md` section 6). An operand stored as f16 forces f16 (rounding it
+///   to bf16 would lose bits it holds), and an unguarded contraction takes bf16 where there is a unit, else stays
+///   exact.
 /// - Attention takes the dtype its keys are stored in when the target has a fragment for it (f16 is the default
 ///   KV dtype), so K and V enter exactly and only Q and P round. A bf16 cache takes bf16 where there is a unit
 ///   and f16 otherwise; an f32 cache takes f16. Its range is POOT-1455's.
@@ -331,7 +332,7 @@ fn fragment_dtype(
             match (guarded, operands.contains(&DType::F16)) {
                 (true, true) => &[F16],
                 (false, true) => &[],
-                (true, false) => &[Bf16, F16],
+                (true, false) => &[F16, Bf16],
                 (false, false) => &[Bf16],
             }
         }

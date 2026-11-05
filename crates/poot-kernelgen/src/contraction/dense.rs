@@ -2,7 +2,7 @@
 //! two per `u32` word), read in the orientation the request names.
 
 use poot_kernel_ir::{BinOp, Body, Local, Ty};
-use poot_target::BufferStorage;
+use poot_target::{BufferStorage, RoundingConversions};
 
 use super::Schedule;
 use super::epilogue::{BoundEpilogue, Epilogue};
@@ -67,6 +67,7 @@ pub(crate) fn dense_contraction(
     k: usize,
     epilogue: Option<&Epilogue>,
     precision: OperandPrecision,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let lane = WeightLane::of("dense_contraction", weight)?;
     if let Some(epilogue) = epilogue {
@@ -85,7 +86,7 @@ pub(crate) fn dense_contraction(
             GemvLaunch::new(width, cols, unroll, activation)?,
             k,
             epilogue,
-            ProductRead::dense(precision, lane),
+            ProductRead::dense(precision, lane, conversions),
         ),
         Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => {
             Err(KernelGenError::Unsupported {
@@ -114,6 +115,7 @@ pub(crate) fn dense_tiled_contraction(
     let TiledRead {
         precision,
         activation_stored,
+        conversions,
     } = read;
     const GENERATOR: &str = "dense_tiled_contraction";
     let lane = weight.lane(GENERATOR)?;
@@ -154,7 +156,7 @@ pub(crate) fn dense_tiled_contraction(
         grouped: None,
         read: ProductRead {
             activation_stored,
-            ..ProductRead::dense(precision, lane)
+            ..ProductRead::dense(precision, lane, conversions)
         },
     };
     let rows_aligned = k.is_multiple_of(lane.per_word());
@@ -165,7 +167,7 @@ pub(crate) fn dense_tiled_contraction(
             launch,
             TiledWeight::Rows(&mut |e, _step, row, k0, count, k, _weight_rows| {
                 let first = row_run_start(e, row, k0, k);
-                lane.emit_run(e, weight_buffer, first, count, word_aligned)
+                lane.emit_run(e, conversions, weight_buffer, first, count, word_aligned)
             }),
         ),
         DenseTiledWeight::KnF32 => tiled_body(
@@ -179,13 +181,15 @@ pub(crate) fn dense_tiled_contraction(
     })
 }
 
-/// How a dense tiled contraction reads its activation (POOT-1448): the declared precision of its products, and the
-/// fragment dtype the activation buffer holds its values in, if the planner stored it narrow (`None`: f32). An
-/// activation stored in the fragment dtype of a narrowed read is exact in it and enters unrounded.
+/// How a dense tiled contraction reads its activation (POOT-1448): the declared precision of its products, the
+/// fragment dtype the activation buffer holds its values in, if the planner stored it narrow (`None`: f32), and how
+/// the device rounds to a fragment dtype (POOT-1458). An activation stored in the fragment dtype of a narrowed read
+/// is exact in it and enters unrounded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TiledRead {
     pub(crate) precision: OperandPrecision,
     pub(crate) activation_stored: Option<FragmentDtype>,
+    pub(crate) conversions: RoundingConversions,
 }
 
 /// The element index of value `k0` of weight row `row` in a row-major `[_, k]` weight.
@@ -232,7 +236,7 @@ fn dense_gemv(
         |e: &mut Emit, row: Local, k0: Local, count: usize, k: Local, _out_total: Local| {
             let first = row_run_start(e, row, k0, k);
             let word_aligned = rows_aligned && count.is_multiple_of(per_word);
-            lane.emit_run(e, weight, first, count, word_aligned)
+            lane.emit_run(e, read.conversions, weight, first, count, word_aligned)
         };
     let epilogue = epilogue.map(|epilogue| BoundEpilogue {
         epilogue,
@@ -355,6 +359,7 @@ mod tests {
                         super::TiledRead {
                             precision: poot_graph_ir::OperandPrecision::Exact,
                             activation_stored: None,
+                            conversions: caps.rounding_conversions,
                         },
                     )
                     .expect("a planned tiling generates");
@@ -453,6 +458,7 @@ mod tests {
                     super::TiledRead {
                         precision,
                         activation_stored: None,
+                        conversions: caps.rounding_conversions,
                     },
                 )
                 .expect("a planned tiling generates");
@@ -465,6 +471,7 @@ mod tests {
                     super::TiledRead {
                         precision,
                         activation_stored: Some(FragmentDtype::Bf16),
+                        conversions: caps.rounding_conversions,
                     },
                 )
                 .expect("a planned tiling generates");

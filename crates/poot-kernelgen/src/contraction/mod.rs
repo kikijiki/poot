@@ -621,7 +621,7 @@ impl RegisterTiling {
             }
         };
         // A staged value of a narrowed operand also takes its rounding (and, into a fragment tile, the narrowing cast).
-        let narrowing = shape.terms.rounding_ops() as f64
+        let narrowing = shape.terms.rounding_ops(caps.rounding_conversions) as f64
             + f64::from(u8::from(
                 matches!(self.micro, MicroTile::Fragment(_)) && shape.terms.fragment.is_some(),
             ));

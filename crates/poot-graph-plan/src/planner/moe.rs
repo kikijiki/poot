@@ -6,6 +6,7 @@ use super::{
     BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, HashMap, KernelRequest,
     OpKind, PlanError, Planned, TopKSpec, ValueId, kg, matmul, value_ids,
 };
+use crate::dtype_widen::ConstLanes;
 use crate::planner::{GraphTables, Layout, StorageDtypes, finalize};
 use crate::predicates::{indexed_gemv_in, indexed_matmul_lowers, view_source};
 use crate::refusal::Site;
@@ -30,7 +31,7 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
-    packed_operands: &[bool],
+    const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
@@ -51,7 +52,7 @@ pub(super) fn plan(
                 region,
                 out_shape,
                 odt,
-                packed_operands,
+                const_lanes,
                 // Only the dense tiled body stores a narrowed output (POOT-1448).
                 false,
             )?;

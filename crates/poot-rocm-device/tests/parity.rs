@@ -61,12 +61,14 @@ fn narrowed_projections_match_the_declared_oracle_on_rocm() {
     }
 }
 
-/// POOT-1448: a block's norm output and its gated MLP activation, which every reader narrows, are stored bf16 on rocm,
-/// written by the row region and the up projection's epilogue that compute them and read as stored by the
-/// projections (register tiles at `M = 5`, fragments at `M = 160`), and the program matches the CPU oracle of the
-/// declared semantics, whose values are f32 and rounded by each reader. A pointwise producer whose values all sit
-/// just above a bf16 rounding midpoint holds the store to rounding to nearest even: a store that truncated would
-/// move its outputs past the tolerance. Mutation: emit `FusedScalarOp::Narrow` as a plain copy (no
+/// POOT-1448 and POOT-1458: a block's norm output and its gated MLP activation, which every reader narrows, are stored
+/// narrow on rocm by the region that computes them and read as stored by the projections (register tiles at `M = 5`,
+/// fragments at `M = 160`), and the program matches the CPU oracle of the declared semantics, whose values are f32 and
+/// rounded by each reader. Under the default the contractions multiply in f16, so each projection reads its
+/// activation row-scaled and the two stores are the f16 outputs of the scaling regions. With the units cut down to
+/// bf16 (`fragment_only`) the norm's region and the up projection's epilogue store bf16, and a pointwise producer
+/// whose values all sit just above a bf16 rounding midpoint holds the store to rounding to nearest even: a store that
+/// truncated would move its outputs past the tolerance. Mutation: emit `FusedScalarOp::Narrow` as a plain copy (no
 /// `round_to_fragment`; the bf16 store then truncates): the rounding fixture goes red. Mutation: in `tiled_body` read
 /// a stored activation as f32 (`read_activation(load, None, ..)`): every fixture is refused.
 #[test]
@@ -76,35 +78,57 @@ fn narrow_stored_activations_match_the_declared_oracle_on_rocm() {
     };
     let t = device.target();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-    let policy = poot_graph_ir::MatmulPrecision::Narrow;
-    let bf16 = |op: &str| (op.to_string(), poot_tensor::DType::BF16);
-    let mut fixtures = Vec::new();
-    for fixture in poot_executor_parity::precision::narrowed_block_fixtures() {
-        fixtures.push((
+    let narrow = poot_graph_ir::MatmulPrecision::Narrow;
+    let bf16_units = poot_executor_parity::Policy {
+        precision: narrow,
+        fragment_only: Some(poot_target::FragmentDtype::Bf16),
+    };
+    let stored = |op: &str, dtype| (op.to_string(), dtype);
+    let (f16, bf16) = (poot_tensor::DType::F16, poot_tensor::DType::BF16);
+    let blocks = poot_executor_parity::precision::narrowed_block_fixtures;
+    let mut rows = Vec::new();
+    for fixture in blocks() {
+        rows.push((
+            poot_executor_parity::Policy::from(narrow),
             fixture,
-            vec![bf16("fused_row"), bf16("contraction_epilogue")],
+            vec![stored("fused_row", f16), stored("fused_row", f16)],
         ));
     }
-    fixtures.push((
+    for fixture in blocks() {
+        rows.push((
+            bf16_units,
+            fixture,
+            vec![
+                stored("fused_row", bf16),
+                stored("contraction_epilogue", bf16),
+            ],
+        ));
+    }
+    rows.push((
+        bf16_units,
         poot_executor_parity::precision::narrowed_rounding_fixture(),
-        vec![bf16("fused")],
+        vec![stored("fused", bf16)],
     ));
-    for (fixture, stored) in &fixtures {
+    for (policy, fixture, want) in rows {
         assert_eq!(
-            &poot_executor_parity::precision::narrow_stored_values(
+            poot_executor_parity::precision::narrow_stored_values(
                 exec.as_ref(),
                 t,
-                fixture,
+                &fixture,
                 policy
             ),
-            stored,
-            "{}: the values every reader narrows are stored narrow",
+            want,
+            "{} {policy:?}: the values every reader narrows are stored narrow",
             fixture.name
         );
+        poot_executor_parity::precision::run_parity_declared(
+            exec.as_mut(),
+            t,
+            std::slice::from_ref(&fixture),
+            policy,
+        )
+        .unwrap_or_else(|e| panic!("{policy:?}: {e}"));
     }
-    let fixtures: Vec<_> = fixtures.into_iter().map(|(fixture, _)| fixture).collect();
-    poot_executor_parity::precision::run_parity_declared(exec.as_mut(), t, &fixtures, policy)
-        .unwrap_or_else(|e| panic!("{e}"));
 }
 
 /// POOT-1430: an attention that declares `Narrow(f16)` or `Split(f16)` over an f16 KV cache, at decode and as a

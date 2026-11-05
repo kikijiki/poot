@@ -57,6 +57,7 @@ use crate::fused::{FusedScalarOp, emit_scalar_op};
 use crate::helpers::{copy, elem, ld, slice_dtype, slice_f32};
 use crate::precision::{ProductRead, pair_products};
 use poot_graph_ir::{FragmentDtype, OperandPrecision};
+use poot_target::RoundingConversions;
 
 mod tiled;
 
@@ -923,11 +924,12 @@ pub(crate) fn attention_body(
     spec: &AttentionSpec,
     rows: std::ops::Range<usize>,
     x_groups: usize,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let lanes = validate(spec)?;
     validate_rows(spec, &rows)?;
     if let AttentionSchedule::Tiled { .. } = spec.schedule {
-        return tiled::tiled_body(name, spec, rows, x_groups);
+        return tiled::tiled_body(name, spec, rows, x_groups, conversions);
     }
     let AttentionSpec {
         batch: _,
@@ -951,6 +953,7 @@ pub(crate) fn attention_body(
         precision,
         activation_stored: None,
         weight_stored: kv.fragment(),
+        conversions,
     };
     let splits = match schedule {
         AttentionSchedule::Streaming { .. } => None,
@@ -1689,7 +1692,15 @@ fn emit_score(
     let unit = crate::emit::bin(e, Ty::F32, BinOp::Mul, local_op(scaled), f32c(1.0 / cap));
     let tanh = e.let_(Ty::F32, Rvalue::Use(f32c(0.0)));
     let (al, stmts) = e.parts();
-    emit_scalar_op(tanh, FusedScalarOp::Tanh, &[local_op(unit)], al, stmts);
+    // `Tanh` rounds nothing, so the conversions are moot.
+    emit_scalar_op(
+        tanh,
+        FusedScalarOp::Tanh,
+        &[local_op(unit)],
+        RoundingConversions::NONE,
+        al,
+        stmts,
+    );
     crate::emit::bin(e, Ty::F32, BinOp::Mul, local_op(tanh), f32c(cap))
 }
 
@@ -1725,10 +1736,25 @@ mod tests {
     #[test]
     fn a_spec_outside_the_generators_contract_is_a_typed_error() {
         let wider_values = AttentionSpec { dv: 8, ..spec() };
-        assert!(attention_body("a", &wider_values, 0..wider_values.workgroups(), 1).is_ok());
+        assert!(
+            attention_body(
+                "a",
+                &wider_values,
+                0..wider_values.workgroups(),
+                1,
+                RoundingConversions::NONE
+            )
+            .is_ok()
+        );
         let ragged = AttentionSpec { n_rep: 3, ..spec() };
         assert!(matches!(
-            attention_body("a", &ragged, 0..ragged.workgroups(), 1),
+            attention_body(
+                "a",
+                &ragged,
+                0..ragged.workgroups(),
+                1,
+                RoundingConversions::NONE
+            ),
             Err(KernelGenError::NotDivisible {
                 generator: GENERATOR,
                 divisor: 3,
@@ -1741,7 +1767,13 @@ mod tests {
             ..spec()
         };
         assert!(matches!(
-            attention_body("a", &no_lanes, 0..no_lanes.workgroups(), 1),
+            attention_body(
+                "a",
+                &no_lanes,
+                0..no_lanes.workgroups(),
+                1,
+                RoundingConversions::NONE
+            ),
             Err(KernelGenError::BelowMinimum {
                 generator: GENERATOR,
                 ..
@@ -1753,7 +1785,13 @@ mod tests {
             ..spec()
         };
         assert!(matches!(
-            attention_body("a", &empty_shared, 0..empty_shared.workgroups(), 1),
+            attention_body(
+                "a",
+                &empty_shared,
+                0..empty_shared.workgroups(),
+                1,
+                RoundingConversions::NONE
+            ),
             Err(KernelGenError::BelowMinimum {
                 generator: GENERATOR,
                 ..
@@ -1765,7 +1803,13 @@ mod tests {
             ..spec()
         };
         assert!(matches!(
-            attention_body("a", &all_shared, 0..all_shared.workgroups(), 1),
+            attention_body(
+                "a",
+                &all_shared,
+                0..all_shared.workgroups(),
+                1,
+                RoundingConversions::NONE
+            ),
             Err(KernelGenError::ExceedsBound {
                 generator: GENERATOR,
                 value: 4,

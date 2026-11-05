@@ -30,7 +30,7 @@ use poot_tensor::{DType, HostView};
 use poot_weights::{HandleFormat, WeightId, WeightMap, WeightView};
 
 use crate::error::{BindError, ExecError, LoadError};
-use crate::lanes::{EncodeError, Encoding, first_non_finite_f16};
+use crate::lanes::{EncodeError, Encoding, first_non_finite_f16, first_past_f16_range};
 
 /// A position in an entry's `locals`: the buffers the entry owns outright. Distinct from an arena slot, a weight,
 /// a state buffer and a resident table, which are positions in other lists (`Loc`), and from a graph value id.
@@ -206,6 +206,8 @@ enum WriteFault {
     /// Card 1007: a packed-F16 weight holds an infinity or NaN, which the generated bodies' in-register
     /// binary16 decode does not represent.
     NonFiniteF16 { index: usize, bits: u16 },
+    /// POOT-1458: a BF16 weight the plan rounds to f16 holds a value past f16's range.
+    PastF16Range { index: usize, bits: u16 },
 }
 
 impl From<PayloadReadError> for WriteFault {
@@ -306,6 +308,9 @@ impl WeightWriter {
             Some(WriteFault::NonFiniteF16 { index, bits }) => {
                 Err(LoadError::NonFiniteF16Weight { name, index, bits })
             }
+            Some(WriteFault::PastF16Range { index, bits }) => {
+                Err(LoadError::WeightPastF16Range { name, index, bits })
+            }
         }
     }
 
@@ -344,6 +349,14 @@ impl WeightWriter {
                     && let Some((index, bits)) = first_non_finite_f16(into)
                 {
                     return Err(WriteFault::NonFiniteF16 {
+                        index: lo / 2 + index,
+                        bits,
+                    });
+                }
+                if self.encoding == Encoding::Bf16AsF16Words
+                    && let Some((index, bits)) = first_past_f16_range(into)
+                {
+                    return Err(WriteFault::PastF16Range {
                         index: lo / 2 + index,
                         bits,
                     });
@@ -1191,27 +1204,33 @@ impl WeightBinder {
                 _ => unreachable!("load_weights checked every mapped key against this store"),
             }
         }
-        let encoded = match table.kind {
-            RowKind::Dense { dtype, width } => {
-                crate::lanes::encode_stored(dtype, &[width], &stored, storage).map_err(|error| {
-                    match error {
-                        EncodeError::NoEncoding => LoadError::WeightFormat {
-                            name: table.name.clone(),
-                            stored: format!("{dtype:?}"),
-                            planned: storage,
-                        },
-                        EncodeError::NonFiniteF16 { index, bits } => {
-                            LoadError::NonFiniteF16Weight {
-                                name: table.name.clone(),
-                                index,
-                                bits,
-                            }
-                        }
-                    }
-                })?
-            }
-            RowKind::Packed { .. } => crate::lanes::encode_words(&stored),
-        };
+        let encoded =
+            match table.kind {
+                RowKind::Dense { dtype, width } => crate::lanes::encode_stored(
+                    dtype,
+                    &[width],
+                    &stored,
+                    storage,
+                )
+                .map_err(|error| match error {
+                    EncodeError::NoEncoding => LoadError::WeightFormat {
+                        name: table.name.clone(),
+                        stored: format!("{dtype:?}"),
+                        planned: storage,
+                    },
+                    EncodeError::NonFiniteF16 { index, bits } => LoadError::NonFiniteF16Weight {
+                        name: table.name.clone(),
+                        index,
+                        bits,
+                    },
+                    EncodeError::PastF16Range { index, bits } => LoadError::WeightPastF16Range {
+                        name: table.name.clone(),
+                        index,
+                        bits,
+                    },
+                })?,
+                RowKind::Packed { .. } => crate::lanes::encode_words(&stored),
+            };
         // The same check after the reads: a file modified while its rows were read is refused, not encoded.
         self.check_table_sources(table)?;
         Ok(encoded)

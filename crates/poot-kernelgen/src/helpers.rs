@@ -5,7 +5,7 @@ use poot_kernel_ir::{
     Rvalue, Statement, SwitchTargets, Terminator, Ty,
 };
 use poot_quant::format::FloatFormat;
-use poot_target::BufferStorage;
+use poot_target::{BufferStorage, RoundingConversions};
 
 use crate::KernelGenError;
 use crate::emit::{self, Emit};
@@ -498,24 +498,33 @@ impl WeightLane {
         }
     }
 
-    /// Statements that assign weight element `idx` of `weight`, as f32, to `dst`.
+    /// Statements that assign weight element `idx` of `weight`, as f32, to `dst`, a half decoded as `conversions`
+    /// says ([`Self::emit_elem`]).
     pub(crate) fn read(
         self,
         al: &mut Alloc,
+        conversions: RoundingConversions,
         weight: Local,
         idx: Local,
         dst: Local,
     ) -> Vec<Statement> {
         let mut e = Emit::new(al);
-        let value = self.emit_elem(&mut e, weight, idx);
+        let value = self.emit_elem(&mut e, conversions, weight, idx);
         e.assign(Place::local(dst), Rvalue::Use(emit::copy(value)));
         e.take()
     }
 
     /// Weight element `idx` of `weight`, as an f32 local. A packed lane loads the one word that holds the element:
     /// a half never straddles a word, so (unlike `emit_read_bits`, which also loads the following word against a
-    /// guard word this buffer does not have) the read stays inside the weight's own `numel.div_ceil(2)` words.
-    pub(crate) fn emit_elem(self, e: &mut Emit, weight: Local, idx: Local) -> Local {
+    /// guard word this buffer does not have) the read stays inside the weight's own `numel.div_ceil(2)` words. An f16
+    /// half widens by the device's conversion where `conversions` keeps it ([`Self::decode_low_half`]).
+    pub(crate) fn emit_elem(
+        self,
+        e: &mut Emit,
+        conversions: RoundingConversions,
+        weight: Local,
+        idx: Local,
+    ) -> Local {
         if self == Self::F32 {
             return e.let_(Ty::F32, Rvalue::Use(copy(elem(weight, idx))));
         }
@@ -538,7 +547,7 @@ impl WeightLane {
             emit::copy(shifted),
             emit::c32(0xffff),
         );
-        self.decode_low_half(e, bits)
+        self.decode_low_half(e, conversions, bits)
     }
 
     /// The `count` weight elements `first .. first + count` of `weight`, as f32 locals in order: the
@@ -549,6 +558,7 @@ impl WeightLane {
     pub(crate) fn emit_run(
         self,
         e: &mut Emit,
+        conversions: RoundingConversions,
         weight: Local,
         first: Local,
         count: usize,
@@ -559,7 +569,7 @@ impl WeightLane {
             return (0..count)
                 .map(|j| {
                     let idx = emit::bin(e, Ty::Usize, BinOp::Add, emit::copy(first), emit::cu(j));
-                    self.emit_elem(e, weight, idx)
+                    self.emit_elem(e, conversions, weight, idx)
                 })
                 .collect();
         }
@@ -589,15 +599,42 @@ impl WeightLane {
                     emit::c32(0xffff),
                 );
                 let high = emit::bin(e, Ty::U32, BinOp::Shr, emit::copy(word), emit::c32(16));
-                [self.decode_low_half(e, low), self.decode_low_half(e, high)]
+                [
+                    self.decode_low_half(e, conversions, low),
+                    self.decode_low_half(e, conversions, high),
+                ]
             })
             .collect()
     }
 
-    /// The f32 value of the 16-bit element in the low half of `bits` (the high half zero).
-    fn decode_low_half(self, e: &mut Emit, bits: Local) -> Local {
+    /// The f32 value of the 16-bit element in the low half of `bits` (the high half zero). An f16 element on a
+    /// device that keeps the f16 conversion (`conversions`, POOT-1458) is reinterpreted as its f16
+    /// ([`Rvalue::FromLowBits`]) and widened by a `Cast`: one conversion instruction, which a staging step that
+    /// narrows it back to f16 folds away. Anywhere else it is decoded in integer arithmetic.
+    pub(crate) fn decode_low_half(
+        self,
+        e: &mut Emit,
+        conversions: RoundingConversions,
+        bits: Local,
+    ) -> Local {
         match self {
             Self::F32 => unreachable!("an f32 lane holds no 16-bit elements"),
+            Self::F16Packed if conversions.keeps(poot_target::FragmentDtype::F16) => {
+                let half = e.let_(
+                    Ty::F16,
+                    Rvalue::FromLowBits {
+                        to: Ty::F16,
+                        operand: emit::copy(bits),
+                    },
+                );
+                e.let_(
+                    Ty::F32,
+                    Rvalue::Cast {
+                        to: Ty::F32,
+                        operand: emit::copy(half),
+                    },
+                )
+            }
             Self::F16Packed => {
                 crate::packed::float_decode::emit_float_decode(e, FloatFormat::F16, bits)
             }

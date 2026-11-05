@@ -140,6 +140,7 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
         shader_features: poot_target::ShaderFeatures::ALL,
         e4m3_storage: poot_target::E4m3Storage::Native,
         native_two_byte_floats: true,
+        rounding_conversions: poot_target::RoundingConversions::F16,
         widens_bf16_decode_weight: true,
         peer_transport: true,
         // Measured on Ampere only; another generation keeps the GEMV at any width.

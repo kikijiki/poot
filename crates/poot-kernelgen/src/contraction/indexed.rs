@@ -19,7 +19,7 @@
 
 use poot_kernel_ir::{BinOp, Body, Constant, Local, Operand, Rvalue, Ty};
 
-use poot_target::BufferStorage;
+use poot_target::{BufferStorage, RoundingConversions};
 
 use super::Schedule;
 use super::epilogue::{BoundEpilogue, Epilogue};
@@ -146,6 +146,7 @@ fn emit_in_slab(
 /// metadata as the request carries it: a tiled body's extents ([`TiledExtents::of_meta`]; `K` also decides whether
 /// a packed row's runs start on a word boundary). `epilogue` (f32) runs over each output element's sum before its
 /// store.
+#[expect(clippy::too_many_arguments)] // the schedule, weight and epilogue of one body, and how it rounds
 pub(crate) fn indexed_contraction(
     name: &str,
     schedule: Schedule,
@@ -154,6 +155,7 @@ pub(crate) fn indexed_contraction(
     meta: &[u32],
     epilogue: Option<&Epilogue>,
     precision: OperandPrecision,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let lane = match WeightLane::of("indexed_contraction", weight)? {
         WeightLane::F16Packed => {
@@ -180,7 +182,7 @@ pub(crate) fn indexed_contraction(
             layout,
             lane,
             epilogue,
-            ProductRead::dense(precision, lane),
+            ProductRead::dense(precision, lane, conversions),
         ),
         Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => {
             let extents = TiledExtents::of_meta("indexed_contraction", meta)?;
@@ -191,7 +193,7 @@ pub(crate) fn indexed_contraction(
                 lane,
                 extents.k,
                 epilogue,
-                ProductRead::dense(precision, lane),
+                ProductRead::dense(precision, lane, conversions),
             )
         }
     }
@@ -240,7 +242,7 @@ fn indexed_gemv(
                     let k_at = bin(e, Ty::Usize, BinOp::Add, copy(k0), cu(j));
                     let in_slab = emit_in_slab(e, layout, (k_at, col), (k, n));
                     let at = bin(e, Ty::Usize, BinOp::Add, copy(slab.base), copy(in_slab));
-                    let value = lane.emit_elem(e, weight, at);
+                    let value = lane.emit_elem(e, read.conversions, weight, at);
                     if j == 0 {
                         bin(e, Ty::F32, BinOp::Add, copy(value), copy(slab.poison))
                     } else {
@@ -316,7 +318,7 @@ fn indexed_register_tiled(
         let row = bin(e, Ty::Usize, BinOp::Add, copy(step[0]), copy(row));
         let row_base = bin(e, Ty::Usize, BinOp::Mul, copy(row), copy(k));
         let first = bin(e, Ty::Usize, BinOp::Add, copy(row_base), copy(k0));
-        lane.emit_run(e, weight, first, count, word_aligned)
+        lane.emit_run(e, read.conversions, weight, first, count, word_aligned)
     };
     let (step, weight_read): (&mut ExpertStep<'_>, _) = match layout {
         WeightLayout::Nk => (&mut first_row, TiledWeight::Rows(&mut row_run)),

@@ -936,6 +936,7 @@ fn a_two_byte_select_is_one_llvm_select_over_the_stored_type() {
                 output: kg::FusedInput::Step(kg::StepId::new(0)),
             },
             None,
+            poot_target::RoundingConversions::NONE,
         )
         .expect("a narrow select region generates");
         for target in [Target::Nvptx, Target::AmdGcn(AmdArch::gfx1151())] {

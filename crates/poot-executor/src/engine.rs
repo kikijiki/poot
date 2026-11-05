@@ -582,6 +582,11 @@ fn encode_error(
             index,
             bits,
         },
+        crate::lanes::EncodeError::PastF16Range { index, bits } => LoadError::WeightPastF16Range {
+            name: name.to_string(),
+            index,
+            bits,
+        },
     }
     .into()
 }
@@ -4553,7 +4558,7 @@ mod arena_slot_alloc_tests {
 mod f16_packed_weight_upload_tests {
     use super::*;
     use crate::Executor;
-    use poot_graph_ir::Builder;
+    use poot_graph_ir::{Builder, MatmulPrecision};
     use poot_graph_plan::{
         CompileOptions, multi_device::topology::DeviceId, staged::DevicePlacement,
         staged::ExpertPlacement, staged::Partition, staged::TargetSet, staged::compile_staged,
@@ -4702,7 +4707,7 @@ mod f16_packed_weight_upload_tests {
         declared: DType,
     ) -> Result<EntryId, ExecError> {
         let store = projection_store(w_bits, stored, StoredBytes::from);
-        load_projection(engine, store, declared)
+        load_projection(engine, store, declared, MatmulPrecision::Exact)
     }
 
     /// The projection's store: an f32 input and a weight of `stored` dtype holding `w_bits`, each tensor's
@@ -4729,11 +4734,13 @@ mod f16_packed_weight_upload_tests {
         Arc::new(store.build())
     }
 
-    /// Load the projection graph over `store` into `engine`, declaring `w` as `declared`.
+    /// Load the projection graph over `store` into `engine`, declaring `w` as `declared`, its products at
+    /// `precision`.
     fn load_projection(
         engine: &mut Engine<UploadRecorder>,
         store: Arc<WeightStore>,
         declared: DType,
+        precision: MatmulPrecision,
     ) -> Result<EntryId, ExecError> {
         let b = Builder::for_tests();
         let x = b
@@ -4761,7 +4768,8 @@ mod f16_packed_weight_upload_tests {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(precision),
         )
         .expect("the projection compiles");
         let exe = engine.load_weights(store, Arc::new(weights))?;
@@ -4973,7 +4981,8 @@ mod f16_packed_weight_upload_tests {
             .unwrap()
             .set_len(0)
             .unwrap();
-        let error = load_projection(&mut engine, store, DType::F16).unwrap_err();
+        let error =
+            load_projection(&mut engine, store, DType::F16, MatmulPrecision::Exact).unwrap_err();
         assert!(
             matches!(&error, ExecError::Load(load) if matches!(**load, LoadError::SourceChanged(_))),
             "{error:?}"
@@ -5017,7 +5026,8 @@ mod f16_packed_weight_upload_tests {
                 .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
                 .unwrap();
         }));
-        let error = load_projection(&mut engine, store, DType::F16).unwrap_err();
+        let error =
+            load_projection(&mut engine, store, DType::F16, MatmulPrecision::Exact).unwrap_err();
         assert!(
             matches!(&error, ExecError::Load(load) if matches!(**load, LoadError::SourceChanged(_))),
             "{error:?}"
@@ -5054,7 +5064,8 @@ mod f16_packed_weight_upload_tests {
                 .set_len(0)
                 .unwrap();
         }));
-        let error = load_projection(&mut engine, store, DType::F16).unwrap_err();
+        let error =
+            load_projection(&mut engine, store, DType::F16, MatmulPrecision::Exact).unwrap_err();
         assert!(
             matches!(
                 &error,
@@ -5149,6 +5160,93 @@ mod f16_packed_weight_upload_tests {
             },
             Err(other) => panic!("expected NonFiniteF16Weight, got {other}"),
             Ok(_) => panic!("a non-finite packed-F16 weight loaded"),
+        }
+    }
+
+    /// The projection over a BF16 weight of `w_bits`, its products narrowed (on the recorder's RADV caps, whose
+    /// only fragment is f16: the contraction multiplies in f16).
+    fn add_narrow_bf16_projection(
+        engine: &mut Engine<UploadRecorder>,
+        w_bits: &[u16],
+    ) -> Result<EntryId, ExecError> {
+        let store = projection_store(w_bits, DType::BF16, StoredBytes::from);
+        load_projection(engine, store, DType::BF16, MatmulPrecision::Narrow)
+    }
+
+    /// POOT-1458 (design section 4): a BF16 weight whose contraction multiplies in f16 is planned in the f16 lane
+    /// and uploaded rounded to nearest even f16, once, at bind: one packed-f16 buffer of `ceil(N * K / 2)` words
+    /// holding each element's f16 bits, and no packed-bf16 copy. The same weight under `Exact` keeps its bf16
+    /// words. Mutation: make `bf16_const_lane` never take `Bf16ConstLane::F16`; the weight uploads as packed bf16
+    /// and this row goes red.
+    #[test]
+    fn a_bf16_weight_of_an_f16_contraction_uploads_rounded_to_f16_once() {
+        // bf16 values spread over the f16 normal and subnormal ranges, both signs.
+        let bits: Vec<u16> = (0..N * K)
+            .map(|i| (0x3300 + 0x23 * i as u16) | ((i as u16 & 1) << 15))
+            .collect();
+        let mut engine = Engine::new(UploadRecorder::default());
+        add_narrow_bf16_projection(&mut engine, &bits).expect("the entry loads");
+        let device = &engine.device;
+        let lanes = |storage: BufferStorage| {
+            device
+                .allocations
+                .iter()
+                .enumerate()
+                .filter(|(_, (role, s, _))| *role == BufferRole::Weight && *s == storage)
+                .map(|(index, _)| index)
+                .collect::<Vec<usize>>()
+        };
+        assert_eq!(lanes(BufferStorage::bf16_packed()), Vec::<usize>::new());
+        let f16 = lanes(BufferStorage::f16_packed());
+        assert_eq!(f16.len(), 1, "allocations: {:?}", device.allocations);
+        let mut want: Vec<u8> = bits
+            .iter()
+            .flat_map(|&b| {
+                poot_quant::scalar::f32_to_f16(poot_quant::scalar::bf16_to_f32(b)).to_le_bytes()
+            })
+            .collect();
+        want.resize((N * K).div_ceil(2) * 4, 0);
+        let written: Vec<&Vec<u8>> = device
+            .writes
+            .iter()
+            .filter(|(dst, _)| *dst == f16[0])
+            .map(|(_, bytes)| bytes)
+            .collect();
+        assert_eq!(written, vec![&want]);
+        let mut exact = Engine::new(UploadRecorder::default());
+        let store = projection_store(&bits, DType::BF16, StoredBytes::from);
+        load_projection(&mut exact, store, DType::BF16, MatmulPrecision::Exact)
+            .expect("the entry loads");
+        assert!(
+            exact
+                .device
+                .allocations
+                .iter()
+                .all(|&(_, storage, _)| storage != BufferStorage::f16_packed()),
+            "an exact contraction keeps its bf16 weight: {:?}",
+            exact.device.allocations
+        );
+    }
+
+    /// POOT-1458 (the ADR-0116 constant rule): a BF16 weight of an f16 contraction past f16's range (65536, the
+    /// first bf16 above 65504's rounding limit) is refused at bind with a typed error naming the weight, the element
+    /// and its bits, instead of reaching the products as an infinity. Mutation: drop the range scan in
+    /// `WeightWriter::read_stream` (scan an empty slice); the entry loads and this row goes red.
+    #[test]
+    fn a_bf16_weight_past_the_f16_range_of_its_contraction_is_refused_at_bind() {
+        let mut bits = vec![0x3f80u16; N * K];
+        bits[9] = 0xc780; // -65536
+        let mut engine = Engine::new(UploadRecorder::default());
+        match add_narrow_bf16_projection(&mut engine, &bits) {
+            Err(ExecError::Load(error)) => match *error {
+                LoadError::WeightPastF16Range { name, index, bits } => assert_eq!(
+                    (name.as_str(), index, bits),
+                    (PROJECTION_WEIGHT.const_name().as_str(), 9, 0xc780)
+                ),
+                other => panic!("expected WeightPastF16Range, got {other}"),
+            },
+            Err(other) => panic!("expected WeightPastF16Range, got {other}"),
+            Ok(_) => panic!("a bf16 weight past the f16 range loaded into the f16 lane"),
         }
     }
 

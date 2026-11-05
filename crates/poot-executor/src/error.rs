@@ -283,6 +283,20 @@ pub enum LoadError {
         /// The raw binary16 bits of the offending value.
         bits: u16,
     },
+    /// POOT-1458: a BF16 weight the plan rounds to f16 at bind (its contractions multiply in f16) holds a value
+    /// f16 cannot hold: an infinity or NaN, or one that rounds past 65504. A weight's range is fixed, so it is
+    /// refused at bind (the ADR-0116 constant rule), never scaled at run time.
+    #[error(
+        "weight {name}: element {index} is the BF16 {bits:#06x}, past the f16 range its contractions multiply in"
+    )]
+    WeightPastF16Range {
+        /// The weight's name.
+        name: String,
+        /// Element index of the offending value.
+        index: usize,
+        /// The raw bfloat16 bits of the offending value.
+        bits: u16,
+    },
     /// Card 1008: a tracer declares the dtype its loader stores; a stored and declared dtype that differ are
     /// refused at load, never converted on upload.
     #[error("weight {name}: stored as {stored} but the graph declares {declared}")]

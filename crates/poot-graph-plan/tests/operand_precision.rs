@@ -159,14 +159,15 @@ fn an_exact_policy_never_narrows() {
     }
 }
 
-/// ROCm caps (bf16 and f16 fragments) give a bf16 contraction and an f16 attention over the default f16 KV
-/// cache; both are published, and the program's class is the narrow-storage one. Mutation: make the
-/// contraction rule prefer f16 (swap the candidates) and the contraction row goes red.
+/// ROCm caps (bf16 and f16 fragments) give an f16 contraction (POOT-1458: a guarded contraction takes f16 where
+/// the unit has it) and an f16 attention over the default f16 KV cache; both are published, and the program's
+/// class is the narrow-storage one. Mutation: make the contraction rule prefer bf16 (swap the candidates) and the
+/// contraction row goes red.
 #[test]
-fn rocm_caps_give_bf16_contractions_and_f16_attention() {
+fn rocm_caps_give_f16_contractions_and_f16_attention() {
     let dense = compiled(&projection(), &rocm_wmma(), MatmulPrecision::Narrow);
-    assert_eq!(precision_of(&dense, is_dense), BF16);
-    assert_eq!(summary(&dense), [(BF16, 1)]);
+    assert_eq!(precision_of(&dense, is_dense), F16);
+    assert_eq!(summary(&dense), [(F16, 1)]);
     assert_eq!(
         dense.numerics_class(),
         poot_graph_ir::analysis::Tier2Class::NarrowStorage
@@ -263,7 +264,7 @@ fn a_split_policy_splits_and_plans_attention_off_the_tiled_schedule() {
 }
 
 /// The planner hands the declared precision to the kernel request of every contraction schedule it picks: the
-/// register-tiled GEMM at `M > 1` and the decode GEMV at `M = 1` both name `Narrow(bf16)`.
+/// register-tiled GEMM at `M > 1` and the decode GEMV at `M = 1` both name `Narrow(f16)`.
 #[test]
 fn the_kernel_request_carries_the_declared_precision() {
     let program = compiled(&projection(), &rocm_wmma(), MatmulPrecision::Narrow);
@@ -273,7 +274,7 @@ fn the_kernel_request_carries_the_declared_precision() {
         .unwrap();
     match program.kernel_choice(eqn) {
         KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(spec))) => {
-            assert_eq!(spec.precision, BF16);
+            assert_eq!(spec.precision, F16);
         }
         other => panic!("the register-tiled GEMM, got {other:?}"),
     }
@@ -293,7 +294,7 @@ fn the_kernel_request_carries_the_declared_precision() {
         KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseGemv {
             precision,
             ..
-        })) => assert_eq!(*precision, BF16),
+        })) => assert_eq!(*precision, F16),
         other => panic!("the decode GEMV, got {other:?}"),
     }
 }

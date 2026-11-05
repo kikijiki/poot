@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use poot_target::{BufferStorage, FragmentDtype};
+use poot_target::{BufferStorage, FragmentDtype, RoundingConversions};
 
 use crate::KernelGenError;
 use crate::emit::Emit;
@@ -133,11 +133,13 @@ impl Emitter<'_> {
 }
 
 /// Emit `dst = op(operands...)` into `stmts`, allocating any temporaries from `al`. Most ops are a single
-/// instruction; `Tanh` and `Erf` expand to inline sequences. Shared by both fused synthesizers.
+/// instruction; `Tanh` and `Erf` expand to inline sequences, and `Narrow` rounds as `conversions` says (the
+/// device's, POOT-1458). Shared by both fused synthesizers.
 pub(crate) fn emit_scalar_op(
     dst: Local,
     op: FusedScalarOp,
     operands: &[Operand],
+    conversions: RoundingConversions,
     al: &mut Alloc,
     stmts: &mut Vec<Statement>,
 ) {
@@ -222,7 +224,7 @@ pub(crate) fn emit_scalar_op(
         FusedScalarOp::Narrow(dtype) => {
             let mut e = Emit::new(al);
             let x = e.let_(Ty::F32, Rvalue::Use(operands[0].clone()));
-            let rounded = round_to_fragment(&mut e, dtype, x);
+            let rounded = round_to_fragment(&mut e, conversions, dtype, x);
             stmts.extend(e.take());
             Rvalue::Use(copy(Place::local(rounded)))
         }
@@ -529,9 +531,11 @@ impl FusedScalarOp {
             Self::Select => (2, 1),
             Self::GeU | Self::RemU => (4, 3),
             // The operand's copy, the rounding's own statements and the copy of its result; the store's narrowing
-            // is one more, which a narrowed output step is the only one to need.
+            // is one more, which a narrowed output step is the only one to need. The integer form is the larger
+            // rounding (POOT-1458), so it bounds every device's.
             Self::Narrow(dtype) => {
-                let rounding = crate::precision::rounding_statements(dtype);
+                let rounding =
+                    crate::precision::rounding_statements(RoundingConversions::NONE, dtype);
                 (rounding + 3, rounding + 2)
             }
         };
@@ -787,6 +791,7 @@ pub(crate) fn row_size(k: &RowKernel, rank: usize, w: usize) -> BodySize {
 /// every leaf (with its broadcast strides), evaluates the straight-line recipe in registers and writes one
 /// output element. One dispatch, no intermediate buffers. Generalizes `binary_broadcast` to N leaves and a
 /// DAG of scalar steps. `leaf_shapes[j]` is leaf `j`'s shape (for its broadcast-effective strides into `out_shape`).
+/// A `Narrow` step rounds in integer arithmetic, the form every target keeps.
 pub fn fused(
     name: &str,
     out_shape: &[usize],
@@ -794,7 +799,15 @@ pub fn fused(
     k: &FusedKernel,
 ) -> Result<Body, KernelGenError> {
     let layouts: Vec<Layout> = leaf_shapes.iter().map(|s| Layout::contiguous(s)).collect();
-    fused_views(name, out_shape, leaf_shapes, &layouts, k, None)
+    fused_views(
+        name,
+        out_shape,
+        leaf_shapes,
+        &layouts,
+        k,
+        None,
+        RoundingConversions::NONE,
+    )
 }
 
 /// The element types of a float region: each step's result type and the output's.
@@ -937,6 +950,7 @@ pub fn fused_views(
     leaf_layouts: &[Layout],
     k: &FusedKernel,
     x_groups: Option<usize>,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     if leaf_shapes.len() != k.n_leaves() {
         return Err(KernelGenError::CountMismatch {
@@ -1020,7 +1034,7 @@ pub fn fused_views(
         } else if let FusedScalarOp::Narrow(_) = step.op {
             // Rounded once, then held as the two-byte value it is exact in.
             let rounded = al.add(Ty::F32, false);
-            emit_scalar_op(rounded, step.op, &operands, &mut al, &mut body);
+            emit_scalar_op(rounded, step.op, &operands, conversions, &mut al, &mut body);
             body.push(Statement::Assign(
                 Place::local(step_reg[s]),
                 Rvalue::Narrow {
@@ -1045,7 +1059,14 @@ pub fn fused_views(
                 *operand = copy(Place::local(widened));
             }
             let computed = al.add(Ty::F32, false);
-            emit_scalar_op(computed, step.op, &operands, &mut al, &mut body);
+            emit_scalar_op(
+                computed,
+                step.op,
+                &operands,
+                conversions,
+                &mut al,
+                &mut body,
+            );
             body.push(Statement::Assign(
                 Place::local(step_reg[s]),
                 Rvalue::Cast {
@@ -1054,7 +1075,14 @@ pub fn fused_views(
                 },
             ));
         } else {
-            emit_scalar_op(step_reg[s], step.op, &operands, &mut al, &mut body);
+            emit_scalar_op(
+                step_reg[s],
+                step.op,
+                &operands,
+                conversions,
+                &mut al,
+                &mut body,
+            );
         }
     }
     // out[i] = the region output value.
@@ -1700,6 +1728,8 @@ struct RowCtx<'a> {
     out_strides: &'a [usize],
     out_shape: &'a [usize],
     scalar_reg: &'a [Option<Local>],
+    /// How a `Narrow` step rounds (the device's, POOT-1458).
+    conversions: RoundingConversions,
 }
 
 /// Emit the per-element value of region-local `local` at output index `i_local`, returning the register
@@ -1732,7 +1762,7 @@ fn emit_row_value(
             stmts,
         );
         let v = al.add(Ty::F32, false);
-        stmts.extend(ctx.lanes[local].read(al, local_for_leaf(local), off, v));
+        stmts.extend(ctx.lanes[local].read(al, ctx.conversions, local_for_leaf(local), off, v));
         v
     } else if ctx.kind[local] == RowKind::Scalar {
         ctx.scalar_reg[local].expect("scalar value computed before use")
@@ -1767,7 +1797,7 @@ fn emit_row_value(
             })
             .collect();
         let out = al.add(Ty::F32, false);
-        emit_scalar_op(out, *op, &operands, al, stmts);
+        emit_scalar_op(out, *op, &operands, ctx.conversions, al, stmts);
         out
     };
     memo.insert(local, res);
@@ -1812,7 +1842,9 @@ fn local_for_leaf(j: usize) -> Local {
 ///
 /// `row_shape` is the shape of the region's rows (`L ++ [n_cols]`), which every leaf broadcasts into, whatever
 /// the written values' shapes: a row value is written at its element of `row_shape`, a per-row scalar at its
-/// row (POOT-1456). Params are the leaves, then one per [`RowKernel::writes`] value.
+/// row (POOT-1456). Params are the leaves, then one per [`RowKernel::writes`] value. A `Narrow` step rounds as
+/// `conversions` says (the device's, POOT-1458).
+#[expect(clippy::too_many_arguments)] // the shapes, leaves and kernel of one body, its fold, and how it rounds
 pub fn fused_row_parallel_views(
     name: &str,
     row_shape: &[usize],
@@ -1821,6 +1853,7 @@ pub fn fused_row_parallel_views(
     k: &RowKernel,
     w: usize,
     x_groups: usize,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     if leaf_shapes.len() != k.n_leaves {
         return Err(KernelGenError::CountMismatch {
@@ -1953,7 +1986,7 @@ pub fn fused_row_parallel_views(
                     .map(|i| scalar_operand(i, &scalar_reg))
                     .collect();
                 let dst = scalar_reg[n + s].unwrap();
-                emit_scalar_op(dst, *op, &operands, &mut al, &mut pending);
+                emit_scalar_op(dst, *op, &operands, conversions, &mut al, &mut pending);
             }
             RowOp::Pointwise { .. } => { /* a Map: recomputed on demand */ }
             RowOp::Reduce { op, input } => {
@@ -1999,6 +2032,7 @@ pub fn fused_row_parallel_views(
                     out_strides: &out_strides,
                     out_shape: row_shape,
                     scalar_reg: &scalar_reg,
+                    conversions,
                 };
                 let mut body_stmts: Vec<Statement> = Vec::new();
                 emit_i(&mut body_stmts);
@@ -2201,6 +2235,7 @@ pub fn fused_row_parallel_views(
             out_strides: &out_strides,
             out_shape: row_shape,
             scalar_reg: &scalar_reg,
+            conversions,
         };
         let mut body_stmts: Vec<Statement> = Vec::new();
         emit_i(&mut body_stmts);
@@ -2324,8 +2359,17 @@ mod tests {
             .collect();
         let wt: Vec<f32> = (0..n_cols).map(|j| 0.5 + j as f32 * 0.013).collect();
         let interpret = |kernel: &RowKernel, out: Buffer| -> Buffer {
-            let body = fused_row_parallel_views("row", &out_shape, &leaves, &layouts, kernel, w, 1)
-                .expect("the row body generates");
+            let body = fused_row_parallel_views(
+                "row",
+                &out_shape,
+                &leaves,
+                &layouts,
+                kernel,
+                w,
+                1,
+                RoundingConversions::NONE,
+            )
+            .expect("the row body generates");
             let mut buffers = vec![Buffer::from_f32s(&x), Buffer::from_f32s(&wt), out];
             run(&body, [num_rows as u32, 1, 1], &mut buffers).expect("interpreter");
             buffers.pop().unwrap()
@@ -2448,6 +2492,7 @@ mod tests {
             &rmsnorm_kernel(n_cols, 1e-6),
             4,
             1,
+            RoundingConversions::F16,
         )
         .expect("fused_row_parallel_views precondition");
         stage_nvptx(&parallel);
@@ -2618,8 +2663,17 @@ mod tests {
         let wt: Vec<f32> = (0..n_cols).map(|j| 0.5 + j as f32 * 0.1).collect();
 
         let serial = fused_row("rms_ser", &out_shape, &leaves, &k).expect("fused_row precondition");
-        let parallel = fused_row_parallel_views("rms_par", &out_shape, &leaves, &layouts, &k, w, 1)
-            .expect("fused_row_parallel_views precondition");
+        let parallel = fused_row_parallel_views(
+            "rms_par",
+            &out_shape,
+            &leaves,
+            &layouts,
+            &k,
+            w,
+            1,
+            RoundingConversions::NONE,
+        )
+        .expect("fused_row_parallel_views precondition");
         let s_ser = spv(&serial, "rms_ser");
         let s_par = spv(&parallel, "rms_par");
 
@@ -2679,8 +2733,17 @@ mod tests {
             .collect();
 
         let serial = fused_row("sm_ser", &out_shape, &leaves, &k).expect("fused_row precondition");
-        let parallel = fused_row_parallel_views("sm_par", &out_shape, &leaves, &layouts, &k, w, 1)
-            .expect("fused_row_parallel_views precondition");
+        let parallel = fused_row_parallel_views(
+            "sm_par",
+            &out_shape,
+            &leaves,
+            &layouts,
+            &k,
+            w,
+            1,
+            RoundingConversions::NONE,
+        )
+        .expect("fused_row_parallel_views precondition");
         let s_ser = spv(&serial, "sm_ser");
         let s_par = spv(&parallel, "sm_par");
         let run = |s: &poot_codegen::CompiledKernel, wg: [u32; 3], threads: [u32; 3]| -> Vec<f32> {
@@ -2795,7 +2858,18 @@ mod tests {
                     chain(op, arity, 8, LeafTy::F32),
                 );
                 let build = |k: &FusedKernel| {
-                    BodySize::of(&fused_views("k", &out_shape, &leaves, &layouts, k, None).unwrap())
+                    BodySize::of(
+                        &fused_views(
+                            "k",
+                            &out_shape,
+                            &leaves,
+                            &layouts,
+                            k,
+                            None,
+                            RoundingConversions::NONE,
+                        )
+                        .unwrap(),
+                    )
                 };
                 let (built, bound) = (
                     (build(&empty), build(&full)),
@@ -2843,8 +2917,16 @@ mod tests {
                     let (empty, full) = (select(0), select(8));
                     let build = |k: &FusedKernel| {
                         BodySize::of(
-                            &fused_views("k", &out_shape, &shapes, &select_layouts, k, x_groups)
-                                .unwrap(),
+                            &fused_views(
+                                "k",
+                                &out_shape,
+                                &shapes,
+                                &select_layouts,
+                                k,
+                                x_groups,
+                                RoundingConversions::NONE,
+                            )
+                            .unwrap(),
                         )
                     };
                     let (built, bound) = (
@@ -2950,8 +3032,17 @@ mod tests {
             let leaves: Vec<&[usize]> = leaf_shapes.iter().map(Vec::as_slice).collect();
             let layouts: Vec<Layout> = leaves.iter().map(|s| Layout::contiguous(s)).collect();
             for w in [1usize, 2, 7, 64, 128, 256] {
-                let body =
-                    fused_row_parallel_views("k", &out_shape, &leaves, &layouts, &k, w, 1).unwrap();
+                let body = fused_row_parallel_views(
+                    "k",
+                    &out_shape,
+                    &leaves,
+                    &layouts,
+                    &k,
+                    w,
+                    1,
+                    RoundingConversions::NONE,
+                )
+                .unwrap();
                 let (built, bound) = (BodySize::of(&body), row_size(&k, 2, w));
                 assert!(
                     built.instructions <= bound.instructions && built.locals <= bound.locals,
@@ -2988,6 +3079,7 @@ mod tests {
         leaf_layouts: &[Layout],
         k: &RowKernel,
     ) -> Result<Body, KernelGenError> {
+        let conversions = RoundingConversions::NONE;
         if leaf_shapes.len() != k.n_leaves {
             return Err(KernelGenError::CountMismatch {
                 generator: "fused_row_views",
@@ -3111,7 +3203,7 @@ mod tests {
                         .map(|i| scalar_operand(i, &scalar_reg))
                         .collect();
                     let dst = scalar_reg[n + s].unwrap();
-                    emit_scalar_op(dst, *op, &operands, &mut al, &mut pending);
+                    emit_scalar_op(dst, *op, &operands, conversions, &mut al, &mut pending);
                 }
                 RowOp::Pointwise { .. } => { /* a Map: recomputed on demand, nothing to emit here */
                 }
@@ -3156,6 +3248,7 @@ mod tests {
                         out_strides: &out_strides,
                         out_shape,
                         scalar_reg: &scalar_reg,
+                        conversions,
                     };
                     let mut body_stmts: Vec<Statement> = Vec::new();
                     emit_i(&mut body_stmts);
@@ -3245,6 +3338,7 @@ mod tests {
             out_strides: &out_strides,
             out_shape,
             scalar_reg: &scalar_reg,
+            conversions,
         };
         let mut body_stmts: Vec<Statement> = Vec::new();
         emit_i(&mut body_stmts);

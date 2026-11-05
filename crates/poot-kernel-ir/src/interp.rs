@@ -747,6 +747,12 @@ impl Workgroup<'_> {
                 };
                 narrow(to, value).map(Value::Scalar)
             }
+            Rvalue::FromLowBits { to, operand } => {
+                let Scalar::U32(word) = self.scalar_operand(lane, operand)? else {
+                    return Err(Fault::IllTyped("a low-bits reinterpretation reads a u32"));
+                };
+                from_low_bits(to, word).map(Value::Scalar)
+            }
             Rvalue::Bitcast { to, operand } => {
                 let a = self.scalar_operand(lane, operand)?;
                 bitcast(to, a).map(Value::Scalar)
@@ -1236,10 +1242,17 @@ fn compare_exchange_matches(old: Scalar, expected: Scalar) -> Result<bool, Fault
 
 // --- narrow floats and FP8 ----------------------------------------------------------------------
 
-/// Round to the nearest `f16` (ties to even); overflow becomes infinity.
+/// The NaN a two-byte float holds for the f32 NaN `x`: its sign and the payload bits the type keeps (all but the
+/// low `dropped` bits), quiet. An f16 or bf16 cannot hold the rest, so no two-byte scalar carries them (POOT-1458:
+/// the exact `Narrow` of a widened f16 then never faults on a NaN, as on every device).
+fn two_byte_nan(x: f32, dropped: u32) -> f32 {
+    f32::from_bits((x.to_bits() & !dropped) | 0x0040_0000)
+}
+
+/// Round to the nearest `f16` (ties to even); overflow becomes infinity, a NaN [`two_byte_nan`].
 fn round_to_f16(x: f32) -> f32 {
     if x.is_nan() {
-        return x;
+        return two_byte_nan(x, 0x1fff);
     }
     let magnitude = x.abs();
     let rounded = if magnitude >= 65520.0 {
@@ -1284,10 +1297,38 @@ fn narrow(to: &Ty, value: f32) -> Result<Scalar, Fault> {
     }
 }
 
-/// Round to the nearest `bfloat16` (ties to even).
+/// The two-byte float `to` whose bits are the low half of `word` (the high half must be zero): f16 decoded exactly
+/// (subnormals, infinities and NaN payloads included), bf16 as the high half of an f32.
+fn from_low_bits(to: &Ty, word: u32) -> Result<Scalar, Fault> {
+    if word >> 16 != 0 {
+        return Err(Fault::IllTyped(
+            "a low-bits reinterpretation reads a word whose high half is zero",
+        ));
+    }
+    match to {
+        Ty::BF16 => Ok(Scalar::BF16(f32::from_bits(word << 16))),
+        Ty::F16 => {
+            let sign = (word & 0x8000) << 16;
+            let (exponent, mantissa) = ((word >> 10) & 0x1f, word & 0x03ff);
+            let value = match exponent {
+                0 => {
+                    f32::from_bits((mantissa as f32 * f32::from_bits(0x3380_0000)).to_bits() | sign)
+                }
+                0x1f => f32::from_bits(sign | 0x7f80_0000 | (mantissa << 13)),
+                _ => f32::from_bits(sign | ((exponent + 112) << 23) | (mantissa << 13)),
+            };
+            Ok(Scalar::F16(value))
+        }
+        _ => Err(Fault::IllTyped(
+            "a low-bits reinterpretation targets f16 or bf16",
+        )),
+    }
+}
+
+/// Round to the nearest `bfloat16` (ties to even); a NaN becomes [`two_byte_nan`].
 fn round_to_bf16(x: f32) -> f32 {
     if x.is_nan() {
-        return x;
+        return two_byte_nan(x, 0xffff);
     }
     let bits = x.to_bits();
     let round_up = 0x7fff + ((bits >> 16) & 1);
@@ -1950,6 +1991,25 @@ mod tests {
             1.0 + 2.0f32.powi(-6)
         );
         assert_eq!(round_to_bf16(3.140625), 3.140625);
+    }
+
+    /// POOT-1458: a cast to a two-byte float of a NaN holds only what the type can: the sign and the payload bits
+    /// it keeps, quiet. Widened back, the value is a NaN the exact `Narrow` accepts. Mutation: return `x` from
+    /// `round_to_f16`'s NaN branch; the cast keeps the low payload bit and this row goes red.
+    #[test]
+    fn a_two_byte_cast_of_a_nan_keeps_only_the_bits_the_type_holds() {
+        let signalling = f32::from_bits(0xff80_0001);
+        let Ok(Scalar::F16(half)) = cast(&Ty::F16, Scalar::F32(signalling)) else {
+            panic!("an f32 casts to f16");
+        };
+        assert_eq!(half.to_bits(), 0xffc0_0000);
+        assert!(narrow(&Ty::F16, half).is_ok());
+        let Ok(Scalar::BF16(brain)) = cast(&Ty::BF16, Scalar::F32(f32::from_bits(0x7fa1_2345)))
+        else {
+            panic!("an f32 casts to bf16");
+        };
+        assert_eq!(brain.to_bits(), 0x7fe1_0000);
+        assert!(narrow(&Ty::BF16, brain).is_ok());
     }
 
     #[test]

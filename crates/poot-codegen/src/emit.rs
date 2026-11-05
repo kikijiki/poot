@@ -190,7 +190,7 @@ fn binop_inst(op: BinOp, is_float: bool, signed: bool) -> (&'static str, ResultT
             ResultTy::Bool,
         ),
         Ne => (
-            if is_float { "fcmp one" } else { "icmp ne" },
+            if is_float { "fcmp une" } else { "icmp ne" },
             ResultTy::Bool,
         ),
         Min => ("__min", ResultTy::Same), // unsupported until needed (would be llvm.minnum / select)

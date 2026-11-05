@@ -22,7 +22,7 @@ use crate::types::GraphStorage;
 use poot_kernelgen::BodyLimits;
 use poot_target::{AieCaps, AieTargetId, Backend, DeviceCaps};
 
-use crate::dtype_widen::bf16_const_is_packed;
+use crate::dtype_widen::ConstLanes;
 use crate::{
     Binding, Capability, CompileError, ImportedKernel, Plan, PlanError, ScratchId, Sink, Source,
     Target, compute_views, numel, value_ids,
@@ -488,24 +488,14 @@ fn plan_eqn_policy(
     observe_plan(compiled);
     let out_shape = g.aval(eqn.out).shape.clone();
     let out_numel = out_numel_saturating(&out_shape);
-    // Card 1011: which operands a narrow reader (a `Cast`, or a fused region that widens its input) reads from
-    // packed `u32` lanes. The lane is the storage plan's (`bf16_const_is_packed`), which needs the whole graph,
-    // so it is decided here.
-    let packed_operands: Vec<bool> = if reads_narrow_operands(&eqn.op) {
-        eqn.inputs
-            .iter()
-            .map(|operand| {
-                matches!(
-                    operand,
-                    Operand::Value(src)
-                        if g.meta(*src).storage.holds_weight_bytes()
-                            && g.aval(*src).dtype == DType::BF16
-                            && bf16_const_is_packed(g, views, *src, target)
-                )
-            })
-            .collect()
+    // Card 1011 and POOT-1458: the lane of each BF16 const operand a reader binds: packed `u32` lanes a narrow
+    // reader (a `Cast`, or a fused region that widens its input) widens, or the f16 lane a dense contraction that
+    // multiplies in f16 reads its weight in. The lane is the storage plan's (`bf16_const_lane`), which needs the
+    // whole graph, so it is decided here.
+    let const_lanes = if reads_narrow_operands(&eqn.op) || eqn.op.dense_weight().is_some() {
+        ConstLanes::of(g, views, eqn, target)
     } else {
-        Vec::new()
+        ConstLanes::default()
     };
     plan_eqn_views_impl(
         g,
@@ -514,7 +504,7 @@ fn plan_eqn_policy(
         out_numel,
         target,
         views,
-        &packed_operands,
+        &const_lanes,
         *limits,
         npu,
         output,
@@ -548,7 +538,7 @@ pub(crate) fn plan_eqn_views_impl(
     out_numel: usize,
     target: &Target,
     views: &HashMap<ValueId, Layout>,
-    packed_operands: &[bool],
+    const_lanes: &ConstLanes,
     limits: BodyLimits,
     npu: Option<&dyn NpuLowering>,
     output: OutputBuffer,
@@ -563,7 +553,7 @@ pub(crate) fn plan_eqn_views_impl(
             *backend,
             views,
             caps,
-            packed_operands,
+            const_lanes,
             limits,
             output,
         ),
@@ -575,7 +565,7 @@ pub(crate) fn plan_eqn_views_impl(
             *target,
             caps,
             views,
-            packed_operands,
+            const_lanes,
             limits,
             npu.ok_or(PlanError::NpuLoweringMissing {
                 target: (*target).into(),
@@ -629,7 +619,7 @@ fn plan_aie_eqn(
     target: AieTargetId,
     caps: &AieCaps,
     views: &HashMap<ValueId, Layout>,
-    packed_operands: &[bool],
+    const_lanes: &ConstLanes,
     limits: BodyLimits,
     npu: &dyn NpuLowering,
 ) -> Result<Planned, PlanError> {
@@ -653,7 +643,7 @@ fn plan_aie_eqn(
             views,
             odt,
             limits,
-            packed_operands,
+            const_lanes,
         )?,
         OpKind::Iota { .. } => return Err(site.refuse(Capability::UnfoldedIota)),
         side_output_ops!() => return Ok(plan_side_output(eqn)),
@@ -750,7 +740,7 @@ fn plan_gpu_eqn(
     backend: Backend,
     views: &HashMap<ValueId, Layout>,
     caps: &DeviceCaps,
-    packed_operands: &[bool],
+    const_lanes: &ConstLanes,
     limits: BodyLimits,
     output: OutputBuffer,
 ) -> Result<Planned, PlanError> {
@@ -768,7 +758,7 @@ fn plan_gpu_eqn(
             odt,
             caps,
             limits,
-            packed_operands,
+            const_lanes,
         );
     }
     let ids = value_ids(eqn);
@@ -812,7 +802,7 @@ fn plan_gpu_eqn(
                 odt,
                 caps,
                 limits,
-                packed_operands,
+                const_lanes,
             );
         }
         moe_ops!() => {
@@ -826,7 +816,7 @@ fn plan_gpu_eqn(
                 odt,
                 caps,
                 limits,
-                packed_operands,
+                const_lanes,
             );
         }
         elementwise_ops!() => elementwise::plan(
@@ -838,7 +828,7 @@ fn plan_gpu_eqn(
             views,
             odt,
             limits,
-            packed_operands,
+            const_lanes,
         )?,
         matmul_ops!() => matmul::plan(
             g,
@@ -849,7 +839,7 @@ fn plan_gpu_eqn(
             odt,
             caps,
             limits,
-            packed_operands,
+            const_lanes,
         )?,
         attention_ops!() => attention::plan(g, eqn, backend, caps, limits)?,
         scan_ops!() => scan::plan(g, eqn, backend, caps, limits)?,
@@ -862,7 +852,7 @@ fn plan_gpu_eqn(
             backend,
             caps,
             limits,
-            packed_operands.first().copied().unwrap_or(false),
+            const_lanes.packed(0),
         )?,
         movement_ops!() => movement::plan(
             g, eqn, out_shape, out_numel, backend, views, odt, caps, limits, output,

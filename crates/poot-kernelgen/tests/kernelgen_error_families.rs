@@ -16,8 +16,16 @@ fn fused_family_rejects_leaf_count_mismatch_and_zero_width() {
         output: poot_kernelgen::FusedInput::Leaf(poot_kernelgen::LeafId::new(0)),
     };
     let layouts = vec![poot_kernelgen::Layout::contiguous(&[4])];
-    let err = poot_kernelgen::fused_views("t", &[4], &[&[4]], &layouts, &kfk, None)
-        .expect_err("1 leaf shape given, kernel wants 2");
+    let err = poot_kernelgen::fused_views(
+        "t",
+        &[4],
+        &[&[4]],
+        &layouts,
+        &kfk,
+        None,
+        poot_target::RoundingConversions::NONE,
+    )
+    .expect_err("1 leaf shape given, kernel wants 2");
     assert_eq!(
         err,
         KernelGenError::CountMismatch {
@@ -37,8 +45,17 @@ fn fused_family_rejects_leaf_count_mismatch_and_zero_width() {
         side_outputs: Vec::new(),
     };
     let layouts = vec![poot_kernelgen::Layout::contiguous(&[4])];
-    let err = poot_kernelgen::fused_row_parallel_views("t", &[4], &[&[4]], &layouts, &krk, 0, 1)
-        .expect_err("workgroup width 0 is invalid");
+    let err = poot_kernelgen::fused_row_parallel_views(
+        "t",
+        &[4],
+        &[&[4]],
+        &layouts,
+        &krk,
+        0,
+        1,
+        poot_target::RoundingConversions::NONE,
+    )
+    .expect_err("workgroup width 0 is invalid");
     assert_eq!(
         err,
         KernelGenError::BelowMinimum {
@@ -176,8 +193,16 @@ fn float_region_rejects_an_i32_leaf_outside_a_select_condition() {
         output: FusedInput::Step(StepId::new(0)),
     };
     let layouts = vec![poot_kernelgen::Layout::contiguous(&[4]); 2];
-    let err = poot_kernelgen::fused_views("t", &[4], &[&[4], &[4]], &layouts, &read_as_float, None)
-        .expect_err("an I32 leaf feeds a float Add");
+    let err = poot_kernelgen::fused_views(
+        "t",
+        &[4],
+        &[&[4], &[4]],
+        &layouts,
+        &read_as_float,
+        None,
+        poot_target::RoundingConversions::NONE,
+    )
+    .expect_err("an I32 leaf feeds a float Add");
     assert!(
         matches!(err, KernelGenError::IndexLeafOperand { leaf, .. } if leaf.index() == 0),
         "{err:?}"
@@ -204,6 +229,7 @@ fn float_region_rejects_an_i32_leaf_outside_a_select_condition() {
         &layouts,
         &as_condition,
         None,
+        poot_target::RoundingConversions::NONE,
     )
     .expect("an I32 condition leaf beside two float branches");
 
@@ -260,19 +286,36 @@ fn a_two_byte_float_is_only_ever_a_select_branch() {
             &layouts,
             &select(vec![LeafTy::I32, leaf, leaf]),
             None,
+            poot_target::RoundingConversions::NONE,
         )
         .expect("a select moves two-byte branches");
     }
     let mixed = select(vec![LeafTy::I32, LeafTy::BF16, LeafTy::F16]);
-    let err = poot_kernelgen::fused_views("t", &[4], &shapes, &layouts, &mixed, None)
-        .expect_err("branches of two types");
+    let err = poot_kernelgen::fused_views(
+        "t",
+        &[4],
+        &shapes,
+        &layouts,
+        &mixed,
+        None,
+        poot_target::RoundingConversions::NONE,
+    )
+    .expect_err("branches of two types");
     assert!(
         matches!(err, KernelGenError::NarrowOperand { .. }),
         "{err:?}"
     );
     let float_and_narrow = select(vec![LeafTy::I32, LeafTy::BF16, LeafTy::F32]);
-    let err = poot_kernelgen::fused_views("t", &[4], &shapes, &layouts, &float_and_narrow, None)
-        .expect_err("a two-byte and an F32 branch");
+    let err = poot_kernelgen::fused_views(
+        "t",
+        &[4],
+        &shapes,
+        &layouts,
+        &float_and_narrow,
+        None,
+        poot_target::RoundingConversions::NONE,
+    )
+    .expect_err("a two-byte and an F32 branch");
     assert!(
         matches!(err, KernelGenError::NarrowOperand { .. }),
         "{err:?}"
@@ -288,9 +331,16 @@ fn a_two_byte_float_is_only_ever_a_select_branch() {
         }],
         output: FusedInput::Step(StepId::new(0)),
     };
-    let err =
-        poot_kernelgen::fused_views("t", &[4], &shapes[..2], &layouts[..2], &arithmetic, None)
-            .expect_err("a two-byte leaf feeds an Add");
+    let err = poot_kernelgen::fused_views(
+        "t",
+        &[4],
+        &shapes[..2],
+        &layouts[..2],
+        &arithmetic,
+        None,
+        poot_target::RoundingConversions::NONE,
+    )
+    .expect_err("a two-byte leaf feeds an Add");
     assert!(
         matches!(err, KernelGenError::NarrowOperand { .. }),
         "{err:?}"
@@ -315,8 +365,16 @@ fn float_region_rejects_a_cast_of_a_float_operand_and_mixed_arithmetic() {
         }],
         output: FusedInput::Step(StepId::new(0)),
     };
-    let err = poot_kernelgen::fused_views("t", &[4], &[&[4]], &layouts[..1], &cast_of_float, None)
-        .expect_err("a cast of an f32 leaf has no meaning");
+    let err = poot_kernelgen::fused_views(
+        "t",
+        &[4],
+        &[&[4]],
+        &layouts[..1],
+        &cast_of_float,
+        None,
+        poot_target::RoundingConversions::NONE,
+    )
+    .expect_err("a cast of an f32 leaf has no meaning");
     assert!(
         matches!(err, KernelGenError::IndexCastOperand { step: 0, .. }),
         "{err:?}"
@@ -345,8 +403,16 @@ fn float_region_rejects_a_cast_of_a_float_operand_and_mixed_arithmetic() {
         output: FusedInput::Step(StepId::new(1)),
     };
     let layouts = vec![poot_kernelgen::Layout::contiguous(&[4]); 3];
-    let err = poot_kernelgen::fused_views("t", &[4], &[&[4], &[4], &[4]], &layouts, &mixed, None)
-        .expect_err("an I32 step feeds a float Add");
+    let err = poot_kernelgen::fused_views(
+        "t",
+        &[4],
+        &[&[4], &[4], &[4]],
+        &layouts,
+        &mixed,
+        None,
+        poot_target::RoundingConversions::NONE,
+    )
+    .expect_err("an I32 step feeds a float Add");
     assert!(
         matches!(err, KernelGenError::NarrowOperand { .. }),
         "{err:?}"

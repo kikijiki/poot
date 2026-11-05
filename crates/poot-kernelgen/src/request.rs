@@ -16,7 +16,7 @@
 
 use poot_kernel_ir::serialize::{Grid, serialize_grid};
 use poot_kernel_ir::{BinOp, Body, MathOp, Statement, Ty, UnOp, WmmaDtype, WmmaShape};
-use poot_target::{BufferStorage, DeviceCaps, ElementKind};
+use poot_target::{BufferStorage, DeviceCaps, ElementKind, RoundingConversions};
 
 use crate::KernelGenError;
 use crate::aie_row::row_contract;
@@ -1001,6 +1001,7 @@ fn pointwise(spec: &PointwiseSpec, caps: &DeviceCaps) -> Result<Generated, Kerne
                 &layouts,
                 &spec.kernel,
                 fold.x_groups(caps),
+                caps.rounding_conversions,
             )?,
             fold.launch(caps),
         ),
@@ -1056,6 +1057,7 @@ fn row(spec: &RowSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
                 kernel,
                 *width,
                 x,
+                caps.rounding_conversions,
             )?;
             with(body, Launch::grid([(x * width) as u32, y as u32, 1]))
         }
@@ -1091,6 +1093,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                     epilogue,
                     fold.x_groups(caps),
                     *precision,
+                    caps.rounding_conversions,
                 )?,
                 None => matmul_batched_dt_grid(
                     ENTRY,
@@ -1100,6 +1103,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                     &shapes.b_shape,
                     fold.x_groups(caps),
                     *precision,
+                    caps.rounding_conversions,
                 ),
             };
             fold.contraction(body, caps)
@@ -1126,6 +1130,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                     WeightLayout::Kn,
                     BufferStorage::f32(),
                     *precision,
+                    caps.rounding_conversions,
                 )?,
                 Launch::grid([(x * width) as u32, y as u32, 1]),
             )
@@ -1138,8 +1143,15 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             epilogue,
             precision,
         } => {
-            let body =
-                dense_contraction(ENTRY, *weight, *schedule, *k, epilogue.as_ref(), *precision)?;
+            let body = dense_contraction(
+                ENTRY,
+                *weight,
+                *schedule,
+                *k,
+                epilogue.as_ref(),
+                *precision,
+                caps.rounding_conversions,
+            )?;
             let threads = schedule.grid_threads(1, 1, *n);
             with(
                 body,
@@ -1166,6 +1178,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                 epilogue.as_ref(),
                 *rows,
                 *precision,
+                caps.rounding_conversions,
             )?;
             with(
                 body,
@@ -1184,7 +1197,15 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
         } => {
             let (x, y) = fold_groups(*numel, caps.max_grid[0]);
             with(
-                attn_scores_v_gemv_lds(ENTRY, *cap, *d, *width, x, *precision),
+                attn_scores_v_gemv_lds(
+                    ENTRY,
+                    *cap,
+                    *d,
+                    *width,
+                    x,
+                    *precision,
+                    caps.rounding_conversions,
+                ),
                 Launch::grid([(x * width) as u32, y as u32, 1]),
             )
         }
@@ -1208,6 +1229,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                     TiledRead {
                         precision: *precision,
                         activation_stored: *activation_stored,
+                        conversions: caps.rounding_conversions,
                     },
                 )?,
                 Launch {
@@ -1233,6 +1255,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                 meta,
                 epilogue.as_ref(),
                 *precision,
+                caps.rounding_conversions,
             )?,
             Launch {
                 grid: *grid,
@@ -1271,7 +1294,7 @@ fn attention(
     // the X cap.
     let (x, y) = fold_within_grid("attention_body", rows.len(), caps)?;
     with(
-        attention_body(ENTRY, spec, rows, x)?,
+        attention_body(ENTRY, spec, rows, x, caps.rounding_conversions)?,
         Launch::grid([(x * lanes) as u32, y as u32, 1]),
     )
 }
@@ -1564,6 +1587,8 @@ fn serialized_pointwise(spec: &PointwiseSpec) -> Result<Scheduled, KernelGenErro
             &leaf_layouts(&spec.leaves),
             &spec.kernel,
             None,
+            // An AIE core rounds in integer arithmetic, the form every target keeps.
+            RoundingConversions::NONE,
         )?,
         Launch::flat(fold.numel),
     )?;
@@ -1698,6 +1723,8 @@ fn serialized_row(spec: &RowSpec) -> Result<Scheduled, KernelGenError> {
                 kernel,
                 1,
                 rows,
+                // An AIE core rounds in integer arithmetic, the form every target keeps.
+                RoundingConversions::NONE,
             )?;
             let accesses = leaves
                 .iter()
