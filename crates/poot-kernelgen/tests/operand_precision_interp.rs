@@ -4,8 +4,9 @@
 //! - The tier-1 storage row: the narrowed value a body stages is bit-identical to the oracle's round to nearest
 //!   even (`poot_eval::round_to_fragment`), over operands that include ties, both range edges, subnormals, zeros
 //!   and infinities, so a wrong rounding mode fails whatever the data.
-//! - The product rows: the register-tiled, GEMV, serial and indexed bodies equal a host product over the same
-//!   terms (`hi`, `lo` for a split operand) in the order the oracle sums them.
+//! - The product rows: the register-tiled body equals a host product over the same terms (`hi`, `lo` for a split
+//!   operand) in the order the oracle sums them; the GEMV and serial bodies equal the exact host product.
+//! - The refusals: a scalar schedule (a Gemv) names no narrowed precision (POOT-1493).
 //!
 //! Every row runs under the caps of each device family (POOT-1458): SPIR-V rounds in integer arithmetic, ROCm and
 //! PTX round to f16 with a kept conversion (`Cast` to f16 and back). Both forms must give the oracle's bits.
@@ -384,12 +385,12 @@ fn a_weight_stored_in_the_fragment_dtype_enters_once() {
     }
 }
 
-/// The product rows. The register-tiled GEMM, the decode GEMV, the serial matmul and the decode `gemv_lds` body each
-/// compute the host product over the same terms (the planner's launch for each), under every precision, over data
-/// that makes the narrowing visible. Mutation: in `tiled_body` write only the `hi` part of a split activation
-/// (drop the `lo` array write); the split GEMM rows go red.
+/// The product row of the matrix-unit nests. The register-tiled GEMM computes the host product over the declared
+/// terms (the planner's launch), under every precision, over data that makes the narrowing visible. Mutation: in
+/// `tiled_body` write only the `hi` part of a split activation (drop the `lo` array write); the split GEMM rows
+/// go red.
 #[test]
-fn every_contraction_body_equals_the_host_product_over_the_declared_terms() {
+fn the_tiled_gemm_equals_the_host_product_over_the_declared_terms() {
     let (m, k, n) = (13usize, 19usize, 11usize);
     let x = fill(m * k, 1, 3.0);
     let w = fill(n * k, 2, 3.0);
@@ -421,6 +422,20 @@ fn every_contraction_body_equals_the_host_product_over_the_declared_terms() {
                 );
             }
         }
+    }
+}
+
+/// The scalar bodies multiply exact operands (a narrowed precision is a matrix-unit schedule's: the planner refuses
+/// it any other, POOT-1476). The decode GEMV and the serial matmul compute the host product, over data that makes a
+/// rounding of either operand visible. Mutation: in the Gemv loop nest (`gemv_body`) add the activation and the weight instead of multiplying them; the
+/// GEMV row goes red.
+#[test]
+fn the_scalar_contraction_bodies_equal_the_exact_host_product() {
+    let (m, k, n) = (13usize, 19usize, 11usize);
+    let x = fill(m * k, 1, 3.0);
+    let w = fill(n * k, 2, 3.0);
+    let precision = OperandPrecision::Exact;
+    for caps in devices() {
         // The decode GEMV (`M = 1`): lanes fold their partial sums in a tree, so the order is the kernel's own and
         // the comparison is to the sum's rounding error.
         let schedule = kg::Schedule::Gemv {
@@ -435,7 +450,6 @@ fn every_contraction_body_equals_the_host_product_over_the_declared_terms() {
             k,
             n,
             epilogue: None,
-            precision,
         });
         let generated = kg::generate(&request, &caps, &LIMITS).unwrap();
         let workgroup = generated.body.workgroup_size[0];
@@ -481,7 +495,6 @@ fn every_contraction_body_equals_the_host_product_over_the_declared_terms() {
                 two_d: false,
                 width: 64,
             },
-            precision,
         });
         let generated = kg::generate(&request, &caps, &LIMITS).unwrap();
         let workgroup = generated.body.workgroup_size[0];
@@ -511,6 +524,46 @@ fn every_contraction_body_equals_the_host_product_over_the_declared_terms() {
                     got[r * n + c]
                 );
             }
+        }
+    }
+}
+
+/// A Gemv multiplies exact operands: an indexed contraction whose Gemv schedule names a narrowed or split precision
+/// is a typed refusal, not an unrounded kernel (the planner refuses the same, `NoMatrixUnitSchedule`). Mutation:
+/// drop the `require_exact` call in `indexed_contraction`; the narrowed Gemv generates and this row goes red.
+#[test]
+fn an_indexed_gemv_refuses_a_narrowed_precision() {
+    let (k, n, m, experts) = (8usize, 4usize, 2usize, 2usize);
+    for precision in PRECISIONS {
+        let request =
+            kg::KernelRequest::Contraction(kg::ContractionSpec::Indexed(kg::IndexedContraction {
+                schedule: kg::Schedule::Gemv {
+                    width: 16,
+                    cols: 2,
+                    unroll: 2,
+                    activation: kg::GemvActivation::Scalar,
+                },
+                layout: kg::WeightLayout::Nk,
+                weight: BufferStorage::f32(),
+                epilogue: None,
+                grid: [64, 1, 1],
+                meta: vec![k as u32, n as u32, m as u32, 0, 0, experts as u32],
+                precision,
+            }));
+        let generated = kg::generate(&request, &devices()[0], &LIMITS);
+        if precision.is_exact() {
+            generated.expect("an exact indexed Gemv generates");
+        } else {
+            assert!(
+                matches!(
+                    generated,
+                    Err(kg::KernelGenError::Unsupported {
+                        request: "indexed_contraction",
+                        ..
+                    })
+                ),
+                "{precision}: {generated:?}"
+            );
         }
     }
 }

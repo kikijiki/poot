@@ -31,9 +31,10 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
+    tiling_pin: Option<kg::RegisterTiling>,
     const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
-    let site = Site::new(g, eqn, backend, limits);
+    let site = Site::new(g, eqn, backend, limits).pinned(tiling_pin);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
     let ids = value_ids(eqn);
     let mut planned = match &eqn.op {

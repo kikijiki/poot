@@ -335,6 +335,13 @@ pub const SM80_MATRIX_FMA_RATE: u8 = 16;
 /// against FP32 67 TFLOPS, 14.8x, rounded to 15.
 pub const SM90_MATRIX_FMA_RATE: u8 = 15;
 
+/// The matrix-unit rate every sm_86, sm_89 and sm_120 part reaches at least (POOT-1496). A capability does not fix the
+/// rate: the GeForce parts run the Tensor Cores at half rate when they accumulate in f32 (RTX 3090: 71 TFLOPS dense
+/// against FP32 35.6, 2.0x; RTX 4090: 165.2 against 82.6, 2.0x; RTX 5090: 209.5 against 104.8, 2.0x), while the
+/// datacenter and workstation parts of the same capability run it at full rate (A40: 149.7 against 37.4, 4.0x; L40S
+/// 362 against 91.6, 4.0x). The cost model takes the floor, so it never credits a unit with speed it may not have.
+pub const GEFORCE_MATRIX_FMA_RATE: u8 = 2;
+
 /// PCI vendor id of AMD, as Vulkan reports it.
 pub const VENDOR_AMD: u32 = 0x1002;
 
@@ -553,6 +560,11 @@ mod tests {
             source: "NVIDIA H100 SXM datasheet: BF16 and FP16 Tensor Core 989 TFLOPS dense over FP32 67 TFLOPS (14.8, rounded). Other compute capabilities: no sourced peak, rate Unknown (no credit)",
         },
         Provenance {
+            name: "GEFORCE_MATRIX_FMA_RATE",
+            value: 2.0,
+            source: "NVIDIA datasheets, FP16 Tensor Core with FP32 accumulate, dense, over non-Tensor FP32: RTX 3090 (GA102 whitepaper) 71 over 35.6; RTX 4090 (Ada whitepaper) 165.2 over 82.6; RTX 5090 209.5 over 104.8. The floor over the parts of sm_86, sm_89 and sm_120: A40 (149.7 over 37.4) and L40S (362 over 91.6) run 4x",
+        },
+        Provenance {
             name: "PORTABLE_PACKED_GEMV_RUN",
             value: 8.0,
             source: "card 653: the 8-element run every class launched before POOT-1398; the run of a decode that addresses each element on its own (gemv_run's Elementwise arm)",
@@ -665,6 +677,7 @@ mod tests {
         assert_provenance("GFX11_MATRIX_FMA_RATE", GFX11_MATRIX_FMA_RATE);
         assert_provenance("SM80_MATRIX_FMA_RATE", SM80_MATRIX_FMA_RATE);
         assert_provenance("SM90_MATRIX_FMA_RATE", SM90_MATRIX_FMA_RATE);
+        assert_provenance("GEFORCE_MATRIX_FMA_RATE", GEFORCE_MATRIX_FMA_RATE);
         claimed(&[
             "REGISTER_LANE_EDGE",
             "REGISTER_LANE_EDGE_WIDE",
@@ -687,6 +700,7 @@ mod tests {
             "GFX11_MATRIX_FMA_RATE",
             "SM80_MATRIX_FMA_RATE",
             "SM90_MATRIX_FMA_RATE",
+            "GEFORCE_MATRIX_FMA_RATE",
             "PORTABLE_PACKED_GEMV_RUN",
             "STRIX_HALO_PACKED_GEMV_RUN",
             "SM_120_PACKED_GEMV_RUN",
@@ -812,7 +826,7 @@ mod tests {
     }
 
     /// The matrix-unit rate is sourced per compute capability: the A100 and H100 carry their datasheet ratios, and
-    /// every other capability, and a Vulkan device nobody measured, is `Unknown` (no speed credit). Mutation: key
+    /// sm_86, sm_89 and sm_120 their GeForce floor, every other capability, and a Vulkan device nobody measured, is `Unknown` (no speed credit). Mutation: key
     /// `vulkan_matrix_fma_rate` on the vendor alone; the discrete card reads `Known`.
     #[test]
     fn the_matrix_rate_is_known_only_where_it_is_sourced() {
@@ -824,9 +838,10 @@ mod tests {
         };
         assert_eq!(rate((8, 0)), vec![Queried::Known(16); 2]);
         assert_eq!(rate((9, 0)), vec![Queried::Known(15); 2]);
-        for cc in [(8, 6), (8, 9), (10, 0), (12, 0)] {
-            assert_eq!(rate(cc), vec![Queried::Unknown; 2], "sm_{}{}", cc.0, cc.1);
+        for cc in [(8, 6), (8, 9), (12, 0)] {
+            assert_eq!(rate(cc), vec![Queried::Known(2); 2], "sm_{}{}", cc.0, cc.1);
         }
+        assert_eq!(rate((10, 0)), vec![Queried::Unknown; 2], "sm_100");
         assert_eq!(
             vulkan_matrix_fma_rate(VENDOR_AMD, "AMD Radeon 8060S (RADV STRIX_HALO)"),
             Queried::Known(4)

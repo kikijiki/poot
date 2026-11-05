@@ -3,8 +3,6 @@ use crate::helpers::{
     Alloc, WeightLane, WeightLayout, copy, elem, emit_lds_tree_blocks, guard, ld,
     lds_tree_block_count, local, slice_f32,
 };
-use crate::precision::{ProductRead, accumulate_statements};
-use poot_graph_ir::OperandPrecision;
 use poot_kernel_ir::{
     BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Operand, Place, Rvalue, Statement,
     Terminator, Ty, WorkgroupLocalDecl,
@@ -53,7 +51,6 @@ pub fn gemv_lds(
     elem_offset: usize,
     layout: WeightLayout,
     weight: BufferStorage,
-    precision: OperandPrecision,
     conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let weight_lane = WeightLane::of("gemv_lds", weight)?;
@@ -156,31 +153,20 @@ pub fn gemv_lds(
     };
     // bb4 (acc body): partial += a[b_off + j] * b[idx(j, n_col)]; j += w
     let read_bv = weight_lane.read(&mut al, conversions, b, bidx, bv);
-    // The step's products: `av * bv` as read, else the sum over every pair of operand terms.
-    let products = if precision.is_exact() {
-        vec![
-            Statement::Assign(
-                Place::local(prod),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(av)), copy(Place::local(bv))),
+    let products = vec![
+        Statement::Assign(
+            Place::local(prod),
+            Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(av)), copy(Place::local(bv))),
+        ),
+        Statement::Assign(
+            Place::local(part_new),
+            Rvalue::BinaryOp(
+                BinOp::Add,
+                copy(Place::local(partial)),
+                copy(Place::local(prod)),
             ),
-            Statement::Assign(
-                Place::local(part_new),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(partial)),
-                    copy(Place::local(prod)),
-                ),
-            ),
-        ]
-    } else {
-        accumulate_statements(
-            &mut al,
-            ProductRead::dense(precision, weight_lane, conversions),
-            (av, bv),
-            partial,
-            part_new,
-        )
-    };
+        ),
+    ];
     let bb4 = BasicBlock {
         statements: [
             Statement::Assign(
@@ -344,15 +330,7 @@ pub fn gemv_lds(
 /// both share one grid-forming convention, though `rows*D` never nears the 65535-per-dim cap in practice.
 /// f32 only (the wgpu decode dtype); the reduction order differs from the naive serial sum by fp rounding,
 /// within the executor-equivalence tolerance.
-pub fn attn_scores_v_gemv_lds(
-    name: &str,
-    cap: usize,
-    d: usize,
-    w: usize,
-    x_groups: usize,
-    precision: OperandPrecision,
-    conversions: RoundingConversions,
-) -> Body {
+pub fn attn_scores_v_gemv_lds(name: &str, cap: usize, d: usize, w: usize, x_groups: usize) -> Body {
     // params: _0 ret, _1 probs [rows, cap], _2 v [rows, cap, d], out [rows, d] (LAST).
     let mut al = Alloc::new(vec![
         ld(Ty::Unit, false),
@@ -451,32 +429,21 @@ pub fn attn_scores_v_gemv_lds(
         )],
         terminator: guard(j_lt, 5, 4),
     };
-    // bb4 (acc body): partial += probs[a_base+j] * v[b_base + j*d + d_col]; j += w. The products are `av * bv`,
-    // or the sum over every pair of operand terms (the probabilities are rounded where they enter `P V`).
-    let products = if precision.is_exact() {
-        vec![
-            Statement::Assign(
-                Place::local(prod),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(av)), copy(Place::local(bv))),
+    // bb4 (acc body): partial += probs[a_base+j] * v[b_base + j*d + d_col]; j += w. The products are `av * bv`.
+    let products = vec![
+        Statement::Assign(
+            Place::local(prod),
+            Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(av)), copy(Place::local(bv))),
+        ),
+        Statement::Assign(
+            Place::local(part_new),
+            Rvalue::BinaryOp(
+                BinOp::Add,
+                copy(Place::local(partial)),
+                copy(Place::local(prod)),
             ),
-            Statement::Assign(
-                Place::local(part_new),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(partial)),
-                    copy(Place::local(prod)),
-                ),
-            ),
-        ]
-    } else {
-        accumulate_statements(
-            &mut al,
-            ProductRead::decoded(precision, conversions),
-            (av, bv),
-            partial,
-            part_new,
-        )
-    };
+        ),
+    ];
     let bb4 = BasicBlock {
         statements: vec![
             Statement::Assign(

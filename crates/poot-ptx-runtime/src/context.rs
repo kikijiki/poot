@@ -608,7 +608,8 @@ impl PtxContext {
     /// ([`PtxContext::copy_to_peer`]) can write it. Done outside any capture: a context that has to
     /// negotiate access lazily mid-capture is a transfer the capture cannot hold. Two contexts on one
     /// physical GPU need no negotiation. A pair the hardware cannot connect is a typed refusal here, never
-    /// a host-staged copy.
+    /// a host-staged copy, and so is a pair that reports and accepts access but whose direct copy delivers
+    /// other bytes than it was given ([`PtxError::PeerCopyUndelivered`]).
     pub fn enable_peer_access(&self, peer: &PtxContext) -> Result<(), PtxError> {
         self.refuse_during_capture("enable_peer_access")?;
         self.bind()?;
@@ -631,10 +632,55 @@ impl PtxContext {
                 | sys::CUresult::CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED => {}
                 error => return Err(PtxError::Driver(cudarc::driver::DriverError(error))),
             }
+            if let Err(error) = self.check_peer_delivery(peer) {
+                // SAFETY: access to `peer.owner.ctx` was enabled above from this current context.
+                let _ = unsafe { sys::cuCtxDisablePeerAccess(peer.owner.ctx) };
+                return Err(error);
+            }
         }
         let mut peers = self.peers.borrow_mut();
         if !peers.contains(&peer.owner.ctx) {
             peers.push(peer.owner.ctx);
+        }
+        Ok(())
+    }
+
+    /// Push known patterns through the direct path just enabled to `peer` and read them back. A link can
+    /// report and accept peer access and still deliver nothing (two PCIe GPUs behind a virtualized root
+    /// complex: the copy completes and the destination stays zero, for some sizes and some moments and
+    /// not others), and neither `cuDeviceCanAccessPeer` nor `cuCtxEnablePeerAccess` says so; only the
+    /// bytes do. Each destination starts zeroed and the pattern has no zero byte, so a copy that moved
+    /// nothing cannot pass, and the sizes span the transfers a placement makes (a hidden row up to a
+    /// prefill block), since a link has been seen to deliver the smallest and drop the rest.
+    fn check_peer_delivery(&self, peer: &PtxContext) -> Result<(), PtxError> {
+        const PROBE_BYTES: [usize; 3] = [256, 64 << 10, 4 << 20];
+        let storage = BufferStorage::f32();
+        for bytes in PROBE_BYTES {
+            let source = self.alloc_storage(BufferRole::Staging, storage, bytes / 4)?;
+            let destination = peer.alloc_storage(BufferRole::Staging, storage, bytes / 4)?;
+            let pattern: Vec<u8> = (0..bytes).map(|i| (i % 251 + 1) as u8).collect();
+            self.write_with(&source, 0, bytes, &mut |range, out| {
+                out.copy_from_slice(&pattern[range]);
+            })?;
+            self.synchronize()?;
+            peer.synchronize()?;
+            // SAFETY: both buffers are live allocations of `bytes`, the copy is enqueued on this
+            // context's live stream (current, bound by the caller), and access to the destination's
+            // device was enabled before this call.
+            unsafe {
+                result::memcpy_dtod_async(destination.ptr(), source.ptr(), bytes, self.owner.stream)
+            }
+            .map_err(|error| self.owner.observe(error))?;
+            self.synchronize()?;
+            let mut got = vec![0u8; bytes];
+            peer.read_bytes(&destination, &mut got)?;
+            self.bind()?;
+            if got != pattern {
+                return Err(PtxError::PeerCopyUndelivered {
+                    from: self.owner.device,
+                    to: peer.owner.device,
+                });
+            }
         }
         Ok(())
     }

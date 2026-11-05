@@ -311,9 +311,10 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
+    tiling_pin: Option<kg::RegisterTiling>,
     const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
-    let site = Site::new(g, eqn, backend, limits);
+    let site = Site::new(g, eqn, backend, limits).pinned(tiling_pin);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
     let ids = value_ids(eqn);
     let fty = fty_ty;
@@ -340,7 +341,6 @@ pub(super) fn plan(
                     epilogue: None,
                     shapes: shapes(),
                     fold: serial_matmul_fold(out_numel, caps),
-                    precision,
                 }))
             };
             // Every route plans a kernel whose single element type covers operands and output, so a mixed
@@ -396,7 +396,7 @@ pub(super) fn plan(
                     // watchdog-safety chunking (card 258): above the trigger it launches the same body over
                     // disjoint ranges of the output, never a different body.
                     refuse_unless_exact(site, precision)?;
-                    decode_gemv_plan(site, backend, kk, nn, out_numel, precision, caps)?
+                    decode_gemv_plan(site, backend, kk, nn, out_numel, caps)?
                 }
                 MatMulRoute::AttnGemv => {
                     // decode attention scores@V: LDS-parallel reduction over cap (card 143 Lever 1b), the
@@ -408,7 +408,6 @@ pub(super) fn plan(
                             d: nn,
                             width: lds_gemv_width(caps),
                             numel: out_numel,
-                            precision,
                         },
                     ))?
                 }
@@ -470,7 +469,6 @@ pub(super) fn plan(
                     b_shape: shape(ids[1]),
                 },
                 fold: serial_matmul_fold(out_numel, caps),
-                precision,
             }))?
         }
         OpKind::Iota { .. } => {
@@ -511,9 +509,18 @@ pub(super) fn register_tiled_launch(
     caps: &DeviceCaps,
 ) -> Result<(kg::RegisterTiling, Vec<TiledDispatch>), PlanError> {
     let overflow = || site.refuse(Capability::DispatchSizeOverflow);
-    // A narrowed or split read runs on a matrix unit or not at all (POOT-1476): a scalar tiling would round for no speed,
-    // and the pass that narrowed the op asked this same function. A refusal, never a silent exact plan.
-    let tiling = if shape.terms.fragment.is_some() {
+    // A tiling the compile pinned is the tiling or a refusal naming it, for an exact and a narrowed read alike
+    // (POOT-1494); the device's candidates are the only tilings it can run.
+    let tiling = if let Some(pin) = site.tiling_pin() {
+        if !pin.runs_over(shape, caps) {
+            return Err(site.refuse(Capability::PinnedTilingNotRunnable {
+                pinned: pin.schedule(),
+            }));
+        }
+        pin
+    } else if shape.terms.fragment.is_some() {
+        // A narrowed or split read runs on a matrix unit or not at all (POOT-1476): a scalar tiling would round for no
+        // speed, and the pass that narrowed the op asked this same function. A refusal, never a silent exact plan.
         kg::RegisterTiling::fragment_tiling(shape, caps)
             .ok_or_else(|| site.refuse(Capability::NoMatrixUnitSchedule))?
     } else {

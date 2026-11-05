@@ -144,7 +144,11 @@ if [ -n "$two_gpu" ]; then
 fi
 printf '%s\n' "${bank_cases[@]+"${bank_cases[@]}"}" | sed '/^$/d' > "$work/bank-cases.txt"
 echo "$passes" > "$work/bank-passes"
-git archive HEAD --format=tar.gz -o "$work/src.tar.gz"
+# the source tree plus the untracked patched wgpu-hal (step 2b): the Cargo.toml [patch] path must resolve on the pod
+# too, where `pootc::import_run` runs cargo over the workspace
+git archive HEAD --format=tar -o "$work/src.tar"
+tar -rf "$work/src.tar" .patched
+gzip -f "$work/src.tar"
 # the pod needs a prebuilt nextest for the stock glibc (the devshell's is a nix binary)
 curl -sfL https://get.nexte.st/latest/linux | tar -C "$work" -xzf -
 nextest_bin=$work/cargo-nextest

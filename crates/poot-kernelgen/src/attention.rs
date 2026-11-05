@@ -55,7 +55,7 @@ use crate::data_movement::Cfg;
 use crate::emit::{copy as copy_local, cu};
 use crate::fused::{FusedScalarOp, emit_scalar_op};
 use crate::helpers::{copy, elem, ld, slice_dtype, slice_f32};
-use crate::precision::{ProductRead, pair_products};
+use crate::precision::require_exact;
 use poot_graph_ir::{FragmentDtype, OperandPrecision};
 use poot_target::RoundingConversions;
 
@@ -656,20 +656,15 @@ fn validate(spec: &AttentionSpec) -> Result<usize, KernelGenError> {
     Ok(lanes)
 }
 
-/// `acc` plus the products of every pair of terms of `a` and `b` (`a` terms outermost: the oracle's order), the
-/// operands read as `read` says. Read as stored it is `acc + a * b`.
-fn add_products(
+/// `acc + a * b`.
+fn add_product(
     c: &mut Cfg,
-    read: ProductRead,
     a: poot_kernel_ir::Local,
     b: poot_kernel_ir::Local,
     acc: poot_kernel_ir::Local,
 ) -> poot_kernel_ir::Local {
-    let (a_terms, b_terms) = c.emit(|e| (read.activation_terms(e, a), read.weight_terms(e, b)));
-    pair_products(&a_terms, &b_terms).fold(acc, |sum, (x, y)| {
-        let term = fbin(c, BinOp::Mul, x, y);
-        fbin(c, BinOp::Add, sum, term)
-    })
+    let term = fbin(c, BinOp::Mul, a, b);
+    fbin(c, BinOp::Add, acc, term)
 }
 
 pub(crate) fn f32_array(len: usize) -> WorkgroupLocalDecl {
@@ -931,6 +926,8 @@ pub(crate) fn attention_body(
     if let AttentionSchedule::Tiled { .. } = spec.schedule {
         return tiled::tiled_body(name, spec, rows, x_groups, conversions);
     }
+    // The streaming and split-KV bodies multiply the operands as stored: only a matrix unit narrows them.
+    require_exact(spec.precision, GENERATOR)?;
     let AttentionSpec {
         batch: _,
         hq,
@@ -946,15 +943,8 @@ pub(crate) fn attention_body(
         sink,
         schedule,
         kv,
-        precision,
+        precision: _,
     } = *spec;
-    // `Q K` and `P V`: the query and the probabilities are f32, the key and value rows are stored in `kv`.
-    let operands = ProductRead {
-        precision,
-        activation_stored: None,
-        weight_stored: kv.fragment(),
-        conversions,
-    };
     let splits = match schedule {
         AttentionSchedule::Streaming { .. } => None,
         AttentionSchedule::SplitKv { splits, .. } => Some(splits),
@@ -1246,7 +1236,7 @@ pub(crate) fn attention_body(
                     let ki = ubin(c, BinOp::Add, row, channel);
                     let qv = c.let_(Ty::F32, Rvalue::Use(copy(elem(q, qi))));
                     let kv_elem = c.emit(|e| kv.read(e, part, ki));
-                    let sum = add_products(c, operands, qv, kv_elem, dot);
+                    let sum = add_product(c, qv, kv_elem, dot);
                     c.assign(Place::local(dot), Rvalue::Use(local_op(sum)));
                 });
             };
@@ -1325,7 +1315,7 @@ pub(crate) fn attention_body(
                 let held = lds_read(c, O_ARRAY, slot);
                 let rescaled = fbin(c, BinOp::Mul, held, corr);
                 let vv = c.emit(|e| kv.read(e, v, vi));
-                let sum = add_products(c, operands, weight, vv, rescaled);
+                let sum = add_product(c, weight, vv, rescaled);
                 lds_write(c, O_ARRAY, slot, local_op(sum));
             });
             c.assign(Place::local(m), Rvalue::Use(local_op(m_new)));
@@ -1374,7 +1364,7 @@ pub(crate) fn attention_body(
                 for (&(k_row, _, _), &dot) in keys.iter().zip(&dots) {
                     let ki = ubin(c, BinOp::Add, k_row, channel);
                     let kv_elem = c.emit(|e| kv.read(e, k, ki));
-                    let sum = add_products(c, operands, qv, kv_elem, dot);
+                    let sum = add_product(c, qv, kv_elem, dot);
                     c.assign(Place::local(dot), Rvalue::Use(local_op(sum)));
                 }
             });
@@ -1421,7 +1411,7 @@ pub(crate) fn attention_body(
                         .fold(rescaled, |sum, (&(_, v_row, _), &weight)| {
                             let vi = ubin(c, BinOp::Add, v_row, channel);
                             let vv = c.emit(|e| kv.read(e, v, vi));
-                            add_products(c, operands, weight, vv, sum)
+                            add_product(c, weight, vv, sum)
                         });
                 lds_write(c, O_ARRAY, slot, local_op(sum));
             });

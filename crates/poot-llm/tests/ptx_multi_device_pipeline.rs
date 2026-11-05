@@ -697,17 +697,21 @@ fn a_capture_failure_on_the_later_rank_aborts_cleanly_and_the_retry_runs_on_ptx(
     );
 }
 
-/// The primitive under every transfer row: a peer copy recorded in a capture on device 0 delivers
-/// exactly the bytes of a device-0 buffer into a device-1 buffer when the graph launches, and a stream
-/// event orders device 1's next work after it.
-///
-/// Mutation: record the copy against the wrong buffer pair (swap `src` and `dst`); device 1's
-/// buffer stays zero.
-#[test]
-fn a_peer_copy_in_a_graph_delivers_its_bytes_and_an_event_orders_the_peer_on_ptx() {
-    let Some((first, second)) = open_two() else {
-        return;
-    };
+const PEER_PATTERN_BYTES: usize = 256;
+
+fn peer_pattern() -> Vec<u8> {
+    (0..PEER_PATTERN_BYTES as u32)
+        .map(|i| (i * 7 + 3) as u8)
+        .collect()
+}
+
+/// Enable device 1's memory to device 0, record a peer copy of a patterned device-0 buffer into a zeroed
+/// device-1 buffer in a capture, launch it, order device 1 after it with an event and read the destination
+/// back. The refusal of `enable_peer_access` is the caller's to judge.
+fn peer_copy_through_a_graph(
+    first: &PtxDevice,
+    second: &PtxDevice,
+) -> Result<Vec<u8>, poot_ptx_runtime::PtxError> {
     let (zero, one) = (first.context(), second.context());
     let storage = poot_target::BufferStorage::f32();
     let source = zero
@@ -716,27 +720,74 @@ fn a_peer_copy_in_a_graph_delivers_its_bytes_and_an_event_orders_the_peer_on_ptx
     let destination = one
         .alloc_storage(poot_runtime_common::BufferRole::Staging, storage, 64)
         .unwrap();
-    let pattern: Vec<u8> = (0..256u32).map(|i| (i * 7 + 3) as u8).collect();
-    zero.write_with(&source, 0, 256, &mut |range, out| {
+    let pattern = peer_pattern();
+    zero.write_with(&source, 0, PEER_PATTERN_BYTES, &mut |range, out| {
         out.copy_from_slice(&pattern[range]);
     })
     .unwrap();
     zero.synchronize().unwrap();
     one.synchronize().unwrap();
 
-    zero.enable_peer_access(one).unwrap();
+    zero.enable_peer_access(one)?;
     let event = zero.create_sync_event().unwrap();
     zero.begin_capture().unwrap();
-    zero.copy_to_peer(&source, &destination, 256).unwrap();
+    zero.copy_to_peer(&source, &destination, PEER_PATTERN_BYTES)
+        .unwrap();
     let graph = zero.end_capture().unwrap();
     zero.launch_timed(&graph).unwrap();
     zero.record_sync_event(&event).unwrap();
     one.wait_sync_event(&event).unwrap();
     one.synchronize().unwrap();
 
-    let mut got = vec![0u8; 256];
+    let mut got = vec![0u8; PEER_PATTERN_BYTES];
     one.read_bytes(&destination, &mut got).unwrap();
-    assert_eq!(got, pattern, "the peer copy delivered the source bytes");
+    Ok(got)
+}
+
+/// The primitive under every transfer row: a peer copy recorded in a capture on device 0 delivers
+/// exactly the bytes of a device-0 buffer into a device-1 buffer when the graph launches, and a stream
+/// event orders device 1's next work after it. A pair whose link cannot deliver (the refusal of
+/// `enable_peer_access`) fails here with that refusal, not with zeros.
+///
+/// Mutation: record the copy against the wrong buffer pair (swap `src` and `dst`); device 1's
+/// buffer stays zero.
+#[test]
+fn a_peer_copy_in_a_graph_delivers_its_bytes_and_an_event_orders_the_peer_on_ptx() {
+    let Some((first, second)) = open_two() else {
+        return;
+    };
+    let got = peer_copy_through_a_graph(&first, &second).unwrap();
+    assert_eq!(
+        got,
+        peer_pattern(),
+        "the peer copy delivered the source bytes"
+    );
+}
+
+/// POOT-1497: `enable_peer_access` admits a pair only if a copy through the enabled link delivers. On a
+/// PCIe pair behind a virtualized root complex (2x A40) the driver reports and accepts peer access while
+/// the direct copy leaves the destination zero; the runtime must refuse that pair with
+/// `PeerCopyUndelivered` rather than let a captured peer copy silently deliver zeros. Either outcome
+/// passes (a working link delivers its bytes, a dead one is refused by name); zeros never do.
+///
+/// Mutation: in `PtxContext::enable_peer_access`, skip `check_peer_delivery`; on the A40 pair this row
+/// reads all zeros instead of seeing the refusal.
+#[test]
+fn a_link_that_cannot_deliver_is_refused_by_name_never_admitted_on_ptx() {
+    let Some((first, second)) = open_two() else {
+        return;
+    };
+    match peer_copy_through_a_graph(&first, &second) {
+        Ok(got) => assert_eq!(
+            got,
+            peer_pattern(),
+            "peer access was admitted but the copy through it delivered other bytes"
+        ),
+        Err(poot_ptx_runtime::PtxError::PeerCopyUndelivered { from, to }) => {
+            eprintln!("link {from} -> {to} refused by name: PeerCopyUndelivered");
+        }
+        Err(other) => panic!("unexpected refusal: {other}"),
+    }
 }
 
 /// POOT-1124 (POOT-1113): the split-KV decode attention in each stage of a two-device layer pipeline.

@@ -242,7 +242,7 @@ fn driver_options(handle: &ModelHandle, capacity: NonZeroUsize) -> DriverOptions
         charge: program_retention,
         draft: DraftPolicy::Off,
         hidden_window: None,
-        matmul_precision: None,
+        matmul_precision: Some(poot_graph_ir::MatmulPrecision::Exact),
     }
 }
 
@@ -284,6 +284,9 @@ impl Server {
             .arg(&model.0)
             .arg(addr.to_string())
             .args(["--backend", "ptx", "--placement", placement])
+            // The one-device driver reference and each placement plan different programs; under the planner-owned
+            // Narrow default they round differently, so both sides are pinned like the poot-llm multi-device rows.
+            .args(["--matmul-precision", "exact"])
             .stdout(std::fs::File::create(&log).expect("the server log"))
             .stderr(Stdio::null())
             .spawn()

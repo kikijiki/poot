@@ -8,7 +8,9 @@
 //! it stays `Copy` like [`crate::DeviceCaps`] and a lookup cannot hit two configs.
 
 use crate::Queried;
-use crate::calibration::{GFX11_MATRIX_FMA_RATE, SM80_MATRIX_FMA_RATE, SM90_MATRIX_FMA_RATE};
+use crate::calibration::{
+    GEFORCE_MATRIX_FMA_RATE, GFX11_MATRIX_FMA_RATE, SM80_MATRIX_FMA_RATE, SM90_MATRIX_FMA_RATE,
+};
 
 /// The operand dtype of a matrix fragment. The accumulator is f32 on every config.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -267,7 +269,8 @@ impl MatrixUnits {
 
     /// An NVIDIA GPU by CUDA compute capability: sm_80 and newer have `wmma` 16x16x16 in bf16 and f16, 32-lane
     /// warps. The `wmma` API's fragment layout is opaque. The unit's rate is the datasheet's Tensor Core peak over
-    /// its FP32 peak, sourced for the A100 (sm_80) and the H100 (sm_90) and `Unknown` for every other capability:
+    /// its FP32 peak, sourced for the A100 (sm_80) and the H100 (sm_90), the GeForce floor for sm_86, sm_89 and sm_120 (a capability
+    /// there spans half-rate and full-rate parts) and `Unknown` for every other capability:
     /// the cost model gives such a unit no speed credit rather than another part's.
     pub fn nvidia(compute_capability: (u32, u32)) -> Self {
         if compute_capability.0 < 8 {
@@ -276,6 +279,7 @@ impl MatrixUnits {
         let fma_rate = match compute_capability {
             (8, 0) => Queried::Known(SM80_MATRIX_FMA_RATE),
             (9, 0) => Queried::Known(SM90_MATRIX_FMA_RATE),
+            (8, 6) | (8, 9) | (12, 0) => Queried::Known(GEFORCE_MATRIX_FMA_RATE),
             _ => Queried::Unknown,
         };
         Self::of(FragmentDtype::ALL.map(|dtype| {

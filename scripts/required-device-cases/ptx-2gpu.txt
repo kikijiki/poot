@@ -15,6 +15,7 @@
 # POOT-750: the production server over both placements against the driver's tokens (SC-001), a sampled
 # tensor-parallel request (SC-002, R477-006).
 poot-llm::ptx_multi_device_pipeline	a_capture_failure_on_the_later_rank_aborts_cleanly_and_the_retry_runs_on_ptx
+poot-llm::ptx_multi_device_pipeline	a_link_that_cannot_deliver_is_refused_by_name_never_admitted_on_ptx
 poot-llm::ptx_multi_device_pipeline	a_peer_copy_in_a_graph_delivers_its_bytes_and_an_event_orders_the_peer_on_ptx
 poot-llm::ptx_multi_device_pipeline	glm_5_3_fixture_two_device_pipeline_matches_single_device_decode
 poot-llm::ptx_multi_device_pipeline	minimax_m2_fixture_two_device_pipeline_matches_single_device_decode

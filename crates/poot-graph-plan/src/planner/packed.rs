@@ -117,9 +117,10 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
+    tiling_pin: Option<kg::RegisterTiling>,
     const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
-    let site = Site::new(g, eqn, backend, limits);
+    let site = Site::new(g, eqn, backend, limits).pinned(tiling_pin);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
     let ids = value_ids(eqn);
     // How the equation reads its operands, and the tiles a split one stages for a weight in `weight`'s storage.
@@ -189,7 +190,7 @@ pub(super) fn plan(
                     return Err(site.refuse(Capability::DtypeLowering));
                 }
                 let schedule = launch.schedule(backend, k);
-                dense_gemv(site, backend, weight, schedule, k, n, None, precision, caps)?
+                dense_gemv(site, backend, weight, schedule, k, n, None, caps)?
             } else {
                 matmul::dense_tiled_plan(
                     site,
@@ -244,17 +245,7 @@ pub(super) fn plan(
                     return Err(site.refuse(Capability::DtypeLowering));
                 }
                 let schedule = launch.schedule(backend, k);
-                dense_gemv(
-                    site,
-                    backend,
-                    weight,
-                    schedule,
-                    k,
-                    n,
-                    Some(epilogue),
-                    precision,
-                    caps,
-                )?
+                dense_gemv(site, backend, weight, schedule, k, n, Some(epilogue), caps)?
             } else {
                 matmul::dense_tiled_plan(
                     site,
@@ -405,7 +396,6 @@ fn dense_gemv(
     k: usize,
     n: usize,
     epilogue: Option<kg::Epilogue>,
-    precision: OperandPrecision,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
     // The longest binding: the `[N, K]` weight counted in elements (at least its words), above the `K` activation,
@@ -423,7 +413,6 @@ fn dense_gemv(
             k,
             n,
             epilogue,
-            precision,
         }),
         backend,
         caps,

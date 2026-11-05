@@ -38,7 +38,6 @@ fn dense(weight: BufferStorage) -> kg::KernelRequest {
         k: 256,
         n: 256,
         epilogue: None,
-        precision: poot_graph_ir::OperandPrecision::Exact,
     })
 }
 

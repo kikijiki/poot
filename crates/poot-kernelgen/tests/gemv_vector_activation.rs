@@ -31,7 +31,6 @@ fn generated(activation: kg::GemvActivation) -> kg::Generated {
         k: K,
         n: N,
         epilogue: None,
-        precision: poot_graph_ir::OperandPrecision::Exact,
     });
     let limits = kg::BodyLimits {
         max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),

@@ -173,6 +173,12 @@ pub struct CompileOptions {
     /// the range is a typed validation fault naming the first op and layer. Off compiles no witness and no extra
     /// equation: the program, its plan digest and its launch count are the ones compiled without the option.
     pub range_check: bool,
+    /// The register tiling every register-tiled contraction of the program must run (POOT-1494), for the calibration
+    /// sweep and tests that time or inspect one candidate. The planner plans that tiling or refuses the contraction
+    /// with [`crate::Capability::PinnedTilingNotRunnable`]; it never plans another in its place. `None` leaves the
+    /// choice to the cost model, and the plan is the one compiled without the option. Only the final plan reads the
+    /// pin: the narrowing and rewrite probes ask what the target can run, not what the pin allows.
+    pub tiling_pin: Option<poot_kernelgen::RegisterTiling>,
     /// The one fragment dtype the `select_operand_precision` pass may narrow to, on a device that has several
     /// (the f16 contraction variant of the tier-3 gates on a target with bf16 and f16 units, POOT-1438). The
     /// device keeps every unit; only the pass sees the one, so the program still compiles for the real target.
@@ -207,6 +213,7 @@ impl CompileOptions {
             npu: None,
             matmul_precision: MatmulPrecision::DEFAULT,
             range_check: false,
+            tiling_pin: None,
             #[cfg(any(test, feature = "test-support"))]
             fragment_only: None,
             #[cfg(any(test, feature = "test-support"))]
@@ -1066,7 +1073,13 @@ pub fn compile(
     if let Some((_, caps)) = gpu {
         transform::refuse_oversized_constants(&graph, caps.max_buffer_bytes)?;
     }
-    let planned = plan_graph(&graph, target, &options.limits.body(), npu)?;
+    let planned = plan_graph(
+        &graph,
+        target,
+        &options.limits.body(),
+        options.tiling_pin,
+        npu,
+    )?;
     let state_commit = planned.state_commit;
     let validation = device_validation::validation_packet_plan(&graph);
     let regions = package(&graph, &planned.plans, target, npu)?;

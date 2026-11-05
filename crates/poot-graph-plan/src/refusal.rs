@@ -75,6 +75,13 @@ pub enum Capability {
         /// The tiling's output tile rows.
         tile_rows: usize,
     },
+    /// A register-tiled contraction compiled under a tiling pin ([`crate::CompileOptions::tiling_pin`]) whose pinned
+    /// tiling this device does not run over this shape (a workgroup, register, LDS or staging limit, or a tile the
+    /// shape's grouping rejects). The planner never plans another tiling in its place.
+    PinnedTilingNotRunnable {
+        /// The schedule of the pinned tiling.
+        pinned: poot_kernelgen::Schedule,
+    },
     /// An indexed contraction past the Gemv rows whose rows name their experts per row: the tiled schedule reads
     /// rows grouped by expert, which the `group_expert_rows` pass forms (POOT-1451).
     UngroupedExpertRows,
@@ -324,6 +331,7 @@ pub(crate) struct Site<'a> {
     eqn: &'a Eqn,
     target: TargetId,
     limits: BodyLimits,
+    tiling_pin: Option<poot_kernelgen::RegisterTiling>,
 }
 
 impl<'a> Site<'a> {
@@ -338,7 +346,22 @@ impl<'a> Site<'a> {
             eqn,
             target: target.into(),
             limits,
+            tiling_pin: None,
         }
+    }
+
+    /// This site planning under `pin`, the tiling every register-tiled contraction it plans must run
+    /// ([`crate::CompileOptions::tiling_pin`]).
+    pub(crate) fn pinned(self, pin: Option<poot_kernelgen::RegisterTiling>) -> Self {
+        Self {
+            tiling_pin: pin,
+            ..self
+        }
+    }
+
+    /// The tiling a register-tiled contraction at this site must run, if the compile pinned one.
+    pub(crate) fn tiling_pin(&self) -> Option<poot_kernelgen::RegisterTiling> {
+        self.tiling_pin
     }
 
     /// The body limits a kernel generated at this site is held to.
@@ -440,6 +463,10 @@ impl fmt::Display for Capability {
             Capability::GroupedTileRows { block, tile_rows } => write!(
                 f,
                 "no tiling runs rows grouped in tiles of {block} positions (the cheapest has {tile_rows}-row tiles)"
+            ),
+            Capability::PinnedTilingNotRunnable { pinned } => write!(
+                f,
+                "the pinned tiling {pinned:?} does not run over this contraction on this device"
             ),
             Capability::NoMatrixUnitSchedule => f.write_str(
                 "an op that reads narrowed operands has no matrix-unit schedule that beats its exact one",

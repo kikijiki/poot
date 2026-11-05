@@ -21,7 +21,7 @@ use crate::contraction::{
 };
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
 use crate::helpers::{Alloc, WeightLayout, elem, guard, ld, local, slice_dtype, slice_f32};
-use crate::precision::ProductRead;
+use crate::precision::{ProductRead, require_exact};
 use poot_graph_ir::OperandPrecision;
 use poot_target::RoundingConversions;
 
@@ -129,14 +129,17 @@ pub(crate) fn packed_contraction(
             cols,
             unroll,
             activation,
-        } => contraction_gemv(
-            name,
-            format,
-            GemvLaunch::new(width, cols, unroll, activation)?,
-            epilogue,
-            rows,
-            read,
-        ),
+        } => {
+            require_exact(precision, GENERATOR)?;
+            contraction_gemv(
+                name,
+                format,
+                GemvLaunch::new(width, cols, unroll, activation)?,
+                epilogue,
+                rows,
+                conversions,
+            )
+        }
         Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. }
             if rows == PackedRows::Indexed =>
         {
@@ -291,11 +294,11 @@ fn contraction_gemv(
     launch: GemvLaunch,
     epilogue: Option<&Epilogue>,
     rows: PackedRows,
-    read: ProductRead,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
     if let Storage::Planar(_) = descriptor.storage {
-        return contraction_gemv_planar(name, format, launch, epilogue, rows, read);
+        return contraction_gemv_planar(name, format, launch, epilogue, rows, conversions);
     }
     let plan = DecodePlan::of(&descriptor)?;
     let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
@@ -349,7 +352,7 @@ fn contraction_gemv(
         lead + 2 + leaf_count as u32,
         [activation, metadata, out],
         launch,
-        read,
+        conversions,
         epilogue.map(|epilogue| BoundEpilogue {
             epilogue,
             leaves: &leaves,
@@ -382,7 +385,7 @@ fn contraction_gemv_planar(
     launch: GemvLaunch,
     epilogue: Option<&Epilogue>,
     rows: PackedRows,
-    read: ProductRead,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
     let plan = PlanarPlan::of(&descriptor)?;
@@ -456,7 +459,7 @@ fn contraction_gemv_planar(
         lead + 1 + (n + leaf_count) as u32,
         [activation, metadata, out],
         launch,
-        read,
+        conversions,
         epilogue.map(|epilogue| BoundEpilogue {
             epilogue,
             leaves: &leaves,

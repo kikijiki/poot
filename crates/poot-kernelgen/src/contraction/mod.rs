@@ -471,8 +471,9 @@ impl RegisterTiling {
             .then_some((config.layout, config.waves))
     }
 
-    /// Every tiling [`Self::choose`] weighs for `shape` on `caps`.
-    pub(crate) fn candidates(
+    /// Every tiling [`Self::choose`] weighs for `shape` on `caps`: the tilings the device can run, which a pin
+    /// ([`Self::runs_over`]) and the calibration sweep enumerate.
+    pub fn candidates(
         shape: TiledShape,
         caps: &poot_target::DeviceCaps,
     ) -> impl Iterator<Item = Self> + '_ {
@@ -523,6 +524,12 @@ impl RegisterTiling {
             .filter(move |tiling| {
                 tiling.runs_on(shape, caps) && shape.admits_tile_rows(tiling.output_tile().0)
             })
+    }
+
+    /// Whether `caps` runs this tiling over `shape`: it is one of [`Self::candidates`]. A caller that pins a tiling
+    /// (the calibration sweep) asks this and refuses by name when it is not.
+    pub fn runs_over(self, shape: TiledShape, caps: &poot_target::DeviceCaps) -> bool {
+        Self::candidates(shape, caps).any(|tiling| tiling == self)
     }
 
     /// The cheapest fragment tiling of a narrowed or split `shape`, or `None` when the device has none for it

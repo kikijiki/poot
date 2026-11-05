@@ -172,7 +172,7 @@ fn the_driver_weight_format_matches_the_declared_oracle_on_rocm() {
 /// POOT-1430 and POOT-1476: an attention that declares `Narrow` over an f16 KV cache as a 160-row causal prefill
 /// matches the CPU oracle on rocm: Q, K, V and the probabilities are read as declared by the fragment schedule the
 /// planner picks. A `Split` attention has no matrix-unit schedule (the tiled attention stages one tile per operand) and
-/// is refused by name. Mutation: in `attention::add_products` read the operands unrounded; the narrow rows go red.
+/// is refused by name. Mutation: in `operand_terms` return the value unrounded; the narrow rows go red.
 #[test]
 fn declared_attention_precision_matches_the_oracle_on_rocm() {
     let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {

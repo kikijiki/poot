@@ -5,8 +5,6 @@ use crate::emit::Emit;
 use crate::helpers::{
     Alloc, WeightLane, batch_eff, copy, elem, guard, ld, local, row_major_strides, slice_dtype,
 };
-use crate::precision::{ProductRead, accumulate_statements};
-use poot_graph_ir::OperandPrecision;
 use poot_kernel_ir::{
     BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Local, Operand, Place, Rvalue,
     Statement, Terminator, Ty,
@@ -26,9 +24,7 @@ use poot_target::RoundingConversions;
 /// known-miscompile ceiling (`caps.known_miscompiles.tiled_gemm_max_workgroups`, 2^15 on the RADV default,
 /// card 095), a much lower bar than the `65535*256` wg-bump ceiling on output elements. Example:
 /// Qwen2.5-0.5B batched prefill at ISL=2048 computes `q[1,14,2048,64] @ kt[1,14,64,2048] -> [1,14,2048,2048]`
-/// (58,720,256 elements), `GridCap([229376,1,1])`. `x_groups: None` is the plain (non-folded) grid. A narrowed
-/// `precision` rounds as `conversions` says (the device's, POOT-1458).
-#[expect(clippy::too_many_arguments)] // the shapes, the fold and the operand rounding of one body
+/// (58,720,256 elements), `GridCap([229376,1,1])`. `x_groups: None` is the plain (non-folded) grid.
 pub fn matmul_batched_dt_grid(
     name: &str,
     dt: Ty,
@@ -36,7 +32,6 @@ pub fn matmul_batched_dt_grid(
     a_shape: &[usize],
     b_shape: &[usize],
     x_groups: Option<usize>,
-    precision: OperandPrecision,
     conversions: RoundingConversions,
 ) -> Body {
     matmul_batched_impl(
@@ -48,7 +43,6 @@ pub fn matmul_batched_dt_grid(
         None,
         &[],
         x_groups,
-        precision,
         conversions,
     )
 }
@@ -57,7 +51,7 @@ pub fn matmul_batched_dt_grid(
 /// store: `C = epilogue(A@B)`. The epilogue's leaves are extra input buffers (a bias, a residual) between `b`
 /// and the output; its dtype is `dt`, and the head result rounds through `dt` before the first step reads it
 /// (see [`Epilogue`]).
-#[expect(clippy::too_many_arguments)] // the shapes, the epilogue, the fold and the operand precision of one body
+#[expect(clippy::too_many_arguments)] // the shapes, the epilogue, the fold and the rounding conversions of one body
 pub fn matmul_batched_epilogue_dt_grid(
     name: &str,
     dt: Ty,
@@ -66,7 +60,6 @@ pub fn matmul_batched_epilogue_dt_grid(
     b_shape: &[usize],
     epilogue: &Epilogue,
     x_groups: Option<usize>,
-    precision: OperandPrecision,
     conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     epilogue.refuse_narrow_store("matmul_batched_epilogue_dt_grid")?;
@@ -80,7 +73,6 @@ pub fn matmul_batched_epilogue_dt_grid(
         Some(epilogue),
         &lanes,
         x_groups,
-        precision,
         conversions,
     ))
 }
@@ -95,7 +87,6 @@ fn matmul_batched_impl(
     epilogue: Option<&Epilogue>,
     lanes: &[Option<WeightLane>],
     x_groups: Option<usize>,
-    precision: OperandPrecision,
     conversions: RoundingConversions,
 ) -> Body {
     let r = out_shape.len();
@@ -273,27 +264,21 @@ fn matmul_batched_impl(
         )],
         terminator: guard(k_lt, 5, 4),
     };
-    // The products of one `k` step: `va * vb` read as stored, else the sum over every pair of operand terms
-    // (`crate::precision`). The exact form keeps the hand-numbered locals, so its kernel key is unchanged.
-    let read = ProductRead::of_dtype(precision, &dt, conversions);
-    let product_stmts: Vec<Statement> = if precision.is_exact() {
-        vec![
-            Statement::Assign(
-                Place::local(prod),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(va)), copy(Place::local(vb))),
+    // The products of one `k` step: `va * vb` as stored.
+    let product_stmts: Vec<Statement> = vec![
+        Statement::Assign(
+            Place::local(prod),
+            Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(va)), copy(Place::local(vb))),
+        ),
+        Statement::Assign(
+            Place::local(acc_new),
+            Rvalue::BinaryOp(
+                BinOp::Add,
+                copy(Place::local(acc)),
+                copy(Place::local(prod)),
             ),
-            Statement::Assign(
-                Place::local(acc_new),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(acc)),
-                    copy(Place::local(prod)),
-                ),
-            ),
-        ]
-    } else {
-        accumulate_statements(&mut al, read, (va, vb), acc, acc_new)
-    };
+        ),
+    ];
     // bb4: pa = a_base + kk*a_k_stride; kn = kk*b_k_stride; pb = b_base + kn; acc += a[pa]*b[pb]; kk++
     // The weight read: a native `dt` element, widened when `dt` is bf16 (a no-op for f32), or the checkpoint
     // weight's lane read.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # calibrate-launch: fit the register-tiled contraction cost model's ratios to this device's measured time and write
-# a PerfCalibration cost entry for review (design POOT-1479 section 3.4). One process per shape (an HSA executor
-# cannot be reopened in a process); the whole batch holds the GPU lock and the heavy lock once, GPU lock first.
+# a PerfCalibration cost entry for review (design POOT-1479 section 3.4). One process per shape and pinned tiling (an
+# HSA executor cannot be reopened in a process); the whole batch holds the GPU lock and the heavy lock once, GPU lock first.
 #
 #   scripts/calibrate-launch rocm|wgpu [out-dir]
 set -euo pipefail
@@ -19,7 +19,8 @@ exec 9>/tmp/poot-gpu.lock
 flock 9
 exec 8>/tmp/poot-heavy.lock
 flock 8
-for shape in $("$bin" shapes); do
-  "$bin" measure --bank "$bank" --shape "$shape" >>"$rows"
-done
+"$bin" shapes >"$out/tilings.tsv"
+while IFS=$'\t' read -r shape tiling; do
+  "$bin" measure --bank "$bank" --shape "$shape" --tiling "$tiling" >>"$rows"
+done <"$out/tilings.tsv"
 "$bin" fit --rows "$rows" --out "$out/entry.rs" --device "$device"

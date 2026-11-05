@@ -330,7 +330,8 @@ fn a_split_policy_splits_contractions_and_leaves_attention_exact() {
 }
 
 /// The planner hands the declared precision to the kernel request of the matrix-unit schedule it picks: the
-/// register-tiled GEMM at `M > 1` names `Narrow(f16)`, and the decode GEMV at `M = 1` is exact.
+/// register-tiled GEMM at `M > 1` names `Narrow(f16)`, and the decode GEMV at `M = 1` (a request with no precision) is
+/// planned for an exact operation.
 #[test]
 fn the_kernel_request_carries_the_declared_precision() {
     let program = compiled(&projection(), &rocm_wmma(), MatmulPrecision::Narrow);
@@ -358,9 +359,10 @@ fn the_kernel_request_carries_the_declared_precision() {
         .unwrap();
     match program.kernel_choice(eqn) {
         KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseGemv {
-            precision,
             ..
-        })) => assert!(precision.is_exact()),
+        })) => {
+            assert!(precision_of(&program, is_dense).is_exact());
+        }
         other => panic!("the decode GEMV, got {other:?}"),
     }
 }

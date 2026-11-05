@@ -266,12 +266,17 @@ pub(crate) fn plan_graph(
     g: &Graph,
     target: &Target,
     limits: &BodyLimits,
+    tiling_pin: Option<kg::RegisterTiling>,
     npu: Option<&dyn NpuLowering>,
 ) -> Result<PlannedGraph, CompileError> {
     let id = target.id();
     check_kv_head_strides(g, target)?;
     let views = compute_views(g, id);
-    let plan = |eqn: &Eqn, output| plan_eqn_compiled(g, eqn, target, &views, limits, npu, output);
+    let plan = |eqn: &Eqn, output| {
+        plan_eqn_policy(
+            g, eqn, target, &views, limits, tiling_pin, npu, output, true,
+        )
+    };
     let mut planned: Vec<Option<Planned>> = g
         .eqns()
         .iter()
@@ -445,6 +450,7 @@ pub fn plan_eqn_choice(
         target,
         views,
         limits,
+        None,
         npu,
         OutputBuffer::Fresh,
         false,
@@ -463,7 +469,7 @@ pub(crate) fn plan_eqn_compiled(
     npu: Option<&dyn NpuLowering>,
     output: OutputBuffer,
 ) -> Result<Planned, PlanError> {
-    plan_eqn_policy(g, eqn, target, views, limits, npu, output, true)
+    plan_eqn_policy(g, eqn, target, views, limits, None, npu, output, true)
 }
 
 /// Whether `select_operand_precision` narrows `eqn`, an op that reads its operands narrowed or split (POOT-1476): the
@@ -534,6 +540,7 @@ fn plan_eqn_policy(
     target: &Target,
     views: &HashMap<ValueId, Layout>,
     limits: &BodyLimits,
+    tiling_pin: Option<kg::RegisterTiling>,
     npu: Option<&dyn NpuLowering>,
     output: OutputBuffer,
     compiled: bool,
@@ -559,6 +566,7 @@ fn plan_eqn_policy(
         views,
         &const_lanes,
         *limits,
+        tiling_pin,
         npu,
         output,
     )
@@ -593,6 +601,7 @@ pub(crate) fn plan_eqn_views_impl(
     views: &HashMap<ValueId, Layout>,
     const_lanes: &ConstLanes,
     limits: BodyLimits,
+    tiling_pin: Option<kg::RegisterTiling>,
     npu: Option<&dyn NpuLowering>,
     output: OutputBuffer,
 ) -> Result<Planned, PlanError> {
@@ -608,6 +617,7 @@ pub(crate) fn plan_eqn_views_impl(
             caps,
             const_lanes,
             limits,
+            tiling_pin,
             output,
         ),
         Target::Npu(NpuTarget::Aie { target, caps }) => plan_aie_eqn(
@@ -795,6 +805,7 @@ fn plan_gpu_eqn(
     caps: &DeviceCaps,
     const_lanes: &ConstLanes,
     limits: BodyLimits,
+    tiling_pin: Option<kg::RegisterTiling>,
     output: OutputBuffer,
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
@@ -811,6 +822,7 @@ fn plan_gpu_eqn(
             odt,
             caps,
             limits,
+            tiling_pin,
             const_lanes,
         );
     }
@@ -855,6 +867,7 @@ fn plan_gpu_eqn(
                 odt,
                 caps,
                 limits,
+                tiling_pin,
                 const_lanes,
             );
         }
@@ -869,6 +882,7 @@ fn plan_gpu_eqn(
                 odt,
                 caps,
                 limits,
+                tiling_pin,
                 const_lanes,
             );
         }
@@ -892,6 +906,7 @@ fn plan_gpu_eqn(
             odt,
             caps,
             limits,
+            tiling_pin,
             const_lanes,
         )?,
         attention_ops!() => attention::plan(g, eqn, backend, caps, limits)?,

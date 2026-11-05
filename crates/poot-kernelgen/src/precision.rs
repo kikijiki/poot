@@ -1,15 +1,18 @@
 //! Operand precision in generated bodies (POOT-1430): the one place a kernel turns a value it read into the
 //! terms its products multiply.
 //!
-//! Every schedule that multiplies two float operands (the register-tiled and GEMV contraction nests, the serial
-//! matmul, the decode GEMVs, the attention bodies) reads each operand through [`operand_terms`], so the declared
-//! rounding is the same whichever schedule the planner picked. The definition is `poot-eval`'s: round to nearest
-//! even, non-saturating, `lo = rne(x - hi)` for a finite `hi` and `0` for an infinite or NaN one.
+//! Only a matrix-unit schedule multiplies narrowed or split operands (the planner refuses every other
+//! schedule a narrowed precision, POOT-1476): the fragment-tiled contraction nests and the fragment attention
+//! read each operand through [`operand_terms`]. A Gemv, a scalar micro-tile, the serial matmul and the
+//! streaming attention multiply exact operands and refuse any other precision ([`require_exact`]). The
+//! definition is `poot-eval`'s: round to nearest even, non-saturating, `lo = rne(x - hi)` for a finite `hi` and
+//! `0` for an infinite or NaN one.
 
 use poot_graph_ir::{FragmentDtype, OperandPrecision};
-use poot_kernel_ir::{BinOp, Constant, Local, Operand, Place, Rvalue, Statement, Ty};
+use poot_kernel_ir::{BinOp, Constant, Local, Operand, Rvalue, Ty};
 use poot_target::RoundingConversions;
 
+use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy};
 use crate::helpers::{Alloc, WeightLane};
 
@@ -108,6 +111,23 @@ pub fn stored_fragment_dtype(storage: poot_target::BufferStorage) -> Option<Frag
     }
 }
 
+/// The typed refusal of a schedule that multiplies its operands as read (a Gemv, a register-tiled scalar micro-tile)
+/// when `precision` is narrowed or split: only a matrix unit multiplies narrowed operands (the planner's
+/// `NoMatrixUnitSchedule` refusal), so no scalar body rounds them.
+pub(crate) fn require_exact(
+    precision: OperandPrecision,
+    request: &'static str,
+) -> Result<(), KernelGenError> {
+    if precision.is_exact() {
+        Ok(())
+    } else {
+        Err(KernelGenError::Unsupported {
+            request,
+            reason: "a narrowed or split precision is a matrix-unit schedule's: a scalar schedule multiplies exact operands",
+        })
+    }
+}
+
 impl ProductRead {
     /// The tiles this read stages.
     pub(crate) fn staged_terms(self) -> StagedTerms {
@@ -124,26 +144,6 @@ impl ProductRead {
             precision,
             activation_stored: None,
             weight_stored: None,
-            conversions,
-        }
-    }
-
-    /// A read of two operands of one storage dtype `dt` (the serial matmul): an operand stored in the fragment
-    /// dtype is exact in it.
-    pub(crate) fn of_dtype(
-        precision: OperandPrecision,
-        dt: &Ty,
-        conversions: RoundingConversions,
-    ) -> Self {
-        let stored = match dt {
-            Ty::BF16 => Some(FragmentDtype::Bf16),
-            Ty::F16 => Some(FragmentDtype::F16),
-            _ => None,
-        };
-        Self {
-            precision,
-            activation_stored: stored,
-            weight_stored: stored,
             conversions,
         }
     }
@@ -470,43 +470,10 @@ pub(crate) fn narrowed(
     operand_terms(e, precision, stored, conversions, x)[0]
 }
 
-/// `dst = acc + sum of the products of every pair of terms of a and b`, as statements: the `k` step of a hand-built
-/// accumulate loop whose operands are the f32 locals `a` and `b` (already widened from their storage). `Exact`
-/// is the single product `a * b`; the kernels keep their original statements for it, so their keys do not change.
-pub(crate) fn accumulate_statements(
-    al: &mut Alloc,
-    read: ProductRead,
-    (a, b): (Local, Local),
-    acc: Local,
-    dst: Local,
-) -> Vec<Statement> {
-    let mut e = Emit::new(al);
-    let (a_terms, b_terms) = (
-        read.activation_terms(&mut e, a),
-        read.weight_terms(&mut e, b),
-    );
-    let mut sum = acc;
-    for (x, y) in pair_products(&a_terms, &b_terms) {
-        let product = bin(&mut e, Ty::F32, BinOp::Mul, copy(x), copy(y));
-        sum = bin(&mut e, Ty::F32, BinOp::Add, copy(sum), copy(product));
-    }
-    e.assign(Place::local(dst), Rvalue::Use(copy(sum)));
-    e.take()
-}
-
-/// The pairs a schedule that multiplies operand terms `a` by `b` adds the product of: every pair, `a` terms
-/// outermost, the order the oracle sums them in.
-pub(crate) fn pair_products<'t>(
-    a: &'t [Local],
-    b: &'t [Local],
-) -> impl Iterator<Item = (Local, Local)> + 't {
-    a.iter().flat_map(move |&x| b.iter().map(move |&y| (x, y)))
-}
-
 #[cfg(test)]
 mod tests {
     use poot_kernel_ir::interp::{Buffer, run};
-    use poot_kernel_ir::{BasicBlock, BlockId, Body, IndexAxis, Terminator};
+    use poot_kernel_ir::{BasicBlock, BlockId, Body, IndexAxis, Place, Terminator};
     use poot_target::FragmentLayout;
 
     use super::*;

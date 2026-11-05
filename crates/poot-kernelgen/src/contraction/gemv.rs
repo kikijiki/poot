@@ -12,7 +12,7 @@ use super::epilogue::{BoundEpilogue, emit_epilogue};
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
 use crate::helpers::{Alloc, elem, guard};
-use crate::precision::{ProductRead, pair_products};
+use poot_target::RoundingConversions;
 
 /// A [`super::Schedule::Gemv`]'s launch shape, checked once before emission: every extent at least one,
 /// `width` a multiple of `cols`, so each column owns exactly `width / cols` lanes, and a vector activation
@@ -97,7 +97,7 @@ pub(crate) fn gemv_body(
     param_count: u32,
     [activation, metadata, out]: [Local; 3],
     launch: GemvLaunch,
-    read: ProductRead,
+    conversions: RoundingConversions,
     epilogue: Option<BoundEpilogue>,
     mut decode_run: impl FnMut(&mut Emit, Local, Local, usize, Local, Local) -> Vec<Local>,
 ) -> Body {
@@ -259,13 +259,8 @@ pub(crate) fn gemv_body(
                     )
                 }
             };
-            // Every pair of operand terms is one product (one pair when the operands are read as stored).
-            let (act_terms, weight_terms) =
-                (read.activation_terms(e, act), read.weight_terms(e, value));
-            for (a, w) in pair_products(&act_terms, &weight_terms) {
-                let product = bin(e, Ty::F32, BinOp::Mul, copy(a), copy(w));
-                sum = bin(e, Ty::F32, BinOp::Add, copy(sum), copy(product));
-            }
+            let product = bin(e, Ty::F32, BinOp::Mul, copy(act), copy(value));
+            sum = bin(e, Ty::F32, BinOp::Add, copy(sum), copy(product));
         }
         e.assign(Place::local(partial), Rvalue::Use(copy(sum)));
     };
@@ -375,7 +370,7 @@ pub(crate) fn gemv_body(
         }) => emit_epilogue(
             &mut store,
             epilogue,
-            read.conversions,
+            conversions,
             store_col,
             leaves,
             lanes,

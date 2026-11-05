@@ -13,9 +13,7 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 
 use poot_graph_ir::op::{ContractionHead, OpKind};
-use poot_graph_ir::{
-    Eqn, Graph, Operand, OperandPrecision, TensorType, ValueId, ValueMeta, ValueTable,
-};
+use poot_graph_ir::{Eqn, Graph, Operand, TensorType, ValueId, ValueMeta, ValueTable};
 use poot_kernelgen as kg;
 use poot_target::{Backend, DeviceCaps, TargetId};
 
@@ -351,7 +349,6 @@ pub(crate) fn decode_gemv_plan(
     k: usize,
     n: usize,
     out_numel: usize,
-    precision: OperandPrecision,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
     let request = |elems, offset| {
@@ -361,7 +358,6 @@ pub(crate) fn decode_gemv_plan(
             width: lds_gemv_width(caps),
             elems,
             offset,
-            precision,
         })
     };
     let over_trigger = caps

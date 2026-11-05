@@ -1254,8 +1254,8 @@ mod contraction_tests {
 
     /// POOT-1430: a packed contraction reads its operands as the declared precision says: the activation is rounded
     /// and the weight, decoded to f32 inside the nest, is rounded after the decode (a packed weight is never
-    /// stored in the fragment dtype), in the decode Gemv and the register-tiled schedule, for every block-32 and
-    /// K-quant format. The output equals a host product over the same rounded terms (`poot_eval`'s rounding, the
+    /// stored in the fragment dtype), in the register-tiled schedule, for every block-32 and K-quant format. The decode
+    /// Gemv multiplies exact operands and refuses a narrowed precision (`a_gemv_refuses_a_narrowed_precision`). The output equals a host product over the same rounded terms (`poot_eval`'s rounding, the
     /// oracle's definition) to the sum's own rounding error, under the integer rounding and the kept f16
     /// conversion alike (POOT-1458: the decode goes directly to the fragment dtype through the device's rounding).
     /// Mutation: in `packed_contraction` read the weight as `ProductRead::dense(.., WeightLane::Bf16Packed)` (as if
@@ -1300,13 +1300,11 @@ mod contraction_tests {
             for format in BLOCK32.into_iter().chain(KQUANT) {
                 // Two blocks per row with a hand-made tiling, and eight (K = 256 for the 32-value formats) with the
                 // tiling the planner's cost model picks for the shape.
-                for (blocks_per_row, m, planned) in [(2, 1, false), (2, 5, false), (8, 4, true)] {
+                for (blocks_per_row, m, planned) in [(2, 5, false), (8, 4, true)] {
                     let out_per_block = if planned { 8 } else { 7 };
                     let (k, bytes, decoded) =
                         super::fixtures::fixture(format, out_per_block, blocks_per_row, 3);
-                    let schedule = if m == 1 {
-                        GEMV_SCHEDULES[1]
-                    } else if planned {
+                    let schedule = if planned {
                         RegisterTiling::choose(
                             crate::TiledShape {
                                 blocks: 1,
@@ -1387,6 +1385,39 @@ mod contraction_tests {
     /// K-quant format, over the Gemv shapes whose run is a multiple of four (a 4-element run, and a 32-element run
     /// across K-quant sub-blocks), blocks 1 and 2 (activation row `b` starts at `b * K`). Both stay within the
     /// reference's tolerance. Mutation: extract each group's lanes in reverse in `gemv_body`; every row goes red.
+    #[test]
+    fn a_gemv_refuses_a_narrowed_precision() {
+        use poot_graph_ir::{FragmentDtype, OperandPrecision};
+        for rows in [crate::PackedRows::Blocks, crate::PackedRows::Indexed] {
+            for precision in [
+                OperandPrecision::Narrow(FragmentDtype::F16),
+                OperandPrecision::Split(FragmentDtype::Bf16),
+            ] {
+                let error = packed_contraction(
+                    "narrowed_gemv",
+                    poot_quant::format::WeightFormat::Q8_0,
+                    GEMV_SCHEDULES[1],
+                    &[64, 8, 4, 0, 0],
+                    None,
+                    rows,
+                    precision,
+                    poot_target::RoundingConversions::NONE,
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        crate::KernelGenError::Unsupported {
+                            request: "packed_contraction",
+                            ..
+                        }
+                    ),
+                    "{rows:?} {precision}: {error}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_vector_activation_read_matches_the_scalar_read_bit_for_bit() {
         let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();

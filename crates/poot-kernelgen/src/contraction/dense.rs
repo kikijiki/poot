@@ -66,7 +66,6 @@ pub(crate) fn dense_contraction(
     schedule: Schedule,
     k: usize,
     epilogue: Option<&Epilogue>,
-    precision: OperandPrecision,
     conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let lane = WeightLane::of("dense_contraction", weight)?;
@@ -86,7 +85,7 @@ pub(crate) fn dense_contraction(
             GemvLaunch::new(width, cols, unroll, activation)?,
             k,
             epilogue,
-            ProductRead::dense(precision, lane, conversions),
+            conversions,
         ),
         Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => {
             Err(KernelGenError::Unsupported {
@@ -208,7 +207,7 @@ fn dense_gemv(
     launch: GemvLaunch,
     k: usize,
     epilogue: Option<&Epilogue>,
-    read: ProductRead,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
     let lanes = match epilogue {
@@ -236,7 +235,7 @@ fn dense_gemv(
         |e: &mut Emit, row: Local, k0: Local, count: usize, k: Local, _out_total: Local| {
             let first = row_run_start(e, row, k0, k);
             let word_aligned = rows_aligned && count.is_multiple_of(per_word);
-            lane.emit_run(e, read.conversions, weight, first, count, word_aligned)
+            lane.emit_run(e, conversions, weight, first, count, word_aligned)
         };
     let epilogue = epilogue.map(|epilogue| BoundEpilogue {
         epilogue,
@@ -249,7 +248,7 @@ fn dense_gemv(
         3 + leaf_count as u32 + 1,
         [activation, metadata, out],
         launch,
-        read,
+        conversions,
         epilogue,
         read_run,
     ))

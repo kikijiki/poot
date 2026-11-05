@@ -2,18 +2,19 @@
 //! (design POOT-1479 section 3.4, the POOT-1403 method), and write a [`PerfCalibration`] cost entry for review.
 //!
 //! Three modes, so no device is opened twice in one process (an HSA executor cannot be reopened after a drop):
-//! - `shapes`: print the fixed corpus, one `MxKxN` per line;
-//! - `measure --bank B --shape MxKxN`: open the device, time the planner's plan of that dense contraction on the
-//!   device clock and print one TSV row: the shape, the median device microseconds, and the cost-model terms of
-//!   the tiling the planner chose;
+//! - `shapes`: open the device and print the corpus, one `MxKxN<TAB>index` line per tiling the device runs for the
+//!   shape (`RegisterTiling::candidates`, in order);
+//! - `measure --bank B --shape MxKxN --tiling INDEX`: open the device, pin that candidate tiling
+//!   (`CompileOptions::tiling_pin`), time the plan of that dense contraction on the device clock and print one TSV
+//!   row: the shape, the median device microseconds, and the cost-model terms of the pinned tiling;
 //! - `fit --rows F --out E`: regress the rows' times (per `K` value) on their terms and write the entry (the ratios, the fit's
 //!   quality and the rows it rests on) to `E`. It opens no device.
 //!
 //! `scripts/calibrate-launch <backend>` runs them in order under the GPU lock. The corpus is a grid of shapes,
 //! never a model's: one run calibrates every shape, and no shape-specific figure enters the table.
 //!
-//! The fit regresses over the tilings the planner chose, since the planner has no way to pin one. A corpus whose
-//! chosen tilings vary (small `M` takes small tiles, large `M` the large ones) determines the ratios; the tool
+//! The fit regresses over every tiling the device runs for every shape, each pinned so the planner runs exactly
+//! that one. The tilings differ in tile geometry whatever the shape, so the corpus determines the ratios; the tool
 //! refuses a corpus that does not.
 
 use std::path::PathBuf;
@@ -30,11 +31,11 @@ use poot_kernelgen::{
 };
 use serde_json::Value;
 
-/// The `[N, K]` weights of the corpus: a square and the two shapes of a gated MLP at a 1024-wide hidden state.
-const WEIGHTS: [(usize, usize); 4] = [(1024, 1024), (1024, 3072), (3072, 1024), (2048, 2048)];
-/// The activation rows of the corpus: from a short prompt (small tiles fill the device) to a long one (large tiles
-/// stage least per FMA).
-const ROWS: [usize; 8] = [16, 32, 64, 128, 256, 512, 1024, 2048];
+/// The `[N, K]` weights of the corpus: a square and a gated MLP's down projection at a 1024-wide hidden state.
+const WEIGHTS: [(usize, usize); 2] = [(1024, 1024), (1024, 3072)];
+/// The activation rows of the corpus: from a short prompt to a long one. Every tiling the device runs is timed for
+/// each shape, one device process per tiling, so the corpus is kept to 8 shapes (80 timed rows on gfx1151).
+const ROWS: [usize; 4] = [16, 64, 256, 1024];
 
 /// The dense, exact, bf16-weight shape the planner's contraction tiling is chosen for (`planner/packed.rs`).
 fn tiled_shape((m, k, n): (usize, usize, usize)) -> TiledShape {
@@ -87,13 +88,14 @@ fn tiled_schedules_of(program: &StagedProgram) -> Vec<String> {
 }
 
 /// The median device time, in microseconds, of the dense contraction `m x k x n` (an f32 activation against a bf16
-/// `[N, K]` weight, exact operands) on `device`, and the schedules the planner gives it. The case is the bank's
+/// `[N, K]` weight, exact operands) on `device` under `tiling`, and the schedules the planner gives it. The case is the bank's
 /// `prefill-dense-bf16-nk` with its shape replaced, so the fixtures, the reference check and the timing policy are
 /// the bank's own; a device that reports no timestamps is an error, never a fabricated time.
 fn dense_contraction_device_us<D>(
     device: D,
     bank: &Value,
     (m, k, n): (usize, usize, usize),
+    tiling: RegisterTiling,
 ) -> Result<(f64, Vec<String>), String>
 where
     D: Device + 'static,
@@ -104,10 +106,12 @@ where
         .ok_or("the bank has no case prefill-dense-bf16-nk")?
         .clone();
     case["shape"] = serde_json::json!({ "m": m, "k": k, "n": n });
-    let ops = Operands { narrow: None };
+    let ops = Operands {
+        narrow: None,
+        tiling: Some(tiling),
+    };
     let prepared = prepare(bank, &case, ops)?;
-    let schedules =
-        tiled_schedules_of(&staged(&prepared.graphs[0], device.target(), ops.policy())?);
+    let schedules = tiled_schedules_of(&staged(&prepared.graphs[0], device.target(), ops)?);
     let measured = measure(device, bank, &prepared, ops)?;
     if !measured.agrees {
         return Err(format!(
@@ -122,7 +126,7 @@ where
     Ok((samples[samples.len() / 2], schedules))
 }
 
-/// The example's whole `main`: `device` opens a device with timestamps, for `measure` only.
+/// The example's whole `main`: `device` opens a device with timestamps, for `shapes` and `measure`.
 pub(crate) fn run<D>(
     backend: &str,
     device: impl FnOnce() -> Result<D, String>,
@@ -133,9 +137,17 @@ where
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("shapes") => {
+            let device = device()?;
+            let Target::Gpu { caps, .. } = device.target() else {
+                return Err("the device is not a GPU target".into());
+            };
             for (n, k) in WEIGHTS {
                 for m in ROWS {
-                    println!("{m}x{k}x{n}");
+                    for index in
+                        0..RegisterTiling::candidates(tiled_shape((m, k, n)), &caps).count()
+                    {
+                        println!("{m}x{k}x{n}\t{index}");
+                    }
                 }
             }
             Ok(())
@@ -152,15 +164,20 @@ where
             let Target::Gpu { caps, .. } = device.target() else {
                 return Err("the device is not a GPU target".into());
             };
-            let tiling = RegisterTiling::choose(tiled_shape(shape), &caps);
+            let index: usize = flag(&args, "--tiling")?
+                .parse()
+                .map_err(|e| format!("--tiling: {e}"))?;
+            let tiling = RegisterTiling::candidates(tiled_shape(shape), &caps)
+                .nth(index)
+                .ok_or_else(|| format!("{shape:?} has no candidate tiling {index}"))?;
             let terms = tiling.cost_terms(tiled_shape(shape), &caps);
-            let (device_us, planned) = dense_contraction_device_us(device, &bank, shape)?;
-            // The tiling recomputed here must be the one the planner ran, or the row pairs a time with the wrong
-            // terms.
+            let (device_us, planned) = dense_contraction_device_us(device, &bank, shape, tiling)?;
+            // Every dispatch (a large shape splits into several) must run the pinned tiling, or the row pairs a time with the
+            // wrong terms.
             let schedule = format!("{:?}", tiling.schedule());
-            if planned != [schedule.clone()] {
+            if planned.is_empty() || planned.iter().any(|ran| *ran != schedule) {
                 return Err(format!(
-                    "{backend} {shape:?}: the planner ran {planned:?}, not the tiling {schedule} the terms are of"
+                    "{backend} {shape:?}: the planner ran {planned:?}, not the pinned tiling {schedule}"
                 ));
             }
             println!(
@@ -216,7 +233,7 @@ where
                  // Fit quality: R^2 = {:.4}; one FMA issue of the model = {:.4e} us per K value.\n\
                  // The current Strix Halo entry is lds_read 1.0, staged_value 8.0.\n\
                  cost: CostRatios {{\n    lds_read: {:.3},\n    staged_value: {:.3},\n}},\n\
-                 // Rows (shape, median device time, chosen schedule):\n{}\n",
+                 // Rows (shape, median device time, pinned schedule):\n{}\n",
                 samples.len(),
                 fit.r_squared,
                 fit.seconds_per_fma,

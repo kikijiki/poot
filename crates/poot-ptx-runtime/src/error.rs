@@ -174,6 +174,18 @@ pub enum PtxError {
         /// CUDA ordinal of the device whose memory would be read.
         to: i32,
     },
+    /// Direct access between two devices was reported and enabled, but a copy through it delivered
+    /// different bytes than were sent (on a PCIe pair without a working peer-to-peer path, zeros): a
+    /// capture-recorded peer copy over this link would silently corrupt the destination.
+    #[error(
+        "device {from} reports direct access to device {to}'s memory, but a copy through it did not deliver its bytes"
+    )]
+    PeerCopyUndelivered {
+        /// CUDA ordinal of the device that would write.
+        from: i32,
+        /// CUDA ordinal of the device whose memory the copy would write.
+        to: i32,
+    },
     /// A whole-buffer copy between buffers of different byte capacity.
     #[error("copy_buffer between buffers of {src} and {dst} bytes")]
     CopyLength {

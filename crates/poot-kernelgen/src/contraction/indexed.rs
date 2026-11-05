@@ -30,7 +30,7 @@ use super::tiled::{
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy, cu, emit_read_meta, select_u32};
 use crate::helpers::{Alloc, WeightLane, WeightLayout, elem, ld, local, slice_dtype, slice_f32};
-use crate::precision::ProductRead;
+use crate::precision::{ProductRead, require_exact};
 use poot_graph_ir::OperandPrecision;
 
 /// The launch metadata words of an indexed contraction, in order: the register-tiled body's own five (`K`, `N`, `M`
@@ -176,14 +176,17 @@ pub(crate) fn indexed_contraction(
             cols,
             unroll,
             activation,
-        } => indexed_gemv(
-            name,
-            GemvLaunch::new(width, cols, unroll, activation)?,
-            layout,
-            lane,
-            epilogue,
-            ProductRead::dense(precision, lane, conversions),
-        ),
+        } => {
+            require_exact(precision, "indexed_contraction")?;
+            indexed_gemv(
+                name,
+                GemvLaunch::new(width, cols, unroll, activation)?,
+                layout,
+                lane,
+                epilogue,
+                conversions,
+            )
+        }
         Schedule::RegisterTiled { .. } | Schedule::FragmentTiled { .. } => {
             let extents = TiledExtents::of_meta("indexed_contraction", meta)?;
             indexed_register_tiled(
@@ -207,7 +210,7 @@ fn indexed_gemv(
     layout: WeightLayout,
     lane: WeightLane,
     epilogue: Option<&Epilogue>,
-    read: ProductRead,
+    conversions: RoundingConversions,
 ) -> Result<Body, KernelGenError> {
     let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
     let lanes = match epilogue {
@@ -242,7 +245,7 @@ fn indexed_gemv(
                     let k_at = bin(e, Ty::Usize, BinOp::Add, copy(k0), cu(j));
                     let in_slab = emit_in_slab(e, layout, (k_at, col), (k, n));
                     let at = bin(e, Ty::Usize, BinOp::Add, copy(slab.base), copy(in_slab));
-                    let value = lane.emit_elem(e, read.conversions, weight, at);
+                    let value = lane.emit_elem(e, conversions, weight, at);
                     if j == 0 {
                         bin(e, Ty::F32, BinOp::Add, copy(value), copy(slab.poison))
                     } else {
@@ -262,7 +265,7 @@ fn indexed_gemv(
         4 + leaf_count as u32 + 1,
         [activation, metadata, out],
         launch,
-        read,
+        conversions,
         epilogue,
         read_run,
     ))

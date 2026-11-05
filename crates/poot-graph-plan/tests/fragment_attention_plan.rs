@@ -455,3 +455,54 @@ fn an_unknown_register_file_plans_no_fragments() {
         None
     );
 }
+
+/// POOT-1496: the fragment attention is chosen by structure, not by the matrix unit's `fma_rate`: its row groups
+/// (`hkv * lq` at the smallest fragment tile of 16 rows, 4 query heads per key/value head) must fill the device's
+/// compute units. `f16_range`'s attention prefill of 640 positions fills every NVIDIA part the pod lanes rent
+/// (RTX 3090 82 SMs to RTX PRO 6000 Blackwell 188), where its former 160 positions filled none past 160 SMs and the
+/// planner kept the attention `Exact` on an RTX 4090 (128). Mutation: build the shape with 160 positions; the
+/// A100 row (108 SMs) reads `Exact`, and so would the larger parts.
+#[test]
+fn a_prefill_that_fills_the_device_narrows_its_attention_on_every_nvidia_part() {
+    let (hq, hkv, d, l) = (16usize, 4usize, 64usize, 640usize);
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, l, d])).unwrap();
+    let kv = TensorType::new(vec![1, hkv, l, d], DType::F16);
+    let k = b.constant("k", kv.clone()).unwrap();
+    let v = b.constant("v", kv).unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, l, l]))
+        .unwrap();
+    let mut plan = b.append_plan(0).unwrap();
+    let out = plan
+        .equation(
+            OpKind::Attention(AttentionAttrs::new(hq / hkv, 0.25, None)),
+            [q, k, v, mask].map(|t| Operand::Value(t.id())).to_vec(),
+        )
+        .unwrap();
+    plan.declare_result(out).unwrap();
+    let mut prepared = b.preflight_append(plan).unwrap();
+    let out = b.commit_append(&mut prepared).unwrap();
+    let g = b.finish(out).unwrap();
+    for (name, cc, sms) in [
+        ("A100", (8, 0), 108),
+        ("RTX 3090", (8, 6), 82),
+        ("RTX 4090", (8, 9), 128),
+        ("H100", (9, 0), 132),
+        ("RTX 5090", (12, 0), 170),
+        ("RTX PRO 6000 Blackwell", (12, 0), 188),
+    ] {
+        let mut caps = DeviceCaps::ptx_default();
+        caps.matrix_units = Queried::Known(MatrixUnits::nvidia(cc));
+        caps.compute_units = Queried::Known(sms);
+        let target = Target::Gpu {
+            backend: Backend::Nvptx,
+            caps,
+        };
+        assert_eq!(
+            selected(&g, &target),
+            OperandPrecision::Narrow(FragmentDtype::F16),
+            "{name}"
+        );
+    }
+}

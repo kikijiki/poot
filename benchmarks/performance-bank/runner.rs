@@ -20,6 +20,7 @@ use poot_graph_plan::staged::{
     DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram, TargetSet, compile_staged,
 };
 use poot_graph_plan::{CompileOptions, Target};
+use poot_kernelgen::RegisterTiling;
 use poot_load::packed_safetensors::sha256_digest;
 use poot_quant::StoredBytes;
 use poot_quant::scalar;
@@ -97,6 +98,9 @@ fn hex(bytes: &[u8]) -> String {
 #[derive(Clone, Copy)]
 pub(crate) struct Operands {
     pub(crate) narrow: Option<FragmentDtype>,
+    /// The register tiling every tiled contraction of the case must run ([`CompileOptions::tiling_pin`]); `None` lets
+    /// the cost model choose, as every bank case does. Only `calibrate-launch` sets it.
+    pub(crate) tiling: Option<RegisterTiling>,
 }
 
 impl Operands {
@@ -110,7 +114,10 @@ impl Operands {
             }),
             Some(other) => return Err(format!("unknown operand_precision {other:?}")),
         };
-        Ok(Self { narrow })
+        Ok(Self {
+            narrow,
+            tiling: None,
+        })
     }
 
     fn tolerance(self) -> f64 {
@@ -986,11 +993,10 @@ pub(crate) fn prepare(bank: &Value, case: &Value, ops: Operands) -> Result<Prepa
     }
 }
 
-pub(crate) fn staged(
-    g: &Graph,
-    target: Target,
-    policy: MatmulPrecision,
-) -> Result<StagedProgram, String> {
+pub(crate) fn staged(g: &Graph, target: Target, ops: Operands) -> Result<StagedProgram, String> {
+    let mut options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+        .with_matmul_precision(ops.policy());
+    options.tiling_pin = ops.tiling;
     compile_staged(
         &g.clone(),
         &TargetSet::single(DeviceId(0), target),
@@ -998,8 +1004,7 @@ pub(crate) fn staged(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
-            .with_matmul_precision(policy),
+        &options,
     )
     .map_err(|e| format!("compile_staged: {e}"))
 }
@@ -1079,7 +1084,7 @@ where
     let mut entries = Vec::new();
     let mut plan = Vec::new();
     for g in &graphs {
-        let program = staged(g, target, ops.policy())?;
+        let program = staged(g, target, ops)?;
         plan = plan_of(&program);
         entries.push(
             exec.add_entry(exe, &program)

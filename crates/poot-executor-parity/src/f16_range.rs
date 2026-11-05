@@ -104,14 +104,15 @@ pub fn in_range_block_fixture() -> Fixture {
 }
 
 /// The attentions of `precision::attention_fixtures`' shapes with every query row past f16's range (`|q|` up to
-/// 1e6): and a 160-row prefill of 16 heads whose rows
-/// fill a fragment attention where the device has a matrix unit.
+/// 1e6): and a 640-row prefill of 16 heads whose row groups (`4 * 640`) fill a fragment attention on every device
+/// with a matrix unit, the largest NVIDIA part's 188 SMs included (the planner tiles only when the row groups fill the
+/// compute units).
 pub fn attention_fixtures() -> Vec<Fixture> {
     let shapes: [(&'static str, Heads, usize, usize); 1] = [(
         "attention_f16_past_range_fragment",
         FRAGMENT_HEADS,
-        160,
-        160,
+        640,
+        640,
     )];
     shapes
         .into_iter()

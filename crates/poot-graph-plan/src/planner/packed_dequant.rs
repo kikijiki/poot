@@ -47,6 +47,7 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
+    tiling_pin: Option<poot_kernelgen::RegisterTiling>,
     const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
     match &eqn.op {
@@ -68,6 +69,7 @@ pub(super) fn plan(
             odt,
             caps,
             limits,
+            tiling_pin,
             *descriptor,
             *rows,
             *precision,
@@ -93,6 +95,7 @@ pub(super) fn plan(
             odt,
             caps,
             limits,
+            tiling_pin,
             *descriptor,
             *rows,
             *precision,
@@ -216,13 +219,14 @@ fn try_plan_contraction(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
+    tiling_pin: Option<poot_kernelgen::RegisterTiling>,
     descriptor: poot_quant::PackedWeight,
     rows: ContractionRows,
     precision: OperandPrecision,
     epilogue: Option<&FusedRegion>,
     const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
-    let site = Site::new(g, eqn, backend, limits);
+    let site = Site::new(g, eqn, backend, limits).pinned(tiling_pin);
     let format = crate::packed_block_float::admit_packed(
         crate::packed_block_float::PACKED_LOWERING,
         descriptor,

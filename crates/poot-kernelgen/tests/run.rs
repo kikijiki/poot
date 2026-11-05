@@ -200,15 +200,7 @@ fn synthesized_kernels_compile_to_valid_ptx() {
         ),
         (
             "attn_scores_v_gemv_lds",
-            kg::attn_scores_v_gemv_lds(
-                "asvg",
-                300,
-                n,
-                128,
-                n,
-                poot_graph_ir::OperandPrecision::Exact,
-                poot_target::RoundingConversions::NONE,
-            ),
+            kg::attn_scores_v_gemv_lds("asvg", 300, n, 128, n),
         ),
     ];
     if !which("llc") {
@@ -617,7 +609,6 @@ fn matmul_gemv_and_batched() {
             &[1, 1, 4],
             &[4, 3],
             None,
-            poot_graph_ir::OperandPrecision::Exact,
             poot_target::RoundingConversions::NONE,
         ),
         "mm",
@@ -648,7 +639,6 @@ fn matmul_gemv_and_batched() {
             &[1, 2, 1, 4],
             &[1, 2, 4, 3],
             None,
-            poot_graph_ir::OperandPrecision::Exact,
             poot_target::RoundingConversions::NONE,
         ),
         "mmb",
@@ -707,7 +697,6 @@ fn matmul_bias_epilogue() {
             &[4, 3],
             &bias_epilogue(&[1, 1, 3], &[3]),
             None,
-            poot_graph_ir::OperandPrecision::Exact,
             poot_target::RoundingConversions::NONE,
         )
         .expect("the epilogue's leaf storage is valid"),
@@ -1540,15 +1529,7 @@ fn attn_scores_v_gemv_lds_matches_naive_batched_matmul() {
     let (w, hq, cap, d) = (128usize, 12usize, 300usize, 64usize);
     let rows = hq; // batch = 1
     let x_groups = rows * d; // rows*d well under 65535, so a single-row (y=1) 2-D grid: col == GroupX.
-    let body = kg::attn_scores_v_gemv_lds(
-        "attn_scores_v",
-        cap,
-        d,
-        w,
-        x_groups,
-        poot_graph_ir::OperandPrecision::Exact,
-        poot_target::RoundingConversions::NONE,
-    );
+    let body = kg::attn_scores_v_gemv_lds("attn_scores_v", cap, d, w, x_groups);
     let spv_bytes = spv(&body, "attn_scores_v");
 
     let dir = std::env::temp_dir()
@@ -1612,7 +1593,6 @@ fn attn_scores_v_gemv_lds_matches_naive_batched_matmul() {
         &a_shape,
         &b_shape,
         None,
-        poot_graph_ir::OperandPrecision::Exact,
         poot_target::RoundingConversions::NONE,
     );
     let naive_bytes = spv(&naive_body, "attn_scores_v_naive");
@@ -1748,7 +1728,6 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
                 0,
                 kg::WeightLayout::Kn,
                 BufferStorage::f32(),
-                poot_graph_ir::OperandPrecision::Exact,
                 poot_target::RoundingConversions::NONE,
             )
             .expect("f32 weight storage"),
@@ -1800,15 +1779,7 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
         ),
         (
             "attn_scores_v_gemv_lds",
-            kg::attn_scores_v_gemv_lds(
-                "asvg_gate",
-                300,
-                n,
-                w,
-                n,
-                poot_graph_ir::OperandPrecision::Exact,
-                poot_target::RoundingConversions::NONE,
-            ),
+            kg::attn_scores_v_gemv_lds("asvg_gate", 300, n, w, n),
         ),
         (
             "rope_dt",
@@ -1824,7 +1795,6 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
                 &[4, 8],
                 &[8, 6],
                 None,
-                poot_graph_ir::OperandPrecision::Exact,
                 poot_target::RoundingConversions::NONE,
             ),
         ),
@@ -1837,7 +1807,6 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
                 &[4, 8],
                 &[8, 6],
                 None,
-                poot_graph_ir::OperandPrecision::Exact,
                 poot_target::RoundingConversions::NONE,
             ),
         ),
@@ -1975,7 +1944,6 @@ fn matmul_epilogue_chain_matches_cpu() {
         &[1, 1, 4, 5],
         &chain_epilogue(Ty::F32, &out_shape),
         None,
-        poot_graph_ir::OperandPrecision::Exact,
         poot_target::RoundingConversions::NONE,
     )
     .expect("the epilogue's leaf storage is valid");
@@ -2087,7 +2055,6 @@ fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
                     b_shape: vec![2, 4, 5],
                 },
                 fold: fold(30),
-                precision: poot_graph_ir::OperandPrecision::Exact,
             }),
         ),
         (
@@ -2121,7 +2088,6 @@ fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
                 k: 8,
                 n: 5,
                 epilogue: Some(chain_epilogue(Ty::F32, &[1, 5])),
-                precision: poot_graph_ir::OperandPrecision::Exact,
             }),
         ),
     ];
@@ -2155,7 +2121,6 @@ fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
                 &[2, 4, 5],
                 &chain_epilogue(dt.clone(), &[2, 3, 5]),
                 None,
-                poot_graph_ir::OperandPrecision::Exact,
                 poot_target::RoundingConversions::NONE,
             )
             .expect("the epilogue's leaf storage is valid");

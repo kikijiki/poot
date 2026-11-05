@@ -694,29 +694,31 @@ mod tests {
     #[test]
     fn an_exact_request_keeps_its_pre_precision_encoding_and_a_narrowed_one_does_not() {
         use poot_graph_ir::{FragmentDtype, OperandPrecision};
-        use poot_kernel_ir::Ty;
-        use poot_kernelgen::{ContractionSpec, Fold, MatmulShapes};
-        let serial = |precision| {
-            KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Serial {
-                dt: Ty::F32,
-                epilogue: None,
-                shapes: MatmulShapes {
-                    out_shape: vec![2, 3],
-                    a_shape: vec![2, 4],
-                    b_shape: vec![4, 3],
-                },
-                fold: Fold {
-                    numel: 6,
-                    two_d: false,
-                    width: 64,
-                },
-                precision,
-            }))
+        use poot_kernelgen::{
+            ContractionSpec, GemvActivation, IndexedContraction, Schedule, WeightLayout,
         };
-        let exact = serial(OperandPrecision::Exact).canonical_text();
+        let indexed = |precision| {
+            KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Indexed(
+                IndexedContraction {
+                    schedule: Schedule::Gemv {
+                        width: 64,
+                        cols: 1,
+                        unroll: 1,
+                        activation: GemvActivation::Scalar,
+                    },
+                    layout: WeightLayout::Nk,
+                    weight: poot_target::BufferStorage::f32(),
+                    epilogue: None,
+                    grid: [64, 1, 1],
+                    meta: vec![4, 3, 2, 0, 0, 2],
+                    precision,
+                },
+            )))
+        };
+        let exact = indexed(OperandPrecision::Exact).canonical_text();
         assert!(!exact.contains("precision"), "{exact}");
         assert!(
-            exact.ends_with("} }))"),
+            exact.ends_with("] })))"),
             "the text ends as it did before the field: {exact}"
         );
         let digests: Vec<_> = [
@@ -728,7 +730,7 @@ mod tests {
         ]
         .into_iter()
         .map(|precision| {
-            serial(precision)
+            indexed(precision)
                 .digest(Backend::SpirvVulkan.into())
                 .to_string()
         })
@@ -812,7 +814,6 @@ mod tests {
                     b_shape: vec![4, b_cols],
                 },
                 fold: fold(6),
-                precision: poot_graph_ir::OperandPrecision::Exact,
             })
         };
         let attention = |scale: f32| {

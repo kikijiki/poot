@@ -72,7 +72,6 @@ fn f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv() {
         &a_shape,
         &b_shape,
         None,
-        poot_graph_ir::OperandPrecision::Exact,
         poot_target::RoundingConversions::NONE,
     );
 
