@@ -1,10 +1,9 @@
-//! The f16 range under the default `Narrow` (POOT-1474, `receipts/1471-narrow-without-range-guards/design.md`
+//! The f16 range under the default `Narrow` (POOT-1474, POOT-1471
 //! section 7): a contraction the narrow policy rounds to f16 reads its activation unscaled, so an activation past
 //! f16's range becomes infinity and the output is not finite.
 //!
-//! Every row drives the production `compile` on RADV caps (f16 fragments only, so the narrow policy rounds to f16)
-//! and on gfx1151 caps cut down to their f16 fragments (`fragment_only`; f16 is also ROCm's default since
-//! POOT-1458), and
+//! Every row drives the production `compile` on gfx1151 caps cut down to their f16 fragments (`fragment_only`; f16 is
+//! also ROCm's default since POOT-1458), and
 //! evaluates the compiled graph with the CPU oracle, which computes the program's declared rounding: the oracle of a
 //! narrowed op rounds its operands as the device does.
 
@@ -37,13 +36,6 @@ fn rocm_wmma() -> Target {
     Target::Gpu {
         backend: Backend::AmdGcn(AmdArch::gfx1151()),
         caps,
-    }
-}
-
-fn radv() -> Target {
-    Target::Gpu {
-        backend: Backend::SpirvVulkan,
-        caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
     }
 }
 
@@ -95,12 +87,10 @@ fn block(norm_scale: f32) -> (Graph, HashMap<ValueId, Value>) {
 /// A target with f16 fragments: its name, the target, and the one fragment dtype the pass may narrow to on it.
 type F16Target = (&'static str, Target, Option<FragmentDtype>);
 
-/// RADV, and gfx1151 cut down to its f16 fragments.
-fn f16_targets() -> [F16Target; 2] {
-    [
-        ("radv", radv(), None),
-        ("gfx1151 f16", rocm_wmma(), Some(FragmentDtype::F16)),
-    ]
+/// gfx1151 cut down to its f16 fragments, the unit RADV exposes. RADV itself is not a row: its cost model finds the
+/// exact schedule cheaper (`an_op_a_matrix_unit_does_not_win_stays_exact`), so the policy never narrows there.
+fn f16_targets() -> [F16Target; 1] {
+    [("gfx1151 f16", rocm_wmma(), Some(FragmentDtype::F16))]
 }
 
 fn compiled(g: &Graph, (_, target, only): &F16Target, policy: MatmulPrecision) -> Program {
@@ -256,10 +246,10 @@ fn the_oracle_graph_and_the_program_narrow_the_same_contractions() {
     for packed in [false, true] {
         let g = projection(packed);
         for target in f16_targets() {
-            let (name, device, only) = &target;
+            let (name, device, _) = &target;
             let program = compiled(&g, &target, MatmulPrecision::Narrow);
-            // `with_operand_precision` sees every unit; on gfx1151 cut down to f16 the program's choice is RADV's.
-            let oracle_target = if only.is_some() { radv() } else { *device };
+            // `with_operand_precision` sees every unit, and f16 is the first candidate on gfx1151 as on the cut-down one.
+            let oracle_target = *device;
             let declared = poot_graph_plan::with_operand_precision(
                 &g,
                 &oracle_target,

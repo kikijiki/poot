@@ -5,16 +5,24 @@
 //! its launch from shapes and the device ([`poot_target::DeviceCaps::compute_units`]); the generator only
 //! implements it.
 
+mod cost;
 mod dense;
 mod epilogue;
+#[cfg(any(test, feature = "test-support"))]
+mod fit;
 mod gemv;
 mod indexed;
 mod tiled;
 
+use cost::ContractionCost;
+pub use cost::CostTerms;
+pub use cost::GemvShape;
 pub use dense::DenseTiledWeight;
 pub(crate) use dense::{TiledRead, dense_contraction, dense_tiled_contraction};
 pub(crate) use epilogue::{BoundEpilogue, emit_epilogue};
 pub use epilogue::{Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep};
+#[cfg(any(test, feature = "test-support"))]
+pub use fit::{CostFit, fit_cost_ratios};
 pub(crate) use gemv::{GemvLaunch, gemv_body};
 pub(crate) use indexed::{
     META_EXPERTS, META_N, META_PACKED_SLAB_WORDS, RowExpert, emit_poison, emit_row_expert,
@@ -197,24 +205,9 @@ impl Schedule {
 const LANE_ROWS: [u32; 3] = [2, 4, 8];
 const LANE_COLS: [u32; 2] = [4, 8];
 
-/// The most accumulators one lane holds (an 8x8 tile): with the `rows + cols` operand values of a step and the
-/// staging addresses, 149 VGPRs on gfx1151, within the 256 a wave32 lane holds, so several waves stay resident.
-const MAX_LANE_ACCUMULATORS: u32 = 64;
-
-/// The issue cost, in FMAs, of what one lane does per staged `K` value: an FMA per accumulator, an LDS read per
-/// operand value of the step, and a staged value (a global load, its LDS write and its share of the round's two
-/// barriers). Calibrated on gfx1151 (ROCm): over every tiling of a qwen3-0.6b prefill at 512 and 2048 tokens, the
-/// contraction device time follows these ratios within a few percent (POOT-1403 receipt).
-const FMA_COST: f64 = 1.0;
-const LDS_READ_COST: f64 = 1.0;
-const STAGED_VALUE_COST: f64 = 8.0;
-/// The reads a lane issues to load one operand fragment, 16 values of 2 bytes adjacent in an `X`-major staged tile
-/// (every fragment operand is staged so, [`MicroTile::staged_major`]): two 16-byte reads.
-const FRAGMENT_LOAD_READS: f64 = 2.0;
-
 /// The bytes one global memory request reads: the cache line of every target poot generates for (the L2 and L0/L1
 /// lines of AMD gfx9-12, NVIDIA's lines). A round whose segment of an operand row is shorter pays a whole request
-/// for part of a line, and the vector memory path is bound by requests, not bytes (`receipts/1445-fragment-traffic`:
+/// for part of a line, and the vector memory path is bound by requests, not bytes (POOT-1445:
 /// halving the bytes of every activation request left the cycles where they were; halving the requests per multiply
 /// took a third of them).
 const GLOBAL_REQUEST_BYTES: usize = 128;
@@ -328,29 +321,25 @@ pub struct RegisterTiling {
 const WAVE_GRIDS: [(u32, u32); 6] = [(1, 1), (2, 1), (1, 2), (2, 2), (4, 2), (2, 4)];
 /// The fragments a wave may accumulate along each axis.
 const WAVE_FRAGMENTS: [u32; 3] = [1, 2, 4];
-/// The most accumulator fragments one wave holds (8 f32 registers each): with the operand fragments of a step
-/// (8 registers each) and the staging addresses, within the 256 registers a wave32 lane holds.
-const MAX_WAVE_FRAGMENTS: u32 = 8;
-/// The issue cost, in lane FMAs, of one fragment multiply per lane: a 16x16x16 multiply is 4096 FMAs spread over 32
-/// lanes, and the matrix unit runs 4x the FMA rate (the measured gfx1151 peaks, 40-45 against 10.8 TFLOP/s:
-/// `receipts/1429-narrow-operands/design.md` section 1.1).
-const WMMA_COST: f64 = 4096.0 / FRAGMENT_LANES as f64 / 4.0;
-
+/// The f32 registers one lane of a wave holds for an accumulator fragment: the 16x16 values of its tile over the
+/// 32 lanes of the wave.
+const FRAGMENT_ACCUMULATOR_REGISTERS: u32 = 16 * 16 / FRAGMENT_LANES as u32;
 impl RegisterTiling {
     /// The tiling of `shape` on `caps`, from an occupancy cost model over every geometry the device can run.
     ///
     /// - Scalar: the narrow and wide lane grids of `caps.gemm_launch()`, each with every register tile of
-    ///   [`LANE_ROWS`] x [`LANE_COLS`] up to [`MAX_LANE_ACCUMULATORS`].
+    ///   [`LANE_ROWS`] x [`LANE_COLS`].
     /// - Fragment, where the operands narrow to a dtype the device has a matrix unit for
-    ///   ([`StagedTerms::fragment`]): every wave grid of [`WAVE_GRIDS`] with every [`WAVE_FRAGMENTS`] tile of at
-    ///   most [`MAX_WAVE_FRAGMENTS`] fragments. Its round depth is the
+    ///   ([`StagedTerms::fragment`]): every wave grid of [`WAVE_GRIDS`] with every [`WAVE_FRAGMENTS`] tile. Its
+    ///   round depth is the
     ///   shallowest of [`FRAGMENT_DEPTHS`] at which one round's segment of every operand row is a whole global
     ///   request ([`GLOBAL_REQUEST_BYTES`]; the deepest when none is), or the deepest shallower one its LDS holds
     ///   ([`Self::fragment_depth`]).
     ///
-    /// A candidate must have a workgroup that fits the device, two staged tiles that fit its LDS and stage in whole
+    /// A candidate must have a workgroup that fits the device, accumulators within the lane's register budget
+    /// ([`poot_target::RegisterBudget`]), two staged tiles that fit its LDS and stage in whole
     /// slots ([`tiled::stages_evenly`]), and an output tile the shape's rows admit (a grouping's block,
-    /// [`TiledShape::admits_tile_rows`]). Each is costed by [`Self::cost`] and the cheapest wins, a tie going to the
+    /// [`TiledShape::admits_tile_rows`]). Each is costed by [`ContractionCost::tiled`] and the cheapest wins, a tie going to the
     /// larger output tile and then to the earlier candidate (the scalar grids, then [`WAVE_GRIDS`] in order: two wave
     /// grids of one output tile load alike and tie). Chosen from shapes, storage widths and device limits alone, never
     /// from the format or a model; the run is the longest that divides `k`.
@@ -376,7 +365,7 @@ impl RegisterTiling {
     fn cheapest(shape: TiledShape, caps: &poot_target::DeviceCaps) -> Option<(f64, Self)> {
         let mut best: Option<(f64, Self)> = None;
         for tiling in Self::candidates(shape, caps) {
-            let cost = tiling.cost(shape, caps);
+            let cost = ContractionCost::tiled(tiling, shape, caps);
             let better = best.is_none_or(|(best_cost, best_tiling)| {
                 cost < best_cost
                     || (cost == best_cost
@@ -507,7 +496,7 @@ impl RegisterTiling {
                 WAVE_GRIDS.into_iter().flat_map(move |(waves_m, waves_n)| {
                     WAVE_FRAGMENTS.into_iter().flat_map(move |rows| {
                         WAVE_FRAGMENTS.into_iter().filter_map(move |cols| {
-                            (rows * cols <= MAX_WAVE_FRAGMENTS && waves_m * waves_n <= waves)
+                            (waves_m * waves_n <= waves)
                                 .then_some(Self {
                                     owners_m: TileSize(waves_m),
                                     owners_n: TileSize(waves_n),
@@ -525,9 +514,57 @@ impl RegisterTiling {
                     })
                 })
             });
-        scalar.chain(fragment).filter(move |tiling| {
-            tiling.runs_on(shape, caps) && shape.admits_tile_rows(tiling.output_tile().0)
-        })
+        // The units follow the precision (POOT-1476): an exact shape runs on lanes, a narrowed or split one on a
+        // matrix unit. A narrowed op never has a scalar tiling, which would round for no speed.
+        let narrowed = shape.terms.fragment.is_some();
+        scalar
+            .filter(move |_| !narrowed)
+            .chain(fragment)
+            .filter(move |tiling| {
+                tiling.runs_on(shape, caps) && shape.admits_tile_rows(tiling.output_tile().0)
+            })
+    }
+
+    /// The cheapest fragment tiling of a narrowed or split `shape`, or `None` when the device has none for it
+    /// (POOT-1476). A narrowed contraction plans only on a matrix unit, so this is the planner's hold: it never
+    /// compares with an exact schedule, which is the pass's question ([`Self::matrix_unit_wins`]).
+    pub fn fragment_tiling(shape: TiledShape, caps: &poot_target::DeviceCaps) -> Option<Self> {
+        shape.terms.fragment?;
+        Self::cheapest(shape, caps).map(|(_, tiling)| tiling)
+    }
+
+    /// Whether a matrix unit is the cheapest schedule of a narrowed or split `shape` (POOT-1476,
+    /// POOT-1471): the cheapest fragment tiling, rounding
+    /// terms included, costs less than the cheapest exact alternative, a scalar tiling of the same shape read exactly
+    /// or the per-row Gemv `gemv` where the planner has one. All are ranked by the one [`ContractionCost`] model
+    /// over the ungrouped rows, so the answer is a property of the dimensions and the device, and a grouping of the
+    /// rows later (`grouped_block`) cannot reverse it.
+    pub fn matrix_unit_wins(
+        shape: TiledShape,
+        gemv: Option<GemvShape>,
+        caps: &poot_target::DeviceCaps,
+    ) -> bool {
+        if shape.terms.fragment.is_none() {
+            return false;
+        }
+        let dense = TiledShape {
+            rows: TiledRows::Dense,
+            ..shape
+        };
+        let exact = TiledShape {
+            terms: StagedTerms::ONE,
+            ..dense
+        };
+        let Some((fragment_cost, _)) = Self::cheapest(dense, caps) else {
+            return false;
+        };
+        [
+            Self::cheapest(exact, caps).map(|(cost, _)| cost),
+            gemv.map(|gemv| ContractionCost::gemv(gemv, caps)),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|exact| fragment_cost < exact)
     }
 
     /// The `K` values one barrier round of this tiling stages.
@@ -555,16 +592,23 @@ impl RegisterTiling {
             .find(|tiling| tiling.runs_on(shape, caps))
     }
 
-    /// Whether `caps` runs this tiling over `shape`: its workgroup fits, its staged tiles (and the scratch an
-    /// `Opaque` fragment spills to) fit the LDS and stage in whole slots, and a scalar register tile is at most
-    /// [`MAX_LANE_ACCUMULATORS`].
+    /// The f32 registers each lane of this tiling holds across the `K` loop: a scalar tile's accumulators, a
+    /// fragment tile's accumulator fragments.
+    pub(crate) fn accumulator_registers(self) -> u32 {
+        match self.micro {
+            MicroTile::Scalar { rows, cols } => rows.get() * cols.get(),
+            MicroTile::Fragment(tile) => tile.rows * tile.cols * FRAGMENT_ACCUMULATOR_REGISTERS,
+        }
+    }
+
+    /// Whether `caps` runs this tiling over `shape`: its workgroup fits, a lane's accumulators fit its register
+    /// budget (`caps.gemm_launch().register_budget`, a quarter of what a lane of this workgroup keeps resident),
+    /// its staged tiles (and the scratch an `Opaque` fragment spills to) fit the LDS and stage in whole slots.
     fn runs_on(self, shape: TiledShape, caps: &poot_target::DeviceCaps) -> bool {
         let lane_count = self.workgroup_lanes();
-        let accumulators = match self.micro {
-            MicroTile::Scalar { rows, cols } => rows.get() * cols.get(),
-            MicroTile::Fragment(_) => 0,
-        };
-        accumulators <= MAX_LANE_ACCUMULATORS
+        let budget = caps.gemm_launch().register_budget;
+        u32::try_from(lane_count)
+            .is_ok_and(|lanes| self.accumulator_registers() <= budget.accumulators(lanes))
             && lane_count <= caps.max_workgroup_invocations as usize
             && lane_count <= caps.max_workgroup_size[0] as usize
             && tiled::lds_bytes(self.launch_shape(), shape.terms) <= caps.lds_bytes as usize
@@ -588,52 +632,11 @@ impl RegisterTiling {
         }
     }
 
-    /// The modelled time of `shape` under this tiling, in FMA issues of one lane per staged `K` value (`K` is
-    /// common to every tiling, so it is left out).
-    ///
-    /// One lane's work per `K` value is its [`FMA_COST`]s (a scalar tile) or its share of the fragment multiplies
-    /// ([`WMMA_COST`] per 16 values), its [`LDS_READ_COST`]s and its share of the tile's staged values
-    /// ([`STAGED_VALUE_COST`]), over the tiles that compute ([`TiledShape::working_row_tiles`]: a grouped tile is
-    /// one expert's, whole tiles per bucket). The device runs `caps.compute_units` units, each saturated by
-    /// `caps.gemm_launch().saturating_lanes` resident lanes: the launch's lanes (padded up to whole tiles: a
-    /// ragged edge computes the full tile) share them, so the time is the lane step times the launch's lanes over
-    /// the device's saturating lanes, but never less than one lane's own sequence of steps. This is what makes a
-    /// short contraction take tiles small enough to fill the device, and a long one the large tiles that stage
-    /// least per FMA.
-    fn cost(self, shape: TiledShape, caps: &poot_target::DeviceCaps) -> f64 {
-        let (tile_rows, tile_cols) = self.output_tile();
-        let lane_count = self.workgroup_lanes() as f64;
-        let staged_per_lane = (tile_rows + tile_cols) as f64 / lane_count;
-        let (compute, reads) = match self.micro {
-            MicroTile::Scalar { rows, cols } => {
-                let (rows, cols) = (f64::from(rows.get()), f64::from(cols.get()));
-                (rows * cols * FMA_COST, (rows + cols) * LDS_READ_COST)
-            }
-            MicroTile::Fragment(tile) => {
-                // A fragment multiply per 16 values, and a lane loads 16 values of each operand fragment in
-                // `FRAGMENT_LOAD_READS` reads.
-                let kappa = self.micro.kappa() as f64;
-                let loads = f64::from(tile.rows + tile.cols) * FRAGMENT_LOAD_READS;
-                (
-                    f64::from(tile.rows * tile.cols) * WMMA_COST / kappa,
-                    loads * LDS_READ_COST / kappa,
-                )
-            }
-        };
-        // A staged value of a narrowed operand also takes its rounding (and, into a fragment tile, the narrowing cast).
-        let narrowing = shape.terms.rounding_ops(caps.rounding_conversions) as f64
-            + f64::from(u8::from(
-                matches!(self.micro, MicroTile::Fragment(_)) && shape.terms.fragment.is_some(),
-            ));
-        let lane_step = compute + reads + staged_per_lane * (STAGED_VALUE_COST + narrowing);
-        let tiles = shape.blocks
-            * shape.working_row_tiles(tile_rows)
-            * shape.out_per_block.div_ceil(tile_cols);
-        // A device with no known compute-unit count is costed as one unit: no schedule is credited with
-        // filling lanes it cannot show exist, so the tilings rank by the work they issue.
-        let device_lanes = f64::from(caps.compute_units.known().map_or(1, |units| units.max(1)))
-            * f64::from(caps.gemm_launch().saturating_lanes.max(1));
-        lane_step * (tiles as f64 * lane_count / device_lanes).max(1.0)
+    /// The terms of this tiling's modelled time for `shape` on `caps`, before the device's
+    /// [`poot_target::calibration::CostRatios`] weigh them: what the calibration fit regresses a measured time on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cost_terms(self, shape: TiledShape, caps: &poot_target::DeviceCaps) -> CostTerms {
+        ContractionCost::tiled_terms(self, shape, caps)
     }
 
     /// The schedule that runs this tiling.
@@ -788,12 +791,13 @@ mod tests {
     }
 
     /// A narrowed contraction on a device whose fragment workgroup is one wave (wgpu: the runtime cannot make the
-    /// pipeline's subgroups 32 lanes wide) takes the scalar tiling, and the same device with several waves per
-    /// workgroup takes the fragments: a one-wave tile is small, so it stages many values per multiply, and each is
-    /// rounded to the narrow dtype. Mutation: drop the `narrowing` term from `RegisterTiling::cost`; the one-wave
-    /// device plans a fragment tile and this row goes red.
+    /// pipeline's subgroups 32 lanes wide) does not win on a matrix unit, and the same device with several waves per
+    /// workgroup does: a one-wave tile is small, so it stages many values per multiply, and each is rounded to the
+    /// narrow dtype. The planner's hold still has a fragment tiling for the one-wave device (a declared narrowing runs
+    /// there), and it is not a scalar one. Mutation: drop the `narrowing` term from `ContractionCost::tiled`; the
+    /// one-wave device wins on a matrix unit and this row goes red.
     #[test]
-    fn a_fragment_tile_of_one_wave_loses_to_the_scalar_tiling() {
+    fn a_fragment_tile_of_one_wave_loses_to_the_exact_tiling() {
         use poot_target::{CooperativeMatrixConfig, FragmentShape, MatrixUnits, Queried};
         let device = |waves| poot_target::DeviceCaps {
             matrix_units: Queried::Known(MatrixUnits::cooperative_matrix(
@@ -804,6 +808,7 @@ mod tests {
                 }],
                 32,
                 waves,
+                Queried::Known(poot_target::calibration::GFX11_MATRIX_FMA_RATE),
             )),
             ..poot_test_util::device_caps::wgpu_rdna3_igpu()
         };
@@ -814,16 +819,116 @@ mod tests {
             },
             ..shape(2048, 1024, 3072)
         };
-        let one_wave = RegisterTiling::choose(narrow, &device(1));
+        assert!(!RegisterTiling::matrix_unit_wins(narrow, None, &device(1)));
+        let held =
+            RegisterTiling::fragment_tiling(narrow, &device(1)).expect("a declared narrowing runs");
+        assert!(matches!(held.micro, MicroTile::Fragment(_)), "{held:?}");
+        let many_waves = FragmentConfig::ANY_WAVES;
+        let tiling =
+            RegisterTiling::fragment_tiling(narrow, &device(many_waves)).expect("fragments");
         assert!(
-            matches!(one_wave.micro, MicroTile::Scalar { .. }),
-            "{one_wave:?}"
+            matches!(tiling.micro, MicroTile::Fragment(_))
+                && tiling.workgroup_lanes() > FRAGMENT_LANES,
+            "{tiling:?}"
         );
-        let many_waves = RegisterTiling::choose(narrow, &device(FragmentConfig::ANY_WAVES));
+    }
+
+    /// The matrix unit is the cheapest schedule of a prefill contraction on gfx1151, and the per-row Gemv is the
+    /// cheapest of a decode row: the Gemv's cost (`ContractionCost::gemv`, the same unit as the tilings') beats the
+    /// fragment tiling of one row, and loses to it once the launch covers enough rows to fill the device. A narrowed
+    /// shape has no scalar candidate. Mutation: drop the Gemv alternative from `matrix_unit_wins`; the one-row
+    /// contraction wins on a matrix unit and this row goes red.
+    #[test]
+    fn the_gemv_beats_a_matrix_unit_at_one_row_and_loses_at_many() {
+        let caps = poot_target::DeviceCaps {
+            matrix_units: poot_target::Queried::Known(poot_target::MatrixUnits::amd("gfx1151", 32)),
+            compute_units: poot_target::Queried::Known(40),
+            ..poot_target::DeviceCaps::rocm_default()
+        };
+        let narrow = |m| TiledShape {
+            terms: crate::precision::StagedTerms {
+                fragment: Some(FragmentDtype::F16),
+                ..crate::precision::StagedTerms::ONE
+            },
+            weight_bits: 16,
+            ..shape(m, 2048, 2048)
+        };
+        let gemv = |rows: usize| GemvShape {
+            outputs: rows * 2048,
+            width: 256,
+            cols: 4,
+        };
+        assert!(!RegisterTiling::matrix_unit_wins(
+            narrow(1),
+            Some(gemv(1)),
+            &caps
+        ));
         assert!(
-            matches!(many_waves.micro, MicroTile::Fragment(_))
-                && many_waves.workgroup_lanes() > FRAGMENT_LANES,
-            "{many_waves:?}"
+            RegisterTiling::matrix_unit_wins(narrow(1), None, &caps),
+            "the Gemv term is what keeps one row exact"
+        );
+        assert!(RegisterTiling::matrix_unit_wins(
+            narrow(2048),
+            Some(gemv(2048)),
+            &caps
+        ));
+        assert!(
+            RegisterTiling::candidates(narrow(512), &caps)
+                .all(|tiling| matches!(tiling.micro, MicroTile::Fragment(_))),
+            "a narrowed shape tiles on fragments alone"
+        );
+    }
+
+    /// The matrix unit's rate is the device's, read from its fragment config: the same fragment tiling on the same
+    /// shape issues a quarter of the multiply FMAs at rate 4 that it does at rate 1, and an unknown rate gives the
+    /// unit no credit (rate 1). The scalar tilings' terms do not move with it.
+    /// Mutation: read a constant 4 instead of `fma_rate` in `cost_terms`; the rate-1 and rate-16 rows go red.
+    #[test]
+    fn the_matrix_units_rate_discounts_the_fragment_multiply() {
+        use poot_target::{FragmentLayout, LaneMap, MatrixUnits, Queried};
+        let caps_with = |fma_rate| poot_target::DeviceCaps {
+            matrix_units: Queried::Known(MatrixUnits::of([FragmentConfig::m16n16k16(
+                FragmentDtype::Bf16,
+                FragmentLayout::Declared(LaneMap::Rdna3),
+                32,
+                FragmentConfig::ANY_WAVES,
+                fma_rate,
+            )])),
+            ..poot_target::DeviceCaps::rocm_default()
+        };
+        let narrow = TiledShape {
+            terms: crate::precision::StagedTerms {
+                fragment: Some(FragmentDtype::Bf16),
+                ..crate::precision::StagedTerms::ONE
+            },
+            ..shape(2048, 1024, 3072)
+        };
+        let fragment_fma = |rate, caps: &poot_target::DeviceCaps| {
+            let tiling = RegisterTiling::candidates(narrow, caps)
+                .find(|t| matches!(t.micro, MicroTile::Fragment(_)))
+                .expect("a fragment candidate");
+            (tiling, tiling.cost_terms(narrow, caps).fma, rate)
+        };
+        let (tiling, unknown, _) =
+            fragment_fma(Queried::<u8>::Unknown, &caps_with(Queried::Unknown));
+        let (_, one, _) = fragment_fma(Queried::Known(1), &caps_with(Queried::Known(1)));
+        let (same, four, _) = fragment_fma(Queried::Known(4), &caps_with(Queried::Known(4)));
+        let (_, sixteen, _) = fragment_fma(Queried::Known(16), &caps_with(Queried::Known(16)));
+        assert_eq!(tiling, same, "the same candidate is costed at every rate");
+        assert_eq!(unknown, one, "an unknown rate is no credit");
+        assert_eq!(four * 4.0, one);
+        assert_eq!(sixteen * 16.0, one);
+        // A narrowed read takes fragment tilings only, so the scalar tilings are the exact shape's.
+        let exact = shape(2048, 1024, 3072);
+        let scalar = |caps: &poot_target::DeviceCaps| {
+            RegisterTiling::candidates(exact, caps)
+                .find(|t| matches!(t.micro, MicroTile::Scalar { .. }))
+                .expect("a scalar candidate")
+                .cost_terms(exact, caps)
+        };
+        assert_eq!(
+            scalar(&caps_with(Queried::Known(1))),
+            scalar(&caps_with(Queried::Known(16)))
         );
     }
 

@@ -1,5 +1,5 @@
 //! The f16 range on a device under the default `Narrow` (POOT-1474,
-//! `receipts/1471-narrow-without-range-guards/design.md` section 7). A contraction or attention the policy rounds
+//! POOT-1471). A contraction or attention the policy rounds
 //! to f16 reads its operand unscaled, so a value past f16's range becomes infinity and reaches the output as a
 //! non-finite value.
 //!
@@ -17,7 +17,7 @@ use poot_graph_ir::{
 use poot_tensor::HostTensor;
 
 use crate::Fixture;
-use crate::precision::{FRAGMENT_HEADS, Heads, SMALL_HEADS, attention_fixture};
+use crate::precision::{FRAGMENT_HEADS, Heads, attention_fixture};
 
 const K: usize = 64;
 const F: usize = 96;
@@ -25,7 +25,7 @@ const F: usize = 96;
 /// The norm weight's scale that puts the normed activation past f16's range: `|h|` reaches about `1e6 x 0.25`.
 const PAST_RANGE: f32 = 1.0e6;
 
-fn block(name: &'static str, m: usize) -> Fixture {
+fn block(name: &'static str, m: usize, norm_scale: f32) -> Fixture {
     let b = Builder::for_tests();
     let x = b
         .slot_named(
@@ -74,7 +74,7 @@ fn block(name: &'static str, m: usize) -> Fixture {
         .collect();
     let store = crate::store_with(&graph, |name, data| {
         let sign = match name {
-            "norm" => PAST_RANGE,
+            "norm" => norm_scale,
             "wg" | "wu" => -1.0,
             _ => 1.0,
         };
@@ -92,25 +92,27 @@ fn block(name: &'static str, m: usize) -> Fixture {
 /// prefill whose tiles fill a matrix unit (`M = 160`).
 pub fn block_fixtures() -> Vec<Fixture> {
     vec![
-        block("f16_past_range_m5", 5),
-        block("f16_past_range_m160", 160),
+        block("f16_past_range_m5", 5, PAST_RANGE),
+        block("f16_past_range_m160", 160, PAST_RANGE),
     ]
 }
 
+/// The block at a prefill whose tiles fill a matrix unit with every activation in f16's range (the norm weight
+/// is 1): the same program as [`block_fixtures`]' with data that does not overflow.
+pub fn in_range_block_fixture() -> Fixture {
+    block("f16_in_range_m160", 160, 1.0)
+}
+
 /// The attentions of `precision::attention_fixtures`' shapes with every query row past f16's range (`|q|` up to
-/// 1e6): a decode row against a 64-key cache, a 33-row causal prefill, and a 160-row prefill of 16 heads whose rows
+/// 1e6): and a 160-row prefill of 16 heads whose rows
 /// fill a fragment attention where the device has a matrix unit.
 pub fn attention_fixtures() -> Vec<Fixture> {
-    let shapes: [(&'static str, Heads, usize, usize); 3] = [
-        ("attention_f16_past_range_decode", SMALL_HEADS, 1, 64),
-        ("attention_f16_past_range_prefill", SMALL_HEADS, 33, 33),
-        (
-            "attention_f16_past_range_fragment",
-            FRAGMENT_HEADS,
-            160,
-            160,
-        ),
-    ];
+    let shapes: [(&'static str, Heads, usize, usize); 1] = [(
+        "attention_f16_past_range_fragment",
+        FRAGMENT_HEADS,
+        160,
+        160,
+    )];
     shapes
         .into_iter()
         .map(|(name, heads, lq, lk)| {
@@ -126,8 +128,9 @@ fn assert_f16_operands(
     target: poot_graph_plan::Target,
     fixture: &Fixture,
     count: usize,
+    policy: crate::Policy,
 ) -> Result<(), String> {
-    let staged = crate::staged_under(exec, fixture, target, MatmulPrecision::Narrow);
+    let staged = crate::staged_under(exec, fixture, target, policy);
     let precisions: Vec<OperandPrecision> = staged
         .stages()
         .flat_map(|(_, _, program)| {
@@ -163,13 +166,44 @@ pub fn run_past_range(
     exec: &mut dyn poot_executor::Executor,
     target: poot_graph_plan::Target,
 ) -> Result<(), String> {
+    past_range(exec, target, MatmulPrecision::Narrow.into(), true)
+}
+
+/// [`run_past_range`] for a device whose planner leaves the policy exact (RADV: its cooperative-matrix schedules cost
+/// more than the exact ones): the narrowing is declared on the block's contractions, and on the attention's when the
+/// device has a fragment attention (`attention`, POOT-1476).
+pub fn run_past_range_declared(
+    exec: &mut dyn poot_executor::Executor,
+    target: poot_graph_plan::Target,
+    attention: bool,
+) -> Result<(), String> {
+    past_range(
+        exec,
+        target,
+        crate::Policy::declared(MatmulPrecision::Narrow),
+        attention,
+    )
+}
+
+fn past_range(
+    exec: &mut dyn poot_executor::Executor,
+    target: poot_graph_plan::Target,
+    policy: crate::Policy,
+    attention: bool,
+) -> Result<(), String> {
     let fixtures = block_fixtures()
         .into_iter()
         .map(|fixture| (fixture, 4))
-        .chain(attention_fixtures().into_iter().map(|fixture| (fixture, 1)));
+        .chain(
+            attention
+                .then(attention_fixtures)
+                .into_iter()
+                .flatten()
+                .map(|fixture| (fixture, 1)),
+        );
     for (fixture, count) in fixtures {
-        assert_f16_operands(exec, target, &fixture, count)?;
-        let outputs = crate::run_outputs_under(exec, target, &fixture, MatmulPrecision::Narrow)?;
+        assert_f16_operands(exec, target, &fixture, count, policy)?;
+        let outputs = crate::run_outputs_under(exec, target, &fixture, policy)?;
         for (step, output) in outputs.iter().enumerate() {
             let values = output
                 .to_f32()

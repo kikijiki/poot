@@ -1,5 +1,6 @@
 //! POOT-1437: the planner takes a fragment tiling for a narrowed prefill attention where the device has a matrix unit
-//! for the operands, and the scalar tiling everywhere else.
+//! for the operands. A narrowed attention has no other schedule: where no fragment tiling beats the exact register
+//! tiles the pass leaves the attention `Exact`, and a declared narrowing there is a typed refusal (POOT-1476).
 //!
 //! Every row drives the production `compile` and reads the schedule of the attention kernel request the plan holds.
 //! The choice reads the equation's operand precision, the target's matrix units and the shapes, and nothing else.
@@ -8,7 +9,10 @@ use poot_graph_ir::{
     AttentionAttrs, Builder, FragmentDtype, Graph, MatmulPrecision, OpKind, Operand,
     OperandPrecision, TensorType,
 };
-use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Program, Target, compile};
+use poot_graph_plan::{
+    Capability, CompileError, CompileLimits, CompileOptions, KernelChoice, PlanError, Program,
+    Target, compile,
+};
 use poot_kernelgen::{
     AttentionMicro, AttentionSchedule, AttentionSpec, KernelRequest, KvLane, QOperand, WaveTile,
 };
@@ -100,6 +104,39 @@ fn compiled(g: &Graph, target: &Target) -> Program {
     let options =
         CompileOptions::new(CompileLimits::STANDARD).with_matmul_precision(MatmulPrecision::Exact);
     compile(g, target, &options).expect("the graph compiles")
+}
+
+/// The capability `g` is refused for on `target` under the exact policy (so only a declared precision narrows).
+fn refused(g: &Graph, target: &Target) -> Capability {
+    refused_or_planned(g, target).expect("the graph must be refused")
+}
+
+/// The capability `g` is refused for on `target` under the exact policy, or `None` when it compiles.
+fn refused_or_planned(g: &Graph, target: &Target) -> Option<Capability> {
+    let options =
+        CompileOptions::new(CompileLimits::STANDARD).with_matmul_precision(MatmulPrecision::Exact);
+    match compile(g, target, &options) {
+        Err(CompileError::Plan(error)) => match *error {
+            PlanError::Refused(refusal) => Some(refusal.missing),
+            other => panic!("expected a typed refusal or a program, got {other:?}"),
+        },
+        Err(other) => panic!("expected a typed refusal or a program, got {other:?}"),
+        Ok(_) => None,
+    }
+}
+
+/// The precision the `narrow` policy gives the one attention of `g` on `target`.
+fn selected(g: &Graph, target: &Target) -> OperandPrecision {
+    let options =
+        CompileOptions::new(CompileLimits::STANDARD).with_matmul_precision(MatmulPrecision::Narrow);
+    let program = compile(g, target, &options).expect("the graph compiles");
+    program
+        .planned()
+        .find_map(|(eqn, _)| match &eqn.op {
+            OpKind::Attention(attrs) => Some(attrs.precision),
+            _ => None,
+        })
+        .expect("the attention equation is planned")
 }
 
 /// The attention kernel request behind the plan's one attention equation.
@@ -255,29 +292,31 @@ fn a_narrowed_prefill_attention_plans_opaque_f16_fragments_on_raw_vulkan() {
 }
 
 /// wgpu cannot widen its subgroups, so its fragment workgroup is one wave: measured on the bank's prefill attention
-/// cells that is 11.6x to 13.8x slower than the register tiles, so the planner keeps the register tiles there.
+/// cells that is 11.6x to 13.8x slower than the register tiles, so the planner has no fragment tiling there. A
+/// narrowed attention then has no schedule (the register tiles would round for no speed): the `narrow` policy leaves
+/// it `Exact`, and a declared narrowing is the typed refusal. Mutation: let `attention_tiling` fall back to the
+/// register tiles for a narrowed spec; the declared row plans scalar tiles and goes red.
 #[test]
 fn a_one_wave_fragment_workgroup_is_not_planned_where_register_tiles_run_wider() {
-    let program = compiled(
-        &attention(OperandPrecision::Narrow(FragmentDtype::F16), 64),
-        &wgpu(),
+    let declared = attention(OperandPrecision::Narrow(FragmentDtype::F16), 64);
+    assert_eq!(
+        refused(&declared, &wgpu()),
+        Capability::NoMatrixUnitSchedule
     );
-    let spec = spec_of(&program);
-    assert!(
-        matches!(
-            spec.schedule,
-            AttentionSchedule::Tiled {
-                micro: AttentionMicro::Scalar { .. },
-                ..
-            }
-        ),
-        "{:?}",
-        spec.schedule
-    );
+    let exact = attention(OperandPrecision::Exact, 64);
+    assert!(selected(&exact, &wgpu()).is_exact());
+    assert!(matches!(
+        spec_of(&compiled(&exact, &wgpu())).schedule,
+        AttentionSchedule::Tiled {
+            micro: AttentionMicro::Scalar { .. },
+            ..
+        }
+    ));
 }
 
-/// RADV has no bf16 fragment, so a bf16 declaration keeps the register tiles there; a device without a matrix unit
-/// keeps them for any narrowed dtype, and an exact attention keeps them on every device.
+/// RADV has no bf16 fragment and a device without a matrix unit has none for any dtype: a narrowed attention is
+/// refused there, the `narrow` policy leaves it `Exact`, and an exact attention keeps the register tiles on every
+/// device.
 #[test]
 fn attention_keeps_register_tiles_without_a_matrix_unit_for_its_dtype_or_when_exact() {
     for (label, target, precision) in [
@@ -291,10 +330,19 @@ fn attention_keeps_register_tiles_without_a_matrix_unit_for_its_dtype_or_when_ex
             rocm_without_units(),
             OperandPrecision::Narrow(FragmentDtype::F16),
         ),
-        ("exact rocm", rocm_wmma(), OperandPrecision::Exact),
-        ("exact wgpu", wgpu(), OperandPrecision::Exact),
     ] {
-        let spec = spec_of(&compiled(&attention(precision, 128), &target));
+        assert_eq!(
+            refused(&attention(precision, 128), &target),
+            Capability::NoMatrixUnitSchedule,
+            "{label}"
+        );
+        assert!(
+            selected(&attention(OperandPrecision::Exact, 128), &target).is_exact(),
+            "{label}"
+        );
+    }
+    for (label, target) in [("exact rocm", rocm_wmma()), ("exact wgpu", wgpu())] {
+        let spec = spec_of(&compiled(&attention(OperandPrecision::Exact, 128), &target));
         assert!(
             matches!(
                 spec.schedule,
@@ -310,27 +358,28 @@ fn attention_keeps_register_tiles_without_a_matrix_unit_for_its_dtype_or_when_ex
 }
 
 /// A head width that is not a whole number of fragment depths cannot run the score product on fragments: the
-/// narrowed attention keeps the register tiles.
+/// narrowed attention has no matrix-unit schedule, so the policy keeps it `Exact` and a declared narrowing is refused.
 #[test]
 fn a_head_width_off_the_fragment_depth_keeps_register_tiles() {
-    let spec = spec_of(&compiled(
-        &attention(OperandPrecision::Narrow(FragmentDtype::F16), 72),
-        &rocm_wmma(),
-    ));
-    assert!(
-        fragment_of(&spec).is_none(),
-        "dk 72 is not a multiple of 16: {:?}",
-        spec.schedule
+    assert_eq!(
+        refused(
+            &attention(OperandPrecision::Narrow(FragmentDtype::F16), 72),
+            &rocm_wmma()
+        ),
+        Capability::NoMatrixUnitSchedule,
+        "dk 72 is not a multiple of 16"
     );
+    assert!(selected(&attention(OperandPrecision::Exact, 72), &rocm_wmma()).is_exact());
 }
 
 /// The tiled schedule of the bank's 16-head, 8-key/value-head, 128-wide prefill on `target`: `(rows, bc, lanes, q)`
-/// of its fragment micro-tile, `None` for register tiles.
+/// of its fragment micro-tile, `None` where the device has none (the narrowed attention is then refused).
 fn bank_fragment_tiling(target: &Target) -> Option<(usize, usize, usize, QOperand)> {
-    let spec = spec_of(&compiled(
-        &attention_of(OperandPrecision::Narrow(FragmentDtype::F16), 16, 128),
-        target,
-    ));
+    let g = attention_of(OperandPrecision::Narrow(FragmentDtype::F16), 16, 128);
+    if refused_or_planned(&g, target) == Some(Capability::NoMatrixUnitSchedule) {
+        return None;
+    }
+    let spec = spec_of(&compiled(&g, target));
     match spec.schedule {
         AttentionSchedule::Tiled {
             br,
@@ -397,7 +446,7 @@ fn a_fragment_attention_holds_q_where_it_fits_the_register_file() {
 }
 
 /// A fragment tiling's register budget is the device's: where the runtime cannot tell its register file the
-/// planner holds no fragments and keeps the register tiles. Mutation: assume a 256-register lane when the file is
+/// planner holds no fragments (the narrowed attention is refused, never run on register tiles). Mutation: assume a 256-register lane when the file is
 /// `Unknown` in `attention_tiling_of`; the plan is a fragment tiling.
 #[test]
 fn an_unknown_register_file_plans_no_fragments() {

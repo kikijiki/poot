@@ -47,6 +47,7 @@ pub mod live_attention;
 pub mod lora;
 pub mod packed;
 pub mod precision;
+pub mod range_check;
 pub mod reference_blocks;
 pub mod routing;
 pub mod row_scale;
@@ -78,6 +79,7 @@ use poot_tensor::{DType, HostTensor};
 
 /// One parity fixture: a graph, the weight store it binds, and the input values for its first few
 /// steps (enough to exercise the record-then-replay boundary at least twice).
+#[derive(Clone)]
 pub struct Fixture {
     /// Fixture name, used in assertion messages and to pick a row out of a table.
     pub name: &'static str,
@@ -581,10 +583,15 @@ pub fn staged_on(exec: &dyn Executor, fixture: &Fixture, target: Target) -> Stag
 /// of a device whose default is f16).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
-    /// The driver's `--matmul-precision`.
+    /// The driver's `--matmul-precision`, or the precision to declare when [`Policy::declared`].
     pub precision: MatmulPrecision,
     /// The one fragment dtype the pass may narrow to; `None` leaves the choice to the pass.
     pub fragment_only: Option<poot_graph_ir::FragmentDtype>,
+    /// Narrow every contraction and attention the dtype rule admits, whether or not a matrix unit wins
+    /// (`CompileOptions::declare_precision`, POOT-1476). The planner's cost model leaves an op exact where a matrix unit does not win (RADV, a decode
+    /// row), so a row that must run a narrowed schedule on such a device declares it: the planner holds the declared
+    /// op to a matrix unit and refuses it by name where the device has none.
+    pub declared: bool,
 }
 
 impl From<MatmulPrecision> for Policy {
@@ -592,11 +599,21 @@ impl From<MatmulPrecision> for Policy {
         Self {
             precision,
             fragment_only: None,
+            declared: false,
         }
     }
 }
 
 impl Policy {
+    /// The policy that declares `precision` on every contraction and attention of a fixture, whatever the planner's
+    /// cost model would pick.
+    pub fn declared(precision: MatmulPrecision) -> Self {
+        Self {
+            declared: true,
+            ..precision.into()
+        }
+    }
+
     /// `target` as the precision pass sees it under this policy: its matrix units cut down to `fragment_only`. What
     /// the oracle of the declared semantics reads ([`poot_graph_plan::with_operand_precision`]), so it declares the
     /// precision the compiled program narrows to.
@@ -624,17 +641,37 @@ pub fn staged_under(
     target: Target,
     policy: impl Into<Policy>,
 ) -> StagedProgram {
+    try_staged_under(exec, fixture, target, policy).unwrap_or_else(|error| panic!("{error}"))
+}
+
+/// [`staged_under`] returning the compile error (its debug text, which names the refusal), for a row that expects
+/// the planner's typed refusal.
+pub fn try_staged_under(
+    exec: &dyn Executor,
+    fixture: &Fixture,
+    target: Target,
+    policy: impl Into<Policy>,
+) -> Result<StagedProgram, String> {
     let policy = policy.into();
     let options = CompileOptions {
         fragment_only: policy.fragment_only,
+        declare_precision: policy.declared,
         ..exec
             .compile_options(poot_graph_plan::CompileLimits::STANDARD)
             .with_matmul_precision(policy.precision)
     };
-    compile_fixture(fixture, target, &options)
+    try_compile_fixture(fixture, target, &options)
 }
 
 fn compile_fixture(fixture: &Fixture, target: Target, options: &CompileOptions) -> StagedProgram {
+    try_compile_fixture(fixture, target, options).unwrap_or_else(|error| panic!("{error}"))
+}
+
+pub(crate) fn try_compile_fixture(
+    fixture: &Fixture,
+    target: Target,
+    options: &CompileOptions,
+) -> Result<StagedProgram, String> {
     let g = bound(fixture).0;
     compile_staged(
         &g,
@@ -645,7 +682,7 @@ fn compile_fixture(fixture: &Fixture, target: Target, options: &CompileOptions) 
         },
         options,
     )
-    .unwrap()
+    .map_err(|error| format!("{error:?}"))
 }
 
 /// `oracle` is called once per device step, in the exact order `run_parity` steps the device
@@ -932,8 +969,9 @@ pub fn run_outputs_under(
     exec: &mut dyn Executor,
     target: Target,
     fixture: &Fixture,
-    policy: MatmulPrecision,
+    policy: impl Into<Policy>,
 ) -> Result<Vec<HostTensor>, String> {
+    let policy = policy.into();
     let exe = exec
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;

@@ -39,6 +39,7 @@ mod operand_precision;
 mod packed;
 mod packed_bind;
 mod pool;
+mod range_check;
 mod routed_experts;
 mod selection;
 mod sharding;
@@ -99,9 +100,9 @@ pub use iota::fold_iota;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) use iota::fold_iota;
 pub(crate) use narrow_storage::store_narrowed_activations;
-#[cfg(any(test, feature = "test-support"))]
-pub use operand_precision::with_operand_precision;
 pub(crate) use operand_precision::{FragmentUnits, select_operand_precision};
+#[cfg(any(test, feature = "test-support"))]
+pub use operand_precision::{declare_operand_precision, with_operand_precision};
 pub use packed::PackedDequantErrorContext;
 pub use packed::PackedDequantProductionError;
 pub use packed::recognize_packed_contractions;
@@ -115,6 +116,7 @@ pub(crate) use pool::pool_experts;
 pub use pool::{
     EXPERT_POOL, EXPERT_POOL_MAP, PoolError, PoolSite, PoolSpec, PooledWeight, routed_step_demand,
 };
+pub(crate) use range_check::check_f16_ranges;
 #[cfg(any(test, feature = "test-support"))]
 pub use routed_experts::{RoutedExpertSite, routed_expert_sites};
 pub(crate) use selection::form_selection;

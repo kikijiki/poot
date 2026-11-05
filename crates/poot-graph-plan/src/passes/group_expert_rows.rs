@@ -1,4 +1,4 @@
-//! `group_expert_rows` (POOT-1451, `receipts/1451-moe-block-aligned-grouping/design.md`): the rows of every indexed
+//! `group_expert_rows` (POOT-1451): the rows of every indexed
 //! contraction the planner tiles are grouped by expert, block-aligned, so every tile of the contraction is one
 //! expert's rows and runs one `K` loop on the matrix units.
 //!

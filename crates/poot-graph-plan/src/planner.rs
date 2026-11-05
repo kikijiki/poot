@@ -40,6 +40,7 @@ use poot_graph_ir::op::OpKind;
 use poot_graph_ir::op::RedOp;
 use poot_graph_ir::op::RowStep;
 use poot_graph_ir::op::UnOp as GUnOp;
+use poot_graph_ir::{ContractionRows, ExpertRows};
 use poot_kernel_ir::BinOp;
 use poot_kernel_ir::Ty;
 use poot_kernelgen as kg;
@@ -463,6 +464,58 @@ pub(crate) fn plan_eqn_compiled(
     output: OutputBuffer,
 ) -> Result<Planned, PlanError> {
     plan_eqn_policy(g, eqn, target, views, limits, npu, output, true)
+}
+
+/// Whether `select_operand_precision` narrows `eqn`, an op that reads its operands narrowed or split (POOT-1476): the
+/// planner can run it on a matrix unit (`plan_eqn_compiled` succeeds, and it plans a narrowed op only on one, a
+/// GEMV, a scalar tiling or a streaming attention being a typed refusal) and, for a contraction, a matrix unit is
+/// the cheapest schedule by the one `ContractionCost` model (the fragment tiling against the exact scalar tiling and
+/// the exact Gemv). The pass and the final plan answer the first part with the same planning, so they cannot disagree.
+///
+/// A per-row indexed contraction past the Gemv rows is the one op the planner refuses before its rows are grouped by
+/// expert (`group_expert_rows`, which runs after the precision is selected): its grouped shape is asked of the cost
+/// model directly, as the grouping will plan it.
+pub(crate) fn runs_on_matrix_unit(
+    g: &Graph,
+    eqn: &Eqn,
+    target: &Target,
+    views: &HashMap<ValueId, Layout>,
+    limits: &BodyLimits,
+    npu: Option<&dyn NpuLowering>,
+) -> bool {
+    let Target::Gpu { backend, caps } = target else {
+        return false;
+    };
+    let grouped = match &eqn.op {
+        OpKind::IndexedMatMul {
+            rows: ExpertRows::PerRow,
+            ..
+        } => Some(grouping_candidate(g, eqn, views, caps)),
+        OpKind::PackedContraction {
+            rows:
+                ContractionRows::Indexed {
+                    rows: ExpertRows::PerRow,
+                    ..
+                },
+            ..
+        } => Some(packed_grouping_candidate(g, eqn, *backend, caps, *limits)),
+        _ => None,
+    };
+    if let Some(shape) = grouped {
+        return shape.is_some_and(|shape| {
+            poot_kernelgen::RegisterTiling::matrix_unit_wins(shape, None, caps)
+        });
+    }
+    if plan_eqn_compiled(g, eqn, target, views, limits, npu, OutputBuffer::Fresh).is_err() {
+        return false;
+    }
+    let tables = GraphTables::from(g);
+    let shapes = packed::dense_cost_shapes(tables, eqn, caps)
+        .or_else(|| packed_dequant::packed_cost_shapes(tables, eqn, *backend, caps, *limits))
+        .or_else(|| matmul::matmul_cost_shape(g, eqn, caps).map(|shape| (shape, None)));
+    shapes.is_none_or(|(tiled, gemv)| {
+        poot_kernelgen::RegisterTiling::matrix_unit_wins(tiled, gemv, caps)
+    })
 }
 
 /// Whether `op` can read a BF16 const operand through a packed lane: the `Cast` kernel, and the fused regions

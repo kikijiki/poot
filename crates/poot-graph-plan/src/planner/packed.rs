@@ -46,6 +46,66 @@ fn is_dense_contraction(op: &OpKind) -> bool {
     )
 }
 
+/// The tiled shape of a dense contraction of `m` activation rows against an `[n, k]` weight held in `weight`, read as
+/// `precision` says with the activation stored as `activation_stored`: what the planner tiles and what the cost model
+/// ranks when the pass asks whether a matrix unit wins.
+fn dense_tiled_shape(
+    precision: OperandPrecision,
+    activation_stored: Option<FragmentDtype>,
+    weight: poot_target::BufferStorage,
+    (m, k, n): (usize, usize, usize),
+) -> kg::TiledShape {
+    kg::TiledShape {
+        blocks: 1,
+        m_per_block: m,
+        out_per_block: n,
+        k,
+        layout: WeightLayout::Nk,
+        rows: poot_kernelgen::TiledRows::Dense,
+        terms: kg::StagedTerms::of(
+            precision,
+            activation_stored,
+            kg::stored_fragment_dtype(weight),
+        ),
+        weight_bits: kg::dense_value_bits(weight),
+        activation_bits: kg::activation_bits(activation_stored),
+    }
+}
+
+/// The shapes the cost model ranks for a dense contraction `eqn` read as it declares: the tiled shape it runs at
+/// `M > 1` and, at `M == 1`, the exact Gemv it would otherwise run (POOT-1476). `None` for any other op.
+pub(super) fn dense_cost_shapes(
+    g: GraphTables<'_>,
+    eqn: &Eqn,
+    caps: &DeviceCaps,
+) -> Option<(kg::TiledShape, Option<kg::GemvShape>)> {
+    let dtype = eqn.op.dense_weight()?;
+    let kind = match dtype {
+        DType::BF16 => StorageKind::Bf16Packed,
+        dtype => dense_contraction_weight_storage(dtype)?,
+    };
+    let weight = ValueStorage::new(kind).buffer_storage();
+    let precision = eqn.op.operand_precision().unwrap_or_default();
+    let out_shape = &g.aval(eqn.out).shape;
+    let out_numel: usize = out_shape.iter().product();
+    let ids = value_ids(eqn);
+    let k = g.aval(ids[1]).shape[1];
+    if let OpKind::GroupedDenseContraction { groups, .. } = eqn.op {
+        return Some((
+            kg::TiledShape {
+                blocks: groups,
+                ..dense_tiled_shape(precision, None, weight, (out_shape[1], k, out_shape[2]))
+            },
+            None,
+        ));
+    }
+    let n = *out_shape.last()?;
+    let tiled = dense_tiled_shape(precision, None, weight, (out_numel / n.max(1), k, n));
+    let gemv = dense_decode_gemv_in(eqn, out_shape, out_numel, caps)
+        .map(|launch| launch.cost_shape(out_numel));
+    Some((tiled, gemv))
+}
+
 /// Plan one packed-reader equation (DenseContraction/DenseRowGather).
 #[expect(clippy::too_many_arguments)]
 pub(super) fn plan(
@@ -76,13 +136,6 @@ pub(super) fn plan(
             _ => None,
         },
         _ => None,
-    };
-    let terms = |weight: poot_target::BufferStorage| {
-        kg::StagedTerms::of(
-            precision,
-            activation_stored,
-            kg::stored_fragment_dtype(weight),
-        )
     };
     let mut planned = match &eqn.op {
         // Card 645: the contraction over a weight in checkpoint `[N, K]` order, so a family written against the
@@ -122,7 +175,16 @@ pub(super) fn plan(
             let r = out_shape.len();
             let n = out_shape[r - 1];
             let k = shape(ids[1])[1];
-            if let Some(launch) = dense_decode_gemv_in(eqn, out_shape, out_numel, caps) {
+            let tiled = dense_tiled_shape(
+                precision,
+                activation_stored,
+                weight,
+                (out_numel / n.max(1), k, n),
+            );
+            // A narrowed read never takes the Gemv: it runs on a matrix unit or is refused (POOT-1476).
+            let gemv = dense_decode_gemv_in(eqn, out_shape, out_numel, caps)
+                .filter(|_| precision.is_exact());
+            if let Some(launch) = gemv {
                 if activation_stored.is_some() {
                     return Err(site.refuse(Capability::DtypeLowering));
                 }
@@ -132,17 +194,7 @@ pub(super) fn plan(
                 matmul::dense_tiled_plan(
                     site,
                     backend,
-                    kg::TiledShape {
-                        blocks: 1,
-                        m_per_block: out_numel / n.max(1),
-                        out_per_block: n,
-                        k,
-                        layout: WeightLayout::Nk,
-                        rows: poot_kernelgen::TiledRows::Dense,
-                        terms: terms(weight),
-                        weight_bits: kg::dense_value_bits(weight),
-                        activation_bits: kg::activation_bits(activation_stored),
-                    },
+                    tiled,
                     kg::DenseTiledWeight::Nk(weight),
                     None,
                     precision,
@@ -164,7 +216,17 @@ pub(super) fn plan(
                     .ok_or_else(|| site.refuse(Capability::DtypeLowering))?,
             };
             let weight = ValueStorage::new(storage).buffer_storage();
-            let gemv = dense_decode_gemv_in(eqn, out_shape, out_numel, caps);
+            let k = shape(ids[1])[1];
+            let n = out_shape[out_shape.len() - 1];
+            let tiled = dense_tiled_shape(
+                precision,
+                activation_stored,
+                weight,
+                (out_numel / n.max(1), k, n),
+            );
+            // A narrowed read never takes the Gemv: it runs on a matrix unit or is refused (POOT-1476).
+            let gemv = dense_decode_gemv_in(eqn, out_shape, out_numel, caps)
+                .filter(|_| precision.is_exact());
             let epilogue = matmul::epilogue_of(
                 site,
                 g,
@@ -177,8 +239,6 @@ pub(super) fn plan(
                 // The tiled body stores a narrowed output into a buffer of native two-byte elements.
                 gemv.is_none() && caps.native_two_byte_floats,
             )?;
-            let k = shape(ids[1])[1];
-            let n = out_shape[out_shape.len() - 1];
             if let Some(launch) = gemv {
                 if activation_stored.is_some() {
                     return Err(site.refuse(Capability::DtypeLowering));
@@ -199,17 +259,7 @@ pub(super) fn plan(
                 matmul::dense_tiled_plan(
                     site,
                     backend,
-                    kg::TiledShape {
-                        blocks: 1,
-                        m_per_block: out_numel / n.max(1),
-                        out_per_block: n,
-                        k,
-                        layout: WeightLayout::Nk,
-                        rows: poot_kernelgen::TiledRows::Dense,
-                        terms: terms(weight),
-                        weight_bits: kg::dense_value_bits(weight),
-                        activation_bits: kg::activation_bits(activation_stored),
-                    },
+                    tiled,
                     kg::DenseTiledWeight::Nk(weight),
                     Some(epilogue),
                     precision,
@@ -238,14 +288,12 @@ pub(super) fn plan(
                 backend,
                 kg::TiledShape {
                     blocks: *groups,
-                    m_per_block: out_shape[1],
-                    out_per_block: out_shape[2],
-                    k,
-                    layout: WeightLayout::Nk,
-                    rows: poot_kernelgen::TiledRows::Dense,
-                    terms: terms(weight),
-                    weight_bits: kg::dense_value_bits(weight),
-                    activation_bits: kg::activation_bits(activation_stored),
+                    ..dense_tiled_shape(
+                        precision,
+                        activation_stored,
+                        weight,
+                        (out_shape[1], k, out_shape[2]),
+                    )
                 },
                 kg::DenseTiledWeight::Nk(weight),
                 None,

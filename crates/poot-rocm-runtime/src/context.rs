@@ -775,8 +775,11 @@ mod caps_tests {
         assert_eq!(caps.max_grid, [11, 22, 33]);
         assert_eq!(
             caps.register_file,
-            Queried::Unknown,
-            "a wave64 CDNA part's file is not recorded"
+            Queried::Known(poot_target::RegisterFile {
+                per_lane: 256,
+                per_workgroup: 131_072,
+            }),
+            "a wave64 CDNA compute unit: four SIMDs of 512 registers over 64 lanes"
         );
     }
 

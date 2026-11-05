@@ -240,6 +240,10 @@ impl Context {
             adapter_info.backend,
             device.features(),
             &adapter.cooperative_matrix_properties(),
+            poot_target::calibration::vulkan_matrix_fma_rate(
+                adapter_info.vendor,
+                &adapter_info.name,
+            ),
         );
         // Card 653: wgpu has no compute-unit query, so read AMD's own Vulkan
         // shader-core properties through the wgpu-hal adapter where the driver exposes them; any other
@@ -432,6 +436,7 @@ fn granted_matrix_units(
     backend: wgpu::Backend,
     granted: wgpu::Features,
     properties: &[wgpu::CooperativeMatrixProperties],
+    fma_rate: poot_target::Queried<u8>,
 ) -> poot_target::Queried<poot_target::MatrixUnits> {
     if backend != wgpu::Backend::Vulkan {
         return poot_target::Queried::Unknown;
@@ -439,7 +444,7 @@ fn granted_matrix_units(
     if !granted.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
         return poot_target::Queried::Known(poot_target::MatrixUnits::NONE);
     }
-    poot_target::Queried::Known(cooperative_matrix_units(properties))
+    poot_target::Queried::Known(cooperative_matrix_units(properties, fma_rate))
 }
 
 /// Lanes per cooperative-matrix fragment: every fragment kernel the code generator emits fixes 32.
@@ -453,6 +458,7 @@ const COOPMAT_WORKGROUP_SUBGROUPS: u32 = 1;
 /// The units of a device's reported cooperative-matrix properties (the same data raw Vulkan reads).
 fn cooperative_matrix_units(
     properties: &[wgpu::CooperativeMatrixProperties],
+    fma_rate: poot_target::Queried<u8>,
 ) -> poot_target::MatrixUnits {
     poot_target::MatrixUnits::cooperative_matrix(
         properties
@@ -468,6 +474,7 @@ fn cooperative_matrix_units(
             }),
         COOPMAT_SUBGROUP_SIZE,
         COOPMAT_WORKGROUP_SUBGROUPS,
+        fma_rate,
     )
 }
 
@@ -561,6 +568,7 @@ mod matrix_units_tests {
             wgpu::Backend::Vulkan,
             wgpu::Features::PASSTHROUGH_SHADERS,
             &props,
+            poot_target::Queried::Unknown,
         );
         assert_eq!(
             ungranted,
@@ -570,6 +578,7 @@ mod matrix_units_tests {
             wgpu::Backend::Vulkan,
             wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
             &props,
+            poot_target::Queried::Unknown,
         );
         assert_ne!(ungranted, granted);
     }
@@ -581,6 +590,7 @@ mod matrix_units_tests {
                 wgpu::Backend::Metal,
                 wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
                 &[f16_16x16x16()],
+                poot_target::Queried::Unknown,
             ),
             poot_target::Queried::Unknown
         );

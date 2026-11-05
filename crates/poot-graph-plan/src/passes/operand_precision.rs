@@ -1,14 +1,16 @@
 //! `select_operand_precision` (POOT-1430): the one pass that writes a non-exact [`OperandPrecision`].
 //!
-//! The pass reads three things and nothing else: the driver's [`MatmulPrecision`] policy, the float dtypes the
-//! target's matrix units take ([`FragmentUnits`]), and the dtypes of the op's operands. It never reads a model, a
-//! shape, a benchmark or an environment variable. The policy is a permission: a target with no matrix unit for the
-//! op's operands leaves the op `Exact` under any policy, because narrowing there would lose accuracy for no speed.
-//! What the planner then makes of a narrowed op (a fragment micro-tile, a scalar micro-tile, a GEMV) is the
-//! planner's business; every schedule computes the same declared rounding.
+//! The pass reads the driver's [`MatmulPrecision`] policy, the float dtypes the target's matrix units take
+//! ([`FragmentUnits`]), the dtypes of the op's operands, and one question it puts to the planner: does the op run on
+//! a matrix unit when it reads its operands narrowed? The policy is a permission, not an obligation: an op narrows
+//! only where a matrix-unit schedule is the cheapest one the planner has (POOT-1476, design 5.2). A decode GEMV, a
+//! scalar tiling or a streaming attention rounds for no speed, so it stays `Exact` under any policy. The criterion is a
+//! property of the schedule, the caps and the planner's cost model, never of a shape, a model, a benchmark or an
+//! environment variable. The planner holds to it: it plans a narrowed op only on a matrix unit and refuses
+//! otherwise, so a program never reverts silently to the exact schedule.
 //!
 //! No operand is range-scaled: a value past f16's range rounds to infinity and reaches the logits as a non-finite
-//! value, which serving refuses with a typed error (`receipts/1471-narrow-without-range-guards/design.md`).
+//! value, which serving refuses with a typed error (POOT-1471).
 
 use poot_graph_ir::graph::{EditError, Eqn, Graph, Operand};
 use poot_graph_ir::op::{ContractionHead, OpKind};
@@ -20,7 +22,11 @@ use super::weight_format::{store_weights_f16, weights_are_f16};
 #[cfg(any(test, feature = "test-support"))]
 use crate::Target;
 #[cfg(any(test, feature = "test-support"))]
+use crate::compile::CompileLimits;
+#[cfg(any(test, feature = "test-support"))]
 use crate::dtype_widen::{fold_dense_bf16_row_gathers, fold_dense_contractions};
+#[cfg(any(test, feature = "test-support"))]
+use crate::predicates::compute_views;
 use poot_tensor::DType;
 
 /// The matrix units a target reports (`DeviceCaps::matrix_units`), as the pass reads them: it takes a fragment
@@ -63,26 +69,65 @@ pub fn with_operand_precision(
     match target {
         Target::Gpu { caps, .. } => {
             let units = FragmentUnits::of(caps);
-            // The weight format is a property of the folded graph (`compile` converts the weights the folds
-            // expose as dense readers), so the oracle's graph folds them the same way before it converts.
-            if weights_are_f16(policy, units) {
-                let folded = fold_dense_bf16_row_gathers(&fold_dense_contractions(g)?)?;
-                select_operand_precision(&store_weights_f16(&folded)?, policy, units)
+            // The planner's answer and the weight format are properties of the folded graph (`compile` selects the
+            // precision after the folds expose the dense readers), so the oracle's graph folds them the same way first.
+            let folded = exposed_readers(g)?;
+            let graph = if weights_are_f16(policy, units) {
+                store_weights_f16(&folded)?
             } else {
-                select_operand_precision(g, policy, units)
-            }
+                folded
+            };
+            let limits = CompileLimits::STANDARD.body();
+            let views = compute_views(&graph, target.id());
+            select_operand_precision(&graph, policy, units, |graph, eqn| {
+                crate::planner::runs_on_matrix_unit(graph, eqn, target, &views, &limits, None)
+            })
         }
         Target::Npu(_) => Ok(g.clone()),
     }
 }
 
-/// `g` with every contraction and attention equation reading its operands as `policy` says, where `units` admit
-/// it. The policy `Exact` returns `g` unchanged. No operand is scaled: a value past f16's range rounds to
-/// infinity and the step's logits are refused (`receipts/1471-narrow-without-range-guards/design.md` section 4).
+/// `g` with the readers `compile` exposes before it selects a precision: the packed contractions and row gathers its
+/// recognizers form, and the dense contractions and bf16 row gathers its folds form. The ids of the values that
+/// survive are `g`'s, so a CPU oracle keeps binding the fixture's inputs.
+#[cfg(any(test, feature = "test-support"))]
+fn exposed_readers(g: &Graph) -> Result<Graph, EditError> {
+    let packed = crate::passes::recognize_packed_row_gathers(
+        &crate::passes::recognize_packed_contractions(g)?,
+    )?;
+    fold_dense_bf16_row_gathers(&fold_dense_contractions(&packed)?)
+}
+
+/// [`with_operand_precision`] for a program compiled with `CompileOptions::declare_precision` (POOT-1476): the
+/// graph that declares the precision `policy` gives every contraction and attention the dtype rule admits, whether
+/// or not a matrix unit wins, over the same exposed readers `compile` selects on. The oracle of such a program
+/// evaluates it.
+#[cfg(any(test, feature = "test-support"))]
+pub fn declare_operand_precision(
+    g: &Graph,
+    target: &Target,
+    policy: MatmulPrecision,
+) -> Result<Graph, EditError> {
+    match target {
+        Target::Gpu { caps, .. } => {
+            // The folds that expose the dense readers run first, as in `compile`: a declared precision on a raw
+            // matmul over a transposed checkpoint weight would keep the fold from forming the dense contraction.
+            let folded = exposed_readers(g)?;
+            select_operand_precision(&folded, policy, FragmentUnits::of(caps), |_, _| true)
+        }
+        Target::Npu(_) => Ok(g.clone()),
+    }
+}
+
+/// `g` with every contraction and attention equation reading its operands as `policy` says, where `units` admit it
+/// and `on_matrix_unit` (the planner's answer for the equation read narrowed) says a matrix unit runs it. The policy
+/// `Exact` returns `g` unchanged. No operand is scaled: a value past f16's range rounds to infinity and the step's
+/// logits are refused (POOT-1471).
 pub(crate) fn select_operand_precision(
     g: &Graph,
     policy: MatmulPrecision,
     units: FragmentUnits,
+    on_matrix_unit: impl Fn(&Graph, &Eqn) -> bool,
 ) -> Result<Graph, EditError> {
     if policy == MatmulPrecision::Exact {
         return Ok(g.clone());
@@ -94,9 +139,16 @@ pub(crate) fn select_operand_precision(
         if eqn.op.operand_precision() == Some(OperandPrecision::Exact)
             && let Some(dtype) = fragment_dtype(g, &eqn, units)
         {
-            eqn.op = eqn
+            let narrowed = eqn
                 .op
                 .with_operand_precision(policy.operand_precision(dtype));
+            let probe = Eqn {
+                op: narrowed.clone(),
+                ..eqn.clone()
+            };
+            if on_matrix_unit(g, &probe) {
+                eqn.op = narrowed;
+            }
         }
         eqns.push(eqn);
     }
@@ -108,8 +160,8 @@ pub(crate) fn select_operand_precision(
 ///
 /// Every contraction and attention takes f16 where the target has an f16 fragment, else bf16, whatever its operand
 /// dtypes: f16 has three more mantissa bits than bf16 (24-41x lower mean KL,
-/// `receipts/1454-narrow-dtype-policy/design.md` section 1) and costs at most 3% of TTFT and TPOT over bf16 on ROCm
-/// (`receipts/1458-f16-rounding/design.md` section 6). An operand stored as f16 forces f16 (rounding it to bf16
+/// POOT-1454) and costs at most 3% of TTFT and TPOT over bf16 on ROCm
+/// (POOT-1458). An operand stored as f16 forces f16 (rounding it to bf16
 /// would lose bits it holds). An operand past f16's range becomes infinity; nothing scales it.
 fn fragment_dtype(g: &Graph, eqn: &Eqn, units: FragmentUnits) -> Option<FragmentDtype> {
     use FragmentDtype::{Bf16, F16};

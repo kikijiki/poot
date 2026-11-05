@@ -76,7 +76,7 @@ test: test-model-free
 
 # the model-free gate: dead-pub and unused-dependency checks, docs-path references, the inventory and lane self-tests, device-probe
 # self-test, then every model-free test and doctest
-test-model-free: gate-check dead-pub machete docs-paths variant-coverage mutation-sample-report diagrams-check aie-link-driver npu-build vpu-build crates-stale-names merge-lost-lines-check cargo-freshness wgpu-hal-patch crates-standalone test-model-free-inventory test-lane-coverage test-bench-runner test-bench-harness
+test-model-free: gate-check dead-pub machete docs-paths receipts-guard variant-coverage mutation-sample-report diagrams-check aie-link-driver npu-build vpu-build crates-stale-names merge-lost-lines-check cargo-freshness wgpu-hal-patch crates-standalone test-model-free-inventory test-lane-coverage test-bench-runner test-bench-harness
     scripts/with-required-backend.sh --self-test
     scripts/test-model-free.sh run
 
@@ -151,6 +151,11 @@ diagrams-check:
 docs-paths:
     scripts/check-docs-paths.py --self-test
     scripts/check-docs-paths.py
+
+# fail when a tracked path sits under the top-level `receipts/`: per-card receipts live in Backstage, never in this repo
+receipts-guard:
+    scripts/check-no-receipts.py --self-test
+    scripts/check-no-receipts.py
 
 # every variant of the registered error and refusal enums names a covering test in scripts/variant-coverage.tsv (or is a
 # listed gap), and each listed test still exists and still names its variant (POOT-1221)
@@ -252,6 +257,11 @@ test-plan-summary-regen:
 # `git diff` of the file and lists every changed row in its landing note
 test-launch-census-regen:
     POOT_LAUNCH_CENSUS_REGEN=1 cargo nextest run -p poot-models --test launch_census the_launch_census_matches_the_checked_in_file
+
+# fit the register-tiled contraction cost model's ratios to this box's measured device time and write a
+# PerfCalibration cost entry for review (POOT-1479 section 3.4); `backend` is rocm or wgpu. Takes the GPU lock.
+calibrate-launch backend out='':
+    scripts/calibrate-launch {{backend}} {{out}}
 
 # rewrite the generated region of website/docs/develop/supported-models.md from what `compile` says about every
 # registered family's fixture graphs and every weight format on each reference target. The supported_models test
@@ -534,7 +544,7 @@ test-device-ptx:
 # The same lane on a rented RunPod SECURE-cloud NVIDIA pod, for a machine with no NVIDIA GPU: builds the archive here,
 # ships it with the toolchain, runs the lane, the staged kernels' `ptx-check` and the required-case gate. Needs
 # RUNPOD_API_KEY; `args` are `--bank-case ID` (repeatable) to also run performance-bank cells on the pod, `--passes N`.
-# See receipts/1453-ptx-pod/README.md. Heavy build: hold /tmp/poot-heavy.lock.
+# See Backstage projects/poot/receipts/1453-ptx-pod/README.md. Heavy build: hold /tmp/poot-heavy.lock.
 test-device-ptx-pod *args:
     scripts/ptx-pod-lane {{args}}
 

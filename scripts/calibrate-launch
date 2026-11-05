@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# calibrate-launch: fit the register-tiled contraction cost model's ratios to this device's measured time and write
+# a PerfCalibration cost entry for review (design POOT-1479 section 3.4). One process per shape (an HSA executor
+# cannot be reopened in a process); the whole batch holds the GPU lock and the heavy lock once, GPU lock first.
+#
+#   scripts/calibrate-launch rocm|wgpu [out-dir]
+set -euo pipefail
+backend="${1:?usage: calibrate-launch rocm|wgpu [out-dir]}"
+out="${2:-calibrate-launch-$backend}"
+mkdir -p "$out"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+bank="$root/benchmarks/performance-bank/cases.json"
+cargo build --release -p "poot-$backend-device" --example calibrate_launch
+bin="${CARGO_TARGET_DIR:-$root/target}/release/examples/calibrate_launch"
+device="${POOT_BANK_DEVICE:-$backend}"
+rows="$out/rows.tsv"
+: >"$rows"
+exec 9>/tmp/poot-gpu.lock
+flock 9
+exec 8>/tmp/poot-heavy.lock
+flock 8
+for shape in $("$bin" shapes); do
+  "$bin" measure --bank "$bank" --shape "$shape" >>"$rows"
+done
+"$bin" fit --rows "$rows" --out "$out/entry.rs" --device "$device"

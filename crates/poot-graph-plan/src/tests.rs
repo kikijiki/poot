@@ -5,8 +5,8 @@ use crate::dtype_widen::{bf16_const_feeds_only_packed_readers, widen_mismatched_
 use crate::graph_validation::ValidationPacketSource;
 use crate::planner::{Planned, fty_ty};
 use crate::predicates::{
-    DenseGemvLaunch, ELEMENTWISE_2D_WIDTH, GEMV_WIDTH, GraphTables, dense_decode_gemv_in,
-    dense_gemv_launch, is_elementwise_2d_in,
+    ELEMENTWISE_2D_WIDTH, GemvFamily, GemvLaunch, GraphTables, dense_decode_gemv_in, gemv_launch,
+    is_elementwise_2d_in, lds_gemv_width,
 };
 use crate::refusal::RefusalDtypes;
 use crate::types::{DispatchPlanError, Launch, ScratchDecl};
@@ -21,7 +21,7 @@ use poot_kernelgen::{
     KernelRequest, LeafTy, PointwiseForm, PointwiseSpec, Schedule,
 };
 use poot_target::{
-    AmdArch, Backend, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps, TargetId, WatchdogBudget,
+    AmdArch, Backend, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps, Queried, TargetId, WatchdogBudget,
 };
 use poot_tensor::DType as GDt;
 use poot_test_util::device_caps::default_caps_for;
@@ -1030,15 +1030,6 @@ fn plan_eqn_derives_shape_from_the_graph_not_a_caller_argument() {
     // 4*8 = 32 elements, one thread each (well under the elementwise-2D fold's threshold): the grid
     // must reflect the graph's real output shape, which plan_eqn can no longer be told to ignore.
     assert_eq!(grid, [32, 1, 1]);
-}
-
-/// The wgpu RDNA3 iGPU as a compile target: SPIR-V with the f16 cooperative matrix, so a narrow policy gives it f16
-/// operands.
-pub(crate) fn wgpu_rdna3_target() -> Target {
-    Target::Gpu {
-        backend: Backend::SpirvVulkan,
-        caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
-    }
 }
 
 /// The typed refusal a planning result carries; any other outcome fails the test with `what`.
@@ -2644,7 +2635,7 @@ fn attention_rank4_matmul_routes_through_batched_tiled_gemm() {
 #[test]
 fn decode_attn_scores_v_matmul_lowers_to_the_lds_gemv_kernel() {
     // Card 143 Lever 1b: decode `scores @ V` (M=1, Hq rows already GQA-repeat_kv-expanded on both
-    // operands, cap=300 not a multiple of GEMV_WIDTH=128) takes the LDS-parallel attn-scores-v GEMV on
+    // operands, cap=300 not a multiple of the LDS Gemv width 128) takes the LDS-parallel attn-scores-v GEMV on
     // every backend that lowers WorkgroupLocalWrite/Barrier, like is_decode_gemv's M=1 gate.
     let bld = Builder::for_tests();
     let probs = bld
@@ -3667,32 +3658,6 @@ struct Provenance {
 /// device (`gfx1151`, wgpu/RADV unless noted) says so; one that is a structural limit says that instead.
 const LAUNCH_PROVENANCE: &[Provenance] = &[
     prov(
-        "GEMV_WIDTH",
-        128,
-        "measured: Qwen2.5-0.5B decode on RADV STRIX_HALO, fused ms/tok w=32 50.9, w=64 53.7, w=128 39.8, w=256 45.6",
-    ),
-    prov(
-        "DENSE_GEMV_WIDTH",
-        256,
-        "card 727: sweep on gfx1151 over the qwen2.5-0.5b BF16 decode shapes",
-    ),
-    prov("DENSE_GEMV_UNROLL", 4, "card 727: same sweep"),
-    prov(
-        "DENSE_GEMV_WIDE_COLS",
-        4,
-        "card 727: wgpu Gemv device time per token cols 64 7.1 ms, 32 6.0, 16 5.3, 8 4.9, 4 4.7; ROCm decode 78-81 tok/s from cols 16 to 2",
-    ),
-    prov(
-        "DENSE_GEMV_NARROW_COLS",
-        2,
-        "card 727: the fallback that keeps a small N from starving the device",
-    ),
-    prov(
-        "DENSE_GEMV_WORKGROUPS_PER_CU",
-        2,
-        "card 727: at least two workgroups per compute unit before the wide column count",
-    ),
-    prov(
         "ELEMENTWISE_2D_WIDTH",
         256,
         "structural: the portable Vulkan workgroup maximum; a folded body derives its index from this width",
@@ -3728,11 +3693,6 @@ const LAUNCH_PROVENANCE: &[Provenance] = &[
         "design bound, not swept: a shorter chunk leaves a workgroup's lanes idle and the launch is the combine's overhead",
     ),
     prov(
-        "WORKGROUPS_PER_COMPUTE_UNIT",
-        2,
-        "design bound, not swept: two resident workgroups keep a CU busy while one waits on its K/V loads",
-    ),
-    prov(
         "INDEXED_GEMV_MAX_ROWS",
         32,
         "design bound, not swept: a decode step's selected experts or a few steps batched; above it the register-tiled schedule over the grouped rows shares expert weight tiles",
@@ -3741,11 +3701,6 @@ const LAUNCH_PROVENANCE: &[Provenance] = &[
         "TILED_MAX_ROWS",
         128,
         "design bound, not swept: past 128 rows the query tile alone (128 x d words) exceeds a 64 KiB workgroup memory at d 128",
-    ),
-    prov(
-        "TILED_ACCUMULATORS_PER_LANE",
-        64,
-        "POOT-1402 bank sweep (Strix Halo wgpu): 40 accumulators beat 80; half of the 128-register occupancy point",
     ),
     prov(
         "TILED_MAX_LANE_COLS",
@@ -6480,18 +6435,24 @@ fn the_planner_narrows_index_math_only_where_its_proof_holds_on_a_target_that_lo
 /// The dense Gemv's wide columns need the device to be shown full: an unknown compute-unit count takes the narrow
 /// ones for every `N`, a known one the wide ones once `ceil(N / 4)` launches two workgroups per unit (POOT-1468).
 ///
-/// Mutation: in `dense_gemv_launch`, read an unknown count as filled (`is_some_and` -> `is_none_or`); every `N` takes the
+/// Mutation: in `gemv_launch`, read an unknown count as filled (`is_some_and` -> `is_none_or`); every `N` takes the
 /// wide columns and the unknown-count row goes red.
 #[test]
 fn dense_gemv_columns_stay_narrow_on_unknown_compute_units() {
     let n = 1 << 20;
-    assert_eq!(dense_gemv_launch(n, Some(40)).cols, 4, "known, filled");
-    assert_eq!(dense_gemv_launch(n, None).cols, 2, "unknown");
-    assert_eq!(dense_gemv_launch(8, Some(40)).cols, 2, "known, starved");
+    let caps = default_caps_for(Backend::SpirvVulkan);
+    let unknown = DeviceCaps {
+        compute_units: Queried::Unknown,
+        ..caps
+    };
+    let cols = |n, caps: &DeviceCaps| gemv_launch(n, GemvFamily::Dense, caps).cols;
+    assert_eq!(cols(n, &caps), 4, "known, filled");
+    assert_eq!(cols(n, &unknown), 2, "unknown");
+    assert_eq!(cols(8, &caps), 2, "known, starved");
 }
 
 /// Body, launch and selection for one packed-BF16 `DenseContraction` are chosen together (Card 727): at
-/// M == 1, on every backend, the generated dense Gemv takes it with the launch `dense_gemv_launch` picks,
+/// M == 1, on every backend, the generated dense Gemv takes it with the launch `gemv_launch` picks,
 /// its workgroup the schedule's `width` and its grid the schedule's own `grid_threads`, `[K, N]` riding in
 /// metadata; above M == 1 the generated `[N, K]` Tiled body takes it (Card 1024).
 ///
@@ -6519,8 +6480,8 @@ fn dense_bf16_decode_gemv_selection_rows() {
         let launch = dense_decode_gemv_in(eqn, &out_shape, out_numel, &caps).unwrap_or_else(|| {
             panic!("{backend:?}: the dense Gemv must take the M == 1 contraction")
         });
-        assert_eq!(launch, dense_gemv_launch(n, caps.compute_units.known()));
-        let DenseGemvLaunch { width, unroll, .. } = launch;
+        assert_eq!(launch, gemv_launch(n, GemvFamily::Dense, &caps));
+        let GemvLaunch { width, unroll, .. } = launch;
         // K = 32 and the 4-element run put every run on a 16-byte group: NVPTX reads them as vectors.
         let activation = if backend == Backend::Nvptx {
             poot_kernelgen::GemvActivation::Vec4
@@ -6597,13 +6558,13 @@ fn dense_bf16_decode_gemv_selection_rows() {
     }
 }
 
-/// The dense Gemv arm of the packed-reader planner passes the one finalizer like every other arm: on a device
-/// whose workgroup holds one invocation fewer than the Gemv's `width`, planning the folded M == 1 contraction is
-/// a typed `WorkgroupInvocations` refusal naming both figures, not a plan a loader would receive. (`compile`
-/// reverts a fold it cannot plan, so this reads the folded equation's own plan.)
+/// The dense Gemv arm of the packed-reader planner passes the one finalizer like every other arm: on a device whose
+/// workgroup memory holds nothing, planning the folded M == 1 contraction is a typed `StaticLds` refusal naming both
+/// figures, not a plan a loader would receive. (`compile` reverts a fold it cannot plan, so this reads the folded
+/// equation's own plan.)
 ///
 /// Mutation: in `planner/packed.rs` return the Gemv arm's `Planned` before `finalize` runs; the over-limit plan
-/// succeeds and this row goes red ("expected a WorkgroupInvocations refusal").
+/// succeeds and this row goes red ("expected a StaticLds refusal").
 #[test]
 fn the_dense_gemv_arm_is_finalized() {
     let backend = Backend::SpirvVulkan;
@@ -6613,26 +6574,46 @@ fn the_dense_gemv_arm_is_finalized() {
         .iter()
         .find(|e| matches!(e.op, OpKind::DenseContraction { .. }))
         .expect("a dense contraction eqn");
-    let (planned_plan, _) = planned_with_choice(&g, eqn, backend).unwrap();
-    let Dispatch { body, .. } = into_with_meta(planned_plan);
-    let width = body.workgroup_size[0];
     let mut small = default_caps_for(backend);
-    small.max_workgroup_invocations = width - 1;
+    small.lds_bytes = 0;
     match planned_with_choice_caps(&g, eqn, backend, &small) {
-        Err(PlanError::Refused(refusal)) => assert_eq!(
-            refusal.missing,
-            Capability::KernelResources(
-                crate::device_validation::ResourceRefusal::WorkgroupInvocations {
-                    invocations: u64::from(width),
-                    limit: width - 1,
-                }
-            )
+        Err(PlanError::Refused(refusal)) => assert!(
+            matches!(
+                refusal.missing,
+                Capability::KernelResources(crate::device_validation::ResourceRefusal::StaticLds {
+                    needed: 1..,
+                    available: 0,
+                })
+            ),
+            "{refusal:?}"
         ),
         other => panic!(
-            "expected a WorkgroupInvocations refusal, got {:?}",
+            "expected a StaticLds refusal, got {:?}",
             other.map(|(_, choice)| choice)
         ),
     }
+}
+
+/// The Gemv is planned inside the device's workgroup limits, not handed a width the device cannot launch (design
+/// A2-05): a device that runs 100 invocations per workgroup gets the widest whole-wave width within them, for the
+/// dense and the packed family alike, and the plan is accepted.
+///
+/// Mutation: drop the `max_workgroup_invocations` bound from `GemmLaunch::of`; the width is 256 and the plan is a
+/// `WorkgroupInvocations` refusal.
+#[test]
+fn the_gemv_width_stays_inside_the_workgroup_limits() {
+    let backend = Backend::SpirvVulkan;
+    let g = dense_contraction_graph(1, 64, 256);
+    let eqn = g
+        .eqns()
+        .iter()
+        .find(|e| matches!(e.op, OpKind::DenseContraction { .. }))
+        .expect("a dense contraction eqn");
+    let mut small = default_caps_for(backend);
+    small.max_workgroup_invocations = 100;
+    let (plan, _) = planned_with_choice_caps(&g, eqn, backend, &small).unwrap();
+    let Dispatch { body, .. } = into_with_meta(plan);
+    assert_eq!(body.workgroup_size[0], 64, "whole waves of 64 within 100");
 }
 
 /// Decode attention `scores @ V` at `hq` heads, cache length `cap` and head dim `d`: `[1, hq, 1, cap] @ [1, hq,
@@ -6651,9 +6632,9 @@ fn attn_scores_v_graph(hq: usize, cap: usize, d: usize) -> Graph {
 
 /// Card 727 SC-005, plan side: a contraction plan whose body sizes its LDS reduction by its baked
 /// width keeps that width through the planner's launch shaping, by its request type. The fixture is the decode
-/// attention GEMV (`GEMV_WIDTH` lanes) on a device whose X grid holds a single workgroup, so the generic bump
+/// attention GEMV (`lds_gemv_width` lanes) on a device whose X grid holds a single workgroup, so the generic bump
 /// (raise a one-thread-per-output body to 256 lanes when `out_numel / width` passes the X cap) would fire; the
-/// plan keeps `GEMV_WIDTH` and an LDS array of exactly that many lanes. The device half (the result equals the
+/// plan keeps `lds_gemv_width` and an LDS array of exactly that many lanes. The device half (the result equals the
 /// oracle) is `a_contraction_keeps_its_lds_width_through_the_planner_*` in `poot-wgpu-device` and `poot-rocm-device`.
 ///
 /// Mutation: in `kernel_mapping::shape_launch` drop the request-type exemption (`contraction = false`); the
@@ -6677,13 +6658,13 @@ fn a_contraction_plan_keeps_its_lds_width_through_the_planner() {
     let Some(Dispatch { body, .. }) = plan.single() else {
         panic!("a single dispatch: {plan:?}");
     };
-    assert_eq!(body.workgroup_size, [GEMV_WIDTH as u32, 1, 1]);
+    assert_eq!(body.workgroup_size, [lds_gemv_width(&caps) as u32, 1, 1]);
     assert_eq!(
         body.workgroup_locals
             .iter()
             .map(|decl| decl.len)
             .collect::<Vec<_>>(),
-        vec![GEMV_WIDTH as u32],
+        vec![lds_gemv_width(&caps) as u32],
         "the reduction's LDS is sized by the same width"
     );
 }

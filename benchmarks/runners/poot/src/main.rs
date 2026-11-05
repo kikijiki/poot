@@ -225,6 +225,10 @@ struct Config {
     /// `None` takes the engine default. The result names the policy the driver ran, so a TTFT number always
     /// says which numerics produced it.
     matmul_precision: Option<MatmulPrecision>,
+    /// Compile every program with the range detector (`--check-ranges`): a step that leaves f16's range is a
+    /// validation fault naming the op and layer. A debugging mode (witness reductions and a readback per step),
+    /// never part of a measurement.
+    check_ranges: bool,
     /// Artifacts the cache directory held before this process opened anything (`None`: no directory named).
     artifact_entries_at_start: Option<u64>,
 }
@@ -257,7 +261,8 @@ const VALUE_FLAGS: [&str; 16] = [
     "--kv-dtype",
     "--matmul-precision",
 ];
-const SWITCHES: [&str; 6] = [
+const SWITCHES: [&str; 7] = [
+    "--check-ranges",
     "--roofline",
     "--prefill",
     "--json",
@@ -356,6 +361,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
                 })
             })
             .transpose()?,
+        check_ranges: switches.contains("--check-ranges"),
         artifact_entries_at_start: artifact_cache_entries(),
     };
 
@@ -932,7 +938,8 @@ fn open_driver(
         wanted.get(),
         config.kv_dtype,
         config.matmul_precision,
-    )?;
+    )?
+    .with_range_check(config.check_ranges);
     // Every entry the cell's prompts plan to is compiled and added before the first timed token.
     let shapes = ServingShapes {
         layout: Layout::Contiguous,
@@ -981,6 +988,7 @@ fn open_driver(
     let initial = driver_counters(&driver);
     let kv_dtype = driver.kv_dtype();
     let matmul_precision = driver.matmul_precision();
+    let check_ranges = driver.range_check();
     let driver = driver
         .prepare(&shapes)
         .map_err(DriverError::from)
@@ -1002,6 +1010,7 @@ fn open_driver(
             prefill_chunk: prefill_chunk.get(),
             kv_dtype,
             matmul_precision,
+            check_ranges,
         },
     ))
 }
@@ -1019,6 +1028,7 @@ struct Resolved {
     prefill_chunk: usize,
     kv_dtype: KvDtype,
     matmul_precision: MatmulPrecision,
+    check_ranges: bool,
 }
 
 /// A cell that opened: the engine and what it ran on.
@@ -1341,6 +1351,7 @@ fn measure(
     line["prefill_chunk"] = json!(resolved.prefill_chunk);
     line["kv_dtype"] = json!(resolved.kv_dtype.as_str());
     line["matmul_precision"] = json!(resolved.matmul_precision.as_str());
+    line["check_ranges"] = json!(resolved.check_ranges);
     line["profiled"] = json!(config.profile);
     line["preparation"] = probe.receipt();
     if let Some(classes) = engine.memory_classes() {
@@ -1796,6 +1807,7 @@ mod stub_cell {
             prefill_chunk: 4,
             kv_dtype: poot_models::model::KvDtype::DEFAULT,
             matmul_precision: poot_llm::driver::MatmulPrecision::DEFAULT,
+            check_ranges: false,
         }
     }
 }
@@ -2595,6 +2607,9 @@ mod tests {
                 Some(want)
             );
         }
+        // The range detector is a debugging switch: off unless asked for.
+        assert!(!defaults.check_ranges);
+        assert!(config(&["--check-ranges"]).check_ranges);
 
         assert!(matches!(
             config(&["--gguf", "/m/model.gguf"]).weights,

@@ -1,9 +1,9 @@
 //! The f16 range of attention under the default `Narrow` (POOT-1474,
-//! `receipts/1471-narrow-without-range-guards/design.md` section 7): an attention the narrow policy rounds to f16
+//! POOT-1471): an attention the narrow policy rounds to f16
 //! reads its query unscaled, and a query past f16's range reaches the output as a non-finite value.
 //!
-//! Every row drives the production `compile` on RADV caps (f16 fragments only) and on gfx1151 caps (bf16 and f16;
-//! the narrow rule takes f16 there since POOT-1458), and evaluates the compiled graph with the CPU oracle, which
+//! Every row drives the production `compile` on gfx1151 caps (bf16 and f16; the narrow rule takes f16 there since
+//! POOT-1458) and evaluates the compiled graph with the CPU oracle, which
 //! computes the program's declared rounding.
 
 use std::collections::HashMap;
@@ -17,17 +17,19 @@ use poot_graph_plan::{CompileLimits, CompileOptions, Program, Target, compile};
 use poot_target::{AmdArch, Backend, DeviceCaps, MatrixUnits, Queried, SubgroupSupport};
 use poot_tensor::{DType, HostTensor};
 
-const HQ: usize = 4;
-const HKV: usize = 2;
-const LQ: usize = 32;
-const LK: usize = 64;
-const D: usize = 16;
+/// A prefill chunk big enough for the matrix unit to win: the policy narrows only where it does (POOT-1476).
+const HQ: usize = 16;
+const HKV: usize = 8;
+const LQ: usize = 256;
+const LK: usize = 256;
+const D: usize = 64;
 
 const F16: OperandPrecision = OperandPrecision::Narrow(FragmentDtype::F16);
 
 fn rocm_wmma() -> Target {
     let mut caps = DeviceCaps::rocm_default();
     caps.matrix_units = Queried::Known(MatrixUnits::amd("gfx1151", 32));
+    caps.register_file = AmdArch::gfx1151().register_file();
     caps.subgroup = Queried::Known(SubgroupSupport::Present {
         min_size: 32,
         max_size: 32,
@@ -38,16 +40,9 @@ fn rocm_wmma() -> Target {
     }
 }
 
-fn radv() -> Target {
-    Target::Gpu {
-        backend: Backend::SpirvVulkan,
-        caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
-    }
-}
-
-/// RADV, and gfx1151 with both fragment dtypes: the two targets on which the narrow policy rounds attention to f16.
-fn f16_targets() -> [(&'static str, Target); 2] {
-    [("radv", radv()), ("gfx1151", rocm_wmma())]
+/// gfx1151 with both fragment dtypes: the target on which the narrow policy rounds attention to f16.
+fn f16_targets() -> [(&'static str, Target); 1] {
+    [("gfx1151", rocm_wmma())]
 }
 
 fn values(n: usize, seed: u64, scale: f32) -> Vec<f32> {
@@ -155,7 +150,7 @@ fn attention_precision(program: &Program) -> OperandPrecision {
 /// The default's failure mode: a query reaching 1e6 (past f16's 65504 on every row) compiles under the narrow policy
 /// to an f16 attention that reads it unscaled, so the query rounds to infinity and the output is not finite (it is
 /// not clamped and not finite-and-wrong); the exact program over the same data is finite. Serving refuses a
-/// non-finite logit with a typed error (`receipts/1471-narrow-without-range-guards/design.md` section 4.2).
+/// non-finite logit with a typed error (POOT-1471).
 /// Mutation: make the narrowing saturate in the oracle (`poot-eval` f16 rounding clamps to 65504); the output turns
 /// finite and this row fails.
 #[test]

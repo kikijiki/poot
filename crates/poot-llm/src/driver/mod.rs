@@ -344,6 +344,15 @@ impl DriverOptions {
             ..self
         }
     }
+
+    /// These options with the range detector on or off for every program of the driver
+    /// ([`CompileOptions::range_check`]): an f16-narrowed step that leaves f16's range is then a typed validation
+    /// fault naming the first op and layer. Off, the programs are the ones compiled without the detector.
+    pub fn with_range_check(mut self, on: bool) -> Self {
+        self.prefill = self.prefill.with_range_check(on);
+        self.decode = self.decode.with_range_check(on);
+        self
+    }
 }
 
 /// One sequence to generate. `sampler` carries its own knobs, penalty history, constraint and seed.
@@ -1170,6 +1179,11 @@ impl<S: State> Driver<S> {
     /// [`DriverOptions::matmul_precision`], else [`MatmulPrecision::DEFAULT`].
     pub fn matmul_precision(&self) -> MatmulPrecision {
         self.settings.matmul_precision
+    }
+
+    /// Whether every program of the driver compiles with the range detector ([`DriverOptions::with_range_check`]).
+    pub fn range_check(&self) -> bool {
+        self.settings.options.prefill.range_check && self.settings.options.decode.range_check
     }
 
     /// What the driver has done so far, with the residency manager's counters read current.

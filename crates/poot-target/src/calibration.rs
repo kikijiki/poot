@@ -7,8 +7,9 @@
 //! records that it did ([`Calibrated`]).
 
 use crate::{
-    AMD_RADV_SAFE_MAX_BUFFER_BYTES, ATTENTION_CHUNK_WORK, DECODE_GEMV_CHUNK_TRIGGER,
-    KnownMiscompiles, PACKED_TILED_CHUNK_WORK, Queried, WatchdogBudget,
+    AMD_RADV_SAFE_MAX_BUFFER_BYTES, ATTENTION_CHUNK_WORK, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps,
+    KnownMiscompiles, PACKED_TILED_CHUNK_WORK, Queried, RegisterBudget, SubgroupSupport,
+    WatchdogBudget,
 };
 
 /// The lane-grid edge of the narrow register-tiled schedule: 64 lanes, one wave64, the widest workgroup every
@@ -37,18 +38,94 @@ pub const STRIX_HALO_PACKED_GEMV_RUN: u32 = 32;
 /// otherwise.
 pub const SM_120_PACKED_GEMV_RUN: u32 = 16;
 
+/// The lanes of one wave64, the widest wave poot targets: the grain of a tiled attention's workgroup width, which
+/// is whole waves of the widest wave so it runs on every device.
+pub(crate) const WAVE_LANES: u32 = 64;
+
+/// The Gemv columns of a dense `[N, K]` weight on Strix Halo (card 727): `cols` 4 while that still launches
+/// [`FILL_WORKGROUPS_PER_UNIT`] workgroups per compute unit, else 2. Set from the card's sweep on gfx1151 over the
+/// qwen2.5-0.5b BF16 decode shapes (wgpu Gemv device time per token: `cols` 64 7.1 ms, 32 6.0, 16 5.3, 8 4.9,
+/// 4 4.7; ROCm decode 78 to 81 tok/s from `cols` 16 to 2). Nearly flat between 4 and 8, so not derivable.
+pub const STRIX_HALO_DENSE_GEMV_COLS: GemvCols = GemvCols { wide: 4, narrow: 2 };
+
+/// The Gemv columns of a packed weight on Strix Halo (card 653): `{16, 8}` with 8-element runs was 3.7 ms of Gemv
+/// device time per Q4_K_M token against 4.2 ms for the dense table and 9.7 ms for the one-column-per-workgroup
+/// body (gfx1151, qwen2.5-0.5b GGUF projection shapes).
+pub const STRIX_HALO_PACKED_GEMV_COLS: GemvCols = GemvCols {
+    wide: 16,
+    narrow: 8,
+};
+
+/// The width of the LDS-tree Gemv on Strix Halo behind RADV (Qwen2.5-0.5B decode, fused ms per token: w=32 50.9,
+/// 64 53.7, 128 39.8, 256 45.6). Non-monotone, so a measurement, not a derivation.
+pub const STRIX_HALO_LDS_GEMV_WIDTH: u32 = 128;
+
+/// The cost model's ratios on Strix Halo (ROCm), fitted over every tiling of a qwen3-0.6b prefill at 512 and 2048
+/// tokens: the contraction device time follows them within a few percent (POOT-1403 receipt).
+pub const STRIX_HALO_COST_RATIOS: CostRatios = CostRatios {
+    lds_read: 1.0,
+    staged_value: 8.0,
+};
+
+/// The keys per staged block of the tiled attention schedule on Strix Halo, widest first. A 64-key block was
+/// measured 20-30% slower than a 32-key one on ROCm and wgpu and no faster on PTX (POOT-1402 bank sweep).
+pub const STRIX_HALO_ATTENTION_KEY_BLOCKS: [usize; 2] = [32, 16];
+
 /// The resident lanes per compute unit the register-tiled schedule's occupancy model treats as saturating it:
 /// eight 32-lane waves, four per SIMD of an RDNA compute unit (two SIMD32s) or two per partition of an NVIDIA SM
 /// (four), the residency at which a unit hides its LDS and memory latency behind other waves' FMAs. Structural,
 /// not measured per device.
 pub const SATURATING_LANES: u32 = 256;
 
+/// The workgroups per compute unit a launch aims at: a unit holds two resident workgroups, so one workgroup's tail
+/// overlaps the next one's start. Structural, the one definition of the Gemv column rule, the split-KV count and
+/// the selected-head grouping (the factor vLLM's `wvSplitK` grid and Marlin's `tiles * 4 <= sms` use).
+pub const FILL_WORKGROUPS_PER_UNIT: u32 = 2;
+
+/// The bytes of the widest load every backend emits (`dwordx4`, `ld.v4`): the contiguous activation bytes a Gemv
+/// lane reads per trip. Structural.
+pub const VECTOR_LOAD_BYTES: u32 = 16;
+
+/// The output columns a Gemv workgroup owns: `wide` while the outputs still fill the device
+/// ([`FILL_WORKGROUPS_PER_UNIT`] workgroups per compute unit), `narrow` otherwise. A weight row is contiguous
+/// along K, so fewer columns give each row more lanes and a longer contiguous run per trip. Measured per weight
+/// family: the best pair depends on the body's trip.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GemvCols {
+    /// Columns while the outputs fill the device.
+    pub wide: u32,
+    /// Columns for a small output count, so the workgroups do not starve the device.
+    pub narrow: u32,
+}
+
+/// The ratios of the register-tiled contraction cost model, in FMA issues (the unit): what one lane's LDS read and
+/// one staged value (a global load, its LDS write and its share of the round's two barriers) cost. Memory-hierarchy
+/// ratios, which only a measurement of the device gives ([`PerfCalibration`]'s fit tool).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct CostRatios {
+    /// One LDS read of one operand value.
+    pub lds_read: f64,
+    /// One staged value of a tile.
+    pub staged_value: f64,
+}
+
 /// The performance figures one device's launches were measured with. A figure here only ranks schedules that are
 /// all correct, so a device nobody measured plans with [`PerfCalibration::PORTABLE`] and the plan says so
 /// ([`Calibrated::Portable`]); a safety figure (a watchdog budget, a miscompile ceiling) is [`Calibration`]'s and
 /// stays absent for such a device.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct PerfCalibration {
+    /// The Gemv columns of a dense `[N, K]` weight.
+    pub dense_gemv_cols: GemvCols,
+    /// The Gemv columns of a packed weight.
+    pub packed_gemv_cols: GemvCols,
+    /// The workgroup width of the LDS-tree Gemv (`gemv_lds`: one output per workgroup, the attention
+    /// scores-by-V Gemv and the one-hot scatter), where the width is not the saturating residency.
+    pub lds_gemv_width: u32,
+    /// The register-tiled contraction cost model's ratios.
+    pub cost: CostRatios,
+    /// The keys per staged block of the tiled attention schedule, widest first.
+    pub attention_key_blocks: &'static [usize],
     /// The longest run of contiguous K elements a packed decode Gemv lane decodes per trip: the register and issue
     /// budget of the device's compiler. The planner runs the format's factor run up to this cap.
     pub packed_gemv_max_run: u32,
@@ -58,17 +135,32 @@ impl PerfCalibration {
     /// The prior an unmeasured device plans with. Every field is named for the device it was measured on or the
     /// launch every device ran before it was measured, never a value nobody observed.
     pub const PORTABLE: Self = Self {
+        dense_gemv_cols: STRIX_HALO_DENSE_GEMV_COLS,
+        packed_gemv_cols: STRIX_HALO_PACKED_GEMV_COLS,
+        lds_gemv_width: STRIX_HALO_LDS_GEMV_WIDTH,
+        cost: STRIX_HALO_COST_RATIOS,
+        attention_key_blocks: &STRIX_HALO_ATTENTION_KEY_BLOCKS,
         packed_gemv_max_run: PORTABLE_PACKED_GEMV_RUN,
     };
 
     /// Strix Halo (gfx1151), through HSA or behind RADV: the device the Gemv figures were measured on.
     pub const STRIX_HALO: Self = Self {
+        dense_gemv_cols: STRIX_HALO_DENSE_GEMV_COLS,
+        packed_gemv_cols: STRIX_HALO_PACKED_GEMV_COLS,
+        lds_gemv_width: STRIX_HALO_LDS_GEMV_WIDTH,
+        cost: STRIX_HALO_COST_RATIOS,
+        attention_key_blocks: &STRIX_HALO_ATTENTION_KEY_BLOCKS,
         packed_gemv_max_run: STRIX_HALO_PACKED_GEMV_RUN,
     };
 
     /// The RTX PRO 6000 Blackwell Server (compute capability 12.0). Measured for the packed Gemv run only; a field
     /// it did not measure is spelled out as [`Self::PORTABLE`]'s, so a reader sees which figures are borrowed.
     pub const SM_120: Self = Self {
+        dense_gemv_cols: Self::PORTABLE.dense_gemv_cols,
+        packed_gemv_cols: Self::PORTABLE.packed_gemv_cols,
+        lds_gemv_width: Self::PORTABLE.lds_gemv_width,
+        cost: Self::PORTABLE.cost,
+        attention_key_blocks: Self::PORTABLE.attention_key_blocks,
         packed_gemv_max_run: SM_120_PACKED_GEMV_RUN,
     };
 }
@@ -149,9 +241,9 @@ impl Calibrated {
 }
 
 /// The launch figures of the contraction schedules on one device: the narrow and wide lane grids of the
-/// register-tiled one and the residency its occupancy model saturates a compute unit at, and the measured or
-/// portable [`PerfCalibration`]. Resolved once from the device's identity; the planner reads the fields and holds
-/// no tile or run literal of its own.
+/// register-tiled one and the residency its occupancy model saturates a compute unit at, the Gemv geometry the
+/// device's limits allow, and the measured or portable [`PerfCalibration`]. Resolved once from the device
+/// ([`DeviceCaps::gemm_launch`]); the planner reads the fields and holds no tile, width or run literal of its own.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GemmLaunch {
     /// The narrow register-tiled lane-grid edge.
@@ -160,23 +252,88 @@ pub struct GemmLaunch {
     pub register_lane_edge_wide: u32,
     /// Resident lanes that saturate one compute unit, in the register-tiled schedule's occupancy model.
     pub saturating_lanes: u32,
+    /// What one lane of a workgroup holds in registers across a loop, from the device's register file. A tiled
+    /// contraction and a tiled attention size their register tiles against it.
+    pub register_budget: RegisterBudget,
+    /// The widest workgroup a tiled attention runs: the saturating residency, bounded by the device's workgroup
+    /// limits. [`Self::tiled_lanes`] lists the widths it considers.
+    pub tiled_lanes_widest: u32,
+    /// Workgroups per compute unit a launch aims at ([`FILL_WORKGROUPS_PER_UNIT`]).
+    pub fill_workgroups_per_unit: u32,
+    /// Lanes of a Gemv workgroup: the saturating residency, within the device's workgroup limits, whole waves.
+    pub gemv_width: u32,
+    /// Contiguous `K` elements a dense Gemv lane reads per trip: one [`VECTOR_LOAD_BYTES`] load of the f32
+    /// activation.
+    pub gemv_unroll: u32,
     /// The performance figures, and whether the device measured them.
     pub calibrated: Calibrated,
 }
 
 impl GemmLaunch {
-    /// The launch of a device whose performance figures are `calibrated`. No device has a confirmed defect that
-    /// narrows the register-tiled lane grids (the RADV wave64 LDS defect of update 0169 does not reproduce, see
-    /// `REGISTER_LANE_EDGE_WIDE`'s provenance).
-    pub const fn new(calibrated: Calibrated) -> Self {
+    /// The launch of `caps`. No device has a confirmed defect that narrows the register-tiled lane grids (the RADV
+    /// wave64 LDS defect of update 0169 does not reproduce, see `REGISTER_LANE_EDGE_WIDE`'s provenance).
+    ///
+    /// The tiled attention's widest workgroup is the saturating lanes bounded by the workgroup limits. The Gemv
+    /// width is the same bound rounded down to whole waves (the largest subgroup the device reports, else
+    /// [`WAVE_LANES`]): a device that runs 128 invocations is planned at 128, not handed an unlaunchable 256.
+    pub fn of(caps: &DeviceCaps) -> Self {
+        let wave = match caps.subgroup {
+            Queried::Known(SubgroupSupport::Present { max_size, .. }) if max_size > 0 => max_size,
+            _ => WAVE_LANES,
+        };
+        let limit = SATURATING_LANES
+            .min(caps.max_workgroup_invocations)
+            .min(caps.max_workgroup_size[0]);
+        let whole_waves = limit / wave * wave;
         Self {
             register_lane_edge: REGISTER_LANE_EDGE,
             register_lane_edge_wide: REGISTER_LANE_EDGE_WIDE,
             saturating_lanes: SATURATING_LANES,
-            calibrated,
+            register_budget: RegisterBudget {
+                file: caps.register_file,
+            },
+            tiled_lanes_widest: limit,
+            fill_workgroups_per_unit: FILL_WORKGROUPS_PER_UNIT,
+            gemv_width: if whole_waves == 0 { limit } else { whole_waves },
+            gemv_unroll: VECTOR_LOAD_BYTES / size_of::<f32>() as u32,
+            calibrated: caps.perf_calibration,
         }
     }
+
+    /// The workgroup widths a tiled attention considers, widest first: the powers of two of whole wave64s up to
+    /// [`Self::tiled_lanes_widest`] (256, 128 and 64 where the device runs 256 lanes). None where the device runs
+    /// fewer lanes than one wave64.
+    pub fn tiled_lanes(&self) -> impl Iterator<Item = usize> {
+        let widest = (self.tiled_lanes_widest / WAVE_LANES)
+            .checked_ilog2()
+            .map(|waves| (WAVE_LANES << waves) as usize);
+        std::iter::successors(widest, |&lanes| Some(lanes / 2))
+            .take_while(|&lanes| lanes >= WAVE_LANES as usize)
+    }
 }
+
+/// The matrix unit's FMA rate on the Vulkan device a `vendor_id` and device name identify: measured on Strix Halo
+/// (4x, [`crate::FragmentConfig::fma_rate`]), `Unknown` for a device nobody measured (the cooperative-matrix
+/// extension reports no rate).
+pub fn vulkan_matrix_fma_rate(vendor_id: u32, device_name: &str) -> Queried<u8> {
+    if vendor_id == VENDOR_AMD && is_strix_halo(device_name) {
+        Queried::Known(GFX11_MATRIX_FMA_RATE)
+    } else {
+        Queried::Unknown
+    }
+}
+
+/// How many times faster than the lane FMA rate the gfx11 (RDNA3, 3.5) WMMA unit runs: the measured gfx1151 peaks,
+/// 40-45 against 10.8 TFLOP/s (`receipts/1429-narrow-operands/design.md` section 1.1).
+pub const GFX11_MATRIX_FMA_RATE: u8 = 4;
+
+/// The A100's (sm_80) matrix-unit rate: NVIDIA's A100 datasheet, BF16 and FP16 Tensor Core 312 TFLOPS dense
+/// against FP32 19.5 TFLOPS, 16x.
+pub const SM80_MATRIX_FMA_RATE: u8 = 16;
+
+/// The H100 SXM's (sm_90) matrix-unit rate: NVIDIA's H100 datasheet, BF16 and FP16 Tensor Core 989 TFLOPS dense
+/// against FP32 67 TFLOPS, 14.8x, rounded to 15.
+pub const SM90_MATRIX_FMA_RATE: u8 = 15;
 
 /// PCI vendor id of AMD, as Vulkan reports it.
 pub const VENDOR_AMD: u32 = 0x1002;
@@ -283,7 +440,7 @@ mod tests {
         /// The constant's name in the source.
         name: &'static str,
         /// Its value.
-        value: u64,
+        value: f64,
         /// The measurement, card or structural reason it rests on; never empty.
         source: &'static str,
     }
@@ -292,43 +449,134 @@ mod tests {
     const LAUNCH_PROVENANCE: &[Provenance] = &[
         Provenance {
             name: "REGISTER_LANE_EDGE",
-            value: 8,
+            value: 8.0,
             source: "card 542b: the 8x8 lane grid, one wave64",
         },
         Provenance {
             name: "REGISTER_LANE_EDGE_WIDE",
-            value: 16,
+            value: 16.0,
             source: "POOT-1193: the 16x16 lane grid, 256 lanes. POOT-1403: runs on RADV too; the wave64 LDS defect (update 0169: a 256-lane LDS-tiled GEMM read stale upper-wave LDS) does not reproduce on Strix Halo RADV Mesa 26.1.3, on the register-tiled body at 16x16 (16.5 KiB LDS; poot-kernelgen the_register_tiled_body_runs_256_lane_workgroups_on_radv, mutation-proven) nor on the deleted one-output-per-lane Tiled body at 16x16 (bit-exact); master already ran the packed register-tiled 16x16 there",
         },
         Provenance {
             name: "SATURATING_LANES",
-            value: 256,
+            value: 256.0,
             source: "structural (POOT-1403): eight wave32s per compute unit, four per RDNA SIMD32 or two per NVIDIA SM partition; the register-tiled cost model's residency, not a per-device measurement",
         },
         Provenance {
+            name: "ACCUMULATOR_SHARE",
+            value: 4.0,
+            source: "structural (POOT-1479): a lane holds at most a quarter of its resident registers as accumulators across a loop, the rest carrying the step's operands, addresses and loop state; gfx1151 spill rows (poot-kernelgen register_budget): 64 accumulators of 256 compile to 149 VGPRs unspilled, 128 spill. The rounding is up: ceil(255 / 4) = 64 keeps sm_80 at 8 x 8, offline ptxas -v row",
+        },
+        Provenance {
+            name: "HELD_SHARE",
+            value: 2.0,
+            source: "structural (POOT-1447): accumulators and held operands together fill at most half of a lane's resident registers; below it RDNA3 keeps 12 waves per SIMD and an NVIDIA SM 16 warps (the held-Q spill rows)",
+        },
+        Provenance {
+            name: "PORTABLE_ACCUMULATORS",
+            value: 64.0,
+            source: "a quarter of the 256 registers a lane addresses on gfx11 and (255) NVIDIA, the devices register-tiled launches were measured on; the budget of a device whose API reports no register file, recorded in the plan",
+        },
+        Provenance {
+            name: "WAVE_LANES",
+            value: 64.0,
+            source: "structural: the widest wave poot targets (wave64 on GCN/CDNA and RADV's wave64 mode), the grain of a tiled attention's workgroup width",
+        },
+        Provenance {
+            name: "FILL_WORKGROUPS_PER_UNIT",
+            value: 2.0,
+            source: "structural (POOT-1479): a unit holds two resident workgroups so one's tail overlaps the next; the factor of vLLM's wvSplitK grid (CuCount * 4, one tile per SIMD) and Marlin (tiles * 4 <= sms), stated once for the Gemv columns, split-KV and selected-head grouping",
+        },
+        Provenance {
+            name: "VECTOR_LOAD_BYTES",
+            value: 16.0,
+            source: "structural: the widest load every backend emits (dwordx4, ld.v4); POOT-1405 counts the Gemv activation read in 16-byte groups, so an f32 activation unrolls 4",
+        },
+        Provenance {
+            name: "STRIX_HALO_DENSE_GEMV_COLS_WIDE",
+            value: 4.0,
+            source: "card 727, gfx1151 sweep over the qwen2.5-0.5b BF16 decode shapes: wgpu Gemv device time per token cols 64 7.1 ms, 32 6.0, 16 5.3, 8 4.9, 4 4.7; ROCm decode 78-81 tok/s from cols 16 to 2",
+        },
+        Provenance {
+            name: "STRIX_HALO_DENSE_GEMV_COLS_NARROW",
+            value: 2.0,
+            source: "card 727: the narrower fallback keeps a small N from starving the device; same sweep as the wide columns",
+        },
+        Provenance {
+            name: "STRIX_HALO_PACKED_GEMV_COLS_WIDE",
+            value: 16.0,
+            source: "card 653, gfx1151 per-kernel sweep over the qwen2.5-0.5b GGUF projection shapes: {16, 8} 3.7 ms Gemv device time per Q4_K_M token against 4.2 ms for the dense table and 9.7 ms for one column per workgroup",
+        },
+        Provenance {
+            name: "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
+            value: 8.0,
+            source: "card 653: same sweep as the wide columns; the plan of a device whose compute units are unknown",
+        },
+        Provenance {
+            name: "STRIX_HALO_LDS_GEMV_WIDTH",
+            value: 128.0,
+            source: "RADV STRIX_HALO sweep, Qwen2.5-0.5B decode, fused ms per token: w=32 50.9, 64 53.7, 128 39.8, 256 45.6; non-monotone, measured on RADV only and borrowed elsewhere",
+        },
+        Provenance {
+            name: "STRIX_HALO_LDS_READ_COST",
+            value: 1.0,
+            source: "POOT-1403 fit, gfx1151 ROCm, every tiling of a qwen3-0.6b prefill at 512 and 2048 tokens: contraction device time follows the ratios within a few percent",
+        },
+        Provenance {
+            name: "STRIX_HALO_STAGED_VALUE_COST",
+            value: 8.0,
+            source: "POOT-1403 fit (same run as the LDS read cost): a global load, its LDS write and its share of the round's two barriers",
+        },
+        Provenance {
+            name: "STRIX_HALO_ATTENTION_KEY_BLOCK_WIDEST",
+            value: 32.0,
+            source: "POOT-1402 bank sweep: a 64-key block was 20-30% slower than a 32-key one on ROCm and wgpu (Strix Halo) and no faster on PTX",
+        },
+        Provenance {
+            name: "STRIX_HALO_ATTENTION_KEY_BLOCK_NARROWEST",
+            value: 16.0,
+            source: "POOT-1402: the narrower block the staged tile falls back to when LDS holds no 32-key one",
+        },
+        Provenance {
+            name: "GFX11_MATRIX_FMA_RATE",
+            value: 4.0,
+            source: "measured gfx1151 peaks, 40-45 TFLOP/s matrix against 10.8 TFLOP/s FMA (receipts/1429-narrow-operands/design.md section 1.1)",
+        },
+        Provenance {
+            name: "SM80_MATRIX_FMA_RATE",
+            value: 16.0,
+            source: "NVIDIA A100 datasheet: BF16 and FP16 Tensor Core 312 TFLOPS dense over FP32 19.5 TFLOPS",
+        },
+        Provenance {
+            name: "SM90_MATRIX_FMA_RATE",
+            value: 15.0,
+            source: "NVIDIA H100 SXM datasheet: BF16 and FP16 Tensor Core 989 TFLOPS dense over FP32 67 TFLOPS (14.8, rounded). Other compute capabilities: no sourced peak, rate Unknown (no credit)",
+        },
+        Provenance {
             name: "PORTABLE_PACKED_GEMV_RUN",
-            value: 8,
+            value: 8.0,
             source: "card 653: the 8-element run every class launched before POOT-1398; the run of a decode that addresses each element on its own (gemv_run's Elementwise arm)",
         },
         Provenance {
             name: "STRIX_HALO_PACKED_GEMV_RUN",
-            value: 32,
+            value: 32.0,
             source: "measured: gfx1151 ROCm and RADV at 17408 x 5120, run 32 vs 8: Q4_K 120 -> 195 GB/s, Q5_K 119 -> 190 (ROCm), Q4_K 143 -> 171-184 (Vulkan); POOT-1390 section 5 and the POOT-1398 receipt",
         },
         Provenance {
             name: "SM_120_PACKED_GEMV_RUN",
-            value: 16,
+            value: 16.0,
             source: "measured on one part only, RTX PRO 6000 Blackwell Server (sm_120), at 17408 x 5120 with the vector activation read and 32-bit index math, run 8 / 16 / 32 GB/s: Q4_K 721/980/665, Q5_K 747/955/741, Q6_K 861/1254/1253 (factor run 16), Q3_K 567/710/711, Q2_K 539/695/695, Q4_0 1026/1094/751, Q8_0 1383/1402/1260, IQ4_XS 894/856/601, IQ4_NL 998/911/641; POOT-1405 receipts. Other NVIDIA parts unmeasured",
         },
     ];
 
     /// The provenance entry named `name`, whose value is `value` and whose source is stated.
-    fn assert_provenance(name: &str, value: u32) {
+    fn assert_provenance(name: &str, value: impl Into<f64>) {
+        let value = value.into();
         let entry = LAUNCH_PROVENANCE
             .iter()
             .find(|entry| entry.name == name)
             .unwrap_or_else(|| panic!("{name} has no provenance entry"));
-        assert_eq!(entry.value, u64::from(value), "{name}");
+        assert_eq!(entry.value, value, "{name}");
         assert!(!entry.source.is_empty(), "{name} states no source");
     }
 
@@ -352,25 +600,93 @@ mod tests {
             register_lane_edge,
             register_lane_edge_wide,
             saturating_lanes,
+            register_budget: _,
+            tiled_lanes_widest,
+            fill_workgroups_per_unit,
+            // Derived from the caps, not a literal: `the_gemv_geometry_follows_the_device_limits` covers them.
+            gemv_width: _,
+            gemv_unroll: _,
             calibrated: _,
-        } = GemmLaunch::new(Calibrated::Portable);
+        } = DeviceCaps::rocm_default().gemm_launch();
+        assert_eq!(
+            tiled_lanes_widest, saturating_lanes,
+            "the widest tiled attention is the saturating residency"
+        );
+        assert_provenance("ACCUMULATOR_SHARE", crate::register_file::ACCUMULATOR_SHARE);
+        assert_provenance("HELD_SHARE", crate::register_file::HELD_SHARE);
+        assert_provenance("WAVE_LANES", WAVE_LANES);
+        assert_provenance(
+            "PORTABLE_ACCUMULATORS",
+            RegisterBudget {
+                file: Queried::Unknown,
+            }
+            .accumulators(256),
+        );
         assert_provenance("REGISTER_LANE_EDGE", register_lane_edge);
         assert_provenance("REGISTER_LANE_EDGE_WIDE", register_lane_edge_wide);
         assert_provenance("SATURATING_LANES", saturating_lanes);
+        assert_provenance("FILL_WORKGROUPS_PER_UNIT", fill_workgroups_per_unit);
+        assert_provenance("VECTOR_LOAD_BYTES", VECTOR_LOAD_BYTES);
         for (entry, row) in [
             (PerfCalibration::PORTABLE, "PORTABLE_PACKED_GEMV_RUN"),
             (PerfCalibration::STRIX_HALO, "STRIX_HALO_PACKED_GEMV_RUN"),
             (PerfCalibration::SM_120, "SM_120_PACKED_GEMV_RUN"),
         ] {
             let PerfCalibration {
+                dense_gemv_cols,
+                packed_gemv_cols,
+                lds_gemv_width,
+                cost,
+                attention_key_blocks,
                 packed_gemv_max_run,
             } = entry;
             assert_provenance(row, packed_gemv_max_run);
+            // Every measured entry spells the Strix Halo figures (SM_120 borrows them from `PORTABLE`, which
+            // are the same values): one row each, checked against whichever entry carries it.
+            assert_provenance("STRIX_HALO_DENSE_GEMV_COLS_WIDE", dense_gemv_cols.wide);
+            assert_provenance("STRIX_HALO_DENSE_GEMV_COLS_NARROW", dense_gemv_cols.narrow);
+            assert_provenance("STRIX_HALO_PACKED_GEMV_COLS_WIDE", packed_gemv_cols.wide);
+            assert_provenance(
+                "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
+                packed_gemv_cols.narrow,
+            );
+            assert_provenance("STRIX_HALO_LDS_GEMV_WIDTH", lds_gemv_width);
+            assert_provenance("STRIX_HALO_LDS_READ_COST", cost.lds_read);
+            assert_provenance("STRIX_HALO_STAGED_VALUE_COST", cost.staged_value);
+            let [widest, narrowest] = attention_key_blocks else {
+                panic!("two key blocks, widest first: {attention_key_blocks:?}");
+            };
+            assert_provenance("STRIX_HALO_ATTENTION_KEY_BLOCK_WIDEST", *widest as u32);
+            assert_provenance(
+                "STRIX_HALO_ATTENTION_KEY_BLOCK_NARROWEST",
+                *narrowest as u32,
+            );
         }
+        assert_provenance("GFX11_MATRIX_FMA_RATE", GFX11_MATRIX_FMA_RATE);
+        assert_provenance("SM80_MATRIX_FMA_RATE", SM80_MATRIX_FMA_RATE);
+        assert_provenance("SM90_MATRIX_FMA_RATE", SM90_MATRIX_FMA_RATE);
         claimed(&[
             "REGISTER_LANE_EDGE",
             "REGISTER_LANE_EDGE_WIDE",
             "SATURATING_LANES",
+            "ACCUMULATOR_SHARE",
+            "HELD_SHARE",
+            "WAVE_LANES",
+            "PORTABLE_ACCUMULATORS",
+            "FILL_WORKGROUPS_PER_UNIT",
+            "VECTOR_LOAD_BYTES",
+            "STRIX_HALO_DENSE_GEMV_COLS_WIDE",
+            "STRIX_HALO_DENSE_GEMV_COLS_NARROW",
+            "STRIX_HALO_PACKED_GEMV_COLS_WIDE",
+            "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
+            "STRIX_HALO_LDS_GEMV_WIDTH",
+            "STRIX_HALO_LDS_READ_COST",
+            "STRIX_HALO_STAGED_VALUE_COST",
+            "STRIX_HALO_ATTENTION_KEY_BLOCK_WIDEST",
+            "STRIX_HALO_ATTENTION_KEY_BLOCK_NARROWEST",
+            "GFX11_MATRIX_FMA_RATE",
+            "SM80_MATRIX_FMA_RATE",
+            "SM90_MATRIX_FMA_RATE",
             "PORTABLE_PACKED_GEMV_RUN",
             "STRIX_HALO_PACKED_GEMV_RUN",
             "SM_120_PACKED_GEMV_RUN",
@@ -419,15 +735,105 @@ mod tests {
     /// the measured run for `Portable`.
     #[test]
     fn a_launch_carries_the_figures_of_its_calibration() {
-        let portable = GemmLaunch::new(Calibrated::Portable);
-        let strix = GemmLaunch::new(Calibrated::STRIX_HALO);
-        let sm_120 = GemmLaunch::new(Calibrated::SM_120);
+        let launch = |calibrated| {
+            DeviceCaps {
+                perf_calibration: calibrated,
+                ..DeviceCaps::rocm_default()
+            }
+            .gemm_launch()
+        };
+        let portable = launch(Calibrated::Portable);
+        let strix = launch(Calibrated::STRIX_HALO);
+        let sm_120 = launch(Calibrated::SM_120);
         assert_eq!(portable.calibrated.figures().packed_gemv_max_run, 8);
         assert_eq!(strix.calibrated.figures().packed_gemv_max_run, 32);
         assert_eq!(sm_120.calibrated.figures().packed_gemv_max_run, 16);
         assert_ne!(
             portable, strix,
             "the launch must record which calibration it used"
+        );
+    }
+
+    /// A tiled attention's workgroup widths are the powers of two of whole wave64s up to the saturating residency
+    /// and the device's workgroup limit, widest first, and a device that runs fewer lanes than a wave64 has none.
+    /// Mutation: skip the `min` with the limit in `GemmLaunch::of`; the 128-lane device lists 256.
+    #[test]
+    fn tiled_attention_widths_follow_the_workgroup_limit() {
+        let widths = |limit| {
+            DeviceCaps {
+                max_workgroup_invocations: limit,
+                max_workgroup_size: [limit, 1024, 1024],
+                ..DeviceCaps::rocm_default()
+            }
+            .gemm_launch()
+            .tiled_lanes()
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(widths(1024), [256, 128, 64]);
+        assert_eq!(widths(256), [256, 128, 64]);
+        assert_eq!(widths(192), [128, 64]);
+        assert_eq!(widths(128), [128, 64]);
+        assert_eq!(widths(64), [64]);
+        assert!(widths(32).is_empty());
+    }
+
+    /// The Gemv width is the saturating residency within the device's workgroup limits, in whole waves of the
+    /// largest subgroup it reports (64 where none): a device that runs fewer invocations is planned at fewer, not
+    /// handed an unlaunchable 256. Mutation: drop the `max_workgroup_invocations` bound from `GemmLaunch::of`; the
+    /// 128-invocation row plans 256.
+    #[test]
+    fn the_gemv_geometry_follows_the_device_limits() {
+        let width = |invocations: u32, size_x: u32, wave: Option<u32>| {
+            DeviceCaps {
+                max_workgroup_invocations: invocations,
+                max_workgroup_size: [size_x, 1024, 1024],
+                subgroup: wave.map_or(Queried::Unknown, |size| {
+                    Queried::Known(SubgroupSupport::Present {
+                        min_size: size,
+                        max_size: size,
+                    })
+                }),
+                ..DeviceCaps::rocm_default()
+            }
+            .gemm_launch()
+            .gemv_width
+        };
+        assert_eq!(width(1024, 1024, Some(32)), 256, "the reference caps");
+        assert_eq!(width(1024, 1024, None), 256, "an unknown wave is 64");
+        assert_eq!(width(128, 1024, Some(32)), 128, "invocations bound it");
+        assert_eq!(width(1024, 192, Some(64)), 192, "the X extent bounds it");
+        assert_eq!(width(1024, 200, Some(64)), 192, "whole waves");
+        assert_eq!(
+            width(48, 1024, Some(64)),
+            48,
+            "less than a wave is the limit itself"
+        );
+        assert_eq!(DeviceCaps::rocm_default().gemm_launch().gemv_unroll, 4);
+    }
+
+    /// The matrix-unit rate is sourced per compute capability: the A100 and H100 carry their datasheet ratios, and
+    /// every other capability, and a Vulkan device nobody measured, is `Unknown` (no speed credit). Mutation: key
+    /// `vulkan_matrix_fma_rate` on the vendor alone; the discrete card reads `Known`.
+    #[test]
+    fn the_matrix_rate_is_known_only_where_it_is_sourced() {
+        let rate = |cc| {
+            crate::MatrixUnits::nvidia(cc)
+                .iter()
+                .map(|config| config.fma_rate)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rate((8, 0)), vec![Queried::Known(16); 2]);
+        assert_eq!(rate((9, 0)), vec![Queried::Known(15); 2]);
+        for cc in [(8, 6), (8, 9), (10, 0), (12, 0)] {
+            assert_eq!(rate(cc), vec![Queried::Unknown; 2], "sm_{}{}", cc.0, cc.1);
+        }
+        assert_eq!(
+            vulkan_matrix_fma_rate(VENDOR_AMD, "AMD Radeon 8060S (RADV STRIX_HALO)"),
+            Queried::Known(4)
+        );
+        assert_eq!(
+            vulkan_matrix_fma_rate(VENDOR_AMD, "AMD Radeon RX 7900 XTX (RADV NAVI31)"),
+            Queried::Unknown
         );
     }
 

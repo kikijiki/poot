@@ -95,8 +95,8 @@ fn hex(bytes: &[u8]) -> String {
 /// backend's: bf16 where the unit takes it (ROCm, PTX), f16 on the Vulkan cooperative matrix (wgpu, raw Vulkan). A narrow case
 /// compares with a reference that rounds the same operands, so its tolerance is the narrow-storage one ([`NARROW_REFERENCE_TOLERANCE`]).
 #[derive(Clone, Copy)]
-struct Operands {
-    narrow: Option<FragmentDtype>,
+pub(crate) struct Operands {
+    pub(crate) narrow: Option<FragmentDtype>,
 }
 
 impl Operands {
@@ -120,7 +120,7 @@ impl Operands {
         }
     }
 
-    fn policy(self) -> MatmulPrecision {
+    pub(crate) fn policy(self) -> MatmulPrecision {
         match self.narrow {
             Some(_) => MatmulPrecision::Narrow,
             None => MatmulPrecision::Exact,
@@ -150,8 +150,8 @@ impl Operands {
 }
 
 /// One case ready to run: graphs (one per weight copy), their consts, and the reference output per copy.
-struct Prepared {
-    graphs: Vec<Graph>,
+pub(crate) struct Prepared {
+    pub(crate) graphs: Vec<Graph>,
     consts: Vec<(String, HostTensor)>,
     references: Vec<Vec<f64>>,
     out_shape: Vec<usize>,
@@ -968,7 +968,7 @@ fn delta_rule_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
     })
 }
 
-fn prepare(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String> {
+pub(crate) fn prepare(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String> {
     let generator = &bank["token_fixtures"][case["token_fixture"]
         .as_str()
         .ok_or("case has no token_fixture")?]["generator"];
@@ -986,7 +986,11 @@ fn prepare(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String
     }
 }
 
-fn staged(g: &Graph, target: Target, policy: MatmulPrecision) -> Result<StagedProgram, String> {
+pub(crate) fn staged(
+    g: &Graph,
+    target: Target,
+    policy: MatmulPrecision,
+) -> Result<StagedProgram, String> {
     compile_staged(
         &g.clone(),
         &TargetSet::single(DeviceId(0), target),
@@ -1029,20 +1033,20 @@ fn reference_check(got: &[f32], want: &[f64], tolerance: f64) -> (f64, bool) {
 
 /// What one device measured of a case: its per-repeat host wall time, the device time of the same steps
 /// when the device reports it, and the realized plan, counters and reference comparison.
-struct Measured {
+pub(crate) struct Measured {
     wall_us: Vec<f64>,
     /// Sum of the step's dispatch durations on the device clock, per repeat; `None` when the device
     /// reports no timestamps (`DeviceTime::Unknown`), never a fabricated zero.
-    device_us: Option<Vec<f64>>,
+    pub(crate) device_us: Option<Vec<f64>>,
     plan: Vec<String>,
-    worst: f64,
-    agrees: bool,
+    pub(crate) worst: f64,
+    pub(crate) agrees: bool,
     memory: Vec<Value>,
     recordings: u64,
     replays: u64,
 }
 
-fn measure<D>(
+pub(crate) fn measure<D>(
     device: D,
     bank: &Value,
     prepared: &Prepared,

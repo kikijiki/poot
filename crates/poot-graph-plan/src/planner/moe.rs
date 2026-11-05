@@ -271,6 +271,7 @@ fn plan_indexed(
     };
     let (schedule, dispatches) = match (rows, indexed_gemv_in(m, n, caps)) {
         (ExpertRows::PerRow, Some(launch)) => {
+            super::matmul::refuse_unless_exact(site, precision)?;
             let schedule = launch.schedule(backend, k);
             let threads = word(schedule.grid_threads(1, m, n))?;
             let meta = vec![word(k)?, word(n)?, word(m)?, 0, 0, word(experts)?];

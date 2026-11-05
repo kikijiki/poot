@@ -36,3 +36,6 @@ __pycache__/
 # wgpu-hal with the POOT-1464 patch applied, produced by scripts/wgpu-hal-patched.sh
 /.patched
 .patched.*
+
+# per-card receipts, evidence and PR text live in Backstage (projects/poot/receipts), never in this repo
+/receipts/

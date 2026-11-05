@@ -7,7 +7,7 @@
 Why: a `BOTTOM_OF_PIPE` stamp is an event that later commands do not wait for. On RADV (Strix Halo, Mesa 26.1.3)
 it can complete after the pass's dispatch has already run, so the pass reads a few ticks and its time is booked to
 the next pass. Measured with three probe processes sharing the GPU: 0.8% to 9% of steps affected before, 0 of
-about 81000 after (`receipts/1464-timestamp-pair-void/diagnosis.md`). The end-of-pass stamp stays `BOTTOM_OF_PIPE`
+about 81000 after (POOT-1464). The end-of-pass stamp stays `BOTTOM_OF_PIPE`
 (it must wait for the pass's work). Only the Vulkan backend is changed; poot's wgpu device is Vulkan only.
 
 ## How the patched crate gets built

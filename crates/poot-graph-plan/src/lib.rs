@@ -101,8 +101,8 @@ pub use graph_validation::{ValidationPacketPlan, ValidationPacketSource};
 #[cfg(any(test, feature = "test-support"))]
 pub use passes::{
     RoutedExpertSite, RowOutputs, canonicalize, collapse_reshape_chains, cse, dce,
-    elide_noop_transposes, flash_attention, fold_iota, fuse, legalize, passes_without_target,
-    rope_fusion, routed_expert_sites, with_operand_precision,
+    declare_operand_precision, elide_noop_transposes, flash_attention, fold_iota, fuse, legalize,
+    passes_without_target, rope_fusion, routed_expert_sites, with_operand_precision,
 };
 pub use planner::{KernelChoice, NoDispatch, Planned, region_member_work};
 #[cfg(any(test, feature = "test-support"))]

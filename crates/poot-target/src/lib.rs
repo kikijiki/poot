@@ -30,7 +30,7 @@ pub use matrix::{
     CooperativeMatrixConfig, FragmentConfig, FragmentDtype, FragmentLayout, FragmentShape, LaneMap,
     MatrixUnits, OperandNarrowing, RoundingConversions,
 };
-pub use register_file::RegisterFile;
+pub use register_file::{RegisterBudget, RegisterFile};
 pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout, ViewError};
 pub use vpu::{NarrowingContract, VendorCompilerId, VpuCaps, VpuTargetId};
 
@@ -417,11 +417,12 @@ pub struct DeviceCaps {
 }
 
 impl DeviceCaps {
-    /// The lane grids the M>1 register-tiled contraction launches with and the packed decode Gemv's lane run on this
-    /// device ([`calibration::GemmLaunch::new`]); which lane grid a contraction runs is the cost model's choice
-    /// under this device's workgroup and LDS limits.
-    pub const fn gemm_launch(&self) -> calibration::GemmLaunch {
-        calibration::GemmLaunch::new(self.perf_calibration)
+    /// The launch figures of the contraction schedules on this device: the lane grids the M>1 register-tiled
+    /// contraction launches with, the registers a lane holds across its loops, the Gemv geometry and the packed
+    /// decode Gemv's lane run ([`calibration::GemmLaunch::of`]); which lane grid a contraction runs is the cost
+    /// model's choice under this device's workgroup and LDS limits.
+    pub fn gemm_launch(&self) -> calibration::GemmLaunch {
+        calibration::GemmLaunch::of(self)
     }
 }
 
@@ -549,7 +550,7 @@ impl DeviceCaps {
             }),
             max_grid: [u32::MAX, 65_535, 65_535],
             watchdog_budget: None,
-            matrix_units: Queried::Known(MatrixUnits::nvidia(8)),
+            matrix_units: Queried::Known(MatrixUnits::nvidia((8, 0))),
             register_file: RegisterFile::nvidia(8).map_or(Queried::Unknown, Queried::Known),
             known_miscompiles: KnownMiscompiles::default(),
             compute_units: Queried::Known(SM80_A100_COMPUTE_UNITS),
@@ -571,6 +572,28 @@ impl DeviceCaps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device's launch is derived from its own caps: the register file and workgroup limits it reports reach the
+    /// budget and the widest tiled attention, and a device that reports no register file plans with the portable
+    /// budget and a launch that differs from the known file's (the plan records which). Mutation: build the budget
+    /// from `Queried::Unknown` in `gemm_launch`; the known-file launch reads the portable budget on a 1024-lane
+    /// workgroup.
+    #[test]
+    fn a_launch_follows_the_register_file_and_limits_of_its_caps() {
+        let caps = DeviceCaps::ptx_default();
+        let launch = caps.gemm_launch();
+        assert_eq!(launch.register_budget.accumulators(1024), 16);
+        assert_eq!(launch.tiled_lanes().collect::<Vec<_>>(), [256, 128, 64]);
+        let unknown = DeviceCaps {
+            register_file: Queried::Unknown,
+            max_workgroup_invocations: 128,
+            ..caps
+        }
+        .gemm_launch();
+        assert_eq!(unknown.register_budget.accumulators(1024), 64);
+        assert_eq!(unknown.tiled_lanes().collect::<Vec<_>>(), [128, 64]);
+        assert_ne!(unknown, launch);
+    }
 
     /// A calibration table keys a device class by this label: each GPU backend has its own, an AMD part
     /// carries its gfx code, and an NPU has none. Mutation: drop the arch from the amdgcn label.

@@ -1,5 +1,5 @@
 //! Operand precision: the declared narrowing of an op that multiplies two float operands (POOT-1430,
-//! `receipts/1429-narrow-operands/design.md` section 2).
+//! POOT-1429).
 //!
 //! Narrowing is part of an op's semantics. The op states it, the oracle evaluates exactly it, and every schedule
 //! (fragment, scalar micro-tile, GEMV) implements it, so numerics never depend on which schedule the planner picked.

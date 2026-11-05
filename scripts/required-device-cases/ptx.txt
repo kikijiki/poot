@@ -48,6 +48,7 @@ poot-llm	driver::device_tests::a_nan_router_weight_is_a_typed_validation_fault_p
 poot-llm	driver::device_tests::a_refused_shape_is_typed_before_any_dispatch_ptx
 poot-llm	driver::device_tests::a_tied_decode_chains_and_equals_stepwise_decode_ptx
 poot-llm	driver::device_tests::adapter_generation_replacement_is_isolated_and_freed_ptx
+poot-llm	driver::device_tests::an_overflow_is_refused_by_the_sampler_without_the_detector_ptx
 poot-llm	driver::device_tests::an_unsupported_request_is_the_same_variant_for_two_families_ptx
 poot-llm	driver::device_tests::attached_device_limit_refuses_an_oversized_constant_ptx
 poot-llm	driver::device_tests::bert_encode_matches_the_oracle_whatever_the_padding_ptx
@@ -131,6 +132,7 @@ poot-llm	driver::device_tests::sampled_differs_from_greedy_ptx
 poot-llm	driver::device_tests::smolvlm_batched_paged_embeds_match_single_row_runs_ptx
 poot-llm	driver::device_tests::smolvlm_caption_matches_the_oracle_rows_ptx
 poot-llm	driver::device_tests::smolvlm_front_end_requests_served_batched_equal_single_row_captions_ptx
+poot-llm	driver::device_tests::the_detector_names_the_layer_whose_activation_overflows_ptx
 poot-llm	driver::device_tests::two_frames_of_one_size_embed_differently_ptx
 poot-llm	driver::step::mtp_tests::mtp_all_accepted_equals_off_ptx
 poot-llm	driver::step::mtp_tests::mtp_greedy_equals_off_ptx
@@ -281,6 +283,7 @@ poot-ptx-device::parity	select_is_bitwise_on_ptx
 poot-ptx-device::parity	selected_attention_reads_exactly_the_selected_blocks_on_ptx
 poot-ptx-device::parity	state_pool_rows_reset_independently_on_ptx
 poot-ptx-device::parity	the_driver_weight_format_matches_the_declared_oracle_on_ptx
+poot-ptx-device::parity	the_range_detector_names_an_f16_overflow_on_ptx
 poot-ptx-device::parity	two_byte_select_is_bitwise_on_ptx
 poot-ptx-device::sample_gumbel_no_contract	gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle
 poot-ptx-device::scan_contract	delta_rule_scan_matches_the_oracle_on_ptx

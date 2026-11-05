@@ -56,9 +56,12 @@ pub use scan::{ScanKernel, ScanSpec};
 
 // The types a request carries (the planner builds them), and `view_eff_strides`, the planner's strided-view
 // legality predicate shares with the generators.
+#[cfg(any(test, feature = "test-support"))]
+pub use contraction::{CostFit, fit_cost_ratios};
 pub use contraction::{
-    DenseTiledWeight, Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep, GemvActivation,
-    RegisterTiling, RunLength, Schedule, TileSize, TiledRows, TiledShape,
+    CostTerms, DenseTiledWeight, Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep,
+    GemvActivation, GemvShape, RegisterTiling, RunLength, Schedule, TileSize, TiledRows,
+    TiledShape,
 };
 pub use fused::{
     FusedInput, FusedKernel, FusedScalarOp, FusedStep, LaneId, LeafId, LeafTy, RowKernel, RowOp,

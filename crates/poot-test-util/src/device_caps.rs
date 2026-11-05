@@ -5,7 +5,7 @@
 //! and used only as a `dev-dependency`, so Cargo structurally prevents this from ever reaching a
 //! production build.
 
-use poot_target::calibration::{Calibrated, Calibration};
+use poot_target::calibration::{Calibrated, Calibration, GFX11_MATRIX_FMA_RATE};
 use poot_target::dram_channels::DramChannels;
 use poot_target::{
     AMD_RADV_SAFE_MAX_BUFFER_BYTES, Backend, CooperativeMatrixConfig, DeviceCaps, E4m3Storage,
@@ -63,6 +63,7 @@ pub fn wgpu_rdna3_igpu() -> DeviceCaps {
             FragmentLayout::Opaque,
             32,
             1,
+            Queried::Known(GFX11_MATRIX_FMA_RATE),
         )])),
         // RADV's `VK_AMD_shader_core_properties` on Strix Halo: 256 VGPRs a lane, 768 wave64 VGPRs per SIMD,
         // two SIMDs a compute unit.
@@ -106,6 +107,7 @@ pub fn vulkan_rdna3_igpu() -> DeviceCaps {
             }],
             32,
             FragmentConfig::ANY_WAVES,
+            Queried::Known(GFX11_MATRIX_FMA_RATE),
         )),
         ..wgpu_rdna3_igpu()
     }

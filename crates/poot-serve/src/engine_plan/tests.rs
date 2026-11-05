@@ -473,6 +473,7 @@ fn args(backend: BackendChoice) -> EngineArgs {
         expert_pool: None,
         kv_dtype: None,
         matmul_precision: None,
+        check_ranges: false,
     }
 }
 
@@ -820,6 +821,9 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
 /// POOT-1474 drops the range scales of the narrowed contractions (the 1457 row scale and its f32 side outputs), so the
 /// scale and scaled-activation values leave the arena: `Activation` 1199540 -> 1151108, 602484 -> 578268 and
 /// 304340 -> 292248 at four, two and one rows.
+/// POOT-1476 leaves an op exact where a matrix unit does not win: the fixture's wgpu target (one fragment wave) narrows
+/// nothing, so no narrowed operand storage is planned and `Activation` is POOT-1451's again: 1151108, 575708 and 288408
+/// at four, two and one rows.
 ///
 /// Mutation: size a dense weight from `shape[..1]` in `Engine::weight_buffer`'s size-only path; `Weight`
 /// is no longer 5216 and this row goes red.
@@ -842,12 +846,12 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         (
             2,
             64,
-            "Activation=578268 Input=117748 Meta=16884 State=6208 Weight=5216",
+            "Activation=575708 Input=117748 Meta=16884 State=6208 Weight=5216",
         ),
         (
             1,
             64,
-            "Activation=292248 Input=82072 Meta=15564 State=3104 Weight=5216",
+            "Activation=288408 Input=82072 Meta=15564 State=3104 Weight=5216",
         ),
     ];
     let domain = candidates(&handle, &args);
@@ -1425,6 +1429,26 @@ fn the_kv_dtype_flag_is_the_dtype_the_started_driver_runs() {
         .expect_err("an unknown dtype is a startup error")
         .to_string();
     assert!(refused.contains("accepted: f16, bf16, f32"), "{refused}");
+}
+
+/// POOT-1475: `--check-ranges` is the range detector every program of the started engine's driver compiles with,
+/// through the real parser and `engine_args`; without it the driver compiles none. Mutation: drop the flag in
+/// `engine_args` (no `with_check_ranges`); the flagged engine runs without the detector and the row goes red.
+#[test]
+fn the_check_ranges_flag_is_the_detector_the_started_driver_compiles_with() {
+    for (flags, want) in [
+        (&["poot-serve", "--check-ranges"][..], true),
+        (&["poot-serve"][..], false),
+    ] {
+        let config = ServeConfig::try_parse_from(flags).expect("the flags parse");
+        let args = crate::startup::engine_args(&config, DraftPolicy::Off).expect("engine args");
+        let handle = dense_model_of(1024);
+        let health = EngineHealth::starting();
+        let (executor, _) = probe(spirv_target(), 0);
+        let (result, _) = build_with(&args, &handle, executor, roomy, &health);
+        let started = result.unwrap_or_else(|error| panic!("{flags:?}: {error}"));
+        assert_eq!(started.driver.range_check(), want, "{flags:?}");
+    }
 }
 
 /// The budget is the runtime's live answer, not the figure the device queried when it opened. The target

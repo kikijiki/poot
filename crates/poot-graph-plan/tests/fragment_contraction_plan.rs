@@ -6,7 +6,9 @@
 //! units and the shapes, and nothing else.
 
 use poot_graph_ir::op::ContractionHead;
-use poot_graph_ir::{Builder, FragmentDtype, Graph, MatmulPrecision, OpKind, TensorType};
+use poot_graph_ir::{
+    Builder, FragmentDtype, Graph, MatmulPrecision, OpKind, OperandPrecision, TensorType,
+};
 use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Program, Target, compile};
 use poot_kernelgen::{ContractionSpec, KernelRequest, Schedule};
 use poot_quant::PackedWeight;
@@ -260,23 +262,34 @@ fn a_split_policy_plans_the_fragment_tiling_too() {
     assert_eq!(dtype, FragmentDtype::F16);
 }
 
-/// RADV has an opaque f16 unit. wgpu leaves the pipeline's subgroup size to the driver, so its workgroup is one
-/// subgroup, and a fragment tile of one wave stages too many values per multiply to beat the scalar tiling (bank
-/// `prefill-dense-bf16-nk-narrow`: 0.61x of f32 on device time with the fragment tiling): the planner takes the
-/// scalar one. Raw Vulkan requires 32-lane subgroups, so its workgroup is several waves and takes the fragments.
-/// Mutation: drop the `narrowing` term from `RegisterTiling::cost`; the wgpu row plans the single-wave fragment and
-/// goes red.
+/// RADV has an opaque f16 unit, and a prefill projection does not narrow on it under the `narrow` policy: its staged
+/// values are rounded in integer arithmetic (SPIR-V keeps the integer form, POOT-1458), and the cost
+/// model finds the exact register tiling cheaper (bank `prefill-dense-bf16-nk-narrow`: the fragment tiling measured
+/// 0.61x of f32 on device time through wgpu, whose workgroup is one wave). An op that DECLARES the narrowing is still
+/// held to a matrix unit: raw Vulkan, whose workgroup is several waves, plans opaque f16 fragments for it and never
+/// the narrowed register tiling. Mutation: let `register_tiled_launch` fall back to `RegisterTiling::choose` for a
+/// narrowed shape; the declared row plans a narrowed register tiling and goes red.
 #[test]
-fn radv_plans_f16_fragments_only_where_a_workgroup_has_several_waves() {
-    let program = compiled(&dense_bf16(), &wgpu(), MatmulPrecision::Narrow);
-    let schedule = schedule_of(&program, is_dense);
-    assert!(
-        matches!(schedule, Schedule::RegisterTiled { .. }),
-        "wgpu runs one wave per workgroup: {schedule:?}"
-    );
-
-    let program = compiled(&dense_bf16(), &vulkan(), MatmulPrecision::Narrow);
-    let (dtype, layout, waves) = fragment(schedule_of(&program, is_dense));
+fn radv_keeps_the_exact_tiling_and_plans_a_declared_narrowing_on_fragments() {
+    for target in [wgpu(), vulkan()] {
+        let program = compiled(&dense_bf16(), &target, MatmulPrecision::Narrow);
+        let schedule = schedule_of(&program, is_dense);
+        assert!(
+            matches!(schedule, Schedule::RegisterTiled { .. }),
+            "the narrow policy leaves RADV exact: {schedule:?}"
+        );
+    }
+    let declared = {
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![M, K])).unwrap();
+        let w = b.constant("w", TensorType::f32(vec![K, N])).unwrap();
+        let out = b
+            .matmul_as(x, w, OperandPrecision::Narrow(FragmentDtype::F16))
+            .unwrap();
+        b.finish(out).unwrap()
+    };
+    let program = compiled(&declared, &vulkan(), MatmulPrecision::Exact);
+    let (dtype, layout, waves) = fragment(schedule_of(&program, is_matmul));
     assert_eq!(
         (dtype, layout),
         (FragmentDtype::F16, FragmentLayout::Opaque)

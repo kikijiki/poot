@@ -11,7 +11,7 @@
 //! the divide and the multiply identities).
 
 use poot_graph_ir::op::{BinOp, RedOp, UnOp};
-use poot_graph_ir::{Builder, MatmulPrecision, OpKind, Scalar, TensorType, Traced};
+use poot_graph_ir::{Builder, OpKind, Scalar, TensorType, Traced};
 use poot_tensor::{DType, HostTensor};
 
 use crate::Fixture;
@@ -124,7 +124,7 @@ fn launches_and_side_outputs(
     exec: &dyn poot_executor::Executor,
     target: poot_graph_plan::Target,
     fixture: &Fixture,
-    policy: MatmulPrecision,
+    policy: crate::Policy,
 ) -> (usize, usize) {
     let staged = crate::staged_under(exec, fixture, target, policy);
     staged
@@ -149,8 +149,9 @@ pub fn run_fused_against_reference(
     exec: &mut dyn poot_executor::Executor,
     target: poot_graph_plan::Target,
     pairs: &[(Fixture, Fixture)],
-    policy: MatmulPrecision,
+    policy: impl Into<crate::Policy>,
 ) -> Result<(), String> {
+    let policy = policy.into();
     for (fused, reference) in pairs {
         let (fused_launches, fused_sides) = launches_and_side_outputs(exec, target, fused, policy);
         let (reference_launches, reference_sides) =

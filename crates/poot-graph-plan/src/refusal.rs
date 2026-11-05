@@ -78,6 +78,11 @@ pub enum Capability {
     /// An indexed contraction past the Gemv rows whose rows name their experts per row: the tiled schedule reads
     /// rows grouped by expert, which the `group_expert_rows` pass forms (POOT-1451).
     UngroupedExpertRows,
+    /// A contraction or attention that reads its operands narrowed (or split) whose cheapest schedule on this device is
+    /// not a matrix-unit one (POOT-1476): a GEMV, a scalar tiling or a streaming attention rounds for no speed, so
+    /// the planner never plans one. `select_operand_precision` narrows an op only where a matrix-unit schedule
+    /// wins; this refusal is the contract that no later change reverts it silently.
+    NoMatrixUnitSchedule,
     /// The packed E4M3FN dispatch needs more x-workgroups than the target's grid allows.
     DispatchGridLimit {
         /// Threads the dispatch needs.
@@ -435,6 +440,9 @@ impl fmt::Display for Capability {
             Capability::GroupedTileRows { block, tile_rows } => write!(
                 f,
                 "no tiling runs rows grouped in tiles of {block} positions (the cheapest has {tile_rows}-row tiles)"
+            ),
+            Capability::NoMatrixUnitSchedule => f.write_str(
+                "an op that reads narrowed operands has no matrix-unit schedule that beats its exact one",
             ),
             Capability::UngroupedExpertRows => f.write_str(
                 "a tiled indexed contraction reads rows grouped by expert, not per-row expert ids",

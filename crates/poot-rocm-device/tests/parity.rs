@@ -51,13 +51,21 @@ fn narrowed_projections_match_the_declared_oracle_on_rocm() {
     fixtures.extend(poot_executor_parity::checkpoint_projection_f16_fixtures());
     fixtures.extend(poot_executor_parity::checkpoint_projection_bf16_fixtures());
     fixtures.extend(poot_executor_parity::packed::packed_linear_fixtures());
-    fixtures.extend(poot_executor_parity::packed::packed_expert_fixtures());
+    // The packed expert fixtures are decode-sized indexed contractions (per-row ids, the Gemv rows): no matrix-unit
+    // schedule exists for them, so a declared narrowing is refused; their exact numerics have their own row.
     for policy in [
         poot_graph_ir::MatmulPrecision::Narrow,
         poot_graph_ir::MatmulPrecision::Split,
     ] {
-        poot_executor_parity::precision::run_parity_declared(exec.as_mut(), t, &fixtures, policy)
-            .unwrap_or_else(|e| panic!("{policy:?}: {e}"));
+        // Declared: the decode fixtures (`M = 1`) are exact under the policy, and a row that must run the narrowed
+        // schedule declares it (POOT-1476).
+        poot_executor_parity::precision::run_parity_declared(
+            exec.as_mut(),
+            t,
+            &fixtures,
+            poot_executor_parity::Policy::declared(policy),
+        )
+        .unwrap_or_else(|e| panic!("{policy:?}: {e}"));
     }
 }
 
@@ -82,6 +90,7 @@ fn narrow_stored_activations_match_the_declared_oracle_on_rocm() {
     let bf16_units = poot_executor_parity::Policy {
         precision: narrow,
         fragment_only: Some(poot_target::FragmentDtype::Bf16),
+        declared: false,
     };
     let stored = |op: &str, dtype| (op.to_string(), dtype);
     let (f16, bf16) = (poot_tensor::DType::F16, poot_tensor::DType::BF16);
@@ -160,10 +169,10 @@ fn the_driver_weight_format_matches_the_declared_oracle_on_rocm() {
     .unwrap_or_else(|e| panic!("{e}"));
 }
 
-/// POOT-1430: an attention that declares `Narrow(f16)` or `Split(f16)` over an f16 KV cache, at decode and as a
-/// 33-row causal prefill, matches the CPU oracle on rocm: Q, K, V and the probabilities are read as declared
-/// by the schedules the planner picks. Mutation: in `attention::add_products` read the operands unrounded; the
-/// narrow and split rows go red.
+/// POOT-1430 and POOT-1476: an attention that declares `Narrow` over an f16 KV cache as a 160-row causal prefill
+/// matches the CPU oracle on rocm: Q, K, V and the probabilities are read as declared by the fragment schedule the
+/// planner picks. A `Split` attention has no matrix-unit schedule (the tiled attention stages one tile per operand) and
+/// is refused by name. Mutation: in `attention::add_products` read the operands unrounded; the narrow rows go red.
 #[test]
 fn declared_attention_precision_matches_the_oracle_on_rocm() {
     let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
@@ -194,7 +203,6 @@ fn declared_attention_precision_matches_the_oracle_on_rocm() {
     }
     for precision in [
         poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::F16),
-        poot_graph_ir::OperandPrecision::Split(poot_graph_ir::FragmentDtype::F16),
         poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::Bf16),
     ] {
         poot_executor_parity::precision::run_parity_declared(
@@ -205,6 +213,13 @@ fn declared_attention_precision_matches_the_oracle_on_rocm() {
         )
         .unwrap_or_else(|e| panic!("{precision}: {e}"));
     }
+    let error = poot_executor_parity::precision::planned_fragment_attention(
+        exec.as_ref(),
+        t,
+        poot_graph_ir::OperandPrecision::Split(poot_graph_ir::FragmentDtype::F16),
+    )
+    .expect_err("a split attention was planned on a matrix unit");
+    assert!(error.contains("NoMatrixUnitSchedule"), "{error}");
 }
 
 /// Card 736: the ALiBi attention BLOOM and MPT trace (`alibi_mask_from_pos` over a
@@ -507,5 +522,21 @@ fn an_f16_overflow_stays_non_finite_on_rocm() {
     let t = device.target();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     poot_executor_parity::f16_range::run_past_range(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// The opt-in range detector on rocm (`--check-ranges`): past-range blocks fault naming a contraction's
+/// activation, an in-range block passes, and a softcapped attention whose query is past f16's range is finite
+/// without the detector and a fault naming layer 17's attention query with it
+/// (`poot_executor_parity::range_check`). Mutation: in `check_f16_ranges` leave an attention's query out of the
+/// watched operands; the softcap half fails (the run passes).
+#[test]
+fn the_range_detector_names_an_f16_overflow_on_rocm() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::range_check::run_range_check(exec.as_mut(), t)
         .unwrap_or_else(|e| panic!("{e}"));
 }

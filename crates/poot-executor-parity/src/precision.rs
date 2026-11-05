@@ -13,10 +13,9 @@ use poot_tensor::{DType, HostTensor};
 
 use crate::{Fixture, const_fixture};
 
-/// Query heads, key/value heads and head width of the small fixtures; [`FRAGMENT_HEADS`] is the shape whose rows
-/// fill a tiled fragment attention.
+/// Query heads, key/value heads and head width of a fixture; [`FRAGMENT_HEADS`] is the shape whose rows fill a tiled
+/// fragment attention.
 pub(crate) type Heads = (usize, usize, usize);
-pub(crate) const SMALL_HEADS: Heads = (4, 2, 16);
 /// 16 query heads over 4 key/value heads of width 64: four query heads per key/value head pack a block of four
 /// positions into the 16 rows of a fragment, and 160 positions give a device's compute units more blocks than it
 /// has.
@@ -42,28 +41,22 @@ fn causal_mask(lq: usize, lk: usize) -> Vec<f32> {
 }
 
 /// One attention equation over an F32 query and an F16 key/value cache (the engine's default KV dtype), reading
-/// its operands as `precision` says: a decode row against a 64-key cache, a 33-row causal prefill, and a 160-row
+/// its operands as `precision` says: a 160-row
 /// prefill of 16 heads whose rows share staged key blocks on the matrix unit of a device that has one (POOT-1437).
 /// All hold the keys and values as F16 constants, so the K and V a `Narrow(f16)` product reads are exact in the
-/// fragment dtype and only Q and the probabilities round.
+/// fragment dtype and only Q and the probabilities round. No decode row or small prefill is here: a decode attention is a
+/// streaming or split-KV schedule and a prefill whose rows do not fill the device has no fragment tiling, so the
+/// planner leaves them exact and refuses a declared narrowing (POOT-1476).
 pub fn attention_fixtures(precision: OperandPrecision) -> Vec<Fixture> {
     [
-        (
-            "attention_decode",
-            SMALL_HEADS,
-            1usize,
-            64usize,
-            (40.0, 4.0),
-        ),
-        ("attention_prefill", SMALL_HEADS, 33, 33, (40.0, 4.0)),
         // Soft scores and small values: the probabilities of a key block are rounded against the running maximum, the
         // oracle's against the final one, so the two differ by a bf16 ulp of the probabilities, times the values, in
         // the output (6e-3 at values of 2 over 160 keys, outside the 5e-3 class).
         (
             "attention_prefill_fragment",
             FRAGMENT_HEADS,
-            160,
-            160,
+            160usize,
+            160usize,
             (4.0, 1.0),
         ),
     ]
@@ -209,11 +202,19 @@ fn run_against_declared(
     policy: crate::Policy,
 ) -> Result<(), String> {
     use poot_eval::test_support::weight_map_oracle::oracle_for;
-    let declared = poot_graph_plan::with_operand_precision(
-        &fixture.graph,
-        &policy.declaring_target(target),
-        policy.precision,
-    )
+    let declared = if policy.declared {
+        poot_graph_plan::declare_operand_precision(
+            &fixture.graph,
+            &policy.declaring_target(target),
+            policy.precision,
+        )
+    } else {
+        poot_graph_plan::with_operand_precision(
+            &fixture.graph,
+            &policy.declaring_target(target),
+            policy.precision,
+        )
+    }
     .map_err(|e| format!("{}: declare the precision: {e}", fixture.name))?;
     let mut oracle = oracle_for(&declared, &fixture.store);
     crate::run_parity_under(exec, target, fixture, policy, &mut oracle)
@@ -232,7 +233,8 @@ pub fn planned_fragment_attention(
         .into_iter()
         .find(|fixture| fixture.name == "attention_prefill_fragment")
         .expect("the fragment fixture");
-    let staged = crate::staged_under(exec, &fixture, target, MatmulPrecision::Exact);
+    let staged = crate::try_staged_under(exec, &fixture, target, MatmulPrecision::Exact)
+        .map_err(|error| format!("the planner refused the declared attention: {error}"))?;
     let (_, _, program) = staged.stages().next().ok_or("no stage")?;
     let (eqn, _) = program
         .planned()

@@ -461,7 +461,7 @@ impl GraphCore {
     /// The stamp is `TOP_OF_PIPE`, written by the command processor in command order before the dispatch
     /// launches. A stage-limited stamp (`COMPUTE_SHADER`, `BOTTOM_OF_PIPE`) is an event the dispatch does not
     /// wait for, and on RADV under GPU sharing it can complete after the dispatch has run: the dispatch then
-    /// reads a few ticks (POOT-1464, `receipts/1464-timestamp-pair-void`). The end stamp stays
+    /// reads a few ticks (POOT-1464). The end stamp stays
     /// `COMPUTE_SHADER`: it must wait for the dispatch.
     fn timestamp_before(
         &mut self,

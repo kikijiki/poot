@@ -10,7 +10,7 @@ use poot_kernel_ir::interp::{self, Buffer};
 use poot_kernelgen::{ContractionSpec, DenseTiledContraction, DenseTiledWeight, KernelRequest};
 use poot_target::{Backend, DeviceCaps, WatchdogBudget};
 
-use crate::predicates::GEMV_WIDTH;
+use crate::predicates::lds_gemv_width;
 use crate::test_support::plan_eqn;
 use crate::{Dispatch, KernelChoice, Plan};
 
@@ -173,7 +173,11 @@ fn decode_gemv_is_one_body_on_both_sides_of_the_watchdog_boundary() {
         let mut covered = 0;
         for dispatch in plan.dispatches().iter().chain(unsplit.dispatches()) {
             let (gk, gn, width, _, _) = gemv_chunk(dispatch);
-            assert_eq!((gk, gn, width), (k, n, GEMV_WIDTH), "one body per shape");
+            assert_eq!(
+                (gk, gn, width),
+                (k, n, lds_gemv_width(&split_caps)),
+                "one body per shape"
+            );
         }
         for dispatch in plan.dispatches() {
             let (_, _, _, elems, offset) = gemv_chunk(dispatch);
@@ -198,7 +202,7 @@ fn decode_gemv_is_one_body_on_both_sides_of_the_watchdog_boundary() {
 }
 
 /// The decode GEMV's planned grid is the one fold the body's `col = GroupY * x_groups + GroupX` reads: X fills
-/// to the device's cap and the rest spills onto Y, one workgroup of `GEMV_WIDTH` lanes per output element.
+/// to the device's cap and the rest spills onto Y, one workgroup of `lds_gemv_width` lanes per output element.
 ///
 /// Mutation: in `ContractionSpec::GemvChunk`'s `generate` arm, launch `[x * width, 1, 1]` (drop the Y spill);
 /// N = 237 on a 50-wide grid plans a grid of one row and the assertion names the planned grid.
@@ -214,7 +218,7 @@ fn decode_gemv_grid_spills_onto_y_past_the_x_cap() {
         assert_eq!(
             plan.single().expect("one dispatch").launch().grid,
             [
-                (x_groups * GEMV_WIDTH) as u32,
+                (x_groups * lds_gemv_width(&caps)) as u32,
                 n.div_ceil(x_groups) as u32,
                 1
             ],

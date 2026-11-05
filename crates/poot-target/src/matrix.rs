@@ -1,11 +1,14 @@
 //! [`MatrixUnits`]: the matrix-multiply fragments a GPU exposes, one [`FragmentConfig`] per operand dtype
-//! (POOT-1431, `receipts/1429-narrow-operands/design.md` section 4.1). Runtimes report them from the
+//! (POOT-1431, POOT-1429). Runtimes report them from the
 //! device; the planner's operand-precision pass and the fragment micro-tile read only this, never a gfx
 //! code, an SM number or a device name.
 //!
 //! A fragment multiplies two operands of one narrow dtype and accumulates in f32. Only the 16x16x16 shape
 //! lowers today, so a device offers at most one config per dtype and [`MatrixUnits`] stores them by dtype:
 //! it stays `Copy` like [`crate::DeviceCaps`] and a lookup cannot hit two configs.
+
+use crate::Queried;
+use crate::calibration::{GFX11_MATRIX_FMA_RATE, SM80_MATRIX_FMA_RATE, SM90_MATRIX_FMA_RATE};
 
 /// The operand dtype of a matrix fragment. The accumulator is f32 on every config.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -124,6 +127,10 @@ pub struct FragmentConfig {
     pub waves: u32,
     /// What the operand rounding costs.
     pub contract: OperandNarrowing,
+    /// How many times faster than the lane FMA rate the unit multiplies: the cost model's credit for a fragment
+    /// multiply. `Unknown` where nobody sourced it; the model then gives the unit no speed credit (rate 1), so a
+    /// fragment tiling wins by its traffic alone.
+    pub fma_rate: Queried<u8>,
 }
 
 impl FragmentConfig {
@@ -144,6 +151,7 @@ impl FragmentConfig {
         layout: FragmentLayout,
         subgroup: u32,
         waves: u32,
+        fma_rate: Queried<u8>,
     ) -> Self {
         FragmentConfig {
             dtype,
@@ -152,6 +160,7 @@ impl FragmentConfig {
             subgroup,
             waves,
             contract: OperandNarrowing::of(dtype),
+            fma_rate,
         }
     }
 }
@@ -170,7 +179,7 @@ pub struct CooperativeMatrixConfig {
 }
 
 /// The fragment dtypes a device's code generator rounds an f32 to with a conversion instruction it keeps
-/// (POOT-1458, `receipts/1458-f16-rounding/design.md` section 3.1): the round trip f32 -> dtype -> f32, written as
+/// (POOT-1458): the round trip f32 -> dtype -> f32, written as
 /// two casts, reaches the device as a round-to-nearest-even conversion and a widening, never folded into the
 /// identity. For any other dtype a generated body rounds in integer arithmetic on the f32 bits, which every target
 /// keeps.
@@ -251,18 +260,32 @@ impl MatrixUnits {
                 FragmentLayout::Declared(LaneMap::Rdna3),
                 32,
                 FragmentConfig::ANY_WAVES,
+                Queried::Known(GFX11_MATRIX_FMA_RATE),
             )
         }))
     }
 
-    /// An NVIDIA GPU by CUDA compute capability major: sm_80 and newer have `wmma` 16x16x16 in bf16 and f16,
-    /// 32-lane warps. The `wmma` API's fragment layout is opaque.
-    pub fn nvidia(compute_capability_major: u32) -> Self {
-        if compute_capability_major < 8 {
+    /// An NVIDIA GPU by CUDA compute capability: sm_80 and newer have `wmma` 16x16x16 in bf16 and f16, 32-lane
+    /// warps. The `wmma` API's fragment layout is opaque. The unit's rate is the datasheet's Tensor Core peak over
+    /// its FP32 peak, sourced for the A100 (sm_80) and the H100 (sm_90) and `Unknown` for every other capability:
+    /// the cost model gives such a unit no speed credit rather than another part's.
+    pub fn nvidia(compute_capability: (u32, u32)) -> Self {
+        if compute_capability.0 < 8 {
             return MatrixUnits::NONE;
         }
+        let fma_rate = match compute_capability {
+            (8, 0) => Queried::Known(SM80_MATRIX_FMA_RATE),
+            (9, 0) => Queried::Known(SM90_MATRIX_FMA_RATE),
+            _ => Queried::Unknown,
+        };
         Self::of(FragmentDtype::ALL.map(|dtype| {
-            FragmentConfig::m16n16k16(dtype, FragmentLayout::Opaque, 32, FragmentConfig::ANY_WAVES)
+            FragmentConfig::m16n16k16(
+                dtype,
+                FragmentLayout::Opaque,
+                32,
+                FragmentConfig::ANY_WAVES,
+                fma_rate,
+            )
         }))
     }
 
@@ -275,6 +298,7 @@ impl MatrixUnits {
         reported: impl IntoIterator<Item = CooperativeMatrixConfig>,
         subgroup: u32,
         waves: u32,
+        fma_rate: Queried<u8>,
     ) -> Self {
         Self::of(
             reported
@@ -286,6 +310,7 @@ impl MatrixUnits {
                         FragmentLayout::Opaque,
                         subgroup,
                         waves,
+                        fma_rate,
                     )
                 }),
         )
@@ -326,7 +351,7 @@ mod tests {
             ab_f16: true,
             result_f32: true,
         };
-        let units = MatrixUnits::cooperative_matrix([f16_f32], 32, 1);
+        let units = MatrixUnits::cooperative_matrix([f16_f32], 32, 1, Queried::Unknown);
         assert_eq!(dtypes(&units), [FragmentDtype::F16]);
         assert_eq!(
             units.config(FragmentDtype::F16).unwrap().layout,
@@ -349,21 +374,21 @@ mod tests {
             },
         ] {
             assert!(
-                MatrixUnits::cooperative_matrix([other], 32, 1).is_empty(),
+                MatrixUnits::cooperative_matrix([other], 32, 1, Queried::Unknown).is_empty(),
                 "{other:?}"
             );
         }
-        assert!(MatrixUnits::cooperative_matrix([], 32, 1).is_empty());
+        assert!(MatrixUnits::cooperative_matrix([], 32, 1, Queried::Unknown).is_empty());
     }
 
     /// sm_80 and newer have opaque bf16 and f16; older has none. Mutation: change the threshold to 9.
     #[test]
     fn nvidia_sm80_and_newer_have_opaque_bf16_and_f16() {
         assert_eq!(
-            dtypes(&MatrixUnits::nvidia(8)),
+            dtypes(&MatrixUnits::nvidia((8, 0))),
             [FragmentDtype::Bf16, FragmentDtype::F16]
         );
-        assert!(MatrixUnits::nvidia(7).is_empty());
+        assert!(MatrixUnits::nvidia((7, 5)).is_empty());
     }
 
     /// The conversion saturates nowhere: the recorded range is the dtype's largest finite value.

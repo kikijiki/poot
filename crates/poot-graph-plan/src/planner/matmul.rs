@@ -11,9 +11,9 @@ use crate::kernel_mapping::{
 };
 use crate::planner::{GraphTables, StorageDtypes};
 use crate::predicates::{
-    GEMV_WIDTH, decode_gemv_plan, indexed_matmul_lowers, is_batched_tileable_matmul_in,
-    is_decode_attn_gemv_in, is_decode_gemv_in, is_tileable_matmul_in,
-    packed_contraction_m_per_block, serial_matmul_fold,
+    decode_gemv_plan, indexed_matmul_lowers, is_batched_tileable_matmul_in, is_decode_attn_gemv_in,
+    is_decode_gemv_in, is_tileable_matmul_in, lds_gemv_width, packed_contraction_m_per_block,
+    serial_matmul_fold,
 };
 use crate::refusal::{FusedStepGap, Site};
 use poot_graph_ir::{ContractionRows, FragmentDtype, LocalId, OperandPrecision};
@@ -252,6 +252,54 @@ pub(super) fn admits_dtypes(dtypes: StorageDtypes) -> Result<(), Capability> {
     }
 }
 
+/// The tiled shape of `blocks` products of `m_per_block` rows against an f32 `[K, N]` weight (the plain matmul's tiled
+/// route).
+fn kn_f32_shape(
+    precision: OperandPrecision,
+    blocks: usize,
+    m_per_block: usize,
+    n: usize,
+    k: usize,
+) -> kg::TiledShape {
+    kg::TiledShape {
+        blocks,
+        m_per_block,
+        out_per_block: n,
+        k,
+        layout: WeightLayout::Kn,
+        rows: poot_kernelgen::TiledRows::Dense,
+        terms: kg::StagedTerms::of(precision, None, None),
+        weight_bits: kg::DenseTiledWeight::KnF32.bits(),
+        activation_bits: kg::activation_bits(None),
+    }
+}
+
+/// The tiled shape the cost model ranks for a `MatMul` that takes a tiled route, read as it declares (POOT-1476); `None`
+/// for any other op or route, none of which has a matrix-unit schedule.
+pub(super) fn matmul_cost_shape(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> Option<kg::TiledShape> {
+    let OpKind::MatMul { precision, .. } = eqn.op else {
+        return None;
+    };
+    let tables = GraphTables::from(g);
+    let out_shape = &g.aval(eqn.out).shape;
+    let out_numel = out_numel_saturating(out_shape);
+    let ids = value_ids(eqn);
+    let a = &g.aval(ids[0]).shape;
+    let r = out_shape.len();
+    let (nn, kk) = (out_shape[r - 1], a[a.len() - 1]);
+    match matmul_route(tables, eqn, out_shape, out_numel, caps) {
+        MatMulRoute::Tileable => Some(kn_f32_shape(precision, 1, out_numel / nn.max(1), nn, kk)),
+        MatMulRoute::BatchedTileable => Some(kn_f32_shape(
+            precision,
+            out_shape[..r - 2].iter().product(),
+            out_shape[r - 2],
+            nn,
+            kk,
+        )),
+        MatMulRoute::DecodeGemv | MatMulRoute::AttnGemv | MatMulRoute::Serial => None,
+    }
+}
+
 /// Plan one matmul-family equation (`MatMul`, or a `ContractionEpilogue` over a `MatMul` head).
 #[expect(clippy::too_many_arguments)]
 pub(super) fn plan(
@@ -286,6 +334,7 @@ pub(super) fn plan(
             // card 181 Bug 2: the one-thread-per-output reference kernel folds past the wg-bump's own
             // ceiling onto the same 2-D grid Unary/Binary/scatter/DUS use (see `is_elementwise_2d`).
             let serial = || {
+                refuse_unless_exact(site, precision)?;
                 generate(KernelRequest::Contraction(ContractionSpec::Serial {
                     dt: fty(odt),
                     epilogue: None,
@@ -309,17 +358,7 @@ pub(super) fn plan(
                     dense_tiled_plan(
                         site,
                         backend,
-                        kg::TiledShape {
-                            blocks: 1,
-                            m_per_block: out_numel / nn.max(1),
-                            out_per_block: nn,
-                            k: kk,
-                            layout: WeightLayout::Kn,
-                            rows: poot_kernelgen::TiledRows::Dense,
-                            terms: kg::StagedTerms::of(precision, None, None),
-                            weight_bits: kg::DenseTiledWeight::KnF32.bits(),
-                            activation_bits: kg::activation_bits(None),
-                        },
+                        kn_f32_shape(precision, 1, out_numel / nn.max(1), nn, kk),
                         kg::DenseTiledWeight::KnF32,
                         None,
                         precision,
@@ -335,17 +374,13 @@ pub(super) fn plan(
                     dense_tiled_plan(
                         site,
                         backend,
-                        kg::TiledShape {
-                            blocks: out_shape[..r - 2].iter().product(),
-                            m_per_block: out_shape[r - 2],
-                            out_per_block: nn,
-                            k: kk,
-                            layout: WeightLayout::Kn,
-                            rows: poot_kernelgen::TiledRows::Dense,
-                            terms: kg::StagedTerms::of(precision, None, None),
-                            weight_bits: kg::DenseTiledWeight::KnF32.bits(),
-                            activation_bits: kg::activation_bits(None),
-                        },
+                        kn_f32_shape(
+                            precision,
+                            out_shape[..r - 2].iter().product(),
+                            out_shape[r - 2],
+                            nn,
+                            kk,
+                        ),
                         kg::DenseTiledWeight::KnF32,
                         None,
                         precision,
@@ -355,21 +390,23 @@ pub(super) fn plan(
                 }
                 MatMulRoute::DecodeGemv => {
                     // Decode GEMV (M=1 shared-weight matmul, single-seq or batched): the one generated
-                    // `gemv_lds` body, one workgroup of GEMV_WIDTH lanes per output element, B baked as a
+                    // `gemv_lds` body, one workgroup of `lds_gemv_width` lanes per output element, B baked as a
                     // const and the batch read from the flat output index, so the dispatch binds
                     // [x, weight, out] with no metadata buffer. `decode_gemv_plan` also owns the large-N
                     // watchdog-safety chunking (card 258): above the trigger it launches the same body over
                     // disjoint ranges of the output, never a different body.
+                    refuse_unless_exact(site, precision)?;
                     decode_gemv_plan(site, backend, kk, nn, out_numel, precision, caps)?
                 }
                 MatMulRoute::AttnGemv => {
                     // decode attention scores@V: LDS-parallel reduction over cap (card 143 Lever 1b), the
                     // batched-per-row sibling of is_decode_gemv's shared-weight decode GEMV.
+                    refuse_unless_exact(site, precision)?;
                     generate(KernelRequest::Contraction(
                         ContractionSpec::AttnScoresVGemv {
                             cap: kk,
                             d: nn,
-                            width: GEMV_WIDTH,
+                            width: lds_gemv_width(caps),
                             numel: out_numel,
                             precision,
                         },
@@ -415,17 +452,7 @@ pub(super) fn plan(
                 return dense_tiled_plan(
                     site,
                     backend,
-                    kg::TiledShape {
-                        blocks: 1,
-                        m_per_block: out_numel / nn.max(1),
-                        out_per_block: nn,
-                        k: a[a.len() - 1],
-                        layout: WeightLayout::Kn,
-                        rows: poot_kernelgen::TiledRows::Dense,
-                        terms: kg::StagedTerms::of(precision, None, None),
-                        weight_bits: kg::DenseTiledWeight::KnF32.bits(),
-                        activation_bits: kg::activation_bits(None),
-                    },
+                    kn_f32_shape(precision, 1, out_numel / nn.max(1), nn, a[a.len() - 1]),
                     kg::DenseTiledWeight::KnF32,
                     Some(epilogue),
                     precision,
@@ -433,6 +460,7 @@ pub(super) fn plan(
                     caps,
                 );
             }
+            refuse_unless_exact(site, precision)?;
             generate(KernelRequest::Contraction(ContractionSpec::Serial {
                 dt: fty(odt),
                 epilogue: Some(epilogue),
@@ -483,7 +511,14 @@ pub(super) fn register_tiled_launch(
     caps: &DeviceCaps,
 ) -> Result<(kg::RegisterTiling, Vec<TiledDispatch>), PlanError> {
     let overflow = || site.refuse(Capability::DispatchSizeOverflow);
-    let tiling = kg::RegisterTiling::choose(shape, caps);
+    // A narrowed or split read runs on a matrix unit or not at all (POOT-1476): a scalar tiling would round for no speed,
+    // and the pass that narrowed the op asked this same function. A refusal, never a silent exact plan.
+    let tiling = if shape.terms.fragment.is_some() {
+        kg::RegisterTiling::fragment_tiling(shape, caps)
+            .ok_or_else(|| site.refuse(Capability::NoMatrixUnitSchedule))?
+    } else {
+        kg::RegisterTiling::choose(shape, caps)
+    };
     let (tile_rows, tile_cols) = tiling.output_tile();
     // A grouping's tile is one output tile: a tiling of other rows would read two buckets' rows as one expert's.
     if !shape.admits_tile_rows(tile_rows) {
@@ -528,6 +563,19 @@ pub(super) fn register_tiled_launch(
         })
         .collect::<Result<Vec<_>, PlanError>>()?;
     Ok((tiling, dispatches))
+}
+
+/// The refusal of a narrowed or split read at a schedule that has no matrix unit (a serial or scalar body, a GEMV
+/// with no matrix-unit alternative): it would round for no speed (POOT-1476).
+pub(super) fn refuse_unless_exact(
+    site: Site<'_>,
+    precision: OperandPrecision,
+) -> Result<(), PlanError> {
+    if precision.is_exact() {
+        Ok(())
+    } else {
+        Err(site.refuse(Capability::NoMatrixUnitSchedule))
+    }
 }
 
 /// How many tiles of a register-tiled contraction one dispatch covers: all of them on a device with no watchdog

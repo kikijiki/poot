@@ -8,6 +8,11 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# The cost-model fit (`fit_cost_ratios`) the `calibrate_launch` device examples run: a measurement tool's code, not
+# a production path (ADR-0113).
+test-support = []
+
 [dependencies]
 poot-kernel-ir.workspace = true
 # `generate` reads the target's `Backend` and `DeviceCaps` (the leaf crate every poot crate may depend on).

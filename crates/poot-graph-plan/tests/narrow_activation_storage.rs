@@ -1,5 +1,5 @@
 //! POOT-1448: a value whose every reader narrows it is stored narrow, rounded once by the region that computes it
-//! (`store_narrowed_activations`, `receipts/1448-activation-narrowed-once/design.md`).
+//! (`store_narrowed_activations`, POOT-1448).
 //!
 //! Every row drives the production `compile` on a transformer block (a norm, three projections of it, a gated MLP
 //! and the residual adds) and reads the program it returns. The bf16 rows run on a gfx11 device whose unit offers
@@ -48,6 +48,7 @@ fn rocm_bf16() -> Target {
         FragmentLayout::Declared(LaneMap::Rdna3),
         32,
         FragmentConfig::ANY_WAVES,
+        Queried::Known(poot_target::calibration::GFX11_MATRIX_FMA_RATE),
     )]));
     Target::Gpu { backend, caps }
 }

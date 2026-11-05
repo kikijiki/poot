@@ -1,4 +1,4 @@
-//! POOT-1438: the tier-3 gates of the narrow operand path (`receipts/1429-narrow-operands/design.md` 6.3).
+//! POOT-1438: the tier-3 gates of the narrow operand path (POOT-1429).
 //!
 //! A real checkpoint is compiled twice on one device and one weight upload: once under
 //! [`MatmulPrecision::Exact`] and once under [`MatmulPrecision::Narrow`]. Both programs score the same token
@@ -13,7 +13,7 @@
 //!
 //! The greedy criterion is ADR-0101 decision 3's tie rule, not a top-1 fraction: a flip is allowed only where the
 //! reference's (Exact's) gap between its top token and the narrow program's top token is within the tie
-//! tolerance delta = 2 x the recorded max-shift ceiling (`receipts/1454-narrow-dtype-policy/design.md`
+//! tolerance delta = 2 x the recorded max-shift ceiling (POOT-1454
 //! section 9). The max-shift gate enforces it: a flip at position p means
 //! `narrow[t_n] >= narrow[t_e]`, so `exact[t_e] - exact[t_n] <= shift(t_n) - shift(t_e) <= 2 x max shift`; a
 //! program within its shift ceiling therefore cannot flip a token beyond the tie tolerance, and one that does
@@ -327,11 +327,29 @@ fn row(
         "the exact program narrowed: {:?}",
         measured.exact_ops
     );
-    assert!(
-        narrowed(&measured.narrow_ops, contraction) > 0,
-        "the narrow program narrows no op to {contraction:?}: {:?}",
-        measured.narrow_ops
-    );
+    // RADV (POOT-1476): the planner narrows an op only where a cooperative-matrix schedule beats the exact one. Through
+    // wgpu (one wave per workgroup) none does, so the narrow policy leaves every op exact and the two programs agree
+    // bit for bit. Through raw Vulkan (several waves) the large projections of some checkpoints do and others' do not, so
+    // a row either narrows to `contraction` or is exact throughout. The narrowed kernels are also held to the declared
+    // oracle by the device parity rows.
+    let all_exact = measured.narrow_ops.keys().all(|k| k == "exact");
+    match choice {
+        BackendChoice::Wgpu => assert!(
+            all_exact,
+            "the planner narrowed an op through wgpu: {:?}",
+            measured.narrow_ops
+        ),
+        BackendChoice::Vulkan => assert!(
+            all_exact || narrowed(&measured.narrow_ops, contraction) > 0,
+            "the narrow program narrows to another dtype than {contraction:?}: {:?}",
+            measured.narrow_ops
+        ),
+        _ => assert!(
+            narrowed(&measured.narrow_ops, contraction) > 0,
+            "the narrow program narrows no op to {contraction:?}: {:?}",
+            measured.narrow_ops
+        ),
+    }
     if let Some(only) = fragments {
         let other = match only {
             FragmentDtype::Bf16 => FragmentDtype::F16,

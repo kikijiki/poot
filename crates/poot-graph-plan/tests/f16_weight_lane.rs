@@ -1,5 +1,4 @@
-//! POOT-1477: the driver stores its dense BF16 weights in one format (`receipts/1471-narrow-without-range-guards/
-//! design.md` sections 2.5 and 5.2). Under the narrow policy on a unit that multiplies in f16, a BF16 weight that
+//! POOT-1477: the driver stores its dense BF16 weights in one format (POOT-1471). Under the narrow policy on a unit that multiplies in f16, a BF16 weight that
 //! only dense contractions and embedding row gathers read is declared F16 by `compile` (the bind converts the
 //! checkpoint's bf16 words once, POOT-1458), whichever schedule the readers plan; any other BF16 weight keeps the
 //! checkpoint's format. Every row drives the production `compile` on RADV caps (f16 fragments only).

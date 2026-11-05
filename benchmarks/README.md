@@ -291,7 +291,7 @@ needs the gcc runtime and TheRock's own HSA library on the path, see `flake.nix`
 memory traffic), and writes `<out>/<case>/summary.{md,json}` for the case's hot kernel (`scripts/profile-rocm-kernel`).
 It takes `/tmp/poot-gpu.lock`. Counter passes serialize dispatches and perturb clocks, so they are a diagnostic like any
 profiled time: they never supply a speed metric. gfx1151 offers no WMMA-busy, instruction-cache or `s_waitcnt` counters
-and `--kernel-trace` crashes against the runtime's raw HSA queues; `receipts/1443-rocm-counters/` records both and the
+and `--kernel-trace` crashes against the runtime's raw HSA queues; POOT-1443 records both and the
 limiter each fragment-contraction cell shows.
 
 ### Run it (needs a GPU + the runners built/installed)

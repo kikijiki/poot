@@ -331,3 +331,19 @@ fn an_f16_overflow_stays_non_finite_on_ptx() {
     poot_executor_parity::f16_range::run_past_range(exec.as_mut(), t)
         .unwrap_or_else(|e| panic!("{e}"));
 }
+
+/// The opt-in range detector on ptx (`--check-ranges`): past-range blocks fault naming a contraction's
+/// activation, an in-range block passes, and a softcapped attention whose query is past f16's range is finite
+/// without the detector and a fault naming layer 17's attention query with it
+/// (`poot_executor_parity::range_check`). Mutation: in `check_f16_ranges` leave an attention's query out of the
+/// watched operands; the softcap half fails (the run passes).
+#[test]
+fn the_range_detector_names_an_f16_overflow_on_ptx() {
+    let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::range_check::run_range_check(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+}

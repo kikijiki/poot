@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use poot_codegen::{Target, artifact_path};
-use poot_target::{AmdArch, BufferStorage, DeviceCaps};
+use poot_target::{AmdArch, Backend, BufferStorage, DeviceCaps, Queried, RegisterFile};
 
 use crate::attention::{
     AttentionMicro, AttentionSchedule, AttentionSink, AttentionSpec, KeyBound, KeyLayout, LaneTile,
@@ -19,6 +19,12 @@ use crate::helpers::WeightLayout;
 
 /// How a gfx1151 body rounds to a fragment dtype: the ROCm caps' kept conversions (POOT-1458).
 const ROCM_ROUNDING: poot_target::RoundingConversions = poot_target::RoundingConversions::F16;
+
+/// The caps of a gfx1151 ROCm agent: its matrix units and its register file, so the planner's register budget is the
+/// one it derives from the device's own file.
+fn gfx1151_caps() -> DeviceCaps {
+    poot_test_util::device_caps::default_caps_for(Backend::AmdGcn(AmdArch::gfx1151()))
+}
 
 /// `(vgprs, spilled vgprs)` of the kernel in code object `hsaco`, from `llvm-readelf --notes` of the toolchain
 /// that compiled it (next to `$POOT_AMD_CLANG`), or `None` when that tool is absent.
@@ -357,10 +363,11 @@ fn the_fragment_attention_loads_every_operand_fragment_wide() {
 }
 
 /// The register-tiled dense contraction at the tiling the planner chooses for each projection of a prefill
-/// spills no register and keeps its occupancy-friendly register count.
+/// spills no register and keeps its occupancy-friendly register count. Planned on the gfx1151 caps, so the tile is
+/// bounded by the budget derived from the device's register file.
 #[test]
 fn the_dense_register_tiled_contraction_spills_no_register() {
-    let caps = DeviceCaps::rocm_default();
+    let caps = gfx1151_caps();
     for (label, m, n, k) in [
         ("qkv", 8192usize, 4096usize, 2560usize),
         ("down", 8192, 2560, 9728),
@@ -405,8 +412,8 @@ fn the_dense_register_tiled_contraction_spills_no_register() {
 /// operands on the gfx11 matrix unit) spills no register: its accumulator fragments, the operand fragments of a step,
 /// the round in flight and the staging addresses fit the file. Over a bf16 `[N, K]` weight (64-deep rounds, whole or
 /// with a `K` tail) and an f32 `[K, N]` one (32-deep rounds of transposed four-column blocks). Mutation: raise
-/// `MAX_WAVE_FRAGMENTS` to 16; the planner's pick for the long projections holds 128 accumulator registers beside its
-/// operands and the row reads `spilled`.
+/// `ACCUMULATOR_SHARE` to 2 (`poot-target`'s `register_file.rs`); the planner's pick for the long projections holds
+/// 128 accumulator registers beside its operands and the row reads `spilled`.
 #[test]
 fn the_fragment_dense_contraction_spills_no_register() {
     let nk = DenseTiledWeight::Nk(BufferStorage::bf16_packed());
@@ -433,10 +440,7 @@ fn planned_fragment_contraction(
     weight: DenseTiledWeight,
     (m, n, k): (usize, usize, usize),
 ) -> poot_kernel_ir::Body {
-    let caps = DeviceCaps {
-        matrix_units: poot_target::Queried::Known(poot_target::MatrixUnits::amd("gfx1151", 32)),
-        ..DeviceCaps::rocm_default()
-    };
+    let caps = gfx1151_caps();
     let precision = poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::Bf16);
     let (layout, stored) = match weight {
         DenseTiledWeight::Nk(storage) => (WeightLayout::Nk, crate::stored_fragment_dtype(storage)),
@@ -481,7 +485,7 @@ fn planned_fragment_contraction(
 /// memory in 16-byte loads: the weight is staged transposed (its 16 depth values of a column adjacent), so its
 /// fragments load like the activation's. Staged `K`-major, a weight fragment was 16 two-byte loads (`ds_load_u16`,
 /// 128 a round) and the VALU that packs them, the long-gemm cell's 35 non-WMMA VALU per `v_wmma`
-/// (`receipts/1443-rocm-counters`). Mutation: make `MicroTile::staged_major` return `StagedMajor::K` for a fragment;
+/// (POOT-1443). Mutation: make `MicroTile::staged_major` return `StagedMajor::K` for a fragment;
 /// the disassembly shows `ds_load_u16`.
 #[test]
 fn the_fragment_contraction_over_a_kn_weight_loads_every_operand_fragment_wide() {
@@ -626,10 +630,7 @@ fn compiled_k_loop(body: &poot_kernel_ir::Body) -> Option<Vec<String>> {
 /// at the top of the loop header; their wait lands before the multiplies and this row goes red.
 #[test]
 fn the_pipelined_fragment_contraction_loads_ahead_of_its_multiplies() {
-    let caps = DeviceCaps {
-        matrix_units: poot_target::Queried::Known(poot_target::MatrixUnits::amd("gfx1151", 32)),
-        ..DeviceCaps::rocm_default()
-    };
+    let caps = gfx1151_caps();
     let precision = poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::Bf16);
     for (label, weight, layout, stored) in [
         (
@@ -700,4 +701,258 @@ fn the_pipelined_fragment_contraction_loads_ahead_of_its_multiplies() {
             k_loop.join("\n")
         );
     }
+}
+
+/// The narrowed `[N, K]` bf16-weight dense shape of an `m x n x k` problem.
+fn bf16_nk_shape(
+    precision: poot_graph_ir::OperandPrecision,
+    (m, n, k): (usize, usize, usize),
+) -> TiledShape {
+    TiledShape {
+        blocks: 1,
+        m_per_block: m,
+        out_per_block: n,
+        k,
+        layout: WeightLayout::Nk,
+        rows: crate::TiledRows::Dense,
+        terms: crate::precision::StagedTerms::of(
+            precision,
+            None,
+            Some(poot_graph_ir::FragmentDtype::Bf16),
+        ),
+        weight_bits: 16,
+        activation_bits: 32,
+    }
+}
+
+/// The dense `[N, K]` bf16 contraction `tiling` runs over an `m x n x k` problem at `precision`.
+fn bf16_nk_body(
+    name: &str,
+    tiling: RegisterTiling,
+    precision: poot_graph_ir::OperandPrecision,
+    (n, k): (usize, usize),
+    caps: &DeviceCaps,
+) -> poot_kernel_ir::Body {
+    dense_tiled_contraction(
+        name,
+        DenseTiledWeight::Nk(BufferStorage::bf16_packed()),
+        tiling.schedule(),
+        TiledExtents {
+            k,
+            out_per_block: n,
+        },
+        None,
+        crate::contraction::TiledRead {
+            precision,
+            activation_stored: None,
+            conversions: caps.rounding_conversions,
+        },
+    )
+    .unwrap()
+}
+
+/// Whether `tiling` is a fragment tiling.
+fn is_fragment(tiling: RegisterTiling) -> bool {
+    matches!(tiling.schedule(), crate::Schedule::FragmentTiled { .. })
+}
+
+/// The register budget derived from the device's file is the boundary of spilling on gfx1151: every tiling the
+/// planner weighs holds at most the 64 accumulators a quarter of the 256-register lane allows, including the
+/// 8-fragment tile, and the tiling a device with a twice as large lane would add (the cheapest of the long
+/// projections at 128 accumulators, 16 fragments) spills on gfx1151. Mutation: make `ACCUMULATOR_SHARE` 2
+/// (`poot-target`'s `register_file.rs`); the planner's candidates reach 128 accumulators.
+#[test]
+fn the_derived_register_budget_is_the_boundary_of_spilling() {
+    let caps = gfx1151_caps();
+    let precision = poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::Bf16);
+    let (m, n, k) = (8192usize, 4096usize, 2560usize);
+    let shape = bf16_nk_shape(precision, (m, n, k));
+    let planned: Vec<RegisterTiling> = RegisterTiling::candidates(shape, &caps).collect();
+    let most = planned
+        .iter()
+        .map(|tiling| tiling.accumulator_registers())
+        .max()
+        .unwrap();
+    assert_eq!(
+        most, 64,
+        "the derived budget admits 64 accumulators and no more"
+    );
+    assert!(
+        planned
+            .iter()
+            .any(|&tiling| is_fragment(tiling) && tiling.accumulator_registers() == 64),
+        "the 8-fragment tile is within the budget"
+    );
+    // The same file with a lane twice as wide: a quarter of it is 128 accumulators.
+    let wide = DeviceCaps {
+        register_file: Queried::Known(RegisterFile {
+            per_lane: 512,
+            per_workgroup: 2 * caps.register_file.known().unwrap().per_workgroup,
+        }),
+        ..caps
+    };
+    let over = RegisterTiling::choose(shape, &wide);
+    assert_eq!(
+        over.accumulator_registers(),
+        128,
+        "{:?}: the unbounded pick holds 16 fragments",
+        over.schedule()
+    );
+    let body = bf16_nk_body(
+        "budget_over_budget_fragment",
+        over,
+        precision,
+        (n, k),
+        &caps,
+    );
+    let Some((vgprs, spilled)) = compiled_registers(&body) else {
+        return;
+    };
+    eprintln!("{}: {vgprs} VGPRs, {spilled} spilled", body.name);
+    assert!(
+        spilled > 0,
+        "the 128-accumulator tiling fits ({vgprs} VGPRs): the budget refuses what the file holds"
+    );
+}
+
+/// The registers `ptxas -v` reports for one PTX kernel.
+struct PtxRegisters {
+    /// Registers per thread.
+    used: u32,
+    /// Bytes the kernel spills to local memory (stores and loads).
+    spilled_bytes: u32,
+}
+
+/// The CUDA toolkit image `ptxas` is taken from: the ptxas of the image is the NVIDIA compiler the driver's JIT
+/// shares its register allocator with, and no pod or GPU is needed to run it.
+const PTXAS_IMAGE: &str = "docker.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04";
+
+/// What `ptxas -v -arch=sm_80` reports for `body` compiled to PTX, or `None` (a reported skip) where `llc`, `podman`
+/// or the CUDA image is absent. The PTX is the kernel `compile` writes for `Target::Nvptx`, the same artifact a pod
+/// loads.
+fn ptxas_registers(body: &poot_kernel_ir::Body) -> Option<PtxRegisters> {
+    let skip = |why: &str| {
+        poot_test_util::skip_report(
+            "poot-kernelgen",
+            &format_args!("{} ptxas -v: {why}", body.name),
+        );
+        None
+    };
+    if std::process::Command::new("llc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return skip("llc not on PATH");
+    }
+    let image_present = std::process::Command::new("podman")
+        .args(["image", "exists", PTXAS_IMAGE])
+        .status()
+        .is_ok_and(|status| status.success());
+    if !image_present {
+        return skip("no local podman image nvidia/cuda");
+    }
+    let dir = std::env::temp_dir()
+        .join("poot-kernelgen-unit-test")
+        .join(format!("{}_ptxas", body.name));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ptx = dir.join(format!("{}.ptx", body.name));
+    poot_codegen::compile(body, Target::Nvptx, &ptx)
+        .unwrap_or_else(|error| panic!("{}: NVPTX compile: {error}", body.name));
+    let mount = format!("{}:/work:ro,z", dir.display());
+    let output = std::process::Command::new("podman")
+        .args(["run", "--rm", "-v", &mount, PTXAS_IMAGE])
+        .args(["ptxas", "-v", "-arch=sm_80", "-o", "/dev/null"])
+        .arg(format!("/work/{}.ptx", body.name))
+        .output()
+        .expect("podman runs");
+    let report = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "ptxas failed:\n{report}");
+    // `ptxas info : Used 64 registers, ...` and `ptxas info : 0 bytes stack frame, 0 bytes spill stores, 0 bytes
+    // spill loads`.
+    let number_before = |unit: &str| -> u32 {
+        report
+            .split_once(unit)
+            .and_then(|(before, _)| before.trim_end().rsplit(' ').next()?.parse().ok())
+            .unwrap_or_else(|| panic!("no `{unit}` in the ptxas report:\n{report}"))
+    };
+    Some(PtxRegisters {
+        used: number_before(" registers"),
+        spilled_bytes: number_before(" bytes spill stores") + number_before(" bytes spill loads"),
+    })
+}
+
+/// On sm_80 the derived budget keeps the 8 x 8 scalar tile and the 8-fragment tile, and `ptxas` spills neither: the
+/// `ceil` of a quarter of an NVIDIA thread's 255 registers is 64, and a floor would drop the scalar tile (63).
+/// Compiled offline (`ptxas -v -arch=sm_80` from the local CUDA image), so no pod is needed. Two sides: the planner's
+/// candidates on the sm_80 caps include an 8 x 8 scalar tile and reach no more than 64 accumulators, and the tiles
+/// at 64 accumulators spill nothing. Mutation: make `div_ceil` a floor in `RegisterBudget::accumulators`
+/// (`poot-target`'s `register_file.rs`); the candidates lose the 8 x 8 tile and the first assertion names it.
+#[test]
+fn the_budget_keeps_sm_80_at_its_8_by_8_tile_without_a_spill() {
+    let caps = poot_test_util::device_caps::default_caps_for(Backend::Nvptx);
+    let (m, n, k) = (8192usize, 4096usize, 2560usize);
+    for (label, precision) in [
+        ("scalar", poot_graph_ir::OperandPrecision::Exact),
+        (
+            "fragment",
+            poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::Bf16),
+        ),
+    ] {
+        let shape = bf16_nk_shape(precision, (m, n, k));
+        let planned: Vec<RegisterTiling> = RegisterTiling::candidates(shape, &caps).collect();
+        assert_eq!(
+            planned
+                .iter()
+                .map(|tiling| tiling.accumulator_registers())
+                .max(),
+            Some(64),
+            "{label}: the sm_80 budget is 64 accumulators"
+        );
+        let widest = planned
+            .iter()
+            .copied()
+            .filter(|&tiling| is_fragment(tiling) == (label == "fragment"))
+            .max_by_key(|tiling| tiling.accumulator_registers())
+            .unwrap_or_else(|| panic!("no {label} tiling on sm_80"));
+        assert_eq!(widest.accumulator_registers(), 64, "{label}: {widest:?}");
+        let name = format!("budget_sm80_{label}");
+        let body = bf16_nk_body(&name, widest, precision, (n, k), &caps);
+        let Some(registers) = ptxas_registers(&body) else {
+            return;
+        };
+        eprintln!(
+            "{name}: {} registers, {} spilled bytes",
+            registers.used, registers.spilled_bytes
+        );
+        assert_eq!(
+            registers.spilled_bytes, 0,
+            "{name}: ptxas spills {} bytes of {} registers (the planner's tiling must fit the register file)",
+            registers.spilled_bytes, registers.used
+        );
+    }
+    // The other side: the 16-fragment tile a lane of twice the registers would be offered spills on sm_80.
+    let precision = poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::Bf16);
+    let wide = DeviceCaps {
+        register_file: Queried::Known(RegisterFile {
+            per_lane: 510,
+            per_workgroup: 2 * caps.register_file.known().unwrap().per_workgroup,
+        }),
+        ..caps
+    };
+    let over = RegisterTiling::choose(bf16_nk_shape(precision, (m, n, k)), &wide);
+    assert_eq!(over.accumulator_registers(), 128, "{:?}", over.schedule());
+    let body = bf16_nk_body("budget_sm80_over", over, precision, (n, k), &caps);
+    let Some(registers) = ptxas_registers(&body) else {
+        return;
+    };
+    eprintln!(
+        "budget_sm80_over: {} registers, {} spilled bytes",
+        registers.used, registers.spilled_bytes
+    );
+    assert!(
+        registers.spilled_bytes > 0,
+        "the 128-accumulator tiling fits in {} registers: the budget refuses what the file holds",
+        registers.used
+    );
 }

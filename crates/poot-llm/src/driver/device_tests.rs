@@ -4352,6 +4352,137 @@ per_backend!(
     a_nan_router_weight_is_a_typed_validation_fault_ptx
 );
 
+/// The default fixture with the BF16 tensor `key` multiplied by `factor`.
+fn handle_with_tensor_scaled(key: &str, factor: f32) -> Arc<ModelHandle> {
+    let registry = Registry::builtin().unwrap();
+    let fixture = poot_models::test_support::family_fixtures::base(registry.entries()[0].family);
+    let mut config = fixture.config.clone();
+    config["eos_token_id"] = serde_json::json!(NO_EOS);
+    let mut store = WeightStore::builder();
+    let mut found = false;
+    for (name, entry) in fixture.store.iter() {
+        let entry = match entry {
+            WeightEntry::Dense(dense) if name.as_str() == key => {
+                found = true;
+                let bytes: Vec<u8> = dense
+                    .bytes()
+                    .as_slice()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .flat_map(|&pair| {
+                        let value = f32::from_bits(u32::from(u16::from_le_bytes(pair)) << 16);
+                        (((value * factor).to_bits() >> 16) as u16).to_le_bytes()
+                    })
+                    .collect();
+                WeightEntry::Dense(
+                    DenseWeight::try_new(dense.dtype(), dense.shape().to_vec(), bytes.into())
+                        .unwrap(),
+                )
+            }
+            other => other.clone(),
+        };
+        store.insert(name.clone(), entry).unwrap();
+    }
+    assert!(found, "the fixture has no tensor {key}");
+    let raw = RawConfig::HfJson {
+        config: &config,
+        generation: None,
+        preprocessor: None,
+    };
+    Arc::new(
+        ModelHandle::from_checkpoint(&raw, store.build(), &registry, |_| Ok(fixture_text()))
+            .unwrap(),
+    )
+}
+
+/// The refusal a driver on `choice` gives a run of a model whose layer 1 has a normed activation past f16's range
+/// (its input norm weight times 1e6), compiled under `Narrow` with the range detector `range_check`. `None` when the
+/// device is unavailable. One executor per row: a ROCm process leaks HSA resources across sequential executors.
+fn overflow_refusal(choice: BackendChoice, range_check: bool) -> Option<DriverError> {
+    let handle = handle_with_tensor_scaled("model.layers.1.input_layernorm.weight", 1.0e6);
+    let executor = open(choice)?;
+    let options = DriverOptions {
+        matmul_precision: Some(crate::driver::MatmulPrecision::Narrow),
+        ..options(8, CAPACITY)
+    }
+    .with_range_check(range_check);
+    let mut driver = Driver::new(handle, executor, options)
+        .unwrap()
+        .serve(Layout::Contiguous);
+    Some(
+        driver
+            .generate(
+                GenerateRequest {
+                    prompt: PROMPT.to_vec(),
+                    max_new: 4,
+                    sampler: Sampler::greedy(),
+                    stops: Vec::new(),
+                    ignore_eos: false,
+                },
+                &mut |_: u32, _: &str| GenerationControl::Continue(()),
+            )
+            .expect_err("an overflowed activation must not publish tokens"),
+    )
+}
+
+/// POOT-1475: without the detector, an activation past f16's range under `Narrow` never publishes a token: the
+/// step's non-finite logit is refused by the sampler (`DriverError::Sampler`). Mutation: in the sampler's logit
+/// check accept a non-finite value; a token publishes and the row fails.
+fn an_overflow_is_refused_by_the_sampler_without_the_detector(choice: BackendChoice) {
+    let Some(error) = overflow_refusal(choice, false) else {
+        return;
+    };
+    assert!(
+        matches!(error, DriverError::Sampler(_)),
+        "unexpected refusal {error:?}"
+    );
+}
+per_backend!(
+    BackendChoice,
+    an_overflow_is_refused_by_the_sampler_without_the_detector,
+    an_overflow_is_refused_by_the_sampler_without_the_detector_wgpu,
+    an_overflow_is_refused_by_the_sampler_without_the_detector_rocm,
+    an_overflow_is_refused_by_the_sampler_without_the_detector_ptx
+);
+
+/// POOT-1475: with `range_check` the same run stops at the step's validation witnesses, which name layer 1's
+/// contraction activation (`ExecError::Validation`), before any output is read. Mutation: in `check_f16_ranges`
+/// skip every equation of layer 1; the first failing witness is another one and the row fails.
+fn the_detector_names_the_layer_whose_activation_overflows(choice: BackendChoice) {
+    use poot_executor::ExecError;
+    use poot_graph_ir::ValidationPacketError;
+    let Some(error) = overflow_refusal(choice, true) else {
+        return;
+    };
+    // wgpu over RADV runs one-wave fragments, which the planner finds dearer than the exact schedules (POOT-1476):
+    // nothing narrows, the detector has no operand to watch, and the run is refused as it is without the detector.
+    if matches!(choice, BackendChoice::Wgpu) {
+        assert!(
+            matches!(error, DriverError::Sampler(_)),
+            "unexpected refusal {error:?}"
+        );
+        return;
+    }
+    let DriverError::Device(ExecError::Validation(failure)) = error else {
+        panic!("expected a validation fault, got {error:?}");
+    };
+    let ValidationPacketError::Failure(failure) = *failure else {
+        panic!("expected one failing lane, got {failure:?}");
+    };
+    assert!(
+        failure.name.starts_with("f16_range.") && failure.name.contains(".l1."),
+        "the detector names layer 1: {failure}"
+    );
+}
+per_backend!(
+    BackendChoice,
+    the_detector_names_the_layer_whose_activation_overflows,
+    the_detector_names_the_layer_whose_activation_overflows_wgpu,
+    the_detector_names_the_layer_whose_activation_overflows_rocm,
+    the_detector_names_the_layer_whose_activation_overflows_ptx
+);
+
 /// POOT-570 SC-008: MiniMax-M2 uses the same component witness: a NaN in layer 1's router (the tensor
 /// `block_sparse_moe.gate`) is `RouterLogitsFinite` naming layer 1 through the driver. Mutation: drop the
 /// router's witness emission in `components::router`; the NaN publishes tokens and the row goes red.

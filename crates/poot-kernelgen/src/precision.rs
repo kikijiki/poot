@@ -233,7 +233,7 @@ pub(crate) fn store_value(e: &mut Emit, store: Option<FragmentDtype>, x: Local) 
 /// part of its payload; a product is NaN either way). Every result is a value of `dtype`, so a staging step narrows
 /// it exactly ([`poot_kernel_ir::Rvalue::Narrow`]) and the operand is rounded once.
 ///
-/// Two forms, the same bits (POOT-1458, `receipts/1458-f16-rounding/design.md` section 3):
+/// Two forms, the same bits (POOT-1458):
 ///
 /// - Where the device keeps the conversion (`conversions.keeps(dtype)`: f16 on AMDGPU and NVPTX), a `Cast` to
 ///   `dtype` and a `Cast` back: one hardware round-to-nearest-even conversion and one widening, which `llc` never

@@ -167,6 +167,12 @@ pub(crate) struct ServeConfig {
     /// `exact` whichever is asked.
     #[arg(long, value_name = "POLICY", value_parser = parse_matmul_precision)]
     pub(crate) matmul_precision: Option<MatmulPrecision>,
+    /// Debug aid: find where a narrowed run leaves f16's range. Every operand a `narrow` or `split` op rounds to
+    /// f16 gets a witness, and a step with an element past f16's range fails with a validation fault naming the
+    /// first op, its layer and the operand's role, instead of a non-finite logit. Costs a row reduction per
+    /// watched value and a validation readback per step; off by default, when programs carry no witness.
+    #[arg(long)]
+    pub(crate) check_ranges: bool,
     /// Render chats through this jinja template instead of the model's own. A value with no jinja
     /// syntax names a built-in template, which poot lacks, and is refused.
     #[arg(long, value_name = "JINJA", conflicts_with = "chat_template_file")]

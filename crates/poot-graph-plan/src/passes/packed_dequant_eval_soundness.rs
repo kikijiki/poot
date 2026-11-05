@@ -579,7 +579,7 @@ fn packed_indexed_linear_matches_the_per_row_expert_product() {
 /// Mutation: in `evaluate_packed_indexed` read the weight unrounded; the narrow and split rows go red.
 #[test]
 fn a_narrowed_packed_indexed_contraction_reads_its_operands_as_declared() {
-    use poot_graph_ir::{FragmentDtype, MatmulPrecision};
+    use poot_graph_ir::{FragmentDtype, OperandPrecision};
     // Q8_0 experts: a decoded weight is `d * q` with an f16 scale and an 8-bit code, which an f16 does not hold
     // exactly, so rounding the decoded weight changes the product (an E4M3 weight is exact in f16 and could not).
     let descriptor = PackedWeight::try_new(WeightFormat::Q8_0, [3, 32]).unwrap();
@@ -621,10 +621,15 @@ fn a_narrowed_packed_indexed_contraction_reads_its_operands_as_declared() {
         })
         .collect();
     let (graph, inputs) = indexed_graph(descriptor, &experts, &x_data, &route);
-    let target = crate::tests::wgpu_rdna3_target();
     let f16 = FragmentDtype::F16;
-    let run = |policy| {
-        let declared = crate::with_operand_precision(&graph, &target, policy).unwrap();
+    // The precision is declared on the op itself: this row is about the oracle primitive, not about the planner's
+    // choice to narrow (a three-row contraction does not run on a matrix unit, `select_operand_precision`).
+    let run = |precision: OperandPrecision| {
+        let mut edit = graph.edit();
+        for eqn in edit.eqns_mut() {
+            eqn.op = eqn.op.clone().with_operand_precision(precision);
+        }
+        let declared = edit.commit().unwrap();
         let Value::Host(got) = eval(&declared, &inputs, EvalOptions::default())
             .map(|r| r.output)
             .unwrap()
@@ -641,10 +646,10 @@ fn a_narrowed_packed_indexed_contraction_reads_its_operands_as_declared() {
             vec![hi]
         }
     };
-    let exact = run(MatmulPrecision::Exact);
+    let exact = run(OperandPrecision::Exact);
     for (policy, split) in [
-        (MatmulPrecision::Narrow, false),
-        (MatmulPrecision::Split, true),
+        (OperandPrecision::Narrow(f16), false),
+        (OperandPrecision::Split(f16), true),
     ] {
         let got = run(policy);
         for (row, &expert) in route.iter().enumerate() {

@@ -1,4 +1,4 @@
-//! `store_narrowed_activations` (POOT-1448, `receipts/1448-activation-narrowed-once/design.md`): a value whose
+//! `store_narrowed_activations` (POOT-1448): a value whose
 //! every reader narrows it is stored narrow, rounded once by the kernel that computes it.
 //!
 //! Under a narrowed precision a dense contraction reads its activation rounded to the fragment dtype. When every

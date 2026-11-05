@@ -64,13 +64,19 @@ fn narrowed_projections_match_the_declared_oracle_on_wgpu() {
     fixtures.extend(poot_executor_parity::checkpoint_projection_f16_fixtures());
     fixtures.extend(poot_executor_parity::checkpoint_projection_bf16_fixtures());
     fixtures.extend(poot_executor_parity::packed::packed_linear_fixtures());
-    fixtures.extend(poot_executor_parity::packed::packed_expert_fixtures());
+    // The packed expert fixtures are decode-sized indexed contractions (per-row ids, the Gemv rows): no matrix-unit
+    // schedule exists for them, so a declared narrowing is refused; their exact numerics have their own row.
     for policy in [
         poot_graph_ir::MatmulPrecision::Narrow,
         poot_graph_ir::MatmulPrecision::Split,
     ] {
-        poot_executor_parity::precision::run_parity_declared(exec.as_mut(), t, &fixtures, policy)
-            .unwrap_or_else(|e| panic!("{policy:?}: {e}"));
+        poot_executor_parity::precision::run_parity_declared(
+            exec.as_mut(),
+            t,
+            &fixtures,
+            poot_executor_parity::Policy::declared(policy),
+        )
+        .unwrap_or_else(|e| panic!("{policy:?}: {e}"));
     }
 }
 
@@ -100,40 +106,25 @@ fn the_driver_weight_format_matches_the_declared_oracle_on_wgpu() {
     .unwrap_or_else(|e| panic!("{e}"));
 }
 
-/// POOT-1430: an attention that declares `Narrow(f16)` or `Split(f16)` over an f16 KV cache, at decode and as a
-/// 33-row causal prefill, matches the CPU oracle on wgpu: Q, K, V and the probabilities are read as declared by
-/// the streaming, split-KV and tiled schedules the planner picks. Mutation: in `attention::add_products` read the
-/// operands unrounded; the narrow and split rows go red.
+/// POOT-1476: an attention that declares `Narrow(f16)` over an f16 KV cache is refused by name on wgpu. wgpu runs one
+/// wave per workgroup, which is slower than the register tiles on attention (11.6x to 13.8x on the bank's prefill
+/// cells), so the planner has no fragment attention here, and a narrowed attention has no other schedule: the typed
+/// refusal, never the register tiles reading the narrowed operands. Mutation: let `attention_tiling` fall back to the
+/// register tiles for a narrowed spec; the planner plans a scalar narrowed attention and this row goes red.
 #[test]
-fn declared_attention_precision_matches_the_oracle_on_wgpu() {
+fn declared_attention_precision_is_refused_by_name_on_wgpu() {
     let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);
-    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-    // wgpu runs one wave per workgroup, which is slower than the register tiles on attention: the planner keeps
-    // them, so this row holds the register-tiled kernel to the declared oracle.
-    assert!(
-        poot_executor_parity::precision::planned_fragment_attention(
-            exec.as_ref(),
-            t,
-            poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::F16),
-        )
-        .is_err(),
-        "a one-wave fragment attention was planned"
-    );
-    for precision in [
+    let exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    let error = poot_executor_parity::precision::planned_fragment_attention(
+        exec.as_ref(),
+        t,
         poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::F16),
-        poot_graph_ir::OperandPrecision::Split(poot_graph_ir::FragmentDtype::F16),
-    ] {
-        poot_executor_parity::precision::run_parity_declared(
-            exec.as_mut(),
-            t,
-            &poot_executor_parity::precision::attention_fixtures(precision),
-            poot_graph_ir::MatmulPrecision::Exact,
-        )
-        .unwrap_or_else(|e| panic!("{precision}: {e}"));
-    }
+    )
+    .expect_err("a one-wave fragment attention was planned");
+    assert!(error.contains("NoMatrixUnitSchedule"), "{error}");
 }
 
 /// Card 736: the ALiBi attention BLOOM and MPT trace (`alibi_mask_from_pos` over a
@@ -560,8 +551,8 @@ fn a_fused_row_scale_is_bitwise_the_unfused_block_on_wgpu() {
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     let pairs = poot_executor_parity::row_scale::row_scale_pairs();
     for policy in [
-        poot_graph_ir::MatmulPrecision::Narrow,
-        poot_graph_ir::MatmulPrecision::Exact,
+        poot_executor_parity::Policy::declared(poot_graph_ir::MatmulPrecision::Narrow),
+        poot_graph_ir::MatmulPrecision::Exact.into(),
     ] {
         poot_executor_parity::row_scale::run_fused_against_reference(
             exec.as_mut(),
@@ -576,13 +567,13 @@ fn a_fused_row_scale_is_bitwise_the_unfused_block_on_wgpu() {
         exec.as_mut(),
         t,
         &fused,
-        poot_graph_ir::MatmulPrecision::Narrow,
+        poot_executor_parity::Policy::declared(poot_graph_ir::MatmulPrecision::Narrow),
     )
     .unwrap_or_else(|e| panic!("{e}"));
 }
 
-/// The default `Narrow` does not scale an operand past f16's range on wgpu: the contractions and attentions
-/// round to f16 and every step's output carries a non-finite element (`poot_executor_parity::f16_range`). Mutation:
+/// A declared `Narrow` does not scale an operand past f16's range on wgpu: the contractions (the default policy leaves
+/// them exact on RADV, so the row declares the narrowing; wgpu has no fragment attention) round to f16 and every step's output carries a non-finite element (`poot_executor_parity::f16_range`). Mutation:
 /// in `select_operand_precision` skip the narrowing of attention; the attention fixtures no longer round to f16 and
 /// the row fails.
 #[test]
@@ -592,6 +583,22 @@ fn an_f16_overflow_stays_non_finite_on_wgpu() {
     };
     let t = target(&device);
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-    poot_executor_parity::f16_range::run_past_range(exec.as_mut(), t)
+    poot_executor_parity::f16_range::run_past_range_declared(exec.as_mut(), t, false)
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// The opt-in range detector on wgpu (`--check-ranges`): past-range blocks fault naming a contraction's
+/// activation, an in-range block passes, and a softcapped attention whose query is past f16's range is finite
+/// without the detector and a fault naming layer 17's attention query with it
+/// (`poot_executor_parity::range_check`). Mutation: in `check_f16_ranges` leave an attention's query out of the
+/// watched operands; the softcap half fails (the run passes).
+#[test]
+fn the_range_detector_names_an_f16_overflow_on_wgpu() {
+    let Some(device) = wgpu() else {
+        return;
+    };
+    let t = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::range_check::run_range_check(exec.as_mut(), t)
         .unwrap_or_else(|e| panic!("{e}"));
 }

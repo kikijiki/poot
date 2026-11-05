@@ -71,6 +71,8 @@ pub(crate) struct EngineArgs {
     /// The operand-precision policy the operator asked for ([`DriverOptions::matmul_precision`]); `None`
     /// takes the engine default.
     pub(crate) matmul_precision: Option<MatmulPrecision>,
+    /// Whether every program compiles with the range detector ([`DriverOptions::with_range_check`]).
+    pub(crate) check_ranges: bool,
 }
 
 impl EngineArgs {
@@ -83,6 +85,7 @@ impl EngineArgs {
             expert_pool: None,
             kv_dtype: None,
             matmul_precision: None,
+            check_ranges: false,
             rows: None,
             max_seq: DEFAULT_MAX_SEQ,
         }
@@ -97,6 +100,14 @@ impl EngineArgs {
     pub(crate) fn with_matmul_precision(self, matmul_precision: Option<MatmulPrecision>) -> Self {
         Self {
             matmul_precision,
+            ..self
+        }
+    }
+
+    /// Compile every program with the range detector when `check_ranges` is set.
+    pub(crate) fn with_check_ranges(self, check_ranges: bool) -> Self {
+        Self {
+            check_ranges,
             ..self
         }
     }
@@ -762,7 +773,8 @@ fn fit_and_prepare(
                 args.draft.clone(),
                 args.kv_dtype,
                 args.matmul_precision,
-            );
+            )
+            .with_range_check(args.check_ranges);
             let encode = encode_shapes_of(candidate);
             match workload {
                 Workload::Generate { .. } => planner.plan_workload(
@@ -811,7 +823,8 @@ fn fit_and_prepare(
             args.draft.clone(),
             args.kv_dtype,
             args.matmul_precision,
-        ),
+        )
+        .with_range_check(args.check_ranges),
         placement.clone(),
     )?;
     if let Some(slots) = args.expert_pool {

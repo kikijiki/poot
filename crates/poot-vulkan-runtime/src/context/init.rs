@@ -343,6 +343,7 @@ impl Context {
                 reported_configs,
                 COOPMAT_SUBGROUP_SIZE,
                 poot_target::FragmentConfig::ANY_WAVES,
+                poot_target::calibration::vulkan_matrix_fma_rate(props.vendor_id, &device_name),
             )
         } else {
             poot_target::MatrixUnits::NONE

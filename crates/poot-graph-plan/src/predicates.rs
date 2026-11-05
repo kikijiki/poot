@@ -267,10 +267,13 @@ pub fn compute_views(g: &Graph, target: impl Into<TargetId>) -> HashMap<ValueId,
     views
 }
 
-/// Workgroup width (lanes per output column) for the wgpu LDS decode-GEMV (`kernelgen::gemv_lds`), used by
-/// `plan_eqn` for both the `[w,1,1]` workgroup and the planned `N*GEMV_WIDTH`-thread grid. 128 measured
-/// best on RADV STRIX_HALO (Qwen2.5-0.5B decode, fused ms/tok: w=32 50.9, w=64 53.7, w=128 39.8, w=256 45.6).
-pub(crate) const GEMV_WIDTH: usize = 128;
+/// Workgroup width (lanes per output column) for the LDS decode-GEMV (`kernelgen::gemv_lds`), used by `plan_eqn`
+/// for both the `[w,1,1]` workgroup and the planned `N*width`-thread grid: the device's calibrated
+/// [`poot_target::calibration::PerfCalibration::lds_gemv_width`] (128 measured best on RADV STRIX_HALO,
+/// Qwen2.5-0.5B decode).
+pub(crate) fn lds_gemv_width(caps: &DeviceCaps) -> usize {
+    caps.gemm_launch().calibrated.figures().lds_gemv_width as usize
+}
 
 /// Does this MatMul take the decode-GEMV path (`kernelgen::gemv_lds`)? Requires M==1 (`out_shape[-2]==1`)
 /// and a rank-2 `[K,N]` weight (`inputs[1]`), which separates a projection GEMV (`a[B,1,K] @ W[K,N]`) from
@@ -323,7 +326,7 @@ pub(crate) fn gemv_grid(out_numel: usize, caps: &DeviceCaps) -> (usize, usize) {
 }
 
 /// Plan a decode-GEMV (`is_decode_gemv`'s `M==1` shared-weight matmul): the one generated `kernelgen::gemv_lds`
-/// body, one workgroup of [`GEMV_WIDTH`] lanes per output element. Below `caps.watchdog_budget`'s
+/// body, one workgroup of [`lds_gemv_width`] lanes per output element. Below `caps.watchdog_budget`'s
 /// `decode_gemv_out_elems` output elements, or on a device with no watchdog budget at all (no display
 /// watchdog off wgpu/RADV, card 163), it is one dispatch over the whole output on a 2-D grid. Above the
 /// trigger it splits into dispatches of that same body over disjoint ranges of the same output buffer
@@ -355,7 +358,7 @@ pub(crate) fn decode_gemv_plan(
         KernelRequest::Contraction(ContractionSpec::GemvChunk {
             k,
             n,
-            width: GEMV_WIDTH,
+            width: lds_gemv_width(caps),
             elems,
             offset,
             precision,
@@ -371,7 +374,7 @@ pub(crate) fn decode_gemv_plan(
 }
 
 /// A decode GEMV as `kg::gemv_lds` dispatches over disjoint output ranges of one buffer: one workgroup of
-/// [`GEMV_WIDTH`] lanes per output element, at most `caps.max_grid[0]` of them per dispatch (a split plan's dispatch is a
+/// [`lds_gemv_width`] lanes per output element, at most `caps.max_grid[0]` of them per dispatch (a split plan's dispatch is a
 /// single 1-D workgroup count). `request(elems, offset)` builds one dispatch's request, so the weight layout is
 /// the caller's.
 pub(crate) fn gemv_chunks(
@@ -396,32 +399,41 @@ pub(crate) fn gemv_chunks(
 /// The launch a `DenseContraction` decode GEMV runs as a [`kg::Schedule::Gemv`] (M == 1 once every leading dim folds
 /// into M), or `None` when the equation is not one or its launch would not fit the device's X grid. Every weight
 /// dtype the fold admits (F32, packed F16, packed BF16) and every backend take the same generated body; the
-/// launch comes from [`dense_gemv_launch`], the activation read from the planner's [`gemv_activation`]
-/// ([`DenseGemvLaunch::schedule`]).
+/// launch comes from [`gemv_launch`], the activation read from the planner's [`gemv_activation`]
+/// ([`GemvLaunch::schedule`]).
 pub(crate) fn dense_decode_gemv_in(
     eqn: &Eqn,
     out_shape: &[usize],
     out_numel: usize,
     caps: &DeviceCaps,
-) -> Option<DenseGemvLaunch> {
+) -> Option<GemvLaunch> {
     eqn.op.dense_weight()?;
     let n = *out_shape.last()?;
     if out_shape.len() < 2 || n == 0 || out_numel != n {
         return None;
     }
-    let launch = dense_gemv_launch(n, caps.compute_units.known());
+    let launch = gemv_launch(n, GemvFamily::Dense, caps);
     (n.div_ceil(launch.cols as usize) <= caps.max_grid[0] as usize).then_some(launch)
 }
 
-/// The launch shape [`dense_gemv_launch`] picks for a dense Gemv (a [`kg::Schedule::Gemv`]'s fields).
+/// The launch shape [`gemv_launch`] picks for a Gemv (a [`kg::Schedule::Gemv`]'s fields).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DenseGemvLaunch {
+pub(crate) struct GemvLaunch {
     pub(crate) width: u32,
     pub(crate) cols: u32,
     pub(crate) unroll: u32,
 }
 
-impl DenseGemvLaunch {
+impl GemvLaunch {
+    /// The launch as the cost model reads it, over `outputs` dot products.
+    pub(crate) fn cost_shape(self, outputs: usize) -> kg::GemvShape {
+        kg::GemvShape {
+            outputs,
+            width: self.width,
+            cols: self.cols,
+        }
+    }
+
     /// The Gemv of this launch over activation rows of `k` values on `backend`, its activation read from
     /// [`gemv_activation`].
     pub(crate) fn schedule(self, backend: Backend, k: usize) -> kg::Schedule {
@@ -434,40 +446,41 @@ impl DenseGemvLaunch {
     }
 }
 
-/// The Gemv launch policy for a dense `[N, K]` contraction with `n` output columns (Card 727): `width` 256 and `unroll` 4, and `cols` 4 while that still launches at least two workgroups per
-/// compute unit (and the count is known), else 2. A weight row is contiguous along K, so fewer `cols` give each row more lanes
-/// (`256 / cols`) and a longer contiguous run per trip; the narrower fallback keeps a small `N` from starving
-/// the device. Set from the card's sweep on gfx1151 over the qwen2.5-0.5b BF16 decode shapes (wgpu Gemv device
-/// time per token: `cols` 64 7.1 ms, 32 6.0, 16 5.3, 8 4.9, 4 4.7; ROCm decode: 78 to 81 tok/s from `cols` 16 to
-/// 2). The `{64, 32}, else 16` table the spike measured is the `[K, N]` column-tile body's, not this one's.
-pub(crate) fn dense_gemv_launch(n: usize, compute_units: Option<u32>) -> DenseGemvLaunch {
-    // A device whose compute units are unknown cannot show that the wide columns fill it, so it takes the
-    // narrow ones, which launch the most workgroups and never starve it.
-    let wide_fills = compute_units.is_some_and(|units| {
-        n.div_ceil(DENSE_GEMV_WIDE_COLS as usize) >= DENSE_GEMV_WORKGROUPS_PER_CU * units as usize
-    });
-    let cols = if wide_fills {
-        DENSE_GEMV_WIDE_COLS
-    } else {
-        DENSE_GEMV_NARROW_COLS
-    };
-    DenseGemvLaunch {
-        width: DENSE_GEMV_WIDTH,
-        cols,
-        unroll: DENSE_GEMV_UNROLL,
-    }
+/// The weight a Gemv reads, which sets its columns table and its lane run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GemvFamily {
+    /// A dense `[N, K]` weight: the unroll is one vector load of the activation (`gemv_unroll`).
+    Dense,
+    /// A packed weight, its lanes decoding `run` contiguous `K` elements per trip ([`gemv_run`]).
+    Packed { run: u32 },
 }
 
-/// Lanes in a dense Gemv workgroup ([`dense_gemv_launch`]).
-const DENSE_GEMV_WIDTH: u32 = 256;
-/// Contiguous `K` elements a dense Gemv lane reads per trip.
-const DENSE_GEMV_UNROLL: u32 = 4;
-/// Output columns a dense Gemv workgroup owns while `N` still fills the device.
-const DENSE_GEMV_WIDE_COLS: u32 = 4;
-/// Output columns a dense Gemv workgroup owns for a small `N`, so it does not starve the device.
-const DENSE_GEMV_NARROW_COLS: u32 = 2;
-/// Workgroups per compute unit the wide column count must still launch.
-const DENSE_GEMV_WORKGROUPS_PER_CU: usize = 2;
+/// The Gemv launch for a contraction with `outputs` output columns: the one rule behind the dense (card 727) and
+/// packed (card 653) decode Gemv.
+///
+/// `width` and (dense) `unroll` are the device's [`poot_target::calibration::GemmLaunch`] geometry. `cols` is the
+/// family's calibrated `wide` while that still launches [`poot_target::calibration::GemmLaunch::fill_workgroups_per_unit`]
+/// workgroups per compute unit, else its `narrow`: a weight row is contiguous along K, so fewer `cols` give each row
+/// more lanes (`width / cols`) and a longer contiguous run per trip, and the narrower fallback keeps a small `N`
+/// from starving the device. A device whose compute units are unknown cannot show that the wide columns fill it, so
+/// it takes the narrow ones, which launch the most workgroups.
+pub(crate) fn gemv_launch(outputs: usize, family: GemvFamily, caps: &DeviceCaps) -> GemvLaunch {
+    let launch = caps.gemm_launch();
+    let figures = launch.calibrated.figures();
+    let (table, unroll) = match family {
+        GemvFamily::Dense => (figures.dense_gemv_cols, launch.gemv_unroll),
+        GemvFamily::Packed { run } => (figures.packed_gemv_cols, run),
+    };
+    let wide_fills = caps.compute_units.known().is_some_and(|units| {
+        outputs.div_ceil(table.wide as usize)
+            >= launch.fill_workgroups_per_unit as usize * units as usize
+    });
+    GemvLaunch {
+        width: launch.gemv_width,
+        cols: if wide_fills { table.wide } else { table.narrow },
+        unroll,
+    }
+}
 
 /// Workgroup width of a one-thread-per-element kernel folded onto a 2-D grid: always 256 (the portable
 /// Vulkan max). A folded body derives its global index from this width, so the dispatch must not use the
@@ -573,12 +586,13 @@ pub(crate) fn attention_lanes(dv: usize, caps: &DeviceCaps) -> Option<usize> {
 /// (`rows` is `batch * hq * lq`). Grouping loads each selected key and value row once for the group, not once
 /// per head, which is what a prefill chunk's rows spend their time on (Native Sparse Attention's
 /// group-centric loading, arXiv 2502.11089 section 3.4); it divides the workgroups by `n_rep`, so it is kept
-/// for the shapes that still fill the device afterwards, [`WORKGROUPS_PER_COMPUTE_UNIT`] groups per compute
-/// unit. A few-row decode keeps a workgroup per head, whose parallelism it needs more than the shared loads.
+/// for the shapes that still fill the device afterwards, [`poot_target::calibration::GemmLaunch::fill_workgroups_per_unit`] groups per
+/// compute unit. A few-row decode keeps a workgroup per head, whose parallelism it needs more than the shared loads.
 fn groups_selected_heads(rows: usize, n_rep: usize, caps: &DeviceCaps) -> bool {
     // An unknown device cannot show the groups still fill it: keep a workgroup per head.
     caps.compute_units.known().is_some_and(|units| {
-        n_rep > 1 && rows / n_rep >= units as usize * WORKGROUPS_PER_COMPUTE_UNIT
+        n_rep > 1
+            && rows / n_rep >= units as usize * caps.gemm_launch().fill_workgroups_per_unit as usize
     })
 }
 
@@ -647,9 +661,6 @@ const MAX_ATTENTION_SPLITS: usize = 16;
 /// The fewest keys a split walks. A shorter chunk leaves a workgroup's lanes mostly idle and the launch
 /// is the combine's overhead alone.
 const MIN_KEYS_PER_SPLIT: usize = 128;
-/// Workgroups per compute unit the split count aims at: two resident workgroups keep a CU busy while one
-/// waits on its K/V loads.
-const WORKGROUPS_PER_COMPUTE_UNIT: usize = 2;
 
 /// The split-KV factor of a decode attention (`Lq == 1`), or `None` for the streaming schedule.
 ///
@@ -677,7 +688,10 @@ pub(crate) fn attention_splits(
     let rows = spec.row_groups();
     // Splitting fills an idle device; with no compute-unit count there is no idle to prove, so keep streaming.
     let compute_units = caps.compute_units.known()? as usize;
-    let wanted = (compute_units * WORKGROUPS_PER_COMPUTE_UNIT).div_ceil(rows);
+    // The split count aims at the launch's resident workgroups per compute unit: two keep a CU busy while one
+    // waits on its K/V loads.
+    let fill = caps.gemm_launch().fill_workgroups_per_unit as usize;
+    let wanted = (compute_units * fill).div_ceil(rows);
     let splits = wanted
         .min(MAX_ATTENTION_SPLITS)
         .min(spec.candidates() / MIN_KEYS_PER_SPLIT);
@@ -699,15 +713,8 @@ pub(crate) fn attention_splits(
     (y <= caps.max_grid[1] as usize).then_some(splits)
 }
 
-/// Workgroup widths the tiled attention schedule considers, widest first: one wave64 and its multiples up to the
-/// widest workgroup every GPU target allows (`attention_tiling`).
-const TILED_LANES: [usize; 3] = [256, 128, 64];
 /// The most tile rows (query positions times packed heads) one tiled attention workgroup serves.
 const TILED_MAX_ROWS: usize = 128;
-/// Keys per staged block of the tiled attention schedule, widest first. A 64-key block was measured 20-30% slower
-/// than a 32-key one on ROCm and wgpu (Strix Halo) and no faster on PTX (POOT-1402 bank sweep): it doubles the key
-/// tile and the score accumulators for half the barriers, and the barriers were not what bounded the kernel.
-const TILED_KEY_BLOCKS: [usize; 2] = [32, 16];
 /// Keys per staged block of the fragment schedule, widest first. A fragment step multiplies 16 keys at a time and
 /// a block costs five barriers and the softmax's row combine whatever its width, so a wider block spends them on
 /// more multiplies.
@@ -715,11 +722,6 @@ const FRAGMENT_KEY_BLOCKS: [usize; 3] = [64, 32, 16];
 /// Workgroup widths the fragment schedule considers, widest first: whole waves of 32 lanes, down to the one wave a
 /// runtime that cannot widen its subgroups allows.
 const FRAGMENT_LANES: [usize; 5] = [512, 256, 128, 64, 32];
-/// The `f32` accumulators (score tile plus output tile) one lane of a tiled attention holds: half of the 128
-/// registers below which RDNA3 keeps 12 waves per SIMD resident (1536 VGPRs per lane slot) and an NVIDIA SM 16
-/// warps (65536 registers), the other half going to the step's staged operands, the addresses and the row state.
-/// An 80-accumulator tile was measured slower than a 40-accumulator one on wgpu (POOT-1402 bank sweep).
-const TILED_ACCUMULATORS_PER_LANE: usize = 64;
 /// The widest lane tile column count a tiled attention considers: a lane's columns are one register each.
 const TILED_MAX_LANE_COLS: usize = 16;
 
@@ -876,7 +878,9 @@ fn attention_micros(
 ///
 /// - the workgroup is at most the device's widest;
 /// - each lane holds at most its register budget across the key loop: a register tile's two accumulator tiles at
-///   most [`TILED_ACCUMULATORS_PER_LANE`] f32 registers; a fragment tiling's accumulator fragments, and its held
+///   most `register_budget.accumulators` f32 registers (a quarter of what the lane keeps resident: 64 on RDNA3 and
+///   Ampere, where 80 accumulators measured slower than 40 on wgpu, POOT-1402 bank sweep); a fragment tiling's
+///   accumulator fragments, and its held
 ///   Q fragments, at most half of what one lane of the workgroup keeps resident of the device's register file
 ///   ([`poot_target::RegisterFile::per_lane_of`]: the addressing limit or the workgroup's share of the file), the
 ///   other half carrying a step's loaded operands, the staging and the softmax's row state;
@@ -918,9 +922,11 @@ pub(crate) fn attention_tiling(
     // POOT-1437) that is 11.6x (2048) and 13.8x (8192) slower than the f32 register tiles, where the multi-wave
     // ROCm tiling is 2.0x and 2.4x faster.
     let at_least = registers.map_or(0, |schedule| schedule.lanes());
+    // A narrowed or split attention runs only on a matrix unit (POOT-1476): the register tiles are the exact schedule,
+    // and a narrowed read would round for no speed there.
     fragment
         .and_then(|config| attention_tiling_of(spec, caps, Some(config), at_least))
-        .or(registers)
+        .or(registers.filter(|_| spec.precision.is_exact()))
 }
 
 /// [`attention_tiling`]'s best tiling over the micro-tiles `fragment` selects (`None`: register tiles), of workgroups
@@ -933,27 +939,34 @@ fn attention_tiling_of(
     min_lanes: usize,
 ) -> Option<poot_kernelgen::AttentionSchedule> {
     use poot_kernelgen::QOperand;
+    let launch = caps.gemm_launch();
     let lanes_limit =
         (caps.max_workgroup_size[0] as usize).min(caps.max_workgroup_invocations as usize);
     let positions = std::iter::successors(Some(1usize), |br| Some(br * 2))
         .take_while(|br| br * spec.n_rep <= TILED_MAX_ROWS && *br < 2 * spec.lq);
     // A fragment workgroup is whole waves, down to the one wave a runtime that cannot widen its subgroups allows.
+    let register_lanes: Vec<usize> = launch.tiled_lanes().collect();
     let (widths, key_blocks, operands): (&[usize], &[usize], &[QOperand]) = match fragment {
         Some(_) => (
             &FRAGMENT_LANES,
             &FRAGMENT_KEY_BLOCKS,
             &[QOperand::Staged, QOperand::Held],
         ),
-        None => (&TILED_LANES, &TILED_KEY_BLOCKS, &[QOperand::Staged]),
+        // The scalar schedule's key blocks are the device's calibrated figure
+        // ([`poot_target::calibration::PerfCalibration::attention_key_blocks`]).
+        None => (
+            &register_lanes,
+            launch.calibrated.figures().attention_key_blocks,
+            &[QOperand::Staged],
+        ),
     };
-    // The registers one lane of a `lanes`-lane workgroup may hold across the key loop.
+    // The registers one lane of a `lanes`-lane workgroup may hold across the key loop: a register tiling's
+    // accumulators, or a fragment tiling's accumulators and held Q (none where the device reports no register file).
     let budget = |lanes: usize| -> Option<usize> {
+        let lanes = u32::try_from(lanes).ok()?;
         match fragment {
-            None => Some(TILED_ACCUMULATORS_PER_LANE),
-            Some(_) => {
-                let file = caps.register_file.known()?;
-                Some(file.per_lane_of(u32::try_from(lanes).ok()?) as usize / 2)
-            }
+            None => Some(launch.register_budget.accumulators(lanes) as usize),
+            Some(_) => launch.register_budget.held(lanes).map(|held| held as usize),
         }
     };
     let candidates = positions.flat_map(|br| {
@@ -1194,12 +1207,12 @@ pub(crate) const INDEXED_GEMV_MAX_ROWS: usize = 32;
 
 /// The launch an `IndexedMatMul` of `m` rows and `n` columns runs as a [`kg::Schedule::Gemv`] on every backend, or
 /// `None` when it is not a decode shape or its launch would not fit the device's X grid. The launch policy is the
-/// dense Gemv's ([`dense_gemv_launch`]) over the `m * n` outputs.
-pub(crate) fn indexed_gemv_in(m: usize, n: usize, caps: &DeviceCaps) -> Option<DenseGemvLaunch> {
+/// dense Gemv's ([`gemv_launch`]) over the `m * n` outputs.
+pub(crate) fn indexed_gemv_in(m: usize, n: usize, caps: &DeviceCaps) -> Option<GemvLaunch> {
     if m == 0 || n == 0 || m > INDEXED_GEMV_MAX_ROWS {
         return None;
     }
-    let launch = dense_gemv_launch(m * n, caps.compute_units.known());
+    let launch = gemv_launch(m * n, GemvFamily::Dense, caps);
     ((m * n).div_ceil(launch.cols as usize) <= caps.max_grid[0] as usize).then_some(launch)
 }
 

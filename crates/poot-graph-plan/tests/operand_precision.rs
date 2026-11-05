@@ -1,5 +1,7 @@
 //! POOT-1430: the `select_operand_precision` pass writes an op's operand precision from the driver's policy, the
-//! target's matrix units and the operands' dtypes, and nothing else.
+//! target's matrix units, the operands' dtypes and whether the planner runs the narrowed op on a matrix unit
+//! (POOT-1476), and nothing else. The shapes of these rows are real projection and prefill dimensions: a matrix unit
+//! wins for them, and the rows that show it does not (a decode row, one wave) say so.
 //!
 //! Every row drives the production `compile` and reads what the compiled `Program` holds
 //! (the precision each planned op carries, the kernel request behind a plan).
@@ -10,7 +12,7 @@ use poot_graph_ir::{
     OperandPrecision, TensorType,
 };
 use poot_graph_plan::{CompileOptions, KernelChoice, Program, Target, compile};
-use poot_kernelgen::{AttentionSchedule, ContractionSpec, KernelRequest};
+use poot_kernelgen::{ContractionSpec, KernelRequest};
 use poot_target::{AmdArch, Backend, DeviceCaps, MatrixUnits, Queried};
 use poot_tensor::DType;
 
@@ -21,6 +23,7 @@ const F16: OperandPrecision = OperandPrecision::Narrow(FragmentDtype::F16);
 fn rocm_wmma() -> Target {
     let mut caps = DeviceCaps::rocm_default();
     caps.matrix_units = Queried::Known(MatrixUnits::amd("gfx1151", 32));
+    caps.register_file = AmdArch::gfx1151().register_file();
     // The wavefront is the device's: a live agent query reports it, the fixture states it.
     caps.subgroup = Queried::Known(poot_target::SubgroupSupport::Present {
         min_size: 32,
@@ -32,8 +35,17 @@ fn rocm_wmma() -> Target {
     }
 }
 
-/// RADV through wgpu or raw Vulkan: cooperative matrix over f16 only.
+/// RADV through raw Vulkan: cooperative matrix over f16 only, several subgroups per workgroup.
 fn radv() -> Target {
+    Target::Gpu {
+        backend: Backend::SpirvVulkan,
+        caps: poot_test_util::device_caps::vulkan_rdna3_igpu(),
+    }
+}
+
+/// RADV through wgpu: the same unit, but the runtime cannot widen the pipeline's subgroups, so a fragment workgroup is
+/// one wave.
+fn wgpu_one_wave() -> Target {
     Target::Gpu {
         backend: Backend::SpirvVulkan,
         caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
@@ -69,21 +81,27 @@ fn summary(program: &Program) -> Vec<(OperandPrecision, usize)> {
     counts
 }
 
-/// `matmul(x, transpose(w))` over F32 operands: the projection the dense fold turns into a `DenseContraction`.
+/// `matmul(x, transpose(w))` over F32 operands: the projection the dense fold turns into a `DenseContraction`, over
+/// the rows of a prefill chunk.
 fn projection() -> Graph {
+    projection_of(2048)
+}
+
+/// [`projection`] over `rows` activation rows.
+fn projection_of(rows: usize) -> Graph {
     let b = Builder::for_tests();
-    let x = b.constant("x", TensorType::f32(vec![33, 200])).unwrap();
-    let w = b.constant("w", TensorType::f32(vec![37, 200])).unwrap();
+    let x = b.constant("x", TensorType::f32(vec![rows, 1024])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![3072, 1024])).unwrap();
     let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
     b.finish(out).unwrap()
 }
 
-/// One `Attention` equation over an F32 query and a key and value cache stored as `kv`.
+/// One prefill `Attention` equation over an F32 query and a key and value cache stored as `kv`.
 fn attention(kv: DType) -> Graph {
-    let (hq, hkv, cap, d) = (4usize, 2usize, 64usize, 16usize);
+    let (hq, hkv, cap, d, lq) = (16usize, 8usize, 2048usize, 128usize, 2048usize);
     let b = Builder::for_tests();
     let q = b
-        .constant("q", TensorType::f32(vec![1, hq, 32, d]))
+        .constant("q", TensorType::f32(vec![1, hq, lq, d]))
         .unwrap();
     let k = b
         .constant("k", TensorType::new(vec![1, hkv, cap, d], kv))
@@ -92,7 +110,7 @@ fn attention(kv: DType) -> Graph {
         .constant("v", TensorType::new(vec![1, hkv, cap, d], kv))
         .unwrap();
     let mask = b
-        .constant("mask", TensorType::f32(vec![1, 1, 32, cap]))
+        .constant("mask", TensorType::f32(vec![1, 1, lq, cap]))
         .unwrap();
     let mut plan = b.append_plan(0).unwrap();
     let out = plan
@@ -204,15 +222,43 @@ fn rocm_caps_give_f16_contractions_and_f16_attention() {
     );
 }
 
-/// RADV exposes f16 fragments only (Mesa disables bf16 on gfx11), so both families get f16 there and the
-/// planner never sees a bf16 fragment request. Mutation: report bf16 fragments on the cooperative-matrix
-/// lowering (`FragmentUnits::of`); the contraction row picks bf16 and goes red.
+/// RADV exposes f16 fragments only (Mesa disables bf16 on gfx11), so an attention that narrows there reads f16 and the
+/// planner never sees a bf16 fragment request. A contraction does not narrow on RADV at all: the cost model finds the
+/// exact register tiling cheaper than the cooperative-matrix one, whose operands are rounded in integer arithmetic
+/// (POOT-1474 measured narrowed wgpu prefill slower than exact). Mutation: report bf16 fragments on the
+/// cooperative-matrix lowering (`FragmentUnits::of`); the attention row picks bf16 and goes red.
 #[test]
-fn radv_caps_give_f16() {
+fn radv_caps_give_f16_attention_and_exact_contractions() {
     let dense = compiled(&projection(), &radv(), MatmulPrecision::Narrow);
-    assert_eq!(precision_of(&dense, is_dense), F16);
+    assert!(precision_of(&dense, is_dense).is_exact());
     let attention = compiled(&attention(DType::F16), &radv(), MatmulPrecision::Narrow);
     assert_eq!(precision_of(&attention, is_attention), F16);
+}
+
+/// An op the matrix unit does not win stays `Exact` under the `narrow` policy (POOT-1476): a decode projection is a
+/// GEMV, and a wgpu workgroup of one wave is slower than the register tiles for attention. The planner then plans
+/// the exact schedule, with no refusal. Mutation: in `select_operand_precision` skip the planner's answer (narrow
+/// every op the dtype rule admits); the decode and one-wave rows compile to a refusal and go red.
+#[test]
+fn an_op_a_matrix_unit_does_not_win_stays_exact() {
+    for (label, target, graph) in [
+        ("decode on rocm", rocm_wmma(), projection_of(1)),
+        ("decode on radv", radv(), projection_of(1)),
+        (
+            "attention, one wave",
+            wgpu_one_wave(),
+            attention(DType::F16),
+        ),
+    ] {
+        let program = compiled(&graph, &target, MatmulPrecision::Narrow);
+        assert!(
+            summary(&program)
+                .iter()
+                .all(|(precision, _)| precision.is_exact()),
+            "{label}: {:?}",
+            summary(&program)
+        );
+    }
 }
 
 /// A target without a matrix unit compiles `Exact` under any policy: narrowing there would lose accuracy for no
@@ -234,7 +280,7 @@ fn caps_without_a_matrix_unit_give_exact() {
 }
 
 /// An attention takes f16 over any cache dtype where the target has an f16 fragment (no operand is range-scaled, so
-/// no cache dtype is kept out of f16: `receipts/1471-narrow-without-range-guards/design.md` section 4.1): f16, bf16
+/// no cache dtype is kept out of f16: POOT-1471): f16, bf16
 /// and f32 KV all give f16 on ROCm and RADV (RADV has no bf16 cache lane to compile a bf16 cache). Mutation: in
 /// `fragment_dtype` make an attention over a bf16 cache offer bf16 alone; the bf16-on-ROCm row goes red.
 #[test]
@@ -270,33 +316,21 @@ fn bf16_fragments_alone_give_bf16() {
     }
 }
 
-/// A `Split` policy gives `Split` ops, publishes the reassociating-or-looser class, and plans an attention on
-/// the streaming schedule (the tiled schedule stages one tile per operand, so a split operand never takes it).
+/// A `Split` policy gives `Split` contractions on a matrix unit. The tiled attention stages one tile per operand, so
+/// a split operand has no matrix-unit attention schedule and the attention stays `Exact` (the streaming schedule is
+/// exact only). Mutation: let `attention_tiling` offer the register tiles to a split spec; the declared row below
+/// plans a scalar split attention and goes red.
 #[test]
-fn a_split_policy_splits_and_plans_attention_off_the_tiled_schedule() {
-    let program = compiled(&attention(DType::F16), &rocm_wmma(), MatmulPrecision::Split);
+fn a_split_policy_splits_contractions_and_leaves_attention_exact() {
     let split = OperandPrecision::Split(FragmentDtype::F16);
-    assert_eq!(precision_of(&program, is_attention), split);
-    let (eqn, _) = program
-        .planned()
-        .find(|(eqn, _)| is_attention(&eqn.op))
-        .unwrap();
-    let KernelChoice::Generated(KernelRequest::Attention(spec)) = program.kernel_choice(eqn) else {
-        panic!("a generated attention");
-    };
-    assert_eq!(
-        spec.precision, split,
-        "the request carries the declared precision"
-    );
-    assert!(
-        !matches!(spec.schedule, AttentionSchedule::Tiled { .. }),
-        "{:?}",
-        spec.schedule
-    );
+    let dense = compiled(&projection(), &rocm_wmma(), MatmulPrecision::Split);
+    assert_eq!(precision_of(&dense, is_dense), split);
+    let attention = compiled(&attention(DType::F16), &rocm_wmma(), MatmulPrecision::Split);
+    assert!(precision_of(&attention, is_attention).is_exact());
 }
 
-/// The planner hands the declared precision to the kernel request of every contraction schedule it picks: the
-/// register-tiled GEMM at `M > 1` and the decode GEMV at `M = 1` both name `Narrow(f16)`.
+/// The planner hands the declared precision to the kernel request of the matrix-unit schedule it picks: the
+/// register-tiled GEMM at `M > 1` names `Narrow(f16)`, and the decode GEMV at `M = 1` is exact.
 #[test]
 fn the_kernel_request_carries_the_declared_precision() {
     let program = compiled(&projection(), &rocm_wmma(), MatmulPrecision::Narrow);
@@ -312,8 +346,8 @@ fn the_kernel_request_carries_the_declared_precision() {
     }
     let decode = {
         let b = Builder::for_tests();
-        let x = b.constant("x", TensorType::f32(vec![1, 200])).unwrap();
-        let w = b.constant("w", TensorType::f32(vec![37, 200])).unwrap();
+        let x = b.constant("x", TensorType::f32(vec![1, 1024])).unwrap();
+        let w = b.constant("w", TensorType::f32(vec![3072, 1024])).unwrap();
         let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
         b.finish(out).unwrap()
     };
@@ -326,7 +360,7 @@ fn the_kernel_request_carries_the_declared_precision() {
         KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseGemv {
             precision,
             ..
-        })) => assert_eq!(*precision, F16),
+        })) => assert!(precision.is_exact()),
         other => panic!("the decode GEMV, got {other:?}"),
     }
 }
@@ -336,8 +370,8 @@ fn the_kernel_request_carries_the_declared_precision() {
 #[test]
 fn a_declared_precision_stands_under_any_policy() {
     let b = Builder::for_tests();
-    let x = b.constant("x", TensorType::f32(vec![16, 32])).unwrap();
-    let w = b.constant("w", TensorType::f32(vec![32, 16])).unwrap();
+    let x = b.constant("x", TensorType::f32(vec![2048, 1024])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![1024, 3072])).unwrap();
     let declared = OperandPrecision::Split(FragmentDtype::Bf16);
     let out = b.matmul_as(x, w, declared).unwrap();
     let out = b

@@ -133,11 +133,32 @@ Every op that multiplies two float operands (`MatMul`, the dense, grouped, packe
 - `Narrow(bf16 | f16)`: each operand not already of that dtype is rounded to it (nearest even; an f32 beyond f16's range becomes infinity, never a clamp) before the products, which accumulate in f32. Attention rounds Q, K, V and the probabilities where they enter `P V`.
 - `Split(bf16 | f16)`: an f32 operand enters as a high and a low part of that dtype, so the product is near f32 accuracy.
 
-The precision is part of the op, so the CPU oracle evaluates exactly what a device must compute, and every schedule (matrix-unit fragments, scalar micro-tiles, GEMV) reads its operands the same way. The published numerics class follows the ops: a program with a narrow op compares with the narrow-storage tolerance, a split one with the reassociating tolerance.
+The precision is part of the op, so the CPU oracle evaluates exactly what a device must compute. A narrowed or split op runs on a matrix unit only: the planner has no GEMV, scalar-tile or streaming-attention schedule that rounds its operands, because rounding there costs accuracy and buys no speed. The published numerics class follows the ops: a program with a narrow op compares with the narrow-storage tolerance, a split one with the reassociating tolerance.
 
-One driver-wide policy, `--matmul-precision exact|split|narrow`, decides what `compile` writes. The `select_operand_precision` pass reads that policy, the target's matrix units and the operands' dtypes, and nothing else: contractions and attention take f16 where the target has f16 fragments and bf16 otherwise, and a target with no matrix unit for the operands compiles `exact` under any policy. The default is `narrow`; `exact` stays selectable.
+One driver-wide policy, `--matmul-precision exact|split|narrow`, is a permission, not an obligation. The `select_operand_precision` pass reads that policy, the target's matrix units, the operands' dtypes and one answer from the planner: does a matrix-unit schedule beat the exact one for this op? The planner ranks the fragment tilings against the exact scalar tilings and the exact GEMV with one cost model, rounding included.
 
-No operand is range-scaled. A value beyond f16's range (65504) rounds to infinity, the infinity reaches the logits as a non-finite value, and serving refuses that step with a typed error instead of sampling a token. `exact` avoids the rounding. Every checkpoint measured stays inside the range. One case stays finite: a model that softcaps its attention scores (Gemma 2) maps an infinite score to the cap, so an overflowed attention query there gives a wrong but finite row. That is a known limit of the default.
+- Where a matrix unit wins, a contraction or attention takes f16 on a target with f16 fragments and bf16 otherwise.
+- Where it does not, the op stays `exact`: a decode row is a GEMV, a one-wave workgroup (wgpu) costs more than the exact tiles, and a target with no matrix unit has none.
+- The criterion is a property of the schedule, the device and the cost model, never of a shape, a model or a benchmark.
+- The planner holds to the decision: an op that declares a narrowed precision and has no matrix-unit schedule is refused by name, never run exactly in silence.
+
+The default is `narrow`; `exact` stays selectable and is the reproducible policy. Because the decision follows the schedule, the rounding a token sees depends on the batch it is run in: a decode step is exact, a prefill chunk large enough for a matrix unit is narrowed, so greedy outputs can differ with batch occupancy and chunking. `exact` does not.
+
+No operand is range-scaled. A value beyond f16's range (65504) rounds to infinity.
+
+- The infinity reaches the logits as a non-finite value.
+- Serving refuses that step with a typed error instead of sampling a token.
+- `exact` avoids the rounding.
+- Every checkpoint measured stays inside the range.
+
+One case stays finite. A model that softcaps its attention scores (Gemma 2) maps an infinite score to the cap, so an overflowed attention query there gives a wrong but finite row. That is a known limit of the default, and the one the range detector covers.
+
+`--check-ranges` is a compile option, off by default.
+
+- Every operand an f16-narrowed op rounds gets a validation witness, on the same channel the router checks use.
+- A step that leaves the range fails with a typed validation error.
+- The error names the first operation, its layer and the operand, softcap or not.
+- Off, no witness and no extra operation exist: the program is the one compiled without the option.
 
 The generated kernels round to f16 and widen from it with the device's own conversion instructions on ROCm and NVIDIA. On Vulkan they round with integer arithmetic on the f32 bits, because the driver may drop a convert-and-convert-back pair. Both forms give the same bits for every f32 value.
 

@@ -21,7 +21,9 @@ use super::{
 };
 use crate::dtype_widen::ConstLanes;
 use crate::planner::{GraphTables, finalize};
-use crate::predicates::{INDEXED_GEMV_MAX_ROWS, gemv_activation, packed_contraction_m_per_block};
+use crate::predicates::{
+    GemvFamily, GemvLaunch, INDEXED_GEMV_MAX_ROWS, gemv_launch, packed_contraction_m_per_block,
+};
 use crate::refusal::Site;
 use poot_graph_ir::{ContractionRows, ExpertRows, OperandPrecision};
 use poot_kernelgen::{
@@ -179,7 +181,7 @@ fn try_plan_row_gather(
 /// `Blocks` carrier (with an epilogue, its leaves sit between the carriers and the metadata). The schedule is
 /// chosen from shapes alone
 /// (dquant.md D3, section 5): `M == 1` (one activation row per block) is `Schedule::Gemv`, its launch
-/// shape from the output count and the device's compute units ([`gemv_schedule`], card 653); `M > 1`
+/// shape from the output count and the device's compute units ([`packed_gemv_launch`], card 653); `M > 1`
 /// is `Schedule::RegisterTiled` (card 542b, dquant.md D6/Q9; POOT-1193), so prefill does not fall back to
 /// `Schedule::Serial` now that Card 545b has deleted the hand-written `TiledRegionDequant` family. Its lanes each
 /// accumulate a register tile, so one workgroup computes a [`Schedule::output_tile`]-sized output tile (chosen
@@ -241,8 +243,22 @@ fn try_plan_contraction(
             let out_per_block = out / blocks;
             let m_per_block = packed_contraction_m_per_block(g, eqn, descriptor, blocks);
             let rows = blocks * m_per_block;
-            if m_per_block == 1 {
-                let schedule = gemv_schedule(site, backend, rows * out_per_block, k, format, caps)?;
+            let tiled = packed_blocks_shape(
+                descriptor,
+                blocks,
+                (m_per_block, k, out_per_block),
+                precision,
+            );
+            // A decode row takes the Gemv unless the read is narrowed: that runs on a matrix unit or is refused.
+            let gemv = if m_per_block == 1 && precision.is_exact() {
+                Some(
+                    packed_gemv_launch(site, rows * out_per_block, format, caps)?
+                        .schedule(backend, k),
+                )
+            } else {
+                None
+            };
+            if let Some(schedule) = gemv {
                 let grid = [
                     schedule.grid_threads(blocks, m_per_block, out_per_block) as u32,
                     1,
@@ -254,21 +270,7 @@ fn try_plan_contraction(
                 };
                 (schedule, vec![launch])
             } else {
-                let (tiling, dispatches) = matmul::register_tiled_launch(
-                    site,
-                    TiledShape {
-                        blocks,
-                        m_per_block,
-                        out_per_block,
-                        k,
-                        layout: WeightLayout::Nk,
-                        rows: poot_kernelgen::TiledRows::Dense,
-                        terms: poot_kernelgen::StagedTerms::of(precision, None, None),
-                        weight_bits: poot_kernelgen::packed_value_bits(descriptor.format()),
-                        activation_bits: poot_kernelgen::activation_bits(None),
-                    },
-                    caps,
-                )?;
+                let (tiling, dispatches) = matmul::register_tiled_launch(site, tiled, caps)?;
                 let launches = dispatches
                     .into_iter()
                     .map(|TiledDispatch { grid, meta }| PackedLaunch { grid, meta })
@@ -377,50 +379,28 @@ struct PackedLaunch {
     meta: Vec<u32>,
 }
 
-/// The `Schedule::Gemv` launch policy for a packed contraction with `outputs` output columns (card
-/// 653): the widest candidate `cols` that still launches at least two
-/// workgroups per compute unit (S60-3), else the narrowest - over this arm's own measured table.
-/// A packed weight is `[N, K]` with `K` contiguous, so `cols` sets how many lanes share one row
-/// (`256 / cols`) and so how long a contiguous run each trip reads; at well under two bytes per
-/// element the packed body wants more lanes per row than the dense BF16 column-tile table ({64, 32},
-/// else 16, 4-element runs) gives. Chosen from a per-kernel sweep on gfx1151 over the qwen2.5-0.5b
-/// GGUF projection shapes (card 653's receipt): {16, 8} with 8-element runs was 3.7 ms of Gemv
-/// device time per Q4_K_M token against 4.2 ms for the dense table and 9.7 ms for the pre-card
-/// one-column-per-workgroup body.
+/// The `Schedule::Gemv` launch for a packed contraction with `outputs` output columns: [`gemv_launch`]'s rule over
+/// the packed family's calibrated columns (card 653: {16, 8} with 8-element runs was 3.7 ms of Gemv device time per
+/// Q4_K_M token on gfx1151 against 4.2 ms for the dense table and 9.7 ms for the one-column-per-workgroup body). A
+/// packed weight is `[N, K]` with `K` contiguous, so `cols` sets how many lanes share one row and so how long a
+/// contiguous run each trip reads.
 ///
-/// A lane's run (`unroll`, the contiguous K elements it decodes per trip) is [`gemv_run`], from what the
-/// format's decode shares across a run and the class's calibrated cap (POOT-1398); the activation read over rows
-/// of `k` values is [`gemv_activation`]'s (POOT-1405).
-fn gemv_schedule(
+/// A lane's run (`unroll`, the contiguous K elements it decodes per trip) is [`gemv_run`], from what the format's
+/// decode shares across a run and the device's calibrated cap (POOT-1398); the activation read over rows of `k`
+/// values is [`crate::predicates::gemv_activation`]'s (POOT-1405).
+fn packed_gemv_launch(
     site: Site<'_>,
-    backend: Backend,
     outputs: usize,
-    k: usize,
     format: WeightFormat,
     caps: &DeviceCaps,
-) -> Result<Schedule, PlanError> {
-    // The narrowest columns launch the most workgroups: they are the plan for a device whose compute units are
-    // unknown, which cannot show a wider one fills it.
-    let cols = [16, 8]
-        .into_iter()
-        .find(|&cols| {
-            caps.compute_units
-                .known()
-                .is_some_and(|units| outputs.div_ceil(cols) >= 2 * units as usize)
-        })
-        .unwrap_or(8);
+) -> Result<GemvLaunch, PlanError> {
     let sharing = poot_kernelgen::packed_run_sharing(format)
         .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
-    let unroll = gemv_run(
+    let run = gemv_run(
         sharing,
         caps.gemm_launch().calibrated.figures().packed_gemv_max_run,
     );
-    Ok(Schedule::Gemv {
-        width: 256,
-        cols: cols as u32,
-        unroll,
-        activation: gemv_activation(backend, k, unroll),
-    })
+    Ok(gemv_launch(outputs, GemvFamily::Packed { run }, caps))
 }
 
 /// The packed decode Gemv's lane run (POOT-1398, B1 of designs/quant-matmul-1390.md), at most `max_run`, the
@@ -555,6 +535,7 @@ fn plan_indexed(
             else {
                 return Err(site.refuse(Capability::UngroupedExpertRows));
             };
+            matmul::refuse_unless_exact(site, precision)?;
             let threads = word(schedule.grid_threads(1, m, out))?;
             let mut meta = vec![word(k)?, word(out)?, word(m)?, 0, 0];
             meta.extend(&tail);
@@ -592,9 +573,67 @@ fn plan_indexed(
     }
 }
 
+/// The tiled shape of `blocks` block-diagonal packed contractions of `m` activation rows against `[n, k]` weights.
+fn packed_blocks_shape(
+    descriptor: poot_quant::PackedWeight,
+    blocks: usize,
+    (m_per_block, k, out_per_block): (usize, usize, usize),
+    precision: OperandPrecision,
+) -> TiledShape {
+    TiledShape {
+        blocks,
+        m_per_block,
+        out_per_block,
+        k,
+        layout: WeightLayout::Nk,
+        rows: poot_kernelgen::TiledRows::Dense,
+        terms: poot_kernelgen::StagedTerms::of(precision, None, None),
+        weight_bits: poot_kernelgen::packed_value_bits(descriptor.format()),
+        activation_bits: poot_kernelgen::activation_bits(None),
+    }
+}
+
+/// The shapes the cost model ranks for a block-diagonal packed contraction `eqn` read as it declares: the tiled shape
+/// it runs at `M > 1` and, at `M == 1`, the exact Gemv it would otherwise run (POOT-1476). `None` for any other op.
+pub(super) fn packed_cost_shapes(
+    g: GraphTables<'_>,
+    eqn: &Eqn,
+    backend: Backend,
+    caps: &DeviceCaps,
+    limits: BodyLimits,
+) -> Option<(TiledShape, Option<poot_kernelgen::GemvShape>)> {
+    let OpKind::PackedContraction {
+        descriptor,
+        rows: ContractionRows::Blocks(blocks),
+        precision,
+    } = eqn.op
+    else {
+        return None;
+    };
+    let [out, k] = descriptor.shape();
+    let out_per_block = out / blocks;
+    let m_per_block = packed_contraction_m_per_block(g, eqn, descriptor, blocks);
+    let tiled = packed_blocks_shape(
+        descriptor,
+        blocks,
+        (m_per_block, k, out_per_block),
+        precision,
+    );
+    let gemv = (m_per_block == 1)
+        .then(|| {
+            let site = Site::new(g, eqn, backend, limits);
+            let outputs = blocks * m_per_block * out_per_block;
+            packed_gemv_launch(site, outputs, descriptor.format(), caps)
+                .ok()
+                .map(|launch| launch.cost_shape(outputs))
+        })
+        .flatten();
+    Some((tiled, gemv))
+}
+
 /// The packed Gemv of an indexed contraction of `m` rows and `n` columns, or `None` when it is not a decode shape
 /// ([`INDEXED_GEMV_MAX_ROWS`]) or its launch would not fit the device's X grid even at one lane per column:
-/// [`gemv_schedule`]'s table, widening `cols` (columns per workgroup) until the workgroup count fits.
+/// [`packed_gemv_launch`]'s table, widening `cols` (columns per workgroup) until the workgroup count fits.
 fn packed_indexed_gemv(
     site: Site<'_>,
     backend: Backend,
@@ -610,25 +649,23 @@ fn packed_indexed_gemv(
     let Some(outputs) = m.checked_mul(n) else {
         return Ok(None);
     };
-    let Schedule::Gemv {
+    let GemvLaunch {
         width,
         cols,
         unroll,
-        activation,
-    } = gemv_schedule(site, backend, outputs, k, format, caps)?
-    else {
-        unreachable!("gemv_schedule returns a Gemv")
-    };
+    } = packed_gemv_launch(site, outputs, format, caps)?;
     let limit = caps.max_grid[0].max(1) as usize;
     Ok(
         std::iter::successors(Some(cols), |&cols| cols.checked_mul(2))
             .take_while(|&cols| cols <= width)
             .find(|&cols| outputs.div_ceil(cols as usize) <= limit)
-            .map(|cols| Schedule::Gemv {
-                width,
-                cols,
-                unroll,
-                activation,
+            .map(|cols| {
+                GemvLaunch {
+                    width,
+                    cols,
+                    unroll,
+                }
+                .schedule(backend, k)
             }),
     )
 }
@@ -650,12 +687,12 @@ mod tests {
     use crate::{CompileError, CompileOptions, Dispatch, KernelChoice, Target, compile};
 
     /// SC-003 (card 653): a decode (`M == 1`) packed contraction compiled for a device with a
-    /// fixture `DeviceCaps::compute_units` plans the Gemv launch of `gemv_schedule`'s table - 16
+    /// fixture `DeviceCaps::compute_units` plans the Gemv launch of `packed_gemv_launch`'s table - 16
     /// columns per workgroup while that still launches `2 x compute_units` workgroups, else 8,
     /// 256 lanes, 32-element runs (POOT-1398: Q8_0's factor run) - in the plan key, the grid and the body's workgroup. `N = 1280`
     /// and `1264` straddle the 80-workgroup floor at 40 compute units; the same `N = 896` flips
     /// with the compute units alone. Driven through `compile`. Mutation: pin
-    /// `cols` to 16 in `gemv_schedule`; every row whose entry is 8 goes red.
+    /// `cols` to 16 in `packed_gemv_launch`; every row whose entry is 8 goes red.
     #[test]
     fn packed_decode_gemv_launch_follows_the_compute_unit_table() {
         let k = 256;
@@ -818,7 +855,7 @@ mod tests {
     /// are pinned as literals on gfx1151 through HSA and Vulkan (cap 32): 32 for the formats whose sub-block is 32 values (Q4_K,
     /// Q5_K, IQ4_XS, Q4_0, Q8_0), 16 for the 16-value ones (Q6_K, Q2_K, Q3_K), 8 for GPTQ and FP8; the
     /// sm_120 caps it at its measured 16 (POOT-1405) and an unmeasured device, Vulkan or CUDA, at the portable 8. Driven through `compile`. Mutation: plan run 32 for Q6_K in
-    /// `gemv_schedule`; the divisibility and the pinned Q6_K row go red.
+    /// `packed_gemv_launch`; the divisibility and the pinned Q6_K row go red.
     #[test]
     fn the_packed_decode_gemv_run_is_the_factor_run_capped_by_the_device_calibration() {
         let wgpu = DeviceCaps {

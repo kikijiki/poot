@@ -168,12 +168,23 @@ pub struct CompileOptions {
     /// (POOT-1430): the one input of the `select_operand_precision` pass besides the target's caps and the
     /// operands' dtypes. `Exact` narrows nothing.
     pub matmul_precision: MatmulPrecision,
+    /// The opt-in range detector (POOT-1475, `--check-ranges`): the `check_f16_ranges` pass gives every operand an
+    /// f16-narrowed op rounds a validation witness that is 1 when an element is past f16's range, so a step that leaves
+    /// the range is a typed validation fault naming the first op and layer. Off compiles no witness and no extra
+    /// equation: the program, its plan digest and its launch count are the ones compiled without the option.
+    pub range_check: bool,
     /// The one fragment dtype the `select_operand_precision` pass may narrow to, on a device that has several
     /// (the f16 contraction variant of the tier-3 gates on a target with bf16 and f16 units, POOT-1438). The
     /// device keeps every unit; only the pass sees the one, so the program still compiles for the real target.
     /// `None` leaves the choice to the pass. Unused for an NPU target.
     #[cfg(any(test, feature = "test-support"))]
     pub fragment_only: Option<poot_graph_ir::FragmentDtype>,
+    /// Narrow every contraction and attention the dtype rule admits without asking the planner whether a matrix unit
+    /// wins (POOT-1476): a device row that must run a narrowed schedule on a target whose cost model leaves the policy
+    /// exact (RADV, a decode row) states the narrowing here, and the planner holds each such op to a matrix unit or
+    /// refuses it by name. Production compiles ask the planner.
+    #[cfg(any(test, feature = "test-support"))]
+    pub declare_precision: bool,
     /// A single-buffer limit below the GPU target's own, in bytes: legalization fits every constant to the
     /// smaller of the two, so a fixture that needs a split on a device whose real limit is far larger states it
     /// here. `None` fits to the target's limit. Unused for an NPU target.
@@ -195,8 +206,11 @@ impl CompileOptions {
             late: None,
             npu: None,
             matmul_precision: MatmulPrecision::DEFAULT,
+            range_check: false,
             #[cfg(any(test, feature = "test-support"))]
             fragment_only: None,
+            #[cfg(any(test, feature = "test-support"))]
+            declare_precision: false,
             #[cfg(any(test, feature = "test-support"))]
             buffer_limit: None,
             aliases: poot_weights::WeightAliases::none(),
@@ -206,6 +220,12 @@ impl CompileOptions {
     /// These options narrowing operands as `policy` says.
     pub const fn with_matmul_precision(mut self, policy: MatmulPrecision) -> Self {
         self.matmul_precision = policy;
+        self
+    }
+
+    /// These options with the range detector on or off ([`CompileOptions::range_check`]).
+    pub const fn with_range_check(mut self, on: bool) -> Self {
+        self.range_check = on;
         self
     }
 
@@ -955,9 +975,22 @@ pub fn compile(
         if transform::weights_are_f16(options.matmul_precision, units) {
             pipeline.require("store_weights_f16", transform::store_weights_f16)?;
         }
+        let limits = options.limits.body();
         pipeline.require("select_operand_precision", |g| {
-            transform::select_operand_precision(g, options.matmul_precision, units)
+            let views = compute_views(g, target.id());
+            #[cfg(any(test, feature = "test-support"))]
+            let declared = options.declare_precision;
+            #[cfg(not(any(test, feature = "test-support")))]
+            let declared = false;
+            transform::select_operand_precision(g, options.matmul_precision, units, |graph, eqn| {
+                declared || planner::runs_on_matrix_unit(graph, eqn, target, &views, &limits, npu)
+            })
         })?;
+        // The detector's witnesses are new: admit them like every other witness, still on the unfused graph.
+        if options.range_check {
+            pipeline.require("check_f16_ranges", transform::check_f16_ranges)?;
+            device_validation::admit_device_witnesses(pipeline.graph())?;
+        }
     }
     // POOT-1451: the rows of every indexed contraction the target tiles are grouped by expert, block-aligned, so a
     // tile is one expert's rows. After the precision is selected (the block's cost model reads it) and before the

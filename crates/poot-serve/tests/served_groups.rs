@@ -257,7 +257,10 @@ fn driver_options() -> DriverOptions {
         charge: program_retention,
         draft: DraftPolicy::Off,
         hidden_window: None,
-        matmul_precision: None,
+        // Greedy equality between a served batch and `Driver::generate` is a property of the exact policy: the planner
+        // narrows an op where a matrix unit wins (POOT-1476), so the rounding a token sees depends on the rows it is
+        // batched with, and a single decode row is exact where a batch of rows is not.
+        matmul_precision: Some(poot_graph_ir::MatmulPrecision::Exact),
     }
 }
 
@@ -363,6 +366,8 @@ fn command(dir: &Path, backend: &str, extra: &[String], stderr: Stdio) -> (Child
         .arg(dir)
         .arg(addr.to_string())
         .args(["--backend", backend])
+        // The rows compare served tokens with `Driver::generate`'s: exact, see `driver_options`.
+        .args(["--matmul-precision", "exact"])
         .args(extra)
         .stdout(Stdio::null())
         .stderr(stderr)

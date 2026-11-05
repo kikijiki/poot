@@ -147,6 +147,8 @@ pub(super) fn plan(
         };
         return row_runs(site, tiled, backend, caps);
     }
+    // The streaming and split-KV schedules are exact: a narrowed or split read with no matrix-unit tiling is refused.
+    super::matmul::refuse_unless_exact(site, *precision)?;
     let splits = attention_splits(&streaming, caps);
     match splits {
         None => row_runs(site, streaming, backend, caps),
@@ -231,6 +233,7 @@ fn plan_selected(
         schedule: AttentionSchedule::Streaming { lanes },
         precision: attrs.precision,
     };
+    super::matmul::refuse_unless_exact(site, attrs.precision)?;
     // A decode row considers `(K + 1) * ratio` positions however deep the cache is, but a few heads still leave a
     // many-CU device idle: the same split-KV rule divides the candidates.
     match attention_splits(&spec, caps) {
