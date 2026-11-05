@@ -183,7 +183,7 @@ fn exports_survive_cse_dce_and_renumbering_and_every_consumer_sees_its_value() {
         "a boundary fans out past the next stage"
     );
 
-    let chained = chain(&graph, &stage_graphs(&program), &inputs);
+    let chained = chain(&graph, &stage_graphs(&program), &inputs, &mut |_, _| None);
     assert_eq!(bits(&chained.output), bits(&whole.output), "the output");
     for (pair, (got, expected)) in graph.state().zip(chained.state.iter().zip(&whole.state)) {
         assert_eq!(bits(got), bits(expected), "state {} -> {}", pair.0, pair.1);
@@ -484,23 +484,29 @@ impl PoolHost<'_> {
         let mut needed: Vec<usize> = ids.iter().map(|&id| id as usize).collect();
         needed.sort_unstable();
         needed.dedup();
-        assert!(needed.len() <= point.site.slots);
+        assert!(needed.len() <= point.experts().expect("a pooled sync point").slots);
         if self.leave_out_lowest {
             needed.remove(0);
         }
         self.resident.push(needed.clone());
-        let mut map = vec![-1i32; point.site.experts];
+        let mut map = vec![-1i32; point.experts().expect("a pooled sync point").experts];
         for (row, &expert) in needed.iter().enumerate() {
             map[expert] = row as i32;
         }
         let mut writes = HashMap::new();
         writes.insert(
-            point.site.map.clone(),
-            Value::from(HostTensor::i32(vec![point.site.experts], map)),
+            point.experts().expect("a pooled sync point").map.clone(),
+            Value::from(HostTensor::i32(
+                vec![point.experts().expect("a pooled sync point").experts],
+                map,
+            )),
         );
-        for weight in &point.site.weights {
+        for weight in &point.experts().expect("a pooled sync point").weights {
             let (shape, data) = &self.tables[&weight.name];
-            assert_eq!(shape[0], point.site.experts);
+            assert_eq!(
+                shape[0],
+                point.experts().expect("a pooled sync point").experts
+            );
             let per_expert = data.len() / shape[0];
             let mut pool = vec![0.0f32; weight.pool.numel()];
             for (row, &expert) in needed.iter().enumerate() {
@@ -646,11 +652,27 @@ fn a_pooled_moe_program_equals_the_unpooled_oracle_bit_for_bit() {
         assert_eq!(program.sync_points().len(), 3);
         for (layer, point) in program.sync_points().iter().enumerate() {
             assert_eq!(point.after, StageId(layer as u32));
-            assert_eq!(point.site.layer, Some(layer));
-            assert_eq!((point.site.experts, point.site.slots), (EXPERTS, 4));
-            assert_eq!(point.site.weights.len(), 2, "the up and the down table");
-            assert_eq!(point.reads, vec![point.site.ids]);
-            for weight in &point.site.weights {
+            assert_eq!(
+                point.experts().expect("a pooled sync point").layer,
+                Some(layer)
+            );
+            assert_eq!(
+                (
+                    point.experts().expect("a pooled sync point").experts,
+                    point.experts().expect("a pooled sync point").slots
+                ),
+                (EXPERTS, 4)
+            );
+            assert_eq!(
+                point.experts().expect("a pooled sync point").weights.len(),
+                2,
+                "the up and the down table"
+            );
+            assert_eq!(
+                point.reads,
+                vec![point.experts().expect("a pooled sync point").ids]
+            );
+            for weight in &point.experts().expect("a pooled sync point").weights {
                 assert_eq!(weight.pool.shape[0], 4);
             }
         }

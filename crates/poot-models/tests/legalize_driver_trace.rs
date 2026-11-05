@@ -1,12 +1,12 @@
 //! POOT-1017: `legalize` on the graph the DRIVER traces (`Model::trace` over a registry-built qwen2),
-//! driven through `compile`. That tracer reads every dense weight as `Transpose(const [out, in])`
+//! driven through `compile_staged`. That tracer reads every dense weight as `Transpose(const [out, in])`
 //! (`components::linear`: `x @ w^T` over the checkpoint's own layout), the lm_head included, so an
 //! oversized weight is never a bare `MatMul` operand: `legalize` must split the weight behind the
 //! transpose, or `compile` refuses the head (`OversizedConstant`) under a `max_buffer_bytes` below it.
 //!
 //! The reference is `weight_map_oracle::eval_mapped` over the unsplit trace; the compiled program is
 //! evaluated on the same weights, each `<name>.chunkN` const bound as the matching row block of `<name>`
-//! and the hosted `TOKEN_EMBED` as the token's embedding row.
+//! and the hosted `HOSTED_ROWS` slot as the token's embedding row.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -14,9 +14,11 @@ use std::num::NonZeroUsize;
 use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_eval::{EvalOptions, Value, eval, materialize_dense};
 use poot_graph_ir::{Slot, SlotKey, Storage, ValueId};
-use poot_graph_plan::{
-    CompileError, CompileLimits, CompileOptions, LegalizeError, Target, compile,
+use poot_graph_plan::multi_device::topology::DeviceId;
+use poot_graph_plan::staged::{
+    DevicePlacement, ExpertPlacement, Partition, StagedCompileError, TargetSet, compile_staged,
 };
+use poot_graph_plan::{CompileError, CompileLimits, CompileOptions, LegalizeError, Target};
 use poot_models::model::{StepShape, StepSpec};
 use poot_models::registry::{RawConfig, Registry};
 use poot_quant::weights::{WeightEntry, WeightStore};
@@ -41,6 +43,22 @@ fn caps(max_buffer_bytes: u64) -> DeviceCaps {
 
 fn options() -> CompileOptions {
     CompileOptions::new(CompileLimits::STANDARD)
+}
+
+/// `graph` compiled for `target` on one device, through the production entry that hosts the embed gather.
+fn compile_one_device(
+    graph: &poot_graph_ir::Graph,
+    target: Target,
+) -> Result<poot_graph_plan::staged::StagedProgram, StagedCompileError> {
+    compile_staged(
+        graph,
+        &TargetSet::single(DeviceId(0), target),
+        &Partition {
+            experts: ExpertPlacement::AllResident,
+            devices: DevicePlacement::Single(DeviceId(0)),
+        },
+        &options(),
+    )
 }
 
 struct Driver {
@@ -144,8 +162,9 @@ fn driver_compile_splits_transposed_weights_under_a_small_buffer_limit() {
         backend: Backend::SpirvVulkan,
         caps: caps(LIMIT),
     };
-    let program = compile(&d.graph, &target, &options())
+    let staged = compile_one_device(&d.graph, target)
         .expect("every oversized weight splits and the embed hosts");
+    let (_, _, program) = staged.stages().next().expect("one stage");
     let g = program.graph();
 
     // per split weight: (chunks bound so far, rows bound so far)
@@ -167,7 +186,7 @@ fn driver_compile_splits_transposed_weights_under_a_small_buffer_limit() {
         let value = match meta.storage {
             Storage::State => continue,
             Storage::Computed(c) => c.tensor(),
-            Storage::Slot(Slot::Owned(role)) if role == poot_graph_plan::TOKEN_EMBED => {
+            Storage::Slot(Slot::Owned(role)) if role == poot_graph_plan::HOSTED_ROWS => {
                 let table = meta
                     .slot_key()
                     .and_then(SlotKey::tag)
@@ -235,8 +254,8 @@ fn driver_compile_refuses_a_head_no_row_split_can_fit() {
         backend: Backend::SpirvVulkan,
         caps: caps(100),
     };
-    let err = compile(&d.graph, &target, &options()).expect_err("one head row is over 100 bytes");
-    let CompileError::Legalize(refusal) = err else {
+    let err = compile_one_device(&d.graph, target).expect_err("one head row is over 100 bytes");
+    let StagedCompileError::Compile(CompileError::Legalize(refusal)) = err else {
         panic!("expected a legalize refusal, got {err}")
     };
     assert!(

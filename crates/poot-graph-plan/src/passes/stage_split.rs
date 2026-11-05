@@ -33,6 +33,9 @@
 //! graph plus the explicit boundary copies, never stages times values. The [`BoundaryId`] and the
 //! slot key, not the value id, are the names that survive the renumbering.
 //!
+//! A value the uncut graph exports is a boundary too, though no later stage reads it: the host reads it from the
+//! stage that produces it (a hosted gather's device-computed ids, [`crate::staged::SyncAction::GatherRows`]).
+//!
 //! Carried state stays whole: a `(state_in, state_out)` pair whose equations span two stages is
 //! [`StageSplitError::StatePairSplit`]. Each stage's graph keeps only the pairs it owns, so a KV
 //! cache buffer is bound on the device that writes it.
@@ -293,9 +296,15 @@ pub(crate) fn split_stages(
 
     let pair_stage = state_pair_stages(g, &producer, &readers)?;
 
+    // A value the uncut graph exports is one its host reads (a hosted gather's device-computed ids): it is a
+    // boundary of its producing stage even when no later stage reads it.
+    let host_read: BTreeSet<ValueId> = g.exports().map(|export| export.value).collect();
+    let crosses =
+        |value: &ValueId| consuming_stages.contains_key(value) || host_read.contains(value);
+
     let mut boundaries = Vec::new();
     for eqn in g.eqns() {
-        if !consuming_stages.contains_key(&eqn.out) {
+        if !crosses(&eqn.out) {
             continue;
         }
         let aval = g.aval(eqn.out).clone();
@@ -306,7 +315,10 @@ pub(crate) fn split_stages(
             byte_len,
             // A boundary value is by construction defined by an equation.
             producing_stage: producer[eqn.out].expect("a boundary value has a producing equation"),
-            consuming_stages: consuming_stages[&eqn.out].iter().copied().collect(),
+            consuming_stages: consuming_stages
+                .get(&eqn.out)
+                .map(|stages| stages.iter().copied().collect())
+                .unwrap_or_default(),
         });
     }
 
@@ -365,7 +377,7 @@ pub(crate) fn split_stages(
             eqns.iter()
                 .rev()
                 .map(|eqn| eqn.out)
-                .find(|value| consuming_stages.contains_key(value))
+                .find(crosses)
                 .ok_or(StageSplitError::StageWithoutExit { stage })?
         };
 
@@ -700,6 +712,7 @@ mod tests {
                 &graph,
                 &split.stages.iter().map(|s| &s.graph).collect::<Vec<_>>(),
                 &inputs,
+                &mut |_, _| None,
             );
             assert_eq!(
                 bits(&chained.output),

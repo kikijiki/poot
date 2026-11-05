@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use poot_graph_ir::{BinOp, Builder, Graph, TensorType, UnOp};
-use poot_graph_plan::{CompileError, CompileOptions, LegalizeError, NpuTarget, Target, compile};
+use poot_graph_plan::{CompileError, CompileOptions, LegalizeError, NpuTarget, Target};
 use poot_models::model::{LogitRows, StepSpec};
 use poot_models::registry::Registry;
 use poot_quant::format::{GroupMap, ScaleEncoding, WeightFormat};
@@ -69,7 +69,7 @@ fn cell(graphs: &[(&'static str, Graph)], target: &Target) -> Cell {
         ..targets::options()
     };
     for (shape, graph) in graphs {
-        let Err(error) = compile(graph, target, &options) else {
+        let Err(error) = targets::compile_production(graph, target, &options) else {
             continue;
         };
         let shape = *shape;
@@ -1137,13 +1137,17 @@ fn a_real_dimension_cell_is_the_planners_verdict_at_the_real_width() {
         ..targets::options()
     };
     for (shape, graph) in &graphs {
-        let program = compile(graph, &wgpu.target, &options)
+        let program = targets::compile_production(graph, &wgpu.target, &options)
             .unwrap_or_else(|e| panic!("{shape}: the planner refuses Qwen3.8-27B: {e}"));
         let largest = program
-            .graph()
-            .consts()
-            .iter()
-            .map(|&id| const_bytes(program.graph(), id))
+            .stages()
+            .flat_map(|(_, _, stage)| {
+                let g = stage.graph();
+                g.consts()
+                    .iter()
+                    .map(|&id| const_bytes(g, id))
+                    .collect::<Vec<_>>()
+            })
             .max()
             .expect("the program has constants");
         assert!(

@@ -11,14 +11,12 @@
 //! constant stays a device buffer, is hosted, is split, or cannot run at all.
 //!
 //! `compile` (`poot-graph-plan`) runs this as one of its own passes, between `dce` and `fuse`: it is
-//! the one pass whose rewrite can change a graph's declared input set (an oversized embed table
-//! becomes a host-computed `TOKEN_EMBED` input instead of a device `Gather`), so a caller that
-//! binds a graph's inputs before executing it must bind against what `compile` actually produced
-//! (card 523a: a bare call outside `compile` is a second entry point).
+//! the one pass whose rewrite can change a graph's declared input set (a split weight is declared as its
+//! chunks), so a caller that binds a graph's inputs before executing it must bind against what `compile`
+//! actually produced (card 523a: a bare call outside `compile` is a second entry point). A table only a
+//! gather reads is not decided here: `hosted_gather` hosts it whatever its size (POOT-1423), before `compile`.
 //!
-//! Four rewrites, tried in order, before anything still over the limit is refused:
-//! - [`host_oversized_token_gathers`]: an axis-0 `Gather` of an oversized constant by a `Slot::Token`
-//!   index (the tracers' embedding lookup) becomes a host-computed `TOKEN_EMBED` row.
+//! Three rewrites, tried in order, before anything still over the limit is refused:
 //! - [`split_oversized_matmul_weights`]: an oversized 2D weight splits into row chunks that each fit, each chunk
 //!   computed separately and joined by a `Concat` (Card 453 D1's lm_head precedent, generalized to any matmul -
 //!   restoring the "split" capability card 523a's first landing dropped). The weight is read either as the
@@ -40,14 +38,13 @@ use poot_target::dram_channels::DramChannels;
 use poot_target::{Backend, DeviceCaps};
 
 use poot_graph_ir::graph::{
-    EditError, Eqn, Graph, LayerIndex, Operand, Slot, SlotKey, Storage, ValueId, ValueMeta,
+    EditError, Eqn, Graph, LayerIndex, Operand, Storage, ValueId, ValueMeta,
 };
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::ops::MASK_HIDDEN;
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{
-    BinOp, ComputedConst, ContractionRows, KeyLayout, MaskOperand, OwnedSlot, Scalar, StateRole,
-    WeightRef,
+    BinOp, ComputedConst, ContractionRows, KeyLayout, MaskOperand, Scalar, StateRole, WeightRef,
 };
 use poot_quant::PackedWeight;
 use poot_tensor::DType;
@@ -59,30 +56,12 @@ use poot_graph_ir::ValueTable;
 /// The stage name an expansion refusal reports.
 const STAGE: &str = "legalize";
 
-/// The slot of a hosted embed gather: the current token's already-embedded input row `[hidden]`, computed by the
-/// host per step (a single-row dequant, not a device gather) and named after the weight it reads. Legalization
-/// hosts the gather when the embedding table is over a backend's single-buffer limit (gemma4's `hidden=5376`
-/// gives ~5.6 GB, over wgpu's ~2 GB `max_buffer_size`), so a decode graph need not declare the full
-/// `[vocab, hidden]` table as a device-resident `Const`. Its buffer holds the table's rows in the lane the
-/// readers' storage plan chose.
-pub const TOKEN_EMBED: OwnedSlot = OwnedSlot::new("tokenembed", true, |aval, _| {
-    use poot_graph_ir::types::{DTypeClass, DTypeClassExt};
-    (aval.dtype.class() != DTypeClass::Arithmetic).then_some("a float tensor")
-});
-
-/// The key of the hosted embed gather that reads `weight`: the role, tagged with the weight's name, which is how
-/// the executor finds the table the host gathers the rows from.
-fn token_embed_key(weight: WeightRef) -> SlotKey {
-    SlotKey::new(Slot::Owned(TOKEN_EMBED), Some(&weight.name()))
-}
-
 /// Why [`legalize`] could not fit `g` onto a target's device limits.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum LegalizeError {
     /// A named constant is larger than the target's single-buffer limit, and legalize has no rewrite
-    /// for how it is used: today's one rewrite is an axis-0 gather of a constant by a `Slot::Token`
-    /// index (the tracers' embedding lookup); anything else over the limit refuses here, before any
-    /// device allocation is attempted.
+    /// for how it is used: a sole-reader gather table was hosted before `compile`, so what is left over the
+    /// limit refuses here, before any device allocation is attempted.
     #[error(
         "constant {name:?} is {bytes} bytes, over the target's {limit}-byte single-buffer limit \
          (DeviceCaps::max_buffer_bytes), and legalize has no rewrite for its use"
@@ -113,14 +92,10 @@ impl From<poot_graph_ir::EditError> for LegalizeError {
 ///
 /// Tracers and loaders never read a device limit: every model traces
 /// and loads the same graph regardless of backend, and only this pass, given the caller's real
-/// [`DeviceCaps`], decides whether a constant fits as one device buffer. Two rewrites, in order:
-/// [`host_oversized_token_gathers`] (an axis-0 `Gather` of a named constant by a `Slot::Token` index,
-/// over the limit, becomes a host-computed `TOKEN_EMBED` row block named after the constant it
-/// replaces - the binder reads that name to gather the row(s) host-side instead of uploading the whole
-/// table, `poot-llm`'s `gather_token_embed_rows`), then [`split_oversized_matmul_weights`] (an
+/// [`DeviceCaps`], decides whether a constant fits as one device buffer: [`split_oversized_matmul_weights`] (an
 /// oversized 2D weight read by a `DenseContraction`, or through a transpose into a `MatMul`, splits into row
-/// chunks that each fit, joined by a `Concat`). Anything
-/// still over the limit after both rewrites is a typed refusal, before any device allocation (SC-002).
+/// chunks that each fit, joined by a `Concat`) and the expert-stack split. Anything still over the limit after
+/// the rewrites is a typed refusal, before any device allocation (SC-002).
 #[cfg_attr(
     not(any(test, feature = "test-support")),
     allow(
@@ -135,8 +110,7 @@ pub fn legalize(
     limits: &CompileLimits,
 ) -> Result<Graph, LegalizeError> {
     let limit = caps.max_buffer_bytes;
-    let g = host_oversized_token_gathers(g, limit)?;
-    let g = split_oversized_matmul_weights(&g, limit, GraphBudget::of(limits))?;
+    let g = split_oversized_matmul_weights(g, limit, GraphBudget::of(limits))?;
     let g = split_oversized_expert_stacks(&g, backend, limit, GraphBudget::of(limits))?;
     let g = pad_kv_extents(&g, caps, GraphBudget::of(limits))?;
     refuse_oversized_constants(&g, limit)?;
@@ -178,139 +152,17 @@ fn const_bytes(g: &Graph, id: ValueId) -> u64 {
 /// The weight a constant `id` declares, when it is a whole mapped weight: not a packed carrier or a chunk
 /// a pass staged, and not a constant with no [`WeightRef`] at all. Only such a constant can be hosted or
 /// split, because the chunk or the host row block it becomes is named after the weight it is part of.
-fn declared_weight(g: &Graph, id: ValueId) -> Option<WeightRef> {
+pub(super) fn declared_weight(g: &Graph, id: ValueId) -> Option<WeightRef> {
     g.meta(id)
         .weight()
         .filter(|weight| weight.source().is_none() && weight.chunk().is_none())
 }
 
-fn operand_value(o: Operand) -> Option<ValueId> {
+pub(super) fn operand_value(o: Operand) -> Option<ValueId> {
     match o {
         Operand::Value(id) => Some(id),
         Operand::Lit(_) => None,
     }
-}
-
-/// Host every axis-0 `Gather(Const, Slot::Token)` whose constant exceeds `limit`: the gather's output
-/// value becomes a `TOKEN_EMBED` input named after the weight the constant holds (so a binder can
-/// still find the weight to gather host-side), the gather equation is dropped, and the constant (and the token slot,
-/// if nothing else reads it) drop out of the graph's input tables. Every other value keeps its
-/// [`ValueId`], so nothing downstream needs rewiring. A constant is hosted only when every reader of it
-/// is a hosted gather: a tied head (the same table also read by a `MatMul` over its transpose) keeps
-/// the constant, and the later stages split it or refuse it.
-fn host_oversized_token_gathers(g: &Graph, limit: u64) -> Result<Graph, EditError> {
-    let mut dropped_eqns = std::collections::HashSet::new();
-    let mut hosted: Vec<(ValueId, ValueId, ValueId)> = Vec::new(); // (gather output, const, token index)
-    let mut candidates: Vec<(usize, ValueId, ValueId, ValueId)> = Vec::new(); // (eqn, out, const, index)
-
-    for (i, eqn) in g.eqns().iter().enumerate() {
-        let OpKind::Gather { axis } = eqn.op else {
-            continue;
-        };
-        if axis != 0 || eqn.inputs.len() != 2 {
-            continue;
-        }
-        let (Some(data_id), Some(index_id)) =
-            (operand_value(eqn.inputs[0]), operand_value(eqn.inputs[1]))
-        else {
-            continue;
-        };
-        if g.meta(data_id).storage != Storage::Const || declared_weight(g, data_id).is_none() {
-            continue;
-        }
-        if g.meta(index_id).storage != Storage::Slot(Slot::Token) {
-            continue;
-        }
-        if const_bytes(g, data_id) <= limit {
-            continue;
-        }
-        candidates.push((i, eqn.out, data_id, index_id));
-    }
-
-    // The constant leaves the graph, so every reader of it must be a gather being hosted: a live
-    // `MatMul` over `Transpose(w)` (a tied head) would be left reading a value that no longer exists.
-    // Such a constant stays, and `split_oversized_matmul_weights` or `refuse_oversized_constants`
-    // answers for it.
-    let candidate_eqns: std::collections::HashSet<usize> =
-        candidates.iter().map(|&(i, ..)| i).collect();
-    let pinned: HashSet<ValueId> = g.pinned_values().collect();
-    for &(i, out, data_id, index_id) in &candidates {
-        let sole_readers = !pinned.contains(&data_id)
-            && g.eqns().iter().enumerate().all(|(j, e)| {
-                candidate_eqns.contains(&j)
-                    || !e.inputs.iter().any(|&o| operand_value(o) == Some(data_id))
-            });
-        if sole_readers {
-            dropped_eqns.insert(i);
-            hosted.push((out, data_id, index_id));
-        }
-    }
-
-    if hosted.is_empty() {
-        return Ok(g.clone());
-    }
-
-    let eqns: Vec<Eqn> = g
-        .eqns()
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !dropped_eqns.contains(i))
-        .map(|(_, e)| e.clone())
-        .collect();
-
-    let referenced = |id: ValueId| -> bool {
-        eqns.iter()
-            .any(|e| e.inputs.iter().any(|&o| operand_value(o) == Some(id)))
-            || g.result() == id
-            || g.state().any(|(s_in, s_out)| s_in == id || s_out == id)
-            || g.witnesses().any(|v| v.value == id)
-    };
-
-    let mut values = g.values().clone();
-    let mut drop_values = std::collections::HashSet::new();
-    let mut new_inputs = Vec::new();
-    let mut new_slots = Vec::new();
-    for (out, data_id, index_id) in hosted {
-        let weight = declared_weight(g, data_id)
-            .expect("a hosted gather's table is a declared weight: candidates are filtered on it");
-        values[out] = ValueMeta::slot_input(values[out].aval.clone(), token_embed_key(weight))
-            .map_err(poot_graph_ir::EditError::from)?;
-        new_inputs.push(out);
-        new_slots.push((out, Slot::Owned(TOKEN_EMBED)));
-        drop_values.insert(data_id);
-        if !referenced(index_id) {
-            drop_values.insert(index_id);
-        }
-    }
-
-    let inputs: Vec<ValueId> = g
-        .inputs()
-        .iter()
-        .copied()
-        .filter(|id| !drop_values.contains(id))
-        .chain(new_inputs)
-        .collect();
-    let consts: Vec<ValueId> = g
-        .consts()
-        .iter()
-        .copied()
-        .filter(|id| !drop_values.contains(id))
-        .collect();
-    let slots: Vec<(ValueId, Slot)> = g
-        .slots()
-        .iter()
-        .copied()
-        .filter(|(id, _)| !drop_values.contains(id))
-        .chain(new_slots)
-        .collect();
-
-    let mut hosted = g.edit();
-    *hosted.values_mut() = values;
-    *hosted.inputs_mut() = inputs;
-    *hosted.consts_mut() = consts;
-    *hosted.slots_mut() = slots;
-    *hosted.eqns_mut() = eqns;
-    hosted.commit()
 }
 
 /// Refuse (before any device allocation) every remaining LIVE named constant over `limit`: whatever
@@ -1248,6 +1100,7 @@ mod tests {
     use super::*;
 
     use poot_graph_ir::Builder;
+    use poot_graph_ir::graph::Slot;
     use poot_graph_ir::types::TensorType;
     use poot_tensor::DType;
     use poot_weights::{WeightId, WeightRole};
@@ -1280,41 +1133,21 @@ mod tests {
         b.finish(out).unwrap()
     }
 
-    /// SC-002 (host): an embed table over the limit is rewritten to a host-computed `TOKEN_EMBED`
-    /// input named after the constant it replaces, and the gather and the oversized constant are gone.
-    /// Mutation (recorded, not committed): neutering the eqn scan in `host_oversized_token_gathers` so
-    /// it never matches a `Gather` left the 2.18 GB embed `Const` in the graph, which
-    /// `refuse_oversized_constants` then (correctly) refused; `expect` panicked red with `an embed
-    /// table always hosts: OversizedConstant { name: "w.embed", bytes: 2179989504,
-    /// limit: 2147483647 }`. Restoring the scan made the rewrite fire again and the test green.
+    /// POOT-1423: hosting a gather-only table is `hosted_gather`'s decision, made before `compile`, so an
+    /// embed table over the limit that reaches `legalize` (a graph the pass did not host) is refused with the
+    /// typed `OversizedConstant`, never rewritten here.
+    ///
+    /// Mutation: re-add a token-gather rewrite to `legalize`; the table is hosted and the `expect_err` goes red.
     #[test]
-    fn legalize_hosts_an_embed_gather_over_the_limit() {
+    fn legalize_refuses_an_oversized_embed_gather_it_was_not_given_hosted() {
         let g = embed_gather_graph(152_064, 3584); // ~2.18 GB f32, qwen2.5-7b's shape
         let caps = caps_with_limit(2_147_483_647); // wgpu's maxBufferSize
-        let legalized = legalize(&g, BACKEND, &caps, &CompileLimits::STANDARD)
-            .expect("an embed table always hosts");
-
+        let err = legalize(&g, BACKEND, &caps, &CompileLimits::STANDARD)
+            .expect_err("legalize has no rewrite for a gather table");
         assert!(
-            !legalized
-                .eqns()
-                .iter()
-                .any(|e| matches!(e.op, OpKind::Gather { .. })),
-            "the gather is replaced, not merely left decomposed"
+            matches!(err, LegalizeError::OversizedConstant { ref name, .. } if name == "w.embed"),
+            "{err:?}"
         );
-        assert!(
-            legalized.consts().is_empty(),
-            "the oversized const drops out"
-        );
-        assert_eq!(
-            legalized.inputs().len(),
-            1,
-            "one host-computed input replaces token+const"
-        );
-        let id = legalized.inputs()[0];
-        let meta = legalized.meta(id);
-        assert_eq!(meta.storage, Storage::Slot(Slot::Owned(crate::TOKEN_EMBED)));
-        assert_eq!(meta.slot_key().and_then(SlotKey::tag), Some("w.embed"));
-        assert_eq!(meta.aval.shape, vec![hidden_of(&g)]);
     }
 
     /// A tied head: the oversized embed table is also read by a `MatMul` over its transpose. Hosting the
@@ -1343,11 +1176,6 @@ mod tests {
             matches!(err, LegalizeError::OversizedConstant { ref name, .. } if name == "w.embed"),
             "{err:?}"
         );
-    }
-
-    fn hidden_of(g: &Graph) -> usize {
-        // The gather's output shape before legalizing (scalar index drops the vocab axis): [hidden].
-        g.aval(g.result()).shape[0]
     }
 
     /// A small model's embed table fits one device buffer: legalize leaves the dense gather alone.

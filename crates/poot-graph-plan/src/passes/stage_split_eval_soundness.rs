@@ -107,6 +107,7 @@ fn adr0099_s2_split_then_chain_matches_the_unsplit_graph() {
             &graph,
             &split.stages.iter().map(|s| &s.graph).collect::<Vec<_>>(),
             &inputs,
+            &mut |_, _| None,
         );
         assert_eq!(chained.boundaries.len(), expected_boundaries);
         for (id, handed) in &chained.boundaries {

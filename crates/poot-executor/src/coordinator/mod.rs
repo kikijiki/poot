@@ -728,6 +728,7 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
                 links: program.links(),
                 transfers: program.transfers(),
                 sync_points: &[],
+                hosted: program.hosted(),
                 late: None,
             };
             match self.engines[rank].add_part(per_rank_exe[rank], &part) {
@@ -962,6 +963,9 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
             stats.output_read_bytes += device.output_read_bytes;
             stats.waits += device.waits;
             stats.weight_bytes_read += device.weight_bytes_read;
+            stats.hosted_rows += device.hosted_rows;
+            stats.hosted_bytes += device.hosted_bytes;
+            stats.hosted_table_bytes += device.hosted_table_bytes;
             stats.kernels_resolved += device.kernels_resolved;
             stats.recordings += device.recordings;
             for &(role, snapshot) in &device.memory {

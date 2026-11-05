@@ -93,7 +93,7 @@ pub enum ChainError {
     #[error("entry {0:?} is named by two steps of one chain")]
     RepeatedEntry(crate::EntryId),
     /// A step of the chain pauses for the host (a pooled-expert sync point, a late input) or reads its
-    /// tokens on the host (a hosted embed gather), so the next step cannot follow on the device.
+    /// tokens on the host (a hosted gather), so the next step cannot follow on the device.
     #[error("entry {0:?} needs the host between its stages and cannot be chained")]
     NeedsHost(crate::EntryId),
     /// The entry exports no value under the picked-token boundary, or has no slot for the fed token.
@@ -235,6 +235,12 @@ pub enum LoadError {
     UnkeyedSlot {
         /// The slot value without a key.
         value: ValueId,
+    },
+    /// A hosted-rows slot is declared by a stage but by no hosted gather site of the program.
+    #[error("hosted rows slot {key:?} belongs to no hosted gather site of the program")]
+    HostedUndeclared {
+        /// The undeclared slot's key.
+        key: poot_graph_ir::SlotKey,
     },
     /// A stored weight's format cannot be loaded into the lane the plan chose for it.
     #[error("weight {name}: stored {stored} cannot load as planned {planned}")]
@@ -507,25 +513,15 @@ pub enum BindError {
         /// Elements the write carried.
         got_len: usize,
     },
-    /// A hosted embed gather's token id is not a row of its table.
-    #[error("embed {name}: token {token} is not one of its {rows} rows")]
-    TokenOutOfRange {
-        /// The embed's name.
+    /// A hosted gather's id is not a row of its table: the step names a row the checkpoint does not hold.
+    #[error("hosted table {name}: id {id} is not one of its {rows} rows")]
+    HostedRowOutOfRange {
+        /// The table's carrier name.
         name: String,
-        /// The offending token id.
-        token: i32,
-        /// Rows in the embed table.
+        /// The offending id.
+        id: i32,
+        /// Rows in the table.
         rows: usize,
-    },
-    /// A packed embed table's row did not decode into the embed's width (the stored payload no longer matches the shape the map was checked against).
-    #[error("embed {name}: token {token}'s row does not decode: {source}")]
-    EmbedDecode {
-        /// The embed's name.
-        name: String,
-        /// The token whose row failed.
-        token: i32,
-        /// Why the decode refused.
-        source: poot_quant::decode::DecodeError,
     },
     /// A sync wrote pool rows outside the table's pool (`first_row + len > pool_rows`).
     #[error("pooled table {table}: rows {first_row}..{end} are outside its {pool_rows} pool rows")]

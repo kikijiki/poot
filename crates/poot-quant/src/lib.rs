@@ -852,7 +852,8 @@ impl PackedPayload {
     /// the row's blocks for a block format, [`decode::FormatDescriptor::decode_planar_row`] (the
     /// per-value planar decode with its source checks done once per row) for a planar one. `O(K)`
     /// per row, so a whole weight decodes in `O(out * K)`. This is the CPU oracle's only packed
-    /// read (`poot-eval`'s `decode_packed_row`).
+    /// read (`poot-eval`'s `decode_packed_row`); the executor copies stored rows and never decodes one.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn decode_row(&self, row: usize, out: &mut [f32]) -> Result<(), DecodeError> {
         let shape = self.weight.shape;
         if row >= shape[0] {

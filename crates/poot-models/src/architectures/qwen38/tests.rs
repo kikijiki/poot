@@ -1632,15 +1632,11 @@ fn the_ple_history_literals_are_the_references_first_step() {
     assert!(firsts.len() > 1, "{HISTORIES_TOP5:?}");
 }
 
-/// A checkpoint that stores the n-gram table as numbered shards under a scale (the official
-/// release's layout) builds a model whose logits equal the single-table checkpoint's, bit for bit.
-/// Mutation: map the shards in reverse ordinal order in `weights_of`; the shard rows swap and the
-/// logits differ.
-#[test]
-fn a_checkpoint_with_sharded_ple_tables_matches_the_single_table() {
+/// `fixture`'s store with the n-gram table stored as three numbered shards of different sizes under a scale of one
+/// (the official release's layout).
+fn sharded_ple_store(fixture: &Fixture) -> WeightStore {
     use poot_quant::weights::{DenseWeight, WeightEntry};
 
-    let fixture = super::fixture();
     let table = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
     let single = format!("{table}.weight");
     let mut store = WeightStore::builder();
@@ -1682,7 +1678,17 @@ fn a_checkpoint_with_sharded_ple_tables_matches_the_single_table() {
             .insert(format!("{table}.weight_scale"), WeightEntry::Dense(one))
             .unwrap();
     }
-    let store = store.build();
+    store.build()
+}
+
+/// A checkpoint that stores the n-gram table as numbered shards under a scale (the official
+/// release's layout) builds a model whose logits equal the single-table checkpoint's, bit for bit.
+/// Mutation: map the shards in reverse ordinal order in `weights_of`; the shard rows swap and the
+/// logits differ.
+#[test]
+fn a_checkpoint_with_sharded_ple_tables_matches_the_single_table() {
+    let fixture = super::fixture();
+    let store = sharded_ple_store(&fixture);
     let registry = Registry::builtin().unwrap();
     let sharded = registry.build(&fixture.raw(), &store).unwrap();
     let single = built(&fixture);
@@ -1694,4 +1700,63 @@ fn a_checkpoint_with_sharded_ple_tables_matches_the_single_table() {
         got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
         want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
     );
+}
+
+/// POOT-1423 SC-003: the model's per-layer table is a hosted gather whose ids the device computes (the n-gram
+/// hash over the token and the carried history), so the program is cut at one host sync per table. Run over a
+/// three-chunk prefill and two decode steps with the carried state handed from step to step, the hosted program
+/// (stages chained on the oracle with the rows the host copies from the stored table at each sync) gives the
+/// unhosted traced graph's logits and carried state bit for bit. The checkpoint with its table stored as three
+/// numbered shards hosts one site per shard (each gathers at its own clamped local row), and equals too.
+///
+/// Mutation: in the supplier, gather row `id + 1`; the logits differ at the first chunk and this row goes red.
+#[test]
+fn a_hosted_ple_program_equals_the_unhosted_graph_over_chunked_prefill_and_decode() {
+    use crate::components::standard::oracle::run_step_hosted;
+    let fixture = super::fixture();
+    let sharded = sharded_ple_store(&fixture);
+    let registry = Registry::builtin().unwrap();
+    let sharded_model = registry.build(&fixture.raw(), &sharded).unwrap().model;
+    let single_model = built(&fixture);
+    let plan = [2usize, 2, 2, 1, 1];
+    for (label, model, store, shards) in [
+        ("single table", single_model.as_ref(), &fixture.store, 1),
+        ("three shards", sharded_model.as_ref(), &sharded, 3),
+    ] {
+        let (mut want_state, mut got_state): (Vec<Vec<f32>>, Vec<Vec<f32>>) =
+            (Vec::new(), Vec::new());
+        let mut at = 0;
+        for &len in &plan {
+            let tokens = &TOKENS[at..at + len];
+            let (want, next_want) = run_step(model, store, CAP, tokens, at as i32, &want_state);
+            let (got, next_got, hosting) =
+                run_step_hosted(model, store, CAP, tokens, at as i32, &got_state);
+            assert!(
+                hosting.device_indexed >= shards,
+                "{label}: a device-indexed site per table of the per-layer embedding: {}",
+                hosting.device_indexed
+            );
+            assert_eq!(hosting.stages, hosting.device_indexed + 1, "{label}");
+            assert!(
+                hosting.sites > hosting.device_indexed,
+                "{label}: the vocabulary table is hosted too"
+            );
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&got),
+                bits(&want),
+                "{label}: logits of the chunk at {at}"
+            );
+            assert_eq!(next_got.len(), next_want.len());
+            for (i, (g, w)) in next_got.iter().zip(&next_want).enumerate() {
+                assert_eq!(
+                    bits(g),
+                    bits(w),
+                    "{label}: carried state {i} after the chunk at {at}"
+                );
+            }
+            (want_state, got_state) = (next_want, next_got);
+            at += len;
+        }
+    }
 }

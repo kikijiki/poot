@@ -84,11 +84,12 @@ pub use imported::{AssetDest, AssetEntry, MANIFEST, ProbeKernel};
 pub use npu::{AieAbiRefusal, NpuHandle, NpuLowering, NpuRegionRefusal, NpuTarget};
 pub use passes::{
     AttentionDecline, BoundaryDescriptor, EXPERT_POOL, EXPERT_POOL_MAP, ExpertStackRefusal,
-    FusionDecline, FusionDeclineReason, LORA_IDX, LegalizeError, PackedBindError, PackedConst,
-    PackedDequantErrorContext, PackedDequantProductionError, PackedLayout, PoolError, PoolSite,
-    PoolSpec, PooledWeight, RopeDecline, ShardError, ShardRule, ShardedGraph, StageSplitError,
-    TOKEN_EMBED, WeightFormats, WeightFormatsError, bind_packed_weights,
-    recognize_packed_contractions, recognize_packed_row_gathers, routed_step_demand, shard,
+    FusionDecline, FusionDeclineReason, HOSTED_ROWS, HostedGather, HostedRows, IndexSource,
+    LORA_IDX, LegalizeError, PackedBindError, PackedConst, PackedDequantErrorContext,
+    PackedDequantProductionError, PackedLayout, PoolError, PoolSite, PoolSpec, PooledWeight,
+    RopeDecline, ShardError, ShardRule, ShardedGraph, StageSplitError, WeightFormats,
+    WeightFormatsError, bind_packed_weights, recognize_packed_contractions,
+    recognize_packed_row_gathers, routed_step_demand, shard,
 };
 // Card 626 (SC-001): `compile` alone runs the graph passes in production - `passes` is a private module, so a
 // default build has no way to name or sequence one. Gated here (ADR-0113 point 3: no forwarder, consumers

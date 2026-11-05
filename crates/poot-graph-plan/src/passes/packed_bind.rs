@@ -72,6 +72,8 @@ impl PackedConst {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WeightFormats {
     consts: BTreeMap<WeightId, PackedConst>,
+    /// Which weights share stored bytes, for the planner's hosting decision.
+    aliases: poot_weights::WeightAliases,
 }
 
 /// A packed-storage record that contradicts another.
@@ -111,7 +113,15 @@ impl WeightFormats {
                 HandleFormat::Dense(_) => None,
             })
             .collect();
-        Self { consts }
+        Self {
+            consts,
+            aliases: map.aliases(),
+        }
+    }
+
+    /// The weights that read the same stored bytes.
+    pub fn aliases(&self) -> &poot_weights::WeightAliases {
+        &self.aliases
     }
 
     /// Record that weight `weight` is stored as `packed`.

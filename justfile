@@ -14,7 +14,10 @@ build:
 
 # fast type-check the workspace (no codegen)
 check:
+    # the production surface alone: a dev-dependency feature (`test-support`) must not be what makes a bin compile
     cargo check --workspace
+    # and every target (tests, examples), which unifies the dev-dependency features
+    cargo check --workspace --all-targets
 
 # format every crate
 fmt:

@@ -163,6 +163,16 @@ pub struct CompileOptions {
     /// The NPU's lowering, required when the target is an [`NpuTarget`] and unused for a GPU target: the
     /// NPU crate's object behind which its opset table, narrowing pass and region limits sit.
     pub npu: Option<NpuHandle>,
+    /// A single-buffer limit below the GPU target's own, in bytes: legalization fits every constant to the
+    /// smaller of the two, so a fixture that needs a split on a device whose real limit is far larger states it
+    /// here. `None` fits to the target's limit. Unused for an NPU target.
+    #[cfg(any(test, feature = "test-support"))]
+    pub buffer_limit: Option<NonZeroU64>,
+    /// Which weights share stored bytes (a tied head and its embedding). A gather-only table whose bytes the
+    /// graph also binds under another id is not hosted: the device holds them anyway, and hosting would only
+    /// make the program host-fed. Empty when nothing is known to alias; a caller that has the weight map
+    /// passes [`poot_weights::WeightMap::aliases`].
+    pub aliases: poot_weights::WeightAliases,
 }
 
 impl CompileOptions {
@@ -173,7 +183,16 @@ impl CompileOptions {
             lora: None,
             late: None,
             npu: None,
+            #[cfg(any(test, feature = "test-support"))]
+            buffer_limit: None,
+            aliases: poot_weights::WeightAliases::none(),
         }
+    }
+
+    /// These options with the weight aliases of the model's map.
+    pub fn with_aliases(mut self, aliases: poot_weights::WeightAliases) -> Self {
+        self.aliases = aliases;
+        self
     }
 
     /// These options with the late-input cut after the exported value `boundary`.
@@ -754,16 +773,15 @@ impl Program {
 /// and backend dtype retyping (Card 534a), then fusion, then `crate::plan_graph`, which makes every
 /// kernel choice (Card 557). The contraction epilogue fuse rule runs right before `fuse`.
 ///
-/// Legalization (card 523a: `legalize`, reading the GPU target's caps to host or split a constant the target
-/// cannot allocate as one device buffer) and Card 534a's step (the BF16 folds, reduce legalization and
+/// Legalization (card 523a: `legalize`, reading the GPU target's caps to split a constant the target
+/// cannot allocate as one device buffer; a gather-only table is hosted before `compile` by
+/// [`crate::compile_staged`], whatever its size) and Card 534a's step (the BF16 folds, reduce legalization and
 /// dtype retyping, each individually tracked and numerics-checked) join the pipeline
 /// between DCE and fusion, each its own tracked pass like every other pass here,
 /// reverted by `revert_unplannable_rewrites` and numerics-read by `NumericsDelta` the same way.
 /// `fold_dense_contractions` runs before `legalize`: an oversized weight is split as the `DenseContraction`
 /// that reads it, so each chunk is the contraction the planner lowers (a BF16 `[K, N]` matmul over a
-/// transposed chunk has no lowering to probe). `legalize` runs before `fold_dense_bf16_row_gathers`: it can
-/// retag a `Gather` into a `TOKEN_EMBED` input, and that fold pattern-matches a `Gather` specifically,
-/// so a table `legalize` already hosted must not still look like one to it. Card 534a's step is the one
+/// transposed chunk has no lowering to probe). Card 534a's step is the one
 /// preparation every target needs before planning: no executor sequences its own copy of it any more.
 ///
 /// After planning, a target whose artifacts are regions (`Target::granularity`) has its planned equations grouped
@@ -796,8 +814,18 @@ pub fn compile(
     // The passes that fit a graph to a GPU's limits read its capabilities; an AIE target has none of them
     // (no grid, no single-buffer limit, no tensor cores, no contraction lowering), so those passes are
     // GPU stages and an AIE compile does not run them.
+    #[cfg(any(test, feature = "test-support"))]
+    let capped = match (target, options.buffer_limit) {
+        (Target::Gpu { caps, .. }, Some(limit)) => Some(DeviceCaps {
+            max_buffer_bytes: limit.get().min(caps.max_buffer_bytes),
+            ..*caps
+        }),
+        _ => None,
+    };
+    #[cfg(not(any(test, feature = "test-support")))]
+    let capped: Option<DeviceCaps> = None;
     let gpu = match target {
-        Target::Gpu { backend, caps } => Some((*backend, caps)),
+        Target::Gpu { backend, caps } => Some((*backend, capped.as_ref().unwrap_or(caps))),
         Target::Npu(_) => None,
     };
     let npu = options.npu.as_ref().map(NpuHandle::lowering);
@@ -1337,9 +1365,7 @@ mod tests {
     use crate::test_support::{gpu_backend, gpu_caps, gpu_caps_mut};
     use crate::{Capability, Dispatch, plan_eqn};
     use poot_graph_ir::analysis::Tier2Class;
-    use poot_graph_ir::{
-        BinOp, Builder, OpKind, RedOp, Scalar, Slot, StateRole, Storage, TensorType, UnOp,
-    };
+    use poot_graph_ir::{BinOp, Builder, OpKind, RedOp, Scalar, Slot, StateRole, TensorType, UnOp};
     use poot_kernelgen::{ContractionSpec, KernelRequest};
     use poot_tensor::DType;
     use poot_test_util::device_caps::default_caps_for;
@@ -1822,122 +1848,19 @@ mod tests {
         }
     }
 
-    /// SC-002 (host), driven through `compile`: an embed table over the target's
-    /// buffer limit compiles to a program whose graph binds `TOKEN_EMBED`, not a device `Gather`,
-    /// and `legalize` is recorded among the passes that changed the graph - `compile`'s own
-    /// `Program::passes()`, not a bare call to `legalize`. Mutation (recorded, not committed): replacing
-    /// `compile`'s `pipeline.try_run("legalize", ...)` call with a no-op pass-through (same effect as
-    /// dropping the pass from the pipeline) failed this test AND
-    /// [`compile_splits_an_oversized_matmul_weight`] with `legalize must be recorded as a pass that
-    /// changed the graph` / `assertion failed: program.passes().any(|p| p == "legalize")`; restoring the
-    /// real call made both green again.
+    /// POOT-1423: hosting a gather-only table is `compile_staged`'s step, taken before any stage is compiled
+    /// (the cuts a device-computed index needs belong to the staged program), so an oversized embed table
+    /// handed to `compile` directly is refused with the typed `OversizedConstant`, never rewritten there.
+    ///
+    /// Mutation: have `legalize` host the gather again; `compile` succeeds and the `expect_err` goes red.
     #[test]
-    fn compile_hosts_an_oversized_embed_gather() {
+    fn compile_refuses_an_oversized_embed_table_it_is_handed_unhosted() {
         let g = embed_gather_graph(152_064, 3584); // qwen2.5-7b's shape, ~2.18 GB
         let target = wgpu_with_limit(2_147_483_647); // wgpu's raw maxBufferSize
-        let program = compile(&g, &target, &REPLAY).expect("an embed table always hosts");
-
+        let error = legalize_error(compile(&g, &target, &REPLAY), "an unhosted embed table");
         assert!(
-            program.passes().any(|p| p == "legalize"),
-            "legalize must be recorded as a pass that changed the graph"
-        );
-        assert!(
-            !program
-                .graph()
-                .eqns()
-                .iter()
-                .any(|e| matches!(e.op, OpKind::Gather { .. })),
-            "the gather is replaced, not merely left decomposed"
-        );
-        let hosted = program
-            .graph()
-            .inputs()
-            .iter()
-            .find(|&&id| {
-                program.graph().meta(id).storage == Storage::Slot(Slot::Owned(crate::TOKEN_EMBED))
-            })
-            .expect("compile's output graph declares the hosted embed input");
-        assert_eq!(
-            program
-                .graph()
-                .meta(*hosted)
-                .slot_key()
-                .and_then(poot_graph_ir::SlotKey::tag),
-            Some("w.embed")
-        );
-    }
-
-    /// POOT-1182: a BF16 embed table over the buffer limit is hosted, and the rows the host gathers are
-    /// weight bytes in the lane the plan chose, exactly as the table's own const would be. On wgpu that
-    /// lane is the packed `u32` one (SPIR-V has no scalar BF16), so the widening `Cast` plans the
-    /// packed body; planning it as the native two-byte cast failed at codegen on the real Qwen3.8-27B-FP8
-    /// checkpoint (`bf16 compute is NVPTX-only`). Mutation: drop `TOKEN_EMBED` from
-    /// `Storage::holds_weight_bytes`; the slot's storage is `Dense(BF16)` and the cast the native one.
-    #[test]
-    fn compile_reads_hosted_bf16_embed_rows_through_the_packed_lane() {
-        let b = Builder::for_tests();
-        let token = b
-            .slot(Slot::Token, TensorType::new(vec![1, 4], DType::I32))
-            .unwrap();
-        let embed = b
-            .weight(
-                WeightRef::whole(EMBED),
-                TensorType::new(vec![40_960, 64], DType::BF16),
-            )
-            .unwrap();
-        let rows = b.gather(embed, 0, token).unwrap();
-        let out = b.cast(rows, DType::F32).unwrap();
-        let g = b.finish(out).unwrap();
-
-        // The gather is folded to a `DenseRowGather` when the table fits, so only a target whose limit is
-        // under the 5 MiB table hosts it.
-        let target = wgpu_with_limit(1 << 20);
-        let program = compile(&g, &target, &REPLAY).expect("a hosted BF16 embed compiles");
-        let &hosted = program
-            .graph()
-            .inputs()
-            .iter()
-            .find(|&&id| {
-                program.graph().meta(id).storage == Storage::Slot(Slot::Owned(crate::TOKEN_EMBED))
-            })
-            .expect("the oversized table is hosted");
-        assert_eq!(
-            program.storage().storage(hosted).buffer_storage(),
-            poot_target::BufferStorage::bf16_packed()
-        );
-        let (cast, _) = program
-            .planned()
-            .find(|(eqn, _)| matches!(eqn.op, OpKind::Cast { .. }))
-            .expect("the widening cast survives compile");
-        assert!(
-            matches!(
-                program.kernel_choice(cast),
-                KernelChoice::Imported {
-                    kernel: crate::ImportedKernel::PackedBf16ToF32,
-                    ..
-                }
-            ),
-            "{:?}",
-            program.kernel_choice(cast)
-        );
-    }
-
-    /// A target whose buffer limit holds the whole table compiles to a program that still binds the
-    /// dense `Gather` - `legalize` is a no-op and is not recorded (matches SC-002's other outcome: a
-    /// target under the limit never needs the rewrite).
-    #[test]
-    fn compile_leaves_a_small_embed_dense() {
-        let g = embed_gather_graph(151_936, 896); // qwen2.5-0.5b, ~544 MB
-        let target = wgpu_with_limit(2_147_483_647);
-        let program = compile(&g, &target, &REPLAY).expect("under the limit, no rewrite needed");
-        assert!(!program.passes().any(|p| p == "legalize"));
-        assert!(
-            program
-                .graph()
-                .eqns()
-                .iter()
-                .any(|e| matches!(e.op, OpKind::Gather { .. })),
-            "the dense gather stays: this target can hold the table"
+            matches!(error, LegalizeError::OversizedConstant { ref name, .. } if name == "w.embed"),
+            "{error:?}"
         );
     }
 

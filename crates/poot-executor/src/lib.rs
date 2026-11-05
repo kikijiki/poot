@@ -142,7 +142,7 @@ impl SyncReads {
         &self.site
     }
 
-    /// Device bytes one pool row of each table holds, in [`SyncPoint::site`] table order: what a
+    /// Device bytes one pool row of each table holds, in [`SyncPoint::experts`] table order: what a
     /// refill of one expert writes.
     pub fn row_bytes(&self) -> &[usize] {
         &self.row_bytes
@@ -158,11 +158,11 @@ impl SyncReads {
 }
 
 /// Make experts `experts` resident in rows `first_row..` of table `table` (an index into the sync
-/// point's [`SyncPoint::site`] weights): the executor writes each expert's stored bytes into its row
+/// point's [`SyncPoint::experts`] weights): the executor writes each expert's stored bytes into its row
 /// in the table's planned lane, never a re-encode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowFill {
-    /// Index into the sync point's [`SyncPoint::site`] weights naming the table to fill.
+    /// Index into the sync point's [`SyncPoint::experts`] weights naming the table to fill.
     pub table: usize,
     /// First pool row written; the experts land in consecutive rows from here.
     pub first_row: usize,
@@ -375,6 +375,14 @@ pub struct ExecutorStats {
     pub pool_rows_written: u64,
     /// Stored bytes those rows wrote.
     pub pool_refill_bytes: u64,
+    /// Rows the hosted gathers copied from the checkpoint mapping into their slots, bind time and sync time
+    /// together.
+    pub hosted_rows: u64,
+    /// The stored bytes those rows wrote: as stored, never decoded on the host.
+    pub hosted_bytes: u64,
+    /// The stored bytes of every hosted table, which stay in the checkpoint mapping instead of the device:
+    /// the `Hosted` byte category beside the device's own `Weight` bytes in [`Self::memory`].
+    pub hosted_table_bytes: u64,
     /// Kernels this engine took through the kernel cache (a disk load or a codegen run), once per distinct
     /// kernel. An engine built over [`SharedKernels`] does not count a kernel another engine of that
     /// table already resolved.
@@ -401,6 +409,9 @@ impl ExecutorStats {
             sync_read_bytes: 0,
             pool_rows_written: 0,
             pool_refill_bytes: 0,
+            hosted_rows: 0,
+            hosted_bytes: 0,
+            hosted_table_bytes: 0,
             kernels_resolved: 0,
             timing,
         }
@@ -481,7 +492,7 @@ pub trait Executor {
     /// is a [`poot_weights::WeightId::const_name`], or a packed source name over one, bound
     /// through the map's view to byte runs of store entries; a const the map does not name is
     /// unbound, even when a store key equals its name), uploads each stored byte run once per
-    /// planned storage and store generation, fills a hosted embed gather from the step's tokens,
+    /// planned storage and store generation, fills each hosted gather from the step's ids (bind time) or at its host sync,
     /// allocates or shares state by (name, aval, storage),
     /// and loads every plan. The entry records on its first `step`.
     fn add_entry(

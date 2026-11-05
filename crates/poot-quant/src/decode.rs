@@ -6,9 +6,12 @@
 use std::fmt;
 
 use crate::format::{
-    Axis, Extent, FieldEncoding, FormatDescriptor, GroupMap, Major, MinSign, OperandRole,
-    PlanarLayout, PlanarOperand, Storage, ValueMap, WeightFormat,
+    Axis, Extent, FormatDescriptor, GroupMap, Major, OperandRole, PlanarLayout, PlanarOperand,
+    Storage, WeightFormat,
 };
+#[cfg(any(test, feature = "test-support"))]
+use crate::format::{FieldEncoding, MinSign, ValueMap};
+#[cfg(any(test, feature = "test-support"))]
 use crate::scalar::{float_to_f32, half_step_to_f32};
 
 /// Typed failures of the scalar decoder.
@@ -185,6 +188,7 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+#[cfg(any(test, feature = "test-support"))]
 /// Raw operand bits with the encoding that reads them.
 #[derive(Clone, Copy)]
 struct Raw {
@@ -193,6 +197,7 @@ struct Raw {
     encoding: FieldEncoding,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Raw {
     fn integer(self) -> i64 {
         match self.encoding {
@@ -216,11 +221,13 @@ impl Raw {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// The value formula of [`crate::format`], evaluated over an operand reader.
 struct Formula<'d> {
     descriptor: &'d FormatDescriptor,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Formula<'_> {
     /// Read the scale and min products and the raw code.
     fn parts(
@@ -293,6 +300,7 @@ impl Formula<'_> {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// `lhs * rhs` in that order when both are present.
 fn product(lhs: Option<f32>, rhs: Option<f32>) -> Option<f32> {
     match (lhs, rhs) {
@@ -379,6 +387,7 @@ impl FormatDescriptor {
     }
 
     /// The byte length of the `role` source tensor for a logical `[out, K]` shape.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn planar_operand_bytes(
         &self,
         shape: [usize; 2],
@@ -432,6 +441,7 @@ impl FormatDescriptor {
     /// Decode logical row `row` of a planar weight into `out` (`K` values), bit for bit what
     /// [`Self::decode_planar_value`] gives per element, with the source checks done once per row
     /// instead of once per value.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn decode_planar_row(
         &self,
         shape: [usize; 2],
@@ -485,6 +495,7 @@ impl FormatDescriptor {
             })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn source<'s>(
         &self,
         sources: &[(OperandRole, &'s [u8])],
@@ -538,6 +549,7 @@ impl FormatDescriptor {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn read_planar(
         &self,
         operand: &PlanarOperand,
@@ -574,6 +586,7 @@ impl FormatDescriptor {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// The quantization group of K index `k`.
     fn group_of(
         &self,

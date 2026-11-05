@@ -403,9 +403,29 @@ fn a_cap_below_the_largest_projection_splits_it_on_every_backend() {
     for backend in capped_backends() {
         let mut target = target(backend);
         gpu_caps_mut(&mut target).max_buffer_bytes = cap;
-        let program = compile(&graph, &target, &options()).unwrap_or_else(|e| {
-            panic!("{backend:?}: a cap of {cap} bytes over {name} ({bytes}): {e}")
-        });
+        // The production entry: the embedding gather is hosted by `compile_staged` before the stage compiles,
+        // so the cap binds every other constant.
+        let staged = poot_graph_plan::staged::compile_staged(
+            &graph,
+            &poot_graph_plan::staged::TargetSet::single(
+                poot_graph_plan::multi_device::topology::DeviceId(0),
+                target,
+            ),
+            &poot_graph_plan::staged::Partition {
+                experts: poot_graph_plan::staged::ExpertPlacement::AllResident,
+                devices: poot_graph_plan::staged::DevicePlacement::Single(
+                    poot_graph_plan::multi_device::topology::DeviceId(0),
+                ),
+            },
+            &options(),
+        )
+        .unwrap_or_else(|e| panic!("{backend:?}: a cap of {cap} bytes over {name} ({bytes}): {e}"));
+        let (_, _, program) = staged.stages().next().expect("one stage");
+        assert_eq!(
+            staged.hosted().len(),
+            1,
+            "{backend:?}: the embedding is hosted"
+        );
         let planned = program.graph();
         // The split survives the pipeline's revert of rewrites the target cannot plan: the compiled
         // program holds the projection as row chunks, not as the original oversized constant.
@@ -416,13 +436,8 @@ fn a_cap_below_the_largest_projection_splits_it_on_every_backend() {
                 .any(|&id| planned.meta(id).name().as_deref() == Some(name.as_str())),
             "{backend:?}: {name} is still one constant after compile"
         );
-        // The embedding gather is hosted off the device (`TOKEN_EMBED`) where the target admits
-        // it, so the cap binds every other constant: the projections, split, and the head, split.
-        for &id in planned
-            .consts()
-            .iter()
-            .filter(|&&id| planned.meta(id).name().as_deref() != Some(&*embedding()))
-        {
+        // Every constant of the stage fits the cap: the projections, split, and the head, split.
+        for &id in planned.consts() {
             assert!(
                 const_bytes(planned, id) <= cap,
                 "{backend:?}: {:?} is {} bytes, over the {cap}-byte cap",

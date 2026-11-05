@@ -145,7 +145,7 @@ fn run(
     graph: &Graph,
     step: &Step,
 ) -> Run {
-    let staged = weight_map::compile(graph, target);
+    let staged = weight_map::compile(graph, target, &weight_map::standard_options());
     let exe = engine
         .load_weights(Arc::clone(&fixture.store), Arc::clone(&fixture.map))
         .expect("weights load");

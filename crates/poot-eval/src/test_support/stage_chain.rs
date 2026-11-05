@@ -39,6 +39,10 @@ fn identity(meta: &ValueMeta) -> Identity {
     }
 }
 
+/// What supplies a planner-owned slot the uncut graph never declared: the slot's key and the boundary values
+/// exported so far, to the slot's value.
+pub type SlotSupply<'a> = dyn FnMut(&SlotKey, &HashMap<BoundaryId, Value>) -> Option<Value> + 'a;
+
 /// The result of evaluating stage graphs one after another on the CPU oracle.
 pub struct Chain {
     /// The final stage's output.
@@ -54,7 +58,16 @@ pub struct Chain {
 /// Evaluate `stages` one after another: each stage is bound to the uncut `inputs` it reads (matched by
 /// declared identity) and to the boundary values earlier stages exported (matched by
 /// [`BoundaryId::slot_key`]), and every export is read back from the stage's environment.
-pub fn chain(graph: &Graph, stages: &[&Graph], inputs: &HashMap<ValueId, Value>) -> Chain {
+///
+/// A slot the uncut graph never declared (a planner-owned one, such as the rows a hosted gather copies) is
+/// asked of `supply` with the boundary values exported so far; it returns the value, or `None` for a slot
+/// nobody supplies, which is a panic naming it.
+pub fn chain(
+    graph: &Graph,
+    stages: &[&Graph],
+    inputs: &HashMap<ValueId, Value>,
+    supply: &mut SlotSupply<'_>,
+) -> Chain {
     let mut by_identity: HashMap<Identity, Value> = graph
         .inputs()
         .iter()
@@ -79,10 +92,13 @@ pub fn chain(graph: &Graph, stages: &[&Graph], inputs: &HashMap<ValueId, Value>)
                     return (id, Value::from(payload.tensor()));
                 }
                 let identity = identity(g.meta(id));
-                let value = by_identity
-                    .get(&identity)
-                    .unwrap_or_else(|| panic!("stage {index}: {identity:?} is unbound"));
-                (id, value.clone())
+                let value = match (by_identity.get(&identity), &identity) {
+                    (Some(value), _) => value.clone(),
+                    (None, Identity::Slot(key)) => supply(key, &boundaries)
+                        .unwrap_or_else(|| panic!("stage {index}: {identity:?} is unbound")),
+                    (None, _) => panic!("stage {index}: {identity:?} is unbound"),
+                };
+                (id, value)
             })
             .collect();
         let result = eval(g, &stage_inputs, EvalOptions::default().keep_environment())

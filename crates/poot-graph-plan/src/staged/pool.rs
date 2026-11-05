@@ -10,7 +10,7 @@ use poot_graph_ir::Graph;
 use poot_graph_ir::analysis::NumericsProperty;
 
 use super::{ExpertPlacement, StagedCompileError};
-use crate::passes::{GraphBudget, PoolSite, StageSplitError, pool_experts};
+use crate::passes::{GraphBudget, PoolSite, pool_experts};
 
 /// The graph after the expert placement and the routed selections it cut at, in equation order.
 pub(super) struct Placed<'g> {
@@ -42,48 +42,4 @@ pub(super) fn apply<'g>(
             })
         }
     }
-}
-
-/// One cut of a pooled program: where the next stage opens and which selection syncs there (`None`
-/// for a layer cut of a pipeline placement).
-pub(super) struct Cut {
-    pub(super) position: usize,
-    pub(super) site: Option<usize>,
-}
-
-/// The cuts of a pooled graph in stage order: its sync cuts and the placement's layer cuts, both
-/// resolved to equation positions of `graph` (the pooled graph, whose layer tags the gathers carry).
-/// Two cuts at one position are one stage boundary.
-pub(super) fn cuts(
-    graph: &Graph,
-    after_layers: &[usize],
-    sites: &[(PoolSite, usize)],
-) -> Result<Vec<Cut>, StageSplitError> {
-    let mut cuts: Vec<Cut> = sites
-        .iter()
-        .enumerate()
-        .map(|(site, (_, position))| Cut {
-            position: *position,
-            site: Some(site),
-        })
-        .collect();
-    if !after_layers.is_empty() {
-        let runs = graph.layer_runs()?;
-        for &layer in after_layers {
-            let position = runs.runs.get(layer + 1).map(|run| run.start).ok_or(
-                StageSplitError::LayerCutOutOfRange {
-                    cut: layer,
-                    layers: runs.layers,
-                },
-            )?;
-            if !cuts.iter().any(|cut| cut.position == position) {
-                cuts.push(Cut {
-                    position,
-                    site: None,
-                });
-            }
-        }
-    }
-    cuts.sort_by_key(|cut| cut.position);
-    Ok(cuts)
 }

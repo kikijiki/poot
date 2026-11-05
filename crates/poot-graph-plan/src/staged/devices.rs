@@ -33,6 +33,9 @@ pub enum Unsupported {
     /// Experts paged through a pool on stages that sit on distinct devices: a sync point reads one
     /// device's ids and writes that device's pool.
     PooledAcrossDevices,
+    /// A hosted gather whose ids the device computes on stages that sit on distinct devices, or on a
+    /// tensor-parallel group: the sync reads one device's ids and writes that device's rows.
+    HostedIndexAcrossDevices,
 }
 
 /// The device and target one stage runs on.

@@ -1203,9 +1203,38 @@ pub(crate) mod oracle {
         map: &WeightMap,
         consts: &[(&str, &[f32])],
         slots: &[(Slot, &[i32])],
-        (named, floats): NamedSlots<'_>,
+        named: NamedSlots<'_>,
         state: &[&[f32]],
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let inputs = bind_inputs(g, store, map, consts, slots, named, state);
+        let eval = poot_eval::eval(g, &inputs, EvalOptions::default())
+            .unwrap_or_else(|e| panic!("oracle: {e}"));
+        (
+            dense(eval.output),
+            eval.state.into_iter().map(dense).collect(),
+        )
+    }
+
+    /// An oracle value as the harness carries it: f32 words (an integer is exact below 2^24).
+    pub(crate) fn dense(v: Value) -> Vec<f32> {
+        let host = v.into_host().unwrap();
+        match host.as_i32() {
+            Some(words) => words.iter().map(|&w| w as f32).collect(),
+            None => host.to_f32().unwrap().into_owned(),
+        }
+    }
+
+    /// Every input binder of `g` bound as [`eval_slots`] binds it: weights from `store` through `map`, other
+    /// consts by name, slots by kind or key, state in [`Graph::state`] order.
+    pub(crate) fn bind_inputs(
+        g: &Graph,
+        store: &WeightStore,
+        map: &WeightMap,
+        consts: &[(&str, &[f32])],
+        slots: &[(Slot, &[i32])],
+        (named, floats): NamedSlots<'_>,
+        state: &[&[f32]],
+    ) -> HashMap<ValueId, Value> {
         let ids: HashMap<String, WeightId> =
             map.iter().map(|(id, _, _)| (id.const_name(), id)).collect();
         // The weight's own entry: the stored one, or the rows of a fused or stacked view cut from
@@ -1344,19 +1373,7 @@ pub(crate) mod oracle {
             };
             inputs.insert(id, value);
         }
-        let eval = poot_eval::eval(g, &inputs, EvalOptions::default())
-            .unwrap_or_else(|e| panic!("oracle: {e}"));
-        let dense = |v: Value| {
-            let host = v.into_host().unwrap();
-            match host.as_i32() {
-                Some(words) => words.iter().map(|&w| w as f32).collect(),
-                None => host.to_f32().unwrap().into_owned(),
-            }
-        };
-        (
-            dense(eval.output),
-            eval.state.into_iter().map(dense).collect(),
-        )
+        inputs
     }
 
     /// One step of `model` on the oracle: trace its `step` program at `rows = 1` with logits at every token (the last one for a single token),
@@ -1470,6 +1487,159 @@ pub(crate) mod oracle {
                 (Slot::MropePosition, &mrope),
             ],
             &state,
+        )
+    }
+
+    /// What [`run_step_hosted`] found in the program it planned.
+    pub(crate) struct Hosting {
+        /// Hosted gather sites, whatever indexes them.
+        pub(crate) sites: usize,
+        /// Of those, the sites whose ids the device computes: each cuts the program at a host sync.
+        pub(crate) device_indexed: usize,
+        /// Stages the program has.
+        pub(crate) stages: usize,
+    }
+
+    /// [`run_step`] through the production entry: the step is planned by `compile_staged` for one Vulkan device,
+    /// which hosts every gather-only table, and the stage graphs are chained on the oracle with the rows the host
+    /// would copy (the ids from the step's token input, or from the stage that exported them). Dense F32 and BF16
+    /// tables only. Returns the logits, the carried state and what the program hosts.
+    pub(crate) fn run_step_hosted(
+        model: &dyn crate::model::Model,
+        store: &WeightStore,
+        capacity: usize,
+        tokens: &[i32],
+        start: i32,
+        state: &[Vec<f32>],
+    ) -> (Vec<f32>, Vec<Vec<f32>>, Hosting) {
+        use poot_graph_plan::multi_device::topology::DeviceId;
+        use poot_graph_plan::staged::{
+            DevicePlacement, ExpertPlacement, Partition, TargetSet, compile_staged,
+        };
+        let logits = if tokens.len() == 1 {
+            LogitRows::Last
+        } else {
+            LogitRows::All
+        };
+        let spec = StepSpec::step(step_shape(tokens.len(), capacity, logits, None));
+        let g = model
+            .trace(&spec, poot_graph_ir::TraceLimits::for_tests())
+            .unwrap();
+        let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
+        let g = poot_graph_plan::bind_packed_weights(&g, &formats).unwrap();
+        let zeros: Vec<Vec<f32>> = g
+            .state()
+            .map(|(si, _)| vec![0.0; g.aval(si).numel()])
+            .collect();
+        let state: Vec<&[f32]> = if state.is_empty() { &zeros } else { state }
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let pos: Vec<i32> = (start..).take(tokens.len()).collect();
+        let mrope = pos.repeat(3);
+        let inputs = bind_inputs(
+            &g,
+            store,
+            model.weights(),
+            &[],
+            &[
+                (Slot::Token, tokens),
+                (Slot::Pos, &pos),
+                (Slot::MropePosition, &mrope),
+            ],
+            (&[], &[]),
+            &state,
+        );
+        let target = poot_graph_plan::Target::Gpu {
+            backend: poot_target::Backend::SpirvVulkan,
+            caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+        };
+        let program = compile_staged(
+            &g,
+            &TargetSet::single(DeviceId(0), target),
+            &Partition {
+                experts: ExpertPlacement::AllResident,
+                devices: DevicePlacement::Single(DeviceId(0)),
+            },
+            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        )
+        .unwrap_or_else(|e| panic!("hosted compile: {e}"));
+        let stages: Vec<&Graph> = program
+            .stages()
+            .map(|(_, _, stage)| stage.graph())
+            .collect();
+        let mut supply =
+            |key: &poot_graph_ir::SlotKey,
+             boundaries: &HashMap<poot_graph_ir::BoundaryId, Value>| {
+                let (site, rows) = program.hosted().iter().find_map(|site| {
+                    site.rows
+                        .iter()
+                        .find(|rows| &rows.slot == key)
+                        .map(|rows| (site, rows))
+                })?;
+                let ids: Vec<i32> = match &site.index {
+                    poot_graph_plan::IndexSource::Step(step) => {
+                        let id = g
+                            .inputs()
+                            .iter()
+                            .copied()
+                            .find(|&id| g.meta(id).slot_key() == Some(step))
+                            .expect("the step input a hosted gather reads");
+                        inputs[&id].as_host().unwrap().as_i32().unwrap().to_vec()
+                    }
+                    poot_graph_plan::IndexSource::Device(boundary) => boundaries[boundary]
+                        .as_host()
+                        .unwrap()
+                        .as_i32()
+                        .unwrap()
+                        .to_vec(),
+                };
+                let table = g
+                    .inputs()
+                    .iter()
+                    .copied()
+                    .find(|&id| g.meta(id).name().as_deref() == Some(rows.source.as_str()))
+                    .expect("the hosted table is a const of the traced graph");
+                let table = inputs[&table].as_host().expect("a dense table");
+                let width = table.shape()[1];
+                let shape = rows.aval.shape.clone();
+                Some(Value::from(match rows.aval.dtype {
+                    DType::F32 => {
+                        let words = table.as_f32().expect("an F32 table");
+                        HostTensor::f32(
+                            shape,
+                            ids.iter()
+                                .flat_map(|&id| {
+                                    words[id as usize * width..(id as usize + 1) * width].to_vec()
+                                })
+                                .collect(),
+                        )
+                    }
+                    DType::BF16 => {
+                        let words = table.as_half().expect("a BF16 table");
+                        HostTensor::bf16(
+                            shape,
+                            ids.iter()
+                                .flat_map(|&id| {
+                                    words[id as usize * width..(id as usize + 1) * width].to_vec()
+                                })
+                                .collect(),
+                        )
+                    }
+                    other => panic!("an oracle row of {other:?} is not supported"),
+                }))
+            };
+        let chained =
+            poot_eval::test_support::stage_chain::chain(&g, &stages, &inputs, &mut supply);
+        let hosting = Hosting {
+            sites: program.hosted().len(),
+            device_indexed: program.sync_points().len(),
+            stages: stages.len(),
+        };
+        (
+            dense(chained.output),
+            chained.state.into_iter().map(dense).collect(),
+            hosting,
         )
     }
 

@@ -351,7 +351,9 @@ impl Driver<Serving> {
                             InputSet::EMPTY,
                         );
                         let chain = u8::try_from(step).map_err(|_| InvalidOptions::ChainTooLong)?;
-                        self.prepared(EntryKey { chain, ..key })?;
+                        if self.prepared(EntryKey { chain, ..key })?.host_fed {
+                            return Err(InvalidOptions::ChainOnHostFed.into());
+                        }
                     }
                 }
             }

@@ -34,6 +34,22 @@ Per-step inputs (`Slot::Token`, `Slot::Pos`, and `Slot::SlotMap` / `Slot::WriteM
 stable addresses. Recorded kernels point at them, and the host rewrites their contents before each replay. A scalar that depends
 on a slot is bound to the slot buffer, never baked into the capture.
 
+## Gather-only tables
+
+A weight table that only gathers read (a token embedding, a per-layer n-gram table) never becomes a device buffer, whatever its
+size and whatever the backend. The planner rewrites the gather so the table stays in the checkpoint mapping, and each step the
+host copies the stored bytes of the rows the step needs into a small slot, one per source of a quantized table. The decode of a
+quantized table stays in the device graph, so the host decodes nothing.
+
+Where the row ids come from decides when the host copies. A step input (the token slot) is known before the step runs, so its
+rows are copied at bind time. An id the device computes (a hash over carried history) is exported by a first stage, read at a
+host sync, and the rows are copied before the stage that reads them. The hash and its history stay in the device graph. A table
+another equation also reads stays a device constant, and an id past the table is a typed bind error before any row is written.
+
+A program with a gather-only table needs the host every step, so its decode does not chain on the device: the driver refuses a
+chain for it when the entries are prepared. The executor's `hosted_rows`, `hosted_bytes` and `hosted_table_bytes` counters report
+the rows copied, the stored bytes they wrote, and the mapped bytes of the hosted tables that are not device memory.
+
 ## Per backend
 
 | Backend | Capture (once) | Per token |

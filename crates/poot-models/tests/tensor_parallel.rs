@@ -315,6 +315,39 @@ fn base_name(name: &str) -> (&str, usize) {
     }
 }
 
+/// The rows a step's hosted gather copies into the slot `key`: the ids from the step's input (a gather by the
+/// token), gathered from the whole table in `tables`. `None` for a slot that is no hosted gather's.
+fn hosted_rows(
+    program: &StagedProgram,
+    key: &SlotKey,
+    tables: &HashMap<String, HostTensor>,
+    step: &Step,
+) -> Option<HostTensor> {
+    let (site, rows) = program.hosted().iter().find_map(|site| {
+        site.rows
+            .iter()
+            .find(|rows| &rows.slot == key)
+            .map(|rows| (site, rows))
+    })?;
+    let poot_graph_plan::IndexSource::Step(ids_key) = &site.index else {
+        panic!("this fixture's hosted gathers are indexed by the token")
+    };
+    let ids = step
+        .slots
+        .get(ids_key)
+        .expect("the step binds the token")
+        .as_i32()
+        .expect("I32 ids");
+    let table = &tables[&rows.source];
+    let width = table.shape()[1];
+    let words = table.as_f32().expect("an F32 table");
+    let gathered: Vec<f32> = ids
+        .iter()
+        .flat_map(|&id| words[id as usize * width..(id as usize + 1) * width].to_vec())
+        .collect();
+    Some(HostTensor::f32(rows.aval.shape.clone(), gathered))
+}
+
 /// The program's stages in order, each bound as its rank binds it.
 fn walk(
     program: &StagedProgram,
@@ -337,6 +370,8 @@ fn walk(
             tensors
         })
         .collect();
+    // The whole tables the hosted gathers copy rows from, as the host reads them from the checkpoint.
+    let tables = weight_tensors(map, store);
     let mut boundaries: HashMap<SlotKey, Value> = HashMap::new();
     let mut state: HashMap<(String, usize), HostTensor> = HashMap::new();
     let mut output = None;
@@ -356,12 +391,15 @@ fn walk(
                     Identity::Computed(payload) => Value::from(payload.tensor()),
                     Identity::Slot(key) => match boundaries.get(&key) {
                         Some(value) => value.clone(),
-                        None => Value::from(
-                            step.slots
-                                .get(&key)
-                                .unwrap_or_else(|| panic!("stage {index}: {key:?} is unbound"))
-                                .clone(),
-                        ),
+                        None => match hosted_rows(program, &key, &tables, step) {
+                            Some(rows) => Value::from(rows),
+                            None => Value::from(
+                                step.slots
+                                    .get(&key)
+                                    .unwrap_or_else(|| panic!("stage {index}: {key:?} is unbound"))
+                                    .clone(),
+                            ),
+                        },
                     },
                     Identity::Named(name) => {
                         if let Some(value) = ranks[rank].get(&name) {
@@ -873,7 +911,19 @@ fn a_sharded_adapted_qwen2_with_alternating_rows_equals_the_full_adapted_graph()
         );
     }
 
-    let step = decode_step(adapted);
+    // The compiled adapted graph has no token slot (its embedding is hosted): bind the traced graph's slots
+    // beside its own, and the rows the host copies for the hosted gather, which both the whole graph and the
+    // ranks' stages read.
+    let weights = (&*mapped.store, &*mapped.map);
+    let tables = weight_tensors(weights.1, weights.0);
+    let mut step = decode_step(adapted);
+    for (key, value) in decode_step(&graph).slots {
+        step.slots.entry(key).or_insert(value);
+    }
+    for rows in single.hosted().iter().flat_map(|site| &site.rows) {
+        let value = hosted_rows(&single, &rows.slot, &tables, &step).expect("a hosted slot");
+        step.slots.insert(rows.slot.clone(), value);
+    }
     assert_walk_matches(
         &program,
         adapted,
@@ -886,7 +936,6 @@ fn a_sharded_adapted_qwen2_with_alternating_rows_equals_the_full_adapted_graph()
     // The adapters change the logits, or the row proves nothing.
     let plain_program = compile(&graph, &mapped.map, &options()).unwrap();
     let base_step = decode_step(&graph);
-    let weights = (&*mapped.store, &*mapped.map);
     let with = walk(&program, weights, &step, &HashMap::new());
     let without = walk(&plain_program, weights, &base_step, &HashMap::new());
     assert_ne!(

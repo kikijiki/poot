@@ -277,15 +277,19 @@ struct GraphPlan {
 /// graph when `compile` refuses it.
 fn describe_graph(name: &str, g: &poot_graph_ir::Graph, target: &Target) -> GraphPlan {
     let mut text = String::new();
-    match compile(g, target, &targets::options()) {
+    // The production entry: a gather-only table is hosted before the stages are compiled, and a program with a
+    // device-indexed hosted site is two stages. Equations are numbered across the stages in order.
+    match targets::compile_production(g, target, &targets::options()) {
         Ok(program) => {
             let mut launches = 0;
             let mut eqns = 0;
-            for (i, (eqn, plan)) in program.planned().enumerate() {
-                let c = describe_plan(eqn, plan, program.kernel_choice(eqn));
-                write_line(&mut text, name, &i.to_string(), &eqn.op.name(), &c);
-                launches += c.launches;
-                eqns += 1;
+            for (_, _, stage) in program.stages() {
+                for (eqn, plan) in stage.planned() {
+                    let c = describe_plan(eqn, plan, stage.kernel_choice(eqn));
+                    write_line(&mut text, name, &eqns.to_string(), &eqn.op.name(), &c);
+                    launches += c.launches;
+                    eqns += 1;
+                }
             }
             GraphPlan {
                 text,

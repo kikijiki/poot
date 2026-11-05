@@ -311,6 +311,12 @@ pub enum InvalidOptions {
     /// A chain of 256 or more steps: a step of a chain is numbered in a byte.
     #[error("a chained dispatch is at most 255 steps")]
     ChainTooLong,
+    /// A chained dispatch of a model whose decode program is host-fed (a hosted gather copies rows from the
+    /// checkpoint each step): its steps cannot run back to back on the device, so none is prepared.
+    #[error(
+        "a chained dispatch needs a program that runs on the device alone; this model's decode is host-fed"
+    )]
+    ChainOnHostFed,
     /// An input to prepare entries for that the model's `step` program does not read as a carriable
     /// one (a per-token input read at every step needs no entry of its own).
     #[error("input {input} is not a carriable input of the model's step program")]

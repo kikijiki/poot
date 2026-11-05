@@ -23,7 +23,7 @@ A new driver is `Driver<Unprepared>`. `prepare` takes it by value and returns th
 
 Every sampling rule runs on the device, as a suffix of the decode graph (`Head::Sample`): draws, penalties and bias, the guided-decoding mask and logprobs. [Serving design](./serving-design.mdx) lists them. The host reads back a token id and a non-finite flag, plus the logprob record when asked, never the logits.
 
-A step runs the narrowest prepared head that serves all its rows; a request none serves is a typed refusal. `Head::Logits` is for callers that ask for full logits. With no guided row, `RowWork::Chain` chains several decode steps on the device, and the host waits once.
+A step runs the narrowest prepared head that serves all its rows; a request none serves is a typed refusal. `Head::Logits` is for callers that ask for full logits. With no guided row and no hosted gather table, `RowWork::Chain` chains several decode steps on the device, and the host waits once. A model whose token embedding is hosted ([Execution](./execution.mdx)) copies rows every step, so asking for a chain on it is a typed refusal when the entries are prepared.
 
 ## Serving surface
 

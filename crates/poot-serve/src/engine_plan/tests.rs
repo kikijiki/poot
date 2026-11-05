@@ -801,9 +801,12 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
 /// rows, 6144 -> 15144 at one. Its indexed (routed-expert) contractions run the same body inside an expert walk, whose
 /// metadata adds the tile offset and the expert count to the old segmented body's words: 16464 -> 16884 at four and
 /// two rows, 15144 -> 15564 at one.
+/// POOT-1423 hosts the fixture's gather-only tables: `Weight` 5344 -> 5216 (128 bytes of table stay in the mapping),
+/// `Activation` drops by the gather outputs the arena no longer holds, and `Input` grows by the hosted rows slots
+/// (stored rows of the step's tokens, one slot per carrier).
 ///
 /// Mutation: size a dense weight from `shape[..1]` in `Engine::weight_buffer`'s size-only path; `Weight`
-/// is no longer 5344 and this row goes red.
+/// is no longer 5216 and this row goes red.
 #[test]
 fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
     let handle = fixture_model();
@@ -818,17 +821,17 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         (
             4,
             64,
-            "Activation=1658772 Input=117980 Meta=16884 State=12416 Weight=5344",
+            "Activation=1543972 Input=189100 Meta=16884 State=12416 Weight=5216",
         ),
         (
             2,
             64,
-            "Activation=829596 Input=82188 Meta=16884 State=6208 Weight=5344",
+            "Activation=772196 Input=117748 Meta=16884 State=6208 Weight=5216",
         ),
         (
             1,
             64,
-            "Activation=414908 Input=64292 Meta=15564 State=3104 Weight=5344",
+            "Activation=386308 Input=82072 Meta=15564 State=3104 Weight=5216",
         ),
     ];
     let domain = candidates(&handle, &args);
@@ -1587,7 +1590,12 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
         live,
         "planned vs live"
     );
-    assert_eq!(live, oracle, "live vs the stored tensor sizes");
+    // The gather-only tables stay in the mapping: the device holds the stored tensors minus those.
+    assert_eq!(
+        live + driver.executor_stats().hosted_table_bytes,
+        oracle,
+        "live plus hosted vs the stored tensor sizes"
+    );
 }
 
 /// A Qwen3-Next fixture (gated delta rule layers beside attention) as an HF checkpoint directory the

@@ -160,6 +160,23 @@ pub(crate) fn encode_stored(
     Ok(out)
 }
 
+/// A packed source's stored bytes as its lane holds them: little-endian `u32` words, the last zero-padded
+/// (`Encoding::PackedWords`, what a weight upload of a source writes).
+pub(crate) fn encode_words(bytes: &[u8]) -> Vec<u8> {
+    let encoding = Encoding::PackedWords;
+    let mut out = vec![0u8; encoded_len(encoding, &[], bytes.len())];
+    let len = out.len();
+    encode_range(
+        encoding,
+        &[],
+        bytes.len(),
+        0..len,
+        &mut |r, into| into.copy_from_slice(&bytes[r]),
+        &mut out,
+    );
+    out
+}
+
 /// A host view's bytes as `planned` holds them (slots and computed consts).
 pub(crate) fn encode_host(dtype: DType, bytes: &[u8], planned: BufferStorage) -> Option<Vec<u8>> {
     match (dtype, planned.element(), planned.dtype()) {

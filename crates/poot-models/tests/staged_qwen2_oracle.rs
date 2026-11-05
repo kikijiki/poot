@@ -21,6 +21,10 @@ use poot_tensor::HostTensor;
 use poot_test_util::{device_caps::default_caps_for, fill};
 use poot_weights::LoraTarget;
 
+#[path = "support/hosted.rs"]
+mod hosted;
+use hosted::hosted_rows;
+
 /// Layers of the traced qwen2.
 const LAYERS: usize = 3;
 
@@ -106,7 +110,12 @@ fn a_qwen2_pipeline_cut_after_layers_zero_and_one_equals_the_uncut_oracle() {
         !program.links().is_empty(),
         "the cuts cross values, or this row proves nothing"
     );
-    let chained = chain(&graph, &stage_graphs(&program), &inputs);
+    let chained = chain(
+        &graph,
+        &stage_graphs(&program),
+        &inputs,
+        &mut hosted_rows(&program, &graph, &inputs),
+    );
     assert_eq!(bits(&chained.output), bits(&whole.output));
     assert_eq!(chained.state.len(), graph.state().count());
     for (pair, (got, expected)) in graph.state().zip(chained.state.iter().zip(&whole.state)) {
@@ -146,15 +155,35 @@ fn a_lora_graph_cut_across_stages_equals_the_unpartitioned_adapted_graph() {
 
     // The adapted graph is the one the oracle evaluates, so bind its inputs by declared identity.
     let single_graph = stage_graphs(&single)[0];
+    let mut supply = hosted_rows(&single, &graph, &inputs);
     let adapted_inputs: HashMap<ValueId, Value> = single_graph
         .inputs()
         .iter()
-        .map(|&id| (id, adapted_input(single_graph, id, &graph, &inputs)))
+        .map(|&id| {
+            let meta = single_graph.meta(id);
+            let hosted = match meta.storage {
+                poot_graph_ir::Storage::Slot(Slot::Owned(role))
+                    if role == poot_graph_plan::HOSTED_ROWS =>
+                {
+                    supply(meta.slot_key().expect("keyed"), &HashMap::new())
+                }
+                _ => None,
+            };
+            (
+                id,
+                hosted.unwrap_or_else(|| adapted_input(single_graph, id, &graph, &inputs)),
+            )
+        })
         .collect();
     let one = eval(single_graph, &adapted_inputs, EvalOptions::default())
         .expect("the adapted graph evaluates");
 
-    let chained = chain(single_graph, &stage_graphs(&cut), &adapted_inputs);
+    let chained = chain(
+        single_graph,
+        &stage_graphs(&cut),
+        &adapted_inputs,
+        &mut |_, _| None,
+    );
     assert_eq!(
         bits(&chained.output),
         bits(&one.output),
@@ -232,12 +261,11 @@ fn a_qwen2_pipeline_on_two_ptx_devices_places_each_layers_weights_on_its_stage()
     };
     assert!(!layer(0).is_empty(), "the trace names layer 0's weights");
     let first = weight_names(stages[0].2.graph());
-    let mut first_expected: Vec<String> =
-        layer(0).into_iter().chain(["w.embed".to_owned()]).collect();
+    let mut first_expected: Vec<String> = layer(0);
     first_expected.sort();
     assert_eq!(
         first, first_expected,
-        "stage 0 reads the embedding and exactly layer 0's weights"
+        "stage 0 reads exactly layer 0's weights: the embedding table is hosted, not placed"
     );
     let mut second_expected: Vec<String> = layer(1)
         .into_iter()
@@ -255,7 +283,12 @@ fn a_qwen2_pipeline_on_two_ptx_devices_places_each_layers_weights_on_its_stage()
         .chain(weight_names(stages[1].2.graph()))
         .collect();
     placed.sort();
-    assert_eq!(placed, weight_names(&graph), "every weight is placed once");
+    let mut device_weights = weight_names(&graph);
+    device_weights.retain(|name| name != "w.embed");
+    assert_eq!(
+        placed, device_weights,
+        "every weight but the hosted embedding is placed once"
+    );
 
     assert!(program.links().is_empty(), "no hop stays on one device");
     assert!(!program.transfers().is_empty(), "the cut crosses values");

@@ -397,11 +397,13 @@ poot-executor	poot-executor	model-free	engine::kernel_identity_tests::colliding_
 poot-executor	poot-executor	model-free	engine::kernel_identity_tests::the_engine_offers_a_kernel_copy_device_its_copy_kernel_once
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_cast_of_a_gathered_ranged_table_compiles_and_an_undeclared_one_is_refused
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_chain_enqueues_every_step_and_waits_once
+poot-executor	poot-executor	model-free	engine::weight_source_tests::a_chain_over_a_hosted_gather_is_refused_before_any_work
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_chunk_set_with_a_missing_index_is_refused
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_const_with_no_store_entry_and_no_step_value_is_unbound
+poot-executor	poot-executor	model-free	engine::weight_source_tests::a_device_indexed_gather_copies_the_rows_the_exported_ids_name_at_the_sync
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_head_over_the_cap_binds_as_row_chunks_of_its_own_bytes
-poot-executor	poot-executor	model-free	engine::weight_source_tests::a_hosted_embed_is_filled_from_the_tokens_and_the_embed_view
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_hosted_embed_refuses_a_file_truncated_after_the_load
+poot-executor	poot-executor	model-free	engine::weight_source_tests::a_hosted_gather_is_filled_with_the_stored_rows_of_the_ids
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_map_const_that_is_only_a_store_key_is_unbound
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_packed_embed_of_another_width_than_the_map_is_refused_at_load_weights
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_paged_read_map_word_outside_the_pool_is_a_typed_bind_refusal
@@ -418,10 +420,11 @@ poot-executor	poot-executor	model-free	engine::weight_source_tests::a_site_is_id
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_state_row_past_the_pool_is_a_state_row_refusal_that_zeroes_nothing
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_store_entry_viewed_by_two_ids_uploads_once
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_syncs_writes_land_before_the_next_stage_replays
-poot-executor	poot-executor	model-free	engine::weight_source_tests::a_token_outside_the_embed_table_is_refused
 poot-executor	poot-executor	model-free	engine::weight_source_tests::a_write_map_binds_only_as_a_checked_forward_slot_map
 poot-executor	poot-executor	model-free	engine::weight_source_tests::an_allocation_over_the_device_buffer_limit_is_a_typed_refusal
+poot-executor	poot-executor	model-free	engine::weight_source_tests::an_exported_id_outside_the_hosted_table_is_refused_at_the_sync
 poot-executor	poot-executor	model-free	engine::weight_source_tests::an_i64_index_table_view_uploads_its_words_as_i32
+poot-executor	poot-executor	model-free	engine::weight_source_tests::an_id_outside_the_hosted_table_is_refused_before_any_write
 poot-executor	poot-executor	model-free	engine::weight_source_tests::an_unloaded_executable_with_pending_work_keeps_its_uploads_until_synchronize
 poot-executor	poot-executor	model-free	engine::weight_source_tests::dense_row_views_upload_their_stored_rows
 poot-executor	poot-executor	model-free	engine::weight_source_tests::distinct_row_views_of_one_payload_are_distinct_uploads_shared_across_executables
@@ -712,9 +715,7 @@ poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_claims_every_
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_claims_packed_linear_as_a_planned_packed_contraction
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_folds_a_row_parallel_softmax_past_the_target_x_grid
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_gives_the_cast_authority_cases_a_range_verdict
-poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_hosts_an_oversized_embed_gather
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_keeps_the_decomposition_when_the_target_refuses_the_fused_region
-poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_leaves_a_small_embed_dense
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_never_succeeds_with_an_oversized_tied_f16_head
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_of_an_untouched_movement_graph_publishes_bit_exact
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_plans_a_non_last_axis_moe_gate_reduce_on_every_backend
@@ -727,7 +728,6 @@ poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_publishes_the
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_reads_an_i32_buffer_on_one_lane_through_an_alias
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_reads_an_i32_slot_on_one_lane_for_gather_and_cast
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_reads_an_i32_slot_on_one_lane_for_gather_and_scatter_update
-poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_reads_hosted_bf16_embed_rows_through_the_packed_lane
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_refuses_a_dispatch_beyond_the_target_grid
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_refuses_a_packed_carrier_that_is_only_a_state_output
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_refuses_a_packed_chain_with_a_live_intermediate
@@ -738,6 +738,7 @@ poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_refuses_a_sca
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_refuses_a_square_packed_chain_under_a_non_matmul
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_refuses_an_equation_the_traced_graph_cannot_run
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_refuses_an_i32_cast_the_graph_does_not_prove_exact
+poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_refuses_an_oversized_embed_table_it_is_handed_unhosted
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_refuses_an_unclaimed_packed_dequant
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_refuses_an_unlegalizable_oversized_constant
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::compile_refuses_the_materializing_packed_moe_chain
@@ -813,15 +814,21 @@ poot-graph-plan	poot-graph-plan	model-free	packed_block_float::packed_lowering_t
 poot-graph-plan	poot-graph-plan	model-free	passes::fuse::tests::a_producer_read_outside_the_region_does_not_fuse
 poot-graph-plan	poot-graph-plan	model-free	passes::fuse::tests::a_producer_read_twice_inside_one_region_fuses
 poot-graph-plan	poot-graph-plan	model-free	passes::fuse::tests::recip_tanh_erf_fuse_into_one_region
+poot-graph-plan	poot-graph-plan	model-free	passes::hosted_gather::tests::a_gather_by_a_device_computed_index_is_a_device_site
+poot-graph-plan	poot-graph-plan	model-free	passes::hosted_gather::tests::a_sole_reader_dense_table_is_hosted_at_any_size
+poot-graph-plan	poot-graph-plan	model-free	passes::hosted_gather::tests::a_sole_reader_packed_table_is_hosted_at_any_size
+poot-graph-plan	poot-graph-plan	model-free	passes::hosted_gather::tests::a_table_another_equation_reads_stays_on_the_device
+poot-graph-plan	poot-graph-plan	model-free	passes::hosted_gather::tests::a_table_two_gathers_read_stays_on_the_device
+poot-graph-plan	poot-graph-plan	model-free	passes::hosted_gather::tests::an_i32_index_table_is_not_hosted
 poot-graph-plan	poot-graph-plan	model-free	passes::iota::tests::cse_merges_identical_iotas_and_keeps_distinct_lengths
 poot-graph-plan	poot-graph-plan	model-free	passes::legalize::tests::a_chunk_carries_its_parent_weight_ref_and_a_non_weight_constant_never_splits
 poot-graph-plan	poot-graph-plan	model-free	passes::legalize::tests::legalize_does_not_host_a_gather_whose_table_another_eqn_reads
-poot-graph-plan	poot-graph-plan	model-free	passes::legalize::tests::legalize_hosts_an_embed_gather_over_the_limit
 poot-graph-plan	poot-graph-plan	model-free	passes::legalize::tests::legalize_ignores_a_dead_oversized_constant
 poot-graph-plan	poot-graph-plan	model-free	passes::legalize::tests::legalize_keeps_a_7b_embed_dense_on_a_device_with_real_headroom
 poot-graph-plan	poot-graph-plan	model-free	passes::legalize::tests::legalize_leaves_a_small_embed_dense
 poot-graph-plan	poot-graph-plan	model-free	passes::legalize::tests::legalize_leaves_a_small_matmul_weight_dense
 poot-graph-plan	poot-graph-plan	model-free	passes::legalize::tests::legalize_refuses_a_matmul_weight_no_split_can_help
+poot-graph-plan	poot-graph-plan	model-free	passes::legalize::tests::legalize_refuses_an_oversized_embed_gather_it_was_not_given_hosted
 poot-graph-plan	poot-graph-plan	model-free	passes::legalize::tests::legalize_refuses_an_oversized_packed_source_instead_of_splitting_it
 poot-graph-plan	poot-graph-plan	model-free	passes::legalize::tests::legalize_refuses_an_oversized_weight_read_without_a_transpose
 poot-graph-plan	poot-graph-plan	model-free	passes::legalize::tests::legalize_splits_a_transposed_matmul_weight_and_keeps_a_shared_one
@@ -950,6 +957,8 @@ poot-graph-plan	poot-graph-plan	model-free	planner::choice::tests::a_template_wi
 poot-graph-plan	poot-graph-plan	model-free	planner::choice::tests::an_empty_split_is_a_typed_refusal
 poot-graph-plan	poot-graph-plan	model-free	planner::choice::tests::every_request_family_has_a_field_that_changes_the_digest
 poot-graph-plan	poot-graph-plan	model-free	planner::choice::tests::requests_differing_only_in_an_f32_parameter_get_different_keys
+poot-graph-plan	poot-graph-plan	model-free	planner::matmul::tests::a_folded_chunk_stays_whole_grid_rows
+poot-graph-plan	poot-graph-plan	model-free	planner::matmul::tests::a_split_launch_fills_whole_waves_per_dispatch
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::a_fp8_prefill_linear_plans_the_register_tiled_gemm_on_gfx1151
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::a_fp8_prefill_linear_plans_the_register_tiled_gemm_on_wgpu
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::a_packed_tiled_contraction_over_the_watchdog_budget_splits_into_tile_ranges
@@ -988,6 +997,13 @@ poot-graph-plan	poot-graph-plan	model-free	staged::tests::exports_survive_cse_dc
 poot-graph-plan	poot-graph-plan	model-free	staged::tests::read_traffic_counts_each_streamed_weight_once_and_the_cache_per_position
 poot-graph-plan	poot-graph-plan	model-free	staged::tests::stage_metadata_is_linear_in_the_graph_plus_links_not_stages_times_values
 poot-graph-plan	poot-graph-plan	model-free	staged::tests::unsupported_partitions_are_typed_refusals
+poot-graph-plan	poot-graph-plan	model-free	staged::tests_hosted::a_device_indexed_hosted_program_equals_the_unhosted_oracle_bit_for_bit
+poot-graph-plan	poot-graph-plan	model-free	staged::tests_hosted::a_device_indexed_site_across_devices_is_refused
+poot-graph-plan	poot-graph-plan	model-free	staged::tests_hosted::a_program_with_no_hosted_site_is_not_host_fed
+poot-graph-plan	poot-graph-plan	model-free	staged::tests_hosted::a_step_indexed_site_adds_no_cut_but_makes_the_program_host_fed
+poot-graph-plan	poot-graph-plan	model-free	staged::tests_hosted::a_table_past_every_device_limit_plans_on_every_backend_as_a_hosted_site
+poot-graph-plan	poot-graph-plan	model-free	staged::tests_hosted::a_tied_embedding_is_not_hosted_and_an_untied_one_is
+poot-graph-plan	poot-graph-plan	model-free	staged::tests_hosted::a_tied_table_past_the_limit_is_still_a_typed_refusal
 poot-graph-plan	poot-graph-plan	model-free	state_commit::tests::a_paged_pool_read_before_the_write_is_refused_not_copied
 poot-graph-plan	poot-graph-plan	model-free	state_commit::tests::a_paged_pool_write_read_back_after_the_scatter_is_donated_in_place
 poot-graph-plan	poot-graph-plan	model-free	state_commit::tests::a_scatter_over_a_value_that_is_not_state_is_refused
@@ -1019,6 +1035,7 @@ poot-graph-plan	poot-graph-plan	model-free	tests::a_select_with_a_literal_branch
 poot-graph-plan	poot-graph-plan	model-free	tests::a_selected_attention_chunk_groups_the_heads_of_a_key_value_head
 poot-graph-plan	poot-graph-plan	model-free	tests::a_split_plans_dispatches_carry_work_in_proportion_to_their_launch
 poot-graph-plan	poot-graph-plan	model-free	tests::a_tiled_gemm_over_the_tile_ceiling_splits_into_disjoint_launches
+poot-graph-plan	poot-graph-plan	model-free	tests::a_watchdog_split_tiled_gemm_dispatches_whole_waves
 poot-graph-plan	poot-graph-plan	model-free	tests::an_i32_binary_plans_the_same_kernel_whatever_consumes_it
 poot-graph-plan	poot-graph-plan	model-free	tests::an_i32_chain_cast_and_float_scale_compile_to_one_launch_on_every_backend
 poot-graph-plan	poot-graph-plan	model-free	tests::an_isolated_i32_gather_plans_the_i32_carrier_with_an_i32_index
@@ -1684,6 +1701,9 @@ poot-llm	poot-llm	checkpoint	driver::text_checkpoint_tests::chat_template_checkp
 poot-llm	poot-llm	checkpoint	driver::text_checkpoint_tests::chat_template_checkpoints::tools_render_into_the_qwen_prompt_and_none_is_unchanged
 poot-llm	poot-llm	checkpoint	driver::text_checkpoint_tests::llama3_golden_tests::encode_equals_llama_cpp_token_ids
 poot-llm	poot-llm	checkpoint	driver::text_checkpoint_tests::llama3_golden_tests::qwen2_encode_equals_llama_cpp_token_ids
+poot-llm	poot-llm	device	driver::device_tests::a_chain_over_a_hosted_gather_is_refused_at_prepare_ptx
+poot-llm	poot-llm	device	driver::device_tests::a_chain_over_a_hosted_gather_is_refused_at_prepare_rocm
+poot-llm	poot-llm	device	driver::device_tests::a_chain_over_a_hosted_gather_is_refused_at_prepare_wgpu
 poot-llm	poot-llm	device	driver::device_tests::a_chat_turn_end_is_cut_from_the_text_and_a_reverse_prompt_is_kept_wgpu
 poot-llm	poot-llm	device	driver::device_tests::a_deepseek4_chunk_that_is_not_a_granule_multiple_is_refused_before_any_executable_ptx
 poot-llm	poot-llm	device	driver::device_tests::a_deepseek4_chunk_that_is_not_a_granule_multiple_is_refused_before_any_executable_rocm
@@ -1716,6 +1736,9 @@ poot-llm	poot-llm	device	driver::device_tests::a_refused_shape_is_typed_before_a
 poot-llm	poot-llm	device	driver::device_tests::a_second_turn_equals_one_run_of_the_concatenated_prompt_and_prefills_only_the_new_tokens_wgpu
 poot-llm	poot-llm	device	driver::device_tests::a_second_turn_over_a_rewritten_history_still_equals_one_run_wgpu
 poot-llm	poot-llm	device	driver::device_tests::a_text_run_ends_at_the_window_and_reports_engine_timing_wgpu
+poot-llm	poot-llm	device	driver::device_tests::a_tied_decode_chains_and_equals_stepwise_decode_ptx
+poot-llm	poot-llm	device	driver::device_tests::a_tied_decode_chains_and_equals_stepwise_decode_rocm
+poot-llm	poot-llm	device	driver::device_tests::a_tied_decode_chains_and_equals_stepwise_decode_wgpu
 poot-llm	poot-llm	device	driver::device_tests::adapter_generation_replacement_is_isolated_and_freed_ptx
 poot-llm	poot-llm	device	driver::device_tests::adapter_generation_replacement_is_isolated_and_freed_rocm
 poot-llm	poot-llm	device	driver::device_tests::adapter_generation_replacement_is_isolated_and_freed_wgpu
@@ -1735,9 +1758,6 @@ poot-llm	poot-llm	device	driver::device_tests::bf16_adapter_generation_replaceme
 poot-llm	poot-llm	device	driver::device_tests::capacity_does_not_change_the_tokens_ptx
 poot-llm	poot-llm	device	driver::device_tests::capacity_does_not_change_the_tokens_rocm
 poot-llm	poot-llm	device	driver::device_tests::capacity_does_not_change_the_tokens_wgpu
-poot-llm	poot-llm	device	driver::device_tests::chained_decode_steps_equal_stepwise_decode_ptx
-poot-llm	poot-llm	device	driver::device_tests::chained_decode_steps_equal_stepwise_decode_rocm
-poot-llm	poot-llm	device	driver::device_tests::chained_decode_steps_equal_stepwise_decode_wgpu
 poot-llm	poot-llm	device	driver::device_tests::chunked_prefill_equals_token_by_token_ptx
 poot-llm	poot-llm	device	driver::device_tests::chunked_prefill_equals_token_by_token_rocm
 poot-llm	poot-llm	device	driver::device_tests::chunked_prefill_equals_token_by_token_wgpu
@@ -2163,6 +2183,7 @@ poot-llm	poot-llm	model-free	driver::expert_residency::tests::the_victim_is_the_
 poot-llm	poot-llm	model-free	driver::features::tests::a_set_is_checked_pair_by_pair
 poot-llm	poot-llm	model-free	driver::features::tests::a_verdict_is_symmetric
 poot-llm	poot-llm	model-free	driver::features::tests::every_feature_has_one_row_and_every_pair_one_verdict
+poot-llm	poot-llm	model-free	driver::flash_next_tests::flash_next_per_layer_table_is_a_hosted_device_indexed_gather_on_every_backend
 poot-llm	poot-llm	model-free	driver::gguf_vocab::tests::a_header_without_tokenizer_keys_is_all_none
 poot-llm	poot-llm	model-free	driver::gguf_vocab::tests::every_tokenizer_key_lands_in_its_field
 poot-llm	poot-llm	model-free	driver::hidden_carry_tests::a_carry_aval_that_differs_from_the_request_is_refused_typed
@@ -2428,6 +2449,7 @@ poot-llm	poot-llm::error_sizes	model-free	boxing_a_cause_does_not_cut_the_source
 poot-llm	poot-llm::error_sizes	model-free	every_boxed_cause_across_the_device_error_enums_preserves_its_source
 poot-llm	poot-llm::error_sizes	model-free	every_boxed_cause_still_converts_through_a_single_question_mark
 poot-llm	poot-llm::error_sizes	model-free	slice_one_error_types_stay_under_the_clippy_threshold
+poot-llm	poot-llm::flash_next_budget	model-free	flash_next_plans_on_vulkan_with_its_gather_tables_hosted
 poot-llm	poot-llm::flash_next_budget	model-free	flash_next_q2_footprint_on_a_96_gb_card
 poot-llm	poot-llm::flash_next_budget	model-free	the_budget_refuses_flash_next_before_any_allocation
 poot-llm	poot-llm::flash_next_budget	model-free	the_decode_curve_cell_runs_at_the_largest_chunk_that_fits_the_card
@@ -2511,6 +2533,7 @@ poot-llm	poot-llm::ptx_tensor_parallel	device	sixteen_tensor_parallel_steps_uplo
 poot-llm	poot-llm::ptx_tensor_parallel	device	the_long_run_stays_inside_the_traced_position_range
 poot-llm	poot-llm::ptx_weight_map_binding	device	a_split_head_generates_the_unsplit_logits_and_tokens
 poot-llm	poot-llm::ptx_weight_map_binding	device	fused_and_stacked_views_equal_separate_storage
+poot-llm	poot-llm::ptx_weight_map_binding	device	hosted_dense_and_packed_gathers_match_the_oracle_at_bind_and_sync_time
 poot-llm	poot-llm::ptx_weight_map_binding	device	qwen2_binds_through_the_map_and_matches_the_oracle
 poot-llm	poot-llm::qwen35_planned_graph	model-free	a_cap_below_one_projection_row_is_a_typed_refusal_naming_the_constant
 poot-llm	poot-llm::qwen35_planned_graph	model-free	a_cap_below_the_largest_projection_splits_it_on_every_backend
@@ -2557,6 +2580,7 @@ poot-llm	poot-llm::rocm_staged_pipeline	device	exported_boundaries_reach_every_c
 poot-llm	poot-llm::rocm_staged_pipeline	device	qwen2_pipeline_cut_after_layers_zero_and_one_matches_the_single_stage_on_rocm
 poot-llm	poot-llm::rocm_weight_map_binding	device	a_split_head_generates_the_unsplit_logits_and_tokens
 poot-llm	poot-llm::rocm_weight_map_binding	device	fused_and_stacked_views_equal_separate_storage
+poot-llm	poot-llm::rocm_weight_map_binding	device	hosted_dense_and_packed_gathers_match_the_oracle_at_bind_and_sync_time
 poot-llm	poot-llm::rocm_weight_map_binding	device	qwen2_binds_through_the_map_and_matches_the_oracle
 poot-llm	poot-llm::rocm_weight_map_binding	device	the_tied_head_decodes_on_bf16_resident_weights_and_matches_the_oracle
 poot-llm	poot-llm::speculate	device	a_row_that_does_not_speculate_says_why_ptx
@@ -2696,10 +2720,11 @@ poot-llm	poot-llm::wgpu_qwen2	device	qwen2_masked_decode_gpu_matches_cpu
 poot-llm	poot-llm::wgpu_staged_pipeline	device	a_pipeline_step_waits_once_on_wgpu
 poot-llm	poot-llm::wgpu_staged_pipeline	device	exported_boundaries_reach_every_consumer_on_wgpu
 poot-llm	poot-llm::wgpu_staged_pipeline	device	qwen2_pipeline_cut_after_layers_zero_and_one_matches_the_single_stage_on_wgpu
-poot-llm	poot-llm::wgpu_weight_map_binding	device	a_hosted_embed_gather_equals_the_device_gather
+poot-llm	poot-llm::wgpu_weight_map_binding	device	a_hosted_embed_gather_matches_the_oracle
 poot-llm	poot-llm::wgpu_weight_map_binding	device	a_split_head_generates_the_unsplit_logits_and_tokens
 poot-llm	poot-llm::wgpu_weight_map_binding	device	chunked_prefill_then_decode_equals_token_by_token_decode
 poot-llm	poot-llm::wgpu_weight_map_binding	device	fused_and_stacked_views_equal_separate_storage
+poot-llm	poot-llm::wgpu_weight_map_binding	device	hosted_dense_and_packed_gathers_match_the_oracle_at_bind_and_sync_time
 poot-llm	poot-llm::wgpu_weight_map_binding	device	qwen2_binds_through_the_map_and_matches_the_oracle
 poot-llm	poot-llm::wgpu_weight_map_binding	device	the_tied_head_decodes_on_bf16_resident_weights_and_matches_the_oracle
 poot-load	poot-load	checkpoint	gguf::tests::parses_real_qwen2_gguf
@@ -3116,6 +3141,7 @@ poot-models	poot-models	model-free	architectures::qwen38::qsa::tests::the_cache_
 poot-models	poot-models	model-free	architectures::qwen38::qsa::tests::the_op_selects_what_the_legacy_rank_chain_selected
 poot-models	poot-models	model-free	architectures::qwen38::tests::a_checkpoint_with_sharded_ple_tables_matches_the_single_table
 poot-models	poot-models	model-free	architectures::qwen38::tests::a_finetune_like_config_loads_traces_and_matches_its_reference
+poot-models	poot-models	model-free	architectures::qwen38::tests::a_hosted_ple_program_equals_the_unhosted_graph_over_chunked_prefill_and_decode
 poot-models	poot-models	model-free	architectures::qwen38::tests::a_missing_tensor_is_named_before_any_trace
 poot-models	poot-models	model-free	architectures::qwen38::tests::a_paged_step_is_a_typed_indexer_refusal
 poot-models	poot-models	model-free	architectures::qwen38::tests::a_shape_off_the_granule_is_a_typed_refusal
@@ -3468,6 +3494,8 @@ poot-models	poot-models::graph_edit_api	model-free	a_commit_that_loses_a_witness
 poot-models	poot-models::graph_edit_api	model-free	a_rewrite_adds_a_witness_only_by_naming_it
 poot-models	poot-models::graph_edit_api	model-free	an_invalid_edit_is_a_typed_error
 poot-models	poot-models::graph_edit_api	model-free	every_output_kind_is_retargeted_by_one_pass_and_kept_by_the_next
+poot-models	poot-models::hosted_gather_qwen2	model-free	compile_staged_hosts_the_decode_embed_gather_without_changing_hidden_state
+poot-models	poot-models::hosted_gather_qwen2	model-free	compile_staged_hosts_the_prefill_embed_gather_without_changing_hidden_state
 poot-models	poot-models::kv_dtype	model-free	a_bf16_cache_compiles_where_bf16_lanes_exist_and_is_refused_by_name_on_spirv
 poot-models	poot-models::kv_dtype	model-free	an_f16_cache_is_read_by_the_fused_attention_through_the_f16_lane
 poot-models	poot-models::kv_dtype	model-free	an_f32_cache_traces_no_narrowing
@@ -3480,8 +3508,6 @@ poot-models	poot-models::kv_extent	model-free	the_padded_position_never_reaches_
 poot-models	poot-models::layer_tags	model-free	every_registered_family_tags_one_run_per_configured_layer
 poot-models	poot-models::legalize_driver_trace	model-free	driver_compile_refuses_a_head_no_row_split_can_fit
 poot-models	poot-models::legalize_driver_trace	model-free	driver_compile_splits_transposed_weights_under_a_small_buffer_limit
-poot-models	poot-models::legalize_qwen2	model-free	compile_hosts_the_decode_embed_gather_without_changing_hidden_state
-poot-models	poot-models::legalize_qwen2	model-free	compile_hosts_the_prefill_embed_gather_without_changing_hidden_state
 poot-models	poot-models::live_kv_bytes	model-free	live_short_decode_reads_the_live_positions_not_the_cache
 poot-models	poot-models::lora_merged_weight	model-free	lora_rows_equal_the_per_row_merged_weight_graph_and_index_zero_is_the_base
 poot-models	poot-models::npu_qwen_refusals	model-free	the_traced_qwen2_block_is_refused_op_class_by_op_class
@@ -3524,8 +3550,6 @@ poot-models	poot-models::plan_summary	model-free	plan_summary_rendering_is_deter
 poot-models	poot-models::prefill_arena_fits_buffer_limit	model-free	a_whole_longest_context_prefill_plans_arena_slots_within_the_buffer_limit
 poot-models	poot-models::qwen2_pipeline_pass_soundness	model-free	cse_preserves_results
 poot-models	poot-models::qwen2_pipeline_pass_soundness	model-free	fuse_preserves_qwen2_results_and_shrinks
-poot-models	poot-models::qwen2_pipeline_pass_soundness	model-free	legalize_hosts_the_decode_embed_gather_without_changing_hidden_state
-poot-models	poot-models::qwen2_pipeline_pass_soundness	model-free	legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state
 poot-models	poot-models::routed_expert_pipeline	model-free	every_moe_family_prefill_has_routed_expert_sites_and_runs_every_pass_on_rocm
 poot-models	poot-models::routed_expert_pipeline	model-free	qwen3next_prefill_tiles_its_routers_and_runs_every_pass_on_every_preset
 poot-models	poot-models::routed_expert_pipeline	model-free	routed_expert_prefill_runs_the_full_pipeline_on_every_preset

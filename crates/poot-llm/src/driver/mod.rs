@@ -67,6 +67,8 @@ mod composition_tests;
 #[cfg(test)]
 mod device_tests;
 #[cfg(test)]
+mod flash_next_tests;
+#[cfg(test)]
 mod hidden_carry_tests;
 #[cfg(test)]
 mod llamacpp_bisect_tests;
@@ -621,6 +623,9 @@ struct Prepared {
     traffic: ReadTraffic,
     /// Whether the entry is a decode step (one token per row), which the read-byte counters split on.
     decode: bool,
+    /// Whether a step of the entry needs the host before or between its stages (a hosted gather copies rows
+    /// from the checkpoint mapping): such an entry cannot be chained on the device.
+    host_fed: bool,
     slots: Vec<BoundSlot>,
     /// The shape of the program's output, as traced: `[rows, positions, width]` for an encode step.
     output: Vec<usize>,
@@ -1319,6 +1324,8 @@ impl<S: State> Driver<S> {
         options: &CompileOptions,
     ) -> Result<StagedProgram, Unsupported> {
         let graph = &bound(graph, formats)?;
+        // A table the checkpoint also binds under another id (a tied head) is not hosted.
+        let options = &options.clone().with_aliases(formats.aliases().clone());
         // The pool pages the graphs that have routed experts; a dense draft model's or an encode graph's
         // stays resident, decided here from the graph rather than by catching the pool's refusal.
         let experts = match &self.runtime.pool {
@@ -1402,6 +1409,7 @@ impl<S: State> Driver<S> {
             held: reservation.held,
             traffic: program.read_traffic(),
             decode: program_kind == Program::Step && shape.is_decode(),
+            host_fed: program.host_fed(),
             slots: io.slots,
             output: io.output,
             picked: io.picked,

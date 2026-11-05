@@ -27,9 +27,10 @@ use poot_graph_ir::{
 };
 use poot_graph_plan::multi_device::PlanNodeId;
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, Plan, PoolSite, Program, Region, Sink, Source, Target,
-    multi_device::topology::DeviceId, region_member_work, staged::Link, staged::StageId,
-    staged::StagedProgram, staged::SyncPoint, staged::TargetSet, staged::Transfer, value_ids,
+    CompileLimits, CompileOptions, HOSTED_ROWS, HostedGather, IndexSource, Plan, PoolSite, Program,
+    Region, Sink, Source, Target, multi_device::topology::DeviceId, region_member_work,
+    staged::Link, staged::StageId, staged::StagedProgram, staged::SyncAction, staged::SyncPoint,
+    staged::TargetSet, staged::Transfer, value_ids,
 };
 use poot_kernel_ir::Body;
 use poot_quant::SourceRole;
@@ -38,7 +39,7 @@ use poot_target::{BufferStorage, TargetId};
 use poot_tensor::DType;
 use poot_weights::WeightMap;
 
-use crate::binder::{self, BoundSlot, EmbedRows, LocalBuffer, StoredAs, WeightBinder};
+use crate::binder::{self, BoundSlot, HostedTable, LocalBuffer, StoredAs, WeightBinder};
 use crate::device::{
     Arg, CopyKernel, CopyMechanism, Device, DeviceTime, Dispatch, LaunchKind, RegionLoader,
     WeightUpload,
@@ -95,6 +96,8 @@ pub struct Engine<D: Device> {
     host_write_bytes: u64,
     /// The host-sync counters ([`ExecutorStats::syncs`] and the three beside it).
     sync_counters: SyncCounters,
+    /// What the hosted gathers copied ([`ExecutorStats::hosted_rows`] and the one beside it).
+    hosted_counters: HostedCounters,
     /// Bytes of step output read back ([`ExecutorStats::output_read_bytes`]).
     output_read_bytes: u64,
     /// Times the host blocked on the device ([`ExecutorStats::waits`]).
@@ -192,6 +195,13 @@ struct SyncCounters {
     refill_bytes: u64,
 }
 
+/// The hosted-gather counters behind [`ExecutorStats::hosted_rows`] and [`ExecutorStats::hosted_bytes`].
+#[derive(Clone, Copy, Debug, Default)]
+struct HostedCounters {
+    rows: u64,
+    bytes: u64,
+}
+
 /// What one resident buffer is, for finding it again from another entry: a table by the stored bytes
 /// it pages and its lane and height, a map by the identity of the site it serves.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,7 +257,8 @@ struct EntryBuild<D: Device> {
     locals: Vec<D::Buffer>,
     arena: Vec<D::Buffer>,
     slots: Vec<BoundSlot>,
-    token_embeds: Vec<TokenEmbedSlot>,
+    /// The hosted gather slots the loaded stages declared so far, one per [`HOSTED_ROWS`] key.
+    hosted_slots: Vec<HostedSlot>,
     /// Each exported boundary's location and element count, by the stage that produced it.
     exported: HashMap<BoundaryId, (Loc, usize)>,
     /// The lane each exported boundary was planned in.
@@ -300,9 +311,12 @@ struct Entry<D: Device> {
     /// stage's).
     arena: Vec<D::Buffer>,
     slots: Vec<BoundSlot>,
-    /// Hosted embed gathers (`legalize`'s `TOKEN_EMBED`), filled each step from the step's
-    /// `Slot::Token` input and the executable's embed rows, never supplied by the caller.
-    token_embeds: Vec<TokenEmbedSlot>,
+    /// The [`HOSTED_ROWS`] buffers of the entry's hosted gathers, filled by the engine from the checkpoint
+    /// mapping, never supplied by the caller.
+    hosted_slots: Vec<HostedSlot>,
+    /// The hosted gather sites the entry runs: each copies the stored rows its ids name into its slots, at
+    /// bind time or at a host sync.
+    hosted: Vec<EntryHosted>,
     /// Where the final stage's primary output is read from: its pre-commit snapshot when the output
     /// aliases a commit destination, else the output itself.
     output: Loc,
@@ -335,14 +349,25 @@ struct EntrySync {
     /// The stage that must complete before the host is called.
     after: usize,
     point: SyncPoint,
-    identity: SiteIdentity,
-    /// Device bytes of one row of each of the site's tables.
-    row_bytes: Vec<usize>,
     /// Each value the point reads: its id, where it lives and its element count.
     reads: Vec<(BoundaryId, Loc, usize)>,
-    /// The site's tables and map in [`Loaded::resident`], in [`PoolSite::weights`] order.
-    tables: Vec<usize>,
-    map: usize,
+    kind: SyncKind,
+}
+
+/// What an entry's sync resolved to.
+enum SyncKind {
+    /// A routed selection's expert refill, decided by the caller's [`HostSync`].
+    Experts {
+        identity: SiteIdentity,
+        /// Device bytes of one row of each of the site's tables.
+        row_bytes: Vec<usize>,
+        /// The site's tables and map in [`Loaded::resident`], in [`PoolSite::weights`] order.
+        tables: Vec<usize>,
+        map: usize,
+    },
+    /// A hosted gather whose ids the device computed: the engine copies the rows itself. The site is an
+    /// index into [`Entry::hosted`].
+    Gather { site: usize },
 }
 
 /// The stages of one entry that one engine loads, and how their boundaries reach them: the whole
@@ -355,6 +380,8 @@ pub(crate) struct EntryPart<'a> {
     pub(crate) links: &'a [Link],
     pub(crate) transfers: &'a [Transfer],
     pub(crate) sync_points: &'a [SyncPoint],
+    /// The program's hosted gather sites.
+    pub(crate) hosted: &'a [HostedGather],
     /// The stage after which a step binds its late inputs ([`StagedProgram::late_after`]).
     pub(crate) late: Option<StageId>,
 }
@@ -370,6 +397,7 @@ impl<'a> EntryPart<'a> {
             links: program.links(),
             transfers: program.transfers(),
             sync_points: program.sync_points(),
+            hosted: program.hosted(),
             late: program.late_after(),
         }
     }
@@ -390,13 +418,47 @@ struct StageRun<D: Device> {
     preserve_output: Option<Loc>,
 }
 
-/// One hosted embed gather: where its rows come from, its planned lane, and its buffer (an index
+/// One carrier of a hosted table: where its stored rows come from, its planned lane, and its buffer (an index
 /// into the entry's `locals`).
-struct TokenEmbedSlot {
-    rows: EmbedRows,
-    numel: usize,
+struct HostedSlot {
+    key: SlotKey,
+    table: HostedTable,
     storage: BufferStorage,
     buffer: LocalBuffer,
+    /// The buffer's native device-element count.
+    elems: usize,
+}
+
+/// One hosted gather site of an entry, resolved to the entry's buffers.
+struct EntryHosted {
+    /// Where the ids come from: a step input read at bind time, or an export read at a host sync.
+    index: IndexSource,
+    /// The ids one step gathers.
+    ids: usize,
+    /// The site's carriers, in [`Entry::hosted_slots`], in role order.
+    slots: Vec<usize>,
+    /// The table's name (its first carrier's) and the stored bytes of the whole table, which stay in the
+    /// checkpoint mapping.
+    table: String,
+    table_bytes: u64,
+}
+
+/// The stored rows `ids` name of every carrier of hosted site `site`, each with the buffer it is written to.
+/// Nothing is written here: the caller writes only after every carrier's rows were read and checked.
+fn gather_hosted<D: Device>(
+    binder: &WeightBinder,
+    entry: &Entry<D>,
+    site: &EntryHosted,
+    ids: &[i32],
+) -> Result<Vec<(LocalBuffer, Vec<u8>)>, ExecError> {
+    site.slots
+        .iter()
+        .map(|&slot| {
+            let slot = &entry.hosted_slots[slot];
+            let bytes = binder.gather_rows(&slot.table, ids, slot.storage)?;
+            Ok((slot.buffer, bytes))
+        })
+        .collect()
 }
 
 /// The entry's validation packet sources, resolved to device locations (empty for a zero-lane
@@ -581,6 +643,23 @@ fn resolve<'a, D: Device>(
 }
 
 impl<D: Device> Engine<D> {
+    /// The stored bytes of every hosted table the loaded executables read from the checkpoint mapping, each
+    /// counted once however many entries host it. These bytes are not device memory.
+    fn hosted_table_bytes(&self) -> u64 {
+        let mut total = 0;
+        for loaded in self.executables.iter().flatten() {
+            let mut seen = std::collections::HashSet::new();
+            for entry in loaded.entries.iter().flatten() {
+                for site in &entry.hosted {
+                    if seen.insert(&site.table) {
+                        total += site.table_bytes;
+                    }
+                }
+            }
+        }
+        total
+    }
+
     /// An engine with the default [`TimingOptions::CountersOnly`] (no behavior change from before
     /// Card 552: cumulative counters are always tracked, no per-dispatch detail is retained).
     pub fn new(device: D) -> Self {
@@ -624,6 +703,7 @@ impl<D: Device> Engine<D> {
             weight_bytes_read: 0,
             host_write_bytes: 0,
             sync_counters: SyncCounters::default(),
+            hosted_counters: HostedCounters::default(),
             output_read_bytes: 0,
             waits: 0,
             device,
@@ -894,7 +974,7 @@ impl<D: Device> Engine<D> {
             locals: Vec::new(),
             arena: Vec::new(),
             slots: Vec::new(),
-            token_embeds: Vec::new(),
+            hosted_slots: Vec::new(),
             exported: HashMap::new(),
             export_lanes: HashMap::new(),
             stages: Vec::new(),
@@ -908,12 +988,13 @@ impl<D: Device> Engine<D> {
         for &(id, stage) in &part.stages {
             self.load_stage(exe, id, stage, part, &mut build)?;
         }
-        let syncs = self.entry_syncs(exe, part, &build)?;
+        let hosted = self.entry_hosted(part, &build)?;
+        let syncs = self.entry_syncs(exe, part, &build, &hosted)?;
         let EntryBuild {
             locals,
             arena,
             slots,
-            token_embeds,
+            hosted_slots,
             exported,
             export_lanes,
             stages,
@@ -943,7 +1024,8 @@ impl<D: Device> Engine<D> {
             locals,
             arena,
             slots,
-            token_embeds,
+            hosted_slots,
+            hosted,
             output,
             output_bytes,
             output_host,
@@ -979,7 +1061,9 @@ impl<D: Device> Engine<D> {
             })
         };
         for point in part.sync_points {
-            let site = &point.site;
+            let SyncAction::RefillExperts(site) = &point.action else {
+                continue;
+            };
             let (_, map_storage) =
                 declared(&site.map).ok_or_else(|| LoadError::PoolUndeclared {
                     key: site.map.clone(),
@@ -1186,6 +1270,42 @@ impl<D: Device> Engine<D> {
         Ok(loaded.resident.len() - 1)
     }
 
+    /// The hosted gather sites of the part's stages, resolved to the buffers the loaded stages declared. A
+    /// site none of the part's stages read is another device's.
+    fn entry_hosted(
+        &self,
+        part: &EntryPart<'_>,
+        build: &EntryBuild<D>,
+    ) -> Result<Vec<EntryHosted>, ExecError> {
+        let mut hosted = Vec::with_capacity(part.hosted.len());
+        for site in part.hosted {
+            let slots: Vec<usize> = site
+                .rows
+                .iter()
+                .filter_map(|rows| {
+                    build
+                        .hosted_slots
+                        .iter()
+                        .position(|slot| slot.key == rows.slot)
+                })
+                .collect();
+            if slots.is_empty() {
+                continue;
+            }
+            if slots.len() != site.rows.len() {
+                return Err(LoadError::UnknownHandle.into());
+            }
+            hosted.push(EntryHosted {
+                index: site.index.clone(),
+                ids: site.ids,
+                slots,
+                table: site.rows[0].source.clone(),
+                table_bytes: site.table_bytes,
+            });
+        }
+        Ok(hosted)
+    }
+
     /// The entry's host syncs: each point's reads (the producing stage's exported buffers) and the
     /// resident buffers of its site. A read must be a plain F32 value a host can take as `f32`s.
     fn entry_syncs(
@@ -1193,6 +1313,7 @@ impl<D: Device> Engine<D> {
         exe: ExecutableId,
         part: &EntryPart<'_>,
         build: &EntryBuild<D>,
+        hosted: &[EntryHosted],
     ) -> Result<Vec<EntrySync>, ExecError> {
         let mut syncs = Vec::with_capacity(part.sync_points.len());
         for point in part.sync_points {
@@ -1231,30 +1352,42 @@ impl<D: Device> Engine<D> {
                 }
                 reads.push((id, loc, elems));
             }
-            let site = &point.site;
-            let tables: Vec<usize> = site
-                .weights
-                .iter()
-                .map(|weight| build.pooled[&weight.slot])
-                .collect();
-            let map = build.pooled[&site.map];
-            let identity = self.site_identity(exe, &tables)?;
-            let loaded = self.loaded(exe)?;
-            let row_bytes = tables
-                .iter()
-                .map(|&index| match &loaded.resident[index].kind {
-                    ResidentKind::Table { row_bytes, .. } => *row_bytes,
-                    ResidentKind::Map { .. } => unreachable!("a site's tables are tables"),
-                })
-                .collect();
+            let kind = match &point.action {
+                SyncAction::RefillExperts(site) => {
+                    let tables: Vec<usize> = site
+                        .weights
+                        .iter()
+                        .map(|weight| build.pooled[&weight.slot])
+                        .collect();
+                    let map = build.pooled[&site.map];
+                    let identity = self.site_identity(exe, &tables)?;
+                    let loaded = self.loaded(exe)?;
+                    let row_bytes = tables
+                        .iter()
+                        .map(|&index| match &loaded.resident[index].kind {
+                            ResidentKind::Table { row_bytes, .. } => *row_bytes,
+                            ResidentKind::Map { .. } => unreachable!("a site's tables are tables"),
+                        })
+                        .collect();
+                    SyncKind::Experts {
+                        identity,
+                        row_bytes,
+                        tables,
+                        map,
+                    }
+                }
+                SyncAction::GatherRows(gather) => SyncKind::Gather {
+                    site: hosted
+                        .iter()
+                        .position(|site| site.index == gather.index)
+                        .ok_or(LoadError::UnknownHandle)?,
+                },
+            };
             syncs.push(EntrySync {
                 after,
                 point: point.clone(),
-                identity,
-                row_bytes,
                 reads,
-                tables,
-                map,
+                kind,
             });
         }
         Ok(syncs)
@@ -1272,7 +1405,7 @@ impl<D: Device> Engine<D> {
             locals,
             arena,
             slots,
-            token_embeds,
+            hosted_slots,
             exported,
             export_lanes,
             stages,
@@ -1399,32 +1532,62 @@ impl<D: Device> Engine<D> {
                     .map_err(device_error(label))?;
                     (loc, elems)
                 }
-                Storage::Slot(Slot::Owned(role)) if role == poot_graph_plan::TOKEN_EMBED => {
-                    // The key's tag is the name of the table the host gathers the rows from.
-                    let table = meta
+                Storage::Slot(Slot::Owned(role)) if role == HOSTED_ROWS => {
+                    let key = meta
                         .slot_key()
-                        .and_then(SlotKey::tag)
+                        .cloned()
                         .ok_or(LoadError::UnkeyedSlot { value: id })?;
-                    let rows = self
-                        .loaded(exe)?
-                        .binder
-                        .embed_rows(id, table, &meta.aval, storage)?;
-                    let (loc, elems) = push_local!(
-                        &format!("token embed rows {table}"),
-                        BufferRole::Input,
-                        storage,
-                        &meta.aval.shape
-                    );
-                    let Loc::Local(buffer) = loc else {
-                        unreachable!("push_local! always returns Loc::Local")
-                    };
-                    token_embeds.push(TokenEmbedSlot {
-                        rows,
-                        numel: meta.aval.numel(),
-                        storage,
-                        buffer,
-                    });
-                    (loc, elems)
+                    if let Some(shared) = hosted_slots.iter().find(|slot| slot.key == key) {
+                        // Another stage of the entry reads the same rows: one buffer.
+                        (Loc::Local(shared.buffer), shared.elems)
+                    } else {
+                        // The program's site names the carrier the host copies the rows from.
+                        let source = part
+                            .hosted
+                            .iter()
+                            .flat_map(|site| &site.rows)
+                            .find(|rows| rows.slot == key)
+                            .map(|rows| rows.source.as_str())
+                            .ok_or_else(|| LoadError::HostedUndeclared { key: key.clone() })?;
+                        let table = self
+                            .loaded(exe)?
+                            .binder
+                            .hosted_table(id, source, &meta.aval, storage)?;
+                        let name = format!("hosted rows {source}");
+                        let (buffer, elems, storage) = match table.packed_words(&meta.aval) {
+                            // A packed carrier is `u32` words whatever the slot's declared I8 type.
+                            Some(words) => {
+                                let buffer = self.allocate_arena_slot(
+                                    &name,
+                                    BufferRole::Input,
+                                    BufferStorage::i32(),
+                                    words,
+                                )?;
+                                (
+                                    LocalBuffer::push(locals, buffer),
+                                    words,
+                                    BufferStorage::i32(),
+                                )
+                            }
+                            None => {
+                                let (buffer, _bytes, elems) = self.allocate(
+                                    &name,
+                                    BufferRole::Input,
+                                    storage,
+                                    &meta.aval.shape,
+                                )?;
+                                (LocalBuffer::push(locals, buffer), elems, storage)
+                            }
+                        };
+                        hosted_slots.push(HostedSlot {
+                            key,
+                            table,
+                            storage,
+                            buffer,
+                            elems,
+                        });
+                        (Loc::Local(buffer), elems)
+                    }
                 }
                 Storage::Slot(Slot::Owned(role))
                     if role == poot_graph_plan::EXPERT_POOL
@@ -1980,9 +2143,9 @@ impl<D: Device> Engine<D> {
         Ok((loaded.weights.len() - 1, elems))
     }
 
-    /// Match each input to exactly one slot (by `SlotKey`), check shape/count/dtype, write it. A
-    /// hosted embed gather is filled from the `Slot::Token` input, which the entry accepts for it
-    /// even when legalize dropped the token slot itself.
+    /// Match each input to exactly one slot (by `SlotKey`), check shape/count/dtype, write it. A hosted
+    /// gather whose ids are a step input is filled from that input, which the entry accepts for it even when
+    /// hosting dropped the slot itself.
     fn bind(
         &mut self,
         exe: ExecutableId,
@@ -1995,6 +2158,7 @@ impl<D: Device> Engine<D> {
             executables,
             device,
             host_write_bytes,
+            hosted_counters,
             ..
         } = self;
         let loaded = executables
@@ -2016,15 +2180,26 @@ impl<D: Device> Engine<D> {
         // CR30: validate every StepInput before writing any of them, so a later
         // input's refusal cannot leave an earlier input's write already on the device.
         let mut writes: Vec<(LocalBuffer, Vec<u8>)> = Vec::with_capacity(e.slots.len());
-        let token_key = SlotKey::new(Slot::Token, None);
-        let mut tokens = None;
+        // The step inputs a hosted gather reads its ids from: bound here as ordinary inputs when another
+        // equation reads them too, and always read for the gather.
+        let mut step_ids: Vec<(&SlotKey, Option<&crate::StepValue<'_>>)> = e
+            .hosted
+            .iter()
+            .filter_map(|site| match &site.index {
+                IndexSource::Step(key) => Some((key, None)),
+                IndexSource::Device(_) => None,
+            })
+            .collect();
         for (key, value) in inputs.iter() {
-            let feeds_embed = !e.token_embeds.is_empty() && *key == token_key;
-            if feeds_embed && tokens.replace(value).is_some() {
+            let feeds_hosted = step_ids.iter_mut().find(|(step_key, _)| *step_key == key);
+            if let Some((_, taken)) = feeds_hosted
+                && taken.replace(value).is_some()
+            {
                 return Err(BindError::Duplicate { key: key.clone() }.into());
             }
+            let feeds_hosted = step_ids.iter().any(|(step_key, _)| *step_key == key);
             let Some(index) = e.slots.iter().position(|slot| &slot.key == key) else {
-                if feeds_embed {
+                if feeds_hosted {
                     continue;
                 }
                 return Err(BindError::Unknown { key: key.clone() }.into());
@@ -2066,13 +2241,19 @@ impl<D: Device> Engine<D> {
             }
             .into());
         }
-        for embed in &e.token_embeds {
-            let value = tokens.ok_or_else(|| BindError::Missing {
-                key: token_key.clone(),
-            })?;
+        let (mut hosted_rows, mut hosted_bytes) = (0u64, 0u64);
+        for site in &e.hosted {
+            let IndexSource::Step(key) = &site.index else {
+                continue;
+            };
+            let value = step_ids
+                .iter()
+                .find_map(|(step_key, value)| (*step_key == key).then_some(*value))
+                .flatten()
+                .ok_or_else(|| BindError::Missing { key: key.clone() })?;
             if value.view.dtype() != DType::I32 {
                 return Err(BindError::Lane {
-                    key: token_key.clone(),
+                    key: key.clone(),
                     expected: DType::I32,
                     got: value.view.dtype(),
                 }
@@ -2086,22 +2267,28 @@ impl<D: Device> Engine<D> {
                 .iter()
                 .map(|c| i32::from_le_bytes(*c))
                 .collect();
-            let expected = embed.numel / embed.rows.width();
-            if ids.len() != expected {
+            if ids.len() != site.ids {
                 return Err(BindError::ElementCount {
-                    key: token_key.clone(),
-                    expected,
+                    key: key.clone(),
+                    expected: site.ids,
                     got: ids.len(),
                 }
                 .into());
             }
-            let bytes = loaded.binder.embed(&embed.rows, &ids, embed.storage)?;
-            writes.push((embed.buffer, bytes));
+            let gathered = gather_hosted(&loaded.binder, e, site, &ids)?;
+            hosted_rows += ids.len() as u64;
+            hosted_bytes += gathered
+                .iter()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum::<u64>();
+            writes.extend(gathered);
         }
         for (buffer, bytes) in writes {
             host_write(device, host_write_bytes, buffer.of(&e.locals), &bytes)
                 .map_err(device_error(label))?;
         }
+        hosted_counters.rows += hosted_rows;
+        hosted_counters.bytes += hosted_bytes;
         Ok(())
     }
 
@@ -2540,7 +2727,7 @@ impl<D: Device> Engine<D> {
             }
             return Err(device_error(label)(err));
         }
-        let (point, reads) = {
+        let values = {
             let Self {
                 executables,
                 device,
@@ -2574,17 +2761,67 @@ impl<D: Device> Engine<D> {
                 values.push((id, words));
             }
             sync_counters.syncs += 1;
-            (
-                sync.point.clone(),
-                SyncReads {
-                    site: sync.identity.clone(),
-                    row_bytes: sync.row_bytes.clone(),
-                    values,
-                },
-            )
+            values
         };
-        let writes = host.sync(&point, &reads)?;
-        self.apply_sync_writes(exe, entry, index, &writes)
+        let sync = &self.loaded_entry(exe, entry)?.syncs[index];
+        match &sync.kind {
+            SyncKind::Experts {
+                identity,
+                row_bytes,
+                ..
+            } => {
+                let point = sync.point.clone();
+                let reads = SyncReads {
+                    site: identity.clone(),
+                    row_bytes: row_bytes.clone(),
+                    values,
+                };
+                let writes = host.sync(&point, &reads)?;
+                self.apply_sync_writes(exe, entry, index, &writes)
+            }
+            &SyncKind::Gather { site } => {
+                let [(_, ids)] = values.as_slice() else {
+                    unreachable!("a gather sync reads its ids alone")
+                };
+                self.write_hosted_rows(exe, entry, site, ids)
+            }
+        }
+    }
+
+    /// Copy the stored rows `ids` name into the slots of hosted site `site` of `entry`: every row is read and
+    /// checked before the first byte is written, so a step that names a row the table lacks writes nothing.
+    fn write_hosted_rows(
+        &mut self,
+        exe: ExecutableId,
+        entry: EntryId,
+        site: usize,
+        ids: &[i32],
+    ) -> Result<(), ExecError> {
+        let label = self.device.backend_name();
+        let Self {
+            executables,
+            device,
+            host_write_bytes,
+            hosted_counters,
+            ..
+        } = self;
+        let loaded = executables
+            .get(exe.index())
+            .and_then(Option::as_ref)
+            .ok_or(LoadError::UnknownHandle)?;
+        let e = loaded
+            .entries
+            .get(entry.index())
+            .and_then(Option::as_ref)
+            .ok_or(LoadError::UnknownHandle)?;
+        let writes = gather_hosted(&loaded.binder, e, &e.hosted[site], ids)?;
+        for (buffer, bytes) in &writes {
+            host_write(device, host_write_bytes, buffer.of(&e.locals), bytes)
+                .map_err(device_error(label))?;
+            hosted_counters.bytes += bytes.len() as u64;
+        }
+        hosted_counters.rows += ids.len() as u64;
+        Ok(())
     }
 
     /// Land a sync's writes: every range is checked against the site's tables first, then the
@@ -2614,15 +2851,17 @@ impl<D: Device> Engine<D> {
             .and_then(Option::as_ref)
             .ok_or(LoadError::UnknownHandle)?
             .syncs[index];
+        let SyncKind::Experts { tables, map, .. } = &sync.kind else {
+            unreachable!("only an expert refill applies host writes")
+        };
         let table_of = |fill: &RowFill| -> Result<&ResidentBuf<D>, ExecError> {
-            let resident = sync
-                .tables
+            let resident = tables
                 .get(fill.table)
                 .map(|&table| &loaded.resident[table])
                 .ok_or_else(|| BindError::ExpertRange {
                     table: format!("#{}", fill.table),
                     expert: fill.table,
-                    experts: sync.tables.len(),
+                    experts: tables.len(),
                 })?;
             Ok(resident)
         };
@@ -2656,7 +2895,7 @@ impl<D: Device> Engine<D> {
                 .into());
             }
         }
-        let map = &loaded.resident[sync.map];
+        let map = &loaded.resident[*map];
         let ResidentKind::Map {
             key,
             experts,
@@ -2968,8 +3207,8 @@ impl<D: Device> Engine<D> {
         Ok(EntryId::new(entries.len() - 1))
     }
 
-    /// Whether a step of `entry` takes an input for `key`: one of its slots, or the token ids of a
-    /// hosted embed.
+    /// Whether a step of `entry` takes an input for `key`: one of its slots, or the step input a hosted
+    /// gather reads its ids from.
     pub(crate) fn takes_input(
         &self,
         exe: ExecutableId,
@@ -2977,9 +3216,10 @@ impl<D: Device> Engine<D> {
         key: &SlotKey,
     ) -> Result<bool, ExecError> {
         let e = self.loaded_entry(exe, entry)?;
-        let token = SlotKey::new(Slot::Token, None);
         Ok(e.slots.iter().any(|slot| &slot.key == key)
-            || (!e.token_embeds.is_empty() && *key == token))
+            || e.hosted
+                .iter()
+                .any(|site| matches!(&site.index, IndexSource::Step(step) if step == key)))
     }
 
     /// Dispatches stage `stage_idx` of `entry` replays per step.
@@ -3342,7 +3582,7 @@ impl<D: Device> Executor for Engine<D> {
                 return Err(ChainError::RepeatedEntry(step.entry).into());
             }
             let e = self.loaded_entry(exe, step.entry)?;
-            if !e.syncs.is_empty() || e.late_after.is_some() || !e.token_embeds.is_empty() {
+            if !e.syncs.is_empty() || e.late_after.is_some() || !e.hosted.is_empty() {
                 return Err(ChainError::NeedsHost(step.entry).into());
             }
             let picked = e
@@ -3640,6 +3880,9 @@ impl<D: Device> Executor for Engine<D> {
             sync_read_bytes: self.sync_counters.read_bytes,
             pool_rows_written: self.sync_counters.rows,
             pool_refill_bytes: self.sync_counters.refill_bytes,
+            hosted_rows: self.hosted_counters.rows,
+            hosted_bytes: self.hosted_counters.bytes,
+            hosted_table_bytes: self.hosted_table_bytes(),
             host_write_bytes: self.host_write_bytes,
             output_read_bytes: self.output_read_bytes,
             waits: self.waits,
@@ -4742,7 +4985,7 @@ mod f16_packed_weight_upload_tests {
 }
 
 /// Card 564: weight binding through the executable's weight map - the map's views to stored byte
-/// runs, the typed unbound refusal, residency by what uploads, and the hosted embed fill - driven
+/// runs, the typed unbound refusal, residency by what uploads, and the hosted gather fill - driven
 /// through the production `load_weights`/`add_entry`/`step` path on a recording device.
 #[cfg(test)]
 mod weight_source_tests {
@@ -4786,6 +5029,9 @@ mod weight_source_tests {
         /// Runs at the start of every write, before its first stored byte is read: the instant a checkpoint
         /// file can change under a runtime read.
         before_write: Option<Box<dyn FnMut()>>,
+        /// What every read of a device buffer returns (a device-computed value the test scripts); a read of
+        /// another length is zeros.
+        read_bytes: Option<Vec<u8>>,
     }
 
     impl Device for Recorder {
@@ -4877,7 +5123,14 @@ mod weight_source_tests {
             self.write_offsets.push(offset);
             Ok(())
         }
-        fn read(&mut self, _src: &usize, _out: &mut [u8]) -> Result<(), std::convert::Infallible> {
+        fn read(&mut self, _src: &usize, out: &mut [u8]) -> Result<(), std::convert::Infallible> {
+            if let Some(bytes) = self
+                .read_bytes
+                .as_deref()
+                .filter(|bytes| bytes.len() == out.len())
+            {
+                out.copy_from_slice(bytes);
+            }
             Ok(())
         }
         fn synchronize(&mut self) -> Result<(), std::convert::Infallible> {
@@ -5586,14 +5839,10 @@ mod weight_source_tests {
         assert_size_only_matches_bytes(&weights, &mapped, &g);
     }
 
-    /// An engine whose target's buffer cap is one byte below a `[rows, K]` F32 table, and an embed
-    /// gather of `w.embed` by the step's tokens compiled for it: `compile`'s legalize hosts the
-    /// gather as a `TOKEN_EMBED` input.
+    /// An engine and an embed gather of `w.embed` by the step's tokens, a `[rows, K]` F32 table: the planner
+    /// hosts the gather whatever the target's buffer limit is, so the table never reaches the device.
     fn hosted_embed(rows: usize, tokens: usize) -> (Engine<Recorder>, StagedProgram) {
-        let engine = Engine::new(Recorder {
-            cap: Some((rows * K * 4 - 1) as u64),
-            ..Recorder::default()
-        });
+        let engine = Engine::new(Recorder::default());
         let b = Builder::for_tests();
         let embed = WeightId::model(WeightRole::Embed);
         let table = b
@@ -5604,16 +5853,53 @@ mod weight_source_tests {
             .unwrap();
         let out = b.gather(table, 0, ids).unwrap();
         let program = compile(&engine, &b.finish(out).unwrap());
+        assert_hosts_the_gather(&program);
+        (engine, program)
+    }
+
+    /// [`hosted_embed`] over a `format` table of `[rows, K]`: its carriers are the sources of a packed weight,
+    /// each hosted as stored rows, and the decode stays in the graph.
+    fn hosted_packed_embed(
+        format: WeightFormat,
+        rows: usize,
+        tokens: usize,
+    ) -> (Engine<Recorder>, StagedProgram) {
+        let engine = Engine::new(Recorder::default());
+        let descriptor = poot_quant::PackedWeight::try_new(format, [rows, K]).unwrap();
+        let b = Builder::for_tests();
+        let embed = WeightId::model(WeightRole::Embed);
+        let sources: Vec<poot_graph_ir::Traced> = descriptor
+            .sources()
+            .into_iter()
+            .map(|role| {
+                b.weight(
+                    WeightRef::whole(embed).with_source(role),
+                    poot_graph_ir::packed_source_type(descriptor, role),
+                )
+                .unwrap()
+            })
+            .collect();
+        let table = b.packed_dequant(&sources, descriptor).unwrap();
+        let ids = b
+            .slot(Slot::Token, TensorType::new(vec![1, tokens], DType::I32))
+            .unwrap();
+        let out = b.gather(table, 0, ids).unwrap();
+        let program = compile(&engine, &b.finish(out).unwrap());
+        assert_hosts_the_gather(&program);
+        (engine, program)
+    }
+
+    fn assert_hosts_the_gather(program: &StagedProgram) {
         let (_, _, stage) = program.stages().next().unwrap();
         assert!(
             stage
                 .graph()
                 .slots()
                 .iter()
-                .any(|&(_, slot)| slot == Slot::Owned(poot_graph_plan::TOKEN_EMBED)),
-            "the cap hosts the gather"
+                .any(|&(_, slot)| slot == Slot::Owned(poot_graph_plan::HOSTED_ROWS)),
+            "the planner hosts the gather"
         );
-        (engine, program)
+        assert_eq!(program.hosted().len(), 1);
     }
 
     fn step_tokens(engine: &mut Engine<Recorder>, exe: ExecutableId, entry: EntryId, ids: &[i32]) {
@@ -5628,15 +5914,15 @@ mod weight_source_tests {
         engine.step(exe, entry, &inputs, &mut NoSync).unwrap();
     }
 
-    /// The binder fills a hosted embed gather from the step's tokens and the map's embed view - here a
-    /// two-part `RowStack`, so a token past the first part reads the second - for a dense table, and
-    /// for a Q8_0 table through the payload's row decode (SC-006's bytes; the device row is in the
-    /// wgpu suite).
+    /// The binder fills a hosted gather from the step's tokens and the map's embed view - here a two-part
+    /// `RowStack`, so a token past the first part reads the second - with the rows as STORED: a dense table's
+    /// rows as the checkpoint holds them, a Q8_0 table's raw block rows as `u32` words (SC-006: the host
+    /// decodes nothing; the device graph does).
     ///
-    /// Mutation: in `WeightBinder::embed`, read row 0 for every token; the filled bytes are the first
-    /// row repeated and this row goes red.
+    /// Mutation: in `WeightBinder::gather_rows`, read row 0 for every id; the filled bytes are the first row
+    /// repeated and this row goes red.
     #[test]
-    fn a_hosted_embed_is_filled_from_the_tokens_and_the_embed_view() {
+    fn a_hosted_gather_is_filled_with_the_stored_rows_of_the_ids() {
         let embed = WeightId::model(WeightRole::Embed);
         let ids = [5, 0, 3, 5];
         let dense = [f32_entry(vec![3, K], 1), f32_entry(vec![3, K], 2)];
@@ -5649,6 +5935,7 @@ mod weight_source_tests {
             .map(|payload| WeightEntry::Packed(Arc::new(payload.clone())))
             .collect::<Vec<_>>();
         for (label, parts) in [("dense", dense.to_vec()), ("q8_0", packed_entries)] {
+            // The stored bytes of row `token`, as the entry holds them.
             let row = |token: i32| -> Vec<u8> {
                 let (part, row) = (token as usize / 3, token as usize % 3);
                 match &parts[part] {
@@ -5656,13 +5943,13 @@ mod weight_source_tests {
                         d.bytes().as_slice()[row * K * 4..(row + 1) * K * 4].to_vec()
                     }
                     WeightEntry::Packed(p) => {
-                        let mut values = vec![0.0f32; K];
-                        p.decode_row(row, &mut values).unwrap();
-                        bytemuck::cast_slice(&values).to_vec()
+                        let row_bytes = p.weight().source_shape(SourceRole::Blocks)[1];
+                        p.bytes(SourceRole::Blocks)[row * row_bytes..(row + 1) * row_bytes].to_vec()
                     }
                 }
             };
-            let want: Vec<u8> = ids.iter().flat_map(|&t| row(t)).collect();
+            let mut want: Vec<u8> = ids.iter().flat_map(|&t| row(t)).collect();
+            want.resize(want.len().next_multiple_of(4), 0);
             let weights = store(vec![("e0", parts[0].clone()), ("e1", parts[1].clone())]);
             let mapped = map(
                 &weights,
@@ -5671,15 +5958,195 @@ mod weight_source_tests {
                     WeightView::RowStack(vec![WeightKey::from("e0"), WeightKey::from("e1")]),
                 )],
             );
-            let (mut engine, program) = hosted_embed(6, ids.len());
+            let (mut engine, program) = if label == "dense" {
+                hosted_embed(6, ids.len())
+            } else {
+                hosted_packed_embed(WeightFormat::Q8_0, 6, ids.len())
+            };
             let exe = engine.load_weights(weights, mapped).unwrap();
             let entry = engine.add_entry(exe, &program).unwrap();
             step_tokens(&mut engine, exe, entry, &ids);
             assert!(
                 written(&engine).contains(&want.as_slice()),
-                "{label}: no step write holds the tokens' embed rows"
+                "{label}: no step write holds the ids' stored rows"
             );
+            let stats = engine.stats();
+            assert_eq!(stats.hosted_rows, ids.len() as u64, "{label}");
+            assert_eq!(stats.hosted_bytes, want.len() as u64, "{label}");
         }
+    }
+
+    /// A `[rows, K]` F32 table gathered by `tokens` ids the DEVICE computes (`token + 1`), then scaled: the
+    /// planner hosts the table, cuts the program after the ids and syncs the host there.
+    fn hosted_device_indexed(
+        rows: usize,
+        tokens: usize,
+        read_ids: &[i32],
+    ) -> (Engine<Recorder>, StagedProgram) {
+        let engine = Engine::new(Recorder {
+            read_bytes: Some(read_ids.iter().flat_map(|id| id.to_le_bytes()).collect()),
+            ..Recorder::default()
+        });
+        let b = Builder::for_tests();
+        let embed = WeightId::model(WeightRole::Embed);
+        let table = b
+            .weight(WeightRef::whole(embed), TensorType::f32(vec![rows, K]))
+            .unwrap();
+        let token = b
+            .slot(Slot::Token, TensorType::new(vec![tokens], DType::I32))
+            .unwrap();
+        let ids = b
+            .binary_scalar(BinOp::Add, token, poot_graph_ir::Scalar::I32(1))
+            .unwrap();
+        let gathered = b.gather(table, 0, ids).unwrap();
+        let scale = b
+            .weight(
+                WeightRef::whole(WeightId::model(WeightRole::Head)),
+                TensorType::f32(vec![K]),
+            )
+            .unwrap();
+        let scale = b.broadcast(scale, vec![tokens, K]).unwrap();
+        let out = b.binary(BinOp::Mul, gathered, scale).unwrap();
+        let program = compile(&engine, &b.finish(out).unwrap());
+        assert_eq!(program.stages().count(), 2, "cut at the sync");
+        assert!(matches!(
+            program.sync_points()[0].action,
+            poot_graph_plan::staged::SyncAction::GatherRows(_)
+        ));
+        (engine, program)
+    }
+
+    fn device_indexed_store() -> (Arc<WeightStore>, Arc<WeightMap>) {
+        let weights = store(vec![
+            ("w.embed", f32_entry(vec![6, K], 1)),
+            ("scale", f32_entry(vec![K], 2)),
+        ]);
+        let mapped = map(
+            &weights,
+            vec![
+                (
+                    WeightId::model(WeightRole::Embed),
+                    WeightView::Stored(WeightKey::from("w.embed")),
+                ),
+                (
+                    WeightId::model(WeightRole::Head),
+                    WeightView::Stored(WeightKey::from("scale")),
+                ),
+            ],
+        );
+        (weights, mapped)
+    }
+
+    /// SC-005 (sync half): a gather whose ids the device computes is filled at the host sync: the engine reads
+    /// the exported ids back, copies THOSE rows' stored bytes into the slot before the next stage runs, calls no
+    /// host handler, and counts the sync, the rows and the bytes.
+    ///
+    /// Mutation: in `write_hosted_rows`, gather `ids` shifted by one row; the written bytes are the wrong rows
+    /// and the `contains` below goes red.
+    #[test]
+    fn a_device_indexed_gather_copies_the_rows_the_exported_ids_name_at_the_sync() {
+        let ids = [4, 0, 5];
+        let (mut engine, program) = hosted_device_indexed(6, ids.len(), &ids);
+        let (weights, mapped) = device_indexed_store();
+        let WeightEntry::Dense(table) = weights.get("w.embed").unwrap() else {
+            unreachable!("the fixture table is dense")
+        };
+        let want: Vec<u8> = ids
+            .iter()
+            .flat_map(|&id| {
+                table.bytes().as_slice()[id as usize * K * 4..(id as usize + 1) * K * 4].to_vec()
+            })
+            .collect();
+        let exe = engine.load_weights(weights, mapped).unwrap();
+        let entry = engine.add_entry(exe, &program).unwrap();
+        let tokens = [3i32, 4, 5];
+        let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        let mut inputs = StepInputs::new();
+        inputs.push(
+            SlotKey::new(Slot::Token, None),
+            &[3],
+            poot_tensor::HostView::new(DType::I32, 3, &bytes).unwrap(),
+        );
+        engine.step(exe, entry, &inputs, &mut NoSync).unwrap();
+        assert!(
+            written(&engine).contains(&want.as_slice()),
+            "no write holds the stored rows of the exported ids"
+        );
+        let stats = engine.stats();
+        assert_eq!(stats.syncs, 1);
+        assert_eq!(stats.hosted_rows, ids.len() as u64);
+        assert_eq!(stats.hosted_bytes, want.len() as u64);
+        assert_eq!(stats.hosted_table_bytes, (6 * K * 4) as u64);
+    }
+
+    /// SC-007 (sync half): an exported id past the table is the typed row-range refusal, before any row is
+    /// written.
+    #[test]
+    fn an_exported_id_outside_the_hosted_table_is_refused_at_the_sync() {
+        let ids = [4, 6, 5];
+        let (mut engine, program) = hosted_device_indexed(6, ids.len(), &ids);
+        let (weights, mapped) = device_indexed_store();
+        let exe = engine.load_weights(weights, mapped).unwrap();
+        let entry = engine.add_entry(exe, &program).unwrap();
+        let bytes: Vec<u8> = [3i32, 4, 5].iter().flat_map(|t| t.to_le_bytes()).collect();
+        let mut inputs = StepInputs::new();
+        inputs.push(
+            SlotKey::new(Slot::Token, None),
+            &[3],
+            poot_tensor::HostView::new(DType::I32, 3, &bytes).unwrap(),
+        );
+        let writes_before = engine.device.writes.len();
+        match engine.step(exe, entry, &inputs, &mut NoSync) {
+            Err(ExecError::Bind(error)) => match *error {
+                BindError::HostedRowOutOfRange { name, id, rows } => {
+                    assert_eq!((name.as_str(), id, rows), ("w.embed", 6, 6));
+                }
+                other => panic!("expected HostedRowOutOfRange, got {other}"),
+            },
+            other => panic!("expected HostedRowOutOfRange, got {:?}", other.map(drop)),
+        }
+        let rows_written = engine.device.writes[writes_before..]
+            .iter()
+            .filter(|(_, bytes)| bytes.len() == 3 * K * 4)
+            .count();
+        assert_eq!(rows_written, 0, "no row was written for the refused ids");
+    }
+
+    /// SC-008 (executor half): a chain over a host-fed entry is refused before any device work, whichever way
+    /// the entry is host-fed (a hosted gather at bind time or at a sync).
+    #[test]
+    fn a_chain_over_a_hosted_gather_is_refused_before_any_work() {
+        let (mut engine, program) = hosted_embed(6, 2);
+        let weights = store(vec![("w.embed", f32_entry(vec![6, K], 1))]);
+        let mapped = map(
+            &weights,
+            vec![(
+                WeightId::model(WeightRole::Embed),
+                WeightView::Stored("w.embed".into()),
+            )],
+        );
+        let exe = engine.load_weights(weights, mapped).unwrap();
+        let entry = engine.add_entry(exe, &program).unwrap();
+        let inputs = StepInputs::new();
+        let steps = [ChainStep {
+            entry,
+            inputs: &inputs,
+        }];
+        let feed = ChainFeed {
+            picked: BoundaryId(ValueId::new(0)),
+            slot: SlotKey::new(Slot::Token, None),
+        };
+        let replays_before = engine.stats().replays;
+        match engine.step_chain(exe, &steps, &feed, &mut NoSync) {
+            Err(ExecError::Chain(error)) => {
+                assert!(
+                    matches!(*error, ChainError::NeedsHost(e) if e == entry),
+                    "{error}"
+                );
+            }
+            other => panic!("expected NeedsHost, got {:?}", other.map(drop)),
+        }
+        assert_eq!(engine.stats().replays, replays_before);
     }
 
     /// POOT-1017: a head over the target's buffer cap, read as the tracers read every dense weight
@@ -5812,13 +6279,14 @@ mod weight_source_tests {
             .unwrap();
     }
 
-    /// A hosted embed's rows are read at every step, long after the load's identity check: a checkpoint file
+    /// A hosted gather's rows are read at every step, long after the load's identity check: a checkpoint file
     /// truncated after `add_entry` is refused by the step as the typed `LoadError::SourceChanged`, without a
     /// page of the truncated file being read, and no embed row is written to the device.
     ///
-    /// Mutation: delete the `check_sources` that opens `WeightBinder::embed`; the row read touches the
-    /// truncated pages and the test process dies with `SIGBUS`. (The check that closes `embed` guards a file
-    /// modified while the rows are read, which no device hook can interleave with; it is not exercised here.)
+    /// Mutation: delete the `check_sources` that opens `WeightBinder::gather_rows`; the row read touches the
+    /// truncated pages and the test process dies with `SIGBUS`. (The check that closes `gather_rows` guards a
+    /// file modified while the rows are read, which no device hook can interleave with; it is not exercised
+    /// here.)
     #[test]
     fn a_hosted_embed_refuses_a_file_truncated_after_the_load() {
         let path = poot_test_util::unique_temp_path("embed_modified.bin");
@@ -5861,9 +6329,13 @@ mod weight_source_tests {
         );
     }
 
-    /// A token past the embed table's rows is a typed refusal naming the embed, never a read past it.
+    /// SC-007: an id past the hosted table's rows is a typed refusal naming the table, raised before any row
+    /// is written, never a read past the table.
+    ///
+    /// Mutation: delete the `filter(|&row| row < total)` of `WeightBinder::gather_rows`; the slice of the
+    /// store panics out of range (or reads another entry's bytes) and this row goes red.
     #[test]
-    fn a_token_outside_the_embed_table_is_refused() {
+    fn an_id_outside_the_hosted_table_is_refused_before_any_write() {
         let weights = store(vec![("w.embed", f32_entry(vec![6, K], 1))]);
         let (mut engine, program) = hosted_embed(6, 2);
         let embed = map(
@@ -5882,16 +6354,22 @@ mod weight_source_tests {
             &[1, 2],
             poot_tensor::HostView::new(DType::I32, 2, &bytes).unwrap(),
         );
+        let writes_before = engine.device.writes.len();
         match engine.step(exe, entry, &inputs, &mut NoSync) {
             Err(ExecError::Bind(error)) => match *error {
-                BindError::TokenOutOfRange { name, token, rows } => {
-                    assert_eq!((name.as_str(), token, rows), ("w.embed", 6, 6));
+                BindError::HostedRowOutOfRange { name, id, rows } => {
+                    assert_eq!((name.as_str(), id, rows), ("w.embed", 6, 6));
                 }
-                other => panic!("expected TokenOutOfRange, got {other}"),
+                other => panic!("expected HostedRowOutOfRange, got {other}"),
             },
-            Err(other) => panic!("expected TokenOutOfRange, got {other}"),
-            Ok(_) => panic!("a token past the table bound"),
+            Err(other) => panic!("expected HostedRowOutOfRange, got {other}"),
+            Ok(_) => panic!("an id past the table bound"),
         }
+        assert_eq!(
+            engine.device.writes.len(),
+            writes_before,
+            "the in-range id's row was not written either"
+        );
     }
 
     /// POOT-1289: `reset_state(Row(r))` for a row past the carried state's leading axis is a typed
@@ -5969,7 +6447,7 @@ mod weight_source_tests {
             vec![(embed, WeightView::Stored(WeightKey::from("e")))],
         );
         let step_over = |weights: Arc<WeightStore>| {
-            let (mut engine, program) = hosted_embed(6, 1);
+            let (mut engine, program) = hosted_packed_embed(WeightFormat::Q8_0, 6, 1);
             let exe = engine.load_weights(weights, Arc::clone(&map))?;
             let entry = engine.add_entry(exe, &program)?;
             let bytes = 3i32.to_le_bytes();

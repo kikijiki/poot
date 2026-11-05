@@ -438,6 +438,52 @@ impl std::error::Error for WeightMapError {
     }
 }
 
+/// Which mapped weights view the same stored bytes: a tied head and its embedding are two [`WeightId`]s of one
+/// view. The planner reads it so a table whose bytes the graph also binds under another id is not hosted
+/// (the device holds those bytes anyway). Empty means nothing is known to alias.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WeightAliases {
+    /// Each group holds two or more ids of one view, in id order.
+    groups: Vec<Vec<WeightId>>,
+}
+
+impl WeightAliases {
+    /// No weight is known to alias another.
+    pub const fn none() -> Self {
+        Self { groups: Vec::new() }
+    }
+
+    /// The other ids that view the same bytes as `id`.
+    pub fn others(&self, id: WeightId) -> impl Iterator<Item = WeightId> + '_ {
+        self.groups
+            .iter()
+            .filter(move |group| group.contains(&id))
+            .flatten()
+            .copied()
+            .filter(move |&other| other != id)
+    }
+}
+
+impl WeightMap {
+    /// The weights of this map that read identical views.
+    pub fn aliases(&self) -> WeightAliases {
+        let mut by_view: Vec<(&WeightView, Vec<WeightId>)> = Vec::new();
+        for (id, (view, _)) in &self.entries {
+            match by_view.iter_mut().find(|(seen, _)| *seen == view) {
+                Some((_, ids)) => ids.push(*id),
+                None => by_view.push((view, vec![*id])),
+            }
+        }
+        WeightAliases {
+            groups: by_view
+                .into_iter()
+                .map(|(_, ids)| ids)
+                .filter(|ids| ids.len() > 1)
+                .collect(),
+        }
+    }
+}
+
 /// A model's weights: `WeightId` -> (store view, handle). Built once by a family from its name table
 /// through [`WeightMapBuilder`], which checks every view against the store; owned by the model. It
 /// holds no bytes: [`Self::materialize`] reads a view out of the store when a binder needs it.

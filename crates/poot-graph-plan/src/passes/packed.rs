@@ -1,7 +1,7 @@
 use super::{
     EditError, Eqn, Graph, HashMap, HashSet, OpKind, Operand, Storage, ValueId, with_eqns,
 };
-use poot_graph_ir::{ContractionRows, ValueTable};
+use poot_graph_ir::{ContractionRows, Slot, ValueTable};
 /// Names the packed equation a [`PackedDequantProductionError`] is about, for its message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedDequantErrorContext {
@@ -38,7 +38,7 @@ impl std::fmt::Display for PackedDequantErrorContext {
 pub enum PackedDequantProductionError {
     /// A carrier operand is not constant storage.
     #[error(
-        "packed dequant {context} carrier {carrier} uses {storage:?} storage; Const is required"
+        "packed dequant {context} carrier {carrier} uses {storage:?} storage; Const or hosted rows is required"
     )]
     CarrierStorage {
         /// The packed equation the refusal is about.
@@ -200,7 +200,10 @@ fn validate_packed_carriers(
         carriers.push(*carrier);
     }
     for &carrier in &carriers {
-        if g.meta(carrier).storage != Storage::Const {
+        // A carrier is a weight constant, or the slot a hosted gather copies its rows into (POOT-1423).
+        if g.meta(carrier).storage != Storage::Const
+            && g.meta(carrier).storage != Storage::Slot(Slot::Owned(super::HOSTED_ROWS))
+        {
             return Err(PackedDequantProductionError::CarrierStorage {
                 context,
                 carrier,

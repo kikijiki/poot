@@ -15,7 +15,8 @@ mod map;
 mod role;
 
 pub use map::{
-    HandleFormat, LoadReport, WeightHandle, WeightMap, WeightMapBuilder, WeightMapError, WeightView,
+    HandleFormat, LoadReport, WeightAliases, WeightHandle, WeightMap, WeightMapBuilder,
+    WeightMapError, WeightView,
 };
 pub use role::{
     AttnRole, CompressRole, DsaRole, ExpertProj, FfnRole, GdnRole, HyperRole, HyperSite, KdaRole,

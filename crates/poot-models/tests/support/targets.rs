@@ -4,7 +4,12 @@
     dead_code,
     reason = "shared by two test binaries (plan_summary, supported_models); each uses part of it"
 )]
-use poot_graph_plan::{CompileLimits, CompileOptions, Target};
+use poot_graph_plan::multi_device::topology::DeviceId;
+use poot_graph_plan::staged::{
+    DevicePlacement, ExpertPlacement, Partition, StagedCompileError, StagedProgram, TargetSet,
+    compile_staged,
+};
+use poot_graph_plan::{CompileError, CompileLimits, CompileOptions, Target};
 use poot_target::{AmdArch, Backend};
 
 /// One planner target with the name its matrix column and its plan digests carry.
@@ -51,6 +56,30 @@ pub(crate) fn reference_targets() -> Vec<RefTarget> {
         preset("ROCm", "amd_gcn", Backend::AmdGcn(AmdArch::gfx1151())),
         preset("PTX", "nvptx", Backend::Nvptx),
     ]
+}
+
+/// `graph` compiled for `target` on one device through the production entry, which hosts every gather-only
+/// table before the stages are compiled: what a model's plan on the target is, hosted tables included. A
+/// refusal is the stage compile's typed [`CompileError`]; any other staged failure is a defect of the compiler,
+/// never of the graph, and panics.
+pub(crate) fn compile_production(
+    graph: &poot_graph_ir::Graph,
+    target: &Target,
+    options: &CompileOptions,
+) -> Result<StagedProgram, CompileError> {
+    compile_staged(
+        graph,
+        &TargetSet::single(DeviceId(0), *target),
+        &Partition {
+            experts: ExpertPlacement::AllResident,
+            devices: DevicePlacement::Single(DeviceId(0)),
+        },
+        options,
+    )
+    .map_err(|error| match error {
+        StagedCompileError::Compile(error) => error,
+        other => panic!("the staged compile failed outside a stage compile: {other}"),
+    })
 }
 
 /// The compile options every reference compile uses: replayed submission under the standard limits.

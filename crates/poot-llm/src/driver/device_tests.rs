@@ -22,7 +22,7 @@ use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
 use crate::GenerationControl;
 use crate::core::sampler::Sampler;
 use crate::driver::caps::PrepareRefused;
-use crate::driver::error::{DriverError, InvalidRequest};
+use crate::driver::error::{DriverError, InvalidOptions, InvalidRequest, PreparedSetRefusal};
 use crate::driver::{
     AdapterRef, Admission, BackendChoice, Driver, DriverOptions, GenerateRequest, Head, Layout,
     ModelHandle, PoolShape, PrefixOutcome, PrefixSkip, PreparedSetLimits, Release, RowWork, SeqId,
@@ -3982,14 +3982,46 @@ per_backend!(
     commit_keeps_fewer_than_returned_ptx
 );
 
+/// The qwen2 fixture with its head tied to the embedding: the checkpoint has no `lm_head.weight`, so the head
+/// is mapped to the embedding's stored tensor and the graph binds it under two ids.
+fn tied_qwen2_handle(eos: u32) -> Arc<ModelHandle> {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == "qwen2")
+        .expect("the builtin qwen2 family");
+    let fixture = poot_models::test_support::family_fixtures::base(entry.family);
+    let mut config = fixture.config.clone();
+    config["eos_token_id"] = serde_json::json!(eos);
+    config["tie_word_embeddings"] = serde_json::json!(true);
+    let mut store = WeightStore::builder();
+    for (key, entry) in fixture.store.iter() {
+        if key.as_str() != "lm_head.weight" {
+            store.insert(key.as_str(), entry.clone()).unwrap();
+        }
+    }
+    let raw = RawConfig::HfJson {
+        config: &config,
+        generation: None,
+        preprocessor: None,
+    };
+    Arc::new(
+        ModelHandle::from_checkpoint(&raw, store.build(), &registry, |_| Ok(fixture_text()))
+            .unwrap(),
+    )
+}
+
 /// SC-005 (device side): a chain of three decode steps returns the tokens three ordinary steps return,
 /// for a plain row and a row with penalties side by side, and waits once for the three. The second row
 /// shows the history flows through the chain: each chained step adds its token to the device history
 /// before the next step reads it. Mutation: skip the history write of a chained step (bind the write map
 /// as all `-1` for steps after the first); the penalized row's tokens diverge.
-fn chained_decode_steps_equal_stepwise_decode(choice: BackendChoice) {
+fn a_tied_decode_chains_and_equals_stepwise_decode(choice: BackendChoice) {
     const STEPS: usize = 3;
-    let handle = family_handle("qwen2", NO_EOS);
+    // A tied embedding is bound under the head's id too, so the planner does not host it and the decode runs on
+    // the device alone: it chains, and the chain equals stepwise decode.
+    let handle = tied_qwen2_handle(NO_EOS);
     let Some(driver) = serving_driver(choice, &handle) else {
         return;
     };
@@ -4054,10 +4086,78 @@ fn chained_decode_steps_equal_stepwise_decode(choice: BackendChoice) {
 }
 per_backend!(
     BackendChoice,
-    chained_decode_steps_equal_stepwise_decode,
-    chained_decode_steps_equal_stepwise_decode_wgpu,
-    chained_decode_steps_equal_stepwise_decode_rocm,
-    chained_decode_steps_equal_stepwise_decode_ptx
+    a_tied_decode_chains_and_equals_stepwise_decode,
+    a_tied_decode_chains_and_equals_stepwise_decode_wgpu,
+    a_tied_decode_chains_and_equals_stepwise_decode_rocm,
+    a_tied_decode_chains_and_equals_stepwise_decode_ptx
+);
+
+/// POOT-1423 SC-008: a model whose token embedding is hosted copies rows from the checkpoint at every step, so
+/// its decode cannot chain on the device. Asking for a chain is a typed refusal when the entries are PREPARED
+/// (`InvalidOptions::ChainOnHostFed`), never a runtime `NeedsHost` from the executor; the same driver prepared
+/// without a chain serves the decode step by step, and a chain request against it is the typed
+/// not-admitted refusal. Mutation: make `Prepared::host_fed` always `false`; the chain entries prepare and the
+/// first assertion goes red.
+fn a_chain_over_a_hosted_gather_is_refused_at_prepare(choice: BackendChoice) {
+    const STEPS: usize = 3;
+    let handle = family_handle("qwen2", NO_EOS);
+    let Some(driver) = serving_driver(choice, &handle) else {
+        return;
+    };
+    let heads = [Head::GREEDY];
+    let rows = [nz(1)];
+    let shapes = |chain| ServingShapes {
+        layout: Layout::Paged(pool_shape(8, 2)),
+        rows: &rows,
+        heads: &heads,
+        warm: Warm::Admitted,
+        windows: &[],
+        adapters: &[],
+        chain,
+    };
+    let Err(refused) = driver.prepare(&shapes(Some(nz(STEPS)))) else {
+        panic!("{choice:?}: a chain over a hosted embed was prepared");
+    };
+    assert!(
+        matches!(
+            refused.error,
+            DriverError::InvalidOptions(InvalidOptions::ChainOnHostFed)
+        ),
+        "{choice:?}: {:?}",
+        refused.error
+    );
+
+    let Some(driver) = serving_driver(choice, &handle) else {
+        return;
+    };
+    let mut driver = driver.prepare(&shapes(None)).unwrap();
+    let (lane, _) = Lane::open(&mut driver, &MEDIUM, 4, Sampler::greedy());
+    let mut lanes = [lane];
+    while lanes[0].out.is_empty() {
+        step_lanes(&mut driver, &mut lanes, &[0]);
+    }
+    let mut rows = [StepRow {
+        seq: lanes[0].seq,
+        work: RowWork::Chain { steps: nz(STEPS) },
+        sampler: &mut lanes[0].sampler,
+    }];
+    let refusal = driver
+        .step(&mut rows)
+        .expect_err("no chain entry was prepared");
+    assert!(
+        matches!(
+            refusal,
+            DriverError::PreparedSet(PreparedSetRefusal::NotAdmitted { .. })
+        ),
+        "{choice:?}: {refusal:?}"
+    );
+}
+per_backend!(
+    BackendChoice,
+    a_chain_over_a_hosted_gather_is_refused_at_prepare,
+    a_chain_over_a_hosted_gather_is_refused_at_prepare_wgpu,
+    a_chain_over_a_hosted_gather_is_refused_at_prepare_rocm,
+    a_chain_over_a_hosted_gather_is_refused_at_prepare_ptx
 );
 
 /// SC-006: a step mixing one greedy row and one guided row runs the adjusted head for the whole step and
@@ -6191,8 +6291,8 @@ fn resident_weights<S: State>(driver: &Driver<S>) -> (u64, u64) {
 /// SC-007 (R475-002): the BF16 owners stay resident as stored and are not re-widened per step.
 /// After the admitted entries are prepared (the load), eight decode steps through the driver leave
 /// the executor's weight allocations and live bytes as they were, and the live bytes are those of the
-/// stored owners (never more: an F32 copy of a BF16 owner is twice its bytes), and more than the
-/// stored bytes minus the embedding table (which a backend may keep on the host). Mutation: rebind
+/// stored owners (never more: an F32 copy of a BF16 owner is twice its bytes), and the stored bytes
+/// minus the hosted gather tables exactly. Mutation: rebind
 /// every BF16 owner as F32 in the body (`Weight::declare` casts a dense BF16 const to F32 when it
 /// declares it); the resident bytes pass the stored bytes and the row goes red.
 fn qwen4exp_bf16_owners_are_not_widened_per_step(choice: BackendChoice) {
@@ -6209,7 +6309,6 @@ fn qwen4exp_bf16_owners_are_not_widened_per_step(choice: BackendChoice) {
             HandleFormat::Packed(_) => panic!("the fixture is dense"),
         })
         .sum();
-    let embedding = (VOCAB * 32 * 2) as u64;
     let Some(driver) = bare_driver(choice, &handle, 8, CAPACITY) else {
         return;
     };
@@ -6220,9 +6319,14 @@ fn qwen4exp_bf16_owners_are_not_widened_per_step(choice: BackendChoice) {
         "{choice:?}: {} resident weight bytes exceed the {stored} bytes the owners are stored in",
         loaded.1
     );
-    assert!(
-        loaded.1 >= stored - embedding,
-        "{choice:?}: {} resident weight bytes, the owners are {stored} stored",
+    // The gather-only tables (the embedding and the per-layer table) are hosted: they stay in the mapping, and
+    // the executor counts them as `Hosted`, so the device holds exactly the rest of the stored owners.
+    let hosted = driver.executor_stats().hosted_table_bytes;
+    assert!(hosted > 0, "{choice:?}: the fixture hosts a gather table");
+    assert_eq!(
+        loaded.1 + hosted,
+        stored,
+        "{choice:?}: {} resident weight bytes and {hosted} hosted bytes, the owners are {stored} stored",
         loaded.1
     );
     let tokens = generate(&mut driver, &PROMPT[..6], 8, Sampler::greedy());

@@ -3520,6 +3520,51 @@ fn a_tiled_gemm_over_the_tile_ceiling_splits_into_disjoint_launches() {
     assert_eq!(covered, tiles, "the launches tile the whole output");
 }
 
+/// A tiled GEMM over the watchdog budget splits into dispatches of whole waves of the device's compute units, only
+/// the last one narrower: a budget-sized chunk and a remainder run a part-idle wave in each dispatch (80 tiles under
+/// a budget of 50 as 50 + 30 take three waves of a 40-unit device where 40 + 40 take two; POOT-1408 measured +23%
+/// on a qwen3-4b `ffn_down` prefill from it). The shape is that projection's (`[512, 9728] x [9728, 2560]`) on the
+/// wgpu caps, whose budget it exceeds. Mutation: in `register_tiled_launch`, use the unaligned `per_dispatch`; the
+/// first dispatch carries the budget's 50 tiles, not a multiple of 40, and this row goes red.
+#[test]
+fn a_watchdog_split_tiled_gemm_dispatches_whole_waves() {
+    let (m, k, n) = (512usize, 9728usize, 2560usize);
+    let caps = default_caps_for(Backend::SpirvVulkan);
+    let units = caps.compute_units as usize;
+    let budget = caps
+        .watchdog_budget
+        .expect("the wgpu caps carry a watchdog budget")
+        .packed_tiled_work;
+    let g = matmul_graph(m, k, n, GDt::F32);
+    let program = compiled_on(&g, Backend::SpirvVulkan, caps);
+    let (plan, choice) = compiled_matmul(&program);
+    let schedule = kn_tiled(choice)
+        .expect("the compile chooses the tiled GEMM")
+        .schedule;
+    let (tile_rows, tile_cols) = schedule.output_tile().expect("a tiled schedule");
+    let tiles = m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
+    let budget_tiles = budget as usize / (tile_rows * tile_cols * k);
+    assert!(
+        tiles > budget_tiles && budget_tiles > units,
+        "the fixture must exceed the budget by more than a wave"
+    );
+    let dispatches = plan.dispatches();
+    let mut covered = 0usize;
+    for (index, dispatch) in dispatches.iter().enumerate() {
+        let lanes = dispatch.body().workgroup_size[0] as usize;
+        let chunk = dispatch.launch().grid[0] as usize / lanes;
+        if index + 1 < dispatches.len() {
+            assert_eq!(
+                chunk % units,
+                0,
+                "dispatch {index} carries {chunk} tiles, not whole waves of {units} units: {plan:?}"
+            );
+        }
+        covered += chunk;
+    }
+    assert_eq!(covered, tiles, "the dispatches tile the whole output");
+}
+
 /// Card 557: the generated tiled GEMM owns its launch (workgroups of its schedule's `lanes^2` lanes), and the op
 /// alone no longer says so: `finalize` reads the recorded choice. A MatMul whose output is past the grid cap at
 /// one workgroup of lanes per tile must keep its schedule-wide workgroups. Mutation: drop the choice from

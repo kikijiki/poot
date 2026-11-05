@@ -147,10 +147,62 @@ fn flash_next_q2_footprint_on_a_96_gb_card() {
         weights.windows(2).all(|pair| pair[0] == pair[1]),
         "the weights do not depend on the context: {weights:?}"
     );
+    // POOT-1423: the per-layer table (26.82 GiB) and the vocabulary table (0.41 GiB) are hosted, so the device
+    // holds 73.44 - 27.23 GiB of weights (the engine's own counter reads the mapped bytes as `Hosted`).
+    let weight = weights[0] as f64 / GIB;
+    assert!(
+        (46.0..46.5).contains(&weight),
+        "the device weights exclude both hosted tables: {weight:.2} GiB"
+    );
+}
+
+/// A Vulkan target with the memory of a 128 GiB unified-memory machine (the Strix Halo box): the device limits
+/// are the preset's (a 32-bit-offset backend with the raw `maxBufferSize`), the memory budget is not the point.
+fn vulkan_128_gib() -> TargetSet {
+    let caps = DeviceCaps {
+        memory_budget_bytes: Some(128 << 30),
+        ..poot_test_util::device_caps::default_caps_for(Backend::SpirvVulkan)
+    };
+    TargetSet::single(
+        DeviceId(0),
+        Target::Gpu {
+            backend: Backend::SpirvVulkan,
+            caps,
+        },
+    )
+}
+
+/// POOT-1423 SC-002: the per-layer table is a 230,401,105,952-bit packed source, past the 32-bit bit offsets
+/// the Vulkan kernels address, so planning Flash-Next on wgpu/Vulkan used to be refused with
+/// `PackedSourceAddressing` naming it. The table is hosted now and is never a device source: the whole model
+/// plans, and the device weights are the 46.21 GiB of everything else.
+///
+/// Mutation: skip the hosting pass on wgpu (`hosted::apply` in `compile_staged`); the plan is refused with
+/// `PackedSourceAddressing` on `w.l1.ple.table` again and the `unwrap_or_else` goes red.
+#[test]
+fn flash_next_plans_on_vulkan_with_its_gather_tables_hosted() {
+    let (handle, _set) = handle();
+    let (options, prompts) = cell(128, 128, 128);
+    let footprint = Planner::new(Arc::clone(&handle), &vulkan_128_gib(), Placement::Single)
+        .unwrap()
+        .plan(options, &shapes(&prompts), &[])
+        .unwrap_or_else(|e| panic!("Flash-Next must plan on Vulkan: {e}"))
+        .footprint;
+    let roles = footprint.role_bytes(DeviceId(0)).unwrap();
+    let weight = roles
+        .iter()
+        .find(|(role, _)| *role == BufferRole::Weight)
+        .map(|&(_, bytes)| bytes as f64 / GIB)
+        .unwrap();
+    assert!(
+        (46.0..46.5).contains(&weight),
+        "the device weights exclude both hosted tables: {weight:.2} GiB"
+    );
 }
 
 /// SC-001: the budget refuses before any allocation, typed, naming the biggest allocation and the shortfall.
-/// A card that holds the plan admits it; one byte under refuses with the per-layer embedding table first.
+/// A card that holds the plan admits it; one byte under refuses naming the biggest allocation, which is no
+/// longer the per-layer embedding table (POOT-1423 hosts it: it is never a device allocation).
 #[test]
 fn the_budget_refuses_flash_next_before_any_allocation() {
     let (handle, _set) = handle();
@@ -172,11 +224,15 @@ fn the_budget_refuses_flash_next_before_any_allocation() {
         panic!("one byte short must be refused over budget");
     };
     assert_eq!((required, available), (need, need - 1));
-    let first = &largest[0];
     assert!(
-        first.id.starts_with("w.l1.ple.table"),
-        "the first-named allocation is the per-layer embedding table (the weight map's `w.l1.ple.table`, GGUF `per_layer_token_embd.weight`): {}",
-        first.describe()
+        largest
+            .iter()
+            .all(|owner| !owner.id.starts_with("w.l1.ple.table")),
+        "the per-layer embedding table (GGUF `per_layer_token_embd.weight`) is hosted, so no allocation names it: {:?}",
+        largest
+            .iter()
+            .map(|owner| owner.describe())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -227,8 +283,8 @@ fn the_prefill_arena_is_set_by_the_chunk_not_the_prompt() {
 
 /// The chunk the benchmark runner runs a cell with on the 96 GB card, through the production choice
 /// (`fit_prefill_chunk`): isl 8192 does not fit whole, so it runs at the largest candidate that does (2048:
-/// 89.65 GiB planned of 95.59); isl 1024 fits whole and keeps its whole-prompt chunk; a card without room for
-/// the weights is the typed refusal naming the per-layer embedding table first.
+/// 83.89 GiB planned of 95.59, the weights 27.23 GiB lighter since the two gather tables are hosted); isl 1024
+/// fits whole and keeps its whole-prompt chunk; a card without room for the chunk is the typed refusal.
 /// Mutation: make `chunk_candidates` return only the desired chunk; isl 8192 is refused instead of chunked.
 #[test]
 fn the_decode_curve_cell_runs_at_the_largest_chunk_that_fits_the_card() {
@@ -261,7 +317,7 @@ fn the_decode_curve_cell_runs_at_the_largest_chunk_that_fits_the_card() {
         total as f64 / GIB,
         RTX_PRO_6000_BYTES as f64 / GIB
     );
-    assert_eq!(fitted.chunk.get(), 2048);
+    assert_eq!(fitted.chunk.get(), 4096);
 
     let whole = fit(1024, RTX_PRO_6000_BYTES, &desired(1024)).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(
@@ -281,7 +337,9 @@ fn the_decode_curve_cell_runs_at_the_largest_chunk_that_fits_the_card() {
     };
     assert_eq!(chunk.get(), 4096, "the smallest candidate tried");
     assert!(
-        largest[0].id.starts_with("w.l1.ple.table"),
+        largest
+            .iter()
+            .all(|owner| !owner.id.starts_with("w.l1.ple.table")),
         "{}",
         largest[0].describe()
     );
@@ -289,11 +347,11 @@ fn the_decode_curve_cell_runs_at_the_largest_chunk_that_fits_the_card() {
 
 /// POOT-1347: the correctness scorer's window (two heads, capacity 2112, 2048 desired) on the 96 GB card. Its
 /// turns extend the prepared set to every admitted piece of both heads (`ServingShapes::turn`), which plans
-/// 106.85 GiB at the whole-prompt-half chunk 1024: fitted for the prompts alone it ran at 1024, the first turn
-/// then allocated the 17 GiB nobody counted and the card ran out of memory. Fitted for the turn set the chunk
-/// shrinks until the whole set fits, and a card too small for the weights is the typed refusal.
-/// Mutation: give `ServingShapes::turn` `Warm::Prompts(&[])`; the fit keeps 1024 and the first assertion
-/// fails.
+/// 85.87 GiB at the whole-prompt-half chunk 1024 (106.85 GiB before POOT-1423 hosted the two gather tables):
+/// fitted for the turn set the chunk is the largest whose whole set fits the card, and a card too small for
+/// the set is the typed refusal.
+/// Mutation: give `ServingShapes::turn` `Warm::Prompts(&[])`; the fit stops counting the turn pieces and
+/// the first assertion fails.
 #[test]
 fn the_score_window_chunk_is_fitted_to_the_turn_set() {
     let (handle, _set) = handle();
@@ -331,10 +389,10 @@ fn the_score_window_chunk_is_fitted_to_the_turn_set() {
         planned as f64 / GIB,
         RTX_PRO_6000_BYTES as f64 / GIB
     );
-    assert!(
-        fitted.chunk.get() < 1024,
-        "the turn set does not fit at 1024: {}",
-        fitted.chunk
+    assert_eq!(
+        fitted.chunk.get(),
+        1024,
+        "the whole turn set (85.87 GiB) fits the card at 1024 now that the gather tables are hosted"
     );
     assert!(
         planned + SUPPORT_RESERVE_BYTES <= RTX_PRO_6000_BYTES,

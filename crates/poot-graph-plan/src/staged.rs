@@ -7,6 +7,8 @@
 //! 1. `devices`: the partition names devices the target set contains; each stage has its device and
 //!    target.
 //! 2. `lora`: the whole-graph LoRA rewrite, applied once to the uncut graph.
+//! 2b. `hosted`: every gather-only table leaves the graph ([`crate::passes::host_gather_tables`]); a gather
+//!    whose ids the device computes adds one cut and one [`SyncPoint`] (the host copies the stored rows there).
 //! 3. `pool`: the expert placement. Pooled experts rewrite each routed layer to read a resident pool
 //!    and add one cut and one [`SyncPoint`] per routed selection (the host makes the selected experts
 //!    resident there).
@@ -22,12 +24,13 @@
 //!    footprint is admitted against its budget.
 
 use crate::passes::{CutSite, StageAssignment, split_stages};
+use crate::passes::{HostedGather, IndexSource};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use poot_graph_ir::analysis::{NumericsProperty, Tier2Class};
-use poot_graph_ir::{BoundaryId, Graph, Slot, SlotKey, TensorType, ValueId};
+use poot_graph_ir::{BoundaryId, Graph, SlotKey, TensorType, ValueId};
 use poot_target::BufferStorage;
 use poot_weights::{WeightId, WeightMap};
 
@@ -39,11 +42,15 @@ use crate::multi_device::{
 use crate::passes::{GraphBudget, PoolError, PoolSite, ShardError, StageSplitError, expand_ranks};
 use crate::{CompileError, CompileOptions, Program, Refusal, ShardRule, Target, shard};
 
+mod cuts;
 mod devices;
+mod hosted;
 mod lora;
 mod pool;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_hosted;
 mod traffic;
 
 pub use devices::Unsupported;
@@ -57,8 +64,19 @@ pub struct StageId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SyncId(pub u32);
 
+/// What the host does at a [`SyncPoint`] once it has read the exported values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SyncAction {
+    /// Make the routed selection's experts resident: the caller's [`crate::staged::SyncPoint`] handler
+    /// decides which and writes the pool.
+    RefillExperts(PoolSite),
+    /// Copy the stored rows the exported ids name into the hosted gather's slots. The executor does it
+    /// itself from its mapping of the checkpoint; no caller handler runs.
+    GatherRows(HostedGather),
+}
+
 /// A host sync of a step: after stage `after` completes, the host reads `reads` (boundary values
-/// that stage exported), may write the resident slots of `site`, and only then the next stage runs.
+/// that stage exported), does `action`, and only then the next stage runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncPoint {
     /// The sync's identity within the step.
@@ -67,8 +85,18 @@ pub struct SyncPoint {
     pub after: StageId,
     /// The exported boundary values the host reads at the sync.
     pub reads: Vec<BoundaryId>,
-    /// The routed selection whose experts the host makes resident here.
-    pub site: PoolSite,
+    /// What the host does with them.
+    pub action: SyncAction,
+}
+
+impl SyncPoint {
+    /// The routed selection this point refills, or `None` when the point copies hosted gather rows.
+    pub fn experts(&self) -> Option<&PoolSite> {
+        match &self.action {
+            SyncAction::RefillExperts(site) => Some(site),
+            SyncAction::GatherRows(_) => None,
+        }
+    }
 }
 
 /// The devices an executor exposes, each with the target `compile` plans for.
@@ -210,6 +238,9 @@ pub struct StagedProgram {
     comm: CommunicationPlan,
     footprints: Vec<(DeviceId, ByteCategories)>,
     sync_points: Vec<SyncPoint>,
+    /// Every gather-only table the program hosts: the rows each step copies from the checkpoint mapping,
+    /// at bind time or at one of `sync_points`.
+    hosted: Vec<HostedGather>,
     /// The stage after which the host binds the late inputs of the stages that follow it, when the
     /// compile was asked for the cut ([`CompileOptions::late`]) and the program is otherwise one stage on
     /// one device. `None` binds every input before the first stage.
@@ -230,6 +261,7 @@ impl StagedProgram {
             comm: CommunicationPlan::default(),
             footprints: Vec::new(),
             sync_points: Vec::new(),
+            hosted: Vec::new(),
             late: None,
             tensor: None,
             transform: NumericsProperty::Exact,
@@ -263,6 +295,7 @@ impl StagedProgram {
             stages: self.stages,
             links: self.links,
             sync_points: self.sync_points,
+            hosted: self.hosted,
         }
     }
 
@@ -277,6 +310,7 @@ impl StagedProgram {
             comm: CommunicationPlan::default(),
             footprints: Vec::new(),
             sync_points: parts.sync_points,
+            hosted: parts.hosted,
             late: None,
             tensor: None,
             transform: NumericsProperty::Exact,
@@ -317,23 +351,38 @@ impl StagedProgram {
         self.tensor.as_ref()
     }
 
-    /// The step's host sync points, in stage order (empty unless experts are pooled).
+    /// The step's host sync points, in stage order (empty unless experts are pooled or a hosted gather's
+    /// ids are computed on the device).
     pub fn sync_points(&self) -> &[SyncPoint] {
         &self.sync_points
     }
 
+    /// The gather-only tables the program hosts, each with the rows a step copies from the checkpoint.
+    pub fn hosted(&self) -> &[HostedGather] {
+        &self.hosted
+    }
+
+    /// Whether a step of this program needs the host between its stages or before its first: a hosted
+    /// gather copies rows from the checkpoint mapping, so no run of steps can stay on the device
+    /// (`Executor::step_chain` refuses such a program, and a driver does not offer one).
+    pub fn host_fed(&self) -> bool {
+        !self.hosted.is_empty() || !self.sync_points.is_empty() || self.late.is_some()
+    }
+
     /// Whether a step of this program takes an input for `key`: a slot one of its stages declares, or the
-    /// token ids a hosted embed gather reads. A stage split keeps only the inputs a stage uses, so a slot
-    /// of the traced graph that no stage reads is not one a step binds.
+    /// step input a hosted gather reads its ids from. A stage split keeps only the inputs a stage uses, so a
+    /// slot of the traced graph that no stage reads is not one a step binds.
     pub fn takes_input(&self, key: &SlotKey) -> bool {
-        let token = SlotKey::new(Slot::Token, None);
-        self.stages.iter().any(|(_, _, program)| {
-            let graph = program.graph();
-            graph.slots().iter().any(|&(id, kind)| {
-                graph.meta(id).slot_key() == Some(key)
-                    || (*key == token && kind == Slot::Owned(crate::TOKEN_EMBED))
+        self.hosted
+            .iter()
+            .any(|site| matches!(&site.index, IndexSource::Step(step) if step == key))
+            || self.stages.iter().any(|(_, _, program)| {
+                let graph = program.graph();
+                graph
+                    .slots()
+                    .iter()
+                    .any(|&(id, _)| graph.meta(id).slot_key() == Some(key))
             })
-        })
     }
 
     /// The stage after which the host binds the late inputs of the stages that follow it: they run on the
@@ -353,6 +402,8 @@ pub struct StagedParts {
     pub links: Vec<Link>,
     /// The host sync points of a step.
     pub sync_points: Vec<SyncPoint>,
+    /// The hosted gather sites of the program.
+    pub hosted: Vec<HostedGather>,
 }
 
 /// The representation of one side of a link: what [`StagedCompileError::LinkSchema`] compares.
@@ -373,6 +424,10 @@ pub enum StagedCompileError {
     /// The expert pool pass refused the graph.
     #[error(transparent)]
     Pool(#[from] PoolError),
+    /// Hosting a gather-only table produced a graph the edit check refused: a defect of the pass, never of
+    /// the input.
+    #[error(transparent)]
+    Hosted(Box<poot_graph_ir::EditError>),
     /// The sharding pass refused the graph.
     #[error(transparent)]
     Shard(#[from] ShardError),
@@ -482,6 +537,17 @@ pub fn compile_staged(
             Unsupported::PooledAcrossDevices,
         ));
     }
+    let hosted = hosted::apply(adapted, &options.aliases)?;
+    let adapted = hosted.graph;
+    // A device-computed index is read at a sync of one device, as a pooled selection's ids are.
+    if hosted.sites.iter().any(|site| site.device_index.is_some())
+        && (placement.spans_devices()
+            || matches!(partition.devices, DevicePlacement::Tensor { .. }))
+    {
+        return Err(StagedCompileError::Unsupported(
+            Unsupported::HostedIndexAcrossDevices,
+        ));
+    }
     let budget = GraphBudget::of(&options.limits);
     let stage_options = CompileOptions {
         lora: None,
@@ -529,10 +595,27 @@ pub fn compile_staged(
     };
     let transform = placed.numerics;
     let adapted = placed.graph;
+    // Where each device-indexed gather site is cut: right before the first equation that reads its rows, in the
+    // graph the stages are cut from. Every site with a device index has a reader, or it would not be hosted.
+    let mut gather_cuts: Vec<(usize, usize)> = Vec::new();
+    for (site, hosted_site) in hosted.sites.iter().enumerate() {
+        if hosted_site.device_index.is_some() {
+            let position = hosted::cut_before_first_reader(&adapted, hosted_site)
+                .expect("a hosted gather's rows are read by an equation");
+            gather_cuts.push((site, position));
+        }
+    }
+    let hosted_gathers: Vec<HostedGather> = hosted
+        .sites
+        .iter()
+        .map(|site| site.gather.clone())
+        .collect();
 
     let uncut = match &rank_cuts {
         Some(cuts) => cuts.is_empty(),
-        None => placement.after_layers.is_empty() && placed.sites.is_empty(),
+        None => {
+            placement.after_layers.is_empty() && placed.sites.is_empty() && gather_cuts.is_empty()
+        }
     };
     // The late-input cut (POOT-1268) splits a program that is otherwise one stage on one device: a program
     // that is cut already, or that spans devices, binds its late inputs with the rest.
@@ -550,6 +633,7 @@ pub fn compile_staged(
         );
         program.tensor = tensor;
         program.transform = transform;
+        program.hosted = hosted_gathers;
         return Ok(program);
     }
 
@@ -560,7 +644,7 @@ pub fn compile_staged(
             rank_cuts.iter().map(|&at| CutSite::Before(at)).collect(),
             Vec::new(),
         )
-    } else if placed.sites.is_empty() {
+    } else if placed.sites.is_empty() && gather_cuts.is_empty() {
         let sites: Vec<CutSite> = placement
             .after_layers
             .iter()
@@ -568,7 +652,8 @@ pub fn compile_staged(
             .collect();
         (sites, Vec::new())
     } else {
-        let cuts = pool::cuts(&adapted, &placement.after_layers, &placed.sites)?;
+        let positions: Vec<usize> = gather_cuts.iter().map(|&(_, position)| position).collect();
+        let cuts = cuts::cuts(&adapted, &placement.after_layers, &placed.sites, &positions)?;
         let sites = cuts
             .iter()
             .map(|cut| CutSite::Before(cut.position))
@@ -678,25 +763,38 @@ pub fn compile_staged(
         devices::admit_capacity(&placement, &footprints)?;
     }
 
-    // One sync per pooled selection, after the stage that computes its ids. The ids must be a value
-    // that stage exports, or the host would have nothing to read.
-    let mut sync_points = Vec::with_capacity(placed.sites.len());
+    // One sync per pooled selection and per device-indexed gather, after the stage that computes its ids. The
+    // ids must be a value that stage exports, or the host would have nothing to read.
+    let mut sync_points = Vec::with_capacity(placed.sites.len() + gather_cuts.len());
     for (stage, cut) in cuts.iter().enumerate() {
-        let Some(site) = cut.site else { continue };
-        let site = placed.sites[site].0.clone();
         let from = StageId(stage as u32);
-        if !stages[stage].2.exports().any(|e| e.id == site.ids) {
-            return Err(StagedCompileError::BoundaryLost {
-                id: site.ids,
-                stage: from,
+        for sync in &cut.syncs {
+            let (ids, action) = match *sync {
+                cuts::CutSync::Experts(site) => {
+                    let site = placed.sites[site].0.clone();
+                    (site.ids, SyncAction::RefillExperts(site))
+                }
+                cuts::CutSync::Gather(index) => {
+                    let gather = hosted_gathers[gather_cuts[index].0].clone();
+                    let IndexSource::Device(ids) = gather.index else {
+                        unreachable!("a gather cut is a device-computed index")
+                    };
+                    (ids, SyncAction::GatherRows(gather))
+                }
+            };
+            if !stages[stage].2.exports().any(|e| e.id == ids) {
+                return Err(StagedCompileError::BoundaryLost {
+                    id: ids,
+                    stage: from,
+                });
+            }
+            sync_points.push(SyncPoint {
+                id: SyncId(sync_points.len() as u32),
+                after: from,
+                reads: vec![ids],
+                action,
             });
         }
-        sync_points.push(SyncPoint {
-            id: SyncId(sync_points.len() as u32),
-            after: from,
-            reads: vec![site.ids],
-            site,
-        });
     }
     Ok(StagedProgram {
         stages,
@@ -705,6 +803,7 @@ pub fn compile_staged(
         comm: plan.communication,
         footprints,
         sync_points,
+        hosted: hosted_gathers,
         late: late_site.map(|_| StageId(0)),
         tensor,
         transform,

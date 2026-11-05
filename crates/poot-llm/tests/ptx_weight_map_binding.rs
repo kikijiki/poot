@@ -57,3 +57,17 @@ fn a_split_head_generates_the_unsplit_logits_and_tokens() {
     };
     fixture::check_split_head(exec.as_mut(), target);
 }
+
+/// POOT-1423 SC-005: a dense and a packed gather-only table hosted by token (rows copied at bind time) and by an
+/// index the device computes (rows copied at a host sync) give the CPU oracle's output on the real device.
+///
+/// Mutation: in `poot_executor::binder::gather_rows`, read the row one past the requested id; every case goes red.
+#[test]
+fn hosted_dense_and_packed_gathers_match_the_oracle_at_bind_and_sync_time() {
+    let Some((mut exec, target)) = engine() else {
+        return;
+    };
+    fixture::check_hosted_gathers(exec.as_mut(), target, &|g, store, map, slots, state| {
+        eval_mapped(g, store, map, slots, state)
+    });
+}

@@ -55,9 +55,7 @@ BindError	UnknownState	covered	crates/poot-executor/src/engine.rs	the_host_seeds
 BindError	StateRowValues	covered	crates/poot-executor/src/engine.rs	the_host_seeds_one_row_of_a_carried_state
 BindError	LateValues	covered	crates/poot-executor/src/engine.rs	late_inputs_that_build_the_wrong_number_of_values_are_refused
 BindError	StateRow	covered	crates/poot-executor/src/engine.rs	a_state_row_past_the_pool_is_a_state_row_refusal_that_zeroes_nothing
-BindError	TokenOutOfRange	covered	crates/poot-executor/src/engine.rs	a_token_outside_the_embed_table_is_refused
-# EmbedDecode: a packed embed row failing to decode needs changed bytes behind an unchanged file identity (`WeightBinder::embed` checks it before and after the read, and user space cannot restore `ctime`), so no input reaches it.
-BindError	EmbedDecode	gap	-	-
+BindError	HostedRowOutOfRange	covered	crates/poot-executor/src/engine.rs	an_id_outside_the_hosted_table_is_refused_before_any_write
 BindError	RowRange	covered	crates/poot-executor/src/engine.rs	a_row_write_at_the_end_of_the_pool_is_a_row_range_refusal
 BindError	ExpertRange	covered	crates/poot-executor/tests/guard_rows.rs	an_expert_id_one_past_the_table_is_refused
 BindError	MapLength	covered	crates/poot-executor/tests/guard_rows.rs	a_map_one_element_off_is_refused

@@ -43,6 +43,10 @@ pub enum ResidencyError {
     /// The sync point's program names no expert-id input.
     #[error("the sync point reads no expert ids")]
     NoIds,
+    /// The point is not an expert refill: the executor copies a hosted gather's rows itself, so a host
+    /// handler is never called for one.
+    #[error("the sync point refills no experts")]
+    NotAnExpertRefill,
     /// An id outside the site's expert range, or negative.
     #[error("expert id {id} is not one of the site's {experts} experts")]
     ExpertId {
@@ -153,8 +157,11 @@ impl HostSync for ExpertResidency {
             .and_then(|&id| reads.values(id))
             .ok_or_else(|| ExecError::Host(Box::new(ResidencyError::NoIds)))?;
         let host = |error: ResidencyError| ExecError::Host(Box::new(error));
-        let experts = point.site.experts;
-        let slots = point.site.slots;
+        let pool = point
+            .experts()
+            .ok_or_else(|| host(ResidencyError::NotAnExpertRefill))?;
+        let experts = pool.experts;
+        let slots = pool.slots;
 
         // The distinct experts the step selects, in first-seen order.
         let mut needed: Vec<usize> = Vec::new();
@@ -185,7 +192,7 @@ impl HostSync for ExpertResidency {
         let mut writes = SyncWrites::default();
         if !fills.is_empty() {
             // Every table of the site gets the same expert in the same row.
-            for table in 0..point.site.weights.len() {
+            for table in 0..pool.weights.len() {
                 for &(row, expert) in &fills {
                     writes.rows.push(RowFill {
                         table,

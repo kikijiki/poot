@@ -218,10 +218,16 @@ fn every_moe_family_prefill_has_routed_expert_sites_and_runs_every_pass_on_rocm(
         let staged = compile_staged(&prefill, &targets, &partition, &REPLAY)
             .unwrap_or_else(|e| panic!("{family}: prefill compiles: {e:?}"));
         let stages: Vec<_> = staged.stages().collect();
-        assert_eq!(stages.len(), 1, "{family}: one stage");
+        // Resident experts add no cut; a hosted gather whose ids the device computes (deepseek4's hashed
+        // tables) cuts the program once at its host sync.
+        assert_eq!(
+            stages.len(),
+            1 + staged.sync_points().len(),
+            "{family}: one stage, plus one per host sync"
+        );
         for pass in ["fuse_contraction_epilogues", "fuse"] {
             assert!(
-                ran(stages[0].2, pass),
+                stages.iter().any(|(_, _, stage)| ran(stage, pass)),
                 "{family}: ROCm prefill skipped {pass}"
             );
         }

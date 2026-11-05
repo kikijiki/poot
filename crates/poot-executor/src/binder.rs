@@ -14,8 +14,7 @@
 //! its parent weight `<name>` that the chunks before it leave off, as a row range of the parent's
 //! own spans: the parent is never read or uploaded whole. A chunk of a packed expert stack's source (legalize's
 //! split of a stack over the buffer limit) is a run of whole experts, padded to the slab stride like the whole.
-//! A hosted embed gather (`TOKEN_EMBED`(`TOKEN_EMBED`)) reads its rows
-//! through the same resolution.
+//! A hosted gather site (`HOSTED_ROWS`) copies the stored rows its ids name from the same resolution.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -370,29 +369,42 @@ struct Located {
     experts: Option<usize>,
 }
 
-/// One logical row run of a hosted embed table: rows `rows` of store entry `key`.
+/// One logical row run of a hosted table: rows `rows` of store entry `key`.
 #[derive(Clone, Debug)]
 struct RowRun {
     key: WeightKey,
     rows: Range<usize>,
 }
 
-/// Where a hosted embed gather (`TOKEN_EMBED`(`TOKEN_EMBED`)) reads its
-/// rows: the embed view's row runs in order, the row width, and how a row is stored.
-#[derive(Clone, Debug)]
-pub(crate) struct EmbedRows {
-    name: String,
-    runs: Vec<RowRun>,
-    width: usize,
-    format: HandleFormat,
+/// How the rows of a hosted table are stored.
+#[derive(Clone, Copy, Debug)]
+enum RowKind {
+    /// A dense table `[rows, width]` of `dtype`: a row is `width` elements, landed in the slot's planned lane.
+    Dense { dtype: DType, width: usize },
+    /// One source role of a packed table: a row is `row_bytes` stored bytes, landed as `u32` words.
+    Packed { role: SourceRole, row_bytes: usize },
 }
 
-impl EmbedRows {
-    /// The table's row width: a slot of `n` elements holds `n / width` tokens.
-    pub(crate) fn width(&self) -> usize {
-        self.width
+/// Where a hosted gather's slot reads its rows (the carrier `name` of the table, one carrier per slot): the
+/// view's row runs in order and how a row is stored. A packed table has one of these per source role.
+#[derive(Clone, Debug)]
+pub(crate) struct HostedTable {
+    name: String,
+    runs: Vec<RowRun>,
+    rows: usize,
+    kind: RowKind,
+}
+
+impl HostedTable {
+    /// The `u32` words a packed carrier's slot buffer holds for `aval`'s rows, with the one zero guard word every
+    /// packed source ends in; `None` for a dense table, whose buffer is sized by its planned lane.
+    pub(crate) fn packed_words(&self, aval: &TensorType) -> Option<usize> {
+        matches!(self.kind, RowKind::Packed { .. }).then(|| aval.numel().div_ceil(4) + 1)
     }
 }
+
+/// The rows one step gathers, in the form a device lane holds: the stored bytes, encoded.
+pub(crate) type HostedBytes = Vec<u8>;
 
 /// An executable's weights: its store and the map its graph consts bind through, each mapped weight
 /// under its [`WeightId::const_name`].
@@ -860,49 +872,61 @@ impl WeightBinder {
         })
     }
 
-    /// Where the hosted embed gather named `name` (the `TOKEN_EMBED` input `value`, declared
-    /// `aval`, planned in `storage`) reads its rows: the embed view's `[rows, width]` table. A dense
-    /// table's rows encode into `storage` as stored; a packed one's decode to F32 rows.
-    pub(crate) fn embed_rows(
+    /// Where the hosted gather carrier named `name` (the `HOSTED_ROWS` slot `value`, declared `aval`, planned in
+    /// `storage`) reads its rows: a dense table's `[rows, width]` rows as stored, or one source role of a packed
+    /// table's stored rows. Nothing is decoded: the slot holds the table's own bytes (ADR-0103).
+    pub(crate) fn hosted_table(
         &self,
         value: ValueId,
         name: &str,
         aval: &TensorType,
         storage: BufferStorage,
-    ) -> Result<EmbedRows, LoadError> {
+    ) -> Result<HostedTable, LoadError> {
         let located = self.locate(value, name)?;
         let shape_error = || LoadError::WeightShape {
             name: name.to_string(),
             stored: located.shape.clone(),
             declared: aval.shape.clone(),
         };
-        let &[_, width] = located.shape.as_slice() else {
+        let &[rows, width] = located.shape.as_slice() else {
             return Err(shape_error());
         };
-        if located.role.is_some() || width == 0 || !aval.numel().is_multiple_of(width) {
+        if width == 0 {
             return Err(shape_error());
         }
-        let encodes = match located.format {
-            HandleFormat::Dense(dtype) => {
-                // The finite-F16 lane is refused: it is the one encoding that can fail on a row's data, and
-                // `embed` has no per-token error for it. (No hosted embed slot is planned in it.)
-                aval.dtype == dtype
-                    && crate::lanes::encoding_of(dtype, storage).is_some_and(|encoding| {
+        let wrong_lane = || LoadError::WeightFormat {
+            name: name.to_string(),
+            stored: format!("{:?}", located.format),
+            planned: storage,
+        };
+        let kind = match (located.format, located.role) {
+            (HandleFormat::Dense(dtype), None) => {
+                // The finite-F16 lane is refused: it is the one encoding that can fail on a row's data, and a
+                // gather has no per-step error for it.
+                if aval.dtype != dtype
+                    || !aval.numel().is_multiple_of(width)
+                    || !crate::lanes::encoding_of(dtype, storage).is_some_and(|encoding| {
                         encoding != crate::lanes::Encoding::PackedWordsFiniteF16
                     })
+                {
+                    return Err(wrong_lane());
+                }
+                RowKind::Dense { dtype, width }
             }
-            HandleFormat::Packed(_) => {
-                aval.dtype == DType::F32
-                    && crate::lanes::encode_host(DType::F32, &[], storage).is_some()
+            (HandleFormat::Packed(weight), Some(role)) if weight.sources().contains(&role) => {
+                let [stored_rows, row_bytes] = weight.source_shape(role);
+                // The slot is `[n, row_bytes]` raw bytes in the words lane, and the role stores one row per
+                // table row.
+                if stored_rows != rows
+                    || aval.shape.get(1) != Some(&row_bytes)
+                    || aval.dtype != DType::I8
+                {
+                    return Err(shape_error());
+                }
+                RowKind::Packed { role, row_bytes }
             }
+            _ => return Err(shape_error()),
         };
-        if !encodes {
-            return Err(LoadError::WeightFormat {
-                name: name.to_string(),
-                stored: format!("{:?}", located.format),
-                planned: storage,
-            });
-        }
         let runs = located
             .parts
             .into_iter()
@@ -912,41 +936,44 @@ impl WeightBinder {
                     let rows = self.entry(value, name, key.as_str())?.shape()[0];
                     Ok(RowRun { key, rows: 0..rows })
                 }
-                // An index table is no embedding, and a column cut is no row run.
+                // An index table is no table of rows, and a column cut is no row run.
                 Part::Narrowed(_) | Part::Ordered(..) | Part::Columns(..) => Err(shape_error()),
             })
             .collect::<Result<Vec<_>, LoadError>>()?;
-        Ok(EmbedRows {
+        Ok(HostedTable {
             name: name.to_string(),
             runs,
-            width,
-            format: located.format,
+            rows,
+            kind,
         })
     }
 
-    /// The embed rows of `tokens`, in order, encoded into `storage`.
-    pub(crate) fn embed(
+    /// The stored rows `ids` name of `table`, in order, in the lane `storage` the slot was planned in.
+    ///
+    /// An id outside the table is a typed [`BindError`] before a byte is returned, so nothing is written for a
+    /// step that names a row the table lacks.
+    pub(crate) fn gather_rows(
         &self,
-        rows: &EmbedRows,
-        tokens: &[i32],
+        table: &HostedTable,
+        ids: &[i32],
         storage: BufferStorage,
-    ) -> Result<Vec<u8>, ExecError> {
+    ) -> Result<HostedBytes, ExecError> {
         // ADR-0103 amendment: no page of a changed file is read, and the rows read are the validated bytes
         // only if the file did not change while they were read.
         self.check_sources()?;
-        let total: usize = rows.runs.iter().map(|run| run.rows.len()).sum();
-        let mut dense = Vec::new();
-        let mut decoded = Vec::new();
-        for &token in tokens {
-            let mut row = usize::try_from(token)
+        let total: usize = table.runs.iter().map(|run| run.rows.len()).sum();
+        debug_assert_eq!(total, table.rows);
+        let mut stored = Vec::new();
+        for &id in ids {
+            let mut row = usize::try_from(id)
                 .ok()
                 .filter(|&row| row < total)
-                .ok_or_else(|| BindError::TokenOutOfRange {
-                    name: rows.name.clone(),
-                    token,
+                .ok_or_else(|| BindError::HostedRowOutOfRange {
+                    name: table.name.clone(),
+                    id,
                     rows: total,
                 })?;
-            let run = rows
+            let run = table
                 .runs
                 .iter()
                 .find(|run| {
@@ -959,56 +986,42 @@ impl WeightBinder {
                 })
                 .expect("a row below the total lies in some run");
             let stored_row = run.rows.start + row;
-            match self.store.get(run.key.as_str()) {
-                Some(WeightEntry::Dense(entry)) => {
+            match (self.store.get(run.key.as_str()), table.kind) {
+                (Some(WeightEntry::Dense(entry)), RowKind::Dense { .. }) => {
                     let bytes = entry.bytes().as_slice();
                     let row_bytes = bytes.len() / entry.shape()[0];
-                    dense.extend_from_slice(
+                    stored.extend_from_slice(
                         &bytes[stored_row * row_bytes..(stored_row + 1) * row_bytes],
                     );
                 }
-                Some(WeightEntry::Packed(payload)) => {
-                    let start = decoded.len();
-                    decoded.resize(start + rows.width, 0.0f32);
-                    // `load_weights` matched the payload to the map's `[rows, width]`, and `embed_rows` cut the
-                    // runs inside its rows, so the decode stays inside the payload's shape; a decode failure
-                    // is typed all the same, never a panic on bytes a file can change.
-                    payload
-                        .decode_row(stored_row, &mut decoded[start..])
-                        .map_err(|source| BindError::EmbedDecode {
-                            name: rows.name.clone(),
-                            token,
-                            source,
-                        })?;
+                (Some(WeightEntry::Packed(payload)), RowKind::Packed { role, row_bytes }) => {
+                    stored.extend_from_slice(
+                        &payload.bytes(role)[stored_row * row_bytes..(stored_row + 1) * row_bytes],
+                    );
                 }
-                None => unreachable!("load_weights checked every mapped key against this store"),
+                _ => unreachable!("load_weights checked every mapped key against this store"),
             }
         }
-        // `embed_rows` admitted this lane for these rows: a dense table's encoding exists and cannot fail on
-        // its data (the finite-F16 lane is not admitted), and a packed table's F32 rows land verbatim.
-        let encoded = match rows.format {
-            HandleFormat::Dense(dtype) => {
-                crate::lanes::encode_stored(dtype, &[rows.width], &dense, storage).map_err(
-                    |error| match error {
+        let encoded = match table.kind {
+            RowKind::Dense { dtype, width } => {
+                crate::lanes::encode_stored(dtype, &[width], &stored, storage).map_err(|error| {
+                    match error {
                         EncodeError::NoEncoding => LoadError::WeightFormat {
-                            name: rows.name.clone(),
+                            name: table.name.clone(),
                             stored: format!("{dtype:?}"),
                             planned: storage,
                         },
                         EncodeError::NonFiniteF16 { index, bits } => {
                             LoadError::NonFiniteF16Weight {
-                                name: rows.name.clone(),
+                                name: table.name.clone(),
                                 index,
                                 bits,
                             }
                         }
-                    },
-                )?
+                    }
+                })?
             }
-            HandleFormat::Packed(_) => {
-                crate::lanes::encode_host(DType::F32, bytemuck::cast_slice(&decoded), storage)
-                    .expect("embed_rows admitted a lane that holds F32 rows")
-            }
+            RowKind::Packed { .. } => crate::lanes::encode_words(&stored),
         };
         // The same check after the reads: a file modified while its rows were read is refused, not encoded.
         self.check_sources()?;

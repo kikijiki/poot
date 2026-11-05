@@ -29,6 +29,7 @@ mod cse_dce;
 mod dtype;
 pub(crate) mod fuse;
 mod guard_witness;
+mod hosted_gather;
 mod iota;
 mod legalize;
 mod lora;
@@ -52,7 +53,7 @@ pub(crate) fn with_eqns(g: &Graph, eqns: Vec<Eqn>) -> Result<Graph, EditError> {
 pub(crate) use budget::GraphBudget;
 pub(crate) use legalize::refuse_oversized_constants;
 pub(crate) use legalize::{KvExtent, kv_extents};
-pub use legalize::{LegalizeError, TOKEN_EMBED, legalize};
+pub use legalize::{LegalizeError, legalize};
 pub(crate) use lora::apply_lora;
 pub use lora::{LORA_IDX, LoraError, LoraPlan};
 
@@ -86,6 +87,8 @@ pub use fuse::fuse;
 pub(crate) use fuse::fuse;
 pub(crate) use fuse::fuse_contraction_epilogues;
 pub(crate) use guard_witness::first_unobserved_clamp;
+pub use hosted_gather::{HOSTED_ROWS, HostedGather, HostedRows, IndexSource};
+pub(crate) use hosted_gather::{HostedSite, host_gather_tables};
 #[cfg(any(test, feature = "test-support"))]
 pub use iota::fold_iota;
 #[cfg(not(any(test, feature = "test-support")))]

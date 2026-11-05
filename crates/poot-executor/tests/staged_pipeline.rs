@@ -690,6 +690,7 @@ fn a_link_read_before_its_producer_exported_is_unresolved() {
         stages,
         links,
         sync_points,
+        hosted,
     } = pipeline(&g).into_parts();
     let last = stages.len() as u32 - 1;
     let flip = |stage: StageId| StageId(last - stage.0);
@@ -711,6 +712,7 @@ fn a_link_read_before_its_producer_exported_is_unresolved() {
             stages,
             links,
             sync_points,
+            hosted,
         },
         store,
         map,
@@ -785,6 +787,7 @@ fn an_export_viewing_carried_state_is_refused_at_load() {
             stages: vec![(StageId(0), DeviceId(0), program)],
             links: Vec::new(),
             sync_points: Vec::new(),
+            hosted: Vec::new(),
         },
         store,
         map,

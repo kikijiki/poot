@@ -4,13 +4,9 @@
 
 use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_executor::{Device, Engine, Executor};
-use poot_graph_ir::Slot;
-use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
-use poot_models::test_support::weight_map::{self as fixture, DIMS, Projections, Qwen2Dims, Step};
+use poot_models::test_support::weight_map::{self as fixture, Projections};
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
-use poot_tensor::DType;
-use poot_test_util::assert_close_scaled;
 use poot_wgpu_device::device::WgpuDevice;
 
 fn engine() -> Option<(Box<dyn Executor>, poot_graph_plan::Target)> {
@@ -63,60 +59,21 @@ fn fused_and_stacked_views_equal_separate_storage() {
     }
 }
 
-/// An F32 embedding is the one tensor over a cap between it and the BF16 head, so legalize hosts
-/// its gather and nothing else.
-const HOSTED: Qwen2Dims = Qwen2Dims { vocab: 256, ..DIMS };
-
-/// SC-006: with a fixture cap that makes legalize host the embed gather as ``TOKEN_EMBED``, the
-/// binder fills it from the step's tokens and the logits equal the unhosted run.
+/// POOT-1423: an F32 embedding table is hosted (the binder copies the rows the step's tokens name from the
+/// stored table, which is never a device constant) and every step's logits equal the oracle's. The vocabulary
+/// is wide enough to name ids past the first rows.
+///
+/// Mutation: in `poot_executor::binder::gather_rows`, read the row one past the requested id; the logits go red.
 #[test]
-fn a_hosted_embed_gather_equals_the_device_gather() {
+fn a_hosted_embed_gather_matches_the_oracle() {
     let Some((mut exec, target)) = engine() else {
         return;
     };
-    let m = fixture::qwen2(HOSTED, Projections::Bf16, DType::F32);
-    let mut caps = gpu_caps(&target);
-    caps.max_buffer_bytes = (HOSTED.vocab * HOSTED.hidden * 4 - 1) as u64;
-    let hosted = |g| {
-        let g = poot_graph_plan::legalize(
-            &g,
-            gpu_backend(&target),
-            &caps,
-            &poot_graph_plan::CompileLimits::STANDARD,
-        )
-        .unwrap();
-        assert!(
-            g.slots()
-                .iter()
-                .any(|&(_, slot)| slot == Slot::Owned(poot_graph_plan::TOKEN_EMBED)),
-            "the fixture cap hosts the embed gather"
-        );
-        g
-    };
-    let steps = [Step::new(&[200, 1, 77], 0), Step::new(&[255], 3)];
-    let run = |exec: &mut dyn Executor, prepare: &dyn Fn(_) -> _| {
-        fixture::run_steps(
-            exec,
-            target,
-            m.model.as_ref(),
-            m.store.clone(),
-            m.map.clone(),
-            &steps,
-            prepare,
-        )
-        .unwrap()
-    };
-    let device_gather = run(exec.as_mut(), &|g| g);
-    let host_gather = run(exec.as_mut(), &hosted);
-    let tolerance = host_gather.class.max(device_gather.class).tolerance();
-    for (step, (got, want)) in host_gather
-        .logits
-        .iter()
-        .zip(&device_gather.logits)
-        .enumerate()
-    {
-        assert_close_scaled(got, want, tolerance, &format!("hosted embed, step {step}"));
-    }
+    fixture::check_f32_embed_matches_oracle(
+        exec.as_mut(),
+        target,
+        &|g, store, map, slots, state| eval_mapped(g, store, map, slots, state),
+    );
 }
 
 /// POOT-1017: under a single-buffer limit below the lm_head, legalize splits the head into row
@@ -146,6 +103,20 @@ fn the_tied_head_decodes_on_bf16_resident_weights_and_matches_the_oracle() {
         return;
     };
     fixture::check_tied_head(exec.as_mut(), target, &|g, store, map, slots, state| {
+        eval_mapped(g, store, map, slots, state)
+    });
+}
+
+/// POOT-1423 SC-005: a dense and a packed gather-only table hosted by token (rows copied at bind time) and by an
+/// index the device computes (rows copied at a host sync) give the CPU oracle's output on the real device.
+///
+/// Mutation: in `poot_executor::binder::gather_rows`, read the row one past the requested id; every case goes red.
+#[test]
+fn hosted_dense_and_packed_gathers_match_the_oracle_at_bind_and_sync_time() {
+    let Some((mut exec, target)) = engine() else {
+        return;
+    };
+    fixture::check_hosted_gathers(exec.as_mut(), target, &|g, store, map, slots, state| {
         eval_mapped(g, store, map, slots, state)
     });
 }

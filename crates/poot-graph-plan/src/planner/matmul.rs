@@ -456,6 +456,12 @@ pub(super) fn register_tiled_launch(
     if let Some(ceiling) = caps.known_miscompiles.tiled_gemm_max_workgroups {
         per_dispatch = per_dispatch.min((ceiling as usize).saturating_sub(1).max(1));
     }
+    let per_dispatch = wave_aligned_chunk(
+        tiles,
+        per_dispatch,
+        caps.compute_units as usize,
+        caps.max_grid[0].max(1) as usize,
+    );
     let extents = [shape.k, shape.out_per_block, shape.m_per_block]
         .into_iter()
         .map(|extent| u32::try_from(extent).map_err(|_| overflow()))
@@ -494,6 +500,25 @@ fn tiles_per_dispatch(tiles: usize, tile_outputs: usize, k: usize, caps: &Device
         within_budget - within_budget % row
     } else {
         within_budget
+    }
+}
+
+/// The tiles per dispatch of a launch of `tiles` that may carry at most `max_per_dispatch`: the bound rounded down to
+/// whole waves of the device's `units` compute units, which run one tile each. A dispatch of 50 tiles on 40 units
+/// takes two waves, the second one 10 tiles wide, and the dispatch after it starts only when that wave ends; 40 + 40
+/// takes the same two waves with both full, so the split that fills every wave but the last costs the least. A
+/// bound within one wave, or a chunk that folds onto several grid rows of `row` tiles (a whole number of them, see
+/// [`tiles_per_dispatch`]), is left as it is.
+fn wave_aligned_chunk(tiles: usize, max_per_dispatch: usize, units: usize, row: usize) -> usize {
+    let units = units.max(1);
+    if max_per_dispatch >= tiles || max_per_dispatch <= units {
+        return max_per_dispatch;
+    }
+    let aligned = max_per_dispatch - max_per_dispatch % units;
+    if aligned > row {
+        max_per_dispatch
+    } else {
+        aligned
     }
 }
 
@@ -542,5 +567,54 @@ pub(super) fn planned_dispatches(
                 .map(|dispatch| Planned::generated_dispatch(site, request(dispatch), backend, caps))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wave_aligned_chunk;
+
+    /// A split launch fills every wave of every dispatch but the last: the bound rounds down to whole waves of the
+    /// device's units, and a launch within its bound or a bound within one wave is not touched. Mutation: return
+    /// `max_per_dispatch` for a split; the first row goes red.
+    #[test]
+    fn a_split_launch_fills_whole_waves_per_dispatch() {
+        assert_eq!(
+            wave_aligned_chunk(80, 50, 40, 65_535),
+            40,
+            "50 + 30 becomes 40 + 40"
+        );
+        assert_eq!(
+            wave_aligned_chunk(320, 50, 40, 65_535),
+            40,
+            "eight full waves"
+        );
+        assert_eq!(wave_aligned_chunk(304, 190, 40, 65_535), 160, "160 + 144");
+        assert_eq!(
+            wave_aligned_chunk(7, 7, 40, 65_535),
+            7,
+            "under the bound: one dispatch"
+        );
+        assert_eq!(
+            wave_aligned_chunk(100, 30, 40, 65_535),
+            30,
+            "a bound inside one wave"
+        );
+    }
+
+    /// A chunk that folds onto several grid rows is a whole number of them, so the wave rounding gives way to the
+    /// row. Mutation: drop the row guard; 280 tiles fold onto two and four fifths rows and this row goes red.
+    #[test]
+    fn a_folded_chunk_stays_whole_grid_rows() {
+        assert_eq!(
+            wave_aligned_chunk(700, 300, 40, 100),
+            300,
+            "280 would end mid-row"
+        );
+        assert_eq!(
+            wave_aligned_chunk(700, 200, 40, 100),
+            200,
+            "200 is whole rows and whole waves"
+        );
     }
 }

@@ -13,10 +13,10 @@ use std::cell::{Cell, RefCell};
 use poot_codegen::{
     ArgSchema, CompiledKernel, KernelCode, NVPTX_COMPILE_ONLY_FIXTURES as COMPILE_ONLY,
 };
-use poot_ptx_runtime::PtxContext;
-use poot_runtime_common::DeviceBackend;
+use poot_ptx_runtime::{PtxBuffer, PtxContext, PtxError};
+use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::ArgAccess;
-use poot_target::{Backend, ElementKind, TargetId};
+use poot_target::{Backend, BufferStorage, ElementKind, TargetId};
 
 /// Wrap a poot-codegen-emitted `.ptx` file's text as a dispatchable [`CompiledKernel`] (card 608's
 /// sanctioned "imported kernel" escape hatch: this binary loads compiled `.ptx` text straight off disk,
@@ -296,6 +296,19 @@ fn run(
     run_inputs(ctx, dir, label, entry, &inputs, out_len, block, threads)
 }
 
+/// Upload host i32 as a weight buffer through the runtime's production storage-typed allocate-and-write path
+/// (the one the executor binds with), not a test-support helper.
+fn upload_i32(ctx: &PtxContext, data: &[i32]) -> Result<PtxBuffer, PtxError> {
+    let buffer = ctx.alloc_storage(BufferRole::Weight, BufferStorage::i32(), data.len())?;
+    ctx.write_with(&buffer, 0, data.len() * 4, &mut |range, out| {
+        let (slots, _) = out.as_chunks_mut::<4>();
+        for (slot, value) in slots.iter_mut().zip(&data[range.start / 4..range.end / 4]) {
+            *slot = value.to_le_bytes();
+        }
+    })?;
+    Ok(buffer)
+}
+
 /// Load `<dir>/<label>.ptx`, dispatch `entry` through the PtxContext with read-only `inputs` (uploaded as
 /// their own element kind) and one writable F32 output of `out_len` (allocated), and return the output. `label`
 /// names it for the profiler + the per-kernel device-time line.
@@ -316,7 +329,7 @@ fn run_inputs(
         .iter()
         .map(|input| match input {
             Input::F32(d) => ctx.upload_f32(d),
-            Input::I32(d) => ctx.upload_i32(d),
+            Input::I32(d) => upload_i32(ctx, d),
         })
         .collect::<Result<_, _>>()
         .expect("upload");

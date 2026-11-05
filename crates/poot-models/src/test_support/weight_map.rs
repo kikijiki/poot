@@ -406,8 +406,9 @@ pub fn trace(model: &dyn Model, map: &WeightMap, tokens: usize, capacity: usize)
     bind_packed_weights(&g, &WeightFormats::from_weight_map(map)).unwrap()
 }
 
-/// `g` compiled for `target`, single stage and single device, replayed.
-pub fn compile(g: &Graph, target: Target) -> StagedProgram {
+/// `g` compiled for `target` under `options`, on one device, replayed. A gather-only table is hosted, so the
+/// program may have a stage per host sync.
+pub fn compile(g: &Graph, target: Target, options: &CompileOptions) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),
@@ -415,9 +416,14 @@ pub fn compile(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
+        options,
     )
     .unwrap_or_else(|e| panic!("compile: {e}"))
+}
+
+/// The options every fixture run compiles with unless it states a buffer limit.
+pub fn standard_options() -> CompileOptions {
+    CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
 }
 
 /// The cache capacity every fixture step traces with.
@@ -434,8 +440,8 @@ pub struct Run {
 
 /// Load `store` bound through `map` on `exec`, then run `steps` in order over carried state (zero at
 /// the start), one entry per distinct token count, each traced over [`CAPACITY`].
-/// `prepare` rewrites each traced graph before it compiles (identity, or a legalize for a fixture
-/// cap). Returns each step's logits and the class of the programs it ran.
+/// `options` is what every entry compiles under (a fixture states a buffer limit through it). Returns each
+/// step's logits and the class of the programs it ran.
 pub fn run_steps(
     exec: &mut dyn Executor,
     target: Target,
@@ -443,7 +449,7 @@ pub fn run_steps(
     store: Arc<WeightStore>,
     map: Arc<WeightMap>,
     steps: &[Step],
-    prepare: &dyn Fn(Graph) -> Graph,
+    options: &CompileOptions,
 ) -> Result<Run, ExecError> {
     let exe = exec.load_weights(store, Arc::clone(&map))?;
     let mut entries = HashMap::new();
@@ -454,8 +460,8 @@ pub fn run_steps(
         let entry = match entries.get(&key) {
             Some(&entry) => entry,
             None => {
-                let g = prepare(trace(model, &map, step.ids.len(), CAPACITY));
-                let program = compile(&g, target);
+                let g = trace(model, &map, step.ids.len(), CAPACITY);
+                let program = compile(&g, target, options);
                 class = class.max(program.numerics_class());
                 let entry = exec.add_entry(exe, &program)?;
                 entries.insert(key, entry);
@@ -522,16 +528,64 @@ pub fn check_matches_oracle(
 ) {
     let m = qwen2(DIMS, projections, DType::BF16);
     let steps = [Step::new(&[3, 1, 4], 0), Step::new(&[1], 3)];
+    assert_run_matches_oracle(
+        exec,
+        target,
+        &m,
+        &steps,
+        oracle,
+        bind,
+        &format!("{projections:?}"),
+    );
+}
+
+/// POOT-1423: a model with an F32 embedding table (a hosted gather's rows are an F32 slot, a different lane
+/// from the BF16 one [`check_matches_oracle`] covers) on a vocabulary wide enough to name ids past the first
+/// rows: every step's logits equal the oracle's. The sole-reader table is hosted, so it is bound host-side
+/// here, never as a device gather.
+pub fn check_f32_embed_matches_oracle(
+    exec: &mut dyn Executor,
+    target: Target,
+    oracle: &MappedOracle<'_>,
+) {
+    let m = qwen2(
+        Qwen2Dims { vocab: 256, ..DIMS },
+        Projections::Bf16,
+        DType::F32,
+    );
+    let steps = [Step::new(&[200, 1, 77], 0), Step::new(&[255], 3)];
+    assert_run_matches_oracle(
+        exec,
+        target,
+        &m,
+        &steps,
+        oracle,
+        &|map, _| map.clone(),
+        "f32 embed",
+    );
+}
+
+/// `steps` through the driver over `m` (its map rebound by `bind`), each step's logits equal to the oracle's
+/// on the same graph, state carried.
+fn assert_run_matches_oracle(
+    exec: &mut dyn Executor,
+    target: Target,
+    m: &MappedModel,
+    steps: &[Step],
+    oracle: &MappedOracle<'_>,
+    bind: &dyn Fn(&WeightMap, &WeightStore) -> WeightMap,
+    label: &str,
+) {
     let got = run_steps(
         exec,
         target,
         m.model.as_ref(),
         Arc::clone(&m.store),
         Arc::new(bind(&m.map, &m.store)),
-        &steps,
-        &|g| g,
+        steps,
+        &standard_options(),
     )
-    .unwrap_or_else(|e| panic!("{projections:?}: {e}"));
+    .unwrap_or_else(|e| panic!("{label}: {e}"));
     let got_class = got.class;
     let mut state: Vec<HostTensor> = Vec::new();
     for (step, got) in steps.iter().zip(&got.logits) {
@@ -550,7 +604,7 @@ pub fn check_matches_oracle(
             got,
             want.as_f32().expect("f32 logits"),
             got_class.tolerance(),
-            &format!("{projections:?} at {}", step.start),
+            &format!("{label} at {}", step.start),
         );
     }
 }
@@ -576,7 +630,7 @@ pub fn check_chunked_prefill(exec: &mut dyn Executor, target: Target) {
             Arc::clone(&m.store),
             Arc::clone(&m.map),
             steps,
-            &|g| g,
+            &standard_options(),
         )
         .unwrap();
         (token_rows(&logits.logits, DIMS.vocab), logits.class)
@@ -605,8 +659,16 @@ pub fn check_fused_views(exec: &mut dyn Executor, target: Target, projections: P
     let (store, map) = fused(&m);
     let steps = [Step::new(&[3, 1, 4], 0), Step::new(&[1], 3)];
     let run = |exec: &mut dyn Executor, store, map| {
-        run_steps(exec, target, m.model.as_ref(), store, map, &steps, &|g| g)
-            .unwrap_or_else(|e| panic!("{projections:?}: {e}"))
+        run_steps(
+            exec,
+            target,
+            m.model.as_ref(),
+            store,
+            map,
+            &steps,
+            &standard_options(),
+        )
+        .unwrap_or_else(|e| panic!("{projections:?}: {e}"))
     };
     let separate = run(exec, Arc::clone(&m.store), Arc::clone(&m.map));
     let viewed = run(exec, store, map);
@@ -617,6 +679,143 @@ pub fn check_fused_views(exec: &mut dyn Executor, target: Target, projections: P
             got == want,
             "{projections:?} step {step}: the viewed store's logits differ from separate storage"
         );
+    }
+}
+
+/// POOT-1423 SC-005: the hosted gathers on a real device. A dense F32 table and a packed Q8_0 table, each gathered
+/// by the step's token (rows copied at bind time) and by an index the device computes (`token + 1`, rows copied at
+/// a host sync), run through the production `load_weights`/`add_entry`/`step` path and give the CPU oracle's output
+/// on the same unhosted graph. Every case must really be hosted: one hosted site, and one host sync exactly for the
+/// device-indexed ones.
+pub fn check_hosted_gathers(exec: &mut dyn Executor, target: Target, oracle: &MappedOracle<'_>) {
+    use poot_graph_ir::{
+        BinOp, Builder, Scalar, TensorType, Traced, WeightRef, packed_source_type,
+    };
+    use poot_quant::PackedWeight;
+
+    const ROWS: usize = 40;
+    const WIDTH: usize = 64;
+    const IDS: [i32; 4] = [37, 0, 5, 12];
+    let embed = poot_weights::WeightId::model(WeightRole::Embed);
+    let head = poot_weights::WeightId::model(WeightRole::Head);
+    let mut store = WeightStore::builder();
+    store
+        .insert(
+            "dense",
+            dense(DType::F32, vec![ROWS, WIDTH], &random(ROWS * WIDTH, 11)),
+        )
+        .unwrap();
+    store
+        .insert(
+            "packed",
+            WeightEntry::Packed(Arc::new(poot_quant::test_support::packed::random_payload(
+                WeightFormat::Q8_0,
+                [ROWS, WIDTH],
+                12,
+            ))),
+        )
+        .unwrap();
+    let store = Arc::new(store.build());
+    let mut map = WeightMap::builder(&store);
+    map.map(embed, WeightView::Stored(WeightKey::from("dense")))
+        .unwrap();
+    map.map(head, WeightView::Stored(WeightKey::from("packed")))
+        .unwrap();
+    let map = Arc::new(map.build());
+
+    let mut tolerance = None;
+    for (label, packed, device_indexed) in [
+        ("dense, bind time", false, false),
+        ("packed, bind time", true, false),
+        ("dense, sync time", false, true),
+        ("packed, sync time", true, true),
+    ] {
+        let b = Builder::for_tests();
+        let token = b
+            .slot(Slot::Token, TensorType::new(vec![IDS.len()], DType::I32))
+            .unwrap();
+        let ids = if device_indexed {
+            b.binary_scalar(BinOp::Add, token, Scalar::I32(1)).unwrap()
+        } else {
+            token
+        };
+        let table: Traced = if packed {
+            let descriptor = PackedWeight::try_new(WeightFormat::Q8_0, [ROWS, WIDTH]).unwrap();
+            let sources: Vec<Traced> = descriptor
+                .sources()
+                .into_iter()
+                .map(|role| {
+                    b.weight(
+                        WeightRef::whole(head).with_source(role),
+                        packed_source_type(descriptor, role),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            b.packed_dequant(&sources, descriptor).unwrap()
+        } else {
+            b.weight(WeightRef::whole(embed), TensorType::f32(vec![ROWS, WIDTH]))
+                .unwrap()
+        };
+        let rows = b.gather(table, 0, ids).unwrap();
+        let out = b.binary_scalar(BinOp::Mul, rows, Scalar::F32(2.0)).unwrap();
+        let g = b.finish(out).unwrap();
+
+        let program = compile(&g, target, &standard_options());
+        assert_eq!(program.hosted().len(), 1, "{label}: the table is hosted");
+        assert_eq!(
+            program.sync_points().len(),
+            usize::from(device_indexed),
+            "{label}: one host sync exactly when the device computes the ids"
+        );
+        tolerance = Some(
+            tolerance
+                .unwrap_or(Tier2Class::BitExact)
+                .max(program.numerics_class()),
+        );
+        let exe = exec
+            .load_weights(Arc::clone(&store), Arc::clone(&map))
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let entry = exec
+            .add_entry(exe, &program)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let bytes: Vec<u8> = IDS.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let shape = [IDS.len()];
+        let mut inputs = StepInputs::new();
+        inputs.push(
+            SlotKey::new(Slot::Token, None),
+            &shape,
+            HostView::new(DType::I32, IDS.len(), &bytes).unwrap(),
+        );
+        let before = exec.stats();
+        let got = exec
+            .step(exe, entry, &inputs, &mut NoSync)
+            .unwrap_or_else(|e| panic!("{label}: {e}"))
+            .to_host()
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let after = exec.stats();
+        assert_eq!(
+            after.hosted_rows - before.hosted_rows,
+            IDS.len() as u64,
+            "{label}: rows copied"
+        );
+        assert_eq!(
+            after.syncs - before.syncs,
+            u64::from(device_indexed),
+            "{label}: host syncs run"
+        );
+        let slots = [(
+            SlotKey::new(Slot::Token, None),
+            HostTensor::i32(vec![IDS.len()], IDS.to_vec()),
+        )];
+        let (want, _) = oracle(&g, &store, &map, &slots, &[]);
+        assert_close_scaled(
+            got.as_f32().expect("f32 rows"),
+            want.as_f32().expect("f32 rows"),
+            tolerance.expect("set above").tolerance(),
+            label,
+        );
+        exec.unload(exe).unwrap();
     }
 }
 
@@ -633,40 +832,39 @@ pub fn check_split_head(exec: &mut dyn Executor, target: Target) {
     // An F32 embedding: its hosted rows are an F32 slot, so no kernel computes in bf16 on the embed path.
     let m = qwen2(DIMS, Projections::Bf16, DType::F32);
     let steps = [Step::new(&[3, 1, 4], 0), Step::new(&[1], 3)];
-    let Target::Gpu { backend, mut caps } = target else {
-        panic!("the split-head check legalizes against GPU limits; {target:?} has none");
+    let capped = CompileOptions {
+        buffer_limit: std::num::NonZeroU64::new(SPLIT_LIMIT),
+        ..standard_options()
     };
-    caps.max_buffer_bytes = SPLIT_LIMIT;
-    let split = |g: Graph| {
-        let g = poot_graph_plan::legalize(
-            &g,
-            backend,
-            &caps,
-            &poot_graph_plan::CompileLimits::STANDARD,
-        )
-        .unwrap_or_else(|e| panic!("legalize under a {SPLIT_LIMIT}-byte limit: {e}"));
-        let head_chunks = g
-            .consts()
-            .iter()
-            .filter(|&&id| {
-                g.meta(id)
-                    .name()
-                    .as_deref()
-                    .is_some_and(|n| n.starts_with("w.head.chunk"))
-            })
-            .count();
-        assert!(head_chunks >= 2, "the head splits ({head_chunks} chunks)");
-        for &id in g.consts() {
-            let bytes = g.aval(id).numel() * g.aval(id).dtype.byte_size();
-            assert!(
-                bytes as u64 <= SPLIT_LIMIT,
-                "{:?} ({bytes} bytes) fits the limit",
-                g.meta(id).name()
-            );
-        }
-        g
-    };
-    let run = |exec: &mut dyn Executor, prepare: &dyn Fn(_) -> _| {
+    // The program the limit makes: the head split into chunks that each fit, the embed table hosted.
+    let program = compile(
+        &trace(m.model.as_ref(), &m.map, 1, CAPACITY),
+        target,
+        &capped,
+    );
+    let (_, _, stage) = program.stages().next().expect("one stage");
+    let g = stage.graph();
+    let head_chunks = g
+        .consts()
+        .iter()
+        .filter(|&&id| {
+            g.meta(id)
+                .name()
+                .as_deref()
+                .is_some_and(|n| n.starts_with("w.head.chunk"))
+        })
+        .count();
+    assert!(head_chunks >= 2, "the head splits ({head_chunks} chunks)");
+    for &id in g.consts() {
+        let bytes = g.aval(id).numel() * g.aval(id).dtype.byte_size();
+        assert!(
+            bytes as u64 <= SPLIT_LIMIT,
+            "{:?} ({bytes} bytes) fits the limit",
+            g.meta(id).name()
+        );
+    }
+    assert_eq!(program.hosted().len(), 1, "the embed table is hosted");
+    let run = |exec: &mut dyn Executor, options: &CompileOptions| {
         run_steps(
             exec,
             target,
@@ -674,12 +872,12 @@ pub fn check_split_head(exec: &mut dyn Executor, target: Target) {
             Arc::clone(&m.store),
             Arc::clone(&m.map),
             &steps,
-            prepare,
+            options,
         )
         .unwrap_or_else(|e| panic!("{e}"))
     };
-    let whole = run(exec, &|g| g);
-    let chunked = run(exec, &split);
+    let whole = run(exec, &standard_options());
+    let chunked = run(exec, &capped);
     let greedy = |logits: &[f32]| {
         logits
             .chunks(DIMS.vocab)
@@ -748,7 +946,7 @@ pub fn check_tied_head(exec: &mut dyn Executor, target: Target, oracle: &MappedO
     let exe = exec
         .load_weights(Arc::clone(&store), Arc::clone(&map))
         .unwrap();
-    let program = compile(&g, target);
+    let program = compile(&g, target, &standard_options());
     let entry = exec.add_entry(exe, &program).unwrap();
     let mut state: Vec<HostTensor> = g
         .state()
