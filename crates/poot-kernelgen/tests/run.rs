@@ -129,7 +129,6 @@ fn attention_spec(
         mask,
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
-        query: kg::AttentionQueryScale::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes },
         precision: poot_graph_ir::OperandPrecision::Exact,
     }

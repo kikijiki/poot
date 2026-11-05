@@ -13,7 +13,7 @@ use crate::error::BuilderError;
 use crate::graph::{Graph, Operand, ValueId};
 use crate::op::{
     ContractionHead, ContractionRows, FusedOperand, FusedRegion, KeyLayout, KvBound, MaskOperand,
-    OpKind, QueryScale, RowRegion, RowStep, ScanFamily, SinkOperand,
+    OpKind, RowRegion, RowStep, ScanFamily, SinkOperand,
 };
 use crate::ops;
 use crate::packed_source::packed_source_constants;
@@ -92,9 +92,6 @@ pub fn decompose(
             let Some((&[q, k, v, mask], extra)) = inputs.split_first_chunk::<4>() else {
                 return Ok(None);
             };
-            let Some((extra, query_scale)) = query_scale_operand(attrs.query, extra) else {
-                return Ok(None);
-            };
             let (extra, sinks) = match (attrs.sink, extra.split_last()) {
                 (SinkOperand::Absent, _) => (extra, None),
                 (SinkOperand::PerHead, Some((&sinks, rest))) => (rest, Some(sinks)),
@@ -147,7 +144,6 @@ pub fn decompose(
                 attrs.softcap,
                 len,
                 sinks,
-                query_scale,
                 attrs.precision,
             )?
         }
@@ -160,10 +156,7 @@ pub fn decompose(
             ops::rope_partial(&b, x, cos, sin, shape[last], *rot, last)?
         }
         OpKind::SelectedAttention(attrs) => {
-            let Some((&[q, k, v, ids, pos], extra)) = inputs.split_first_chunk::<5>() else {
-                return Ok(None);
-            };
-            let Some((&[], query_scale)) = query_scale_operand(attrs.query, extra) else {
+            let &[q, k, v, ids, pos] = inputs.as_slice() else {
                 return Ok(None);
             };
             let dtype = operands[0].dtype;
@@ -178,7 +171,6 @@ pub fn decompose(
                 attrs.scale,
                 attrs.softcap,
                 attrs.ratio,
-                query_scale,
                 attrs.precision,
             )?
         }
@@ -295,18 +287,6 @@ pub fn decompose(
         operands: inputs.iter().map(|input| input.id()).collect(),
         graph: b.finish(result)?,
     }))
-}
-
-/// An attention's operands after its fixed ones split into the rest and the per-row query scale, the last operand
-/// under [`QueryScale::PerRow`]; `None` when that operand is missing.
-fn query_scale_operand(query: QueryScale, extra: &[Traced]) -> Option<(&[Traced], Option<Traced>)> {
-    match query {
-        QueryScale::Absent => Some((extra, None)),
-        QueryScale::PerRow => {
-            let (&scale, rest) = extra.split_last()?;
-            Some((rest, Some(scale)))
-        }
-    }
 }
 
 /// An attention key or value read as the query's `dtype`: a `Cast` of one stored narrower (a two-byte KV
@@ -945,7 +925,6 @@ pub(crate) mod tests {
                     softcap: None,
                     ratio: 2,
                     k: 2,
-                    query: QueryScale::Absent,
                     precision: crate::precision::OperandPrecision::Exact,
                 }),
                 vec![

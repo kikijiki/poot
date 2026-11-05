@@ -114,8 +114,7 @@ pub fn selected_block_mask(
 
 /// The output `[B, Hq, Lq, Dv]` of `OpKind::SelectedAttention` over `q`, `k`, `v`, `ids` and `pos`: dense attention
 /// under [`selected_block_mask`]. Quadratic in nothing but `Lk`, so a long context costs the oracle a dense
-/// attention and one `[B, Lq, K, blocks]` indicator. `query_scale` is the per-row scale `q` was divided by
-/// ([`crate::QueryScale::PerRow`], as for dense attention).
+/// attention and one `[B, Lq, K, blocks]` indicator.
 #[expect(clippy::too_many_arguments)]
 pub fn selected_attention(
     b: &Builder,
@@ -128,7 +127,6 @@ pub fn selected_attention(
     scale: f32,
     softcap: Option<f32>,
     ratio: usize,
-    query_scale: Option<Traced>,
     precision: OperandPrecision,
 ) -> Result<Traced, BuilderError> {
     let lk = b.aval(k)?.shape[2];
@@ -144,7 +142,6 @@ pub fn selected_attention(
         softcap,
         None,
         None,
-        query_scale,
         precision,
     )
 }

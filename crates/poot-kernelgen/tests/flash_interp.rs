@@ -36,7 +36,6 @@ fn spec(
         mask: kg::MaskKind::Broadcast,
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
-        query: kg::AttentionQueryScale::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes: 4 },
         precision: poot_graph_ir::OperandPrecision::Exact,
     }
@@ -78,8 +77,6 @@ struct Operands {
     sinks: Option<Vec<f32>>,
     /// The `[B, Lq]` query positions of a causal mask, which the kernel reads in the mask's place.
     positions: Option<Vec<i32>>,
-    /// The `[B, Hq, Lq]` query scale of each row, which the kernel's query was divided by.
-    query_scales: Option<Vec<f32>>,
 }
 
 impl Operands {
@@ -102,24 +99,6 @@ impl Operands {
             read: None,
             sinks: None,
             positions: None,
-            query_scales: None,
-        }
-    }
-
-    /// These operands with the query of each row divided by its scale `scales[row]`, the scale passed beside
-    /// it ([`kg::AttentionQueryScale::PerRow`]). The kernel multiplies the row's products back, so it computes
-    /// the reference of the undivided query: the scales are powers of two, which divide and multiply exactly.
-    fn with_query_scales(self, spec: &kg::AttentionSpec, scales: Vec<f32>) -> Self {
-        let q = self
-            .q
-            .chunks(spec.dk)
-            .zip(&scales)
-            .flat_map(|(row, &s)| row.iter().map(move |&x| x / s))
-            .collect();
-        Self {
-            q,
-            query_scales: Some(scales),
-            ..self
         }
     }
 
@@ -182,7 +161,6 @@ impl Operands {
         buffers.extend(self.read.as_deref().map(Buffer::from_i32s));
         buffers.extend(self.len.as_deref().map(Buffer::from_i32s));
         buffers.extend(self.sinks.as_deref().map(Buffer::from_f32s));
-        buffers.extend(self.query_scales.as_deref().map(Buffer::from_f32s));
         buffers
     }
 
@@ -1294,66 +1272,6 @@ fn a_tiled_prefill_matches_the_reference_and_the_streaming_kernel() {
     let operands = Operands::new(&per_head, mask);
     let got = interpret(&small_tiled(per_head.clone()), &caps(), &operands);
     assert_close(&got, &operands.reference(&per_head), TILED_TOLERANCE);
-}
-
-/// POOT-1455: a query divided by a per-row scale, the scale passed as the `PerRow` parameter, computes the reference
-/// of the undivided query on every schedule: streaming (prefill and decode), split-KV decode and tiled prefill. Each
-/// row has its own power-of-two scale (1 to 8), so a kernel that reads one row's scale for another, or none, scores
-/// the row's keys at the wrong temperature.
-///
-/// Mutation: in `emit_score`, ignore `row_scale` (`dot` unscaled); every row whose scale is not 1 goes red on every
-/// schedule.
-#[test]
-fn a_row_scaled_query_scores_as_the_undivided_query_on_every_schedule() {
-    let scaled = |spec: kg::AttentionSpec| kg::AttentionSpec {
-        query: kg::AttentionQueryScale::PerRow,
-        ..spec
-    };
-    let scales = |spec: &kg::AttentionSpec| -> Vec<f32> {
-        (0..spec.rows())
-            .map(|row| (1u32 << (row % 4)) as f32)
-            .collect()
-    };
-    let check = |name: &str, spec: kg::AttentionSpec, operands: Operands, split: bool| {
-        let want = operands.reference(&spec);
-        let spec = scaled(spec);
-        let row_scales = scales(&spec);
-        assert!(row_scales.iter().any(|&s| s != 1.0));
-        let operands = operands.with_query_scales(&spec, row_scales);
-        let got = if split {
-            interpret_split(&spec, &caps(), &operands, f32::NAN).0
-        } else {
-            interpret(&spec, &caps(), &operands)
-        };
-        let error = max_abs_error(&got, &want);
-        assert!(
-            error <= TILED_TOLERANCE,
-            "{name}: worst absolute error {error} against the undivided query's reference"
-        );
-    };
-    let prefill = spec(2, 4, 2, 6, 6, 8);
-    let prefill_operands = || Operands::new(&prefill, additive_mask(2, 6, 6, None));
-    let decode = with_lanes(spec(2, 3, 1, 1, 41, 8), 4);
-    let decode_operands = || Operands::new(&decode, additive_mask(2, 1, 41, Some(&[33, 41])));
-    check(
-        "tiled prefill",
-        small_tiled(prefill.clone()),
-        prefill_operands(),
-        false,
-    );
-    check(
-        "split-kv decode",
-        with_splits(decode.clone(), 4, 4),
-        decode_operands(),
-        true,
-    );
-    check(
-        "streaming prefill",
-        prefill.clone(),
-        prefill_operands(),
-        false,
-    );
-    check("streaming decode", decode.clone(), decode_operands(), false);
 }
 
 /// Other tilings of one causal prefill: one head per key/value head (MHA, 8 positions per block), wide key

@@ -5207,7 +5207,6 @@ fn selected_attention_planned(
             softcap: None,
             ratio: 4,
             k: 512,
-            query: poot_graph_ir::QueryScale::Absent,
             precision: poot_graph_ir::OperandPrecision::Exact,
         },
         [q, k, v, ids, pos],

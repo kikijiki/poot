@@ -1,7 +1,8 @@
 //! POOT-1456: a norm, its per-row scale and the narrowed projections that read the scaled activation, as one row
 //! kernel with a side output, against the same block planned without it.
 //!
-//! The block is the row-scaled guard of POOT-1454 design.md section 4.1: `h = rmsnorm(x)`,
+//! The block is the row scale of POOT-1454 design.md section 4.1, built by hand (the narrow policy emits no scale,
+//! POOT-1474): `h = rmsnorm(x)`,
 //! `s = max(rowmax(|h|) / limit, 1)`, `y_i = ((h / s) W_i^T) * s`, summed. `compile` fuses the norm, the absmax,
 //! the scale and the divide into one row region that writes `h / s` and `s` (its side output), and each
 //! projection's epilogue multiplies by `s`. The reference reads `h` for the scale through two transposes, which no
@@ -154,8 +155,6 @@ pub fn run_fused_against_reference(
         let (fused_launches, fused_sides) = launches_and_side_outputs(exec, target, fused, policy);
         let (reference_launches, reference_sides) =
             launches_and_side_outputs(exec, target, reference, policy);
-        // Under an f16 narrow policy the planner's range guard (POOT-1457) scales both blocks' activations again, in
-        // a row region of its own with its scale as a side output; the fused block still writes one more.
         if fused_sides <= reference_sides {
             return Err(format!(
                 "{}: {fused_sides} side outputs fused, {reference_sides} in the reference",

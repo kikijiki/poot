@@ -30,7 +30,6 @@
 
 pub mod alibi;
 pub mod attention;
-pub mod attention_f16_range;
 pub mod bf16_cast;
 pub mod block_top_k;
 pub mod capture;
@@ -39,7 +38,7 @@ pub mod coresident;
 pub mod device_sampling;
 pub mod dispatch_length;
 pub mod echo;
-pub mod f16_range_guard;
+pub mod f16_range;
 pub mod float_ne;
 pub mod gdn;
 pub mod i32_gather;

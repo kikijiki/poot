@@ -9,8 +9,8 @@ use poot_codegen::{Target, artifact_path};
 use poot_target::{AmdArch, BufferStorage, DeviceCaps};
 
 use crate::attention::{
-    AttentionMicro, AttentionQueryScale, AttentionSchedule, AttentionSink, AttentionSpec, KeyBound,
-    KeyLayout, LaneTile, MaskKind, QOperand, ScoreTransform, WaveTile, attention_body,
+    AttentionMicro, AttentionSchedule, AttentionSink, AttentionSpec, KeyBound, KeyLayout, LaneTile,
+    MaskKind, QOperand, ScoreTransform, WaveTile, attention_body,
 };
 use crate::contraction::{
     DenseTiledWeight, RegisterTiling, TiledExtents, TiledShape, dense_tiled_contraction,
@@ -99,7 +99,6 @@ fn tiled_spec(br: usize, bc: usize, score: (usize, usize), out: (usize, usize)) 
         mask: MaskKind::Causal { window: None },
         bound: KeyBound::Static,
         sink: AttentionSink::Absent,
-        query: AttentionQueryScale::Absent,
         schedule: AttentionSchedule::Tiled {
             br,
             bc,

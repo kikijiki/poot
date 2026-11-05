@@ -47,9 +47,9 @@ use poot_kernel_ir::{
 };
 
 use super::{
-    AttentionMicro, AttentionQueryScale, AttentionSchedule, AttentionSink, AttentionSpec,
-    GENERATOR, KeyBound, KeyLayout, KvLane, LaneTile, MaskKind, QOperand, WaveTile, count,
-    count_to, emit_score, f32_array, f32c, local_op,
+    AttentionMicro, AttentionSchedule, AttentionSink, AttentionSpec, GENERATOR, KeyBound,
+    KeyLayout, KvLane, LaneTile, MaskKind, QOperand, WaveTile, count, count_to, emit_score,
+    f32_array, f32c, local_op,
 };
 use crate::KernelGenError;
 use crate::data_movement::Cfg;
@@ -718,7 +718,6 @@ pub(super) fn tiled_body(
         mask: mask_kind,
         bound,
         sink,
-        query,
         schedule: _,
         kv,
         precision,
@@ -775,10 +774,6 @@ pub(super) fn tiled_body(
     let sinks = match sink {
         AttentionSink::PerHead => Some(next_param(ld(slice_f32(false), false))),
         AttentionSink::Absent => None,
-    };
-    let query_scales = match query {
-        AttentionQueryScale::PerRow => Some(next_param(ld(slice_f32(false), false))),
-        AttentionQueryScale::Absent => None,
     };
     let out = next_param(ld(slice_f32(true), true));
     let (q, k, v, mask) = (
@@ -932,20 +927,6 @@ pub(super) fn tiled_body(
             })),
             MaskKind::Causal { .. } | MaskKind::Blocks { .. } => None,
         };
-        // The score rows' query scales, read once for the whole key walk.
-        let row_scales = query_scales.map(|scales| {
-            c.emit(|e| {
-                gs.row_values(e, |e, r| {
-                    let h = tile.head(e, r);
-                    let i = tile.clamped_query(e, r);
-                    let row = tile.flat(e, h, i);
-                    e.let_(
-                        Ty::F32,
-                        Rvalue::Use(crate::helpers::copy(elem(scales, row))),
-                    )
-                })
-            })
-        });
 
         let mut acc_o = c.emit(|e| {
             let mut acc = out_grid.micro.accumulator(e.parts().0);
@@ -1053,14 +1034,7 @@ pub(super) fn tiled_body(
             }
             let mut s = c.emit(|e| {
                 let mut s = score_grid.micro.elements(e, &gs, acc_s, scratch);
-                match &row_scales {
-                    Some(scales) => {
-                        s.map_rows(e, scales, |e, _, scale, dot| {
-                            emit_score(e, score, Some(scale), dot)
-                        });
-                    }
-                    None => s.map(e, |e, _, dot| emit_score(e, score, None, dot)),
-                }
+                s.map(e, |e, _, dot| emit_score(e, score, dot));
                 if let Some(mask_rows) = &mask_rows {
                     s.map_rows(e, mask_rows, |e, coord, row, value| {
                         let t = uu(e, BinOp::Add, k0, coord.col);

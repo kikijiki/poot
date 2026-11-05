@@ -400,8 +400,9 @@ gate_rows! {
 }
 
 gate_rows! {
-    // The contraction dtype on ROCm: f16 (POOT-1458), its activations row-scaled (POOT-1457; in range the scale is
-    // exactly 1, so the shifts are the unguarded f16 program's), its bf16 weights rounded to f16 once at bind.
+    // The contraction dtype on ROCm: f16 (POOT-1458), its activations unscaled (POOT-1474; every scale of the
+    // retired range guards was 1 on these texts, so the shifts equal the guarded program's), its bf16 weights
+    // rounded to f16 once at bind.
     rocm_f16, BackendChoice::Rocm, DeviceBackend::Rocm, None, FragmentDtype::F16;
     qwen3_0_6b => "qwen3-0.6b", 0.0331,
     qwen3_4b => "qwen3-4b", 0.0326,

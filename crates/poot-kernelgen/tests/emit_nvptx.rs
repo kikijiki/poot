@@ -41,7 +41,6 @@ fn attention_decode_body() -> poot_kernel_ir::Body {
         mask: kg::MaskKind::Broadcast,
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
-        query: kg::AttentionQueryScale::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes: 4 },
         precision: poot_graph_ir::OperandPrecision::Exact,
     };

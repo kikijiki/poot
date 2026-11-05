@@ -1009,8 +1009,7 @@ impl ContractionHead {
 /// `mask`, `key` and `bound` name the operand conventions the kernels read. A variant added to one is a new case
 /// every consumer matches, never a flag on the others. The operand list is `[q, k, v, mask]`, then the shared key
 /// part when `key` is [`KeyLayout::Split`] or the slot map `read` when it is [`KeyLayout::Paged`], then `len`
-/// when `bound` is [`KvBound::Live`], then the per-head `sinks [Hq]` when `sink` is [`SinkOperand::PerHead`], then
-/// the per-row query scale `[B,Hq,Lq,1]` when `query` is [`QueryScale::PerRow`].
+/// when `bound` is [`KvBound::Live`], then the per-head `sinks [Hq]` when `sink` is [`SinkOperand::PerHead`].
 #[derive(Clone, PartialEq, Debug)]
 pub struct AttentionAttrs {
     /// Query heads per key/value head (`Hq / Hkv`).
@@ -1028,8 +1027,6 @@ pub struct AttentionAttrs {
     pub bound: KvBound,
     /// Whether the softmax carries a learned per-head sink logit.
     pub sink: SinkOperand,
-    /// Whether the query arrives divided by a per-row scale the scores multiply back.
-    pub query: QueryScale,
     /// How Q, K, V and the probabilities P enter the two products: P is rounded where it enters `P V`.
     pub precision: OperandPrecision,
 }
@@ -1046,25 +1043,9 @@ impl AttentionAttrs {
             key: KeyLayout::Single,
             bound: KvBound::Capacity,
             sink: SinkOperand::Absent,
-            query: QueryScale::Absent,
             precision: OperandPrecision::Exact,
         }
     }
-}
-
-/// Whether an attention's query ([`AttentionAttrs`], [`SelectedAttentionAttrs`]) arrives divided by a per-row
-/// scale (POOT-1455). The narrow policy writes [`Self::PerRow`] where it rounds the query to f16, with
-/// `s = max(rowmax(|q|) / 65504, 1)`: the rounding of `q / s` cannot overflow, and a row in f16's range has `s`
-/// exactly 1, so it computes bit for bit what it would without the scale
-/// (`receipts/1455-attention-f16-range/design.md`).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum QueryScale {
-    /// The query is read as it is.
-    Absent,
-    /// The last operand, `[B,Hq,Lq,1]` in the query's dtype, holds each query row's scale `s`. The query operand
-    /// is the query divided by it, and each raw `Q K^T` product of the row is multiplied by `s` before the score
-    /// scale: `score = ((q / s) . k) * s * scale`.
-    PerRow,
 }
 
 /// Whether [`AttentionAttrs`]'s softmax includes a sink: one position-independent logit per query head that
@@ -2820,15 +2801,15 @@ impl OpKind {
             ),
             OpKind::SideOutput { index, ty } => format!("side_output {index} {ty:?}"),
             OpKind::Attention(a) => format!(
-                "attention n_rep={} scale={} softcap={:?} mask={:?} key={:?} bound={:?} sink={:?} query={:?}",
-                a.n_rep, a.scale, a.softcap, a.mask, a.key, a.bound, a.sink, a.query
+                "attention n_rep={} scale={} softcap={:?} mask={:?} key={:?} bound={:?} sink={:?}",
+                a.n_rep, a.scale, a.softcap, a.mask, a.key, a.bound, a.sink
             ),
             OpKind::Rope { rot } => format!("rope rot={rot}"),
             OpKind::Scan(attrs) => format!("scan {} chunk={}", attrs.family.name(), attrs.chunk),
             OpKind::BlockTopK(attrs) => format!("block_top_k ratio={} k={}", attrs.ratio, attrs.k),
             OpKind::SelectedAttention(a) => format!(
-                "selected_attention n_rep={} scale={} softcap={:?} ratio={} k={} query={:?}",
-                a.n_rep, a.scale, a.softcap, a.ratio, a.k, a.query
+                "selected_attention n_rep={} scale={} softcap={:?} ratio={} k={}",
+                a.n_rep, a.scale, a.softcap, a.ratio, a.k
             ),
             OpKind::AllReduce { op, axis } => {
                 format!("all_reduce.{} ax={axis}", format!("{op:?}").to_lowercase())
@@ -2874,20 +2855,15 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
     let paged = matches!(attrs.key, KeyLayout::Paged);
     let live = matches!(attrs.bound, KvBound::Live);
     let sink = matches!(attrs.sink, SinkOperand::PerHead);
-    let scaled = matches!(attrs.query, QueryScale::PerRow);
     arity(
         ins,
-        4 + usize::from(split || paged)
-            + usize::from(live)
-            + usize::from(sink)
-            + usize::from(scaled),
+        4 + usize::from(split || paged) + usize::from(live) + usize::from(sink),
     )?;
     let (q, k, v, mask) = (&ins[0], &ins[1], &ins[2], &ins[3]);
     let shared = split.then(|| &ins[4]);
     let read = paged.then(|| &ins[4]);
-    let len = live.then(|| &ins[ins.len() - 1 - usize::from(sink) - usize::from(scaled)]);
-    let sinks = sink.then(|| &ins[ins.len() - 1 - usize::from(scaled)]);
-    let query_scale = scaled.then(|| &ins[ins.len() - 1]);
+    let len = live.then(|| &ins[ins.len() - 1 - usize::from(sink)]);
+    let sinks = sink.then(|| &ins[ins.len() - 1]);
     // Float operands only: the decomposition's softmax (`Exp`, `Div`) does not type over I32.
     if q.dtype.class() != DTypeClass::Arithmetic {
         return Err(ShapeError::DtypeOp {
@@ -3102,34 +3078,7 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
             actual: sinks.shape.clone(),
         });
     }
-    check_query_scale(query_scale, q, [bsz, hq, lq])?;
     Ok(TensorType::new(vec![bsz, hq, lq, dv], q.dtype))
-}
-
-/// A [`QueryScale::PerRow`] operand is one scale per query row, `[B,Hq,Lq,1]`, in the query's dtype.
-fn check_query_scale(
-    scale: Option<&TensorType>,
-    q: &TensorType,
-    [bsz, hq, lq]: [usize; 3],
-) -> Result<(), ShapeError> {
-    let Some(scale) = scale else {
-        return Ok(());
-    };
-    if scale.dtype != q.dtype {
-        return Err(ShapeError::AttentionDtype {
-            operand: "query_scale",
-            expected: q.dtype,
-            actual: scale.dtype,
-        });
-    }
-    if scale.shape != [bsz, hq, lq, 1] {
-        return Err(ShapeError::AttentionOperand {
-            operand: "query_scale",
-            expected: vec![bsz, hq, lq, 1],
-            actual: scale.shape.clone(),
-        });
-    }
-    Ok(())
 }
 
 /// The recurrence a [`OpKind::Scan`] computes.
@@ -3316,8 +3265,6 @@ pub struct SelectedAttentionAttrs {
     pub ratio: usize,
     /// The blocks each query reads: the width of the `ids` operand.
     pub k: usize,
-    /// Whether the query arrives divided by a per-row scale, the operand after `pos`.
-    pub query: QueryScale,
     /// How Q, K, V and the probabilities enter the two products.
     pub precision: OperandPrecision,
 }
@@ -3340,11 +3287,9 @@ pub struct SelectedAttentionLayout {
 }
 
 impl SelectedAttentionAttrs {
-    /// The layout `ins` (`[q, k, v, ids, pos]`, then the query scale under [`QueryScale::PerRow`]) imply, or the
-    /// typing error.
+    /// The layout `ins` (`[q, k, v, ids, pos]`) imply, or the typing error.
     pub fn layout(&self, ins: &[TensorType]) -> Result<SelectedAttentionLayout, ShapeError> {
-        let scaled = matches!(self.query, QueryScale::PerRow);
-        arity(ins, 5 + usize::from(scaled))?;
+        arity(ins, 5)?;
         let (q, k, v, ids, pos) = (&ins[0], &ins[1], &ins[2], &ins[3], &ins[4]);
         if self.ratio == 0 || self.k == 0 {
             return Err(ShapeError::SelectedAttention {
@@ -3435,7 +3380,6 @@ impl SelectedAttentionAttrs {
                 actual: pos.shape.clone(),
             });
         }
-        check_query_scale(scaled.then(|| &ins[5]), q, [batch, hq, lq])?;
         Ok(SelectedAttentionLayout {
             batch,
             hq,
@@ -6066,7 +6010,6 @@ mod tests {
                     attrs.key.hash(h);
                     attrs.bound.hash(h);
                     attrs.sink.hash(h);
-                    attrs.query.hash(h);
                     attrs.precision.hash(h);
                 }
                 OpKind::Rope { rot } => rot.hash(h),
@@ -6078,7 +6021,6 @@ mod tests {
                     attrs.softcap.map(f32::to_bits).hash(h);
                     attrs.ratio.hash(h);
                     attrs.k.hash(h);
-                    attrs.query.hash(h);
                     attrs.precision.hash(h);
                 }
                 OpKind::AllReduce { op, axis } => {

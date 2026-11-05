@@ -1,0 +1,21 @@
+--- a/src/vulkan/command.rs
++++ b/src/vulkan/command.rs
+@@ -1312,8 +1312,17 @@
+ 
+         if let Some(timestamp_writes) = desc.timestamp_writes.as_ref() {
+             if let Some(index) = timestamp_writes.beginning_of_pass_write_index {
++                // POOT-1464 (patches/wgpu-hal/README.md): the pass-begin stamp is written at TOP_OF_PIPE, in command
++                // order before the pass's dispatches launch. At BOTTOM_OF_PIPE (what `write_timestamp` uses) the
++                // event is not ordered before later work and RADV can complete it after the dispatch has run,
++                // so the pass reads near zero.
+                 unsafe {
+-                    self.write_timestamp(timestamp_writes.query_set, index);
++                    self.device.raw.cmd_write_timestamp(
++                        self.active,
++                        vk::PipelineStageFlags::TOP_OF_PIPE,
++                        timestamp_writes.query_set.raw,
++                        index,
++                    );
+                 }
+             }
+             self.end_of_pass_timer_query = timestamp_writes

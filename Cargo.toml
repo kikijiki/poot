@@ -202,3 +202,9 @@ ctrlc = { version = "3", features = ["termination"] }
 tiny_http = "0.12"
 # poot-npu's build script (the optional XRT FFI shim).
 cc = "1"
+
+# wgpu-hal with the pass-begin timestamp at TOP_OF_PIPE (patches/wgpu-hal/README.md, POOT-1464): remove when upstream
+# writes it there. `.patched/wgpu-hal` is built by scripts/wgpu-hal-patched.sh (the devshell runs it on entry); until it
+# has run, cargo fails on the missing path rather than building the unpatched crate.
+[patch.crates-io]
+wgpu-hal = { path = ".patched/wgpu-hal" }

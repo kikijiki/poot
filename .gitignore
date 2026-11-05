@@ -32,3 +32,7 @@ result-*
 # python bytecode from scripts/
 __pycache__/
 *.pyc
+
+# wgpu-hal with the POOT-1464 patch applied, produced by scripts/wgpu-hal-patched.sh
+/.patched
+.patched.*

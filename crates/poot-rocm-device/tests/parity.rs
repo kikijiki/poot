@@ -64,8 +64,8 @@ fn narrowed_projections_match_the_declared_oracle_on_rocm() {
 /// POOT-1448 and POOT-1458: a block's norm output and its gated MLP activation, which every reader narrows, are stored
 /// narrow on rocm by the region that computes them and read as stored by the projections (register tiles at `M = 5`,
 /// fragments at `M = 160`), and the program matches the CPU oracle of the declared semantics, whose values are f32 and
-/// rounded by each reader. Under the default the contractions multiply in f16, so each projection reads its
-/// activation row-scaled and the two stores are the f16 outputs of the scaling regions. With the units cut down to
+/// rounded by each reader. Under the default the contractions multiply in f16 and read their activations unscaled
+/// (POOT-1474), so the norm's region and the up projection's epilogue store f16. With the units cut down to
 /// bf16 (`fragment_only`) the norm's region and the up projection's epilogue store bf16, and a pointwise producer
 /// whose values all sit just above a bf16 rounding midpoint holds the store to rounding to nearest even: a store that
 /// truncated would move its outputs past the tolerance. Mutation: emit `FusedScalarOp::Narrow` as a plain copy (no
@@ -91,7 +91,10 @@ fn narrow_stored_activations_match_the_declared_oracle_on_rocm() {
         rows.push((
             poot_executor_parity::Policy::from(narrow),
             fixture,
-            vec![stored("fused_row", f16), stored("fused_row", f16)],
+            vec![
+                stored("fused_row", f16),
+                stored("contraction_epilogue", f16),
+            ],
         ));
     }
     for fixture in blocks() {
@@ -176,23 +179,6 @@ fn declared_attention_precision_matches_the_oracle_on_rocm() {
         )
         .unwrap_or_else(|e| panic!("{precision}: {e}"));
     }
-}
-
-/// POOT-1455 on rocm: an f16 attention reads its query row-scaled, so a query past f16's range gives a finite output
-/// on the oracle, and an in-range query bit for bit the unguarded f16 attention's
-/// (`poot_executor_parity::attention_f16_range`). Mutation: in `emit_score` ignore `row_scale`; the past-range rows
-/// score at the wrong temperature and leave the oracle.
-#[test]
-fn the_attention_f16_range_guard_holds_on_rocm() {
-    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
-        return;
-    };
-    let t = device.target();
-    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-    poot_executor_parity::attention_f16_range::run_past_range(exec.as_mut(), t)
-        .unwrap_or_else(|e| panic!("{e}"));
-    poot_executor_parity::attention_f16_range::run_in_range_identity(exec.as_mut(), t)
-        .unwrap_or_else(|e| panic!("{e}"));
 }
 
 /// Card 736: the ALiBi attention BLOOM and MPT trace (`alibi_mask_from_pos` over a
@@ -481,4 +467,19 @@ fn a_fused_row_scale_is_bitwise_the_unfused_block_on_rocm() {
         poot_graph_ir::MatmulPrecision::Narrow,
     )
     .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// The default `Narrow` does not scale an operand past f16's range on rocm: the contractions and attentions round to
+/// f16 and every step's output carries a non-finite element (`poot_executor_parity::f16_range`). Mutation: in
+/// `select_operand_precision` skip the narrowing of attention; the attention fixtures no longer round to f16 and
+/// the row fails.
+#[test]
+fn an_f16_overflow_stays_non_finite_on_rocm() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::f16_range::run_past_range(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
 }

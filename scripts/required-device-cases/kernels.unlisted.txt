@@ -170,7 +170,6 @@ poot-kernelgen::flash_interp	a_paged_key_equals_the_dense_kernel_over_its_gather
 poot-kernelgen::flash_interp	a_paged_split_kv_with_a_live_bound_never_reads_past_the_length	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_poisoned_scratch_with_trailing_empty_splits_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_prefill_split_into_runs_of_rows_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
-poot-kernelgen::flash_interp	a_row_scaled_query_scores_as_the_undivided_query_on_every_schedule	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_row_with_no_visible_key_is_nan_and_its_neighbours_are_not	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_run_of_rows_outside_the_grid_is_a_typed_error	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_sink_joins_the_softmax_and_no_value_sum	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole

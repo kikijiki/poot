@@ -76,7 +76,7 @@ test: test-model-free
 
 # the model-free gate: dead-pub and unused-dependency checks, docs-path references, the inventory and lane self-tests, device-probe
 # self-test, then every model-free test and doctest
-test-model-free: gate-check dead-pub machete docs-paths variant-coverage mutation-sample-report diagrams-check aie-link-driver npu-build vpu-build crates-stale-names merge-lost-lines-check cargo-freshness crates-standalone test-model-free-inventory test-lane-coverage test-bench-runner test-bench-harness
+test-model-free: gate-check dead-pub machete docs-paths variant-coverage mutation-sample-report diagrams-check aie-link-driver npu-build vpu-build crates-stale-names merge-lost-lines-check cargo-freshness wgpu-hal-patch crates-standalone test-model-free-inventory test-lane-coverage test-bench-runner test-bench-harness
     scripts/with-required-backend.sh --self-test
     scripts/test-model-free.sh run
 
@@ -167,6 +167,12 @@ mutation-sample-report:
 # worktrees share a slot target dir, so cargo must decide freshness by source content, not mtime (POOT-1037)
 cargo-freshness:
     scripts/check-cargo-freshness.sh
+
+# the wgpu-hal the workspace builds is the pinned crates.io crate plus patches/wgpu-hal (POOT-1464): the patched directory
+# is current and cargo resolves wgpu-hal to it
+wgpu-hal-patch:
+    scripts/wgpu-hal-patched.sh
+    scripts/wgpu-hal-patched.sh check
 
 # rustc's dead_code lint skips every item reachable from a library crate root, so an unused `pub` item passes
 # `just check` and `just clippy`. This scan reports it (name based; scripts/dead-pub/dead_pub.py explains the

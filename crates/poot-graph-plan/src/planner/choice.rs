@@ -521,8 +521,8 @@ mod tests {
     use crate::types::DispatchPlanError;
     use poot_graph_ir::{AttentionAttrs, Builder, TensorType};
     use poot_kernelgen::{
-        AttentionQueryScale, AttentionSchedule, AttentionSink, AttentionSpec, KeyBound, KeyLayout,
-        MaskKind, ScoreTransform,
+        AttentionSchedule, AttentionSink, AttentionSpec, KeyBound, KeyLayout, MaskKind,
+        ScoreTransform,
     };
     use poot_tensor::DType;
     use poot_test_util::device_caps::default_caps_for;
@@ -832,7 +832,6 @@ mod tests {
                 mask: MaskKind::Broadcast,
                 bound: KeyBound::Static,
                 sink: AttentionSink::Absent,
-                query: AttentionQueryScale::Absent,
                 schedule: AttentionSchedule::Streaming { lanes: 4 },
                 precision: poot_graph_ir::OperandPrecision::Exact,
             })

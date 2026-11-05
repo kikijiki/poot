@@ -115,14 +115,11 @@ impl StrideRates {
     /// far less than the dispatch (an outlier of 115 GB/s at the one-channel stride, above the 105 GB/s the
     /// contiguous read reaches, under CPU load) moves it arbitrarily, and the order check does not use it.
     ///
-    /// POOT-1464, what such a run is. Not a cache hit and not a host timer: on wgpu (Vulkan/RADV, Mesa 26.1.3) a
-    /// captured run listed its two dispatches at 280 ns and 120 ns (the read of 24 MiB would be 87 TB/s) with a
-    /// first-start-to-last-end span of 611 ns, while the host wall time of the step was the usual 174 ms; all four
-    /// `BOTTOM_OF_PIPE` timestamps of the submit landed within 61 ticks of the device clock. It showed once in
-    /// about 30000 timed steps (idle, 64 spinning CPU processes, three probe processes sharing the GPU and the
-    /// wgpu device lane's own concurrency: none of those reproduced it again, so the driver-side cause is not
-    /// established). Per run, a dispatch whose bytes over its duration exceed the device's memory bandwidth
-    /// ceiling is a void timestamp pair, not a fast read, and its duration must not enter a published number.
+    /// POOT-1464, what such a run was: a void timestamp pair, not a fast read. The dispatch's start stamp was
+    /// written at a stage that later work does not wait for (`BOTTOM_OF_PIPE` in wgpu-hal, `COMPUTE_SHADER` in the
+    /// raw Vulkan runtime) and RADV can complete such a stamp after the dispatch has run, under GPU sharing; the
+    /// pair then spans a few ticks and the dispatch's time lands in the next pass. Both runtimes now write the start
+    /// stamp at `TOP_OF_PIPE` (`patches/wgpu-hal/README.md`), and the peak stays a report column only.
     pub fn peak(&self) -> f64 {
         self.gbps.iter().copied().fold(0.0, f64::max)
     }

@@ -199,6 +199,11 @@
 
           shellHook = ''
             ${cargoEnv}
+            # The patched wgpu-hal the workspace [patch.crates-io] points at (patches/wgpu-hal/README.md). A no-op while
+            # current; on failure it leaves no directory, so cargo fails instead of building the unpatched crate.
+            if top="$(git rev-parse --show-toplevel 2>/dev/null)" && [ -x "$top/scripts/wgpu-hal-patched.sh" ]; then
+              "$top/scripts/wgpu-hal-patched.sh" >&2 || echo "wgpu-hal-patched.sh FAILED: cargo will not build until it succeeds" >&2
+            fi
             # Put system LLVM's llc ahead of anything the rust toolchain exposes.
             export PATH="${llvm.llvm}/bin:$PATH"
             # The only fonts `just diagrams` renders with (resvg skips the host's fonts), so the PNGs are byte-stable.

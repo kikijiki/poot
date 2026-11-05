@@ -113,7 +113,6 @@ fn build_with(
         case.scale(),
         None,
         case.ratio,
-        None,
         poot_graph_ir::OperandPrecision::Exact,
     )
     .unwrap();

@@ -817,6 +817,9 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
 /// `Activation` 1155988 -> 1151108, 578148 -> 575708 and 289592 -> 288408 at four, two and one rows.
 /// POOT-1461 makes `Narrow` the default `MatmulPrecision`: the narrowed contractions plan their narrowed operand storage in
 /// the arena, so `Activation` 1151108 -> 1199540, 575708 -> 602484 and 288408 -> 304340 at four, two and one rows.
+/// POOT-1474 drops the range scales of the narrowed contractions (the 1457 row scale and its f32 side outputs), so the
+/// scale and scaled-activation values leave the arena: `Activation` 1199540 -> 1151108, 602484 -> 578268 and
+/// 304340 -> 292248 at four, two and one rows.
 ///
 /// Mutation: size a dense weight from `shape[..1]` in `Engine::weight_buffer`'s size-only path; `Weight`
 /// is no longer 5216 and this row goes red.
@@ -834,17 +837,17 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         (
             4,
             64,
-            "Activation=1199540 Input=189100 Meta=16884 State=12416 Weight=5216",
+            "Activation=1151108 Input=189100 Meta=16884 State=12416 Weight=5216",
         ),
         (
             2,
             64,
-            "Activation=602484 Input=117748 Meta=16884 State=6208 Weight=5216",
+            "Activation=578268 Input=117748 Meta=16884 State=6208 Weight=5216",
         ),
         (
             1,
             64,
-            "Activation=304340 Input=82072 Meta=15564 State=3104 Weight=5216",
+            "Activation=292248 Input=82072 Meta=15564 State=3104 Weight=5216",
         ),
     ];
     let domain = candidates(&handle, &args);

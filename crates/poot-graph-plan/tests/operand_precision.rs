@@ -116,8 +116,7 @@ fn precision_of(program: &Program, want: impl Fn(&OpKind) -> bool) -> OperandPre
         .expect("the equation is planned and carries a precision")
 }
 
-/// A dense contraction, bare or as the head of an epilogue (a contraction narrowed to f16 multiplies its row scale
-/// back in its epilogue, POOT-1457).
+/// A dense contraction, bare or as the head of an epilogue.
 fn is_dense(op: &OpKind) -> bool {
     matches!(
         op,
@@ -174,8 +173,8 @@ fn an_exact_policy_never_narrows() {
     }
 }
 
-/// ROCm caps (bf16 and f16 fragments) give an f16 contraction (POOT-1458: a guarded contraction takes f16 where
-/// the unit has it) and an f16 attention over the default f16 KV cache; both are published, and the program's
+/// ROCm caps (bf16 and f16 fragments) give an f16 contraction (POOT-1458: a contraction takes f16 where the
+/// unit has it) and an f16 attention over the default f16 KV cache; both are published, and the program's
 /// class is the narrow-storage one. Mutation: make the contraction rule prefer bf16 (swap the candidates) and the
 /// contraction row goes red.
 #[test]
@@ -234,23 +233,40 @@ fn caps_without_a_matrix_unit_give_exact() {
     }
 }
 
-/// An attention takes f16 only over keys and values stored f16 (the default KV dtype), which enter exactly while its
-/// query is row-scaled (POOT-1455). A bf16 or f32 cache takes bf16, whose range is f32's: its keys and values would
-/// round to f16 unscaled and could overflow. So f32 KV is bf16 on ROCm and exact on RADV (no bf16 fragments; the
-/// SPIR-V planner has no bf16 cache lane, so bf16 KV does not compile there). Mutation: in `fragment_dtype` let an
-/// f32 cache take f16 again (`&[Bf16, F16]`); the f32-on-RADV row narrows to f16 and goes red.
+/// An attention takes f16 over any cache dtype where the target has an f16 fragment (no operand is range-scaled, so
+/// no cache dtype is kept out of f16: `receipts/1471-narrow-without-range-guards/design.md` section 4.1): f16, bf16
+/// and f32 KV all give f16 on ROCm and RADV (RADV has no bf16 cache lane to compile a bf16 cache). Mutation: in
+/// `fragment_dtype` make an attention over a bf16 cache offer bf16 alone; the bf16-on-ROCm row goes red.
 #[test]
-fn attention_takes_f16_only_over_an_f16_cache() {
+fn attention_takes_f16_over_any_cache_dtype() {
     let cases = [
-        (rocm_wmma(), DType::F16, F16),
-        (rocm_wmma(), DType::BF16, BF16),
-        (rocm_wmma(), DType::F32, BF16),
-        (radv(), DType::F16, F16),
-        (radv(), DType::F32, OperandPrecision::Exact),
+        (rocm_wmma(), DType::F16),
+        (rocm_wmma(), DType::BF16),
+        (rocm_wmma(), DType::F32),
+        (radv(), DType::F16),
+        (radv(), DType::F32),
     ];
-    for (target, kv, want) in cases {
+    for (target, kv) in cases {
         let program = compiled(&attention(kv), &target, MatmulPrecision::Narrow);
-        assert_eq!(precision_of(&program, is_attention), want, "{kv}");
+        assert_eq!(precision_of(&program, is_attention), F16, "{kv}");
+    }
+}
+
+/// A target whose units offer bf16 fragments alone (gfx11 cut down with `fragment_only`) gets bf16 for every
+/// contraction and every attention over a bf16 or f32 cache: f16 is the first candidate, bf16 the fallback.
+/// Mutation: in `fragment_dtype` drop `Bf16` from the contraction candidates; the dense row stays exact and goes red.
+#[test]
+fn bf16_fragments_alone_give_bf16() {
+    let options = CompileOptions {
+        fragment_only: Some(FragmentDtype::Bf16),
+        ..CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(MatmulPrecision::Narrow)
+    };
+    let dense = compile(&projection(), &rocm_wmma(), &options).expect("the graph compiles");
+    assert_eq!(precision_of(&dense, is_dense), BF16);
+    for kv in [DType::BF16, DType::F32] {
+        let program = compile(&attention(kv), &rocm_wmma(), &options).expect("the graph compiles");
+        assert_eq!(precision_of(&program, is_attention), BF16, "{kv}");
     }
 }
 

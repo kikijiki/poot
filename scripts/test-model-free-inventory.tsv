@@ -1212,8 +1212,7 @@ poot-graph-plan	poot-graph-plan::activation_primitives	model-free	activation_com
 poot-graph-plan	poot-graph-plan::activation_primitives	model-free	glu_wrappers_equal_activation_times_up
 poot-graph-plan	poot-graph-plan::activation_primitives	model-free	mlp_fixtures_match_the_pre_card_oracle
 poot-graph-plan	poot-graph-plan::activation_primitives	model-free	softcap_on_the_tanh_primitive_stays_within_tier_two_of_the_pre_card_oracle
-poot-graph-plan	poot-graph-plan::attention_f16_range	model-free	a_query_past_the_f16_range_gives_a_finite_correct_output
-poot-graph-plan	poot-graph-plan::attention_f16_range	model-free	query_rows_in_range_compute_the_unguarded_f16_attention_bit_for_bit
+poot-graph-plan	poot-graph-plan::attention_f16_range	model-free	a_query_past_the_f16_range_gives_a_non_finite_output
 poot-graph-plan	poot-graph-plan::attention_live	model-free	a_declined_live_graph_plans_on_every_target
 poot-graph-plan	poot-graph-plan::attention_live	model-free	a_declined_live_graph_treats_an_out_of_range_length_as_length_one
 poot-graph-plan	poot-graph-plan::attention_live	model-free	a_narrow_capacity_attention_chain_stays_the_decomposition
@@ -1279,10 +1278,9 @@ poot-graph-plan	poot-graph-plan::expert_grouping_plan	model-free	a_decode_keeps_
 poot-graph-plan	poot-graph-plan::expert_grouping_plan	model-free	a_grouping_whose_block_no_tiling_has_is_refused_by_name
 poot-graph-plan	poot-graph-plan::expert_grouping_plan	model-free	a_per_row_contraction_past_the_gemv_rows_is_refused_by_name
 poot-graph-plan	poot-graph-plan::expert_grouping_plan	model-free	a_routed_prefill_is_grouped_once_and_runs_the_fragment_tile
-poot-graph-plan	poot-graph-plan::f16_range_guard	model-free	a_product_of_two_runtime_values_never_narrows_to_f16
-poot-graph-plan	poot-graph-plan::f16_range_guard	model-free	activations_past_the_f16_range_give_a_finite_correct_output
-poot-graph-plan	poot-graph-plan::f16_range_guard	model-free	rows_in_range_compute_the_unguarded_f16_program_bit_for_bit
-poot-graph-plan	poot-graph-plan::f16_range_guard	model-free	the_oracle_graph_and_the_program_narrow_the_same_contractions
+poot-graph-plan	poot-graph-plan::f16_range	model-free	a_product_of_two_runtime_values_narrows_to_f16
+poot-graph-plan	poot-graph-plan::f16_range	model-free	activations_past_the_f16_range_give_a_non_finite_output
+poot-graph-plan	poot-graph-plan::f16_range	model-free	the_oracle_graph_and_the_program_narrow_the_same_contractions
 poot-graph-plan	poot-graph-plan::f16_weight_lane	model-free	a_bf16_weight_of_f16_contractions_is_one_f16_lane_for_its_buffer_and_its_body
 poot-graph-plan	poot-graph-plan::flash_prefill_softcap_fusion	model-free	flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference
 poot-graph-plan	poot-graph-plan::fragment_attention_plan	model-free	a_bf16_narrowed_prefill_attention_plans_bf16_fragments_on_the_rocm_matrix_unit
@@ -1336,11 +1334,11 @@ poot-graph-plan	poot-graph-plan::movement_softmax	model-free	fused_multi_axis_br
 poot-graph-plan	poot-graph-plan::movement_softmax	model-free	fused_pointwise_over_empty_tensor_edges
 poot-graph-plan	poot-graph-plan::movement_softmax	model-free	reshape_collapse_is_value_identical
 poot-graph-plan	poot-graph-plan::mrope_sectioned_rope_fusion	model-free	rope_fusion_matches_and_is_result_preserving_on_sectioned_rope
-poot-graph-plan	poot-graph-plan::narrow_activation_storage	model-free	a_row_scaled_activation_is_stored_f16_by_the_region_that_scales_it
 poot-graph-plan	poot-graph-plan::narrow_activation_storage	model-free	a_value_an_f32_reader_reads_stays_f32
 poot-graph-plan	poot-graph-plan::narrow_activation_storage	model-free	a_value_every_reader_narrows_is_stored_narrow_by_its_producer
 poot-graph-plan	poot-graph-plan::narrow_activation_storage	model-free	a_value_stored_narrow_shares_its_arena_slot_with_f32_values
 poot-graph-plan	poot-graph-plan::narrow_activation_storage	model-free	an_exact_program_stores_nothing_narrow
+poot-graph-plan	poot-graph-plan::narrow_activation_storage	model-free	an_f16_activation_is_stored_f16_by_the_region_that_computes_it
 poot-graph-plan	poot-graph-plan::narrow_activation_storage	model-free	the_narrowed_program_evaluates_bit_for_bit_as_the_declared_one
 poot-graph-plan	poot-graph-plan::numerical_legality	model-free	explicit_narrow_casts_remain_between_contraction_and_epilogue
 poot-graph-plan	poot-graph-plan::numerical_legality	model-free	finite_scaled_contraction_survives_compile
@@ -1356,7 +1354,8 @@ poot-graph-plan	poot-graph-plan::numerical_legality	model-free	softcap_requires_
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	a_declared_precision_stands_under_any_policy
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	a_split_policy_splits_and_plans_attention_off_the_tiled_schedule
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	an_exact_policy_never_narrows
-poot-graph-plan	poot-graph-plan::operand_precision	model-free	attention_takes_f16_only_over_an_f16_cache
+poot-graph-plan	poot-graph-plan::operand_precision	model-free	attention_takes_f16_over_any_cache_dtype
+poot-graph-plan	poot-graph-plan::operand_precision	model-free	bf16_fragments_alone_give_bf16
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	caps_without_a_matrix_unit_give_exact
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	options_that_name_no_policy_compile_under_narrow
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	radv_caps_give_f16
@@ -1696,7 +1695,6 @@ poot-kernelgen	poot-kernelgen::flash_interp	model-free	a_paged_key_equals_the_de
 poot-kernelgen	poot-kernelgen::flash_interp	model-free	a_paged_split_kv_with_a_live_bound_never_reads_past_the_length
 poot-kernelgen	poot-kernelgen::flash_interp	model-free	a_poisoned_scratch_with_trailing_empty_splits_matches_the_reference
 poot-kernelgen	poot-kernelgen::flash_interp	model-free	a_prefill_split_into_runs_of_rows_matches_the_reference
-poot-kernelgen	poot-kernelgen::flash_interp	model-free	a_row_scaled_query_scores_as_the_undivided_query_on_every_schedule
 poot-kernelgen	poot-kernelgen::flash_interp	model-free	a_row_with_no_visible_key_is_nan_and_its_neighbours_are_not
 poot-kernelgen	poot-kernelgen::flash_interp	model-free	a_run_of_rows_outside_the_grid_is_a_typed_error
 poot-kernelgen	poot-kernelgen::flash_interp	model-free	a_sink_joins_the_softmax_and_no_value_sum
@@ -4236,6 +4234,7 @@ poot-ptx-device	poot-ptx-device::packed_serving	device	packed_prefill_through_se
 poot-ptx-device	poot-ptx-device::parity	device	a_grouped_moe_prefill_runs_the_fragment_tile_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	adjusted_sampling_head_matches_the_oracle_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	alibi_slopes_attention_matches_the_oracle_and_the_reference_on_ptx
+poot-ptx-device	poot-ptx-device::parity	device	an_f16_overflow_stays_non_finite_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	bf16_const_cast_is_bit_exact_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	bf16_grouped_projection_matches_the_oracle_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	block_top_k_selects_what_the_plain_selection_selects_on_ptx
@@ -4246,7 +4245,6 @@ poot-ptx-device	poot-ptx-device::parity	device	greedy_sample_token_is_exact_on_p
 poot-ptx-device	poot-ptx-device::parity	device	select_is_bitwise_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	selected_attention_reads_exactly_the_selected_blocks_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	state_pool_rows_reset_independently_on_ptx
-poot-ptx-device	poot-ptx-device::parity	device	the_attention_f16_range_guard_holds_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	two_byte_select_is_bitwise_on_ptx
 poot-ptx-device	poot-ptx-device::sample_gumbel_no_contract	device	gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle
 poot-ptx-device	poot-ptx-device::scan_contract	device	delta_rule_scan_matches_the_oracle_on_ptx
@@ -4482,6 +4480,7 @@ poot-rocm-device	poot-rocm-device::packed_serving	device	packed_prefill_through_
 poot-rocm-device	poot-rocm-device::parity	device	a_fused_row_scale_is_bitwise_the_unfused_block_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	adjusted_sampling_head_matches_the_oracle_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	alibi_slopes_attention_matches_the_oracle_and_the_reference_on_rocm
+poot-rocm-device	poot-rocm-device::parity	device	an_f16_overflow_stays_non_finite_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	bf16_checkpoint_orientation_projection_matches_the_oracle_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	bf16_const_cast_is_bit_exact_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	bf16_grouped_projection_matches_the_oracle_on_rocm
@@ -4497,7 +4496,6 @@ poot-rocm-device	poot-rocm-device::parity	device	select_is_bitwise_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	split_kv_decode_matches_the_oracle_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	split_kv_decode_replay_equals_the_recording_step_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	state_pool_rows_reset_independently_on_rocm
-poot-rocm-device	poot-rocm-device::parity	device	the_attention_f16_range_guard_holds_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	two_byte_select_is_bitwise_on_rocm
 poot-rocm-device	poot-rocm-device::pcie_receipt	model-free	pcie_receipt_without_the_env_reaches_the_device_checks
 poot-rocm-device	poot-rocm-device::recording_ownership	device	dropping_a_bound_buffer_keeps_its_allocation_until_the_recording_drops

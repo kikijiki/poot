@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 
 use poot_graph_ir::graph::{EditError, Eqn, Graph, Operand, Storage, ValueId};
 use poot_graph_ir::op::{
-    AttentionAttrs, BinOp, BlockTopKAttrs, KeyLayout, KvBound, MaskOperand, OpKind, QueryScale,
+    AttentionAttrs, BinOp, BlockTopKAttrs, KeyLayout, KvBound, MaskOperand, OpKind,
     SelectedAttentionAttrs, SinkOperand,
 };
 use poot_graph_ir::types::{Scalar, TensorType};
@@ -296,7 +296,6 @@ fn selected_attention(
         || attrs.key != KeyLayout::Single
         || attrs.bound != KvBound::Capacity
         || attrs.sink != SinkOperand::Absent
-        || attrs.query != QueryScale::Absent
     {
         return None;
     }
@@ -343,7 +342,6 @@ fn selected_attention(
         softcap: attrs.softcap,
         ratio,
         k: selected,
-        query: QueryScale::Absent,
         precision: attrs.precision,
     };
     composite(
@@ -614,7 +612,6 @@ mod tests {
             case.scale(),
             None,
             case.ratio,
-            None,
             poot_graph_ir::OperandPrecision::Exact,
         )
         .unwrap();
@@ -672,7 +669,6 @@ mod tests {
                     softcap: None,
                     ratio: case.ratio,
                     k: case.k,
-                    query: poot_graph_ir::QueryScale::Absent,
                     precision: poot_graph_ir::OperandPrecision::Exact
                 }],
                 "{}",

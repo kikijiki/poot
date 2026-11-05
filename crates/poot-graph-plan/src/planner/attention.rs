@@ -14,12 +14,12 @@ use crate::predicates::{
 use crate::refusal::Site;
 use crate::types::ScratchDecl;
 use poot_graph_ir::{
-    AttentionAttrs, KeyLayout, KvBound, MaskOperand, OperandPrecision, QueryScale,
-    SelectedAttentionAttrs, SinkOperand,
+    AttentionAttrs, KeyLayout, KvBound, MaskOperand, OperandPrecision, SelectedAttentionAttrs,
+    SinkOperand,
 };
 use poot_kernelgen::{
-    AttentionCombineSpec, AttentionQueryScale, AttentionRows, AttentionSchedule, AttentionSink,
-    AttentionSpec, KeyBound, KeyLayout as KernelKeyLayout, KvLane, MaskKind, ScoreTransform,
+    AttentionCombineSpec, AttentionRows, AttentionSchedule, AttentionSink, AttentionSpec, KeyBound,
+    KeyLayout as KernelKeyLayout, KvLane, MaskKind, ScoreTransform,
 };
 use poot_target::{Backend, BufferStorage, DeviceCaps};
 use poot_tensor::DType;
@@ -58,7 +58,6 @@ pub(super) fn plan(
         key,
         bound,
         sink,
-        query,
         precision,
     }) = &eqn.op
     else {
@@ -129,7 +128,6 @@ pub(super) fn plan(
             SinkOperand::Absent => AttentionSink::Absent,
             SinkOperand::PerHead => AttentionSink::PerHead,
         },
-        query: query_scale(*query),
         schedule: AttentionSchedule::Streaming { lanes },
         precision: *precision,
     };
@@ -230,7 +228,6 @@ fn plan_selected(
         },
         bound: KeyBound::Static,
         sink: AttentionSink::Absent,
-        query: query_scale(attrs.query),
         schedule: AttentionSchedule::Streaming { lanes },
         precision: attrs.precision,
     };
@@ -246,15 +243,6 @@ fn plan_selected(
             backend,
             caps,
         ),
-    }
-}
-
-/// The kernel parameter that carries an attention's query scale: the op's last operand, the kernel's last
-/// parameter before `out`, so the operands bind in order.
-fn query_scale(query: QueryScale) -> AttentionQueryScale {
-    match query {
-        QueryScale::Absent => AttentionQueryScale::Absent,
-        QueryScale::PerRow => AttentionQueryScale::PerRow,
     }
 }
 

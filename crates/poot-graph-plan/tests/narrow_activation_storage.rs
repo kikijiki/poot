@@ -3,8 +3,8 @@
 //!
 //! Every row drives the production `compile` on a transformer block (a norm, three projections of it, a gated MLP
 //! and the residual adds) and reads the program it returns. The bf16 rows run on a gfx11 device whose unit offers
-//! bf16 alone: where the unit also has f16 a guarded contraction takes f16 (POOT-1458), whose activations are
-//! row-scaled and stored by their scaling region (the f16 rows).
+//! bf16 alone: where the unit also has f16 a contraction takes f16 (POOT-1458), whose activations are stored f16
+//! by the regions that compute them (the f16 rows).
 
 use std::collections::HashMap;
 
@@ -148,8 +148,7 @@ fn compiled(g: &Graph, target: &Target, policy: MatmulPrecision) -> Program {
     .expect("the block compiles")
 }
 
-/// The block under the narrow policy with the f16 fragments alone (RADV's narrowing): each contraction reads its
-/// activation row-scaled (POOT-1457).
+/// The block under the narrow policy with the f16 fragments alone (RADV's narrowing).
 fn compiled_f16(g: &Graph, target: &Target) -> Program {
     let options = CompileOptions {
         fragment_only: Some(FragmentDtype::F16),
@@ -232,22 +231,21 @@ fn a_value_every_reader_narrows_is_stored_narrow_by_its_producer() {
     );
 }
 
-/// With f16 fragments each projection reads its activation row-scaled (POOT-1457): the norm's region computes the
-/// scale and stores the scaled activation f16, and the gated activation, an epilogue's value, is scaled and stored
-/// f16 by a row region of its own (the up epilogue then writes f32). Still nothing is added for the narrow storage
-/// itself. Mutation: in `store_narrowed_activations` commit a value without probing (`if true`); the device without
-/// two-byte elements narrows too and the row goes red.
+/// With f16 fragments each projection reads its activation unscaled (POOT-1474): the norm's region stores its output
+/// f16 and the up projection's epilogue stores the gated activation f16, as they store bf16 on the bf16 device.
+/// Nothing is added for the narrow storage itself (no scale step). Mutation: in `store_narrowed_activations` commit a
+/// value without probing (`if true`); the device without two-byte elements narrows too and the row goes red.
 #[test]
-fn a_row_scaled_activation_is_stored_f16_by_the_region_that_scales_it() {
+fn an_f16_activation_is_stored_f16_by_the_region_that_computes_it() {
     let (g, _) = block(false);
     let narrowed = compiled_f16(&g, &rocm_wmma());
     assert_eq!(
         narrow_values(&narrowed),
         vec![
             ("fused_row".to_string(), DType::F16),
-            ("fused_row".to_string(), DType::F16),
+            ("contraction_epilogue".to_string(), DType::F16),
         ],
-        "the two scaled activations are stored narrow, nothing else"
+        "the norm and the gated activation are stored narrow, nothing else"
     );
     let unnarrowed = compiled_f16(&g, &without_two_byte_elements(rocm_wmma()));
     assert_eq!(narrow_values(&unnarrowed), Vec::new());
@@ -275,7 +273,7 @@ fn a_value_an_f32_reader_reads_stays_f32() {
 /// The narrowed program computes what the declared semantics compute, bit for bit: the oracle of the compiled
 /// graph, whose values are stored narrow, equals the oracle of the traced graph under the same operand precision,
 /// whose values are f32 and rounded by each reader (the producer's `Cast` and the readers' narrowing are one
-/// rounding), on the bf16 device and on the gfx11 one, whose f16 contractions read their activations row-scaled.
+/// rounding), on the bf16 device and on the gfx11 one, whose contractions read f16.
 /// Mutation: in `OperandPrecision::stored_activation` map `Narrow(Bf16)` to `F16`; the readers round an f16 value
 /// to bf16 again and the bf16 device's bits differ.
 #[test]

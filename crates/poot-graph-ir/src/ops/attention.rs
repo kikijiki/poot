@@ -60,7 +60,6 @@ pub fn attention_masked_sinks(
         None,
         None,
         Some(sinks),
-        None,
         OperandPrecision::Exact,
     )
 }
@@ -156,7 +155,6 @@ pub fn attention_masked_softcap(
         attn_logit_softcap,
         None,
         None,
-        None,
         OperandPrecision::Exact,
     )
 }
@@ -242,7 +240,6 @@ pub fn attention_live(
         attn_logit_softcap,
         Some(live_len),
         None,
-        None,
         OperandPrecision::Exact,
     )?;
     Ok(LiveAttention {
@@ -259,11 +256,6 @@ pub fn attention_live(
 /// inactive K and V rows are *selected* to zero before either matmul (a float `Select`, never a multiplication
 /// by zero, so a NaN there cannot survive) and inactive scores are selected to `-inf` after the mask is
 /// added, so inactive positions weigh exactly zero. Both parts of a split key are guarded.
-///
-/// With `query_scale = Some(s)` (`s [B,Hq,Lq,1]`, [`crate::QueryScale::PerRow`]) `q` is the query divided by `s`,
-/// and each row's raw `Q K^T` products are multiplied by its `s` before the score scale: `(q / s . k) * s`. The
-/// narrow policy writes it so the query's rounding to f16 cannot overflow (POOT-1455); a row whose `s` is 1
-/// computes exactly what it would without it.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn attention_over_keys(
     b: &Builder,
@@ -276,7 +268,6 @@ pub(crate) fn attention_over_keys(
     attn_logit_softcap: Option<f32>,
     live_len: Option<Traced>,
     sinks: Option<Traced>,
-    query_scale: Option<Traced>,
     precision: OperandPrecision,
 ) -> Result<Traced, BuilderError> {
     let live = match live_len {
@@ -305,10 +296,6 @@ pub(crate) fn attention_over_keys(
     let v = repeat_kv(b, v, n_rep)?;
     let kt = b.transpose(k, vec![0, 1, 3, 2])?; // [B,Hq,D,Lk]
     let scores = b.matmul_as(q, kt, precision)?; // [B,Hq,Lq,Lk]
-    let scores = match query_scale {
-        Some(s) => b.binary(BinOp::Mul, scores, s)?, // the row's scale, broadcast over Lk
-        None => scores,
-    };
     let scores = b.binary_scalar(BinOp::Mul, scores, Scalar::F32(scale))?;
     let scores = match attn_logit_softcap {
         Some(c) => softcap(b, scores, c)?,

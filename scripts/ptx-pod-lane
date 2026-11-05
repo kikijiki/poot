@@ -113,6 +113,9 @@ while IFS= read -r f; do patch_elf "$f"; done < <(find "$work/ex/target" -type f
 tar -C "$work/ex" -cf - target | zstd -T0 -12 -q -o "$work/archive.tar.zst"
 rm -rf "$work/ex"
 
+# 2b. the patched wgpu-hal the workspace builds against (patches/wgpu-hal/README.md)
+"$(dirname "$0")/wgpu-hal-patched.sh"
+
 # 3. the bank example
 if [ ${#bank_cases[@]} -gt 0 ]; then
   RUSTC_WRAPPER= cargo build --release -p poot-ptx-device --example performance_bank

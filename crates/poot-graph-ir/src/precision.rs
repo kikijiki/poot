@@ -89,7 +89,8 @@ pub enum MatmulPrecision {
     Exact,
     /// Contractions and attention split where a matrix unit admits them.
     Split,
-    /// Contractions and attention narrow where a matrix unit admits them.
+    /// Contractions and attention narrow where a matrix unit admits them: f16 where the unit has it, no range
+    /// scale. An operand past f16's range is infinity and the step's logits are refused.
     #[default]
     Narrow,
 }

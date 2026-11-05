@@ -134,8 +134,7 @@ fn schedule_of(program: &Program, want: impl Fn(&OpKind) -> bool) -> Schedule {
     }
 }
 
-/// A contraction narrowed to f16 multiplies its row scale back in its epilogue (POOT-1457), so each family is
-/// matched bare or as an epilogue's head.
+/// Each family is matched bare or as an epilogue's head.
 fn is_dense(op: &OpKind) -> bool {
     matches!(
         op,

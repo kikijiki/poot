@@ -1,8 +1,9 @@
 //! POOT-1456: row regions with a per-row scalar result and with side outputs (multi-output row regions).
 //!
-//! A norm feeding a per-row scale and a narrowed contraction (the row-scaled f16 guard of POOT-1454 design.md
-//! section 4.1) plans one row kernel that writes the scaled activation and its scale, and the contraction applies
-//! the scale in its epilogue: the dispatch count is the unscaled block's. Every row drives the production `compile`
+//! A norm feeding a per-row scale and a narrowed contraction (the shape of POOT-1454 design.md section 4.1, built by
+//! hand here: the narrow policy no longer emits it, POOT-1474) plans one row kernel that writes the scaled
+//! activation and its scale, and the contraction applies the scale in its epilogue: the dispatch count is the
+//! unscaled block's. Every row drives the production `compile`
 //! (or the `fuse` pass on its own) and reads the program or graph it returns.
 
 use std::collections::HashMap;
@@ -46,11 +47,12 @@ fn values(n: usize, seed: u64, scale: f32) -> Vec<f32> {
         .collect()
 }
 
-/// `h = rmsnorm(x)` read by `projections` BF16 projections, summed. Under the narrow policy on a target with f16
-/// fragments, `compile` puts the row scale of POOT-1454 design.md section 4.1 between them (POOT-1457): each
-/// projection reads `h / s` with `s = max(rowmax(|h|) / 65504, 1)` and multiplies its result by `s`. `norm_scale`
-/// scales the norm weight (a norm cancels the scale of its input), so a normed value past f16's range can be made.
-fn block(projections: usize, norm_scale: f32) -> (Graph, HashMap<ValueId, Value>) {
+/// `h = rmsnorm(x)` read by `projections` F16 projections, summed. With `scaled` the block carries the row scale of
+/// POOT-1454 design.md section 4.1: each projection reads `h / s` with `s = max(rowmax(|h|) / 65504, 1)` and
+/// multiplies its result by `s`; without it the projections are plain matmuls on `h`. The policy rounds both to f16
+/// (`compiled_f16`). `norm_scale` scales the norm weight (a norm cancels the scale of its input), so a normed value
+/// past f16's range can be made.
+fn block(projections: usize, norm_scale: f32, scaled: bool) -> (Graph, HashMap<ValueId, Value>) {
     let b = Builder::for_tests();
     let mut inputs = HashMap::new();
     let x = b.constant("x", TensorType::f32(vec![M, K])).unwrap();
@@ -64,18 +66,40 @@ fn block(projections: usize, norm_scale: f32) -> (Graph, HashMap<ValueId, Value>
         Value::Host(HostTensor::f32(vec![K], values(K, 2, norm_scale))),
     );
     let h = rmsnorm(&b, x, norm, 1e-6).unwrap();
+    let row_scale = scaled.then(|| {
+        let magnitude = b
+            .binary(BinOp::Max, h, b.unary(UnOp::Neg, h).unwrap())
+            .unwrap();
+        let ratio = b
+            .binary_scalar(
+                BinOp::Div,
+                b.reduce(RedOp::Max, magnitude, 1, true).unwrap(),
+                Scalar::F32(65504.0),
+            )
+            .unwrap();
+        let s = b
+            .binary_scalar(BinOp::Max, ratio, Scalar::F32(1.0))
+            .unwrap();
+        (s, b.binary(BinOp::Div, h, s).unwrap())
+    });
     let mut out: Option<Traced> = None;
     for p in 0..projections {
         let name = format!("w{p}");
         let w = b
-            .constant(&name, TensorType::new(vec![K, K], DType::BF16))
+            .constant(&name, TensorType::new(vec![K, K], DType::F16))
             .unwrap();
-        let bits = values(K * K, 3 + p as u64, 1.0)
+        let words = values(K * K, 3 + p as u64, 1.0)
             .into_iter()
-            .map(|v| (v.to_bits() >> 16) as u16)
+            .map(poot_quant::scalar::f32_to_f16)
             .collect();
-        inputs.insert(w.id(), Value::Host(HostTensor::bf16(vec![K, K], bits)));
-        let y = b.matmul(h, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
+        inputs.insert(w.id(), Value::Host(HostTensor::f16(vec![K, K], words)));
+        let w = b.transpose(w, vec![1, 0]).unwrap();
+        let y = match row_scale {
+            Some((s, h_scaled)) => b
+                .binary(BinOp::Mul, b.matmul(h_scaled, w).unwrap(), s)
+                .unwrap(),
+            None => b.matmul(h, w).unwrap(),
+        };
         out = Some(match out {
             Some(sum) => b.binary(BinOp::Add, sum, y).unwrap(),
             None => y,
@@ -96,8 +120,7 @@ fn compiled(g: &Graph, policy: MatmulPrecision) -> Program {
     .expect("the block compiles")
 }
 
-/// The block under the narrow policy with the f16 fragments alone: each projection rounds to f16 and reads its
-/// activation row-scaled (POOT-1457).
+/// The block under the narrow policy with the f16 fragments alone: each projection rounds to f16.
 fn compiled_f16(g: &Graph) -> Program {
     let options = CompileOptions {
         fragment_only: Some(FragmentDtype::F16),
@@ -150,22 +173,28 @@ fn row_regions(program: &Program) -> Vec<(DType, usize)> {
         .collect()
 }
 
-/// SC-1 (the card's acceptance; since POOT-1457 the scale is the planner's f16 guard): a norm -> per-row scale ->
-/// narrowed contraction block plans the dispatch count of the unscaled block (the same block narrowed to bf16, the
-/// ROCm default, which needs no scale), the scale adding none, with one and with three projections sharing the scaled activation. The
+/// SC-1 (the card's acceptance): a norm -> per-row scale -> narrowed contraction block plans the dispatch count of
+/// the unscaled block (the same block without the scale), the scale adding none, with one and
+/// with three projections sharing the scaled activation. The
 /// norm, the scale and the divide are one row kernel that writes the narrowed activation and the scale (its side
 /// output), and each projection's epilogue multiplies by the scale. Mutation: in `fuse`, admit no shared value into
 /// a row region (`shared` = `single_use`); the scale costs its own kernels again and the counts differ.
 #[test]
 fn a_row_scale_between_a_norm_and_its_projections_costs_no_dispatch() {
     for projections in [1, 3] {
-        let (g, _) = block(projections, 1.0);
-        let plain = compiled(&g, MatmulPrecision::Narrow);
-        let scaled = compiled_f16(&g);
+        let (g, _) = block(projections, 1.0, false);
+        let (g_scaled, _) = block(projections, 1.0, true);
+        let plain = compiled_f16(&g);
+        let scaled = compiled_f16(&g_scaled);
         assert_eq!(
             dispatches(&scaled),
             dispatches(&plain),
             "{projections} projections: the scale adds no dispatch"
+        );
+        assert_eq!(
+            row_regions(&plain),
+            vec![(DType::F16, 0)],
+            "{projections} projections: the unscaled norm stores the narrowed activation alone"
         );
         assert_eq!(
             row_regions(&scaled),
@@ -183,16 +212,16 @@ fn a_row_scale_between_a_norm_and_its_projections_costs_no_dispatch() {
     }
 }
 
-/// SC-2: the fused program (on RADV, where the narrow policy rounds to f16 and so row-scales, POOT-1457) computes
-/// what the declared semantics compute, bit for bit: the oracle of the compiled graph (one row region with a side output, its projection, the epilogues) equals the oracle of the traced graph
-/// under the same operand precision, both for activations in f16's range (the scale is 1) and past it (the scale
+/// SC-2: the fused program (on RADV, where the declared f16 projections round) computes what the declared semantics
+/// compute, bit for bit: the oracle of the compiled graph (one row region with a side output, its projection, the
+/// epilogues) equals the oracle of the traced graph under the same operand precision, both for activations in f16's range (the scale is 1) and past it (the scale
 /// divides). Mutation: in the oracle's `side_output_definition` define the side output as the region's result
 /// (`output: region.output`); the oracle refuses the value it computes for the scale (`published [96, 64] for
 /// declared f32[96,1]`).
 #[test]
 fn the_fused_row_scale_evaluates_bit_for_bit_as_the_declared_block() {
     for norm_scale in [1.0, 1.0e6] {
-        let (g, inputs) = block(3, norm_scale);
+        let (g, inputs) = block(3, norm_scale, true);
         let program = compile(
             &g,
             &radv(),

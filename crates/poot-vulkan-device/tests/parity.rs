@@ -672,32 +672,15 @@ fn a_fused_row_scale_is_bitwise_the_unfused_block_on_vulkan() {
     .unwrap_or_else(|e| panic!("{e}"));
 }
 
-/// POOT-1457 SC-3 and SC-4 on raw Vulkan: the f16 range guard keeps a past-range block finite and on the oracle, and
-/// leaves an in-range block bit for bit the unguarded f16 one (`poot_executor_parity::f16_range_guard`). Mutation: in
-/// `select_operand_precision` push the narrowed contraction without `emit_row_scaled`; the past-range output is not
-/// finite.
+/// The default `Narrow` does not scale an operand past f16's range on raw Vulkan: the contractions and attentions
+/// round to f16 and every step's output carries a non-finite element (`poot_executor_parity::f16_range`). Mutation:
+/// in `select_operand_precision` skip the narrowing of attention; the attention fixtures no longer round to f16 and
+/// the row fails.
 #[test]
-fn the_f16_range_guard_holds_on_vulkan() {
+fn an_f16_overflow_stays_non_finite_on_vulkan() {
     let Some((mut exec, t)) = vulkan() else {
         return;
     };
-    poot_executor_parity::f16_range_guard::run_past_range(exec.as_mut(), t)
-        .unwrap_or_else(|e| panic!("{e}"));
-    poot_executor_parity::f16_range_guard::run_in_range_identity(exec.as_mut(), t)
-        .unwrap_or_else(|e| panic!("{e}"));
-}
-
-/// POOT-1455 on raw Vulkan: an f16 attention reads its query row-scaled, so a query past f16's range gives a finite
-/// output on the oracle, and an in-range query bit for bit the unguarded f16 attention's
-/// (`poot_executor_parity::attention_f16_range`). Mutation: in `emit_score` ignore `row_scale`; the past-range rows
-/// score at the wrong temperature and leave the oracle.
-#[test]
-fn the_attention_f16_range_guard_holds_on_vulkan() {
-    let Some((mut exec, t)) = vulkan() else {
-        return;
-    };
-    poot_executor_parity::attention_f16_range::run_past_range(exec.as_mut(), t)
-        .unwrap_or_else(|e| panic!("{e}"));
-    poot_executor_parity::attention_f16_range::run_in_range_identity(exec.as_mut(), t)
+    poot_executor_parity::f16_range::run_past_range(exec.as_mut(), t)
         .unwrap_or_else(|e| panic!("{e}"));
 }

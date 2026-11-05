@@ -69,20 +69,17 @@ pub fn attention_fixtures(precision: OperandPrecision) -> Vec<Fixture> {
     ]
     .into_iter()
     .map(|(name, heads, lq, lk, scales)| {
-        attention_fixture(name, precision, heads, (lq, lk), scales, 0.25)
+        attention_fixture(name, precision, heads, (lq, lk), scales)
     })
     .collect()
 }
 
-/// One attention over a query of magnitude up to `q_scale / 2` and an F16 key/value cache of magnitude up to
-/// `kv_scale / 2`, its scores multiplied by `score_scale`.
 pub(crate) fn attention_fixture(
     name: &'static str,
     precision: OperandPrecision,
     (hq, hkv, d): Heads,
     (lq, lk): (usize, usize),
     (q_scale, kv_scale): (f32, f32),
-    score_scale: f32,
 ) -> Fixture {
     let b = Builder::for_tests();
     let q = b
@@ -99,7 +96,7 @@ pub(crate) fn attention_fixture(
         .equation(
             OpKind::Attention(AttentionAttrs {
                 precision,
-                ..AttentionAttrs::new(hq / hkv, score_scale, None)
+                ..AttentionAttrs::new(hq / hkv, 0.25, None)
             }),
             [q, k, v, mask].map(|t| Operand::Value(t.id())).to_vec(),
         )
