@@ -224,7 +224,11 @@ fn pooled_qwen3moe_stages_run_the_contraction_and_pointwise_passes() {
     let formats = WeightFormats::from_weight_map(model.model.weights());
     let graph = bind_packed_weights(&graph, &formats).unwrap();
     let presets = [
-        ("wgpu", Backend::SpirvVulkan, DeviceCaps::wgpu_rdna3_igpu()),
+        (
+            "wgpu",
+            Backend::SpirvVulkan,
+            poot_test_util::device_caps::wgpu_rdna3_igpu(),
+        ),
         (
             "rocm",
             Backend::AmdGcn(AmdArch::gfx1151()),

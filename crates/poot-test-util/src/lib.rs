@@ -13,6 +13,7 @@ pub mod contained_child;
 pub mod device_caps;
 pub mod qwen_vl;
 pub mod smolvlm;
+pub mod toolchain;
 
 /// The manifest directory of the package whose test is running, read from `CARGO_MANIFEST_DIR` at run time.
 ///
@@ -276,6 +277,25 @@ pub fn model_path_with(
         return None;
     }
     Some(path)
+}
+
+/// Report that a checkpoint row cannot run because `what` is missing, `what` being anything but a model (a tool,
+/// a device): a panic under `POOT_REQUIRE_MODELS=1`, so a checkpoint lane fails on it instead of passing on a skip,
+/// and a `POOT-SKIP` report otherwise. A row calls this and returns.
+pub fn missing_prerequisite(what: &dyn std::fmt::Display) {
+    missing_prerequisite_with(|variable| std::env::var(variable).ok(), what);
+}
+
+/// [`missing_prerequisite`] with the environment injected, so a test can set one variable without touching the process.
+pub fn missing_prerequisite_with(
+    get: impl Fn(&str) -> Option<String>,
+    what: &dyn std::fmt::Display,
+) {
+    assert!(
+        get(REQUIRE_MODELS_VARIABLE).as_deref() != Some("1"),
+        "{what}, but {REQUIRE_MODELS_VARIABLE}=1: a checkpoint lane fails on a missing prerequisite"
+    );
+    eprintln!("POOT-SKIP: {what}");
 }
 
 /// `v` as little-endian bytes.
@@ -678,6 +698,22 @@ mod tests {
         );
 
         assert_eq!(found, Some(models.join("qwen2.5-0.5b-gguf/model.gguf")));
+    }
+
+    #[test]
+    fn a_missing_prerequisite_is_a_skip_unless_models_are_required() {
+        missing_prerequisite_with(env(&[]), &"llama-perplexity is not on PATH");
+        let message = panic_message(|| {
+            missing_prerequisite_with(
+                env(&[("POOT_REQUIRE_MODELS", "1")]),
+                &"llama-perplexity is not on PATH",
+            );
+        });
+        assert!(
+            message.contains("llama-perplexity is not on PATH")
+                && message.contains("POOT_REQUIRE_MODELS=1"),
+            "the panic names the prerequisite and the requirement, got: {message}"
+        );
     }
 
     #[test]

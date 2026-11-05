@@ -4092,7 +4092,7 @@ mod kernel_identity_tests {
         fn target(&self) -> poot_graph_plan::Target {
             poot_graph_plan::Target::Gpu {
                 backend: Backend::SpirvVulkan,
-                caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+                caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
             }
         }
         fn memory(&self) -> Vec<(BufferRole, poot_runtime_common::MemoryCounterSnapshot)> {
@@ -4458,7 +4458,7 @@ mod arena_slot_alloc_tests {
         fn target(&self) -> poot_graph_plan::Target {
             poot_graph_plan::Target::Gpu {
                 backend: Backend::SpirvVulkan,
-                caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+                caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
             }
         }
         fn memory(&self) -> Vec<(BufferRole, poot_runtime_common::MemoryCounterSnapshot)> {
@@ -4610,7 +4610,7 @@ mod f16_packed_weight_upload_tests {
         fn target(&self) -> poot_graph_plan::Target {
             poot_graph_plan::Target::Gpu {
                 backend: Backend::SpirvVulkan,
-                caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+                caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
             }
         }
         fn memory(&self) -> Vec<(BufferRole, poot_runtime_common::MemoryCounterSnapshot)> {
@@ -5439,7 +5439,7 @@ mod weight_source_tests {
         }
 
         fn target(&self) -> poot_graph_plan::Target {
-            let mut caps = poot_target::DeviceCaps::wgpu_rdna3_igpu();
+            let mut caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
             if let Some(cap) = self.cap {
                 caps.max_buffer_bytes = cap;
             }
@@ -8490,7 +8490,7 @@ mod weight_source_tests {
         fn target(&self) -> poot_graph_plan::Target {
             poot_graph_plan::Target::Gpu {
                 backend: Backend::SpirvVulkan,
-                caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+                caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
             }
         }
         fn memory(&self) -> Vec<(BufferRole, poot_runtime_common::MemoryCounterSnapshot)> {

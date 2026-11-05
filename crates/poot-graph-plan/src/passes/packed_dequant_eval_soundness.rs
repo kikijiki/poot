@@ -621,7 +621,7 @@ fn a_narrowed_packed_indexed_contraction_reads_its_operands_as_declared() {
         })
         .collect();
     let (graph, inputs) = indexed_graph(descriptor, &experts, &x_data, &route);
-    let target = crate::test_support::wgpu_rdna3_target();
+    let target = crate::tests::wgpu_rdna3_target();
     let f16 = FragmentDtype::F16;
     let run = |policy| {
         let declared = crate::with_operand_precision(&graph, &target, policy).unwrap();

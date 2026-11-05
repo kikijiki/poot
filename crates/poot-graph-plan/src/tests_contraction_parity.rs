@@ -101,7 +101,7 @@ fn assert_close(got: &[f32], want: &[f32], ctx: &str) {
 /// A device whose X grid holds `max_x` workgroups and whose watchdog splits a decode GEMV above `trigger`
 /// output elements: the production trigger, shrunk so the interpreter crosses it in a few workgroups.
 fn watchdog_caps(max_x: u32, trigger: u64) -> DeviceCaps {
-    let base = DeviceCaps::wgpu_rdna3_igpu();
+    let base = poot_test_util::device_caps::wgpu_rdna3_igpu();
     DeviceCaps {
         max_grid: [max_x, base.max_grid[1], base.max_grid[2]],
         watchdog_budget: Some(WatchdogBudget {
@@ -241,7 +241,7 @@ fn batched_tiled_gemm_is_one_body_across_the_tile_ceiling() {
     let backend = Backend::SpirvVulkan;
     let unsplit_caps = DeviceCaps {
         watchdog_budget: None,
-        ..DeviceCaps::wgpu_rdna3_igpu()
+        ..poot_test_util::device_caps::wgpu_rdna3_igpu()
     };
     for (e, m, k, n) in [
         (3usize, 19usize, 24usize, 21usize),
@@ -298,7 +298,7 @@ fn shared_weight_tiled_gemm_matches_the_oracle_across_the_tile_ceiling() {
     let backend = Backend::SpirvVulkan;
     let unsplit_caps = DeviceCaps {
         watchdog_budget: None,
-        ..DeviceCaps::wgpu_rdna3_igpu()
+        ..poot_test_util::device_caps::wgpu_rdna3_igpu()
     };
     let split_caps = DeviceCaps {
         known_miscompiles: poot_target::KnownMiscompiles {
@@ -348,7 +348,7 @@ fn no_imported_contraction_kernel_exists_or_is_planned() {
         );
     }
     // Every MatMul route, on a device that takes none of the tensor-core arms, is a generated contraction.
-    let caps = DeviceCaps::wgpu_rdna3_igpu();
+    let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     for (a, b) in [
         (vec![1, 1, 16], vec![16, 40]),
         (vec![3, 1, 16], vec![16, 40]),

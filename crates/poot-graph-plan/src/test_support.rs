@@ -72,15 +72,6 @@ pub fn gpu_backend(target: &Target) -> Backend {
     }
 }
 
-/// The wgpu RDNA3 iGPU as a compile target: SPIR-V with the f16 cooperative matrix, so a narrow policy gives it f16
-/// operands.
-pub fn wgpu_rdna3_target() -> Target {
-    Target::Gpu {
-        backend: Backend::SpirvVulkan,
-        caps: DeviceCaps::wgpu_rdna3_igpu(),
-    }
-}
-
 /// The graph `compile` hands the planner for `g` on the GPU target `backend` with `caps`: the one preparation
 /// pipeline every target runs under `policy`, for tests that assert on the prepared graph.
 pub fn compiled_graph(

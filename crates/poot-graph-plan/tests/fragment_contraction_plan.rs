@@ -41,7 +41,7 @@ fn rocm_wmma() -> Target {
 fn wgpu() -> Target {
     Target::Gpu {
         backend: Backend::SpirvVulkan,
-        caps: DeviceCaps::wgpu_rdna3_igpu(),
+        caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
     }
 }
 

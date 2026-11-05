@@ -1552,7 +1552,7 @@ pub(crate) mod oracle {
         );
         let target = poot_graph_plan::Target::Gpu {
             backend: poot_target::Backend::SpirvVulkan,
-            caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+            caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
         };
         let program = compile_staged(
             &g,

@@ -1821,6 +1821,7 @@ dependencies = [
  "poot-npu-artifacts",
  "poot-runtime-common",
  "poot-target",
+ "poot-test-util",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -2365,6 +2366,7 @@ dependencies = [
  "poot-kernel-ir",
  "poot-runtime-common",
  "poot-target",
+ "poot-test-util",
  "poot-wgpu-runtime",
  "serde_json",
  "thiserror 2.0.18",

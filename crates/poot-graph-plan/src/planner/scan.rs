@@ -70,7 +70,11 @@ pub(crate) fn scan_geometry(layout: &ScanLayout, caps: &DeviceCaps) -> Option<Sc
     };
     let unsplit = fit(1, limit.min(MAX_COLS))?;
     let launched_lanes = layout.heads * layout.width.next_multiple_of(unsplit.state_cols);
-    let fills_device = launched_lanes >= caps.compute_units as usize * LANES_PER_COMPUTE_UNIT;
+    // With no compute-unit count there is no idle device to prove, so the scan stays unsplit.
+    let fills_device = caps
+        .compute_units
+        .known()
+        .is_none_or(|units| launched_lanes >= units as usize * LANES_PER_COMPUTE_UNIT);
     if layout.len < MIN_SPLIT_STEPS || fills_device {
         return Some(unsplit);
     }
@@ -130,4 +134,35 @@ pub(super) fn plan(
         row_split: split,
     };
     Planned::generated(site, KernelRequest::Scan(spec), backend, caps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use poot_target::Queried;
+
+    /// A long sequence over few heads leaves a known device idle, so the state's rows are shared between lanes; the
+    /// same layout on a device whose compute units are unknown cannot show the idle device and keeps one lane per
+    /// column (POOT-1468).
+    ///
+    /// Mutation: in `scan_geometry`, read an unknown count as not filled (`is_none_or` -> `is_some_and`); the
+    /// unknown-count row shares rows and goes red.
+    #[test]
+    fn a_scan_on_unknown_compute_units_stays_unsplit() {
+        let layout = ScanLayout {
+            heads: 2,
+            len: 1024,
+            state_rows: 128,
+            width: 8,
+        };
+        let known = poot_test_util::device_caps::wgpu_rdna3_igpu();
+        let unknown = DeviceCaps {
+            compute_units: Queried::Unknown,
+            ..known
+        };
+        let split =
+            |caps: &DeviceCaps| scan_geometry(&layout, caps).expect("one column fits").split;
+        assert!(split(&known) > 1, "the known-count control must share rows");
+        assert_eq!(split(&unknown), 1);
+    }
 }

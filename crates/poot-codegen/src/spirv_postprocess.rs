@@ -1265,21 +1265,11 @@ mod tests {
 
     /// End to end: compile the builtin-call IR through the real `llc` with poot's Vulkan triple, confirm
     /// `spirv-val --target-env vulkan1.3` rejects the raw output (the Import/Linkage shape) and accepts the
-    /// output of `fix_coopmat_calls`. Needs `llc` and `spirv-val` on PATH (`nix develop`); skips otherwise,
-    /// as `crates/poot-codegen/tests/llc.rs`'s `add_spirv_validates` does. The `.ll` fixture matches
+    /// output of `fix_coopmat_calls`. Needs `llc` and `spirv-val` on PATH (`nix develop`); fails without them. The `.ll` fixture matches
     /// `specs/113-vulkan-coopmat/probe-fixtures/02_vulkan_env_load_muladd_store_IMPORT_LINKAGE.ll`.
     #[test]
     fn real_llc_output_before_fails_validation_after_fix_passes() {
-        fn have(bin: &str) -> bool {
-            std::process::Command::new(bin)
-                .arg("--version")
-                .output()
-                .is_ok()
-        }
-        if !have("llc") || !have("spirv-val") {
-            eprintln!("llc/spirv-val not on PATH; skipping coopmat route-1 round-trip probe");
-            return;
-        }
+        poot_test_util::toolchain::require_tools(&["llc", "spirv-val"]);
 
         let dir = std::env::temp_dir().join("poot-codegen-coopmat-probe");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1355,16 +1345,7 @@ mod tests {
     /// three builtins.
     #[test]
     fn real_llc_coopmat_tile_with_zero_accumulator_validates_after_fix() {
-        fn have(bin: &str) -> bool {
-            std::process::Command::new(bin)
-                .arg("--version")
-                .output()
-                .is_ok()
-        }
-        if !have("llc") || !have("spirv-val") {
-            eprintln!("llc/spirv-val not on PATH; skipping coopmat tile round-trip probe");
-            return;
-        }
+        poot_test_util::toolchain::require_tools(&["llc", "spirv-val"]);
 
         let dir = std::env::temp_dir().join("poot-codegen-coopmat-tile-probe");
         std::fs::create_dir_all(&dir).unwrap();

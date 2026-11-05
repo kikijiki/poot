@@ -37,7 +37,7 @@ const LIMIT: u64 = 4096;
 fn caps(max_buffer_bytes: u64) -> DeviceCaps {
     DeviceCaps {
         max_buffer_bytes,
-        ..DeviceCaps::wgpu_rdna3_igpu()
+        ..poot_test_util::device_caps::wgpu_rdna3_igpu()
     }
 }
 

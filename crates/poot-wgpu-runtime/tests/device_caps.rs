@@ -1,7 +1,9 @@
 //! SC-004 (card 522): `Context::device_caps` compares field-for-field against a direct wgpu adapter
-//! query taken independently of `Context::new`, not by re-reading the same cached struct fields. Skips
-//! (passes) with no Vulkan adapter, like every other test in this crate.
+//! query taken independently of `Context::new`, not by re-reading the same cached struct fields. A missing
+//! device is a `POOT-SKIP`, and a failure when `POOT_REQUIRE_WGPU` requires it.
 
+use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::device_skip::{open_or_skip, skip_unsupported};
 use poot_wgpu_runtime::Context;
 
 /// The same adapter selection `Context::new_async` makes (same power preference), queried directly
@@ -21,15 +23,11 @@ async fn raw_adapter() -> Option<wgpu::Adapter> {
 
 #[test]
 fn wgpu_device_caps_matches_a_direct_adapter_query() {
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let Some(adapter) = pollster::block_on(raw_adapter()) else {
-        eprintln!("no GPU (raw adapter query failed); skipping");
+        skip_unsupported(DeviceBackend::Wgpu, "a raw adapter query");
         return;
     };
     let info = adapter.get_info();

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Required-case gate for the `just test-device-*` lanes (card 670).
+"""Required-case gate for the `just test-device-*` lanes (card 670) and the checkpoint-style lanes (POOT-1467).
 
 Each lane has a hand-maintained list, scripts/required-device-cases/<lane>.txt - one line per
 required case, `binary_id<TAB>test_name` (the same identity JUnit reports as `classname` and
@@ -9,6 +9,12 @@ nextest run, this gate compares that list with the run's actual results
 and fails when a required case did not run, failed, or was skipped. The two lists are
 independently sourced, so a comparison that read its required cases from the run's own results
 passes trivially; `--self-test` proves both of the card's mutations red against fixture results.
+
+The four non-device lanes that run required-checkpoint rows by exact name (`checkpoint`, `checkpoint-large`,
+`real-dims-long`, `npu-toolchain`) are gated the same way: their required rows are the lane's rows of
+scripts/required-checkpoint-cases.txt (`lane<TAB>binary_id<TAB>test_name`), they run under the nextest profile
+`lane-<lane>`, and they have no unlisted or parked rows, because the lane's selection is its required list: a
+row that ran and is not required fails the gate as unclassified.
 
 Every lane classifies every row it ran: a passing row that is in neither the required list nor the lane's
 `<lane>.unlisted.txt` (`binary_id<TAB>test_name<TAB>reason`, a deliberate non-requirement with its reason; the
@@ -55,6 +61,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 REQUIRED_DIR = ROOT / "scripts" / "required-device-cases"
+REQUIRED_CHECKPOINTS = ROOT / "scripts" / "required-checkpoint-cases.txt"
+
+# The non-device lanes whose required rows are in REQUIRED_CHECKPOINTS, and run under the profile `lane-<lane>`.
+CHECKPOINT_STYLE_LANES = ("checkpoint", "checkpoint-large", "npu-toolchain", "real-dims-long")
 
 SKIP_REPORT = re.compile(r"(?:^|\s)POOT-SKIP(?::|\s|$)")
 
@@ -70,40 +80,54 @@ def rel(path: Path) -> str:
         return str(path)
 
 
-def parse_required_list(path: Path) -> tuple[list[tuple[str, str]], list[str]]:
-    """The required rows of a hand-maintained list, plus every schema problem in it."""
+def profile_of(lane: str) -> str:
+    """The nextest profile a lane runs under, and so the report name its results file carries."""
+    return f"lane-{lane}" if lane in CHECKPOINT_STYLE_LANES else f"device-{lane}"
+
+
+def parse_required_list(path: Path, lane: str | None = None) -> tuple[list[tuple[str, str]], list[str]]:
+    """The required rows of a hand-maintained list, plus every schema problem in it.
+
+    With a `lane`, the list is the checkpoint list (`lane<TAB>binary_id<TAB>test_name`) and the rows are the lane's."""
     if not path.is_file():
         return [], [f"required-case list missing: {rel(path)}"]
     rows: list[tuple[str, str]] = []
     problems: list[str] = []
     seen: set[tuple[str, str]] = set()
     text = path.read_text(encoding="ascii")
+    columns = 2 if lane is None else 3
     for lineno, line in enumerate(text.splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         parts = line.split("\t")
-        if len(parts) != 2 or not parts[0] or not parts[1]:
-            problems.append(
-                f"required-case list malformed at line {lineno}: expected binary_id<TAB>test_name: {line}"
-            )
+        if len(parts) != columns or not all(parts):
+            expected = "binary_id<TAB>test_name" if lane is None else "lane<TAB>binary_id<TAB>test_name"
+            problems.append(f"required-case list malformed at line {lineno}: expected {expected}: {line}")
             continue
+        if lane is not None:
+            if parts[0] != lane:
+                continue
+            parts = parts[1:]
         row = (parts[0], parts[1])
         if row in seen:
             problems.append(f"required-case list has a duplicate row: {row[0]} {row[1]}")
         seen.add(row)
         rows.append(row)
     if not rows and not problems:
-        problems.append(f"required-case list is empty: {rel(path)} names no test")
+        problems.append(f"required-case list is empty: {rel(path)} names no test" + (f" for lane {lane}" if lane else ""))
     data_lines = [f"{binary}\t{test}" for binary, test in rows]
     if data_lines != sorted(data_lines):
         problems.append(f"required-case list is not in canonical sorted order: {rel(path)}")
     return rows, problems
 
 
-def parse_unlisted_list(path: Path) -> tuple[dict[tuple[str, str], str], list[str]]:
+def parse_unlisted_list(path: Path | None) -> tuple[dict[tuple[str, str], str], list[str]]:
     """The deliberately unlisted rows of a lane (row -> reason), plus every schema problem in it.
 
-    Every lane has the file; a lane with nothing to leave unlisted has one with only comments."""
+    Every device lane has the file; a lane with nothing to leave unlisted has one with only comments. A lane
+    whose selection is its required list (`CHECKPOINT_STYLE_LANES`) has no file (`None`) and leaves nothing unlisted."""
+    if path is None:
+        return {}, []
     if not path.is_file():
         return {}, [f"unlisted-case list missing: {rel(path)}"]
     rows: dict[tuple[str, str], str] = {}
@@ -216,9 +240,9 @@ def load_results(
         raise Problem(f"lane results are not valid XML: {rel(path)}: {error}") from error
     if lane is not None:
         profile = tree.getroot().get("name")
-        if profile != f"device-{lane}":
+        if profile != profile_of(lane):
             raise Problem(
-                f"lane results are foreign: {rel(path)} was written by profile {profile!r}, not device-{lane}"
+                f"lane results are foreign: {rel(path)} was written by profile {profile!r}, not {profile_of(lane)}"
             )
     results: dict[tuple[str, str], tuple[str, str]] = {}
     for case in tree.getroot().iter("testcase"):
@@ -248,9 +272,10 @@ def check(
     list_path: Path,
     results_path: Path,
     label: str,
-    unlisted_path: Path,
+    unlisted_path: Path | None,
     bound_lane: str | None = None,
     parked_path: Path | None = None,
+    list_lane: str | None = None,
 ) -> int:
     """Fail unless every required case in list_path ran and passed in results_path.
 
@@ -259,7 +284,7 @@ def check(
     file to its run (see `load_results`). A parked row (parked_path) is in neither list and is not run; if it
     runs and passes, it fails the gate until it is moved back to the required list, so a parking cannot outlive
     its fix."""
-    rows, problems = parse_required_list(list_path)
+    rows, problems = parse_required_list(list_path, list_lane)
     unlisted, unlisted_problems = parse_unlisted_list(unlisted_path)
     parked, parked_problems = parse_parked_list(parked_path)
     problems += unlisted_problems + parked_problems
@@ -296,10 +321,10 @@ def check(
                     f"{identity[0]} {identity[1]}"
                 )
             elif identity not in unlisted and identity not in parked and status == "passed":
-                problems.append(
-                    f"unclassified passing row (list it in {rel(list_path)} or give it a reason in "
-                    f"{rel(unlisted_path)}): {identity[0]} {identity[1]}"
-                )
+                where = f"list it in {rel(list_path)}"
+                if unlisted_path is not None:
+                    where += f" or give it a reason in {rel(unlisted_path)}"
+                problems.append(f"unclassified passing row ({where}): {identity[0]} {identity[1]}")
         for binary, test in sorted(unlisted):
             if (binary, test) not in results:
                 problems.append(f"unlisted case did not run: {binary} {test}")
@@ -384,6 +409,27 @@ def run_fixture(
             status = check(
                 list_path, results_path, "fixture", unlisted_path, run.lane if run else None, parked_path
             )
+    return status, captured.getvalue()
+
+
+def run_checkpoint_fixture(
+    list_text: str, results_xml: str, lane: str, run: "BoundRun | None" = None
+) -> tuple[int, str]:
+    """Run the gate for a checkpoint-style lane (rows `lane<TAB>binary_id<TAB>test_name`, no unlisted list)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        list_path = directory / "required-checkpoint-cases.txt"
+        list_path.write_text(list_text, encoding="ascii")
+        results_path = directory / "results.xml"
+        if run is not None:
+            begin(run.lane, results_path)
+        results_path.write_text(results_xml, encoding="ascii")
+        if run is not None:
+            marker_ns = marker_path(results_path).stat().st_mtime_ns
+            os.utime(results_path, ns=(marker_ns + run.results_offset_ns,) * 2)
+        captured = io.StringIO()
+        with redirect_stderr(captured), redirect_stdout(io.StringIO()):
+            status = check(list_path, results_path, lane, None, run.lane if run else None, None, lane)
     return status, captured.getvalue()
 
 
@@ -638,8 +684,71 @@ def self_test() -> int:
     for label, needle, run in binding:
         if not expect_rejection(label, needle, FIXTURE_LIST_AB, FIXTURE_GREEN, "", run):
             return 1
+    if not checkpoint_lane_self_test():
+        return 1
     print("required-case gate self-test: pass")
     return 0
+
+
+def checkpoint_lane_self_test() -> bool:
+    """The checkpoint-style lanes (POOT-1467): only the lane's own rows of the shared list are required, and a
+    skip, an absent row, a failed row or an unrequired row that ran fails the gate."""
+    alpha = "poot-wgpu-device::fixture\talpha_case"
+    both_lanes = f"checkpoint\t{alpha}\ncheckpoint-large\tpoot-wgpu-device::fixture\tbeta_case\n"
+    status, output = run_checkpoint_fixture(both_lanes, FIXTURE_ALPHA_ONLY, "checkpoint")
+    if status != 0:
+        print("checkpoint-lane check rejected a lane that ran exactly its rows", file=sys.stderr)
+        print(output, file=sys.stderr)
+        return False
+    print("required-case check accepted: a checkpoint lane that ran exactly its own rows")
+    rejections = [
+        (
+            "checkpoint lane row skipped",
+            "required case skipped: poot-wgpu-device::fixture alpha_case: POOT-SKIP: llama-perplexity is not on PATH",
+            fixture_with_alpha("      <system-err>POOT-SKIP: llama-perplexity is not on PATH\n</system-err>"),
+            both_lanes,
+            None,
+        ),
+        (
+            "checkpoint lane row absent",
+            "required case did not run: poot-wgpu-device::fixture beta_case",
+            FIXTURE_ALPHA_ONLY,
+            f"checkpoint\t{alpha}\ncheckpoint\tpoot-wgpu-device::fixture\tbeta_case\n",
+            None,
+        ),
+        (
+            "checkpoint lane ran a row the lane does not require",
+            "unclassified passing row (list it in",
+            FIXTURE_GREEN,
+            f"checkpoint\t{alpha}\n",
+            None,
+        ),
+        (
+            "checkpoint lane results written by another profile",
+            "lane results are foreign",
+            FIXTURE_ALPHA_ONLY,
+            f"checkpoint\t{alpha}\n",
+            BoundRun("checkpoint", 1_000_000),
+        ),
+        (
+            "lane with no row in the list",
+            "required-case list is empty",
+            FIXTURE_ALPHA_ONLY,
+            "checkpoint-large\tpoot-wgpu-device::fixture\tbeta_case\n",
+            None,
+        ),
+    ]
+    for label, needle, results_xml, list_text, run in rejections:
+        status, output = run_checkpoint_fixture(list_text, results_xml, "checkpoint", run)
+        if status == 0:
+            print(f"required-case mutation unexpectedly passed: {label}", file=sys.stderr)
+            return False
+        if needle not in output:
+            print(f"required-case check did not name its mismatch: {label} (wanted {needle})", file=sys.stderr)
+            print(output, file=sys.stderr)
+            return False
+        print(f"required-case check rejected: {label} ({needle})")
+    return True
 
 
 def main(argv: list[str]) -> int:
@@ -651,6 +760,8 @@ def main(argv: list[str]) -> int:
         results_path = Path(results)
         if command == "begin":
             return begin(lane, results_path)
+        if lane in CHECKPOINT_STYLE_LANES:
+            return check(REQUIRED_CHECKPOINTS, results_path, lane, None, lane, None, lane)
         return check(
             REQUIRED_DIR / f"{lane}.txt",
             results_path,

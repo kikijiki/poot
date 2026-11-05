@@ -20,6 +20,12 @@ pub enum PtxError {
         /// The fault that poisoned the context.
         cause: DriverError,
     },
+    /// A device ordinal that does not fit the CUDA driver's `int` ordinal.
+    #[error("device ordinal {ordinal} does not fit a CUDA device ordinal")]
+    InvalidOrdinal {
+        /// The requested ordinal.
+        ordinal: usize,
+    },
     /// The kernel text or entry name could not be loaded as a PTX module; carries the reason.
     #[error("invalid kernel text or entry name: {0}")]
     BadKernel(String),

@@ -508,7 +508,7 @@ pub(super) fn register_tiled_launch(
     let per_dispatch = wave_aligned_chunk(
         tiles,
         per_dispatch,
-        caps.compute_units as usize,
+        caps.compute_units.known().map_or(1, |units| units as usize),
         caps.max_grid[0].max(1) as usize,
     );
     let extents = [shape.k, shape.out_per_block, grid_rows]

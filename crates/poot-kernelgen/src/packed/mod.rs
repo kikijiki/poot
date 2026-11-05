@@ -1319,7 +1319,7 @@ mod contraction_tests {
                                 weight_bits: crate::packed_value_bits(format),
                                 activation_bits: 32,
                             },
-                            &poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+                            &poot_test_util::device_caps::wgpu_rdna3_igpu(),
                         )
                         .schedule()
                     } else {
@@ -2975,7 +2975,7 @@ mod planar_wgpu_tests {
     /// this row goes red ("element 2080: got 0 want 2460.198").
     #[test]
     fn the_register_tiled_body_runs_256_lane_workgroups_on_radv() {
-        wide_tile_matches_reference_on_radv(&poot_target::DeviceCaps::wgpu_rdna3_igpu(), 256);
+        wide_tile_matches_reference_on_radv(&poot_test_util::device_caps::wgpu_rdna3_igpu(), 256);
     }
 }
 

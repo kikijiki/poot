@@ -25,7 +25,7 @@ use poot_graph_plan::{
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::WeightStore;
-use poot_target::{Backend, DeviceCaps};
+use poot_target::Backend;
 
 #[derive(Default)]
 struct ControlInner {
@@ -84,7 +84,7 @@ impl Device for FakeDevice {
     fn target(&self) -> Target {
         Target::Gpu {
             backend: Backend::SpirvVulkan,
-            caps: DeviceCaps::wgpu_rdna3_igpu(),
+            caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
         }
     }
 

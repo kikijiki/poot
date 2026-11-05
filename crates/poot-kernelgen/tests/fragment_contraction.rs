@@ -68,7 +68,7 @@ fn wgpu_device() -> Option<Device> {
             return None;
         }
     };
-    let caps = DeviceCaps::wgpu_rdna3_igpu();
+    let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     let dir = work_dir("fragment_contraction_wgpu");
     Some(Device {
         name: "wgpu (RADV cooperative matrix)",

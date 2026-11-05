@@ -688,7 +688,9 @@ pub(crate) fn caps_from_agent(probe: &AgentProbe<'_>) -> poot_target::DeviceCaps
         },
         matrix_units: poot_target::Queried::Known(matrix_units),
         register_file,
-        compute_units: probe.compute_units.unwrap_or(defaults.compute_units),
+        compute_units: probe
+            .compute_units
+            .map_or(poot_target::Queried::Unknown, poot_target::Queried::Known),
         // 0 is the failed one-time pool query: unknown, not an empty device.
         memory_budget_bytes: (probe.vram_total_bytes != 0).then_some(probe.vram_total_bytes),
         dram_channels: poot_target::dram_channels::DramChannels::of_device_name(probe.isa_name),
@@ -761,7 +763,7 @@ mod caps_tests {
             Queried::Known(poot_target::MatrixUnits::NONE),
             "CDNA is MFMA: no fragment lowering yet"
         );
-        assert_eq!(caps.compute_units, 7);
+        assert_eq!(caps.compute_units, Queried::Known(7));
         assert_eq!(caps.memory_budget_bytes, Some(12_345), "the pool size");
         assert_eq!(caps.lds_bytes, 12_288, "the group-segment size");
         assert_eq!(caps.max_workgroup_size, [1000, 500, 60]);
@@ -897,7 +899,11 @@ mod caps_tests {
             caps.max_buffer_bytes,
             DeviceCaps::rocm_default().max_buffer_bytes
         );
-        assert_eq!(caps.compute_units, DeviceCaps::rocm_default().compute_units);
+        assert_eq!(
+            caps.compute_units,
+            Queried::Unknown,
+            "a failed compute-unit query is unknown, not a neighbour's count"
+        );
     }
 }
 

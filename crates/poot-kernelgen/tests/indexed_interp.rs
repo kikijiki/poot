@@ -5,7 +5,7 @@
 
 use poot_kernel_ir::interp::{Buffer, run};
 use poot_kernelgen as kg;
-use poot_target::{BufferStorage, DeviceCaps};
+use poot_target::BufferStorage;
 
 const EXPERTS: usize = 4;
 const K: usize = 10;
@@ -119,7 +119,7 @@ fn run_indexed(
     layout: kg::WeightLayout,
     weight: BufferStorage,
 ) -> Vec<f32> {
-    let caps = DeviceCaps::wgpu_rdna3_igpu();
+    let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     let limits = kg::BodyLimits {
         max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),
         max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),
@@ -232,7 +232,7 @@ fn an_invalid_expert_id_is_a_nan_row_and_never_an_out_of_range_read() {
                     weight_bits: kg::DenseTiledWeight::Nk(weight).bits(),
                     activation_bits: 32,
                 },
-                &DeviceCaps::wgpu_rdna3_igpu(),
+                &poot_test_util::device_caps::wgpu_rdna3_igpu(),
             )
             .schedule();
             assert_eq!(tiled.output_tile(), Some((16, 32)), "{tiled:?}");
@@ -284,7 +284,11 @@ fn an_f16_packed_indexed_weight_is_refused_by_name() {
         max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),
         max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),
     };
-    let error = kg::generate(&request, &DeviceCaps::wgpu_rdna3_igpu(), &limits)
-        .expect_err("an F16 indexed weight has no body");
+    let error = kg::generate(
+        &request,
+        &poot_test_util::device_caps::wgpu_rdna3_igpu(),
+        &limits,
+    )
+    .expect_err("an F16 indexed weight has no body");
     assert!(error.to_string().contains("an indexed weight"), "{error}");
 }

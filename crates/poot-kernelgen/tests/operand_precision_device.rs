@@ -9,7 +9,7 @@ use poot_codegen::compile_kernel;
 use poot_eval::round_to_fragment;
 use poot_graph_ir::{FragmentDtype, OperandPrecision};
 use poot_kernelgen as kg;
-use poot_target::{Backend, BufferStorage, DeviceCaps};
+use poot_target::{Backend, BufferStorage};
 use poot_wgpu_runtime::{Context, KernelBuffer};
 
 /// One `K = 16` staging round: a probe row `[x, 0, ..]` fills it, so no tail slot is masked.
@@ -58,7 +58,7 @@ fn probes() -> Vec<f32> {
 /// `precision` staged by the register-tiled GEMM on wgpu: `out[i] = narrow(x_i) * 1` for the probe rows `[x, 0, ..]`
 /// against the weight row `[1, 0, ..]`.
 fn staged_on_wgpu(ctx: &Context, precision: OperandPrecision, probes: &[f32]) -> Vec<f32> {
-    let caps = DeviceCaps::wgpu_rdna3_igpu();
+    let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     let m = probes.len();
     let schedule = kg::RegisterTiling::choose(
         kg::TiledShape {

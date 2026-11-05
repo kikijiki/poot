@@ -125,8 +125,14 @@ impl Context {
 
         // SAFETY: `physical_device` is from this instance's own enumeration.
         let device_extensions =
-            unsafe { instance.enumerate_device_extension_properties(physical_device) }
-                .unwrap_or_default();
+            match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
+                Ok(extensions) => extensions,
+                Err(e) => {
+                    // SAFETY: no device was created; the instance is still solely owned here.
+                    unsafe { instance.destroy_instance(None) };
+                    return Err(e.into());
+                }
+            };
         // SAFETY: `physical_device` is from this instance's own enumeration.
         let physical_props = unsafe { instance.get_physical_device_properties(physical_device) };
         let features = DeviceFeatures::query(
@@ -169,10 +175,19 @@ impl Context {
             let coop_matrix = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
             // SAFETY: `has_cooperative_matrix` confirmed the extension is supported on this physical
             // device, so the loaded function pointer is real (not the ash panic-on-call stub).
-            let configs = unsafe {
+            let configs = match unsafe {
                 coop_matrix.get_physical_device_cooperative_matrix_properties(physical_device)
-            }
-            .unwrap_or_default();
+            } {
+                Ok(configs) => configs,
+                Err(e) => {
+                    // SAFETY: nothing was created from `device` yet, and `instance` is solely owned here.
+                    unsafe {
+                        device.destroy_device(None);
+                        instance.destroy_instance(None);
+                    }
+                    return Err(e.into());
+                }
+            };
             configs
                 .into_iter()
                 .filter(|c| c.scope == vk::ScopeKHR::SUBGROUP)
@@ -284,15 +299,14 @@ impl Context {
         let known_miscompiles = calibration.known_miscompiles;
         // Channel data is per part, read from the device's own name (RADV names Strix Halo in it).
         let dram_channels = poot_target::dram_channels::DramChannels::of_device_name(&device_name);
-        // Card 653: AMD's shader-core properties where the driver exposes them, else
-        // the RDNA3 default, as the wgpu runtime does. The same properties give the register file
+        // Card 653: AMD's shader-core properties where the driver exposes them, else unknown
+        // (POOT-1468), as the wgpu runtime does. The same properties give the register file
         // (POOT-1447), unknown on any other device.
         // SAFETY: `physical_device` is from this instance's own enumeration.
         let shader_core = unsafe { amd_vulkan_shader_core(&owner.instance, physical_device) };
-        let compute_units = shader_core.map_or(
-            poot_target::DeviceCaps::wgpu_rdna3_igpu().compute_units,
-            |core| core.compute_units,
-        );
+        let compute_units = shader_core.map_or(poot_target::Queried::Unknown, |core| {
+            poot_target::Queried::Known(core.compute_units)
+        });
         let register_file = shader_core.map_or(poot_target::Queried::Unknown, |core| {
             poot_target::Queried::Known(poot_target::RegisterFile::amd_shader_core(
                 core.max_vgpr_allocation,
@@ -451,7 +465,7 @@ impl Context {
     /// allocation a descriptor can bind whole; Card 553, R-553-1). This crate dispatches the same SPIR-V through the same Vulkan driver
     /// as `poot-wgpu-runtime` (wgpu), so an AMD Vulkan (RADV) device shares its RADV gfx-ring wedge
     /// (`max_buffer_bytes`), display-watchdog budget and card-095 tiled-GEMM miscompile ceiling; both are
-    /// the same vendor-scoped default ([`poot_target::DeviceCaps::wgpu_rdna3_igpu`]) `poot-wgpu-runtime`
+    /// the same vendor-scoped default (`poot_test_util::device_caps::wgpu_rdna3_igpu`) `poot-wgpu-runtime`
     /// reports there, not a device query (neither is exposed by any driver API). `matrix_units` come from the
     /// `VK_KHR_cooperative_matrix` query measured once at construction (card 522 review), never parsed
     /// from `device_name()`'s marketing codename string.

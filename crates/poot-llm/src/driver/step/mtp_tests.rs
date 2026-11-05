@@ -26,7 +26,7 @@ use poot_models::model::{
 use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::BufferRole;
-use poot_target::{Backend, DeviceCaps};
+use poot_target::Backend;
 use poot_tensor::{DType, HostTensor};
 use poot_test_util::per_backend;
 use poot_text::{ChatFormat, HermesToolCodec};
@@ -260,7 +260,7 @@ impl Device for FakeDevice {
     fn target(&self) -> Target {
         Target::Gpu {
             backend: Backend::SpirvVulkan,
-            caps: DeviceCaps::wgpu_rdna3_igpu(),
+            caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
         }
     }
     fn memory(&self) -> Vec<(BufferRole, poot_runtime_common::MemoryCounterSnapshot)> {

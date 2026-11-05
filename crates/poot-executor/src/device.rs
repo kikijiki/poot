@@ -526,12 +526,12 @@ mod flush_policy_tests {
     /// `Some(Self::WATCHDOG)` unconditionally; the budget-less rows fail on `None`.
     #[test]
     fn a_device_has_a_flush_policy_exactly_when_it_has_a_watchdog_budget() {
-        assert!(FlushPolicy::of(&DeviceCaps::wgpu_rdna3_igpu()).is_some());
+        assert!(FlushPolicy::of(&poot_test_util::device_caps::wgpu_rdna3_igpu()).is_some());
         assert_eq!(FlushPolicy::of(&DeviceCaps::rocm_default()), None);
         assert_eq!(FlushPolicy::of(&DeviceCaps::ptx_default()), None);
         let unbudgeted = DeviceCaps {
             watchdog_budget: None,
-            ..DeviceCaps::wgpu_rdna3_igpu()
+            ..poot_test_util::device_caps::wgpu_rdna3_igpu()
         };
         assert_eq!(FlushPolicy::of(&unbudgeted), None);
     }

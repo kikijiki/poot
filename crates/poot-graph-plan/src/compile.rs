@@ -77,7 +77,7 @@ pub use package::{ArtifactGranularity, Region};
 /// use poot_target::{AieTargetId, DeviceCaps};
 /// let _ = NpuTarget::Aie {
 ///     target: AieTargetId::Xdna2,
-///     caps: DeviceCaps::wgpu_rdna3_igpu(),
+///     caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
 /// };
 /// ```
 ///

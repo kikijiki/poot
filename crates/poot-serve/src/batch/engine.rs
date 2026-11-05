@@ -317,7 +317,11 @@ impl DriverEngine {
                 .map_err(refuse)?;
             if let Err(error) = self.prepare_adapters(generation) {
                 // Nothing serves the generation: drop it so a refused load leaves the engine as it was.
-                let _ = self.driver.unload_adapter_set(generation);
+                // An unload that fails is retried by `reap_retired`, like any generation that outlives its set.
+                if let Err(unload) = self.driver.unload_adapter_set(generation) {
+                    tracing::warn!(%unload, "unload of a refused adapter generation failed; retrying");
+                    self.adapters.retired.push(generation);
+                }
                 return Err(refuse(error));
             }
             Some(generation)

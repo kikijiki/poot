@@ -1,6 +1,6 @@
 //! End-to-end: poot-kernel-ir Body -> poot-codegen SPIR-V -> wgpu dispatch on the Arc, checking the
-//! result against the CPU computation (the GPU-path executor-equivalence anchor). Skips (passes) if no
-//! Vulkan adapter is available.
+//! result against the CPU computation (the GPU-path executor-equivalence anchor). A missing
+//! device is a `POOT-SKIP`, and a failure when `POOT_REQUIRE_WGPU` requires it.
 
 use std::path::PathBuf;
 
@@ -8,6 +8,8 @@ use poot_codegen::CompiledKernel;
 use poot_codegen::{Target, compile_kernel, kernel_handle};
 use poot_kernel_ir::fixtures;
 use poot_kernel_ir::test_support::{matmul_kernel, square_kernel};
+use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::device_skip::open_or_skip;
 use poot_wgpu_runtime::{Context, KernelBuffer};
 
 fn spv_for(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel {
@@ -21,12 +23,8 @@ fn spv_for(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel {
 
 #[test]
 fn add_runs_on_gpu() {
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let spv = spv_for(&fixtures::add_kernel(), "add");
     let a = [1.0f32, 2.0, 3.0, 4.0, 5.0];
@@ -43,12 +41,8 @@ fn add_runs_on_gpu() {
 
 #[test]
 fn square_runs_on_gpu() {
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let spv = spv_for(&square_kernel(), "square");
     let x = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -63,12 +57,8 @@ fn square_runs_on_gpu() {
 
 #[test]
 fn matmul_runs_on_gpu() {
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let (m, n, k) = (2usize, 3, 4);
     let spv = spv_for(&matmul_kernel(m, n, k), "matmul");
@@ -108,12 +98,8 @@ fn matmul_runs_on_gpu() {
 #[test]
 fn add_device_resident() {
     use poot_kernel_ir::fixtures;
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let spv = spv_for(&fixtures::add_kernel(), "add");
     let a = [1.0f32, 2.0, 3.0, 4.0, 5.0];

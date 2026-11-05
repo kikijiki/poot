@@ -8,7 +8,7 @@
 //! device.
 
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use poot_executor::Executor;
@@ -33,6 +33,9 @@ pub enum EncoderError {
     /// Tokenizing the text for the encoder failed.
     #[error(transparent)]
     Text(#[from] TextError),
+    /// The checkpoint's pooling module is unreadable or selects a pooling poot does not implement.
+    #[error(transparent)]
+    Pooling(#[from] PoolingError),
     /// The text tokenizes to no token at all, so there is no row to pool or score.
     #[error("cannot embed empty text")]
     EmptyText,
@@ -71,21 +74,97 @@ pub enum Pooling {
     Cls,
 }
 
+/// Why a checkpoint's `1_Pooling/config.json` is refused.
+#[derive(Debug, thiserror::Error)]
+pub enum PoolingError {
+    /// The file exists but cannot be read.
+    #[error("pooling config {path}: {source}")]
+    Unreadable {
+        /// The `1_Pooling/config.json` that could not be read.
+        path: PathBuf,
+        /// The underlying I/O failure.
+        source: std::io::Error,
+    },
+    /// The file is not a JSON object.
+    #[error("pooling config {path}: {source}")]
+    Malformed {
+        /// The `1_Pooling/config.json` that did not parse.
+        path: PathBuf,
+        /// The parse failure.
+        source: serde_json::Error,
+    },
+    /// A `pooling_mode_*` field is present and not a boolean.
+    #[error("pooling config {path}: `{field}` must be a boolean")]
+    NotBoolean {
+        /// The `1_Pooling/config.json` carrying the field.
+        path: PathBuf,
+        /// The offending field.
+        field: &'static str,
+    },
+    /// The checkpoint selects a pooling poot does not implement.
+    #[error(
+        "pooling config {path}: `{field}` is set, and poot implements only CLS and mean pooling"
+    )]
+    Unsupported {
+        /// The `1_Pooling/config.json` carrying the field.
+        path: PathBuf,
+        /// The `pooling_mode_*` field that is true.
+        field: &'static str,
+    },
+    /// Not exactly one of `pooling_mode_cls_token` and `pooling_mode_mean_tokens` is set.
+    #[error(
+        "pooling config {path}: exactly one of `pooling_mode_cls_token` and `pooling_mode_mean_tokens` must be true"
+    )]
+    NoSingleMode {
+        /// The `1_Pooling/config.json` that selects no single supported mode.
+        path: PathBuf,
+    },
+}
+
 impl Pooling {
-    /// The pooling the checkpoint in `dir` declares: `1_Pooling/config.json`'s
-    /// `pooling_mode_cls_token`. A checkpoint with no pooling module (a bare BERT) mean-pools, the
-    /// MiniLM convention.
-    pub fn read(dir: &Path) -> Self {
-        let config = std::fs::read(dir.join("1_Pooling").join("config.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-        match config
-            .as_ref()
-            .and_then(|c| c.get("pooling_mode_cls_token"))
-            .and_then(|v| v.as_bool())
-        {
-            Some(true) => Pooling::Cls,
-            _ => Pooling::Mean,
+    /// The `pooling_mode_*` flags sentence-transformers defines besides CLS and mean; a checkpoint that
+    /// sets one pools in a way [`pool`] does not implement.
+    const UNSUPPORTED_MODES: [&'static str; 4] = [
+        "pooling_mode_max_tokens",
+        "pooling_mode_mean_sqrt_len_tokens",
+        "pooling_mode_weightedmean_tokens",
+        "pooling_mode_lasttoken",
+    ];
+
+    /// The pooling the checkpoint in `dir` declares in `1_Pooling/config.json`. A checkpoint with no
+    /// pooling module (a bare BERT) mean-pools, the MiniLM convention; a module that is present must be
+    /// readable and select exactly CLS or mean (an absent flag is false, as in sentence-transformers).
+    pub fn read(dir: &Path) -> Result<Self, PoolingError> {
+        let path = dir.join("1_Pooling").join("config.json");
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Pooling::Mean),
+            Err(source) => return Err(PoolingError::Unreadable { path, source }),
+        };
+        let config: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|source| PoolingError::Malformed {
+                path: path.clone(),
+                source,
+            })?;
+        let flag = |field: &'static str| match config.get(field) {
+            None => Ok(false),
+            Some(value) => value.as_bool().ok_or_else(|| PoolingError::NotBoolean {
+                path: path.clone(),
+                field,
+            }),
+        };
+        for field in Self::UNSUPPORTED_MODES {
+            if flag(field)? {
+                return Err(PoolingError::Unsupported { path, field });
+            }
+        }
+        match (
+            flag("pooling_mode_cls_token")?,
+            flag("pooling_mode_mean_tokens")?,
+        ) {
+            (true, false) => Ok(Pooling::Cls),
+            (false, true) => Ok(Pooling::Mean),
+            _ => Err(PoolingError::NoSingleMode { path }),
         }
     }
 }
@@ -138,11 +217,12 @@ impl SentenceEncoder {
         executor: Box<dyn Executor>,
         rows: NonZeroUsize,
     ) -> Result<Self, EncoderError> {
+        let pooling = Pooling::read(dir)?;
         let (driver, handle) = open(dir, executor, rows)?;
         Ok(Self {
             driver,
             handle,
-            pooling: Pooling::read(dir),
+            pooling,
         })
     }
 
@@ -297,26 +377,89 @@ mod tests {
         );
     }
 
-    /// `1_Pooling/config.json` picks the pooling; no file or a false flag is mean.
+    fn pooling_dir(name: &str, config: Option<&str>) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("poot-pooling-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(dir.join("1_Pooling")).unwrap();
+        if let Some(config) = config {
+            std::fs::write(dir.join("1_Pooling").join("config.json"), config).unwrap();
+        }
+        dir
+    }
+
+    /// `1_Pooling/config.json` picks the pooling; no pooling module is mean.
     #[test]
     fn the_pooling_mode_is_read_from_the_checkpoints_pooling_module() {
-        let base = std::env::temp_dir().join(format!("poot-pooling-{}", std::process::id()));
-        let none = base.join("none");
+        let none = std::env::temp_dir().join(format!("poot-pooling-{}-none", std::process::id()));
         std::fs::create_dir_all(&none).unwrap();
-        assert_eq!(Pooling::read(&none), Pooling::Mean);
+        assert_eq!(Pooling::read(&none).unwrap(), Pooling::Mean);
         for (name, config, want) in [
-            ("cls", r#"{"pooling_mode_cls_token": true}"#, Pooling::Cls),
+            (
+                "cls",
+                r#"{"pooling_mode_cls_token": true, "pooling_mode_mean_tokens": false}"#,
+                Pooling::Cls,
+            ),
             (
                 "mean",
-                r#"{"pooling_mode_cls_token": false}"#,
+                r#"{"pooling_mode_cls_token": false, "pooling_mode_mean_tokens": true}"#,
+                Pooling::Mean,
+            ),
+            (
+                "mean-absent-cls",
+                r#"{"pooling_mode_mean_tokens": true}"#,
                 Pooling::Mean,
             ),
         ] {
-            let dir = base.join(name);
-            std::fs::create_dir_all(dir.join("1_Pooling")).unwrap();
-            std::fs::write(dir.join("1_Pooling").join("config.json"), config).unwrap();
-            assert_eq!(Pooling::read(&dir), want, "{name}");
+            let dir = pooling_dir(name, Some(config));
+            assert_eq!(Pooling::read(&dir).unwrap(), want, "{name}");
         }
-        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A pooling module that is present but corrupt, or that selects a pooling poot does not implement,
+    /// is a typed refusal naming the file and field, never a silent fall back to mean pooling.
+    #[test]
+    fn a_corrupt_or_unsupported_pooling_module_is_refused() {
+        let corrupt = pooling_dir("corrupt", Some("{not json"));
+        assert!(matches!(
+            Pooling::read(&corrupt),
+            Err(PoolingError::Malformed { .. })
+        ));
+        let unreadable = pooling_dir("unreadable", None);
+        std::fs::create_dir(unreadable.join("1_Pooling").join("config.json")).unwrap();
+        assert!(matches!(
+            Pooling::read(&unreadable),
+            Err(PoolingError::Unreadable { .. })
+        ));
+        let not_bool = pooling_dir("not-bool", Some(r#"{"pooling_mode_cls_token": "yes"}"#));
+        assert!(matches!(
+            Pooling::read(&not_bool),
+            Err(PoolingError::NotBoolean {
+                field: "pooling_mode_cls_token",
+                ..
+            })
+        ));
+        let lasttoken = pooling_dir(
+            "lasttoken",
+            Some(r#"{"pooling_mode_mean_tokens": false, "pooling_mode_lasttoken": true}"#),
+        );
+        assert!(matches!(
+            Pooling::read(&lasttoken),
+            Err(PoolingError::Unsupported {
+                field: "pooling_mode_lasttoken",
+                ..
+            })
+        ));
+        for (name, config) in [
+            ("neither", r#"{"pooling_mode_cls_token": false}"#),
+            (
+                "both",
+                r#"{"pooling_mode_cls_token": true, "pooling_mode_mean_tokens": true}"#,
+            ),
+        ] {
+            let dir = pooling_dir(name, Some(config));
+            assert!(
+                matches!(Pooling::read(&dir), Err(PoolingError::NoSingleMode { .. })),
+                "{name}"
+            );
+        }
     }
 }

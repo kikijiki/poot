@@ -117,7 +117,8 @@ impl Calibration {
         tiled_gemm_max_workgroups: Some(1 << 15),
     };
 
-    pub(crate) const STRIX_HALO_RADV: Self = Self {
+    /// Strix Halo (gfx1151) behind RADV, the one device these figures were measured on.
+    pub const STRIX_HALO_RADV: Self = Self {
         watchdog_budget: Some(WatchdogBudget {
             decode_gemv_out_elems: DECODE_GEMV_CHUNK_TRIGGER,
             serial_dequant_work: 400_000_000,

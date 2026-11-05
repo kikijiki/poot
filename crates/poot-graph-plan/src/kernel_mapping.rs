@@ -615,7 +615,7 @@ mod tests {
         let eqn = add.eqns().last().unwrap();
         let gpu = crate::Target::Gpu {
             backend: Backend::SpirvVulkan,
-            caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+            caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
         };
         let grid = crate::plan_eqn_choice(
             &add,

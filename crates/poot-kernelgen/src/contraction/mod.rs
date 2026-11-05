@@ -629,7 +629,9 @@ impl RegisterTiling {
         let tiles = shape.blocks
             * shape.working_row_tiles(tile_rows)
             * shape.out_per_block.div_ceil(tile_cols);
-        let device_lanes = f64::from(caps.compute_units.max(1))
+        // A device with no known compute-unit count is costed as one unit: no schedule is credited with
+        // filling lanes it cannot show exist, so the tilings rank by the work they issue.
+        let device_lanes = f64::from(caps.compute_units.known().map_or(1, |units| units.max(1)))
             * f64::from(caps.gemm_launch().saturating_lanes.max(1));
         lane_step * (tiles as f64 * lane_count / device_lanes).max(1.0)
     }
@@ -705,7 +707,7 @@ mod tests {
         for caps in [
             poot_target::DeviceCaps::rocm_default(),
             poot_target::DeviceCaps::ptx_default(),
-            poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+            poot_test_util::device_caps::wgpu_rdna3_igpu(),
         ] {
             let tiling = RegisterTiling::choose(shape(2048, 1024, 3072), &caps);
             assert_eq!(
@@ -803,7 +805,7 @@ mod tests {
                 32,
                 waves,
             )),
-            ..poot_target::DeviceCaps::wgpu_rdna3_igpu()
+            ..poot_test_util::device_caps::wgpu_rdna3_igpu()
         };
         let narrow = TiledShape {
             terms: crate::precision::StagedTerms {

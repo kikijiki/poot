@@ -1589,7 +1589,7 @@ mod tests {
         let observe = |ceiling: Option<u64>, free: Option<u64>, held: u64| {
             let mut target = Target::Gpu {
                 backend: poot_target::Backend::SpirvVulkan,
-                caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+                caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
             };
             gpu_caps_mut(&mut target).memory_budget_bytes = ceiling;
             Budget::observed(
@@ -1749,7 +1749,7 @@ mod tests {
         let handle = mixtral_handle();
         let target = Target::Gpu {
             backend: poot_target::Backend::SpirvVulkan,
-            caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+            caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
         };
         let targets = TargetSet::single(D0, target);
         let rows = [NonZeroUsize::MIN];

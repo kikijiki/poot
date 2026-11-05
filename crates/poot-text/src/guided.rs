@@ -48,7 +48,7 @@ impl TextCodec {
         use regex_automata::dfa::{StartKind, dense};
         use regex_automata::nfa::thompson;
         const CAP: usize = 64;
-        if let Some(dfa) = self.guided_dfa_cache.lock().unwrap().get(pattern) {
+        if let Some(dfa) = lock_cache(&self.guided_dfa_cache).get(pattern) {
             return Ok(dfa.clone());
         }
         // The whole output must match: anchor the start and append an end anchor so a state is dead
@@ -68,7 +68,7 @@ impl TextCodec {
                 .build(&whole)
                 .map_err(|e| err!("compile guided regex {pattern:?}: {e}"))?,
         );
-        let mut cache = self.guided_dfa_cache.lock().unwrap();
+        let mut cache = lock_cache(&self.guided_dfa_cache);
         if cache.len() >= CAP {
             cache.clear(); // bounded: drop the cold set rather than grow without limit
         }
@@ -294,6 +294,14 @@ pub struct StateMasks {
     walked: std::sync::atomic::AtomicUsize,
 }
 
+/// The guard of a memo cache. A cache only holds values recomputable from their key, so one a panicking
+/// request poisoned is still valid: recover it rather than panic every later guided request.
+fn lock_cache<T>(cache: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl StateMasks {
     fn mask(
         &self,
@@ -303,7 +311,7 @@ impl StateMasks {
     ) -> std::sync::Arc<TokenMask> {
         use regex_automata::dfa::Automaton;
         use std::sync::atomic::Ordering;
-        if let Some(mask) = self.by_state.lock().unwrap().get(&state) {
+        if let Some(mask) = lock_cache(&self.by_state).get(&state) {
             return mask.clone();
         }
         let mut words = vec![0u64; bytes.len().div_ceil(64)];
@@ -322,7 +330,7 @@ impl StateMasks {
         }
         self.walked.fetch_add(bytes.len(), Ordering::Relaxed);
         let mask = std::sync::Arc::new(TokenMask { words });
-        let mut cache = self.by_state.lock().unwrap();
+        let mut cache = lock_cache(&self.by_state);
         if cache.len() >= STATE_MASK_CAP {
             cache.clear(); // bounded: drop the cold set rather than grow without limit
         }
@@ -1466,6 +1474,19 @@ mod guided_byte_table_cache {
         }
         let len = r.guided_dfa_cache.lock().unwrap().len();
         assert!(len <= 64, "cache must stay bounded, got {len}");
+    }
+
+    #[test]
+    fn a_poisoned_guided_cache_still_serves_later_requests() {
+        // A request that panics while it holds the cache must not fail every later guided request.
+        let r = codec();
+        let poisoner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = r.guided_dfa_cache.lock().unwrap();
+            panic!("poison the cache");
+        }));
+        assert!(poisoner.is_err() && r.guided_dfa_cache.is_poisoned());
+        r.guided_dfa("[0-9]{3}")
+            .expect("a poisoned idempotent cache is recovered");
     }
 }
 

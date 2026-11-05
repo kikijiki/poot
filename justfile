@@ -53,8 +53,12 @@ models_dir := env("POOT_MODELS_DIR", home_directory() / "models")
 # are hidden and required in it, so a test that reaches for one fails. Tests that need a checkpoint or a
 # device, and tests named `*_real_dims`, stay out; they run in the lanes below.
 
-# The local merge gate (owner ruling Q8, 2026-10-18: no CI, every check runs on this box or the laptop): format
-# check, clippy with every warning an error, then the model-free lane. Each step fails the recipe; none is skipped.
+# The local merge gate (owner ruling Q8, 2026-10-18: no CI for the code, every check runs on this box or the laptop):
+# format check, clippy with every warning an error, then the model-free lane. Each step fails the recipe; none is
+# skipped. It is the merge gate for code and does NOT run the docs checks (`just docs-check`), the website checks
+# (`just site-check`, `just site-audit`; the cd-docs workflow runs `scripts/site-check.sh` before it publishes), the
+# device lanes (`just test-device-*`) or the checkpoint lanes (`just test-checkpoint*`, `just test-real-dims*`): a change
+# to what one of those covers runs it by hand.
 gate: fmt-check clippy test
 
 # the gate's own self-test: it runs fmt-check, clippy -D warnings and the model-free lane in order, and fmt-check fails a
@@ -66,7 +70,8 @@ gate-check:
 fmt-check:
     cargo fmt --all --check
 
-# the one entry point for the whole gate: dead-pub and unused-dependency checks, every self-test, the model-free lane
+# the test half of the gate: dead-pub and unused-dependency checks, every self-test, the model-free lane (the lanes
+# listed at `gate` are separate recipes)
 test: test-model-free
 
 # the model-free gate: dead-pub and unused-dependency checks, docs-path references, the inventory and lane self-tests, device-probe
@@ -254,17 +259,25 @@ test-real-dims:
 # gate, which fails a row that skipped. `test-lane-coverage` fails when a checkpoint test or an ignored test is
 # in no lane's list and when a listed row names no test.
 
-# checkpoint lane: CPU rows over the small checkpoints in the models directory; a missing model fails
+# checkpoint lane: CPU rows over the small checkpoints in the models directory; a missing model fails, then the
+# required-case gate, which fails a row that skipped (a missing llama.cpp tool prints a skip report) or did not run
 test-checkpoint:
+    scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin checkpoint {{results}}/lane-checkpoint/results.xml
     POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
-        {{nextest}} --run-ignored all -p poot-llm -p poot-load -p poot-models -p poot-serve \
+        {{nextest}} --profile lane-checkpoint --run-ignored all -p poot-llm -p poot-load -p poot-models -p poot-serve \
         -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint)"
+    scripts/check-required-cases.py check checkpoint {{results}}/lane-checkpoint/results.xml
 
-# rows that read a 20B+ checkpoint (never on the dev box: a pod or host that holds the checkpoints and the memory)
+# rows that read a 20B+ checkpoint (never on the dev box: a pod or host that holds the checkpoints and the memory),
+# then the required-case gate
 test-checkpoint-large:
+    scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin checkpoint-large {{results}}/lane-checkpoint-large/results.xml
     POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
-        {{nextest}} --run-ignored all -p poot-llm -p poot-load -p poot-models \
+        {{nextest}} --profile lane-checkpoint-large --run-ignored all -p poot-llm -p poot-load -p poot-models \
         -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-large)"
+    scripts/check-required-cases.py check checkpoint-large {{results}}/lane-checkpoint-large/results.xml
 
 # every real-checkpoint device row on wgpu, wgpu and the models required, then the required-case gate
 test-checkpoint-wgpu:
@@ -336,15 +349,22 @@ test-checkpoint-large-ptx:
         -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-large-ptx)"
     scripts/check-required-cases.py check checkpoint-large-ptx {{results}}/device-checkpoint-large-ptx/results.xml
 
-# the real-dimension rows too slow for `test-real-dims` (minutes on the CPU oracle), in release
+# the real-dimension rows too slow for `test-real-dims` (minutes on the CPU oracle), in release, then the required-case gate
 test-real-dims-long:
-    {{nextest}} --release --run-ignored all -p poot-eval -p poot-models \
+    scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin real-dims-long {{results}}/lane-real-dims-long/results.xml
+    {{nextest}} --profile lane-real-dims-long --release --run-ignored all -p poot-eval -p poot-models \
         -E "$(scripts/check-lane-coverage.py --lane-filter real-dims-long)"
+    scripts/check-required-cases.py check real-dims-long {{results}}/lane-real-dims-long/results.xml
 
-# the rows that need the pinned Peano llc and the IRON link driver; without them the compile is a typed error
+# the rows that need the pinned Peano llc and the IRON link driver; without them the compile is a typed error. Then
+# the required-case gate.
 test-npu-toolchain:
-    nix develop .#npu -c {{nextest}} --run-ignored all -p poot-kernelgen \
+    scripts/check-required-cases.py --self-test
+    scripts/check-required-cases.py begin npu-toolchain {{results}}/lane-npu-toolchain/results.xml
+    nix develop .#npu -c {{nextest}} --profile lane-npu-toolchain --run-ignored all -p poot-kernelgen \
         -E "$(scripts/check-lane-coverage.py --lane-filter npu-toolchain)"
+    scripts/check-required-cases.py check npu-toolchain {{results}}/lane-npu-toolchain/results.xml
 
 # Device-lane selection. Each lane's nextest filterset is defined once, here, and used twice: by the lane
 # recipe, and by `test-lane-coverage`, which fails when a device test (or any test of a package the
@@ -574,15 +594,13 @@ docs-check:
     echo "-- docs/ path references --"
     just docs-paths || rc=1
     echo "-- architecture guide (layer table, stale claims, checked-against sha) --"
-    # The guide and overview live in Backstage, a sibling checkout. A missing checkout fails the stage;
-    # POOT_SKIP_ARCHITECTURE_DOC=1 is the explicit opt-out for a clone that has none.
+    # The guide and overview live in Backstage, a sibling checkout. A missing checkout fails the stage: a check
+    # that can be switched off by an environment variable passes without running.
     if [ -d ../backstage/projects/poot ]; then
         python3 scripts/check-architecture-doc.py --self-test || rc=1
         python3 scripts/check-architecture-doc.py || rc=1
-    elif [ "${POOT_SKIP_ARCHITECTURE_DOC:-}" = 1 ]; then
-        echo "../backstage not found: skipped by POOT_SKIP_ARCHITECTURE_DOC=1"
     else
-        echo "../backstage not found: clone it beside this repo, or set POOT_SKIP_ARCHITECTURE_DOC=1"
+        echo "../backstage not found: clone it beside this repo"
         rc=1
     fi
     echo "-- ascii (no em-dashes / non-ascii) --"
@@ -645,42 +663,6 @@ site-audit: _site-deps
     cd website && nix shell nixpkgs#chromium -c node scripts/audit-pages.mjs --self-test
     cd website && nix shell nixpkgs#chromium -c node scripts/audit-pages.mjs --lanes
 
-# the site's checks: TypeScript typecheck, a production build (broken links), names the code no longer has, the develop/ Rust snippets, and the ascii rule over
-# tracked text sources. git grep ignores untracked build/vendor files; bun.lock is generated metadata.
+# the site's checks (scripts/site-check.sh, which the cd-docs workflow runs too, minus the Rust snippets that need this toolchain)
 site-check: _site-deps
-    #!/usr/bin/env bash
-    set -uo pipefail
-    rc=0
-    echo "-- typecheck --"
-    (cd website && bun run typecheck) || rc=1
-    echo "-- component tests (the Performance page's selection logic, the navbar check) --"
-    (cd website && bun test) || rc=1
-    echo "-- benchmark grid (every required cell is verified, pending or has a reason) --"
-    just grid-check || rc=1
-    echo "-- navbar (every top-level docs section has a navbar entry and its sidebar, every item a doc) --"
-    (cd website && bun scripts/check-navbar.mjs) || rc=1
-    echo "-- build (broken-link check) --"
-    (cd website && bun run build) || rc=1
-    echo "-- stale names (identifiers, variables, crates, paths, recipes, flags the code no longer has) --"
-    scripts/site-stale-names.sh || rc=1
-    echo "-- rust snippets (the develop/ pages' code compiles) --"
-    scripts/site-rust-snippets.sh || rc=1
-    echo "-- edge bars (no coloured bar on the left edge of a card, callout, alert or active item) --"
-    scripts/site-edge-bars.sh || rc=1
-    echo "-- card numbers (the site never names an internal card or board id) --"
-    scripts/site-card-numbers.sh || rc=1
-    echo "-- NPU summaries (what an NPU runs is stated on architecture/npu.mdx only) --"
-    scripts/site-npu-summaries.sh || rc=1
-    echo "-- readability (no prose paragraph over the word limit) --"
-    scripts/site-readability.sh || rc=1
-    echo "-- ascii (no em-dashes / non-ascii) --"
-    ascii_rc=0
-    git grep -nIP '[^\x00-\x7F]' -- website ':!website/bun.lock' || ascii_rc=$?
-    if [ "$ascii_rc" -eq 0 ]; then
-        echo "non-ASCII characters found (see above) - replace with ASCII equivalents"
-        rc=1
-    elif [ "$ascii_rc" -ne 1 ]; then
-        echo "ASCII scan failed with status $ascii_rc"
-        rc=1
-    fi
-    exit $rc
+    scripts/site-check.sh

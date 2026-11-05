@@ -1032,6 +1032,15 @@ fn plan_eqn_derives_shape_from_the_graph_not_a_caller_argument() {
     assert_eq!(grid, [32, 1, 1]);
 }
 
+/// The wgpu RDNA3 iGPU as a compile target: SPIR-V with the f16 cooperative matrix, so a narrow policy gives it f16
+/// operands.
+pub(crate) fn wgpu_rdna3_target() -> Target {
+    Target::Gpu {
+        backend: Backend::SpirvVulkan,
+        caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
+    }
+}
+
 /// The typed refusal a planning result carries; any other outcome fails the test with `what`.
 pub(crate) fn refusal_of(result: Result<Plan, PlanError>, what: &str) -> Refusal {
     match result {
@@ -3571,7 +3580,10 @@ fn a_tiled_gemm_over_the_tile_ceiling_splits_into_disjoint_launches() {
 fn a_watchdog_split_tiled_gemm_dispatches_whole_waves() {
     let (m, k, n) = (512usize, 9728usize, 2560usize);
     let caps = default_caps_for(Backend::SpirvVulkan);
-    let units = caps.compute_units as usize;
+    let units = caps
+        .compute_units
+        .known()
+        .expect("the preset knows its compute units") as usize;
     let budget = caps
         .watchdog_budget
         .expect("the wgpu caps carry a watchdog budget")
@@ -4880,9 +4892,11 @@ fn decode_gemv_chunking_follows_the_caps_watchdog_trigger_not_a_fixed_constant()
     let caps_for = |decode_gemv_out_elems: u64| DeviceCaps {
         watchdog_budget: Some(WatchdogBudget {
             decode_gemv_out_elems,
-            ..DeviceCaps::wgpu_rdna3_igpu().watchdog_budget.unwrap()
+            ..poot_test_util::device_caps::wgpu_rdna3_igpu()
+                .watchdog_budget
+                .unwrap()
         }),
-        ..DeviceCaps::wgpu_rdna3_igpu()
+        ..poot_test_util::device_caps::wgpu_rdna3_igpu()
     };
 
     // Low trigger (under this shape's 230_000 elements): chunks, like the BLOOM-scale case above.
@@ -5358,8 +5372,8 @@ fn a_long_prefill_plans_the_tiled_schedule_and_a_decode_does_not() {
             "{backend:?}: {lanes} lanes"
         );
         assert!(
-            spec.row_groups() >= caps.compute_units as usize,
-            "{backend:?}: {} row groups on {} compute units",
+            spec.row_groups() >= caps.compute_units.known().expect("a known count") as usize,
+            "{backend:?}: {} row groups on {:?} compute units",
             spec.row_groups(),
             caps.compute_units
         );
@@ -5430,7 +5444,7 @@ fn the_tiled_schedule_is_chosen_only_within_the_devices_resources() {
             first_attention_spec(&choice).schedule,
             kg::AttentionSchedule::Streaming { .. }
         ),
-        "16 rows of one key/value head cannot fill {} compute units",
+        "16 rows of one key/value head cannot fill {:?} compute units",
         caps.compute_units
     );
 
@@ -6451,6 +6465,19 @@ fn the_planner_narrows_index_math_only_where_its_proof_holds_on_a_target_that_lo
     );
 }
 
+/// The dense Gemv's wide columns need the device to be shown full: an unknown compute-unit count takes the narrow
+/// ones for every `N`, a known one the wide ones once `ceil(N / 4)` launches two workgroups per unit (POOT-1468).
+///
+/// Mutation: in `dense_gemv_launch`, read an unknown count as filled (`is_some_and` -> `is_none_or`); every `N` takes the
+/// wide columns and the unknown-count row goes red.
+#[test]
+fn dense_gemv_columns_stay_narrow_on_unknown_compute_units() {
+    let n = 1 << 20;
+    assert_eq!(dense_gemv_launch(n, Some(40)).cols, 4, "known, filled");
+    assert_eq!(dense_gemv_launch(n, None).cols, 2, "unknown");
+    assert_eq!(dense_gemv_launch(8, Some(40)).cols, 2, "known, starved");
+}
+
 /// Body, launch and selection for one packed-BF16 `DenseContraction` are chosen together (Card 727): at
 /// M == 1, on every backend, the generated dense Gemv takes it with the launch `dense_gemv_launch` picks,
 /// its workgroup the schedule's `width` and its grid the schedule's own `grid_threads`, `[K, N]` riding in
@@ -6480,7 +6507,7 @@ fn dense_bf16_decode_gemv_selection_rows() {
         let launch = dense_decode_gemv_in(eqn, &out_shape, out_numel, &caps).unwrap_or_else(|| {
             panic!("{backend:?}: the dense Gemv must take the M == 1 contraction")
         });
-        assert_eq!(launch, dense_gemv_launch(n, caps.compute_units));
+        assert_eq!(launch, dense_gemv_launch(n, caps.compute_units.known()));
         let DenseGemvLaunch { width, unroll, .. } = launch;
         // K = 32 and the 4-element run put every run on a 16-byte group: NVPTX reads them as vectors.
         let activation = if backend == Backend::Nvptx {

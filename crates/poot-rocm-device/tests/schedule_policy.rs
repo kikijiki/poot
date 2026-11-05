@@ -86,11 +86,24 @@ fn scan_schedules_match_the_oracle_in_every_regime_on_rocm() {
         return;
     };
     // Heads that fill the device: more lanes than one wave per compute unit at one lane per column.
-    let filling = gpu_caps(&target).compute_units as usize * 64 / 128 + 1;
-    let ssd_filling = gpu_caps(&target).compute_units as usize + 1;
+    let filling = gpu_caps(&target)
+        .compute_units
+        .known()
+        .expect("a device test needs a known count") as usize
+        * 64
+        / 128
+        + 1;
+    let ssd_filling = gpu_caps(&target)
+        .compute_units
+        .known()
+        .expect("a device test needs a known count") as usize
+        + 1;
     // The most heads that still leave the device under-filled: the split launch with the most workgroups
     // resident at once, where waves of one column are skewed the most.
-    let ssd_crowded = (gpu_caps(&target).compute_units as usize)
+    let ssd_crowded = (gpu_caps(&target)
+        .compute_units
+        .known()
+        .expect("a device test needs a known count") as usize)
         .saturating_sub(1)
         .max(1);
     // The crowded launch shares the rows exactly as the same state width does with two heads: only the

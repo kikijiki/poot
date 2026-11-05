@@ -509,7 +509,9 @@ pub(super) fn run_reference(model: &Path, corpus: &Path, n_ctx: usize, out: &Pat
     let version = match Command::new("llama-perplexity").arg("--version").output() {
         Ok(output) => output,
         Err(error) => {
-            eprintln!("POOT-SKIP: llama-perplexity is not on PATH ({error})");
+            poot_test_util::missing_prerequisite(&format_args!(
+                "llama-perplexity is not on PATH ({error})"
+            ));
             return None;
         }
     };

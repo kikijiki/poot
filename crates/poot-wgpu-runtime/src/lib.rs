@@ -124,9 +124,9 @@ pub struct Context {
     /// earlier adapter-name-string classifier this doc described). Only configs this backend's SPIR-V
     /// codegen lowers are reported (f16 fragments); the same silicon's bf16 WMMA is the ROCm path.
     matrix_units: poot_target::Queried<poot_target::MatrixUnits>,
-    /// Active compute units, probed from AMD's Vulkan shader-core properties at init (card 653); the
-    /// RDNA3 default where the driver exposes no such query. Feeds [`Context::device_caps`].
-    compute_units: u32,
+    /// Active compute units, probed from AMD's Vulkan shader-core properties at init (card 653); `Unknown`
+    /// where the driver exposes no such query. Feeds [`Context::device_caps`].
+    compute_units: poot_target::Queried<u32>,
     /// The register file, from the same AMD shader-core properties (POOT-1447); `Unknown` where the driver
     /// exposes none. Feeds [`Context::device_caps`].
     register_file: poot_target::Queried<poot_target::RegisterFile>,

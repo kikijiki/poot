@@ -19,13 +19,12 @@ use poot_graph_ir::{
 };
 use poot_graph_plan::test_support::roomy_body_limits;
 use poot_graph_plan::{Capability, FusedStepGap, PlanError, Target, plan_eqn_choice};
-use poot_target::DeviceCaps;
 use poot_tensor::DType;
 
 fn wgpu() -> Target {
     Target::Gpu {
         backend: poot_target::Backend::SpirvVulkan,
-        caps: DeviceCaps::wgpu_rdna3_igpu(),
+        caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
     }
 }
 
@@ -154,7 +153,7 @@ fn a_device_below_the_block_top_k_workgroup_is_refused_with_both_numbers() {
     let selection =
         composites::block_top_k(&b, BlockTopKAttrs { ratio: 2, k: 2 }, scores, pos).unwrap();
     let g = b.finish(selection.packed).unwrap();
-    let mut caps = DeviceCaps::wgpu_rdna3_igpu();
+    let mut caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     caps.lds_bytes = 16;
     let target = Target::Gpu {
         backend: poot_target::Backend::SpirvVulkan,
@@ -195,7 +194,7 @@ fn a_traced_block_selection_on_a_small_device_is_refused_as_the_block_top_k() {
         .unwrap();
     let packed = poot_graph_ir::ops::block_top_k_packed(&b, scores, pos, 2, 2).unwrap();
     let g = b.finish(packed).unwrap();
-    let mut caps = DeviceCaps::wgpu_rdna3_igpu();
+    let mut caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     caps.lds_bytes = 16;
     let target = Target::Gpu {
         backend: poot_target::Backend::SpirvVulkan,

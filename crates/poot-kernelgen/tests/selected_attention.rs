@@ -12,7 +12,6 @@ use std::num::NonZeroUsize;
 use poot_graph_ir::test_support::selected_attention::{Case, cases};
 use poot_kernel_ir::interp::{Buffer, run};
 use poot_kernelgen as kg;
-use poot_target::DeviceCaps;
 
 fn limits() -> kg::BodyLimits {
     kg::BodyLimits {
@@ -88,7 +87,7 @@ fn interpret(
                 kg::AttentionCombineSpec::of(&spec).expect("a split schedule combines");
             let combine = kg::generate(
                 &kg::KernelRequest::AttentionCombine(combine_spec),
-                &DeviceCaps::wgpu_rdna3_igpu(),
+                &poot_test_util::device_caps::wgpu_rdna3_igpu(),
                 &limits(),
             )
             .expect("the combine generates");
@@ -111,7 +110,7 @@ fn interpret(
 fn generate_request(spec: &kg::AttentionSpec) -> kg::Generated {
     kg::generate(
         &kg::KernelRequest::Attention(spec.clone()),
-        &DeviceCaps::wgpu_rdna3_igpu(),
+        &poot_test_util::device_caps::wgpu_rdna3_igpu(),
         &limits(),
     )
     .expect("the selected attention request generates")

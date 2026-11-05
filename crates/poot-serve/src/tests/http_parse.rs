@@ -223,6 +223,22 @@ fn request_parses_content_array() {
     assert!(n.messages[0].content.is_none());
 }
 
+/// A `content` that is present but not a string, an array of parts or null is a parse refusal, not a blank
+/// message: the model would answer a turn the client never sent.
+#[test]
+fn a_malformed_chat_content_is_refused_not_blanked() {
+    for (case, content) in [
+        ("number", "5"),
+        ("object", r#"{"type":"text","text":"x"}"#),
+        ("part without type", r#"[{"text":"x"}]"#),
+        ("text part without text", r#"[{"type":"text"}]"#),
+        ("text part with a number", r#"[{"type":"text","text":3}]"#),
+    ] {
+        let body = format!(r#"{{"messages":[{{"role":"user","content":{content}}}]}}"#);
+        assert!(serde_json::from_str::<ChatReq>(&body).is_err(), "{case}");
+    }
+}
+
 /// A codec-parsed call becomes an OpenAI `tool_calls` entry: ordered ids, the `function` kind, the
 /// arguments kept as a JSON string. The markup formats themselves are pinned in poot-text.
 #[test]

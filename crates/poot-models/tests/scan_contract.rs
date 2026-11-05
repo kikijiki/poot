@@ -218,7 +218,15 @@ fn a_scan_is_one_launch_over_the_whole_sequence() {
 #[test]
 fn per_head_states_stay_within_the_declared_resources() {
     for (name, target) in targets() {
-        let fill = |width: usize| gpu_caps(&target).compute_units as usize * 64 / width + 1;
+        let fill = |width: usize| {
+            gpu_caps(&target)
+                .compute_units
+                .known()
+                .expect("a device test needs a known count") as usize
+                * 64
+                / width
+                + 1
+        };
         for rows in [4usize, 32, 128, 256] {
             for (regime, filled, len, shares) in [
                 ("short", false, 16usize, false),

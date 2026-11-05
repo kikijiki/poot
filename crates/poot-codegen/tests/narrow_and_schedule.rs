@@ -1,7 +1,7 @@
 //! `Rvalue::Narrow` and `Statement::SchedulingBoundary` (POOT-1441) per target: the exact narrowing never emits a
 //! rounding sequence (AMDGCN bf16 takes the top half of the f32, every other narrowing is one `fptrunc`), and the
 //! scheduling boundary is `llvm.amdgcn.sched.barrier(0)` on AMDGCN and nothing on the targets whose compiler takes
-//! no such order. The compile half skips (passes) when a toolchain is absent, as `mul_add.rs` does.
+//! no such order. A missing toolchain fails the compile half (`poot_test_util::toolchain`), as in `mul_add.rs`.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -11,6 +11,7 @@ use poot_kernel_ir::{
     BasicBlock, BlockId, Body, IndexAxis, Local, LocalDecl, Operand, Place, ProjectionElem, Rvalue,
     Statement, Terminator, Ty,
 };
+use poot_test_util::toolchain::{require_amd_clang, require_tools};
 
 const SCHED_BARRIER: &str = "call void @llvm.amdgcn.sched.barrier(i32 0)";
 
@@ -135,26 +136,19 @@ fn out_dir(tag: &str) -> PathBuf {
     d
 }
 
-fn have(bin: &str) -> bool {
-    Command::new(bin).arg("--version").output().is_ok()
-}
-
 /// Every case compiles with its target's toolchain (and the SPIR-V one is `spirv-val` clean), so the boundary and
 /// the narrowing are lowerings each backend accepts, not only IR text.
 #[test]
 fn the_narrowing_and_the_boundary_compile_on_every_gpu_target() {
     let dir = out_dir("narrow-and-schedule");
     for (target, to) in cases() {
-        let available = match target {
-            Target::AmdGcn(_) => std::env::var("POOT_AMD_CLANG")
-                .is_ok_and(|clang| Command::new(clang).arg("--version").output().is_ok()),
-            Target::Nvptx => have("llc"),
-            Target::SpirvVulkan => have("llc") && have("spirv-val"),
-            Target::AieCore => false,
-        };
-        if !available {
-            eprintln!("POOT-SKIP poot-codegen: no toolchain for {target:?}");
-            continue;
+        match target {
+            Target::AmdGcn(_) => {
+                require_amd_clang();
+            }
+            Target::Nvptx => require_tools(&["llc"]),
+            Target::SpirvVulkan => require_tools(&["llc", "spirv-val"]),
+            Target::AieCore => continue,
         }
         let name = format!("narrow_{:?}", to).to_lowercase();
         let out = poot_codegen::artifact_path(&dir, &name, target);

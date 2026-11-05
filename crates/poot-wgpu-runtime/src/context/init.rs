@@ -235,14 +235,13 @@ impl Context {
         );
         // Card 653: wgpu has no compute-unit query, so read AMD's own Vulkan
         // shader-core properties through the wgpu-hal adapter where the driver exposes them; any other
-        // device plans against the RDNA3 default, the one device family this backend's launch policy
-        // is measured on.
+        // device reports its compute units unknown (POOT-1468), and the planner takes the schedule that
+        // needs no count.
         // POOT-1447: the same properties give the register file; any other device reports it unknown.
         let shader_core = probe_amd_shader_core(&adapter);
-        let compute_units = shader_core.map_or(
-            poot_target::DeviceCaps::wgpu_rdna3_igpu().compute_units,
-            |core| core.compute_units,
-        );
+        let compute_units = shader_core.map_or(poot_target::Queried::Unknown, |core| {
+            poot_target::Queried::Known(core.compute_units)
+        });
         let register_file = shader_core.map_or(poot_target::Queried::Unknown, |core| {
             poot_target::Queried::Known(poot_target::RegisterFile::amd_shader_core(
                 core.max_vgpr_allocation,
@@ -624,7 +623,7 @@ mod launch_caps_device_receipt {
     use super::*;
 
     /// Receipt (SC-003): on a live AMD Vulkan device the launch limits and subgroup range the context
-    /// reports equal the ones [`poot_target::DeviceCaps::wgpu_rdna3_igpu`] documents as measured on this
+    /// reports equal the ones [`poot_test_util::device_caps::wgpu_rdna3_igpu`] documents as measured on this
     /// device family. A skip (no GPU, or a non-AMD adapter) is reported as one, not as a pass.
     #[test]
     fn a_live_amd_device_reports_the_launch_limits_the_fixture_documents() {
@@ -642,7 +641,7 @@ mod launch_caps_device_receipt {
         }
         let live = ctx.device_caps();
         eprintln!("live wgpu caps: {live:?}");
-        let fixture = poot_target::DeviceCaps::wgpu_rdna3_igpu();
+        let fixture = poot_test_util::device_caps::wgpu_rdna3_igpu();
         assert_eq!(live.max_workgroup_size, fixture.max_workgroup_size);
         assert_eq!(
             live.max_workgroup_invocations,

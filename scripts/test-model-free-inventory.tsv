@@ -1023,6 +1023,7 @@ poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::the_p
 poot-graph-plan	poot-graph-plan	model-free	planner::sampling::tests::greedy_plans_a_chunk_stage_and_a_combine_stage
 poot-graph-plan	poot-graph-plan	model-free	planner::sampling::tests::greedy_refuses_a_grid_past_the_target_limit
 poot-graph-plan	poot-graph-plan	model-free	planner::sampling::tests::greedy_refuses_a_vocabulary_whose_indices_are_not_exact_f32
+poot-graph-plan	poot-graph-plan	model-free	planner::scan::tests::a_scan_on_unknown_compute_units_stays_unsplit
 poot-graph-plan	poot-graph-plan	model-free	staged::devices::tests::a_device_over_its_budget_refuses_the_placement
 poot-graph-plan	poot-graph-plan	model-free	staged::devices::tests::a_device_with_an_unknown_budget_is_refused
 poot-graph-plan	poot-graph-plan	model-free	staged::devices::tests::a_layered_pipeline_on_two_ptx_devices_binds_every_boundary_by_a_row
@@ -1112,6 +1113,7 @@ poot-graph-plan	poot-graph-plan	model-free	tests::decode_gemv_chunking_follows_t
 poot-graph-plan	poot-graph-plan	model-free	tests::decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape
 poot-graph-plan	poot-graph-plan	model-free	tests::decode_gemv_width_ceiling_follows_the_caps_not_the_backend
 poot-graph-plan	poot-graph-plan	model-free	tests::dense_bf16_decode_gemv_selection_rows
+poot-graph-plan	poot-graph-plan	model-free	tests::dense_gemv_columns_stay_narrow_on_unknown_compute_units
 poot-graph-plan	poot-graph-plan	model-free	tests::dispatch_count_planned_chain_drops_further_than_phase_1_one_hop
 poot-graph-plan	poot-graph-plan	model-free	tests::dynamic_update_slice_runtime_index_is_i32_only
 poot-graph-plan	poot-graph-plan	model-free	tests::e4m3_storage_admission_follows_the_caps_not_the_backend
@@ -1228,6 +1230,7 @@ poot-graph-plan	poot-graph-plan::attention_rows	model-free	a_prefill_over_the_wa
 poot-graph-plan	poot-graph-plan::attention_rows	model-free	a_prefill_within_the_watchdog_budget_stays_one_launch
 poot-graph-plan	poot-graph-plan::attention_split	model-free	a_buffer_limit_below_the_scratch_falls_back_to_streaming
 poot-graph-plan	poot-graph-plan::attention_split	model-free	a_decode_that_fills_the_device_or_has_a_short_cache_keeps_the_streaming_schedule
+poot-graph-plan	poot-graph-plan::attention_split	model-free	a_device_with_unknown_compute_units_keeps_the_streaming_schedule
 poot-graph-plan	poot-graph-plan::attention_split	model-free	a_live_decode_over_a_declared_position_slot_plans_the_split_schedule
 poot-graph-plan	poot-graph-plan::attention_split	model-free	a_low_head_decode_plans_two_launches_through_one_scratch
 poot-graph-plan	poot-graph-plan::attention_split	model-free	every_split_dispatch_stays_within_max_grid
@@ -1643,6 +1646,7 @@ poot-kernelgen	poot-kernelgen::block_top_k	model-free	an_awkward_block_count_sel
 poot-kernelgen	poot-kernelgen::block_top_k	model-free	the_kernel_lowers_to_spirv_and_ptx
 poot-kernelgen	poot-kernelgen::block_top_k	model-free	the_kernel_selects_at_16384_32768_and_65536_blocks
 poot-kernelgen	poot-kernelgen::block_top_k	model-free	the_kernel_selects_what_the_definition_selects
+poot-kernelgen	poot-kernelgen::compile_only_fixtures	model-free	every_compile_only_fixture_has_a_staging_test
 poot-kernelgen	poot-kernelgen::coopmat_dispatch_probe	device	coopmat_tile_dispatches_and_matches_cpu_on_radv
 poot-kernelgen	poot-kernelgen::emit_bf16_cast	model-free	amdgcn_f32_to_bf16_keeps_nan
 poot-kernelgen	poot-kernelgen::emit_bf16_cast	model-free	amdgcn_f32_to_bf16_still_rounds_to_nearest_even
@@ -1838,8 +1842,6 @@ poot-kernelgen	poot-kernelgen::selected_attention	model-free	a_padded_cache_and_
 poot-kernelgen	poot-kernelgen::selected_attention	model-free	an_id_naming_a_future_block_reads_no_key_after_the_query
 poot-kernelgen	poot-kernelgen::selected_attention	model-free	the_kernel_attends_over_exactly_the_selected_blocks
 poot-kernelgen	poot-kernelgen::selected_attention	model-free	the_kernel_lowers_to_spirv_and_ptx
-poot-kernelgen	poot-kernelgen::skip_report_scan	model-free	a_skipping_test_reports_it_with_the_reserved_token
-poot-kernelgen	poot-kernelgen::skip_report_scan	model-free	every_compile_only_fixture_has_a_staging_test
 poot-l0-runtime	poot-l0-runtime	model-free	ffi::tests::a_library_without_the_entry_points_names_the_first_missing_symbol
 poot-l0-runtime	poot-l0-runtime	model-free	ffi::tests::a_missing_loader_is_a_typed_library_error
 poot-l0-runtime	poot-l0-runtime	model-free	ffi::tests::descriptor_layouts_match_ze_api_h
@@ -2373,6 +2375,7 @@ poot-llm	poot-llm	model-free	driver::features::tests::a_verdict_is_symmetric
 poot-llm	poot-llm	model-free	driver::features::tests::every_feature_has_one_row_and_every_pair_one_verdict
 poot-llm	poot-llm	model-free	driver::flash_next_tests::flash_next_per_layer_table_is_a_hosted_device_indexed_gather_on_every_backend
 poot-llm	poot-llm	model-free	driver::gguf_vocab::tests::a_header_without_tokenizer_keys_is_all_none
+poot-llm	poot-llm	model-free	driver::gguf_vocab::tests::a_present_but_ill_typed_key_is_refused_naming_the_key
 poot-llm	poot-llm	model-free	driver::gguf_vocab::tests::every_tokenizer_key_lands_in_its_field
 poot-llm	poot-llm	model-free	driver::hidden_carry_tests::a_carry_aval_that_differs_from_the_request_is_refused_typed
 poot-llm	poot-llm	model-free	driver::hidden_carry_tests::a_family_that_ignores_the_request_is_refused_typed
@@ -2560,6 +2563,7 @@ poot-llm	poot-llm	model-free	multimodal::apng::tests::the_frame_source_serves_a_
 poot-llm	poot-llm	model-free	multimodal::decode::tests::an_oversized_header_is_refused_before_any_pixel_decodes
 poot-llm	poot-llm	model-free	multimodal::decode::tests::png_and_jpeg_bytes_decode_to_their_pixels
 poot-llm	poot-llm	model-free	multimodal::decode::tests::the_header_gates_the_pixel_cap_and_other_encoders_pixels_become_rgb
+poot-llm	poot-llm	model-free	multimodal::encoders::tests::a_corrupt_or_unsupported_pooling_module_is_refused
 poot-llm	poot-llm	model-free	multimodal::encoders::tests::a_ranking_sorts_descending_and_keeps_indices
 poot-llm	poot-llm	model-free	multimodal::encoders::tests::pooling_averages_or_takes_the_first_token_and_normalizes
 poot-llm	poot-llm	model-free	multimodal::encoders::tests::the_pooling_mode_is_read_from_the_checkpoints_pooling_module
@@ -4693,6 +4697,7 @@ poot-serve	poot-serve::bin/poot-serve	model-free	tests::admission::the_image_cap
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::admission::the_rate_limit_is_decided_before_the_body_is_read
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::admission::the_request_past_the_queue_cap_is_answered_429_at_once
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::config::a_device_group_refuses_device_timing
+poot-serve	poot-serve::bin/poot-serve	model-free	tests::config::a_single_file_checkpoint_serves_with_the_default_pooling
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::config::an_invalid_value_for_any_field_is_a_startup_error
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::config::both_draft_flags_are_refused_by_the_parser_and_by_the_policy
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::config::config_under_environment_child
@@ -4744,6 +4749,7 @@ poot-serve	poot-serve::bin/poot-serve	model-free	tests::hostile_http::any_transf
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::hostile_http::content_length_spellings_that_are_not_plain_digits_are_refused
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::hostile_http::seeded_garbage_never_panics_the_handler_or_draws_a_success
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::hostile_http::two_content_lengths_are_refused_even_when_they_agree
+poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::a_malformed_chat_content_is_refused_not_blanked
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::chat_req_defaults_stream_options_to_none
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::chat_req_parses_empty_stream_options_object
 poot-serve	poot-serve::bin/poot-serve	model-free	tests::http_parse::chat_req_parses_stream_options_include_usage_false
@@ -5052,6 +5058,7 @@ poot-tensor	poot-tensor	model-free	tests::host_view_refuses_a_length_mismatch
 poot-tensor	poot-tensor	model-free	tests::host_view_typed_accessors_refuse_the_wrong_dtype
 poot-tensor	poot-tensor	model-free	tests::parse_rejects_an_unrecognized_spelling
 poot-tensor	poot-tensor	model-free	tests::parse_round_trips_every_safetensors_spelling
+poot-test-util	poot-test-util	model-free	tests::a_missing_prerequisite_is_a_skip_unless_models_are_required
 poot-test-util	poot-test-util	model-free	tests::assert_close_accepts_matching_infinities_and_errors_within_tolerance
 poot-test-util	poot-test-util	model-free	tests::assert_close_names_the_worst_element_not_the_first
 poot-test-util	poot-test-util	model-free	tests::assert_close_rejects_an_all_nan_actual_against_a_finite_expected
@@ -5081,6 +5088,8 @@ poot-test-util	poot-test-util	model-free	tests::no_test_folds_a_difference_with_
 poot-test-util	poot-test-util	model-free	tests::seed_of_is_the_fnv1a_64_hash_of_the_name
 poot-test-util	poot-test-util	model-free	tests::unique_temp_path_guard_removes_its_parent_directory_on_drop
 poot-test-util	poot-test-util	model-free	tests::unique_temp_paths_differ_within_one_process
+poot-test-util	poot-test-util	model-free	toolchain::tests::a_tool_that_does_not_exist_fails_the_test
+poot-test-util	poot-test-util	model-free	toolchain::tests::only_the_tools_that_do_not_run_are_missing
 poot-test-util	poot-test-util::binary_built_elsewhere	model-free	a_binary_built_in_one_checkout_reads_the_files_of_the_checkout_it_runs_from
 poot-test-util	poot-test-util::contained_child	model-free	child_dies_when_its_parent_is_sigkilled
 poot-test-util	poot-test-util::contained_child	model-free	child_holds_no_inherited_lock_descriptor
@@ -5103,6 +5112,9 @@ poot-test-util	poot-test-util::device_crates_generate_no_kernels	model-free	devi
 poot-test-util	poot-test-util::device_crates_generate_no_kernels	model-free	the_scan_sees_a_generator_in_production_code_and_not_in_prose_or_tests
 poot-test-util	poot-test-util::no_baked_checkout_paths	model-free	no_source_bakes_a_checkout_path_at_compile_time
 poot-test-util	poot-test-util::no_baked_checkout_paths	model-free	the_scan_recognises_a_baked_path
+poot-test-util	poot-test-util::skip_reports	model-free	a_skipping_test_reports_it_with_the_reserved_token
+poot-test-util	poot-test-util::skip_reports	model-free	the_scan_reads_a_skip_that_prints_no_token
+poot-text	poot-text	model-free	chat::chat_from_files_tests::a_corrupt_tokenizer_config_is_refused_not_treated_as_absent
 poot-text	poot-text	model-free	chat::chat_from_files_tests::embedded_chat_template_field_takes_priority_over_standalone_file
 poot-text	poot-text	model-free	chat::chat_from_files_tests::falls_back_to_standalone_chat_template_jinja_file
 poot-text	poot-text	model-free	chat::chat_from_files_tests::held_bytes_preserve_embedded_chat_semantics_without_a_path
@@ -5150,6 +5162,7 @@ poot-text	poot-text	model-free	grammar::tests::negated_class
 poot-text	poot-text	model-free	grammar::tests::optional_and_groups
 poot-text	poot-text	model-free	grammar::tests::parses_and_accepts_simple_alternation
 poot-text	poot-text	model-free	grammar::tests::recursion_balanced_parens
+poot-text	poot-text	model-free	guided::guided_byte_table_cache::a_poisoned_guided_cache_still_serves_later_requests
 poot-text	poot-text	model-free	guided::guided_byte_table_cache::byte_table_is_built_once_and_reused
 poot-text	poot-text	model-free	guided::guided_byte_table_cache::guided_dfa_is_cached_per_pattern_and_bounded
 poot-text	poot-text	model-free	guided::guided_mask_fuzz::grammar_constraint_masks_tokens_through_the_byte_table

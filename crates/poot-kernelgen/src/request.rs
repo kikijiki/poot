@@ -1970,7 +1970,7 @@ mod tests {
     #[test]
     fn the_attn_gemv_grid_covers_every_output_row_of_the_batch() {
         let (d, batch, width) = (32usize, 3usize, 128usize);
-        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
         let generated = generate(
             &KernelRequest::Contraction(ContractionSpec::AttnScoresVGemv {
                 cap: 64,
@@ -2051,7 +2051,7 @@ mod tests {
         out_len: usize,
     ) -> Vec<f32> {
         use poot_kernel_ir::interp::{Buffer, run};
-        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
         let generated = generate(request, &caps, &roomy()).expect("stateable");
         let workgroup = generated.body.workgroup_size;
         let workgroups =
@@ -2151,7 +2151,7 @@ mod tests {
                         DenseTiledWeight::Nk(BufferStorage::f32()),
                         (1, k, n),
                         Some(epilogue(storage)),
-                        &DeviceCaps::wgpu_rdna3_igpu(),
+                        &poot_test_util::device_caps::wgpu_rdna3_igpu(),
                     ),
                     weight_values.clone(),
                 ),
@@ -2238,7 +2238,7 @@ mod tests {
         out_len: usize,
     ) -> Vec<f32> {
         use poot_kernel_ir::interp::{Buffer, run};
-        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
         let generated = generate(request, &caps, &roomy()).expect("stateable");
         let workgroup = generated.body.workgroup_size;
         let workgroups =
@@ -2296,7 +2296,7 @@ mod tests {
                         DenseTiledWeight::Nk(weight),
                         (m, k, n),
                         None,
-                        &DeviceCaps::wgpu_rdna3_igpu(),
+                        &poot_test_util::device_caps::wgpu_rdna3_igpu(),
                     ),
                 })
             };
@@ -2341,7 +2341,7 @@ mod tests {
     /// red.
     #[test]
     fn a_dense_contraction_over_an_unread_weight_storage_is_unsupported() {
-        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
         for weight in [BufferStorage::f16(), BufferStorage::i32()] {
             let request = KernelRequest::Contraction(ContractionSpec::DenseGemv {
                 weight,
@@ -2576,7 +2576,7 @@ mod tests {
     /// built body's count and the stage assertion fails.
     #[test]
     fn a_fused_region_over_the_body_limits_is_refused_before_generation() {
-        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
         let request = erf_chain(6);
         let bound = recipe_size(&request).expect("a pointwise request is sized from its recipe");
         let fits = generate(&request, &caps, &limits(bound.instructions, bound.locals))
@@ -2624,7 +2624,7 @@ mod tests {
     /// returned. Mutation: drop the `Finished` reservation; the over-limit body comes back `Ok`.
     #[test]
     fn a_body_over_the_limits_is_refused_after_generation_when_its_request_cannot_be_sized() {
-        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
         let request = KernelRequest::TopK(TopKSpec {
             e: 8,
             k: 2,
@@ -2741,7 +2741,7 @@ mod tests {
     fn the_aie_schedule_computes_what_the_grid_body_computes() {
         use poot_kernel_ir::interp::run;
         const NUMEL: usize = 70;
-        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
         for (op, request) in admitted_requests(NUMEL) {
             let inputs = if matches!(op, AieOp::Unary(_)) { 1 } else { 2 };
             let grid_body = generate(&request, &caps, &aie_limits()).unwrap();
@@ -2843,7 +2843,7 @@ mod tests {
         use poot_kernel_ir::interp::{Buffer, run};
         const ROWS: usize = 5;
         const COLS: usize = 70;
-        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
         let x: Vec<f32> = (0..ROWS * COLS)
             .map(|i| ((i * 37) % 101) as f32 * 0.05 - 2.5)
             .collect();
@@ -2901,7 +2901,7 @@ mod tests {
     #[test]
     fn the_aie_reduction_and_gather_schedules_compute_what_the_grid_bodies_compute() {
         use poot_kernel_ir::interp::{Buffer, run};
-        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
         let (rows, cols) = (7usize, 9usize);
         let sum = |op| {
             KernelRequest::Row(RowSpec::ReduceLast {

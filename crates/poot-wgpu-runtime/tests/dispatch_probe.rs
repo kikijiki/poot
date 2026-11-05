@@ -5,9 +5,9 @@
 //! `vec4_probe_tests`: it needs `KernelBuffer::read_write_f32`, `pub(crate)` only.)
 //!
 //! The fixtures are hand-written raw LLVM IR (not `poot_kernel_ir::Body` +
-//! `poot_codegen::emit_llvm_ir`), so the tests shell out to `llc` directly (skip-if-absent, as in
-//! `poot-codegen/tests/llc.rs`) instead of `poot_codegen::compile`. Skips cleanly (prints + returns)
-//! if `llc` or a Vulkan adapter is unavailable.
+//! `poot_codegen::emit_llvm_ir`), so the tests shell out to `llc` directly instead of `poot_codegen::compile`. A missing
+//! tool fails the test (`poot_test_util::toolchain`); a missing Vulkan adapter is a `POOT-SKIP`, and a failure when
+//! `POOT_REQUIRE_WGPU` requires it.
 //!
 //! Verify with `cargo test -p poot-wgpu-runtime --test dispatch_probe --no-run` (or `--release`); run the
 //! dispatch tests only in the serial GPU lane (run command in the module docs at the bottom).
@@ -16,8 +16,11 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use poot_codegen::{ArgSchema, CompiledKernel, KernelCode};
+use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::device_skip::open_or_skip;
 use poot_target::ArgAccess;
 use poot_target::ElementKind;
+use poot_test_util::toolchain::require_tools;
 use poot_wgpu_runtime::{Context, DeviceBuffer};
 
 /// Wrap hand-written raw-LLVM-IR SPIR-V (not `poot_kernel_ir::Body` + `poot_codegen`, see the module
@@ -43,10 +46,6 @@ fn kernel_from_spv(spv: &[u8], args: Vec<ArgSchema>) -> CompiledKernel {
     }
 }
 
-fn have(bin: &str) -> bool {
-    Command::new(bin).arg("--version").output().is_ok()
-}
-
 fn probe_dir() -> PathBuf {
     let d = std::env::temp_dir().join("poot-wgpu-runtime-dispatch-probe");
     std::fs::create_dir_all(&d).unwrap();
@@ -55,7 +54,7 @@ fn probe_dir() -> PathBuf {
 
 /// Compile raw SPIR-V-target LLVM IR text to a `.spv` via system `llc` (same flags as
 /// `poot_codegen::Target::SpirvVulkan::llc_args()`), then validate it with `spirv-val`. Panics with the
-/// tool's stderr on failure (a hard gate, not a skip; the caller already checked `have("llc")`).
+/// tool's stderr on failure (a hard gate, not a skip; the caller already required `llc` and `spirv-val`).
 fn compile_and_validate(ll_source: &str, tag: &str) -> Vec<u8> {
     let dir = probe_dir();
     let ll_path = dir.join(format!("{tag}.ll"));
@@ -79,21 +78,17 @@ fn compile_and_validate(ll_source: &str, tag: &str) -> Vec<u8> {
         String::from_utf8_lossy(&out.stderr)
     );
     let bytes = std::fs::read(&spv_path).unwrap();
-    if have("spirv-val") {
-        let v = Command::new("spirv-val")
-            .arg("--target-env")
-            .arg("vulkan1.3")
-            .arg(&spv_path)
-            .output()
-            .expect("failed to run spirv-val");
-        assert!(
-            v.status.success(),
-            "spirv-val failed for {tag}:\n{}",
-            String::from_utf8_lossy(&v.stderr)
-        );
-    } else {
-        eprintln!("spirv-val not on PATH; skipping static validation for {tag}");
-    }
+    let v = Command::new("spirv-val")
+        .arg("--target-env")
+        .arg("vulkan1.3")
+        .arg(&spv_path)
+        .output()
+        .expect("failed to run spirv-val");
+    assert!(
+        v.status.success(),
+        "spirv-val failed for {tag}:\n{}",
+        String::from_utf8_lossy(&v.stderr)
+    );
     bytes
 }
 
@@ -106,14 +101,7 @@ fn compile_and_validate(ll_source: &str, tag: &str) -> Vec<u8> {
 /// `mixed_scalar_vec4_two_bindings_alias_one_buffer_runs_on_gpu` below.
 #[test]
 fn mixed_scalar_vec4_one_binding_is_rejected_by_spirv_val() {
-    if !have("llc") {
-        eprintln!("llc not on PATH; skipping");
-        return;
-    }
-    if !have("spirv-val") {
-        eprintln!("spirv-val not on PATH; skipping (this test only asserts a spirv-val rejection)");
-        return;
-    }
+    require_tools(&["llc", "spirv-val"]);
     let ll = include_str!("fixtures/dispatch_probe/C1_mixed_scalar_vec4_one_binding_INVALID.ll");
     let dir = probe_dir();
     let ll_path = dir.join("c1_mixed_one_binding.ll");
@@ -162,16 +150,9 @@ fn mixed_scalar_vec4_one_binding_is_rejected_by_spirv_val() {
 /// emission for P1.
 #[test]
 fn mixed_scalar_vec4_two_bindings_alias_one_buffer_runs_on_gpu() {
-    if !have("llc") {
-        eprintln!("llc not on PATH; skipping");
+    require_tools(&["llc", "spirv-val"]);
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
         return;
-    }
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping");
-            return;
-        }
     };
     let ll = include_str!("fixtures/dispatch_probe/C2_mixed_scalar_vec4_two_bindings_WORKS.ll");
     let spv = compile_and_validate(ll, "c2_mixed_two_bindings");

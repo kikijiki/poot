@@ -239,9 +239,13 @@ impl RocmContext {
         // A copy still in flight into these bytes (a write to an earlier allocation at this address, freed
         // since) must land before the fill, or it would overwrite the zeros. Freeing already waits for it;
         // this is the second line of defence for a range the ring still names. A poisoned context cannot
-        // prove completion, and its allocations are leaked, so the result is ignored.
+        // prove completion, and its allocations are leaked, so only its failure is ignored: any other
+        // drain failure leaves a copy possibly in flight over the zeros that follow.
         let base = dst as usize;
-        let _ = self.drain_ring(&mut self.lock_ring(), Some(base..base + len), "zero_fill");
+        match self.drain_ring(&mut self.lock_ring(), Some(base..base + len), "zero_fill") {
+            Err(_) if self.is_poisoned() => {}
+            drained => drained?,
+        }
         let words = len / 4;
         if words > 0 {
             // SAFETY: `dst` is 4-byte aligned and `words * 4 <= len` bytes of a live allocation (function

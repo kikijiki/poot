@@ -444,7 +444,7 @@ mod resources {
         let declared = KernelRequirements {
             subgroup_lanes: Some(32),
         };
-        let radv = DeviceCaps::wgpu_rdna3_igpu();
+        let radv = poot_test_util::device_caps::wgpu_rdna3_igpu();
         let radv_subgroup = Queried::Known(SubgroupSupport::Present {
             min_size: 32,
             max_size: 32,

@@ -54,7 +54,7 @@ use poot_graph_ir::{Graph, ValueId};
 use poot_graph_plan::{WeightFormats, bind_packed_weights};
 use poot_models::model::{LogitRows, StepShape, StepSpec};
 use poot_models::registry::Registry;
-use poot_test_util::{Checkpoint, REQUIRE_MODELS_VARIABLE};
+use poot_test_util::Checkpoint;
 
 use poot_executor::Executor;
 
@@ -203,12 +203,6 @@ fn drop_attention_scale(config: &mut serde_json::Value) {
     config["max_position_embeddings"] = config["original_max_position_embeddings"].clone();
 }
 
-/// Whether a missing tool, model or device fails the row (`POOT_REQUIRE_MODELS=1`, the checkpoint lanes)
-/// instead of skipping it.
-fn required() -> bool {
-    std::env::var(REQUIRE_MODELS_VARIABLE).as_deref() == Ok("1")
-}
-
 /// Which engine computes poot's logits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Engine {
@@ -226,19 +220,16 @@ enum Opened {
 }
 
 /// Open `engine` before anything slow runs (the HF load, the llama.cpp reference). `None` after saying why
-/// when the ROCm device is absent: a failure when [`required`], a skip otherwise.
+/// when the ROCm device is absent: a failure under `POOT_REQUIRE_MODELS`, a skip otherwise.
 fn open(engine: Engine) -> Option<Opened> {
     match engine {
         Engine::Oracle => Some(Opened::Oracle),
         Engine::Rocm => match open_executor(BackendChoice::Rocm) {
             Ok(exec) => Some(Opened::Rocm(exec)),
             Err(error) => {
-                assert!(
-                    !required(),
-                    "no ROCm device ({error}) but {REQUIRE_MODELS_VARIABLE}=1: the checkpoint lane fails on a \
-                     missing device"
-                );
-                eprintln!("SKIP: ROCm device unavailable: {error}");
+                poot_test_util::missing_prerequisite(&format_args!(
+                    "ROCm device unavailable: {error}"
+                ));
                 None
             }
         },
@@ -268,19 +259,12 @@ fn load(dir: &Path) -> ModelHandle {
 }
 
 /// llama.cpp's reference over `text` on `gguf`, parsed from `bytes` the caller keeps alive; `None` after saying
-/// why when `llama-perplexity` is not on `PATH` (a failure when [`required`]).
+/// why when `llama-perplexity` is not on `PATH` (a failure under `POOT_REQUIRE_MODELS`).
 fn llama_reference(gguf: &Path, text: &str, n_ctx: usize) -> Option<Vec<u8>> {
     let scratch = poot_test_util::unique_temp_path("reference.bin");
     let corpus = scratch.with_file_name("corpus.txt");
     std::fs::write(&corpus, text).unwrap();
-    if run_reference(gguf, &corpus, n_ctx, &scratch).is_none() {
-        assert!(
-            !required(),
-            "llama-perplexity is not on PATH but {REQUIRE_MODELS_VARIABLE}=1: the checkpoint lane fails on a \
-             missing tool"
-        );
-        return None;
-    }
+    run_reference(gguf, &corpus, n_ctx, &scratch)?;
     Some(std::fs::read(&scratch).unwrap())
 }
 

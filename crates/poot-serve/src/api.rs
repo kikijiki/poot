@@ -747,7 +747,7 @@ impl Usage {
 }
 
 #[derive(Deserialize, Serialize)]
-#[serde(from = "ChatMsgRaw")]
+#[serde(try_from = "ChatMsgRaw")]
 pub(crate) struct ChatMsg {
     pub(crate) role: String,
     // Optional so an assistant tool-call turn (`content: null`) and the full OpenAI message shape
@@ -793,53 +793,78 @@ struct ChatMsgRaw {
     name: Option<String>,
 }
 
-impl From<ChatMsgRaw> for ChatMsg {
-    fn from(raw: ChatMsgRaw) -> Self {
-        let (content, non_text_parts, image_urls) = flatten_chat_content(&raw.content);
-        ChatMsg {
+impl TryFrom<ChatMsgRaw> for ChatMsg {
+    type Error = String;
+
+    fn try_from(raw: ChatMsgRaw) -> Result<Self, String> {
+        let FlatContent {
+            text,
+            non_text_parts,
+            image_urls,
+        } = flatten_chat_content(&raw.content)?;
+        Ok(ChatMsg {
             role: raw.role,
-            content,
+            content: text,
             non_text_parts,
             image_urls,
             tool_calls: raw.tool_calls,
             tool_call_id: raw.tool_call_id,
             name: raw.name,
-        }
+        })
     }
 }
 
-/// Flatten one OpenAI `content` value to `(text, non_text_part_types, image_urls)`. Text parts are
+/// A `content` value flattened: the text, the `type` of each non-text part and the image urls.
+#[derive(Default)]
+struct FlatContent {
+    text: Option<String>,
+    non_text_parts: Vec<String>,
+    image_urls: Vec<String>,
+}
+
+/// Flatten one OpenAI `content` value to its [`FlatContent`]. Text parts are
 /// concatenated; every non-`text` part's `type` string is recorded, and the `url` of each image part
-/// (`image_url` as a string or as `{url}`).
-fn flatten_chat_content(v: &serde_json::Value) -> (Option<String>, Vec<String>, Vec<String>) {
+/// (`image_url` as a string or as `{url}`). `null` (a tool-call turn) is no content; any other shape, a
+/// part without a string `type`, or a `text` part without a string `text` is refused, never read as empty.
+fn flatten_chat_content(v: &serde_json::Value) -> Result<FlatContent, String> {
     match v {
-        serde_json::Value::String(s) => (Some(s.clone()), Vec::new(), Vec::new()),
+        serde_json::Value::Null => Ok(FlatContent::default()),
+        serde_json::Value::String(s) => Ok(FlatContent {
+            text: Some(s.clone()),
+            ..FlatContent::default()
+        }),
         serde_json::Value::Array(parts) => {
             let mut text = String::new();
             let mut non_text_parts = Vec::new();
             let mut image_urls = Vec::new();
             for part in parts {
-                match part.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => {
-                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                            text.push_str(t);
-                        }
+                let kind = part
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .ok_or("a content part needs a string `type`")?;
+                if kind == "text" {
+                    text.push_str(
+                        part.get("text")
+                            .and_then(|t| t.as_str())
+                            .ok_or("a `text` content part needs a string `text`")?,
+                    );
+                } else {
+                    if is_image_part(kind) {
+                        let url = part.get("image_url").and_then(|image| {
+                            image.as_str().or_else(|| image.get("url")?.as_str())
+                        });
+                        image_urls.extend(url.map(str::to_string));
                     }
-                    Some(other) => {
-                        if is_image_part(other) {
-                            let url = part.get("image_url").and_then(|image| {
-                                image.as_str().or_else(|| image.get("url")?.as_str())
-                            });
-                            image_urls.extend(url.map(str::to_string));
-                        }
-                        non_text_parts.push(other.to_string());
-                    }
-                    None => {}
+                    non_text_parts.push(kind.to_string());
                 }
             }
-            (Some(text), non_text_parts, image_urls)
+            Ok(FlatContent {
+                text: Some(text),
+                non_text_parts,
+                image_urls,
+            })
         }
-        _ => (None, Vec::new(), Vec::new()),
+        _ => Err("`content` must be a string, an array of content parts, or null".to_string()),
     }
 }
 

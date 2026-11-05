@@ -165,14 +165,19 @@ fn the_dense_gemv_meets_tier_2_in_every_lane_and_launch_on_rocm() {
     };
     let target = device.target();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-    for (n, cols) in launch_shapes(gpu_caps(&target).compute_units) {
+    for (n, cols) in launch_shapes(
+        gpu_caps(&target)
+            .compute_units
+            .known()
+            .expect("a device test needs a known count"),
+    ) {
         for dtype in [DType::F32, DType::F16, DType::BF16] {
             for k in [1037, 515] {
                 let case = gemv_case(dtype, k, n);
                 let schedule = planned_schedule(&case, target);
                 assert!(
                     matches!(schedule, Schedule::Gemv { cols: c, .. } if c == cols),
-                    "N = {n} on {} compute units: {schedule:?}",
+                    "N = {n} on {:?} compute units: {schedule:?}",
                     gpu_caps(&target).compute_units
                 );
                 let what = format!("{dtype:?} k={k} n={n} {schedule:?}");

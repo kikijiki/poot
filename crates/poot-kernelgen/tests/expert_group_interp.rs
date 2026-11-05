@@ -6,7 +6,6 @@
 use poot_graph_ir::ExpertGrouping;
 use poot_kernel_ir::interp::{Buffer, run};
 use poot_kernelgen as kg;
-use poot_target::DeviceCaps;
 
 fn limits() -> kg::BodyLimits {
     kg::BodyLimits {
@@ -19,7 +18,7 @@ fn limits() -> kg::BodyLimits {
 fn run_group(ids: &[i32], experts: usize, block: usize) -> Vec<i32> {
     let generated = kg::generate(
         &kg::KernelRequest::ExpertGroup(kg::ExpertGroupSpec { experts, block }),
-        &DeviceCaps::wgpu_rdna3_igpu(),
+        &poot_test_util::device_caps::wgpu_rdna3_igpu(),
         &limits(),
     )
     .unwrap();
@@ -141,7 +140,7 @@ fn weights() -> Vec<f32> {
 /// The tiled indexed contraction (f32 weight, `[E, K, N]`) of `x [rows, K]` over its rows grouped from `ids`, on
 /// the interpreter: the block the cost model picks for the shape, its tiling, and the grouping kernel's grouping.
 fn run_grouped(x: &[f32], ids: &[i32]) -> Vec<f32> {
-    let caps = DeviceCaps::wgpu_rdna3_igpu();
+    let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     let rows = ids.len();
     let shape = |block| kg::TiledShape {
         blocks: 1,

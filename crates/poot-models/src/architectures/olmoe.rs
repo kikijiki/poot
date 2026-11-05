@@ -533,7 +533,7 @@ mod family_tests {
             let target = Target::Gpu {
                 backend,
                 caps: match backend {
-                    Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
+                    Backend::SpirvVulkan => poot_test_util::device_caps::wgpu_rdna3_igpu(),
                     Backend::Nvptx => DeviceCaps::ptx_default(),
                     Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
                 },

@@ -4,8 +4,7 @@
 //! Vulkan SPIR-V), indexed dynamically and loaded as an `i32`. The probe kernel is
 //! `out[i] = table[i]`; each text check is followed by a compile through the real toolchain where
 //! one is installed, and the Vulkan
-//! module must pass `spirv-val`. Skips (passes) when the relevant tool is absent, like the other
-//! codegen integration tests.
+//! module must pass `spirv-val`. A missing tool fails the test (`poot_test_util::toolchain`).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -15,6 +14,7 @@ use poot_kernel_ir::{
     BasicBlock, BlockId, Body, Constant, ConstantTableDecl, IndexAxis, Local, LocalDecl, Operand,
     Place, ProjectionElem, Rvalue, Statement, Terminator, Ty,
 };
+use poot_test_util::toolchain::{require_amd_clang, require_tools};
 
 const WORDS: [u32; 4] = [0x0807_0605, 0xdead_beef, 0x8000_0001, 7];
 
@@ -70,10 +70,6 @@ fn probe() -> Body {
         words: WORDS.to_vec(),
     }];
     body
-}
-
-fn have(bin: &str) -> bool {
-    Command::new(bin).arg("--version").output().is_ok()
 }
 
 fn out_dir(tag: &str) -> PathBuf {
@@ -145,10 +141,7 @@ fn aie_core_refuses_a_constant_table() {
 
 #[test]
 fn the_vulkan_module_validates() {
-    if !have("llc") || !have("spirv-val") {
-        eprintln!("llc/spirv-val not on PATH; skipping");
-        return;
-    }
+    require_tools(&["llc", "spirv-val"]);
     let dir = out_dir("constant-table-spirv");
     let out = poot_codegen::artifact_path(&dir, "table_probe", Target::SpirvVulkan);
     compile(&probe(), Target::SpirvVulkan, &out).expect("SpirvVulkan compile");
@@ -166,10 +159,7 @@ fn the_vulkan_module_validates() {
 
 #[test]
 fn the_nvptx_module_reads_the_table_from_global_memory() {
-    if !have("llc") {
-        eprintln!("llc not on PATH; skipping");
-        return;
-    }
+    require_tools(&["llc"]);
     let dir = out_dir("constant-table-nvptx");
     let out = poot_codegen::artifact_path(&dir, "table_probe", Target::Nvptx);
     compile(&probe(), Target::Nvptx, &out).expect("Nvptx compile");
@@ -186,12 +176,7 @@ fn the_nvptx_module_reads_the_table_from_global_memory() {
 
 #[test]
 fn the_amdgcn_module_compiles() {
-    if !std::env::var("POOT_AMD_CLANG")
-        .is_ok_and(|clang| Command::new(clang).arg("--version").output().is_ok())
-    {
-        eprintln!("POOT_AMD_CLANG not set or not runnable; skipping");
-        return;
-    }
+    require_amd_clang();
     let dir = out_dir("constant-table-amdgcn");
     let target = Target::AmdGcn(poot_target::AmdArch::gfx1151());
     let out = poot_codegen::artifact_path(&dir, "table_probe", target);

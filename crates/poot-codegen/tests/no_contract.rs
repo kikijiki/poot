@@ -1,7 +1,7 @@
 //! Card 628 (dquant.md section 7 R1) end-to-end acceptance: `Rvalue::BinaryOpNoContract`
 //! lowers to a real per-backend no-contraction mechanism, verified against the actual toolchain
-//! (`fixtures::no_contract_probe_kernel`, `out[i] = a[i]*b[i] - c[i]*d[i]`). Skips (passes) if the relevant
-//! toolchain is absent, matching `llc.rs`'s convention so `cargo test` outside the devshell stays green.
+//! (`fixtures::no_contract_probe_kernel`, `out[i] = a[i]*b[i] - c[i]*d[i]`). A missing tool fails the test
+//! (`poot_test_util::toolchain`): the devshell provides every one of them.
 //!
 //! The marker sits on the final **subtract**, not either multiply - a real-hardware finding (RADV/ACO,
 //! `poot-wgpu-runtime`'s `no_contract_tests` module): decorating only the second multiply (`c*d`) leaves ACO
@@ -42,15 +42,7 @@ use std::process::Command;
 
 use poot_codegen::{Target, compile};
 use poot_kernel_ir::test_support::no_contract_probe_kernel;
-
-fn have(bin: &str) -> bool {
-    Command::new(bin).arg("--version").output().is_ok()
-}
-
-fn amd_toolchain_available() -> bool {
-    std::env::var("POOT_AMD_CLANG")
-        .is_ok_and(|clang| Command::new(clang).arg("--version").output().is_ok())
-}
+use poot_test_util::toolchain::{require_amd_clang, require_tools};
 
 fn out_dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join("poot-codegen-test").join(tag);
@@ -64,10 +56,7 @@ fn out_dir(tag: &str) -> PathBuf {
 /// itself break validation.
 #[test]
 fn spirv_marked_subtract_is_decorated_nocontraction_unmarked_is_not() {
-    if !have("llc") || !have("spirv-dis") || !have("spirv-val") {
-        eprintln!("llc/spirv-dis/spirv-val not on PATH; skipping");
-        return;
-    }
+    require_tools(&["llc", "spirv-dis", "spirv-val"]);
     let dir = out_dir("no-contract-spirv");
     for (marked, tag) in [(true, "marked"), (false, "unmarked")] {
         let body = no_contract_probe_kernel(marked);
@@ -135,10 +124,7 @@ fn spirv_marked_subtract_is_decorated_nocontraction_unmarked_is_not() {
 /// then reverted, confirmed green again).
 #[test]
 fn nvptx_marked_subtract_emits_constrained_intrinsic_under_strictfp() {
-    if !have("llc") {
-        eprintln!("llc not on PATH; skipping");
-        return;
-    }
+    require_tools(&["llc"]);
     let dir = out_dir("no-contract-nvptx");
     let mut compiled = std::collections::HashMap::new();
     for (marked, tag) in [(true, "marked"), (false, "unmarked")] {
@@ -196,20 +182,13 @@ fn nvptx_marked_subtract_emits_constrained_intrinsic_under_strictfp() {
 /// of this card.
 #[test]
 fn amdgcn_marked_subtract_stays_unfused_in_the_compiled_isa() {
-    if !amd_toolchain_available() {
-        eprintln!(
-            "no AMD toolchain (POOT_AMD_CLANG) available; skipping AMDGCN no-contraction test"
-        );
-        return;
-    }
-    let objdump = {
-        let clang = std::env::var("POOT_AMD_CLANG").unwrap();
-        PathBuf::from(&clang).parent().unwrap().join("llvm-objdump")
-    };
-    if !objdump.exists() {
-        eprintln!("llvm-objdump not found next to POOT_AMD_CLANG; skipping disassembly check");
-        return;
-    }
+    let clang = require_amd_clang();
+    let objdump = clang.parent().unwrap().join("llvm-objdump");
+    assert!(
+        objdump.exists(),
+        "llvm-objdump not found next to POOT_AMD_CLANG ({})",
+        clang.display()
+    );
     let dir = out_dir("no-contract-amdgcn");
     let target = Target::AmdGcn(poot_target::AmdArch::gfx1151());
     for (marked, tag) in [(true, "marked"), (false, "unmarked")] {

@@ -35,7 +35,7 @@ use poot_graph_plan::{
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::BufferRole;
-use poot_target::{Backend, DeviceCaps};
+use poot_target::Backend;
 use poot_tensor::DType;
 
 type Graph = poot_graph_ir::Graph;
@@ -91,7 +91,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram {
 fn fake_target() -> Target {
     Target::Gpu {
         backend: Backend::SpirvVulkan,
-        caps: DeviceCaps::wgpu_rdna3_igpu(),
+        caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
     }
 }
 

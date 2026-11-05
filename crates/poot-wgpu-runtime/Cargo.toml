@@ -28,6 +28,8 @@ bytemuck.workspace = true
 wgpu-hal.workspace = true
 
 [dev-dependencies]
+# Host toolchain (`poot_test_util::toolchain`) and the device-caps fixtures.
+poot-test-util.workspace = true
 # This crate's own `tests/*.rs` integration binaries drive a `Context` through the gated upload/download API.
 poot-wgpu-runtime = { path = ".", features = ["test-support"] }
 poot-runtime-common = { workspace = true, features = ["test-support"] }

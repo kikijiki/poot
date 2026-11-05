@@ -399,10 +399,15 @@ fn gemv_schedule(
     format: WeightFormat,
     caps: &DeviceCaps,
 ) -> Result<Schedule, PlanError> {
-    let min_workgroups = 2 * caps.compute_units as usize;
+    // The narrowest columns launch the most workgroups: they are the plan for a device whose compute units are
+    // unknown, which cannot show a wider one fills it.
     let cols = [16, 8]
         .into_iter()
-        .find(|&cols| outputs.div_ceil(cols) >= min_workgroups)
+        .find(|&cols| {
+            caps.compute_units
+                .known()
+                .is_some_and(|units| outputs.div_ceil(cols) >= 2 * units as usize)
+        })
         .unwrap_or(8);
     let sharing = poot_kernelgen::packed_run_sharing(format)
         .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
@@ -652,15 +657,18 @@ mod tests {
     fn packed_decode_gemv_launch_follows_the_compute_unit_table() {
         let k = 256;
         for (compute_units, n, cols) in [
-            (40, 151_936, 16),
-            (40, 4864, 16),
-            (40, 1280, 16),
-            (40, 1264, 8),
-            (40, 896, 8),
-            (40, 128, 8),
-            (4, 896, 16),
+            (Some(40), 151_936, 16),
+            (Some(40), 4864, 16),
+            (Some(40), 1280, 16),
+            (Some(40), 1264, 8),
+            (Some(40), 896, 8),
+            (Some(40), 128, 8),
+            (Some(4), 896, 16),
+            // POOT-1468: no known compute-unit count plans the narrowest columns, however wide N is.
+            (None, 151_936, 8),
+            (None, 896, 8),
         ] {
-            let what = format!("compute_units={compute_units} N={n}");
+            let what = format!("compute_units={compute_units:?} N={n}");
             let builder = Builder::for_tests();
             let x = builder
                 .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, k]))
@@ -673,9 +681,10 @@ mod tests {
             let target = Target::Gpu {
                 backend: Backend::SpirvVulkan,
                 caps: DeviceCaps {
-                    compute_units,
+                    compute_units: compute_units
+                        .map_or(poot_target::Queried::Unknown, poot_target::Queried::Known),
                     memory_budget_bytes: None,
-                    ..DeviceCaps::wgpu_rdna3_igpu()
+                    ..poot_test_util::device_caps::wgpu_rdna3_igpu()
                 },
             };
             let options = CompileOptions::new(crate::CompileLimits::STANDARD)
@@ -823,7 +832,7 @@ mod tests {
                     backend: Backend::SpirvVulkan,
                     caps: DeviceCaps {
                         memory_budget_bytes: None,
-                        ..DeviceCaps::wgpu_rdna3_igpu()
+                        ..poot_test_util::device_caps::wgpu_rdna3_igpu()
                     },
                 },
             ),
@@ -933,7 +942,7 @@ mod tests {
         .unwrap();
         let target = Target::Gpu {
             backend: Backend::SpirvVulkan,
-            caps: DeviceCaps::wgpu_rdna3_igpu(),
+            caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
         };
         let options = CompileOptions::new(crate::CompileLimits::STANDARD);
         let program = compile(&builder.finish(out_value).unwrap(), &target, &options).unwrap();
@@ -957,7 +966,7 @@ mod tests {
                 weight_bits: poot_kernelgen::packed_value_bits(WeightFormat::E2m1Row32),
                 activation_bits: poot_kernelgen::activation_bits(None),
             },
-            &DeviceCaps::wgpu_rdna3_igpu(),
+            &poot_test_util::device_caps::wgpu_rdna3_igpu(),
         )
         .schedule();
         let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(
@@ -1038,7 +1047,7 @@ mod tests {
         let (m, k, n) = (128usize, 5120usize, 17408usize);
         let target = Target::Gpu {
             backend: Backend::SpirvVulkan,
-            caps: DeviceCaps::wgpu_rdna3_igpu(),
+            caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
         };
         let Fp8PrefillPlan {
             schedule,
@@ -1140,7 +1149,7 @@ mod tests {
     #[test]
     fn a_packed_tiled_contraction_over_the_watchdog_budget_splits_into_tile_ranges() {
         let (m, n, k) = (2048usize, 16_384usize, 512usize);
-        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
         let format = WeightFormat::E4m3Block128 {
             scale: poot_quant::format::ScaleEncoding::Bf16,
         };
@@ -1205,7 +1214,7 @@ mod tests {
 
         let unbudgeted = plan_for(DeviceCaps {
             watchdog_budget: None,
-            ..DeviceCaps::wgpu_rdna3_igpu()
+            ..poot_test_util::device_caps::wgpu_rdna3_igpu()
         });
         assert_eq!(unbudgeted.len(), 1);
         assert_eq!(unbudgeted[0].1[4], 0);
@@ -1260,7 +1269,7 @@ mod tests {
     fn tiny_grid_caps() -> DeviceCaps {
         DeviceCaps {
             max_grid: [4, 4, 4],
-            ..DeviceCaps::wgpu_rdna3_igpu()
+            ..poot_test_util::device_caps::wgpu_rdna3_igpu()
         }
     }
 
@@ -1554,7 +1563,11 @@ mod tests {
             "the fixture is past 2^32 bits"
         );
         assert!(matches!(
-            refusal(&graph, index, &DeviceCaps::wgpu_rdna3_igpu()),
+            refusal(
+                &graph,
+                index,
+                &poot_test_util::device_caps::wgpu_rdna3_igpu()
+            ),
             Capability::DispatchSizeOverflow
         ));
     }
@@ -1593,7 +1606,7 @@ mod tests {
             &DeviceCaps {
                 watchdog_budget: None,
                 known_miscompiles: poot_target::KnownMiscompiles::NONE,
-                ..DeviceCaps::wgpu_rdna3_igpu()
+                ..poot_test_util::device_caps::wgpu_rdna3_igpu()
             },
             &crate::test_support::roomy_body_limits(),
         )
@@ -1640,7 +1653,7 @@ mod tests {
             max_grid: [1024, 65_535, 65_535],
             watchdog_budget: None,
             known_miscompiles: poot_target::KnownMiscompiles::NONE,
-            ..DeviceCaps::wgpu_rdna3_igpu()
+            ..poot_test_util::device_caps::wgpu_rdna3_igpu()
         };
         assert!(
             rows * out > 65_535 * 256,
@@ -1683,7 +1696,7 @@ mod tests {
     /// the 32-row Gemv becomes Tiled and this row goes red.
     #[test]
     fn an_indexed_contraction_is_a_gemv_up_to_the_decode_row_count_and_tiled_above_it() {
-        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
         let schedule_of = |rows: usize| {
             let (graph, index) = indexed_eqn(rows, 4, 11, 64);
             let plan = plan_indexed(&graph, index, &caps).unwrap();

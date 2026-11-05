@@ -1,18 +1,17 @@
 //! Card 522: `Context::device_caps` fills a plausible descriptor on the real
 //! device, and `matrix_units` is a real `VK_KHR_cooperative_matrix` measurement, not a device-name guess -
-//! confirmed by this box's real RDNA3.5 WMMA hardware reporting a matching config. Skips (passes) if no
-//! Vulkan device is available.
+//! confirmed by this box's real RDNA3.5 WMMA hardware reporting a matching config. A row without a Vulkan
+//! device (or, for the RADV rows, without a RADV one) skips with `POOT-SKIP`, and fails when
+//! `POOT_REQUIRE_VULKAN` requires the device.
 
+use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::device_skip::{open_or_skip, skip_unsupported};
 use poot_vulkan_runtime::Context;
 
 #[test]
 fn device_caps_is_plausible_on_the_real_device() {
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device ({e}); skipping");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Vulkan, Context::new()) else {
+        return;
     };
     let caps = ctx.device_caps();
     eprintln!("raw-vulkan device_caps: {caps:?}");
@@ -41,17 +40,13 @@ fn device_caps_is_plausible_on_the_real_device() {
 /// `MatrixUnits::cooperative_matrix`; the dtype assertion goes red.
 #[test]
 fn raw_vulkan_reports_exactly_an_opaque_f16_fragment_on_this_box() {
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device ({e}); skipping");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Vulkan, Context::new()) else {
+        return;
     };
     if !ctx.device_name().to_ascii_lowercase().contains("radv") {
-        eprintln!(
-            "not the expected RADV iGPU ({:?}); skipping the WMMA-specific assertion",
-            ctx.device_name()
+        skip_unsupported(
+            DeviceBackend::Vulkan,
+            "the expected RADV iGPU (WMMA assertion)",
         );
         return;
     }
@@ -74,21 +69,20 @@ fn raw_vulkan_reports_exactly_an_opaque_f16_fragment_on_this_box() {
 
 /// POOT-1231 SC-001: the reference caps the raw Vulkan planner column compiles against are this device's
 /// own: every figure the fixture fixes (workgroup memory, workgroup and grid limits, subgroup range, matrix
-/// hardware, compute units, the vendor-scoped RADV caps) is what the live context reports. Skips on a
-/// non-RADV device (the fixture describes the RADV iGPU). Mutation: change a figure of
+/// hardware, compute units, the vendor-scoped RADV caps) is what the live context reports. A
+/// non-RADV device is a skip (the fixture describes the RADV iGPU). Mutation: change a figure of
 /// `poot_test_util::device_caps::vulkan_rdna3_igpu` (or point it back at the wgpu preset's `lds_bytes`): the field named in the
 /// assertion differs from the live value.
 #[test]
 fn the_reference_caps_of_the_raw_vulkan_column_are_what_the_radv_device_reports() {
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device ({e}); skipping");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Vulkan, Context::new()) else {
+        return;
     };
     if !ctx.device_name().to_ascii_lowercase().contains("radv") {
-        eprintln!("not a RADV device ({:?}); skipping", ctx.device_name());
+        skip_unsupported(
+            DeviceBackend::Vulkan,
+            "a RADV device (the reference caps describe one)",
+        );
         return;
     }
     let live = ctx.device_caps();

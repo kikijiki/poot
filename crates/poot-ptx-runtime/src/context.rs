@@ -134,7 +134,7 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
             .map_or(poot_target::Queried::Unknown, poot_target::Queried::Known),
         // A device's miscompiles are the target family's known facts, not something CUDA reports.
         known_miscompiles: poot_target::DeviceCaps::ptx_default().known_miscompiles,
-        compute_units: attrs.multiprocessor_count,
+        compute_units: poot_target::Queried::Known(attrs.multiprocessor_count),
         memory_budget_bytes: Some(total_memory),
         dram_channels: None,
         shader_features: poot_target::ShaderFeatures::ALL,
@@ -193,7 +193,9 @@ impl PtxContext {
                 PtxError::CudaUnavailable("libcuda not loadable (no NVIDIA driver)".to_string())
             })?
             .map_err(PtxError::Driver)?;
-        let device = result::device::get(ordinal as i32)?;
+        let cuda_ordinal =
+            i32::try_from(ordinal).map_err(|_| PtxError::InvalidOrdinal { ordinal })?;
+        let device = result::device::get(cuda_ordinal)?;
         let driver: Arc<dyn CudaDriver> = Arc::new(DriverCleanup);
         // NonBlocking is required for CUDA graph capture (a legacy-default-synchronizing stream cannot be captured).
         // The cross-stream hazard (a NULL-stream zeroing in `alloc_f32` racing a compute kernel on this stream,
@@ -1080,7 +1082,7 @@ mod caps_tests {
                 max_size: 16
             })
         );
-        assert_eq!(caps.compute_units, 99);
+        assert_eq!(caps.compute_units, poot_target::Queried::Known(99));
         assert_eq!(
             caps.memory_budget_bytes,
             Some(123_456),

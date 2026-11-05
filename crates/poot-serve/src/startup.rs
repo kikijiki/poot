@@ -132,6 +132,16 @@ pub(crate) extern "C" fn sigint_handler(_: libc::c_int) {
 }
 
 /// Served model name: the model-dir basename, or the GGUF file stem; echoed in responses and /v1/models.
+/// The pooling of the served model. A single-file checkpoint (a GGUF) has no `1_Pooling` module, so it
+/// takes the default; only a checkpoint directory is read, and a corrupt module there is a startup error.
+pub(crate) fn served_pooling(model: &std::path::Path) -> Result<Pooling> {
+    if model.is_dir() {
+        Ok(Pooling::read(model)?)
+    } else {
+        Ok(Pooling::Mean)
+    }
+}
+
 fn served_model_name(model_dir: &str) -> String {
     std::path::Path::new(model_dir)
         .file_stem()
@@ -381,7 +391,7 @@ pub(crate) fn run() -> Result<()> {
         job_rx,
     )?;
     let served = Arc::new(Served {
-        pooling: Pooling::read(std::path::Path::new(&model_dir)),
+        pooling: served_pooling(std::path::Path::new(&model_dir))?,
         model,
         engine: job_tx,
         view,

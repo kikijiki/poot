@@ -8,7 +8,7 @@ use poot_graph_ir::op::BinOp;
 use poot_graph_ir::{Builder, Graph, MatmulPrecision, OpKind, Operand, TensorType};
 use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Program, Target, compile};
 use poot_kernelgen::{ContractionSpec, DenseTiledContraction, DenseTiledWeight, KernelRequest};
-use poot_target::{Backend, BufferStorage, DeviceCaps};
+use poot_target::{Backend, BufferStorage};
 use poot_tensor::DType;
 
 const M: usize = 8;
@@ -18,7 +18,7 @@ const N: usize = 32;
 fn radv() -> Target {
     Target::Gpu {
         backend: Backend::SpirvVulkan,
-        caps: DeviceCaps::wgpu_rdna3_igpu(),
+        caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
     }
 }
 

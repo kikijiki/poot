@@ -132,7 +132,7 @@ fn a_stage_is_one_submit_without_a_watchdog_budget_and_cut_with_one() {
         "no budget: heavy dispatches still one submit"
     );
 
-    let budget = poot_target::DeviceCaps::wgpu_rdna3_igpu().watchdog_budget;
+    let budget = poot_test_util::device_caps::wgpu_rdna3_igpu().watchdog_budget;
     assert!(budget.is_some());
     let mut device = device.with_flush_caps(&DeviceCaps {
         watchdog_budget: budget,
@@ -165,7 +165,7 @@ fn a_cut_replay_keeps_two_submits_in_flight() {
         return;
     };
     let real = device.context().device_caps();
-    let budget = poot_target::DeviceCaps::wgpu_rdna3_igpu().watchdog_budget;
+    let budget = poot_test_util::device_caps::wgpu_rdna3_igpu().watchdog_budget;
     assert!(budget.is_some());
     let mut device = device.with_flush_caps(&DeviceCaps {
         watchdog_budget: budget,

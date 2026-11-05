@@ -25,6 +25,8 @@ tracing.workspace = true
 [dev-dependencies]
 # `no_contract_probe_kernel` (`poot_kernel_ir::test_support`, ADR-0113).
 poot-kernel-ir = { workspace = true, features = ["test-support"] }
+# The host toolchain a codegen test requires (`poot_test_util::toolchain`).
+poot-test-util.workspace = true
 
 [lints]
 workspace = true

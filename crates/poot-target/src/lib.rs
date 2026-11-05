@@ -370,10 +370,10 @@ pub struct DeviceCaps {
     pub register_file: Queried<RegisterFile>,
     /// Confirmed hardware/driver defects this device is known to have.
     pub known_miscompiles: KnownMiscompiles,
-    /// Compute units (AMD CUs, NVIDIA SMs): how many workgroups the device runs side by side. Probed
-    /// where the backend exposes it; the planner's Gemv launch policy sizes its grid
-    /// against it (at least two workgroups per compute unit).
-    pub compute_units: u32,
+    /// Compute units (AMD CUs, NVIDIA SMs): how many workgroups the device runs side by side. `Unknown`
+    /// where the backend exposes no query; the planner's launch policies size their grids against a known
+    /// count and take the schedule that needs none (no split, narrowest Gemv columns) on an unknown one.
+    pub compute_units: Queried<u32>,
     /// The device memory a process may allocate, in bytes, as the runtime queried it when the device
     /// opened (`VK_EXT_memory_budget`'s heap budget, the HSA pool size, CUDA's total). An observation
     /// at open, not a reservation: it is the ceiling of a budget, and admission reads the live free memory
@@ -427,7 +427,7 @@ impl DeviceCaps {
 
 /// Card 258: output-element count (one `gemv_lds` workgroup per element) above which a wgpu decode-GEMV
 /// splits into several smaller dispatches on a device with this box's measured watchdog budget (see
-/// [`DeviceCaps::wgpu_rdna3_igpu`]). One definition (card 522 review): `poot-graph-plan`'s
+/// `poot_test_util::device_caps::wgpu_rdna3_igpu`). One definition (card 522 review): `poot-graph-plan`'s
 /// `decode_gemv_plan` reads it through `caps.watchdog_budget`, and `dtype_widen`'s bf16 decode-GEMV
 /// eligibility gate imports this constant directly for its own chunk-trigger check (card 546b threaded
 /// `DeviceCaps.max_grid` into that gate's separate grid-cap check, but this trigger stays a plain
@@ -484,9 +484,9 @@ pub const SUBMIT_WORK: u64 = 4_000_000;
 /// consumes that figure, hosting or splitting whatever constant does not fit.
 pub const AMD_RADV_SAFE_MAX_BUFFER_BYTES: u64 = 1_342_177_280;
 
-/// Strix Halo's (gfx1151, Radeon 8060S) compute units, as HSA reports them: the RDNA3 default for
-/// [`DeviceCaps::wgpu_rdna3_igpu`] (wgpu has no compute-unit query) and [`DeviceCaps::rocm_default`]
-/// (a live ROCm context reports its own agent's count).
+/// Strix Halo's (gfx1151, Radeon 8060S) compute units, as HSA reports them: the figure of the test presets
+/// `poot_test_util::device_caps::wgpu_rdna3_igpu` and [`DeviceCaps::rocm_default`]. A runtime reports its own device's count
+/// or `Unknown`, never this one.
 pub const STRIX_HALO_COMPUTE_UNITS: u32 = 40;
 
 /// The AMDGPU backend's flat workgroup ceiling (LLVM `amdgpu-flat-work-group-size` maximum, every gfx9+
@@ -495,57 +495,10 @@ pub const STRIX_HALO_COMPUTE_UNITS: u32 = 40;
 pub const AMDGPU_MAX_WORKGROUP_INVOCATIONS: u32 = 1024;
 
 /// An A100's (sm_80, the NVPTX codegen target) streaming multiprocessors: [`DeviceCaps::ptx_default`]'s
-/// value (a live PTX context reports its own device's count).
+/// test-preset value (a live PTX context reports its own device's count).
 pub const SM80_A100_COMPUTE_UNITS: u32 = 108;
 
 impl DeviceCaps {
-    /// The values measured on this box's wgpu/RADV device (Strix Halo, gfx1151) as of card 522: the
-    /// display-watchdog budgets cards 163/258/159 calibrated, and the card-095 tiled-GEMM RADV
-    /// miscompile ceiling. Used as the default for [`Backend::SpirvVulkan`] until a real per-call
-    /// `DeviceCaps` is threaded through every entry point (Card 532), and as a synthetic fixture in
-    /// tests and the plan-summary corpus (card 599).
-    pub fn wgpu_rdna3_igpu() -> Self {
-        let calibration = calibration::Calibration::STRIX_HALO_RADV;
-        DeviceCaps {
-            max_buffer_bytes: AMD_RADV_SAFE_MAX_BUFFER_BYTES,
-            // Both Vulkan runtimes open the device with the adapter's own limits: RADV offers 64 KiB of
-            // workgroup memory and 1024 invocations per workgroup axis.
-            lds_bytes: 65_536,
-            max_workgroup_size: [1024, 1024, 1024],
-            max_workgroup_invocations: 1024,
-            // RDNA3 runs 32- or 64-lane waves; wgpu reports the adapter's range.
-            subgroup: Queried::Known(SubgroupSupport::Present {
-                min_size: 32,
-                max_size: 64,
-            }),
-            max_grid: [65_535, 65_535, 65_535],
-            watchdog_budget: calibration.watchdog_budget,
-            // wgpu leaves the pipeline's subgroup size to the driver, so only a one-subgroup workgroup is a
-            // fragment collective.
-            matrix_units: Queried::Known(MatrixUnits::of([FragmentConfig::m16n16k16(
-                FragmentDtype::F16,
-                FragmentLayout::Opaque,
-                32,
-                1,
-            )])),
-            // RADV's `VK_AMD_shader_core_properties` on Strix Halo: 256 VGPRs a lane, 768 wave64 VGPRs per SIMD,
-            // two SIMDs a compute unit.
-            register_file: Queried::Known(RegisterFile::amd_shader_core(256, 768, 2)),
-            known_miscompiles: calibration.known_miscompiles,
-            compute_units: STRIX_HALO_COMPUTE_UNITS,
-            memory_budget_bytes: None,
-            dram_channels: Some(dram_channels::DramChannels::STRIX_HALO),
-            shader_features: ShaderFeatures::ALL,
-            e4m3_storage: E4m3Storage::PackedLanes,
-            native_two_byte_floats: false,
-            rounding_conversions: RoundingConversions::NONE,
-            widens_bf16_decode_weight: false,
-            peer_transport: false,
-            decode_gemv_max_out_cols: None,
-            launch_class: calibration::LaunchClass::Vulkan,
-        }
-    }
-
     /// A ROCm/HSA device with no confirmed display watchdog or tiled-GEMM ceiling: HSA queues
     /// dispatches on hardware with no host display-refresh TDR, and the RADV miscompile is a wgpu/RADV
     /// codegen-path defect this backend does not share. `matrix_units` and `lds_bytes` should be filled
@@ -565,7 +518,7 @@ impl DeviceCaps {
             // Like the matrix units, only the agent's gfx code says ([`AmdArch::register_file`]).
             register_file: Queried::Unknown,
             known_miscompiles: KnownMiscompiles::default(),
-            compute_units: STRIX_HALO_COMPUTE_UNITS,
+            compute_units: Queried::Known(STRIX_HALO_COMPUTE_UNITS),
             memory_budget_bytes: None,
             dram_channels: None,
             shader_features: ShaderFeatures::ALL,
@@ -597,7 +550,7 @@ impl DeviceCaps {
             matrix_units: Queried::Known(MatrixUnits::nvidia(8)),
             register_file: RegisterFile::nvidia(8).map_or(Queried::Unknown, Queried::Known),
             known_miscompiles: KnownMiscompiles::default(),
-            compute_units: SM80_A100_COMPUTE_UNITS,
+            compute_units: Queried::Known(SM80_A100_COMPUTE_UNITS),
             memory_budget_bytes: None,
             dram_channels: None,
             shader_features: ShaderFeatures::ALL,
@@ -650,7 +603,11 @@ mod tests {
 
     #[test]
     fn wgpu_default_has_a_watchdog_budget_and_rocm_default_does_not() {
-        assert!(DeviceCaps::wgpu_rdna3_igpu().watchdog_budget.is_some());
+        assert!(
+            calibration::Calibration::STRIX_HALO_RADV
+                .watchdog_budget
+                .is_some()
+        );
         assert!(DeviceCaps::rocm_default().watchdog_budget.is_none());
         assert!(DeviceCaps::ptx_default().watchdog_budget.is_none());
     }

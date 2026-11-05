@@ -33,7 +33,7 @@ poot-graph-plan = { workspace = true, features = ["test-support"] }
 poot-kernelgen.workspace = true
 # The sampling parity rows sum the oracle's own top-p mass (`top_p_token_mass`), not a copy of it.
 poot-eval.workspace = true
-poot-runtime-common.workspace = true
+poot-runtime-common = { workspace = true, features = ["test-support"] }
 poot-test-util.workspace = true
 # SC-002 (card 531c): dispatches pootc's emitted .ptx to prove a real Assert traps on PTX, same as
 # poot-wgpu-runtime does for SpirvVulkan above.

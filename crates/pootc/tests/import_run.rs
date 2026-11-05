@@ -1,6 +1,6 @@
 //! End-to-end: a kernel authored in ordinary, type/borrow-checked Rust is compiled by `pootc` to a
 //! dispatchable SPIR-V module (Stable MIR -> Body -> llc -> .spv, all inside pootc) and dispatched on the
-//! GPU (real Rust, real rustc MIR, no hand-built IR). Skips (passes) if no Vulkan adapter.
+//! GPU (real Rust, real rustc MIR, no hand-built IR). A missing Vulkan adapter is a `POOT-SKIP`, and a failure when `POOT_REQUIRE_WGPU` requires it.
 //! Requires `llc` (nix develop).
 //!
 //! `manual_clamp` is allowed crate-wide: the gumbel-sampling CPU oracles intentionally mirror the
@@ -10,7 +10,10 @@
 //! `.clamp()` and `.max().min()` are equivalent here.
 #![allow(clippy::manual_clamp)]
 
+use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::device_skip::open_or_skip;
 use poot_test_util::contained_child::ContainChild;
+use poot_test_util::toolchain::require_tools;
 use std::process::Command;
 
 use poot_codegen::CompiledKernel;
@@ -534,20 +537,17 @@ fn llc_spin_depth4_and_reproducer() {
 
     // llc rebuilds the selection merges from exactly the CFG this pass shapes, so the module has to be
     // strictly valid, not merely tolerated by RADV.
-    if Command::new("spirv-val").arg("--version").output().is_err() {
-        eprintln!("spirv-val not on PATH; skipping validation");
-    } else {
-        let v = Command::new("spirv-val")
-            .args(["--target-env", "vulkan1.3"])
-            .arg(&spv_path)
-            .output()
-            .expect("run spirv-val");
-        assert!(
-            v.status.success(),
-            "the depth-4 `&&` module must validate:\n{}",
-            String::from_utf8_lossy(&v.stderr)
-        );
-    }
+    require_tools(&["spirv-val"]);
+    let v = Command::new("spirv-val")
+        .args(["--target-env", "vulkan1.3"])
+        .arg(&spv_path)
+        .output()
+        .expect("run spirv-val");
+    assert!(
+        v.status.success(),
+        "the depth-4 `&&` module must validate:\n{}",
+        String::from_utf8_lossy(&v.stderr)
+    );
 
     // The structurizer clones the shared else arm for the inner condition; the clone has to compute what
     // the nested-if spelling computes. The bytes below exercise all four outcomes of
@@ -572,13 +572,9 @@ fn llc_spin_depth4_and_reproducer() {
     }
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            let _ = std::fs::remove_dir_all(&out_dir);
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        let _ = std::fs::remove_dir_all(&out_dir);
+        return;
     };
     let mut bufs = [
         KernelBuffer::read_only_u32(&table),
@@ -609,12 +605,8 @@ fn add_kernel_imported_from_mir_runs_on_gpu() {
     assert_eq!(params, 3, "add has 3 slice params");
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     // FORK NOTE (card 531c): `add`'s bounds-check Asserts against `a`/`b` are not provably redundant
     // with the `if i < c.len()` guard (different slices), so the compiled module now needs the reserved
@@ -667,12 +659,8 @@ fn assert_trap_reports_the_spirv_error_word_on_wgpu() {
     );
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
 
     // Green: every idx in range, the kernel runs to completion and computes data[idx[i]].
@@ -880,12 +868,8 @@ fn from_bits_kernel_imported_from_mir_runs_on_gpu() {
     assert_eq!(params, 3);
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let x = [1.0f32, 2.0, 3.0, 4.0];
     let scale = 0.25f32;
@@ -914,12 +898,8 @@ fn rowsum_loop_kernel_imported_from_mir_runs_on_gpu() {
     assert_eq!(params, 2);
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     // 2 rows x 4 cols: row sums are 1+2+3+4=10 and 10+20+30+40=100.
     let x = [1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
@@ -943,12 +923,8 @@ fn rowsum_for_loop_kernel_imported_from_mir_runs_on_gpu() {
     assert_eq!(params, 2);
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let x = [1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
     let mut bufs = [KernelBuffer::read_only_f32(&x), KernelBuffer::write_f32(2)];
@@ -972,12 +948,8 @@ fn rowsum_inclusive_for_loop_kernel_imported_from_mir_runs_on_gpu() {
     assert_eq!(params, 2);
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let x = [1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
     let mut bufs = [KernelBuffer::read_only_f32(&x), KernelBuffer::write_f32(2)];
@@ -1001,12 +973,8 @@ fn for_over_slice_kernel_imported_from_mir_runs_on_gpu() {
     assert_eq!(params, 2);
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let x = [1.0f32, 2.0, 3.0, 4.0];
     let mut bufs = [KernelBuffer::read_only_f32(&x), KernelBuffer::write_f32(2)];
@@ -1029,12 +997,8 @@ fn math_unary_kernel_imported_from_mir_runs_on_gpu() {
     assert_eq!(params, 2);
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let x = [4.0f32, 9.0, 16.0];
     let mut bufs = [KernelBuffer::read_only_f32(&x), KernelBuffer::write_f32(3)];
@@ -1059,12 +1023,8 @@ fn rmsnorm_kernel_imported_from_mir_runs_on_gpu() {
     assert_eq!(params, 3);
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     // two rows of D=4; non-trivial weights so the broadcast multiply is exercised.
     let x = [3.0f32, 4.0, 0.0, 0.0, 1.0, 2.0, 2.0, 1.0];
@@ -1109,12 +1069,8 @@ fn softmax_kernel_imported_from_mir_runs_on_gpu() {
     assert_eq!(params, 2);
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let x = [1.0f32, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 10.0];
     let mut bufs = [
@@ -1155,12 +1111,8 @@ fn shape_generic_kernel_runs_any_shape_from_one_body() {
     assert_eq!(params, 3);
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
 
     // shape A: 2 rows of 4 columns.
@@ -1208,12 +1160,8 @@ fn shape_generic_rmsnorm_runs_any_hidden_dim_from_one_body() {
     assert_eq!(params, 4);
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
 
     let rmsnorm_ref = |x: &[f32], w: &[f32], d: usize| -> Vec<f32> {
@@ -1281,12 +1229,8 @@ fn imported_kernel_matches_kernelgen_reduce_last() {
     let (compiled_kernel, _, _needs_error_word) = pootc_compile(kernel, "rowsum_dyn");
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let x = [
         1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 5.0, 6.0, 7.0, 8.0,
@@ -1352,12 +1296,8 @@ fn workgroup_index_intrinsics_imported_and_run_on_gpu() {
     assert_eq!(params, 1);
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let n = 128usize; // 2 workgroups of 64
     let mut bufs = [KernelBuffer::write_f32(n)];
@@ -1392,12 +1332,8 @@ fn imported_lds_reduction_matches_kernelgen() {
     assert_eq!(params, 2);
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let a: Vec<f32> = (0..64).map(|i| i as f32).collect(); // sum = 2016
     let (wg, threads) = ([64u32, 1, 1], [64u32, 1, 1]); // ONE workgroup of 64 lanes
@@ -1450,12 +1386,8 @@ fn imported_argmax_matches_host_argmax() {
     assert_eq!((partials_params, finalize_params), (2, 2));
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let wg = [256u32, 1, 1];
     for (vocab, groups) in [(64usize, 1u32), (5000, 3)] {
@@ -1551,12 +1483,8 @@ fn imported_argmax_chunk_and_combine_match_host_argmax() {
     );
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
 
     const CHUNK: usize = 64;
@@ -1688,12 +1616,8 @@ fn imported_random_uniform_matches_cpu_oracle() {
     );
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
 
     for (seeds, cols) in [
@@ -1865,12 +1789,8 @@ fn imported_sample_gumbel_argmax_batched_matches_cpu_oracle() {
     );
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
 
     // (batch, vocab, per-row (seed, temperature, min_p)): several seeds/temperatures plus a min-p row
@@ -1979,12 +1899,8 @@ fn imported_sample_truncated_gumbel_argmax_batched_matches_cpu_oracle() {
     );
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
 
     // (batch, vocab, per-row (seed, temperature, min_p, top_k)): top_k=0.0 means disabled.
@@ -2096,12 +2012,8 @@ fn imported_sample_topp_gumbel_argmax_batched_matches_cpu_oracle() {
     );
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
 
     // (batch, vocab, per-row (seed, temperature, min_p, top_k, top_p)); top_k/top_p = 0.0/1.0 = disabled.
@@ -2279,17 +2191,10 @@ fn imported_sample_topp_gumbel_argmax_batched_matches_cpu_oracle() {
 /// `gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle` (not here: this crate's test binary has
 /// no cargo/rustc on a pod to re-import through `pootc`, so it stays model-free).
 ///
-/// Skips (passes) when `llc` is absent, matching this crate's other NVPTX-text checks.
+/// Fails when `llc` is absent (`poot_test_util::toolchain`).
 #[test]
 fn gumbel_select_nvptx_add_is_marked_no_contract_and_isa_guaranteed_unfused() {
-    if std::process::Command::new("llc")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("llc not on PATH; skipping");
-        return;
-    }
+    require_tools(&["llc"]);
     let (marked_body, _ptx) = pootc_compile_nvptx(
         manifest_path("kernels/sampling/sample_gumbel_argmax_batched.rs"),
         "sample_gumbel_argmax_batched",
@@ -2397,12 +2302,8 @@ fn imported_atomic_add_sum_smoke_runs_on_gpu() {
     let compiled_kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let n = 256u32; // 4 workgroups of 64: cross-workgroup atomic contention
     // the u32 counter rides through an f32 buffer (raw bytes); zero-initialized by write_f32.
@@ -2432,12 +2333,8 @@ fn imported_tiled_gemm_matches_reference() {
     assert_eq!(params, 4, "tiled_gemm: a, b, dims, out");
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     for (m, k, n) in [
         (8usize, 8usize, 8usize),
@@ -2500,12 +2397,8 @@ fn imported_tiled_gemm_masked_matches_reference() {
     assert_eq!(params, 4, "tiled_gemm_masked: a, b, dims, out");
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     for (m, k, n) in [
         (7usize, 5usize, 9usize),
@@ -2564,12 +2457,8 @@ fn matmul_kernel_imported_from_mir_runs_on_gpu() {
     assert_eq!(params, 3);
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let (m, n, k) = (2usize, 3, 4);
     let a: Vec<f32> = (0..m * k).map(|i| i as f32).collect();
@@ -2614,12 +2503,8 @@ fn scale_kernel_imported_from_mir_runs_on_gpu() {
     assert_eq!(params, 2, "scale has 2 slice params");
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let a = [1.0f32, 2.0, 3.0, 4.0, 5.0];
     let mut bufs = [
@@ -2652,10 +2537,7 @@ fn nested_selection_emits_valid_spirv() {
     let kernel = manifest_path("tests/kernels/nested_sel.rs");
     let (_spv, params, _needs_error_word) = pootc_compile(kernel, "nested_sel");
     assert_eq!(params, 3, "nested_sel: a, sel, out");
-    if Command::new("spirv-val").arg("--version").output().is_err() {
-        eprintln!("spirv-val not on PATH; skipping validation");
-        return;
-    }
+    require_tools(&["spirv-val"]);
     let spv_path = std::env::temp_dir()
         .join("pootc-nested_sel")
         .join("nested_sel.spv");
@@ -2681,10 +2563,7 @@ fn barrier_in_branchy_loop_emits_valid_spirv() {
     let kernel = manifest_path("tests/kernels/barrier_branch_loop.rs");
     let (_spv, params, _needs_error_word) = pootc_compile(kernel, "barrier_branch_loop");
     assert_eq!(params, 3, "barrier_branch_loop: a, dims, out");
-    if Command::new("spirv-val").arg("--version").output().is_err() {
-        eprintln!("spirv-val not on PATH; skipping validation");
-        return;
-    }
+    require_tools(&["spirv-val"]);
     let spv_path = std::env::temp_dir()
         .join("pootc-barrier_branch_loop")
         .join("barrier_branch_loop.spv");
@@ -2707,10 +2586,7 @@ fn workgroup_barrier_emits_valid_vulkan_spirv() {
     // AcquireRelease|WorkgroupMemory. Guards that a plain barrier kernel (wg_reduce) passes spirv-val.
     let kernel = manifest_path("tests/kernels/wg_reduce.rs");
     let (_spv, _params, _needs_error_word) = pootc_compile(kernel, "wg_reduce");
-    if Command::new("spirv-val").arg("--version").output().is_err() {
-        eprintln!("spirv-val not on PATH; skipping validation");
-        return;
-    }
+    require_tools(&["spirv-val"]);
     let spv_path = std::env::temp_dir()
         .join("pootc-wg_reduce")
         .join("wg_reduce.spv");
@@ -2756,12 +2632,8 @@ fn barrier_in_branchy_loop_runs_on_gpu() {
     }
 
     let _gpu_guard = gpu_lock();
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let mut bufs = [
         KernelBuffer::read_only_f32(&a),

@@ -340,7 +340,7 @@ pub(crate) fn gemv_grid(out_numel: usize, caps: &DeviceCaps) -> (usize, usize) {
 /// `N` is the dominant hazard axis: BLOOM `N=250880` hangs; gpt-oss `N=201088` (tied, `K=32`) and SmolLM3
 /// `N=128256` (tied, `K=2048`, higher `out_numel*K` than BLOOM's `2.57e8`) do not. So the trigger is
 /// element-count-only (unlike the K-scaled `serial_dequant_work`), and the box's own wgpu/RADV device is
-/// measured at 220_000 (`DeviceCaps::wgpu_rdna3_igpu`), between the proven-safe 201088 and the
+/// measured at 220_000 (`poot_test_util::device_caps::wgpu_rdna3_igpu`), between the proven-safe 201088 and the
 /// proven-hanging 250880.
 pub(crate) fn decode_gemv_plan(
     site: Site<'_>,
@@ -409,7 +409,7 @@ pub(crate) fn dense_decode_gemv_in(
     if out_shape.len() < 2 || n == 0 || out_numel != n {
         return None;
     }
-    let launch = dense_gemv_launch(n, caps.compute_units);
+    let launch = dense_gemv_launch(n, caps.compute_units.known());
     (n.div_ceil(launch.cols as usize) <= caps.max_grid[0] as usize).then_some(launch)
 }
 
@@ -435,14 +435,18 @@ impl DenseGemvLaunch {
 }
 
 /// The Gemv launch policy for a dense `[N, K]` contraction with `n` output columns (Card 727): `width` 256 and `unroll` 4, and `cols` 4 while that still launches at least two workgroups per
-/// compute unit, else 2. A weight row is contiguous along K, so fewer `cols` give each row more lanes
+/// compute unit (and the count is known), else 2. A weight row is contiguous along K, so fewer `cols` give each row more lanes
 /// (`256 / cols`) and a longer contiguous run per trip; the narrower fallback keeps a small `N` from starving
 /// the device. Set from the card's sweep on gfx1151 over the qwen2.5-0.5b BF16 decode shapes (wgpu Gemv device
 /// time per token: `cols` 64 7.1 ms, 32 6.0, 16 5.3, 8 4.9, 4 4.7; ROCm decode: 78 to 81 tok/s from `cols` 16 to
 /// 2). The `{64, 32}, else 16` table the spike measured is the `[K, N]` column-tile body's, not this one's.
-pub(crate) fn dense_gemv_launch(n: usize, compute_units: u32) -> DenseGemvLaunch {
-    let min_workgroups = DENSE_GEMV_WORKGROUPS_PER_CU * compute_units as usize;
-    let cols = if n.div_ceil(DENSE_GEMV_WIDE_COLS as usize) >= min_workgroups {
+pub(crate) fn dense_gemv_launch(n: usize, compute_units: Option<u32>) -> DenseGemvLaunch {
+    // A device whose compute units are unknown cannot show that the wide columns fill it, so it takes the
+    // narrow ones, which launch the most workgroups and never starve it.
+    let wide_fills = compute_units.is_some_and(|units| {
+        n.div_ceil(DENSE_GEMV_WIDE_COLS as usize) >= DENSE_GEMV_WORKGROUPS_PER_CU * units as usize
+    });
+    let cols = if wide_fills {
         DENSE_GEMV_WIDE_COLS
     } else {
         DENSE_GEMV_NARROW_COLS
@@ -572,7 +576,10 @@ pub(crate) fn attention_lanes(dv: usize, caps: &DeviceCaps) -> Option<usize> {
 /// for the shapes that still fill the device afterwards, [`WORKGROUPS_PER_COMPUTE_UNIT`] groups per compute
 /// unit. A few-row decode keeps a workgroup per head, whose parallelism it needs more than the shared loads.
 fn groups_selected_heads(rows: usize, n_rep: usize, caps: &DeviceCaps) -> bool {
-    n_rep > 1 && rows / n_rep >= caps.compute_units as usize * WORKGROUPS_PER_COMPUTE_UNIT
+    // An unknown device cannot show the groups still fill it: keep a workgroup per head.
+    caps.compute_units.known().is_some_and(|units| {
+        n_rep > 1 && rows / n_rep >= units as usize * WORKGROUPS_PER_COMPUTE_UNIT
+    })
 }
 
 /// How a block-selected attention schedules its workgroups: whether one serves the `n_rep` heads of a key/value
@@ -668,7 +675,8 @@ pub(crate) fn attention_splits(
         return None;
     }
     let rows = spec.row_groups();
-    let compute_units = caps.compute_units as usize;
+    // Splitting fills an idle device; with no compute-unit count there is no idle to prove, so keep streaming.
+    let compute_units = caps.compute_units.known()? as usize;
     let wanted = (compute_units * WORKGROUPS_PER_COMPUTE_UNIT).div_ceil(rows);
     let splits = wanted
         .min(MAX_ATTENTION_SPLITS)
@@ -983,7 +991,11 @@ fn attention_tiling_of(
                 ..spec.clone()
             };
             let lds = tiled.tiled_lds_bytes()?.ok()?;
-            let fills = tiled.row_groups() >= caps.compute_units as usize;
+            // The tiling must fill the device; one whose size is unknown cannot show it does.
+            let fills = caps
+                .compute_units
+                .known()
+                .is_some_and(|units| tiled.row_groups() >= units as usize);
             // Larger ranks first; a fragment tiling's width counts down (the narrowest wins). Among the
             // micro-tiles of one register tiling the fewest LDS reads per lane and key block win, then the
             // narrower tiles: the pairs the workgroup memory rejects are not candidates.
@@ -1187,7 +1199,7 @@ pub(crate) fn indexed_gemv_in(m: usize, n: usize, caps: &DeviceCaps) -> Option<D
     if m == 0 || n == 0 || m > INDEXED_GEMV_MAX_ROWS {
         return None;
     }
-    let launch = dense_gemv_launch(m * n, caps.compute_units);
+    let launch = dense_gemv_launch(m * n, caps.compute_units.known());
     ((m * n).div_ceil(launch.cols as usize) <= caps.max_grid[0] as usize).then_some(launch)
 }
 

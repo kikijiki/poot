@@ -86,6 +86,28 @@ path = "results.xml"
 report-name = "device-l0"
 store-success-output = true
 
+# The checkpoint-style lanes that are not device lanes (POOT-1467) run under a profile of their own too, so the
+# required-case gate reads their results: `lane-<lane>`, `scripts/check-required-cases.py` binds the file to it.
+[profile.lane-checkpoint.junit]
+path = "results.xml"
+report-name = "lane-checkpoint"
+store-success-output = true
+
+[profile.lane-checkpoint-large.junit]
+path = "results.xml"
+report-name = "lane-checkpoint-large"
+store-success-output = true
+
+[profile.lane-real-dims-long.junit]
+path = "results.xml"
+report-name = "lane-real-dims-long"
+store-success-output = true
+
+[profile.lane-npu-toolchain.junit]
+path = "results.xml"
+report-name = "lane-npu-toolchain"
+store-success-output = true
+
 # A checkpoint row that outlives its budget is killed: the box-wide GPU lock is held for the whole lane, so a row
 # stuck on a CPU oracle or a hung device would block every other lane (POOT-1406: one row held it for ~80 min).
 # The budget is `period x terminate-after`: an hour for a checkpoint row, two for a large one.

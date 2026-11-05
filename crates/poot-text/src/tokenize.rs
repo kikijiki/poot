@@ -166,7 +166,7 @@ impl TextCodec {
         let (template, bos_token, eos_token) = crate::chat::chat_from_files(
             files.tokenizer_config.as_deref(),
             files.chat_template_jinja.as_deref(),
-        );
+        )?;
         Ok(Self::new(
             tokenizer,
             None,

@@ -267,7 +267,7 @@ fn interpret_requests(
 }
 
 fn caps() -> DeviceCaps {
-    DeviceCaps::wgpu_rdna3_igpu()
+    poot_test_util::device_caps::wgpu_rdna3_igpu()
 }
 
 /// `[B, 1, Lq, Lk]` causal mask with `valid[b]` keys visible to every row of batch `b` (decode) or the

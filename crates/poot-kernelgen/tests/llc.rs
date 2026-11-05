@@ -712,7 +712,7 @@ fn generated_pointwise_and_batched_tiled_bodies_lower_on_every_gpu_target() {
     let add = FusedScalarOp::Binary(poot_kernel_ir::BinOp::Add);
     // Three `[17, 24] x [24, 21]` products, one `[K, N]` weight slab each: the register-tiled GEMM's blocks.
     let batched_tiled = || {
-        let caps = poot_target::DeviceCaps::wgpu_rdna3_igpu();
+        let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
         let (blocks, m, k, n) = (3usize, 17usize, 24usize, 21usize);
         let tiling = RegisterTiling::choose(
             TiledShape {

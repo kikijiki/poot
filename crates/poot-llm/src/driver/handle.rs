@@ -335,10 +335,10 @@ impl ModelHandle {
         let family = resolve(&raw, registry)?;
         let store = read_gguf(&index, &IdentityNames).map_err(LoadError::from)?;
         Self::build(family, &raw, Arc::new(store), |config| {
-            let text =
-                TextCodec::from_gguf(&gguf_vocab(&index), constraint_eos(config), config.chat)
-                    .map_err(|e| LoadError::Text(Box::new(e)))?
-                    .with_tool_codec(config.tool_codec.clone());
+            let vocab = gguf_vocab(&index).map_err(|e| LoadError::Text(Box::new(e)))?;
+            let text = TextCodec::from_gguf(&vocab, constraint_eos(config), config.chat)
+                .map_err(|e| LoadError::Text(Box::new(e)))?
+                .with_tool_codec(config.tool_codec.clone());
             Ok(match template {
                 Some(template) => text.with_chat_template(template),
                 None => text,

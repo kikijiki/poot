@@ -35,7 +35,7 @@ const LIMITS: kg::BodyLimits = kg::BodyLimits {
 /// One device of each rounding form: SPIR-V (integer), ROCm and PTX (the kept f16 conversion).
 fn devices() -> [DeviceCaps; 3] {
     [
-        DeviceCaps::wgpu_rdna3_igpu(),
+        poot_test_util::device_caps::wgpu_rdna3_igpu(),
         DeviceCaps::rocm_default(),
         DeviceCaps::ptx_default(),
     ]

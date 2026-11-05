@@ -29,7 +29,7 @@ use poot_graph_plan::{
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
 use poot_runtime_common::{BufferRole, MemoryCounters};
-use poot_target::{Backend, BufferStorage, DeviceCaps};
+use poot_target::{Backend, BufferStorage};
 use poot_tensor::DType;
 use poot_weights::{ExpertProj, MoeRole, WeightId, WeightMap, WeightRole, WeightView};
 
@@ -64,7 +64,7 @@ impl Device for Recorder {
     fn target(&self) -> poot_graph_plan::Target {
         poot_graph_plan::Target::Gpu {
             backend: Backend::SpirvVulkan,
-            caps: DeviceCaps::wgpu_rdna3_igpu(),
+            caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
         }
     }
     fn memory(&self) -> Vec<(BufferRole, poot_runtime_common::MemoryCounterSnapshot)> {

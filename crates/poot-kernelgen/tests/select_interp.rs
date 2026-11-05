@@ -150,7 +150,12 @@ fn expected(numel: usize) -> Vec<u32> {
 /// `Ne 0` to `Eq 1` in `emit_select`; the cond 2 and -1 lanes select `if_false` and this row goes red.
 #[test]
 fn float_select_equals_the_hand_written_words() {
-    let (got, _) = run_select(6, &DeviceCaps::wgpu_rdna3_igpu(), true, flat(6));
+    let (got, _) = run_select(
+        6,
+        &poot_test_util::device_caps::wgpu_rdna3_igpu(),
+        true,
+        flat(6),
+    );
     assert_eq!(got, EXPECTED, "got {got:#010x?}");
 }
 
@@ -158,7 +163,12 @@ fn float_select_equals_the_hand_written_words() {
 /// through even where `if_true - if_false` would wrap.
 #[test]
 fn i32_select_takes_the_true_branch_for_any_nonzero_word() {
-    let (got, _) = run_select(6, &DeviceCaps::wgpu_rdna3_igpu(), false, flat(6));
+    let (got, _) = run_select(
+        6,
+        &poot_test_util::device_caps::wgpu_rdna3_igpu(),
+        false,
+        flat(6),
+    );
     // The i32 form moves the float table's words as plain words.
     assert_eq!(got, EXPECTED, "got {got:#010x?}");
 }
@@ -169,7 +179,7 @@ fn i32_select_takes_the_true_branch_for_any_nonzero_word() {
 #[test]
 fn a_folded_float_select_covers_every_element_once() {
     let numel = 700;
-    let mut narrow = DeviceCaps::wgpu_rdna3_igpu();
+    let mut narrow = poot_test_util::device_caps::wgpu_rdna3_igpu();
     narrow.max_grid[0] = 2;
     let fold = kg::Fold {
         numel,

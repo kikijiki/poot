@@ -129,6 +129,7 @@ poot-kernelgen::block_top_k	an_awkward_block_count_selects_what_the_definition_s
 poot-kernelgen::block_top_k	the_kernel_lowers_to_spirv_and_ptx	kernelgen `block_top_k` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::block_top_k	the_kernel_selects_at_16384_32768_and_65536_blocks	kernelgen `block_top_k` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::block_top_k	the_kernel_selects_what_the_definition_selects	kernelgen `block_top_k` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::compile_only_fixtures	every_compile_only_fixture_has_a_staging_test	kernelgen `compile_only_fixtures` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::coopmat_dispatch_probe	coopmat_tile_dispatches_and_matches_cpu_on_radv	kernelgen `coopmat_dispatch_probe` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::emit_bf16_cast	amdgcn_f32_to_bf16_keeps_nan	kernelgen `emit_bf16_cast` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::emit_bf16_cast	amdgcn_f32_to_bf16_still_rounds_to_nearest_even	kernelgen `emit_bf16_cast` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
@@ -291,8 +292,6 @@ poot-kernelgen::selected_attention	a_padded_cache_and_a_stray_id_read_no_key_pas
 poot-kernelgen::selected_attention	an_id_naming_a_future_block_reads_no_key_after_the_query	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::selected_attention	the_kernel_attends_over_exactly_the_selected_blocks	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::selected_attention	the_kernel_lowers_to_spirv_and_ptx	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
-poot-kernelgen::skip_report_scan	a_skipping_test_reports_it_with_the_reserved_token	kernelgen `skip_report_scan` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
-poot-kernelgen::skip_report_scan	every_compile_only_fixture_has_a_staging_test	kernelgen `skip_report_scan` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 pootc::bin/pootc	normalize::tests::eliminates_a_provably_redundant_guard	pootc command-line row; the lane runs the package whole
 pootc::bin/pootc	normalize::tests::folds_ref_reborrow_alias	pootc command-line row; the lane runs the package whole
 pootc::bin/pootc	normalize::tests::leaves_a_guard_over_a_different_slice_alone	pootc command-line row; the lane runs the package whole

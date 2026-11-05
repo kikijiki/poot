@@ -29,7 +29,7 @@ use poot_graph_plan::{
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::BufferRole;
-use poot_target::{Backend, DeviceCaps};
+use poot_target::Backend;
 use poot_tensor::{DType, HostView};
 use poot_weights::WeightMap;
 
@@ -120,7 +120,7 @@ impl Device for FakeDevice {
     fn target(&self) -> Target {
         Target::Gpu {
             backend: Backend::SpirvVulkan,
-            caps: DeviceCaps::wgpu_rdna3_igpu(),
+            caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
         }
     }
 
@@ -312,7 +312,7 @@ fn layered() -> (poot_graph_ir::Graph, Arc<WeightStore>, Arc<WeightMap>) {
 fn target() -> Target {
     Target::Gpu {
         backend: Backend::SpirvVulkan,
-        caps: DeviceCaps::wgpu_rdna3_igpu(),
+        caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
     }
 }
 

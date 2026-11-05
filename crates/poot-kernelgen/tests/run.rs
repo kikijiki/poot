@@ -143,7 +143,7 @@ fn attention(spec: &kg::AttentionSpec) -> kg::Generated {
     };
     kg::generate(
         &kg::KernelRequest::Attention(spec.clone()),
-        &poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+        &poot_test_util::device_caps::wgpu_rdna3_igpu(),
         &limits,
     )
     .expect("the attention request generates")
@@ -156,7 +156,7 @@ fn synthesized_kernels_compile_to_valid_ptx() {
     // llc accepted the IR; the `.extern .func` grep catches an unresolved intrinsic (a wrong NVPTX intrinsic name
     // only JIT-fails on a real GPU, see memory `nvptx-lg2-intrinsic-name`), so it must be empty.
     let (m, k, n) = (17usize, 64usize, 24usize);
-    let caps = poot_target::DeviceCaps::wgpu_rdna3_igpu();
+    let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     let kernels: Vec<(&str, Body)> = vec![
         (
             "dense_tiled_kn",
@@ -735,7 +735,7 @@ fn matmul_bias_epilogue() {
 /// The cost model's register tiling of an indexed `[E, K, N]` (`Kn`) contraction of `m` rows grouped by expert, on
 /// the wgpu caps: the grouping's block, and the tiling of exactly those rows.
 fn indexed_tiling((m, k, n, experts): (usize, usize, usize, usize)) -> kg::Schedule {
-    let caps = poot_target::DeviceCaps::wgpu_rdna3_igpu();
+    let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     let shape = |block| kg::TiledShape {
         blocks: 1,
         m_per_block: m,
@@ -794,8 +794,7 @@ fn indexed_kernel(
     (m, k, n, experts): (usize, usize, usize, usize),
     name: &str,
 ) -> (poot_codegen::CompiledKernel, kg::Launch, [u32; 3]) {
-    use poot_target::DeviceCaps;
-    let caps = DeviceCaps::wgpu_rdna3_igpu();
+    let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     let limits = kg::BodyLimits {
         max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),
         max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),
@@ -935,8 +934,8 @@ fn indexed_bodies_compile_to_valid_spirv_and_nvptx() {
     // The Gemv and the register-tiled schedule over the grouped rows, each bare and with an epilogue, build, verify and compile on both
     // SPIR-V and NVPTX.
     use kg::{ContractionSpec, IndexedContraction, KernelRequest, Schedule};
-    use poot_target::DeviceCaps;
-    let caps = DeviceCaps::wgpu_rdna3_igpu();
+
+    let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     let limits = kg::BodyLimits {
         max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),
         max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),
@@ -1255,7 +1254,7 @@ fn dense_tiled_epilogue_is_bit_exact_against_the_unfused_chain() {
     // one, followed by the two f32 adds on the host: bit for bit, at a single partial tile (M = 5) and at many
     // (M = 160), in both weight layouts.
     let Some(ctx) = ctx() else { return };
-    let caps = poot_target::DeviceCaps::wgpu_rdna3_igpu();
+    let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     let (k, n) = (32usize, 24usize);
     let run = |generated: &kg::Generated, inputs: &[&[f32]], numel: usize| -> Vec<f32> {
         let s = spv(&generated.body, "dense_tiled_epilogue");
@@ -1351,7 +1350,7 @@ fn dense_tiled_validates_and_matches_cpu_matmul() {
     // The register-tiled GEMM over both weight layouts: (1) compile to SPIR-V and spirv-val (strict check:
     // in-loop barrier + LDS); (2) dispatch and compare to a serial CPU matmul over partial-tile shapes, with an
     // odd `K` (single-value runs and a `K` tail).
-    let caps = poot_target::DeviceCaps::wgpu_rdna3_igpu();
+    let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     let (m, k, n) = (17usize, 37usize, 24usize); // partial tiles in M (17) and N (24)
     for weight in [
         kg::DenseTiledWeight::KnF32,
@@ -2067,7 +2066,7 @@ fn dense_tiled_generated(
 fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
     use kg::{ContractionSpec, KernelRequest, MatmulShapes, Schedule};
     use poot_target::DeviceCaps;
-    let caps = DeviceCaps::wgpu_rdna3_igpu();
+    let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
     let limits = kg::BodyLimits {
         max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),
         max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),

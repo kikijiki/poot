@@ -2,6 +2,8 @@
 //! by the macro into `__poot_kernel_add`, which `pootc` discovers, imports, and compiles to a dispatchable
 //! SPIR-V module that runs on the GPU. The proc-macro artifact is wired in via `--extern`.
 
+use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::device_skip::{open_or_skip, skip_unsupported};
 use poot_test_util::contained_child::ContainChild;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap};
@@ -201,12 +203,8 @@ fn kernel_attribute_is_discovered_by_pootc() {
     let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
 
     let _gpu = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
     };
     let a = [1.0f32, 2.0, 3.0, 4.0, 5.0];
     let b = [10.0f32, 20.0, 30.0, 40.0, 50.0];
@@ -364,10 +362,12 @@ include!("poot_cache.rs");
 pub fn add(a: &[f32], b: &[f32], c: &mut [f32]) {}
 
 fn main() {
+    // The probe is its own program with no test helpers: it reports a missing device on stdout and the test that
+    // built it decides (skip, or fail when the device is required).
     let ctx = match poot_wgpu_runtime::Context::new() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("no GPU ({e}); skipping the dispatch");
+            println!("POOT-SKIP host-pass probe: no GPU ({e})");
             return;
         }
     };
@@ -455,8 +455,11 @@ fn main() {
         run.status.success(),
         "host-pass probe binary failed: stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    if stdout.contains("no GPU") || stderr.contains("no GPU") {
-        eprintln!("no GPU; host-pass dispatch skipped (structural compile/wire-up still verified)");
+    if stdout.contains("POOT-SKIP") || stderr.contains("POOT-SKIP") {
+        skip_unsupported(
+            DeviceBackend::Wgpu,
+            "a device for the host-pass probe binary",
+        );
         return;
     }
     assert!(

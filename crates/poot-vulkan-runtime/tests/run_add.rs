@@ -1,8 +1,8 @@
 //! P1 acceptance (spec 133 Verification, "Decomposition (P1)"): poot-kernel-ir Body -> poot-codegen
 //! SPIR-V (`Target::SpirvVulkan`) -> raw-Vulkan (`ash`) dispatch, checked against the CPU oracle. The
 //! required raw-Vulkan lane opens no second backend: inherited wgpu configuration or requirement state
-//! must be irrelevant once raw Vulkan opens. Skips (passes) if no Vulkan device is available, unless
-//! the required lane selected it.
+//! must be irrelevant once raw Vulkan opens. A missing Vulkan device is a `POOT-SKIP`, and a
+//! failure when the required lane selected it.
 
 use std::path::PathBuf;
 
@@ -10,7 +10,8 @@ use poot_codegen::CompiledKernel;
 use poot_codegen::{Target, compile_kernel, kernel_handle};
 use poot_kernel_ir::fixtures;
 use poot_kernel_ir::test_support::square_kernel;
-use poot_runtime_common::BufferRole;
+use poot_runtime_common::device_skip::open_or_skip;
+use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::BufferStorage;
 use poot_vulkan_runtime::{Context, DeviceBuffer};
 
@@ -49,12 +50,8 @@ fn kernel_for(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel {
 
 #[test]
 fn add_runs_on_gpu_via_raw_vulkan() {
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device ({e}); skipping");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Vulkan, Context::new()) else {
+        return;
     };
     eprintln!("raw-vulkan device: {}", ctx.device_name());
 
@@ -83,12 +80,8 @@ fn add_runs_on_gpu_via_raw_vulkan() {
 
 #[test]
 fn square_runs_on_gpu_via_raw_vulkan() {
-    let ctx = match Context::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device ({e}); skipping");
-            return;
-        }
+    let Some(ctx) = open_or_skip(DeviceBackend::Vulkan, Context::new()) else {
+        return;
     };
     let kernel = kernel_for(&square_kernel(), "square");
     let x = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];

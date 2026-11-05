@@ -12,7 +12,7 @@ mod chat_template_checkpoints {
     fn chat_from_dir(dir: &std::path::Path) -> (Option<String>, Option<String>, Option<String>) {
         let config = std::fs::read(dir.join("tokenizer_config.json")).ok();
         let jinja = std::fs::read_to_string(dir.join("chat_template.jinja")).ok();
-        chat_from_files(config.as_deref(), jinja.as_deref())
+        chat_from_files(config.as_deref(), jinja.as_deref()).expect("chat files parse")
     }
 
     const MSGS: &[(&str, &str)] = &[("system", "Be terse."), ("user", "Hi")];
@@ -224,7 +224,7 @@ mod phi3_gguf_inspect_legacy {
             &poot_quant::StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap(),
         )
         .expect("load phi3 gguf");
-        let vocab = gguf_vocab(&g);
+        let vocab = gguf_vocab(&g).expect("gguf vocab");
         let codec = TextCodec::from_gguf(&vocab, vocab.eos_token_id.unwrap_or(0), ChatFormat::Phi3)
             .expect("build phi3 gguf tokenizer");
         let tok = codec.tokenizer();
@@ -354,7 +354,7 @@ mod gemma_tokenizer {
             &poot_quant::StoredBytes::map(std::fs::File::open(gguf).unwrap()).unwrap(),
         )
         .unwrap();
-        let vocab = gguf_vocab(&g);
+        let vocab = gguf_vocab(&g).expect("gguf vocab");
         let codec =
             TextCodec::from_gguf(&vocab, vocab.eos_token_id.unwrap_or(0), ChatFormat::ChatML)
                 .expect("build gguf spm-bpe tokenizer");
@@ -475,8 +475,12 @@ mod llama3_golden_tests {
             &poot_quant::StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap(),
         )
         .expect("open the Qwen2.5 GGUF");
-        let codec =
-            TextCodec::from_gguf(&gguf_vocab(&g), 151645, ChatFormat::ChatML).expect("build codec");
+        let codec = TextCodec::from_gguf(
+            &gguf_vocab(&g).expect("gguf vocab"),
+            151645,
+            ChatFormat::ChatML,
+        )
+        .expect("build codec");
         for (text, want) in GOLDEN {
             assert_eq!(
                 &codec.encode(text).expect("encode"),
@@ -497,8 +501,12 @@ mod llama3_golden_tests {
             &poot_quant::StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap(),
         )
         .expect("open the Llama-3.2-1B GGUF");
-        let codec =
-            TextCodec::from_gguf(&gguf_vocab(&g), 128009, ChatFormat::ChatML).expect("build codec");
+        let codec = TextCodec::from_gguf(
+            &gguf_vocab(&g).expect("gguf vocab"),
+            128009,
+            ChatFormat::ChatML,
+        )
+        .expect("build codec");
         for (text, want) in GOLDEN {
             assert_eq!(
                 &codec.encode(text).expect("encode"),

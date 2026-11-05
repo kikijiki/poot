@@ -12,7 +12,6 @@ use poot_graph_ir::test_support::scan::ScanFixture;
 use poot_kernel_ir::Terminator;
 use poot_kernel_ir::interp::{Buffer, run};
 use poot_kernelgen::{BodyLimits, KernelGenError, KernelRequest, ScanKernel, ScanSpec, generate};
-use poot_target::DeviceCaps;
 use poot_test_util::assert_close;
 
 fn limits(max_instructions: usize) -> BodyLimits {
@@ -55,7 +54,7 @@ fn interpret(fixture: &ScanFixture, state_cols: usize, row_split: usize) -> (Vec
         let lanes = state_cols * row_split;
         let generated = generate(
             &KernelRequest::Scan(spec.clone()),
-            &DeviceCaps::wgpu_rdna3_igpu(),
+            &poot_test_util::device_caps::wgpu_rdna3_igpu(),
             &limits(1 << 16),
         )
         .expect("the scan request generates");
@@ -125,13 +124,17 @@ fn the_body_does_not_grow_with_the_sequence_and_obeys_its_limit() {
             let size = |len: usize| {
                 let fixture = ScanFixture { len, ..base };
                 let request = KernelRequest::Scan(spec(&fixture, 4, split));
-                let generated = generate(&request, &DeviceCaps::wgpu_rdna3_igpu(), &limits(768))
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "{:?} split {split} L={len}: the body must fit 768 instructions: {e}",
-                            base.family
-                        )
-                    });
+                let generated = generate(
+                    &request,
+                    &poot_test_util::device_caps::wgpu_rdna3_igpu(),
+                    &limits(768),
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{:?} split {split} L={len}: the body must fit 768 instructions: {e}",
+                        base.family
+                    )
+                });
                 generated
                     .body
                     .blocks
@@ -147,7 +150,7 @@ fn the_body_does_not_grow_with_the_sequence_and_obeys_its_limit() {
             );
             let tiny = generate(
                 &KernelRequest::Scan(spec(&base, 4, split)),
-                &DeviceCaps::wgpu_rdna3_igpu(),
+                &poot_test_util::device_caps::wgpu_rdna3_igpu(),
                 &limits(sizes[0] - 1),
             );
             assert!(
@@ -167,9 +170,13 @@ fn a_split_adds_its_barriers_and_an_unsplit_launch_has_none() {
     for fixture in fixtures() {
         for split in splits(&fixture) {
             let request = KernelRequest::Scan(spec(&fixture, 4, split));
-            let body = generate(&request, &DeviceCaps::wgpu_rdna3_igpu(), &limits(1 << 16))
-                .expect("the scan request generates")
-                .body;
+            let body = generate(
+                &request,
+                &poot_test_util::device_caps::wgpu_rdna3_igpu(),
+                &limits(1 << 16),
+            )
+            .expect("the scan request generates")
+            .body;
             let barriers = body
                 .blocks
                 .iter()

@@ -602,3 +602,20 @@ fn rows_and_max_seq_are_positive_whole_numbers() {
         assert!(error.contains(flags[1]), "{flags:?}: {error}");
     }
 }
+
+/// A single-file checkpoint has no pooling module: serving a GGUF must not read `<file>/1_Pooling`
+/// (ENOTDIR) and refuse to start. A directory with a corrupt module still refuses.
+#[test]
+fn a_single_file_checkpoint_serves_with_the_default_pooling() {
+    let dir = std::env::temp_dir().join(format!("poot-served-pooling-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("1_Pooling")).unwrap();
+    let file = dir.join("model.gguf");
+    std::fs::write(&file, b"gguf").unwrap();
+    assert_eq!(
+        crate::startup::served_pooling(&file).unwrap(),
+        poot_llm::encoders::Pooling::Mean
+    );
+    std::fs::write(dir.join("1_Pooling").join("config.json"), "{not json").unwrap();
+    assert!(crate::startup::served_pooling(&dir).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

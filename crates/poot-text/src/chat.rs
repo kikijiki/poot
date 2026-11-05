@@ -754,7 +754,8 @@ pub(crate) fn parse_tokenizer_config_chat_bytes(
 /// of its standalone `chat_template.jinja`, each `None` when the checkpoint ships no such file. Returns
 /// all-`None` when neither source has a template (the server then falls back to the hardcoded
 /// [`ChatFormat`]). Embedded fields use [`parse_tokenizer_config_chat_bytes`]; a `tokenizer_config.json`
-/// that does not parse contributes nothing.
+/// that is present and does not parse is a [`TextError`], not an absent file: dropping its template and
+/// bos/eos would silently change the markup the model is prompted with.
 ///
 /// Falls back to the standalone `chat_template.jinja` when `tokenizer_config.json` carries no embedded
 /// `chat_template` field (found during gpt-oss-20b coherence verification, the "gptoss real
@@ -764,11 +765,14 @@ pub(crate) fn parse_tokenizer_config_chat_bytes(
 pub fn chat_from_files(
     tokenizer_config: Option<&[u8]>,
     chat_template_jinja: Option<&str>,
-) -> (Option<String>, Option<String>, Option<String>) {
-    let parsed = tokenizer_config.and_then(|bytes| parse_tokenizer_config_chat_bytes(bytes).ok());
-    let (template, bos, eos) = parsed.unwrap_or_default();
+) -> crate::error::Result<(Option<String>, Option<String>, Option<String>)> {
+    let (template, bos, eos) = match tokenizer_config {
+        Some(bytes) => parse_tokenizer_config_chat_bytes(bytes)
+            .map_err(|e| err!("tokenizer_config.json: {e}"))?,
+        None => Default::default(),
+    };
     let template = template.or_else(|| chat_template_jinja.map(str::to_string));
-    (template, bos, eos)
+    Ok((template, bos, eos))
 }
 
 #[cfg(test)]
@@ -794,7 +798,8 @@ mod chat_from_files_tests {
         let (template, bos, eos) = chat_from_files(
             Some(br#"{"bos_token": "<bos>", "eos_token": "<eos>"}"#),
             Some("{{ messages[0].content }}"),
-        );
+        )
+        .unwrap();
         assert_eq!(template.as_deref(), Some("{{ messages[0].content }}"));
         assert_eq!(bos.as_deref(), Some("<bos>"));
         assert_eq!(eos.as_deref(), Some("<eos>"));
@@ -807,15 +812,24 @@ mod chat_from_files_tests {
         let (template, _, _) = chat_from_files(
             Some(br#"{"chat_template": "embedded"}"#),
             Some("standalone"),
-        );
+        )
+        .unwrap();
         assert_eq!(template.as_deref(), Some("embedded"));
     }
 
     #[test]
     fn neither_source_present_returns_none() {
-        let (template, _, _) = chat_from_files(Some(br#"{}"#), None);
+        let (template, _, _) = chat_from_files(Some(br#"{}"#), None).unwrap();
         assert_eq!(template, None);
-        assert_eq!(chat_from_files(None, None), (None, None, None));
+        assert_eq!(chat_from_files(None, None).unwrap(), (None, None, None));
+    }
+
+    /// A `tokenizer_config.json` that is present but does not parse is a load refusal naming the file, not
+    /// an absent file: the standalone template must not paper over it, and bos/eos must not vanish.
+    #[test]
+    fn a_corrupt_tokenizer_config_is_refused_not_treated_as_absent() {
+        let err = chat_from_files(Some(b"{not json"), Some("{{ standalone }}")).unwrap_err();
+        assert!(err.to_string().contains("tokenizer_config.json"), "{err}");
     }
 }
 

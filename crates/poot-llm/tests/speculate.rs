@@ -40,7 +40,7 @@ use poot_models::model::{KvDtype, LogitRows, StepShape, StepSpec};
 use poot_models::registry::{Fixture, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::{BufferRole, DeviceBackend};
-use poot_target::{Backend, DeviceCaps};
+use poot_target::Backend;
 use poot_tensor::HostTensor;
 use poot_weights::WeightMap;
 use tokenizers::Tokenizer;
@@ -181,7 +181,7 @@ impl Device for FakeDevice {
     fn target(&self) -> Target {
         Target::Gpu {
             backend: Backend::SpirvVulkan,
-            caps: DeviceCaps::wgpu_rdna3_igpu(),
+            caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
         }
     }
     fn memory(&self) -> Vec<(BufferRole, poot_runtime_common::MemoryCounterSnapshot)> {

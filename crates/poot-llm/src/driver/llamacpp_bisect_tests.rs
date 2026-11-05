@@ -470,10 +470,10 @@ mod checkpoint_rows {
         match Command::new(&tool).arg("--help").output() {
             Ok(_) => Some(tool),
             Err(error) => {
-                eprintln!(
-                    "POOT-SKIP: {} is not runnable ({error}); build it with scripts/llamacpp-dump/build.sh",
+                poot_test_util::missing_prerequisite(&format_args!(
+                    "{} is not runnable ({error}); build it with scripts/llamacpp-dump/build.sh",
                     tool.display()
-                );
+                ));
                 None
             }
         }
@@ -578,7 +578,9 @@ mod checkpoint_rows {
         match quantize {
             Ok(output) if output.status.success() => {}
             other => {
-                eprintln!("POOT-SKIP: llama-quantize did not make the F16 copy: {other:?}");
+                poot_test_util::missing_prerequisite(&format_args!(
+                    "llama-quantize did not make the F16 copy: {other:?}"
+                ));
                 return;
             }
         }

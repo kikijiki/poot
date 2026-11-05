@@ -40,7 +40,7 @@ use poot_models::test_support::weight_map::MappedModel;
 use poot_profile::Report;
 use poot_quant::weights::WeightStore;
 use poot_runtime_common::{BufferRole, DeviceBackend, MemoryCounters};
-use poot_target::{Backend, DeviceCaps};
+use poot_target::Backend;
 use poot_tensor::{DType, HostTensor};
 use poot_weights::WeightMap;
 use tokenizers::Tokenizer;
@@ -337,7 +337,7 @@ impl Device for CountingDevice {
     fn target(&self) -> Target {
         Target::Gpu {
             backend: Backend::SpirvVulkan,
-            caps: DeviceCaps::wgpu_rdna3_igpu(),
+            caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
         }
     }
     fn memory(&self) -> Vec<(BufferRole, poot_runtime_common::MemoryCounterSnapshot)> {

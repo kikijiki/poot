@@ -292,6 +292,7 @@ pub(crate) fn gguf_gstr_bytes(s: &str) -> Vec<u8> {
 pub(crate) fn gguf_encode_value(val: &GgufValue) -> (u32, Vec<u8>) {
     match val {
         GgufValue::U32(x) => (4, x.to_le_bytes().to_vec()),
+        GgufValue::I32(x) => (5, x.to_le_bytes().to_vec()),
         GgufValue::F32(x) => (6, x.to_le_bytes().to_vec()),
         GgufValue::Bool(b) => (7, vec![*b as u8]),
         GgufValue::Str(s) => (8, gguf_gstr_bytes(s)),

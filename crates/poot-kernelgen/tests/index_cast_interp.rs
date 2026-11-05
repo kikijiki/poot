@@ -6,7 +6,6 @@
 
 use poot_kernel_ir::interp::{Buffer, run};
 use poot_kernelgen as kg;
-use poot_target::DeviceCaps;
 
 fn limits() -> kg::BodyLimits {
     kg::BodyLimits {
@@ -39,7 +38,7 @@ fn run_region(numel: usize, kernel: kg::FusedKernel, buffers: &mut [Buffer]) -> 
     };
     let generated = kg::generate(
         &kg::KernelRequest::Pointwise(spec),
-        &DeviceCaps::wgpu_rdna3_igpu(),
+        &poot_test_util::device_caps::wgpu_rdna3_igpu(),
         &limits(),
     )
     .expect("the request generates");

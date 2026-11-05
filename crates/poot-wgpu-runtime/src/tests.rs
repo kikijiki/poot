@@ -483,6 +483,8 @@ mod storage_checked_write_tests {
 mod profiled_dispatch_tests {
     use crate::Context;
     use poot_codegen::CompiledKernel;
+    use poot_runtime_common::DeviceBackend;
+    use poot_runtime_common::device_skip::{open_or_skip, skip_unsupported};
 
     fn spv_for(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel {
         let dir = std::env::temp_dir().join("poot-wgpu-runtime-test");
@@ -497,12 +499,9 @@ mod profiled_dispatch_tests {
     fn profiled_dispatch_records_stats() {
         use poot_runtime_common::{CallPurpose, TransferDirection};
 
-        let ctx = match Context::new_with_device_timing(64) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("no GPU ({e}); skipping");
-                return;
-            }
+        let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new_with_device_timing(64))
+        else {
+            return;
         };
         let spv = spv_for(&poot_kernel_ir::fixtures::add_kernel(), "add");
         let a = ctx.upload_f32(&[1.0, 2.0, 3.0, 4.0, 5.0]);
@@ -544,7 +543,7 @@ mod profiled_dispatch_tests {
             assert!(timing.sum.as_nanos() > 0, "positive device time");
             eprintln!("device time: {:?}", timing.sum);
         } else {
-            eprintln!("TIMESTAMP_QUERY unavailable; device time skipped (FR-005)");
+            eprintln!("TIMESTAMP_QUERY unavailable; no device time recorded (FR-005)");
         }
     }
 
@@ -563,15 +562,12 @@ mod profiled_dispatch_tests {
     /// Reverted: GREEN.
     #[test]
     fn device_timed_batch_charges_its_timestamp_buffers_as_staging() {
-        let ctx = match Context::new_with_device_timing(64) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("no GPU ({e}); skipping");
-                return;
-            }
+        let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new_with_device_timing(64))
+        else {
+            return;
         };
         if !ctx.timestamps_available() {
-            eprintln!("TIMESTAMP_QUERY unavailable; skipping (FR-005)");
+            skip_unsupported(DeviceBackend::Wgpu, "TIMESTAMP_QUERY (FR-005)");
             return;
         }
         let spv = spv_for(&poot_kernel_ir::fixtures::add_kernel(), "add_ts_staging");
@@ -623,6 +619,8 @@ mod profiled_dispatch_tests {
 mod no_contract_tests {
     use crate::{Context, KernelBuffer};
     use poot_codegen::CompiledKernel;
+    use poot_runtime_common::DeviceBackend;
+    use poot_runtime_common::device_skip::open_or_skip;
 
     fn spv_for(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel {
         let dir = std::env::temp_dir().join("poot-wgpu-runtime-test");
@@ -663,12 +661,8 @@ mod no_contract_tests {
 
     #[test]
     fn spirv_no_contract_marker_matches_unfused_reference_on_fma_sensitive_rows() {
-        let ctx = match Context::new() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("no GPU ({e}); skipping");
-                return;
-            }
+        let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+            return;
         };
         let rows = fma_sensitive_rows(64);
         let a: Vec<f32> = rows.iter().map(|r| r.0).collect();
@@ -712,12 +706,8 @@ mod no_contract_tests {
     /// diverges from the unfused reference on the same FMA-sensitive rows the marked test uses.
     #[test]
     fn spirv_unmarked_probe_diverges_from_unfused_reference_on_the_same_rows() {
-        let ctx = match Context::new() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("no GPU ({e}); skipping");
-                return;
-            }
+        let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+            return;
         };
         let rows = fma_sensitive_rows(64);
         let a: Vec<f32> = rows.iter().map(|r| r.0).collect();
@@ -796,10 +786,8 @@ mod vec4_probe_tests {
 
     use crate::{Context, KernelBuffer};
     use poot_codegen::KernelCode;
-
-    fn have(bin: &str) -> bool {
-        Command::new(bin).arg("--version").output().is_ok()
-    }
+    use poot_runtime_common::DeviceBackend;
+    use poot_runtime_common::device_skip::open_or_skip;
 
     fn probe_dir() -> PathBuf {
         let d = std::env::temp_dir().join("poot-wgpu-runtime-vec4-probe");
@@ -809,7 +797,7 @@ mod vec4_probe_tests {
 
     /// Compile raw SPIR-V-target LLVM IR text to a `.spv` via system `llc`, then validate it with
     /// `spirv-val`. Panics with the tool's stderr on failure (a hard gate, not a skip; the caller already
-    /// checked `have("llc")`).
+    /// required `llc` and `spirv-val`).
     fn compile_and_validate(ll_source: &str, tag: &str) -> Vec<u8> {
         let dir = probe_dir();
         let ll_path = dir.join(format!("{tag}.ll"));
@@ -833,21 +821,17 @@ mod vec4_probe_tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let bytes = std::fs::read(&spv_path).unwrap();
-        if have("spirv-val") {
-            let v = Command::new("spirv-val")
-                .arg("--target-env")
-                .arg("vulkan1.3")
-                .arg(&spv_path)
-                .output()
-                .expect("failed to run spirv-val");
-            assert!(
-                v.status.success(),
-                "spirv-val failed for {tag}:\n{}",
-                String::from_utf8_lossy(&v.stderr)
-            );
-        } else {
-            eprintln!("spirv-val not on PATH; skipping static validation for {tag}");
-        }
+        let v = Command::new("spirv-val")
+            .arg("--target-env")
+            .arg("vulkan1.3")
+            .arg(&spv_path)
+            .output()
+            .expect("failed to run spirv-val");
+        assert!(
+            v.status.success(),
+            "spirv-val failed for {tag}:\n{}",
+            String::from_utf8_lossy(&v.stderr)
+        );
         bytes
     }
 
@@ -880,16 +864,9 @@ mod vec4_probe_tests {
     /// the round trip through wgpu/RADV for every lane.
     #[test]
     fn vec4_load_store_runs_on_gpu() {
-        if !have("llc") {
-            eprintln!("llc not on PATH; skipping");
+        poot_test_util::toolchain::require_tools(&["llc", "spirv-val"]);
+        let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
             return;
-        }
-        let ctx = match Context::new() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("no GPU ({e}); skipping");
-                return;
-            }
         };
         let ll = include_str!("../tests/fixtures/dispatch_probe/A1_vec4_typed_buffer_WORKS.ll");
         let spv = compile_and_validate(ll, "a1_vec4");

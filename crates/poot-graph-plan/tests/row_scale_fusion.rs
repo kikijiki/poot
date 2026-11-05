@@ -111,7 +111,7 @@ fn compiled_f16(g: &Graph) -> Program {
 fn radv() -> Target {
     Target::Gpu {
         backend: poot_target::Backend::SpirvVulkan,
-        caps: DeviceCaps::wgpu_rdna3_igpu(),
+        caps: poot_test_util::device_caps::wgpu_rdna3_igpu(),
     }
 }
 

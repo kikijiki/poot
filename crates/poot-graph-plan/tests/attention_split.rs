@@ -194,7 +194,10 @@ fn a_decode_that_fills_the_device_or_has_a_short_cache_keeps_the_streaming_sched
         let Target::Gpu { caps, .. } = &target else {
             unreachable!("targets() lists GPU targets")
         };
-        let units = caps.compute_units as usize;
+        let units = caps
+            .compute_units
+            .known()
+            .expect("the target reports its compute units") as usize;
         for (graph, why) in [
             (decode_chain(1, units, 1024, 64), "one row per compute unit"),
             (
@@ -376,5 +379,42 @@ fn every_split_dispatch_stays_within_max_grid() {
                 max_grid
             );
         }
+    }
+}
+
+/// A device whose compute units are unknown cannot show it is idle, so a decode that splits on every known count
+/// keeps the streaming schedule (POOT-1468): one launch, no scratch. Driven through `compile` with the same graph
+/// the split rows use, the caps differing only in the count.
+///
+/// Mutation: in `attention_splits`, read an unknown count as the Strix Halo preset's 40
+/// (`caps.compute_units.known().unwrap_or(40)`); the unknown-count rows plan the split schedule and go red.
+#[test]
+fn a_device_with_unknown_compute_units_keeps_the_streaming_schedule() {
+    for (name, planned) in targets() {
+        let Target::Gpu { backend, caps } = planned else {
+            unreachable!("targets() lists GPU targets")
+        };
+        let graph = decode_chain(1, 2, 1024, 64);
+        let known = compiled(&graph, &target(backend, caps));
+        assert!(
+            matches!(
+                attentions(&known)[0].3.schedule,
+                AttentionSchedule::SplitKv { .. }
+            ),
+            "{name}: the known-count control must split"
+        );
+        let unknown = DeviceCaps {
+            compute_units: poot_target::Queried::Unknown,
+            ..caps
+        };
+        let program = compiled(&graph, &target(backend, unknown));
+        let [(_, _, plan, spec)] = attentions(&program)[..] else {
+            panic!("{name}: one attention");
+        };
+        assert!(
+            matches!(spec.schedule, AttentionSchedule::Streaming { .. }),
+            "{name}: {spec:?}"
+        );
+        assert_eq!((plan.len(), plan.scratch().len()), (1, 0), "{name}");
     }
 }

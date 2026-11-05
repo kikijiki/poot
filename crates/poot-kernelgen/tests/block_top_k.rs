@@ -14,7 +14,6 @@ use poot_kernel_ir::interp::{Buffer, run};
 use poot_kernelgen::{
     BLOCK_TOP_K_LANES, BlockTopKSpec, BodyLimits, KernelGenError, KernelRequest, generate,
 };
-use poot_target::DeviceCaps;
 
 fn limits() -> BodyLimits {
     BodyLimits {
@@ -34,7 +33,7 @@ fn interpret(scores: &[Vec<f32>], pos: &[i32], ratio: usize, k: usize) -> Vec<Ve
     };
     let generated = generate(
         &KernelRequest::BlockTopK(spec),
-        &DeviceCaps::wgpu_rdna3_igpu(),
+        &poot_test_util::device_caps::wgpu_rdna3_igpu(),
         &limits(),
     )
     .expect("the block top-k request generates");
@@ -146,7 +145,7 @@ fn the_kernel_lowers_to_spirv_and_ptx() {
             ratio: 4,
             k: 50,
         }),
-        &DeviceCaps::wgpu_rdna3_igpu(),
+        &poot_test_util::device_caps::wgpu_rdna3_igpu(),
         &limits(),
     )
     .unwrap();
@@ -204,7 +203,7 @@ fn a_block_count_no_count_width_holds_is_refused() {
             ratio: 4,
             k: 512,
         }),
-        &DeviceCaps::wgpu_rdna3_igpu(),
+        &poot_test_util::device_caps::wgpu_rdna3_igpu(),
         &limits(),
     );
     match refused {
