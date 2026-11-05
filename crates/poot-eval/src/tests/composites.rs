@@ -516,6 +516,7 @@ fn fused_row_composite_is_the_traced_softmax() {
             pointwise(FusedOp::Binary(BinOp::Div), vec![local(3), local(4)]),
         ],
         output: LocalId::new(5),
+        side_outputs: Vec::new(),
     };
     let inputs = [data(&[3, 7], 29, 4.0)];
     assert_composite_matches_chain(

@@ -407,3 +407,37 @@ fn adjusted_sampling_head_matches_the_oracle_on_rocm() {
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     poot_executor_parity::device_sampling::assert_matches_the_oracle(exec.as_mut(), t);
 }
+
+/// POOT-1456 SC-7: a norm, its per-row scale and three narrowed projections of the scaled activation run as one
+/// row kernel writing the activation and its scale (a side output) on rocm, and every step's output is bit for bit
+/// that of the same block planned as a norm, a scale and a divide kernel; under the exact policy too. The fused
+/// block also matches the CPU oracle of the declared semantics.
+#[test]
+fn a_fused_row_scale_is_bitwise_the_unfused_block_on_rocm() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    let pairs = poot_executor_parity::row_scale::row_scale_pairs();
+    for policy in [
+        poot_graph_ir::MatmulPrecision::Narrow,
+        poot_graph_ir::MatmulPrecision::Exact,
+    ] {
+        poot_executor_parity::row_scale::run_fused_against_reference(
+            exec.as_mut(),
+            t,
+            &pairs,
+            policy,
+        )
+        .unwrap_or_else(|e| panic!("{policy:?}: {e}"));
+    }
+    let fused: Vec<_> = pairs.into_iter().map(|(fused, _)| fused).collect();
+    poot_executor_parity::precision::run_parity_declared(
+        exec.as_mut(),
+        t,
+        &fused,
+        poot_graph_ir::MatmulPrecision::Narrow,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+}

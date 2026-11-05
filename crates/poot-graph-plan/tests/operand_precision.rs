@@ -4,6 +4,7 @@
 //! Every row drives the production `compile` and reads what the compiled `Program` holds
 //! (the precision each planned op carries, the kernel request behind a plan).
 
+use poot_graph_ir::op::ContractionHead;
 use poot_graph_ir::{
     AttentionAttrs, BinOp, Builder, FragmentDtype, Graph, MatmulPrecision, OpKind, Operand,
     OperandPrecision, TensorType,
@@ -115,8 +116,17 @@ fn precision_of(program: &Program, want: impl Fn(&OpKind) -> bool) -> OperandPre
         .expect("the equation is planned and carries a precision")
 }
 
+/// A dense contraction, bare or as the head of an epilogue (a contraction narrowed to f16 multiplies its row scale
+/// back in its epilogue, POOT-1457).
 fn is_dense(op: &OpKind) -> bool {
-    matches!(op, OpKind::DenseContraction { .. })
+    matches!(
+        op,
+        OpKind::DenseContraction { .. }
+            | OpKind::ContractionEpilogue {
+                head: ContractionHead::Dense { .. },
+                ..
+            }
+    )
 }
 
 fn is_attention(op: &OpKind) -> bool {

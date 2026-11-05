@@ -88,7 +88,7 @@ fn fused_equals_unfused_elementwise_chain_all_fusable() {
         inputs.insert(leaf_ids[0], Value::from(HostTensor::f32(shape.clone(), d0)));
         inputs.insert(leaf_ids[1], Value::from(HostTensor::f32(shape.clone(), d1)));
 
-        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        let fg = fuse(&cse(&g).unwrap(), poot_graph_plan::RowOutputs::Multiple).unwrap();
         let n_fused = fg.eqns().len();
 
         // Assertion (a): fusion must fire.
@@ -209,7 +209,7 @@ fn fused_equals_unfused_matmul_epilogue() {
             )),
         );
 
-        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        let fg = fuse(&cse(&g).unwrap(), poot_graph_plan::RowOutputs::Multiple).unwrap();
         let n_fused = fg.eqns().len();
 
         // Assertion (a): epilogue must fuse (at least 2 epilogue eqns -> 1 Fused).

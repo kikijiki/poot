@@ -2345,7 +2345,83 @@ impl Graph {
             }
             defined[eqn.out] = true;
         }
+        self.check_side_outputs()?;
         self.check_layer_order()?;
+        Ok(())
+    }
+
+    /// POOT-1456: every side output of a multi-output row region is named by exactly one
+    /// [`OpKind::SideOutput`] of its local's type, and every projection names one. Runs after the equation
+    /// walk, so every operand is defined and every region's inference holds.
+    fn check_side_outputs(&self) -> Result<(), GraphValidationError> {
+        use crate::error::SideOutputReason;
+        let mut region_at: ValueTable<Option<usize>> = ValueTable::filled(self.values.len(), None);
+        let mut projected: Vec<Vec<bool>> = vec![Vec::new(); self.eqns.len()];
+        let operand_types = |eqn: &Eqn| -> Vec<TensorType> {
+            eqn.inputs
+                .iter()
+                .map(|operand| match operand {
+                    Operand::Value(v) => self.values[*v].aval.clone(),
+                    Operand::Lit(s) => s.ty(),
+                })
+                .collect()
+        };
+        for (i, eqn) in self.eqns.iter().enumerate() {
+            let fail = |reason| GraphValidationError::SideOutputPairing {
+                equation: i,
+                operation: eqn.op.name(),
+                reason,
+            };
+            match &eqn.op {
+                OpKind::FusedRow(region) => {
+                    region_at[eqn.out] = Some(i);
+                    projected[i] = vec![false; region.side_outputs.len()];
+                }
+                OpKind::SideOutput { index, ty } => {
+                    let producer = match eqn.inputs.as_slice() {
+                        [Operand::Value(v)] => region_at[*v],
+                        _ => None,
+                    }
+                    .ok_or_else(|| fail(SideOutputReason::NotARegionResult))?;
+                    let OpKind::FusedRow(region) = &self.eqns[producer].op else {
+                        return Err(fail(SideOutputReason::NotARegionResult));
+                    };
+                    let types = region
+                        .side_output_types(&operand_types(&self.eqns[producer]))
+                        .map_err(|source| GraphValidationError::EquationInference {
+                            equation: producer,
+                            operation: self.eqns[producer].op.name(),
+                            source,
+                        })?;
+                    let local = types.get(*index).ok_or_else(|| {
+                        fail(SideOutputReason::NoSuchSideOutput {
+                            index: *index,
+                            sides: types.len(),
+                        })
+                    })?;
+                    if local != ty {
+                        return Err(fail(SideOutputReason::TypeMismatch {
+                            index: *index,
+                            declared: ty.clone(),
+                            local: local.clone(),
+                        }));
+                    }
+                    if std::mem::replace(&mut projected[producer][*index], true) {
+                        return Err(fail(SideOutputReason::ProjectedTwice { index: *index }));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (i, sides) in projected.iter().enumerate() {
+            if let Some(index) = sides.iter().position(|&named| !named) {
+                return Err(GraphValidationError::SideOutputPairing {
+                    equation: i,
+                    operation: self.eqns[i].op.name(),
+                    reason: SideOutputReason::NotProjected { index },
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -3196,6 +3272,139 @@ mod tests {
         assert_eq!(
             crate::test_support::verdict(&graph),
             Err(GraphValidationError::StateInputNotInput { value: state.id() })
+        );
+    }
+
+    /// POOT-1456: a multi-output row region and its projections pair one to one. The graph `x / rowmax(|x|)` as one
+    /// region writing the row max as a side output, projected once and read by the result, validates; a projection
+    /// of the wrong type, a region whose side output has no projection, and a projection of a value no region
+    /// defines are refused with the typed reason. Mutation: delete the `check_side_outputs` call in `Graph::check`;
+    /// the three refusals validate.
+    #[test]
+    fn validate_pairs_a_row_regions_side_outputs_with_one_projection_each() {
+        use crate::error::SideOutputReason;
+        use crate::op::{FusedOp, FusedOperand, LocalId, RedOp, RowRegion, RowStep, UnOp};
+        use crate::{Eqn, Operand};
+
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+        let magnitude = b
+            .binary(BinOp::Max, x, b.unary(UnOp::Neg, x).unwrap())
+            .unwrap();
+        let rowmax = b.reduce(RedOp::Max, magnitude, 1, true).unwrap();
+        let divided = b.binary(BinOp::Div, x, rowmax).unwrap();
+        let out = b.binary(BinOp::Add, divided, rowmax).unwrap();
+        let traced = b.finish(out).unwrap();
+        let local = |i| FusedOperand::Local(LocalId::new(i));
+        let region = RowRegion {
+            n_inputs: 1,
+            axis: 1,
+            steps: vec![
+                RowStep::Pointwise {
+                    op: FusedOp::Unary(UnOp::Neg),
+                    inputs: vec![local(0)],
+                },
+                RowStep::Pointwise {
+                    op: FusedOp::Binary(BinOp::Max),
+                    inputs: vec![local(0), local(1)],
+                },
+                RowStep::Reduce {
+                    op: RedOp::Max,
+                    input: local(2),
+                },
+                RowStep::Pointwise {
+                    op: FusedOp::Binary(BinOp::Div),
+                    inputs: vec![local(0), local(3)],
+                },
+            ],
+            output: LocalId::new(4),
+            side_outputs: vec![LocalId::new(3)],
+        };
+        let fused = Eqn {
+            op: OpKind::FusedRow(region),
+            inputs: vec![Operand::Value(x.id())],
+            out: divided.id(),
+            layer: None,
+        };
+        let projection = |ty: TensorType, of: crate::ValueId| Eqn {
+            op: OpKind::SideOutput { index: 0, ty },
+            inputs: vec![Operand::Value(of)],
+            out: rowmax.id(),
+            layer: None,
+        };
+        let sum = traced.eqns().last().unwrap().clone();
+        let with = |eqns: Vec<Eqn>| {
+            let mut draft = traced.clone().into_draft();
+            *draft.eqns_mut() = eqns;
+            crate::test_support::verdict(&draft)
+        };
+        let scalar = TensorType::f32(vec![4, 1]);
+
+        assert_eq!(
+            with(vec![
+                fused.clone(),
+                projection(scalar.clone(), divided.id()),
+                sum.clone()
+            ]),
+            Ok(())
+        );
+        let pairing = |equation, reason| {
+            Err(GraphValidationError::SideOutputPairing {
+                equation,
+                operation: match equation {
+                    0 => fused.op.name(),
+                    _ => projection(scalar.clone(), divided.id()).op.name(),
+                },
+                reason,
+            })
+        };
+        // A projection whose type is not the local's: the stored value retyped with it, so only the pairing differs.
+        let mut retyped = traced.clone().into_draft();
+        retyped.values_mut()[rowmax.id()].aval = TensorType::f32(vec![4, 8]);
+        *retyped.eqns_mut() = vec![
+            fused.clone(),
+            projection(TensorType::f32(vec![4, 8]), divided.id()),
+        ];
+        retyped.set_result(divided.id());
+        assert_eq!(
+            crate::test_support::verdict(&retyped),
+            Err(GraphValidationError::SideOutputPairing {
+                equation: 1,
+                operation: projection(TensorType::f32(vec![4, 8]), divided.id())
+                    .op
+                    .name(),
+                reason: SideOutputReason::TypeMismatch {
+                    index: 0,
+                    declared: TensorType::f32(vec![4, 8]),
+                    local: scalar.clone(),
+                },
+            })
+        );
+        // The side output unprojected: nothing would name the buffer its kernel writes.
+        let mut unprojected = traced.clone().into_draft();
+        *unprojected.eqns_mut() = vec![fused.clone()];
+        unprojected.set_result(divided.id());
+        assert_eq!(
+            crate::test_support::verdict(&unprojected),
+            pairing(0, SideOutputReason::NotProjected { index: 0 })
+        );
+        // A projection of a value no region defines (the constant).
+        assert_eq!(
+            with(vec![
+                Eqn {
+                    op: OpKind::FusedRow(RowRegion {
+                        side_outputs: Vec::new(),
+                        ..match &fused.op {
+                            OpKind::FusedRow(region) => region.clone(),
+                            _ => unreachable!(),
+                        }
+                    }),
+                    ..fused.clone()
+                },
+                projection(scalar.clone(), x.id()),
+                sum
+            ]),
+            pairing(1, SideOutputReason::NotARegionResult)
         );
     }
 

@@ -421,22 +421,49 @@ pub(super) fn plan(
                     float_region_leaf_storage(site, g.aval(id).dtype, packed)
                 })
                 .collect::<Result<Vec<_>, PlanError>>()?;
+            // The kernel walks the region's rows, whatever the shape of what it writes: the result and each side
+            // output is a row or a per-row scalar of them (POOT-1456). A side output is stored f32.
+            let operand_types: Vec<_> = eqn
+                .inputs
+                .iter()
+                .map(|operand| match operand {
+                    Operand::Value(v) => g.aval(*v).clone(),
+                    Operand::Lit(scalar) => scalar.ty(),
+                })
+                .collect();
+            let row_shape = region
+                .row_shape(&operand_types)
+                .ok()
+                .flatten()
+                .ok_or_else(|| site.refuse(Capability::RowRegionWithoutReduction))?;
+            let side_types = region
+                .side_output_types(&operand_types)
+                .map_err(|_| site.refuse(Capability::RowRegionWithoutReduction))?;
+            if side_types.iter().any(|ty| ty.dtype != DType::F32) {
+                return Err(site.refuse(Capability::DtypeLowering));
+            }
+            let n_cols = row_shape[region.axis];
             let kernel = kg::RowKernel {
                 n_leaves: region.n_inputs,
                 leaf_storage,
-                n_cols: out_shape[region.axis],
+                n_cols,
                 steps,
                 output: map_row_value(region.output, region.n_inputs),
+                side_outputs: region
+                    .side_outputs
+                    .iter()
+                    .map(|&side| map_row_value(side, region.n_inputs))
+                    .collect(),
             };
             generate(KernelRequest::Row(RowSpec::Fused {
-                out_shape: out_shape.to_vec(),
-                numel: out_numel,
+                numel: row_shape.iter().product::<usize>().max(1),
+                row_shape,
                 leaves: leaves(&ids),
                 kernel,
                 // One workgroup of `width` lanes per row (spec 013); an AIE core is one lane, the form of
                 // the generator without workgroup memory.
                 width: match lowering {
-                    Lowering::Gpu { .. } => row_parallel_width(out_shape[region.axis]),
+                    Lowering::Gpu { .. } => row_parallel_width(n_cols),
                     Lowering::Aie(_) => 1,
                 },
             }))?
@@ -445,6 +472,7 @@ pub(super) fn plan(
             unreachable!("plan_eqn refuses an unfolded Iota before dispatching to a family")
         }
         imported_ops!()
+        | side_output_ops!()
         | packed_ops!()
         | moe_ops!()
         | matmul_ops!()

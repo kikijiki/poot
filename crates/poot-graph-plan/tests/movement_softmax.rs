@@ -75,11 +75,15 @@ fn reshape_collapse_is_value_identical() {
         .output
         .into_host()
         .unwrap();
-    let fused = eval(&fuse(&cse(&g).unwrap()).unwrap(), &inputs, opts())
-        .unwrap()
-        .output
-        .into_host()
-        .unwrap();
+    let fused = eval(
+        &fuse(&cse(&g).unwrap(), poot_graph_plan::RowOutputs::Multiple).unwrap(),
+        &inputs,
+        opts(),
+    )
+    .unwrap()
+    .output
+    .into_host()
+    .unwrap();
 
     assert_eq!(base.shape(), vec![4, 6]);
     let bits = |t: &HostTensor| {
@@ -259,7 +263,10 @@ fn fused_equals_unfused_over_random_movement_graphs() {
                 "collapse_reshape_chains",
                 collapse_reshape_chains(&g).unwrap(),
             ),
-            ("fuse(cse).unwrap()", fuse(&cse(&g).unwrap()).unwrap()),
+            (
+                "fuse(cse).unwrap()",
+                fuse(&cse(&g).unwrap(), poot_graph_plan::RowOutputs::Multiple).unwrap(),
+            ),
         ] {
             let got = eval(&gg, &inputs, EvalOptions::default())
                 .unwrap()
@@ -318,7 +325,7 @@ fn fused_multi_axis_broadcast_leaf_matches_unfused() {
             )),
         );
 
-        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        let fg = fuse(&cse(&g).unwrap(), poot_graph_plan::RowOutputs::Multiple).unwrap();
         assert!(
             fg.eqns().len() < g.eqns().len(),
             "m={m} n={n} k={k}: expected fusion to merge the chain ({} -> {} eqns)",
@@ -396,7 +403,7 @@ fn fused_pointwise_over_empty_tensor_edges() {
             "shape {shape:?}: 0-size dim must yield no data"
         );
 
-        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        let fg = fuse(&cse(&g).unwrap(), poot_graph_plan::RowOutputs::Multiple).unwrap();
         let fused = eval(&fg, &inputs, EvalOptions::default())
             .unwrap_or_else(|e| {
                 panic!("shape {shape:?}: eval (fused) failed on an empty tensor: {e}")

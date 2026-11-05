@@ -165,21 +165,16 @@ fn broadcast_kv_attention_stays_decomposed_and_matches_the_oracle() {
                 _ => "other",
             })
             .collect();
-        // K^T, Q K^T with the scale and the mask in its epilogue, the softmax max/exp rows, P V.
+        // K^T, Q K^T with the scale and the mask in its epilogue, the softmax in one row kernel (its `exp`, read by
+        // the sum and the divide, is internal to the region, POOT-1456), P V.
         assert_eq!(
             kinds,
-            [
-                "transpose",
-                "contraction_epilogue",
-                "fused_row",
-                "fused_row",
-                "matmul"
-            ],
+            ["transpose", "contraction_epilogue", "fused_row", "matmul"],
             "{name}: optimized op kinds"
         );
         assert_eq!(
             dispatch_count(&optimized),
-            5,
+            4,
             "{name}: optimized dispatches"
         );
         assert_optimize_preserves(name, &raw, &optimized);

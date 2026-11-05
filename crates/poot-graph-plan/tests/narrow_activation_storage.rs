@@ -10,7 +10,7 @@ use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::op::BinOp;
 use poot_graph_ir::ops::rmsnorm;
 use poot_graph_ir::ops::silu;
-use poot_graph_ir::{Builder, Graph, MatmulPrecision, OpKind, TensorType, ValueId};
+use poot_graph_ir::{Builder, FragmentDtype, Graph, MatmulPrecision, OpKind, TensorType, ValueId};
 use poot_graph_plan::{CompileLimits, CompileOptions, Program, Target, compile};
 use poot_target::{AmdArch, Backend, DeviceCaps, MatrixUnits, Queried, SubgroupSupport};
 use poot_tensor::{DType, HostTensor};
@@ -129,6 +129,17 @@ fn compiled(g: &Graph, target: &Target, policy: MatmulPrecision) -> Program {
     .expect("the block compiles")
 }
 
+/// The block under the narrow policy with the f16 fragments alone (RADV's narrowing): each contraction reads its
+/// activation row-scaled (POOT-1457).
+fn compiled_f16(g: &Graph, target: &Target) -> Program {
+    let options = CompileOptions {
+        fragment_only: Some(FragmentDtype::F16),
+        ..CompileOptions::new(CompileLimits::STANDARD)
+            .with_matmul_precision(MatmulPrecision::Narrow)
+    };
+    compile(g, target, &options).expect("the block compiles")
+}
+
 /// The op name and dtype of every value the program computes in a two-byte float.
 fn narrow_values(program: &Program) -> Vec<(String, DType)> {
     program
@@ -195,6 +206,32 @@ fn a_value_every_reader_narrows_is_stored_narrow_by_its_producer() {
         Vec::new(),
         "no buffer to store it in"
     );
+    assert_eq!(
+        (narrowed.graph().eqns().len(), dispatches(&narrowed)),
+        (unnarrowed.graph().eqns().len(), dispatches(&unnarrowed)),
+        "no equation and no dispatch is added"
+    );
+}
+
+/// With f16 fragments each projection reads its activation row-scaled (POOT-1457): the norm's region computes the
+/// scale and stores the scaled activation f16, and the gated activation, an epilogue's value, is scaled and stored
+/// f16 by a row region of its own (the up epilogue then writes f32). Still nothing is added for the narrow storage
+/// itself. Mutation: in `store_narrowed_activations` commit a value without probing (`if true`); the device without
+/// two-byte elements narrows too and the row goes red.
+#[test]
+fn a_row_scaled_activation_is_stored_f16_by_the_region_that_scales_it() {
+    let (g, _) = block(false);
+    let narrowed = compiled_f16(&g, &rocm_wmma());
+    assert_eq!(
+        narrow_values(&narrowed),
+        vec![
+            ("fused_row".to_string(), DType::F16),
+            ("fused_row".to_string(), DType::F16),
+        ],
+        "the two scaled activations are stored narrow, nothing else"
+    );
+    let unnarrowed = compiled_f16(&g, &rocm_wmma_without_two_byte_elements());
+    assert_eq!(narrow_values(&unnarrowed), Vec::new());
     assert_eq!(
         (narrowed.graph().eqns().len(), dispatches(&narrowed)),
         (unnarrowed.graph().eqns().len(), dispatches(&unnarrowed)),

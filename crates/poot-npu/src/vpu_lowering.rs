@@ -350,6 +350,7 @@ fn unsupported(op: &OpKind) -> Capability {
         | OpKind::Reduce { .. }
         | OpKind::Fused(_)
         | OpKind::FusedRow(_)
+        | OpKind::SideOutput { .. }
         | OpKind::PackedDequant { .. }
         | OpKind::PackedContraction { .. }
         | OpKind::PackedRowGather { .. }

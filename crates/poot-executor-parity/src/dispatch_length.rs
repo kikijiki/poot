@@ -1,8 +1,8 @@
 //! POOT-1205: the engine refuses a dispatch whose asserted length exceeds the buffer bound to it, before
 //! any device sees the dispatch, on whichever real `Device` the caller opens.
 //!
-//! The fixture is the arena program (`a + b` reduced, then added to a reduced `c + c`; four dispatches,
-//! the first writing a 64-element activation). [`ShortActivations`] wraps the caller's device and
+//! The fixture is the arena program (`a + b` reduced, then added to a reduced `c`; four dispatches, the first
+//! writing a 64-element activation: the reductions drop their axis, which no row region takes in). [`ShortActivations`] wraps the caller's device and
 //! allocates every multi-element activation buffer one element short of what the plan asks (an untyped arena
 //! slot one word short), as a device whose allocation disagrees with the plan would; the length a dispatch then
 //! asserts for it is one element more than its buffer holds. The device is real, so its `buffer_elems` reports the real (short)
@@ -175,10 +175,9 @@ fn fixture() -> (
     let ta = b.constant("a", TensorType::f32(vec![K])).unwrap();
     let tb = b.constant("b", TensorType::f32(vec![K])).unwrap();
     let v1 = b.binary(BinOp::Add, ta, tb).unwrap();
-    let s1 = b.reduce(RedOp::Sum, v1, 0, true).unwrap();
+    let s1 = b.reduce(RedOp::Sum, v1, 0, false).unwrap();
     let tc = b.constant("c", TensorType::f32(vec![1])).unwrap();
-    let v2 = b.binary(BinOp::Add, tc, tc).unwrap();
-    let s2 = b.reduce(RedOp::Sum, v2, 0, true).unwrap();
+    let s2 = b.reduce(RedOp::Sum, tc, 0, false).unwrap();
     let out = b.binary(BinOp::Add, s1, s2).unwrap();
     let graph = b.finish(out).unwrap();
 

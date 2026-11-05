@@ -721,7 +721,7 @@ fn gather_composition_gpu_matches_cpu_over_random_graphs() {
             chained_gathers += 1;
         }
         let g = b.finish(acc).unwrap();
-        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        let fg = fuse(&cse(&g).unwrap(), poot_graph_plan::RowOutputs::Multiple).unwrap();
         if fg.eqns().len() < g.eqns().len() {
             fused_total += 1;
         }

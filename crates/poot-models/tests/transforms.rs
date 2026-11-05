@@ -266,7 +266,7 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
     let transforms: [(&str, Transform); 5] = [
         ("cse", cse),
         ("dce", dce),
-        ("fusion", fuse),
+        ("fusion", |g| fuse(g, poot_graph_plan::RowOutputs::Multiple)),
         ("reshape cleanup", collapse_reshape_chains),
         ("transpose elision", elide_noop_transposes),
     ];

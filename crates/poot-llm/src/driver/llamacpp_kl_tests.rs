@@ -26,10 +26,13 @@ use std::process::Command;
 use std::sync::Arc;
 
 use poot_executor::{EntryId, ExecutableId, Executor, StateScope};
+use poot_graph_ir::Graph;
 use poot_graph_plan::{
     CompileLimits, CompileOptions, WeightFormats, bind_packed_weights,
     multi_device::topology::DeviceId,
-    staged::{DevicePlacement, ExpertPlacement, Partition, compile_staged},
+    staged::{
+        DevicePlacement, ExpertPlacement, Partition, StagedProgram, TargetSet, compile_staged,
+    },
 };
 use poot_models::model::{LogitRows, StepShape, StepSpec};
 use poot_models::test_support::weight_map::Step;
@@ -393,7 +396,23 @@ pub(super) struct TeacherForced {
     exec: Box<dyn Executor>,
     exe: ExecutableId,
     entry: EntryId,
+    /// The traced prefill with its packed weights bound: every variant compiles this graph.
+    graph: Graph,
     n_ctx: usize,
+}
+
+/// The teacher-forced prefill `graph` compiled for `targets` under `options`.
+fn compile_window(graph: &Graph, targets: &TargetSet, options: &CompileOptions) -> StagedProgram {
+    compile_staged(
+        graph,
+        targets,
+        &Partition {
+            experts: ExpertPlacement::AllResident,
+            devices: DevicePlacement::Single(DeviceId(0)),
+        },
+        options,
+    )
+    .expect("compile the teacher-forced prefill")
 }
 
 impl TeacherForced {
@@ -405,16 +424,11 @@ impl TeacherForced {
             .expect("trace the teacher-forced prefill");
         let graph = bind_packed_weights(&graph, &WeightFormats::from_weight_map(model.weights()))
             .expect("bind the packed weights");
-        let program = compile_staged(
+        let program = compile_window(
             &graph,
             &exec.target_set(),
-            &Partition {
-                experts: ExpertPlacement::AllResident,
-                devices: DevicePlacement::Single(DeviceId(0)),
-            },
             &CompileOptions::new(CompileLimits::STANDARD),
-        )
-        .expect("compile the teacher-forced prefill");
+        );
         let exe = exec
             .load_weights(
                 Arc::clone(handle.shared_store()),
@@ -426,12 +440,44 @@ impl TeacherForced {
             exec,
             exe,
             entry,
+            graph,
             n_ctx,
         }
     }
 
+    /// The target set the executor's device plans for.
+    pub(super) fn target_set(&self) -> TargetSet {
+        self.exec.target_set()
+    }
+
+    /// The traced prefill with its packed weights bound.
+    pub(super) fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
+    /// Another entry of the same weights: `graph` compiled for `targets` under `options`. Returns the entry and
+    /// the program it runs, which says what the planner made of the options.
+    pub(super) fn add_variant(
+        &mut self,
+        graph: &Graph,
+        targets: &TargetSet,
+        options: &CompileOptions,
+    ) -> (EntryId, StagedProgram) {
+        let program = compile_window(graph, targets, options);
+        let entry = self
+            .exec
+            .add_entry(self.exe, &program)
+            .expect("add the variant entry");
+        (entry, program)
+    }
+
     /// The logits of every position of `window`, `[n_ctx, n_vocab]` row-major.
     pub(super) fn logits(&mut self, window: &[i32]) -> Vec<f32> {
+        self.logits_of(self.entry, window)
+    }
+
+    /// [`Self::logits`] on `entry`, one of this value's entries.
+    pub(super) fn logits_of(&mut self, entry: EntryId, window: &[i32]) -> Vec<f32> {
         assert_eq!(window.len(), self.n_ctx);
         self.exec
             .reset_state(self.exe, StateScope::All)
@@ -439,12 +485,7 @@ impl TeacherForced {
         let step = Step::new(window, 0);
         let out = self
             .exec
-            .step(
-                self.exe,
-                self.entry,
-                &step.inputs(),
-                &mut poot_executor::NoSync,
-            )
+            .step(self.exe, entry, &step.inputs(), &mut poot_executor::NoSync)
             .expect("step")
             .to_host()
             .expect("read the logits");

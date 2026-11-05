@@ -45,7 +45,7 @@ pub use builder::{Builder, LayerScope, Outputs, ScanResult, Traced, WitnessDecla
 pub use builder::{BuilderAppendAccounting, BuilderAppendPlan, PreparedBuilderAppend};
 pub use error::{
     BuilderCollection, BuilderError, BuilderValueNamespace, FusedOperandReason,
-    GraphValidationError, Requirement, ScanReason, ShapeError,
+    GraphValidationError, Requirement, ScanReason, ShapeError, SideOutputReason,
 };
 pub use graph::{
     BoundaryId, ComputedConst, EditError, Eqn, ExecutionValidationFailure, Export, Graph,

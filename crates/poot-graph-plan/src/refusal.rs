@@ -116,6 +116,9 @@ pub enum Capability {
     /// The equation is an unfolded `Iota`. It is a pure compile-time constant: `transform::fold_iota`
     /// folds it to a `Storage::Computed` graph constant before planning (R466-019), so no kernel exists.
     UnfoldedIota,
+    /// A row region with no reduction over a row value: its kernel walks the rows its first reduction reads
+    /// (POOT-1456), so a region without one has no row to walk.
+    RowRegionWithoutReduction,
     /// A step of a fused region cannot be lowered in the region's arithmetic.
     FusedStep(FusedStepGap),
     /// The equation has the wrong number of operands for its lowering.
@@ -461,6 +464,9 @@ impl fmt::Display for Capability {
             Capability::UnfoldedIota => f.write_str(
                 "iota must be folded to a computed constant before planning (transform::fold_iota)",
             ),
+            Capability::RowRegionWithoutReduction => {
+                f.write_str("a row region needs a reduction over a row value to walk its rows")
+            }
             Capability::FusedStep(gap) => write!(f, "{gap}"),
             Capability::OperandCount { expected, actual } => {
                 write!(f, "the lowering reads {expected} operands, got {actual}")

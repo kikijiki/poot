@@ -168,6 +168,12 @@ pub struct CompileOptions {
     /// (POOT-1430): the one input of the `select_operand_precision` pass besides the target's caps and the
     /// operands' dtypes. `Exact` narrows nothing.
     pub matmul_precision: MatmulPrecision,
+    /// The one fragment dtype the `select_operand_precision` pass may narrow to, on a device that has several
+    /// (the f16 contraction variant of the tier-3 gates on a target with bf16 and f16 units, POOT-1438). The
+    /// device keeps every unit; only the pass sees the one, so the program still compiles for the real target.
+    /// `None` leaves the choice to the pass. Unused for an NPU target.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fragment_only: Option<poot_graph_ir::FragmentDtype>,
     /// A single-buffer limit below the GPU target's own, in bytes: legalization fits every constant to the
     /// smaller of the two, so a fixture that needs a split on a device whose real limit is far larger states it
     /// here. `None` fits to the target's limit. Unused for an NPU target.
@@ -189,6 +195,8 @@ impl CompileOptions {
             late: None,
             npu: None,
             matmul_precision: MatmulPrecision::DEFAULT,
+            #[cfg(any(test, feature = "test-support"))]
+            fragment_only: None,
             #[cfg(any(test, feature = "test-support"))]
             buffer_limit: None,
             aliases: poot_weights::WeightAliases::none(),
@@ -680,7 +688,7 @@ impl Program {
         for (eqn, plan) in self.planned() {
             match plan {
                 Plan::Alias(src) | Plan::View { src, .. } => root[eqn.out] = root[*src],
-                Plan::Dispatches(_) | Plan::Graph => {}
+                Plan::Dispatches(_) | Plan::Graph | Plan::SideOutput { .. } => {}
             }
         }
         self.graph.exports().find_map(|export| {
@@ -939,6 +947,11 @@ pub fn compile(
     // program publishes are the policy's, whichever schedule the planner picks.
     if let Some((_, caps)) = gpu {
         let units = FragmentUnits::of(caps);
+        #[cfg(any(test, feature = "test-support"))]
+        let units = match options.fragment_only {
+            Some(dtype) => units.only(dtype),
+            None => units,
+        };
         pipeline.require("select_operand_precision", |g| {
             transform::select_operand_precision(g, options.matmul_precision, units)
         })?;
@@ -973,7 +986,13 @@ pub fn compile(
             None => false,
         })
     })?;
-    pipeline.run("fuse", transform::fuse)?;
+    // A target whose row kernels write one row-width value fuses without side outputs or per-row scalar results
+    // (POOT-1456): an AIE core binds one output.
+    let rows = match target {
+        Target::Gpu { .. } => transform::RowOutputs::Multiple,
+        Target::Npu(_) => transform::RowOutputs::Single,
+    };
+    pipeline.run("fuse", |g| transform::fuse(g, rows))?;
     pipeline.run("fuse_widening_casts", transform::fuse_widening_casts)?;
     // After `fuse`: the casts it left between an I32 word and the float pointwise kernels that read it or
     // the exact-I32 kernels that write it become steps of those kernels (POOT-1108). GPU targets only: the
@@ -1390,6 +1409,17 @@ fn revert_unplannable_rewrites(
         .enumerate()
         .map(|(i, eqn)| (eqn.out, i))
         .collect();
+    // A multi-output region and its side output projections are one rewrite (POOT-1456): restoring either
+    // restores both, so no projection is left reading a region the revert took apart.
+    let mut grouped: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    for eqn in after.eqns() {
+        if let (OpKind::SideOutput { .. }, [Operand::Value(region)]) =
+            (&eqn.op, eqn.inputs.as_slice())
+        {
+            grouped.entry(*region).or_default().push(eqn.out);
+            grouped.entry(eqn.out).or_default().push(*region);
+        }
+    }
     let mut restored: HashMap<ValueId, Refusal> = HashMap::new();
     for (root, refusal) in refused {
         let mut pending = vec![root];
@@ -1398,6 +1428,7 @@ fn revert_unplannable_rewrites(
                 continue;
             }
             restored.insert(out, refusal.clone());
+            pending.extend(grouped.get(&out).into_iter().flatten().copied());
             for operand in &before.eqns()[before_at[&out]].inputs {
                 if let Operand::Value(input) = operand
                     && before_at.contains_key(input)
@@ -1532,7 +1563,9 @@ mod tests {
         let mut pipeline =
             PassPipeline::new(&pointwise_chain(), &target, CompileLimits::STANDARD, None);
         pipeline
-            .run("fixture_pass", transform::fuse)
+            .run("fixture_pass", |g| {
+                transform::fuse(g, transform::RowOutputs::Multiple)
+            })
             .expect("the fixture pass runs");
         let (graph, class, passes) = pipeline.finish().expect("the record covers the graph");
         assert!(
@@ -1675,7 +1708,7 @@ mod tests {
         let out = b.binary(BinOp::Add, e, bias).unwrap();
         let g = b.finish(out).unwrap();
 
-        let optimized = transform::fuse(&g).unwrap();
+        let optimized = transform::fuse(&g, crate::RowOutputs::Multiple).unwrap();
         let fused = optimized
             .eqns()
             .iter()

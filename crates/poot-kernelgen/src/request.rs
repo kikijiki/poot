@@ -389,6 +389,15 @@ impl KernelRequest {
         }
     }
 
+    /// How many side outputs the generated body writes, each a param between the reads (and metadata) and the
+    /// last write (POOT-1456): a multi-output row kernel's [`RowKernel::side_outputs`], zero for every other request.
+    pub fn side_writes(&self) -> usize {
+        match self {
+            Self::Row(RowSpec::Fused { kernel, .. }) => kernel.side_outputs.len(),
+            _ => 0,
+        }
+    }
+
     /// The family name, for diagnostics and the plan summary's `choice` column.
     pub fn family(&self) -> &'static str {
         match self {
@@ -494,9 +503,10 @@ pub struct PointwiseSpec {
 pub enum RowSpec {
     /// A row-wise fused region: one workgroup of `width` lanes per row.
     Fused {
-        /// The output's logical shape.
-        out_shape: Vec<usize>,
-        /// Output elements; the row count is `numel / kernel.n_cols`.
+        /// The shape of the region's rows, `L ++ [kernel.n_cols]`: what every leaf broadcasts into, whatever the
+        /// shapes of the values the kernel writes (a row value or a per-row scalar, POOT-1456).
+        row_shape: Vec<usize>,
+        /// Elements of `row_shape`; the row count is `numel / kernel.n_cols`.
         numel: usize,
         /// The leaves, each with its shape and the layout it is read through.
         leaves: Vec<ViewOperand>,
@@ -906,11 +916,11 @@ fn recipe_size(req: &KernelRequest) -> Option<BodySize> {
             ))
         }
         KernelRequest::Row(RowSpec::Fused {
-            out_shape,
+            row_shape,
             kernel,
             width,
             ..
-        }) => Some(row_size(kernel, out_shape.len(), *width)),
+        }) => Some(row_size(kernel, row_shape.len(), *width)),
         _ => None,
     }
 }
@@ -1029,7 +1039,7 @@ fn pointwise(spec: &PointwiseSpec, caps: &DeviceCaps) -> Result<Generated, Kerne
 fn row(spec: &RowSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
     match spec {
         RowSpec::Fused {
-            out_shape,
+            row_shape,
             numel,
             leaves,
             kernel,
@@ -1040,7 +1050,7 @@ fn row(spec: &RowSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
             let (x, y) = fold_groups(rows, caps.max_grid[0]);
             let body = fused_row_parallel_views(
                 ENTRY,
-                out_shape,
+                row_shape,
                 &leaf_shapes(leaves),
                 &leaf_layouts(leaves),
                 kernel,
@@ -1635,7 +1645,7 @@ fn serialized_row(spec: &RowSpec) -> Result<Scheduled, KernelGenError> {
             })
         }
         RowSpec::Fused {
-            out_shape,
+            row_shape,
             numel,
             leaves,
             kernel,
@@ -1667,6 +1677,12 @@ fn serialized_row(spec: &RowSpec) -> Result<Scheduled, KernelGenError> {
                 ));
             }
             let contract = row_contract(kernel).map_err(|reason| unsupported(GENERATOR, reason))?;
+            if !kernel.side_outputs.is_empty() || kernel.writes_per_row_scalar(kernel.output) {
+                return Err(unsupported(
+                    GENERATOR,
+                    "a row kernel writing side outputs or a per-row scalar; the AIE shape ABI binds one row-width output",
+                ));
+            }
             let rows = (numel / kernel.n_cols.max(1)).max(1);
             let threads = u32::try_from(rows).map_err(|_| KernelGenError::ExceedsBound {
                 generator: GENERATOR,
@@ -1676,7 +1692,7 @@ fn serialized_row(spec: &RowSpec) -> Result<Scheduled, KernelGenError> {
             })?;
             let body = fused_row_parallel_views(
                 ENTRY,
-                out_shape,
+                row_shape,
                 &leaf_shapes(leaves),
                 &leaf_layouts(leaves),
                 kernel,
@@ -1688,7 +1704,7 @@ fn serialized_row(spec: &RowSpec) -> Result<Scheduled, KernelGenError> {
                 .map(|leaf| read_f32(product(&leaf.shape)))
                 .chain([SerializedAccess {
                     writes: true,
-                    ..read_f32(product(out_shape))
+                    ..read_f32(product(row_shape))
                 }])
                 .collect();
             Ok(Scheduled {
@@ -2732,7 +2748,7 @@ mod tests {
             layout: Layout::contiguous(shape),
         };
         KernelRequest::Row(RowSpec::Fused {
-            out_shape: vec![rows, cols],
+            row_shape: vec![rows, cols],
             numel: rows * cols,
             leaves: vec![operand(&[rows, cols]), operand(&[cols])],
             kernel: RowKernel {
@@ -2782,6 +2798,7 @@ mod tests {
                     ),
                 ],
                 output: RowValue::Step(StepId::new(6)),
+                side_outputs: Vec::new(),
             },
             width,
         })
@@ -2979,7 +2996,7 @@ mod tests {
         // A row kernel over one leaf with a single step `op(x, x)` / `op(x)` reduced or written out.
         let kernel = |steps: Vec<RowOp>, output: RowValue| {
             KernelRequest::Row(RowSpec::Fused {
-                out_shape: vec![3, 8],
+                row_shape: vec![3, 8],
                 numel: 24,
                 leaves: vec![ViewOperand {
                     shape: vec![3, 8],
@@ -2991,6 +3008,7 @@ mod tests {
                     n_cols: 8,
                     steps,
                     output,
+                    side_outputs: Vec::new(),
                 },
                 width: 1,
             })

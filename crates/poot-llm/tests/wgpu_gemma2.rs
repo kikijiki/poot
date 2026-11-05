@@ -509,7 +509,7 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_on_gpu() {
     let inputs = bind_decode(&g, pos, 5);
 
     let base = cse(&g).unwrap(); // the resident executor's normal pre-pass; fusion groups on top of it.
-    let fg = fuse(&base).unwrap();
+    let fg = fuse(&base, poot_graph_plan::RowOutputs::Multiple).unwrap();
     let geglu_region_count = fg
         .eqns()
         .iter()

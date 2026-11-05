@@ -144,7 +144,13 @@ pub fn eval(
 pub(crate) fn releases_after_each_equation(g: &Graph) -> Vec<Vec<ValueId>> {
     let mut last_read: HashMap<ValueId, usize> = HashMap::new();
     for (idx, eqn) in g.eqns().iter().enumerate() {
-        for operand in &eqn.inputs {
+        // A side output is evaluated from its region's operands (`side_output_definition`), so it reads them.
+        let definition = side_output_definition(g, eqn);
+        for operand in eqn
+            .inputs
+            .iter()
+            .chain(definition.iter().flat_map(|definition| &definition.inputs))
+        {
             if let IrOperand::Value(value) = operand {
                 last_read.insert(*value, idx);
             }
@@ -163,6 +169,35 @@ pub(crate) fn releases_after_each_equation(g: &Graph) -> Vec<Vec<ValueId>> {
         }
     }
     releases
+}
+
+/// The definition of a side output (POOT-1456): the region that produces it, computing only that local, over
+/// the region's own operands, as one equation defining the projection's value. The oracle evaluates it like any
+/// row region, so a side output is exactly the value the region's chain computes for that local. `None` for any
+/// other equation, and for a projection the graph check would refuse.
+fn side_output_definition(g: &Graph, eqn: &Eqn) -> Option<Eqn> {
+    let OpKind::SideOutput { index, .. } = eqn.op else {
+        return None;
+    };
+    let [IrOperand::Value(result)] = eqn.inputs.as_slice() else {
+        return None;
+    };
+    let producer = g.eqns().iter().find(|candidate| candidate.out == *result)?;
+    let OpKind::FusedRow(region) = &producer.op else {
+        return None;
+    };
+    // The region computing only that local: its chain, with that local its one output.
+    let definition = poot_graph_ir::op::RowRegion {
+        output: *region.side_outputs.get(index)?,
+        side_outputs: Vec::new(),
+        ..region.clone()
+    };
+    Some(Eqn {
+        op: OpKind::FusedRow(definition),
+        inputs: producer.inputs.clone(),
+        out: eqn.out,
+        layer: eqn.layer,
+    })
 }
 
 /// Tell the caller's observer, if any, what the walk is about to copy out.
@@ -404,6 +439,14 @@ fn evaluate_equation(
 ) -> Result<Value, EvalError> {
     if eqn.op.class() == OpClass::Composite {
         return evaluate_composite(g, eqn, env, idx, opts, decompositions);
+    }
+    if let OpKind::SideOutput { .. } = eqn.op {
+        let definition = side_output_definition(g, eqn).ok_or_else(|| EvalError::Unsupported {
+            eqn: eqn.out,
+            op: resolve::op_label(&eqn.op),
+            detail: "the operand is not the result of a row region with this side output".into(),
+        })?;
+        return evaluate_composite(g, &definition, env, idx, opts, decompositions);
     }
     match eqn.op {
         OpKind::PackedDequant { descriptor } => {
@@ -1482,6 +1525,7 @@ fn evaluate_dense(
         }
         OpKind::Cast { .. }
         | OpKind::Gather { .. }
+        | OpKind::SideOutput { .. }
         | OpKind::PackedDequant { .. }
         | OpKind::PackedRowGather { .. }
         | OpKind::PackedContraction {

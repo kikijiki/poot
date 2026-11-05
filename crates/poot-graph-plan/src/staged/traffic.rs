@@ -81,7 +81,7 @@ pub(super) fn read_traffic(program: &Program) -> ReadTraffic {
             Plan::Alias(src) | Plan::View { src, .. } => {
                 source.insert(eqn.out, *src);
             }
-            Plan::Dispatches(_) | Plan::Graph => {}
+            Plan::Dispatches(_) | Plan::Graph | Plan::SideOutput { .. } => {}
         }
     }
     let root = |mut id: ValueId| {

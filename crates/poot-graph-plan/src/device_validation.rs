@@ -189,6 +189,7 @@ fn witness_op(op: &OpKind) -> WitnessOp {
         | OpKind::DynamicUpdateSlice { .. }
         | OpKind::Fused(_)
         | OpKind::FusedRow(_)
+        | OpKind::SideOutput { .. }
         | OpKind::Attention(_)
         | OpKind::Rope { .. }
         | OpKind::Scan(_)

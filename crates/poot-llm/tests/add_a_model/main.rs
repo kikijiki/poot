@@ -600,7 +600,9 @@ fn driver_options(chunk: usize, max_trace_tokens: usize) -> DriverOptions {
         charge: program_retention,
         draft: DraftPolicy::Off,
         hidden_window: None,
-        matmul_precision: None,
+        // Design 6.4 (POOT-1438): this row compares device tokens with the f32 CPU oracle's; pinned to the
+        // exact class so the row holds when the engine default narrows.
+        matmul_precision: Some(poot_llm::driver::MatmulPrecision::Exact),
     }
 }
 

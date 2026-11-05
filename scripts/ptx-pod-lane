@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# The PTX device lane (`just test-device-ptx`) on a RunPod SECURE-cloud NVIDIA pod, for a machine with no NVIDIA GPU.
+#
+#   scripts/ptx-pod-lane [--bank-case ID]... [--passes N] [--models MANIFEST --checkpoint-filter FILTERSET] [--no-device-lane]
+#
+# --models and --checkpoint-filter also run real-checkpoint rows (a filterset of the `device-checkpoint-ptx` profile)
+# with POOT_MODELS_DIR set and POOT_REQUIRE_MODELS=1 on the pod, so a missing model fails instead of skipping. MANIFEST
+# lists `path<TAB>source<TAB>sha256` (scripts/ptx-pod-models/): a `ship` file is uploaded from the local models dir
+# (POOT_MODELS_DIR, default ~/models), an https source is downloaded on the pod, and every file is checked against its
+# sha256 there before a row runs. The checkpoint rows' results come back as
+# target/nextest/device-checkpoint-ptx/results.xml; they are a subset of the checkpoint-ptx lane, so the lane's
+# required-case gate does not judge them: a failure, an error or a skip report among them fails this script.
+# --no-device-lane runs only the checkpoint rows (no `test-device-ptx`, kernelgen emit, ptx-check or gate).
+#
+# The pod has no `just`, cargo or python, so this driver builds everything here and ships it:
+#   1. `begin ptx` (the required-case gate binds the results file to this run),
+#   2. a nextest archive of the lane's packages, every ELF patched to the stock glibc loader and stripped,
+#   3. the performance-bank example of poot-ptx-device (when --bank-case is given),
+#   4. the Rust toolchain closure, extracted on the pod at the same /nix/store paths. Two PTX rows build or run
+#      rustc at run time (`pootc::import_run` compiles poot-kernel-intrinsics with the `cargo` its binary was built
+#      with and runs `pootc`, a rustc driver, which needs `rustc` on PATH and its `librustc_driver`),
+#   5. `poot-orchestrator exec`: scripts/ptx-pod-lane-remote.sh runs the lane filter (the justfile's `ptx_selection`,
+#      evaluated here and shipped, so it cannot drift), the staged kernelgen emit, `ptx-check`, and the bank cases,
+#      and prints the results back between markers,
+#   6. `check ptx` locally against the results that came back.
+#
+# Run it in `nix develop` (patchelf, strip, cargo-nextest, just, zstd, curl). It builds with plain `cargo`: wrap it like any other
+# job: `poot-cargo nix develop -c scripts/ptx-pod-lane`. It takes /tmp/poot-heavy.lock itself for the builds (steps 2-4)
+# and releases it before the pod, whose wait is long and not heavy, so do not wrap it in flock. Needs RUNPOD_API_KEY.
+# Environment: PTX_POD_GPU_TYPES (tried in order), PTX_POD_MAX_PRICE (USD/h, default 1.0), PTX_POD_MAX_CMD (default 3h),
+# PTX_POD_WORK (default target/ptx-pod-lane), PTX_POD_DISK_GB (container disk, default 40; checkpoints need more).
+# Prints the pod id, its price and the teardown line from the orchestrator.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+: "${RUNPOD_API_KEY:?RUNPOD_API_KEY must be set (it is read only from the environment)}"
+gpu_types=${PTX_POD_GPU_TYPES:-"NVIDIA RTX 4000 Ada Generation,NVIDIA A40,NVIDIA RTX PRO 4500 Blackwell,NVIDIA GeForce RTX 4090"}
+max_price=${PTX_POD_MAX_PRICE:-1.0}
+max_cmd=${PTX_POD_MAX_CMD:-3h}
+work=${PTX_POD_WORK:-target/ptx-pod-lane}
+disk_gb=${PTX_POD_DISK_GB:-40}
+passes=3
+bank_cases=()
+models=
+checkpoint_filter=
+device_lane=1
+while [ $# -gt 0 ]; do
+  case $1 in
+    --bank-case) bank_cases+=("$2"); shift 2 ;;
+    --passes) passes=$2; shift 2 ;;
+    --models) models=$2; shift 2 ;;
+    --checkpoint-filter) checkpoint_filter=$2; shift 2 ;;
+    --no-device-lane) device_lane=; shift ;;
+    *) echo "usage: $0 [--bank-case ID]... [--passes N] [--models MANIFEST --checkpoint-filter FILTERSET] [--no-device-lane]" >&2; exit 2 ;;
+  esac
+done
+if { [ -n "$models" ] && [ -z "$checkpoint_filter" ]; } || { [ -z "$models" ] && [ -n "$checkpoint_filter" ]; }; then
+  echo "--models and --checkpoint-filter go together" >&2; exit 2
+fi
+if [ -z "$device_lane" ] && [ -z "$checkpoint_filter" ]; then
+  echo "--no-device-lane needs --checkpoint-filter: nothing would run" >&2; exit 2
+fi
+
+results=target/nextest/device-ptx/results.xml
+checkpoint_results=target/nextest/device-checkpoint-ptx/results.xml
+rm -rf "$work"; mkdir -p "$work/stage"
+if [ -n "$device_lane" ]; then
+  scripts/check-required-cases.py --self-test
+  scripts/check-required-cases.py begin ptx "$results"
+fi
+
+# the checkpoints: the `ship` files, checked here against the manifest before they leave, and the download list
+if [ -n "$models" ]; then
+  models_dir=${POOT_MODELS_DIR:-$HOME/models}
+  grep -v '^#' "$models" | awk -F'\t' '$2 == "ship" { print $3 "  " $1 }' > "$work/ship.sha256"
+  (cd "$models_dir" && sha256sum --quiet -c -) < "$work/ship.sha256"
+  awk '{ print $2 }' "$work/ship.sha256" | tar -C "$models_dir" -czf "$work/models.tar.gz" -T -
+  grep -v '^#' "$models" > "$work/models.tsv"
+fi
+
+exec 8>>/tmp/poot-heavy.lock; flock 8
+# 2. the archive. RUSTC_WRAPPER is cleared: a compile cache must not bake its paths into the binaries.
+RUSTC_WRAPPER= cargo nextest archive --lib --bins --tests \
+  -p poot-ptx-device -p poot-ptx-runtime -p poot-kernelgen -p pootc -p poot-llm -p poot-serve \
+  --archive-file "$work/archive.tar.zst"
+mkdir "$work/ex"; tar -C "$work/ex" --zstd -xf "$work/archive.tar.zst"; rm "$work/archive.tar.zst"
+chmod -R u+w "$work/ex"
+patch_elf() { # stock loader, no nix rpath, no debug info (the upload runs at about 3 MB/s)
+  head -c4 "$1" | grep -q ELF || return 0
+  strip --strip-debug "$1" 2>/dev/null || true
+  patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath "$1" 2>/dev/null || patchelf --remove-rpath "$1"
+}
+while IFS= read -r f; do patch_elf "$f"; done < <(find "$work/ex/target" -type f \( -perm -u+x -o -name '*.so' \))
+tar -C "$work/ex" -cf - target | zstd -T0 -12 -q -o "$work/archive.tar.zst"
+rm -rf "$work/ex"
+
+# 3. the bank example
+if [ ${#bank_cases[@]} -gt 0 ]; then
+  RUSTC_WRAPPER= cargo build --release -p poot-ptx-device --example performance_bank
+  cp "${CARGO_TARGET_DIR:-target}/release/examples/performance_bank" "$work/performance_bank"
+  chmod u+w "$work/performance_bank"; patch_elf "$work/performance_bank"
+fi
+
+# 4. the toolchain closure, at its own store paths
+rust=$(dirname "$(dirname "$(readlink -f "$(command -v rustc)")")")
+nix-store -qR "$rust" | sed 's|^/||' | tar -C / -czf "$work/toolchain.tar.gz" -T -
+echo "$rust" > "$work/rust-path"
+
+flock -u 8
+# 5. the pod
+just --evaluate ptx_selection > "$work/selection.txt"
+printf '%s\n' "${bank_cases[@]+"${bank_cases[@]}"}" | sed '/^$/d' > "$work/bank-cases.txt"
+echo "$passes" > "$work/bank-passes"
+git archive HEAD --format=tar.gz -o "$work/src.tar.gz"
+# the pod needs a prebuilt nextest for the stock glibc (the devshell's is a nix binary)
+curl -sfL https://get.nexte.st/latest/linux | tar -C "$work" -xzf -
+nextest_bin=$work/cargo-nextest
+uploads=(--upload "$work/archive.tar.zst:/root/archive.tar.zst" --upload "$work/toolchain.tar.gz:/root/toolchain.tar.gz"
+  --upload "$work/rust-path:/root/rust-path" --upload "$work/selection.txt:/root/selection.txt"
+  --upload "$work/bank-cases.txt:/root/bank-cases.txt" --upload "$work/bank-passes:/root/bank-passes"
+  --upload "$work/src.tar.gz:/root/src.tar.gz" --upload "$nextest_bin:/root/cargo-nextest"
+  --upload scripts/ptx-pod-lane-remote.sh:/root/ptx-pod-lane-remote.sh)
+[ ${#bank_cases[@]} -gt 0 ] && uploads+=(--upload "$work/performance_bank:/root/performance_bank")
+if [ -n "$models" ]; then
+  printf '%s\n' "$checkpoint_filter" > "$work/checkpoint-filter.txt"
+  uploads+=(--upload "$work/models.tar.gz:/root/models.tar.gz" --upload "$work/models.tsv:/root/models.tsv"
+    --upload "$work/checkpoint-filter.txt:/root/checkpoint-filter.txt")
+fi
+if [ -z "$device_lane" ]; then
+  : > "$work/no-device-lane"
+  uploads+=(--upload "$work/no-device-lane:/root/no-device-lane")
+fi
+cargo run -q --release -p poot-orchestrator -- exec --image ghcr.io/kikijiki/poot-bench:latest --cloud secure \
+  --gpu-types "$gpu_types" --max-price-per-hour "$max_price" --max-cmd "$max_cmd" --container-disk-gb "$disk_gb" \
+  "${uploads[@]}" --cmd 'bash /root/ptx-pod-lane-remote.sh' | tee "$work/exec.log"
+
+# 6. the results come back between markers
+extract() { sed -n "/===$1-BEGIN===/,/===$1-END===/p" "$work/exec.log" | sed '1d;$d'; }
+if [ ${#bank_cases[@]} -gt 0 ]; then mkdir -p "$work/bank"; extract BANK | base64 -d | tar -C "$work/bank" -xzf -; fi
+status=0
+if [ -n "$models" ]; then
+  mkdir -p "$(dirname "$checkpoint_results")"
+  extract CHECKPOINT-RESULTS | base64 -d | gunzip > "$checkpoint_results"
+  # A subset of the checkpoint-ptx lane: every row it ran must pass, and none may report a skip.
+  ran=$(grep -c '<testcase ' "$checkpoint_results" || true)
+  bad=$(grep -cE '<(failure|error)[ >]' "$checkpoint_results" || true)
+  skips=$(grep -c 'POOT-SKIP' "$checkpoint_results" || true)
+  echo "checkpoint rows: $ran ran, $bad failed or errored, $skips skip reports"
+  if [ "$ran" -eq 0 ] || [ "$bad" -ne 0 ] || [ "$skips" -ne 0 ]; then status=1; fi
+fi
+if [ -n "$device_lane" ]; then
+  extract RESULTS | base64 -d | gunzip > "$results"
+  scripts/check-required-cases.py check ptx "$results" || status=1
+fi
+exit $status

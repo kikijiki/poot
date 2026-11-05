@@ -121,8 +121,9 @@ pub enum CollectiveKind {
 
 /// One kernel launch of a [`Plan::Dispatches`] plan.
 ///
-/// The kernel's params are `[reads.., meta?, write]`: one per [`Binding::reads`] entry in order, then the
-/// launch's metadata buffer when [`Launch::meta`] is non-empty, then the one written buffer. `binding` and
+/// The kernel's params are `[reads.., meta?, side writes.., write]`: one per [`Binding::reads`] entry in order,
+/// then the launch's metadata buffer when [`Launch::meta`] is non-empty, then the equation's side outputs a
+/// multi-output region writes ([`Binding::side_writes`]), then the last written buffer. `binding` and
 /// `choice` are private and the rest is `pub(crate)`: a dispatch is built only by the planner, and a
 /// [`DispatchPlan`] validates its bindings against the kernel body and launch before any other crate sees
 /// it. Outside this crate the fields read through accessors; the only change after validation is the
@@ -311,13 +312,18 @@ pub enum Sink {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Binding {
     reads: Vec<Source>,
+    side_writes: usize,
     write: Sink,
 }
 
 impl Binding {
     /// A binding that reads `reads` in param order and writes `write`.
     pub fn new(reads: Vec<Source>, write: Sink) -> Self {
-        Self { reads, write }
+        Self {
+            reads,
+            side_writes: 0,
+            write,
+        }
     }
 
     /// The binding of a dispatch over an equation of `arity` value operands: every operand in order,
@@ -326,12 +332,28 @@ impl Binding {
         Self::new((0..arity).map(Source::Operand).collect(), Sink::Out)
     }
 
+    /// [`Binding::eqn`] for a multi-output region (POOT-1456): every operand in order, then each of its
+    /// `side_writes` side outputs, then the equation's output.
+    pub fn eqn_with_side_writes(arity: usize, side_writes: usize) -> Self {
+        Self {
+            side_writes,
+            ..Self::eqn(arity)
+        }
+    }
+
     /// The data reads, in param order.
     pub fn reads(&self) -> &[Source] {
         &self.reads
     }
 
-    /// The one write.
+    /// How many side outputs of the equation the dispatch writes: params after the reads and the metadata
+    /// buffer, side output `k` at the `k`-th, each the buffer of the equation's [`poot_graph_ir::OpKind::SideOutput`]
+    /// `{ index: k }`. Zero for every equation but a multi-output region.
+    pub fn side_writes(&self) -> usize {
+        self.side_writes
+    }
+
+    /// The last write.
     pub fn write(&self) -> Sink {
         self.write
     }
@@ -394,6 +416,12 @@ pub enum DispatchPlanError {
         dispatch: usize,
         /// The scratch it reads and writes.
         scratch: ScratchId,
+    },
+    /// A dispatch writes side outputs but not the equation's output: the region's kernel writes them together.
+    #[error("dispatch {dispatch} writes side outputs but not the equation's output")]
+    SideWritesWithoutOutput {
+        /// Index of the dispatch within the plan.
+        dispatch: usize,
     },
     /// A param's mutability disagrees with whether its binding writes it.
     #[error(
@@ -467,9 +495,13 @@ impl DispatchPlan {
         let mut written = vec![false; scratch.len()];
         let mut out_written = false;
         for (index, dispatch) in dispatches.iter().enumerate() {
-            let Binding { reads, write } = &dispatch.binding;
+            let Binding {
+                reads,
+                side_writes,
+                write,
+            } = &dispatch.binding;
             let meta = usize::from(!dispatch.launch.meta.is_empty());
-            let bound = reads.len() + meta + 1;
+            let bound = reads.len() + meta + side_writes + 1;
             let params: Vec<_> = dispatch.body.params().collect();
             if params.len() != bound {
                 return Err(DispatchPlanError::ParamCount {
@@ -529,12 +561,18 @@ impl DispatchPlan {
                     kernel_mutable: true,
                 });
             }
-            if !mutable(bound - 1) {
-                return Err(DispatchPlanError::MutabilityMismatch {
-                    dispatch: index,
-                    param: bound - 1,
-                    kernel_mutable: false,
-                });
+            for param in reads.len() + meta..bound {
+                if !mutable(param) {
+                    return Err(DispatchPlanError::MutabilityMismatch {
+                        dispatch: index,
+                        param,
+                        kernel_mutable: false,
+                    });
+                }
+            }
+            // A side output is written with the output, by the dispatch that computes them both.
+            if *side_writes > 0 && *write != Sink::Out {
+                return Err(DispatchPlanError::SideWritesWithoutOutput { dispatch: index });
             }
             match *write {
                 Sink::Out => out_written = true,
@@ -646,6 +684,12 @@ pub enum Plan {
     /// launches nothing of its own: the program's one region ([`ArtifactGranularity::Graph`](crate::ArtifactGranularity))
     /// runs it with the rest of the graph.
     Graph,
+    /// The output is a side output of the multi-output region whose result is `region` (POOT-1456): that
+    /// equation's dispatch writes it, into a buffer of its own that is live from that equation on. No dispatch.
+    SideOutput {
+        /// The result of the region whose kernel writes this value.
+        region: ValueId,
+    },
 }
 
 /// Which [`Plan`] variant an equation planned as, without its payload. Executors name it when a walk
@@ -660,6 +704,8 @@ pub enum PlanKind {
     View,
     /// The equation is a node of the target's graph artifact.
     Graph,
+    /// The output is a side output another equation's dispatch writes.
+    SideOutput,
 }
 
 impl Plan {
@@ -693,7 +739,7 @@ impl Plan {
     pub(crate) fn aliased_source(&self) -> Option<ValueId> {
         match self {
             Plan::Alias(source) | Plan::View { src: source, .. } => Some(*source),
-            Plan::Dispatches(_) | Plan::Graph => None,
+            Plan::Dispatches(_) | Plan::Graph | Plan::SideOutput { .. } => None,
         }
     }
 
@@ -704,6 +750,7 @@ impl Plan {
             Plan::Alias(_) => PlanKind::Alias,
             Plan::View { .. } => PlanKind::View,
             Plan::Graph => PlanKind::Graph,
+            Plan::SideOutput { .. } => PlanKind::SideOutput,
         }
     }
 }

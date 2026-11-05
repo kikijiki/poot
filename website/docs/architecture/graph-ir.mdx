@@ -32,13 +32,13 @@ A `Graph` is private; it is read through accessors and changed only through a ch
 
 ## Storage classes
 
-| Class | What it is |
-| --- | --- |
-| `Device` | An ordinary intermediate tensor: attention scores, MLP outputs, the residual stream |
-| `Const` | A weight or table, identified by its `WeightRef`, never by a name; weight caches never reuse different bytes |
-| `Slot(Slot)` | A per-step input in a stable device buffer the host rewrites in place |
-| `State` | A buffer carried across decode steps: the KV cache |
-| `Computed` | A compiler-defined constant, such as a folded `Iota` |
+| Class        | What it is                                                                                                   |
+| ------------ | ------------------------------------------------------------------------------------------------------------ |
+| `Device`     | An ordinary intermediate tensor: attention scores, MLP outputs, the residual stream                          |
+| `Const`      | A weight or table, identified by its `WeightRef`, never by a name; weight caches never reuse different bytes |
+| `Slot(Slot)` | A per-step input in a stable device buffer the host rewrites in place                                        |
+| `State`      | A buffer carried across decode steps: the KV cache                                                           |
+| `Computed`   | A compiler-defined constant, such as a folded `Iota`                                                         |
 
 **Slots.** `Token` and `Pos` carry the step's ids and absolute positions. `SlotMap` and `WriteMap` carry paged KV reads and writes, each declaring the range of the words it holds, which the bind checks. Other roles (the adapter index, the expert pool, the sampler inputs) are defined by the pass or feature that declares them. The attention mask is not a slot: it is computed in-graph from `Pos`.
 
@@ -136,6 +136,64 @@ Every op that multiplies two float operands (`MatMul`, the dense, grouped, packe
 The precision is part of the op, so the CPU oracle evaluates exactly what a device must compute, and every schedule (matrix-unit fragments, scalar micro-tiles, GEMV) reads its operands the same way. The published numerics class follows the ops: a program with a narrow op compares with the narrow-storage tolerance, a split one with the reassociating tolerance.
 
 One driver-wide policy, `--matmul-precision exact|split|narrow`, decides what `compile` writes. The `select_operand_precision` pass reads that policy, the target's matrix units and the operands' dtypes, and nothing else: contractions take bf16 where the target has bf16 fragments and f16 otherwise, attention takes the dtype its KV cache is stored in, and a target with no matrix unit for the operands compiles `exact` under any policy. The default is `exact`.
+
+A contraction that rounds its activation to f16 reads it row-scaled: each row is divided by `s = max(1, max|x| / 65504)` before the rounding and the result is multiplied by `s` after, so the rounding cannot overflow. Where a row is inside f16's range, `s` is exactly 1 and the result is bit for bit the unscaled one. The scale steps are ordinary graph ops, so the CPU oracle evaluates them too, and fusion computes `s` in the row kernel that produces the activation (a norm), or in a row kernel of its own when a contraction produces it. A product of two runtime values (no weight) has no scale and does not narrow to f16.
+
+### Measured agreement of narrow with exact
+
+A checkpoint is compiled twice on one device and one weight upload, once `exact` and once `narrow`. Both programs score the same 640 tokens (five windows of 128, teacher-forced, logits at every position) and their next-token distributions are compared position by position. This is the `llama-perplexity --kl-divergence` method with the exact program as the reference.
+
+- **top-1** is the fraction of positions where both programs rank the same token first.
+- **mean KL** is the mean of KL(exact || narrow) in nats.
+- **max shift** is the largest `|logit narrow - logit exact|` over every logit of the text.
+
+A row passes when:
+
+- the mean KL is at most 1e-3;
+- the max shift is within the ceiling recorded for that row: the measured shift times 2.4 (the largest spread of one checkpoint's shift across the three f16 backends), rounded up;
+- every token flip is a near tie: the exact program's two candidates were within twice that ceiling of each other. This is the tie rule of the tier-3 contract, and the ceiling enforces it, because logits that move by at most the ceiling cannot flip a wider gap.
+
+The top-1 fraction is reported, not gated. For scale, llama.cpp's own CPU and Vulkan backends differ by about 1.4e-3 in mean KL on a similar text. The AMD rows are from the Strix Halo box (gfx1151); the NVIDIA PTX rows are from rented RTX 4090 and A40 GPUs, which gave identical numbers.
+
+| backend, contraction dtype | checkpoint                     | top-1  | mean KL       | max shift |
+| -------------------------- | ------------------------------ | ------ | ------------- | --------- |
+| ROCm, bf16                 | Qwen3 0.6B (bf16)              | 0.9953 | 4.8e-5        | 0.20      |
+|                            | Qwen3 4B (bf16)                | 0.9953 | 2.9e-5        | 0.15      |
+|                            | Qwen3 0.6B (Q8_0)              | 0.9969 | 1.1e-4        | 0.32      |
+|                            | Qwen2.5 1.5B Instruct (Q4_K_M) | 0.9906 | 1.0e-4        | 0.49      |
+|                            | Gemma 3 1B Instruct (bf16)     | 0.9891 | 5.5e-4        | 2.32      |
+|                            | Llama 3.2 1B Instruct (bf16)   | 0.9969 | 2.6e-5        | 0.13      |
+| ROCm, f16                  | Qwen3 0.6B (bf16)              | 1.0000 | 1.6e-6        | 0.03      |
+|                            | Qwen3 4B (bf16)                | 1.0000 | 8.7e-7        | 0.03      |
+|                            | Qwen3 0.6B (Q8_0)              | 1.0000 | 2.7e-6        | 0.07      |
+|                            | Qwen2.5 1.5B Instruct (Q4_K_M) | 1.0000 | 4.0e-6        | 0.07      |
+|                            | Gemma 3 1B Instruct (bf16)     | 0.9984 | 2.3e-5        | 0.62      |
+|                            | Llama 3.2 1B Instruct (bf16)   | 1.0000 | 1.0e-6        | 0.03      |
+| wgpu (Vulkan), f16         | Qwen3 0.6B (bf16)              | 0.9984 | 1.6e-6        | 0.03      |
+|                            | Qwen3 4B (bf16)                | 1.0000 | 1.0e-6        | 0.03      |
+|                            | Qwen3 0.6B (Q8_0)              | 1.0000 | 2.6e-6        | 0.07      |
+|                            | Qwen2.5 1.5B Instruct (Q4_K_M) | 1.0000 | 3.9e-6        | 0.07      |
+|                            | Gemma 3 1B Instruct (bf16)     | 0.9984 | 1.6e-5        | 0.50      |
+|                            | Llama 3.2 1B Instruct (bf16)   | 1.0000 | 1.0e-6        | 0.02      |
+| raw Vulkan, f16            | Qwen3 0.6B (bf16)              | 0.9984 | 1.8e-6        | 0.06      |
+|                            | Qwen3 4B (bf16)                | 1.0000 | 1.0e-6        | 0.02      |
+|                            | Qwen3 0.6B (Q8_0)              | 0.9984 | 2.7e-6        | 0.07      |
+|                            | Qwen2.5 1.5B Instruct (Q4_K_M) | 1.0000 | 3.9e-6        | 0.07      |
+|                            | Gemma 3 1B Instruct (bf16)     | 0.9984 | 1.4e-5        | 0.44      |
+|                            | Llama 3.2 1B Instruct (bf16)   | 1.0000 | 8.6e-7        | 0.02      |
+| NVIDIA (PTX), bf16         | Qwen3 0.6B (bf16)              | 0.9953 | 5.0e-5        | 0.44      |
+|                            | Qwen3 4B (bf16)                | 1.0000 | 2.7e-5        | 0.14      |
+|                            | Qwen3 0.6B (Q8_0)              | 0.9922 | 1.2e-4        | 0.46      |
+|                            | Qwen2.5 1.5B Instruct (Q4_K_M) | 0.9891 | 9.6e-5        | 0.48      |
+|                            | Gemma 3 1B Instruct (bf16)     | 0.9844 | 1.9e-3 (miss) | 7.93      |
+|                            | Llama 3.2 1B Instruct (bf16)   | 0.9984 | 2.6e-5        | 0.13      |
+
+What the table says:
+
+- **Contractions use bf16 where the target has bf16 fragments (ROCm, NVIDIA), and f16 only where f16 is the only fragment (wgpu and raw Vulkan on RADV).** bf16 keeps the f32 exponent range, so narrowing an activation to it cannot overflow. f16 is more accurate (24 to 41 times lower mean KL on ROCm, which has both; the f16 rows there are a measured comparison, not the shipped choice). Its activations are row-scaled, so they cannot overflow: on wgpu and raw Vulkan the scale costs 1 to 4% of prefill on Qwen3 4B, and every f16 row above is unchanged by it. It is not used where bf16 exists because rounding to f16 costs the current kernels 23 to 60% of prefill on ROCm. A weight beyond 65504 rounded to f16 becomes infinity, never a clamped value, and serving refuses non-finite logits with a typed error.
+- **Gemma 3 is the sensitive family.** It has the largest logit shift under every dtype (0.4 to 7.9), and under bf16 a few positions move far: KL 0.07 at one position on ROCm and 0.33 on NVIDIA.
+- **Gemma 3 under bf16 on NVIDIA misses the mean-KL ceiling (1.9e-3).** The two exact programs agree across AMD and NVIDIA to within 0.005 (every 512th logit of every position compared), so the gap is the bf16 rounding itself: at the same sensitive positions, a different but correct accumulation order moves a bf16 result further. On NVIDIA, `narrow` is not yet within the gate for this family; `exact` (the default) is unaffected.
+- **The default stays `exact`.**
 
 ## Quantization
 

@@ -37,7 +37,11 @@ fn main() {
     );
 
     // the standard pipeline: cse to drop redundancy, then G5 automatic fusion.
-    let fused = transform::fuse(&transform::cse(&g).unwrap()).unwrap();
+    let fused = transform::fuse(
+        &transform::cse(&g).unwrap(),
+        poot_graph_plan::RowOutputs::Multiple,
+    )
+    .unwrap();
     let mut pointwise = 0usize;
     let mut row = 0usize;
     for e in fused.eqns() {

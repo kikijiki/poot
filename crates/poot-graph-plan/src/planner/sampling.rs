@@ -143,6 +143,7 @@ pub(super) fn plan(
             unreachable!("plan_eqn refuses an unfolded Iota before dispatching to a family")
         }
         imported_ops!()
+        | side_output_ops!()
         | packed_ops!()
         | moe_ops!()
         | elementwise_ops!()

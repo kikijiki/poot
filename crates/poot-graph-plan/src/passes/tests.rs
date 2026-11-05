@@ -1092,7 +1092,7 @@ fn fuse_collapses_pointwise_chain() {
     let out = b.binary(BinOp::Mul, t, d).unwrap();
     let g = b.finish(out).unwrap();
     assert_eq!(g.eqns().len(), 2);
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, crate::RowOutputs::Multiple).unwrap();
     assert_eq!(
         fg.eqns().len(),
         1,
@@ -1127,7 +1127,7 @@ fn fuse_fuses_a_multi_use_value_read_only_inside_the_region() {
     let v = b.binary(BinOp::Sub, t, d).unwrap();
     let out = b.binary(BinOp::Add, u, v).unwrap();
     let g = b.finish(out).unwrap();
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, crate::RowOutputs::Multiple).unwrap();
     assert_eq!(fg.eqns().len(), 1, "t joins the region that reads it twice");
     assert!(matches!(&fg.eqns()[0].op, OpKind::Fused(r) if r.steps.len() == 4));
 }
@@ -1139,7 +1139,7 @@ fn fuse_does_not_wrap_a_singleton() {
     let (a, c) = (f(&b, &[3]), f(&b, &[3]));
     let out = b.binary(BinOp::Add, a, c).unwrap();
     let g = b.finish(out).unwrap();
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, crate::RowOutputs::Multiple).unwrap();
     assert_eq!(fg.eqns().len(), 1);
     assert!(matches!(fg.eqns()[0].op, OpKind::Binary(_)));
 }
@@ -1155,7 +1155,7 @@ fn fuse_collapses_exact_i32_pointwise_chain() {
         .binary_scalar(BinOp::GeU, sum, poot_graph_ir::types::Scalar::I32(-1))
         .unwrap();
     let g = b.finish(out).unwrap();
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, crate::RowOutputs::Multiple).unwrap();
     assert_eq!(fg.eqns().len(), 1, "same-shape I32 Add+GeU should fuse");
     match &fg.eqns()[0].op {
         OpKind::Fused(region) => assert_eq!(region.steps.len(), 2),
@@ -1175,7 +1175,7 @@ fn fuse_i32_closed_dag_absorbs_non_escaping_multi_use() {
     let v = b.unary(UnOp::Not, t).unwrap();
     let out = b.select(u, v, t).unwrap();
     let g = b.finish(out).unwrap();
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, crate::RowOutputs::Multiple).unwrap();
     assert_eq!(fg.eqns().len(), 1);
     match &fg.eqns()[0].op {
         OpKind::Fused(region) => {
@@ -1204,7 +1204,7 @@ fn fuse_float_select_is_a_step_of_a_float_region_with_the_condition_as_a_leaf() 
     let selected = b.select(cond, if_true, if_false).unwrap();
     let out = b.unary(UnOp::Neg, selected).unwrap();
     let g = b.finish(out).unwrap();
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, crate::RowOutputs::Multiple).unwrap();
     assert_eq!(fg.eqns().len(), 1);
     let OpKind::Fused(region) = &fg.eqns()[0].op else {
         panic!("expected Fused, got {}", fg.eqns()[0].op.name());
@@ -1252,7 +1252,7 @@ fn fuse_keeps_a_float_select_out_of_row_regions() {
     let sum = b.reduce(RedOp::Sum, exp, 1, true).unwrap();
     let out = b.binary(BinOp::Div, exp, sum).unwrap();
     let g = b.finish(out).unwrap();
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, crate::RowOutputs::Multiple).unwrap();
     let mut selects = 0;
     for eqn in fg.eqns() {
         match &eqn.op {
@@ -1291,7 +1291,7 @@ fn fuse_i32_pack_concat_keeps_shared_operands_in_one_region() {
     let high = b.binary(BinOp::Xor, shared, y).unwrap();
     let packed = b.concat(0, &[low, high]).unwrap();
     let g = b.finish(packed).unwrap();
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, crate::RowOutputs::Multiple).unwrap();
     assert_eq!(fg.eqns().len(), 1);
     match &fg.eqns()[0].op {
         OpKind::Fused(region) => {
@@ -1316,7 +1316,7 @@ fn fuse_i32_pack_concat_absorbs_unit_last_axis_unpack_slices() {
     let masked = b.binary(BinOp::And, left, right).unwrap();
     let out = b.binary(BinOp::Or, masked, left).unwrap();
     let g = b.finish(out).unwrap();
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, crate::RowOutputs::Multiple).unwrap();
     assert!(
         !fg.eqns()
             .iter()
@@ -1356,7 +1356,8 @@ fn fuse_i32_pack_concat_keeps_a_pinned_unpack_slice() {
     let masked = b.binary(BinOp::And, left, right).unwrap();
     let _keep = b.binary(BinOp::Or, masked, left).unwrap();
     let g = b.finish(left).unwrap();
-    let fg = fuse(&g).expect("pinned unpack slice must remain a produced graph output");
+    let fg = fuse(&g, crate::RowOutputs::Multiple)
+        .expect("pinned unpack slice must remain a produced graph output");
     assert_eq!(fg.result(), left.id());
     assert!(
         fg.eqns().iter().any(|eqn| eqn.out == left.id()),
@@ -1375,7 +1376,7 @@ fn fuse_does_not_cross_a_matmul_boundary() {
     let e = f(&b, &[1, 4]);
     let out = b.binary(BinOp::Add, m, e).unwrap();
     let g = b.finish(out).unwrap();
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, crate::RowOutputs::Multiple).unwrap();
     // matmul stays; neither add fuses with anything (each is a singleton across the boundary).
     assert!(
         fg.eqns()
@@ -1396,7 +1397,7 @@ fn fuse_forms_a_rmsnorm_row_region() {
     let w = b.constant("w", TensorType::f32(vec![n])).unwrap();
     let out = rmsnorm(&b, x, w, 1e-6).unwrap();
     let g = b.finish(out).unwrap();
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, crate::RowOutputs::Multiple).unwrap();
     let rows = fg
         .eqns()
         .iter()
@@ -1421,36 +1422,68 @@ fn fuse_forms_a_rmsnorm_row_region() {
     }
 }
 
+/// POOT-1456: a row region may end in a per-row scalar. Both reduced-output shapes the 0196/0197 guard used to
+/// skip, a bare reduce of a pointwise and a scalar step after a reduce (the `quant_scale_kv` shape), now fuse to one
+/// `FusedRow` each, and the planner walks the full row: the region's first reduction reads `[1, 4, 8]`, so the row
+/// kernel has 8 columns over 32 elements, not the output's unit axis (the old guard's garbage came from a kernel that
+/// took its width from the output and reduced one column). The oracle computes what the chain computed, bit for bit.
+/// Mutation: in `planner/elementwise.rs`, take `n_cols` from the output shape (`out_shape[region.axis]`); both
+/// width rows go red with 1 column.
 #[test]
-fn fuse_does_not_form_a_reduced_output_row_region() {
-    // A FusedRow whose output is the reduced value (axis size 1, not the full row width) breaks the
-    // fused_row_parallel kernel: it derives n_cols from the output shape and would iterate 1 column
-    // instead of the full row. Such regions are skipped (the reduce stays a plain `Reduce`, the
-    // pointwise falls to pointwise fusion). Two shapes of reduced output, both accepted by `row_fits`
-    // (its `== 1` clause), so the region would otherwise form: (a) a bare reduce root, and (b) a
-    // scalar pointwise applied to a reduce (the `quant_scale_kv = reduce_max(|x|)*(1/127)` shape that
-    // gave garbage on real KV-quant weights). Fast unit-level guard for the bug the GPU fuzzer and a
-    // real-model test caught.
+fn fuse_forms_a_reduced_output_row_region_over_the_full_row() {
+    use crate::planner::{KernelChoice, Planned, plan_eqn_choice};
     use poot_graph_ir::Scalar;
-    use poot_graph_ir::op::RedOp;
-    let has_row = |g: &Graph| g.eqns().iter().any(|e| matches!(e.op, OpKind::FusedRow(_)));
-    let has_reduce = |g: &Graph| {
-        g.eqns()
-            .iter()
-            .any(|e| matches!(e.op, OpKind::Reduce { .. }))
+    use poot_kernelgen::{KernelRequest, RowSpec};
+    use poot_test_util::device_caps::default_caps_for;
+
+    let backend = poot_target::Backend::SpirvVulkan;
+    let target = crate::Target::Gpu {
+        backend,
+        caps: default_caps_for(backend),
+    };
+    let check = |name: &str, g: Graph| {
+        let fg = fuse(&g, crate::RowOutputs::Multiple).unwrap();
+        assert_eq!(fg.eqns().len(), 1, "{name}: one region: {fg:?}");
+        let eqn = &fg.eqns()[0];
+        let OpKind::FusedRow(region) = &eqn.op else {
+            panic!("{name}: expected a FusedRow, got {:?}", eqn.op);
+        };
+        assert_eq!(
+            fg.aval(eqn.out).shape,
+            vec![1, 4, 1],
+            "{name}: per-row result"
+        );
+        assert!(region.side_outputs.is_empty(), "{name}: one output");
+        let Planned { choice, .. } = plan_eqn_choice(
+            &fg,
+            eqn,
+            &target,
+            &HashMap::new(),
+            &crate::test_support::roomy_body_limits(),
+            None,
+        )
+        .unwrap();
+        let KernelChoice::Generated(KernelRequest::Row(RowSpec::Fused {
+            row_shape,
+            numel,
+            kernel,
+            ..
+        })) = choice
+        else {
+            panic!("{name}: expected a generated row kernel, got {choice:?}");
+        };
+        assert_eq!(row_shape, vec![1, 4, 8], "{name}: row shape");
+        assert_eq!(kernel.n_cols, 8, "{name}: the kernel walks the full row");
+        assert_eq!(numel, 32, "{name}: row elements");
+        assert_eq!(eval_bits(&g), eval_bits(&fg), "{name}: oracle bits");
     };
 
-    // (a) bare reduce of a pointwise: sum(x + x) over the last axis -> output [1,4,1].
+    // (a) bare reduce of a pointwise: sum(x + x) over the last axis -> [1,4,1].
     let b = Builder::for_tests();
     let x = b.constant("x", TensorType::f32(vec![1, 4, 8])).unwrap();
     let s = b.binary(BinOp::Add, x, x).unwrap();
     let r = b.reduce(RedOp::Sum, s, 2, true).unwrap();
-    let fg = fuse(&b.finish(r).unwrap()).unwrap();
-    assert!(
-        !has_row(&fg),
-        "bare reduce-output region must not be a FusedRow (0196)"
-    );
-    assert!(has_reduce(&fg), "the reduce stays a plain Reduce op");
+    check("sum of a pointwise", b.finish(r).unwrap());
 
     // (b) scalar pointwise after a reduce (the quant_scale_kv shape): reduce_max(x) * (1/127) -> [1,4,1].
     let b = Builder::for_tests();
@@ -1459,12 +1492,58 @@ fn fuse_does_not_form_a_reduced_output_row_region() {
     let sc = b
         .binary_scalar(BinOp::Mul, m, Scalar::F32(1.0 / 127.0))
         .unwrap();
-    let fg = fuse(&b.finish(sc).unwrap()).unwrap();
-    assert!(
-        !has_row(&fg),
-        "scalar-after-reduce reduced output must not be a FusedRow (0197)"
+    check("scaled max", b.finish(sc).unwrap());
+}
+
+/// POOT-1456: dead-code elimination keeps a live region's side output projections. Here the scale's only outside
+/// reader is dead, so the projection reads as dead too; the region still writes the scale, so the projection that
+/// names its buffer must stay, or the graph check refuses the region. Mutation: delete the projection loop in
+/// `dce_with_roots`; the projection goes with its reader and `dce` fails with `NotProjected`.
+#[test]
+fn dce_keeps_the_projections_of_a_live_row_region() {
+    use poot_graph_ir::Scalar;
+    use poot_graph_ir::op::UnOp;
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![8, 3])).unwrap();
+    let magnitude = b
+        .binary(BinOp::Max, x, b.unary(UnOp::Neg, x).unwrap())
+        .unwrap();
+    let scale = b
+        .binary_scalar(
+            BinOp::Mul,
+            b.reduce(RedOp::Max, magnitude, 1, true).unwrap(),
+            Scalar::F32(1.0 / 127.0),
+        )
+        .unwrap();
+    let quantized = b.binary(BinOp::Div, x, scale).unwrap();
+    let product = b.matmul(quantized, w).unwrap();
+    let out = b.binary(BinOp::Mul, product, scale).unwrap();
+    let fused = fuse(&b.finish(out).unwrap(), crate::RowOutputs::Multiple).unwrap();
+    let projections = |g: &Graph| {
+        g.eqns()
+            .iter()
+            .filter(|e| matches!(e.op, OpKind::SideOutput { .. }))
+            .count()
+    };
+    assert_eq!(
+        projections(&fused),
+        1,
+        "the scale is a side output: {fused:?}"
     );
-    assert!(has_reduce(&fg), "the reduce stays a plain Reduce op");
+    // Publish the product instead: the multiply, the scale's one outside reader, is dead.
+    let mut edit = fused.edit();
+    edit.set_result(product.id());
+    let unread = edit.commit().unwrap();
+    let live = dce(&unread).unwrap();
+    assert_eq!(projections(&live), 1, "{live:?}");
+    assert!(
+        !live
+            .eqns()
+            .iter()
+            .any(|e| matches!(e.op, OpKind::Binary(BinOp::Mul))),
+        "the dead reader goes"
+    );
 }
 
 #[test]
@@ -1474,8 +1553,8 @@ fn fuse_is_idempotent() {
     let t = b.binary(BinOp::Add, a, c).unwrap();
     let out = b.binary(BinOp::Mul, t, d).unwrap();
     let g = b.finish(out).unwrap();
-    let f1 = fuse(&g).unwrap();
-    let f2 = fuse(&f1).unwrap();
+    let f1 = fuse(&g, crate::RowOutputs::Multiple).unwrap();
+    let f2 = fuse(&f1, crate::RowOutputs::Multiple).unwrap();
     assert_eq!(f1.eqns().len(), f2.eqns().len());
 }
 
@@ -1575,7 +1654,7 @@ fn fuse_collapses_the_reshape_after_eliding_a_noop_transpose() {
     let t = b.transpose(r1, vec![0, 2, 1, 3]).unwrap(); // [1,4,1,8] - no-op at seq 1
     let out = b.reshape(t, vec![1, 4, 8]).unwrap();
     let g = b.finish(out).unwrap();
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, crate::RowOutputs::Multiple).unwrap();
     assert!(
         !fg.eqns()
             .iter()
@@ -1812,7 +1891,7 @@ fn fusion_pins_validation_packet_values() {
     )
     .unwrap();
 
-    let transformed = fuse(&graph).unwrap();
+    let transformed = fuse(&graph, crate::RowOutputs::Multiple).unwrap();
     assert!(
         transformed.eqns().iter().any(|eqn| eqn.out == witness.id()),
         "the validation root must not be absorbed into its consumer"
@@ -2606,7 +2685,7 @@ fn card533_optimize_passes_keep_witness_outputs() {
         ("fuse_contraction_epilogues", |g| {
             fuse_contraction_epilogues(g, |_, _| true)
         }),
-        ("fuse", fuse),
+        ("fuse", |g| fuse(g, crate::RowOutputs::Multiple)),
     ];
     for (name, pass) in passes {
         let transformed = pass(&graph).unwrap();
@@ -2638,7 +2717,7 @@ fn card533_pass_numerics_are_read_off_the_produced_ops() {
     let sum = b.binary(BinOp::Add, product, y).unwrap();
     let graph = b.finish(sum).unwrap();
 
-    let fused = fuse(&graph).unwrap();
+    let fused = fuse(&graph, crate::RowOutputs::Multiple).unwrap();
     assert!(
         fused
             .eqns()

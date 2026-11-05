@@ -1,6 +1,6 @@
 use poot_graph_ir::graph::ComputedConst;
 
-use super::{EditError, Eqn, Graph, HashMap, Operand, Storage, ValueId, with_eqns};
+use super::{EditError, Eqn, Graph, HashMap, OpKind, Operand, Storage, ValueId, with_eqns};
 use poot_graph_ir::ValueTable;
 
 /// Common-subexpression elimination: collapse structurally identical eqns (same op + same operands)
@@ -102,6 +102,16 @@ pub(crate) fn dce_with_roots(g: &Graph, extra_roots: &[ValueId]) -> Result<Graph
                     live[*v] = true;
                 }
             }
+        }
+    }
+    // A live multi-output region keeps every projection of its side outputs (POOT-1456): its kernel writes them
+    // all, so each needs the buffer its projection names. A projection reads only the region, already live.
+    for eqn in g.eqns() {
+        if let (OpKind::SideOutput { .. }, [Operand::Value(region)]) =
+            (&eqn.op, eqn.inputs.as_slice())
+            && live[*region]
+        {
+            live[eqn.out] = true;
         }
     }
     let eqns: Vec<Eqn> = g.eqns().iter().filter(|e| live[e.out]).cloned().collect();

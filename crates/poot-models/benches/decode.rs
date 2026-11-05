@@ -131,7 +131,13 @@ fn prefill_benches(c: &mut Criterion) {
     });
     let gb = trace(&model_b, 64, 64);
     c.bench_function("prefill_cse+fuse", |b| {
-        b.iter(|| transform::fuse(&transform::cse(black_box(&gb)).unwrap()).unwrap())
+        b.iter(|| {
+            transform::fuse(
+                &transform::cse(black_box(&gb)).unwrap(),
+                poot_graph_plan::RowOutputs::Multiple,
+            )
+            .unwrap()
+        })
     });
 
     // Eager prefill forward, un-fused vs fused, on the small config at two prompt lengths; each pair is the
@@ -140,7 +146,11 @@ fn prefill_benches(c: &mut Criterion) {
     for n in [16usize, 64usize] {
         let g = trace(&model, n, n);
         let inputs = bind(&g);
-        let gf = transform::fuse(&transform::cse(&g).unwrap()).unwrap();
+        let gf = transform::fuse(
+            &transform::cse(&g).unwrap(),
+            poot_graph_plan::RowOutputs::Multiple,
+        )
+        .unwrap();
         c.bench_function(&format!("eval_prefill_{n}"), |b| {
             b.iter(|| {
                 poot_eval::eval(black_box(&g), black_box(&inputs), EvalOptions::default())
@@ -182,7 +192,13 @@ fn decode_benches(c: &mut Criterion) {
 
     let g = trace(&model, 1, cap);
     c.bench_function("cse+fuse", |b| {
-        b.iter(|| transform::fuse(&transform::cse(black_box(&g)).unwrap()).unwrap())
+        b.iter(|| {
+            transform::fuse(
+                &transform::cse(black_box(&g)).unwrap(),
+                poot_graph_plan::RowOutputs::Multiple,
+            )
+            .unwrap()
+        })
     });
 
     // Un-fused vs fused eager decode step on the same graph and inputs: fusion collapses the
@@ -203,7 +219,11 @@ fn decode_benches(c: &mut Criterion) {
                 .unwrap()
         })
     });
-    let gf = transform::fuse(&transform::cse(&g).unwrap()).unwrap();
+    let gf = transform::fuse(
+        &transform::cse(&g).unwrap(),
+        poot_graph_plan::RowOutputs::Multiple,
+    )
+    .unwrap();
     c.bench_function("eval_decode_step_fused", |b| {
         b.iter(|| {
             poot_eval::eval(black_box(&gf), black_box(&inputs), EvalOptions::default())
@@ -224,7 +244,11 @@ fn decode_benches(c: &mut Criterion) {
     let cap_b = 64;
     let gb = trace(&model_b, 1, cap_b);
     let inputs_b = bind(&gb);
-    let gbf = transform::fuse(&transform::cse(&gb).unwrap()).unwrap();
+    let gbf = transform::fuse(
+        &transform::cse(&gb).unwrap(),
+        poot_graph_plan::RowOutputs::Multiple,
+    )
+    .unwrap();
     c.bench_function("eval_decode_step_big", |b| {
         b.iter(|| {
             poot_eval::eval(black_box(&gb), black_box(&inputs_b), EvalOptions::default())

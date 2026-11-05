@@ -5,4 +5,10 @@
 # never a pass. Sorted in canonical (LC_ALL=C) order.
 #
 # Real-checkpoint device rows (checkpoint-vulkan), run by exact name with POOT_REQUIRE_MODELS=1 and the backend required.
+poot-llm	driver::narrow_gate_tests::vulkan_f16::gemma_3_1b_it
+poot-llm	driver::narrow_gate_tests::vulkan_f16::llama_3_2_1b_instruct
+poot-llm	driver::narrow_gate_tests::vulkan_f16::qwen2_5_1_5b_q4_k_m
+poot-llm	driver::narrow_gate_tests::vulkan_f16::qwen3_0_6b
+poot-llm	driver::narrow_gate_tests::vulkan_f16::qwen3_0_6b_q8_0
+poot-llm	driver::narrow_gate_tests::vulkan_f16::qwen3_4b
 poot-llm::vulkan_generate	qwen2_5_0_5b_greedy_tokens_equal_the_recorded_literals_on_vulkan

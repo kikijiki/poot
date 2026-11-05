@@ -166,6 +166,13 @@ macro_rules! block_top_k_ops {
     };
 }
 
+/// The side output projection (POOT-1456): planned here, as no dispatch, because its region's dispatch writes it.
+macro_rules! side_output_ops {
+    () => {
+        OpKind::SideOutput { .. }
+    };
+}
+
 /// Ops planned by `planner::cast`.
 macro_rules! cast_ops {
     () => {
@@ -649,6 +656,7 @@ fn plan_aie_eqn(
             packed_operands,
         )?,
         OpKind::Iota { .. } => return Err(site.refuse(Capability::UnfoldedIota)),
+        side_output_ops!() => return Ok(plan_side_output(eqn)),
         movement_ops!() => movement::plan_serialized(g, eqn, out_shape, target, odt, limits)?,
         imported_ops!()
         | packed_ops!()
@@ -665,6 +673,15 @@ fn plan_aie_eqn(
     };
     finalize_aie(&planned, g, eqn, target, caps, npu)?;
     Ok(planned)
+}
+
+/// A side output's plan (POOT-1456): no dispatch, because its region's dispatch writes the value. The operand is
+/// that region's result: a graph only commits a projection the graph check paired with one.
+fn plan_side_output(eqn: &Eqn) -> Planned {
+    match eqn.inputs.as_slice() {
+        [Operand::Value(region)] => Planned::side_output(*region),
+        _ => unreachable!("the graph check pairs every side output with a row region's result"),
+    }
 }
 
 /// The storage dtypes of one equation that decide whether its family can lower it: the output's, and
@@ -717,7 +734,7 @@ fn admit_dtypes(op: &OpKind, dtypes: StorageDtypes, caps: &DeviceCaps) -> Result
         movement_ops!() => movement::admits_dtypes(op, dtypes, caps),
         // An unfolded `Iota` and an imported op are refused (or routed) by their own arms, before any dtype
         // rule applies.
-        OpKind::Iota { .. } | imported_ops!() => Ok(()),
+        OpKind::Iota { .. } | imported_ops!() | side_output_ops!() => Ok(()),
     }
 }
 
@@ -782,6 +799,7 @@ fn plan_gpu_eqn(
         // `Storage::Computed` graph constant before planning, and a graph that reaches the planner with
         // one unfolded is refused here. There is deliberately no iota kernel.
         OpKind::Iota { .. } => return Err(site.refuse(Capability::UnfoldedIota)),
+        side_output_ops!() => return Ok(plan_side_output(eqn)),
         // The packed and MoE families run `finalize` at their own tail and return here directly; every
         // other family falls through to the `finalize` below. No arm returns a plan without it.
         packed_ops!() => {

@@ -513,6 +513,11 @@ pub enum RowStep {
 /// Lowered to one kernel that processes one row at a time, computing each reduction into a register and
 /// recomputing the pointwise chain per pass (one-pass RMSNorm, fused softmax). The pointwise [`FusedRegion`]
 /// is the no-reduction case.
+///
+/// Any local can be an output, a row or a per-row scalar (POOT-1456): `output` is the equation's own value, and
+/// each of `side_outputs` is one more value the same kernel writes, which the graph names by the one
+/// [`OpKind::SideOutput`] equation that projects it. One kernel then writes a normalized row and its per-row
+/// scale, or an updated residual and its norm.
 #[derive(Clone, PartialEq, Debug)]
 pub struct RowRegion {
     /// The number of external inputs, which are locals `0..n_inputs`.
@@ -521,46 +526,17 @@ pub struct RowRegion {
     pub axis: usize,
     /// The steps in execution order; step `j` defines local `n_inputs + j`.
     pub steps: Vec<RowStep>,
-    /// The local that is the region's result.
+    /// The local that is the region's result, the equation's value.
     pub output: LocalId,
+    /// The other locals the region writes, in order: side output `k` is the value of the
+    /// [`OpKind::SideOutput`] `{ index: k }` equation that reads this region's result.
+    pub side_outputs: Vec<LocalId>,
 }
 
 impl RowRegion {
-    /// Whether a [`FusedOp::Cast`] step reads external input `input`: the input a lowering widens as it reads it.
-    pub fn widens_input(&self, input: LocalId) -> bool {
-        self.steps.iter().any(|step| {
-            matches!(
-                step,
-                RowStep::Pointwise { op: FusedOp::Cast { .. }, inputs }
-                    if matches!(inputs.as_slice(), [FusedOperand::Local(local)] if *local == input)
-            )
-        })
-    }
-
-    /// The two-byte float the region's result is narrowed to by its last step, as [`FusedRegion::narrowed_output`].
-    pub fn narrowed_output(&self) -> Option<DType> {
-        let RowStep::Pointwise { op, .. } = self.steps.last()? else {
-            return None;
-        };
-        if self.output.index() != self.n_inputs + self.steps.len() - 1 {
-            return None;
-        }
-        narrowing_cast(*op)
-    }
-
-    /// This region with its result narrowed to `to` by a final `Cast` step, as [`FusedRegion::narrowing_output`].
-    pub fn narrowing_output(mut self, to: DType) -> Self {
-        self.steps.push(RowStep::Pointwise {
-            op: FusedOp::Cast { to },
-            inputs: vec![FusedOperand::Local(self.output)],
-        });
-        self.output = LocalId::new(self.n_inputs + self.steps.len() - 1);
-        self
-    }
-
-    /// The output type, threading input types through the steps (the un-fused chain's inference).
+    /// The type of every local over the input types `ins`: the inputs, then each step's result.
     #[deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-    pub fn infer(&self, ins: &[TensorType]) -> Result<TensorType, ShapeError> {
+    pub fn local_types(&self, ins: &[TensorType]) -> Result<Vec<TensorType>, ShapeError> {
         if ins.len() != self.n_inputs {
             return Err(ShapeError::Arity {
                 expected: self.n_inputs,
@@ -595,6 +571,75 @@ impl RowRegion {
                 .infer(&[ty_of(input, &locals)?])?,
             };
             locals.push(ty);
+        }
+        Ok(locals)
+    }
+
+    /// The shape of the region's rows over the input types `ins`: what its first reduction reads, the full
+    /// width `N` on the last axis whatever the shape of the outputs. `None` for a region with no reduction.
+    #[deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+    pub fn row_shape(&self, ins: &[TensorType]) -> Result<Option<Vec<usize>>, ShapeError> {
+        let locals = self.local_types(ins)?;
+        for step in &self.steps {
+            if let RowStep::Reduce { input, .. } = step {
+                return Ok(match input {
+                    FusedOperand::Local(id) => Some(local_ty(&locals, *id)?.shape.clone()),
+                    FusedOperand::Lit(_) | FusedOperand::PackLane { .. } => None,
+                });
+            }
+        }
+        Ok(None)
+    }
+
+    /// The type of each side output over the input types `ins`, in order.
+    #[deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+    pub fn side_output_types(&self, ins: &[TensorType]) -> Result<Vec<TensorType>, ShapeError> {
+        let locals = self.local_types(ins)?;
+        self.side_outputs
+            .iter()
+            .map(|id| local_ty(&locals, *id).cloned())
+            .collect()
+    }
+
+    /// Whether a [`FusedOp::Cast`] step reads external input `input`: the input a lowering widens as it reads it.
+    pub fn widens_input(&self, input: LocalId) -> bool {
+        self.steps.iter().any(|step| {
+            matches!(
+                step,
+                RowStep::Pointwise { op: FusedOp::Cast { .. }, inputs }
+                    if matches!(inputs.as_slice(), [FusedOperand::Local(local)] if *local == input)
+            )
+        })
+    }
+
+    /// The two-byte float the region's result is narrowed to by its last step, as [`FusedRegion::narrowed_output`].
+    pub fn narrowed_output(&self) -> Option<DType> {
+        let RowStep::Pointwise { op, .. } = self.steps.last()? else {
+            return None;
+        };
+        if self.output.index() != self.n_inputs + self.steps.len() - 1 {
+            return None;
+        }
+        narrowing_cast(*op)
+    }
+
+    /// This region with its result narrowed to `to` by a final `Cast` step, as [`FusedRegion::narrowing_output`].
+    pub fn narrowing_output(mut self, to: DType) -> Self {
+        self.steps.push(RowStep::Pointwise {
+            op: FusedOp::Cast { to },
+            inputs: vec![FusedOperand::Local(self.output)],
+        });
+        self.output = LocalId::new(self.n_inputs + self.steps.len() - 1);
+        self
+    }
+
+    /// The output type, threading input types through the steps (the un-fused chain's inference). Every side
+    /// output must name a local too.
+    #[deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+    pub fn infer(&self, ins: &[TensorType]) -> Result<TensorType, ShapeError> {
+        let locals = self.local_types(ins)?;
+        for side in &self.side_outputs {
+            local_ty(&locals, *side)?;
         }
         Ok(local_ty(&locals, self.output)?.clone())
     }
@@ -1346,6 +1391,17 @@ pub enum OpKind {
     /// A row-wise (reduction-rooted) fused region (G5b): last-axis reductions + their pointwise feed and
     /// epilogue, lowered to one row-at-a-time kernel; see [`RowRegion`].
     FusedRow(RowRegion),
+    /// Side output `index` of the multi-output [`OpKind::FusedRow`] that defines its one operand (POOT-1456): a
+    /// value the region's kernel writes besides its result, of type `ty` (the type of the region's local
+    /// [`RowRegion::side_outputs`]`[index]`). It names a value; it computes nothing, and it plans no dispatch.
+    /// The graph check holds the pairing: the operand is a `FusedRow` result, `index` is one of its side
+    /// outputs, `ty` is that local's type, and each side output has exactly one projection.
+    SideOutput {
+        /// Which of the region's side outputs this is.
+        index: usize,
+        /// The side output's type.
+        ty: TensorType,
+    },
     /// Fused attention, inputs `[q, k, v, mask]` with `q[B,Hq,Lq,D]`, `k`/`v[B,Hq/n_rep,Lk,D]` and
     /// `mask[B,Hm,Lq,Lk]` (`Hm` is 1 or Hq), all dense: `infer` rejects any other operand shape. Output
     /// `[B,Hq,Lq,D]` (== q's type). `Lq` and `Lk` are independent: decode is `Lq == 1` against a capacity-long cache, a
@@ -2391,6 +2447,10 @@ impl OpKind {
             }
             OpKind::Fused(region) => region.infer(ins),
             OpKind::FusedRow(region) => reject_i32_region("FusedRow", region.infer(ins)?),
+            OpKind::SideOutput { ty, .. } => {
+                arity(ins, 1)?;
+                Ok(ty.clone())
+            }
             OpKind::Attention(attrs) => infer_attention(ins, attrs),
             OpKind::Rope { rot } => infer_rope(ins, *rot),
             OpKind::Scan(attrs) => infer_scan(ins, attrs),
@@ -2458,6 +2518,7 @@ impl OpKind {
     /// | `AllReduce`, `AllGather` | cross-rank collectives; `AllReduce` keeps the shape, `AllGather` multiplies `axis` by `world` |
     /// | `IndexedMatMul` | the row-indexed MoE contraction; revisited when contraction lowering lands (Card 727) |
     /// | `RandomUniform`, `SampleToken` | the sampling primitives (Card 719): counter-based noise and the token rule |
+    /// | `SideOutput` | names a value a multi-output `FusedRow` writes; the oracle evaluates the region's definition of that local |
     ///
     /// The match is exhaustive: a new variant states its class here.
     pub fn class(&self) -> OpClass {
@@ -2485,6 +2546,7 @@ impl OpKind {
             | Self::IndexedMatMul { .. }
             | Self::RandomUniform { .. }
             | Self::SampleToken { .. }
+            | Self::SideOutput { .. }
             | Self::PackedRowGather { .. }
             | Self::PackedContraction {
                 rows: ContractionRows::Indexed { .. },
@@ -2559,6 +2621,7 @@ impl OpKind {
             Self::DynamicUpdateSlice { .. } => "dynamic_update_slice",
             Self::Fused(_) => "fused",
             Self::FusedRow(_) => "fused_row",
+            Self::SideOutput { .. } => "side_output",
             Self::Attention(_) => "attention",
             Self::Rope { .. } => "rope",
             Self::Scan(_) => "scan",
@@ -2596,10 +2659,15 @@ impl OpKind {
                 (shape.len() as u64).checked_mul(WORD)
             }
             OpKind::Transpose { perm } => (perm.len() as u64).checked_mul(WORD),
+            OpKind::SideOutput { ty, .. } => (ty.shape.len() as u64).checked_mul(WORD),
             OpKind::Fused(region) => fused(region),
             OpKind::ContractionEpilogue { region, .. } => fused(region),
             OpKind::FusedRow(region) => {
-                let mut total = list(region.steps.len(), std::mem::size_of::<RowStep>())?;
+                let mut total = list(region.steps.len(), std::mem::size_of::<RowStep>())?
+                    .checked_add(list(
+                        region.side_outputs.len(),
+                        std::mem::size_of::<LocalId>(),
+                    )?)?;
                 for step in &region.steps {
                     if let RowStep::Pointwise { inputs, .. } = step {
                         total = total.checked_add(list(
@@ -2722,7 +2790,16 @@ impl OpKind {
             OpKind::IndexedMatMul { rows, .. } => format!("indexed_matmul{}", rows.label()),
             OpKind::DynamicUpdateSlice { axis } => format!("dyn_update_slice ax={axis}"),
             OpKind::Fused(r) => format!("fused n_in={} steps={}", r.n_inputs, r.steps.len()),
-            OpKind::FusedRow(r) => format!("fused_row n_in={} steps={}", r.n_inputs, r.steps.len()),
+            OpKind::FusedRow(r) if r.side_outputs.is_empty() => {
+                format!("fused_row n_in={} steps={}", r.n_inputs, r.steps.len())
+            }
+            OpKind::FusedRow(r) => format!(
+                "fused_row n_in={} steps={} side_outputs={}",
+                r.n_inputs,
+                r.steps.len(),
+                r.side_outputs.len()
+            ),
+            OpKind::SideOutput { index, ty } => format!("side_output {index} {ty:?}"),
             OpKind::Attention(a) => format!(
                 "attention n_rep={} scale={} softcap={:?} mask={:?} key={:?} bound={:?} sink={:?}",
                 a.n_rep, a.scale, a.softcap, a.mask, a.key, a.bound, a.sink
@@ -5221,6 +5298,7 @@ mod tests {
                 }],
             }],
             output: LocalId::new(1),
+            side_outputs: Vec::new(),
         };
         assert_eq!(
             region.infer(&[i32_ty(&[2, 4])]),
@@ -5239,6 +5317,7 @@ mod tests {
                 },
             }],
             output: LocalId::new(1),
+            side_outputs: Vec::new(),
         };
         assert_eq!(
             reduce.infer(&[i32_ty(&[2, 4])]),
@@ -5530,6 +5609,7 @@ mod tests {
                 },
             ],
             output: LocalId::new(output),
+            side_outputs: Vec::new(),
         })
     }
 
@@ -5916,6 +5996,11 @@ mod tests {
                         }
                     }
                     region.output.hash(h);
+                    region.side_outputs.hash(h);
+                }
+                OpKind::SideOutput { index, ty } => {
+                    index.hash(h);
+                    ty.hash(h);
                 }
                 OpKind::Attention(attrs) => {
                     attrs.n_rep.hash(h);

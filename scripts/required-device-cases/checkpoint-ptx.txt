@@ -60,5 +60,10 @@ poot-llm	driver::device_tests::checkpoint::smollm2_gguf_coherent::ptx
 poot-llm	driver::device_tests::checkpoint::smollm3_coherent::ptx
 poot-llm	driver::device_tests::checkpoint::smollm3_gguf_oracle::ptx
 poot-llm	driver::device_tests::checkpoint::tinyllama_coherent::ptx
+poot-llm	driver::narrow_gate_tests::ptx_bf16::llama_3_2_1b_instruct
+poot-llm	driver::narrow_gate_tests::ptx_bf16::qwen2_5_1_5b_q4_k_m
+poot-llm	driver::narrow_gate_tests::ptx_bf16::qwen3_0_6b
+poot-llm	driver::narrow_gate_tests::ptx_bf16::qwen3_0_6b_q8_0
+poot-llm	driver::narrow_gate_tests::ptx_bf16::qwen3_4b
 poot-llm::smolvlm_checkpoint	caption_matches_the_recorded_vlm_runner_tokens_ptx
 poot-llm::smolvlm_checkpoint	two_captions_on_one_front_end_are_not_stale_ptx

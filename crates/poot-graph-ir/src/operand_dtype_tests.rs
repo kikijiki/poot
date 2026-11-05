@@ -130,6 +130,8 @@ fn expectations() -> Vec<(&'static str, Vec<Admits>)> {
         ("fused n_in=2", rigid(2)),
         ("fused n_in=1", rigid(1)),
         ("fused_row", vec![OtherFloats]),
+        // The projection types itself from its own attribute: it names a value and reads none of its operand.
+        ("side_output", vec![Anything]),
         ("attention", narrow_kv(4)),
         ("attention", narrow_kv(4)),
         ("attention", narrow_kv(4)),

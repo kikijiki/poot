@@ -6,15 +6,15 @@
 //! asks `Device::allocate`/`Device::dispatch` for), not a backend's numeric result (that half is
 //! `poot-wgpu-device/tests/buffer_plan.rs`, on real wgpu hardware).
 //!
-//! Fixture (same shape as `poot-wgpu-device`'s, compiled through the full pipeline: `fuse` folds `c + c` into
-//! the reduce that reads it, so the program is four dispatches):
+//! Fixture (compiled through the full pipeline; its reductions drop their axis, which no row region takes in, so the
+//! program is four dispatches):
 //!
 //! ```text
 //! a, b: const [K]            K = 64
 //! v1  = a + b                 // eqn 0: [K]
-//! s1  = reduce_sum(v1, axis0) // eqn 1: [1]; v1 dies
+//! s1  = reduce_sum(v1, axis0) // eqn 1: one element; v1 dies
 //! c:    const [1]
-//! s2  = reduce_sum(c + c)     // eqn 2: one FusedRow, [1]; reuses v1's freed [K] arena slot
+//! s2  = reduce_sum(c, axis0)  // eqn 2: one element; reuses v1's freed [K] arena slot
 //! out = s1 + s2                // eqn 3
 //! ```
 
@@ -49,10 +49,11 @@ fn fixture() -> (Graph, Arc<WeightStore>, Arc<poot_weights::WeightMap>) {
     let ta = b.constant("a", TensorType::f32(vec![K])).unwrap();
     let tb = b.constant("b", TensorType::f32(vec![K])).unwrap();
     let v1 = b.binary(BinOp::Add, ta, tb).unwrap();
-    let s1 = b.reduce(RedOp::Sum, v1, 0, true).unwrap();
+    // The reductions drop their axis: a row region takes in only a keepdim reduction (and, since POOT-1456, the
+    // pointwise feeding it), so each equation here stays its own dispatch.
+    let s1 = b.reduce(RedOp::Sum, v1, 0, false).unwrap();
     let tc = b.constant("c", TensorType::f32(vec![1])).unwrap();
-    let v2 = b.binary(BinOp::Add, tc, tc).unwrap();
-    let s2 = b.reduce(RedOp::Sum, v2, 0, true).unwrap();
+    let s2 = b.reduce(RedOp::Sum, tc, 0, false).unwrap();
     let out = b.binary(BinOp::Add, s1, s2).unwrap();
     let g = b.finish(out).unwrap();
 
@@ -257,7 +258,7 @@ impl Device for RecordingDevice {
 
 /// SC-002 (the engine's own half of the decoupled-length contract): every dispatch's `Arg::elems`
 /// is the operand's own logical element count - `v1` [64], `s1`/`c`/`s2`/`out` [1] - never a slot's
-/// shared capacity, in particular at eqn 2 (`s2 = reduce_sum(c + c)`), whose output shares `v1`'s freed
+/// shared capacity, in particular at eqn 2 (`s2 = reduce_sum(c)`), whose output shares `v1`'s freed
 /// [64] arena slot but must still publish length 1.
 ///
 /// Mutation (card 547b, applied by hand, reverted, never left in the tree): in
@@ -280,15 +281,11 @@ fn dispatch_args_carry_the_values_own_length_never_the_slots_capacity() {
         .unwrap();
 
     let dispatches = recorder.dispatches.borrow();
-    assert_eq!(
-        dispatches.len(),
-        4,
-        "four equations (`c + c` is folded into its reduce), four dispatches"
-    );
+    assert_eq!(dispatches.len(), 4, "four equations, four dispatches");
     let expected: [(&[usize], usize); 4] = [
         (&[64, 64], 64), // eqn 0: v1 = a + b
         (&[64], 1),      // eqn 1: s1 = reduce_sum(v1)
-        (&[1], 1),       // eqn 2: s2 = reduce_sum(c + c) (output shares v1's freed [64] slot)
+        (&[1], 1),       // eqn 2: s2 = reduce_sum(c) (output shares v1's freed [64] slot)
         (&[1, 1], 1),    // eqn 3: out = s1 + s2
     ];
     for (i, (record, (want_inputs, want_output))) in dispatches.iter().zip(expected).enumerate() {
@@ -359,7 +356,7 @@ fn staged_entries_allocate_one_arena_for_the_values_their_stages_share() {
     {
         let _layer = b.layer_scope(0);
         let v1 = b.binary(BinOp::Add, ta, tb).unwrap();
-        s = b.reduce(RedOp::Sum, v1, 0, true).unwrap();
+        s = b.reduce(RedOp::Sum, v1, 0, false).unwrap();
     }
     let out;
     {
@@ -367,7 +364,7 @@ fn staged_entries_allocate_one_arena_for_the_values_their_stages_share() {
         let wide = b.broadcast(s, vec![K]).unwrap();
         let m1 = b.binary(BinOp::Add, wide, ta).unwrap();
         let m2 = b.binary(BinOp::Mul, m1, tb).unwrap();
-        out = b.reduce(RedOp::Sum, m2, 0, true).unwrap();
+        out = b.reduce(RedOp::Sum, m2, 0, false).unwrap();
     }
     let g = b.finish(out).unwrap();
     let mut names = poot_graph_ir::test_support::const_weights::ConstWeights::new(&store);

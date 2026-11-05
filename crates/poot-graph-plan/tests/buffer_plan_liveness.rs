@@ -100,6 +100,18 @@ fn occupants(program: &Program, slot_of: &dyn Fn(Key) -> Option<usize>) -> Vec<O
                 );
             }
             Plan::Graph => {}
+            // The region's dispatch writes a side output, so it is born where the region runs.
+            Plan::SideOutput { region } => {
+                if slot_of(Key::Value(eqn.out)).is_some() {
+                    let at = program
+                        .graph()
+                        .eqns()
+                        .iter()
+                        .position(|candidate| candidate.out == *region)
+                        .expect("a side output's region is an equation of the program");
+                    born.push((at, eqn.out));
+                }
+            }
         }
     }
     let mut death: HashMap<ValueId, usize> = born.iter().map(|&(i, v)| (v, i)).collect();

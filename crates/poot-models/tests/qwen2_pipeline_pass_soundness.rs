@@ -120,7 +120,7 @@ fn fuse_preserves_qwen2_results_and_shrinks() {
     // reduction-rooted FusedRow regions (each layer's RMSNorm + softmax).
     let pos = 3usize;
     let g = decode_graph(&tiny_qwen2(), 8);
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, poot_graph_plan::RowOutputs::Multiple).unwrap();
     assert!(
         fg.eqns().len() < g.eqns().len(),
         "fusion should drop eqns: {} -> {}",

@@ -215,15 +215,9 @@ fn a_cast_read_by_lone_pointwise_equations_folds_into_each() {
     let scaled = b
         .binary_scalar(BinOp::Mul, pos_f, poot_graph_ir::Scalar::F32(0.5))
         .unwrap();
-    // A reduce keeps the two readers from becoming one region.
-    let out = b
-        .binary(
-            BinOp::Add,
-            b.reduce(poot_graph_ir::RedOp::Sum, keep, 0, true).unwrap(),
-            b.reduce(poot_graph_ir::RedOp::Sum, scaled, 0, true)
-                .unwrap(),
-        )
-        .unwrap();
+    // A concat keeps the two readers from becoming one region: it moves data, so no region takes it in. (Two
+    // reductions joined by an add no longer do: they form one row region with a per-row scalar result.)
+    let out = b.concat(0, &[keep, scaled]).unwrap();
     let pos_id = pos.id();
     let g = b.finish(out).unwrap();
 

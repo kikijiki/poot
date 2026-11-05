@@ -84,11 +84,11 @@ pub(crate) use dtype::collapse_reshape_chains;
 pub use dtype::elide_noop_transposes;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) use dtype::elide_noop_transposes;
-#[cfg(any(test, feature = "test-support"))]
-pub use fuse::fuse;
-#[cfg(not(any(test, feature = "test-support")))]
-pub(crate) use fuse::fuse;
 pub(crate) use fuse::fuse_contraction_epilogues;
+#[cfg(any(test, feature = "test-support"))]
+pub use fuse::{RowOutputs, fuse};
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) use fuse::{RowOutputs, fuse};
 pub(crate) use group_expert_rows::group_expert_rows;
 pub(crate) use guard_witness::first_unobserved_clamp;
 pub use hosted_gather::{HOSTED_ROWS, HostedGather, HostedRows, IndexSource};
@@ -134,7 +134,7 @@ pub fn passes_without_target(g: &Graph) -> Result<Graph, EditError> {
     let g = flash_attention(&rope_fusion(&fold_iota(&g)?)?.0)?.0;
     let g = form_selection(&g)?;
     let g = fuse_contraction_epilogues(&dce(&g)?, |_, _| true)?;
-    fuse_index_casts(&fuse_widening_casts(&fuse(&g)?)?)
+    fuse_index_casts(&fuse_widening_casts(&fuse(&g, RowOutputs::Multiple)?)?)
 }
 
 #[cfg(test)]

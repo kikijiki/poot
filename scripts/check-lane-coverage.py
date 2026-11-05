@@ -107,7 +107,10 @@ def device_lane_path(lane: str) -> Path:
 def load_device_cases(directory: Path) -> tuple[dict[tuple[str, str], str], dict[tuple[str, str], str]]:
     """(binary id, test name) -> lane for every device-lane list row, and the `checkpoint-*` subset of it.
 
-    The device lanes' lists are `binary id<TAB>test name` (`check-required-cases.py` owns their schema checks)."""
+    The device lanes' lists are `binary id<TAB>test name` (`check-required-cases.py` owns their schema checks). Every
+    list of the directory counts, `<lane>.unlisted.txt` and `<lane>.parked.txt` too: a parked row (an `#[ignore]`d,
+    measured, not-yet-passing row naming the card that fixes it) is listed, so it stays covered, while
+    `lane_filter` runs only the rows of `<lane>.txt` itself, so the lane does not run it."""
     every: dict[tuple[str, str], str] = {}
     for path in sorted(directory.glob("*.txt")):
         for line in path.read_text(encoding="ascii").splitlines():

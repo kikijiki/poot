@@ -1240,6 +1240,7 @@ fn rmsnorm_kernel(n_cols: usize, eps: f32) -> kg::RowKernel {
             },
         ],
         output: kg::RowValue::Step(kg::StepId::new(6)),
+        side_outputs: Vec::new(),
     }
 }
 
@@ -1682,6 +1683,7 @@ fn softmax_kernel(n_cols: usize) -> kg::RowKernel {
             },
         ],
         output: kg::RowValue::Step(kg::StepId::new(4)),
+        side_outputs: Vec::new(),
     }
 }
 

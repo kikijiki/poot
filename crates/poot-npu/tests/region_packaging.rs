@@ -352,3 +352,69 @@ fn an_intel_npu_target_packages_the_whole_graph_as_one_region() {
     assert_eq!(artifact.outputs().len(), region.writes().len());
     assert_eq!(artifact.layers().len(), 6);
 }
+
+/// POOT-1456: an AIE core's shape ABI binds one row-width output, so `compile` fuses for it without side outputs
+/// (`RowOutputs::Single`): the norm over a scaled input `r = x * c`, which a later gather reads too, is the
+/// single-output norm region it planned before multi-output regions existed, and `r` stays its own equation. The
+/// same graph fused for a GPU target writes `r` as the region's side output. Mutation: fuse every target with
+/// `RowOutputs::Multiple` in `compile`; the AIE refuses the region, the pass reverts it whole, and the unfused
+/// literal arithmetic has no AIE schedule, so the compile fails.
+#[test]
+fn an_aie_target_fuses_its_row_regions_without_side_outputs() {
+    use poot_graph_ir::{OpKind, RedOp, Scalar, UnOp};
+    let b = Builder::for_tests();
+    let x = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(vec![4, 8]))
+        .unwrap();
+    let c = b.constant("c", TensorType::f32(vec![4, 8])).unwrap();
+    let r = b.binary(BinOp::Mul, x, c).unwrap();
+    let ss = b
+        .reduce(RedOp::Sum, b.binary(BinOp::Mul, r, r).unwrap(), 1, true)
+        .unwrap();
+    let mean = b
+        .binary_scalar(
+            BinOp::Add,
+            b.binary_scalar(BinOp::Mul, ss, Scalar::F32(1.0 / 8.0))
+                .unwrap(),
+            Scalar::F32(1e-6),
+        )
+        .unwrap();
+    let normed = b
+        .binary(BinOp::Div, r, b.unary(UnOp::Sqrt, mean).unwrap())
+        .unwrap();
+    // Gathers read `r` and the normed rows after the norm: no row region takes a gather in.
+    let ids = b
+        .constant("ids", TensorType::new(vec![4], poot_tensor::DType::I32))
+        .unwrap();
+    let out = b
+        .binary(
+            BinOp::Add,
+            b.gather(normed, 0, ids).unwrap(),
+            b.gather(r, 0, ids).unwrap(),
+        )
+        .unwrap();
+    let g = b.finish(out).unwrap();
+    let side_outputs = poot_graph_plan::fuse(&g, poot_graph_plan::RowOutputs::Multiple)
+        .unwrap()
+        .eqns()
+        .iter()
+        .filter(|eqn| matches!(eqn.op, OpKind::SideOutput { .. }))
+        .count();
+    assert_eq!(side_outputs, 1, "fused for a GPU, `r` is a side output");
+    let program = compiled(&g, caps()).expect("the AIE program compiles");
+    let ops: Vec<bool> = program
+        .graph()
+        .eqns()
+        .iter()
+        .map(|eqn| matches!(eqn.op, OpKind::FusedRow(_)))
+        .collect();
+    assert_eq!(ops.iter().filter(|&&row| row).count(), 1, "the norm region");
+    assert!(
+        program
+            .graph()
+            .eqns()
+            .iter()
+            .all(|eqn| !matches!(eqn.op, OpKind::SideOutput { .. })),
+        "no side output on an AIE core"
+    );
+}

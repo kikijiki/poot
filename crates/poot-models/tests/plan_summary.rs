@@ -231,6 +231,9 @@ fn describe_plan(eqn: &Eqn, plan: &Plan, choice: &KernelChoice) -> PlanCells {
             format!("src={src} strides={strides:?} offset={offset}"),
         ),
         Plan::Graph => PlanCells::no_launch("graph", choice, String::new()),
+        Plan::SideOutput { region } => {
+            PlanCells::no_launch("side_output", choice, format!("region={region}"))
+        }
     }
 }
 
@@ -489,7 +492,11 @@ fn plan_digests_match_the_checked_in_file() {
 /// file compiles.
 fn is_loadable(plan: &Plan) -> bool {
     match plan {
-        Plan::Dispatches(_) | Plan::Alias(_) | Plan::View { .. } | Plan::Graph => true,
+        Plan::Dispatches(_)
+        | Plan::Alias(_)
+        | Plan::View { .. }
+        | Plan::Graph
+        | Plan::SideOutput { .. } => true,
     }
 }
 

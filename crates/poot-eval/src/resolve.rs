@@ -47,6 +47,7 @@ pub(crate) fn op_label(op: &OpKind) -> &'static str {
         OpKind::DynamicUpdateSlice { .. } => "dynamic_update_slice",
         OpKind::Fused(_) => "fused",
         OpKind::FusedRow(_) => "fused_row",
+        OpKind::SideOutput { .. } => "side_output",
         OpKind::Attention(_) => "attention",
         OpKind::Rope { .. } => "rope",
         OpKind::Scan(_) => "scan",

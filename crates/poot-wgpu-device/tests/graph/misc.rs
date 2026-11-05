@@ -244,7 +244,7 @@ fn fused_gpu_matches_cpu_over_random_graphs() {
             bcast.id(),
             HostTensor::f32(bshape.clone(), fill(seed * 7 + 101, bnumel)),
         );
-        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        let fg = fuse(&cse(&g).unwrap(), poot_graph_plan::RowOutputs::Multiple).unwrap();
         if fg.eqns().len() < g.eqns().len() {
             fused_total += 1;
         }
@@ -427,7 +427,12 @@ fn movement_gpu_matches_cpu_over_random_graphs() {
             .output
             .into_host()
             .unwrap();
-        let got = run_via_contract(&mut gpu, target, &fuse(&cse(&g).unwrap()).unwrap(), &inputs);
+        let got = run_via_contract(
+            &mut gpu,
+            target,
+            &fuse(&cse(&g).unwrap(), poot_graph_plan::RowOutputs::Multiple).unwrap(),
+            &inputs,
+        );
         assert_eq!(
             got.shape(),
             cpu.shape(),

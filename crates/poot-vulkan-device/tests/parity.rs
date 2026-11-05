@@ -639,3 +639,50 @@ fn expert_grouping_is_block_aligned_and_keeps_every_row_on_vulkan() {
     };
     poot_executor_parity::routing::assert_expert_grouping_on_device(exec.as_mut(), target);
 }
+
+/// POOT-1456 SC-7: a norm, its per-row scale and three narrowed projections of the scaled activation run as one
+/// row kernel writing the activation and its scale (a side output) on raw Vulkan, and every step's output is bit
+/// for bit that of the same block planned as a norm, a scale and a divide kernel; under the exact policy too. The
+/// fused block also matches the CPU oracle of the declared semantics.
+#[test]
+fn a_fused_row_scale_is_bitwise_the_unfused_block_on_vulkan() {
+    let Some((mut exec, t)) = vulkan() else {
+        return;
+    };
+    let pairs = poot_executor_parity::row_scale::row_scale_pairs();
+    for policy in [
+        poot_graph_ir::MatmulPrecision::Narrow,
+        poot_graph_ir::MatmulPrecision::Exact,
+    ] {
+        poot_executor_parity::row_scale::run_fused_against_reference(
+            exec.as_mut(),
+            t,
+            &pairs,
+            policy,
+        )
+        .unwrap_or_else(|e| panic!("{policy:?}: {e}"));
+    }
+    let fused: Vec<_> = pairs.into_iter().map(|(fused, _)| fused).collect();
+    poot_executor_parity::precision::run_parity_declared(
+        exec.as_mut(),
+        t,
+        &fused,
+        poot_graph_ir::MatmulPrecision::Narrow,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// POOT-1457 SC-3 and SC-4 on raw Vulkan: the f16 range guard keeps a past-range block finite and on the oracle, and
+/// leaves an in-range block bit for bit the unguarded f16 one (`poot_executor_parity::f16_range_guard`). Mutation: in
+/// `select_operand_precision` push the narrowed contraction without `emit_row_scaled`; the past-range output is not
+/// finite.
+#[test]
+fn the_f16_range_guard_holds_on_vulkan() {
+    let Some((mut exec, t)) = vulkan() else {
+        return;
+    };
+    poot_executor_parity::f16_range_guard::run_past_range(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+    poot_executor_parity::f16_range_guard::run_in_range_identity(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+}

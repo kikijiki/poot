@@ -524,7 +524,7 @@ mod tests {
             let n = b.unary(UnOp::Neg, x).unwrap();
             let y = b.unary(op, n).unwrap();
             let graph = b.finish(y).unwrap();
-            let fused = fuse(&graph).unwrap();
+            let fused = fuse(&graph, crate::RowOutputs::Multiple).unwrap();
             let eqn = fused
                 .eqns()
                 .iter()

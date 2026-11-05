@@ -351,7 +351,7 @@ fn exact_i32_bit_select_and_closed_fusion_plan_as_i32() {
         }
     }
 
-    let fused = crate::fuse(&g).unwrap();
+    let fused = crate::fuse(&g, crate::RowOutputs::Multiple).unwrap();
     assert_eq!(fused.eqns().len(), 1);
     let eqn = &fused.eqns()[0];
     let (planned_plan, choice) = planned_with_choice(&fused, eqn, Backend::Nvptx).unwrap();
@@ -563,7 +563,7 @@ fn float_select_past_the_grid_ceiling_emits_a_2d_fold() {
     let negated = b
         .unary(GUnOp::Neg, b.select(cond, if_true, if_false).unwrap())
         .unwrap();
-    let fused = crate::fuse(&b.finish(negated).unwrap()).unwrap();
+    let fused = crate::fuse(&b.finish(negated).unwrap(), crate::RowOutputs::Multiple).unwrap();
     assert!(matches!(fused.eqns()[..], [ref eqn] if matches!(eqn.op, OpKind::Fused(_))));
     for (what, g) in [("standalone", &standalone), ("fused", &fused)] {
         let eqn = g.eqns().last().unwrap();
@@ -932,6 +932,44 @@ fn planner_refuses_an_unfolded_iota_with_a_typed_refusal() {
         "unfolded Iota",
     );
     assert_eq!(refusal.missing, Capability::UnfoldedIota);
+}
+
+/// POOT-1456: a row kernel walks the rows its region's first reduction reads, so a row region with no reduction
+/// (well typed, but nothing `fuse` forms) is refused by name. Mutation: plan such a region over the output's shape
+/// instead (`unwrap_or(out_shape)`); the plan succeeds and the row goes red.
+#[test]
+fn planner_refuses_a_row_region_without_a_reduction() {
+    use poot_graph_ir::op::{FusedOp, FusedOperand, LocalId, RowRegion, RowStep};
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+    let output = b.unary(GUnOp::Exp, x).unwrap();
+    let graph = b.finish(output).unwrap();
+    let region = Eqn {
+        op: OpKind::FusedRow(RowRegion {
+            n_inputs: 1,
+            axis: 1,
+            steps: vec![RowStep::Pointwise {
+                op: FusedOp::Unary(GUnOp::Exp),
+                inputs: vec![FusedOperand::Local(LocalId::new(0))],
+            }],
+            output: LocalId::new(1),
+            side_outputs: Vec::new(),
+        }),
+        inputs: vec![Operand::Value(x.id())],
+        out: output.id(),
+        layer: None,
+    };
+    let refusal = refusal_of(
+        plan_eqn(
+            &graph,
+            &region,
+            Backend::SpirvVulkan,
+            &default_caps_for(Backend::SpirvVulkan),
+            &crate::test_support::roomy_body_limits(),
+        ),
+        "row region without a reduction",
+    );
+    assert_eq!(refusal.missing, Capability::RowRegionWithoutReduction);
 }
 
 #[test]
@@ -7017,7 +7055,7 @@ mod family_dtype_admission {
             planned_with_choice_caps(&g, plain, Backend::SpirvVulkan, &caps).is_ok(),
             "a BF16 Binary is wired"
         );
-        let fused = crate::passes::fuse(&g).unwrap();
+        let fused = crate::passes::fuse(&g, crate::RowOutputs::Multiple).unwrap();
         let region = fused
             .eqns()
             .iter()

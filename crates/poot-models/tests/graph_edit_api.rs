@@ -155,7 +155,10 @@ fn every_output_kind_is_retargeted_by_one_pass_and_kept_by_the_next() {
     assert_ne!(f.state_copy, f.primary);
 
     // DCE and fusion keep the same four outputs and still describe a defined graph.
-    for graph in [dce(&merged).unwrap(), fuse(&merged).unwrap()] {
+    for graph in [
+        dce(&merged).unwrap(),
+        fuse(&merged, poot_graph_plan::RowOutputs::Multiple).unwrap(),
+    ] {
         assert!(graph.witnesses().eq(merged.witnesses()));
         assert!(graph.exports().eq(merged.exports()));
         assert_eq!(

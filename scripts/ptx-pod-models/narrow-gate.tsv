@@ -1,0 +1,39 @@
+# The checkpoint files the narrow-gate PTX rows read (narrow_gate_tests::ptx_bf16), for scripts/ptx-pod-lane --models.
+# path under the models dir<TAB>source: an https URL the pod downloads, or "ship" (uploaded from the local models dir)<TAB>sha256
+# Every downloaded file has the sha256 of the local copy the other backends' rows were measured on (gemma-3-1b-it from
+# the unsloth mirror: byte-identical to google/gemma-3-1b-it, which is gated).
+qwen3-0.6b/config.json	ship	660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd
+qwen3-0.6b/generation_config.json	ship	2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2
+qwen3-0.6b/merges.txt	ship	8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5
+qwen3-0.6b/model.safetensors	https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/model.safetensors	f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b
+qwen3-0.6b/tokenizer.json	ship	aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
+qwen3-0.6b/tokenizer_config.json	ship	d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101
+qwen3-0.6b/vocab.json	ship	ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910
+qwen3-4b/config.json	ship	8ba006f74fecfaaeb392872a60f4a480e7ec9860153d2e1b769ec81f9a147f8a
+qwen3-4b/generation_config.json	ship	2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2
+qwen3-4b/merges.txt	ship	8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5
+qwen3-4b/model-00001-of-00003.safetensors	https://huggingface.co/Qwen/Qwen3-4B/resolve/main/model-00001-of-00003.safetensors	328a91d3122359d5547f9d79521205bc0a46e1f79a792dfe650e99fc2d651223
+qwen3-4b/model-00002-of-00003.safetensors	https://huggingface.co/Qwen/Qwen3-4B/resolve/main/model-00002-of-00003.safetensors	6cd087b316306a68c562436b5492edbcf6e16c6dba3a1308279caa5a58e21ca5
+qwen3-4b/model-00003-of-00003.safetensors	https://huggingface.co/Qwen/Qwen3-4B/resolve/main/model-00003-of-00003.safetensors	e4bf436957184f4eeb86a80e9db394503f1f56446b2e6b7edeac5b81470f4ca1
+qwen3-4b/model.safetensors.index.json	ship	6dc0981b8829fead746441f68f38f24c5ca4a3a66351f652c26c6df0efc43ab2
+qwen3-4b/tokenizer.json	ship	aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
+qwen3-4b/tokenizer_config.json	ship	d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101
+qwen3-4b/vocab.json	ship	ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910
+gemma-3-1b-it/added_tokens.json	ship	50b2f405ba56a26d4913fd772089992252d7f942123cc0a034d96424221ba946
+gemma-3-1b-it/chat_template.jinja	ship	7de1c58e208eda46e9c7f86397df37ec49883aeece39fb961e0a6b24088dd3c4
+gemma-3-1b-it/config.json	ship	c5b2136c452797c0c52cba5793ced59d95453dfdc3444433b03e27699ff1c2cd
+gemma-3-1b-it/generation_config.json	ship	faa83f23a56aee7b9722f2a7263f6419341b62496d604a78775aeff9660701c3
+gemma-3-1b-it/model.safetensors	https://huggingface.co/unsloth/gemma-3-1b-it/resolve/main/model.safetensors	3d4ef8d71c14db7e448a09ebe891cfb6bf32c57a9b44499ae0d1c098e48516b6
+gemma-3-1b-it/special_tokens_map.json	ship	45a857d8a2495d0be30a5d2d6de03278195eb028b6e0b8efc248bfa697d65f05
+gemma-3-1b-it/tokenizer.json	ship	4667f2089529e8e7657cfb6d1c19910ae71ff5f28aa7ab2ff2763330affad795
+gemma-3-1b-it/tokenizer.model	ship	1299c11d7cf632ef3b4e11937501358ada021bbdf7c47638d13c0ee982f2e79c
+gemma-3-1b-it/tokenizer_config.json	ship	a622f3103725cffe1f19deed01e8675cea4443bc3eff27680f9484e5dc4acf7b
+llama-3.2-1b-instruct/chat_template.jinja	ship	5816fce10444e03c2e9ee1ef8a4a1ea61ae7e69e438613f3b17b69d0426223a4
+llama-3.2-1b-instruct/config.json	ship	dfb67fd8afe73a1c75245824ef9d64a6ba8983025447e3bf76aa1ea57ee46152
+llama-3.2-1b-instruct/generation_config.json	ship	6d4f979915331212d7672c68b22a4ddad9e21ed8126cf2bd1ea6b2b88f595c1c
+llama-3.2-1b-instruct/model.safetensors	https://huggingface.co/unsloth/Llama-3.2-1B-Instruct/resolve/main/model.safetensors	1ff795ff6a07e6a68085d206fb84417da2f083f68391c2843cd2b8ac6df8538f
+llama-3.2-1b-instruct/special_tokens_map.json	ship	94e708c3f5e64acf85bbe5ad01467a1248faadb73e83b41793087ecced586e8f
+llama-3.2-1b-instruct/tokenizer.json	ship	6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b
+llama-3.2-1b-instruct/tokenizer_config.json	ship	9ddd255c19fe319c8d4e891163540382e9fbda99f394674f2a929efc47d57458
+qwen3-0.6b-gguf/Qwen3-0.6B-Q8_0.gguf	https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf	9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031
+qwen2.5-1.5b-q4km/qwen2.5-1.5b-instruct-q4_k_m.gguf	https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf	6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e

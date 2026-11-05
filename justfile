@@ -499,6 +499,13 @@ test-device-ptx:
         scripts/with-required-backend.sh POOT_REQUIRE_PTX cargo run -p poot-ptx-device --bin ptx-check -- "$stage"
     scripts/check-required-cases.py check ptx {{results}}/device-ptx/results.xml
 
+# The same lane on a rented RunPod SECURE-cloud NVIDIA pod, for a machine with no NVIDIA GPU: builds the archive here,
+# ships it with the toolchain, runs the lane, the staged kernels' `ptx-check` and the required-case gate. Needs
+# RUNPOD_API_KEY; `args` are `--bank-case ID` (repeatable) to also run performance-bank cells on the pod, `--passes N`.
+# See receipts/1453-ptx-pod/README.md. Heavy build: hold /tmp/poot-heavy.lock.
+test-device-ptx-pod *args:
+    scripts/ptx-pod-lane {{args}}
+
 # two-NVIDIA-GPU rows (the captured coordinator's pipeline and tensor-parallel decode across GPUs 0 and 1,
 # POOT-748 and POOT-749, and the production server's requests over both placements, POOT-750): one device
 # required and a second required too (a missing one fails instead of skipping), then the required-case gate

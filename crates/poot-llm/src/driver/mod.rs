@@ -77,6 +77,8 @@ mod llamacpp_kl_tests;
 #[cfg(test)]
 mod llamacpp_longrope_tests;
 #[cfg(test)]
+mod narrow_gate_tests;
+#[cfg(test)]
 mod placed_tests;
 #[cfg(test)]
 mod tests;
@@ -213,7 +215,8 @@ pub fn program_retention(program: &StagedProgram) -> Retention {
                 }
                 poot_graph_plan::Plan::Alias(_)
                 | poot_graph_plan::Plan::View { .. }
-                | poot_graph_plan::Plan::Graph => {}
+                | poot_graph_plan::Plan::Graph
+                | poot_graph_plan::Plan::SideOutput { .. } => {}
             }
         }
     }

@@ -27,9 +27,13 @@ pub(crate) fn store_narrowed_activations(
     plans: impl Fn(&Graph, &[&Eqn]) -> bool,
 ) -> Result<Graph, EditError> {
     let pinned: HashSet<ValueId> = g.pinned_values().collect();
-    // Every read of each value: the reading equation's index and the operand position.
+    // Every read of each value: the reading equation's index and the operand position. A side output projection
+    // names a value its region writes and reads none of its operand's data (POOT-1456), so it is no reader.
     let mut reads: HashMap<ValueId, Vec<(usize, usize)>> = HashMap::new();
     for (e, eqn) in g.eqns().iter().enumerate() {
+        if matches!(eqn.op, OpKind::SideOutput { .. }) {
+            continue;
+        }
         for (position, operand) in eqn.inputs.iter().enumerate() {
             if let Operand::Value(value) = operand {
                 reads.entry(*value).or_default().push((e, position));

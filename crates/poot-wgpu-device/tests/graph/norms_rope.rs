@@ -163,7 +163,11 @@ fn ge_comparison_gpu_matches_cpu() {
         .binary(BinOp::Mul, b2.binary(BinOp::Ge, a2, b2b).unwrap(), c2)
         .unwrap();
     let (a2i, b2i, c2i) = (a2.id(), b2b.id(), c2.id());
-    let g2 = fuse(&cse(&b2.finish(masked).unwrap()).unwrap()).unwrap();
+    let g2 = fuse(
+        &cse(&b2.finish(masked).unwrap()).unwrap(),
+        poot_graph_plan::RowOutputs::Multiple,
+    )
+    .unwrap();
 
     let mut in2 = HashMap::new();
     in2.insert(a2i, HostTensor::f32(vec![1, 1, n], ad));

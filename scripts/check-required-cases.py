@@ -16,6 +16,11 @@ file exists for every lane, empty when the lane's selection is its required list
 to the lane's selection cannot go unclassified (cards 1125, 1218). A row that printed a skip report fails the
 gate whether it is required, unlisted or neither: a skip is never a pass for any row.
 
+A lane may also have `<lane>.parked.txt` (same schema): a measured row that does not pass yet, `#[ignore]`d with the
+same reason, which must name the card that makes it pass (POOT-1454). The lane does not run it, and the lane
+coverage gate (scripts/check-lane-coverage.py) counts it as listed, so the test stays in the inventory and
+visible. A parked row that runs and passes fails the gate until it is moved back to the required list.
+
 The results file is bound to its run. A lane recipe calls `begin <lane> <results>` before the run, which deletes
 the results file and stamps a start marker beside it, and `check <lane> <results>` after it, which rejects a
 results file that is missing, older than the marker, or written by another nextest profile than
@@ -123,6 +128,41 @@ def parse_unlisted_list(path: Path) -> tuple[dict[tuple[str, str], str], list[st
     return rows, problems
 
 
+PARKING_CARD = re.compile(r"\bPOOT-\d+\b")
+
+
+def parse_parked_list(path: Path | None) -> tuple[dict[tuple[str, str], str], list[str]]:
+    """The parked rows of a lane (row -> reason), plus every schema problem in it.
+
+    A parked row is a measured, not-yet-passing row: the test is `#[ignore]`d with the same reason, its lane does
+    not run it, and the reason names the card that makes it pass. The file is optional; a lane without one parks
+    nothing."""
+    if path is None or not path.is_file():
+        return {}, []
+    rows: dict[tuple[str, str], str] = {}
+    problems: list[str] = []
+    data_lines: list[str] = []
+    for lineno, line in enumerate(path.read_text(encoding="ascii").splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 3 or not all(part.strip() for part in parts):
+            problems.append(
+                f"parked-case list malformed at line {lineno}: expected binary_id<TAB>test_name<TAB>reason: {line}"
+            )
+            continue
+        row = (parts[0], parts[1])
+        if row in rows:
+            problems.append(f"parked-case list has a duplicate row: {row[0]} {row[1]}")
+        if not PARKING_CARD.search(parts[2]):
+            problems.append(f"parked row names no card that makes it pass (POOT-NNNN): {row[0]} {row[1]}")
+        rows[row] = parts[2]
+        data_lines.append(f"{parts[0]}\t{parts[1]}")
+    if data_lines != sorted(data_lines):
+        problems.append(f"parked-case list is not in canonical sorted order: {rel(path)}")
+    return rows, problems
+
+
 def skip_report(text: str | None) -> str | None:
     """The first skip-report line in captured output, if it carries one."""
     if not text:
@@ -210,17 +250,23 @@ def check(
     label: str,
     unlisted_path: Path,
     bound_lane: str | None = None,
+    parked_path: Path | None = None,
 ) -> int:
     """Fail unless every required case in list_path ran and passed in results_path.
 
     Every other row of the results must be named in unlisted_path, and a row named there must have run, so the
     classification cannot rot either. A skipped row fails wherever it is listed. bound_lane binds the results
-    file to its run (see `load_results`)."""
+    file to its run (see `load_results`). A parked row (parked_path) is in neither list and is not run; if it
+    runs and passes, it fails the gate until it is moved back to the required list, so a parking cannot outlive
+    its fix."""
     rows, problems = parse_required_list(list_path)
     unlisted, unlisted_problems = parse_unlisted_list(unlisted_path)
-    problems += unlisted_problems
+    parked, parked_problems = parse_parked_list(parked_path)
+    problems += unlisted_problems + parked_problems
     both = sorted(set(rows) & set(unlisted))
     problems += [f"row is both required and unlisted: {b} {t}" for b, t in both]
+    problems += [f"row is both required and parked: {b} {t}" for b, t in sorted(set(rows) & set(parked))]
+    problems += [f"row is both unlisted and parked: {b} {t}" for b, t in sorted(set(unlisted) & set(parked))]
     results: dict[tuple[str, str], tuple[str, str]] | None = None
     if not problems:
         try:
@@ -244,7 +290,12 @@ def check(
                 continue
             if status == "skipped":
                 problems.append(f"unlisted case skipped: {identity[0]} {identity[1]}: {detail}")
-            elif identity not in unlisted and status == "passed":
+            elif identity in parked and status == "passed":
+                problems.append(
+                    f"parked case passed (move it back to {rel(list_path)} and drop its #[ignore]): "
+                    f"{identity[0]} {identity[1]}"
+                )
+            elif identity not in unlisted and identity not in parked and status == "passed":
                 problems.append(
                     f"unclassified passing row (list it in {rel(list_path)} or give it a reason in "
                     f"{rel(unlisted_path)}): {identity[0]} {identity[1]}"
@@ -257,7 +308,10 @@ def check(
             print(problem, file=sys.stderr)
         print(f"required-case gate: {len(problems)} problem(s) for {label}", file=sys.stderr)
         return 1
-    print(f"required cases ({label}): {len(rows)} ran and passed, {len(unlisted)} deliberately unlisted")
+    parked_note = f", {len(parked)} parked" if parked else ""
+    print(
+        f"required cases ({label}): {len(rows)} ran and passed, {len(unlisted)} deliberately unlisted{parked_note}"
+    )
     return 0
 
 
@@ -300,11 +354,13 @@ def run_fixture(
     results_xml: str | None,
     unlisted_text: str | None = "",
     run: "BoundRun | None" = None,
+    parked_text: str | None = None,
 ) -> tuple[int, str]:
     """Run the gate against fixture files; returns its exit status and captured stderr.
 
     unlisted_text None leaves the lane without an unlisted list. run binds the results file to a lane run: its
-    start marker and the age of the results relative to it."""
+    start marker and the age of the results relative to it. parked_text None leaves the lane without a parked
+    list."""
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         list_path = directory / "required.txt"
@@ -320,10 +376,13 @@ def run_fixture(
         unlisted_path = directory / "unlisted.txt"
         if unlisted_text is not None:
             unlisted_path.write_text(unlisted_text, encoding="ascii")
+        parked_path = directory / "parked.txt"
+        if parked_text is not None:
+            parked_path.write_text(parked_text, encoding="ascii")
         captured = io.StringIO()
         with redirect_stderr(captured), redirect_stdout(io.StringIO()):
             status = check(
-                list_path, results_path, "fixture", unlisted_path, run.lane if run else None
+                list_path, results_path, "fixture", unlisted_path, run.lane if run else None, parked_path
             )
     return status, captured.getvalue()
 
@@ -344,9 +403,10 @@ def expect_rejection(
     results_xml: str | None,
     unlisted_text: str | None = "",
     run: BoundRun | None = None,
+    parked_text: str | None = None,
 ) -> bool:
     """The gate must fail the fixture and name the mismatch; a pass here means a mutation lives."""
-    status, output = run_fixture(list_text, results_xml, unlisted_text, run)
+    status, output = run_fixture(list_text, results_xml, unlisted_text, run, parked_text)
     if status == 0:
         print(f"required-case mutation unexpectedly passed: {label}", file=sys.stderr)
         return False
@@ -532,6 +592,30 @@ def self_test() -> int:
     ):
         return 1
 
+    # A parked row (POOT-1454): ignored, not run, named with the card that makes it pass.
+    parked_beta = "poot-wgpu-device::fixture\tbeta_case\tPOOT-9999: misses its ceiling until the guard lands\n"
+    status, output = run_fixture(only_alpha, FIXTURE_ALPHA_ONLY, "", None, parked_beta)
+    if status != 0:
+        print("required-case check rejected a parked row that did not run", file=sys.stderr)
+        print(output, file=sys.stderr)
+        return 1
+    print("required-case check accepted: a parked row that did not run")
+    parking = [
+        # Mutation: drop the parked-and-passed check in `check`; the row reads as parked forever after its fix.
+        ("a parked row that passed", "parked case passed", only_alpha, FIXTURE_GREEN, parked_beta),
+        ("a row both required and parked", "row is both required and parked", FIXTURE_LIST_AB, FIXTURE_GREEN, parked_beta),
+        (
+            "a parked row that names no card",
+            "names no card",
+            only_alpha,
+            FIXTURE_ALPHA_ONLY,
+            "poot-wgpu-device::fixture\tbeta_case\tfails for now\n",
+        ),
+    ]
+    for label, needle, list_text, results_xml, parked_text in parking:
+        if not expect_rejection(label, needle, list_text, results_xml, "", None, parked_text):
+            return 1
+
     # The results file is bound to its run (card 1218, SC-001).
     status, output = run_fixture(FIXTURE_LIST_AB, FIXTURE_GREEN, "", BoundRun("fixture", 1_000_000))
     if status != 0:
@@ -573,6 +657,7 @@ def main(argv: list[str]) -> int:
             lane,
             REQUIRED_DIR / f"{lane}.unlisted.txt",
             lane,
+            REQUIRED_DIR / f"{lane}.parked.txt",
         )
     print(usage, file=sys.stderr)
     return 0 if argv in (["--help"], ["-h"]) else 2

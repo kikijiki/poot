@@ -55,7 +55,7 @@ fn fuse_preserves_the_exact_i32_bit_select_and_clz_chain() {
     // Lane 0 by hand: select(and=0, or=7, xor=7) = 7; or-ed with shl 0, shr 0, not -1, clz 32 = -1.
     assert_eq!(unfused.as_deref().map(|words| words[0]), Some(-1));
 
-    let fused = poot_graph_plan::fuse(&g).unwrap();
+    let fused = poot_graph_plan::fuse(&g, poot_graph_plan::RowOutputs::Multiple).unwrap();
     assert!(
         fused.eqns().len() < g.eqns().len(),
         "fuse must actually rewrite this chain ({} eqns before, {} after)",

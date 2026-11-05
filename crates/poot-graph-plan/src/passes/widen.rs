@@ -167,6 +167,9 @@ fn widen_row_input(region: &mut RowRegion, input: LocalId, to: DType) {
         },
     );
     region.output = widened_local(region.output, input, n);
+    for side in &mut region.side_outputs {
+        *side = widened_local(*side, input, n);
+    }
 }
 
 /// Fold the `Cast` of an I32 value to F32 into the pointwise kernel that reads it or the one that writes it.

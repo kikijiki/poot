@@ -275,7 +275,8 @@ pub fn decompose(
         | OpKind::AllReduce { .. }
         | OpKind::AllGather { .. }
         | OpKind::RandomUniform { .. }
-        | OpKind::SampleToken { .. } => return Ok(None),
+        | OpKind::SampleToken { .. }
+        | OpKind::SideOutput { .. } => return Ok(None),
     };
     // The composite's typing rule and its definition must agree, or the evaluator would publish a value
     // of another type than the equation declares.
@@ -567,10 +568,11 @@ pub(crate) mod tests {
             OpKind::RandomUniform { .. } => 29,
             OpKind::SampleToken { .. } => 30,
             OpKind::ExpertGroup { .. } => 35,
+            OpKind::SideOutput { .. } => 36,
         }
     }
 
-    pub(crate) const VARIANTS: usize = 36;
+    pub(crate) const VARIANTS: usize = 37;
 
     /// The epilogue region `(head + bias) + residual`: local 0 the head result, 1 the bias, 2 the residual.
     fn bias_residual_region() -> FusedRegion {
@@ -669,6 +671,7 @@ pub(crate) mod tests {
                 },
             ],
             output: LocalId::new(5),
+            side_outputs: Vec::new(),
         };
         let i32 = DType::I32;
         let decode = vec![
@@ -821,6 +824,13 @@ pub(crate) mod tests {
             (OpKind::Fused(f32_region), vec![f32(&[3, 4]), f32(&[3, 4])]),
             (OpKind::Fused(i32_region), vec![typed(&[3, 2], i32)]),
             (OpKind::FusedRow(softmax), vec![f32(&[3, 7])]),
+            (
+                OpKind::SideOutput {
+                    index: 0,
+                    ty: f32(&[3, 1]),
+                },
+                vec![f32(&[3, 7])],
+            ),
             (OpKind::Attention(AttentionAttrs::new(2, 0.5, None)), decode),
             (
                 OpKind::Attention(AttentionAttrs::new(2, 0.5, None)),

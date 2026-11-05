@@ -392,6 +392,45 @@ impl From<crate::graph::EditError> for BuilderError {
     }
 }
 
+/// Why a multi-output region and its projections do not pair (POOT-1456,
+/// [`GraphValidationError::SideOutputPairing`]).
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SideOutputReason {
+    /// The projection's operand is not the result of a `FusedRow` equation.
+    #[error("the operand is not the result of a row region")]
+    NotARegionResult,
+    /// The projection names a side output the region does not have.
+    #[error("side output {index} of a region with {sides}")]
+    NoSuchSideOutput {
+        /// The side output named.
+        index: usize,
+        /// How many side outputs the region has.
+        sides: usize,
+    },
+    /// The projection's declared type is not the type of the region's local.
+    #[error("declares side output {index} as {declared}, the region's local is {local}")]
+    TypeMismatch {
+        /// The side output named.
+        index: usize,
+        /// The projection's type.
+        declared: TensorType,
+        /// The region local's type.
+        local: TensorType,
+    },
+    /// A second projection of one side output.
+    #[error("side output {index} is projected twice")]
+    ProjectedTwice {
+        /// The side output named.
+        index: usize,
+    },
+    /// A region's side output has no projection: its kernel would write a buffer nothing names.
+    #[error("side output {index} has no projection")]
+    NotProjected {
+        /// The side output with none.
+        index: usize,
+    },
+}
+
 /// A structural or binding-table failure of a graph draft, reported by [`crate::GraphEdit::commit`] as
 /// [`crate::EditError::Invalid`].
 ///
@@ -640,6 +679,17 @@ pub enum GraphValidationError {
         stored: TensorType,
         /// The type inference computed.
         inferred: TensorType,
+    },
+    /// A side output of a multi-output region is not paired with exactly one projection of its type
+    /// (POOT-1456): the equation is the projection, or the region whose side output has none.
+    #[error("eqn {equation} ({operation}): {reason}")]
+    SideOutputPairing {
+        /// The index of the equation.
+        equation: usize,
+        /// The name of the equation's operation.
+        operation: String,
+        /// What is unpaired.
+        reason: SideOutputReason,
     },
     /// The primary result is never defined.
     #[error("output {value} not defined")]

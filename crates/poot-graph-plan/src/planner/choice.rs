@@ -30,6 +30,8 @@ pub enum NoDispatch {
     View,
     /// The equation is a node of the target's graph artifact (an Intel NPU's vendor-compiled graph).
     Graph,
+    /// The output is a side output another equation's dispatch writes (POOT-1456).
+    SideOutput,
 }
 
 /// The kernel the planner chose for one equation.
@@ -156,10 +158,14 @@ impl PlannedDispatch {
 }
 
 /// The binding of a dispatch over an equation's value operands: the kernel's params are `[operands..,
-/// meta?, out]`, so the operand count is what is left after the metadata buffer and the output.
-fn eqn_binding(body: &Body, launch: &Launch) -> Binding {
+/// meta?, side writes.., out]`, so the operand count is what is left after the metadata buffer, the request's
+/// side writes ([`KernelRequest::side_writes`]) and the output.
+fn eqn_binding(body: &Body, launch: &Launch, side_writes: usize) -> Binding {
     let meta = usize::from(!launch.meta.is_empty());
-    Binding::eqn(body.params().count().saturating_sub(meta + 1))
+    Binding::eqn_with_side_writes(
+        body.params().count().saturating_sub(meta + side_writes + 1),
+        side_writes,
+    )
 }
 
 /// A one-dispatch plan with no scratch. Its binding is the equation's own, so only a kernel whose
@@ -194,7 +200,13 @@ impl Built {
             grid: launch.grid,
             meta: launch.meta.unwrap_or_default(),
         };
-        let binding = eqn_binding(&body, &launch);
+        let side_writes = match &choice {
+            KernelChoice::Generated(request) | KernelChoice::Serialized { request, .. } => {
+                request.side_writes()
+            }
+            KernelChoice::Imported { .. } | KernelChoice::NoDispatch(_) => 0,
+        };
+        let binding = eqn_binding(&body, &launch, side_writes);
         PlannedDispatch {
             dispatch: Dispatch::new(body, key, label, launch, binding, choice),
         }
@@ -421,7 +433,7 @@ impl Planned {
             grid,
             meta: meta.unwrap_or_default(),
         };
-        let binding = eqn_binding(&body, &launch);
+        let binding = eqn_binding(&body, &launch, 0);
         PlannedDispatch {
             dispatch: Dispatch::new(body, key, label, launch, binding, choice),
         }
@@ -476,6 +488,11 @@ impl Planned {
     /// An equation that lowers to a node of the target's graph artifact.
     pub(crate) fn graph() -> Self {
         Self::no_dispatch(Plan::Graph, NoDispatch::Graph)
+    }
+
+    /// A side output of the region whose result is `region`: that region's dispatch writes it (POOT-1456).
+    pub(crate) fn side_output(region: ValueId) -> Self {
+        Self::no_dispatch(Plan::SideOutput { region }, NoDispatch::SideOutput)
     }
 
     fn no_dispatch(plan: Plan, kind: NoDispatch) -> Self {
@@ -768,7 +785,7 @@ mod tests {
         };
         let row = |width: usize| {
             KernelRequest::Row(RowSpec::Fused {
-                out_shape: vec![4],
+                row_shape: vec![4],
                 numel: 4,
                 leaves: vec![leaf()],
                 kernel: RowKernel {
@@ -780,6 +797,7 @@ mod tests {
                         inputs: vec![FusedInput::Leaf(LeafId::new(0))],
                     }],
                     output: RowValue::Step(StepId::new(0)),
+                    side_outputs: Vec::new(),
                 },
                 width,
             })

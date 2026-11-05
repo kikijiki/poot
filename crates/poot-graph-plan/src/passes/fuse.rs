@@ -145,15 +145,27 @@ fn row_fits(shape: &[usize], l: &[usize], n: usize) -> bool {
         && (shape[l.len()] == n || shape[l.len()] == 1)
 }
 
-/// The leaf/local layout of a fused region: the root eqn (its escaping output), the external value-operand
-/// leaves in first-encounter order, and the outer-`ValueId` -> region-local map (leaves `0..n_inputs`,
-/// then each member's output). Shared by pointwise and row-wise region building.
-fn region_layout(
-    g: &Graph,
-    members: &[usize],
-    producer: &ValueTable<Option<usize>>,
-) -> (usize, Vec<ValueId>, HashMap<ValueId, LocalId>) {
-    let member_set: HashSet<usize> = members.iter().copied().collect();
+/// Which row regions [`fuse`] forms (POOT-1456). A region with side outputs, or with a per-row scalar result, is
+/// one kernel writing several values, or one value per row; a target whose row kernels bind one row-width output
+/// (an AIE core's shape ABI) is fused without them, so its planner is never handed a region the single-output
+/// grouping would have planned and the pass revert would then take apart whole.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        unreachable_pub,
+        reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
+    )
+)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowOutputs {
+    /// Side outputs and per-row scalar results: a GPU target's row kernel writes any number of either.
+    Multiple,
+    /// One row-width output per region, from single-use values only.
+    Single,
+}
+
+/// The root of a pointwise region: the one member whose output no member reads, its escaping value.
+fn pointwise_root(g: &Graph, members: &[usize]) -> usize {
     let consumed_internally = |out: ValueId| -> bool {
         members.iter().any(|&m| {
             g.eqns()[m]
@@ -162,11 +174,143 @@ fn region_layout(
                 .any(|o| matches!(o, Operand::Value(v) if *v == out))
         })
     };
-    let root = *members
+    *members
         .iter()
         .find(|&&m| !consumed_internally(g.eqns()[m].out))
-        .expect("a fused region has exactly one escaping (root) output");
+        .expect("a fused region has exactly one escaping (root) output")
+}
 
+/// The members of one row region, in program order, and the `(leading dims L, N)` signature every member's
+/// value fits (a row `L ++ [N]` or a per-row scalar `L ++ [1]`).
+struct RowGroup {
+    members: Vec<usize>,
+    lead: Vec<usize>,
+    cols: usize,
+}
+
+impl RowGroup {
+    /// The last member: where the region's equation sits, and its result.
+    fn last(&self) -> usize {
+        *self
+            .members
+            .last()
+            .expect("a row group has at least two members")
+    }
+
+    /// Whether the region can sit at the group's last member and write every value read outside it (POOT-1456):
+    /// each such read comes after that member, and only the last member's value may be pinned (a graph output or
+    /// carried state is the region's result, never a side output).
+    fn is_legal(
+        &self,
+        g: &Graph,
+        readers: &ValueTable<Vec<usize>>,
+        pinned: &HashSet<ValueId>,
+    ) -> bool {
+        let last = self.last();
+        let members: HashSet<usize> = self.members.iter().copied().collect();
+        self.members.iter().all(|&m| {
+            let out = g.eqns()[m].out;
+            (m == last || !pinned.contains(&out))
+                && readers[out]
+                    .iter()
+                    .all(|reader| members.contains(reader) || *reader > last)
+        })
+    }
+}
+
+/// Group the row candidates `within` into row regions: union two candidates over a value `joins` admits when
+/// one `(L, N)` signature, seeded from a last-axis reduction, covers both ends; grown to a fixpoint. The groups
+/// of two or more members that hold a reduction, in program order of their last member.
+fn row_groups_of(
+    g: &Graph,
+    producer: &ValueTable<Option<usize>>,
+    joins: impl Fn(ValueId) -> bool,
+    within: impl Fn(usize) -> bool,
+) -> Vec<RowGroup> {
+    let n_eqns = g.eqns().len();
+    let candidate = |e: usize| within(e) && is_row_candidate(g, &g.eqns()[e]);
+    let mut ds = DisjointSet::new(n_eqns);
+    let mut sig: HashMap<usize, (Vec<usize>, usize)> = HashMap::new();
+    for (e, eqn) in g.eqns().iter().enumerate() {
+        if within(e)
+            && row_reduce_op(g, eqn).is_some()
+            && let Some(Operand::Value(v)) = eqn.inputs.first()
+        {
+            let s = &g.aval(*v).shape;
+            let k = s.len();
+            sig.insert(e, (s[..k - 1].to_vec(), s[k - 1]));
+        }
+    }
+    // grow to a fixpoint: an edge joins two candidates when a consistent signature covers both ends.
+    loop {
+        let mut changed = false;
+        for (e, eqn) in g.eqns().iter().enumerate() {
+            if !candidate(e) {
+                continue;
+            }
+            for o in &eqn.inputs {
+                let Operand::Value(v) = o else { continue };
+                if !joins(*v) {
+                    continue;
+                }
+                let Some(pe) = producer[*v] else { continue };
+                if !candidate(pe) {
+                    continue;
+                }
+                let (re, rp) = (ds.find(e), ds.find(pe));
+                if re == rp {
+                    continue;
+                }
+                let sg = match (sig.get(&re), sig.get(&rp)) {
+                    (Some(a), Some(b)) if a == b => Some(a.clone()),
+                    (Some(_), Some(_)) => None, // conflicting signatures: do not merge
+                    (Some(a), None) | (None, Some(a)) => Some(a.clone()),
+                    (None, None) => None,
+                };
+                let Some((l, n)) = sg else { continue };
+                if row_fits(&g.aval(eqn.out).shape, &l, n) && row_fits(&g.aval(*v).shape, &l, n) {
+                    ds.union(e, pe);
+                    sig.insert(ds.find(e), (l, n));
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // collect row components (those with a signature, i.e. containing a reduce), members in program order.
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for e in 0..n_eqns {
+        if candidate(e) {
+            let r = ds.find(e);
+            if sig.contains_key(&r) {
+                groups.entry(r).or_default().push(e);
+            }
+        }
+    }
+    let mut groups: Vec<RowGroup> = groups
+        .into_iter()
+        .filter(|(_, members)| members.len() >= 2)
+        .map(|(rep, members)| RowGroup {
+            members,
+            lead: sig[&rep].0.clone(),
+            cols: sig[&rep].1,
+        })
+        .collect();
+    groups.sort_by_key(RowGroup::last);
+    groups
+}
+
+/// The leaf/local layout of a fused region: the external value-operand leaves in first-encounter order, and the
+/// outer-`ValueId` -> region-local map (leaves `0..n_inputs`, then each member's output). Shared by pointwise
+/// and row-wise region building.
+fn region_layout(
+    g: &Graph,
+    members: &[usize],
+    producer: &ValueTable<Option<usize>>,
+) -> (Vec<ValueId>, HashMap<ValueId, LocalId>) {
+    let member_set: HashSet<usize> = members.iter().copied().collect();
     let mut local_of: HashMap<ValueId, LocalId> = HashMap::new();
     let mut leaves: Vec<ValueId> = Vec::new();
     for &m in members {
@@ -184,7 +328,7 @@ fn region_layout(
     for (s, &m) in members.iter().enumerate() {
         local_of.insert(g.eqns()[m].out, LocalId::new(n_inputs + s));
     }
-    (root, leaves, local_of)
+    (leaves, local_of)
 }
 
 /// Map an outer operand to a region operand, given the local map.
@@ -316,6 +460,10 @@ fn to_i32_region_operand(o: &Operand, operand_of: &HashMap<ValueId, FusedOperand
 /// whose steps stay in `Ge`/`GeU`/`Sub`/`Add`/`Mul`, `Not`/`Clz` and `Select`, and whose packed
 /// last-axis concat is carried by the region's `pack`. The exact-I32 evaluator has a `Fused` arm for
 /// exactly that subset (`poot-eval/src/exact_i32.rs`), so the region is supported rather than dropped.
+///
+/// `rows` says which row regions form (POOT-1456): under [`RowOutputs::Multiple`] a region takes in a value read
+/// outside it too (a side output, named by an [`OpKind::SideOutput`] after the region) and may end in a per-row
+/// scalar; under [`RowOutputs::Single`] it takes in single-use values only and ends in a row-width value.
 #[cfg_attr(
     not(any(test, feature = "test-support")),
     allow(
@@ -323,7 +471,7 @@ fn to_i32_region_operand(o: &Operand, operand_of: &HashMap<ValueId, FusedOperand
         reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
     )
 )]
-pub fn fuse(g: &Graph) -> Result<Graph, EditError> {
+pub fn fuse(g: &Graph, rows: RowOutputs) -> Result<Graph, EditError> {
     // First turn data-no-op transposes into (free) reshapes so they cost no dispatch on the launch-bound
     // decode; the fusion grouping below treats both as movement boundaries, so this only removes launches.
     // Then collapse the reshape chains that elision exposes (seq-1 attention q/k/v), shrinking the graph.
@@ -350,90 +498,68 @@ pub fn fuse(g: &Graph) -> Result<Graph, EditError> {
     let mut claimed: HashSet<usize> = HashSet::new(); // every eqn in some region (excluded from later phases)
 
     // --- Phase A: row-wise (reduction-rooted) regions ------------------------------------------------
-    // union candidates whose shapes fit a common (L, N) signature seeded from the reductions.
-    let mut ds = DisjointSet::new(n_eqns);
-    let mut sig: HashMap<usize, (Vec<usize>, usize)> = HashMap::new();
+    // Every read of each value, by reading equation.
+    let mut readers: ValueTable<Vec<usize>> = ValueTable::filled(n_vals, Vec::new());
     for (e, eqn) in g.eqns().iter().enumerate() {
-        if row_reduce_op(g, eqn).is_some()
-            && let Some(Operand::Value(v)) = eqn.inputs.first()
-        {
-            let s = &g.aval(*v).shape;
-            let k = s.len();
-            sig.insert(e, (s[..k - 1].to_vec(), s[k - 1]));
-        }
-    }
-    // grow to a fixpoint: an edge joins two candidates when a consistent signature covers both ends.
-    loop {
-        let mut changed = false;
-        for (e, eqn) in g.eqns().iter().enumerate() {
-            if !is_row_candidate(g, eqn) {
-                continue;
-            }
-            for o in &eqn.inputs {
-                let Operand::Value(v) = o else { continue };
-                if !single_use(*v) {
-                    continue;
-                }
-                let Some(pe) = producer[*v] else { continue };
-                if !is_row_candidate(g, &g.eqns()[pe]) {
-                    continue;
-                }
-                let (re, rp) = (ds.find(e), ds.find(pe));
-                if re == rp {
-                    continue;
-                }
-                let sg = match (sig.get(&re), sig.get(&rp)) {
-                    (Some(a), Some(b)) if a == b => Some(a.clone()),
-                    (Some(_), Some(_)) => None, // conflicting signatures: do not merge
-                    (Some(a), None) | (None, Some(a)) => Some(a.clone()),
-                    (None, None) => None,
-                };
-                let Some((l, n)) = sg else { continue };
-                if row_fits(&g.aval(g.eqns()[e].out).shape, &l, n)
-                    && row_fits(&g.aval(*v).shape, &l, n)
-                {
-                    ds.union(e, pe);
-                    sig.insert(ds.find(e), (l, n));
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    // collect row components (those with a signature, i.e. containing a reduce).
-    let mut row_groups: HashMap<usize, Vec<usize>> = HashMap::new();
-    for e in 0..n_eqns {
-        if is_row_candidate(g, &g.eqns()[e]) {
-            let r = ds.find(e);
-            if sig.contains_key(&r) {
-                row_groups.entry(r).or_default().push(e);
+        for o in &eqn.inputs {
+            if let Operand::Value(v) = o {
+                readers[*v].push(e);
             }
         }
     }
-    for (rep, members) in &row_groups {
-        if members.len() < 2 {
-            continue;
+    // A row region may absorb a producer whose value is also read outside it (POOT-1456): the value becomes a
+    // side output the region's kernel writes too. The region's equation sits at its last member, so a grouping is
+    // legal only when every outside read of a member comes after that member: then no outside equation lies on a
+    // path between two members (the reachability rule of XLA's multi-output fusion). A group that is not falls
+    // back to the single-use grouping of its equations, whose one escaping value is its last member.
+    let row_groups: Vec<RowGroup> = match rows {
+        RowOutputs::Multiple => {
+            let shared = |v: ValueId| !pinned.contains(&v);
+            let mut row_groups: Vec<RowGroup> = Vec::new();
+            let mut regroup: HashSet<usize> = HashSet::new();
+            for group in row_groups_of(g, &producer, shared, |_| true) {
+                if group.is_legal(g, &readers, &pinned) {
+                    row_groups.push(group);
+                } else {
+                    regroup.extend(group.members.iter().copied());
+                }
+            }
+            if !regroup.is_empty() {
+                row_groups.extend(row_groups_of(g, &producer, single_use, |e| {
+                    regroup.contains(&e)
+                }));
+            }
+            row_groups
         }
-        let (l, n) = &sig[rep];
-        let (n, axis) = (*n, l.len());
-        let (root, leaves, local_of) = region_layout(g, members, &producer);
-        // The FusedRow kernel requires its output (root) to be a row-width value: it derives n_cols, the
-        // leaf strides, num_rows, and the output layout from the root eqn's shape, assuming its reduced
-        // axis is the full row width `n`. If the region output is reduced (axis size != n) the kernel
-        // iterates 1 column instead of the full row. Two ways to get a reduced output: (a) the root is a
-        // bare reduce, and (b) the root is a scalar pointwise applied to a reduce (e.g. `quant_scale_kv`
-        // = `reduce_max(|x|) * (1/127)`, output `[..,1]`); case (b) once slipped past a "root is a
-        // reduce" guard and produced garbage on real KV-quant weights (uniform synthetic weights masked
-        // it, since reducing 1 column ~= the true absmax). The condition is the output shape's reduced
-        // axis == the full width. rmsnorm/softmax are fine: their reduce is internal and the root is a
-        // row-width pointwise. When the output is reduced, skip the region: the pointwise members fall
-        // to the pointwise-fusion phase and the reduce(s) stay plain `Reduce` ops. Fusing into a
-        // reduce-output region would need the reduce width carried separately from the output width.
-        if g.aval(g.eqns()[root].out).shape.get(axis) != Some(&n) {
-            continue;
-        }
+        // One row-width output per region: single-use edges, and no region whose result is a per-row scalar.
+        RowOutputs::Single => row_groups_of(g, &producer, single_use, |_| true)
+            .into_iter()
+            .filter(|group| {
+                g.aval(g.eqns()[group.last()].out)
+                    .shape
+                    .get(group.lead.len())
+                    == Some(&group.cols)
+            })
+            .collect(),
+    };
+    // The side output projections of each region, by the region's equation index: emitted right after it.
+    let mut projections: HashMap<usize, Vec<Eqn>> = HashMap::new();
+    for group in &row_groups {
+        let members = &group.members;
+        let member_set: HashSet<usize> = members.iter().copied().collect();
+        let root = group.last();
+        let (leaves, local_of) = region_layout(g, members, &producer);
+        // The members read outside the region besides its result, in program order: its side outputs.
+        let sides: Vec<usize> = members
+            .iter()
+            .copied()
+            .filter(|&m| {
+                m != root
+                    && readers[g.eqns()[m].out]
+                        .iter()
+                        .any(|reader| !member_set.contains(reader))
+            })
+            .collect();
         let steps: Vec<RowStep> = members
             .iter()
             .map(|&m| {
@@ -455,20 +581,40 @@ pub fn fuse(g: &Graph) -> Result<Graph, EditError> {
                 }
             })
             .collect();
+        let result = g.eqns()[root].out;
         let region = RowRegion {
             n_inputs: leaves.len(),
-            axis,
+            axis: group.lead.len(),
             steps,
-            output: local_of[&g.eqns()[root].out],
+            output: local_of[&result],
+            side_outputs: sides.iter().map(|&m| local_of[&g.eqns()[m].out]).collect(),
         };
         fused_at.insert(
             root,
             Eqn {
                 op: OpKind::FusedRow(region),
                 inputs: leaves.into_iter().map(Operand::Value).collect(),
-                out: g.eqns()[root].out,
+                out: result,
                 layer: g.eqns()[root].layer,
             },
+        );
+        // Each side output keeps its value id, now defined by its projection of the region's result. The projection
+        // is the region's, so it carries the region's layer: a region may take in the previous layer's residual.
+        projections.insert(
+            root,
+            sides
+                .iter()
+                .enumerate()
+                .map(|(index, &m)| Eqn {
+                    op: OpKind::SideOutput {
+                        index,
+                        ty: g.aval(g.eqns()[m].out).clone(),
+                    },
+                    inputs: vec![Operand::Value(result)],
+                    out: g.eqns()[m].out,
+                    layer: g.eqns()[root].layer,
+                })
+                .collect(),
         );
         for &m in members {
             claimed.insert(m);
@@ -506,14 +652,6 @@ pub fn fuse(g: &Graph) -> Result<Graph, EditError> {
     // A producer read more than once fuses too when every read is by a member of one region (a diamond:
     // the activation compositions read their input twice, `x / (1 + exp(-x))`). Its value then never
     // escapes the region, so legality is the single-use rule's: no outside reader, no pinned value.
-    let mut readers: ValueTable<Vec<usize>> = ValueTable::filled(n_vals, Vec::new());
-    for (e, eqn) in g.eqns().iter().enumerate() {
-        for o in &eqn.inputs {
-            if let Operand::Value(v) = o {
-                readers[*v].push(e);
-            }
-        }
-    }
     loop {
         let mut changed = false;
         for pe in (0..n_eqns).filter(|&pe| f32_pointwise(pe)) {
@@ -547,7 +685,8 @@ pub fn fuse(g: &Graph) -> Result<Graph, EditError> {
         if members.len() < 2 {
             continue;
         }
-        let (root, leaves, local_of) = region_layout(g, members, &producer);
+        let root = pointwise_root(g, members);
+        let (leaves, local_of) = region_layout(g, members, &producer);
         let steps: Vec<FusedStep> = members
             .iter()
             .map(|&m| FusedStep {
@@ -584,12 +723,13 @@ pub fn fuse(g: &Graph) -> Result<Graph, EditError> {
     fuse_i32_pack_concat(g, &producer, &pinned, &mut fused_at, &mut absorbed);
     fuse_closed_i32_pointwise(g, &producer, &pinned, &mut fused_at, &mut absorbed);
 
-    // rebuild the eqn list in order: a root emits its fused eqn, an absorbed member is dropped, the rest
-    // pass through.
+    // rebuild the eqn list in order: a root emits its fused eqn and then a row region's side output
+    // projections, an absorbed member is dropped, the rest pass through.
     let mut eqns: Vec<Eqn> = Vec::with_capacity(n_eqns);
     for (e, eqn) in g.eqns().iter().enumerate() {
         if let Some(fe) = fused_at.remove(&e) {
             eqns.push(fe);
+            eqns.extend(projections.remove(&e).into_iter().flatten());
         } else if !absorbed.contains(&e) {
             eqns.push(eqn.clone());
         }
@@ -1184,7 +1324,7 @@ mod tests {
         let r = b.unary(UnOp::Recip, e).unwrap();
         let graph = b.finish(r).unwrap();
 
-        let fused = fuse(&graph).unwrap();
+        let fused = fuse(&graph, crate::RowOutputs::Multiple).unwrap();
         let region = single_fused_region(&fused);
         assert_eq!(
             region.steps.len(),
@@ -1226,7 +1366,7 @@ mod tests {
         let out = poot_graph_ir::ops::silu(&b, sum).unwrap();
         let graph = b.finish(out).unwrap();
 
-        let fused = fuse(&graph).unwrap();
+        let fused = fuse(&graph, crate::RowOutputs::Multiple).unwrap();
         let region = single_fused_region(&fused);
         assert_eq!(
             region.steps.len(),
@@ -1256,7 +1396,7 @@ mod tests {
             .unwrap();
         let graph = b.finish(out).unwrap();
 
-        let fused = fuse(&graph).unwrap();
+        let fused = fuse(&graph, crate::RowOutputs::Multiple).unwrap();
         let plain_adds = fused
             .eqns()
             .iter()

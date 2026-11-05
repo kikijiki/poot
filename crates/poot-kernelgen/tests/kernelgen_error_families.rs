@@ -34,6 +34,7 @@ fn fused_family_rejects_leaf_count_mismatch_and_zero_width() {
         n_cols: 4,
         steps: vec![],
         output: poot_kernelgen::RowValue::Leaf(poot_kernelgen::LeafId::new(0)),
+        side_outputs: Vec::new(),
     };
     let layouts = vec![poot_kernelgen::Layout::contiguous(&[4])];
     let err = poot_kernelgen::fused_row_parallel_views("t", &[4], &[&[4]], &layouts, &krk, 0, 1)

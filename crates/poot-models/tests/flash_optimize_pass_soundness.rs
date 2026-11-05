@@ -382,7 +382,8 @@ fn flash_default_cuts_prefill_dispatch_count() {
         .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
     assert_eq!(n_flash, layers, "one Attention per layer");
-    let no_flash = dispatch_count(&fuse(&cse(&g).unwrap()).unwrap());
+    let no_flash =
+        dispatch_count(&fuse(&cse(&g).unwrap(), poot_graph_plan::RowOutputs::Multiple).unwrap());
     let with_flash = dispatch_count(&passes_without_target(&g).unwrap());
     assert!(
         with_flash < no_flash,
@@ -401,7 +402,8 @@ fn flash_default_cuts_decode_dispatch_count() {
     let layers = 4;
     let cap = 8;
     let g = trace(&tiny_qwen2(layers, 16), 1, 1, cap);
-    let no_flash = dispatch_count(&fuse(&cse(&g).unwrap()).unwrap());
+    let no_flash =
+        dispatch_count(&fuse(&cse(&g).unwrap(), poot_graph_plan::RowOutputs::Multiple).unwrap());
     let with_flash = dispatch_count(&passes_without_target(&g).unwrap());
     let saved = no_flash - with_flash;
     eprintln!(

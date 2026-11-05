@@ -122,7 +122,9 @@ fn options(chunk: usize, capacity: usize) -> DriverOptions {
         charge: program_retention,
         draft: poot_llm::driver::DraftPolicy::Off,
         hidden_window: None,
-        matmul_precision: None,
+        // Design 6.4 (POOT-1438): this row compares raw Vulkan with wgpu and with tokens recorded under f32
+        // semantics; pinned to the exact class so the row holds when the engine default narrows.
+        matmul_precision: Some(poot_llm::driver::MatmulPrecision::Exact),
     }
 }
 

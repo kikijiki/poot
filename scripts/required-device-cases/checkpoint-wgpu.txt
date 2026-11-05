@@ -60,6 +60,12 @@ poot-llm	driver::device_tests::checkpoint::smollm2_gguf_coherent::wgpu
 poot-llm	driver::device_tests::checkpoint::smollm3_coherent::wgpu
 poot-llm	driver::device_tests::checkpoint::smollm3_gguf_oracle::wgpu
 poot-llm	driver::device_tests::checkpoint::tinyllama_coherent::wgpu
+poot-llm	driver::narrow_gate_tests::wgpu_f16::gemma_3_1b_it
+poot-llm	driver::narrow_gate_tests::wgpu_f16::llama_3_2_1b_instruct
+poot-llm	driver::narrow_gate_tests::wgpu_f16::qwen2_5_1_5b_q4_k_m
+poot-llm	driver::narrow_gate_tests::wgpu_f16::qwen3_0_6b
+poot-llm	driver::narrow_gate_tests::wgpu_f16::qwen3_0_6b_q8_0
+poot-llm	driver::narrow_gate_tests::wgpu_f16::qwen3_4b
 poot-llm::coherence	bge_cls_pooling_separates_related
 poot-llm::coherence	cross_encoder_reranks
 poot-llm::coherence	minilm_encoder_reranks

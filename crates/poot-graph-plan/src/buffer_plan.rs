@@ -215,6 +215,15 @@ pub(crate) fn plan_buffers(
             }
         }
     }
+    // A side output is written by its region's dispatch (POOT-1456), so its buffer is born where that equation
+    // runs, with the region's own output, never at the projection after it: a slot freed by the region's operands
+    // is not free while the region still reads them.
+    let defined_at: HashMap<ValueId, usize> = g
+        .eqns()
+        .iter()
+        .enumerate()
+        .map(|(eqn_idx, eqn)| (eqn.out, eqn_idx))
+        .collect();
     let mut roots: ValueTable<ValueId> = g.values().ids().collect();
     let mut birth: HashMap<BufferKey, usize> = HashMap::new();
     let mut death: HashMap<BufferKey, usize> = HashMap::new();
@@ -264,7 +273,11 @@ pub(crate) fn plan_buffers(
             continue;
         };
         let key = BufferKey::Value(eqn.out);
-        birth.insert(key, at[eqn_idx]);
+        let born = match plan {
+            Plan::SideOutput { region } => at[defined_at[region]],
+            Plan::Dispatches(_) | Plan::Graph | Plan::Alias(_) | Plan::View { .. } => at[eqn_idx],
+        };
+        birth.insert(key, born);
         death.insert(key, at[eqn_idx]);
         elems.insert(key, value_elems);
         store_of.insert(key, value_storage);

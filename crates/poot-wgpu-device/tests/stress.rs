@@ -823,7 +823,11 @@ fn deep_fused_chain_gpu_matches_cpu() {
     let x = b.binary(BinOp::Add, x, c).unwrap();
     let x = b.binary(BinOp::Mul, x, x).unwrap();
     let (ai, ci) = (a.id(), c.id());
-    let g = fuse(&cse(&b.finish(x).unwrap()).unwrap()).unwrap();
+    let g = fuse(
+        &cse(&b.finish(x).unwrap()).unwrap(),
+        poot_graph_plan::RowOutputs::Multiple,
+    )
+    .unwrap();
 
     let mut inputs = HashMap::new();
     inputs.insert(ai, HostTensor::f32(vec![n], fill(13001, n)));

@@ -65,7 +65,7 @@ fn fused_pointwise_chain_is_bit_identical_to_unfused() {
     let (ai, bi, ci) = (a.id(), bb.id(), c.id());
     let g = b.finish(out).unwrap();
 
-    let fg = fuse(&g).unwrap();
+    let fg = fuse(&g, poot_graph_plan::RowOutputs::Multiple).unwrap();
     assert_eq!(fg.eqns().len(), 1, "the 4-op chain fuses to one eqn");
 
     let mut inputs = HashMap::new();
@@ -146,7 +146,7 @@ fn fused_equals_unfused_over_random_pointwise_graphs() {
                 )),
             );
         }
-        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        let fg = fuse(&cse(&g).unwrap(), poot_graph_plan::RowOutputs::Multiple).unwrap();
         if fg.eqns().len() < g.eqns().len() {
             fused_count += 1;
         }
@@ -278,7 +278,7 @@ fn fused_equals_unfused_over_random_reduction_graphs() {
                 fill(bnumel, seed * 13 + 101),
             )),
         );
-        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        let fg = fuse(&cse(&g).unwrap(), poot_graph_plan::RowOutputs::Multiple).unwrap();
         let unfused = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output

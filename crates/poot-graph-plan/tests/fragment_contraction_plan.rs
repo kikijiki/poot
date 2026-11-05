@@ -5,6 +5,7 @@
 //! choice reads the policy (through the operand precision `select_operand_precision` writes), the target's matrix
 //! units and the shapes, and nothing else.
 
+use poot_graph_ir::op::ContractionHead;
 use poot_graph_ir::{Builder, FragmentDtype, Graph, MatmulPrecision, OpKind, TensorType};
 use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Program, Target, compile};
 use poot_kernelgen::{ContractionSpec, KernelRequest, Schedule};
@@ -133,20 +134,50 @@ fn schedule_of(program: &Program, want: impl Fn(&OpKind) -> bool) -> Schedule {
     }
 }
 
+/// A contraction narrowed to f16 multiplies its row scale back in its epilogue (POOT-1457), so each family is
+/// matched bare or as an epilogue's head.
 fn is_dense(op: &OpKind) -> bool {
-    matches!(op, OpKind::DenseContraction { .. })
+    matches!(
+        op,
+        OpKind::DenseContraction { .. }
+            | OpKind::ContractionEpilogue {
+                head: ContractionHead::Dense { .. },
+                ..
+            }
+    )
 }
 
 fn is_matmul(op: &OpKind) -> bool {
-    matches!(op, OpKind::MatMul { .. })
+    matches!(
+        op,
+        OpKind::MatMul { .. }
+            | OpKind::ContractionEpilogue {
+                head: ContractionHead::MatMul { .. },
+                ..
+            }
+    )
 }
 
 fn is_packed(op: &OpKind) -> bool {
-    matches!(op, OpKind::PackedContraction { .. })
+    matches!(
+        op,
+        OpKind::PackedContraction { .. }
+            | OpKind::ContractionEpilogue {
+                head: ContractionHead::Packed { .. },
+                ..
+            }
+    )
 }
 
 fn is_indexed(op: &OpKind) -> bool {
-    matches!(op, OpKind::IndexedMatMul { .. })
+    matches!(
+        op,
+        OpKind::IndexedMatMul { .. }
+            | OpKind::ContractionEpilogue {
+                head: ContractionHead::Indexed { .. },
+                ..
+            }
+    )
 }
 
 /// The fragment dtype, layout and waves of a fragment schedule.

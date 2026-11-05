@@ -23,7 +23,8 @@ use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use poot_graph_ir::{
-    BoundaryId, Eqn, Slot, SlotKey, StateRole, Storage, TensorType, ValueId, ValueMeta, ValueTable,
+    BoundaryId, Eqn, OpKind, Operand, Slot, SlotKey, StateRole, Storage, TensorType, ValueId,
+    ValueMeta, ValueTable,
 };
 use poot_graph_plan::multi_device::PlanNodeId;
 use poot_graph_plan::{
@@ -1724,6 +1725,22 @@ impl<D: Device> Engine<D> {
                 region_of[member] = Some(index);
             }
         }
+        // The side outputs of each multi-output region, by the region's result, in side-output order (POOT-1456):
+        // the buffers its dispatch writes between its reads and its output.
+        let mut side_outputs: HashMap<ValueId, Vec<(usize, ValueId)>> = HashMap::new();
+        for eqn in g.eqns() {
+            if let (OpKind::SideOutput { index, .. }, [Operand::Value(region)]) =
+                (&eqn.op, eqn.inputs.as_slice())
+            {
+                side_outputs
+                    .entry(*region)
+                    .or_default()
+                    .push((*index, eqn.out));
+            }
+        }
+        for sides in side_outputs.values_mut() {
+            sides.sort_unstable();
+        }
         let mut steps = Vec::new();
         for (eqn_index, (eqn, plan)) in program.planned().enumerate() {
             let operand = |values: &ValueTable<Option<(Loc, usize)>>,
@@ -1810,6 +1827,15 @@ impl<D: Device> Engine<D> {
                 Plan::Graph => {
                     return Err(LoadError::Unimplemented("a graph node outside any region").into());
                 }
+                // The region's dispatch placed this buffer and writes it.
+                Plan::SideOutput { .. } => {
+                    if values[eqn.out].is_none() {
+                        return Err(LoadError::Unimplemented(
+                            "a side output its region's dispatch did not write",
+                        )
+                        .into());
+                    }
+                }
                 Plan::Dispatches(dispatches) => {
                     let output_loc = out_loc(
                         OutLocArgs {
@@ -1824,6 +1850,25 @@ impl<D: Device> Engine<D> {
                     )?;
                     let output = (output_loc, elems_of(eqn.out)?);
                     let operands = operands_with_elems(&values, eqn)?;
+                    // A multi-output region's side outputs: placed here, where its dispatch writes them, and named by
+                    // their projections after it (POOT-1456).
+                    let mut sides = Vec::new();
+                    for &(_, side) in side_outputs.get(&eqn.out).into_iter().flatten() {
+                        let loc = out_loc(
+                            OutLocArgs {
+                                out: side,
+                                storage: storage_of(side),
+                                commit_plan,
+                                buffer_plan,
+                            },
+                            &values,
+                            &self.device,
+                            &mut stage_arena,
+                        )?;
+                        let placed = (loc, elems_of(side)?);
+                        values[side] = Some(placed);
+                        sides.push(placed);
+                    }
                     // A scratch buffer is an arena slot of this equation's own index, bound through the view
                     // of its slot as its declared storage; its element count is the declared one, never the
                     // slot's capacity (the slot is shared with other layers' scratch and values).
@@ -1883,6 +1928,17 @@ impl<D: Device> Engine<D> {
                         if !launch.meta.is_empty() {
                             let meta_loc = self.meta_buffer(&launch.meta, locals)?;
                             inputs.push((meta_loc, launch.meta.len()));
+                        }
+                        // The side writes ride after the reads and the metadata, before the output, as the kernel
+                        // declares them.
+                        if binding.side_writes() > 0 {
+                            if binding.side_writes() != sides.len() {
+                                return Err(LoadError::Unimplemented(
+                                    "a dispatch writes other side outputs than its region projects",
+                                )
+                                .into());
+                            }
+                            inputs.extend(sides.iter().copied());
                         }
                         steps.push(LoadedStep {
                             kernel,

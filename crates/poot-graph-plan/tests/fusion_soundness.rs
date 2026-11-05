@@ -65,7 +65,7 @@ fn recip_tanh_erf_fused_region_matches_the_oracle() {
     let r = b.unary(UnOp::Recip, e).unwrap();
     let graph = b.finish(r).unwrap();
 
-    let fused = fuse(&graph).unwrap();
+    let fused = fuse(&graph, poot_graph_plan::RowOutputs::Multiple).unwrap();
     assert_eq!(
         fused.eqns().len(),
         1,

@@ -642,7 +642,7 @@ fn fused_decode_matches_unfused_on_gpu() {
     let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
     let (g, feed) = tiny_decode_graph();
     let base = cse(&g).unwrap(); // the executor's normal pre-pass; fusion groups on top of it.
-    let fg = fuse(&base).unwrap();
+    let fg = fuse(&base, poot_graph_plan::RowOutputs::Multiple).unwrap();
     let n_fused = fg
         .eqns()
         .iter()
@@ -878,7 +878,7 @@ fn fusion_dispatch_reduction_on_real_qwen2_config() {
 
     let cap = 64;
     let base = cse(&real_trace(&real_dense(), step(1, 1, cap, LogitRows::Last))).unwrap();
-    let fused = fuse(&base).unwrap();
+    let fused = fuse(&base, poot_graph_plan::RowOutputs::Multiple).unwrap();
 
     let before = count_dispatches(&base);
     let after = count_dispatches(&fused);
