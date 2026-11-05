@@ -252,6 +252,24 @@ pub enum LoadError {
         /// The device lane the plan chose.
         planned: BufferStorage,
     },
+    /// A weight's bytes could not be read from its checkpoint file: the file was truncated or replaced
+    /// after it was mapped.
+    #[error("weight {name}: {source}")]
+    WeightRead {
+        /// The weight's name.
+        name: String,
+        /// The failed read.
+        source: poot_quant::ReadError,
+    },
+    /// A stored value of a weight failed its payload's content check as the upload read it (ADR-0103
+    /// decision 4, amendment of 2026-10-27): the weight is not uploaded or bound.
+    #[error("weight {name}: {source}")]
+    WeightContent {
+        /// The weight's name.
+        name: String,
+        /// The refused value.
+        source: poot_quant::PackedWeightError,
+    },
     /// Card 1007: a packed-F16 weight holds an infinity or NaN, which the generated bodies' in-register
     /// binary16 decode does not represent (its domain is the finite values).
     #[error(

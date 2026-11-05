@@ -6,7 +6,7 @@
 //! production build.
 
 use poot_target::dram_channels::DramChannels;
-use poot_target::{Backend, DeviceCaps, MatrixLowering, Queried, ShaderFeatures, SubgroupSupport};
+use poot_target::{Backend, DeviceCaps, Queried, ShaderFeatures, SubgroupSupport};
 
 /// The [`DeviceCaps`] a test should use for a given [`Backend`] when it has no real measured device to
 /// thread through: the values this box's own wgpu/RADV device measured (card 522), and the documented
@@ -16,8 +16,7 @@ pub fn default_caps_for(backend: Backend) -> DeviceCaps {
         Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
         // A live ROCm context reads both from its agent: the arch carries the same values.
         Backend::AmdGcn(arch) => DeviceCaps {
-            tensor_core: arch.tensor_core,
-            matrix_lowering: MatrixLowering::amd(arch.tensor_core),
+            matrix_units: Queried::Known(arch.matrix_units()),
             subgroup: Queried::Known(SubgroupSupport::Present {
                 min_size: arch.wave,
                 max_size: arch.wave,

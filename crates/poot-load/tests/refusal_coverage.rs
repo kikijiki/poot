@@ -6,7 +6,6 @@ use poot_load::LoadError;
 use poot_load::config::QuantConfig;
 use poot_load::gguf::{GgufIndex, TensorNameMap, read_gguf, write_gguf};
 use poot_load::lora::LoraAdapter;
-use poot_load::plan::default_workers;
 use poot_load::safetensors::map_weight_files;
 use poot_quant::StoredBytes;
 use poot_quant::weights::WeightKey;
@@ -127,10 +126,7 @@ fn two_gguf_tensors_mapped_to_one_weight_key_are_a_duplicate_weight_key() {
         ],
     );
     let index = GgufIndex::parse(&StoredBytes::from(bytes)).unwrap();
-    let error = refusal(
-        read_gguf(&index, &OneKey, default_workers()),
-        "two tensors under one key",
-    );
+    let error = refusal(read_gguf(&index, &OneKey), "two tensors under one key");
     assert!(
         matches!(error, LoadError::GgufDuplicateWeightKey(_)),
         "expected GgufDuplicateWeightKey, got: {error}"

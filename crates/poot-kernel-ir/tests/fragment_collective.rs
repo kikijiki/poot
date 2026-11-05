@@ -346,3 +346,39 @@ fn matrix_work_after_the_arms_reconverge_is_accepted() {
     ];
     body.verify().unwrap();
 }
+
+/// An accumulator element is a lane's own register: a branch on one differs between lanes, so it cannot guard
+/// matrix work. (An element read must not be mistaken for a uniform value.)
+#[test]
+fn a_branch_on_an_accumulator_element_is_lane_divergent() {
+    const ELEMENT: u32 = 11;
+    let selector = vec![
+        Statement::WmmaZero {
+            dtype: DTYPE,
+            shape: SHAPE,
+            dst: l(7),
+        },
+        Statement::WmmaElemRead {
+            src: l(7),
+            idx: 3,
+            dst: l(ELEMENT),
+        },
+        assign(
+            COND,
+            Rvalue::BinaryOp(BinOp::Gt, copy(ELEMENT), Operand::Const(Constant::F32(0.0))),
+        ),
+    ];
+    let mut body = guarded(IndexAxis::X, [256, 1, 1], selector);
+    body.locals.push(LocalDecl {
+        ty: Ty::F32,
+        mutable: true,
+    });
+    assert_eq!(
+        divergent_error(&body),
+        VerifyErrorKind::DivergentFragmentParticipation {
+            branch: bb(1),
+            op: bb(2),
+            reconverge: None,
+        }
+    );
+}

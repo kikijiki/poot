@@ -273,5 +273,11 @@ impl<'a> Emitter<'a> {
             // card 628: Nvptx/AmdGcn's `#0` is unused otherwise (see `strictfp_attr_suffix`).
             let _ = writeln!(self.out, "\nattributes #0 = {{ strictfp }}");
         }
+        if self.loops_not_unrolled {
+            let _ = writeln!(
+                self.out,
+                "\n!0 = distinct !{{!0, !1}}\n!1 = !{{!\"llvm.loop.unroll.disable\"}}"
+            );
+        }
     }
 }

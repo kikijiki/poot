@@ -310,6 +310,78 @@ fn program_arena_bytes_equals_what_the_engine_allocates() {
     assert_eq!(activation_bytes, 66 * 4);
 }
 
+/// POOT-1433: the stages of an entry share the buffers of values that are dead between them. Layer 0 sums a
+/// `[64]` sum into the `[1]` boundary `s`; layer 1 recomputes two `[64]` temporaries from `s`. Each stage
+/// alone needs a `[64]` slot; the entry allocates one, plus the two exact-size values that outlive their
+/// stage (`s`, and the result), where the stages' own arenas would add up to two.
+///
+/// Mutation: allocate every stage's slots separately again (`EntryArena::plan` called once per stage in
+/// `Engine::load_entry`); the engine's Activation bytes exceed the shared figure by one `[64]` slot (256 B).
+#[test]
+fn staged_entries_allocate_one_arena_for_the_values_their_stages_share() {
+    let (_, store, _map) = fixture();
+    let b = Builder::for_tests();
+    let ta = b.constant("a", TensorType::f32(vec![K])).unwrap();
+    let tb = b.constant("b", TensorType::f32(vec![K])).unwrap();
+    let s;
+    {
+        let _layer = b.layer_scope(0);
+        let v1 = b.binary(BinOp::Add, ta, tb).unwrap();
+        s = b.reduce(RedOp::Sum, v1, 0, true).unwrap();
+    }
+    let out;
+    {
+        let _layer = b.layer_scope(1);
+        let wide = b.broadcast(s, vec![K]).unwrap();
+        let m1 = b.binary(BinOp::Add, wide, ta).unwrap();
+        let m2 = b.binary(BinOp::Mul, m1, tb).unwrap();
+        out = b.reduce(RedOp::Sum, m2, 0, true).unwrap();
+    }
+    let g = b.finish(out).unwrap();
+    let mut names = poot_graph_ir::test_support::const_weights::ConstWeights::new(&store);
+    let g = names.graph(&g);
+    let map = Arc::new(names.map());
+
+    let target = fake_target();
+    let program = compile_staged(
+        &g,
+        &TargetSet::single(DeviceId(0), target),
+        &Partition {
+            experts: ExpertPlacement::AllResident,
+            devices: DevicePlacement::Pipeline {
+                after_layers: vec![0],
+                devices: vec![DeviceId(0); 2],
+            },
+        },
+        &REPLAY,
+    )
+    .expect("the two-layer fixture compiles");
+    assert_eq!(program.stages().count(), 2, "one cut, two stages");
+    let separate: usize = program
+        .stages()
+        .map(|(_, _, p)| p.buffer_plan().arena_bytes())
+        .sum();
+
+    let mut engine = Engine::new(RecordingDevice {
+        recorder: Recorder::default(),
+    });
+    let exe = engine.load_weights(store, map).unwrap();
+    engine.add_entry(exe, &program).unwrap();
+    let activation_bytes = engine
+        .stats()
+        .memory
+        .into_iter()
+        .find(|&(role, _)| role == BufferRole::Activation)
+        .map(|(_, snap)| snap.live_bytes)
+        .unwrap_or(0);
+    // Hand-traced: the [64] temporaries (one shared slot), `s` and the result, both [1].
+    assert_eq!(activation_bytes, (64 + 1 + 1) * 4);
+    assert!(
+        activation_bytes < separate as u64,
+        "the stages' own arenas ({separate} B) would each hold a [64] slot"
+    );
+}
+
 /// SC-004 (accounting half): two simultaneously retained entries with distinct scratch allocations
 /// (the fixture compiled twice, once per `add_entry`, into the same executable) have a planned
 /// aggregate equal to the engine's actual retained `Activation` bytes. The expected aggregate is

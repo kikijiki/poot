@@ -500,6 +500,7 @@ pub(crate) fn fix_coopmat_calls(words: Vec<u32>) -> Vec<u32> {
     const OP_COOP_STORE: u16 = 4458;
     const OP_COOP_MULADD: u16 = 4459;
     const OP_COMPOSITE_CONSTRUCT: u16 = 80;
+    const OP_BITCAST: u16 = 124;
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Kind {
@@ -582,6 +583,9 @@ pub(crate) fn fix_coopmat_calls(words: Vec<u32>) -> Vec<u32> {
     let mut has_vulkan_memory_model = false;
     let mut has_vulkan_memory_model_ext = false;
     let mut memory_model_operand_idx: Option<usize> = None;
+    // result id -> (instruction span, operand id) of every `OpBitcast`.
+    let mut pointer_casts: std::collections::HashMap<u32, ((usize, usize), u32)> =
+        std::collections::HashMap::new();
 
     let mut i = 5;
     while i < words.len() {
@@ -611,6 +615,11 @@ pub(crate) fn fix_coopmat_calls(words: Vec<u32>) -> Vec<u32> {
             }
             OP_MEMORY_MODEL if wc == 3 => {
                 memory_model_operand_idx = Some(i + 2);
+            }
+            // `OpBitcast ResultType ResultId Operand`: a coopmat load/store's Pointer must be a logical pointer,
+            // so a cast LLVM inserted to match the stub's default `uchar` pointee is undone below.
+            OP_BITCAST if wc == 4 => {
+                pointer_casts.insert(words[i + 2], ((i, i + wc), words[i + 3]));
             }
             OP_DECORATE
                 if wc >= 5
@@ -742,11 +751,42 @@ pub(crate) fn fix_coopmat_calls(words: Vec<u32>) -> Vec<u32> {
         spans_to_delete.push(cap_span);
     }
 
-    let in_deleted_range = |idx: usize| spans_to_delete.iter().any(|&(s, e)| idx >= s && idx < e);
     let call_at: std::collections::HashMap<usize, (usize, Kind, Option<u32>)> = calls
         .into_iter()
         .map(|(s, wc, k, m)| (s, (wc, k, m)))
         .collect();
+
+    // A coopmat load/store takes the tile's pointer as its first argument. The stub's pointer parameter has
+    // the default `uchar` pointee, so LLVM casts a typed element pointer (a workgroup array element, say) to
+    // it with an `OpBitcast`; the real instruction requires a logical pointer (an `OpVariable` or
+    // `OpAccessChain` result, SPIR-V "Logical" addressing), so the cast goes and the call takes the
+    // uncast pointer. The cast is deleted once nothing else uses it. (A global tile avoids the cast with a
+    // byte-typed view of its binding, see `coopmat_byte_ptr`.) The operand's pointee type then fixes the
+    // unit of the Stride operand: elements of the tile's own type.
+    let mut strip_cast: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut cast_uses: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for (&start, &(wc, kind, _)) in &call_at {
+        if !matches!(kind, Kind::Load | Kind::Store) || wc < 5 {
+            continue;
+        }
+        let pointer = words[start + 4];
+        if let Some(&(_, source)) = pointer_casts.get(&pointer) {
+            strip_cast.insert(pointer, source);
+            *cast_uses.entry(pointer).or_default() += 1;
+        }
+    }
+    for (&cast, &uses) in &cast_uses {
+        let (span, _) = pointer_casts[&cast];
+        let mentions = words[5..]
+            .iter()
+            .enumerate()
+            .filter(|&(offset, &word)| word == cast && 5 + offset != span.0 + 2)
+            .count();
+        if mentions == uses {
+            spans_to_delete.push(span);
+        }
+    }
+    let in_deleted_range = |idx: usize| spans_to_delete.iter().any(|&(s, e)| idx >= s && idx < e);
 
     // Real coopmat instructions are legal under Vulkan only when `VulkanMemoryModel` is declared and
     // `OpMemoryModel` selects it (SPV_KHR_cooperative_matrix: Shader + CooperativeMatrixKHR requires it).
@@ -792,6 +832,11 @@ pub(crate) fn fix_coopmat_calls(words: Vec<u32>) -> Vec<u32> {
             let mut args: Vec<u32> = words[i + 4..i + wc].to_vec();
             if let Some(literal) = mask {
                 *args.last_mut().unwrap() = literal;
+            }
+            if matches!(kind, Kind::Load | Kind::Store)
+                && let Some(&source) = args.first().and_then(|p| strip_cast.get(p))
+            {
+                args[0] = source;
             }
             match kind {
                 Kind::Load | Kind::MulAdd | Kind::CompositeConstruct => {

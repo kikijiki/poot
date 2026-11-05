@@ -19,7 +19,6 @@
 //! swapped; DQ-5 two entries of the IQ3_XXS grid are swapped.
 
 use poot_load::gguf::{GgufIndex, IdentityNames, read_gguf, write_gguf};
-use poot_load::plan::default_workers;
 use poot_quant::StoredBytes;
 use poot_quant::format::Storage;
 use poot_quant::weights::WeightEntry;
@@ -85,7 +84,7 @@ fn decode(sample: &Sample) -> Vec<f32> {
     );
     let file = StoredBytes::from(bytes);
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames).unwrap();
     match store.get("w").expect("the tensor is stored") {
         WeightEntry::Packed(payload) => {
             let mut out = vec![0.0; values];

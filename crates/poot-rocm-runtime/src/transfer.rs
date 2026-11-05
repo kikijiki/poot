@@ -433,6 +433,11 @@ impl RocmContext {
         Some(unified_free_bytes(pool, host_available_bytes()?))
     }
 
+    /// Whether the GPU agent is an APU, whose device memory is the host's RAM.
+    pub fn is_unified_memory(&self) -> bool {
+        self.unified_memory
+    }
+
     /// Card 125 (FR-004/SC-004): a device DMA transfer (`hsa_amd_memory_async_copy` + completion
     /// signal) for [`Self::upload_strategy`] == [`UploadStrategy::Dma`]. `size` is bytes; `dst`/`src`
     /// are a pool allocation and the agent address of `staging`. The copy starts once every signal in

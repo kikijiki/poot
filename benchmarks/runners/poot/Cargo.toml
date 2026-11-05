@@ -27,7 +27,7 @@ poot-models.workspace = true
 poot-profile.workspace = true
 poot-quant.workspace = true
 anyhow.workspace = true
-blake3.workspace = true
+blake3 = { workspace = true, features = ["rayon"] }
 serde_json.workspace = true
 tracing-subscriber.workspace = true
 

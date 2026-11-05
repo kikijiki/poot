@@ -219,6 +219,10 @@ impl Device for RocmDevice {
         self.ctx.vram_free_bytes()
     }
 
+    fn unified_memory(&self) -> bool {
+        self.ctx.is_unified_memory()
+    }
+
     fn identity(&self) -> Option<DeviceIdentity> {
         self.ctx.identity()
     }

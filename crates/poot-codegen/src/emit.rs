@@ -72,6 +72,11 @@ struct Emitter<'a> {
     /// `emit_signature`/`emit_footer` add the `strictfp` function attribute the constrained intrinsics
     /// (`llvm.experimental.constrained.{fadd,fsub,fmul}`) require.
     strictfp_needed: bool,
+    /// The block `emit_block` is emitting, so a branch to an earlier block is known as a loop's back edge.
+    block: u32,
+    /// AmdGcn: whether a back edge carries the `!llvm.loop` no-unroll metadata, which `emit_footer`
+    /// then defines (the body's generator owns its unrolling, [`poot_kernel_ir::Unrolling::Generator`]).
+    loops_not_unrolled: bool,
 }
 mod core;
 mod memory;

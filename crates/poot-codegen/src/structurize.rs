@@ -464,6 +464,7 @@ mod tests {
             workgroup_locals: Vec::new(),
             constant_tables: Vec::new(),
             index_width: poot_kernel_ir::IndexWidth::Native,
+            unrolling: poot_kernel_ir::Unrolling::Backend,
         }
     }
     fn succ_of(b: &Body, i: usize) -> Vec<usize> {

@@ -33,7 +33,7 @@ use crate::graph_validation::ValidationPacketPlan;
 use crate::state_commit::StateCommitPlan;
 use crate::types::GraphStorage;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use poot_graph_ir::{Graph, ValueId, ValueTable};
 use poot_target::BufferStorage;
@@ -50,7 +50,7 @@ impl ArenaSlotId {
         Self(index as u32)
     }
 
-    /// This slot's index into [`BufferPlan::slot_storage`]/[`BufferPlan::slot_elems`], for a caller
+    /// This slot's index into [`BufferPlan::slot_elems`], for a caller
     /// that holds one device buffer per slot in a plain `Vec` (the engine's own arena).
     pub fn index(self) -> usize {
         self.0 as usize
@@ -76,6 +76,9 @@ struct SlotInfo {
     /// `Device::allocate`), never a logical tensor `numel` this slot's smaller occupants may fall short
     /// of.
     elems: usize,
+    /// Whether the slot's one occupant outlives the program's dispatch loop (an export, see the module
+    /// doc): a staged entry keeps the slot's buffer past its stage.
+    outlives_stage: bool,
 }
 
 /// Lifetimes and arena-slot assignment for one compiled graph's locally-computed values (Card 547b).
@@ -87,6 +90,8 @@ struct SlotInfo {
 pub struct BufferPlan {
     slots: Vec<SlotInfo>,
     assignment: HashMap<BufferKey, ArenaSlotId>,
+    #[cfg(any(test, feature = "test-support"))]
+    live_peak_bytes: usize,
 }
 
 impl BufferPlan {
@@ -106,19 +111,19 @@ impl BufferPlan {
             .map(|(index, info)| (ArenaSlotId::new(index), info.storage, info.elems))
     }
 
-    /// The storage every occupant of `slot` shares (arena coloring never mixes two distinct
-    /// [`BufferStorage`]s onto one slot).
-    pub fn slot_storage(&self, slot: ArenaSlotId) -> BufferStorage {
-        self.slots[slot.index()].storage
-    }
-
     /// `slot`'s native device-element count: the largest its occupants ever needed, what the engine
     /// passes to `Device::allocate` for this slot's one buffer.
     pub fn slot_elems(&self, slot: ArenaSlotId) -> usize {
         self.slots[slot.index()].elems
     }
 
-    /// `slot`'s byte size (SC-001/SC-003): `slot_elems` native elements at `slot_storage`'s own
+    /// Whether `slot` holds a value that outlives this program's own run: the primary output, an export,
+    /// a state-commit source or a validation witness. Every other slot is dead once the program has run.
+    pub fn slot_outlives_stage(&self, slot: ArenaSlotId) -> bool {
+        self.slots[slot.index()].outlives_stage
+    }
+
+    /// `slot`'s byte size (SC-001/SC-003): `slot_elems` native elements at the slot's own
     /// element width.
     #[cfg(any(test, feature = "test-support"))]
     pub fn slot_bytes(&self, slot: ArenaSlotId) -> usize {
@@ -147,12 +152,22 @@ impl BufferPlan {
     /// Sum of every arena slot's bytes (SC-001, SC-003, SC-004): this program's peak locally-computed-
     /// value memory, distinct from the weight, state, and slot-input buffers the engine allocates
     /// separately and never arena-shares.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn arena_bytes(&self) -> usize {
         self.slots.iter().map(SlotInfo::byte_size).sum()
+    }
+
+    /// The most bytes of locally-computed values alive at one equation index, each at its own size: the
+    /// lower bound any arena of this program can reach, against which [`BufferPlan::arena_bytes`] (every
+    /// slot at its largest occupant) is measured.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn live_peak_bytes(&self) -> usize {
+        self.live_peak_bytes
     }
 }
 
 impl SlotInfo {
+    #[cfg(any(test, feature = "test-support"))]
     fn byte_size(&self) -> usize {
         self.elems * self.storage.element().byte_width()
     }
@@ -304,46 +319,83 @@ pub(crate) fn plan_buffers(
 
     for key in group_keys {
         let mut members = groups.remove(&key).expect("key came from this map");
-        members.sort_by_key(|&v| (birth[&v], v));
+        // Largest first (best-fit decreasing, ggml-alloc / XLA's heap simulator): a big value claims a slot
+        // while no smaller occupant has stretched another, so a slot only grows to a size some value needs.
+        members.sort_by_key(|&v| (Reverse(elems[&v]), birth[&v], v));
 
-        let mut free: Vec<ArenaSlotId> = Vec::new();
-        let mut active: BinaryHeap<Reverse<(usize, u32)>> = BinaryHeap::new();
-
+        // The slots of this class and the lifetimes of their occupants.
+        let mut class: Vec<(ArenaSlotId, Vec<(usize, usize)>)> = Vec::new();
         for value in members {
-            let b = birth[&value];
-            while let Some(&Reverse((d, slot_index))) = active.peek() {
-                if d < b {
-                    active.pop();
-                    free.push(ArenaSlotId::new(slot_index as usize));
-                } else {
-                    break;
-                }
-            }
-            let needed = elems[&value];
-            let slot = if is_export.contains(&value) {
+            let (b, d, needed) = (birth[&value], death[&value], elems[&value]);
+            // A slot whose occupants all end before `b` or start after `d`; the one that grows least, and
+            // among those that need no growth the tightest. An export takes none: its slot is its own.
+            let fit = if is_export.contains(&value) {
                 None
             } else {
-                free.pop()
+                class
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, lives))| lives.iter().all(|&(lb, ld)| ld < b || d < lb))
+                    .min_by_key(|(index, (slot, _))| {
+                        let have = slots[slot.index()].elems;
+                        (needed.saturating_sub(have), have, *index)
+                    })
+                    .map(|(index, _)| index)
             };
-            let slot = match slot {
-                Some(slot) => {
-                    let info = &mut slots[slot.index()];
-                    info.elems = info.elems.max(needed);
-                    slot
-                }
+            let index = match fit {
+                Some(index) => index,
                 None => {
-                    let slot = ArenaSlotId::new(slots.len());
+                    class.push((ArenaSlotId::new(slots.len()), Vec::new()));
                     slots.push(SlotInfo {
                         storage: key,
-                        elems: needed,
+                        elems: 0,
+                        outlives_stage: is_export.contains(&value),
                     });
-                    slot
+                    class.len() - 1
                 }
             };
-            active.push(Reverse((death[&value], slot.0)));
-            assignment.insert(value, slot);
+            let (slot, lives) = &mut class[index];
+            lives.push((b, d));
+            let info = &mut slots[slot.index()];
+            info.elems = info.elems.max(needed);
+            assignment.insert(value, *slot);
         }
     }
 
-    BufferPlan { slots, assignment }
+    #[cfg(any(test, feature = "test-support"))]
+    let live_peak_bytes = live_peak_bytes(&birth, &death, &elems, &store_of);
+
+    BufferPlan {
+        slots,
+        assignment,
+        #[cfg(any(test, feature = "test-support"))]
+        live_peak_bytes,
+    }
+}
+
+/// The most bytes alive at one equation index over `birth`/`death` (inclusive spans), each buffer at its own
+/// size: the floor under any slot arena of the plan.
+#[cfg(any(test, feature = "test-support"))]
+fn live_peak_bytes(
+    birth: &HashMap<BufferKey, usize>,
+    death: &HashMap<BufferKey, usize>,
+    elems: &HashMap<BufferKey, usize>,
+    store_of: &HashMap<BufferKey, BufferStorage>,
+) -> usize {
+    let mut edges: Vec<(usize, isize)> = Vec::with_capacity(birth.len() * 2);
+    for (key, &b) in birth {
+        let bytes = (elems[key] * store_of[key].element().byte_width()) as isize;
+        edges.push((b, bytes));
+        edges.push((death[key] + 1, -bytes));
+    }
+    // A value dying at index `d` frees its bytes at `d + 1`; sorting by `(index, delta)` applies the frees
+    // of an index before its births.
+    edges.sort_unstable();
+    let mut live = 0isize;
+    let mut peak = 0isize;
+    for (_, delta) in edges {
+        live += delta;
+        peak = peak.max(live);
+    }
+    peak as usize
 }

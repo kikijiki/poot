@@ -109,7 +109,7 @@ impl Context {
             subgroup: launch.subgroup,
             max_grid: [self.max_workgroups; 3],
             watchdog_budget: calibration.watchdog_budget,
-            tensor_core: self.tensor_core,
+            matrix_units: self.matrix_units,
             known_miscompiles: calibration.known_miscompiles,
             compute_units: self.compute_units,
             memory_budget_bytes: self.memory_budget_bytes,
@@ -117,7 +117,6 @@ impl Context {
             shader_features: self.shader_features,
             // SPIR-V holds E4M3FN in packed lanes and has no native two-byte float lane on any Vulkan device.
             e4m3_storage: poot_target::E4m3Storage::PackedLanes,
-            matrix_lowering: poot_target::MatrixLowering::vulkan(self.tensor_core),
             native_two_byte_floats: false,
             widens_bf16_decode_weight: false,
             peer_transport: false,
@@ -227,7 +226,7 @@ impl Context {
         // `Adapter::cooperative_matrix_properties`), never parsed from the adapter's device-name
         // string - Mesa RADV reports a marketing codename, not a gfx code. Reported only for what
         // the device was granted (`device.features()`), not what the adapter advertises.
-        let tensor_core = granted_tensor_core(
+        let matrix_units = granted_matrix_units(
             adapter_info.backend,
             device.features(),
             &adapter.cooperative_matrix_properties(),
@@ -286,7 +285,7 @@ impl Context {
             max_buffer_size,
             effective_max_buffer_size,
             lds_bytes,
-            tensor_core,
+            matrix_units,
             compute_units,
             memory_budget_bytes: None,
             calibration,
@@ -402,36 +401,46 @@ impl Context {
     }
 }
 
-/// The matrix-hardware family a device reports: every cooperative-matrix configuration folded (a
-/// device can report more than one shape), but only when `granted` holds the cooperative-matrix
+/// The matrix units a device reports: its cooperative-matrix configurations classified by
+/// [`poot_target::MatrixUnits::cooperative_matrix`], but only when `granted` holds the cooperative-matrix
 /// feature, since a kernel using it on a device created without it declares an unenabled capability.
 /// `wgpu::Backend::Vulkan` is the only backend whose property list is meaningfully populated, so any
-/// other backend says `UnknownNotExposedByApi`.
-fn granted_tensor_core(
+/// other backend is `Unknown`.
+fn granted_matrix_units(
     backend: wgpu::Backend,
     granted: wgpu::Features,
     properties: &[wgpu::CooperativeMatrixProperties],
-) -> poot_target::TensorCoreSupport {
+) -> poot_target::Queried<poot_target::MatrixUnits> {
     if backend != wgpu::Backend::Vulkan {
-        return poot_target::TensorCoreSupport::UnknownNotExposedByApi;
+        return poot_target::Queried::Unknown;
     }
     if !granted.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
-        return poot_target::TensorCoreSupport::None;
+        return poot_target::Queried::Known(poot_target::MatrixUnits::NONE);
     }
-    properties
-        .iter()
-        .map(|c| {
-            poot_target::TensorCoreSupport::from_cooperative_matrix_config(
-                c.m_size,
-                c.n_size,
-                c.k_size,
-                c.ab_type == wgpu::CooperativeScalarType::F16,
-                c.cr_type == wgpu::CooperativeScalarType::F32,
-            )
-        })
-        .fold(poot_target::TensorCoreSupport::None, |acc, x| {
-            acc.most_specific(x)
-        })
+    poot_target::Queried::Known(cooperative_matrix_units(properties))
+}
+
+/// Lanes per cooperative-matrix fragment: every fragment kernel the code generator emits fixes 32.
+const COOPMAT_SUBGROUP_SIZE: u32 = 32;
+
+/// The units of a device's reported cooperative-matrix properties (the same data raw Vulkan reads).
+fn cooperative_matrix_units(
+    properties: &[wgpu::CooperativeMatrixProperties],
+) -> poot_target::MatrixUnits {
+    poot_target::MatrixUnits::cooperative_matrix(
+        properties
+            .iter()
+            .map(|c| poot_target::CooperativeMatrixConfig {
+                shape: poot_target::FragmentShape {
+                    m: c.m_size,
+                    n: c.n_size,
+                    k: c.k_size,
+                },
+                ab_f16: c.ab_type == wgpu::CooperativeScalarType::F16,
+                result_f32: c.cr_type == wgpu::CooperativeScalarType::F32,
+            }),
+        COOPMAT_SUBGROUP_SIZE,
+    )
 }
 
 /// The optional shader features the device was granted. `SHADER_I16` and `SHADER_INT64` are required at open,
@@ -497,7 +506,7 @@ impl LaunchCaps {
 }
 
 #[cfg(test)]
-mod tensor_core_tests {
+mod matrix_units_tests {
     use super::*;
 
     fn f16_16x16x16() -> wgpu::CooperativeMatrixProperties {
@@ -512,34 +521,37 @@ mod tensor_core_tests {
     }
 
     /// SC-001: an adapter that advertises cooperative matrices but whose device was created without
-    /// the feature reports no tensor core; with the feature granted the same properties are reported.
+    /// the feature reports no matrix unit; with the feature granted the same properties are reported.
     /// Mutation: read the properties without checking `granted` and the first assertion fails.
     #[test]
-    fn tensor_core_is_reported_only_for_a_granted_feature() {
+    fn matrix_units_are_reported_only_for_a_granted_feature() {
         let props = [f16_16x16x16()];
-        let ungranted = granted_tensor_core(
+        let ungranted = granted_matrix_units(
             wgpu::Backend::Vulkan,
             wgpu::Features::PASSTHROUGH_SHADERS,
             &props,
         );
-        assert_eq!(ungranted, poot_target::TensorCoreSupport::None);
-        let granted = granted_tensor_core(
+        assert_eq!(
+            ungranted,
+            poot_target::Queried::Known(poot_target::MatrixUnits::NONE)
+        );
+        let granted = granted_matrix_units(
             wgpu::Backend::Vulkan,
             wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
             &props,
         );
-        assert_ne!(granted, poot_target::TensorCoreSupport::None);
+        assert_ne!(ungranted, granted);
     }
 
     #[test]
     fn a_non_vulkan_backend_is_unknown_whatever_was_granted() {
         assert_eq!(
-            granted_tensor_core(
+            granted_matrix_units(
                 wgpu::Backend::Metal,
                 wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
                 &[f16_16x16x16()],
             ),
-            poot_target::TensorCoreSupport::UnknownNotExposedByApi
+            poot_target::Queried::Unknown
         );
     }
 }
@@ -616,7 +628,7 @@ mod launch_caps_device_receipt {
         assert_eq!(live.subgroup, fixture.subgroup);
         // Granted, not merely advertised: the device holds the cooperative-matrix feature that the
         // reported matrix hardware depends on.
-        assert_eq!(live.tensor_core, fixture.tensor_core);
+        assert_eq!(live.matrix_units, fixture.matrix_units);
         assert!(
             ctx.device
                 .features()

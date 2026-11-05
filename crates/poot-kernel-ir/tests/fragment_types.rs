@@ -1,9 +1,9 @@
 //! Independent Bodies for the declared fragment-type contract (role, operand dtype and tile are part of each
 //! fragment local's `Ty::Fragment`). No generator or device required.
 use poot_kernel_ir::{
-    BasicBlock, BlockId, Body, Constant, FragmentTy, Local, LocalDecl, Operand, Place,
-    ProjectionElem, Rvalue, Site, Statement, SwitchTargets, Terminator, Ty, VerifyErrorKind,
-    WmmaDtype, WmmaMat, WmmaShape, WorkgroupLocalDecl,
+    BasicBlock, BlockId, Body, Constant, FragmentMajor, FragmentRole, FragmentTy, Local, LocalDecl,
+    Operand, Place, ProjectionElem, Rvalue, Site, Statement, SwitchTargets, Terminator, Ty,
+    VerifyErrorKind, WmmaDtype, WmmaMat, WmmaShape, WorkgroupLocalDecl,
 };
 
 fn l(index: u32) -> Local {
@@ -55,10 +55,12 @@ fn tile(dtype: WmmaDtype, lds: bool) -> Body {
     let load = |which, param, dst| {
         if lds {
             Statement::WmmaLoadLds {
-                which,
+                role: FragmentRole::Matrix(which),
                 dtype,
                 shape,
                 array: 0,
+                base: Operand::Const(Constant::Usize(0)),
+                major: FragmentMajor::Row,
                 stride: 16,
                 dst: l(dst),
             }
@@ -78,6 +80,8 @@ fn tile(dtype: WmmaDtype, lds: bool) -> Body {
             dtype,
             shape,
             array: 1,
+            base: Operand::Const(Constant::Usize(0)),
+            major: FragmentMajor::Row,
             stride: 16,
             src: l(7),
         }
@@ -418,4 +422,176 @@ fn existing_definition_and_shape_errors_remain_typed() {
         bad_shape.verify().unwrap_err().kind,
         VerifyErrorKind::UnsupportedWmmaShape { .. }
     ));
+}
+
+// --- POOT-1432: LDS fragment ops with base and major, accumulator load, declared element access -------------
+
+/// A column-major operand tile loads into a fragment declared with that layout; the multiply takes either
+/// layout (NVPTX specialises on it); a destination declared with the other layout is refused at the load.
+#[test]
+fn lds_load_layout_is_part_of_the_destination_type() {
+    for dtype in [WmmaDtype::F16, WmmaDtype::Bf16] {
+        let mut body = tile(dtype, true);
+        let Statement::WmmaLoadLds { major, .. } = &mut body.blocks[0].statements[1] else {
+            unreachable!()
+        };
+        *major = FragmentMajor::Col;
+        let error = body
+            .verify()
+            .expect_err("a column load into a row-declared fragment must refuse");
+        assert_eq!(error.site, site(0, 1));
+        assert_eq!(
+            error.kind,
+            mismatch(
+                5,
+                FragmentTy::matrix_major(WmmaMat::A, dtype, shape(), FragmentMajor::Col),
+                FragmentTy::matrix(WmmaMat::A, dtype, shape())
+            )
+        );
+
+        body.locals[5].ty = Ty::Fragment(FragmentTy::matrix_major(
+            WmmaMat::A,
+            dtype,
+            shape(),
+            FragmentMajor::Col,
+        ));
+        body.verify()
+            .expect("a column-declared operand fragment loads and multiplies");
+    }
+}
+
+#[test]
+fn lds_tile_base_must_be_an_index() {
+    let mut body = tile(WmmaDtype::F16, true);
+    let Statement::WmmaLoadLds { base, .. } = &mut body.blocks[0].statements[1] else {
+        unreachable!()
+    };
+    *base = Operand::Const(Constant::F32(0.0));
+    let error = body.verify().expect_err("a float base must refuse");
+    assert_eq!(error.site, site(0, 1));
+    assert!(
+        matches!(error.kind, VerifyErrorKind::TypeMismatch { .. }),
+        "{error:?}"
+    );
+
+    let mut body = tile(WmmaDtype::F16, true);
+    let Statement::WmmaStoreLds { base, .. } = &mut body.blocks[0].statements[5] else {
+        unreachable!()
+    };
+    *base = Operand::Const(Constant::I32(0));
+    let error = body.verify().expect_err("an i32 store base must refuse");
+    assert_eq!(error.site, site(0, 5));
+    assert!(
+        matches!(error.kind, VerifyErrorKind::TypeMismatch { .. }),
+        "{error:?}"
+    );
+}
+
+/// An accumulator-role LDS load fills an accumulator local (any layout), never an operand fragment.
+#[test]
+fn accumulator_load_fills_an_accumulator_only() {
+    for dtype in [WmmaDtype::F16, WmmaDtype::Bf16] {
+        let acc_load = |dst| Statement::WmmaLoadLds {
+            role: FragmentRole::Accumulator,
+            dtype,
+            shape: shape(),
+            array: 1,
+            base: Operand::Const(Constant::Usize(64)),
+            major: FragmentMajor::Col,
+            stride: 16,
+            dst: l(dst),
+        };
+        let mut body = tile(dtype, true);
+        body.blocks[0].statements[3] = acc_load(7);
+        body.verify()
+            .expect("an accumulator load seeds the accumulator");
+
+        let mut body = tile(dtype, true);
+        body.blocks[0].statements[3] = acc_load(5);
+        let error = body
+            .verify()
+            .expect_err("an accumulator load into A must refuse");
+        assert_eq!(error.site, site(0, 3));
+        assert_eq!(
+            error.kind,
+            mismatch(
+                5,
+                FragmentTy::accumulator(dtype, shape()),
+                FragmentTy::matrix(WmmaMat::A, dtype, shape())
+            )
+        );
+    }
+}
+
+#[test]
+fn element_access_is_per_lane_accumulator_registers() {
+    let read = |idx| Statement::WmmaElemRead {
+        src: l(7),
+        idx,
+        dst: l(8),
+    };
+    let write = |idx| Statement::WmmaElemWrite {
+        dst: l(7),
+        idx,
+        value: Operand::Copy(Place::local(l(8))),
+    };
+    let with_elements = |statements: Vec<Statement>| {
+        let mut body = tile(WmmaDtype::F16, false);
+        body.locals.push(LocalDecl {
+            ty: Ty::F32,
+            mutable: true,
+        });
+        let at = 4;
+        for (n, s) in statements.into_iter().enumerate() {
+            body.blocks[0].statements.insert(at + n, s);
+        }
+        body
+    };
+
+    with_elements(vec![read(0), write(7)])
+        .verify()
+        .expect("elements 0..8 are addressable");
+
+    let error = with_elements(vec![read(8)])
+        .verify()
+        .expect_err("element 8 does not exist");
+    assert_eq!(error.site, site(0, 4));
+    assert_eq!(
+        error.kind,
+        VerifyErrorKind::FragmentElementOutOfRange { idx: 8 }
+    );
+    let error = with_elements(vec![read(0), write(200)])
+        .verify()
+        .expect_err("element 200 does not exist");
+    assert_eq!(
+        error.kind,
+        VerifyErrorKind::FragmentElementOutOfRange { idx: 200 }
+    );
+
+    // An operand fragment has no declared element map.
+    let mut on_operand = with_elements(vec![read(0)]);
+    let Statement::WmmaElemRead { src, .. } = &mut on_operand.blocks[0].statements[4] else {
+        unreachable!()
+    };
+    *src = l(5);
+    let error = on_operand.verify().expect_err("A has no element map");
+    assert!(
+        matches!(
+            error.kind,
+            VerifyErrorKind::InvalidOperandType {
+                what: "fragment element access",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+
+    // The element is an f32 on both sides.
+    let mut wide = with_elements(vec![read(0)]);
+    wide.locals[8].ty = Ty::Usize;
+    let error = wide.verify().expect_err("a usize destination must refuse");
+    assert!(
+        matches!(error.kind, VerifyErrorKind::TypeMismatch { .. }),
+        "{error:?}"
+    );
 }

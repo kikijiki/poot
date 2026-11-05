@@ -199,6 +199,16 @@ fn float_width(float: FloatFormat) -> usize {
 }
 
 impl BlockContentCheck {
+    /// Bytes of one block.
+    pub(crate) fn block_bytes(&self) -> usize {
+        self.block_bytes
+    }
+
+    /// Values (K elements) of one block.
+    pub(crate) fn values(&self) -> usize {
+        self.values
+    }
+
     /// The first non-finite stored float of `bytes`, a run of whole blocks: its field's role and
     /// the flat K index of the first element it is the value of. Fields are checked in descriptor
     /// order within a block, so the answer is the first failing element of the first failing

@@ -268,7 +268,8 @@ fn a_multi_consumer_boundary_has_a_complete_map_and_an_exact_per_device_footprin
     // Footprints: weights are 16 / 512 / 128 bytes; arenas come from the programs themselves.
     let footprint: HashMap<DeviceId, _> = program.footprints().iter().copied().collect();
     assert_eq!(footprint.len(), 3);
-    let arena = |stage: usize| stages[stage].2.buffer_plan().arena_bytes() as u64;
+    let arena =
+        |stage: usize| crate::EntryArena::plan([stages[stage].2.buffer_plan()]).bytes() as u64;
     assert_eq!(footprint[&DeviceId(0)].dense_constants, 16);
     assert_eq!(footprint[&DeviceId(1)].dense_constants, 512);
     assert_eq!(footprint[&DeviceId(2)].dense_constants, 128);

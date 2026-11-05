@@ -1,5 +1,5 @@
 //! Card 522: `Context::device_caps` fills a plausible descriptor on the real
-//! device, and `tensor_core` is a real `VK_KHR_cooperative_matrix` measurement, not a device-name guess -
+//! device, and `matrix_units` is a real `VK_KHR_cooperative_matrix` measurement, not a device-name guess -
 //! confirmed by this box's real RDNA3.5 WMMA hardware reporting a matching config. Skips (passes) if no
 //! Vulkan device is available.
 
@@ -33,13 +33,14 @@ fn device_caps_is_plausible_on_the_real_device() {
     }
 }
 
-/// This box's iGPU is RDNA3.5 (gfx1151), which has WMMA matrix hardware. `Context::device_caps` must
-/// report a confirmed tensor-core family here, measured from `VK_KHR_cooperative_matrix` - not `None`
-/// (which a name-string classifier would give, since Mesa RADV's device name carries a marketing
-/// codename, "RADV STRIX_HALO", not a gfx code) and not `UnknownNotExposedByApi` (which would mean the
-/// query itself found no coop-matrix extension on this device, also wrong on this box).
+/// POOT-1431: this box's iGPU is RDNA3.5 (gfx1151) behind RADV. `Context::device_caps` must report exactly one
+/// matrix unit, measured from `VK_KHR_cooperative_matrix`: an opaque f16 16x16x16 fragment across 32 lanes. RADV
+/// exposes no bf16 cooperative matrix (Mesa disables `VK_KHR_shader_bfloat16` on gfx11), so a bf16 config would
+/// route bf16 operands to a body that cannot lower them.
+/// Mutation: report a bf16 config (`MatrixUnits::of` with a `Bf16` `FragmentConfig`) from
+/// `MatrixUnits::cooperative_matrix`; the dtype assertion goes red.
 #[test]
-fn raw_vulkan_reports_wmma_class_support_on_this_box() {
+fn raw_vulkan_reports_exactly_an_opaque_f16_fragment_on_this_box() {
     let ctx = match Context::new() {
         Ok(c) => c,
         Err(e) => {
@@ -54,11 +55,21 @@ fn raw_vulkan_reports_wmma_class_support_on_this_box() {
         );
         return;
     }
+    let units = ctx
+        .device_caps()
+        .matrix_units
+        .known()
+        .expect("a Vulkan device reports its matrix units");
+    let configs: Vec<_> = units.iter().collect();
     assert_eq!(
-        ctx.device_caps().tensor_core,
-        poot_target::TensorCoreSupport::Wmma16x16x16Rdna3,
-        "this box's gfx1151 iGPU must report confirmed WMMA-class cooperative-matrix support"
+        configs.iter().map(|c| c.dtype).collect::<Vec<_>>(),
+        [poot_target::FragmentDtype::F16],
+        "RADV offers f16 cooperative matrices only: {configs:?}"
     );
+    let config = configs[0];
+    assert_eq!(config.shape, poot_target::FragmentShape::M16N16K16);
+    assert_eq!(config.layout, poot_target::FragmentLayout::Opaque);
+    assert_eq!(config.subgroup, 32);
 }
 
 /// POOT-1231 SC-001: the reference caps the raw Vulkan planner column compiles against are this device's

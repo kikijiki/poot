@@ -7,13 +7,11 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use std::num::NonZeroUsize;
-
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
 
 use super::{LoadError, QuantKind, QuantScheme, checked_header_end, miss, parse_dtype};
-use crate::plan::{Container, JobKind, LoadPlan, TensorJob, build_store, default_workers};
+use crate::plan::{Container, JobKind, LoadPlan, TensorJob, build_store};
 
 struct UniqueSafetensorsHeader(serde_json::Map<String, serde_json::Value>);
 
@@ -323,24 +321,20 @@ pub fn map_weight_files<E: From<LoadError>>(
 /// decisions 1 and 3, card 540b). No f32 widening happens here; a consumer that needs f32 (the CPU
 /// oracle, or a GPU backend with no native upload lane for the stored dtype) decodes on demand from the
 /// returned entries. Once the last file is read, every file must still be the one that was mapped
-/// (ADR-0103 amendment, boundary 1) or the load is [`LoadError::SourceChanged`]. The tensors are
-/// validated on `workers` threads ([`build_store`]).
-pub fn load_mapped_weight_store(
-    files: &[(String, StoredBytes)],
-    workers: NonZeroUsize,
-) -> Result<WeightStore, LoadError> {
-    build_store(safetensors_plan(files)?, workers)
+/// (ADR-0103 amendment, boundary 1) or the load is [`LoadError::SourceChanged`]. The entries are
+/// built by [`build_store`]: structure only, the content is checked when the upload reads it.
+pub fn load_mapped_weight_store(files: &[(String, StoredBytes)]) -> Result<WeightStore, LoadError> {
+    build_store(safetensors_plan(files)?)
 }
 
-/// [`map_weight_files`] then [`load_mapped_weight_store`] on [`default_workers`], for a test with no
-/// files to pin.
+/// [`map_weight_files`] then [`load_mapped_weight_store`], for a test with no files to pin.
 #[cfg(any(test, feature = "test-support"))]
 pub fn load_weight_store(dir: impl AsRef<Path>) -> Result<WeightStore, LoadError> {
     let dir = dir.as_ref();
     let files = map_weight_files(dir, |name| {
         std::fs::read(dir.join(name)).map_err(LoadError::from)
     })?;
-    load_mapped_weight_store(&files, default_workers())
+    load_mapped_weight_store(&files)
 }
 
 /// Whether `prefix` (a `.weight` tensor's name without that suffix) names one numbered shard of a
@@ -649,7 +643,7 @@ pub fn pack_quantized_linears(
             }
         };
         let payload = PackedWeight::try_new(format, shape)
-            .and_then(|weight| PackedPayload::try_new(weight, sources))
+            .and_then(|weight| PackedPayload::try_new_deferred(weight, sources))
             .map_err(|source| LoadError::QuantizedLinearPayload {
                 linear: format!("{prefix}.weight"),
                 source,
@@ -673,7 +667,7 @@ pub fn pack_quantized_linears(
 /// name) into a [`WeightStore`]. Used by loaders whose single archive has its own name (the LoRA
 /// adapter loader's `adapter_model.safetensors`, e.g.). See [`load_weight_store`].
 pub fn load_weight_store_file(path: impl AsRef<Path>) -> Result<WeightStore, LoadError> {
-    load_mapped_weight_store(&[map_file(path.as_ref())?], default_workers())
+    load_mapped_weight_store(&[map_file(path.as_ref())?])
 }
 
 /// The dense entry named `name`, or a typed error for a missing/packed entry. Exposed beyond this
@@ -698,7 +692,7 @@ pub(crate) mod test_only {
     /// [`load_weight_store`]. Only this crate's tests build an archive in memory.
     pub(crate) fn load_weight_store_bytes(bytes: &[u8]) -> Result<WeightStore, LoadError> {
         let files = [(String::new(), StoredBytes::from(bytes.to_vec()))];
-        build_store(safetensors_plan(&files)?, default_workers())
+        build_store(safetensors_plan(&files)?)
     }
 }
 

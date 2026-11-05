@@ -1,6 +1,8 @@
 use std::fmt::Write as _;
 
-use poot_kernel_ir::{FragmentRole, FragmentTy, WmmaMat, WmmaShape};
+use poot_kernel_ir::{
+    FragmentMajor, FragmentRole, FragmentTy, Operand, Ty, WmmaMat, WmmaShape, accumulator_map,
+};
 
 use super::{EmitError, Emitter, Local, Place, ProjectionElem, Target};
 
@@ -97,14 +99,32 @@ impl<'a> Emitter<'a> {
         self.check_wmma_dtype_matches(&elem_ty, dtype)
     }
 
-    /// [`Self::check_wmma_dtype_matches`] for a workgroup-local (LDS) array (`WmmaLoadLds`'s `array`).
+    /// [`Self::check_wmma_dtype_matches`] for a workgroup-local (LDS) array (`WmmaLoadLds`'s `array`): an
+    /// A/B operand tile holds `dtype`, an accumulator tile holds f32.
     pub(super) fn check_wmma_load_lds_dtype(
         &self,
         array: u8,
+        role: FragmentRole,
         dtype: poot_kernel_ir::WmmaDtype,
     ) -> Result<(), EmitError> {
         let elem_ty = self.body.workgroup_locals[array as usize].elem_ty.clone();
-        self.check_wmma_dtype_matches(&elem_ty, dtype)
+        match role {
+            FragmentRole::Matrix(_) => self.check_wmma_dtype_matches(&elem_ty, dtype),
+            FragmentRole::Accumulator => self.check_wmma_lds_accumulator_array(array),
+        }
+    }
+
+    /// An accumulator tile staged in LDS is f32 (`WmmaStoreLds` writes it, an accumulator `WmmaLoadLds`
+    /// reads it): any other element type would convert silently or reinterpret bits.
+    pub(super) fn check_wmma_lds_accumulator_array(&self, array: u8) -> Result<(), EmitError> {
+        let elem_ty = &self.body.workgroup_locals[array as usize].elem_ty;
+        if *elem_ty == Ty::F32 {
+            Ok(())
+        } else {
+            Err(EmitError::Unsupported(format!(
+                "an accumulator fragment tile in LDS must be f32, array {array} holds {elem_ty:?}"
+            )))
+        }
     }
 
     /// The AMD arch descriptor when the target is AMDGPU, else `None`; WMMA emit uses it to gate the tensor-core
@@ -116,18 +136,18 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Guard the AMDGPU WMMA path on the detected tensor-core family. Only the RDNA3/3.5 (gfx11xx) WMMA 16x16x16
-    /// layout is emitted; RDNA4 (128b) and CDNA (MFMA) use different fragment packings, so they get a typed
-    /// "unsupported target" error instead of the wrong intrinsic or a backend "cannot select" crash (FR-003).
+    /// Guard the AMDGPU WMMA path on the arch's matrix units. Only the RDNA3/3.5 (gfx11xx) WMMA 16x16x16
+    /// layout is emitted; RDNA4 (128b) and CDNA (MFMA) report no unit, so they get a typed "unsupported target"
+    /// error instead of the wrong intrinsic or a backend "cannot select" crash (FR-003).
     pub(super) fn require_amd_wmma(&self) -> Result<(), EmitError> {
         if let Some(arch) = self.amd_arch()
-            && arch.tensor_core != poot_target::TensorCoreSupport::Wmma16x16x16Rdna3
+            && arch.matrix_units().is_empty()
         {
             return Err(EmitError::Unsupported(format!(
-                "WMMA tensor-core codegen unsupported for AMD target {} ({:?}); only \
+                "WMMA tensor-core codegen unsupported for AMD target {} (wave {}); only \
                  RDNA3/3.5 (gfx11xx) WMMA 16x16x16 is implemented",
                 arch.mcpu(),
-                arch.tensor_core,
+                arch.wave,
             )));
         }
         Ok(())
@@ -361,6 +381,82 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// The `CooperativeMatrixLayout` operand of a coopmat load/store: `RowMajorKHR` is 0, `ColumnMajorKHR` 1.
+    fn coopmat_layout(major: FragmentMajor) -> u32 {
+        match major {
+            FragmentMajor::Row => 0,
+            FragmentMajor::Col => 1,
+        }
+    }
+
+    /// `OpCooperativeMatrixLoadKHR` from workgroup (LDS) storage: an A/B operand tile of f16, or an f32
+    /// accumulator tile, at element `base` of `array`, in tile layout `major`. `stride` is in elements of the
+    /// array's element type (the pointer addresses elements, not bytes: the LDS arrays are typed). The
+    /// cooperative matrix is logical, so a column-major tile loads into the same fragment a row-major one
+    /// would.
+    #[expect(clippy::too_many_arguments)]
+    pub(super) fn emit_wmma_load_lds_coopmat(
+        &mut self,
+        role: FragmentRole,
+        array: u8,
+        base: &Operand,
+        major: FragmentMajor,
+        stride: u32,
+        dst: Local,
+        w: &mut String,
+    ) -> Result<(), EmitError> {
+        let (ty, mangled) = match role {
+            FragmentRole::Matrix(WmmaMat::A) => (
+                self.coopmat_ty("half", 0),
+                "_Z32__spirv_CooperativeMatrixLoadKHR_4",
+            ),
+            FragmentRole::Matrix(WmmaMat::B) => (
+                self.coopmat_ty("half", 1),
+                "_Z32__spirv_CooperativeMatrixLoadKHR_5",
+            ),
+            FragmentRole::Accumulator => (
+                self.coopmat_ty("float", 2),
+                "_Z32__spirv_CooperativeMatrixLoadKHR_3",
+            ),
+        };
+        let (ptr, _) = self.lds_tile_ptr(array, base, w)?;
+        let layout = Self::coopmat_layout(major);
+        self.declares.insert(format!(
+            "declare dso_local spir_func {ty} @{mangled}(ptr addrspace(3), i32, i64, i32)"
+        ));
+        let d = self.fresh();
+        let _ = writeln!(
+            w,
+            "  {d} = tail call spir_func {ty} @{mangled}(ptr addrspace(3) {ptr}, i32 {layout}, i64 {stride}, i32 0)"
+        );
+        self.store_place(&Place::local(dst), &d, &ty, w)
+    }
+
+    /// `OpCooperativeMatrixStoreKHR` of the f32 accumulator to workgroup (LDS) storage at element `base` of
+    /// the f32 `array`, in tile layout `major`.
+    pub(super) fn emit_wmma_store_lds_coopmat(
+        &mut self,
+        array: u8,
+        base: &Operand,
+        major: FragmentMajor,
+        stride: u32,
+        src: Local,
+        w: &mut String,
+    ) -> Result<(), EmitError> {
+        let (v_reg, v_ty) = self.load_place(&Place::local(src), w)?;
+        let (ptr, _) = self.lds_tile_ptr(array, base, w)?;
+        let layout = Self::coopmat_layout(major);
+        let mangled = "_Z33__spirv_CooperativeMatrixStoreKHR_1";
+        self.declares.insert(format!(
+            "declare dso_local spir_func void @{mangled}(ptr addrspace(3), {v_ty}, i32, i64, i32)"
+        ));
+        let _ = writeln!(
+            w,
+            "  tail call spir_func void @{mangled}(ptr addrspace(3) {ptr}, {v_ty} {v_reg}, i32 {layout}, i64 {stride}, i32 0)"
+        );
+        Ok(())
+    }
+
     // ---- dispatch (target-neutral entry points, card 530) -------------------------------------------
 
     #[expect(clippy::too_many_arguments)]
@@ -382,45 +478,106 @@ impl<'a> Emitter<'a> {
         }
         if self.amd_arch().is_some() {
             self.require_amd_wmma()?;
-            return self.emit_wmma_load_amdgcn(which, dtype, tile, stride, dst, w);
+            return self.emit_wmma_load_amdgcn(which, tile, stride, dst, w);
         }
         let (ptr, _, addr) = self.element_ptr(tile, w)?;
         let gptr = self.wmma_generic_ptr(&ptr, addr, w);
-        self.emit_wmma_load_from_nvptx(which, dtype, &gptr, stride, dst, w)
+        self.emit_wmma_load_from_nvptx(which, dtype, FragmentMajor::Row, &gptr, stride, dst, w)
     }
 
-    /// WMMA-load an A/B fragment from a workgroup-local (LDS) array (the dequant gemm stages a bf16 B-tile
-    /// there); same intrinsic as `emit_wmma_load` with the LDS global addrspacecast to generic. NVPTX-only.
-    #[expect(clippy::too_many_arguments)]
-    pub(super) fn emit_wmma_load_lds(
+    /// The element pointer of workgroup-local array `array` at index `base`, and the array's element LLVM type.
+    /// The pointer is in LDS (`addrspace(3)`); the `.p0` NVPTX intrinsics take it addrspacecast to generic.
+    fn lds_tile_ptr(
         &mut self,
-        which: poot_kernel_ir::WmmaMat,
-        dtype: poot_kernel_ir::WmmaDtype,
-        shape: WmmaShape,
         array: u8,
-        stride: u32,
-        dst: Local,
+        base: &Operand,
         w: &mut String,
-    ) -> Result<(), EmitError> {
-        self.wmma_check_shape(shape)?;
-        self.check_wmma_load_lds_dtype(array, dtype)?;
-        if self.target != Target::Nvptx {
-            return Err(EmitError::Unsupported(
-                "WmmaLoadLds is NVPTX-only (no AMDGPU LDS WMMA path yet)".into(),
-            ));
-        }
+    ) -> Result<(String, String), EmitError> {
+        let (base_idx, _) = self.operand(base, w)?;
         let name = self.body.name.clone();
         let decl = &self.body.workgroup_locals[array as usize];
         let (n, elem) = (decl.len, self.scalar_llty(&decl.elem_ty)?);
         let us = self.usize_llty();
-        let base = self.fresh();
+        let ptr = self.fresh();
         let _ = writeln!(
             w,
-            "  {base} = getelementptr [{n} x {elem}], ptr addrspace(3) @{name}_lds{array}, {us} 0, {us} 0"
+            "  {ptr} = getelementptr [{n} x {elem}], ptr addrspace(3) @{name}_lds{array}, {us} 0, {us} {base_idx}"
         );
-        let gptr = self.fresh();
-        let _ = writeln!(w, "  {gptr} = addrspacecast ptr addrspace(3) {base} to ptr");
-        self.emit_wmma_load_from_nvptx(which, dtype, &gptr, stride, dst, w)
+        Ok((ptr, elem))
+    }
+
+    /// Load a fragment from a workgroup-local (LDS) array: the tile's first element at index `base`, tile
+    /// layout `major` (the fragment-IR contract: LDS fragment ops with a base and a major, on every target).
+    /// An A/B role fills an operand fragment; the accumulator role reloads an f32 tile, which is how an
+    /// `Opaque`-layout target applies a per-row scale to an accumulator.
+    #[expect(clippy::too_many_arguments)]
+    pub(super) fn emit_wmma_load_lds(
+        &mut self,
+        role: FragmentRole,
+        dtype: poot_kernel_ir::WmmaDtype,
+        shape: WmmaShape,
+        array: u8,
+        base: &Operand,
+        major: FragmentMajor,
+        stride: u32,
+        dst: Local,
+        w: &mut String,
+    ) -> Result<(), EmitError> {
+        self.wmma_check_target(dtype)?;
+        self.wmma_check_shape(shape)?;
+        self.check_wmma_load_lds_dtype(array, role, dtype)?;
+        if self.target == Target::SpirvVulkan {
+            return self.emit_wmma_load_lds_coopmat(role, array, base, major, stride, dst, w);
+        }
+        let (ptr, elem) = self.lds_tile_ptr(array, base, w)?;
+        if self.amd_arch().is_some() {
+            self.require_amd_wmma()?;
+            return match role {
+                FragmentRole::Matrix(which) => self.emit_wmma_load_ab_amdgcn(
+                    which,
+                    major,
+                    stride,
+                    AmdTilePtr::lds(&ptr, &elem),
+                    dst,
+                    w,
+                ),
+                FragmentRole::Accumulator => self.emit_wmma_load_acc_amdgcn(
+                    major,
+                    stride,
+                    AmdTilePtr::lds(&ptr, &elem),
+                    dst,
+                    w,
+                ),
+            };
+        }
+        let gptr = self.wmma_generic_ptr(&ptr, 3, w);
+        match role {
+            FragmentRole::Matrix(which) => {
+                self.emit_wmma_load_from_nvptx(which, dtype, major, &gptr, stride, dst, w)
+            }
+            FragmentRole::Accumulator => {
+                self.emit_wmma_load_acc_nvptx(major, &gptr, stride, dst, w)
+            }
+        }
+    }
+
+    /// NVPTX `wmma.load.c`: the f32 accumulator fragment from `gptr` (generic) in tile layout `major`.
+    fn emit_wmma_load_acc_nvptx(
+        &mut self,
+        major: FragmentMajor,
+        gptr: &str,
+        stride: u32,
+        dst: Local,
+        w: &mut String,
+    ) -> Result<(), EmitError> {
+        let layout = nvptx_layout(major);
+        let fty = Self::NVPTX_ACC_STRUCT_TY;
+        let intrin = format!("llvm.nvvm.wmma.m16n16k16.load.c.{layout}.stride.f32.p0");
+        self.declares
+            .insert(format!("declare {fty} @{intrin}(ptr, i32)"));
+        let f = self.fresh();
+        let _ = writeln!(w, "  {f} = call {fty} @{intrin}(ptr {gptr}, i32 {stride})");
+        self.store_place(&Place::local(dst), &f, fty, w)
     }
 
     /// The per-`dtype` NVPTX WMMA A/B fragment field list: the LLVM element type each aggregate field of the
@@ -443,10 +600,12 @@ impl<'a> Emitter<'a> {
     /// NVPTX WMMA fragment load: call the `load.{a,b}.row.stride.<dtype>.p0` intrinsic on `gptr` and store the
     /// returned aggregate straight into `dst`'s alloca (one store, no per-lane spill - `dst`'s alloca is
     /// exactly this aggregate type, see `fragment_llty`). `gptr` is a generic (addrspace 0) pointer.
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn emit_wmma_load_from_nvptx(
         &mut self,
         which: poot_kernel_ir::WmmaMat,
         dtype: poot_kernel_ir::WmmaDtype,
+        major: FragmentMajor,
         gptr: &str,
         stride: u32,
         dst: Local,
@@ -463,7 +622,8 @@ impl<'a> Emitter<'a> {
         let fty = Self::nvptx_ab_struct_ty(dtype);
         // Generic (.p0) addrspace: the only wmma load/store intrinsic variant llc lowers for all spaces (the .p1/.p3
         // variants are not all present); a generic pointer covers global + shared.
-        let intrin = format!("llvm.nvvm.wmma.m16n16k16.load.{mat}.row.stride.{dty_name}.p0");
+        let layout = nvptx_layout(major);
+        let intrin = format!("llvm.nvvm.wmma.m16n16k16.load.{mat}.{layout}.stride.{dty_name}.p0");
         self.declares
             .insert(format!("declare {fty} @{intrin}(ptr, i32)"));
         let f = self.fresh();
@@ -471,17 +631,10 @@ impl<'a> Emitter<'a> {
         self.store_place(&Place::local(dst), &f, &fty, w)
     }
 
-    /// AMDGPU WMMA fragment load (GFX11 wave32, 16x16x16). Each lane holds 16 values of `dtype`'s element
-    /// (16 bf16/f16 lanes, matching the register width WMMA reads). A (m16 x k16): loads A[row=lane%16,
-    /// 0..15] -> A[i, k]. B (k16 x n16): loads B[0..15, col=lane%16] -> B[k, j] (transposed). Builds the
-    /// native `<16 x elem>` vector (`elem` from `dtype`, not a bitcast trick: `half`/`bfloat` are both
-    /// ordinary LLVM scalar types this backend accepts, see `scalar_llty`), then bitcasts it once to the
-    /// fragment's raw-bits alloca type `<8 x i32>` (same total width either way) and stores that - one
-    /// store, no per-lane spill.
+    /// AMDGPU WMMA fragment load from a global tile.
     pub(super) fn emit_wmma_load_amdgcn(
         &mut self,
         which: poot_kernel_ir::WmmaMat,
-        dtype: poot_kernel_ir::WmmaDtype,
         tile: &Place,
         stride: u32,
         dst: Local,
@@ -489,66 +642,87 @@ impl<'a> Emitter<'a> {
     ) -> Result<(), EmitError> {
         let (base_ptr, elem_llty, addr) = self.element_ptr(tile, w)?;
         let gptr = self.wmma_generic_ptr(&base_ptr, addr, w);
-        let _ = dtype; // elem_llty already reflects the tile's declared element type (bf16 or f16).
+        self.emit_wmma_load_ab_amdgcn(
+            which,
+            FragmentMajor::Row,
+            stride,
+            AmdTilePtr::generic(&gptr, &elem_llty),
+            dst,
+            w,
+        )
+    }
 
+    /// The lane id within its wave32 (`workitem.id.x & 31`).
+    fn amdgcn_lane(&mut self, w: &mut String) -> String {
         self.declares
             .insert("declare i32 @llvm.amdgcn.workitem.id.x()".into());
         let lane_raw = self.fresh();
         let _ = writeln!(w, "  {lane_raw} = call i32 @llvm.amdgcn.workitem.id.x()");
         let lane = self.fresh();
         let _ = writeln!(w, "  {lane} = and i32 {lane_raw}, 31");
-        let row = self.fresh();
-        let _ = writeln!(w, "  {row} = and i32 {lane}, 15");
-        let us = self.usize_llty();
+        lane
+    }
 
-        // For A: address = tile + row * stride + j  (row-major, j = 0..15)
-        // For B: address = tile + j * stride + row  (transposed: B[j, row])
-        let row_stride = match which {
-            poot_kernel_ir::WmmaMat::A => {
-                let rs = self.fresh();
-                let _ = writeln!(w, "  {rs} = mul i32 {row}, {stride}");
-                rs
-            }
-            poot_kernel_ir::WmmaMat::B => String::new(),
+    /// AMDGPU WMMA A/B fragment load (GFX11 wave32, 16x16x16) from `tile`, in tile layout `major`. Each lane
+    /// holds 16 values of the tile's element type, those of one row of A (`m = lane % 16`, all 16 `k`) or one
+    /// column of B (`n = lane % 16`, all 16 `k`); the two half-waves replicate. Which memory axis a lane's
+    /// 16 values step along follows from the layout: `k` is contiguous for A row-major and B column-major
+    /// (`r * stride + j`), strided for A column-major and B row-major (`j * stride + r`). Builds the native
+    /// `<16 x elem>` vector, bitcasts it once to the fragment's raw-bits alloca type `<8 x i32>` and stores
+    /// that: one store, no per-lane spill.
+    pub(super) fn emit_wmma_load_ab_amdgcn(
+        &mut self,
+        which: WmmaMat,
+        major: FragmentMajor,
+        stride: u32,
+        tile: AmdTilePtr<'_>,
+        dst: Local,
+        w: &mut String,
+    ) -> Result<(), EmitError> {
+        let AmdTilePtr {
+            ptr_ty,
+            ptr,
+            elem: elem_llty,
+        } = tile;
+        let lane = self.amdgcn_lane(w);
+        let r = self.fresh();
+        let _ = writeln!(w, "  {r} = and i32 {lane}, 15");
+        let us = self.usize_llty();
+        let k_contiguous = matches!(
+            (which, major),
+            (WmmaMat::A, FragmentMajor::Row) | (WmmaMat::B, FragmentMajor::Col)
+        );
+        // `k` contiguous: one `r * stride` (the lane's row/column start), then `+ j`. `k` strided: `r + j *
+        // stride`, a constant per element.
+        let r_stride = if k_contiguous {
+            let o = self.fresh();
+            let _ = writeln!(w, "  {o} = mul i32 {r}, {stride}");
+            o
+        } else {
+            String::new()
         };
 
-        // Load 16 values of `elem_llty`, build `<16 x elem_llty>`, bitcast to the `<8 x i32>` storage type.
         let vec_ty = format!("<16 x {elem_llty}>");
         let mut cur_vec = String::new();
-
         for j in 0..16u32 {
-            let offset = match which {
-                poot_kernel_ir::WmmaMat::A => {
-                    if j == 0 {
-                        row_stride.clone()
-                    } else {
-                        let o = self.fresh();
-                        let _ = writeln!(w, "  {o} = add i32 {row_stride}, {j}");
-                        o
-                    }
-                }
-                poot_kernel_ir::WmmaMat::B => {
-                    // B: offset = j * stride + row
-                    if j == 0 {
-                        row.clone()
-                    } else {
-                        let j_stride = self.fresh();
-                        let _ = writeln!(w, "  {j_stride} = mul i32 {j}, {stride}");
-                        let o = self.fresh();
-                        let _ = writeln!(w, "  {o} = add i32 {j_stride}, {row}");
-                        o
-                    }
-                }
+            let offset = if k_contiguous {
+                let o = self.fresh();
+                let _ = writeln!(w, "  {o} = add i32 {r_stride}, {j}");
+                o
+            } else {
+                let o = self.fresh();
+                let _ = writeln!(w, "  {o} = add i32 {r}, {}", j * stride);
+                o
             };
             let offset_us = self.fresh();
             let _ = writeln!(w, "  {offset_us} = zext i32 {offset} to {us}");
             let addr_j = self.fresh();
             let _ = writeln!(
                 w,
-                "  {addr_j} = getelementptr {elem_llty}, ptr {gptr}, {us} {offset_us}"
+                "  {addr_j} = getelementptr {elem_llty}, {ptr_ty} {ptr}, {us} {offset_us}"
             );
             let val = self.fresh();
-            let _ = writeln!(w, "  {val} = load {elem_llty}, ptr {addr_j}");
+            let _ = writeln!(w, "  {val} = load {elem_llty}, {ptr_ty} {addr_j}");
             let new_vec = self.fresh();
             let prev = if j == 0 { "poison" } else { cur_vec.as_str() };
             let _ = writeln!(
@@ -562,6 +736,137 @@ impl<'a> Emitter<'a> {
         let frag = self.fresh();
         let _ = writeln!(w, "  {frag} = bitcast {vec_ty} {cur_vec} to {frag_ty}");
         self.store_place(&Place::local(dst), &frag, frag_ty, w)
+    }
+
+    /// The memory offset (in elements) of accumulator element `i` of this lane in a 16x16 tile of layout
+    /// `major` and `stride`, under the declared [`accumulator_map`]: row `2 i + lane / 16`, column
+    /// `lane % 16`. `half` is `lane / 16`, `col` is `lane % 16`.
+    fn amdgcn_acc_offset(
+        &mut self,
+        i: u32,
+        half: &str,
+        col: &str,
+        major: FragmentMajor,
+        stride: u32,
+        w: &mut String,
+    ) -> String {
+        let row = self.fresh();
+        let _ = writeln!(
+            w,
+            "  {row} = add i32 {half}, {}",
+            accumulator_map::position(0, i).0
+        );
+        let (major_idx, minor_idx) = match major {
+            FragmentMajor::Row => (row.as_str(), col),
+            FragmentMajor::Col => (col, row.as_str()),
+        };
+        let scaled = self.fresh();
+        let _ = writeln!(w, "  {scaled} = mul i32 {major_idx}, {stride}");
+        let offset = self.fresh();
+        let _ = writeln!(w, "  {offset} = add i32 {scaled}, {minor_idx}");
+        offset
+    }
+
+    /// `(lane / 16, lane % 16)`: the row-set and the column every [`accumulator_map`] element of this lane uses.
+    fn amdgcn_acc_lane_parts(&mut self, w: &mut String) -> (String, String) {
+        let lane = self.amdgcn_lane(w);
+        let col = self.fresh();
+        let _ = writeln!(
+            w,
+            "  {col} = and i32 {lane}, {}",
+            accumulator_map::LANES_PER_ROW_SET - 1
+        );
+        let half = self.fresh();
+        let _ = writeln!(w, "  {half} = lshr i32 {lane}, 4");
+        (half, col)
+    }
+
+    /// AMDGPU accumulator load: lane l's `<8 x float>` registers from `tile` under the declared
+    /// [`accumulator_map`], tile layout `major`.
+    pub(super) fn emit_wmma_load_acc_amdgcn(
+        &mut self,
+        major: FragmentMajor,
+        stride: u32,
+        tile: AmdTilePtr<'_>,
+        dst: Local,
+        w: &mut String,
+    ) -> Result<(), EmitError> {
+        let AmdTilePtr {
+            ptr_ty,
+            ptr,
+            elem: elem_llty,
+        } = tile;
+        let (half, col) = self.amdgcn_acc_lane_parts(w);
+        let us = self.usize_llty();
+        let mut cur = "poison".to_string();
+        for i in 0..accumulator_map::ELEMENTS_PER_LANE {
+            let offset = self.amdgcn_acc_offset(i, &half, &col, major, stride, w);
+            let offset_us = self.fresh();
+            let _ = writeln!(w, "  {offset_us} = zext i32 {offset} to {us}");
+            let addr_i = self.fresh();
+            let _ = writeln!(
+                w,
+                "  {addr_i} = getelementptr {elem_llty}, {ptr_ty} {ptr}, {us} {offset_us}"
+            );
+            let val = self.fresh();
+            let _ = writeln!(w, "  {val} = load {elem_llty}, {ptr_ty} {addr_i}");
+            let next = self.fresh();
+            let _ = writeln!(
+                w,
+                "  {next} = insertelement <8 x float> {cur}, float {val}, i32 {i}"
+            );
+            cur = next;
+        }
+        self.store_place(&Place::local(dst), &cur, "<8 x float>", w)
+    }
+
+    /// Accumulator element read: `dst = acc[idx]` of this lane, under the declared [`accumulator_map`].
+    /// AMDGCN only: the other targets' fragment registers have no public layout.
+    pub(super) fn emit_wmma_elem_read(
+        &mut self,
+        src: Local,
+        idx: u8,
+        dst: Local,
+        w: &mut String,
+    ) -> Result<(), EmitError> {
+        self.require_declared_fragment_layout("WmmaElemRead")?;
+        let (acc, _) = self.load_place(&Place::local(src), w)?;
+        let v = self.fresh();
+        let _ = writeln!(w, "  {v} = extractelement <8 x float> {acc}, i32 {idx}");
+        self.store_place(&Place::local(dst), &v, "float", w)
+    }
+
+    /// Accumulator element write: `acc[idx] = value` of this lane, under the declared [`accumulator_map`].
+    pub(super) fn emit_wmma_elem_write(
+        &mut self,
+        dst: Local,
+        idx: u8,
+        value: &Operand,
+        w: &mut String,
+    ) -> Result<(), EmitError> {
+        self.require_declared_fragment_layout("WmmaElemWrite")?;
+        let (v, _) = self.operand(value, w)?;
+        let (acc, _) = self.load_place(&Place::local(dst), w)?;
+        let next = self.fresh();
+        let _ = writeln!(
+            w,
+            "  {next} = insertelement <8 x float> {acc}, float {v}, i32 {idx}"
+        );
+        self.store_place(&Place::local(dst), &next, "<8 x float>", w)
+    }
+
+    /// Element access names `(lane, element)`, which only a `Declared` fragment layout defines. AMDGCN gfx11
+    /// publishes one; SPIR-V cooperative matrices and NVPTX `wmma` fragments are opaque, so they refuse
+    /// (typed) and the schedule stages the accumulator through LDS.
+    fn require_declared_fragment_layout(&self, op: &str) -> Result<(), EmitError> {
+        if self.amd_arch().is_some() {
+            self.require_amd_wmma()
+        } else {
+            Err(EmitError::Unsupported(format!(
+                "{op} needs a declared accumulator layout (AMDGCN gfx11); {:?} fragments are opaque: stage                  the accumulator through WmmaStoreLds / an accumulator WmmaLoadLds instead",
+                self.target
+            )))
+        }
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -625,12 +930,19 @@ impl<'a> Emitter<'a> {
         // ("f32.f32" here, both f32-accumulate), matching PTX ISA's
         // `wmma.mma.sync.aligned.row.row.m16n16k16.f32.f16.f16.f32`; bf16 has only one accumulate type, so
         // the name carries no C/D suffix.
+        // The multiply is specialised on the layouts the operands were loaded in (`.alayout.blayout`), which
+        // the operands' declared fragment types carry.
+        let layouts = format!(
+            "{}.{}",
+            nvptx_layout(self.operand_fragment_major(a)),
+            nvptx_layout(self.operand_fragment_major(b))
+        );
         let intrin = match dtype {
             poot_kernel_ir::WmmaDtype::Bf16 => {
-                "llvm.nvvm.wmma.m16n16k16.mma.row.row.bf16".to_string()
+                format!("llvm.nvvm.wmma.m16n16k16.mma.{layouts}.bf16")
             }
             poot_kernel_ir::WmmaDtype::F16 => {
-                "llvm.nvvm.wmma.m16n16k16.mma.row.row.f32.f32".to_string()
+                format!("llvm.nvvm.wmma.m16n16k16.mma.{layouts}.f32.f32")
             }
         };
         let arg_sig: Vec<&str> = ab_fields
@@ -652,6 +964,14 @@ impl<'a> Emitter<'a> {
             args.join(", ")
         );
         self.store_place(&Place::local(dst), &d, Self::NVPTX_ACC_STRUCT_TY, w)
+    }
+
+    /// The layout an A/B operand fragment local was declared as loaded from.
+    fn operand_fragment_major(&self, operand: Local) -> FragmentMajor {
+        match self.body.locals[operand.index as usize].ty {
+            Ty::Fragment(fragment) => fragment.major,
+            _ => FragmentMajor::Row, // the verifier only admits fragment locals here
+        }
     }
 
     /// AMDGPU WMMA MMA: `a`/`b` are already alloca'd as the raw-bits `<8 x i32>` fragment type; bitcast each
@@ -727,6 +1047,20 @@ impl<'a> Emitter<'a> {
         src: Local,
         w: &mut String,
     ) -> Result<(), EmitError> {
+        let (ptr, _, addr) = self.element_ptr(tile, w)?;
+        let gptr = self.wmma_generic_ptr(&ptr, addr, w);
+        self.emit_wmma_store_to_nvptx(FragmentMajor::Row, &gptr, stride, src, w)
+    }
+
+    /// NVPTX `wmma.store.d` of the f32 accumulator `src` to the generic pointer `gptr`, tile layout `major`.
+    fn emit_wmma_store_to_nvptx(
+        &mut self,
+        major: FragmentMajor,
+        gptr: &str,
+        stride: u32,
+        src: Local,
+        w: &mut String,
+    ) -> Result<(), EmitError> {
         let (src_val, _) = self.load_place(&Place::local(src), w)?;
         let mut vals = Vec::new();
         for i in 0..8 {
@@ -738,9 +1072,8 @@ impl<'a> Emitter<'a> {
             );
             vals.push(format!("float {e}"));
         }
-        let (ptr, _, addr) = self.element_ptr(tile, w)?;
-        let gptr = self.wmma_generic_ptr(&ptr, addr, w);
-        let intrin = "llvm.nvvm.wmma.m16n16k16.store.d.row.stride.f32.p0";
+        let layout = nvptx_layout(major);
+        let intrin = format!("llvm.nvvm.wmma.m16n16k16.store.d.{layout}.stride.f32.p0");
         self.declares.insert(format!(
             "declare void @{intrin}(ptr, float, float, float, float, float, float, float, float, i32)"
         ));
@@ -752,11 +1085,8 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    /// AMDGPU WMMA store: each wave32 lane stores 8 f32 values (`extractelement`d from the `<8 x float>`
-    /// accumulator fragment) to the 16x16 tile.
-    /// GFX11 wave32 WMMA output layout (from rocWMMA / rocKE):
-    ///   lane l, slot i -> (row = 2*i + l/16, col = l%16)
-    /// Lanes 0-15 write even rows (0,2,4,...,14), lanes 16-31 write odd rows (1,3,...,15).
+    /// AMDGPU WMMA store to a global tile (row-major): each wave32 lane stores its 8 f32 accumulator elements
+    /// at the position the declared [`accumulator_map`] gives (lanes 0-15 the even rows, lanes 16-31 the odd).
     pub(super) fn emit_wmma_store_amdgcn(
         &mut self,
         tile: &Place,
@@ -766,101 +1096,83 @@ impl<'a> Emitter<'a> {
     ) -> Result<(), EmitError> {
         let (base_ptr, elem_llty, addr) = self.element_ptr(tile, w)?;
         let gptr = self.wmma_generic_ptr(&base_ptr, addr, w);
+        self.emit_wmma_store_acc_amdgcn(
+            FragmentMajor::Row,
+            stride,
+            AmdTilePtr::generic(&gptr, &elem_llty),
+            src,
+            w,
+        )
+    }
+
+    /// Store the f32 accumulator `src` to `tile` in tile layout `major`, element `i` of this lane at the
+    /// [`accumulator_map`] position.
+    fn emit_wmma_store_acc_amdgcn(
+        &mut self,
+        major: FragmentMajor,
+        stride: u32,
+        tile: AmdTilePtr<'_>,
+        src: Local,
+        w: &mut String,
+    ) -> Result<(), EmitError> {
+        let AmdTilePtr {
+            ptr_ty,
+            ptr,
+            elem: elem_llty,
+        } = tile;
         let (src_val, _) = self.load_place(&Place::local(src), w)?;
-
-        // Get lane ID.
-        self.declares
-            .insert("declare i32 @llvm.amdgcn.workitem.id.x()".into());
-        let lane_raw = self.fresh();
-        let _ = writeln!(w, "  {lane_raw} = call i32 @llvm.amdgcn.workitem.id.x()");
-        let lane = self.fresh();
-        let _ = writeln!(w, "  {lane} = and i32 {lane_raw}, 31");
-
-        // frag = lane % 16 (column index)
-        let frag = self.fresh();
-        let _ = writeln!(w, "  {frag} = and i32 {lane}, 15");
-        // half = lane / 16 (0 for even rows, 1 for odd rows)
-        let half = self.fresh();
-        let _ = writeln!(w, "  {half} = lshr i32 {lane}, 4");
-
+        let (half, col) = self.amdgcn_acc_lane_parts(w);
         let us = self.usize_llty();
-
-        for i in 0..8usize {
+        for i in 0..accumulator_map::ELEMENTS_PER_LANE {
             let v = self.fresh();
             let _ = writeln!(w, "  {v} = extractelement <8 x float> {src_val}, i32 {i}");
-            // row = 2*i + half
-            let row = self.fresh();
-            let _ = writeln!(w, "  {row} = add i32 {half}, {i_twice}", i_twice = i * 2);
-            // col = frag
-            // byte_offset = (row * stride + col) * sizeof(elem)
-            let row_stride = self.fresh();
-            let _ = writeln!(w, "  {row_stride} = mul i32 {row}, {stride}");
-            let offset = self.fresh();
-            let _ = writeln!(w, "  {offset} = add i32 {row_stride}, {frag}");
+            let offset = self.amdgcn_acc_offset(i, &half, &col, major, stride, w);
             let offset_us = self.fresh();
             let _ = writeln!(w, "  {offset_us} = zext i32 {offset} to {us}");
-            let addr_j = self.fresh();
+            let addr_i = self.fresh();
             let _ = writeln!(
                 w,
-                "  {addr_j} = getelementptr {elem_llty}, ptr {gptr}, {us} {offset_us}"
+                "  {addr_i} = getelementptr {elem_llty}, {ptr_ty} {ptr}, {us} {offset_us}"
             );
-            let _ = writeln!(w, "  store {elem_llty} {v}, ptr {addr_j}");
+            let _ = writeln!(w, "  store {elem_llty} {v}, {ptr_ty} {addr_i}");
         }
         Ok(())
     }
 
-    /// WMMA store the f32 D fragment to a workgroup-local (LDS, `addrspace(3)`) array (base index 0) with row
-    /// `stride`. The same `store.d.row.stride.f32.p0` intrinsic as `emit_wmma_store`, but the destination is
-    /// the LDS global addrspacecast to generic (the bf16 gemm narrow epilogue stages f32 in LDS here).
-    /// NVPTX-only.
+    /// Store the f32 accumulator fragment to a workgroup-local (LDS) f32 `array`: the tile's first element at
+    /// index `base`, tile layout `major`. The narrow epilogue and an `Opaque` target's element access stage an
+    /// accumulator in LDS this way.
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn emit_wmma_store_lds(
         &mut self,
         dtype: poot_kernel_ir::WmmaDtype,
         shape: WmmaShape,
         array: u8,
+        base: &Operand,
+        major: FragmentMajor,
         stride: u32,
         src: Local,
         w: &mut String,
     ) -> Result<(), EmitError> {
         self.wmma_check_target(dtype)?;
         self.wmma_check_shape(shape)?;
-        if self.target != Target::Nvptx {
-            return Err(EmitError::Unsupported(
-                "WmmaStoreLds is NVPTX-only (no AMDGPU LDS WMMA path yet)".into(),
-            ));
+        self.check_wmma_lds_accumulator_array(array)?;
+        if self.target == Target::SpirvVulkan {
+            return self.emit_wmma_store_lds_coopmat(array, base, major, stride, src, w);
         }
-        let (src_val, _) = self.load_place(&Place::local(src), w)?;
-        let mut vals = Vec::new();
-        for i in 0..8 {
-            let e = self.fresh();
-            let _ = writeln!(
+        let (ptr, elem) = self.lds_tile_ptr(array, base, w)?;
+        if self.amd_arch().is_some() {
+            self.require_amd_wmma()?;
+            return self.emit_wmma_store_acc_amdgcn(
+                major,
+                stride,
+                AmdTilePtr::lds(&ptr, &elem),
+                src,
                 w,
-                "  {e} = extractvalue {} {src_val}, {i}",
-                Self::NVPTX_ACC_STRUCT_TY
             );
-            vals.push(format!("float {e}"));
         }
-        let name = self.body.name.clone();
-        let decl = &self.body.workgroup_locals[array as usize];
-        let (n, elem) = (decl.len, self.scalar_llty(&decl.elem_ty)?);
-        let us = self.usize_llty();
-        let base = self.fresh();
-        let _ = writeln!(
-            w,
-            "  {base} = getelementptr [{n} x {elem}], ptr addrspace(3) @{name}_lds{array}, {us} 0, {us} 0"
-        );
-        let gptr = self.fresh();
-        let _ = writeln!(w, "  {gptr} = addrspacecast ptr addrspace(3) {base} to ptr");
-        let intrin = "llvm.nvvm.wmma.m16n16k16.store.d.row.stride.f32.p0";
-        self.declares.insert(format!(
-            "declare void @{intrin}(ptr, float, float, float, float, float, float, float, float, i32)"
-        ));
-        let _ = writeln!(
-            w,
-            "  call void @{intrin}(ptr {gptr}, {}, i32 {stride})",
-            vals.join(", ")
-        );
-        Ok(())
+        let gptr = self.wmma_generic_ptr(&ptr, 3, w);
+        self.emit_wmma_store_to_nvptx(major, &gptr, stride, src, w)
     }
 
     /// Seed a zero-valued f32 accumulator fragment (card 154; every target, card 530). SPIR-V builds it
@@ -899,5 +1211,42 @@ impl<'a> Emitter<'a> {
             "  {g} = addrspacecast ptr addrspace({addr}) {ptr} to ptr"
         );
         g
+    }
+}
+
+/// A tile's base pointer for the AMDGCN fragment loads and stores: the pointer value, its address space
+/// (`ptr` for generic/global, `ptr addrspace(3)` for LDS) and the tile's element LLVM type.
+#[derive(Clone, Copy)]
+pub(super) struct AmdTilePtr<'p> {
+    ptr_ty: &'static str,
+    ptr: &'p str,
+    elem: &'p str,
+}
+
+impl<'p> AmdTilePtr<'p> {
+    /// A generic (flat) pointer, as the global tile paths use.
+    pub(super) fn generic(ptr: &'p str, elem: &'p str) -> Self {
+        Self {
+            ptr_ty: "ptr",
+            ptr,
+            elem,
+        }
+    }
+
+    /// A workgroup-local (LDS, `addrspace(3)`) pointer.
+    pub(super) fn lds(ptr: &'p str, elem: &'p str) -> Self {
+        Self {
+            ptr_ty: "ptr addrspace(3)",
+            ptr,
+            elem,
+        }
+    }
+}
+
+/// The NVVM intrinsic spelling of a tile layout.
+fn nvptx_layout(major: FragmentMajor) -> &'static str {
+    match major {
+        FragmentMajor::Row => "row",
+        FragmentMajor::Col => "col",
     }
 }

@@ -57,7 +57,6 @@ use poot_models::model::KvDtype;
 use poot_models::registry::Registry;
 use poot_profile::{Ceiling, Fit, GB};
 use poot_quant::weights::{WeightEntry, WeightStore};
-use poot_quant::Access;
 
 /// The git sha this binary was built from (`build.rs`); the harness records it with every result.
 const BUILD_SHA: &str = env!("POOT_BUILD_SHA");
@@ -676,6 +675,11 @@ impl Generate for DriverCell {
             "host_picks": stats.host_picks,
             "recordings": executor.recordings,
             "replays": executor.replays,
+            "host_memory": json!({
+                "opened": host_memory_json(executor.load_memory.opened),
+                "uploaded": host_memory_json(executor.load_memory.uploaded),
+                "now": host_memory_json(poot_executor::HostMemory::now()),
+            }),
             "memory": executor
                 .memory
                 .iter()
@@ -692,6 +696,17 @@ impl Generate for DriverCell {
                 .collect::<serde_json::Map<_, _>>(),
         }))
     }
+}
+
+/// One engine-produced host-memory reading (`RssAnon`, `RssFile`, `VmHWM`), or `null` where the kernel gives none.
+fn host_memory_json(memory: Option<poot_executor::HostMemory>) -> Value {
+    memory.map_or(Value::Null, |memory| {
+        json!({
+            "rss_anon_bytes": memory.rss_anon,
+            "rss_file_bytes": memory.rss_file,
+            "peak_rss_bytes": memory.peak_rss,
+        })
+    })
 }
 
 /// A stored weight's dtype as a precision name: the checkpoint dtype of a dense tensor (`bf16`), the format of
@@ -735,28 +750,48 @@ fn ensure_store_holds(requested: &str, store: &WeightStore) -> anyhow::Result<St
 }
 
 /// A digest of the checkpoint's content as the driver holds it: every weight's name, shape, stored dtype and
-/// stored bytes in key order. Two checkpoints with one name but different weights digest differently.
-fn checkpoint_digest(store: &WeightStore) -> String {
+/// stored bytes in key order. Two checkpoints with one name but different weights digest differently. The
+/// bytes are read by positional reads into one bounded buffer, several threads at a time, and hashed across
+/// threads, so the digest maps none of the checkpoint in and a cold file is read at the disk's queue depth.
+fn checkpoint_digest(store: &WeightStore) -> anyhow::Result<String> {
+    /// Bytes hashed per round.
+    const CHUNK: usize = 64 << 20;
+    /// Reader threads per round.
+    const READERS: usize = 8;
     let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; CHUNK];
     for (key, entry) in store.iter() {
         hasher.update(key.to_string().as_bytes());
         hasher.update(format!("{:?}", entry.shape()).as_bytes());
         hasher.update(stored_name(entry).as_bytes());
         match entry {
             WeightEntry::Dense(dense) => {
-                hasher.update(dense.bytes().as_slice());
-                dense.bytes().advise(Access::Release);
+                let bytes = dense.bytes();
+                for start in (0..bytes.len()).step_by(CHUNK) {
+                    let end = bytes.len().min(start + CHUNK);
+                    let chunk = &mut buffer[..end - start];
+                    poot_quant::read_split(chunk, start, READERS, |range, part| {
+                        bytes.read_at(range, part)
+                    })?;
+                    hasher.update_rayon(chunk);
+                }
             }
             WeightEntry::Packed(payload) => {
                 for role in payload.weight().sources() {
-                    let bytes = payload.bytes(role);
-                    hasher.update(bytes);
-                    payload.advise(role, 0..bytes.len(), Access::Release);
+                    let len = payload.weight().source_bytes(role);
+                    for start in (0..len).step_by(CHUNK) {
+                        let end = len.min(start + CHUNK);
+                        let chunk = &mut buffer[..end - start];
+                        poot_quant::read_split(chunk, start, READERS, |range, part| {
+                            payload.read_verified(role, range, part)
+                        })?;
+                        hasher.update_rayon(chunk);
+                    }
                 }
             }
         }
     }
-    format!("blake3:{}", hasher.finalize().to_hex())
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
 /// The driver engine over a loaded registered family: size every driver's KV to the longest request the
@@ -770,7 +805,7 @@ fn open_driver(
     let handle = Arc::new(handle);
     // Before an executor opens: a request the checkpoint does not hold needs no device.
     let precision = ensure_store_holds(&config.precision, handle.store())?;
-    let checkpoint_digest = checkpoint_digest(handle.store());
+    let checkpoint_digest = checkpoint_digest(handle.store())?;
     let backend = config.backend;
     // The chunk each prompt prefills in when it fits the device (the whole longest prompt, or the chunk the
     // caller named), and whether the device may shrink it to fit.
@@ -919,6 +954,8 @@ fn open(config: &Config) -> Result<Opened, OpenFailure> {
     let path = match &config.weights {
         Weights::Safetensors(path) | Weights::Gguf(path) => path.as_str(),
     };
+    // The engine's load-memory counters report the peak since here: the load's own, not the process's.
+    poot_executor::HostMemory::reset_peak();
     // One registry resolve decides: a registered family runs on the driver, any other is a refusal.
     let registry = Registry::builtin().context("build the family registry")?;
     let handle = ModelHandle::load(
@@ -2309,10 +2346,10 @@ mod tests {
         let f32_embed = qwen2(DIMS, Projections::Bf16, poot_tensor::DType::F32);
         let again = qwen2(DIMS, Projections::Bf16, poot_tensor::DType::BF16);
 
-        let digest = checkpoint_digest(&bf16.store);
+        let digest = checkpoint_digest(&bf16.store).unwrap();
         assert!(digest.starts_with("blake3:") && digest.len() == "blake3:".len() + 64);
-        assert_eq!(digest, checkpoint_digest(&again.store));
-        assert_ne!(digest, checkpoint_digest(&f32_embed.store));
+        assert_eq!(digest, checkpoint_digest(&again.store).unwrap());
+        assert_ne!(digest, checkpoint_digest(&f32_embed.store).unwrap());
     }
 
     /// The runner measures release builds only: a debug profile, or debug assertions in a release one, is

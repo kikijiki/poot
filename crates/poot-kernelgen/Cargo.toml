@@ -27,6 +27,8 @@ poot-quant = { workspace = true, features = ["test-support"] }
 poot-kernel-ir = { workspace = true, features = ["test-support"] }
 poot-codegen = { workspace = true, features = ["test-support"] }
 poot-wgpu-runtime = { workspace = true, features = ["test-support"] }
+# The fragment-IR probe (tests/fragment_lds_probe.rs) dispatches on raw Vulkan as well as wgpu.
+poot-vulkan-runtime.workspace = true
 poot-ptx-runtime = { workspace = true, features = ["test-support"] }
 # The packed-kernel ROCm device rows (card 542a SC-004/SC-005) dispatch generated bodies on real
 # ROCm/HSA hardware, the same real-executable-path proof card 628's no_contract tests use.

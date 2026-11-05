@@ -271,6 +271,13 @@ pub trait Device {
         WeightUpload::Bytes
     }
 
+    /// Whether this device's memory is the host's RAM (an APU): a weight uploaded to it takes memory the
+    /// page cache of the checkpoint it was read from also holds, so the engine asks the kernel to drop
+    /// each range of the file once it is staged. A discrete device keeps the cache for the next load.
+    fn unified_memory(&self) -> bool {
+        false
+    }
+
     /// How this device compiles the regions of a program whose artifacts are regions (an NPU). `None` for a
     /// device that runs per-equation kernels: the engine then refuses a region program as a typed load error.
     fn region_loader(&self) -> Option<&dyn RegionLoader> {

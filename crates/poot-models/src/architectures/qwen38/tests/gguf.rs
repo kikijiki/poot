@@ -451,12 +451,8 @@ fn the_real_expert_stack_is_cut_at_the_real_stride() {
         .unwrap();
     }
     let index = set.index();
-    let store = read_gguf(
-        &index,
-        &Keep(&["blk.47.ffn_down_exps.weight"]),
-        poot_load::plan::default_workers(),
-    )
-    .unwrap_or_else(|e| panic!("{e}"));
+    let store = read_gguf(&index, &Keep(&["blk.47.ffn_down_exps.weight"]))
+        .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(store.keys().count(), 512);
     for expert in [0usize, 1, 255, 511] {
         let key = format!("blk.47.ffn_down_exps.weight.{expert}");

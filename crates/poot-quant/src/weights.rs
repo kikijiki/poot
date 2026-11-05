@@ -439,21 +439,33 @@ impl WeightStore {
     /// since it was mapped. A loader runs it before publishing the store and an executor before a bind
     /// batch (ADR-0103 amendment: the identity check at its named boundaries).
     pub fn check_sources(&self) -> Result<(), SourceChanged> {
-        let mut checked: Vec<&StoredBytes> = Vec::new();
+        self.mapped_files()
+            .try_for_each(StoredBytes::check_unchanged)
+    }
+
+    /// Bytes read off the store's checkpoint files by [`StoredBytes::read_at`] since they were mapped, summed
+    /// over the distinct files: the load's own read counter, which is the checkpoint's size once per file
+    /// when nothing is read twice.
+    pub fn bytes_read(&self) -> u64 {
+        self.mapped_files().map(StoredBytes::bytes_read).sum()
+    }
+
+    /// One view per distinct mapped checkpoint file under this store (owned regions never change and are
+    /// not files).
+    fn mapped_files(&self) -> impl Iterator<Item = &StoredBytes> {
+        let mut seen: Vec<&StoredBytes> = Vec::new();
         for owned in self.entries.values() {
             let views: Vec<&StoredBytes> = match &owned.entry {
                 WeightEntry::Dense(dense) => vec![dense.bytes()],
                 WeightEntry::Packed(payload) => payload.stored().collect(),
             };
             for view in views {
-                // Owned regions never change; only a mapped region is checked, once per file.
-                if view.is_mapped() && !checked.iter().any(|seen| seen.same_region(view)) {
-                    view.check_unchanged()?;
-                    checked.push(view);
+                if view.is_mapped() && !seen.iter().any(|known| known.same_region(view)) {
+                    seen.push(view);
                 }
             }
         }
-        Ok(())
+        seen.into_iter()
     }
 
     /// Removes and returns one entry, releasing the store's own copy of its bytes once the caller

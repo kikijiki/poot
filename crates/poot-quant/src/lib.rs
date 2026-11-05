@@ -30,13 +30,16 @@ use std::fmt;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 
-use content::ContentCheck;
+use content::{BlockContentCheck, ContentCheck};
 use decode::DecodeError;
 use format::{Axis, GroupMap, Storage, WeightFormat};
 
 pub use encode::{EncodeError, encode};
 pub use format::OperandRole;
-pub use stored::{Access, FileIdentity, MapError, SliceError, SourceChanged, StoredBytes};
+pub use stored::{
+    FileIdentity, MapError, ReadError, SliceError, SourceChanged, StoredBytes, StoredReader,
+    read_split,
+};
 
 /// A logical shape axis rejected by descriptor construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -686,6 +689,42 @@ pub struct PackedPayload {
     weight: PackedWeight,
     /// One entry per [`PackedWeight::sources`] role, in that order.
     sources: Vec<PayloadSource>,
+    content: Content,
+}
+
+/// Whether a payload's stored values passed the content check ([`PackedPayload::try_new`]) or are checked as
+/// they are read off their file ([`PackedPayload::try_new_deferred`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Content {
+    Checked,
+    Deferred,
+}
+
+/// [`PackedPayload::read_verified`] refused a range.
+#[derive(Debug)]
+pub enum PayloadReadError {
+    /// The bytes could not be read.
+    Read(ReadError),
+    /// The bytes were read and a stored value failed the content check.
+    Content(PackedWeightError),
+}
+
+impl fmt::Display for PayloadReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => error.fmt(f),
+            Self::Content(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for PayloadReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(error) => Some(error),
+            Self::Content(error) => Some(error),
+        }
+    }
 }
 
 impl PartialEq for PackedPayload {
@@ -703,6 +742,50 @@ impl PackedPayload {
         weight: PackedWeight,
         sources: impl IntoIterator<Item = (SourceRole, StoredBytes)>,
     ) -> Result<Self, PackedWeightError> {
+        let ordered = Self::bind_sources(weight, sources)?;
+        validate_content(weight, &ordered)?;
+        Ok(Self {
+            weight,
+            sources: ordered,
+            content: Content::Checked,
+        })
+    }
+
+    /// [`Self::try_new`] for sources read off a checkpoint file, where the content check must not be a
+    /// pass of its own over the whole file. A block format's stored values are checked block by block as
+    /// [`Self::read_verified`] reads them (the one pass that stages the weight for the device) and as
+    /// [`Self::decode_row`] reads a row; nothing here touches a byte. A planar format's content check
+    /// (group indices, padding nibbles) is not block-local, so it runs here, as in [`Self::try_new`].
+    pub fn try_new_deferred(
+        weight: PackedWeight,
+        sources: impl IntoIterator<Item = (SourceRole, StoredBytes)>,
+    ) -> Result<Self, PackedWeightError> {
+        let ordered = Self::bind_sources(weight, sources)?;
+        let content = match weight.format().descriptor().storage {
+            Storage::Blocks(_) => Content::Deferred,
+            Storage::Planar(_) => {
+                validate_content(weight, &ordered)?;
+                Content::Checked
+            }
+        };
+        Ok(Self {
+            weight,
+            sources: ordered,
+            content,
+        })
+    }
+
+    /// Whether this payload's stored values are still to be checked as they are read
+    /// ([`Self::try_new_deferred`]); [`Self::bytes`] of such a payload is unchecked.
+    #[cfg(any(test, feature = "test-support"))]
+    const fn content_pending(&self) -> bool {
+        matches!(self.content, Content::Deferred)
+    }
+
+    fn bind_sources(
+        weight: PackedWeight,
+        sources: impl IntoIterator<Item = (SourceRole, StoredBytes)>,
+    ) -> Result<Vec<PayloadSource>, PackedWeightError> {
         let mut provided: Vec<(SourceRole, StoredBytes)> = sources.into_iter().collect();
         let mut ordered = Vec::with_capacity(provided.len());
         for role in weight.sources() {
@@ -732,12 +815,7 @@ impl PackedPayload {
             });
         }
 
-        validate_content(weight, &ordered)?;
-
-        Ok(Self {
-            weight,
-            sources: ordered,
-        })
+        Ok(ordered)
     }
 
     /// The descriptor this payload's sources were validated against.
@@ -751,10 +829,96 @@ impl PackedPayload {
         self.source(role).bytes.as_slice()
     }
 
-    /// A paging hint over `range` of `role`'s source bytes ([`StoredBytes::advise_range`]). Panics if
+    /// Copy `range` of `role`'s source bytes into `out` by a positional file read
+    /// ([`StoredBytes::read_at`]), checking the stored values of a [`Self::content_pending`] payload on the
+    /// bytes just read. The check runs on whole blocks: a range that starts or ends inside a block also
+    /// reads the block's missing head or tail (less than two blocks per call), so every block of the
+    /// range is checked whole. Panics if `role` is not one of this payload's sources.
+    pub fn read_verified(
+        &self,
+        role: SourceRole,
+        range: std::ops::Range<usize>,
+        out: &mut [u8],
+    ) -> Result<(), PayloadReadError> {
+        let source = &self.source(role).bytes;
+        source
+            .read_at(range.clone(), out)
+            .map_err(PayloadReadError::Read)?;
+        let Content::Deferred = self.content else {
+            return Ok(());
+        };
+        let check = self.block_check().map_err(PayloadReadError::Content)?;
+        let ContentCheck::Blocks(blocks) = &*check else {
+            unreachable!("a deferred payload is a block format")
+        };
+        let block = blocks.block_bytes();
+        let (first, last) = (
+            range.start.next_multiple_of(block),
+            range.end / block * block,
+        );
+        if first < last {
+            self.check_blocks(blocks, first, &out[first - range.start..last - range.start])?;
+        }
+        // The block a range starts or ends inside is checked on its own copy: the part outside the range is
+        // read beside the part in `out`.
+        let mut edges = Vec::with_capacity(2);
+        if !range.start.is_multiple_of(block) {
+            edges.push(range.start / block * block);
+        }
+        if !range.end.is_multiple_of(block) && edges.last() != Some(&(range.end / block * block)) {
+            edges.push(range.end / block * block);
+        }
+        let mut copy = vec![0u8; block];
+        for start in edges {
+            let end = start + block;
+            let (lo, hi) = (range.start.max(start), range.end.min(end));
+            source
+                .read_at(start..lo, &mut copy[..lo - start])
+                .map_err(PayloadReadError::Read)?;
+            copy[lo - start..hi - start].copy_from_slice(&out[lo - range.start..hi - range.start]);
+            source
+                .read_at(hi..end, &mut copy[hi - start..])
+                .map_err(PayloadReadError::Read)?;
+            self.check_blocks(blocks, start, &copy)?;
+        }
+        Ok(())
+    }
+
+    /// Drop the page-cache pages of `range` of `role`'s source bytes ([`StoredBytes::evict`]). Panics if
     /// `role` is not one of this payload's sources.
-    pub fn advise(&self, role: SourceRole, range: std::ops::Range<usize>, access: Access) {
-        self.source(role).bytes.advise_range(range, access);
+    pub fn evict(&self, role: SourceRole, range: std::ops::Range<usize>) {
+        self.source(role).bytes.evict(range);
+    }
+
+    /// Ask the kernel to read `range` of `role`'s source bytes into the page cache ahead of a read of it
+    /// ([`StoredBytes::prefetch`]). Panics if `role` is not one of this payload's sources.
+    pub fn prefetch(&self, role: SourceRole, range: std::ops::Range<usize>) {
+        self.source(role).bytes.prefetch(range);
+    }
+
+    fn block_check(&self) -> Result<std::sync::Arc<ContentCheck>, PackedWeightError> {
+        ContentCheck::of(self.weight.format()).map_err(PackedWeightError::Layout)
+    }
+
+    /// The content check of whole blocks `bytes`, which start at payload byte `offset` (a multiple of the
+    /// block size).
+    fn check_blocks(
+        &self,
+        check: &BlockContentCheck,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), PayloadReadError> {
+        match check.first_non_finite(bytes, &mut ()) {
+            None => Ok(()),
+            Some((operand, element)) => Err(PayloadReadError::Content(
+                PackedWeightError::NonFiniteField {
+                    format: self.weight.format(),
+                    role: SourceRole::Blocks,
+                    operand,
+                    element: offset / check.block_bytes() * check.values() + element,
+                },
+            )),
+        }
     }
 
     /// Every source's owner, in [`PackedWeight::sources`] order.
@@ -877,6 +1041,24 @@ impl PackedPayload {
                 let start = row * row_bytes;
                 let bytes =
                     &self.source(SourceRole::Blocks).bytes.as_slice()[start..start + row_bytes];
+                if self.content_pending() {
+                    let check = self.block_check().map_err(|_| DecodeError::Overflow {
+                        format: self.weight.format,
+                    })?;
+                    if let ContentCheck::Blocks(blocks) = &*check
+                        && let Err(PayloadReadError::Content(PackedWeightError::NonFiniteField {
+                            operand,
+                            element,
+                            ..
+                        })) = self.check_blocks(blocks, start, bytes)
+                    {
+                        return Err(DecodeError::NonFiniteStored {
+                            format: self.weight.format,
+                            role: operand,
+                            element,
+                        });
+                    }
+                }
                 descriptor.decode_blocks(bytes, out)
             }
             Storage::Planar(_) => {

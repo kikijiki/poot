@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 
 use poot_load::LoadError;
 use poot_load::gguf::{GgufIndex, IdentityNames, TensorNameMap, gguf_plan, read_gguf, shard_paths};
-use poot_load::plan::default_workers;
 use poot_quant::StoredBytes;
 use poot_quant::format::WeightFormat;
 use poot_quant::weights::{WeightEntry, WeightKey};
@@ -120,8 +119,8 @@ fn the_27b_iq3_s_tensor_plans_as_one_packed_iq3_s_owner() {
     };
     let index = open(&path);
     assert_eq!(index.tensors["blk.14.ffn_down.weight"].ggml_type, 21);
-    let store = read_gguf(&index, &Only("blk.14.ffn_down.weight"), default_workers())
-        .unwrap_or_else(|e| panic!("{e}"));
+    let store =
+        read_gguf(&index, &Only("blk.14.ffn_down.weight")).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(store.len(), 1);
     let WeightEntry::Packed(payload) = store.get("blk.14.ffn_down.weight").expect("one owner")
     else {

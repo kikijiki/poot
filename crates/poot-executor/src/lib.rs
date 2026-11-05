@@ -21,6 +21,7 @@ mod coordinator;
 mod device;
 mod engine;
 mod error;
+mod host_memory;
 mod lanes;
 mod shared_kernels;
 mod timing;
@@ -36,6 +37,7 @@ pub use device::{
 };
 pub use engine::Engine;
 pub use error::{BindError, ChainError, DeviceError, DispatchError, ExecError, LoadError};
+pub use host_memory::{HostMemory, LoadMemory};
 use poot_runtime_common::{BufferRole, DeviceIdentity, MemoryCounterSnapshot};
 use poot_tensor::{HostTensor, HostView};
 pub use shared_kernels::{SharedKernels, SharedKernelsMismatch};
@@ -362,6 +364,8 @@ pub struct ExecutorStats {
     pub waits: u64,
     /// The device's own live bytes by role ([`Device::memory`]).
     pub memory: Vec<(BufferRole, MemoryCounterSnapshot)>,
+    /// The host process's resident memory when the engine opened and after its latest weight upload.
+    pub load_memory: LoadMemory,
     /// Bytes read from the weight store and encoded for upload, summed over every weight upload. A
     /// [`WeightUpload::SizeOnly`] device reads none.
     pub weight_bytes_read: u64,
@@ -404,6 +408,7 @@ impl ExecutorStats {
             output_read_bytes: 0,
             waits: 0,
             memory: Vec::new(),
+            load_memory: LoadMemory::default(),
             weight_bytes_read: 0,
             syncs: 0,
             sync_read_bytes: 0,

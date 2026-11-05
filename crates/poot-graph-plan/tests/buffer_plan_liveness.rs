@@ -376,3 +376,59 @@ fn the_scan_reports_two_live_values_forced_into_one_slot() {
         "forcing {a_name} and {b_name} into slot {target_slot} must be reported, got {found:?}"
     );
 }
+
+/// A residual stack whose layers widen to `[rows, 4 * width]` and narrow back: values of two sizes alive
+/// at interleaved times, the shape on which a slot sized by its largest occupant is wasted when a wide value
+/// lands on a narrow slot (POOT-1433).
+fn widening_stack(layers: usize) -> Graph {
+    let (rows, width) = (64usize, 256usize);
+    let b = Builder::for_tests();
+    let mut h = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(vec![rows, width]))
+        .unwrap();
+    for layer in 0..layers {
+        let up = b
+            .constant(
+                &format!("up{layer}"),
+                TensorType::f32(vec![width, 4 * width]),
+            )
+            .unwrap();
+        let down = b
+            .constant(
+                &format!("down{layer}"),
+                TensorType::f32(vec![4 * width, width]),
+            )
+            .unwrap();
+        let wide = b.unary(UnOp::Tanh, b.matmul(h, up).unwrap()).unwrap();
+        let narrow = b.matmul(wide, down).unwrap();
+        h = b.binary(BinOp::Add, h, narrow).unwrap();
+    }
+    b.finish(h).unwrap()
+}
+
+/// POOT-1433: a slot is sized to the values that need it. On the widening stack the arena is within 20%
+/// of the most bytes ever alive at once (best-fit decreasing: 1.17x at six layers), where first-fit in birth
+/// order stretches the narrow slots to the wide values. The live peak is itself checked against the independent scan, so the bound cannot
+/// pass by the plan under-reporting it.
+/// Mutation: color in birth order and take the newest compatible slot again (`members.sort_by_key` by
+/// birth and the `min_by_key` of `plan_buffers` keyed by the slot index, reversed); the ratio row goes red.
+#[test]
+fn the_arena_is_within_a_fifth_of_the_live_peak_on_mixed_widths() {
+    for (name, target) in targets() {
+        for layers in [2, 6] {
+            let program = compiled(&widening_stack(layers), &target);
+            let plan = program.buffer_plan();
+            let (arena, peak) = (plan.arena_bytes(), plan.live_peak_bytes());
+            let all = occupants(&program, &planned_slot(&program));
+            assert!(overlaps(&all).is_empty(), "{name} x{layers}");
+            assert!(
+                arena >= peak,
+                "{name} x{layers}: {arena} arena bytes under the {peak}-byte live peak"
+            );
+            assert!(
+                arena * 5 <= peak * 6,
+                "{name} x{layers}: arena {arena} bytes against a live peak of {peak}"
+            );
+        }
+    }
+}

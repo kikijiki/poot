@@ -694,6 +694,8 @@ impl Workgroup<'_> {
             Statement::WmmaZero { .. } => Err(Fault::Unsupported("WmmaZero")),
             Statement::WmmaLoadLds { .. } => Err(Fault::Unsupported("WmmaLoadLds")),
             Statement::WmmaStoreLds { .. } => Err(Fault::Unsupported("WmmaStoreLds")),
+            Statement::WmmaElemRead { .. } => Err(Fault::Unsupported("WmmaElemRead")),
+            Statement::WmmaElemWrite { .. } => Err(Fault::Unsupported("WmmaElemWrite")),
         }
     }
 

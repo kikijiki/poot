@@ -165,7 +165,7 @@ impl Context {
         // The device above enables the extension and its feature whenever the driver supports them, so
         // the matrix hardware reported here is hardware the SPIR-V the planner selects for it can use
         // (Card 553, R-553-1).
-        let measured_tensor_core = if has_cooperative_matrix {
+        let reported_configs = if has_cooperative_matrix {
             let coop_matrix = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
             // SAFETY: `has_cooperative_matrix` confirmed the extension is supported on this physical
             // device, so the loaded function pointer is real (not the ash panic-on-call stub).
@@ -176,20 +176,20 @@ impl Context {
             configs
                 .into_iter()
                 .filter(|c| c.scope == vk::ScopeKHR::SUBGROUP)
-                .map(|c| {
-                    poot_target::TensorCoreSupport::from_cooperative_matrix_config(
-                        c.m_size,
-                        c.n_size,
-                        c.k_size,
-                        c.a_type == vk::ComponentTypeKHR::FLOAT16,
-                        c.result_type == vk::ComponentTypeKHR::FLOAT32,
-                    )
+                .map(|c| poot_target::CooperativeMatrixConfig {
+                    shape: poot_target::FragmentShape {
+                        m: c.m_size,
+                        n: c.n_size,
+                        k: c.k_size,
+                    },
+                    ab_f16: c.a_type == vk::ComponentTypeKHR::FLOAT16
+                        && c.b_type == vk::ComponentTypeKHR::FLOAT16,
+                    result_f32: c.result_type == vk::ComponentTypeKHR::FLOAT32
+                        && c.c_type == vk::ComponentTypeKHR::FLOAT32,
                 })
-                .fold(poot_target::TensorCoreSupport::None, |acc, x| {
-                    acc.most_specific(x)
-                })
+                .collect::<Vec<_>>()
         } else {
-            poot_target::TensorCoreSupport::UnknownNotExposedByApi
+            Vec::new()
         };
 
         let validation = if validate {
@@ -309,10 +309,10 @@ impl Context {
                 && subgroup.compute_size_control
                 && (min..=max).contains(&COOPMAT_SUBGROUP_SIZE)
         });
-        let tensor_core = if has_cooperative_matrix && coopmat_subgroup_sizes.is_none() {
-            poot_target::TensorCoreSupport::None
+        let matrix_units = if coopmat_subgroup_sizes.is_some() {
+            poot_target::MatrixUnits::cooperative_matrix(reported_configs, COOPMAT_SUBGROUP_SIZE)
         } else {
-            measured_tensor_core
+            poot_target::MatrixUnits::NONE
         };
         let device_caps = poot_target::DeviceCaps {
             max_buffer_bytes,
@@ -322,7 +322,7 @@ impl Context {
             subgroup: launch.subgroup,
             max_grid: max_workgroup_count,
             watchdog_budget,
-            tensor_core,
+            matrix_units: poot_target::Queried::Known(matrix_units),
             known_miscompiles,
             compute_units,
             memory_budget_bytes: features.memory_budget().then(|| {
@@ -333,7 +333,6 @@ impl Context {
             shader_features: features.shader_features(),
             // SPIR-V holds E4M3FN in packed lanes and has no native two-byte float lane on any Vulkan device.
             e4m3_storage: poot_target::E4m3Storage::PackedLanes,
-            matrix_lowering: poot_target::MatrixLowering::vulkan(tensor_core),
             native_two_byte_floats: false,
             widens_bf16_decode_weight: false,
             peer_transport: false,
@@ -436,7 +435,7 @@ impl Context {
     /// as `poot-wgpu-runtime` (wgpu), so an AMD Vulkan (RADV) device shares its RADV gfx-ring wedge
     /// (`max_buffer_bytes`), display-watchdog budget and card-095 tiled-GEMM miscompile ceiling; both are
     /// the same vendor-scoped default ([`poot_target::DeviceCaps::wgpu_rdna3_igpu`]) `poot-wgpu-runtime`
-    /// reports there, not a device query (neither is exposed by any driver API). `tensor_core` is the
+    /// reports there, not a device query (neither is exposed by any driver API). `matrix_units` come from the
     /// `VK_KHR_cooperative_matrix` query measured once at construction (card 522 review), never parsed
     /// from `device_name()`'s marketing codename string.
     pub fn device_caps(&self) -> poot_target::DeviceCaps {

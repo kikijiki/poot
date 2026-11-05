@@ -28,6 +28,8 @@ impl<'a> Emitter<'a> {
             uses_len: false,
             error_accum,
             strictfp_needed: false,
+            block: 0,
+            loops_not_unrolled: false,
         }
     }
 
@@ -530,6 +532,7 @@ impl<'a> Emitter<'a> {
 
     pub(super) fn emit_block(&mut self, id: BlockId, w: &mut String) -> Result<(), EmitError> {
         let block = &self.body.blocks[id.index as usize];
+        self.block = id.index;
         let _ = writeln!(w, "bb{}:", id.index);
         // clone the small bits we need to avoid borrow conflicts with &mut self.
         let stmts = block.statements.clone();
@@ -623,17 +626,29 @@ impl<'a> Emitter<'a> {
                 dtype,
                 shape,
                 array,
+                base,
+                major,
                 stride,
                 src,
-            } => self.emit_wmma_store_lds(*dtype, *shape, *array, *stride, *src, w),
+            } => self.emit_wmma_store_lds(*dtype, *shape, *array, base, *major, *stride, *src, w),
             Statement::WmmaLoadLds {
-                which,
+                role,
                 dtype,
                 shape,
                 array,
+                base,
+                major,
                 stride,
                 dst,
-            } => self.emit_wmma_load_lds(*which, *dtype, *shape, *array, *stride, *dst, w),
+            } => self.emit_wmma_load_lds(
+                *role, *dtype, *shape, *array, base, *major, *stride, *dst, w,
+            ),
+            Statement::WmmaElemRead { src, idx, dst } => {
+                self.emit_wmma_elem_read(*src, *idx, *dst, w)
+            }
+            Statement::WmmaElemWrite { dst, idx, value } => {
+                self.emit_wmma_elem_write(*dst, *idx, value, w)
+            }
             // Spec 138 Phase 2: a scoped memory-ordering fence with no control-flow effect. AieCore is rejected here (in
             // `emit_statement`, not `emit_terminator`): a single AIE core has no other core to fence against (as for the
             // Barrier/CAS rejections). Every other target gets an explicit syncscope (see
@@ -667,7 +682,16 @@ impl<'a> Emitter<'a> {
     ) -> Result<(), EmitError> {
         match t {
             Terminator::Goto { target } => {
-                let _ = writeln!(w, "  br label %bb{}", target.index);
+                // A branch to an earlier block closes a loop. AMDGCN: where the generator unrolled the body
+                // itself, tell LLVM not to unroll it again (`Unrolling::Generator`).
+                let owns_unrolling = matches!(self.target, Target::AmdGcn(_))
+                    && self.body.unrolling == poot_kernel_ir::Unrolling::Generator;
+                if owns_unrolling && target.index <= self.block {
+                    self.loops_not_unrolled = true;
+                    let _ = writeln!(w, "  br label %bb{}, !llvm.loop !0", target.index);
+                } else {
+                    let _ = writeln!(w, "  br label %bb{}", target.index);
+                }
                 Ok(())
             }
             Terminator::Return => {

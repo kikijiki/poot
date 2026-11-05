@@ -61,6 +61,7 @@ mod types;
 /// value (Card 547b).
 mod buffer_plan;
 mod compile;
+mod entry_arena;
 mod graph_validation;
 mod kernel_mapping;
 mod npu;
@@ -78,6 +79,7 @@ pub use compile::{
     ExpansionError, ExpertIdsError, ExpertIdsGap, GraphResource, LoraError, LoraPlan, Program,
     Region, SlotSchema, Target, compile,
 };
+pub use entry_arena::EntryArena;
 pub use imported::ImportedKernel;
 #[cfg(any(test, feature = "test-support"))]
 pub use imported::{AssetDest, AssetEntry, MANIFEST, ProbeKernel};

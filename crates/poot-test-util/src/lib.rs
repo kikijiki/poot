@@ -93,6 +93,36 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+/// How many of the pages of the file at `path` the page cache holds now, and how many it has: `mincore` over
+/// a read-only shared mapping made for the query (which itself faults nothing in). The file must be non-empty.
+#[expect(unsafe_code, reason = "mincore has no safe wrapper in std")]
+pub fn cached_pages(path: &std::path::Path) -> (usize, usize) {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).expect("open the file to query");
+    let len = usize::try_from(file.metadata().expect("stat the file").len()).expect("fits");
+    assert!(len > 0, "an empty file has no pages");
+    // SAFETY: a fresh read-only shared mapping of `len` bytes of an open file; it is unmapped below and
+    // never dereferenced. `mincore` writes one byte per page into `resident`, which is sized for them.
+    unsafe {
+        let page = usize::try_from(libc::sysconf(libc::_SC_PAGESIZE)).expect("page size");
+        let pages = len.div_ceil(page);
+        let map = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        );
+        assert_ne!(map, libc::MAP_FAILED, "mmap the file to query");
+        let mut resident = vec![0u8; pages];
+        let status = libc::mincore(map, len, resident.as_mut_ptr());
+        libc::munmap(map, len);
+        assert_eq!(status, 0, "mincore");
+        (resident.iter().filter(|&&p| p & 1 == 1).count(), pages)
+    }
+}
+
 /// A path under the temp dir that no other test process or thread shares: `<temp>/poot-test-<pid>-<n>/<name>`.
 ///
 /// Tests that write a fixture to a fixed name under the temp dir clobber each other whenever two of them run

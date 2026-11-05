@@ -18,7 +18,6 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use poot_load::gguf::{GgufIndex, GgufValue, IdentityNames, read_gguf, write_gguf};
-use poot_load::plan::default_workers;
 use poot_load::safetensors::load_mapped_weight_store;
 use poot_load::{GgufSplitError, LoadError};
 use poot_quant::StoredBytes;
@@ -81,7 +80,7 @@ const VALID_GGUF_DATA_LEN: usize = 96 + 288;
 /// `parse` then `read_gguf` over `bytes`, the loader's two production steps.
 fn load_gguf(bytes: Vec<u8>) -> Result<(), LoadError> {
     let index = GgufIndex::parse(&StoredBytes::from(bytes))?;
-    read_gguf(&index, &IdentityNames, default_workers()).map(drop)
+    read_gguf(&index, &IdentityNames).map(drop)
 }
 
 /// A GGUF header written field by field, so a row can put any value in any field. `tensors` and
@@ -659,7 +658,7 @@ fn load_safetensors(files: Vec<Vec<u8>>) -> Result<(), LoadError> {
         .enumerate()
         .map(|(i, bytes)| (format!("shard-{i}.safetensors"), StoredBytes::from(bytes)))
         .collect();
-    load_mapped_weight_store(&files, default_workers()).map(drop)
+    load_mapped_weight_store(&files).map(drop)
 }
 
 fn one(header: &str, data: &[u8]) -> Result<(), LoadError> {

@@ -14,10 +14,12 @@ rust-version.workspace = true
 test-support = []
 
 [dependencies]
+libc.workspace = true
 memmap2.workspace = true
 poot-tensor.workspace = true
 
 [dev-dependencies]
+poot-test-util.workspace = true
 poot-quant = { path = ".", features = ["test-support"] }
 
 [lints]

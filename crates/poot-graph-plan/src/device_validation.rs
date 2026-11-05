@@ -13,9 +13,11 @@
 use crate::graph_validation::{ValidationPacketPlan, ValidationPacketSource};
 use poot_graph_ir::op::{BinOp, OpKind, RedOp};
 use poot_graph_ir::{Eqn, Graph, Operand, Scalar, ValidationPacketLayout, ValueId, ValueTable};
-use poot_kernel_ir::{Body, WmmaShape};
+use poot_kernel_ir::{Body, WmmaDtype};
 use poot_kernelgen::{BodyUse, FragmentUse, KernelRequirements, UnmeasurableLds};
-use poot_target::{DeviceCaps, Queried, SubgroupSupport, TensorCoreSupport};
+use poot_target::{
+    DeviceCaps, FragmentDtype, FragmentShape, MatrixUnits, Queried, SubgroupSupport,
+};
 use poot_tensor::DType;
 
 use crate::PlanError;
@@ -390,13 +392,13 @@ pub enum ResourceRefusal {
         /// The fragment the body uses.
         fragment: FragmentUse,
     },
-    /// The device's matrix hardware does not run the fragment the body uses.
-    #[error("the device's {tensor_core:?} matrix hardware does not run the {fragment:?} fragment")]
+    /// None of the device's matrix units runs the fragment the body uses.
+    #[error("the device's matrix units {matrix_units:?} do not run the {fragment:?} fragment")]
     FragmentUnsupported {
         /// The fragment the body uses.
         fragment: FragmentUse,
-        /// What the device reports about its matrix hardware.
-        tensor_core: TensorCoreSupport,
+        /// What the device reports about its matrix units.
+        matrix_units: MatrixUnits,
     },
     /// The device does not expose its matrix hardware through its API, so the fragment is unproven.
     #[error(
@@ -506,7 +508,7 @@ pub(crate) fn validate_kernel_resources(
         if declared.subgroup_lanes.is_none() {
             return Err(ResourceRefusal::FragmentWithoutSubgroup { fragment });
         }
-        check_fragment(fragment, caps.tensor_core)?;
+        check_fragment(fragment, caps.matrix_units)?;
     }
     if let Some(lanes) = declared.subgroup_lanes {
         match caps.subgroup {
@@ -553,28 +555,30 @@ pub(crate) fn validate_kernel_resources(
     Ok(())
 }
 
-/// Whether a device's matrix hardware runs `fragment`: a 16x16x16 tile on the families whose layout the
-/// emitters implement. A family the emitters do not implement is a refusal, not a guess.
+/// Whether a device's matrix units run `fragment`: a unit of the fragment's operand dtype and shape. A
+/// device that reports f16 units only (RADV) refuses a bf16 fragment: the unit list is per dtype, not one
+/// family flag. A device that cannot tell is a refusal naming that, not a guess.
 fn check_fragment(
     fragment: FragmentUse,
-    tensor_core: TensorCoreSupport,
+    matrix_units: Queried<MatrixUnits>,
 ) -> Result<(), ResourceRefusal> {
-    match tensor_core {
-        TensorCoreSupport::Wmma16x16x16Rdna3 | TensorCoreSupport::NvidiaWmma16x16x16Sm80
-            if fragment.shape == WmmaShape::M16N16K16 =>
-        {
-            Ok(())
-        }
-        TensorCoreSupport::UnknownNotExposedByApi => {
-            Err(ResourceRefusal::FragmentCapabilityUnknown { fragment })
-        }
-        TensorCoreSupport::None
-        | TensorCoreSupport::Wmma16x16x16Rdna3
-        | TensorCoreSupport::NvidiaWmma16x16x16Sm80
-        | TensorCoreSupport::Rdna4
-        | TensorCoreSupport::CdnaMfma => Err(ResourceRefusal::FragmentUnsupported {
+    let Queried::Known(units) = matrix_units else {
+        return Err(ResourceRefusal::FragmentCapabilityUnknown { fragment });
+    };
+    let dtype = match fragment.dtype {
+        WmmaDtype::Bf16 => FragmentDtype::Bf16,
+        WmmaDtype::F16 => FragmentDtype::F16,
+    };
+    let shape = FragmentShape {
+        m: fragment.shape.m.into(),
+        n: fragment.shape.n.into(),
+        k: fragment.shape.k.into(),
+    };
+    match units.config(dtype) {
+        Some(config) if config.shape == shape => Ok(()),
+        _ => Err(ResourceRefusal::FragmentUnsupported {
             fragment,
-            tensor_core,
+            matrix_units: units,
         }),
     }
 }

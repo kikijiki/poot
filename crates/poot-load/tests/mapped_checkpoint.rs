@@ -14,10 +14,11 @@ use std::path::Path;
 
 use poot_load::LoadError;
 use poot_load::gguf::{GgufIndex, IdentityNames, TensorNameMap, read_gguf, write_gguf};
-use poot_load::plan::default_workers;
 use poot_quant::format::{Storage, WeightFormat};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
-use poot_quant::{MapError, PackedWeightError, SourceRole, StoredBytes};
+use poot_quant::{
+    MapError, PackedWeightError, PayloadReadError, ReadError, SourceRole, StoredBytes,
+};
 use poot_tensor::DType;
 
 const GGML_F32: u32 = 0;
@@ -131,7 +132,7 @@ fn mb1_mapped_gguf_equals_a_positional_read() {
     std::fs::write(&*path, &bytes).unwrap();
     let file = map_path(&path);
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames).unwrap();
     let reader = File::open(&*path).unwrap();
     for (key, offset, len) in gguf_extents(&index, &bytes, &store) {
         let mut expected = vec![0u8; len];
@@ -182,7 +183,7 @@ fn mb2_entries_are_views_of_one_region() {
     std::fs::write(&*path, &bytes).unwrap();
     let file = map_path(&path);
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames).unwrap();
     let extents = gguf_extents(&index, &bytes, &store);
     let (first_key, first_offset, _) = extents[0];
     let first_ptr = entry_bytes(&store, first_key).as_ptr() as isize;
@@ -213,7 +214,7 @@ fn mb3_the_last_owner_unmaps() {
     let file = map_path(&path);
     assert!(is_mapped(&path));
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames).unwrap();
     let Some(WeightEntry::Dense(norm)) = store.get("norm.weight") else {
         panic!("norm.weight is dense")
     };
@@ -274,7 +275,7 @@ fn mb4_unmappable_sources_are_typed() {
     let from_memory = StoredBytes::from(bytes);
     let load = |source: &StoredBytes| {
         let index = GgufIndex::parse(source).unwrap();
-        read_gguf(&index, &IdentityNames, default_workers()).unwrap()
+        read_gguf(&index, &IdentityNames).unwrap()
     };
     assert_eq!(load(&from_file), load(&from_memory));
 }
@@ -297,7 +298,7 @@ fn mb5_a_truncated_file_is_refused_typed() {
     std::fs::write(&*path, fixture_gguf()).unwrap();
     let file = map_path(&path);
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames).unwrap();
     assert!(store.check_sources().is_ok());
 
     File::options()
@@ -309,7 +310,7 @@ fn mb5_a_truncated_file_is_refused_typed() {
 
     // Boundary 1, end of load: the reader's own check, reached with no tensor read.
     assert!(matches!(
-        read_gguf(&index, &KeepNothing, default_workers()),
+        read_gguf(&index, &KeepNothing),
         Err(LoadError::SourceChanged(_))
     ));
     // Boundary 2's check, on the store loaded before the truncation.
@@ -327,7 +328,7 @@ fn mb6_rename_replacement_is_safe() {
     std::fs::write(&*path, &original).unwrap();
     let file = map_path(&path);
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames).unwrap();
     let before: Vec<Vec<u8>> = GGUF_KEYS
         .iter()
         .map(|k| entry_bytes(&store, k).to_vec())
@@ -344,13 +345,19 @@ fn mb6_rename_replacement_is_safe() {
     assert!(store.check_sources().is_ok());
 }
 
-/// MB-7: validation still runs over mapped bytes: a NaN `d` scale in the last Q4_K block of a mapped
-/// file is refused, naming the role and element.
+/// MB-7: validation runs over the bytes of a mapped file, in the one read that stages them (ADR-0103
+/// amendment of 2026-10-27): the load builds the entry of a Q4_K tensor whose last block holds a NaN `d`
+/// scale without reading it, and the positional read of that tensor refuses it, naming the role and the
+/// element. The read of the bytes before the bad block is clean.
+///
+/// Mutation: skip the content check in `PackedPayload::read_verified` for a mapped source; the read of the
+/// whole tensor returns `Ok` and this row goes red.
 #[test]
-fn mb7_validation_runs_over_mapped_bytes() {
+fn mb7_validation_runs_over_the_bytes_the_read_stages() {
     let mut q4k = zero_blocks(WeightFormat::Q4_K, 2, 256);
     let block = q4k.len() - 144;
     q4k[block..block + 2].copy_from_slice(&0x7e00u16.to_le_bytes()); // f16 NaN `d`
+    let len = q4k.len();
     let bytes = write_gguf(
         &[],
         &[("blk.0.attn_k.weight", vec![256, 2], GGML_Q4_K, q4k)],
@@ -359,16 +366,94 @@ fn mb7_validation_runs_over_mapped_bytes() {
     std::fs::write(&*path, bytes).unwrap();
     let file = map_path(&path);
     let index = GgufIndex::parse(&file).unwrap();
-    let error = read_gguf(&index, &IdentityNames, default_workers()).unwrap_err();
-    match error {
-        LoadError::GgufPackedWeight(PackedWeightError::NonFiniteField {
+    let store = read_gguf(&index, &IdentityNames).expect("the load reads no content");
+    let Some(WeightEntry::Packed(payload)) = store.get("blk.0.attn_k.weight") else {
+        panic!("a Q4_K tensor is packed");
+    };
+    let mut out = vec![0u8; len];
+    payload
+        .read_verified(SourceRole::Blocks, 0..len - 144, &mut out[..len - 144])
+        .expect("the first block is finite");
+    match payload.read_verified(SourceRole::Blocks, 0..len, &mut out) {
+        Err(PayloadReadError::Content(PackedWeightError::NonFiniteField {
             role, element, ..
-        }) => {
+        })) => {
             assert_eq!(role, SourceRole::Blocks);
             assert_eq!(element, 256, "the second block's `d`");
         }
         other => panic!("expected NonFiniteField, got {other:?}"),
     }
+    // The read bytes were counted by the file's own counter: both reads, whole.
+    assert_eq!(store.bytes_read(), (len - 144 + len) as u64);
+}
+
+/// MB-9: a file truncated after the load is a typed read error at the read that needs the missing bytes, not
+/// a `SIGBUS` that ends the process (a mapped read would fault on the missing page).
+///
+/// Mutation: read the tensor through the mapping (`as_slice`) instead of `read_at`; the test process dies
+/// with `SIGBUS` and this row goes red.
+#[test]
+fn mb9_a_file_truncated_after_the_load_is_a_typed_read_error() {
+    let path = poot_test_util::unique_temp_path("mb9.gguf");
+    std::fs::write(&*path, fixture_gguf()).unwrap();
+    let file = map_path(&path);
+    let index = GgufIndex::parse(&file).unwrap();
+    let store = read_gguf(&index, &IdentityNames).unwrap();
+    File::options()
+        .write(true)
+        .open(&*path)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    let Some(WeightEntry::Packed(payload)) = store.get("blk.0.attn_q.weight") else {
+        panic!("a Q8_0 tensor is packed");
+    };
+    let mut out = vec![0u8; payload.weight().source_bytes(SourceRole::Blocks)];
+    match payload.read_verified(SourceRole::Blocks, 0..out.len(), &mut out) {
+        Err(PayloadReadError::Read(ReadError::Io(error))) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        }
+        other => panic!("expected a short-read error, got {other:?}"),
+    }
+}
+
+/// MB-10: `StoredBytes::evict` drops the page cache of the range it names and leaves the rest: a unified-memory
+/// device calls it for every range its upload has staged, so the checkpoint's cache and its device copy are
+/// not both resident. The control is the same file read warm: the cache holds nearly all of it first.
+///
+/// Mutation: make `MappedFile::evict` return without the `posix_fadvise`; the evicted half stays cached and
+/// this row goes red.
+#[test]
+fn mb10_evict_drops_the_page_cache_of_the_range() {
+    const LEN: usize = 32 << 20;
+    let path = poot_test_util::unique_temp_path("mb10.bin");
+    let bytes: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+    {
+        let file = File::create(&*path).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+        file.sync_all().unwrap();
+    }
+    assert_eq!(std::fs::read(&*path).unwrap().len(), LEN);
+    let (warm, pages) = poot_test_util::cached_pages(&path);
+    assert!(
+        warm * 10 > pages * 9,
+        "control: a file just read is cached ({warm} of {pages} pages)"
+    );
+    let file = map_path(&path);
+    file.evict(0..LEN / 2);
+    let (after, pages) = poot_test_util::cached_pages(&path);
+    assert!(
+        after <= pages / 2 + pages / 20,
+        "the evicted half left the cache ({after} of {pages} pages remain)"
+    );
+    assert!(
+        after >= pages / 2 - pages / 20,
+        "the other half stayed cached ({after} of {pages} pages remain)"
+    );
+    // Evicting changes no byte: a read of the range returns the file's content from the disk.
+    let mut out = vec![0u8; 1 << 20];
+    file.read_at(0..out.len(), &mut out).unwrap();
+    assert_eq!(out, bytes[..out.len()]);
 }
 
 /// MB-5 for the plain safetensors loader: a shard truncated after mapping is refused at the end of load.
@@ -400,7 +485,7 @@ fn mb5_a_truncated_safetensors_shard_is_refused_at_the_end_of_load() {
         .set_len(files[0].1.len() as u64 - 1)
         .unwrap();
     assert!(matches!(
-        poot_load::safetensors::load_mapped_weight_store(&files, default_workers()),
+        poot_load::safetensors::load_mapped_weight_store(&files),
         Err(LoadError::SourceChanged(_))
     ));
 }
@@ -421,12 +506,14 @@ fn rss_file_bytes() -> u64 {
     kib * 1024
 }
 
-/// MB-8: a load validates every byte of a mapped checkpoint and then leaves none of it in the process's
-/// resident set: the store holds the mapping, not the pages. The payload is 64 MiB of Q8_0 tensors, each
-/// larger than the 64 KiB rounding of a release, so a load that kept its pages would show all of it.
-/// The bytes are still readable afterwards and equal the file's.
+/// MB-8: neither the load nor the read that stages a mapped checkpoint puts any of it in the process's
+/// resident set: the store holds the mapping, never the pages. The payload is 272 MiB of Q8_0 tensors; a
+/// load that touched their bytes through the mapping, or a read that went through it, would show all of it
+/// in `RssFile`. The bytes the positional read delivers equal the file's.
 ///
-/// Mutation: drop the `advise(Access::Release)` in `plan::TensorJob::run`; `RssFile` grows by the payload.
+/// Mutation: have `TensorJob::run` sum the bytes of its view (`bytes.as_slice()`); `RssFile` grows by the
+/// payload after the load. For the read half, make `StoredBytes::read_at` copy from the mapping
+/// (`as_slice`); `RssFile` grows after the reads.
 #[test]
 fn mb8_a_loaded_checkpoint_is_not_resident() {
     const TENSORS: usize = 16;
@@ -457,25 +544,31 @@ fn mb8_a_loaded_checkpoint_is_not_resident() {
     let file = map_path(&path);
     let before = rss_file_bytes();
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames).unwrap();
     let resident = rss_file_bytes().saturating_sub(before);
     assert!(
         resident < payload as u64 / 8,
         "a loaded {payload}-byte checkpoint left {resident} bytes of it resident"
     );
 
-    // Releasing dropped page-table entries, not bytes: a read faults the same content back in.
-    let reader = File::open(&*path).unwrap();
-    let len = entry_bytes(&store, "blk.3.attn_q.weight").len();
-    let offset = index.tensors["blk.3.attn_q.weight"].offset;
-    let data_start = std::fs::metadata(&*path).unwrap().len()
-        - (index.tensors.values().map(|t| t.offset).max().unwrap() + len as u64);
-    let mut expected = vec![0u8; len];
-    reader
-        .read_exact_at(&mut expected, data_start + offset)
-        .unwrap();
-    assert_eq!(
-        entry_bytes(&store, "blk.3.attn_q.weight"),
-        expected.as_slice()
+    // Read every tensor the way the upload does: the process's mapping is still not touched.
+    let mut delivered = Vec::new();
+    for i in 0..TENSORS {
+        let Some(WeightEntry::Packed(payload)) = store.get(&format!("blk.{i}.attn_q.weight"))
+        else {
+            panic!("a Q8_0 tensor is packed");
+        };
+        let mut out = vec![0u8; block.len()];
+        payload
+            .read_verified(SourceRole::Blocks, 0..out.len(), &mut out)
+            .unwrap();
+        delivered.push(out);
+    }
+    let resident = rss_file_bytes().saturating_sub(before);
+    assert!(
+        resident < payload as u64 / 8,
+        "reading a {payload}-byte checkpoint left {resident} bytes of it resident"
     );
+    assert_eq!(store.bytes_read(), payload as u64, "each byte read once");
+    assert!(delivered.iter().all(|out| out == &block));
 }

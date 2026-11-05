@@ -4,8 +4,8 @@
 
 use crate::helpers::{Alloc, elem, ld, local};
 use poot_kernel_ir::{
-    BasicBlock, Body, Constant, FragmentTy, Operand, Place, Rvalue, Statement, Terminator, Ty,
-    WmmaDtype, WmmaMat, WmmaShape,
+    BasicBlock, Body, Constant, FragmentMajor, FragmentRole, FragmentTy, Operand, Place, Rvalue,
+    Statement, Terminator, Ty, WmmaDtype, WmmaMat, WmmaShape,
 };
 
 mod tests {
@@ -42,7 +42,8 @@ pub(crate) mod test_only {
     /// Probe: WMMA-load both A and B fragments from a bf16 LDS tile (`WmmaLoadLds`), mma, store to a global f32 C.
     /// Exercises the `WmmaLoadLds` capability the fused tensor-core dequant gemm needs (it dequants a packed int4
     /// B-tile into a bf16 LDS tile, then WMMA-loads it). Compile-only: the LDS is zero-initialized here, so it is a
-    /// codegen check (does `wmma.load` from `.shared` lower), not a value test. NVPTX-only (see `WmmaLoadLds`'s doc).
+    /// codegen check (does `wmma.load` from `.shared` lower), not a value test: the value rows (every backend, both
+    /// layouts, a nonzero base) are `tests/fragment_lds_probe.rs`.
     pub(crate) fn wmma_loadlds_probe(name: &str) -> Body {
         use crate::helpers::slice_f32;
         use poot_kernel_ir::WorkgroupLocalDecl;
@@ -77,18 +78,22 @@ pub(crate) mod test_only {
                 dst: acc,
             },
             Statement::WmmaLoadLds {
-                which: WmmaMat::A,
+                role: FragmentRole::Matrix(WmmaMat::A),
                 dtype: WmmaDtype::Bf16,
                 shape: WmmaShape::M16N16K16,
                 array: 0,
+                base: Operand::Const(Constant::Usize(0)),
+                major: FragmentMajor::Row,
                 stride: 16,
                 dst: af,
             },
             Statement::WmmaLoadLds {
-                which: WmmaMat::B,
+                role: FragmentRole::Matrix(WmmaMat::B),
                 dtype: WmmaDtype::Bf16,
                 shape: WmmaShape::M16N16K16,
                 array: 0,
+                base: Operand::Const(Constant::Usize(0)),
+                major: FragmentMajor::Row,
                 stride: 16,
                 dst: bf,
             },

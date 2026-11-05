@@ -20,10 +20,15 @@ mod access;
 pub mod aie;
 pub mod calibration;
 pub mod dram_channels;
+mod matrix;
 pub mod storage;
 pub mod vpu;
 pub use access::ArgAccess;
 pub use aie::{AieCaps, AieIsa, AiePlatform, AieTargetId};
+pub use matrix::{
+    CooperativeMatrixConfig, FragmentConfig, FragmentDtype, FragmentLayout, FragmentShape, LaneMap,
+    MatrixUnits, OperandNarrowing,
+};
 pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
 pub use vpu::{NarrowingContract, VendorCompilerId, VpuCaps, VpuTargetId};
 
@@ -45,7 +50,7 @@ pub enum Backend {
     /// Any Vulkan device, lowered to SPIR-V (the wgpu and raw-Vulkan executors).
     SpirvVulkan,
     /// ROCm/AMDGPU executor. Carries the per-device arch (gfx code, wavefront, tensor-core family) so
-    /// `plan_eqn` can gate the WMMA path on `TensorCoreSupport::Wmma16x16x16Rdna3` (spec 130).
+    /// `plan_eqn` can gate the WMMA path on the arch's [`MatrixUnits`] (spec 130).
     AmdGcn(AmdArch),
 }
 
@@ -116,116 +121,6 @@ impl From<VpuTargetId> for TargetId {
     }
 }
 
-/// Matrix (tensor-core) hardware a device exposes, as measured from a real capability query - never
-/// parsed from a marketing device-name string (card 522 review: a descriptor that says "no tensor
-/// cores" on a WMMA-capable part because the name string carried a codename instead of a gfx/config
-/// token is wrong data, not a conservative default).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
-pub enum TensorCoreSupport {
-    /// Queried and confirmed absent: no matrix hardware the planner's WMMA/MFMA path targets.
-    #[default]
-    None,
-    /// RDNA3 / RDNA3.5 (gfx11xx / a matching 16x16x16 f16-in f32-out cooperative-matrix config):
-    /// WMMA `16x16x16`, wave32.
-    Wmma16x16x16Rdna3,
-    /// RDNA4 (gfx12xx): WMMA with a different fragment packing. Layout not implemented.
-    Rdna4,
-    /// CDNA (gfx9xx MI-series): MFMA matrix cores. Not implemented.
-    CdnaMfma,
-    /// NVIDIA compute capability 8.0 or newer: the `wmma` `16x16x16` bf16/f16-in f32-out fragments the
-    /// NVPTX tensor-core kernels use, 32-lane warps. Classified from the device's own compute
-    /// capability ([`TensorCoreSupport::from_cuda_compute_capability`]).
-    NvidiaWmma16x16x16Sm80,
-    /// This API gives no way to query matrix hardware on this backend (distinct from `None`, which is a
-    /// confirmed absence): a wgpu backend other than Vulkan, or any future caller that has not wired a
-    /// real query yet. Never used to mean "not present" - a caller that cannot tell must say so, not
-    /// guess.
-    UnknownNotExposedByApi,
-}
-
-impl TensorCoreSupport {
-    /// Classify an AMD gfx code (e.g. `"gfx1151"`), from an HSA ISA name query
-    /// ([`AmdArch::from_isa_name`]). Unknown codes map to `None` so an unrecognized device does not
-    /// silently take a matrix-core path.
-    pub fn from_amd_gfx_code(gfx: &str) -> Self {
-        let n = gfx.strip_prefix("gfx").unwrap_or(gfx);
-        if n.starts_with("11") {
-            TensorCoreSupport::Wmma16x16x16Rdna3
-        } else if n.starts_with("12") {
-            TensorCoreSupport::Rdna4
-        } else if matches!(n, "908" | "90a" | "940" | "941" | "942") {
-            TensorCoreSupport::CdnaMfma
-        } else {
-            TensorCoreSupport::None
-        }
-    }
-
-    /// Classify a CUDA device by its compute capability major version (`CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR`).
-    /// poot's NVPTX tensor-core kernels use bf16 `wmma` fragments, which exist from sm_80; an older
-    /// device is a confirmed `None` for those kernels.
-    pub fn from_cuda_compute_capability(major: u32) -> Self {
-        if major >= 8 {
-            TensorCoreSupport::NvidiaWmma16x16x16Sm80
-        } else {
-            TensorCoreSupport::None
-        }
-    }
-
-    /// Classify one reported Vulkan `VK_KHR_cooperative_matrix` configuration (or wgpu's
-    /// `CooperativeMatrixProperties`, the same data): `m`/`n`/`k` are the matrix-multiply dimensions,
-    /// `ab_f16` is whether the A/B operand type is 16-bit float, and `result_f32` is whether the
-    /// accumulator/result type is 32-bit float. Matches RDNA3's one emitted WMMA shape (16x16x16,
-    /// f16-in f32-out, card 110); a device may report several configs; fold with
-    /// [`TensorCoreSupport::most_specific`] to combine them. Every other shape/type combination the
-    /// extension can report (RDNA4's, CDNA's, NVIDIA's, Apple's) is not yet classified here, so it
-    /// returns `UnknownNotExposedByApi` for this one config (card 522): the extension reported
-    /// a real config the device exposes, it is only this classifier that cannot name its family, which
-    /// is a different fact from a device whose reported-config list is empty (a genuinely confirmed
-    /// absence, which `most_specific`'s fold over an empty list leaves at `None`). Read the fold of every
-    /// reported config, not one in isolation.
-    pub fn from_cooperative_matrix_config(
-        m: u32,
-        n: u32,
-        k: u32,
-        ab_f16: bool,
-        result_f32: bool,
-    ) -> Self {
-        if m == 16 && n == 16 && k == 16 && ab_f16 && result_f32 {
-            TensorCoreSupport::Wmma16x16x16Rdna3
-        } else {
-            TensorCoreSupport::UnknownNotExposedByApi
-        }
-    }
-
-    /// Fold two classifications of the same device (e.g. one per reported cooperative-matrix config)
-    /// into one: a confirmed family wins over `None`, and `UnknownNotExposedByApi` only survives if
-    /// nothing else ever did.
-    pub fn most_specific(self, other: Self) -> Self {
-        match (self, other) {
-            (TensorCoreSupport::None | TensorCoreSupport::UnknownNotExposedByApi, other) => other,
-            (this, _) => this,
-        }
-    }
-
-    /// Find and classify a `gfx<code>` token anywhere in a device identity string, case-insensitively:
-    /// an HSA ISA name (`"amdgcn-amd-amdhsa--gfx1151"`). `None` if the string carries no such token.
-    /// Kept for identity strings that genuinely carry the gfx code (unlike Mesa RADV's wgpu/Vulkan
-    /// device name, which reports a marketing codename instead - see `from_cooperative_matrix_config`
-    /// for the measured query that backend needs).
-    pub fn from_device_name(name: &str) -> Self {
-        let lower = name.to_ascii_lowercase();
-        let Some(start) = lower.find("gfx") else {
-            return TensorCoreSupport::None;
-        };
-        let rest = &lower[start..];
-        let end = rest[3..]
-            .find(|c: char| !c.is_ascii_alphanumeric())
-            .map(|i| i + 3)
-            .unwrap_or(rest.len());
-        TensorCoreSupport::from_amd_gfx_code(&rest[..end])
-    }
-}
-
 /// A short, `Copy` ASCII holder for an AMD gfx code (e.g. `"gfx1151"`); the inline buffer keeps
 /// [`AmdArch`] `Copy`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -258,15 +153,13 @@ impl std::fmt::Debug for GfxCode {
     }
 }
 
-/// An AMD GPU codegen target: the `-mcpu` gfx code plus wavefront size and tensor-core family. Derived
+/// An AMD GPU codegen target: the `-mcpu` gfx code plus wavefront size and matrix units. Derived
 /// at runtime from the HSA-reported ISA name and wavefront size ([`AmdArch::from_isa_name`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AmdArch {
     gfx: GfxCode,
     /// Wavefront size (32 or 64), from the runtime-detected value.
     pub wave: u32,
-    /// Matrix-core family, classified from the gfx code.
-    pub tensor_core: TensorCoreSupport,
 }
 
 /// Error classifying a runtime ISA name into an [`AmdArch`].
@@ -283,7 +176,6 @@ impl AmdArch {
         AmdArch {
             gfx: GfxCode::new("gfx1151"),
             wave: 32,
-            tensor_core: TensorCoreSupport::Wmma16x16x16Rdna3,
         }
     }
 
@@ -292,14 +184,17 @@ impl AmdArch {
         self.gfx.as_str()
     }
 
-    /// Build a descriptor from an explicit gfx code and wavefront size; the tensor-core family is
-    /// classified from the gfx code.
+    /// Build a descriptor from an explicit gfx code and wavefront size.
     pub fn new(gfx: &str, wave: u32) -> Self {
         AmdArch {
             gfx: GfxCode::new(gfx),
             wave,
-            tensor_core: TensorCoreSupport::from_amd_gfx_code(gfx),
         }
+    }
+
+    /// The matrix units of this gfx code and wavefront size ([`MatrixUnits::amd`]).
+    pub fn matrix_units(&self) -> MatrixUnits {
+        MatrixUnits::amd(self.mcpu(), self.wave)
     }
 
     /// Derive a descriptor from an HSA-reported ISA name (`"amdgcn-amd-amdhsa--gfx1151"` or a bare
@@ -427,50 +322,6 @@ impl ShaderFeatures {
     };
 }
 
-/// The matrix kernels the code generator has for a device's matrix hardware: which operand dtype the planner
-/// may route to a tensor-core body. A lowering fact of the runtime's target, reported next to the hardware
-/// ([`DeviceCaps::tensor_core`]) because the same hardware family is driven by different kernels on HSA and on
-/// Vulkan. Build it with the constructor of the runtime's own target.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum MatrixLowering {
-    /// No matrix kernel for this device.
-    #[default]
-    None,
-    /// RDNA3 WMMA over bf16 operands, through the AMDGPU backend.
-    AmdWmmaBf16,
-    /// NVIDIA `wmma` over bf16 operands.
-    NvidiaWmmaBf16,
-    /// `VK_KHR_cooperative_matrix` over f16 operands with an f32 accumulator.
-    CooperativeMatrixF16,
-}
-
-impl MatrixLowering {
-    /// The lowering of an AMD device the ROCm runtime drives: WMMA on RDNA3.
-    pub fn amd(tensor_core: TensorCoreSupport) -> Self {
-        match tensor_core {
-            TensorCoreSupport::Wmma16x16x16Rdna3 => Self::AmdWmmaBf16,
-            _ => Self::None,
-        }
-    }
-
-    /// The lowering of an NVIDIA device the PTX runtime drives.
-    pub fn nvidia(tensor_core: TensorCoreSupport) -> Self {
-        match tensor_core {
-            TensorCoreSupport::NvidiaWmma16x16x16Sm80 => Self::NvidiaWmmaBf16,
-            _ => Self::None,
-        }
-    }
-
-    /// The lowering of a Vulkan device (wgpu or raw): the cooperative matrix, where the device reported the
-    /// 16x16x16 f16-in f32-out configuration the kernels are written for.
-    pub fn vulkan(tensor_core: TensorCoreSupport) -> Self {
-        match tensor_core {
-            TensorCoreSupport::Wmma16x16x16Rdna3 => Self::CooperativeMatrixF16,
-            _ => Self::None,
-        }
-    }
-}
-
 /// How a device holds an E4M3FN tensor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum E4m3Storage {
@@ -504,8 +355,8 @@ pub struct DeviceCaps {
     pub max_grid: [u32; 3],
     /// The iGPU display-watchdog chunk budgets, or `None` on a device with no such watchdog.
     pub watchdog_budget: Option<WatchdogBudget>,
-    /// Matrix (tensor-core) hardware this device exposes to the planner.
-    pub tensor_core: TensorCoreSupport,
+    /// The matrix units this device exposes to the planner, `Unknown` where the API cannot tell.
+    pub matrix_units: Queried<MatrixUnits>,
     /// Confirmed hardware/driver defects this device is known to have.
     pub known_miscompiles: KnownMiscompiles,
     /// Compute units (AMD CUs, NVIDIA SMs): how many workgroups the device runs side by side. Probed
@@ -530,8 +381,6 @@ pub struct DeviceCaps {
     /// How the device holds E4M3FN tensors. Without storage only the packed-lane row gather reads an E4M3FN
     /// table.
     pub e4m3_storage: E4m3Storage,
-    /// The matrix kernels the code generator has for this device's matrix hardware.
-    pub matrix_lowering: MatrixLowering,
     /// Whether the device holds F16 and BF16 values in native two-byte lanes. SPIR-V has none: its two-byte
     /// floats live as packed `u32` words, so a BF16 const is always packed there and the two-byte elementwise
     /// bodies do not exist.
@@ -656,14 +505,17 @@ impl DeviceCaps {
             }),
             max_grid: [65_535, 65_535, 65_535],
             watchdog_budget: calibration.watchdog_budget,
-            tensor_core: TensorCoreSupport::Wmma16x16x16Rdna3,
+            matrix_units: Queried::Known(MatrixUnits::of([FragmentConfig::m16n16k16(
+                FragmentDtype::F16,
+                FragmentLayout::Opaque,
+                32,
+            )])),
             known_miscompiles: calibration.known_miscompiles,
             compute_units: STRIX_HALO_COMPUTE_UNITS,
             memory_budget_bytes: None,
             dram_channels: Some(dram_channels::DramChannels::STRIX_HALO),
             shader_features: ShaderFeatures::ALL,
             e4m3_storage: E4m3Storage::PackedLanes,
-            matrix_lowering: MatrixLowering::CooperativeMatrixF16,
             native_two_byte_floats: false,
             widens_bf16_decode_weight: false,
             peer_transport: false,
@@ -674,7 +526,7 @@ impl DeviceCaps {
 
     /// A ROCm/HSA device with no confirmed display watchdog or tiled-GEMM ceiling: HSA queues
     /// dispatches on hardware with no host display-refresh TDR, and the RADV miscompile is a wgpu/RADV
-    /// codegen-path defect this backend does not share. `tensor_core` and `lds_bytes` should be filled
+    /// codegen-path defect this backend does not share. `matrix_units` and `lds_bytes` should be filled
     /// per device from the HSA agent query where one exists; this is the fallback for what it does not
     /// expose.
     pub fn rocm_default() -> Self {
@@ -687,7 +539,7 @@ impl DeviceCaps {
             subgroup: Queried::Unknown,
             max_grid: [u32::MAX, u32::MAX, u32::MAX],
             watchdog_budget: None,
-            tensor_core: TensorCoreSupport::None,
+            matrix_units: Queried::Known(MatrixUnits::NONE),
             known_miscompiles: KnownMiscompiles::default(),
             compute_units: STRIX_HALO_COMPUTE_UNITS,
             memory_budget_bytes: None,
@@ -695,8 +547,6 @@ impl DeviceCaps {
             shader_features: ShaderFeatures::ALL,
             // HSA has no E4M3FN tensor storage: the packed-lane row gather is the only reader.
             e4m3_storage: E4m3Storage::None,
-            // The fixture's tensor core is `None`, so no matrix kernel: a runtime builds it from its agent.
-            matrix_lowering: MatrixLowering::None,
             native_two_byte_floats: true,
             widens_bf16_decode_weight: false,
             peer_transport: false,
@@ -719,14 +569,13 @@ impl DeviceCaps {
             }),
             max_grid: [u32::MAX, 65_535, 65_535],
             watchdog_budget: None,
-            tensor_core: TensorCoreSupport::NvidiaWmma16x16x16Sm80,
+            matrix_units: Queried::Known(MatrixUnits::nvidia(8)),
             known_miscompiles: KnownMiscompiles::default(),
             compute_units: SM80_A100_COMPUTE_UNITS,
             memory_budget_bytes: None,
             dram_channels: None,
             shader_features: ShaderFeatures::ALL,
             e4m3_storage: E4m3Storage::Native,
-            matrix_lowering: MatrixLowering::NvidiaWmmaBf16,
             native_two_byte_floats: true,
             widens_bf16_decode_weight: true,
             peer_transport: true,
@@ -769,73 +618,6 @@ mod tests {
         assert_eq!(
             VendorCompilerId { major: 7, minor: 5 }.canonical(),
             "vcl=7.5"
-        );
-    }
-
-    #[test]
-    fn device_name_classification_finds_the_gfx_token_in_an_hsa_isa_string() {
-        assert_eq!(
-            TensorCoreSupport::from_device_name("amdgcn-amd-amdhsa--gfx1151"),
-            TensorCoreSupport::Wmma16x16x16Rdna3
-        );
-        assert_eq!(
-            TensorCoreSupport::from_device_name("NVIDIA GeForce RTX 4090"),
-            TensorCoreSupport::None
-        );
-    }
-
-    #[test]
-    fn amd_gfx_code_classification_matches_known_families() {
-        assert_eq!(
-            TensorCoreSupport::from_amd_gfx_code("gfx1151"),
-            TensorCoreSupport::Wmma16x16x16Rdna3
-        );
-        assert_eq!(
-            TensorCoreSupport::from_amd_gfx_code("gfx1201"),
-            TensorCoreSupport::Rdna4
-        );
-        assert_eq!(
-            TensorCoreSupport::from_amd_gfx_code("gfx90a"),
-            TensorCoreSupport::CdnaMfma
-        );
-        assert_eq!(
-            TensorCoreSupport::from_amd_gfx_code("gfx900"),
-            TensorCoreSupport::None
-        );
-    }
-
-    #[test]
-    fn cooperative_matrix_config_classifies_only_the_rdna3_wmma_shape() {
-        assert_eq!(
-            TensorCoreSupport::from_cooperative_matrix_config(16, 16, 16, true, true),
-            TensorCoreSupport::Wmma16x16x16Rdna3
-        );
-        // An unclassified but present config reports "we don't know", never "confirmed absent"
-        // (card 522): a device reporting only these configs still has real matrix
-        // hardware, just not one this classifier names.
-        assert_eq!(
-            TensorCoreSupport::from_cooperative_matrix_config(8, 8, 8, false, true),
-            TensorCoreSupport::UnknownNotExposedByApi
-        );
-        assert_eq!(
-            TensorCoreSupport::from_cooperative_matrix_config(16, 16, 16, false, true),
-            TensorCoreSupport::UnknownNotExposedByApi
-        );
-    }
-
-    #[test]
-    fn most_specific_prefers_a_confirmed_family_over_none_or_unknown() {
-        assert_eq!(
-            TensorCoreSupport::None.most_specific(TensorCoreSupport::Wmma16x16x16Rdna3),
-            TensorCoreSupport::Wmma16x16x16Rdna3
-        );
-        assert_eq!(
-            TensorCoreSupport::UnknownNotExposedByApi.most_specific(TensorCoreSupport::Rdna4),
-            TensorCoreSupport::Rdna4
-        );
-        assert_eq!(
-            TensorCoreSupport::Wmma16x16x16Rdna3.most_specific(TensorCoreSupport::None),
-            TensorCoreSupport::Wmma16x16x16Rdna3
         );
     }
 

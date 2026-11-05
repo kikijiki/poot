@@ -183,6 +183,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures",
+ "rayon-core",
 ]
 
 [[package]]
@@ -1946,6 +1947,7 @@ dependencies = [
  "poot-runtime-common",
  "poot-target",
  "poot-test-util",
+ "poot-vulkan-runtime",
  "poot-wgpu-runtime",
  "thiserror 2.0.18",
 ]
@@ -2150,9 +2152,11 @@ dependencies = [
 name = "poot-quant"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "memmap2",
  "poot-quant",
  "poot-tensor",
+ "poot-test-util",
 ]
 
 [[package]]

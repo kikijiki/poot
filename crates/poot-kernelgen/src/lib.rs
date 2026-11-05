@@ -22,6 +22,8 @@ mod matmul;
 mod microtile;
 mod packed;
 mod reduce;
+#[cfg(test)]
+mod register_budget;
 mod request;
 mod scan;
 #[cfg(test)]

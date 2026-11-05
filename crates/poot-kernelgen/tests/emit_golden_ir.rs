@@ -567,17 +567,15 @@ fn wmma_tile_is_one_body_lowered_on_every_target() {
         "NVPTX B fragment must load via load.b: {nvptx_ir}"
     );
 
-    // AMDGCN: `emit_wmma_load_amdgcn`'s row-vs-col per-lane offset arithmetic differs by `which` (see
-    // its doc): the A load precomputes `row * stride` exactly once (a register-operand `mul`) and
-    // then only adds per-lane constants, while the B load has no such precompute and instead
-    // recomputes `j * stride` fresh each of the 15 nonzero lanes (15 literal-operand `mul`s). Splitting
-    // on the per-load `workitem.id.x` call (emitted once per `WmmaLoad`, A's call before B's in
-    // program order) isolates each load's block; counting `mul i32` occurrences in each catches either
-    // half of a swap (A losing its one precompute, or B gaining one it should not have), not just a
-    // clean full exchange.
-    // `emit_wmma_store_amdgcn` (the store epilogue) also calls `workitem.id.x()` once for its own lane
-    // addressing, so the function has 3 such calls total (A load, B load, store); split into 4 parts
-    // and stop at the 3rd so `b_block` holds only the B load's own code, not the unrelated store tail.
+    // AMDGCN: `emit_wmma_load_ab_amdgcn`'s per-lane offset arithmetic differs between a row-major A and a
+    // row-major B (see its doc: `k` is contiguous for A, strided for B). The A load precomputes
+    // `row * stride` once (one register-operand `mul`) and adds the literal `j` for lane value `j`; the B load
+    // has no multiply and adds the literal `j * stride` (up to `15 * 16 = 240`) to the lane's column.
+    // Splitting on the per-load `workitem.id.x` call (emitted once per `WmmaLoad`, A's call before B's in
+    // program order) isolates each load's block, so either half of a swap is caught, not just a clean full
+    // exchange. `emit_wmma_store_amdgcn` (the store epilogue) calls `workitem.id.x()` once for its own lane
+    // addressing, so the function has 3 such calls total (A load, B load, store); split into 4 parts and stop
+    // at the 3rd so `b_block` holds only the B load's own code, not the unrelated store tail.
     let amdgcn_ir = emit_llvm_ir(&body, Target::AmdGcn(AmdArch::gfx1151())).unwrap();
     let lane_call = "call i32 @llvm.amdgcn.workitem.id.x()";
     let mut parts = amdgcn_ir.splitn(4, lane_call);
@@ -589,15 +587,32 @@ fn wmma_tile_is_one_body_lowered_on_every_target() {
         .next()
         .expect("B load's block, up to the store's lane call");
     let mul_count = |s: &str| s.matches("mul i32").count();
+    // The literal right operand of every `add i32` (the lane's `and`-masked row index is not an offset).
+    let add_literals = |s: &str| -> Vec<String> {
+        s.lines()
+            .filter(|line| line.contains("= add i32"))
+            .filter_map(|line| line.rsplit(", ").next())
+            .map(|literal| literal.trim().to_string())
+            .collect()
+    };
+    let (a_adds, b_adds) = (add_literals(a_block), add_literals(b_block));
     assert_eq!(
         mul_count(a_block),
         1,
         "AMDGCN A fragment must precompute row*stride exactly once: {a_block}"
     );
+    assert!(
+        a_adds.contains(&"15".to_string()) && !a_adds.contains(&"240".to_string()),
+        "AMDGCN A fragment steps k by 1 per lane value: {a_block}"
+    );
     assert_eq!(
         mul_count(b_block),
-        15,
-        "AMDGCN B fragment must compute j*stride fresh for each of its 15 nonzero lanes: {b_block}"
+        0,
+        "AMDGCN B fragment has no per-lane multiply (its k step is the literal j*stride): {b_block}"
+    );
+    assert!(
+        b_adds.contains(&"240".to_string()) && !b_adds.contains(&"15".to_string()),
+        "AMDGCN B fragment steps k by the row stride (15 * 16 = 240 for its last lane value): {b_block}"
     );
 }
 

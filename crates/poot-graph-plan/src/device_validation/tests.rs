@@ -307,7 +307,7 @@ mod resources {
         BasicBlock, Body, Local, Statement, Terminator, Ty, WmmaDtype, WmmaShape,
     };
     use poot_kernelgen::{FragmentUse, KernelRequirements};
-    use poot_target::{DeviceCaps, Queried, SubgroupSupport, TensorCoreSupport};
+    use poot_target::{DeviceCaps, MatrixUnits, Queried, SubgroupSupport};
 
     use crate::device_validation::{ResourceRefusal, validate_kernel_resources};
 
@@ -326,8 +326,12 @@ mod resources {
     }
 
     fn fragment_statement() -> Statement {
+        fragment_statement_of(WmmaDtype::F16)
+    }
+
+    fn fragment_statement_of(dtype: WmmaDtype) -> Statement {
         Statement::WmmaZero {
-            dtype: WmmaDtype::F16,
+            dtype,
             shape: WmmaShape::M16N16K16,
             dst: Local { index: 1 },
         }
@@ -430,6 +434,46 @@ mod resources {
         );
     }
 
+    /// POOT-1431: matrix units are per operand dtype. A bf16 fragment is refused by a device whose units are f16
+    /// only (RADV: no `VK_KHR_shader_bfloat16`) and admitted by one that has bf16 (PTX sm_80+, ROCm gfx11); the
+    /// f16 fragment runs on both. The old one-family flag admitted the bf16 fragment on RADV.
+    /// Mutation: in `check_fragment`, look the config up by `FragmentDtype::F16` whatever the fragment's dtype;
+    /// the bf16-on-RADV row is admitted and goes red.
+    #[test]
+    fn a_fragment_needs_a_matrix_unit_of_its_own_dtype() {
+        let declared = KernelRequirements {
+            subgroup_lanes: Some(32),
+        };
+        let radv = DeviceCaps::wgpu_rdna3_igpu();
+        let radv_subgroup = Queried::Known(SubgroupSupport::Present {
+            min_size: 32,
+            max_size: 32,
+        });
+        let radv = DeviceCaps {
+            subgroup: radv_subgroup,
+            ..radv
+        };
+        let bf16 = body([32, 1, 1], vec![fragment_statement_of(WmmaDtype::Bf16)]);
+        let f16 = body([32, 1, 1], vec![fragment_statement_of(WmmaDtype::F16)]);
+        let refusal = validate_kernel_resources(&bf16, declared, &radv);
+        assert!(
+            matches!(
+                refusal,
+                Err(ResourceRefusal::FragmentUnsupported {
+                    fragment: FragmentUse {
+                        dtype: WmmaDtype::Bf16,
+                        ..
+                    },
+                    ..
+                })
+            ),
+            "{refusal:?}"
+        );
+        assert_eq!(validate_kernel_resources(&f16, declared, &radv), Ok(()));
+        assert_eq!(validate_kernel_resources(&bf16, declared, &caps()), Ok(()));
+        assert_eq!(validate_kernel_resources(&f16, declared, &caps()), Ok(()));
+    }
+
     /// A fragment kernel that declares its 32-lane subgroup is refused, with the matching typed reason, by a
     /// device that reports no subgroups, does not expose them, has subgroups of another size, has no matrix
     /// hardware, or has matrix hardware its API does not expose; `Unknown` is never read as "present". The
@@ -478,15 +522,15 @@ mod resources {
             ),
             (
                 "no matrix hardware",
-                |caps| caps.tensor_core = TensorCoreSupport::None,
+                |caps| caps.matrix_units = Queried::Known(MatrixUnits::NONE),
                 ResourceRefusal::FragmentUnsupported {
                     fragment,
-                    tensor_core: TensorCoreSupport::None,
+                    matrix_units: MatrixUnits::NONE,
                 },
             ),
             (
                 "matrix hardware not exposed",
-                |caps| caps.tensor_core = TensorCoreSupport::UnknownNotExposedByApi,
+                |caps| caps.matrix_units = Queried::Unknown,
                 ResourceRefusal::FragmentCapabilityUnknown { fragment },
             ),
         ];

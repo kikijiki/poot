@@ -474,10 +474,21 @@ pub(super) fn footprints(
                 }
             }
         }
+        usage.insert(*device, categories);
+    }
+    // One arena per device: its stages run in turn and share the buffers of values that are dead between them.
+    let mut arenas: BTreeMap<DeviceId, Vec<&crate::BufferPlan>> = BTreeMap::new();
+    for (_, device, program) in stages {
+        arenas
+            .entry(*device)
+            .or_default()
+            .push(program.buffer_plan());
+    }
+    for (device, plans) in arenas {
+        let categories = usage.entry(device).or_default();
         categories.activations = categories
             .activations
-            .saturating_add(program.buffer_plan().arena_bytes() as u64);
-        usage.insert(*device, categories);
+            .saturating_add(crate::EntryArena::plan(plans).bytes() as u64);
     }
     for transfer in transfers {
         let (_, device, _) = &stages[transfer.to.0 as usize];

@@ -14,32 +14,32 @@
 //!    file in place while it is mapped. This is a contract, not a defended boundary. A write to the file
 //!    while a `&[u8]` into it is live is a data race, which is undefined behavior by the language's rules
 //!    whatever the hardware then does; a truncation ends the process with `SIGBUS`. The content checks of
-//!    a packed payload (finite scales, group-index range) run once on the mapped bytes at load and the
-//!    bytes are read again at upload, so a modification between the two can put an unchecked value on
-//!    the device. [`MappedFile::check_unchanged`] runs at the load end and on both sides of the
-//!    load-time upload's reads, so a modification made before, or during, that upload is refused after
-//!    it and the weights are dropped unpublished. The runtime reads of the mapping (embed rows, expert
-//!    refills) are not followed by a check, so a modification racing one is not detected. Replacing a
-//!    checkpoint by rename never modifies a mapped inode and is always safe.
+//!    a packed payload (finite scales) run on the bytes of the one positional read that uploads them
+//!    ([`MappedFile::read_at`]), so the bytes checked are the bytes staged. [`MappedFile::check_unchanged`]
+//!    runs at the load end and on both sides of the load-time upload's reads, so a modification made
+//!    before, or during, that upload is refused after it and the weights are dropped unpublished. The
+//!    runtime reads of the mapping (embed rows, expert refills) are not followed by a check, so a
+//!    modification racing one is not detected. Replacing a checkpoint by rename never modifies a mapped
+//!    inode and is always safe.
 //!
-//! 5. [`MappedFile::release`] is the one `madvise(MADV_DONTNEED)`: it only ever names whole pages of a
-//!    clean private file mapping, which drops them from this process and changes no byte a slice reads
-//!    (invariant 1), so it is sound while slices into the range are live.
+//! 5. The load path never touches the mapping: it reads by `pread` ([`MappedFile::read_at`], safe code),
+//!    so a truncated file is a typed short-read error, not `SIGBUS`, and no page of the checkpoint is
+//!    counted in this process's `RssFile` while it loads. [`MappedFile::evict`] is a
+//!    `posix_fadvise(POSIX_FADV_DONTNEED)` on the descriptor: advice about the page cache, which changes no
+//!    byte any slice or read observes.
 //!
 //! `MappedFile` is `Send + Sync` through the auto traits (`memmap2::Mmap` and `File` are); there is no
 //! `unsafe impl`.
 
 use std::fs::{File, Metadata};
 use std::ops::Range;
-use std::os::unix::fs::MetadataExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileExt, MetadataExt};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use memmap2::{Advice, Mmap, MmapOptions, UncheckedAdvice};
+use memmap2::{Mmap, MmapOptions};
 
-use super::{Access, FileIdentity, MapError, SourceChanged};
-
-/// The largest page size of any Linux target. `madvise` wants a page-aligned start; rounding a start
-/// down to a multiple of this is page-aligned on every page size and only widens an advisory hint.
-const MAX_PAGE: usize = 64 * 1024;
+use super::{FileIdentity, MapError, SourceChanged};
 
 pub(super) struct MappedFile {
     /// `PROT_READ`, `MAP_PRIVATE`, offset 0, length `identity.len` at map time.
@@ -47,6 +47,8 @@ pub(super) struct MappedFile {
     /// Kept open: [`Self::check_unchanged`] stats this descriptor, never the path.
     file: File,
     identity: FileIdentity,
+    /// Bytes returned by [`Self::read_at`] since the map: the load's own read counter.
+    read: AtomicU64,
 }
 
 impl FileIdentity {
@@ -98,6 +100,7 @@ impl MappedFile {
             map,
             file,
             identity,
+            read: AtomicU64::new(0),
         }))
     }
 
@@ -127,34 +130,40 @@ impl MappedFile {
         }
     }
 
-    /// A paging hint over `range` of the mapping. Advisory: a refusal is ignored.
-    pub(super) fn advise(&self, range: Range<usize>, access: Access) {
-        let advice = match access {
-            Access::Sequential => Advice::Sequential,
-            Access::WillNeed => Advice::WillNeed,
-            Access::Release => return self.release(range),
-        };
-        let start = range.start / MAX_PAGE * MAX_PAGE;
-        let _ = self.map.advise_range(advice, start, range.end - start);
+    /// Fill `out` from the file bytes at `offset` by `pread`, never through the mapping. A file shorter
+    /// than `offset + out.len()` (truncated since the map) is an `UnexpectedEof` error.
+    pub(super) fn read_at(&self, offset: usize, out: &mut [u8]) -> std::io::Result<()> {
+        self.file.read_exact_at(out, offset as u64)?;
+        self.read.fetch_add(out.len() as u64, Ordering::Relaxed);
+        Ok(())
     }
 
-    /// Drop this process's page-table entries for the pages wholly inside `range`. The edges round
-    /// inward (to [`MAX_PAGE`]), never outward: the neighbouring tensors sharing an edge page have not
-    /// been consumed yet. Advisory: a refusal is ignored.
-    fn release(&self, range: Range<usize>) {
-        let start = range.start.next_multiple_of(MAX_PAGE);
-        let end = range.end / MAX_PAGE * MAX_PAGE;
-        if start >= end {
+    /// Bytes [`Self::read_at`] has returned.
+    pub(super) fn bytes_read(&self) -> u64 {
+        self.read.load(Ordering::Relaxed)
+    }
+
+    /// Ask the kernel to drop the page-cache pages of `range` of the file. Advisory: a refusal is
+    /// ignored, and the kernel keeps partial pages and pages another process maps.
+    pub(super) fn evict(&self, range: Range<usize>) {
+        self.advise_cache(range, libc::POSIX_FADV_DONTNEED);
+    }
+
+    /// Ask the kernel to start reading `range` of the file into the page cache, without waiting for it.
+    /// Advisory: a refusal is ignored.
+    pub(super) fn prefetch(&self, range: Range<usize>) {
+        self.advise_cache(range, libc::POSIX_FADV_WILLNEED);
+    }
+
+    fn advise_cache(&self, range: Range<usize>, advice: libc::c_int) {
+        let (Ok(offset), Ok(len)) = (
+            libc::off_t::try_from(range.start),
+            libc::off_t::try_from(range.len()),
+        ) else {
             return;
-        }
-        // SAFETY: invariant 1 of the module docs: the mapping is `PROT_READ` and `MAP_PRIVATE` over a
-        // regular file and this process never wrote a page of it, so every page is clean and file-backed.
-        // `MADV_DONTNEED` on such a page only unmaps it from this process (the page cache keeps it), and
-        // the next access to the range faults the file's bytes in again, so no `&[u8]` into the mapping
-        // changes meaning. The range is inside the mapping: `range` is a checked view range (invariant 3).
-        let _ = unsafe {
-            self.map
-                .unchecked_advise_range(UncheckedAdvice::DontNeed, start, end - start)
         };
+        // SAFETY: invariant 5 of the module docs. `posix_fadvise` takes a valid open descriptor (the
+        // `File` this value owns) and three integers; it reads and writes no memory of this process.
+        let _ = unsafe { libc::posix_fadvise(self.file.as_raw_fd(), offset, len, advice) };
     }
 }

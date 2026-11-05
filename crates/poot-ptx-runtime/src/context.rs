@@ -68,7 +68,7 @@ pub(crate) fn require_gpu_check_with<E: std::fmt::Display>(
 /// device's total VRAM (`cuMemGetInfo`'s total; no narrower ceiling is known for this backend), and the LDS,
 /// grid, workgroup (block), warp and compute-capability values are `cuDeviceGetAttribute` queries. There
 /// is no display watchdog or confirmed tiled-GEMM miscompile on this backend (both are wgpu/RADV
-/// codegen-path defects). `tensor_core` is classified from the device's compute capability: poot's NVPTX
+/// codegen-path defects). `matrix_units` come from the device's compute capability: poot's NVPTX
 /// codegen targets `-mcpu=sm_80`, whose bf16 `wmma` fragments exist from compute capability 8.
 ///
 /// Called once, at [`PtxContext::build_ordinal`], while the retained context is current on this thread;
@@ -116,9 +116,6 @@ struct CudaAttributes {
 }
 
 fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_target::DeviceCaps {
-    let tensor_core = poot_target::TensorCoreSupport::from_cuda_compute_capability(
-        attrs.compute_capability_major,
-    );
     poot_target::DeviceCaps {
         max_buffer_bytes: total_memory,
         lds_bytes: attrs.shared_memory_per_block,
@@ -130,7 +127,9 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
         }),
         max_grid: attrs.max_grid,
         watchdog_budget: None,
-        tensor_core,
+        matrix_units: poot_target::Queried::Known(poot_target::MatrixUnits::nvidia(
+            attrs.compute_capability_major,
+        )),
         // A device's miscompiles are the target family's known facts, not something CUDA reports.
         known_miscompiles: poot_target::DeviceCaps::ptx_default().known_miscompiles,
         compute_units: attrs.multiprocessor_count,
@@ -138,7 +137,6 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
         dram_channels: None,
         shader_features: poot_target::ShaderFeatures::ALL,
         e4m3_storage: poot_target::E4m3Storage::Native,
-        matrix_lowering: poot_target::MatrixLowering::nvidia(tensor_core),
         native_two_byte_floats: true,
         widens_bf16_decode_weight: true,
         peer_transport: true,
@@ -1047,7 +1045,7 @@ impl KernelArgs {
 #[cfg(test)]
 mod caps_tests {
     use super::*;
-    use poot_target::{Queried, SubgroupSupport, TensorCoreSupport};
+    use poot_target::{FragmentDtype, FragmentLayout, MatrixUnits, Queried, SubgroupSupport};
 
     fn sentinel(compute_capability_major: u32) -> CudaAttributes {
         CudaAttributes {
@@ -1085,7 +1083,19 @@ mod caps_tests {
             Some(123_456),
             "the device's total memory"
         );
-        assert_eq!(caps.tensor_core, TensorCoreSupport::NvidiaWmma16x16x16Sm80);
+        let units = caps
+            .matrix_units
+            .known()
+            .expect("a CUDA device reports its matrix units");
+        assert_eq!(
+            units.iter().map(|c| c.dtype).collect::<Vec<_>>(),
+            [FragmentDtype::Bf16, FragmentDtype::F16]
+        );
+        assert!(
+            units
+                .iter()
+                .all(|c| c.layout == FragmentLayout::Opaque && c.subgroup == 32)
+        );
     }
 
     /// The decode-GEMV width ceiling is a measured Ampere figure, keyed by the device's compute capability: an
@@ -1103,12 +1113,12 @@ mod caps_tests {
         );
     }
 
-    /// A pre-Ampere device is a confirmed absence of the bf16 fragments poot's kernels use.
+    /// A pre-Ampere device is a confirmed absence of the fragments poot's kernels use.
     #[test]
     fn a_pre_ampere_device_has_no_matrix_hardware_for_poots_kernels() {
         assert_eq!(
-            caps_from_attributes(1, &sentinel(7)).tensor_core,
-            TensorCoreSupport::None
+            caps_from_attributes(1, &sentinel(7)).matrix_units,
+            Queried::Known(MatrixUnits::NONE)
         );
     }
 }

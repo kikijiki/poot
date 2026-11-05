@@ -835,7 +835,6 @@ mod tests {
     use poot_load::gguf::{
         GgufIndex, GgufValue, IdentityNames, TensorNameMap, gguf_plan, read_gguf,
     };
-    use poot_load::plan::default_workers;
     use poot_quant::StoredBytes;
     use poot_weights::HandleFormat;
     use serde_json::json;
@@ -1973,7 +1972,7 @@ mod tests {
         let raw = RawConfig::Gguf(&index);
         let mut p = Qwen35Params::from_raw(&raw).unwrap();
         p.kinds.truncate(4);
-        let store = read_gguf(&index, &FirstBlocks { blocks: 4 }, default_workers()).unwrap();
+        let store = read_gguf(&index, &FirstBlocks { blocks: 4 }).unwrap();
         let format = |key: &str| match store.get(key).unwrap_or_else(|| panic!("{key}")) {
             WeightEntry::Packed(payload) => payload.weight().format(),
             WeightEntry::Dense(_) => panic!("{key} was widened to a dense tensor"),
@@ -2043,7 +2042,7 @@ mod tests {
         let mut p = Qwen35Params::from_raw(&RawConfig::Gguf(&index)).unwrap();
         p.kinds.truncate(1);
         assert_eq!(p.kinds, [LayerKind::LinearAttention]);
-        let store = read_gguf(&index, &FirstBlocks { blocks: 1 }, default_workers()).unwrap();
+        let store = read_gguf(&index, &FirstBlocks { blocks: 1 }).unwrap();
         let weights = weights_of(&p, &store).unwrap();
         let w = GdnWeights::new(&weights, 0, p.width, &p.gdn).unwrap();
         let tokens = input.len() / p.width;
@@ -2137,7 +2136,7 @@ mod tests {
             assert_eq!(index.tensors[name].ggml_type, ggml_type, "{name}");
             let store = tensors
                 .entry(name.to_string())
-                .or_insert_with(|| read_gguf(&index, &Only(name), default_workers()).unwrap());
+                .or_insert_with(|| read_gguf(&index, &Only(name)).unwrap());
             let WeightEntry::Packed(payload) = store.get(name).unwrap() else {
                 panic!("{name} was widened to a dense tensor");
             };

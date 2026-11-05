@@ -9,7 +9,6 @@ use std::sync::Arc;
 use poot_graph_ir::{Graph, OpKind, ValueId};
 use poot_graph_plan::{WeightFormats, bind_packed_weights};
 use poot_load::gguf::{GgufIndex, GgufValue, IdentityNames, read_gguf, write_gguf};
-use poot_load::plan::default_workers;
 use poot_quant::SourceRole;
 use poot_quant::StoredBytes;
 use poot_quant::format::WeightFormat;
@@ -316,7 +315,7 @@ pub(crate) fn read_back(
     let bytes = write_gguf(kvs, tensors);
     let file = StoredBytes::from(bytes);
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames).unwrap();
     (index, store)
 }
 

@@ -74,49 +74,56 @@ fn wgpu_device_caps_matches_a_direct_adapter_query() {
         "max_buffer_bytes must be the queried device max, RADV-capped where applicable"
     );
 
-    // The tensor-core family is measured from `VK_KHR_cooperative_matrix` (via wgpu's own adapter-level
+    // The matrix units are measured from `VK_KHR_cooperative_matrix` (via wgpu's own adapter-level
     // query), never parsed from the adapter's device-name string (card 522 review). Re-derive
-    // independently from a fresh adapter query so a hardcoded family would disagree.
+    // independently from a fresh adapter query so hardcoded units would disagree.
     // `Context::new_async` requests the cooperative-matrix feature exactly when the adapter advertises
-    // it, so that feature is granted iff advertised; without it no family is reported.
+    // it, so that feature is granted iff advertised; without it no unit is reported.
     let coopmat_granted = adapter
         .features()
         .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
-    let expected_tensor_core = if info.backend != wgpu::Backend::Vulkan {
-        poot_target::TensorCoreSupport::UnknownNotExposedByApi
-    } else if !coopmat_granted {
-        poot_target::TensorCoreSupport::None
+    let reported_f16_16x16x16 = adapter
+        .cooperative_matrix_properties()
+        .into_iter()
+        .any(|c| {
+            (c.m_size, c.n_size, c.k_size) == (16, 16, 16)
+                && c.ab_type == wgpu::CooperativeScalarType::F16
+                && c.cr_type == wgpu::CooperativeScalarType::F32
+        });
+    let expected_dtypes = if info.backend != wgpu::Backend::Vulkan {
+        None
+    } else if coopmat_granted && reported_f16_16x16x16 {
+        Some(vec![poot_target::FragmentDtype::F16])
     } else {
-        adapter
-            .cooperative_matrix_properties()
-            .into_iter()
-            .map(|c| {
-                poot_target::TensorCoreSupport::from_cooperative_matrix_config(
-                    c.m_size,
-                    c.n_size,
-                    c.k_size,
-                    c.ab_type == wgpu::CooperativeScalarType::F16,
-                    c.cr_type == wgpu::CooperativeScalarType::F32,
-                )
-            })
-            .fold(poot_target::TensorCoreSupport::None, |acc, x| {
-                acc.most_specific(x)
-            })
+        Some(vec![])
     };
     assert_eq!(
-        caps.tensor_core, expected_tensor_core,
-        "tensor_core must be measured from a fresh VK_KHR_cooperative_matrix query, not a hardcoded family"
+        caps.matrix_units
+            .known()
+            .map(|units| units.iter().map(|c| c.dtype).collect::<Vec<_>>()),
+        expected_dtypes,
+        "matrix_units must be measured from a fresh VK_KHR_cooperative_matrix query, not hardcoded"
     );
-    // On this box (AMD Vulkan/RADV, RDNA3.5 WMMA hardware) this must be a confirmed family, not `None`
-    // or `UnknownNotExposedByApi` - the whole point of measuring instead of parsing a name string.
+    // On this box (AMD Vulkan/RADV, RDNA3.5 WMMA hardware) the units are exactly one opaque f16 16x16x16
+    // fragment across 32 lanes: RADV exposes no bf16 cooperative matrix (Mesa disables it on gfx11), and
+    // reporting one would send bf16 operands to a body that cannot lower them.
     let is_amd_radv = info.backend == wgpu::Backend::Vulkan && info.vendor == 0x1002;
     if is_amd_radv {
+        let units = caps
+            .matrix_units
+            .known()
+            .expect("a Vulkan adapter reports its matrix units");
+        let configs: Vec<_> = units.iter().collect();
         assert_eq!(
-            caps.tensor_core,
-            poot_target::TensorCoreSupport::Wmma16x16x16Rdna3,
-            "this box's RDNA3.5 iGPU must report confirmed WMMA-class support, not {:?}",
-            caps.tensor_core
+            configs.len(),
+            1,
+            "RADV offers one fragment config: {configs:?}"
         );
+        let config = configs[0];
+        assert_eq!(config.dtype, poot_target::FragmentDtype::F16);
+        assert_eq!(config.shape, poot_target::FragmentShape::M16N16K16);
+        assert_eq!(config.layout, poot_target::FragmentLayout::Opaque);
+        assert_eq!(config.subgroup, 32);
     }
 
     // The watchdog budget and the tiled-GEMM miscompile ceiling come from the calibration table, keyed by the

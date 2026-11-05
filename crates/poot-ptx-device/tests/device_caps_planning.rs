@@ -8,13 +8,13 @@ use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
 use poot_ptx_device::device::PtxDevice;
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
-use poot_target::{Backend, Queried, SubgroupSupport, TensorCoreSupport};
+use poot_target::{Backend, FragmentDtype, FragmentLayout, Queried, SubgroupSupport};
 
-/// A live device reports positive workgroup limits, a fixed 32-lane warp, and a matrix family classified from
-/// its compute capability (never `Unknown`).
+/// A live device reports positive workgroup limits, a fixed 32-lane warp, and the matrix units of its compute
+/// capability (never `Unknown`): on an sm_80+ part opaque bf16 and f16 fragments across 32 lanes.
 ///
-/// Mutation: report `TensorCoreSupport::UnknownNotExposedByApi` from `from_cuda_compute_capability`; the
-/// matrix-family assertion goes red.
+/// Mutation: report `Queried::Unknown` from `caps_from_attributes`; the matrix-unit assertion goes red.
+/// Owed on a pod (POOT-1431): this box has no NVIDIA device.
 #[test]
 fn a_live_ptx_device_reports_its_workgroup_subgroup_and_matrix_caps() {
     let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
@@ -33,13 +33,20 @@ fn a_live_ptx_device_reports_its_workgroup_subgroup_and_matrix_caps() {
             max_size: 32
         })
     );
+    let units = caps
+        .matrix_units
+        .known()
+        .expect("an NVIDIA device reports its matrix units from its compute capability");
+    assert_eq!(
+        units.iter().map(|c| c.dtype).collect::<Vec<_>>(),
+        [FragmentDtype::Bf16, FragmentDtype::F16],
+        "sm_80+ has bf16 and f16 wmma fragments"
+    );
     assert!(
-        matches!(
-            caps.tensor_core,
-            TensorCoreSupport::NvidiaWmma16x16x16Sm80 | TensorCoreSupport::None
-        ),
-        "an NVIDIA device classifies its matrix hardware from its compute capability: {:?}",
-        caps.tensor_core
+        units
+            .iter()
+            .all(|c| c.layout == FragmentLayout::Opaque && c.subgroup == 32),
+        "the wmma API's fragment layout is opaque, held across a 32-lane warp: {units:?}"
     );
 }
 

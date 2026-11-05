@@ -18,13 +18,13 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use poot_graph_ir::{
     IndexRange, PackedSourceName, SlotKey, TensorType, ValueId, WeightRef, packed_stack_source_type,
 };
 use poot_quant::weights::{StoreGeneration, WeightEntry, WeightKey, WeightStore};
-use poot_quant::{Access, SourceRole};
+use poot_quant::{PackedWeightError, PayloadReadError, ReadError, SourceRole};
 use poot_target::BufferStorage;
 use poot_tensor::{DType, HostView};
 use poot_weights::{HandleFormat, WeightId, WeightMap, WeightView};
@@ -177,16 +177,6 @@ impl ConstBytes {
     }
 }
 
-/// The stored bytes `span` names, as the store holds them (an I64 table is still I64 here).
-fn stored_bytes<'s>(store: &'s WeightStore, span: &StoredSpan) -> &'s [u8] {
-    let stored = match (store.get(span.key.as_str()), span.role) {
-        (Some(WeightEntry::Dense(dense)), None) => dense.bytes().as_slice(),
-        (Some(WeightEntry::Packed(payload)), Some(role)) => payload.bytes(role),
-        _ => unreachable!("a span is built from the store it reads"),
-    };
-    &stored[span.bytes.clone()]
-}
-
 /// One word of an I64 table read as I32 ([`StoredSpan::narrowed`]). The map range-checked every word
 /// when it was built, so a word outside I32 can only come from a source file modified since: it
 /// saturates, never panics. The load-time upload's identity check after its reads
@@ -206,11 +196,52 @@ impl StoredSpan {
     }
 }
 
+/// Why a [`WeightWriter`] could not deliver the bytes of a range: the first failure of its fills.
+#[derive(Debug)]
+enum WriteFault {
+    /// The checkpoint file could not be read (truncated or replaced since it was mapped).
+    Read(ReadError),
+    /// A stored value failed its payload's content check (ADR-0103 decision 4).
+    Content(PackedWeightError),
+    /// Card 1007: a packed-F16 weight holds an infinity or NaN, which the generated bodies' in-register
+    /// binary16 decode does not represent.
+    NonFiniteF16 { index: usize, bits: u16 },
+}
+
+impl From<PayloadReadError> for WriteFault {
+    fn from(error: PayloadReadError) -> Self {
+        match error {
+            PayloadReadError::Read(error) => Self::Read(error),
+            PayloadReadError::Content(error) => Self::Content(error),
+        }
+    }
+}
+
+/// Reader threads one large fill splits its file read across: the host's parallelism, at most eight (past
+/// that the disk, not the thread count, is the limit).
+fn reader_threads() -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::thread::available_parallelism().map_or(1, |threads| threads.get().min(8))
+    })
+}
+
+/// How far past the bytes a fill reads the next fill's bytes are requested from the kernel: two fills of the
+/// device's 64 MiB staging chunk. The disk then reads the next chunk while this one is copied to the device,
+/// instead of idling between reads.
+const READ_AHEAD: usize = 2 * poot_runtime_common::UPLOAD_CHUNK_BYTES;
+
+/// A fill smaller than this is read on the submitting thread: the threads would cost more than they save.
+const PARALLEL_READ_MIN: usize = 8 << 20;
+
 /// One weight const on its way to the device: its spans, back to back (a stacked source's runs each
 /// followed by zeros to the slab stride, so expert `e` starts at byte `e * slab_bytes`), landed in the planned
-/// lane by [`lanes::encode_range`](crate::lanes::encode_range). It reads the store's views straight into
-/// the buffers a [`Device::write_with`](crate::Device::write_with) hands out: no intermediate copy of the
-/// weight is built (dmap.md section 6.1).
+/// lane by [`lanes::encode_range`](crate::lanes::encode_range). It reads the store's byte runs by positional
+/// file reads straight into the buffers a [`Device::write_with`](crate::Device::write_with) hands out, so the
+/// checkpoint is neither mapped nor copied on the way: the one read of each byte also checks it (a packed
+/// payload's stored values, a packed-F16 weight's finiteness). `fill` cannot return an error through
+/// `write_with`, so the first failure is held and zeroes every later fill; the caller asks for it with
+/// [`Self::finish`] before it publishes the buffer.
 pub(crate) struct WeightWriter {
     /// The store the spans read, shared with the binder: the writer borrows nothing, so the engine builds it
     /// once per weight and keeps it across the device allocation.
@@ -222,6 +253,9 @@ pub(crate) struct WeightWriter {
     shape: Vec<usize>,
     /// The stored stream's length without a stack's last slab padding.
     data_len: usize,
+    /// Drop each range's page cache once it is read ([`Device::unified_memory`](crate::Device::unified_memory)).
+    evict: bool,
+    fault: Mutex<Option<WriteFault>>,
 }
 
 impl WeightWriter {
@@ -230,40 +264,53 @@ impl WeightWriter {
         crate::lanes::encoded_len(self.encoding, &self.shape, self.data_len)
     }
 
-    /// A packed-F16 weight holding an infinity or NaN is refused before any byte is written: the
-    /// generated bodies decode the packed binary16 lane over its finite domain only (Card 1007).
-    pub(crate) fn check_encodable(&self) -> Result<(), EncodeError> {
-        if self.encoding != Encoding::PackedWordsFiniteF16 {
-            return Ok(());
-        }
-        let mut base = 0;
-        for span in &self.spans {
-            if let Some((index, bits)) = first_non_finite_f16(stored_bytes(&self.store, span)) {
-                return Err(EncodeError::NonFiniteF16 {
-                    index: base + index,
-                    bits,
-                });
-            }
-            base += span.bytes.len() / 2;
-        }
-        Ok(())
-    }
-
     /// Encoded bytes `range` into `out` (`out.len() == range.len()`): any sub-range, since every encoding
-    /// is element- or row-local. Writes every byte of `out`.
+    /// is element- or row-local. Writes every byte of `out`; after a failure ([`Self::finish`]) it writes
+    /// zeros and reads nothing.
     pub(crate) fn fill(&self, range: Range<usize>, out: &mut [u8]) {
+        if self
+            .fault
+            .lock()
+            .expect("a reader does not panic")
+            .is_some()
+        {
+            out.fill(0);
+            return;
+        }
         crate::lanes::encode_range(
             self.encoding,
             &self.shape,
             self.data_len,
             range,
-            &mut |stored, into| self.read_stream(stored, into),
+            &mut |stored, into| {
+                if let Err(fault) = self.read_stream(stored, into) {
+                    into.fill(0);
+                    self.fault
+                        .lock()
+                        .expect("a reader does not panic")
+                        .get_or_insert(fault);
+                }
+            },
             out,
         );
     }
 
+    /// `Ok` when every fill delivered its bytes; otherwise the first failure, named for weight `name`.
+    pub(crate) fn finish(&self, name: &str) -> Result<(), LoadError> {
+        let fault = self.fault.lock().expect("a reader does not panic").take();
+        let name = name.to_string();
+        match fault {
+            None => Ok(()),
+            Some(WriteFault::Read(source)) => Err(LoadError::WeightRead { name, source }),
+            Some(WriteFault::Content(source)) => Err(LoadError::WeightContent { name, source }),
+            Some(WriteFault::NonFiniteF16 { index, bits }) => {
+                Err(LoadError::NonFiniteF16Weight { name, index, bits })
+            }
+        }
+    }
+
     /// Stored-stream bytes `range` into `out`; a slab gap is zeros.
-    fn read_stream(&self, range: Range<usize>, out: &mut [u8]) {
+    fn read_stream(&self, range: Range<usize>, out: &mut [u8]) -> Result<(), WriteFault> {
         out.fill(0);
         let first = self
             .starts
@@ -279,18 +326,87 @@ impl WeightWriter {
                 continue;
             }
             let into = &mut out[lo - range.start..hi - range.start];
-            let stored = stored_bytes(&self.store, span);
             if span.narrowed {
                 // Output word `w` of the I32 stream is stored word `w` of the I64 table.
+                let (first, last) = ((lo - start) / 4, (hi - start).div_ceil(4));
+                let mut wide = vec![0u8; (last - first) * 8];
+                let at = span.bytes.start + first * 8;
+                self.read_run(span, at..at + wide.len(), &mut wide)?;
                 for (offset, byte) in (lo - start..hi - start).zip(into.iter_mut()) {
-                    let (word, lane) = (offset / 4, offset % 4);
-                    let wide =
-                        i64::from_le_bytes(stored[word * 8..word * 8 + 8].try_into().unwrap());
-                    *byte = narrow_word(wide).to_le_bytes()[lane];
+                    let (word, lane) = (offset / 4 - first, offset % 4);
+                    let word = i64::from_le_bytes(wide[word * 8..word * 8 + 8].try_into().unwrap());
+                    *byte = narrow_word(word).to_le_bytes()[lane];
                 }
             } else {
-                into.copy_from_slice(&stored[lo - start..hi - start]);
+                let at = span.bytes.start + (lo - start);
+                self.read_run(span, at..at + into.len(), into)?;
+                if self.encoding == Encoding::PackedWordsFiniteF16
+                    && let Some((index, bits)) = first_non_finite_f16(into)
+                {
+                    return Err(WriteFault::NonFiniteF16 {
+                        index: lo / 2 + index,
+                        bits,
+                    });
+                }
             }
+        }
+        Ok(())
+    }
+
+    /// Bytes `at` of `span`'s entry (absolute within the entry's role bytes) into `out`, split across
+    /// reader threads when it is large. Once every reader is done the range's page cache is dropped when the
+    /// device shares its memory with the host: once for the whole range, because a reader that dropped its
+    /// own part early would see the kernel's readahead, driven by its neighbour's last pages, bring the
+    /// head of that part back.
+    fn read_run(
+        &self,
+        span: &StoredSpan,
+        at: Range<usize>,
+        out: &mut [u8],
+    ) -> Result<(), WriteFault> {
+        self.prefetch(span, at.end..at.end + READ_AHEAD);
+        let threads = if out.len() < PARALLEL_READ_MIN {
+            1
+        } else {
+            reader_threads()
+        };
+        poot_quant::read_split(out, at.start, threads, |range, part| {
+            self.read_one(span, range, part)
+        })?;
+        if self.evict {
+            match (self.store.get(span.key.as_str()), span.role) {
+                (Some(WeightEntry::Dense(dense)), None) => dense.bytes().evict(at),
+                (Some(WeightEntry::Packed(payload)), Some(role)) => payload.evict(role, at),
+                _ => unreachable!("a span is built from the store it reads"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Ask the kernel to read `ahead` of `span`'s entry into the page cache (clamped to the file).
+    fn prefetch(&self, span: &StoredSpan, ahead: Range<usize>) {
+        match (self.store.get(span.key.as_str()), span.role) {
+            (Some(WeightEntry::Dense(dense)), None) => dense.bytes().prefetch(ahead),
+            (Some(WeightEntry::Packed(payload)), Some(role)) => payload.prefetch(role, ahead),
+            _ => unreachable!("a span is built from the store it reads"),
+        }
+    }
+
+    /// One positional read of `at` of `span`'s entry into `out`, checked as its entry requires.
+    fn read_one(
+        &self,
+        span: &StoredSpan,
+        at: Range<usize>,
+        out: &mut [u8],
+    ) -> Result<(), WriteFault> {
+        match (self.store.get(span.key.as_str()), span.role) {
+            (Some(WeightEntry::Dense(dense)), None) => {
+                dense.bytes().read_at(at, out).map_err(WriteFault::Read)
+            }
+            (Some(WeightEntry::Packed(payload)), Some(role)) => {
+                Ok(payload.read_verified(role, at, out)?)
+            }
+            _ => unreachable!("a span is built from the store it reads"),
         }
     }
 }
@@ -426,24 +542,6 @@ impl WeightBinder {
     /// validated. `WeightBinder::embed` and the expert refills run it around their runtime reads of the same mapping.
     pub(crate) fn check_sources(&self) -> Result<(), LoadError> {
         Ok(self.store.check_sources()?)
-    }
-
-    /// The stored bytes `bytes` read have been uploaded: the process drops its mapped pages of them
-    /// ([`Access::Release`]); a later read faults them in again.
-    pub(crate) fn release(&self, bytes: &ConstBytes) {
-        for span in &bytes.spans {
-            match (self.store.get(span.key.as_str()), span.role) {
-                (Some(WeightEntry::Dense(dense)), None) => {
-                    dense
-                        .bytes()
-                        .advise_range(span.bytes.clone(), Access::Release);
-                }
-                (Some(WeightEntry::Packed(payload)), Some(role)) => {
-                    payload.advise(role, span.bytes.clone(), Access::Release);
-                }
-                _ => unreachable!("a span is built from the store it reads"),
-            }
-        }
     }
 
     fn entry(&self, value: ValueId, name: &str, key: &str) -> Result<&WeightEntry, LoadError> {
@@ -795,7 +893,17 @@ impl WeightBinder {
         }
         let mut base = 0;
         for span in &bytes.spans {
-            let stored = stored_bytes(&self.store, span);
+            let mut stored = vec![0u8; span.bytes.len()];
+            match self.store.get(span.key.as_str()) {
+                Some(WeightEntry::Dense(dense)) => dense
+                    .bytes()
+                    .read_at(span.bytes.clone(), &mut stored)
+                    .map_err(|source| LoadError::WeightRead {
+                        name: name.to_string(),
+                        source,
+                    })?,
+                _ => unreachable!("a dense const is built from a dense entry"),
+            }
             // A narrowed span is an I64 table whose words the map range-checked into I32
             // ([`narrow_word`]).
             let words: Box<dyn Iterator<Item = i32> + '_> = if span.narrowed {
@@ -840,6 +948,7 @@ impl WeightBinder {
         bytes: &ConstBytes,
         shape: &[usize],
         storage: BufferStorage,
+        evict: bool,
     ) -> Result<WeightWriter, EncodeError> {
         let encoding = match bytes.stored {
             StoredAs::Dense(dtype) => {
@@ -869,6 +978,8 @@ impl WeightBinder {
             encoding,
             shape: shape.to_vec(),
             data_len,
+            evict,
+            fault: Mutex::new(None),
         })
     }
 
@@ -948,6 +1059,26 @@ impl WeightBinder {
         })
     }
 
+    /// Drop the page cache of `table`'s stored bytes (POOT-1424): nothing of a hosted table is read at load,
+    /// so only pages cached before it (a warm file) remain. Runtime row gathers fault their pages back on
+    /// demand and the kernel evicts them freely. Advisory; the bytes any later read returns do not change.
+    pub(crate) fn release_hosted(&self, table: &HostedTable) {
+        for run in &table.runs {
+            match (self.store.get(run.key.as_str()), table.kind) {
+                (Some(WeightEntry::Dense(entry)), RowKind::Dense { .. }) => {
+                    let row_bytes = entry.bytes().len() / entry.shape()[0];
+                    entry
+                        .bytes()
+                        .evict(run.rows.start * row_bytes..run.rows.end * row_bytes);
+                }
+                (Some(WeightEntry::Packed(payload)), RowKind::Packed { role, row_bytes }) => {
+                    payload.evict(role, run.rows.start * row_bytes..run.rows.end * row_bytes);
+                }
+                _ => unreachable!("load_weights checked every mapped key against this store"),
+            }
+        }
+    }
+
     /// The stored rows `ids` name of `table`, in order, in the lane `storage` the slot was planned in.
     ///
     /// An id outside the table is a typed [`BindError`] before a byte is returned, so nothing is written for a
@@ -988,16 +1119,41 @@ impl WeightBinder {
             let stored_row = run.rows.start + row;
             match (self.store.get(run.key.as_str()), table.kind) {
                 (Some(WeightEntry::Dense(entry)), RowKind::Dense { .. }) => {
-                    let bytes = entry.bytes().as_slice();
-                    let row_bytes = bytes.len() / entry.shape()[0];
-                    stored.extend_from_slice(
-                        &bytes[stored_row * row_bytes..(stored_row + 1) * row_bytes],
-                    );
+                    let row_bytes = entry.bytes().len() / entry.shape()[0];
+                    let at = stored.len();
+                    stored.resize(at + row_bytes, 0);
+                    entry
+                        .bytes()
+                        .read_at(
+                            stored_row * row_bytes..(stored_row + 1) * row_bytes,
+                            &mut stored[at..],
+                        )
+                        .map_err(|source| LoadError::WeightRead {
+                            name: table.name.clone(),
+                            source,
+                        })?;
                 }
                 (Some(WeightEntry::Packed(payload)), RowKind::Packed { role, row_bytes }) => {
-                    stored.extend_from_slice(
-                        &payload.bytes(role)[stored_row * row_bytes..(stored_row + 1) * row_bytes],
-                    );
+                    // A deferred payload's stored values are checked as the row is read (ADR-0103
+                    // amendment of 2026-10-27): a hosted row is content-checked like an uploaded one.
+                    let at = stored.len();
+                    stored.resize(at + row_bytes, 0);
+                    payload
+                        .read_verified(
+                            role,
+                            stored_row * row_bytes..(stored_row + 1) * row_bytes,
+                            &mut stored[at..],
+                        )
+                        .map_err(|error| match error {
+                            PayloadReadError::Read(source) => LoadError::WeightRead {
+                                name: table.name.clone(),
+                                source,
+                            },
+                            PayloadReadError::Content(source) => LoadError::WeightContent {
+                                name: table.name.clone(),
+                                source,
+                            },
+                        })?;
                 }
                 _ => unreachable!("load_weights checked every mapped key against this store"),
             }
@@ -1042,10 +1198,12 @@ mod tests {
     /// (what [`WeightWriter`] reads, whole).
     fn stored_stream(binder: &WeightBinder, bytes: &ConstBytes) -> Vec<u8> {
         let writer = binder
-            .writer(bytes, &[], BufferStorage::i32())
+            .writer(bytes, &[], BufferStorage::i32(), false)
             .expect("a packed source has an encoding");
         let mut out = vec![0u8; bytes.stored_len()];
-        writer.read_stream(0..out.len(), &mut out);
+        writer
+            .read_stream(0..out.len(), &mut out)
+            .expect("the fixture bytes read clean");
         out
     }
 
@@ -1159,7 +1317,7 @@ mod tests {
             .const_bytes(ValueId::new(0), name.as_str(), &declared, None)
             .expect("the stacked source binds");
         let writer = binder
-            .writer(&bytes, &[], BufferStorage::i32())
+            .writer(&bytes, &[], BufferStorage::i32(), false)
             .expect("a packed source has an encoding");
         let transport: Vec<u8> = poot_quant::packed_source_words(&stored_stream(&binder, &bytes))
             .into_iter()
@@ -1218,7 +1376,7 @@ mod tests {
             .const_bytes(ValueId::new(0), &id.const_name(), &declared, None)
             .expect("the narrowed table binds");
         let writer = binder
-            .writer(&bytes, &[3, 2], BufferStorage::i32())
+            .writer(&bytes, &[3, 2], BufferStorage::i32(), false)
             .expect("an I32 table lands verbatim");
         let expected: Vec<u8> = words
             .iter()

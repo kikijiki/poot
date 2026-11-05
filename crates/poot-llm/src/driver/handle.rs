@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use poot_load::gguf::{GgufIndex, IdentityNames, read_gguf, shard_paths};
 use poot_load::packed_safetensors::{FilePin, Sha256Digest, check_pin_reader};
-use poot_load::plan::default_workers;
 use poot_models::model::{Model, ModelConfig};
 use poot_models::multimodal::front_end::{FrontEnd, TowerId};
 use poot_models::registry::{FamilyEntry, ModelParts, RawConfig, Registry};
@@ -160,7 +159,7 @@ impl Pins {
                 .get(name)
                 .ok_or_else(|| LoadError::Unpinned { file: name.clone() })?;
             match mapped.iter().find(|(file, _)| file == name) {
-                Some((_, bytes)) => check_pin_reader(bytes.as_slice(), pin, name)?,
+                Some((_, bytes)) => check_pin_reader(bytes.reader(), pin, name)?,
                 None => {
                     let path = dir.join(name);
                     let file = File::open(&path).map_err(io_error(&path))?;
@@ -271,8 +270,8 @@ impl ModelHandle {
         // A GPTQ, AWQ or FP8 checkpoint's quantized linears are packed straight from their stored
         // bytes, never decoded: the family maps the packed entries like any other weight.
         let scheme = poot_load::config::quant_scheme(&config).map_err(LoadError::from)?;
-        let store = poot_load::safetensors::load_mapped_weight_store(&files, default_workers())
-            .map_err(LoadError::from)?;
+        let store =
+            poot_load::safetensors::load_mapped_weight_store(&files).map_err(LoadError::from)?;
         let store = match scheme {
             Some(scheme) => poot_load::safetensors::pack_quantized_linears(&store, scheme)
                 .map_err(LoadError::from)?,
@@ -334,8 +333,7 @@ impl ModelHandle {
         let index = GgufIndex::parse_shards(&files).map_err(LoadError::from)?;
         let raw = RawConfig::Gguf(&index);
         let family = resolve(&raw, registry)?;
-        let store =
-            read_gguf(&index, &IdentityNames, default_workers()).map_err(LoadError::from)?;
+        let store = read_gguf(&index, &IdentityNames).map_err(LoadError::from)?;
         Self::build(family, &raw, Arc::new(store), |config| {
             let text =
                 TextCodec::from_gguf(&gguf_vocab(&index), constraint_eos(config), config.chat)

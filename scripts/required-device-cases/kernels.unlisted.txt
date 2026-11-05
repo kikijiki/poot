@@ -89,6 +89,7 @@ poot-kernelgen	reduce::tests::array_sum_probe_emits_valid_nvptx	kernelgen unit r
 poot-kernelgen	reduce::tests::array_sum_probe_rejected_on_spirv	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	reduce::tests::reduce_last_lds_emits_valid_nvptx	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	reduce::tests::reduce_last_lds_parallel	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	register_budget::only_a_body_the_generator_unrolled_carries_the_no_unroll_metadata	kernelgen unit row on emitted LLVM IR text; no toolchain or device, runs whole with the package in just test
 poot-kernelgen	request::tests::a_body_budget_takes_exactly_its_limits_and_refuses_the_next_reservation	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	request::tests::a_body_over_the_limits_is_refused_after_generation_when_its_request_cannot_be_sized	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	request::tests::a_dense_contraction_over_an_unread_weight_storage_is_unsupported	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -185,6 +186,8 @@ poot-kernelgen::flash_interp	prefill_matches_the_reference	kernelgen `flash_inte
 poot-kernelgen::flash_interp	softcapped_prefill_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	split_kv_decode_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	tiled_runs_empty_rows_and_padded_queries_match_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::fragment_lds_probe	fragment_probes_match_the_host_reference_on_rocm	kernelgen `fragment_lds_probe` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::fragment_lds_probe	fragment_probes_match_the_host_reference_on_vulkan	kernelgen `fragment_lds_probe` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::fused_row_interp	fused_row_parallel_folded_grid_covers_every_row	kernelgen `fused_row_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::fused_row_interp	fused_row_reads_a_packed_bf16_leaf_as_its_widened_values	kernelgen `fused_row_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::gemv_index_width	a_narrowed_body_runs_32_bit_index_math_on_nvptx	kernelgen `gemv_index_width` test binary (emit, interpreter or dispatch rows); the lane runs the package whole

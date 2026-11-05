@@ -821,17 +821,17 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         (
             4,
             64,
-            "Activation=1543972 Input=189100 Meta=16884 State=12416 Weight=5216",
+            "Activation=1252436 Input=189100 Meta=16884 State=12416 Weight=5216",
         ),
         (
             2,
             64,
-            "Activation=772196 Input=117748 Meta=16884 State=6208 Weight=5216",
+            "Activation=626428 Input=117748 Meta=16884 State=6208 Weight=5216",
         ),
         (
             1,
             64,
-            "Activation=386308 Input=82072 Meta=15564 State=3104 Weight=5216",
+            "Activation=313584 Input=82072 Meta=15564 State=3104 Weight=5216",
         ),
     ];
     let domain = candidates(&handle, &args);

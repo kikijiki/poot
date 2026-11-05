@@ -2160,11 +2160,34 @@ fn device_caps_matches_a_direct_hsa_query() {
     // SAFETY: discovery contract: the context keeps its runtime initialized and `ctx.gpu_agent` is the
     // agent this context was built from.
     let isa = unsafe { agent_isa_name(&ctx.hsa.funcs, ctx.gpu_agent) }.expect("agent_isa_name");
-    assert_eq!(
-        caps.tensor_core,
-        poot_target::TensorCoreSupport::from_device_name(&isa),
-        "tensor_core must be classified from a fresh ISA-name query, not a hardcoded family"
-    );
+    // gfx11 (this box's gfx1151) has declared bf16 and f16 WMMA fragments across 32 lanes; any other part
+    // reports none until a lane map and a lowering exist.
+    let gfx11 = isa.contains("gfx11");
+    let units = caps
+        .matrix_units
+        .known()
+        .expect("an HSA agent reports its matrix units from its ISA name");
+    if gfx11 {
+        use poot_target::{FragmentDtype, FragmentLayout, LaneMap};
+        assert_eq!(
+            units.iter().map(|c| c.dtype).collect::<Vec<_>>(),
+            [FragmentDtype::Bf16, FragmentDtype::F16],
+            "{isa}: gfx11 has bf16 and f16 WMMA fragments"
+        );
+        assert!(
+            units
+                .iter()
+                .all(|c| c.layout == FragmentLayout::Declared(LaneMap::Rdna3)
+                    && c.subgroup == 32
+                    && c.shape == poot_target::FragmentShape::M16N16K16),
+            "{isa}: the RDNA3 lane map is declared: {units:?}"
+        );
+    } else {
+        assert!(
+            units.is_empty(),
+            "{isa}: no fragment lowering for this family: {units:?}"
+        );
+    }
 
     let budget = ctx
         .vram_budget_bytes()

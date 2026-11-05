@@ -118,13 +118,12 @@ pub struct Context {
     /// Device `max_compute_workgroup_storage_size` (queried at init): the LDS/shared-memory budget one
     /// dispatch may use. Card 522: feeds [`Context::device_caps`].
     lds_bytes: u32,
-    /// Matrix-hardware family, measured from `Adapter::cooperative_matrix_properties()` (the real
-    /// `VK_KHR_cooperative_matrix` query) on a Vulkan adapter; `UnknownNotExposedByApi` on any other
-    /// backend, since this crate confirms only Vulkan's property list is meaningfully populated (card
-    /// 522 — corrected from an earlier adapter-name-string classifier this doc described).
-    /// wgpu's SPIR-V path does not itself emit AMD WMMA intrinsics (that is the ROCm/AmdGcn codegen path
-    /// on the same hardware); this describes the device, not what this backend's codegen can reach.
-    tensor_core: poot_target::TensorCoreSupport,
+    /// Matrix units, measured from `Adapter::cooperative_matrix_properties()` (the real
+    /// `VK_KHR_cooperative_matrix` query) on a Vulkan adapter; `Unknown` on any other backend, since this
+    /// crate confirms only Vulkan's property list is meaningfully populated (card 522 — corrected from an
+    /// earlier adapter-name-string classifier this doc described). Only configs this backend's SPIR-V
+    /// codegen lowers are reported (f16 fragments); the same silicon's bf16 WMMA is the ROCm path.
+    matrix_units: poot_target::Queried<poot_target::MatrixUnits>,
     /// Active compute units, probed from AMD's Vulkan shader-core properties at init (card 653); the
     /// RDNA3 default where the driver exposes no such query. Feeds [`Context::device_caps`].
     compute_units: u32,

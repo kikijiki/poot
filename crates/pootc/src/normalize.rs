@@ -466,6 +466,8 @@ fn rewrite_statement(s: &mut Statement, aliases: &HashMap<u32, Place>) {
         Statement::WmmaMma { .. }
         | Statement::WmmaStoreLds { .. }
         | Statement::WmmaLoadLds { .. }
+        | Statement::WmmaElemRead { .. }
+        | Statement::WmmaElemWrite { .. }
         | Statement::WmmaZero { .. } => {}
         // Spec 138 Phase 2: a Fence has no operand or place to rewrite; like WMMA/CAS it is hand-built in kernelgen.
         Statement::Fence { .. } => {}

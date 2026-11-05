@@ -549,9 +549,24 @@ ir_node! {
 }
 
 ir_node! {
+    /// The memory layout of a fragment tile: which of its two axes is contiguous (the stride steps the other).
+    /// For an `A` tile (`m x k`) `Row` is `a[m * stride + k]`, `Col` is `a[k * stride + m]`; for a `B` tile
+    /// (`k x n`) `Row` is `b[k * stride + n]`, `Col` is `b[n * stride + k]`; for an accumulator (`m x n`)
+    /// `Row` is `c[m * stride + n]`, `Col` is `c[n * stride + m]`. Both layouts name the same logical tile, so a
+    /// product never depends on the layout it was loaded from.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+    pub enum FragmentMajor {
+        /// Rows are contiguous.
+        Row,
+        /// Columns are contiguous.
+        Col,
+    }
+}
+
+ir_node! {
     /// The declared type of a matrix-fragment local (see [`Ty::Fragment`]): its role, the operand `dtype` the
-    /// multiply consumes (an accumulator carries the dtype of the operands it accumulates), and the `m x n x k`
-    /// tile it covers.
+    /// multiply consumes (an accumulator carries the dtype of the operands it accumulates), the `m x n x k`
+    /// tile it covers and, for an `A`/`B` operand, the memory layout it was loaded from.
     #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
     pub struct FragmentTy {
         /// Which matrix the fragment holds.
@@ -560,16 +575,31 @@ ir_node! {
         pub dtype: WmmaDtype,
         /// The tile shape.
         pub shape: WmmaShape,
+        /// The layout an `A`/`B` operand was loaded in: NVPTX's multiply is specialised on it (`wmma.mma`'s
+        /// `.alayout`/`.blayout`), so the declared type carries it to the multiply. Always `Row` for an
+        /// accumulator, whose load and store take their layout from the statement.
+        pub major: FragmentMajor,
     }
 }
 
 impl FragmentTy {
-    /// The declared type of an `A` or `B` operand fragment.
+    /// The declared type of a row-major `A` or `B` operand fragment.
     pub const fn matrix(which: WmmaMat, dtype: WmmaDtype, shape: WmmaShape) -> Self {
+        Self::matrix_major(which, dtype, shape, FragmentMajor::Row)
+    }
+
+    /// The declared type of an `A` or `B` operand fragment loaded from a `major` tile.
+    pub const fn matrix_major(
+        which: WmmaMat,
+        dtype: WmmaDtype,
+        shape: WmmaShape,
+        major: FragmentMajor,
+    ) -> Self {
         FragmentTy {
             role: FragmentRole::Matrix(which),
             dtype,
             shape,
+            major,
         }
     }
 
@@ -579,7 +609,30 @@ impl FragmentTy {
             role: FragmentRole::Accumulator,
             dtype,
             shape,
+            major: FragmentMajor::Row,
         }
+    }
+}
+
+/// The declared element map of an accumulator fragment on a target whose accumulator layout is public
+/// (AMDGCN gfx11, wave32): lane `l` holds [`ACCUMULATOR_ELEMENTS_PER_LANE`] f32 elements, and element `i` is
+/// the tile's row `2 i + l / 16`, column `l % 16`. [`Statement::WmmaElemRead`] and [`Statement::WmmaElemWrite`]
+/// address a fragment by this `(lane, element)` pair; targets whose fragment layout is opaque (SPIR-V
+/// cooperative matrix, NVPTX `wmma`) refuse them and go through an LDS store and reload instead.
+pub mod accumulator_map {
+    use super::FRAGMENT_COLLECTIVE_LANES;
+
+    /// Accumulator elements one lane holds (a 16x16 tile over a 32-lane collective).
+    pub const ELEMENTS_PER_LANE: u32 = 8;
+    /// Lanes that share a row set: lanes `l` and `l + 16` hold the even and the odd rows.
+    pub const LANES_PER_ROW_SET: u32 = FRAGMENT_COLLECTIVE_LANES / 2;
+
+    /// The `(row, column)` of element `element` of lane `lane`'s accumulator registers.
+    pub const fn position(lane: u32, element: u32) -> (u32, u32) {
+        (
+            2 * element + lane / LANES_PER_ROW_SET,
+            lane % LANES_PER_ROW_SET,
+        )
     }
 }
 
@@ -721,24 +774,32 @@ ir_node! {
             /// The accumulator fragment zeroed.
             dst: Local,
         },
-        /// Load an A/B fragment from a workgroup-local (LDS) `array` (base index 0) with row `stride`. LDS
-        /// analog of `WmmaLoad`, used by the bf16 tensor-core dequant gemm (spec 026). NVPTX-only.
+        /// Load a fragment from a workgroup-local (LDS) `array`: the LDS analog of `WmmaLoad`, with the tile's
+        /// first element at index `base` and tile layout `major` (the fragment-IR contract of POOT-1432).
+        /// `role` selects an `A`/`B` operand (the array holds `dtype`) or the f32 accumulator (the array holds
+        /// f32; a `Opaque` target reloads a scaled accumulator this way). For an `A`/`B` role `dst` is declared
+        /// with `major` as its layout, which the multiply is specialised on.
         WmmaLoadLds {
-            /// Whether `dst` is the `A` or `B` fragment.
-            which: WmmaMat,
+            /// Which fragment `dst` is.
+            role: FragmentRole,
             /// The operand element dtype.
             dtype: WmmaDtype,
             /// The tile shape.
             shape: WmmaShape,
             /// Which workgroup-local array.
             array: u8,
-            /// The row stride, in elements.
+            /// The array index of the tile's first element.
+            base: Operand,
+            /// The tile's memory layout.
+            major: FragmentMajor,
+            /// The stride between rows (`Row`) or columns (`Col`), in elements.
             stride: u32,
             /// The fragment local filled.
             dst: Local,
         },
-        /// Store the f32 D fragment to a workgroup-local (LDS) `array` (base index 0) with row `stride`. Used
-        /// by the bf16 tensor-core gemm epilogue (store to LDS, barrier, narrow-copy to bf16). NVPTX-only.
+        /// Store the f32 accumulator fragment `src` to a workgroup-local (LDS) `array` of f32, the tile's first
+        /// element at index `base`, with tile layout `major`. The epilogue and the `Opaque`-layout element
+        /// access stage an accumulator in LDS this way.
         WmmaStoreLds {
             /// The operand element dtype.
             dtype: WmmaDtype,
@@ -746,10 +807,35 @@ ir_node! {
             shape: WmmaShape,
             /// Which workgroup-local array.
             array: u8,
-            /// The row stride, in elements.
+            /// The array index of the tile's first element.
+            base: Operand,
+            /// The tile's memory layout.
+            major: FragmentMajor,
+            /// The stride between rows (`Row`) or columns (`Col`), in elements.
             stride: u32,
             /// The accumulator fragment stored.
             src: Local,
+        },
+        /// `dst = accumulator element `idx` of this lane` under the declared [`accumulator_map`]: a per-lane
+        /// register read, so it is not collective. Only targets that publish the map lower it (AMDGCN gfx11);
+        /// the others refuse it with a typed error.
+        WmmaElemRead {
+            /// The accumulator fragment read.
+            src: Local,
+            /// The element, in `0..accumulator_map::ELEMENTS_PER_LANE`.
+            idx: u8,
+            /// The f32 local written.
+            dst: Local,
+        },
+        /// Overwrite accumulator element `idx` of this lane (under the declared [`accumulator_map`]) with the
+        /// f32 `value`, so a softmax or epilogue runs on the fragment in place. Per-lane, not collective.
+        WmmaElemWrite {
+            /// The accumulator fragment updated.
+            dst: Local,
+            /// The element, in `0..accumulator_map::ELEMENTS_PER_LANE`.
+            idx: u8,
+            /// The f32 value stored.
+            value: Operand,
         },
         /// A scoped memory-ordering fence with no control-flow effect (spec 138), hence a `Statement`.
         /// Lowers to one LLVM `fence` scoped by `scope`/`ordering`; see `emit_statement`'s
@@ -942,6 +1028,20 @@ ir_node! {
 }
 
 ir_node! {
+    /// Who unrolls the loops of one body (POOT-1428).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+    pub enum Unrolling {
+        /// The target's backend unrolls as it sees fit.
+        #[default]
+        Backend,
+        /// The generator unrolled the body's loops to what its register tiles hold, so the backend must not
+        /// unroll them again: a second unrolling hoists the operand loads of every copy ahead of the FMAs and
+        /// takes a register-tiled body past the register file (spills in the hot loops).
+        Generator,
+    }
+}
+
+ir_node! {
     /// One lowered `#[kernel]` function.
     #[derive(Clone, PartialEq, Debug)]
     pub struct Body {
@@ -970,6 +1070,21 @@ ir_node! {
             serde(default, skip_serializing_if = "IndexWidth::is_native")
         )]
         pub index_width: IndexWidth,
+        /// Who unrolls the body's loops: the backend unless the generator did it already.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Unrolling::is_backend")
+        )]
+        pub unrolling: Unrolling,
+    }
+}
+
+impl Unrolling {
+    /// Whether this is the backend's own choice: a body serializes its unrolling only when the generator owns
+    /// it, so every other body keeps its serialized form.
+    #[cfg(feature = "serde")]
+    fn is_backend(&self) -> bool {
+        *self == Unrolling::Backend
     }
 }
 
@@ -999,6 +1114,7 @@ impl Body {
             workgroup_locals: Vec::new(),
             constant_tables: Vec::new(),
             index_width: IndexWidth::Native,
+            unrolling: Unrolling::Backend,
         }
     }
 
@@ -1033,8 +1149,9 @@ pub use verify::{Site, VerifyError, VerifyErrorKind};
 mod verify {
     use super::{
         BasicBlock, BinOp, BlockId, Body, Constant, ConstantTableDecl, FRAGMENT_COLLECTIVE_LANES,
-        FragmentTy, IndexAxis, Local, Operand, Place, ProjectionElem, Rvalue, Statement,
-        Terminator, Ty, WmmaMat, WmmaShape, WorkgroupLocalDecl,
+        FragmentRole, FragmentTy, IndexAxis, Local, Operand, Place, ProjectionElem, Rvalue,
+        Statement, Terminator, Ty, WmmaDtype, WmmaMat, WmmaShape, WorkgroupLocalDecl,
+        accumulator_map,
     };
     use std::collections::HashSet;
     use std::fmt;
@@ -1174,6 +1291,16 @@ mod verify {
             expected: FragmentTy,
             /// The type the local is declared as.
             found: Ty,
+        },
+        /// A fragment element access names an element a lane does not hold
+        /// (`accumulator_map::ELEMENTS_PER_LANE` per lane).
+        #[error(
+            "fragment element {idx} is out of range (a lane holds {} accumulator elements)",
+            accumulator_map::ELEMENTS_PER_LANE
+        )]
+        FragmentElementOutOfRange {
+            /// The element index the access names.
+            idx: u8,
         },
         /// A matrix-fragment op is reachable under control flow that can split its collective subgroup
         /// (card 663): `branch` switches on a value that can differ between lanes of one
@@ -1533,8 +1660,8 @@ mod verify {
                     dst,
                 } => {
                     self.check_wmma_shape(*shape)?;
-                    self.expect_fragment(*a, FragmentTy::matrix(WmmaMat::A, *dtype, *shape))?;
-                    self.expect_fragment(*b, FragmentTy::matrix(WmmaMat::B, *dtype, *shape))?;
+                    self.expect_operand_fragment(*a, WmmaMat::A, *dtype, *shape)?;
+                    self.expect_operand_fragment(*b, WmmaMat::B, *dtype, *shape)?;
                     let accumulator = FragmentTy::accumulator(*dtype, *shape);
                     self.expect_fragment(*c, accumulator)?;
                     self.expect_fragment(*dst, accumulator)
@@ -1555,27 +1682,46 @@ mod verify {
                     self.expect_fragment(*dst, FragmentTy::accumulator(*dtype, *shape))
                 }
                 Statement::WmmaLoadLds {
-                    which,
+                    role,
                     dtype,
                     shape,
                     array,
+                    base,
+                    major,
                     dst,
                     ..
                 } => {
                     self.check_wmma_shape(*shape)?;
                     self.workgroup_array(*array)?;
-                    self.expect_fragment(*dst, FragmentTy::matrix(*which, *dtype, *shape))
+                    expect_ty("fragment tile base", &Ty::Usize, &self.operand_ty(base)?)?;
+                    let expected = match role {
+                        FragmentRole::Matrix(which) => {
+                            FragmentTy::matrix_major(*which, *dtype, *shape, *major)
+                        }
+                        FragmentRole::Accumulator => FragmentTy::accumulator(*dtype, *shape),
+                    };
+                    self.expect_fragment(*dst, expected)
                 }
                 Statement::WmmaStoreLds {
                     dtype,
                     shape,
                     array,
+                    base,
                     src,
                     ..
                 } => {
                     self.check_wmma_shape(*shape)?;
                     self.workgroup_array(*array)?;
+                    expect_ty("fragment tile base", &Ty::Usize, &self.operand_ty(base)?)?;
                     self.expect_fragment(*src, FragmentTy::accumulator(*dtype, *shape))
+                }
+                Statement::WmmaElemRead { src, idx, dst } => {
+                    self.check_accumulator_element(*src, *idx)?;
+                    expect_ty("fragment element", &Ty::F32, self.declared(*dst)?)
+                }
+                Statement::WmmaElemWrite { dst, idx, value } => {
+                    self.check_accumulator_element(*dst, *idx)?;
+                    expect_ty("fragment element", &Ty::F32, &self.operand_ty(value)?)
                 }
                 Statement::Fence { .. } => Ok(()),
             }
@@ -1593,6 +1739,50 @@ mod verify {
                     expected,
                     found: found.clone(),
                 })
+            }
+        }
+
+        /// `l` must be declared as the `which` operand fragment of `dtype` and `shape`, in either layout: the
+        /// multiply accepts a row- or column-loaded operand (NVPTX specialises on it, the others do not).
+        fn expect_operand_fragment(
+            &self,
+            l: Local,
+            which: WmmaMat,
+            dtype: WmmaDtype,
+            shape: WmmaShape,
+        ) -> Check<()> {
+            let found = self.declared(l)?;
+            match found {
+                Ty::Fragment(f)
+                    if f.role == FragmentRole::Matrix(which)
+                        && f.dtype == dtype
+                        && f.shape == shape =>
+                {
+                    Ok(())
+                }
+                _ => Err(VerifyErrorKind::FragmentTypeMismatch {
+                    local: l,
+                    expected: FragmentTy::matrix(which, dtype, shape),
+                    found: found.clone(),
+                }),
+            }
+        }
+
+        /// `l` must be an accumulator fragment and `idx` one of its per-lane elements.
+        fn check_accumulator_element(&self, l: Local, idx: u8) -> Check<()> {
+            match self.declared(l)? {
+                Ty::Fragment(f) if f.role == FragmentRole::Accumulator => {}
+                other => {
+                    return Err(VerifyErrorKind::InvalidOperandType {
+                        what: "fragment element access",
+                        found: other.clone(),
+                    });
+                }
+            }
+            if u32::from(idx) < accumulator_map::ELEMENTS_PER_LANE {
+                Ok(())
+            } else {
+                Err(VerifyErrorKind::FragmentElementOutOfRange { idx })
             }
         }
 
@@ -2290,6 +2480,8 @@ mod verify {
             Statement::Assign(place, rvalue) if place.projection.is_empty() => {
                 Some((place.local.index as usize, rvalue_class(rvalue, flow)))
             }
+            // A lane's own accumulator element: it differs between any two lanes.
+            Statement::WmmaElemRead { dst, .. } => Some((dst.index as usize, LaneClass::Varying)),
             _ => None,
         }
     }
@@ -2498,7 +2690,8 @@ mod verify {
             Statement::WmmaLoad { dst, .. }
             | Statement::WmmaMma { dst, .. }
             | Statement::WmmaZero { dst, .. }
-            | Statement::WmmaLoadLds { dst, .. } => f(*dst),
+            | Statement::WmmaLoadLds { dst, .. }
+            | Statement::WmmaElemRead { dst, .. } => f(*dst),
             _ => {}
         }
     }
@@ -2600,8 +2793,17 @@ mod verify {
                 place_reads(tile, f);
                 f(*src);
             }
-            Statement::WmmaStoreLds { src, .. } => f(*src),
-            Statement::WmmaZero { .. } | Statement::WmmaLoadLds { .. } => {}
+            Statement::WmmaStoreLds { base, src, .. } => {
+                operand_reads(base, f);
+                f(*src);
+            }
+            Statement::WmmaLoadLds { base, .. } => operand_reads(base, f),
+            Statement::WmmaElemRead { src, .. } => f(*src),
+            Statement::WmmaElemWrite { dst, value, .. } => {
+                f(*dst);
+                operand_reads(value, f);
+            }
+            Statement::WmmaZero { .. } => {}
         }
     }
 

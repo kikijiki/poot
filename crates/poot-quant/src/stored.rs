@@ -3,19 +3,21 @@
 //!
 //! A `StoredBytes` is a view (a shared region plus a byte range) of one read-only private mapping of a
 //! checkpoint file, so a tensor, or a GGUF expert (ADR-0109), is a slice of the mapping and nothing is
-//! zero-filled or copied on the host. Bytes that are not a file's (fixtures, in-memory buffers, bytes a
+//! zero-filled or copied on the host. The load reads a view by [`StoredBytes::read_at`] (`pread`) into the
+//! device's staging, so the mapping is only touched by the runtime host reads (embed rows, expert refills). Bytes that are not a file's (fixtures, in-memory buffers, bytes a
 //! loader derives) are an owned heap region of the same type. The region kinds are a private closed enum:
 //! no other crate adds an owner with other invariants.
 //!
 //! Modifying a mapped checkpoint in place is unsupported, and the unsupported case is undefined behavior,
-//! not a defined failure: a write while a slice is live is a data race, and the content checks that ran
-//! at load are not repeated at upload (see `mapping`, invariant 4). A modification already made is refused
-//! by [`StoredBytes::check_unchanged`], an `fstat` identity check on the mapped descriptor that loaders
-//! and binders run at their boundaries. The load-time upload of a weight runs it before and after its
-//! reads, so a file modified while that upload read it is refused and the entry is not published; the
-//! runtime reads of the mapping (embed rows, expert refills) have no check after them, so a modification
-//! racing one is not detected (a truncation ends the process with `SIGBUS`). Replacing a checkpoint by
-//! rename is always safe.
+//! not a defined failure, for a read through the mapping (a write while a slice is live is a data race). The
+//! load-time upload reads by [`StoredBytes::read_at`] instead, where a changed file is a changed value or a
+//! typed short read, never undefined behavior, and the content checks run on the bytes that read stages (see
+//! `mapping`, invariant 4). A modification already made is refused by [`StoredBytes::check_unchanged`], an
+//! `fstat` identity check on the mapped descriptor that loaders and binders run at their boundaries. The
+//! load-time upload of a weight runs it before and after its reads, so a file modified while that upload
+//! read it is refused and the entry is not published; the runtime reads of the mapping (embed rows, expert
+//! refills) have no check after them, so a modification racing one is not detected (a truncation ends the
+//! process with `SIGBUS`). Replacing a checkpoint by rename is always safe.
 
 #[expect(unsafe_code)]
 mod mapping;
@@ -62,20 +64,6 @@ impl FileIdentity {
     }
 }
 
-/// A paging hint over a view ([`StoredBytes::advise`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Access {
-    /// Pages will be read front to back, so the kernel may read ahead and drop behind.
-    Sequential,
-    /// The range will be needed soon, so the kernel may start paging it in.
-    WillNeed,
-    /// The bytes have been consumed (copied to the device): the process drops its page-table entries
-    /// for every whole page inside the range, so the checkpoint no longer counts in its resident set
-    /// (`RssFile`) beside the device copy. The pages stay in the page cache for the next reader; a later
-    /// read of the range faults them in again from there or from the disk, with the same bytes.
-    Release,
-}
-
 /// [`StoredBytes::map`] refused a file.
 #[derive(Debug)]
 pub enum MapError {
@@ -107,6 +95,83 @@ impl std::error::Error for MapError {
         match self {
             Self::Io(error) => Some(error),
             Self::NotRegularFile { .. } => None,
+        }
+    }
+}
+
+/// [`StoredBytes::reader`]: a sequential [`std::io::Read`] over a view.
+pub struct StoredReader<'a> {
+    bytes: &'a StoredBytes,
+    position: usize,
+}
+
+impl std::io::Read for StoredReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(self.bytes.len() - self.position);
+        self.bytes
+            .read_at(self.position..self.position + n, &mut buf[..n])
+            .map_err(|error| match error {
+                ReadError::Io(error) => error,
+                ReadError::Range(error) => std::io::Error::other(error),
+            })?;
+        self.position += n;
+        Ok(n)
+    }
+}
+
+/// Fill `out`, the bytes `start..start + out.len()` of some source, with `threads` readers at once: `out` is
+/// cut into parts of whole MiB, each part is read by `read(range, part)` on its own scoped thread, and the
+/// first failure in part order is returned. One thread (or a `threads` of 0 or 1) reads it whole on the
+/// calling thread. A reader that panics panics the caller.
+pub fn read_split<E: Send>(
+    out: &mut [u8],
+    start: usize,
+    threads: usize,
+    read: impl Fn(Range<usize>, &mut [u8]) -> Result<(), E> + Sync,
+) -> Result<(), E> {
+    if threads <= 1 {
+        return read(start..start + out.len(), out);
+    }
+    let part = out.len().div_ceil(threads).next_multiple_of(1 << 20);
+    let read = &read;
+    std::thread::scope(|scope| {
+        let readers: Vec<_> = out
+            .chunks_mut(part)
+            .enumerate()
+            .map(|(index, piece)| {
+                let at = start + index * part;
+                scope.spawn(move || read(at..at + piece.len(), piece))
+            })
+            .collect();
+        readers
+            .into_iter()
+            .try_for_each(|reader| reader.join().expect("a reader does not panic"))
+    })
+}
+
+/// [`StoredBytes::read_at`] could not deliver a range.
+#[derive(Debug)]
+pub enum ReadError {
+    /// The range is outside the view.
+    Range(SliceError),
+    /// The file read failed or came back short (truncated since it was mapped).
+    Io(std::io::Error),
+}
+
+impl fmt::Display for ReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Range(error) => error.fmt(f),
+            Self::Io(error) => write!(f, "cannot read the checkpoint file: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Range(error) => Some(error),
+            Self::Io(error) => Some(error),
         }
     }
 }
@@ -236,20 +301,68 @@ impl StoredBytes {
         }
     }
 
-    /// A paging hint over this view; a no-op on an owned region. Advisory: failures are ignored.
-    pub fn advise(&self, access: Access) {
-        if let Region::Mapped(mapped) = &*self.region {
-            mapped.advise(self.range.clone(), access);
+    /// Copy `range` of this view (relative to it) into `out` (`out.len() == range.len()`): a positional
+    /// read of the file for a mapped region, never a touch of the mapping, so the checkpoint is not
+    /// counted in the process's `RssFile`; a plain copy for an owned one. A range outside the view is
+    /// [`ReadError::Range`]; a file that no longer holds the range is [`ReadError::Io`].
+    pub fn read_at(&self, range: Range<usize>, out: &mut [u8]) -> Result<(), ReadError> {
+        assert_eq!(out.len(), range.len(), "the output is the range's length");
+        if range.start > range.end || range.end > self.len() {
+            return Err(ReadError::Range(SliceError {
+                range,
+                len: self.len(),
+            }));
+        }
+        let start = self.range.start + range.start;
+        match &*self.region {
+            Region::Heap(bytes) => {
+                out.copy_from_slice(&bytes[start..start + out.len()]);
+                Ok(())
+            }
+            Region::Mapped(mapped) => mapped.read_at(start, out).map_err(ReadError::Io),
         }
     }
 
-    /// [`Self::advise`] over `range` of this view (relative to it); a range past the view's end is
-    /// clamped to it. A no-op on an owned region.
-    pub fn advise_range(&self, range: Range<usize>, access: Access) {
+    /// The view's bytes as an [`std::io::Read`], by positional reads of the same descriptor (the same inode
+    /// the mapping and every later read use), so hashing a mapped checkpoint maps none of it in.
+    pub fn reader(&self) -> StoredReader<'_> {
+        StoredReader {
+            bytes: self,
+            position: 0,
+        }
+    }
+
+    /// Drop the page-cache pages of `range` of this view (relative to it; a range past the end is
+    /// clamped) after its bytes were consumed: on a unified-memory device the checkpoint's cache and the
+    /// weights it was copied into are the same RAM. Advisory, a no-op on an owned region; a later read of
+    /// the range reads the disk again with the same bytes.
+    pub fn evict(&self, range: Range<usize>) {
         if let Region::Mapped(mapped) = &*self.region {
             let end = range.end.min(self.len());
             let start = range.start.min(end);
-            mapped.advise(self.range.start + start..self.range.start + end, access);
+            mapped.evict(self.range.start + start..self.range.start + end);
+        }
+    }
+
+    /// Ask the kernel to read `range` of this view (relative to its start) into the page cache ahead of a
+    /// [`Self::read_at`] of it, so a cold sequential load keeps the disk busy while the reader works on the
+    /// bytes before. The range may run past the view's end: it is clamped to the file, and the bytes after a
+    /// tensor are the next tensor's. Advisory, non-blocking, a no-op on an owned region.
+    pub fn prefetch(&self, range: Range<usize>) {
+        if let Region::Mapped(mapped) = &*self.region {
+            let file_len = mapped.bytes().len();
+            let end = (self.range.start + range.end).min(file_len);
+            let start = (self.range.start + range.start).min(end);
+            mapped.prefetch(start..end);
+        }
+    }
+
+    /// Bytes [`Self::read_at`] has read from this view's file since it was mapped (every view of the file
+    /// shares the count); `0` for an owned region.
+    pub fn bytes_read(&self) -> u64 {
+        match &*self.region {
+            Region::Heap(_) => 0,
+            Region::Mapped(mapped) => mapped.bytes_read(),
         }
     }
 
@@ -344,5 +457,98 @@ mod tests {
         let shown = format!("{a:?}");
         assert!(shown.contains("heap") && shown.contains("0..3"), "{shown}");
         assert!(!shown.contains('9'), "the bytes are never printed: {shown}");
+    }
+
+    /// POOT-1416: `read_at` is a positional file read, not a touch of the mapping: it returns the file's
+    /// bytes for any sub-range of any view, counts them once on the file's counter (shared by every view),
+    /// refuses a range outside the view as `Range`, and reports a file truncated after the map as an
+    /// `UnexpectedEof` I/O error.
+    ///
+    /// Mutation: make the `Mapped` arm of `read_at` copy from `as_slice` (the mapping); the truncated read
+    /// ends the process with `SIGBUS` and this row dies.
+    #[test]
+    fn read_at_reads_the_file_counts_once_and_reports_a_truncation() {
+        let path = poot_test_util::unique_temp_path("read_at.bin");
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let whole = StoredBytes::map(File::open(&path).unwrap()).unwrap();
+        let view = whole.slice(100..4000).unwrap();
+        let mut out = vec![0u8; 50];
+        view.read_at(10..60, &mut out).unwrap();
+        assert_eq!(out, bytes[110..160]);
+        let mut again = vec![0u8; 5];
+        whole.read_at(0..5, &mut again).unwrap();
+        assert_eq!(again, bytes[..5]);
+        assert_eq!((whole.bytes_read(), view.bytes_read()), (55, 55));
+        assert!(matches!(
+            view.read_at(3890..3910, &mut [0u8; 20]),
+            Err(ReadError::Range(_))
+        ));
+        assert_eq!(StoredBytes::from(vec![1u8, 2, 3]).bytes_read(), 0);
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1000)
+            .unwrap();
+        match whole.read_at(900..1100, &mut [0u8; 200]) {
+            Err(ReadError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+            }
+            other => panic!("expected a short read, got {other:?}"),
+        }
+    }
+
+    /// `reader()` is the view as a sequential `Read`, from the file, ending at the view's end.
+    #[test]
+    fn the_reader_streams_the_view_and_stops_at_its_end() {
+        use std::io::Read;
+        let path = poot_test_util::unique_temp_path("reader.bin");
+        let bytes: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let whole = StoredBytes::map(File::open(&path).unwrap()).unwrap();
+        let mut streamed = Vec::new();
+        whole
+            .slice(10..990)
+            .unwrap()
+            .reader()
+            .read_to_end(&mut streamed)
+            .unwrap();
+        assert_eq!(streamed, bytes[10..990]);
+    }
+
+    /// `read_split` cuts `out` into whole-MiB parts, hands each its absolute range, and reports the first
+    /// failure in part order. The control is one thread, which reads the whole range in one call.
+    ///
+    /// Mutation: pass `at = start` for every part (forget the part's offset); the filled pattern is wrong
+    /// and this row goes red.
+    #[test]
+    fn read_split_covers_the_range_exactly_and_reports_the_first_failure() {
+        let fill = |range: Range<usize>, part: &mut [u8]| -> Result<(), usize> {
+            for (offset, byte) in range.clone().zip(part.iter_mut()) {
+                *byte = (offset % 251) as u8;
+            }
+            Ok(())
+        };
+        let len = 5 << 20;
+        let start = 1000;
+        let expected: Vec<u8> = (start..start + len).map(|i| (i % 251) as u8).collect();
+        for threads in [0, 1, 4, 16] {
+            let mut out = vec![0u8; len];
+            read_split(&mut out, start, threads, fill).unwrap();
+            assert!(out == expected, "{threads} threads filled the wrong bytes");
+        }
+        // 5 MiB over 4 threads is parts of 2 MiB at 0, 2 and 4: the last two fail, the first of them is
+        // the error reported.
+        let failing = |range: Range<usize>, _: &mut [u8]| -> Result<(), usize> {
+            if range.start >= 2 << 20 {
+                Err(range.start)
+            } else {
+                Ok(())
+            }
+        };
+        let mut out = vec![0u8; len];
+        assert_eq!(read_split(&mut out, 0, 4, failing), Err(2 << 20));
     }
 }

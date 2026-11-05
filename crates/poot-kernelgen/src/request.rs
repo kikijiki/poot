@@ -183,6 +183,7 @@ impl BodyUse {
             let used = match *statement {
                 Statement::WmmaLoad { dtype, shape, .. }
                 | Statement::WmmaLoadLds { dtype, shape, .. }
+                | Statement::WmmaStoreLds { dtype, shape, .. }
                 | Statement::WmmaMma { dtype, shape, .. }
                 | Statement::WmmaStore { dtype, shape, .. }
                 | Statement::WmmaZero { dtype, shape, .. } => FragmentUse { dtype, shape },

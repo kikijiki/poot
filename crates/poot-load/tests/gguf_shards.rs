@@ -11,7 +11,6 @@
 use std::path::Path;
 
 use poot_load::gguf::{GgufIndex, GgufValue, IdentityNames, read_gguf, shard_paths, write_gguf};
-use poot_load::plan::default_workers;
 use poot_load::{GgufSplitError, LoadError};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{WeightEntry, WeightStore};
@@ -72,7 +71,7 @@ fn sh1_each_tensor_reads_its_own_shards_bytes() {
     assert_eq!(index.architecture(), Some("test"));
     let shards: Vec<_> = ["a", "b", "c"].map(|n| index.tensors[n].shard).into();
     assert_eq!(shards, [0, 1, 2]);
-    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames).unwrap();
     assert_eq!(values(&store, "a"), [1.0, 2.0, 3.0, 4.0]);
     assert_eq!(values(&store, "b"), [10.0, 11.0, 12.0, 13.0]);
     assert_eq!(values(&store, "c"), [100.0, 101.0, 102.0, 103.0]);
@@ -137,7 +136,7 @@ fn sh5_a_set_missing_tensors_is_not_loadable() {
         shard(1, 2, 3, &[("b", 10.0)]),
     ];
     let index = GgufIndex::parse_shards(&files).unwrap();
-    let error = read_gguf(&index, &IdentityNames, default_workers()).unwrap_err();
+    let error = read_gguf(&index, &IdentityNames).unwrap_err();
     assert!(
         matches!(
             error,

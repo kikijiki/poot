@@ -92,6 +92,8 @@ pub struct Engine<D: Device> {
     residency: HashMap<Residency, Weak<ResidentWeight<D>>>,
     /// Bytes read from the weight store for uploads ([`ExecutorStats::weight_bytes_read`]).
     weight_bytes_read: u64,
+    /// The host's resident memory at open and after the latest upload ([`ExecutorStats::load_memory`]).
+    load_memory: crate::LoadMemory,
     /// Bytes the host wrote to device buffers while binding steps ([`ExecutorStats::host_write_bytes`]).
     host_write_bytes: u64,
     /// The host-sync counters ([`ExecutorStats::syncs`] and the three beside it).
@@ -256,6 +258,8 @@ struct StateBuffer<D: Device> {
 struct EntryBuild<D: Device> {
     locals: Vec<D::Buffer>,
     arena: Vec<D::Buffer>,
+    /// Which of `arena`'s buffers each stage's buffer-plan slots live in.
+    arena_plan: poot_graph_plan::EntryArena,
     slots: Vec<BoundSlot>,
     /// The hosted gather slots the loaded stages declared so far, one per [`HOSTED_ROWS`] key.
     hosted_slots: Vec<HostedSlot>,
@@ -701,6 +705,10 @@ impl<D: Device> Engine<D> {
             copy_kernel_loaded: false,
             residency: HashMap::new(),
             weight_bytes_read: 0,
+            load_memory: crate::LoadMemory {
+                opened: crate::HostMemory::now(),
+                uploaded: None,
+            },
             host_write_bytes: 0,
             sync_counters: SyncCounters::default(),
             hosted_counters: HostedCounters::default(),
@@ -973,6 +981,9 @@ impl<D: Device> Engine<D> {
         let mut build = EntryBuild {
             locals: Vec::new(),
             arena: Vec::new(),
+            arena_plan: poot_graph_plan::EntryArena::plan(
+                part.stages.iter().map(|&(_, stage)| stage.buffer_plan()),
+            ),
             slots: Vec::new(),
             hosted_slots: Vec::new(),
             exported: HashMap::new(),
@@ -985,6 +996,20 @@ impl<D: Device> Engine<D> {
             outgoing: Vec::new(),
         };
         self.load_pools(exe, part, &mut build)?;
+        // One buffer per shared arena buffer, allocated up front: the stages share the buffers of values
+        // that are dead between them.
+        for (index, &(storage, elems)) in build.arena_plan.buffers().iter().enumerate() {
+            // Review F3: `elems` is already the buffer's native device-element count - never route it
+            // through `Self::allocate`, which would apply `BufferStorage::device_elems` to it a second
+            // time and under-allocate a packed buffer by half.
+            let buffer = self.allocate_arena_slot(
+                &format!("activation slot {index}"),
+                BufferRole::Activation,
+                storage,
+                elems,
+            )?;
+            build.arena.push(buffer);
+        }
         for &(id, stage) in &part.stages {
             self.load_stage(exe, id, stage, part, &mut build)?;
         }
@@ -1209,7 +1234,9 @@ impl<D: Device> Engine<D> {
                 let writer = self
                     .loaded(exe)?
                     .binder
-                    .writer(&bytes, &full.shape, storage)
+                    // A refill re-reads these bytes every time the pool pages an expert in: the page cache is
+                    // what keeps those reads off the disk, so it is not dropped here.
+                    .writer(&bytes, &full.shape, storage, false)
                     .map_err(|error| encode_error(error, &bytes, &weight.name, storage))?;
                 Some(writer)
             }
@@ -1404,6 +1431,7 @@ impl<D: Device> Engine<D> {
         let EntryBuild {
             locals,
             arena,
+            arena_plan,
             slots,
             hosted_slots,
             exported,
@@ -1442,27 +1470,11 @@ impl<D: Device> Engine<D> {
         let mut values: ValueTable<Option<(Loc, usize)>> =
             ValueTable::filled(g.values().len(), None);
 
-        // Card 547b: one buffer per arena slot, allocated once up front from the program's buffer
-        // plan (`Program::buffer_plan`) - never one buffer per computed value. This stage's slots
-        // follow the earlier stages' in the entry's shared arena.
+        // Card 547b: one buffer per arena slot of the program's buffer plan (`Program::buffer_plan`) - never
+        // one buffer per computed value. `load_entry` allocated the entry's shared buffers (POOT-1433); this
+        // stage's slots live in the ones `arena_plan` assigned them.
         let buffer_plan = program.buffer_plan();
-        let arena_base = arena.len();
-        arena.reserve(buffer_plan.slot_count());
-        for (_, slot_storage, slot_elems) in buffer_plan.slots() {
-            // Review F3: `slot_elems` is already the slot's native device-element count - never
-            // route it through `Self::allocate`, which would apply `BufferStorage::device_elems` to
-            // it a second time and under-allocate a packed slot by half.
-            let buffer = self.allocate_arena_slot(
-                &format!(
-                    "stage {stage:?} activation slot {}",
-                    arena.len() - arena_base
-                ),
-                BufferRole::Activation,
-                slot_storage,
-                slot_elems,
-            )?;
-            arena.push(buffer);
-        }
+        let arena_buffers = arena_plan.stage_buffers(stages.len());
 
         macro_rules! push_local {
             ($name:expr, $role:expr, $storage:expr, $shape:expr) => {{
@@ -1553,6 +1565,7 @@ impl<D: Device> Engine<D> {
                             .loaded(exe)?
                             .binder
                             .hosted_table(id, source, &meta.aval, storage)?;
+                        self.loaded(exe)?.binder.release_hosted(&table);
                         let name = format!("hosted rows {source}");
                         let (buffer, elems, storage) = match table.packed_words(&meta.aval) {
                             // A packed carrier is `u32` words whatever the slot's declared I8 type.
@@ -1735,7 +1748,7 @@ impl<D: Device> Engine<D> {
                             out: write,
                             commit_plan,
                             buffer_plan,
-                            arena_base,
+                            arena_buffers,
                         },
                         &values,
                     )?;
@@ -1780,7 +1793,7 @@ impl<D: Device> Engine<D> {
                             out: eqn.out,
                             commit_plan,
                             buffer_plan,
-                            arena_base,
+                            arena_buffers,
                         },
                         &values,
                     )?;
@@ -1799,7 +1812,7 @@ impl<D: Device> Engine<D> {
                                     "a scratch buffer the buffer plan never colored",
                                 ),
                             )?;
-                            Ok((Loc::Arena(arena_base + slot.index()), decl.elems()))
+                            Ok((Loc::Arena(arena_buffers[slot.index()]), decl.elems()))
                         };
                     for dispatch in dispatches.iter() {
                         let (body, launch) = (dispatch.body(), dispatch.launch());
@@ -2012,8 +2025,8 @@ impl<D: Device> Engine<D> {
 
     /// The writer for one weight upload, built once (the allocation and the write both use it) after checking
     /// the upload can land in its planned lane: nothing is read from the store and nothing is allocated yet, so a weight
-    /// with no encoding, or a packed-F16 weight holding a non-finite element, is refused before it costs a
-    /// buffer. A packed source is its stored bytes as `u32` words (SC-016).
+    /// with no encoding is refused before it costs a buffer. A packed source is its stored bytes as `u32` words
+    /// (SC-016). The bytes are checked as the write reads them ([`binder::WeightWriter::finish`]).
     fn weight_writer(
         &mut self,
         exe: ExecutableId,
@@ -2022,13 +2035,11 @@ impl<D: Device> Engine<D> {
         aval: &TensorType,
         storage: BufferStorage,
     ) -> Result<binder::WeightWriter, ExecError> {
+        let evict = self.device.unified_memory();
         let writer = self
             .loaded(exe)?
             .binder
-            .writer(bytes, &aval.shape, storage)
-            .map_err(|error| encode_error(error, bytes, name, storage))?;
-        writer
-            .check_encodable()
+            .writer(bytes, &aval.shape, storage, evict)
             .map_err(|error| encode_error(error, bytes, name, storage))?;
         self.weight_bytes_read += bytes.stored_len() as u64;
         Ok(writer)
@@ -2132,9 +2143,8 @@ impl<D: Device> Engine<D> {
                     writer.fill(range, out)
                 })
                 .map_err(device_error(label))?;
-            // The device holds the weight now: the checkpoint's pages leave this process's resident set
-            // instead of staying mapped beside the device copy for the model's lifetime.
-            self.loaded(exe)?.binder.release(&bytes);
+            // The upload's one read of the bytes also checked them: a refused weight is not published.
+            writer.finish(name)?;
         }
         let resident = Arc::new(ResidentWeight { buffer, elems });
         self.residency.insert(key, Arc::downgrade(&resident));
@@ -2921,7 +2931,10 @@ impl<D: Device> Engine<D> {
         for fill in &writes.rows {
             let resident = table_of(fill)?;
             let ResidentKind::Table {
-                row_bytes, writer, ..
+                name,
+                row_bytes,
+                writer,
+                ..
             } = &resident.kind
             else {
                 unreachable!("a site's tables are tables")
@@ -2936,6 +2949,7 @@ impl<D: Device> Engine<D> {
                             writer.fill(range.start - at + from..range.end - at + from, out)
                         })
                         .map_err(device_error(label))?;
+                    writer.finish(name)?;
                 }
                 sync_counters.rows += 1;
                 sync_counters.refill_bytes += *row_bytes as u64;
@@ -3141,8 +3155,8 @@ struct OutLocArgs<'a> {
     out: ValueId,
     commit_plan: &'a poot_graph_plan::state_commit::StateCommitPlan,
     buffer_plan: &'a poot_graph_plan::BufferPlan,
-    /// Where this stage's arena slots start in the entry's shared arena.
-    arena_base: usize,
+    /// The entry's shared arena buffer each of this stage's buffer-plan slots lives in.
+    arena_buffers: &'a [usize],
 }
 
 fn out_loc(
@@ -3156,7 +3170,7 @@ fn out_loc(
         .buffer_plan
         .slot(args.out)
         .ok_or(LoadError::Unimplemented("E4M3/raw-byte device lanes"))?;
-    Ok(Loc::Arena(args.arena_base + slot.index()))
+    Ok(Loc::Arena(args.arena_buffers[slot.index()]))
 }
 
 impl<D: Device> Engine<D> {
@@ -3202,6 +3216,7 @@ impl<D: Device> Engine<D> {
                 return Err(e);
             }
         };
+        self.load_memory.uploaded = crate::HostMemory::now();
         let entries = &mut self.loaded(exe)?.entries;
         entries.push(Some(entry));
         Ok(EntryId::new(entries.len() - 1))
@@ -3875,6 +3890,7 @@ impl<D: Device> Executor for Engine<D> {
             replays,
             stages,
             memory: self.device.memory(),
+            load_memory: self.load_memory,
             weight_bytes_read: self.weight_bytes_read,
             syncs: self.sync_counters.syncs,
             sync_read_bytes: self.sync_counters.read_bytes,
@@ -4413,6 +4429,8 @@ mod f16_packed_weight_upload_tests {
         allocations: Vec<(BufferRole, BufferStorage, usize)>,
         writes: Vec<(usize, Vec<u8>)>,
         upload: WeightUpload,
+        /// The device's memory is the host's RAM ([`Device::unified_memory`]).
+        unified: bool,
         /// Runs once the device has the destination and before the first stored byte is read into it:
         /// the instant between a load's validation and its upload.
         before_fill: Option<Box<dyn FnMut()>>,
@@ -4430,6 +4448,10 @@ mod f16_packed_weight_upload_tests {
 
         fn weight_upload(&self) -> WeightUpload {
             self.upload
+        }
+
+        fn unified_memory(&self) -> bool {
+            self.unified
         }
 
         fn backend_name(&self) -> &'static str {
@@ -4611,31 +4633,45 @@ mod f16_packed_weight_upload_tests {
         kib * 1024
     }
 
-    /// POOT-1382: a weight read from a mapped checkpoint leaves the process's resident set once the device
-    /// has it, so the checkpoint is not counted in the host beside its device copy. The weight is 8 MiB,
-    /// far above the 64 KiB rounding of a release; the entry loads through the production `add_entry`, and
-    /// the device received every byte.
-    ///
-    /// Mutation: drop the `binder.release` call in `Engine::weight_buffer`; `RssFile` grows by the weight.
-    #[test]
-    fn an_uploaded_mapped_weight_leaves_the_resident_set() {
-        const ROWS: usize = 2048;
-        const WIDTH: usize = 1024;
-        let x_len = 4 * WIDTH * 4;
-        let w_len = ROWS * WIDTH * 4;
-        let path = poot_test_util::unique_temp_path("release_after_upload.bin");
+    /// A [`mapped_projection`] ready for its `add_entry`: the engine over `device`, the loaded executable, the
+    /// compiled program, the store (for its read counter), the file's path guard and the weight's byte length.
+    type MappedProjection = (
+        Engine<UploadRecorder>,
+        ExecutableId,
+        StagedProgram,
+        Arc<WeightStore>,
+        poot_test_util::UniqueTempPath,
+        usize,
+    );
+
+    /// The mapped-checkpoint projection of the next two tests: an `[4, WIDTH]` input and a `[ROWS, WIDTH]`
+    /// weight of 1.5s in one file, compiled and loaded on `device` but not yet uploaded, so a test measures
+    /// the production `add_entry` alone.
+    fn mapped_projection(
+        device: UploadRecorder,
+        name: &str,
+        rows: usize,
+        width: usize,
+    ) -> MappedProjection {
+        let x_len = 4 * width * 4;
+        let w_len = rows * width * 4;
+        let path = poot_test_util::unique_temp_path(name);
         let mut fill = vec![0u8; x_len + w_len];
         fill[x_len..]
             .as_chunks_mut::<4>()
             .0
             .iter_mut()
             .for_each(|word| word.copy_from_slice(&1.5f32.to_le_bytes()));
-        std::fs::write(&path, &fill).unwrap();
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            std::io::Write::write_all(&mut &file, &fill).unwrap();
+            file.sync_all().unwrap();
+        }
         let mapped = StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap();
         let mut store = WeightStore::builder();
         for (id, shape, range) in [
-            (PROJECTION_INPUT, vec![4, WIDTH], 0..x_len),
-            (PROJECTION_WEIGHT, vec![ROWS, WIDTH], x_len..x_len + w_len),
+            (PROJECTION_INPUT, vec![4, width], 0..x_len),
+            (PROJECTION_WEIGHT, vec![rows, width], x_len..x_len + w_len),
         ] {
             let dense =
                 DenseWeight::try_new(DType::F32, shape, mapped.slice(range).unwrap()).unwrap();
@@ -4649,13 +4685,13 @@ mod f16_packed_weight_upload_tests {
         let x = b
             .constant(
                 &PROJECTION_INPUT.const_name(),
-                TensorType::f32(vec![4, WIDTH]),
+                TensorType::f32(vec![4, width]),
             )
             .unwrap();
         let w = b
             .constant(
                 &PROJECTION_WEIGHT.const_name(),
-                TensorType::f32(vec![ROWS, WIDTH]),
+                TensorType::f32(vec![rows, width]),
             )
             .unwrap();
         let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
@@ -4667,7 +4703,7 @@ mod f16_packed_weight_upload_tests {
                 .unwrap();
         }
         let weights = weights.build();
-        let mut engine = Engine::new(UploadRecorder::default());
+        let mut engine = Engine::new(device);
         let program = compile_staged(
             &g,
             &TargetSet::single(DeviceId(0), engine.device().target()),
@@ -4678,8 +4714,27 @@ mod f16_packed_weight_upload_tests {
             &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
         )
         .expect("the projection compiles");
-        let exe = engine.load_weights(store, Arc::new(weights)).unwrap();
+        let exe = engine
+            .load_weights(Arc::clone(&store), Arc::new(weights))
+            .unwrap();
+        (engine, exe, program, store, path, w_len)
+    }
 
+    /// POOT-1382 / POOT-1416: a weight uploaded from a mapped checkpoint never enters the process's resident
+    /// set (`RssFile`) and is read from its file exactly once: the upload reads by `pread` into the device's
+    /// staging, not through the mapping, so the checkpoint is not counted in the host beside its device copy
+    /// and no release step is needed. The weight is 8 MiB; the device received every byte; the file's own
+    /// read counter shows each byte of the input and the weight read once.
+    ///
+    /// Mutation: have `WeightWriter::read_one` copy from the mapping (`dense.bytes().as_slice()`) instead of
+    /// `read_at`; `RssFile` grows by the weight and this row goes red. A second pass over the bytes (a
+    /// separate validation read) doubles the counter and goes red on the equality.
+    #[test]
+    fn an_uploaded_mapped_weight_is_read_once_and_never_resident() {
+        const ROWS: usize = 2048;
+        const WIDTH: usize = 1024;
+        let (mut engine, exe, program, store, _path, w_len) =
+            mapped_projection(UploadRecorder::default(), "read_once.bin", ROWS, WIDTH);
         let before = rss_file_bytes();
         engine.add_entry(exe, &program).unwrap();
         let resident = rss_file_bytes().saturating_sub(before);
@@ -4700,6 +4755,44 @@ mod f16_packed_weight_upload_tests {
         assert!(
             resident < w_len as u64 / 8,
             "an uploaded {w_len}-byte weight left {resident} bytes of it resident"
+        );
+        assert_eq!(
+            store.bytes_read(),
+            (w_len + 4 * WIDTH * 4) as u64,
+            "each byte of the file was read exactly once"
+        );
+    }
+
+    /// POOT-1416 (owner Q2): on a unified-memory device the upload drops the page cache of every range it
+    /// staged, so the checkpoint is not resident beside its device copy; on a discrete device the cache is
+    /// kept for the next load. The control is the same upload on the discrete device, whose file stays
+    /// cached.
+    ///
+    /// Mutation: pass `false` for `evict` in `Engine::weight_writer`; the unified run keeps its cache and this
+    /// row goes red.
+    #[test]
+    fn a_unified_memory_upload_drops_the_page_cache_it_staged() {
+        const ROWS: usize = 4096;
+        const WIDTH: usize = 1024;
+        let cached = |unified: bool| {
+            let device = UploadRecorder {
+                unified,
+                ..UploadRecorder::default()
+            };
+            let (mut engine, exe, program, _store, path, _) =
+                mapped_projection(device, "evict.bin", ROWS, WIDTH);
+            engine.add_entry(exe, &program).unwrap();
+            poot_test_util::cached_pages(&path)
+        };
+        let (kept, pages) = cached(false);
+        assert!(
+            kept * 10 > pages * 9,
+            "control: a discrete device keeps the cache ({kept} of {pages} pages)"
+        );
+        let (left, pages) = cached(true);
+        assert!(
+            left * 10 < pages,
+            "a unified-memory device drops it ({left} of {pages} pages remain)"
         );
     }
 
@@ -4780,6 +4873,50 @@ mod f16_packed_weight_upload_tests {
         );
     }
 
+    /// POOT-1416 (P1): a checkpoint file truncated while its weight uploads is a typed
+    /// `LoadError::WeightRead` (an `UnexpectedEof` from the positional read) and no entry is published: the
+    /// upload reads the file, not the mapping, so the missing pages are an error value and not the `SIGBUS`
+    /// that ends the process. The truncation happens at the instant the device has the destination and
+    /// before the first stored byte is read.
+    ///
+    /// Mutation: read the weight through the mapping (`dense.bytes().as_slice()` in `WeightWriter::read_one`);
+    /// the test process dies with `SIGBUS` and this row dies with it.
+    #[test]
+    fn a_file_truncated_while_its_weight_uploads_is_a_typed_read_error() {
+        let path = poot_test_util::unique_temp_path("bind_truncated_during_upload.bin");
+        let bits = finite_bits();
+        std::fs::write(&path, vec![0u8; 4 * K * 4 + bits.len() * 2]).unwrap();
+        let mapped = StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut next = 0;
+        let store = projection_store(&bits, DType::F16, |bytes| {
+            let view = mapped.slice(next..next + bytes.len()).unwrap();
+            next += bytes.len();
+            view
+        });
+        let mut engine = Engine::new(UploadRecorder::default());
+        let truncated = path.to_path_buf();
+        engine.device.before_fill = Some(Box::new(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&truncated)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+        }));
+        let error = load_projection(&mut engine, store, DType::F16).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ExecError::Load(load) if matches!(
+                    &**load,
+                    LoadError::WeightRead { source: poot_quant::ReadError::Io(io), .. }
+                        if io.kind() == std::io::ErrorKind::UnexpectedEof
+                )
+            ),
+            "{error:?}"
+        );
+    }
+
     /// Distinct finite binary16 words, one per weight element.
     fn finite_bits() -> Vec<u16> {
         (0..N * K).map(|i| 0x3c00 + 37 * i as u16).collect()
@@ -4842,8 +4979,8 @@ mod f16_packed_weight_upload_tests {
     /// Card 1007: a packed-F16 weight holding an infinity is refused at upload with a typed error naming the
     /// weight and the element, since the generated bodies decode binary16 over its finite values only.
     ///
-    /// Mutation: drop the non-finite scan in `WeightWriter::check_encodable`; the entry loads
-    /// and this row goes red.
+    /// Mutation: drop the non-finite scan in `WeightWriter::read_stream` (scan an empty slice); the entry
+    /// loads and this row goes red.
     #[test]
     fn a_non_finite_packed_f16_weight_is_a_typed_refusal() {
         let mut engine = Engine::new(UploadRecorder::default());
@@ -4947,7 +5084,7 @@ mod f16_packed_weight_upload_tests {
     /// and no f32 buffer of the weight's size is allocated or written.
     ///
     /// Mutation: re-admit the BF16/F32 pair in `Engine::weight_buffer`'s dtype check (and widen it in
-    /// `WeightWriter::check_encodable`); the entry loads and this row goes red.
+    /// `WeightWriter::read_stream`); the entry loads and this row goes red.
     #[test]
     fn a_bf16_weight_declared_f32_is_a_typed_refusal_never_widened() {
         let mut engine = Engine::new(UploadRecorder::default());
@@ -5839,6 +5976,62 @@ mod weight_source_tests {
         assert_size_only_matches_bytes(&weights, &mapped, &g);
     }
 
+    /// ADR-0103 amendment of 2026-10-27 (POOT-1416): a packed weight whose stored scale is non-finite is
+    /// refused by the upload that reads its bytes, as the typed `LoadError::WeightContent` naming the weight
+    /// and the first bad element, and no entry is published. The control is the same weight with finite
+    /// scales, which loads: the refusal is the content, not the path.
+    ///
+    /// Mutation: drop the `writer.finish(name)?` after the write in `Engine::weight_buffer`; the weight
+    /// uploads zeros and `add_entry` returns `Ok`, so this row goes red.
+    #[test]
+    fn a_packed_weight_with_a_non_finite_scale_is_refused_by_the_upload_that_reads_it() {
+        let load = |nan: bool| {
+            let good =
+                poot_quant::test_support::packed::random_payload(WeightFormat::Q8_0, [N, K], 7);
+            let mut bytes = good.bytes(SourceRole::Blocks).to_vec();
+            // Q8_0 block: an f16 scale `d` then 32 int8 quants; poison the last block's scale.
+            let last = bytes.len() - 34;
+            bytes[last..last + 2]
+                .copy_from_slice(&if nan { 0x7e00u16 } else { 0x3c00 }.to_le_bytes());
+            let deferred = PackedPayload::try_new_deferred(
+                good.weight(),
+                [(SourceRole::Blocks, StoredBytes::from(bytes))],
+            )
+            .expect("the structure is sound");
+            let weights = store(vec![("w", WeightEntry::Packed(Arc::new(deferred)))]);
+            let mapped = map(
+                &weights,
+                vec![(id(Q), WeightView::Stored(WeightKey::from("w")))],
+            );
+            let g = projections(&[id(Q)], &WeightFormats::from_weight_map(&mapped));
+            let mut engine = Engine::new(Recorder::default());
+            let program = compile(&engine, &g);
+            let exe = engine.load_weights(weights, mapped).unwrap();
+            let result = engine.add_entry(exe, &program);
+            (result, engine.stats().weight_bytes_read)
+        };
+        let (control, _) = load(false);
+        control.expect("finite scales load");
+        let (refused, _) = load(true);
+        match refused {
+            Err(ExecError::Load(error)) => match *error {
+                LoadError::WeightContent { name, source } => {
+                    assert!(name.starts_with(&id(Q).const_name()), "{name}");
+                    assert!(
+                        matches!(
+                            source,
+                            poot_quant::PackedWeightError::NonFiniteField { element, .. }
+                                if element == (N * K / 32 - 1) * 32
+                        ),
+                        "{source:?}"
+                    );
+                }
+                other => panic!("expected WeightContent, got {other:?}"),
+            },
+            other => panic!("expected a load refusal, got {:?}", other.map(|_| ())),
+        }
+    }
+
     /// An engine and an embed gather of `w.embed` by the step's tokens, a `[rows, K]` F32 table: the planner
     /// hosts the gather whatever the target's buffer limit is, so the table never reaches the device.
     fn hosted_embed(rows: usize, tokens: usize) -> (Engine<Recorder>, StagedProgram) {
@@ -5973,6 +6166,122 @@ mod weight_source_tests {
             let stats = engine.stats();
             assert_eq!(stats.hosted_rows, ids.len() as u64, "{label}");
             assert_eq!(stats.hosted_bytes, want.len() as u64, "{label}");
+        }
+    }
+
+    /// POOT-1424: a hosted table in a mapped checkpoint stays out of the device and out of the page cache. The
+    /// file was just written, so every page of it is cached (the control); `add_entry` plans no upload for the
+    /// table, so the device's `Weight` bytes stay below it and `hosted_table_bytes` counts it, and the table's
+    /// pages are dropped. A step then gathers its row from the file and
+    /// writes the table's stored row.
+    ///
+    /// Mutation: allocate the table as a `Weight` in the `HOSTED_ROWS` branch of `Engine::load_entry`; the
+    /// `Weight` counter reaches the table's size and the first assert goes red. Drop the
+    /// `release_hosted` call; the cached-pages assert goes red.
+    #[test]
+    fn a_hosted_table_uploads_nothing_and_leaves_the_page_cache() {
+        const ROWS: usize = 16384;
+        let table_bytes = ROWS * K * 4;
+        let path = poot_test_util::unique_temp_path("hosted_residency.bin");
+        let fill: Vec<u8> = (0..ROWS * K)
+            .flat_map(|i| (i as f32).to_le_bytes())
+            .collect();
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            std::io::Write::write_all(&mut &file, &fill).unwrap();
+            file.sync_all().unwrap();
+        }
+        let mapped = StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap();
+        let dense = DenseWeight::try_new(
+            DType::F32,
+            vec![ROWS, K],
+            mapped.slice(0..table_bytes).unwrap(),
+        )
+        .unwrap();
+        let embed = WeightId::model(WeightRole::Embed);
+        let weights = store(vec![("e0", WeightEntry::Dense(dense))]);
+        let mapping = map(
+            &weights,
+            vec![(embed, WeightView::Stored(WeightKey::from("e0")))],
+        );
+        let (mut engine, program) = hosted_embed(ROWS, 1);
+        let exe = engine.load_weights(weights, mapping).unwrap();
+        let (cached, pages) = poot_test_util::cached_pages(&path);
+        assert!(
+            cached * 10 > pages * 9,
+            "control: the written file is cached ({cached} of {pages} pages)"
+        );
+
+        let entry = engine.add_entry(exe, &program).unwrap();
+        let stats = engine.stats();
+        let weight_bytes: u64 = stats
+            .memory
+            .iter()
+            .filter(|(role, _)| *role == BufferRole::Weight)
+            .map(|(_, memory)| memory.peak_bytes)
+            .sum();
+        assert!(
+            weight_bytes < table_bytes as u64 / 8,
+            "the {table_bytes}-byte hosted table reached the device as {weight_bytes} Weight bytes"
+        );
+        assert_eq!(stats.hosted_table_bytes, table_bytes as u64);
+        let (left, pages) = poot_test_util::cached_pages(&path);
+        assert!(
+            left * 10 < pages,
+            "the hosted table left the page cache ({left} of {pages} pages remain)"
+        );
+
+        step_tokens(&mut engine, exe, entry, &[ROWS as i32 - 1]);
+        assert!(
+            written(&engine).contains(&&fill[(ROWS - 1) * K * 4..]),
+            "the step wrote the table's last row"
+        );
+    }
+
+    /// POOT-1416 (ADR-0103 amendment of 2026-10-27): a hosted gather of a deferred packed table checks the
+    /// rows it reads. A step naming only finite rows fills them; a step naming a row whose stored scale is
+    /// non-finite is the typed `LoadError::WeightContent` and writes nothing for that step.
+    ///
+    /// Mutation: in `WeightBinder::gather_rows`, read the packed row with `payload.bytes(role)` (unchecked);
+    /// the bad row is gathered and this row goes red.
+    #[test]
+    fn a_hosted_gather_refuses_a_row_whose_stored_scale_is_non_finite() {
+        let embed = WeightId::model(WeightRole::Embed);
+        let good = poot_quant::test_support::packed::random_payload(WeightFormat::Q8_0, [3, K], 3);
+        let mut bytes = good.bytes(SourceRole::Blocks).to_vec();
+        let row_bytes = good.weight().source_shape(SourceRole::Blocks)[1];
+        bytes[row_bytes..row_bytes + 2].copy_from_slice(&0x7e00u16.to_le_bytes()); // row 1's scale
+        let deferred = PackedPayload::try_new_deferred(
+            good.weight(),
+            [(SourceRole::Blocks, StoredBytes::from(bytes))],
+        )
+        .unwrap();
+        let weights = store(vec![("e0", WeightEntry::Packed(Arc::new(deferred)))]);
+        let mapped = map(
+            &weights,
+            vec![(embed, WeightView::Stored(WeightKey::from("e0")))],
+        );
+        let (mut engine, program) = hosted_packed_embed(WeightFormat::Q8_0, 3, 2);
+        let exe = engine.load_weights(weights, mapped).unwrap();
+        let entry = engine.add_entry(exe, &program).unwrap();
+        step_tokens(&mut engine, exe, entry, &[0, 2]);
+        let ids = [0i32, 1];
+        let bytes: Vec<u8> = ids.iter().flat_map(|t| t.to_le_bytes()).collect();
+        let shape = [1, ids.len()];
+        let mut inputs = StepInputs::new();
+        inputs.push(
+            SlotKey::new(Slot::Token, None),
+            &shape,
+            poot_tensor::HostView::new(DType::I32, ids.len(), &bytes).unwrap(),
+        );
+        match engine.step(exe, entry, &inputs, &mut NoSync) {
+            Err(ExecError::Load(error)) => {
+                assert!(
+                    matches!(*error, LoadError::WeightContent { .. }),
+                    "{error:?}"
+                );
+            }
+            other => panic!("expected WeightContent, got {:?}", other.map(|_| ())),
         }
     }
 

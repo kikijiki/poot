@@ -33,7 +33,9 @@
 //! scores keeps `m = -inf` and is routed around `-inf - -inf`; a row with no visible key at all divides zero by
 //! zero, the oracle's NaN, as the streaming schedule does.
 
-use poot_kernel_ir::{BinOp, Body, Constant, IndexAxis, Local, Operand, Place, Rvalue, Ty};
+use poot_kernel_ir::{
+    BinOp, Body, Constant, IndexAxis, Local, Operand, Place, Rvalue, Ty, Unrolling,
+};
 
 use super::{
     AttentionMicro, AttentionSchedule, AttentionSink, AttentionSpec, GENERATOR, KeyBound,
@@ -792,6 +794,7 @@ pub(super) fn tiled_body(
 
     let mut body = c.finish(name);
     body.workgroup_size = [lanes as u32, 1, 1];
+    body.unrolling = Unrolling::Generator;
     body.workgroup_locals = layout
         .lds_arrays(dk, dv)
         .into_iter()

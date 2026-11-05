@@ -313,7 +313,9 @@ fn reject_cooperation(body: &Body) -> Result<(), SerializeError> {
                 Statement::WmmaLoad { .. }
                 | Statement::WmmaMma { .. }
                 | Statement::WmmaStore { .. }
-                | Statement::WmmaZero { .. } => return Err(SerializeError::Subgroup),
+                | Statement::WmmaZero { .. }
+                | Statement::WmmaElemRead { .. }
+                | Statement::WmmaElemWrite { .. } => return Err(SerializeError::Subgroup),
                 Statement::Fence { scope, .. } => {
                     return Err(SerializeError::Fence { scope: *scope });
                 }

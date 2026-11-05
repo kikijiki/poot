@@ -50,6 +50,8 @@ mod pool;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_arena;
+#[cfg(test)]
 mod tests_hosted;
 mod traffic;
 

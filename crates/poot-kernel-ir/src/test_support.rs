@@ -12,10 +12,13 @@
 //! this crate, duplicated here rather than widened to `pub` crate-wide for a handful of dead fixtures.
 
 use crate::{
-    BasicBlock, BinOp, BlockId, Body, Constant, Fp8Format, FragmentTy, IndexAxis, Local, LocalDecl,
-    Operand, Place, ProjectionElem, Rvalue, Statement, SwitchTargets, Terminator, Ty, WmmaDtype,
-    WmmaMat, WmmaShape, WorkgroupLocalDecl,
+    BasicBlock, BinOp, BlockId, Body, Constant, Fp8Format, FragmentMajor, FragmentRole, FragmentTy,
+    IndexAxis, Local, LocalDecl, Operand, Place, ProjectionElem, Rvalue, Statement, SwitchTargets,
+    Terminator, Ty, WmmaDtype, WmmaMat, WmmaShape, WorkgroupLocalDecl, accumulator_map,
 };
+
+mod fragment_probe;
+pub use fragment_probe::{AccInit, FragmentProbe, Readout};
 
 // --- small IR-builder primitives, duplicated from `poot_kernelgen`'s crate-private `helpers` module ---------
 

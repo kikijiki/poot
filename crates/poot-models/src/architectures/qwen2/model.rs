@@ -278,7 +278,6 @@ mod tests {
     use poot_graph_ir::{OpKind, Slot};
     use poot_graph_plan::{WeightFormats, bind_packed_weights};
     use poot_load::gguf::{GgufIndex, GgufValue, IdentityNames, read_gguf, write_gguf};
-    use poot_load::plan::default_workers;
     use poot_quant::SourceRole;
     use poot_quant::StoredBytes;
     use poot_quant::format::WeightFormat;
@@ -831,7 +830,7 @@ mod tests {
         let (bytes, reference_store) = gguf_fixture(false);
         let file = StoredBytes::from(bytes);
         let index = GgufIndex::parse(&file).unwrap();
-        let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
+        let store = read_gguf(&index, &IdentityNames).unwrap();
         let raw = RawConfig::Gguf(&index);
         let registry = Registry::builtin().unwrap();
         assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
@@ -899,7 +898,7 @@ mod tests {
         let (bytes, reference_store) = gguf_fixture(true);
         let file = StoredBytes::from(bytes);
         let index = GgufIndex::parse(&file).unwrap();
-        let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
+        let store = read_gguf(&index, &IdentityNames).unwrap();
         let model = model(&RawConfig::Gguf(&index), &store);
         assert_tied(&*model);
         let embed = model

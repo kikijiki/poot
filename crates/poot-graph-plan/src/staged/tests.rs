@@ -25,7 +25,7 @@ fn target() -> Target {
     }
 }
 
-fn options() -> CompileOptions {
+pub(super) fn options() -> CompileOptions {
     CompileOptions::new(CompileLimits::STANDARD)
 }
 
@@ -36,14 +36,18 @@ fn partition(devices: DevicePlacement) -> Partition {
     }
 }
 
-fn pipeline(after_layers: &[usize]) -> DevicePlacement {
+pub(super) fn pipeline(after_layers: &[usize]) -> DevicePlacement {
     DevicePlacement::Pipeline {
         after_layers: after_layers.to_vec(),
         devices: vec![DeviceId(0); after_layers.len() + 1],
     }
 }
 
-fn staged(g: &Graph, devices: DevicePlacement, options: &CompileOptions) -> StagedProgram {
+pub(super) fn staged(
+    g: &Graph,
+    devices: DevicePlacement,
+    options: &CompileOptions,
+) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target()),

@@ -468,3 +468,75 @@ fn decode_row_refuses_a_row_or_output_outside_the_shape() {
         }
     }
 }
+
+/// A Q8_0 `[rows, 64]` payload built deferred (two 34-byte blocks a row), every block finite except the
+/// `bad` ones, whose f16 scale is a NaN.
+fn deferred_q8(rows: usize, bad: &[usize]) -> PackedPayload {
+    let weight = PackedWeight::try_new(WeightFormat::Q8_0, [rows, 64]).unwrap();
+    let mut bytes = vec![0u8; weight.source_bytes(SourceRole::Blocks)];
+    for block in bad {
+        bytes[block * 34..block * 34 + 2].copy_from_slice(&0x7e00u16.to_le_bytes());
+    }
+    PackedPayload::try_new_deferred(weight, [(SourceRole::Blocks, owner(&bytes))]).unwrap()
+}
+
+/// POOT-1416: the content check of a deferred payload runs on exactly the blocks a read touches, whatever
+/// the read's alignment: a range that ends inside a bad block, starts inside one, or lies wholly inside one
+/// is refused, and a range that stops one byte short of the bad block, or starts one byte past it, is clean
+/// (an edge block is checked whole, never by the bytes of the range alone). The reported element is the
+/// first element of the bad block.
+///
+/// Mutation: in `read_verified`, check only the whole blocks of the range (skip the `edges` loop); the
+/// ranges that touch the bad block at an edge are admitted and this row goes red.
+#[test]
+fn a_deferred_read_checks_every_block_it_touches_at_any_alignment() {
+    // Bad block 3 spans bytes 102..136 (rows of two blocks: block 3 is row 1's second block).
+    let payload = deferred_q8(4, &[3]);
+    let read = |range: std::ops::Range<usize>| {
+        let mut out = vec![0u8; range.len()];
+        payload.read_verified(SourceRole::Blocks, range, &mut out)
+    };
+    let refused = |range: std::ops::Range<usize>| match read(range.clone()) {
+        Err(PayloadReadError::Content(PackedWeightError::NonFiniteField { element, .. })) => {
+            assert_eq!(element, 3 * 32, "{range:?}");
+        }
+        other => panic!("{range:?}: expected NonFiniteField, got {other:?}"),
+    };
+    // Whole range, aligned or not: refused.
+    refused(0..136);
+    refused(0..137);
+    refused(0..102 + 5);
+    refused(105..110);
+    refused(101 + 1..135);
+    refused(135..136);
+    refused(102..103);
+    // Ranges that stop short of, or start past, the bad block's bytes: clean.
+    read(0..102).expect("ends at the block's first byte");
+    read(0..101).expect("ends inside the previous block");
+    read(136..136 + 34).expect("starts at the next block");
+    // A range inside blocks 0..2 only, unaligned at both ends.
+    read(5..90).expect("good blocks only");
+}
+
+/// A deferred payload's `decode_row` refuses a bad row before it decodes, and decodes a good one; an eager
+/// payload keeps refusing at construction. The refusal names the first element of the bad block (flat over the payload: row 1, column 32).
+///
+/// Mutation: drop the `content_pending` check in `PackedPayload::decode_row`; the bad row decodes NaN and
+/// this row goes red.
+#[test]
+fn a_deferred_payload_refuses_a_bad_row_when_it_is_decoded() {
+    let payload = deferred_q8(4, &[3]);
+    let mut row = vec![0.0f32; 64];
+    payload.decode_row(0, &mut row).expect("row 0 is finite");
+    assert!(matches!(
+        payload.decode_row(1, &mut row),
+        Err(DecodeError::NonFiniteStored { element, .. }) if element == 96
+    ));
+    let weight = PackedWeight::try_new(WeightFormat::Q8_0, [1, 32]).unwrap();
+    let mut eager = vec![0u8; 34];
+    eager[0..2].copy_from_slice(&0x7e00u16.to_le_bytes());
+    assert!(matches!(
+        PackedPayload::try_new(weight, [(SourceRole::Blocks, owner(&eager))]),
+        Err(PackedWeightError::NonFiniteField { .. })
+    ));
+}

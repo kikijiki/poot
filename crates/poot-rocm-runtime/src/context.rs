@@ -662,7 +662,10 @@ pub(crate) struct AgentProbe<'a> {
 
 pub(crate) fn caps_from_agent(probe: &AgentProbe<'_>) -> poot_target::DeviceCaps {
     let defaults = poot_target::DeviceCaps::rocm_default();
-    let tensor_core = poot_target::TensorCoreSupport::from_device_name(probe.isa_name);
+    // An agent whose ISA name carries no gfx code, or whose wavefront is unknown, has no matrix unit the
+    // code generator can target.
+    let matrix_units = poot_target::AmdArch::from_isa_name(probe.isa_name, probe.wavefront)
+        .map_or(poot_target::MatrixUnits::NONE, |arch| arch.matrix_units());
     poot_target::DeviceCaps {
         max_buffer_bytes: if probe.vram_total_bytes == 0 {
             defaults.max_buffer_bytes
@@ -681,8 +684,7 @@ pub(crate) fn caps_from_agent(probe: &AgentProbe<'_>) -> poot_target::DeviceCaps
                 max_size: probe.wavefront,
             })
         },
-        tensor_core,
-        matrix_lowering: poot_target::MatrixLowering::amd(tensor_core),
+        matrix_units: poot_target::Queried::Known(matrix_units),
         compute_units: probe.compute_units.unwrap_or(defaults.compute_units),
         // 0 is the failed one-time pool query: unknown, not an empty device.
         memory_budget_bytes: (probe.vram_total_bytes != 0).then_some(probe.vram_total_bytes),
@@ -720,7 +722,7 @@ impl Drop for RocmContext {
 mod caps_tests {
     use super::*;
     use crate::discovery::AgentLimits;
-    use poot_target::{DeviceCaps, Queried, SubgroupSupport, TensorCoreSupport};
+    use poot_target::{DeviceCaps, Queried, SubgroupSupport};
 
     /// Limits no real device reports, so a field that comes from a preset instead of the probe is visible.
     const SENTINEL_LIMITS: AgentLimits = AgentLimits {
@@ -751,7 +753,11 @@ mod caps_tests {
                 max_size: 64
             })
         );
-        assert_eq!(caps.tensor_core, TensorCoreSupport::CdnaMfma);
+        assert_eq!(
+            caps.matrix_units,
+            Queried::Known(poot_target::MatrixUnits::NONE),
+            "CDNA is MFMA: no fragment lowering yet"
+        );
         assert_eq!(caps.compute_units, 7);
         assert_eq!(caps.memory_budget_bytes, Some(12_345), "the pool size");
         assert_eq!(caps.lds_bytes, 12_288, "the group-segment size");

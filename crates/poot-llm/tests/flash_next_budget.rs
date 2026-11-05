@@ -279,13 +279,20 @@ fn the_prefill_arena_is_set_by_the_chunk_not_the_prompt() {
             .any(|&(_, _, total)| total + SUPPORT_RESERVE_BYTES <= RTX_PRO_6000_BYTES),
         "some chunk fits the card: {rows:?}"
     );
+    // POOT-1433: the stages of the prefill share one arena and each stage's slots are sized to the values
+    // that need them, so the whole 8192-token prompt is a chunk the card holds (18.63 GiB of activations;
+    // 74.40 GiB when every stage kept an arena of its own).
+    assert!(
+        rows[0].1 < 20 << 30 && rows[0].2 + SUPPORT_RESERVE_BYTES <= RTX_PRO_6000_BYTES,
+        "the whole-prompt chunk fits the card: {rows:?}"
+    );
 }
 
 /// The chunk the benchmark runner runs a cell with on the 96 GB card, through the production choice
-/// (`fit_prefill_chunk`): isl 8192 does not fit whole, so it runs at the largest candidate that does (2048:
-/// 83.89 GiB planned of 95.59, the weights 27.23 GiB lighter since the two gather tables are hosted); isl 1024
-/// fits whole and keeps its whole-prompt chunk; a card without room for the chunk is the typed refusal.
-/// Mutation: make `chunk_candidates` return only the desired chunk; isl 8192 is refused instead of chunked.
+/// (`fit_prefill_chunk`): isl 8192 fits whole, since the prefill's stages share one activation arena
+/// (POOT-1433: 65.21 GiB planned of 95.59, 4096 and 83.89 GiB at 2048 before); isl 1024 fits whole and keeps
+/// its whole-prompt chunk; a card without room for the chunk is the typed refusal.
+/// Mutation: make `fit_prefill_chunk` fit over `&candidates[1..]`; the first assertion reports chunk 4096.
 #[test]
 fn the_decode_curve_cell_runs_at_the_largest_chunk_that_fits_the_card() {
     let (handle, _set) = handle();
@@ -317,7 +324,11 @@ fn the_decode_curve_cell_runs_at_the_largest_chunk_that_fits_the_card() {
         total as f64 / GIB,
         RTX_PRO_6000_BYTES as f64 / GIB
     );
-    assert_eq!(fitted.chunk.get(), 4096);
+    assert_eq!(
+        fitted.chunk.get(),
+        8192,
+        "the whole prompt fits since the stages of the prefill share one activation arena (POOT-1433)"
+    );
 
     let whole = fit(1024, RTX_PRO_6000_BYTES, &desired(1024)).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(
@@ -326,7 +337,7 @@ fn the_decode_curve_cell_runs_at_the_largest_chunk_that_fits_the_card() {
         "a cell that fits whole is unchanged"
     );
 
-    let no_room = 70 << 30;
+    let no_room = 40 << 30;
     let candidates = &desired(8192)[..2];
     let Err(AdmitError::NoChunkFits {
         chunk,
@@ -347,8 +358,8 @@ fn the_decode_curve_cell_runs_at_the_largest_chunk_that_fits_the_card() {
 
 /// POOT-1347: the correctness scorer's window (two heads, capacity 2112, 2048 desired) on the 96 GB card. Its
 /// turns extend the prepared set to every admitted piece of both heads (`ServingShapes::turn`), which plans
-/// 85.87 GiB at the whole-prompt-half chunk 1024 (106.85 GiB before POOT-1423 hosted the two gather tables):
-/// fitted for the turn set the chunk is the largest whose whole set fits the card, and a card too small for
+/// 67.23 GiB at the whole window chunk 2048 (85.87 GiB at chunk 1024 before the stages shared one activation
+/// arena, POOT-1433; 106.85 GiB before POOT-1423 hosted the two gather tables): fitted for the turn set the chunk is the largest whose whole set fits the card, and a card too small for
 /// the set is the typed refusal.
 /// Mutation: give `ServingShapes::turn` `Warm::Prompts(&[])`; the fit stops counting the turn pieces and
 /// the first assertion fails.
@@ -391,8 +402,8 @@ fn the_score_window_chunk_is_fitted_to_the_turn_set() {
     );
     assert_eq!(
         fitted.chunk.get(),
-        1024,
-        "the whole turn set (85.87 GiB) fits the card at 1024 now that the gather tables are hosted"
+        2048,
+        "the whole turn set (67.23 GiB) fits the card at the whole window since the stages share one arena"
     );
     assert!(
         planned + SUPPORT_RESERVE_BYTES <= RTX_PRO_6000_BYTES,
@@ -407,7 +418,7 @@ fn the_score_window_chunk_is_fitted_to_the_turn_set() {
                 ..
             },
         ..
-    }) = fit(70 << 30, &candidates[..2])
+    }) = fit(40 << 30, &candidates[..2])
     else {
         panic!("a card without room for the weights must be refused over budget");
     };

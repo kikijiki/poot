@@ -15,7 +15,6 @@ pub use format::write_gguf;
 pub use format::{GgufIndex, GgufTensorInfo, GgufValue, weight_format_of};
 
 use poot_tensor::DType;
-use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -219,21 +218,16 @@ fn split_name(name: &str) -> Option<(&str, usize)> {
     (1..=count).contains(&no).then_some((stem, count))
 }
 
-/// [`gguf_plan`] then [`build_store`] on `workers` threads: every tensor validated, the file checked
-/// unchanged (ADR-0103 amendment, boundary 1), then the store published.
-pub fn read_gguf(
-    index: &GgufIndex,
-    names: &dyn TensorNameMap,
-    workers: NonZeroUsize,
-) -> Result<WeightStore, LoadError> {
-    build_store(gguf_plan(index, names)?, workers)
+/// [`gguf_plan`] then [`build_store`]: every entry's structure checked, the file checked unchanged
+/// (ADR-0103 amendment, boundary 1), then the store published. A packed tensor's content is checked when
+/// the upload reads it.
+pub fn read_gguf(index: &GgufIndex, names: &dyn TensorNameMap) -> Result<WeightStore, LoadError> {
+    build_store(gguf_plan(index, names)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::plan::default_workers;
     use poot_quant::format::Storage;
     use poot_quant::scalar::{bf16_to_f32, f16_to_f32, f32_to_f16};
     use poot_quant::weights::WeightEntry;
@@ -885,7 +879,7 @@ mod tests {
         }
         // The one reader keeps each dense tensor's stored bytes exactly (spec 135 Phase 2, FR-006):
         // a GPU upload reads the source, not a re-encode.
-        let store = read_gguf(&g, &IdentityNames, default_workers()).expect("read_gguf");
+        let store = read_gguf(&g, &IdentityNames).expect("read_gguf");
         let stored = |name: &str| match store.get(name) {
             Some(WeightEntry::Dense(dense)) => (dense.dtype(), dense.bytes().as_slice().to_vec()),
             other => panic!("{name}: {other:?}"),
@@ -1087,7 +1081,7 @@ mod tests {
         let fixture = TempGguf::write(&bytes);
         let file = fixture.map();
         let index = GgufIndex::parse(&file).expect("parse index");
-        let store = read_gguf(&index, &IdentityNames, default_workers()).expect("read_gguf");
+        let store = read_gguf(&index, &IdentityNames).expect("read_gguf");
 
         assert_eq!(store.len(), 1);
         let entry = store.get("blk.0.attn_v.weight").expect("missing entry");
@@ -1112,8 +1106,7 @@ mod tests {
         let fixture = TempGguf::write(&bytes);
         let file = fixture.map();
         let index = GgufIndex::parse(&file).expect("parse index");
-        let error =
-            read_gguf(&index, &IdentityNames, default_workers()).expect_err("must refuse Q8_1");
+        let error = read_gguf(&index, &IdentityNames).expect_err("must refuse Q8_1");
         match error {
             LoadError::UnsupportedGgufType { tensor, ggml_type } => {
                 assert_eq!(tensor, "blk.0.attn_v.weight");
@@ -1141,8 +1134,7 @@ mod tests {
         let fixture = TempGguf::write(&bytes);
         let file = fixture.map();
         let index = GgufIndex::parse(&file).expect("parse index");
-        let store =
-            read_gguf(&index, &SkipEverything, default_workers()).expect("skips, does not refuse");
+        let store = read_gguf(&index, &SkipEverything).expect("skips, does not refuse");
         assert!(store.is_empty());
     }
 
@@ -1178,7 +1170,7 @@ mod tests {
         let fixture = TempGguf::write(&bytes);
         let file = fixture.map();
         let index = GgufIndex::parse(&file).expect("parse index");
-        let store = read_gguf(&index, &IdentityNames, default_workers()).expect("read_gguf");
+        let store = read_gguf(&index, &IdentityNames).expect("read_gguf");
 
         assert_eq!(store.len(), experts);
         for expert in 0..experts {
@@ -1230,7 +1222,7 @@ mod tests {
         let fixture = TempGguf::write(&bytes);
         let file = fixture.map();
         let index = GgufIndex::parse(&file).expect("parse index");
-        let store = read_gguf(&index, &IdentityNames, default_workers()).expect("read_gguf");
+        let store = read_gguf(&index, &IdentityNames).expect("read_gguf");
 
         let WeightEntry::Dense(f32_entry) = store.get("norm.weight").expect("missing f32 entry")
         else {
@@ -1270,7 +1262,7 @@ mod tests {
         );
         let file = StoredBytes::from(bytes);
         let index = GgufIndex::parse(&file).expect("parse in-memory gguf");
-        let store = read_gguf(&index, &IdentityNames, default_workers()).expect("read_gguf");
+        let store = read_gguf(&index, &IdentityNames).expect("read_gguf");
         let entry = store.get("blk.0.attn_v.weight").expect("missing entry");
         let WeightEntry::Packed(payload) = entry else {
             panic!("expected a packed entry, got {entry:?}");

@@ -106,6 +106,16 @@ pub enum DecodeError {
         /// The operand whose `Float` field cannot be located as whole bytes.
         role: OperandRole,
     },
+    /// A stored `Float` field of a payload whose content check is deferred
+    /// ([`crate::PackedPayload::try_new_deferred`]) is NaN or an infinity, found as its row was read.
+    NonFiniteStored {
+        /// The format that owns the field.
+        format: WeightFormat,
+        /// The operand whose stored field is not finite.
+        role: OperandRole,
+        /// The flat K index of the first element it is the value of.
+        element: usize,
+    },
     /// A stored operand is NaN (E8M0 `0xff`, E4M3FN `0x7f`, a NaN float).
     NotANumber {
         /// The format that owns the operand.
@@ -178,6 +188,14 @@ impl fmt::Display for DecodeError {
             Self::NotANumber { format, role } => {
                 write!(f, "{format:?} stores a NaN {role:?} operand")
             }
+            Self::NonFiniteStored {
+                format,
+                role,
+                element,
+            } => write!(
+                f,
+                "{format:?} stores a non-finite {role:?} at element {element}"
+            ),
             Self::UnsupportedFloatField { format, role } => write!(
                 f,
                 "{format:?} {role:?} is a float the content check cannot locate as whole bytes"
