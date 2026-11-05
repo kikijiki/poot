@@ -134,6 +134,32 @@ fn narrow_stored_activations_match_the_declared_oracle_on_rocm() {
     }
 }
 
+/// POOT-1477: the driver's weight format on rocm. A BF16 embedding the driver stores as f16 gathers the rounded
+/// rows (a table of f16-subnormal magnitudes, scaled to O(1) so the rounding shows), and a tied-embedding
+/// language-model step (embedding gather, a projection and a head, every weight declared F16 over the BF16
+/// checkpoint) matches the CPU oracle of the declared graph at one row (the decode GEMV) and at 64 (the tiled
+/// schedules): the weights the device reads are the weights the oracle evaluates, whichever schedule reads them.
+/// Mutations: in `store_weights_f16`'s `reads_as_dense_weight` drop the `DenseRowGather` arm (the embedding
+/// keeps bf16 and the row fails its "converted" guard on the embedding fixture); in `packed_f16_row_gather.rs`
+/// read `half & 0x3ff` as the sign bit's mantissa (the gather decodes wrong rows).
+#[test]
+fn the_driver_weight_format_matches_the_declared_oracle_on_rocm() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    let mut fixtures = vec![poot_executor_parity::precision::weight_format_embedding_fixture()];
+    fixtures.extend(poot_executor_parity::precision::weight_format_lm_fixtures());
+    poot_executor_parity::precision::run_parity_weight_format(
+        exec.as_mut(),
+        t,
+        &fixtures,
+        poot_graph_ir::MatmulPrecision::Narrow,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+}
+
 /// POOT-1430: an attention that declares `Narrow(f16)` or `Split(f16)` over an f16 KV cache, at decode and as a
 /// 33-row causal prefill, matches the CPU oracle on rocm: Q, K, V and the probabilities are read as declared
 /// by the schedules the planner picks. Mutation: in `attention::add_products` read the operands unrounded; the

@@ -411,17 +411,17 @@ pub struct DeviceCaps {
     /// The output-column count above which a decode GEMV is measured slower than the batched matmul on this
     /// device; `None` where nobody measured one (the GEMV is kept at any width).
     pub decode_gemv_max_out_cols: Option<u32>,
-    /// The kind of device the launch figures are calibrated for. The launch is derived from it and
-    /// `known_miscompiles` by [`DeviceCaps::gemm_launch`], so the two cannot disagree.
-    pub launch_class: calibration::LaunchClass,
+    /// Whether this device's performance figures were measured on it or are the portable prior, resolved from
+    /// the device's identity by its runtime. The launch is derived from it by [`DeviceCaps::gemm_launch`].
+    pub perf_calibration: calibration::Calibrated,
 }
 
 impl DeviceCaps {
     /// The lane grids the M>1 register-tiled contraction launches with and the packed decode Gemv's lane run on this
-    /// device, the figures of its class ([`calibration::GemmLaunch::resolve`]); which lane grid a contraction runs is
-    /// the cost model's choice under this device's workgroup and LDS limits.
+    /// device ([`calibration::GemmLaunch::new`]); which lane grid a contraction runs is the cost model's choice
+    /// under this device's workgroup and LDS limits.
     pub const fn gemm_launch(&self) -> calibration::GemmLaunch {
-        calibration::GemmLaunch::resolve(self.launch_class)
+        calibration::GemmLaunch::new(self.perf_calibration)
     }
 }
 
@@ -529,7 +529,9 @@ impl DeviceCaps {
             widens_bf16_decode_weight: false,
             peer_transport: false,
             decode_gemv_max_out_cols: None,
-            launch_class: calibration::LaunchClass::Hsa,
+            // The arch is the live agent's to say ([`calibration::Calibrated::of_hsa_arch`]); a device with no
+            // arch plans with the portable prior.
+            perf_calibration: calibration::Calibrated::Portable,
         }
     }
 
@@ -560,7 +562,8 @@ impl DeviceCaps {
             widens_bf16_decode_weight: true,
             peer_transport: true,
             decode_gemv_max_out_cols: calibration::nvidia_decode_gemv_max_out_cols(8).known(),
-            launch_class: calibration::LaunchClass::Cuda,
+            // sm_80 is not a measured device ([`calibration::Calibrated::of_cuda_compute_capability`]).
+            perf_calibration: calibration::Calibrated::Portable,
         }
     }
 }

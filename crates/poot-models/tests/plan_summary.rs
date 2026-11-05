@@ -15,7 +15,9 @@
 //! A card that changes plans by design regenerates the file with `just test-plan-summary-regen` and lists
 //! every changed graph in its landing note. To see which equations of a changed graph moved, run the test
 //! with `POOT_PLAN_SUMMARY_DUMP=<dir>` before and after: it writes the full per-equation description of
-//! every target to `<dir>/<target>.tsv` (uncommitted), and the two directories diff.
+//! every target to `<dir>/<target>.tsv` (uncommitted), and the two directories diff. The dump has one column the
+//! digested text does not, `kind`: the request's own name (`contraction:gemv_chunk` is the `[K, N]` decode GEMV).
+//! For the committed schedule fields of the real-dimension models, see `launch_census.rs`.
 //!
 //! The corpus needs no checkpoint: every graph is a registered family's fixture traced at tiny fixed
 //! dims, plus the dense parity checkpoints (`support/corpus.rs`), and the invariants also run on the
@@ -56,7 +58,9 @@ fn registry() -> Registry {
 
 // ---- the summary -----------------------------------------------------------------------------
 
-const DUMP_HEADER: &str = "graph\teqn\top\tplan\tchoice\trequest\tlaunches\tgrid\tdetail\n";
+/// The dump's columns: the digested ones, plus `kind`, the request's own name ([`kind_cell`]). `kind` is not
+/// part of the digested text, so naming it did not move a digest.
+const DUMP_HEADER: &str = "graph\teqn\top\tplan\tchoice\tkind\trequest\tlaunches\tgrid\tdetail\n";
 
 /// Tabs and newlines in a free-text field would break the line format.
 fn cell(s: &str) -> String {
@@ -276,26 +280,54 @@ fn describe_compile_error(error: &CompileError) -> (String, String, PlanCells) {
     )
 }
 
-/// One summary line.
-fn write_line(out: &mut String, name: &str, eqn: &str, op: &str, c: &PlanCells) {
+/// The `kind` cell of a kernel choice: a generated request names its family, form and (for a dense Gemv) its
+/// schedule and shape ([`poot_kernelgen::KernelRequest::display_label`], so `contraction:gemv_chunk` is the
+/// `[K, N]` decode GEMV and `contraction:dense_gemv:..` the `[N, K]` one); any other choice names itself.
+fn kind_cell(choice: &KernelChoice) -> String {
+    match choice {
+        KernelChoice::Generated(request) | KernelChoice::Serialized { request, .. } => {
+            request.display_label()
+        }
+        other => other.label(),
+    }
+}
+
+/// One summary line: written to `digested`, the text the digest covers, and (with the request's `kind`
+/// after `choice`) to `dump`.
+fn write_line(
+    digested: &mut String,
+    dump: &mut String,
+    name: &str,
+    eqn: &str,
+    op: &str,
+    c: &PlanCells,
+    kind: &str,
+) {
+    let (op, choice, request, detail) =
+        (cell(op), cell(&c.choice), cell(&c.request), cell(&c.detail));
     writeln!(
-        out,
-        "{name}\t{eqn}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        cell(op),
+        digested,
+        "{name}\t{eqn}\t{op}\t{}\t{choice}\t{request}\t{}\t{}\t{detail}",
+        c.plan, c.launches, c.grid,
+    )
+    .expect("write to a String");
+    writeln!(
+        dump,
+        "{name}\t{eqn}\t{op}\t{}\t{choice}\t{}\t{request}\t{}\t{}\t{detail}",
         c.plan,
-        cell(&c.choice),
-        cell(&c.request),
+        cell(kind),
         c.launches,
         c.grid,
-        cell(&c.detail),
     )
     .expect("write to a String");
 }
 
 /// One graph's description, as `compile` planned (or refused) it.
 struct GraphPlan {
-    /// The description lines, one per planned equation or one for a refused graph.
+    /// The description lines, one per planned equation or one for a refused graph: what the digest covers.
     text: String,
+    /// The same lines with the request `kind` column, for [`DUMP_ENV`].
+    dump: String,
     /// `plans`, or `refused` when `compile` returned an error.
     verdict: &'static str,
     /// Planned equations, or 0 for a refused graph.
@@ -307,7 +339,7 @@ struct GraphPlan {
 /// `g` compiled for `target` and described: one line per planned equation, or one line for the whole
 /// graph when `compile` refuses it.
 fn describe_graph(name: &str, g: &poot_graph_ir::Graph, target: &Target) -> GraphPlan {
-    let mut text = String::new();
+    let (mut text, mut dump) = (String::new(), String::new());
     // The production entry: a gather-only table is hosted before the stages are compiled, and a program with a
     // device-indexed hosted site is two stages. Equations are numbered across the stages in order.
     match targets::compile_production(g, target, &targets::options()) {
@@ -317,13 +349,23 @@ fn describe_graph(name: &str, g: &poot_graph_ir::Graph, target: &Target) -> Grap
             for (_, _, stage) in program.stages() {
                 for (eqn, plan) in stage.planned() {
                     let c = describe_plan(eqn, plan, stage.kernel_choice(eqn));
-                    write_line(&mut text, name, &eqns.to_string(), &eqn.op.name(), &c);
+                    let kind = kind_cell(stage.kernel_choice(eqn));
+                    write_line(
+                        &mut text,
+                        &mut dump,
+                        name,
+                        &eqns.to_string(),
+                        &eqn.op.name(),
+                        &c,
+                        &kind,
+                    );
                     launches += c.launches;
                     eqns += 1;
                 }
             }
             GraphPlan {
                 text,
+                dump,
                 verdict: "plans",
                 eqns,
                 launches,
@@ -331,9 +373,10 @@ fn describe_graph(name: &str, g: &poot_graph_ir::Graph, target: &Target) -> Grap
         }
         Err(error) => {
             let (eqn, op, c) = describe_compile_error(&error);
-            write_line(&mut text, name, &eqn, &op, &c);
+            write_line(&mut text, &mut dump, name, &eqn, &op, &c, "-");
             GraphPlan {
                 text,
+                dump,
                 verdict: "refused",
                 eqns: 0,
                 launches: 0,
@@ -380,7 +423,7 @@ fn render_digests(registry: &Registry) -> String {
 fn render_dump(registry: &Registry, reference: &RefTarget) -> String {
     let mut out = String::from(DUMP_HEADER);
     for (_, plan) in plans(registry, reference) {
-        out.push_str(&plan.text);
+        out.push_str(&plan.dump);
     }
     out
 }

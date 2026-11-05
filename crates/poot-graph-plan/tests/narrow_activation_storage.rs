@@ -178,8 +178,21 @@ fn dispatches(program: &Program) -> usize {
         .sum()
 }
 
+/// The output of `g` over `inputs`, each constant bound as `g` declares it (a weight the driver stores as f16 is
+/// bound converted, as the bind does).
 fn output_bits(g: &Graph, inputs: &HashMap<ValueId, Value>) -> Vec<u32> {
-    eval(g, inputs, EvalOptions::default())
+    let inputs: HashMap<ValueId, Value> = inputs
+        .iter()
+        .map(|(&id, value)| match value {
+            Value::Host(tensor) => {
+                let declared = poot_eval::declared_weight("input", g.meta(id), tensor.clone())
+                    .expect("the weight converts");
+                (id, Value::Host(declared))
+            }
+            other => (id, other.clone()),
+        })
+        .collect();
+    eval(g, &inputs, EvalOptions::default())
         .expect("the graph evaluates")
         .output
         .into_host()

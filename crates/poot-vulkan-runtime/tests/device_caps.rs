@@ -29,6 +29,14 @@ fn device_caps_is_plausible_on_the_real_device() {
             caps.known_miscompiles.tiled_gemm_max_workgroups.is_some(),
             calibrated.known().is_some()
         );
+        // The performance figures follow the same identity: measured on Strix Halo, the portable prior elsewhere.
+        assert_eq!(
+            caps.perf_calibration,
+            poot_target::calibration::Calibrated::of_vulkan_device(
+                poot_target::calibration::VENDOR_AMD,
+                &ctx.device_name(),
+            )
+        );
     }
 }
 

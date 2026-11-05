@@ -32,6 +32,31 @@ fn checkpoint_orientation_projection_matches_the_oracle_on_ptx() {
     }
 }
 
+/// POOT-1477: the driver's weight format on PTX. A BF16 embedding the driver stores as f16 gathers the rounded rows
+/// (f16 subnormals and normals), and a language-model step (a projection and a head, every device weight declared F16
+/// over the BF16 checkpoint) matches the CPU oracle of the declared graph at one row (the decode GEMV) and at 64
+/// (the tiled schedules): the weights the device reads are the weights the oracle evaluates, whichever schedule
+/// reads them. Owed a pod run (POOT-1478); the wgpu, Vulkan and ROCm rows of the same name hold the fixture.
+/// Mutations: in `store_weights_f16`'s `reads_as_dense_weight` make the `DenseRowGather` arm `false` (the embedding
+/// fixture converts nothing and the guard refuses it); in `packed_f16_row_gather.rs` use a decode bias of 111.
+#[test]
+fn the_driver_weight_format_matches_the_declared_oracle_on_ptx() {
+    let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    let mut fixtures = vec![poot_executor_parity::precision::weight_format_embedding_fixture()];
+    fixtures.extend(poot_executor_parity::precision::weight_format_lm_fixtures());
+    poot_executor_parity::precision::run_parity_weight_format(
+        exec.as_mut(),
+        t,
+        &fixtures,
+        poot_graph_ir::MatmulPrecision::Narrow,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+}
+
 /// POOT-1048: a grouped projection `matmul(x, transpose(reshape(w, [G, N, K]), [0, 2, 1]))` over a BF16 `[G * N, K]`
 /// const (DeepSeek V4's `wo_a`), at `M = 1`, `5` and `33` with three groups and at one group, compiled for PTX: the
 /// program holds one `GroupedDenseContraction` and neither a `Transpose` nor a `Cast`, and every replayed step

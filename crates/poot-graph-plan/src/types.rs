@@ -767,8 +767,8 @@ pub(crate) enum StorageKind {
     /// (see [`ValueStorage::dtype`]).
     Bf16Packed,
     /// F16 values packed two elements per device `u32` word, which every backend's generated body decodes
-    /// in-register: an F16 `DenseContraction` weight's checkpoint bytes (Card 1007), or a BF16 weight of
-    /// contractions that multiply in f16, rounded to f16 once at bind (POOT-1458, `Bf16ConstLane::F16`).
+    /// in-register: an F16 `DenseContraction` weight or `DenseRowGather` table, the checkpoint's binary16 bytes
+    /// (Card 1007) or the f16 a BF16 checkpoint weight is converted to at bind (POOT-1477, `store_weights_f16`).
     F16Packed,
     /// E4M3FN checkpoint bytes packed four elements per device `u32` word, each row of the last axis
     /// padded to a whole word (POOT-1060): a `DenseRowGather` table, which every backend's imported

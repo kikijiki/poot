@@ -411,7 +411,10 @@ fn gemv_schedule(
         .unwrap_or(8);
     let sharing = poot_kernelgen::packed_run_sharing(format)
         .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
-    let unroll = gemv_run(sharing, caps.gemm_launch().packed_gemv_max_run);
+    let unroll = gemv_run(
+        sharing,
+        caps.gemm_launch().calibrated.figures().packed_gemv_max_run,
+    );
     Ok(Schedule::Gemv {
         width: 256,
         cols: cols as u32,
@@ -421,7 +424,7 @@ fn gemv_schedule(
 }
 
 /// The packed decode Gemv's lane run (POOT-1398, B1 of designs/quant-matmul-1390.md), at most `max_run`, the
-/// class's register and issue budget ([`poot_target::calibration::GemmLaunch::packed_gemv_max_run`]).
+/// device's register and issue budget ([`poot_target::calibration::PerfCalibration::packed_gemv_max_run`]).
 ///
 /// A decode that shares a run's block address, factors and code windows up to the factor run
 /// ([`PackedRunSharing::FactorRun`]) runs the longest divisor of the factor run within `max_run`: a longer run
@@ -806,38 +809,61 @@ mod tests {
     }
 
     /// POOT-1398 (B1 of designs/quant-matmul-1390.md), GPU-free: the decode Gemv's lane run is the format's
-    /// factor run (the aligned elements that share one decoded scale/min), capped by the device class's
+    /// factor run (the aligned elements that share one decoded scale/min), capped by the device's
     /// calibrated `packed_gemv_max_run`. For every block-storage format (whose decode shares a run's block
-    /// address, factors and code windows) and every launch class the planned run divides the factor run, never
+    /// address, factors and code windows) and every calibration (measured or portable) the planned run divides the factor run, never
     /// exceeds it or the cap, and is the largest such run, so a run never straddles a factor boundary (the 1390
     /// cliff: Q6_K at run 32 decodes every element's factors, 60 GB/s against 190 at 16). A planar format,
     /// whose decode addresses each element on its own, runs the portable run within the cap. The measured rows
-    /// are pinned as literals on the HSA class (cap 32): 32 for the formats whose sub-block is 32 values (Q4_K,
+    /// are pinned as literals on gfx1151 through HSA and Vulkan (cap 32): 32 for the formats whose sub-block is 32 values (Q4_K,
     /// Q5_K, IQ4_XS, Q4_0, Q8_0), 16 for the 16-value ones (Q6_K, Q2_K, Q3_K), 8 for GPTQ and FP8; the
-    /// CUDA class caps it at its measured 16 (POOT-1405). Driven through `compile`. Mutation: plan run 32 for Q6_K in
+    /// sm_120 caps it at its measured 16 (POOT-1405) and an unmeasured device, Vulkan or CUDA, at the portable 8. Driven through `compile`. Mutation: plan run 32 for Q6_K in
     /// `gemv_schedule`; the divisibility and the pinned Q6_K row go red.
     #[test]
-    fn the_packed_decode_gemv_run_is_the_factor_run_capped_by_the_launch_class() {
+    fn the_packed_decode_gemv_run_is_the_factor_run_capped_by_the_device_calibration() {
+        let wgpu = DeviceCaps {
+            memory_budget_bytes: None,
+            ..poot_test_util::device_caps::wgpu_rdna3_igpu()
+        };
         let targets = [
             (
                 "hsa",
                 Target::Gpu {
                     backend: Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
-                    caps: DeviceCaps::rocm_default(),
+                    caps: poot_test_util::device_caps::default_caps_for(Backend::AmdGcn(
+                        poot_target::AmdArch::gfx1151(),
+                    )),
                 },
             ),
             (
                 "vulkan",
                 Target::Gpu {
                     backend: Backend::SpirvVulkan,
+                    caps: wgpu,
+                },
+            ),
+            (
+                "vulkan-portable",
+                Target::Gpu {
+                    backend: Backend::SpirvVulkan,
                     caps: DeviceCaps {
-                        memory_budget_bytes: None,
-                        ..poot_test_util::device_caps::wgpu_rdna3_igpu()
+                        perf_calibration: poot_target::calibration::Calibrated::Portable,
+                        ..wgpu
                     },
                 },
             ),
             (
                 "cuda",
+                Target::Gpu {
+                    backend: Backend::Nvptx,
+                    caps: DeviceCaps {
+                        perf_calibration: poot_target::calibration::Calibrated::SM_120,
+                        ..DeviceCaps::ptx_default()
+                    },
+                },
+            ),
+            (
+                "cuda-portable",
                 Target::Gpu {
                     backend: Backend::Nvptx,
                     caps: DeviceCaps::ptx_default(),
@@ -851,7 +877,7 @@ mod tests {
             let Target::Gpu { caps, .. } = target else {
                 unreachable!("every target is a GPU");
             };
-            let cap = caps.gemm_launch().packed_gemv_max_run as usize;
+            let cap = caps.gemm_launch().calibrated.figures().packed_gemv_max_run as usize;
             for format in packed_gemv_formats() {
                 let what = format!("{class} {format:?}");
                 let run = planned_gemv_run(format, target) as usize;
@@ -909,7 +935,16 @@ mod tests {
             ),
         ] {
             assert_eq!(planned[&("hsa", format)], run, "hsa {format:?}");
+            assert_eq!(planned[&("vulkan", format)], run, "vulkan {format:?}");
             assert_eq!(planned[&("cuda", format)], run.min(16), "cuda {format:?}");
+            // An unmeasured device plans the portable run whatever runtime drives it, Vulkan included.
+            for portable in ["vulkan-portable", "cuda-portable"] {
+                assert_eq!(
+                    planned[&(portable, format)],
+                    run.min(8),
+                    "{portable} {format:?}"
+                );
+            }
         }
     }
 

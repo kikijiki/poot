@@ -5,7 +5,7 @@ use super::{
     BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, ImportedKernel,
     KernelRequest, OpKind, PlanError, Planned, ValueId, WeightLayout, kg, matmul, value_ids,
 };
-use crate::dtype_widen::{Bf16ConstLane, ConstLanes};
+use crate::dtype_widen::ConstLanes;
 use crate::planner::{GraphTables, StorageDtypes, finalize};
 use crate::predicates::dense_decode_gemv_in;
 use crate::refusal::Site;
@@ -44,15 +44,6 @@ fn is_dense_contraction(op: &OpKind) -> bool {
                 ..
             }
     )
-}
-
-/// The storage a dense contraction reads its BF16 weight (operand 1) in: f16 words when the storage plan rounds
-/// the const to f16 at bind (POOT-1458, [`Bf16ConstLane::F16`]), else the packed bf16 words (Card 1024).
-fn bf16_weight_storage(const_lanes: &ConstLanes) -> StorageKind {
-    match const_lanes.lane(1) {
-        Some(Bf16ConstLane::F16) => StorageKind::F16Packed,
-        _ => StorageKind::Bf16Packed,
-    }
 }
 
 /// Plan one packed-reader equation (DenseContraction/DenseRowGather).
@@ -114,14 +105,14 @@ pub(super) fn plan(
         // (the only portable BF16 read on wgpu, where SPIR-V rejects `Ty::BF16`; the ROCm and PTX typed walks
         // upload the same lanes), widened in-register, so the device buffer stays at two bytes per element.
         // Its storage is the BF16 const rule ([`value_storage_kind`]), so a BF16 weight may have other readers.
-        // POOT-1458: a BF16 weight whose every reader multiplies it in f16 is rounded to f16 once at bind instead
-        // (the lane `bf16_weight_storage` reads), and the body stages it as stored.
+        // POOT-1477: under the narrow policy the driver declares a weight only dense readers use F16
+        // (`store_weights_f16`), so it takes the F16 arm above: the bind rounds it to f16 once.
         OpKind::DenseContraction {
             weight: dtype @ (DType::F32 | DType::F16 | DType::BF16),
             ..
         } => {
             let kind = match dtype {
-                DType::BF16 => bf16_weight_storage(const_lanes),
+                DType::BF16 => StorageKind::Bf16Packed,
                 _ => match dense_contraction_weight_storage(*dtype) {
                     Some(kind) => kind,
                     None => return Err(site.refuse(Capability::DtypeLowering)),
@@ -168,7 +159,7 @@ pub(super) fn plan(
             region,
         } => {
             let storage = match dtype {
-                DType::BF16 => bf16_weight_storage(const_lanes),
+                DType::BF16 => StorageKind::Bf16Packed,
                 dtype => dense_contraction_weight_storage(*dtype)
                     .ok_or_else(|| site.refuse(Capability::DtypeLowering))?,
             };
@@ -228,16 +219,20 @@ pub(super) fn plan(
             }
         }
         // The grouped contraction (`fold_dense_contractions`' `[0, 2, 1]` spelling): `groups` independent
-        // `[M, K] x [N, K]^T` products over row blocks of one `[groups * N, K]` weight, in packed-BF16 storage
-        // (the only dtype with grouped rows). That is the register-tiled GEMM's block-diagonal form: group `g`'s
+        // `[M, K] x [N, K]^T` products over row blocks of one `[groups * N, K]` weight, in packed storage (BF16, or
+        // the F16 `store_weights_f16` declares). That is the register-tiled GEMM's block-diagonal form: group `g`'s
         // rows read weight rows `g * N ..`, so it takes the same body as the plain dense contraction.
         OpKind::GroupedDenseContraction {
-            weight: DType::BF16,
+            weight: dtype @ (DType::BF16 | DType::F16),
             groups,
             ..
         } => {
             let k = shape(ids[1])[1];
-            let weight = ValueStorage::new(bf16_weight_storage(const_lanes)).buffer_storage();
+            let kind = match dtype {
+                DType::BF16 => StorageKind::Bf16Packed,
+                _ => StorageKind::F16Packed,
+            };
+            let weight = ValueStorage::new(kind).buffer_storage();
             matmul::dense_tiled_plan(
                 site,
                 backend,
@@ -287,6 +282,15 @@ pub(super) fn plan(
             source: DType::BF16,
         } => Planned::imported(
             ImportedKernel::PackedBf16RowGather,
+            backend,
+            None,
+            [out_numel as u32, 1, 1],
+        )?,
+        // POOT-1477: the same gather over the packed-f16 table `store_weights_f16` declares for an embedding the
+        // driver stores as f16 (two binary16 elements per lane, the layout of a dense F16 weight). Its row
+        // values are the converted weight's, so the embedding and a tied head read one buffer.
+        OpKind::DenseRowGather { source: DType::F16 } => Planned::imported(
+            ImportedKernel::PackedF16RowGather,
             backend,
             None,
             [out_numel as u32, 1, 1],

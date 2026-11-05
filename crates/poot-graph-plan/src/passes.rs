@@ -43,6 +43,7 @@ mod routed_experts;
 mod selection;
 mod sharding;
 pub(crate) mod stage_split;
+mod weight_format;
 mod widen;
 
 /// `g` with its equations replaced by `eqns`, checked through the edit API: the one way a pass that
@@ -122,6 +123,7 @@ pub use sharding::{ShardError, ShardRule, ShardedGraph, shard};
 pub use stage_split::BoundaryDescriptor;
 pub use stage_split::StageSplitError;
 pub(crate) use stage_split::{CutSite, StageAssignment, split_stages};
+pub(crate) use weight_format::{store_weights_f16, weights_are_f16};
 pub(crate) use widen::{fuse_index_casts, fuse_widening_casts};
 
 /// The graph-to-graph passes alone, in the order [`crate::compile`]'s pipeline runs them, without

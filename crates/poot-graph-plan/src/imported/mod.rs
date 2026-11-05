@@ -171,6 +171,8 @@ pub enum ImportedKernel {
     // packed.rs
     /// Axis-0 embedding gather over a dense BF16 table read as packed `u32` lanes, widened to F32 in the kernel.
     PackedBf16RowGather,
+    /// Axis-0 embedding gather over a dense F16 table read as packed `u32` lanes, widened to F32 in the kernel.
+    PackedF16RowGather,
     /// The `Cast(BF16 -> F32)` of a BF16 const read from its packed `u32` lanes.
     PackedBf16ToF32,
     /// Axis-0 embedding gather over a dense E4M3FN table read as packed `u32` lanes, widened to F32 in the kernel.

@@ -725,6 +725,82 @@ fn a_grouped_bf16_projection_plans_one_grouped_dense_contraction_and_no_transpos
     }
 }
 
+/// POOT-1477: under the narrow policy the driver stores a grouped projection's BF16 weight as f16 like any dense
+/// weight: the contraction is the F16 grouped one over a weight declared F16 over the BF16 checkpoint, and the
+/// register-tiled body reads the packed f16 lane the weight value is planned in, on the devices with an f16 unit.
+///
+/// Mutation: in `planner/packed.rs` plan the grouped F16 arm's weight as `StorageKind::Bf16Packed`; the request
+/// and the weight value disagree and this row goes red.
+#[test]
+fn a_grouped_bf16_projection_is_declared_f16_under_narrow() {
+    let is_grouped_f16 = |op: &OpKind| {
+        matches!(
+            op,
+            OpKind::GroupedDenseContraction {
+                weight: DType::F16,
+                groups: GROUPS,
+                ..
+            }
+        )
+    };
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+        .with_matmul_precision(MatmulPrecision::Narrow);
+    // The devices whose matrix units report an f16 fragment: RADV, and ROCm with the gfx11 WMMA lowering.
+    let mut rocm = DeviceCaps::rocm_default();
+    rocm.matrix_units = poot_target::Queried::Known(poot_target::MatrixUnits::amd("gfx1151", 32));
+    rocm.subgroup = poot_target::Queried::Known(poot_target::SubgroupSupport::Present {
+        min_size: 32,
+        max_size: 32,
+    });
+    let targets = [
+        (Backend::SpirvVulkan, target(Backend::SpirvVulkan)),
+        (
+            Backend::AmdGcn(AmdArch::gfx1151()),
+            Target::Gpu {
+                backend: Backend::AmdGcn(AmdArch::gfx1151()),
+                caps: rocm,
+            },
+        ),
+    ];
+    for (backend, target) in targets {
+        for m in [1, 33] {
+            let program = compile(&grouped_projection(m, |_, _, y| y), &target, &options)
+                .expect("the graph compiles");
+            let label = format!("{backend:?} M={m}: {:?}", op_names(&program));
+            assert_eq!(count(&program, is_grouped_f16), 1, "{label}");
+            let (eqn, _) = program
+                .planned()
+                .find(|(eqn, _)| is_grouped_f16(&eqn.op))
+                .expect("the contraction is planned");
+            let Operand::Value(weight) = eqn.inputs[1] else {
+                panic!("the weight operand is a value");
+            };
+            let meta = program.graph().meta(weight);
+            assert_eq!(
+                (meta.aval.dtype, meta.stored_dtype()),
+                (DType::F16, DType::BF16),
+                "{label}"
+            );
+            match request(&program, is_grouped_f16) {
+                KernelRequest::Contraction(ContractionSpec::DenseTiled(
+                    DenseTiledContraction {
+                        weight: DenseTiledWeight::Nk(named),
+                        ..
+                    },
+                )) => {
+                    assert_eq!(*named, BufferStorage::f16_packed(), "{label}");
+                    assert_eq!(
+                        *named,
+                        program.storage().storage(weight).buffer_storage(),
+                        "{label}: the request and the weight value share one storage"
+                    );
+                }
+                other => panic!("{label}: expected the register-tiled body, got {other:?}"),
+            }
+        }
+    }
+}
+
 /// POOT-1048: the blocked weight is a real value when something else reads it (here a reduction), so the fold
 /// leaves the `Reshape`, `Transpose` and `MatMul` as traced instead of dropping a reshape a second reader needs.
 ///
@@ -824,13 +900,13 @@ fn a_grouped_weight_that_is_not_bf16_keeps_the_traced_chain() {
 
 /// POOT-1241: `infer` types a grouped contraction over any arithmetic float weight, so a target that has no
 /// grouped body for the weight's dtype says so as a typed `DtypeLowering` refusal naming the equation (the
-/// planner's capability to refuse), not by `infer` rejecting a graph that is well typed.
+/// planner's capability to refuse), not by `infer` rejecting a graph that is well typed. F16 has grouped rows
+/// since POOT-1477 (the f16 a BF16 grouped weight is stored as); F32 has none.
 ///
-/// Mutation: make the planner's grouped arm plan any weight dtype as BF16; the F32 and F16 rows compile and
-/// go red.
+/// Mutation: make the planner's grouped arm plan any weight dtype as BF16; the F32 row compiles and goes red.
 #[test]
 fn a_grouped_contraction_over_a_weight_without_grouped_rows_is_a_typed_refusal() {
-    for weight in [DType::F32, DType::F16] {
+    for weight in [DType::F32] {
         let b = Builder::for_tests();
         let x = b
             .constant("x", TensorType::f32(vec![GROUPS, 4, K]))

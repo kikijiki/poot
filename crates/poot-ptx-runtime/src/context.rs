@@ -98,6 +98,7 @@ fn measure_device_caps(dev: sys::CUdevice) -> Result<poot_target::DeviceCaps, Pt
             max_threads_per_block: attr(Attr::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?,
             warp_size: attr(Attr::CU_DEVICE_ATTRIBUTE_WARP_SIZE)?,
             compute_capability_major: attr(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?,
+            compute_capability_minor: attr(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?,
             multiprocessor_count: attr(Attr::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
         },
     ))
@@ -112,6 +113,7 @@ struct CudaAttributes {
     max_threads_per_block: u32,
     warp_size: u32,
     compute_capability_major: u32,
+    compute_capability_minor: u32,
     multiprocessor_count: u32,
 }
 
@@ -148,7 +150,10 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
             attrs.compute_capability_major,
         )
         .known(),
-        launch_class: poot_target::calibration::LaunchClass::Cuda,
+        perf_calibration: poot_target::calibration::Calibrated::of_cuda_compute_capability(
+            attrs.compute_capability_major,
+            attrs.compute_capability_minor,
+        ),
     }
 }
 
@@ -1060,6 +1065,7 @@ mod caps_tests {
             max_threads_per_block: 88,
             warp_size: 16,
             compute_capability_major,
+            compute_capability_minor: 0,
             multiprocessor_count: 99,
         }
     }
@@ -1116,6 +1122,29 @@ mod caps_tests {
             caps_from_attributes(1, &sentinel(9)).decode_gemv_max_out_cols,
             None
         );
+    }
+
+    /// POOT-1486: a device's performance figures follow its compute capability: the one measured part (sm_120)
+    /// is a measured entry and every other capability, minor versions included, plans with the portable prior.
+    /// Mutation: key on the major version alone; the sm_121 row reads `Measured`.
+    #[test]
+    fn performance_figures_follow_the_compute_capability() {
+        use poot_target::calibration::Calibrated;
+        let calibrated = |major, minor| {
+            let attrs = CudaAttributes {
+                compute_capability_minor: minor,
+                ..sentinel(major)
+            };
+            caps_from_attributes(1, &attrs).perf_calibration
+        };
+        assert_eq!(calibrated(12, 0), Calibrated::SM_120);
+        for (major, minor) in [(8, 0), (9, 0), (12, 1)] {
+            assert_eq!(
+                calibrated(major, minor),
+                Calibrated::Portable,
+                "sm_{major}{minor}"
+            );
+        }
     }
 
     /// A pre-Ampere device is a confirmed absence of the fragments poot's kernels use.

@@ -385,7 +385,7 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
                 widens_bf16_decode_weight: false,
                 peer_transport: false,
                 decode_gemv_max_out_cols: None,
-                launch_class: poot_target::calibration::LaunchClass::Vulkan,
+                perf_calibration: poot_target::calibration::Calibrated::Portable,
             },
             memory_budget: false,
             pipeline_cache: HashMap::new(),

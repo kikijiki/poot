@@ -123,7 +123,7 @@ impl Context {
             widens_bf16_decode_weight: false,
             peer_transport: false,
             decode_gemv_max_out_cols: None,
-            launch_class: poot_target::calibration::LaunchClass::Vulkan,
+            perf_calibration: self.perf_calibration,
         }
     }
 
@@ -216,6 +216,14 @@ impl Context {
         } else {
             poot_target::Queried::Unknown
         };
+        let perf_calibration = if adapter_info.backend == wgpu::Backend::Vulkan {
+            poot_target::calibration::Calibrated::of_vulkan_device(
+                adapter_info.vendor,
+                &adapter_info.name,
+            )
+        } else {
+            poot_target::calibration::Calibrated::Portable
+        };
         let effective_max_buffer_size = calibration
             .known()
             .and_then(|c| c.safe_max_buffer_bytes)
@@ -302,6 +310,7 @@ impl Context {
             compute_units,
             memory_budget_bytes: None,
             calibration,
+            perf_calibration,
             shader_features,
             pipelines: RefCell::new(HashMap::new()),
             pipeline_builds: Default::default(),

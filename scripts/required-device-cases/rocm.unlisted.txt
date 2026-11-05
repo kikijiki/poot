@@ -9,6 +9,7 @@ poot-rocm-device::pcie_receipt	pcie_receipt_without_the_env_reaches_the_device_c
 poot-rocm-runtime	context::caps_tests::a_failed_query_stays_unknown_not_a_guessed_default	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	context::caps_tests::a_gfx11_agent_reports_its_register_file	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	context::caps_tests::agent_values_come_out_in_their_own_caps_fields	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
+poot-rocm-runtime	context::caps_tests::an_agents_performance_figures_follow_its_gfx_code	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	host_memory::tests::a_host_below_its_floor_leaves_the_device_nothing	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	host_memory::tests::a_meminfo_without_a_readable_mem_available_is_none	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`
 poot-rocm-runtime	host_memory::tests::a_pool_below_the_host_bound_stands	ROCm runtime row against the mock HSA driver or host arithmetic; drives no device, and runs under `just test`

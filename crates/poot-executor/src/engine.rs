@@ -2184,13 +2184,14 @@ impl<D: Device> Engine<D> {
             StoredAs::PackedSource | StoredAs::PackedStackSource { .. }
         );
         if let StoredAs::Dense(dtype) = bytes.stored {
-            // The plan never retypes a const, so any stored/declared difference is the tracer's and
+            // The graph declares the checkpoint's dtype for the weight, or states the one conversion the bind
+            // performs ([`ValueMeta::stored_dtype`]); any other stored/declared difference is the tracer's and
             // is refused.
-            if dtype != aval.dtype {
+            if dtype != meta.stored_dtype() {
                 return Err(LoadError::WeightDtype {
                     name: name.to_string(),
                     stored: dtype,
-                    declared: aval.dtype,
+                    declared: meta.stored_dtype(),
                 }
                 .into());
             }
@@ -4776,6 +4777,129 @@ mod f16_packed_weight_upload_tests {
         engine.add_entry(exe, &program)
     }
 
+    const VOCAB: usize = 11;
+
+    /// A tied language-model head over one stored tensor `t`: the embedding gathered by token and the head
+    /// contraction over `h`, both ids viewing `t` (so the planner keeps the embedding a device constant, an
+    /// untied one would be hosted), compiled under `precision` and added as an entry. Returns the engine's
+    /// weight allocations.
+    fn add_tied_head(
+        bits: &[u16],
+        precision: MatmulPrecision,
+    ) -> Result<Vec<(BufferStorage, usize)>, ExecError> {
+        let embed = WeightId::model(WeightRole::Embed);
+        let head = WeightId::model(WeightRole::Head);
+        let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let mut store = WeightStore::builder();
+        store
+            .insert(
+                "t",
+                WeightEntry::Dense(
+                    DenseWeight::try_new(DType::BF16, vec![VOCAB, K], StoredBytes::from(bytes))
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        let store = Arc::new(store.build());
+        let mut map = WeightMap::builder(&store);
+        for id in [embed, head] {
+            map.map(id, WeightView::Stored("t".into())).unwrap();
+        }
+        let map = map.build();
+        let b = Builder::for_tests();
+        let table = b
+            .weight(
+                poot_graph_ir::WeightRef::whole(embed),
+                TensorType::new(vec![VOCAB, K], DType::BF16),
+            )
+            .unwrap();
+        let tied = b
+            .weight(
+                poot_graph_ir::WeightRef::whole(head),
+                TensorType::new(vec![VOCAB, K], DType::BF16),
+            )
+            .unwrap();
+        let token = b
+            .slot(
+                poot_graph_ir::Slot::Token,
+                TensorType::new(vec![4], DType::I32),
+            )
+            .unwrap();
+        let h = b
+            .cast(b.gather(table, 0, token).unwrap(), DType::F32)
+            .unwrap();
+        let logits = b.matmul(h, b.transpose(tied, vec![1, 0]).unwrap()).unwrap();
+        let g = b.finish(logits).unwrap();
+        let mut engine = Engine::new(UploadRecorder::default());
+        let program = compile_staged(
+            &g,
+            &TargetSet::single(DeviceId(0), engine.device().target()),
+            &Partition {
+                experts: ExpertPlacement::AllResident,
+                devices: DevicePlacement::Single(DeviceId(0)),
+            },
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(precision)
+                .with_aliases(map.aliases()),
+        )
+        .expect("the tied head compiles");
+        let exe = engine.load_weights(store, Arc::new(map))?;
+        engine.add_entry(exe, &program)?;
+        Ok(engine
+            .device
+            .allocations
+            .iter()
+            .filter(|(role, ..)| *role == BufferRole::Weight)
+            .map(|&(_, storage, elems)| (storage, elems))
+            .collect())
+    }
+
+    /// bf16 words spread over f16's normal and subnormal ranges, both signs.
+    fn tied_bits() -> Vec<u16> {
+        (0..VOCAB * K)
+            .map(|i| (0x3300 + 0x23 * i as u16) | ((i as u16 & 1) << 15))
+            .collect()
+    }
+
+    /// POOT-1477 (design section 2.5): a tied embedding and head are one stored tensor and the driver gives it one
+    /// format, so the device holds one copy: under the narrow policy the single weight allocation is the packed f16
+    /// lane, and its size is the exact program's bf16 one (the same number of two-byte elements). Before the driver
+    /// decided once, the head took the f16 lane while the embedding's gather kept bf16 words, and the aliased
+    /// bytes uploaded twice (0.78 GB on qwen3-4b). Mutation: in `passes/weight_format.rs` make
+    /// `reads_as_dense_weight` refuse a `DenseRowGather`; the embedding keeps bf16, two lanes upload, and this row
+    /// goes red.
+    #[test]
+    fn a_tied_embedding_and_head_upload_one_f16_copy_the_size_of_the_exact_one() {
+        let narrow = add_tied_head(&tied_bits(), MatmulPrecision::Narrow).expect("the entry loads");
+        let exact = add_tied_head(&tied_bits(), MatmulPrecision::Exact).expect("the entry loads");
+        let words = (VOCAB * K).div_ceil(2);
+        assert_eq!(narrow, vec![(BufferStorage::f16_packed(), words)]);
+        assert_eq!(exact, vec![(BufferStorage::bf16_packed(), words)]);
+    }
+
+    /// POOT-1477: the tied tensor's range is checked once, at the one upload, whichever reader binds it first: an
+    /// element past f16's range (bf16 65536) is a typed refusal, not an infinity in the embedding rows. Mutation:
+    /// drop the range scan in `WeightWriter::read_stream`; the entry loads and this row goes red.
+    #[test]
+    fn a_tied_tensor_past_the_f16_range_is_refused_at_the_one_upload() {
+        let mut bits = tied_bits();
+        bits[9] = 0x4780; // +65536
+        match add_tied_head(&bits, MatmulPrecision::Narrow) {
+            Err(ExecError::Load(error)) => assert!(
+                matches!(
+                    *error,
+                    LoadError::WeightPastF16Range {
+                        index: 9,
+                        bits: 0x4780,
+                        ..
+                    }
+                ),
+                "{error}"
+            ),
+            other => panic!("expected WeightPastF16Range, got {other:?}"),
+        }
+    }
+
     /// `RssFile` of this process in bytes: the file-backed pages (a mapped checkpoint's) in its page tables.
     fn rss_file_bytes() -> u64 {
         let status = std::fs::read_to_string("/proc/self/status").unwrap();
@@ -5176,7 +5300,7 @@ mod f16_packed_weight_upload_tests {
     /// POOT-1458 (design section 4): a BF16 weight whose contraction multiplies in f16 is planned in the f16 lane
     /// and uploaded rounded to nearest even f16, once, at bind: one packed-f16 buffer of `ceil(N * K / 2)` words
     /// holding each element's f16 bits, and no packed-bf16 copy. The same weight under `Exact` keeps its bf16
-    /// words. Mutation: make `bf16_const_lane` never take `Bf16ConstLane::F16`; the weight uploads as packed bf16
+    /// words. Mutation: make `store_weights_f16` return its graph unchanged; the weight uploads as packed bf16
     /// and this row goes red.
     #[test]
     fn a_bf16_weight_of_an_f16_contraction_uploads_rounded_to_f16_once() {

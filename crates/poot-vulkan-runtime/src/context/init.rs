@@ -292,6 +292,10 @@ impl Context {
             poot_target::calibration::Calibration::of_vulkan_device(props.vendor_id, &device_name)
                 .known()
                 .unwrap_or(poot_target::calibration::Calibration::UNMEASURED);
+        // The performance figures follow the same identity: Strix Halo is measured, any other device plans with
+        // the portable prior and the plan records it.
+        let perf_calibration =
+            poot_target::calibration::Calibrated::of_vulkan_device(props.vendor_id, &device_name);
         let max_buffer_bytes = calibration
             .safe_max_buffer_bytes
             .map_or(measured_max_buffer, |safe| measured_max_buffer.min(safe));
@@ -368,7 +372,7 @@ impl Context {
             widens_bf16_decode_weight: false,
             peer_transport: false,
             decode_gemv_max_out_cols: None,
-            launch_class: poot_target::calibration::LaunchClass::Vulkan,
+            perf_calibration,
         };
 
         Ok(Context {

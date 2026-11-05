@@ -72,6 +72,15 @@ fn wgpu_device_caps_matches_a_direct_adapter_query() {
         "max_buffer_bytes must be the queried device max, RADV-capped where applicable"
     );
 
+    // The performance figures follow the device's identity (Strix Halo measured, any other Vulkan device and every
+    // non-Vulkan adapter on the portable prior), re-derived from the independently queried adapter.
+    let expected_calibration = if info.backend == wgpu::Backend::Vulkan {
+        poot_target::calibration::Calibrated::of_vulkan_device(info.vendor, &info.name)
+    } else {
+        poot_target::calibration::Calibrated::Portable
+    };
+    assert_eq!(caps.perf_calibration, expected_calibration);
+
     // The matrix units are measured from `VK_KHR_cooperative_matrix` (via wgpu's own adapter-level
     // query), never parsed from the adapter's device-name string (card 522 review). Re-derive
     // independently from a fresh adapter query so hardcoded units would disagree.

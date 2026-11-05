@@ -247,6 +247,12 @@ test-model-free-inventory-regen:
 test-plan-summary-regen:
     POOT_PLAN_SUMMARY_REGEN=1 cargo nextest run -p poot-models --test plan_summary plan_digests_match_the_checked_in_file
 
+# rewrite crates/poot-models/tests/launch_census/real_dims.tsv (every contraction and attention schedule the
+# reference models plan at real dimensions, per target); a card that changes launch geometry runs this, reads
+# `git diff` of the file and lists every changed row in its landing note
+test-launch-census-regen:
+    POOT_LAUNCH_CENSUS_REGEN=1 cargo nextest run -p poot-models --test launch_census the_launch_census_matches_the_checked_in_file
+
 # rewrite the generated region of website/docs/develop/supported-models.md from what `compile` says about every
 # registered family's fixture graphs and every weight format on each reference target. The supported_models test
 # fails when the page differs from the generator, so a planner or registry change that moves a cell runs this.

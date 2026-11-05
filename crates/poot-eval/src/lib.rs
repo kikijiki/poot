@@ -17,6 +17,8 @@ pub mod observer;
 mod weight_store;
 
 pub use weight_store::{MaterializeError, materialize_dense};
+#[cfg(any(test, feature = "test-support"))]
+pub use weight_store::{declared_weight, materialize_declared};
 
 pub use exact_bf16::ExactBf16Error;
 pub use ops::precision::round_to_fragment;

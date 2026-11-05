@@ -5,7 +5,7 @@
 //! and used only as a `dev-dependency`, so Cargo structurally prevents this from ever reaching a
 //! production build.
 
-use poot_target::calibration::{Calibration, LaunchClass};
+use poot_target::calibration::{Calibrated, Calibration};
 use poot_target::dram_channels::DramChannels;
 use poot_target::{
     AMD_RADV_SAFE_MAX_BUFFER_BYTES, Backend, CooperativeMatrixConfig, DeviceCaps, E4m3Storage,
@@ -28,6 +28,7 @@ pub fn default_caps_for(backend: Backend) -> DeviceCaps {
                 max_size: arch.wave,
             }),
             dram_channels: DramChannels::of_device_name(arch.mcpu()),
+            perf_calibration: Calibrated::of_hsa_arch(arch),
             ..DeviceCaps::rocm_default()
         },
         Backend::Nvptx => DeviceCaps::ptx_default(),
@@ -77,7 +78,7 @@ pub fn wgpu_rdna3_igpu() -> DeviceCaps {
         widens_bf16_decode_weight: false,
         peer_transport: false,
         decode_gemv_max_out_cols: None,
-        launch_class: LaunchClass::Vulkan,
+        perf_calibration: Calibrated::STRIX_HALO,
     }
 }
 

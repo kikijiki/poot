@@ -107,9 +107,7 @@ fn check_bf16_const_reads(
                 continue;
             }
             let lane = storage.storage(root).buffer_storage();
-            let want = if lane == poot_target::BufferStorage::bf16_packed()
-                || lane == poot_target::BufferStorage::f16_packed()
-            {
+            let want = if lane == poot_target::BufferStorage::bf16_packed() {
                 poot_kernel_ir::Ty::U32
             } else {
                 poot_kernel_ir::Ty::BF16
@@ -159,27 +157,43 @@ pub(crate) fn dense_contraction_weight_storage(dtype: DType) -> Option<StorageKi
     }
 }
 
-/// Every dense-contraction weight whose planned storage differs from its dtype's dense default (a packed F16
-/// weight, Card 1007), with that storage. A buffer has one storage, so such a weight must be a non-escaping const
-/// that dense contractions are the only readers of, at their weight operand, all in that same storage: anything
-/// else is [`PlanError::UnrepresentableValue`] with [`StorageGap::F16PackedLanes`], naming the value. The fold
-/// (`fold_dense_contractions`) only produces F16 contractions that satisfy this, so a refusal here is a graph
-/// some other path built.
+/// The value an equation reads as a dense weight or embedding table whose planned storage differs from its
+/// dtype's dense default (a packed F16 weight, Card 1007; the F16 table of a row gather, POOT-1477), with the
+/// operand position it reads it at and that storage.
+fn packed_weight_read(eqn: &Eqn) -> Option<(ValueId, usize, StorageKind)> {
+    let (dtype, position) = match &eqn.op {
+        OpKind::DenseRowGather { source } => (*source, 0),
+        op => (op.dense_weight()?, 1),
+    };
+    let Some(Operand::Value(value)) = eqn.inputs.get(position) else {
+        return None;
+    };
+    dense_contraction_weight_storage(dtype)
+        .filter(|&kind| kind != StorageKind::Dense(dtype))
+        .map(|kind| (*value, position, kind))
+}
+
+/// Every dense-contraction weight and row-gather table whose planned storage differs from its dtype's dense
+/// default (a packed F16 weight, Card 1007), with that storage. A buffer has one storage, so such a weight must be
+/// a non-escaping const that dense contractions and row gathers are the only readers of, at their weight or table
+/// operand, all in that same storage: anything else is [`PlanError::UnrepresentableValue`] with
+/// [`StorageGap::F16PackedLanes`], naming the value. The fold (`fold_dense_contractions`) and
+/// `store_weights_f16` only produce F16 readers that satisfy this, so a refusal here is a graph some other path
+/// built.
 fn dense_contraction_weight_storages(
     g: &Graph,
 ) -> Result<HashMap<ValueId, StorageKind>, PlanError> {
-    let reads = |eqn: &Eqn| match (eqn.op.dense_weight(), eqn.inputs.get(1)) {
-        (Some(weight), Some(Operand::Value(value))) => dense_contraction_weight_storage(weight)
-            .filter(|&kind| kind != StorageKind::Dense(weight))
-            .map(|kind| (*value, kind)),
-        _ => None,
-    };
-    let weights: HashMap<ValueId, StorageKind> = g.eqns().iter().filter_map(reads).collect();
+    let weights: HashMap<ValueId, StorageKind> = g
+        .eqns()
+        .iter()
+        .filter_map(packed_weight_read)
+        .map(|(value, _, kind)| (value, kind))
+        .collect();
     for (&value, &kind) in &weights {
         let sole_reader = g.eqns().iter().all(|eqn| {
             eqn.inputs.iter().enumerate().all(|(position, operand)| {
                 !matches!(operand, Operand::Value(read) if *read == value)
-                    || (position == 1 && reads(eqn) == Some((value, kind)))
+                    || packed_weight_read(eqn) == Some((value, position, kind))
             })
         });
         if g.meta(value).storage != Storage::Const
@@ -314,8 +328,7 @@ fn slice_elem(ty: &poot_kernel_ir::Ty) -> Option<&poot_kernel_ir::Ty> {
 
 /// One value's storage kind. A value keeps its declared dtype, densely stored, except a BF16 const: it is never
 /// widened (Card 1011), it is BF16 on every backend, and [`bf16_const_lane`] decides whether the buffer is packed
-/// two-per-`u32` word, native two-byte bf16, or f16 converted at bind and packed (POOT-1458), the one answer the
-/// planners read too.
+/// two-per-`u32` word or native two-byte bf16, the one answer the planners read too.
 fn value_storage_kind(
     g: &Graph,
     views: &HashMap<ValueId, Layout>,
@@ -328,7 +341,6 @@ fn value_storage_kind(
     }
     match bf16_const_lane(g, views, id, target) {
         Bf16ConstLane::Packed => StorageKind::Bf16Packed,
-        Bf16ConstLane::F16 => StorageKind::F16Packed,
         Bf16ConstLane::Native => StorageKind::Dense(DType::BF16),
     }
 }

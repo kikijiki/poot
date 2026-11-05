@@ -694,6 +694,10 @@ pub(crate) fn caps_from_agent(probe: &AgentProbe<'_>) -> poot_target::DeviceCaps
         // 0 is the failed one-time pool query: unknown, not an empty device.
         memory_budget_bytes: (probe.vram_total_bytes != 0).then_some(probe.vram_total_bytes),
         dram_channels: poot_target::dram_channels::DramChannels::of_device_name(probe.isa_name),
+        perf_calibration: arch.map_or(
+            poot_target::calibration::Calibrated::Portable,
+            poot_target::calibration::Calibrated::of_hsa_arch,
+        ),
         ..defaults
     }
 }
@@ -774,6 +778,38 @@ mod caps_tests {
             Queried::Unknown,
             "a wave64 CDNA part's file is not recorded"
         );
+    }
+
+    /// POOT-1486: the agent's gfx code is the identity its performance figures follow: gfx1151 is the measured
+    /// Strix Halo entry and any other part, or an agent whose ISA name carries no gfx code, plans with the
+    /// portable prior. Mutation: resolve `Calibrated::STRIX_HALO` for every agent; the gfx90a row fails.
+    #[test]
+    fn an_agents_performance_figures_follow_its_gfx_code() {
+        let calibrated = |isa_name| {
+            caps_from_agent(&AgentProbe {
+                vram_total_bytes: 12_345,
+                isa_name,
+                wavefront: 32,
+                compute_units: Some(40),
+                limits: SENTINEL_LIMITS,
+            })
+            .perf_calibration
+        };
+        assert_eq!(
+            calibrated("amdgcn-amd-amdhsa--gfx1151"),
+            poot_target::calibration::Calibrated::STRIX_HALO
+        );
+        for other in [
+            "amdgcn-amd-amdhsa--gfx90a:sramecc+:xnack-",
+            "amdgcn-amd-amdhsa--gfx1100",
+            "unknown",
+        ] {
+            assert_eq!(
+                calibrated(other),
+                poot_target::calibration::Calibrated::Portable,
+                "{other}"
+            );
+        }
     }
 
     /// POOT-1447: a gfx1151 agent reports the full RDNA3 register file of its gfx code, which the planner sizes

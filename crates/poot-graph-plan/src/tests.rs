@@ -6380,7 +6380,7 @@ fn a_gemv_reads_activation_vectors_only_where_every_run_is_a_whole_aligned_group
 /// `try_plan_contraction`'s longest binding; the `[65536, 5120]` row goes red.
 #[test]
 fn the_planner_narrows_index_math_only_where_its_proof_holds_on_a_target_that_lowers_it() {
-    let packed_dispatch = |backend: Backend, n: usize, k: usize| -> Dispatch {
+    let packed_dispatch = |backend: Backend, caps: DeviceCaps, n: usize, k: usize| -> Dispatch {
         let builder = Builder::for_tests();
         let x = builder
             .slot_named(
@@ -6396,10 +6396,7 @@ fn the_planner_narrows_index_math_only_where_its_proof_holds_on_a_target_that_lo
             &builder, x, "layer", weight, None, None,
         )
         .unwrap();
-        let target = Target::Gpu {
-            backend,
-            caps: default_caps_for(backend),
-        };
+        let target = Target::Gpu { backend, caps };
         let program = compile(
             &builder.finish(out).unwrap(),
             &target,
@@ -6415,19 +6412,33 @@ fn the_planner_narrows_index_math_only_where_its_proof_holds_on_a_target_that_lo
             .unwrap_or_else(|| panic!("one Gemv dispatch, got {plan:?}"))
             .clone()
     };
-    // The generator's Gemv overshoot at the CUDA class's 256 lanes and 16-element run.
-    let gemv_slack = 256 * 16 + 16 + 256 + 64;
-    let narrowed = packed_dispatch(Backend::Nvptx, 64, 256);
+    // The generator's Gemv overshoot at 256 lanes and a `run`-element lane run.
+    let gemv_slack = |run: u32| 256 * run + run + 256 + 64;
+    // The measured part (sm_120) runs 16 elements per lane; an unmeasured NVIDIA part runs the portable 8.
+    let sm_120 = DeviceCaps {
+        perf_calibration: poot_target::calibration::Calibrated::SM_120,
+        ..default_caps_for(Backend::Nvptx)
+    };
+    let narrowed = packed_dispatch(Backend::Nvptx, sm_120, 64, 256);
     assert_eq!(
         narrowed.body().index_width,
         poot_kernel_ir::IndexWidth::U32(poot_kernel_ir::IndexBound {
             scale: 32,
-            slack: gemv_slack
+            slack: gemv_slack(16)
         }),
-        "Q4_K [64, 256] on NVPTX"
+        "Q4_K [64, 256] on sm_120"
+    );
+    let portable = packed_dispatch(Backend::Nvptx, default_caps_for(Backend::Nvptx), 64, 256);
+    assert_eq!(
+        portable.body().index_width,
+        poot_kernel_ir::IndexWidth::U32(poot_kernel_ir::IndexBound {
+            scale: 32,
+            slack: gemv_slack(8)
+        }),
+        "Q4_K [64, 256] on an unmeasured NVIDIA part"
     );
     assert!(narrowed.key().ends_with(":u32"), "{}", narrowed.key());
-    let wide = packed_dispatch(Backend::Nvptx, 65536, 8192);
+    let wide = packed_dispatch(Backend::Nvptx, sm_120, 65536, 8192);
     assert_eq!(
         wide.body().index_width,
         poot_kernel_ir::IndexWidth::Native,
@@ -6437,7 +6448,7 @@ fn the_planner_narrows_index_math_only_where_its_proof_holds_on_a_target_that_lo
     // 47.2 M words, 1.51 G bit offsets: its graph-shaped carrier is far longer than that, its binding is not.
     assert!(
         matches!(
-            packed_dispatch(Backend::Nvptx, 65536, 5120)
+            packed_dispatch(Backend::Nvptx, sm_120, 65536, 5120)
                 .body()
                 .index_width,
             poot_kernel_ir::IndexWidth::U32(_)
@@ -6446,7 +6457,9 @@ fn the_planner_narrows_index_math_only_where_its_proof_holds_on_a_target_that_lo
     );
     for backend in [Backend::SpirvVulkan, Backend::AmdGcn(AmdArch::gfx1151())] {
         assert_eq!(
-            packed_dispatch(backend, 64, 256).body().index_width,
+            packed_dispatch(backend, default_caps_for(backend), 64, 256)
+                .body()
+                .index_width,
             poot_kernel_ir::IndexWidth::Native,
             "Q4_K [64, 256] on {backend:?}"
         );

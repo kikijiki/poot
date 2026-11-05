@@ -952,6 +952,9 @@ pub fn compile(
             Some(dtype) => units.only(dtype),
             None => units,
         };
+        if transform::weights_are_f16(options.matmul_precision, units) {
+            pipeline.require("store_weights_f16", transform::store_weights_f16)?;
+        }
         pipeline.require("select_operand_precision", |g| {
             transform::select_operand_precision(g, options.matmul_precision, units)
         })?;

@@ -35,9 +35,8 @@ pub(crate) enum Encoding {
     /// Card 1007: as [`Encoding::PackedWords`], once every element is a finite binary16.
     PackedWordsFiniteF16,
     /// POOT-1458: BF16 elements, each rounded to nearest even binary16 ([`poot_quant::scalar::f32_to_f16`]),
-    /// packed as [`Encoding::PackedWords`]: the f16 lane of a BF16 weight whose contractions multiply in f16
-    /// (`poot-graph-plan`'s `Bf16ConstLane::F16`), once every element is inside f16's finite range. The value a
-    /// kernel staging the BF16 element would round it to, so the products are the same.
+    /// packed as [`Encoding::PackedWords`]: the f16 lane of a BF16 weight the graph declares F16
+    /// ([`poot_graph_ir::GraphEdit::convert_weight`], POOT-1477), once every element is inside f16's finite range.
     Bf16AsF16Words,
     /// POOT-1060: one-byte elements, each row of the last axis padded with zero bytes to a whole `u32` word.
     RowPaddedWords,

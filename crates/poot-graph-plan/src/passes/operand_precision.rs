@@ -15,7 +15,12 @@ use poot_graph_ir::op::{ContractionHead, OpKind};
 use poot_graph_ir::{FragmentDtype, KeyLayout, MatmulPrecision, OperandPrecision};
 use poot_target::{DeviceCaps, FragmentShape, MatrixUnits};
 
+#[cfg(any(test, feature = "test-support"))]
+use super::weight_format::{store_weights_f16, weights_are_f16};
+#[cfg(any(test, feature = "test-support"))]
 use crate::Target;
+#[cfg(any(test, feature = "test-support"))]
+use crate::dtype_widen::{fold_dense_bf16_row_gathers, fold_dense_contractions};
 use poot_tensor::DType;
 
 /// The matrix units a target reports (`DeviceCaps::matrix_units`), as the pass reads them: it takes a fragment
@@ -37,7 +42,7 @@ impl FragmentUnits {
         Self(MatrixUnits::of(self.0.config(dtype).cloned()))
     }
 
-    fn takes(self, dtype: FragmentDtype) -> bool {
+    pub(super) fn takes(self, dtype: FragmentDtype) -> bool {
         self.0
             .config(dtype)
             .is_some_and(|config| config.shape == FragmentShape::M16N16K16)
@@ -45,7 +50,7 @@ impl FragmentUnits {
 }
 
 /// `g` with every contraction and attention equation reading its operands as `policy` says on `target`: the
-/// graph `compile`'s `select_operand_precision` pass writes, before the passes that fold and fuse it. It is the
+/// graph `compile` hands the planner with the weight format and precision selected, before the passes that fuse it. It is the
 /// graph a CPU oracle evaluates to hold a device that compiled `g` under `policy` to the declared semantics (a
 /// program narrowed by the planner is compared with the oracle of the narrowed ops, not of the exact ones). A
 /// target with no matrix unit, or the policy `Exact`, returns `g` unchanged.
@@ -56,7 +61,17 @@ pub fn with_operand_precision(
     policy: MatmulPrecision,
 ) -> Result<Graph, EditError> {
     match target {
-        Target::Gpu { caps, .. } => select_operand_precision(g, policy, FragmentUnits::of(caps)),
+        Target::Gpu { caps, .. } => {
+            let units = FragmentUnits::of(caps);
+            // The weight format is a property of the folded graph (`compile` converts the weights the folds
+            // expose as dense readers), so the oracle's graph folds them the same way before it converts.
+            if weights_are_f16(policy, units) {
+                let folded = fold_dense_bf16_row_gathers(&fold_dense_contractions(g)?)?;
+                select_operand_precision(&store_weights_f16(&folded)?, policy, units)
+            } else {
+                select_operand_precision(g, policy, units)
+            }
+        }
         Target::Npu(_) => Ok(g.clone()),
     }
 }

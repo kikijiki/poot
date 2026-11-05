@@ -139,6 +139,10 @@ pub struct Context {
     /// the display watchdog, the tiled-GEMM ceiling and the safe buffer size are observed facts about one
     /// device, not something a device query answers, so `Unknown` for a device nobody measured.
     calibration: poot_target::Queried<poot_target::calibration::Calibration>,
+    /// Whether this device's performance figures were measured on it
+    /// ([`poot_target::calibration::Calibrated::of_vulkan_device`]); a non-Vulkan adapter plans with the portable
+    /// prior. Feeds [`Context::device_caps`].
+    perf_calibration: poot_target::calibration::Calibrated,
     /// The optional shader features the device was granted at open. Feeds [`Context::device_caps`].
     shader_features: poot_target::ShaderFeatures,
     /// G4: compute pipelines (shader module + bind-group layout + pipeline) bucketed by kernel key and

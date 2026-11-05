@@ -139,7 +139,23 @@ One driver-wide policy, `--matmul-precision exact|split|narrow`, decides what `c
 
 No operand is range-scaled. A value beyond f16's range (65504) rounds to infinity, the infinity reaches the logits as a non-finite value, and serving refuses that step with a typed error instead of sampling a token. `exact` avoids the rounding. Every checkpoint measured stays inside the range. One case stays finite: a model that softcaps its attention scores (Gemma 2) maps an infinite score to the cap, so an overflowed attention query there gives a wrong but finite row. That is a known limit of the default.
 
-The generated kernels round to f16 and widen from it with the device's own conversion instructions on ROCm and NVIDIA. On Vulkan they round with integer arithmetic on the f32 bits, because the driver may drop a convert-and-convert-back pair. Both forms give the same bits for every f32 value. A bf16 weight read only by contractions that multiply in f16 is rounded to f16 once, when it is bound, so the kernels read it as stored. A weight that f16 cannot hold (beyond 65504, an infinity or a NaN) is refused at bind with a typed error naming the weight and the element.
+The generated kernels round to f16 and widen from it with the device's own conversion instructions on ROCm and NVIDIA. On Vulkan they round with integer arithmetic on the f32 bits, because the driver may drop a convert-and-convert-back pair. Both forms give the same bits for every f32 value.
+
+The driver also stores its weights in one format. Under `narrow` on a target whose matrix units take f16, a bf16 weight that only dense contractions and embedding gathers read is declared f16 in the graph (the `store_weights_f16` pass). It is rounded to f16 once, when it is bound, so the kernels read it as stored and the oracle evaluates the same values.
+
+The decision reads three things and nothing else:
+
+- the policy;
+- the target's matrix units;
+- the kinds of a weight's readers, never a shape or the precision a reader plans.
+
+Three consequences follow:
+
+- Every program of a driver (prefill, decode) holds a weight in the same format.
+- A tied embedding and head share one stored tensor, so they upload one copy.
+- Any other bf16 weight (a norm scale, a router) keeps the checkpoint's format.
+
+A weight that f16 cannot hold (beyond 65504, an infinity or a NaN) is refused at bind with a typed error naming the weight and the element.
 
 ### Measured agreement of narrow with exact
 

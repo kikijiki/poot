@@ -13,6 +13,13 @@ kernel_assets! {
         params: 3,
         dest: GraphPlan,
     },
+    PackedF16RowGather {
+        name: "packed_f16_row_gather",
+        source: "packed_f16_row_gather",
+        entry: "__poot_kernel_packed_f16_row_gather",
+        params: 3,
+        dest: GraphPlan,
+    },
     PackedBf16ToF32 {
         name: "packed_bf16_to_f32",
         source: "packed_bf16_to_f32",

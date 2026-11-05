@@ -101,6 +101,7 @@ poot-vulkan-device::parity	select_is_bitwise_on_vulkan
 poot-vulkan-device::parity	selected_attention_reads_exactly_the_selected_blocks_on_vulkan
 poot-vulkan-device::parity	split_kv_decode_matches_the_oracle_on_vulkan
 poot-vulkan-device::parity	split_kv_decode_replay_equals_the_recording_step_on_vulkan
+poot-vulkan-device::parity	the_driver_weight_format_matches_the_declared_oracle_on_vulkan
 poot-vulkan-device::parity	tied_moe_routing_picks_the_lowest_index_first_on_vulkan
 poot-vulkan-device::parity	tiled_gemm_with_a_remainder_tile_matches_the_oracle_on_vulkan
 poot-vulkan-runtime	context::init::launch_caps_device_receipt::a_live_vulkan_device_reports_its_own_launch_limits

@@ -810,6 +810,17 @@ pub enum GraphValidationError {
         /// Its storage.
         storage: Storage,
     },
+    /// A weight is stored in a dtype the bind does not convert to the declared one: the only conversion is a BF16
+    /// checkpoint weight read as F16 ([`crate::GraphEdit::convert_weight`]).
+    #[error("{value} is stored as {stored:?} but declared {declared:?}; no such weight conversion")]
+    UnsupportedWeightConversion {
+        /// The value.
+        value: ValueId,
+        /// The dtype the checkpoint holds.
+        stored: DType,
+        /// The dtype the graph declares.
+        declared: DType,
+    },
     /// A `Positional` role names an axis past the value's rank.
     #[error(
         "state input {value} declares Positional axis {axis} out of range for rank-{rank} value"

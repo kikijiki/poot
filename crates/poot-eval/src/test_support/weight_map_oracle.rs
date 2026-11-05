@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{EvalOptions, Value, eval, materialize_dense};
+use crate::{EvalOptions, Value, eval, materialize_declared, materialize_dense};
 use poot_graph_ir::{Graph, PackedSourceName, SlotKey, Storage, ValueId};
 use poot_quant::weights::{WeightEntry, WeightStore};
 use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef};
@@ -111,7 +111,7 @@ pub fn eval_mapped(
 /// serves are `poot_models::test_support`'s. Weights bind from `store` by const name:
 /// a const named as a packed source ([`PackedSourceName`]) over a packed entry binds that entry's component
 /// of the named role, every other const the store entry as its stored dtype (an F16 or BF16 weight binds as
-/// its stored words). This is the one definition every backend's parity tests share.
+/// its stored words), converted where the graph declares a conversion ([`materialize_declared`]). This is the one definition every backend's parity tests share.
 pub fn oracle_for<'a>(
     graph: &'a Graph,
     store: &'a WeightStore,
@@ -150,7 +150,7 @@ pub fn oracle_for<'a>(
             let value = match meta.storage {
                 Storage::Const => match packed.get(&id) {
                     Some(component) => component.clone(),
-                    None => Value::from(materialize_dense(store, &meta.name().unwrap()).unwrap()),
+                    None => Value::from(materialize_declared(store, meta).unwrap()),
                 },
                 Storage::State => Value::from(
                     state
