@@ -185,7 +185,7 @@ fn witness_op(op: &OpKind) -> WitnessOp {
         | OpKind::ContractionEpilogue { .. }
         | OpKind::ArgTopK { .. }
         | OpKind::ExpertGroup { .. }
-        | OpKind::IndexedMatMul
+        | OpKind::IndexedMatMul { .. }
         | OpKind::DynamicUpdateSlice { .. }
         | OpKind::Fused(_)
         | OpKind::FusedRow(_)

@@ -14,6 +14,7 @@ pub(crate) mod index;
 pub(crate) mod index_rule;
 pub(crate) mod movement;
 pub(crate) mod packed;
+pub(crate) mod precision;
 pub(crate) mod reduce;
 pub(crate) mod sampling;
 

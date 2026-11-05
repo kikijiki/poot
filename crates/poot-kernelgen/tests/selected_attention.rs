@@ -58,6 +58,7 @@ fn interpret(
             None => kg::AttentionSchedule::Streaming { lanes },
             Some(splits) => kg::AttentionSchedule::SplitKv { lanes, splits },
         },
+        precision: poot_graph_ir::OperandPrecision::Exact,
     };
     let generated = generate_request(&spec);
     let out_len = case.batch * case.hq * case.lq * d;
@@ -336,6 +337,7 @@ fn the_kernel_lowers_to_spirv_and_ptx() {
             bound: kg::KeyBound::Static,
             sink: kg::AttentionSink::Absent,
             schedule: kg::AttentionSchedule::Streaming { lanes: 64 },
+            precision: poot_graph_ir::OperandPrecision::Exact,
         };
         let generated = generate_request(&spec);
         for target in [Target::SpirvVulkan, Target::Nvptx] {

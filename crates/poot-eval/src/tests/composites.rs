@@ -25,7 +25,7 @@ use super::helpers::fill;
 use crate::{EvalError, EvalOptions, Value, eval};
 
 /// `n` deterministic values in `[-scale, scale)`.
-fn data(shape: &[usize], seed: u64, scale: f32) -> HostTensor {
+pub(super) fn data(shape: &[usize], seed: u64, scale: f32) -> HostTensor {
     let n = shape.iter().product::<usize>();
     HostTensor::f32(
         shape.to_vec(),
@@ -34,7 +34,7 @@ fn data(shape: &[usize], seed: u64, scale: f32) -> HostTensor {
 }
 
 /// An additive mask `[.., rows, keys]`: `0` where key `j <= i + offset`, `-1e9` elsewhere.
-fn causal_mask(shape: &[usize], offset: usize) -> HostTensor {
+pub(super) fn causal_mask(shape: &[usize], offset: usize) -> HostTensor {
     let (rows, keys) = (shape[shape.len() - 2], shape[shape.len() - 1]);
     let n = shape.iter().product::<usize>();
     HostTensor::f32(
@@ -50,7 +50,7 @@ fn causal_mask(shape: &[usize], offset: usize) -> HostTensor {
 
 /// A graph whose constants are `inputs` (in order) and whose output is what `body` builds over them,
 /// with the inputs bound.
-fn graph_over(
+pub(super) fn graph_over(
     inputs: &[HostTensor],
     body: impl FnOnce(&Builder, &[Traced]) -> Traced,
 ) -> (Graph, HashMap<ValueId, Value>) {
@@ -77,7 +77,7 @@ fn graph_over(
 
 /// A one-equation graph holding `op` over `inputs`. A composite is compiler-only (`Builder` has no
 /// method for one), so it is staged through an append plan.
-fn one_equation(op: OpKind, inputs: &[HostTensor]) -> (Graph, HashMap<ValueId, Value>) {
+pub(super) fn one_equation(op: OpKind, inputs: &[HostTensor]) -> (Graph, HashMap<ValueId, Value>) {
     graph_over(inputs, |b, traced| {
         let mut plan = b.append_plan(0).unwrap();
         let operands = traced.iter().map(|t| Operand::Value(t.id())).collect();
@@ -88,13 +88,15 @@ fn one_equation(op: OpKind, inputs: &[HostTensor]) -> (Graph, HashMap<ValueId, V
     })
 }
 
-fn evaluate((g, inputs): &(Graph, HashMap<ValueId, Value>)) -> Result<HostTensor, EvalError> {
+pub(super) fn evaluate(
+    (g, inputs): &(Graph, HashMap<ValueId, Value>),
+) -> Result<HostTensor, EvalError> {
     let output = eval(g, inputs, EvalOptions::default())?.output;
     Ok(output.into_host().expect("a dense output"))
 }
 
 /// Every element equal bit for bit (I32 words or F32 bits), and no non-finite F32 element.
-fn assert_bits_equal(got: &HostTensor, want: &HostTensor, what: &str) {
+pub(super) fn assert_bits_equal(got: &HostTensor, want: &HostTensor, what: &str) {
     assert_eq!(got.shape(), want.shape(), "{what}: shape");
     assert_eq!(got.dtype(), want.dtype(), "{what}: dtype");
     if let (Some(got), Some(want)) = (got.as_i32(), want.as_i32()) {
@@ -392,7 +394,9 @@ fn contraction_epilogue_composite_is_the_traced_matmul_then_chain() {
         data(&[2, 3, 4], 27, 1.0),
     ];
     let op = OpKind::ContractionEpilogue {
-        head: ContractionHead::MatMul,
+        head: ContractionHead::MatMul {
+            precision: poot_graph_ir::OperandPrecision::Exact,
+        },
         region,
     };
     assert_composite_matches_chain("contraction_epilogue", op, &inputs, |b, t| {
@@ -707,7 +711,9 @@ fn a_narrow_head_rounds_before_its_residual_in_the_composite_and_the_chain() {
             tensor(&[1, 1], vec![minus_one]),
         ];
         let op = OpKind::ContractionEpilogue {
-            head: ContractionHead::MatMul,
+            head: ContractionHead::MatMul {
+                precision: poot_graph_ir::OperandPrecision::Exact,
+            },
             region: one_step_region(BinOp::Add),
         };
         let composite = evaluate(&one_equation(op, &inputs)).unwrap();
@@ -759,7 +765,9 @@ fn every_step_of_a_narrow_epilogue_rounds_through_the_head_dtype() {
         pack: Vec::new(),
     };
     let op = OpKind::ContractionEpilogue {
-        head: ContractionHead::MatMul,
+        head: ContractionHead::MatMul {
+            precision: poot_graph_ir::OperandPrecision::Exact,
+        },
         region,
     };
     // Inputs: A = [1], B = [1] (head 1.0), then the leaf `tie` read by both steps.

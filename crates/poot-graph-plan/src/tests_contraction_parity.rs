@@ -122,6 +122,7 @@ fn gemv_chunk(dispatch: &Dispatch) -> (usize, usize, usize, usize, usize) {
             width,
             elems,
             offset,
+            ..
         })) => (*k, *n, *width, *elems, *offset),
         other => panic!("a decode GEMV is the generated gemv_lds body, got {other:?}"),
     }

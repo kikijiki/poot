@@ -466,6 +466,7 @@ pub fn recognize_packed_contractions(g: &Graph) -> Result<Graph, EditError> {
         let candidate_op = OpKind::PackedContraction {
             descriptor: candidate.descriptor,
             rows: ContractionRows::Blocks(candidate.blocks),
+            precision: poot_graph_ir::OperandPrecision::Exact,
         };
         let candidate_inputs: Vec<poot_graph_ir::types::TensorType> =
             std::iter::once(g.aval(activation).clone())
@@ -541,6 +542,7 @@ pub fn recognize_packed_contractions(g: &Graph) -> Result<Graph, EditError> {
         let candidate_op = OpKind::PackedContraction {
             descriptor: candidate.descriptor,
             rows: ContractionRows::Blocks(candidate.blocks),
+            precision: poot_graph_ir::OperandPrecision::Exact,
         };
         let candidate_inputs: Vec<poot_graph_ir::types::TensorType> =
             std::iter::once(g.aval(activation).clone())
@@ -671,7 +673,10 @@ pub(crate) fn reject_packed_dequant_escapes(g: &Graph) -> Result<(), PackedDequa
             let carriers = &eqn.inputs[..eqn.inputs.len().saturating_sub(1)];
             validate_packed_carriers(g, equation, descriptor, carriers, &consumers)?;
         }
-        if let OpKind::PackedContraction { descriptor, rows } = eqn.op {
+        if let OpKind::PackedContraction {
+            descriptor, rows, ..
+        } = eqn.op
+        {
             let carriers = &eqn.inputs[rows.leading_operands()..];
             validate_packed_carriers(g, equation, descriptor, carriers, &consumers)?;
             if g.state().any(|(_, state_out)| state_out == eqn.out) {
@@ -855,6 +860,7 @@ mod tests {
             OpKind::PackedContraction {
                 descriptor: d,
                 rows,
+                ..
             } => {
                 assert_eq!(*d, descriptor());
                 assert_eq!(*rows, ContractionRows::Blocks(1));
@@ -897,6 +903,7 @@ mod tests {
             OpKind::PackedContraction {
                 descriptor: d,
                 rows,
+                ..
             } => {
                 assert_eq!(*d, descriptor());
                 assert_eq!(*rows, ContractionRows::Blocks(1));
@@ -974,6 +981,7 @@ mod tests {
             OpKind::PackedContraction {
                 descriptor: d,
                 rows,
+                ..
             } => {
                 assert_eq!(*d, descriptor);
                 assert_eq!(*rows, ContractionRows::Blocks(1));

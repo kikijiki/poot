@@ -384,11 +384,19 @@ impl Elements {
 
     /// Write every element `(row, col)` to `into` as element `(k = col, x = row)`: word `col * stride + row`, the
     /// `A` operand of a product whose depth is this tile's columns (the `P` of attention's `P * V`).
-    pub(crate) fn stage(&self, e: &mut Emit, into: Staged) {
+    ///
+    /// `stored` turns each element into the value that is written (the narrowing of the operand it becomes).
+    pub(crate) fn stage(
+        &self,
+        e: &mut Emit,
+        into: Staged,
+        mut stored: impl FnMut(&mut Emit, Local) -> Local,
+    ) {
         for &(coord, cell) in &self.cells {
             let by_col = bin(e, Ty::Usize, BinOp::Mul, copy(coord.col), cu(into.stride));
             let idx = bin(e, Ty::Usize, BinOp::Add, copy(by_col), copy(coord.row));
-            e.write_lds(into.array, copy(idx), copy(cell));
+            let value = stored(e, cell);
+            e.write_lds(into.array, copy(idx), copy(value));
         }
     }
 

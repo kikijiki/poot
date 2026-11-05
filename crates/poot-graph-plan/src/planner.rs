@@ -88,9 +88,9 @@ macro_rules! packed_ops {
 /// Ops planned by `planner::moe`.
 macro_rules! moe_ops {
     () => {
-        OpKind::IndexedMatMul
+        OpKind::IndexedMatMul { .. }
             | OpKind::ContractionEpilogue {
-                head: ContractionHead::Indexed,
+                head: ContractionHead::Indexed { .. },
                 ..
             }
             | OpKind::ArgTopK { .. }
@@ -139,7 +139,7 @@ macro_rules! matmul_ops {
     () => {
         OpKind::MatMul { .. }
             | OpKind::ContractionEpilogue {
-                head: ContractionHead::MatMul,
+                head: ContractionHead::MatMul { .. },
                 ..
             }
     };

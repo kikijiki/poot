@@ -125,6 +125,18 @@ Every `OpKind` implements `infer(input_types) -> output_type`, run on the host a
 
 Per-step inputs (`Slot::Token`, `Slot::Pos`) are small buffers the host writes each token. Output shapes never depend on slot values, because the KV capacity is fixed, so a captured graph stays valid at every position.
 
+## Operand precision
+
+Every op that multiplies two float operands (`MatMul`, the dense, grouped, packed and indexed contractions, and attention) carries an `OperandPrecision`:
+
+- `Exact`: the operands enter the products as the graph declares them.
+- `Narrow(bf16 | f16)`: each operand not already of that dtype is rounded to it (nearest even; an f32 beyond f16's range becomes infinity, never a clamp) before the products, which accumulate in f32. Attention rounds Q, K, V and the probabilities where they enter `P V`.
+- `Split(bf16 | f16)`: an f32 operand enters as a high and a low part of that dtype, so the product is near f32 accuracy.
+
+The precision is part of the op, so the CPU oracle evaluates exactly what a device must compute, and every schedule (matrix-unit fragments, scalar micro-tiles, GEMV) reads its operands the same way. The published numerics class follows the ops: a program with a narrow op compares with the narrow-storage tolerance, a split one with the reassociating tolerance.
+
+One driver-wide policy, `--matmul-precision exact|split|narrow`, decides what `compile` writes. The `select_operand_precision` pass reads that policy, the target's matrix units and the operands' dtypes, and nothing else: contractions take bf16 where the target has bf16 fragments and f16 otherwise, attention takes the dtype its KV cache is stored in, and a target with no matrix unit for the operands compiles `exact` under any policy. The default is `exact`.
+
 ## Quantization
 
 `PackedDequant` is the one packed-weight primitive. Its `poot-quant::PackedWeight` descriptor names the `WeightFormat`, shape and source roles. The compiler recognizes dense projections as `PackedContraction` and embedding lookups as `PackedRowGather`, and generated kernels decode only the weight values they consume.

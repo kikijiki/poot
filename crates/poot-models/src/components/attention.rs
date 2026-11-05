@@ -802,6 +802,7 @@ fn score_selected(
         p.scale,
         p.softcap,
         ratio,
+        poot_graph_ir::OperandPrecision::Exact,
     )?)
 }
 

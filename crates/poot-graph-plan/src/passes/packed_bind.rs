@@ -309,6 +309,7 @@ pub fn bind_packed_weights(g: &Graph, formats: &WeightFormats) -> Result<Graph, 
                     op: OpKind::PackedContraction {
                         descriptor: packed.weight,
                         rows: ContractionRows::Indexed { experts },
+                        precision: poot_graph_ir::OperandPrecision::Exact,
                     },
                     inputs,
                     out: g.eqns()[indexed].out,
@@ -420,7 +421,7 @@ fn expert_stack_use(
         });
     };
     let indexed_eqn = &g.eqns()[indexed];
-    if !matches!(indexed_eqn.op, OpKind::IndexedMatMul) {
+    if !matches!(indexed_eqn.op, OpKind::IndexedMatMul { .. }) {
         return Err(ExpertStackRefusal::NotIndexed {
             op: indexed_eqn.op.name(),
         });
@@ -752,6 +753,7 @@ mod tests {
                 OpKind::PackedContraction {
                     descriptor: q8(8, 64),
                     rows: ContractionRows::Indexed { experts },
+                    precision: poot_graph_ir::OperandPrecision::Exact
                 }
             );
             let names: Vec<_> = bound

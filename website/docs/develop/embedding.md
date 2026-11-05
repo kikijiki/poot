@@ -93,6 +93,9 @@ let options = DriverOptions {
     // KV cache storage dtype: None takes the model's preference, else f16;
     // Some(KvDtype::F32) is the exact reference
     kv_dtype: None,
+    // Operand precision of matrix products: None takes the default, exact;
+    // Some(MatmulPrecision::Narrow) rounds operands where a matrix unit admits it
+    matmul_precision: None,
 };
 let executor = open_executor(BackendChoice::Auto)?;
 // or `prepare(&shapes)`: the Serving driver is the one that generates

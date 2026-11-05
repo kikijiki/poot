@@ -572,6 +572,107 @@ fn packed_indexed_linear_matches_the_per_row_expert_product() {
     }
 }
 
+/// POOT-1430: the indexed packed contraction is an oracle primitive (it decodes only the experts the ids select), so
+/// it reads its operands as its precision says itself: under `Narrow(f16)` and `Split(f16)` each row's output is the
+/// sequential sum over the activation's terms and the decoded expert weight's terms, bit for bit, and it differs from
+/// the exact output (the rounding is applied).
+/// Mutation: in `evaluate_packed_indexed` read the weight unrounded; the narrow and split rows go red.
+#[test]
+fn a_narrowed_packed_indexed_contraction_reads_its_operands_as_declared() {
+    use poot_graph_ir::{FragmentDtype, MatmulPrecision};
+    // Q8_0 experts: a decoded weight is `d * q` with an f16 scale and an 8-bit code, which an f16 does not hold
+    // exactly, so rounding the decoded weight changes the product (an E4M3 weight is exact in f16 and could not).
+    let descriptor = PackedWeight::try_new(WeightFormat::Q8_0, [3, 32]).unwrap();
+    let experts: Vec<Arc<PackedPayload>> = (0..3u8)
+        .map(|expert| {
+            let blocks: Vec<u8> = (0..3u8)
+                .flat_map(|row| {
+                    let scale =
+                        poot_quant::scalar::f32_to_f16(0.0123 + 0.0071 * f32::from(row + expert));
+                    let codes = (0..32u8).map(move |c| {
+                        (c.wrapping_mul(37).wrapping_add(row * 11 + expert * 5)) as i8 as u8
+                    });
+                    scale.to_le_bytes().into_iter().chain(codes)
+                })
+                .collect();
+            Arc::new(
+                PackedPayload::try_new(
+                    descriptor,
+                    [(SourceRole::Blocks, StoredBytes::from(blocks))],
+                )
+                .unwrap(),
+            )
+        })
+        .collect();
+    let [out, k] = descriptor.shape();
+    let route = [2usize, 0, 2, 1, 0];
+    let m = route.len();
+    let x_data: Vec<f32> = (0..m * k)
+        .map(|index| (index as f32 - 11.0) / 7.0 + 1e-3 * index as f32)
+        .collect();
+    let weights: Vec<Vec<f32>> = experts
+        .iter()
+        .map(|expert| {
+            let mut weight = vec![0.0f32; out * k];
+            for (o, row) in weight.chunks_exact_mut(k).enumerate() {
+                expert.decode_row(o, row).unwrap();
+            }
+            weight
+        })
+        .collect();
+    let (graph, inputs) = indexed_graph(descriptor, &experts, &x_data, &route);
+    let target = crate::test_support::wgpu_rdna3_target();
+    let f16 = FragmentDtype::F16;
+    let run = |policy| {
+        let declared = crate::with_operand_precision(&graph, &target, policy).unwrap();
+        let Value::Host(got) = eval(&declared, &inputs, EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap()
+        else {
+            panic!("dense result");
+        };
+        got.as_f32().unwrap().to_vec()
+    };
+    let terms = |split: bool, x: f32| -> Vec<f32> {
+        let hi = poot_eval::round_to_fragment(f16, x);
+        if split {
+            vec![hi, poot_eval::round_to_fragment(f16, x - hi)]
+        } else {
+            vec![hi]
+        }
+    };
+    let exact = run(MatmulPrecision::Exact);
+    for (policy, split) in [
+        (MatmulPrecision::Narrow, false),
+        (MatmulPrecision::Split, true),
+    ] {
+        let got = run(policy);
+        for (row, &expert) in route.iter().enumerate() {
+            for o in 0..out {
+                let mut acc = 0.0f32;
+                for column in 0..k {
+                    for a in terms(split, x_data[row * k + column]) {
+                        for w in terms(split, weights[expert][o * k + column]) {
+                            acc += a * w;
+                        }
+                    }
+                }
+                assert_eq!(
+                    got[row * out + o].to_bits(),
+                    acc.to_bits(),
+                    "{policy:?} row {row} output {o}"
+                );
+            }
+        }
+        if !split {
+            assert_ne!(
+                got, exact,
+                "{policy:?}: the rounding must be visible on this fixture"
+            );
+        }
+    }
+}
+
 /// An observer counting the allocations an evaluation charges, by size.
 #[derive(Default)]
 struct Allocations(Vec<usize>);
@@ -920,6 +1021,7 @@ fn contract_through_the_oracle(
         OpKind::PackedContraction {
             descriptor: weight,
             rows: poot_graph_ir::ContractionRows::Blocks(1),
+            precision: poot_graph_ir::OperandPrecision::Exact,
         },
         operands,
     )?;

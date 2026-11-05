@@ -304,8 +304,8 @@ pub(crate) fn apply_lora(
                 vec![site.x],
             )?
         };
-        let xa = emitter.val(OpKind::IndexedMatMul, vec![x2, a, per_token])?;
-        let xab = emitter.val(OpKind::IndexedMatMul, vec![xa, bb, per_token])?;
+        let xa = emitter.val(OpKind::indexed_matmul(), vec![x2, a, per_token])?;
+        let xab = emitter.val(OpKind::indexed_matmul(), vec![xa, bb, per_token])?;
         let row_scale = emitter.val(OpKind::Gather { axis: 0 }, vec![scale, per_token])?;
         let scale_col = emitter.val(OpKind::Reshape { shape: vec![m, 1] }, vec![row_scale])?;
         let scaled = emitter.val(OpKind::Binary(BinOp::Mul), vec![xab, scale_col])?;

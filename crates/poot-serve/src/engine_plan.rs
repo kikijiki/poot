@@ -22,6 +22,7 @@ use poot_graph_plan::{
     Refusal, ShardRule, multi_device::topology::DeviceId, staged::DevicePlacement,
     staged::TargetSet,
 };
+use poot_llm::driver::MatmulPrecision;
 use poot_llm::driver::block_table::BLOCK_SIZE;
 use poot_llm::driver::capacity::{
     Budget, CapacityRefusal, EncodeNeed, Fit, FitError, Observation, PlanError, PlanFailure,
@@ -67,6 +68,9 @@ pub(crate) struct EngineArgs {
     /// The KV cache dtype the operator asked for ([`DriverOptions::kv_dtype`]); `None` takes the model's
     /// preference or the engine default.
     pub(crate) kv_dtype: Option<KvDtype>,
+    /// The operand-precision policy the operator asked for ([`DriverOptions::matmul_precision`]); `None`
+    /// takes the engine default.
+    pub(crate) matmul_precision: Option<MatmulPrecision>,
 }
 
 impl EngineArgs {
@@ -78,6 +82,7 @@ impl EngineArgs {
             embeds: false,
             expert_pool: None,
             kv_dtype: None,
+            matmul_precision: None,
             rows: None,
             max_seq: DEFAULT_MAX_SEQ,
         }
@@ -86,6 +91,14 @@ impl EngineArgs {
     /// Store the KV cache as `kv_dtype` when it is `Some`.
     pub(crate) fn with_kv_dtype(self, kv_dtype: Option<KvDtype>) -> Self {
         Self { kv_dtype, ..self }
+    }
+
+    /// Compile every program under `matmul_precision` when it is `Some`.
+    pub(crate) fn with_matmul_precision(self, matmul_precision: Option<MatmulPrecision>) -> Self {
+        Self {
+            matmul_precision,
+            ..self
+        }
     }
 
     /// The rows and positions to ask the fit for first.
@@ -434,6 +447,7 @@ fn driver_options(
     workload: Workload,
     draft: DraftPolicy,
     kv_dtype: Option<KvDtype>,
+    matmul_precision: Option<MatmulPrecision>,
 ) -> DriverOptions {
     let max_seq = workload.max_seq();
     // The largest granule multiple within the chunk budget and the capacity, and never below one granule.
@@ -458,6 +472,7 @@ fn driver_options(
             max_retained_bytes: NonZeroU64::new(MAX_RETAINED_BYTES).expect("nonzero"),
         },
         kv_dtype,
+        matmul_precision,
         ..DriverOptions::generation(max_seq, chunk).with_draft(draft)
     }
 }
@@ -746,6 +761,7 @@ fn fit_and_prepare(
                 workload.fitted(candidate),
                 args.draft.clone(),
                 args.kv_dtype,
+                args.matmul_precision,
             );
             let encode = encode_shapes_of(candidate);
             match workload {
@@ -794,6 +810,7 @@ fn fit_and_prepare(
             workload.fitted(&chosen),
             args.draft.clone(),
             args.kv_dtype,
+            args.matmul_precision,
         ),
         placement.clone(),
     )?;

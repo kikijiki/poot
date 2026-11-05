@@ -25,6 +25,8 @@ pub mod ops;
 /// Graph constant names and source types of a packed linear: the `{linear_id}.packed_weight_source` /
 /// `{linear_id}.packed_scale_source` spelling and the scale byte width each carrier is shaped by.
 pub mod packed_source;
+/// The declared narrowing of the ops that multiply two float operands, and the driver policy that selects it.
+pub mod precision;
 /// The interval analysis of I32 values and the declared slot ranges it starts from (POOT-726).
 pub mod range;
 pub mod rope_table;
@@ -64,6 +66,7 @@ pub use op::{
 #[cfg(any(test, feature = "test-support"))]
 pub use packed_source::packed_source_constants;
 pub use packed_source::{PackedSourceName, packed_source_type, packed_stack_source_type};
+pub use precision::{FragmentDtype, MatmulPrecision, OperandPrecision};
 pub use range::{IndexRange, RangeFacts, value_ranges};
 pub use slot_map::{ForwardSlotMap, SlotMapError};
 pub use types::{Operands, Scalar, TensorType};

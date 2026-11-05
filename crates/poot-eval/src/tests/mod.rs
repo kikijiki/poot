@@ -19,6 +19,7 @@ mod linear_attention;
 mod linear_attention_hybrid;
 mod moe_gating;
 mod mrope;
+mod operand_precision;
 mod oracle_corners;
 mod packed_oracle_guards;
 mod qwen3next_block_refs;

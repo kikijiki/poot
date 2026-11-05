@@ -315,6 +315,7 @@ fn driver_of(kind: Kind, k: usize, carry: bool) -> Driver {
             charge: super::program_retention,
             draft,
             hidden_window: carry.then(|| nz(k + 1)),
+            matmul_precision: None,
         },
     )
     .unwrap()

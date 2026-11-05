@@ -257,6 +257,7 @@ fn driver_options() -> DriverOptions {
         charge: program_retention,
         draft: DraftPolicy::Off,
         hidden_window: None,
+        matmul_precision: None,
     }
 }
 

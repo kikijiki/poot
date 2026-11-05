@@ -37,6 +37,7 @@ fn spec(
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes: 4 },
+        precision: poot_graph_ir::OperandPrecision::Exact,
     }
 }
 
@@ -1487,4 +1488,131 @@ fn a_tiling_that_does_not_fit_the_block_is_a_typed_error() {
             spec.schedule
         );
     }
+}
+
+/// POOT-1430: a narrowed attention rounds Q, K, V and the probabilities on every schedule. Each of the streaming,
+/// split-KV and tiled schedules, under each narrow dtype, lands within the dtype's bound of the textbook attention
+/// over operands rounded as declared (what is left is the probabilities' own rounding, half an ulp of the dtype
+/// times the value range), and off the exact kernel's output by more than that rounding alone could hide, so the
+/// rounding is applied and the row is not inert. Mutation: in `attention::add_products` read the operands unrounded
+/// (`ProductRead` with `Exact`); the streaming and split rows stop moving off the exact output and go red; in the
+/// tiled body skip the `narrowed` call at the V staging and the tiled row's distance to the rounded reference grows
+/// past the bound.
+#[test]
+fn a_narrowed_attention_rounds_its_operands_on_every_schedule() {
+    use poot_graph_ir::{FragmentDtype, OperandPrecision};
+    let rounded = |dtype, values: &[f32]| -> Vec<f32> {
+        values
+            .iter()
+            .map(|&x| poot_eval::round_to_fragment(dtype, x))
+            .collect()
+    };
+    let distance = |a: &[f32], b: &[f32]| max_abs_error(a, b);
+
+    let decode = with_lanes(spec(1, 4, 2, 1, 13, 8), 5);
+    let split = with_splits(with_lanes(spec(2, 3, 1, 1, 41, 8), 4), 4, 4);
+    let prefill = causal(spec(2, 4, 2, 13, 13, 8), None);
+    let positions: Vec<i32> = (0..2).flat_map(|_| 0..13).collect();
+
+    struct Case {
+        name: &'static str,
+        spec: kg::AttentionSpec,
+        operands: Operands,
+        split: bool,
+    }
+    let cases = [
+        Case {
+            name: "streaming decode",
+            operands: Operands::new(&decode, additive_mask(1, 1, 13, Some(&[10]))),
+            spec: decode,
+            split: false,
+        },
+        Case {
+            name: "split-KV decode",
+            operands: Operands::new(&split, additive_mask(2, 1, 41, Some(&[33, 41]))),
+            spec: split,
+            split: true,
+        },
+        Case {
+            name: "tiled prefill",
+            operands: Operands::new(&prefill, Vec::new()).with_positions(&positions),
+            spec: small_tiled(prefill),
+            split: false,
+        },
+    ];
+    let run = |case: &Case, spec: &kg::AttentionSpec| -> Vec<f32> {
+        if case.split {
+            interpret_split(spec, &caps(), &case.operands, f32::NAN).0
+        } else {
+            interpret(spec, &caps(), &case.operands)
+        }
+    };
+    for case in &cases {
+        let exact = run(case, &case.spec);
+        for (dtype, bound, visible) in [
+            (FragmentDtype::F16, 3e-3, 5e-5),
+            (FragmentDtype::Bf16, 2e-2, 5e-4),
+        ] {
+            let narrow = kg::AttentionSpec {
+                precision: OperandPrecision::Narrow(dtype),
+                ..case.spec.clone()
+            };
+            let got = run(case, &narrow);
+            let mut operands = Operands::new(&case.spec, case.operands.mask.clone());
+            operands.positions = case.operands.positions.clone();
+            operands.len = case.operands.len.clone();
+            operands.q = rounded(dtype, &operands.q);
+            operands.k = rounded(dtype, &operands.k);
+            operands.v = rounded(dtype, &operands.v);
+            let want = operands.reference(&case.spec);
+            let near = distance(&got, &want);
+            let moved = distance(&got, &exact);
+            assert!(
+                near < bound,
+                "{} {dtype:?}: {near:e} from the rounded reference",
+                case.name
+            );
+            assert!(
+                moved > visible,
+                "{} {dtype:?}: only {moved:e} from the exact kernel, the rounding is not applied",
+                case.name
+            );
+        }
+        // A split operand recovers the f32 values: the streaming schedules land far nearer the exact output
+        // than the narrow ones. (The tiled schedule stages one tile per operand and takes no split precision.)
+        if !matches!(case.spec.schedule, kg::AttentionSchedule::Tiled { .. }) {
+            let narrow = kg::AttentionSpec {
+                precision: OperandPrecision::Narrow(FragmentDtype::F16),
+                ..case.spec.clone()
+            };
+            let split = kg::AttentionSpec {
+                precision: OperandPrecision::Split(FragmentDtype::F16),
+                ..case.spec.clone()
+            };
+            let (narrow_err, split_err) = (
+                distance(&run(case, &narrow), &exact),
+                distance(&run(case, &split), &exact),
+            );
+            assert!(
+                split_err < narrow_err / 10.0,
+                "{}: split {split_err:e} vs narrow {narrow_err:e}",
+                case.name
+            );
+        }
+    }
+}
+
+/// The tiled schedule stages one tile per operand, so a split precision on it is a typed refusal by name, not a
+/// body that drops the `lo` part.
+#[test]
+fn a_split_precision_has_no_tiled_schedule() {
+    use poot_graph_ir::{FragmentDtype, OperandPrecision};
+    let base = causal(spec(1, 4, 2, 13, 13, 8), None);
+    let tiled = kg::AttentionSpec {
+        precision: OperandPrecision::Split(FragmentDtype::F16),
+        ..small_tiled(base)
+    };
+    let error = kg::generate(&kg::KernelRequest::Attention(tiled), &caps(), &LIMITS)
+        .expect_err("a split tiled attention has no body");
+    assert!(error.to_string().contains("split"), "{error}");
 }

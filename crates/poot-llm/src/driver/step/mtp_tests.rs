@@ -352,6 +352,7 @@ fn toy_options(draft: DraftPolicy) -> DriverOptions {
         charge: crate::driver::program_retention,
         hidden_window: draft.carry_window(),
         draft,
+        matmul_precision: None,
     }
 }
 

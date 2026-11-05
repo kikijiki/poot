@@ -21,7 +21,10 @@ fn as_dense_contraction(g: Graph, x: ValueId, weight: ValueId) -> Graph {
     let out = g.result();
     poot_graph_ir::test_support::graph_fixtures::derive(&g, |draft| {
         *draft.eqns_mut() = vec![poot_graph_ir::Eqn {
-            op: OpKind::DenseContraction { weight: dtype },
+            op: OpKind::DenseContraction {
+                weight: dtype,
+                precision: poot_graph_ir::OperandPrecision::Exact,
+            },
             inputs: vec![
                 poot_graph_ir::Operand::Value(x),
                 poot_graph_ir::Operand::Value(weight),
@@ -247,7 +250,8 @@ fn dense_contraction_matches_the_mixed_matmul_definition() {
     assert!(
         graph.eqns().iter().any(|eqn| eqn.op
             == poot_graph_ir::OpKind::DenseContraction {
-                weight: DType::BF16
+                weight: DType::BF16,
+                precision: poot_graph_ir::OperandPrecision::Exact
             }),
         "the LM head must fold before this evaluates"
     );

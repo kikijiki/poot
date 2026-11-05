@@ -27,6 +27,7 @@ use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy, cu, emit_read_meta, select_u32};
 use crate::helpers::{Alloc, WeightLane, WeightLayout, elem, guard};
 use crate::microtile::{LaneRows, MicroCols, MicroTile, Staged, StoreAt};
+use crate::precision::{ProductRead, StagedTerms};
 
 /// `K` elements staged in LDS per barrier round, and run in unrolled outer-product steps.
 pub(super) const BLOCK_K: usize = 16;
@@ -45,9 +46,11 @@ const LATCH: u32 = 7;
 const STORES: u32 = 8;
 
 /// The workgroup-local bytes one workgroup of `lanes x lanes` lanes of `micro` tiles stages its two tiles in.
-pub(super) const fn lds_bytes(lanes: usize, micro: MicroTile) -> usize {
+pub(super) const fn lds_bytes(lanes: usize, micro: MicroTile, terms: StagedTerms) -> usize {
     let (tile_rows, tile_cols) = micro.output_tile(lanes, lanes);
-    BLOCK_K * (tile_rows + 1 + tile_cols + 1) * std::mem::size_of::<f32>()
+    BLOCK_K
+        * ((tile_rows + 1) * terms.activation + (tile_cols + 1) * terms.weight)
+        * std::mem::size_of::<f32>()
 }
 
 /// Whether a workgroup of `lanes x lanes` lanes of `micro` tiles stages both tiles in whole slots: every lane
@@ -174,6 +177,8 @@ pub(crate) struct TiledBody<'a> {
     pub(crate) out: Local,
     pub(crate) epilogue: Option<BoundEpilogue<'a>>,
     pub(crate) walk: Option<ExpertWalk<'a>>,
+    /// How the two staged tiles are read: the declared operand precision, applied where each value is staged.
+    pub(crate) read: ProductRead,
 }
 
 /// One staged slot of one operand's tile: where its values land in LDS and where they come from.
@@ -222,6 +227,7 @@ pub(crate) fn tiled_body(
         out,
         epilogue,
         mut walk,
+        read,
     } = spec;
     debug_assert_eq!(
         matches!(weight, TiledWeight::Columns { .. }),
@@ -239,6 +245,17 @@ pub(crate) fn tiled_body(
     let ret = STORES + 2 * micro.accumulators() as u32;
     let (walk_head, walk_step, walk_next) = (ret + 1, ret + 2, ret + 3);
     let n_inputs = (params.len() - 1) as u32;
+    // The staged tiles' LDS arrays: the activation's and the weight's (`hi`) parts, then the `lo` part of each
+    // operand that is split ([`StagedTerms`]).
+    let terms = read.staged_terms();
+    let a_array = |term: usize| if term == 0 { 0 } else { 2 };
+    let b_array = |term: usize| {
+        if term == 0 {
+            1
+        } else {
+            1 + terms.activation as u8
+        }
+    };
     let mut al = Alloc::new(params);
     let gx = al.add(Ty::Usize, false);
     let gy = al.add(Ty::Usize, false);
@@ -675,7 +692,13 @@ pub(crate) fn tiled_body(
                 copy(staged.lds_idx),
                 cu(j * stride_a),
             );
-            load.write_lds(0, copy(slot), copy(value));
+            for (term, part) in read
+                .activation_terms(&mut load, value)
+                .into_iter()
+                .enumerate()
+            {
+                load.write_lds(a_array(term), copy(slot), copy(part));
+            }
         }
     }
     match weight {
@@ -693,7 +716,6 @@ pub(crate) fn tiled_body(
                     weight_rows,
                 );
                 for (j, &decoded) in values.iter().enumerate() {
-                    let value = bin(&mut load, Ty::F32, BinOp::Mul, copy(decoded), copy(mask));
                     let slot = bin(
                         &mut load,
                         Ty::Usize,
@@ -701,7 +723,14 @@ pub(crate) fn tiled_body(
                         copy(staged.lds_idx),
                         cu(j * stride_b),
                     );
-                    load.write_lds(1, copy(slot), copy(value));
+                    for (term, part) in read
+                        .weight_terms(&mut load, decoded)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let value = bin(&mut load, Ty::F32, BinOp::Mul, copy(part), copy(mask));
+                        load.write_lds(b_array(term), copy(slot), copy(value));
+                    }
                 }
             }
         }
@@ -739,8 +768,10 @@ pub(crate) fn tiled_body(
                     copy(in_slab),
                 );
                 let raw = lane.emit_elem(&mut load, weight, idx);
-                let value = bin(&mut load, Ty::F32, BinOp::Mul, copy(raw), copy(mask));
-                load.write_lds(1, copy(staged.lds_idx), copy(value));
+                for (term, part) in read.weight_terms(&mut load, raw).into_iter().enumerate() {
+                    let value = bin(&mut load, Ty::F32, BinOp::Mul, copy(part), copy(mask));
+                    load.write_lds(b_array(term), copy(staged.lds_idx), copy(value));
+                }
             }
         }
     }
@@ -750,19 +781,25 @@ pub(crate) fn tiled_body(
     };
 
     // --- dot: `BLOCK_K` unrolled micro-tile steps over the two staged tiles ---
-    let (staged_a, staged_b) = (
-        Staged {
-            array: 0,
-            stride: stride_a,
-        },
-        Staged {
-            array: 1,
-            stride: stride_b,
-        },
-    );
+    let staged_a = |term: usize| Staged {
+        array: a_array(term),
+        stride: stride_a,
+    };
+    let staged_b = |term: usize| Staged {
+        array: b_array(term),
+        stride: stride_b,
+    };
+    let (a_parts, b_parts): (Vec<usize>, Vec<usize>) =
+        ((0..terms.activation).collect(), (0..terms.weight).collect());
     let mut dot = Emit::new(&mut al);
     for k in 0..BLOCK_K {
-        micro.step(&mut dot, &geometry, &mut acc, staged_a, staged_b, k);
+        // A split operand adds a product per pair of parts, `a` parts outermost: the oracle's order.
+        for (a, b) in a_parts
+            .iter()
+            .flat_map(|&a| b_parts.iter().map(move |&b| (a, b)))
+        {
+            micro.step(&mut dot, &geometry, &mut acc, staged_a(a), staged_b(b), k);
+        }
     }
     let dot = BasicBlock {
         statements: dot.take(),
@@ -848,8 +885,16 @@ pub(crate) fn tiled_body(
 
     let mut body = Body::new(name, n_inputs, al.locals, blocks_out);
     body.workgroup_size = [lane_count as u32, 1, 1];
-    body.workgroup_locals = [stride_a, stride_b]
+    // Array order: activation, weight, then the activation's `lo` part and the weight's, when split.
+    let arrays = [
+        (stride_a, 1),
+        (stride_b, 1),
+        (stride_a, terms.activation - 1),
+        (stride_b, terms.weight - 1),
+    ];
+    body.workgroup_locals = arrays
         .into_iter()
+        .flat_map(|(stride, count)| std::iter::repeat_n(stride, count))
         .map(|stride| WorkgroupLocalDecl {
             elem_ty: Ty::F32,
             len: (BLOCK_K * stride) as u32,

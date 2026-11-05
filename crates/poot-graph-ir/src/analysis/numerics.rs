@@ -26,6 +26,7 @@ use std::collections::HashMap;
 
 use super::{Graph, OpKind, ValueId};
 use crate::graph::Eqn;
+use crate::precision::OperandPrecision;
 use crate::types::{DType, DTypeClass, DTypeClassExt};
 
 /// Device scheduling behavior (ADR-0101 decision 2), ordered by severity. This describes comparison
@@ -97,6 +98,21 @@ impl Tier2Class {
 /// The property a single op implies, independent of any pass declaration. `out_dtype` decides whether
 /// an elementwise op is float arithmetic (a real-device tier-2 class) or an exact-integer op (tier 1).
 fn implied_op_numerics(op: &OpKind, out_dtype: DType) -> NumericsProperty {
+    // An op that declares its operand precision is classed by it, whatever the op itself implies: a narrowed
+    // operand moves a result by a narrow ulp when an upstream f32 ulp flips its rounding (`Tier2Class::NarrowStorage`),
+    // a split operand is compensated by its low part and only reassociates (design 6.2).
+    match op.operand_precision() {
+        Some(OperandPrecision::Narrow(_)) => return NumericsProperty::Narrowing,
+        Some(OperandPrecision::Split(_)) => {
+            return NumericsProperty::Reassociating.strongest(op_baseline_numerics(op, out_dtype));
+        }
+        Some(OperandPrecision::Exact) | None => {}
+    }
+    op_baseline_numerics(op, out_dtype)
+}
+
+/// The property an op implies at its declared precision.
+fn op_baseline_numerics(op: &OpKind, out_dtype: DType) -> NumericsProperty {
     match op {
         OpKind::Fused(_)
         | OpKind::FusedRow(_)
@@ -110,7 +126,7 @@ fn implied_op_numerics(op: &OpKind, out_dtype: DType) -> NumericsProperty {
         | OpKind::DenseContraction { .. }
         | OpKind::GroupedDenseContraction { .. }
         | OpKind::DenseRowGather { .. }
-        | OpKind::IndexedMatMul => NumericsProperty::Narrowing,
+        | OpKind::IndexedMatMul { .. } => NumericsProperty::Narrowing,
         OpKind::Cast { to }
             if matches!(to.class(), DTypeClass::StorageOnly | DTypeClass::Packed) =>
         {
@@ -208,5 +224,93 @@ impl NumericsDelta {
             .map(|eqn| class(after, eqn))
             .fold(NumericsProperty::Exact, NumericsProperty::strongest);
         Self { produced }
+    }
+}
+
+#[cfg(test)]
+mod operand_precision_tests {
+    use super::*;
+    use crate::builder::Builder;
+    use crate::op::ContractionHead;
+    use crate::precision::{FragmentDtype, OperandPrecision};
+    use crate::types::TensorType;
+
+    const BF16: OperandPrecision = OperandPrecision::Narrow(FragmentDtype::Bf16);
+    const SPLIT: OperandPrecision = OperandPrecision::Split(FragmentDtype::F16);
+
+    /// A graph of one f32 matmul read as `precision`.
+    fn matmul(precision: OperandPrecision) -> Graph {
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+        let w = b.constant("w", TensorType::f32(vec![8, 3])).unwrap();
+        let out = b.matmul_as(x, w, precision).unwrap();
+        b.finish(out).unwrap()
+    }
+
+    /// The class a program publishes follows from the precision its ops declare and nothing else: an exact matmul
+    /// is the unfused hardware baseline, a narrowed one is the narrow-storage class (a 1-ulp f32 difference upstream
+    /// flips one narrow rounding and moves an element by a narrow ulp), a split one only reassociates (its `lo`
+    /// part compensates a changed `hi`). Mutation: map `Narrow` to `Reassociating` in `implied_op_numerics`; the
+    /// program publishes the tighter 1e-3 tolerance and the narrow row goes red.
+    #[test]
+    fn the_published_class_follows_the_declared_precision() {
+        let class = |precision| implied_numerics(&matmul(precision)).tier2_class();
+        assert_eq!(class(OperandPrecision::Exact), Tier2Class::Unfused);
+        assert_eq!(class(BF16), Tier2Class::NarrowStorage);
+        assert_eq!(class(SPLIT), Tier2Class::Reassociating);
+    }
+
+    /// A split op that is narrowing for another reason (a decoded packed or checkpoint weight) keeps the stronger
+    /// property: the precision only ever adds to what the op implies.
+    #[test]
+    fn a_split_op_keeps_the_stronger_property_the_op_implies() {
+        let op = OpKind::dense_contraction(DType::BF16).with_operand_precision(SPLIT);
+        assert_eq!(
+            implied_op_numerics(&op, DType::F32),
+            NumericsProperty::Narrowing
+        );
+    }
+
+    /// A dump names the precision only when the op narrows, so an exact program prints as it always did; the
+    /// parameter hash tells the precisions apart.
+    #[test]
+    fn a_dump_and_a_hash_tell_the_precisions_apart() {
+        use std::hash::{DefaultHasher, Hasher};
+        let ops = [
+            OpKind::matmul(),
+            OpKind::matmul().with_operand_precision(BF16),
+        ];
+        assert_eq!(ops[0].name(), "matmul");
+        assert_eq!(ops[1].name(), "matmul precision=narrow(bf16)");
+        let hashed = |op: &OpKind| {
+            let mut h = DefaultHasher::new();
+            op.hash_params(&mut h);
+            h.finish()
+        };
+        assert_ne!(hashed(&ops[0]), hashed(&ops[1]));
+    }
+
+    /// An op and its epilogue head agree on the precision, and every op without one reports none.
+    #[test]
+    fn a_head_carries_the_precision_of_its_op() {
+        for precision in [OperandPrecision::Exact, BF16, SPLIT] {
+            let heads = [
+                ContractionHead::MatMul { precision },
+                ContractionHead::Dense {
+                    weight: DType::BF16,
+                    precision,
+                },
+                ContractionHead::Indexed { precision },
+            ];
+            for head in heads {
+                assert_eq!(head.op().operand_precision(), Some(precision));
+                assert_eq!(
+                    head.with_precision(OperandPrecision::Exact).precision(),
+                    OperandPrecision::Exact
+                );
+            }
+        }
+        assert_eq!(OpKind::Select.operand_precision(), None);
+        assert_eq!(OpKind::Select.with_operand_precision(BF16), OpKind::Select);
     }
 }

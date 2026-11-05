@@ -3,6 +3,7 @@
 use super::{
     AttentionKeys, BinOp, Builder, BuilderError, RedOp, Scalar, Traced, attention_over_keys,
 };
+use crate::precision::OperandPrecision;
 use crate::types::DType;
 
 /// The magnitude of the additive penalty on a position the selection does not read.
@@ -126,6 +127,7 @@ pub fn selected_attention(
     scale: f32,
     softcap: Option<f32>,
     ratio: usize,
+    precision: OperandPrecision,
 ) -> Result<Traced, BuilderError> {
     let lk = b.aval(k)?.shape[2];
     let mask = selected_block_mask(b, ids, pos, ratio, lk)?;
@@ -140,5 +142,6 @@ pub fn selected_attention(
         softcap,
         None,
         None,
+        precision,
     )
 }

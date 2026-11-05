@@ -100,9 +100,9 @@ fn packed_bf16_reader(op: &OpKind, position: usize) -> bool {
     let weight = (op.dense_weight().is_some()
         || matches!(
             op,
-            OpKind::IndexedMatMul
+            OpKind::IndexedMatMul { .. }
                 | OpKind::ContractionEpilogue {
-                    head: ContractionHead::Indexed,
+                    head: ContractionHead::Indexed { .. },
                     ..
                 }
         ))
@@ -254,7 +254,10 @@ pub(crate) fn fold_dense_contractions(g: &Graph) -> Result<Graph, EditError> {
             [1, 0] => {
                 let dtype = g.aval(source).dtype;
                 (
-                    OpKind::DenseContraction { weight: dtype },
+                    OpKind::DenseContraction {
+                        weight: dtype,
+                        precision: poot_graph_ir::OperandPrecision::Exact,
+                    },
                     source,
                     vec![transpose_index],
                 )
@@ -293,6 +296,7 @@ pub(crate) fn fold_dense_contractions(g: &Graph) -> Result<Graph, EditError> {
                     OpKind::GroupedDenseContraction {
                         weight: stored.dtype,
                         groups,
+                        precision: poot_graph_ir::OperandPrecision::Exact,
                     },
                     weight,
                     vec![transpose_index, reshape_index],
@@ -1094,7 +1098,8 @@ mod fold_dense_bf16_tests {
             folded.eqns()[0].op,
             OpKind::GroupedDenseContraction {
                 weight: DType::BF16,
-                groups: 3
+                groups: 3,
+                precision: poot_graph_ir::OperandPrecision::Exact
             }
         );
         assert_eq!(folded.eqns()[0].out, graph.result());
@@ -1132,7 +1137,8 @@ mod fold_dense_bf16_tests {
         assert_eq!(
             folded.eqns()[index].op,
             OpKind::DenseContraction {
-                weight: DType::BF16
+                weight: DType::BF16,
+                precision: poot_graph_ir::OperandPrecision::Exact
             }
         );
         assert_eq!(
@@ -1158,10 +1164,11 @@ mod fold_dense_bf16_tests {
         // An F32 weight is in the table (Card 645): it folds the same way, into an F32 contraction.
         let f32_weight = fold_dense_contractions(&lm_head_shaped_graph(DType::F32)).unwrap();
         assert!(
-            f32_weight
-                .eqns()
-                .iter()
-                .any(|eqn| eqn.op == OpKind::DenseContraction { weight: DType::F32 }),
+            f32_weight.eqns().iter().any(|eqn| eqn.op
+                == OpKind::DenseContraction {
+                    weight: DType::F32,
+                    precision: poot_graph_ir::OperandPrecision::Exact
+                }),
             "an F32 checkpoint weight folds"
         );
         assert!(
@@ -1174,10 +1181,11 @@ mod fold_dense_bf16_tests {
         // An F16 const weight is in the table (Card 1007) and the contraction is its sole reader: it folds.
         let f16_weight = fold_dense_contractions(&lm_head_shaped_graph(DType::F16)).unwrap();
         assert!(
-            f16_weight
-                .eqns()
-                .iter()
-                .any(|eqn| eqn.op == OpKind::DenseContraction { weight: DType::F16 }),
+            f16_weight.eqns().iter().any(|eqn| eqn.op
+                == OpKind::DenseContraction {
+                    weight: DType::F16,
+                    precision: poot_graph_ir::OperandPrecision::Exact
+                }),
             "an F16 checkpoint weight folds"
         );
         // An F16 weight that is not a const cannot be stored packed (its producer writes it natively), so the

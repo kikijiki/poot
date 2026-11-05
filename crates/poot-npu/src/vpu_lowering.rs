@@ -357,7 +357,7 @@ fn unsupported(op: &OpKind) -> Capability {
         | OpKind::DenseContraction { .. }
         | OpKind::GroupedDenseContraction { .. }
         | OpKind::DenseRowGather { .. }
-        | OpKind::IndexedMatMul
+        | OpKind::IndexedMatMul { .. }
         | OpKind::ArgTopK { .. }
         | OpKind::ExpertGroup { .. }
         | OpKind::MatMul { .. }

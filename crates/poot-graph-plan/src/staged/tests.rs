@@ -967,6 +967,7 @@ fn a_block_selected_cache_is_counted_at_its_selected_positions() {
             softcap: None,
             ratio: 4,
             k: 2,
+            precision: poot_graph_ir::OperandPrecision::Exact,
         },
         [q, k, v, ids, pos],
     )

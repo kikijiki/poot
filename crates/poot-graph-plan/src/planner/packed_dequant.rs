@@ -22,7 +22,7 @@ use super::{
 use crate::planner::{GraphTables, finalize};
 use crate::predicates::{INDEXED_GEMV_MAX_ROWS, gemv_activation, packed_contraction_m_per_block};
 use crate::refusal::Site;
-use poot_graph_ir::ContractionRows;
+use poot_graph_ir::{ContractionRows, OperandPrecision};
 use poot_kernelgen::{
     PackedContraction, PackedKernelOp, PackedKernelSpec, PackedRows, PackedRunSharing, Schedule,
     TiledShape, WeightLayout,
@@ -52,7 +52,11 @@ pub(super) fn plan(
         OpKind::PackedDequant { .. } => {
             Err(Site::new(g, eqn, backend, limits).refuse(Capability::ImportedKernelPlanning))
         }
-        OpKind::PackedContraction { descriptor, rows } => try_plan_contraction(
+        OpKind::PackedContraction {
+            descriptor,
+            rows,
+            precision,
+        } => try_plan_contraction(
             g,
             eqn,
             out_shape,
@@ -63,13 +67,19 @@ pub(super) fn plan(
             limits,
             *descriptor,
             *rows,
+            *precision,
             None,
             packed_operands,
         ),
         // A packed contraction followed by its pointwise epilogue (`fuse_contraction_epilogues`): the same
         // Gemv as above with the epilogue applied to each column's sum before its store.
         OpKind::ContractionEpilogue {
-            head: ContractionHead::Packed { descriptor, rows },
+            head:
+                ContractionHead::Packed {
+                    descriptor,
+                    rows,
+                    precision,
+                },
             region,
         } => try_plan_contraction(
             g,
@@ -82,6 +92,7 @@ pub(super) fn plan(
             limits,
             *descriptor,
             *rows,
+            *precision,
             Some(region),
             packed_operands,
         ),
@@ -204,6 +215,7 @@ fn try_plan_contraction(
     limits: BodyLimits,
     descriptor: poot_quant::PackedWeight,
     rows: ContractionRows,
+    precision: OperandPrecision,
     epilogue: Option<&FusedRegion>,
     packed_operands: &[bool],
 ) -> Result<Planned, PlanError> {
@@ -250,6 +262,7 @@ fn try_plan_contraction(
                         k,
                         layout: WeightLayout::Nk,
                         segments: 1,
+                        terms: poot_kernelgen::StagedTerms::of(precision, None, None),
                     },
                     caps,
                 )?;
@@ -271,7 +284,12 @@ fn try_plan_contraction(
             site,
             g,
             eqn,
-            ContractionHead::Packed { descriptor, rows }.operands(),
+            ContractionHead::Packed {
+                descriptor,
+                rows,
+                precision,
+            }
+            .operands(),
             region,
             out_shape,
             odt,
@@ -290,6 +308,7 @@ fn try_plan_contraction(
             epilogue: epilogue.clone(),
             grid,
             meta,
+            precision,
         }))
     };
     // The longest binding a dispatch makes: each weight source at its uploaded word count (the guard word
@@ -433,6 +452,7 @@ fn plan_indexed(
     backend: Backend,
     caps: &DeviceCaps,
 ) -> Result<(Schedule, Vec<PackedLaunch>), PlanError> {
+    let precision = eqn.op.operand_precision().unwrap_or_default();
     let ids = value_ids(eqn);
     if g.aval(ids[1]).dtype != DType::I32 {
         return Err(site.refuse(Capability::IndexOperand));
@@ -475,6 +495,7 @@ fn plan_indexed(
                     k,
                     layout: WeightLayout::Nk,
                     segments: experts,
+                    terms: poot_kernelgen::StagedTerms::of(precision, None, None),
                 },
                 caps,
             )?;
@@ -857,6 +878,7 @@ mod tests {
                 k,
                 layout: WeightLayout::Nk,
                 segments: 1,
+                terms: poot_kernelgen::StagedTerms::ONE,
             },
             &DeviceCaps::wgpu_rdna3_igpu(),
         )
@@ -1049,6 +1071,7 @@ mod tests {
             k,
             layout: WeightLayout::Nk,
             segments: 1,
+            terms: poot_kernelgen::StagedTerms::ONE,
         };
         let (tile_rows, tile_cols) = RegisterTiling::choose(shape, &caps).output_tile();
         let tiles = m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
@@ -1183,6 +1206,7 @@ mod tests {
                 k: 32,
                 layout: WeightLayout::Nk,
                 segments: 1,
+                terms: poot_kernelgen::StagedTerms::ONE,
             },
             &tiny_grid_caps(),
         );

@@ -189,7 +189,10 @@ fn a_dense_gemv_epilogue_matches_the_oracle_on_wgpu() {
     let head = epilogue_head(&g, &target);
     assert!(matches!(
         head,
-        ContractionHead::Dense { weight: DType::F32 }
+        ContractionHead::Dense {
+            weight: DType::F32,
+            ..
+        }
     ));
     assert_fused_matches_oracle(&mut gpu, target, &g, &inputs, "dense gemv epilogue");
 }
@@ -224,7 +227,7 @@ fn a_serial_matmul_epilogue_matches_the_oracle_on_wgpu() {
     ]);
     let g = b.finish(out).unwrap();
     let head = epilogue_head(&g, &spirv_fixture_target());
-    assert!(matches!(head, ContractionHead::MatMul));
+    assert!(matches!(head, ContractionHead::MatMul { .. }));
     assert_fused_matches_oracle(&mut gpu, target, &g, &inputs, "serial matmul epilogue");
 }
 
@@ -257,7 +260,7 @@ fn a_tiled_matmul_epilogue_matches_the_oracle_on_wgpu() {
         ]);
         let g = b.finish(out).unwrap();
         let head = epilogue_head(&g, &target);
-        assert!(matches!(head, ContractionHead::MatMul), "M={m}");
+        assert!(matches!(head, ContractionHead::MatMul { .. }), "M={m}");
         assert_fused_matches_oracle(
             &mut gpu,
             target,
@@ -301,7 +304,8 @@ fn a_dense_bf16_weight_epilogue_matches_the_oracle_on_wgpu() {
     assert!(matches!(
         head,
         ContractionHead::Dense {
-            weight: DType::BF16
+            weight: DType::BF16,
+            ..
         }
     ));
     assert_fused_matches_oracle(&mut gpu, target, &g, &inputs, "dense bf16 epilogue");
@@ -348,7 +352,8 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_wgpu() {
             assert_eq!(
                 head,
                 ContractionHead::Dense {
-                    weight: weight_dtype
+                    weight: weight_dtype,
+                    precision: poot_graph_ir::OperandPrecision::Exact
                 }
             );
             assert_fused_matches_oracle(

@@ -194,6 +194,7 @@ pub fn packed_indexed_linear(
             rows: crate::op::ContractionRows::Indexed {
                 experts: table.experts,
             },
+            precision: crate::precision::OperandPrecision::Exact,
         },
         operands,
     )?;
@@ -532,6 +533,7 @@ mod tests {
                 OpKind::PackedContraction {
                     descriptor,
                     rows: crate::op::ContractionRows::Indexed { experts: 3 },
+                    precision: crate::precision::OperandPrecision::Exact
                 },
                 "{format:?}"
             );

@@ -91,6 +91,13 @@ impl KernelChoice {
         }
     }
 
+    /// The canonical encoding of this choice: its `Debug` text, without the `precision: Exact` a request carries
+    /// by default. An exact request is the one that existed before the field did, so a plan compiled under the
+    /// default policy keeps the key it always had; a narrowed one names its precision and keys differently.
+    pub fn canonical_text(&self) -> String {
+        format!("{self:?}").replace(", precision: Exact", "")
+    }
+
     /// The digest of this choice's canonical encoding for `target`'s codegen epoch.
     fn digest(&self, target: poot_codegen::Target) -> ChoiceDigest {
         // The `Debug` form of the plain-data choice is its encoding. That is sound only while no type
@@ -104,7 +111,7 @@ impl KernelChoice {
         hasher.update(b"\n");
         // The target itself, not only the flags the epoch folds in: two targets may share an epoch's flags.
         hasher.update(format!("{target:?}\n").as_bytes());
-        hasher.update(format!("{self:?}").as_bytes());
+        hasher.update(self.canonical_text().as_bytes());
         ChoiceDigest(*hasher.finalize().as_bytes())
     }
 }
@@ -658,6 +665,60 @@ mod tests {
             .to_string()
     }
 
+    /// POOT-1430: the default policy leaves every plan key where it was. A request at `precision: Exact` encodes
+    /// without the field, byte for byte as it did before the field existed, so no program compiled under the
+    /// default policy changes digest; a narrowed or split request names its precision and keys differently from
+    /// the exact one and from every other precision. Mutation: drop the `replace` in `canonical_text`; the exact
+    /// request names its precision, every digest in `plan_summary` moves, and this row goes red.
+    #[test]
+    fn an_exact_request_keeps_its_pre_precision_encoding_and_a_narrowed_one_does_not() {
+        use poot_graph_ir::{FragmentDtype, OperandPrecision};
+        use poot_kernel_ir::Ty;
+        use poot_kernelgen::{ContractionSpec, Fold, MatmulShapes};
+        let serial = |precision| {
+            KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Serial {
+                dt: Ty::F32,
+                epilogue: None,
+                shapes: MatmulShapes {
+                    out_shape: vec![2, 3],
+                    a_shape: vec![2, 4],
+                    b_shape: vec![4, 3],
+                },
+                fold: Fold {
+                    numel: 6,
+                    two_d: false,
+                    width: 64,
+                },
+                precision,
+            }))
+        };
+        let exact = serial(OperandPrecision::Exact).canonical_text();
+        assert!(!exact.contains("precision"), "{exact}");
+        assert!(
+            exact.ends_with("} }))"),
+            "the text ends as it did before the field: {exact}"
+        );
+        let digests: Vec<_> = [
+            OperandPrecision::Exact,
+            OperandPrecision::Narrow(FragmentDtype::Bf16),
+            OperandPrecision::Narrow(FragmentDtype::F16),
+            OperandPrecision::Split(FragmentDtype::Bf16),
+            OperandPrecision::Split(FragmentDtype::F16),
+        ]
+        .into_iter()
+        .map(|precision| {
+            serial(precision)
+                .digest(Backend::SpirvVulkan.into())
+                .to_string()
+        })
+        .collect();
+        for (i, a) in digests.iter().enumerate() {
+            for b in &digests[i + 1..] {
+                assert_ne!(a, b, "{digests:?}");
+            }
+        }
+    }
+
     /// Card 636: the digest hashes the `Debug` text of the request, so every field must be visible
     /// in it. This is per family, not per field: one field of each family (the `f32` literal a fused region
     /// carries, and for the packed family the hand-written `TileSize` `Debug` and the Gemv launch shape)
@@ -729,6 +790,7 @@ mod tests {
                     b_shape: vec![4, b_cols],
                 },
                 fold: fold(6),
+                precision: poot_graph_ir::OperandPrecision::Exact,
             })
         };
         let attention = |scale: f32| {
@@ -749,6 +811,7 @@ mod tests {
                 bound: KeyBound::Static,
                 sink: AttentionSink::Absent,
                 schedule: AttentionSchedule::Streaming { lanes: 4 },
+                precision: poot_graph_ir::OperandPrecision::Exact,
             })
         };
         let transpose = |perm: Vec<usize>| {
@@ -780,6 +843,7 @@ mod tests {
                 epilogue: None,
                 grid: [64, 1, 1],
                 meta: vec![32, 4],
+                precision: poot_graph_ir::OperandPrecision::Exact,
             }))
         };
         // The register tilings of a short and a long contraction: two lane grids and register tiles.
@@ -792,6 +856,7 @@ mod tests {
                     k: 1024,
                     layout: poot_kernelgen::WeightLayout::Nk,
                     segments: 1,
+                    terms: poot_kernelgen::StagedTerms::ONE,
                 },
                 &DeviceCaps::rocm_default(),
             )

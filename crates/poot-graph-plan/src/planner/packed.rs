@@ -10,6 +10,7 @@ use crate::predicates::dense_decode_gemv_in;
 use crate::refusal::Site;
 use crate::storage_analysis::dense_contraction_weight_storage;
 use crate::types::{StorageKind, ValueStorage};
+use poot_graph_ir::OperandPrecision;
 use poot_target::{Backend, DeviceCaps};
 
 /// Whether this family lowers `op` over these storage dtypes. The E4M3FN table row gather reads the
@@ -40,6 +41,11 @@ pub(super) fn plan(
     let site = Site::new(g, eqn, backend, limits);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
     let ids = value_ids(eqn);
+    // How the equation reads its operands, and the tiles a split one stages for a weight in `weight`'s storage.
+    let precision = eqn.op.operand_precision().unwrap_or_default();
+    let terms = |weight: poot_target::BufferStorage| {
+        kg::StagedTerms::of(precision, None, kg::stored_fragment_dtype(weight))
+    };
     let mut planned = match &eqn.op {
         // Card 645: the contraction over a weight in checkpoint `[N, K]` order, so a family written against the
         // checkpoint's orientation never runs a device `transpose`. The generated bodies read the weight in its
@@ -63,6 +69,7 @@ pub(super) fn plan(
         // Its storage is the BF16 const rule ([`value_storage_kind`]), so a BF16 weight may have other readers.
         OpKind::DenseContraction {
             weight: dtype @ (DType::F32 | DType::F16 | DType::BF16),
+            ..
         } => {
             let kind = match dtype {
                 DType::BF16 => StorageKind::Bf16Packed,
@@ -77,7 +84,7 @@ pub(super) fn plan(
             let k = shape(ids[1])[1];
             if let Some(launch) = dense_decode_gemv_in(eqn, out_shape, out_numel, caps) {
                 let schedule = launch.schedule(backend, k);
-                dense_gemv(site, backend, weight, schedule, k, n, None, caps)?
+                dense_gemv(site, backend, weight, schedule, k, n, None, precision, caps)?
             } else {
                 matmul::dense_tiled_plan(
                     site,
@@ -89,9 +96,11 @@ pub(super) fn plan(
                         k,
                         layout: WeightLayout::Nk,
                         segments: 1,
+                        terms: terms(weight),
                     },
                     kg::DenseTiledWeight::Nk(weight),
                     None,
+                    precision,
                     caps,
                 )?
             }
@@ -100,7 +109,7 @@ pub(super) fn plan(
         // weight storage (BF16 included) and Gemv as above at `M == 1`, else the register-tiled GEMM, each applying
         // the epilogue to the head's f32 result before the store.
         OpKind::ContractionEpilogue {
-            head: ContractionHead::Dense { weight: dtype },
+            head: head @ ContractionHead::Dense { weight: dtype, .. },
             region,
         } => {
             let storage = match dtype {
@@ -113,7 +122,7 @@ pub(super) fn plan(
                 site,
                 g,
                 eqn,
-                ContractionHead::Dense { weight: *dtype }.operands(),
+                head.operands(),
                 region,
                 out_shape,
                 odt,
@@ -123,7 +132,17 @@ pub(super) fn plan(
             let n = out_shape[out_shape.len() - 1];
             if let Some(launch) = dense_decode_gemv_in(eqn, out_shape, out_numel, caps) {
                 let schedule = launch.schedule(backend, k);
-                dense_gemv(site, backend, weight, schedule, k, n, Some(epilogue), caps)?
+                dense_gemv(
+                    site,
+                    backend,
+                    weight,
+                    schedule,
+                    k,
+                    n,
+                    Some(epilogue),
+                    precision,
+                    caps,
+                )?
             } else {
                 matmul::dense_tiled_plan(
                     site,
@@ -135,9 +154,11 @@ pub(super) fn plan(
                         k,
                         layout: WeightLayout::Nk,
                         segments: 1,
+                        terms: terms(weight),
                     },
                     kg::DenseTiledWeight::Nk(weight),
                     Some(epilogue),
+                    precision,
                     caps,
                 )?
             }
@@ -149,8 +170,10 @@ pub(super) fn plan(
         OpKind::GroupedDenseContraction {
             weight: DType::BF16,
             groups,
+            ..
         } => {
             let k = shape(ids[1])[1];
+            let weight = ValueStorage::new(StorageKind::Bf16Packed).buffer_storage();
             matmul::dense_tiled_plan(
                 site,
                 backend,
@@ -161,11 +184,11 @@ pub(super) fn plan(
                     k,
                     layout: WeightLayout::Nk,
                     segments: 1,
+                    terms: terms(weight),
                 },
-                kg::DenseTiledWeight::Nk(
-                    ValueStorage::new(StorageKind::Bf16Packed).buffer_storage(),
-                ),
+                kg::DenseTiledWeight::Nk(weight),
                 None,
+                precision,
                 caps,
             )?
         }
@@ -262,6 +285,7 @@ fn dense_gemv(
     k: usize,
     n: usize,
     epilogue: Option<kg::Epilogue>,
+    precision: OperandPrecision,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
     // The longest binding: the `[N, K]` weight counted in elements (at least its words), above the `K` activation,
@@ -279,6 +303,7 @@ fn dense_gemv(
             k,
             n,
             epilogue,
+            precision,
         }),
         backend,
         caps,

@@ -87,7 +87,8 @@ pub(crate) fn engine_args(config: &ServeConfig, draft: DraftPolicy) -> Result<En
         .with_shape(config.rows, config.max_seq)
         .with_placement(config.placement.clone())
         .with_expert_pool(config.expert_pool)
-        .with_kv_dtype(config.kv_dtype))
+        .with_kv_dtype(config.kv_dtype)
+        .with_matmul_precision(config.matmul_precision))
 }
 
 /// The draft policy the flags name: `Off` with none of the three. A `--draft-model` checkpoint is loaded

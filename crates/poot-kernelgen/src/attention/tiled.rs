@@ -46,6 +46,8 @@ use crate::data_movement::Cfg;
 use crate::emit::{Emit, bin, cu};
 use crate::helpers::{elem, ld, slice_dtype, slice_f32};
 use crate::microtile::{Acc, Coord, Geometry, LaneRows, MicroCols, MicroTile, Staged};
+use crate::precision::narrowed;
+use poot_graph_ir::OperandPrecision;
 
 /// `Q^T`: element `(channel d, row r)` at `d * (rows + 1) + r`.
 const Q_ARRAY: u8 = 0;
@@ -415,7 +417,16 @@ pub(super) fn tiled_body(
         sink,
         schedule: _,
         kv,
+        precision,
     } = *spec;
+    // One staged tile per operand: a narrowed operand is rounded as it is staged (Q, K, V and P), and a split one,
+    // which has a `lo` tile as well, is the streaming schedule's.
+    if let OperandPrecision::Split(_) = precision {
+        return Err(KernelGenError::Unsupported {
+            request: "attention_tiled",
+            reason: "a split operand precision has no tiled schedule",
+        });
+    }
     let hkv = hq / n_rep;
     let blocks_per_head = lq.div_ceil(br);
     let shared_dim = match key {
@@ -507,7 +518,8 @@ pub(super) fn tiled_body(
                 let row = tile.flat(e, h, i);
                 let base = un(e, BinOp::Mul, row, dk);
                 let at = uu(e, BinOp::Add, base, d);
-                e.let_(Ty::F32, Rvalue::Use(crate::helpers::copy(elem(q, at))))
+                let raw = e.let_(Ty::F32, Rvalue::Use(crate::helpers::copy(elem(q, at))));
+                narrowed(e, precision, None, raw)
             },
             |e, r, d, value| {
                 let by_channel = un(e, BinOp::Mul, d, tile_rows + 1);
@@ -640,6 +652,7 @@ pub(super) fn tiled_body(
                 |e, j, d, value| {
                     let by_channel = un(e, BinOp::Mul, d, bc + 1);
                     let slot = uu(e, BinOp::Add, by_channel, j);
+                    let value = narrowed(e, precision, kv.fragment(), value);
                     e.write_lds(KV_ARRAY, op(slot), op(value));
                 },
             );
@@ -652,6 +665,7 @@ pub(super) fn tiled_body(
                         let channel = un(e, BinOp::Add, d, head_dim);
                         let by_channel = un(e, BinOp::Mul, channel, bc + 1);
                         let slot = uu(e, BinOp::Add, by_channel, j);
+                        let value = narrowed(e, precision, kv.fragment(), value);
                         e.write_lds(KV_ARRAY, op(slot), op(value));
                     },
                 );
@@ -729,13 +743,14 @@ pub(super) fn tiled_body(
                 |e, j, d, value| {
                     let by_key = un(e, BinOp::Mul, j, dv);
                     let slot = uu(e, BinOp::Add, by_key, d);
+                    let value = narrowed(e, precision, kv.fragment(), value);
                     e.write_lds(KV_ARRAY, op(slot), op(value));
                 },
             );
             c.emit(|e| {
                 let maxima = gs.row_values(e, |e, row| running_max(e, row, owners).1);
                 s.map_rows(e, &maxima, |e, _, m, value| weight(e, value, m));
-                s.stage(e, tiles.p);
+                s.stage(e, tiles.p, |e, p| narrowed(e, precision, None, p));
                 s.row_reduce(e, BinOp::Add).publish(e, &gs, RED_SUM_ARRAY);
                 let alphas = go.row_values(e, |e, row| {
                     let (old, new) = running_max(e, row, owners);

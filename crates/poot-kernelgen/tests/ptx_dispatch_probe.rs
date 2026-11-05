@@ -198,6 +198,7 @@ fn attention_spec(
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes },
+        precision: poot_graph_ir::OperandPrecision::Exact,
     }
 }
 
@@ -397,6 +398,7 @@ fn attention_split_key_and_live_bound_match_cpu_on_ptx() {
         bound: kg::KeyBound::Live,
         sink: kg::AttentionSink::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes: 8 },
+        precision: poot_graph_ir::OperandPrecision::Exact,
     };
     let len = [37i32, 100, -1, 1000];
     let q = attention_fill(batch * hq * dk, 1);

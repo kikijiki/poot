@@ -37,16 +37,16 @@ pub(super) fn plan(
     let mut planned = match &eqn.op {
         // card 088: x[M,K], W[E,K,N], idx[M] -> [M,N]; each row reads its own expert's slab in-kernel. With a
         // routed gate weighting fused behind it (`ContractionEpilogue`), the epilogue runs over each sum.
-        OpKind::IndexedMatMul => plan_indexed(site, g, eqn, backend, views, caps, None)?,
+        OpKind::IndexedMatMul { .. } => plan_indexed(site, g, eqn, backend, views, caps, None)?,
         OpKind::ContractionEpilogue {
-            head: ContractionHead::Indexed,
+            head: head @ ContractionHead::Indexed { .. },
             region,
         } => {
             let epilogue = matmul::epilogue_of(
                 site,
                 g,
                 eqn,
-                ContractionHead::Indexed.operands(),
+                head.operands(),
                 region,
                 out_shape,
                 odt,
@@ -147,6 +147,7 @@ fn plan_indexed(
     epilogue: Option<kg::Epilogue>,
 ) -> Result<Planned, PlanError> {
     let ids = value_ids(eqn);
+    let precision = eqn.op.operand_precision().unwrap_or_default();
     if !indexed_matmul_lowers(g, eqn) {
         return Err(site.refuse(Capability::DtypeLowering));
     }
@@ -197,6 +198,7 @@ fn plan_indexed(
                     k,
                     layout,
                     segments: experts,
+                    terms: kg::StagedTerms::of(precision, None, kg::stored_fragment_dtype(weight)),
                 },
                 caps,
             )?;
@@ -220,6 +222,7 @@ fn plan_indexed(
                 epilogue: epilogue.clone(),
                 grid,
                 meta,
+                precision,
             }))
         },
     )

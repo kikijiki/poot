@@ -1,5 +1,6 @@
 use super::{BinOp, Builder, BuilderError, DType, RedOp, Scalar, Traced, UnOp, softcap};
 use crate::error::Requirement;
+use crate::precision::OperandPrecision;
 
 /// GQA repeat_kv: broadcast each of H_kv heads to n_rep query heads.
 /// `k[bsz,H_kv,S,D]` -> `[bsz,H_kv*n_rep,S,D]`.
@@ -59,6 +60,7 @@ pub fn attention_masked_sinks(
         None,
         None,
         Some(sinks),
+        OperandPrecision::Exact,
     )
 }
 
@@ -153,6 +155,7 @@ pub fn attention_masked_softcap(
         attn_logit_softcap,
         None,
         None,
+        OperandPrecision::Exact,
     )
 }
 
@@ -237,6 +240,7 @@ pub fn attention_live(
         attn_logit_softcap,
         Some(live_len),
         None,
+        OperandPrecision::Exact,
     )?;
     Ok(LiveAttention {
         out,
@@ -264,6 +268,7 @@ pub(crate) fn attention_over_keys(
     attn_logit_softcap: Option<f32>,
     live_len: Option<Traced>,
     sinks: Option<Traced>,
+    precision: OperandPrecision,
 ) -> Result<Traced, BuilderError> {
     let live = match live_len {
         Some(len) => {
@@ -290,7 +295,7 @@ pub(crate) fn attention_over_keys(
     let k = repeat_kv(b, k, n_rep)?;
     let v = repeat_kv(b, v, n_rep)?;
     let kt = b.transpose(k, vec![0, 1, 3, 2])?; // [B,Hq,D,Lk]
-    let scores = b.matmul(q, kt)?; // [B,Hq,Lq,Lk]
+    let scores = b.matmul_as(q, kt, precision)?; // [B,Hq,Lq,Lk]
     let scores = b.binary_scalar(BinOp::Mul, scores, Scalar::F32(scale))?;
     let scores = match attn_logit_softcap {
         Some(c) => softcap(b, scores, c)?,
@@ -328,7 +333,7 @@ pub(crate) fn attention_over_keys(
         None => denom,
     };
     let p = b.binary(BinOp::Div, e, denom)?;
-    b.matmul(p, v) // [B,Hq,Lq,Dv]
+    b.matmul_as(p, v, precision) // [B,Hq,Lq,Dv]
 }
 
 /// The activity conditions and select fallbacks of a live bound, built once from `len [B]`.

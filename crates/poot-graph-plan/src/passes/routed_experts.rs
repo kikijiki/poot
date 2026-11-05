@@ -104,7 +104,7 @@ fn upstream_router(g: &Graph, producer: &HashMap<ValueId, usize>, start: usize) 
 /// The operand position of an indexed contraction's per-row expert index, `None` for any other op.
 fn expert_index_position(op: &OpKind) -> Option<usize> {
     match op {
-        OpKind::IndexedMatMul => Some(2),
+        OpKind::IndexedMatMul { .. } => Some(2),
         OpKind::PackedContraction {
             rows: ContractionRows::Indexed { .. },
             ..
@@ -217,7 +217,7 @@ mod tests {
         assert_eq!(site.experts.len(), 1);
         assert!(matches!(
             g.eqns()[site.experts[0]].op,
-            OpKind::IndexedMatMul
+            OpKind::IndexedMatMul { .. }
         ));
     }
 }

@@ -11,6 +11,8 @@ use super::tiled::{TiledBody, TiledLaunch, TiledWeight, tiled_body};
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, copy};
 use crate::helpers::{Alloc, WeightLane, WeightLayout, ld, local, slice_dtype, slice_f32};
+use crate::precision::ProductRead;
+use poot_graph_ir::OperandPrecision;
 
 /// The weight of a dense `M > 1` contraction: its orientation and its planned storage. Only the checkpoint's
 /// `[N, K]` order reads a narrow (packed) weight; a `[K, N]` weight (the operand of a traced `MatMul`) is f32, so a
@@ -55,6 +57,7 @@ pub(crate) fn dense_contraction(
     schedule: Schedule,
     k: usize,
     epilogue: Option<&Epilogue>,
+    precision: OperandPrecision,
 ) -> Result<Body, KernelGenError> {
     let lane = WeightLane::of("dense_contraction", weight)?;
     if let Some(epilogue) = epilogue {
@@ -72,6 +75,7 @@ pub(crate) fn dense_contraction(
             GemvLaunch::new(width, cols, unroll, activation)?,
             k,
             epilogue,
+            ProductRead::dense(precision, lane),
         ),
         Schedule::RegisterTiled { .. } => Err(KernelGenError::Unsupported {
             request: "dense_contraction",
@@ -93,6 +97,7 @@ pub(crate) fn dense_tiled_contraction(
     schedule: Schedule,
     k: usize,
     epilogue: Option<&Epilogue>,
+    precision: OperandPrecision,
 ) -> Result<Body, KernelGenError> {
     const GENERATOR: &str = "dense_tiled_contraction";
     let lane = weight.lane(GENERATOR)?;
@@ -141,6 +146,7 @@ pub(crate) fn dense_tiled_contraction(
             lanes: &leaf_lanes,
         }),
         walk: None,
+        read: ProductRead::dense(precision, lane),
     };
     let rows_aligned = k.is_multiple_of(lane.per_word());
     let word_aligned = rows_aligned && (run.get() as usize).is_multiple_of(lane.per_word());
@@ -180,6 +186,7 @@ fn dense_gemv(
     launch: GemvLaunch,
     k: usize,
     epilogue: Option<&Epilogue>,
+    read: ProductRead,
 ) -> Result<Body, KernelGenError> {
     let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
     let lanes = match epilogue {
@@ -220,6 +227,7 @@ fn dense_gemv(
         3 + leaf_count as u32 + 1,
         [activation, metadata, out],
         launch,
+        read,
         epilogue,
         read_run,
     ))
@@ -231,6 +239,7 @@ mod tests {
     use poot_target::{BufferStorage, DeviceCaps};
 
     use super::{DenseTiledWeight, dense_tiled_contraction};
+    use crate::StagedTerms;
     use crate::contraction::RegisterTiling;
     use crate::helpers::WeightLayout;
 
@@ -302,9 +311,18 @@ mod tests {
                         (0..k).map(|d| activation[row * k + d] * at(b, c, d)).sum()
                     })
                     .collect();
-                for tiling in RegisterTiling::candidates(k, weight.layout(), &caps) {
-                    let body = dense_tiled_contraction("t", weight, tiling.schedule(), k, None)
-                        .expect("a planned tiling generates");
+                for tiling in
+                    RegisterTiling::candidates(k, weight.layout(), StagedTerms::ONE, &caps)
+                {
+                    let body = dense_tiled_contraction(
+                        "t",
+                        weight,
+                        tiling.schedule(),
+                        k,
+                        None,
+                        poot_graph_ir::OperandPrecision::Exact,
+                    )
+                    .expect("a planned tiling generates");
                     let (tile_rows, tile_cols) = tiling.output_tile();
                     let tiles = blocks * m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
                     let meta = [k as u32, n as u32, m as u32, tiles as u32, 0];

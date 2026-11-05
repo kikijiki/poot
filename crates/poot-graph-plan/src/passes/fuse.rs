@@ -780,17 +780,22 @@ pub(crate) fn fuse_contraction_epilogues(
 /// `DenseContraction`, or a plain (`Blocks(1)`) or indexed `PackedContraction`.
 fn epilogue_head(g: &Graph, eqn: &Eqn) -> Option<ContractionHead> {
     match &eqn.op {
-        OpKind::DenseContraction { weight } => Some(ContractionHead::Dense { weight: *weight }),
+        OpKind::DenseContraction { weight, precision } => Some(ContractionHead::Dense {
+            weight: *weight,
+            precision: *precision,
+        }),
         // A plain (`Blocks(1)`) or indexed contraction: the packed Gemv carries an epilogue, the tiled one does not
         // (`epilogue_head_lowers` decides per shape).
         OpKind::PackedContraction {
             descriptor,
             rows: rows @ (ContractionRows::Blocks(1) | ContractionRows::Indexed { .. }),
+            precision,
         } => Some(ContractionHead::Packed {
             descriptor: *descriptor,
             rows: *rows,
+            precision: *precision,
         }),
-        OpKind::IndexedMatMul => {
+        OpKind::IndexedMatMul { precision } => {
             let [Operand::Value(x), Operand::Value(w), Operand::Value(_)] = eqn.inputs.as_slice()
             else {
                 return None;
@@ -799,16 +804,22 @@ fn epilogue_head(g: &Graph, eqn: &Eqn) -> Option<ContractionHead> {
             // An f32 contraction over an f32 or BF16 expert stack (the packed lane widens in-register).
             let weight_fits = g.aval(*w).dtype == dtype
                 || (dtype == DType::F32 && g.aval(*w).dtype == DType::BF16);
-            (is_float(dtype) && g.aval(*x).dtype == dtype && weight_fits)
-                .then_some(ContractionHead::Indexed)
+            (is_float(dtype) && g.aval(*x).dtype == dtype && weight_fits).then_some(
+                ContractionHead::Indexed {
+                    precision: *precision,
+                },
+            )
         }
-        OpKind::MatMul { .. } => {
+        OpKind::MatMul { precision, .. } => {
             let [Operand::Value(a), Operand::Value(b)] = eqn.inputs.as_slice() else {
                 return None;
             };
             let dtype = g.aval(eqn.out).dtype;
-            (is_float(dtype) && g.aval(*a).dtype == dtype && g.aval(*b).dtype == dtype)
-                .then_some(ContractionHead::MatMul)
+            (is_float(dtype) && g.aval(*a).dtype == dtype && g.aval(*b).dtype == dtype).then_some(
+                ContractionHead::MatMul {
+                    precision: *precision,
+                },
+            )
         }
         _ => None,
     }

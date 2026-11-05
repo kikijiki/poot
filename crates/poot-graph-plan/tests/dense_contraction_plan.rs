@@ -72,7 +72,7 @@ fn request(program: &Program, want: impl Fn(&OpKind) -> bool) -> &KernelRequest 
 }
 
 fn is_dense_f32(op: &OpKind) -> bool {
-    matches!(op, OpKind::DenseContraction { weight } if *weight == DType::F32)
+    matches!(op, OpKind::DenseContraction { weight, .. } if *weight == DType::F32)
 }
 
 /// SC-002: the program holds one `DenseContraction` equation for the projection and no `Transpose` dispatch,
@@ -205,7 +205,7 @@ fn f16_projection(m: usize) -> Graph {
 }
 
 fn is_dense_f16(op: &OpKind) -> bool {
-    matches!(op, OpKind::DenseContraction { weight } if *weight == DType::F16)
+    matches!(op, OpKind::DenseContraction { weight, .. } if *weight == DType::F16)
 }
 
 /// The weight-operand storage every request of the contraction names, and the storage the program planned for
@@ -353,7 +353,10 @@ fn a_packed_f16_weight_with_a_native_reader_is_a_typed_refusal() {
             .iter_mut()
             .find(|eqn| matches!(eqn.op, OpKind::MatMul { .. }))
             .expect("the traced graph multiplies");
-        matmul.op = OpKind::DenseContraction { weight: DType::F16 };
+        matmul.op = OpKind::DenseContraction {
+            weight: DType::F16,
+            precision: poot_graph_ir::OperandPrecision::Exact,
+        };
         matmul.inputs[1] = Operand::Value(w.id());
     })
     .unwrap();
@@ -416,7 +419,7 @@ fn a_biased_residual_dense_head_is_one_epilogue_contraction_at_every_m() {
                     matches!(
                         op,
                         OpKind::ContractionEpilogue {
-                            head: poot_graph_ir::op::ContractionHead::Dense { weight: stored },
+                            head: poot_graph_ir::op::ContractionHead::Dense { weight: stored, .. },
                             ..
                         } if *stored == weight
                     )
@@ -474,7 +477,7 @@ fn a_biased_residual_tiled_matmul_head_is_one_epilogue_contraction() {
                 matches!(
                     op,
                     OpKind::ContractionEpilogue {
-                        head: poot_graph_ir::op::ContractionHead::MatMul,
+                        head: poot_graph_ir::op::ContractionHead::MatMul { .. },
                         ..
                     }
                 )
@@ -655,7 +658,8 @@ fn is_grouped_bf16(op: &OpKind) -> bool {
         op,
         OpKind::GroupedDenseContraction {
             weight: DType::BF16,
-            groups: GROUPS
+            groups: GROUPS,
+            ..
         }
     )
 }
@@ -840,6 +844,7 @@ fn a_grouped_contraction_over_a_weight_without_grouped_rows_is_a_typed_refusal()
             draft.eqns_mut()[matmul].op = OpKind::GroupedDenseContraction {
                 weight,
                 groups: GROUPS,
+                precision: poot_graph_ir::OperandPrecision::Exact,
             };
             draft.eqns_mut()[matmul].inputs = vec![Operand::Value(x.id()), Operand::Value(w.id())];
         })

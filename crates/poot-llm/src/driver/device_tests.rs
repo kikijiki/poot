@@ -179,6 +179,7 @@ pub(super) fn options(chunk: usize, capacity: usize) -> DriverOptions {
         charge: crate::driver::program_retention,
         draft: crate::driver::DraftPolicy::Off,
         hidden_window: None,
+        matmul_precision: None,
     }
 }
 

@@ -113,6 +113,7 @@ fn build_with(
         case.scale(),
         None,
         case.ratio,
+        poot_graph_ir::OperandPrecision::Exact,
     )
     .unwrap();
     let graph = b.finish(Outputs::new(out)).unwrap();

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use poot_executor::DetailedTiming;
+use poot_llm::driver::MatmulPrecision;
 use poot_llm::driver::{BackendChoice, LoadOptions};
 use poot_models::model::KvDtype;
 use poot_text::ChatTemplateOverride;
@@ -160,6 +161,12 @@ pub(crate) struct ServeConfig {
     /// model's own preference applies, else f16. Attention computes in f32 whichever is stored.
     #[arg(long, value_name = "DTYPE", value_parser = parse_kv_dtype)]
     pub(crate) kv_dtype: Option<KvDtype>,
+    /// How contraction and attention operands are read: `exact` (as the graph declares them), `narrow` (rounded
+    /// to the target's matrix-unit dtype where it has one, accumulated in f32) or `split` (hi + lo parts of that
+    /// dtype, near-f32 accuracy). Without it the engine default applies. A target with no matrix unit runs
+    /// `exact` whichever is asked.
+    #[arg(long, value_name = "POLICY", value_parser = parse_matmul_precision)]
+    pub(crate) matmul_precision: Option<MatmulPrecision>,
     /// Render chats through this jinja template instead of the model's own. A value with no jinja
     /// syntax names a built-in template, which poot lacks, and is refused.
     #[arg(long, value_name = "JINJA", conflicts_with = "chat_template_file")]
@@ -443,6 +450,10 @@ fn parse_max_seq(raw: &str) -> Result<NonZeroUsize, String> {
 
 fn parse_expert_pool(raw: &str) -> Result<NonZeroUsize, String> {
     positive(raw, "the pool row count")
+}
+
+fn parse_matmul_precision(raw: &str) -> Result<MatmulPrecision, String> {
+    MatmulPrecision::parse(raw).ok_or_else(|| format!("{raw:?}: expected exact, narrow or split"))
 }
 
 fn parse_kv_dtype(raw: &str) -> Result<KvDtype, String> {

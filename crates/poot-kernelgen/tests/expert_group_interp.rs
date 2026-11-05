@@ -128,6 +128,7 @@ fn run_indexed(x: &[f32], ids: &[i32]) -> Vec<f32> {
             k: K,
             layout: kg::WeightLayout::Kn,
             segments: EXPERTS,
+            terms: poot_kernelgen::StagedTerms::ONE,
         },
         &caps,
     )
@@ -145,6 +146,7 @@ fn run_indexed(x: &[f32], ids: &[i32]) -> Vec<f32> {
             epilogue: None,
             grid: [threads, 1, 1],
             meta: vec![K as u32, N as u32, rows as u32, tiles, 0, EXPERTS as u32],
+            precision: poot_graph_ir::OperandPrecision::Exact,
         }));
     let generated = kg::generate(&request, &caps, &limits).unwrap();
     let wg = generated.body.workgroup_size[0];

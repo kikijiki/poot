@@ -2072,7 +2072,10 @@ fn a_dense_gemv_epilogue_matches_the_oracle_on_rocm() {
     assert_fuses_into_one_epilogue(
         &g,
         &target,
-        poot_graph_ir::op::ContractionHead::Dense { weight: DType::F32 },
+        poot_graph_ir::op::ContractionHead::Dense {
+            weight: DType::F32,
+            precision: poot_graph_ir::OperandPrecision::Exact,
+        },
     );
     assert_fused_matches_oracle(&mut rocm, target, &g, &inputs, "dense gemv epilogue");
 }
@@ -2124,6 +2127,7 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_rocm() {
                 &target,
                 poot_graph_ir::op::ContractionHead::Dense {
                     weight: weight_dtype,
+                    precision: poot_graph_ir::OperandPrecision::Exact,
                 },
             );
             assert_fused_matches_oracle(
@@ -2163,7 +2167,13 @@ fn a_serial_matmul_epilogue_matches_the_oracle_on_rocm() {
         ),
     ]);
     let g = b.finish(out).unwrap();
-    assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
+    assert_fuses_into_one_epilogue(
+        &g,
+        &target,
+        poot_graph_ir::op::ContractionHead::MatMul {
+            precision: poot_graph_ir::OperandPrecision::Exact,
+        },
+    );
     assert_fused_matches_oracle(&mut rocm, target, &g, &inputs, "serial matmul epilogue");
 }
 
@@ -2192,7 +2202,13 @@ fn a_tiled_matmul_epilogue_matches_the_oracle_on_rocm() {
             (residual.id(), HostTensor::f32(vec![m, n], fill(4, m * n))),
         ]);
         let g = b.finish(out).unwrap();
-        assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
+        assert_fuses_into_one_epilogue(
+            &g,
+            &target,
+            poot_graph_ir::op::ContractionHead::MatMul {
+                precision: poot_graph_ir::OperandPrecision::Exact,
+            },
+        );
         assert_fused_matches_oracle(
             &mut rocm,
             target,
@@ -2240,7 +2256,13 @@ fn a_narrow_head_rounds_before_its_residual_on_rocm() {
             (residual.id(), tensor(&[1, 1], vec![minus_one])),
         ]);
         let g = b.finish(out).unwrap();
-        assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
+        assert_fuses_into_one_epilogue(
+            &g,
+            &target,
+            poot_graph_ir::op::ContractionHead::MatMul {
+                precision: poot_graph_ir::OperandPrecision::Exact,
+            },
+        );
         let got = assert_fused_matches_oracle(
             &mut rocm,
             target,
@@ -2288,7 +2310,13 @@ fn every_step_of_a_narrow_epilogue_rounds_through_its_dtype_on_rocm() {
         (leaf.id(), HostTensor::bf16(vec![1, 1], vec![tie])),
     ]);
     let g = b.finish(out).unwrap();
-    assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
+    assert_fuses_into_one_epilogue(
+        &g,
+        &target,
+        poot_graph_ir::op::ContractionHead::MatMul {
+            precision: poot_graph_ir::OperandPrecision::Exact,
+        },
+    );
     let got = assert_fused_matches_oracle(&mut rocm, target, &g, &inputs, "bf16 multistage");
     assert_eq!(got.to_f32().unwrap().as_ref(), [1.0]);
 }

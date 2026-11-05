@@ -92,6 +92,7 @@ fn tiled_spec(br: usize, bc: usize, score: (usize, usize), out: (usize, usize)) 
                 },
             },
         },
+        precision: poot_graph_ir::OperandPrecision::Exact,
     }
 }
 
@@ -139,6 +140,7 @@ fn the_dense_register_tiled_contraction_spills_no_register() {
             k,
             layout: WeightLayout::Nk,
             segments: 1,
+            terms: crate::precision::StagedTerms::ONE,
         };
         let tiling = RegisterTiling::choose(shape, &caps);
         let name = format!("budget_dense_{label}");
@@ -148,6 +150,7 @@ fn the_dense_register_tiled_contraction_spills_no_register() {
             tiling.schedule(),
             k,
             None,
+            poot_graph_ir::OperandPrecision::Exact,
         )
         .unwrap();
         let Some((vgprs, spilled)) = compiled_registers(&body) else {

@@ -468,6 +468,7 @@ fn args(backend: BackendChoice) -> EngineArgs {
         embeds: false,
         expert_pool: None,
         kv_dtype: None,
+        matmul_precision: None,
     }
 }
 
@@ -489,7 +490,7 @@ fn live_total(handle: &Arc<ModelHandle>, candidate: &Candidate) -> u64 {
     let driver = Driver::new(
         Arc::clone(handle),
         Box::new(executor),
-        driver_options(handle, generate(candidate), DraftPolicy::Off, None),
+        driver_options(handle, generate(candidate), DraftPolicy::Off, None, None),
     )
     .expect("driver");
     let rows = [candidate.rows];
@@ -746,7 +747,7 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
         let rows = [candidate.rows];
         let planned = planner
             .plan(
-                driver_options(&handle, generate(candidate), DraftPolicy::Off, None),
+                driver_options(&handle, generate(candidate), DraftPolicy::Off, None, None),
                 &shapes_of(&candidate, &rows),
                 &[],
             )
@@ -755,7 +756,7 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
         let driver = Driver::new(
             Arc::clone(&handle),
             Box::new(executor),
-            driver_options(&handle, generate(candidate), DraftPolicy::Off, None),
+            driver_options(&handle, generate(candidate), DraftPolicy::Off, None, None),
         )
         .unwrap();
         let driver = driver.prepare(&shapes_of(&candidate, &rows)).unwrap();
@@ -844,7 +845,7 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         let r = [candidate.rows];
         let planned = planner
             .plan(
-                driver_options(&handle, generate(candidate), DraftPolicy::Off, None),
+                driver_options(&handle, generate(candidate), DraftPolicy::Off, None, None),
                 &shapes_of(candidate, &r),
                 &[],
             )
@@ -883,7 +884,7 @@ fn startup_reads_the_weights_once_however_many_candidates_it_plans() {
         let driver = Driver::new(
             Arc::clone(&handle),
             Box::new(executor),
-            driver_options(&handle, generate(chosen), DraftPolicy::Off, None),
+            driver_options(&handle, generate(chosen), DraftPolicy::Off, None, None),
         )
         .expect("driver");
         let rows = [chosen.rows];
@@ -932,7 +933,7 @@ fn loaded_kernels(handle: &Arc<ModelHandle>, candidate: &Candidate) -> HashSet<u
     let driver = Driver::new(
         Arc::clone(handle),
         Box::new(executor),
-        driver_options(handle, generate(candidate), DraftPolicy::Off, None),
+        driver_options(handle, generate(candidate), DraftPolicy::Off, None, None),
     )
     .expect("driver");
     let rows = [candidate.rows];
@@ -965,7 +966,7 @@ fn a_planner_resolves_each_distinct_kernel_once_across_candidates() {
         let rows = [candidate.rows];
         planner
             .plan(
-                driver_options(&handle, generate(candidate), DraftPolicy::Off, None),
+                driver_options(&handle, generate(candidate), DraftPolicy::Off, None, None),
                 &shapes_of(candidate, &rows),
                 &[],
             )
@@ -1094,7 +1095,7 @@ fn admission_uses_the_fresh_budget_and_publishes_only_the_chosen_candidate() {
         let driver = Driver::new(
             Arc::clone(&handle),
             Box::new(reference),
-            driver_options(&handle, generate(domain[k]), DraftPolicy::Off, None),
+            driver_options(&handle, generate(domain[k]), DraftPolicy::Off, None, None),
         )
         .expect("driver");
         let rows = [domain[k].rows];
@@ -1430,7 +1431,7 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
     let oracle = Driver::new(
         Arc::clone(&handle),
         Box::new(executor),
-        driver_options(&handle, generate(first), DraftPolicy::Off, None),
+        driver_options(&handle, generate(first), DraftPolicy::Off, None, None),
     )
     .unwrap();
     let oracle = oracle.prepare(&shapes_of(&first, &[first.rows])).unwrap();
@@ -1467,7 +1468,7 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
             Planner::new(Arc::clone(&handle), &targets, Placement::Single)
                 .unwrap()
                 .plan(
-                    driver_options(&handle, generate(c), DraftPolicy::Off, None),
+                    driver_options(&handle, generate(c), DraftPolicy::Off, None, None),
                     &shapes_of(&c, &rows),
                     &[],
                 )
@@ -1564,7 +1565,7 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
     let rows = [candidate.rows];
     let planned = planner
         .plan(
-            driver_options(&handle, generate(candidate), DraftPolicy::Off, None),
+            driver_options(&handle, generate(candidate), DraftPolicy::Off, None, None),
             &shapes_of(&candidate, &rows),
             &[],
         )
@@ -1579,7 +1580,7 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
     let driver = Driver::new(
         Arc::clone(&handle),
         Box::new(executor),
-        driver_options(&handle, generate(candidate), DraftPolicy::Off, None),
+        driver_options(&handle, generate(candidate), DraftPolicy::Off, None, None),
     )
     .unwrap();
     let driver = driver.prepare(&shapes_of(&candidate, &rows)).unwrap();
@@ -1667,6 +1668,7 @@ fn a_recurrent_family_plans_many_rows_and_its_state_bytes_grow_with_the_sequence
                         max_seq,
                     },
                     DraftPolicy::Off,
+                    None,
                     None,
                 ),
                 &ServingShapes {
@@ -1866,7 +1868,7 @@ fn smallest_candidate_bytes(
     let planned = Planner::new(Arc::clone(handle), &targets, placement)
         .expect("a planner")
         .plan(
-            driver_options(handle, generate(candidate), DraftPolicy::Off, None),
+            driver_options(handle, generate(candidate), DraftPolicy::Off, None, None),
             &shapes_of(&candidate, &rows),
             &[],
         )

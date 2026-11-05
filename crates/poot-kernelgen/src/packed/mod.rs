@@ -517,6 +517,7 @@ mod planar_fixtures {
     };
     use poot_quant::{PackedWeight, SourceRole};
 
+    use crate::StagedTerms;
     use crate::contraction::{RegisterTiling, Schedule};
     use crate::helpers::WeightLayout;
 
@@ -725,7 +726,7 @@ mod planar_fixtures {
             scale: ScaleEncoding::F32,
         };
         let (m, out_rows) = (130, 130);
-        let tiling = RegisterTiling::candidates(k, WeightLayout::Nk, caps)
+        let tiling = RegisterTiling::candidates(k, WeightLayout::Nk, StagedTerms::ONE, caps)
             .max_by_key(|tiling| {
                 let (rows, cols) = tiling.output_tile();
                 rows * cols
@@ -1158,7 +1159,7 @@ mod contraction_tests {
         register_tiled, schedule_tag,
     };
     use super::kernel::packed_contraction;
-    use crate::contraction::Schedule;
+    use crate::contraction::{RegisterTiling, Schedule};
 
     fn run_case(
         format: poot_quant::format::WeightFormat,
@@ -1195,6 +1196,7 @@ mod contraction_tests {
             schedule,
             None,
             crate::PackedRows::Blocks,
+            poot_graph_ir::OperandPrecision::Exact,
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -1220,6 +1222,120 @@ mod contraction_tests {
         run(&body, workgroups, &mut buffers)
             .unwrap_or_else(|error| panic!("{format:?}: interpreter: {error}"));
         (buffers[3].to_f32s().unwrap(), expected)
+    }
+
+    /// POOT-1430: a packed contraction reads its operands as the declared precision says: the activation is rounded
+    /// and the weight, decoded to f32 inside the nest, is rounded after the decode (a packed weight is never
+    /// stored in the fragment dtype), in the decode Gemv and the register-tiled schedule, for every block-32 and
+    /// K-quant format. The output equals a host product over the same rounded terms (`poot_eval`'s rounding, the
+    /// oracle's definition) to the sum's own rounding error. Mutation: in `packed_contraction` read the weight
+    /// as `ProductRead::dense(.., WeightLane::Bf16Packed)` (as if stored narrow, so never rounded); the f16 rows
+    /// go red.
+    #[test]
+    fn a_narrowed_packed_contraction_rounds_the_decoded_weight_and_the_activation() {
+        use poot_graph_ir::{FragmentDtype, OperandPrecision};
+        let round = |dtype, x: f32| poot_eval::round_to_fragment(dtype, x);
+        let terms = |precision: OperandPrecision, x: f32| -> Vec<f32> {
+            match precision {
+                OperandPrecision::Exact => vec![x],
+                OperandPrecision::Narrow(d) => vec![round(d, x)],
+                OperandPrecision::Split(d) => {
+                    let hi = round(d, x);
+                    vec![
+                        hi,
+                        if hi.is_finite() {
+                            round(d, x - hi)
+                        } else {
+                            0.0
+                        },
+                    ]
+                }
+            }
+        };
+        for precision in [
+            OperandPrecision::Narrow(FragmentDtype::F16),
+            OperandPrecision::Narrow(FragmentDtype::Bf16),
+            OperandPrecision::Split(FragmentDtype::F16),
+        ] {
+            for format in BLOCK32.into_iter().chain(KQUANT) {
+                // Two blocks per row with a hand-made tiling, and eight (K = 256 for the 32-value formats) with the
+                // tiling the planner's cost model picks for the shape.
+                for (blocks_per_row, m, planned) in [(2, 1, false), (2, 5, false), (8, 4, true)] {
+                    let out_per_block = if planned { 8 } else { 7 };
+                    let (k, bytes, decoded) =
+                        super::fixtures::fixture(format, out_per_block, blocks_per_row, 3);
+                    let schedule = if m == 1 {
+                        GEMV_SCHEDULES[1]
+                    } else if planned {
+                        RegisterTiling::choose(
+                            crate::TiledShape {
+                                blocks: 1,
+                                m_per_block: m,
+                                out_per_block,
+                                k,
+                                layout: crate::WeightLayout::Nk,
+                                segments: 1,
+                                terms: crate::StagedTerms::ONE,
+                            },
+                            &poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+                        )
+                        .schedule()
+                    } else {
+                        register_tiled(2, k)
+                    };
+                    let mut state = 0x2545_f491_4f6c_dd1du64;
+                    let activation: Vec<f32> = (0..m * k)
+                        .map(|_| {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            ((state % 2000) as f32 - 1000.0) / 100.0
+                        })
+                        .collect();
+                    let body = packed_contraction(
+                        "narrowed",
+                        format,
+                        schedule,
+                        None,
+                        crate::PackedRows::Blocks,
+                        precision,
+                    )
+                    .unwrap();
+                    let metadata = [k as u32, out_per_block as u32, m as u32, 0, 0];
+                    let mut buffers = [
+                        Buffer::from_f32s(&activation),
+                        Buffer::from_u32s(&pack_words(&bytes)),
+                        Buffer::from_u32s(&metadata),
+                        Buffer::from_f32s(&vec![f32::NAN; m * out_per_block]),
+                    ];
+                    let workgroups =
+                        workgroups_covering(&body, schedule.grid_threads(1, m, out_per_block));
+                    run(&body, workgroups, &mut buffers).unwrap();
+                    let got = buffers[3].to_f32s().unwrap();
+                    for row in 0..m {
+                        for col in 0..out_per_block {
+                            let (mut want, mut magnitude) = (0.0f32, 0.0f32);
+                            for kk in 0..k {
+                                for a in terms(precision, activation[row * k + kk]) {
+                                    for w in terms(precision, decoded[col * k + kk]) {
+                                        want += a * w;
+                                        magnitude += (a * w).abs();
+                                    }
+                                }
+                            }
+                            let got = got[row * out_per_block + col];
+                            // A format whose fixture decodes a non-finite weight (MXFP4's reserved codes) makes the
+                            // sum non-finite, and the sign of an infinity or the NaN it meets is the sum order's.
+                            assert!(
+                                !want.is_finite()
+                                    || (got - want).abs() <= 1e-5 * magnitude.max(1.0),
+                                "{format:?} {precision} {schedule:?} [{row}, {col}]: {got} vs {want}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// POOT-1405: a Gemv that reads its full runs' activation values as 4-lane vector groups
@@ -1278,6 +1394,7 @@ mod contraction_tests {
             schedule,
             None,
             crate::PackedRows::Blocks,
+            poot_graph_ir::OperandPrecision::Exact,
         );
         assert!(
             matches!(
@@ -1385,6 +1502,7 @@ mod contraction_tests {
                     schedule,
                     Some(&epilogue),
                     crate::PackedRows::Blocks,
+                    poot_graph_ir::OperandPrecision::Exact,
                 )
                 .unwrap_or_else(|error| panic!("{format:?}: {error}"));
                 body.verify().expect("the epilogue body verifies");
@@ -1423,6 +1541,7 @@ mod contraction_tests {
             register_tiled(2, 32),
             Some(&epilogue),
             crate::PackedRows::Blocks,
+            poot_graph_ir::OperandPrecision::Exact,
         )
         .expect_err("a packed RegisterTiled contraction has no epilogue");
         assert_eq!(
@@ -1513,6 +1632,7 @@ mod contraction_tests {
                 schedule,
                 None,
                 crate::PackedRows::Blocks,
+                poot_graph_ir::OperandPrecision::Exact,
             )
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -1557,9 +1677,15 @@ mod contraction_tests {
         for format in BLOCK32 {
             for schedule in GEMV_SCHEDULES {
                 let name = format!("contraction_{format:?}_{}", schedule_tag(schedule));
-                let body =
-                    packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
-                        .unwrap();
+                let body = packed_contraction(
+                    &name,
+                    format,
+                    schedule,
+                    None,
+                    crate::PackedRows::Blocks,
+                    poot_graph_ir::OperandPrecision::Exact,
+                )
+                .unwrap();
                 let _ = crate::unit_helpers::spv(&body, &format!("{name}_spv"));
                 let _ = crate::unit_helpers::ptx(&body, &format!("{name}_ptx"));
                 let dir = std::env::temp_dir()
@@ -1584,9 +1710,15 @@ mod contraction_tests {
         for format in KQUANT {
             for schedule in GEMV_SCHEDULES {
                 let name = format!("contraction_kquant_{format:?}_{}", schedule_tag(schedule));
-                let body =
-                    packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
-                        .unwrap();
+                let body = packed_contraction(
+                    &name,
+                    format,
+                    schedule,
+                    None,
+                    crate::PackedRows::Blocks,
+                    poot_graph_ir::OperandPrecision::Exact,
+                )
+                .unwrap();
                 let _ = crate::unit_helpers::spv(&body, &format!("{name}_spv"));
                 let _ = crate::unit_helpers::ptx(&body, &format!("{name}_ptx"));
                 let dir = std::env::temp_dir()
@@ -1600,8 +1732,15 @@ mod contraction_tests {
         for format in BLOCK32.into_iter().chain(KQUANT) {
             let schedule = register_tiled(2, 32);
             let name = format!("contraction_{format:?}_{}", schedule_tag(schedule));
-            let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
-                .unwrap();
+            let body = packed_contraction(
+                &name,
+                format,
+                schedule,
+                None,
+                crate::PackedRows::Blocks,
+                poot_graph_ir::OperandPrecision::Exact,
+            )
+            .unwrap();
             let _ = crate::unit_helpers::spv(&body, &format!("{name}_spv"));
             let _ = crate::unit_helpers::ptx(&body, &format!("{name}_ptx"));
             let dir = std::env::temp_dir()
@@ -1633,8 +1772,15 @@ mod contraction_tests {
             "contraction_wgpu_{format:?}_{}_{blocks}",
             schedule_tag(schedule)
         );
-        let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
-            .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
+        let body = packed_contraction(
+            &name,
+            format,
+            schedule,
+            None,
+            crate::PackedRows::Blocks,
+            poot_graph_ir::OperandPrecision::Exact,
+        )
+        .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let dir = std::env::temp_dir()
             .join("poot-kernelgen-sc004")
             .join(&name);
@@ -1801,8 +1947,15 @@ mod contraction_tests {
                 contraction_fixture(format, blocks, m_per_block, out_per_block);
             let schedule = register_tiled(tile, 32);
             let name = format!("contraction_wgpu_folded_{format:?}");
-            let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
+            let body = packed_contraction(
+                &name,
+                format,
+                schedule,
+                None,
+                crate::PackedRows::Blocks,
+                poot_graph_ir::OperandPrecision::Exact,
+            )
+            .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
             let dir = std::env::temp_dir()
                 .join("poot-kernelgen-card658-fold")
                 .join(&name);
@@ -1917,6 +2070,7 @@ mod planar_contraction_tests {
             schedule,
             None,
             crate::PackedRows::Blocks,
+            poot_graph_ir::OperandPrecision::Exact,
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -1975,7 +2129,9 @@ mod planar_contraction_tests {
         let k = 20;
         for format in every_planar_format() {
             for m in [9, 33, 70, 130] {
-                for tiling in RegisterTiling::candidates(k, WeightLayout::Nk, &caps) {
+                for tiling in
+                    RegisterTiling::candidates(k, WeightLayout::Nk, crate::StagedTerms::ONE, &caps)
+                {
                     run_case(format, k, 6, m, tiling.schedule());
                 }
             }
@@ -2031,6 +2187,7 @@ mod planar_contraction_tests {
                 schedule,
                 None,
                 crate::PackedRows::Blocks,
+                poot_graph_ir::OperandPrecision::Exact,
             )
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -2288,8 +2445,15 @@ mod rocm_tests {
             "contraction_rocm_{format:?}_{}_{blocks}",
             schedule_tag(schedule)
         );
-        let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
-            .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
+        let body = packed_contraction(
+            &name,
+            format,
+            schedule,
+            None,
+            crate::PackedRows::Blocks,
+            poot_graph_ir::OperandPrecision::Exact,
+        )
+        .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let words = pack_words(&bytes);
         // metadata[3] (x_groups): 0 is fine here - every dispatch below is `[threads, 1, 1]`
         // (unfolded), so `GroupY` always reads 0 and `g = gy*x_groups+gx` collapses to `gx`
@@ -2474,9 +2638,15 @@ mod rocm_tests {
                     super::planar_fixtures::format_tag(format),
                     schedule_tag(schedule)
                 );
-                let body =
-                    packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
-                        .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
+                let body = packed_contraction(
+                    &name,
+                    format,
+                    schedule,
+                    None,
+                    crate::PackedRows::Blocks,
+                    poot_graph_ir::OperandPrecision::Exact,
+                )
+                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
                 let metadata = [k as u32, out_rows as u32, m as u32, 0, 0]; // [3] x_groups unused (unfolded), [4] tile_offset 0
                 let out_len = m * out_rows;
                 let grid = (schedule.grid_threads(1, m, out_rows) as u32, 1, 1);
@@ -2517,6 +2687,7 @@ mod rocm_tests {
                 case.schedule,
                 None,
                 crate::PackedRows::Blocks,
+                poot_graph_ir::OperandPrecision::Exact,
             )
             .unwrap_or_else(|error| panic!("{:?}: packed_kernel: {error}", case.format));
             let metadata = [k as u32, case.out_rows as u32, case.m as u32, 0, 0]; // [3] x_groups unused (unfolded), [4] tile_offset 0
@@ -2578,6 +2749,7 @@ mod planar_wgpu_tests {
                 case.schedule,
                 None,
                 crate::PackedRows::Blocks,
+                poot_graph_ir::OperandPrecision::Exact,
             )
             .unwrap_or_else(|error| panic!("{:?}: packed_kernel: {error}", case.format));
             assert_eq!(body.workgroup_size[0], lanes, "the case's lane grid");
@@ -2762,8 +2934,15 @@ mod ptx_tests {
             "contraction_ptx_{format:?}_{}_{blocks}",
             schedule_tag(schedule)
         );
-        let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
-            .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
+        let body = packed_contraction(
+            &name,
+            format,
+            schedule,
+            None,
+            crate::PackedRows::Blocks,
+            poot_graph_ir::OperandPrecision::Exact,
+        )
+        .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let kernel = compile_and_load(&name, &body);
         let words = pack_words(&bytes);
         let words_buf = upload_u32(ctx, &words);
@@ -3020,8 +3199,15 @@ mod planar_ptx_tests {
             format_tag(format),
             schedule_tag(schedule)
         );
-        let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
-            .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
+        let body = packed_contraction(
+            &name,
+            format,
+            schedule,
+            None,
+            crate::PackedRows::Blocks,
+            poot_graph_ir::OperandPrecision::Exact,
+        )
+        .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let kernel = compile_and_load(&name, &body);
         let source_bufs: Vec<PtxBuffer> = word_bufs
             .iter()

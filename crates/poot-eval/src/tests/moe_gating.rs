@@ -439,7 +439,7 @@ fn moe_grouped_matches_dense() {
     // SC-004 (structural): the IndexedMatMul rows equal M = L*k, not L*E (not a disguised dense pass).
     let mut checked = 0;
     for eqn in gg.eqns() {
-        if matches!(eqn.op, OpKind::IndexedMatMul) {
+        if matches!(eqn.op, OpKind::IndexedMatMul { .. }) {
             let x_id = match eqn.inputs[0] {
                 poot_graph_ir::Operand::Value(id) => id,
                 _ => panic!("IndexedMatMul's x operand must be a value"),

@@ -19,6 +19,7 @@ mod weight_store;
 pub use weight_store::{MaterializeError, materialize_dense};
 
 pub use exact_bf16::ExactBf16Error;
+pub use ops::precision::round_to_fragment;
 
 use std::borrow::Cow;
 

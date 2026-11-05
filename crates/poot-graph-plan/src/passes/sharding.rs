@@ -625,7 +625,7 @@ impl<'a> Sharder<'a> {
             K::Iota { .. } => Ok((eqn.op.clone(), inputs, Layout::Whole)),
             K::Gather { axis } => self.gather(eqn, inputs, *axis),
             K::MatMul { .. } => self.matmul(eqn, inputs),
-            K::IndexedMatMul => self.indexed_matmul(eqn, inputs),
+            K::IndexedMatMul { .. } => self.indexed_matmul(eqn, inputs),
             K::DynamicUpdateSlice { axis } => self.update_slice(eqn, inputs, *axis),
             K::ScatterUpdate => self.scatter_update(eqn, inputs),
             K::PackedDequant { descriptor } => self.packed_dequant(eqn, inputs, *descriptor),

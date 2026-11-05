@@ -25,6 +25,7 @@ The command-line options of `poot-serve`. Every setting is a flag: no environmen
 | `--max-seq N` | `4096` | Positions per sequence, or tokens per text of an embedding or reranking model, capped at the model's own limit. At least 1. |
 | `--expert-pool ROWS` | off | Page every routed expert table through a pool of `ROWS` resident rows per layer. |
 | `--kv-dtype DTYPE` | model's preference, else `f16` | What the KV cache stores: `f16`, `bf16` or `f32` (the exact reference, twice the bytes). Attention computes in f32 either way. See [KV cache storage dtype](../architecture/attention.mdx#storage-dtype). |
+| `--matmul-precision POLICY` | `exact` | How contraction and attention operands are read: `exact` (as the graph declares them), `narrow` (rounded to the target's matrix-unit dtype where it has one, accumulated in f32) or `split` (high and low parts of that dtype, near-f32 accuracy). A target with no matrix unit runs `exact` whichever is asked. See [Operand precision](../architecture/graph-ir.mdx#operand-precision). |
 
 Refusals at startup:
 
@@ -37,6 +38,7 @@ Refusals at startup:
 - `--chat-template` with a value that has no jinja syntax (poot has no built-in templates), a template that does not compile, or a vision-language checkpoint. A template that fails to render a conversation answers that request with an error, never another format.
 - `--expert-pool` on a dense model, or `ROWS` below the experts one token selects or not below the model's expert count.
 - `--kv-dtype` with a value other than `f16`, `bf16` or `f32`, and `bf16` on `wgpu` or `vulkan` (SPIR-V has no bf16 type).
+- `--matmul-precision` with a value other than `exact`, `narrow` or `split`.
 
 `--rows` and `--max-seq` are halved by the memory fit (`--max-seq` to a floor of 128) until the workload fits. `/health` reports the values it settled on.
 

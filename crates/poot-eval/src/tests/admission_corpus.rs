@@ -442,7 +442,9 @@ fn matmul_contraction_epilogue_indexed_matmul_evaluate() {
     let staged = plan
         .equation(
             OpKind::ContractionEpilogue {
-                head: ContractionHead::MatMul,
+                head: ContractionHead::MatMul {
+                    precision: poot_graph_ir::OperandPrecision::Exact,
+                },
                 region: FusedRegion {
                     n_inputs: 2,
                     steps: vec![FusedStep {

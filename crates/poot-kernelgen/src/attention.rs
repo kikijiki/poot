@@ -55,6 +55,8 @@ use crate::data_movement::Cfg;
 use crate::emit::{copy as copy_local, cu};
 use crate::fused::{FusedScalarOp, emit_scalar_op};
 use crate::helpers::{copy, elem, ld, slice_dtype, slice_f32};
+use crate::precision::{ProductRead, pair_products};
+use poot_graph_ir::{FragmentDtype, OperandPrecision};
 
 mod tiled;
 
@@ -90,6 +92,9 @@ pub struct AttentionSpec {
     pub schedule: AttentionSchedule,
     /// How the key and value elements (the shared key part too) are stored.
     pub kv: KvLane,
+    /// How Q, K, V and the probabilities P enter the two products: every schedule rounds them as this says, P
+    /// where it enters `P V`.
+    pub precision: OperandPrecision,
 }
 
 /// How an attention's key and value elements sit in their buffers (POOT-1395): f32, or a two-byte float in its
@@ -105,6 +110,15 @@ pub enum KvLane {
 }
 
 impl KvLane {
+    /// The fragment dtype this lane stores its elements in, `None` for f32: a stored element is exact in it.
+    pub(crate) const fn fragment(self) -> Option<FragmentDtype> {
+        match self {
+            KvLane::F32 => None,
+            KvLane::F16 => Some(FragmentDtype::F16),
+            KvLane::Bf16 => Some(FragmentDtype::Bf16),
+        }
+    }
+
     /// The key or value parameter's declaration.
     fn param(self) -> LocalDecl {
         let elem = match self {
@@ -580,6 +594,22 @@ fn validate(spec: &AttentionSpec) -> Result<usize, KernelGenError> {
     Ok(lanes)
 }
 
+/// `acc` plus the products of every pair of terms of `a` and `b` (`a` terms outermost: the oracle's order), the
+/// operands read as `read` says. Read as stored it is `acc + a * b`.
+fn add_products(
+    c: &mut Cfg,
+    read: ProductRead,
+    a: poot_kernel_ir::Local,
+    b: poot_kernel_ir::Local,
+    acc: poot_kernel_ir::Local,
+) -> poot_kernel_ir::Local {
+    let (a_terms, b_terms) = c.emit(|e| (read.activation_terms(e, a), read.weight_terms(e, b)));
+    pair_products(&a_terms, &b_terms).fold(acc, |sum, (x, y)| {
+        let term = fbin(c, BinOp::Mul, x, y);
+        fbin(c, BinOp::Add, sum, term)
+    })
+}
+
 pub(crate) fn f32_array(len: usize) -> WorkgroupLocalDecl {
     WorkgroupLocalDecl {
         elem_ty: Ty::F32,
@@ -853,7 +883,14 @@ pub(crate) fn attention_body(
         sink,
         schedule,
         kv,
+        precision,
     } = *spec;
+    // `Q K` and `P V`: the query and the probabilities are f32, the key and value rows are stored in `kv`.
+    let operands = ProductRead {
+        precision,
+        activation_stored: None,
+        weight_stored: kv.fragment(),
+    };
     let splits = match schedule {
         AttentionSchedule::Streaming { .. } => None,
         AttentionSchedule::SplitKv { splits, .. } => Some(splits),
@@ -1145,8 +1182,7 @@ pub(crate) fn attention_body(
                     let ki = ubin(c, BinOp::Add, row, channel);
                     let qv = c.let_(Ty::F32, Rvalue::Use(copy(elem(q, qi))));
                     let kv_elem = c.emit(|e| kv.read(e, part, ki));
-                    let term = fbin(c, BinOp::Mul, qv, kv_elem);
-                    let sum = fbin(c, BinOp::Add, dot, term);
+                    let sum = add_products(c, operands, qv, kv_elem, dot);
                     c.assign(Place::local(dot), Rvalue::Use(local_op(sum)));
                 });
             };
@@ -1225,8 +1261,7 @@ pub(crate) fn attention_body(
                 let held = lds_read(c, O_ARRAY, slot);
                 let rescaled = fbin(c, BinOp::Mul, held, corr);
                 let vv = c.emit(|e| kv.read(e, v, vi));
-                let added = fbin(c, BinOp::Mul, weight, vv);
-                let sum = fbin(c, BinOp::Add, rescaled, added);
+                let sum = add_products(c, operands, weight, vv, rescaled);
                 lds_write(c, O_ARRAY, slot, local_op(sum));
             });
             c.assign(Place::local(m), Rvalue::Use(local_op(m_new)));
@@ -1275,8 +1310,7 @@ pub(crate) fn attention_body(
                 for (&(k_row, _, _), &dot) in keys.iter().zip(&dots) {
                     let ki = ubin(c, BinOp::Add, k_row, channel);
                     let kv_elem = c.emit(|e| kv.read(e, k, ki));
-                    let term = fbin(c, BinOp::Mul, qv, kv_elem);
-                    let sum = fbin(c, BinOp::Add, dot, term);
+                    let sum = add_products(c, operands, qv, kv_elem, dot);
                     c.assign(Place::local(dot), Rvalue::Use(local_op(sum)));
                 }
             });
@@ -1323,8 +1357,7 @@ pub(crate) fn attention_body(
                         .fold(rescaled, |sum, (&(_, v_row, _), &weight)| {
                             let vi = ubin(c, BinOp::Add, v_row, channel);
                             let vv = c.emit(|e| kv.read(e, v, vi));
-                            let added = fbin(c, BinOp::Mul, weight, vv);
-                            fbin(c, BinOp::Add, sum, added)
+                            add_products(c, operands, weight, vv, sum)
                         });
                 lds_write(c, O_ARRAY, slot, local_op(sum));
             });
@@ -1606,6 +1639,7 @@ mod tests {
     fn spec() -> AttentionSpec {
         AttentionSpec {
             kv: crate::KvLane::F32,
+            precision: OperandPrecision::Exact,
             batch: 1,
             hq: 4,
             n_rep: 2,

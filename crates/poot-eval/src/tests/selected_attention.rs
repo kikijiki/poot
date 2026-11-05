@@ -27,6 +27,7 @@ fn attrs(case: &Case) -> SelectedAttentionAttrs {
         softcap: None,
         ratio: case.ratio,
         k: case.k,
+        precision: poot_graph_ir::OperandPrecision::Exact,
     }
 }
 
@@ -190,6 +191,7 @@ fn the_typing_rule_refuses_what_it_cannot_read() {
         softcap: None,
         ratio: 4,
         k: 3,
+        precision: poot_graph_ir::OperandPrecision::Exact,
     };
     let ok = [
         TensorType::f32(vec![2, 4, 5, 8]),

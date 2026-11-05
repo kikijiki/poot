@@ -293,14 +293,16 @@ pub(crate) fn pool_experts(
         for &e in &site.eqns {
             let eqn = &mut pooled.eqns_mut()[e];
             let position = match eqn.op {
-                OpKind::IndexedMatMul => 2,
+                OpKind::IndexedMatMul { .. } => 2,
                 OpKind::PackedContraction {
                     descriptor,
                     rows: ContractionRows::Indexed { .. },
+                    precision,
                 } => {
                     eqn.op = OpKind::PackedContraction {
                         descriptor,
                         rows: ContractionRows::Indexed { experts: slots },
+                        precision,
                     };
                     1
                 }
@@ -461,7 +463,7 @@ fn find(g: &Graph) -> Result<Vec<Found>, PoolError> {
         for &e in &site.experts {
             let eqn = &g.eqns()[e];
             let position = match eqn.op {
-                OpKind::IndexedMatMul => 2,
+                OpKind::IndexedMatMul { .. } => 2,
                 _ => 1,
             };
             let Some(Operand::Value(ids)) = eqn.inputs.get(position) else {
@@ -485,7 +487,7 @@ fn find(g: &Graph) -> Result<Vec<Found>, PoolError> {
         for &e in &eqns {
             let eqn = &g.eqns()[e];
             let operands: Vec<ValueId> = match eqn.op {
-                OpKind::IndexedMatMul => vec![operand(eqn, 1)],
+                OpKind::IndexedMatMul { .. } => vec![operand(eqn, 1)],
                 _ => eqn
                     .inputs
                     .iter()

@@ -130,6 +130,7 @@ fn attention_spec(
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes },
+        precision: poot_graph_ir::OperandPrecision::Exact,
     }
 }
 
@@ -199,7 +200,14 @@ fn synthesized_kernels_compile_to_valid_ptx() {
         ),
         (
             "attn_scores_v_gemv_lds",
-            kg::attn_scores_v_gemv_lds("asvg", 300, n, 128, n),
+            kg::attn_scores_v_gemv_lds(
+                "asvg",
+                300,
+                n,
+                128,
+                n,
+                poot_graph_ir::OperandPrecision::Exact,
+            ),
         ),
     ];
     if !which("llc") {
@@ -601,7 +609,15 @@ fn matmul_gemv_and_batched() {
     let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
     let bm: Vec<f32> = (0..12).map(|i| i as f32).collect();
     let s = spv(
-        &kg::matmul_batched_dt_grid("mm", Ty::F32, &[1, 1, 3], &[1, 1, 4], &[4, 3], None),
+        &kg::matmul_batched_dt_grid(
+            "mm",
+            Ty::F32,
+            &[1, 1, 3],
+            &[1, 1, 4],
+            &[4, 3],
+            None,
+            poot_graph_ir::OperandPrecision::Exact,
+        ),
         "mm",
     );
     let mut bufs = [
@@ -630,6 +646,7 @@ fn matmul_gemv_and_batched() {
             &[1, 2, 1, 4],
             &[1, 2, 4, 3],
             None,
+            poot_graph_ir::OperandPrecision::Exact,
         ),
         "mmb",
     );
@@ -687,6 +704,7 @@ fn matmul_bias_epilogue() {
             &[4, 3],
             &bias_epilogue(&[1, 1, 3], &[3]),
             None,
+            poot_graph_ir::OperandPrecision::Exact,
         )
         .expect("the epilogue's leaf storage is valid"),
         "mmbias",
@@ -719,6 +737,7 @@ fn indexed_tiling((m, k, n, experts): (usize, usize, usize, usize)) -> kg::Sched
             k,
             layout: kg::WeightLayout::Kn,
             segments: experts,
+            terms: poot_kernelgen::StagedTerms::ONE,
         },
         &poot_target::DeviceCaps::wgpu_rdna3_igpu(),
     )
@@ -754,6 +773,7 @@ fn indexed_kernel(
             epilogue: None,
             grid: [threads as u32, 1, 1],
             meta: vec![k as u32, n as u32, m as u32, x_groups, 0, experts as u32],
+            precision: poot_graph_ir::OperandPrecision::Exact,
         }));
     let generated =
         kg::generate(&request, &caps, &limits).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -881,6 +901,7 @@ fn indexed_bodies_compile_to_valid_spirv_and_nvptx() {
             epilogue,
             grid: [64, 1, 1],
             meta: vec![16, 8, 8, 0, 0, 4],
+            precision: poot_graph_ir::OperandPrecision::Exact,
         }))
     };
     let requests = [
@@ -1465,7 +1486,14 @@ fn attn_scores_v_gemv_lds_matches_naive_batched_matmul() {
     let (w, hq, cap, d) = (128usize, 12usize, 300usize, 64usize);
     let rows = hq; // batch = 1
     let x_groups = rows * d; // rows*d well under 65535, so a single-row (y=1) 2-D grid: col == GroupX.
-    let body = kg::attn_scores_v_gemv_lds("attn_scores_v", cap, d, w, x_groups);
+    let body = kg::attn_scores_v_gemv_lds(
+        "attn_scores_v",
+        cap,
+        d,
+        w,
+        x_groups,
+        poot_graph_ir::OperandPrecision::Exact,
+    );
     let spv_bytes = spv(&body, "attn_scores_v");
 
     let dir = std::env::temp_dir()
@@ -1522,8 +1550,15 @@ fn attn_scores_v_gemv_lds_matches_naive_batched_matmul() {
     let out_shape = [1, hq, 1, d];
     let a_shape = [1, hq, 1, cap];
     let b_shape = [1, hq, cap, d];
-    let naive_body =
-        kg::matmul_batched_dt_grid("attn_naive", Ty::F32, &out_shape, &a_shape, &b_shape, None);
+    let naive_body = kg::matmul_batched_dt_grid(
+        "attn_naive",
+        Ty::F32,
+        &out_shape,
+        &a_shape,
+        &b_shape,
+        None,
+        poot_graph_ir::OperandPrecision::Exact,
+    );
     let naive_bytes = spv(&naive_body, "attn_scores_v_naive");
     let out_numel = rows * d;
     let mut naive_bufs = [
@@ -1656,6 +1691,7 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
                 0,
                 kg::WeightLayout::Kn,
                 BufferStorage::f32(),
+                poot_graph_ir::OperandPrecision::Exact,
             )
             .expect("f32 weight storage"),
         ),
@@ -1704,7 +1740,14 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
         ),
         (
             "attn_scores_v_gemv_lds",
-            kg::attn_scores_v_gemv_lds("asvg_gate", 300, n, w, n),
+            kg::attn_scores_v_gemv_lds(
+                "asvg_gate",
+                300,
+                n,
+                w,
+                n,
+                poot_graph_ir::OperandPrecision::Exact,
+            ),
         ),
         (
             "rope_dt",
@@ -1713,11 +1756,27 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
         ("arg_top_k_dt", kg::arg_top_k_dt("argtopk_gate", 8, 4)),
         (
             "matmul_batched_dt (F32)",
-            kg::matmul_batched_dt_grid("mmbdt_f32_gate", Ty::F32, &[4, 6], &[4, 8], &[8, 6], None),
+            kg::matmul_batched_dt_grid(
+                "mmbdt_f32_gate",
+                Ty::F32,
+                &[4, 6],
+                &[4, 8],
+                &[8, 6],
+                None,
+                poot_graph_ir::OperandPrecision::Exact,
+            ),
         ),
         (
             "matmul_batched_dt (F16)",
-            kg::matmul_batched_dt_grid("mmbdt_f16_gate", Ty::F16, &[4, 6], &[4, 8], &[8, 6], None),
+            kg::matmul_batched_dt_grid(
+                "mmbdt_f16_gate",
+                Ty::F16,
+                &[4, 6],
+                &[4, 8],
+                &[8, 6],
+                None,
+                poot_graph_ir::OperandPrecision::Exact,
+            ),
         ),
         ("cast_f32_to_f16", kg::cast_f32_to_f16("cast_f32_f16_gate")),
         ("cast_f16_to_f32", kg::cast_f16_to_f32("cast_f16_f32_gate")),
@@ -1853,6 +1912,7 @@ fn matmul_epilogue_chain_matches_cpu() {
         &[1, 1, 4, 5],
         &chain_epilogue(Ty::F32, &out_shape),
         None,
+        poot_graph_ir::OperandPrecision::Exact,
     )
     .expect("the epilogue's leaf storage is valid");
     let s = spv(&body, "mm_epilogue");
@@ -1902,6 +1962,7 @@ fn dense_tiled(
             k,
             layout,
             segments: 1,
+            terms: poot_kernelgen::StagedTerms::ONE,
         },
         caps,
     );
@@ -1914,6 +1975,7 @@ fn dense_tiled(
         epilogue,
         grid: [(tiles * lanes) as u32, 1, 1],
         meta: vec![k as u32, n as u32, m as u32, tiles as u32, 0],
+        precision: poot_graph_ir::OperandPrecision::Exact,
     }))
 }
 
@@ -1958,6 +2020,7 @@ fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
                     b_shape: vec![2, 4, 5],
                 },
                 fold: fold(30),
+                precision: poot_graph_ir::OperandPrecision::Exact,
             }),
         ),
         (
@@ -1991,6 +2054,7 @@ fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
                 k: 8,
                 n: 5,
                 epilogue: Some(chain_epilogue(Ty::F32, &[1, 5])),
+                precision: poot_graph_ir::OperandPrecision::Exact,
             }),
         ),
     ];
@@ -2024,6 +2088,7 @@ fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
                 &[2, 4, 5],
                 &chain_epilogue(dt.clone(), &[2, 3, 5]),
                 None,
+                poot_graph_ir::OperandPrecision::Exact,
             )
             .expect("the epilogue's leaf storage is valid");
             let asm = ptx(&body, &format!("epilogue_serial_{dt:?}"));

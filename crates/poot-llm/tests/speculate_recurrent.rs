@@ -137,6 +137,7 @@ fn options(draft: DraftPolicy) -> DriverOptions {
         charge: program_retention,
         draft,
         hidden_window: None,
+        matmul_precision: None,
     }
 }
 

@@ -342,6 +342,7 @@ fn selected_attention(
         softcap: attrs.softcap,
         ratio,
         k: selected,
+        precision: attrs.precision,
     };
     composite(
         g,
@@ -611,6 +612,7 @@ mod tests {
             case.scale(),
             None,
             case.ratio,
+            poot_graph_ir::OperandPrecision::Exact,
         )
         .unwrap();
         let graph = b.finish(Outputs::new(out)).unwrap();
@@ -667,6 +669,7 @@ mod tests {
                     softcap: None,
                     ratio: case.ratio,
                     k: case.k,
+                    precision: poot_graph_ir::OperandPrecision::Exact
                 }],
                 "{}",
                 case.label

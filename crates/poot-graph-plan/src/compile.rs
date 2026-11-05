@@ -42,14 +42,15 @@ use poot_graph_ir::analysis::{
     implied_numerics,
 };
 use poot_graph_ir::{
-    BoundaryId, ContractionRows, EditError, Eqn, Export, Graph, IndexRange, OpKind, Operand, Slot,
-    ValueId, ValueTable, value_ranges,
+    BoundaryId, ContractionRows, EditError, Eqn, Export, Graph, IndexRange, MatmulPrecision,
+    OpKind, Operand, Slot, ValueId, ValueTable, value_ranges,
 };
 use poot_target::{Backend, DeviceCaps, Queried, TargetId};
 use poot_tensor::DType;
 
 use crate::passes::{
-    self as transform, FusionDecline, GraphBudget, LegalizeError, PackedDequantProductionError,
+    self as transform, FragmentUnits, FusionDecline, GraphBudget, LegalizeError,
+    PackedDequantProductionError,
 };
 pub use crate::passes::{LoraError, LoraPlan};
 use crate::{
@@ -163,6 +164,10 @@ pub struct CompileOptions {
     /// The NPU's lowering, required when the target is an [`NpuTarget`] and unused for a GPU target: the
     /// NPU crate's object behind which its opset table, narrowing pass and region limits sit.
     pub npu: Option<NpuHandle>,
+    /// The driver's policy for narrowing contraction and attention operands into matrix units
+    /// (POOT-1430): the one input of the `select_operand_precision` pass besides the target's caps and the
+    /// operands' dtypes. `Exact` narrows nothing.
+    pub matmul_precision: MatmulPrecision,
     /// A single-buffer limit below the GPU target's own, in bytes: legalization fits every constant to the
     /// smaller of the two, so a fixture that needs a split on a device whose real limit is far larger states it
     /// here. `None` fits to the target's limit. Unused for an NPU target.
@@ -183,10 +188,17 @@ impl CompileOptions {
             lora: None,
             late: None,
             npu: None,
+            matmul_precision: MatmulPrecision::DEFAULT,
             #[cfg(any(test, feature = "test-support"))]
             buffer_limit: None,
             aliases: poot_weights::WeightAliases::none(),
         }
+    }
+
+    /// These options narrowing operands as `policy` says.
+    pub fn with_matmul_precision(mut self, policy: MatmulPrecision) -> Self {
+        self.matmul_precision = policy;
+        self
     }
 
     /// These options with the weight aliases of the model's map.
@@ -437,7 +449,7 @@ fn refuse_unproven_expert_ids(g: &Graph) -> Result<(), ExpertIdsError> {
         // infers every equation, and `OpKind::infer` gives each of these operands a rank (w rank 3, ids
         // rank 1), so none of them is a literal.
         let (ids, experts) = match (&eqn.op, eqn.inputs.as_slice()) {
-            (OpKind::IndexedMatMul, [_, Operand::Value(weight), Operand::Value(ids)]) => {
+            (OpKind::IndexedMatMul { .. }, [_, Operand::Value(weight), Operand::Value(ids)]) => {
                 (*ids, g.aval(*weight).shape.first().copied().unwrap_or(0))
             }
             (
@@ -447,12 +459,14 @@ fn refuse_unproven_expert_ids(g: &Graph) -> Result<(), ExpertIdsError> {
                 },
                 [_, Operand::Value(ids), ..],
             ) => (*ids, *experts),
-            (OpKind::IndexedMatMul | OpKind::PackedContraction { .. }, operands) => unreachable!(
-                "equation {}: {} has operands {operands:?}; infer gives its weight and ids a rank, \
+            (OpKind::IndexedMatMul { .. } | OpKind::PackedContraction { .. }, operands) => {
+                unreachable!(
+                    "equation {}: {} has operands {operands:?}; infer gives its weight and ids a rank, \
                  so a literal there fails validation",
-                eqn.out,
-                eqn.op.name()
-            ),
+                    eqn.out,
+                    eqn.op.name()
+                )
+            }
             _ => continue,
         };
         let proven = facts[ids].unwrap_or(IndexRange::I32);
@@ -900,6 +914,16 @@ pub fn compile(
     // witness is refused with the planner's typed `PlanError::ValidationWitnessNotCanonical`, naming
     // the witness, before any executor allocates.
     device_validation::admit_device_witnesses(pipeline.graph())?;
+    // Operand precision is selected on the typed, dtype-prepared graph, before the epilogue rule copies a
+    // contraction's precision into its head. It is required, not an optimization: a narrowed op the planner
+    // cannot lower is the planner's typed refusal, never a silent revert to the exact op, so the numerics a
+    // program publishes are the policy's, whichever schedule the planner picks.
+    if let Some((_, caps)) = gpu {
+        let units = FragmentUnits::of(caps);
+        pipeline.require("select_operand_precision", |g| {
+            transform::select_operand_precision(g, options.matmul_precision, units)
+        })?;
+    }
     // The contraction epilogue rule runs on the typed, dtype-prepared graph, right before `fuse` would claim
     // the same pointwise chains for a standalone region: a head fuses only where the planner's generated
     // lowering carries an epilogue (`epilogue_head_lowers`), so no head trades a faster schedule for it. Like

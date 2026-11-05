@@ -22,6 +22,8 @@ use crate::contraction::{
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
 use crate::helpers::{Alloc, WeightLayout, elem, guard, ld, local, slice_dtype, slice_f32};
 use crate::microtile::{LaneRows, MicroCols};
+use crate::precision::ProductRead;
+use poot_graph_ir::OperandPrecision;
 
 /// What one generated packed kernel computes (dquant.md 3.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -94,10 +96,13 @@ pub(crate) fn packed_contraction(
     schedule: Schedule,
     epilogue: Option<&Epilogue>,
     rows: PackedRows,
+    precision: OperandPrecision,
 ) -> Result<Body, KernelGenError> {
     if let Some(epilogue) = epilogue {
         epilogue.require_f32("packed_contraction")?;
     }
+    // A packed weight is decoded to f32 inside the nest, so a narrowed or split precision rounds it.
+    let read = ProductRead::decoded(precision);
     match schedule {
         Schedule::Gemv {
             width,
@@ -110,6 +115,7 @@ pub(crate) fn packed_contraction(
             GemvLaunch::new(width, cols, unroll, activation)?,
             epilogue,
             rows,
+            read,
         ),
         Schedule::RegisterTiled {
             lanes,
@@ -121,6 +127,7 @@ pub(crate) fn packed_contraction(
             format,
             TiledLaunch::new(lanes, lane_rows, cols, run, WeightLayout::Nk)?,
             epilogue,
+            read,
         ),
         Schedule::RegisterTiled { .. } if epilogue.is_some() => Err(KernelGenError::Unsupported {
             request: "packed_contraction",
@@ -131,7 +138,7 @@ pub(crate) fn packed_contraction(
             rows,
             cols,
             run,
-        } => contraction_register_tiled(name, format, lanes, rows, cols, run),
+        } => contraction_register_tiled(name, format, lanes, rows, cols, run, read),
     }
 }
 
@@ -251,10 +258,11 @@ fn contraction_gemv(
     launch: GemvLaunch,
     epilogue: Option<&Epilogue>,
     rows: PackedRows,
+    read: ProductRead,
 ) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
     if let Storage::Planar(_) = descriptor.storage {
-        return contraction_gemv_planar(name, format, launch, epilogue, rows);
+        return contraction_gemv_planar(name, format, launch, epilogue, rows, read);
     }
     let plan = DecodePlan::of(&descriptor)?;
     let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
@@ -308,6 +316,7 @@ fn contraction_gemv(
         lead + 2 + leaf_count as u32,
         [activation, metadata, out],
         launch,
+        read,
         epilogue.map(|epilogue| BoundEpilogue {
             epilogue,
             leaves: &leaves,
@@ -340,6 +349,7 @@ fn contraction_gemv_planar(
     launch: GemvLaunch,
     epilogue: Option<&Epilogue>,
     rows: PackedRows,
+    read: ProductRead,
 ) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
     let plan = PlanarPlan::of(&descriptor)?;
@@ -413,6 +423,7 @@ fn contraction_gemv_planar(
         lead + 1 + (n + leaf_count) as u32,
         [activation, metadata, out],
         launch,
+        read,
         epilogue.map(|epilogue| BoundEpilogue {
             epilogue,
             leaves: &leaves,
@@ -437,6 +448,7 @@ fn contraction_register_tiled(
     rows: LaneRows,
     cols: MicroCols,
     run: RunLength,
+    read: ProductRead,
 ) -> Result<Body, KernelGenError> {
     let launch = TiledLaunch::new(lanes, rows, cols, run, WeightLayout::Nk)?;
     let descriptor = format.descriptor();
@@ -464,6 +476,7 @@ fn contraction_register_tiled(
         out: local(3 + source_count as u32),
         epilogue: None,
         walk: None,
+        read,
     };
     let mut body = match (&block_plan, &planar_plan) {
         (Some(plan), _) => tiled_body(

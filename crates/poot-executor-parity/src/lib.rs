@@ -44,6 +44,7 @@ pub mod launch;
 pub mod live_attention;
 pub mod lora;
 pub mod packed;
+pub mod precision;
 pub mod reference_blocks;
 pub mod routing;
 pub mod sample_token;
@@ -61,7 +62,7 @@ use poot_eval::test_support::StepFixture;
 use poot_executor::{Executor, NoSync, StateScope, StepInputs};
 use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::test_support::const_weights::ConstWeights;
-use poot_graph_ir::{ForwardSlotMap, Graph, Slot, Storage, TensorType};
+use poot_graph_ir::{ForwardSlotMap, Graph, MatmulPrecision, Slot, Storage, TensorType};
 use poot_graph_plan::{
     CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
     staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
@@ -514,10 +515,23 @@ pub fn staged(fixture: &Fixture, target: Target) -> StagedProgram {
 /// [`staged`] for the device `exec` drives, compiled with the options that device takes
 /// ([`Executor::compile_options`]): the way to compile for an NPU.
 pub fn staged_on(exec: &dyn Executor, fixture: &Fixture, target: Target) -> StagedProgram {
+    staged_under(exec, fixture, target, MatmulPrecision::Exact)
+}
+
+/// [`staged_on`] under the operand-precision policy `policy` (POOT-1430): the program a driver with that policy
+/// compiles for the device `exec` drives.
+pub fn staged_under(
+    exec: &dyn Executor,
+    fixture: &Fixture,
+    target: Target,
+    policy: MatmulPrecision,
+) -> StagedProgram {
     compile_fixture(
         fixture,
         target,
-        &exec.compile_options(poot_graph_plan::CompileLimits::STANDARD),
+        &exec
+            .compile_options(poot_graph_plan::CompileLimits::STANDARD)
+            .with_matmul_precision(policy),
     )
 }
 
@@ -737,10 +751,24 @@ pub fn run_parity(
     fixture: &Fixture,
     oracle: &mut Oracle<'_>,
 ) -> Result<(), String> {
+    run_parity_under(exec, target, fixture, MatmulPrecision::Exact, oracle)
+}
+
+/// [`run_parity`] with the fixture compiled under the operand-precision policy `policy`. The oracle must evaluate
+/// the semantics the policy declares: the graph `poot_graph_plan::with_operand_precision(&fixture.graph, &target,
+/// policy)` returns, not the fixture's exact one. The program's published class (`NarrowStorage` for a narrowed
+/// program) sets the tolerance, as it does for every parity row.
+pub fn run_parity_under(
+    exec: &mut dyn Executor,
+    target: Target,
+    fixture: &Fixture,
+    policy: MatmulPrecision,
+    oracle: &mut Oracle<'_>,
+) -> Result<(), String> {
     let exe = exec
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
-    let program = staged_on(exec, fixture, target);
+    let program = staged_under(exec, fixture, target, policy);
     let class = program.numerics_class();
     let entry = exec
         .add_entry(exe, &program)

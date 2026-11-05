@@ -508,6 +508,7 @@ fn rig(options: RigOptions) -> Rig {
             charge: options.charge,
             draft: poot_llm::driver::DraftPolicy::Off,
             hidden_window: None,
+            matmul_precision: None,
         },
     )
     .unwrap();
@@ -1065,6 +1066,7 @@ fn qwen2_rig(trace: poot_graph_ir::TraceLimits) -> Qwen2Rig {
             charge: poot_llm::driver::program_retention,
             draft: poot_llm::driver::DraftPolicy::Off,
             hidden_window: None,
+            matmul_precision: None,
         },
     )
     .unwrap();

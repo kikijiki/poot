@@ -431,6 +431,7 @@ fn packed_contraction(
             OpKind::PackedContraction {
                 descriptor,
                 rows: poot_graph_ir::ContractionRows::Blocks(blocks),
+                precision: poot_graph_ir::OperandPrecision::Exact,
             },
             operands,
         )
@@ -562,6 +563,7 @@ fn dense_contraction(weight: HostTensor) -> (Graph, HashMap<ValueId, Value>) {
         .equation(
             OpKind::DenseContraction {
                 weight: weight.dtype(),
+                precision: poot_graph_ir::OperandPrecision::Exact,
             },
             vec![Operand::Value(x.id()), Operand::Value(w.id())],
         )
@@ -969,6 +971,7 @@ fn a_grouped_dense_contraction_equals_each_groups_own_block_product() {
             OpKind::GroupedDenseContraction {
                 weight: DType::BF16,
                 groups,
+                precision: poot_graph_ir::OperandPrecision::Exact,
             },
             vec![Operand::Value(xs.id()), Operand::Value(w.id())],
         )

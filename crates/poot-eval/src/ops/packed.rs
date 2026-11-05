@@ -3,11 +3,11 @@
 //!
 //! `walk.rs` reports every packed output's allocation to the caller's `EvalObserver`.
 
-use poot_graph_ir::{Graph, OpKind, Operand, ValueId, ValueTable};
+use poot_graph_ir::{Graph, OpKind, Operand, OperandPrecision, ValueId, ValueTable};
 use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, SourceRole};
 
 use crate::value::PackedEvalError;
-use poot_tensor::{HostData, HostTensor};
+use poot_tensor::{DType, HostData, HostTensor};
 
 use crate::{EvalError, Value};
 
@@ -307,11 +307,18 @@ pub(crate) fn evaluate_packed_indexed(
     stack: &PackedStack,
     out_shape: &[usize],
     eqn: ValueId,
+    precision: OperandPrecision,
     mut allocated: impl FnMut(),
 ) -> Result<HostTensor, EvalError> {
     let [out, k] = stack.weight().shape();
     let m = x.shape()[0];
     let x_view = x.to_f32()?;
+    // The activation's terms, read once; each decoded expert's weight is read through the same precision below.
+    let x_terms = if precision.is_exact() {
+        vec![x_view.to_vec()]
+    } else {
+        super::precision::operand_terms(&x_view, x.dtype(), precision)
+    };
     let selected: Vec<usize> = super::movement::index_values(ids)?
         .into_iter()
         .enumerate()
@@ -333,11 +340,21 @@ pub(crate) fn evaluate_packed_indexed(
                 })
             })?;
         }
+        // A decoded packed weight is f32, never stored in the fragment dtype, so a non-exact precision rounds it.
+        let weight_terms = if precision.is_exact() {
+            vec![weight.clone()]
+        } else {
+            super::precision::operand_terms(&weight, DType::F32, precision)
+        };
         for mm in rows {
             for nn in 0..out {
                 let mut acc = 0.0f32;
                 for kk in 0..k {
-                    acc += x_view[mm * k + kk] * weight[nn * k + kk];
+                    for xt in &x_terms {
+                        for wt in &weight_terms {
+                            acc += xt[mm * k + kk] * wt[nn * k + kk];
+                        }
+                    }
                 }
                 data[mm * out + nn] = acc;
             }

@@ -5,6 +5,8 @@ use crate::emit::Emit;
 use crate::helpers::{
     Alloc, WeightLane, batch_eff, copy, elem, guard, ld, local, row_major_strides, slice_dtype,
 };
+use crate::precision::{ProductRead, accumulate_statements};
+use poot_graph_ir::OperandPrecision;
 use poot_kernel_ir::{
     BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Local, Operand, Place, Rvalue,
     Statement, Terminator, Ty,
@@ -31,14 +33,26 @@ pub fn matmul_batched_dt_grid(
     a_shape: &[usize],
     b_shape: &[usize],
     x_groups: Option<usize>,
+    precision: OperandPrecision,
 ) -> Body {
-    matmul_batched_impl(name, dt, out_shape, a_shape, b_shape, None, &[], x_groups)
+    matmul_batched_impl(
+        name,
+        dt,
+        out_shape,
+        a_shape,
+        b_shape,
+        None,
+        &[],
+        x_groups,
+        precision,
+    )
 }
 
 /// [`matmul_batched_dt_grid`] with a pointwise epilogue applied to each output element in registers before the
 /// store: `C = epilogue(A@B)`. The epilogue's leaves are extra input buffers (a bias, a residual) between `b`
 /// and the output; its dtype is `dt`, and the head result rounds through `dt` before the first step reads it
 /// (see [`Epilogue`]).
+#[expect(clippy::too_many_arguments)] // the shapes, the epilogue, the fold and the operand precision of one body
 pub fn matmul_batched_epilogue_dt_grid(
     name: &str,
     dt: Ty,
@@ -47,6 +61,7 @@ pub fn matmul_batched_epilogue_dt_grid(
     b_shape: &[usize],
     epilogue: &Epilogue,
     x_groups: Option<usize>,
+    precision: OperandPrecision,
 ) -> Result<Body, KernelGenError> {
     let lanes = epilogue.lanes("matmul_batched_epilogue_dt_grid")?;
     Ok(matmul_batched_impl(
@@ -58,6 +73,7 @@ pub fn matmul_batched_epilogue_dt_grid(
         Some(epilogue),
         &lanes,
         x_groups,
+        precision,
     ))
 }
 
@@ -71,6 +87,7 @@ fn matmul_batched_impl(
     epilogue: Option<&Epilogue>,
     lanes: &[Option<WeightLane>],
     x_groups: Option<usize>,
+    precision: OperandPrecision,
 ) -> Body {
     let r = out_shape.len();
     let k = a_shape[a_shape.len() - 1];
@@ -247,6 +264,27 @@ fn matmul_batched_impl(
         )],
         terminator: guard(k_lt, 5, 4),
     };
+    // The products of one `k` step: `va * vb` read as stored, else the sum over every pair of operand terms
+    // (`crate::precision`). The exact form keeps the hand-numbered locals, so its kernel key is unchanged.
+    let read = ProductRead::of_dtype(precision, &dt);
+    let product_stmts: Vec<Statement> = if precision.is_exact() {
+        vec![
+            Statement::Assign(
+                Place::local(prod),
+                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(va)), copy(Place::local(vb))),
+            ),
+            Statement::Assign(
+                Place::local(acc_new),
+                Rvalue::BinaryOp(
+                    BinOp::Add,
+                    copy(Place::local(acc)),
+                    copy(Place::local(prod)),
+                ),
+            ),
+        ]
+    } else {
+        accumulate_statements(&mut al, read, (va, vb), acc, acc_new)
+    };
     // bb4: pa = a_base + kk*a_k_stride; kn = kk*b_k_stride; pb = b_base + kn; acc += a[pa]*b[pb]; kk++
     // The weight read: a native `dt` element, widened when `dt` is bf16 (a no-op for f32), or the checkpoint
     // weight's lane read.
@@ -299,19 +337,8 @@ fn matmul_batched_impl(
         ]
         .into_iter()
         .chain(read_vb)
+        .chain(product_stmts)
         .chain([
-            Statement::Assign(
-                Place::local(prod),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(va)), copy(Place::local(vb))),
-            ),
-            Statement::Assign(
-                Place::local(acc_new),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(acc)),
-                    copy(Place::local(prod)),
-                ),
-            ),
             Statement::Assign(Place::local(acc), Rvalue::Use(copy(Place::local(acc_new)))),
             Statement::Assign(
                 Place::local(k_new),

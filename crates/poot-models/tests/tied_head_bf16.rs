@@ -58,7 +58,8 @@ fn the_tied_head_decode_runs_the_bf16_gemv_over_bf16_resident_weight() {
         assert_eq!(
             eqn.op,
             OpKind::DenseContraction {
-                weight: DType::BF16
+                weight: DType::BF16,
+                precision: poot_graph_ir::OperandPrecision::Exact
             },
             "{backend:?}: the head reads the weight in checkpoint order"
         );

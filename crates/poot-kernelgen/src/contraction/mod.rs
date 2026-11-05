@@ -26,6 +26,7 @@ pub(crate) use tiled::{ExpertWalk, TiledBody, TiledLaunch, TiledWeight, tiled_bo
 use crate::KernelGenError;
 use crate::helpers::WeightLayout;
 use crate::microtile::{LaneRows, MicroCols, MicroTile};
+use crate::precision::StagedTerms;
 
 /// How a [`Schedule::Gemv`] lane reads the `unroll` activation values of a full run. Both read the same values
 /// and feed them to the same products in the same order, so the output is bit-identical; they differ only in the
@@ -211,6 +212,8 @@ pub struct TiledShape {
     pub layout: WeightLayout,
     /// Contiguous row runs of a block that read different weights: an expert walk's keys (1 for none).
     pub segments: usize,
+    /// The f32 tiles staged per operand: more than one for a split operand, which stages its `hi` and `lo` parts.
+    pub terms: StagedTerms,
 }
 
 impl TiledShape {
@@ -252,7 +255,7 @@ impl RegisterTiling {
         let launch = caps.gemm_launch();
         let run = RunLength::dividing(shape.k);
         let mut best: Option<(f64, Self)> = None;
-        for tiling in Self::candidates(shape.k, shape.layout, caps) {
+        for tiling in Self::candidates(shape.k, shape.layout, shape.terms, caps) {
             let cost = tiling.cost(shape, caps);
             let better = best.is_none_or(|(best_cost, best_tiling)| {
                 cost < best_cost
@@ -280,6 +283,7 @@ impl RegisterTiling {
     pub(crate) fn candidates(
         k: usize,
         layout: WeightLayout,
+        terms: StagedTerms,
         caps: &poot_target::DeviceCaps,
     ) -> impl Iterator<Item = Self> + '_ {
         let launch = caps.gemm_launch();
@@ -296,19 +300,24 @@ impl RegisterTiling {
                     })
                 })
             })
-            .filter(move |tiling| tiling.runs_on(layout, caps))
+            .filter(move |tiling| tiling.runs_on(layout, terms, caps))
     }
 
     /// Whether `caps` runs this tiling over a weight stored in `layout`: its workgroup fits, its two staged tiles
     /// fit the LDS and stage in whole slots, and its register tile is at most [`MAX_LANE_ACCUMULATORS`].
-    fn runs_on(self, layout: WeightLayout, caps: &poot_target::DeviceCaps) -> bool {
+    fn runs_on(
+        self,
+        layout: WeightLayout,
+        terms: StagedTerms,
+        caps: &poot_target::DeviceCaps,
+    ) -> bool {
         let lanes = self.lanes();
         let lane_count = lanes * lanes;
         let micro = self.micro_tile();
         self.rows.get() * self.cols.get() <= MAX_LANE_ACCUMULATORS
             && lane_count <= caps.max_workgroup_invocations as usize
             && lane_count <= caps.max_workgroup_size[0] as usize
-            && tiled::lds_bytes(lanes, micro) <= caps.lds_bytes as usize
+            && tiled::lds_bytes(lanes, micro, terms) <= caps.lds_bytes as usize
             && tiled::stages_evenly(lanes, micro, self.run.get() as usize, layout)
     }
 
@@ -399,6 +408,7 @@ mod tests {
             k,
             layout: WeightLayout::Nk,
             segments: 1,
+            terms: crate::precision::StagedTerms::ONE,
         }
     }
 
@@ -491,7 +501,7 @@ mod tests {
             ..poot_target::DeviceCaps::rocm_default()
         };
         assert!(
-            RegisterTiling::candidates(1024, WeightLayout::Nk, &small_workgroup)
+            RegisterTiling::candidates(1024, WeightLayout::Nk, StagedTerms::ONE, &small_workgroup)
                 .all(|tiling| tiling.lanes() == 8)
         );
         let small_lds = poot_target::DeviceCaps {
@@ -499,11 +509,12 @@ mod tests {
             ..poot_target::DeviceCaps::rocm_default()
         };
         let offered: Vec<RegisterTiling> =
-            RegisterTiling::candidates(1024, WeightLayout::Nk, &small_lds).collect();
+            RegisterTiling::candidates(1024, WeightLayout::Nk, StagedTerms::ONE, &small_lds)
+                .collect();
         assert!(!offered.is_empty());
         for tiling in offered {
             assert!(
-                tiled::lds_bytes(tiling.lanes(), tiling.micro_tile()) <= 8 * 1024,
+                tiled::lds_bytes(tiling.lanes(), tiling.micro_tile(), StagedTerms::ONE) <= 8 * 1024,
                 "{tiling:?}"
             );
         }

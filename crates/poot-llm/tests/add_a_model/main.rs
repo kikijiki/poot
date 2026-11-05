@@ -596,6 +596,7 @@ fn driver_options(chunk: usize, max_trace_tokens: usize) -> DriverOptions {
         charge: program_retention,
         draft: DraftPolicy::Off,
         hidden_window: None,
+        matmul_precision: None,
     }
 }
 

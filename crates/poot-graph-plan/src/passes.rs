@@ -33,6 +33,7 @@ mod hosted_gather;
 mod iota;
 mod legalize;
 mod lora;
+mod operand_precision;
 mod packed;
 mod packed_bind;
 mod pool;
@@ -93,6 +94,9 @@ pub(crate) use hosted_gather::{HostedSite, host_gather_tables};
 pub use iota::fold_iota;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) use iota::fold_iota;
+#[cfg(any(test, feature = "test-support"))]
+pub use operand_precision::with_operand_precision;
+pub(crate) use operand_precision::{FragmentUnits, select_operand_precision};
 pub use packed::PackedDequantErrorContext;
 pub use packed::PackedDequantProductionError;
 pub use packed::recognize_packed_contractions;

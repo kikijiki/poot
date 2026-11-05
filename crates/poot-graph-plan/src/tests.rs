@@ -1092,7 +1092,7 @@ fn a_biased_checkpoint_orientation_projection_is_one_contraction_with_bias_and_n
                 matches!(
                     ops.as_slice(),
                     [OpKind::ContractionEpilogue {
-                        head: ContractionHead::Dense { weight: stored },
+                        head: ContractionHead::Dense { weight: stored, .. },
                         ..
                     }] if *stored == weight
                 ),
@@ -3298,7 +3298,7 @@ fn f16_non_wired_op_rejected_with_diagnostic() {
     let eqn = g
         .eqns()
         .iter()
-        .find(|e| matches!(e.op, OpKind::IndexedMatMul))
+        .find(|e| matches!(e.op, OpKind::IndexedMatMul { .. }))
         .expect("an indexed_matmul eqn");
     assert_eq!(
         g.aval(eqn.out).dtype,
@@ -3806,7 +3806,7 @@ fn indexed_lane_edge(backend: Backend, caps: &DeviceCaps, packed: bool) -> usize
         .find(|e| {
             matches!(
                 e.op,
-                OpKind::IndexedMatMul | OpKind::PackedContraction { .. }
+                OpKind::IndexedMatMul { .. } | OpKind::PackedContraction { .. }
             )
         })
         .expect("a routed contraction eqn");
@@ -5152,6 +5152,7 @@ fn selected_attention_planned(
             softcap: None,
             ratio: 4,
             k: 512,
+            precision: poot_graph_ir::OperandPrecision::Exact,
         },
         [q, k, v, ids, pos],
     )
@@ -5802,6 +5803,7 @@ fn an_m1_dense_bf16_contraction_plans_the_generated_gemv_on_every_backend() {
             k,
             n,
             epilogue,
+            ..
         })) = choice
         else {
             panic!("{backend:?}: expected the generated dense Gemv, got {choice:?}");

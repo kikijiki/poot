@@ -13,7 +13,7 @@
 //! level down, the first time an equation of that shape is evaluated (`EvalError::Unsupported`), not
 //! before the walk starts.
 
-use poot_graph_ir::{Eqn, Graph, OpKind, Operand};
+use poot_graph_ir::{Eqn, Graph, OpKind, Operand, OperandPrecision};
 use poot_tensor::DType;
 
 /// A static label for [`EvalError::Unsupported`], one per [`OpKind`] discriminant (never the dynamic,
@@ -43,7 +43,7 @@ pub(crate) fn op_label(op: &OpKind) -> &'static str {
         OpKind::ContractionEpilogue { .. } => "contraction_epilogue",
         OpKind::ArgTopK { .. } => "arg_top_k",
         OpKind::ExpertGroup { .. } => "expert_group",
-        OpKind::IndexedMatMul => "indexed_matmul",
+        OpKind::IndexedMatMul { .. } => "indexed_matmul",
         OpKind::DynamicUpdateSlice { .. } => "dynamic_update_slice",
         OpKind::Fused(_) => "fused",
         OpKind::FusedRow(_) => "fused_row",
@@ -72,7 +72,10 @@ pub(crate) enum Bf16Equation<'a> {
     /// `Transpose` of a BF16 value.
     Transpose { perm: &'a [usize] },
     /// `MatMul(F32 activation, BF16 weight) -> F32`, the mixed-dtype linear.
-    WeightMatMul,
+    WeightMatMul {
+        /// How the activation and the weight are read.
+        precision: OperandPrecision,
+    },
 }
 
 /// Whether `eqn` reads or produces a BF16 value.
@@ -113,10 +116,12 @@ pub(crate) fn classify<'a>(graph: &Graph, eqn: &'a Eqn) -> Option<Bf16Equation<'
                 perm: perm.as_slice(),
             })
         }
-        OpKind::MatMul { .. }
+        OpKind::MatMul { precision, .. }
             if (arity, first, second) == (2, Some(DType::F32), Some(DType::BF16)) =>
         {
-            Some(Bf16Equation::WeightMatMul)
+            Some(Bf16Equation::WeightMatMul {
+                precision: *precision,
+            })
         }
         _ => None,
     }

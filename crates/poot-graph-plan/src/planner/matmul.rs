@@ -13,7 +13,7 @@ use crate::predicates::{
     packed_contraction_m_per_block, serial_matmul_fold,
 };
 use crate::refusal::{FusedStepGap, Site};
-use poot_graph_ir::{ContractionRows, LocalId};
+use poot_graph_ir::{ContractionRows, LocalId, OperandPrecision};
 use poot_target::{Backend, DeviceCaps};
 
 /// The launch of a `Tiled` contraction of `tiles` workgroups of `tile * tile` threads: the tiles laid out on the X
@@ -123,9 +123,11 @@ pub(crate) fn epilogue_head_lowers(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> b
         // an epilogue, so every dense head lowers (the weight dtypes the dense planner admits).
         OpKind::DenseContraction { .. } => true,
         // Every indexed schedule (Gemv and the register-tiled expert walk) carries an epilogue.
-        OpKind::IndexedMatMul => indexed_matmul_lowers(tables, eqn),
+        OpKind::IndexedMatMul { .. } => indexed_matmul_lowers(tables, eqn),
         // The packed Gemv (one activation row per block) carries an epilogue; the block-diagonal tiled schedule does not.
-        OpKind::PackedContraction { descriptor, rows } => {
+        OpKind::PackedContraction {
+            descriptor, rows, ..
+        } => {
             crate::packed_block_float::admit_packed(
                 crate::packed_block_float::PACKED_LOWERING,
                 *descriptor,
@@ -251,6 +253,8 @@ pub(super) fn plan(
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
     let ids = value_ids(eqn);
     let fty = fty_ty;
+    // How the equation reads its operands: every schedule below implements it.
+    let precision = eqn.op.operand_precision().unwrap_or_default();
     let generate = |request: KernelRequest| Planned::generated(site, request, backend, caps);
     let planned = match &eqn.op {
         OpKind::MatMul { .. } => {
@@ -271,6 +275,7 @@ pub(super) fn plan(
                     epilogue: None,
                     shapes: shapes(),
                     fold: serial_matmul_fold(out_numel, caps),
+                    precision,
                 }))
             };
             // Every route plans a kernel whose single element type covers operands and output, so a mixed
@@ -295,9 +300,11 @@ pub(super) fn plan(
                             k: kk,
                             layout: WeightLayout::Kn,
                             segments: 1,
+                            terms: kg::StagedTerms::of(precision, None, None),
                         },
                         kg::DenseTiledWeight::KnF32,
                         None,
+                        precision,
                         caps,
                     )?
                 }
@@ -316,9 +323,11 @@ pub(super) fn plan(
                             k: kk,
                             layout: WeightLayout::Kn,
                             segments: 1,
+                            terms: kg::StagedTerms::of(precision, None, None),
                         },
                         kg::DenseTiledWeight::KnF32,
                         None,
+                        precision,
                         caps,
                     )?
                 }
@@ -329,7 +338,7 @@ pub(super) fn plan(
                     // [x, weight, out] with no metadata buffer. `decode_gemv_plan` also owns the large-N
                     // watchdog-safety chunking (card 258): above the trigger it launches the same body over
                     // disjoint ranges of the output, never a different body.
-                    decode_gemv_plan(site, backend, kk, nn, out_numel, caps)?
+                    decode_gemv_plan(site, backend, kk, nn, out_numel, precision, caps)?
                 }
                 MatMulRoute::AttnGemv => {
                     // decode attention scores@V: LDS-parallel reduction over cap (card 143 Lever 1b), the
@@ -340,6 +349,7 @@ pub(super) fn plan(
                             d: nn,
                             width: GEMV_WIDTH,
                             numel: out_numel,
+                            precision,
                         },
                     ))?
                 }
@@ -352,13 +362,13 @@ pub(super) fn plan(
             }
         }
         OpKind::ContractionEpilogue {
-            head: ContractionHead::MatMul,
+            head: head @ ContractionHead::MatMul { .. },
             region,
         } => {
             // The head's operands and result share one dtype (the fuse rule's contract), and the generated
             // serial kernel is the lowering: it rounds the f32 accumulator through that dtype before the
             // epilogue reads it, as the unfused program's store does.
-            if ids[..ContractionHead::MatMul.operands()]
+            if ids[..head.operands()]
                 .iter()
                 .any(|&id| g.aval(id).dtype != odt)
             {
@@ -368,7 +378,7 @@ pub(super) fn plan(
                 site,
                 g,
                 eqn,
-                ContractionHead::MatMul.operands(),
+                head.operands(),
                 region,
                 out_shape,
                 odt,
@@ -388,9 +398,11 @@ pub(super) fn plan(
                         k: a[a.len() - 1],
                         layout: WeightLayout::Kn,
                         segments: 1,
+                        terms: kg::StagedTerms::of(precision, None, None),
                     },
                     kg::DenseTiledWeight::KnF32,
                     Some(epilogue),
+                    precision,
                     caps,
                 );
             }
@@ -403,6 +415,7 @@ pub(super) fn plan(
                     b_shape: shape(ids[1]),
                 },
                 fold: serial_matmul_fold(out_numel, caps),
+                precision,
             }))?
         }
         OpKind::Iota { .. } => {
@@ -531,6 +544,7 @@ pub(super) fn dense_tiled_plan(
     shape: kg::TiledShape,
     weight: kg::DenseTiledWeight,
     epilogue: Option<kg::Epilogue>,
+    precision: OperandPrecision,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
     let (tiling, dispatches) = register_tiled_launch(site, shape, caps)?;
@@ -546,6 +560,7 @@ pub(super) fn dense_tiled_plan(
                 epilogue: epilogue.clone(),
                 grid,
                 meta,
+                precision,
             }))
         },
     )

@@ -350,6 +350,7 @@ fn options(capacity: usize) -> DriverOptions {
         charge: poot_llm::driver::program_retention,
         draft: poot_llm::driver::DraftPolicy::Off,
         hidden_window: None,
+        matmul_precision: None,
     }
 }
 

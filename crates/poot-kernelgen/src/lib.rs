@@ -21,6 +21,7 @@ mod helpers;
 mod matmul;
 mod microtile;
 mod packed;
+mod precision;
 mod reduce;
 #[cfg(test)]
 mod register_budget;
@@ -65,6 +66,7 @@ pub use fused::{
 pub use helpers::{BodyBudget, BodyLimits, BodySize, Layout, WeightLayout, view_eff_strides};
 pub use microtile::{LaneRows, MicroCols};
 pub use packed::{PackedKernelOp, PackedKernelSpec};
+pub use precision::{StagedTerms, stored_fragment_dtype};
 
 // Generators still called by name outside `generate`, each for a recorded reason (card 636 census, at
 // dispatch the planner calls none of them):

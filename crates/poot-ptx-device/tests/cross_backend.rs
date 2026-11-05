@@ -1340,7 +1340,8 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_ptx() {
             assert_eq!(
                 heads,
                 [poot_graph_ir::op::ContractionHead::Dense {
-                    weight: weight_dtype
+                    weight: weight_dtype,
+                    precision: poot_graph_ir::OperandPrecision::Exact
                 }],
                 "{label}: one fused dense contraction"
             );
@@ -1413,7 +1414,9 @@ fn a_tiled_matmul_epilogue_matches_the_oracle_on_ptx() {
             .collect();
         assert_eq!(
             heads,
-            [poot_graph_ir::op::ContractionHead::MatMul],
+            [poot_graph_ir::op::ContractionHead::MatMul {
+                precision: poot_graph_ir::OperandPrecision::Exact
+            }],
             "{label}: one fused matmul contraction"
         );
         let (fused, class) = common::run_resident_classed(&mut ptx, &g, &inputs);

@@ -13,7 +13,9 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 
 use poot_graph_ir::op::{ContractionHead, OpKind};
-use poot_graph_ir::{Eqn, Graph, Operand, TensorType, ValueId, ValueMeta, ValueTable};
+use poot_graph_ir::{
+    Eqn, Graph, Operand, OperandPrecision, TensorType, ValueId, ValueMeta, ValueTable,
+};
 use poot_kernelgen as kg;
 use poot_target::{Backend, DeviceCaps, TargetId};
 
@@ -116,9 +118,9 @@ fn is_strided_capable(eqn: &Eqn, value: ValueId) -> bool {
         OpKind::Binary(_) | OpKind::Unary(_) | OpKind::Fused(_) | OpKind::FusedRow(_) => true,
         // The indexed contraction reads its stacked weight (operand 1 only) through a transposed layout, so a
         // `Transpose` feeding it is never materialized. Its activation, ids and epilogue leaves are read flat.
-        OpKind::IndexedMatMul
+        OpKind::IndexedMatMul { .. }
         | OpKind::ContractionEpilogue {
-            head: ContractionHead::Indexed,
+            head: ContractionHead::Indexed { .. },
             ..
         } => reads_as_indexed_weight(eqn, value),
         _ => false,
@@ -129,9 +131,9 @@ fn is_strided_capable(eqn: &Eqn, value: ValueId) -> bool {
 fn reads_as_indexed_weight(eqn: &Eqn, value: ValueId) -> bool {
     matches!(
         eqn.op,
-        OpKind::IndexedMatMul
+        OpKind::IndexedMatMul { .. }
             | OpKind::ContractionEpilogue {
-                head: ContractionHead::Indexed,
+                head: ContractionHead::Indexed { .. },
                 ..
             }
     ) && matches!(eqn.inputs.get(1), Some(Operand::Value(weight)) if *weight == value)
@@ -346,6 +348,7 @@ pub(crate) fn decode_gemv_plan(
     k: usize,
     n: usize,
     out_numel: usize,
+    precision: OperandPrecision,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
     let request = |elems, offset| {
@@ -355,6 +358,7 @@ pub(crate) fn decode_gemv_plan(
             width: GEMV_WIDTH,
             elems,
             offset,
+            precision,
         })
     };
     let over_trigger = caps
@@ -845,9 +849,9 @@ pub(crate) fn is_tileable_matmul_in(g: GraphTables<'_>, eqn: &Eqn) -> bool {
     let head_operands = match &eqn.op {
         OpKind::MatMul { .. } => 2,
         OpKind::ContractionEpilogue {
-            head: ContractionHead::MatMul,
+            head: head @ ContractionHead::MatMul { .. },
             ..
-        } => ContractionHead::MatMul.operands(),
+        } => head.operands(),
         _ => return false,
     };
     let out = &g.aval(eqn.out).shape;
@@ -1035,6 +1039,7 @@ pub(crate) fn is_elementwise_2d_in(
         // `finalize` already skips.
         OpKind::DenseContraction {
             weight: DType::F32 | DType::F16,
+            ..
         } => {
             out_numel > fold_ceiling
                 && dense_decode_gemv_in(eqn, out_shape, out_numel, caps).is_none()

@@ -16,10 +16,16 @@ poot-target.workspace = true
 # generates kernel bodies for poot-quant's formats, so this is a real (non-dev) dependency of a leaf
 # crate, not a cycle (card 542a, dquant.md D1).
 poot-quant.workspace = true
+# `OperandPrecision` and `FragmentDtype`: the declared operand rounding every schedule of a contraction or attention
+# body implements (POOT-1430). Their rounding helpers live here, in `crate::precision`.
+poot-graph-ir.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 poot-graph-ir = { workspace = true, features = ["test-support"] }
+# `round_to_fragment`: the oracle's definition of the operand narrowing, which the operand-precision rows hold the
+# generated bodies' staged values against bit for bit.
+poot-eval.workspace = true
 poot-quant = { workspace = true, features = ["test-support"] }
 # ADR-0113: this crate's own `#[cfg(test)]` module (`emit.rs`) and its `tests/{flash,rope}_interp.rs`
 # call `poot_kernel_ir::interp::Buffer::from_f32s`/`from_u32s`/`to_f32s` directly, gated behind

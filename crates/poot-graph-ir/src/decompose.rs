@@ -17,6 +17,7 @@ use crate::op::{
 };
 use crate::ops;
 use crate::packed_source::packed_source_constants;
+use crate::precision::OperandPrecision;
 use crate::types::{DType, TensorType};
 use poot_quant::PackedWeight;
 
@@ -143,6 +144,7 @@ pub fn decompose(
                 attrs.softcap,
                 len,
                 sinks,
+                attrs.precision,
             )?
         }
         OpKind::Rope { rot } => {
@@ -169,6 +171,7 @@ pub fn decompose(
                 attrs.scale,
                 attrs.softcap,
                 attrs.ratio,
+                attrs.precision,
             )?
         }
         OpKind::BlockTopK(attrs) => {
@@ -212,23 +215,26 @@ pub fn decompose(
         OpKind::PackedContraction {
             descriptor,
             rows: ContractionRows::Blocks(blocks),
+            precision,
         } => {
             let [activation, carriers @ ..] = inputs.as_slice() else {
                 return Ok(None);
             };
-            packed_contraction(&b, *descriptor, *blocks, *activation, carriers)?
+            packed_contraction(&b, *descriptor, *blocks, *activation, carriers, *precision)?
         }
         OpKind::PackedContraction {
             rows: ContractionRows::Indexed { .. },
             ..
         } => return Ok(None),
-        OpKind::DenseContraction { .. } => {
+        OpKind::DenseContraction { precision, .. } => {
             let &[activation, weight] = inputs.as_slice() else {
                 return Ok(None);
             };
-            b.matmul(activation, b.transpose(weight, vec![1, 0])?)?
+            b.matmul_as(activation, b.transpose(weight, vec![1, 0])?, *precision)?
         }
-        OpKind::GroupedDenseContraction { groups, .. } => {
+        OpKind::GroupedDenseContraction {
+            groups, precision, ..
+        } => {
             let &[activation, weight] = inputs.as_slice() else {
                 return Ok(None);
             };
@@ -236,7 +242,7 @@ pub fn decompose(
                 return Ok(None);
             };
             let blocks = b.reshape(weight, vec![*groups, rows / groups, k])?;
-            b.matmul(activation, b.transpose(blocks, vec![0, 2, 1])?)?
+            b.matmul_as(activation, b.transpose(blocks, vec![0, 2, 1])?, *precision)?
         }
         OpKind::DenseRowGather { .. } => {
             let &[table, index] = inputs.as_slice() else {
@@ -262,7 +268,7 @@ pub fn decompose(
         | OpKind::PackedRowGather { .. }
         | OpKind::ArgTopK { .. }
         | OpKind::ExpertGroup { .. }
-        | OpKind::IndexedMatMul
+        | OpKind::IndexedMatMul { .. }
         | OpKind::DynamicUpdateSlice { .. }
         | OpKind::AllReduce { .. }
         | OpKind::AllGather { .. }
@@ -319,6 +325,7 @@ fn packed_contraction(
     blocks: usize,
     activation: Traced,
     carriers: &[Traced],
+    precision: OperandPrecision,
 ) -> Result<Traced, BuilderError> {
     let weight = b.packed_dequant(carriers, descriptor)?;
     let [out, k] = descriptor.shape();
@@ -328,7 +335,7 @@ fn packed_contraction(
         let grouped = b.reshape(weight, vec![blocks, out / blocks, k])?;
         b.transpose(grouped, vec![0, 2, 1])?
     };
-    b.matmul(activation, weight)
+    b.matmul_as(activation, weight, precision)
 }
 
 /// One region local as an equation operand: an input or step result, or a literal kept in place.
@@ -532,7 +539,7 @@ pub(crate) mod tests {
             OpKind::DenseRowGather { .. } => 18,
             OpKind::ContractionEpilogue { .. } => 19,
             OpKind::ArgTopK { .. } => 20,
-            OpKind::IndexedMatMul => 21,
+            OpKind::IndexedMatMul { .. } => 21,
             OpKind::DynamicUpdateSlice { .. } => 22,
             OpKind::Fused(_) => 23,
             OpKind::FusedRow(_) => 24,
@@ -716,6 +723,7 @@ pub(crate) mod tests {
                 OpKind::PackedContraction {
                     descriptor: packed,
                     rows: ContractionRows::Blocks(1),
+                    precision: crate::precision::OperandPrecision::Exact,
                 },
                 with_sources(vec![f32(&[2, 32])], false),
             ),
@@ -723,6 +731,7 @@ pub(crate) mod tests {
                 OpKind::PackedContraction {
                     descriptor: packed,
                     rows: ContractionRows::Blocks(2),
+                    precision: crate::precision::OperandPrecision::Exact,
                 },
                 with_sources(vec![f32(&[2, 3, 32])], false),
             ),
@@ -733,21 +742,29 @@ pub(crate) mod tests {
             (
                 OpKind::DenseContraction {
                     weight: DType::BF16,
+                    precision: crate::precision::OperandPrecision::Exact,
                 },
                 vec![f32(&[2, 4]), typed(&[3, 4], DType::BF16)],
             ),
             (
-                OpKind::DenseContraction { weight: DType::F32 },
+                OpKind::DenseContraction {
+                    weight: DType::F32,
+                    precision: crate::precision::OperandPrecision::Exact,
+                },
                 vec![f32(&[2, 3, 4]), f32(&[5, 4])],
             ),
             (
-                OpKind::DenseContraction { weight: DType::F16 },
+                OpKind::DenseContraction {
+                    weight: DType::F16,
+                    precision: crate::precision::OperandPrecision::Exact,
+                },
                 vec![f32(&[2, 4]), typed(&[3, 4], DType::F16)],
             ),
             (
                 OpKind::GroupedDenseContraction {
                     weight: DType::BF16,
                     groups: 2,
+                    precision: crate::precision::OperandPrecision::Exact,
                 },
                 vec![f32(&[2, 3, 4]), typed(&[10, 4], DType::BF16)],
             ),
@@ -765,7 +782,9 @@ pub(crate) mod tests {
             ),
             (
                 OpKind::ContractionEpilogue {
-                    head: ContractionHead::MatMul,
+                    head: ContractionHead::MatMul {
+                        precision: crate::precision::OperandPrecision::Exact,
+                    },
                     region: bias_residual_region(),
                 },
                 vec![f32(&[2, 3]), f32(&[3, 4]), f32(&[4]), f32(&[2, 4])],
@@ -773,7 +792,7 @@ pub(crate) mod tests {
             (OpKind::ArgTopK { k: 2 }, vec![f32(&[2, 5])]),
             (OpKind::ExpertGroup { experts: 4 }, vec![typed(&[6], i32)]),
             (
-                OpKind::IndexedMatMul,
+                OpKind::indexed_matmul(),
                 vec![f32(&[2, 3]), f32(&[4, 3, 5]), typed(&[2], i32)],
             ),
             (
@@ -877,6 +896,7 @@ pub(crate) mod tests {
                     softcap: None,
                     ratio: 2,
                     k: 2,
+                    precision: crate::precision::OperandPrecision::Exact,
                 }),
                 vec![
                     f32(&[2, 4, 1, 8]),
@@ -996,7 +1016,9 @@ pub(crate) mod tests {
         );
         // A bias of width 5 does not broadcast against the head's `[2, 4]` result.
         let epilogue = OpKind::ContractionEpilogue {
-            head: ContractionHead::MatMul,
+            head: ContractionHead::MatMul {
+                precision: crate::precision::OperandPrecision::Exact,
+            },
             region: bias_residual_region(),
         };
         let wide_bias = [f32(&[2, 3]), f32(&[3, 4]), f32(&[5]), f32(&[2, 4])];

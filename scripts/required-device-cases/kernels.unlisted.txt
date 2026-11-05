@@ -31,6 +31,7 @@ poot-kernelgen	helpers::stride_tests::broadcast_eff_strides_single_axis_zeroed	k
 poot-kernelgen	helpers::stride_tests::row_major_strides_contiguous	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	helpers::stride_tests::view_eff_strides_contiguous_matches_broadcast_eff_strides	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	helpers::stride_tests::view_eff_strides_transposed_layout_is_not_row_major	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::contraction_tests::a_narrowed_packed_contraction_rounds_the_decoded_weight_and_the_activation	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_tiled_packed_contraction_refuses_an_epilogue_by_name	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_vector_activation_read_matches_the_scalar_read_bit_for_bit	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_vector_activation_read_over_a_partial_group_run_is_refused	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -156,6 +157,7 @@ poot-kernelgen::flash_interp	a_causal_row_never_reads_a_key_it_cannot_see	kernel
 poot-kernelgen::flash_interp	a_causal_row_under_split_kv_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_folded_grid_covers_every_row_once	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_live_bound_never_reads_the_poisoned_tail	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::flash_interp	a_narrowed_attention_rounds_its_operands_on_every_schedule	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_paged_key_equals_the_dense_kernel_over_its_gathered_views	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_paged_split_kv_with_a_live_bound_never_reads_past_the_length	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_poisoned_scratch_with_trailing_empty_splits_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
@@ -167,6 +169,7 @@ poot-kernelgen::flash_interp	a_sink_row_with_no_visible_key_is_zero	kernelgen `f
 poot-kernelgen::flash_interp	a_sink_under_split_kv_is_counted_once	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_split_key_with_a_narrower_value_matches_the_reference	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_split_launch_past_the_grid_is_a_typed_refusal	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::flash_interp	a_split_precision_has_no_tiled_schedule	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_split_row_with_no_visible_key_is_nan_and_its_neighbour_is_not	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_split_whose_keys_are_all_masked_weighs_zero	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::flash_interp	a_tiled_prefill_into_a_cache_never_reads_a_key_no_row_sees	kernelgen `flash_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
@@ -220,6 +223,9 @@ poot-kernelgen::llc	matrix_work_under_a_lane_varying_branch_is_refused_before_co
 poot-kernelgen::llc	second_amd_target_follows_mach	kernelgen `llc` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::llc	swapped_matrix_operands_are_refused_before_codegen	kernelgen `llc` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::llc	whole_subgroup_selection_lowers_to_valid_spirv	kernelgen `llc` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::operand_precision_interp	a_weight_stored_in_the_fragment_dtype_enters_once	kernelgen `operand_precision_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::operand_precision_interp	every_contraction_body_equals_the_host_product_over_the_declared_terms	kernelgen `operand_precision_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::operand_precision_interp	staged_narrow_values_are_bit_identical_to_the_oracles_round_to_nearest_even	kernelgen `operand_precision_interp` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::packed_contraction_movement	a_windowed_scatter_composes_to_the_whole_output	kernelgen `packed_contraction_movement` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::packed_contraction_movement	every_op_matches_the_reference_on_every_storage	kernelgen `packed_contraction_movement` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::packed_contraction_movement	fp8_special_encodings_move_as_raw_bits_and_decode_like_dense_movement	kernelgen `packed_contraction_movement` test binary (emit, interpreter or dispatch rows); the lane runs the package whole

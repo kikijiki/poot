@@ -71,6 +71,57 @@ fn checkpoint_orientation_projection_matches_the_oracle_on_vulkan() {
     }
 }
 
+/// POOT-1430: the checkpoint-orientation projections (f32, f16 and bf16 weights, at `M = 1`, `4` and `33`) and every
+/// packed linear and indexed packed expert contraction, compiled
+/// for vulkan under the `Narrow` and the `Split` policy, match the CPU oracle of the declared semantics: the
+/// register-tiled and decode GEMV bodies read their operands as the pass declared. Mutation: in `tiled_body` stage
+/// the activation unrounded; every `Narrow` row goes red.
+#[test]
+fn narrowed_projections_match_the_declared_oracle_on_vulkan() {
+    let Some(device) = open_or_skip(DeviceBackend::Vulkan, VulkanDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    let mut fixtures = poot_executor_parity::checkpoint_projection_fixtures();
+    fixtures.extend(poot_executor_parity::checkpoint_projection_f16_fixtures());
+    fixtures.extend(poot_executor_parity::checkpoint_projection_bf16_fixtures());
+    fixtures.extend(poot_executor_parity::packed::packed_linear_fixtures());
+    fixtures.extend(poot_executor_parity::packed::packed_expert_fixtures());
+    for policy in [
+        poot_graph_ir::MatmulPrecision::Narrow,
+        poot_graph_ir::MatmulPrecision::Split,
+    ] {
+        poot_executor_parity::precision::run_parity_declared(exec.as_mut(), t, &fixtures, policy)
+            .unwrap_or_else(|e| panic!("{policy:?}: {e}"));
+    }
+}
+
+/// POOT-1430: an attention that declares `Narrow(f16)` or `Split(f16)` over an f16 KV cache, at decode and as a
+/// 33-row causal prefill, matches the CPU oracle on vulkan: Q, K, V and the probabilities are read as declared
+/// by the schedules the planner picks. Mutation: in `attention::add_products` read the operands unrounded; the
+/// narrow and split rows go red.
+#[test]
+fn declared_attention_precision_matches_the_oracle_on_vulkan() {
+    let Some(device) = open_or_skip(DeviceBackend::Vulkan, VulkanDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    for precision in [
+        poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::F16),
+        poot_graph_ir::OperandPrecision::Split(poot_graph_ir::FragmentDtype::F16),
+    ] {
+        poot_executor_parity::precision::run_parity_declared(
+            exec.as_mut(),
+            t,
+            &poot_executor_parity::precision::attention_fixtures(precision),
+            poot_graph_ir::MatmulPrecision::Exact,
+        )
+        .unwrap_or_else(|e| panic!("{precision}: {e}"));
+    }
+}
+
 /// Card 736: the ALiBi attention BLOOM and MPT trace (`alibi_mask_from_pos` over a
 /// `ComputedConst::AlibiSlopes` of 6 heads, decode at three positions and a 4-token prefill), compiled for
 /// raw Vulkan, matches `eval(g)` at every replayed step (ADR-0101 tier 1) AND an f64 reference that writes the

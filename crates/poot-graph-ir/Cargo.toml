@@ -16,6 +16,8 @@ test-support = ["dep:poot-test-util"]
 
 [dependencies]
 poot-tensor.workspace = true
+# `FragmentDtype`: the operand dtype of a matrix fragment, shared with the device caps (`MatrixUnits`).
+poot-target.workspace = true
 poot-quant.workspace = true
 poot-weights.workspace = true
 # `fill`, the seeded fill the scan fixture draws its operands from; present only under `test-support`.

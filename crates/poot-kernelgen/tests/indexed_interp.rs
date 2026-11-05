@@ -117,6 +117,7 @@ fn run_indexed(
             epilogue: None,
             grid,
             meta: vec![K as u32, N as u32, m as u32, x_groups, 0, EXPERTS as u32],
+            precision: poot_graph_ir::OperandPrecision::Exact,
         }));
     let generated = kg::generate(&request, &caps, &limits).unwrap();
     let wg = generated.body.workgroup_size[0];
@@ -188,6 +189,7 @@ fn an_invalid_expert_id_is_a_nan_row_and_never_an_out_of_range_read() {
                     k: K,
                     layout,
                     segments: EXPERTS,
+                    terms: poot_kernelgen::StagedTerms::ONE,
                 },
                 &DeviceCaps::wgpu_rdna3_igpu(),
             )
@@ -235,6 +237,7 @@ fn an_f16_packed_indexed_weight_is_refused_by_name() {
             epilogue: None,
             grid: [16, 1, 1],
             meta: vec![K as u32, N as u32, 1, 0, 0, EXPERTS as u32],
+            precision: poot_graph_ir::OperandPrecision::Exact,
         }));
     let limits = kg::BodyLimits {
         max_instructions: std::num::NonZeroUsize::new(1 << 20).unwrap(),

@@ -25,6 +25,7 @@ use crate::contraction::{
 };
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
 use crate::helpers::{ld, local, slice_dtype, slice_f32};
+use crate::precision::ProductRead;
 
 /// The row selection of an indexed packed Gemv: the `ids` buffer and the `metadata` buffer to read it from.
 #[derive(Clone, Copy)]
@@ -111,6 +112,7 @@ pub(super) fn indexed_register_tiled(
     format: poot_quant::format::WeightFormat,
     launch: TiledLaunch,
     epilogue: Option<&Epilogue>,
+    read: ProductRead,
 ) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
     let decode = match descriptor.storage {
@@ -184,6 +186,7 @@ pub(super) fn indexed_register_tiled(
             experts_word: META_EXPERTS,
             step: &mut slabs,
         }),
+        read,
     };
     let mut body = tiled_body(spec, launch, TiledWeight::Rows(&mut run));
     body.constant_tables = tables;
@@ -347,6 +350,7 @@ mod tests {
             schedule,
             epilogue.map(|(epilogue, _)| epilogue),
             PackedRows::Indexed,
+            poot_graph_ir::OperandPrecision::Exact,
         )
         .unwrap_or_else(|error| panic!("{format:?}: {error}"));
         let (grid, x_groups) = match schedule {

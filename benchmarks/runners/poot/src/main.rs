@@ -47,6 +47,7 @@ use serde_json::{json, Value};
 use poot_executor::DetailedTiming;
 use poot_llm::driver::capacity::{chunk_candidates, fit_prefill_chunk, Observation};
 use poot_llm::driver::error::DriverError;
+use poot_llm::driver::MatmulPrecision;
 use poot_llm::driver::{
     open_executor, open_timed_executor, BackendChoice, Driver, DriverOptions, DriverStats,
     GenerateRequest, Head, Layout, ModelHandle, PhaseTiming, PreparedSetLimits, Serving,
@@ -213,6 +214,10 @@ struct Config {
     /// The KV cache dtype the cell asks the driver for (`--kv-dtype`); `None` takes the model's preference or
     /// the engine default. The result names the dtype the driver ran.
     kv_dtype: Option<KvDtype>,
+    /// The operand-precision policy the cell asks the driver for (`--matmul-precision exact|split|narrow`);
+    /// `None` takes the engine default. The result names the policy the driver ran, so a TTFT number always
+    /// says which numerics produced it.
+    matmul_precision: Option<MatmulPrecision>,
     /// Artifacts the cache directory held before this process opened anything (`None`: no directory named).
     artifact_entries_at_start: Option<u64>,
 }
@@ -227,7 +232,7 @@ enum Invocation {
 /// Options that take a value and switches that do not. Everything else is an error: a flag the runner
 /// ignores would report a measurement the caller did not ask for. `--synthetic` is part of the suite's
 /// runner contract (the harness passes it to every runner); decode-curve contexts are always synthetic.
-const VALUE_FLAGS: [&str; 15] = [
+const VALUE_FLAGS: [&str; 16] = [
     "--roofline-fit",
     "--model-dir",
     "--gguf",
@@ -243,6 +248,7 @@ const VALUE_FLAGS: [&str; 15] = [
     "--prefill-chunk",
     "--prepared-state",
     "--kv-dtype",
+    "--matmul-precision",
 ];
 const SWITCHES: [&str; 6] = [
     "--roofline",
@@ -334,6 +340,14 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
         kv_dtype: values
             .get("--kv-dtype")
             .map(|name| name.parse::<KvDtype>())
+            .transpose()?,
+        matmul_precision: values
+            .get("--matmul-precision")
+            .map(|name| {
+                MatmulPrecision::parse(name).with_context(|| {
+                    format!("--matmul-precision {name:?}: expected exact, narrow or split")
+                })
+            })
             .transpose()?,
         artifact_entries_at_start: artifact_cache_entries(),
     };
@@ -561,10 +575,12 @@ fn driver_options(
     capacity: NonZeroUsize,
     chunk: usize,
     kv_dtype: Option<KvDtype>,
+    matmul_precision: Option<MatmulPrecision>,
 ) -> anyhow::Result<DriverOptions> {
     let chunk = NonZeroUsize::new(chunk).context("a prefill chunk holds a token")?;
     Ok(DriverOptions {
         kv_dtype,
+        matmul_precision,
         trace: poot_llm::driver::serving_trace_limits(capacity),
         prepared: PreparedSetLimits {
             max_entries: NonZeroUsize::new(64).expect("nonzero"),
@@ -840,7 +856,12 @@ fn open_driver(
     let device = executor
         .device_identity()
         .context("the device cannot name its adapter and driver")?;
-    let options = driver_options(capacity, wanted.get(), config.kv_dtype)?;
+    let options = driver_options(
+        capacity,
+        wanted.get(),
+        config.kv_dtype,
+        config.matmul_precision,
+    )?;
     // Every entry the cell's prompts plan to is compiled and added before the first timed token.
     let shapes = ServingShapes {
         layout: Layout::Contiguous,
@@ -888,6 +909,7 @@ fn open_driver(
     };
     let initial = driver_counters(&driver);
     let kv_dtype = driver.kv_dtype();
+    let matmul_precision = driver.matmul_precision();
     let driver = driver
         .prepare(&shapes)
         .map_err(DriverError::from)
@@ -908,6 +930,7 @@ fn open_driver(
             checkpoint_digest,
             prefill_chunk: prefill_chunk.get(),
             kv_dtype,
+            matmul_precision,
         },
     ))
 }
@@ -924,6 +947,7 @@ struct Resolved {
     checkpoint_digest: String,
     prefill_chunk: usize,
     kv_dtype: KvDtype,
+    matmul_precision: MatmulPrecision,
 }
 
 /// A cell that opened: the engine and what it ran on.
@@ -1245,6 +1269,7 @@ fn measure(
     line["checkpoint_digest"] = json!(resolved.checkpoint_digest);
     line["prefill_chunk"] = json!(resolved.prefill_chunk);
     line["kv_dtype"] = json!(resolved.kv_dtype.as_str());
+    line["matmul_precision"] = json!(resolved.matmul_precision.as_str());
     line["profiled"] = json!(config.profile);
     line["preparation"] = probe.receipt();
     if let Some(receipt) = engine.engine_receipt() {
@@ -1689,6 +1714,7 @@ mod stub_cell {
             checkpoint_digest: format!("blake3:{}", "0".repeat(64)),
             prefill_chunk: 4,
             kv_dtype: poot_models::model::KvDtype::DEFAULT,
+            matmul_precision: poot_llm::driver::MatmulPrecision::DEFAULT,
         }
     }
 }
@@ -2476,6 +2502,18 @@ mod tests {
             Some(KvDtype::Bf16)
         );
         assert_eq!(config(&["--kv-dtype", "f32"]).kv_dtype, Some(KvDtype::F32));
+        // No `--matmul-precision`: the driver takes the engine default.
+        assert_eq!(defaults.matmul_precision, None);
+        for (flag, want) in [
+            ("exact", MatmulPrecision::Exact),
+            ("split", MatmulPrecision::Split),
+            ("narrow", MatmulPrecision::Narrow),
+        ] {
+            assert_eq!(
+                config(&["--matmul-precision", flag]).matmul_precision,
+                Some(want)
+            );
+        }
 
         assert!(matches!(
             config(&["--gguf", "/m/model.gguf"]).weights,
@@ -2496,6 +2534,9 @@ mod tests {
         assert!(parse_error(&["--mode", "decode-curve"]).contains("non-empty --isl-list"));
         assert!(parse_error(&["--engine", "driver"]).contains("unknown argument"));
         assert!(parse_error(&["--kv-dtype", "f8"]).contains("unknown KV cache dtype"));
+        assert!(
+            parse_error(&["--matmul-precision", "fp8"]).contains("expected exact, narrow or split")
+        );
     }
 
     /// The registry decides the engine: a registered family's checkpoint opens through the driver (here

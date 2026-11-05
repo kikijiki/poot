@@ -1137,6 +1137,7 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
             charge: options.charge,
             draft,
             hidden_window: None,
+            matmul_precision: None,
         },
     )?;
     Ok(Rig { driver, world })

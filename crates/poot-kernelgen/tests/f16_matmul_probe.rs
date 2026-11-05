@@ -65,7 +65,15 @@ fn f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv() {
     let out_shape = [m, n];
     let a_shape = [m, k];
     let b_shape = [k, n];
-    let body = kg::matmul_batched_dt_grid("f16mm", Ty::F16, &out_shape, &a_shape, &b_shape, None);
+    let body = kg::matmul_batched_dt_grid(
+        "f16mm",
+        Ty::F16,
+        &out_shape,
+        &a_shape,
+        &b_shape,
+        None,
+        poot_graph_ir::OperandPrecision::Exact,
+    );
 
     // (1) SC-002 half 1: F16 matmul lowers to valid SPIR-V and passes spirv-val on RADV. Build-time
     // only, no GPU hardware needed - every other kernelgen probe in this crate follows this pattern.

@@ -42,6 +42,7 @@ fn attention_decode_body() -> poot_kernel_ir::Body {
         bound: kg::KeyBound::Static,
         sink: kg::AttentionSink::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes: 4 },
+        precision: poot_graph_ir::OperandPrecision::Exact,
     };
     let limits = kg::BodyLimits {
         max_instructions: std::num::NonZeroUsize::new(1 << 22).unwrap(),

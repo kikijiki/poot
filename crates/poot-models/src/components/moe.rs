@@ -676,7 +676,7 @@ mod tests {
         let grouped_ids = g
             .eqns()
             .iter()
-            .filter(|e| matches!(e.op, OpKind::IndexedMatMul))
+            .filter(|e| matches!(e.op, OpKind::IndexedMatMul { .. }))
             .map(|e| match e.inputs[2] {
                 Operand::Value(id) => g.eqns().iter().find(|p| p.out == id).map(|p| p.op.clone()),
                 Operand::Lit(_) => None,

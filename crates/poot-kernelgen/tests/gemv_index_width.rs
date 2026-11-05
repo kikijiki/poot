@@ -27,6 +27,7 @@ fn packed(format: WeightFormat, rows: kg::PackedRows) -> kg::KernelRequest {
         epilogue: None,
         grid: [4096, 1, 1],
         meta: vec![256, 256],
+        precision: poot_graph_ir::OperandPrecision::Exact,
     }))
 }
 
@@ -37,6 +38,7 @@ fn dense(weight: BufferStorage) -> kg::KernelRequest {
         k: 256,
         n: 256,
         epilogue: None,
+        precision: poot_graph_ir::OperandPrecision::Exact,
     })
 }
 

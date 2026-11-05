@@ -214,7 +214,7 @@ fn moe_grouped_gpu_matches_cpu() {
     // SC-004 (structural, on the graph run below): IndexedMatMul's M dim must be L*k, not L*E.
     let mut checked = 0;
     for eqn in g.eqns() {
-        if matches!(eqn.op, OpKind::IndexedMatMul) {
+        if matches!(eqn.op, OpKind::IndexedMatMul { .. }) {
             let x_id = match eqn.inputs[0] {
                 poot_graph_ir::Operand::Value(id) => id,
                 _ => panic!("IndexedMatMul's x operand must be a value"),

@@ -70,13 +70,13 @@ fn fnv1a(text: &str) -> u64 {
     })
 }
 
-/// The `request` cell of a kernel choice: a digest of its whole `Debug` encoding (every parameter that
+/// The `request` cell of a kernel choice: a digest of its canonical encoding (every parameter that
 /// selects a different kernel, shapes and layouts included), so any change to a request changes the
 /// line even though the `choice` column only names its kind. The plan's own `key` is not written: it
 /// folds in the codegen epoch, so it changes with the toolchain and every `poot-codegen` edit, which
 /// would make this committed file churn for reasons that have nothing to do with planning.
 fn request_cell(choice: &KernelChoice) -> String {
-    format!("{:016x}", fnv1a(&format!("{choice:?}")))
+    format!("{:016x}", fnv1a(&choice.canonical_text()))
 }
 
 /// The variant name of a debug-printed value: `Unsupported("x")` is `Unsupported`.

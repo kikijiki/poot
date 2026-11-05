@@ -29,6 +29,8 @@ use super::tiled::{ExpertWalk, TiledBody, TiledLaunch, TiledWeight, WalkStep, ti
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy, cu, emit_read_meta, select_u32};
 use crate::helpers::{Alloc, WeightLane, WeightLayout, elem, ld, local, slice_dtype, slice_f32};
+use crate::precision::ProductRead;
+use poot_graph_ir::OperandPrecision;
 
 /// The launch metadata words of an indexed contraction, in order: the register-tiled body's own five (`K`, `N`, `M`
 /// the activation rows, `x_groups` and `tile_offset`; [`super::tiled::META_K`]..), then `E` (the expert count). The
@@ -175,6 +177,7 @@ pub(crate) fn indexed_contraction(
     weight: BufferStorage,
     k: usize,
     epilogue: Option<&Epilogue>,
+    precision: OperandPrecision,
 ) -> Result<Body, KernelGenError> {
     let lane = match WeightLane::of("indexed_contraction", weight)? {
         WeightLane::F16Packed => {
@@ -200,6 +203,7 @@ pub(crate) fn indexed_contraction(
             layout,
             lane,
             epilogue,
+            ProductRead::dense(precision, lane),
         ),
         Schedule::RegisterTiled {
             lanes,
@@ -213,6 +217,7 @@ pub(crate) fn indexed_contraction(
             lane,
             k,
             epilogue,
+            ProductRead::dense(precision, lane),
         ),
     }
 }
@@ -225,6 +230,7 @@ fn indexed_gemv(
     layout: WeightLayout,
     lane: WeightLane,
     epilogue: Option<&Epilogue>,
+    read: ProductRead,
 ) -> Result<Body, KernelGenError> {
     let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
     let lanes = match epilogue {
@@ -279,6 +285,7 @@ fn indexed_gemv(
         4 + leaf_count as u32 + 1,
         [activation, metadata, out],
         launch,
+        read,
         epilogue,
         read_run,
     ))
@@ -295,6 +302,7 @@ fn indexed_register_tiled(
     lane: WeightLane,
     k: usize,
     epilogue: Option<&Epilogue>,
+    read: ProductRead,
 ) -> Result<Body, KernelGenError> {
     let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
     let lanes = match epilogue {
@@ -355,6 +363,7 @@ fn indexed_register_tiled(
             experts_word: META_EXPERTS,
             step,
         }),
+        read,
     };
     Ok(tiled_body(spec, launch, weight_read))
 }

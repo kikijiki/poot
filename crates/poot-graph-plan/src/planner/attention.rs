@@ -14,7 +14,8 @@ use crate::predicates::{
 use crate::refusal::Site;
 use crate::types::ScratchDecl;
 use poot_graph_ir::{
-    AttentionAttrs, KeyLayout, KvBound, MaskOperand, SelectedAttentionAttrs, SinkOperand,
+    AttentionAttrs, KeyLayout, KvBound, MaskOperand, OperandPrecision, SelectedAttentionAttrs,
+    SinkOperand,
 };
 use poot_kernelgen::{
     AttentionCombineSpec, AttentionRows, AttentionSchedule, AttentionSink, AttentionSpec, KeyBound,
@@ -57,6 +58,7 @@ pub(super) fn plan(
         key,
         bound,
         sink,
+        precision,
     }) = &eqn.op
     else {
         unreachable!("plan_eqn routes only attention ops here")
@@ -127,11 +129,18 @@ pub(super) fn plan(
             SinkOperand::PerHead => AttentionSink::PerHead,
         },
         schedule: AttentionSchedule::Streaming { lanes },
+        precision: *precision,
     };
     // This is the GPU planner: an AIE target never reaches it (an NPU target plans through its own schedule).
     // A multi-row attention whose rows can share staged key blocks takes the tiled schedule; a decode row may
     // split its keys instead.
-    if let Some(schedule) = attention_tiling(&streaming, caps) {
+    // The tiled schedule stages one tile per operand, so a split operand (which has a `lo` tile as well) runs the
+    // streaming schedules, which read every operand through the same declared rounding.
+    let tiling = match precision {
+        OperandPrecision::Split(_) => None,
+        _ => attention_tiling(&streaming, caps),
+    };
+    if let Some(schedule) = tiling {
         let tiled = AttentionSpec {
             schedule,
             ..streaming
@@ -220,6 +229,7 @@ fn plan_selected(
         bound: KeyBound::Static,
         sink: AttentionSink::Absent,
         schedule: AttentionSchedule::Streaming { lanes },
+        precision: attrs.precision,
     };
     // A decode row considers `(K + 1) * ratio` positions however deep the cache is, but a few heads still leave a
     // many-CU device idle: the same split-KV rule divides the candidates.

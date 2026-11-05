@@ -44,7 +44,8 @@ use poot_graph_ir::op::OpKind;
 use poot_graph_ir::ops::MASK_HIDDEN;
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{
-    BinOp, ComputedConst, ContractionRows, KeyLayout, MaskOperand, Scalar, StateRole, WeightRef,
+    BinOp, ComputedConst, ContractionRows, KeyLayout, MaskOperand, OperandPrecision, Scalar,
+    StateRole, WeightRef,
 };
 use poot_quant::PackedWeight;
 use poot_tensor::DType;
@@ -492,6 +493,8 @@ fn expert_ranges(
 /// constants, one per role), and the expert ranges of the pieces.
 struct StackSplit {
     descriptor: PackedWeight,
+    /// How the contraction reads its operands; every piece reads them the same way.
+    precision: OperandPrecision,
     x: ValueId,
     ids: ValueId,
     carriers: Vec<ValueId>,
@@ -594,6 +597,7 @@ fn split_oversized_expert_stacks(
     for eqn in g.eqns() {
         let Some(StackSplit {
             descriptor,
+            precision,
             x,
             ids,
             carriers,
@@ -685,6 +689,7 @@ fn split_oversized_expert_stacks(
                 rows: ContractionRows::Indexed {
                     experts: range.len(),
                 },
+                precision,
             };
             let last = index + 1 == ranges.len();
             let piece_out = emit.push(contraction, &piece_inputs, out_aval.clone())?;
@@ -721,6 +726,7 @@ fn splittable_stack(g: &Graph, eqn: &Eqn, backend: Backend, limit: u64) -> Optio
     let OpKind::PackedContraction {
         descriptor,
         rows: ContractionRows::Indexed { experts },
+        precision,
     } = &eqn.op
     else {
         return None;
@@ -739,6 +745,7 @@ fn splittable_stack(g: &Graph, eqn: &Eqn, backend: Backend, limit: u64) -> Optio
         }))
     .then_some(StackSplit {
         descriptor: *descriptor,
+        precision: *precision,
         x,
         ids,
         carriers,
@@ -1308,7 +1315,8 @@ mod tests {
                 matches!(
                     e.op,
                     OpKind::DenseContraction {
-                        weight: DType::BF16
+                        weight: DType::BF16,
+                        ..
                     }
                 )
             })

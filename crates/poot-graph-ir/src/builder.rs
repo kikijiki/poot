@@ -23,6 +23,7 @@ use crate::graph::{
     LayerIndex, Operand, Slot, SlotKey, StateRole, Storage, ValidationId, ValueId, ValueMeta,
 };
 use crate::op::{OpKind, SampleRule};
+use crate::precision::OperandPrecision;
 use crate::range::IndexRange;
 use crate::types::{DType, Operands, Scalar, TensorType};
 use crate::weight_ref::WeightRef;
@@ -2396,7 +2397,21 @@ impl Builder {
 
     /// Batched matrix product `a[.., M, K] x b[.., K, N] -> [.., M, N]`, batch dims broadcasting.
     pub fn matmul(&self, a: Traced, b: Traced) -> Result<Traced, BuilderError> {
-        self.emit(OpKind::matmul(), vec![self.operand(a)?, self.operand(b)?])
+        self.matmul_as(a, b, OperandPrecision::Exact)
+    }
+
+    /// [`Builder::matmul`] reading its operands as `precision` says: the product of the definitions in
+    /// [`OperandPrecision`], accumulated in f32.
+    pub fn matmul_as(
+        &self,
+        a: Traced,
+        b: Traced,
+        precision: OperandPrecision,
+    ) -> Result<Traced, BuilderError> {
+        self.emit(
+            OpKind::matmul().with_operand_precision(precision),
+            vec![self.operand(a)?, self.operand(b)?],
+        )
     }
 
     /// [`Builder::matmul`] over two operands of one narrow float dtype (F16 or BF16), accumulating and storing F32:
@@ -2441,7 +2456,7 @@ impl Builder {
         idx: Traced,
     ) -> Result<Traced, BuilderError> {
         self.emit(
-            OpKind::IndexedMatMul,
+            OpKind::indexed_matmul(),
             vec![self.operand(x)?, self.operand(w)?, self.operand(idx)?],
         )
     }

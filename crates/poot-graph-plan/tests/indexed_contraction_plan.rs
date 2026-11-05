@@ -73,9 +73,9 @@ fn indexed(m: usize, gate: bool) -> Graph {
 fn is_indexed_head(op: &OpKind) -> bool {
     matches!(
         op,
-        OpKind::IndexedMatMul
+        OpKind::IndexedMatMul { .. }
             | OpKind::ContractionEpilogue {
-                head: ContractionHead::Indexed,
+                head: ContractionHead::Indexed { .. },
                 ..
             }
     )
@@ -143,7 +143,7 @@ fn routed_gate_weighting_compiles_to_one_indexed_contraction_epilogue() {
                 count(&fused, |op| matches!(
                     op,
                     OpKind::ContractionEpilogue {
-                        head: ContractionHead::Indexed,
+                        head: ContractionHead::Indexed { .. },
                         ..
                     }
                 )),
@@ -151,7 +151,7 @@ fn routed_gate_weighting_compiles_to_one_indexed_contraction_epilogue() {
                 "{label}"
             );
             assert_eq!(
-                count(&fused, |op| matches!(op, OpKind::IndexedMatMul)),
+                count(&fused, |op| matches!(op, OpKind::IndexedMatMul { .. })),
                 0,
                 "{label}"
             );
@@ -170,7 +170,7 @@ fn routed_gate_weighting_compiles_to_one_indexed_contraction_epilogue() {
 /// Mutation: admit `F32` in `check_index_dtype` (`op.rs`); the F32 id infers and this row goes red.
 #[test]
 fn an_f32_id_operand_is_refused_by_inference() {
-    let error = OpKind::IndexedMatMul
+    let error = OpKind::indexed_matmul()
         .infer(&[
             TensorType::f32(vec![5, K]),
             TensorType::f32(vec![EXPERTS, K, N]),
@@ -355,7 +355,7 @@ fn a_checkpoint_order_weight_under_the_gate_epilogue_plans_no_transpose() {
                 count(&program, |op| matches!(
                     op,
                     OpKind::ContractionEpilogue {
-                        head: ContractionHead::Indexed,
+                        head: ContractionHead::Indexed { .. },
                         ..
                     }
                 )),

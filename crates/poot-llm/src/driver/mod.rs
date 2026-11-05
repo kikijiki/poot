@@ -92,6 +92,7 @@ use poot_executor::{
     LateInputs, NoSync, StepInputs,
 };
 use poot_graph_ir::ForwardSlotMap;
+pub use poot_graph_ir::MatmulPrecision;
 use poot_graph_ir::{BoundaryId, Graph, SlotKey, StatePolicy, StateRows};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, ShardRule, WeightFormats, bind_packed_weights, shard,
@@ -288,6 +289,11 @@ pub struct DriverOptions {
     /// preference or the engine default ([`KvDtype::resolve`]). One dtype per driver: state is keyed by
     /// (name, aval), so every program of the driver declares its caches in it.
     pub kv_dtype: Option<KvDtype>,
+    /// How the programs of the driver read their contraction and attention operands: whether the planner may
+    /// narrow them into the target's matrix units ([`MatmulPrecision`]). `None` takes the engine default
+    /// ([`MatmulPrecision::DEFAULT`]). One policy per driver, like the KV dtype, so every program of it (prefill,
+    /// decode, verify) rounds alike and a speculative verify window agrees with plain decode.
+    pub matmul_precision: Option<MatmulPrecision>,
 }
 
 impl DriverOptions {
@@ -316,6 +322,7 @@ impl DriverOptions {
             draft: DraftPolicy::Off,
             hidden_window: None,
             kv_dtype: None,
+            matmul_precision: None,
         }
     }
 
@@ -745,6 +752,9 @@ struct Settings {
     /// The KV cache dtype every program of the driver stores: [`DriverOptions::kv_dtype`] resolved against the
     /// model's preference once, at construction.
     kv_dtype: KvDtype,
+    /// The operand-precision policy every program of the driver compiles under: [`DriverOptions::matmul_precision`]
+    /// resolved against the engine default once, at construction.
+    matmul_precision: MatmulPrecision,
 }
 
 impl Settings {
@@ -923,6 +933,7 @@ impl Driver<Unprepared> {
         let formats = WeightFormats::from_weight_map(handle.model().weights());
         let speculation = speculate::Speculation::new(options.draft.clone());
         let kv_dtype = KvDtype::resolve(options.kv_dtype, handle.config().kv_dtype);
+        let matmul_precision = options.matmul_precision.unwrap_or(MatmulPrecision::DEFAULT);
         Self {
             handle,
             runtime: Runtime {
@@ -941,6 +952,7 @@ impl Driver<Unprepared> {
                 time_phases: false,
                 hidden: None,
                 kv_dtype,
+                matmul_precision,
             },
             ledger: ledger::PreparedLedger::default(),
             speculation,
@@ -1151,6 +1163,12 @@ impl<S: State> Driver<S> {
         self.settings.kv_dtype
     }
 
+    /// The operand-precision policy every program of the driver compiles under: the user's
+    /// [`DriverOptions::matmul_precision`], else [`MatmulPrecision::DEFAULT`].
+    pub fn matmul_precision(&self) -> MatmulPrecision {
+        self.settings.matmul_precision
+    }
+
     /// What the driver has done so far, with the residency manager's counters read current.
     pub fn stats(&self) -> DriverStats {
         DriverStats {
@@ -1187,11 +1205,12 @@ impl<S: State> Driver<S> {
     /// The compile options of an entry: a decode step compiles with the decode options, every other
     /// step with the prefill options.
     fn options_for(&self, program: Program, shape: StepShape) -> CompileOptions {
-        if program == Program::Step && shape.is_decode() {
+        let options = if program == Program::Step && shape.is_decode() {
             self.settings.options.decode.clone()
         } else {
             self.settings.options.prefill.clone()
-        }
+        };
+        options.with_matmul_precision(self.settings.matmul_precision)
     }
 
     /// The entry for `key`, preparing it on a miss: refuse a step above the trace limit before tracing,

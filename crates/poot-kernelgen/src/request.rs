@@ -46,6 +46,7 @@ use crate::matmul::{matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid};
 use crate::packed::{PackedKernelSpec, packed_contraction, packed_kernel};
 use crate::reduce::reduce_last_dt;
 use crate::scan::{ScanSpec, scan_body};
+use poot_graph_ir::OperandPrecision;
 use poot_quant::format::WeightFormat;
 
 /// The entry-point name every generated body but the named ones below carries; the shared name the GPU
@@ -316,6 +317,7 @@ impl KernelRequest {
                 k,
                 n,
                 epilogue,
+                precision,
             }) => {
                 let launch = match schedule {
                     Schedule::Gemv {
@@ -346,7 +348,12 @@ impl KernelRequest {
                 let epilogue = epilogue.as_ref().map_or_else(String::new, |epilogue| {
                     format!(":epilogue{}", epilogue.steps.len())
                 });
-                format!("contraction:dense_gemv:{weight}:{launch}:{k}x{n}{epilogue}")
+                let precision = if precision.is_exact() {
+                    String::new()
+                } else {
+                    format!(":{precision}")
+                };
+                format!("contraction:dense_gemv:{weight}:{launch}:{k}x{n}{epilogue}{precision}")
             }
             Self::Contraction(spec) => format!("contraction:{}", spec.form()),
             other => other.family().to_string(),
@@ -508,6 +515,8 @@ pub enum ContractionSpec {
         shapes: MatmulShapes,
         /// How the launch folds past the device's x-grid cap.
         fold: Fold,
+        /// How the two operands are read.
+        precision: OperandPrecision,
     },
     /// A range of a decode GEMV over a `[K, N]` weight: `elems` workgroups of `width` lanes starting at output
     /// element `offset`, one workgroup per output element, folded onto a 2-D grid past the device's X cap. The
@@ -523,6 +532,8 @@ pub enum ContractionSpec {
         elems: usize,
         /// First output element of the range.
         offset: usize,
+        /// How the activation and the weight are read.
+        precision: OperandPrecision,
     },
     /// The `DenseContraction` decode GEMV (`M == 1`): `schedule` (a [`Schedule::Gemv`]) over an `[N, K]` weight
     /// in `weight` storage (`BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`), the shared Gemv loop nest
@@ -535,6 +546,7 @@ pub enum ContractionSpec {
     /// field and a `[K, N]` Gemv cannot be written down.
     ///
     /// ```
+    /// use poot_graph_ir::OperandPrecision;
     /// use poot_kernelgen::{ContractionSpec, GemvActivation, Schedule};
     /// use poot_target::BufferStorage;
     ///
@@ -544,6 +556,7 @@ pub enum ContractionSpec {
     ///     k: 896,
     ///     n: 4864,
     ///     epilogue: None,
+    ///     precision: OperandPrecision::Exact,
     /// };
     /// ```
     ///
@@ -571,6 +584,8 @@ pub enum ContractionSpec {
         n: usize,
         /// Pointwise steps applied to each column's sum before the store, if any.
         epilogue: Option<Epilogue>,
+        /// How the activation and the weight are read.
+        precision: OperandPrecision,
     },
     /// Decode attention `scores @ V`: an LDS-parallel reduction over `cap`, `width` lanes per output.
     AttnScoresVGemv {
@@ -582,6 +597,8 @@ pub enum ContractionSpec {
         width: usize,
         /// Outputs, one workgroup each.
         numel: usize,
+        /// How the probabilities and the values are read.
+        precision: OperandPrecision,
     },
     /// An `M > 1` contraction over a dense weight: the register-tiled loop nest ([`DenseTiledContraction`]).
     DenseTiled(DenseTiledContraction),
@@ -625,6 +642,8 @@ pub struct DenseTiledContraction {
     pub grid: [u32; 3],
     /// The metadata buffer's contents.
     pub meta: Vec<u32>,
+    /// How the activation and the weight are read.
+    pub precision: OperandPrecision,
 }
 
 /// A contraction over a packed weight in `format`: `schedule`'s loop nest over the weight's descriptor-driven
@@ -645,6 +664,8 @@ pub struct PackedContraction {
     pub grid: [u32; 3],
     /// The metadata buffer's contents (`K`, `N` and further shape facts, by schedule).
     pub meta: Vec<u32>,
+    /// How the activation and the decoded weight are read.
+    pub precision: OperandPrecision,
 }
 
 /// How a [`PackedContraction`]'s output rows meet the packed weight's rows.
@@ -691,6 +712,8 @@ pub struct IndexedContraction {
     pub grid: [u32; 3],
     /// The metadata buffer's contents: `[K, N, M, x_groups, tile_offset, E]`.
     pub meta: Vec<u32>,
+    /// How the activation and the weight are read.
+    pub precision: OperandPrecision,
 }
 
 /// A generated packed-weight kernel that is not a contraction (a standalone dequantize or a row gather). The
@@ -1012,6 +1035,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             epilogue,
             shapes,
             fold,
+            precision,
         } => {
             let body = match epilogue {
                 Some(epilogue) => matmul_batched_epilogue_dt_grid(
@@ -1022,6 +1046,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                     &shapes.b_shape,
                     epilogue,
                     fold.x_groups(caps),
+                    *precision,
                 )?,
                 None => matmul_batched_dt_grid(
                     ENTRY,
@@ -1030,6 +1055,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                     &shapes.a_shape,
                     &shapes.b_shape,
                     fold.x_groups(caps),
+                    *precision,
                 ),
             };
             fold.contraction(body, caps)
@@ -1040,6 +1066,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             width,
             elems,
             offset,
+            precision,
         } => {
             // One workgroup per output element, X filling to the device's cap and the rest spilling onto Y: the
             // same body whether the planner launches the whole output or one watchdog-sized range of it.
@@ -1054,6 +1081,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                     *offset,
                     WeightLayout::Kn,
                     BufferStorage::f32(),
+                    *precision,
                 )?,
                 Launch::grid([(x * width) as u32, y as u32, 1]),
             )
@@ -1064,8 +1092,10 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             k,
             n,
             epilogue,
+            precision,
         } => {
-            let body = dense_contraction(ENTRY, *weight, *schedule, *k, epilogue.as_ref())?;
+            let body =
+                dense_contraction(ENTRY, *weight, *schedule, *k, epilogue.as_ref(), *precision)?;
             let threads = schedule.grid_threads(1, 1, *n);
             with(
                 body,
@@ -1082,6 +1112,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             epilogue,
             grid,
             meta,
+            precision,
         }) => {
             let body = packed_contraction(
                 "packed_contraction",
@@ -1089,6 +1120,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                 *schedule,
                 epilogue.as_ref(),
                 *rows,
+                *precision,
             )?;
             with(
                 body,
@@ -1103,10 +1135,11 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             d,
             width,
             numel,
+            precision,
         } => {
             let (x, y) = fold_groups(*numel, caps.max_grid[0]);
             with(
-                attn_scores_v_gemv_lds(ENTRY, *cap, *d, *width, x),
+                attn_scores_v_gemv_lds(ENTRY, *cap, *d, *width, x, *precision),
                 Launch::grid([(x * width) as u32, y as u32, 1]),
             )
         }
@@ -1116,6 +1149,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             epilogue,
             grid,
             meta,
+            precision,
         }) => {
             let k = meta.first().copied().ok_or(KernelGenError::Unsupported {
                 request: "dense_tiled_contraction",
@@ -1128,6 +1162,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                     *schedule,
                     k as usize,
                     epilogue.as_ref(),
+                    *precision,
                 )?,
                 Launch {
                     grid: *grid,
@@ -1142,6 +1177,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             epilogue,
             grid,
             meta,
+            precision,
         }) => with(
             indexed_contraction(
                 ENTRY,
@@ -1150,6 +1186,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                 *weight,
                 meta.first().map_or(0, |&k| k as usize),
                 epilogue.as_ref(),
+                *precision,
             )?,
             Launch {
                 grid: *grid,
@@ -1786,6 +1823,7 @@ mod tests {
                     k: 896,
                     n: 4864,
                     epilogue: None,
+                    precision: poot_graph_ir::OperandPrecision::Exact,
                 }),
                 format!(
                     "contraction:dense_gemv:{}:w256c4u4:896x4864",
@@ -1802,6 +1840,7 @@ mod tests {
                         b_shape: vec![4, 3],
                     },
                     fold,
+                    precision: poot_graph_ir::OperandPrecision::Exact,
                 }),
                 "contraction:serial".to_string(),
             ),
@@ -1811,6 +1850,7 @@ mod tests {
                     d: 4,
                     width: 128,
                     numel: 4,
+                    precision: poot_graph_ir::OperandPrecision::Exact,
                 }),
                 "contraction:attn_scores_v_gemv".to_string(),
             ),
@@ -1855,6 +1895,7 @@ mod tests {
                 d,
                 width,
                 numel: d * batch,
+                precision: poot_graph_ir::OperandPrecision::Exact,
             }),
             &caps,
             &roomy(),
@@ -1884,6 +1925,7 @@ mod tests {
                 k,
                 layout: weight.layout(),
                 segments: 1,
+                terms: crate::precision::StagedTerms::ONE,
             },
             caps,
         );
@@ -1896,6 +1938,7 @@ mod tests {
             epilogue,
             grid: [(tiles * lanes) as u32, 1, 1],
             meta: vec![k as u32, n as u32, m as u32, tiles as u32, 0],
+            precision: poot_graph_ir::OperandPrecision::Exact,
         })
     }
 
@@ -2014,6 +2057,7 @@ mod tests {
                         k,
                         n,
                         epilogue: Some(epilogue(storage)),
+                        precision: poot_graph_ir::OperandPrecision::Exact,
                     },
                     weight_values.clone(),
                 ),
@@ -2032,6 +2076,7 @@ mod tests {
                         epilogue: Some(epilogue(storage)),
                         shapes: shapes(vec![k, n]),
                         fold,
+                        precision: poot_graph_ir::OperandPrecision::Exact,
                     },
                     // the same weight, `[K, N]`
                     (0..k * n)
@@ -2160,6 +2205,7 @@ mod tests {
                         k,
                         n,
                         epilogue: None,
+                        precision: poot_graph_ir::OperandPrecision::Exact,
                     },
                     _ => dense_tiled(
                         DenseTiledWeight::Nk(weight),
@@ -2223,6 +2269,7 @@ mod tests {
                 k: 8,
                 n: 4,
                 epilogue: None,
+                precision: poot_graph_ir::OperandPrecision::Exact,
             });
             match generate(&request, &caps, &roomy()) {
                 Err(KernelGenError::Unsupported { request, .. }) => {
@@ -2303,6 +2350,7 @@ mod tests {
                         k,
                         n,
                         epilogue: None,
+                        precision: poot_graph_ir::OperandPrecision::Exact,
                     });
                     let got = interpret(&request, buffer, &activation, n);
                     for (col, &value) in got.iter().enumerate() {

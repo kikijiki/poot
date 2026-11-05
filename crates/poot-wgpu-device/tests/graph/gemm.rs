@@ -88,6 +88,7 @@ fn planned_tile(m: usize, k: usize, n: usize) -> (usize, usize) {
             k,
             layout: poot_kernelgen::WeightLayout::Kn,
             segments: 1,
+            terms: poot_kernelgen::StagedTerms::ONE,
         },
         &poot_test_util::device_caps::default_caps_for(poot_target::Backend::SpirvVulkan),
     )
@@ -1011,7 +1012,7 @@ fn tiled_gemm_random_shapes_gpu_matches_cpu() {
                     e.op,
                     OpKind::MatMul { .. }
                         | OpKind::ContractionEpilogue {
-                            head: ContractionHead::MatMul,
+                            head: ContractionHead::MatMul { .. },
                             ..
                         }
                 )
@@ -1375,7 +1376,7 @@ fn tiled_gemm_then_bias_add_gpu_matches_cpu() {
         matches!(
             op,
             OpKind::ContractionEpilogue {
-                head: poot_graph_ir::op::ContractionHead::MatMul,
+                head: poot_graph_ir::op::ContractionHead::MatMul { .. },
                 ..
             }
         )

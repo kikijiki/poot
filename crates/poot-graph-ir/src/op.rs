@@ -9,6 +9,7 @@ use std::fmt;
 use std::num::NonZeroU32;
 
 use crate::error::{FusedOperandReason, ScanReason, ShapeError};
+use crate::precision::OperandPrecision;
 use crate::types::{
     DType, DTypeClass, DTypeClassExt, Operands, Scalar, TensorType, broadcast_shapes,
 };
@@ -622,15 +623,17 @@ impl OpKind {
         matches!(
             self,
             OpKind::MatMul {
-                accumulate: MatMulAccumulate::Operand
+                accumulate: MatMulAccumulate::Operand,
+                precision: OperandPrecision::Exact,
             }
         )
     }
 
-    /// A matmul that stores A's own dtype.
+    /// A matmul that stores A's own dtype, over exact operands.
     pub const fn matmul() -> Self {
         OpKind::MatMul {
             accumulate: MatMulAccumulate::Operand,
+            precision: OperandPrecision::Exact,
         }
     }
 
@@ -639,7 +642,76 @@ impl OpKind {
     pub const fn matmul_f32_accumulate() -> Self {
         OpKind::MatMul {
             accumulate: MatMulAccumulate::F32,
+            precision: OperandPrecision::Exact,
         }
+    }
+
+    /// A dense contraction over exact operands.
+    pub const fn dense_contraction(weight: DType) -> Self {
+        OpKind::DenseContraction {
+            weight,
+            precision: OperandPrecision::Exact,
+        }
+    }
+
+    /// A grouped dense contraction over exact operands.
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn grouped_dense_contraction(weight: DType, groups: usize) -> Self {
+        OpKind::GroupedDenseContraction {
+            weight,
+            groups,
+            precision: OperandPrecision::Exact,
+        }
+    }
+
+    /// A packed contraction over exact operands.
+    pub const fn packed_contraction(descriptor: PackedWeight, rows: ContractionRows) -> Self {
+        OpKind::PackedContraction {
+            descriptor,
+            rows,
+            precision: OperandPrecision::Exact,
+        }
+    }
+
+    /// An indexed matmul over exact operands.
+    pub const fn indexed_matmul() -> Self {
+        OpKind::IndexedMatMul {
+            precision: OperandPrecision::Exact,
+        }
+    }
+
+    /// How this op reads its two float operands: `Some` for every op that carries an [`OperandPrecision`] (the
+    /// matmul and contraction family, attention, and a contraction epilogue through its head), `None` for the rest.
+    pub fn operand_precision(&self) -> Option<OperandPrecision> {
+        match self {
+            OpKind::MatMul { precision, .. }
+            | OpKind::PackedContraction { precision, .. }
+            | OpKind::DenseContraction { precision, .. }
+            | OpKind::GroupedDenseContraction { precision, .. }
+            | OpKind::IndexedMatMul { precision } => Some(*precision),
+            OpKind::ContractionEpilogue { head, .. } => Some(head.precision()),
+            OpKind::Attention(attrs) => Some(attrs.precision),
+            OpKind::SelectedAttention(attrs) => Some(attrs.precision),
+            _ => None,
+        }
+    }
+
+    /// This op reading its operands as `precision` says; the op unchanged when it carries none.
+    #[must_use]
+    pub fn with_operand_precision(&self, precision: OperandPrecision) -> Self {
+        let mut op = self.clone();
+        match &mut op {
+            OpKind::MatMul { precision: p, .. }
+            | OpKind::PackedContraction { precision: p, .. }
+            | OpKind::DenseContraction { precision: p, .. }
+            | OpKind::GroupedDenseContraction { precision: p, .. }
+            | OpKind::IndexedMatMul { precision: p } => *p = precision,
+            OpKind::ContractionEpilogue { head, .. } => *head = head.with_precision(precision),
+            OpKind::Attention(attrs) => attrs.precision = precision,
+            OpKind::SelectedAttention(attrs) => attrs.precision = precision,
+            _ => {}
+        }
+        op
     }
 }
 
@@ -648,11 +720,16 @@ impl OpKind {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum ContractionHead {
     /// [`OpKind::MatMul`] over `A[.., M, K]` and `B[.., K, N]`.
-    MatMul,
+    MatMul {
+        /// How the two operands are read.
+        precision: OperandPrecision,
+    },
     /// [`OpKind::DenseContraction`] over an activation and a `[N, K]` weight of dtype `weight`.
     Dense {
         /// The weight's storage dtype, an arithmetic float.
         weight: DType,
+        /// How the activation and the weight are read.
+        precision: OperandPrecision,
     },
     /// [`OpKind::PackedContraction`] over an f32 activation and the carriers of the packed weight
     /// `descriptor`, its rows selected as `rows` says. Its result is f32, so the head applies no
@@ -662,10 +739,15 @@ pub enum ContractionHead {
         descriptor: PackedWeight,
         /// How activation rows meet weight rows.
         rows: ContractionRows,
+        /// How the activation and the decoded weight are read.
+        precision: OperandPrecision,
     },
     /// [`OpKind::IndexedMatMul`] over an activation `x [M, K]`, a stacked weight `W [E, K, N]` and the per-row
     /// expert ids `idx [M]`: a routed expert matmul followed by its gate weighting.
-    Indexed,
+    Indexed {
+        /// How the activation and the weight are read.
+        precision: OperandPrecision,
+    },
 }
 
 impl ContractionHead {
@@ -673,21 +755,56 @@ impl ContractionHead {
     /// carrier per source role of its descriptor, and for an indexed head the weight and the row ids.
     pub fn operands(self) -> usize {
         match self {
-            Self::MatMul | Self::Dense { .. } => 2,
-            Self::Indexed => 3,
-            Self::Packed { descriptor, rows } => {
-                rows.leading_operands() + descriptor.sources().len()
-            }
+            Self::MatMul { .. } | Self::Dense { .. } => 2,
+            Self::Indexed { .. } => 3,
+            Self::Packed {
+                descriptor, rows, ..
+            } => rows.leading_operands() + descriptor.sources().len(),
         }
     }
 
     /// The primitive op that computes the head's result.
     pub fn op(self) -> OpKind {
         match self {
-            Self::MatMul => OpKind::matmul(),
-            Self::Dense { weight } => OpKind::DenseContraction { weight },
-            Self::Indexed => OpKind::IndexedMatMul,
-            Self::Packed { descriptor, rows } => OpKind::PackedContraction { descriptor, rows },
+            Self::MatMul { precision } => OpKind::matmul().with_operand_precision(precision),
+            Self::Dense { weight, precision } => OpKind::DenseContraction { weight, precision },
+            Self::Indexed { precision } => OpKind::IndexedMatMul { precision },
+            Self::Packed {
+                descriptor,
+                rows,
+                precision,
+            } => OpKind::PackedContraction {
+                descriptor,
+                rows,
+                precision,
+            },
+        }
+    }
+
+    /// How the head reads its operands.
+    pub const fn precision(self) -> OperandPrecision {
+        match self {
+            Self::MatMul { precision }
+            | Self::Dense { precision, .. }
+            | Self::Packed { precision, .. }
+            | Self::Indexed { precision } => precision,
+        }
+    }
+
+    /// The head reading its operands as `precision` says.
+    #[must_use]
+    pub const fn with_precision(self, precision: OperandPrecision) -> Self {
+        match self {
+            Self::MatMul { .. } => Self::MatMul { precision },
+            Self::Dense { weight, .. } => Self::Dense { weight, precision },
+            Self::Packed {
+                descriptor, rows, ..
+            } => Self::Packed {
+                descriptor,
+                rows,
+                precision,
+            },
+            Self::Indexed { .. } => Self::Indexed { precision },
         }
     }
 }
@@ -715,6 +832,8 @@ pub struct AttentionAttrs {
     pub bound: KvBound,
     /// Whether the softmax carries a learned per-head sink logit.
     pub sink: SinkOperand,
+    /// How Q, K, V and the probabilities P enter the two products: P is rounded where it enters `P V`.
+    pub precision: OperandPrecision,
 }
 
 impl AttentionAttrs {
@@ -729,6 +848,7 @@ impl AttentionAttrs {
             key: KeyLayout::Single,
             bound: KvBound::Capacity,
             sink: SinkOperand::Absent,
+            precision: OperandPrecision::Exact,
         }
     }
 }
@@ -889,6 +1009,8 @@ pub enum OpKind {
     MatMul {
         /// The dtype the contraction stores.
         accumulate: MatMulAccumulate,
+        /// How the two operands are read (POOT-1430).
+        precision: OperandPrecision,
     },
     /// Decode one validated rank-2 packed payload into checkpoint-order `[out,K]` f32.
     /// Its `descriptor.sources()` I8 operands are opaque const byte carriers, not numeric tensors,
@@ -916,6 +1038,8 @@ pub enum OpKind {
         descriptor: PackedWeight,
         /// How activation rows meet weight rows.
         rows: ContractionRows,
+        /// How the activation and the decoded weight are read (POOT-1430).
+        precision: OperandPrecision,
     },
     /// Compiler-only replacement for an axis-0 `Gather` of a packed weight's rows (card 642/545a,
     /// quantized GGUF token embeddings): `out[.., :] = decode(ids[..], :)`. Inputs are the
@@ -950,6 +1074,8 @@ pub enum OpKind {
     DenseContraction {
         /// The weight's storage dtype, an arithmetic float.
         weight: DType,
+        /// How the activation and the weight are read (POOT-1430).
+        precision: OperandPrecision,
     },
     /// Compiler-only grouped sibling of [`OpKind::DenseContraction`]: `groups` independent contractions, each over
     /// its own block of rows of one checkpoint-order weight. Inputs are the activation `[G, M, K]` (F32,
@@ -966,6 +1092,8 @@ pub enum OpKind {
         weight: DType,
         /// The number of independent groups `G`.
         groups: usize,
+        /// How the activation and the weight are read (POOT-1430).
+        precision: OperandPrecision,
     },
     /// Gather rows from a dense narrow-float table along axis 0 and widen them to F32 in one equation:
     /// `out[s.., r] = decode(table[index[s..], r])`. Inputs are the table `[V, R]` (`source` dtype) and the index
@@ -1030,7 +1158,10 @@ pub enum OpKind {
     /// made `moe_sparse` slower than dense). Output `[M,N]`, dtype = x's. One definition (the eager eval gathers
     /// per-row; the kernel reads the selected expert's rows in-kernel through `ContractionSpec::Indexed`). An id
     /// outside `0..E` is a typed oracle error and a NaN output row on every device.
-    IndexedMatMul,
+    IndexedMatMul {
+        /// How the activation and the stacked weight are read (POOT-1430).
+        precision: OperandPrecision,
+    },
     /// The permutation that groups MoE rows by expert: `ids [M]` (I32, the per-row expert ids of an
     /// [`OpKind::IndexedMatMul`]) to `[2, M]` I32, where row 0 is `order` (`order[r]` is the row sorted position `r`
     /// holds) and row 1 is `dest` (`dest[m]` is the sorted position of row `m`, the inverse permutation). Rows sort by
@@ -1652,7 +1783,7 @@ impl OpKind {
                 }
                 Ok(base.clone())
             }
-            OpKind::MatMul { accumulate } => {
+            OpKind::MatMul { accumulate, .. } => {
                 arity(ins, 2)?;
                 let (a, b) = (&ins[0], &ins[1]);
                 reject_non_arithmetic("MatMul", a.dtype)?;
@@ -1729,7 +1860,9 @@ impl OpKind {
                 }
                 Ok(TensorType::f32(descriptor.shape().to_vec()))
             }
-            OpKind::PackedContraction { descriptor, rows } => {
+            OpKind::PackedContraction {
+                descriptor, rows, ..
+            } => {
                 let lead = rows.leading_operands();
                 arity(ins, lead + descriptor.sources().len())?;
                 let carriers = &ins[lead..];
@@ -1830,7 +1963,7 @@ impl OpKind {
                 shape.push(descriptor.shape()[1]);
                 Ok(TensorType::f32(shape))
             }
-            OpKind::DenseContraction { weight } => {
+            OpKind::DenseContraction { weight, .. } => {
                 // activation [..,M,K] F32 x weight [N,K] (`weight` dtype) -> [..,M,N] F32. The weight is in checkpoint order,
                 // so its contraction axis is the last one, not the second to last.
                 arity(ins, 2)?;
@@ -1872,7 +2005,7 @@ impl OpKind {
                 }
                 Ok(TensorType::f32(shape))
             }
-            OpKind::GroupedDenseContraction { weight, groups } => {
+            OpKind::GroupedDenseContraction { weight, groups, .. } => {
                 // activation [G, M, K] F32 x weight [G * N, K] (an arithmetic float) -> [G, M, N] F32.
                 arity(ins, 2)?;
                 if weight.class() != DTypeClass::Arithmetic {
@@ -1969,7 +2102,7 @@ impl OpKind {
                 }
                 Ok(out)
             }
-            OpKind::IndexedMatMul => {
+            OpKind::IndexedMatMul { .. } => {
                 // x[M,K], W[E,K,N], idx[M] -> [M,N]. Each row m contracts x[m] against expert W[idx[m]].
                 arity(ins, 3)?;
                 let (x, w, idx) = (&ins[0], &ins[1], &ins[2]);
@@ -2156,7 +2289,7 @@ impl OpKind {
             | Self::ExpertGroup { .. }
             | Self::AllReduce { .. }
             | Self::AllGather { .. }
-            | Self::IndexedMatMul
+            | Self::IndexedMatMul { .. }
             | Self::RandomUniform { .. }
             | Self::SampleToken { .. }
             | Self::PackedRowGather { .. }
@@ -2187,10 +2320,10 @@ impl OpKind {
     /// [`OpKind::ContractionEpilogue`] over a dense head. The weight is input 1 in all three.
     pub fn dense_weight(&self) -> Option<DType> {
         match self {
-            Self::DenseContraction { weight }
+            Self::DenseContraction { weight, .. }
             | Self::GroupedDenseContraction { weight, .. }
             | Self::ContractionEpilogue {
-                head: ContractionHead::Dense { weight },
+                head: ContractionHead::Dense { weight, .. },
                 ..
             } => Some(*weight),
             _ => None,
@@ -2229,7 +2362,7 @@ impl OpKind {
             Self::ContractionEpilogue { .. } => "contraction_epilogue",
             Self::ArgTopK { .. } => "arg_top_k",
             Self::ExpertGroup { .. } => "expert_group",
-            Self::IndexedMatMul => "indexed_matmul",
+            Self::IndexedMatMul { .. } => "indexed_matmul",
             Self::DynamicUpdateSlice { .. } => "dynamic_update_slice",
             Self::Fused(_) => "fused",
             Self::FusedRow(_) => "fused_row",
@@ -2303,7 +2436,7 @@ impl OpKind {
             | OpKind::DenseRowGather { .. }
             | OpKind::ArgTopK { .. }
             | OpKind::ExpertGroup { .. }
-            | OpKind::IndexedMatMul
+            | OpKind::IndexedMatMul { .. }
             | OpKind::DynamicUpdateSlice { .. }
             | OpKind::Attention(_)
             | OpKind::Rope { .. }
@@ -2317,8 +2450,17 @@ impl OpKind {
         }
     }
 
-    /// The short name shown in a graph dump.
+    /// The short name shown in a graph dump: the op and its parameters, then ` precision=..` when the op narrows
+    /// its operands (an exact op prints as it always did).
     pub fn name(&self) -> String {
+        let base = self.base_name();
+        match self.operand_precision() {
+            Some(precision) if !precision.is_exact() => format!("{base} precision={precision}"),
+            _ => base,
+        }
+    }
+
+    fn base_name(&self) -> String {
         match self {
             OpKind::Unary(u) => format!("{u:?}").to_lowercase(),
             OpKind::Binary(b) => format!("{b:?}").to_lowercase(),
@@ -2340,14 +2482,16 @@ impl OpKind {
             OpKind::ArgTopK { k } => format!("arg_top_k k={k}"),
             OpKind::ExpertGroup { experts } => format!("expert_group experts={experts}"),
             OpKind::ScatterUpdate => "scatter_update".to_string(),
-            OpKind::MatMul { accumulate } => match accumulate {
+            OpKind::MatMul { accumulate, .. } => match accumulate {
                 MatMulAccumulate::Operand => "matmul".to_string(),
                 MatMulAccumulate::F32 => "matmul f32_accumulate".to_string(),
             },
             OpKind::PackedDequant { descriptor } => {
                 format!("packed_dequant {:?}", descriptor.format()).to_lowercase()
             }
-            OpKind::PackedContraction { descriptor, rows } => {
+            OpKind::PackedContraction {
+                descriptor, rows, ..
+            } => {
                 let base = format!("packed_contraction {:?}", descriptor.format()).to_lowercase();
                 match rows {
                     ContractionRows::Blocks(1) => base,
@@ -2358,21 +2502,25 @@ impl OpKind {
             OpKind::PackedRowGather { descriptor } => {
                 format!("packed_row_gather {:?}", descriptor.format()).to_lowercase()
             }
-            OpKind::DenseContraction { weight } => {
+            OpKind::DenseContraction { weight, .. } => {
                 format!("dense_contraction {weight:?}").to_lowercase()
             }
-            OpKind::GroupedDenseContraction { weight, groups } => {
+            OpKind::GroupedDenseContraction { weight, groups, .. } => {
                 format!("grouped_dense_contraction {weight:?} groups={groups}").to_lowercase()
             }
             OpKind::DenseRowGather { source } => {
                 format!("dense_row_gather {source:?}").to_lowercase()
             }
+            // The head's own parameters; its precision is the dump's suffix, as for every op.
             OpKind::ContractionEpilogue { head, region } => format!(
-                "contraction_epilogue {head:?} n_in={} steps={}",
+                "contraction_epilogue {} n_in={} steps={}",
+                format!("{:?}", head.with_precision(OperandPrecision::Exact))
+                    .replace(" { precision: Exact }", "")
+                    .replace(", precision: Exact", ""),
                 region.n_inputs,
                 region.steps.len()
             ),
-            OpKind::IndexedMatMul => "indexed_matmul".to_string(),
+            OpKind::IndexedMatMul { .. } => "indexed_matmul".to_string(),
             OpKind::DynamicUpdateSlice { axis } => format!("dyn_update_slice ax={axis}"),
             OpKind::Fused(r) => format!("fused n_in={} steps={}", r.n_inputs, r.steps.len()),
             OpKind::FusedRow(r) => format!("fused_row n_in={} steps={}", r.n_inputs, r.steps.len()),
@@ -2841,6 +2989,8 @@ pub struct SelectedAttentionAttrs {
     pub ratio: usize,
     /// The blocks each query reads: the width of the `ids` operand.
     pub k: usize,
+    /// How Q, K, V and the probabilities enter the two products.
+    pub precision: OperandPrecision,
 }
 
 /// The extents a [`OpKind::SelectedAttention`]'s operands fix.
@@ -3387,7 +3537,7 @@ mod tests {
         );
         refused(
             "IndexedMatMul",
-            OpKind::IndexedMatMul.infer(&[f(&[2, 3]), f(&[4, 3, 5]), f(&[2])]),
+            OpKind::indexed_matmul().infer(&[f(&[2, 3]), f(&[4, 3, 5]), f(&[2])]),
         );
         refused(
             "DynamicUpdateSlice",
@@ -3415,7 +3565,7 @@ mod tests {
             }
         ));
 
-        let err = OpKind::IndexedMatMul
+        let err = OpKind::indexed_matmul()
             .infer(&[
                 f(&[2, 3]),
                 f(&[4, 3, 5]),
@@ -3450,7 +3600,10 @@ mod tests {
     #[test]
     fn dense_contraction_infers_over_a_checkpoint_order_weight() {
         for dtype in [DType::BF16, DType::F32, DType::F16] {
-            let op = OpKind::DenseContraction { weight: dtype };
+            let op = OpKind::DenseContraction {
+                weight: dtype,
+                precision: crate::precision::OperandPrecision::Exact,
+            };
             let weight = TensorType::new(vec![7, 5], dtype);
             assert_eq!(
                 op.infer(&[f(&[1, 3, 5]), weight.clone()]),
@@ -3535,7 +3688,10 @@ mod tests {
     #[test]
     fn dense_contraction_rejects_a_weight_that_is_not_an_arithmetic_float() {
         for dtype in [DType::BF16, DType::F32, DType::F16] {
-            let op = OpKind::DenseContraction { weight: dtype };
+            let op = OpKind::DenseContraction {
+                weight: dtype,
+                precision: crate::precision::OperandPrecision::Exact,
+            };
             assert_eq!(
                 op.infer(&[f(&[1, 3, 5]), TensorType::new(vec![7, 5], dtype)]),
                 Ok(f(&[1, 3, 7])),
@@ -3543,7 +3699,10 @@ mod tests {
             );
         }
         for dtype in [DType::I32, DType::I8, DType::E4M3FN] {
-            let op = OpKind::DenseContraction { weight: dtype };
+            let op = OpKind::DenseContraction {
+                weight: dtype,
+                precision: crate::precision::OperandPrecision::Exact,
+            };
             assert!(matches!(
                 op.infer(&[f(&[1, 3, 5]), TensorType::new(vec![7, 5], dtype)]),
                 Err(ShapeError::DenseContractionWeightDtype { actual }) if actual == dtype
@@ -3651,6 +3810,7 @@ mod tests {
         let op = OpKind::GroupedDenseContraction {
             weight: DType::BF16,
             groups: 3,
+            precision: crate::precision::OperandPrecision::Exact,
         };
         let weight = TensorType::new(vec![12, 5], DType::BF16);
         assert_eq!(
@@ -3694,7 +3854,8 @@ mod tests {
             assert_eq!(
                 OpKind::GroupedDenseContraction {
                     weight: dtype,
-                    groups: 3
+                    groups: 3,
+                    precision: crate::precision::OperandPrecision::Exact
                 }
                 .infer(&[f(&[3, 2, 5]), TensorType::new(vec![12, 5], dtype)]),
                 Ok(f(&[3, 2, 4])),
@@ -3703,7 +3864,7 @@ mod tests {
         }
         for dtype in [DType::I32, DType::E4M3FN] {
             assert!(matches!(
-                OpKind::GroupedDenseContraction { weight: dtype, groups: 3 }
+                OpKind::GroupedDenseContraction { weight: dtype, groups: 3, precision: crate::precision::OperandPrecision::Exact }
                     .infer(&[f(&[3, 2, 5]), TensorType::new(vec![12, 5], dtype)]),
                 Err(ShapeError::DenseContractionWeightDtype { actual }) if actual == dtype
             ));
@@ -3712,7 +3873,8 @@ mod tests {
         assert!(matches!(
             OpKind::GroupedDenseContraction {
                 weight: DType::BF16,
-                groups: 0
+                groups: 0,
+                precision: crate::precision::OperandPrecision::Exact
             }
             .infer(&[f(&[0, 2, 5]), weight]),
             Err(ShapeError::GroupedDenseContractionGroups { groups: 0, .. })
@@ -3725,6 +3887,7 @@ mod tests {
     fn dense_contraction_rejects_malformed_operands() {
         let op = OpKind::DenseContraction {
             weight: DType::BF16,
+            precision: crate::precision::OperandPrecision::Exact,
         };
         let weight = TensorType::new(vec![7, 5], DType::BF16);
         // A narrowed activation: the card 376 definition keeps it F32 and never rounds it.
@@ -3937,6 +4100,7 @@ mod tests {
         let operation = OpKind::PackedContraction {
             descriptor,
             rows: ContractionRows::Blocks(1),
+            precision: crate::precision::OperandPrecision::Exact,
         };
         let output = operation
             .infer(&[
@@ -3981,6 +4145,7 @@ mod tests {
         let blocked = OpKind::PackedContraction {
             descriptor,
             rows: ContractionRows::Blocks(4),
+            precision: crate::precision::OperandPrecision::Exact,
         };
         // out=8, blocks=4 -> block_out=2. A well-formed [blocks, m, k] activation infers
         // [blocks, m, block_out].
@@ -4015,6 +4180,7 @@ mod tests {
         let indivisible = OpKind::PackedContraction {
             descriptor,
             rows: ContractionRows::Blocks(3),
+            precision: crate::precision::OperandPrecision::Exact,
         };
         assert_eq!(
             indivisible.infer(&[
@@ -4027,6 +4193,7 @@ mod tests {
         let zero_blocks = OpKind::PackedContraction {
             descriptor,
             rows: ContractionRows::Blocks(0),
+            precision: crate::precision::OperandPrecision::Exact,
         };
         assert_eq!(
             zero_blocks.infer(&[
@@ -4052,6 +4219,7 @@ mod tests {
         let operation = OpKind::PackedContraction {
             descriptor,
             rows: ContractionRows::Indexed { experts },
+            precision: crate::precision::OperandPrecision::Exact,
         };
         let x = TensorType::f32(vec![5, 32]);
         let ids = TensorType::new(vec![5], DType::I32);
@@ -4094,6 +4262,7 @@ mod tests {
             OpKind::PackedContraction {
                 descriptor,
                 rows: ContractionRows::Indexed { experts: 0 },
+                precision: crate::precision::OperandPrecision::Exact
             }
             .infer(&[x, ids, stacked]),
             Err(ShapeError::PackedStackExperts)
@@ -4933,7 +5102,9 @@ mod tests {
             actual,
         };
         let epilogue = OpKind::ContractionEpilogue {
-            head: ContractionHead::MatMul,
+            head: ContractionHead::MatMul {
+                precision: crate::precision::OperandPrecision::Exact,
+            },
             region: one_step_fused(
                 2,
                 FusedOp::Binary(BinOp::Add),
@@ -4984,19 +5155,19 @@ mod tests {
             ),
             (
                 "indexed_matmul x rank",
-                OpKind::IndexedMatMul,
+                OpKind::indexed_matmul(),
                 vec![f(&[2, 3, 4]), f(&[5, 4, 6]), i32_ty(&[2])],
                 operand_rank("IndexedMatMul", "x", 2, 3),
             ),
             (
                 "indexed_matmul w rank",
-                OpKind::IndexedMatMul,
+                OpKind::indexed_matmul(),
                 vec![f(&[2, 4]), f(&[4, 6]), i32_ty(&[2])],
                 operand_rank("IndexedMatMul", "w", 3, 2),
             ),
             (
                 "indexed_matmul idx rank",
-                OpKind::IndexedMatMul,
+                OpKind::indexed_matmul(),
                 vec![f(&[2, 4]), f(&[5, 4, 6]), i32_ty(&[2, 1])],
                 operand_rank("IndexedMatMul", "idx", 1, 2),
             ),
@@ -5026,13 +5197,13 @@ mod tests {
             ),
             (
                 "indexed_matmul contraction extent",
-                OpKind::IndexedMatMul,
+                OpKind::indexed_matmul(),
                 vec![f(&[2, 4]), f(&[5, 3, 6]), i32_ty(&[2])],
                 operand_dim("IndexedMatMul", "w", 1, 4, 3),
             ),
             (
                 "indexed_matmul idx extent",
-                OpKind::IndexedMatMul,
+                OpKind::indexed_matmul(),
                 vec![f(&[2, 4]), f(&[5, 4, 6]), i32_ty(&[3])],
                 operand_dim("IndexedMatMul", "idx", 0, 2, 3),
             ),
@@ -5191,7 +5362,10 @@ mod tests {
             op.hash_params(&mut hasher);
             std::hash::Hasher::finish(&hasher)
         };
-        let matmul = |accumulate| OpKind::MatMul { accumulate };
+        let matmul = |accumulate| OpKind::MatMul {
+            accumulate,
+            precision: crate::precision::OperandPrecision::Exact,
+        };
         assert_eq!(
             hash(&matmul(MatMulAccumulate::F32)),
             hash(&matmul(MatMulAccumulate::F32))
@@ -5461,8 +5635,15 @@ mod tests {
                     dtype.hash(h);
                 }
                 OpKind::Gather { axis } => axis.hash(h),
-                OpKind::MatMul { accumulate } => accumulate.hash(h),
-                OpKind::Select | OpKind::ScatterUpdate | OpKind::IndexedMatMul => {} // no params beyond the discriminant already hashed
+                OpKind::MatMul {
+                    accumulate,
+                    precision,
+                } => {
+                    accumulate.hash(h);
+                    precision.hash(h);
+                }
+                OpKind::IndexedMatMul { precision } => precision.hash(h),
+                OpKind::Select | OpKind::ScatterUpdate => {} // no params beyond the discriminant already hashed
                 OpKind::ContractionEpilogue { head, region } => {
                     head.hash(h);
                     region.n_inputs.hash(h);
@@ -5474,15 +5655,28 @@ mod tests {
                     region.output.hash(h);
                 }
                 OpKind::PackedDequant { descriptor } => descriptor.hash(h),
-                OpKind::PackedContraction { descriptor, rows } => {
+                OpKind::PackedContraction {
+                    descriptor,
+                    rows,
+                    precision,
+                } => {
                     descriptor.hash(h);
                     rows.hash(h);
+                    precision.hash(h);
                 }
                 OpKind::PackedRowGather { descriptor } => descriptor.hash(h),
-                OpKind::DenseContraction { weight } => weight.hash(h),
-                OpKind::GroupedDenseContraction { weight, groups } => {
+                OpKind::DenseContraction { weight, precision } => {
+                    weight.hash(h);
+                    precision.hash(h);
+                }
+                OpKind::GroupedDenseContraction {
+                    weight,
+                    groups,
+                    precision,
+                } => {
                     weight.hash(h);
                     groups.hash(h);
+                    precision.hash(h);
                 }
                 OpKind::DenseRowGather { source } => source.hash(h),
                 OpKind::ArgTopK { k } => k.hash(h),
@@ -5526,6 +5720,7 @@ mod tests {
                     attrs.key.hash(h);
                     attrs.bound.hash(h);
                     attrs.sink.hash(h);
+                    attrs.precision.hash(h);
                 }
                 OpKind::Rope { rot } => rot.hash(h),
                 OpKind::Scan(attrs) => attrs.hash(h),
@@ -5536,6 +5731,7 @@ mod tests {
                     attrs.softcap.map(f32::to_bits).hash(h);
                     attrs.ratio.hash(h);
                     attrs.k.hash(h);
+                    attrs.precision.hash(h);
                 }
                 OpKind::AllReduce { op, axis } => {
                     op.hash(h);

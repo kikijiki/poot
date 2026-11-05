@@ -46,6 +46,7 @@ fn text_options(capacity: usize, chunk: usize) -> DriverOptions {
         charge: program_retention,
         draft: DraftPolicy::Off,
         hidden_window: None,
+        matmul_precision: None,
     }
 }
 

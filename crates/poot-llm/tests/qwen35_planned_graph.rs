@@ -140,7 +140,8 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_lm_head_weight() {
     assert_eq!(
         readers[0].op,
         OpKind::DenseContraction {
-            weight: DType::BF16
+            weight: DType::BF16,
+            precision: poot_graph_ir::OperandPrecision::Exact
         },
         "the head is a BF16 contraction over the checkpoint constant, not a copy of it"
     );

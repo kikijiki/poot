@@ -861,6 +861,7 @@ fn options() -> DriverOptions {
         charge: record_bodies,
         draft: DraftPolicy::Off,
         hidden_window: None,
+        matmul_precision: None,
     }
 }
 

@@ -417,6 +417,7 @@ fn evaluate_equation(
         OpKind::PackedContraction {
             descriptor,
             rows: poot_graph_ir::ContractionRows::Indexed { experts },
+            precision,
         } => {
             let [x, ids] = [&eqn.inputs[0], &eqn.inputs[1]].map(|operand| match operand {
                 IrOperand::Value(id) => *id,
@@ -437,6 +438,7 @@ fn evaluate_equation(
                 stack,
                 &out_shape,
                 eqn.out,
+                precision,
                 // One decoded `[out, K]` expert at a time: charged per expert actually read.
                 || opts.allocated(eqn.out, idx, DType::F32, out * k * 4),
             )?))
@@ -1097,7 +1099,7 @@ fn evaluate_bf16(
         Bf16Equation::Transpose { perm } => Ok(Value::Exact(ExactValue::Bf16(
             crate::operand::bf16_view(eqn, 0, env)?.transpose(perm),
         ))),
-        Bf16Equation::WeightMatMul => {
+        Bf16Equation::WeightMatMul { precision } => {
             let activation = host_tensor(eqn, 0, env)?;
             let activation_values = activation.to_f32()?;
             let elements: usize = out_shape.iter().product();
@@ -1106,14 +1108,29 @@ fn evaluate_bf16(
             // The weight is a BF16 host tensor or an exact view; both read through the same
             // exact BF16 view, never widened ahead of the contraction.
             let weight = crate::operand::bf16_view(eqn, 1, env)?;
-            ops::contraction::matmul_accumulate(
-                activation.shape(),
-                |flat| activation_values[flat],
-                weight.shape(),
-                |flat| weight.value(flat),
-                out_shape,
-                Arc::get_mut(&mut data).expect("a fresh allocation is uniquely owned"),
-            );
+            let out = Arc::get_mut(&mut data).expect("a fresh allocation is uniquely owned");
+            if precision.is_exact() {
+                ops::contraction::matmul_accumulate(
+                    activation.shape(),
+                    &[&|flat| activation_values[flat]],
+                    weight.shape(),
+                    &[&|flat| weight.value(flat)],
+                    out_shape,
+                    out,
+                );
+            } else {
+                // A narrowed read rounds every element, so the view is read once, in full.
+                let weight_values: Vec<f32> = (0..weight.shape().iter().product())
+                    .map(|flat| weight.value(flat))
+                    .collect();
+                ops::contraction::matmul_narrowed(
+                    (activation.shape(), &activation_values, activation.dtype()),
+                    (weight.shape(), &weight_values, DType::BF16),
+                    out_shape,
+                    out,
+                    precision,
+                );
+            }
             Ok(Value::Host(HostTensor::f32_arc(out_shape.clone(), data)))
         }
     }
@@ -1393,16 +1410,16 @@ fn evaluate_dense(
             dtype: *dtype,
         }
         .tensor(),
-        OpKind::MatMul { .. } => {
+        OpKind::MatMul { precision, .. } => {
             let a = get(&eqn.inputs[0])?;
             let b = get(&eqn.inputs[1])?;
-            ops::contraction::matmul_to(&a, &b, &out_shape)?
+            ops::contraction::matmul_to(&a, &b, &out_shape, *precision)?
         }
-        OpKind::IndexedMatMul => {
+        OpKind::IndexedMatMul { precision } => {
             let x = get(&eqn.inputs[0])?;
             let w = get(&eqn.inputs[1])?;
             let idx = get(&eqn.inputs[2])?;
-            ops::contraction::indexed_matmul(&x, &w, &idx, &out_shape, eqn.out)?
+            ops::contraction::indexed_matmul(&x, &w, &idx, &out_shape, eqn.out, *precision)?
         }
         OpKind::DynamicUpdateSlice { axis } => {
             let operand = get(&eqn.inputs[0])?;
