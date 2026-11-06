@@ -8,8 +8,10 @@ use super::{
 };
 use crate::dtype_widen::ConstLanes;
 use crate::planner::{GraphTables, Layout, StorageDtypes, finalize};
-use crate::predicates::{indexed_gemv_in, indexed_matmul_lowers, view_source};
-use crate::refusal::Site;
+use crate::predicates::{
+    IndexedRows, gemv_wins, indexed_gemv_in, indexed_matmul_lowers, view_source,
+};
+use crate::refusal::{Pins, Site};
 use poot_graph_ir::ExpertRows;
 use poot_target::{Backend, BufferStorage, DeviceCaps};
 
@@ -31,10 +33,10 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
-    tiling_pin: Option<kg::RegisterTiling>,
+    pins: Pins,
     const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
-    let site = Site::new(g, eqn, backend, limits).pinned(tiling_pin);
+    let site = Site::new(g, eqn, backend, limits).pinned(pins);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
     let ids = value_ids(eqn);
     let mut planned = match &eqn.op {
@@ -192,12 +194,14 @@ fn indexed_tiled_shape(
 
 /// The tiled shape of a per-row dense indexed contraction (`IndexedMatMul`) the planner would tile on `caps` (its
 /// rows past the Gemv's), as grouped rows over its `experts + 1` buckets (the block is the caller's to choose);
-/// `None` for one it runs as a Gemv or cannot plan. What the `group_expert_rows` pass groups.
+/// `None` for one it runs as a Gemv (the cheaper of the two, or the one `pin` names) or cannot plan. What the
+/// `group_expert_rows` pass groups.
 pub(crate) fn grouping_candidate(
     g: &poot_graph_ir::Graph,
     eqn: &Eqn,
     views: &HashMap<ValueId, Layout>,
     caps: &DeviceCaps,
+    pin: Option<IndexedRows>,
 ) -> Option<kg::TiledShape> {
     let OpKind::IndexedMatMul {
         rows: ExpertRows::PerRow,
@@ -213,10 +217,10 @@ pub(crate) fn grouping_candidate(
     }
     let (x, w) = (&tables.aval(ids[0]).shape, &tables.aval(ids[1]).shape);
     let (m, k, experts, n) = (x[0], x[1], w[0], w[2]);
-    if experts == 0 || indexed_gemv_in(m, n, caps).is_some() {
+    if experts == 0 || pin == Some(IndexedRows::Gemv) {
         return None;
     }
-    Some(indexed_tiled_shape(
+    let grouped = indexed_tiled_shape(
         (m, k, n, experts),
         stored_layout(ids[1], w, views)?,
         stack_storage(tables, views, ids[1])?,
@@ -225,12 +229,15 @@ pub(crate) fn grouping_candidate(
             groups: experts + 1,
             block: 0,
         },
-    ))
+    );
+    let gemv = indexed_gemv_in(m, n, caps).map(|launch| launch.cost_shape(m * n));
+    (!gemv_wins(pin, gemv, grouped, caps)).then_some(grouped)
 }
 
 /// One generated indexed contraction ([`ContractionSpec::Indexed`]): `x[M, K]` against the stacked `W[E, K, N]`
 /// (or its checkpoint `[E, N, K]` view), optionally with an epilogue over each sum. Per-row ids run the Gemv at
-/// decode row counts ([`indexed_gemv_in`], from shapes and the device alone) and are refused past them; rows grouped
+/// the row counts where the Gemv costs less than the grouping ([`gemv_wins`], from shapes and the device alone) and
+/// are refused past them; rows grouped
 /// by expert ([`ExpertRows::Grouped`]) run the tiled schedule over the grouping ([`register_tiled_launch`] over one
 /// block of the grouping's positions, the tiling's output tile the grouping's block), split and folded as every
 /// tiled contraction is.
@@ -270,7 +277,30 @@ fn plan_indexed(
         } => *rows,
         _ => unreachable!("plan_indexed plans an indexed head"),
     };
-    let (schedule, dispatches) = match (rows, indexed_gemv_in(m, n, caps)) {
+    let per_row_gemv = match rows {
+        ExpertRows::PerRow => {
+            let grouped = indexed_tiled_shape(
+                (m, k, n, experts),
+                layout,
+                weight,
+                precision,
+                kg::TiledRows::Grouped {
+                    groups: experts + 1,
+                    block: 0,
+                },
+            );
+            indexed_gemv_in(m, n, caps).filter(|launch| {
+                gemv_wins(
+                    site.indexed_rows_pin(),
+                    Some(launch.cost_shape(m * n)),
+                    grouped,
+                    caps,
+                )
+            })
+        }
+        ExpertRows::Grouped { .. } => None,
+    };
+    let (schedule, dispatches) = match (rows, per_row_gemv) {
         (ExpertRows::PerRow, Some(launch)) => {
             super::matmul::refuse_unless_exact(site, precision)?;
             let schedule = launch.schedule(backend, k);

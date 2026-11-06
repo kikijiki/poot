@@ -54,6 +54,17 @@ if [ -s /root/speed-model ]; then
   done
   echo ===SPEED-BEGIN===; tar -C /root/speed -czf - . | base64 -w0; echo; echo ===SPEED-END===
 fi
+# the launch calibration (--calibrate): scripts/calibrate-launch over the prebuilt example, one process per measurement,
+# on the pod's one GPU before anything else shares it. A mode that fails prints its exit code and the others still run.
+if [ -x /root/calibrate_launch ]; then
+  mkdir -p /root/calibrate
+  export POOT_BANK_DEVICE="$(nvidia-smi --query-gpu=name --format=csv,noheader)" CALIBRATE_LAUNCH_BIN=/root/calibrate_launch CALIBRATE_LAUNCH_LOCKED=1
+  for mode in tilings indexed gemv; do
+    bash scripts/calibrate-launch ptx "$mode" "/root/calibrate/$mode" > "/root/calibrate/$mode.log" 2>&1; echo "calibrate $mode exit $?"
+    tail -3 "/root/calibrate/$mode.log"
+  done
+  echo ===CALIBRATE-BEGIN===; tar -C /root/calibrate -czf - . | base64 -w0; echo; echo ===CALIBRATE-END===
+fi
 if [ -e /root/no-device-lane ]; then exit 0; fi
 if [ -e /root/two-gpu ]; then
   nvidia-smi -L

@@ -11,11 +11,10 @@ use crate::kernel_mapping::{
 };
 use crate::planner::{GraphTables, StorageDtypes};
 use crate::predicates::{
-    decode_gemv_plan, indexed_matmul_lowers, is_batched_tileable_matmul_in, is_decode_attn_gemv_in,
-    is_decode_gemv_in, is_tileable_matmul_in, lds_gemv_width, packed_contraction_m_per_block,
-    serial_matmul_fold,
+    indexed_matmul_lowers, is_batched_tileable_matmul_in, is_decode_attn_gemv_in,
+    is_tileable_matmul_in, lds_gemv_width, packed_contraction_m_per_block, serial_matmul_fold,
 };
-use crate::refusal::{FusedStepGap, Site};
+use crate::refusal::{FusedStepGap, Pins, Site};
 use poot_graph_ir::{ContractionRows, FragmentDtype, LocalId, OperandPrecision};
 use poot_target::{Backend, DeviceCaps};
 
@@ -75,9 +74,6 @@ pub(super) enum MatMulRoute {
     /// The register-tiled GEMM with a `[K, N]` weight slab per batch entry (block): the per-expert MoE GEMM and
     /// the prefill attention matmuls.
     BatchedTileable,
-    /// The decode GEMV (`M == 1`, rank-2 `[K, N]` f32 weight). A BF16 `[K, N]` weight lands here too and is
-    /// refused by the mixed-dtype guard in `plan_eqn`: its only lowering is the dense Gemv over `[N, K]`.
-    DecodeGemv,
     /// The decode attention `scores @ V` GEMV.
     AttnGemv,
     /// The one-thread-per-output kernel every other `MatMul` lands on.
@@ -92,9 +88,7 @@ pub(super) fn matmul_route(
     out_numel: usize,
     caps: &DeviceCaps,
 ) -> MatMulRoute {
-    if is_decode_gemv_in(g, eqn, out_shape, out_numel, caps) {
-        MatMulRoute::DecodeGemv
-    } else if is_tileable_matmul_in(g, eqn) {
+    if is_tileable_matmul_in(g, eqn) {
         MatMulRoute::Tileable
     } else if is_batched_tileable_matmul_in(g, eqn) {
         MatMulRoute::BatchedTileable
@@ -107,7 +101,7 @@ pub(super) fn matmul_route(
 
 /// Whether `eqn`, a contraction head, has an epilogue lowering that is also the plan it would get without one:
 /// the epilogue fuse rule forms a [`OpKind::ContractionEpilogue`] only over such a head, so no head loses a faster schedule (a tensor-core,
-/// tiled or decode-GEMV `MatMul`) to gain a fused store. The generated Gemv, serial and tiled bodies carry an
+/// tiled or attention-GEMV `MatMul`) to gain a fused store. The generated Gemv, serial and tiled bodies carry an
 /// epilogue; a `MatMul` head's fragment, GEMV and batched-weight tiled schedules do not.
 pub(crate) fn epilogue_head_lowers(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> bool {
     let tables = GraphTables::from(g);
@@ -296,7 +290,7 @@ pub(super) fn matmul_cost_shape(g: &Graph, eqn: &Eqn, caps: &DeviceCaps) -> Opti
             nn,
             kk,
         )),
-        MatMulRoute::DecodeGemv | MatMulRoute::AttnGemv | MatMulRoute::Serial => None,
+        MatMulRoute::AttnGemv | MatMulRoute::Serial => None,
     }
 }
 
@@ -311,10 +305,10 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
-    tiling_pin: Option<kg::RegisterTiling>,
+    pins: Pins,
     const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
-    let site = Site::new(g, eqn, backend, limits).pinned(tiling_pin);
+    let site = Site::new(g, eqn, backend, limits).pinned(pins);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
     let ids = value_ids(eqn);
     let fty = fty_ty;
@@ -388,19 +382,8 @@ pub(super) fn plan(
                         caps,
                     )?
                 }
-                MatMulRoute::DecodeGemv => {
-                    // Decode GEMV (M=1 shared-weight matmul, single-seq or batched): the one generated
-                    // `gemv_lds` body, one workgroup of `lds_gemv_width` lanes per output element, B baked as a
-                    // const and the batch read from the flat output index, so the dispatch binds
-                    // [x, weight, out] with no metadata buffer. `decode_gemv_plan` also owns the large-N
-                    // watchdog-safety chunking (card 258): above the trigger it launches the same body over
-                    // disjoint ranges of the output, never a different body.
-                    refuse_unless_exact(site, precision)?;
-                    decode_gemv_plan(site, backend, kk, nn, out_numel, caps)?
-                }
                 MatMulRoute::AttnGemv => {
-                    // decode attention scores@V: LDS-parallel reduction over cap (card 143 Lever 1b), the
-                    // batched-per-row sibling of is_decode_gemv's shared-weight decode GEMV.
+                    // decode attention scores@V: LDS-parallel reduction over cap (card 143 Lever 1b).
                     refuse_unless_exact(site, precision)?;
                     generate(KernelRequest::Contraction(
                         ContractionSpec::AttnScoresVGemv {

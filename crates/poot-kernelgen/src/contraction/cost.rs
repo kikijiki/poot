@@ -5,8 +5,14 @@
 //! The unit is the FMA issues of one lane per `K` value (`K` is common to every schedule, so it is left out), over the
 //! launch's lanes against the device's saturating lanes, but never less than one lane's own sequence of steps.
 //!
-//! Calibration: the tiling ratios are the device's ([`poot_target::calibration::PerfCalibration::cost`]; gfx1151's
-//! were fitted by POOT-1403); [`DIRECT_VALUE_COST`] is provisional and uncalibrated (card 1479-E fits it with the microbench and adds the roofline traffic term).
+//! Calibration: every ratio is the device's ([`poot_target::calibration::PerfCalibration::cost`]; the tiling ratios of
+//! gfx1151 through HSA were fitted by POOT-1494, the Gemv's direct value by the POOT-1489 microbench).
+//!
+//! One model ranks the tilings of one contraction ([`ContractionCost::tiled`]), the Gemv against a matrix unit
+//! ([`ContractionCost::gemv`]) and the per-row Gemv of an indexed contraction against the tiling of its rows grouped
+//! by expert ([`crate::RegisterTiling::gemv_beats_grouped`]). It counts issues only. A global-byte roofline over the
+//! same terms was measured and left out (POOT-1489): over the 88 cells of the indexed microbench it classified no cell
+//! better than the issues alone, and its byte ratio was not identified by them.
 
 use poot_target::calibration::CostRatios;
 
@@ -24,10 +30,6 @@ const FRAGMENT_LOAD_READS: f64 = 2.0;
 /// spread over 32 lanes. The unit runs [`poot_target::FragmentConfig::fma_rate`] times the FMA rate (1 where the
 /// device does not report it: no credit).
 const FRAGMENT_MULTIPLY_FMAS: f64 = 4096.0 / FRAGMENT_LANES as f64;
-/// The issue cost, in FMAs, of a value a Gemv lane reads straight from global memory: no LDS stage and no barrier,
-/// so below a staged value (which a tile amortizes over its rows) and above an LDS read. Provisional; card
-/// 1479-E measures it.
-const DIRECT_VALUE_COST: f64 = 4.0;
 
 /// The terms of a tiling's modelled time on a device, before the device's [`CostRatios`] weigh them: one lane's
 /// issues per staged `K` value and the occupancy factor that turns them into the launch's time. Linear in the
@@ -40,6 +42,9 @@ pub struct CostTerms {
     pub lds_reads: f64,
     /// The values one lane stages (weighed by [`CostRatios::staged_value`]).
     pub staged_per_lane: f64,
+    /// The values one lane reads straight from global memory (weighed by [`CostRatios::direct_value`]): a Gemv
+    /// lane's, none for a tile.
+    pub direct_per_lane: f64,
     /// The extra FMA issues a staged value takes to be rounded to a narrow dtype.
     pub rounding: f64,
     /// The launch's lanes over the device's saturating lanes, never below 1.
@@ -51,7 +56,8 @@ impl CostTerms {
     pub fn modelled_time(self, ratios: CostRatios) -> f64 {
         let lane_step = self.fma
             + self.lds_reads * ratios.lds_read
-            + self.staged_per_lane * (ratios.staged_value + self.rounding);
+            + self.staged_per_lane * (ratios.staged_value + self.rounding)
+            + self.direct_per_lane * ratios.direct_value;
         lane_step * self.occupancy
     }
 }
@@ -65,6 +71,15 @@ pub struct GemvShape {
     pub width: u32,
     /// Adjacent output columns a workgroup owns.
     pub cols: u32,
+}
+
+impl GemvShape {
+    /// The terms of this launch's modelled time on `caps`, before the device's ratios weigh them: what the
+    /// calibration fit regresses a measured time on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cost_terms(self, caps: &poot_target::DeviceCaps) -> CostTerms {
+        ContractionCost::gemv_terms(self, caps)
+    }
 }
 
 /// The cost functions of every contraction schedule.
@@ -133,6 +148,7 @@ impl ContractionCost {
             fma,
             lds_reads,
             staged_per_lane,
+            direct_per_lane: 0.0,
             rounding,
             occupancy: Self::fill(tiles as f64 * lane_count, caps),
         }
@@ -141,12 +157,24 @@ impl ContractionCost {
     /// The modelled time of a Gemv launch, in the unit of [`Self::tiled`]. A workgroup of `width` lanes shares the
     /// `K` values of `cols` output columns, so per `K` value a lane issues `1 / width` of the FMAs of its columns
     /// and reads their weight values and the activation value straight from global memory
-    /// ([`DIRECT_VALUE_COST`]), with no LDS stage or barrier. The launch is `outputs / cols` workgroups.
+    /// ([`CostRatios::direct_value`]), with no LDS stage or barrier. The launch is `outputs / cols` workgroups.
     pub(super) fn gemv(gemv: GemvShape, caps: &poot_target::DeviceCaps) -> f64 {
+        let ratios = caps.gemm_launch().calibrated.figures().cost;
+        Self::gemv_terms(gemv, caps).modelled_time(ratios)
+    }
+
+    /// The terms [`Self::gemv`] weighs for `gemv` on `caps`.
+    pub(super) fn gemv_terms(gemv: GemvShape, caps: &poot_target::DeviceCaps) -> CostTerms {
         let (width, cols) = (f64::from(gemv.width.max(1)), f64::from(gemv.cols.max(1)));
-        let lane_step = (cols * (FMA_COST + DIRECT_VALUE_COST) + DIRECT_VALUE_COST) / width;
         let lanes = gemv.outputs.div_ceil(gemv.cols.max(1) as usize) as f64 * width;
-        lane_step * Self::fill(lanes, caps)
+        CostTerms {
+            fma: cols * FMA_COST / width,
+            lds_reads: 0.0,
+            staged_per_lane: 0.0,
+            direct_per_lane: (cols + 1.0) / width,
+            rounding: 0.0,
+            occupancy: Self::fill(lanes, caps),
+        }
     }
 
     /// The launch's lanes over the device's saturating lanes, never below one lane's own sequence of steps. A

@@ -1,5 +1,5 @@
 //! Per-eqn routing: the strided-view promotion pass (`compute_views`, spec 132) and the dispatch
-//! predicates and launch-grid math (`is_decode_gemv`, `is_tileable_matmul`, `is_batched_tileable_matmul`,
+//! predicates and launch-grid math (`is_tileable_matmul`, `is_batched_tileable_matmul`,
 //! `is_decode_attn_gemv`, `is_elementwise_2d`, [`default_grid_in`], ...). The planner computes each
 //! eqn's launch grid once, alongside the kernel choice it shapes, and stores it in the [`Plan`]
 //! (card 525); no separate dispatch-time function re-derives it. Also the `*_plan` helpers that build
@@ -20,7 +20,7 @@ use poot_target::{Backend, DeviceCaps, TargetId};
 use crate::PlanError;
 use crate::planner::PlannedDispatch;
 use crate::{Binding, Sink, Source};
-use poot_kernelgen::{ContractionSpec, KernelRequest};
+use poot_kernelgen::KernelRequest;
 
 /// The codegen capability query for the target (card 522, R468-014). `Backend`'s `AmdGcn` payload already
 /// carries the same `AmdArch` `poot_codegen::Target::AmdGcn` takes, so the conversion is a bare re-tag, not
@@ -265,142 +265,33 @@ pub fn compute_views(g: &Graph, target: impl Into<TargetId>) -> HashMap<ValueId,
     views
 }
 
-/// Workgroup width (lanes per output column) for the LDS decode-GEMV (`kernelgen::gemv_lds`), used by `plan_eqn`
-/// for both the `[w,1,1]` workgroup and the planned `N*width`-thread grid: the device's calibrated
+/// Workgroup width (lanes per output column) for the LDS decode attention GEMV (`kernelgen::attn_scores_v_gemv_lds`),
+/// used by `plan_eqn` for both the `[w,1,1]` workgroup and the planned `N*width`-thread grid: the device's calibrated
 /// [`poot_target::calibration::PerfCalibration::lds_gemv_width`] (128 measured best on RADV STRIX_HALO,
 /// Qwen2.5-0.5B decode).
 pub(crate) fn lds_gemv_width(caps: &DeviceCaps) -> usize {
     caps.gemm_launch().calibrated.figures().lds_gemv_width as usize
 }
 
-/// Does this MatMul take the decode-GEMV path (`kernelgen::gemv_lds`)? Requires M==1 (`out_shape[-2]==1`)
-/// and a rank-2 `[K,N]` weight (`inputs[1]`), which separates a projection GEMV (`a[B,1,K] @ W[K,N]`) from
-/// a per-head attention matmul (`q[B,Hq,1,D] @ k[B,Hkv,cap,D]`, batched weight). `out_numel = B*N` must fit
-/// the 2-D workgroup grid ([`gemv_grid`]).
-pub(crate) fn is_decode_gemv_in(
-    g: GraphTables<'_>,
-    eqn: &Eqn,
-    out_shape: &[usize],
-    out_numel: usize,
-    caps: &DeviceCaps,
-) -> bool {
-    if !matches!(eqn.op, OpKind::MatMul { .. }) {
-        return false;
-    }
-    // The decode GEMV is f32; bf16 decode on NVPTX/AmdGcn takes the tensor-core path.
-    if g.aval(eqn.out).dtype != DType::F32 {
-        return false;
-    }
-    let r = out_shape.len();
-    if r < 2 || out_shape[r - 2] != 1 || out_numel == 0 {
-        return false;
-    }
-    // One workgroup per output element on a 2-D grid (`gemv_lds`'s `col = GroupY*x_groups+GroupX`), so the Y
-    // cap is on the output count; reject only if that would overflow.
-    if gemv_grid(out_numel, caps).1 > caps.max_grid[1] as usize {
-        return false;
-    }
-    // A device can have a measured width above which the batched matmul beats the GEMV (NVIDIA Ampere: the GEMV's
-    // serial lane-0 LDS reduction and stride-N weight reads make it ~2x slower for large decode projections,
-    // gate/up/down/lm_head with N in the thousands). A device with no measurement keeps the GEMV at any width.
-    if caps
-        .decode_gemv_max_out_cols
-        .is_some_and(|max| out_shape[out_shape.len() - 1] > max as usize)
-    {
-        return false;
-    }
-    // The weight (inputs[1]) must be rank-2 [K,N].
-    let ids = value_ids(eqn);
-    ids.len() >= 2 && g.aval(ids[1]).shape.len() == 2
-}
-
-/// The 2-D workgroup grid `(x_groups, y_groups)` for a decode GEMV over `out_numel` elements (one workgroup
-/// per element). X fills up to `caps.max_grid[0]` (the planner reads the target's
-/// own measured cap, never a baked wgpu-specific literal) and the remainder spills onto Y, so a
-/// ~150k-vocab `lm_head` fits. For `out_numel <= caps.max_grid[0]` this is `(out_numel, 1)`. Used by
-/// `plan_eqn`, which bakes `x_groups` into the kernel and the planned grid.
+/// The 2-D workgroup grid `(x_groups, y_groups)` for a decode attention GEMV over `out_numel` elements (one
+/// workgroup per element). X fills up to `caps.max_grid[0]` (the planner reads the target's own measured cap,
+/// never a baked wgpu-specific literal) and the remainder spills onto Y. For `out_numel <= caps.max_grid[0]`
+/// this is `(out_numel, 1)`.
 pub(crate) fn gemv_grid(out_numel: usize, caps: &DeviceCaps) -> (usize, usize) {
     kg::fold_groups(out_numel, caps.max_grid[0])
-}
-
-/// Plan a decode-GEMV (`is_decode_gemv`'s `M==1` shared-weight matmul): the one generated `kernelgen::gemv_lds`
-/// body, one workgroup of [`lds_gemv_width`] lanes per output element. Below `caps.watchdog_budget`'s
-/// `decode_gemv_out_elems` output elements, or on a device with no watchdog budget at all (no display
-/// watchdog off wgpu/RADV, card 163), it is one dispatch over the whole output on a 2-D grid. Above the
-/// trigger it splits into dispatches of that same body over disjoint ranges of the same output buffer
-/// (`offset` baked per range). The trigger changes the launch, never the body or its summation order.
-/// `chunk_elems` is capped at `caps.max_grid[0]` because a split plan's dispatch is a single 1-D workgroup
-/// count. `k`/`n` are the weight's `[K,N]` dims.
-///
-/// A single dispatch at BLOOM's scale (`N=250880, K=1024`) completes in ~0.6s alone, but the same dispatch
-/// right after another large one (a materializing `transpose` of the same weight, ~3.7s) trips the Strix
-/// Halo iGPU's display-watchdog TDR within ~1.5s, even though the deleted `GpuExecutor::run` polled after every submit.
-/// The trigger is the total busy stretch across a rapid sequence of large dispatches, not one dispatch's
-/// duration. Splitting gives display work scheduling gaps.
-///
-/// `N` is the dominant hazard axis: BLOOM `N=250880` hangs; gpt-oss `N=201088` (tied, `K=32`) and SmolLM3
-/// `N=128256` (tied, `K=2048`, higher `out_numel*K` than BLOOM's `2.57e8`) do not. So the trigger is
-/// element-count-only (unlike the K-scaled `serial_dequant_work`), and the box's own wgpu/RADV device is
-/// measured at 220_000 (`poot_test_util::device_caps::wgpu_rdna3_igpu`), between the proven-safe 201088 and the
-/// proven-hanging 250880.
-pub(crate) fn decode_gemv_plan(
-    site: Site<'_>,
-    backend: Backend,
-    k: usize,
-    n: usize,
-    out_numel: usize,
-    caps: &DeviceCaps,
-) -> Result<Planned, PlanError> {
-    let request = |elems, offset| {
-        KernelRequest::Contraction(ContractionSpec::GemvChunk {
-            k,
-            n,
-            width: lds_gemv_width(caps),
-            elems,
-            offset,
-        })
-    };
-    let over_trigger = caps
-        .watchdog_budget
-        .is_some_and(|w| out_numel > w.decode_gemv_out_elems as usize);
-    if !over_trigger {
-        return Planned::generated(site, request(out_numel, 0), backend, caps);
-    }
-    gemv_chunks(site, backend, out_numel, request, caps)
-}
-
-/// A decode GEMV as `kg::gemv_lds` dispatches over disjoint output ranges of one buffer: one workgroup of
-/// [`lds_gemv_width`] lanes per output element, at most `caps.max_grid[0]` of them per dispatch (a split plan's dispatch is a
-/// single 1-D workgroup count). `request(elems, offset)` builds one dispatch's request, so the weight layout is
-/// the caller's.
-pub(crate) fn gemv_chunks(
-    site: Site<'_>,
-    backend: Backend,
-    out_numel: usize,
-    request: impl Fn(usize, usize) -> KernelRequest,
-    caps: &DeviceCaps,
-) -> Result<Planned, PlanError> {
-    let chunk_elems = caps.max_grid[0] as usize;
-    let n_chunks = out_numel.div_ceil(chunk_elems);
-    let chunks = (0..n_chunks)
-        .map(|ci| {
-            let offset = ci * chunk_elems;
-            let elems = (out_numel - offset).min(chunk_elems);
-            Planned::generated_dispatch(site, request(elems, offset), backend, caps)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Planned::split(chunks)
 }
 
 /// The launch a `DenseContraction` decode GEMV runs as a [`kg::Schedule::Gemv`] (M == 1 once every leading dim folds
 /// into M), or `None` when the equation is not one or its launch would not fit the device's X grid. Every weight
 /// dtype the fold admits (F32, packed F16, packed BF16) and every backend take the same generated body; the
 /// launch comes from [`gemv_launch`], the activation read from the planner's [`gemv_activation`]
-/// ([`GemvLaunch::schedule`]).
+/// ([`GemvLaunch::schedule`]). `cols_pin` replaces the launch's columns per workgroup for the calibration sweep
+/// ([`crate::CompileOptions::gemv_cols_pin`]); a pin the workgroup width does not divide is no launch.
 pub(crate) fn dense_decode_gemv_in(
     eqn: &Eqn,
     out_shape: &[usize],
     out_numel: usize,
+    cols_pin: Option<u32>,
     caps: &DeviceCaps,
 ) -> Option<GemvLaunch> {
     eqn.op.dense_weight()?;
@@ -408,7 +299,12 @@ pub(crate) fn dense_decode_gemv_in(
     if out_shape.len() < 2 || n == 0 || out_numel != n {
         return None;
     }
-    let launch = gemv_launch(n, GemvFamily::Dense, caps);
+    let planned = gemv_launch(n, GemvFamily::Dense, caps);
+    let launch = match cols_pin {
+        Some(cols) if cols == 0 || !planned.width.is_multiple_of(cols) => return None,
+        Some(cols) => GemvLaunch { cols, ..planned },
+        None => planned,
+    };
     (n.div_ceil(launch.cols as usize) <= caps.max_grid[0] as usize).then_some(launch)
 }
 
@@ -1192,24 +1088,63 @@ pub(crate) fn is_decode_attn_gemv_in(
     ) {
         return false;
     }
-    // One workgroup per output element on a 2-D grid (gemv_lds); Y must clear the target's grid cap.
+    // One workgroup per output element on a 2-D grid (attn_scores_v_gemv_lds); Y must clear the target's grid cap.
     gemv_grid(out_numel, caps).1 <= caps.max_grid[1] as usize
 }
 
-/// The most activation rows an `IndexedMatMul` runs as the Gemv (`M` rows are the `k` selected experts of a
-/// decode step, or a few such steps batched): above it `compile` groups the rows by expert and the tiled schedule
-/// shares each expert's weight tile across the rows that selected it.
-pub(crate) const INDEXED_GEMV_MAX_ROWS: usize = 32;
+/// How the rows of a per-row indexed contraction (`IndexedMatMul`, an indexed `PackedContraction`) run. `M` rows are
+/// the experts a decode step selects, or the routed rows of a prefill chunk: few rows share no expert and each is
+/// cheapest as its own Gemv, many share experts and the register-tiled schedule over the rows grouped by expert reads
+/// each expert's weight tile once for all of them. Where one gives way to the other is the cost model's
+/// ([`gemv_wins`]), not a row count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexedRows {
+    /// Each row runs the per-row Gemv over its own expert's weight rows.
+    Gemv,
+    /// The rows are grouped by expert (`group_expert_rows`) and run the register-tiled schedule.
+    Grouped,
+}
 
-/// The launch an `IndexedMatMul` of `m` rows and `n` columns runs as a [`kg::Schedule::Gemv`] on every backend, or
-/// `None` when it is not a decode shape or its launch would not fit the device's X grid. The launch policy is the
-/// dense Gemv's ([`gemv_launch`]) over the `m * n` outputs.
+/// The launch an `IndexedMatMul` of `m` rows and `n` columns would run as a [`kg::Schedule::Gemv`] on every backend,
+/// or `None` when its launch would not fit the device's X grid even at one lane per column. The launch policy is the
+/// dense Gemv's ([`gemv_launch`]) over the `m * n` outputs, widened to fit the grid ([`widened_to_fit_grid`]).
 pub(crate) fn indexed_gemv_in(m: usize, n: usize, caps: &DeviceCaps) -> Option<GemvLaunch> {
-    if m == 0 || n == 0 || m > INDEXED_GEMV_MAX_ROWS {
+    if m == 0 || n == 0 {
         return None;
     }
-    let launch = gemv_launch(m * n, GemvFamily::Dense, caps);
-    ((m * n).div_ceil(launch.cols as usize) <= caps.max_grid[0] as usize).then_some(launch)
+    let outputs = m.checked_mul(n)?;
+    widened_to_fit_grid(gemv_launch(outputs, GemvFamily::Dense, caps), outputs, caps)
+}
+
+/// `launch` with its columns per workgroup doubled (up to the workgroup width) until the `outputs` dot products launch
+/// no more workgroups than the device's X grid holds, rather than folding or refusing; `None` when even a workgroup
+/// per lane does not fit. The grid-fit rule of every indexed Gemv, dense and packed.
+pub(crate) fn widened_to_fit_grid(
+    launch: GemvLaunch,
+    outputs: usize,
+    caps: &DeviceCaps,
+) -> Option<GemvLaunch> {
+    let limit = caps.max_grid[0].max(1) as usize;
+    std::iter::successors(Some(launch.cols), |&cols| cols.checked_mul(2))
+        .take_while(|&cols| cols <= launch.width)
+        .find(|&cols| outputs.div_ceil(cols as usize) <= limit)
+        .map(|cols| GemvLaunch { cols, ..launch })
+}
+
+/// Whether a per-row indexed contraction runs as the Gemv `gemv` rather than as `grouped` (its rows grouped by
+/// expert, `kg::TiledRows::Grouped`): the cost model's answer ([`kg::RegisterTiling::gemv_beats_grouped`]) unless the
+/// compile pinned one. `gemv` is `None` where no Gemv launch fits the device, and then the rows are grouped.
+pub(crate) fn gemv_wins(
+    pin: Option<IndexedRows>,
+    gemv: Option<kg::GemvShape>,
+    grouped: kg::TiledShape,
+    caps: &DeviceCaps,
+) -> bool {
+    match (pin, gemv) {
+        (Some(IndexedRows::Grouped), _) | (_, None) => false,
+        (Some(IndexedRows::Gemv), Some(_)) => true,
+        (None, Some(gemv)) => kg::RegisterTiling::gemv_beats_grouped(gemv, grouped, caps),
+    }
 }
 
 /// Whether an `IndexedMatMul` (or a `ContractionEpilogue` over one) has a generated lowering by dtype: f32
@@ -1300,7 +1235,7 @@ pub(crate) fn is_elementwise_2d_in(
             ..
         } => {
             out_numel > fold_ceiling
-                && dense_decode_gemv_in(eqn, out_shape, out_numel, caps).is_none()
+                && dense_decode_gemv_in(eqn, out_shape, out_numel, None, caps).is_none()
         }
         _ => false,
     }

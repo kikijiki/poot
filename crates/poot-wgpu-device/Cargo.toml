@@ -32,9 +32,8 @@ serde_json.workspace = true
 poot-executor-parity.workspace = true
 poot-test-util.workspace = true
 poot-graph-ir = { workspace = true, features = ["test-support"] }
-# Card 671: this crate's own `tests/graph/*.rs` call
-# `is_decode_gemv`/`is_tiled_gemm`/`per_eqn_plans_outside_compile` directly; those are
-# gated behind `test-support` in poot-graph-plan now.
+# Card 671: this crate's own `tests/graph/*.rs` call `per_eqn_plans_outside_compile` and the
+# `test_support` fixtures directly; those are gated behind `test-support` in poot-graph-plan.
 poot-graph-plan = { workspace = true, features = ["test-support"] }
 criterion.workspace = true
 # Tests build kernelgen's kernels to assert the imported ones (the on-device argmax) match.

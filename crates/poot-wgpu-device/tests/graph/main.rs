@@ -11,7 +11,6 @@ mod lora;
 mod misc;
 mod moe;
 mod norms_rope;
-mod packed_kv;
 mod plan_selection;
 mod prefill_qwen3next;
 mod ssm_linear_attn;
@@ -68,6 +67,25 @@ fn run_via_contract(
     g: &poot_graph_ir::Graph,
     inputs: &HashMap<poot_graph_ir::ValueId, HostTensor>,
 ) -> HostTensor {
+    run_via_contract_under(
+        exec,
+        target,
+        g,
+        inputs,
+        poot_graph_ir::MatmulPrecision::Exact,
+    )
+}
+
+/// [`run_via_contract`] compiled under `policy` (`poot_executor_parity::Policy`): a row about the Gemv or the tiled
+/// schedule over the rows grouped by expert pins it, since at the dimensions these graphs have the planner's cost model
+/// plans the Gemv at every row count (POOT-1489).
+fn run_via_contract_under(
+    exec: &mut dyn Executor,
+    target: Target,
+    g: &poot_graph_ir::Graph,
+    inputs: &HashMap<poot_graph_ir::ValueId, HostTensor>,
+    policy: impl Into<poot_executor_parity::Policy>,
+) -> HostTensor {
     let mut consts = Vec::new();
     let mut slots = Vec::new();
     for (&id, t) in inputs {
@@ -115,7 +133,7 @@ fn run_via_contract(
             ),
         }
     }
-    poot_executor_parity::run_once(exec, target, g, &consts, &slots)
+    poot_executor_parity::run_once_under(exec, target, g, &consts, &slots, policy)
         .unwrap_or_else(|e| panic!("{e}"))
 }
 

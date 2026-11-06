@@ -78,8 +78,7 @@ pub fn wgpu_rdna3_igpu() -> DeviceCaps {
         rounding_conversions: RoundingConversions::NONE,
         widens_bf16_decode_weight: false,
         peer_transport: false,
-        decode_gemv_max_out_cols: None,
-        perf_calibration: Calibrated::STRIX_HALO,
+        perf_calibration: Calibrated::STRIX_HALO_VULKAN,
     }
 }
 

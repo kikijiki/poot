@@ -1672,8 +1672,8 @@ fn softmax_kernel(n_cols: usize) -> kg::RowKernel {
     }
 }
 
-/// spirv-val CI gate for the hot synthesized kernels the wgpu engine dispatches on RADV, including six that
-/// were never run through `spirv-val` before: `gemv_lds` (base f32 decode GEMV), `fused_row_parallel`
+/// spirv-val CI gate for the hot synthesized kernels the wgpu engine dispatches on RADV, including several that
+/// were never run through `spirv-val` before: `fused_row_parallel`
 /// (RMSNorm/softmax decode row-kernel), `rope_dt`, `arg_top_k_dt`, `matmul_batched_dt` in F32 (the F16
 /// instantiation is validated by `f16_matmul_probe.rs`), and the 4 `cast_*` narrow/widen kernels. RADV
 /// tolerates some invalid SPIR-V that a strict validator or a WebGPU backend rejects, so a kernel that
@@ -1716,22 +1716,6 @@ fn every_hot_synthesized_kernel_validates_as_spirv() {
     ];
 
     let kernels: Vec<(&str, Body)> = vec![
-        (
-            "gemv_lds",
-            // shape mirrors pootc/tests/import_run.rs's kernelgen-vs-imported gemv_lds parity check.
-            kg::gemv_lds(
-                "gemv_lds_gate",
-                128,
-                8,
-                128,
-                8,
-                0,
-                kg::WeightLayout::Kn,
-                BufferStorage::f32(),
-                poot_target::RoundingConversions::NONE,
-            )
-            .expect("f32 weight storage"),
-        ),
         (
             "fused_row_parallel (rmsnorm)",
             kg::fused_row_parallel_views(

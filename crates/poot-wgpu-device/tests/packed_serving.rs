@@ -28,7 +28,7 @@ use poot_graph_ir::{
 };
 use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    CompileOptions, IndexedRows, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
     staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
     staged::compile_staged,
 };
@@ -43,6 +43,13 @@ use poot_wgpu_device::device::WgpuDevice;
 
 /// Compile `g` for `target` through the executor contract's one staged program.
 fn staged(g: &Graph, target: Target) -> StagedProgram {
+    staged_rows(g, target, None)
+}
+
+/// [`staged`] with every per-row indexed contraction pinned to `rows` (`None`: the cost model's choice). A row about
+/// one kernel (the Gemv, or the tiling of the rows grouped by expert) names it, so the cost model's boundary cannot
+/// move it to the other.
+fn staged_rows(g: &Graph, target: Target, rows: Option<IndexedRows>) -> StagedProgram {
     let g = g.clone();
     compile_staged(
         &g,
@@ -51,8 +58,11 @@ fn staged(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
-            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
+        &CompileOptions {
+            indexed_rows_pin: rows,
+            ..CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact)
+        },
     )
     .expect("compile the packed graph")
 }
@@ -485,7 +495,9 @@ fn packed_prefill_through_serving_paths_is_bit_exact() {
 
 const EXPERTS: usize = 3;
 const ROWS: usize = 5;
-/// Rows past `INDEXED_GEMV_MAX_ROWS` (32), so an indexed contraction of them runs the register-tiled schedule over the grouped rows.
+/// Rows an indexed contraction runs pinned to the register-tiled schedule over the grouped rows
+/// ([`IndexedRows::Grouped`]): the cost model decides the boundary at the dimensions it is given, and these tiny ones
+/// are a Gemv's, so a row about the grouped kernel names it.
 const PREFILL_ROWS: usize = 70;
 const PREFILL_OUT: usize = 11;
 /// Row `m` routed to expert `(2m + 1) % EXPERTS`: every window of rows holds all the experts.
@@ -618,6 +630,7 @@ fn run_indexed_case(
     (rows, out, k): (usize, usize, usize),
     expert_of: fn(usize) -> usize,
     buffers: StackBuffers,
+    indexed_rows: IndexedRows,
 ) {
     let owners: Vec<Arc<PackedPayload>> = (0..EXPERTS)
         .map(|e| {
@@ -672,7 +685,7 @@ fn run_indexed_case(
     let (store, slot_binds) = split_consts_and_slots(&g, &inputs);
     let (bound, map) = ConstWeights::bind(&g, &store);
     let bound = buffers.graph(&bound, target, table.descriptor);
-    let program = staged(&bound, target);
+    let program = staged_rows(&bound, target, Some(indexed_rows));
     let compiled = program.stages().next().expect("single stage").2.graph();
     let carriers: Vec<usize> = compiled
         .consts()
@@ -686,15 +699,21 @@ fn run_indexed_case(
     );
     if buffers == StackBuffers::One {
         // The contraction, after the grouping of its rows when the target tiles them (POOT-1451).
-        let contraction = match compiled.eqns() {
-            [contraction] => contraction,
+        let (contraction, grouped) = match compiled.eqns() {
+            [contraction] => (contraction, false),
             [grouping, contraction]
                 if matches!(grouping.op, poot_graph_ir::OpKind::ExpertGroup { .. }) =>
             {
-                contraction
+                (contraction, true)
             }
             eqns => panic!("{what}: one contraction, got {eqns:?}"),
         };
+        // The case runs the kernel it names: grouped rows only under the grouping pin.
+        assert_eq!(
+            grouped,
+            indexed_rows == IndexedRows::Grouped,
+            "{what}: the plan follows the pinned rows"
+        );
         assert!(
             matches!(
                 contraction.op,
@@ -756,6 +775,7 @@ fn packed_indexed_contraction_runs_bit_exact() {
             (ROWS, OUT, K),
             interleaved,
             StackBuffers::One,
+            IndexedRows::Gemv,
         );
     }
 }
@@ -784,6 +804,7 @@ fn a_split_expert_stack_runs_bit_exact() {
             (ROWS, 2, K),
             interleaved,
             StackBuffers::Split,
+            IndexedRows::Gemv,
         );
     }
 }
@@ -808,6 +829,7 @@ fn an_unaligned_expert_slab_table_runs_bit_exact() {
         (ROWS, 3, 32),
         interleaved,
         StackBuffers::One,
+        IndexedRows::Gemv,
     );
 }
 
@@ -833,6 +855,7 @@ fn packed_indexed_prefill_runs_bit_exact() {
             (PREFILL_ROWS, PREFILL_OUT, K),
             gapped,
             StackBuffers::One,
+            IndexedRows::Grouped,
         );
     }
 }
@@ -858,6 +881,7 @@ fn packed_indexed_prefill_above_the_gemv_grid_limit_runs_bit_exact() {
         (GRID_LIMIT_ROWS, GRID_LIMIT_OUT, 64),
         gapped,
         StackBuffers::One,
+        IndexedRows::Grouped,
     );
 }
 

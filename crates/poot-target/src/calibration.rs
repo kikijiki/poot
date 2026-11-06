@@ -7,9 +7,8 @@
 //! records that it did ([`Calibrated`]).
 
 use crate::{
-    AMD_RADV_SAFE_MAX_BUFFER_BYTES, ATTENTION_CHUNK_WORK, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps,
-    KnownMiscompiles, PACKED_TILED_CHUNK_WORK, Queried, RegisterBudget, SubgroupSupport,
-    WatchdogBudget,
+    AMD_RADV_SAFE_MAX_BUFFER_BYTES, ATTENTION_CHUNK_WORK, DeviceCaps, KnownMiscompiles,
+    PACKED_TILED_CHUNK_WORK, Queried, RegisterBudget, SubgroupSupport, WatchdogBudget,
 };
 
 /// The lane-grid edge of the narrow register-tiled schedule: 64 lanes, one wave64, the widest workgroup every
@@ -60,12 +59,32 @@ pub const STRIX_HALO_PACKED_GEMV_COLS: GemvCols = GemvCols {
 /// 64 53.7, 128 39.8, 256 45.6). Non-monotone, so a measurement, not a derivation.
 pub const STRIX_HALO_LDS_GEMV_WIDTH: u32 = 128;
 
-/// The cost model's ratios on Strix Halo (ROCm), fitted over every tiling of a qwen3-0.6b prefill at 512 and 2048
-/// tokens: the contraction device time follows them within a few percent (POOT-1403 receipt).
-pub const STRIX_HALO_COST_RATIOS: CostRatios = CostRatios {
+/// The cost model's ratios of a device nobody identified them on, and of Strix Halo behind RADV: the POOT-1403 fit
+/// of the LDS read and the staged value (every tiling of a qwen3-0.6b prefill at 512 and 2048 tokens, ROCm), which
+/// repeats within about 6 % on ROCm but not behind RADV (POOT-1494: the staged ratio moved 38 % between two runs and
+/// 1.5-2x with the corpus), and the Gemv's direct value, which the POOT-1489 microbench measured behind RADV: the one
+/// value at which the model's Gemv-versus-grouped choices are never slower than the retired 32-row switch, 7.6.
+pub const PORTABLE_COST_RATIOS: CostRatios = CostRatios {
     lds_read: 1.0,
     staged_value: 8.0,
+    direct_value: 7.6,
 };
+
+/// The cost model's ratios on Strix Halo through HSA (ROCm), identified by `calibrate-launch` over every candidate
+/// tiling of 8 shapes (POOT-1494, two runs of 80 rows: LDS read 10.2 and 9.6, staged value 8.6 and 8.2, repeating
+/// within about 6 %), refitted over the 160 rows together: LDS read 9.88, staged value 8.43, R^2 0.93. The direct
+/// value is the POOT-1489 microbench's: the centre of the range in which the model's Gemv-versus-grouped choices are
+/// never slower than the retired 32-row switch (11.9 to 23.6).
+pub const STRIX_HALO_HSA_COST_RATIOS: CostRatios = CostRatios {
+    lds_read: 9.88,
+    staged_value: 8.43,
+    direct_value: 16.8,
+};
+
+/// The Gemv's direct value on the RTX PRO 6000 Blackwell Server (sm_120), identified by `calibrate-launch indexed` on
+/// that part (POOT-1490): the centre of the range in which the model's Gemv-versus-grouped choices are never slower
+/// than the retired 32-row switch, 11.9 to 16.8. It is not [`PORTABLE_COST_RATIOS`]'s 7.6, which lies below the range.
+pub const SM_120_DIRECT_VALUE_COST: f64 = 14.15;
 
 /// The keys per staged block of the tiled attention schedule on Strix Halo, widest first. A 64-key block was
 /// measured 20-30% slower than a 32-key one on ROCm and wgpu and no faster on PTX (POOT-1402 bank sweep).
@@ -98,15 +117,19 @@ pub struct GemvCols {
     pub narrow: u32,
 }
 
-/// The ratios of the register-tiled contraction cost model, in FMA issues (the unit): what one lane's LDS read and
-/// one staged value (a global load, its LDS write and its share of the round's two barriers) cost. Memory-hierarchy
-/// ratios, which only a measurement of the device gives ([`PerfCalibration`]'s fit tool).
+/// The ratios of the contraction cost model, in FMA issues (the unit): what one lane's LDS read, one staged value
+/// (a global load, its LDS write and its share of the round's two barriers) and one value a Gemv lane reads straight
+/// from global memory cost. Memory-hierarchy ratios, which only a measurement of the device gives
+/// ([`PerfCalibration`]'s fit tool).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct CostRatios {
     /// One LDS read of one operand value.
     pub lds_read: f64,
     /// One staged value of a tile.
     pub staged_value: f64,
+    /// One value a Gemv lane reads straight from global memory: no LDS stage and no barrier, but also no row to
+    /// amortize the load over, so a Gemv lane pays it per FMA where a tile pays a staged value per tile row.
+    pub direct_value: f64,
 }
 
 /// The performance figures one device's launches were measured with. A figure here only ranks schedules that are
@@ -119,8 +142,8 @@ pub struct PerfCalibration {
     pub dense_gemv_cols: GemvCols,
     /// The Gemv columns of a packed weight.
     pub packed_gemv_cols: GemvCols,
-    /// The workgroup width of the LDS-tree Gemv (`gemv_lds`: one output per workgroup, the attention
-    /// scores-by-V Gemv and the one-hot scatter), where the width is not the saturating residency.
+    /// The workgroup width of the LDS-tree attention Gemv (`attn_scores_v_gemv_lds`: one output per workgroup,
+    /// the decode scores-by-V matmul), where the width is not the saturating residency.
     pub lds_gemv_width: u32,
     /// The register-tiled contraction cost model's ratios.
     pub cost: CostRatios,
@@ -138,28 +161,48 @@ impl PerfCalibration {
         dense_gemv_cols: STRIX_HALO_DENSE_GEMV_COLS,
         packed_gemv_cols: STRIX_HALO_PACKED_GEMV_COLS,
         lds_gemv_width: STRIX_HALO_LDS_GEMV_WIDTH,
-        cost: STRIX_HALO_COST_RATIOS,
+        cost: PORTABLE_COST_RATIOS,
         attention_key_blocks: &STRIX_HALO_ATTENTION_KEY_BLOCKS,
         packed_gemv_max_run: PORTABLE_PACKED_GEMV_RUN,
     };
 
-    /// Strix Halo (gfx1151), through HSA or behind RADV: the device the Gemv figures were measured on.
-    pub const STRIX_HALO: Self = Self {
+    /// Strix Halo (gfx1151) through HSA (ROCm): the device the Gemv figures were measured on, with the cost ratios
+    /// `calibrate-launch` identified on ROCm.
+    pub const STRIX_HALO_HSA: Self = Self {
         dense_gemv_cols: STRIX_HALO_DENSE_GEMV_COLS,
         packed_gemv_cols: STRIX_HALO_PACKED_GEMV_COLS,
         lds_gemv_width: STRIX_HALO_LDS_GEMV_WIDTH,
-        cost: STRIX_HALO_COST_RATIOS,
+        cost: STRIX_HALO_HSA_COST_RATIOS,
         attention_key_blocks: &STRIX_HALO_ATTENTION_KEY_BLOCKS,
         packed_gemv_max_run: STRIX_HALO_PACKED_GEMV_RUN,
     };
 
-    /// The RTX PRO 6000 Blackwell Server (compute capability 12.0). Measured for the packed Gemv run only; a field
-    /// it did not measure is spelled out as [`Self::PORTABLE`]'s, so a reader sees which figures are borrowed.
+    /// Strix Halo (gfx1151) behind RADV (wgpu, raw Vulkan): the same silicon and Gemv figures, but the cost ratios
+    /// `calibrate-launch` could not identify behind RADV (POOT-1494) are spelled as [`Self::PORTABLE`]'s.
+    pub const STRIX_HALO_VULKAN: Self = Self {
+        dense_gemv_cols: STRIX_HALO_DENSE_GEMV_COLS,
+        packed_gemv_cols: STRIX_HALO_PACKED_GEMV_COLS,
+        lds_gemv_width: STRIX_HALO_LDS_GEMV_WIDTH,
+        cost: Self::PORTABLE.cost,
+        attention_key_blocks: &STRIX_HALO_ATTENTION_KEY_BLOCKS,
+        packed_gemv_max_run: STRIX_HALO_PACKED_GEMV_RUN,
+    };
+
+    /// The RTX PRO 6000 Blackwell Server (compute capability 12.0). Measured for the packed Gemv run (POOT-1405) and
+    /// the Gemv's direct value (POOT-1490); a field it did not identify is spelled out as [`Self::PORTABLE`]'s, so a
+    /// reader sees which figures are borrowed: the LDS read and the staged value (the tiling fit is underdetermined on
+    /// PTX: the 80 candidate rows are one tile family), both Gemv columns tables (the dense sweep ties at every
+    /// output count but one, the packed table has no bank producer to sweep), the LDS-tree Gemv width and the
+    /// attention key blocks.
     pub const SM_120: Self = Self {
         dense_gemv_cols: Self::PORTABLE.dense_gemv_cols,
         packed_gemv_cols: Self::PORTABLE.packed_gemv_cols,
         lds_gemv_width: Self::PORTABLE.lds_gemv_width,
-        cost: Self::PORTABLE.cost,
+        cost: CostRatios {
+            lds_read: Self::PORTABLE.cost.lds_read,
+            staged_value: Self::PORTABLE.cost.staged_value,
+            direct_value: SM_120_DIRECT_VALUE_COST,
+        },
         attention_key_blocks: Self::PORTABLE.attention_key_blocks,
         packed_gemv_max_run: SM_120_PACKED_GEMV_RUN,
     };
@@ -169,8 +212,10 @@ impl PerfCalibration {
 /// the table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MeasuredDevice {
-    /// Strix Halo (gfx1151), through HSA or behind RADV.
-    StrixHalo,
+    /// Strix Halo (gfx1151) through HSA (ROCm).
+    StrixHaloHsa,
+    /// Strix Halo (gfx1151) behind RADV (wgpu, raw Vulkan).
+    StrixHaloVulkan,
     /// The RTX PRO 6000 Blackwell Server (compute capability 12.0).
     Sm120,
 }
@@ -179,7 +224,8 @@ impl MeasuredDevice {
     /// What was measured on this device.
     pub const fn figures(self) -> PerfCalibration {
         match self {
-            Self::StrixHalo => PerfCalibration::STRIX_HALO,
+            Self::StrixHaloHsa => PerfCalibration::STRIX_HALO_HSA,
+            Self::StrixHaloVulkan => PerfCalibration::STRIX_HALO_VULKAN,
             Self::Sm120 => PerfCalibration::SM_120,
         }
     }
@@ -197,8 +243,11 @@ pub enum Calibrated {
 }
 
 impl Calibrated {
-    /// Strix Halo's measured entry.
-    pub const STRIX_HALO: Self = Self::Measured(MeasuredDevice::StrixHalo);
+    /// Strix Halo through HSA's measured entry.
+    pub const STRIX_HALO_HSA: Self = Self::Measured(MeasuredDevice::StrixHaloHsa);
+
+    /// Strix Halo behind RADV's measured entry.
+    pub const STRIX_HALO_VULKAN: Self = Self::Measured(MeasuredDevice::StrixHaloVulkan);
 
     /// The RTX PRO 6000 Blackwell's measured entry.
     pub const SM_120: Self = Self::Measured(MeasuredDevice::Sm120);
@@ -214,7 +263,7 @@ impl Calibrated {
     /// The entry of an AMD device the HSA runtime drives, by its gfx code.
     pub fn of_hsa_arch(arch: crate::AmdArch) -> Self {
         if is_strix_halo(arch.mcpu()) {
-            Self::STRIX_HALO
+            Self::STRIX_HALO_HSA
         } else {
             Self::Portable
         }
@@ -224,7 +273,7 @@ impl Calibrated {
     /// runtime family: another RADV part, or an Intel or NVIDIA device behind Vulkan, is [`Self::Portable`].
     pub fn of_vulkan_device(vendor_id: u32, device_name: &str) -> Self {
         if vendor_id == VENDOR_AMD && is_strix_halo(device_name) {
-            Self::STRIX_HALO
+            Self::STRIX_HALO_VULKAN
         } else {
             Self::Portable
         }
@@ -374,7 +423,6 @@ impl Calibration {
     /// Strix Halo (gfx1151) behind RADV, the one device these figures were measured on.
     pub const STRIX_HALO_RADV: Self = Self {
         watchdog_budget: Some(WatchdogBudget {
-            decode_gemv_out_elems: DECODE_GEMV_CHUNK_TRIGGER,
             serial_dequant_work: 400_000_000,
             scatter_update_work: 1_000_000,
             indexed_dequant_work: 800_000_000,
@@ -404,18 +452,6 @@ impl Calibration {
         known_miscompiles: KnownMiscompiles::NONE,
         safe_max_buffer_bytes: None,
     };
-}
-
-/// The output-column count above which a decode GEMV is slower than the batched matmul on an NVIDIA part:
-/// the 2026-07-03 benchmark measured the GEMV's serial lane-0 LDS reduction and stride-N weight reads at about
-/// 2x slower on Ampere (compute capability 8.x) for projections in the thousands of columns. `Unknown` for a
-/// generation nobody measured.
-pub fn nvidia_decode_gemv_max_out_cols(compute_capability_major: u32) -> Queried<u32> {
-    if compute_capability_major == 8 {
-        Queried::Known(256)
-    } else {
-        Queried::Unknown
-    }
 }
 
 #[cfg(test)]
@@ -525,14 +561,39 @@ mod tests {
             source: "RADV STRIX_HALO sweep, Qwen2.5-0.5B decode, fused ms per token: w=32 50.9, 64 53.7, 128 39.8, 256 45.6; non-monotone, measured on RADV only and borrowed elsewhere",
         },
         Provenance {
-            name: "STRIX_HALO_LDS_READ_COST",
+            name: "PORTABLE_LDS_READ_COST",
             value: 1.0,
-            source: "POOT-1403 fit, gfx1151 ROCm, every tiling of a qwen3-0.6b prefill at 512 and 2048 tokens: contraction device time follows the ratios within a few percent",
+            source: "POOT-1403 fit, gfx1151 ROCm, every tiling of a qwen3-0.6b prefill at 512 and 2048 tokens: contraction device time follows the ratios within a few percent. POOT-1494 refit over every candidate tiling: ROCm identifies it (9.6-10.2), RADV does not (staged value 37-52 between two runs), so RADV and an unmeasured device keep this fit",
         },
         Provenance {
-            name: "STRIX_HALO_STAGED_VALUE_COST",
+            name: "PORTABLE_STAGED_VALUE_COST",
             value: 8.0,
-            source: "POOT-1403 fit (same run as the LDS read cost): a global load, its LDS write and its share of the round's two barriers",
+            source: "POOT-1403 fit (same run as the LDS read cost): a global load, its LDS write and its share of the round's two barriers; not identified on RADV by POOT-1494, so the prior of every device but ROCm gfx1151",
+        },
+        Provenance {
+            name: "STRIX_HALO_HSA_LDS_READ_COST",
+            value: 9.88,
+            source: "POOT-1494 calibrate-launch, gfx1151 ROCm, every candidate tiling of 8 shapes (M 16-1024, weights 1024x1024 and 3072x1024), two runs of 80 rows: 10.18 and 9.60, R^2 0.935 and 0.927, spread 5.9 %; one fit over the 160 rows together (POOT-1489): 9.88, R^2 0.931",
+        },
+        Provenance {
+            name: "STRIX_HALO_HSA_STAGED_VALUE_COST",
+            value: 8.43,
+            source: "POOT-1494 calibrate-launch (same runs as the LDS read cost): 8.65 and 8.23, spread 5.0 %; the joint fit over the 160 rows: 8.43",
+        },
+        Provenance {
+            name: "PORTABLE_DIRECT_VALUE_COST",
+            value: 7.6,
+            source: "POOT-1489 calibrate-launch indexed, gfx1151 behind RADV (wgpu), 88 cells of 8-128 experts x 4-4096 routed rows x two weight shapes, the Gemv and the grouped tiling of each timed, two runs: the only direct value at which the model's Gemv-versus-grouped choices are never slower than the retired 32-row switch on any cell is 7.6 (7.7 in the first run), mean regret against the faster schedule 1.10 against the switch's 1.61. It replaces POOT-1476's provisional 4.0, which was 15 % slower than the switch in one near-tie cell. The prior of a device nobody measured",
+        },
+        Provenance {
+            name: "STRIX_HALO_HSA_DIRECT_VALUE_COST",
+            value: 16.8,
+            source: "POOT-1489 calibrate-launch indexed, gfx1151 ROCm, the same 88 cells: the direct values at which the model's choices are never slower than the retired 32-row switch (within 5 %) and within 5 % of the best mean regret are 11.9 to 23.6; the geometric centre. Two runs; mean regret against the faster of the two schedules 1.035 against the retired switch's 1.65",
+        },
+        Provenance {
+            name: "SM_120_DIRECT_VALUE_COST",
+            value: 14.15,
+            source: "POOT-1490 calibrate-launch indexed on one RTX PRO 6000 Blackwell Server (sm_120, secure pod, 88 cells, 176 rows): the direct values at which the model's choices are never slower than the retired 32-row switch (within 5 %) and within 5 % of the best mean regret are 11.9 to 16.8; the geometric centre. Mean regret against the faster schedule 1.056 against the retired switch's 1.177. An RTX 4090 (sm_89) gave 7.6 to 11.9, so the figure moves between parts and this one is that part's; receipts/1490-cuda-sweep/",
         },
         Provenance {
             name: "STRIX_HALO_ATTENTION_KEY_BLOCK_WIDEST",
@@ -641,14 +702,21 @@ mod tests {
         assert_provenance("VECTOR_LOAD_BYTES", VECTOR_LOAD_BYTES);
         for (entry, row) in [
             (PerfCalibration::PORTABLE, "PORTABLE_PACKED_GEMV_RUN"),
-            (PerfCalibration::STRIX_HALO, "STRIX_HALO_PACKED_GEMV_RUN"),
+            (
+                PerfCalibration::STRIX_HALO_HSA,
+                "STRIX_HALO_PACKED_GEMV_RUN",
+            ),
+            (
+                PerfCalibration::STRIX_HALO_VULKAN,
+                "STRIX_HALO_PACKED_GEMV_RUN",
+            ),
             (PerfCalibration::SM_120, "SM_120_PACKED_GEMV_RUN"),
         ] {
             let PerfCalibration {
                 dense_gemv_cols,
                 packed_gemv_cols,
                 lds_gemv_width,
-                cost,
+                cost: _,
                 attention_key_blocks,
                 packed_gemv_max_run,
             } = entry;
@@ -663,8 +731,6 @@ mod tests {
                 packed_gemv_cols.narrow,
             );
             assert_provenance("STRIX_HALO_LDS_GEMV_WIDTH", lds_gemv_width);
-            assert_provenance("STRIX_HALO_LDS_READ_COST", cost.lds_read);
-            assert_provenance("STRIX_HALO_STAGED_VALUE_COST", cost.staged_value);
             let [widest, narrowest] = attention_key_blocks else {
                 panic!("two key blocks, widest first: {attention_key_blocks:?}");
             };
@@ -674,6 +740,29 @@ mod tests {
                 *narrowest as u32,
             );
         }
+        // The cost ratios: the portable prior is the unidentified devices' (RADV borrows it, sm_120 borrows all but the direct value), ROCm
+        // gfx1151 has its own.
+        let portable = PerfCalibration::PORTABLE.cost;
+        assert_provenance("PORTABLE_LDS_READ_COST", portable.lds_read);
+        assert_provenance("PORTABLE_STAGED_VALUE_COST", portable.staged_value);
+        assert_provenance("PORTABLE_DIRECT_VALUE_COST", portable.direct_value);
+        let hsa = PerfCalibration::STRIX_HALO_HSA.cost;
+        assert_provenance("STRIX_HALO_HSA_LDS_READ_COST", hsa.lds_read);
+        assert_provenance("STRIX_HALO_HSA_STAGED_VALUE_COST", hsa.staged_value);
+        assert_provenance("STRIX_HALO_HSA_DIRECT_VALUE_COST", hsa.direct_value);
+        assert_eq!(
+            PerfCalibration::STRIX_HALO_VULKAN.cost,
+            portable,
+            "RADV borrows the prior"
+        );
+        // sm_120 identified the direct value only: the other two ratios are the prior's.
+        let sm_120 = PerfCalibration::SM_120.cost;
+        assert_provenance("SM_120_DIRECT_VALUE_COST", sm_120.direct_value);
+        assert_eq!(
+            (sm_120.lds_read, sm_120.staged_value),
+            (portable.lds_read, portable.staged_value),
+            "sm_120 borrows the prior's LDS read and staged value"
+        );
         assert_provenance("GFX11_MATRIX_FMA_RATE", GFX11_MATRIX_FMA_RATE);
         assert_provenance("SM80_MATRIX_FMA_RATE", SM80_MATRIX_FMA_RATE);
         assert_provenance("SM90_MATRIX_FMA_RATE", SM90_MATRIX_FMA_RATE);
@@ -693,8 +782,13 @@ mod tests {
             "STRIX_HALO_PACKED_GEMV_COLS_WIDE",
             "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
             "STRIX_HALO_LDS_GEMV_WIDTH",
-            "STRIX_HALO_LDS_READ_COST",
-            "STRIX_HALO_STAGED_VALUE_COST",
+            "PORTABLE_LDS_READ_COST",
+            "PORTABLE_STAGED_VALUE_COST",
+            "PORTABLE_DIRECT_VALUE_COST",
+            "STRIX_HALO_HSA_LDS_READ_COST",
+            "STRIX_HALO_HSA_STAGED_VALUE_COST",
+            "STRIX_HALO_HSA_DIRECT_VALUE_COST",
+            "SM_120_DIRECT_VALUE_COST",
             "STRIX_HALO_ATTENTION_KEY_BLOCK_WIDEST",
             "STRIX_HALO_ATTENTION_KEY_BLOCK_NARROWEST",
             "GFX11_MATRIX_FMA_RATE",
@@ -714,11 +808,11 @@ mod tests {
     fn performance_figures_follow_device_identity() {
         assert_eq!(
             Calibrated::of_hsa_arch(crate::AmdArch::gfx1151()),
-            Calibrated::STRIX_HALO
+            Calibrated::STRIX_HALO_HSA
         );
         assert_eq!(
             Calibrated::of_vulkan_device(VENDOR_AMD, "AMD Radeon 8060S (RADV STRIX_HALO)"),
-            Calibrated::STRIX_HALO
+            Calibrated::STRIX_HALO_VULKAN
         );
         for (vendor, name) in [
             (VENDOR_AMD, "AMD Radeon RX 7900 XTX (RADV NAVI31)"),
@@ -744,6 +838,31 @@ mod tests {
         }
     }
 
+    /// The cost ratios follow the backend they were identified on, not the silicon (POOT-1489): gfx1151 through HSA has
+    /// the ratios `calibrate-launch` identified on ROCm, gfx1151 behind RADV keeps the portable prior (its ratios
+    /// moved 38 % between two runs, POOT-1494), and every other figure of the two entries is the same device's.
+    /// Mutation: resolve `STRIX_HALO_HSA` for the Vulkan identity; the prior row goes red.
+    #[test]
+    fn the_cost_ratios_follow_the_backend_that_measured_them() {
+        let hsa = Calibrated::of_hsa_arch(crate::AmdArch::gfx1151()).figures();
+        let vulkan = Calibrated::of_vulkan_device(VENDOR_AMD, "AMD Radeon 8060S (RADV STRIX_HALO)")
+            .figures();
+        assert_ne!(hsa.cost, vulkan.cost, "the two backends share one entry");
+        assert_eq!(
+            vulkan.cost,
+            PerfCalibration::PORTABLE.cost,
+            "RADV keeps the prior"
+        );
+        assert_eq!(
+            PerfCalibration {
+                cost: vulkan.cost,
+                ..hsa
+            },
+            vulkan,
+            "only the cost ratios differ between the two entries of one silicon"
+        );
+    }
+
     /// The packed Gemv run an unmeasured device plans with is the portable 8, whichever runtime drives it, and a
     /// measured one carries its own: the launch a plan is made with names which. Mutation: make `figures` return
     /// the measured run for `Portable`.
@@ -757,7 +876,7 @@ mod tests {
             .gemm_launch()
         };
         let portable = launch(Calibrated::Portable);
-        let strix = launch(Calibrated::STRIX_HALO);
+        let strix = launch(Calibrated::STRIX_HALO_HSA);
         let sm_120 = launch(Calibrated::SM_120);
         assert_eq!(portable.calibrated.figures().packed_gemv_max_run, 8);
         assert_eq!(strix.calibrated.figures().packed_gemv_max_run, 32);
@@ -850,13 +969,5 @@ mod tests {
             vulkan_matrix_fma_rate(VENDOR_AMD, "AMD Radeon RX 7900 XTX (RADV NAVI31)"),
             Queried::Unknown
         );
-    }
-
-    /// The NVIDIA GEMV ceiling is a measured Ampere figure. Mutation: return `Known` for every major.
-    #[test]
-    fn the_gemv_ceiling_is_known_only_for_the_measured_generation() {
-        assert_eq!(nvidia_decode_gemv_max_out_cols(8), Queried::Known(256));
-        assert_eq!(nvidia_decode_gemv_max_out_cols(9), Queried::Unknown);
-        assert_eq!(nvidia_decode_gemv_max_out_cols(7), Queried::Unknown);
     }
 }

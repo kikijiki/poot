@@ -146,11 +146,6 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
         rounding_conversions: poot_target::RoundingConversions::F16,
         widens_bf16_decode_weight: true,
         peer_transport: true,
-        // Measured on Ampere only; another generation keeps the GEMV at any width.
-        decode_gemv_max_out_cols: poot_target::calibration::nvidia_decode_gemv_max_out_cols(
-            attrs.compute_capability_major,
-        )
-        .known(),
         perf_calibration: poot_target::calibration::Calibrated::of_cuda_compute_capability(
             attrs.compute_capability_major,
             attrs.compute_capability_minor,
@@ -1153,21 +1148,6 @@ mod caps_tests {
             units
                 .iter()
                 .all(|c| c.layout == FragmentLayout::Opaque && c.subgroup == 32)
-        );
-    }
-
-    /// The decode-GEMV width ceiling is a measured Ampere figure, keyed by the device's compute capability: an
-    /// sm_8x device reports it and another generation reports none, so the planner keeps the GEMV at any width
-    /// there. Mutation: report the ceiling for every generation; the sm_90 row fails.
-    #[test]
-    fn the_gemv_width_ceiling_is_reported_only_for_the_measured_generation() {
-        assert_eq!(
-            caps_from_attributes(1, &sentinel(8)).decode_gemv_max_out_cols,
-            Some(256)
-        );
-        assert_eq!(
-            caps_from_attributes(1, &sentinel(9)).decode_gemv_max_out_cols,
-            None
         );
     }
 

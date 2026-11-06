@@ -39,7 +39,7 @@ fn run_each(fixtures: &[Fixture], before: impl Fn(&Fixture, poot_graph_plan::Tar
 /// (the tiled GEMM), compiled for wgpu matches `eval(g)` of the traced graph, within the parity tolerance
 /// (ADR-0101 tier 2), at every replayed step. The oracle evaluates the `Transpose` + `MatMul` the tracer
 /// emitted; the device runs the `DenseContraction` the fold made of it, reading the weight as stored.
-/// Mutation: in the F32 GEMV body read B as `[K, N]` (`gemv_lds`, `WeightLayout::Nk` arm); the `M = 1` row goes red.
+/// Mutation: in the dense Gemv body (`dense_contraction`) read the weight as `[K, N]`; the `M = 1` row goes red.
 #[test]
 fn checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
     run_each(

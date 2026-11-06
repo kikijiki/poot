@@ -291,9 +291,9 @@ fn expert_group_case(name: &'static str, ids: Vec<i32>, experts: usize) -> Vec<E
         .collect()
 }
 
-/// One routed-contraction case: the indexed contraction of `rows` activation rows through their expert ids, more
-/// rows than a Gemv serves, so `compile` groups them by expert (`group_expert_rows`) and the device runs the tiled
-/// contraction over the grouping. The `[rows, N]` output is in row order.
+/// One routed-contraction case: the indexed contraction of `rows` activation rows through their expert ids, pinned to
+/// the grouping (`Policy::grouped`), so `compile` groups them by expert (`group_expert_rows`) and the device runs the
+/// tiled contraction over the grouping. The `[rows, N]` output is in row order.
 pub struct GroupedContractionCase {
     /// The program holding the contraction.
     pub fixture: Fixture,
@@ -304,7 +304,7 @@ pub struct GroupedContractionCase {
     pub expected: Vec<f32>,
 }
 
-/// More rows than a Gemv serves (so every device runs the tiled contraction over the rows' grouping), over routings
+/// Rows pinned to the grouping (so every device runs the tiled contraction over the rows' grouping), over routings
 /// where a tile holds one expert's rows, one expert takes every row, or experts take none.
 pub fn grouped_contraction_cases() -> Vec<GroupedContractionCase> {
     const EXPERTS: usize = 8;
@@ -362,7 +362,6 @@ pub fn assert_grouped_fragment_contraction_on_device(exec: &mut dyn Executor, ta
         ],
         ids.clone(),
     );
-    let policy = poot_graph_ir::MatmulPrecision::Narrow;
     // A matrix unit that takes the stack's BF16 (ROCm WMMA, NVPTX `wmma`) runs the fragment tile; an F16-only one
     // (a Vulkan cooperative matrix) leaves the tiling to the cost model.
     let bf16_units = match target {
@@ -371,6 +370,14 @@ pub fn assert_grouped_fragment_contraction_on_device(exec: &mut dyn Executor, ta
             .known()
             .is_some_and(|units| units.config(poot_graph_ir::FragmentDtype::Bf16).is_some()),
         Target::Npu(_) => false,
+    };
+    // The rows are pinned to the grouping: at these dimensions the cost model plans the Gemv. On a BF16 unit the
+    // narrowing is declared too: this row is about the grouped fragment path, and whether a unit's issue rate pays at
+    // 48 columns and 64 deep is the cost model's own call (an sm_89 part, at the GeForce floor rate, keeps the
+    // register tile), not what this row asserts.
+    let policy = crate::Policy {
+        declared: bf16_units,
+        ..crate::Policy::grouped(poot_graph_ir::MatmulPrecision::Narrow)
     };
     let program = crate::staged_under(exec, &fixture, target, policy);
     let (_, _, stage) = program.stages().next().expect("one stage");
@@ -514,15 +521,17 @@ pub fn assert_expert_grouping_on_device(exec: &mut dyn Executor, target: Target)
         crate::run_parity(exec, target, &case.fixture, &mut oracle)
             .unwrap_or_else(|e| panic!("{e}"));
     }
+    // The contractions are pinned to the grouping: at these dimensions the cost model plans the Gemv.
+    let grouped = crate::Policy::grouped(poot_graph_ir::MatmulPrecision::Exact);
     for case in grouped_contraction_cases() {
         let name = case.fixture.name;
-        let outputs =
-            crate::run_outputs(exec, target, &case.fixture).unwrap_or_else(|e| panic!("{e}"));
+        let outputs = crate::run_outputs_under(exec, target, &case.fixture, grouped)
+            .unwrap_or_else(|e| panic!("{e}"));
         for got in &outputs {
             assert_every_row_is_its_experts_product(&case, got);
         }
         let mut oracle = oracle_for(&case.fixture.graph, &case.fixture.store);
-        crate::run_parity(exec, target, &case.fixture, &mut oracle)
+        crate::run_parity_under(exec, target, &case.fixture, grouped, &mut oracle)
             .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
 }

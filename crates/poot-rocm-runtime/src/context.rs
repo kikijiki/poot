@@ -785,7 +785,7 @@ mod caps_tests {
 
     /// POOT-1486: the agent's gfx code is the identity its performance figures follow: gfx1151 is the measured
     /// Strix Halo entry and any other part, or an agent whose ISA name carries no gfx code, plans with the
-    /// portable prior. Mutation: resolve `Calibrated::STRIX_HALO` for every agent; the gfx90a row fails.
+    /// portable prior. Mutation: resolve `Calibrated::STRIX_HALO_HSA` for every agent; the gfx90a row fails.
     #[test]
     fn an_agents_performance_figures_follow_its_gfx_code() {
         let calibrated = |isa_name| {
@@ -800,7 +800,7 @@ mod caps_tests {
         };
         assert_eq!(
             calibrated("amdgcn-amd-amdhsa--gfx1151"),
-            poot_target::calibration::Calibrated::STRIX_HALO
+            poot_target::calibration::Calibrated::STRIX_HALO_HSA
         );
         for other in [
             "amdgcn-amd-amdhsa--gfx90a:sramecc+:xnack-",

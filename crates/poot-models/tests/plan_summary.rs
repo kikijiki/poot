@@ -16,7 +16,7 @@
 //! every changed graph in its landing note. To see which equations of a changed graph moved, run the test
 //! with `POOT_PLAN_SUMMARY_DUMP=<dir>` before and after: it writes the full per-equation description of
 //! every target to `<dir>/<target>.tsv` (uncommitted), and the two directories diff. The dump has one column the
-//! digested text does not, `kind`: the request's own name (`contraction:gemv_chunk` is the `[K, N]` decode GEMV).
+//! digested text does not, `kind`: the request's own name (`contraction:dense_gemv:..` is the dense decode Gemv).
 //! For the committed schedule fields of the real-dimension models, see `launch_census.rs`.
 //!
 //! The corpus needs no checkpoint: every graph is a registered family's fixture traced at tiny fixed
@@ -281,8 +281,8 @@ fn describe_compile_error(error: &CompileError) -> (String, String, PlanCells) {
 }
 
 /// The `kind` cell of a kernel choice: a generated request names its family, form and (for a dense Gemv) its
-/// schedule and shape ([`poot_kernelgen::KernelRequest::display_label`], so `contraction:gemv_chunk` is the
-/// `[K, N]` decode GEMV and `contraction:dense_gemv:..` the `[N, K]` one); any other choice names itself.
+/// schedule and shape ([`poot_kernelgen::KernelRequest::display_label`], so `contraction:dense_gemv:..` is the
+/// dense decode Gemv over an `[N, K]` weight); any other choice names itself.
 fn kind_cell(choice: &KernelChoice) -> String {
     match choice {
         KernelChoice::Generated(request) | KernelChoice::Serialized { request, .. } => {

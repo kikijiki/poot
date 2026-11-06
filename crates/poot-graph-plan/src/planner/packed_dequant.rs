@@ -22,9 +22,10 @@ use super::{
 use crate::dtype_widen::ConstLanes;
 use crate::planner::{GraphTables, finalize};
 use crate::predicates::{
-    GemvFamily, GemvLaunch, INDEXED_GEMV_MAX_ROWS, gemv_launch, packed_contraction_m_per_block,
+    GemvFamily, GemvLaunch, IndexedRows, gemv_launch, gemv_wins, packed_contraction_m_per_block,
+    widened_to_fit_grid,
 };
-use crate::refusal::Site;
+use crate::refusal::{Pins, Site};
 use poot_graph_ir::{ContractionRows, ExpertRows, OperandPrecision};
 use poot_kernelgen::{
     PackedContraction, PackedKernelOp, PackedKernelSpec, PackedRows, PackedRunSharing, Schedule,
@@ -47,7 +48,7 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
-    tiling_pin: Option<poot_kernelgen::RegisterTiling>,
+    pins: Pins,
     const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
     match &eqn.op {
@@ -69,7 +70,7 @@ pub(super) fn plan(
             odt,
             caps,
             limits,
-            tiling_pin,
+            pins,
             *descriptor,
             *rows,
             *precision,
@@ -95,7 +96,7 @@ pub(super) fn plan(
             odt,
             caps,
             limits,
-            tiling_pin,
+            pins,
             *descriptor,
             *rows,
             *precision,
@@ -201,7 +202,7 @@ fn try_plan_row_gather(
 /// schedule's real workgroup count ([`Schedule::grid_threads`] divided by the lane grid's `lanes*lanes`); above
 /// `caps.max_grid[0]` it is folded
 /// onto a 2-D `(x_groups, y_groups)` grid the body reconstructs as `gy*x_groups+gx`
-/// (`poot_kernelgen`'s `tiled_body` doc - the same `GroupY`-spill convention `gemv_lds`/
+/// (`poot_kernelgen`'s `tiled_body` doc - the same `GroupY`-spill convention `attn_scores_v_gemv_lds`/
 /// `attention_body` use, `x_groups` riding in `metadata[3]` rather than baked, matching this
 /// kernel family's own shape-in-metadata design). Above `caps.max_grid[1]` too, or on any `usize ->
 /// u32` overflow along the way, `try_plan_contraction` refuses with `Capability::DispatchGridLimit`/
@@ -219,14 +220,14 @@ fn try_plan_contraction(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
-    tiling_pin: Option<poot_kernelgen::RegisterTiling>,
+    pins: Pins,
     descriptor: poot_quant::PackedWeight,
     rows: ContractionRows,
     precision: OperandPrecision,
     epilogue: Option<&FusedRegion>,
     const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
-    let site = Site::new(g, eqn, backend, limits).pinned(tiling_pin);
+    let site = Site::new(g, eqn, backend, limits).pinned(pins);
     let format = crate::packed_block_float::admit_packed(
         crate::packed_block_float::PACKED_LOWERING,
         descriptor,
@@ -454,13 +455,15 @@ fn packed_indexed_shape(
 
 /// The tiled shape of a per-row indexed packed contraction the planner would tile on `caps` (no packed Gemv runs
 /// its rows), as grouped rows over its `experts + 1` buckets (the block is the caller's to choose); `None` for one
-/// it runs as a Gemv or cannot plan. What the `group_expert_rows` pass groups.
+/// it runs as a Gemv (the cheaper of the two, or the one `pin` names) or cannot plan. What the `group_expert_rows`
+/// pass groups.
 pub(crate) fn packed_grouping_candidate(
     g: &poot_graph_ir::Graph,
     eqn: &Eqn,
     backend: Backend,
     caps: &DeviceCaps,
     limits: BodyLimits,
+    pin: Option<IndexedRows>,
 ) -> Option<TiledShape> {
     let OpKind::PackedContraction {
         descriptor,
@@ -475,10 +478,15 @@ pub(crate) fn packed_grouping_candidate(
         return None;
     };
     let tables = GraphTables::from(g);
-    let site = Site::new(tables, eqn, backend, limits);
+    let site = Site::new(tables, eqn, backend, limits).pinned(Pins {
+        indexed_rows: pin,
+        ..Pins::default()
+    });
     let m = tables.aval(value_ids(eqn)[0]).shape[0];
-    let [out, k] = descriptor.shape();
-    match packed_indexed_gemv(site, backend, m, out, k, descriptor.format(), caps) {
+    if pin == Some(IndexedRows::Gemv) {
+        return None;
+    }
+    match packed_indexed_gemv(site, backend, m, (descriptor, experts, precision), caps) {
         Ok(None) => Some(packed_indexed_shape(
             descriptor,
             m,
@@ -493,16 +501,15 @@ pub(crate) fn packed_grouping_candidate(
 }
 
 /// The launch of an indexed packed contraction, chosen from shapes and the device alone, as the dense indexed
-/// contraction's is ([`indexed_gemv_in`]): per-row ids run the packed Gemv over `M * N` flat output columns at
-/// decode row counts (flat column `m * N + n` reads weight row `n` of expert `ids[m]`) and are refused past them;
-/// rows grouped by expert ([`ExpertRows::Grouped`]) run the tiled schedule over the grouping
+/// contraction's is ([`gemv_wins`]): per-row ids run the packed Gemv over `M * N` flat output columns where it costs
+/// less than the grouping of the rows (flat column `m * N + n` reads weight row `n` of expert `ids[m]`) and are
+/// refused where it does not; rows grouped by expert ([`ExpertRows::Grouped`]) run the tiled schedule over the grouping
 /// ([`matmul::register_tiled_launch`] over one block of the grouping's positions), whose tiles each decode one
 /// expert's weight tile for all their rows and whose dispatches split and fold as every tiled contraction's do.
 /// Metadata: `[K, N, M, x_groups, tile_offset, E]` (`M` the grid's rows), then each source's per-expert slab stride
 /// in words ([`poot_quant::PackedWeight::slab_words`]).
 ///
-/// The decode/prefill threshold ([`INDEXED_GEMV_MAX_ROWS`]) is shared with the dense indexed contraction and is
-/// UNTUNED for packed weights.
+/// The decode/prefill boundary is the dense indexed contraction's: one cost comparison ([`gemv_wins`]).
 fn plan_indexed(
     site: Site<'_>,
     g: GraphTables<'_>,
@@ -535,7 +542,7 @@ fn plan_indexed(
     match rows {
         ExpertRows::PerRow => {
             let Some(schedule) =
-                packed_indexed_gemv(site, backend, m, out, k, descriptor.format(), caps)?
+                packed_indexed_gemv(site, backend, m, (descriptor, experts, precision), caps)?
             else {
                 return Err(site.refuse(Capability::UngroupedExpertRows));
             };
@@ -635,43 +642,42 @@ pub(super) fn packed_cost_shapes(
     Some((tiled, gemv))
 }
 
-/// The packed Gemv of an indexed contraction of `m` rows and `n` columns, or `None` when it is not a decode shape
-/// ([`INDEXED_GEMV_MAX_ROWS`]) or its launch would not fit the device's X grid even at one lane per column:
-/// [`packed_gemv_launch`]'s table, widening `cols` (columns per workgroup) until the workgroup count fits.
+/// The packed Gemv of an indexed contraction of `m` rows against `descriptor`'s `experts` experts, or `None` when
+/// its launch would not fit the device's X grid even at one lane per column, or the rows grouped by expert cost less
+/// ([`gemv_wins`]). The launch is [`packed_gemv_launch`]'s table, widening `cols` (columns per workgroup) until the
+/// workgroup count fits.
 fn packed_indexed_gemv(
     site: Site<'_>,
     backend: Backend,
     m: usize,
-    n: usize,
-    k: usize,
-    format: WeightFormat,
+    (descriptor, experts, precision): (poot_quant::PackedWeight, usize, OperandPrecision),
     caps: &DeviceCaps,
 ) -> Result<Option<Schedule>, PlanError> {
-    if m == 0 || n == 0 || m > INDEXED_GEMV_MAX_ROWS {
+    let [n, k] = descriptor.shape();
+    if m == 0 || n == 0 {
         return Ok(None);
     }
     let Some(outputs) = m.checked_mul(n) else {
         return Ok(None);
     };
-    let GemvLaunch {
-        width,
-        cols,
-        unroll,
-    } = packed_gemv_launch(site, outputs, format, caps)?;
-    let limit = caps.max_grid[0].max(1) as usize;
-    Ok(
-        std::iter::successors(Some(cols), |&cols| cols.checked_mul(2))
-            .take_while(|&cols| cols <= width)
-            .find(|&cols| outputs.div_ceil(cols as usize) <= limit)
-            .map(|cols| {
-                GemvLaunch {
-                    width,
-                    cols,
-                    unroll,
-                }
-                .schedule(backend, k)
-            }),
-    )
+    let launch = widened_to_fit_grid(
+        packed_gemv_launch(site, outputs, descriptor.format(), caps)?,
+        outputs,
+        caps,
+    );
+    let grouped = packed_indexed_shape(
+        descriptor,
+        m,
+        precision,
+        TiledRows::Grouped {
+            groups: experts + 1,
+            block: 0,
+        },
+    );
+    let gemv = launch.map(|launch| launch.cost_shape(outputs));
+    Ok(gemv_wins(site.indexed_rows_pin(), gemv, grouped, caps)
+        .then(|| launch.map(|launch| launch.schedule(backend, k)))
+        .flatten())
 }
 
 #[cfg(test)]
@@ -1563,7 +1569,7 @@ mod tests {
         let backend = Backend::SpirvVulkan;
         let grouped = crate::passes::group_expert_rows(
             graph,
-            |g, eqn| super::packed_grouping_candidate(g, eqn, backend, caps, limits),
+            |g, eqn| super::packed_grouping_candidate(g, eqn, backend, caps, limits, None),
             |shapes| poot_kernelgen::RegisterTiling::grouped_block(shapes, caps),
         )
         .expect("the grouping commits");
@@ -1576,7 +1582,7 @@ mod tests {
         crate::plan_eqn(&grouped, eqn, backend, caps, &limits)
     }
 
-    /// A decode-sized indexed packed contraction (`M <= INDEXED_GEMV_MAX_ROWS`) is the Gemv. Its metadata is `[K,
+    /// A decode-sized indexed packed contraction (few enough rows that the cost model picks the per-row Gemv) is the Gemv. Its metadata is `[K,
     /// N, M, x_groups, tile_offset, E, slab_words..]` (the planner's stride is the descriptor's word-padded slab), and a row
     /// count whose workgroups exceed the device's X extent widens `cols` (columns per workgroup) until the grid
     /// fits, rather than folding or refusing. Mutation: leave `cols` at the occupancy choice (`find(|_| true)`);
@@ -1765,42 +1771,56 @@ mod tests {
         );
     }
 
-    /// The decode/prefill split follows the row count: `INDEXED_GEMV_MAX_ROWS` rows is the Gemv and one row more is
-    /// the register-tiled schedule over the grouped rows, unfolded while its tiles fit the X extent (`x_groups` is the
-    /// tile count, the grouping's 6 row tiles at the smallest 16 x 32 tile by `ceil(11/32) = 1`). Mutation: compare
-    /// `m >= INDEXED_GEMV_MAX_ROWS` in `packed_indexed_gemv`;
-    /// the 32-row Gemv becomes Tiled and this row goes red.
+    /// The Gemv-or-grouped split follows the cost model, not a row count (POOT-1489): as the routed rows of a fixed table
+    /// double, the plan is the Gemv (`x_groups` 0 in its metadata, one row of workgroups) and then, from one row count on,
+    /// the register-tiled schedule over the rows grouped by expert (`x_groups` the tile count, the grid's rows the
+    /// grouping's padded positions), and never the Gemv again. The table is 4 experts of 1024 outputs, so the many
+    /// rows of the sweep share each expert's weight tile. Mutation: answer `gemv_wins` with `true` for every row count;
+    /// the sweep never leaves the Gemv and this row goes red. Answer `false`; it never starts as one.
     #[test]
-    fn an_indexed_contraction_is_a_gemv_up_to_the_decode_row_count_and_tiled_above_it() {
+    fn an_indexed_contraction_is_a_gemv_until_the_cost_models_boundary_and_tiled_above_it() {
         let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
-        let schedule_of = |rows: usize| {
-            let (graph, index) = indexed_eqn(rows, 4, 11, 64);
+        let plan_of = |rows: usize| {
+            let (graph, index) = indexed_eqn(rows, 4, 1024, 64);
             let plan = plan_indexed(&graph, index, &caps).unwrap();
             let Some(Dispatch {
                 launch: Launch { grid, meta },
                 ..
             }) = plan.single()
             else {
-                panic!("expected a single dispatch, got {plan:?}");
+                panic!("expected a single dispatch at {rows} rows, got {plan:?}");
             };
             (grid.to_vec(), meta.clone())
         };
-        let (gemv_grid, gemv_meta) = schedule_of(crate::predicates::INDEXED_GEMV_MAX_ROWS);
+        // Up to 8192 rows: past 16384 rows of 1024 outputs the Gemv's workgroups no longer fit the device's X grid at any
+        // width, and the rows are grouped for want of a Gemv, not for cost.
+        let counts: Vec<usize> = std::iter::successors(Some(1usize), |rows| Some(rows * 2))
+            .take_while(|&rows| rows <= 1 << 13)
+            .collect();
+        let tiled: Vec<bool> = counts.iter().map(|&rows| plan_of(rows).1[3] != 0).collect();
+        assert!(!tiled[0], "one row is a Gemv: {tiled:?}");
+        assert!(
+            tiled[tiled.len() - 1],
+            "many rows per expert are tiled: {tiled:?}"
+        );
+        let boundary = tiled.iter().position(|&tiled| tiled).unwrap();
+        assert!(
+            tiled[boundary..].iter().all(|&tiled| tiled),
+            "the Gemv does not come back past the boundary: {tiled:?}"
+        );
+        let (gemv_grid, gemv_meta) = plan_of(counts[boundary - 1]);
         assert_eq!(gemv_meta[3], 0, "a Gemv carries no x_groups: {gemv_meta:?}");
         assert_eq!(gemv_grid[1], 1);
-        let (tiled_grid, tiled_meta) = schedule_of(crate::predicates::INDEXED_GEMV_MAX_ROWS + 1);
-        // The grid's rows are the grouping's padded positions at the 16-row block: `(33 + 5 * 15) / 16` tiles.
-        let positions = poot_graph_ir::ExpertGrouping {
-            rows: crate::predicates::INDEXED_GEMV_MAX_ROWS + 1,
-            experts: 4,
-            block: 16,
-        }
-        .positions();
-        assert_eq!(
-            tiled_meta[2..4],
-            [positions as u32, 6],
+        let rows = counts[boundary];
+        let (tiled_grid, tiled_meta) = plan_of(rows);
+        // The grid's rows are the grouping's padded positions, so at least the routed rows.
+        assert!(
+            tiled_meta[2] as usize >= rows,
             "[M, x_groups]: {tiled_meta:?}"
         );
-        assert_eq!(tiled_grid, [6 * 64, 1, 1]);
+        assert!(
+            tiled_meta[3] > 0 && tiled_grid[0] > 0,
+            "{tiled_grid:?} {tiled_meta:?}"
+        );
     }
 }

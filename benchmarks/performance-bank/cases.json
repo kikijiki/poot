@@ -31,14 +31,14 @@
       "id": "dense-decode-gemv",
       "regime": "dense bandwidth decode",
       "level": "kernel",
-      "producer": "dense_matmul",
+      "producer": "dense_contraction",
       "shape": {
         "m": 1,
         "k": 2048,
         "n": 2048
       },
       "storage": "f32",
-      "layout": "kn",
+      "layout": "nk",
       "numerics": {
         "accumulate": "f32",
         "reference": "f64 loop"
@@ -56,10 +56,10 @@
         "ptx"
       ],
       "status": "runnable",
-      "fixture_id": "0ad1a71c6d24f3bc2392159466a45ddc4917660abc8a0641d8d737ae0564212f",
+      "fixture_id": "8c169fed3e6dc124852439f9458204ac4c9ac631a641adcb76d6e8af7cd77d5c",
       "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
       "cache_id": "6f9c88e074c47ba8a55bcb66180a49c8d849dec363867775261398cb2d0fecd1",
-      "identity_digest": "ddf91990536c590e6c03a698de2f57569f07b1e6cb7ef9307e494694d835d35f"
+      "identity_digest": "8ec089430082d8e634a09c13002e47ae46afae2ba3b82ac5e5e4c38ea9c21aa4"
     },
     {
       "id": "batched-decode-gemm",

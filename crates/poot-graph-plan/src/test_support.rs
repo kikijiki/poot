@@ -3,9 +3,9 @@
 //!
 //! [`plan_eqn`] is [`crate::plan_eqn`] under [`roomy_body_limits`].
 //!
-//! ADR-0113: `is_decode_gemv`/`is_tiled_gemm` had no production caller at all (production routes through
-//! this crate's private `_in` twins) and were deleted; their cross-crate callers assert on the `Plan`
-//! [`plan_eqn`] returns instead of calling a test-only predicate.
+//! ADR-0113: test-only predicates (the old `is_tiled_gemm`) had no production caller at all (production
+//! routes through this crate's private `_in` twins) and were deleted; their cross-crate callers assert on the
+//! `Plan` [`plan_eqn`] returns instead of calling a test-only predicate.
 //! `per_eqn_plans_outside_compile` reads this crate's private state (a crate-private thread-local
 //! counter) and stays beside it under
 //! `#[cfg(any(test, feature = "test-support"))]` (ADR-0113 point 2); their consumers call them directly

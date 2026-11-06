@@ -15,7 +15,7 @@ use crate::kernel_mapping::{finalize, finalize_aie};
 use crate::npu::{NpuLowering, NpuTarget};
 use crate::planner::kg::Layout;
 use crate::predicates::GraphTables;
-use crate::refusal::{Site, refusal_at};
+use crate::refusal::{Pins, Site, refusal_at};
 use crate::state_commit::{StateCommitPlan, state_commit_from_aliases};
 use crate::storage_analysis::{check_kv_head_strides, value_storage_of_plans};
 use crate::types::GraphStorage;
@@ -266,16 +266,14 @@ pub(crate) fn plan_graph(
     g: &Graph,
     target: &Target,
     limits: &BodyLimits,
-    tiling_pin: Option<kg::RegisterTiling>,
+    pins: Pins,
     npu: Option<&dyn NpuLowering>,
 ) -> Result<PlannedGraph, CompileError> {
     let id = target.id();
     check_kv_head_strides(g, target)?;
     let views = compute_views(g, id);
     let plan = |eqn: &Eqn, output| {
-        plan_eqn_policy(
-            g, eqn, target, &views, limits, tiling_pin, npu, output, true,
-        )
+        plan_eqn_policy(g, eqn, target, &views, limits, pins, npu, output, true)
     };
     let mut planned: Vec<Option<Planned>> = g
         .eqns()
@@ -450,7 +448,7 @@ pub fn plan_eqn_choice(
         target,
         views,
         limits,
-        None,
+        Pins::default(),
         npu,
         OutputBuffer::Fresh,
         false,
@@ -469,7 +467,17 @@ pub(crate) fn plan_eqn_compiled(
     npu: Option<&dyn NpuLowering>,
     output: OutputBuffer,
 ) -> Result<Planned, PlanError> {
-    plan_eqn_policy(g, eqn, target, views, limits, None, npu, output, true)
+    plan_eqn_policy(
+        g,
+        eqn,
+        target,
+        views,
+        limits,
+        Pins::default(),
+        npu,
+        output,
+        true,
+    )
 }
 
 /// Whether `select_operand_precision` narrows `eqn`, an op that reads its operands narrowed or split (POOT-1476): the
@@ -496,7 +504,7 @@ pub(crate) fn runs_on_matrix_unit(
         OpKind::IndexedMatMul {
             rows: ExpertRows::PerRow,
             ..
-        } => Some(grouping_candidate(g, eqn, views, caps)),
+        } => Some(grouping_candidate(g, eqn, views, caps, None)),
         OpKind::PackedContraction {
             rows:
                 ContractionRows::Indexed {
@@ -504,7 +512,9 @@ pub(crate) fn runs_on_matrix_unit(
                     ..
                 },
             ..
-        } => Some(packed_grouping_candidate(g, eqn, *backend, caps, *limits)),
+        } => Some(packed_grouping_candidate(
+            g, eqn, *backend, caps, *limits, None,
+        )),
         _ => None,
     };
     if let Some(shape) = grouped {
@@ -540,7 +550,7 @@ fn plan_eqn_policy(
     target: &Target,
     views: &HashMap<ValueId, Layout>,
     limits: &BodyLimits,
-    tiling_pin: Option<kg::RegisterTiling>,
+    pins: Pins,
     npu: Option<&dyn NpuLowering>,
     output: OutputBuffer,
     compiled: bool,
@@ -566,7 +576,7 @@ fn plan_eqn_policy(
         views,
         &const_lanes,
         *limits,
-        tiling_pin,
+        pins,
         npu,
         output,
     )
@@ -601,7 +611,7 @@ pub(crate) fn plan_eqn_views_impl(
     views: &HashMap<ValueId, Layout>,
     const_lanes: &ConstLanes,
     limits: BodyLimits,
-    tiling_pin: Option<kg::RegisterTiling>,
+    pins: Pins,
     npu: Option<&dyn NpuLowering>,
     output: OutputBuffer,
 ) -> Result<Planned, PlanError> {
@@ -617,7 +627,7 @@ pub(crate) fn plan_eqn_views_impl(
             caps,
             const_lanes,
             limits,
-            tiling_pin,
+            pins,
             output,
         ),
         Target::Npu(NpuTarget::Aie { target, caps }) => plan_aie_eqn(
@@ -805,7 +815,7 @@ fn plan_gpu_eqn(
     caps: &DeviceCaps,
     const_lanes: &ConstLanes,
     limits: BodyLimits,
-    tiling_pin: Option<kg::RegisterTiling>,
+    pins: Pins,
     output: OutputBuffer,
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
@@ -822,7 +832,7 @@ fn plan_gpu_eqn(
             odt,
             caps,
             limits,
-            tiling_pin,
+            pins,
             const_lanes,
         );
     }
@@ -867,7 +877,7 @@ fn plan_gpu_eqn(
                 odt,
                 caps,
                 limits,
-                tiling_pin,
+                pins,
                 const_lanes,
             );
         }
@@ -882,7 +892,7 @@ fn plan_gpu_eqn(
                 odt,
                 caps,
                 limits,
-                tiling_pin,
+                pins,
                 const_lanes,
             );
         }
@@ -906,7 +916,7 @@ fn plan_gpu_eqn(
             odt,
             caps,
             limits,
-            tiling_pin,
+            pins,
             const_lanes,
         )?,
         attention_ops!() => attention::plan(g, eqn, backend, caps, limits)?,

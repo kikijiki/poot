@@ -542,8 +542,8 @@ fn biased_residual_matmul(xs: Vec<usize>, ws: Vec<usize>, head_dtype: DType) -> 
 /// Every other `MatMul` head keeps the plan it would get without one, so no head loses its schedule to a fused store:
 /// an F16 or BF16 head is not tileable (the body is f32-only) and fuses on its serial dtype-generic body (BF16 is
 /// refused on SPIR-V, which has no scalar bf16); a rank-3 weight takes the generated batched-weight tiled GEMM on
-/// every backend, which carries no epilogue, so its chain stays apart; `M == 1` is the decode GEMV and keeps its
-/// chain everywhere.
+/// every backend, which carries no epilogue, so its chain stays apart; an `M == 1` head is not tileable either and
+/// fuses on the serial body, like any other head off the tiled route.
 ///
 /// Mutation: drop the F32-operand clause, the rank-2-weight clause or the `M > 1` clause of
 /// `is_tileable_matmul_in` (each lets the matcher admit the head onto the tiled GEMM); the matching case then plans
@@ -579,7 +579,7 @@ fn a_matmul_head_off_the_tiled_route_never_takes_the_tiled_epilogue() {
         (
             "M == 1",
             biased_residual_matmul(vec![1, K], vec![K, N], DType::F32),
-            [ChainKept, ChainKept, ChainKept],
+            [SerialEpilogue, SerialEpilogue, SerialEpilogue],
         ),
     ];
     let options = exact_options();

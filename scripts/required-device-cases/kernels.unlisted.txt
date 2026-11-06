@@ -12,8 +12,11 @@ poot-kernelgen	contraction::tests::a_fragment_tile_of_one_wave_loses_to_the_exac
 poot-kernelgen	contraction::tests::a_grouping_with_few_rows_per_expert_takes_a_short_block	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_long_prefill_takes_the_widest_tile	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::grouped_rows_count_whole_tiles_per_bucket	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::tests::rows_expected_to_touch_fewer_buckets_than_they_have	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::the_candidates_are_the_tilings_the_device_runs	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::tests::the_comparison_is_for_grouped_rows_on_a_device_that_tiles_them	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::the_gemv_beats_a_matrix_unit_at_one_row_and_loses_at_many	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::tests::the_gemv_gives_way_to_the_grouping_where_the_rows_share_their_experts	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::the_matrix_units_rate_discounts_the_fragment_multiply	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tiled::tests::a_split_moves_the_reads_ahead_and_keeps_their_uses	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	emit::tests::reads_a_full_word_at_a_word_boundary	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case

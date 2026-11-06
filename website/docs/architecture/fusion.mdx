@@ -115,7 +115,7 @@ from a shipped kernel, or needs no dispatch at all.
 | --- | --- | --- |
 | **Elementwise** | `Fused` pointwise region | Synthesized: one thread per element. |
 | **Reduction** | `FusedRow` region | Synthesized: block reduce + epilogue in shared memory. |
-| **GEMV** | `MatMul` with M=1 (decode) | Synthesized: `kernelgen::gemv_lds`, one workgroup per output row. |
+| **GEMV** | A dense contraction with M=1 (decode), and the decode attention `scores @ V` `MatMul` | Synthesized: the dense Gemv over the weight in checkpoint `[N, K]` order; the attention GEMV is one workgroup per output element. |
 | **Tiled GEMM** | A dense contraction with M>1: a `MatMul` with f32 operands and a shared or per-batch weight, or a weight in checkpoint `[N, K]` order | Synthesized register-tiled GEMM: LDS-staged tiles, a register tile per lane, the tile sized from the shape and the device. |
 | **Attention** | `Attention` | Generated from `KernelRequest::Attention` (`AttentionSpec`): one workgroup per (batch row, Q head, query row), lanes striding the keys, softcap optional. A block-selected prefill serves the `n_rep` heads of a key/value head in one workgroup. |
 | **Dequant GEMV/GEMM** | `PackedContraction` | Generated decode from the format descriptor, then contraction. |

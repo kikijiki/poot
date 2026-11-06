@@ -263,10 +263,11 @@ test-plan-summary-regen:
 test-launch-census-regen:
     POOT_LAUNCH_CENSUS_REGEN=1 cargo nextest run -p poot-models --test launch_census the_launch_census_matches_the_checked_in_file
 
-# fit the register-tiled contraction cost model's ratios to this box's measured device time and write a
-# PerfCalibration cost entry for review (POOT-1479 section 3.4); `backend` is rocm or wgpu. Takes the GPU lock.
-calibrate-launch backend out='':
-    scripts/calibrate-launch {{backend}} {{out}}
+# fit the contraction cost model's ratios to this box's measured device time and write a PerfCalibration cost entry
+# for review (POOT-1479 section 3.4); `backend` is rocm or wgpu, `mode` tilings (the LDS-read and staged-value ratios)
+# or indexed (the Gemv's direct-value and global-byte ratios, POOT-1489). Takes the GPU lock.
+calibrate-launch backend mode out='':
+    scripts/calibrate-launch {{backend}} {{mode}} {{out}}
 
 # rewrite the generated region of website/docs/develop/supported-models.md from what `compile` says about every
 # registered family's fixture graphs and every weight format on each reference target. The supported_models test

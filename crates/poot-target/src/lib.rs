@@ -268,8 +268,6 @@ pub enum SubgroupSupport {
 /// `None` on [`DeviceCaps::watchdog_budget`] means this device has no such budget.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WatchdogBudget {
-    /// Output elements for an unchunked decode-GEMV dispatch (card 258).
-    pub decode_gemv_out_elems: u64,
     /// `out_elems * K` for an unchunked serial K-quant dequant matmul (card 163).
     pub serial_dequant_work: u64,
     /// Output elements for an unchunked scatter-update / dynamic-update-slice dispatch (card 159).
@@ -400,7 +398,7 @@ pub struct DeviceCaps {
     /// (POOT-1458): a generated body rounds an operand to such a dtype with two casts, and to any other in integer
     /// arithmetic. None on SPIR-V; f16 on AMDGPU and NVPTX.
     pub rounding_conversions: RoundingConversions,
-    /// Whether a BF16 `[K, N]` decode projection is widened to F32 before its GEMV (the device has native
+    /// Whether a BF16 `[K, N]` decode projection is widened to F32 before it is planned (the device has native
     /// two-byte storage and no packed reader for it) instead of being refused (the lane is packed and
     /// a widening copy of the weight would double its bytes).
     pub widens_bf16_decode_weight: bool,
@@ -408,9 +406,6 @@ pub struct DeviceCaps {
     /// copies and the collectives built on them). Without it a stage cut between two such devices has nothing
     /// to carry its boundary.
     pub peer_transport: bool,
-    /// The output-column count above which a decode GEMV is measured slower than the batched matmul on this
-    /// device; `None` where nobody measured one (the GEMV is kept at any width).
-    pub decode_gemv_max_out_cols: Option<u32>,
     /// Whether this device's performance figures were measured on it or are the portable prior, resolved from
     /// the device's identity by its runtime. The launch is derived from it by [`DeviceCaps::gemm_launch`].
     pub perf_calibration: calibration::Calibrated,
@@ -425,27 +420,6 @@ impl DeviceCaps {
         calibration::GemmLaunch::of(self)
     }
 }
-
-/// Card 258: output-element count (one `gemv_lds` workgroup per element) above which a wgpu decode-GEMV
-/// splits into several smaller dispatches on a device with this box's measured watchdog budget (see
-/// `poot_test_util::device_caps::wgpu_rdna3_igpu`). One definition (card 522 review): `poot-graph-plan`'s
-/// `decode_gemv_plan` reads it through `caps.watchdog_budget`, and `dtype_widen`'s bf16 decode-GEMV
-/// eligibility gate imports this constant directly for its own chunk-trigger check (card 546b threaded
-/// `DeviceCaps.max_grid` into that gate's separate grid-cap check, but this trigger stays a plain
-/// constant both sides read), so the two can never independently drift.
-///
-/// A single dispatch at BLOOM's scale (`N=250880, K=1024`) completes in ~0.6s alone, but the same
-/// dispatch right after another large one (a materializing `transpose` of the same weight, ~3.7s) trips
-/// the Strix Halo iGPU's display-watchdog TDR within ~1.5s, even though the wgpu executor polls after
-/// every submit (the pre-contract `GpuExecutor::run` did this; the executor contract's `WgpuDevice`
-/// does the same). The trigger is the total busy stretch across a rapid sequence of large dispatches,
-/// not one dispatch's duration. Splitting gives display work scheduling gaps (card 258 holds the calibration table).
-///
-/// `N` is the dominant hazard axis: BLOOM `N=250880` hangs; gpt-oss `N=201088` (tied, `K=32`) and
-/// SmolLM3 `N=128256` (tied, `K=2048`, higher `out_numel*K` than BLOOM's `2.57e8`) do not. So the trigger
-/// is element-count-only (unlike the K-scaled `serial_dequant_work`), set at 220_000 between the
-/// proven-safe 201088 and the proven-hanging 250880.
-pub const DECODE_GEMV_CHUNK_TRIGGER: u64 = 220_000;
 
 /// POOT-1263: multiply-accumulates one packed tiled-contraction dispatch may carry on a device with the
 /// display watchdog ([`WatchdogBudget::packed_tiled_work`]). A Qwen3.8-27B-FP8 prefill forward of 2048
@@ -529,7 +503,6 @@ impl DeviceCaps {
             rounding_conversions: RoundingConversions::F16,
             widens_bf16_decode_weight: false,
             peer_transport: false,
-            decode_gemv_max_out_cols: None,
             // The arch is the live agent's to say ([`calibration::Calibrated::of_hsa_arch`]); a device with no
             // arch plans with the portable prior.
             perf_calibration: calibration::Calibrated::Portable,
@@ -562,7 +535,6 @@ impl DeviceCaps {
             rounding_conversions: RoundingConversions::F16,
             widens_bf16_decode_weight: true,
             peer_transport: true,
-            decode_gemv_max_out_cols: calibration::nvidia_decode_gemv_max_out_cols(8).known(),
             // sm_80 is not a measured device ([`calibration::Calibrated::of_cuda_compute_capability`]).
             perf_calibration: calibration::Calibrated::Portable,
         }

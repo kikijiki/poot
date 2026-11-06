@@ -18,6 +18,8 @@ use poot_runtime_common::device_skip::open_or_skip;
 use poot_tensor::{DType, HostTensor};
 
 const EXPERTS: usize = 4;
+/// The routed rows of the prefill cases: the rows these cases pin to the grouping.
+const PREFILL_ROWS: usize = 160;
 /// `K` is not a multiple of the 8-row tile and `N` not a multiple of its column edge, so the tail masks run.
 const K: usize = 36;
 const N: usize = 21;
@@ -203,8 +205,23 @@ fn run(
             }
         })
         .collect();
-    poot_executor_parity::run_once(engine, target, &p.graph, &consts, &[])
-        .unwrap_or_else(|e| panic!("{e}"))
+    // At a dozen wide the cost model plans every row count as the Gemv, so a row about the tiled schedule over the
+    // rows grouped by expert pins it (POOT-1489): the prefill row counts are the grouping's, the decode ones the Gemv's.
+    let rows = p.graph.aval(p.graph.result()).shape[0];
+    let schedule = if rows >= PREFILL_ROWS {
+        poot_graph_plan::IndexedRows::Grouped
+    } else {
+        poot_graph_plan::IndexedRows::Gemv
+    };
+    poot_executor_parity::run_once_under(
+        engine,
+        target,
+        &p.graph,
+        &consts,
+        &[],
+        poot_executor_parity::Policy::indexed(schedule, poot_graph_ir::MatmulPrecision::Exact),
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn bits(t: &HostTensor) -> Vec<u32> {

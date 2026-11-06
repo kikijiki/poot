@@ -435,27 +435,15 @@ fn pooled_keep(
                 b.slice(selection, 3, kept_pools, kept_pools + pools)?,
                 DType::F32,
             )?,
-            vec![rows, t, pools],
+            vec![rows, t, pools, 1],
         )?;
-        // Spread each pool's flag over its positions: `[pools, cap]` ones where slot `s` is in pool `j`.
-        let starts = b.broadcast(
-            b.reshape(
-                b.binary_scalar(BinOp::Mul, b.iota(pools)?, Scalar::F32(pool as f32))?,
-                vec![pools, 1],
-            )?,
-            vec![pools, cap],
+        // Spread each pool's flag over its positions, slot `s` reading pool `s / pool`: the flags repeated
+        // `pool` times each, a view that copies them (no arithmetic, so the `0`/`1` flags stay exact).
+        let spread = b.reshape(
+            b.broadcast(chosen, vec![rows, t, pools, pool])?,
+            vec![rows, t, pools * pool],
         )?;
-        let slot_row = b.broadcast(b.reshape(b.iota(cap)?, vec![1, cap])?, vec![pools, cap])?;
-        let in_pool = b.binary(
-            BinOp::Mul,
-            b.binary(BinOp::Ge, slot_row, starts)?,
-            b.binary(
-                BinOp::Ge,
-                b.binary_scalar(BinOp::Add, starts, Scalar::F32(pool as f32 - 1.0))?,
-                slot_row,
-            )?,
-        )?;
-        (tail_from, Some(b.matmul(chosen, in_pool)?)) // [rows, t, cap]
+        (tail_from, Some(spread)) // [rows, t, pools * pool]
     };
     let tail = b.binary(
         BinOp::Mul,
@@ -466,8 +454,18 @@ fn pooled_keep(
         )?,
         visible,
     )?;
+    // The kept pools cover the slots of the whole pools; a slot past the last whole pool is in no pool, so
+    // only the tail keeps it.
+    let pooled = pools * pool;
     let keep = match kept {
-        Some(kept) => b.binary(BinOp::Add, kept, tail)?,
+        Some(kept) if pooled == cap => b.binary(BinOp::Add, kept, tail)?,
+        Some(kept) => b.concat(
+            2,
+            &[
+                b.binary(BinOp::Add, kept, b.slice(tail, 2, 0, pooled)?)?,
+                b.slice(tail, 2, pooled, cap)?,
+            ],
+        )?,
         None => tail,
     };
     let drop = b.binary_scalar(
@@ -816,12 +814,24 @@ mod tests {
         }
 
         fn run(fx: &Fx, topk_pools: usize, x: &[f32], start: i32, state: &[Vec<f32>]) -> Run {
+            run_at(fx, CAPACITY, topk_pools, x, start, state)
+        }
+
+        /// [`run`] over a cache of `capacity` positions.
+        fn run_at(
+            fx: &Fx,
+            capacity: usize,
+            topk_pools: usize,
+            x: &[f32],
+            start: i32,
+            state: &[Vec<f32>],
+        ) -> Run {
             let mut p = params();
             p.pool_topk = topk_pools;
             let w = PooledDsaWeights::new(&fx.map(), 0, WIDTH, &p).unwrap();
             let tokens = x.len() / WIDTH;
             let b = Builder::for_tests();
-            let step = Step::new(&b, step_shape(tokens, CAPACITY, LogitRows::All)).unwrap();
+            let step = Step::new(&b, step_shape(tokens, capacity, LogitRows::All)).unwrap();
             let xs = b
                 .constant("x", TensorType::f32(vec![1, tokens, WIDTH]))
                 .unwrap();
@@ -1044,6 +1054,24 @@ mod tests {
                 });
                 assert!(moved, "the output does not depend on {}", role(r));
             }
+        }
+
+        /// A cache whose capacity is not whole pools: the slot past the last whole pool belongs to no
+        /// pool, so only the tail keeps it, and the token written there still attends itself. Eleven
+        /// tokens fill an eleven-slot cache (five pools and one loose slot), with the selection live.
+        /// Mutation: spread the flags pool-minor (slot `s` reading pool `s % pools`, a broadcast of
+        /// `[rows, t, 1, pools]`); the kept slots move and the row goes red. Mutation: drop the loose
+        /// slot's tail (keep only the pooled slots, zero past them); the last token's row goes red.
+        #[test]
+        fn the_pooled_layer_matches_the_definition_past_the_last_whole_pool() {
+            let fx = fixture();
+            let x: Vec<f32> = oracle::random((TOKENS + 1) * WIDTH, 51)
+                .into_iter()
+                .map(|v| 3.0 * v)
+                .collect();
+            let (want, _, _) = reference(&fx, POOL_TOPK, &x);
+            let got = run_at(&fx, TOKENS + 1, POOL_TOPK, &x, 0, &[]);
+            oracle::assert_matches_f64(&got.out, &want, 1e-4);
         }
 
         /// The selection decides the output: keeping every complete pool gives other outputs than

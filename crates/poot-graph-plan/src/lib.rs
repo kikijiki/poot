@@ -50,7 +50,7 @@ pub mod staged;
 mod imported;
 
 /// The strided-view promotion pass (`compute_views`, spec 132) and the dispatch predicates + launch-grid
-/// math (`is_decode_gemv`, `decode_gemv_plan`, and friends) that `plan_eqn_views` and its callers share.
+/// math (`is_tileable_matmul_in`, `dense_decode_gemv_in`, and friends) that `plan_eqn_views` and its callers share.
 mod predicates;
 
 /// The small pub types every caller matches on: [`Backend`], [`Plan`], [`PlanError`], [`CollectiveKind`],
@@ -107,7 +107,7 @@ pub use passes::{
 pub use planner::{KernelChoice, NoDispatch, Planned, region_member_work};
 #[cfg(any(test, feature = "test-support"))]
 pub use planner::{plan_eqn, plan_eqn_choice, plan_eqn_views};
-pub use predicates::{compute_views, numel, value_ids};
+pub use predicates::{IndexedRows, compute_views, numel, value_ids};
 pub use refusal::{Capability, FusedStepGap, Refusal, RefusalDtypes, StorageGap};
 pub use types::{
     Binding, CollectiveKind, Dispatch, DispatchPlan, DispatchPlanError, GraphStorage, Launch, Plan,

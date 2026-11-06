@@ -288,17 +288,28 @@ impl TiledShape {
     }
 
     /// The row tiles of one block that compute, at `tile_rows` rows a tile: the rows' tiles, or for grouped rows
-    /// spread evenly over `min(groups, rows)` non-empty buckets, each bucket's whole tiles. The model of the cost,
-    /// from the shape alone.
+    /// spread evenly over the buckets the rows are expected to touch ([`expected_touched_buckets`]), each bucket's
+    /// whole tiles. The model of the cost, from the shape alone.
     pub fn working_row_tiles(self, tile_rows: usize) -> usize {
         match self.rows {
             TiledRows::Dense => self.m_per_block.div_ceil(tile_rows),
             TiledRows::Grouped { groups, .. } => {
-                let buckets = groups.min(self.m_per_block).max(1);
+                let buckets = expected_touched_buckets(groups, self.m_per_block);
                 buckets * self.m_per_block.div_ceil(buckets).div_ceil(tile_rows)
             }
         }
     }
+}
+
+/// The buckets `rows` rows are expected to touch among `groups` when each picks one uniformly: `G (1 - (1 - 1/G)^M)`,
+/// rounded up, at least one and at most `rows`. A shape carries no routing, so uniform routing is the documented prior
+/// (llama.cpp sizes an RDNA MoE tile against the average tokens per expert, `mmq.cu:299-304`; vLLM uses `M / E`): rows
+/// share buckets long before `M` reaches `G`, at `M = G` about 37 % of them do.
+pub(crate) fn expected_touched_buckets(groups: usize, rows: usize) -> usize {
+    let groups = groups.max(1) as f64;
+    let touched = groups * (1.0 - (1.0 - 1.0 / groups).powf(rows as f64));
+    // Round off the float noise of a whole count before taking the ceiling.
+    ((touched - 1e-9).ceil() as usize).clamp(1, rows.max(1))
 }
 
 /// The geometry of a [`Schedule::RegisterTiled`] or [`Schedule::FragmentTiled`] contraction, chosen from the shapes
@@ -394,20 +405,8 @@ impl RegisterTiling {
             },
             ..shape
         };
-        let mut blocks: Vec<usize> = shapes
-            .iter()
-            .flat_map(|&shape| {
-                let free = TiledShape {
-                    rows: TiledRows::Dense,
-                    ..shape
-                };
-                Self::candidates(free, caps).map(|tiling| tiling.output_tile().0)
-            })
-            .collect();
-        blocks.sort_unstable();
-        blocks.dedup();
         let mut best: Option<(f64, usize)> = None;
-        for block in blocks {
+        for block in Self::blocks_of(shapes, caps) {
             let total = shapes.iter().try_fold(0.0, |total, &shape| {
                 Self::cheapest(grouped(shape, block), caps).map(|(cost, _)| total + cost)
             });
@@ -574,6 +573,52 @@ impl RegisterTiling {
         .all(|exact| fragment_cost < exact)
     }
 
+    /// The output-tile rows some tiling of any of `shapes` has when its rows are free: the blocks a grouping can take,
+    /// ascending.
+    fn blocks_of(shapes: &[TiledShape], caps: &poot_target::DeviceCaps) -> Vec<usize> {
+        let mut blocks: Vec<usize> = shapes
+            .iter()
+            .flat_map(|&shape| {
+                let free = TiledShape {
+                    rows: TiledRows::Dense,
+                    ..shape
+                };
+                Self::candidates(free, caps).map(|tiling| tiling.output_tile().0)
+            })
+            .collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        blocks
+    }
+
+    /// Whether the per-row Gemv `gemv` of an indexed contraction costs no more than the tiling of the same rows
+    /// grouped by expert (`grouped`: its `rows` are `TiledRows::Grouped`, its block replaced by the cheapest one for
+    /// this contraction alone, as a grouping of it by itself would take). Both are costed by the one
+    /// [`ContractionCost`] model, the grouped one over the buckets the rows are expected to touch
+    /// ([`TiledShape::working_row_tiles`]); a grouped shape the device runs no tiling for loses to any Gemv. The one
+    /// question that decides where an indexed contraction stops being a Gemv, from the dimensions and the device
+    /// alone.
+    pub fn gemv_beats_grouped(
+        gemv: GemvShape,
+        grouped: TiledShape,
+        caps: &poot_target::DeviceCaps,
+    ) -> bool {
+        let TiledRows::Grouped { groups, .. } = grouped.rows else {
+            return false;
+        };
+        let best = Self::blocks_of(&[grouped], caps)
+            .into_iter()
+            .filter_map(|block| {
+                let grouped = TiledShape {
+                    rows: TiledRows::Grouped { groups, block },
+                    ..grouped
+                };
+                Self::cheapest(grouped, caps).map(|(cost, _)| cost)
+            })
+            .min_by(f64::total_cmp);
+        best.is_none_or(|grouped| ContractionCost::gemv(gemv, caps) <= grouped)
+    }
+
     /// The `K` values one barrier round of this tiling stages.
     pub fn depth(self) -> usize {
         self.depth
@@ -726,6 +771,99 @@ mod tests {
                 "{tiling:?}"
             );
         }
+    }
+
+    /// Rows spread uniformly over buckets touch `G (1 - (1 - 1/G)^M)` of them, rounded up: 82 of 129 buckets at
+    /// `M = 129` (rows share long before `M` reaches `G`), every bucket at `M >> G`, and never more than the rows or
+    /// fewer than one. Mutation: answer `groups.min(rows)` (the old even spread); the `M = G` row goes red.
+    #[test]
+    fn rows_expected_to_touch_fewer_buckets_than_they_have() {
+        assert_eq!(expected_touched_buckets(129, 129), 82);
+        assert_eq!(expected_touched_buckets(129, 4), 4);
+        assert_eq!(expected_touched_buckets(129, 4096), 129);
+        assert_eq!(expected_touched_buckets(1, 5), 1);
+        assert_eq!(expected_touched_buckets(129, 0), 1);
+        // The working tiles follow: 129 rows over 129 buckets are 82 buckets of 2 rows, each its own 16-row tile.
+        let grouped = TiledShape {
+            rows: TiledRows::Grouped {
+                groups: 129,
+                block: 16,
+            },
+            ..shape(129, 2048, 1024)
+        };
+        assert_eq!(grouped.working_row_tiles(16), 82);
+    }
+
+    /// A routed projection of `rows` rows over `experts` experts of a bf16 `[N, K]` stack: the grouped tiled shape and
+    /// the Gemv launch the planner would cost against it.
+    fn routed(rows: usize, experts: usize) -> (GemvShape, TiledShape) {
+        let grouped = TiledShape {
+            blocks: 1,
+            m_per_block: rows,
+            out_per_block: 1024,
+            k: 1024,
+            layout: WeightLayout::Nk,
+            rows: TiledRows::Grouped {
+                groups: experts + 1,
+                block: 0,
+            },
+            terms: crate::precision::StagedTerms::ONE,
+            weight_bits: 16,
+            activation_bits: 32,
+        };
+        let gemv = GemvShape {
+            outputs: rows * 1024,
+            width: 256,
+            cols: 4,
+        };
+        (gemv, grouped)
+    }
+
+    /// Where an indexed contraction stops being a Gemv is the cost model's (POOT-1489), and on gfx1151 through HSA it
+    /// is where `calibrate-launch indexed` measured it for a `1024 x 1024` bf16 expert: 16 rows over 8 experts are a
+    /// Gemv (the grouping timed 2.1x slower), 256 over 8 are grouped (it timed 0.6x), 256 over 128 are a Gemv (2.1x),
+    /// 4096 over 128 grouped again (0.16x). The retired 32-row switch had the third row wrong. Mutation: compare
+    /// `gemv > grouped` in `gemv_beats_grouped`; every row inverts and goes red.
+    #[test]
+    fn the_gemv_gives_way_to_the_grouping_where_the_rows_share_their_experts() {
+        let backend = poot_target::Backend::AmdGcn(poot_target::AmdArch::gfx1151());
+        let caps = poot_test_util::device_caps::default_caps_for(backend);
+        for (rows, experts, gemv_wins) in [
+            (16, 8, true),
+            (256, 8, false),
+            (256, 128, true),
+            (4096, 128, false),
+        ] {
+            let (gemv, grouped) = routed(rows, experts);
+            assert_eq!(
+                RegisterTiling::gemv_beats_grouped(gemv, grouped, &caps),
+                gemv_wins,
+                "{rows} rows over {experts} experts"
+            );
+        }
+    }
+
+    /// A grouped shape the device runs no tiling for loses to any Gemv, and a dense shape is never the grouping's:
+    /// the comparison answers only for rows grouped by expert. Mutation: answer `true` for a dense shape; the second
+    /// assertion goes red.
+    #[test]
+    fn the_comparison_is_for_grouped_rows_on_a_device_that_tiles_them() {
+        let caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
+        let (gemv, grouped) = routed(256, 8);
+        let dense = TiledShape {
+            rows: TiledRows::Dense,
+            ..grouped
+        };
+        assert!(!RegisterTiling::gemv_beats_grouped(gemv, dense, &caps));
+        let no_tiling = poot_target::DeviceCaps {
+            max_workgroup_invocations: 1,
+            max_workgroup_size: [1, 1, 1],
+            ..caps
+        };
+        assert!(
+            RegisterTiling::gemv_beats_grouped(gemv, grouped, &no_tiling),
+            "a device that runs no tile of the grouping runs the Gemv"
+        );
     }
 
     /// Grouped rows compute whole tiles per bucket and launch the grouping's padded positions: 4096 rows over 64

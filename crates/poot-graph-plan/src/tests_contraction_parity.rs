@@ -1,6 +1,6 @@
-//! One source per contraction (POOT-1237). The decode GEMV and the tiled GEMM each come from kernelgen's
-//! `generate`; a launch-size trigger (the display-watchdog split, the RADV tile ceiling) changes how many
-//! dispatches cover the output, never the body that computes it. These rows plan through the production
+//! One source per contraction (POOT-1237). The tiled GEMM comes from kernelgen's `generate`; a launch-size
+//! trigger (the RADV tile ceiling) changes how many dispatches cover the output, never the body that
+//! computes it. These rows plan through the production
 //! entry (`plan_eqn`), run every planned dispatch on the reference interpreter, and compare across the old
 //! trigger boundary: the unsplit plan and the split plan of one shape must agree bit for bit, and with the
 //! plain matmul oracle.
@@ -8,11 +8,10 @@
 use poot_graph_ir::{Builder, Graph, TensorType};
 use poot_kernel_ir::interp::{self, Buffer};
 use poot_kernelgen::{ContractionSpec, DenseTiledContraction, DenseTiledWeight, KernelRequest};
-use poot_target::{Backend, DeviceCaps, WatchdogBudget};
+use poot_target::{Backend, DeviceCaps};
 
-use crate::predicates::lds_gemv_width;
 use crate::test_support::plan_eqn;
-use crate::{Dispatch, KernelChoice, Plan};
+use crate::{KernelChoice, Plan};
 
 fn fill(seed: u64, count: usize) -> Vec<f32> {
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15) | 1;
@@ -95,142 +94,6 @@ fn assert_close(got: &[f32], want: &[f32], ctx: &str) {
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
         let tol = 1e-4 + 1e-4 * w.abs();
         assert!((g - w).abs() <= tol, "{ctx}[{i}]: {g} vs {w}");
-    }
-}
-
-/// A device whose X grid holds `max_x` workgroups and whose watchdog splits a decode GEMV above `trigger`
-/// output elements: the production trigger, shrunk so the interpreter crosses it in a few workgroups.
-fn watchdog_caps(max_x: u32, trigger: u64) -> DeviceCaps {
-    let base = poot_test_util::device_caps::wgpu_rdna3_igpu();
-    DeviceCaps {
-        max_grid: [max_x, base.max_grid[1], base.max_grid[2]],
-        watchdog_budget: Some(WatchdogBudget {
-            decode_gemv_out_elems: trigger,
-            ..base
-                .watchdog_budget
-                .expect("the wgpu iGPU fixture has a watchdog budget")
-        }),
-        ..base
-    }
-}
-
-fn gemv_chunk(dispatch: &Dispatch) -> (usize, usize, usize, usize, usize) {
-    match dispatch.choice() {
-        KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::GemvChunk {
-            k,
-            n,
-            width,
-            elems,
-            offset,
-            ..
-        })) => (*k, *n, *width, *elems, *offset),
-        other => panic!("a decode GEMV is the generated gemv_lds body, got {other:?}"),
-    }
-}
-
-/// SC-002: the decode GEMV across the old watchdog-trigger boundary. At `trigger` output elements the plan is
-/// one dispatch; one element past it the plan is several, and every dispatch of both is the same generated
-/// `GemvChunk` body over the same `[K, N]` weight. The split result equals the unsplit result of the same shape
-/// bit for bit (same body, same summation order), single-sequence and batched.
-///
-/// Mutation: in `decode_gemv_plan`, plan the over-trigger branch as a different body (the serial matmul
-/// kernel); the split plan's dispatches are no `GemvChunk`, the choice assertion names it, and the results
-/// differ in the last bits.
-#[test]
-fn decode_gemv_is_one_body_on_both_sides_of_the_watchdog_boundary() {
-    const TRIGGER: u64 = 100;
-    let backend = Backend::SpirvVulkan;
-    let split_caps = watchdog_caps(50, TRIGGER);
-    let unsplit_caps = DeviceCaps {
-        watchdog_budget: None,
-        ..split_caps
-    };
-    let k = 37;
-    for (batch, n) in [
-        (1usize, 100usize),
-        (1, 101),
-        (1, 237),
-        (3, 33),
-        (3, 34),
-        (4, 77),
-    ] {
-        let out_numel = batch * n;
-        let x = fill(1, batch * k);
-        let w = fill(2, k * n);
-        let plan = matmul_plan(&[batch, 1, k], &[k, n], backend, &split_caps);
-        let unsplit = matmul_plan(&[batch, 1, k], &[k, n], backend, &unsplit_caps);
-        let crosses = out_numel as u64 > TRIGGER;
-        assert_eq!(
-            plan.dispatches().len() > 1,
-            crosses,
-            "B={batch} N={n}: {out_numel} outputs against a trigger of {TRIGGER}"
-        );
-        assert_eq!(
-            unsplit.dispatches().len(),
-            1,
-            "no watchdog budget: one dispatch"
-        );
-        let mut covered = 0;
-        for dispatch in plan.dispatches().iter().chain(unsplit.dispatches()) {
-            let (gk, gn, width, _, _) = gemv_chunk(dispatch);
-            assert_eq!(
-                (gk, gn, width),
-                (k, n, lds_gemv_width(&split_caps)),
-                "one body per shape"
-            );
-        }
-        for dispatch in plan.dispatches() {
-            let (_, _, _, elems, offset) = gemv_chunk(dispatch);
-            assert_eq!(offset, covered, "ranges tile the output in order");
-            covered += elems;
-        }
-        assert_eq!(covered, out_numel, "the ranges cover the whole output");
-
-        let got = run_plan(&plan, &x, &w, out_numel);
-        let whole = run_plan(&unsplit, &x, &w, out_numel);
-        assert_eq!(
-            bits(&got),
-            bits(&whole),
-            "B={batch} N={n}: split vs unsplit"
-        );
-        assert_close(
-            &got,
-            &matmul_oracle(batch, 1, k, n, &x, &w, true),
-            &format!("B={batch} N={n}"),
-        );
-    }
-}
-
-/// The decode GEMV's planned grid is the one fold the body's `col = GroupY * x_groups + GroupX` reads: X fills
-/// to the device's cap and the rest spills onto Y, one workgroup of `lds_gemv_width` lanes per output element.
-///
-/// Mutation: in `ContractionSpec::GemvChunk`'s `generate` arm, launch `[x * width, 1, 1]` (drop the Y spill);
-/// N = 237 on a 50-wide grid plans a grid of one row and the assertion names the planned grid.
-#[test]
-fn decode_gemv_grid_spills_onto_y_past_the_x_cap() {
-    let caps = DeviceCaps {
-        watchdog_budget: None,
-        ..watchdog_caps(50, u64::MAX)
-    };
-    for n in [1usize, 49, 50, 51, 237] {
-        let plan = matmul_plan(&[1, 1, 8], &[8, n], Backend::SpirvVulkan, &caps);
-        let x_groups = n.clamp(1, 50);
-        assert_eq!(
-            plan.single().expect("one dispatch").launch().grid,
-            [
-                (x_groups * lds_gemv_width(&caps)) as u32,
-                n.div_ceil(x_groups) as u32,
-                1
-            ],
-            "planned grid for N={n}"
-        );
-        let x = fill(3, 8);
-        let w = fill(4, 8 * n);
-        assert_close(
-            &run_plan(&plan, &x, &w, n),
-            &matmul_oracle(1, 1, 8, n, &x, &w, true),
-            &format!("N={n}"),
-        );
     }
 }
 

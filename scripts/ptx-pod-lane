@@ -16,6 +16,8 @@
 # --two-gpu rents a two-GPU pod and runs `test-device-ptx-2gpu` (the justfile's multi-device selection without the
 # four-way row, POOT_REQUIRE_PTX_2GPU=1) in place of the single-device lane, then its required-case gate; it excludes
 # the other modes. PTX_POD_MAX_PRICE then bounds the whole pod's hourly price.
+# --calibrate also ships the `calibrate_launch` example and runs `scripts/calibrate-launch ptx` (tilings, indexed, gemv) on
+# the pod before the device lane, and brings the raw rows and fitted entries back as calibrate/ (POOT-1490).
 # --no-device-lane runs only the checkpoint rows (no `test-device-ptx`, kernelgen emit, ptx-check or gate).
 #
 # The pod has no `just`, cargo or python, so this driver builds everything here and ships it:
@@ -46,6 +48,7 @@ max_cmd=${PTX_POD_MAX_CMD:-3h}
 work=${PTX_POD_WORK:-target/ptx-pod-lane}
 disk_gb=${PTX_POD_DISK_GB:-40}
 passes=3
+calibrate=
 speed_model=
 two_gpu=
 bank_cases=()
@@ -59,6 +62,7 @@ while [ $# -gt 0 ]; do
     --models) models=$2; shift 2 ;;
     --checkpoint-filter) checkpoint_filter=$2; shift 2 ;;
     --speed) speed_model=$2; shift 2 ;;
+    --calibrate) calibrate=1; shift ;;
     --two-gpu) two_gpu=1; device_lane=; shift ;;
     --no-device-lane) device_lane=; shift ;;
     *) echo "usage: $0 [--bank-case ID]... [--passes N] [--models MANIFEST --checkpoint-filter FILTERSET] [--speed MODEL] [--no-device-lane]" >&2; exit 2 ;;
@@ -67,12 +71,12 @@ done
 if { [ -n "$models" ] && [ -z "$checkpoint_filter" ]; } || { [ -z "$models" ] && [ -n "$checkpoint_filter" ]; }; then
   echo "--models and --checkpoint-filter go together" >&2; exit 2
 fi
-if [ -n "$two_gpu" ] && { [ -n "$models" ] || [ -n "$speed_model" ] || [ ${#bank_cases[@]} -gt 0 ]; }; then
-  echo "--two-gpu excludes --models, --speed and --bank-case" >&2; exit 2
+if [ -n "$two_gpu" ] && { [ -n "$models" ] || [ -n "$speed_model" ] || [ -n "$calibrate" ] || [ ${#bank_cases[@]} -gt 0 ]; }; then
+  echo "--two-gpu excludes --models, --speed, --calibrate and --bank-case" >&2; exit 2
 fi
 if [ -n "$speed_model" ] && [ -z "$models" ]; then echo "--speed needs --models" >&2; exit 2; fi
-if [ -z "$device_lane" ] && [ -z "$checkpoint_filter" ] && [ -z "$speed_model" ] && [ -z "$two_gpu" ]; then
-  echo "--no-device-lane needs --checkpoint-filter: nothing would run" >&2; exit 2
+if [ -z "$device_lane" ] && [ -z "$checkpoint_filter" ] && [ -z "$speed_model" ] && [ -z "$two_gpu" ] && [ -z "$calibrate" ]; then
+  echo "--no-device-lane needs --checkpoint-filter or --calibrate: nothing would run" >&2; exit 2
 fi
 
 results=target/nextest/device-ptx/results.xml
@@ -130,6 +134,13 @@ if [ -n "$speed_model" ]; then
   chmod u+w "$work/poot-bench-runner"; patch_elf "$work/poot-bench-runner"
 fi
 
+# 3c. the launch calibration example
+if [ -n "$calibrate" ]; then
+  RUSTC_WRAPPER= cargo build --release -p poot-ptx-device --example calibrate_launch
+  cp "${CARGO_TARGET_DIR:-target}/release/examples/calibrate_launch" "$work/calibrate_launch"
+  chmod u+w "$work/calibrate_launch"; patch_elf "$work/calibrate_launch"
+fi
+
 # 4. the toolchain closure, at its own store paths
 rust=$(dirname "$(dirname "$(readlink -f "$(command -v rustc)")")")
 nix-store -qR "$rust" | sed 's|^/||' | tar -C / -czf "$work/toolchain.tar.gz" -T -
@@ -163,6 +174,7 @@ if [ -n "$models" ]; then
   uploads+=(--upload "$work/models.tar.gz:/root/models.tar.gz" --upload "$work/models.tsv:/root/models.tsv"
     --upload "$work/checkpoint-filter.txt:/root/checkpoint-filter.txt")
 fi
+if [ -n "$calibrate" ]; then uploads+=(--upload "$work/calibrate_launch:/root/calibrate_launch"); fi
 if [ -n "$speed_model" ]; then
   printf '%s\n' "$speed_model" > "$work/speed-model"
   uploads+=(--upload "$work/poot-bench-runner:/root/poot-bench-runner" --upload "$work/speed-model:/root/speed-model")
@@ -179,6 +191,7 @@ cargo run -q --release -p poot-orchestrator -- exec --image ghcr.io/kikijiki/poo
 extract() { sed -n "/===$1-BEGIN===/,/===$1-END===/p" "$work/exec.log" | sed '1d;$d'; }
 if [ ${#bank_cases[@]} -gt 0 ]; then mkdir -p "$work/bank"; extract BANK | base64 -d | tar -C "$work/bank" -xzf -; fi
 status=0
+if [ -n "$calibrate" ]; then mkdir -p "$work/calibrate"; extract CALIBRATE | base64 -d | tar -C "$work/calibrate" -xzf -; fi
 if [ -n "$speed_model" ]; then mkdir -p "$work/speed"; extract SPEED | base64 -d | tar -C "$work/speed" -xzf -; fi
 if [ -n "$models" ]; then
   mkdir -p "$(dirname "$checkpoint_results")"

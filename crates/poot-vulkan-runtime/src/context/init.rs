@@ -372,7 +372,6 @@ impl Context {
             rounding_conversions: poot_target::RoundingConversions::NONE,
             widens_bf16_decode_weight: false,
             peer_transport: false,
-            decode_gemv_max_out_cols: None,
             perf_calibration,
         };
 

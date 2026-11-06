@@ -33,7 +33,7 @@ use poot_graph_ir::{
     BinOp, Builder, Graph, OpKind, PackedSourceName, Slot, StateRole, TensorType, ValueId,
 };
 use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
-use poot_graph_plan::{CompileOptions, Target, compile};
+use poot_graph_plan::{CompileOptions, IndexedRows, Target, compile};
 use poot_ptx_device::PtxDevice;
 use poot_quant::format::{GroupMap, WeightFormat};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -402,7 +402,9 @@ fn packed_prefill_through_serving_path_is_bit_exact_on_ptx() {
 
 const EXPERTS: usize = 3;
 const ROWS: usize = 5;
-/// Rows past `INDEXED_GEMV_MAX_ROWS` (32), so an indexed contraction of them runs the register-tiled schedule over the grouped rows.
+/// Rows an indexed contraction runs pinned to the register-tiled schedule over the grouped rows
+/// ([`IndexedRows::Grouped`]): the cost model decides the boundary at the dimensions it is given, and these tiny ones
+/// are a Gemv's, so a row about the grouped kernel names it.
 const PREFILL_ROWS: usize = 70;
 const PREFILL_OUT: usize = 11;
 /// Row `m` routed to expert `(2m + 1) % EXPERTS`: every window of rows holds all the experts.
@@ -545,6 +547,7 @@ fn run_indexed_case(
     (rows, out, k): (usize, usize, usize),
     expert_of: fn(usize) -> usize,
     buffers: StackBuffers,
+    indexed_rows: IndexedRows,
 ) {
     let owners: Vec<Arc<PackedPayload>> = (0..experts)
         .map(|e| {
@@ -596,7 +599,7 @@ fn run_indexed_case(
     let selected: Vec<i32> = (0..rows).map(|m| expert_of(m) as i32).collect();
     inputs.insert(ids.id(), HostTensor::i32(vec![rows], selected).into());
     let target = poot_executor::Device::target(&*ptx);
-    let got = common::run_resident_prepared(ptx, &graph, &inputs, |named| {
+    let got = common::run_resident_prepared(ptx, &graph, &inputs, Some(indexed_rows), |named| {
         buffers.graph(named, target, table.descriptor)
     });
     // Only the routed experts are decoded: a stack past 512 MiB must not cost a host decode of every expert.
@@ -632,6 +635,7 @@ fn packed_indexed_contraction_runs_bit_exact_on_ptx() {
             (ROWS, OUT, K),
             interleaved,
             StackBuffers::One,
+            IndexedRows::Gemv,
         );
     }
 }
@@ -655,6 +659,7 @@ fn a_split_expert_stack_runs_bit_exact_on_ptx() {
             (ROWS, 2, K),
             interleaved,
             StackBuffers::Split,
+            IndexedRows::Gemv,
         );
     }
 }
@@ -675,6 +680,7 @@ fn a_stack_past_512_mib_runs_whole_and_bit_exact_on_ptx() {
         (3, 4096, 8192),
         across_the_wide_table,
         StackBuffers::One,
+        IndexedRows::Gemv,
     );
 }
 
@@ -694,6 +700,7 @@ fn an_unaligned_expert_slab_table_runs_bit_exact_on_ptx() {
         (ROWS, 3, 32),
         interleaved,
         StackBuffers::One,
+        IndexedRows::Gemv,
     );
 }
 
@@ -715,6 +722,7 @@ fn packed_indexed_prefill_runs_bit_exact_on_ptx() {
             (PREFILL_ROWS, PREFILL_OUT, K),
             gapped,
             StackBuffers::One,
+            IndexedRows::Grouped,
         );
     }
 }
@@ -736,6 +744,7 @@ fn packed_indexed_prefill_above_the_gemv_grid_limit_runs_bit_exact_on_ptx() {
         (GRID_LIMIT_ROWS, GRID_LIMIT_OUT, 64),
         gapped,
         StackBuffers::One,
+        IndexedRows::Grouped,
     );
 }
 

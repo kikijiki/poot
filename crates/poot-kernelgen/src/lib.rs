@@ -88,7 +88,7 @@ pub use fp8::{e4m3fn_packed_to_f32, f32_to_e4m3fn_packed};
 pub use fused::{
     fused, fused_i32_views_grid, fused_i32_views_grid_pack, fused_row_parallel_views, fused_views,
 };
-pub use gemv::{attn_scores_v_gemv_lds, gemv_lds};
+pub use gemv::attn_scores_v_gemv_lds;
 pub use matmul::{matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid};
 pub use packed::{PackedRunSharing, packed_kernel, packed_run_sharing, packed_value_bits};
 pub use reduce::reduce_last_dt;

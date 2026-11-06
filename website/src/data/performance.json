@@ -203,9 +203,9 @@
      "regime": "dense bandwidth decode",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 298.228,
-      "median": 293.038,
-      "min": 283.951,
+      "max": 122.8,
+      "median": 112.541,
+      "min": 101.991,
       "n": 9
      },
      "storage": "f32"
@@ -224,9 +224,9 @@
      "regime": "dense bandwidth decode",
      "series": "poot (wgpu)",
      "step_us": {
-      "max": 360.074,
-      "median": 314.098,
-      "min": 305.502,
+      "max": 235.872,
+      "median": 210.464,
+      "min": 202.78,
       "n": 9
      },
      "storage": "f32"
@@ -4897,27 +4897,6 @@
       "max": 181.493,
       "median": 177.456,
       "min": 176.014,
-      "n": 9
-     },
-     "storage": "f32"
-    },
-    {
-     "backend": "ptx",
-     "case": "dense-decode-gemv",
-     "dimensions": {
-      "k": 2048,
-      "m": 1,
-      "n": 2048
-     },
-     "driver": "595.91.07",
-     "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/ptx/dense-decode-gemv.json",
-     "regime": "dense bandwidth decode",
-     "series": "poot (PTX)",
-     "step_us": {
-      "max": 56.004,
-      "median": 55.393,
-      "min": 55.203,
       "n": 9
      },
      "storage": "f32"

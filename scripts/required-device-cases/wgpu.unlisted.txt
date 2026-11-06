@@ -167,9 +167,7 @@ poot-wgpu-device::graph	gemm::batched_tiled_gemm_random_shapes_gpu_matches_cpu	w
 poot-wgpu-device::graph	gemm::chunked_large_tiled_gemm_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	gemm::concat_n_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	gemm::concat_n_rank4_axis2_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
-poot-wgpu-device::graph	gemm::decode_gemv_chunked_at_bloom_lm_head_n_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	gemm::large_elementwise_readback_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
-poot-wgpu-device::graph	gemm::lm_head_gemv_2d_grid_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	gemm::nvptx_prefill_tiled_gemm_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	gemm::rank4_batched_tiled_gemm_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	gemm::synthesized_tiled_gemm_choice_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
@@ -192,9 +190,6 @@ poot-wgpu-device::graph	norms_rope::layernorm_gpu_matches_cpu	wgpu graph-executi
 poot-wgpu-device::graph	norms_rope::log_and_softplus_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	norms_rope::rmsnorm_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	norms_rope::rope_fused_gpu_matches_cpu_decomposition	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
-poot-wgpu-device::graph	packed_kv::batched_decode_gemv_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
-poot-wgpu-device::graph	packed_kv::decode_gemv_random_shapes_gpu_matches_cpu	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
-poot-wgpu-device::graph	packed_kv::nvptx_decode_gemv_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	plan_selection::concat2_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	plan_selection::dyn_update_slice_dynamic_gpu_matches_static	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun
 poot-wgpu-device::graph	plan_selection::dyn_update_slice_plan_selection	wgpu graph-execution row, device output against the CPU oracle; selected by package so none goes unrun

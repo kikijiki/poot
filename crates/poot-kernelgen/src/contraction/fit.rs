@@ -3,13 +3,14 @@
 //! ratios once the unit of time is left free, so a measured time per tiling regresses on the terms directly.
 
 use super::CostTerms;
-use poot_target::calibration::CostRatios;
 
 /// The ratios fitted to a set of measured tilings, and how well the model follows the measurements under them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CostFit {
-    /// The fitted ratios, in FMA issues (the unit).
-    pub ratios: CostRatios,
+    /// The fitted [`CostRatios::lds_read`], in FMA issues (the unit).
+    pub lds_read: f64,
+    /// The fitted [`CostRatios::staged_value`].
+    pub staged_value: f64,
     /// The time one FMA issue of the model takes on this device, in the unit of the samples.
     pub seconds_per_fma: f64,
     /// The fraction of the samples' variance (about their mean) the fitted model explains: 1 is a perfect fit.
@@ -80,10 +81,8 @@ pub fn fit_cost_ratios(samples: &[(CostTerms, f64)]) -> Option<CostFit> {
         total += (time - mean).powi(2);
     }
     Some(CostFit {
-        ratios: CostRatios {
-            lds_read: lds / fma,
-            staged_value: staged / fma,
-        },
+        lds_read: lds / fma,
+        staged_value: staged / fma,
         seconds_per_fma: fma,
         r_squared: if total > 0.0 {
             1.0 - residual / total
@@ -96,6 +95,7 @@ pub fn fit_cost_ratios(samples: &[(CostTerms, f64)]) -> Option<CostFit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use poot_target::calibration::CostRatios;
 
     /// A tiling's terms for tile `(rows, cols)` of `lanes` lanes over `tiles` tiles on a `device_lanes` device:
     /// the scalar-tile arithmetic of `RegisterTiling::cost_terms`.
@@ -104,6 +104,7 @@ mod tests {
             fma: rows * cols,
             lds_reads: rows + cols,
             staged_per_lane: (rows * 8.0 + cols * 8.0) / lanes,
+            direct_per_lane: 0.0,
             rounding: 0.0,
             occupancy: (tiles * lanes / device_lanes).max(1.0),
         }
@@ -127,14 +128,15 @@ mod tests {
         let truth = CostRatios {
             lds_read: 1.7,
             staged_value: 5.2,
+            direct_value: 4.0,
         };
         let samples: Vec<_> = corpus()
             .into_iter()
             .map(|t| (t, t.modelled_time(truth) * 3.5e-9))
             .collect();
         let fit = fit_cost_ratios(&samples).expect("a determined fit");
-        assert!((fit.ratios.lds_read - 1.7).abs() < 1e-9, "{fit:?}");
-        assert!((fit.ratios.staged_value - 5.2).abs() < 1e-9, "{fit:?}");
+        assert!((fit.lds_read - 1.7).abs() < 1e-9, "{fit:?}");
+        assert!((fit.staged_value - 5.2).abs() < 1e-9, "{fit:?}");
         assert!((fit.seconds_per_fma - 3.5e-9).abs() < 1e-18, "{fit:?}");
         assert!(fit.r_squared > 1.0 - 1e-12, "{fit:?}");
     }

@@ -101,6 +101,12 @@ pub(crate) struct Operands {
     /// The register tiling every tiled contraction of the case must run ([`CompileOptions::tiling_pin`]); `None` lets
     /// the cost model choose, as every bank case does. Only `calibrate-launch` sets it.
     pub(crate) tiling: Option<RegisterTiling>,
+    /// How every per-row indexed contraction of the case must run ([`CompileOptions::indexed_rows_pin`]); `None`
+    /// lets the cost model choose. Only `calibrate-launch` sets it.
+    pub(crate) indexed_rows: Option<poot_graph_plan::IndexedRows>,
+    /// The columns per workgroup every dense decode Gemv of the case must launch ([`CompileOptions::gemv_cols_pin`]);
+    /// `None` lets the device's columns table choose. Only `calibrate-launch` sets it.
+    pub(crate) gemv_cols: Option<u32>,
 }
 
 impl Operands {
@@ -117,6 +123,8 @@ impl Operands {
         Ok(Self {
             narrow,
             tiling: None,
+            indexed_rows: None,
+            gemv_cols: None,
         })
     }
 
@@ -377,17 +385,21 @@ fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
     })
 }
 
-/// A dense contraction over a checkpoint-order `[N, K]` BF16 weight, in the form a model's `linear` traces
+/// A dense contraction over a checkpoint-order `[N, K]` F32 or BF16 weight, in the form a model's `linear` traces
 /// (`MatMul(x, Transpose(w))`, which compile folds into one `DenseContraction` reading `w` as stored). The
-/// f32 activation `x` is `[M, K]`. Each weight is the fixture's f32 draw truncated to its top 16 bits, so the
-/// stored BF16 value is exact and the reference reads it back by the same bit shift, with no engine code.
+/// f32 activation `x` is `[M, K]`. An F32 weight is the fixture's draw; a BF16 weight is the draw truncated to its
+/// top 16 bits, so the stored BF16 value is exact and the reference reads it back by the same bit shift, with no
+/// engine code.
 fn dense_contraction(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String> {
     let shape = &case["shape"];
     let (m, k, n) = (dim(shape, "m")?, dim(shape, "k")?, dim(shape, "n")?);
-    if case["storage"] != "bf16" || case["layout"] != "nk" {
-        return Err("dense_contraction measures a bf16 [N, K] weight".into());
-    }
-    let copies = weight_copies(bank, case, n * k * 2)?;
+    let bf16 = match (case["storage"].as_str(), case["layout"].as_str()) {
+        (Some("bf16"), Some("nk")) => true,
+        (Some("f32"), Some("nk")) => false,
+        _ => return Err("dense_contraction measures an f32 or bf16 [N, K] weight".into()),
+    };
+    let element_bytes = if bf16 { 2 } else { 4 };
+    let copies = weight_copies(bank, case, n * k * element_bytes)?;
     let mut stream = SplitMix64(
         bank["token_fixtures"][case["token_fixture"].as_str().unwrap()]["seed"]
             .as_u64()
@@ -398,15 +410,18 @@ fn dense_contraction(bank: &Value, case: &Value, ops: Operands) -> Result<Prepar
     let mut consts = vec![("x".to_string(), HostTensor::f32(vec![m, k], x.clone()))];
     let (mut graphs, mut references) = (Vec::new(), Vec::new());
     for copy in 0..copies {
-        let words: Vec<u16> = stream
-            .tensor(n * k)
-            .into_iter()
-            .map(|v| (v.to_bits() >> 16) as u16)
-            .collect();
-        let w: Vec<f64> = words
-            .iter()
-            .map(|&bits| ops.round(f32::from_bits(u32::from(bits) << 16)))
-            .collect();
+        let draw = stream.tensor(n * k);
+        let (stored, w): (HostTensor, Vec<f64>) = if bf16 {
+            let words: Vec<u16> = draw.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+            let w = words
+                .iter()
+                .map(|&bits| ops.round(f32::from_bits(u32::from(bits) << 16)))
+                .collect();
+            (HostTensor::bf16(vec![n, k], words), w)
+        } else {
+            let w = draw.iter().map(|&v| ops.round(v)).collect();
+            (HostTensor::f32(vec![n, k], draw), w)
+        };
         let mut want = vec![0.0f64; m * n];
         for row in 0..m {
             let xs = &x_read[row * k..(row + 1) * k];
@@ -422,12 +437,17 @@ fn dense_contraction(bank: &Value, case: &Value, ops: Operands) -> Result<Prepar
         let name = format!("w{copy}");
         let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
         let xi = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
+        let dtype = if bf16 {
+            poot_tensor::DType::BF16
+        } else {
+            poot_tensor::DType::F32
+        };
         let wi = b
-            .constant(&name, TensorType::new(vec![n, k], poot_tensor::DType::BF16))
+            .constant(&name, TensorType::new(vec![n, k], dtype))
             .unwrap();
         let y = b.matmul(xi, b.transpose(wi, vec![1, 0]).unwrap()).unwrap();
         graphs.push(b.finish(y).unwrap());
-        consts.push((name, HostTensor::bf16(vec![n, k], words)));
+        consts.push((name, stored));
     }
     Ok(Prepared {
         graphs,
@@ -437,10 +457,10 @@ fn dense_contraction(bank: &Value, case: &Value, ops: Operands) -> Result<Prepar
         slots: Vec::new(),
         observed: json!({
             "shape": { "m": m, "k": k, "n": n },
-            "storage": "bf16",
+            "storage": case["storage"].clone(),
             "layout": "nk",
             "weight_copies": copies,
-            "weight_bytes_per_copy": n * k * 2,
+            "weight_bytes_per_copy": n * k * element_bytes,
         }),
     })
 }
@@ -515,17 +535,28 @@ fn grouped_experts(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared
             }
         };
         let mut want = vec![0.0f64; rows * n];
-        for row in 0..rows {
-            let (e, token) = (ids[row] as usize, row / top_k);
-            let xs = &x_read[token * k..(token + 1) * k];
-            for (col, acc) in want[row * n..(row + 1) * n].iter_mut().enumerate() {
-                *acc = xs
-                    .iter()
-                    .enumerate()
-                    .map(|(kk, &a)| a * w_read[at(e, kk, col)])
-                    .sum();
+        // The rows are independent dot products: spread them over the host's threads, the reference being the
+        // slowest part of a large routed case.
+        let per_thread = rows.div_ceil(std::thread::available_parallelism().map_or(1, usize::from));
+        std::thread::scope(|scope| {
+            for (chunk, out) in want.chunks_mut(per_thread * n).enumerate() {
+                let (ids, x_read, w_read, at) = (&ids, &x_read, &w_read, &at);
+                scope.spawn(move || {
+                    for (offset, row_out) in out.chunks_mut(n).enumerate() {
+                        let row = chunk * per_thread + offset;
+                        let (e, token) = (ids[row] as usize, row / top_k);
+                        let xs = &x_read[token * k..(token + 1) * k];
+                        for (col, acc) in row_out.iter_mut().enumerate() {
+                            *acc = xs
+                                .iter()
+                                .enumerate()
+                                .map(|(kk, &a)| a * w_read[at(e, kk, col)])
+                                .sum();
+                        }
+                    }
+                });
             }
-        }
+        });
         references.push(want);
         let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
         // The routed rows as the MoE block traces them: each token's row broadcast over its `top_k` slots.
@@ -997,6 +1028,8 @@ pub(crate) fn staged(g: &Graph, target: Target, ops: Operands) -> Result<StagedP
     let mut options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
         .with_matmul_precision(ops.policy());
     options.tiling_pin = ops.tiling;
+    options.indexed_rows_pin = ops.indexed_rows;
+    options.gemv_cols_pin = ops.gemv_cols;
     compile_staged(
         &g.clone(),
         &TargetSet::single(DeviceId(0), target),
@@ -1109,9 +1142,12 @@ where
             .step(exe, entry, &inputs, &mut NoSync)
             .map_err(|e| format!("step: {e}"))?;
         let device_us = match outputs.device_time() {
+            // The sum of the dispatches' own durations where the device times each; else the span of the step's replay
+            // (PTX brackets a captured graph with an event pair and has no per-dispatch time inside it).
             DeviceTime::Measured(measured) => measured
                 .sum_of_dispatch_durations
-                .map(|sum| sum.as_secs_f64() * 1e6),
+                .or(measured.device_span)
+                .map(|time| time.as_secs_f64() * 1e6),
             DeviceTime::Unknown => None,
         };
         let output = outputs.to_host().map_err(|e| format!("read: {e}"))?;

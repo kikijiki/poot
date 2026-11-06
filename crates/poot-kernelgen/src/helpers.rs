@@ -37,7 +37,7 @@ pub(crate) fn lds_tree_block_count(w: usize) -> u32 {
     3 * lds_tree_rounds(w).len() as u32
 }
 
-/// Emits the unrolled log2-tree LDS combine shared by `gemv_lds`, `attn_scores_v_gemv_lds`, and the
+/// Emits the unrolled log2-tree LDS combine shared by `attn_scores_v_gemv_lds` and the
 /// `dequant_gemv_lds_*`/`indexed_dequant_gemv_lds_q6k` family. Precondition: the caller has already emitted
 /// `WorkgroupLocalWrite(LDS[lane], partial)` + a `Barrier` targeting `round_start`. Each round is an
 /// if/then-merge diamond (guard: `lane < thresh` -> combine, else straight to the barrier) followed by a

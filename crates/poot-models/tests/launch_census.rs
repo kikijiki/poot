@@ -13,8 +13,8 @@
 //! of it and lists every changed row in its landing note. A card that must not change plans leaves the diff empty
 //! on the targets it names.
 //!
-//! The census answers questions of the form "which request does this contraction reach": `rg gemv_chunk` over the
-//! file lists every equation the `[K, N]` decode GEMV serves.
+//! The census answers questions of the form "which request does this contraction reach": `rg dense_gemv` over the
+//! file lists every equation the dense decode Gemv serves.
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -167,59 +167,5 @@ fn the_launch_census_matches_the_checked_in_file() {
          the card's landing note.",
         path.display(),
         diff(&expected, &actual)
-    );
-}
-
-/// What reaches the `[K, N]` decode GEMV (`gemv_chunk`, the planner's `MatMulRoute::DecodeGemv`) over the fixture
-/// corpus, on every reference target: only a matmul whose `[K, N]` operand the graph computes, never a stored weight.
-/// Every model projection is `x @ w^T`, which `compile` folds into a dense `[N, K]` contraction, so a weight in
-/// `[K, N]` order has no consumer here. What is left is `glm53_flash`'s one-hot scatter of the block top-k's
-/// selection onto the experts (a `[blocks, experts]` matrix built from an iota compare, `M == 1` at decode); the
-/// real-dimension census (`real_dims.tsv`) holds no `gemv_chunk` row at all. A weight reaching the route, an
-/// unfolded transpose of one included, is the event this row names: it would need the folded form, not the
-/// `[K, N]` GEMV.
-///
-/// Mutation: make `fold_dense_contractions` skip an F32 weight (`continue` before the `[1, 0]` arm): the
-/// projections stay `matmul(x, transpose(w))`, the GEMV reads the transpose, and this row names the graph.
-#[test]
-fn the_k_by_n_decode_gemv_is_reached_only_by_a_computed_operand() {
-    let registry = poot_models::registry::Registry::builtin().expect("the builtin registry");
-    let options = targets::options();
-    let mut reached = 0usize;
-    for RefTarget { id, target, .. } in reference_targets() {
-        for row in corpus::corpus(&registry) {
-            let Ok(program) = targets::compile_production(&row.graph(), &target, &options) else {
-                continue;
-            };
-            for (_, _, stage) in program.stages() {
-                let eqns = stage.graph().eqns();
-                for (eqn, _) in stage.planned() {
-                    let KernelChoice::Generated(KernelRequest::Contraction(
-                        poot_kernelgen::ContractionSpec::GemvChunk { .. },
-                    )) = stage.kernel_choice(eqn)
-                    else {
-                        continue;
-                    };
-                    reached += 1;
-                    let Some(poot_graph_ir::Operand::Value(weight)) = eqn.inputs.get(1) else {
-                        panic!("{} on {id}: a GEMV matmul without a value weight", row.name);
-                    };
-                    let producer = eqns.iter().find(|producer| producer.out == *weight);
-                    assert!(
-                        producer.is_some_and(|producer| !matches!(
-                            producer.op,
-                            poot_graph_ir::OpKind::Transpose { .. }
-                        )),
-                        "{} on {id}: the [K, N] decode GEMV reads {weight}, produced by {:?}, not a computed matrix",
-                        row.name,
-                        producer.map(|producer| producer.op.name()),
-                    );
-                }
-            }
-        }
-    }
-    assert!(
-        reached > 0,
-        "no corpus matmul reached the decode GEMV, so this row proves nothing"
     );
 }

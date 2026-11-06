@@ -3,8 +3,8 @@
 //! [`poot_wgpu_runtime::KernelBuffer`] is raw, dtype-agnostic bytes, so an f16-encoded (2 bytes/elem) buffer
 //! dispatches through the same `Context::dispatch` every other kernelgen probe uses (see `tests/run.rs`'s
 //! `binary_mul`). `matmul_batched_dt(Ty::F16, ...)` is the dtype-generic serial matmul, the kernel a whole-graph
-//! F16 matmul equation lowers to once the `is_decode_gemv`/`is_tiled_gemm`/`is_tileable_matmul` f32-only fast
-//! paths are excluded (poot-graph-plan / poot-graph-ir transform tests cover that exclusion).
+//! F16 matmul equation lowers to once the `is_tileable_matmul` f32-only fast path is excluded (poot-graph-plan /
+//! poot-graph-ir transform tests cover that exclusion).
 //!
 //! Skips (passes) if no Vulkan adapter or `spirv-val` is absent, same convention as every other probe.
 

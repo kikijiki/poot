@@ -20,9 +20,7 @@ use poot_kernelgen::{
     CastSpec, ContractionSpec, DenseTiledContraction, DenseTiledWeight, FusedInput, FusedScalarOp,
     KernelRequest, LeafTy, PointwiseForm, PointwiseSpec, Schedule,
 };
-use poot_target::{
-    AmdArch, Backend, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps, Queried, TargetId, WatchdogBudget,
-};
+use poot_target::{AmdArch, Backend, DeviceCaps, Queried, TargetId};
 use poot_tensor::DType as GDt;
 use poot_test_util::device_caps::default_caps_for;
 use std::collections::HashMap;
@@ -180,12 +178,6 @@ fn planned_with_choice_caps(
 /// Whether a choice is the shipped kernel `kernel`.
 fn is_imported(choice: &KernelChoice, kernel: ImportedKernel) -> bool {
     matches!(choice, KernelChoice::Imported { kernel: k, .. } if *k == kernel)
-}
-
-/// Whether the choice is the generated decode GEMV (`kg::gemv_lds`): the one body every decode `[K, N]` GEMV
-/// runs, whole or split.
-fn is_decode_gemv(choice: &KernelChoice) -> bool {
-    matches!(contraction(choice), Some(ContractionSpec::GemvChunk { .. }))
 }
 
 /// The kernel choice for one equation. Tests assert on this record, never on the plan's opaque key.
@@ -2636,7 +2628,7 @@ fn attention_rank4_matmul_routes_through_batched_tiled_gemm() {
 fn decode_attn_scores_v_matmul_lowers_to_the_lds_gemv_kernel() {
     // Card 143 Lever 1b: decode `scores @ V` (M=1, Hq rows already GQA-repeat_kv-expanded on both
     // operands, cap=300 not a multiple of the LDS Gemv width 128) takes the LDS-parallel attn-scores-v GEMV on
-    // every backend that lowers WorkgroupLocalWrite/Barrier, like is_decode_gemv's M=1 gate.
+    // every backend that lowers WorkgroupLocalWrite/Barrier.
     let bld = Builder::for_tests();
     let probs = bld
         .constant("probs", TensorType::new(vec![1, 8, 1, 300], GDt::F32))
@@ -3693,11 +3685,6 @@ const LAUNCH_PROVENANCE: &[Provenance] = &[
         "design bound, not swept: a shorter chunk leaves a workgroup's lanes idle and the launch is the combine's overhead",
     ),
     prov(
-        "INDEXED_GEMV_MAX_ROWS",
-        32,
-        "design bound, not swept: a decode step's selected experts or a few steps batched; above it the register-tiled schedule over the grouped rows shares expert weight tiles",
-    ),
-    prov(
         "TILED_MAX_ROWS",
         128,
         "design bound, not swept: past 128 rows the query tile alone (128 x d words) exceeds a 64 KiB workgroup memory at d 128",
@@ -3772,7 +3759,6 @@ const ROUTED: (usize, usize, usize, usize) = (4096, 256, 1024, 2);
 /// `caps`, for the dense f32-stack form (`packed == false`) and the packed-stack form.
 fn indexed_lane_edge(backend: Backend, caps: &DeviceCaps, packed: bool) -> usize {
     let (rows, k, n, experts) = ROUTED;
-    assert!(rows > crate::predicates::INDEXED_GEMV_MAX_ROWS);
     let b = Builder::for_tests();
     let x = b
         .slot_named(
@@ -4603,127 +4589,6 @@ fn scatter_update_launches_over_source_rows_and_chunks_only_a_wide_prefill_on_wg
     );
 }
 
-/// Card 258: at BLOOM's tied-`lm_head` decode-GEMV scale (`M=1, K=1024, N=250880`, the shape that hung
-/// real hardware, over
-/// `DECODE_GEMV_CHUNK_TRIGGER`), the wgpu decode-GEMV plan must split into several dispatches
-/// (kernelgen `gemv_lds` with a baked `elem_offset`, not the fixed-signature imported kernel) covering
-/// disjoint, full-coverage output-column ranges, like `serial_kquant_dequant_plan` (card 163). gpt-oss's
-/// scale (`N=201088`, at/under the trigger) stays a single unchunked imported dispatch. AmdGcn (no display
-/// watchdog) stays a single imported dispatch even at BLOOM's shape; chunking is `Backend::SpirvVulkan`-only.
-#[test]
-fn decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape() {
-    let (k, n) = (1024usize, 250_880usize); // BLOOM-560m's real tied lm_head (hidden, vocab)
-    let g = matmul_graph(1, k, n, GDt::F32);
-    let eqn = g
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
-        .unwrap();
-    let out_shape = g.aval(eqn.out).shape.clone();
-    let out_numel = numel(&out_shape);
-    assert_eq!(out_numel, n);
-    assert!(
-        out_numel as u64 > DECODE_GEMV_CHUNK_TRIGGER,
-        "test fixture must exceed the chunk trigger"
-    );
-
-    let plan = plan_eqn(
-        &g,
-        eqn,
-        Backend::SpirvVulkan,
-        &default_caps_for(Backend::SpirvVulkan),
-        &crate::test_support::roomy_body_limits(),
-    )
-    .unwrap();
-    let chunks = plan.dispatches();
-    assert!(
-        chunks.len() > 1,
-        "BLOOM-scale wgpu decode-GEMV should split into >1 dispatch: {plan:?}"
-    );
-    // every chunk's workgroup count must clear the wgpu per-dim grid cap (chunk size is capped at
-    // caps.max_grid[0]; each chunk is a plain 1-D grid).
-    let grid_cap = default_caps_for(Backend::SpirvVulkan).max_grid[0] as usize;
-    let groups = |c: &Dispatch| c.launch().grid[0] as usize / c.body().workgroup_size[0] as usize;
-    for c in chunks {
-        assert!(groups(c) <= grid_cap, "chunk grid must clear the grid cap");
-        assert!(
-            c.launch().meta.is_empty(),
-            "a kernelgen chunk bakes its offset as a const, no meta buffer"
-        );
-    }
-    // chunks must be disjoint and fully cover out_numel (one workgroup per output element, so
-    // `groups` sums exactly to out_numel, with no workgroup-size rounding slack).
-    let covered: usize = chunks.iter().map(groups).sum();
-    assert_eq!(
-        covered, out_numel,
-        "chunks must exactly cover the full output"
-    );
-
-    // gpt-oss's scale (at/under the trigger) stays the single unchunked dispatch of the same body.
-    let (k2, n2) = (32usize, 201_088usize);
-    let g2 = matmul_graph(1, k2, n2, GDt::F32);
-    let eqn2 = g2
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
-        .unwrap();
-    match planned_with_choice(&g2, eqn2, Backend::SpirvVulkan).unwrap() {
-        (compute_plan, choice) if is_plain(&compute_plan) => {
-            assert!(is_decode_gemv(&choice), "{choice:?}")
-        }
-        other => panic!("gpt-oss-scale wgpu decode-GEMV should stay one dispatch: {other:?}"),
-    }
-
-    // AmdGcn has no display watchdog: stays the single unchunked dispatch even at BLOOM's
-    // large shape (chunking is SpirvVulkan-only, as in card 163).
-    let amdgcn = Backend::AmdGcn(AmdArch::gfx1151());
-    match planned_with_choice(&g, eqn, amdgcn).unwrap() {
-        (compute_plan, choice) if is_plain(&compute_plan) => {
-            assert!(is_decode_gemv(&choice), "{choice:?}")
-        }
-        other => panic!("AmdGcn decode-GEMV should stay one dispatch (no chunking): {other:?}"),
-    }
-}
-
-/// R486-013 / SC-006, POOT-1232 SC-001: the decode-GEMV is kept only below the device's measured width
-/// (`caps.decode_gemv_max_out_cols`), and the ceiling belongs to the caps, not to the backend. The NVPTX fixture
-/// carries the Ampere figure (256), so a 300-column decode projection plans the one-thread-per-output
-/// fallback there; the same backend with no measured ceiling keeps the coalesced GEMV, and the SPIR-V backend
-/// with the same ceiling drops it. Mutation: hard-code the 256 ceiling instead of reading the caps field: the
-/// NVPTX row without a ceiling (N=300) loses the GEMV (`assertion failed: gemv_at(Backend::Nvptx, None, 300)`).
-#[test]
-fn decode_gemv_width_ceiling_follows_the_caps_not_the_backend() {
-    let gemv_at = |backend: Backend, ceiling: Option<u32>, n: usize| {
-        let g = matmul_graph(1, 64, n, GDt::F32);
-        let eqn = g
-            .eqns()
-            .iter()
-            .find(|e| matches!(e.op, OpKind::MatMul { .. }))
-            .expect("a matmul eqn");
-        let caps = DeviceCaps {
-            decode_gemv_max_out_cols: ceiling,
-            ..default_caps_for(backend)
-        };
-        let (_, choice) = planned_with_choice_caps(&g, eqn, backend, &caps).unwrap();
-        eprintln!("{backend:?} N={n} ceiling={ceiling:?}: {choice:?}");
-        is_decode_gemv(&choice)
-    };
-    // The Ampere fixture: the boundary is inclusive.
-    assert!(
-        gemv_at(Backend::Nvptx, Some(256), 256),
-        "N=256 is at the ceiling"
-    );
-    assert!(
-        !gemv_at(Backend::Nvptx, Some(256), 300),
-        "N=300 is above it"
-    );
-    // No measured ceiling: the GEMV is kept at any width, on the backend that used to be special-cased.
-    assert!(gemv_at(Backend::Nvptx, None, 300));
-    // A ceiling on another backend applies the same way.
-    assert!(!gemv_at(Backend::SpirvVulkan, Some(256), 300));
-    assert!(gemv_at(Backend::SpirvVulkan, Some(256), 256));
-}
-
 /// POOT-1232 SC-001: whether an E4M3FN tensor has native storage is the device's `e4m3_storage`, not its
 /// backend. The ROCm backend with native E4M3FN storage admits the `ScatterUpdate` it refuses without, and the
 /// SPIR-V backend without it refuses by name. Mutation: gate on the backend again (`Backend::SpirvVulkan |
@@ -4823,61 +4688,6 @@ fn predicates_and_planner_do_not_compare_backend_variants() {
         "a planner rule keys on the backend name, not on device caps:\n{}",
         offenders.join("\n")
     );
-}
-
-/// Card 522 SC-002: the planner reads the display-watchdog chunk trigger from `DeviceCaps`, not from a
-/// backend-keyed constant. Two synthetic `DeviceCaps` for the same `Backend::SpirvVulkan`, differing
-/// only in `watchdog_budget.decode_gemv_out_elems`, plan the same decode-GEMV shape differently: the
-/// lower trigger chunks it, the higher trigger keeps it a single dispatch. At the baseline (this test,
-/// before any mutation) the two plans differ, proving the planner reads the caps value rather than
-/// ignoring it.
-#[test]
-fn decode_gemv_chunking_follows_the_caps_watchdog_trigger_not_a_fixed_constant() {
-    let (k, n) = (1024usize, 230_000usize); // between gpt-oss's 201088 and BLOOM's 250880
-    let g = matmul_graph(1, k, n, GDt::F32);
-    let eqn = g
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
-        .unwrap();
-    let out_shape = g.aval(eqn.out).shape.clone();
-    let out_numel = numel(&out_shape);
-    assert_eq!(out_numel, n);
-
-    let caps_for = |decode_gemv_out_elems: u64| DeviceCaps {
-        watchdog_budget: Some(WatchdogBudget {
-            decode_gemv_out_elems,
-            ..poot_test_util::device_caps::wgpu_rdna3_igpu()
-                .watchdog_budget
-                .unwrap()
-        }),
-        ..poot_test_util::device_caps::wgpu_rdna3_igpu()
-    };
-
-    // Low trigger (under this shape's 230_000 elements): chunks, like the BLOOM-scale case above.
-    let low = caps_for(100_000);
-    let chunked = plan_eqn(
-        &g,
-        eqn,
-        Backend::SpirvVulkan,
-        &low,
-        &crate::test_support::roomy_body_limits(),
-    )
-    .unwrap();
-    assert!(
-        chunked.dispatches().len() > 1,
-        "low watchdog trigger should chunk this shape: {chunked:?}"
-    );
-
-    // High trigger (over this shape's 230_000 elements): a single unchunked dispatch, even though this
-    // is the exact same backend and the exact same shape that chunked above.
-    let high = caps_for(1_000_000);
-    match planned_with_choice_caps(&g, eqn, Backend::SpirvVulkan, &high).unwrap() {
-        (compute_plan, choice) if is_plain(&compute_plan) => {
-            assert!(is_decode_gemv(&choice), "{choice:?}")
-        }
-        other => panic!("high watchdog trigger should stay a single dispatch: {other:?}"),
-    }
 }
 
 /// One attention equation to plan: `q[B,Hq,Lq,D]`, `k`/`v[B,Hq/n_rep,Lk,D]`, `mask[B,Hm,Lq,Lk]`.
@@ -6477,9 +6287,10 @@ fn dense_bf16_decode_gemv_selection_rows() {
         let out_shape = g.aval(eqn.out).shape.clone();
         let out_numel = numel(&out_shape);
         assert_eq!(out_numel, n, "M == 1: one row of {n} outputs");
-        let launch = dense_decode_gemv_in(eqn, &out_shape, out_numel, &caps).unwrap_or_else(|| {
-            panic!("{backend:?}: the dense Gemv must take the M == 1 contraction")
-        });
+        let launch =
+            dense_decode_gemv_in(eqn, &out_shape, out_numel, None, &caps).unwrap_or_else(|| {
+                panic!("{backend:?}: the dense Gemv must take the M == 1 contraction")
+            });
         assert_eq!(launch, gemv_launch(n, GemvFamily::Dense, &caps));
         let GemvLaunch { width, unroll, .. } = launch;
         // K = 32 and the 4-element run put every run on a 16-byte group: NVPTX reads them as vectors.
@@ -6537,7 +6348,7 @@ fn dense_bf16_decode_gemv_selection_rows() {
         let out_numel = numel(&out_shape);
         assert_eq!(out_numel, 2 * n, "M == 2: two rows of {n} outputs");
         assert_eq!(
-            dense_decode_gemv_in(eqn, &out_shape, out_numel, &default_caps_for(backend)),
+            dense_decode_gemv_in(eqn, &out_shape, out_numel, None, &default_caps_for(backend)),
             None,
             "{backend:?}: the Gemv is M == 1, so M > 1 must decline"
         );
@@ -6718,8 +6529,9 @@ fn bf16_projection_contraction_choice(
 /// checkpoint `[N, K]` order plans the generated dense Gemv on every backend. The same projection over a
 /// `[K, N]` weight is a typed `DtypeLowering` refusal on SPIR-V and ROCm (the retired column-tile body was its
 /// only lowering; a per-column Gemv over BF16 would read `[K, N]` at a stride of `N` per lane), and on NVPTX the
-/// weight is widened to f32 and the projection plans the f32 decode GEMV, never the BF16 dense Gemv. Mutation: in `dtype_widen::matmul_bf16_column_gemv` return `false`; the weight is widened by a
-/// Cast, the projection plans the f32 decode GEMV and this row goes red.
+/// weight is widened to f32 and the projection plans the f32 serial contraction, never the BF16 dense Gemv.
+/// Mutation: in `dtype_widen::matmul_bf16_column_gemv` return `false`; the weight is widened by a Cast, the
+/// projection plans the f32 serial contraction and this row goes red.
 #[test]
 fn a_k_by_n_bf16_decode_projection_is_refused_on_the_packed_lane_backends() {
     let (k, n) = (896, 256);
@@ -6746,7 +6558,7 @@ fn a_k_by_n_bf16_decode_projection_is_refused_on_the_packed_lane_backends() {
                 matches!(
                     kn,
                     KernelChoice::Generated(KernelRequest::Contraction(
-                        ContractionSpec::GemvChunk { .. }
+                        ContractionSpec::Serial { .. }
                     ))
                 ),
                 "{backend:?} [K, N]: {kn:?}"

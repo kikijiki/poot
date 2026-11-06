@@ -32,6 +32,15 @@ use poot_tensor::HostTensor;
 
 /// `g` staged for the executor contract against `target`.
 pub(crate) fn staged_program(g: &Graph, target: Target) -> StagedProgram {
+    staged_program_rows(g, target, None)
+}
+
+/// [`staged_program`] with every per-row indexed contraction pinned to `rows` (`None`: the cost model's choice).
+pub(crate) fn staged_program_rows(
+    g: &Graph,
+    target: Target,
+    rows: Option<poot_graph_plan::IndexedRows>,
+) -> StagedProgram {
     let g = g.clone();
     compile_staged(
         &g,
@@ -40,8 +49,11 @@ pub(crate) fn staged_program(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
-            .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact),
+        &CompileOptions {
+            indexed_rows_pin: rows,
+            ..CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(poot_graph_ir::MatmulPrecision::Exact)
+        },
     )
     .expect("stage ptx graph")
 }
@@ -190,7 +202,7 @@ pub(crate) fn run_resident_classed(
     g: &Graph,
     inputs: &HashMap<ValueId, Value>,
 ) -> (HostTensor, Tier2Class) {
-    run_prepared(device, g, inputs, Graph::clone)
+    run_prepared(device, g, inputs, None, Graph::clone)
 }
 
 /// [`run_resident`] over `prepare(named)`: the graph with its consts named by the weight map, rewritten by
@@ -199,20 +211,22 @@ pub(crate) fn run_resident_prepared(
     device: &mut PtxDevice,
     g: &Graph,
     inputs: &HashMap<ValueId, Value>,
+    rows: Option<poot_graph_plan::IndexedRows>,
     prepare: impl FnOnce(&Graph) -> Graph,
 ) -> HostTensor {
-    run_prepared(device, g, inputs, prepare).0
+    run_prepared(device, g, inputs, rows, prepare).0
 }
 
 fn run_prepared(
     device: &mut PtxDevice,
     g: &Graph,
     inputs: &HashMap<ValueId, Value>,
+    rows: Option<poot_graph_plan::IndexedRows>,
     prepare: impl FnOnce(&Graph) -> Graph,
 ) -> (HostTensor, Tier2Class) {
     let mut engine = poot_executor::Engine::new(PtxDeviceProxy(device));
     let (exe, named) = load_consts(&mut engine, g, inputs);
-    let staged = staged_program(&prepare(&named), Device::target(engine.device()));
+    let staged = staged_program_rows(&prepare(&named), Device::target(engine.device()), rows);
     let entry = engine.add_entry(exe, &staged).expect("add_entry");
     let bytes = engine
         .step(exe, entry, &slot_inputs(g, inputs), &mut NoSync)

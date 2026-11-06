@@ -955,33 +955,15 @@ mod tests {
         }
     }
 
-    /// A split plan with no dispatch has no choice to record. `Planned::split` refuses it as a typed
-    /// error, and the production splitters reach it with a zero-element output (no chunks to plan).
-    /// Mutation: have `split` return `Ok` with a default choice for an empty list; both rows go red.
+    /// A split plan with no dispatch has no choice to record: `Planned::split` refuses it as a typed
+    /// error (a splitter over a zero-element output has no chunks to plan).
+    /// Mutation: have `split` return `Ok` with a default choice for an empty list; the row goes red.
     #[test]
     fn an_empty_split_is_a_typed_refusal() {
         assert!(matches!(
             Planned::split(Vec::new()),
             Err(PlanError::BadShape(_))
         ));
-
-        let g = flash_decode_graph(8, 1.0);
-        let eqn = g.eqns().last().expect("the graph has an equation");
-        let backend = Backend::SpirvVulkan;
-        let site = Site::new(
-            (&g).into(),
-            eqn,
-            backend,
-            crate::test_support::roomy_body_limits(),
-        );
-        let planned = crate::predicates::gemv_chunks(
-            site,
-            backend,
-            0,
-            |_, _| unreachable!("a zero-element output plans no chunk"),
-            &default_caps_for(backend),
-        );
-        assert!(matches!(planned, Err(PlanError::BadShape(_))));
     }
 
     /// POOT-1115: a shipped template whose read param is mutable breaks the dispatch calling convention.

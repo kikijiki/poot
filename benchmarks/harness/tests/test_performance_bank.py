@@ -200,9 +200,9 @@ class ClaimTests(BankRoot):
 
     def test_a_missing_backend_marked_verified_without_a_receipt_is_refused(self):
         # A claim that names a receipt file the bank does not hold (here: a deleted one) is not coverage.
-        (self.root / self.entry("dense-decode-gemv", "ptx")["receipt"]).unlink()
+        (self.root / self.entry("batched-decode-gemm", "ptx")["receipt"]).unlink()
         errors = self.errors()
-        self.assertTrue(any("('dense-decode-gemv', 'ptx')" in e and "is not a file" in e for e in errors), errors)
+        self.assertTrue(any("('batched-decode-gemm', 'ptx')" in e and "is not a file" in e for e in errors), errors)
 
     def test_a_planned_case_cannot_be_verified_even_with_a_receipt(self):
         case, backend = self.first_verified()

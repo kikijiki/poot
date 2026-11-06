@@ -1,26 +1,67 @@
 #!/usr/bin/env bash
-# calibrate-launch: fit the register-tiled contraction cost model's ratios to this device's measured time and write
-# a PerfCalibration cost entry for review (design POOT-1479 section 3.4). One process per shape and pinned tiling (an
-# HSA executor cannot be reopened in a process); the whole batch holds the GPU lock and the heavy lock once, GPU lock first.
+# calibrate-launch: fit the contraction cost model's ratios to this device's measured time and write a PerfCalibration
+# cost entry for review (design POOT-1479 section 3.4). One process per measurement (an HSA executor cannot be reopened
+# in a process); the whole batch holds the GPU lock and the heavy lock once, GPU lock first.
 #
-#   scripts/calibrate-launch rocm|wgpu [out-dir]
+#   scripts/calibrate-launch rocm|wgpu tilings [out-dir]   the LDS-read and staged-value ratios, over every candidate
+#                                                          tiling of a dense corpus (POOT-1494)
+#   scripts/calibrate-launch rocm|wgpu indexed [out-dir]   the Gemv's direct-value and global-byte ratios, over the Gemv
+#                                                          and the grouped tiling of an indexed corpus (POOT-1489), and
+#                                                          the table of the production planner's choice against the
+#                                                          retired 32-row switch
+#   scripts/calibrate-launch rocm|wgpu|ptx gemv [out-dir]  the dense decode Gemv's columns per workgroup, every power of
+#                                                          two up to 16 pinned over output counts from a launch that
+#                                                          starves the device to one that floods it (POOT-1490)
+#
+# CALIBRATE_LAUNCH_BIN names a prebuilt example binary (the script then builds nothing), and CALIBRATE_LAUNCH_LOCKED=1
+# says the caller already holds the GPU lock and the heavy lock (gpu first), so one hold can cover several runs.
 set -euo pipefail
-backend="${1:?usage: calibrate-launch rocm|wgpu [out-dir]}"
-out="${2:-calibrate-launch-$backend}"
+backend="${1:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv [out-dir]}"
+mode="${2:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv [out-dir]}"
+out="${3:-calibrate-launch-$backend-$mode}"
 mkdir -p "$out"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 bank="$root/benchmarks/performance-bank/cases.json"
-cargo build --release -p "poot-$backend-device" --example calibrate_launch
-bin="${CARGO_TARGET_DIR:-$root/target}/release/examples/calibrate_launch"
+if [ -z "${CALIBRATE_LAUNCH_BIN:-}" ]; then
+  cargo build --release -p "poot-$backend-device" --example calibrate_launch
+fi
+bin="${CALIBRATE_LAUNCH_BIN:-${CARGO_TARGET_DIR:-$root/target}/release/examples/calibrate_launch}"
 device="${POOT_BANK_DEVICE:-$backend}"
 rows="$out/rows.tsv"
 : >"$rows"
-exec 9>/tmp/poot-gpu.lock
-flock 9
-exec 8>/tmp/poot-heavy.lock
-flock 8
-"$bin" shapes >"$out/tilings.tsv"
-while IFS=$'\t' read -r shape tiling; do
-  "$bin" measure --bank "$bank" --shape "$shape" --tiling "$tiling" >>"$rows"
-done <"$out/tilings.tsv"
-"$bin" fit --rows "$rows" --out "$out/entry.rs" --device "$device"
+if [ -z "${CALIBRATE_LAUNCH_LOCKED:-}" ]; then
+  exec 9>/tmp/poot-gpu.lock
+  flock 9
+  exec 8>/tmp/poot-heavy.lock
+  flock 8
+fi
+case "$mode" in
+tilings)
+  "$bin" shapes >"$out/tilings.tsv"
+  while IFS=$'\t' read -r shape tiling; do
+    "$bin" measure --bank "$bank" --shape "$shape" --tiling "$tiling" >>"$rows"
+  done <"$out/tilings.tsv"
+  "$bin" fit --rows "$rows" --out "$out/entry.rs" --device "$device"
+  ;;
+indexed)
+  "$bin" indexed-cells >"$out/cells.tsv"
+  while read -r cell; do
+    for pin in gemv grouped; do
+      "$bin" indexed-measure --bank "$bank" --cell "$cell" --rows "$pin" >>"$rows"
+    done
+  done <"$out/cells.tsv"
+  "$bin" indexed-choice >"$out/choices.tsv"
+  "$bin" indexed-fit --rows "$rows" --choices "$out/choices.tsv" --out "$out/entry.rs"
+  ;;
+gemv)
+  "$bin" gemv-cells >"$out/cells.tsv"
+  while IFS=$'\t' read -r cell cols; do
+    "$bin" gemv-measure --bank "$bank" --cell "$cell" --cols "$cols" >>"$rows"
+  done <"$out/cells.tsv"
+  "$bin" gemv-fit --rows "$rows" --out "$out/entry.rs"
+  ;;
+*)
+  echo "usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv [out-dir]" >&2
+  exit 2
+  ;;
+esac

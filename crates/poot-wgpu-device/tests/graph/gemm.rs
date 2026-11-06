@@ -3,8 +3,8 @@ use super::*;
 use poot_graph_plan::KernelChoice;
 use poot_kernelgen::{ContractionSpec, KernelRequest};
 
-// ADR-0113: a test checks the production kernel choice instead of calling the deleted test-only predicates
-// `is_decode_gemv`/`is_tiled_gemm`.
+// ADR-0113: a test checks the production kernel choice instead of calling the deleted test-only predicate
+// `is_tiled_gemm`.
 
 /// The register-tiled GEMM over an f32 `[K, N]` weight, the planner's choice for an M>1 F32 matmul against a
 /// rank-2 weight (Card 557).
@@ -12,16 +12,6 @@ fn is_generated_tiled_gemm(choice: &KernelChoice) -> bool {
     matches!(
         choice,
         KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(_)))
-    )
-}
-
-/// The decode GEMV: the generated `gemv_lds` body, whole or one range of a watchdog-split output.
-fn is_decode_gemv_kernel(choice: &KernelChoice) -> bool {
-    matches!(
-        choice,
-        KernelChoice::Generated(KernelRequest::Contraction(
-            ContractionSpec::GemvChunk { .. }
-        ))
     )
 }
 
@@ -214,134 +204,6 @@ fn large_elementwise_readback_matches_cpu() {
         .unwrap();
     let got = run_via_contract(&mut gpu, target, &g, &inp);
     assert_close(got.as_f32().unwrap(), cpu.as_f32().unwrap(), 1e-4);
-}
-
-#[test]
-fn lm_head_gemv_2d_grid_matches_cpu() {
-    // The decode GEMV lays its output over a 2-D workgroup grid (`col = GroupY*x_groups + GroupX`), so a large-vocab lm_head
-    // (out cols > the 65535 per-dim cap) uses the LDS-GEMV instead of the naive kernel. A [1,K] @ [K,N] projection with
-    // N > 65535 must lower GPU == CPU (exercising the Y-grid spill and over-dispatch tail guard).
-    use poot_graph_ir::op::OpKind;
-    let _gpu_guard = gpu_lock();
-    let Some((mut gpu, target)) = open_engine_or_skip() else {
-        return;
-    };
-    let (k, n) = (48usize, 70_000usize); // n > 65535 -> the grid spills onto Y
-    let b = Builder::for_tests();
-    let a = b.constant("a", TensorType::f32(vec![1, k])).unwrap();
-    let wt = b.constant("w", TensorType::f32(vec![k, n])).unwrap();
-    let out = b.matmul(a, wt).unwrap();
-    let g = b.finish(out).unwrap();
-    // sanity: this is the decode-GEMV path (M=1, rank-2 weight, large N).
-    let eqn = g
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
-        .unwrap();
-    let (plan, choice) = plan_eqn_with_choice(
-        &g,
-        eqn,
-        poot_target::Backend::SpirvVulkan,
-        &poot_test_util::device_caps::default_caps_for(poot_target::Backend::SpirvVulkan),
-    )
-    .unwrap();
-    assert!(
-        is_decode_gemv_kernel(&choice),
-        "large-N decode matmul should take the 2-D GEMV path, got {plan:?} / {choice:?}"
-    );
-    let r = |s: usize, num: usize| -> Vec<f32> {
-        (0..num)
-            .map(|i| ((i + s) as f32 * 0.001).sin() * 0.1)
-            .collect()
-    };
-    let mut inp = HashMap::new();
-    inp.insert(a.id(), HostTensor::f32(vec![1, k], r(1, k)));
-    inp.insert(wt.id(), HostTensor::f32(vec![k, n], r(7, k * n)));
-    let eval_inp: HashMap<_, Value> = inp
-        .iter()
-        .map(|(&id, t)| (id, Value::from(t.clone())))
-        .collect();
-    let cpu = eval(&g, &eval_inp, EvalOptions::default())
-        .unwrap()
-        .output
-        .into_host()
-        .unwrap();
-    let got = run_via_contract(&mut gpu, target, &g, &inp);
-    assert_eq!(got.shape(), vec![1, n]);
-    for (i, (a, c)) in got
-        .as_f32()
-        .unwrap()
-        .iter()
-        .zip(cpu.as_f32().unwrap())
-        .enumerate()
-    {
-        assert!(
-            (a - c).abs() < 1e-3,
-            "lm_head gemv elem {i}: gpu {a} vs cpu {c}"
-        );
-    }
-}
-
-#[test]
-fn decode_gemv_chunked_at_bloom_lm_head_n_matches_cpu() {
-    // Card 258: BLOOM's tied lm_head has `vocab=250880` (over `DECODE_GEMV_CHUNK_TRIGGER`), which hung real wgpu/RADV hardware
-    // at K=1024. This uses the real vocab (N=250880) with a
-    // small K (~32MB weight) to check the split-dispatch plan (`decode_gemv_plan`/`kernelgen::gemv_lds`'s
-    // `elem_offset`) bit-for-bit against the CPU oracle. N, not K, is the watchdog hazard axis, so it is safe to run
-    // unconditionally (unlike the `#[ignore]`d real-BLOOM-scale diagnostics in `cross_backend.rs`).
-    use poot_graph_ir::op::OpKind;
-    let _gpu_guard = gpu_lock();
-    let Some((mut gpu, target)) = open_engine_or_skip() else {
-        return;
-    };
-    let (k, n) = (32usize, 250_880usize); // BLOOM's real tied lm_head vocab, a small K
-    let b = Builder::for_tests();
-    let a = b.constant("a", TensorType::f32(vec![1, k])).unwrap();
-    let wt = b.constant("w", TensorType::f32(vec![k, n])).unwrap();
-    let out = b.matmul(a, wt).unwrap();
-    let g = b.finish(out).unwrap();
-    // sanity: this is the decode-GEMV path, over the chunk trigger - plan_eqn must actually take the new
-    // split-dispatch branch, not silently stay a single dispatch.
-    let eqn = g
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMul { .. }))
-        .unwrap();
-    let (plan, choice) = plan_eqn_with_choice(
-        &g,
-        eqn,
-        poot_target::Backend::SpirvVulkan,
-        &poot_test_util::device_caps::default_caps_for(poot_target::Backend::SpirvVulkan),
-    )
-    .unwrap();
-    assert!(
-        is_decode_gemv_kernel(&choice),
-        "large-N decode matmul should take the decode-GEMV path, got {plan:?} / {choice:?}"
-    );
-    assert!(
-        plan.dispatches().len() > 1,
-        "BLOOM-scale N should split into >1 watchdog-safety chunk, got {plan:?}"
-    );
-    let r = |s: usize, num: usize| -> Vec<f32> {
-        (0..num)
-            .map(|i| ((i + s) as f32 * 0.001).sin() * 0.1)
-            .collect()
-    };
-    let mut inp = HashMap::new();
-    inp.insert(a.id(), HostTensor::f32(vec![1, k], r(1, k)));
-    inp.insert(wt.id(), HostTensor::f32(vec![k, n], r(7, k * n)));
-    let eval_inp: HashMap<_, Value> = inp
-        .iter()
-        .map(|(&id, t)| (id, Value::from(t.clone())))
-        .collect();
-    let cpu = eval(&g, &eval_inp, EvalOptions::default())
-        .unwrap()
-        .output
-        .into_host()
-        .unwrap();
-    let got = run_via_contract(&mut gpu, target, &g, &inp);
-    assert_eq!(got.shape(), vec![1, n]);
-    assert_close(got.as_f32().unwrap(), cpu.as_f32().unwrap(), 1e-3);
 }
 
 #[test]
@@ -589,6 +451,21 @@ fn indexed_program(case: &IndexedCase, gate: Option<Vec<f32>>) -> IndexedProgram
     }
 }
 
+/// The policy an indexed program runs under: at these dimensions the cost model plans the Gemv at every row count, so
+/// the prefill programs (160 routed rows) pin the tiled schedule over the rows grouped by expert and the decode ones the
+/// Gemv (POOT-1489).
+fn indexed_policy(program: &IndexedProgram) -> poot_executor_parity::Policy {
+    let rows = program.graph.aval(program.graph.result()).shape[0];
+    poot_executor_parity::Policy::indexed(
+        if rows >= 160 {
+            poot_graph_plan::IndexedRows::Grouped
+        } else {
+            poot_graph_plan::IndexedRows::Gemv
+        },
+        poot_graph_ir::MatmulPrecision::Exact,
+    )
+}
+
 /// The CPU oracle over `program`.
 fn indexed_oracle(program: &IndexedProgram) -> Result<HostTensor, poot_eval::EvalError> {
     let eval_inputs: HashMap<_, Value> = program
@@ -622,7 +499,13 @@ fn indexed_matmul_matches_the_oracle_bit_for_bit() {
     for case in indexed_cases() {
         let program = indexed_program(&case, None);
         let want = indexed_oracle(&program).unwrap();
-        let got = run_via_contract(&mut gpu, target, &program.graph, &program.inputs);
+        let got = run_via_contract_under(
+            &mut gpu,
+            target,
+            &program.graph,
+            &program.inputs,
+            indexed_policy(&program),
+        );
         assert_eq!(got.shape(), vec![case.m, case.n], "{}", case.name);
         let (got_bits, want_bits) = (bits(&got), bits(&want));
         let wrong: Vec<usize> = (0..got_bits.len())
@@ -693,7 +576,13 @@ fn indexed_matmul_checkpoint_order_experts_match_the_oracle_bit_for_bit() {
             inputs,
         };
         let want = indexed_oracle(&program).unwrap();
-        let got = run_via_contract(&mut gpu, target, &program.graph, &program.inputs);
+        let got = run_via_contract_under(
+            &mut gpu,
+            target,
+            &program.graph,
+            &program.inputs,
+            indexed_policy(&program),
+        );
         let (got_bits, want_bits) = (bits(&got), bits(&want));
         if let Some(first) = (0..got_bits.len()).find(|&i| got_bits[i] != want_bits[i]) {
             failures.push(format!(
@@ -784,7 +673,13 @@ fn routed_gate_weighting_checkpoint_order_equals_the_oracle_bit_for_bit() {
             inputs,
         };
         let want = indexed_oracle(&program).unwrap();
-        let got = run_via_contract(&mut gpu, target, &program.graph, &program.inputs);
+        let got = run_via_contract_under(
+            &mut gpu,
+            target,
+            &program.graph,
+            &program.inputs,
+            indexed_policy(&program),
+        );
         assert_eq!(bits(&got), bits(&want), "M={m}");
     }
 }
@@ -868,7 +763,13 @@ fn indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit() {
                     inputs,
                 };
                 let want = indexed_oracle(&program).unwrap();
-                let got = run_via_contract(&mut gpu, target, &program.graph, &program.inputs);
+                let got = run_via_contract_under(
+                    &mut gpu,
+                    target,
+                    &program.graph,
+                    &program.inputs,
+                    indexed_policy(&program),
+                );
                 let (got_bits, want_bits) = (bits(&got), bits(&want));
                 if let Some(first) = (0..got_bits.len()).find(|&i| got_bits[i] != want_bits[i]) {
                     failures.push(format!(

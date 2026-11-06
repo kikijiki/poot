@@ -7,7 +7,7 @@
 use poot_graph_ir::op::{BinOp, ContractionHead, RedOp};
 use poot_graph_ir::{Builder, Graph, MatmulPrecision, OpKind, TensorType};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, KernelChoice, Plan, Program, Target, compile,
+    CompileLimits, CompileOptions, IndexedRows, KernelChoice, Plan, Program, Target, compile,
 };
 use poot_kernelgen::{ContractionSpec, IndexedContraction, KernelRequest, Schedule, WeightLayout};
 use poot_target::{AmdArch, Backend, BufferStorage, DeviceCaps};
@@ -36,13 +36,35 @@ fn target(backend: Backend) -> Target {
     }
 }
 
+/// The rows of the prefill shape these rows pin to the grouped tiling; every fewer is a decode shape.
+const PREFILL_ROWS: usize = 160;
+
+/// The schedule a row of `m` rows tests. At these dimensions (a few dozen wide) the cost model plans every row count
+/// as the Gemv, so a row about the Gemv or about the tiling of the rows grouped by expert names it
+/// (`CompileOptions::indexed_rows_pin`); where the model's boundary lies is `indexed_rows_choice.rs`'s question.
+fn schedule_for(m: usize) -> IndexedRows {
+    if m >= PREFILL_ROWS {
+        IndexedRows::Grouped
+    } else {
+        IndexedRows::Gemv
+    }
+}
+
 fn options() -> CompileOptions {
     CompileOptions::new(CompileLimits::STANDARD).with_matmul_precision(MatmulPrecision::Exact)
 }
 
-/// `g` compiled for `backend` through the full pipeline.
-fn program(g: &Graph, backend: Backend) -> Program {
-    compile(g, &target(backend), &options()).expect("the graph compiles")
+/// The options with every indexed contraction pinned to `rows`.
+fn pinned(rows: IndexedRows) -> CompileOptions {
+    CompileOptions {
+        indexed_rows_pin: Some(rows),
+        ..options()
+    }
+}
+
+/// `g` compiled for `backend` through the full pipeline, its indexed contraction pinned to `rows`.
+fn program(g: &Graph, backend: Backend, rows: IndexedRows) -> Program {
+    compile(g, &target(backend), &pinned(rows)).expect("the graph compiles")
 }
 
 /// `IndexedMatMul(x [m, K], w [E, K, N], ids [m])`, all f32; with `gate`, the product times `gate[m]` (`[m, 1]`
@@ -99,9 +121,10 @@ fn indexed_request(program: &Program) -> &IndexedContraction {
     }
 }
 
-/// SC-003: the decode shape (`M = 5`) plans `Schedule::Gemv` over the per-row ids on wgpu, ROCm and PTX, and the
-/// prefill shape (`M = 160`) the register-tiled schedule (exact operands) over the rows grouped by expert: one
-/// `ExpertGroup` whose block is the tiling's tile rows, and the grid's rows its padded positions (POOT-1451).
+/// SC-003: an indexed contraction pinned to the Gemv (`M = 5`) plans `Schedule::Gemv` over the per-row ids on wgpu,
+/// ROCm and PTX, and one pinned to the grouping (`M = 160`) the register-tiled schedule (exact operands) over the rows
+/// grouped by expert: one `ExpertGroup` whose block is the tiling's tile rows, and the grid's rows its padded
+/// positions (POOT-1451).
 ///
 /// Mutation: restore the `SpirvVulkan`-only condition on the Gemv choice (`indexed_gemv_in` gated on the backend);
 /// ROCm and PTX plan the register-tiled schedule at `M = 5` and the decode row goes red.
@@ -110,7 +133,7 @@ fn decode_shape_plans_the_gemv_on_every_backend_and_prefill_the_register_tiled_g
     for backend in backends() {
         for (m, gemv) in [(5, true), (160, false)] {
             let label = format!("{backend:?} M={m}");
-            let program = program(&indexed(m, false), backend);
+            let program = program(&indexed(m, false), backend, schedule_for(m));
             let request = indexed_request(&program);
             let groupings: Vec<usize> = program
                 .planned()
@@ -156,7 +179,7 @@ fn routed_gate_weighting_compiles_to_one_indexed_contraction_epilogue() {
         for m in [5, 160] {
             let label = format!("{backend:?} M={m}");
             let g = indexed(m, true);
-            let fused = program(&g, backend);
+            let fused = program(&g, backend, schedule_for(m));
             assert_eq!(
                 count(&fused, |op| matches!(
                     op,
@@ -255,7 +278,7 @@ fn checkpoint_order_experts_plan_one_contraction_and_no_transpose() {
     for backend in backends() {
         for m in [1, 5, 160] {
             let label = format!("{backend:?} M={m}");
-            let program = program(&checkpoint_order(m, false), backend);
+            let program = program(&checkpoint_order(m, false), backend, schedule_for(m));
             assert_eq!(count(&program, is_indexed_head), 1, "{label}");
             assert_eq!(transposes(&program), 0, "{label}: a transpose dispatch ran");
             assert_eq!(
@@ -276,7 +299,7 @@ fn checkpoint_order_experts_plan_one_contraction_and_no_transpose() {
 #[test]
 fn a_transposed_weight_with_a_second_consumer_keeps_its_transpose() {
     for backend in backends() {
-        let program = program(&checkpoint_order(5, true), backend);
+        let program = program(&checkpoint_order(5, true), backend, IndexedRows::Gemv);
         assert_eq!(transposes(&program), 1, "{backend:?}");
         assert_eq!(
             indexed_request(&program).layout,
@@ -293,7 +316,7 @@ fn a_transposed_weight_with_a_second_consumer_keeps_its_transpose() {
 fn the_ekn_orientation_plans_the_plain_layout() {
     for backend in backends() {
         for m in [1, 5, 160] {
-            let program = program(&indexed(m, false), backend);
+            let program = program(&indexed(m, false), backend, schedule_for(m));
             assert_eq!(
                 indexed_request(&program).layout,
                 WeightLayout::Kn,
@@ -367,7 +390,7 @@ fn a_checkpoint_order_weight_under_the_gate_epilogue_plans_no_transpose() {
             let out = b
                 .binary(BinOp::Mul, product, b.reshape(gate, vec![m, 1]).unwrap())
                 .unwrap();
-            let program = program(&b.finish(out).unwrap(), backend);
+            let program = program(&b.finish(out).unwrap(), backend, schedule_for(m));
             let label = format!("{backend:?} M={m}");
             assert_eq!(
                 count(&program, |op| matches!(
@@ -437,7 +460,11 @@ fn a_bf16_expert_stack_plans_the_packed_lane_without_a_widened_copy() {
                 [(false, false), (true, false), (true, true), (false, true)]
             {
                 let label = format!("{backend:?} M={m} nk={checkpoint_order} gate={gate}");
-                let program = program(&bf16_experts(m, checkpoint_order, gate), backend);
+                let program = program(
+                    &bf16_experts(m, checkpoint_order, gate),
+                    backend,
+                    schedule_for(m),
+                );
                 assert_eq!(count(&program, is_indexed_head), 1, "{label}");
                 assert_eq!(transposes(&program), 0, "{label}: a transpose dispatch ran");
                 assert_eq!(

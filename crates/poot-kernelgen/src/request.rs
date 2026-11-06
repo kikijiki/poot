@@ -41,7 +41,7 @@ use crate::fused::{
     FusedInput, FusedKernel, FusedScalarOp, LeafTy, RowKernel, fused_i32_views_grid,
     fused_i32_views_grid_pack, fused_row_parallel_views, fused_views, pointwise_size, row_size,
 };
-use crate::gemv::{attn_scores_v_gemv_lds, gemv_lds};
+use crate::gemv::attn_scores_v_gemv_lds;
 use crate::helpers::{BodyBudget, BodyLimits, BodySize, Layout, WeightLayout};
 use crate::matmul::{matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid};
 use crate::packed::{PackedKernelSpec, packed_contraction, packed_kernel};
@@ -549,21 +549,6 @@ pub enum ContractionSpec {
         /// How the launch folds past the device's x-grid cap.
         fold: Fold,
     },
-    /// A range of a decode GEMV over a `[K, N]` weight: `elems` workgroups of `width` lanes starting at output
-    /// element `offset`, one workgroup per output element, folded onto a 2-D grid past the device's X cap. The
-    /// whole output is one range; a watchdog-split output is several, all this one body.
-    GemvChunk {
-        /// Reduction length (the `[K, N]` weight's rows).
-        k: usize,
-        /// Output columns of the `[K, N]` weight.
-        n: usize,
-        /// Lanes per workgroup.
-        width: usize,
-        /// Workgroups in this range, one per output element.
-        elems: usize,
-        /// First output element of the range.
-        offset: usize,
-    },
     /// The `DenseContraction` decode GEMV (`M == 1`): `schedule` (a [`Schedule::Gemv`]) over an `[N, K]` weight
     /// in `weight` storage (`BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`), the shared Gemv loop nest
     /// with the dense operand load, `epilogue` (f32) applied to each column's sum before its store. The body is
@@ -638,7 +623,6 @@ impl ContractionSpec {
     fn form(&self) -> &'static str {
         match self {
             Self::Serial { .. } => "serial",
-            Self::GemvChunk { .. } => "gemv_chunk",
             Self::DenseGemv { .. } => "dense_gemv",
             Self::AttnScoresVGemv { .. } => "attn_scores_v_gemv",
             Self::DenseTiled(_) => "dense_tiled",
@@ -1088,31 +1072,6 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                 ),
             };
             fold.contraction(body, caps)
-        }
-        ContractionSpec::GemvChunk {
-            k,
-            n,
-            width,
-            elems,
-            offset,
-        } => {
-            // One workgroup per output element, X filling to the device's cap and the rest spilling onto Y: the
-            // same body whether the planner launches the whole output or one watchdog-sized range of it.
-            let (x, y) = fold_within_grid("gemv_lds", *elems, caps)?;
-            with(
-                gemv_lds(
-                    ENTRY,
-                    *k,
-                    *n,
-                    *width,
-                    x,
-                    *offset,
-                    WeightLayout::Kn,
-                    BufferStorage::f32(),
-                    caps.rounding_conversions,
-                )?,
-                Launch::grid([(x * width) as u32, y as u32, 1]),
-            )
         }
         ContractionSpec::DenseGemv {
             weight,

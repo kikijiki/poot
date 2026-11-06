@@ -8,7 +8,7 @@ use super::{
 use crate::dtype_widen::ConstLanes;
 use crate::planner::{GraphTables, StorageDtypes, finalize};
 use crate::predicates::dense_decode_gemv_in;
-use crate::refusal::Site;
+use crate::refusal::{Pins, Site};
 use crate::storage_analysis::dense_contraction_weight_storage;
 use crate::types::{StorageKind, ValueStorage};
 use poot_graph_ir::{FragmentDtype, OperandPrecision};
@@ -101,7 +101,7 @@ pub(super) fn dense_cost_shapes(
     }
     let n = *out_shape.last()?;
     let tiled = dense_tiled_shape(precision, None, weight, (out_numel / n.max(1), k, n));
-    let gemv = dense_decode_gemv_in(eqn, out_shape, out_numel, caps)
+    let gemv = dense_decode_gemv_in(eqn, out_shape, out_numel, None, caps)
         .map(|launch| launch.cost_shape(out_numel));
     Some((tiled, gemv))
 }
@@ -117,10 +117,10 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
-    tiling_pin: Option<kg::RegisterTiling>,
+    pins: Pins,
     const_lanes: &ConstLanes,
 ) -> Result<Planned, PlanError> {
-    let site = Site::new(g, eqn, backend, limits).pinned(tiling_pin);
+    let site = Site::new(g, eqn, backend, limits).pinned(pins);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
     let ids = value_ids(eqn);
     // How the equation reads its operands, and the tiles a split one stages for a weight in `weight`'s storage.
@@ -183,7 +183,7 @@ pub(super) fn plan(
                 (out_numel / n.max(1), k, n),
             );
             // A narrowed read never takes the Gemv: it runs on a matrix unit or is refused (POOT-1476).
-            let gemv = dense_decode_gemv_in(eqn, out_shape, out_numel, caps)
+            let gemv = dense_decode_gemv_in(eqn, out_shape, out_numel, site.gemv_cols_pin(), caps)
                 .filter(|_| precision.is_exact());
             if let Some(launch) = gemv {
                 if activation_stored.is_some() {
@@ -226,7 +226,7 @@ pub(super) fn plan(
                 (out_numel / n.max(1), k, n),
             );
             // A narrowed read never takes the Gemv: it runs on a matrix unit or is refused (POOT-1476).
-            let gemv = dense_decode_gemv_in(eqn, out_shape, out_numel, caps)
+            let gemv = dense_decode_gemv_in(eqn, out_shape, out_numel, site.gemv_cols_pin(), caps)
                 .filter(|_| precision.is_exact());
             let epilogue = matmul::epilogue_of(
                 site,

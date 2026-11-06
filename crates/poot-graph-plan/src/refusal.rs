@@ -331,7 +331,21 @@ pub(crate) struct Site<'a> {
     eqn: &'a Eqn,
     target: TargetId,
     limits: BodyLimits,
-    tiling_pin: Option<poot_kernelgen::RegisterTiling>,
+    pins: Pins,
+}
+
+/// The schedule choices a compile fixes for the calibration sweep and the tests that time or inspect one candidate
+/// ([`crate::CompileOptions::tiling_pin`], [`crate::CompileOptions::indexed_rows_pin`],
+/// [`crate::CompileOptions::gemv_cols_pin`]). `Pins::default()` leaves
+/// every choice to the cost model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Pins {
+    /// The tiling every register-tiled contraction must run.
+    pub(crate) tiling: Option<poot_kernelgen::RegisterTiling>,
+    /// How every per-row indexed contraction must run.
+    pub(crate) indexed_rows: Option<crate::predicates::IndexedRows>,
+    /// The columns per workgroup every dense decode Gemv must launch.
+    pub(crate) gemv_cols: Option<u32>,
 }
 
 impl<'a> Site<'a> {
@@ -346,22 +360,28 @@ impl<'a> Site<'a> {
             eqn,
             target: target.into(),
             limits,
-            tiling_pin: None,
+            pins: Pins::default(),
         }
     }
 
-    /// This site planning under `pin`, the tiling every register-tiled contraction it plans must run
-    /// ([`crate::CompileOptions::tiling_pin`]).
-    pub(crate) fn pinned(self, pin: Option<poot_kernelgen::RegisterTiling>) -> Self {
-        Self {
-            tiling_pin: pin,
-            ..self
-        }
+    /// This site planning under `pins`.
+    pub(crate) fn pinned(self, pins: Pins) -> Self {
+        Self { pins, ..self }
     }
 
     /// The tiling a register-tiled contraction at this site must run, if the compile pinned one.
     pub(crate) fn tiling_pin(&self) -> Option<poot_kernelgen::RegisterTiling> {
-        self.tiling_pin
+        self.pins.tiling
+    }
+
+    /// How a per-row indexed contraction at this site must run, if the compile pinned it.
+    pub(crate) fn indexed_rows_pin(&self) -> Option<crate::predicates::IndexedRows> {
+        self.pins.indexed_rows
+    }
+
+    /// The columns per workgroup a dense decode Gemv at this site must launch, if the compile pinned them.
+    pub(crate) fn gemv_cols_pin(&self) -> Option<u32> {
+        self.pins.gemv_cols
     }
 
     /// The body limits a kernel generated at this site is held to.

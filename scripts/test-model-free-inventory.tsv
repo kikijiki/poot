@@ -1017,7 +1017,7 @@ poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::a_fp8
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::a_packed_tiled_contraction_over_the_watchdog_budget_splits_into_tile_ranges
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::a_prefill_indexed_contraction_above_the_gemv_grid_plans_a_folded_tiled_schedule
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::an_indexed_contraction_beyond_the_grid_or_the_bit_range_is_a_typed_refusal
-poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::an_indexed_contraction_is_a_gemv_up_to_the_decode_row_count_and_tiled_above_it
+poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::an_indexed_contraction_is_a_gemv_until_the_cost_models_boundary_and_tiled_above_it
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::an_indexed_contraction_widens_its_gemv_columns_to_fit_the_grid
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::block_diagonal_ragged_m_per_block_compiles_to_tiled_not_serial
 poot-graph-plan	poot-graph-plan	model-free	planner::packed_dequant::tests::over_cap_block_diagonal_compile_reports_the_grid_refusal_not_the_escape_symptom
@@ -1115,9 +1115,6 @@ poot-graph-plan	poot-graph-plan	model-free	tests::cast_f32_to_i32_is_still_unwir
 poot-graph-plan	poot-graph-plan	model-free	tests::cast_i32_to_f32_plans_an_i32_in_f32_out_kernel
 poot-graph-plan	poot-graph-plan	model-free	tests::compute_views_never_promotes_validation_values
 poot-graph-plan	poot-graph-plan	model-free	tests::decode_attn_scores_v_matmul_lowers_to_the_lds_gemv_kernel
-poot-graph-plan	poot-graph-plan	model-free	tests::decode_gemv_chunking_follows_the_caps_watchdog_trigger_not_a_fixed_constant
-poot-graph-plan	poot-graph-plan	model-free	tests::decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape
-poot-graph-plan	poot-graph-plan	model-free	tests::decode_gemv_width_ceiling_follows_the_caps_not_the_backend
 poot-graph-plan	poot-graph-plan	model-free	tests::dense_bf16_decode_gemv_selection_rows
 poot-graph-plan	poot-graph-plan	model-free	tests::dense_gemv_columns_stay_narrow_on_unknown_compute_units
 poot-graph-plan	poot-graph-plan	model-free	tests::dispatch_count_planned_chain_drops_further_than_phase_1_one_hop
@@ -1200,8 +1197,6 @@ poot-graph-plan	poot-graph-plan	model-free	tests::widen_casts_an_aligned_mixed_m
 poot-graph-plan	poot-graph-plan	model-free	tests::widen_inserts_cast_for_decode_shaped_mixed_matmul
 poot-graph-plan	poot-graph-plan	model-free	tests::widen_preserves_cpu_oracle_numerics
 poot-graph-plan	poot-graph-plan	model-free	tests_contraction_parity::batched_tiled_gemm_is_one_body_across_the_tile_ceiling
-poot-graph-plan	poot-graph-plan	model-free	tests_contraction_parity::decode_gemv_grid_spills_onto_y_past_the_x_cap
-poot-graph-plan	poot-graph-plan	model-free	tests_contraction_parity::decode_gemv_is_one_body_on_both_sides_of_the_watchdog_boundary
 poot-graph-plan	poot-graph-plan	model-free	tests_contraction_parity::no_imported_contraction_kernel_exists_or_is_planned
 poot-graph-plan	poot-graph-plan	model-free	tests_contraction_parity::shared_weight_tiled_gemm_matches_the_oracle_across_the_tile_ceiling
 poot-graph-plan	poot-graph-plan	model-free	types::tests::a_binding_must_cover_the_kernels_params
@@ -1316,6 +1311,9 @@ poot-graph-plan	poot-graph-plan::fused_attention_rope_shape_proofs	model-free	ro
 poot-graph-plan	poot-graph-plan::fusion_soundness	model-free	recip_tanh_erf_fused_region_matches_the_oracle
 poot-graph-plan	poot-graph-plan::fuzz_primitives_fusion	model-free	fused_equals_unfused_elementwise_chain_all_fusable
 poot-graph-plan	poot-graph-plan::fuzz_primitives_fusion	model-free	fused_equals_unfused_matmul_epilogue
+poot-graph-plan	poot-graph-plan::gemv_cols_pin	model-free	a_pinned_column_count_is_the_one_launched
+poot-graph-plan	poot-graph-plan::gemv_cols_pin	model-free	columns_the_width_does_not_divide_launch_no_gemv
+poot-graph-plan	poot-graph-plan::gemv_cols_pin	model-free	pinning_the_chosen_columns_changes_nothing
 poot-graph-plan	poot-graph-plan::generated_resources	model-free	a_finalizer_workgroup_bump_is_reflected_in_the_plan_key
 poot-graph-plan	poot-graph-plan::generated_resources	model-free	an_imported_kernel_over_the_lds_budget_is_refused_before_any_load
 poot-graph-plan	poot-graph-plan::generated_resources	model-free	an_overlarge_workgroup_is_refused_for_generated_and_imported_kernels_alike
@@ -1338,6 +1336,11 @@ poot-graph-plan	poot-graph-plan::indexed_contraction_plan	model-free	checkpoint_
 poot-graph-plan	poot-graph-plan::indexed_contraction_plan	model-free	decode_shape_plans_the_gemv_on_every_backend_and_prefill_the_register_tiled_grouped_rows
 poot-graph-plan	poot-graph-plan::indexed_contraction_plan	model-free	routed_gate_weighting_compiles_to_one_indexed_contraction_epilogue
 poot-graph-plan	poot-graph-plan::indexed_contraction_plan	model-free	the_ekn_orientation_plans_the_plain_layout
+poot-graph-plan	poot-graph-plan::indexed_rows_choice	model-free	a_gemv_whose_workgroups_exceed_the_grid_is_widened_not_refused
+poot-graph-plan	poot-graph-plan::indexed_rows_choice	model-free	a_pin_names_the_schedule_the_model_would_not_choose
+poot-graph-plan	poot-graph-plan::indexed_rows_choice	model-free	the_cost_model_decides_where_an_indexed_contraction_stops_being_a_gemv
+poot-graph-plan	poot-graph-plan::indexed_rows_choice	model-free	the_direct_value_of_the_device_moves_the_gemv_boundary
+poot-graph-plan	poot-graph-plan::indexed_rows_choice	model-free	the_two_backends_of_gfx1151_plan_with_their_own_ratios
 poot-graph-plan	poot-graph-plan::iota_fold	model-free	iota_matches_the_bound_range_oracle_and_folds_to_the_same_values
 poot-graph-plan	poot-graph-plan::iota_fold	model-free	the_i32_iota_is_exact_through_the_oracle_and_the_folded_constant
 poot-graph-plan	poot-graph-plan::movement_softmax	model-free	compile_chooses_the_generated_tiled_gemm_for_m_over_one_only
@@ -1564,8 +1567,11 @@ poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_fragment_tile_of_
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_grouping_with_few_rows_per_expert_takes_a_short_block
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_long_prefill_takes_the_widest_tile
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::grouped_rows_count_whole_tiles_per_bucket
+poot-kernelgen	poot-kernelgen	model-free	contraction::tests::rows_expected_to_touch_fewer_buckets_than_they_have
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_candidates_are_the_tilings_the_device_runs
+poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_comparison_is_for_grouped_rows_on_a_device_that_tiles_them
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_gemv_beats_a_matrix_unit_at_one_row_and_loses_at_many
+poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_gemv_gives_way_to_the_grouping_where_the_rows_share_their_experts
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_matrix_units_rate_discounts_the_fragment_multiply
 poot-kernelgen	poot-kernelgen	model-free	contraction::tiled::tests::a_split_moves_the_reads_ahead_and_keeps_their_uses
 poot-kernelgen	poot-kernelgen	model-free	emit::tests::reads_a_full_word_at_a_word_boundary
@@ -3494,6 +3500,7 @@ poot-models	poot-models	model-free	components::conv::tests::the_conv_matches_an_
 poot-models	poot-models	model-free	components::dsa::tests::params_refuse_an_impossible_indexer
 poot-models	poot-models	model-free	components::dsa::tests::pooled::params_refuse_a_budget_that_is_not_whole_pools
 poot-models	poot-models	model-free	components::dsa::tests::pooled::the_pooled_layer_matches_the_definition_and_continues_across_chunks
+poot-models	poot-models	model-free	components::dsa::tests::pooled::the_pooled_layer_matches_the_definition_past_the_last_whole_pool
 poot-models	poot-models	model-free	components::dsa::tests::pooled::the_selection_is_live
 poot-models	poot-models	model-free	components::dsa::tests::the_indexer_scores_and_the_selection_match_the_definition
 poot-models	poot-models	model-free	components::embed::tests::embed_gathers_the_table_rows_of_each_token
@@ -3745,7 +3752,6 @@ poot-models	poot-models::kv_extent	model-free	a_paged_pool_keeps_its_logical_ext
 poot-models	poot-models::kv_extent	model-free	a_traced_cache_is_declared_at_the_logical_capacity
 poot-models	poot-models::kv_extent	model-free	no_model_code_names_the_dram_channel_rule
 poot-models	poot-models::kv_extent	model-free	the_padded_position_never_reaches_the_logits
-poot-models	poot-models::launch_census	model-free	the_k_by_n_decode_gemv_is_reached_only_by_a_computed_operand
 poot-models	poot-models::launch_census	model-free	the_launch_census_matches_the_checked_in_file
 poot-models	poot-models::layer_tags	model-free	every_registered_family_tags_one_run_per_configured_layer
 poot-models	poot-models::legalize_driver_trace	model-free	driver_compile_refuses_a_head_no_row_split_can_fit
@@ -4309,7 +4315,6 @@ poot-ptx-runtime	poot-ptx-runtime	device	tests::ptx_buffer_and_its_context_move_
 poot-ptx-runtime	poot-ptx-runtime	model-free	context::caps_tests::a_pre_ampere_device_has_no_matrix_hardware_for_poots_kernels
 poot-ptx-runtime	poot-ptx-runtime	model-free	context::caps_tests::every_attribute_lands_in_its_own_caps_field
 poot-ptx-runtime	poot-ptx-runtime	model-free	context::caps_tests::performance_figures_follow_the_compute_capability
-poot-ptx-runtime	poot-ptx-runtime	model-free	context::caps_tests::the_gemv_width_ceiling_is_reported_only_for_the_measured_generation
 poot-ptx-runtime	poot-ptx-runtime	model-free	tests::a_sticky_device_fault_is_device_lost_and_the_next_call_is_poisoned
 poot-ptx-runtime	poot-ptx-runtime	model-free	tests::allocation_arithmetic_is_checked_before_native_allocation
 poot-ptx-runtime	poot-ptx-runtime	model-free	tests::allocation_initialization_failure_frees_before_returning
@@ -5078,7 +5083,7 @@ poot-target	poot-target	model-free	calibration::tests::a_launch_carries_the_figu
 poot-target	poot-target	model-free	calibration::tests::calibration_is_keyed_by_device_identity_not_vendor
 poot-target	poot-target	model-free	calibration::tests::every_launch_figure_has_provenance
 poot-target	poot-target	model-free	calibration::tests::performance_figures_follow_device_identity
-poot-target	poot-target	model-free	calibration::tests::the_gemv_ceiling_is_known_only_for_the_measured_generation
+poot-target	poot-target	model-free	calibration::tests::the_cost_ratios_follow_the_backend_that_measured_them
 poot-target	poot-target	model-free	calibration::tests::the_gemv_geometry_follows_the_device_limits
 poot-target	poot-target	model-free	calibration::tests::the_matrix_rate_is_known_only_where_it_is_sourced
 poot-target	poot-target	model-free	calibration::tests::tiled_attention_widths_follow_the_workgroup_limit

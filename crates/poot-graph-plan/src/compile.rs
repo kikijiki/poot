@@ -27,7 +27,7 @@ use crate::graph_validation::ValidationPacketPlan;
 use crate::npu::{NpuHandle, NpuLowering, NpuRegionRefusal, NpuTarget};
 use crate::planner::{OutputBuffer, plan_eqn_compiled, plan_graph};
 use crate::predicates::GraphTables;
-use crate::refusal::refusal_at;
+use crate::refusal::{Pins, refusal_at};
 use crate::state_commit::StateCommitPlan;
 #[cfg(feature = "test-support")]
 use crate::types::{DispatchPlanError, ScratchDecl};
@@ -179,6 +179,17 @@ pub struct CompileOptions {
     /// choice to the cost model, and the plan is the one compiled without the option. Only the final plan reads the
     /// pin: the narrowing and rewrite probes ask what the target can run, not what the pin allows.
     pub tiling_pin: Option<poot_kernelgen::RegisterTiling>,
+    /// How every per-row indexed contraction of the program must run (POOT-1489), for the calibration sweep that times
+    /// the Gemv and the grouped tiling of one shape. `None` leaves the choice to the cost model (the one comparison of
+    /// `RegisterTiling::gemv_beats_grouped`), and the plan is the one compiled without the option. Only the final plan
+    /// and the grouping pass read the pin.
+    pub indexed_rows_pin: Option<crate::IndexedRows>,
+    /// The columns per workgroup every dense decode Gemv of the program must launch (POOT-1490), for the calibration
+    /// sweep that times one weight row split over different lane counts. The planner plans that launch or, where the
+    /// workgroup width is not a multiple of it, plans the contraction as it would without a Gemv; it never plans other
+    /// columns in the pin's place. `None` leaves the choice to the device's calibrated columns table, and the plan is
+    /// the one compiled without the option. Only the final plan reads the pin.
+    pub gemv_cols_pin: Option<u32>,
     /// The one fragment dtype the `select_operand_precision` pass may narrow to, on a device that has several
     /// (the f16 contraction variant of the tier-3 gates on a target with bf16 and f16 units, POOT-1438). The
     /// device keeps every unit; only the pass sees the one, so the program still compiles for the real target.
@@ -214,6 +225,8 @@ impl CompileOptions {
             matmul_precision: MatmulPrecision::DEFAULT,
             range_check: false,
             tiling_pin: None,
+            indexed_rows_pin: None,
+            gemv_cols_pin: None,
             #[cfg(any(test, feature = "test-support"))]
             fragment_only: None,
             #[cfg(any(test, feature = "test-support"))]
@@ -1010,9 +1023,17 @@ pub fn compile(
             transform::group_expert_rows(
                 g,
                 |graph, eqn| {
-                    planner::grouping_candidate(graph, eqn, &views, caps).or_else(|| {
-                        planner::packed_grouping_candidate(graph, eqn, backend, caps, limits)
-                    })
+                    planner::grouping_candidate(graph, eqn, &views, caps, options.indexed_rows_pin)
+                        .or_else(|| {
+                            planner::packed_grouping_candidate(
+                                graph,
+                                eqn,
+                                backend,
+                                caps,
+                                limits,
+                                options.indexed_rows_pin,
+                            )
+                        })
                 },
                 |shapes| poot_kernelgen::RegisterTiling::grouped_block(shapes, caps),
             )
@@ -1077,7 +1098,11 @@ pub fn compile(
         &graph,
         target,
         &options.limits.body(),
-        options.tiling_pin,
+        Pins {
+            tiling: options.tiling_pin,
+            indexed_rows: options.indexed_rows_pin,
+            gemv_cols: options.gemv_cols_pin,
+        },
         npu,
     )?;
     let state_commit = planned.state_commit;

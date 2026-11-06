@@ -934,6 +934,7 @@ mod value_storage_tests {
 /// POOT-1229: the planner-side check over the stored KV extent.
 #[cfg(test)]
 mod kv_stride_tests {
+    use crate::refusal::Pins;
     use poot_graph_ir::ops::{AttentionKeys, attention_live, causal_mask_from_pos};
     use poot_graph_ir::{
         BinOp, Builder, Graph, IndexRange, Outputs, RedOp, Scalar, Slot, StateRole, TensorType,
@@ -1072,7 +1073,8 @@ mod kv_stride_tests {
         // 512 positions of a 128-wide head: a 2048 B stride, whole channel periods.
         let g = decode(512, 128, Reader::Attention);
         let limits = CompileLimits::STANDARD.body();
-        let Err(refused) = plan_graph(&fused(&g), &with_channels(), &limits, None, None) else {
+        let Err(refused) = plan_graph(&fused(&g), &with_channels(), &limits, Pins::default(), None)
+        else {
             panic!("a camping cache the legalizer could pad was planned");
         };
         assert!(
@@ -1087,7 +1089,16 @@ mod kv_stride_tests {
             stored(&compile(&g, &with_channels(), &options()).expect("the legalizer pads it")),
             [513, 513]
         );
-        assert!(plan_graph(&fused(&g), &without_channels(), &limits, None, None).is_ok());
+        assert!(
+            plan_graph(
+                &fused(&g),
+                &without_channels(),
+                &limits,
+                Pins::default(),
+                None
+            )
+            .is_ok()
+        );
         assert_eq!(
             stored(&compile(&g, &without_channels(), &options()).unwrap()),
             [512, 512]
@@ -1102,7 +1113,16 @@ mod kv_stride_tests {
         let limits = CompileLimits::STANDARD.body();
         // 512 f32 per head row is 2048 B: no whole-position pad escapes the period.
         let whole_period = decode(4, 512, Reader::Attention);
-        assert!(plan_graph(&fused(&whole_period), &with_channels(), &limits, None, None).is_ok());
+        assert!(
+            plan_graph(
+                &fused(&whole_period),
+                &with_channels(),
+                &limits,
+                Pins::default(),
+                None
+            )
+            .is_ok()
+        );
         assert_eq!(
             stored(&compile(&whole_period, &with_channels(), &options()).unwrap()),
             [4, 4]
@@ -1128,6 +1148,6 @@ mod kv_stride_tests {
         let g = b
             .finish(Outputs::new(next).with_state(&[(pool, next)]))
             .unwrap();
-        assert!(plan_graph(&g, &with_channels(), &limits, None, None).is_ok());
+        assert!(plan_graph(&g, &with_channels(), &limits, Pins::default(), None).is_ok());
     }
 }

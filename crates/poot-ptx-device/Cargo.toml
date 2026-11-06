@@ -29,7 +29,7 @@ poot-eval = { workspace = true, features = ["test-support"] }
 poot-executor-parity.workspace = true
 poot-quant = { workspace = true, features = ["test-support"] }
 poot-tensor.workspace = true
-poot-kernelgen.workspace = true
+poot-kernelgen = { workspace = true, features = ["test-support"] }
 # The performance-bank example loads a checkpoint through the loader and hashes its plan with
 # `sha256_digest` (ADR-0113).
 poot-load = { workspace = true, features = ["test-support"] }

@@ -592,6 +592,11 @@ pub struct Policy {
     /// row), so a row that must run a narrowed schedule on such a device declares it: the planner holds the declared
     /// op to a matrix unit and refuses it by name where the device has none.
     pub declared: bool,
+    /// How every per-row indexed contraction of the fixture runs (`CompileOptions::indexed_rows_pin`, POOT-1489);
+    /// `None` leaves the Gemv-or-grouped choice to the planner's cost model. A fixture is a few dozen wide, where the
+    /// model plans the Gemv at every row count, so a row about the tiled schedule over the rows grouped by expert
+    /// pins it ([`Policy::grouped`]).
+    pub indexed_rows: Option<poot_graph_plan::IndexedRows>,
 }
 
 impl From<MatmulPrecision> for Policy {
@@ -600,11 +605,26 @@ impl From<MatmulPrecision> for Policy {
             precision,
             fragment_only: None,
             declared: false,
+            indexed_rows: None,
         }
     }
 }
 
 impl Policy {
+    /// `precision` with every per-row indexed contraction pinned to the tiled schedule over the rows grouped by
+    /// expert.
+    pub fn grouped(precision: MatmulPrecision) -> Self {
+        Self::indexed(poot_graph_plan::IndexedRows::Grouped, precision)
+    }
+
+    /// `precision` with every per-row indexed contraction pinned to `rows`.
+    pub fn indexed(rows: poot_graph_plan::IndexedRows, precision: MatmulPrecision) -> Self {
+        Self {
+            indexed_rows: Some(rows),
+            ..precision.into()
+        }
+    }
+
     /// The policy that declares `precision` on every contraction and attention of a fixture, whatever the planner's
     /// cost model would pick.
     pub fn declared(precision: MatmulPrecision) -> Self {
@@ -656,6 +676,7 @@ pub fn try_staged_under(
     let options = CompileOptions {
         fragment_only: policy.fragment_only,
         declare_precision: policy.declared,
+        indexed_rows_pin: policy.indexed_rows,
         ..exec
             .compile_options(poot_graph_plan::CompileLimits::STANDARD)
             .with_matmul_precision(policy.precision)
@@ -783,6 +804,20 @@ pub fn run_once(
     consts: &[ConstFixture],
     slots: &[StepFixture],
 ) -> Result<HostTensor, String> {
+    run_once_under(exec, target, g, consts, slots, MatmulPrecision::Exact)
+}
+
+/// [`run_once`] with the graph compiled under the policy `policy` ([`staged_under`]): a row about the Gemv or the
+/// tiled schedule over the rows grouped by expert pins it ([`Policy::indexed`]).
+pub fn run_once_under(
+    exec: &mut dyn Executor,
+    target: Target,
+    g: &Graph,
+    consts: &[ConstFixture],
+    slots: &[StepFixture],
+    policy: impl Into<Policy>,
+) -> Result<HostTensor, String> {
+    let policy = policy.into();
     let mut builder = WeightStore::builder();
     for c in consts {
         let dense = DenseWeight::try_new(
@@ -808,9 +843,12 @@ pub fn run_once(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &exec
-            .compile_options(poot_graph_plan::CompileLimits::STANDARD)
-            .with_matmul_precision(MatmulPrecision::Exact),
+        &CompileOptions {
+            indexed_rows_pin: policy.indexed_rows,
+            ..exec
+                .compile_options(poot_graph_plan::CompileLimits::STANDARD)
+                .with_matmul_precision(policy.precision)
+        },
     )
     .map_err(|e| format!("run_once: compile_staged: {e}"))?;
     let entry = exec

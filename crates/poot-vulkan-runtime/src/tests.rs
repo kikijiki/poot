@@ -384,7 +384,6 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
                 rounding_conversions: poot_target::RoundingConversions::NONE,
                 widens_bf16_decode_weight: false,
                 peer_transport: false,
-                decode_gemv_max_out_cols: None,
                 perf_calibration: poot_target::calibration::Calibrated::Portable,
             },
             memory_budget: false,
