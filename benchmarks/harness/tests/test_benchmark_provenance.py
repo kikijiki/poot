@@ -36,13 +36,13 @@ def install_build(directory, name, build_sha, backend="ptx"):
     return path
 
 
-def run_poot_cell(binary, *, backend="ptx", device=None):
+def run_poot_cell(binary, *, backend="ptx", device=None, model=None):
     with (
         mock.patch.object(observer, "run_observed", side_effect=run_fixture_runner),
         mock.patch.dict(os.environ, {"POOT_BENCH_BACKEND": backend}),
     ):
         return bench.run_cell(
-            model={"id": "fixture", "match_precision": "bf16"},
+            model=model or {"id": "fixture", "match_precision": "bf16"},
             scen={"id": "single", "gen_tokens": 4},
             fw="poot",
             fw_cfg={"support": True, "precision": "bf16"},
@@ -84,6 +84,17 @@ class BinaryProvenanceTests(unittest.TestCase):
         self.assertEqual(row["binary_sha256"], expected)
         self.assertNotEqual(rebuilt["binary_sha256"], expected)
         self.assertEqual(rebuilt["build_sha"], "c" * 40)
+
+    def test_row_records_the_weights_revision_a_pinned_model_ran_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = install_build(tmp, "build-a", "a" * 40)
+            pinned = run_poot_cell(
+                binary, model={"id": "fixture", "match_precision": "bf16", "hf_revision": "766911a"}
+            )
+            unpinned = run_poot_cell(binary)
+
+        self.assertEqual(pinned["weights_revision"], "766911a")
+        self.assertNotIn("weights_revision", unpinned)
 
     def test_row_records_the_backend_and_device_the_cell_ran_on(self):
         with tempfile.TemporaryDirectory() as tmp:

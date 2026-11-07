@@ -413,12 +413,19 @@ frameworks.llamacpp     = { support = true, precision = "q4_k_xl", caveat = "the
 # Qwen3.8-Flash-Next UD-Q2_K_XL (GGUF arch qwen4exp, 78.9 GB in three shards): the same repo and directory as the Q4
 # entry, a different include. It fits one RTX PRO 6000 Blackwell (96 GB), where the 111 GB Q4_K_XL needs an H200.
 # poot's precision is the dtype most of the store's bytes are in: IQ4_NL (65.2 % of the shards' bytes; IQ2_XS 28.9 %,
-# Q5_K 2.5 %, Q8_0 1.0 %, from the shards' tensor directories).
+# Q5_K 2.5 %, Q8_0 1.0 %, from the shards' tensor directories). Pinned to the repo's commit of 2026-10-06, the last
+# before unsloth re-quantised it in place on 2026-11-04 ("Better UD 3.1 quants": four shards, IQ2_XXS experts, which
+# poot does not read): both engines measure the same bytes, and the cell's earlier numbers stay comparable. The
+# shards at that revision (size in bytes, sha256 of the file):
+#   -00001-of-00003.gguf      10946624  a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86  (metadata only)
+#   -00002-of-00003.gguf   49979779296  2e3bf1ee7d2a04e261e9f342a2d968f696cce5941d082b0e434deb9b1edc12c6
+#   -00003-of-00003.gguf   28878402944  ec8c106759fdf4f463039c34c0707718d7d8908d53d892bd4f002e71620803f9
 [[model]]
 id = "qwen3.8-flash-next-q2"
 arch = "qwen4exp"
 hf_repo = "unsloth/Qwen3.8-Flash-Next-GGUF"
 hf_include = ["UD-Q2_K_XL/*.gguf"]
+hf_revision = "766911a6b7369840a91dbcd95f9f997acaab6cd6"
 local_dir = "qwen3.8-flash-next-gguf"
 weights_file = "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf"
 size_class = "xl"

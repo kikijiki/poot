@@ -95,6 +95,7 @@ test-bench-harness: bench-compare
     python3 -m unittest discover -s benchmarks/harness/tests -p 'test_*.py'
     python3 benchmarks/harness/performance_bank.py
     python3 -I scripts/flash-next-correctness/test_compare.py
+    python3 -I scripts/flash-next-correctness/test_shards.py
     just grid-check
 
 # The noise-aware comparator (benchmarks/harness/bench.py compare-committed) on the committed results: the baseline is
@@ -689,6 +690,7 @@ site-serve: _site-deps
 site-audit: _site-deps
     cd website && bun run build
     cd website && nix shell nixpkgs#chromium -c node scripts/audit-pages.mjs --self-test
+    cd website && nix shell nixpkgs#chromium -c bash scripts/audit-concurrent.sh
     cd website && nix shell nixpkgs#chromium -c node scripts/audit-pages.mjs --lanes
 
 # the site's checks (scripts/site-check.sh, which the cd-docs workflow runs too, minus the Rust snippets that need this toolchain)

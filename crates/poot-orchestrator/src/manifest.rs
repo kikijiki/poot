@@ -14,6 +14,10 @@ pub(crate) struct Model {
     /// `hf download --include` patterns: fetch only these files of `hf_repo` (a repo holding many quants of a
     /// model is hundreds of GB). Empty: the whole repo.
     pub(crate) hf_include: Vec<String>,
+    /// `hf download --revision`: the commit of `hf_repo` the weights are fetched at. A repo that is re-quantised in
+    /// place (unsloth's GGUF repos) changes what a name means; a pinned commit keeps every engine on the same bytes.
+    /// None: the repo's head.
+    pub(crate) hf_revision: Option<String>,
     /// The file the runners are handed instead of the directory (the first shard of a split GGUF), relative to
     /// the model's directory. Set for a pre-quantized model, whose download is already the format llama.cpp loads.
     pub(crate) weights_file: Option<String>,
@@ -53,6 +57,7 @@ pub(crate) fn parse_manifest_models(toml_src: &str) -> Result<Vec<Model>> {
         local_dir: Option<String>,
         #[serde(default)]
         hf_include: Vec<String>,
+        hf_revision: Option<String>,
         weights_file: Option<String>,
         #[serde(default)]
         frameworks: HashMap<String, FwCfg>,
@@ -85,6 +90,7 @@ pub(crate) fn parse_manifest_models(toml_src: &str) -> Result<Vec<Model>> {
                 hf_repo: x.hf_repo,
                 local_dir: x.local_dir,
                 hf_include: x.hf_include,
+                hf_revision: x.hf_revision,
                 weights_file: x.weights_file,
                 poot_supported,
                 llamacpp_supported,

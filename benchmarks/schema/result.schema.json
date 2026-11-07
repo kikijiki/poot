@@ -228,6 +228,18 @@
         }
       }
     },
+    "page_cache": {
+      "description": "The page-cache state the cell started from (harness/page_cache.py): the whole weights set is read to the end before the cell, so every engine starts warm whichever ran before. files and bytes are the set read; major_faults is what the cell's process tree took, and a warm repeat above the bound is marked unverified by compare.",
+      "type": "object",
+      "required": ["state", "files", "bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "state": { "enum": ["warm"] },
+        "files": { "type": "integer", "minimum": 1 },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "major_faults": { "type": "integer", "minimum": 0 }
+      }
+    },
     "caveats": {
       "type": "array",
       "items": { "type": "string" },

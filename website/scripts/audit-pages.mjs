@@ -3,12 +3,11 @@
 // heading skips, unlabelled images and diagrams, console errors. Needs `bun run build` first (CHROMIUM=/path/to/chromium; default `chromium`).
 // Usage: node scripts/audit-pages.mjs [--lanes] [--only <path-substring>]   audit the built site
 //        node scripts/audit-pages.mjs --self-test                            each rule must fail on its fixture in scripts/audit-fixtures
-import { spawn } from "node:child_process";
-import { readFileSync, readdirSync, mkdtempSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { createServer } from "node:http";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { serveDirectory, startBrowser } from "./harness.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -16,8 +15,7 @@ const selfTest = args.includes("--self-test");
 const byLane = args.includes("--lanes");
 const only = args.includes("--only") ? args[args.indexOf("--only") + 1] : null;
 const chromium = process.env.CHROMIUM ?? "chromium";
-const sitePort = 3996;
-const debugPort = 9337;
+let debugPort; // the DevTools port of the browser withBrowser started
 const viewports = [[1440, 1440], [500, 500]];
 const MAX_PARAGRAPH_LINES = 9;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -153,13 +151,12 @@ async function auditPage(base, path) {
 }
 
 async function withBrowser(run) {
-  const profile = mkdtempSync(join(tmpdir(), "poot-site-audit-"));
-  const browser = spawn(chromium, ["--headless=new", "--no-sandbox", "--disable-gpu", "--hide-scrollbars", `--user-data-dir=${profile}`, `--remote-debugging-port=${debugPort}`, "about:blank"], { stdio: "ignore" });
+  const browser = await startBrowser(chromium, "poot-site-audit-");
+  debugPort = browser.port;
   try {
-    await sleep(4000);
     return await run();
   } finally {
-    browser.kill();
+    browser.stop();
   }
 }
 
@@ -205,7 +202,9 @@ if (selfTest) {
       res.statusCode = 404;
       res.end();
     }
-  }).listen(sitePort);
+  });
+  await new Promise((done) => server.listen(0, "127.0.0.1", done));
+  const sitePort = server.address().port;
   let ok = true;
   await withBrowser(async () => {
     for (const file of readdirSync(dir).sort()) {
@@ -224,17 +223,16 @@ if (selfTest) {
 
 const sitemap = readFileSync(join(here, "..", "build", "sitemap.xml"), "utf8");
 const paths = [...sitemap.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => new URL(m[1]).pathname.replace(/(.)\/$/, "$1")).filter((p) => p !== "/search" && (!only || p.includes(only)));
-const server = spawn("bun", ["run", "serve", "--", "--port", String(sitePort), "--no-open"], { stdio: "ignore", cwd: join(here, "..") });
+const site = await serveDirectory(join(here, "..", "build"));
 let ok = false;
 try {
-  await sleep(3000);
   const results = await withBrowser(async () => {
     const out = [];
-    for (const path of paths) out.push([path, await auditPage(`http://127.0.0.1:${sitePort}`, path)]);
+    for (const path of paths) out.push([path, await auditPage(`http://127.0.0.1:${site.port}`, path)]);
     return out;
   });
   ok = report(results);
 } finally {
-  server.kill();
+  site.stop();
 }
 process.exit(ok ? 0 : 1);

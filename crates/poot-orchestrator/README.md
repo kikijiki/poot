@@ -90,7 +90,7 @@ Fire it in the background and it will keep going; re-run the same `run` command 
 Key flags (see `run --help` for all): `--git-ref`, `--models`, `--scenario`, `--gpu-types` (tried in
 order), `--cloud` (COMMUNITY/SECURE/ALL), `--image`, `--ssh-key`, `--repeats`, `--give-up-after-min`,
 `--max-replacements`, `--reuse-pod`, `--sweep-timeout-s`, `--keep-pod` (release the pod to idle; a later
-`run` with the same image adopts it, otherwise it is reaped), `--poot-bin` (skip the build), `--commit`,
+`run` with the same image adopts it, or `--reuse-pod` names it; `reap` leaves it alone and its pod-side TTL ends it), `--poot-bin` (skip the build), `--commit`,
 `--dry-run`.
 
 - `--give-up-after-min N` ends the wait for capacity after N minutes: the run is `cancelled`, naming the GPU

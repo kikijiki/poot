@@ -873,6 +873,15 @@ impl Db {
                 None => protection.has_unrecorded = true,
             }
         }
+        // A pod released to `idle` (`--keep-pod`) belongs to no unfinished run, yet it is kept on purpose: the next
+        // `run` adopts it (`--reuse-pod`, or the same image). Reaping it first would delete what that run is about
+        // to use. Its pod-side TTL ends it if nobody comes.
+        let mut idle = self
+            .conn
+            .prepare("SELECT id FROM pods WHERE status = 'idle'")?;
+        for id in idle.query_map([], |row| row.get::<_, String>(0))? {
+            protection.pod_ids.push(id?);
+        }
         Ok(protection)
     }
 

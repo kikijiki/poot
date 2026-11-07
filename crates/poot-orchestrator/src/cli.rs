@@ -351,7 +351,7 @@ pub(crate) struct RunArgs {
     /// `bench compare` baseline needs 5.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     pub(crate) repeats: u32,
-    /// do NOT terminate the pod at the end (debug). It will still be reaped on the next run. It removes
+    /// do NOT terminate the pod at the end (debug). `reap` leaves it alone; the next `run` can adopt it. It removes
     /// itself through the pod-side TTL (every model's repeats at `--sweep-timeout-s`, plus 30 minutes).
     #[arg(long)]
     pub(crate) keep_pod: bool,

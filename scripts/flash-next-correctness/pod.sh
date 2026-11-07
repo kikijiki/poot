@@ -16,6 +16,7 @@ df -h /root | tail -1
 cp /root/hf-token /root/.cache/huggingface/token
 
 tar -xf /root/fn.tar -C "$work"
+source "$work/flash-next-correctness/shards.sh"
 repo=unsloth/Qwen3.8-Flash-Next-GGUF
 models=/root/models/qwen3.8-flash-next-gguf
 (
@@ -42,7 +43,8 @@ wait "$download" || { stamp "download failed"; tail -20 "$out/download.log"; exi
 stamp "model downloaded: $(du -sh "$models" | cut -f1)"
 stamp "free memory: $(free -g | awk '/Mem/ {print $7 " GiB available"}')"
 
-export MODEL=$models/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf
+MODEL=$(first_shard "$models/UD-Q2_K_XL") || { stamp "no first shard in the download"; exit 1; }
+export MODEL
 export OUT=$out/cases LLAMA_BIN=$work/llama.cpp/build/bin POOT_SCORE=/root/poot-score POOT_BACKEND=ptx
 export LLAMA_GPU_FLAGS="-ngl 99" PYTHON=/root/py/bin/python POOT_LLC=/usr/lib/llvm-22/bin/llc
 # Run 1 hung in llama.cpp v0.4.1's CPU decode of this model (a 48-token prompt, then 19 minutes at 1500% CPU with

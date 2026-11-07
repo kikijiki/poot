@@ -1,6 +1,7 @@
 //! Command handlers and the remote benchmark lifecycle.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,6 +20,7 @@ use crate::heal::{
     self, Cancelled, Cursor, Healing, HostFault, LocalFault, Outcome, PodLost, Replacement,
     SetupFault, Unrecoverable,
 };
+use crate::hf;
 use crate::image_resolve::{
     DigestResolver, ImageLabels, RegistryV2Resolver, image_min_cuda, pin_image,
 };
@@ -2807,6 +2809,70 @@ fn sync_python_runners<R: Remote + ?Sized>(remote: &R, bench: &Path) -> Result<(
     Ok(())
 }
 
+/// What became of the local Hugging Face token.
+#[derive(Debug, PartialEq, Eq)]
+enum TokenForwarding {
+    NoToken,
+    Forwarded { user: String },
+    Withheld { why: String },
+}
+
+impl fmt::Display for TokenForwarding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoToken => f.write_str("no local HF token; only public repos will download"),
+            Self::Forwarded { user } => {
+                write!(
+                    f,
+                    "forwarded the local HF token of {user} (enables gated downloads)"
+                )
+            }
+            Self::Withheld { why } => write!(
+                f,
+                "NOT forwarding the local HF token: {why}. Downloads on the pod are anonymous \
+                 (gated repos will fail); refresh it with `hf auth login`"
+            ),
+        }
+    }
+}
+
+/// Send the token file to the pod so gated repos download, once Hugging Face vouches for it: a stale token would
+/// turn every download on the pod into a 401. scp'd as a file so the secret never lands in a command string that
+/// ssh errors would log.
+fn forward_hf_token<R: Remote + ?Sized>(
+    remote: &R,
+    token_file: &Path,
+    whoami: &hf::Whoami,
+) -> Result<TokenForwarding> {
+    let Ok(text) = std::fs::read_to_string(token_file) else {
+        return Ok(TokenForwarding::NoToken);
+    };
+    let user = match whoami.user(text.trim()) {
+        Ok(user) => user,
+        Err(e) => {
+            return Ok(TokenForwarding::Withheld {
+                why: format!("{} ({e})", token_file.display()),
+            });
+        }
+    };
+    let made = remote
+        .ssh_until(
+            "mkdir -p /root/.cache/huggingface",
+            Instant::now() + Duration::from_secs(60),
+        )
+        .map_err(|e| anyhow!("{e:?}"))?;
+    if !made.ok() {
+        bail!("mkdir of the pod's HF cache failed: {}", made.stderr.trim());
+    }
+    remote.scp_up(
+        token_file
+            .to_str()
+            .ok_or_else(|| anyhow!("{} is not UTF-8", token_file.display()))?,
+        "/root/.cache/huggingface/token",
+    )?;
+    Ok(TokenForwarding::Forwarded { user })
+}
+
 fn setup_pod(
     db: &Db,
     run: &Run,
@@ -2846,14 +2912,12 @@ fn setup_pod(
     // Ensure the `hf` CLI. The slim image has no system pip, so install via uv into /root/.local/bin
     // (needs POD_PATH to find uv).
     ep.ssh(&format!("{POD_PATH} command -v hf >/dev/null 2>&1 || uv tool install --quiet huggingface_hub 2>&1 | tail -2 || true"))?;
-    // Forward the local HF token (if any) so gated repos download. scp'd as a file so the secret never
-    // lands in a command string that ssh errors would log.
-    let hf_token = expand_tilde("~/.cache/huggingface/token");
-    if Path::new(&hf_token).exists() {
-        ep.ssh("mkdir -p /root/.cache/huggingface")?;
-        ep.scp_up(&hf_token, "/root/.cache/huggingface/token")?;
-        log("forwarded local HF token (enables gated downloads)");
-    }
+    log(forward_hf_token(
+        ep,
+        Path::new(&expand_tilde("~/.cache/huggingface/token")),
+        &hf::Whoami::new()?,
+    )?
+    .to_string());
 
     for m in models {
         cursor.set(Some(&m.id), "setup");
@@ -2886,7 +2950,11 @@ fn setup_pod(
                 m.id
             ));
         } else {
-            log(format!("  fetching {} ({repo}) -> {dst}", m.id));
+            let at = m
+                .hf_revision
+                .as_deref()
+                .map_or_else(String::new, |r| format!(" at {r}"));
+            log(format!("  fetching {} ({repo}{at}) -> {dst}", m.id));
             ep.ssh_checked(&download_command(m, repo, &dst))?;
         }
         // GGUF for llama.cpp (best-effort; a failure just makes that cell unsupported).
@@ -2903,15 +2971,21 @@ fn setup_pod(
     Ok(())
 }
 
-/// The `hf download` of one model into `dst`: its `hf_include` files only, or the whole repo when it names none.
+/// The `hf download` of one model into `dst`: its `hf_include` files only, or the whole repo when it names none,
+/// at its `hf_revision` when it pins one.
 fn download_command(m: &Model, repo: &str, dst: &str) -> String {
     let include: String = m
         .hf_include
         .iter()
         .map(|pattern| format!(" --include '{pattern}'"))
         .collect();
+    let revision = m
+        .hf_revision
+        .as_deref()
+        .map(|revision| format!(" --revision {revision}"))
+        .unwrap_or_default();
     format!(
-        "{POD_PATH} hf download {repo} --local-dir {dst}{include} >/tmp/dl-{}.log 2>&1",
+        "{POD_PATH} hf download {repo}{revision} --local-dir {dst}{include} >/tmp/dl-{}.log 2>&1",
         m.id
     )
 }
@@ -3369,6 +3443,144 @@ mod tests {
         ) -> Result<ssh::Run, ssh::DeadlineError> {
             unreachable!("syncing the runners runs no command")
         }
+    }
+
+    /// A pod that records what it is sent and told.
+    #[derive(Default)]
+    struct TokenPod {
+        uploads: RefCell<Vec<(String, String)>>,
+        commands: RefCell<Vec<String>>,
+    }
+
+    impl Remote for TokenPod {
+        fn wait_ssh(&self, _timeout: Duration) -> Result<()> {
+            Ok(())
+        }
+
+        fn scp_up(&self, local: &str, remote: &str) -> Result<()> {
+            self.uploads
+                .borrow_mut()
+                .push((local.into(), remote.into()));
+            Ok(())
+        }
+
+        fn ssh_until(&self, cmd: &str, _deadline: Instant) -> Result<ssh::Run, ssh::DeadlineError> {
+            self.commands.borrow_mut().push(cmd.into());
+            Ok(ssh::Run {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// A Hugging Face that answers every request with `status` and `body`; the origin and the requests it saw.
+    fn fake_hugging_face(status: &str, body: &str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (seen, requests) = std::sync::mpsc::channel();
+        let reply = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            seen.send(String::from_utf8_lossy(&buf[..n]).into_owned())
+                .unwrap();
+            let _ = stream.write_all(reply.as_bytes());
+        });
+        (origin, requests)
+    }
+
+    fn token_file(name: &str, token: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("poot-orch-{name}-{}", std::process::id()));
+        std::fs::write(&path, format!("{token}\n")).unwrap();
+        path
+    }
+
+    /// A token Hugging Face rejects (401) is not sent to the pod, and the log line says so. Mutation: forward
+    /// without asking `whoami` and the pod gets the stale token ("Forwarded" instead of "Withheld").
+    #[test]
+    fn a_token_hugging_face_rejects_is_not_forwarded() {
+        let (origin, requests) =
+            fake_hugging_face("401 Unauthorized", "{\"error\":\"Invalid credentials\"}");
+        let file = token_file("stale", "hf_stale");
+        let pod = TokenPod::default();
+
+        let outcome =
+            forward_hf_token(&pod, &file, &hf::Whoami::with_base(origin).unwrap()).unwrap();
+
+        let request = requests.recv().unwrap();
+        assert!(request.starts_with("GET /api/whoami-v2 "), "{request}");
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer hf_stale"),
+            "{request}"
+        );
+        assert!(
+            matches!(outcome, TokenForwarding::Withheld { .. }),
+            "{outcome:?}"
+        );
+        let line = outcome.to_string();
+        assert!(
+            line.contains("NOT forwarding") && line.contains("HTTP 401"),
+            "{line}"
+        );
+        assert!(pod.uploads.borrow().is_empty(), "{:?}", pod.uploads);
+        assert!(pod.commands.borrow().is_empty(), "{:?}", pod.commands);
+        std::fs::remove_file(file).unwrap();
+    }
+
+    /// A token Hugging Face vouches for is the file that goes to the pod.
+    #[test]
+    fn a_token_hugging_face_vouches_for_is_forwarded() {
+        let (origin, _requests) = fake_hugging_face("200 OK", "{\"name\":\"kiki\"}");
+        let file = token_file("good", "hf_good");
+        let pod = TokenPod::default();
+
+        let outcome =
+            forward_hf_token(&pod, &file, &hf::Whoami::with_base(origin).unwrap()).unwrap();
+
+        assert_eq!(
+            outcome,
+            TokenForwarding::Forwarded {
+                user: "kiki".into()
+            }
+        );
+        assert_eq!(
+            *pod.uploads.borrow(),
+            [(
+                file.display().to_string(),
+                "/root/.cache/huggingface/token".to_string()
+            )]
+        );
+        assert_eq!(
+            *pod.commands.borrow(),
+            ["mkdir -p /root/.cache/huggingface"]
+        );
+        std::fs::remove_file(file).unwrap();
+    }
+
+    /// A token nobody could check (Hugging Face unreachable) is withheld, not trusted.
+    #[test]
+    fn a_token_that_could_not_be_checked_is_not_forwarded() {
+        let (origin, _requests) = fake_hugging_face("503 Service Unavailable", "");
+        let file = token_file("unchecked", "hf_unchecked");
+        let pod = TokenPod::default();
+
+        let outcome =
+            forward_hf_token(&pod, &file, &hf::Whoami::with_base(origin).unwrap()).unwrap();
+
+        assert!(
+            matches!(outcome, TokenForwarding::Withheld { .. }),
+            "{outcome:?}"
+        );
+        assert!(pod.uploads.borrow().is_empty());
+        std::fs::remove_file(file).unwrap();
     }
 
     #[test]
@@ -5627,6 +5839,7 @@ id = "big-gguf"
 hf_repo = "org/big-GGUF"
 local_dir = "big-gguf"
 hf_include = ["Q4/*.gguf", "tok.json"]
+hf_revision = "0123abc"
 weights_file = "Q4/big-00001-of-00004.gguf"
 frameworks.poot = { precision = "q4_k" }
 frameworks.llamacpp = { support = true, precision = "q4_k_xl" }
@@ -5659,11 +5872,12 @@ frameworks.llamacpp = { support = true, precision = "f16" }
             "/root/models/big-gguf",
         );
         assert!(
-            big.contains("hf download org/big-GGUF --local-dir /root/models/big-gguf --include 'Q4/*.gguf' --include 'tok.json' >"),
+            big.contains("hf download org/big-GGUF --revision 0123abc --local-dir /root/models/big-gguf --include 'Q4/*.gguf' --include 'tok.json' >"),
             "{big}"
         );
         let dense = download_command(&manifest_model("dense"), "org/dense", "/root/models/dense");
         assert!(!dense.contains("--include"), "{dense}");
+        assert!(!dense.contains("--revision"), "{dense}");
     }
 
     /// The volume cache probe looks for the file the runners are handed, not a `config.json` a GGUF repo lacks.
@@ -6202,6 +6416,42 @@ frameworks.llamacpp = { support = true, precision = "f16" }
         .unwrap_err();
         assert!(err.downcast_ref::<Unrecoverable>().is_some(), "{err:#}");
     }
+    /// The opening `reap` of a `run` spares a pod an earlier `--keep-pod` run released to idle, so `--reuse-pod`
+    /// finds it alive; a pod no record covers is still taken. Mutation: drop the `idle` rows from
+    /// `reap_protection` and the reap deletes the kept pod ("pod-kept") before the run can use it.
+    #[test]
+    fn the_opening_reap_spares_the_idle_pod_a_reuse_names() {
+        let db = Db::open(":memory:").unwrap();
+        let owner = db.pod_owner_prefix().unwrap();
+        let image = run_args(&[]).image;
+        db.create_pod_record("pod-kept", "H100", "SECURE", None, &image)
+            .unwrap();
+        db.set_pod_endpoint("pod-kept", "1.2.3.4", 40022).unwrap();
+        db.release_pod("pod-kept").unwrap();
+        let cloud = FakePods::default();
+        cloud.seed("pod-kept", &owner.pod_name("run-finished", 1), true);
+        cloud.seed("pod-orphan", &owner.pod_name("run-lost", 1), true);
+
+        let reaped = reap(&db, &cloud, false).unwrap();
+
+        assert_eq!(
+            *cloud.deleted.borrow(),
+            ["pod-orphan"],
+            "reap deleted the pod --keep-pod released ({reaped} reaped)"
+        );
+        let (run, endpoint) = resolve_run(
+            &db,
+            &cloud,
+            &run_args(&["--reuse-pod", "pod-kept"]),
+            &named_models(&["m"]),
+            "abc",
+        )
+        .unwrap();
+        assert_eq!(run.pod_id.as_deref(), Some("pod-kept"));
+        assert!(endpoint.is_some());
+        assert_eq!(cloud.created.get(), 0);
+    }
+
     /// SIGINT/SIGTERM: the run ends 'cancelled', its pod is deleted and recorded terminated. Mutation: leave the
     /// status alone in `finalize_on_signal` and the run stays 'sweeping' (a zombie on the dashboard).
     #[test]

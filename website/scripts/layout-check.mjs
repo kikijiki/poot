@@ -3,15 +3,13 @@
 // horizontally; a page with a sidebar still shows sidebar items at the bottom, and a single page has none; every
 // markdown table fills its frame and stays inside the content column. It saves a screenshot at the top and one
 // scrolled to the bottom. Usage: CHROMIUM=/path/to/chromium bun scripts/layout-check.mjs <outdir>
-import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { serveDirectory, startBrowser } from "./harness.mjs";
 
 const out = process.argv[2] ?? "screenshots/layout";
 const chromium = process.env.CHROMIUM ?? "chromium";
-const sitePort = 3996;
-const debugPort = 9333;
 // [path, has a sidebar]
 const pages = [
   ["performance", false],
@@ -24,8 +22,10 @@ const widths = [1440, 1320, 1100, 500];
 const height = 900;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const server = spawn("bun", ["run", "serve", "--", "--port", String(sitePort), "--no-open"], { stdio: "ignore" });
-const browser = spawn(chromium, ["--headless=new", "--no-sandbox", "--disable-gpu", "--hide-scrollbars", `--remote-debugging-port=${debugPort}`, `--user-data-dir=${mkdtempSync(join(tmpdir(), "poot-layout-"))}`, "about:blank"], { stdio: "ignore" });
+const site = await serveDirectory(join(dirname(fileURLToPath(import.meta.url)), "..", "build"));
+const sitePort = site.port;
+const browser = await startBrowser(chromium, "poot-layout-");
+const debugPort = browser.port;
 mkdirSync(out, { recursive: true });
 
 async function connect() {
@@ -99,7 +99,7 @@ try {
     }
   }
 } finally {
-  browser.kill();
-  server.kill();
+  browser.stop();
+  site.stop();
 }
 process.exit(failed ? 1 : 0);

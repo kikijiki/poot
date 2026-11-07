@@ -55,6 +55,14 @@ benchmarks/
 
 ## The measurement contract (why the numbers are fair)
 
+**Page cache.** Before every cell, whichever engine it is, the harness reads the model's whole weights set (every
+shard of a split GGUF, every file of a checkpoint directory) to the end (`harness/page_cache.py`), so each engine
+starts warm and the result does not depend on which engine ran before: llama.cpp's lazily mapped 27 GiB Flash-Next
+embedding table measured 12.1 s to first token on a cache the streamed loader had left cold and 3.2 s on a warm one
+(POOT-1510). The row records `page_cache` (state, files, bytes and the `major_faults` of the cell's process tree); a
+set larger than the available memory is refused with a typed reason instead of run; `compare` marks a cell unverified
+when a warm repeat took more than `UNEXPECTED_MAJOR_FAULTS` faults. A cold start would be its own labelled scenario.
+
 The metric definitions follow MLPerf Inference, vLLM `bench serve`, NVIDIA GenAI-Perf, and Anyscale LLMPerf.
 
 **Scenario `decode-curve`.** For each context length ISL in {128, 512, 2048, 8192, 16384, ...}, prefill
@@ -401,7 +409,8 @@ once a clean baseline curve is committed, a poot-only re-run is a single ~30-40 
   `match_precision`, and a `frameworks.<fw>` entry per engine (`support` + `precision`, or `support=false`
   - `reason`, for the external engines; a `frameworks.poot` entry is `precision` and an optional `caveat`,
     never `support`). The harness enumerates it automatically. A pre-quantized model (a repo holding many GGUF
-    quants) adds `hf_include` (the `hf download --include` patterns, so only the wanted files are fetched) and
+    quants) adds `hf_include` (the `hf download --include` patterns, so only the wanted files are fetched), optionally `hf_revision` (the repo commit to fetch, for a repo
+    re-quantised in place: the result rows then carry it as `weights_revision`) and
     `weights_file` (relative to `local_dir`: the first shard of the split GGUF, which every runner is handed
     instead of the directory). poot's `precision` there is the dtype most of the file's bytes are stored in.
 - **A scenario:** add a `[[scenario]]`. A single-point scenario takes a `prompt_file` + `gen_tokens`; a

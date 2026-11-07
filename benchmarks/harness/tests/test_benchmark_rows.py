@@ -63,6 +63,8 @@ def bench_run(directory, single, curve, manifest=MANIFEST, *, diagnostic=False, 
     stub = directory / "stub-runner"
     stub.write_text(runner_script(single, curve, directory / "args.log"), encoding="ascii")
     stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    (directory / "fixture").mkdir(exist_ok=True)
+    (directory / "fixture" / "model.safetensors").write_bytes(b"\0" * 16)  # the weights the harness warms
     (directory / "manifest.toml").write_text(manifest)
     (directory / "runners.toml").write_text(f'[poot]\nbin = "{stub}"\ncmd = ["{{bin}}"]\n')
     args = argparse.Namespace(
@@ -107,6 +109,10 @@ class StoredRowTests(unittest.TestCase):
         single, curve = rows
         self.assertIn("decode_tok_s", single)
         self.assertNotIn("curve", single)
+        for row in rows:
+            self.assertEqual(row["page_cache"]["state"], "warm")
+            self.assertEqual((row["page_cache"]["files"], row["page_cache"]["bytes"]), (1, 16))
+            self.assertIsInstance(row["page_cache"]["major_faults"], int)
         self.assertEqual([point["isl"] for point in curve["curve"]], [4, 8])
 
     def test_a_cell_that_raises_is_an_error_row_and_the_sweep_goes_on(self):

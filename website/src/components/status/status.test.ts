@@ -61,10 +61,12 @@ describe("status board data", () => {
     for (const card of board.cards) expect((card.groups ?? []).flatMap((g) => g.items).length).toBeLessThanOrEqual(16);
   });
 
-  // The page says poot is behind llama.cpp on decode and first-token time in every measured cell. That is a claim about
-  // the data: when poot reaches a baseline on either metric in any verified, latest cell the claim is false and this
-  // test says which one. Memory has its own tests below.
-  test("poot is behind the best baseline on decode and first-token time in every compared verified cell of every hardware", () => {
+  // The page says poot is behind llama.cpp on decode in every measured cell, and on first-token time in every cell except
+  // the qwen3-0.6b and qwen3-4b rows of Strix Halo (poot on ROCm prefills ahead of llama.cpp Vulkan there) and qwen3-0.6b at
+  // 128 tokens on the RTX PRO 6000 (poot's 6.9 ms against llama.cpp's 19 ms). That is a claim
+  // about the data: when poot reaches a baseline on decode anywhere, or on first-token time outside those rows, in any
+  // verified, latest cell the claim is false and this test says which one. Memory has its own tests below.
+  test("poot is behind the best baseline on decode, and on first-token time outside the Strix Halo qwen3 rows, in every compared verified cell of every hardware", () => {
     type Point = { framework: string; isl: number; model: string; verified: boolean; latest: boolean; metrics: Record<string, { median: number }> };
     const better: Record<string, (values: number[]) => number> = { decode_tok_s: (v) => Math.max(...v), ttft_ms: (v) => Math.min(...v) };
     const ahead: string[] = [];
@@ -82,7 +84,11 @@ describe("status board data", () => {
           if (!cell.poot.length || !cell.base.length) continue;
           const [poot, base] = [better[metric](cell.poot), better[metric](cell.base)];
           const behind = metric === "decode_tok_s" ? poot < base : poot > base;
-          if (!behind) ahead.push(`${hw.id} ${metric} ${key}`);
+          const stated =
+            metric === "ttft_ms" &&
+            ((hw.id === "amd-radeon-8060s-graphics" && /^qwen3-(0\.6b|4b)@/.test(key)) ||
+              (hw.id === "nvidia-rtx-pro-6000-blackwell" && key === "qwen3-0.6b@128"));
+          if (!behind && !stated) ahead.push(`${hw.id} ${metric} ${key}`);
         }
       }
     }

@@ -73,12 +73,14 @@ pub const PORTABLE_COST_RATIOS: CostRatios = CostRatios {
 /// The cost model's ratios on Strix Halo through HSA (ROCm), identified by `calibrate-launch` over every candidate
 /// tiling of 8 shapes (POOT-1494, two runs of 80 rows: LDS read 10.2 and 9.6, staged value 8.6 and 8.2, repeating
 /// within about 6 %), refitted over the 160 rows together: LDS read 9.88, staged value 8.43, R^2 0.93. The direct
-/// value is the POOT-1489 microbench's: the centre of the range in which the model's Gemv-versus-grouped choices are
-/// never slower than the retired 32-row switch (11.9 to 23.6).
+/// value is the POOT-1489 microbench's range in which the model's Gemv-versus-grouped choices are never slower than
+/// the retired 32-row switch (11.9 to 23.6), cut at the top by the dense decode Gemv: above 15.2 the model puts a
+/// one-row contraction of a vocabulary-sized output onto a matrix unit, which is slower (POOT-1503). The centre of
+/// 11.9 to 15.2.
 pub const STRIX_HALO_HSA_COST_RATIOS: CostRatios = CostRatios {
     lds_read: 9.88,
     staged_value: 8.43,
-    direct_value: 16.8,
+    direct_value: 13.4,
 };
 
 /// The Gemv's direct value on the RTX PRO 6000 Blackwell Server (sm_120), identified by `calibrate-launch indexed` on
@@ -587,8 +589,8 @@ mod tests {
         },
         Provenance {
             name: "STRIX_HALO_HSA_DIRECT_VALUE_COST",
-            value: 16.8,
-            source: "POOT-1489 calibrate-launch indexed, gfx1151 ROCm, the same 88 cells: the direct values at which the model's choices are never slower than the retired 32-row switch (within 5 %) and within 5 % of the best mean regret are 11.9 to 23.6; the geometric centre. Two runs; mean regret against the faster of the two schedules 1.035 against the retired switch's 1.65",
+            value: 13.4,
+            source: "POOT-1489 calibrate-launch indexed, gfx1151 ROCm, the same 88 cells: the direct values at which the model's choices are never slower than the retired 32-row switch (within 5 %) and within 5 % of the best mean regret are 11.9 to 23.6. POOT-1503 cut the range at 15.2, the crossover at which the model's cost of a one-row dense Gemv of four columns per workgroup passes a fragment tiling's once both fill the device (the 16.8 centre moved the 151936-column head of qwen3-0.6b and qwen3-4b onto a matrix unit: decode 8 % and 5 % slower on ROCm); the geometric centre of 11.9 to 15.2. Two runs; the dense side is the model's own crossover, confirmed by the A/B of that head on ROCm",
         },
         Provenance {
             name: "SM_120_DIRECT_VALUE_COST",

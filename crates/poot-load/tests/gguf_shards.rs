@@ -177,6 +177,50 @@ fn sh7_a_lone_shard_is_refused() {
     );
 }
 
+/// SH-9 (POOT-1502): a first shard that holds only metadata and ends at its last header byte (unsloth's
+/// Qwen3.8-Flash-Next UD-Q2_K_XL since 2026-11-04) is a valid shard; the set loads, and a shard that
+/// does hold tensors and is cut inside the padding before its data is still refused.
+#[test]
+fn sh9_a_metadata_only_first_shard_ends_at_its_header() {
+    let parse = |bytes: &[u8]| GgufIndex::parse(&StoredBytes::from(bytes.to_vec()));
+    let second = shard(1, 2, 1, &[("a", 1.0)]);
+    let in_set = |first: &[u8]| {
+        GgufIndex::parse_shards(&[StoredBytes::from(first.to_vec()), second.clone()]).is_ok()
+    };
+    // The first shard of a two-shard set: metadata only, its header cut at the last byte of its last KV. Some
+    // padding length makes the header end off the 32-byte alignment, which is what the cut removes.
+    let metadata_only = (0..32)
+        .find_map(|pad| {
+            let bytes = write_gguf(
+                &[
+                    ("split.no", GgufValue::U32(0)),
+                    ("split.count", GgufValue::U32(2)),
+                    ("split.tensors.count", GgufValue::U32(1)),
+                    ("general.architecture", GgufValue::Str("test".into())),
+                    ("test.pad", GgufValue::Str("x".repeat(pad))),
+                ],
+                &[],
+            );
+            let end = (0..=bytes.len()).find(|&len| in_set(&bytes[..len]))?;
+            (end < bytes.len()).then(|| StoredBytes::from(bytes[..end].to_vec()))
+        })
+        .expect("some header length is off the alignment");
+    let files = [metadata_only, second];
+    let index = GgufIndex::parse_shards(&files).unwrap();
+    let store = read_gguf(&index, &IdentityNames).unwrap();
+    assert_eq!(values(&store, "a"), [1.0, 2.0, 3.0, 4.0]);
+
+    let with_tensor = shard(0, 1, 1, &[("a", 1.0)]);
+    let with_tensor = with_tensor.as_slice();
+    let header_end = (0..=with_tensor.len())
+        .find(|&len| parse(&with_tensor[..len]).is_ok())
+        .expect("the whole shard parses");
+    assert!(matches!(
+        parse(&with_tensor[..header_end - 1]),
+        Err(LoadError::SafeTensors(message)) if message.contains("tensor data start past end of file")
+    ));
+}
+
 /// SH-8 (POOT-1196): the first shard must sit at `split.no = 0`: another number, or none, is
 /// refused at position 0.
 #[test]

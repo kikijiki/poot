@@ -3,17 +3,13 @@
 // Also opens every docs page that embeds an architecture diagram at 1440, 1100 and 500 px and fails (exit 1) when the
 // page scrolls sideways or an element of the article is wider than the article column (a clipped diagram).
 // Usage: node scripts/screenshots.mjs <outdir>
-import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { serveDirectory, startBrowser } from "./harness.mjs";
 
 const out = process.argv[2] ?? "screenshots";
 const chromium = process.env.CHROMIUM ?? "chromium";
-const sitePort = 3998;
-const debugPort = 9333;
-const page = `http://127.0.0.1:${sitePort}/docs/performance`;
-
 
 // [name, query, script run once the page has rendered, variants]
 const shots = [
@@ -53,9 +49,11 @@ async function connect(url) {
   return { send, close: () => ws.close(), id: target.id, url };
 }
 
-const server = spawn("bun", ["run", "serve", "--", "--port", String(sitePort), "--no-open"], { stdio: "ignore" });
-const profile = mkdtempSync(join(tmpdir(), "poot-site-shots-"));
-const browser = spawn(chromium, ["--headless=new", "--no-sandbox", "--disable-gpu", "--hide-scrollbars", `--user-data-dir=${profile}`, `--remote-debugging-port=${debugPort}`, "about:blank"], { stdio: "ignore" });
+const site = await serveDirectory(join(dirname(fileURLToPath(import.meta.url)), "..", "build"));
+const sitePort = site.port;
+const browser = await startBrowser(chromium, "poot-site-shots-");
+const debugPort = browser.port;
+const page = `http://127.0.0.1:${sitePort}/docs/performance`;
 mkdirSync(out, { recursive: true });
 try {
   await sleep(5000);
@@ -104,6 +102,6 @@ try {
   }
   if (overflowing > 0) process.exitCode = 1;
 } finally {
-  browser.kill();
-  server.kill();
+  browser.stop();
+  site.stop();
 }

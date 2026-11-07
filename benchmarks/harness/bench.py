@@ -52,6 +52,7 @@ except ModuleNotFoundError:  # pragma: no cover
 try:
     from . import known_unverified
     from . import memory_phases
+    from . import page_cache
     from . import performance_receipt as receipts
     from .result_contract import (
         BUILD_IDENTITY_FIELDS,
@@ -65,6 +66,7 @@ try:
 except ImportError:  # direct `python harness/bench.py` execution
     import known_unverified
     import memory_phases
+    import page_cache
     import performance_receipt as receipts
     from result_contract import (
         BUILD_IDENTITY_FIELDS,
@@ -278,6 +280,9 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
         "precision": fw_cfg.get("precision", model.get("match_precision", "")),
         "scenario": scen["id"],
     }
+    if model.get("hf_revision"):
+        # The commit of the weights repo the cell ran on: a repo re-quantised in place changes what the name means.
+        base["weights_revision"] = model["hf_revision"]
     if not is_supported(fw_cfg):
         return {**base, "status": "unsupported", "reason": fw_cfg.get("reason", "unsupported"),
                 "caveats": _caveats(model, fw_cfg)}
@@ -333,7 +338,18 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
         if fw == "poot" and scen.get("prefill_chunk") is not None:
             cmd += ["--prefill-chunk", str(scen["prefill_chunk"])]
         on_line = _curve_progress(fw, isls)
+    # The page cache is an explicit condition of every cell, identical whichever engine ran before: the weights are
+    # read to the end first (POOT-1510), and the major faults the cell's process tree takes are recorded beside it.
+    if model.get("local_dir"):
+        try:
+            base["page_cache"] = page_cache.warm(model_dir)
+        except page_cache.WarmRefusal as refusal:
+            return {**base, "status": "unsupported", "reason": f"page cache not warmed ({refusal})",
+                    "caveats": _caveats(model, fw_cfg)}
+    faults_before = page_cache.children_major_faults()
     obs = run_observed(cmd, device=device, interval_s=interval_ms / 1000.0, on_line=on_line)
+    if "page_cache" in base:
+        base["page_cache"]["major_faults"] = page_cache.children_major_faults() - faults_before
     timing = parse_last_json_line(obs["stdout"])
     caveats = _merge_caveats(_caveats(model, fw_cfg), _runner_caveats(timing))
     caveats += [f"memory split unavailable: {error}" for error in obs["memory_mark_errors"]]
@@ -906,6 +922,10 @@ def _compare_cell(key, rows_a, rows_b, policy):
 
     cell.update(vram_a=_median_of(ok_a, "peak_vram_bytes"), vram_b=_median_of(ok_b, "peak_vram_bytes"))
     for side, ok in (("baseline", ok_a), ("candidate", ok_b)):
+        cold = [(n, faults) for n, r in enumerate(ok, 1) if (faults := page_cache.unexpected_faults(r)) is not None]
+        if cold:
+            repeats = ", ".join(f"repeat {n} took {faults} major faults" for n, faults in cold)
+            return settle(receipts.UNVERIFIED, f"the {side} was not on a warm page cache: {repeats}")
         if len({r.get("binary_sha256") for r in ok}) > 1:
             return settle(receipts.UNVERIFIED, f"the {side} runs mix binaries")
         identities = [receipts.row_identity(r) for r in ok]

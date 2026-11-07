@@ -366,7 +366,7 @@ struct ParsedHeader {
     data_start: usize,
 }
 
-fn parse_header(bytes: &[u8]) -> Result<ParsedHeader, LoadError> {
+fn parse_header(bytes: &[u8], in_set: bool) -> Result<ParsedHeader, LoadError> {
     let mut c = Cursor { b: bytes, p: 0 };
     if c.take(4)? != b"GGUF" {
         return Err(gerr("bad magic (not a GGUF file)"));
@@ -451,7 +451,9 @@ fn parse_header(bytes: &[u8]) -> Result<ParsedHeader, LoadError> {
     let data_start =
         c.p.checked_next_multiple_of(alignment)
             .ok_or_else(|| gerr("tensor data start overflows usize"))?;
-    if data_start > bytes.len() {
+    // A shard of a split set that holds no tensor (llama.cpp's split writer puts only metadata in the first) ends
+    // at its last header byte, before the padding that would align a data section it does not have.
+    if data_start > bytes.len() && !(in_set && tensors.is_empty()) {
         return Err(gerr("tensor data start past end of file"));
     }
 
@@ -560,7 +562,7 @@ impl GgufIndex {
         let first = files
             .first()
             .ok_or(LoadError::GgufSplit(GgufSplitError::NoShards))?;
-        let header = parse_header(first.as_slice())?;
+        let header = parse_header(first.as_slice(), files.len() > 1)?;
         let mut index = Self {
             version: header.version,
             metadata: header.metadata,
@@ -589,7 +591,7 @@ impl GgufIndex {
             }
         }
         for (position, file) in files.iter().enumerate().skip(1) {
-            let header = parse_header(file.as_slice())?;
+            let header = parse_header(file.as_slice(), true)?;
             let declared = header.metadata.get("split.no").and_then(GgufValue::as_u64);
             if declared != Some(position as u64) {
                 return Err(LoadError::GgufSplit(GgufSplitError::Order {

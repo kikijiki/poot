@@ -753,6 +753,50 @@ mod tests {
         }
     }
 
+    /// A one-row dense decode contraction stays on the Gemv on gfx1151 through HSA at every output count, the vocabulary
+    /// head's (150 000 columns and up) included: past the point where both launches fill the device, the Gemv costs
+    /// `1 + (1 + 1 / cols) * direct_value` issues per output and a fragment tiling a fixed 20, so the Gemv's direct
+    /// value must stay under the crossover (15.2 for four columns per workgroup). The direct value POOT-1489 fitted
+    /// on the indexed corpus alone (16.8) sat above it, so the head moved onto a matrix unit that reads the same
+    /// weight bytes through an LDS stage and decode went 8 % slower (POOT-1503). Mutation: restore
+    /// `STRIX_HALO_HSA_COST_RATIOS.direct_value` to 16.8; the rows from 16 384 columns up go red (observed: `[1, 1024] x [16384, 1024]^T moved onto a matrix unit`).
+    #[test]
+    fn a_one_row_dense_decode_stays_on_the_gemv_at_every_output_count() {
+        let caps = poot_target::DeviceCaps {
+            matrix_units: poot_target::Queried::Known(poot_target::MatrixUnits::amd("gfx1151", 32)),
+            compute_units: poot_target::Queried::Known(40),
+            perf_calibration: poot_target::calibration::Calibrated::STRIX_HALO_HSA,
+            ..poot_target::DeviceCaps::rocm_default()
+        };
+        for (n, k) in [
+            (1024, 1024),
+            (16384, 1024),
+            (65536, 1024),
+            (128_256, 4096),
+            (151_936, 1024),
+            (151_936, 2560),
+            (262_144, 2048),
+        ] {
+            let narrow = TiledShape {
+                terms: crate::precision::StagedTerms {
+                    fragment: Some(FragmentDtype::F16),
+                    ..crate::precision::StagedTerms::ONE
+                },
+                weight_bits: 16,
+                ..shape(1, k, n)
+            };
+            let gemv = GemvShape {
+                outputs: n,
+                width: 128,
+                cols: 4,
+            };
+            assert!(
+                !RegisterTiling::matrix_unit_wins(narrow, Some(gemv), &caps),
+                "[1, {k}] x [{n}, {k}]^T moved onto a matrix unit"
+            );
+        }
+    }
+
     /// A long prefill projection (`[2048, 1024] x [3072, 1024]^T`) fills the device many times over, so the
     /// tiling that stages least per FMA wins: the wide lane grid of 8x8 register tiles, a 128 x 128 output tile,
     /// on the ROCm, PTX and wgpu caps. Mutation: cost the lane step alone (drop the launch-lanes factor in

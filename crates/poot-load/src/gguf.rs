@@ -98,7 +98,12 @@ pub fn gguf_plan(index: &GgufIndex, names: &dyn TensorNameMap) -> Result<LoadPla
         }));
     }
     for (shard, file) in files.iter().enumerate() {
-        if index.data_start(shard) > file.len() {
+        // Only a shard of a split set may be metadata-only (llama.cpp's split writer ends the first at its last
+        // header byte, before the padding of a data section it does not have); a lone file with nothing to
+        // read is cut short.
+        let metadata_only =
+            files.len() > 1 && index.tensors.values().all(|info| info.shard != shard);
+        if !metadata_only && index.data_start(shard) > file.len() {
             return Err(gerr("tensor data start past end of file"));
         }
     }

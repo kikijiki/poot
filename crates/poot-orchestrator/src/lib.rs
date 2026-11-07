@@ -27,6 +27,7 @@ mod clock;
 mod gather;
 mod hardware;
 mod heal;
+mod hf;
 mod logging;
 mod manifest;
 mod workflow;

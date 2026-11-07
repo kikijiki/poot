@@ -1566,6 +1566,7 @@ poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_fragment_round_st
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_fragment_tile_of_one_wave_loses_to_the_exact_tiling
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_grouping_with_few_rows_per_expert_takes_a_short_block
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_long_prefill_takes_the_widest_tile
+poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_one_row_dense_decode_stays_on_the_gemv_at_every_output_count
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::grouped_rows_count_whole_tiles_per_bucket
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::rows_expected_to_touch_fewer_buckets_than_they_have
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_candidates_are_the_tilings_the_device_runs
@@ -3054,6 +3055,7 @@ poot-load	poot-load::gguf_shards	model-free	sh5_a_set_missing_tensors_is_not_loa
 poot-load	poot-load::gguf_shards	model-free	sh6_a_shard_name_names_the_set
 poot-load	poot-load::gguf_shards	model-free	sh7_a_lone_shard_is_refused
 poot-load	poot-load::gguf_shards	model-free	sh8_the_first_shard_must_be_number_zero
+poot-load	poot-load::gguf_shards	model-free	sh9_a_metadata_only_first_shard_ends_at_its_header
 poot-load	poot-load::gguf_whole_file_plan	checkpoint	every_tensor_of_every_local_qwen38_gguf_maps_to_a_format
 poot-load	poot-load::gguf_whole_file_plan	checkpoint	the_27b_iq3_s_tensor_plans_as_one_packed_iq3_s_owner
 poot-load	poot-load::hostile_inputs	model-free	a_data_start_exactly_at_the_end_of_the_file_loads
@@ -4126,6 +4128,9 @@ poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_second_exec_ne
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_signal_ends_the_run_cancelled_with_its_pod_terminated
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_stuck_newest_warm_pod_does_not_hide_an_older_reachable_one
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_sweep_is_not_started_on_a_pod_without_a_gpu
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_token_hugging_face_rejects_is_not_forwarded
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_token_hugging_face_vouches_for_is_forwarded
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_token_that_could_not_be_checked_is_not_forwarded
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_type_only_one_cloud_offers_is_a_miss_on_the_other_not_an_error
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_warm_exec_pod_over_the_cap_is_not_reused
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::a_warm_pod_runpod_no_longer_lists_is_closed_without_a_delete
@@ -4177,6 +4182,7 @@ poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_catalog_pric
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_catalog_refuses_an_over_cap_cloud_before_any_create
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_download_fetches_only_the_included_files
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_f16_gguf_is_made_only_for_a_llamacpp_model_that_downloads_as_safetensors
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_opening_reap_spares_the_idle_pod_a_reuse_names
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_periodic_gather_step_faults_a_pod_that_lost_its_gpu
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_resumed_sweep_skips_the_repeats_already_gathered
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_stored_status_says_whether_the_pod_was_lost_or_had_a_host_fault

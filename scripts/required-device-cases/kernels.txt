@@ -8,6 +8,7 @@
 # packed i32 lanes) the lane must compile and run on every kernels run, plus one ROCm dispatch of
 # the packed suites: it guards on its own context (not the lane's required wgpu backend), so a
 # hidden ROCm device turns it into a skip - and a skipped required case fails the gate.
+poot-kernelgen	contraction::tests::a_one_row_dense_decode_stays_on_the_gemv_at_every_output_count
 poot-kernelgen	packed::planar_wgpu_tests::the_register_tiled_body_runs_256_lane_workgroups_on_radv
 poot-kernelgen	packed::rocm_tests::contraction_wide_register_tile_matches_reference_on_rocm
 poot-kernelgen	packed::rocm_tests::packed_fragment_contractions_match_the_scalar_tiling_of_the_same_precision_on_rocm

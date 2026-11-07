@@ -15,7 +15,9 @@
   ],
   "later": "Other hardware targets, deeper decode fusion, release packaging and an API stability promise.",
   "limitations": [
-    "Behind llama.cpp in every measured cell: decode up to 5x slower, first token up to 100x slower. Holds up to 2x the GPU memory of llama.cpp at inference.",
+    "Behind llama.cpp on decode in every measured cell, up to 3.5x slower.",
+    "Behind on first token up to 8x slower, except qwen3-0.6b and qwen3-4b on Strix Halo ROCm and qwen3-0.6b at 128 tokens on the RTX PRO 6000.",
+    "Holds up to 2x the GPU memory of llama.cpp at inference.",
     "The benchmark grid is two machines and six models, with llama.cpp as the reference.",
     "There is no compatibility guarantee: APIs and formats change without notice.",
     "Benchmark cells that fail the noise contract are marked unverified and never counted."
@@ -288,7 +290,7 @@
       "column": "building",
       "icon": "bolt",
       "title": "Performance: decode, prefill and memory",
-      "line": "Behind llama.cpp on decode, first-token time and GPU memory at inference in every measured cell; host memory is lower on most Strix Halo cells.",
+      "line": "Behind llama.cpp on decode and GPU memory everywhere, on first token except Strix Halo qwen3 and one RTX PRO 6000 cell; host memory lower on most Strix.",
       "badge": "in-progress",
       "link": "/docs/performance"
     },

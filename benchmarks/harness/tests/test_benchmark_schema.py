@@ -125,6 +125,13 @@ class ResultSchemaTests(unittest.TestCase):
         self.assertEqual(self.errors(poot_row(device=None)), [])
         self.assertEqual(self.errors(poot_row(device=3)), ["$.device is not a schema string or null"])
 
+    def test_the_page_cache_state_is_warm_with_its_set_and_faults(self):
+        warm = {"state": "warm", "files": 2, "bytes": 1024, "major_faults": 0}
+        self.assertEqual(self.errors(poot_row(page_cache=warm)), [])
+        self.assertNotEqual(self.errors(poot_row(page_cache={**warm, "state": "cold"})), [])
+        self.assertNotEqual(self.errors(poot_row(page_cache={**warm, "major_faults": -1})), [])
+        self.assertNotEqual(self.errors(poot_row(page_cache=without(warm, "bytes"))), [])
+
 
 if __name__ == "__main__":
     unittest.main()
