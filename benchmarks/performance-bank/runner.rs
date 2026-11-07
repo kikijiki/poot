@@ -1258,9 +1258,24 @@ pub(crate) fn prepare(bank: &Value, case: &Value, ops: Operands) -> Result<Prepa
     }
 }
 
-pub(crate) fn staged(g: &Graph, target: Target, ops: Operands) -> Result<StagedProgram, String> {
+/// The compile facts of the bank's one device (`DeviceId(0)`, as `staged` partitions): its NPU lowering and its
+/// compiler's register feedback, so a case plans as the device's driver would (POOT-1505).
+pub(crate) fn facts_of<D: Device + ?Sized>(device: &D) -> poot_graph_plan::DeviceOptions {
+    poot_graph_plan::DeviceOptions::single(
+        DeviceId(0),
+        poot_executor::device_facts(device, poot_graph_plan::CompileLimits::STANDARD),
+    )
+}
+
+pub(crate) fn staged(
+    g: &Graph,
+    target: Target,
+    ops: Operands,
+    devices: &poot_graph_plan::DeviceOptions,
+) -> Result<StagedProgram, String> {
     let mut options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
-        .with_matmul_precision(ops.policy());
+        .with_matmul_precision(ops.policy())
+        .with_device(devices.clone());
     options.tiling_pin = ops.tiling;
     options.indexed_rows_pin = ops.indexed_rows;
     options.gemv_cols_pin = ops.gemv_cols;
@@ -1328,6 +1343,7 @@ where
     D: Device + 'static,
 {
     let target = device.target();
+    let devices = facts_of(&device);
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
 
     let mut builder = WeightStore::builder();
@@ -1356,7 +1372,7 @@ where
     let mut entries = Vec::new();
     let mut plan = Vec::new();
     for g in &graphs {
-        let program = staged(g, target, ops)?;
+        let program = staged(g, target, ops, &devices)?;
         plan = plan_of(&program);
         entries.push(
             exec.add_entry(exe, &program)

@@ -11,6 +11,7 @@
 //! ([`PtxContext::copy_buffer`], `cuMemcpyDtoDAsync` on the capturing stream), ordered like any dispatch
 //! and byte-exact for any length and element kind: the device generates no kernel.
 
+use crate::register_oracle::PtxKernelRegisters;
 use poot_codegen::CompiledKernel;
 use poot_executor::{Arg, Device, DeviceTime, Dispatch, LaunchKind, MeasuredDeviceTime};
 use poot_graph_plan::Target;
@@ -37,6 +38,9 @@ pub struct PtxRecording {
 /// one per GPU.
 pub struct PtxDevice {
     ctx: PtxContext,
+    /// This device's CUDA driver as the engine's compile feedback (POOT-1505): what a kernel allocates, asked of the
+    /// compiler that will run the plan.
+    registers: std::sync::Arc<PtxKernelRegisters>,
     /// The open step's device-timed spans (Card 552 SC-006), one per [`Self::replay`] since
     /// [`Self::begin_step`], read by [`Self::device_time`]; empty when this device was not built with
     /// [`PtxContext::new_with_device_timing`], or no step has replayed yet.
@@ -46,27 +50,29 @@ pub struct PtxDevice {
 impl PtxDevice {
     /// A device on the default GPU, with no device timing; see [`Self::open`] for a chosen ordinal.
     pub fn new() -> Result<Self, PtxGpuError> {
-        Ok(Self::with_context(PtxContext::new()?))
+        Self::with_context(PtxContext::new()?)
     }
 
     /// Like [`Self::new`], but every graph replay is bracketed by a CUDA event pair, so
     /// [`Device::device_time`] is `Measured` (the device span; PTX has no per-dispatch timing inside a
     /// captured graph).
     pub fn new_with_device_timing() -> Result<Self, PtxGpuError> {
-        Ok(Self::with_context(PtxContext::new_with_device_timing()?))
+        Self::with_context(PtxContext::new_with_device_timing()?)
     }
 
     /// A device on GPU `ordinal`: one of the devices a [`poot_executor::Coordinator`] drives. Several
     /// may live on one host thread.
     pub fn open(ordinal: usize) -> Result<Self, PtxGpuError> {
-        Ok(Self::with_context(PtxContext::open(ordinal)?))
+        Self::with_context(PtxContext::open(ordinal)?)
     }
 
-    fn with_context(ctx: PtxContext) -> Self {
-        Self {
+    fn with_context(ctx: PtxContext) -> Result<Self, PtxGpuError> {
+        let registers = std::sync::Arc::new(PtxKernelRegisters::new(&ctx)?);
+        Ok(Self {
             ctx,
+            registers,
             pending_spans: Vec::new(),
-        }
+        })
     }
 
     /// Diagnostic access to the underlying context (e.g. `profiler()`).
@@ -93,6 +99,10 @@ impl Device for PtxDevice {
             backend: Backend::Nvptx,
             caps: self.ctx.device_caps(),
         }
+    }
+
+    fn kernel_registers(&self) -> Option<std::sync::Arc<dyn poot_executor::KernelRegisters>> {
+        Some(self.registers.clone())
     }
 
     fn memory(&self) -> Vec<(BufferRole, poot_runtime_common::MemoryCounterSnapshot)> {

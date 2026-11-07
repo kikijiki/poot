@@ -284,6 +284,13 @@ pub trait Device {
         None
     }
 
+    /// The compiler this device asks what a kernel allocates (POOT-1505): a device whose runtime can compile a kernel
+    /// it is handed and read its registers returns it, and the engine plans its programs with the verdicts, lowering
+    /// each candidate's probe itself. `None` (the default) plans with the register model alone.
+    fn kernel_registers(&self) -> Option<std::sync::Arc<dyn crate::KernelRegisters>> {
+        None
+    }
+
     /// Live/peak bytes and allocation count by role, read from this device's own runtime counters
     /// (Card 547a: `Engine::stats().memory` reads this, not an engine-side tally over its own
     /// bookkeeping, so cross-backend equality is not equal by construction).

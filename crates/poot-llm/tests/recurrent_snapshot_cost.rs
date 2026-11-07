@@ -432,7 +432,13 @@ fn planned_state_bytes(family: FamilyKey) -> u64 {
     let engine = Engine::new(CountingDevice {
         memory: MemoryCounters::new(),
     });
-    let planner = Planner::new(handle, &engine.target_set(), Placement::Single).unwrap();
+    let planner = Planner::new(
+        handle,
+        &engine.target_set(),
+        Placement::Single,
+        poot_graph_plan::DeviceOptions::none_for(&engine.target_set()),
+    )
+    .unwrap();
     let planned = planner
         .plan(
             options(),

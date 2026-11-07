@@ -507,10 +507,17 @@ pub(super) fn register_tiled_launch(
         // A narrowed or split read runs on a matrix unit or not at all (POOT-1476): the op is narrowed because its
         // fragment tiling won the selection (`RegisterTiling::select`, POOT-1505), and a scalar tiling would round for
         // no speed. A refusal, never a silent exact plan.
-        kg::RegisterTiling::tiling_of(shape, caps)
+        kg::RegisterTiling::tiling_of(shape, caps, site.feasibility())
             .ok_or_else(|| site.refuse(Capability::NoMatrixUnitSchedule))?
     } else {
-        kg::RegisterTiling::choose(shape, caps)
+        match site.feasibility() {
+            kg::Feasibility::Model => kg::RegisterTiling::choose(shape, caps),
+            // With feedback a tiling runs only where the compiler holds it: no fallback that may spill.
+            compiled @ kg::Feasibility::Compiled(_) => {
+                kg::RegisterTiling::tiling_of(shape, caps, compiled)
+                    .ok_or_else(|| site.refuse(Capability::NoTilingHoldsItsRegisters))?
+            }
+        }
     };
     let (tile_rows, tile_cols) = tiling.output_tile();
     // A grouping's tile is one output tile: a tiling of other rows would read two buckets' rows as one expert's.

@@ -59,9 +59,9 @@ pub use scan::{ScanKernel, ScanSpec};
 #[cfg(any(test, feature = "test-support"))]
 pub use contraction::{CostFit, fit_cost_ratios};
 pub use contraction::{
-    CostTerms, DenseTiledWeight, Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep,
-    GemvActivation, GemvShape, RegisterTiling, RunLength, Schedule, Selection, StagedWeight,
-    TileSize, TiledRows, TiledShape,
+    CostTerms, DenseTiledWeight, Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep, Feasibility,
+    GemvActivation, GemvShape, RegisterTiling, RunLength, Schedule, Selection, SpillCheck,
+    StagedWeight, TileSize, TiledRows, TiledShape, probe_body,
 };
 pub use fused::{
     FusedInput, FusedKernel, FusedScalarOp, FusedStep, LaneId, LeafId, LeafTy, RowKernel, RowOp,

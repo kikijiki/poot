@@ -108,6 +108,8 @@ pub struct NativeCounters {
     pub modules: u64,
     /// Peer copies recorded into a capture.
     pub peer_copies: u64,
+    /// Kernels the driver's JIT compiled only to report their registers ([`crate::PtxCompilerProbe`]).
+    pub register_probes: u64,
 }
 
 /// The live counters behind [`NativeCounters`]; `Relaxed` is enough because they only count.
@@ -118,6 +120,7 @@ pub(crate) struct OwnerCounters {
     pub(crate) events: AtomicU64,
     pub(crate) modules: AtomicU64,
     pub(crate) peer_copies: AtomicU64,
+    pub(crate) register_probes: AtomicU64,
 }
 
 impl OwnerCounters {
@@ -132,6 +135,7 @@ impl OwnerCounters {
             events: self.events.load(Ordering::Relaxed),
             modules: self.modules.load(Ordering::Relaxed),
             peer_copies: self.peer_copies.load(Ordering::Relaxed),
+            register_probes: self.register_probes.load(Ordering::Relaxed),
         }
     }
 }

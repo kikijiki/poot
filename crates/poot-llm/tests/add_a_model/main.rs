@@ -515,6 +515,12 @@ impl Executor for Counting {
     fn target_set(&self) -> TargetSet {
         self.inner.target_set()
     }
+    fn device_options(
+        &self,
+        limits: poot_graph_plan::CompileLimits,
+    ) -> poot_graph_plan::DeviceOptions {
+        self.inner.device_options(limits)
+    }
     fn free_memory_bytes(&self) -> Option<u64> {
         self.inner.free_memory_bytes()
     }

@@ -630,7 +630,11 @@ pub fn compile_staged(
     if uncut && late_site.is_none() {
         let only = &placement.stages[0];
         let mut program = StagedProgram::single(
-            crate::compile(&adapted, &only.target, &stage_options)?,
+            crate::compile(
+                &adapted,
+                &only.target,
+                &stage_options.for_device(only.device),
+            )?,
             only.device,
         );
         program.tensor = tensor;
@@ -673,7 +677,11 @@ pub fn compile_staged(
     devices::admit_links(&adapted, &split.boundaries, &placement)?;
     let mut stages = Vec::with_capacity(split.stages.len());
     for (index, (stage, placed)) in split.stages.iter().zip(&placement.stages).enumerate() {
-        let program = crate::compile(&stage.graph, &placed.target, &stage_options)?;
+        let program = crate::compile(
+            &stage.graph,
+            &placed.target,
+            &stage_options.for_device(placed.device),
+        )?;
         stages.push((StageId(index as u32), placed.device, program));
     }
 

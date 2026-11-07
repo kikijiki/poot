@@ -200,6 +200,7 @@ fn main() -> anyhow::Result<()> {
     let fitted = fit_prefill_chunk(
         &handle,
         &executor.target_set(),
+        executor.device_options(options.prefill.limits),
         || Observation::of(&*executor),
         &options,
         &shapes,

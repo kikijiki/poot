@@ -32,7 +32,7 @@ use poot_executor::{
     Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine, ExecError, Executor,
     NativeCounters, SharedKernels, SharedKernelsMismatch, SupportBound, WeightUpload,
 };
-use poot_graph_plan::{Target, multi_device::topology::DeviceId, staged::TargetSet};
+use poot_graph_plan::{DeviceOptions, Target, multi_device::topology::DeviceId, staged::TargetSet};
 use poot_models::io::InputId;
 use poot_runtime_common::{AllocGuard, BufferRole, MemoryCounterSnapshot, MemoryCounters};
 use poot_target::BufferStorage;
@@ -468,6 +468,9 @@ pub struct Planned {
     /// candidate of the same [`Planner`] had already resolved, so the sum over a planning pass is the
     /// number of distinct kernels (POOT-1068).
     pub kernels_resolved: u64,
+    /// The device and the compiler of each planned stage ([`super::DriverStats::planned_with`]): the device's
+    /// compiler when the planner was given its facts, `None` for a stage planned by the register model alone.
+    pub planned_with: Vec<(DeviceId, Option<poot_target::KernelCompiler>)>,
 }
 
 /// A candidate the plan step could not produce a footprint for.
@@ -792,17 +795,19 @@ pub struct FittedChunk {
 /// as without this call. A device that cannot report its free memory admits nothing and keeps the first
 /// candidate. When no candidate fits the smallest one's [`CapacityRefusal::OverBudget`] names the largest
 /// allocations and the shortfall. `options.prefill_chunk` is replaced by each candidate; the caller
-/// prepares the chosen chunk with the same `shapes`.
+/// prepares the chosen chunk with the same `shapes`. `devices` are the devices' compile facts, as
+/// [`Planner::new`] takes them.
 pub fn fit_prefill_chunk(
     handle: &Arc<ModelHandle>,
     targets: &TargetSet,
+    devices: DeviceOptions,
     mut observe: impl FnMut() -> Observation,
     options: &DriverOptions,
     shapes: &ServingShapes<'_>,
     candidates: &[NonZeroUsize],
 ) -> Result<FittedChunk, AdmitError> {
-    let planner =
-        Planner::new(Arc::clone(handle), targets, Placement::Single).map_err(PlanError::from)?;
+    let planner = Planner::new(Arc::clone(handle), targets, Placement::Single, devices)
+        .map_err(PlanError::from)?;
     let observe = || Budget::observed(&observe(), SUPPORT_RESERVE_BYTES);
     let fit = fit(
         candidates,
@@ -852,15 +857,23 @@ pub struct Planner {
     kernels: SharedKernels,
     /// Pool rows per routed selection when the planned drivers page their experts.
     pool: Option<NonZeroUsize>,
+    /// The compile facts of the devices planned for ([`Planner::new`]).
+    devices: DeviceOptions,
 }
 
 impl Planner {
     /// A planner for `placement` over the devices of `targets`: the footprint it returns names the bytes
     /// each device owns, so each device's budget is checked on its own.
+    ///
+    /// `devices` are the compile facts of the devices planned for (POOT-1505): the real executor's
+    /// ([`poot_executor::Executor::device_options`]), so the planned programs are the ones the served driver
+    /// compiles, register feedback included. A tool with no device to ask passes devices with no facts on purpose
+    /// (`DeviceOptions::none_for`), and its plans record no compiler.
     pub fn new(
         handle: Arc<ModelHandle>,
         targets: &TargetSet,
         placement: Placement,
+        devices: DeviceOptions,
     ) -> Result<Self, DriverError> {
         let placed = Placed::resolve(targets.clone(), placement)?;
         let target = targets.devices()[0].1.id();
@@ -869,6 +882,7 @@ impl Planner {
             placed,
             kernels: SharedKernels::new(target),
             pool: None,
+            devices,
         })
     }
 
@@ -957,16 +971,21 @@ impl Planner {
             .collect::<Vec<_>>();
         let mut driver = match self.placed.placement() {
             Placement::Single => {
-                let (_, device) = devices.remove(0);
+                let (id, device) = devices.remove(0);
                 Driver::new(
                     Arc::clone(&self.handle),
-                    Box::new(Engine::new(device).with_shared_kernels(self.kernels.clone())?),
+                    Box::new(
+                        Engine::new(device)
+                            .with_shared_kernels(self.kernels.clone())?
+                            .planning_for(self.devices.of(id)),
+                    ),
                     options,
                 )?
             }
             placement => {
                 let coordinator = Coordinator::new(devices)
-                    .map_err(|e| DriverError::Device(ExecError::from(e)))?;
+                    .map_err(|e| DriverError::Device(ExecError::from(e)))?
+                    .planning_for(&self.devices);
                 Driver::placed(
                     Arc::clone(&self.handle),
                     coordinator,
@@ -995,6 +1014,7 @@ impl Planner {
             }
         }
         let stats = driver.executor_stats();
+        let planned_with = driver.stats().planned_with;
         drop(driver);
         let residue = counters
             .iter()
@@ -1004,6 +1024,7 @@ impl Planner {
         Ok(Planned {
             weight_bytes_read: stats.weight_bytes_read,
             kernels_resolved: stats.kernels_resolved,
+            planned_with,
             footprint,
             residue,
         })
@@ -1356,6 +1377,7 @@ mod tests {
                     residue: BTreeMap::new(),
                     weight_bytes_read: 0,
                     kernels_resolved: 0,
+                    planned_with: Vec::new(),
                 })
             },
             || budget.clone(),
@@ -1467,6 +1489,7 @@ mod tests {
             },
             weight_bytes_read: 0,
             kernels_resolved: 0,
+            planned_with: Vec::new(),
         }
     }
 
@@ -1765,8 +1788,13 @@ mod tests {
             chain: None,
         };
         let plan = |pool: Option<usize>| {
-            let mut planner =
-                Planner::new(Arc::clone(&handle), &targets, Placement::Single).unwrap();
+            let mut planner = Planner::new(
+                Arc::clone(&handle),
+                &targets,
+                Placement::Single,
+                poot_graph_plan::DeviceOptions::none_for(&targets),
+            )
+            .unwrap();
             if let Some(slots) = pool {
                 planner = planner.with_expert_pool(NonZeroUsize::new(slots).unwrap());
             }

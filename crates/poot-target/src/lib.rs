@@ -20,12 +20,14 @@ mod access;
 pub mod aie;
 pub mod calibration;
 pub mod dram_channels;
+mod kernel_compiler;
 mod matrix;
 mod register_file;
 pub mod storage;
 pub mod vpu;
 pub use access::ArgAccess;
 pub use aie::{AieCaps, AieIsa, AiePlatform, AieTargetId};
+pub use kernel_compiler::KernelCompiler;
 pub use matrix::{
     CooperativeMatrixConfig, FragmentConfig, FragmentDtype, FragmentLayout, FragmentShape, LaneMap,
     MatrixUnits, OperandNarrowing, RoundingConversions,

@@ -1207,10 +1207,15 @@ fn the_planner_keeps_a_footprint_per_device() {
     let shapes = serving();
     let reference = {
         let one = TargetSet::single(DeviceId(0), target());
-        Planner::new(Arc::clone(&handle), &one, Placement::Single)
-            .unwrap()
-            .plan(options(), &shapes, &[])
-            .unwrap()
+        Planner::new(
+            Arc::clone(&handle),
+            &one,
+            Placement::Single,
+            poot_graph_plan::DeviceOptions::none_for(&one),
+        )
+        .unwrap()
+        .plan(options(), &shapes, &[])
+        .unwrap()
     };
     let whole = per_device(&reference.footprint, BufferRole::Weight)[0];
     let head_bytes = (VOCAB * HIDDEN * 4) as u64;
@@ -1222,10 +1227,15 @@ fn the_planner_keeps_a_footprint_per_device() {
         // Half of every cut weight on each rank; the head, which the final stage reads, on one.
         (tensor(), Some(head_bytes)),
     ] {
-        let planned = Planner::new(Arc::clone(&handle), &targets, placement.clone())
-            .unwrap()
-            .plan(options(), &shapes, &[])
-            .unwrap();
+        let planned = Planner::new(
+            Arc::clone(&handle),
+            &targets,
+            placement.clone(),
+            poot_graph_plan::DeviceOptions::none_for(&targets),
+        )
+        .unwrap()
+        .plan(options(), &shapes, &[])
+        .unwrap();
         let weights = per_device(&planned.footprint, BufferRole::Weight);
         assert!(
             weights.iter().all(|&bytes| bytes > 0),
@@ -1257,10 +1267,15 @@ fn each_devices_planned_role_bytes_equal_its_own_prepared_counters() {
     let targets = TargetSet::new(vec![(DeviceId(0), target()), (DeviceId(1), target())]).unwrap();
     let shapes = serving();
     for placement in [pipeline(), tensor()] {
-        let planned = Planner::new(Arc::clone(&handle), &targets, placement.clone())
-            .unwrap()
-            .plan(options(), &shapes, &[])
-            .unwrap();
+        let planned = Planner::new(
+            Arc::clone(&handle),
+            &targets,
+            placement.clone(),
+            poot_graph_plan::DeviceOptions::none_for(&targets),
+        )
+        .unwrap()
+        .plan(options(), &shapes, &[])
+        .unwrap();
         let (driver, _) = placed(&handle, placement.clone()).unwrap();
         let driver = driver.prepare(&shapes).expect("the shapes prepare");
         let live = driver.live_device_bytes();
@@ -1283,10 +1298,15 @@ fn each_devices_planned_role_bytes_equal_its_own_prepared_counters() {
 fn every_planned_owner_names_a_device_of_the_placement() {
     let handle = handle();
     let targets = TargetSet::new(vec![(DeviceId(0), target()), (DeviceId(1), target())]).unwrap();
-    let planned = Planner::new(Arc::clone(&handle), &targets, tensor())
-        .unwrap()
-        .plan(options(), &serving(), &[])
-        .unwrap();
+    let planned = Planner::new(
+        Arc::clone(&handle),
+        &targets,
+        tensor(),
+        poot_graph_plan::DeviceOptions::none_for(&targets),
+    )
+    .unwrap()
+    .plan(options(), &serving(), &[])
+    .unwrap();
     let owners: Vec<&AllocationOwner> = planned.footprint.owners().collect();
     assert!(!owners.is_empty());
     assert!(
@@ -1316,7 +1336,13 @@ fn the_fit_refuses_a_short_rank_of_either_placement_naming_it() {
     let targets = TargetSet::new(vec![(DeviceId(0), target()), (DeviceId(1), target())]).unwrap();
     let shapes = serving();
     for placement in [pipeline(), tensor()] {
-        let planner = Planner::new(Arc::clone(&handle), &targets, placement.clone()).unwrap();
+        let planner = Planner::new(
+            Arc::clone(&handle),
+            &targets,
+            placement.clone(),
+            poot_graph_plan::DeviceOptions::none_for(&targets),
+        )
+        .unwrap();
         let plan = |_: &u8| {
             planner
                 .plan(options(), &shapes, &[])
@@ -1460,10 +1486,15 @@ fn each_ranks_paged_kv_footprint_is_its_heads_of_the_pool_and_equals_the_prepare
     let shapes = paged_serving();
 
     let one = TargetSet::single(DeviceId(0), target());
-    let reference = Planner::new(Arc::clone(&handle), &one, Placement::Single)
-        .unwrap()
-        .plan(options(), &shapes, &[])
-        .unwrap();
+    let reference = Planner::new(
+        Arc::clone(&handle),
+        &one,
+        Placement::Single,
+        poot_graph_plan::DeviceOptions::none_for(&one),
+    )
+    .unwrap()
+    .plan(options(), &shapes, &[])
+    .unwrap();
     let whole = per_device(&reference.footprint, BufferRole::State)[0];
     assert_eq!(
         whole,
@@ -1471,10 +1502,15 @@ fn each_ranks_paged_kv_footprint_is_its_heads_of_the_pool_and_equals_the_prepare
         "the single device holds the whole pool"
     );
 
-    let planned = Planner::new(Arc::clone(&handle), &targets, tensor())
-        .unwrap()
-        .plan(options(), &shapes, &[])
-        .unwrap();
+    let planned = Planner::new(
+        Arc::clone(&handle),
+        &targets,
+        tensor(),
+        poot_graph_plan::DeviceOptions::none_for(&targets),
+    )
+    .unwrap()
+    .plan(options(), &shapes, &[])
+    .unwrap();
     let state = per_device(&planned.footprint, BufferRole::State);
     assert_eq!(
         state,
@@ -1495,5 +1531,93 @@ fn each_ranks_paged_kv_footprint_is_its_heads_of_the_pool_and_equals_the_prepare
             .find(|&&(role, _)| role == BufferRole::State)
             .map_or(0, |&(_, bytes)| bytes);
         assert_eq!(state[index], live, "State on {device:?}");
+    }
+}
+
+/// The CUDA driver of an RTX PRO 6000 (POOT-1505): the compiler the rows below give a device.
+const CUDA: poot_target::KernelCompiler = poot_target::KernelCompiler::CudaDriver {
+    release: 13_020,
+    compute_capability: (12, 0),
+};
+
+/// The facts of a PTX device whose compiler holds every probe's registers.
+fn cuda_facts() -> poot_graph_plan::DeviceFacts {
+    poot_graph_plan::DeviceFacts {
+        npu: None,
+        register_feedback: Some(poot_graph_plan::RegisterFeedback::new(
+            poot_graph_plan::FakeCompiledRegisters {
+                compiler: CUDA,
+                verdict: Box::new(|_| {
+                    Ok(poot_graph_plan::RegisterVerdict {
+                        registers: 32,
+                        local_bytes: 0,
+                    })
+                }),
+                compiles: std::sync::atomic::AtomicUsize::new(0),
+            },
+        )),
+    }
+}
+
+/// POOT-1505: every program the production preparation compiles plans with its device's compiler, whichever
+/// program it is (prefill and decode here), when the planner is given the device's facts; a GPU-free plan given none
+/// records none. The planner runs the driver's own `Driver::compile`, so this holds both: the driver attaches the
+/// executor's facts at its one compile point, and the capacity planner's engine reports the real device's.
+///
+/// Mutations: drop `.with_device(..)` in `Driver::compile`, or `.planning_for(..)` in `Planner::plan_with`; every
+/// stage reads `None`.
+#[test]
+fn every_planned_program_asks_its_device_compiler() {
+    let handle = handle();
+    let targets = TargetSet::single(DeviceId(0), target());
+    let plan = |devices| {
+        Planner::new(Arc::clone(&handle), &targets, Placement::Single, devices)
+            .unwrap()
+            .plan(options(), &serving(), &[])
+            .unwrap()
+            .planned_with
+    };
+    let with = plan(poot_graph_plan::DeviceOptions::single(
+        DeviceId(0),
+        cuda_facts(),
+    ));
+    assert!(with.len() >= 2, "a prefill and a decode program: {with:?}");
+    assert!(
+        with.iter().all(|&(_, compiler)| compiler == Some(CUDA)),
+        "{with:?}"
+    );
+    let without = plan(poot_graph_plan::DeviceOptions::none_for(&targets));
+    assert!(
+        without.iter().all(|&(_, compiler)| compiler.is_none()),
+        "{without:?}"
+    );
+}
+
+/// POOT-1505: a stage plans with its own device's compiler. In a pipeline over two devices where only device 1's
+/// compiler can be asked, every stage on device 0 records none and every stage on device 1 the compiler.
+///
+/// Mutation: make `CompileOptions::for_device` return the options as they are (one set of facts for every stage);
+/// device 1's stages read `None`.
+#[test]
+fn each_stage_plans_with_its_own_devices_compiler() {
+    let handle = handle();
+    let targets = TargetSet::new(vec![(DeviceId(0), target()), (DeviceId(1), target())]).unwrap();
+    let devices = poot_graph_plan::DeviceOptions::none([DeviceId(0)]).union(
+        poot_graph_plan::DeviceOptions::single(DeviceId(1), cuda_facts()),
+    );
+    let planned = Planner::new(Arc::clone(&handle), &targets, pipeline(), devices)
+        .unwrap()
+        .plan(options(), &serving(), &[])
+        .unwrap()
+        .planned_with;
+    for device in [DeviceId(0), DeviceId(1)] {
+        assert!(
+            planned.iter().any(|&(on, _)| on == device),
+            "a stage on {device:?}: {planned:?}"
+        );
+    }
+    for &(device, compiler) in &planned {
+        let expected = (device == DeviceId(1)).then_some(CUDA);
+        assert_eq!(compiler, expected, "a stage on {device:?}: {planned:?}");
     }
 }

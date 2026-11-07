@@ -22,6 +22,7 @@ mod device;
 mod engine;
 mod error;
 mod host_memory;
+mod kernel_registers;
 mod lanes;
 mod shared_kernels;
 mod timing;
@@ -38,6 +39,7 @@ pub use device::{
 pub use engine::Engine;
 pub use error::{BindError, ChainError, DeviceError, DispatchError, ExecError, LoadError};
 pub use host_memory::{HostMemory, LoadMemory};
+pub use kernel_registers::{KernelRegisters, KernelRegistersError, device_facts};
 use poot_runtime_common::{BufferRole, DeviceIdentity, MemoryCounterSnapshot};
 use poot_tensor::{HostTensor, HostView};
 pub use shared_kernels::{SharedKernels, SharedKernelsMismatch};
@@ -487,10 +489,14 @@ pub trait Executor {
     fn device_identity(&self) -> Option<DeviceIdentity> {
         None
     }
-    /// The options a compile for this executor's device takes: `limits`, and for an NPU the lowering its device
-    /// owns ([`RegionLoader::lowering`]). The default is the options of a device with no region loader.
+    /// What each device this executor drives brings to a compile under `limits` (POOT-1505): its NPU lowering
+    /// ([`RegionLoader::lowering`]) and its compiler's register feedback ([`Device::kernel_registers`], the probe
+    /// lowered by the engine). Required, with no default, so an executor cannot drop its devices' facts by omission;
+    /// a test executor with no device states [`poot_graph_plan::DeviceOptions::none`] on purpose.
+    fn device_options(&self, limits: CompileLimits) -> poot_graph_plan::DeviceOptions;
+    /// The options a compile for this executor takes: `limits` and its devices' facts ([`Self::device_options`]).
     fn compile_options(&self, limits: CompileLimits) -> CompileOptions {
-        CompileOptions::new(limits)
+        CompileOptions::new(limits).with_device(self.device_options(limits))
     }
     /// A new executable over `store`, its consts bound by `weights`. Records both and uploads
     /// nothing: a weight's device lane is a per-program planning decision, so upload happens at

@@ -253,6 +253,16 @@ pub struct Coordinator<D: Device + Collectives> {
 }
 
 impl<D: Device + Collectives> Coordinator<D> {
+    /// This planning coordinator planning for devices whose compile facts `devices` holds
+    /// ([`Engine::planning_for`], POOT-1505).
+    #[must_use]
+    pub fn planning_for(mut self, devices: &poot_graph_plan::DeviceOptions) -> Self {
+        for (&id, engine) in self.devices.iter().zip(&mut self.engines) {
+            engine.plan_for(devices.of(id));
+        }
+        self
+    }
+
     /// A coordinator over `devices`, one engine each, in rank order.
     pub fn new(devices: Vec<(DeviceId, D)>) -> Result<Self, CoordinatorError> {
         if devices.is_empty() {
@@ -623,6 +633,22 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
                 .collect(),
         )
         .expect("the devices were checked distinct at construction")
+    }
+
+    fn device_options(
+        &self,
+        limits: poot_graph_plan::CompileLimits,
+    ) -> poot_graph_plan::DeviceOptions {
+        self.devices
+            .iter()
+            .zip(&self.engines)
+            .map(|(&id, engine)| {
+                poot_graph_plan::DeviceOptions::single(id, engine.device_facts(limits))
+            })
+            .fold(
+                poot_graph_plan::DeviceOptions::EMPTY,
+                poot_graph_plan::DeviceOptions::union,
+            )
     }
 
     fn device_memory(&self) -> Vec<DeviceMemory> {

@@ -497,10 +497,12 @@ pub(crate) fn runs_on_matrix_unit(
     views: &HashMap<ValueId, Layout>,
     limits: &BodyLimits,
     npu: Option<&dyn NpuLowering>,
+    feedback: Option<&crate::RegisterFeedback>,
 ) -> bool {
     let Target::Gpu { backend, caps } = target else {
         return false;
     };
+    let feasibility = crate::register_feedback::feasibility(feedback);
     let grouped = match &eqn.op {
         OpKind::IndexedMatMul {
             rows: ExpertRows::PerRow,
@@ -519,7 +521,7 @@ pub(crate) fn runs_on_matrix_unit(
         _ => None,
     };
     if let Some(shape) = grouped {
-        return shape.is_some_and(|shape| narrows(shape, None, caps));
+        return shape.is_some_and(|shape| narrows(shape, None, caps, feasibility));
     }
     if plan_eqn_compiled(g, eqn, target, views, limits, npu, OutputBuffer::Fresh).is_err() {
         return false;
@@ -528,7 +530,7 @@ pub(crate) fn runs_on_matrix_unit(
     let shapes = packed::dense_cost_shapes(tables, eqn, caps)
         .or_else(|| packed_dequant::packed_cost_shapes(tables, eqn, *backend, caps, *limits))
         .or_else(|| matmul::matmul_cost_shape(g, eqn, caps).map(|shape| (shape, None)));
-    shapes.is_none_or(|(tiled, gemv)| narrows(tiled, gemv, caps))
+    shapes.is_none_or(|(tiled, gemv)| narrows(tiled, gemv, caps, feasibility))
 }
 
 /// Whether the selection over `shape`'s exact and narrowed schedules (and the exact Gemv `gemv`) chooses its
@@ -537,8 +539,9 @@ fn narrows(
     shape: poot_kernelgen::TiledShape,
     gemv: Option<poot_kernelgen::GemvShape>,
     caps: &DeviceCaps,
+    feasibility: poot_kernelgen::Feasibility<'_>,
 ) -> bool {
-    poot_kernelgen::RegisterTiling::select(shape, gemv, caps)
+    poot_kernelgen::RegisterTiling::select(shape, gemv, caps, feasibility)
         .is_some_and(poot_kernelgen::Selection::narrows)
 }
 

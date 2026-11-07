@@ -61,6 +61,7 @@ mod types;
 /// value (Card 547b).
 mod buffer_plan;
 mod compile;
+mod device_options;
 mod entry_arena;
 mod graph_validation;
 mod kernel_mapping;
@@ -71,6 +72,7 @@ mod npu;
 mod passes;
 mod planner;
 mod refusal;
+mod register_feedback;
 mod storage_analysis;
 
 pub use buffer_plan::{ArenaSlotId, BufferPlan};
@@ -97,6 +99,7 @@ pub use passes::{
 // default build has no way to name or sequence one. Gated here (ADR-0113 point 3: no forwarder, consumers
 // call the real thing through this feature edge) because pass-soundness and plan-shape tests across the
 // workspace drive an individual pass directly.
+pub use device_options::{DeviceFacts, DeviceOptions};
 pub use graph_validation::{ValidationPacketPlan, ValidationPacketSource};
 #[cfg(any(test, feature = "test-support"))]
 pub use passes::{
@@ -109,6 +112,12 @@ pub use planner::{KernelChoice, NoDispatch, Planned, region_member_work};
 pub use planner::{plan_eqn, plan_eqn_choice, plan_eqn_views};
 pub use predicates::{IndexedRows, compute_views, numel, value_ids};
 pub use refusal::{Capability, FusedStepGap, Refusal, RefusalDtypes, StorageGap};
+pub use register_feedback::{
+    CompiledRegisters, FeedbackError, RegisterFeedback, RegisterProbe, RegisterVerdict,
+    VerdictCache,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use register_feedback::{FakeCompiledRegisters, FakeVerdict};
 pub use types::{
     Binding, CollectiveKind, Dispatch, DispatchPlan, DispatchPlanError, GraphStorage, Launch, Plan,
     PlanError, PlanKind, ScratchDecl, ScratchId, Sink, Source, ValueStorage,

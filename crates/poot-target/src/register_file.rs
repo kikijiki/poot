@@ -51,6 +51,17 @@ impl RegisterBudget {
             .map(|file| file.per_lane_of(lanes) / HELD_SHARE)
     }
 
+    /// The registers each lane of a `lanes`-lane workgroup keeps resident (POOT-1505): the lane's whole file, or the
+    /// portable lane's 256 where it is unknown. The bound a candidate's count must fit when the device's compiler
+    /// decides whether it spills: no lane holds more.
+    pub fn lane_registers(self, lanes: u32) -> u32 {
+        self.file
+            .known()
+            .map_or(PORTABLE_ACCUMULATORS * ACCUMULATOR_SHARE, |file| {
+                file.per_lane_of(lanes)
+            })
+    }
+
     /// The registers each lane of a `lanes`-lane workgroup holds at once across a tiled contraction's `K` loop in all,
     /// its accumulators and the round it stages (POOT-1505): the held share, half of what the lane keeps resident.
     /// The other half carries the step's operand fragments, the staging addresses and the decode's temporaries.

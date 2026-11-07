@@ -804,6 +804,7 @@ poot-graph-plan	poot-graph-plan	model-free	compile::tests::expert_ids::compile_a
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::expert_ids::compile_refuses_ids_the_graph_does_not_prove_inside_the_experts
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::only_plans_outside_compile_are_counted
 poot-graph-plan	poot-graph-plan	model-free	compile::tests::program_declines_name_the_first_failing_check_of_a_near_miss_attention_chain
+poot-graph-plan	poot-graph-plan	model-free	device_options::tests::a_feedback_for_another_backend_is_refused
 poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::device_witness_admits_spec_recipes
 poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::device_witness_admits_the_selector_bounds_chain
 poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::device_witness_rejects_a_narrow_intermediate
@@ -1030,6 +1031,8 @@ poot-graph-plan	poot-graph-plan	model-free	planner::sampling::tests::greedy_plan
 poot-graph-plan	poot-graph-plan	model-free	planner::sampling::tests::greedy_refuses_a_grid_past_the_target_limit
 poot-graph-plan	poot-graph-plan	model-free	planner::sampling::tests::greedy_refuses_a_vocabulary_whose_indices_are_not_exact_f32
 poot-graph-plan	poot-graph-plan	model-free	planner::scan::tests::a_scan_on_unknown_compute_units_stays_unsplit
+poot-graph-plan	poot-graph-plan	model-free	register_feedback::tests::a_verdict_is_compiled_once_and_read_back_from_disk
+poot-graph-plan	poot-graph-plan	model-free	register_feedback::tests::local_memory_and_a_failed_compile_refuse_the_probe
 poot-graph-plan	poot-graph-plan	model-free	staged::devices::tests::a_device_over_its_budget_refuses_the_placement
 poot-graph-plan	poot-graph-plan	model-free	staged::devices::tests::a_device_with_an_unknown_budget_is_refused
 poot-graph-plan	poot-graph-plan	model-free	staged::devices::tests::a_layered_pipeline_on_two_ptx_devices_binds_every_boundary_by_a_row
@@ -1254,6 +1257,7 @@ poot-graph-plan	poot-graph-plan::compile_budgets	model-free	a_traced_graph_over_
 poot-graph-plan	poot-graph-plan::compile_budgets	model-free	a_transform_that_would_append_a_ninth_equation_is_refused_before_appending_it
 poot-graph-plan	poot-graph-plan::compile_budgets	model-free	the_dtype_widening_is_sized_before_it_runs
 poot-graph-plan	poot-graph-plan::compile_budgets	model-free	the_value_table_is_capped_independently_of_the_equation_list
+poot-graph-plan	poot-graph-plan::compile_options_sites	model-free	every_compile_options_site_takes_the_device_options
 poot-graph-plan	poot-graph-plan::contract_inventory	model-free	deleted_contracts_stay_deleted
 poot-graph-plan	poot-graph-plan::contract_inventory	model-free	packed_graph_builders_live_only_in_the_fixture_module
 poot-graph-plan	poot-graph-plan::contract_inventory	model-free	production_text_ignores_items_only_a_test_build_compiles
@@ -1391,6 +1395,9 @@ poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_negative_literal_
 poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_standalone_packed_dequant_is_an_imported_kernel_planning_refusal
 poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_traced_block_selection_on_a_small_device_is_refused_as_the_block_top_k
 poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	an_i32_remainder_by_literal_zero_is_an_exact_i32_op_refusal
+poot-graph-plan	poot-graph-plan::register_feedback_plan	model-free	a_contraction_no_tiling_of_which_holds_is_refused
+poot-graph-plan	poot-graph-plan::register_feedback_plan	model-free	a_program_planned_with_feedback_names_the_compiler
+poot-graph-plan	poot-graph-plan::register_feedback_plan	model-free	a_tiling_the_compiler_spills_gives_way_to_the_next
 poot-graph-plan	poot-graph-plan::row_scale_fusion	model-free	a_pinned_member_is_never_a_side_output
 poot-graph-plan	poot-graph-plan::row_scale_fusion	model-free	a_refused_row_region_is_reverted_with_its_side_outputs
 poot-graph-plan	poot-graph-plan::row_scale_fusion	model-free	a_row_scale_between_a_norm_and_its_projections_costs_no_dispatch
@@ -1561,6 +1568,7 @@ poot-kernelgen	poot-kernelgen	model-free	contraction::dense::tests::a_narrow_sto
 poot-kernelgen	poot-kernelgen	model-free	contraction::dense::tests::the_dense_tiled_body_matches_a_host_product_at_every_planned_tiling
 poot-kernelgen	poot-kernelgen	model-free	contraction::fit::tests::an_underdetermined_corpus_gives_no_fit
 poot-kernelgen	poot-kernelgen	model-free	contraction::fit::tests::the_fit_recovers_the_ratios_the_times_were_made_with
+poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_compiled_selection_takes_the_cheapest_candidate_that_holds
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_contraction_below_the_device_takes_the_cheapest_lane_step
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_fragment_round_stages_whole_requests_of_every_operand_row
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_fragment_tile_of_one_wave_loses_to_the_exact_tiling
@@ -1571,6 +1579,8 @@ poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_one_row_dense_dec
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_packed_expert_round_stays_within_the_lanes_held_registers
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_shape_no_whole_round_holds_stages_one_fragment_step
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_tie_between_exact_and_narrowed_stays_exact
+poot-kernelgen	poot-kernelgen	model-free	contraction::tests::compile_feedback_weighs_a_tiling_the_held_share_refuses
+poot-kernelgen	poot-kernelgen	model-free	contraction::tests::every_tiled_contraction_has_a_probe
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::grouped_rows_count_whole_tiles_per_bucket
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::rows_expected_to_touch_fewer_buckets_than_they_have
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_candidates_are_the_tilings_the_device_runs
@@ -2477,7 +2487,9 @@ poot-llm	poot-llm	model-free	driver::placed_tests::a_two_device_pipeline_decodes
 poot-llm	poot-llm	model-free	driver::placed_tests::an_mtp_layer_an_adapter_and_an_encode_step_have_no_tensor_or_pipeline_form
 poot-llm	poot-llm	model-free	driver::placed_tests::each_devices_planned_role_bytes_equal_its_own_prepared_counters
 poot-llm	poot-llm	model-free	driver::placed_tests::each_ranks_paged_kv_footprint_is_its_heads_of_the_pool_and_equals_the_prepared_bytes
+poot-llm	poot-llm	model-free	driver::placed_tests::each_stage_plans_with_its_own_devices_compiler
 poot-llm	poot-llm	model-free	driver::placed_tests::every_planned_owner_names_a_device_of_the_placement
+poot-llm	poot-llm	model-free	driver::placed_tests::every_planned_program_asks_its_device_compiler
 poot-llm	poot-llm	model-free	driver::placed_tests::the_fit_refuses_a_short_rank_of_either_placement_naming_it
 poot-llm	poot-llm	model-free	driver::placed_tests::the_planner_keeps_a_footprint_per_device
 poot-llm	poot-llm	model-free	driver::placed_tests::the_single_device_reference_decodes_a_varied_sequence
@@ -4266,6 +4278,7 @@ poot-ptx-device	poot-ptx-device::device_caps_planning	device	a_live_ptx_device_r
 poot-ptx-device	poot-ptx-device::device_caps_planning	device	the_ptx_device_reports_live_free_memory_within_its_open_time_ceiling
 poot-ptx-device	poot-ptx-device::device_timing	device	plain_ptx_device_reports_unknown_device_time
 poot-ptx-device	poot-ptx-device::device_timing	device	timed_ptx_device_reads_a_nonzero_device_time_for_a_known_kernel
+poot-ptx-device	poot-ptx-device::feedback_end_to_end	device	the_engine_plans_the_expert_projection_with_the_drivers_verdicts_on_ptx
 poot-ptx-device	poot-ptx-device::float_ne	device	float_ne_is_ieee_on_nan_on_ptx
 poot-ptx-device	poot-ptx-device::i32_index	device	gather_with_i32_indices_matches_the_oracle_bit_for_bit_on_ptx
 poot-ptx-device	poot-ptx-device::indexed_matmul	device	indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit
@@ -4309,6 +4322,10 @@ poot-ptx-device	poot-ptx-device::parity	device	state_pool_rows_reset_independent
 poot-ptx-device	poot-ptx-device::parity	device	the_driver_weight_format_matches_the_declared_oracle_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	the_range_detector_names_an_f16_overflow_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	two_byte_select_is_bitwise_on_ptx
+poot-ptx-device	poot-ptx-device::register_oracle	device	a_probe_the_jit_refuses_is_a_compile_error
+poot-ptx-device	poot-ptx-device::register_oracle	device	a_ptx_verdict_is_compiled_once
+poot-ptx-device	poot-ptx-device::register_oracle	device	the_ptx_oracle_matches_the_ptxas_sweep_verdicts
+poot-ptx-device	poot-ptx-device::register_oracle	model-free	the_sweep_table_is_the_planners_kernels
 poot-ptx-device	poot-ptx-device::sample_gumbel_no_contract	device	gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle
 poot-ptx-device	poot-ptx-device::scan_contract	device	delta_rule_scan_matches_the_oracle_on_ptx
 poot-ptx-device	poot-ptx-device::scan_contract	device	long_scan_agrees_with_the_oracle_and_with_stepped_pieces_on_ptx

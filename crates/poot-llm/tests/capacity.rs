@@ -394,6 +394,7 @@ fn planned_and_live(
             Arc::clone(handle),
             &executor.target_set(),
             Placement::Single,
+            poot_graph_plan::DeviceOptions::none_for(&executor.target_set()),
         )
         .unwrap()
     };
@@ -508,6 +509,7 @@ fn the_prefill_chunk_is_the_largest_that_fits_the_device() {
         Arc::clone(&handle),
         &engine(None).target_set(),
         Placement::Single,
+        poot_graph_plan::DeviceOptions::none_for(&engine(None).target_set()),
     )
     .unwrap();
     let need = |chunk: usize| {
@@ -530,6 +532,7 @@ fn the_prefill_chunk_is_the_largest_that_fits_the_device() {
         let fitted = fit_prefill_chunk(
             &handle,
             &executor.target_set(),
+            poot_graph_plan::DeviceOptions::none_for(&executor.target_set()),
             || Observation::of(&executor),
             &options(64),
             &shapes(Layout::Contiguous),

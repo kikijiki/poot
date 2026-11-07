@@ -756,7 +756,12 @@ fn fit_and_prepare(
     workload: Workload,
     observe: &mut impl FnMut(&Observation) -> Budget,
 ) -> Result<Fitted, StartupError> {
-    let mut planner = Planner::new(Arc::clone(handle), targets, placement.clone())?;
+    // The planner plans with the real devices' compile facts, so the fitted footprint and kernels are the ones the
+    // served driver compiles (POOT-1505); the serving options compile under the standard limits.
+    let devices = launch
+        .executor()
+        .device_options(poot_graph_plan::CompileLimits::STANDARD);
+    let mut planner = Planner::new(Arc::clone(handle), targets, placement.clone(), devices)?;
     if let Some(slots) = args.expert_pool {
         planner = planner.with_expert_pool(slots);
     }

@@ -1097,7 +1097,8 @@ fn the_planned_packed_expert_tilings_spill_no_register() {
             let free = packed_expert_shape(format, (m, n, k), 0);
             let block = RegisterTiling::grouped_block(&[free], &caps).expect("a grouping block");
             let shape = packed_expert_shape(format, (m, n, k), block);
-            let tiling = RegisterTiling::tiling_of(shape, &caps).expect("a fragment tiling");
+            let tiling = RegisterTiling::tiling_of(shape, &caps, crate::Feasibility::Model)
+                .expect("a fragment tiling");
             let name = format!("budget_planned_packed_{format:?}_{m}");
             let body = packed_expert_body(&name, format, tiling, (n, k));
             let Some((vgprs, spilled)) = compiled_registers(&body) else {

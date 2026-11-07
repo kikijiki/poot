@@ -9,6 +9,7 @@ poot-ptx-device::bin/ptx-check	tests::a_staged_fixture_nobody_checks_fails_the_r
 poot-ptx-device::bin/ptx-check	tests::compile_only_fixtures_are_allowed_and_must_exist_when_required	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
 poot-ptx-device::bin/ptx-check	tests::missing_fixture_is_skipped_not_run	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
 poot-ptx-device::bin/ptx-check	tests::staged_fixture_is_run_not_skipped	host-only check of the ptx-check binary's own logic: needs no device, and runs under `just test`
+poot-ptx-device::register_oracle	the_sweep_table_is_the_planners_kernels	model-free: rebuilds the sweep's kernels from the planner and needs no device; it runs under `just test` too
 poot-ptx-runtime	context::caps_tests::a_pre_ampere_device_has_no_matrix_hardware_for_poots_kernels	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	context::caps_tests::every_attribute_lands_in_its_own_caps_field	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`
 poot-ptx-runtime	context::caps_tests::performance_figures_follow_the_compute_capability	PTX runtime row against the mock CUDA driver or host arithmetic; drives no device, and runs under `just test`

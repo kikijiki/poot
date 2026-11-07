@@ -212,6 +212,15 @@ pub struct CompileOptions {
     /// make the program host-fed. Empty when nothing is known to alias; a caller that has the weight map
     /// passes [`poot_weights::WeightMap::aliases`].
     pub aliases: poot_weights::WeightAliases,
+    /// The device compiler the selection asks whether a candidate tiling spills (POOT-1505,
+    /// [`crate::RegisterFeedback`]). `None` plans with the register model alone: the plan the GPU-free tools (the plan
+    /// summary, the launch census, `ptx-graph-check`) describe. With feedback the plan may differ, and names the
+    /// compiler that decided it.
+    pub register_feedback: Option<crate::RegisterFeedback>,
+    /// The compile facts of every device the compile may place a stage on ([`crate::DeviceOptions`], set only by
+    /// [`CompileOptions::with_device`]): `compile_staged` gives each stage its own device's `npu` and
+    /// `register_feedback`. Empty for options no executor filled; the stage-level fields are then used as they are.
+    pub devices: crate::DeviceOptions,
 }
 
 impl CompileOptions {
@@ -234,6 +243,8 @@ impl CompileOptions {
             #[cfg(any(test, feature = "test-support"))]
             buffer_limit: None,
             aliases: poot_weights::WeightAliases::none(),
+            register_feedback: None,
+            devices: crate::DeviceOptions::EMPTY,
         }
     }
 
@@ -395,6 +406,35 @@ pub enum CompileError {
     /// (every `Graph` is well formed on its own).
     #[error(transparent)]
     Edit(Box<EditError>),
+    /// The register feedback names a compiler of another backend than the target's (POOT-1505): its verdicts are
+    /// about kernels this target never runs, so the compile refuses it rather than plan with them.
+    #[error("the register feedback of {compiler:?} cannot plan for a {backend:?} target")]
+    FeedbackForAnotherBackend {
+        /// The compiler the feedback asks.
+        compiler: poot_target::KernelCompiler,
+        /// The target's backend.
+        backend: poot_target::Backend,
+    },
+}
+
+/// Refuse `feedback` for `target` when its compiler does not compile for the target's backend.
+pub(crate) fn refuse_foreign_feedback(
+    target: &Target,
+    feedback: Option<&crate::RegisterFeedback>,
+) -> Result<(), CompileError> {
+    let (Some(feedback), Target::Gpu { backend, .. }) = (feedback, target) else {
+        return Ok(());
+    };
+    let compiler = feedback.compiler();
+    let compiles_for = compiler.compiles_for(*backend);
+    if compiles_for {
+        Ok(())
+    } else {
+        Err(CompileError::FeedbackForAnotherBackend {
+            compiler,
+            backend: *backend,
+        })
+    }
 }
 
 /// A `Cast(I32 -> F32)` whose operand is not proven inside `[-2^24, 2^24]`, the integers an `f32`
@@ -666,9 +706,18 @@ pub struct Program {
     /// The limits this program was compiled under; an executor loads its kernels under the same
     /// `max_artifact_bytes`.
     limits: CompileLimits,
+    /// The device compiler whose register verdicts chose this program's tilings (POOT-1505,
+    /// [`CompileOptions::register_feedback`]); `None` for a program the register model planned.
+    register_feedback: Option<poot_target::KernelCompiler>,
 }
 
 impl Program {
+    /// The device compiler whose register verdicts chose this program's tilings, `None` for a program the register
+    /// model alone planned: the same graph, target and compiler plan the same program (POOT-1505).
+    pub fn register_feedback(&self) -> Option<poot_target::KernelCompiler> {
+        self.register_feedback
+    }
+
     /// The compiled graph.
     pub fn graph(&self) -> &Graph {
         &self.graph
@@ -876,6 +925,7 @@ pub fn compile(
     target: &Target,
     options: &CompileOptions,
 ) -> Result<Program, CompileError> {
+    refuse_foreign_feedback(target, options.register_feedback.as_ref())?;
     let budget = GraphBudget::of(&options.limits);
     budget.admit("compile input", g)?;
     // The LoRA mode transform comes first: it rewrites the traced graph, and everything after it
@@ -1003,7 +1053,16 @@ pub fn compile(
             #[cfg(not(any(test, feature = "test-support")))]
             let declared = false;
             transform::select_operand_precision(g, options.matmul_precision, units, |graph, eqn| {
-                declared || planner::runs_on_matrix_unit(graph, eqn, target, &views, &limits, npu)
+                declared
+                    || planner::runs_on_matrix_unit(
+                        graph,
+                        eqn,
+                        target,
+                        &views,
+                        &limits,
+                        npu,
+                        options.register_feedback.as_ref(),
+                    )
             })
         })?;
         // The detector's witnesses are new: admit them like every other witness, still on the unfused graph.
@@ -1107,6 +1166,7 @@ pub fn compile(
             tiling: options.tiling_pin,
             indexed_rows: options.indexed_rows_pin,
             gemv_cols: options.gemv_cols_pin,
+            feedback: options.register_feedback.as_ref(),
         },
         npu,
     )?;
@@ -1144,6 +1204,10 @@ pub fn compile(
         regions,
         buffer_plan,
         limits: options.limits,
+        register_feedback: options
+            .register_feedback
+            .as_ref()
+            .map(crate::RegisterFeedback::compiler),
     })
 }
 

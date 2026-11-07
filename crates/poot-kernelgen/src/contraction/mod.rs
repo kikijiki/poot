@@ -12,6 +12,7 @@ mod epilogue;
 mod fit;
 mod gemv;
 mod indexed;
+mod probe;
 mod tiled;
 
 use cost::ContractionCost;
@@ -28,6 +29,7 @@ pub(crate) use indexed::{
     META_EXPERTS, META_N, META_PACKED_SLAB_WORDS, RowExpert, emit_poison, emit_row_expert,
     indexed_contraction,
 };
+pub use probe::{Feasibility, SpillCheck, probe_body};
 
 pub(crate) use tiled::{
     GroupedRows, TiledBody, TiledExtents, TiledLaunch, TiledWeight, held_registers, tiled_body,
@@ -394,6 +396,15 @@ impl RunRegisters {
     }
 }
 
+/// The register bound a candidate's count is held to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bound {
+    /// The register model decides: accumulators within their share, the loop's registers within the held share.
+    HeldShare,
+    /// A compiler decides: the loop's registers within the lane's whole file, the least a lane could hold.
+    Lane,
+}
+
 /// The schedule [`RegisterTiling::select`] chose for a contraction, which also says at which precision it reads its
 /// operands.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -439,7 +450,7 @@ impl RegisterTiling {
         // The narrow grid's smallest tile stages evenly at any run and fits every device that runs a 64-lane
         // workgroup; it is the tiling of a device the filter leaves nothing for (a grouped shape's planner then
         // refuses it unless its rows are the block).
-        Self::cheapest(shape, caps).map_or(
+        Self::cheapest(shape, caps, Feasibility::Model).map_or(
             Self::scalar(
                 TileSize(launch.register_lane_edge),
                 LaneRows(LANE_ROWS[0]),
@@ -451,21 +462,31 @@ impl RegisterTiling {
     }
 
     /// The cheapest candidate of `shape` on `caps` and its modelled cost, as [`Self::choose`] ranks them; `None`
-    /// when the device runs none.
-    fn cheapest(shape: TiledShape, caps: &poot_target::DeviceCaps) -> Option<(f64, Self)> {
-        let mut best: Option<(f64, Self)> = None;
-        for tiling in Self::candidates(shape, caps) {
-            let cost = ContractionCost::tiled(tiling, shape, caps);
-            let better = best.is_none_or(|(best_cost, best_tiling)| {
-                cost < best_cost
-                    || (cost == best_cost
-                        && tiling.outputs_per_tile() > best_tiling.outputs_per_tile())
-            });
-            if better {
-                best = Some((cost, tiling));
-            }
+    /// when the device runs none. Under [`Feasibility::Compiled`] the candidates are compiled in cost order (a tie
+    /// going to the larger output tile, then the earlier candidate) and the first whose probe holds its registers is
+    /// the cheapest: usually the first compile, the kernel the plan runs.
+    fn cheapest(
+        shape: TiledShape,
+        caps: &poot_target::DeviceCaps,
+        feasibility: Feasibility<'_>,
+    ) -> Option<(f64, Self)> {
+        let mut ranked: Vec<(f64, Self)> = Self::prefiltered(shape, caps, feasibility)
+            .into_iter()
+            .map(|tiling| (ContractionCost::tiled(tiling, shape, caps), tiling))
+            .collect();
+        // Stable: equal costs and tiles keep the candidates' order.
+        ranked.sort_by(|(a_cost, a), (b_cost, b)| {
+            a_cost
+                .total_cmp(b_cost)
+                .then(b.outputs_per_tile().cmp(&a.outputs_per_tile()))
+        });
+        match feasibility {
+            Feasibility::Model => ranked.into_iter().next(),
+            Feasibility::Compiled(check) => ranked.into_iter().find(|&(_, tiling)| {
+                probe_body(shape, tiling, caps.rounding_conversions)
+                    .is_ok_and(|body| check.holds(&body))
+            }),
         }
-        best
     }
 
     /// The block of one expert grouping several contractions read (POOT-1451): the output-tile rows for which the
@@ -487,7 +508,8 @@ impl RegisterTiling {
         let mut best: Option<(f64, usize)> = None;
         for block in Self::blocks_of(shapes, caps) {
             let total = shapes.iter().try_fold(0.0, |total, &shape| {
-                Self::cheapest(grouped(shape, block), caps).map(|(cost, _)| total + cost)
+                Self::cheapest(grouped(shape, block), caps, Feasibility::Model)
+                    .map(|(cost, _)| total + cost)
             });
             if let Some(total) = total
                 && best.is_none_or(|(best_total, _)| total <= best_total)
@@ -549,12 +571,28 @@ impl RegisterTiling {
             .then_some((config.layout, config.waves))
     }
 
-    /// Every tiling [`Self::choose`] weighs for `shape` on `caps`: the tilings the device can run, which a pin
-    /// ([`Self::runs_over`]) and the calibration sweep enumerate.
+    /// Every tiling [`Self::choose`] weighs for `shape` on `caps` under the register model: the tilings the device
+    /// can run, which a pin ([`Self::runs_over`]) and the calibration sweep enumerate.
     pub fn candidates(
         shape: TiledShape,
         caps: &poot_target::DeviceCaps,
     ) -> impl Iterator<Item = Self> + '_ {
+        Self::prefiltered(shape, caps, Feasibility::Model).into_iter()
+    }
+
+    /// The candidates `feasibility` weighs: under [`Feasibility::Model`] each fragment geometry at the depth
+    /// [`Self::fragment_depth`] gives it and every tiling within the held share; under [`Feasibility::Compiled`] each
+    /// geometry at every whole-request depth, deepest first, and every tiling whose count fits the lane's registers at
+    /// all (the compiler decides the rest, [`Self::cheapest`]).
+    fn prefiltered(
+        shape: TiledShape,
+        caps: &poot_target::DeviceCaps,
+        feasibility: Feasibility<'_>,
+    ) -> Vec<Self> {
+        let bound = match feasibility {
+            Feasibility::Model => Bound::HeldShare,
+            Feasibility::Compiled(_) => Bound::Lane,
+        };
         let launch = caps.gemm_launch();
         let run = RunLength::dividing(shape.k);
         let runs = RunRegisters::of(shape, run);
@@ -596,13 +634,24 @@ impl RegisterTiling {
                 })
         };
         let admitted = move |tiling: &Self| {
-            runs.is_some_and(|runs| tiling.runs_on(shape, caps, runs))
+            runs.is_some_and(|runs| tiling.runs_on(shape, caps, runs, bound))
                 && shape.admits_tile_rows(tiling.output_tile().0)
         };
-        let mut fragment: Vec<Self> = geometries()
-            .filter_map(|tiling| tiling.fragment_depth(shape, caps, runs))
-            .filter(admitted)
-            .collect();
+        let mut fragment: Vec<Self> = match bound {
+            Bound::HeldShare => geometries()
+                .filter_map(|tiling| tiling.fragment_depth(shape, caps, runs))
+                .filter(admitted)
+                .collect(),
+            Bound::Lane => geometries()
+                .flat_map(|tiling| {
+                    Self::whole_request_depths(shape)
+                        .iter()
+                        .rev()
+                        .map(move |&depth| Self { depth, ..tiling })
+                })
+                .filter(admitted)
+                .collect(),
+        };
         // A shape no fragment tiling holds at a whole-request depth stages one fragment step a round (POOT-1505): the
         // round holds half of what the shallowest whole-request one does, at twice its barriers, which the cost model
         // does not price, so it is the round only of a shape that has no deeper one (a one-wave tile over an act-order
@@ -623,6 +672,7 @@ impl RegisterTiling {
             .filter(move |_| !narrowed)
             .filter(admitted)
             .chain(fragment)
+            .collect()
     }
 
     /// Whether `caps` runs this tiling over `shape`: it is one of [`Self::candidates`]. A caller that pins a tiling
@@ -635,8 +685,12 @@ impl RegisterTiling {
     /// fragment tilings of a narrowed or split one), or `None` when the device runs none. What the planner plans a
     /// contraction with once [`Self::select`] has chosen its precision: the precision is that choice's output, so a
     /// narrowed contraction is one whose fragment tiling won.
-    pub fn tiling_of(shape: TiledShape, caps: &poot_target::DeviceCaps) -> Option<Self> {
-        Self::cheapest(shape, caps).map(|(_, tiling)| tiling)
+    pub fn tiling_of(
+        shape: TiledShape,
+        caps: &poot_target::DeviceCaps,
+        feasibility: Feasibility<'_>,
+    ) -> Option<Self> {
+        Self::cheapest(shape, caps, feasibility).map(|(_, tiling)| tiling)
     }
 
     /// The schedule of a contraction (POOT-1505): the cheapest, by the
@@ -645,7 +699,8 @@ impl RegisterTiling {
     /// - the per-row Gemv `gemv`, where the planner has one;
     /// - the fragment tilings of `shape` at its narrowed or split precision, where `shape.terms` permits one.
     ///
-    /// Every tiling passes the one feasibility rule of [`Self::candidates`]. Each is costed over `shape`'s rows as
+    /// Every tiling passes the one feasibility rule, `feasibility` (the register model, or the device's compiler on
+    /// the candidate's probe, [`Feasibility`]). Each is costed over `shape`'s rows as
     /// the plan runs them: a grouped shape at every block a tiling of its precision has, the block chosen with the
     /// tiling, so the empty rows of a short expert tile are in every cost. A tie goes
     /// to the exact schedule: a narrowing rounds, so it must win. `None` when the device runs no candidate.
@@ -656,16 +711,17 @@ impl RegisterTiling {
         shape: TiledShape,
         gemv: Option<GemvShape>,
         caps: &poot_target::DeviceCaps,
+        feasibility: Feasibility<'_>,
     ) -> Option<Selection> {
         let exact = TiledShape {
             terms: StagedTerms::ONE,
             ..shape
         };
-        let tiled = Self::cheapest_grouping(exact, caps)
+        let tiled = Self::cheapest_grouping(exact, caps, feasibility)
             .map(|(cost, tiling)| (cost, Selection::Exact(tiling)));
         let gemv = gemv.map(|gemv| (ContractionCost::gemv(gemv, caps), Selection::Gemv));
         let narrowed = shape.terms.fragment.and_then(|_| {
-            Self::cheapest_grouping(shape, caps)
+            Self::cheapest_grouping(shape, caps, feasibility)
                 .map(|(cost, tiling)| (cost, Selection::Narrowed(tiling)))
         });
         Self::first_cheapest([tiled, gemv, narrowed].into_iter().flatten())
@@ -682,9 +738,13 @@ impl RegisterTiling {
     /// The cheapest tiling of `shape` and its cost: over its rows as given when they are dense, and for grouped rows
     /// at every block a tiling of its precision has ([`Self::blocks_of`]), as a grouping of this contraction alone
     /// would take it (a tie going to the larger block, which runs fewer tiles). `None` when the device runs none.
-    fn cheapest_grouping(shape: TiledShape, caps: &poot_target::DeviceCaps) -> Option<(f64, Self)> {
+    fn cheapest_grouping(
+        shape: TiledShape,
+        caps: &poot_target::DeviceCaps,
+        feasibility: Feasibility<'_>,
+    ) -> Option<(f64, Self)> {
         let TiledRows::Grouped { groups, .. } = shape.rows else {
-            return Self::cheapest(shape, caps);
+            return Self::cheapest(shape, caps, feasibility);
         };
         Self::blocks_of(&[shape], caps)
             .into_iter()
@@ -695,6 +755,7 @@ impl RegisterTiling {
                         ..shape
                     },
                     caps,
+                    feasibility,
                 )
             })
             .reduce(|best, next| if next.0 <= best.0 { next } else { best })
@@ -733,7 +794,7 @@ impl RegisterTiling {
         if !matches!(grouped.rows, TiledRows::Grouped { .. }) {
             return false;
         }
-        Self::cheapest_grouping(grouped, caps)
+        Self::cheapest_grouping(grouped, caps, Feasibility::Model)
             .is_none_or(|(grouped, _)| ContractionCost::gemv(gemv, caps) <= grouped)
     }
 
@@ -755,16 +816,24 @@ impl RegisterTiling {
         caps: &poot_target::DeviceCaps,
         runs: Option<RunRegisters>,
     ) -> Option<Self> {
+        Self::whole_request_depths(shape)
+            .iter()
+            .rev()
+            .map(|&depth| Self { depth, ..self })
+            .find(|tiling| {
+                runs.is_some_and(|runs| tiling.runs_on(shape, caps, runs, Bound::HeldShare))
+            })
+    }
+
+    /// [`FRAGMENT_DEPTHS`] up to the shallowest at which one round's segment of every operand row of `shape` is a
+    /// whole [`GLOBAL_REQUEST_BYTES`] request (all of them when none is): the depths a fragment geometry may run.
+    fn whole_request_depths(shape: TiledShape) -> &'static [usize] {
         let narrowest = shape.activation_bits.min(shape.weight.bits()).max(1) as usize;
         let whole = FRAGMENT_DEPTHS
             .iter()
             .position(|&depth| depth * narrowest >= GLOBAL_REQUEST_BYTES * 8)
             .unwrap_or(FRAGMENT_DEPTHS.len() - 1);
-        FRAGMENT_DEPTHS[..=whole]
-            .iter()
-            .rev()
-            .map(|&depth| Self { depth, ..self })
-            .find(|tiling| runs.is_some_and(|runs| tiling.runs_on(shape, caps, runs)))
+        &FRAGMENT_DEPTHS[..=whole]
     }
 
     /// The f32 registers each lane of this tiling holds across the `K` loop: a scalar tile's accumulators, a
@@ -796,18 +865,23 @@ impl RegisterTiling {
     /// budget (`caps.gemm_launch().register_budget`, a quarter of what a lane of this workgroup keeps resident) and
     /// so do all the registers it holds across the loop ([`Self::loop_registers`] within the budget's
     /// [`poot_target::RegisterBudget::loop_registers`], half of it: a tiling over it spills, POOT-1505), its staged
-    /// tiles (and the scratch an `Opaque` fragment spills to) fit the LDS and stage in whole slots.
+    /// tiles (and the scratch an `Opaque` fragment spills to) fit the LDS and stage in whole slots. Under
+    /// [`Bound::Lane`] (a compiler decides the spill) the registers it holds need only fit the lane's whole file.
     fn runs_on(
         self,
         shape: TiledShape,
         caps: &poot_target::DeviceCaps,
         runs: RunRegisters,
+        bound: Bound,
     ) -> bool {
         let lane_count = self.workgroup_lanes();
         let budget = caps.gemm_launch().register_budget;
-        u32::try_from(lane_count).is_ok_and(|lanes| {
-            self.accumulator_registers() <= budget.accumulators(lanes)
-                && self.loop_registers(runs) <= budget.loop_registers(lanes)
+        u32::try_from(lane_count).is_ok_and(|lanes| match bound {
+            Bound::HeldShare => {
+                self.accumulator_registers() <= budget.accumulators(lanes)
+                    && self.loop_registers(runs) <= budget.loop_registers(lanes)
+            }
+            Bound::Lane => self.loop_registers(runs) <= budget.lane_registers(lanes),
         }) && lane_count <= caps.max_workgroup_invocations as usize
             && lane_count <= caps.max_workgroup_size[0] as usize
             && tiled::lds_bytes(self.launch_shape(), shape.terms) <= caps.lds_bytes as usize
@@ -910,7 +984,8 @@ mod tests {
 
     /// Whether the selection over `shape`'s exact and narrowed schedules chooses its fragment tiling.
     fn narrows(shape: TiledShape, gemv: Option<GemvShape>, caps: &poot_target::DeviceCaps) -> bool {
-        RegisterTiling::select(shape, gemv, caps).is_some_and(Selection::narrows)
+        RegisterTiling::select(shape, gemv, caps, Feasibility::Model)
+            .is_some_and(Selection::narrows)
     }
 
     /// A one-row dense decode contraction stays on the Gemv on gfx1151 through HSA at every output count, the vocabulary
@@ -1169,11 +1244,12 @@ mod tests {
             ..shape(2048, 1024, 3072)
         };
         assert!(!narrows(narrow, None, &device(1)));
-        let held =
-            RegisterTiling::tiling_of(narrow, &device(1)).expect("a declared narrowing runs");
+        let held = RegisterTiling::tiling_of(narrow, &device(1), Feasibility::Model)
+            .expect("a declared narrowing runs");
         assert!(matches!(held.micro, MicroTile::Fragment(_)), "{held:?}");
         let many_waves = FragmentConfig::ANY_WAVES;
-        let tiling = RegisterTiling::tiling_of(narrow, &device(many_waves)).expect("fragments");
+        let tiling = RegisterTiling::tiling_of(narrow, &device(many_waves), Feasibility::Model)
+            .expect("fragments");
         assert!(
             matches!(tiling.micro, MicroTile::Fragment(_))
                 && tiling.workgroup_lanes() > FRAGMENT_LANES,
@@ -1426,7 +1502,7 @@ mod tests {
             candidates.contains(&tile(2, 32)),
             "the 16 x 64 tile at 32 holds its round: {candidates:?}"
         );
-        assert!(RegisterTiling::tiling_of(grouped, &caps).is_some());
+        assert!(RegisterTiling::tiling_of(grouped, &caps, Feasibility::Model).is_some());
     }
 
     /// POOT-1505: a shape no fragment tiling holds at a whole-request depth stages one fragment step a round, and only
@@ -1459,8 +1535,10 @@ mod tests {
                 groups: std::num::NonZeroUsize::new(4).unwrap(),
             },
         };
-        let depth =
-            |format| RegisterTiling::tiling_of(linear(format), &caps).map(RegisterTiling::depth);
+        let depth = |format| {
+            RegisterTiling::tiling_of(linear(format), &caps, Feasibility::Model)
+                .map(RegisterTiling::depth)
+        };
         assert_eq!(
             depth(act_order),
             Some(16),
@@ -1502,7 +1580,8 @@ mod tests {
             weight: StagedWeight::Packed(poot_quant::format::WeightFormat::Iq2_Xs),
             activation_bits: 32,
         };
-        let Some(Selection::Narrowed(tiling)) = RegisterTiling::select(grouped(16), None, &caps)
+        let Some(Selection::Narrowed(tiling)) =
+            RegisterTiling::select(grouped(16), None, &caps, Feasibility::Model)
         else {
             panic!("the expert projection stays exact");
         };
@@ -1514,9 +1593,176 @@ mod tests {
             tiling.schedule()
         );
         assert_eq!(
-            RegisterTiling::tiling_of(grouped(rows), &caps),
+            RegisterTiling::tiling_of(grouped(rows), &caps, Feasibility::Model),
             Some(tiling)
         );
+    }
+
+    /// A check that holds every probe but counts them, and refuses the probes whose names contain `refused`.
+    struct Counted {
+        refused: Option<String>,
+        asked: std::cell::Cell<usize>,
+    }
+
+    impl SpillCheck for Counted {
+        fn holds(&self, probe: &poot_kernel_ir::Body) -> bool {
+            self.asked.set(self.asked.get() + 1);
+            self.refused
+                .as_ref()
+                .is_none_or(|refused| !probe.name.contains(refused.as_str()))
+        }
+    }
+
+    /// The gfx1151 ROCm caps with the agent's register file.
+    fn gfx1151() -> poot_target::DeviceCaps {
+        poot_test_util::device_caps::default_caps_for(poot_target::Backend::AmdGcn(
+            poot_target::AmdArch::gfx1151(),
+        ))
+    }
+
+    /// The narrowed bf16 prefill projection of the bank (2048 rows of a 3072 x 1024 weight).
+    fn narrowed_prefill() -> TiledShape {
+        TiledShape {
+            terms: crate::precision::StagedTerms {
+                fragment: Some(FragmentDtype::F16),
+                ..crate::precision::StagedTerms::ONE
+            },
+            weight: StagedWeight::Dense { bits: 16 },
+            ..shape(2048, 1024, 3072)
+        }
+    }
+
+    /// Under compile feedback the candidates are compiled in cost order and the first that holds is the tiling: a
+    /// compiler that holds everything is asked once, and one that spills that tiling is asked again and gets the next
+    /// candidate, which costs no less. Mutation: in `RegisterTiling::cheapest`, take the first candidate in the
+    /// candidates' order instead of the cost order; the first compile is not the model's cheapest.
+    #[test]
+    fn a_compiled_selection_takes_the_cheapest_candidate_that_holds() {
+        let caps = gfx1151();
+        let shape = narrowed_prefill();
+        let all = Counted {
+            refused: None,
+            asked: Default::default(),
+        };
+        let (first_cost, first) =
+            RegisterTiling::cheapest(shape, &caps, Feasibility::Compiled(&all))
+                .expect("a tiling holds");
+        assert_eq!(all.asked.get(), 1, "the cheapest holds: one compile");
+        let lane = RegisterTiling::prefiltered(shape, &caps, Feasibility::Compiled(&all));
+        let least = lane
+            .iter()
+            .map(|&tiling| ContractionCost::tiled(tiling, shape, &caps))
+            .fold(f64::INFINITY, f64::min);
+        assert_eq!(
+            first_cost, least,
+            "the first compile is the cheapest candidate"
+        );
+        let name = probe_body(shape, first, caps.rounding_conversions)
+            .unwrap()
+            .name;
+        let spills_first = Counted {
+            refused: Some(name),
+            asked: Default::default(),
+        };
+        let (next_cost, next) =
+            RegisterTiling::cheapest(shape, &caps, Feasibility::Compiled(&spills_first))
+                .expect("another tiling holds");
+        assert_ne!(next, first);
+        assert!(next_cost >= first_cost);
+        assert!(spills_first.asked.get() >= 2);
+    }
+
+    /// The compiler, not the held share, decides: the Flash-Next expert projection's one-wave 16 x 16 tile at a 64-deep
+    /// round counts 136 registers on an sm_120 lane, over the held share (127), so the register model never weighs
+    /// it, and under compile feedback it is a candidate (POOT-1509 measured it at 2.00 ms against the exact 2.35 ms,
+    /// unspilled). Mutation: hold `Bound::Lane` to `RegisterBudget::loop_registers` in `RegisterTiling::runs_on`; the
+    /// tile is no candidate.
+    #[test]
+    fn compile_feedback_weighs_a_tiling_the_held_share_refuses() {
+        let caps = poot_target::DeviceCaps {
+            matrix_units: poot_target::Queried::Known(poot_target::MatrixUnits::nvidia((12, 0))),
+            register_file: poot_target::RegisterFile::nvidia(12)
+                .map_or(poot_target::Queried::Unknown, poot_target::Queried::Known),
+            ..poot_target::DeviceCaps::ptx_default()
+        };
+        let grouped = TiledShape {
+            blocks: 1,
+            m_per_block: 1280,
+            out_per_block: 640,
+            k: 2560,
+            layout: WeightLayout::Nk,
+            rows: TiledRows::Grouped {
+                groups: 513,
+                block: 16,
+            },
+            terms: crate::precision::StagedTerms::of(
+                poot_graph_ir::OperandPrecision::Narrow(FragmentDtype::F16),
+                None,
+                None,
+            ),
+            weight: StagedWeight::Packed(poot_quant::format::WeightFormat::Iq2_Xs),
+            activation_bits: 32,
+        };
+        let layout = caps
+            .matrix_units
+            .known()
+            .and_then(|units| Some(units.config(FragmentDtype::F16)?.layout))
+            .unwrap();
+        let tile = RegisterTiling {
+            owners_m: TileSize(1),
+            owners_n: TileSize(1),
+            micro: MicroTile::Fragment(FragmentTile {
+                dtype: FragmentDtype::F16,
+                layout,
+                rows: 1,
+                cols: 1,
+            }),
+            run: RunLength::dividing(2560),
+            depth: 64,
+        };
+        assert!(!RegisterTiling::candidates(grouped, &caps).any(|t| t == tile));
+        let all = Counted {
+            refused: None,
+            asked: Default::default(),
+        };
+        assert!(
+            RegisterTiling::prefiltered(grouped, &caps, Feasibility::Compiled(&all))
+                .contains(&tile),
+            "the compiler is asked about the 64-deep 16 x 16 tile"
+        );
+    }
+
+    /// The probe of a tiling is a body for each kind of contraction the planner tiles: a dense weight read as `[N, K]`
+    /// or grouped by expert, and a packed weight over plain or grouped rows. Mutation: return an error for the
+    /// grouped dense arm of `probe_body`; that row reads `Err`.
+    #[test]
+    fn every_tiled_contraction_has_a_probe() {
+        let caps = gfx1151();
+        let grouped = |shape: TiledShape| TiledShape {
+            rows: TiledRows::Grouped {
+                groups: 9,
+                block: 16,
+            },
+            ..shape
+        };
+        let packed = TiledShape {
+            weight: StagedWeight::Packed(poot_quant::format::WeightFormat::Q4_K),
+            ..shape(512, 2560, 768)
+        };
+        for shape in [
+            narrowed_prefill(),
+            grouped(shape(512, 1024, 512)),
+            packed,
+            grouped(packed),
+        ] {
+            let tiling = RegisterTiling::tiling_of(shape, &caps, Feasibility::Model)
+                .expect("the model tiles it");
+            assert!(
+                probe_body(shape, tiling, caps.rounding_conversions).is_ok(),
+                "{shape:?} under {:?}",
+                tiling.schedule()
+            );
+        }
     }
 
     /// A tie between an exact schedule and the narrowed one stays exact: a narrowing rounds, so it must win.

@@ -6,6 +6,7 @@ poot-kernelgen	contraction::dense::tests::a_narrow_stored_activation_and_a_narro
 poot-kernelgen	contraction::dense::tests::the_dense_tiled_body_matches_a_host_product_at_every_planned_tiling	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::fit::tests::an_underdetermined_corpus_gives_no_fit	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::fit::tests::the_fit_recovers_the_ratios_the_times_were_made_with	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::tests::a_compiled_selection_takes_the_cheapest_candidate_that_holds	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_contraction_below_the_device_takes_the_cheapest_lane_step	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_fragment_round_stages_whole_requests_of_every_operand_row	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_fragment_tile_of_one_wave_loses_to_the_exact_tiling	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -15,6 +16,8 @@ poot-kernelgen	contraction::tests::a_long_prefill_takes_the_widest_tile	kernelge
 poot-kernelgen	contraction::tests::a_packed_expert_round_stays_within_the_lanes_held_registers	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_shape_no_whole_round_holds_stages_one_fragment_step	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::a_tie_between_exact_and_narrowed_stays_exact	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::tests::compile_feedback_weighs_a_tiling_the_held_share_refuses	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	contraction::tests::every_tiled_contraction_has_a_probe	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::grouped_rows_count_whole_tiles_per_bucket	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::rows_expected_to_touch_fewer_buckets_than_they_have	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tests::the_candidates_are_the_tilings_the_device_runs	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case

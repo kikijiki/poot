@@ -59,6 +59,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 mod buffer;
+mod compiler_probe;
 mod context;
 mod driver;
 mod error;
@@ -67,6 +68,7 @@ mod owner;
 mod upload;
 
 pub use buffer::PtxBuffer;
+pub use compiler_probe::{FunctionRegisters, ProbeError, PtxCompilerProbe};
 pub use context::PtxContext;
 pub use error::PtxError;
 pub use graph::{PtxGraphExec, PtxSpan, PtxSyncEvent};

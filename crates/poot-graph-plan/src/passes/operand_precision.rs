@@ -80,7 +80,7 @@ pub fn with_operand_precision(
             let limits = CompileLimits::STANDARD.body();
             let views = compute_views(&graph, target.id());
             select_operand_precision(&graph, policy, units, |graph, eqn| {
-                crate::planner::runs_on_matrix_unit(graph, eqn, target, &views, &limits, None)
+                crate::planner::runs_on_matrix_unit(graph, eqn, target, &views, &limits, None, None)
             })
         }
         Target::Npu(_) => Ok(g.clone()),

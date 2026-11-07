@@ -513,6 +513,13 @@ impl<F: FnMut(u32, &str) -> GenerationControl> TokenSink for F {
 pub struct DriverStats {
     /// Programs compiled (cold preparations; a refused one counts, a warm replay never does).
     pub compiles: u64,
+    /// The compiler each stage of every compiled program planned with (POOT-1505,
+    /// [`poot_graph_plan::Program::register_feedback`]), in compile order: `None` for a stage the register model
+    /// planned alone. A receipt reads it to say whether its plans had the device compiler's feedback.
+    pub planned_with: Vec<(
+        poot_graph_plan::multi_device::topology::DeviceId,
+        Option<poot_target::KernelCompiler>,
+    )>,
     /// Entries added to the executor.
     pub entries_added: u64,
     /// Steps run, of every kind; each step of a chain counts.
@@ -1361,7 +1368,12 @@ impl<S: State> Driver<S> {
     ) -> Result<StagedProgram, Unsupported> {
         let graph = &bound(graph, formats)?;
         // A table the checkpoint also binds under another id (a tied head) is not hosted.
-        let options = &options.clone().with_aliases(formats.aliases().clone());
+        // The devices' own facts (their NPU lowering, their compiler's register feedback) come from the executor and
+        // replace whatever the options held: the one place every program of the driver gets them (POOT-1505).
+        let options = &options
+            .clone()
+            .with_aliases(formats.aliases().clone())
+            .with_device(self.runtime.executor.device_options(options.limits));
         // The pool pages the graphs that have routed experts; a dense draft model's or an encode graph's
         // stays resident, decided here from the graph rather than by catching the pool's refusal.
         let experts = match &self.runtime.pool {
@@ -1398,6 +1410,11 @@ impl<S: State> Driver<S> {
     /// Nothing is recorded until [`Self::add_entry`].
     fn admit(&mut self, program: &StagedProgram) -> Result<Reservation, DriverError> {
         self.stats.compiles += 1;
+        self.stats.planned_with.extend(
+            program
+                .stages()
+                .map(|(_, device, stage)| (device, stage.register_feedback())),
+        );
         let reservation = self.ledger.reserve((self.settings.options.charge)(program));
         let would_retain = self
             .ledger

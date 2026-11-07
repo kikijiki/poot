@@ -90,6 +90,9 @@ pub enum Capability {
     /// the planner never plans one. `select_operand_precision` narrows an op only where a matrix-unit schedule
     /// wins; this refusal is the contract that no later change reverts it silently.
     NoMatrixUnitSchedule,
+    /// A register-tiled contraction none of whose candidate tilings the device's compiler compiles without spilling
+    /// (POOT-1505, [`crate::CompileOptions::register_feedback`]).
+    NoTilingHoldsItsRegisters,
     /// The packed E4M3FN dispatch needs more x-workgroups than the target's grid allows.
     DispatchGridLimit {
         /// Threads the dispatch needs.
@@ -331,7 +334,7 @@ pub(crate) struct Site<'a> {
     eqn: &'a Eqn,
     target: TargetId,
     limits: BodyLimits,
-    pins: Pins,
+    pins: Pins<'a>,
 }
 
 /// The schedule choices a compile fixes for the calibration sweep and the tests that time or inspect one candidate
@@ -339,13 +342,16 @@ pub(crate) struct Site<'a> {
 /// [`crate::CompileOptions::gemv_cols_pin`]). `Pins::default()` leaves
 /// every choice to the cost model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Pins {
+pub(crate) struct Pins<'a> {
     /// The tiling every register-tiled contraction must run.
     pub(crate) tiling: Option<poot_kernelgen::RegisterTiling>,
     /// How every per-row indexed contraction must run.
     pub(crate) indexed_rows: Option<crate::predicates::IndexedRows>,
     /// The columns per workgroup every dense decode Gemv must launch.
     pub(crate) gemv_cols: Option<u32>,
+    /// The device compiler a tiling's register feasibility is asked of ([`crate::CompileOptions::register_feedback`]);
+    /// `None` leaves it to the register model.
+    pub(crate) feedback: Option<&'a crate::RegisterFeedback>,
 }
 
 impl<'a> Site<'a> {
@@ -365,8 +371,13 @@ impl<'a> Site<'a> {
     }
 
     /// This site planning under `pins`.
-    pub(crate) fn pinned(self, pins: Pins) -> Self {
+    pub(crate) fn pinned(self, pins: Pins<'a>) -> Self {
         Self { pins, ..self }
+    }
+
+    /// How this site decides whether a candidate tiling holds its registers: the compile's feedback, or the model.
+    pub(crate) fn feasibility(&self) -> poot_kernelgen::Feasibility<'_> {
+        crate::register_feedback::feasibility(self.pins.feedback)
     }
 
     /// The tiling a register-tiled contraction at this site must run, if the compile pinned one.
@@ -487,6 +498,9 @@ impl fmt::Display for Capability {
             Capability::PinnedTilingNotRunnable { pinned } => write!(
                 f,
                 "the pinned tiling {pinned:?} does not run over this contraction on this device"
+            ),
+            Capability::NoTilingHoldsItsRegisters => f.write_str(
+                "no candidate tiling compiles without spilling on this device's compiler",
             ),
             Capability::NoMatrixUnitSchedule => f.write_str(
                 "an op that reads narrowed operands has no matrix-unit schedule that beats its exact one",

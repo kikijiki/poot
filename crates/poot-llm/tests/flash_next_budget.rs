@@ -86,11 +86,16 @@ fn shapes(prompts: &[usize]) -> ServingShapes<'_> {
 
 fn plan(handle: &Arc<ModelHandle>, isl: usize, osl: usize, chunk: usize) -> Footprint {
     let (options, prompts) = cell(isl, osl, chunk);
-    Planner::new(Arc::clone(handle), &rtx_pro_6000(), Placement::Single)
-        .unwrap()
-        .plan(options, &shapes(&prompts), &[])
-        .unwrap_or_else(|e| panic!("{e}"))
-        .footprint
+    Planner::new(
+        Arc::clone(handle),
+        &rtx_pro_6000(),
+        Placement::Single,
+        poot_graph_plan::DeviceOptions::none_for(&rtx_pro_6000()),
+    )
+    .unwrap()
+    .plan(options, &shapes(&prompts), &[])
+    .unwrap_or_else(|e| panic!("{e}"))
+    .footprint
 }
 
 /// An idle card with `free` bytes free, as the runtime reports it.
@@ -183,11 +188,16 @@ fn vulkan_128_gib() -> TargetSet {
 fn flash_next_plans_on_vulkan_with_its_gather_tables_hosted() {
     let (handle, _set) = handle();
     let (options, prompts) = cell(128, 128, 128);
-    let footprint = Planner::new(Arc::clone(&handle), &vulkan_128_gib(), Placement::Single)
-        .unwrap()
-        .plan(options, &shapes(&prompts), &[])
-        .unwrap_or_else(|e| panic!("Flash-Next must plan on Vulkan: {e}"))
-        .footprint;
+    let footprint = Planner::new(
+        Arc::clone(&handle),
+        &vulkan_128_gib(),
+        Placement::Single,
+        poot_graph_plan::DeviceOptions::none_for(&vulkan_128_gib()),
+    )
+    .unwrap()
+    .plan(options, &shapes(&prompts), &[])
+    .unwrap_or_else(|e| panic!("Flash-Next must plan on Vulkan: {e}"))
+    .footprint;
     let roles = footprint.role_bytes(DeviceId(0)).unwrap();
     let weight = roles
         .iter()
@@ -303,6 +313,7 @@ fn the_decode_curve_cell_runs_at_the_largest_chunk_that_fits_the_card() {
         fit_prefill_chunk(
             &handle,
             &targets,
+            poot_graph_plan::DeviceOptions::none_for(&targets),
             || observe(free),
             &options,
             &shapes(&prompts),
@@ -380,6 +391,7 @@ fn the_score_window_chunk_is_fitted_to_the_turn_set() {
         fit_prefill_chunk(
             &handle,
             &targets,
+            poot_graph_plan::DeviceOptions::none_for(&targets),
             || observe(free),
             &options,
             &ServingShapes::turn(Layout::Contiguous, &heads),

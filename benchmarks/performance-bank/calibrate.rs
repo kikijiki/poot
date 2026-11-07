@@ -53,7 +53,7 @@ use poot_graph_plan::staged::StagedProgram;
 use poot_graph_plan::{IndexedRows, KernelChoice};
 use poot_kernelgen::{ContractionSpec, GemvShape, KernelRequest, Schedule};
 
-use crate::runner::{Operands, measure, prepare, staged};
+use crate::runner::{Operands, facts_of, measure, prepare, staged};
 use poot_graph_plan::Target;
 use poot_kernelgen::{
     CostTerms, RegisterTiling, StagedTerms, TiledRows, TiledShape, fit_cost_ratios,
@@ -143,7 +143,12 @@ where
         gemv_cols: None,
     };
     let prepared = prepare(bank, &case, ops)?;
-    let schedules = tiled_schedules_of(&staged(&prepared.graphs[0], device.target(), ops)?);
+    let schedules = tiled_schedules_of(&staged(
+        &prepared.graphs[0],
+        device.target(),
+        ops,
+        &facts_of(&device),
+    )?);
     let measured = measure(device, bank, &prepared, ops)?;
     if !measured.agrees {
         return Err(format!(
@@ -486,7 +491,12 @@ where
         gemv_cols: None,
     };
     let prepared = prepare(bank, &case, ops)?;
-    let schedules = indexed_schedules_of(&staged(&prepared.graphs[0], device.target(), ops)?);
+    let schedules = indexed_schedules_of(&staged(
+        &prepared.graphs[0],
+        device.target(),
+        ops,
+        &facts_of(&device),
+    )?);
     let measured = measure(device, bank, &prepared, ops)?;
     if !measured.agrees {
         return Err(format!(
@@ -568,7 +578,12 @@ where
         gemv_cols: None,
     };
     for cell in indexed_cells() {
-        let schedules = indexed_schedules_of(&staged(&indexed_graph(cell)?, device.target(), ops)?);
+        let schedules = indexed_schedules_of(&staged(
+            &indexed_graph(cell)?,
+            device.target(),
+            ops,
+            &facts_of(&device),
+        )?);
         let Some(&schedule) = schedules.first() else {
             return Err(format!(
                 "{}: no indexed contraction planned",
@@ -925,6 +940,7 @@ where
         &prepared.graphs[0],
         device.target(),
         unpinned,
+        &facts_of(&device),
     )?));
     let ops = Operands {
         gemv_cols: Some(cols),
@@ -934,6 +950,7 @@ where
         &prepared.graphs[0],
         device.target(),
         ops,
+        &facts_of(&device),
     )?));
     if ran != Some(cols) {
         return Err(format!(
@@ -1199,7 +1216,12 @@ where
     };
     ops.tiling = tiling;
     let prepared = crate::runner::prepare(&bank, &case, ops)?;
-    let schedules = packed_schedules_of(&staged(&prepared.graphs[0], target, ops)?);
+    let schedules = packed_schedules_of(&staged(
+        &prepared.graphs[0],
+        target,
+        ops,
+        &facts_of(&device),
+    )?);
     let measured = measure(device, &bank, &prepared, ops)?;
     if !measured.agrees {
         return Err(format!(

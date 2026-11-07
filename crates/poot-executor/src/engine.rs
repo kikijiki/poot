@@ -26,11 +26,12 @@ use poot_graph_ir::{
     BoundaryId, Eqn, OpKind, Operand, Slot, SlotKey, StateRole, Storage, TensorType, ValueId,
     ValueMeta, ValueTable,
 };
+use poot_graph_plan::RegisterFeedback;
 use poot_graph_plan::multi_device::PlanNodeId;
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, HOSTED_ROWS, HostedGather, IndexSource, Plan, PoolSite, Program,
-    Region, Sink, Source, Target, multi_device::topology::DeviceId, region_member_work,
-    staged::Link, staged::StageId, staged::StagedProgram, staged::SyncAction, staged::SyncPoint,
+    CompileLimits, HOSTED_ROWS, HostedGather, IndexSource, Plan, PoolSite, Program, Region, Sink,
+    Source, Target, multi_device::topology::DeviceId, region_member_work, staged::Link,
+    staged::StageId, staged::StagedProgram, staged::SyncAction, staged::SyncPoint,
     staged::TargetSet, staged::Transfer, value_ids,
 };
 use poot_kernel_ir::Body;
@@ -79,6 +80,13 @@ pub struct Engine<D: Device> {
     /// kernels.
     region_kernels: HashMap<String, (usize, LaunchKind)>,
     kernel_cache: Option<poot_codegen::KernelCache>,
+    /// The register feedback built for each artifact limit a compile asked under ([`Self::register_feedback`]): one
+    /// per limit for the engine's life, so the verdicts a feedback keeps in memory (a cache with no directory) are
+    /// asked once, not once per compile.
+    register_feedback: std::sync::Mutex<Vec<(NonZeroU64, RegisterFeedback)>>,
+    /// The facts of the device a planning engine plans for ([`Self::planning_for`]): its recording device has no
+    /// compiler, so the real device's facts stand in. `None` for an engine over a real device.
+    planned_facts: Option<poot_graph_plan::DeviceFacts>,
     /// Artifacts shared with the other engines of one planning pass; `None` for an executing engine,
     /// which keeps no artifact bytes beyond the kernel it loads.
     shared_kernels: Option<SharedKernels>,
@@ -716,6 +724,8 @@ impl<D: Device> Engine<D> {
             kernel_cache: poot_codegen::Target::try_from(target)
                 .ok()
                 .map(poot_codegen::KernelCache::open),
+            register_feedback: std::sync::Mutex::new(Vec::new()),
+            planned_facts: None,
             shared_kernels: None,
             kernels_resolved: 0,
             copy_kernel_loaded: false,
@@ -801,6 +811,49 @@ impl<D: Device> Engine<D> {
             .get_mut(exe.index())
             .and_then(Option::as_mut)
             .ok_or_else(|| LoadError::UnknownHandle.into())
+    }
+
+    /// The planner's compile feedback from this engine's device, if its compiler can be asked (POOT-1505): the engine
+    /// lowers each probe through its own kernel cache, the device compiles the kernel and reports its registers.
+    fn register_feedback(&self, max_artifact_bytes: NonZeroU64) -> Option<RegisterFeedback> {
+        let mut built = self
+            .register_feedback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, feedback)) = built.iter().find(|(limit, _)| *limit == max_artifact_bytes) {
+            return Some(feedback.clone());
+        }
+        let registers = self.device.kernel_registers()?;
+        let kernels = self.kernel_cache.clone()?;
+        let feedback =
+            crate::kernel_registers::register_feedback(registers, kernels, max_artifact_bytes);
+        built.push((max_artifact_bytes, feedback.clone()));
+        Some(feedback)
+    }
+
+    /// This planning engine planning for a device whose compile facts are `facts` (POOT-1505): the capacity planner
+    /// plans on a recording device with no compiler, and its plans must be the ones the real device's driver makes,
+    /// so the real device's NPU lowering and register feedback stand in for the recorder's none.
+    #[must_use]
+    pub fn planning_for(mut self, facts: poot_graph_plan::DeviceFacts) -> Self {
+        self.planned_facts = Some(facts);
+        self
+    }
+
+    /// [`Self::planning_for`] on an engine a coordinator owns.
+    pub(crate) fn plan_for(&mut self, facts: poot_graph_plan::DeviceFacts) {
+        self.planned_facts = Some(facts);
+    }
+
+    /// What this engine's device brings to a compile under `limits` ([`Executor::device_options`]).
+    pub(crate) fn device_facts(&self, limits: CompileLimits) -> poot_graph_plan::DeviceFacts {
+        if let Some(facts) = &self.planned_facts {
+            return facts.clone();
+        }
+        poot_graph_plan::DeviceFacts {
+            npu: self.device.region_loader().map(RegionLoader::lowering),
+            register_feedback: self.register_feedback(limits.max_artifact_bytes),
+        }
     }
 
     /// `body` compiled for this engine's target, resolved through the kernel cache (the shared table when
@@ -3658,11 +3711,8 @@ impl<D: Device> Executor for Engine<D> {
         self.device.identity()
     }
 
-    fn compile_options(&self, limits: CompileLimits) -> CompileOptions {
-        CompileOptions {
-            npu: self.device.region_loader().map(RegionLoader::lowering),
-            ..CompileOptions::new(limits)
-        }
+    fn device_options(&self, limits: CompileLimits) -> poot_graph_plan::DeviceOptions {
+        poot_graph_plan::DeviceOptions::single(self.id, self.device_facts(limits))
     }
 
     fn load_weights(

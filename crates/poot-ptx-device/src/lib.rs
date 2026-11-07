@@ -9,10 +9,12 @@
 
 pub mod device;
 pub mod multi_device;
+pub mod register_oracle;
 
 use poot_graph_ir::{ExecutionValidationFailure, ValidationId, ValueId};
 
 pub use device::{PtxDevice, PtxKernel, PtxRecording};
+pub use register_oracle::PtxKernelRegisters;
 
 /// An error enum never carries another poot error enum by value (spec 384). Every cause below is boxed, so
 /// this type's size does not depend on the cause-chain depth. `std::io::Error` is exempt (already one

@@ -338,6 +338,12 @@ impl Executor for Probe {
     fn target_set(&self) -> TargetSet {
         self.inner.target_set()
     }
+    fn device_options(
+        &self,
+        limits: poot_graph_plan::CompileLimits,
+    ) -> poot_graph_plan::DeviceOptions {
+        self.inner.device_options(limits)
+    }
     fn free_memory_bytes(&self) -> Option<u64> {
         self.inner.free_memory_bytes()
     }
@@ -740,6 +746,7 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
         Arc::clone(&handle),
         &probe(spirv_target(), 0).0.target_set(),
         Placement::Single,
+        poot_graph_plan::DeviceOptions::none_for(&probe(spirv_target(), 0).0.target_set()),
     )
     .unwrap();
     let non_staging = |roles: Vec<(BufferRole, u64)>| -> Vec<(BufferRole, u64)> {
@@ -835,6 +842,7 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         Arc::clone(&handle),
         &probe(spirv_target(), 0).0.target_set(),
         Placement::Single,
+        poot_graph_plan::DeviceOptions::none_for(&probe(spirv_target(), 0).0.target_set()),
     )
     .unwrap();
     let golden = [
@@ -980,7 +988,15 @@ fn a_planner_resolves_each_distinct_kernel_once_across_candidates() {
     let handle = fixture_model();
     let args = args(BackendChoice::Wgpu);
     let targets = probe(spirv_target(), 0).0.target_set();
-    let new_planner = || Planner::new(Arc::clone(&handle), &targets, Placement::Single).unwrap();
+    let new_planner = || {
+        Planner::new(
+            Arc::clone(&handle),
+            &targets,
+            Placement::Single,
+            poot_graph_plan::DeviceOptions::none_for(&targets),
+        )
+        .unwrap()
+    };
     let plan = |planner: &Planner, candidate: &Candidate| {
         let rows = [candidate.rows];
         planner
@@ -1504,17 +1520,22 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
             let &[(device, _)] = targets.devices() else {
                 panic!("one device");
             };
-            Planner::new(Arc::clone(&handle), &targets, Placement::Single)
-                .unwrap()
-                .plan(
-                    driver_options(&handle, generate(c), DraftPolicy::Off, None, None),
-                    &shapes_of(&c, &rows),
-                    &[],
-                )
-                .unwrap()
-                .footprint
-                .device_bytes(device)
-                .unwrap()
+            Planner::new(
+                Arc::clone(&handle),
+                &targets,
+                Placement::Single,
+                poot_graph_plan::DeviceOptions::none_for(&targets),
+            )
+            .unwrap()
+            .plan(
+                driver_options(&handle, generate(c), DraftPolicy::Off, None, None),
+                &shapes_of(&c, &rows),
+                &[],
+            )
+            .unwrap()
+            .footprint
+            .device_bytes(device)
+            .unwrap()
         })
         .min()
         .unwrap();
@@ -1599,6 +1620,7 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
         Arc::clone(&handle),
         &probe(spirv_target(), 0).0.target_set(),
         Placement::Single,
+        poot_graph_plan::DeviceOptions::none_for(&probe(spirv_target(), 0).0.target_set()),
     )
     .unwrap();
     let rows = [candidate.rows];
@@ -1689,6 +1711,7 @@ fn a_recurrent_family_plans_many_rows_and_its_state_bytes_grow_with_the_sequence
         Arc::clone(&handle),
         &probe(spirv_target(), 0).0.target_set(),
         Placement::Single,
+        poot_graph_plan::DeviceOptions::none_for(&probe(spirv_target(), 0).0.target_set()),
     )
     .unwrap();
     let max_seq = NonZeroUsize::new(64).unwrap();
@@ -1904,14 +1927,19 @@ fn smallest_candidate_bytes(
     ])
     .unwrap();
     let rows = [candidate.rows];
-    let planned = Planner::new(Arc::clone(handle), &targets, placement)
-        .expect("a planner")
-        .plan(
-            driver_options(handle, generate(candidate), DraftPolicy::Off, None, None),
-            &shapes_of(&candidate, &rows),
-            &[],
-        )
-        .expect("the candidate plans");
+    let planned = Planner::new(
+        Arc::clone(handle),
+        &targets,
+        placement,
+        poot_graph_plan::DeviceOptions::none_for(&targets),
+    )
+    .expect("a planner")
+    .plan(
+        driver_options(handle, generate(candidate), DraftPolicy::Off, None, None),
+        &shapes_of(&candidate, &rows),
+        &[],
+    )
+    .expect("the candidate plans");
     [DeviceId(0), DeviceId(1)].map(|device| planned.footprint.device_bytes(device).unwrap())
 }
 
