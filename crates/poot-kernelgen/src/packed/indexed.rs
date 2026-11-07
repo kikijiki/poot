@@ -197,6 +197,54 @@ pub(super) fn indexed_register_tiled(
     Ok(body)
 }
 
+/// The 32-bit registers one staged run of `run` aligned values of a `format` expert row holds across a tiled round's
+/// multiply (POOT-1505): the run [`indexed_register_tiled`] stages, emitted alone and counted by
+/// [`crate::contraction::held_registers`] (the reads the round issues ahead of the multiply that its decode reads
+/// after it). A descriptor the decode emitter cannot state is its typed [`KernelGenError`].
+pub fn packed_run_held_registers(
+    format: poot_quant::format::WeightFormat,
+    run: usize,
+) -> Result<u32, KernelGenError> {
+    let descriptor = format.descriptor();
+    let decode = match descriptor.storage {
+        Storage::Planar(_) => Decode::Planar(PlanarPlan::of(&descriptor)?),
+        _ => Decode::Block(DecodePlan::of(&descriptor)?),
+    };
+    let sources = match &decode {
+        Decode::Block(_) => 1,
+        Decode::Planar(plan) => plan.source_count(),
+    };
+    let mut params = vec![ld(Ty::Unit, false)];
+    params.extend((0..sources).map(|_| ld(slice_dtype(Ty::U32, false), false)));
+    let mut al = crate::helpers::Alloc::new(params);
+    let slabs: Vec<Local> = (0..sources).map(|_| al.add(Ty::Usize, false)).collect();
+    let [row, k0, k, weight_rows] = [(); 4].map(|()| al.add(Ty::Usize, false));
+    let mut e = Emit::new(&mut al);
+    let words = |index: usize| local(1 + index as u32);
+    match &decode {
+        Decode::Block(plan) => {
+            let source = Source {
+                words: words(0),
+                slab_bit: Some(slabs[0]),
+            };
+            plan.emit_run(&mut e, source, row, k0, run, k);
+        }
+        Decode::Planar(plan) => {
+            let sources: Vec<Source> = slabs
+                .iter()
+                .enumerate()
+                .map(|(index, &slab)| Source {
+                    words: words(index),
+                    slab_bit: Some(slab),
+                })
+                .collect();
+            plan.emit_run(&mut e, &sources, row, k0, run, k, weight_rows);
+        }
+    }
+    let statements = e.take();
+    Ok(crate::contraction::held_registers(statements, &al.locals))
+}
+
 #[cfg(test)]
 mod tests {
     //! The indexed packed Gemv in the KIR interpreter (GPU-free): every packed layout (block, K-quant and

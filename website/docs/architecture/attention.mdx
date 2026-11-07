@@ -115,7 +115,7 @@ The planner chooses the tiling from the shape and the device:
 | --- | --- |
 | Applies to | More than one query row, dense keys (single, split or paged), any mask but a block selection |
 | Workgroup | The widest of 256, 128 and 64 lanes the device allows; 64 on RADV (Strix Halo), whose wider workgroups lose workgroup-memory writes |
-| Registers | At most 64 accumulators per lane across the two tiles |
+| Registers | At most the device's accumulator budget per lane across the two tiles (a quarter of the lane's register file; 64 where the device reports none) |
 | Memory | The staged tiles fit the device's workgroup memory |
 | Fill | At least one workgroup per compute unit; otherwise the streaming schedule |
 

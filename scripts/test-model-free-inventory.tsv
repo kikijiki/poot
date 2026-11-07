@@ -1564,9 +1564,13 @@ poot-kernelgen	poot-kernelgen	model-free	contraction::fit::tests::the_fit_recove
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_contraction_below_the_device_takes_the_cheapest_lane_step
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_fragment_round_stages_whole_requests_of_every_operand_row
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_fragment_tile_of_one_wave_loses_to_the_exact_tiling
+poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_grouped_contraction_is_selected_at_the_block_its_grouping_takes
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_grouping_with_few_rows_per_expert_takes_a_short_block
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_long_prefill_takes_the_widest_tile
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_one_row_dense_decode_stays_on_the_gemv_at_every_output_count
+poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_packed_expert_round_stays_within_the_lanes_held_registers
+poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_shape_no_whole_round_holds_stages_one_fragment_step
+poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_tie_between_exact_and_narrowed_stays_exact
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::grouped_rows_count_whole_tiles_per_bucket
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::rows_expected_to_touch_fewer_buckets_than_they_have
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_candidates_are_the_tilings_the_device_runs
@@ -1574,6 +1578,7 @@ poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_comparison_is_f
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_gemv_beats_a_matrix_unit_at_one_row_and_loses_at_many
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_gemv_gives_way_to_the_grouping_where_the_rows_share_their_experts
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_matrix_units_rate_discounts_the_fragment_multiply
+poot-kernelgen	poot-kernelgen	model-free	contraction::tiled::tests::a_round_holds_the_reads_its_decode_uses
 poot-kernelgen	poot-kernelgen	model-free	contraction::tiled::tests::a_split_moves_the_reads_ahead_and_keeps_their_uses
 poot-kernelgen	poot-kernelgen	model-free	emit::tests::reads_a_full_word_at_a_word_boundary
 poot-kernelgen	poot-kernelgen	model-free	emit::tests::reads_spanning_a_word_boundary
@@ -1642,6 +1647,7 @@ poot-kernelgen	poot-kernelgen	model-free	reduce::tests::array_sum_probe_emits_va
 poot-kernelgen	poot-kernelgen	model-free	reduce::tests::array_sum_probe_rejected_on_spirv
 poot-kernelgen	poot-kernelgen	model-free	reduce::tests::reduce_last_lds_emits_valid_nvptx
 poot-kernelgen	poot-kernelgen	model-free	register_budget::a_held_query_the_planner_refuses_spills
+poot-kernelgen	poot-kernelgen	model-free	register_budget::a_packed_expert_tiling_within_the_held_registers_spills_none
 poot-kernelgen	poot-kernelgen	model-free	register_budget::only_a_body_the_generator_unrolled_carries_the_no_unroll_metadata
 poot-kernelgen	poot-kernelgen	model-free	register_budget::the_budget_keeps_sm_80_at_its_8_by_8_tile_without_a_spill
 poot-kernelgen	poot-kernelgen	model-free	register_budget::the_dense_register_tiled_contraction_spills_no_register
@@ -1652,6 +1658,7 @@ poot-kernelgen	poot-kernelgen	model-free	register_budget::the_fragment_attention
 poot-kernelgen	poot-kernelgen	model-free	register_budget::the_fragment_contraction_over_a_kn_weight_loads_every_operand_fragment_wide
 poot-kernelgen	poot-kernelgen	model-free	register_budget::the_fragment_dense_contraction_spills_no_register
 poot-kernelgen	poot-kernelgen	model-free	register_budget::the_pipelined_fragment_contraction_loads_ahead_of_its_multiplies
+poot-kernelgen	poot-kernelgen	model-free	register_budget::the_planned_packed_expert_tilings_spill_no_register
 poot-kernelgen	poot-kernelgen	model-free	register_budget::the_tiled_attention_at_its_planned_tilings_spills_no_register
 poot-kernelgen	poot-kernelgen	model-free	request::tests::a_body_budget_takes_exactly_its_limits_and_refuses_the_next_reservation
 poot-kernelgen	poot-kernelgen	model-free	request::tests::a_body_over_the_limits_is_refused_after_generation_when_its_request_cannot_be_sized

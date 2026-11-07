@@ -263,7 +263,9 @@ fn kn_f32_shape(
         layout: WeightLayout::Kn,
         rows: poot_kernelgen::TiledRows::Dense,
         terms: kg::StagedTerms::of(precision, None, None),
-        weight_bits: kg::DenseTiledWeight::KnF32.bits(),
+        weight: kg::StagedWeight::Dense {
+            bits: kg::DenseTiledWeight::KnF32.bits(),
+        },
         activation_bits: kg::activation_bits(None),
     }
 }
@@ -502,9 +504,10 @@ pub(super) fn register_tiled_launch(
         }
         pin
     } else if shape.terms.fragment.is_some() {
-        // A narrowed or split read runs on a matrix unit or not at all (POOT-1476): a scalar tiling would round for no
-        // speed, and the pass that narrowed the op asked this same function. A refusal, never a silent exact plan.
-        kg::RegisterTiling::fragment_tiling(shape, caps)
+        // A narrowed or split read runs on a matrix unit or not at all (POOT-1476): the op is narrowed because its
+        // fragment tiling won the selection (`RegisterTiling::select`, POOT-1505), and a scalar tiling would round for
+        // no speed. A refusal, never a silent exact plan.
+        kg::RegisterTiling::tiling_of(shape, caps)
             .ok_or_else(|| site.refuse(Capability::NoMatrixUnitSchedule))?
     } else {
         kg::RegisterTiling::choose(shape, caps)

@@ -482,13 +482,14 @@ pub(crate) fn plan_eqn_compiled(
 
 /// Whether `select_operand_precision` narrows `eqn`, an op that reads its operands narrowed or split (POOT-1476): the
 /// planner can run it on a matrix unit (`plan_eqn_compiled` succeeds, and it plans a narrowed op only on one, a
-/// GEMV, a scalar tiling or a streaming attention being a typed refusal) and, for a contraction, a matrix unit is
-/// the cheapest schedule by the one `ContractionCost` model (the fragment tiling against the exact scalar tiling and
-/// the exact Gemv). The pass and the final plan answer the first part with the same planning, so they cannot disagree.
+/// GEMV, a scalar tiling or a streaming attention being a typed refusal) and, for a contraction, the one selection
+/// over its exact and narrowed schedules chooses a fragment tiling (`RegisterTiling::select`, POOT-1505): the
+/// precision is that choice's output, so narrowing happens only where it is the cheapest schedule of the shape the
+/// plan runs, never because the policy permits it.
 ///
 /// A per-row indexed contraction past the Gemv rows is the one op the planner refuses before its rows are grouped by
-/// expert (`group_expert_rows`, which runs after the precision is selected): its grouped shape is asked of the cost
-/// model directly, as the grouping will plan it.
+/// expert (`group_expert_rows`, which runs after the precision is selected): its grouped shape is asked of the
+/// selection directly, which costs it at the blocks the grouping can take, as the grouping will plan it.
 pub(crate) fn runs_on_matrix_unit(
     g: &Graph,
     eqn: &Eqn,
@@ -518,9 +519,7 @@ pub(crate) fn runs_on_matrix_unit(
         _ => None,
     };
     if let Some(shape) = grouped {
-        return shape.is_some_and(|shape| {
-            poot_kernelgen::RegisterTiling::matrix_unit_wins(shape, None, caps)
-        });
+        return shape.is_some_and(|shape| narrows(shape, None, caps));
     }
     if plan_eqn_compiled(g, eqn, target, views, limits, npu, OutputBuffer::Fresh).is_err() {
         return false;
@@ -529,9 +528,18 @@ pub(crate) fn runs_on_matrix_unit(
     let shapes = packed::dense_cost_shapes(tables, eqn, caps)
         .or_else(|| packed_dequant::packed_cost_shapes(tables, eqn, *backend, caps, *limits))
         .or_else(|| matmul::matmul_cost_shape(g, eqn, caps).map(|shape| (shape, None)));
-    shapes.is_none_or(|(tiled, gemv)| {
-        poot_kernelgen::RegisterTiling::matrix_unit_wins(tiled, gemv, caps)
-    })
+    shapes.is_none_or(|(tiled, gemv)| narrows(tiled, gemv, caps))
+}
+
+/// Whether the selection over `shape`'s exact and narrowed schedules (and the exact Gemv `gemv`) chooses its
+/// fragment tiling.
+fn narrows(
+    shape: poot_kernelgen::TiledShape,
+    gemv: Option<poot_kernelgen::GemvShape>,
+    caps: &DeviceCaps,
+) -> bool {
+    poot_kernelgen::RegisterTiling::select(shape, gemv, caps)
+        .is_some_and(poot_kernelgen::Selection::narrows)
 }
 
 /// Whether `op` can read a BF16 const operand through a packed lane: the `Cast` kernel, and the fused regions

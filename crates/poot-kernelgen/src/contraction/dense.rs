@@ -34,7 +34,7 @@ impl DenseTiledWeight {
         }
     }
 
-    /// The bits one weight element occupies in global memory ([`crate::TiledShape::weight_bits`]): 16 for a packed
+    /// The bits one weight element occupies in global memory ([`crate::StagedWeight::bits`]): 16 for a packed
     /// half, 32 for an f32 word.
     pub fn bits(self) -> u32 {
         match self {
@@ -342,7 +342,9 @@ mod tests {
                     layout: weight.layout(),
                     rows: crate::TiledRows::Dense,
                     terms: StagedTerms::ONE,
-                    weight_bits: weight.bits(),
+                    weight: crate::StagedWeight::Dense {
+                        bits: weight.bits(),
+                    },
                     activation_bits: 32,
                 };
                 for tiling in RegisterTiling::candidates(tiled_shape, &caps) {
@@ -427,7 +429,9 @@ mod tests {
                 layout: weight.layout(),
                 rows: crate::TiledRows::Dense,
                 terms: StagedTerms::of(precision, None, Some(FragmentDtype::Bf16)),
-                weight_bits: weight.bits(),
+                weight: crate::StagedWeight::Dense {
+                    bits: weight.bits(),
+                },
                 activation_bits,
             };
             for tiling in RegisterTiling::candidates(shape(16), &caps) {

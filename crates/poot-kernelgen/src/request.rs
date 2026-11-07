@@ -1931,7 +1931,9 @@ mod tests {
                 layout: weight.layout(),
                 rows: crate::TiledRows::Dense,
                 terms: crate::precision::StagedTerms::ONE,
-                weight_bits: weight.bits(),
+                weight: crate::StagedWeight::Dense {
+                    bits: weight.bits(),
+                },
                 activation_bits: 32,
             },
             caps,

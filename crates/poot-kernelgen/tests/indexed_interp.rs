@@ -229,7 +229,9 @@ fn an_invalid_expert_id_is_a_nan_row_and_never_an_out_of_range_read() {
                         block: 16,
                     },
                     terms: poot_kernelgen::StagedTerms::ONE,
-                    weight_bits: kg::DenseTiledWeight::Nk(weight).bits(),
+                    weight: kg::StagedWeight::Dense {
+                        bits: kg::DenseTiledWeight::Nk(weight).bits(),
+                    },
                     activation_bits: 32,
                 },
                 &poot_test_util::device_caps::wgpu_rdna3_igpu(),

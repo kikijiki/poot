@@ -59,12 +59,13 @@ With no vendor graph API, poot records the dispatch sequence as AQL packets and 
 
 On every backend the next token is picked on the device, in a step appended to the decode graph. The host reads back the token id, a non-finite flag and any logprobs; bias, penalties and the guided mask run in that step. See [Serving design](./serving-design.mdx#the-scheduling-loop).
 
-What a backend can run is decided by planning: a graph runs when `compile` succeeds for that target, and a refusal names the op and the missing capability. [Supported models and formats](../develop/supported-models.md) is generated from those results.
+The operand policy is [`--matmul-precision`](../serve/configuration.md); the units and the choice are on [Matrix units and the cost model](./matrix-units.mdx). What a backend can run is decided by planning: a graph runs when `compile` succeeds for that target, and a refusal names the op and the missing capability. [Supported models and formats](../develop/supported-models.md) is generated from those results.
 
 | | wgpu, raw Vulkan | ROCm | PTX |
 | --- | --- | --- | --- |
-| Compute dtype | f32 | f32, opt-in bf16 matmul | f32, opt-in bf16 matmul |
-| Matrix unit | Not used: every GEMM is the register-tiled body on the vector units | Not used | Not used |
+| Contraction operands | `narrow` by default: f16 on the matrix unit where one wins, else `exact` | `narrow` by default: f16 where one wins, bf16 otherwise | `narrow` by default: f16 where one wins, bf16 otherwise |
+| Accumulation | f32 | f32 | f32 |
+| Matrix unit | Cooperative matrix (f16), used where the cost model ranks it first | WMMA on gfx11, used where it ranks first | `wmma` on sm_80 and newer, used where it ranks first |
 
 ## Correctness
 

@@ -50,6 +50,20 @@ A program with a gather-only table needs the host every step, so its decode does
 chain for it when the entries are prepared. The executor's `hosted_rows`, `hosted_bytes` and `hosted_table_bytes` counters report
 the rows copied, the stored bytes they wrote, and the mapped bytes of the hosted tables that are not device memory.
 
+## Loading and activation memory
+
+A checkpoint is read once, by the upload that stages it for the device. Each tensor is read with positional reads into pinned
+staging memory, and the same pass checks a packed payload's stored values. The host keeps no copy of the weights, so its resident
+set does not grow with the checkpoint, and nothing binds a byte of a checkpoint whose check refused it: the weight store is published
+only after every tensor passed and every file is still the one that was mapped. A malformed config is a typed load refusal.
+
+The activations of an entry come from a lifetime arena. The stages of an entry run one after another, so a slot that is dead once
+its stage has run is free for the next stage. The entry needs as many shared buffers as its most demanding stage has slots, each as
+large as the largest slot that ever sits in it, and the slots are matched largest-first. A slot that outlives its stage (an export a
+later stage binds, the output, a state-commit source, a validation witness) keeps a buffer of its own. A shared buffer is untyped
+bytes, and each binding views it as its own storage. The capacity check in [Choosing a backend](../serve/choosing-a-backend.md)
+counts every retained arena.
+
 ## Per backend
 
 | Backend | Capture (once) | Per token |

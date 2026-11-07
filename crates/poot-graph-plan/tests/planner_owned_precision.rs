@@ -166,7 +166,7 @@ fn is_contraction(op: &OpKind) -> bool {
 /// if and only if it runs a matrix-unit schedule, and a decode GEMV is exact. Over a prefill and a decode program of a
 /// dense and a packed model on gfx1151. Mutation: in `select_operand_precision` skip the planner's answer (narrow
 /// every op the dtype rule admits); the decode programs narrow (`dense decode: [Narrow(F16), ..]`) and go red.
-/// Mutation: drop the Gemv alternative from `RegisterTiling::matrix_unit_wins`; the same rows go red.
+/// Mutation: drop the Gemv alternative from `RegisterTiling::select`; the same rows go red.
 #[test]
 fn a_narrowed_op_runs_on_a_matrix_unit_and_a_decode_gemv_stays_exact() {
     for (name, graph, narrows) in [

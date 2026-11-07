@@ -215,7 +215,7 @@
         "accumulate": "f32",
         "reference": "f64 loop",
         "operand_precision": "narrow",
-        "operand_rounding": "activation and weight operands rounded to nearest even to the backend matrix unit dtype (bf16 on ROCm and PTX, f16 on Vulkan), products accumulated in f32; the reference rounds the same operands"
+        "operand_rounding": "activation and weight operands rounded to nearest even to the backend matrix unit dtype (f16 where the unit takes it, else bf16: the planner's dtype policy, POOT-1454), products accumulated in f32; the reference rounds the same operands"
       },
       "token_fixture": "splitmix64-seed0-unit",
       "cache": "weights-resident-hot",
@@ -230,7 +230,7 @@
         "ptx"
       ],
       "status": "runnable",
-      "fixture_id": "34824a3c162360ecedcacc5cd53dd4d4c2fef22a9980824908cfe6e7d580a5b1",
+      "fixture_id": "2a60518f1644e6c163d92c4cb368af75133a8c63cdeee014ea18d10a1c6bb99e",
       "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
       "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
       "identity_digest": "d08ec43b67292546b9c1bb49224e6202dac7cecf7bec3ed29a479a3dcd245178"
@@ -253,7 +253,7 @@
         "weight": "each f32 draw truncated to its top 16 bits",
         "reference": "f64 loop over the stored bf16 weights",
         "operand_precision": "narrow",
-        "operand_rounding": "activation and weight operands rounded to nearest even to the backend matrix unit dtype (bf16 on ROCm and PTX, f16 on Vulkan), products accumulated in f32; the reference rounds the same operands"
+        "operand_rounding": "activation and weight operands rounded to nearest even to the backend matrix unit dtype (f16 where the unit takes it, else bf16: the planner's dtype policy, POOT-1454), products accumulated in f32; the reference rounds the same operands"
       },
       "token_fixture": "splitmix64-seed0-unit",
       "cache": "weights-resident-hot",
@@ -268,7 +268,7 @@
         "ptx"
       ],
       "status": "runnable",
-      "fixture_id": "e8fd2f4c5447236ae0731ac6edf89c0069aa53d54f8674e30c68de88f2357715",
+      "fixture_id": "4725e7309d7f396a5ccb889bc6dfefd8a3aa702e77d16b18cbb61114b6dd5b77",
       "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
       "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
       "identity_digest": "d0dad29d0f51df635dad132d543acef38d89550ac982740d84cf420f7e40489e"
@@ -327,7 +327,7 @@
         "weight": "each f32 draw truncated to its top 16 bits",
         "reference": "f64 loop over the stored bf16 weights",
         "operand_precision": "narrow",
-        "operand_rounding": "activation and weight operands rounded to nearest even to the backend matrix unit dtype (bf16 on ROCm and PTX, f16 on Vulkan), products accumulated in f32; the reference rounds the same operands"
+        "operand_rounding": "activation and weight operands rounded to nearest even to the backend matrix unit dtype (f16 where the unit takes it, else bf16: the planner's dtype policy, POOT-1454), products accumulated in f32; the reference rounds the same operands"
       },
       "token_fixture": "splitmix64-seed0-unit",
       "cache": "weights-resident-hot",
@@ -342,7 +342,7 @@
         "ptx"
       ],
       "status": "runnable",
-      "fixture_id": "328ec1990b6e77b241d2fb8bbeddfb844b9e02134036263b77fbbf4a779a5ab4",
+      "fixture_id": "92926817ff1537cb984009eb9137b232a4b6620328e7c95fbba11b3a4cf11a98",
       "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
       "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
       "identity_digest": "bb94fc5f00b6db448518ac3f0567c6859b0e63956074ca5dea462da436e11887"
@@ -942,7 +942,7 @@
         "routing": "each routed row's expert drawn uniformly from the fixture stream after the activation, rows in row order",
         "reference": "f64 loop over each row's own expert",
         "operand_precision": "narrow",
-        "operand_rounding": "activation and weight operands rounded to nearest even to the backend matrix unit dtype (bf16 on ROCm and PTX, f16 on Vulkan), products accumulated in f32; the reference rounds the same operands"
+        "operand_rounding": "activation and weight operands rounded to nearest even to the backend matrix unit dtype (f16 where the unit takes it, else bf16: the planner's dtype policy, POOT-1454), products accumulated in f32; the reference rounds the same operands"
       },
       "token_fixture": "splitmix64-seed0-unit",
       "cache": "weights-resident-hot",
@@ -957,7 +957,7 @@
         "ptx"
       ],
       "status": "runnable",
-      "fixture_id": "0ff78e1a448f167e3bd7d3914d2a1e96f62cc1ddfaf784e4b7117f353de6dfa6",
+      "fixture_id": "890a020b7aa15d892f1da570f55e55168205839515a7bfcd196eeb061596ad4c",
       "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
       "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
       "identity_digest": "8221b7414273460fe0cfb75b1722b0f39f49cbd503cdff4ea27de63e9b0e7202"
@@ -1193,6 +1193,130 @@
       "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
       "fixture_id": "652a9aa3225d42b9ebf52f7eedb17ff7eb908bf904cd6e8929cc33735e665548",
       "identity_digest": "ff57e37f6f77ff162a30f0a34d034605ec049e7892012a708c9f153454004d47"
+    },
+    {
+      "id": "expert-prefill-packed-iq2xs-up",
+      "regime": "MoE prefill routed expert projection over a packed IQ2_XS expert stack at a wide mixture's dimensions (128 tokens, each to 10 of 512 experts, K 2560, N 640: about 2.5 routed rows per expert), exact operands",
+      "level": "kernel",
+      "producer": "packed_grouped_experts",
+      "shape": {
+        "tokens": 128,
+        "top_k": 10,
+        "experts": 512,
+        "k": 2560,
+        "n": 640,
+        "order": "routed"
+      },
+      "storage": "iq2_xs",
+      "layout": "nk",
+      "numerics": {
+        "accumulate": "f32",
+        "activation": "f32, one row per token, broadcast over the token's top_k routed rows as the MoE block traces it",
+        "weight": "each expert a random iq2_xs payload at a checkpoint's scale magnitude: random codes, every block scale 2^-8 .. 2^-5 (the runner's checkpoint_scaled_payload, seed 7e+101)",
+        "routing": "each routed row's expert drawn uniformly from the fixture stream after the activation, rows in row order",
+        "reference": "f64 loop over each row's own expert as the oracle decoder reads it",
+        "operand_precision": "exact"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "fixture_id": "885a130ad1591ecad7f814aced6a84ed04df82382a94cd563b65e02c86ee1e1b",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "d837c60c21ba65ca27fae105ecc9b1b663fd9519fd0f6adceacecfda9aa8514f",
+      "status": "runnable"
+    },
+    {
+      "id": "expert-prefill-packed-iq2xs-up-narrow",
+      "regime": "The same packed IQ2_XS routed projection with narrow operands (the matrix unit)",
+      "level": "kernel",
+      "producer": "packed_grouped_experts",
+      "shape": {
+        "tokens": 128,
+        "top_k": 10,
+        "experts": 512,
+        "k": 2560,
+        "n": 640,
+        "order": "routed"
+      },
+      "storage": "iq2_xs",
+      "layout": "nk",
+      "numerics": {
+        "accumulate": "f32",
+        "activation": "f32, one row per token, broadcast over the token's top_k routed rows as the MoE block traces it",
+        "weight": "each expert a random iq2_xs payload at a checkpoint's scale magnitude: random codes, every block scale 2^-8 .. 2^-5 (the runner's checkpoint_scaled_payload, seed 7e+101)",
+        "routing": "each routed row's expert drawn uniformly from the fixture stream after the activation, rows in row order",
+        "reference": "f64 loop over each row's own expert as the oracle decoder reads it",
+        "operand_precision": "narrow",
+        "operand_rounding": "activation and decoded weight operands rounded to nearest even to the backend matrix unit dtype (f16 where the unit takes it, else bf16: the planner's dtype policy, POOT-1454), products accumulated in f32; the reference rounds the same operands"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "fixture_id": "6948e4e33b5f999dc80b628d4ff7b58f6418bbc1f73af7bfc0fc4cd0eb718b9b",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "29342022e617346b8a97b82dfd6628faa9a988f5f12f5cd0f29a523781918e00",
+      "status": "runnable"
+    },
+    {
+      "id": "expert-prefill-packed-iq4nl-down",
+      "regime": "MoE prefill routed expert down projection over a packed IQ4_NL expert stack at a wide mixture's dimensions (128 tokens, each to 10 of 512 experts, K 640, N 2560), exact operands",
+      "level": "kernel",
+      "producer": "packed_grouped_experts",
+      "shape": {
+        "tokens": 128,
+        "top_k": 10,
+        "experts": 512,
+        "k": 640,
+        "n": 2560,
+        "order": "routed"
+      },
+      "storage": "iq4_nl",
+      "layout": "nk",
+      "numerics": {
+        "accumulate": "f32",
+        "activation": "f32, one row per token, broadcast over the token's top_k routed rows as the MoE block traces it",
+        "weight": "each expert a random iq4_nl payload at a checkpoint's scale magnitude: random codes, every block scale 2^-8 .. 2^-5 (the runner's checkpoint_scaled_payload, seed 7e+101)",
+        "routing": "each routed row's expert drawn uniformly from the fixture stream after the activation, rows in row order",
+        "reference": "f64 loop over each row's own expert as the oracle decoder reads it",
+        "operand_precision": "exact"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "fixture_id": "195578deac9dc8b7d537b4e7fcdae38846171c74e4b0d978b630fee4b430dd2e",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "30c4233ddc4becf3447a778bacefbbf0322b11fbb2386587db383e127d24af91",
+      "status": "runnable"
     }
   ]
 }

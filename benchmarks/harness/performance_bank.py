@@ -341,7 +341,7 @@ def work_flop(case):
     shape, producer = case["shape"], case["producer"]
     if producer in ("dense_matmul", "dense_contraction"):
         return 2 * shape["m"] * shape["k"] * shape["n"]
-    if producer == "grouped_experts":
+    if producer in ("grouped_experts", "packed_grouped_experts"):
         # Every routed row contracts against its own expert once.
         return 2 * shape["tokens"] * shape.get("top_k", 1) * shape["k"] * shape["n"]
     if producer == "attention_decode":

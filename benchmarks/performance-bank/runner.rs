@@ -22,9 +22,10 @@ use poot_graph_plan::staged::{
 use poot_graph_plan::{CompileOptions, Target};
 use poot_kernelgen::RegisterTiling;
 use poot_load::packed_safetensors::sha256_digest;
-use poot_quant::StoredBytes;
+use poot_quant::format::WeightFormat;
 use poot_quant::scalar;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
+use poot_quant::{PackedPayload, StoredBytes};
 use poot_tensor::{HostTensor, HostView};
 use serde_json::{Value, json};
 
@@ -92,8 +93,8 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The operand rounding a case declares in `numerics.operand_precision` (`"exact"`, or `"narrow"`: operands enter
-/// the products rounded to the fragment dtype of the backend's matrix unit, accumulated in f32). The dtype is the
-/// backend's: bf16 where the unit takes it (ROCm, PTX), f16 on the Vulkan cooperative matrix (wgpu, raw Vulkan). A narrow case
+/// the products rounded to the fragment dtype of the device's matrix unit, accumulated in f32). The dtype is the
+/// planner's ([`Operands::fragment_dtype`]): f16 where the unit takes it, else bf16. A narrow case
 /// compares with a reference that rounds the same operands, so its tolerance is the narrow-storage one ([`NARROW_REFERENCE_TOLERANCE`]).
 #[derive(Clone, Copy)]
 pub(crate) struct Operands {
@@ -110,14 +111,10 @@ pub(crate) struct Operands {
 }
 
 impl Operands {
-    fn of(backend: &str, case: &Value) -> Result<Self, String> {
+    pub(crate) fn of(target: Target, case: &Value) -> Result<Self, String> {
         let narrow = match case["numerics"]["operand_precision"].as_str() {
             None | Some("exact") => None,
-            Some("narrow") => Some(if matches!(backend, "wgpu" | "vulkan") {
-                FragmentDtype::F16
-            } else {
-                FragmentDtype::Bf16
-            }),
+            Some("narrow") => Some(Self::fragment_dtype(target)),
             Some(other) => return Err(format!("unknown operand_precision {other:?}")),
         };
         Ok(Self {
@@ -126,6 +123,23 @@ impl Operands {
             indexed_rows: None,
             gemv_cols: None,
         })
+    }
+
+    /// The dtype a narrowed contraction of f32 and bf16 or packed operands runs in on `target`, as the planner's
+    /// `select_operand_precision` picks it (POOT-1454): f16 where the matrix unit takes it, else bf16.
+    fn fragment_dtype(target: Target) -> FragmentDtype {
+        let takes_f16 = match target {
+            Target::Gpu { caps, .. } => caps
+                .matrix_units
+                .known()
+                .is_some_and(|units| units.config(FragmentDtype::F16).is_some()),
+            _ => false,
+        };
+        if takes_f16 {
+            FragmentDtype::F16
+        } else {
+            FragmentDtype::Bf16
+        }
     }
 
     fn tolerance(self) -> f64 {
@@ -170,6 +184,9 @@ pub(crate) struct Prepared {
     consts: Vec<(String, HostTensor)>,
     references: Vec<Vec<f64>>,
     out_shape: Vec<usize>,
+    /// The packed weights the graphs name, by store entry: a packed expert stack's experts are the entries
+    /// `{stack const}.{expert}` (`ConstWeights` views them as one stack).
+    packed: Vec<(String, Arc<PackedPayload>)>,
     /// Per-step slot inputs, bound identically at every step: key, shape and the I32 words as bytes.
     slots: Vec<(poot_graph_ir::SlotKey, Vec<usize>, Vec<u8>)>,
     observed: Value,
@@ -228,6 +245,7 @@ fn dense_matmul(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, S
         consts,
         references,
         out_shape: vec![m, n],
+        packed: Vec::new(),
         slots: Vec::new(),
         observed: json!({
             "shape": { "m": m, "k": k, "n": n },
@@ -374,6 +392,7 @@ fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
         consts,
         references: vec![want],
         out_shape: vec![1, hq, 1, d],
+        packed: Vec::new(),
         slots,
         observed: json!({
             "shape": shape_json,
@@ -454,6 +473,7 @@ fn dense_contraction(bank: &Value, case: &Value, ops: Operands) -> Result<Prepar
         consts,
         references,
         out_shape: vec![m, n],
+        packed: Vec::new(),
         slots: Vec::new(),
         observed: json!({
             "shape": { "m": m, "k": k, "n": n },
@@ -611,6 +631,7 @@ fn grouped_experts(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared
         consts,
         references,
         out_shape: vec![rows, n],
+        packed: Vec::new(),
         slots,
         observed: json!({
             "shape": shape.clone(),
@@ -618,6 +639,215 @@ fn grouped_experts(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared
             "layout": case["layout"].clone(),
             "weight_copies": copies,
             "weight_bytes_per_copy": experts * k * n * elem_bytes,
+        }),
+    })
+}
+
+/// The packed weight format a case's `storage` names (the GGUF type names, lower case).
+pub(crate) fn packed_format(storage: &str) -> Result<WeightFormat, String> {
+    match storage {
+        "q8_0" => Ok(WeightFormat::Q8_0),
+        "q4_k" => Ok(WeightFormat::Q4_K),
+        "iq2_xs" => Ok(WeightFormat::Iq2_Xs),
+        "iq4_nl" => Ok(WeightFormat::Iq4_Nl),
+        other => Err(format!("no packed format named {other:?}")),
+    }
+}
+
+/// An admitted-domain random payload of a block `format` whose block scales (and mins) are a checkpoint's
+/// magnitude: `random_payload`'s codes, each float factor replaced by `2^-8 .. 2^-5` cycling over the blocks. A
+/// random f16 scale spans `2^-24 .. 65504`, which decodes weights past any narrow dtype's range; a checkpoint's do not.
+fn checkpoint_scaled_payload(format: WeightFormat, shape: [usize; 2], seed: u64) -> PackedPayload {
+    use poot_quant::format::{FieldEncoding, FloatFormat, OperandRole, Storage};
+    let base = poot_quant::test_support::packed::random_payload(format, shape, seed);
+    let Storage::Blocks(layout) = format.descriptor().storage else {
+        return base;
+    };
+    let weight = base.weight();
+    let sources: Vec<_> = weight
+        .sources()
+        .into_iter()
+        .map(|role| {
+            let mut bytes = base.bytes(role).to_vec();
+            for (index, block) in bytes.chunks_mut(layout.bytes).enumerate() {
+                for field_role in [OperandRole::Scale, OperandRole::Min] {
+                    let Some(field) = layout.field(field_role) else {
+                        continue;
+                    };
+                    let scale = 2f32.powi(-8 + (index % 4) as i32);
+                    let byte = (field.field.pieces[0].layout.bit(0) / 8) as usize;
+                    let bits = match field.field.encoding {
+                        FieldEncoding::Float(FloatFormat::F16) => half_bits(scale),
+                        FieldEncoding::Float(FloatFormat::Bf16) => (scale.to_bits() >> 16) as u16,
+                        _ => continue,
+                    };
+                    block[byte..byte + 2].copy_from_slice(&bits.to_le_bytes());
+                }
+            }
+            (role, StoredBytes::from(bytes))
+        })
+        .collect();
+    PackedPayload::try_new(weight, sources).expect("a rescaled payload is admitted")
+}
+
+/// The binary16 bits of `v`, a power of two inside the normal range.
+fn half_bits(v: f32) -> u16 {
+    let exponent = (v.to_bits() >> 23) as i32 - 127;
+    (((exponent + 15) as u16) << 10) | ((v.to_bits() >> 13) as u16 & 0x3ff)
+}
+
+/// One routed expert projection of a MoE prefill over a packed expert stack (POOT-1505): `tokens * top_k` rows
+/// through the indexed packed contraction against `experts` packed `[N, K]` weights of the case's `storage` format,
+/// the rows in row order as a model traces them (`compile` groups them by expert for a tiled contraction). Each
+/// row's expert is drawn from the fixture stream, uniform over the experts. Every expert is a random payload at a
+/// checkpoint's scale magnitude ([`checkpoint_scaled_payload`]); the f64 reference contracts each row against its own expert
+/// as the oracle decoder reads it, the operands rounded as the case's precision reads them. The stack is one copy:
+/// a stack of the experts' slabs is far beyond the last-level cache at the dimensions this producer is for.
+fn packed_grouped_experts(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String> {
+    let shape = &case["shape"];
+    let (tokens, experts, k, n) = (
+        dim(shape, "tokens")?,
+        dim(shape, "experts")?,
+        dim(shape, "k")?,
+        dim(shape, "n")?,
+    );
+    let top_k = shape["top_k"].as_u64().map_or(1, |v| v as usize);
+    let rows = tokens * top_k;
+    if case["layout"].as_str() != Some("nk") {
+        return Err("packed_grouped_experts reads a packed [N, K] stack (layout nk)".into());
+    }
+    let format = packed_format(case["storage"].as_str().ok_or("case has no storage")?)?;
+    if shape["order"].as_str() != Some("routed") {
+        return Err("packed_grouped_experts routes its rows uniformly (order routed)".into());
+    }
+    let mut stream = SplitMix64(
+        bank["token_fixtures"][case["token_fixture"].as_str().unwrap()]["seed"]
+            .as_u64()
+            .ok_or("fixture has no seed")?,
+    );
+    let x = stream.tensor(tokens * k);
+    let x_read: Vec<f64> = x.iter().map(|&v| ops.round(v)).collect();
+    let ids: Vec<i32> = stream
+        .tensor(rows)
+        .into_iter()
+        .map(|u| ((((u + 1.0) * 0.5) * experts as f32) as usize).min(experts - 1) as i32)
+        .collect();
+    let payloads: Vec<Arc<PackedPayload>> = (0..experts)
+        .map(|e| {
+            Arc::new(checkpoint_scaled_payload(
+                format,
+                [n, k],
+                e as u64 * 7 + 101,
+            ))
+        })
+        .collect();
+    // The reference, one expert at a time (its rows decoded once), the experts spread over the host's threads.
+    let mut routed: Vec<Vec<usize>> = vec![Vec::new(); experts];
+    for (row, &e) in ids.iter().enumerate() {
+        routed[e as usize].push(row);
+    }
+    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    let parts: Vec<Vec<(usize, Vec<f64>)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|thread| {
+                let (routed, payloads, x_read) = (&routed, &payloads, &x_read);
+                scope.spawn(move || -> Result<Vec<(usize, Vec<f64>)>, String> {
+                    let mut out = Vec::new();
+                    let mut decoded = vec![0.0f32; k];
+                    for e in (thread..experts).step_by(threads) {
+                        if routed[e].is_empty() {
+                            continue;
+                        }
+                        let mut w = vec![0.0f64; n * k];
+                        for (col, read) in w.chunks_mut(k).enumerate() {
+                            payloads[e]
+                                .decode_row(col, &mut decoded)
+                                .map_err(|error| format!("expert {e} row {col}: {error:?}"))?;
+                            for (r, &v) in read.iter_mut().zip(&decoded) {
+                                *r = ops.round(v);
+                            }
+                        }
+                        for &row in &routed[e] {
+                            let xs = &x_read[(row / top_k) * k..(row / top_k + 1) * k];
+                            let want = w
+                                .chunks(k)
+                                .map(|wc| xs.iter().zip(wc).map(|(a, b)| a * b).sum())
+                                .collect();
+                            out.push((row, want));
+                        }
+                    }
+                    Ok(out)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("a reference thread panicked"))
+            .collect::<Result<_, String>>()
+    })?;
+    let mut want = vec![0.0f64; rows * n];
+    for (row, values) in parts.into_iter().flatten() {
+        want[row * n..(row + 1) * n].copy_from_slice(&values);
+    }
+    let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
+        stack: poot_graph_ir::test_support::packed_graphs::TEST_STACK,
+        descriptor: payloads[0].weight(),
+        experts,
+    };
+    let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
+    // The routed rows as the MoE block traces them: each token's row broadcast over its `top_k` slots.
+    let tokens_x = b.constant("x", TensorType::f32(vec![tokens, k])).unwrap();
+    let xi = b
+        .reshape(
+            b.broadcast(
+                b.reshape(tokens_x, vec![tokens, 1, k]).unwrap(),
+                vec![tokens, top_k, k],
+            )
+            .unwrap(),
+            vec![rows, k],
+        )
+        .unwrap();
+    let idi = b
+        .slot_named_ranged(
+            poot_graph_ir::Slot::Activation,
+            "ids",
+            TensorType::new(vec![rows], poot_tensor::DType::I32),
+            poot_graph_ir::IndexRange::below(experts).ok_or("experts must be non-zero")?,
+        )
+        .unwrap();
+    let y = poot_graph_ir::test_support::packed_graphs::packed_indexed_linear(&b, xi, idi, &table)
+        .map_err(|e| format!("packed_indexed_linear: {e}"))?;
+    let graph = b.finish(y).unwrap();
+    let key = graph
+        .meta(idi.id())
+        .slot_key()
+        .cloned()
+        .ok_or("the ids slot has no slot key")?;
+    let bytes = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+    let stack = poot_graph_ir::test_support::packed_graphs::TEST_STACK.const_name();
+    let slab_bytes: usize = table
+        .descriptor
+        .sources()
+        .into_iter()
+        .map(|role| table.descriptor.slab_bytes(role))
+        .sum();
+    Ok(Prepared {
+        graphs: vec![graph],
+        consts: vec![("x".to_string(), HostTensor::f32(vec![tokens, k], x))],
+        references: vec![want],
+        out_shape: vec![rows, n],
+        packed: payloads
+            .into_iter()
+            .enumerate()
+            .map(|(e, payload)| (format!("{stack}.{e}"), payload))
+            .collect(),
+        slots: vec![(key, vec![rows], bytes)],
+        observed: json!({
+            "shape": shape.clone(),
+            "storage": case["storage"].clone(),
+            "layout": case["layout"].clone(),
+            "weight_copies": 1,
+            "weight_bytes_per_copy": experts * slab_bytes,
         }),
     })
 }
@@ -773,6 +1003,7 @@ fn attention_prefill(bank: &Value, case: &Value) -> Result<Prepared, String> {
         ],
         references: vec![want],
         out_shape: vec![1, hq, lq, d],
+        packed: Vec::new(),
         slots: vec![(key, vec![1, lq], positions)],
         observed: json!({
             "shape": { "hq": hq, "hkv": hkv, "d": d, "lq": lq, "cap": cap },
@@ -895,6 +1126,7 @@ fn ssd_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
         ],
         references: vec![want],
         out_shape: vec![1, heads, rows, p],
+        packed: Vec::new(),
         slots: Vec::new(),
         observed: json!({
             "shape": { "family": "ssd", "heads": heads, "p": p, "n": n, "steps": len },
@@ -995,6 +1227,7 @@ fn delta_rule_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
         ],
         references: vec![want],
         out_shape: vec![1, heads, rows, d],
+        packed: Vec::new(),
         slots: Vec::new(),
         observed: json!({
             "shape": { "heads": heads, "d": d, "steps": len },
@@ -1020,6 +1253,7 @@ pub(crate) fn prepare(bank: &Value, case: &Value, ops: Operands) -> Result<Prepa
         Some("attention_prefill") => attention_prefill(bank, case),
         Some("recurrence_scan") => recurrence_scan(bank, case),
         Some("grouped_experts") => grouped_experts(bank, case, ops),
+        Some("packed_grouped_experts") => packed_grouped_experts(bank, case, ops),
         other => Err(format!("no runner for producer {other:?}")),
     }
 }
@@ -1107,6 +1341,11 @@ where
         builder
             .insert(name.as_str(), WeightEntry::Dense(dense))
             .map_err(|e| format!("const {name}: {e}"))?;
+    }
+    for (name, payload) in &prepared.packed {
+        builder
+            .insert(name.as_str(), WeightEntry::Packed(Arc::clone(payload)))
+            .map_err(|e| format!("packed {name}: {e}"))?;
     }
     let store = builder.build();
     let mut weights = ConstWeights::new(&store);
@@ -1222,7 +1461,7 @@ fn run_case<D>(
 where
     D: Device + 'static,
 {
-    let ops = Operands::of(backend, case)?;
+    let ops = Operands::of(wall_device.target(), case)?;
     let prepared = prepare(bank, case, ops)?;
     let wall = measure(wall_device, bank, &prepared, ops)?;
     let timed = measure(timed_device, bank, &prepared, ops)?;

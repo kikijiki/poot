@@ -82,7 +82,7 @@ impl StagedTerms {
 }
 
 /// The bits one value of a dense weight held in `storage` occupies in global memory
-/// ([`crate::TiledShape::weight_bits`]): 16 for a packed half, 32 for an f32 word.
+/// ([`crate::StagedWeight::bits`]): 16 for a packed half, 32 for an f32 word.
 pub fn dense_value_bits(storage: poot_target::BufferStorage) -> u32 {
     match stored_fragment_dtype(storage) {
         Some(_) => 16,

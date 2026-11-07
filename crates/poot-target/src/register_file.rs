@@ -50,6 +50,19 @@ impl RegisterBudget {
             .known()
             .map(|file| file.per_lane_of(lanes) / HELD_SHARE)
     }
+
+    /// The registers each lane of a `lanes`-lane workgroup holds at once across a tiled contraction's `K` loop in all,
+    /// its accumulators and the round it stages (POOT-1505): the held share, half of what the lane keeps resident.
+    /// The other half carries the step's operand fragments, the staging addresses and the decode's temporaries.
+    /// Where the register file is unknown, half of the portable lane's (four times [`PORTABLE_ACCUMULATORS`]): a
+    /// spill is slow, not wrong, as for the accumulators. Evidence: of 32 packed expert tilings compiled for gfx1151
+    /// (IQ2_XS and IQ4_NL, every 16-row fragment geometry and the long tiles at both round depths), the 14 the
+    /// planner's count puts within 128 spill nothing, and every one that spills is over it; 4 of the 18 over it
+    /// compile just under the file, 236 to 253 VGPRs (POOT-1505).
+    pub fn loop_registers(self, lanes: u32) -> u32 {
+        self.held(lanes)
+            .unwrap_or(PORTABLE_ACCUMULATORS * ACCUMULATOR_SHARE / HELD_SHARE)
+    }
 }
 
 /// The 32-bit registers a device gives a lane and a workgroup.

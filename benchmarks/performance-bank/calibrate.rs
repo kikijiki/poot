@@ -29,6 +29,16 @@
 //! - `gemv-fit --rows F --out E`: for each output count, the columns that ran fastest and by how much, and which
 //!   figures the sweep identifies. It opens no device.
 //!
+//! Packed grouped modes (POOT-1505), for a routed projection over a packed expert stack (a `packed_grouped_experts`
+//! bank case) at several prompt lengths:
+//! - `packed-cells --bank B --case ID`: one `tokens<TAB>precision<TAB>index` line per tiling the device runs for the
+//!   case's rows at each of [`PACKED_TOKENS`], exact and narrow, each grouped at its own output-tile rows;
+//! - `packed-measure --bank B --case ID --tokens T --precision exact|narrow --tiling INDEX|chosen`: pin that tiling
+//!   (or none), time the plan on the device clock and print one TSV row with the tiling's cost-model terms;
+//! - `packed-fit --rows F --out E`: regress the rows on the terms (a fit is reported, never written as a figure),
+//!   and score the model's choice per cell under the device's own ratios: its tiling against the fastest measured, and
+//!   its precision (the cheapest modelled of each) against the faster measured. It opens no device.
+//!
 //! `scripts/calibrate-launch <backend>` runs them in order under the GPU lock. The corpus is a grid of shapes,
 //! never a model's: one run calibrates every shape, and no shape-specific figure enters the table.
 //!
@@ -67,7 +77,7 @@ fn tiled_shape((m, k, n): (usize, usize, usize)) -> TiledShape {
         layout: poot_kernelgen::WeightLayout::Nk,
         rows: TiledRows::Dense,
         terms: StagedTerms::ONE,
-        weight_bits: 16,
+        weight: poot_kernelgen::StagedWeight::Dense { bits: 16 },
         activation_bits: 32,
     }
 }
@@ -298,8 +308,11 @@ where
         }
         Some("gemv-measure") => gemv_measure(&args, device),
         Some("gemv-fit") => gemv_fit(backend, &args),
+        Some("packed-cells") => packed_cells(&args, device),
+        Some("packed-measure") => packed_measure(&args, device),
+        Some("packed-fit") => packed_fit(backend, &args),
         other => Err(format!(
-            "usage: calibrate_launch shapes|measure|fit|indexed-cells|indexed-measure|indexed-choice|indexed-fit|gemv-cells|gemv-measure|gemv-fit, got {other:?}"
+            "usage: calibrate_launch shapes|measure|fit|indexed-cells|indexed-measure|indexed-choice|indexed-fit|gemv-cells|gemv-measure|gemv-fit|packed-cells|packed-measure|packed-fit, got {other:?}"
         )),
     }
 }
@@ -446,7 +459,7 @@ fn indexed_terms(
                     block: tiling.output_tile().0,
                 },
                 terms: StagedTerms::ONE,
-                weight_bits: 16,
+                weight: poot_kernelgen::StagedWeight::Dense { bits: 16 },
                 activation_bits: 32,
             };
             Ok(tiling.cost_terms(shape, caps))
@@ -1007,6 +1020,334 @@ fn gemv_fit(backend: &str, args: &[String]) -> Result<(), String> {
             "//   {cell}\t{chosen}\t{named}\t{margin:.3}\t{}\n",
             listed.join(" ")
         );
+    }
+    std::fs::write(&out, &report).map_err(|e| format!("write {}: {e}", out.display()))?;
+    print!("{report}");
+    Ok(())
+}
+
+/// The token counts of the packed grouped corpus (POOT-1505): a short prompt to a long prefill chunk, so the routed
+/// rows per expert of a wide mixture run from a few (each grouped tile mostly padding) to many.
+const PACKED_TOKENS: [usize; 6] = [128, 256, 512, 1024, 2048, 4096];
+
+/// The bank case `id` with its token count replaced.
+fn packed_case(bank: &Value, id: &str, tokens: usize) -> Result<Value, String> {
+    let mut case = bank["cases"]
+        .as_array()
+        .and_then(|cases| cases.iter().find(|c| c["id"] == id))
+        .ok_or_else(|| format!("the bank has no case {id}"))?
+        .clone();
+    if case["producer"] != "packed_grouped_experts" {
+        return Err(format!("{id} is not a packed_grouped_experts case"));
+    }
+    case["shape"]["tokens"] = tokens.into();
+    Ok(case)
+}
+
+/// The precision a `--precision` names, and the operands of a measurement at it on `target` with its rows grouped:
+/// the bank's own narrow operands ([`Operands::of`]).
+fn packed_operands(name: &str, target: Target) -> Result<crate::runner::Operands, String> {
+    let case = match name {
+        "exact" | "narrow" => serde_json::json!({ "numerics": { "operand_precision": name } }),
+        other => return Err(format!("--precision is exact or narrow, not {other:?}")),
+    };
+    Ok(Operands {
+        indexed_rows: Some(IndexedRows::Grouped),
+        ..Operands::of(target, &case)?
+    })
+}
+
+/// The grouped tiled shape of the packed case at `tokens` under `ops`, its block the tile rows the caller pins (the
+/// planner's own `packed_indexed_shape`, from the case's dimensions).
+fn packed_grouped_shape(
+    case: &Value,
+    ops: crate::runner::Operands,
+    block: usize,
+) -> Result<TiledShape, String> {
+    let shape = &case["shape"];
+    let dim = |name: &str| {
+        shape[name]
+            .as_u64()
+            .map(|v| v as usize)
+            .ok_or_else(|| format!("case shape has no {name}"))
+    };
+    let format = crate::runner::packed_format(case["storage"].as_str().unwrap_or_default())?;
+    let precision = match ops.narrow {
+        None => poot_graph_ir::OperandPrecision::Exact,
+        Some(dtype) => poot_graph_ir::OperandPrecision::Narrow(dtype),
+    };
+    Ok(TiledShape {
+        blocks: 1,
+        m_per_block: dim("tokens")? * shape["top_k"].as_u64().unwrap_or(1) as usize,
+        out_per_block: dim("n")?,
+        k: dim("k")?,
+        layout: poot_kernelgen::WeightLayout::Nk,
+        rows: TiledRows::Grouped {
+            groups: dim("experts")? + 1,
+            block,
+        },
+        terms: StagedTerms::of(precision, None, None),
+        weight: poot_kernelgen::StagedWeight::Packed(format),
+        activation_bits: poot_kernelgen::activation_bits(None),
+    })
+}
+
+/// The tilings the device runs for the packed case's rows at any block: the candidates of the shape with its rows
+/// free, each one grouping at its own output-tile rows.
+fn packed_candidates(
+    case: &Value,
+    ops: crate::runner::Operands,
+    caps: &poot_target::DeviceCaps,
+) -> Result<Vec<RegisterTiling>, String> {
+    let free = TiledShape {
+        rows: TiledRows::Dense,
+        ..packed_grouped_shape(case, ops, 0)?
+    };
+    Ok(RegisterTiling::candidates(free, caps)
+        .filter(|tiling| {
+            packed_grouped_shape(case, ops, tiling.output_tile().0)
+                .is_ok_and(|grouped| tiling.runs_over(grouped, caps))
+        })
+        .collect())
+}
+
+/// `packed-cells --bank B --case ID`: one `tokens<TAB>precision<TAB>index` line per tiling of the corpus, the
+/// planner's own choice first marked by the line `tokens<TAB>precision<TAB>chosen`.
+fn packed_cells<D>(
+    args: &[String],
+    device: impl FnOnce() -> Result<D, String>,
+) -> Result<(), String>
+where
+    D: Device + 'static,
+{
+    let bank = read_bank(args)?;
+    let id = flag(args, "--case")?;
+    let device = device()?;
+    let Target::Gpu { caps, .. } = device.target() else {
+        return Err("the device is not a GPU target".into());
+    };
+    for tokens in PACKED_TOKENS {
+        let case = packed_case(&bank, &id, tokens)?;
+        for precision in ["exact", "narrow"] {
+            let ops = packed_operands(precision, device.target())?;
+            for index in 0..packed_candidates(&case, ops, &caps)?.len() {
+                println!("{tokens}\t{precision}\t{index}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_bank(args: &[String]) -> Result<Value, String> {
+    let bank_path = PathBuf::from(flag(args, "--bank")?);
+    serde_json::from_slice(
+        &std::fs::read(&bank_path).map_err(|e| format!("read {}: {e}", bank_path.display()))?,
+    )
+    .map_err(|e| format!("parse {}: {e}", bank_path.display()))
+}
+
+/// The tiled schedules of the indexed packed contractions `program` plans, in plan order.
+fn packed_schedules_of(program: &StagedProgram) -> Vec<Schedule> {
+    program
+        .stages()
+        .flat_map(|(_, _, p)| p.planned())
+        .flat_map(|(_, plan)| plan.dispatches().iter())
+        .filter_map(|d| match d.choice() {
+            KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(spec))) => {
+                Some(spec.schedule)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `packed-measure --bank B --case ID --tokens T --precision exact|narrow --tiling INDEX|chosen`: one TSV row of
+/// the packed grouped dataset: the cell, the median device microseconds, the cost-model terms of the tiling that ran
+/// (its rows grouped at its own tile), its modelled cost under the device's ratios and its schedule. `chosen` runs
+/// the planner's own tiling (no pin) with the rows grouped.
+fn packed_measure<D>(
+    args: &[String],
+    device: impl FnOnce() -> Result<D, String>,
+) -> Result<(), String>
+where
+    D: Device + 'static,
+{
+    let bank = read_bank(args)?;
+    let id = flag(args, "--case")?;
+    let tokens: usize = flag(args, "--tokens")?
+        .parse()
+        .map_err(|e| format!("--tokens: {e}"))?;
+    let precision = flag(args, "--precision")?;
+    let device = device()?;
+    let target = device.target();
+    let Target::Gpu { caps, .. } = target else {
+        return Err("the device is not a GPU target".into());
+    };
+    let case = packed_case(&bank, &id, tokens)?;
+    let mut ops = packed_operands(&precision, target)?;
+    let tiling = match flag(args, "--tiling")?.as_str() {
+        "chosen" => None,
+        index => {
+            let index: usize = index.parse().map_err(|e| format!("--tiling: {e}"))?;
+            Some(
+                packed_candidates(&case, ops, &caps)?
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| format!("no candidate tiling {index}"))?,
+            )
+        }
+    };
+    ops.tiling = tiling;
+    let prepared = crate::runner::prepare(&bank, &case, ops)?;
+    let schedules = packed_schedules_of(&staged(&prepared.graphs[0], target, ops)?);
+    let measured = measure(device, &bank, &prepared, ops)?;
+    if !measured.agrees {
+        return Err(format!(
+            "{id} at {tokens}: the output disagrees with the reference (worst {})",
+            measured.worst
+        ));
+    }
+    let Some(&schedule) = schedules.first() else {
+        return Err(format!("{id} at {tokens}: no packed contraction planned"));
+    };
+    if schedules.iter().any(|ran| *ran != schedule)
+        || tiling.is_some_and(|pin| pin.schedule() != schedule)
+    {
+        return Err(format!(
+            "{id} at {tokens}: the planner ran {schedules:?}, not the pinned {tiling:?}"
+        ));
+    }
+    let ran = RegisterTiling::of(schedule).ok_or("the grouped rows ran no tiling")?;
+    let shape = packed_grouped_shape(&case, ops, ran.output_tile().0)?;
+    let terms = ran.cost_terms(shape, &caps);
+    let modelled = terms.modelled_time(caps.gemm_launch().calibrated.figures().cost);
+    let mut samples = measured
+        .device_us
+        .ok_or("the device reports no timestamps; build it with device timing")?;
+    samples.sort_by(f64::total_cmp);
+    let (tile_rows, tile_cols) = ran.output_tile();
+    println!(
+        "{tokens}\t{precision}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{modelled}\t{tile_rows}x{tile_cols}\t{}\t{}\t{schedule:?}",
+        samples[samples.len() / 2],
+        terms.fma,
+        terms.lds_reads,
+        terms.staged_per_lane,
+        terms.rounding,
+        terms.occupancy,
+        ran.workgroup_lanes(),
+        ran.depth(),
+        flag(args, "--tiling")?,
+    );
+    Ok(())
+}
+
+/// One measured row of the packed grouped dataset.
+struct PackedRow {
+    tokens: usize,
+    precision: String,
+    device_us: f64,
+    terms: CostTerms,
+    modelled: f64,
+    tiling: String,
+    schedule: String,
+}
+
+fn parse_packed_rows(text: &str) -> Result<Vec<PackedRow>, String> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let f: Vec<&str> = line.split('\t').collect();
+            let number = |i: usize| {
+                f.get(i)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .ok_or_else(|| format!("bad row {line:?}"))
+            };
+            Ok(PackedRow {
+                tokens: number(0)? as usize,
+                precision: f.get(1).ok_or("empty row")?.to_string(),
+                device_us: number(2)?,
+                terms: CostTerms {
+                    fma: number(3)?,
+                    lds_reads: number(4)?,
+                    staged_per_lane: number(5)?,
+                    direct_per_lane: 0.0,
+                    rounding: number(6)?,
+                    occupancy: number(7)?,
+                },
+                modelled: number(9)?,
+                tiling: f.get(12).unwrap_or(&"").to_string(),
+                schedule: f.get(13).unwrap_or(&"").to_string(),
+            })
+        })
+        .collect()
+}
+
+/// `packed-fit`: the regression of the packed rows on the model's terms, reported (the device's entry is left as it
+/// is: one case's tilings rarely determine the ratios), and the model's choices scored against the measurements.
+fn packed_fit(backend: &str, args: &[String]) -> Result<(), String> {
+    let rows = parse_packed_rows(
+        &std::fs::read_to_string(flag(args, "--rows")?).map_err(|e| e.to_string())?,
+    )?;
+    let out = PathBuf::from(flag(args, "--out")?);
+    // Each pinned tiling once; the planner's own choice repeats one of them.
+    let pinned: Vec<&PackedRow> = rows.iter().filter(|r| r.tiling != "chosen").collect();
+    let samples: Vec<(CostTerms, f64)> = pinned.iter().map(|r| (r.terms, r.device_us)).collect();
+    let mut report = format!(
+        "// calibrate-launch packed-fit ({backend}), {} pinned rows. Reported only: no figure is written.\n",
+        pinned.len()
+    );
+    match fit_cost_ratios(&samples) {
+        Some(fit) => report.push_str(&format!(
+            "// Fit over these rows: lds_read {:.3}, staged_value {:.3}, R^2 {:.4}.\n",
+            fit.lds_read, fit.staged_value, fit.r_squared
+        )),
+        None => report.push_str("// These rows do not determine the ratios.\n"),
+    }
+    let mut cells: Vec<(usize, String)> = pinned
+        .iter()
+        .map(|r| (r.tokens, r.precision.clone()))
+        .collect();
+    cells.sort();
+    cells.dedup();
+    report.push_str("// tokens precision: fastest measured tiling, the model's cheapest, its time over the fastest\n");
+    let best = |tokens: usize, precision: &str, key: fn(&PackedRow) -> f64| {
+        pinned
+            .iter()
+            .filter(|r| r.tokens == tokens && r.precision == precision)
+            .min_by(|a, b| key(a).total_cmp(&key(b)))
+            .copied()
+    };
+    for (tokens, precision) in &cells {
+        let (Some(fastest), Some(modelled)) = (
+            best(*tokens, precision, |r| r.device_us),
+            best(*tokens, precision, |r| r.modelled),
+        ) else {
+            continue;
+        };
+        report.push_str(&format!(
+            "{tokens}\t{precision}\t{:.1} us {}\t{:.1} us {}\t{:.3}\n",
+            fastest.device_us,
+            fastest.schedule,
+            modelled.device_us,
+            modelled.schedule,
+            modelled.device_us / fastest.device_us,
+        ));
+    }
+    report.push_str("// tokens: the precision the model ranks cheaper, the measured faster (each its fastest tiling)\n");
+    let mut tokens: Vec<usize> = cells.iter().map(|(t, _)| *t).collect();
+    tokens.dedup();
+    for t in tokens {
+        let pick = |key: fn(&PackedRow) -> f64| {
+            let exact = best(t, "exact", key).map(key);
+            let narrow = best(t, "narrow", key).map(key);
+            match (exact, narrow) {
+                (Some(e), Some(n)) => Some(if n < e { "narrow" } else { "exact" }),
+                _ => None,
+            }
+        };
+        if let (Some(model), Some(measured)) = (pick(|r| r.modelled), pick(|r| r.device_us)) {
+            report.push_str(&format!("{t}\t{model}\t{measured}\n"));
+        }
     }
     std::fs::write(&out, &report).map_err(|e| format!("write {}: {e}", out.display()))?;
     print!("{report}");

@@ -187,7 +187,9 @@ fn indexed_tiled_shape(
         layout,
         rows,
         terms: kg::StagedTerms::of(precision, None, kg::stored_fragment_dtype(weight)),
-        weight_bits: kg::dense_value_bits(weight),
+        weight: kg::StagedWeight::Dense {
+            bits: kg::dense_value_bits(weight),
+        },
         activation_bits: kg::activation_bits(None),
     }
 }

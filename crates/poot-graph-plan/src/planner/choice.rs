@@ -880,7 +880,7 @@ mod tests {
                     layout: poot_kernelgen::WeightLayout::Nk,
                     rows: poot_kernelgen::TiledRows::Dense,
                     terms: poot_kernelgen::StagedTerms::ONE,
-                    weight_bits: 32,
+                    weight: poot_kernelgen::StagedWeight::Dense { bits: 32 },
                     activation_bits: 32,
                 },
                 &DeviceCaps::rocm_default(),

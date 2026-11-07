@@ -9,6 +9,10 @@
 #                                                          and the grouped tiling of an indexed corpus (POOT-1489), and
 #                                                          the table of the production planner's choice against the
 #                                                          retired 32-row switch
+#   scripts/calibrate-launch rocm|wgpu packed [out-dir]    every tiling of a routed projection over a packed expert stack
+#                                                          (a packed_grouped_experts bank case) from a short prompt to a
+#                                                          long one, exact and narrow, and the model's choices scored
+#                                                          against them; reports a fit, writes no figure (POOT-1505)
 #   scripts/calibrate-launch rocm|wgpu|ptx gemv [out-dir]  the dense decode Gemv's columns per workgroup, every power of
 #                                                          two up to 16 pinned over output counts from a launch that
 #                                                          starves the device to one that floods it (POOT-1490)
@@ -16,8 +20,8 @@
 # CALIBRATE_LAUNCH_BIN names a prebuilt example binary (the script then builds nothing), and CALIBRATE_LAUNCH_LOCKED=1
 # says the caller already holds the GPU lock and the heavy lock (gpu first), so one hold can cover several runs.
 set -euo pipefail
-backend="${1:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv [out-dir]}"
-mode="${2:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv [out-dir]}"
+backend="${1:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed [out-dir]}"
+mode="${2:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed [out-dir]}"
 out="${3:-calibrate-launch-$backend-$mode}"
 mkdir -p "$out"
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -53,6 +57,15 @@ indexed)
   "$bin" indexed-choice >"$out/choices.tsv"
   "$bin" indexed-fit --rows "$rows" --choices "$out/choices.tsv" --out "$out/entry.rs"
   ;;
+packed)
+  # CALIBRATE_LAUNCH_CASE names the packed_grouped_experts bank case (default: the IQ2_XS expert up projection).
+  case_id="${CALIBRATE_LAUNCH_CASE:-expert-prefill-packed-iq2xs-up}"
+  "$bin" packed-cells --bank "$bank" --case "$case_id" >"$out/cells.tsv"
+  while IFS=$'\t' read -r tokens precision tiling; do
+    "$bin" packed-measure --bank "$bank" --case "$case_id" --tokens "$tokens" --precision "$precision" --tiling "$tiling" >>"$rows"
+  done <"$out/cells.tsv"
+  "$bin" packed-fit --rows "$rows" --out "$out/entry.rs"
+  ;;
 gemv)
   "$bin" gemv-cells >"$out/cells.tsv"
   while IFS=$'\t' read -r cell cols; do
@@ -61,7 +74,7 @@ gemv)
   "$bin" gemv-fit --rows "$rows" --out "$out/entry.rs"
   ;;
 *)
-  echo "usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv [out-dir]" >&2
+  echo "usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed [out-dir]" >&2
   exit 2
   ;;
 esac

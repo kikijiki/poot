@@ -79,7 +79,7 @@ fn planned_tile(m: usize, k: usize, n: usize) -> (usize, usize) {
             layout: poot_kernelgen::WeightLayout::Kn,
             rows: poot_kernelgen::TiledRows::Dense,
             terms: poot_kernelgen::StagedTerms::ONE,
-            weight_bits: 32,
+            weight: poot_kernelgen::StagedWeight::Dense { bits: 32 },
             activation_bits: 32,
         },
         &poot_test_util::device_caps::default_caps_for(poot_target::Backend::SpirvVulkan),

@@ -84,7 +84,7 @@ pub fn packed_run_sharing(format: WeightFormat) -> Result<PackedRunSharing, Kern
     })
 }
 
-/// The bits one value of `format` occupies in global memory, rounded up ([`crate::TiledShape::weight_bits`]): a
+/// The bits one value of `format` occupies in global memory, rounded up ([`crate::StagedWeight::bits`]): a
 /// block format's block bits over its values, a planar one's code width.
 pub fn packed_value_bits(format: WeightFormat) -> u32 {
     match format.descriptor().storage {

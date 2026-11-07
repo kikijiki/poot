@@ -1,0 +1,81 @@
+---
+id: matrix-units
+title: Matrix Units and the Cost Model
+sidebar_position: 5.5
+---
+
+# Matrix Units and the Cost Model
+
+A contraction can run on the vector units, as a register-tiled body or a Gemv, or on the matrix units of the GPU. This page
+states what a device reports, which schedules use it, and how the planner chooses between schedules.
+
+## What a device reports
+
+Each runtime reports the matrix-multiply **fragments** its device exposes as `MatrixUnits`, one config per operand dtype. A
+fragment multiplies two operands of one narrow dtype and accumulates in f32. Only the 16x16x16 shape is lowered, in `bf16` or `f16`.
+
+| Backend | Source | Dtypes |
+| --- | --- | --- |
+| ROCm | RDNA3 and 3.5 (gfx11) WMMA, 32-lane waves | bf16, f16 |
+| PTX | `wmma` on compute capability 8.0 and newer | bf16, f16 |
+| Raw Vulkan, wgpu | `VK_KHR_cooperative_matrix` configurations the driver reports | f16 |
+
+A code that is not recognized (gfx12, CDNA, older NVIDIA) has no matrix unit rather than a guessed one, and its programs run the
+exact schedules. The planner reads only this description, never a device name. Each config also carries the unit's rate against
+the vector units; a capability whose rate nobody sourced is `Unknown`, and the cost model gives that unit no speed credit.
+
+## Fragment contraction
+
+The register-tiled contraction has a fragment variant: each wave holds fragments of the output tile and loops over K with a
+pipelined, software-staged read. A routed expert contraction reaches it through block-aligned grouping, so every tile holds one
+expert's rows. The operand precision pass decides whether a contraction takes it; see [Operand precision](./graph-ir.mdx#operand-precision).
+A narrowed activation is rounded once, by the op that produces it, and stored narrow.
+
+## Fragment attention
+
+The [tiled prefill schedule](./attention.mdx#the-tiled-prefill-schedule) has a fragment body too. Both products, `S = Q K^T`
+and `O += P V`, run on fragments, with the query held in registers and the running softmax maximum kept per row in one lane.
+The planner chooses among every feasible micro-tile for the shape and device. An f16 attention runs only over an f16 cache.
+
+## The contraction cost model
+
+Every choice among contraction schedules uses one model, `ContractionCost`. It prices a schedule in FMA issues:
+
+- the multiply-accumulates of the tile, divided by the unit's rate for a fragment;
+- one lane's LDS reads;
+- each staged value: a global load, its LDS write and its share of the barriers of a round;
+- for a Gemv, each value a lane reads straight from global memory;
+- the rounding of a staged narrowed operand.
+
+The same model ranks the fragment tilings against the exact tilings, and decides whether a per-row indexed contraction runs as
+the Gemv or as the register-tiled schedule over its rows grouped by expert. No fixed row count switches between them, and the
+criterion never mentions a model, a shape or a benchmark.
+
+## Register budget
+
+A lane holds the accumulators of its tile and, in a pipelined loop, the operand reads staged for a round. The budget comes from
+the register file the runtime reports: a quarter of a lane's registers hold accumulators, and the loop as a whole may hold half. A tiling over
+either bound is not offered, so a tile that would spill is replaced by a shallower one. Where the runtime reports no register
+file, the planner uses a portable figure and the plan records that it did.
+
+## Calibration
+
+The ratios of the cost model are memory-hierarchy figures that only a measurement on the device gives. They are kept per device
+identity, together with the Gemv geometry (columns per workgroup, lane run and width). A device nobody measured is never given a
+neighbour's figures: it plans with one named portable entry, and the plan records that it was uncalibrated. The figures only rank
+schedules that are all correct, so a wrong ratio costs speed and never correctness.
+
+`scripts/calibrate-launch` fits them. It times every candidate tiling pinned through a compile option and writes an entry for
+review; modes cover the dense tilings, the indexed Gemv against the grouped tiling, packed expert stacks and the Gemv columns.
+
+## Weight format
+
+A driver holds its weights in one format. Under `narrow` on a target whose matrix units take f16, a bf16 weight read only by
+dense contractions and embedding gathers is stored as f16, and a tied embedding and head share one copy. A weight f16
+cannot hold is refused when it is bound. See [Operand precision](./graph-ir.mdx#operand-precision).
+
+## Seeing what was planned
+
+The launch census is a committed record of every contraction and attention schedule the planner picks for the reference models
+at their real dimensions, on each reference target. A change to a figure the planner reads changes a row, so a review sees the
+schedules that moved. See [Test](../develop/test.md#launch-census).

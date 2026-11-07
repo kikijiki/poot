@@ -448,7 +448,7 @@ fn packed_indexed_shape(
         layout: WeightLayout::Nk,
         rows,
         terms: poot_kernelgen::StagedTerms::of(precision, None, None),
-        weight_bits: poot_kernelgen::packed_value_bits(descriptor.format()),
+        weight: poot_kernelgen::StagedWeight::Packed(descriptor.format()),
         activation_bits: poot_kernelgen::activation_bits(None),
     }
 }
@@ -599,7 +599,7 @@ fn packed_blocks_shape(
         layout: WeightLayout::Nk,
         rows: poot_kernelgen::TiledRows::Dense,
         terms: poot_kernelgen::StagedTerms::of(precision, None, None),
-        weight_bits: poot_kernelgen::packed_value_bits(descriptor.format()),
+        weight: poot_kernelgen::StagedWeight::Packed(descriptor.format()),
         activation_bits: poot_kernelgen::activation_bits(None),
     }
 }
@@ -1045,7 +1045,7 @@ mod tests {
                 layout: WeightLayout::Nk,
                 rows: poot_kernelgen::TiledRows::Dense,
                 terms: poot_kernelgen::StagedTerms::ONE,
-                weight_bits: poot_kernelgen::packed_value_bits(WeightFormat::E2m1Row32),
+                weight: poot_kernelgen::StagedWeight::Packed(WeightFormat::E2m1Row32),
                 activation_bits: poot_kernelgen::activation_bits(None),
             },
             &poot_test_util::device_caps::wgpu_rdna3_igpu(),
@@ -1243,7 +1243,7 @@ mod tests {
             layout: WeightLayout::Nk,
             rows: poot_kernelgen::TiledRows::Dense,
             terms: poot_kernelgen::StagedTerms::ONE,
-            weight_bits: poot_kernelgen::packed_value_bits(format),
+            weight: poot_kernelgen::StagedWeight::Packed(format),
             activation_bits: poot_kernelgen::activation_bits(None),
         };
         let (tile_rows, tile_cols) = RegisterTiling::choose(shape, &caps).output_tile();
@@ -1377,7 +1377,7 @@ mod tests {
                 layout: WeightLayout::Nk,
                 rows: poot_kernelgen::TiledRows::Dense,
                 terms: poot_kernelgen::StagedTerms::ONE,
-                weight_bits: 32,
+                weight: poot_kernelgen::StagedWeight::Dense { bits: 32 },
                 activation_bits: poot_kernelgen::activation_bits(None),
             },
             &tiny_grid_caps(),

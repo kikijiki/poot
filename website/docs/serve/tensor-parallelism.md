@@ -22,6 +22,6 @@ Verified on NVIDIA GPUs joined by NVLink:
 - Tensor groups and layer pipelines served requests on two GPUs of one node. Greedy requests matched the single-GPU result to rounding, and sampled requests matched the single-GPU sampler's tokens.
 - A tensor group of four GPUs decoded a tiny model to the single-GPU logits, every rank summing the partials of all four.
 
-Not covered: serving a group of four, a real checkpoint, and GPUs that reach each other only across CPU sockets (on one such host peer copies delivered no data, so check yours first).
+Not covered: serving a group of four, a real checkpoint, and GPUs that reach each other only across CPU sockets. At startup the server copies test patterns through each peer link and reads them back; a link whose direct copy delivers other bytes than it was given (seen on PCIe pairs that report peer access) is refused with `PeerCopyUndelivered` instead of serving corrupted output.
 
 Design: [Serving design](../architecture/serving-design.mdx).

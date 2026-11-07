@@ -60,8 +60,8 @@ pub use scan::{ScanKernel, ScanSpec};
 pub use contraction::{CostFit, fit_cost_ratios};
 pub use contraction::{
     CostTerms, DenseTiledWeight, Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep,
-    GemvActivation, GemvShape, RegisterTiling, RunLength, Schedule, TileSize, TiledRows,
-    TiledShape,
+    GemvActivation, GemvShape, RegisterTiling, RunLength, Schedule, Selection, StagedWeight,
+    TileSize, TiledRows, TiledShape,
 };
 pub use fused::{
     FusedInput, FusedKernel, FusedScalarOp, FusedStep, LaneId, LeafId, LeafTy, RowKernel, RowOp,
@@ -90,7 +90,10 @@ pub use fused::{
 };
 pub use gemv::attn_scores_v_gemv_lds;
 pub use matmul::{matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid};
-pub use packed::{PackedRunSharing, packed_kernel, packed_run_sharing, packed_value_bits};
+pub use packed::{
+    PackedRunSharing, packed_kernel, packed_run_held_registers, packed_run_sharing,
+    packed_value_bits,
+};
 pub use reduce::reduce_last_dt;
 
 /// Shared compile-and-check helpers for this crate's own unit tests (card 622): the crate's `pub(crate)`

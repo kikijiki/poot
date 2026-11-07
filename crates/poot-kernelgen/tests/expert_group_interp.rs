@@ -153,7 +153,7 @@ fn run_grouped(x: &[f32], ids: &[i32]) -> Vec<f32> {
             block,
         },
         terms: kg::StagedTerms::ONE,
-        weight_bits: 32,
+        weight: kg::StagedWeight::Dense { bits: 32 },
         activation_bits: 32,
     };
     let block = kg::RegisterTiling::grouped_block(&[shape(0)], &caps).expect("a block");

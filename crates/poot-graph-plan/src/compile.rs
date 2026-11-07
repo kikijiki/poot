@@ -1035,7 +1035,12 @@ pub fn compile(
                             )
                         })
                 },
-                |shapes| poot_kernelgen::RegisterTiling::grouped_block(shapes, caps),
+                // A pinned tiling (the calibration sweep) groups the rows at its own output tile, the one block it runs
+                // (POOT-1505): any other block would refuse the pin by `GroupedTileRows`.
+                |shapes| match options.tiling_pin {
+                    Some(pin) => Some(pin.output_tile().0),
+                    None => poot_kernelgen::RegisterTiling::grouped_block(shapes, caps),
+                },
             )
         })?;
     }

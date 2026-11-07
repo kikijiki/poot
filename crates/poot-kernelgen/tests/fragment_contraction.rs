@@ -696,7 +696,7 @@ fn narrow_contractions_stay_within_the_recorded_contract_on_the_bank_shapes() {
                             layout: kg::WeightLayout::Nk,
                             rows: poot_kernelgen::TiledRows::Dense,
                             terms: kg::StagedTerms::of(precision, None, Some(FragmentDtype::Bf16)),
-                            weight_bits: 16,
+                            weight: kg::StagedWeight::Dense { bits: 16 },
                             activation_bits: 32,
                         },
                         &device.caps,

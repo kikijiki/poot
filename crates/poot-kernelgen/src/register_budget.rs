@@ -380,7 +380,7 @@ fn the_dense_register_tiled_contraction_spills_no_register() {
             layout: WeightLayout::Nk,
             rows: crate::TiledRows::Dense,
             terms: crate::precision::StagedTerms::ONE,
-            weight_bits: 16,
+            weight: crate::StagedWeight::Dense { bits: 16 },
             activation_bits: 32,
         };
         let tiling = RegisterTiling::choose(shape, &caps);
@@ -454,7 +454,9 @@ fn planned_fragment_contraction(
         layout,
         rows: crate::TiledRows::Dense,
         terms: crate::precision::StagedTerms::of(precision, None, stored),
-        weight_bits: weight.bits(),
+        weight: crate::StagedWeight::Dense {
+            bits: weight.bits(),
+        },
         activation_bits: 32,
     };
     let tiling = RegisterTiling::choose(shape, &caps);
@@ -650,7 +652,9 @@ fn the_pipelined_fragment_contraction_loads_ahead_of_its_multiplies() {
             layout,
             rows: crate::TiledRows::Dense,
             terms: crate::precision::StagedTerms::of(precision, None, stored),
-            weight_bits: weight.bits(),
+            weight: crate::StagedWeight::Dense {
+                bits: weight.bits(),
+            },
             activation_bits: 32,
         };
         let tiling = RegisterTiling::choose(shape, &caps);
@@ -720,7 +724,7 @@ fn bf16_nk_shape(
             None,
             Some(poot_graph_ir::FragmentDtype::Bf16),
         ),
-        weight_bits: 16,
+        weight: crate::StagedWeight::Dense { bits: 16 },
         activation_bits: 32,
     }
 }
@@ -955,4 +959,156 @@ fn the_budget_keeps_sm_80_at_its_8_by_8_tile_without_a_spill() {
         "the 128-accumulator tiling fits in {} registers: the budget refuses what the file holds",
         registers.used
     );
+}
+
+/// The grouped shape of a routed projection of `m` rows over a packed `[n, k]` expert stack of `format` (512 experts),
+/// narrowed to f16 as the planner narrows it on gfx1151, its tiles `block` rows.
+fn packed_expert_shape(
+    format: poot_quant::format::WeightFormat,
+    (m, n, k): (usize, usize, usize),
+    block: usize,
+) -> TiledShape {
+    TiledShape {
+        blocks: 1,
+        m_per_block: m,
+        out_per_block: n,
+        k,
+        layout: WeightLayout::Nk,
+        rows: crate::TiledRows::Grouped { groups: 513, block },
+        terms: crate::precision::StagedTerms::of(
+            poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::F16),
+            None,
+            None,
+        ),
+        weight: crate::StagedWeight::Packed(format),
+        activation_bits: 32,
+    }
+}
+
+/// The narrowed indexed packed contraction body of `tiling` over `format` with `n` columns of `k`.
+fn packed_expert_body(
+    name: &str,
+    format: poot_quant::format::WeightFormat,
+    tiling: RegisterTiling,
+    (n, k): (usize, usize),
+) -> poot_kernel_ir::Body {
+    let meta = [k as u32, n as u32, 8208, 0, 0, 512, 1024];
+    crate::packed::packed_contraction(
+        name,
+        format,
+        tiling.schedule(),
+        &meta,
+        None,
+        crate::PackedRows::Indexed,
+        poot_graph_ir::OperandPrecision::Narrow(poot_graph_ir::FragmentDtype::F16),
+        ROCM_ROUNDING,
+    )
+    .unwrap()
+}
+
+/// The expert projections of Flash-Next: the IQ2_XS up projection (N 640, K 2560) and the IQ4_NL down projection
+/// (N 2560, K 640).
+const PACKED_EXPERTS: [(poot_quant::format::WeightFormat, usize, usize); 2] = [
+    (poot_quant::format::WeightFormat::Iq2_Xs, 640, 2560),
+    (poot_quant::format::WeightFormat::Iq4_Nl, 2560, 640),
+];
+
+/// POOT-1505: a tiling the planner counts within the held share of the lane's registers across its `K` loop
+/// (`RegisterTiling::loop_registers`: its accumulators, the next round's reads, the values they decode to, against
+/// `RegisterBudget::loop_registers`, 128) compiles on gfx1151 with no register spilled: every fragment geometry of a
+/// 16-row expert tile and the 64- and 128-row tiles, at both round depths, over both Flash-Next expert formats. The
+/// bound is safe, not tight: a few tilings it refuses compile just under the file. Mutation: count a packed run's
+/// reads alone (drop the decoded `run` values from `StagedWeight::run_registers`); an admitted tiling reads `spilled`.
+#[test]
+fn a_packed_expert_tiling_within_the_held_registers_spills_none() {
+    let caps = gfx1151_caps();
+    let layout = caps
+        .matrix_units
+        .known()
+        .and_then(|units| Some(units.config(poot_graph_ir::FragmentDtype::F16)?.layout))
+        .expect("gfx1151 has an f16 matrix unit");
+    let geometries = [
+        (1u32, 1u32, 1u32, 1u32),
+        (1, 1, 1, 2),
+        (1, 1, 1, 4),
+        (1, 2, 1, 1),
+        (1, 2, 1, 2),
+        (1, 2, 1, 4),
+        (2, 2, 2, 4),
+        (4, 2, 2, 4),
+    ];
+    let mut admitted = 0;
+    for (format, n, k) in PACKED_EXPERTS {
+        for (waves_m, waves_n, rows, cols) in geometries {
+            for depth in [32u32, 64] {
+                let tiling = RegisterTiling::of(crate::Schedule::FragmentTiled {
+                    waves_m: crate::contraction::TileSize::new(waves_m).unwrap(),
+                    waves_n: crate::contraction::TileSize::new(waves_n).unwrap(),
+                    tile: crate::FragmentTile {
+                        dtype: poot_graph_ir::FragmentDtype::F16,
+                        layout,
+                        rows,
+                        cols,
+                    },
+                    run: crate::contraction::RunLength::dividing(k),
+                    depth,
+                })
+                .unwrap();
+                let shape = packed_expert_shape(format, (1280, n, k), tiling.output_tile().0);
+                let counted = tiling.loop_registers_over(shape).unwrap();
+                let budget = caps
+                    .gemm_launch()
+                    .register_budget
+                    .loop_registers(tiling.workgroup_lanes() as u32);
+                let (tile_rows, tile_cols) = tiling.output_tile();
+                let name = format!(
+                    "budget_packed_{format:?}_{tile_rows}x{tile_cols}_w{waves_m}x{waves_n}_d{depth}"
+                );
+                let body = packed_expert_body(&name, format, tiling, (n, k));
+                let Some((vgprs, spilled)) = compiled_registers(&body) else {
+                    return;
+                };
+                eprintln!(
+                    "{name}: counted {counted} of {budget}, {vgprs} VGPRs, {spilled} spilled"
+                );
+                if counted <= budget {
+                    admitted += 1;
+                    assert_eq!(
+                        spilled, 0,
+                        "{name}: counted {counted} of {budget} registers across the loop, compiled to {vgprs} VGPRs, {spilled} spilled"
+                    );
+                }
+            }
+        }
+    }
+    assert!(admitted >= 8, "the bound admits {admitted} of 32 tilings");
+}
+
+/// POOT-1505: the narrowed tiling the planner chooses for each Flash-Next expert projection, from a short prompt
+/// (1280 routed rows, 128 tokens) to a long one (20480), grouped at the block it chooses, spills no register on
+/// gfx1151. Before the loop-register term the 128-token up projection took the 16 x 128 tile at a 64-deep round,
+/// 720 VGPRs spilled (f16). Mutation: drop the `loop_registers` clause of `RegisterTiling::runs_on`; the 128-token row
+/// reads `spilled 720 VGPRs of 256`.
+#[test]
+fn the_planned_packed_expert_tilings_spill_no_register() {
+    let caps = gfx1151_caps();
+    for (format, n, k) in PACKED_EXPERTS {
+        for m in [1280usize, 20480] {
+            let free = packed_expert_shape(format, (m, n, k), 0);
+            let block = RegisterTiling::grouped_block(&[free], &caps).expect("a grouping block");
+            let shape = packed_expert_shape(format, (m, n, k), block);
+            let tiling = RegisterTiling::tiling_of(shape, &caps).expect("a fragment tiling");
+            let name = format!("budget_planned_packed_{format:?}_{m}");
+            let body = packed_expert_body(&name, format, tiling, (n, k));
+            let Some((vgprs, spilled)) = compiled_registers(&body) else {
+                return;
+            };
+            assert_eq!(
+                spilled,
+                0,
+                "{name} {:?}: spilled {spilled} VGPRs of {vgprs}",
+                tiling.schedule()
+            );
+        }
+    }
 }

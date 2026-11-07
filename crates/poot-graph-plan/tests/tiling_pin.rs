@@ -58,7 +58,7 @@ fn shape() -> TiledShape {
         layout: WeightLayout::Nk,
         rows: TiledRows::Dense,
         terms: StagedTerms::ONE,
-        weight_bits: 16,
+        weight: poot_kernelgen::StagedWeight::Dense { bits: 16 },
         activation_bits: 32,
     }
 }

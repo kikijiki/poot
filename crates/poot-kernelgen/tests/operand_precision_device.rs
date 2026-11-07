@@ -74,7 +74,7 @@ fn staged_on_wgpu(ctx: &Context, precision: OperandPrecision, probes: &[f32]) ->
                 fragment: None,
                 ..kg::StagedTerms::of(precision, None, None)
             },
-            weight_bits: 32,
+            weight: kg::StagedWeight::Dense { bits: 32 },
             activation_bits: 32,
         },
         &caps,

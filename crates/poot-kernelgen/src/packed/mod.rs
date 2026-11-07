@@ -14,6 +14,7 @@ mod kernel;
 mod planar;
 mod source;
 
+pub use indexed::packed_run_held_registers;
 pub(crate) use kernel::packed_contraction;
 pub use kernel::{
     PackedKernelOp, PackedKernelSpec, PackedRunSharing, packed_kernel, packed_run_sharing,
@@ -749,7 +750,7 @@ mod planar_fixtures {
             layout: WeightLayout::Nk,
             rows: crate::TiledRows::Dense,
             terms: StagedTerms::ONE,
-            weight_bits: crate::packed_value_bits(format),
+            weight: crate::StagedWeight::Packed(format),
             activation_bits: 32,
         };
         let tiling = RegisterTiling::candidates(shape, caps)
@@ -1314,7 +1315,7 @@ mod contraction_tests {
                                 layout: crate::WeightLayout::Nk,
                                 rows: crate::TiledRows::Dense,
                                 terms: crate::StagedTerms::ONE,
-                                weight_bits: crate::packed_value_bits(format),
+                                weight: crate::StagedWeight::Packed(format),
                                 activation_bits: 32,
                             },
                             &poot_test_util::device_caps::wgpu_rdna3_igpu(),
@@ -2232,7 +2233,7 @@ mod planar_contraction_tests {
                     layout: WeightLayout::Nk,
                     rows: crate::TiledRows::Dense,
                     terms: crate::StagedTerms::ONE,
-                    weight_bits: crate::packed_value_bits(format),
+                    weight: crate::StagedWeight::Packed(format),
                     activation_bits: 32,
                 };
                 for tiling in RegisterTiling::candidates(shape, &caps) {

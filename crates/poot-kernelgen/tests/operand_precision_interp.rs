@@ -188,7 +188,9 @@ fn run_dense_tiled(
             layout: kg::WeightLayout::Nk,
             rows: poot_kernelgen::TiledRows::Dense,
             terms,
-            weight_bits: kg::DenseTiledWeight::Nk(storage).bits(),
+            weight: kg::StagedWeight::Dense {
+                bits: kg::DenseTiledWeight::Nk(storage).bits(),
+            },
             activation_bits: 32,
         },
         caps,

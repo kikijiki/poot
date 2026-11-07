@@ -735,7 +735,7 @@ fn indexed_tiling((m, k, n, experts): (usize, usize, usize, usize)) -> kg::Sched
             block,
         },
         terms: poot_kernelgen::StagedTerms::ONE,
-        weight_bits: 32,
+        weight: kg::StagedWeight::Dense { bits: 32 },
         activation_bits: 32,
     };
     let block = kg::RegisterTiling::grouped_block(&[shape(0)], &caps).expect("a block");
@@ -1979,7 +1979,9 @@ fn dense_tiled(
             layout,
             rows: poot_kernelgen::TiledRows::Dense,
             terms: poot_kernelgen::StagedTerms::ONE,
-            weight_bits: weight.bits(),
+            weight: kg::StagedWeight::Dense {
+                bits: weight.bits(),
+            },
             activation_bits: 32,
         },
         caps,

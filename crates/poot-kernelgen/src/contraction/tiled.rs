@@ -1186,7 +1186,7 @@ type StagedWrite = (u8, Local, Local);
 /// statement moves ahead of the second part only if it is a plain assignment of a local with no side effect,
 /// reads no local the second part defines, and defines no local an earlier statement of the second part reads or
 /// defines.
-fn split_reads(statements: Vec<Statement>) -> (Vec<Statement>, Vec<Statement>) {
+pub(crate) fn split_reads(statements: Vec<Statement>) -> (Vec<Statement>, Vec<Statement>) {
     use std::collections::HashSet;
     let (mut issue, mut consume) = (Vec::new(), Vec::new());
     // Locals holding a loaded value or one computed from it; locals the second part reads or defines.
@@ -1223,6 +1223,49 @@ fn split_reads(statements: Vec<Statement>) -> (Vec<Statement>, Vec<Statement>) {
         }
     }
     (issue, consume)
+}
+
+/// The 32-bit registers the reads of `statements` hold until the rest of them runs (POOT-1505): split as a pipelined
+/// round's staging is ([`split_reads`]), every local the issued part defines and the rest reads stays live across the
+/// round's multiply. Each counts by its width ([`register_words`]); `locals` declares them.
+pub(crate) fn held_registers(statements: Vec<Statement>, locals: &[LocalDecl]) -> u32 {
+    use std::collections::HashSet;
+    let (issue, consume) = split_reads(statements);
+    // Only a read's value is held: the address arithmetic the issued part also computes is rebuilt from the round's
+    // few base registers wherever the compiler needs the register, which a loaded value cannot be.
+    let mut defined: HashSet<Local> = HashSet::new();
+    for statement in &issue {
+        if let Statement::Assign(place, rvalue) = statement
+            && reads_memory(rvalue) == Some(true)
+        {
+            defined.insert(place.local);
+        }
+    }
+    let mut held: HashSet<Local> = HashSet::new();
+    for statement in &consume {
+        statement.for_each_read(|l| {
+            if defined.contains(&l) {
+                held.insert(l);
+            }
+        });
+    }
+    held.into_iter()
+        .map(|l| register_words(&locals[l.index as usize].ty))
+        .sum()
+}
+
+/// The 32-bit registers a value of `ty` occupies: one for a scalar of at most 32 bits (a 16-bit value takes a whole
+/// register), two for a 64-bit one, a vector's lanes packed, nothing for a type no register holds.
+fn register_words(ty: &Ty) -> u32 {
+    match ty {
+        Ty::Bool | Ty::Usize | Ty::I32 | Ty::U32 | Ty::F32 | Ty::F16 | Ty::BF16 => 1,
+        Ty::F64 => 2,
+        Ty::Vec { elem, lanes } => match elem.as_ref() {
+            Ty::F16 | Ty::BF16 => lanes.div_ceil(2),
+            elem => lanes * register_words(elem),
+        },
+        _ => 0,
+    }
 }
 
 /// Whether `rvalue` reads memory (a buffer or private array element, a vector of them, a constant table word or
@@ -1336,5 +1379,48 @@ mod tests {
         };
         assert_eq!(issue, at(&[0, 1, 3, 4]));
         assert_eq!(consume, at(&[2, 5, 6, 7]));
+    }
+
+    /// POOT-1505: the registers a round's reads hold are the read values its decode uses, by width: two reads of an
+    /// f32 and a four-lane f32 vector that the decode reads hold six, an issued read nobody reads after the split
+    /// and the address arithmetic the decode also reads (rebuilt where it is needed) hold none. Mutation: count every
+    /// local the issued part defines (drop the `reads_memory` test in `held_registers`); the address `_10` is counted
+    /// and the row reads 7.
+    #[test]
+    fn a_round_holds_the_reads_its_decode_uses() {
+        let one = Operand::Const(Constant::Usize(1));
+        let mut locals = vec![
+            LocalDecl {
+                ty: Ty::Unit,
+                mutable: false,
+            };
+            20
+        ];
+        for (index, ty) in [
+            (10, Ty::Usize),
+            (11, Ty::F32),
+            (12, Ty::F32),
+            (13, Ty::F32),
+            (14, Ty::F32),
+            (15, Ty::F32),
+            (17, Ty::F32),
+        ] {
+            locals[index].ty = ty;
+        }
+        locals[16].ty = Ty::Vec {
+            elem: Box::new(Ty::F32),
+            lanes: 4,
+        };
+        let statements = vec![
+            set(10, Rvalue::Use(one.clone())), // address, read by the decode
+            set(11, read(1, 10)),              // read, decoded
+            set(12, read(1, 10)),              // read, never used
+            set(16, read(2, 10)),              // vector read, decoded
+            set(13, read(1, 10)),              // read, decoded
+            set(14, add(11, copy(l(13)))),     // decode
+            set(15, add(10, copy(l(14)))),     // decode reads the address
+            set(17, add(16, one.clone())),     // decode of the vector
+        ];
+        assert_eq!(held_registers(statements, &locals), 1 + 4 + 1);
     }
 }

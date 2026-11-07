@@ -61,3 +61,29 @@ The lanes:
 ## The required-case gate
 
 Every device lane ends by checking a list of required test names. Each listed test must have run and passed in that lane, and a skipped test never counts.
+
+## Launch census
+
+The plan digests of the model-free suite cover small fixtures, where launch geometry mostly does not bind. The launch census
+covers the reference models at their real dimensions: one row per distinct contraction or attention request on each reference
+target, with every field of its schedule. A change to a figure the planner reads changes a row.
+
+```bash
+just test-launch-census-regen
+```
+
+Regenerate the file after a change that moves plans on purpose, read the diff and state every changed row in the change. A change
+that must not move plans leaves the diff empty. `rg dense_gemv` over the file lists every equation the dense decode Gemv serves.
+
+## Repository guards
+
+The model-free lane (`just test`) also runs checks on the tree itself:
+
+| Recipe | Fails when |
+| --- | --- |
+| `docs-paths` | A tracked file names a `docs/` page that does not exist |
+| `receipts-guard` | A tracked path sits under the top-level `receipts/` directory; per-change evidence is kept outside the repository |
+| `home-paths-guard` | A tracked file contains a home-directory path; recorded data uses repo-relative paths |
+| `variant-coverage` | A variant of a registered error or refusal enum names no covering test |
+
+`scripts/check-home-paths.py --strip` rewrites the path prefix in JSON files and proves nothing else in them changed.

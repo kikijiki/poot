@@ -30,7 +30,7 @@ pub(crate) use indexed::{
 };
 
 pub(crate) use tiled::{
-    GroupedRows, TiledBody, TiledExtents, TiledLaunch, TiledWeight, tiled_body,
+    GroupedRows, TiledBody, TiledExtents, TiledLaunch, TiledWeight, held_registers, tiled_body,
 };
 
 use poot_graph_ir::FragmentDtype;
@@ -215,7 +215,8 @@ const GLOBAL_REQUEST_BYTES: usize = 128;
 /// The round depths a fragment tiling may stage, shallowest first: one and two pairs of fragment steps. The
 /// pipelined loop holds one round's loaded values in registers while it multiplies the previous one, so a deeper
 /// round holds more: at 64 the 128 x 128 tile of a narrowed bf16 projection is 225 VGPRs on gfx1151, near the 256 a
-/// wave32 lane holds (`register_budget` guards the planner's tilings against spills).
+/// wave32 lane holds (`RegisterTiling::loop_registers` bounds what a round holds). A shape that holds no fragment
+/// tiling at either stages one fragment step a round ([`RegisterTiling::candidates`]).
 const FRAGMENT_DEPTHS: [usize; 2] = [32, 64];
 
 /// How the activation rows of a [`TiledShape`]'s blocks meet the tiles.
@@ -232,6 +233,43 @@ pub enum TiledRows {
         /// The positions of one tile.
         block: usize,
     },
+}
+
+/// What a tiled contraction's weight values are staged from (POOT-1505): what decides how deep a round reads whole
+/// requests of a weight row and what one staged run holds in registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StagedWeight {
+    /// A dense element of `bits` in global memory, rounded up: 32 for f32, 16 for a packed half. A staged value is
+    /// the value its load reads.
+    Dense {
+        /// The bits one element occupies.
+        bits: u32,
+    },
+    /// A packed weight of this format, decoded as it is staged ([`crate::packed_value_bits`] bits per value).
+    Packed(poot_quant::format::WeightFormat),
+}
+
+impl StagedWeight {
+    /// The bits one weight value occupies in global memory, rounded up.
+    pub fn bits(self) -> u32 {
+        match self {
+            Self::Dense { bits } => bits,
+            Self::Packed(format) => crate::packed_value_bits(format),
+        }
+    }
+
+    /// The 32-bit registers one staged run of `run` weight values holds in a tiled round: a dense run its loaded
+    /// bits; a packed run the reads its decode issues ahead of the round's multiply
+    /// ([`crate::packed_run_held_registers`]) and the `run` f32 values the decode then computes from them, which
+    /// stay live until the round's staged write. `None` for a format the decode emitter cannot state.
+    pub fn run_registers(self, run: usize) -> Option<u32> {
+        match self {
+            Self::Dense { bits } => Some((run as u32 * bits).div_ceil(32)),
+            Self::Packed(format) => crate::packed_run_held_registers(format, run)
+                .ok()
+                .map(|held| held + run as u32),
+        }
+    }
 }
 
 /// The shape of an `M > 1` contraction: `blocks` independent products of `m_per_block` activation rows against
@@ -254,10 +292,10 @@ pub struct TiledShape {
     pub rows: TiledRows,
     /// The f32 tiles staged per operand: more than one for a split operand, which stages its `hi` and `lo` parts.
     pub terms: StagedTerms,
-    /// The bits one weight element occupies in global memory, rounded up: 32 for f32, 16 for a packed half, a
-    /// packed format's bits per value ([`crate::packed_value_bits`]). What decides how deep a fragment round must
-    /// be to read whole requests of a weight row.
-    pub weight_bits: u32,
+    /// What the weight's staged values are read from: a dense element of some bits, or a packed format's decode.
+    /// Its bits decide how deep a fragment round must be to read whole requests of a weight row, and its read
+    /// decides the registers a round holds ([`StagedWeight::run_registers`]).
+    pub weight: StagedWeight,
     /// The bits one activation element occupies in global memory: 32 for f32, 16 for an activation the planner
     /// stored in its fragment dtype (POOT-1448). The activation's side of the same round depth rule.
     pub activation_bits: u32,
@@ -335,6 +373,46 @@ const WAVE_FRAGMENTS: [u32; 3] = [1, 2, 4];
 /// The f32 registers one lane of a wave holds for an accumulator fragment: the 16x16 values of its tile over the
 /// 32 lanes of the wave.
 const FRAGMENT_ACCUMULATOR_REGISTERS: u32 = 16 * 16 / FRAGMENT_LANES as u32;
+
+/// The 32-bit registers one staged run of each operand of a shape holds in a tiled round (POOT-1505), at the run
+/// every tiling of the shape stages: an activation run its loaded bits, a weight run what
+/// [`StagedWeight::run_registers`] says. Computed once per shape for [`RegisterTiling::candidates`]; `None` for a
+/// weight whose decode the emitter cannot state, which no tiling runs.
+#[derive(Clone, Copy, Debug)]
+struct RunRegisters {
+    activation: u32,
+    weight: u32,
+}
+
+impl RunRegisters {
+    fn of(shape: TiledShape, run: RunLength) -> Option<Self> {
+        let run = run.get() as usize;
+        Some(Self {
+            activation: (run as u32 * shape.activation_bits).div_ceil(32),
+            weight: shape.weight.run_registers(run)?,
+        })
+    }
+}
+
+/// The schedule [`RegisterTiling::select`] chose for a contraction, which also says at which precision it reads its
+/// operands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Selection {
+    /// A scalar tiling of the exact read (for grouped rows, its output-tile rows are the block it was costed at).
+    Exact(RegisterTiling),
+    /// The per-row Gemv of the exact read.
+    Gemv,
+    /// A fragment tiling of the narrowed or split read (for grouped rows, its output-tile rows are the block).
+    Narrowed(RegisterTiling),
+}
+
+impl Selection {
+    /// Whether the contraction reads its operands narrowed: its fragment tiling was the cheapest schedule.
+    pub fn narrows(self) -> bool {
+        matches!(self, Self::Narrowed(_))
+    }
+}
+
 impl RegisterTiling {
     /// The tiling of `shape` on `caps`, from an occupancy cost model over every geometry the device can run.
     ///
@@ -344,11 +422,12 @@ impl RegisterTiling {
     ///   ([`StagedTerms::fragment`]): every wave grid of [`WAVE_GRIDS`] with every [`WAVE_FRAGMENTS`] tile. Its
     ///   round depth is the
     ///   shallowest of [`FRAGMENT_DEPTHS`] at which one round's segment of every operand row is a whole global
-    ///   request ([`GLOBAL_REQUEST_BYTES`]; the deepest when none is), or the deepest shallower one its LDS holds
-    ///   ([`Self::fragment_depth`]).
+    ///   request ([`GLOBAL_REQUEST_BYTES`]; the deepest when none is), or the deepest shallower one it runs
+    ///   ([`Self::fragment_depth`]); where no geometry runs at either depth, every geometry at one fragment step.
     ///
-    /// A candidate must have a workgroup that fits the device, accumulators within the lane's register budget
-    /// ([`poot_target::RegisterBudget`]), two staged tiles that fit its LDS and stage in whole
+    /// A candidate must have a workgroup that fits the device, accumulators and the registers it holds across the
+    /// loop within the lane's register budget ([`poot_target::RegisterBudget`], [`Self::loop_registers`]), two staged
+    /// tiles that fit its LDS and stage in whole
     /// slots ([`tiled::stages_evenly`]), and an output tile the shape's rows admit (a grouping's block,
     /// [`TiledShape::admits_tile_rows`]). Each is costed by [`ContractionCost::tiled`] and the cheapest wins, a tie going to the
     /// larger output tile and then to the earlier candidate (the scalar grids, then [`WAVE_GRIDS`] in order: two wave
@@ -478,6 +557,7 @@ impl RegisterTiling {
     ) -> impl Iterator<Item = Self> + '_ {
         let launch = caps.gemm_launch();
         let run = RunLength::dividing(shape.k);
+        let runs = RunRegisters::of(shape, run);
         let scalar = [launch.register_lane_edge, launch.register_lane_edge_wide]
             .into_iter()
             .flat_map(move |lanes| {
@@ -487,17 +567,18 @@ impl RegisterTiling {
                     })
                 })
             });
-        let fragment = shape
-            .terms
-            .fragment
-            .and_then(|dtype| Some((dtype, Self::fragment_config(dtype, caps)?)))
-            .into_iter()
-            .flat_map(move |(dtype, (layout, waves))| {
-                WAVE_GRIDS.into_iter().flat_map(move |(waves_m, waves_n)| {
-                    WAVE_FRAGMENTS.into_iter().flat_map(move |rows| {
-                        WAVE_FRAGMENTS.into_iter().filter_map(move |cols| {
-                            (waves_m * waves_n <= waves)
-                                .then_some(Self {
+        // Every fragment geometry the device runs, its depth chosen by `fragment_depth` (or, for the fallback below, set).
+        let geometries = move || {
+            shape
+                .terms
+                .fragment
+                .and_then(|dtype| Some((dtype, Self::fragment_config(dtype, caps)?)))
+                .into_iter()
+                .flat_map(move |(dtype, (layout, waves))| {
+                    WAVE_GRIDS.into_iter().flat_map(move |(waves_m, waves_n)| {
+                        WAVE_FRAGMENTS.into_iter().flat_map(move |rows| {
+                            WAVE_FRAGMENTS.into_iter().filter_map(move |cols| {
+                                (waves_m * waves_n <= waves).then_some(Self {
                                     owners_m: TileSize(waves_m),
                                     owners_n: TileSize(waves_n),
                                     micro: MicroTile::Fragment(FragmentTile {
@@ -509,20 +590,39 @@ impl RegisterTiling {
                                     run,
                                     depth: FRAGMENT_DEPTHS[0],
                                 })
-                                .and_then(|tiling| tiling.fragment_depth(shape, caps))
+                            })
                         })
                     })
                 })
-            });
+        };
+        let admitted = move |tiling: &Self| {
+            runs.is_some_and(|runs| tiling.runs_on(shape, caps, runs))
+                && shape.admits_tile_rows(tiling.output_tile().0)
+        };
+        let mut fragment: Vec<Self> = geometries()
+            .filter_map(|tiling| tiling.fragment_depth(shape, caps, runs))
+            .filter(admitted)
+            .collect();
+        // A shape no fragment tiling holds at a whole-request depth stages one fragment step a round (POOT-1505): the
+        // round holds half of what the shallowest whole-request one does, at twice its barriers, which the cost model
+        // does not price, so it is the round only of a shape that has no deeper one (a one-wave tile over an act-order
+        // GPTQ weight).
+        if fragment.is_empty() {
+            fragment = geometries()
+                .map(|tiling| Self {
+                    depth: tiling.micro.kappa(),
+                    ..tiling
+                })
+                .filter(admitted)
+                .collect();
+        }
         // The units follow the precision (POOT-1476): an exact shape runs on lanes, a narrowed or split one on a
         // matrix unit. A narrowed op never has a scalar tiling, which would round for no speed.
         let narrowed = shape.terms.fragment.is_some();
         scalar
             .filter(move |_| !narrowed)
+            .filter(admitted)
             .chain(fragment)
-            .filter(move |tiling| {
-                tiling.runs_on(shape, caps) && shape.admits_tile_rows(tiling.output_tile().0)
-            })
     }
 
     /// Whether `caps` runs this tiling over `shape`: it is one of [`Self::candidates`]. A caller that pins a tiling
@@ -531,46 +631,73 @@ impl RegisterTiling {
         Self::candidates(shape, caps).any(|tiling| tiling == self)
     }
 
-    /// The cheapest fragment tiling of a narrowed or split `shape`, or `None` when the device has none for it
-    /// (POOT-1476). A narrowed contraction plans only on a matrix unit, so this is the planner's hold: it never
-    /// compares with an exact schedule, which is the pass's question ([`Self::matrix_unit_wins`]).
-    pub fn fragment_tiling(shape: TiledShape, caps: &poot_target::DeviceCaps) -> Option<Self> {
-        shape.terms.fragment?;
+    /// The cheapest tiling of `shape` at its own precision and rows (the scalar tilings of an exact shape, the
+    /// fragment tilings of a narrowed or split one), or `None` when the device runs none. What the planner plans a
+    /// contraction with once [`Self::select`] has chosen its precision: the precision is that choice's output, so a
+    /// narrowed contraction is one whose fragment tiling won.
+    pub fn tiling_of(shape: TiledShape, caps: &poot_target::DeviceCaps) -> Option<Self> {
         Self::cheapest(shape, caps).map(|(_, tiling)| tiling)
     }
 
-    /// Whether a matrix unit is the cheapest schedule of a narrowed or split `shape` (POOT-1476,
-    /// POOT-1471): the cheapest fragment tiling, rounding
-    /// terms included, costs less than the cheapest exact alternative, a scalar tiling of the same shape read exactly
-    /// or the per-row Gemv `gemv` where the planner has one. All are ranked by the one [`ContractionCost`] model
-    /// over the ungrouped rows, so the answer is a property of the dimensions and the device, and a grouping of the
-    /// rows later (`grouped_block`) cannot reverse it.
-    pub fn matrix_unit_wins(
+    /// The schedule of a contraction (POOT-1505): the cheapest, by the
+    /// one [`ContractionCost`] model, of every candidate the device runs:
+    /// - the scalar tilings of `shape` read exactly;
+    /// - the per-row Gemv `gemv`, where the planner has one;
+    /// - the fragment tilings of `shape` at its narrowed or split precision, where `shape.terms` permits one.
+    ///
+    /// Every tiling passes the one feasibility rule of [`Self::candidates`]. Each is costed over `shape`'s rows as
+    /// the plan runs them: a grouped shape at every block a tiling of its precision has, the block chosen with the
+    /// tiling, so the empty rows of a short expert tile are in every cost. A tie goes
+    /// to the exact schedule: a narrowing rounds, so it must win. `None` when the device runs no candidate.
+    ///
+    /// The precision is this choice's output: a contraction reads its operands narrowed exactly when the choice is
+    /// [`Selection::Narrowed`]. A precision policy that permits narrowing never obliges it.
+    pub fn select(
         shape: TiledShape,
         gemv: Option<GemvShape>,
         caps: &poot_target::DeviceCaps,
-    ) -> bool {
-        if shape.terms.fragment.is_none() {
-            return false;
-        }
-        let dense = TiledShape {
-            rows: TiledRows::Dense,
-            ..shape
-        };
+    ) -> Option<Selection> {
         let exact = TiledShape {
             terms: StagedTerms::ONE,
-            ..dense
+            ..shape
         };
-        let Some((fragment_cost, _)) = Self::cheapest(dense, caps) else {
-            return false;
+        let tiled = Self::cheapest_grouping(exact, caps)
+            .map(|(cost, tiling)| (cost, Selection::Exact(tiling)));
+        let gemv = gemv.map(|gemv| (ContractionCost::gemv(gemv, caps), Selection::Gemv));
+        let narrowed = shape.terms.fragment.and_then(|_| {
+            Self::cheapest_grouping(shape, caps)
+                .map(|(cost, tiling)| (cost, Selection::Narrowed(tiling)))
+        });
+        Self::first_cheapest([tiled, gemv, narrowed].into_iter().flatten())
+    }
+
+    /// The cheapest of `ranked` (cost, schedule) pairs, a tie going to the earlier one: [`Self::select`] lists the
+    /// exact schedules first, so a tie stays exact.
+    fn first_cheapest(ranked: impl Iterator<Item = (f64, Selection)>) -> Option<Selection> {
+        ranked
+            .reduce(|best, next| if next.0 < best.0 { next } else { best })
+            .map(|(_, selection)| selection)
+    }
+
+    /// The cheapest tiling of `shape` and its cost: over its rows as given when they are dense, and for grouped rows
+    /// at every block a tiling of its precision has ([`Self::blocks_of`]), as a grouping of this contraction alone
+    /// would take it (a tie going to the larger block, which runs fewer tiles). `None` when the device runs none.
+    fn cheapest_grouping(shape: TiledShape, caps: &poot_target::DeviceCaps) -> Option<(f64, Self)> {
+        let TiledRows::Grouped { groups, .. } = shape.rows else {
+            return Self::cheapest(shape, caps);
         };
-        [
-            Self::cheapest(exact, caps).map(|(cost, _)| cost),
-            gemv.map(|gemv| ContractionCost::gemv(gemv, caps)),
-        ]
-        .into_iter()
-        .flatten()
-        .all(|exact| fragment_cost < exact)
+        Self::blocks_of(&[shape], caps)
+            .into_iter()
+            .filter_map(|block| {
+                Self::cheapest(
+                    TiledShape {
+                        rows: TiledRows::Grouped { groups, block },
+                        ..shape
+                    },
+                    caps,
+                )
+            })
+            .reduce(|best, next| if next.0 <= best.0 { next } else { best })
     }
 
     /// The output-tile rows some tiling of any of `shapes` has when its rows are free: the blocks a grouping can take,
@@ -603,20 +730,11 @@ impl RegisterTiling {
         grouped: TiledShape,
         caps: &poot_target::DeviceCaps,
     ) -> bool {
-        let TiledRows::Grouped { groups, .. } = grouped.rows else {
+        if !matches!(grouped.rows, TiledRows::Grouped { .. }) {
             return false;
-        };
-        let best = Self::blocks_of(&[grouped], caps)
-            .into_iter()
-            .filter_map(|block| {
-                let grouped = TiledShape {
-                    rows: TiledRows::Grouped { groups, block },
-                    ..grouped
-                };
-                Self::cheapest(grouped, caps).map(|(cost, _)| cost)
-            })
-            .min_by(f64::total_cmp);
-        best.is_none_or(|grouped| ContractionCost::gemv(gemv, caps) <= grouped)
+        }
+        Self::cheapest_grouping(grouped, caps)
+            .is_none_or(|(grouped, _)| ContractionCost::gemv(gemv, caps) <= grouped)
     }
 
     /// The `K` values one barrier round of this tiling stages.
@@ -626,13 +744,18 @@ impl RegisterTiling {
 
     /// This fragment geometry at its round depth, or `None` when the device runs it at none: the shallowest of
     /// [`FRAGMENT_DEPTHS`] whose round segment of every operand row (the activation's rows at
-    /// `shape.activation_bits` per value, the weight's at `shape.weight_bits`) is at least one
+    /// `shape.activation_bits` per value, the weight's at `shape.weight`'s bits) is at least one
     /// [`GLOBAL_REQUEST_BYTES`] request, the deepest when none is; and if [`Self::runs_on`] refuses that depth (its
-    /// staged tiles outgrow the LDS), the deepest shallower one it runs. A 32-deep round of a bf16 row reads half a
-    /// line per request: the vector memory path pays a request for it, so the round doubles; an f32 activation row
-    /// is a whole line at 32 already.
-    fn fragment_depth(self, shape: TiledShape, caps: &poot_target::DeviceCaps) -> Option<Self> {
-        let narrowest = shape.activation_bits.min(shape.weight_bits).max(1) as usize;
+    /// staged tiles outgrow the LDS, or the round it holds outgrows the lane's registers), the deepest shallower one
+    /// it runs. A 32-deep round of a bf16 row reads half a line per request: the vector memory path pays a request
+    /// for it, so the round doubles; an f32 activation row is a whole line at 32 already.
+    fn fragment_depth(
+        self,
+        shape: TiledShape,
+        caps: &poot_target::DeviceCaps,
+        runs: Option<RunRegisters>,
+    ) -> Option<Self> {
+        let narrowest = shape.activation_bits.min(shape.weight.bits()).max(1) as usize;
         let whole = FRAGMENT_DEPTHS
             .iter()
             .position(|&depth| depth * narrowest >= GLOBAL_REQUEST_BYTES * 8)
@@ -641,7 +764,7 @@ impl RegisterTiling {
             .iter()
             .rev()
             .map(|&depth| Self { depth, ..self })
-            .find(|tiling| tiling.runs_on(shape, caps))
+            .find(|tiling| runs.is_some_and(|runs| tiling.runs_on(shape, caps, runs)))
     }
 
     /// The f32 registers each lane of this tiling holds across the `K` loop: a scalar tile's accumulators, a
@@ -653,15 +776,39 @@ impl RegisterTiling {
         }
     }
 
+    /// The 32-bit registers each lane of this tiling holds at once across its `K` loop (POOT-1505): its
+    /// accumulators, and its share of a round of both operands, `runs` registers per staged run of each. The loop is
+    /// software-pipelined: a round's reads are issued before the previous round's multiply and decoded after it, so
+    /// a lane holds the next round's reads through the multiply, then those reads and the values they decode to
+    /// until the round's staged write. A lane stages `rows * depth / lanes` activation values and
+    /// `cols * depth / lanes` weight values of a round (`(rows, cols)` the output tile).
+    fn loop_registers(self, runs: RunRegisters) -> u32 {
+        let lanes = self.workgroup_lanes();
+        let (rows, cols) = self.output_tile();
+        let run = self.run.get() as usize;
+        let lane_runs = |extent: usize| (extent * self.depth).div_ceil(lanes).div_ceil(run) as u32;
+        self.accumulator_registers()
+            + lane_runs(rows) * runs.activation
+            + lane_runs(cols) * runs.weight
+    }
+
     /// Whether `caps` runs this tiling over `shape`: its workgroup fits, a lane's accumulators fit its register
-    /// budget (`caps.gemm_launch().register_budget`, a quarter of what a lane of this workgroup keeps resident),
-    /// its staged tiles (and the scratch an `Opaque` fragment spills to) fit the LDS and stage in whole slots.
-    fn runs_on(self, shape: TiledShape, caps: &poot_target::DeviceCaps) -> bool {
+    /// budget (`caps.gemm_launch().register_budget`, a quarter of what a lane of this workgroup keeps resident) and
+    /// so do all the registers it holds across the loop ([`Self::loop_registers`] within the budget's
+    /// [`poot_target::RegisterBudget::loop_registers`], half of it: a tiling over it spills, POOT-1505), its staged
+    /// tiles (and the scratch an `Opaque` fragment spills to) fit the LDS and stage in whole slots.
+    fn runs_on(
+        self,
+        shape: TiledShape,
+        caps: &poot_target::DeviceCaps,
+        runs: RunRegisters,
+    ) -> bool {
         let lane_count = self.workgroup_lanes();
         let budget = caps.gemm_launch().register_budget;
-        u32::try_from(lane_count)
-            .is_ok_and(|lanes| self.accumulator_registers() <= budget.accumulators(lanes))
-            && lane_count <= caps.max_workgroup_invocations as usize
+        u32::try_from(lane_count).is_ok_and(|lanes| {
+            self.accumulator_registers() <= budget.accumulators(lanes)
+                && self.loop_registers(runs) <= budget.loop_registers(lanes)
+        }) && lane_count <= caps.max_workgroup_invocations as usize
             && lane_count <= caps.max_workgroup_size[0] as usize
             && tiled::lds_bytes(self.launch_shape(), shape.terms) <= caps.lds_bytes as usize
             && tiled::stages_evenly(
@@ -739,6 +886,14 @@ mod tests {
     use super::*;
     use poot_target::FragmentConfig;
 
+    impl RegisterTiling {
+        /// [`Self::loop_registers`] of this tiling over `shape`, `None` for a weight whose decode the emitter cannot
+        /// state: what the register spill rows (`register_budget`) hold the compiler's count against.
+        pub(crate) fn loop_registers_over(self, shape: TiledShape) -> Option<u32> {
+            RunRegisters::of(shape, self.run).map(|runs| self.loop_registers(runs))
+        }
+    }
+
     fn shape(m: usize, k: usize, n: usize) -> TiledShape {
         TiledShape {
             blocks: 1,
@@ -748,9 +903,14 @@ mod tests {
             layout: WeightLayout::Nk,
             rows: crate::TiledRows::Dense,
             terms: crate::precision::StagedTerms::ONE,
-            weight_bits: 32,
+            weight: crate::StagedWeight::Dense { bits: 32 },
             activation_bits: 32,
         }
+    }
+
+    /// Whether the selection over `shape`'s exact and narrowed schedules chooses its fragment tiling.
+    fn narrows(shape: TiledShape, gemv: Option<GemvShape>, caps: &poot_target::DeviceCaps) -> bool {
+        RegisterTiling::select(shape, gemv, caps).is_some_and(Selection::narrows)
     }
 
     /// A one-row dense decode contraction stays on the Gemv on gfx1151 through HSA at every output count, the vocabulary
@@ -782,7 +942,7 @@ mod tests {
                     fragment: Some(FragmentDtype::F16),
                     ..crate::precision::StagedTerms::ONE
                 },
-                weight_bits: 16,
+                weight: crate::StagedWeight::Dense { bits: 16 },
                 ..shape(1, k, n)
             };
             let gemv = GemvShape {
@@ -791,7 +951,7 @@ mod tests {
                 cols: 4,
             };
             assert!(
-                !RegisterTiling::matrix_unit_wins(narrow, Some(gemv), &caps),
+                !narrows(narrow, Some(gemv), &caps),
                 "[1, {k}] x [{n}, {k}]^T moved onto a matrix unit"
             );
         }
@@ -852,7 +1012,7 @@ mod tests {
                 block: 0,
             },
             terms: crate::precision::StagedTerms::ONE,
-            weight_bits: 16,
+            weight: crate::StagedWeight::Dense { bits: 16 },
             activation_bits: 32,
         };
         let gemv = GemvShape {
@@ -1008,13 +1168,12 @@ mod tests {
             },
             ..shape(2048, 1024, 3072)
         };
-        assert!(!RegisterTiling::matrix_unit_wins(narrow, None, &device(1)));
+        assert!(!narrows(narrow, None, &device(1)));
         let held =
-            RegisterTiling::fragment_tiling(narrow, &device(1)).expect("a declared narrowing runs");
+            RegisterTiling::tiling_of(narrow, &device(1)).expect("a declared narrowing runs");
         assert!(matches!(held.micro, MicroTile::Fragment(_)), "{held:?}");
         let many_waves = FragmentConfig::ANY_WAVES;
-        let tiling =
-            RegisterTiling::fragment_tiling(narrow, &device(many_waves)).expect("fragments");
+        let tiling = RegisterTiling::tiling_of(narrow, &device(many_waves)).expect("fragments");
         assert!(
             matches!(tiling.micro, MicroTile::Fragment(_))
                 && tiling.workgroup_lanes() > FRAGMENT_LANES,
@@ -1025,7 +1184,7 @@ mod tests {
     /// The matrix unit is the cheapest schedule of a prefill contraction on gfx1151, and the per-row Gemv is the
     /// cheapest of a decode row: the Gemv's cost (`ContractionCost::gemv`, the same unit as the tilings') beats the
     /// fragment tiling of one row, and loses to it once the launch covers enough rows to fill the device. A narrowed
-    /// shape has no scalar candidate. Mutation: drop the Gemv alternative from `matrix_unit_wins`; the one-row
+    /// shape has no scalar candidate. Mutation: drop the Gemv alternative from `RegisterTiling::select`; the one-row
     /// contraction wins on a matrix unit and this row goes red.
     #[test]
     fn the_gemv_beats_a_matrix_unit_at_one_row_and_loses_at_many() {
@@ -1039,7 +1198,7 @@ mod tests {
                 fragment: Some(FragmentDtype::F16),
                 ..crate::precision::StagedTerms::ONE
             },
-            weight_bits: 16,
+            weight: crate::StagedWeight::Dense { bits: 16 },
             ..shape(m, 2048, 2048)
         };
         let gemv = |rows: usize| GemvShape {
@@ -1047,20 +1206,12 @@ mod tests {
             width: 256,
             cols: 4,
         };
-        assert!(!RegisterTiling::matrix_unit_wins(
-            narrow(1),
-            Some(gemv(1)),
-            &caps
-        ));
+        assert!(!narrows(narrow(1), Some(gemv(1)), &caps));
         assert!(
-            RegisterTiling::matrix_unit_wins(narrow(1), None, &caps),
+            narrows(narrow(1), None, &caps),
             "the Gemv term is what keeps one row exact"
         );
-        assert!(RegisterTiling::matrix_unit_wins(
-            narrow(2048),
-            Some(gemv(2048)),
-            &caps
-        ));
+        assert!(narrows(narrow(2048), Some(gemv(2048)), &caps));
         assert!(
             RegisterTiling::candidates(narrow(512), &caps)
                 .all(|tiling| matches!(tiling.micro, MicroTile::Fragment(_))),
@@ -1127,7 +1278,7 @@ mod tests {
     /// the same 128 x 128 of 4 x 2 waves for both layouts: every fragment operand is staged `X`-major, so the two
     /// grids of that tile load alike and the first wins. An activation the planner stored bf16 (POOT-1448) is a
     /// 64-byte row at 32 values too, so over an f32 `[N, K]` weight its round is 64 deep. Mutation: size the depth from
-    /// the activation alone (drop `shape.weight_bits` from `fragment_depth`'s `narrowest`); the bf16 weight row takes
+    /// the activation alone (drop `shape.weight.bits()` from `fragment_depth`'s `narrowest`); the bf16 weight row takes
     /// 32 and goes red. Mutation: size it from the weight alone (drop `shape.activation_bits`); the bf16 activation
     /// row takes 32 and goes red.
     #[test]
@@ -1149,7 +1300,7 @@ mod tests {
                     TiledShape {
                         layout,
                         terms: narrow(stored),
-                        weight_bits,
+                        weight: StagedWeight::Dense { bits: weight_bits },
                         activation_bits,
                         ..shape(2048, 1024, 3072)
                     },
@@ -1219,5 +1370,170 @@ mod tests {
                 "{tiling:?}"
             );
         }
+    }
+
+    /// POOT-1505: a fragment tiling of a short-prompt projection over a packed expert stack holds no more registers
+    /// across its loop than the lane's held share. The Flash-Next expert up projection at 128 tokens (1280 IQ2_XS rows
+    /// routed to 512 experts, K 2560, N 640) narrowed to f16 on gfx1151 grouped in 16-row tiles: the 16 x 128 tile at
+    /// a 64-deep round the planner took before (two waves; 432 registers a lane holds across the loop against the
+    /// held share of 128, 720 VGPRs spilled when compiled; the 128-token first token took twice the exact plan's,
+    /// POOT-1504) is no candidate, and neither is its 32-deep round (232). A 16-row fragment tiling remains (the
+    /// 16 x 64 tile at a 32-deep round, 120), so the contraction still narrows. Mutation: drop the
+    /// `loop_registers` clause of `RegisterTiling::runs_on`; the 16 x 128 tile at 64 is a candidate again and the
+    /// row names it.
+    #[test]
+    fn a_packed_expert_round_stays_within_the_lanes_held_registers() {
+        let backend = poot_target::Backend::AmdGcn(poot_target::AmdArch::gfx1151());
+        let caps = poot_test_util::device_caps::default_caps_for(backend);
+        let precision = poot_graph_ir::OperandPrecision::Narrow(FragmentDtype::F16);
+        let grouped = TiledShape {
+            blocks: 1,
+            m_per_block: 1280,
+            out_per_block: 640,
+            k: 2560,
+            layout: WeightLayout::Nk,
+            rows: TiledRows::Grouped {
+                groups: 513,
+                block: 16,
+            },
+            terms: crate::precision::StagedTerms::of(precision, None, None),
+            weight: StagedWeight::Packed(poot_quant::format::WeightFormat::Iq2_Xs),
+            activation_bits: 32,
+        };
+        let (layout, _) = RegisterTiling::fragment_config(FragmentDtype::F16, &caps)
+            .expect("gfx1151 has an f16 matrix unit");
+        let tile = |cols, depth| RegisterTiling {
+            owners_m: TileSize(1),
+            owners_n: TileSize(2),
+            micro: MicroTile::Fragment(FragmentTile {
+                dtype: FragmentDtype::F16,
+                layout,
+                rows: 1,
+                cols,
+            }),
+            run: RunLength::dividing(2560),
+            depth,
+        };
+        let candidates: Vec<RegisterTiling> = RegisterTiling::candidates(grouped, &caps).collect();
+        for refused in [tile(4, 64), tile(4, 32)] {
+            assert!(
+                !candidates.contains(&refused),
+                "a tiling that spills its round is a candidate: {:?}",
+                refused.schedule()
+            );
+        }
+        assert!(
+            candidates.contains(&tile(2, 32)),
+            "the 16 x 64 tile at 32 holds its round: {candidates:?}"
+        );
+        assert!(RegisterTiling::tiling_of(grouped, &caps).is_some());
+    }
+
+    /// POOT-1505: a shape no fragment tiling holds at a whole-request depth stages one fragment step a round, and only
+    /// such a shape. On the wgpu caps (a one-wave fragment workgroup) a narrowed packed linear of 4 rows over an
+    /// act-order GPTQ weight (8 columns of 256, 4 groups) holds 136 registers in the 16 x 16 tile at a 32-deep round
+    /// against the held share of 128, and plans at 16 (72); the same linear over Q8_0 holds a 64-deep round (104) and
+    /// keeps it. Mutation: drop the one-step fallback of `RegisterTiling::candidates`; the GPTQ row has no fragment
+    /// tiling and reads `None`.
+    #[test]
+    fn a_shape_no_whole_round_holds_stages_one_fragment_step() {
+        use poot_quant::format::{GroupMap, WeightFormat};
+        let caps = poot_test_util::device_caps::default_caps_for(poot_target::Backend::SpirvVulkan);
+        let linear = |format| TiledShape {
+            blocks: 1,
+            m_per_block: 4,
+            out_per_block: 8,
+            k: 256,
+            layout: WeightLayout::Nk,
+            rows: TiledRows::Dense,
+            terms: crate::precision::StagedTerms::of(
+                poot_graph_ir::OperandPrecision::Narrow(FragmentDtype::F16),
+                None,
+                None,
+            ),
+            weight: StagedWeight::Packed(format),
+            activation_bits: 32,
+        };
+        let act_order = WeightFormat::Gptq {
+            groups: GroupMap::Indexed {
+                groups: std::num::NonZeroUsize::new(4).unwrap(),
+            },
+        };
+        let depth =
+            |format| RegisterTiling::tiling_of(linear(format), &caps).map(RegisterTiling::depth);
+        assert_eq!(
+            depth(act_order),
+            Some(16),
+            "the act-order GPTQ linear: one 16-deep fragment step"
+        );
+        assert_eq!(depth(WeightFormat::Q8_0), Some(64), "the Q8_0 linear");
+    }
+
+    /// The selection costs a grouped contraction at the blocks its grouping can take, not over its ungrouped rows
+    /// (POOT-1505): the Flash-Next expert projection at a 128-token prompt (IQ2_XS, `K` 2560, `N` 640, 1280 rows
+    /// routed over 513 buckets) on gfx1151 narrows onto a 16-row fragment tile, the block its buckets fill, and the
+    /// grouped plan runs that tiling at that block. Over 1280 dense rows the cheapest fragment tile is 128 rows tall,
+    /// which no grouping of these buckets would plan. Mutation: cost the narrowed candidates over `TiledRows::Dense` in
+    /// `RegisterTiling::select`; the selection reads a 128-row tile (observed: `selected FragmentTiled { waves_m: 4, waves_n: 2,
+    /// .. rows: 2, cols: 4 }, run: 4, depth: 32 }`, left 128, right 16).
+    #[test]
+    fn a_grouped_contraction_is_selected_at_the_block_its_grouping_takes() {
+        let caps = poot_target::DeviceCaps {
+            matrix_units: poot_target::Queried::Known(poot_target::MatrixUnits::amd("gfx1151", 32)),
+            register_file: poot_target::Queried::Known(
+                poot_target::RegisterFile::amd("gfx1151", 32).expect("gfx1151's file"),
+            ),
+            compute_units: poot_target::Queried::Known(40),
+            perf_calibration: poot_target::calibration::Calibrated::STRIX_HALO_HSA,
+            ..poot_target::DeviceCaps::rocm_default()
+        };
+        let grouped = |block| TiledShape {
+            blocks: 1,
+            m_per_block: 1280,
+            out_per_block: 640,
+            k: 2560,
+            layout: WeightLayout::Nk,
+            rows: TiledRows::Grouped { groups: 513, block },
+            terms: crate::precision::StagedTerms::of(
+                poot_graph_ir::OperandPrecision::Narrow(FragmentDtype::F16),
+                None,
+                None,
+            ),
+            weight: StagedWeight::Packed(poot_quant::format::WeightFormat::Iq2_Xs),
+            activation_bits: 32,
+        };
+        let Some(Selection::Narrowed(tiling)) = RegisterTiling::select(grouped(16), None, &caps)
+        else {
+            panic!("the expert projection stays exact");
+        };
+        let rows = tiling.output_tile().0;
+        assert_eq!(rows, 16, "selected {:?}", tiling.schedule());
+        assert!(
+            tiling.runs_over(grouped(rows), &caps),
+            "{:?}",
+            tiling.schedule()
+        );
+        assert_eq!(
+            RegisterTiling::tiling_of(grouped(rows), &caps),
+            Some(tiling)
+        );
+    }
+
+    /// A tie between an exact schedule and the narrowed one stays exact: a narrowing rounds, so it must win.
+    /// Mutation: let a later candidate replace the best on `<=` in `RegisterTiling::first_cheapest`; the narrowed
+    /// tiling is chosen.
+    #[test]
+    fn a_tie_between_exact_and_narrowed_stays_exact() {
+        let tiling =
+            RegisterTiling::choose(shape(64, 64, 64), &poot_target::DeviceCaps::rocm_default());
+        let ranked = [
+            (2.0, Selection::Exact(tiling)),
+            (1.0, Selection::Gemv),
+            (1.0, Selection::Narrowed(tiling)),
+        ];
+        assert_eq!(
+            RegisterTiling::first_cheapest(ranked.into_iter()),
+            Some(Selection::Gemv)
+        );
     }
 }
