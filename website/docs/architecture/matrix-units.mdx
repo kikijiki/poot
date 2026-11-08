@@ -7,7 +7,8 @@ sidebar_position: 5.5
 # Matrix Units and the Cost Model
 
 A contraction can run on the vector units, as a register-tiled body or a Gemv, or on the matrix units of the GPU. This page
-states what a device reports, which schedules use it, and how the planner chooses between schedules.
+states what a device reports, which schedules use it, how the planner chooses between schedules, and how a device's compiler
+can correct that choice.
 
 ## What a device reports
 
@@ -28,8 +29,9 @@ the vector units; a capability whose rate nobody sourced is `Unknown`, and the c
 
 The register-tiled contraction has a fragment variant: each wave holds fragments of the output tile and loops over K with a
 pipelined, software-staged read. A routed expert contraction reaches it through block-aligned grouping, so every tile holds one
-expert's rows. The operand precision pass decides whether a contraction takes it; see [Operand precision](./graph-ir.mdx#operand-precision).
-A narrowed activation is rounded once, by the op that produces it, and stored narrow.
+expert's rows. Whether a contraction takes it is the outcome of [the selection](#one-selection-per-contraction), not a separate
+question; see [Operand precision](./graph-ir.mdx#operand-precision). A narrowed activation is rounded once, by the op that produces
+it, and stored narrow.
 
 ## Fragment attention
 
@@ -47,16 +49,53 @@ Every choice among contraction schedules uses one model, `ContractionCost`. It p
 - for a Gemv, each value a lane reads straight from global memory;
 - the rounding of a staged narrowed operand.
 
-The same model ranks the fragment tilings against the exact tilings, and decides whether a per-row indexed contraction runs as
-the Gemv or as the register-tiled schedule over its rows grouped by expert. No fixed row count switches between them, and the
-criterion never mentions a model, a shape or a benchmark.
+## One selection per contraction
+
+The planner makes one choice for each contraction, dense or packed, grouped by expert or not: the cheapest candidate under the cost
+model. The candidates are
+
+- the exact register tilings;
+- the exact Gemv, where the contraction has one;
+- the fragment tilings of the dtype the precision policy permits, where the device has a matrix unit for it.
+
+A grouped contraction is priced at the block of rows its grouping will use, chosen together with the tiling, so the empty rows of a short expert tile are in every cost.
+A tie goes to an exact schedule: a narrowing rounds, so it must win. No fixed row count switches between the Gemv and the tiled schedule, and the criterion never
+mentions a model, a shape or a benchmark.
+
+The precision is the selection's output. `narrow` and `split` permit narrowing and `exact` forbids it, but a contraction reads its operands
+narrowed only when a fragment tiling is the cheapest candidate. The precision pass and the final plan ask the same question of the same shape, so they cannot disagree.
 
 ## Register budget
 
 A lane holds the accumulators of its tile and, in a pipelined loop, the operand reads staged for a round. The budget comes from
 the register file the runtime reports: a quarter of a lane's registers hold accumulators, and the loop as a whole may hold half. A tiling over
 either bound is not offered, so a tile that would spill is replaced by a shallower one. Where the runtime reports no register
-file, the planner uses a portable figure and the plan records that it did.
+file, the planner uses a portable figure and the plan records that it did. This is the register model: a count the planner makes
+without running a compiler.
+
+## Compile feedback
+
+Whether a kernel spills is the compiler's to say. A device whose compiler can be asked (PTX today) gives the planner that answer.
+The planner then compiles a candidate's probe, the kernel body the generator emits for the contraction's shape and tiling without
+its epilogue, and takes the cheapest candidate that does not spill:
+
+- Candidates are compiled in cost order, so the first compile is usually the kernel the plan runs. The register model only prunes
+  a tiling that cannot fit the lane's whole register file, and each fragment geometry is weighed at every whole-request depth.
+- A kernel spills when the compiler gives it any per-lane local memory. A probe the compiler refuses is a tiling the device does not run.
+- If no candidate of a contraction holds, planning refuses the contraction by name instead of falling back to a tiling that may spill.
+- A verdict is a function of the probe and the compiler. Verdicts are cached on disk by the compiler's identity (the driver release
+  and compute capability on PTX) and the probe's digest, so a restart reads them back and another driver starts afresh.
+- The plan names the compiler whose verdicts chose its tilings, and plans made with different compilers are different plans.
+
+The division of labour follows the architecture: the device is mechanism and reports the registers and local memory of a kernel it
+was handed; the engine owns lowering, compiles each probe through its own kernel cache and passes the verdicts to the planner. The
+driver attaches the device's feedback at the one place it compiles, so every program the driver compiles plans with it and a caller
+cannot leave it out. The probe has no epilogue, so a contraction whose fused epilogue raises its register pressure
+past the file could still spill.
+
+Tools that plan without a GPU (the plan summary and the launch census) plan without feedback on purpose, stay
+GPU-free and describe the register model's plan, which can differ from the plan a device with feedback runs. wgpu, raw Vulkan and ROCm report
+no compiler registers today and plan with the register model alone.
 
 ## Calibration
 

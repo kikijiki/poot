@@ -200,6 +200,29 @@ class PerfPageTest(unittest.TestCase):
 
         self.assertEqual({p["set"]: (p["latest"], p["hosts"]) for p in cls["points"]}, {"old": (False, 1), "other": (False, 1), "new": (True, 1)})
 
+    def test_a_superseded_sets_legacy_length_is_not_current_beside_the_newest_set(self):
+        def sweep(lengths):
+            def row(delta):
+                points = [
+                    {"isl": isl, "prompt_tokens": isl, "decode_tok_s": 100.0 + delta,
+                     "ttft_ms": {"p50": 10.0, "min": 9.0, "max": 11.0}, "tpot_ms": {"p50": 10.0, "min": 9.0, "max": 11.0}}
+                    for isl in lengths
+                ]
+                return {**ROW, "scenario": "decode-curve", "curve": points, "decode_tok_s": 100.0 + delta}
+            return [row(d) for d in (-1.0, -0.5, 0.0, 0.5, 1.0)]
+
+        # decode-curve declares 128, 2048 and 8192. The old set also measured 512; the newer set did not; the newest
+        # lacks 2048. Each set is on its own host, so no host entry sees the others.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_set(Path(tmp), "old", sweep((128, 512, 2048, 8192)), date="2026-10-19", env={"cpu": "CPU A"})
+            write_set(Path(tmp), "new", sweep((128, 2048, 8192)), date="2026-10-20", env={"cpu": "CPU B"})
+            write_set(Path(tmp), "incomplete", sweep((128, 8192)), date="2026-10-21", env={"cpu": "CPU C"})
+            (cls,) = generate_classes(tmp)
+
+        current = sorted((p["isl"], p["set"]) for p in cls["points"] if p["latest"])
+        self.assertEqual(current, [(128, "incomplete"), (2048, "new"), (8192, "incomplete")])
+        self.assertIn(512, [p["isl"] for p in cls["points"] if p["set"] == "old" and not p["latest"]])
+
     def test_a_set_another_host_has_since_remeasured_feeds_no_headline_value_of_any_metric(self):
         gib = 2**30
         old = [{**ROW, "peak_rss_bytes": 74 * gib, "decode_tok_s": 10.0 + d / 100} for d in (-1.0, -0.5, 0.0, 0.5, 1.0)]

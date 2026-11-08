@@ -220,6 +220,14 @@ verifies, whose measurement no longer matches the entry, or that has gone is a `
 applies to the committed set compared with itself, not to a candidate. The Performance page shows a listed cell's measured median muted and
 labelled unverified, never ranked and never in a ratio, and `bench index` lists it in INDEX.md. Rows are never edited.
 
+**Which points the Performance page shows as current.** For one (model, series, scenario) the newest set decides which
+context lengths are current (`aggregate_hosts` in `harness/perf_page.py`). A point of an older set is current only at a
+length the newest set measured (and then the newer value wins), or at a length `manifest.toml` declares for the scenario
+that the newest set lacks, so an incomplete new set never blanks the page (`grid-check` still fails the incomplete cell).
+Any other point of an older set, a legacy length the newest set does not measure and the manifest no longer lists, stays
+a row of its own and is not drawn beside the newest set, which a different build measured. The rule drops points from the
+current view only; no measured number is edited.
+
 A cell is keyed by `(model, scenario, framework, backend, device, host CPU, GPU driver)`, and rows that state different workloads
 (precision, prompt length, output length) are `incomparable`. The host CPU and driver come from the `env.json` of the
 run directory a row was recorded in, so repeats recorded on two hosts of the same GPU (host-side launch overhead

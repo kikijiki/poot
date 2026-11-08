@@ -15,10 +15,11 @@
   ],
   "later": "Other hardware targets, deeper decode fusion, release packaging and an API stability promise.",
   "limitations": [
-    "Behind llama.cpp on decode in every measured cell, up to 3.5x slower.",
-    "Behind on first token up to 8x slower, except qwen3-0.6b and qwen3-4b on Strix Halo ROCm and qwen3-0.6b at 128 tokens on the RTX PRO 6000.",
-    "Holds up to 2x the GPU memory of llama.cpp at inference.",
-    "The benchmark grid is two machines and six models, with llama.cpp as the reference.",
+    "Behind llama.cpp on decode in every measured cell, from 1.02x to 3.5x slower.",
+    "Behind on first token in 15 of 28 cells, up to 3.2x slower.",
+    "Ahead of llama.cpp on first token on qwen3-0.6b and qwen3-4b (Strix Halo ROCm, RTX PRO 6000 PTX) and on qwen3-4b-q4km at 8192 tokens (ROCm).",
+    "Holds up to 1.5x the GPU memory of llama.cpp at inference.",
+    "The benchmark grid is two machines and five models, with llama.cpp as the reference.",
     "There is no compatibility guarantee: APIs and formats change without notice.",
     "Benchmark cells that fail the noise contract are marked unverified and never counted."
   ],
@@ -281,7 +282,7 @@
       "column": "works",
       "icon": "chart",
       "title": "Public benchmarks",
-      "line": "Verified runs next to llama.cpp, on two machines and six models.",
+      "line": "Verified runs next to llama.cpp, on two machines and five models.",
       "badge": "works",
       "link": "/docs/performance"
     },
@@ -290,7 +291,7 @@
       "column": "building",
       "icon": "bolt",
       "title": "Performance: decode, prefill and memory",
-      "line": "Behind llama.cpp on decode and GPU memory everywhere, on first token except Strix Halo qwen3 and one RTX PRO 6000 cell; host memory lower on most Strix.",
+      "line": "Behind llama.cpp on decode and GPU memory everywhere; ahead of it on first token on the small qwen3 models; host memory lower on most Strix.",
       "badge": "in-progress",
       "link": "/docs/performance"
     },
@@ -326,7 +327,7 @@
       "column": "building",
       "icon": "chart",
       "title": "Wider benchmark coverage",
-      "line": "The standing grid is filling in: two machines (Strix Halo and one RTX PRO 6000 cloud GPU), six models.",
+      "line": "The standing grid is filling in: two machines (Strix Halo and one RTX PRO 6000 cloud GPU), five models.",
       "badge": "in-progress",
       "link": "/docs/performance"
     },

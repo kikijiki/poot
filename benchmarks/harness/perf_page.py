@@ -424,25 +424,51 @@ def combine_hosts(points, labels):
     return point
 
 
-def aggregate_hosts(host_points):
+def declared_lengths(manifest=receipts.MANIFEST):
+    """The input lengths each sweep scenario of the manifest declares, by scenario id."""
+    return {s["id"]: set(s["isl"]) for s in bench.load_toml(manifest)["scenario"] if "isl" in s}
+
+
+def aggregate_hosts(host_points, declared):
     """The points of a hardware choice from the points of its hosts, as `(host, scenario, point)`. The newest sets of
     the hosts are combined into one point per (model, series, input length, scenario), so a host-only difference never
     splits a series. A set older than the newest verified one of its point, on any host, is superseded: it stays a row of its own
-    (the table lists it, no chart draws it) and feeds no median."""
+    (the table lists it, no chart draws it) and feeds no median.
+
+    A set is also superseded as a whole. For one (model, series, scenario) the newest set decides which lengths are
+    current: a point of an older set is current only at a length the newest set measured, where the rule above picks the
+    newer value, or at a length the manifest declares for the scenario (`declared`) that the newest set lacks, so an incomplete
+    new set never blanks the page. A legacy length of an older set (one the newest set does not measure and the manifest no
+    longer lists) is a row of its own, never drawn beside the newest set's curve, which a different build measured."""
     # The date of the newest verified set of a point, or of the newest set when none is verified: an unverified re-measurement
     # does not supersede the last verified one (the page still prefers the verified values, see `combine_hosts`).
     newest, newest_verified = {}, {}
+    # The same per (model, series, scenario): the date of the newest set and the lengths it measured.
+    newest_set, measured = {}, {}
     for host, scenario, point in host_points:
         key = (point["model"], point["series"], point["isl"], scenario)
         if point["latest"]:
             newest[key] = max(newest.get(key, ""), point["date"])
             if point["verified"]:
                 newest_verified[key] = max(newest_verified.get(key, ""), point["date"])
+    for host, scenario, point in host_points:
+        if point["latest"]:
+            sweep = (point["model"], point["series"], scenario)
+            newest_set[sweep] = max(newest_set.get(sweep, ""), point["date"])
+    for host, scenario, point in host_points:
+        sweep = (point["model"], point["series"], scenario)
+        if point["latest"] and point["date"] == newest_set[sweep]:
+            measured.setdefault(sweep, set()).add(point["isl"])
+
+    def current(scenario, point):
+        sweep = (point["model"], point["series"], scenario)
+        return point["date"] >= newest_set[sweep] or point["isl"] in measured[sweep] or point["isl"] in declared.get(scenario, ())
+
     groups, older = {}, []
     for host, scenario, point in host_points:
         key = (point["model"], point["series"], point["isl"], scenario)
-        if not point["latest"] or point["date"] < newest_verified.get(key, newest[key]):
-            # A set another host has since re-measured is superseded: it is a row of its own and feeds no headline value.
+        if not point["latest"] or not current(scenario, point) or point["date"] < newest_verified.get(key, newest[key]):
+            # A set another host has since re-measured, or a legacy length of a superseded set, is a row of its own and feeds no headline value.
             older.append(combine_hosts([{**point, "latest": False}], [host]))
             continue
         group = groups.setdefault(key, {})
@@ -452,7 +478,7 @@ def aggregate_hosts(host_points):
     return [combine_hosts(list(group.values()), list(group)) for group in groups.values()] + older
 
 
-def hardware_classes(hosts, kernels):
+def hardware_classes(hosts, kernels, declared):
     """One entry per GPU model (`device_class`): its hosts, its aggregated points, the exclusions of every host and
     its kernel receipts. A receipt records its device but not its host, so receipts belong to the device. A device
     with no end-to-end point is not a page entry."""
@@ -475,7 +501,7 @@ def hardware_classes(hosts, kernels):
             cls["hosts"].append(host)
             host_points += [(label, cell["scenario"], point) for cell in entry["cells"] for point in cell_points(cell)]
             cls["excluded"] += [{**item, "host": label} for item in entry["excluded"]]
-        cls["points"] = aggregate_hosts(host_points)
+        cls["points"] = aggregate_hosts(host_points, declared)
         cls["points"].sort(key=lambda p: (p["model"], p["series"], p["isl"], p["date"], p["set"]))
         cls["excluded"].sort(key=lambda e: (e["host"], e["set"], e["model"], e["series"]))
         cls["kernels"].sort(key=lambda k: (k["case"], k["backend"]))
@@ -489,7 +515,7 @@ def generate(results_dir=RESULTS_DIR, bank_root=bank.BANK_ROOT, known_path=None)
     return {
         "schema": SCHEMA,
         "policy": {"min_repeats": policy["min_trials"], "max_uncertainty": policy["metrics"][policy["headline_metric"]]["max_uncertainty"]},
-        "hardware": hardware_classes(hosts, collect_kernels(Path(bank_root))),
+        "hardware": hardware_classes(hosts, collect_kernels(Path(bank_root)), declared_lengths()),
     }
 
 

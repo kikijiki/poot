@@ -66,6 +66,7 @@ The operand policy is [`--matmul-precision`](../serve/configuration.md); the uni
 | Contraction operands | `narrow` by default: f16 on the matrix unit where one wins, else `exact` | `narrow` by default: f16 where one wins, bf16 otherwise | `narrow` by default: f16 where one wins, bf16 otherwise |
 | Accumulation | f32 | f32 | f32 |
 | Matrix unit | Cooperative matrix (f16), used where the cost model ranks it first | WMMA on gfx11, used where it ranks first | `wmma` on sm_80 and newer, used where it ranks first |
+| Register feasibility | The register model | The register model | The driver JIT: the planner asks whether a tiling spills ([compile feedback](./matrix-units.mdx#compile-feedback)) |
 
 ## Correctness
 

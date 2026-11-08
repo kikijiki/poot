@@ -12299,6 +12299,13 @@
      "set": "2026-10-26-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-153650"
     },
     {
+     "host": "AMD EPYC 9555 64-Core Processor",
+     "model": "qwen3-0.6b",
+     "reason": "noise band 75.1% of the median exceeds 10%",
+     "series": "candle (CUDA)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116"
+    },
+    {
      "host": "AMD EPYC 9575F 64-Core Processor",
      "model": "qwen3-0.6b",
      "reason": "a repeat has status 'error'",
@@ -12445,6 +12452,54 @@
       "n": 9
      },
      "storage": "f32"
+    },
+    {
+     "backend": "ptx",
+     "case": "expert-prefill-packed-iq2xs-up-narrow",
+     "dimensions": {
+      "experts": 512,
+      "k": 2560,
+      "n": 640,
+      "order": "routed",
+      "tokens": 128,
+      "top_k": 10
+     },
+     "driver": "595.91.07",
+     "live_context": "n/a",
+     "receipt": "benchmarks/performance-bank/receipts/ptx/expert-prefill-packed-iq2xs-up-narrow.json",
+     "regime": "The same packed IQ2_XS routed projection with narrow operands (the matrix unit)",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 1822.441,
+      "median": 1812.932,
+      "min": 1807.341,
+      "n": 9
+     },
+     "storage": "iq2_xs"
+    },
+    {
+     "backend": "ptx",
+     "case": "expert-prefill-qwen3moe-up-narrow",
+     "dimensions": {
+      "experts": 128,
+      "k": 2048,
+      "n": 768,
+      "order": "routed",
+      "tokens": 512,
+      "top_k": 8
+     },
+     "driver": "595.91.07",
+     "live_context": "n/a",
+     "receipt": "benchmarks/performance-bank/receipts/ptx/expert-prefill-qwen3moe-up-narrow.json",
+     "regime": "MoE prefill routed expert projection at Qwen3-MoE dimensions (512 tokens, each to 8 of 128 experts) over a checkpoint-order bf16 expert stack, narrow operands",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 17293.425,
+      "median": 11559.62,
+      "min": 11475.172,
+      "n": 9
+     },
+     "storage": "bf16"
     },
     {
      "backend": "ptx",
@@ -13011,18 +13066,157 @@
     },
     {
      "backend": "cuda",
-     "band": 0.002,
+     "band": 0.001,
      "cells": {
       "unverified": 0,
-      "verified": 2
+      "verified": 1
      },
      "date": "2026-11-06",
      "framework": "llamacpp",
      "host_labels": [
-      "AMD EPYC 9355 32-Core Processor",
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 128,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 611.487,
+       "median": 611.156,
+       "min": 608.664,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 6735.767,
+       "median": 6697.945,
+       "min": 6665.806,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 1.643,
+       "median": 1.636,
+       "min": 1.635,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 19.202,
+       "median": 19.11,
+       "min": 19.003,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "f16",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-125828",
+     "spread": {
+      "decode_tok_s": {
+       "max": 611.156,
+       "min": 611.156
+      },
+      "prefill_tok_s": {
+       "max": 6697.945,
+       "min": 6697.945
+      },
+      "tpot_ms": {
+       "max": 1.636,
+       "min": 1.636
+      },
+      "ttft_ms": {
+       "max": 19.11,
+       "min": 19.11
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.002,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-06",
+     "framework": "llamacpp",
+     "host_labels": [
       "AMD EPYC 9555 64-Core Processor"
      ],
-     "hosts": 2,
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 128,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 593.709,
+       "median": 593.377,
+       "min": 592.142,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 6755.381,
+       "median": 6637.775,
+       "min": 6599.835,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 1.689,
+       "median": 1.685,
+       "min": 1.684,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 19.394,
+       "median": 19.284,
+       "min": 18.948,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "f16",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "spread": {
+      "decode_tok_s": {
+       "max": 593.377,
+       "min": 593.377
+      },
+      "prefill_tok_s": {
+       "max": 6637.775,
+       "min": 6637.775
+      },
+      "tpot_ms": {
+       "max": 1.685,
+       "min": 1.685
+      },
+      "ttft_ms": {
+       "max": 19.284,
+       "min": 19.284
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.02,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9555 64-Core Processor"
+     ],
+     "hosts": 1,
      "identity": {
       "framework_version": "b29c606"
      },
@@ -13031,51 +13225,51 @@
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
-       "max": 611.487,
-       "median": 602.266,
-       "min": 592.142,
-       "n": 10
+       "max": 608.061,
+       "median": 595.635,
+       "min": 593.981,
+       "n": 5
       },
       "prefill_tok_s": {
-       "max": 6755.381,
-       "median": 6667.86,
-       "min": 6599.835,
-       "n": 10
+       "max": 6773.444,
+       "median": 6715.206,
+       "min": 6699.56,
+       "n": 5
       },
       "tpot_ms": {
-       "max": 1.689,
-       "median": 1.66,
-       "min": 1.635,
-       "n": 10
+       "max": 1.684,
+       "median": 1.679,
+       "min": 1.645,
+       "n": 5
       },
       "ttft_ms": {
-       "max": 19.394,
-       "median": 19.197,
-       "min": 18.948,
-       "n": 10
+       "max": 19.106,
+       "median": 19.061,
+       "min": 18.897,
+       "n": 5
       }
      },
      "model": "qwen3-0.6b",
      "precision": "f16",
-     "repeats": 10,
+     "repeats": 5,
      "series": "llama.cpp (CUDA)",
-     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-125828, 2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-182912",
      "spread": {
       "decode_tok_s": {
-       "max": 611.156,
-       "min": 593.377
+       "max": 595.635,
+       "min": 595.635
       },
       "prefill_tok_s": {
-       "max": 6697.945,
-       "min": 6637.775
+       "max": 6715.206,
+       "min": 6715.206
       },
       "tpot_ms": {
-       "max": 1.685,
-       "min": 1.636
+       "max": 1.679,
+       "min": 1.679
       },
       "ttft_ms": {
-       "max": 19.284,
-       "min": 19.11
+       "max": 19.061,
+       "min": 19.061
       }
      },
      "verified": true
@@ -13292,18 +13486,157 @@
     },
     {
      "backend": "cuda",
-     "band": 0.002,
+     "band": 0.001,
      "cells": {
       "unverified": 0,
-      "verified": 2
+      "verified": 1
      },
      "date": "2026-11-06",
      "framework": "llamacpp",
      "host_labels": [
-      "AMD EPYC 9355 32-Core Processor",
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 2048,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 550.283,
+       "median": 550.015,
+       "min": 547.1,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 23208.192,
+       "median": 23202.141,
+       "min": 23161.25,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 1.828,
+       "median": 1.818,
+       "min": 1.817,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 88.424,
+       "median": 88.268,
+       "min": 88.245,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "f16",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-125828",
+     "spread": {
+      "decode_tok_s": {
+       "max": 550.015,
+       "min": 550.015
+      },
+      "prefill_tok_s": {
+       "max": 23202.141,
+       "min": 23202.141
+      },
+      "tpot_ms": {
+       "max": 1.818,
+       "min": 1.818
+      },
+      "ttft_ms": {
+       "max": 88.268,
+       "min": 88.268
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.002,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-06",
+     "framework": "llamacpp",
+     "host_labels": [
       "AMD EPYC 9555 64-Core Processor"
      ],
-     "hosts": 2,
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 2048,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 538.529,
+       "median": 537.642,
+       "min": 537.442,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 22683.73,
+       "median": 22675.895,
+       "min": 22493.458,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 1.861,
+       "median": 1.86,
+       "min": 1.857,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 91.049,
+       "median": 90.316,
+       "min": 90.285,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "f16",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "spread": {
+      "decode_tok_s": {
+       "max": 537.642,
+       "min": 537.642
+      },
+      "prefill_tok_s": {
+       "max": 22675.895,
+       "min": 22675.895
+      },
+      "tpot_ms": {
+       "max": 1.86,
+       "min": 1.86
+      },
+      "ttft_ms": {
+       "max": 90.316,
+       "min": 90.316
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.02,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9555 64-Core Processor"
+     ],
+     "hosts": 1,
      "identity": {
       "framework_version": "b29c606"
      },
@@ -13312,51 +13645,51 @@
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
-       "max": 550.283,
-       "median": 543.829,
-       "min": 537.442,
-       "n": 10
+       "max": 544.037,
+       "median": 539.086,
+       "min": 536.309,
+       "n": 5
       },
       "prefill_tok_s": {
-       "max": 23208.192,
-       "median": 22939.018,
-       "min": 22493.458,
-       "n": 10
+       "max": 23158.672,
+       "median": 23114.211,
+       "min": 22654.162,
+       "n": 5
       },
       "tpot_ms": {
-       "max": 1.861,
-       "median": 1.839,
-       "min": 1.817,
-       "n": 10
+       "max": 1.865,
+       "median": 1.855,
+       "min": 1.838,
+       "n": 5
       },
       "ttft_ms": {
-       "max": 91.049,
-       "median": 89.292,
-       "min": 88.245,
-       "n": 10
+       "max": 90.403,
+       "median": 88.603,
+       "min": 88.433,
+       "n": 5
       }
      },
      "model": "qwen3-0.6b",
      "precision": "f16",
-     "repeats": 10,
+     "repeats": 5,
      "series": "llama.cpp (CUDA)",
-     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-125828, 2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-182912",
      "spread": {
       "decode_tok_s": {
-       "max": 550.015,
-       "min": 537.642
+       "max": 539.086,
+       "min": 539.086
       },
       "prefill_tok_s": {
-       "max": 23202.141,
-       "min": 22675.895
+       "max": 23114.211,
+       "min": 23114.211
       },
       "tpot_ms": {
-       "max": 1.86,
-       "min": 1.818
+       "max": 1.855,
+       "min": 1.855
       },
       "ttft_ms": {
-       "max": 90.316,
-       "min": 88.268
+       "max": 88.603,
+       "min": 88.603
       }
      },
      "verified": true
@@ -13666,111 +13999,110 @@
     },
     {
      "backend": "cuda",
-     "band": 0.002,
+     "band": 0.001,
      "cells": {
       "unverified": 0,
-      "verified": 2
+      "verified": 1
      },
      "date": "2026-11-06",
      "framework": "llamacpp",
      "host_labels": [
-      "AMD EPYC 9355 32-Core Processor",
-      "AMD EPYC 9555 64-Core Processor"
+      "AMD EPYC 9355 32-Core Processor"
      ],
-     "hosts": 2,
+     "hosts": 1,
      "identity": {
       "framework_version": "b29c606"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
        "max": 428.238,
-       "median": 423.954,
-       "min": 419.726,
-       "n": 10
+       "median": 427.67,
+       "min": 425.434,
+       "n": 5
       },
       "energy_j": {
-       "max": 3933.345,
-       "median": 2341.612,
+       "max": 3327.648,
+       "median": 2168.927,
        "min": 2157.078,
-       "n": 10
+       "n": 5
       },
       "kv_bytes": {
        "max": 968884224,
-       "median": 968884224.0,
+       "median": 968884224,
        "min": 968884224,
-       "n": 10
+       "n": 5
       },
       "load_rss_bytes": {
-       "max": 1732952064,
-       "median": 843507712.0,
+       "max": 727019520,
+       "median": 726835200,
        "min": 726753280,
-       "n": 10
+       "n": 5
       },
       "load_vram_bytes": {
-       "max": 3257073664,
-       "median": 3227713536.0,
+       "max": 3227713536,
+       "median": 3227713536,
        "min": 3227713536,
-       "n": 10
+       "n": 5
       },
       "peak_rss_bytes": {
-       "max": 1674883072,
-       "median": 1674604544.0,
+       "max": 1674866688,
+       "median": 1674723328,
        "min": 1608888320,
-       "n": 10
+       "n": 5
       },
       "peak_vram_bytes": {
        "max": 3257073664,
-       "median": 3257073664.0,
+       "median": 3257073664,
        "min": 3257073664,
-       "n": 10
+       "n": 5
       },
       "prefill_tok_s": {
        "max": 22130.333,
-       "median": 21866.77,
-       "min": 21487.212,
-       "n": 10
+       "median": 22126.712,
+       "min": 22099.181,
+       "n": 5
       },
       "tpot_ms": {
-       "max": 2.383,
-       "median": 2.359,
+       "max": 2.351,
+       "median": 2.338,
        "min": 2.335,
-       "n": 10
+       "n": 5
       },
       "ttft_ms": {
-       "max": 381.25,
-       "median": 374.685,
+       "max": 370.692,
+       "median": 370.231,
        "min": 370.171,
-       "n": 10
+       "n": 5
       },
       "weights_bytes": {
        "max": 1192230912,
-       "median": 1192230912.0,
+       "median": 1192230912,
        "min": 1192230912,
-       "n": 10
+       "n": 5
       },
       "workspace_bytes": {
        "max": 313262080,
-       "median": 313262080.0,
+       "median": 313262080,
        "min": 313262080,
-       "n": 10
+       "n": 5
       }
      },
      "model": "qwen3-0.6b",
      "over_sweep": true,
      "precision": "f16",
-     "repeats": 10,
+     "repeats": 5,
      "series": "llama.cpp (CUDA)",
-     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-125828, 2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-125828",
      "spread": {
       "decode_tok_s": {
        "max": 427.67,
-       "min": 420.238
+       "min": 427.67
       },
       "energy_j": {
-       "max": 2514.297,
+       "max": 2168.927,
        "min": 2168.927
       },
       "kv_bytes": {
@@ -13778,7 +14110,7 @@
        "min": 968884224
       },
       "load_rss_bytes": {
-       "max": 960180224,
+       "max": 726835200,
        "min": 726835200
       },
       "load_vram_bytes": {
@@ -13787,7 +14119,7 @@
       },
       "peak_rss_bytes": {
        "max": 1674723328,
-       "min": 1674485760
+       "min": 1674723328
       },
       "peak_vram_bytes": {
        "max": 3257073664,
@@ -13795,15 +14127,317 @@
       },
       "prefill_tok_s": {
        "max": 22126.712,
+       "min": 22126.712
+      },
+      "tpot_ms": {
+       "max": 2.338,
+       "min": 2.338
+      },
+      "ttft_ms": {
+       "max": 370.231,
+       "min": 370.231
+      },
+      "weights_bytes": {
+       "max": 1192230912,
+       "min": 1192230912
+      },
+      "workspace_bytes": {
+       "max": 313262080,
+       "min": 313262080
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.002,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-06",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9555 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 8192,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 420.786,
+       "median": 420.238,
+       "min": 419.726,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 3933.345,
+       "median": 2514.297,
+       "min": 2491.792,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 968884224,
+       "median": 968884224,
+       "min": 968884224,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 1732952064,
+       "median": 960180224,
+       "min": 726970368,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 3257073664,
+       "median": 3227713536,
+       "min": 3227713536,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 1674883072,
+       "median": 1674485760,
+       "min": 1674297344,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 3257073664,
+       "median": 3257073664,
+       "min": 3257073664,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 21738.568,
+       "median": 21606.828,
+       "min": 21487.212,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 2.383,
+       "median": 2.38,
+       "min": 2.377,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 381.25,
+       "median": 379.139,
+       "min": 376.842,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 1192230912,
+       "median": 1192230912,
+       "min": 1192230912,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 313262080,
+       "median": 313262080,
+       "min": 313262080,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "over_sweep": true,
+     "precision": "f16",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "spread": {
+      "decode_tok_s": {
+       "max": 420.238,
+       "min": 420.238
+      },
+      "energy_j": {
+       "max": 2514.297,
+       "min": 2514.297
+      },
+      "kv_bytes": {
+       "max": 968884224,
+       "min": 968884224
+      },
+      "load_rss_bytes": {
+       "max": 960180224,
+       "min": 960180224
+      },
+      "load_vram_bytes": {
+       "max": 3227713536,
+       "min": 3227713536
+      },
+      "peak_rss_bytes": {
+       "max": 1674485760,
+       "min": 1674485760
+      },
+      "peak_vram_bytes": {
+       "max": 3257073664,
+       "min": 3257073664
+      },
+      "prefill_tok_s": {
+       "max": 21606.828,
        "min": 21606.828
       },
       "tpot_ms": {
        "max": 2.38,
-       "min": 2.338
+       "min": 2.38
       },
       "ttft_ms": {
        "max": 379.139,
-       "min": 370.231
+       "min": 379.139
+      },
+      "weights_bytes": {
+       "max": 1192230912,
+       "min": 1192230912
+      },
+      "workspace_bytes": {
+       "max": 313262080,
+       "min": 313262080
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.02,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9555 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 425.409,
+       "median": 423.357,
+       "min": 422.654,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 4056.134,
+       "median": 2565.33,
+       "min": 2485.585,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 968884224,
+       "median": 968884224,
+       "min": 968884224,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 1835839488,
+       "median": 962437120,
+       "min": 732569600,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 3257073664,
+       "median": 2552430592,
+       "min": 2552430592,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 1674481664,
+       "median": 1674137600,
+       "min": 1673945088,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 3257073664,
+       "median": 3257073664,
+       "min": 3257073664,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 21971.428,
+       "median": 21819.275,
+       "min": 21678.912,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 2.366,
+       "median": 2.362,
+       "min": 2.351,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 377.879,
+       "median": 375.448,
+       "min": 372.848,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 1192230912,
+       "median": 1192230912,
+       "min": 1192230912,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 313262080,
+       "median": 313262080,
+       "min": 313262080,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "over_sweep": true,
+     "precision": "f16",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-182912",
+     "spread": {
+      "decode_tok_s": {
+       "max": 423.357,
+       "min": 423.357
+      },
+      "energy_j": {
+       "max": 2565.33,
+       "min": 2565.33
+      },
+      "kv_bytes": {
+       "max": 968884224,
+       "min": 968884224
+      },
+      "load_rss_bytes": {
+       "max": 962437120,
+       "min": 962437120
+      },
+      "load_vram_bytes": {
+       "max": 2552430592,
+       "min": 2552430592
+      },
+      "peak_rss_bytes": {
+       "max": 1674137600,
+       "min": 1674137600
+      },
+      "peak_vram_bytes": {
+       "max": 3257073664,
+       "min": 3257073664
+      },
+      "prefill_tok_s": {
+       "max": 21819.275,
+       "min": 21819.275
+      },
+      "tpot_ms": {
+       "max": 2.362,
+       "min": 2.362
+      },
+      "ttft_ms": {
+       "max": 375.448,
+       "min": 375.448
       },
       "weights_bytes": {
        "max": 1192230912,
@@ -14043,20 +14677,170 @@
     },
     {
      "backend": "ptx",
-     "band": 0.005,
+     "band": 0.006,
      "cells": {
       "unverified": 0,
-      "verified": 2
+      "verified": 1
      },
      "date": "2026-11-06",
      "framework": "poot",
      "host_labels": [
-      "AMD EPYC 9355 32-Core Processor",
-      "AMD EPYC 9555 64-Core Processor"
+      "AMD EPYC 9355 32-Core Processor"
      ],
-     "hosts": 2,
+     "hosts": 1,
      "identity": {
       "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "c86384697cfaefcd651473bcfab25899f0a88d55",
+      "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 128,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 287.552,
+       "median": 286.807,
+       "min": 286.338,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 18614.099,
+       "median": 18566.644,
+       "min": 18167.612,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 3.492,
+       "median": 3.487,
+       "min": 3.478,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 7.046,
+       "median": 6.894,
+       "min": 6.877,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-125828",
+     "spread": {
+      "decode_tok_s": {
+       "max": 286.807,
+       "min": 286.807
+      },
+      "prefill_tok_s": {
+       "max": 18566.644,
+       "min": 18566.644
+      },
+      "tpot_ms": {
+       "max": 3.487,
+       "min": 3.487
+      },
+      "ttft_ms": {
+       "max": 6.894,
+       "min": 6.894
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.005,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-06",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9555 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "c35faf9dd95f604a46d382a527c832e4f5234ad3",
+      "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 128,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 289.927,
+       "median": 289.812,
+       "min": 289.312,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 18703.008,
+       "median": 18638.287,
+       "min": 18573.902,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 3.456,
+       "median": 3.451,
+       "min": 3.449,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 6.891,
+       "median": 6.868,
+       "min": 6.844,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "spread": {
+      "decode_tok_s": {
+       "max": 289.812,
+       "min": 289.812
+      },
+      "prefill_tok_s": {
+       "max": 18638.287,
+       "min": 18638.287
+      },
+      "tpot_ms": {
+       "max": 3.451,
+       "min": 3.451
+      },
+      "ttft_ms": {
+       "max": 6.868,
+       "min": 6.868
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.016,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9555 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "c0db83e1f8768fd1198f7cb902f67f9c2893e872",
       "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
       "compute_dtype": "f32",
       "driver_version": "cuda 13.2",
@@ -14067,51 +14851,51 @@
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
-       "max": 289.927,
-       "median": 288.31,
-       "min": 286.338,
-       "n": 10
+       "max": 288.866,
+       "median": 287.508,
+       "min": 286.984,
+       "n": 5
       },
       "prefill_tok_s": {
-       "max": 18703.008,
-       "median": 18602.465,
-       "min": 18167.612,
-       "n": 10
+       "max": 18580.696,
+       "median": 18418.374,
+       "min": 18034.941,
+       "n": 5
       },
       "tpot_ms": {
-       "max": 3.492,
-       "median": 3.469,
-       "min": 3.449,
-       "n": 10
+       "max": 3.485,
+       "median": 3.478,
+       "min": 3.462,
+       "n": 5
       },
       "ttft_ms": {
-       "max": 7.046,
-       "median": 6.881,
-       "min": 6.844,
-       "n": 10
+       "max": 7.097,
+       "median": 6.95,
+       "min": 6.889,
+       "n": 5
       }
      },
      "model": "qwen3-0.6b",
      "precision": "bf16",
-     "repeats": 10,
+     "repeats": 5,
      "series": "poot (PTX)",
-     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-125828, 2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-182912",
      "spread": {
       "decode_tok_s": {
-       "max": 289.812,
-       "min": 286.807
+       "max": 287.508,
+       "min": 287.508
       },
       "prefill_tok_s": {
-       "max": 18638.287,
-       "min": 18566.644
+       "max": 18418.374,
+       "min": 18418.374
       },
       "tpot_ms": {
-       "max": 3.487,
-       "min": 3.451
+       "max": 3.478,
+       "min": 3.478
       },
       "ttft_ms": {
-       "max": 6.894,
-       "min": 6.868
+       "max": 6.95,
+       "min": 6.95
       }
      },
      "verified": true
@@ -14343,20 +15127,170 @@
     },
     {
      "backend": "ptx",
-     "band": 0.005,
+     "band": 0.006,
      "cells": {
       "unverified": 0,
-      "verified": 2
+      "verified": 1
      },
      "date": "2026-11-06",
      "framework": "poot",
      "host_labels": [
-      "AMD EPYC 9355 32-Core Processor",
-      "AMD EPYC 9555 64-Core Processor"
+      "AMD EPYC 9355 32-Core Processor"
      ],
-     "hosts": 2,
+     "hosts": 1,
      "identity": {
       "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "c86384697cfaefcd651473bcfab25899f0a88d55",
+      "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 2048,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 174.695,
+       "median": 174.046,
+       "min": 173.769,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 47024.226,
+       "median": 46928.844,
+       "min": 46573.471,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 5.755,
+       "median": 5.746,
+       "min": 5.724,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 43.974,
+       "median": 43.641,
+       "min": 43.552,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-125828",
+     "spread": {
+      "decode_tok_s": {
+       "max": 174.046,
+       "min": 174.046
+      },
+      "prefill_tok_s": {
+       "max": 46928.844,
+       "min": 46928.844
+      },
+      "tpot_ms": {
+       "max": 5.746,
+       "min": 5.746
+      },
+      "ttft_ms": {
+       "max": 43.641,
+       "min": 43.641
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.005,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-06",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9555 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "c35faf9dd95f604a46d382a527c832e4f5234ad3",
+      "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 2048,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 176.529,
+       "median": 176.406,
+       "min": 176.274,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 46906.69,
+       "median": 46424.281,
+       "min": 46076.257,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 5.673,
+       "median": 5.669,
+       "min": 5.665,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 44.448,
+       "median": 44.115,
+       "min": 43.661,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "spread": {
+      "decode_tok_s": {
+       "max": 176.406,
+       "min": 176.406
+      },
+      "prefill_tok_s": {
+       "max": 46424.281,
+       "min": 46424.281
+      },
+      "tpot_ms": {
+       "max": 5.669,
+       "min": 5.669
+      },
+      "ttft_ms": {
+       "max": 44.115,
+       "min": 44.115
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.016,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9555 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "c0db83e1f8768fd1198f7cb902f67f9c2893e872",
       "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
       "compute_dtype": "f32",
       "driver_version": "cuda 13.2",
@@ -14367,51 +15301,51 @@
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
-       "max": 176.529,
-       "median": 175.226,
-       "min": 173.769,
-       "n": 10
+       "max": 176.005,
+       "median": 175.961,
+       "min": 175.537,
+       "n": 5
       },
       "prefill_tok_s": {
-       "max": 47024.226,
-       "median": 46676.562,
-       "min": 46076.257,
-       "n": 10
+       "max": 46682.488,
+       "median": 46468.777,
+       "min": 44681.743,
+       "n": 5
       },
       "tpot_ms": {
-       "max": 5.755,
-       "median": 5.707,
-       "min": 5.665,
-       "n": 10
+       "max": 5.697,
+       "median": 5.683,
+       "min": 5.682,
+       "n": 5
       },
       "ttft_ms": {
-       "max": 44.448,
-       "median": 43.878,
-       "min": 43.552,
-       "n": 10
+       "max": 45.835,
+       "median": 44.073,
+       "min": 43.871,
+       "n": 5
       }
      },
      "model": "qwen3-0.6b",
      "precision": "bf16",
-     "repeats": 10,
+     "repeats": 5,
      "series": "poot (PTX)",
-     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-125828, 2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-182912",
      "spread": {
       "decode_tok_s": {
-       "max": 176.406,
-       "min": 174.046
+       "max": 175.961,
+       "min": 175.961
       },
       "prefill_tok_s": {
-       "max": 46928.844,
-       "min": 46424.281
+       "max": 46468.777,
+       "min": 46468.777
       },
       "tpot_ms": {
-       "max": 5.746,
-       "min": 5.669
+       "max": 5.683,
+       "min": 5.683
       },
       "ttft_ms": {
-       "max": 44.115,
-       "min": 43.641
+       "max": 44.073,
+       "min": 44.073
       }
      },
      "verified": true
@@ -14796,20 +15730,392 @@
     },
     {
      "backend": "ptx",
-     "band": 0.005,
+     "band": 0.006,
      "cells": {
       "unverified": 0,
-      "verified": 2
+      "verified": 1
      },
      "date": "2026-11-06",
      "framework": "poot",
      "host_labels": [
-      "AMD EPYC 9355 32-Core Processor",
-      "AMD EPYC 9555 64-Core Processor"
+      "AMD EPYC 9355 32-Core Processor"
      ],
-     "hosts": 2,
+     "hosts": 1,
      "identity": {
       "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "c86384697cfaefcd651473bcfab25899f0a88d55",
+      "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 8192,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 171.308,
+       "median": 170.828,
+       "min": 170.721,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 2571.579,
+       "median": 2455.583,
+       "min": 2427.993,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 954204160,
+       "median": 954204160,
+       "min": 954204160,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 696291328,
+       "median": 695996416,
+       "min": 629796864,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 3345154048,
+       "median": 3332571136,
+       "min": 3330473984,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 658763776,
+       "median": 635953152,
+       "min": 630722560,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 3940089856,
+       "median": 3353542656,
+       "min": 3353542656,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 26699.06,
+       "median": 26667.207,
+       "min": 26606.872,
+       "n": 5
+      },
+      "rss_anon_bytes": {
+       "max": 270102528,
+       "median": 268591104,
+       "min": 263327744,
+       "n": 5
+      },
+      "rss_file_bytes": {
+       "max": 111837184,
+       "median": 90570752,
+       "min": 90370048,
+       "n": 5
+      },
+      "staging_bytes": {
+       "max": 0,
+       "median": 0,
+       "min": 0,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 5.857,
+       "median": 5.854,
+       "min": 5.837,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 307.89,
+       "median": 307.194,
+       "min": 306.827,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 1192099840,
+       "median": 1192099840,
+       "min": 1192099840,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 491467464,
+       "median": 491467464,
+       "min": 491467464,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "over_sweep": true,
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-125828",
+     "spread": {
+      "decode_tok_s": {
+       "max": 170.828,
+       "min": 170.828
+      },
+      "energy_j": {
+       "max": 2455.583,
+       "min": 2455.583
+      },
+      "kv_bytes": {
+       "max": 954204160,
+       "min": 954204160
+      },
+      "load_rss_bytes": {
+       "max": 695996416,
+       "min": 695996416
+      },
+      "load_vram_bytes": {
+       "max": 3332571136,
+       "min": 3332571136
+      },
+      "peak_rss_bytes": {
+       "max": 635953152,
+       "min": 635953152
+      },
+      "peak_vram_bytes": {
+       "max": 3353542656,
+       "min": 3353542656
+      },
+      "prefill_tok_s": {
+       "max": 26667.207,
+       "min": 26667.207
+      },
+      "rss_anon_bytes": {
+       "max": 268591104,
+       "min": 268591104
+      },
+      "rss_file_bytes": {
+       "max": 90570752,
+       "min": 90570752
+      },
+      "staging_bytes": {
+       "max": 0,
+       "min": 0
+      },
+      "tpot_ms": {
+       "max": 5.854,
+       "min": 5.854
+      },
+      "ttft_ms": {
+       "max": 307.194,
+       "min": 307.194
+      },
+      "weights_bytes": {
+       "max": 1192099840,
+       "min": 1192099840
+      },
+      "workspace_bytes": {
+       "max": 491467464,
+       "min": 491467464
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.005,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-06",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9555 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "c35faf9dd95f604a46d382a527c832e4f5234ad3",
+      "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 8192,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 172.931,
+       "median": 172.765,
+       "min": 172.178,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 3056.628,
+       "median": 2717.411,
+       "min": 2612.438,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 954204160,
+       "median": 954204160,
+       "min": 954204160,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 680341504,
+       "median": 634093568,
+       "min": 616501248,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 3345154048,
+       "median": 3345154048,
+       "min": 3330473984,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 639496192,
+       "median": 618209280,
+       "min": 616275968,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 3353542656,
+       "median": 3353542656,
+       "min": 3353542656,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 26761.983,
+       "median": 26605.158,
+       "min": 26162.936,
+       "n": 5
+      },
+      "rss_anon_bytes": {
+       "max": 252583936,
+       "median": 250634240,
+       "min": 248774656,
+       "n": 5
+      },
+      "rss_file_bytes": {
+       "max": 112041984,
+       "median": 90693632,
+       "min": 90669056,
+       "n": 5
+      },
+      "staging_bytes": {
+       "max": 0,
+       "median": 0,
+       "min": 0,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 5.808,
+       "median": 5.788,
+       "min": 5.783,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 313.115,
+       "median": 307.91,
+       "min": 306.106,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 1192099840,
+       "median": 1192099840,
+       "min": 1192099840,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 491467464,
+       "median": 491467464,
+       "min": 491467464,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "over_sweep": true,
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "spread": {
+      "decode_tok_s": {
+       "max": 172.765,
+       "min": 172.765
+      },
+      "energy_j": {
+       "max": 2717.411,
+       "min": 2717.411
+      },
+      "kv_bytes": {
+       "max": 954204160,
+       "min": 954204160
+      },
+      "load_rss_bytes": {
+       "max": 634093568,
+       "min": 634093568
+      },
+      "load_vram_bytes": {
+       "max": 3345154048,
+       "min": 3345154048
+      },
+      "peak_rss_bytes": {
+       "max": 618209280,
+       "min": 618209280
+      },
+      "peak_vram_bytes": {
+       "max": 3353542656,
+       "min": 3353542656
+      },
+      "prefill_tok_s": {
+       "max": 26605.158,
+       "min": 26605.158
+      },
+      "rss_anon_bytes": {
+       "max": 250634240,
+       "min": 250634240
+      },
+      "rss_file_bytes": {
+       "max": 90693632,
+       "min": 90693632
+      },
+      "staging_bytes": {
+       "max": 0,
+       "min": 0
+      },
+      "tpot_ms": {
+       "max": 5.788,
+       "min": 5.788
+      },
+      "ttft_ms": {
+       "max": 307.91,
+       "min": 307.91
+      },
+      "weights_bytes": {
+       "max": 1192099840,
+       "min": 1192099840
+      },
+      "workspace_bytes": {
+       "max": 491467464,
+       "min": 491467464
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.016,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9555 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "c0db83e1f8768fd1198f7cb902f67f9c2893e872",
       "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
       "compute_dtype": "f32",
       "driver_version": "cuda 13.2",
@@ -14820,154 +16126,154 @@
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
-       "max": 172.931,
-       "median": 171.796,
-       "min": 170.721,
-       "n": 10
+       "max": 172.638,
+       "median": 172.456,
+       "min": 172.321,
+       "n": 5
       },
       "energy_j": {
-       "max": 3056.628,
-       "median": 2586.497,
-       "min": 2427.993,
-       "n": 10
+       "max": 2907.642,
+       "median": 2678.69,
+       "min": 2594.415,
+       "n": 5
       },
       "kv_bytes": {
        "max": 954204160,
-       "median": 954204160.0,
+       "median": 954204160,
        "min": 954204160,
-       "n": 10
+       "n": 5
       },
       "load_rss_bytes": {
-       "max": 696291328,
-       "median": 665044992.0,
-       "min": 616501248,
-       "n": 10
+       "max": 680243200,
+       "median": 679780352,
+       "min": 613552128,
+       "n": 5
       },
       "load_vram_bytes": {
        "max": 3345154048,
-       "median": 3338862592.0,
+       "median": 3345154048,
        "min": 3330473984,
-       "n": 10
+       "n": 5
       },
       "peak_rss_bytes": {
-       "max": 658763776,
-       "median": 627081216.0,
-       "min": 616275968,
-       "n": 10
+       "max": 639373312,
+       "median": 616296448,
+       "min": 614334464,
+       "n": 5
       },
       "peak_vram_bytes": {
-       "max": 3940089856,
-       "median": 3353542656.0,
+       "max": 3353542656,
+       "median": 3353542656,
        "min": 3353542656,
-       "n": 10
+       "n": 5
       },
       "prefill_tok_s": {
-       "max": 26761.983,
-       "median": 26636.182,
-       "min": 26162.936,
-       "n": 10
+       "max": 26756.594,
+       "median": 26688.143,
+       "min": 26103.079,
+       "n": 5
       },
       "rss_anon_bytes": {
-       "max": 270102528,
-       "median": 259612672.0,
-       "min": 248774656,
-       "n": 10
+       "max": 250494976,
+       "median": 248946688,
+       "min": 246902784,
+       "n": 5
       },
       "rss_file_bytes": {
-       "max": 112041984,
-       "median": 90632192.0,
-       "min": 90370048,
-       "n": 10
+       "max": 112054272,
+       "median": 90746880,
+       "min": 90525696,
+       "n": 5
       },
       "staging_bytes": {
        "max": 0,
-       "median": 0.0,
+       "median": 0,
        "min": 0,
-       "n": 10
+       "n": 5
       },
       "tpot_ms": {
-       "max": 5.857,
-       "median": 5.821,
-       "min": 5.783,
-       "n": 10
+       "max": 5.803,
+       "median": 5.799,
+       "min": 5.792,
+       "n": 5
       },
       "ttft_ms": {
-       "max": 313.115,
-       "median": 307.552,
-       "min": 306.106,
-       "n": 10
+       "max": 313.833,
+       "median": 306.953,
+       "min": 306.168,
+       "n": 5
       },
       "weights_bytes": {
        "max": 1192099840,
-       "median": 1192099840.0,
+       "median": 1192099840,
        "min": 1192099840,
-       "n": 10
+       "n": 5
       },
       "workspace_bytes": {
        "max": 491467464,
-       "median": 491467464.0,
+       "median": 491467464,
        "min": 491467464,
-       "n": 10
+       "n": 5
       }
      },
      "model": "qwen3-0.6b",
      "over_sweep": true,
      "precision": "bf16",
-     "repeats": 10,
+     "repeats": 5,
      "series": "poot (PTX)",
-     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-125828, 2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-182912",
      "spread": {
       "decode_tok_s": {
-       "max": 172.765,
-       "min": 170.828
+       "max": 172.456,
+       "min": 172.456
       },
       "energy_j": {
-       "max": 2717.411,
-       "min": 2455.583
+       "max": 2678.69,
+       "min": 2678.69
       },
       "kv_bytes": {
        "max": 954204160,
        "min": 954204160
       },
       "load_rss_bytes": {
-       "max": 695996416,
-       "min": 634093568
+       "max": 679780352,
+       "min": 679780352
       },
       "load_vram_bytes": {
        "max": 3345154048,
-       "min": 3332571136
+       "min": 3345154048
       },
       "peak_rss_bytes": {
-       "max": 635953152,
-       "min": 618209280
+       "max": 616296448,
+       "min": 616296448
       },
       "peak_vram_bytes": {
        "max": 3353542656,
        "min": 3353542656
       },
       "prefill_tok_s": {
-       "max": 26667.207,
-       "min": 26605.158
+       "max": 26688.143,
+       "min": 26688.143
       },
       "rss_anon_bytes": {
-       "max": 268591104,
-       "min": 250634240
+       "max": 248946688,
+       "min": 248946688
       },
       "rss_file_bytes": {
-       "max": 90693632,
-       "min": 90570752
+       "max": 90746880,
+       "min": 90746880
       },
       "staging_bytes": {
        "max": 0,
        "min": 0
       },
       "tpot_ms": {
-       "max": 5.854,
-       "min": 5.788
+       "max": 5.799,
+       "min": 5.799
       },
       "ttft_ms": {
-       "max": 307.91,
-       "min": 307.194
+       "max": 306.953,
+       "min": 306.953
       },
       "weights_bytes": {
        "max": 1192099840,
@@ -15262,6 +16568,76 @@
     },
     {
      "backend": "cuda",
+     "band": 0.07,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-06",
+     "framework": "transformers",
+     "host_labels": [
+      "AMD EPYC 9555 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "5.0.0 (torch 2.14.1+cu130)"
+     },
+     "isl": 128,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 105.36,
+       "median": 105.047,
+       "min": 87.435,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 12774.953,
+       "median": 12600.094,
+       "min": 8724.166,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 11.437,
+       "median": 9.52,
+       "min": 9.491,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 14.672,
+       "median": 10.159,
+       "min": 10.02,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "transformers (CUDA)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "spread": {
+      "decode_tok_s": {
+       "max": 105.047,
+       "min": 105.047
+      },
+      "prefill_tok_s": {
+       "max": 12600.094,
+       "min": 12600.094
+      },
+      "tpot_ms": {
+       "max": 9.52,
+       "min": 9.52
+      },
+      "ttft_ms": {
+       "max": 10.159,
+       "min": 10.159
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
      "band": 0.037,
      "cells": {
       "unverified": 0,
@@ -15536,6 +16912,76 @@
       "ttft_ms": {
        "max": 19.639,
        "min": 19.639
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.07,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-06",
+     "framework": "transformers",
+     "host_labels": [
+      "AMD EPYC 9555 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "5.0.0 (torch 2.14.1+cu130)"
+     },
+     "isl": 2048,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 106.514,
+       "median": 106.353,
+       "min": 93.586,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 103913.563,
+       "median": 103772.874,
+       "min": 103294.406,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 10.685,
+       "median": 9.403,
+       "min": 9.388,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 19.827,
+       "median": 19.735,
+       "min": 19.709,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "transformers (CUDA)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "spread": {
+      "decode_tok_s": {
+       "max": 106.353,
+       "min": 106.353
+      },
+      "prefill_tok_s": {
+       "max": 103772.874,
+       "min": 103772.874
+      },
+      "tpot_ms": {
+       "max": 9.403,
+       "min": 9.403
+      },
+      "ttft_ms": {
+       "max": 19.735,
+       "min": 19.735
       }
      },
      "verified": true
@@ -15986,6 +17432,147 @@
     },
     {
      "backend": "cuda",
+     "band": 0.07,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-06",
+     "framework": "transformers",
+     "host_labels": [
+      "AMD EPYC 9555 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "5.0.0 (torch 2.14.1+cu130)"
+     },
+     "isl": 8192,
+     "latest": false,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 106.468,
+       "median": 106.29,
+       "min": 94.257,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 3293.242,
+       "median": 3105.231,
+       "min": 2990.237,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 2535968768,
+       "median": 2347319296,
+       "min": 2154311680,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 2095251456,
+       "median": 2095251456,
+       "min": 2011365376,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 1873997824,
+       "median": 1775337472,
+       "min": 1775177728,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 6289555456,
+       "median": 6289555456,
+       "min": 6289555456,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 95814.715,
+       "median": 95738.354,
+       "min": 95675.264,
+       "n": 5
+      },
+      "rss_anon_bytes": {
+       "max": 1241530368,
+       "median": 1229189120,
+       "min": 1229008896,
+       "n": 5
+      },
+      "rss_file_bytes": {
+       "max": 654815232,
+       "median": 543809536,
+       "min": 543748096,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 10.609,
+       "median": 9.408,
+       "min": 9.392,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 85.623,
+       "median": 85.567,
+       "min": 85.498,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "over_sweep": true,
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "transformers (CUDA)",
+     "set": "2026-11-06-rtx-pro-6000-blackwell-server-edition-qwen3-0-6b-142116",
+     "spread": {
+      "decode_tok_s": {
+       "max": 106.29,
+       "min": 106.29
+      },
+      "energy_j": {
+       "max": 3105.231,
+       "min": 3105.231
+      },
+      "load_rss_bytes": {
+       "max": 2347319296,
+       "min": 2347319296
+      },
+      "load_vram_bytes": {
+       "max": 2095251456,
+       "min": 2095251456
+      },
+      "peak_rss_bytes": {
+       "max": 1775337472,
+       "min": 1775337472
+      },
+      "peak_vram_bytes": {
+       "max": 6289555456,
+       "min": 6289555456
+      },
+      "prefill_tok_s": {
+       "max": 95738.354,
+       "min": 95738.354
+      },
+      "rss_anon_bytes": {
+       "max": 1229189120,
+       "min": 1229189120
+      },
+      "rss_file_bytes": {
+       "max": 543809536,
+       "min": 543809536
+      },
+      "tpot_ms": {
+       "max": 9.408,
+       "min": 9.408
+      },
+      "ttft_ms": {
+       "max": 85.567,
+       "min": 85.567
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
      "band": 0.0,
      "cells": {
       "unverified": 0,
@@ -16141,7 +17728,7 @@
       "framework_version": "0.10.2"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -16190,6 +17777,76 @@
       "ttft_ms": {
        "max": 110.034,
        "min": 110.034
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.003,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "candle",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "0.10.2"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 107.803,
+       "median": 107.733,
+       "min": 106.042,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 1002.033,
+       "median": 998.11,
+       "min": 987.673,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 9.43,
+       "median": 9.282,
+       "min": 9.276,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 129.598,
+       "median": 128.242,
+       "min": 127.74,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "candle (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 107.733,
+       "min": 107.733
+      },
+      "prefill_tok_s": {
+       "max": 998.11,
+       "min": 998.11
+      },
+      "tpot_ms": {
+       "max": 9.282,
+       "min": 9.282
+      },
+      "ttft_ms": {
+       "max": 128.242,
+       "min": 128.242
       }
      },
      "verified": true
@@ -16351,7 +18008,7 @@
       "framework_version": "0.10.2"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -16400,6 +18057,76 @@
       "ttft_ms": {
        "max": 495.141,
        "min": 495.141
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.003,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "candle",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "0.10.2"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 73.487,
+       "median": 73.461,
+       "min": 73.368,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 3881.075,
+       "median": 3867.137,
+       "min": 3864.84,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 13.63,
+       "median": 13.613,
+       "min": 13.608,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 529.906,
+       "median": 529.591,
+       "min": 527.689,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "candle (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 73.461,
+       "min": 73.461
+      },
+      "prefill_tok_s": {
+       "max": 3867.137,
+       "min": 3867.137
+      },
+      "tpot_ms": {
+       "max": 13.613,
+       "min": 13.613
+      },
+      "ttft_ms": {
+       "max": 529.591,
+       "min": 529.591
       }
      },
      "verified": true
@@ -16663,7 +18390,7 @@
       "framework_version": "0.10.2"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -16763,6 +18490,127 @@
       "ttft_ms": {
        "max": 3797.077,
        "min": 3797.077
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.003,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "candle",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "0.10.2"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 35.418,
+       "median": 35.35,
+       "min": 35.281,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 19827.541,
+       "median": 17693.266,
+       "min": 17675.438,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 8309968896,
+       "median": 4495900672,
+       "min": 2706214912,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 10313990144,
+       "median": 9340911616,
+       "min": 9240248320,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 2094325760,
+       "median": 586588160,
+       "min": 367894528,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 23248568320,
+       "median": 22863347712,
+       "min": 22729129984,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 2029.513,
+       "median": 2025.468,
+       "min": 2015.072,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 28.344,
+       "median": 28.288,
+       "min": 28.234,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 4065.364,
+       "median": 4044.497,
+       "min": 4036.437,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b",
+     "over_sweep": true,
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "candle (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 35.35,
+       "min": 35.35
+      },
+      "energy_j": {
+       "max": 17693.266,
+       "min": 17693.266
+      },
+      "load_rss_bytes": {
+       "max": 4495900672,
+       "min": 4495900672
+      },
+      "load_vram_bytes": {
+       "max": 9340911616,
+       "min": 9340911616
+      },
+      "peak_rss_bytes": {
+       "max": 586588160,
+       "min": 586588160
+      },
+      "peak_vram_bytes": {
+       "max": 22863347712,
+       "min": 22863347712
+      },
+      "prefill_tok_s": {
+       "max": 2025.468,
+       "min": 2025.468
+      },
+      "tpot_ms": {
+       "max": 28.288,
+       "min": 28.288
+      },
+      "ttft_ms": {
+       "max": 4044.497,
+       "min": 4044.497
       }
      },
      "verified": true
@@ -16924,7 +18772,7 @@
       "framework_version": "b29c606"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -16973,6 +18821,76 @@
       "ttft_ms": {
        "max": 52.348,
        "min": 52.348
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.004,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 155.795,
+       "median": 155.608,
+       "min": 155.523,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 2164.445,
+       "median": 2159.665,
+       "min": 2131.034,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 6.43,
+       "median": 6.426,
+       "min": 6.419,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 60.065,
+       "median": 59.268,
+       "min": 59.138,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b",
+     "precision": "f16",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 155.608,
+       "min": 155.608
+      },
+      "prefill_tok_s": {
+       "max": 2159.665,
+       "min": 2159.665
+      },
+      "tpot_ms": {
+       "max": 6.426,
+       "min": 6.426
+      },
+      "ttft_ms": {
+       "max": 59.268,
+       "min": 59.268
       }
      },
      "verified": true
@@ -17134,7 +19052,7 @@
       "framework_version": "b29c606"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -17183,6 +19101,76 @@
       "ttft_ms": {
        "max": 310.174,
        "min": 310.174
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.004,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 149.364,
+       "median": 148.927,
+       "min": 148.717,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 6150.047,
+       "median": 6144.105,
+       "min": 6137.75,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 6.724,
+       "median": 6.715,
+       "min": 6.695,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 333.673,
+       "median": 333.328,
+       "min": 333.006,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b",
+     "precision": "f16",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 148.927,
+       "min": 148.927
+      },
+      "prefill_tok_s": {
+       "max": 6144.105,
+       "min": 6144.105
+      },
+      "tpot_ms": {
+       "max": 6.715,
+       "min": 6.715
+      },
+      "ttft_ms": {
+       "max": 333.328,
+       "min": 333.328
       }
      },
      "verified": true
@@ -17446,7 +19434,7 @@
       "framework_version": "b29c606"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -17568,6 +19556,157 @@
       "ttft_ms": {
        "max": 1302.685,
        "min": 1302.685
+      },
+      "weights_bytes": {
+       "max": 8045325189,
+       "min": 8045325189
+      },
+      "workspace_bytes": {
+       "max": 316407808,
+       "min": 316407808
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.004,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 137.981,
+       "median": 137.961,
+       "min": 137.934,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 10516.696,
+       "median": 8948.815,
+       "min": 8900.858,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 1245708288,
+       "median": 1245708288,
+       "min": 1245708288,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 8378351616,
+       "median": 8378068992,
+       "min": 3653509120,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 8632074240,
+       "median": 8632074240,
+       "min": 585302016,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 2419400704,
+       "median": 2419068928,
+       "min": 2418839552,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 10389487616,
+       "median": 10389487616,
+       "min": 10389487616,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 5972.964,
+       "median": 5966.103,
+       "min": 5964.398,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 7.25,
+       "median": 7.248,
+       "min": 7.247,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 1373.483,
+       "median": 1373.091,
+       "min": 1371.513,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 8045325189,
+       "median": 8045325189,
+       "min": 8045325189,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 316407808,
+       "median": 316407808,
+       "min": 316407808,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b",
+     "over_sweep": true,
+     "precision": "f16",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 137.961,
+       "min": 137.961
+      },
+      "energy_j": {
+       "max": 8948.815,
+       "min": 8948.815
+      },
+      "kv_bytes": {
+       "max": 1245708288,
+       "min": 1245708288
+      },
+      "load_rss_bytes": {
+       "max": 8378068992,
+       "min": 8378068992
+      },
+      "load_vram_bytes": {
+       "max": 8632074240,
+       "min": 8632074240
+      },
+      "peak_rss_bytes": {
+       "max": 2419068928,
+       "min": 2419068928
+      },
+      "peak_vram_bytes": {
+       "max": 10389487616,
+       "min": 10389487616
+      },
+      "prefill_tok_s": {
+       "max": 5966.103,
+       "min": 5966.103
+      },
+      "tpot_ms": {
+       "max": 7.248,
+       "min": 7.248
+      },
+      "ttft_ms": {
+       "max": 1373.091,
+       "min": 1373.091
       },
       "weights_bytes": {
        "max": 8045325189,
@@ -17752,7 +19891,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -17801,6 +19940,81 @@
       "ttft_ms": {
        "max": 18.654,
        "min": 18.654
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.002,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "57559e3b1c4d4e6a60e1b78e3a3883175c13ec03",
+      "checkpoint_digest": "blake3:45f29d5ff2e2428b6327f9149877aa347561e2d004d0198c7e68cae542ecd683",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 113.008,
+       "median": 112.922,
+       "min": 112.837,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 5811.092,
+       "median": 5801.481,
+       "min": 5797.169,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 8.862,
+       "median": 8.856,
+       "min": 8.849,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 22.08,
+       "median": 22.063,
+       "min": 22.027,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 112.922,
+       "min": 112.922
+      },
+      "prefill_tok_s": {
+       "max": 5801.481,
+       "min": 5801.481
+      },
+      "tpot_ms": {
+       "max": 8.856,
+       "min": 8.856
+      },
+      "ttft_ms": {
+       "max": 22.063,
+       "min": 22.063
       }
      },
      "verified": true
@@ -17977,7 +20191,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -18026,6 +20240,81 @@
       "ttft_ms": {
        "max": 139.297,
        "min": 139.297
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.002,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "57559e3b1c4d4e6a60e1b78e3a3883175c13ec03",
+      "checkpoint_digest": "blake3:45f29d5ff2e2428b6327f9149877aa347561e2d004d0198c7e68cae542ecd683",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 86.62,
+       "median": 86.391,
+       "min": 85.789,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 13141.869,
+       "median": 13115.952,
+       "min": 13001.681,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 11.657,
+       "median": 11.575,
+       "min": 11.545,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 157.518,
+       "median": 156.146,
+       "min": 155.838,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 86.391,
+       "min": 86.391
+      },
+      "prefill_tok_s": {
+       "max": 13115.952,
+       "min": 13115.952
+      },
+      "tpot_ms": {
+       "max": 11.575,
+       "min": 11.575
+      },
+      "ttft_ms": {
+       "max": 156.146,
+       "min": 156.146
       }
      },
      "verified": true
@@ -18304,7 +20593,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -18469,6 +20758,192 @@
      "verified": true
     },
     {
+     "backend": "ptx",
+     "band": 0.002,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "57559e3b1c4d4e6a60e1b78e3a3883175c13ec03",
+      "checkpoint_digest": "blake3:45f29d5ff2e2428b6327f9149877aa347561e2d004d0198c7e68cae542ecd683",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 60.501,
+       "median": 60.463,
+       "min": 59.923,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 10478.627,
+       "median": 9148.088,
+       "min": 8998.449,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 1226833920,
+       "median": 1226833920,
+       "min": 1226833920,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 700243968,
+       "median": 677531648,
+       "min": 677371904,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 11291262976,
+       "median": 11291262976,
+       "min": 11278680064,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 700817408,
+       "median": 677728256,
+       "min": 677654528,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 11299651584,
+       "median": 11299651584,
+       "min": 11299651584,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 8822.901,
+       "median": 8822.045,
+       "min": 8816.407,
+       "n": 5
+      },
+      "rss_anon_bytes": {
+       "max": 311738368,
+       "median": 310099968,
+       "min": 310022144,
+       "n": 5
+      },
+      "rss_file_bytes": {
+       "max": 112254976,
+       "median": 90828800,
+       "min": 90804224,
+       "n": 5
+      },
+      "staging_bytes": {
+       "max": 0,
+       "median": 0,
+       "min": 0,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 16.688,
+       "median": 16.539,
+       "min": 16.529,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 929.177,
+       "median": 928.583,
+       "min": 928.493,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 8044936192,
+       "median": 8044936192,
+       "min": 8044936192,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 1149801388,
+       "median": 1149801388,
+       "min": 1149801388,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b",
+     "over_sweep": true,
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 60.463,
+       "min": 60.463
+      },
+      "energy_j": {
+       "max": 9148.088,
+       "min": 9148.088
+      },
+      "kv_bytes": {
+       "max": 1226833920,
+       "min": 1226833920
+      },
+      "load_rss_bytes": {
+       "max": 677531648,
+       "min": 677531648
+      },
+      "load_vram_bytes": {
+       "max": 11291262976,
+       "min": 11291262976
+      },
+      "peak_rss_bytes": {
+       "max": 677728256,
+       "min": 677728256
+      },
+      "peak_vram_bytes": {
+       "max": 11299651584,
+       "min": 11299651584
+      },
+      "prefill_tok_s": {
+       "max": 8822.045,
+       "min": 8822.045
+      },
+      "rss_anon_bytes": {
+       "max": 310099968,
+       "min": 310099968
+      },
+      "rss_file_bytes": {
+       "max": 90828800,
+       "min": 90828800
+      },
+      "staging_bytes": {
+       "max": 0,
+       "min": 0
+      },
+      "tpot_ms": {
+       "max": 16.539,
+       "min": 16.539
+      },
+      "ttft_ms": {
+       "max": 928.583,
+       "min": 928.583
+      },
+      "weights_bytes": {
+       "max": 8044936192,
+       "min": 8044936192
+      },
+      "workspace_bytes": {
+       "max": 1149801388,
+       "min": 1149801388
+      }
+     },
+     "verified": true
+    },
+    {
      "backend": "cuda",
      "band": 0.04,
      "cells": {
@@ -18612,7 +21087,7 @@
      "backend": "cuda",
      "band": 0.057,
      "cells": {
-      "unverified": 0,
+      "unverified": 1,
       "verified": 1
      },
      "date": "2026-11-06",
@@ -18822,7 +21297,7 @@
      "backend": "cuda",
      "band": 0.057,
      "cells": {
-      "unverified": 0,
+      "unverified": 1,
       "verified": 1
      },
      "date": "2026-11-06",
@@ -19134,7 +21609,7 @@
      "backend": "cuda",
      "band": 0.057,
      "cells": {
-      "unverified": 0,
+      "unverified": 1,
       "verified": 1
      },
      "date": "2026-11-06",
@@ -19428,7 +21903,7 @@
       "framework_version": "b29c606"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -19477,6 +21952,76 @@
       "ttft_ms": {
        "max": 10.967,
        "min": 10.967
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.004,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 319.012,
+       "median": 318.729,
+       "min": 311.816,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 10054.712,
+       "median": 10010.053,
+       "min": 9715.043,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 3.207,
+       "median": 3.137,
+       "min": 3.135,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 13.175,
+       "median": 12.787,
+       "min": 12.73,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b-q4km",
+     "precision": "q4_k_m",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-q4km-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 318.729,
+       "min": 318.729
+      },
+      "prefill_tok_s": {
+       "max": 10010.053,
+       "min": 10010.053
+      },
+      "tpot_ms": {
+       "max": 3.137,
+       "min": 3.137
+      },
+      "ttft_ms": {
+       "max": 12.787,
+       "min": 12.787
       }
      },
      "verified": true
@@ -19638,7 +22183,7 @@
       "framework_version": "b29c606"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -19687,6 +22232,76 @@
       "ttft_ms": {
        "max": 86.613,
        "min": 86.613
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.004,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 295.092,
+       "median": 294.723,
+       "min": 289.85,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 21353.995,
+       "median": 21341.469,
+       "min": 21183.9,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 3.45,
+       "median": 3.393,
+       "min": 3.389,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 96.677,
+       "median": 95.963,
+       "min": 95.907,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b-q4km",
+     "precision": "q4_k_m",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-q4km-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 294.723,
+       "min": 294.723
+      },
+      "prefill_tok_s": {
+       "max": 21341.469,
+       "min": 21341.469
+      },
+      "tpot_ms": {
+       "max": 3.393,
+       "min": 3.393
+      },
+      "ttft_ms": {
+       "max": 95.963,
+       "min": 95.963
       }
      },
      "verified": true
@@ -19930,7 +22545,7 @@
       "framework_version": "b29c606"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -20052,6 +22667,157 @@
       "ttft_ms": {
        "max": 397.429,
        "min": 397.429
+      },
+      "weights_bytes": {
+       "max": 2491322204,
+       "min": 2491322204
+      },
+      "workspace_bytes": {
+       "max": 316407808,
+       "min": 316407808
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.004,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 253.427,
+       "median": 253.181,
+       "min": 252.29,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 5335.842,
+       "median": 3683.442,
+       "min": 3651.778,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 1245708288,
+       "median": 1245708288,
+       "min": 1245708288,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 2824105984,
+       "median": 1050320896,
+       "min": 1049993216,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 3829596160,
+       "median": 3829596160,
+       "min": 3829596160,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 1964056576,
+       "median": 1963794432,
+       "min": 1963466752,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 4735565824,
+       "median": 4735565824,
+       "min": 4735565824,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 19350.143,
+       "median": 19320.596,
+       "min": 19248.775,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 3.964,
+       "median": 3.95,
+       "min": 3.946,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 425.586,
+       "median": 424.003,
+       "min": 423.356,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 2491322204,
+       "median": 2491322204,
+       "min": 2491322204,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 316407808,
+       "median": 316407808,
+       "min": 316407808,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b-q4km",
+     "over_sweep": true,
+     "precision": "q4_k_m",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-q4km-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 253.181,
+       "min": 253.181
+      },
+      "energy_j": {
+       "max": 3683.442,
+       "min": 3683.442
+      },
+      "kv_bytes": {
+       "max": 1245708288,
+       "min": 1245708288
+      },
+      "load_rss_bytes": {
+       "max": 1050320896,
+       "min": 1050320896
+      },
+      "load_vram_bytes": {
+       "max": 3829596160,
+       "min": 3829596160
+      },
+      "peak_rss_bytes": {
+       "max": 1963794432,
+       "min": 1963794432
+      },
+      "peak_vram_bytes": {
+       "max": 4735565824,
+       "min": 4735565824
+      },
+      "prefill_tok_s": {
+       "max": 19320.596,
+       "min": 19320.596
+      },
+      "tpot_ms": {
+       "max": 3.95,
+       "min": 3.95
+      },
+      "ttft_ms": {
+       "max": 424.003,
+       "min": 424.003
       },
       "weights_bytes": {
        "max": 2491322204,
@@ -20236,7 +23002,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -20285,6 +23051,81 @@
       "ttft_ms": {
        "max": 25.138,
        "min": 25.138
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.025,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "57559e3b1c4d4e6a60e1b78e3a3883175c13ec03",
+      "checkpoint_digest": "blake3:a94fd97793e5a1224e9cea51bd26a4bec8e76889cf931770032408051e2844b6",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 161.862,
+       "median": 160.847,
+       "min": 156.513,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 4387.053,
+       "median": 4382.685,
+       "min": 4247.938,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 6.389,
+       "median": 6.217,
+       "min": 6.178,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 30.132,
+       "median": 29.206,
+       "min": 29.177,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b-q4km",
+     "precision": "q4_k",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-q4km-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 160.847,
+       "min": 160.847
+      },
+      "prefill_tok_s": {
+       "max": 4382.685,
+       "min": 4382.685
+      },
+      "tpot_ms": {
+       "max": 6.217,
+       "min": 6.217
+      },
+      "ttft_ms": {
+       "max": 29.206,
+       "min": 29.206
       }
      },
      "verified": true
@@ -20461,7 +23302,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -20510,6 +23351,81 @@
       "ttft_ms": {
        "max": 459.397,
        "min": 459.397
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.025,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "57559e3b1c4d4e6a60e1b78e3a3883175c13ec03",
+      "checkpoint_digest": "blake3:a94fd97793e5a1224e9cea51bd26a4bec8e76889cf931770032408051e2844b6",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 113.145,
+       "median": 112.616,
+       "min": 109.179,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 9794.254,
+       "median": 9775.474,
+       "min": 9737.164,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 9.159,
+       "median": 8.88,
+       "min": 8.838,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 210.328,
+       "median": 209.504,
+       "min": 209.102,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b-q4km",
+     "precision": "q4_k",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-q4km-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 112.616,
+       "min": 112.616
+      },
+      "prefill_tok_s": {
+       "max": 9775.474,
+       "min": 9775.474
+      },
+      "tpot_ms": {
+       "max": 8.88,
+       "min": 8.88
+      },
+      "ttft_ms": {
+       "max": 209.504,
+       "min": 209.504
       }
      },
      "verified": true
@@ -20788,7 +23704,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -20953,6 +23869,192 @@
      "verified": true
     },
     {
+     "backend": "ptx",
+     "band": 0.025,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9355 32-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "57559e3b1c4d4e6a60e1b78e3a3883175c13ec03",
+      "checkpoint_digest": "blake3:a94fd97793e5a1224e9cea51bd26a4bec8e76889cf931770032408051e2844b6",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 71.721,
+       "median": 71.67,
+       "min": 71.624,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 9858.67,
+       "median": 8431.693,
+       "min": 8112.379,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 1226833920,
+       "median": 1226833920,
+       "min": 1226833920,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 830341120,
+       "median": 807604224,
+       "min": 807485440,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 6136463360,
+       "median": 6136463360,
+       "min": 6136463360,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 830820352,
+       "median": 807911424,
+       "min": 807723008,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 6144851968,
+       "median": 6144851968,
+       "min": 6144851968,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 7155.056,
+       "median": 7154.942,
+       "min": 7151.538,
+       "n": 5
+      },
+      "rss_anon_bytes": {
+       "max": 436359168,
+       "median": 434626560,
+       "min": 434622464,
+       "n": 5
+      },
+      "rss_file_bytes": {
+       "max": 117637120,
+       "median": 96464896,
+       "min": 96276480,
+       "n": 5
+      },
+      "staging_bytes": {
+       "max": 0,
+       "median": 0,
+       "min": 0,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 13.962,
+       "median": 13.953,
+       "min": 13.943,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 1145.488,
+       "median": 1144.943,
+       "min": 1144.925,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 2491324916,
+       "median": 2491324916,
+       "min": 2491324916,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 1510773692,
+       "median": 1510773692,
+       "min": 1510773692,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b-q4km",
+     "over_sweep": true,
+     "precision": "q4_k",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-4b-q4km-224152",
+     "spread": {
+      "decode_tok_s": {
+       "max": 71.67,
+       "min": 71.67
+      },
+      "energy_j": {
+       "max": 8431.693,
+       "min": 8431.693
+      },
+      "kv_bytes": {
+       "max": 1226833920,
+       "min": 1226833920
+      },
+      "load_rss_bytes": {
+       "max": 807604224,
+       "min": 807604224
+      },
+      "load_vram_bytes": {
+       "max": 6136463360,
+       "min": 6136463360
+      },
+      "peak_rss_bytes": {
+       "max": 807911424,
+       "min": 807911424
+      },
+      "peak_vram_bytes": {
+       "max": 6144851968,
+       "min": 6144851968
+      },
+      "prefill_tok_s": {
+       "max": 7154.942,
+       "min": 7154.942
+      },
+      "rss_anon_bytes": {
+       "max": 434626560,
+       "min": 434626560
+      },
+      "rss_file_bytes": {
+       "max": 96464896,
+       "min": 96464896
+      },
+      "staging_bytes": {
+       "max": 0,
+       "min": 0
+      },
+      "tpot_ms": {
+       "max": 13.953,
+       "min": 13.953
+      },
+      "ttft_ms": {
+       "max": 1144.943,
+       "min": 1144.943
+      },
+      "weights_bytes": {
+       "max": 2491324916,
+       "min": 2491324916
+      },
+      "workspace_bytes": {
+       "max": 1510773692,
+       "min": 1510773692
+      }
+     },
+     "verified": true
+    },
+    {
      "backend": "cuda",
      "band": 0.004,
      "cells": {
@@ -21039,7 +24141,7 @@
       "framework_version": "b29c606"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -21164,6 +24266,76 @@
     },
     {
      "backend": "cuda",
+     "band": 0.0,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9554 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 67.258,
+       "median": 67.254,
+       "min": 67.042,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 2381.18,
+       "median": 2378.266,
+       "min": 2311.771,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 14.916,
+       "median": 14.869,
+       "min": 14.868,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 55.369,
+       "median": 53.821,
+       "min": 53.755,
+       "n": 5
+      }
+     },
+     "model": "qwen3.8-27b-q4",
+     "precision": "q4_k_xl",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-27b-q4-205555",
+     "spread": {
+      "decode_tok_s": {
+       "max": 67.254,
+       "min": 67.254
+      },
+      "prefill_tok_s": {
+       "max": 2378.266,
+       "min": 2378.266
+      },
+      "tpot_ms": {
+       "max": 14.869,
+       "min": 14.869
+      },
+      "ttft_ms": {
+       "max": 53.821,
+       "min": 53.821
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
      "band": 0.002,
      "cells": {
       "unverified": 0,
@@ -21179,7 +24351,7 @@
       "framework_version": "b29c606"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -21228,6 +24400,76 @@
       "ttft_ms": {
        "max": 528.246,
        "min": 528.246
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.0,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9554 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 66.859,
+       "median": 66.827,
+       "min": 66.809,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 3869.506,
+       "median": 3867.981,
+       "min": 3862.711,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 14.968,
+       "median": 14.964,
+       "min": 14.957,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 530.198,
+       "median": 529.475,
+       "min": 529.267,
+       "n": 5
+      }
+     },
+     "model": "qwen3.8-27b-q4",
+     "precision": "q4_k_xl",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-27b-q4-205555",
+     "spread": {
+      "decode_tok_s": {
+       "max": 66.827,
+       "min": 66.827
+      },
+      "prefill_tok_s": {
+       "max": 3867.981,
+       "min": 3867.981
+      },
+      "tpot_ms": {
+       "max": 14.964,
+       "min": 14.964
+      },
+      "ttft_ms": {
+       "max": 529.475,
+       "min": 529.475
       }
      },
      "verified": true
@@ -21370,7 +24612,7 @@
       "framework_version": "b29c606"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -21626,6 +24868,157 @@
      "verified": true
     },
     {
+     "backend": "cuda",
+     "band": 0.0,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9554 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 64.827,
+       "median": 64.803,
+       "min": 64.784,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 23279.737,
+       "median": 18262.521,
+       "min": 18223.991,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 710536069,
+       "median": 710536069,
+       "min": 710536069,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 17924952064,
+       "median": 17254129664,
+       "min": 14590926848,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 17068916736,
+       "median": 17068916736,
+       "min": 17068916736,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 2009182208,
+       "median": 2008625152,
+       "min": 2008465408,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 18427871232,
+       "median": 18427871232,
+       "min": 18427871232,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 3820.538,
+       "median": 3818.147,
+       "min": 3812.404,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 15.436,
+       "median": 15.431,
+       "min": 15.426,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 2148.775,
+       "median": 2145.543,
+       "min": 2144.2,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 16482020884,
+       "median": 16482020884,
+       "min": 16482020884,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 538202604,
+       "median": 538202604,
+       "min": 538202604,
+       "n": 5
+      }
+     },
+     "model": "qwen3.8-27b-q4",
+     "over_sweep": true,
+     "precision": "q4_k_xl",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-27b-q4-205555",
+     "spread": {
+      "decode_tok_s": {
+       "max": 64.803,
+       "min": 64.803
+      },
+      "energy_j": {
+       "max": 18262.521,
+       "min": 18262.521
+      },
+      "kv_bytes": {
+       "max": 710536069,
+       "min": 710536069
+      },
+      "load_rss_bytes": {
+       "max": 17254129664,
+       "min": 17254129664
+      },
+      "load_vram_bytes": {
+       "max": 17068916736,
+       "min": 17068916736
+      },
+      "peak_rss_bytes": {
+       "max": 2008625152,
+       "min": 2008625152
+      },
+      "peak_vram_bytes": {
+       "max": 18427871232,
+       "min": 18427871232
+      },
+      "prefill_tok_s": {
+       "max": 3818.147,
+       "min": 3818.147
+      },
+      "tpot_ms": {
+       "max": 15.431,
+       "min": 15.431
+      },
+      "ttft_ms": {
+       "max": 2145.543,
+       "min": 2145.543
+      },
+      "weights_bytes": {
+       "max": 16482020884,
+       "min": 16482020884
+      },
+      "workspace_bytes": {
+       "max": 538202604,
+       "min": 538202604
+      }
+     },
+     "verified": true
+    },
+    {
      "backend": "ptx",
      "band": 0.0,
      "cells": {
@@ -21722,7 +25115,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -21857,6 +25250,81 @@
       "unverified": 0,
       "verified": 1
      },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9554 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "57559e3b1c4d4e6a60e1b78e3a3883175c13ec03",
+      "checkpoint_digest": "blake3:f3c4ee28b7b94955c218ee0e4b3b86976f621d915fa61436c05b4ad7cedb1915",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 37.776,
+       "median": 37.742,
+       "min": 37.703,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 752.017,
+       "median": 750.706,
+       "min": 741.468,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 26.523,
+       "median": 26.496,
+       "min": 26.472,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 172.631,
+       "median": 170.506,
+       "min": 170.209,
+       "n": 5
+      }
+     },
+     "model": "qwen3.8-27b-q4",
+     "precision": "q5_k",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-27b-q4-205555",
+     "spread": {
+      "decode_tok_s": {
+       "max": 37.742,
+       "min": 37.742
+      },
+      "prefill_tok_s": {
+       "max": 750.706,
+       "min": 750.706
+      },
+      "tpot_ms": {
+       "max": 26.496,
+       "min": 26.496
+      },
+      "ttft_ms": {
+       "max": 170.506,
+       "min": 170.506
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.001,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
      "date": "2026-10-26",
      "framework": "poot",
      "host_labels": [
@@ -21872,7 +25340,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -21921,6 +25389,81 @@
       "ttft_ms": {
        "max": 3482.948,
        "min": 3482.948
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.001,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9554 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "57559e3b1c4d4e6a60e1b78e3a3883175c13ec03",
+      "checkpoint_digest": "blake3:f3c4ee28b7b94955c218ee0e4b3b86976f621d915fa61436c05b4ad7cedb1915",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 33.718,
+       "median": 33.702,
+       "min": 33.604,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 1342.356,
+       "median": 1342.143,
+       "min": 1341.711,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 29.759,
+       "median": 29.672,
+       "min": 29.658,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 1526.409,
+       "median": 1525.918,
+       "min": 1525.675,
+       "n": 5
+      }
+     },
+     "model": "qwen3.8-27b-q4",
+     "precision": "q5_k",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-27b-q4-205555",
+     "spread": {
+      "decode_tok_s": {
+       "max": 33.702,
+       "min": 33.702
+      },
+      "prefill_tok_s": {
+       "max": 1342.143,
+       "min": 1342.143
+      },
+      "tpot_ms": {
+       "max": 29.672,
+       "min": 29.672
+      },
+      "ttft_ms": {
+       "max": 1525.918,
+       "min": 1525.918
       }
      },
      "verified": true
@@ -22073,7 +25616,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -22364,6 +25907,192 @@
      "verified": true
     },
     {
+     "backend": "ptx",
+     "band": 0.001,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9554 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "57559e3b1c4d4e6a60e1b78e3a3883175c13ec03",
+      "checkpoint_digest": "blake3:f3c4ee28b7b94955c218ee0e4b3b86976f621d915fa61436c05b4ad7cedb1915",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 32.767,
+       "median": 32.741,
+       "min": 32.732,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 45781.252,
+       "median": 37402.308,
+       "min": 37291.741,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 702152704,
+       "median": 702152704,
+       "min": 702152704,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 971096064,
+       "median": 948113408,
+       "min": 948072448,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 22662021120,
+       "median": 22662021120,
+       "min": 22662021120,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 971988992,
+       "median": 948944896,
+       "min": 948772864,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 23284219904,
+       "median": 22697672704,
+       "min": 22697672704,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 1235.271,
+       "median": 1234.962,
+       "min": 1232.729,
+       "n": 5
+      },
+      "rss_anon_bytes": {
+       "max": 572456960,
+       "median": 570773504,
+       "min": 570736640,
+       "n": 5
+      },
+      "rss_file_bytes": {
+       "max": 122707968,
+       "median": 101363712,
+       "min": 101175296,
+       "n": 5
+      },
+      "staging_bytes": {
+       "max": 0,
+       "median": 0,
+       "min": 0,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 30.551,
+       "median": 30.543,
+       "min": 30.518,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 6645.417,
+       "median": 6633.402,
+       "min": 6631.745,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 16482013124,
+       "median": 16482013124,
+       "min": 16482013124,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 4047525148,
+       "median": 4047525148,
+       "min": 4047525148,
+       "n": 5
+      }
+     },
+     "model": "qwen3.8-27b-q4",
+     "over_sweep": true,
+     "precision": "q5_k",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-27b-q4-205555",
+     "spread": {
+      "decode_tok_s": {
+       "max": 32.741,
+       "min": 32.741
+      },
+      "energy_j": {
+       "max": 37402.308,
+       "min": 37402.308
+      },
+      "kv_bytes": {
+       "max": 702152704,
+       "min": 702152704
+      },
+      "load_rss_bytes": {
+       "max": 948113408,
+       "min": 948113408
+      },
+      "load_vram_bytes": {
+       "max": 22662021120,
+       "min": 22662021120
+      },
+      "peak_rss_bytes": {
+       "max": 948944896,
+       "min": 948944896
+      },
+      "peak_vram_bytes": {
+       "max": 22697672704,
+       "min": 22697672704
+      },
+      "prefill_tok_s": {
+       "max": 1234.962,
+       "min": 1234.962
+      },
+      "rss_anon_bytes": {
+       "max": 570773504,
+       "min": 570773504
+      },
+      "rss_file_bytes": {
+       "max": 101363712,
+       "min": 101363712
+      },
+      "staging_bytes": {
+       "max": 0,
+       "min": 0
+      },
+      "tpot_ms": {
+       "max": 30.543,
+       "min": 30.543
+      },
+      "ttft_ms": {
+       "max": 6633.402,
+       "min": 6633.402
+      },
+      "weights_bytes": {
+       "max": 16482013124,
+       "min": 16482013124
+      },
+      "workspace_bytes": {
+       "max": 4047525148,
+       "min": 4047525148
+      }
+     },
+     "verified": true
+    },
+    {
      "backend": "cuda",
      "band": 0.008,
      "cells": {
@@ -22450,7 +26179,7 @@
       "framework_version": "b29c606"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -22505,6 +26234,76 @@
     },
     {
      "backend": "cuda",
+     "band": 0.004,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9554 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 93.935,
+       "median": 93.907,
+       "min": 93.582,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 923.354,
+       "median": 916.601,
+       "min": 912.093,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 10.686,
+       "median": 10.649,
+       "min": 10.646,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 140.337,
+       "median": 139.646,
+       "min": 138.625,
+       "n": 5
+      }
+     },
+     "model": "qwen3.8-flash-next-q2",
+     "precision": "q2_k_xl",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-flash-next-q2-205555",
+     "spread": {
+      "decode_tok_s": {
+       "max": 93.907,
+       "min": 93.907
+      },
+      "prefill_tok_s": {
+       "max": 916.601,
+       "min": 916.601
+      },
+      "tpot_ms": {
+       "max": 10.649,
+       "min": 10.649
+      },
+      "ttft_ms": {
+       "max": 139.646,
+       "min": 139.646
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
      "band": 0.008,
      "cells": {
       "unverified": 0,
@@ -22520,7 +26319,7 @@
       "framework_version": "b29c606"
      },
      "isl": 512,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -22660,7 +26459,7 @@
       "framework_version": "b29c606"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -22709,6 +26508,76 @@
       "ttft_ms": {
        "max": 799.347,
        "min": 799.347
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "cuda",
+     "band": 0.004,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9554 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 91.418,
+       "median": 91.407,
+       "min": 90.922,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 2463.9,
+       "median": 2442.035,
+       "min": 2420.12,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 10.998,
+       "median": 10.94,
+       "min": 10.939,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 846.239,
+       "median": 838.645,
+       "min": 831.203,
+       "n": 5
+      }
+     },
+     "model": "qwen3.8-flash-next-q2",
+     "precision": "q2_k_xl",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-flash-next-q2-205555",
+     "spread": {
+      "decode_tok_s": {
+       "max": 91.407,
+       "min": 91.407
+      },
+      "prefill_tok_s": {
+       "max": 2442.035,
+       "min": 2442.035
+      },
+      "tpot_ms": {
+       "max": 10.94,
+       "min": 10.94
+      },
+      "ttft_ms": {
+       "max": 838.645,
+       "min": 838.645
       }
      },
      "verified": true
@@ -22851,7 +26720,7 @@
       "framework_version": "b29c606"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -22956,6 +26825,157 @@
      "verified": true
     },
     {
+     "backend": "cuda",
+     "band": 0.004,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "llamacpp",
+     "host_labels": [
+      "AMD EPYC 9554 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "framework_version": "b29c606"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 85.516,
+       "median": 84.396,
+       "min": 83.623,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 19254.227,
+       "median": 16577.687,
+       "min": 16493.655,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 325656248,
+       "median": 325656248,
+       "min": 325656248,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 49997938688,
+       "median": 49997828096,
+       "min": 49997762560,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 50208112640,
+       "median": 50208112640,
+       "min": 50208112640,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 9048391680,
+       "median": 9028902912,
+       "min": 9015750656,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 51378323456,
+       "median": 51378323456,
+       "min": 51378323456,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 2518.928,
+       "median": 2514.859,
+       "min": 2499.44,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 11.958,
+       "median": 11.849,
+       "min": 11.694,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 3277.534,
+       "median": 3257.439,
+       "min": 3252.177,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 49620986102,
+       "median": 49620986102,
+       "min": 49620986102,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 534773760,
+       "median": 534773760,
+       "min": 534773760,
+       "n": 5
+      }
+     },
+     "model": "qwen3.8-flash-next-q2",
+     "over_sweep": true,
+     "precision": "q2_k_xl",
+     "repeats": 5,
+     "series": "llama.cpp (CUDA)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-flash-next-q2-205555",
+     "spread": {
+      "decode_tok_s": {
+       "max": 84.396,
+       "min": 84.396
+      },
+      "energy_j": {
+       "max": 16577.687,
+       "min": 16577.687
+      },
+      "kv_bytes": {
+       "max": 325656248,
+       "min": 325656248
+      },
+      "load_rss_bytes": {
+       "max": 49997828096,
+       "min": 49997828096
+      },
+      "load_vram_bytes": {
+       "max": 50208112640,
+       "min": 50208112640
+      },
+      "peak_rss_bytes": {
+       "max": 9028902912,
+       "min": 9028902912
+      },
+      "peak_vram_bytes": {
+       "max": 51378323456,
+       "min": 51378323456
+      },
+      "prefill_tok_s": {
+       "max": 2514.859,
+       "min": 2514.859
+      },
+      "tpot_ms": {
+       "max": 11.849,
+       "min": 11.849
+      },
+      "ttft_ms": {
+       "max": 3257.439,
+       "min": 3257.439
+      },
+      "weights_bytes": {
+       "max": 49620986102,
+       "min": 49620986102
+      },
+      "workspace_bytes": {
+       "max": 534773760,
+       "min": 534773760
+      }
+     },
+     "verified": true
+    },
+    {
      "backend": "ptx",
      "band": 0.001,
      "cells": {
@@ -23052,7 +27072,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -23107,6 +27127,81 @@
     },
     {
      "backend": "ptx",
+     "band": 0.004,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9554 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "57559e3b1c4d4e6a60e1b78e3a3883175c13ec03",
+      "checkpoint_digest": "blake3:fb2bf0f4d7da43fa4315f0acd96916a4927658e198fa17da54f01b0558c17bde",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 49.405,
+       "median": 49.358,
+       "min": 49.31,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 557.376,
+       "median": 556.982,
+       "min": 556.672,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 20.28,
+       "median": 20.26,
+       "min": 20.241,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 229.938,
+       "median": 229.81,
+       "min": 229.648,
+       "n": 5
+      }
+     },
+     "model": "qwen3.8-flash-next-q2",
+     "precision": "iq4_nl",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-flash-next-q2-205555",
+     "spread": {
+      "decode_tok_s": {
+       "max": 49.358,
+       "min": 49.358
+      },
+      "prefill_tok_s": {
+       "max": 556.982,
+       "min": 556.982
+      },
+      "tpot_ms": {
+       "max": 20.26,
+       "min": 20.26
+      },
+      "ttft_ms": {
+       "max": 229.81,
+       "min": 229.81
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
      "band": 0.001,
      "cells": {
       "unverified": 0,
@@ -23127,7 +27222,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 512,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -23277,7 +27372,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -23326,6 +27421,81 @@
       "ttft_ms": {
        "max": 3326.276,
        "min": 3326.276
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.004,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9554 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "57559e3b1c4d4e6a60e1b78e3a3883175c13ec03",
+      "checkpoint_digest": "blake3:fb2bf0f4d7da43fa4315f0acd96916a4927658e198fa17da54f01b0558c17bde",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 48.912,
+       "median": 48.863,
+       "min": 48.836,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 1013.676,
+       "median": 1011.014,
+       "min": 1007.732,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 20.477,
+       "median": 20.465,
+       "min": 20.445,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 2032.286,
+       "median": 2025.69,
+       "min": 2020.369,
+       "n": 5
+      }
+     },
+     "model": "qwen3.8-flash-next-q2",
+     "precision": "iq4_nl",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-flash-next-q2-205555",
+     "spread": {
+      "decode_tok_s": {
+       "max": 48.863,
+       "min": 48.863
+      },
+      "prefill_tok_s": {
+       "max": 1011.014,
+       "min": 1011.014
+      },
+      "tpot_ms": {
+       "max": 20.465,
+       "min": 20.465
+      },
+      "ttft_ms": {
+       "max": 2025.69,
+       "min": 2025.69
       }
      },
      "verified": true
@@ -23478,7 +27648,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -23578,6 +27748,192 @@
       "ttft_ms": {
        "max": 13843.495,
        "min": 13843.495
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "ptx",
+     "band": 0.004,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-07",
+     "framework": "poot",
+     "host_labels": [
+      "AMD EPYC 9554 64-Core Processor"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "build_sha": "57559e3b1c4d4e6a60e1b78e3a3883175c13ec03",
+      "checkpoint_digest": "blake3:fb2bf0f4d7da43fa4315f0acd96916a4927658e198fa17da54f01b0558c17bde",
+      "compute_dtype": "f32",
+      "driver_version": "cuda 13.2",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 51.784,
+       "median": 51.763,
+       "min": 51.542,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 38015.706,
+       "median": 29722.373,
+       "min": 29657.001,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 335314952,
+       "median": 335314952,
+       "min": 335314952,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 1306980352,
+       "median": 1284231168,
+       "min": 1280249856,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 76961546240,
+       "median": 76961480704,
+       "min": 76961480704,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 1307934720,
+       "median": 1284988928,
+       "min": 1280950272,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 77020200960,
+       "median": 77020200960,
+       "min": 77020200960,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 1047.122,
+       "median": 1046.02,
+       "min": 1044.443,
+       "n": 5
+      },
+      "rss_anon_bytes": {
+       "max": 919154688,
+       "median": 917491712,
+       "min": 913256448,
+       "n": 5
+      },
+      "rss_file_bytes": {
+       "max": 111955968,
+       "median": 90697728,
+       "min": 90632192,
+       "n": 5
+      },
+      "staging_bytes": {
+       "max": 0,
+       "median": 0,
+       "min": 0,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 19.402,
+       "median": 19.319,
+       "min": 19.311,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 7843.412,
+       "median": 7831.588,
+       "min": 7823.35,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 49620925444,
+       "median": 49620925444,
+       "min": 49620925444,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 25435127348,
+       "median": 25435127348,
+       "min": 25435127348,
+       "n": 5
+      }
+     },
+     "model": "qwen3.8-flash-next-q2",
+     "over_sweep": true,
+     "precision": "iq4_nl",
+     "repeats": 5,
+     "series": "poot (PTX)",
+     "set": "2026-11-07-rtx-pro-6000-blackwell-server-edition-qwen3-8-flash-next-q2-205555",
+     "spread": {
+      "decode_tok_s": {
+       "max": 51.763,
+       "min": 51.763
+      },
+      "energy_j": {
+       "max": 29722.373,
+       "min": 29722.373
+      },
+      "kv_bytes": {
+       "max": 335314952,
+       "min": 335314952
+      },
+      "load_rss_bytes": {
+       "max": 1284231168,
+       "min": 1284231168
+      },
+      "load_vram_bytes": {
+       "max": 76961480704,
+       "min": 76961480704
+      },
+      "peak_rss_bytes": {
+       "max": 1284988928,
+       "min": 1284988928
+      },
+      "peak_vram_bytes": {
+       "max": 77020200960,
+       "min": 77020200960
+      },
+      "prefill_tok_s": {
+       "max": 1046.02,
+       "min": 1046.02
+      },
+      "rss_anon_bytes": {
+       "max": 917491712,
+       "min": 917491712
+      },
+      "rss_file_bytes": {
+       "max": 90697728,
+       "min": 90697728
+      },
+      "staging_bytes": {
+       "max": 0,
+       "min": 0
+      },
+      "tpot_ms": {
+       "max": 19.319,
+       "min": 19.319
+      },
+      "ttft_ms": {
+       "max": 7831.588,
+       "min": 7831.588
+      },
+      "weights_bytes": {
+       "max": 49620925444,
+       "min": 49620925444
+      },
+      "workspace_bytes": {
+       "max": 25435127348,
+       "min": 25435127348
       }
      },
      "verified": true

@@ -31,9 +31,9 @@ device = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 host_cpu = "AMD EPYC 9555 64-Core Processor"
 driver = "595.91.07"
 pair = "isl=128 tpot_ms"
-band = 0.8018
+band = 0.2117
 repeats = 5
-reason = "the same 0.6b candle decode on a second host class: the isl=128 repeats range from 3.6 to 4.5 ms per token while the isl=2048 and 8192 repeats agree to 1%"
+reason = "the same 0.6b candle decode on a second host class: the isl=128 repeats range from 4.07 to 5.05 ms per token (set 182912, POOT-1524) while the isl=2048 and 8192 repeats agree to 1%"
 follow_up = "POOT-1412"
 
 [[cell]]
@@ -44,8 +44,27 @@ backend = "cuda"
 device = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 host_cpu = "AMD EPYC 9555 64-Core Processor"
 driver = "595.91.07"
-pair = "isl=128 ttft_ms"
-band = 0.1187
+pair = "headline decode_tok_s"
+band = 0.2226
 repeats = 5
-reason = "host-launch jitter on a first-token latency of a few tens of milliseconds"
+reason = "host-launch jitter on a 0.6b bf16 eager decode (about 10 ms per token): the five repeats of set 182912 (POOT-1524) fall from 103 to 88 tok/s while the GPU stays at or below 60 C"
+follow_up = "POOT-1412"
+
+# qwen3-4b on the RunPod RTX PRO 6000 Server, transformers (driver 595.91.07, set 224152): a bf16 eager decode of about
+# 11.5 ms per token is host-launch bound; the five repeats range from 84.3 to 87.4 tok/s with GPU at or below 57 C and the
+# SM clock within 1% of its mean (POOT-1524 thermal log). An earlier set of the same cell on an EPYC 9555 host (set 182912, not committed)
+# was wider (67.8 to 78.8 tok/s), and the set of a third pod on EPYC 9535 (set 171906, not committed) was steady, so the spread
+# follows the host and the run, not the temperature or the binary. Not a poot cell.
+[[cell]]
+model = "qwen3-4b"
+scenario = "decode-curve"
+framework = "transformers"
+backend = "cuda"
+device = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+host_cpu = "AMD EPYC 9355 32-Core Processor"
+driver = "595.91.07"
+pair = "isl=2048 tpot_ms"
+band = 0.1422
+repeats = 5
+reason = "host-launch jitter on a 4b bf16 eager decode (about 11.5 ms per token): the isl=2048 repeats range from 11.06 to 11.81 ms per token (headline 84.3 to 87.4 tok/s) at a flat GPU temperature and clock"
 follow_up = "POOT-1412"

@@ -66,7 +66,7 @@ Every device lane ends by checking a list of required test names. Each listed te
 
 The plan digests of the model-free suite cover small fixtures, where launch geometry mostly does not bind. The launch census
 covers the reference models at their real dimensions: one row per distinct contraction or attention request on each reference
-target, with every field of its schedule. A change to a figure the planner reads changes a row.
+target, with every field of its schedule. A change to a figure the planner reads changes a row. The census plans without compile feedback, so it describes the register model's plan and needs no GPU.
 
 ```bash
 just test-launch-census-regen

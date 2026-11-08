@@ -62,22 +62,24 @@ describe("status board data", () => {
   });
 
   // The page says poot is behind llama.cpp on decode in every measured cell, and on first-token time in every cell except
-  // the qwen3-0.6b and qwen3-4b rows of Strix Halo and qwen3-4b-q4km at 8192 tokens (poot on ROCm prefills ahead of llama.cpp Vulkan there) and qwen3-0.6b at
-  // 128 tokens on the RTX PRO 6000 (poot's 6.9 ms against llama.cpp's 19 ms). That is a claim
+  // the qwen3-0.6b and qwen3-4b rows of both machines (poot on ROCm and on PTX prefills ahead there) and qwen3-4b-q4km at 8192
+  // tokens on Strix Halo. That is a claim
   // about the data: when poot reaches a baseline on decode anywhere, or on first-token time outside those rows, in any
   // verified, latest cell the claim is false and this test says which one. Memory has its own tests below.
-  test("poot is behind the best baseline on decode, and on first-token time outside the Strix Halo qwen3 rows, in every compared verified cell of every hardware", () => {
+  test("poot is behind the best baseline on decode, and on first-token time outside the small qwen3 rows, in every compared verified cell of every hardware", () => {
     type Point = { framework: string; isl: number; model: string; verified: boolean; latest: boolean; metrics: Record<string, { median: number }> };
     const better: Record<string, (values: number[]) => number> = { decode_tok_s: (v) => Math.max(...v), ttft_ms: (v) => Math.min(...v) };
     const ahead: string[] = [];
+    const statedButBehind: string[] = [];
     for (const hw of performance.hardware as unknown as { id: string; points: Point[] }[]) {
       for (const metric of Object.keys(better)) {
-        const cells = new Map<string, { poot: number[]; base: number[] }>();
+        const cells = new Map<string, { poot: number[]; base: number[]; llamacpp: number[] }>();
         for (const p of hw.points) {
           const m = p.metrics[metric];
           if (!p.verified || !p.latest || !m) continue;
-          const cell = cells.get(`${p.model}@${p.isl}`) ?? { poot: [], base: [] };
+          const cell = cells.get(`${p.model}@${p.isl}`) ?? { poot: [], base: [], llamacpp: [] };
           cell[p.framework === "poot" ? "poot" : "base"].push(m.median);
+          if (p.framework === "llamacpp") cell.llamacpp.push(m.median);
           cells.set(`${p.model}@${p.isl}`, cell);
         }
         for (const [key, cell] of cells) {
@@ -86,13 +88,16 @@ describe("status board data", () => {
           const behind = metric === "decode_tok_s" ? poot < base : poot > base;
           const stated =
             metric === "ttft_ms" &&
-            ((hw.id === "amd-radeon-8060s-graphics" && /^qwen3-(0\.6b|4b)@|^qwen3-4b-q4km@8192$/.test(key)) ||
-              (hw.id === "nvidia-rtx-pro-6000-blackwell" && key === "qwen3-0.6b@128"));
+            (/^qwen3-(0\.6b|4b)@/.test(key) || (hw.id === "amd-radeon-8060s-graphics" && key === "qwen3-4b-q4km@8192"));
           if (!behind && !stated) ahead.push(`${hw.id} ${metric} ${key}`);
+          // The page says ahead of llama.cpp, the reference: the transformers and candle rows of the NVIDIA qwen3 cells prefill faster than poot.
+          if (stated && cell.llamacpp.length && poot > Math.min(...cell.llamacpp)) statedButBehind.push(`${hw.id} ${metric} ${key}`);
         }
       }
     }
     expect(ahead).toEqual([]);
+    // The rows the page says poot is ahead of llama.cpp on are ahead: a stated exception that is behind makes the sentence false too.
+    expect(statedButBehind).toEqual([]);
   });
 
   // Memory is the peak at inference (after load and warmup), which the harness derives from the stored traces. The page says poot holds

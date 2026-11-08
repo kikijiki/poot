@@ -80,7 +80,7 @@ step, so the fused kernel computes what the unfused kernels would have stored.
 | `MatMul` | Generated tiled GEMM (f32 `[K, N]` weight above one row) or one-thread-per-output body | Decode GEMV, batched-weight tiled schedules |
 | Routed expert matmul | Gate weighting, on both decode Gemv and register-tiled schedules | |
 
-A routed expert contraction runs as the Gemv or as a register-tiled schedule over its rows grouped by expert. The planner picks the one with the lower modelled time from the same contraction cost model that ranks the matrix-unit tilings, never from a fixed row count. A tiling counts the registers its pipelined loop holds (accumulators plus the operand reads staged for a round), and one over the lane's register budget is not offered, so a packed expert tile that would spill is replaced by a shallower one.
+A routed expert contraction runs as the Gemv or as a register-tiled schedule over its rows grouped by expert. The planner picks the one with the lower modelled time from the same contraction cost model that ranks the matrix-unit tilings, in one selection per contraction, never from a fixed row count. A tiling counts the registers its pipelined loop holds (accumulators plus the operand reads staged for a round), and one over the lane's register budget is not offered, so a packed expert tile that would spill is replaced by a shallower one. Where the device's compiler can be asked, it decides that (see [compile feedback](./matrix-units.mdx#compile-feedback)).
 
 ### Reduction-rooted regions
 
