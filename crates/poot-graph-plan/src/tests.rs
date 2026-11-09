@@ -7067,3 +7067,101 @@ fn a_tiling_whose_most_square_micro_overflows_keeps_a_feasible_one() {
     );
     assert_eq!(lds, Some(Ok(61_568)));
 }
+
+/// A model repeats each kernel in every layer, and planning generates a body per equation: the compiled program
+/// holds each distinct kernel's body once. Two matmuls of one shape run one kernel and share its body; a matmul of
+/// another shape runs another and keeps its own. Mutation: make `SharedBodies::share` look up no key (`self.0.get("")`)
+/// and the first assertion fails, the layers' bodies being equal but separately allocated (on a 4B model that is about 6 GiB
+/// of host memory held through the load).
+#[test]
+fn equations_running_one_kernel_share_its_body() {
+    let bld = Builder::for_tests();
+    let dt = GDt::F32;
+    let x = bld
+        .constant("x", TensorType::new(vec![1, 32, 64], dt))
+        .unwrap();
+    let w1 = bld
+        .constant("w1", TensorType::new(vec![64, 64], dt))
+        .unwrap();
+    let w2 = bld
+        .constant("w2", TensorType::new(vec![64, 64], dt))
+        .unwrap();
+    let w3 = bld
+        .constant("w3", TensorType::new(vec![64, 128], dt))
+        .unwrap();
+    let h1 = bld.matmul(x, w1).unwrap();
+    let h2 = bld.matmul(h1, w2).unwrap();
+    let h3 = bld.matmul(h2, w3).unwrap();
+    let g = bld.finish(h3).unwrap();
+    let program = compiled(&g, Backend::SpirvVulkan);
+    let matmuls: Vec<&Dispatch> = program
+        .planned()
+        .filter(|(eqn, _)| matches!(eqn.op, OpKind::MatMul { .. }))
+        .map(|(_, plan)| one_dispatch_ref(plan))
+        .collect();
+    assert_eq!(matmuls.len(), 3, "three matmuls plan");
+    assert_eq!(matmuls[0].key(), matmuls[1].key(), "one shape, one kernel");
+    assert_ne!(
+        matmuls[1].key(),
+        matmuls[2].key(),
+        "another shape, another kernel"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&matmuls[0].body, &matmuls[1].body),
+        "the second layer's dispatch holds its own copy of the kernel body"
+    );
+    assert!(
+        !std::sync::Arc::ptr_eq(&matmuls[1].body, &matmuls[2].body),
+        "two different kernels share a body"
+    );
+}
+
+fn one_dispatch_ref(plan: &Plan) -> &Dispatch {
+    plan.single().expect("one dispatch")
+}
+
+/// A key that named two different bodies would make one equation run the other's kernel, so the sharing refuses it
+/// with a typed error naming the key and both equations, in release as in debug. The two dispatches are real plans
+/// of different matmul shapes, the second given the first's key. Mutation: delete the `if **shared != *dispatch.body`
+/// check in `SharedBodies::share` and the second dispatch silently takes the first's body, so this goes red.
+#[test]
+fn one_key_naming_two_bodies_is_a_typed_planner_error() {
+    let bld = Builder::for_tests();
+    let dt = GDt::F32;
+    let x = bld
+        .constant("x", TensorType::new(vec![1, 32, 64], dt))
+        .unwrap();
+    let w = bld
+        .constant("w", TensorType::new(vec![64, 64], dt))
+        .unwrap();
+    let h = bld.matmul(x, w).unwrap();
+    let y = bld.binary(GBinOp::Add, h, h).unwrap();
+    let g = bld.finish(y).unwrap();
+    let program = compiled(&g, Backend::SpirvVulkan);
+    let mut launches: Vec<(ValueId, Dispatch)> = program
+        .planned()
+        .filter(|(eqn, _)| matches!(eqn.op, OpKind::MatMul { .. } | OpKind::Binary { .. }))
+        .map(|(eqn, plan)| (eqn.out, one_dispatch_ref(plan).clone()))
+        .collect();
+    assert_eq!(launches.len(), 2, "a matmul and an add launch");
+    let (second_out, mut second) = launches.pop().unwrap();
+    let (first_out, mut first) = launches.pop().unwrap();
+    assert_ne!(*first.body(), *second.body(), "two kernels, two bodies");
+    second.key = first.key.clone();
+    let shared_key = first.key.clone();
+    let mut bodies = crate::types::SharedBodies::default();
+    bodies
+        .share(&mut first, first_out)
+        .expect("the first of a key is recorded");
+    match bodies.share(&mut second, second_out) {
+        Err(PlanError::KernelKeyCollision {
+            key,
+            first: named_first,
+            second: named_second,
+        }) => {
+            assert_eq!(key, shared_key);
+            assert_eq!((named_first, named_second), (first_out, second_out));
+        }
+        other => panic!("expected a KernelKeyCollision, got {other:?}"),
+    }
+}

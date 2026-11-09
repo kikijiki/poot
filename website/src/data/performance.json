@@ -2381,7 +2381,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -2430,6 +2430,81 @@
       "ttft_ms": {
        "max": 33.842,
        "min": 33.842
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "vulkan",
+     "band": 0.008,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 94.168,
+       "median": 93.494,
+       "min": 88.591,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 3817.524,
+       "median": 3776.845,
+       "min": 3411.849,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 11.288,
+       "median": 10.696,
+       "min": 10.619,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 37.516,
+       "median": 33.891,
+       "min": 33.53,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (Vulkan)",
+     "set": "2026-11-08-strix-06b-vulkan",
+     "spread": {
+      "decode_tok_s": {
+       "max": 93.494,
+       "min": 93.494
+      },
+      "prefill_tok_s": {
+       "max": 3776.845,
+       "min": 3776.845
+      },
+      "tpot_ms": {
+       "max": 10.696,
+       "min": 10.696
+      },
+      "ttft_ms": {
+       "max": 33.891,
+       "min": 33.891
       }
      },
      "verified": true
@@ -2531,7 +2606,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -2580,6 +2655,81 @@
       "ttft_ms": {
        "max": 436.722,
        "min": 436.722
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "vulkan",
+     "band": 0.008,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 76.837,
+       "median": 76.628,
+       "min": 74.904,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 4708.903,
+       "median": 4698.219,
+       "min": 4645.358,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 13.35,
+       "median": 13.05,
+       "min": 13.014,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 440.87,
+       "median": 435.91,
+       "min": 434.921,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (Vulkan)",
+     "set": "2026-11-08-strix-06b-vulkan",
+     "spread": {
+      "decode_tok_s": {
+       "max": 76.628,
+       "min": 76.628
+      },
+      "prefill_tok_s": {
+       "max": 4698.219,
+       "min": 4698.219
+      },
+      "tpot_ms": {
+       "max": 13.05,
+       "min": 13.05
+      },
+      "ttft_ms": {
+       "max": 435.91,
+       "min": 435.91
       }
      },
      "verified": true
@@ -2732,7 +2882,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -2897,6 +3047,192 @@
      "verified": true
     },
     {
+     "backend": "vulkan",
+     "band": 0.008,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 62.406,
+       "median": 62.315,
+       "min": 60.618,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 3773.237,
+       "median": 3699.441,
+       "min": 3169.45,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 954318848,
+       "median": 954318848,
+       "min": 954318848,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 528400384,
+       "median": 527585280,
+       "min": 526872576,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 2645495808,
+       "median": 2641006592,
+       "min": 2636062720,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 262352896,
+       "median": 256077824,
+       "min": 255983616,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 2897518592,
+       "median": 2897506304,
+       "min": 2727845888,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 3357.081,
+       "median": 3349.001,
+       "min": 3345.611,
+       "n": 5
+      },
+      "rss_anon_bytes": {
+       "max": 210255872,
+       "median": 204042240,
+       "min": 203808768,
+       "n": 5
+      },
+      "rss_file_bytes": {
+       "max": 52547584,
+       "median": 52146176,
+       "min": 51912704,
+       "n": 5
+      },
+      "staging_bytes": {
+       "max": 0,
+       "median": 0,
+       "min": 0,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 16.497,
+       "median": 16.048,
+       "min": 16.024,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 2448.581,
+       "median": 2446.103,
+       "min": 2440.215,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 1192099840,
+       "median": 1192099840,
+       "min": 1192099840,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 495670728,
+       "median": 495670728,
+       "min": 495670728,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "over_sweep": true,
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (Vulkan)",
+     "set": "2026-11-08-strix-06b-vulkan",
+     "spread": {
+      "decode_tok_s": {
+       "max": 62.315,
+       "min": 62.315
+      },
+      "energy_j": {
+       "max": 3699.441,
+       "min": 3699.441
+      },
+      "kv_bytes": {
+       "max": 954318848,
+       "min": 954318848
+      },
+      "load_rss_bytes": {
+       "max": 527585280,
+       "min": 527585280
+      },
+      "load_vram_bytes": {
+       "max": 2641006592,
+       "min": 2641006592
+      },
+      "peak_rss_bytes": {
+       "max": 256077824,
+       "min": 256077824
+      },
+      "peak_vram_bytes": {
+       "max": 2897506304,
+       "min": 2897506304
+      },
+      "prefill_tok_s": {
+       "max": 3349.001,
+       "min": 3349.001
+      },
+      "rss_anon_bytes": {
+       "max": 204042240,
+       "min": 204042240
+      },
+      "rss_file_bytes": {
+       "max": 52146176,
+       "min": 52146176
+      },
+      "staging_bytes": {
+       "max": 0,
+       "min": 0
+      },
+      "tpot_ms": {
+       "max": 16.048,
+       "min": 16.048
+      },
+      "ttft_ms": {
+       "max": 2446.103,
+       "min": 2446.103
+      },
+      "weights_bytes": {
+       "max": 1192099840,
+       "min": 1192099840
+      },
+      "workspace_bytes": {
+       "max": 495670728,
+       "min": 495670728
+      }
+     },
+     "verified": true
+    },
+    {
      "backend": "wgpu",
      "band": 0.041,
      "cells": {
@@ -2993,7 +3329,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -3042,6 +3378,81 @@
       "ttft_ms": {
        "max": 35.451,
        "min": 35.451
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "wgpu",
+     "band": 0.022,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 89.557,
+       "median": 89.28,
+       "min": 87.888,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 3650.137,
+       "median": 3621.877,
+       "min": 3608.178,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 11.378,
+       "median": 11.201,
+       "min": 11.166,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 35.475,
+       "median": 35.341,
+       "min": 35.067,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (wgpu)",
+     "set": "2026-11-08-strix-06b-wgpu",
+     "spread": {
+      "decode_tok_s": {
+       "max": 89.28,
+       "min": 89.28
+      },
+      "prefill_tok_s": {
+       "max": 3621.877,
+       "min": 3621.877
+      },
+      "tpot_ms": {
+       "max": 11.201,
+       "min": 11.201
+      },
+      "ttft_ms": {
+       "max": 35.341,
+       "min": 35.341
       }
      },
      "verified": true
@@ -3143,7 +3554,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -3192,6 +3603,81 @@
       "ttft_ms": {
        "max": 481.108,
        "min": 481.108
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "wgpu",
+     "band": 0.022,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 73.053,
+       "median": 72.947,
+       "min": 72.395,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 4277.385,
+       "median": 4256.565,
+       "min": 4240.102,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 13.813,
+       "median": 13.709,
+       "min": 13.689,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 483.007,
+       "median": 481.139,
+       "min": 478.797,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (wgpu)",
+     "set": "2026-11-08-strix-06b-wgpu",
+     "spread": {
+      "decode_tok_s": {
+       "max": 72.947,
+       "min": 72.947
+      },
+      "prefill_tok_s": {
+       "max": 4256.565,
+       "min": 4256.565
+      },
+      "tpot_ms": {
+       "max": 13.709,
+       "min": 13.709
+      },
+      "ttft_ms": {
+       "max": 481.139,
+       "min": 481.139
       }
      },
      "verified": true
@@ -3344,7 +3830,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -3496,6 +3982,192 @@
       "ttft_ms": {
        "max": 2771.868,
        "min": 2771.868
+      },
+      "weights_bytes": {
+       "max": 1192099840,
+       "min": 1192099840
+      },
+      "workspace_bytes": {
+       "max": 491476424,
+       "min": 491476424
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "wgpu",
+     "band": 0.022,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:657f40994c742ac285bcb84d1dd97f72a054b5e9ea370833ad6a8f78fefab5d6",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 59.671,
+       "median": 59.251,
+       "min": 59.069,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 3976.607,
+       "median": 3966.057,
+       "min": 3934.087,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 954318848,
+       "median": 954318848,
+       "min": 954318848,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 198672384,
+       "median": 197054464,
+       "min": 195141632,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 4142485504,
+       "median": 4142485504,
+       "min": 4142485504,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 210542592,
+       "median": 197410816,
+       "min": 196571136,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 3075362816,
+       "median": 3075362816,
+       "min": 3075350528,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 2941.16,
+       "median": 2925.483,
+       "min": 2922.723,
+       "n": 5
+      },
+      "rss_anon_bytes": {
+       "max": 154824704,
+       "median": 141074432,
+       "min": 140853248,
+       "n": 5
+      },
+      "rss_file_bytes": {
+       "max": 56557568,
+       "median": 55902208,
+       "min": 55570432,
+       "n": 5
+      },
+      "staging_bytes": {
+       "max": 72856,
+       "median": 72856,
+       "min": 72856,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 16.929,
+       "median": 16.877,
+       "min": 16.759,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 2802.866,
+       "median": 2800.221,
+       "min": 2785.296,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 1192099840,
+       "median": 1192099840,
+       "min": 1192099840,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 491476424,
+       "median": 491476424,
+       "min": 491476424,
+       "n": 5
+      }
+     },
+     "model": "qwen3-0.6b",
+     "over_sweep": true,
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (wgpu)",
+     "set": "2026-11-08-strix-06b-wgpu",
+     "spread": {
+      "decode_tok_s": {
+       "max": 59.251,
+       "min": 59.251
+      },
+      "energy_j": {
+       "max": 3966.057,
+       "min": 3966.057
+      },
+      "kv_bytes": {
+       "max": 954318848,
+       "min": 954318848
+      },
+      "load_rss_bytes": {
+       "max": 197054464,
+       "min": 197054464
+      },
+      "load_vram_bytes": {
+       "max": 4142485504,
+       "min": 4142485504
+      },
+      "peak_rss_bytes": {
+       "max": 197410816,
+       "min": 197410816
+      },
+      "peak_vram_bytes": {
+       "max": 3075362816,
+       "min": 3075362816
+      },
+      "prefill_tok_s": {
+       "max": 2925.483,
+       "min": 2925.483
+      },
+      "rss_anon_bytes": {
+       "max": 141074432,
+       "min": 141074432
+      },
+      "rss_file_bytes": {
+       "max": 55902208,
+       "min": 55902208
+      },
+      "staging_bytes": {
+       "max": 72856,
+       "min": 72856
+      },
+      "tpot_ms": {
+       "max": 16.877,
+       "min": 16.877
+      },
+      "ttft_ms": {
+       "max": 2800.221,
+       "min": 2800.221
       },
       "weights_bytes": {
        "max": 1192099840,
@@ -5160,7 +5832,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -5209,6 +5881,81 @@
       "ttft_ms": {
        "max": 193.643,
        "min": 193.643
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "vulkan",
+     "band": 0.005,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-09",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:45f29d5ff2e2428b6327f9149877aa347561e2d004d0198c7e68cae542ecd683",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 24.347,
+       "median": 24.311,
+       "min": 24.094,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 644.429,
+       "median": 639.248,
+       "min": 635.518,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 41.504,
+       "median": 41.134,
+       "min": 41.073,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 201.411,
+       "median": 200.235,
+       "min": 198.625,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (Vulkan)",
+     "set": "2026-11-08-strix-4b-vulkan",
+     "spread": {
+      "decode_tok_s": {
+       "max": 24.311,
+       "min": 24.311
+      },
+      "prefill_tok_s": {
+       "max": 639.248,
+       "min": 639.248
+      },
+      "tpot_ms": {
+       "max": 41.134,
+       "min": 41.134
+      },
+      "ttft_ms": {
+       "max": 200.235,
+       "min": 200.235
       }
      },
      "verified": true
@@ -5385,7 +6132,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -5434,6 +6181,81 @@
       "ttft_ms": {
        "max": 2935.607,
        "min": 2935.607
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "vulkan",
+     "band": 0.005,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-09",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:45f29d5ff2e2428b6327f9149877aa347561e2d004d0198c7e68cae542ecd683",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 22.2,
+       "median": 22.193,
+       "min": 21.996,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 683.264,
+       "median": 680.985,
+       "min": 679.332,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 45.464,
+       "median": 45.059,
+       "min": 45.046,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 3014.726,
+       "median": 3007.407,
+       "min": 2997.375,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b",
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (Vulkan)",
+     "set": "2026-11-08-strix-4b-vulkan",
+     "spread": {
+      "decode_tok_s": {
+       "max": 22.193,
+       "min": 22.193
+      },
+      "prefill_tok_s": {
+       "max": 680.985,
+       "min": 680.985
+      },
+      "tpot_ms": {
+       "max": 45.059,
+       "min": 45.059
+      },
+      "ttft_ms": {
+       "max": 3007.407,
+       "min": 3007.407
       }
      },
      "verified": true
@@ -5772,7 +6594,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -5924,6 +6746,192 @@
       "ttft_ms": {
        "max": 13475.163,
        "min": 13475.163
+      },
+      "weights_bytes": {
+       "max": 8044936192,
+       "min": 8044936192
+      },
+      "workspace_bytes": {
+       "max": 1154104412,
+       "min": 1154104412
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "vulkan",
+     "band": 0.005,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-09",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:45f29d5ff2e2428b6327f9149877aa347561e2d004d0198c7e68cae542ecd683",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 17.402,
+       "median": 17.394,
+       "min": 17.287,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 16166.213,
+       "median": 15728.042,
+       "min": 15499.826,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 1226981376,
+       "median": 1226981376,
+       "min": 1226981376,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 1169682432,
+       "median": 1169121280,
+       "min": 1168633856,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 10456444928,
+       "median": 10456244224,
+       "min": 10446467072,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 564174848,
+       "median": 563867648,
+       "min": 563273728,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 11231260672,
+       "median": 11215552512,
+       "min": 11215552512,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 604.134,
+       "median": 594.617,
+       "min": 592.302,
+       "n": 5
+      },
+      "rss_anon_bytes": {
+       "max": 511332352,
+       "median": 511049728,
+       "min": 510713856,
+       "n": 5
+      },
+      "rss_file_bytes": {
+       "max": 53006336,
+       "median": 52559872,
+       "min": 52445184,
+       "n": 5
+      },
+      "staging_bytes": {
+       "max": 0,
+       "median": 0,
+       "min": 0,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 57.847,
+       "median": 57.492,
+       "min": 57.463,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 13830.793,
+       "median": 13776.934,
+       "min": 13559.913,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 8044936192,
+       "median": 8044936192,
+       "min": 8044936192,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 1154104412,
+       "median": 1154104412,
+       "min": 1154104412,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b",
+     "over_sweep": true,
+     "precision": "bf16",
+     "repeats": 5,
+     "series": "poot (Vulkan)",
+     "set": "2026-11-08-strix-4b-vulkan",
+     "spread": {
+      "decode_tok_s": {
+       "max": 17.394,
+       "min": 17.394
+      },
+      "energy_j": {
+       "max": 15728.042,
+       "min": 15728.042
+      },
+      "kv_bytes": {
+       "max": 1226981376,
+       "min": 1226981376
+      },
+      "load_rss_bytes": {
+       "max": 1169121280,
+       "min": 1169121280
+      },
+      "load_vram_bytes": {
+       "max": 10456244224,
+       "min": 10456244224
+      },
+      "peak_rss_bytes": {
+       "max": 563867648,
+       "min": 563867648
+      },
+      "peak_vram_bytes": {
+       "max": 11215552512,
+       "min": 11215552512
+      },
+      "prefill_tok_s": {
+       "max": 594.617,
+       "min": 594.617
+      },
+      "rss_anon_bytes": {
+       "max": 511049728,
+       "min": 511049728
+      },
+      "rss_file_bytes": {
+       "max": 52559872,
+       "min": 52559872
+      },
+      "staging_bytes": {
+       "max": 0,
+       "min": 0
+      },
+      "tpot_ms": {
+       "max": 57.492,
+       "min": 57.492
+      },
+      "ttft_ms": {
+       "max": 13776.934,
+       "min": 13776.934
       },
       "weights_bytes": {
        "max": 8044936192,
@@ -6108,7 +7116,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -6157,6 +7165,81 @@
       "ttft_ms": {
        "max": 239.888,
        "min": 239.888
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "wgpu",
+     "band": 0.049,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:45f29d5ff2e2428b6327f9149877aa347561e2d004d0198c7e68cae542ecd683",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 23.713,
+       "median": 23.559,
+       "min": 23.139,
+       "n": 7
+      },
+      "prefill_tok_s": {
+       "max": 553.452,
+       "median": 528.795,
+       "min": 526.081,
+       "n": 7
+      },
+      "tpot_ms": {
+       "max": 43.217,
+       "median": 42.446,
+       "min": 42.17,
+       "n": 7
+      },
+      "ttft_ms": {
+       "max": 243.309,
+       "median": 242.06,
+       "min": 231.276,
+       "n": 7
+      }
+     },
+     "model": "qwen3-4b",
+     "precision": "bf16",
+     "repeats": 7,
+     "series": "poot (wgpu)",
+     "set": "2026-11-08-strix-4b-wgpu",
+     "spread": {
+      "decode_tok_s": {
+       "max": 23.559,
+       "min": 23.559
+      },
+      "prefill_tok_s": {
+       "max": 528.795,
+       "min": 528.795
+      },
+      "tpot_ms": {
+       "max": 42.446,
+       "min": 42.446
+      },
+      "ttft_ms": {
+       "max": 242.06,
+       "min": 242.06
       }
      },
      "verified": true
@@ -6333,7 +7416,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -6382,6 +7465,81 @@
       "ttft_ms": {
        "max": 3090.836,
        "min": 3090.836
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "wgpu",
+     "band": 0.049,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:45f29d5ff2e2428b6327f9149877aa347561e2d004d0198c7e68cae542ecd683",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 21.579,
+       "median": 21.536,
+       "min": 21.053,
+       "n": 7
+      },
+      "prefill_tok_s": {
+       "max": 674.636,
+       "median": 662.573,
+       "min": 643.517,
+       "n": 7
+      },
+      "tpot_ms": {
+       "max": 47.499,
+       "median": 46.434,
+       "min": 46.34,
+       "n": 7
+      },
+      "ttft_ms": {
+       "max": 3182.512,
+       "median": 3090.982,
+       "min": 3035.711,
+       "n": 7
+      }
+     },
+     "model": "qwen3-4b",
+     "precision": "bf16",
+     "repeats": 7,
+     "series": "poot (wgpu)",
+     "set": "2026-11-08-strix-4b-wgpu",
+     "spread": {
+      "decode_tok_s": {
+       "max": 21.536,
+       "min": 21.536
+      },
+      "prefill_tok_s": {
+       "max": 662.573,
+       "min": 662.573
+      },
+      "tpot_ms": {
+       "max": 46.434,
+       "min": 46.434
+      },
+      "ttft_ms": {
+       "max": 3090.982,
+       "min": 3090.982
       }
      },
      "verified": true
@@ -6720,7 +7878,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -6872,6 +8030,192 @@
       "ttft_ms": {
        "max": 15134.392,
        "min": 15134.392
+      },
+      "weights_bytes": {
+       "max": 8044936192,
+       "min": 8044936192
+      },
+      "workspace_bytes": {
+       "max": 1149910108,
+       "min": 1149910108
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "wgpu",
+     "band": 0.049,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:45f29d5ff2e2428b6327f9149877aa347561e2d004d0198c7e68cae542ecd683",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 16.939,
+       "median": 16.745,
+       "min": 16.646,
+       "n": 7
+      },
+      "energy_j": {
+       "max": 19546.494,
+       "median": 19001.098,
+       "min": 16758.039,
+       "n": 7
+      },
+      "kv_bytes": {
+       "max": 1226981376,
+       "median": 1226981376,
+       "min": 1226981376,
+       "n": 7
+      },
+      "load_rss_bytes": {
+       "max": 365244416,
+       "median": 363835392,
+       "min": 361967616,
+       "n": 7
+      },
+      "load_vram_bytes": {
+       "max": 21961547776,
+       "median": 21958770688,
+       "min": 21958770688,
+       "n": 7
+      },
+      "peak_rss_bytes": {
+       "max": 365568000,
+       "median": 364011520,
+       "min": 362262528,
+       "n": 7
+      },
+      "peak_vram_bytes": {
+       "max": 11969400832,
+       "median": 11967647744,
+       "min": 11962617856,
+       "n": 7
+      },
+      "prefill_tok_s": {
+       "max": 541.669,
+       "median": 532.796,
+       "min": 525.79,
+       "n": 7
+      },
+      "rss_anon_bytes": {
+       "max": 308756480,
+       "median": 308035584,
+       "min": 305582080,
+       "n": 7
+      },
+      "rss_file_bytes": {
+       "max": 57147392,
+       "median": 56680448,
+       "min": 55959552,
+       "n": 7
+      },
+      "staging_bytes": {
+       "max": 233048,
+       "median": 233048,
+       "min": 233048,
+       "n": 7
+      },
+      "tpot_ms": {
+       "max": 60.075,
+       "median": 59.721,
+       "min": 59.037,
+       "n": 7
+      },
+      "ttft_ms": {
+       "max": 15580.376,
+       "median": 15375.489,
+       "min": 15123.623,
+       "n": 7
+      },
+      "weights_bytes": {
+       "max": 8044936192,
+       "median": 8044936192,
+       "min": 8044936192,
+       "n": 7
+      },
+      "workspace_bytes": {
+       "max": 1149910108,
+       "median": 1149910108,
+       "min": 1149910108,
+       "n": 7
+      }
+     },
+     "model": "qwen3-4b",
+     "over_sweep": true,
+     "precision": "bf16",
+     "repeats": 7,
+     "series": "poot (wgpu)",
+     "set": "2026-11-08-strix-4b-wgpu",
+     "spread": {
+      "decode_tok_s": {
+       "max": 16.745,
+       "min": 16.745
+      },
+      "energy_j": {
+       "max": 19001.098,
+       "min": 19001.098
+      },
+      "kv_bytes": {
+       "max": 1226981376,
+       "min": 1226981376
+      },
+      "load_rss_bytes": {
+       "max": 363835392,
+       "min": 363835392
+      },
+      "load_vram_bytes": {
+       "max": 21958770688,
+       "min": 21958770688
+      },
+      "peak_rss_bytes": {
+       "max": 364011520,
+       "min": 364011520
+      },
+      "peak_vram_bytes": {
+       "max": 11967647744,
+       "min": 11967647744
+      },
+      "prefill_tok_s": {
+       "max": 532.796,
+       "min": 532.796
+      },
+      "rss_anon_bytes": {
+       "max": 308035584,
+       "min": 308035584
+      },
+      "rss_file_bytes": {
+       "max": 56680448,
+       "min": 56680448
+      },
+      "staging_bytes": {
+       "max": 233048,
+       "min": 233048
+      },
+      "tpot_ms": {
+       "max": 59.721,
+       "min": 59.721
+      },
+      "ttft_ms": {
+       "max": 15375.489,
+       "min": 15375.489
       },
       "weights_bytes": {
        "max": 8044936192,
@@ -8461,7 +9805,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -8510,6 +9854,81 @@
       "ttft_ms": {
        "max": 141.949,
        "min": 141.949
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "vulkan",
+     "band": 0.019,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:a94fd97793e5a1224e9cea51bd26a4bec8e76889cf931770032408051e2844b6",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 61.402,
+       "median": 61.176,
+       "min": 60.922,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 906.881,
+       "median": 895.987,
+       "min": 890.584,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 16.414,
+       "median": 16.346,
+       "min": 16.286,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 143.726,
+       "median": 142.859,
+       "min": 141.143,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b-q4km",
+     "precision": "q4_k",
+     "repeats": 5,
+     "series": "poot (Vulkan)",
+     "set": "2026-11-08-strix-4bq4-vulkan",
+     "spread": {
+      "decode_tok_s": {
+       "max": 61.176,
+       "min": 61.176
+      },
+      "prefill_tok_s": {
+       "max": 895.987,
+       "min": 895.987
+      },
+      "tpot_ms": {
+       "max": 16.346,
+       "min": 16.346
+      },
+      "ttft_ms": {
+       "max": 142.859,
+       "min": 142.859
       }
      },
      "verified": true
@@ -8611,7 +10030,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -8660,6 +10079,81 @@
       "ttft_ms": {
        "max": 2333.535,
        "min": 2333.535
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "vulkan",
+     "band": 0.019,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:a94fd97793e5a1224e9cea51bd26a4bec8e76889cf931770032408051e2844b6",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 49.383,
+       "median": 49.353,
+       "min": 49.217,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 864.248,
+       "median": 863.668,
+       "min": 863.189,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 20.318,
+       "median": 20.262,
+       "min": 20.25,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 2372.597,
+       "median": 2371.281,
+       "min": 2369.691,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b-q4km",
+     "precision": "q4_k",
+     "repeats": 5,
+     "series": "poot (Vulkan)",
+     "set": "2026-11-08-strix-4bq4-vulkan",
+     "spread": {
+      "decode_tok_s": {
+       "max": 49.353,
+       "min": 49.353
+      },
+      "prefill_tok_s": {
+       "max": 863.668,
+       "min": 863.668
+      },
+      "tpot_ms": {
+       "max": 20.262,
+       "min": 20.262
+      },
+      "ttft_ms": {
+       "max": 2371.281,
+       "min": 2371.281
       }
      },
      "verified": true
@@ -8812,7 +10306,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -8977,6 +10471,192 @@
      "verified": true
     },
     {
+     "backend": "vulkan",
+     "band": 0.019,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:a94fd97793e5a1224e9cea51bd26a4bec8e76889cf931770032408051e2844b6",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 30.612,
+       "median": 30.576,
+       "min": 30.47,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 11297.714,
+       "median": 11258.533,
+       "min": 11242.07,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 1226981376,
+       "median": 1226981376,
+       "min": 1226981376,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 431202304,
+       "median": 430977024,
+       "min": 430469120,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 5265305600,
+       "median": 5265092608,
+       "min": 5264941056,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 582545408,
+       "median": 582303744,
+       "min": 581959680,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 6042583040,
+       "median": 6042583040,
+       "min": 6042583040,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 699.557,
+       "median": 695.401,
+       "min": 692.493,
+       "n": 5
+      },
+      "rss_anon_bytes": {
+       "max": 524251136,
+       "median": 523964416,
+       "min": 523735040,
+       "n": 5
+      },
+      "rss_file_bytes": {
+       "max": 58531840,
+       "median": 58290176,
+       "min": 58224640,
+       "n": 5
+      },
+      "staging_bytes": {
+       "max": 0,
+       "median": 0,
+       "min": 0,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 32.819,
+       "median": 32.705,
+       "min": 32.667,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 11829.717,
+       "median": 11780.259,
+       "min": 11710.266,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 2491324916,
+       "median": 2491324916,
+       "min": 2491324916,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 1515076716,
+       "median": 1515076716,
+       "min": 1515076716,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b-q4km",
+     "over_sweep": true,
+     "precision": "q4_k",
+     "repeats": 5,
+     "series": "poot (Vulkan)",
+     "set": "2026-11-08-strix-4bq4-vulkan",
+     "spread": {
+      "decode_tok_s": {
+       "max": 30.576,
+       "min": 30.576
+      },
+      "energy_j": {
+       "max": 11258.533,
+       "min": 11258.533
+      },
+      "kv_bytes": {
+       "max": 1226981376,
+       "min": 1226981376
+      },
+      "load_rss_bytes": {
+       "max": 430977024,
+       "min": 430977024
+      },
+      "load_vram_bytes": {
+       "max": 5265092608,
+       "min": 5265092608
+      },
+      "peak_rss_bytes": {
+       "max": 582303744,
+       "min": 582303744
+      },
+      "peak_vram_bytes": {
+       "max": 6042583040,
+       "min": 6042583040
+      },
+      "prefill_tok_s": {
+       "max": 695.401,
+       "min": 695.401
+      },
+      "rss_anon_bytes": {
+       "max": 523964416,
+       "min": 523964416
+      },
+      "rss_file_bytes": {
+       "max": 58290176,
+       "min": 58290176
+      },
+      "staging_bytes": {
+       "max": 0,
+       "min": 0
+      },
+      "tpot_ms": {
+       "max": 32.705,
+       "min": 32.705
+      },
+      "ttft_ms": {
+       "max": 11780.259,
+       "min": 11780.259
+      },
+      "weights_bytes": {
+       "max": 2491324916,
+       "min": 2491324916
+      },
+      "workspace_bytes": {
+       "max": 1515076716,
+       "min": 1515076716
+      }
+     },
+     "verified": true
+    },
+    {
      "backend": "wgpu",
      "band": 0.04,
      "cells": {
@@ -9073,7 +10753,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 128,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -9122,6 +10802,81 @@
       "ttft_ms": {
        "max": 151.607,
        "min": 151.607
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "wgpu",
+     "band": 0.008,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:a94fd97793e5a1224e9cea51bd26a4bec8e76889cf931770032408051e2844b6",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 128,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 50.038,
+       "median": 49.865,
+       "min": 49.537,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 845.636,
+       "median": 822.284,
+       "min": 807.288,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 20.187,
+       "median": 20.054,
+       "min": 19.985,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 158.556,
+       "median": 155.664,
+       "min": 151.365,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b-q4km",
+     "precision": "q4_k",
+     "repeats": 5,
+     "series": "poot (wgpu)",
+     "set": "2026-11-08-strix-4bq4-wgpu",
+     "spread": {
+      "decode_tok_s": {
+       "max": 49.865,
+       "min": 49.865
+      },
+      "prefill_tok_s": {
+       "max": 822.284,
+       "min": 822.284
+      },
+      "tpot_ms": {
+       "max": 20.054,
+       "min": 20.054
+      },
+      "ttft_ms": {
+       "max": 155.664,
+       "min": 155.664
       }
      },
      "verified": true
@@ -9223,7 +10978,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 2048,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -9272,6 +11027,81 @@
       "ttft_ms": {
        "max": 2438.092,
        "min": 2438.092
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "wgpu",
+     "band": 0.008,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:a94fd97793e5a1224e9cea51bd26a4bec8e76889cf931770032408051e2844b6",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 2048,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 40.737,
+       "median": 40.033,
+       "min": 39.833,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 845.783,
+       "median": 826.966,
+       "min": 822.073,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 25.105,
+       "median": 24.98,
+       "min": 24.547,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 2491.264,
+       "median": 2476.522,
+       "min": 2421.424,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b-q4km",
+     "precision": "q4_k",
+     "repeats": 5,
+     "series": "poot (wgpu)",
+     "set": "2026-11-08-strix-4bq4-wgpu",
+     "spread": {
+      "decode_tok_s": {
+       "max": 40.033,
+       "min": 40.033
+      },
+      "prefill_tok_s": {
+       "max": 826.966,
+       "min": 826.966
+      },
+      "tpot_ms": {
+       "max": 24.98,
+       "min": 24.98
+      },
+      "ttft_ms": {
+       "max": 2476.522,
+       "min": 2476.522
       }
      },
      "verified": true
@@ -9424,7 +11254,7 @@
       "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
      },
      "isl": 8192,
-     "latest": true,
+     "latest": false,
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
@@ -9576,6 +11406,192 @@
       "ttft_ms": {
        "max": 12453.475,
        "min": 12453.475
+      },
+      "weights_bytes": {
+       "max": 2491324916,
+       "min": 2491324916
+      },
+      "workspace_bytes": {
+       "max": 1510882412,
+       "min": 1510882412
+      }
+     },
+     "verified": true
+    },
+    {
+     "backend": "wgpu",
+     "band": 0.008,
+     "cells": {
+      "unverified": 0,
+      "verified": 1
+     },
+     "date": "2026-11-08",
+     "framework": "poot",
+     "host_labels": [
+      "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+     ],
+     "hosts": 1,
+     "identity": {
+      "adapter": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "build_sha": "c66cb9c7cfc365526cb76a0b26965a93db0697d5",
+      "checkpoint_digest": "blake3:a94fd97793e5a1224e9cea51bd26a4bec8e76889cf931770032408051e2844b6",
+      "compute_dtype": "f32",
+      "driver_version": "radv Mesa 26.1.3",
+      "rustc_version": "rustc 1.101.0-nightly (ea137335b 2026-10-05)"
+     },
+     "isl": 8192,
+     "latest": true,
+     "memory_scope": "inference",
+     "metrics": {
+      "decode_tok_s": {
+       "max": 27.056,
+       "median": 26.94,
+       "min": 26.835,
+       "n": 5
+      },
+      "energy_j": {
+       "max": 12624.837,
+       "median": 12463.107,
+       "min": 12425.723,
+       "n": 5
+      },
+      "kv_bytes": {
+       "max": 1226981376,
+       "median": 1226981376,
+       "min": 1226981376,
+       "n": 5
+      },
+      "load_rss_bytes": {
+       "max": 382902272,
+       "median": 381394944,
+       "min": 379883520,
+       "n": 5
+      },
+      "load_vram_bytes": {
+       "max": 8283361280,
+       "median": 8059985920,
+       "min": 8059985920,
+       "n": 5
+      },
+      "peak_rss_bytes": {
+       "max": 383078400,
+       "median": 381566976,
+       "min": 380055552,
+       "n": 5
+      },
+      "peak_vram_bytes": {
+       "max": 5831966720,
+       "median": 5779099648,
+       "min": 5649264640,
+       "n": 5
+      },
+      "prefill_tok_s": {
+       "max": 664.627,
+       "median": 654.378,
+       "min": 652.168,
+       "n": 5
+      },
+      "rss_anon_bytes": {
+       "max": 320413696,
+       "median": 319393792,
+       "min": 317485056,
+       "n": 5
+      },
+      "rss_file_bytes": {
+       "max": 62664704,
+       "median": 62484480,
+       "min": 62164992,
+       "n": 5
+      },
+      "staging_bytes": {
+       "max": 222244,
+       "median": 222244,
+       "min": 222244,
+       "n": 5
+      },
+      "tpot_ms": {
+       "max": 37.264,
+       "median": 37.12,
+       "min": 36.961,
+       "n": 5
+      },
+      "ttft_ms": {
+       "max": 12561.173,
+       "median": 12518.764,
+       "min": 12325.714,
+       "n": 5
+      },
+      "weights_bytes": {
+       "max": 2491324916,
+       "median": 2491324916,
+       "min": 2491324916,
+       "n": 5
+      },
+      "workspace_bytes": {
+       "max": 1510882412,
+       "median": 1510882412,
+       "min": 1510882412,
+       "n": 5
+      }
+     },
+     "model": "qwen3-4b-q4km",
+     "over_sweep": true,
+     "precision": "q4_k",
+     "repeats": 5,
+     "series": "poot (wgpu)",
+     "set": "2026-11-08-strix-4bq4-wgpu",
+     "spread": {
+      "decode_tok_s": {
+       "max": 26.94,
+       "min": 26.94
+      },
+      "energy_j": {
+       "max": 12463.107,
+       "min": 12463.107
+      },
+      "kv_bytes": {
+       "max": 1226981376,
+       "min": 1226981376
+      },
+      "load_rss_bytes": {
+       "max": 381394944,
+       "min": 381394944
+      },
+      "load_vram_bytes": {
+       "max": 8059985920,
+       "min": 8059985920
+      },
+      "peak_rss_bytes": {
+       "max": 381566976,
+       "min": 381566976
+      },
+      "peak_vram_bytes": {
+       "max": 5779099648,
+       "min": 5779099648
+      },
+      "prefill_tok_s": {
+       "max": 654.378,
+       "min": 654.378
+      },
+      "rss_anon_bytes": {
+       "max": 319393792,
+       "min": 319393792
+      },
+      "rss_file_bytes": {
+       "max": 62484480,
+       "min": 62484480
+      },
+      "staging_bytes": {
+       "max": 222244,
+       "min": 222244
+      },
+      "tpot_ms": {
+       "max": 37.12,
+       "min": 37.12
+      },
+      "ttft_ms": {
+       "max": 12518.764,
+       "min": 12518.764
       },
       "weights_bytes": {
        "max": 2491324916,

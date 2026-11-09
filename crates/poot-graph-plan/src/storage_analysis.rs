@@ -640,7 +640,7 @@ mod value_storage_tests {
     /// `binding.reads()[p]` names; the swapped plan is accepted and this row goes red.
     #[test]
     fn storage_checks_read_params_through_the_binding() {
-        use crate::{Binding, Dispatch};
+        use crate::Binding;
 
         let b = Builder::for_tests();
         let table = b
@@ -680,15 +680,7 @@ mod value_storage_tests {
                 let mut reads = dispatch.binding().reads().to_vec();
                 reads.swap(0, 1);
                 let binding = Binding::new(reads, dispatch.binding().write());
-                let choice = dispatch.choice().clone();
-                let Dispatch {
-                    body,
-                    key,
-                    label,
-                    launch,
-                    ..
-                } = dispatch;
-                Dispatch::new(body, key, label, launch, binding, choice)
+                dispatch.with_binding(binding)
             })
             .collect();
         let swapped = Plan::Dispatches(crate::DispatchPlan::new(swapped, Vec::new()).unwrap());

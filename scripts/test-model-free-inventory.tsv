@@ -1143,6 +1143,7 @@ poot-graph-plan	poot-graph-plan	model-free	tests::e4m3fn_scatter_update_rejects_
 poot-graph-plan	poot-graph-plan	model-free	tests::e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu
 poot-graph-plan	poot-graph-plan	model-free	tests::e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu
 poot-graph-plan	poot-graph-plan	model-free	tests::e4m3fn_zero_element_transpose_is_rejected_by_name
+poot-graph-plan	poot-graph-plan	model-free	tests::equations_running_one_kernel_share_its_body
 poot-graph-plan	poot-graph-plan	model-free	tests::every_attention_fixture_plans_the_generated_attention_family_on_every_target
 poot-graph-plan	poot-graph-plan	model-free	tests::every_launch_literal_has_provenance
 poot-graph-plan	poot-graph-plan	model-free	tests::exact_i32_binary_plans_typed_integer_kernels_on_every_compute_backend
@@ -1170,6 +1171,7 @@ poot-graph-plan	poot-graph-plan	model-free	tests::i32_is_its_own_kernel_element_
 poot-graph-plan	poot-graph-plan	model-free	tests::i32_movement_carries_i32_whatever_consumes_it
 poot-graph-plan	poot-graph-plan	model-free	tests::is_elementwise_2d_folds_binary_and_unary_for_a_non_f32_dtype
 poot-graph-plan	poot-graph-plan	model-free	tests::mixed_dtype_matmul_is_refused_on_every_backend
+poot-graph-plan	poot-graph-plan	model-free	tests::one_key_naming_two_bodies_is_a_typed_planner_error
 poot-graph-plan	poot-graph-plan	model-free	tests::only_an_f32_m_gt_1_matmul_takes_the_tiled_gemm
 poot-graph-plan	poot-graph-plan	model-free	tests::plan_eqn_derives_shape_from_the_graph_not_a_caller_argument
 poot-graph-plan	poot-graph-plan	model-free	tests::planner_refuses_a_row_region_without_a_reduction

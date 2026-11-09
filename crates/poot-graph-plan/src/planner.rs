@@ -18,7 +18,7 @@ use crate::predicates::GraphTables;
 use crate::refusal::{Pins, Site, refusal_at};
 use crate::state_commit::{StateCommitPlan, state_commit_from_aliases};
 use crate::storage_analysis::{check_kv_head_strides, value_storage_of_plans};
-use crate::types::GraphStorage;
+use crate::types::{GraphStorage, SharedBodies};
 use poot_kernelgen::BodyLimits;
 use poot_target::{AieCaps, AieTargetId, Backend, DeviceCaps};
 
@@ -272,8 +272,15 @@ pub(crate) fn plan_graph(
     let id = target.id();
     check_kv_head_strides(g, target)?;
     let views = compute_views(g, id);
+    // Each equation generates its own bodies; a model repeats every kernel in every layer, so the plan keeps one
+    // body per kernel key and the rest are dropped as each equation finishes, not all held until the graph is done.
+    let bodies = std::cell::RefCell::new(SharedBodies::default());
     let plan = |eqn: &Eqn, output| {
-        plan_eqn_policy(g, eqn, target, &views, limits, pins, npu, output, true)
+        let mut planned = plan_eqn_policy(g, eqn, target, &views, limits, pins, npu, output, true)?;
+        planned
+            .plan
+            .share_bodies(&mut bodies.borrow_mut(), eqn.out)?;
+        Ok::<_, CompileError>(planned)
     };
     let mut planned: Vec<Option<Planned>> = g
         .eqns()

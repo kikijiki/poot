@@ -526,6 +526,7 @@ mod tests {
     };
     use poot_tensor::DType;
     use poot_test_util::device_caps::default_caps_for;
+    use std::sync::Arc;
 
     use super::*;
     use crate::{CompileError, CompileOptions, Program, Target, compile};
@@ -983,7 +984,7 @@ mod tests {
         let honest = dispatch.clone();
         single_plan(honest).expect("the shipped template follows the calling convention");
         let param = dispatch.body.params().next().expect("a read param");
-        let slot = &mut dispatch.body.locals[param.index as usize].ty;
+        let slot = &mut Arc::make_mut(&mut dispatch.body).locals[param.index as usize].ty;
         let poot_kernel_ir::Ty::Ref { mutable, .. } = slot else {
             panic!("the template's read param is a reference: {slot:?}");
         };

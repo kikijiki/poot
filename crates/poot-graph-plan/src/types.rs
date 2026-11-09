@@ -8,6 +8,8 @@ use poot_tensor::DType;
 
 use crate::{KernelChoice, Refusal, StorageGap};
 use poot_kernel_ir::Body;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Why the planner produced no [`Plan`] for an equation or a graph.
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +31,20 @@ pub enum PlanError {
         dtype: DType,
         /// What about the dtype the executor entry point cannot carry.
         gap: StorageGap,
+    },
+    /// Two equations planned the same kernel key with different bodies. The key names the kernel, and a plan
+    /// holds one body per key ([`SharedBodies`]), so one of the two equations would run the other's kernel: a
+    /// planner bug, refused instead of planned.
+    #[error(
+        "the equations defining {first} and {second} plan kernel key {key} with different bodies"
+    )]
+    KernelKeyCollision {
+        /// The key both dispatches carry.
+        key: String,
+        /// The value defined by the equation that planned the key first.
+        first: ValueId,
+        /// The value defined by the equation whose body differs.
+        second: ValueId,
     },
     /// The target is an NPU and the compile was given no lowering for it: the NPU crate's
     /// [`NpuLowering`](crate::NpuLowering) is an explicit argument of [`CompileOptions`](crate::CompileOptions).
@@ -130,7 +146,9 @@ pub enum CollectiveKind {
 /// planner's own launch shaping (`set_workgroup_x`, `append_key`), which cannot change the params.
 #[derive(Clone, Debug)]
 pub struct Dispatch {
-    pub(crate) body: Body,
+    /// Shared between the dispatches of one graph that run the same kernel ([`SharedBodies`]): a generated body
+    /// is megabytes of statements, and a model repeats each kernel in every layer.
+    pub(crate) body: Arc<Body>,
     pub(crate) key: String,
     /// A human-readable name for the kernel (family, form and, for a contraction, its shape):
     /// display only, carried into the per-dispatch timing so device time can be read per shape.
@@ -153,7 +171,7 @@ impl Dispatch {
         choice: KernelChoice,
     ) -> Self {
         Self {
-            body,
+            body: Arc::new(body),
             key,
             label,
             launch,
@@ -208,7 +226,7 @@ impl Dispatch {
 
     /// The planner's launch shaping: bump the workgroup's x extent. Params are unchanged.
     pub(crate) fn set_workgroup_x(&mut self, x: u32) {
-        self.body.workgroup_size[0] = x;
+        Arc::make_mut(&mut self.body).workgroup_size[0] = x;
     }
 
     /// The planner's launch shaping: name a changed body in the key.
@@ -474,6 +492,40 @@ pub struct DispatchPlan {
     scratch: Vec<ScratchDecl>,
 }
 
+/// The bodies of one graph's plan, one per kernel key: a dispatch planned later for a key already seen drops its own
+/// copy of the body for the first one. Planning generates a body per equation (every layer's projections again), and
+/// the key names the kernel a body is, so the plan holds each distinct kernel once instead of once per equation.
+#[derive(Default)]
+pub(crate) struct SharedBodies(HashMap<String, (Arc<Body>, ValueId)>);
+
+impl SharedBodies {
+    /// Point `dispatch`, planned by the equation defining `eqn`, at the body this graph already holds for its key,
+    /// or record its own.
+    ///
+    /// # Errors
+    ///
+    /// [`PlanError::KernelKeyCollision`] when the held body differs from `dispatch`'s.
+    pub(crate) fn share(&mut self, dispatch: &mut Dispatch, eqn: ValueId) -> Result<(), PlanError> {
+        match self.0.get(&dispatch.key) {
+            Some((shared, first)) => {
+                if **shared != *dispatch.body {
+                    return Err(PlanError::KernelKeyCollision {
+                        key: dispatch.key.clone(),
+                        first: *first,
+                        second: eqn,
+                    });
+                }
+                dispatch.body = Arc::clone(shared);
+            }
+            None => {
+                self.0
+                    .insert(dispatch.key.clone(), (Arc::clone(&dispatch.body), eqn));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl DispatchPlan {
     /// Validate `dispatches`, which bind among the declared `scratch` buffers.
     pub fn new(
@@ -627,6 +679,17 @@ impl DispatchPlan {
         u64::try_from(launched).unwrap_or(u64::MAX)
     }
 
+    /// Share every dispatch's body through `bodies`; `eqn` is the value the planning equation defines.
+    pub(crate) fn share_bodies(
+        &mut self,
+        bodies: &mut SharedBodies,
+        eqn: ValueId,
+    ) -> Result<(), PlanError> {
+        self.dispatches
+            .iter_mut()
+            .try_for_each(|dispatch| bodies.share(dispatch, eqn))
+    }
+
     pub(crate) fn single_mut(&mut self) -> Option<&mut Dispatch> {
         match self.dispatches.as_mut_slice() {
             [dispatch] => Some(dispatch),
@@ -715,6 +778,18 @@ impl Plan {
         match self {
             Plan::Dispatches(dispatches) => dispatches.single(),
             _ => None,
+        }
+    }
+
+    /// Share the bodies of the plan's dispatches through `bodies`; a plan with no launch has none.
+    pub(crate) fn share_bodies(
+        &mut self,
+        bodies: &mut SharedBodies,
+        eqn: ValueId,
+    ) -> Result<(), PlanError> {
+        match self {
+            Plan::Dispatches(dispatches) => dispatches.share_bodies(bodies, eqn),
+            _ => Ok(()),
         }
     }
 
