@@ -2,8 +2,8 @@
 // against the data (a pick the data cannot satisfy falls back), offered only the options that exist, and kept in the URL
 // query. The data is one workload family: rates over input tokens. Pure functions of the data, so the filtering and the
 // aggregation maths are tested without a browser.
-import { CHART_METRICS, MEMORY_METRICS, num, seriesId, seriesSlot, type Unit } from "./format";
-import type { Hardware, PerformanceData, Point, PointMetric, Stat } from "./types";
+import { BACKEND_PAIRS, CHART_METRICS, MEMORY_METRICS, num, seriesId, seriesPair, seriesRank, type Unit } from "./format";
+import type { Hardware, NotRun, PerformanceData, Point, PointMetric, Stat } from "./types";
 
 // One column of the page: a hardware and a model.
 export type Side = { hw: string; model: string };
@@ -15,7 +15,7 @@ export type Selection = Side & { b?: Side };
 export type RawSelection = Partial<Side> & { b?: Partial<Side> };
 
 export const pointSeries = (p: Point) => seriesId(p.framework, p.backend);
-const bySeries = (a: string, b: string) => seriesSlot(a) - seriesSlot(b) || a.localeCompare(b);
+const bySeries = (a: string, b: string) => seriesRank(a) - seriesRank(b) || a.localeCompare(b);
 
 export function findHardware(report: PerformanceData, id: string): Hardware | undefined {
   return report.hardware.find((h) => h.id === id);
@@ -145,6 +145,33 @@ export function runBars(points: Point[], metric: PointMetric): Bar[] {
 export function legendSeries(points: Point[]): { id: string; label: string }[] {
   const series = new Map(points.map((p) => [pointSeries(p), p.series]));
   return [...series].sort(([a], [b]) => bySeries(a, b)).map(([id, label]) => ({ id, label }));
+}
+
+// One row of the legend: a measured series, or a series the grid declares not run, with its reason.
+export type LegendEntry = { id: string; label: string; notRun?: string };
+
+// A legend group: a same-backend pair (poot and llama.cpp on one API) or the extras that have no twin.
+export type LegendGroup = { key: string; title: string; entries: LegendEntry[] };
+
+// The legend as groups: each backend pair that has a measured series or a not-run cell for the model, with a missing side shown as
+// its not-run reason, then the extras (series in no pair). `notRun` is the hardware's list; only the model's cells count.
+export function legendGroups(points: Point[], notRun: NotRun[], model: string): LegendGroup[] {
+  const measured = new Map(legendSeries(points).map((s) => [s.id, s.label]));
+  const gaps = new Map(notRun.filter((n) => n.model === model).map((n) => [seriesId(n.framework, n.backend), n]));
+  const entry = (id: string): LegendEntry | undefined => {
+    const label = measured.get(id);
+    if (label) return { id, label };
+    const gap = gaps.get(id);
+    return gap && { id, label: gap.series, notRun: gap.reason };
+  };
+  const groups: LegendGroup[] = [];
+  for (const pair of BACKEND_PAIRS) {
+    const entries = [entry(pair.poot), entry(pair.llamacpp)].filter((e): e is LegendEntry => !!e);
+    if (entries.some((e) => !e.notRun)) groups.push({ key: pair.key, title: `${pair.label}: poot and llama.cpp`, entries });
+  }
+  const extras = [...new Set([...measured.keys(), ...gaps.keys()])].filter((id) => !seriesPair(id)).sort(bySeries).map((id) => entry(id) as LegendEntry);
+  if (extras.length) groups.push({ key: "extras", title: "No llama.cpp twin", entries: extras });
+  return groups;
 }
 
 export type Bar = { id: string; label: string; value: number; verified: boolean; note: string | null; point: Point };

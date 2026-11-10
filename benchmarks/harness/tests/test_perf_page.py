@@ -494,6 +494,28 @@ class PerfPageTest(unittest.TestCase):
             perf_page.row_backend({"framework": "vllm", "device": "AMD Radeon 8060S Graphics"})
 
 
+class NotRunGapsTests(unittest.TestCase):
+    """The grid's not-run cells reach the page as explicit gaps, with the grid's own reason."""
+
+    def test_a_not_run_cell_is_listed_under_its_hardware_with_its_reason(self):
+        gaps = perf_page.not_run_cells()["nvidia-rtx-pro-6000-blackwell"]
+        (gap,) = [g for g in gaps if (g["model"], g["framework"]) == ("gpt-oss-20b", "poot")]
+        self.assertEqual((gap["backend"], gap["series"]), ("ptx", "poot (PTX)"))
+        self.assertIn("MXFP4", gap["reason"])
+
+    def test_the_flash_next_poot_vulkan_gap_states_the_refusal(self):
+        gaps = perf_page.not_run_cells()["amd-radeon-8060s-graphics"]
+        (gap,) = [g for g in gaps if (g["model"], g["series"]) == ("qwen3.8-flash-next-q2", "poot (Vulkan)")]
+        self.assertIn("PackedSourceAddressing", gap["reason"])
+
+    def test_every_hardware_entry_carries_its_gaps(self):
+        with tempfile.TemporaryDirectory() as results, tempfile.TemporaryDirectory() as bank_dir:
+            write_set(Path(results), "set", repeats(), env={"cpu": "Test CPU"})
+            write_bank(bank_dir)
+            (entry,) = perf_page.generate(results, bank_dir)["hardware"]
+        self.assertEqual(entry["not_run"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

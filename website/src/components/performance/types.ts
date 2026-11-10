@@ -46,11 +46,16 @@ export type Point = {
   unverified?: Unverified;
 };
 
+// A cell the standing grid declares not run on this hardware, with its stated reason: the page shows it as an explicit gap in the
+// legend beside the series that were measured.
+export type NotRun = { model: string; framework: string; backend: string; series: string; reason: string };
+
 // One GPU model and its points.
 export type Hardware = {
   id: string;
   label: string;
   points: Point[];
+  not_run: NotRun[];
 };
 
 export type PerformanceData = {

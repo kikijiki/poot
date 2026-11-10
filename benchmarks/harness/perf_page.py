@@ -27,6 +27,7 @@ HARNESS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HARNESS_DIR))
 
 import bench  # noqa: E402
+import grid  # noqa: E402
 import known_unverified  # noqa: E402
 import memory_phases as phases  # noqa: E402
 import performance_bank as bank  # noqa: E402
@@ -37,7 +38,7 @@ REPO_ROOT = HARNESS_DIR.parents[1]
 RESULTS_DIR = bench.BENCH_ROOT / "results"
 OUTPUT = REPO_ROOT / "website" / "src" / "data" / "performance.json"
 
-SCHEMA = 5
+SCHEMA = 6
 
 # Memory is charted at inference: the peak after the model is loaded and the warmup request has run (memory_phases.py).
 # The load peak is stated beside it. A cell none of whose runs has a usable load boundary keeps the lifetime peak and says
@@ -508,14 +509,33 @@ def hardware_classes(hosts, kernels, declared):
     return sorted((c for c in classes.values() if c["points"]), key=lambda c: c["label"])
 
 
+def not_run_cells(grid_path=grid.GRID, manifest_path=grid.MANIFEST):
+    """The cells the standing grid declares not-run, by hardware id: (model, framework, backend) and the reason. The page
+    draws one as an explicit gap beside the series that were measured, so a missing twin reads as a stated reason, not
+    as silence."""
+    grid_value, manifest = grid.load_toml(grid_path), grid.load_toml(manifest_path)
+    hardware = {machine["id"]: machine["hardware"] for machine in grid_value["machine"]}
+    gaps = {}
+    for cell in grid.load_cells(grid_value, manifest):
+        if cell.status == grid.STATUS_NOT_RUN:
+            gaps.setdefault(hardware[cell.machine], {})[(cell.model, cell.framework, cell.backend)] = cell.reason
+    return {
+        hw: [{"model": m, "framework": f, "backend": b, "series": series_label(f, b), "reason": reason}
+             for (m, f, b), reason in sorted(cells.items())]
+        for hw, cells in gaps.items()
+    }
+
+
 def generate(results_dir=RESULTS_DIR, bank_root=bank.BANK_ROOT, known_path=None):
     policy = receipts.load_policy()
     hosts = {}
     collect_runs(Path(results_dir), policy, hosts, known_path or known_unverified.beside(results_dir))
+    classes = hardware_classes(hosts, collect_kernels(Path(bank_root)), declared_lengths())
+    gaps = not_run_cells()
     return {
         "schema": SCHEMA,
         "policy": {"min_repeats": policy["min_trials"], "max_uncertainty": policy["metrics"][policy["headline_metric"]]["max_uncertainty"]},
-        "hardware": hardware_classes(hosts, collect_kernels(Path(bank_root)), declared_lengths()),
+        "hardware": [{**cls, "not_run": gaps.get(cls["id"], [])} for cls in classes],
     }
 
 

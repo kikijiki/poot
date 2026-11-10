@@ -34,7 +34,7 @@ gpu_types = ["NVIDIA RTX PRO 6000 Blackwell Server Edition", "NVIDIA RTX PRO 600
 max_price_per_hour = 2.7
 
 # ----------------------------------------------------------------------------------------------
-# Strix Halo: poot wgpu, Vulkan and ROCm, llama.cpp Vulkan.
+# Strix Halo: poot wgpu, Vulkan and ROCm; llama.cpp Vulkan and ROCm (HIP). Pairs: Vulkan <-> Vulkan, ROCm <-> ROCm.
 # ----------------------------------------------------------------------------------------------
 [[group]]
 machine = "strix-halo"
@@ -43,6 +43,7 @@ models = ["qwen3-0.6b", "qwen3-4b"]
 engines = [
   { framework = "poot", backend = "wgpu" },
   { framework = "llamacpp", backend = "vulkan" },
+  { framework = "llamacpp", backend = "rocm" },
 ]
 
 [[group]]
@@ -79,6 +80,7 @@ engines = [
   { framework = "poot", backend = "vulkan" },
   { framework = "poot", backend = "rocm" },
   { framework = "llamacpp", backend = "vulkan" },
+  { framework = "llamacpp", backend = "rocm" },
 ]
 
 # gpt-oss-20b: poot cannot load its MXFP4 weights yet (a poot feature gap, tracked by a card): the poot cells are
@@ -105,13 +107,15 @@ engines = [
   { framework = "poot", backend = "rocm" },
 ]
 
-# The large rows: ROCm and llama.cpp only.
+# The large rows. The same-backend pair is poot ROCm <-> llama.cpp ROCm (HIP, benchmarks/nix/llamacpp-hip.nix); the
+# llama.cpp Vulkan cells stay as extras whose poot Vulkan twin is a not-run gap below.
 [[group]]
 machine = "strix-halo"
 scenario = "decode-curve-large"
 models = ["qwen3.8-27b-q4"]
 engines = [
   { framework = "poot", backend = "rocm" },
+  { framework = "llamacpp", backend = "rocm" },
   { framework = "llamacpp", backend = "vulkan" },
 ]
 
@@ -129,6 +133,7 @@ scenario = "decode-curve-large"
 models = ["qwen3.8-flash-next-q2"]
 engines = [
   { framework = "poot", backend = "rocm" },
+  { framework = "llamacpp", backend = "rocm" },
 ]
 
 [[group]]

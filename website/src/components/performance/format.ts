@@ -77,10 +77,32 @@ export const SERIES_SLOTS: Readonly<Record<string, number>> = {
   "llamacpp vulkan": 6,
   "candle cuda": 7,
   "transformers cuda": 8,
+  "llamacpp rocm": 9,
 };
 
 // The slot of a pair that has no entry above: neutral, so a new pair is visibly unassigned instead of borrowing another's colour.
-const UNASSIGNED_SLOT = 9;
+const UNASSIGNED_SLOT = 10;
+
+// poot is compared with llama.cpp only on the same backend API: these are the pairs. The legend and the charts keep a pair's two
+// series together, poot first; poot's CUDA driver path is PTX, so PTX pairs with llama.cpp's CUDA backend. A series in no pair (poot
+// wgpu, candle, transformers) is an extra, drawn after the pairs.
+export type BackendPair = { key: string; label: string; poot: string; llamacpp: string };
+export const BACKEND_PAIRS: readonly BackendPair[] = [
+  { key: "vulkan", label: "Vulkan", poot: "poot vulkan", llamacpp: "llamacpp vulkan" },
+  { key: "rocm", label: "ROCm / HIP", poot: "poot rocm", llamacpp: "llamacpp rocm" },
+  { key: "cuda", label: "CUDA (PTX)", poot: "poot ptx", llamacpp: "llamacpp cuda" },
+];
+
+// The pair a series belongs to, if any.
+export function seriesPair(id: string): BackendPair | undefined {
+  return BACKEND_PAIRS.find((p) => p.poot === id || p.llamacpp === id);
+}
+
+// The chart order: the pairs in `BACKEND_PAIRS` order with poot before llama.cpp, then the extras by slot.
+export function seriesRank(id: string): number {
+  const at = BACKEND_PAIRS.findIndex((p) => p.poot === id || p.llamacpp === id);
+  return at < 0 ? BACKEND_PAIRS.length * 2 + seriesSlot(id) : at * 2 + (BACKEND_PAIRS[at].poot === id ? 0 : 1);
+}
 
 export function seriesId(framework: string, backend: string): string {
   return `${framework} ${backend}`;

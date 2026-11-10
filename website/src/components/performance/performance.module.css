@@ -16,7 +16,8 @@
   --series-6: #3a9a3a;
   --series-7: #b0623a;
   --series-8: #5d6b85;
-  --series-9: #8a8590;
+  --series-9: #c4478f;
+  --series-10: #8a8590;
   margin: 1.5rem 0;
 }
 
@@ -36,7 +37,8 @@
   --series-6: #8bd17c;
   --series-7: #ffb38a;
   --series-8: #9db0d6;
-  --series-9: #a79fb0;
+  --series-9: #f08fc6;
+  --series-10: #a79fb0;
 }
 
 .pickerLabel {
@@ -124,10 +126,36 @@
 .legend {
   color: var(--text-secondary);
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   font-size: 0.8rem;
-  gap: 0.25rem 1rem;
+  gap: 0.2rem;
   margin: 0.4rem 0 0.2rem;
+}
+
+.legendGroup {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 1rem;
+}
+
+.legendTitle {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.notRun {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.swatchGap {
+  border: 2px dashed;
+  border-radius: 2px;
+  display: inline-block;
+  height: 0.7rem;
+  margin-right: 0.4rem;
+  width: 0.7rem;
 }
 
 .plot {

@@ -3,7 +3,7 @@ import data from "@site/src/data/performance.json";
 import Lines from "./Lines";
 import RunBars from "./RunBars";
 import { CHART_METRICS, MEMORY_METRICS, metricInfo, seriesColor } from "./format";
-import { chartMetrics, defaultSecond, findHardware, fromQuery, options, resolve, selectPoints, legendSeries, runBars, seriesLines, toQuery, yTop, type Selection, type Side } from "./selection";
+import { chartMetrics, defaultSecond, findHardware, fromQuery, options, resolve, selectPoints, legendGroups, runBars, seriesLines, toQuery, yTop, type Selection, type Side } from "./selection";
 import styles from "./performance.module.css";
 import type { Hardware, PerformanceData, PointMetric } from "./types";
 
@@ -61,11 +61,23 @@ function Column({ side, other, slots, onChange }: { side: Side; other?: Side; sl
     <div className={styles.column} style={slots ? ({ "--rows": FIXED_ROWS + Math.max(slots.length, 1) } as React.CSSProperties) : undefined}>
       {compare && <Pickers report={report} side={side} onChange={onChange} />}
       <div className={styles.legend}>
-        {legendSeries(points).map((s) => (
-          <span key={s.id}>
-            <span className={styles.swatch} style={{ background: seriesColor(s.id) }} />
-            {s.label}
-          </span>
+        {legendGroups(points, hw.not_run, side.model).map((g) => (
+          <div key={g.key} className={styles.legendGroup} role="group" aria-label={g.title}>
+            <span className={styles.legendTitle}>{g.title}</span>
+            {g.entries.map((e) =>
+              e.notRun ? (
+                <span key={e.id} className={styles.notRun}>
+                  <span className={styles.swatchGap} style={{ borderColor: seriesColor(e.id) }} />
+                  {e.label}: not run, {e.notRun}
+                </span>
+              ) : (
+                <span key={e.id}>
+                  <span className={styles.swatch} style={{ background: seriesColor(e.id) }} />
+                  {e.label}
+                </span>
+              ),
+            )}
+          </div>
         ))}
       </div>
       <div className={compare ? styles.chartsHalf : styles.charts}>

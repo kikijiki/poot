@@ -6,7 +6,10 @@ cells and judges each against the committed Performance page data (`website/src/
 * a cell without a status is required: every context length of its scenario has a latest, verified point of at
   least the grid's `repeats` repeats on the machine's hardware, else the check fails;
 * a `pending` cell is allowed to lack data and is listed; `--strict` (the release gate) fails on it;
-* a `not-run` cell needs a `reason` and is never judged against data.
+* a `not-run` cell needs a `reason` and is never judged against data;
+* every (machine, model, scenario) with a live (not `not-run`) poot or llama.cpp cell needs at least one same-backend
+  pair: a poot cell and the llama.cpp cell of its twin backend, both live. Extra unpaired series stay (poot wgpu has no
+  twin; a pair's other side may be a visible `not-run` gap), but poot is never compared with llama.cpp across APIs.
 
 A pending cell that already has its data is reported as measured, and its marker is stale but not an error: the lane
 that measured it need not edit the grid in the same commit.
@@ -32,6 +35,8 @@ PERFORMANCE = REPO_ROOT / "website" / "src" / "data" / "performance.json"
 STATUS_REQUIRED, STATUS_PENDING, STATUS_NOT_RUN = "required", "pending", "not-run"
 STATUSES = (STATUS_PENDING, STATUS_NOT_RUN)
 MACHINE_FIELDS = {"id", "hardware", "label", "cloud", "gpu_types", "max_price_per_hour"}
+# The llama.cpp backend each poot backend is compared with: the same API (poot's CUDA driver path is PTX).
+LLAMACPP_TWIN = {"vulkan": "vulkan", "rocm": "rocm", "ptx": "cuda"}
 GROUP_FIELDS = {"machine", "scenario", "models", "engines", "status", "reason"}
 
 
@@ -123,6 +128,18 @@ def verified_isls(performance, hardware, cell, repeats):
     return set()
 
 
+def unpaired_models(cells):
+    """The (machine, model, scenario) keys with a live poot or llama.cpp cell but no live same-backend pair."""
+    live = {(c.machine, c.model, c.scenario, c.framework, c.backend) for c in cells if c.status != STATUS_NOT_RUN}
+    keys = {key[:3] for key in live if key[3] in ("poot", "llamacpp")}
+    return sorted(
+        key for key in keys
+        if not any(
+            (*key, "poot", poot) in live and (*key, "llamacpp", twin) in live for poot, twin in LLAMACPP_TWIN.items()
+        )
+    )
+
+
 @dataclass
 class Report:
     failures: list
@@ -130,6 +147,16 @@ class Report:
     measured_pending: list
     not_run: list
     satisfied: int
+
+
+def pair_failures(cells):
+    """One failure per (machine, model, scenario) that has live cells but no same-backend poot/llama.cpp pair."""
+    return [
+        f"{machine} / {model} / {scenario}: no same-backend pair of poot and llama.cpp "
+        f"({', '.join(f'poot {p} <-> llamacpp {t}' for p, t in LLAMACPP_TWIN.items())}); "
+        f"measure one pair or mark its cells not-run with a reason"
+        for machine, model, scenario in unpaired_models(cells)
+    ]
 
 
 def judge(grid, manifest, performance):
@@ -157,8 +184,11 @@ def judge(grid, manifest, performance):
 
 
 def check(strict, grid_path=GRID, manifest_path=MANIFEST, performance_path=PERFORMANCE, out=sys.stdout):
-    """Print the grid's state; the exit code is 1 when a required cell lacks data (or, under `strict`, is pending)."""
-    report = judge(load_toml(grid_path), load_toml(manifest_path), json.loads(Path(performance_path).read_text()))
+    """Print the grid's state; the exit code is 1 when a required cell lacks data, a model has no same-backend pair (or, under `strict`, a cell
+    is pending)."""
+    grid_value, manifest = load_toml(grid_path), load_toml(manifest_path)
+    report = judge(grid_value, manifest, json.loads(Path(performance_path).read_text()))
+    report.failures.extend(pair_failures(load_cells(grid_value, manifest)))
     failures = list(report.failures)
     if strict:
         failures += [f"{cell.label()}: pending (release gate)" for cell in report.pending]

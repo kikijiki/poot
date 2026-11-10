@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import data from "../../data/status.json";
 import performance from "../../data/performance.json";
+import { BACKEND_PAIRS } from "../performance/format";
 import { iconNames } from "./Icon";
 import { badgeLabel, type StatusData } from "./types";
 
@@ -61,72 +62,59 @@ describe("status board data", () => {
     for (const card of board.cards) expect((card.groups ?? []).flatMap((g) => g.items).length).toBeLessThanOrEqual(16);
   });
 
-  // The page says poot is behind llama.cpp on decode in every measured cell, and on first-token time in every cell except
-  // the qwen3-0.6b and qwen3-4b rows of both machines (poot on ROCm and on PTX prefills ahead there) and qwen3-4b-q4km at 8192
-  // tokens on Strix Halo. That is a claim
-  // about the data: when poot reaches a baseline on decode anywhere, or on first-token time outside those rows, in any
-  // verified, latest cell the claim is false and this test says which one. Memory has its own tests below.
-  test("poot is behind the best baseline on decode, and on first-token time outside the small qwen3 rows, in every compared verified cell of every hardware", () => {
-    type Point = { framework: string; isl: number; model: string; verified: boolean; latest: boolean; metrics: Record<string, { median: number }> };
-    const better: Record<string, (values: number[]) => number> = { decode_tok_s: (v) => Math.max(...v), ttft_ms: (v) => Math.min(...v) };
-    const ahead: string[] = [];
-    const statedButBehind: string[] = [];
-    for (const hw of performance.hardware as unknown as { id: string; points: Point[] }[]) {
-      for (const metric of Object.keys(better)) {
-        const cells = new Map<string, { poot: number[]; base: number[]; llamacpp: number[] }>();
-        for (const p of hw.points) {
-          const m = p.metrics[metric];
-          if (!p.verified || !p.latest || !m) continue;
-          const cell = cells.get(`${p.model}@${p.isl}`) ?? { poot: [], base: [], llamacpp: [] };
-          cell[p.framework === "poot" ? "poot" : "base"].push(m.median);
-          if (p.framework === "llamacpp") cell.llamacpp.push(m.median);
-          cells.set(`${p.model}@${p.isl}`, cell);
-        }
-        for (const [key, cell] of cells) {
-          if (!cell.poot.length || !cell.base.length) continue;
-          const [poot, base] = [better[metric](cell.poot), better[metric](cell.base)];
-          const behind = metric === "decode_tok_s" ? poot < base : poot > base;
-          const stated =
-            metric === "ttft_ms" &&
-            (/^qwen3-(0\.6b|4b)@/.test(key) || (hw.id === "amd-radeon-8060s-graphics" && key === "qwen3-4b-q4km@8192"));
-          if (!behind && !stated) ahead.push(`${hw.id} ${metric} ${key}`);
-          // The page says ahead of llama.cpp, the reference: the transformers and candle rows of the NVIDIA qwen3 cells prefill faster than poot.
-          if (stated && cell.llamacpp.length && poot > Math.min(...cell.llamacpp)) statedButBehind.push(`${hw.id} ${metric} ${key}`);
+  // poot is compared with llama.cpp only on the same backend API (BACKEND_PAIRS): poot Vulkan with llama.cpp Vulkan, ROCm with ROCm,
+  // PTX with CUDA. A pair of one cell is the two series' medians at one model and input length, both verified and latest.
+  type PairPoint = { framework: string; backend: string; isl: number; model: string; verified: boolean; latest: boolean; over_sweep?: boolean; metrics: Record<string, { median: number }> };
+  type Pair = { hw: string; backend: string; key: string; poot: number; llamacpp: number };
+  const pairedCells = (metric: string, wholeRun = false): Pair[] => {
+    const cells: Pair[] = [];
+    for (const hw of performance.hardware as unknown as { id: string; points: PairPoint[] }[]) {
+      const at = new Map<string, number>();
+      for (const p of hw.points) if (p.verified && p.latest && p.metrics[metric] && (!wholeRun || p.over_sweep)) at.set(`${p.framework} ${p.backend} ${p.model}@${p.isl}`, p.metrics[metric].median);
+      for (const pair of BACKEND_PAIRS) {
+        for (const [key, poot] of at) {
+          const [framework, backend, cell] = key.split(" ");
+          if (`${framework} ${backend}` !== pair.poot) continue;
+          const llamacpp = at.get(`${pair.llamacpp} ${cell}`);
+          if (llamacpp !== undefined) cells.push({ hw: hw.id, backend: pair.key, key: cell, poot, llamacpp });
         }
       }
     }
-    expect(ahead).toEqual([]);
-    // The rows the page says poot is ahead of llama.cpp on are ahead: a stated exception that is behind makes the sentence false too.
-    expect(statedButBehind).toEqual([]);
+    return cells;
+  };
+  const limitations = board.limitations.join(" ");
+
+  // The page says poot is behind llama.cpp on the same backend on decode in every pair, by the stated range, and on first-token time in
+  // the stated share of pairs. That is a claim about the data: when poot reaches llama.cpp on decode anywhere, or the counts and ranges
+  // drift, this test says which. The first-token exceptions are the small qwen3 rows (Strix Halo ROCm, RTX PRO 6000 PTX) the page names.
+  test("poot is behind llama.cpp on the same backend on decode in every pair, and on first-token time as the page states", () => {
+    const decode = pairedCells("decode_tok_s");
+    expect(decode.filter((c) => c.poot >= c.llamacpp).map((c) => `${c.hw} ${c.backend} ${c.key}`)).toEqual([]);
+    const slower = decode.map((c) => c.llamacpp / c.poot);
+    expect(limitations).toContain(`from ${Math.min(...slower).toFixed(2)}x to ${Math.max(...slower).toFixed(1)}x slower`);
+
+    const first = pairedCells("ttft_ms");
+    const behind = first.filter((c) => c.poot > c.llamacpp);
+    expect(limitations).toContain(`Behind on first token in ${behind.length} of ${first.length} cells, up to ${Math.max(...behind.map((c) => c.poot / c.llamacpp)).toFixed(1)}x slower`);
+    const ahead = first.filter((c) => c.poot <= c.llamacpp);
+    const smallQwen = /^qwen3-(0\.6b|4b|4b-q4km)@/;
+    expect(ahead.filter((c) => !smallQwen.test(c.key) || c.backend === "vulkan").map((c) => `${c.hw} ${c.backend} ${c.key}`)).toEqual([]);
+    expect(ahead.length).toBeGreaterThan(0);
   });
 
   // Memory is the peak at inference (after load and warmup), which the harness derives from the stored traces. The page says poot holds
-  // more GPU memory than the best baseline in every compared cell and less host memory on most Strix Halo cells; both are claims about
-  // the data, so a cell that contradicts one fails here.
-  type MemPoint = { framework: string; isl: number; model: string; verified: boolean; latest: boolean; over_sweep?: boolean; metrics: Record<string, { median: number }> };
-  const memoryCells = (hw: { points: MemPoint[] }, metric: string) => {
-    const cells = new Map<string, { poot: number[]; base: number[] }>();
-    for (const p of hw.points) {
-      const m = p.metrics[metric];
-      if (!p.verified || !p.latest || !p.over_sweep || !m) continue;
-      const cell = cells.get(p.model) ?? { poot: [], base: [] };
-      cell[p.framework === "poot" ? "poot" : "base"].push(m.median);
-      cells.set(p.model, cell);
-    }
-    return [...cells].filter(([, c]) => c.poot.length && c.base.length).map(([model, c]) => ({ model, poot: Math.min(...c.poot), base: Math.min(...c.base) }));
-  };
-  const hardware = performance.hardware as unknown as { id: string; points: MemPoint[] }[];
-
-  test("poot holds at least as much GPU memory as the best baseline in every compared verified cell", () => {
-    const lower: string[] = [];
-    for (const hw of hardware) for (const c of memoryCells(hw, "peak_vram_bytes")) if (c.poot < c.base) lower.push(`${hw.id} ${c.model}`);
-    expect(lower).toEqual([]);
+  // more GPU memory than llama.cpp on the same backend in every pair, by up to the stated factor, and less host memory in every pair;
+  // both are claims about the data, so a pair that contradicts one fails here.
+  test("poot holds at least as much GPU memory as llama.cpp on the same backend in every pair, by up to the stated factor", () => {
+    const cells = pairedCells("peak_vram_bytes", true);
+    expect(cells.length).toBeGreaterThan(10);
+    expect(cells.filter((c) => c.poot < c.llamacpp).map((c) => `${c.hw} ${c.backend} ${c.key}`)).toEqual([]);
+    expect(limitations).toContain(`Holds up to ${Math.max(...cells.map((c) => c.poot / c.llamacpp)).toFixed(1)}x the GPU memory of llama.cpp`);
   });
 
-  test("poot holds less host memory than the best baseline on most Strix Halo cells", () => {
-    const strix = hardware.find((h) => h.id.includes("8060s"));
-    const cells = memoryCells(strix as { points: MemPoint[] }, "peak_rss_bytes");
-    expect(cells.length).toBeGreaterThan(2);
-    expect(cells.filter((c) => c.poot < c.base).length).toBeGreaterThan(cells.length / 2);
+  test("poot holds less host memory than llama.cpp on the same backend in every pair", () => {
+    const cells = pairedCells("peak_rss_bytes", true);
+    expect(cells.length).toBeGreaterThan(10);
+    expect(cells.filter((c) => c.poot >= c.llamacpp).map((c) => `${c.hw} ${c.backend} ${c.key}`)).toEqual([]);
   });
 });

@@ -80,6 +80,44 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual((report.failures, len(report.not_run)), ([], 1))
 
 
+def engines(*pairs):
+    return {"engines": [{"framework": f, "backend": b} for f, b in pairs]}
+
+
+class PairRuleTests(unittest.TestCase):
+    """Poot is compared with llama.cpp only on the same backend: every model needs at least one live pair."""
+
+    def failures(self, *groups):
+        return grid.pair_failures(grid.load_cells(declared(*groups), MANIFEST))
+
+    def test_a_same_backend_pair_satisfies_the_rule(self):
+        self.assertEqual(self.failures(engines(("poot", "vulkan"), ("llamacpp", "vulkan"))), [])
+
+    def test_poot_vulkan_against_llamacpp_rocm_is_not_a_pair(self):
+        failures = self.failures(engines(("poot", "vulkan"), ("llamacpp", "rocm")))
+        self.assertEqual(len(failures), 1)
+        self.assertIn("no same-backend pair", failures[0])
+
+    def test_poot_wgpu_has_no_twin_and_stays_an_extra_next_to_a_pair(self):
+        self.assertEqual(self.failures(engines(("poot", "wgpu"), ("poot", "rocm"), ("llamacpp", "rocm"))), [])
+        self.assertEqual(len(self.failures(engines(("poot", "wgpu"), ("llamacpp", "vulkan")))), 1)
+
+    def test_ptx_pairs_with_cuda(self):
+        self.assertEqual(self.failures(engines(("poot", "ptx"), ("llamacpp", "cuda"))), [])
+
+    def test_a_not_run_side_does_not_make_a_pair_but_another_pair_does(self):
+        gap = {**engines(("poot", "vulkan")), "status": "not-run", "reason": "refused at plan time"}
+        self.assertEqual(len(self.failures(gap, engines(("llamacpp", "vulkan")))), 1)
+        self.assertEqual(self.failures(gap, engines(("llamacpp", "vulkan"), ("llamacpp", "rocm"), ("poot", "rocm"))), [])
+
+    def test_a_model_with_every_cell_not_run_needs_no_pair(self):
+        gap = {**engines(("poot", "vulkan"), ("llamacpp", "vulkan")), "status": "not-run", "reason": "no MXFP4 load"}
+        self.assertEqual(self.failures(gap), [])
+
+    def test_other_frameworks_alone_need_no_pair(self):
+        self.assertEqual(self.failures(engines(("candle", "cuda"))), [])
+
+
 class DeclarationTests(unittest.TestCase):
     def assertRejected(self, grid_value, text):
         with self.assertRaises(ValueError) as caught:
@@ -118,11 +156,11 @@ class ReleaseGateTests(unittest.TestCase):
             (root / "grid.toml").write_text(
                 'repeats = 5\n[[machine]]\nid = "box"\nhardware = "hw"\n'
                 '[[group]]\nmachine = "box"\nscenario = "curve"\nmodels = ["m"]\nstatus = "pending"\n'
-                'engines = [{ framework = "poot", backend = "wgpu" }]\n'
+                'engines = [{ framework = "poot", backend = "rocm" }, { framework = "llamacpp", backend = "rocm" }]\n'
             )
             (root / "manifest.toml").write_text(
                 '[performance]\nmin_trials = 5\n[[scenario]]\nid = "curve"\nisl = [128, 8192]\n'
-                '[[model]]\nid = "m"\n[model.frameworks.poot]\nprecision = "bf16"\n'
+                '[[model]]\nid = "m"\n[model.frameworks.poot]\nprecision = "bf16"\n[model.frameworks.llamacpp]\nsupport = true\n'
             )
             (root / "performance.json").write_text(json.dumps(performance()))
             out = io.StringIO()
@@ -157,6 +195,10 @@ class CommittedGridTests(unittest.TestCase):
         report = grid.judge(grid.load_toml(grid.GRID), grid.load_toml(grid.MANIFEST), mutated)
         self.assertEqual(len(report.failures), 1)
         self.assertIn("qwen3.8-flash-next-q2 / poot ptx / decode-curve-large", report.failures[0])
+
+    def test_every_committed_model_has_a_same_backend_pair(self):
+        grid_value, manifest = grid.load_toml(grid.GRID), grid.load_toml(grid.MANIFEST)
+        self.assertEqual(grid.unpaired_models(grid.load_cells(grid_value, manifest)), [])
 
     def test_the_nvidia_machine_declares_the_secure_rtx_pro_6000_cap(self):
         flags = grid.machine_arguments("nvidia-rtx-pro-6000")

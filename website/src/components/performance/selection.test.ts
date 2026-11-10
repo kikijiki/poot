@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import data from "../../data/performance.json";
 import { SERIES_SLOTS, seriesColor } from "./format";
 import { CHART_METRICS, MS, TOK_S } from "./format";
-import { legendSeries, NO_DATA, rowsAt, chartMetrics, commonMetrics, runBars, defaultSecond, yTop, defaultHardware, defaultModel, modelSize, fromQuery, options, pointSeries, resolve, selectPoints, seriesLines, toQuery } from "./selection";
-import type { Hardware, PerformanceData, Point, Stat } from "./types";
+import { legendGroups, legendSeries, NO_DATA, rowsAt, chartMetrics, commonMetrics, runBars, defaultSecond, yTop, defaultHardware, defaultModel, modelSize, fromQuery, options, pointSeries, resolve, selectPoints, seriesLines, toQuery } from "./selection";
+import type { Hardware, NotRun, PerformanceData, Point, Stat } from "./types";
 
 const stat = (median: number): Stat => ({ median, min: median * 0.99, max: median * 1.01, n: 5 });
 
@@ -39,7 +39,7 @@ const poot = (model: string, isl: number, decode: number, prefill?: number, extr
 const llama = (model: string, isl: number, decode: number, prefill?: number, extra?: Partial<Point>) =>
   point({ framework: "llamacpp", backend: "cuda", model, isl, decode, prefill, extra });
 
-const hw = (id: string, points: Point[]): Hardware => ({ id, label: id, points });
+const hw = (id: string, points: Point[], not_run: NotRun[] = []): Hardware => ({ id, label: id, points, not_run });
 
 const strix = hw("amd-radeon-8060s-graphics", [
   poot("m1", 128, 100, 900),
@@ -51,7 +51,7 @@ const strix = hw("amd-radeon-8060s-graphics", [
   poot("m2", 6, 22),
 ]);
 const a100 = hw("a100", [poot("n1", 128, 50), llama("n1", 128, 200), poot("n2", 128, 20)]);
-const report: PerformanceData = { schema: 3, policy: { min_repeats: 5, max_uncertainty: 0.1 }, hardware: [a100, strix] };
+const report: PerformanceData = { schema: 6, policy: { min_repeats: 5, max_uncertainty: 0.1 }, hardware: [a100, strix] };
 const sel = (raw: Parameters<typeof resolve>[1]) => resolve(report, raw);
 
 describe("defaults", () => {
@@ -130,7 +130,7 @@ describe("charts", () => {
       withMetrics("m", { peak_rss_bytes: stat(20) }, 128, "rocm"),
       withMetrics("m", { decode_tok_s: stat(1) }, 128, "vulkan"),
     ];
-    expect(runBars(points, "peak_rss_bytes").map((b) => [b.label, b.value])).toEqual([["poot (ptx)", 30], ["poot (rocm)", 20]]);
+    expect(runBars(points, "peak_rss_bytes").map((b) => [b.label, b.value])).toEqual([["poot (rocm)", 20], ["poot (ptx)", 30]]);
     expect(CHART_METRICS.filter((m) => m.wholeRun).map((m) => m.key)).toEqual(["peak_rss_bytes", "peak_vram_bytes", "weights_bytes", "kv_bytes", "workspace_bytes", "energy_j"]);
   });
 
@@ -148,7 +148,7 @@ describe("charts", () => {
     const split = withMetrics("m", { peak_rss_bytes: stat(6 * GiB), load_rss_bytes: stat(26 * GiB) });
     const lifetime = withMetrics("m", { peak_rss_bytes: stat(53 * GiB) }, 128, "rocm");
     lifetime.memory_scope = "includes_load";
-    expect(runBars([split, lifetime], "peak_rss_bytes").map((b) => [b.label, b.note])).toEqual([["poot (ptx)", null], ["poot (rocm)", "includes load"]]);
+    expect(runBars([split, lifetime], "peak_rss_bytes").map((b) => [b.label, b.note])).toEqual([["poot (rocm)", "includes load"], ["poot (ptx)", null]]);
     expect(runBars([withMetrics("m", { energy_j: stat(1) })], "energy_j").map((b) => b.note)).toEqual([null]);
   });
 });
@@ -325,7 +325,7 @@ describe("tooltip rows", () => {
 describe("legend", () => {
   test("one entry per series of the model, in chart order, whatever the metric or input length", () => {
     const points = selectPoints(strix, { hw: strix.id, model: "m1" });
-    expect(legendSeries(points).map((s) => s.id)).toEqual(["poot ptx", "poot vulkan", "llamacpp cuda"]);
+    expect(legendSeries(points).map((s) => s.id)).toEqual(["poot vulkan", "poot ptx", "llamacpp cuda"]);
     expect(legendSeries(points)[2].label).toBe("llamacpp (cuda)");
     expect(legendSeries(points).map((s) => s.id)).toEqual(seriesLines(points, "decode_tok_s").map((l) => l.id));
   });
@@ -333,5 +333,35 @@ describe("legend", () => {
   test("a model another hardware has does not add its series", () => {
     expect(legendSeries(selectPoints(a100, { hw: a100.id, model: "n1" })).map((s) => s.id)).toEqual(["poot ptx", "llamacpp cuda"]);
     expect(legendSeries([])).toEqual([]);
+  });
+});
+
+describe("legend groups", () => {
+  const gap = (model: string, framework: string, backend: string, reason: string): NotRun => ({ model, framework, backend, series: `${framework} (${backend})`, reason });
+  const vk = (model: string, framework: string, backend: string, decode: number) => point({ framework, backend, model, isl: 128, decode });
+
+  test("a pair keeps poot and llama.cpp of one backend together, poot first, and no pair mixes backends", () => {
+    const points = [vk("m", "llamacpp", "rocm", 3), vk("m", "poot", "rocm", 2), vk("m", "llamacpp", "vulkan", 6), vk("m", "poot", "vulkan", 5), vk("m", "poot", "wgpu", 1)];
+    const groups = legendGroups(points, [], "m");
+    expect(groups.map((g) => [g.key, g.entries.map((e) => e.id)])).toEqual([
+      ["vulkan", ["poot vulkan", "llamacpp vulkan"]],
+      ["rocm", ["poot rocm", "llamacpp rocm"]],
+      ["extras", ["poot wgpu"]],
+    ]);
+  });
+
+  test("a side the grid declares not run is a gap with its reason inside its pair; another model's gap is not shown", () => {
+    const points = [vk("m", "llamacpp", "vulkan", 6)];
+    const notRun = [gap("m", "poot", "vulkan", "refused: PackedSourceAddressing"), gap("other", "poot", "rocm", "x")];
+    const groups = legendGroups(points, notRun, "m");
+    expect(groups).toHaveLength(1);
+    expect(groups[0].entries).toEqual([
+      { id: "poot vulkan", label: "poot (vulkan)", notRun: "refused: PackedSourceAddressing" },
+      { id: "llamacpp vulkan", label: "llamacpp (vulkan)" },
+    ]);
+  });
+
+  test("a pair with nothing measured is not a group", () => {
+    expect(legendGroups([], [gap("m", "poot", "vulkan", "r"), gap("m", "llamacpp", "vulkan", "r")], "m")).toEqual([]);
   });
 });
