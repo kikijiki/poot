@@ -171,11 +171,24 @@ class QuietCell(unittest.TestCase):
         self.assertEqual(row["host_load"]["discarded_loads"][0]["foreign_share_max"], 0.38)
         self.assertEqual(row["host_load"]["foreign_share_max"], 0.01)  # the kept attempt's load, not the discard's
 
+    def test_a_short_pass_without_evidence_is_discarded_and_redone_for_any_framework(self):
+        FakeMeter.scripted = [load(0.01, True), load(0.01, True)]
+        rows = iter([
+            {"status": "ok", "curve": [{"isl": 128, "iters": 3, "ttft_ms": {"p50": 370, "min": 365, "max": 690}}]},
+            {"status": "ok", "curve": [{"isl": 128, "iters": 3, "ttft_ms": {"p50": 370, "min": 365, "max": 372}}]},
+        ])
+        with (mock.patch.object(bench.host_load, "wait_quiet", return_value=(True, 0.0, {"quiet": True})),
+              mock.patch.object(bench.host_load, "LoadMeter", FakeMeter)):
+            row = bench.run_quiet_cell(lambda: next(rows), 0.0)
+        self.assertEqual(row["host_load"]["discarded"], 1)
+        self.assertEqual(row["host_load"]["discarded_loads"][0]["uncovered_short_passes"][0][0], 128)
+        self.assertEqual(row["curve"][0]["ttft_ms"]["max"], 372)
+
     def test_a_cell_that_never_runs_quiet_is_an_error_row_not_a_number(self):
         row, runs = self.run_cell([load(0.4, False)] * (host_load.MAX_DISCARDS + 1))
         self.assertEqual(runs, host_load.MAX_DISCARDS + 1)
         self.assertEqual(row["status"], "error")
-        self.assertIn("host load above 10%", row["reason"])
+        self.assertIn("discarded (host load above 10%", row["reason"])
         self.assertEqual(row["host_load"]["discarded"], host_load.MAX_DISCARDS + 1)
 
     def test_a_host_that_is_not_quiet_before_the_run_does_not_run_it(self):

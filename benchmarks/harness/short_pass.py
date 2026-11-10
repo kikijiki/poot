@@ -45,3 +45,13 @@ def uncovered(runs):
                 if got is not None and not got[0]:
                     out.append((run_id, row, point, got[1], got[2]))
     return out
+
+
+def uncovered_in_row(row):
+    """`[(isl, spread)]` of a freshly measured row's uncovered short passes; the harness discards such an attempt."""
+    out = []
+    for point in row.get("curve") or []:
+        got = coverage(point)
+        if got is not None and not got[0]:
+            out.append((point["isl"], round(got[2], 3)))
+    return out

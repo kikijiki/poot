@@ -596,7 +596,8 @@ def run_quiet_cell(run_once, quiet_wait_s):
     """Run one cell on a quiet host (POOT-1523), for every framework and backend alike.
 
     Before each attempt the host must be quiet (`host_load.wait_quiet`); during it the foreign CPU share is metered.
-    An attempt whose windows exceeded the limit is discarded and run again, at most `host_load.MAX_DISCARDS` times;
+    An attempt whose windows exceeded the limit, or with a short first-token pass that is neither timed for a window nor
+    flat (`short_pass`, the same rule for every framework), is discarded and run again, at most `host_load.MAX_DISCARDS` times;
     the row records the load of the attempt it keeps and a summary of every discarded one, so a discard is never
     silent. A cell that never ran quiet is an error row that says so, not a number.
     """
@@ -607,17 +608,20 @@ def run_quiet_cell(run_once, quiet_wait_s):
             with host_load.LoadMeter() as meter:
                 row = run_once()
             load = meter.result()
-            if row.get("status") != "ok" or load.get("quiet", True):
+            if row.get("status") != "ok":
                 break
-            discarded.append(_load_summary(load))
+            uncovered = short_pass.uncovered_in_row(row)
+            if load.get("quiet", True) and not uncovered:
+                break
+            discarded.append({**_load_summary(load), **({"uncovered_short_passes": uncovered} if uncovered else {})})
         else:
             load = probe
             row = {"status": "error", "reason": f"host not quiet before the run: {_load_summary(probe)}"}
             break
         if len(discarded) > host_load.MAX_DISCARDS:
             row = {**row, "status": "error",
-                   "reason": f"host load above {host_load.FOREIGN_SHARE_LIMIT:.0%} in every one of "
-                             f"{len(discarded)} attempts: {discarded}"}
+                   "reason": f"every one of {len(discarded)} attempts was discarded (host load above "
+                             f"{host_load.FOREIGN_SHARE_LIMIT:.0%}, or a short pass without evidence): {discarded}"}
             break
     row["host_load"] = {**load, "discarded": len(discarded)}
     if discarded:

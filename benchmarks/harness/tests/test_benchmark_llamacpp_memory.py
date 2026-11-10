@@ -72,8 +72,8 @@ class RunnerMemoryTest(unittest.TestCase):
     """The runner's whole output with a fake llama-bench: the probe's classes reach the result line, in front of the run."""
 
     ROWS = [
-        {"backends": "Vulkan", "n_prompt": 128, "n_gen": 0, "avg_ts": 5000.0, "build_commit": "b"},
-        {"backends": "Vulkan", "n_prompt": 0, "n_gen": 8, "avg_ts": 50.0, "build_commit": "b"},
+        {"backends": "Vulkan", "n_prompt": 128, "n_gen": 0, "avg_ts": 5000.0, "samples_ts": [5000.0] * 4, "build_commit": "b"},
+        {"backends": "Vulkan", "n_prompt": 0, "n_gen": 8, "avg_ts": 50.0, "samples_ts": [50.0] * 4, "build_commit": "b"},
     ]
 
     def run_curve(self, probe_stderr, probe_returncode=0):

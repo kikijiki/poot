@@ -90,6 +90,7 @@ def bench_run(directory, single, curve, manifest=MANIFEST, *, diagnostic=False, 
         mock.patch.object(bench, "capture_env", side_effect=lambda manifest: HOST_WITH_GPU),
         mock.patch.object(observer, "run_observed", side_effect=run_fixture_runner),
         mock.patch.object(bench.host_load, "wait_quiet", return_value=(True, 0.0, {"quiet": True})),
+        mock.patch.object(bench.short_pass, "uncovered_in_row", return_value=[]),  # the fixtures' passes are 4 ms long
         mock.patch.dict(os.environ, {"POOT_BENCH_BACKEND": "ptx"}),
         contextlib.redirect_stdout(io.StringIO()),
         contextlib.redirect_stderr(io.StringIO()),

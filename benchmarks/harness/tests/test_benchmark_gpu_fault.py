@@ -104,8 +104,8 @@ class LlamaCppDeviceTests(unittest.TestCase):
     def test_the_decode_curve_result_names_the_backend_llama_bench_used(self):
         runner = llamacpp_runner()
         rows = [
-            {"backends": "CUDA", "n_prompt": 128, "n_gen": 0, "avg_ts": 5000.0, "build_commit": "b"},
-            {"backends": "CUDA", "n_prompt": 0, "n_gen": 128, "avg_ts": 50.0, "build_commit": "b"},
+            {"backends": "CUDA", "n_prompt": 128, "n_gen": 0, "avg_ts": 5000.0, "samples_ts": [5000.0] * 4, "build_commit": "b"},
+            {"backends": "CUDA", "n_prompt": 0, "n_gen": 128, "avg_ts": 50.0, "samples_ts": [50.0] * 4, "build_commit": "b"},
         ]
         completed = mock.Mock(returncode=0, stdout=json.dumps(rows), stderr="")
         argv = ["run.py", "--gguf", "m.gguf", "--prompt-file", __file__, "--mode", "decode-curve", "--isl-list", "128"]
