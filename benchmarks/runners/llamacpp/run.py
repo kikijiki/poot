@@ -202,6 +202,8 @@ def timed_samples(row, warmup):
 # those is the iteration the contract sees. It is a property of the engine's first seconds, the same for every backend.
 SHORT_PASS_S = 2.0
 TIMED_WINDOW_S = 20.0
+# The pilot is a process's first pass, slower than the passes after it; sizing from it alone leaves the window short.
+PILOT_MARGIN = 1.15
 MAX_REPETITIONS = 100
 
 
@@ -209,7 +211,7 @@ def prefill_repetitions(pass_s, warmup, iters):
     """llama-bench repetitions (warm-up included) for a prefill pass that took `pass_s` seconds in a pilot."""
     if pass_s >= SHORT_PASS_S:
         return warmup + iters
-    return warmup + max(iters, min(MAX_REPETITIONS, math.ceil(TIMED_WINDOW_S / pass_s)))
+    return warmup + max(iters, min(MAX_REPETITIONS, math.ceil(TIMED_WINDOW_S * PILOT_MARGIN / pass_s)))
 
 
 def curve_iterations(isl, osl, pp_row, tg_row, warmup):

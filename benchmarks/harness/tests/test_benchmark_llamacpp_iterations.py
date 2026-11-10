@@ -43,7 +43,7 @@ class CurveIterations(unittest.TestCase):
 
     def test_a_short_prefill_pass_is_repeated_for_a_timed_window_and_a_long_one_is_not(self):
         run = llamacpp_runner()
-        self.assertEqual(run.prefill_repetitions(0.4, warmup=1, iters=3), 1 + 50)  # 20 s / 0.4 s
+        self.assertEqual(run.prefill_repetitions(0.4, warmup=1, iters=3), 1 + 58)  # 20 s x 1.15 / 0.4 s
         self.assertEqual(run.prefill_repetitions(0.001, warmup=1, iters=3), 1 + run.MAX_REPETITIONS)
         self.assertEqual(run.prefill_repetitions(2.0, warmup=1, iters=3), 4)  # long passes keep the suite's count
         self.assertEqual(run.prefill_repetitions(18.0, warmup=1, iters=3), 4)

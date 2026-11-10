@@ -51,6 +51,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 try:
     from . import host_load
+    from . import short_pass
     from . import known_unverified
     from . import memory_phases
     from . import page_cache
@@ -66,6 +67,7 @@ try:
     )
 except ImportError:  # direct `python harness/bench.py` execution
     import host_load
+    import short_pass
     import known_unverified
     import memory_phases
     import page_cache
@@ -787,6 +789,17 @@ def render_index(runs, known=()):
     return "\n".join(out)
 
 
+def cmd_short_passes(args):
+    """List the short prefill passes of the committed results whose timed iterations are not evidence (short_pass.py)."""
+    results_dir = Path(args.results_dir or (BENCH_ROOT / "results"))
+    found = short_pass.uncovered(load_runs(results_dir))
+    for run_id, row, point, window_s, spread in found:
+        print(f"{run_id}\t{row['framework']}/{row.get('backend') or '-'}\t{row['model']}\tisl={point['isl']}"
+              f"\titers={point['iters']}\twindow={window_s:.1f}s\tspread={spread:.0%}")
+    print(f"{len(found)} uncovered short pass(es)", file=sys.stderr)
+    return 1 if found else 0
+
+
 def cmd_index(args):
     """Scan every results/<run>/ snapshot into results/INDEX.md."""
     results_dir = Path(args.results_dir or (BENCH_ROOT / "results"))
@@ -1241,6 +1254,10 @@ def main():
     cc.add_argument("--known-unverified",
                     help="the reviewed list of committed cells that stay unverified (default: known-unverified.toml next to the results directory)")
     cc.set_defaults(func=cmd_compare_committed)
+
+    sp = sub.add_parser("short-passes", help="list the short prefill passes whose timed iterations are not evidence (exit 1: some)")
+    sp.add_argument("--results-dir")
+    sp.set_defaults(func=cmd_short_passes)
 
     ix = sub.add_parser("index", help="regenerate results/INDEX.md from all snapshots (progress view)")
     ix.add_argument("--results-dir")
