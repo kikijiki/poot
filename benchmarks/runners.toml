@@ -64,5 +64,5 @@ bin_env = "POOT_BENCH_LLAMACPP_PYTHON"
 bin = "python"
 cmd = ["{bin}", "{bench_root}/runners/llamacpp/run.py", "--gguf", "{model_dir}",
        "--prompt-file", "{prompt_file}", "--gen-tokens", "{gen_tokens}", "--iters", "{iters}",
-       "--precision", "{precision}"]
+       "--warmup", "{warmup}", "--precision", "{precision}"]
 needs_gpu = true

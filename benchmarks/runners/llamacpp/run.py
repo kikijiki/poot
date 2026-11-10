@@ -12,6 +12,8 @@ import argparse
 import json
 import os
 import re
+import math
+import statistics
 import subprocess
 import sys
 
@@ -182,6 +184,47 @@ def resolve_gguf(gguf, precision="f16"):
     raise RuntimeError(f"multiple .gguf in {gguf} and none uniquely match precision {precision}: {ggufs}")
 
 
+def timed_samples(row, warmup):
+    """The per-repetition rates (tokens/s) of one llama-bench row after its `warmup` first repetitions, which are
+    discarded exactly as every other framework discards its warm-up iterations. llama-bench's own `avg_ts` is the
+    mean of all repetitions: one slow repetition moves it, and the first one is always slower (lazy device
+    initialisation), where the contract takes the median of the iterations the runner reports."""
+    samples = row.get("samples_ts") or []
+    if len(samples) <= warmup:
+        raise ValueError(f"llama-bench reported {len(samples)} repetitions, the run needs more than its {warmup} warm-up")
+    return samples[warmup:]
+
+
+# A short prefill pass on the ROCm build stalls in episodes of several seconds after the model loads: the GPU kernels that
+# read the host-mapped tensors (the embedding gather) run up to 500x slower while the kernel compacts memory
+# (kcompactd, page migration), and consecutive passes stay slow until it settles. Three repetitions can all fall inside
+# one episode, so a pass shorter than SHORT_PASS_S is repeated for TIMED_WINDOW_S of timed passes, and the median of
+# those is the iteration the contract sees. It is a property of the engine's first seconds, the same for every backend.
+SHORT_PASS_S = 2.0
+TIMED_WINDOW_S = 20.0
+MAX_REPETITIONS = 100
+
+
+def prefill_repetitions(pass_s, warmup, iters):
+    """llama-bench repetitions (warm-up included) for a prefill pass that took `pass_s` seconds in a pilot."""
+    if pass_s >= SHORT_PASS_S:
+        return warmup + iters
+    return warmup + max(iters, min(MAX_REPETITIONS, math.ceil(TIMED_WINDOW_S / pass_s)))
+
+
+def curve_iterations(isl, osl, pp_row, tg_row, warmup):
+    """The timed iterations of one context length: one per timed prefill repetition after the warm-up, each with the
+    median decode rate of the context length's timed decode repetitions (a short prefill pass is repeated many times
+    and a decode pass few, so the two do not pair one to one)."""
+    pp, tg = timed_samples(pp_row, warmup), timed_samples(tg_row, warmup)
+    tpot = 1000.0 / statistics.median(tg)
+    out = []
+    for pp_ts in pp:
+        ttft = isl / pp_ts * 1000.0
+        out.append({"ttft_ms": ttft, "e2e_ms": ttft + tpot * osl, "itl_ms": [tpot] * max(osl - 1, 0)})
+    return out
+
+
 def run_decode_curve(args):
     """decode-curve (spec 115) via two llama-bench tests per ISL: `-p ISL` for prefill (ttft) and
     `-d ISL -n OSL` for generation throughput at KV depth ISL (decode tok/s at that context length).
@@ -197,7 +240,7 @@ def run_decode_curve(args):
         sys.exit(1)
     isls = [int(x) for x in args.isl_list.split(",") if x.strip()]
     osl = args.osl
-    reps = str(max(args.iters, 1))
+    reps = str(max(args.iters, 1) + args.warmup)
     caveats = ["llama-bench generates at synthetic KV-depth ISL (tokenizer-neutral; throughput, not literal text)",
                "ITL/TPOT is the llama-bench aggregate tg rate at depth (avg over -r reps), NOT a per-token distribution"]
     if args.precision.startswith("q") or "k_m" in args.precision:
@@ -207,8 +250,8 @@ def run_decode_curve(args):
     if memory_caveat:
         caveats.append(memory_caveat)
 
-    def bench(extra):
-        cmd = [BENCH, "-m", gguf, "-ngl", "99", "-r", reps, "-o", "json"] + extra
+    def bench(extra, repetitions=None):
+        cmd = [BENCH, "-m", gguf, "-ngl", "99", "-r", str(repetitions or reps), "-o", "json"] + extra
         log("llamacpp:", " ".join(cmd))
         r = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
         if r.returncode != 0:
@@ -223,23 +266,21 @@ def run_decode_curve(args):
         return rows
 
     for isl in isls:
-        pp_rows = bench(["-p", str(isl), "-n", "0"])              # prefill ISL tokens at depth 0 -> ttft
+        pilot = bench(["-p", str(isl), "-n", "0"], repetitions=1)    # how long one prefill pass takes
+        pilot_row = next((x for x in pilot or [] if x.get("n_prompt", 0) > 0 and x.get("n_gen", 0) == 0), None)
+        pass_s = isl / pilot_row["avg_ts"] if pilot_row and pilot_row.get("avg_ts") else SHORT_PASS_S
+        pp_reps = prefill_repetitions(pass_s, args.warmup, max(args.iters, 1))
+        pp_rows = bench(["-p", str(isl), "-n", "0"], repetitions=pp_reps)  # prefill ISL tokens at depth 0 -> ttft
         tg_rows = bench(["-p", "0", "-n", str(osl), "-d", str(isl)])  # generate OSL at KV-depth ISL -> decode
         if not pp_rows or not tg_rows:
             continue
         pp = next((x for x in pp_rows if x.get("n_prompt", 0) > 0 and x.get("n_gen", 0) == 0), None)
         gp = next((x for x in tg_rows if x.get("n_gen", 0) > 0), None)
         version = (gp or pp or {}).get("build_commit", version)
-        pp_ts = pp["avg_ts"] if pp else None
-        tg_ts = gp["avg_ts"] if gp else None
-        if not tg_ts:
+        if not pp or not gp:
             continue
-        ttft = (isl / pp_ts * 1000.0) if pp_ts else None
-        tpot = 1000.0 / tg_ts
-        e2e = (ttft or 0.0) + tpot * osl
         backend = reported_backend(tg_rows)
-        curve.append({"isl": isl, "prompt_tokens": isl,
-                      "iters": [{"ttft_ms": ttft, "e2e_ms": e2e, "itl_ms": [tpot] * max(osl - 1, 0)}]})
+        curve.append({"isl": isl, "prompt_tokens": isl, "iters": curve_iterations(isl, osl, pp, gp, args.warmup)})
     print(json.dumps({"framework": "llamacpp", **({"backend": backend} if backend else {}), "framework_version": version,
                       "precision": args.precision, "mode": "decode-curve", "osl": osl, "caveats": caveats, "curve": curve,
                       **({"memory_classes": memory_classes} if memory_classes else {})}))
@@ -251,6 +292,7 @@ def main():
     p.add_argument("--prompt-file", required=True)
     p.add_argument("--gen-tokens", type=int, default=128)
     p.add_argument("--iters", type=int, default=5)
+    p.add_argument("--warmup", type=int, default=1, help="leading repetitions of each llama-bench test to discard")
     p.add_argument("--precision", default="f16")
     p.add_argument("--mode", default="single")  # single | decode-curve (spec 115)
     p.add_argument("--isl-list", default="128,512,2048,8192")
