@@ -50,6 +50,7 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 try:
+    from . import host_load
     from . import known_unverified
     from . import memory_phases
     from . import page_cache
@@ -64,6 +65,7 @@ try:
         validate_runner_result,
     )
 except ImportError:  # direct `python harness/bench.py` execution
+    import host_load
     import known_unverified
     import memory_phases
     import page_cache
@@ -582,6 +584,50 @@ def cmd_run(args):
         _run_matrix(args, manifest, runners, suite, models_dir, env, results_root / repeat_id)
 
 
+def cmd_quiet(args):
+    quiet, waited, probe = host_load.wait_quiet(args.wait_s)
+    print(json.dumps({"quiet": quiet, "waited_s": round(waited, 1), **probe}))
+    return 0 if quiet else 1
+
+
+def run_quiet_cell(run_once, quiet_wait_s):
+    """Run one cell on a quiet host (POOT-1523), for every framework and backend alike.
+
+    Before each attempt the host must be quiet (`host_load.wait_quiet`); during it the foreign CPU share is metered.
+    An attempt whose windows exceeded the limit is discarded and run again, at most `host_load.MAX_DISCARDS` times;
+    the row records the load of the attempt it keeps and a summary of every discarded one, so a discard is never
+    silent. A cell that never ran quiet is an error row that says so, not a number.
+    """
+    discarded = []
+    while True:
+        quiet, waited, probe = host_load.wait_quiet(quiet_wait_s)
+        if quiet:
+            with host_load.LoadMeter() as meter:
+                row = run_once()
+            load = meter.result()
+            if row.get("status") != "ok" or load.get("quiet", True):
+                break
+            discarded.append(_load_summary(load))
+        else:
+            load = probe
+            row = {"status": "error", "reason": f"host not quiet before the run: {_load_summary(probe)}"}
+            break
+        if len(discarded) > host_load.MAX_DISCARDS:
+            row = {**row, "status": "error",
+                   "reason": f"host load above {host_load.FOREIGN_SHARE_LIMIT:.0%} in every one of "
+                             f"{len(discarded)} attempts: {discarded}"}
+            break
+    row["host_load"] = {**load, "discarded": len(discarded)}
+    if discarded:
+        row["host_load"]["discarded_loads"] = discarded
+    return row
+
+
+def _load_summary(load):
+    return {k: load.get(k) for k in ("foreign_share_max", "foreign_share_mean", "windows_over_limit", "loadavg_start",
+                                     "loadavg_end") if k in load}
+
+
 def _run_matrix(args, manifest, runners, suite, models_dir, env, run_dir):
     """Run the selected cells once and write the run directory: env.json, results.jsonl and report.md."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -601,12 +647,14 @@ def _run_matrix(args, manifest, runners, suite, models_dir, env, run_dir):
                 continue
             label = f"{model['id']} / {scen['id']} / {fw}"
             print(f"[run] {label} ...", file=sys.stderr, flush=True)
+            def run_once():
+                return run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite,
+                                interval_ms=args.sample_interval_ms, device=env["gpu_name"],
+                                overrides={"gen_tokens": args.gen_tokens, "warmup": args.warmup,
+                                           "iters": args.iters},
+                                diagnostic=args.diagnostic)
             try:
-                row = run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite,
-                               interval_ms=args.sample_interval_ms, device=env["gpu_name"],
-                               overrides={"gen_tokens": args.gen_tokens, "warmup": args.warmup,
-                                          "iters": args.iters},
-                               diagnostic=args.diagnostic)
+                row = run_once() if not is_supported(fw_cfg) else run_quiet_cell(run_once, args.quiet_wait_s)
             except Exception as exc:  # one cell's failure is that cell's error row, never the whole sweep's end
                 row = {"framework": fw, "model": model["id"], "scenario": scen["id"],
                        "precision": fw_cfg.get("precision", model.get("match_precision", "")),
@@ -1160,11 +1208,18 @@ def main():
                         "results/diagnostics/: where the time goes, never throughput evidence")
     r.add_argument("--skip-unsupported", action="store_true",
                    help="omit unsupported cells instead of recording them")
+    r.add_argument("--quiet-wait-s", type=float, default=60.0,
+                   help="how long a cell may wait for a quiet host before it is an error row (the box should be "
+                        "quiet before the locks are taken: `bench quiet`)")
     r.add_argument("--sample-interval-ms", type=float, default=50.0)
     r.add_argument("--gen-tokens", type=int, help="override the scenario gen-tokens (quick smoke runs)")
     r.add_argument("--warmup", type=int, help="override the suite warmup iters")
     r.add_argument("--iters", type=int, help="override the suite timed iters")
     r.set_defaults(func=cmd_run)
+
+    q = sub.add_parser("quiet", help="wait for a quiet host (exit 0), or give up (exit 1): the gate every cell runs behind")
+    q.add_argument("--wait-s", type=float, default=0.0)
+    q.set_defaults(func=cmd_quiet)
 
     rp = sub.add_parser("report", help="render a run directory to a table")
     rp.add_argument("run_dir")

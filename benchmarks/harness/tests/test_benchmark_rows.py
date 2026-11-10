@@ -84,10 +84,12 @@ def bench_run(directory, single, curve, manifest=MANIFEST, *, diagnostic=False, 
         iters=None,
         diagnostic=diagnostic,
         skip_repeats=skip_repeats,
+        quiet_wait_s=0.0,
     )
     with (
         mock.patch.object(bench, "capture_env", side_effect=lambda manifest: HOST_WITH_GPU),
         mock.patch.object(observer, "run_observed", side_effect=run_fixture_runner),
+        mock.patch.object(bench.host_load, "wait_quiet", return_value=(True, 0.0, {"quiet": True})),
         mock.patch.dict(os.environ, {"POOT_BENCH_BACKEND": "ptx"}),
         contextlib.redirect_stdout(io.StringIO()),
         contextlib.redirect_stderr(io.StringIO()),

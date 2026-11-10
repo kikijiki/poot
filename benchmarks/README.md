@@ -63,6 +63,16 @@ embedding table measured 12.1 s to first token on a cache the streamed loader ha
 set larger than the available memory is refused with a typed reason instead of run; `compare` marks a cell unverified
 when a warm repeat took more than `UNEXPECTED_MAJOR_FAULTS` faults. A cold start would be its own labelled scenario.
 
+**Host load.** A short measurement on the host's launch path is a CPU-contention measurement too: Flash-Next on llama.cpp
+ROCm took 400 ms for 128 tokens on a quiet Strix Halo, 432 ms with 12 of 32 CPUs busy elsewhere and 545 ms with all
+32, wherever the busy work ran (POOT-1523). Every supported cell therefore runs behind `harness/host_load.py`, for
+every framework and backend: the host must be quiet before it starts (`bench.py quiet`, which a sweep runs before it
+takes the device locks), and the CPU that user processes outside the cell's tree use is metered in 0.5 s windows
+(kernel threads are the cell's own page-cache work and do not count). A window above 10% of the machine, which
+is under half the 10% noise band at the measured 0.35% per point, discards the attempt and reruns the cell, at most 3
+times; the row's `host_load` records the windows' mean and maximum, the load average and the number of discards with
+their loads. A cell that never runs quiet is an error row. Pinning the process to cores does not help and is not done.
+
 The metric definitions follow MLPerf Inference, vLLM `bench serve`, NVIDIA GenAI-Perf, and Anyscale LLMPerf.
 
 **Scenario `decode-curve`.** For each context length ISL in {128, 512, 2048, 8192, 16384, ...}, prefill

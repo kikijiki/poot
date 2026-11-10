@@ -1,22 +1,7 @@
 {
  "hardware": [
   {
-   "excluded": [
-    {
-     "host": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
-     "model": "qwen3.8-flash-next-q2",
-     "reason": "noise band 11.7% of the median exceeds 10%",
-     "series": "llama.cpp (ROCm)",
-     "set": "2026-11-10-strix-llamacpp-hip-flashq2-pass2"
-    },
-    {
-     "host": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
-     "model": "qwen3.8-flash-next-q2",
-     "reason": "noise band 10.2% of the median exceeds 10%",
-     "series": "llama.cpp (ROCm)",
-     "set": "2026-11-10-strix-llamacpp-hip-flashq2-pass3"
-    }
-   ],
+   "excluded": [],
    "hosts": [
     {
      "cpu": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
@@ -14109,7 +14094,7 @@
     },
     {
      "backend": "rocm",
-     "band": 0.078,
+     "band": 0.041,
      "cells": {
       "unverified": 0,
       "verified": 1
@@ -14128,27 +14113,27 @@
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
-       "max": 26.24,
-       "median": 26.039,
-       "min": 25.033,
+       "max": 27.324,
+       "median": 27.069,
+       "min": 26.496,
        "n": 5
       },
       "prefill_tok_s": {
-       "max": 340.277,
-       "median": 295.176,
-       "min": 203.016,
+       "max": 340.876,
+       "median": 331.638,
+       "min": 291.266,
        "n": 5
       },
       "tpot_ms": {
-       "max": 39.947,
-       "median": 38.404,
-       "min": 38.109,
+       "max": 37.741,
+       "median": 36.942,
+       "min": 36.597,
        "n": 5
       },
       "ttft_ms": {
-       "max": 630.491,
-       "median": 433.639,
-       "min": 376.164,
+       "max": 439.461,
+       "median": 385.963,
+       "min": 375.503,
        "n": 5
       }
      },
@@ -14156,30 +14141,30 @@
      "precision": "q2_k_xl",
      "repeats": 5,
      "series": "llama.cpp (ROCm)",
-     "set": "2026-11-10-strix-llamacpp-hip-flashq2",
+     "set": "2026-11-11-strix-llamacpp-hip-flashq2-gated",
      "spread": {
       "decode_tok_s": {
-       "max": 26.039,
-       "min": 26.039
+       "max": 27.069,
+       "min": 27.069
       },
       "prefill_tok_s": {
-       "max": 295.176,
-       "min": 295.176
+       "max": 331.638,
+       "min": 331.638
       },
       "tpot_ms": {
-       "max": 38.404,
-       "min": 38.404
+       "max": 36.942,
+       "min": 36.942
       },
       "ttft_ms": {
-       "max": 433.639,
-       "min": 433.639
+       "max": 385.963,
+       "min": 385.963
       }
      },
      "verified": true
     },
     {
      "backend": "rocm",
-     "band": 0.078,
+     "band": 0.041,
      "cells": {
       "unverified": 0,
       "verified": 1
@@ -14198,15 +14183,15 @@
      "memory_scope": "inference",
      "metrics": {
       "decode_tok_s": {
-       "max": 25.948,
-       "median": 25.887,
-       "min": 25.216,
+       "max": 25.882,
+       "median": 25.112,
+       "min": 24.9,
        "n": 5
       },
       "energy_j": {
-       "max": 32807.536,
-       "median": 25708.296,
-       "min": 23705.543,
+       "max": 25252.211,
+       "median": 24608.258,
+       "min": 24244.973,
        "n": 5
       },
       "kv_bytes": {
@@ -14216,45 +14201,45 @@
        "n": 5
       },
       "load_rss_bytes": {
-       "max": 29801226240,
-       "median": 29800960000,
-       "min": 29797249024,
+       "max": 29800394752,
+       "median": 29800370176,
+       "min": 29800230912,
        "n": 5
       },
       "load_vram_bytes": {
-       "max": 50910781440,
-       "median": 50910769152,
-       "min": 50910760960,
+       "max": 50912538624,
+       "median": 50911436800,
+       "min": 50910769152,
        "n": 5
       },
       "peak_rss_bytes": {
-       "max": 30188838912,
-       "median": 30188756992,
-       "min": 30184734720,
+       "max": 30188027904,
+       "median": 30187925504,
+       "min": 30187876352,
        "n": 5
       },
       "peak_vram_bytes": {
-       "max": 50912694272,
-       "median": 50912690176,
-       "min": 50912677888,
+       "max": 50914865152,
+       "median": 50913325056,
+       "min": 50912280576,
        "n": 5
       },
       "prefill_tok_s": {
-       "max": 456.626,
-       "median": 440.47,
-       "min": 433.353,
+       "max": 439.723,
+       "median": 432.073,
+       "min": 410.697,
        "n": 5
       },
       "tpot_ms": {
-       "max": 39.657,
-       "median": 38.63,
-       "min": 38.538,
+       "max": 40.16,
+       "median": 39.822,
+       "min": 38.637,
        "n": 5
       },
       "ttft_ms": {
-       "max": 18903.778,
-       "median": 18598.334,
-       "min": 17940.269,
+       "max": 19946.573,
+       "median": 18959.761,
+       "min": 18629.9,
        "n": 5
       },
       "weights_bytes": {
@@ -14275,47 +14260,47 @@
      "precision": "q2_k_xl",
      "repeats": 5,
      "series": "llama.cpp (ROCm)",
-     "set": "2026-11-10-strix-llamacpp-hip-flashq2",
+     "set": "2026-11-11-strix-llamacpp-hip-flashq2-gated",
      "spread": {
       "decode_tok_s": {
-       "max": 25.887,
-       "min": 25.887
+       "max": 25.112,
+       "min": 25.112
       },
       "energy_j": {
-       "max": 25708.296,
-       "min": 25708.296
+       "max": 24608.258,
+       "min": 24608.258
       },
       "kv_bytes": {
        "max": 325656248,
        "min": 325656248
       },
       "load_rss_bytes": {
-       "max": 29800960000,
-       "min": 29800960000
+       "max": 29800370176,
+       "min": 29800370176
       },
       "load_vram_bytes": {
-       "max": 50910769152,
-       "min": 50910769152
+       "max": 50911436800,
+       "min": 50911436800
       },
       "peak_rss_bytes": {
-       "max": 30188756992,
-       "min": 30188756992
+       "max": 30187925504,
+       "min": 30187925504
       },
       "peak_vram_bytes": {
-       "max": 50912690176,
-       "min": 50912690176
+       "max": 50913325056,
+       "min": 50913325056
       },
       "prefill_tok_s": {
-       "max": 440.47,
-       "min": 440.47
+       "max": 432.073,
+       "min": 432.073
       },
       "tpot_ms": {
-       "max": 38.63,
-       "min": 38.63
+       "max": 39.822,
+       "min": 39.822
       },
       "ttft_ms": {
-       "max": 18598.334,
-       "min": 18598.334
+       "max": 18959.761,
+       "min": 18959.761
       },
       "weights_bytes": {
        "max": 49620986102,
