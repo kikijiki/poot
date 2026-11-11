@@ -22,7 +22,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": 4096,
-     "receipt": "benchmarks/performance-bank/receipts/rocm/attention-low-head-decode.json",
+     "receipt": "rocm attention-low-head-decode, receipt 329cc024646b",
      "regime": "low-head low-occupancy attention",
      "series": "poot (ROCm)",
      "step_us": {
@@ -44,7 +44,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": 4096,
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/attention-low-head-decode.json",
+     "receipt": "wgpu attention-low-head-decode, receipt bb110feb3b8c",
      "regime": "low-head low-occupancy attention",
      "series": "poot (wgpu)",
      "step_us": {
@@ -67,7 +67,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": 32768,
-     "receipt": "benchmarks/performance-bank/receipts/rocm/attention-low-head-decode-live-full.json",
+     "receipt": "rocm attention-low-head-decode-live-full, receipt f4129f052be2",
      "regime": "low-head attention, live length at the cache capacity",
      "series": "poot (ROCm)",
      "step_us": {
@@ -90,7 +90,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": 32768,
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/attention-low-head-decode-live-full.json",
+     "receipt": "wgpu attention-low-head-decode-live-full, receipt 65c78b0e7a36",
      "regime": "low-head attention, live length at the cache capacity",
      "series": "poot (wgpu)",
      "step_us": {
@@ -113,7 +113,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": 1024,
-     "receipt": "benchmarks/performance-bank/receipts/rocm/attention-low-head-decode-live-short.json",
+     "receipt": "rocm attention-low-head-decode-live-short, receipt f0486f3c0467",
      "regime": "low-head attention, live length far below the cache capacity",
      "series": "poot (ROCm)",
      "step_us": {
@@ -136,7 +136,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": 1024,
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/attention-low-head-decode-live-short.json",
+     "receipt": "wgpu attention-low-head-decode-live-short, receipt 54fccb36b510",
      "regime": "low-head attention, live length far below the cache capacity",
      "series": "poot (wgpu)",
      "step_us": {
@@ -157,7 +157,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/rocm/batched-decode-gemm.json",
+     "receipt": "rocm batched-decode-gemm, receipt 4dfe34e5c0dd",
      "regime": "batched decode",
      "series": "poot (ROCm)",
      "step_us": {
@@ -178,7 +178,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/batched-decode-gemm.json",
+     "receipt": "wgpu batched-decode-gemm, receipt 041c31901c38",
      "regime": "batched decode",
      "series": "poot (wgpu)",
      "step_us": {
@@ -199,7 +199,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/rocm/dense-decode-gemv.json",
+     "receipt": "rocm dense-decode-gemv, receipt d7dffe6726aa",
      "regime": "dense bandwidth decode",
      "series": "poot (ROCm)",
      "step_us": {
@@ -220,7 +220,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/dense-decode-gemv.json",
+     "receipt": "wgpu dense-decode-gemv, receipt 678a8f78bb4e",
      "regime": "dense bandwidth decode",
      "series": "poot (wgpu)",
      "step_us": {
@@ -241,7 +241,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/rocm/long-recurrence-scan.json",
+     "receipt": "rocm long-recurrence-scan, receipt f90b6daae48e",
      "regime": "long recurrence",
      "series": "poot (ROCm)",
      "step_us": {
@@ -262,7 +262,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/long-recurrence-scan.json",
+     "receipt": "wgpu long-recurrence-scan, receipt 0af0fc1a65c2",
      "regime": "long recurrence",
      "series": "poot (wgpu)",
      "step_us": {
@@ -285,7 +285,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": 2048,
-     "receipt": "benchmarks/performance-bank/receipts/rocm/prefill-attention-2048.json",
+     "receipt": "rocm prefill-attention-2048, receipt 50b5b3164776",
      "regime": "causal prefill attention, GQA",
      "series": "poot (ROCm)",
      "step_us": {
@@ -308,7 +308,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": 2048,
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/prefill-attention-2048.json",
+     "receipt": "wgpu prefill-attention-2048, receipt e86c2a44bd43",
      "regime": "causal prefill attention, GQA",
      "series": "poot (wgpu)",
      "step_us": {
@@ -331,7 +331,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": 8192,
-     "receipt": "benchmarks/performance-bank/receipts/rocm/prefill-attention-8192.json",
+     "receipt": "rocm prefill-attention-8192, receipt a20cb51399c6",
      "regime": "causal prefill attention, GQA",
      "series": "poot (ROCm)",
      "step_us": {
@@ -354,7 +354,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": 8192,
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/prefill-attention-8192.json",
+     "receipt": "wgpu prefill-attention-8192, receipt b2441811eb78",
      "regime": "causal prefill attention, GQA",
      "series": "poot (wgpu)",
      "step_us": {
@@ -375,7 +375,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/rocm/prefill-dense-bf16-nk.json",
+     "receipt": "rocm prefill-dense-bf16-nk, receipt 062c3a6ec3a9",
      "regime": "compute-heavy prefill projection over a checkpoint-order bf16 weight",
      "series": "poot (ROCm)",
      "step_us": {
@@ -396,7 +396,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/prefill-dense-bf16-nk.json",
+     "receipt": "wgpu prefill-dense-bf16-nk, receipt b473ba248d9c",
      "regime": "compute-heavy prefill projection over a checkpoint-order bf16 weight",
      "series": "poot (wgpu)",
      "step_us": {
@@ -417,7 +417,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/rocm/prefill-long-gemm.json",
+     "receipt": "rocm prefill-long-gemm, receipt 62cd31f851b0",
      "regime": "compute-heavy long prefill",
      "series": "poot (ROCm)",
      "step_us": {
@@ -438,7 +438,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/prefill-long-gemm.json",
+     "receipt": "wgpu prefill-long-gemm, receipt 8accb3d39b62",
      "regime": "compute-heavy long prefill",
      "series": "poot (wgpu)",
      "step_us": {
@@ -459,7 +459,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/rocm/prefill-short-gemm.json",
+     "receipt": "rocm prefill-short-gemm, receipt 4276c5e04602",
      "regime": "compute-heavy short prefill",
      "series": "poot (ROCm)",
      "step_us": {
@@ -480,7 +480,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/prefill-short-gemm.json",
+     "receipt": "wgpu prefill-short-gemm, receipt bd182b2af415",
      "regime": "compute-heavy short prefill",
      "series": "poot (wgpu)",
      "step_us": {
@@ -501,7 +501,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/rocm/recurrence-scan-many-heads.json",
+     "receipt": "rocm recurrence-scan-many-heads, receipt cd3719e2695d",
      "regime": "recurrence, device-saturating head count",
      "series": "poot (ROCm)",
      "step_us": {
@@ -522,7 +522,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/recurrence-scan-many-heads.json",
+     "receipt": "wgpu recurrence-scan-many-heads, receipt 10f6adc16835",
      "regime": "recurrence, device-saturating head count",
      "series": "poot (wgpu)",
      "step_us": {
@@ -543,7 +543,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/rocm/recurrence-scan-narrow-state.json",
+     "receipt": "rocm recurrence-scan-narrow-state, receipt 307b94aa1970",
      "regime": "recurrence, narrow per-head state",
      "series": "poot (ROCm)",
      "step_us": {
@@ -564,7 +564,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/recurrence-scan-narrow-state.json",
+     "receipt": "wgpu recurrence-scan-narrow-state, receipt ae0e13192bc8",
      "regime": "recurrence, narrow per-head state",
      "series": "poot (wgpu)",
      "step_us": {
@@ -585,7 +585,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/rocm/recurrence-scan-short.json",
+     "receipt": "rocm recurrence-scan-short, receipt 26810642e789",
      "regime": "recurrence, short sequence",
      "series": "poot (ROCm)",
      "step_us": {
@@ -606,7 +606,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/recurrence-scan-short.json",
+     "receipt": "wgpu recurrence-scan-short, receipt fc3d55de69d9",
      "regime": "recurrence, short sequence",
      "series": "poot (wgpu)",
      "step_us": {
@@ -629,7 +629,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/rocm/ssd-long-recurrence-scan.json",
+     "receipt": "rocm ssd-long-recurrence-scan, receipt cb3bceb29db1",
      "regime": "SSD long recurrence, few heads",
      "series": "poot (ROCm)",
      "step_us": {
@@ -652,7 +652,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/ssd-long-recurrence-scan.json",
+     "receipt": "wgpu ssd-long-recurrence-scan, receipt 92eb8eef1a20",
      "regime": "SSD long recurrence, few heads",
      "series": "poot (wgpu)",
      "step_us": {
@@ -675,7 +675,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/rocm/ssd-recurrence-scan-boundary.json",
+     "receipt": "rocm ssd-recurrence-scan-boundary, receipt 09d0d7875bb7",
      "regime": "SSD recurrence, at the split threshold",
      "series": "poot (ROCm)",
      "step_us": {
@@ -698,7 +698,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/ssd-recurrence-scan-boundary.json",
+     "receipt": "wgpu ssd-recurrence-scan-boundary, receipt ea0e92ef6863",
      "regime": "SSD recurrence, at the split threshold",
      "series": "poot (wgpu)",
      "step_us": {
@@ -721,7 +721,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/rocm/ssd-recurrence-scan-many-heads.json",
+     "receipt": "rocm ssd-recurrence-scan-many-heads, receipt 0f0b5e9eef20",
      "regime": "SSD recurrence, device-saturating head count",
      "series": "poot (ROCm)",
      "step_us": {
@@ -744,7 +744,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/ssd-recurrence-scan-many-heads.json",
+     "receipt": "wgpu ssd-recurrence-scan-many-heads, receipt 6b2ba7a5f3ff",
      "regime": "SSD recurrence, device-saturating head count",
      "series": "poot (wgpu)",
      "step_us": {
@@ -767,7 +767,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/rocm/ssd-recurrence-scan-short.json",
+     "receipt": "rocm ssd-recurrence-scan-short, receipt 99a6c68a6434",
      "regime": "SSD recurrence, short sequence",
      "series": "poot (ROCm)",
      "step_us": {
@@ -790,7 +790,7 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/wgpu/ssd-recurrence-scan-short.json",
+     "receipt": "wgpu ssd-recurrence-scan-short, receipt fa68d2b20d47",
      "regime": "SSD recurrence, short sequence",
      "series": "poot (wgpu)",
      "step_us": {
@@ -14245,7 +14245,7 @@
      },
      "driver": "595.91.07",
      "live_context": 4096,
-     "receipt": "benchmarks/performance-bank/receipts/ptx/attention-low-head-decode.json",
+     "receipt": "ptx attention-low-head-decode, receipt 53db68ab0193",
      "regime": "low-head low-occupancy attention",
      "series": "poot (PTX)",
      "step_us": {
@@ -14268,7 +14268,7 @@
      },
      "driver": "595.91.07",
      "live_context": 32768,
-     "receipt": "benchmarks/performance-bank/receipts/ptx/attention-low-head-decode-live-full.json",
+     "receipt": "ptx attention-low-head-decode-live-full, receipt d07cdf2351bf",
      "regime": "low-head attention, live length at the cache capacity",
      "series": "poot (PTX)",
      "step_us": {
@@ -14289,7 +14289,7 @@
      },
      "driver": "595.91.07",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/ptx/batched-decode-gemm.json",
+     "receipt": "ptx batched-decode-gemm, receipt 04b69a412bd0",
      "regime": "batched decode",
      "series": "poot (PTX)",
      "step_us": {
@@ -14310,7 +14310,7 @@
      },
      "driver": "595.91.07",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/ptx/dense-decode-gemv.json",
+     "receipt": "ptx dense-decode-gemv, receipt 11f83a5ada48",
      "regime": "dense bandwidth decode",
      "series": "poot (PTX)",
      "step_us": {
@@ -14334,7 +14334,7 @@
      },
      "driver": "595.91.07",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/ptx/expert-prefill-packed-iq2xs-up-narrow.json",
+     "receipt": "ptx expert-prefill-packed-iq2xs-up-narrow, receipt 414ee77445e9",
      "regime": "The same packed IQ2_XS routed projection with narrow operands (the matrix unit)",
      "series": "poot (PTX)",
      "step_us": {
@@ -14358,7 +14358,7 @@
      },
      "driver": "595.91.07",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/ptx/expert-prefill-qwen3moe-up-narrow.json",
+     "receipt": "ptx expert-prefill-qwen3moe-up-narrow, receipt fc10a8ddf09e",
      "regime": "MoE prefill routed expert projection at Qwen3-MoE dimensions (512 tokens, each to 8 of 128 experts) over a checkpoint-order bf16 expert stack, narrow operands",
      "series": "poot (PTX)",
      "step_us": {
@@ -14381,7 +14381,7 @@
      },
      "driver": "595.91.07",
      "live_context": 2048,
-     "receipt": "benchmarks/performance-bank/receipts/ptx/prefill-attention-2048.json",
+     "receipt": "ptx prefill-attention-2048, receipt a2aae4983507",
      "regime": "causal prefill attention, GQA",
      "series": "poot (PTX)",
      "step_us": {
@@ -14404,7 +14404,7 @@
      },
      "driver": "595.91.07",
      "live_context": 8192,
-     "receipt": "benchmarks/performance-bank/receipts/ptx/prefill-attention-8192.json",
+     "receipt": "ptx prefill-attention-8192, receipt d7839f27c447",
      "regime": "causal prefill attention, GQA",
      "series": "poot (PTX)",
      "step_us": {
@@ -14425,7 +14425,7 @@
      },
      "driver": "595.91.07",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/ptx/prefill-dense-bf16-nk.json",
+     "receipt": "ptx prefill-dense-bf16-nk, receipt e92e76c1b982",
      "regime": "compute-heavy prefill projection over a checkpoint-order bf16 weight",
      "series": "poot (PTX)",
      "step_us": {
@@ -14446,7 +14446,7 @@
      },
      "driver": "595.91.07",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/ptx/prefill-long-gemm.json",
+     "receipt": "ptx prefill-long-gemm, receipt 3af98da4ee79",
      "regime": "compute-heavy long prefill",
      "series": "poot (PTX)",
      "step_us": {
@@ -14467,7 +14467,7 @@
      },
      "driver": "595.91.07",
      "live_context": "n/a",
-     "receipt": "benchmarks/performance-bank/receipts/ptx/prefill-short-gemm.json",
+     "receipt": "ptx prefill-short-gemm, receipt 65078a00f457",
      "regime": "compute-heavy short prefill",
      "series": "poot (PTX)",
      "step_us": {

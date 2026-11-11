@@ -329,7 +329,7 @@ device clock, measured on a second engine over a device built with timing (so it
 lands in the wall numbers). A claim then states `device_tflop_per_s` too, the same work over the median
 `device_us`, which judges the kernel without the output readback; a device with no timestamps records no device
 cell and states none.
-`receipts/request-level/` holds the poot runner's own decode-curve lines from the three preparation states on one device (qwen2.5-0.5b, wgpu): measurements, not claims, so `receipts.json` does not list them.
+The bank directory's `request-level/` receipts hold the poot runner's own decode-curve lines from the three preparation states on one device (qwen2.5-0.5b, wgpu): measurements, not claims, so `receipts.json` does not list them.
 Hardware numbers are recorded with their noise: a baseline taken next to other GPU work shows it, and the
 uncertainty rule above then calls a later comparison unverified instead of passing it.
 

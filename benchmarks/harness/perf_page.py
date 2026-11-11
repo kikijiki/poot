@@ -324,7 +324,7 @@ def collect_kernels(bank_root=None):
             "live_context": identity["live_context"],
             "driver": identity["driver"],
             "step_us": _stat(samples),
-            "receipt": f"benchmarks/performance-bank/{claim['receipt']}",
+            "receipt": f"{claim['backend']} {claim['case']}, receipt {claim['receipt_sha256'][:12]}",
         }))
     return kernels
 

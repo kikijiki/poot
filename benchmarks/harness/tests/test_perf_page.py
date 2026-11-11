@@ -41,7 +41,8 @@ def write_bank(bank_dir, device=None):
     bank_dir = Path(bank_dir)
     entries = []
     if device:
-        entries = [{"status": "verified", "case": "case-1", "backend": "wgpu", "receipt": "r.json"}]
+        entries = [{"status": "verified", "case": "case-1", "backend": "wgpu", "receipt": "r.json",
+                    "receipt_sha256": "0123456789abcdef" * 4}]
         (bank_dir / "r.json").write_text(json.dumps({
             "reference": {"agrees": True},
             "identity": {"device": device, "precision": "f32", "dimensions": {}, "live_context": 1, "driver": "d 1"},
@@ -271,6 +272,14 @@ class PerfPageTest(unittest.TestCase):
         (cls,) = self.classes({"set-a": (repeats(), {"cpu": "CPU A"}), "set-b": (repeats(), {"cpu": "CPU B"})}, kernel_device="Test GPU")
 
         self.assertEqual([k["case"] for k in cls["kernels"]], ["case-1"])
+
+    def test_a_kernel_row_names_its_measurement_not_a_file_of_the_repository(self):
+        """Mutation: emit the receipt's bank path again and the label names a file the public repository does not hold."""
+        (cls,) = self.classes({"set-a": (repeats(), {"cpu": "CPU A"})}, kernel_device="Test GPU")
+
+        (kernel,) = cls["kernels"]
+        self.assertEqual(kernel["receipt"], "wgpu case-1, receipt 0123456789ab")
+        self.assertNotIn("/", kernel["receipt"])
 
     def test_a_device_with_receipts_and_no_runs_is_not_a_class(self):
         (cls,) = self.classes({"set-a": (repeats(), {"cpu": "CPU A"})}, kernel_device="Other GPU")
