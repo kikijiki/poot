@@ -1048,6 +1048,19 @@ pub enum ShapeError {
         blocks: usize,
     },
 
+    /// A stable rank orders at least one element per row.
+    #[error("stable rank needs at least one element on its last axis")]
+    StableRankNoExperts,
+
+    /// A stable rank's eligibility has the shape of its scores.
+    #[error("stable rank eligibility has shape {actual:?}; the scores have {expected:?}")]
+    StableRankEligibility {
+        /// The scores' shape.
+        expected: Vec<usize>,
+        /// The eligibility's shape.
+        actual: Vec<usize>,
+    },
+
     /// The operation does not accept the dtype.
     #[error("{op} does not support {dtype}")]
     DtypeOp {

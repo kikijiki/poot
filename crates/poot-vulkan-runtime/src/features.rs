@@ -134,6 +134,11 @@ impl DeviceFeatures {
         self.cooperative_matrix && self.subgroup_size_control
     }
 
+    /// Whether a pipeline can require full subgroups (`computeFullSubgroups` of `VK_EXT_subgroup_size_control`).
+    pub(crate) fn full_subgroup_pipelines(&self) -> bool {
+        self.subgroup_size_control
+    }
+
     /// The core features the logical device enables: everything supported that poot's SPIR-V can use.
     /// Robust buffer access is not optional here: `create_device` refuses a device without it.
     fn enabled_core(&self) -> vk::PhysicalDeviceFeatures {

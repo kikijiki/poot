@@ -52,6 +52,7 @@ pub(crate) fn op_label(op: &OpKind) -> &'static str {
         OpKind::Rope { .. } => "rope",
         OpKind::Scan(_) => "scan",
         OpKind::BlockTopK(_) => "block_top_k",
+        OpKind::StableRank(_) => "stable_rank",
         OpKind::SelectedAttention(_) => "selected_attention",
         OpKind::AllReduce { .. } => "all_reduce",
         OpKind::AllGather { .. } => "all_gather",

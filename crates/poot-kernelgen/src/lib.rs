@@ -20,6 +20,7 @@ mod gemv;
 mod helpers;
 mod matmul;
 mod microtile;
+mod order_key;
 mod packed;
 mod precision;
 mod reduce;
@@ -27,6 +28,7 @@ mod reduce;
 mod register_budget;
 mod request;
 mod scan;
+mod stable_rank;
 #[cfg(test)]
 mod synchronization;
 #[cfg(test)]
@@ -53,6 +55,7 @@ pub use request::{
     serialized_schedule,
 };
 pub use scan::{ScanKernel, ScanSpec};
+pub use stable_rank::{STABLE_RANK_MAX_LANES, StableRankSpec};
 
 // The types a request carries (the planner builds them), and `view_eff_strides`, the planner's strided-view
 // legality predicate shares with the generators.

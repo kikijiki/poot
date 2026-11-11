@@ -1,0 +1,13 @@
+# Planner-invariant losses that stay while their root-cause card is open (harness/planner_invariant.py, POOT-1548).
+# A narrow case whose chosen schedule measures slower than its exact twin fails the invariant; listing the pair here
+# reports it as DECLARED LOSS with the follow-up and lets the gate pass. The entry is temporary: a listed pair that no
+# longer loses FAILS, so delete the entry in the commit that fixes the loss. `median_*_us` are the device-clock medians
+# of the committed receipts the entry was reviewed at.
+
+[[loss]]
+case = "expert-prefill-packed-iq2xs-up-narrow"
+backend = "rocm"
+median_narrow_us = 5427.4
+median_exact_us = 5059.4
+reason = "the planner realized a different plan than the exact twin for the packed IQ2_XS expert up projection and it measures about 7% slower on the ROCm iGPU; the root cause is open"
+follow_up = "POOT-1547"

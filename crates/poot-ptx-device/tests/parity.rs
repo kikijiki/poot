@@ -262,6 +262,27 @@ fn block_top_k_selects_what_the_plain_selection_selects_on_ptx() {
     }
 }
 
+/// POOT-1543: the router's stable rank (ties across the cut, signed zeros, NaN and infinities, one expert to 513, a
+/// masked rank whose eligibility is 0.5, 2.0 and NaN) runs through the generated workgroup sort on the device, and
+/// its ranks equal both the plain sort (computed here without the oracle) and the oracle's primitive definition at
+/// every replayed step.
+/// Mutation: in `stable_rank.rs` write `p + 1` as the rank (device lane), or break the tie order (the comparator
+/// takes the higher index on equal keys); the ties case goes red.
+#[test]
+fn stable_rank_ranks_what_the_plain_sort_ranks_on_ptx() {
+    let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    for case in poot_executor_parity::stable_rank::cases() {
+        poot_executor_parity::stable_rank::assert_device_ranks(exec.as_mut(), t, &case);
+        let mut oracle = oracle_for(&case.fixture.graph, &case.fixture.store);
+        poot_executor_parity::run_parity(exec.as_mut(), t, &case.fixture, &mut oracle)
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+}
+
 /// POOT-1143 stage 3: attention over the blocks a selection names (a GQA decode, a prefill with empty and short
 /// selections, every block selected, and the design's deep decode: 24 query heads over 2 of 256, 32768 positions,
 /// 512 blocks selected) runs through the generated kernel on the device and equals the independent f64 attention

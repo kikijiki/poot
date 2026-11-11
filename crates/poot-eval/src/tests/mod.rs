@@ -29,6 +29,7 @@ mod qwen3next_ladder;
 mod scan_contract;
 mod select;
 mod selected_attention;
+mod stable_rank;
 mod swa_gemma3;
 mod tensor_residency;
 mod validation;

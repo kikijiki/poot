@@ -13,7 +13,7 @@
 use crate::graph_validation::{ValidationPacketPlan, ValidationPacketSource};
 use poot_graph_ir::op::{BinOp, OpKind, RedOp};
 use poot_graph_ir::{Eqn, Graph, Operand, Scalar, ValidationPacketLayout, ValueId, ValueTable};
-use poot_kernel_ir::{Body, WmmaDtype};
+use poot_kernel_ir::{Body, COLLECTIVE_LANES, WmmaDtype};
 use poot_kernelgen::{BodyUse, FragmentUse, KernelRequirements, UnmeasurableLds};
 use poot_target::{
     DeviceCaps, FragmentDtype, FragmentShape, MatrixUnits, Queried, SubgroupSupport,
@@ -194,6 +194,7 @@ fn witness_op(op: &OpKind) -> WitnessOp {
         | OpKind::Rope { .. }
         | OpKind::Scan(_)
         | OpKind::BlockTopK(_)
+        | OpKind::StableRank(_)
         | OpKind::SelectedAttention(_)
         | OpKind::AllReduce { .. }
         | OpKind::AllGather { .. }
@@ -467,6 +468,24 @@ pub enum ResourceRefusal {
         /// The device's limit on invocations per workgroup.
         limit: u32,
     },
+    /// The body shuffles between lanes and the device may run subgroups narrower than the 32 lanes a shuffle
+    /// mask can reach.
+    #[error(
+        "the body shuffles between lanes of a {COLLECTIVE_LANES}-lane run; the device may run subgroups of {min_size} lanes"
+    )]
+    ShuffleSubgroupTooNarrow {
+        /// The smallest subgroup the device can run, in lanes.
+        min_size: u32,
+    },
+    /// The body shuffles between lanes and its X extent is not a whole number of lane runs, so the last run
+    /// has lanes whose partners do not exist.
+    #[error(
+        "the body shuffles between lanes of a {COLLECTIVE_LANES}-lane run; its workgroup X extent {extent} is not a multiple of it"
+    )]
+    ShuffleWorkgroupExtent {
+        /// The workgroup's X extent, in lanes.
+        extent: u32,
+    },
     /// The body computes in 64-bit floats and the device was not opened with that shader feature.
     #[error(
         "the body computes in 64-bit floats; the device was not opened with the float64 shader feature"
@@ -510,6 +529,26 @@ pub(crate) fn validate_kernel_resources(
             return Err(ResourceRefusal::FragmentWithoutSubgroup { fragment });
         }
         check_fragment(fragment, caps.matrix_units)?;
+    }
+    if used.uses_shuffle {
+        // A shuffle exchanges within an aligned run of COLLECTIVE_LANES lanes, which is a whole subgroup
+        // only where every subgroup the device may run has at least that many lanes.
+        let lanes = COLLECTIVE_LANES;
+        match caps.subgroup {
+            Queried::Unknown => return Err(ResourceRefusal::SubgroupUnknown { lanes }),
+            Queried::Known(SubgroupSupport::Absent) => {
+                return Err(ResourceRefusal::SubgroupAbsent { lanes });
+            }
+            Queried::Known(SubgroupSupport::Present { min_size, .. }) if min_size < lanes => {
+                return Err(ResourceRefusal::ShuffleSubgroupTooNarrow { min_size });
+            }
+            Queried::Known(SubgroupSupport::Present { .. }) => {}
+        }
+        if !used.workgroup[0].is_multiple_of(lanes) {
+            return Err(ResourceRefusal::ShuffleWorkgroupExtent {
+                extent: used.workgroup[0],
+            });
+        }
     }
     if let Some(lanes) = declared.subgroup_lanes {
         match caps.subgroup {

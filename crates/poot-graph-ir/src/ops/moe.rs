@@ -65,11 +65,12 @@ pub fn stable_descending_rank(b: &Builder, x: Traced) -> Result<Traced, BuilderE
     b.reduce(RedOp::Sum, precedes, last + 1, false)
 }
 
-/// Stable descending rank restricted by an exact `0.0`/`1.0` eligibility mask of the same shape.
-/// Eligible entries always precede ineligible entries, then canonical score descending and lower index
-/// break ties within each class. The result remains a permutation of `0..E`; this is the group-limited MoE
-/// equivalent of setting excluded softmax probabilities to zero, without relying on an additive sentinel
-/// that can collide with `f32::MIN`.
+/// Stable descending rank restricted by an eligibility of the same shape. An entry is eligible when
+/// `eligible >= 1.0` (a NaN is not), so the class is one comparison and every value of the operand has a
+/// meaning; an exact `0.0`/`1.0` mask is its own class. Eligible entries always precede ineligible entries, then
+/// canonical score descending and lower index break ties within each class. The result remains a permutation
+/// of `0..E`; this is the group-limited MoE equivalent of setting excluded softmax probabilities to zero,
+/// without relying on an additive sentinel that can collide with `f32::MIN`.
 pub fn stable_descending_rank_masked(
     b: &Builder,
     x: Traced,
@@ -95,6 +96,7 @@ pub fn stable_descending_rank_masked(
     }
     let last = shape.len() - 1;
     let scores = canonical_router_scores(b, x)?;
+    let eligible = b.binary_scalar(BinOp::Ge, eligible, Scalar::F32(1.0))?;
 
     let mut pair_shape = shape.clone();
     pair_shape.push(e);

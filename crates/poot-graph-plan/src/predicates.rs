@@ -653,7 +653,7 @@ fn attention_fragment_config(
     };
     let config = *caps.matrix_units.known()?.config(dtype)?;
     (config.shape == poot_target::FragmentShape::M16N16K16
-        && config.subgroup == poot_kernel_ir::FRAGMENT_COLLECTIVE_LANES)
+        && config.subgroup == poot_kernel_ir::COLLECTIVE_LANES)
         .then_some(config)
 }
 

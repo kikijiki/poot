@@ -366,6 +366,7 @@ fn unsupported(op: &OpKind) -> Capability {
         | OpKind::SelectedAttention(_)
         | OpKind::Scan(_)
         | OpKind::BlockTopK(_)
+        | OpKind::StableRank(_)
         | OpKind::Cast { .. }
         | OpKind::RandomUniform { .. }
         | OpKind::SampleToken { .. }

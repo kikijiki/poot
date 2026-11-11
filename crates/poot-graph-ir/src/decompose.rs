@@ -180,6 +180,13 @@ pub fn decompose(
             };
             ops::block_top_k_packed(&b, scores, pos, attrs.ratio, attrs.k)?
         }
+        OpKind::StableRank(attrs) => match (attrs.masked, inputs.as_slice()) {
+            (false, &[scores]) => ops::stable_descending_rank(&b, scores)?,
+            (true, &[scores, eligible]) => {
+                ops::stable_descending_rank_masked(&b, scores, eligible)?
+            }
+            _ => return Ok(None),
+        },
         OpKind::Scan(attrs) => {
             // The definition unrolls one chunk body per chunk; the CPU oracle never evaluates it whole but one
             // chunk window at a time (`poot_eval`), so the sequence length has no ceiling there.
@@ -569,10 +576,11 @@ pub(crate) mod tests {
             OpKind::SampleToken { .. } => 30,
             OpKind::ExpertGroup { .. } => 35,
             OpKind::SideOutput { .. } => 36,
+            OpKind::StableRank(_) => 37,
         }
     }
 
-    pub(crate) const VARIANTS: usize = 37;
+    pub(crate) const VARIANTS: usize = 38;
 
     /// The epilogue region `(head + bias) + residual`: local 0 the head result, 1 the bias, 2 the residual.
     fn bias_residual_region() -> FusedRegion {
@@ -938,6 +946,14 @@ pub(crate) mod tests {
             (
                 OpKind::BlockTopK(crate::op::BlockTopKAttrs { ratio: 2, k: 3 }),
                 vec![f32(&[2, 1, 3, 6]), typed(&[2, 3], i32)],
+            ),
+            (
+                OpKind::StableRank(crate::op::StableRankAttrs { masked: false }),
+                vec![f32(&[2, 5])],
+            ),
+            (
+                OpKind::StableRank(crate::op::StableRankAttrs { masked: true }),
+                vec![f32(&[2, 5]), f32(&[2, 5])],
             ),
             (
                 OpKind::AllReduce {

@@ -1968,6 +1968,7 @@ mod tests {
             },
             detail: poot_runtime_common::Coverage::Unavailable,
             buckets: Default::default(),
+            labelled: Default::default(),
             perturbed: false,
         }
     }

@@ -13,7 +13,9 @@
 
 use crate::register_oracle::PtxKernelRegisters;
 use poot_codegen::CompiledKernel;
-use poot_executor::{Arg, Device, DeviceTime, Dispatch, LaunchKind, MeasuredDeviceTime};
+use poot_executor::{
+    Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind, MeasuredDeviceTime,
+};
 use poot_graph_plan::Target;
 use poot_ptx_runtime::{PtxBuffer, PtxContext, PtxError, PtxGraphExec, PtxSpan};
 use poot_runtime_common::{BufferRole, DeviceIdentity};
@@ -54,8 +56,9 @@ impl PtxDevice {
     }
 
     /// Like [`Self::new`], but every graph replay is bracketed by a CUDA event pair, so
-    /// [`Device::device_time`] is `Measured` (the device span; PTX has no per-dispatch timing inside a
-    /// captured graph).
+    /// [`Device::device_time`] is `Measured` (the device span), and the graphs it captures carry a CUDA event
+    /// after each dispatch, so each dispatch has its own duration. The events serialize nothing the capture
+    /// did not already order, but they cost a node each: a timed device is diagnostic, not throughput evidence.
     pub fn new_with_device_timing() -> Result<Self, PtxGpuError> {
         Self::with_context(PtxContext::new_with_device_timing()?)
     }
@@ -224,14 +227,25 @@ impl Device for PtxDevice {
     /// [`PtxContext::new_with_device_timing`] (SC-006: never a fabricated host-wall measurement), or
     /// if reading the event pair fails.
     fn device_time(&self) -> DeviceTime {
-        match self.ctx.spans_elapsed(&self.pending_spans) {
-            Ok(Some(duration)) => DeviceTime::Measured(MeasuredDeviceTime {
-                sum_of_dispatch_durations: None,
-                device_span: Some(duration),
-                dispatches: Vec::new(),
-            }),
-            Ok(None) | Err(_) => DeviceTime::Unknown,
+        let Ok(Some(span)) = self.ctx.spans_elapsed(&self.pending_spans) else {
+            return DeviceTime::Unknown;
+        };
+        let mut durations = Vec::new();
+        for pending in &self.pending_spans {
+            match self.ctx.dispatch_durations(pending) {
+                Ok(read) => durations.extend(read),
+                Err(_) => return DeviceTime::Unknown,
+            }
         }
+        DeviceTime::Measured(MeasuredDeviceTime {
+            sum_of_dispatch_durations: Some(durations.iter().sum()),
+            device_span: Some(span),
+            dispatches: durations
+                .into_iter()
+                .enumerate()
+                .map(|(index, duration)| DispatchDeviceTime { index, duration })
+                .collect(),
+        })
     }
 
     fn abort(&mut self) -> Result<(), PtxGpuError> {

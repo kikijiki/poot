@@ -255,7 +255,11 @@ impl<T> Queried<T> {
 pub enum SubgroupSupport {
     /// Queried and confirmed absent.
     Absent,
-    /// A subgroup has between `min_size` and `max_size` lanes (equal where the size is fixed).
+    /// Compute shaders run subgroup shuffles, and a workgroup whose X extent is a multiple of `max_size` runs
+    /// as full subgroups of consecutive `LocalX` lanes. A subgroup has between `min_size` and `max_size` lanes
+    /// (equal where the size is fixed). Each runtime reports it where its API gives that guarantee: PTX and
+    /// ROCm from the fixed warp or wavefront size, raw Vulkan from the compute stage's supported subgroup
+    /// operations (a shuffling pipeline requires full subgroups), wgpu from the granted `SUBGROUP` feature.
     Present {
         /// The smallest subgroup the device can run.
         min_size: u32,

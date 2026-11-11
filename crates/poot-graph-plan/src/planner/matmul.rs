@@ -467,6 +467,7 @@ pub(super) fn plan(
         | attention_ops!()
         | scan_ops!()
         | block_top_k_ops!()
+        | stable_rank_ops!()
         | cast_ops!()
         | movement_ops!()
         | sampling_ops!() => unreachable!("plan_eqn routes only matmul ops here"),

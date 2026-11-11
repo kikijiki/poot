@@ -505,7 +505,7 @@ impl PtxContext {
             )
         }?;
         self.capture.begin();
-        Ok(())
+        self.mark_capture()
     }
 
     /// End capture and instantiate the recorded graph into a replayable [`PtxGraphExec`] that owns the
@@ -514,14 +514,65 @@ impl PtxContext {
     pub fn end_capture(&self) -> Result<PtxGraphExec, PtxError> {
         self.bind()?;
         let captured = self.capture.finish();
+        let marks = self.capture.take_marks();
         // SAFETY: `stream` is this context's live stream; ending a capture takes no host memory.
         let graph = unsafe { result::stream::end_capture(self.owner.stream) }?;
-        instantiate_graph(Arc::clone(&self.owner), graph, captured, |exec| {
+        let mut exec = instantiate_graph(Arc::clone(&self.owner), graph, captured, |exec| {
             // SAFETY: `exec` is a valid out-pointer and `graph` is the live graph the capture just returned.
             unsafe { sys::cuGraphInstantiateWithFlags(exec, graph, 0) }
                 .result()
                 .map_err(PtxError::Driver)
-        })
+        })?;
+        exec.marks = marks;
+        Ok(exec)
+    }
+
+    /// Record a timing mark on the capturing stream when this context is device-timed: a CUDA event the
+    /// captured graph records at this point of its dispatch sequence. The capture's marks are its start and
+    /// the end of each dispatch, so [`PtxContext::dispatch_durations`] reads one duration per dispatch. An
+    /// untimed context records nothing, so the graph it captures is the one a throughput run replays.
+    fn mark_capture(&self) -> Result<(), PtxError> {
+        if !self.device_timing {
+            return Ok(());
+        }
+        let event = PtxEvent::new(
+            result::event::create(sys::CUevent_flags::CU_EVENT_DEFAULT)
+                .map_err(PtxError::Driver)?,
+            Arc::clone(&self.owner),
+        );
+        // SAFETY: `event` is live and `stream` is this context's stream, in capture: the record is captured
+        // as an event node of the graph under construction. The capture retains `event` for the graph. The
+        // record is external, the one kind of captured event record whose event reads a time after a launch.
+        unsafe {
+            sys::cuEventRecordWithFlags(
+                event.event,
+                self.owner.stream,
+                sys::CUevent_record_flags::CU_EVENT_RECORD_EXTERNAL as u32,
+            )
+        }
+        .result()
+        .map_err(|error| self.owner.observe(error))?;
+        self.capture.mark(event);
+        Ok(())
+    }
+
+    /// Each dispatch of the graph `span` launched, in capture order: the device time from the end of the
+    /// previous dispatch (the start of the capture for the first) to the end of this one. That window holds
+    /// the dispatch and its launch gap, which is what the graph spends on it. Empty for a launch of a graph
+    /// captured untimed. The caller must have synchronized since [`PtxContext::launch_timed`], and a graph
+    /// launched again overwrites its marks, so read a span before the next launch of the same graph.
+    pub fn dispatch_durations(&self, span: &PtxSpan) -> Result<Vec<Duration>, PtxError> {
+        self.bind()?;
+        span.marks
+            .windows(2)
+            .map(|pair| {
+                // SAFETY: both marks are live events the graph recorded on this context's stream; the caller
+                // has synchronized (documented above).
+                let ms = unsafe { result::event::elapsed(pair[0].event, pair[1].event) }
+                    .map_err(|error| self.owner.observe(error))?;
+                Ok(Duration::from_secs_f64(f64::from(ms) / 1000.0))
+            })
+            .collect()
     }
 
     /// Replay `exec` (Card 552 SC-006): a plain [`PtxGraphExec::launch`] on this context's stream,
@@ -544,7 +595,11 @@ impl PtxContext {
         exec.launch()?;
         // SAFETY: as above.
         unsafe { result::event::record(stop.event, self.owner.stream) }?;
-        Ok(Some(PtxSpan { start, stop }))
+        Ok(Some(PtxSpan {
+            start,
+            stop,
+            marks: exec.marks.clone(),
+        }))
     }
 
     /// The elapsed device time from the start of the first of `spans` to the end of the last (Card
@@ -578,6 +633,7 @@ impl PtxContext {
     /// not surfaced. Any partial graph is destroyed, never instantiated.
     pub fn abort_capture(&self) {
         let captured = self.capture.finish();
+        drop(self.capture.take_marks());
         if let Ok(_guard) = self.owner.current_guard()
             // SAFETY: `stream` is this context's live stream; ending a capture takes no host memory.
             && let Ok(graph) = unsafe { result::stream::end_capture(self.owner.stream) }
@@ -951,6 +1007,9 @@ impl PtxContext {
         unsafe {
             result::launch_kernel(func, grid, block, 0, self.owner.stream, &mut params)
                 .map_err(|error| self.owner.observe(error))?;
+        }
+        if self.capture.is_open() {
+            self.mark_capture()?;
         }
         Ok(())
     }

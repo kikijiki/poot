@@ -13,6 +13,7 @@ pub mod graph_fixtures;
 pub mod packed_graphs;
 pub mod scan;
 pub mod selected_attention;
+pub mod stable_rank;
 
 #[cfg(test)]
 use crate::error::GraphValidationError;

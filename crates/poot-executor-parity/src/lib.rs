@@ -55,6 +55,7 @@ pub mod sample_token;
 pub mod scan;
 pub mod select;
 pub mod selected_attention;
+pub mod stable_rank;
 pub mod state_row;
 pub mod strided_read;
 pub mod view_probe;

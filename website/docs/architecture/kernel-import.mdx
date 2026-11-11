@@ -106,7 +106,7 @@ One manifest lists every asset, its source and its destination. A test regenerat
 
 Before codegen, `Body::verify` checks every matrix-fragment operation against its locals' `Ty::Fragment` type. Role (A, B or accumulator), operand dtype and tile shape must match at every producer and consumer, and a mismatch is a typed error with the statement location.
 
-Matrix operations are collective over one 32-lane subgroup, so the verifier rejects one reachable under a branch that can split a subgroup (`DivergentFragmentParticipation`). Selecting a whole subgroup, such as warp 0, is accepted. The accumulator is an ordinary variable and carries across a K loop.
+Matrix operations and the subgroup xor-shuffle are collective over one aligned run of 32 lanes, so the verifier rejects one reachable under a branch that can split a run (`DivergentCollectiveParticipation`). Selecting a whole subgroup, such as warp 0, is accepted. A shuffle mask of 32 or more is a typed error (`ShuffleMaskOutOfRange`), and the CPU interpreter runs the lanes of a run in lockstep at the shuffle, so a body that shuffles is testable without a device. The accumulator is an ordinary variable and carries across a K loop.
 
 Executor tests dispatch the kernels on each device backend and compare against the CPU oracle ([Execution](./execution#verification)); PTX tests run on rented NVIDIA pods.
 

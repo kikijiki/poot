@@ -338,6 +338,15 @@ impl Context {
                 && subgroup.compute_size_control
                 && (min..=max).contains(&COOPMAT_SUBGROUP_SIZE)
         });
+        // A pipeline whose body shuffles is created with full subgroups, so the workgroup's X extent is a whole
+        // number of subgroups of consecutive lanes. That needs the device to report shuffles and to create
+        // full-subgroup pipelines; the planner sizes the workgroup to a multiple of the largest subgroup.
+        let shuffle_subgroup_size = match launch.subgroup {
+            poot_target::Queried::Known(poot_target::SubgroupSupport::Present {
+                max_size, ..
+            }) if features.full_subgroup_pipelines() => Some(max_size),
+            _ => None,
+        };
         let matrix_units = if coopmat_subgroup_sizes.is_some() {
             poot_target::MatrixUnits::cooperative_matrix(
                 reported_configs,
@@ -383,6 +392,7 @@ impl Context {
             timestamp_period_ns,
             timestamp_valid_mask,
             coopmat_subgroup_sizes,
+            shuffle_subgroup_size,
             min_storage_offset_alignment: props.limits.min_storage_buffer_offset_alignment as usize,
             max_workgroup_count,
             device_caps,
@@ -513,8 +523,9 @@ pub(super) const COOPMAT_SUBGROUP_SIZE: u32 = 32;
 /// and the subgroup-size range where `VK_EXT_subgroup_size_control` or Vulkan 1.3 reports one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SubgroupProbe {
-    /// The compute stage supports the basic subgroup operations.
-    pub(crate) compute_basic: bool,
+    /// The compute stage supports the basic and shuffle subgroup operations
+    /// (`subgroupSupportedStages` and `subgroupSupportedOperations`, the check ggml-vulkan makes).
+    pub(crate) compute_shuffle: bool,
     /// `subgroupSize`: the size a pipeline gets by default.
     pub(crate) size: u32,
     /// `(minSubgroupSize, maxSubgroupSize)` where the device reports a controllable range.
@@ -540,7 +551,7 @@ impl LaunchCaps {
         Self {
             max_workgroup_size: limits.max_compute_work_group_size,
             max_workgroup_invocations: limits.max_compute_work_group_invocations,
-            subgroup: poot_target::Queried::Known(if subgroup.compute_basic {
+            subgroup: poot_target::Queried::Known(if subgroup.compute_shuffle {
                 poot_target::SubgroupSupport::Present { min_size, max_size }
             } else {
                 poot_target::SubgroupSupport::Absent
@@ -573,12 +584,12 @@ unsafe fn probe_subgroup(
     // SAFETY: the caller's contract; `props2` and its chain outlive the call.
     unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
     SubgroupProbe {
-        compute_basic: subgroup
+        compute_shuffle: subgroup
             .supported_stages
             .contains(vk::ShaderStageFlags::COMPUTE)
             && subgroup
                 .supported_operations
-                .contains(vk::SubgroupFeatureFlags::BASIC),
+                .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::SHUFFLE),
         size: subgroup.subgroup_size,
         size_range: has_size_control
             .then_some((control.min_subgroup_size, control.max_subgroup_size)),
@@ -610,7 +621,7 @@ mod launch_caps_tests {
         let caps = LaunchCaps::from_vulkan(
             &limits(),
             SubgroupProbe {
-                compute_basic: true,
+                compute_shuffle: true,
                 size: 48,
                 size_range: Some((8, 128)),
                 compute_size_control: true,
@@ -634,7 +645,7 @@ mod launch_caps_tests {
         let fixed = LaunchCaps::from_vulkan(
             &limits(),
             SubgroupProbe {
-                compute_basic: true,
+                compute_shuffle: true,
                 size: 48,
                 size_range: None,
                 compute_size_control: false,
@@ -650,7 +661,7 @@ mod launch_caps_tests {
         let absent = LaunchCaps::from_vulkan(
             &limits(),
             SubgroupProbe {
-                compute_basic: false,
+                compute_shuffle: false,
                 size: 48,
                 size_range: None,
                 compute_size_control: false,

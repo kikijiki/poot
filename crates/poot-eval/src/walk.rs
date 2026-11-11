@@ -1548,6 +1548,7 @@ fn evaluate_dense(
         | OpKind::Rope { .. }
         | OpKind::Scan(_)
         | OpKind::BlockTopK(_)
+        | OpKind::StableRank(_)
         | OpKind::SelectedAttention(_) => {
             unreachable!("a composite evaluates through its decomposition (evaluate_composite)")
         }

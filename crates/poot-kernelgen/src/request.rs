@@ -15,7 +15,7 @@
 //! function and cannot disagree.
 
 use poot_kernel_ir::serialize::{Grid, serialize_grid};
-use poot_kernel_ir::{BinOp, Body, MathOp, Statement, Ty, UnOp, WmmaDtype, WmmaShape};
+use poot_kernel_ir::{BinOp, Body, MathOp, Rvalue, Statement, Ty, UnOp, WmmaDtype, WmmaShape};
 use poot_target::{BufferStorage, DeviceCaps, ElementKind, RoundingConversions};
 
 use crate::KernelGenError;
@@ -47,6 +47,7 @@ use crate::matmul::{matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid};
 use crate::packed::{PackedKernelSpec, packed_contraction, packed_kernel};
 use crate::reduce::reduce_last_dt;
 use crate::scan::{ScanSpec, scan_body};
+use crate::stable_rank::{StableRankSpec, stable_rank_body};
 use poot_graph_ir::{FragmentDtype, OperandPrecision};
 use poot_quant::format::WeightFormat;
 
@@ -124,6 +125,9 @@ pub struct BodyUse {
     /// Whether any local or workgroup-local array of the body holds 64-bit floats, so the device must run the
     /// `Float64` capability.
     pub uses_float64: bool,
+    /// Whether the body holds a [`Rvalue::SubgroupShuffleXor`], so the device must run subgroups of at least
+    /// [`poot_kernel_ir::COLLECTIVE_LANES`] lanes.
+    pub uses_shuffle: bool,
 }
 
 /// Whether `ty` is, or is made of, a 64-bit float.
@@ -200,11 +204,22 @@ impl BodyUse {
                 .workgroup_locals
                 .iter()
                 .any(|decl| mentions_float64(&decl.elem_ty));
+        let uses_shuffle =
+            body.blocks
+                .iter()
+                .flat_map(|block| &block.statements)
+                .any(|statement| {
+                    matches!(
+                        statement,
+                        Statement::Assign(_, Rvalue::SubgroupShuffleXor { .. })
+                    )
+                });
         Ok(Self {
             lds_bytes,
             workgroup: body.workgroup_size,
             fragments,
             uses_float64,
+            uses_shuffle,
         })
     }
 }
@@ -297,6 +312,8 @@ pub enum KernelRequest {
     ExpertGroup(ExpertGroupSpec),
     /// The per-query block selection of a sparse-attention indexer: a radix select over block scores.
     BlockTopK(BlockTopKSpec),
+    /// The stable descending rank along the last axis of F32 scores: a bitonic sort of each row in workgroup memory.
+    StableRank(StableRankSpec),
 }
 
 impl KernelRequest {
@@ -333,50 +350,29 @@ impl KernelRequest {
                 n,
                 epilogue,
             }) => {
-                let launch = match schedule {
-                    Schedule::Gemv {
-                        width,
-                        cols,
-                        unroll,
-                        activation,
-                    } => {
-                        let read = match activation {
-                            GemvActivation::Scalar => "",
-                            GemvActivation::Vec4 => "v4",
-                        };
-                        format!("w{width}c{cols}u{unroll}{read}")
-                    }
-                    Schedule::RegisterTiled {
-                        lanes,
-                        rows,
-                        cols,
-                        run,
-                    } => format!(
-                        "register_tiled{}x{}x{}r{}",
-                        lanes.get(),
-                        rows.get(),
-                        cols.get(),
-                        run.get()
-                    ),
-                    Schedule::FragmentTiled {
-                        waves_m,
-                        waves_n,
-                        tile,
-                        run,
-                        depth,
-                    } => format!(
-                        "fragment_tiled{}x{}x{}x{}r{}d{depth}",
-                        waves_m.get(),
-                        waves_n.get(),
-                        tile.rows,
-                        tile.cols,
-                        run.get()
-                    ),
-                };
+                let launch = schedule_label(schedule);
                 let epilogue = epilogue.as_ref().map_or_else(String::new, |epilogue| {
                     format!(":epilogue{}", epilogue.steps.len())
                 });
                 format!("contraction:dense_gemv:{weight}:{launch}:{k}x{n}{epilogue}")
+            }
+            Self::Contraction(ContractionSpec::Packed(packed)) => {
+                let epilogue = packed
+                    .epilogue
+                    .as_ref()
+                    .map_or_else(String::new, |epilogue| {
+                        format!(":epilogue{}", epilogue.steps.len())
+                    });
+                let shape = match packed.meta.as_slice() {
+                    [k, n, ..] => format!("{k}x{n}"),
+                    _ => "?".to_string(),
+                };
+                format!(
+                    "contraction:packed:{:?}:{:?}:{}:{shape}{epilogue}",
+                    packed.format,
+                    packed.rows,
+                    schedule_label(&packed.schedule)
+                )
             }
             Self::Contraction(spec) => format!("contraction:{}", spec.form()),
             other => other.family().to_string(),
@@ -408,7 +404,52 @@ impl KernelRequest {
             Self::TopK(_) => "topk",
             Self::ExpertGroup(_) => "expert_group",
             Self::BlockTopK(_) => "block_top_k",
+            Self::StableRank(_) => "stable_rank",
         }
+    }
+}
+
+/// The schedule as a display label: a GEMV's width, columns, unroll and activation read, or a tiled form's tiling.
+fn schedule_label(schedule: &Schedule) -> String {
+    match schedule {
+        Schedule::Gemv {
+            width,
+            cols,
+            unroll,
+            activation,
+        } => {
+            let read = match activation {
+                GemvActivation::Scalar => "",
+                GemvActivation::Vec4 => "v4",
+            };
+            format!("w{width}c{cols}u{unroll}{read}")
+        }
+        Schedule::RegisterTiled {
+            lanes,
+            rows,
+            cols,
+            run,
+        } => format!(
+            "register_tiled{}x{}x{}r{}",
+            lanes.get(),
+            rows.get(),
+            cols.get(),
+            run.get()
+        ),
+        Schedule::FragmentTiled {
+            waves_m,
+            waves_n,
+            tile,
+            run,
+            depth,
+        } => format!(
+            "fragment_tiled{}x{}x{}x{}r{}d{depth}",
+            waves_m.get(),
+            waves_n.get(),
+            tile.rows,
+            tile.cols,
+            run.get()
+        ),
     }
 }
 
@@ -908,6 +949,7 @@ fn build(req: &KernelRequest, caps: &DeviceCaps) -> Result<Generated, KernelGenE
         KernelRequest::AttentionCombine(spec) => attention_combine(spec, caps),
         KernelRequest::Scan(spec) => scan(spec, caps),
         KernelRequest::BlockTopK(spec) => block_top_k(spec, caps),
+        KernelRequest::StableRank(spec) => stable_rank(spec, caps),
         KernelRequest::Movement(spec) => movement(spec, caps),
         KernelRequest::Packed(spec) => {
             let body = packed_kernel(spec.name, spec.spec)?;
@@ -1251,6 +1293,14 @@ fn block_top_k(spec: &BlockTopKSpec, caps: &DeviceCaps) -> Result<Generated, Ker
     with(
         block_top_k_body(ENTRY, spec, x)?,
         Launch::grid([(x * lanes) as u32, y as u32, 1]),
+    )
+}
+
+fn stable_rank(spec: &StableRankSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
+    let (x, y) = fold_groups(spec.rows, caps.max_grid[0]);
+    with(
+        stable_rank_body(ENTRY, spec, x)?,
+        Launch::grid([(x * spec.lanes()) as u32, y as u32, 1]),
     )
 }
 
@@ -1856,6 +1906,23 @@ mod tests {
                     numel: 4,
                 }),
                 "contraction:attn_scores_v_gemv".to_string(),
+            ),
+            (
+                KernelRequest::Contraction(ContractionSpec::Packed(PackedContraction {
+                    format: poot_quant::format::WeightFormat::Q5_K,
+                    rows: PackedRows::Blocks,
+                    schedule: Schedule::Gemv {
+                        width: 128,
+                        cols: 2,
+                        unroll: 1,
+                        activation: crate::GemvActivation::Scalar,
+                    },
+                    epilogue: None,
+                    grid: [64, 1, 1],
+                    meta: vec![5120, 17408],
+                    precision: poot_graph_ir::OperandPrecision::Exact,
+                })),
+                "contraction:packed:Q5_K:Blocks:w128c2u1:5120x17408".to_string(),
             ),
             (
                 KernelRequest::Cast(CastSpec::F32ToBf16 { numel: 4 }),

@@ -34,8 +34,8 @@ pub enum SerializeError {
     /// The body shares workgroup-local memory between threads.
     #[error("the body uses workgroup-local memory")]
     WorkgroupMemory,
-    /// The body is written for a subgroup collective (a matrix fragment).
-    #[error("the body uses a subgroup collective (a matrix fragment)")]
+    /// The body is written for a subgroup collective (a matrix fragment or a lane shuffle).
+    #[error("the body uses a subgroup collective (a matrix fragment or a shuffle)")]
     Subgroup,
     /// The body performs an atomic whose result depends on the other threads' order.
     #[error("the body performs an atomic at {scope:?} scope")]
@@ -334,6 +334,7 @@ fn reject_cooperation(body: &Body) -> Result<(), SerializeError> {
                             scope: MemoryScope::Device,
                         });
                     }
+                    Rvalue::SubgroupShuffleXor { .. } => return Err(SerializeError::Subgroup),
                     _ => {}
                 },
                 // A scheduling boundary orders one thread's instructions, which a serial loop keeps in order.
@@ -555,6 +556,21 @@ mod tests {
             refusal(&wmma_tile("k"), [32, 1, 1]),
             SerializeError::Subgroup
         );
+    }
+
+    #[test]
+    fn a_subgroup_shuffle_is_refused_as_a_subgroup_collective() {
+        let body = one_block(
+            vec![assign(
+                2,
+                Rvalue::SubgroupShuffleXor {
+                    value: Operand::Const(Constant::U32(1)),
+                    mask: 1,
+                },
+            )],
+            Terminator::Return,
+        );
+        assert_eq!(refusal(&body, [4, 1, 1]), SerializeError::Subgroup);
     }
 
     #[test]

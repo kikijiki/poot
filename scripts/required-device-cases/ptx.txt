@@ -242,6 +242,7 @@ poot-ptx-device::device_caps_planning	a_live_ptx_device_reports_its_workgroup_su
 poot-ptx-device::device_caps_planning	the_ptx_device_reports_live_free_memory_within_its_open_time_ceiling
 poot-ptx-device::device_timing	plain_ptx_device_reports_unknown_device_time
 poot-ptx-device::device_timing	timed_ptx_device_reads_a_nonzero_device_time_for_a_known_kernel
+poot-ptx-device::device_timing	timed_ptx_device_reads_each_dispatch_of_a_captured_step
 poot-ptx-device::feedback_end_to_end	the_engine_plans_the_expert_projection_with_the_drivers_verdicts_on_ptx
 poot-ptx-device::float_ne	float_ne_is_ieee_on_nan_on_ptx
 poot-ptx-device::i32_index	gather_with_i32_indices_matches_the_oracle_bit_for_bit_on_ptx
@@ -283,6 +284,7 @@ poot-ptx-device::parity	f16_checkpoint_orientation_projection_matches_the_oracle
 poot-ptx-device::parity	greedy_sample_token_is_exact_on_ptx
 poot-ptx-device::parity	select_is_bitwise_on_ptx
 poot-ptx-device::parity	selected_attention_reads_exactly_the_selected_blocks_on_ptx
+poot-ptx-device::parity	stable_rank_ranks_what_the_plain_sort_ranks_on_ptx
 poot-ptx-device::parity	state_pool_rows_reset_independently_on_ptx
 poot-ptx-device::parity	the_range_detector_names_an_f16_overflow_on_ptx
 poot-ptx-device::parity	two_byte_select_is_bitwise_on_ptx

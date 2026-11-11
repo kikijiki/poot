@@ -106,6 +106,9 @@ pub struct Context {
     /// The `[min, max]` subgroup size a cooperative-matrix pipeline may require, when the device can
     /// create such a pipeline at all (`None`: it cannot, and reports no matrix hardware).
     coopmat_subgroup_sizes: Option<(u32, u32)>,
+    /// The largest subgroup a shuffling pipeline runs as full subgroups of, when the device reports subgroup
+    /// shuffles and can create full-subgroup pipelines (`None`: a kernel that shuffles is refused).
+    shuffle_subgroup_size: Option<u32>,
     /// `minStorageBufferOffsetAlignment`: a descriptor binds a meta block at a multiple of this.
     min_storage_offset_alignment: usize,
     /// Per-axis `maxComputeWorkGroupCount` from the physical device (queried, not hardcoded).

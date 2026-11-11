@@ -25,6 +25,10 @@ pub struct PtxGraphExec {
         reason = "owned so every captured buffer outlives the graph that records its address"
     )]
     captured: Vec<PtxBuffer>,
+    /// The events a device-timed capture recorded between its dispatches ([`CaptureRetention::mark`]): the
+    /// one at the start of the capture, then one after each dispatch. Empty for an untimed capture. Shared
+    /// with the [`PtxSpan`] of every launch, so a span read after the graph dropped still names live events.
+    pub(crate) marks: Vec<Arc<PtxEvent>>,
 }
 
 // SAFETY: `owner` is `Send + Sync` (see its doc) and `captured` is `Vec<PtxBuffer>`, `Send`
@@ -82,6 +86,7 @@ impl GraphConstruction {
             graph,
             owner: Arc::clone(&self.owner),
             captured: std::mem::take(&mut self.captured),
+            marks: Vec::new(),
         }
     }
 }
@@ -124,28 +129,42 @@ pub(crate) fn instantiate_graph(
 /// addresses, so every dispatch or copy recorded during the capture retains its buffers, and
 /// `end_capture` moves them into the [`PtxGraphExec`]. `None` means no capture is open.
 #[derive(Default)]
-pub(crate) struct CaptureRetention(RefCell<Option<Vec<PtxBuffer>>>);
+pub(crate) struct CaptureRetention {
+    buffers: RefCell<Option<Vec<PtxBuffer>>>,
+    marks: RefCell<Vec<Arc<PtxEvent>>>,
+}
 
 impl CaptureRetention {
     /// Start recording; called once the driver has opened the capture.
     pub(crate) fn begin(&self) {
-        *self.0.borrow_mut() = Some(Vec::new());
+        *self.buffers.borrow_mut() = Some(Vec::new());
+        self.marks.borrow_mut().clear();
     }
 
     pub(crate) fn is_open(&self) -> bool {
-        self.0.borrow().is_some()
+        self.buffers.borrow().is_some()
+    }
+
+    /// Keep `event`, recorded on the capturing stream, as the next mark of the graph being captured.
+    pub(crate) fn mark(&self, event: PtxEvent) {
+        self.marks.borrow_mut().push(Arc::new(event));
+    }
+
+    /// The marks the capture recorded, in capture order.
+    pub(crate) fn take_marks(&self) -> Vec<Arc<PtxEvent>> {
+        std::mem::take(&mut *self.marks.borrow_mut())
     }
 
     /// Keep `buffer` alive for the graph being captured. A no-op when no capture is open.
     pub(crate) fn retain(&self, buffer: &PtxBuffer) {
-        if let Some(retained) = self.0.borrow_mut().as_mut() {
+        if let Some(retained) = self.buffers.borrow_mut().as_mut() {
             retained.push(buffer.clone());
         }
     }
 
     /// Stop recording and return what the capture retained.
     pub(crate) fn finish(&self) -> Vec<PtxBuffer> {
-        self.0.borrow_mut().take().unwrap_or_default()
+        self.buffers.borrow_mut().take().unwrap_or_default()
     }
 }
 
@@ -226,6 +245,8 @@ impl Drop for PtxEvent {
 pub struct PtxSpan {
     pub(crate) start: PtxEvent,
     pub(crate) stop: PtxEvent,
+    /// The launched graph's dispatch marks ([`PtxGraphExec::marks`]); empty when it was captured untimed.
+    pub(crate) marks: Vec<Arc<PtxEvent>>,
 }
 
 pub(crate) fn create_event_pair(

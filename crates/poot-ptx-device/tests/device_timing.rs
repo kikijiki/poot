@@ -48,3 +48,35 @@ fn plain_ptx_device_reports_unknown_device_time() {
         DeviceTime::Unknown
     );
 }
+
+/// A timed device reports each dispatch's own duration, contiguous in submission order, and they add up to the
+/// step's device span: the marks the capture recorded partition the replay. Mutation: have
+/// `PtxContext::mark_capture` record nothing; the dispatch list is empty and the row goes red.
+#[test]
+fn timed_ptx_device_reads_each_dispatch_of_a_captured_step() {
+    let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new_with_device_timing()) else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = Engine::new(device);
+    let DeviceTime::Measured(measured) = device_time_of_step(&mut engine, target, &scan()) else {
+        panic!("a timing-enabled ptx device must report Measured");
+    };
+    assert!(
+        !measured.dispatches.is_empty(),
+        "a timed capture reports its dispatches, not only the span"
+    );
+    for (position, dispatch) in measured.dispatches.iter().enumerate() {
+        assert_eq!(dispatch.index, position, "dispatches keep submission order");
+        assert!(
+            dispatch.duration > Duration::ZERO,
+            "dispatch {position} has no duration"
+        );
+    }
+    let sum: Duration = measured.dispatches.iter().map(|d| d.duration).sum();
+    assert_eq!(measured.sum_of_dispatch_durations, Some(sum));
+    assert!(
+        sum <= measured.device_span.expect("span"),
+        "the dispatch windows lie inside the step's span"
+    );
+}

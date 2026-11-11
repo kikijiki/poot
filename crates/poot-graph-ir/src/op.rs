@@ -1449,6 +1449,17 @@ pub enum OpKind {
     ///
     /// A tracer never emits it: it states the composition above and `compile`'s selection pass forms the op.
     BlockTopK(BlockTopKAttrs),
+    /// The stable descending rank along the last axis of F32 scores (POOT-1543), the router's contract:
+    /// `rank[.., i]` is the position of element `i` under "canonical score descending, lower index first on equal
+    /// scores" ([`crate::ops::canonical_router_scores`]), so every row is a permutation of `0..E`. Operands are
+    /// the scores `[.., E]` and, when [`StableRankAttrs::masked`], the eligibility `[.., E]` (F32); the result is
+    /// F32 `[.., E]`, integer valued. Eligible elements (`eligible >= 1`, NaN is not eligible) rank before
+    /// ineligible ones. Its definition is [`crate::ops::stable_descending_rank`] /
+    /// [`crate::ops::stable_descending_rank_masked`], quadratic in `E`; a device sorts the row's distinct
+    /// `(key, index)` pairs instead, and the tuples are distinct, so the permutation is unique and bit-identical.
+    ///
+    /// A tracer never emits it: it states the composition above and `compile`'s selection pass forms the op.
+    StableRank(StableRankAttrs),
     /// Attention over the blocks a [`OpKind::BlockTopK`] selected (POOT-1143): each query reads only the keys of
     /// its `K` selected blocks and of its own unfinished block, not all `Lk`. Operands `[q, k, v, ids, pos]`:
     /// `q [B,Hq,Lq,Dk]`, `k [B,Hkv,Lk,Dk]`, `v [B,Hkv,Lk,Dv]` (the cache, stored positions past `Lk` never
@@ -2455,6 +2466,7 @@ impl OpKind {
             OpKind::Rope { rot } => infer_rope(ins, *rot),
             OpKind::Scan(attrs) => infer_scan(ins, attrs),
             OpKind::BlockTopK(attrs) => infer_block_top_k(ins, attrs),
+            OpKind::StableRank(attrs) => infer_stable_rank(ins, attrs),
             OpKind::SelectedAttention(attrs) => infer_selected_attention(ins, attrs),
             OpKind::AllReduce { .. } => {
                 // Shape-preserving: each rank holds a same-shaped partial; the collective combines across ranks and returns
@@ -2504,6 +2516,7 @@ impl OpKind {
     /// | `Attention` | `flash_attention` from the attention chain |
     /// | `Rope` | `rope_fusion` from the half-split rotation chain |
     /// | `BlockTopK` | `form_selection` from [`crate::ops::block_top_k_packed`], the rank chain a sparse indexer's tracer states |
+    /// | `StableRank` | `form_selection` from [`crate::ops::stable_descending_rank`] and its masked variant, the pairwise rank a router states |
     /// | `SelectedAttention` | `form_selection` from an additive `Attention` whose mask is [`crate::ops::selected_block_mask`] |
     /// | `ContractionEpilogue` | `fuse` from a contraction and the single-use pointwise chain that consumes it |
     /// | `Fused`, `FusedRow` | `fuse` from pointwise chains and their last-axis reductions |
@@ -2563,6 +2576,7 @@ impl OpKind {
             | Self::Rope { .. }
             | Self::Scan(_)
             | Self::BlockTopK(_)
+            | Self::StableRank(_)
             | Self::SelectedAttention(_)
             | Self::ContractionEpilogue { .. }
             | Self::Fused(_)
@@ -2626,6 +2640,7 @@ impl OpKind {
             Self::Rope { .. } => "rope",
             Self::Scan(_) => "scan",
             Self::BlockTopK(_) => "block_top_k",
+            Self::StableRank(_) => "stable_rank",
             Self::SelectedAttention(_) => "selected_attention",
             Self::AllReduce { .. } => "all_reduce",
             Self::AllGather { .. } => "all_gather",
@@ -2703,6 +2718,7 @@ impl OpKind {
             | OpKind::Rope { .. }
             | OpKind::Scan(_)
             | OpKind::BlockTopK(_)
+            | OpKind::StableRank(_)
             | OpKind::SelectedAttention(_)
             | OpKind::AllReduce { .. }
             | OpKind::AllGather { .. }
@@ -2807,6 +2823,7 @@ impl OpKind {
             OpKind::Rope { rot } => format!("rope rot={rot}"),
             OpKind::Scan(attrs) => format!("scan {} chunk={}", attrs.family.name(), attrs.chunk),
             OpKind::BlockTopK(attrs) => format!("block_top_k ratio={} k={}", attrs.ratio, attrs.k),
+            OpKind::StableRank(attrs) => format!("stable_rank masked={}", attrs.masked),
             OpKind::SelectedAttention(a) => format!(
                 "selected_attention n_rep={} scale={} softcap={:?} ratio={} k={}",
                 a.n_rep, a.scale, a.softcap, a.ratio, a.k
@@ -3412,6 +3429,13 @@ pub struct BlockTopKAttrs {
     pub k: usize,
 }
 
+/// The attributes of [`OpKind::StableRank`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct StableRankAttrs {
+    /// Whether a second operand, the eligibility, ranks the eligible elements before the ineligible ones.
+    pub masked: bool,
+}
+
 /// The two halves of a [`OpKind::BlockTopK`] result `[R, 1, T, K + NB]`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct BlockTopKLayout {
@@ -3515,6 +3539,45 @@ fn infer_block_top_k(ins: &[TensorType], attrs: &BlockTopKAttrs) -> Result<Tenso
         attrs.layout(ins)?.packed_shape(),
         DType::I32,
     ))
+}
+
+/// The typing rule of `StableRank`: the F32 rank of the scores, whose last axis holds at least one element,
+/// beside an eligibility of the same type when masked.
+fn infer_stable_rank(
+    ins: &[TensorType],
+    attrs: &StableRankAttrs,
+) -> Result<TensorType, ShapeError> {
+    arity(ins, 1 + usize::from(attrs.masked))?;
+    let scores = &ins[0];
+    for operand in ins {
+        if operand.dtype != DType::F32 {
+            return Err(ShapeError::DtypeOp {
+                op: "StableRank",
+                dtype: operand.dtype,
+            });
+        }
+    }
+    match scores.shape.last() {
+        None => {
+            return Err(ShapeError::RankTooLow {
+                op: "StableRank",
+                operand: "scores",
+                min: 1,
+                actual: 0,
+            });
+        }
+        Some(0) => return Err(ShapeError::StableRankNoExperts),
+        Some(_) => {}
+    }
+    if let Some(eligible) = ins.get(1)
+        && eligible.shape != scores.shape
+    {
+        return Err(ShapeError::StableRankEligibility {
+            expected: scores.shape.clone(),
+            actual: eligible.shape.clone(),
+        });
+    }
+    Ok(scores.clone())
 }
 
 /// The typing rule of `Scan`: the packed result of the layout the operands imply.
@@ -6015,6 +6078,7 @@ mod tests {
                 OpKind::Rope { rot } => rot.hash(h),
                 OpKind::Scan(attrs) => attrs.hash(h),
                 OpKind::BlockTopK(attrs) => attrs.hash(h),
+                OpKind::StableRank(attrs) => attrs.hash(h),
                 OpKind::SelectedAttention(attrs) => {
                     attrs.n_rep.hash(h);
                     attrs.scale.to_bits().hash(h);

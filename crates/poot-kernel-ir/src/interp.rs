@@ -8,6 +8,11 @@
 //! to every lane's read after it. A lane that returns while another waits at a barrier, or lanes that park at
 //! different barriers, is an error: the interpreter refuses it as a possible deadlock.
 //!
+//! A [`Rvalue::SubgroupShuffleXor`] is a lockstep point of its own: each lane runs to its next shuffle or
+//! barrier, the lanes parked at one shuffle exchange their values within their aligned run of
+//! [`COLLECTIVE_LANES`] `LocalX`, and each then runs on. A run whose lanes park at different shuffles, at a
+//! barrier, or after a return, is [`Fault::DivergentCollective`].
+//!
 //! Semantics, chosen to match what the codegen backends emit:
 //!
 //! - Integer arithmetic wraps; division by zero and a shift amount at or past the bit width are errors. `Shr`
@@ -22,8 +27,9 @@
 //!   backend-neutral IR.
 
 use crate::{
-    AtomicOp, BinOp, Body, Constant, Fp8Format, IndexAxis, IntScalarOp, Local, MathOp, Operand,
-    Place, ProjectionElem, Rvalue, Site, Statement, Terminator, Ty, UnOp, VerifyError,
+    AtomicOp, BinOp, Body, COLLECTIVE_LANES, Constant, Fp8Format, IndexAxis, IntScalarOp, Local,
+    MathOp, Operand, Place, ProjectionElem, Rvalue, Site, Statement, Terminator, Ty, UnOp,
+    VerifyError,
 };
 
 /// Basic blocks a run may execute, summed over every lane, before it is abandoned as non-terminating.
@@ -129,9 +135,17 @@ impl Value {
 pub struct Buffer {
     elem: Ty,
     data: Vec<Scalar>,
+    /// How many times a run read each element of `data`.
+    reads: Vec<std::cell::Cell<u32>>,
 }
 
 impl Buffer {
+    #[cfg(any(test, feature = "test-support"))]
+    fn new(elem: Ty, data: Vec<Scalar>) -> Self {
+        let reads = vec![std::cell::Cell::new(0); data.len()];
+        Buffer { elem, data, reads }
+    }
+
     // Card 671: no production caller anywhere in the workspace builds a `Buffer` from raw values or reads
     // one back as `f32`s - every non-test reference is poot-test-util's fixtures (reached only as a
     // dev-dependency); this crate's own unit tests use them too. Gated so a default build never has them,
@@ -140,28 +154,19 @@ impl Buffer {
     /// A buffer of `f32` elements holding `values`.
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_f32s(values: &[f32]) -> Self {
-        Buffer {
-            elem: Ty::F32,
-            data: values.iter().map(|&v| Scalar::F32(v)).collect(),
-        }
+        Buffer::new(Ty::F32, values.iter().map(|&v| Scalar::F32(v)).collect())
     }
 
     /// A buffer of `u32` elements holding `values`.
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_u32s(values: &[u32]) -> Self {
-        Buffer {
-            elem: Ty::U32,
-            data: values.iter().map(|&v| Scalar::U32(v)).collect(),
-        }
+        Buffer::new(Ty::U32, values.iter().map(|&v| Scalar::U32(v)).collect())
     }
 
     /// A buffer of `i32` elements holding `values`.
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_i32s(values: &[i32]) -> Self {
-        Buffer {
-            elem: Ty::I32,
-            data: values.iter().map(|&v| Scalar::I32(v)).collect(),
-        }
+        Buffer::new(Ty::I32, values.iter().map(|&v| Scalar::I32(v)).collect())
     }
 
     /// A buffer of two-byte float elements, `elem` being `Ty::F16` or `Ty::BF16`, holding `values` rounded to
@@ -177,10 +182,20 @@ impl Buffer {
             Ty::BF16 => |v: f32| Scalar::BF16(round_to_bf16(v)),
             other => panic!("{other:?} is not a two-byte float"),
         };
-        Buffer {
-            elem,
-            data: values.iter().map(|&v| scalar(v)).collect(),
+        Buffer::new(elem, values.iter().map(|&v| scalar(v)).collect())
+    }
+
+    fn count_reads(&self, range: std::ops::Range<usize>) {
+        for reads in &self.reads[range] {
+            reads.set(reads.get().saturating_add(1));
         }
+    }
+
+    /// How many times the runs since the buffer was built read each element, in element order. A vector load
+    /// counts once per element it covers; an atomic or a store does not count.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn read_counts(&self) -> Vec<u32> {
+        self.reads.iter().map(std::cell::Cell::get).collect()
     }
 
     /// The values of an f16 or bf16 buffer, or [`InterpError::NotHalf`] for any other element type.
@@ -301,6 +316,12 @@ pub enum Fault {
         /// The f32 operand.
         value: f32,
     },
+    /// The lanes of one aligned run of [`COLLECTIVE_LANES`] `LocalX` did not reach one
+    /// [`Rvalue::SubgroupShuffleXor`] together. Like [`Fault::DivergentBarrier`], [`Body::verify`]'s
+    /// divergence analysis rejects the bodies that produce it, so it fires only if that analysis is unsound
+    /// (or the shuffle names a partner outside the workgroup).
+    #[error("lanes of one subgroup run did not reach the same shuffle together: {0}")]
+    DivergentCollective(&'static str),
     #[error("kernel trap: a failed Assert or a reached Unreachable terminator ran (code {0})")]
     /// A lane reached a [`Terminator::Trap`] with this code.
     Trap(u32),
@@ -421,6 +442,8 @@ fn check_buffers(body: &Body, buffers: &[Buffer]) -> Result<(), InterpError> {
 /// One lane's registers and position.
 struct Lane {
     block: usize,
+    /// The next statement of `block` to run: nonzero only while the lane waits at a shuffle.
+    statement: usize,
     /// Indexed by local; `None` until assigned.
     locals: Vec<Option<Value>>,
     /// Private arrays, indexed by local; elements are `None` until stored.
@@ -432,7 +455,21 @@ struct Lane {
 enum Stop {
     /// Waiting at a barrier whose successor is this block.
     Barrier(usize),
+    /// Waiting at the shuffle statement `lane.statement` of `lane.block`, contributing `value` and exchanging
+    /// with the lane `LocalX ^ mask`.
+    Shuffle {
+        value: Scalar,
+        mask: u32,
+    },
     Return,
+}
+
+/// What a lane of a workgroup is doing between two rounds.
+enum LaneState {
+    Running,
+    Barrier(usize),
+    Shuffle { value: Scalar, mask: u32 },
+    Returned,
 }
 
 /// The storage a place addresses.
@@ -461,6 +498,7 @@ impl Workgroup<'_> {
         let [wx, wy, _] = self.body.workgroup_size;
         Lane {
             block: 0,
+            statement: 0,
             locals: vec![None; self.body.locals.len()],
             arrays: self
                 .body
@@ -475,26 +513,36 @@ impl Workgroup<'_> {
         }
     }
 
-    /// Run every lane to completion, in lockstep between barriers.
+    /// Run every lane to completion, in lockstep between shuffles and barriers.
     fn run(&mut self) -> Result<(), (u32, Site, Fault)> {
         let count = self.lane_count();
         let mut lanes: Vec<Lane> = (0..count).map(|id| self.new_lane(id)).collect();
-        let mut returned = vec![false; count as usize];
+        let mut states: Vec<LaneState> = (0..count).map(|_| LaneState::Running).collect();
         loop {
-            let mut parked: Vec<Option<usize>> = vec![None; count as usize];
             for (id, lane) in lanes.iter_mut().enumerate() {
-                if returned[id] {
+                if !matches!(states[id], LaneState::Running) {
                     continue;
                 }
-                match self
+                states[id] = match self
                     .step_lane(lane)
                     .map_err(|(site, f)| (id as u32, site, f))?
                 {
-                    Stop::Barrier(target) => parked[id] = Some(target),
-                    Stop::Return => returned[id] = true,
-                }
+                    Stop::Barrier(target) => LaneState::Barrier(target),
+                    Stop::Shuffle { value, mask } => LaneState::Shuffle { value, mask },
+                    Stop::Return => LaneState::Returned,
+                };
             }
-            let mut targets = parked.iter().flatten().copied();
+            if states
+                .iter()
+                .any(|s| matches!(s, LaneState::Shuffle { .. }))
+            {
+                self.exchange(&mut lanes, &mut states)?;
+                continue;
+            }
+            let mut targets = states.iter().filter_map(|s| match s {
+                LaneState::Barrier(target) => Some(*target),
+                _ => None,
+            });
             let Some(first) = targets.next() else {
                 return Ok(());
             };
@@ -505,9 +553,11 @@ impl Workgroup<'_> {
                 };
                 Site::Terminator { block }
             };
+            let waiting_at =
+                |wanted: &dyn Fn(&LaneState) -> bool| states.iter().position(wanted).unwrap_or(0);
             // A lane that already returned can never reach this barrier.
-            if returned.iter().any(|&done| done) {
-                let waiting = parked.iter().position(Option::is_some).unwrap_or(0);
+            if states.iter().any(|s| matches!(s, LaneState::Returned)) {
+                let waiting = waiting_at(&|s| matches!(s, LaneState::Barrier(_)));
                 return Err((
                     waiting as u32,
                     barrier_site(waiting),
@@ -515,19 +565,109 @@ impl Workgroup<'_> {
                 ));
             }
             if let Some(other) = targets.find(|&t| t != first) {
-                let waiting = parked.iter().position(|t| *t == Some(other)).unwrap_or(0);
+                let waiting = waiting_at(&|s| matches!(s, LaneState::Barrier(t) if *t == other));
                 return Err((
                     waiting as u32,
                     barrier_site(waiting),
                     Fault::DivergentBarrier(first as u32, other as u32),
                 ));
             }
-            for (lane, target) in lanes.iter_mut().zip(&parked) {
-                if let Some(target) = target {
-                    lane.block = *target;
+            for (lane, state) in lanes.iter_mut().zip(&mut states) {
+                if let LaneState::Barrier(target) = *state {
+                    lane.block = target;
+                    lane.statement = 0;
+                    *state = LaneState::Running;
                 }
             }
         }
+    }
+
+    /// Resolve every shuffle some lane waits at: each aligned run of [`COLLECTIVE_LANES`] `LocalX` (within one
+    /// `LocalY`/`LocalZ` row) that has a lane at a shuffle must have all of its lanes at that same shuffle,
+    /// and each lane then takes the value its `LocalX ^ mask` partner contributed and runs on.
+    fn exchange(
+        &mut self,
+        lanes: &mut [Lane],
+        states: &mut [LaneState],
+    ) -> Result<(), (u32, Site, Fault)> {
+        let [wx, ..] = self.body.workgroup_size;
+        let run_of = |id: usize| {
+            (
+                id / wx as usize,
+                (id % wx as usize) / COLLECTIVE_LANES as usize,
+            )
+        };
+        let mut resolved = vec![false; states.len()];
+        for first in 0..states.len() {
+            if resolved[first] || !matches!(states[first], LaneState::Shuffle { .. }) {
+                continue;
+            }
+            let at = |lane: &Lane| (lane.block, lane.statement);
+            let site = |lane: &Lane| Site::Statement {
+                block: crate::BlockId {
+                    index: lane.block as u32,
+                },
+                index: lane.statement,
+            };
+            let fault = |id: usize, lane: &Lane, why| {
+                (id as u32, site(lane), Fault::DivergentCollective(why))
+            };
+            let run: Vec<usize> = (0..states.len())
+                .filter(|&id| run_of(id) == run_of(first))
+                .collect();
+            let mask = match states[first] {
+                LaneState::Shuffle { mask, .. } => mask,
+                _ => unreachable!("the run was selected at a shuffle"),
+            };
+            let mut contributed = vec![None; COLLECTIVE_LANES as usize];
+            for &id in &run {
+                match states[id] {
+                    LaneState::Shuffle { value, mask: m }
+                        if m == mask && at(&lanes[id]) == at(&lanes[first]) =>
+                    {
+                        contributed[(id % wx as usize) % COLLECTIVE_LANES as usize] = Some(value);
+                    }
+                    LaneState::Shuffle { .. } => {
+                        return Err(fault(
+                            id,
+                            &lanes[id],
+                            "the lanes wait at different shuffles",
+                        ));
+                    }
+                    LaneState::Barrier(_) => {
+                        return Err(fault(id, &lanes[id], "a lane waits at a barrier"));
+                    }
+                    LaneState::Returned => {
+                        return Err(fault(id, &lanes[id], "a lane has returned"));
+                    }
+                    LaneState::Running => unreachable!("every running lane has stopped"),
+                }
+            }
+            for &id in &run {
+                let own = (id % wx as usize) % COLLECTIVE_LANES as usize;
+                let received = contributed
+                    .get(own ^ mask as usize)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| {
+                        fault(id, &lanes[id], "the partner lane is outside the workgroup")
+                    })?;
+                let block = &self.body.blocks[lanes[id].block];
+                let Statement::Assign(place, _) = &block.statements[lanes[id].statement] else {
+                    unreachable!("a lane parks only at a shuffle assignment");
+                };
+                let place = place.clone();
+                let here = site(&lanes[id]);
+                let lane = &mut lanes[id];
+                self.cell(lane, &place)
+                    .and_then(|cell| self.store(lane, &cell, Value::Scalar(received)))
+                    .map_err(|f| (id as u32, here, f))?;
+                lanes[id].statement += 1;
+                states[id] = LaneState::Running;
+                resolved[id] = true;
+            }
+        }
+        Ok(())
     }
 
     /// Execute one lane until it parks at a barrier or returns.
@@ -542,16 +682,19 @@ impl Workgroup<'_> {
                 return Err((Site::Terminator { block: block_id }, Fault::StepLimit));
             }
             let block = &body.blocks[lane.block];
-            for (index, statement) in block.statements.iter().enumerate() {
-                self.statement(lane, statement).map_err(|fault| {
-                    (
-                        Site::Statement {
-                            block: block_id,
-                            index,
-                        },
-                        fault,
-                    )
-                })?;
+            for (index, statement) in block.statements.iter().enumerate().skip(lane.statement) {
+                let site = Site::Statement {
+                    block: block_id,
+                    index,
+                };
+                if let Statement::Assign(_, Rvalue::SubgroupShuffleXor { value, mask }) = statement
+                {
+                    let value = self.scalar_operand(lane, value).map_err(|f| (site, f))?;
+                    lane.statement = index;
+                    return Ok(Stop::Shuffle { value, mask: *mask });
+                }
+                self.statement(lane, statement)
+                    .map_err(|fault| (site, fault))?;
             }
             let flow = self
                 .terminator(lane, &block.terminator)
@@ -559,6 +702,7 @@ impl Workgroup<'_> {
             if let Some(stop) = flow {
                 return Ok(stop);
             }
+            lane.statement = 0;
         }
     }
 
@@ -602,15 +746,16 @@ impl Workgroup<'_> {
                 element(array, "private array", index).map(Value::Scalar)
             }
             Cell::Buffer { param, index } => {
-                let data = &self.buffers[param].data;
-                data.get(index)
-                    .copied()
-                    .map(Value::Scalar)
-                    .ok_or(Fault::OutOfBounds {
+                let buffer = &self.buffers[param];
+                let value = buffer.data.get(index).copied().map(Value::Scalar).ok_or(
+                    Fault::OutOfBounds {
                         what: "buffer",
                         index,
-                        len: data.len(),
-                    })
+                        len: buffer.data.len(),
+                    },
+                )?;
+                buffer.count_reads(index..index + 1);
+                Ok(value)
             }
         }
     }
@@ -856,15 +1001,21 @@ impl Workgroup<'_> {
                 let Cell::Buffer { param, index } = self.cell(lane, place)? else {
                     return Err(Fault::IllTyped("a vector load reads a buffer"));
                 };
-                let data = &self.buffers[param].data;
-                let range = vector_range(index, lanes, data.len())?;
-                Ok(Value::Vector(data[range].to_vec()))
+                let buffer = &self.buffers[param];
+                let range = vector_range(index, lanes, buffer.data.len())?;
+                buffer.count_reads(range.clone());
+                Ok(Value::Vector(buffer.data[range].to_vec()))
             }
             Rvalue::VectorSplat(operand) => {
                 let lanes = lanes_of(dest)?;
                 let value = self.scalar_operand(lane, operand)?;
                 Ok(Value::Vector(vec![value; lanes]))
             }
+            // `step_lane` parks a lane at the shuffle statement and `exchange` completes it, so no rvalue
+            // evaluation reaches here.
+            Rvalue::SubgroupShuffleXor { .. } => Err(Fault::IllTyped(
+                "a subgroup shuffle completes at its exchange, not as an expression",
+            )),
             Rvalue::VectorExtract { vector, lane: at } => {
                 let Value::Vector(lanes) = self.operand(lane, vector)? else {
                     return Err(Fault::IllTyped("a vector extract reads a vector"));
@@ -1396,6 +1547,10 @@ mod tests {
         Operand::Copy(Place::local(l(local)))
     }
 
+    fn copy_place(place: Place) -> Operand {
+        Operand::Copy(place)
+    }
+
     fn cusize(v: u64) -> Operand {
         Operand::Const(Constant::Usize(v))
     }
@@ -1879,10 +2034,7 @@ mod tests {
             Ty::F32 => Scalar::F32(0.0),
             other => panic!("unsupported test type {other:?}"),
         };
-        let mut buffers = [Buffer {
-            elem: result_ty,
-            data: vec![seed],
-        }];
+        let mut buffers = [Buffer::new(result_ty, vec![seed])];
         run(&body, [1, 1, 1], &mut buffers)?;
         Ok(buffers[0].data[0])
     }
@@ -2367,6 +2519,234 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    fn shuffle(local: u32, value: u32, mask: u32) -> Statement {
+        assign(
+            local,
+            Rvalue::SubgroupShuffleXor {
+                value: copy(value),
+                mask,
+            },
+        )
+    }
+
+    /// `out[lane] = shuffle_xor(lane as u32, mask)` over `wg` lanes.
+    fn lane_shuffle_body(wg: u32, mask: u32) -> Body {
+        // _1 out, _2 lane, _3 lane as u32, _4 received
+        body_of(
+            1,
+            vec![buffer_ty(Ty::U32), Ty::Usize, Ty::U32, Ty::U32],
+            vec![
+                block(vec![], thread_index(2, IndexAxis::LocalX, 1)),
+                block(
+                    vec![
+                        assign(
+                            3,
+                            Rvalue::Cast {
+                                to: Ty::U32,
+                                operand: copy(2),
+                            },
+                        ),
+                        shuffle(4, 3, mask),
+                        Statement::Assign(element_of(1, 2), Rvalue::Use(copy(4))),
+                    ],
+                    Terminator::Return,
+                ),
+            ],
+            [wg, 1, 1],
+        )
+    }
+
+    #[test]
+    fn a_shuffle_returns_the_value_of_the_lane_xor_mask() {
+        for mask in [1u32, 2, 4, 8, 16] {
+            let mut buffers = [Buffer::from_u32s(&[0; 64])];
+            run(&lane_shuffle_body(64, mask), [1, 1, 1], &mut buffers).unwrap();
+            let expected: Vec<u32> = (0..64).map(|lane| lane ^ mask).collect();
+            assert_eq!(u32s(&buffers[0]), expected, "mask {mask}");
+        }
+    }
+
+    /// The exchange is between lanes of one aligned 32-run, and it carries the partner's own data: a
+    /// five-round xor butterfly leaves every lane of a run holding the sum of that run's inputs.
+    #[test]
+    fn a_butterfly_of_shuffles_sums_each_run_of_32_lanes() {
+        // _1 in, _2 out, _3 lane, _4 acc (f32), _5 received
+        let mut statements = vec![Statement::Assign(
+            Place::local(l(4)),
+            Rvalue::Use(copy_place(element_of(1, 3))),
+        )];
+        for mask in [16, 8, 4, 2, 1] {
+            statements.push(shuffle(5, 4, mask));
+            statements.push(assign(4, Rvalue::BinaryOp(BinOp::Add, copy(4), copy(5))));
+        }
+        statements.push(Statement::Assign(element_of(2, 3), Rvalue::Use(copy(4))));
+        let body = body_of(
+            2,
+            vec![
+                buffer_ty(Ty::F32),
+                buffer_ty(Ty::F32),
+                Ty::Usize,
+                Ty::F32,
+                Ty::F32,
+            ],
+            vec![
+                block(vec![], thread_index(3, IndexAxis::LocalX, 1)),
+                block(statements, Terminator::Return),
+            ],
+            [96, 1, 1],
+        );
+        let input: Vec<f32> = (0..96).map(|lane| (lane * lane % 7) as f32).collect();
+        let mut buffers = [Buffer::from_f32s(&input), Buffer::from_f32s(&[0.0; 96])];
+        run(&body, [1, 1, 1], &mut buffers).unwrap();
+        let expected: Vec<f32> = (0..96)
+            .map(|lane| input[lane / 32 * 32..][..32].iter().sum())
+            .collect();
+        assert_eq!(buffers[1].to_f32s().unwrap(), expected);
+    }
+
+    /// A shuffle between two barriers resumes at the statement after it, and a barrier still synchronizes
+    /// the whole workgroup around it.
+    #[test]
+    fn a_shuffle_between_barriers_resumes_after_itself() {
+        // _1 out, _2 lane, _3 lane as u32, _4 first, _5 partner index, _6 read, _7 second;
+        // LDS[lane] = shuffle(lane, 1) before the barrier, out[lane] = shuffle(LDS[lane ^ 32], 2) after it.
+        let body = {
+            let mut body = body_of(
+                1,
+                vec![
+                    buffer_ty(Ty::U32),
+                    Ty::Usize,
+                    Ty::U32,
+                    Ty::U32,
+                    Ty::Usize,
+                    Ty::U32,
+                    Ty::U32,
+                ],
+                vec![
+                    block(vec![], thread_index(2, IndexAxis::LocalX, 1)),
+                    block(
+                        vec![
+                            assign(
+                                3,
+                                Rvalue::Cast {
+                                    to: Ty::U32,
+                                    operand: copy(2),
+                                },
+                            ),
+                            shuffle(4, 3, 1),
+                            Statement::WorkgroupLocalWrite {
+                                idx: copy(2),
+                                value: copy(4),
+                                array: 0,
+                            },
+                        ],
+                        Terminator::Barrier {
+                            target: BlockId { index: 2 },
+                        },
+                    ),
+                    block(
+                        vec![
+                            assign(5, Rvalue::BinaryOp(BinOp::BitXor, copy(2), cusize(32))),
+                            assign(
+                                6,
+                                Rvalue::WorkgroupLocalRead {
+                                    idx: copy(5),
+                                    array: 0,
+                                },
+                            ),
+                            shuffle(7, 6, 2),
+                            Statement::Assign(element_of(1, 2), Rvalue::Use(copy(7))),
+                        ],
+                        Terminator::Return,
+                    ),
+                ],
+                [64, 1, 1],
+            );
+            body.workgroup_locals.push(WorkgroupLocalDecl {
+                elem_ty: Ty::U32,
+                len: 64,
+            });
+            body
+        };
+        let mut buffers = [Buffer::from_u32s(&[0; 64])];
+        run(&body, [1, 1, 1], &mut buffers).unwrap();
+        // LDS[i] = i ^ 1; lane reads LDS[lane ^ 32] = lane ^ 32 ^ 1, then takes its xor-2 partner's read.
+        let expected: Vec<u32> = (0..64).map(|lane| (lane ^ 2) ^ 32 ^ 1).collect();
+        assert_eq!(u32s(&buffers[0]), expected);
+    }
+
+    #[test]
+    fn a_shuffle_partner_outside_the_workgroup_is_a_divergent_collective_fault() {
+        // 48 lanes: the second run holds lanes 32..48, so lane 32 ^ 16 = 48 does not exist.
+        let mut buffers = [Buffer::from_u32s(&[0; 48])];
+        let err = run(&lane_shuffle_body(48, 16), [1, 1, 1], &mut buffers).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InterpError::Fault {
+                    fault: Fault::DivergentCollective(_),
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_buffer_counts_every_element_read() {
+        // out[0] = in[1] + in[1] + in[3]; the vector load of in[4..8] counts each element once.
+        // _1 in, _2 out, _3 i, _4 a, _5 b, _6 c, _7 v
+        let body = body_of(
+            2,
+            vec![
+                buffer_ty(Ty::F32),
+                buffer_ty(Ty::F32),
+                Ty::Usize,
+                Ty::F32,
+                Ty::F32,
+                Ty::F32,
+                Ty::Vec {
+                    elem: Box::new(Ty::F32),
+                    lanes: 4,
+                },
+            ],
+            vec![block(
+                vec![
+                    assign(3, Rvalue::Use(cusize(1))),
+                    Statement::Assign(
+                        Place::local(l(4)),
+                        Rvalue::Use(copy_place(element_of(1, 3))),
+                    ),
+                    Statement::Assign(
+                        Place::local(l(5)),
+                        Rvalue::Use(copy_place(element_of(1, 3))),
+                    ),
+                    assign(3, Rvalue::Use(cusize(3))),
+                    Statement::Assign(
+                        Place::local(l(6)),
+                        Rvalue::Use(copy_place(element_of(1, 3))),
+                    ),
+                    assign(3, Rvalue::Use(cusize(1))),
+                    assign(
+                        7,
+                        Rvalue::VectorLoad {
+                            place: element_of(1, 3),
+                        },
+                    ),
+                    assign(3, Rvalue::Use(cusize(0))),
+                    Statement::Assign(element_of(2, 3), Rvalue::Use(copy(4))),
+                ],
+                Terminator::Return,
+            )],
+            [1, 1, 1],
+        );
+        let mut buffers = [Buffer::from_f32s(&[0.0; 8]), Buffer::from_f32s(&[0.0; 1])];
+        run(&body, [1, 1, 1], &mut buffers).unwrap();
+        // Group 1 of the vector load covers elements 4..8.
+        assert_eq!(buffers[0].read_counts(), vec![0, 2, 0, 1, 1, 1, 1, 1]);
+        assert_eq!(buffers[1].read_counts(), vec![0]);
     }
 
     #[test]

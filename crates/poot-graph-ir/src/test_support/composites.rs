@@ -1,5 +1,5 @@
-//! The pass-only composites as ops in a test graph: the tests that exercise `OpKind::BlockTopK` and
-//! `OpKind::SelectedAttention` themselves (typing, decomposition, the oracle's bounds, the planner's
+//! The pass-only composites as ops in a test graph: the tests that exercise `OpKind::BlockTopK`,
+//! `OpKind::StableRank` and `OpKind::SelectedAttention` themselves (typing, decomposition, the oracle's bounds, the planner's
 //! refusals) need an equation holding the op.
 //!
 //! A tracer states a selection as its primitive composition ([`crate::ops::block_top_k_packed`],
@@ -10,7 +10,7 @@
 
 use crate::builder::{Builder, Traced};
 use crate::error::BuilderError;
-use crate::op::{BlockTopKAttrs, OpKind, SelectedAttentionAttrs};
+use crate::op::{BlockTopKAttrs, OpKind, SelectedAttentionAttrs, StableRankAttrs};
 
 /// The values of a block selection built by [`block_top_k`]: the packed result its one equation defines and the
 /// two projections of it.
@@ -50,6 +50,23 @@ pub fn block_top_k(
         ids: b.slice(packed, 3, ids.start, ids.end)?,
         keep: b.slice(packed, 3, keep.start, keep.end)?,
     })
+}
+
+/// ONE `OpKind::StableRank` equation over `scores` `[.., E]` and, when `eligible` is given, its eligibility of the
+/// same shape. The F32 rank has the scores' shape.
+pub fn stable_rank(
+    b: &Builder,
+    scores: Traced,
+    eligible: Option<Traced>,
+) -> Result<Traced, BuilderError> {
+    let attrs = StableRankAttrs {
+        masked: eligible.is_some(),
+    };
+    let mut inputs = vec![b.operand(scores)?];
+    if let Some(eligible) = eligible {
+        inputs.push(b.operand(eligible)?);
+    }
+    b.emit(OpKind::StableRank(attrs), inputs)
 }
 
 /// ONE `OpKind::SelectedAttention` equation over `q`, the cached `k` and `v`, the selected block `ids`

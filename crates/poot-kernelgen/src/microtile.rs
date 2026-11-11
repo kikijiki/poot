@@ -29,7 +29,7 @@
 //! written back to workgroup memory as the next product's operand).
 
 use poot_kernel_ir::{
-    BasicBlock, BinOp, BlockId, Constant, FRAGMENT_COLLECTIVE_LANES, FragmentMajor, FragmentRole,
+    BasicBlock, BinOp, BlockId, COLLECTIVE_LANES, Constant, FragmentMajor, FragmentRole,
     FragmentTy, Local, Operand, Place, Rvalue, Statement, Terminator, Ty, WmmaDtype, WmmaMat,
     WmmaShape, accumulator_map,
 };
@@ -39,7 +39,7 @@ use crate::emit::{Emit, bin, copy, cu};
 use crate::helpers::{Alloc, elem, guard};
 
 /// Lanes in one fragment collective: the wave (or subgroup) a fragment is held across.
-pub(crate) const FRAGMENT_LANES: usize = FRAGMENT_COLLECTIVE_LANES as usize;
+pub(crate) const FRAGMENT_LANES: usize = COLLECTIVE_LANES as usize;
 /// The edge of a fragment: every config lowers 16x16x16.
 const FRAGMENT_EDGE: usize = 16;
 

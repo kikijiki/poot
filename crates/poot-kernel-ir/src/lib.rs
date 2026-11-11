@@ -109,17 +109,18 @@ ir_node! {
             lanes: u32,
         },
         /// A subgroup-collective matrix fragment (spec 025/154, cards 530/663): one opaque value spread across
-        /// the lanes of a [`FRAGMENT_COLLECTIVE_LANES`]-lane group, never a scalar. The declared type is the
+        /// the lanes of a [`COLLECTIVE_LANES`]-lane group, never a scalar. The declared type is the
         /// fragment's whole identity (role, operand dtype, tile); the verifier checks every producer and
         /// consumer against it, and codegen allocates the local from it.
         Fragment(FragmentTy),
     }
 }
 
-/// The lane count of the collective scope a matrix fragment lives in: one 32-lane subgroup (an NVPTX warp, a
-/// gfx11 wave32, a Vulkan subgroup of size 32). Every `Wmma*` statement is executed by all of these lanes
-/// together or by none; the verifier proves it (`Body::verify`'s collective-participation check).
-pub const FRAGMENT_COLLECTIVE_LANES: u32 = 32;
+/// The lane count of a collective scope: one 32-lane subgroup (an NVPTX warp, a gfx11 wave32, a Vulkan
+/// subgroup of size 32), or half of a wider one. Every `Wmma*` statement and every
+/// [`Rvalue::SubgroupShuffleXor`] is executed by all of these lanes together or by none; the verifier proves
+/// it (`Body::verify`'s collective-participation check).
+pub const COLLECTIVE_LANES: u32 = 32;
 
 impl Ty {
     /// Whether the type is a float scalar, or a vector of one.
@@ -544,6 +545,18 @@ ir_node! {
             /// The lane read.
             lane: u32,
         },
+        /// `value` as held by the lane whose `LocalX` is this lane's `LocalX ^ mask`: a subgroup-collective
+        /// butterfly exchange of a scalar `F32`, `I32` or `U32`, which is also the result's type. `mask` is a
+        /// constant below [`COLLECTIVE_LANES`], so the lanes that exchange always sit in one aligned run of
+        /// [`COLLECTIVE_LANES`] consecutive `LocalX`. Every lane of that run executes the shuffle together or
+        /// none does (the verifier proves it, like a `Wmma*` statement), and the node carries no subgroup
+        /// size.
+        SubgroupShuffleXor {
+            /// The value this lane contributes.
+            value: Operand,
+            /// The lane distance exchanged, below [`COLLECTIVE_LANES`].
+            mask: u32,
+        },
     }
 }
 
@@ -644,12 +657,12 @@ impl FragmentTy {
 /// address a fragment by this `(lane, element)` pair; targets whose fragment layout is opaque (SPIR-V
 /// cooperative matrix, NVPTX `wmma`) refuse them and go through an LDS store and reload instead.
 pub mod accumulator_map {
-    use super::FRAGMENT_COLLECTIVE_LANES;
+    use super::COLLECTIVE_LANES;
 
     /// Accumulator elements one lane holds (a 16x16 tile over a 32-lane collective).
     pub const ELEMENTS_PER_LANE: u32 = 8;
     /// Lanes that share a row set: lanes `l` and `l + 16` hold the even and the odd rows.
-    pub const LANES_PER_ROW_SET: u32 = FRAGMENT_COLLECTIVE_LANES / 2;
+    pub const LANES_PER_ROW_SET: u32 = COLLECTIVE_LANES / 2;
 
     /// The `(row, column)` of element `element` of lane `lane`'s accumulator registers.
     pub const fn position(lane: u32, element: u32) -> (u32, u32) {
@@ -1195,7 +1208,7 @@ pub use verify::{Site, VerifyError, VerifyErrorKind};
 /// bindings, and no local read on a path where it was never assigned.
 mod verify {
     use super::{
-        BasicBlock, BinOp, BlockId, Body, Constant, ConstantTableDecl, FRAGMENT_COLLECTIVE_LANES,
+        BasicBlock, BinOp, BlockId, Body, COLLECTIVE_LANES, Constant, ConstantTableDecl,
         FragmentRole, FragmentTy, IndexAxis, Local, Operand, Place, ProjectionElem, Rvalue,
         Statement, Terminator, Ty, WmmaDtype, WmmaMat, WmmaShape, WorkgroupLocalDecl,
         accumulator_map,
@@ -1339,6 +1352,13 @@ mod verify {
             /// The type the local is declared as.
             found: Ty,
         },
+        /// A [`Rvalue::SubgroupShuffleXor`] mask at or past [`COLLECTIVE_LANES`]: the exchange would leave the
+        /// aligned run of lanes that execute it together.
+        #[error("subgroup shuffle mask {mask} is not below {COLLECTIVE_LANES}")]
+        ShuffleMaskOutOfRange {
+            /// The mask the shuffle names.
+            mask: u32,
+        },
         /// A fragment element access names an element a lane does not hold
         /// (`accumulator_map::ELEMENTS_PER_LANE` per lane).
         #[error(
@@ -1349,23 +1369,23 @@ mod verify {
             /// The element index the access names.
             idx: u8,
         },
-        /// A matrix-fragment op is reachable under control flow that can split its collective subgroup
-        /// (card 663): `branch` switches on a value that can differ between lanes of one
-        /// [`FRAGMENT_COLLECTIVE_LANES`]-lane group, and a path from it reaches the op before the arms
+        /// A collective op (a matrix-fragment op or a [`Rvalue::SubgroupShuffleXor`]) is reachable under control
+        /// flow that can split its collective subgroup (card 663): `branch` switches on a value that can differ between lanes of one
+        /// [`COLLECTIVE_LANES`]-lane group, and a path from it reaches the op before the arms
         /// reconverge. A collective op executed by only some lanes of its subgroup is undefined on every
         /// target. Selecting a whole subgroup (`lane / 32 == 0`, `lane < 32`) is uniform at this scope and
         /// accepted.
         #[error(
-            "bb{} branches on a value that can differ between lanes of one subgroup: the matrix-fragment op at \
+            "bb{} branches on a value that can differ between lanes of one subgroup: the collective op at \
              bb{} is reachable before the branch's arms reconverge{}",
             branch.index,
             op.index,
             reconverge_desc(*reconverge)
         )]
-        DivergentFragmentParticipation {
+        DivergentCollectiveParticipation {
             /// The divergent branch's block.
             branch: BlockId,
-            /// The block holding the matrix-fragment op.
+            /// The block holding the collective op.
             op: BlockId,
             /// The branch's reconvergence block, if its arms reunite.
             reconverge: Option<BlockId>,
@@ -2083,6 +2103,18 @@ mod verify {
                         found: other,
                     }),
                 },
+                Rvalue::SubgroupShuffleXor { value, mask } => {
+                    if *mask >= COLLECTIVE_LANES {
+                        return Err(VerifyErrorKind::ShuffleMaskOutOfRange { mask: *mask });
+                    }
+                    match self.operand_ty(value)? {
+                        ty @ (Ty::F32 | Ty::I32 | Ty::U32) => Ok(ty),
+                        other => Err(VerifyErrorKind::InvalidOperandType {
+                            what: "subgroup shuffle operand",
+                            found: other,
+                        }),
+                    }
+                }
             }
         }
 
@@ -2257,11 +2289,11 @@ mod verify {
                 // lane-varying one can split a fragment op's participants.
                 if class.splits_subgroup()
                     && let Some(op) = self.block_before(block_id, reconverge, |block| {
-                        block.statements.iter().any(is_fragment_op)
+                        block.statements.iter().any(is_collective_op)
                     })
                 {
                     return Err(at_terminator(
-                        VerifyErrorKind::DivergentFragmentParticipation {
+                        VerifyErrorKind::DivergentCollectiveParticipation {
                             branch: block_id,
                             op,
                             reconverge,
@@ -2308,7 +2340,7 @@ mod verify {
     enum LaneClass {
         /// The same for every lane of the workgroup.
         Uniform,
-        /// The same for every lane of one [`FRAGMENT_COLLECTIVE_LANES`]-lane subgroup, possibly different
+        /// The same for every lane of one [`COLLECTIVE_LANES`]-lane subgroup, possibly different
         /// between subgroups (a warp selector such as `lane / 32`).
         Subgroup,
         /// The lane's own thread index along the contiguous (X) axis, or that index taken modulo a multiple
@@ -2358,7 +2390,7 @@ mod verify {
         class: Vec<LaneClass>,
         racy: Vec<bool>,
         /// Whether a subgroup's lanes are consecutive X indices (the workgroup's X extent is a multiple of
-        /// [`FRAGMENT_COLLECTIVE_LANES`]): the precondition for any [`LaneClass::Lane`]/[`LaneClass::Subgroup`]
+        /// [`COLLECTIVE_LANES`]): the precondition for any [`LaneClass::Lane`]/[`LaneClass::Subgroup`]
         /// reading of a thread index.
         subgroups_follow_x: bool,
     }
@@ -2371,7 +2403,7 @@ mod verify {
             FlowState {
                 class: vec![LaneClass::Uniform; n],
                 racy: vec![false; n],
-                subgroups_follow_x: workgroup_size[0].is_multiple_of(FRAGMENT_COLLECTIVE_LANES),
+                subgroups_follow_x: workgroup_size[0].is_multiple_of(COLLECTIVE_LANES),
             }
         }
 
@@ -2422,8 +2454,9 @@ mod verify {
         }
     }
 
-    /// A statement that every lane of a collective subgroup must execute together (a `Wmma*` op).
-    fn is_fragment_op(stmt: &Statement) -> bool {
+    /// A statement that every lane of a collective subgroup must execute together (a `Wmma*` op or a
+    /// subgroup shuffle).
+    fn is_collective_op(stmt: &Statement) -> bool {
         matches!(
             stmt,
             Statement::WmmaLoad { .. }
@@ -2432,6 +2465,7 @@ mod verify {
                 | Statement::WmmaZero { .. }
                 | Statement::WmmaLoadLds { .. }
                 | Statement::WmmaStoreLds { .. }
+                | Statement::Assign(_, Rvalue::SubgroupShuffleXor { .. })
         )
     }
 
@@ -2643,6 +2677,9 @@ mod verify {
             | Rvalue::WorkgroupLocalCompareExchange { .. }
             | Rvalue::GlobalCompareExchange { .. }
             | Rvalue::VectorLoad { .. } => LaneClass::Varying,
+            // Each lane receives its partner's value, so the result differs between lanes of one subgroup
+            // whatever the operand's class.
+            Rvalue::SubgroupShuffleXor { .. } => LaneClass::Varying,
         }
     }
 
@@ -2672,7 +2709,7 @@ mod verify {
         }
     }
 
-    /// A positive integer constant that is a multiple of [`FRAGMENT_COLLECTIVE_LANES`].
+    /// A positive integer constant that is a multiple of [`COLLECTIVE_LANES`].
     fn is_subgroup_multiple(op: &Operand) -> bool {
         let value = match op {
             Operand::Const(Constant::Usize(v)) => *v,
@@ -2680,7 +2717,7 @@ mod verify {
             Operand::Const(Constant::I32(v)) if *v > 0 => *v as u64,
             _ => return false,
         };
-        value > 0 && value.is_multiple_of(u64::from(FRAGMENT_COLLECTIVE_LANES))
+        value > 0 && value.is_multiple_of(u64::from(COLLECTIVE_LANES))
     }
 
     fn operand_class(op: &Operand, flow: &FlowState) -> LaneClass {
@@ -2780,7 +2817,8 @@ mod verify {
             | Rvalue::MathUnary(_, a)
             | Rvalue::IntScalarUnary(_, a)
             | Rvalue::VectorSplat(a)
-            | Rvalue::VectorExtract { vector: a, .. } => operand_reads(a, f),
+            | Rvalue::VectorExtract { vector: a, .. }
+            | Rvalue::SubgroupShuffleXor { value: a, .. } => operand_reads(a, f),
             Rvalue::Cast { operand, .. }
             | Rvalue::Narrow { operand, .. }
             | Rvalue::FromLowBits { operand, .. }

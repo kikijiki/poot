@@ -4,6 +4,7 @@
 poot-vulkan-runtime	context::graph::length_tests::kernel_lengths_past_u32_are_a_typed_refusal	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	context::init::launch_caps_tests::a_fixed_size_and_a_missing_feature_are_reported_as_such	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	context::init::launch_caps_tests::launch_caps_carry_the_reported_limits_and_the_subgroup_range	raw Vulkan runtime row; selected by package so none goes unrun
+poot-vulkan-runtime	context::pipeline::shuffle_workgroup_tests::a_shuffling_workgroup_must_be_whole_subgroups_of_a_device_that_runs_them	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	context::select::tests::a_device_without_a_compute_queue_is_skipped	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	context::select::tests::a_device_without_mappable_device_local_memory_is_refused	raw Vulkan runtime row; selected by package so none goes unrun
 poot-vulkan-runtime	context::select::tests::a_gpu_outranks_a_software_device_listed_first	raw Vulkan runtime row; selected by package so none goes unrun

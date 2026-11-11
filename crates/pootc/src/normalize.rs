@@ -440,6 +440,8 @@ fn rewrite_rvalue(rv: &mut Rvalue, aliases: &HashMap<u32, Place>) {
         Rvalue::VectorSplat(op) | Rvalue::VectorExtract { vector: op, .. } => {
             rewrite_operand(op, aliases)
         }
+        // Hand-built in kernelgen, never produced by MIR lowering; rewritten for completeness.
+        Rvalue::SubgroupShuffleXor { value, .. } => rewrite_operand(value, aliases),
     }
 }
 

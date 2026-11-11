@@ -365,6 +365,10 @@ poot-eval	poot-eval	model-free	tests::selected_attention::selecting_every_block_
 poot-eval	poot-eval	model-free	tests::selected_attention::the_definition_attends_over_exactly_the_selected_keys
 poot-eval	poot-eval	model-free	tests::selected_attention::the_oracle_refuses_a_selection_it_cannot_expand
 poot-eval	poot-eval	model-free	tests::selected_attention::the_typing_rule_refuses_what_it_cannot_read
+poot-eval	poot-eval	model-free	tests::stable_rank::eligibility_is_the_class_eligible_at_least_one
+poot-eval	poot-eval	model-free	tests::stable_rank::the_definition_ranks_what_the_plain_sort_ranks
+poot-eval	poot-eval	model-free	tests::stable_rank::the_masked_definition_ranks_the_eligible_class_first
+poot-eval	poot-eval	model-free	tests::stable_rank::the_typing_rule_refuses_what_it_cannot_rank
 poot-eval	poot-eval	model-free	tests::swa_gemma3::causal_mask_from_pos_matches_host_built_mask_row_table
 poot-eval	poot-eval	model-free	tests::swa_gemma3::causal_mask_from_pos_prefill_shape_matches_visibility_pattern_and_flushes_either_magnitude
 poot-eval	poot-eval	model-free	tests::swa_gemma3::swa_windowed_mask_eval_oracle_correctness
@@ -810,13 +814,16 @@ poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::device_witn
 poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::device_witness_rejects_noncanonical_heads
 poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::device_witness_rejects_the_chain_above_the_exact_bound
 poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::device_witness_reports_the_first_declaration
+poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::resources::a_body_without_a_shuffle_needs_no_subgroup
 poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::resources::a_declared_subgroup_must_lie_in_the_reported_range
 poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::resources::a_fragment_kernel_needs_the_subgroup_and_matrix_hardware_the_device_reports
 poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::resources::a_fragment_needs_a_matrix_unit_of_its_own_dtype
 poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::resources::a_fragment_without_a_declared_subgroup_is_refused
+poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::resources::a_shuffle_needs_subgroups_of_at_least_32_lanes_and_whole_runs
 poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::resources::a_workgroup_array_of_unmeasurable_type_is_refused_not_guessed
 poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::resources::a_workgroup_that_is_not_whole_subgroups_is_refused
 poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::resources::a_zero_workgroup_extent_is_refused
+poot-graph-plan	poot-graph-plan	model-free	device_validation::tests::resources::each_runtimes_reported_subgroup_bounds_a_collective_kernel
 poot-graph-plan	poot-graph-plan	model-free	dtype_widen::compile_preparation_tests::a_bf16_weight_stays_bf16_and_is_cast_in_the_graph
 poot-graph-plan	poot-graph-plan	model-free	dtype_widen::compile_preparation_tests::lowers_the_non_last_axis_reduce_identically_on_every_backend
 poot-graph-plan	poot-graph-plan	model-free	dtype_widen::fold_dense_bf16_tests::a_grouped_weight_folds_only_when_it_is_bf16
@@ -1384,6 +1391,7 @@ poot-graph-plan	poot-graph-plan::operand_precision	model-free	options_that_name_
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	radv_caps_give_f16_attention_and_exact_contractions
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	rocm_caps_give_f16_contractions_and_f16_attention
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	the_kernel_request_carries_the_declared_precision
+poot-graph-plan	poot-graph-plan::packed_gemv_columns	model-free	a_packed_gemv_takes_the_columns_of_its_devices_calibration
 poot-graph-plan	poot-graph-plan::planner_owned_precision	model-free	a_declared_narrowing_is_held_to_a_matrix_unit_or_refused
 poot-graph-plan	poot-graph-plan::planner_owned_precision	model-free	a_narrowed_op_runs_on_a_matrix_unit_and_a_decode_gemv_stays_exact
 poot-graph-plan	poot-graph-plan::planner_owned_precision	model-free	nothing_narrows_on_a_one_wave_device
@@ -1393,6 +1401,7 @@ poot-graph-plan	poot-graph-plan::range_check	model-free	in_range_data_passes_and
 poot-graph-plan	poot-graph-plan::range_check	model-free	off_adds_no_witness_and_no_equation
 poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_binary_equation_with_three_operands_is_an_operand_count_refusal
 poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_device_below_the_block_top_k_workgroup_is_refused_with_both_numbers
+poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_device_below_the_stable_rank_workgroup_memory_is_refused_with_the_extent
 poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_float_region_step_the_kernel_cannot_compute_is_a_fused_step_refusal
 poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_negative_literal_update_index_is_an_index_operand_refusal
 poot-graph-plan	poot-graph-plan::refusal_coverage	model-free	a_standalone_packed_dequant_is_an_imported_kernel_planning_refusal
@@ -1426,11 +1435,15 @@ poot-kernel-attr	poot-kernel-attr	model-free	card537_no_env_input_tests::host_wr
 poot-kernel-intrinsics	poot-kernel-intrinsics::smoke	model-free	every_intrinsic_is_callable
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_barrier_makes_every_lanes_lds_write_visible
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_body_that_never_terminates_hits_the_step_limit
+poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_butterfly_of_shuffles_sums_each_run_of_32_lanes
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_constant_table_read_past_the_end_is_a_fault
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_constant_table_read_returns_the_declared_word
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_lane_that_returns_before_a_barrier_deadlocks_the_workgroup
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_mul_add_rounds_once
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_select_reads_only_the_picked_branch
+poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_shuffle_between_barriers_resumes_after_itself
+poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_shuffle_partner_outside_the_workgroup_is_a_divergent_collective_fault
+poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_shuffle_returns_the_value_of_the_lane_xor_mask
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_two_byte_cast_of_a_nan_keeps_only_the_bits_the_type_holds
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_vector_group_index_that_overflows_is_an_out_of_bounds_fault
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::a_vector_load_at_a_near_usize_max_group_index_is_a_typed_fault
@@ -1447,6 +1460,7 @@ poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::lanes_parked_at_differen
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::narrow_floats_round_to_nearest_even
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::out_of_bounds_and_uninitialised_reads_are_errors
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::shifts_are_arithmetic_on_i32_and_logical_on_u32
+poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::the_buffer_counts_every_element_read
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::vector_load_splat_and_store_are_lanewise
 poot-kernel-ir	poot-kernel-ir	model-free	interp::tests::wmma_is_refused_by_name
 poot-kernel-ir	poot-kernel-ir	model-free	naming::tests::non_kernel
@@ -1457,6 +1471,7 @@ poot-kernel-ir	poot-kernel-ir	model-free	serialize::tests::a_fence_is_refused
 poot-kernel-ir	poot-kernel-ir	model-free	serialize::tests::a_global_atomic_is_refused
 poot-kernel-ir	poot-kernel-ir	model-free	serialize::tests::a_grid_the_workgroups_do_not_tile_is_refused
 poot-kernel-ir	poot-kernel-ir	model-free	serialize::tests::a_matrix_fragment_is_refused_as_a_subgroup_collective
+poot-kernel-ir	poot-kernel-ir	model-free	serialize::tests::a_subgroup_shuffle_is_refused_as_a_subgroup_collective
 poot-kernel-ir	poot-kernel-ir	model-free	serialize::tests::serializing_a_grid_matches_running_it
 poot-kernel-ir	poot-kernel-ir	model-free	serialize::tests::workgroup_memory_is_refused
 poot-kernel-ir	poot-kernel-ir	model-free	test_support::tests::fixture_bodies_verify
@@ -1529,6 +1544,9 @@ poot-kernel-ir	poot-kernel-ir::fragment_types	model-free	producer_destination_mu
 poot-kernel-ir	poot-kernel-ir::fragment_types	model-free	repeated_seeds_loads_and_in_place_mma_stay_legal
 poot-kernel-ir	poot-kernel-ir::fragment_types	model-free	swapped_a_b_are_rejected
 poot-kernel-ir	poot-kernel-ir::fragment_types	model-free	valid_global_and_lds_fragments_verify
+poot-kernel-ir	poot-kernel-ir::subgroup_shuffle	model-free	a_shuffle_mask_below_the_collective_width_is_accepted_and_the_width_itself_is_rejected
+poot-kernel-ir	poot-kernel-ir::subgroup_shuffle	model-free	a_shuffle_takes_f32_i32_and_u32_and_nothing_else
+poot-kernel-ir	poot-kernel-ir::subgroup_shuffle	model-free	a_shuffle_under_a_branch_that_splits_a_subgroup_is_rejected_and_one_under_a_whole_subgroup_is_accepted
 poot-kernelgen	poot-kernelgen	device	fused::tests::fused_row_parallel_matches_serial_rmsnorm
 poot-kernelgen	poot-kernelgen	device	fused::tests::fused_row_parallel_matches_serial_softmax
 poot-kernelgen	poot-kernelgen	device	fused::tests::fused_row_rmsnorm_multi_row
@@ -1903,6 +1921,12 @@ poot-kernelgen	poot-kernelgen::selected_attention	model-free	a_padded_cache_and_
 poot-kernelgen	poot-kernelgen::selected_attention	model-free	an_id_naming_a_future_block_reads_no_key_after_the_query
 poot-kernelgen	poot-kernelgen::selected_attention	model-free	the_kernel_attends_over_exactly_the_selected_blocks
 poot-kernelgen	poot-kernelgen::selected_attention	model-free	the_kernel_lowers_to_spirv_and_ptx
+poot-kernelgen	poot-kernelgen::stable_rank	model-free	an_extent_no_rank_can_name_is_refused
+poot-kernelgen	poot-kernelgen::stable_rank	model-free	rows_are_independent
+poot-kernelgen	poot-kernelgen::stable_rank	model-free	the_kernel_lowers_to_spirv_and_ptx
+poot-kernelgen	poot-kernelgen::stable_rank	model-free	the_kernel_ranks_what_the_definition_ranks
+poot-kernelgen	poot-kernelgen::stable_rank	model-free	the_masked_kernel_ranks_what_the_definition_ranks
+poot-kernelgen	poot-kernelgen::stable_rank	model-free	the_spec_names_its_lanes_and_workgroup_memory
 poot-l0-runtime	poot-l0-runtime	model-free	ffi::tests::a_library_without_the_entry_points_names_the_first_missing_symbol
 poot-l0-runtime	poot-l0-runtime	model-free	ffi::tests::a_missing_loader_is_a_typed_library_error
 poot-l0-runtime	poot-l0-runtime	model-free	ffi::tests::descriptor_layouts_match_ze_api_h
@@ -2840,6 +2864,7 @@ poot-llm	poot-llm::rocm_executor_coverage	device	flash_attention_with_a_per_head
 poot-llm	poot-llm::rocm_executor_coverage	device	packed_decode_gemv_matches_llama_cpp_dequantisation_on_real_blocks_on_rocm
 poot-llm	poot-llm::rocm_executor_coverage	device	packed_linears_and_the_indexed_expert_contraction_match_the_oracle_on_rocm
 poot-llm	poot-llm::rocm_executor_coverage	device	selected_attention_reads_exactly_the_selected_blocks_on_rocm
+poot-llm	poot-llm::rocm_executor_coverage	device	stable_rank_ranks_what_the_plain_sort_ranks_on_rocm
 poot-llm	poot-llm::rocm_executor_coverage	device	tied_moe_routing_picks_the_lowest_index_first_on_rocm
 poot-llm	poot-llm::rocm_executor_coverage	device	tiled_gemm_with_a_remainder_tile_matches_the_oracle_on_rocm
 poot-llm	poot-llm::rocm_parity_models	device	parity_table_matches_the_oracle_on_rocm
@@ -4226,6 +4251,7 @@ poot-profile	poot-profile	model-free	timing::tests::buckets_key_on_kind_name_not
 poot-profile	poot-profile	model-free	timing::tests::counters_only_reports_detail_unavailable
 poot-profile	poot-profile	model-free	timing::tests::entries_with_activity_since_finds_only_entries_touched_after_the_mark
 poot-profile	poot-profile	model-free	timing::tests::host_partition_sums_to_wall_without_touching_device
+poot-profile	poot-profile	model-free	timing::tests::labelled_rows_split_a_kind_by_plan_label
 poot-profile	poot-profile	model-free	timing::tests::other_nanos_can_be_negative
 poot-profile	poot-profile	model-free	timing::tests::render_never_lets_the_callers_measured_wall_corrupt_the_step_sum_identity
 poot-profile	poot-profile	model-free	timing::tests::render_prints_the_unknown_fallback_not_a_zero_line
@@ -4286,6 +4312,7 @@ poot-ptx-device	poot-ptx-device::device_caps_planning	device	a_live_ptx_device_r
 poot-ptx-device	poot-ptx-device::device_caps_planning	device	the_ptx_device_reports_live_free_memory_within_its_open_time_ceiling
 poot-ptx-device	poot-ptx-device::device_timing	device	plain_ptx_device_reports_unknown_device_time
 poot-ptx-device	poot-ptx-device::device_timing	device	timed_ptx_device_reads_a_nonzero_device_time_for_a_known_kernel
+poot-ptx-device	poot-ptx-device::device_timing	device	timed_ptx_device_reads_each_dispatch_of_a_captured_step
 poot-ptx-device	poot-ptx-device::feedback_end_to_end	device	the_engine_plans_the_expert_projection_with_the_drivers_verdicts_on_ptx
 poot-ptx-device	poot-ptx-device::float_ne	device	float_ne_is_ieee_on_nan_on_ptx
 poot-ptx-device	poot-ptx-device::i32_index	device	gather_with_i32_indices_matches_the_oracle_bit_for_bit_on_ptx
@@ -4327,6 +4354,7 @@ poot-ptx-device	poot-ptx-device::parity	device	f16_checkpoint_orientation_projec
 poot-ptx-device	poot-ptx-device::parity	device	greedy_sample_token_is_exact_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	select_is_bitwise_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	selected_attention_reads_exactly_the_selected_blocks_on_ptx
+poot-ptx-device	poot-ptx-device::parity	device	stable_rank_ranks_what_the_plain_sort_ranks_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	state_pool_rows_reset_independently_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	the_range_detector_names_an_f16_overflow_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	two_byte_select_is_bitwise_on_ptx
@@ -5335,6 +5363,7 @@ poot-vulkan-runtime	poot-vulkan-runtime	device	features::tests::the_enabled_core
 poot-vulkan-runtime	poot-vulkan-runtime	model-free	context::graph::length_tests::kernel_lengths_past_u32_are_a_typed_refusal
 poot-vulkan-runtime	poot-vulkan-runtime	model-free	context::init::launch_caps_tests::a_fixed_size_and_a_missing_feature_are_reported_as_such
 poot-vulkan-runtime	poot-vulkan-runtime	model-free	context::init::launch_caps_tests::launch_caps_carry_the_reported_limits_and_the_subgroup_range
+poot-vulkan-runtime	poot-vulkan-runtime	model-free	context::pipeline::shuffle_workgroup_tests::a_shuffling_workgroup_must_be_whole_subgroups_of_a_device_that_runs_them
 poot-vulkan-runtime	poot-vulkan-runtime	model-free	context::select::tests::a_device_without_a_compute_queue_is_skipped
 poot-vulkan-runtime	poot-vulkan-runtime	model-free	context::select::tests::a_device_without_mappable_device_local_memory_is_refused
 poot-vulkan-runtime	poot-vulkan-runtime	model-free	context::select::tests::a_gpu_outranks_a_software_device_listed_first

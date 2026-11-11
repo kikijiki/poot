@@ -310,6 +310,12 @@ poot-kernelgen::selected_attention	a_padded_cache_and_a_stray_id_read_no_key_pas
 poot-kernelgen::selected_attention	an_id_naming_a_future_block_reads_no_key_after_the_query	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::selected_attention	the_kernel_attends_over_exactly_the_selected_blocks	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::selected_attention	the_kernel_lowers_to_spirv_and_ptx	kernelgen `selected_attention` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::stable_rank	an_extent_no_rank_can_name_is_refused	kernelgen `stable_rank` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::stable_rank	rows_are_independent	kernelgen `stable_rank` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::stable_rank	the_kernel_lowers_to_spirv_and_ptx	kernelgen `stable_rank` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::stable_rank	the_kernel_ranks_what_the_definition_ranks	kernelgen `stable_rank` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::stable_rank	the_masked_kernel_ranks_what_the_definition_ranks	kernelgen `stable_rank` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
+poot-kernelgen::stable_rank	the_spec_names_its_lanes_and_workgroup_memory	kernelgen `stable_rank` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 pootc::bin/pootc	normalize::tests::eliminates_a_provably_redundant_guard	pootc command-line row; the lane runs the package whole
 pootc::bin/pootc	normalize::tests::folds_ref_reborrow_alias	pootc command-line row; the lane runs the package whole
 pootc::bin/pootc	normalize::tests::leaves_a_guard_over_a_different_slice_alone	pootc command-line row; the lane runs the package whole

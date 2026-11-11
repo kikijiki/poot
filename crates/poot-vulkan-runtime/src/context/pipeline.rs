@@ -73,6 +73,12 @@ impl Context {
         } else {
             None
         };
+        // A module that shuffles needs its workgroup to be whole subgroups of consecutive lanes (no required
+        // size: the device default divides the largest subgroup, which the workgroup X is a multiple of).
+        let full_subgroups = facts.subgroup_shuffle || required_subgroup_size.is_some();
+        if facts.subgroup_shuffle && required_subgroup_size.is_none() {
+            check_shuffle_workgroup(self.shuffle_subgroup_size, facts.local_size_x)?;
+        }
         let n = shape.args.len();
         let bound = n + 1 + usize::from(shape.has_trap);
         let words = &*shape.words;
@@ -124,10 +130,12 @@ impl Context {
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
             .name(entry_point);
+        if full_subgroups {
+            stage_info =
+                stage_info.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+        }
         if required_subgroup_size.is_some() {
-            stage_info = stage_info
-                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
-                .push_next(&mut required_size);
+            stage_info = stage_info.push_next(&mut required_size);
         }
         let pipeline_info = vk::ComputePipelineCreateInfo::default()
             .stage(stage_info)
@@ -178,5 +186,42 @@ impl PipelineShape {
             has_trap: kernel.has_trap(),
             words: spirv_words(kernel)?.into(),
         })
+    }
+}
+
+/// A shuffling module is created with full subgroups, which needs a device that can (`subgroup_size` is its
+/// largest subgroup) and a workgroup X that is a whole number of them.
+fn check_shuffle_workgroup(
+    subgroup_size: Option<u32>,
+    local_size_x: Option<u32>,
+) -> Result<(), RuntimeError> {
+    match (subgroup_size, local_size_x) {
+        (Some(size), Some(x)) if x.is_multiple_of(size) => Ok(()),
+        _ => Err(RuntimeError::SubgroupShuffleUnsupported {
+            local_size_x,
+            subgroup_size,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod shuffle_workgroup_tests {
+    use super::*;
+
+    /// A device that runs full subgroups admits a workgroup of whole subgroups and refuses a partial one, one
+    /// with no declared X, and a device that cannot create full-subgroup pipelines. Mutation: admit every X
+    /// (drop the `is_multiple_of`); the 96-lane row is admitted and goes red.
+    #[test]
+    fn a_shuffling_workgroup_must_be_whole_subgroups_of_a_device_that_runs_them() {
+        assert!(check_shuffle_workgroup(Some(64), Some(128)).is_ok());
+        for (size, x) in [(Some(64), Some(96)), (Some(64), None), (None, Some(128))] {
+            assert!(
+                matches!(
+                    check_shuffle_workgroup(size, x),
+                    Err(RuntimeError::SubgroupShuffleUnsupported { .. })
+                ),
+                "{size:?} {x:?}"
+            );
+        }
     }
 }

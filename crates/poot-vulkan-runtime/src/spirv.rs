@@ -1,12 +1,13 @@
-//! The two facts about a SPIR-V module a pipeline's creation depends on, read from its words: whether it
-//! declares cooperative matrices, and its `LocalSize` X. A module is a header of five words followed by
-//! instructions, each one word of `(word count << 16) | opcode` and its operands; capabilities come first
-//! and execution modes follow the entry points.
+//! The facts about a SPIR-V module a pipeline's creation depends on, read from its words: whether it
+//! declares cooperative matrices, whether it shuffles across a subgroup, and its `LocalSize` X. A module is
+//! a header of five words followed by instructions, each one word of `(word count << 16) | opcode` and its
+//! operands; capabilities come first and execution modes follow the entry points.
 
 const HEADER_WORDS: usize = 5;
 const OP_CAPABILITY: u32 = 17;
 const OP_EXECUTION_MODE: u32 = 16;
 const CAPABILITY_COOPERATIVE_MATRIX_KHR: u32 = 6022;
+const CAPABILITY_GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
 const EXECUTION_MODE_LOCAL_SIZE: u32 = 17;
 
 /// What [`scan`] found.
@@ -14,6 +15,8 @@ const EXECUTION_MODE_LOCAL_SIZE: u32 = 17;
 pub(crate) struct ModuleFacts {
     /// `OpCapability CooperativeMatrixKHR` is declared.
     pub(crate) cooperative_matrix: bool,
+    /// `OpCapability GroupNonUniformShuffle` is declared: the body exchanges values between subgroup lanes.
+    pub(crate) subgroup_shuffle: bool,
     /// `OpExecutionMode ... LocalSize x y z`'s `x`, if the module declares a literal one.
     pub(crate) local_size_x: Option<u32>,
 }
@@ -23,6 +26,7 @@ pub(crate) struct ModuleFacts {
 pub(crate) fn scan(words: &[u32]) -> ModuleFacts {
     let mut facts = ModuleFacts {
         cooperative_matrix: false,
+        subgroup_shuffle: false,
         local_size_x: None,
     };
     let mut at = HEADER_WORDS;
@@ -36,6 +40,9 @@ pub(crate) fn scan(words: &[u32]) -> ModuleFacts {
         match opcode {
             OP_CAPABILITY if operands.first() == Some(&CAPABILITY_COOPERATIVE_MATRIX_KHR) => {
                 facts.cooperative_matrix = true;
+            }
+            OP_CAPABILITY if operands.first() == Some(&CAPABILITY_GROUP_NON_UNIFORM_SHUFFLE) => {
+                facts.subgroup_shuffle = true;
             }
             // `OpExecutionMode %entry mode ...`: `LocalSize` carries three literal sizes.
             OP_EXECUTION_MODE
@@ -80,7 +87,23 @@ mod tests {
             scan(&coopmat),
             ModuleFacts {
                 cooperative_matrix: true,
+                subgroup_shuffle: false,
                 local_size_x: Some(32)
+            }
+        );
+        let shuffle = module(&[
+            instruction(OP_CAPABILITY, &[65]), // GroupNonUniformShuffle, from the SPIR-V grammar
+            instruction(
+                OP_EXECUTION_MODE,
+                &[7, EXECUTION_MODE_LOCAL_SIZE, 128, 1, 1],
+            ),
+        ]);
+        assert_eq!(
+            scan(&shuffle),
+            ModuleFacts {
+                cooperative_matrix: false,
+                subgroup_shuffle: true,
+                local_size_x: Some(128)
             }
         );
         let plain = module(&[
@@ -91,6 +114,7 @@ mod tests {
             scan(&plain),
             ModuleFacts {
                 cooperative_matrix: false,
+                subgroup_shuffle: false,
                 local_size_x: Some(64)
             }
         );
@@ -108,6 +132,7 @@ mod tests {
             scan(&words),
             ModuleFacts {
                 cooperative_matrix: true,
+                subgroup_shuffle: false,
                 local_size_x: None
             }
         );

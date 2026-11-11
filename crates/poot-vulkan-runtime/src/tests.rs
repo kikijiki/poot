@@ -362,6 +362,7 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
             timestamp_period_ns: 0.0,
             timestamp_valid_mask: 0,
             coopmat_subgroup_sizes: None,
+            shuffle_subgroup_size: None,
             min_storage_offset_alignment: 256,
             max_workgroup_count: [65_535, 65_535, 65_535],
             device_caps: poot_target::DeviceCaps {

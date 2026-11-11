@@ -14,9 +14,16 @@ about 128).
 (`performance_receipt.metric_verdict`, the exact twin as the baseline and the narrow twin as the candidate) on the
 device-clock samples. The two receipts must come from one binary on one device: a pair measured in two sessions
 says nothing about the planner. A pair with a missing or incomparable side is `unmeasured`, never a pass.
+
+A real loss that a root-cause card is still working on is declared in `benchmarks/known-losses.toml` (case, backend,
+the medians it was reviewed at, why, and the follow-up card). A declared loss is reported as `DECLARED LOSS` with its
+follow-up and does not fail; a declared pair that no longer loses fails (remove the entry); an undeclared loss fails.
+The list is temporary by construction: each entry ends with its card.
 """
 
 import json
+import re
+import tomllib
 from pathlib import Path
 
 try:
@@ -28,6 +35,12 @@ except ImportError:  # direct execution from harness/
     import performance_receipt as receipts
     import results_root
 
+FILE_NAME = "known-losses.toml"
+LOSS_FIELDS = ("case", "backend", "follow_up", "median_narrow_us", "median_exact_us", "reason")
+FOLLOW_UP = re.compile(r"POOT-\d+")
+# The verdict line of a regression that `known-losses.toml` declares.
+DECLARED_LOSS = "DECLARED LOSS"
+
 # The verdict of a pair whose twins realized one plan: the invariant holds by identity.
 SAME_PLAN = "same plan"
 
@@ -35,6 +48,38 @@ SAME_PLAN = "same plan"
 PRECISION_FIELDS = ("operand_precision", "operand_rounding")
 # What a twin's definition may differ in besides its numerics and the prose that names it.
 DESCRIPTIVE_FIELDS = ("id", "regime", "numerics", "identity_digest", "fixture_id", "schedule_id", "cache_id")
+
+
+def committed_losses_path():
+    """The committed list: `benchmarks/known-losses.toml`."""
+    return Path(__file__).resolve().parent.parent / FILE_NAME
+
+
+def load_losses(path):
+    """The declared losses as `{(case, backend): entry}`, checked for completeness; no path or an absent file declares none."""
+    if path is None or not Path(path).exists():
+        return {}
+    with open(path, "rb") as f:
+        entries = tomllib.load(f).get("loss", [])
+    errors, found = [], {}
+    for i, entry in enumerate(entries, 1):
+        where = f"[[loss]] #{i}"
+        missing = [field for field in LOSS_FIELDS if entry.get(field) in (None, "")]
+        if missing:
+            errors.append(f"{where} lacks {', '.join(missing)}")
+            continue
+        if not FOLLOW_UP.fullmatch(entry["follow_up"]):
+            errors.append(f"{where} follow_up must be a card id like POOT-1234")
+        for field in ("median_narrow_us", "median_exact_us"):
+            if not (isinstance(entry[field], (int, float)) and entry[field] > 0):
+                errors.append(f"{where} {field} must be a positive number")
+        key = (entry["case"], entry["backend"])
+        if key in found:
+            errors.append(f"{where} declares {key} twice")
+        found[key] = entry
+    if errors:
+        raise ValueError(f"{path}: " + "; ".join(errors))
+    return found
 
 
 def _without_precision(numerics):
@@ -146,43 +191,72 @@ def pair_verdicts(definitions, manifest, root, policy=None):
     return rows
 
 
-def invariant_errors_of(rows):
+def _is_loss(row):
+    return row["verdict"] == receipts.REGRESSION
+
+
+def declared_label(row, declared):
+    """`DECLARED LOSS` with the follow-up when `row` is a regression that `declared` lists, else the row's verdict."""
+    entry = declared.get((row["pair"], row["backend"]))
+    if _is_loss(row) and entry:
+        return f"{DECLARED_LOSS} ({entry['follow_up']})"
+    return row["verdict"]
+
+
+def invariant_errors_of(rows, declared=None):
     """The violations among `pair_verdicts` rows: each pair whose chosen schedule measures slower than exact beyond
-    the comparator's band."""
-    return [
+    the comparator's band and is not declared, and each declaration whose pair no longer loses (a stale entry)."""
+    declared = declared or {}
+    errors = [
         f"{row['pair']} on {row['backend']}: the chosen schedule loses to exact "
         f"({row['median_narrow']:.1f} us against {row['median_exact']:.1f} us of {row['exact']})"
         for row in rows
-        if row["verdict"] == receipts.REGRESSION
+        if _is_loss(row) and (row["pair"], row["backend"]) not in declared
     ]
+    losing = {(row["pair"], row["backend"]) for row in rows if _is_loss(row)}
+    errors += [
+        f"{case} on {backend}: declared in {FILE_NAME} ({entry['follow_up']}) but no longer loses: remove the entry"
+        for (case, backend), entry in declared.items()
+        if (case, backend) not in losing
+    ]
+    return errors
 
 
-def invariant_errors(root=None):
+def invariant_errors(root=None, losses_path=None):
     """Every violation of the invariant in the bank at `root` (default: the checkout's definitions and the results
-    setting's receipts): a narrow case without an exact twin, and each pair whose chosen schedule loses."""
+    setting's receipts): a narrow case without an exact twin, each pair whose chosen schedule loses without a
+    declaration in `losses_path` (default: the checkout's `known-losses.toml`), and each stale declaration."""
     definitions_root, root = bank._roots(root, results_root.committed_bank_root)
     definitions = bank.load_json(definitions_root / "cases.json")
     manifest = bank.load_json(root / "receipts.json")
-    return pair_errors(definitions) + invariant_errors_of(pair_verdicts(definitions, manifest, root))
+    declared = load_losses(losses_path or committed_losses_path())
+    return pair_errors(definitions) + invariant_errors_of(pair_verdicts(definitions, manifest, root), declared)
 
 
 def main(argv=None):
     import argparse
 
     parser = argparse.ArgumentParser(description="judge every narrow case against its exact twin on the device")
+    parser.add_argument("--losses", help=f"the declared-loss list; default: the checkout's {FILE_NAME}")
     parser.add_argument("--root", help="a self-contained bank directory; default: the checkout's cases and the results setting's receipts")
     args = parser.parse_args(argv)
     definitions_root, root = bank._roots(args.root, results_root.committed_bank_root)
     definitions = bank.load_json(definitions_root / "cases.json")
     manifest = bank.load_json(root / "receipts.json")
-    for row in pair_verdicts(definitions, manifest, root):
+    declared = load_losses(args.losses or committed_losses_path())
+    rows = pair_verdicts(definitions, manifest, root)
+    for row in rows:
         medians = (
             f" {row['median_narrow']:.1f} vs {row['median_exact']:.1f} us"
             if row.get("median_narrow") is not None
             else ""
         )
-        print(f"{row['verdict']:>10}  {row['pair']} on {row['backend']}{medians}{('  ' + row['note']) if row['note'] else ''}")
-    errors = invariant_errors(args.root)
+        print(f"{declared_label(row, declared):>10}  {row['pair']} on {row['backend']}{medians}{('  ' + row['note']) if row['note'] else ''}")
+    for row in rows:
+        if _is_loss(row) and (row["pair"], row["backend"]) in declared:
+            entry = declared[(row["pair"], row["backend"])]
+            print(f"{DECLARED_LOSS}: {row['pair']} on {row['backend']}, follow-up {entry['follow_up']}: {entry['reason']}")
+    errors = pair_errors(definitions) + invariant_errors_of(rows, declared)
     for error in errors:
         print(f"error: {error}")
     return 1 if errors else 0

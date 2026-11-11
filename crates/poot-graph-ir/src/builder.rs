@@ -716,9 +716,9 @@ impl PreparedAppendResult {
 /// let _ = b.flash_attention_prefill_softcap(q, k, v, mask, 1, 0.5, Some(50.0));
 /// ```
 ///
-/// A tracer cannot construct a pass-only composite (architecture rule 3): `OpKind::BlockTopK` and
-/// `OpKind::SelectedAttention` are formed by `compile` from the compositions [`crate::ops::block_top_k_packed`]
-/// and [`crate::ops::selected_attention`] state, so the builder has no method for either. The tests that need
+/// A tracer cannot construct a pass-only composite (architecture rule 3): `OpKind::BlockTopK`,
+/// `OpKind::StableRank` and `OpKind::SelectedAttention` are formed by `compile` from the compositions
+/// [`crate::ops::block_top_k_packed`], [`crate::ops::stable_descending_rank`] and [`crate::ops::selected_attention`] state, so the builder has no method for either. The tests that need
 /// the op itself build it with `test_support::composites`.
 ///
 /// ```compile_fail,E0599

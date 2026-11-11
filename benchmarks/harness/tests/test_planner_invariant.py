@@ -97,6 +97,65 @@ class PlannerInvariant(unittest.TestCase):
         [row] = self.verdicts(receipt("x", EXACT_US, device_cell=False), receipt("x-narrow", EXACT_US))
         self.assertEqual(row["verdict"], "unmeasured", row)
 
+    def loss_row(self):
+        slower = [s * 1.3 for s in EXACT_US]
+        [row] = self.verdicts(receipt("x", EXACT_US), receipt("x-narrow", slower))
+        return row
+
+    def declared(self, **overrides):
+        entry = {
+            "case": "x-narrow",
+            "backend": "rocm",
+            "median_narrow_us": 1300.0,
+            "median_exact_us": 1000.0,
+            "reason": "r",
+            "follow_up": "POOT-1",
+        }
+        entry.update(overrides)
+        return {(entry["case"], entry["backend"]): entry}
+
+    def test_an_undeclared_loss_fails(self):
+        self.assertEqual(len(inv.invariant_errors_of([self.loss_row()], {})), 1)
+
+    def test_a_declared_loss_is_reported_with_its_follow_up_and_does_not_fail(self):
+        row, declared = self.loss_row(), self.declared()
+        self.assertEqual(inv.invariant_errors_of([row], declared), [])
+        self.assertEqual(inv.declared_label(row, declared), "DECLARED LOSS (POOT-1)")
+        self.assertEqual(inv.declared_label(row, {}), pr.REGRESSION)
+
+    def test_a_declared_pair_that_no_longer_loses_fails(self):
+        for factor in (1.001, 0.5):
+            [row] = self.verdicts(receipt("x", EXACT_US), receipt("x-narrow", [s * factor for s in EXACT_US]))
+            [error] = inv.invariant_errors_of([row], self.declared())
+            self.assertIn("no longer loses", error)
+        self.assertEqual(len(inv.invariant_errors_of([], self.declared())), 1)
+
+    def test_a_declaration_covers_only_its_own_backend(self):
+        self.assertEqual(len(inv.invariant_errors_of([self.loss_row()], self.declared(backend="ptx"))), 2)
+
+    def test_the_declared_loss_list_is_checked_for_completeness(self):
+        path = self.root / "losses.toml"
+        good = (
+            '[[loss]]\ncase = "c"\nbackend = "rocm"\nmedian_narrow_us = 2.0\nmedian_exact_us = 1.0\n'
+            'reason = "r"\nfollow_up = "POOT-9"\n'
+        )
+        path.write_text(good)
+        self.assertEqual(list(inv.load_losses(path)), [("c", "rocm")])
+        self.assertEqual(inv.load_losses(self.root / "absent.toml"), {})
+        for bad in (
+            good.replace('follow_up = "POOT-9"\n', ""),
+            good.replace("POOT-9", "later"),
+            good.replace("2.0", "-2.0"),
+            good + good,
+        ):
+            path.write_text(bad)
+            with self.assertRaises(ValueError):
+                inv.load_losses(path)
+
+    def test_the_checked_in_declarations_name_a_follow_up_card(self):
+        declared = inv.load_losses(inv.committed_losses_path())
+        self.assertIn(("expert-prefill-packed-iq2xs-up-narrow", "rocm"), declared)
+
     def test_the_checked_in_bank_pairs_every_narrow_case_and_has_no_loss(self):
         self.assertEqual(inv.invariant_errors(), [])
 

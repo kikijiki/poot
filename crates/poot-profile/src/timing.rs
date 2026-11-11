@@ -21,6 +21,9 @@ use poot_target::TargetId;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
+/// How many `(kind_name, plan_label)` rows [`WindowReport::render`] prints, most device time first.
+const LABELLED_ROWS: usize = 60;
+
 /// Host wall time partitioned into the intervals the engine itself measures: encoding/submitting
 /// work (`encode`), blocking on the device (`wait`), and the step's total wall (`wall`). `other` (the
 /// unattributed residual) is always `wall - encode - wait`, computed, never independently measured
@@ -397,6 +400,10 @@ pub struct WindowReport {
     pub detail: Coverage,
     /// Per-`kind_name` aggregation of the retained per-dispatch records, keyed by the op's semantic report key.
     pub buckets: BTreeMap<&'static str, OpBucket>,
+    /// The same records aggregated by `(kind_name, plan_label)`: a kind split by what the planner named for each
+    /// dispatch (its schedule and shape), so a family's rows show which shape its time goes to. Dispatches with
+    /// no label are in `buckets` only.
+    pub labelled: BTreeMap<(&'static str, String), OpBucket>,
     /// Card 552: true when any retained step in this window changed submission grouping
     /// to collect its detail. A caller must not present this window's per-token device-time
     /// figures as unperturbed throughput evidence when this is set (a separate, unprofiled/
@@ -485,6 +492,30 @@ impl WindowReport {
                 ));
             }
         }
+        if !self.labelled.is_empty() {
+            let mut rows: Vec<_> = self.labelled.iter().collect();
+            rows.sort_by_key(|(_, bucket)| std::cmp::Reverse(bucket.device));
+            out.push_str(&format!(
+                "{:<20} {:>10} {:>14} {:>10}  {}\n",
+                "kind_name", "dispatches", "device ms", "mean us", "plan_label"
+            ));
+            for ((kind, label), bucket) in rows.into_iter().take(LABELLED_ROWS) {
+                let (total, mean) = match bucket.device {
+                    Some(d) => (
+                        format!("{:.3}", ms(d)),
+                        format!(
+                            "{:.1}",
+                            ms(d) * 1000.0 / bucket.dispatch_count.max(1) as f64
+                        ),
+                    ),
+                    None => ("unknown".to_string(), "unknown".to_string()),
+                };
+                out.push_str(&format!(
+                    "{:<20} {:>10} {:>14} {:>10}  {}\n",
+                    kind, bucket.dispatch_count, total, mean, label
+                ));
+            }
+        }
         out
     }
 
@@ -551,6 +582,7 @@ impl Report {
         };
 
         let mut buckets: BTreeMap<&'static str, OpBucket> = BTreeMap::new();
+        let mut labelled: BTreeMap<(&'static str, String), OpBucket> = BTreeMap::new();
         let mut span_sum: Option<Duration> = None;
         let mut span_complete = detail.is_complete() && !in_window.is_empty();
         let perturbed = in_window.iter().any(|s| s.perturbed);
@@ -568,6 +600,13 @@ impl Report {
                 if let Some(dur) = d.device {
                     bucket.device = Some(bucket.device.unwrap_or_default() + dur);
                 }
+                if let Some(label) = &d.plan_label {
+                    let bucket = labelled.entry((d.kind_name, label.clone())).or_default();
+                    bucket.dispatch_count += 1;
+                    if let Some(dur) = d.device {
+                        bucket.device = Some(bucket.device.unwrap_or_default() + dur);
+                    }
+                }
             }
         }
 
@@ -583,6 +622,7 @@ impl Report {
             },
             detail,
             buckets,
+            labelled,
             perturbed,
         }
     }
@@ -717,6 +757,47 @@ mod tests {
         assert_eq!(matmul.dispatch_count, 2);
         assert_eq!(matmul.device, Some(Duration::from_micros(30)));
         assert_eq!(report.buckets["reduce"].dispatch_count, 1);
+    }
+
+    /// The labelled view splits a kind by plan label and sums repeats of one label, most device time first in the
+    /// rendering; a dispatch with no label is only in the kind bucket.
+    /// Mutation: key `labelled` on the kind alone (drop the label from the key); the two matmul labels merge and
+    /// the row count is 2, not 3.
+    #[test]
+    fn labelled_rows_split_a_kind_by_plan_label() {
+        let mut snap = snapshot(4, 64);
+        let mark = snap.mark();
+        let dispatch = |index, label: Option<&str>, micros| DispatchTiming {
+            dispatch_index: index,
+            kind_name: "matmul",
+            plan_label: label.map(str::to_string),
+            device: Some(Duration::from_micros(micros)),
+        };
+        snap.record(
+            1,
+            1,
+            host(1, 1, 2),
+            DeviceCoverage::Unknown,
+            vec![
+                dispatch(0, Some("k1536"), 10),
+                dispatch(1, Some("k4096"), 20),
+                dispatch(2, Some("k1536"), 14),
+                dispatch(3, None, 7),
+            ],
+        );
+        let report = Report::window(&snap, &mark, &[1]);
+        assert_eq!(report.labelled.len(), 2);
+        let small = &report.labelled[&("matmul", "k1536".to_string())];
+        assert_eq!(small.dispatch_count, 2);
+        assert_eq!(small.device, Some(Duration::from_micros(24)));
+        assert_eq!(report.buckets["matmul"].dispatch_count, 4);
+        let text = report.render(1, Duration::from_millis(2));
+        let k4096 = text.find("k4096").expect("k4096 row");
+        let k1536 = text.find("k1536").expect("k1536 row");
+        assert!(
+            k1536 < k4096,
+            "the label with more device time prints first (24 us vs 20 us)"
+        );
     }
 
     /// SC-006 shape: a bound ring evicts the oldest step first, and a window that reaches past the

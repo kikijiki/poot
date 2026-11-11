@@ -95,7 +95,7 @@ impl Context {
         );
         let launch = LaunchCaps::from_wgpu(
             &self.device.limits(),
-            self._adapter.features().contains(wgpu::Features::SUBGROUP),
+            self.device.features().contains(wgpu::Features::SUBGROUP),
             {
                 let info = self._adapter.get_info();
                 (info.subgroup_min_size, info.subgroup_max_size)

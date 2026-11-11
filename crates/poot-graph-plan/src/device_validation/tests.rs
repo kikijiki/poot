@@ -304,7 +304,8 @@ fn device_witness_rejects_the_chain_above_the_exact_bound() {
 mod resources {
     use poot_kernel_ir::WorkgroupLocalDecl;
     use poot_kernel_ir::{
-        BasicBlock, Body, Local, Statement, Terminator, Ty, WmmaDtype, WmmaShape,
+        BasicBlock, Body, Constant, Local, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        WmmaDtype, WmmaShape,
     };
     use poot_kernelgen::{FragmentUse, KernelRequirements};
     use poot_target::{DeviceCaps, MatrixUnits, Queried, SubgroupSupport};
@@ -434,6 +435,72 @@ mod resources {
         );
     }
 
+    fn shuffle_statement() -> Statement {
+        Statement::Assign(
+            Place::local(Local { index: 1 }),
+            Rvalue::SubgroupShuffleXor {
+                value: Operand::Const(Constant::U32(1)),
+                mask: 1,
+            },
+        )
+    }
+
+    /// A subgroup shuffle exchanges within an aligned run of 32 lanes, so it needs a device whose every
+    /// subgroup has at least 32 lanes, and a workgroup of whole runs.
+    /// Mutation: drop the `uses_shuffle` branch of `validate_kernel_resources`; every refusal row goes red.
+    #[test]
+    fn a_shuffle_needs_subgroups_of_at_least_32_lanes_and_whole_runs() {
+        let declared = KernelRequirements {
+            subgroup_lanes: None,
+        };
+        let launch = body([64, 1, 1], vec![shuffle_statement()]);
+        let with_subgroup = |subgroup| {
+            let mut caps = caps();
+            caps.subgroup = subgroup;
+            validate_kernel_resources(&launch, declared, &caps)
+        };
+        assert_eq!(
+            with_subgroup(Queried::Known(SubgroupSupport::Present {
+                min_size: 32,
+                max_size: 64,
+            })),
+            Ok(())
+        );
+        assert_eq!(
+            with_subgroup(Queried::Known(SubgroupSupport::Absent)),
+            Err(ResourceRefusal::SubgroupAbsent { lanes: 32 })
+        );
+        assert_eq!(
+            with_subgroup(Queried::Unknown),
+            Err(ResourceRefusal::SubgroupUnknown { lanes: 32 })
+        );
+        assert_eq!(
+            with_subgroup(Queried::Known(SubgroupSupport::Present {
+                min_size: 16,
+                max_size: 64,
+            })),
+            Err(ResourceRefusal::ShuffleSubgroupTooNarrow { min_size: 16 })
+        );
+        let ragged = body([48, 1, 1], vec![shuffle_statement()]);
+        assert_eq!(
+            validate_kernel_resources(&ragged, declared, &caps()),
+            Err(ResourceRefusal::ShuffleWorkgroupExtent { extent: 48 })
+        );
+    }
+
+    /// The shuffle scan is a property of the body: a body without one is admitted on a device with no
+    /// subgroup support.
+    #[test]
+    fn a_body_without_a_shuffle_needs_no_subgroup() {
+        let mut caps = caps();
+        caps.subgroup = Queried::Known(SubgroupSupport::Absent);
+        let declared = KernelRequirements {
+            subgroup_lanes: None,
+        };
+        let launch = body([48, 1, 1], vec![]);
+        assert_eq!(validate_kernel_resources(&launch, declared, &caps), Ok(()));
+    }
+
     /// POOT-1431: matrix units are per operand dtype. A bf16 fragment is refused by a device whose units are f16
     /// only (RADV: no `VK_KHR_shader_bfloat16`) and admitted by one that has bf16 (PTX sm_80+, ROCm gfx11); the
     /// f16 fragment runs on both. The old one-family flag admitted the bf16 fragment on RADV.
@@ -540,6 +607,66 @@ mod resources {
             assert_eq!(
                 validate_kernel_resources(&kernel, declared, &degraded),
                 Err(expected),
+                "{what}"
+            );
+        }
+    }
+
+    /// W3 (POOT-1553): the subgroup each runtime reports is the one the planner sizes a collective kernel
+    /// against. For PTX (warp 32), ROCm wave32 and wave64 parts and a Vulkan range of 32 to 64, a kernel that
+    /// declares the device's largest subgroup in a workgroup of two of them is admitted, a workgroup that
+    /// is not a whole number of them is refused as such, and a size outside the reported range is refused
+    /// with it. Mutation: skip the `is_multiple_of` check in `validate_kernel_resources`; the 3 / 2
+    /// subgroup row is admitted and goes red.
+    #[test]
+    fn each_runtimes_reported_subgroup_bounds_a_collective_kernel() {
+        use poot_target::AmdArch;
+        let rocm = |isa, wave| {
+            let arch = AmdArch::from_isa_name(isa, wave).expect("a known gfx code");
+            poot_test_util::device_caps::default_caps_for(poot_target::Backend::AmdGcn(arch))
+        };
+        let runtimes = [
+            ("ptx", DeviceCaps::ptx_default()),
+            ("rocm gfx1151", rocm("amdgcn-amd-amdhsa--gfx1151", 32)),
+            ("rocm gfx90a", rocm("amdgcn-amd-amdhsa--gfx90a", 64)),
+            (
+                "vulkan radv",
+                poot_test_util::device_caps::wgpu_rdna3_igpu(),
+            ),
+        ];
+        for (what, caps) in runtimes {
+            let Queried::Known(SubgroupSupport::Present { min_size, max_size }) = caps.subgroup
+            else {
+                panic!("{what} reports its subgroup: {:?}", caps.subgroup);
+            };
+            let declared = KernelRequirements {
+                subgroup_lanes: Some(max_size),
+            };
+            let whole = body([2 * max_size, 1, 1], vec![]);
+            assert_eq!(
+                validate_kernel_resources(&whole, declared, &caps),
+                Ok(()),
+                "{what}"
+            );
+            let partial = body([max_size + max_size / 2, 1, 1], vec![]);
+            assert_eq!(
+                validate_kernel_resources(&partial, declared, &caps),
+                Err(ResourceRefusal::WorkgroupNotSubgroupMultiple {
+                    invocations: u64::from(max_size + max_size / 2),
+                    lanes: max_size,
+                }),
+                "{what}"
+            );
+            let too_wide = KernelRequirements {
+                subgroup_lanes: Some(2 * max_size),
+            };
+            assert_eq!(
+                validate_kernel_resources(&whole, too_wide, &caps),
+                Err(ResourceRefusal::SubgroupSize {
+                    lanes: 2 * max_size,
+                    min_size,
+                    max_size,
+                }),
                 "{what}"
             );
         }

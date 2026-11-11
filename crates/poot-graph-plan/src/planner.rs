@@ -167,6 +167,13 @@ macro_rules! block_top_k_ops {
     };
 }
 
+/// Ops planned by `planner::stable_rank`.
+macro_rules! stable_rank_ops {
+    () => {
+        OpKind::StableRank(_)
+    };
+}
+
 /// The side output projection (POOT-1456): planned here, as no dispatch, because its region's dispatch writes it.
 macro_rules! side_output_ops {
     () => {
@@ -216,6 +223,7 @@ mod packed;
 mod packed_dequant;
 mod sampling;
 mod scan;
+mod stable_rank;
 
 pub use choice::Planned;
 pub(crate) use choice::PlannedDispatch;
@@ -746,6 +754,7 @@ fn plan_aie_eqn(
         | attention_ops!()
         | scan_ops!()
         | block_top_k_ops!()
+        | stable_rank_ops!()
         | cast_ops!()
         | sampling_ops!() => {
             // Any other op's lowering reads GPU capabilities.
@@ -810,6 +819,7 @@ fn admit_dtypes(op: &OpKind, dtypes: StorageDtypes, caps: &DeviceCaps) -> Result
         attention_ops!() => attention::admits_dtypes(dtypes),
         scan_ops!() => scan::admits_dtypes(dtypes),
         block_top_k_ops!() => block_top_k::admits_dtypes(dtypes),
+        stable_rank_ops!() => stable_rank::admits_dtypes(dtypes),
         sampling_ops!() => sampling::admits_dtypes(dtypes),
         cast_ops!() => cast::admits_dtypes(dtypes, caps),
         movement_ops!() => movement::admits_dtypes(op, dtypes, caps),
@@ -940,6 +950,7 @@ fn plan_gpu_eqn(
         attention_ops!() => attention::plan(g, eqn, backend, caps, limits)?,
         scan_ops!() => scan::plan(g, eqn, backend, caps, limits)?,
         block_top_k_ops!() => block_top_k::plan(g, eqn, backend, caps, limits)?,
+        stable_rank_ops!() => stable_rank::plan(g, eqn, backend, caps, limits)?,
         cast_ops!() => cast::plan(
             g,
             eqn,

@@ -406,6 +406,7 @@ fn shape_launch(
             | OpKind::Attention(_)
             | OpKind::Scan(_)
             | OpKind::BlockTopK(_)
+            | OpKind::StableRank(_)
             | OpKind::SelectedAttention(_)
             // Card 551a: every SampleToken body is one fixed-64-lane workgroup per row (the LDS
             // reduce arrays are sized for exactly 64 lanes); the generic bump below would silently

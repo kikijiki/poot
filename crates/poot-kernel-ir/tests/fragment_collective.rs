@@ -218,7 +218,7 @@ fn a_lane_prefix_shorter_than_a_subgroup_is_rejected() {
     let body = guarded(IndexAxis::X, [256, 1, 1], selector);
     assert_eq!(
         divergent_error(&body),
-        VerifyErrorKind::DivergentFragmentParticipation {
+        VerifyErrorKind::DivergentCollectiveParticipation {
             branch: bb(1),
             op: bb(2),
             // Both arms end in their own `Return`: they only meet at the body's exit.
@@ -236,7 +236,7 @@ fn even_lanes_only_is_rejected() {
     let body = guarded(IndexAxis::X, [256, 1, 1], selector);
     assert!(matches!(
         divergent_error(&body),
-        VerifyErrorKind::DivergentFragmentParticipation { .. }
+        VerifyErrorKind::DivergentCollectiveParticipation { .. }
     ));
 }
 
@@ -250,7 +250,7 @@ fn a_lane_dependent_modulus_that_is_not_a_subgroup_multiple_is_rejected() {
     let body = guarded(IndexAxis::X, [96, 1, 1], selector);
     assert!(matches!(
         divergent_error(&body),
-        VerifyErrorKind::DivergentFragmentParticipation { .. }
+        VerifyErrorKind::DivergentCollectiveParticipation { .. }
     ));
 }
 
@@ -265,7 +265,7 @@ fn subgroups_that_straddle_workgroup_rows_are_rejected() {
     );
     assert!(matches!(
         divergent_error(&body),
-        VerifyErrorKind::DivergentFragmentParticipation { .. }
+        VerifyErrorKind::DivergentCollectiveParticipation { .. }
     ));
 }
 
@@ -305,7 +305,7 @@ fn a_lane_varying_loop_around_matrix_work_is_rejected() {
     ];
     assert_eq!(
         divergent_error(&body),
-        VerifyErrorKind::DivergentFragmentParticipation {
+        VerifyErrorKind::DivergentCollectiveParticipation {
             branch: bb(2),
             op: bb(3),
             reconverge: Some(bb(4)),
@@ -375,7 +375,7 @@ fn a_branch_on_an_accumulator_element_is_lane_divergent() {
     });
     assert_eq!(
         divergent_error(&body),
-        VerifyErrorKind::DivergentFragmentParticipation {
+        VerifyErrorKind::DivergentCollectiveParticipation {
             branch: bb(1),
             op: bb(2),
             reconverge: None,

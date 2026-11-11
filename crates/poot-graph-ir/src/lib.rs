@@ -62,7 +62,7 @@ pub use op::{
     AttentionAttrs, BinOp, BlockTopKAttrs, BlockTopKLayout, ContractionRows, ExpertGrouping,
     ExpertRows, KeyLayout, KvBound, LaneId, LocalId, MaskOperand, OpClass, OpKind, RedOp,
     ScanAttrs, ScanFamily, ScanLayout, SelectedAttentionAttrs, SelectedAttentionLayout,
-    SinkOperand, UnOp,
+    SinkOperand, StableRankAttrs, UnOp,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use packed_source::packed_source_constants;

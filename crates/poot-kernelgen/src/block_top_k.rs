@@ -35,6 +35,7 @@ use crate::attention::{count_to, local_op, ubin, uc};
 use crate::data_movement::Cfg;
 use crate::emit::{c32, cu};
 use crate::helpers::{copy, elem, ld, slice_dtype, slice_f32};
+use crate::order_key::order_key;
 
 /// Lanes of the workgroup.
 pub const LANES: usize = 256;
@@ -193,7 +194,7 @@ fn lds_write_u32(c: &mut Cfg, array: u8, idx: poot_kernel_ir::Local, value: Oper
     c.emit(|e| e.write_lds(array, local_op(idx), value));
 }
 
-fn ubin32(c: &mut Cfg, op: BinOp, a: Operand, b: Operand) -> poot_kernel_ir::Local {
+pub(crate) fn ubin32(c: &mut Cfg, op: BinOp, a: Operand, b: Operand) -> poot_kernel_ir::Local {
     c.bin(Ty::U32, op, a, b)
 }
 
@@ -225,39 +226,14 @@ pub(crate) fn select(
     )
 }
 
-/// The order-preserving key of `scores[at]`: its canonical value's bits, flipped so that unsigned order is
-/// float order.
+/// The order-preserving key of `scores[at]` ([`order_key`]).
 fn key_of(
     c: &mut Cfg,
     scores: poot_kernel_ir::Local,
     at: poot_kernel_ir::Local,
 ) -> poot_kernel_ir::Local {
-    const MIN_BITS: u32 = 0xFF7F_FFFF;
-    const MAX_BITS: u32 = 0x7F7F_FFFF;
-    const INF_BITS: u32 = 0x7F80_0000;
     let value = c.let_(Ty::F32, Rvalue::Use(copy(elem(scores, at))));
-    let bits = c.let_(
-        Ty::U32,
-        Rvalue::Bitcast {
-            to: Ty::U32,
-            operand: local_op(value),
-        },
-    );
-    let magnitude = ubin32(c, BinOp::BitAnd, local_op(bits), c32(0x7FFF_FFFF));
-    let sign = ubin32(c, BinOp::Shr, local_op(bits), c32(31));
-    let negative = c.bin(Ty::Bool, BinOp::Ne, local_op(sign), c32(0));
-    let nan = c.bin(Ty::Bool, BinOp::Gt, local_op(magnitude), c32(INF_BITS));
-    let infinite = c.bin(Ty::Bool, BinOp::Eq, local_op(magnitude), c32(INF_BITS));
-    let zero = c.bin(Ty::Bool, BinOp::Eq, local_op(magnitude), c32(0));
-    let inf_bits = select(c, Ty::U32, negative, c32(MIN_BITS), c32(MAX_BITS));
-    let bits = select(c, Ty::U32, nan, c32(MIN_BITS), local_op(bits));
-    let bits = select(c, Ty::U32, infinite, local_op(inf_bits), local_op(bits));
-    let bits = select(c, Ty::U32, zero, c32(0), local_op(bits));
-    // Negative floats sort descending by magnitude: flip every bit; positive ones flip the sign bit.
-    let sign = ubin32(c, BinOp::Shr, local_op(bits), c32(31));
-    let negative = c.bin(Ty::Bool, BinOp::Ne, local_op(sign), c32(0));
-    let flip = select(c, Ty::U32, negative, c32(u32::MAX), c32(0x8000_0000));
-    ubin32(c, BinOp::BitXor, local_op(bits), local_op(flip))
+    order_key(c, value)
 }
 
 /// The inclusive prefix sum across the workgroup of every lane's `value`, by `log2(LANES)` doubling steps

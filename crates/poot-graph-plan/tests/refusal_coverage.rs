@@ -174,6 +174,43 @@ fn a_device_below_the_block_top_k_workgroup_is_refused_with_both_numbers() {
     }
 }
 
+/// The stable rank sorts a row in workgroup memory, `8 * next_pow2(E)` bytes: a device with 2 KiB refuses a
+/// 512-expert row (4 KiB) with the extent and both numbers, where the control device plans the same equation.
+///
+/// Mutation: make the `fits` check in `stable_rank::plan` never fire; the request reaches the generic resource
+/// check and this row goes red (`expected RankExtent, got KernelResources(StaticLds ..)`).
+#[test]
+fn a_device_below_the_stable_rank_workgroup_memory_is_refused_with_the_extent() {
+    let b = Builder::for_tests();
+    let scores = b.constant("scores", TensorType::f32(vec![3, 512])).unwrap();
+    let rank = composites::stable_rank(&b, scores, None).unwrap();
+    let g = b.finish(rank).unwrap();
+    assert_eq!(
+        refusal_or_ok(&g),
+        None,
+        "the control device plans a 512-expert rank"
+    );
+    let mut caps = poot_test_util::device_caps::wgpu_rdna3_igpu();
+    caps.lds_bytes = 2048;
+    let target = Target::Gpu {
+        backend: poot_target::Backend::SpirvVulkan,
+        caps,
+    };
+    match refusal_on(&g, &target) {
+        Capability::RankExtent {
+            experts,
+            lanes,
+            lds_needed,
+            lds_bytes,
+            ..
+        } => assert_eq!(
+            (experts, lanes, lds_needed, lds_bytes),
+            (512, 256, 4096, 2048)
+        ),
+        other => panic!("expected RankExtent, got {other:?}"),
+    }
+}
+
 /// The same refusal through `compile`, from the composition a tracer states: the selection pass forms the
 /// `BlockTopK` and the small device refuses that op with its workgroup numbers, not the first primitive of the
 /// quadratic rank chain it replaced (which no device lowers). Mutation: make `compile` run the selection pass

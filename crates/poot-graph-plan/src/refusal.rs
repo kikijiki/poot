@@ -195,6 +195,21 @@ pub enum Capability {
         /// The device's workgroup memory, in bytes.
         lds_bytes: u32,
     },
+    /// The stable rank kernel sorts a row in workgroup memory: `lanes` lanes and `lds_needed` bytes (a key word and a
+    /// tag word per element, the row padded to a power of two) for a row of `experts` elements, and the device's
+    /// workgroup, invocation or memory limits are below it.
+    RankExtent {
+        /// Elements ranked per row.
+        experts: usize,
+        /// Lanes the kernel needs in one workgroup.
+        lanes: usize,
+        /// The device's most invocations per workgroup.
+        max_invocations: u32,
+        /// Workgroup memory the kernel needs, in bytes.
+        lds_needed: u64,
+        /// The device's workgroup memory, in bytes.
+        lds_bytes: u32,
+    },
     /// A plan-local scratch buffer (`DispatchPlan::scratch`) is larger than the device's single-buffer
     /// ceiling. The split-KV attention rule chooses the streaming schedule when its scratch does not fit,
     /// so this is the backstop for a plan that reached validation anyway: a typed refusal, never a failed
@@ -577,6 +592,16 @@ impl fmt::Display for Capability {
             } => write!(
                 f,
                 "the block top-k kernel needs a {lanes}-lane workgroup and {lds_needed} bytes of workgroup memory, the device has {max_invocations} invocations and {lds_bytes} bytes"
+            ),
+            Capability::RankExtent {
+                experts,
+                lanes,
+                max_invocations,
+                lds_needed,
+                lds_bytes,
+            } => write!(
+                f,
+                "the stable rank kernel sorts a row of {experts} elements with {lanes} lanes and {lds_needed} bytes of workgroup memory, the device has {max_invocations} invocations and {lds_bytes} bytes"
             ),
             Capability::ScratchBytes {
                 needed,

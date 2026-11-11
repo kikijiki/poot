@@ -144,6 +144,8 @@ fn expectations() -> Vec<(&'static str, Vec<Admits>)> {
         ("scan ssd", rigid(7)),
         ("selected_attention", narrow_kv(5)),
         ("block_top_k", rigid(2)),
+        ("stable_rank masked=false", rigid(1)),
+        ("stable_rank masked=true", rigid(2)),
         ("all_reduce", vec![OtherFloats]),
         ("all_gather", vec![Anything]),
         ("random_uniform", rigid(1)),

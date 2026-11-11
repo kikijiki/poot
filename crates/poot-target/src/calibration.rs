@@ -37,6 +37,13 @@ pub const STRIX_HALO_PACKED_GEMV_RUN: u32 = 32;
 /// otherwise.
 pub const SM_120_PACKED_GEMV_RUN: u32 = 16;
 
+/// The Gemv columns of a packed weight on the RTX PRO 6000 Blackwell Server (sm_120), measured (POOT-1319, one secure
+/// pod): `{4, 2}` against the Strix Halo table's `{16, 8}` it borrowed, whole-model decode at ISL 128 (tokens/s,
+/// two repeats of three timed iterations each): Qwen3-4B Q4_K_M 162-168 -> 179-181, Qwen3.8-27B UD-Q4_K_XL 36.7-38.4
+/// -> 40.6, Qwen3.8-27B-FP8 15.9 -> 17.2. Narrower columns give each weight row more lanes and a longer contiguous
+/// run per trip, and launch more workgroups across the 188 compute units.
+pub const SM_120_PACKED_GEMV_COLS: GemvCols = GemvCols { wide: 4, narrow: 2 };
+
 /// The lanes of one wave64, the widest wave poot targets: the grain of a tiled attention's workgroup width, which
 /// is whole waves of the widest wave so it runs on every device.
 pub(crate) const WAVE_LANES: u32 = 64;
@@ -190,15 +197,14 @@ impl PerfCalibration {
         packed_gemv_max_run: STRIX_HALO_PACKED_GEMV_RUN,
     };
 
-    /// The RTX PRO 6000 Blackwell Server (compute capability 12.0). Measured for the packed Gemv run (POOT-1405) and
-    /// the Gemv's direct value (POOT-1490); a field it did not identify is spelled out as [`Self::PORTABLE`]'s, so a
-    /// reader sees which figures are borrowed: the LDS read and the staged value (the tiling fit is underdetermined on
-    /// PTX: the 80 candidate rows are one tile family), both Gemv columns tables (the dense sweep ties at every
-    /// output count but one, the packed table has no bank producer to sweep), the LDS-tree Gemv width and the
-    /// attention key blocks.
+    /// The RTX PRO 6000 Blackwell Server (compute capability 12.0). Measured for the packed Gemv run (POOT-1405), the
+    /// Gemv's direct value (POOT-1490) and the packed Gemv columns (POOT-1319); a field it did not identify is spelled
+    /// out as [`Self::PORTABLE`]'s, so a reader sees which figures are borrowed: the LDS read and the staged value (the
+    /// tiling fit is underdetermined on PTX: the 80 candidate rows are one tile family), the dense Gemv columns table
+    /// (the dense sweep ties at every output count but one), the LDS-tree Gemv width and the attention key blocks.
     pub const SM_120: Self = Self {
         dense_gemv_cols: Self::PORTABLE.dense_gemv_cols,
-        packed_gemv_cols: Self::PORTABLE.packed_gemv_cols,
+        packed_gemv_cols: SM_120_PACKED_GEMV_COLS,
         lds_gemv_width: Self::PORTABLE.lds_gemv_width,
         cost: CostRatios {
             lds_read: Self::PORTABLE.cost.lds_read,
@@ -598,6 +604,16 @@ mod tests {
             source: "POOT-1490 calibrate-launch indexed on one RTX PRO 6000 Blackwell Server (sm_120, secure pod, 88 cells, 176 rows): the direct values at which the model's choices are never slower than the retired 32-row switch (within 5 %) and within 5 % of the best mean regret are 11.9 to 16.8; the geometric centre. Mean regret against the faster schedule 1.056 against the retired switch's 1.177. An RTX 4090 (sm_89) gave 7.6 to 11.9, so the figure moves between parts and this one is that part's; receipts/1490-cuda-sweep/",
         },
         Provenance {
+            name: "SM_120_PACKED_GEMV_COLS_WIDE",
+            value: 4.0,
+            source: "POOT-1319, one RTX PRO 6000 Blackwell Server (sm_120, secure pod), whole-model decode at ISL 128 under pinned (wide, narrow) pairs, tokens/s: Qwen3.8-27B UD-Q4_K_XL (16,8) 36.7-38.4, (8,4) 39.5, (4,2) 40.6, (4,4) 40.1, (2,1) 39.6, (8,8) 38.5, (16,16) 35.6, (32,16) 32.9, (1,1) 37.6; Qwen3-4B Q4_K_M (16,8) 162-168, (8,4) 175, (4,4) 177, (4,2) 179-181, (2,2) 161; Qwen3.8-27B-FP8 (16,8) 15.9, (4,2) 17.2. The Strix Halo pair (16,8) it replaces was borrowed, never measured here",
+        },
+        Provenance {
+            name: "SM_120_PACKED_GEMV_COLS_NARROW",
+            value: 2.0,
+            source: "POOT-1319, the same sweep as SM_120_PACKED_GEMV_COLS_WIDE: the narrow column of the best pair (4,2); (4,4) and (8,4) ran 1-3 % behind it on Qwen3-4B Q4_K_M and Qwen3.8-27B",
+        },
+        Provenance {
             name: "STRIX_HALO_ATTENTION_KEY_BLOCK_WIDEST",
             value: 32.0,
             source: "POOT-1402 bank sweep: a 64-key block was 20-30% slower than a 32-key one on ROCm and wgpu (Strix Halo) and no faster on PTX",
@@ -702,17 +718,39 @@ mod tests {
         assert_provenance("SATURATING_LANES", saturating_lanes);
         assert_provenance("FILL_WORKGROUPS_PER_UNIT", fill_workgroups_per_unit);
         assert_provenance("VECTOR_LOAD_BYTES", VECTOR_LOAD_BYTES);
-        for (entry, row) in [
-            (PerfCalibration::PORTABLE, "PORTABLE_PACKED_GEMV_RUN"),
+        for (entry, row, cols_rows) in [
+            (
+                PerfCalibration::PORTABLE,
+                "PORTABLE_PACKED_GEMV_RUN",
+                (
+                    "STRIX_HALO_PACKED_GEMV_COLS_WIDE",
+                    "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
+                ),
+            ),
             (
                 PerfCalibration::STRIX_HALO_HSA,
                 "STRIX_HALO_PACKED_GEMV_RUN",
+                (
+                    "STRIX_HALO_PACKED_GEMV_COLS_WIDE",
+                    "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
+                ),
             ),
             (
                 PerfCalibration::STRIX_HALO_VULKAN,
                 "STRIX_HALO_PACKED_GEMV_RUN",
+                (
+                    "STRIX_HALO_PACKED_GEMV_COLS_WIDE",
+                    "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
+                ),
             ),
-            (PerfCalibration::SM_120, "SM_120_PACKED_GEMV_RUN"),
+            (
+                PerfCalibration::SM_120,
+                "SM_120_PACKED_GEMV_RUN",
+                (
+                    "SM_120_PACKED_GEMV_COLS_WIDE",
+                    "SM_120_PACKED_GEMV_COLS_NARROW",
+                ),
+            ),
         ] {
             let PerfCalibration {
                 dense_gemv_cols,
@@ -723,15 +761,12 @@ mod tests {
                 packed_gemv_max_run,
             } = entry;
             assert_provenance(row, packed_gemv_max_run);
-            // Every measured entry spells the Strix Halo figures (SM_120 borrows them from `PORTABLE`, which
-            // are the same values): one row each, checked against whichever entry carries it.
+            // Every measured entry spells the Strix Halo figures (SM_120 borrows the dense columns from `PORTABLE`,
+            // which are the same values): one row each, checked against whichever entry carries it.
             assert_provenance("STRIX_HALO_DENSE_GEMV_COLS_WIDE", dense_gemv_cols.wide);
             assert_provenance("STRIX_HALO_DENSE_GEMV_COLS_NARROW", dense_gemv_cols.narrow);
-            assert_provenance("STRIX_HALO_PACKED_GEMV_COLS_WIDE", packed_gemv_cols.wide);
-            assert_provenance(
-                "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
-                packed_gemv_cols.narrow,
-            );
+            assert_provenance(cols_rows.0, packed_gemv_cols.wide);
+            assert_provenance(cols_rows.1, packed_gemv_cols.narrow);
             assert_provenance("STRIX_HALO_LDS_GEMV_WIDTH", lds_gemv_width);
             let [widest, narrowest] = attention_key_blocks else {
                 panic!("two key blocks, widest first: {attention_key_blocks:?}");
@@ -783,6 +818,8 @@ mod tests {
             "STRIX_HALO_DENSE_GEMV_COLS_NARROW",
             "STRIX_HALO_PACKED_GEMV_COLS_WIDE",
             "STRIX_HALO_PACKED_GEMV_COLS_NARROW",
+            "SM_120_PACKED_GEMV_COLS_WIDE",
+            "SM_120_PACKED_GEMV_COLS_NARROW",
             "STRIX_HALO_LDS_GEMV_WIDTH",
             "PORTABLE_LDS_READ_COST",
             "PORTABLE_STAGED_VALUE_COST",

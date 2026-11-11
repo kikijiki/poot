@@ -597,7 +597,7 @@ fn matrix_work_under_a_lane_varying_branch_is_refused_before_codegen() {
         assert!(
             matches!(
                 error.kind,
-                VerifyErrorKind::DivergentFragmentParticipation { .. }
+                VerifyErrorKind::DivergentCollectiveParticipation { .. }
             ),
             "{target:?}: {error}"
         );

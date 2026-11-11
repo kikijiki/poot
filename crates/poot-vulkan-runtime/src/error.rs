@@ -102,6 +102,17 @@ pub enum RuntimeError {
         /// The device's supported subgroup size range as `(min, max)`, if it reports one.
         supported: Option<(u32, u32)>,
     },
+    /// A kernel shuffles across its subgroup, which this device cannot run as full subgroups, or whose
+    /// workgroup X is not a whole number of the device's largest subgroup.
+    #[error(
+        "a subgroup-shuffle kernel with workgroup X {local_size_x:?} cannot run on this device (full subgroups of {subgroup_size:?} lanes)"
+    )]
+    SubgroupShuffleUnsupported {
+        /// The kernel's declared workgroup X size, if it declared one.
+        local_size_x: Option<u32>,
+        /// The largest subgroup the device runs shuffling pipelines as, if it can create them at all.
+        subgroup_size: Option<u32>,
+    },
     /// `POOT_VULKAN_VALIDATION` asked for the Khronos validation layer and it cannot be enabled.
     #[error(
         "POOT_VULKAN_VALIDATION is set but the validation layer or VK_EXT_debug_utils is not available"
