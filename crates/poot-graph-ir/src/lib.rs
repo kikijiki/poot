@@ -68,7 +68,7 @@ pub use op::{
 pub use packed_source::packed_source_constants;
 pub use packed_source::{PackedSourceName, packed_source_type, packed_stack_source_type};
 pub use precision::{FragmentDtype, MatmulPrecision, OperandPrecision};
-pub use range::{IndexRange, RangeFacts, value_ranges};
+pub use range::{IndexRange, RangeFacts, ValueBound, value_ranges};
 pub use slot_map::{ForwardSlotMap, SlotMapError};
 pub use types::{Operands, Scalar, TensorType};
 pub use weight_ref::WeightRef;

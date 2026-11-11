@@ -98,7 +98,12 @@ fn projection_of(rows: usize) -> Graph {
 
 /// One prefill `Attention` equation over an F32 query and a key and value cache stored as `kv`.
 fn attention(kv: DType) -> Graph {
-    let (hq, hkv, cap, d, lq) = (16usize, 8usize, 2048usize, 128usize, 2048usize);
+    attention_of(kv, 2048)
+}
+
+/// One `Attention` equation of `lq` query rows (one is a decode step) over a 2048-long cache stored as `kv`.
+fn attention_of(kv: DType, lq: usize) -> Graph {
+    let (hq, hkv, cap, d) = (16usize, 8usize, 2048usize, 128usize);
     let b = Builder::for_tests();
     let q = b
         .constant("q", TensorType::f32(vec![1, hq, lq, d]))
@@ -258,6 +263,28 @@ fn an_op_a_matrix_unit_does_not_win_stays_exact() {
             "{label}: {:?}",
             summary(&program)
         );
+    }
+}
+
+/// The attention class of the planner invariant (POOT-1520): attention has no cost model of its own, so the one rule
+/// that keeps a narrowed attention from losing to the exact schedule is structural: a decode step (one query row) is
+/// a streaming attention that reads each key and value once, and a fragment tile would pad its one row, so it stays
+/// exact under the `narrow` policy on every target with a matrix unit; the bank's `-narrow` attention cells judge the
+/// prefill ones on the device. Mutation: in `select_operand_precision` skip the planner's answer (narrow every op the
+/// dtype rule admits); the decode step compiles narrowed or refused and this row goes red.
+#[test]
+fn a_decode_attention_stays_exact_under_the_narrow_policy() {
+    for (label, target) in [("rocm", rocm_wmma()), ("radv", radv())] {
+        for kv in [DType::F16, DType::F32] {
+            let program = compiled(&attention_of(kv, 1), &target, MatmulPrecision::Narrow);
+            assert!(
+                summary(&program)
+                    .iter()
+                    .all(|(precision, _)| precision.is_exact()),
+                "{label} decode attention over a {kv:?} cache: {:?}",
+                summary(&program)
+            );
+        }
     }
 }
 

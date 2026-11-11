@@ -89,11 +89,13 @@ test-bench-runner:
     scripts/test-model-free.sh run-isolated {{isolated_package}}
 
 # The benchmark harness, all of it stdlib and GPU-free: its unit tests (result contract, row identity, the committed
-# results' identity fields, the comparator, build.rs), the performance bank's claims, and the noise-aware comparator
+# results' identity fields, the comparator, build.rs), the performance bank's claims, the planner invariant (every narrow
+# case against its exact twin on the device, POOT-1520), and the noise-aware comparator
 # over the committed results (`bench-compare`). A recipe not named here runs in no gate: until POOT-1260 nothing did.
 test-bench-harness: bench-compare
     python3 -m unittest discover -s benchmarks/harness/tests -p 'test_*.py'
     python3 benchmarks/harness/performance_bank.py
+    python3 benchmarks/harness/planner_invariant.py
     python3 -I scripts/flash-next-correctness/test_compare.py
     python3 -I scripts/flash-next-correctness/test_shards.py
     just grid-check
@@ -109,15 +111,16 @@ bench-compare results='' *candidate:
     python3 benchmarks/harness/bench.py compare-committed --results-dir '{{results}}' --candidate {{candidate}}
 
 # Record the dense cell of one local backend: 5 repeats of qwen3-0.6b decode-128 through the release runner, one run
-# directory per repeat under $POOT_BENCH_RESULTS (benchmarks/results/ by default). Holds the GPU: run it as `flock /tmp/poot-gpu.lock just
-# bench-record wgpu`, with the box otherwise idle, and move the directories to the archive with `bench index` regenerated.
+# directory per repeat under $POOT_BENCH_RESULTS (benchmarks/results/ by default). Holds the GPU: the harness takes
+# /tmp/poot-gpu.lock and /tmp/poot-heavy.lock itself for each attempt, after the cooldown and quiet waits (`--hold-locks`), so
+# do NOT wrap this recipe in `flock`. Move the directories to the archive with `bench index` regenerated.
 bench-record backend model='qwen3-0.6b' scenario='decode-128':
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release -p poot-bench-runner
     POOT_BENCH_BACKEND={{backend}} POOT_BENCH_POOT_BIN="${CARGO_TARGET_DIR:-target}/release/poot-bench-runner" \
         python3 benchmarks/harness/bench.py run --framework poot --model {{model}} --scenario {{scenario}} \
-        --models-dir {{models_dir}} --repeats 5
+        --models-dir {{models_dir}} --repeats 5 --hold-locks
 
 # Fail when a test runs in no lane. A test is covered when it is model-free or real-dims (the model-free lane), a
 # checkpoint test (a row of scripts/required-checkpoint-cases.txt, run by the `test-checkpoint*` recipes), or matched by one of the

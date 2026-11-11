@@ -1,5 +1,5 @@
 //! POOT-1505 / POOT-1509: the PTX register oracle against the POOT-1509 sweep. Every kernel the sweep compiled for
-//! sm_120 (784 tilings of eight shapes, 385 distinct bodies) is rebuilt the way the sweep built it, then asked of the
+//! sm_120 (784 tilings of eight shapes, 434 distinct bodies) is rebuilt the way the sweep built it, then asked of the
 //! CUDA driver's JIT through the engine's compile feedback (the engine lowers the probe, [`PtxKernelRegisters`] compiles it); the verdict must be the one `ptxas` and the JIT gave then
 //! (`tests/data/ptxas_sweep_sm120.tsv`). A host without an NVIDIA device skips.
 
@@ -29,8 +29,11 @@ use poot_tensor::DType;
 /// another compiler, so a row on a different driver fails by name and the sweep is repeated.
 const SWEEP_DRIVER_RELEASE: u32 = 13_020;
 const SWEEP_COMPUTE_CAPABILITY: (u32, u32) = (12, 0);
-/// The distinct kernel bodies of the sm_120 sweep.
-const SWEEP_DISTINCT_BODIES: usize = 385;
+/// The distinct kernel bodies of the sm_120 sweep. The table was swept at 385 (POOT-1509), when a narrowed bf16 dense
+/// weight was stored f16 and shared its body with the f16 shape; since POOT-1535 it stays bf16 and the narrowed
+/// contraction rounds it in staging, a body of its own. The `Dense(bf16)` narrow rows' verdicts are owed a re-sweep on
+/// a pod (POOT-1478): the device row of this file fails on them until it is done.
+const SWEEP_DISTINCT_BODIES: usize = 434;
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -303,7 +306,7 @@ fn sweep_kernels() -> Vec<Kernel> {
     kernels
 }
 
-/// The sweep's kernels are rebuilt from the planner, not read from a file: all 784 tilings of the table, 385 distinct
+/// The sweep's kernels are rebuilt from the planner, not read from a file: all 784 tilings of the table, 434 distinct
 /// bodies. Needs no device. Mutation: leave `lifted` out of the enumeration in `sweep_kernels`; the tilings only the
 /// lifted register model admits are missing.
 #[test]

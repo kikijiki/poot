@@ -162,21 +162,15 @@ One case stays finite. A model that softcaps its attention scores (Gemma 2) maps
 
 The generated kernels round to f16 and widen from it with the device's own conversion instructions on ROCm and NVIDIA. On Vulkan they round with integer arithmetic on the f32 bits, because the driver may drop a convert-and-convert-back pair. Both forms give the same bits for every f32 value.
 
-The driver also stores its weights in one format. Under `narrow` on a target whose matrix units take f16, a bf16 weight that only dense contractions and embedding gathers read is declared f16 in the graph (the `store_weights_f16` pass). It is rounded to f16 once, when it is bound, so the kernels read it as stored and the oracle evaluates the same values.
-
-The decision reads three things and nothing else:
-
-- the policy;
-- the target's matrix units;
-- the kinds of a weight's readers, never a shape or the precision a reader plans.
+A weight keeps its checkpoint format in every program of a driver. No pass retypes it. Precision belongs to the contraction that reads the weight: a contraction the planner narrows to f16 over a bf16 weight rounds the staged weight in its fragment staging, a cost the planner prices in the same choice that picked the matrix-unit schedule. A narrow program in which the planner narrows nothing is therefore the same program as the exact one, with the same weight formats.
 
 Three consequences follow:
 
-- Every program of a driver (prefill, decode) holds a weight in the same format.
+- Every program of a driver (prefill, decode) holds a weight in the same format, so each weight is uploaded once.
 - A tied embedding and head share one stored tensor, so they upload one copy.
-- Any other bf16 weight (a norm scale, a router) keeps the checkpoint's format.
+- An exact read of a weight never pays for a rounding a narrowed reader needs.
 
-A weight that f16 cannot hold (beyond 65504, an infinity or a NaN) is refused at bind with a typed error naming the weight and the element.
+When the planner narrows a contraction to f16 over a bf16 weight, it declares that weight finite in f16. The weight binder checks the declaration when a program binds the weight, before it looks for a copy another program already uploaded. A weight that f16 cannot hold (beyond 65504, an infinity or a NaN) is refused with a typed error naming the weight and the element.
 
 ### Measured agreement of narrow with exact
 

@@ -161,39 +161,6 @@ pub fn run_parity_declared(
     Ok(())
 }
 
-/// [`run_parity_declared`] for the driver's weight format (POOT-1477): every fixture's compiled program must hold
-/// at least one weight the graph converts (declared F16 over the checkpoint's BF16), or the call fails: a program
-/// that kept the checkpoint's format would pass by comparing bf16 with bf16. The oracle evaluates the declared
-/// graph, whose weights the oracle binds converted as the bind does.
-pub fn run_parity_weight_format(
-    exec: &mut dyn poot_executor::Executor,
-    target: poot_graph_plan::Target,
-    fixtures: &[Fixture],
-    policy: impl Into<crate::Policy>,
-) -> Result<(), String> {
-    let policy = policy.into();
-    for fixture in fixtures {
-        let converted = crate::staged_under(exec, fixture, target, policy)
-            .stages()
-            .map(|(_, _, program)| {
-                let g = program.graph();
-                g.inputs()
-                    .iter()
-                    .filter(|&&id| g.meta(id).stored_dtype() != g.aval(id).dtype)
-                    .count()
-            })
-            .sum::<usize>();
-        if converted == 0 {
-            return Err(format!(
-                "{}: no weight of the program compiled under {policy:?} is converted",
-                fixture.name
-            ));
-        }
-        run_against_declared(exec, target, fixture, policy)?;
-    }
-    Ok(())
-}
-
 /// `fixture` run on `exec` under `policy` against the CPU oracle of the graph the policy declares for `target`.
 fn run_against_declared(
     exec: &mut dyn poot_executor::Executor,
@@ -322,81 +289,75 @@ pub fn narrowed_block_fixtures() -> Vec<Fixture> {
     ]
 }
 
-/// POOT-1477: a BF16 embedding the driver stores as f16, gathered by two token inputs and widened:
-/// `out = (embed[a] + embed[b]) * 2^20` over a table of odd width whose magnitudes are `2^e (1 + k/128)` for `e` from
-/// -20 to 3: the low exponents are bf16 values f16 holds only as subnormals (16 levels per binade, a relative
-/// rounding error up to 3%, far past the narrow-storage tolerance once the scale lifts them to `[1, 4)`), the rest
-/// are f16 normals, so the row covers both branches of the kernel's decode. An oracle that read the bf16 table, or a
-/// device that read the bf16 lane, would differ. The table has two gathers, so the planner keeps it a device
-/// constant instead of hosting its rows (a hosted table is never a device buffer). Two steps with different ids.
-pub fn weight_format_embedding_fixture() -> Fixture {
-    const VOCAB: usize = 24;
-    const WIDTH: usize = 5;
-    const IDS: usize = 6;
+/// POOT-1535: a BF16 projection whose weights span f16's subnormals and normals, read by a narrowed contraction:
+/// `out = (x W^T) * 2^20` with `W` a BF16 `[24, 5]` table of magnitudes `2^e (1 + k/128)` for `e` from -20 to 3 and
+/// `x` a permutation matrix slot, so each output is one weight element. The low exponents are bf16 values f16 holds
+/// only as subnormals (16 levels per binade, a relative rounding error up to 3%, far past the narrow-storage
+/// tolerance once the scale lifts them to `[1, 4)`), the rest are f16 normals, so the row covers both branches of the
+/// staging's rounding. An oracle that read the bf16 table unrounded, or a device that did, would differ. Two steps
+/// with different permutations.
+pub fn narrowed_bf16_weight_fixture() -> Fixture {
+    const N: usize = 24;
+    const K: usize = 5;
     let b = Builder::for_tests();
-    let embed = b
-        .constant("embed", TensorType::new(vec![VOCAB, WIDTH], DType::BF16))
+    let x = b
+        .slot_named(
+            poot_graph_ir::Slot::Activation,
+            "x",
+            TensorType::f32(vec![K, K]),
+        )
         .unwrap();
-    let scale = b.constant("scale", TensorType::f32(vec![WIDTH])).unwrap();
-    let ids = TensorType::new(vec![IDS], DType::I32);
-    let first = b
-        .slot_named(poot_graph_ir::Slot::Token, "first", ids.clone())
+    let w = b
+        .constant("w", TensorType::new(vec![N, K], DType::BF16))
         .unwrap();
-    let second = b
-        .slot_named(poot_graph_ir::Slot::Token, "second", ids)
+    let scale = b.constant("scale", TensorType::f32(vec![N])).unwrap();
+    let product = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
+    let out = b
+        .binary(poot_graph_ir::op::BinOp::Mul, product, scale)
         .unwrap();
-    let rows = |token| {
-        b.cast(b.gather(embed, 0, token).unwrap(), DType::F32)
-            .unwrap()
-    };
-    let sum = b
-        .binary(poot_graph_ir::op::BinOp::Add, rows(first), rows(second))
-        .unwrap();
-    let out = b.binary(poot_graph_ir::op::BinOp::Mul, sum, scale).unwrap();
     let graph = b.finish(out).unwrap();
-    let keys = [first, second].map(|t| graph.meta(t.id()).slot_key().unwrap().clone());
-    let table: Vec<f32> = (0..VOCAB * WIDTH)
+    let key = graph.meta(x.id()).slot_key().unwrap().clone();
+    let table: Vec<f32> = (0..N * K)
         .map(|i| {
             let sign = if i % 3 == 0 { -1.0 } else { 1.0 };
             sign * (1.0 + ((i * 37) % 128) as f32 / 128.0) * 2f32.powi(-20 + (i as i32 * 5) % 24)
         })
         .collect();
-    let steps = [
-        ([0, 23, 7, 7, 12, 1], [5, 5, 22, 0, 9, 17]),
-        ([3, 4, 5, 6, 7, 8], [23, 22, 21, 20, 19, 18]),
-    ]
-    .into_iter()
-    .map(|(a, b)| {
-        keys.iter()
-            .zip([a, b])
-            .map(|(key, ids)| crate::StepFixture {
+    let steps = [[0usize, 1, 2, 3, 4], [3, 4, 0, 2, 1]]
+        .into_iter()
+        .map(|permutation| {
+            let mut identity = vec![0.0f32; K * K];
+            for (row, column) in permutation.into_iter().enumerate() {
+                identity[row * K + column] = 1.0;
+            }
+            vec![crate::StepFixture {
                 key: key.clone(),
-                tensor: HostTensor::i32(vec![IDS], ids.to_vec()),
-            })
-            .collect()
-    })
-    .collect();
+                tensor: HostTensor::f32(vec![K, K], identity),
+            }]
+        })
+        .collect();
     Fixture {
-        name: "weight_format_embedding",
+        name: "narrowed_bf16_weight",
         store: crate::store_of(vec![
-            ("embed", vec![VOCAB, WIDTH], DType::BF16, table),
-            ("scale", vec![WIDTH], DType::F32, vec![2f32.powi(20); WIDTH]),
+            ("w", vec![N, K], DType::BF16, table),
+            ("scale", vec![N], DType::F32, vec![2f32.powi(20); N]),
         ]),
         graph,
         steps,
     }
 }
 
-/// POOT-1477: a language-model step at `m` rows: the embedding gathered by token (hosted: one gather, untied), a
-/// projection and a head, every device weight a BF16 table the driver stores as f16. `m = 1` plans the decode GEMV, `m = 64` the tiled schedules; the program holds the same weight
-/// format for both.
-pub fn weight_format_lm_fixtures() -> Vec<Fixture> {
+/// POOT-1535: a language-model step at `m` rows: the embedding gathered by token (hosted: one gather, untied), a
+/// projection and a head, every device weight a BF16 table the checkpoint holds. `m = 1` plans the decode GEMV, `m = 64`
+/// the tiled schedules; the program holds the same weight format for both, and a narrowed contraction rounds the staged
+/// weight.
+pub fn checkpoint_format_lm_fixtures() -> Vec<Fixture> {
     const VOCAB: usize = 48;
     const K: usize = 64;
     const N: usize = 32;
     [
-        ("weight_format_lm_m1", 1usize),
-        ("weight_format_lm_m64", 64),
+        ("checkpoint_format_lm_m1", 1usize),
+        ("checkpoint_format_lm_m64", 64),
     ]
     .into_iter()
     .map(|(name, m)| {

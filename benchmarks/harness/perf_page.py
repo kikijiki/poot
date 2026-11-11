@@ -28,11 +28,13 @@ sys.path.insert(0, str(HARNESS_DIR))
 
 import bench  # noqa: E402
 import grid  # noqa: E402
+import host_load  # noqa: E402
 import known_unverified  # noqa: E402
 import memory_phases as phases  # noqa: E402
 import performance_bank as bank  # noqa: E402
 import performance_receipt as receipts  # noqa: E402
 import results_root as results_lookup  # noqa: E402
+import thermal  # noqa: E402
 from result_contract import committed_row_errors  # noqa: E402
 
 REPO_ROOT = HARNESS_DIR.parents[1]
@@ -155,6 +157,12 @@ def contract_exclusion(rows, policy):
         return f"{len(rows)} repeats, the policy needs {policy['min_trials']}"
     if len({row.get("binary_sha256") for row in rows}) > 1:
         return "the repeats mix binaries"
+    for n, row in enumerate(rows, 1):
+        if host_load.contenders(row):
+            return f"repeat {n} was contended by {host_load.describe_contention(row)}"
+    if throttled := thermal.throttled_repeats(rows):
+        n, roles = throttled[0]
+        return f"repeat {n} reached the throttle point of the {' and '.join(roles)}"
     identities = [receipts.row_identity(row) for row in rows]
     for field in receipts.row_identity_fields(rows[0]["framework"]):
         if len({repr(identity[field]) for identity in identities}) > 1:

@@ -189,3 +189,105 @@ pub fn e8m0_scaled_payload(
     )
     .unwrap_or_else(|error| panic!("{format:?} {shape:?}: {error:?}"))
 }
+
+/// Whole blocks of the block format `format` in which every field takes every value it can hold:
+/// each field's distinct storage slots in a block (the element indices whose pieces sit at the same
+/// bits share one) count `0, 1, 2, ...` across the blocks, modulo the field's range and rotated by one
+/// per pass over it, until every value has occurred. A float `Codes` field of at most 8 bits (E2M1)
+/// sweeps its finite patterns the same way; any other float (an f16 `d` or `dmin`, an E8M0 `e`, a dense
+/// value) cycles four finite values of its format (1, -0.5 or 0.5, the smallest positive one and a large
+/// one), so the payload is admitted and no product overflows. Built from the descriptor alone: a new
+/// block format gets the fixture with no code of its own. Deterministic, so a reference generated from it
+/// (the ggml references in `tests/data/ggml_reference/`) can be checked against it.
+pub fn every_field_blocks(format: WeightFormat) -> Vec<u8> {
+    let Storage::Blocks(layout) = format.descriptor().storage else {
+        panic!("{format:?}: not a block format");
+    };
+    let fields: Vec<(Vec<usize>, Vec<u32>, &crate::format::BlockField)> = layout
+        .fields
+        .iter()
+        .map(|field| {
+            let mut slots: Vec<Vec<u32>> = Vec::new();
+            let slot_of = (0..layout.values as u32)
+                .map(|index| {
+                    let bits: Vec<u32> = field
+                        .field
+                        .pieces
+                        .iter()
+                        .map(|piece| piece.layout.bit(index))
+                        .collect();
+                    slots
+                        .iter()
+                        .position(|slot| *slot == bits)
+                        .unwrap_or_else(|| {
+                            slots.push(bits);
+                            slots.len() - 1
+                        })
+                })
+                .collect();
+            (slot_of, field_values(field), field)
+        })
+        .collect();
+    let blocks = fields
+        .iter()
+        .map(|(slot_of, values, _)| {
+            let slots = slot_of.iter().max().map_or(1, |&last| last + 1);
+            values.len().div_ceil(slots)
+        })
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mut bytes = vec![0u8; blocks * layout.bytes];
+    for (block, bytes) in bytes.chunks_mut(layout.bytes).enumerate() {
+        for (slot_of, values, field) in &fields {
+            let slots = slot_of.iter().max().map_or(1, |&last| last + 1);
+            for (index, &slot) in slot_of.iter().enumerate() {
+                // Counter `n` runs over the field's slots block after block; each pass over the range
+                // is rotated by one more, so two slots a whole range apart (the low and high nibble of
+                // one byte) hold different values and a layout that swaps them is seen.
+                let n = block * slots + slot;
+                let value = values[(n + n / values.len()) % values.len()];
+                write_field_bits(bytes, &field.field, index as u32, value);
+            }
+        }
+    }
+    bytes
+}
+
+/// The stored values [`every_field_blocks`] cycles a field through, as raw bits.
+fn field_values(field: &crate::format::BlockField) -> Vec<u32> {
+    let width = field.field.width();
+    match field.field.encoding {
+        FieldEncoding::Float(float) if field.role == OperandRole::Codes && width <= 8 => (0..1u32
+            << width)
+            .filter(|&bits| !float.non_finite().is_some_and(|nf| nf.matches(bits)))
+            .collect(),
+        FieldEncoding::Float(float) => match float {
+            FloatFormat::F16 => vec![0x3c00, 0xb800, 0x0001, 0x5640],
+            FloatFormat::Bf16 => vec![0x3f80, 0xbf00, 0x0001, 0x42c8],
+            FloatFormat::F32 => vec![0x3f80_0000, 0xbf00_0000, 0x0000_0001, 0x42c8_0000],
+            FloatFormat::E8m0 => vec![127, 126, 1, 133],
+            FloatFormat::E4m3Fn | FloatFormat::E2m1 => {
+                unreachable!("no block format stores a {float:?} factor")
+            }
+        },
+        FieldEncoding::Unsigned { .. } | FieldEncoding::Signed | FieldEncoding::HalfStep { .. } => {
+            assert!(width <= 16, "a {width}-bit integer field is not swept");
+            (0..1u32 << width).collect()
+        }
+    }
+}
+
+/// Write the low `field.width()` bits of `value` into `field` as read for in-block element `index`: the
+/// field's pieces take the bits low first (`format::Field`).
+fn write_field_bits(block: &mut [u8], field: &crate::format::Field, index: u32, mut value: u32) {
+    for piece in field.pieces {
+        let start = piece.layout.bit(index) as usize;
+        for bit in 0..piece.width as usize {
+            let (byte, shift) = ((start + bit) / 8, (start + bit) % 8);
+            block[byte] = (block[byte] & !(1 << shift)) | ((((value >> bit) & 1) as u8) << shift);
+        }
+        // A 32-bit piece (a dense F32 value) consumes the whole value.
+        value = value.checked_shr(piece.width).unwrap_or(0);
+    }
+}

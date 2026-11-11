@@ -158,7 +158,7 @@ pub(crate) fn dense_contraction_weight_storage(dtype: DType) -> Option<StorageKi
 }
 
 /// The value an equation reads as a dense weight or embedding table whose planned storage differs from its
-/// dtype's dense default (a packed F16 weight, Card 1007; the F16 table of a row gather, POOT-1477), with the
+/// dtype's dense default (a packed F16 weight, Card 1007), with the
 /// operand position it reads it at and that storage.
 fn packed_weight_read(eqn: &Eqn) -> Option<(ValueId, usize, StorageKind)> {
     let (dtype, position) = match &eqn.op {
@@ -177,9 +177,8 @@ fn packed_weight_read(eqn: &Eqn) -> Option<(ValueId, usize, StorageKind)> {
 /// default (a packed F16 weight, Card 1007), with that storage. A buffer has one storage, so such a weight must be
 /// a non-escaping const that dense contractions and row gathers are the only readers of, at their weight or table
 /// operand, all in that same storage: anything else is [`PlanError::UnrepresentableValue`] with
-/// [`StorageGap::F16PackedLanes`], naming the value. The fold (`fold_dense_contractions`) and
-/// `store_weights_f16` only produce F16 readers that satisfy this, so a refusal here is a graph some other path
-/// built.
+/// [`StorageGap::F16PackedLanes`], naming the value. The fold (`fold_dense_contractions`) only
+/// produces F16 readers that satisfy this, so a refusal here is a graph some other path built.
 fn dense_contraction_weight_storages(
     g: &Graph,
 ) -> Result<HashMap<ValueId, StorageKind>, PlanError> {

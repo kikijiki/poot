@@ -1009,6 +1009,19 @@ mod tests {
         );
     }
 
+    /// POOT-1514: the formats the loader reads are exactly `poot_quant`'s GGUF format list, in ggml type
+    /// order, so a test that iterates the list covers every format a GGUF file can bring in. Mutation: drop
+    /// `Iq4_Nl` from `GGUF_FORMATS`; the lists differ (and the array length no longer compiles until it is
+    /// shortened too).
+    #[test]
+    fn the_formats_the_loader_reads_are_the_gguf_format_list() {
+        let read: Vec<WeightFormat> = (0..=u8::MAX as u32).filter_map(weight_format_of).collect();
+        assert_eq!(
+            read,
+            poot_quant::test_support::formats::GGUF_FORMATS.to_vec()
+        );
+    }
+
     /// `read_gguf`'s block-format fixtures below need blocks of the right byte length; this reads
     /// that length off `format`'s own descriptor rather than a restated literal, per format.rs's
     /// module docs ("the layout of a format is written once, here, and nowhere else").

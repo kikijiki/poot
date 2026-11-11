@@ -195,6 +195,53 @@ fn a_dense_contraction_reads_its_operands_as_declared() {
     }
 }
 
+/// POOT-1535: a weight stays in its checkpoint dtype, so the oracle of a narrowed dense contraction is the one that
+/// rounds it: a BF16 weight under `Narrow(f16)` enters the products as the f16 the kernel's staging rounds it to
+/// (round to nearest even, a tie below the smallest f16 subnormal to the even zero), whatever the operand's declared
+/// dtype. The expected values are the f16-rounded weights as an F32 weight of an exact contraction, so the row holds
+/// the weight to the definition rather than to a second copy of the narrowing code.
+///
+/// Mutation: in `Bf16Equation::WeightMatMul` pass the weight's stored dtype as `DType::F16` to `matmul_narrowed`;
+/// the weight is read unrounded, as if f16-resident, and this row goes red.
+#[test]
+fn a_narrowed_dense_contraction_rounds_its_bf16_weight_to_the_fragment_dtype() {
+    // 1.0, 2^-25 (half the smallest f16 subnormal: a tie that goes to zero), 1.5 * 2^-25 (rounds up to 2^-24), and
+    // -2^-24 (kept).
+    let words: [u16; 4] = [0x3f80, 0x3300, 0x3340, 0xb380];
+    let weight = HostTensor::bf16(vec![4, 1], words.to_vec());
+    let rounded: Vec<f32> = words
+        .iter()
+        .map(|&w| {
+            poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(
+                poot_quant::scalar::bf16_to_f32(w),
+            ))
+        })
+        .collect();
+    assert_eq!(rounded, [1.0, 0.0, 2f32.powi(-24), -(2f32.powi(-24))]);
+    let x = HostTensor::f32(vec![1, 1], vec![1.0]);
+    let narrowed = evaluate(&one_equation(
+        OpKind::dense_contraction(DType::BF16).with_operand_precision(F16),
+        &[x.clone(), weight.clone()],
+    ))
+    .unwrap();
+    let want = evaluate(&one_equation(
+        OpKind::dense_contraction(DType::F32),
+        &[x.clone(), HostTensor::f32(vec![4, 1], rounded)],
+    ))
+    .unwrap();
+    assert_eq!(bits(&narrowed), bits(&want));
+    let exact = evaluate(&one_equation(
+        OpKind::dense_contraction(DType::BF16),
+        &[x, weight],
+    ))
+    .unwrap();
+    assert_ne!(
+        bits(&exact),
+        bits(&want),
+        "the fixture's weights are not f16 values, so rounding them is visible"
+    );
+}
+
 /// The grouped sibling: each group's block of rows contracted at the declared precision.
 #[test]
 fn a_grouped_dense_contraction_reads_its_operands_as_declared() {

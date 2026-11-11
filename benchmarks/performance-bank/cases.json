@@ -62,6 +62,80 @@
       "identity_digest": "8ec089430082d8e634a09c13002e47ae46afae2ba3b82ac5e5e4c38ea9c21aa4"
     },
     {
+      "id": "dense-decode-head-bf16",
+      "regime": "dense bandwidth decode of a vocabulary head (151936 outputs over K 1024) over a checkpoint-order bf16 weight",
+      "level": "kernel",
+      "producer": "dense_contraction",
+      "shape": {
+        "m": 1,
+        "k": 1024,
+        "n": 151936
+      },
+      "storage": "bf16",
+      "layout": "nk",
+      "numerics": {
+        "accumulate": "f32",
+        "activation": "f32",
+        "weight": "each f32 draw truncated to its top 16 bits",
+        "reference": "f64 loop over the stored bf16 weights"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-rotated-beyond-cache",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "a1461c6f098c91d778d88d6094001884739a58f8af1c129f53233c7f8c7f2fb5",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "6f9c88e074c47ba8a55bcb66180a49c8d849dec363867775261398cb2d0fecd1",
+      "identity_digest": "deb7abbab1cece0316eb8610c025229a0b3cb1a778786a814364fcddd7cd90b9"
+    },
+    {
+      "id": "dense-decode-head-bf16-narrow",
+      "regime": "dense bandwidth decode of a vocabulary head (151936 outputs over K 1024) over a checkpoint-order bf16 weight, narrow operands",
+      "level": "kernel",
+      "producer": "dense_contraction",
+      "shape": {
+        "m": 1,
+        "k": 1024,
+        "n": 151936
+      },
+      "storage": "bf16",
+      "layout": "nk",
+      "numerics": {
+        "accumulate": "f32",
+        "activation": "f32",
+        "weight": "each f32 draw truncated to its top 16 bits",
+        "reference": "f64 loop over the stored bf16 weights",
+        "operand_precision": "narrow",
+        "operand_rounding": "activation and weight operands rounded to nearest even to the backend matrix unit dtype (f16 where the unit takes it, else bf16: the planner's dtype policy, POOT-1454), products accumulated in f32; the reference rounds the same operands"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-rotated-beyond-cache",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "6daa87e75fe51f9a284edfc36d03efbd037094da6a32b8dbc2cf714bf83e3272",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "6f9c88e074c47ba8a55bcb66180a49c8d849dec363867775261398cb2d0fecd1",
+      "identity_digest": "ebfeaa4a0b0bbb877488c5e5675cf261049d0761a46b0ee8eb5aa9131b4e8c10"
+    },
+    {
       "id": "batched-decode-gemm",
       "regime": "batched decode",
       "level": "kernel",
@@ -919,6 +993,46 @@
       "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
       "cache_id": "6f9c88e074c47ba8a55bcb66180a49c8d849dec363867775261398cb2d0fecd1",
       "identity_digest": "fbcc9e47f31f99fa7a7c20631f84b79490e213d09e0f0e335471e429607db1c9"
+    },
+    {
+      "id": "expert-prefill-qwen3moe-up",
+      "regime": "MoE prefill routed expert projection at Qwen3-MoE dimensions (512 tokens, each to 8 of 128 experts) over a checkpoint-order bf16 expert stack, exact operands",
+      "level": "kernel",
+      "producer": "grouped_experts",
+      "shape": {
+        "tokens": 512,
+        "top_k": 8,
+        "experts": 128,
+        "k": 2048,
+        "n": 768,
+        "order": "routed"
+      },
+      "storage": "bf16",
+      "layout": "nk",
+      "numerics": {
+        "accumulate": "f32",
+        "activation": "f32, one row per token, broadcast over the token's top_k routed rows as the MoE block traces it",
+        "weight": "each f32 draw truncated to its top 16 bits",
+        "routing": "each routed row's expert drawn uniformly from the fixture stream after the activation, rows in row order",
+        "reference": "f64 loop over each row's own expert"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "dff15494a8d4eeda55de900c2f05d34aaadfd7b927e9084135abf7deecccbb2d",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "fd6ecf14c142a790a85ae3785d1add7940d0e4d3f8e5d364036b4f2a42527253"
     },
     {
       "id": "expert-prefill-qwen3moe-up-narrow",

@@ -86,11 +86,33 @@ when a warm repeat took more than `UNEXPECTED_MAJOR_FAULTS` faults. A cold start
 ROCm took 400 ms for 128 tokens on a quiet Strix Halo, 432 ms with 12 of 32 CPUs busy elsewhere and 545 ms with all
 32, wherever the busy work ran (POOT-1523). Every supported cell therefore runs behind `harness/host_load.py`, for
 every framework and backend: the host must be quiet before it starts (`bench.py quiet`, which a sweep runs before it
-takes the device locks), and the CPU that user processes outside the cell's tree use is metered in 0.5 s windows
+takes the device locks), and the CPU that user processes outside the cell's tree use is metered in 1 s windows
 (kernel threads are the cell's own page-cache work and do not count). A window above 10% of the machine, which
 is under half the 10% noise band at the measured 0.35% per point, discards the attempt and reruns the cell, at most 3
 times; the row's `host_load` records the windows' mean and maximum, the load average and the number of discards with
 their loads. A cell that never runs quiet is an error row. Pinning the process to cores does not help and is not done.
+
+**Contention (POOT-1508).** The same meter records, per repeat, who else used the GPU: `gpu_busy_percent` before and in
+every window, the engine time each foreign process holds (`/proc/<pid>/fdinfo`, `drm-engine-*`), the top consumers by
+process name in the first and last window, and every foreign process that started during the repeat. A window with a
+foreign GPU share over 5% (half the 10% noise band at a slope of at most 1) or a foreign CPU share over 10% makes the
+repeat `contended`; the names and the shares they held are in `host_load.contention`. A CPU-contended attempt is
+discarded and rerun as above; a GPU-contended one is kept and marked, and `compare` reports the cell unverified naming the
+repeat and the contender (it is not dropped or reweighted). The Performance page excludes such a cell likewise.
+
+**Private runner.** `bench run` copies every repository-built runner once, before the first cell, and measures the copy:
+other lanes rebuild the shared binary and kache can restore a stale build, which labelled rows `-dirty` with a second
+checksum. Each row carries `binary_sha256` (the copy that ran) and `staged_sha256` (the digest recorded at staging);
+publication refuses a row whose two differ and one whose `build_sha` ends in `-dirty`.
+
+**Thermal start gate (POOT-1523).** Before every attempt of every cell (`harness/thermal.py`) the GPU and CPU must be at
+or below their start limits, `throttle point - 22 C`: the throttle point is the driver's `temp1_crit` where hwmon reports
+one and otherwise the temperature at which the Strix Halo shader clock was seen to fall (87 C GPU, 89 C CPU), giving 65 C and
+67 C. The wait holds no lock; the harness takes the GPU and heavy locks (`--hold-locks`) only after it, re-checks the
+temperatures under them, and an attempt that does not cool within `--thermal-timeout-s` is an error row with the
+reason `thermal-never-cooled`. The row's `thermal` records the limits, the temperatures at the start, end and peak, the
+shader clock range and `throttled`; `compare` reports a throttled cell unverified. A host with no sensors records
+`available: false` and is not gated.
 
 **Short passes.** A first-token pass under 2 s needs timed evidence for every framework (`harness/short_pass.py`): iterations spanning 20 s, or at least three flat to 10% of their median. The harness discards and reruns an attempt that has neither, and `bench short-passes` lists the committed points that predate the rule. llama.cpp's runner repeats a short pass for the window after discarding the suite's warm-up passes (its ROCm build stalls for seconds after loading while the kernel compacts memory; see `runners/llamacpp/run.py`).
 
@@ -368,8 +390,8 @@ dev box (Strix Halo: ROCm/HSA and Vulkan), where VRAM is shared host memory, so 
 differently from a discrete GPU. On such a box:
 
 ```bash
-flock /tmp/poot-gpu.lock just bench-record wgpu     # 5 repeats of qwen2.5-0.5b decode-128 through the release runner
-flock /tmp/poot-gpu.lock just bench-record rocm
+just bench-record wgpu     # 5 repeats of qwen2.5-0.5b decode-128 through the release runner
+just bench-record rocm     # the harness takes the device locks itself, after its waits (--hold-locks)
 python3 benchmarks/harness/bench.py index          # regenerate results/INDEX.md, then move the run directories to the archive
 POOT_BENCH_BACKEND=rocm uv run bench run --framework poot --model qwen2.5-0.5b --diagnostic   # where the time goes
 ```

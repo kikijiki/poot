@@ -12,6 +12,8 @@ mod epilogue;
 mod fit;
 mod gemv;
 mod indexed;
+#[cfg(test)]
+mod invariant;
 mod probe;
 mod tiled;
 

@@ -10,15 +10,18 @@
 //! otherwise, so a program never reverts silently to the exact schedule.
 //!
 //! No operand is range-scaled: a value past f16's range rounds to infinity and reaches the logits as a non-finite
-//! value, which serving refuses with a typed error (POOT-1471).
+//! value, which serving refuses with a typed error (POOT-1471). The one exception is a BF16 weight a contraction
+//! narrows to f16: the pass declares it finite in f16 ([`ValueBound::FiniteIn`]) and the binder refuses a weight
+//! that is not, before any upload (POOT-1458).
+//!
+//! A weight keeps its checkpoint dtype in every program (POOT-1535): a narrowed contraction rounds the staged weight
+//! in its fragment staging, a priced term of the same argmin that chose the schedule.
 
-use poot_graph_ir::graph::{EditError, Eqn, Graph, Operand};
+use poot_graph_ir::graph::{EditError, Eqn, Graph, Operand, Storage, ValueId};
 use poot_graph_ir::op::{ContractionHead, OpKind};
-use poot_graph_ir::{FragmentDtype, KeyLayout, MatmulPrecision, OperandPrecision};
+use poot_graph_ir::{FragmentDtype, KeyLayout, MatmulPrecision, OperandPrecision, ValueBound};
 use poot_target::{DeviceCaps, FragmentShape, MatrixUnits};
 
-#[cfg(any(test, feature = "test-support"))]
-use super::weight_format::{store_weights_f16, weights_are_f16};
 #[cfg(any(test, feature = "test-support"))]
 use crate::Target;
 #[cfg(any(test, feature = "test-support"))]
@@ -56,7 +59,7 @@ impl FragmentUnits {
 }
 
 /// `g` with every contraction and attention equation reading its operands as `policy` says on `target`: the
-/// graph `compile` hands the planner with the weight format and precision selected, before the passes that fuse it. It is the
+/// graph `compile` hands the planner with the precision selected, before the passes that fuse it. It is the
 /// graph a CPU oracle evaluates to hold a device that compiled `g` under `policy` to the declared semantics (a
 /// program narrowed by the planner is compared with the oracle of the narrowed ops, not of the exact ones). A
 /// target with no matrix unit, or the policy `Exact`, returns `g` unchanged.
@@ -69,14 +72,9 @@ pub fn with_operand_precision(
     match target {
         Target::Gpu { caps, .. } => {
             let units = FragmentUnits::of(caps);
-            // The planner's answer and the weight format are properties of the folded graph (`compile` selects the
-            // precision after the folds expose the dense readers), so the oracle's graph folds them the same way first.
-            let folded = exposed_readers(g)?;
-            let graph = if weights_are_f16(policy, units) {
-                store_weights_f16(&folded)?
-            } else {
-                folded
-            };
+            // The planner's answer is a property of the folded graph (`compile` selects the precision after the
+            // folds expose the dense readers), so the oracle's graph folds them the same way first.
+            let graph = exposed_readers(g)?;
             let limits = CompileLimits::STANDARD.body();
             let views = compute_views(&graph, target.id());
             select_operand_precision(&graph, policy, units, |graph, eqn| {
@@ -134,6 +132,7 @@ pub(crate) fn select_operand_precision(
     }
     let mut edit = g.edit();
     let mut eqns: Vec<Eqn> = Vec::with_capacity(g.eqns().len());
+    let mut finite_in_f16: Vec<ValueId> = Vec::new();
     for eqn in g.eqns() {
         let mut eqn = eqn.clone();
         if eqn.op.operand_precision() == Some(OperandPrecision::Exact)
@@ -148,12 +147,41 @@ pub(crate) fn select_operand_precision(
             };
             if on_matrix_unit(g, &probe) {
                 eqn.op = narrowed;
+                finite_in_f16.extend(weight_to_bound(g, &eqn, dtype));
             }
         }
         eqns.push(eqn);
     }
     *edit.eqns_mut() = eqns;
+    for weight in finite_in_f16 {
+        edit.declare_bound(weight, ValueBound::FiniteIn(FragmentDtype::F16))?;
+    }
     edit.commit()
+}
+
+/// The weight const of the dense contraction `eqn` when narrowing it to `fragment` can round the weight past the
+/// fragment's range: a BF16 weight (f32's exponent range) read in f16 (65504). The caller declares that weight
+/// finite in f16, which the binder checks. A weight stored in the fragment's own dtype, or one whose range the
+/// fragment holds, needs no bound.
+fn weight_to_bound(g: &Graph, eqn: &Eqn, fragment: FragmentDtype) -> Option<ValueId> {
+    if fragment != FragmentDtype::F16 {
+        return None;
+    }
+    let head = match &eqn.op {
+        OpKind::ContractionEpilogue { head, .. } => *head,
+        op => head_of(op)?,
+    };
+    let ContractionHead::Dense {
+        weight: DType::BF16,
+        ..
+    } = head
+    else {
+        return None;
+    };
+    match eqn.inputs.get(1)? {
+        Operand::Value(weight) if g.meta(*weight).storage == Storage::Const => Some(*weight),
+        _ => None,
+    }
 }
 
 /// The fragment dtype `eqn`'s products run in on `units`, or `None` when no unit admits the equation.

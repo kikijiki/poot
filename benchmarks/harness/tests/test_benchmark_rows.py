@@ -57,7 +57,8 @@ def runner_script(single, curve, args_log):
     )
 
 
-def bench_run(directory, single, curve, manifest=MANIFEST, *, diagnostic=False, skip_repeats=None, repeats=1):
+def bench_run(directory, single, curve, manifest=MANIFEST, *, diagnostic=False, skip_repeats=None, repeats=1,
+              thermal_source=None):
     """`bench run` over a fixture manifest with a stub runner; the rows it stored in results.jsonl."""
     directory = Path(directory)
     stub = directory / "stub-runner"
@@ -85,11 +86,15 @@ def bench_run(directory, single, curve, manifest=MANIFEST, *, diagnostic=False, 
         diagnostic=diagnostic,
         skip_repeats=skip_repeats,
         quiet_wait_s=0.0,
+        thermal_timeout_s=0.0,
+        hold_locks=False,
     )
     with (
         mock.patch.object(bench, "capture_env", side_effect=lambda manifest: HOST_WITH_GPU),
         mock.patch.object(observer, "run_observed", side_effect=run_fixture_runner),
         mock.patch.object(bench.host_load, "wait_quiet", return_value=(True, 0.0, {"quiet": True})),
+        # the host running the tests is no benchmark host: no thermal source, unless the test plants one
+        mock.patch.object(bench.thermal, "SysfsThermal", return_value=thermal_source or mock.Mock(sensors={})),
         mock.patch.object(bench.short_pass, "uncovered_in_row", return_value=[]),  # the fixtures' passes are 4 ms long
         mock.patch.dict(os.environ, {"POOT_BENCH_BACKEND": "ptx"}),
         contextlib.redirect_stdout(io.StringIO()),
@@ -133,6 +138,16 @@ class StoredRowTests(unittest.TestCase):
         self.assertEqual(calls, ["single", "curve"])
         self.assertEqual([row["status"] for row in rows], ["error", "ok"])
         self.assertIn("boom", rows[0]["reason"])
+
+    def test_a_cell_that_never_cools_is_a_typed_error_row_that_names_its_cell(self):
+        from test_contention_thermal import HOT, FakeSensors
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = bench_run(tmp, valid_single(), valid_curve(), thermal_source=FakeSensors(HOT))
+
+        self.assertEqual([(row["model"], row["scenario"], row["status"]) for row in rows],
+                         [("fixture", "single", "error"), ("fixture", "curve", "error")])
+        self.assertEqual({row["failure"] for row in rows}, {"thermal-never-cooled"})
 
     def test_skipped_repeats_are_not_run_and_the_others_keep_their_names(self):
         with tempfile.TemporaryDirectory() as tmp:

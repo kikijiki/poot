@@ -16,9 +16,7 @@
 //! Card 1011: a BF16 const is never widened. Its declared dtype is its stored dtype on every backend, and the lane
 //! its bytes upload to (packed `u32` words or native two-byte BF16) is decided by [`bf16_const_lane`] and read by
 //! the storage plan and the planners alike. A reader with no body for that lane refuses at planning; nothing widens
-//! the weight on upload. The one declared difference is `store_weights_f16` (POOT-1477): under the narrow policy a
-//! weight only dense readers use is declared F16 over the checkpoint's BF16, in the graph, before this lane rule
-//! sees it.
+//! the weight on upload.
 
 use crate::Target;
 use poot_graph_ir::graph::{Storage, ValueMeta};

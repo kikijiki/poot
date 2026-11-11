@@ -161,8 +161,6 @@ pub(super) fn plan(
         // (the only portable BF16 read on wgpu, where SPIR-V rejects `Ty::BF16`; the ROCm and PTX typed walks
         // upload the same lanes), widened in-register, so the device buffer stays at two bytes per element.
         // Its storage is the BF16 const rule ([`value_storage_kind`]), so a BF16 weight may have other readers.
-        // POOT-1477: under the narrow policy the driver declares a weight only dense readers use F16
-        // (`store_weights_f16`), so it takes the F16 arm above: the bind rounds it to f16 once.
         OpKind::DenseContraction {
             weight: dtype @ (DType::F32 | DType::F16 | DType::BF16),
             ..
@@ -263,7 +261,7 @@ pub(super) fn plan(
         }
         // The grouped contraction (`fold_dense_contractions`' `[0, 2, 1]` spelling): `groups` independent
         // `[M, K] x [N, K]^T` products over row blocks of one `[groups * N, K]` weight, in packed storage (BF16, or
-        // the F16 `store_weights_f16` declares). That is the register-tiled GEMM's block-diagonal form: group `g`'s
+        // F16). That is the register-tiled GEMM's block-diagonal form: group `g`'s
         // rows read weight rows `g * N ..`, so it takes the same body as the plain dense contraction.
         OpKind::GroupedDenseContraction {
             weight: dtype @ (DType::BF16 | DType::F16),
@@ -323,15 +321,6 @@ pub(super) fn plan(
             source: DType::BF16,
         } => Planned::imported(
             ImportedKernel::PackedBf16RowGather,
-            backend,
-            None,
-            [out_numel as u32, 1, 1],
-        )?,
-        // POOT-1477: the same gather over the packed-f16 table `store_weights_f16` declares for an embedding the
-        // driver stores as f16 (two binary16 elements per lane, the layout of a dense F16 weight). Its row
-        // values are the converted weight's, so the embedding and a tied head read one buffer.
-        OpKind::DenseRowGather { source: DType::F16 } => Planned::imported(
-            ImportedKernel::PackedF16RowGather,
             backend,
             None,
             [out_numel as u32, 1, 1],

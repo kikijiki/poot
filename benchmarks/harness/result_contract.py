@@ -445,6 +445,10 @@ def committed_row_errors(row):
     errors += _identity_field_errors(row, ("backend",))
     if str(row.get("build_sha", "")).endswith("-dirty"):
         errors.append("build_sha ends in '-dirty': a committed result comes from a clean commit")
+    staged = row.get("staged_sha256")
+    if staged is not None and staged != row.get("binary_sha256"):
+        errors.append(f"binary_sha256 {row.get('binary_sha256')!r} differs from the {staged!r} the runner was staged with: "
+                      "the measured binary is not the recorded build")
     if row.get("build_profile", RELEASE_PROFILE) != RELEASE_PROFILE:
         errors.append(f"build_profile is {row['build_profile']!r}: only a release build is a result")
     if row.get("profiled"):

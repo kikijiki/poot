@@ -9,7 +9,7 @@ use poot_tensor::HostTensor;
 
 use crate::error::GraphValidationError;
 use crate::op::OpKind;
-use crate::range::IndexRange;
+use crate::range::{IndexRange, ValueBound};
 use crate::rope_table::{self, RopeSpec, RopeTable};
 use crate::types::{DType, Operands, Scalar, TensorType};
 use crate::weight_ref::WeightRef;
@@ -884,21 +884,18 @@ pub struct ValueMeta {
     /// [`Graph::validate`] checks both directions (a `State` value with no role, and any other value
     /// with one).
     pub(crate) state_role: Option<StateRole>,
-    /// The range a [`Storage::Slot`] or [`Storage::Const`] input declares for its I32 words, set once
-    /// at construction ([`crate::builder::Builder::slot_ranged`],
-    /// [`crate::builder::Builder::constant_ranged`]) and checked by the binder against the bound
-    /// words, so [`crate::value_ranges`] may treat it as a fact. `None` for every other value.
-    pub(crate) range: Option<IndexRange>,
-    /// The dtype the checkpoint holds a [`Storage::Const`] weight in when the graph declares another
-    /// ([`GraphEdit::convert_weight`]): the bind converts from it to `aval.dtype`, and the oracle's weights are
-    /// converted the same way. `None` when the declared dtype is the stored one.
-    stored: Option<DType>,
+    /// The bound a [`Storage::Slot`] or [`Storage::Const`] input declares for its words: an I32 range, set at
+    /// construction ([`crate::builder::Builder::slot_ranged`], [`crate::builder::Builder::constant_ranged`]), or the
+    /// finiteness of a weight in a fragment dtype, declared by the pass that narrows its reader
+    /// ([`GraphEdit::declare_bound`]). The binder checks it against the bound words, so [`crate::value_ranges`] and the
+    /// readers may treat it as a fact. `None` for every other value.
+    pub(crate) bound: Option<ValueBound>,
 }
 
 impl ValueMeta {
     /// This value declaring `range` for its I32 words.
     pub(crate) fn with_range(mut self, range: Option<IndexRange>) -> Self {
-        self.range = range;
+        self.bound = range.map(ValueBound::Index);
         self
     }
 
@@ -915,8 +912,7 @@ impl ValueMeta {
             storage,
             identity,
             state_role: None,
-            range: None,
-            stored: None,
+            bound: None,
         }
     }
 
@@ -1054,16 +1050,18 @@ impl ValueMeta {
         }
     }
 
-    /// The dtype the checkpoint holds this weight in: the declared dtype unless a pass converted the weight
-    /// ([`GraphEdit::convert_weight`]).
-    pub fn stored_dtype(&self) -> DType {
-        self.stored.unwrap_or(self.aval.dtype)
+    /// The bound this input declares for its words, if any. The binders check it at bind.
+    pub fn bound(&self) -> Option<ValueBound> {
+        self.bound
     }
 
     /// The range this input declares for its I32 words, if any. The binders check it at bind;
     /// [`crate::value_ranges`] reads it as proven.
     pub fn range(&self) -> Option<IndexRange> {
-        self.range
+        match self.bound {
+            Some(ValueBound::Index(range)) => Some(range),
+            _ => None,
+        }
     }
 
     /// The structured [`SlotKey`] of a [`Storage::Slot`] input built through [`crate::builder::Builder`]
@@ -1289,13 +1287,14 @@ pub enum EditError {
         /// What it lacks.
         reason: &'static str,
     },
-    /// [`GraphEdit::convert_weight`] was asked to convert a value that is not an unconverted BF16 `Const`.
-    #[error("value {value} cannot be converted to a weight of another dtype: {reason}")]
-    NotConvertible {
-        /// The value that was asked to convert.
+    /// [`GraphEdit::declare_bound`] was asked to bound a value that is not a `Const`, or one that declares a different
+    /// bound already (`declared`): a const is an index table or a weight, never both.
+    #[error("value {value} cannot declare another bound (declared: {declared:?})")]
+    BoundConflict {
+        /// The value that was asked to declare a bound.
         value: ValueId,
-        /// What it lacks.
-        reason: &'static str,
+        /// The bound it declares already; `None` when it is no `Const`.
+        declared: Option<ValueBound>,
     },
     /// [`GraphEdit::declare_slot`] was asked for a second input of one kind and tag, which a per-name binder
     /// could not tell apart.
@@ -1858,30 +1857,34 @@ impl GraphEdit {
         Ok(key)
     }
 
-    /// Declare the BF16 weight `value` as F16: the graph computes over the f16 values the bind converts the
-    /// checkpoint's bf16 words to (round to nearest even, a value past f16's range refused), and the value keeps
-    /// the checkpoint dtype as [`ValueMeta::stored_dtype`]. The one weight conversion a graph can declare; the
-    /// readers' own dtype attributes are the caller's to move with it.
+    /// Declare `bound` on the `Const` `value`: a fact about its words the binder checks at bind before it looks up
+    /// the resident copy, so a weight another program uploaded is checked against this graph's reader. Declaring
+    /// the bound it already has is a no-op.
     ///
     /// # Errors
     ///
-    /// [`EditError::NotConvertible`] when `value` is not a BF16 `Const` weight the checkpoint holds as declared.
-    pub fn convert_weight(&mut self, value: ValueId) -> Result<(), EditError> {
-        let not_convertible = |reason| EditError::NotConvertible { value, reason };
+    /// [`EditError::BoundConflict`] when `value` is not a `Const` or already declares a different bound: a const is
+    /// an index table or a weight, never both.
+    pub fn declare_bound(&mut self, value: ValueId, bound: ValueBound) -> Result<(), EditError> {
         let meta = self
             .draft
             .values
             .get_mut(value)
-            .ok_or_else(|| not_convertible("it is not a value of the graph"))?;
-        if meta.storage != Storage::Const || meta.stored.is_some() {
-            return Err(not_convertible("it is not an unconverted const"));
+            .filter(|meta| meta.storage == Storage::Const)
+            .ok_or(EditError::BoundConflict {
+                value,
+                declared: None,
+            })?;
+        match meta.bound {
+            Some(declared) if declared != bound => Err(EditError::BoundConflict {
+                value,
+                declared: Some(declared),
+            }),
+            _ => {
+                meta.bound = Some(bound);
+                Ok(())
+            }
         }
-        if meta.aval.dtype != DType::BF16 {
-            return Err(not_convertible("it is not BF16"));
-        }
-        meta.stored = Some(DType::BF16);
-        meta.aval.dtype = DType::F16;
-        Ok(())
     }
 
     /// Declare a new keyed `slot` input of type `aval`, tagged `tag` like
@@ -2270,20 +2273,6 @@ impl Graph {
                 return Err(GraphValidationError::UnexpectedWeightRef {
                     value: id,
                     storage: meta.storage,
-                });
-            }
-        }
-
-        // A weight is stored in another dtype than it is declared only by the one conversion the bind performs.
-        for (id, meta) in self.values.iter_enumerated() {
-            if let Some(stored) = meta.stored
-                && (meta.storage != Storage::Const
-                    || (stored, meta.aval.dtype) != (DType::BF16, DType::F16))
-            {
-                return Err(GraphValidationError::UnsupportedWeightConversion {
-                    value: id,
-                    stored,
-                    declared: meta.aval.dtype,
                 });
             }
         }
@@ -3467,78 +3456,41 @@ mod tests {
         );
     }
 
-    /// POOT-1477: `convert_weight` declares a BF16 weight F16 over the checkpoint's dtype: the type changes, the
-    /// value keeps its id, and `stored_dtype` names the dtype the bind reads. It refuses what is not an unconverted
-    /// BF16 const: a second conversion, an F32 weight and a computed value.
+    /// POOT-1535: `declare_bound` puts one bound on a const: declaring it again is a no-op, a different bound or a
+    /// value that is no const is refused, because a const is an index table or a weight, never both.
     ///
-    /// Mutation: drop the `meta.stored.is_some()` clause of the first guard; the second conversion succeeds.
+    /// Mutation: drop the `declared != bound` arm (always overwrite); the conflicting declaration succeeds.
     #[test]
-    fn convert_weight_declares_a_bf16_const_f16_over_the_checkpoint_dtype() {
+    fn declare_bound_gives_a_const_one_bound_and_refuses_a_second_different_one() {
         let b = Builder::for_tests();
         let w = b
             .constant("w", TensorType::new(vec![2, 2], DType::BF16))
             .unwrap();
-        let f = b.constant("f", TensorType::f32(vec![2, 2])).unwrap();
         let out = b.cast(w, DType::F32).unwrap();
-        let out = b.binary(crate::op::BinOp::Add, out, f).unwrap();
         let graph = b.finish(out).unwrap();
+        let finite = crate::ValueBound::FiniteIn(crate::FragmentDtype::F16);
         let mut edit = graph.edit();
-        edit.convert_weight(w.id()).unwrap();
+        assert_eq!(graph.meta(w.id()).bound(), None);
+        edit.declare_bound(w.id(), finite).unwrap();
+        edit.declare_bound(w.id(), finite).unwrap();
+        let other = crate::ValueBound::Index(crate::IndexRange::below(4).unwrap());
         assert_eq!(
-            edit.convert_weight(w.id()),
-            Err(EditError::NotConvertible {
+            edit.declare_bound(w.id(), other),
+            Err(EditError::BoundConflict {
                 value: w.id(),
-                reason: "it is not an unconverted const"
+                declared: Some(finite)
             })
         );
         assert_eq!(
-            edit.convert_weight(f.id()),
-            Err(EditError::NotConvertible {
-                value: f.id(),
-                reason: "it is not BF16"
-            })
-        );
-        assert_eq!(
-            edit.convert_weight(out.id()),
-            Err(EditError::NotConvertible {
+            edit.declare_bound(out.id(), finite),
+            Err(EditError::BoundConflict {
                 value: out.id(),
-                reason: "it is not an unconverted const"
+                declared: None
             })
         );
-        let converted = edit.commit().expect("the cast reads the F16 const");
-        assert_eq!(
-            (
-                converted.aval(w.id()).dtype,
-                converted.meta(w.id()).stored_dtype()
-            ),
-            (DType::F16, DType::BF16)
-        );
-        assert_eq!(converted.meta(f.id()).stored_dtype(), DType::F32);
-    }
-
-    /// POOT-1477: a graph whose weight is stored in a dtype the bind does not convert to the declared one is
-    /// refused, whoever built it. Only a BF16 const read as F16 is.
-    ///
-    /// Mutation: accept any pair in the `UnsupportedWeightConversion` check (delete the pair comparison); this goes red.
-    #[test]
-    fn validate_rejects_a_stored_dtype_that_is_not_the_bf16_to_f16_conversion() {
-        let b = Builder::for_tests();
-        let w = b
-            .constant("w", TensorType::new(vec![2, 2], DType::F16))
-            .unwrap();
-        let out = b.cast(w, DType::F32).unwrap();
-        let mut graph = b.finish(out).unwrap().into_draft();
-        graph.values_mut()[w.id()].stored = Some(DType::F32);
-        assert_eq!(
-            crate::test_support::verdict(&graph),
-            Err(GraphValidationError::UnsupportedWeightConversion {
-                value: w.id(),
-                stored: DType::F32,
-                declared: DType::F16,
-            })
-        );
-        graph.values_mut()[w.id()].stored = Some(DType::BF16);
-        assert_eq!(crate::test_support::verdict(&graph), Ok(()));
+        let bounded = edit.commit().unwrap();
+        assert_eq!(bounded.meta(w.id()).bound(), Some(finite));
+        assert_eq!(bounded.meta(w.id()).range(), None);
     }
 
     #[test]

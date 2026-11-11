@@ -21,7 +21,8 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use poot_graph_ir::{
-    IndexRange, PackedSourceName, SlotKey, TensorType, ValueId, WeightRef, packed_stack_source_type,
+    FragmentDtype, IndexRange, PackedSourceName, SlotKey, TensorType, ValueBound, ValueId,
+    WeightRef, packed_stack_source_type,
 };
 use poot_quant::weights::{StoreGeneration, WeightEntry, WeightKey, WeightStore};
 use poot_quant::{PackedWeightError, PayloadReadError, ReadError, SourceRole};
@@ -206,8 +207,6 @@ enum WriteFault {
     /// Card 1007: a packed-F16 weight holds an infinity or NaN, which the generated bodies' in-register
     /// binary16 decode does not represent.
     NonFiniteF16 { index: usize, bits: u16 },
-    /// POOT-1458: a BF16 weight the plan rounds to f16 holds a value past f16's range.
-    PastF16Range { index: usize, bits: u16 },
 }
 
 impl From<PayloadReadError> for WriteFault {
@@ -308,9 +307,6 @@ impl WeightWriter {
             Some(WriteFault::NonFiniteF16 { index, bits }) => {
                 Err(LoadError::NonFiniteF16Weight { name, index, bits })
             }
-            Some(WriteFault::PastF16Range { index, bits }) => {
-                Err(LoadError::WeightPastF16Range { name, index, bits })
-            }
         }
     }
 
@@ -349,14 +345,6 @@ impl WeightWriter {
                     && let Some((index, bits)) = first_non_finite_f16(into)
                 {
                     return Err(WriteFault::NonFiniteF16 {
-                        index: lo / 2 + index,
-                        bits,
-                    });
-                }
-                if self.encoding == Encoding::Bf16AsF16Words
-                    && let Some((index, bits)) = first_past_f16_range(into)
-                {
-                    return Err(WriteFault::PastF16Range {
                         index: lo / 2 + index,
                         bits,
                     });
@@ -882,11 +870,80 @@ impl WeightBinder {
             .collect()
     }
 
+    /// The const `name` (stored as `bytes`) satisfies `bound`, the fact its graph declares about its words: the
+    /// check that makes the declaration one the graph's consumers may rely on, as [`check_and_encode`] is for a
+    /// slot. Run before the residency lookup, so a copy another program uploaded is checked against this graph's
+    /// declaration too.
+    pub(crate) fn check_bound(
+        &self,
+        name: &str,
+        bytes: &ConstBytes,
+        bound: ValueBound,
+    ) -> Result<(), LoadError> {
+        match bound {
+            ValueBound::Index(range) => self.check_range(name, bytes, range),
+            ValueBound::FiniteIn(FragmentDtype::F16) => self.check_finite_in_f16(name, bytes),
+            ValueBound::FiniteIn(FragmentDtype::Bf16) => Err(LoadError::Unimplemented(
+                "a bf16 finiteness bound on a weight",
+            )),
+        }
+    }
+
+    /// Every element of the BF16 const `name` is finite once rounded to f16 ([`ValueBound::FiniteIn`]): the first
+    /// one that is not is refused by its row-major index (POOT-1458, the ADR-0116 constant rule: a weight's range is
+    /// fixed, so it is refused at bind and never scaled at run time).
+    fn check_finite_in_f16(&self, name: &str, bytes: &ConstBytes) -> Result<(), LoadError> {
+        let StoredAs::Dense(dtype) = bytes.stored else {
+            return Err(LoadError::Unimplemented(
+                "a finiteness bound on a packed weight source",
+            ));
+        };
+        if dtype != DType::BF16 {
+            return Err(LoadError::WeightDtype {
+                name: name.to_string(),
+                stored: dtype,
+                declared: DType::BF16,
+            });
+        }
+        let mut base = 0;
+        for span in &bytes.spans {
+            let mut stored = vec![0u8; span.bytes.len()];
+            self.read_dense_span(name, span, &mut stored)?;
+            if let Some((index, bits)) = first_past_f16_range(&stored) {
+                return Err(LoadError::WeightPastF16Range {
+                    name: name.to_string(),
+                    index: base + index,
+                    bits,
+                });
+            }
+            base += stored.len() / 2;
+        }
+        Ok(())
+    }
+
+    /// The stored bytes of dense `span` of the const `name`, read into `out`.
+    fn read_dense_span(
+        &self,
+        name: &str,
+        span: &StoredSpan,
+        out: &mut [u8],
+    ) -> Result<(), LoadError> {
+        match self.store.get(span.key.as_str()) {
+            Some(WeightEntry::Dense(dense)) => dense
+                .bytes()
+                .read_at(span.bytes.clone(), out)
+                .map_err(|source| LoadError::WeightRead {
+                    name: name.to_string(),
+                    source,
+                }),
+            _ => unreachable!("a dense const is built from a dense entry"),
+        }
+    }
+
     /// Every word of the I32 const `name` (stored as `bytes`) lies in `range`, the range its graph
-    /// declares ([`poot_graph_ir::Builder::constant_ranged`]): the check that makes the declaration a
-    /// fact the graph's consumers may rely on, as [`check_and_encode`] is for a slot. The first word
-    /// outside is refused by its row-major index, with the range.
-    pub(crate) fn check_range(
+    /// declares ([`poot_graph_ir::Builder::constant_ranged`]). The first word outside is refused by its
+    /// row-major index, with the range.
+    fn check_range(
         &self,
         name: &str,
         bytes: &ConstBytes,
@@ -907,16 +964,7 @@ impl WeightBinder {
         let mut base = 0;
         for span in &bytes.spans {
             let mut stored = vec![0u8; span.bytes.len()];
-            match self.store.get(span.key.as_str()) {
-                Some(WeightEntry::Dense(dense)) => dense
-                    .bytes()
-                    .read_at(span.bytes.clone(), &mut stored)
-                    .map_err(|source| LoadError::WeightRead {
-                        name: name.to_string(),
-                        source,
-                    })?,
-                _ => unreachable!("a dense const is built from a dense entry"),
-            }
+            self.read_dense_span(name, span, &mut stored)?;
             // A narrowed span is an I64 table whose words the map range-checked into I32
             // ([`narrow_word`]).
             let words: Box<dyn Iterator<Item = i32> + '_> = if span.narrowed {
@@ -1204,33 +1252,27 @@ impl WeightBinder {
                 _ => unreachable!("load_weights checked every mapped key against this store"),
             }
         }
-        let encoded =
-            match table.kind {
-                RowKind::Dense { dtype, width } => crate::lanes::encode_stored(
-                    dtype,
-                    &[width],
-                    &stored,
-                    storage,
-                )
-                .map_err(|error| match error {
-                    EncodeError::NoEncoding => LoadError::WeightFormat {
-                        name: table.name.clone(),
-                        stored: format!("{dtype:?}"),
-                        planned: storage,
-                    },
-                    EncodeError::NonFiniteF16 { index, bits } => LoadError::NonFiniteF16Weight {
-                        name: table.name.clone(),
-                        index,
-                        bits,
-                    },
-                    EncodeError::PastF16Range { index, bits } => LoadError::WeightPastF16Range {
-                        name: table.name.clone(),
-                        index,
-                        bits,
-                    },
-                })?,
-                RowKind::Packed { .. } => crate::lanes::encode_words(&stored),
-            };
+        let encoded = match table.kind {
+            RowKind::Dense { dtype, width } => {
+                crate::lanes::encode_stored(dtype, &[width], &stored, storage).map_err(|error| {
+                    match error {
+                        EncodeError::NoEncoding => LoadError::WeightFormat {
+                            name: table.name.clone(),
+                            stored: format!("{dtype:?}"),
+                            planned: storage,
+                        },
+                        EncodeError::NonFiniteF16 { index, bits } => {
+                            LoadError::NonFiniteF16Weight {
+                                name: table.name.clone(),
+                                index,
+                                bits,
+                            }
+                        }
+                    }
+                })?
+            }
+            RowKind::Packed { .. } => crate::lanes::encode_words(&stored),
+        };
         // The same check after the reads: a file modified while its rows were read is refused, not encoded.
         self.check_table_sources(table)?;
         Ok(encoded)

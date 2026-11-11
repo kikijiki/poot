@@ -28,6 +28,7 @@ The report/compare paths are pure stdlib, so they run without a GPU or framework
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -37,6 +38,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +52,7 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 try:
+    from . import device_locks
     from . import host_load
     from . import short_pass
     from . import known_unverified
@@ -57,6 +60,7 @@ try:
     from . import page_cache
     from . import performance_receipt as receipts
     from . import results_root as results_lookup
+    from . import thermal
     from .result_contract import (
         BUILD_IDENTITY_FIELDS,
         CURVE_KIND,
@@ -67,6 +71,7 @@ try:
         validate_runner_result,
     )
 except ImportError:  # direct `python harness/bench.py` execution
+    import device_locks
     import host_load
     import short_pass
     import known_unverified
@@ -74,6 +79,7 @@ except ImportError:  # direct `python harness/bench.py` execution
     import page_cache
     import performance_receipt as receipts
     import results_root as results_lookup
+    import thermal
     from result_contract import (
         BUILD_IDENTITY_FIELDS,
         CURVE_KIND,
@@ -196,6 +202,32 @@ def binary_sha256(binary):
         for chunk in iter(lambda: f.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def stage_runners(runners, stage_dir):
+    """The runners with every repository-built one replaced by a private copy (POOT-1508).
+
+    Other lanes rebuild the shared `poot-bench-runner` in the shared cargo target and kache can restore a stale build,
+    so rows of one sweep were labelled with different checksums and `-dirty` shas. A sweep measures a copy made once,
+    before its first cell, in `stage_dir`; each row records the copy's digest as `staged_sha256` beside the
+    `binary_sha256` it measured, and publication refuses a row whose two differ. External tools run through
+    interpreters and are not copied. A runner whose binary cannot be found is left as it is: the cell reports that.
+    """
+    staged = {}
+    for fw, cfg in runners.items():
+        source = shutil.which(resolve_binary(cfg)) if fw in receipts.BUILD_IDENTITY_FRAMEWORKS else None
+        if source is None:
+            staged[fw] = cfg
+            continue
+        dest = Path(stage_dir) / fw / Path(source).name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, dest)
+        digest, original = binary_sha256(str(dest)), binary_sha256(source)
+        if digest != original:
+            raise RuntimeError(f"the private copy of the {fw} runner differs from {source} ({digest} against {original}): "
+                               "the shared binary changed while it was copied")
+        staged[fw] = {**{k: v for k, v in cfg.items() if k != "bin_env"}, "bin": str(dest), "staged_sha256": digest}
+    return staged
 
 
 def resolve_cmd(runner, subst):
@@ -322,6 +354,8 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
     # about the tool: its row carries the version the tool reports instead (`framework_version`).
     if fw in receipts.BUILD_IDENTITY_FRAMEWORKS:
         base["binary_sha256"] = binary_sha256(resolve_binary(runners[fw]))
+        if "staged_sha256" in runners[fw]:
+            base["staged_sha256"] = runners[fw]["staged_sha256"]
     base["device"] = device
     requested_backend = subst["backend"] if fw in receipts.BUILD_IDENTITY_FRAMEWORKS else None
     if requested_backend is not None:
@@ -567,6 +601,12 @@ def cmd_run(args):
         # committed-set check never read it.
         results_root = results_root / DIAGNOSTICS_DIR
     run_id = args.run_id
+    with tempfile.TemporaryDirectory(prefix="poot-bench-runner-") as stage_dir:
+        runners = stage_runners(runners, stage_dir)
+        _run_repeats(args, manifest, runners, suite, models_dir, results_root, run_id)
+
+
+def _run_repeats(args, manifest, runners, suite, models_dir, results_root, run_id):
     skipped = {int(n) for n in args.skip_repeats.split(",") if n.strip()} if args.skip_repeats else set()
     for repeat in range(1, args.repeats + 1):
         if repeat in skipped:
@@ -594,32 +634,62 @@ def cmd_quiet(args):
     return 0 if quiet else 1
 
 
-def run_quiet_cell(run_once, quiet_wait_s):
-    """Run one cell on a quiet host (POOT-1523), for every framework and backend alike.
+def run_quiet_cell(run_once, quiet_wait_s, gate=None, lock_paths=()):
+    """Run one cell on a quiet, cool host (POOT-1523, POOT-1508), for every framework and backend alike.
 
-    Before each attempt the host must be quiet (`host_load.wait_quiet`); during it the foreign CPU share is metered.
-    An attempt whose windows exceeded the limit, or with a short first-token pass that is neither timed for a window nor
-    flat (`short_pass`, the same rule for every framework), is discarded and run again, at most `host_load.MAX_DISCARDS` times;
-    the row records the load of the attempt it keeps and a summary of every discarded one, so a discard is never
-    silent. A cell that never ran quiet is an error row that says so, not a number.
+    Before each attempt the host must be cool (`gate`, the thermal start gate) and quiet (`host_load.wait_quiet`);
+    both waits hold no lock. Only then are the device locks `lock_paths` taken, the temperatures re-checked under
+    them (a queue for a lock heats or cools the box), and the attempt run with the foreign load and the temperatures
+    metered. An attempt whose CPU windows exceeded the limit, or with a short first-token pass that is neither timed for a
+    window nor flat (`short_pass`, the same rule for every framework), is discarded and run again, at most
+    `host_load.MAX_DISCARDS` times; the row records the load of the attempt it keeps and a summary of every discarded
+    one, so a discard is never silent. A GPU-contended or throttled attempt is kept and marked (`host_load.contended`,
+    `thermal.throttled`), and the comparison names it. A cell that never ran quiet, or never cooled, is an error row
+    that says so, not a number.
     """
     discarded = []
+    thermal_row = None
+    requeued = 0
     while True:
-        quiet, waited, probe = host_load.wait_quiet(quiet_wait_s)
-        if quiet:
-            with host_load.LoadMeter() as meter:
-                row = run_once()
-            load = meter.result()
-            if row.get("status") != "ok":
+        waited = None
+        if gate is not None and gate.available():
+            waited = gate.wait()
+            if not waited["cooled"]:
+                load = {}
+                row = {"status": "error", "failure": thermal.NEVER_COOLED, "reason": gate.refusal(waited)}
+                thermal_row = {"available": True, "limits": gate.rules, "waited_s": waited["waited_s"],
+                               "start": {k: v for k, v in waited["reading"].items() if k.endswith("_c")}}
                 break
-            uncovered = short_pass.uncovered_in_row(row)
-            if load.get("quiet", True) and not uncovered:
-                break
-            discarded.append({**_load_summary(load), **({"uncovered_short_passes": uncovered} if uncovered else {})})
-        else:
+        quiet, _, probe = host_load.wait_quiet(quiet_wait_s)
+        if not quiet:
             load = probe
             row = {"status": "error", "reason": f"host not quiet before the run: {_load_summary(probe)}"}
             break
+        with device_locks.held(lock_paths):
+            if gate is not None and gate.available():
+                cool, reading = gate.check()
+                if not cool:
+                    requeued += 1
+                    if requeued > host_load.MAX_DISCARDS:
+                        load = {}
+                        row = {"status": "error", "failure": thermal.NEVER_COOLED,
+                               "reason": f"{thermal.NEVER_COOLED}: the box was above its start limit again each of the "
+                                         f"{requeued} times the device locks were obtained"}
+                        thermal_row = {"available": True, "limits": gate.rules,
+                                       "start": {k: v for k, v in reading.items() if k.endswith("_c")}}
+                        break
+                    continue
+            with host_load.LoadMeter() as meter, (gate.meter() if gate is not None and gate.available()
+                                                  else contextlib.nullcontext()) as thermal_meter:
+                row = run_once()
+        load = meter.result()
+        thermal_row = thermal_meter.result(waited) if thermal_meter is not None else None
+        if row.get("status") != "ok":
+            break
+        uncovered = short_pass.uncovered_in_row(row)
+        if load.get("quiet", True) and not uncovered:
+            break
+        discarded.append({**_load_summary(load), **({"uncovered_short_passes": uncovered} if uncovered else {})})
         if len(discarded) > host_load.MAX_DISCARDS:
             row = {**row, "status": "error",
                    "reason": f"every one of {len(discarded)} attempts was discarded (host load above "
@@ -628,6 +698,8 @@ def run_quiet_cell(run_once, quiet_wait_s):
     row["host_load"] = {**load, "discarded": len(discarded)}
     if discarded:
         row["host_load"]["discarded_loads"] = discarded
+    if gate is not None:
+        row["thermal"] = thermal_row if thermal_row is not None else {"available": False}
     return row
 
 
@@ -643,6 +715,8 @@ def _run_matrix(args, manifest, runners, suite, models_dir, env, run_dir):
     results_path = run_dir / "results.jsonl"
 
     rows = []
+    gate = thermal.Gate(timeout_s=args.thermal_timeout_s)
+    lock_paths = device_locks.ORDER if args.hold_locks else ()
     with open(results_path, "w") as out:
         for model, scen, fw, fw_cfg in cells(manifest):
             if args.framework and fw != args.framework:
@@ -661,12 +735,13 @@ def _run_matrix(args, manifest, runners, suite, models_dir, env, run_dir):
                                 overrides={"gen_tokens": args.gen_tokens, "warmup": args.warmup,
                                            "iters": args.iters},
                                 diagnostic=args.diagnostic)
+            identity = {"framework": fw, "model": model["id"], "scenario": scen["id"],
+                        "precision": fw_cfg.get("precision", model.get("match_precision", ""))}
             try:
-                row = run_once() if not is_supported(fw_cfg) else run_quiet_cell(run_once, args.quiet_wait_s)
+                row = run_once() if not is_supported(fw_cfg) else run_quiet_cell(run_once, args.quiet_wait_s, gate, lock_paths)
+                row = {**identity, **row}  # a cell refused before it ran (not quiet, never cooled) still names itself
             except Exception as exc:  # one cell's failure is that cell's error row, never the whole sweep's end
-                row = {"framework": fw, "model": model["id"], "scenario": scen["id"],
-                       "precision": fw_cfg.get("precision", model.get("match_precision", "")),
-                       "status": "error", "reason": f"harness exception: {exc!r}"[:1200]}
+                row = {**identity, "status": "error", "reason": f"harness exception: {exc!r}"[:1200]}
             out.write(json.dumps(row) + "\n")
             out.flush()
             rows.append(row)
@@ -1007,6 +1082,14 @@ def _compare_cell(key, rows_a, rows_b, policy):
             return settle(receipts.UNVERIFIED, f"the {side} was not on a warm page cache: {repeats}")
         if len({r.get("binary_sha256") for r in ok}) > 1:
             return settle(receipts.UNVERIFIED, f"the {side} runs mix binaries")
+        contended = [(n, host_load.describe_contention(r)) for n, r in enumerate(ok, 1) if host_load.contenders(r)]
+        if contended:
+            repeats = "; ".join(f"repeat {n} by {who}" for n, who in contended)
+            return settle(receipts.UNVERIFIED, f"the {side} was contended: {repeats}")
+        throttled = thermal.throttled_repeats(ok)
+        if throttled:
+            repeats = "; ".join(f"repeat {n} reached the throttle point of the {' and '.join(roles)}" for n, roles in throttled)
+            return settle(receipts.UNVERIFIED, f"the {side} was throttled: {repeats}")
         identities = [receipts.row_identity(r) for r in ok]
         mixed = [f for f in receipts.row_identity_fields(key[2]) if len({repr(i[f]) for i in identities}) > 1]
         if mixed:
@@ -1242,6 +1325,12 @@ def main():
     r.add_argument("--quiet-wait-s", type=float, default=60.0,
                    help="how long a cell may wait for a quiet host before it is an error row (the box should be "
                         "quiet before the locks are taken: `bench quiet`)")
+    r.add_argument("--thermal-timeout-s", type=float, default=thermal.DEFAULT_TIMEOUT_S,
+                   help="how long an attempt may wait for the GPU and CPU to cool to their start limits before it is a "
+                        f"`{thermal.NEVER_COOLED}` error row (the wait holds no lock)")
+    r.add_argument("--hold-locks", action="store_true",
+                   help=f"take {' and '.join(device_locks.ORDER)} for each attempt, after the waits; do not wrap this "
+                        "command in `flock`, which would hold them through the waits")
     r.add_argument("--sample-interval-ms", type=float, default=50.0)
     r.add_argument("--gen-tokens", type=int, help="override the scenario gen-tokens (quick smoke runs)")
     r.add_argument("--warmup", type=int, help="override the suite warmup iters")

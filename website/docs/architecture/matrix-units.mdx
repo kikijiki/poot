@@ -109,9 +109,9 @@ review; modes cover the dense tilings, the indexed Gemv against the grouped tili
 
 ## Weight format
 
-A driver holds its weights in one format. Under `narrow` on a target whose matrix units take f16, a bf16 weight read only by
-dense contractions and embedding gathers is stored as f16, and a tied embedding and head share one copy. A weight f16
-cannot hold is refused when it is bound. See [Operand precision](./graph-ir.mdx#operand-precision).
+A driver holds each weight in its checkpoint format, in every program, and a tied embedding and head share one copy. A
+contraction the planner narrows to f16 over a bf16 weight rounds the staged weight, and the weight is refused when it is bound
+if f16 cannot hold it. See [Operand precision](./graph-ir.mdx#operand-precision).
 
 ## Seeing what was planned
 

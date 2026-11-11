@@ -1,7 +1,7 @@
 //! Host bytes into a planned device lane: the one encoder every device shares, so no backend
 //! re-derives how a stored dtype lands in the storage the plan chose (ADR-0103: bytes as stored where
-//! the plan keeps them, the plan's widening where it does not, and the plan's rounding of a BF16 weight
-//! to the f16 its contractions multiply in, POOT-1458).
+//! the plan keeps them, and the plan's widening where it does not). A weight is never rounded here: a narrowed
+//! contraction rounds the staged weight itself (POOT-1535).
 
 use std::ops::Range;
 
@@ -17,11 +17,6 @@ pub(crate) enum EncodeError {
     /// generated bodies decode packed binary16 over its finite domain only (the packed emitter's admitted
     /// domain), so such a weight is refused at upload rather than decoded to a wrong finite value.
     NonFiniteF16 { index: usize, bits: u16 },
-    /// POOT-1458: a BF16 weight planned in the f16 lane holds, at element `index`, a value f16 cannot hold: an
-    /// infinity or NaN, or a finite value that rounds past 65504. Weights are constants, so their range is
-    /// checked once, here, and refused (the ADR-0116 constant rule) rather than reaching the products as an
-    /// infinity.
-    PastF16Range { index: usize, bits: u16 },
 }
 
 /// How a stored dense dtype lands in a planned lane, decided from the two types alone: it names the transform
@@ -34,10 +29,6 @@ pub(crate) enum Encoding {
     PackedWords,
     /// Card 1007: as [`Encoding::PackedWords`], once every element is a finite binary16.
     PackedWordsFiniteF16,
-    /// POOT-1458: BF16 elements, each rounded to nearest even binary16 ([`poot_quant::scalar::f32_to_f16`]),
-    /// packed as [`Encoding::PackedWords`]: the f16 lane of a BF16 weight the graph declares F16
-    /// ([`poot_graph_ir::GraphEdit::convert_weight`], POOT-1477), once every element is inside f16's finite range.
-    Bf16AsF16Words,
     /// POOT-1060: one-byte elements, each row of the last axis padded with zero bytes to a whole `u32` word.
     RowPaddedWords,
 }
@@ -55,8 +46,6 @@ pub(crate) fn encoding_of(stored: DType, planned: BufferStorage) -> Option<Encod
         (DType::BF16, p) if p == BufferStorage::bf16_packed() => Some(Encoding::PackedWords),
         // Card 1007: the same word for F16, element `i` in word `i / 2` at bit `(i % 2) * 16`.
         (DType::F16, p) if p == BufferStorage::f16_packed() => Some(Encoding::PackedWordsFiniteF16),
-        // POOT-1458: the same words for a BF16 weight the plan rounds to f16 at bind.
-        (DType::BF16, p) if p == BufferStorage::f16_packed() => Some(Encoding::Bf16AsF16Words),
         // POOT-1060: `words_per_row = ceil(width / 4)`, so a row never starts mid-word.
         (DType::E4M3FN, p) if p == BufferStorage::e4m3_packed() => Some(Encoding::RowPaddedWords),
         _ => None,
@@ -74,13 +63,8 @@ pub(crate) fn first_non_finite_f16(bytes: &[u8]) -> Option<(usize, u16)> {
         .find(|&(_, bits)| bits & 0x7c00 == 0x7c00)
 }
 
-/// The binary16 bits BF16 element `bits` rounds to (nearest even).
-fn bf16_as_f16(bits: u16) -> u16 {
-    poot_quant::scalar::f32_to_f16(poot_quant::scalar::bf16_to_f32(bits))
-}
-
 /// The first element of BF16 `bytes` f16 cannot hold (an infinity or NaN, or a value that rounds past 65504), as
-/// `(index, bf16 bits)`.
+/// `(index, bf16 bits)`: the check of a [`poot_graph_ir::ValueBound::FiniteIn`] declaration on a BF16 weight.
 pub(crate) fn first_past_f16_range(bytes: &[u8]) -> Option<(usize, u16)> {
     bytes
         .as_chunks::<2>()
@@ -88,7 +72,10 @@ pub(crate) fn first_past_f16_range(bytes: &[u8]) -> Option<(usize, u16)> {
         .iter()
         .map(|c| u16::from_le_bytes(*c))
         .enumerate()
-        .find(|&(_, bits)| bf16_as_f16(bits) & 0x7c00 == 0x7c00)
+        .find(|&(_, bits)| {
+            let half = poot_quant::scalar::f32_to_f16(poot_quant::scalar::bf16_to_f32(bits));
+            half & 0x7c00 == 0x7c00
+        })
 }
 
 /// The width of one row of `shape`'s last axis (a 0-D value is one row of width one) and that row zero-padded
@@ -104,9 +91,7 @@ fn row_widths(shape: &[usize]) -> (usize, usize) {
 pub(crate) fn encoded_len(encoding: Encoding, shape: &[usize], stored_len: usize) -> usize {
     match encoding {
         Encoding::Verbatim => stored_len,
-        Encoding::PackedWords | Encoding::PackedWordsFiniteF16 | Encoding::Bf16AsF16Words => {
-            stored_len.div_ceil(4) * 4
-        }
+        Encoding::PackedWords | Encoding::PackedWordsFiniteF16 => stored_len.div_ceil(4) * 4,
         Encoding::RowPaddedWords => {
             let (width, padded) = row_widths(shape);
             stored_len.div_ceil(width) * padded
@@ -140,16 +125,6 @@ pub(crate) fn encode_range(
     match encoding {
         Encoding::Verbatim | Encoding::PackedWords | Encoding::PackedWordsFiniteF16 => {
             copy_clipped(range.start, out, read);
-        }
-        Encoding::Bf16AsF16Words => {
-            // Element `i` is bytes `2i, 2i + 1` in and out: round the whole elements the range touches.
-            let (lo, hi) = (range.start & !1, (range.end + 1) & !1);
-            let mut elements = vec![0u8; hi - lo];
-            copy_clipped(lo, &mut elements, read);
-            for element in elements.as_chunks_mut::<2>().0 {
-                *element = bf16_as_f16(u16::from_le_bytes(*element)).to_le_bytes();
-            }
-            out.copy_from_slice(&elements[range.start - lo..range.end - lo]);
         }
         Encoding::RowPaddedWords => {
             let (width, padded) = row_widths(shape);
@@ -187,11 +162,6 @@ pub(crate) fn encode_stored(
         && let Some((index, bits)) = first_non_finite_f16(bytes)
     {
         return Err(EncodeError::NonFiniteF16 { index, bits });
-    }
-    if encoding == Encoding::Bf16AsF16Words
-        && let Some((index, bits)) = first_past_f16_range(bytes)
-    {
-        return Err(EncodeError::PastF16Range { index, bits });
     }
     let mut out = vec![0u8; encoded_len(encoding, shape, bytes.len())];
     let len = out.len();
@@ -241,6 +211,7 @@ mod tests {
 
     use super::{
         EncodeError, Encoding, encode_host, encode_range, encode_stored, encoded_len, encoding_of,
+        first_past_f16_range,
     };
 
     /// POOT-1060: a stored E4M3FN table lands as `u32` words with every row of the last axis zero-padded to
@@ -277,34 +248,43 @@ mod tests {
         assert_eq!(encode_host(DType::F32, &words, BufferStorage::f16()), None);
     }
 
-    /// POOT-1458: a BF16 weight in the f16 lane lands each element rounded to nearest even f16, the value a kernel
-    /// staging it in f16 would round it to: exact in the normal range, rounded in the f16 subnormal range (a tie
-    /// to even), 65280 (the largest bf16 below the f16 limit) kept. An element f16 cannot hold (65536, an
-    /// infinity, a NaN) is refused by index. Mutation: compare the rounded bits with `0x7c00` only for an exact
-    /// infinity's mantissa (`== 0x7c00` on the whole value, so a NaN passes); the NaN element is accepted and this
-    /// row goes red.
+    /// POOT-1535: a BF16 weight has no encoding into the f16 lane: the bytes land as stored, or not at all. The f16
+    /// rounding of a narrowed contraction's weight is the contraction's staging, never an upload.
+    ///
+    /// Mutation: in `encoding_of` map `(BF16, f16_packed)` to `Some(Encoding::PackedWords)`; the pair encodes and
+    /// this row goes red.
     #[test]
-    fn a_bf16_weight_in_the_f16_lane_is_rounded_once_and_refused_past_the_range() {
+    fn a_bf16_weight_has_no_encoding_into_the_f16_lane() {
         let lane = BufferStorage::f16_packed();
+        assert_eq!(encoding_of(DType::BF16, lane), None);
+        assert_eq!(
+            encode_stored(DType::BF16, &[2], &[0x80, 0x3f, 0x80, 0x3f], lane),
+            Err(EncodeError::NoEncoding)
+        );
+    }
+
+    /// POOT-1458, now the check of a `FiniteIn(F16)` bound: an element of a BF16 weight that f16 cannot hold (65536,
+    /// an infinity, a NaN) is found by index, and 65280 (the largest bf16 below the f16 limit) and the f16
+    /// subnormals pass. Mutation: compare the rounded bits with `0x7c00` only for an exact infinity's mantissa
+    /// (`== 0x7c00` on the whole value, so a NaN passes); the NaN element is accepted and this row goes red.
+    #[test]
+    fn a_bf16_weight_past_the_f16_range_is_found_by_index() {
         let words = |bits: &[u16]| {
             bits.iter()
                 .flat_map(|b| b.to_le_bytes())
                 .collect::<Vec<u8>>()
         };
-        // 1.0, -2.5, 65280, the smallest f16 subnormal 2^-24, and 1.5 * 2^-24 (a tie between 2^-24 and 2^-23,
-        // which goes to the even 2^-23).
-        let stored = words(&[0x3f80, 0xc020, 0x477f, 0x3380, 0x33c0]);
-        let encoded = encode_stored(DType::BF16, &[5], &stored, lane).unwrap();
+        // 1.0, -2.5, 65280, the smallest f16 subnormal 2^-24, and a tie between 2^-24 and 2^-23.
         assert_eq!(
-            encoded,
-            words(&[0x3c00, 0xc100, 0x7bf8, 0x0001, 0x0002, 0x0000])
+            first_past_f16_range(&words(&[0x3f80, 0xc020, 0x477f, 0x3380, 0x33c0])),
+            None
         );
         for (index, bits) in [(2usize, 0x4780u16), (1, 0xff80), (0, 0x7fc1)] {
             let mut weights = vec![0x3f80u16; 3];
             weights[index] = bits;
             assert_eq!(
-                encode_stored(DType::BF16, &[3], &words(&weights), lane),
-                Err(EncodeError::PastF16Range { index, bits }),
+                first_past_f16_range(&words(&weights)),
+                Some((index, bits)),
                 "{bits:#06x}"
             );
         }
@@ -407,14 +387,13 @@ mod tests {
     /// row start); every chunking that cuts a row goes red.
     #[test]
     fn every_encoding_lands_the_oracle_bytes_in_chunks_of_any_size() {
-        let cases: [(DType, BufferStorage, &[usize]); 8] = [
+        let cases: [(DType, BufferStorage, &[usize]); 7] = [
             (DType::F32, BufferStorage::f32(), &[3, 7]),
             (DType::F16, BufferStorage::f16(), &[5, 3]),
             (DType::BF16, BufferStorage::bf16(), &[5, 3]),
             (DType::I32, BufferStorage::i32(), &[3, 5]),
             (DType::BF16, BufferStorage::bf16_packed(), &[5, 3]),
             (DType::F16, BufferStorage::f16_packed(), &[5, 3]),
-            (DType::BF16, BufferStorage::f16_packed(), &[5, 3]),
             (DType::E4M3FN, BufferStorage::e4m3_packed(), &[7, 5]),
         ];
         for (dtype, storage, shape) in cases {
@@ -441,16 +420,6 @@ mod tests {
                     oracle_word_padded(&bytes)
                 }
                 Encoding::RowPaddedWords => oracle_row_padded(shape, &bytes),
-                Encoding::Bf16AsF16Words => oracle_word_padded(
-                    &bytes
-                        .chunks(2)
-                        .flat_map(|e| {
-                            let bits = u16::from_le_bytes([e[0], e[1]]);
-                            poot_quant::scalar::f32_to_f16(poot_quant::scalar::bf16_to_f32(bits))
-                                .to_le_bytes()
-                        })
-                        .collect::<Vec<u8>>(),
-                ),
             };
             assert_eq!(
                 encoded_len(encoding, shape, bytes.len()),

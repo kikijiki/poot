@@ -414,7 +414,8 @@ impl<const N: usize> ConstPlan<N> {
 }
 
 /// Bind `$plan` to `$format`'s const plan and evaluate `$body`, or `$otherwise` for a format
-/// without one.
+/// without one: a dense float (one value per block) or a planar format. The match names every
+/// format, so a new block format does not compile until it has a plan here or is stated dense.
 macro_rules! with_plan {
     ($format:expr, |$plan:ident| $body:expr, otherwise $otherwise:expr) => {{
         use crate::blocks;
@@ -442,7 +443,12 @@ macro_rules! with_plan {
             WeightFormat::Iq2_Xs => arm!(blocks::IQ2_XS, blocks::QK_K),
             WeightFormat::Iq3_Xxs => arm!(blocks::IQ3_XXS, blocks::QK_K),
             WeightFormat::Iq3_S => arm!(blocks::IQ3_S, blocks::QK_K),
-            _ => $otherwise,
+            WeightFormat::F32 | WeightFormat::F16 | WeightFormat::Bf16 => $otherwise,
+            WeightFormat::E4m3PerChannel { .. }
+            | WeightFormat::E4m3Block128 { .. }
+            | WeightFormat::E2m1Row32
+            | WeightFormat::Gptq { .. }
+            | WeightFormat::Awq { .. } => $otherwise,
         }
     }};
 }
@@ -583,6 +589,41 @@ mod tests {
                 }
             }
             assert!(refused < 512, "{format:?}: every random block was refused");
+        }
+    }
+
+    /// POOT-1514: over every GGUF format's every-field fixture (each field holds every value it can), the plan
+    /// decodes as the interpreter, bit for bit. The format list and the fixture both come from
+    /// `test_support`, so a new format is covered here with no edit. Mutation: in `decode_block`, read a
+    /// codebook entry as `table[(bits & 0x7) as usize]`; red at `Iq4_Nl block 0 element 8`.
+    #[test]
+    fn the_block_plan_decodes_every_field_fixture_as_the_interpreter() {
+        for format in crate::test_support::formats::GGUF_FORMATS {
+            let descriptor = format.descriptor();
+            let Storage::Blocks(layout) = descriptor.storage else {
+                panic!("{format:?} is listed as a GGUF block format");
+            };
+            let bytes = crate::test_support::packed::every_field_blocks(format);
+            let blocks = bytes.len() / layout.bytes;
+            let mut planned = vec![0.0; blocks * layout.values];
+            decode_blocks(format, &bytes, &mut planned)
+                .unwrap_or_else(|error| panic!("{format:?}: {error}"));
+            for (block, (bytes, planned)) in bytes
+                .chunks(layout.bytes)
+                .zip(planned.chunks(layout.values))
+                .enumerate()
+            {
+                for (index, planned) in planned.iter().enumerate() {
+                    let want = descriptor
+                        .decode_block_value(bytes, index)
+                        .unwrap_or_else(|error| panic!("{format:?}: {error}"));
+                    assert_eq!(
+                        planned.to_bits(),
+                        want.to_bits(),
+                        "{format:?} block {block} element {index}"
+                    );
+                }
+            }
         }
     }
 

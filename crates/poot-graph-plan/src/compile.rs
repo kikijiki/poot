@@ -1042,9 +1042,6 @@ pub fn compile(
             Some(dtype) => units.only(dtype),
             None => units,
         };
-        if transform::weights_are_f16(options.matmul_precision, units) {
-            pipeline.require("store_weights_f16", transform::store_weights_f16)?;
-        }
         let limits = options.limits.body();
         pipeline.require("select_operand_precision", |g| {
             let views = compute_views(g, target.id());

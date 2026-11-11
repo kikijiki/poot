@@ -28,6 +28,7 @@ use std::collections::HashMap;
 
 use crate::graph::{Eqn, Graph, Operand, Storage, ValueId, ValueTable};
 use crate::op::{BinOp, OpKind, RedOp, UnOp};
+use crate::precision::FragmentDtype;
 use crate::types::{DType, Scalar};
 
 /// A half-open interval `[lo, hi_exclusive)` of `i32` words, with `lo < hi_exclusive`.
@@ -129,6 +130,17 @@ impl IndexRange {
     fn nonnegative(&self) -> bool {
         self.lo >= 0
     }
+}
+
+/// A fact a `Const` input declares about its words, checked by the binder at bind: the one declaration slot of a
+/// value ([`crate::graph::ValueMeta::bound`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ValueBound {
+    /// An I32 table whose words lie in the range ([`crate::Builder::constant_ranged`]).
+    Index(IndexRange),
+    /// A float weight whose every element is finite once rounded to the fragment dtype: the declaration of a
+    /// contraction the planner narrows to it.
+    FiniteIn(FragmentDtype),
 }
 
 impl std::fmt::Display for IndexRange {

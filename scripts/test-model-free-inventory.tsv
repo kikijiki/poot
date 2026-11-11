@@ -335,6 +335,7 @@ poot-eval	poot-eval	model-free	tests::mrope::mrope_zero_width_section_traces_and
 poot-eval	poot-eval	model-free	tests::operand_precision::a_contraction_epilogue_reads_its_head_operands_as_declared
 poot-eval	poot-eval	model-free	tests::operand_precision::a_dense_contraction_reads_its_operands_as_declared
 poot-eval	poot-eval	model-free	tests::operand_precision::a_grouped_dense_contraction_reads_its_operands_as_declared
+poot-eval	poot-eval	model-free	tests::operand_precision::a_narrowed_dense_contraction_rounds_its_bf16_weight_to_the_fragment_dtype
 poot-eval	poot-eval	model-free	tests::operand_precision::an_operand_beyond_the_f16_range_becomes_infinity_not_a_clamp
 poot-eval	poot-eval	model-free	tests::operand_precision::an_operand_stored_in_the_fragment_dtype_enters_once
 poot-eval	poot-eval	model-free	tests::operand_precision::attention_rounds_its_operands_as_declared
@@ -376,8 +377,6 @@ poot-eval	poot-eval	model-free	tests::validation::eval_rejects_the_same_lane_reg
 poot-eval	poot-eval	model-free	tests::value_release::a_value_is_released_after_its_last_reader_and_a_root_never_is
 poot-eval	poot-eval	model-free	tests::value_release::releasing_dead_values_changes_neither_the_result_nor_the_carried_state
 poot-eval	poot-eval	model-free	tests::value_release::the_walk_really_drops_dead_values_while_it_runs
-poot-eval	poot-eval	model-free	tests::weight_store::a_converted_weight_binds_as_the_f16_the_bind_uploads
-poot-eval	poot-eval	model-free	tests::weight_store::a_converted_weight_past_the_f16_range_is_refused_like_the_bind
 poot-eval	poot-eval	model-free	tests::weight_store::bf16_native_bytes_preserved
 poot-eval	poot-eval	model-free	tests::weight_store::f16_native_bytes_preserved
 poot-eval	poot-eval	model-free	tests::widen::widen_is_total_over_tensor_kinds_and_keeps_each_payload
@@ -407,15 +406,15 @@ poot-executor	poot-executor	model-free	device::flush_policy_tests::a_device_has_
 poot-executor	poot-executor	model-free	device::flush_policy_tests::a_run_is_cut_at_either_bound_and_never_when_empty
 poot-executor	poot-executor	model-free	engine::arena_slot_alloc_tests::arena_slot_native_elems_reach_device_allocate_unconverted
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_bf16_weight_declared_f32_is_a_typed_refusal_never_widened
-poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_bf16_weight_of_an_f16_contraction_uploads_rounded_to_f16_once
+poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_bf16_weight_of_an_f16_contraction_uploads_in_its_checkpoint_format_once
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_bf16_weight_past_the_f16_range_of_its_contraction_is_refused_at_bind
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_contraction_weight_declared_f32_but_stored_f16_is_a_typed_refusal
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_file_truncated_while_its_weight_uploads_is_a_typed_read_error
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_non_finite_packed_f16_weight_is_a_typed_refusal
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_size_only_device_refuses_a_dtype_mismatch_and_sizes_a_packed_weight_like_the_byte_taking_one
-poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_tied_embedding_and_head_upload_one_f16_copy_the_size_of_the_exact_one
-poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_tied_tensor_past_the_f16_range_is_refused_at_the_one_upload
+poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_tied_embedding_and_head_upload_one_copy_in_the_checkpoint_format
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_unified_memory_upload_drops_the_page_cache_it_staged
+poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::a_weight_past_f16_range_is_refused_when_a_narrow_program_binds_it_after_an_exact_one
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::add_entry_refuses_a_file_modified_while_its_weight_uploads
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::add_entry_refuses_a_store_whose_mapped_file_changed
 poot-executor	poot-executor	model-free	engine::f16_packed_weight_upload_tests::an_f16_contraction_weight_uploads_its_two_byte_words_packed
@@ -474,7 +473,8 @@ poot-executor	poot-executor	model-free	engine::weight_source_tests::the_host_see
 poot-executor	poot-executor	model-free	host_memory::tests::a_status_text_is_read_in_bytes
 poot-executor	poot-executor	model-free	host_memory::tests::a_status_without_a_field_is_none
 poot-executor	poot-executor	model-free	host_memory::tests::the_live_reading_sees_anonymous_memory_the_process_touches
-poot-executor	poot-executor	model-free	lanes::tests::a_bf16_weight_in_the_f16_lane_is_rounded_once_and_refused_past_the_range
+poot-executor	poot-executor	model-free	lanes::tests::a_bf16_weight_has_no_encoding_into_the_f16_lane
+poot-executor	poot-executor	model-free	lanes::tests::a_bf16_weight_past_the_f16_range_is_found_by_index
 poot-executor	poot-executor	model-free	lanes::tests::a_host_f16_view_lands_only_in_the_native_f16_lane
 poot-executor	poot-executor	model-free	lanes::tests::an_e4m3_table_pads_each_row_to_a_whole_word
 poot-executor	poot-executor	model-free	lanes::tests::dense_e4m3_storage_has_no_encoding
@@ -599,7 +599,7 @@ poot-graph-ir	poot-graph-ir	model-free	graph::tests::a_slot_role_declared_at_a_t
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::a_typed_identity_has_no_name_beside_it
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::alibi_slopes_follow_the_published_series
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::an_unknown_sampler_tag_is_refused_apart_from_a_wrong_dtype
-poot-graph-ir	poot-graph-ir	model-free	graph::tests::convert_weight_declares_a_bf16_const_f16_over_the_checkpoint_dtype
+poot-graph-ir	poot-graph-ir	model-free	graph::tests::declare_bound_gives_a_const_one_bound_and_refuses_a_second_different_one
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::graph_edits_of_inputs_return_typed_errors
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::input_key_distinguishes_same_role_tagged_slots
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::input_key_is_structured_not_debug_formatted_and_not_by_value_id
@@ -612,7 +612,6 @@ poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_preserves_literal_
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_a_computed_constant_whose_payload_disagrees_with_its_type
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_a_duplicate_ssa_producer
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_a_slot_input_that_has_only_a_name
-poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_a_stored_dtype_that_is_not_the_bf16_to_f16_conversion
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_a_weight_reference_on_a_value_that_is_not_a_constant
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_arithmetic_on_a_packed_or_storage_only_dtype
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_blocked_axis_out_of_range_for_rank
@@ -1251,6 +1250,11 @@ poot-graph-plan	poot-graph-plan::cast_quant_norm_rope_fusion	model-free	fused_po
 poot-graph-plan	poot-graph-plan::cast_quant_norm_rope_fusion	model-free	optimize_preserves_rope_numerics
 poot-graph-plan	poot-graph-plan::cast_quant_norm_rope_fusion	model-free	rope_fusion_eval_matches_unfused_full
 poot-graph-plan	poot-graph-plan::cast_quant_norm_rope_fusion	model-free	rope_fusion_eval_matches_unfused_partial
+poot-graph-plan	poot-graph-plan::checkpoint_weight_format	model-free	a_narrow_program_that_narrows_nothing_is_its_exact_twin
+poot-graph-plan	poot-graph-plan::checkpoint_weight_format	model-free	a_narrowed_contraction_declares_its_weight_finite_in_f16
+poot-graph-plan	poot-graph-plan::checkpoint_weight_format	model-free	a_narrowed_reader_keeps_its_bf16_weight_attribute
+poot-graph-plan	poot-graph-plan::checkpoint_weight_format	model-free	a_tied_embedding_and_head_share_one_format
+poot-graph-plan	poot-graph-plan::checkpoint_weight_format	model-free	a_weight_has_its_checkpoint_format_in_prefill_and_decode
 poot-graph-plan	poot-graph-plan::compile_budgets	model-free	a_kernel_over_the_body_limits_with_no_smaller_form_is_a_typed_planner_refusal
 poot-graph-plan	poot-graph-plan::compile_budgets	model-free	a_pass_sized_ahead_of_time_is_refused_before_it_runs
 poot-graph-plan	poot-graph-plan::compile_budgets	model-free	a_program_carries_the_artifact_limit_it_was_compiled_under
@@ -1267,7 +1271,7 @@ poot-graph-plan	poot-graph-plan::contract_inventory	model-free	surviving_contrac
 poot-graph-plan	poot-graph-plan::dense_contraction_plan	model-free	a_biased_residual_dense_head_is_one_epilogue_contraction_at_every_m
 poot-graph-plan	poot-graph-plan::dense_contraction_plan	model-free	a_biased_residual_tiled_matmul_head_is_one_epilogue_contraction
 poot-graph-plan	poot-graph-plan::dense_contraction_plan	model-free	a_blocked_weight_with_a_second_consumer_is_not_folded
-poot-graph-plan	poot-graph-plan::dense_contraction_plan	model-free	a_grouped_bf16_projection_is_declared_f16_under_narrow
+poot-graph-plan	poot-graph-plan::dense_contraction_plan	model-free	a_grouped_bf16_projection_keeps_its_checkpoint_weight_under_narrow
 poot-graph-plan	poot-graph-plan::dense_contraction_plan	model-free	a_grouped_bf16_projection_plans_one_grouped_dense_contraction_and_no_transpose
 poot-graph-plan	poot-graph-plan::dense_contraction_plan	model-free	a_grouped_contraction_over_a_weight_without_grouped_rows_is_a_typed_refusal
 poot-graph-plan	poot-graph-plan::dense_contraction_plan	model-free	a_grouped_weight_that_is_not_bf16_keeps_the_traced_chain
@@ -1290,10 +1294,6 @@ poot-graph-plan	poot-graph-plan::expert_grouping_plan	model-free	a_routed_prefil
 poot-graph-plan	poot-graph-plan::f16_range	model-free	a_product_of_two_runtime_values_narrows_to_f16
 poot-graph-plan	poot-graph-plan::f16_range	model-free	activations_past_the_f16_range_give_a_non_finite_output
 poot-graph-plan	poot-graph-plan::f16_range	model-free	the_oracle_graph_and_the_program_narrow_the_same_contractions
-poot-graph-plan	poot-graph-plan::f16_weight_lane	model-free	a_bf16_weight_of_dense_readers_is_declared_f16_under_narrow
-poot-graph-plan	poot-graph-plan::f16_weight_lane	model-free	a_tied_embedding_and_head_have_one_weight_format
-poot-graph-plan	poot-graph-plan::f16_weight_lane	model-free	an_f16_embedding_gathers_with_the_packed_f16_kernel_on_every_backend
-poot-graph-plan	poot-graph-plan::f16_weight_lane	model-free	prefill_and_decode_programs_declare_every_weight_alike
 poot-graph-plan	poot-graph-plan::flash_prefill_softcap_fusion	model-free	flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference
 poot-graph-plan	poot-graph-plan::fragment_attention_plan	model-free	a_bf16_narrowed_prefill_attention_plans_bf16_fragments_on_the_rocm_matrix_unit
 poot-graph-plan	poot-graph-plan::fragment_attention_plan	model-free	a_fragment_attention_holds_q_where_it_fits_the_register_file
@@ -1373,6 +1373,7 @@ poot-graph-plan	poot-graph-plan::numerical_legality	model-free	rhs_underflow_is_
 poot-graph-plan	poot-graph-plan::numerical_legality	model-free	scalar_contraction_corner_corpus_is_bitwise
 poot-graph-plan	poot-graph-plan::numerical_legality	model-free	softcap_requires_the_exact_reciprocal_literal
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	a_declared_precision_stands_under_any_policy
+poot-graph-plan	poot-graph-plan::operand_precision	model-free	a_decode_attention_stays_exact_under_the_narrow_policy
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	a_split_policy_splits_contractions_and_leaves_attention_exact
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	an_exact_policy_never_narrows
 poot-graph-plan	poot-graph-plan::operand_precision	model-free	an_op_a_matrix_unit_does_not_win_stays_exact
@@ -1570,6 +1571,9 @@ poot-kernelgen	poot-kernelgen	model-free	contraction::dense::tests::a_narrow_sto
 poot-kernelgen	poot-kernelgen	model-free	contraction::dense::tests::the_dense_tiled_body_matches_a_host_product_at_every_planned_tiling
 poot-kernelgen	poot-kernelgen	model-free	contraction::fit::tests::an_underdetermined_corpus_gives_no_fit
 poot-kernelgen	poot-kernelgen	model-free	contraction::fit::tests::the_fit_recovers_the_ratios_the_times_were_made_with
+poot-kernelgen	poot-kernelgen	model-free	contraction::invariant::a_compiled_choice_never_runs_a_tiling_its_compiler_spills
+poot-kernelgen	poot-kernelgen	model-free	contraction::invariant::the_chosen_schedule_never_loses_to_exact
+poot-kernelgen	poot-kernelgen	model-free	contraction::invariant::the_sweep_reaches_both_sides_of_the_choice
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_compiled_selection_takes_the_cheapest_candidate_that_holds
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_contraction_below_the_device_takes_the_cheapest_lane_step
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::a_fragment_round_stages_whole_requests_of_every_operand_row
@@ -3033,6 +3037,7 @@ poot-load	poot-load	model-free	gguf::tests::read_gguf_loads_rank3_experts_as_sep
 poot-load	poot-load	model-free	gguf::tests::read_gguf_refuses_a_scheme_with_no_packed_path_by_name
 poot-load	poot-load	model-free	gguf::tests::read_gguf_skips_a_tensor_the_name_map_does_not_map
 poot-load	poot-load	model-free	gguf::tests::read_gguf_works_over_an_in_memory_buffer_with_no_temp_file
+poot-load	poot-load	model-free	gguf::tests::the_formats_the_loader_reads_are_the_gguf_format_list
 poot-load	poot-load	model-free	gguf::tests::the_tensor_element_cap_is_inclusive
 poot-load	poot-load	model-free	gguf::tests::truncated_tensor_data_is_a_typed_error
 poot-load	poot-load	model-free	gguf::tests::weight_format_of_matches_the_pinned_ggml_type_table
@@ -4309,6 +4314,7 @@ poot-ptx-device	poot-ptx-device::packed_serving	device	packed_indexed_prefill_ru
 poot-ptx-device	poot-ptx-device::packed_serving	device	packed_loaders_match_the_oracle_on_every_output_on_ptx
 poot-ptx-device	poot-ptx-device::packed_serving	device	packed_prefill_through_serving_path_is_bit_exact_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	a_grouped_moe_prefill_runs_the_fragment_tile_on_ptx
+poot-ptx-device	poot-ptx-device::parity	device	a_narrowed_bf16_weight_matches_the_declared_oracle_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	adjusted_sampling_head_matches_the_oracle_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	alibi_slopes_attention_matches_the_oracle_and_the_reference_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	an_f16_overflow_stays_non_finite_on_ptx
@@ -4322,7 +4328,6 @@ poot-ptx-device	poot-ptx-device::parity	device	greedy_sample_token_is_exact_on_p
 poot-ptx-device	poot-ptx-device::parity	device	select_is_bitwise_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	selected_attention_reads_exactly_the_selected_blocks_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	state_pool_rows_reset_independently_on_ptx
-poot-ptx-device	poot-ptx-device::parity	device	the_driver_weight_format_matches_the_declared_oracle_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	the_range_detector_names_an_f16_overflow_on_ptx
 poot-ptx-device	poot-ptx-device::parity	device	two_byte_select_is_bitwise_on_ptx
 poot-ptx-device	poot-ptx-device::register_oracle	device	a_probe_the_jit_refuses_is_a_compile_error
@@ -4411,6 +4416,7 @@ poot-quant	poot-quant	model-free	encode::tests::off_grid_values_decode_to_the_ro
 poot-quant	poot-quant	model-free	encode::tests::uniform_block_schemes_round_trip_bit_exactly
 poot-quant	poot-quant	model-free	encode::tests::unsupported_and_malformed_requests_are_typed
 poot-quant	poot-quant	model-free	plan::tests::decode_blocks_refuses_a_row_length_that_is_not_whole_blocks
+poot-quant	poot-quant	model-free	plan::tests::the_block_plan_decodes_every_field_fixture_as_the_interpreter
 poot-quant	poot-quant	model-free	plan::tests::the_block_plan_decodes_every_format_as_the_interpreter
 poot-quant	poot-quant	model-free	planar::tests::awq_decodes_to_the_autoawq_reference
 poot-quant	poot-quant	model-free	planar::tests::e2m1_row32_decodes_to_the_ocp_reference
@@ -4457,6 +4463,8 @@ poot-quant	poot-quant	model-free	weights::tests::dense_weight_rejects_a_byte_len
 poot-quant	poot-quant	model-free	weights::tests::dense_weight_rejects_shape_overflow
 poot-quant	poot-quant	model-free	weights::tests::store_reports_its_entries_uniformly_across_dense_and_packed
 poot-quant	poot-quant	model-free	weights::tests::weight_key_equal_content_is_equal_and_looks_up_by_str
+poot-quant	poot-quant::gguf_formats	model-free	every_referenced_format_decodes_its_fixture_like_llamacpp
+poot-quant	poot-quant::gguf_formats	model-free	the_fixture_reaches_every_value_of_every_field
 poot-quant	poot-quant::packed_linear	model-free	adjacent_e2m1_ragged_padding_and_nibble_mapping_are_exact
 poot-quant	poot-quant::packed_linear	model-free	coordinate_mapping_uses_handwritten_row_and_scale_sentinels
 poot-quant	poot-quant::packed_linear	model-free	decode_row_matches_the_scalar_decoder_bit_for_bit
@@ -4561,6 +4569,7 @@ poot-rocm-device	poot-rocm-device::packed_serving	device	packed_indexed_prefill_
 poot-rocm-device	poot-rocm-device::packed_serving	device	packed_loaders_match_the_oracle_on_every_output_on_rocm
 poot-rocm-device	poot-rocm-device::packed_serving	device	packed_prefill_through_the_contract_is_bit_exact
 poot-rocm-device	poot-rocm-device::parity	device	a_fused_row_scale_is_bitwise_the_unfused_block_on_rocm
+poot-rocm-device	poot-rocm-device::parity	device	a_narrowed_bf16_weight_matches_the_declared_oracle_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	adjusted_sampling_head_matches_the_oracle_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	alibi_slopes_attention_matches_the_oracle_and_the_reference_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	an_f16_overflow_stays_non_finite_on_rocm
@@ -4579,7 +4588,6 @@ poot-rocm-device	poot-rocm-device::parity	device	select_is_bitwise_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	split_kv_decode_matches_the_oracle_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	split_kv_decode_replay_equals_the_recording_step_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	state_pool_rows_reset_independently_on_rocm
-poot-rocm-device	poot-rocm-device::parity	device	the_driver_weight_format_matches_the_declared_oracle_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	the_range_detector_names_an_f16_overflow_on_rocm
 poot-rocm-device	poot-rocm-device::parity	device	two_byte_select_is_bitwise_on_rocm
 poot-rocm-device	poot-rocm-device::pcie_receipt	model-free	pcie_receipt_without_the_env_reaches_the_device_checks

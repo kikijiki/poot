@@ -725,24 +725,14 @@ fn a_grouped_bf16_projection_plans_one_grouped_dense_contraction_and_no_transpos
     }
 }
 
-/// POOT-1477: under the narrow policy the driver stores a grouped projection's BF16 weight as f16 like any dense
-/// weight: the contraction is the F16 grouped one over a weight declared F16 over the BF16 checkpoint, and the
-/// register-tiled body reads the packed f16 lane the weight value is planned in, on the devices with an f16 unit.
+/// POOT-1535: under the narrow policy a grouped projection keeps its BF16 checkpoint weight, whatever precision the
+/// planner gives the contraction: the op is the BF16 grouped one, and the register-tiled body reads the packed bf16
+/// lane the weight value is planned in, on the devices with an f16 unit.
 ///
-/// Mutation: in `planner/packed.rs` plan the grouped F16 arm's weight as `StorageKind::Bf16Packed`; the request
+/// Mutation: in `planner/packed.rs` plan the grouped arm's BF16 weight as `StorageKind::F16Packed`; the request
 /// and the weight value disagree and this row goes red.
 #[test]
-fn a_grouped_bf16_projection_is_declared_f16_under_narrow() {
-    let is_grouped_f16 = |op: &OpKind| {
-        matches!(
-            op,
-            OpKind::GroupedDenseContraction {
-                weight: DType::F16,
-                groups: GROUPS,
-                ..
-            }
-        )
-    };
+fn a_grouped_bf16_projection_keeps_its_checkpoint_weight_under_narrow() {
     let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD)
         .with_matmul_precision(MatmulPrecision::Narrow);
     // The devices whose matrix units report an f16 fragment: RADV, and ROCm with the gfx11 WMMA lowering.
@@ -767,28 +757,23 @@ fn a_grouped_bf16_projection_is_declared_f16_under_narrow() {
             let program = compile(&grouped_projection(m, |_, _, y| y), &target, &options)
                 .expect("the graph compiles");
             let label = format!("{backend:?} M={m}: {:?}", op_names(&program));
-            assert_eq!(count(&program, is_grouped_f16), 1, "{label}");
+            assert_eq!(count(&program, is_grouped_bf16), 1, "{label}");
             let (eqn, _) = program
                 .planned()
-                .find(|(eqn, _)| is_grouped_f16(&eqn.op))
+                .find(|(eqn, _)| is_grouped_bf16(&eqn.op))
                 .expect("the contraction is planned");
             let Operand::Value(weight) = eqn.inputs[1] else {
                 panic!("the weight operand is a value");
             };
-            let meta = program.graph().meta(weight);
-            assert_eq!(
-                (meta.aval.dtype, meta.stored_dtype()),
-                (DType::F16, DType::BF16),
-                "{label}"
-            );
-            match request(&program, is_grouped_f16) {
+            assert_eq!(program.graph().aval(weight).dtype, DType::BF16, "{label}");
+            match request(&program, is_grouped_bf16) {
                 KernelRequest::Contraction(ContractionSpec::DenseTiled(
                     DenseTiledContraction {
                         weight: DenseTiledWeight::Nk(named),
                         ..
                     },
                 )) => {
-                    assert_eq!(*named, BufferStorage::f16_packed(), "{label}");
+                    assert_eq!(*named, BufferStorage::bf16_packed(), "{label}");
                     assert_eq!(
                         *named,
                         program.storage().storage(weight).buffer_storage(),

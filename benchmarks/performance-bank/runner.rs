@@ -183,6 +183,10 @@ pub(crate) struct Prepared {
     pub(crate) graphs: Vec<Graph>,
     consts: Vec<(String, HostTensor)>,
     references: Vec<Vec<f64>>,
+    /// The reference per copy with the operands read exactly, for a case run under the `narrow` policy: the planner
+    /// chooses between its exact and narrowed schedules, so the output is held to the reference of the schedule it
+    /// chose ([`Measured::narrowed`]). `None` for a case that declares exact operands.
+    exact_references: Option<Vec<Vec<f64>>>,
     out_shape: Vec<usize>,
     /// The packed weights the graphs name, by store entry: a packed expert stack's experts are the entries
     /// `{stack const}.{expert}` (`ConstWeights` views them as one stack).
@@ -241,6 +245,7 @@ fn dense_matmul(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, S
         consts.push((name, HostTensor::f32(vec![k, n], w)));
     }
     Ok(Prepared {
+        exact_references: None,
         graphs,
         consts,
         references,
@@ -388,6 +393,7 @@ fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
         shape_json["live"] = json!(live);
     }
     Ok(Prepared {
+        exact_references: None,
         graphs: vec![graph],
         consts,
         references: vec![want],
@@ -469,6 +475,7 @@ fn dense_contraction(bank: &Value, case: &Value, ops: Operands) -> Result<Prepar
         consts.push((name, stored));
     }
     Ok(Prepared {
+        exact_references: None,
         graphs,
         consts,
         references,
@@ -627,6 +634,7 @@ fn grouped_experts(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared
         consts.push((name, stored));
     }
     Ok(Prepared {
+        exact_references: None,
         graphs,
         consts,
         references,
@@ -832,6 +840,7 @@ fn packed_grouped_experts(bank: &Value, case: &Value, ops: Operands) -> Result<P
         .map(|role| table.descriptor.slab_bytes(role))
         .sum();
     Ok(Prepared {
+        exact_references: None,
         graphs: vec![graph],
         consts: vec![("x".to_string(), HostTensor::f32(vec![tokens, k], x))],
         references: vec![want],
@@ -981,6 +990,7 @@ fn attention_prefill(bank: &Value, case: &Value) -> Result<Prepared, String> {
         .flat_map(|p| (p as i32).to_le_bytes())
         .collect();
     Ok(Prepared {
+        exact_references: None,
         graphs: vec![graph],
         consts: vec![
             ("q".into(), HostTensor::f32(vec![1, hq, lq, d], q)),
@@ -1114,6 +1124,7 @@ fn ssd_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
         )
         .unwrap();
     Ok(Prepared {
+        exact_references: None,
         graphs: vec![b.finish(scan.packed).unwrap()],
         consts: vec![
             ("x".into(), HostTensor::f32(x_ty, x)),
@@ -1216,6 +1227,7 @@ fn delta_rule_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
         )
         .unwrap();
     Ok(Prepared {
+        exact_references: None,
         graphs: vec![b.finish(scan.packed).unwrap()],
         consts: vec![
             ("q".into(), HostTensor::f32(sequence.clone(), q)),
@@ -1240,6 +1252,19 @@ fn delta_rule_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
 }
 
 pub(crate) fn prepare(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String> {
+    let mut prepared = prepare_reading(bank, case, ops)?;
+    if ops.narrow.is_some() {
+        let exact = Operands {
+            narrow: None,
+            ..ops
+        };
+        prepared.exact_references = Some(prepare_reading(bank, case, exact)?.references);
+    }
+    Ok(prepared)
+}
+
+/// [`prepare`] with the reference reading its operands as `ops` says.
+fn prepare_reading(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String> {
     let generator = &bank["token_fixtures"][case["token_fixture"]
         .as_str()
         .ok_or("case has no token_fixture")?]["generator"];
@@ -1291,6 +1316,15 @@ pub(crate) fn staged(
     .map_err(|e| format!("compile_staged: {e}"))
 }
 
+/// Whether any equation of `program` reads its operands narrowed or split: the planner's choice under the `narrow`
+/// policy, which keeps an op exact where a matrix unit does not win (POOT-1476).
+fn reads_narrowed(program: &StagedProgram) -> bool {
+    program
+        .stages()
+        .flat_map(|(_, _, p)| p.planned())
+        .any(|(eqn, _)| eqn.op.operand_precision().is_some_and(|p| !p.is_exact()))
+}
+
 /// The kernels the planner chose, in plan order: label (family, schedule, shape) and plan key.
 fn plan_of(program: &StagedProgram) -> Vec<String> {
     program
@@ -1328,6 +1362,9 @@ pub(crate) struct Measured {
     plan: Vec<String>,
     pub(crate) worst: f64,
     pub(crate) agrees: bool,
+    /// Whether the planner chose a narrowed operand read for any contraction or attention of the case; the output
+    /// was held to the reference and tolerance of the schedule chosen.
+    narrowed: bool,
     memory: Vec<Value>,
     recordings: u64,
     replays: u64,
@@ -1371,9 +1408,11 @@ where
         .map_err(|e| format!("load_weights: {e}"))?;
     let mut entries = Vec::new();
     let mut plan = Vec::new();
+    let mut narrowed = false;
     for g in &graphs {
         let program = staged(g, target, ops, &devices)?;
         plan = plan_of(&program);
+        narrowed |= reads_narrowed(&program);
         entries.push(
             exec.add_entry(exe, &program)
                 .map_err(|e| format!("add_entry: {e}"))?,
@@ -1413,7 +1452,13 @@ where
     // reference; those steps are warmup. Further warmup keeps the rotation going before the timed repeats.
     let mut worst = 0.0f64;
     let mut agrees = true;
-    for (copy, want) in prepared.references.iter().enumerate() {
+    // A case under the `narrow` policy is held to the reference of the schedule the planner chose: its operands
+    // rounded when it narrowed, read exactly when it kept the exact schedule.
+    let (references, tolerance) = match (&prepared.exact_references, narrowed) {
+        (Some(exact), false) => (exact, REFERENCE_TOLERANCE),
+        _ => (&prepared.references, ops.tolerance()),
+    };
+    for (copy, want) in references.iter().enumerate() {
         let (_, _, output) = step(copy)?;
         if output.shape() != prepared.out_shape.as_slice() {
             return Err(format!(
@@ -1423,17 +1468,17 @@ where
             ));
         }
         let got = output.as_f32().ok_or("the output is not F32")?;
-        let (err, ok) = reference_check(got, want, ops.tolerance());
+        let (err, ok) = reference_check(got, want, tolerance);
         worst = worst.max(err);
         agrees &= ok;
     }
     for index in 0..warmup {
-        step(prepared.references.len() + index)?;
+        step(references.len() + index)?;
     }
     let (mut wall_us, mut device_samples) =
         (Vec::with_capacity(repeats), Vec::with_capacity(repeats));
     for index in 0..repeats {
-        let (wall, device, _) = step(prepared.references.len() + warmup + index)?;
+        let (wall, device, _) = step(references.len() + warmup + index)?;
         wall_us.push(wall);
         device_samples.push(device);
     }
@@ -1458,6 +1503,7 @@ where
         plan,
         worst,
         agrees,
+        narrowed,
         memory,
         recordings: stats.recordings,
         replays: stats.replays,
@@ -1481,7 +1527,7 @@ where
     let prepared = prepare(bank, case, ops)?;
     let wall = measure(wall_device, bank, &prepared, ops)?;
     let timed = measure(timed_device, bank, &prepared, ops)?;
-    if timed.plan != wall.plan {
+    if timed.plan != wall.plan || timed.narrowed != wall.narrowed {
         return Err("the timed device realized a different plan than the wall device".into());
     }
     let digest = sha256_digest(wall.plan.join("\n").as_bytes()).as_bytes();
@@ -1518,7 +1564,8 @@ where
             "provenance": "independent-golden",
             "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
             "max_relative_error": wall.worst.max(timed.worst),
-            "tolerance": ops.tolerance(),
+            "narrowed": wall.narrowed,
+            "tolerance": if wall.narrowed { ops.tolerance() } else { REFERENCE_TOLERANCE },
             "agrees": wall.agrees && timed.agrees,
         },
         "memory": wall.memory,

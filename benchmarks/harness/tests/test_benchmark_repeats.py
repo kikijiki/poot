@@ -69,6 +69,8 @@ def bench_run(directory, results, *extra):
         mock.patch.object(sys, "argv", argv),
         mock.patch.object(bench, "capture_env", side_effect=lambda manifest: HOST_WITH_GPU),
         mock.patch.object(observer, "run_observed", side_effect=run_fixture_runner),
+        mock.patch.object(bench.thermal, "SysfsThermal", return_value=mock.Mock(sensors={})),  # no thermal source: not gated
+        mock.patch.object(bench.host_load, "wait_quiet", return_value=(True, 0.0, {"quiet": True})),  # the box under test is shared
         mock.patch("sys.stdout"),
         mock.patch("sys.stderr"),
     ):
