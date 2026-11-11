@@ -61,11 +61,12 @@ holds them, and every harness tool and the orchestrator resolve it the same way 
 
 - a run that records new sets (`bench run`, `bench index`, the orchestrator) writes to `$POOT_BENCH_RESULTS`, by default
   `benchmarks/results/` in this checkout (git-ignored), so a fresh sweep needs no setup;
-- a tool that reads the committed baseline (`perf_page.py`, `bench compare-committed` and so `just bench-compare` and
+- a tool that reads the committed baseline (`perf_page.py`, `performance_bank.py`, `bench compare-committed` and so `just bench-compare` and
   `just test-bench-harness`, and the harness tests) reads `$POOT_BENCH_RESULTS`, by default the archive: the first sibling
   directory of this repository that holds `projects/poot/benchmark-results`
   (`<repository parent>/*/projects/poot/benchmark-results`). `python3 benchmarks/harness/results_root.py` prints the path
-  it resolved.
+  it resolved. The bank's receipts, registry and ceilings are the `performance-bank` directory beside that results root, so
+  one archive checkout serves both.
 
 A baseline that cannot be found fails with every lookup it tried; nothing falls back to an empty result. To compare fresh
 sets with the baseline: `just bench-compare '' benchmarks/results/<run>-r1 ...`. To publish new sets, add the run
@@ -302,9 +303,11 @@ any layer. A layer no producer counts is `null` (Unknown) and makes the receipt 
 runner counts plan, entries and recordings and the artifact cache directory (`POOT_KERNEL_CACHE_DIR`), and
 reports the rest as Unknown. Pass `--prepared-state` to declare the state.
 
-`performance-bank/` is the checked-in small bank: `cases.json` defines each case (shape, storage, numerics,
+`performance-bank/` is the small bank's source: `cases.json` defines each case (shape, storage, numerics,
 token fixture, cache condition, schedules) once, for the validator and for the backend runners
-(`examples/performance_bank.rs` in `poot-wgpu-device`, `poot-rocm-device`, `poot-ptx-device`). `receipts.json` claims, per
+(`examples/performance_bank.rs` in `poot-wgpu-device`, `poot-rocm-device`, `poot-ptx-device`). The measured output
+(`receipts.json`, `receipts/`, `ceilings/`) is not in this repository: it is the `performance-bank` directory beside the
+results root of "Where the results live". `receipts.json` claims, per
 case and backend, a verified baseline receipt or the case as missing/refused with its reason; planned cases
 (packed decode, long recurrence, expert routing) stay explicit missing coverage until their producers land.
 
@@ -315,7 +318,7 @@ flock /tmp/poot-gpu.lock python3 harness/performance_bank.py --record dense-deco
     --wrap "poot-cargo nix develop -c"                    # measure on this device, register the receipt
 ```
 
-Receipts are hardware measurements under `performance-bank/receipts/<backend>/`, kept apart from the
+Receipts are hardware measurements under `receipts/<backend>/` of that directory, kept apart from the
 model-free fixtures in `harness/tests`. A receipt names the commit its binary was built from (the tree must be
 clean), the device and driver, the realized plan, the observed workload, and an independent f64 reference.
 A verified claim in `receipts.json` also states what it derives from its receipt: the repeats' `spread` and, for

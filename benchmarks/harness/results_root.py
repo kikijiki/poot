@@ -9,6 +9,10 @@ The result sets are not part of this repository. `POOT_BENCH_RESULTS` names the 
   tests) reads `$POOT_BENCH_RESULTS`, by default the archive: the first sibling directory of this repository that
   holds `projects/poot/benchmark-results` (`<repo parent>/*/projects/poot/benchmark-results`).
 
+The performance bank's measured output (`receipts/`, `receipts.json`, `ceilings/`) follows the same setting: it is the
+`performance-bank` directory beside the results root (`bank_root`), so one archive checkout serves both. The case
+definitions and runners stay in `benchmarks/performance-bank/`.
+
 A baseline that cannot be found fails with every lookup tried, never an empty result.
 """
 
@@ -19,6 +23,7 @@ ENV = "POOT_BENCH_RESULTS"
 BENCH_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = BENCH_ROOT.parent
 ARCHIVE_GLOB = "*/projects/poot/benchmark-results"
+BANK_DIR = "performance-bank"
 
 
 class ResultsRootMissing(Exception):
@@ -46,6 +51,19 @@ def committed_root():
             f"set ${ENV} to the directory holding the result sets, or put an archive checkout beside {REPO_ROOT}"
         )
     return found[0]
+
+
+def recording_bank_root():
+    """The directory a bank run writes its receipts and registry into: `performance-bank` beside the recording root."""
+    return recording_root().parent / BANK_DIR
+
+
+def committed_bank_root():
+    """The directory holding the committed bank receipts, registry and ceilings, which must exist."""
+    root = committed_root().parent / BANK_DIR
+    if not root.is_dir():
+        raise ResultsRootMissing(f"no committed bank receipts: {root} is not a directory (beside the results root)")
+    return root
 
 
 if __name__ == "__main__":

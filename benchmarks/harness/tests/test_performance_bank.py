@@ -1,4 +1,4 @@
-"""The checked-in performance bank: identities, claims and the receipt files that back them."""
+"""The performance bank: identities, claims and the receipt files that back them (measured output read from the results archive)."""
 
 import copy
 import hashlib
@@ -15,10 +15,15 @@ sys.path.insert(0, str(HARNESS_DIR))
 
 import performance_bank as bank  # noqa: E402
 import performance_receipt as pr  # noqa: E402
+import results_root  # noqa: E402
 
 
-def verified_pairs(root=bank.BANK_ROOT):
-    manifest = bank.load_json(Path(root) / "receipts.json")
+def committed_bank():
+    return results_root.committed_bank_root()
+
+
+def verified_pairs(root=None):
+    manifest = bank.load_json(Path(root or committed_bank()) / "receipts.json")
     return [(e["case"], e["backend"]) for e in manifest["entries"] if e["status"] == "verified"]
 
 
@@ -30,6 +35,7 @@ class BankRoot(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name) / "performance-bank"
         shutil.copytree(bank.BANK_ROOT, self.root)
+        shutil.copytree(committed_bank(), self.root, dirs_exist_ok=True)
 
     def cases(self):
         return bank.load_json(self.root / "cases.json")
@@ -71,7 +77,7 @@ class CheckedInBankTests(unittest.TestCase):
 
     def test_every_claimed_backend_of_every_case_has_a_claim(self):
         data = bank.load_json(bank.BANK_ROOT / "cases.json")
-        claims = {(e["case"], e["backend"]) for e in bank.load_json(bank.BANK_ROOT / "receipts.json")["entries"]}
+        claims = {(e["case"], e["backend"]) for e in bank.load_json(committed_bank() / "receipts.json")["entries"]}
         for case in data["cases"]:
             for backend in case["backends"]:
                 self.assertIn((case["id"], backend), claims)
@@ -107,14 +113,14 @@ class CheckedInBankTests(unittest.TestCase):
                 if (case["id"], backend) not in verified_pairs():
                     continue
                 with self.subTest(case=case["id"], backend=backend):
-                    receipt = bank.load_json(bank.BANK_ROOT / "receipts" / backend / f"{case['id']}.json")
+                    receipt = bank.load_json(committed_bank() / "receipts" / backend / f"{case['id']}.json")
                     self.assertEqual(bank.observed_errors(data, case, receipt["observed"]), [])
 
     def test_a_verified_receipt_compares_with_a_later_candidate_of_the_same_identity(self):
         pairs = verified_pairs()
         self.assertTrue(pairs, "this card records hardware baselines for the runnable cases")
         case, backend = pairs[0]
-        receipt = bank.load_json(bank.BANK_ROOT / "receipts" / backend / f"{case}.json")
+        receipt = bank.load_json(committed_bank() / "receipts" / backend / f"{case}.json")
         spec = {"cells": {"kernel": [bank.KERNEL_METRIC]}}
         samples = [r["metrics"][bank.KERNEL_METRIC] for r in receipt["cells"]["kernel"]["repeats"]]
         shift = 20 * sorted(samples)[len(samples) // 2]

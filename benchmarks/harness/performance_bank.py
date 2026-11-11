@@ -1,13 +1,15 @@
-"""The checked-in performance bank: case definitions, their identities and the receipts claimed for them.
+"""The performance bank: case definitions, their identities and the receipts claimed for them.
 
 `performance-bank/cases.json` defines every case (shape, storage, numerics, token fixture, cache condition,
-schedules) once, for both the Python validator and the Rust backend runners. `performance-bank/receipts.json`
-lists, per case and backend, what is claimed: a verified baseline receipt, or the case as missing or refused
+schedules) once, for both the Python validator and the Rust backend runners. `receipts.json`, in the bank's
+measured-output directory (`results_root.committed_bank_root`, not part of this repository), lists, per case and backend, what is claimed: a verified baseline receipt, or the case as missing or refused
 with its reason. `validate_bank` rebuilds every identity from the case definitions and refuses a claim the
 receipt files do not back; it never decides a speed verdict (that is `performance_receipt`).
 
-Hardware receipts live under `performance-bank/receipts/<backend>/`, apart from the model-free fixtures in
-`harness/tests`: a receipt is a measurement, a fixture is a deterministic synthetic sample.
+Hardware receipts live under `receipts/<backend>/` of that directory, apart from the model-free fixtures in
+`harness/tests`: a receipt is a measurement, a fixture is a deterministic synthetic sample. A function given one
+`root` treats it as a self-contained bank (definitions and measured output together); without one, the definitions
+come from the checkout and the measured output from the results setting.
 """
 
 import hashlib
@@ -20,8 +22,10 @@ from pathlib import Path
 
 try:
     from . import performance_receipt as receipts
+    from . import results_root
 except ImportError:  # direct execution from harness/
     import performance_receipt as receipts
+    import results_root
 
 BANK_ROOT = Path(__file__).resolve().parents[1] / "performance-bank"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -125,9 +129,9 @@ def stamps(bank, case):
     }
 
 
-def stamp_bank(root=BANK_ROOT):
+def stamp_bank(root=None):
     """Rewrite `cases.json` with the identities its definitions give (run after editing a case on purpose)."""
-    path = Path(root) / "cases.json"
+    path = Path(root or BANK_ROOT) / "cases.json"
     bank = load_json(path)
     for case in bank["cases"]:
         case.update(stamps(bank, case))
@@ -418,31 +422,31 @@ def device_identity():
     return env["gpu_name"], env["gpu_driver"] or f"host kernel {env['host_kernel']}"
 
 
-def record(case_id, backend, *, wrap=(), root=BANK_ROOT, repo=REPO_ROOT, device=None, run=subprocess.run):
+def record(case_id, backend, *, wrap=(), root=None, repo=REPO_ROOT, device=None, run=subprocess.run):
     """Measure `case_id` on `backend` with the checked-in command and register the receipt as verified.
 
     The tree must be clean: the receipt names the commit the measuring binary was built from. The runner
     reports what it executed; this completes the receipt from the case definition and refuses it when the
     two disagree or any validation fails, so a receipt that is written is one `validate_bank` accepts.
     """
-    root = Path(root)
-    bank = load_json(root / "cases.json")
+    cases_root, root = _roots(root, results_root.recording_bank_root)
+    bank = load_json(cases_root / "cases.json")
     case = next((c for c in bank["cases"] if c["id"] == case_id), None)
     if case is None or backend not in case.get("backends", []):
         raise SystemExit(f"{case_id} on {backend} is not a bank case")
-    # Receipts recorded earlier in the session are not source: they cannot change the binary's behavior.
-    bank_dir = Path(root).resolve().relative_to(Path(repo).resolve())
-    if _git("status", "--porcelain", "--", ".", f":(exclude){bank_dir}/receipts", f":(exclude){bank_dir}/receipts.json", repo=repo):
+    if _git("status", "--porcelain", repo=repo):
         raise SystemExit("the tree has uncommitted source changes: a receipt names the commit it was built from")
     name, driver = device or device_identity()
     if not (name and driver):
         raise SystemExit("this host reports no device or driver to name in the receipt")
 
     command = bank_command(bank, case, backend)
+    path = root / "receipts" / backend / f"{case_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    measured = [*command[:-1], str(path)]  # the claimed command names the bank-relative path; the run writes under `root`
     env = {**os.environ, "POOT_BANK_DEVICE": name, "POOT_BANK_DRIVER": driver}
-    run([*wrap, *command], cwd=repo, env=env, check=True)
+    run([*wrap, *measured], cwd=repo, env=env, check=True)
 
-    path = Path(repo) / command[command.index("--out") + 1]
     receipt = json.loads(path.read_text())
     hardware = receipt.pop("hardware")
     binary = Path(receipt.pop("binary"))
@@ -460,7 +464,7 @@ def record(case_id, backend, *, wrap=(), root=BANK_ROOT, repo=REPO_ROOT, device=
     path.write_text(json.dumps(receipt, indent=2) + "\n")
 
     manifest_path = root / "receipts.json"
-    manifest = load_json(manifest_path)
+    manifest = load_json(manifest_path) if manifest_path.exists() else {"schema": 1, "entries": []}
     previous = next((e for e in manifest["entries"] if (e["case"], e["backend"]) == (case_id, backend)), {})
     manifest["entries"] = [e for e in manifest["entries"] if (e["case"], e["backend"]) != (case_id, backend)]
     manifest["entries"].append(
@@ -480,19 +484,29 @@ def record(case_id, backend, *, wrap=(), root=BANK_ROOT, repo=REPO_ROOT, device=
     return path
 
 
-def validate_bank(root=BANK_ROOT):
-    """Every error in the checked-in bank and its receipt claims, case definitions first."""
-    root = Path(root)
-    bank = load_json(root / "cases.json")
+def _roots(root, default):
+    """`(definitions root, measured-output root)`: one self-contained `root`, else the checkout's definitions and
+    the measured output `default()` resolves."""
+    if root is not None:
+        return Path(root), Path(root)
+    return BANK_ROOT, default()
+
+
+def validate_bank(root=None):
+    """Every error in the bank and its receipt claims, case definitions first. Without `root` the receipts are read
+    from the committed bank of `results_root.py`, and fail loudly when it is missing."""
+    cases_root, root = _roots(root, results_root.committed_bank_root)
+    bank = load_json(cases_root / "cases.json")
     errors = bank_errors(bank)
     if errors:
         return errors
     return manifest_errors(bank, load_json(root / "receipts.json"), root)
 
 
-def coverage(root=BANK_ROOT):
+def coverage(root=None):
     """`{status: [(case, backend)]}` over the claims, so a report separates verified from missing/refused."""
-    manifest = load_json(Path(root) / "receipts.json")
+    _, root = _roots(root, results_root.committed_bank_root)
+    manifest = load_json(root / "receipts.json")
     found = {status: [] for status in CLAIM_STATUSES}
     for entry in manifest["entries"]:
         found.setdefault(entry["status"], []).append((entry["case"], entry["backend"]))
@@ -503,7 +517,7 @@ def main(argv=None):
     import argparse
 
     parser = argparse.ArgumentParser(description="validate the performance bank and its receipt claims")
-    parser.add_argument("--root", default=str(BANK_ROOT))
+    parser.add_argument("--root", help="a self-contained bank directory; default: the checkout's cases and the results setting's receipts")
     parser.add_argument("--stamp", action="store_true", help="rewrite the case identities after an intended edit")
     parser.add_argument("--record", nargs=2, metavar=("CASE", "BACKEND"), help="measure a case and register its receipt")
     parser.add_argument("--wrap", default="", help="command prefix for --record, one string, e.g. 'poot-cargo nix develop -c'")
@@ -521,4 +535,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except results_root.ResultsRootMissing as error:
+        raise SystemExit(f"performance_bank.py: {error}")

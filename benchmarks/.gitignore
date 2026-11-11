@@ -12,6 +12,10 @@ models/
 
 # the default recording root of a run (see harness/results_root.py): the committed sets live in the results archive
 results/
+# the bank's measured output, when a run records beside the default results root
+performance-bank/receipts/
+performance-bank/receipts.json
+performance-bank/ceilings/
 
 # sets with no ok row (see poot-orchestrator gather::failed_dir)
 failed-results/

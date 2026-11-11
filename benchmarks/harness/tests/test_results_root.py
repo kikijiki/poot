@@ -62,5 +62,26 @@ class CommittedRootTests(unittest.TestCase):
         self.assertEqual(results_root.recording_root(), self.parent / "out")
 
 
+    def test_the_bank_receipts_are_the_performance_bank_beside_the_results_root(self):
+        notes = self.parent / "notes" / "projects" / "poot"
+        (notes / "benchmark-results").mkdir(parents=True)
+        (notes / "performance-bank").mkdir()
+
+        self.assertEqual(results_root.committed_bank_root(), notes / "performance-bank")
+
+    def test_an_archive_without_the_bank_fails_naming_the_directory(self):
+        notes = self.parent / "notes" / "projects" / "poot"
+        (notes / "benchmark-results").mkdir(parents=True)
+
+        with self.assertRaisesRegex(results_root.ResultsRootMissing, "performance-bank is not a directory"):
+            results_root.committed_bank_root()
+
+    def test_a_bank_run_records_beside_the_recording_root(self):
+        self.assertEqual(results_root.recording_bank_root(), results_root.BENCH_ROOT / "performance-bank")
+        os.environ[results_root.ENV] = str(self.parent / "out" / "sets")
+
+        self.assertEqual(results_root.recording_bank_root(), self.parent / "out" / "performance-bank")
+
+
 if __name__ == "__main__":
     unittest.main()

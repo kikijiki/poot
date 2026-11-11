@@ -6,7 +6,7 @@ Two sources, nothing typed by hand:
 * every committed run set under the results root of `results_root.py` (`<run-id>-r1` ... `-rN`: `results.jsonl` and `env.json`),
   one cell per (hardware, model, scenario, framework, backend, precision): the median, minimum and maximum over
   the repeats of each metric, with the identity the rows state;
-* the performance bank's verified kernel receipts (`benchmarks/performance-bank/receipts.json`).
+* the performance bank's verified kernel receipts (`receipts.json` of the committed bank, see `results_root.py`).
 
 A run set is charted only when it passes the contract the harness itself applies: every row is attributable
 (`result_contract.committed_row_errors`), enough repeats ran, one binary produced them, every identity field
@@ -296,10 +296,14 @@ def collect_runs(results_dir, policy, hosts, known_path):
         entry["cells"].sort(key=lambda c: (c["model"], c["scenario"], c["series"], c["date"], c["set"]))
 
 
-def collect_kernels(bank_root):
-    """Every verified bank receipt as a `(device, kernel row)` pair, for the device it was measured on."""
+def collect_kernels(bank_root=None):
+    """Every verified bank receipt as a `(device, kernel row)` pair, for the device it was measured on. `bank_root`
+    is one self-contained bank; by default the cases come from the checkout and the receipts from the committed
+    bank of `results_root.py`."""
+    cases_root = Path(bank_root) if bank_root else bank.BANK_ROOT
+    bank_root = Path(bank_root) if bank_root else results_lookup.committed_bank_root()
     claims = bank.load_json(bank_root / "receipts.json")
-    cases = {case["id"]: case for case in bank.load_json(bank_root / "cases.json")["cases"]}
+    cases = {case["id"]: case for case in bank.load_json(cases_root / "cases.json")["cases"]}
     kernels = []
     for claim in claims["entries"]:
         if claim["status"] != "verified":
@@ -526,7 +530,7 @@ def not_run_cells(grid_path=grid.GRID, manifest_path=grid.MANIFEST):
     }
 
 
-def generate(results_dir=None, bank_root=bank.BANK_ROOT, known_path=None):
+def generate(results_dir=None, bank_root=None, known_path=None):
     """The page data from `results_dir`, by default the committed baseline of `results_root.py`."""
     policy = receipts.load_policy()
     hosts = {}
@@ -534,7 +538,7 @@ def generate(results_dir=None, bank_root=bank.BANK_ROOT, known_path=None):
         results_dir = results_lookup.committed_root()
         known_path = known_path or known_unverified.committed_path()
     collect_runs(Path(results_dir), policy, hosts, known_path)
-    classes = hardware_classes(hosts, collect_kernels(Path(bank_root)), declared_lengths())
+    classes = hardware_classes(hosts, collect_kernels(bank_root), declared_lengths())
     gaps = not_run_cells()
     return {
         "schema": SCHEMA,

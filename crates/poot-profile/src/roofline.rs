@@ -21,7 +21,8 @@ pub struct Ceiling {
     pub gb_per_s: f64,
     /// The hardware the number was measured on.
     pub device: &'static str,
-    /// The checked-in receipt of the measurement, a path relative to the repository root.
+    /// The receipt of the measurement, a path relative to the performance bank's measured-output directory (kept
+    /// outside the repository).
     pub receipt: &'static str,
 }
 
