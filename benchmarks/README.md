@@ -73,6 +73,8 @@ is under half the 10% noise band at the measured 0.35% per point, discards the a
 times; the row's `host_load` records the windows' mean and maximum, the load average and the number of discards with
 their loads. A cell that never runs quiet is an error row. Pinning the process to cores does not help and is not done.
 
+**Short passes.** A first-token pass under 2 s needs timed evidence for every framework (`harness/short_pass.py`): iterations spanning 20 s, or at least three flat to 10% of their median. The harness discards and reruns an attempt that has neither, and `bench short-passes` lists the committed points that predate the rule. llama.cpp's runner repeats a short pass for the window after discarding the suite's warm-up passes (its ROCm build stalls for seconds after loading while the kernel compacts memory; see `runners/llamacpp/run.py`).
+
 The metric definitions follow MLPerf Inference, vLLM `bench serve`, NVIDIA GenAI-Perf, and Anyscale LLMPerf.
 
 **Scenario `decode-curve`.** For each context length ISL in {128, 512, 2048, 8192, 16384, ...}, prefill

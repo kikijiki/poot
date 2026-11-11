@@ -204,7 +204,7 @@ SHORT_PASS_S = 2.0
 TIMED_WINDOW_S = 20.0
 # The pilot is a process's first pass, slower than the passes after it; sizing from it alone leaves the window short.
 PILOT_MARGIN = 1.15
-MAX_REPETITIONS = 100
+MAX_REPETITIONS = 2000
 
 
 def prefill_repetitions(pass_s, warmup, iters):

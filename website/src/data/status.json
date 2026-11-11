@@ -15,8 +15,8 @@
   ],
   "later": "Other hardware targets, deeper decode fusion, release packaging and an API stability promise.",
   "limitations": [
-    "Behind llama.cpp on the same backend on decode in every pair, from 1.03x to 3.5x slower.",
-    "Behind on first token in 25 of 37 cells, up to 3.2x slower.",
+    "Behind llama.cpp on the same backend on decode in every pair, from 1.04x to 3.6x slower.",
+    "Behind on first token in 26 of 37 cells, up to 3.5x slower.",
     "Ahead of llama.cpp on first token on the small qwen3 rows (RTX PRO 6000 PTX, Strix Halo ROCm); never against a different backend.",
     "Holds up to 1.5x the GPU memory of llama.cpp at inference.",
     "The benchmark grid is two machines and five models, with llama.cpp as the reference.",

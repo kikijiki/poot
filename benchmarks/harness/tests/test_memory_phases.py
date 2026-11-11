@@ -196,7 +196,7 @@ class StoredResultsTest(unittest.TestCase):
         self.assertGreater(got["inference"]["vram_bytes"], 90 * GIB)
 
     def test_llamacpp_flash_next_is_bounded_by_its_last_load(self):
-        got = phases.inferred_phases(self.stored("2026-10-26-rtx-pro-6000-blackwell-server-edition-qwen3-8-fla*-r1", "llamacpp"), 1)
+        got = phases.inferred_phases(self.stored("2026-11-10-rtx-pro-6000-blackwell-server-edition-qwen3-8-fla*-r1", "llamacpp"), 1)
         self.assertLess(got["inference"]["rss_bytes"], 10 * GIB)
         self.assertGreater(got["load"]["rss_bytes"], 40 * GIB)
 
