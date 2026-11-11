@@ -171,7 +171,7 @@ class KnownUnverifiedList(unittest.TestCase):
             self.load(toml_of(ENTRY, ENTRY))
 
     def test_the_committed_list_loads(self):
-        known_unverified.load(known_unverified.beside(bench.BENCH_ROOT / "results"))
+        known_unverified.load(known_unverified.committed_path())
 
 
 class KnownUnverifiedPage(unittest.TestCase):

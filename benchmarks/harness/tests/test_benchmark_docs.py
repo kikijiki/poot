@@ -2,6 +2,7 @@
 
 import json
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ sys.path.insert(0, str(HARNESS_DIR))
 
 import bench  # noqa: E402
 import known_unverified  # noqa: E402
+import results_root  # noqa: E402
 
 BENCH_ROOT = bench.BENCH_ROOT
 REPO_ROOT = BENCH_ROOT.parent
@@ -56,7 +58,10 @@ _EXTERNAL = {"convert_hf_to_gguf.py"}
 
 def exists(ref, doc=None):
     """A reference resolves against the benchmarks directory, its harness and setup scripts, the doc's own
-    directory (a runner's NOTES.md names its neighbours), or the repository root."""
+    directory (a runner's NOTES.md names its neighbours), or the repository root. A `results/...` path resolves in the
+    committed results root, which is not in the repository."""
+    if ref.startswith("results/"):
+        return (results_root.committed_root() / ref.removeprefix("results/")).exists()
     roots = [BENCH_ROOT, BENCH_ROOT / "harness", BENCH_ROOT / "setup", REPO_ROOT]
     if doc is not None:
         roots.append(doc.parent)
@@ -99,8 +104,8 @@ class NamedFilesExistTests(unittest.TestCase):
 
 class IndexTests(unittest.TestCase):
     def test_the_committed_index_is_the_index_the_results_generate(self):
-        results = BENCH_ROOT / "results"
-        regenerated = bench.render_index(bench.load_runs(results), known_unverified.load(known_unverified.beside(results)))
+        results = results_root.committed_root()
+        regenerated = bench.render_index(bench.load_runs(results), known_unverified.load(known_unverified.committed_path()))
 
         self.assertEqual(
             (results / "INDEX.md").read_text(),
@@ -109,7 +114,7 @@ class IndexTests(unittest.TestCase):
         )
 
     def test_the_index_lists_every_run_with_an_ok_row(self):
-        results = BENCH_ROOT / "results"
+        results = results_root.committed_root()
         index = (results / "INDEX.md").read_text()
         for run_id, _env, rows in bench.load_runs(results):
             if any(row.get("status") == "ok" for row in rows):
@@ -160,8 +165,10 @@ class PartialSetTests(unittest.TestCase):
         self.assertIn("failed-results/", ignore)
 
     def test_git_ignores_a_partial(self):
-        ignore = (BENCH_ROOT / ".gitignore").read_text().splitlines()
-        self.assertIn(f"results/*{bench.PARTIAL_SUFFIX}/", ignore)
+        """Mutation: drop `results/` from benchmarks/.gitignore and the mirror of a sweep in flight is untracked, not ignored."""
+        mirror = f"benchmarks/results/2026-10-22-gpu-m-000000-r2{bench.PARTIAL_SUFFIX}/results.jsonl"
+        ignored = subprocess.run(["git", "check-ignore", "-q", mirror], cwd=REPO_ROOT)
+        self.assertEqual(ignored.returncode, 0, f"git does not ignore {mirror}")
 
 
 if __name__ == "__main__":

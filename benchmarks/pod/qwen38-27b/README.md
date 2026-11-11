@@ -96,7 +96,7 @@ assumed from their documented formats: the first real run is the check).
 H100 SXM $3.99/h: **~$12-18** (expect ~$14). A100 SXM $1.79/h: ~$6-9. The keep-warm/keep window bills until the pod
 is deleted: delete by id as soon as `extract` succeeds. These are estimates, not measurements.
 
-## Run 1 findings (2026-10-18, H100, poot b00cb7feb; its snapshot `2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb` was removed from `benchmarks/results/` on 2026-10-20: recorded before the identity contract, it is in git history)
+## Run 1 findings (2026-10-18, H100, poot b00cb7feb; its snapshot `2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb` was removed from the committed results on 2026-10-20: recorded before the identity contract)
 
 - **poot PTX batch 1**: decode 8.2 tok/s (TPOT 122 ms, flat from ISL 128 to 8192), prefill ~35 tok/s (ISL 8192 = 234 s),
   peak 39.5 GiB. 122 ms per token for ~28 GB is ~230 GB/s of a ~3.35 TB/s card: a poot performance problem, not a
@@ -111,7 +111,7 @@ fit the engine's 4096 positions`), and the c4/c16/c32 cells at 1800 s each burne
 - **roofline `None`**: not a bug in the extraction. The runner reports `{kind: unknown, reason: "no pinned ceiling for
 this device"}` (no calibrated ceiling row for the H100 in `crates/poot-profile/data/ceilings.tsv`), and the fit is
   `unknown` (needs two points with different bytes per token). `summarize.py` now prints that reason.
-- `ingest.py` turns a sweep dir into a `results/<run-id>` snapshot through the harness's own result contract.
+- `ingest.py` turns a sweep dir into a `<run-id>` snapshot under the results root through the harness's own result contract.
 
 ## Run 2 findings (2026-10-18, H100, same poot build; snapshot `2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb-run2`, removed likewise, is in git history)
 

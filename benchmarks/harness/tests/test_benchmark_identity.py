@@ -16,6 +16,7 @@ sys.path.insert(0, str(HARNESS_DIR))
 
 import bench  # noqa: E402
 import performance_receipt as receipts  # noqa: E402
+import results_root  # noqa: E402
 from result_contract import (  # noqa: E402
     BUILD_IDENTITY_FIELDS,
     MEASUREMENT_IDENTITY_FIELDS,
@@ -25,7 +26,6 @@ from runner_fixtures import POOT_IDENTITY, run_fixture_runner, valid_single  # n
 from test_benchmark_compare import BASELINE, repeats, result_row  # noqa: E402
 from test_benchmark_manifest import refusing_runner, run_poot_cell  # noqa: E402
 
-RESULTS = bench.BENCH_ROOT / "results"
 REPO_ROOT = bench.BENCH_ROOT.parent
 
 # The identity a comparison must agree on, written out here so that dropping a field from
@@ -50,7 +50,7 @@ LOCAL_BACKENDS = ("wgpu", "rocm")
 def committed_poot_rows():
     return [
         (run.name, row)
-        for run in sorted(RESULTS.iterdir())
+        for run in sorted(results_root.committed_root().iterdir())
         if (run / "results.jsonl").is_file()
         for row in bench._load_rows(run)
         if row["framework"] == "poot"
@@ -128,7 +128,8 @@ class EnvironmentTests(unittest.TestCase):
 
 class DiagnosticRunTests(unittest.TestCase):
     def test_a_committed_diagnostic_run_is_profiled_and_never_a_committed_set(self):
-        diagnostics = RESULTS / bench.DIAGNOSTICS_DIR
+        committed = results_root.committed_root()
+        diagnostics = committed / bench.DIAGNOSTICS_DIR
         runs = [run for run in sorted(diagnostics.iterdir()) if (run / "results.jsonl").is_file()] if diagnostics.is_dir() else []
 
         self.assertTrue(runs, "no committed diagnostic run: the harness has never requested the device-time data")
@@ -139,8 +140,8 @@ class DiagnosticRunTests(unittest.TestCase):
                     self.assertIs(row["profiled"], True)
                     self.assertIn(row["device_time"]["kind"], ("measured", "unknown"))
                     self.assertTrue(committed_row_errors(row), "a profiled row must not pass as a committed result")
-        self.assertNotIn(bench.DIAGNOSTICS_DIR, {name for name in bench.committed_sets(RESULTS)})
-        self.assertFalse(any(run.parent == diagnostics for dirs in bench.committed_sets(RESULTS).values() for run in dirs))
+        self.assertNotIn(bench.DIAGNOSTICS_DIR, {name for name in bench.committed_sets(committed)})
+        self.assertFalse(any(run.parent == diagnostics for dirs in bench.committed_sets(committed).values() for run in dirs))
 
     def test_a_profiled_row_compares_only_with_a_profiled_one(self):
         profiled = [{**row, "profiled": True} for row in repeats(BASELINE)]
@@ -308,7 +309,7 @@ class BenchCompareRecipeTests(unittest.TestCase):
     def test_the_committed_results_are_a_verifiable_baseline(self):
         # The data gate `just test` runs through `test-bench-harness`, on the real measurements: a cell whose
         # robust band stays over its limit (a two-mode cell) fails it until it is re-recorded, by design.
-        done = self.recipe(RESULTS)
+        done = self.recipe("")  # the recipe's default: the committed baseline and its list of known-unverified cells
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn(receipts.WITHIN_NOISE, done.stdout)

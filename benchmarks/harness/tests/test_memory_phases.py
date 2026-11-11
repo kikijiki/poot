@@ -8,6 +8,7 @@ HARNESS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARNESS_DIR))
 
 import memory_phases as phases  # noqa: E402
+import results_root  # noqa: E402
 
 GIB = 2**30
 
@@ -180,9 +181,7 @@ class StoredResultsTest(unittest.TestCase):
     def stored(self, run_dir_glob, framework):
         import json
 
-        from bench import BENCH_ROOT
-
-        for path in sorted((BENCH_ROOT / "results").glob(f"{run_dir_glob}/results.jsonl")):
+        for path in sorted(results_root.committed_root().glob(f"{run_dir_glob}/results.jsonl")):
             for line in path.read_text().splitlines():
                 found = json.loads(line)
                 if found["framework"] == framework:

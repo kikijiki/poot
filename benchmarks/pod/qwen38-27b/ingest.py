@@ -1,4 +1,4 @@
-"""POOT-1184: turn a pod-sweep results directory into a committed benchmarks/results/<run-id>/ snapshot.
+"""POOT-1184: turn a pod-sweep results directory into a results snapshot, `<run-id>/` under the results root (harness/results_root.py).
 
 The poot curve goes through the harness's own `validate_runner_result` (the same contract `bench run` applies),
 so the row is exactly what `bench.py run` would have written; env.json carries the pod facts; the sweep's own

@@ -14,8 +14,9 @@ gap is recorded as a caveat in the results.
 
 ## Results + tracking progress over time
 
-Every run is a committed snapshot under `results/<run-id>/` (`env.json` + `results.jsonl` + `report.md`),
-and **`results/INDEX.md`** is the progress index. The report tool renders the degradation curve
+Every run is a snapshot under `results/<run-id>/` (`env.json` + `results.jsonl` + `report.md`),
+and **`results/INDEX.md`** is the progress index. The committed sets are kept outside this repository (see "Where the results
+live" below). The report tool renders the degradation curve
 (decode tokens/s and TPOT vs context length, per engine). `bench compare --baseline <runs> --candidate
 <runs>` decides whether a change moved a number: each side is 5 repeats of the same matrix (see "Compare two
 builds"). The index is generated from the snapshots: regenerate it with `bench index` after each new run;
@@ -50,8 +51,25 @@ benchmarks/
   docker/              the pre-baked image: Dockerfile (bakes the 5 engines, sm_80 + sm_86) + README
   flake.nix            a separate devshell with the image build/push tooling (podman, skopeo, gh, uv)
   justfile             image-build / image-smoke / harness commands (run in `nix develop`)
-  results/             committed run snapshots: results/<date>-<gpu>-<sha>/{env.json,results.jsonl,report.md}
+  results/             git-ignored recording root of a run: results/<date>-<gpu>-<sha>/{env.json,results.jsonl,report.md}
 ```
+
+## Where the results live
+
+The committed result sets are not part of this repository. One setting, `POOT_BENCH_RESULTS`, names the directory that
+holds them, and every harness tool and the orchestrator resolve it the same way (`harness/results_root.py`):
+
+- a run that records new sets (`bench run`, `bench index`, the orchestrator) writes to `$POOT_BENCH_RESULTS`, by default
+  `benchmarks/results/` in this checkout (git-ignored), so a fresh sweep needs no setup;
+- a tool that reads the committed baseline (`perf_page.py`, `bench compare-committed` and so `just bench-compare` and
+  `just test-bench-harness`, and the harness tests) reads `$POOT_BENCH_RESULTS`, by default the archive: the first sibling
+  directory of this repository that holds `projects/poot/benchmark-results`
+  (`<repository parent>/*/projects/poot/benchmark-results`). `python3 benchmarks/harness/results_root.py` prints the path
+  it resolved.
+
+A baseline that cannot be found fails with every lookup it tried; nothing falls back to an empty result. To compare fresh
+sets with the baseline: `just bench-compare '' benchmarks/results/<run>-r1 ...`. To publish new sets, add the run
+directories to the archive and regenerate `INDEX.md` and the Performance page (`just perf-page-regen`).
 
 ## The measurement contract (why the numbers are fair)
 
@@ -221,7 +239,7 @@ python3 harness/bench.py compare --baseline results/base-{1..5} --candidate resu
 
 `just bench-compare` runs this comparator over the committed results, the last committed set of each cell being the
 baseline: with no argument it compares that set with itself, which fails unless the set is a verifiable baseline (the
-model-free gate runs it), and `just bench-compare benchmarks/results <candidate run directories>` judges fresh
+model-free gate runs it), and `just bench-compare '' <candidate run directories>` judges fresh
 repeats against it. `bench run --repeats 5` writes the five run directories.
 
 A committed cell whose repeats stay unverified (a band over `max_uncertainty` that more repeats do not narrow) is
@@ -349,7 +367,7 @@ differently from a discrete GPU. On such a box:
 ```bash
 flock /tmp/poot-gpu.lock just bench-record wgpu     # 5 repeats of qwen2.5-0.5b decode-128 through the release runner
 flock /tmp/poot-gpu.lock just bench-record rocm
-python3 benchmarks/harness/bench.py index          # regenerate results/INDEX.md, then commit the run directories
+python3 benchmarks/harness/bench.py index          # regenerate results/INDEX.md, then move the run directories to the archive
 POOT_BENCH_BACKEND=rocm uv run bench run --framework poot --model qwen2.5-0.5b --diagnostic   # where the time goes
 ```
 

@@ -101,15 +101,16 @@ test-bench-harness: bench-compare
 # The noise-aware comparator (benchmarks/harness/bench.py compare-committed) on the committed results: the baseline is
 # the last committed set of each cell. With no candidate the set is compared with itself, which proves it is a
 # verifiable baseline (enough repeats, one binary, a band that excludes a practical loss) and fails the gate when it
-# is not; with candidate run directories (`just bench-compare benchmarks/results benchmarks/results/<run>-r1 ...`) it
-# judges them against that set. `results` is the directory holding the committed set. Exit 1: a regression or a failed
-# repeat; 2: a cell that cannot be verified.
-bench-compare results='benchmarks/results' *candidate:
-    python3 benchmarks/harness/bench.py compare-committed --results-dir {{results}} --candidate {{candidate}}
+# is not; with candidate run directories (`just bench-compare '' benchmarks/results/<run>-r1 ...`) it
+# judges them against that set. `results` is the directory holding the committed set; empty (the default) resolves it as
+# benchmarks/harness/results_root.py does ($POOT_BENCH_RESULTS, else the archive beside this repository). Exit 1: a
+# regression or a failed repeat; 2: a cell that cannot be verified.
+bench-compare results='' *candidate:
+    python3 benchmarks/harness/bench.py compare-committed --results-dir '{{results}}' --candidate {{candidate}}
 
 # Record the dense cell of one local backend: 5 repeats of qwen3-0.6b decode-128 through the release runner, one run
-# directory per repeat under benchmarks/results/. Holds the GPU: run it as `flock /tmp/poot-gpu.lock just
-# bench-record wgpu`, with the box otherwise idle, and commit the directories with `bench index` regenerated.
+# directory per repeat under $POOT_BENCH_RESULTS (benchmarks/results/ by default). Holds the GPU: run it as `flock /tmp/poot-gpu.lock just
+# bench-record wgpu`, with the box otherwise idle, and move the directories to the archive with `bench index` regenerated.
 bench-record backend model='qwen3-0.6b' scenario='decode-128':
     #!/usr/bin/env bash
     set -euo pipefail
@@ -651,7 +652,7 @@ docs-fix:
 grid-check *args:
     python3 benchmarks/harness/grid.py check {{args}}
 
-# rewrite website/src/data/performance.json, the data of the Performance pages, from benchmarks/results and the performance bank
+# rewrite website/src/data/performance.json, the data of the Performance pages, from the committed results and the performance bank
 # (`test-bench-harness` fails when the committed file differs from what the generator derives)
 perf-page-regen:
     python3 benchmarks/harness/perf_page.py

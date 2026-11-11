@@ -4205,6 +4205,7 @@ poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_download_fet
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_f16_gguf_is_made_only_for_a_llamacpp_model_that_downloads_as_safetensors
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_opening_reap_spares_the_idle_pod_a_reuse_names
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_periodic_gather_step_faults_a_pod_that_lost_its_gpu
+poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_results_root_follows_the_setting_else_the_checkout
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_resumed_sweep_skips_the_repeats_already_gathered
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_stored_status_says_whether_the_pod_was_lost_or_had_a_host_fault
 poot-orchestrator	poot-orchestrator	model-free	workflow::tests::the_sweep_command_passes_the_cell_and_repeats_and_exports_no_provenance

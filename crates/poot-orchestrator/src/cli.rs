@@ -358,9 +358,6 @@ pub(crate) struct RunArgs {
     /// skip building the poot runner; use this prebuilt binary.
     #[arg(long)]
     pub(crate) poot_bin: Option<String>,
-    /// git add + commit the new snapshot(s) when done.
-    #[arg(long)]
-    pub(crate) commit: bool,
     /// build + validate config, but do not touch RunPod.
     #[arg(long)]
     pub(crate) dry_run: bool,

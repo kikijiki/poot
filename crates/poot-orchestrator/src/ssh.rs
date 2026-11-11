@@ -368,10 +368,10 @@ mod tests {
                 "203.0.113.7",
                 2222,
                 "/opt/benchmarks/results/run-1-2-m",
-                "benchmarks/results/"
+                "out/"
             ),
             "ssh -i /keys/id -p 2222 root@203.0.113.7\n\
-             scp -r -i /keys/id -P 2222 root@203.0.113.7:/opt/benchmarks/results/run-1-2-m benchmarks/results/"
+             scp -r -i /keys/id -P 2222 root@203.0.113.7:/opt/benchmarks/results/run-1-2-m out/"
         );
     }
 

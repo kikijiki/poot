@@ -55,7 +55,7 @@ pub(crate) struct ScanGeometry {
 /// SSD's one-barrier alternating-plane reduction was measured against one lane per column on wgpu, ROCm and
 /// PTX at 4096 steps (3.9x to 4.8x) and at 512 steps (3.6x to 4.5x), and was indistinguishable from it at
 /// 64 steps and on a device-filling head count, where the rule plans the same launch (POOT-1112 bank cases,
-/// `candidates/POOT-1112`). The rule reads the shapes and device limits only.
+/// the POOT-1112 candidate runs). The rule reads the shapes and device limits only.
 pub(crate) fn scan_geometry(layout: &ScanLayout, caps: &DeviceCaps) -> Option<ScanGeometry> {
     let rows = layout.state_rows;
     debug_assert!(rows > 0, "a scan layout has at least one state row");

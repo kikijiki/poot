@@ -42,16 +42,16 @@ def entry_key(entry):
     return tuple(entry.get(field) for field in KEY_FIELDS)
 
 
-def beside(results_dir):
-    """The list of the results directory: `known-unverified.toml` next to it (`benchmarks/known-unverified.toml`)."""
-    return Path(results_dir).parent / FILE_NAME
+def committed_path():
+    """The committed list: `benchmarks/known-unverified.toml`."""
+    return Path(__file__).resolve().parent.parent / FILE_NAME
 
 
 def load(path):
-    """The listed exceptions as `{cell key: entry}`, checked for completeness; an absent file lists nothing."""
-    path = Path(path)
-    if not path.exists():
+    """The listed exceptions as `{cell key: entry}`, checked for completeness; no path or an absent file lists nothing."""
+    if path is None or not Path(path).exists():
         return {}
+    path = Path(path)
     with open(path, "rb") as f:
         entries = tomllib.load(f).get("cell", [])
     errors, found = [], {}

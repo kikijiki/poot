@@ -1,7 +1,7 @@
 # poot docs website
 
 The poot documentation site, built with [Docusaurus](https://docusaurus.io/): getting started,
-architecture, usage, and examples (`docs/`). Benchmark results live under `../benchmarks/results`.
+architecture, usage, and examples (`docs/`). Benchmark results are kept outside this repository; see `../benchmarks/README.md`.
 
 ## Structure
 

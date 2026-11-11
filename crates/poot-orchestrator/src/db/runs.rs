@@ -541,8 +541,8 @@ impl Db {
         Ok(())
     }
 
-    /// The results-snapshot dirs this run produced, each a `benchmarks/results/<dir>`: every repeat of every
-    /// model's sweep (see [`Run::model_snapshot_dirs`]). Used by the dashboard's Results tab and the commit message.
+    /// The results-snapshot dirs this run produced, each a `<dir>` of the results root: every repeat of every
+    /// model's sweep (see [`Run::model_snapshot_dirs`]). Used by the dashboard's Results tab.
     pub(crate) fn snapshot_dirs(&self, run_id: &str) -> Result<Vec<String>> {
         let repeats: u32 = self
             .conn

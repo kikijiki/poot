@@ -4,7 +4,7 @@
 The repository's own docs/ directory holds a few files; project notes live outside this repository, so a comment that
 points at `docs/updates/...` or `docs/<name>.md` is a dangling reference. Only repo-root `docs/` paths are
 checked: `website/docs/...` and other prefixed paths are not (the lookbehind rejects any path character before
-`docs/`). website/ and benchmarks/results/ are skipped, as in `just docs-check`.
+`docs/`). website/ is skipped, as in `just docs-check`.
 
 usage: scripts/check-docs-paths.py [--self-test]
 """
@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 REFERENCE = re.compile(r"(?<![\w./-])docs/[\w./*-]*?\.md\b")
-SKIPPED = ("website/", "benchmarks/results/")
+SKIPPED = ("website/",)
 
 
 def dangling(text: str, exists) -> list[str]:

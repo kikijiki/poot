@@ -6,8 +6,8 @@ A local, resumable runner for poot benchmark sweeps on rented RunPod GPUs. It ru
 2. **provision** a RunPod GPU pod (cycling the GPU types and both clouds, waiting for capacity for as long as it takes),
 3. **set it up** (upload the binary, sync the current harness, `hf download` each model, convert GGUFs),
 4. **sweep** the decode-curve scenario per model, in `tmux` on the pod, streaming live progress,
-5. **gather** the result sets back into `benchmarks/results/`, each as soon as the harness finishes it (the
-   Docusaurus dashboard auto-ingests that dir), regenerate `results/INDEX.md`, optionally commit,
+5. **gather** the result sets back into the results root (`$POOT_BENCH_RESULTS`, by default the git-ignored
+   `benchmarks/results/`; see `benchmarks/README.md`), each as soon as the harness finishes it, regenerate `results/INDEX.md`,
 6. **tear the pod down** - always, even on failure.
 
 It is a CLI you run locally in `nix develop`, which provides `cargo`/`pootc` to build the runner and
@@ -51,14 +51,14 @@ right; a peer that is alive is not an orphan.
 ```sh
 export RUNPOD_API_KEY=...                      # a RunPod API key (pod create/terminate)
 
-# full sweep of all poot-supported models at HEAD, commit the snapshots:
-cargo run -p poot-orchestrator --release -- run --commit
+# full sweep of all poot-supported models at HEAD:
+cargo run -p poot-orchestrator --release -- run
 
 # specific models / GPU / ref:
 cargo run -p poot-orchestrator --release -- run --models qwen2.5-0.5b,qwen3-0.6b --gpu-types "NVIDIA GeForce RTX 3090"
 cargo run -p poot-orchestrator --release -- run --git-ref v0.3.0          # builds that ref from a clean worktree
 
-# five repeats of the matrix per model (`<run-id>-r1` .. `-r5` under benchmarks/results/), the baseline `bench compare` wants:
+# five repeats of the matrix per model (`<run-id>-r1` .. `-r5` under the results root), the baseline `bench compare` wants:
 cargo run -p poot-orchestrator --release -- run --models qwen2.5-0.5b --repeats 5
 
 # build + validate config without touching RunPod:
@@ -90,7 +90,7 @@ Fire it in the background and it will keep going; re-run the same `run` command 
 Key flags (see `run --help` for all): `--git-ref`, `--models`, `--scenario`, `--gpu-types` (tried in
 order), `--cloud` (COMMUNITY/SECURE/ALL), `--image`, `--ssh-key`, `--repeats`, `--give-up-after-min`,
 `--max-replacements`, `--reuse-pod`, `--sweep-timeout-s`, `--keep-pod` (release the pod to idle; a later
-`run` with the same image adopts it, or `--reuse-pod` names it; `reap` leaves it alone and its pod-side TTL ends it), `--poot-bin` (skip the build), `--commit`,
+`run` with the same image adopts it, or `--reuse-pod` names it; `reap` leaves it alone and its pod-side TTL ends it), `--poot-bin` (skip the build),
 `--dry-run`.
 
 - `--give-up-after-min N` ends the wait for capacity after N minutes: the run is `cancelled`, naming the GPU
@@ -229,19 +229,19 @@ While a model sweeps, the orchestrator asks the pod about every two minutes whic
 each one into a staging directory under `benchmarks/.orchestrator/`. A copy is checked with the harness's own
 identity rule (`result_contract.committed_row_errors`); a set that fails it is moved to
 `benchmarks/.orchestrator/rejected/` and reported, never left in `results/`. A set that passes is moved into
-`benchmarks/results/` under the name every committed set has, `<date>-<gpu>-<model>-<time>-r<N>`: the date and
+the results root under the name every committed set has, `<date>-<gpu>-<model>-<time>-r<N>`: the date and
 time are when the set started, the GPU slug comes from the set's `env.json`, as `bench.py` names a run directory.
 A pod lost mid-sweep therefore costs only the repeat in flight, a multi-model run has model A's sets local while
 model B runs, and `bench index` accepts the sets as gathered. The perf page needs at least 5 repeats per set.
 
 A set with no `ok` row (every cell errored) would break the harness rule that every indexed run measured
-something, so it is gathered into `benchmarks/failed-results/<same name>/` instead (git-ignored, never read by
+something, so it is gathered into `failed-results/<same name>/` beside the results root instead (git-ignored, never read by
 `bench index`, the perf page or `compare-committed`); a set that mixes `ok` and `error` rows stays in `results/`,
 where the harness handles error rows. A failed set counts as gathered, so a resume does not run it again.
 
 **Live results.** About every 20 s of a sweep the run process reads the rows the pod has so far (the harness
 appends one per finished cell) and mirrors them, with `env.json` once it exists, into
-`benchmarks/results/<committed name>.partial/`, replacing the previous copy. A `.partial` directory is not a set:
+`<committed name>.partial/` in the results root, replacing the previous copy. A `.partial` directory is not a set:
 the harness tools skip it (`bench.PARTIAL_SUFFIX`), git ignores it, and it is removed when the complete set is
 gathered. The run process also keeps the harness's latest `[progress]` line (`isl N done (k/4)`, ETA) in
 `benchmarks/.orchestrator/progress/<run id>.txt`. `serve` only reads these files and the DB.

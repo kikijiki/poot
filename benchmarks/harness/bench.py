@@ -56,6 +56,7 @@ try:
     from . import memory_phases
     from . import page_cache
     from . import performance_receipt as receipts
+    from . import results_root as results_lookup
     from .result_contract import (
         BUILD_IDENTITY_FIELDS,
         CURVE_KIND,
@@ -72,6 +73,7 @@ except ImportError:  # direct `python harness/bench.py` execution
     import memory_phases
     import page_cache
     import performance_receipt as receipts
+    import results_root as results_lookup
     from result_contract import (
         BUILD_IDENTITY_FIELDS,
         CURVE_KIND,
@@ -559,7 +561,7 @@ def cmd_run(args):
         sys.exit("bench run: no models directory: pass --models-dir or set POOT_MODELS_DIR")
 
     sys.path.insert(0, str(HERE))  # so run_cell can import observer
-    results_root = Path(args.results_dir or (BENCH_ROOT / "results"))
+    results_root = Path(args.results_dir or results_lookup.recording_root())
     if args.diagnostic:
         # Device timing perturbs submission: a profiled row is stored where `index`, `compare` and the
         # committed-set check never read it.
@@ -795,7 +797,7 @@ def render_index(runs, known=()):
 
 def cmd_short_passes(args):
     """List the short prefill passes of the committed results whose timed iterations are not evidence (short_pass.py)."""
-    results_dir = Path(args.results_dir or (BENCH_ROOT / "results"))
+    results_dir = committed_results_dir(args)
     found = short_pass.uncovered(load_runs(results_dir))
     for run_id, row, point, window_s, spread in found:
         print(f"{run_id}\t{row['framework']}/{row.get('backend') or '-'}\t{row['model']}\tisl={point['isl']}"
@@ -806,9 +808,9 @@ def cmd_short_passes(args):
 
 def cmd_index(args):
     """Scan every results/<run>/ snapshot into results/INDEX.md."""
-    results_dir = Path(args.results_dir or (BENCH_ROOT / "results"))
+    results_dir = Path(args.results_dir or results_lookup.recording_root())
     runs = load_runs(results_dir)
-    text = render_index(runs, known_unverified.load(known_unverified.beside(results_dir)))
+    text = render_index(runs, known_unverified.load(known_unverified.committed_path()))
     (results_dir / "INDEX.md").write_text(text)
     print(f"wrote {results_dir / 'INDEX.md'} ({len(runs)} run(s))")
     print(text)
@@ -853,8 +855,20 @@ def last_committed_set(results_dir):
     return [d for name in chosen for d in sets[name]], rows
 
 
+def committed_results_dir(args):
+    """`--results-dir`, else the committed baseline of `results_root.py`; a baseline that is missing ends the command.
+    Only the committed baseline carries the committed list of known-unverified cells: a directory named by
+    `--results-dir` is judged on its own rows unless `--known-unverified` names a list."""
+    if args.results_dir:
+        return Path(args.results_dir)
+    try:
+        return results_lookup.committed_root()
+    except results_lookup.ResultsRootMissing as error:
+        sys.exit(f"bench {args.cmd}: {error}")
+
+
 def cmd_compare_committed(args):
-    results_dir = Path(args.results_dir or (BENCH_ROOT / "results"))
+    results_dir = committed_results_dir(args)
     baseline_dirs, baseline_rows = last_committed_set(results_dir)
     if not baseline_rows:
         sys.exit(f"bench compare-committed: no committed run under {results_dir}")
@@ -867,7 +881,7 @@ def cmd_compare_committed(args):
         # Only the committed set judged against itself is a statement about the set; a candidate's band is
         # also the candidate's, so the exceptions say nothing about it.
         cells = known_unverified.apply(
-            cells, known_unverified.load(args.known_unverified or known_unverified.beside(results_dir)),
+            cells, known_unverified.load(args.known_unverified or (None if args.results_dir else known_unverified.committed_path())),
             lambda key: _compare_cell(key, None, None, policy))
     print(render_compare(baseline_dirs, candidate_dirs, cells))
     return compare_exit_code(cells)

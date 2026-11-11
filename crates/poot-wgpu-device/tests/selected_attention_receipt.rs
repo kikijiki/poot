@@ -4,7 +4,7 @@
 //! query heads over 2 key/value heads of 256, 128K stored positions, 512 blocks of four selected). The test
 //! prints the TSV lines of `poot_executor_parity::selected_attention::print_receipt` and asserts only that the
 //! device measured every fixture; the numbers are recorded in
-//! `benchmarks/performance-bank/candidates/POOT-1143`.
+//! the POOT-1143 candidate outputs, kept outside this repository.
 
 use std::num::NonZeroUsize;
 

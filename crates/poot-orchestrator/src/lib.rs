@@ -2,7 +2,7 @@
 //!
 //! Builds the poot runner from a git ref, provisions a GPU pod (with retry), sets it up (binary,
 //! harness, models, GGUFs), runs the decode-curve sweep per model in tmux, copies the result snapshots
-//! into benchmarks/results/ (which the Docusaurus dashboard ingests), and always tears the pod down.
+//! into the results root (`POOT_BENCH_RESULTS`, default benchmarks/results/), and always tears the pod down.
 //!
 //! Every phase and per-model flag is committed to a SQLite run-state DB, so a crash resumes. The sweep
 //! runs in tmux on the pod and keeps going while the orchestrator is down; resume reattaches. The pod id

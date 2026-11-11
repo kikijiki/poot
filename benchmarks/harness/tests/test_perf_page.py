@@ -127,7 +127,7 @@ class PerfPageTest(unittest.TestCase):
             (Path(tmp) / "known-unverified.toml").write_text(text)
             with tempfile.TemporaryDirectory() as bank_dir:
                 write_bank(bank_dir)
-                return perf_page.generate(results, bank_dir)["hardware"]
+                return perf_page.generate(results, bank_dir, Path(tmp) / "known-unverified.toml")["hardware"]
 
     def test_an_unverified_host_does_not_move_the_median_of_a_verified_class_point(self):
         (cls,) = self.classes_with_noisy_host(listed=True)
@@ -153,7 +153,7 @@ class PerfPageTest(unittest.TestCase):
             (Path(tmp) / "known-unverified.toml").write_text(entries)
             with tempfile.TemporaryDirectory() as bank_dir:
                 write_bank(bank_dir)
-                (cls,) = perf_page.generate(results, bank_dir)["hardware"]
+                (cls,) = perf_page.generate(results, bank_dir, Path(tmp) / "known-unverified.toml")["hardware"]
 
         (point,) = cls["points"]
         self.assertFalse(point["verified"])

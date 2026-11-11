@@ -31,7 +31,6 @@ use tiny_http::{Header, Method, Response, Server};
 use crate::clock::{now_secs, secs_from_iso};
 use crate::db::{Db, Pod};
 use crate::logging::{list_logs, log, log_kind_and_state, read_log_tail, spawn_image_build};
-use crate::workflow::repo_root;
 
 mod derive;
 
@@ -55,10 +54,8 @@ pub(crate) fn serve(db: Db, addr: &str) -> Result<()> {
     let server = Server::http(addr).map_err(|e| anyhow!("bind {addr}: {e}"))?;
     log(format!("dashboard on http://{addr}  (Ctrl-C to stop)"));
 
-    // `benchmarks/results` of the checkout `serve` runs from; the run process writes the sets and their mirrors there.
-    let results_dir = repo_root()
-        .ok()
-        .map(|root| root.join("benchmarks").join("results"));
+    // The results root of the checkout `serve` runs from; the run process writes the sets and their mirrors there.
+    let results_dir = crate::workflow::results_dir().ok();
     let verifier = derive::spawn_verifier();
     let mut log_cache = derive::LogCache::default();
     for mut req in server.incoming_requests() {

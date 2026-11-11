@@ -1346,7 +1346,7 @@ pub(crate) fn cmd_run(db: Db, state_db: String, a: RunArgs) -> Result<()> {
                 host,
                 *port,
                 &format!("{}/run-*", gather::POD_RESULTS),
-                "benchmarks/results/"
+                &format!("{}/", results_dir()?.display())
             )
         ));
     }
@@ -1835,7 +1835,7 @@ fn run_phases(live: &mut LiveRun<'_>) -> Result<()> {
     cursor.set(None, "gather");
     gather(db, run, models, &ep)?;
 
-    postprocess(run, db, a)?;
+    postprocess()?;
     Ok(())
 }
 
@@ -3023,9 +3023,19 @@ fn sweep_run_id(db: &Db, run: &Run, model: &str) -> Result<String> {
     Ok(format!("{}-{model}", db.set_id(&run.id)?))
 }
 
-/// The local `benchmarks/results` directory.
-fn results_dir() -> Result<PathBuf> {
-    Ok(repo_root()?.join("benchmarks").join("results"))
+/// The environment variable naming the results root; the harness resolves the same setting (`results_root.py`).
+const RESULTS_ENV: &str = "POOT_BENCH_RESULTS";
+
+/// The local results root: `$POOT_BENCH_RESULTS`, else the git-ignored `benchmarks/results` of the checkout.
+pub(crate) fn results_dir() -> Result<PathBuf> {
+    Ok(results_dir_in(
+        &repo_root()?,
+        std::env::var_os(RESULTS_ENV).filter(|setting| !setting.is_empty()),
+    ))
+}
+
+fn results_dir_in(repo: &Path, setting: Option<std::ffi::OsString>) -> PathBuf {
+    setting.map_or_else(|| repo.join("benchmarks").join("results"), PathBuf::from)
 }
 
 /// One incremental gather pass over `dirs`: the complete sets on the pod that are not yet local are copied,
@@ -3368,38 +3378,15 @@ fn gather(db: &Db, run: &Run, models: &[Model], ep: &ssh::Endpoint) -> Result<()
     Ok(())
 }
 
-fn postprocess(run: &Run, db: &Db, a: &RunArgs) -> Result<()> {
+fn postprocess() -> Result<()> {
     let bench = repo_root()?.join("benchmarks");
-    log("regenerating results/INDEX.md (the dashboard auto-ingests benchmarks/results/)");
+    log("regenerating results/INDEX.md");
     let _ = sh(
         std::process::Command::new("uv")
             .args(["run", "bench", "index"])
             .current_dir(&bench),
         "bench index",
     );
-    if a.commit {
-        let results = results_dir()?;
-        let rids: Vec<String> = db
-            .snapshot_dirs(&run.id)?
-            .into_iter()
-            .filter_map(|pod_dir| gather::local_set(&results, &pod_dir))
-            .collect();
-        let repo = repo_root()?;
-        let _ = sh(
-            std::process::Command::new("git")
-                .args(["add", "benchmarks/results/"])
-                .current_dir(&repo),
-            "git add",
-        );
-        let msg = format!("bench: sweep snapshot(s) {}", rids.join(", "));
-        let _ = sh(
-            std::process::Command::new("git")
-                .args(["commit", "-q", "-m", &msg])
-                .current_dir(&repo),
-            "git commit",
-        );
-        log(format!("committed {} snapshot(s)", rids.len()));
-    }
     Ok(())
 }
 
@@ -6775,5 +6762,21 @@ frameworks.llamacpp = { support = true, precision = "f16" }
             std::fs::write(dir.join(file), r#"{"gpu_name":"NVIDIA GeForce RTX 3090"}"#).unwrap();
         }
         assert_eq!(extension_set(&tmp, set, &models).unwrap(), set);
+    }
+
+    /// The results root is `$POOT_BENCH_RESULTS` when it is set, else `benchmarks/results` of the checkout; the harness's
+    /// recording tools (`results_root.py`) resolve the same setting. Mutation: ignore the setting and the
+    /// first assertion is red.
+    #[test]
+    fn the_results_root_follows_the_setting_else_the_checkout() {
+        let repo = Path::new("/work/poot");
+        assert_eq!(
+            results_dir_in(repo, Some("/data/sets".into())),
+            Path::new("/data/sets")
+        );
+        assert_eq!(
+            results_dir_in(repo, None),
+            Path::new("/work/poot/benchmarks/results")
+        );
     }
 }

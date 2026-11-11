@@ -3,7 +3,7 @@
 
 Two sources, nothing typed by hand:
 
-* every committed run set under `benchmarks/results` (`<run-id>-r1` ... `-rN`: `results.jsonl` and `env.json`),
+* every committed run set under the results root of `results_root.py` (`<run-id>-r1` ... `-rN`: `results.jsonl` and `env.json`),
   one cell per (hardware, model, scenario, framework, backend, precision): the median, minimum and maximum over
   the repeats of each metric, with the identity the rows state;
 * the performance bank's verified kernel receipts (`benchmarks/performance-bank/receipts.json`).
@@ -32,10 +32,10 @@ import known_unverified  # noqa: E402
 import memory_phases as phases  # noqa: E402
 import performance_bank as bank  # noqa: E402
 import performance_receipt as receipts  # noqa: E402
+import results_root as results_lookup  # noqa: E402
 from result_contract import committed_row_errors  # noqa: E402
 
 REPO_ROOT = HARNESS_DIR.parents[1]
-RESULTS_DIR = bench.BENCH_ROOT / "results"
 OUTPUT = REPO_ROOT / "website" / "src" / "data" / "performance.json"
 
 SCHEMA = 6
@@ -526,10 +526,14 @@ def not_run_cells(grid_path=grid.GRID, manifest_path=grid.MANIFEST):
     }
 
 
-def generate(results_dir=RESULTS_DIR, bank_root=bank.BANK_ROOT, known_path=None):
+def generate(results_dir=None, bank_root=bank.BANK_ROOT, known_path=None):
+    """The page data from `results_dir`, by default the committed baseline of `results_root.py`."""
     policy = receipts.load_policy()
     hosts = {}
-    collect_runs(Path(results_dir), policy, hosts, known_path or known_unverified.beside(results_dir))
+    if results_dir is None:  # the committed baseline, with the committed list of its known-unverified cells
+        results_dir = results_lookup.committed_root()
+        known_path = known_path or known_unverified.committed_path()
+    collect_runs(Path(results_dir), policy, hosts, known_path)
     classes = hardware_classes(hosts, collect_kernels(Path(bank_root)), declared_lengths())
     gaps = not_run_cells()
     return {
@@ -548,7 +552,10 @@ def main():
     parser.add_argument("--check", action="store_true", help="exit 1 when the committed JSON differs from the derived one")
     parser.add_argument("--output", type=Path, default=OUTPUT)
     args = parser.parse_args()
-    text = render(generate())
+    try:
+        text = render(generate())
+    except results_lookup.ResultsRootMissing as error:
+        sys.exit(f"perf_page.py: {error}")
     if args.check:
         if not args.output.exists() or args.output.read_text() != text:
             sys.exit(f"{args.output} differs from what perf_page.py derives; run `just perf-page-regen`")
