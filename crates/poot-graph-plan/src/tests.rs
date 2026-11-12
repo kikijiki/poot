@@ -3682,7 +3682,7 @@ const LAUNCH_PROVENANCE: &[Provenance] = &[
     prov(
         "MIN_KEYS_PER_SPLIT",
         128,
-        "design bound, not swept: a shorter chunk leaves a workgroup's lanes idle and the launch is the combine's overhead",
+        "design bound, not swept: a shorter share leaves a workgroup's lanes idle and the launch is the combine's overhead",
     ),
     prov(
         "TILED_MAX_ROWS",
@@ -5308,7 +5308,11 @@ fn the_split_kv_plan_records_the_exact_resources_of_both_launches() {
     let (lanes, splits) = (64usize, 8usize);
     assert_eq!(
         attention_spec(&choice).schedule,
-        kg::AttentionSchedule::SplitKv { lanes, splits }
+        kg::AttentionSchedule::SplitKv {
+            lanes,
+            splits,
+            min_units: 128
+        }
     );
     let Plan::Dispatches(dispatches) = &plan else {
         panic!("a dispatching plan: {plan:?}");

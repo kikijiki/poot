@@ -10,9 +10,14 @@
 #                                                          the table of the production planner's choice against the
 #                                                          retired 32-row switch
 #   scripts/calibrate-launch rocm|wgpu packed [out-dir]    every tiling of a routed projection over a packed expert stack
-#                                                          (a packed_grouped_experts bank case) from a short prompt to a
-#                                                          long one, exact and narrow, and the model's choices scored
-#                                                          against them; reports a fit, writes no figure (POOT-1505)
+#                                                          (a packed_grouped_experts bank case) at 128, 512 and 2048
+#                                                          tokens, exact and narrow, and the per-row Gemv, one row each
+#                                                          with the dispatches timed one by one (POOT-1505, POOT-1547)
+#   scripts/calibrate-launch rocm|wgpu dense [out-dir]     the same rows for dense prefill projections and one-row
+#                                                          vocabulary-head decodes (POOT-1547)
+#   scripts/calibrate-launch rocm fragment [out-dir]       both packed cases (IQ2_XS up, IQ4_NL down) and the dense
+#                                                          cells in one hold: the rows benchmarks/calibration/<device>.tsv
+#                                                          is made of, which fit_fragment_cost.py there fits
 #   scripts/calibrate-launch rocm|wgpu|ptx gemv [out-dir]  the dense decode Gemv's columns per workgroup, every power of
 #                                                          two up to 16 pinned over output counts from a launch that
 #                                                          starves the device to one that floods it (POOT-1490)
@@ -20,8 +25,8 @@
 # CALIBRATE_LAUNCH_BIN names a prebuilt example binary (the script then builds nothing), and CALIBRATE_LAUNCH_LOCKED=1
 # says the caller already holds the GPU lock and the heavy lock (gpu first), so one hold can cover several runs.
 set -euo pipefail
-backend="${1:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed [out-dir]}"
-mode="${2:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed [out-dir]}"
+backend="${1:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed|dense|fragment [out-dir]}"
+mode="${2:?usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed|dense|fragment [out-dir]}"
 out="${3:-calibrate-launch-$backend-$mode}"
 mkdir -p "$out"
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -64,7 +69,22 @@ packed)
   while IFS=$'\t' read -r tokens precision tiling; do
     "$bin" packed-measure --bank "$bank" --case "$case_id" --tokens "$tokens" --precision "$precision" --tiling "$tiling" >>"$rows"
   done <"$out/cells.tsv"
-  "$bin" packed-fit --rows "$rows" --out "$out/entry.rs"
+  ;;
+dense)
+  "$bin" dense-cells --bank "$bank" >"$out/cells.tsv"
+  while IFS=$'\t' read -r shape precision tiling; do
+    "$bin" dense-measure --bank "$bank" --shape "$shape" --precision "$precision" --tiling "$tiling" >>"$rows"
+  done <"$out/cells.tsv"
+  ;;
+fragment)
+  # The corpus of POOT-1547: the packed cases and the dense cells, one hold. The committed file adds the cell, K and
+  # the rows to each of these rows (see its header).
+  for case_id in expert-prefill-packed-iq2xs-up expert-prefill-packed-iq4nl-down; do
+    CALIBRATE_LAUNCH_CASE="$case_id" CALIBRATE_LAUNCH_BIN="$bin" CALIBRATE_LAUNCH_LOCKED=1 "$0" "$backend" packed "$out/$case_id"
+  done
+  CALIBRATE_LAUNCH_BIN="$bin" CALIBRATE_LAUNCH_LOCKED=1 "$0" "$backend" dense "$out/dense"
+  echo "rows are in $out/*/rows.tsv; join them into benchmarks/calibration/<device>.tsv and run" >&2
+  echo "python3 -I benchmarks/calibration/fit_fragment_cost.py --check" >&2
   ;;
 gemv)
   "$bin" gemv-cells >"$out/cells.tsv"
@@ -74,7 +94,7 @@ gemv)
   "$bin" gemv-fit --rows "$rows" --out "$out/entry.rs"
   ;;
 *)
-  echo "usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed [out-dir]" >&2
+  echo "usage: calibrate-launch rocm|wgpu|ptx tilings|indexed|gemv|packed|dense|fragment [out-dir]" >&2
   exit 2
   ;;
 esac

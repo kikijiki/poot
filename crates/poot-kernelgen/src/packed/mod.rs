@@ -6,6 +6,7 @@
 //! `M > 1` (card 658: every `M > 1` block-diagonal split too, never `Schedule::Serial`, deleted).
 
 mod decode_plan;
+mod family;
 // `crate::helpers::WeightLane` (Card 1007) reads a packed F16 dense weight through the same float
 // decode every packed body uses, rather than restating the binary16 layout.
 pub(crate) mod float_decode;
@@ -13,6 +14,9 @@ mod indexed;
 mod kernel;
 mod planar;
 mod source;
+
+#[cfg(test)]
+mod identity_tests;
 
 pub use indexed::packed_run_held_registers;
 pub(crate) use kernel::packed_contraction;
@@ -133,6 +137,7 @@ mod fixtures {
     use poot_quant::format::{
         BlockLayout, FieldEncoding, FloatFormat, OperandRole, Storage, ValueMap, WeightFormat,
     };
+    use poot_quant::test_support::formats::GGUF_FORMATS;
 
     use crate::contraction::{RunLength, Schedule, TileSize};
     use crate::microtile::{LaneRows, MicroCols};
@@ -227,38 +232,40 @@ mod fixtures {
         },
     ];
 
-    pub(super) const BLOCK32: [WeightFormat; 7] = [
-        WeightFormat::Q4_0,
-        WeightFormat::Q4_1,
-        WeightFormat::Q5_0,
-        WeightFormat::Q5_1,
-        WeightFormat::Q8_0,
-        WeightFormat::Iq4_Nl,
-        WeightFormat::Mxfp4,
-    ];
+    /// The block formats of 32 values (`Q4_0` to `Q8_0`, `IQ4_NL`, MXFP4), from the shared format list.
+    pub(super) fn block32() -> Vec<WeightFormat> {
+        gguf_blocks_of(32)
+    }
 
-    /// The 256-value super-block formats (`blocks::QK_K`): the six K-quants and `IQ4_XS` of card 542b
-    /// (packed 6-bit `SubScale`/`SubMin` sub-factors: Q2_K, Q4_K, Q5_K two-piece each; Q3_K, IQ4_XS
-    /// `SubScale` two-piece; Q6_K `SubScale` one piece) and the three lattice quants `IQ2_XS`/`IQ3_XXS`/`IQ3_S`,
-    /// whose decode reads a constant table and a `Signs` field.
-    pub(super) const KQUANT: [WeightFormat; 9] = [
-        WeightFormat::Q2_K,
-        WeightFormat::Q3_K,
-        WeightFormat::Q4_K,
-        WeightFormat::Q5_K,
-        WeightFormat::Q6_K,
-        WeightFormat::Iq4_Xs,
-        WeightFormat::Iq2_Xs,
-        WeightFormat::Iq3_Xxs,
-        WeightFormat::Iq3_S,
-    ];
+    /// The 256-value super-block formats (`blocks::QK_K`): the five K-quants, `IQ4_XS` and the three sign
+    /// lattices, whose decode reads packed 6-bit `SubScale`/`SubMin` sub-factors, or a constant table and a
+    /// `Signs` field. From the shared format list.
+    pub(super) fn kquant() -> Vec<WeightFormat> {
+        gguf_blocks_of(256)
+    }
 
-    /// The lattice quants, which decode through a constant grid table and a `Signs` field.
-    pub(super) const LATTICE: [WeightFormat; 3] = [
-        WeightFormat::Iq2_Xs,
-        WeightFormat::Iq3_Xxs,
-        WeightFormat::Iq3_S,
-    ];
+    /// The lattice quants with a sign pattern, which decode through a constant grid table and a `Signs` field.
+    pub(super) fn lattice() -> Vec<WeightFormat> {
+        kquant()
+            .into_iter()
+            .filter(|format| {
+                matches!(
+                    format.descriptor().value,
+                    ValueMap::Lattice(lattice) if lattice.signs.is_some()
+                )
+            })
+            .collect()
+    }
+
+    /// The GGUF block formats of `values` values per block, in ggml order.
+    fn gguf_blocks_of(values: usize) -> Vec<WeightFormat> {
+        GGUF_FORMATS
+            .into_iter()
+            .filter(|format| {
+                matches!(format.descriptor().storage, Storage::Blocks(layout) if layout.values == values)
+            })
+            .collect()
+    }
 
     /// xorshift64 bytes, exactly `plan.rs`'s own fixture generator (card 539a): deterministic and
     /// covers every bit pattern of every field.
@@ -373,7 +380,7 @@ mod fixtures {
     /// modulo 16 (16-value runs for `IQ2_XS`, 32-value runs for `IQ3_XXS`). `d` is 1.0.
     pub(super) fn every_grid_point(format: WeightFormat) -> (usize, usize, Vec<u8>, Vec<f32>) {
         let descriptor = format.descriptor();
-        let (Storage::Blocks(layout), ValueMap::SignedGrid(grid)) =
+        let (Storage::Blocks(layout), ValueMap::Lattice(grid)) =
             (descriptor.storage, descriptor.value)
         else {
             panic!("{format:?} is not a lattice format");
@@ -412,7 +419,7 @@ mod fixtures {
         pub(super) expected: Vec<f32>,
     }
 
-    /// Every [`KQUANT`] format over random blocks (rows `[3, 0, 4, 3]` of five), and every [`LATTICE`]
+    /// Every [`kquant`] format over random blocks (rows `[3, 0, 4, 3]` of five), and every [`lattice`]
     /// format over [`every_grid_point`] blocks (all rows, reversed).
     pub(super) fn kquant_gather_cases() -> Vec<GatherCase> {
         let select = |decoded: &[f32], k: usize, ids: &[u32]| -> Vec<f32> {
@@ -425,7 +432,7 @@ mod fixtures {
                 .collect()
         };
         let mut cases = Vec::new();
-        for (seed, format) in KQUANT.into_iter().enumerate() {
+        for (seed, format) in kquant().into_iter().enumerate() {
             let (k, bytes, decoded) = fixture(format, 5, 2, seed as u64);
             let ids = vec![3, 0, 4, 3];
             let expected = select(&decoded, k, &ids);
@@ -438,7 +445,7 @@ mod fixtures {
                 expected,
             });
         }
-        for format in LATTICE {
+        for format in lattice() {
             let (rows, k, bytes, decoded) = every_grid_point(format);
             let ids: Vec<u32> = (0..rows as u32).rev().collect();
             let expected = select(&decoded, k, &ids);
@@ -529,8 +536,9 @@ mod planar_fixtures {
     use std::num::NonZeroUsize;
 
     use poot_quant::format::{
-        FieldEncoding, FloatFormat, GroupMap, OperandRole, ScaleEncoding, WeightFormat,
+        FieldEncoding, FloatFormat, GroupMap, PlanarRole, ScaleEncoding, WeightFormat,
     };
+    use poot_quant::test_support::formats::SAFETENSORS_FORMATS;
     use poot_quant::{PackedWeight, SourceRole};
 
     use crate::StagedTerms;
@@ -540,29 +548,6 @@ mod planar_fixtures {
     fn nz(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).unwrap()
     }
-
-    /// The six `E4M3` scale encodings (card 542c): per-channel and 128x128-block, each F32, BF16 and
-    /// E8M0.
-    pub(super) const E4M3: [WeightFormat; 6] = [
-        WeightFormat::E4m3PerChannel {
-            scale: ScaleEncoding::F32,
-        },
-        WeightFormat::E4m3PerChannel {
-            scale: ScaleEncoding::Bf16,
-        },
-        WeightFormat::E4m3PerChannel {
-            scale: ScaleEncoding::E8m0,
-        },
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::F32,
-        },
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::Bf16,
-        },
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::E8m0,
-        },
-    ];
 
     pub(super) fn gptq_contiguous() -> WeightFormat {
         WeightFormat::Gptq {
@@ -581,12 +566,21 @@ mod planar_fixtures {
         WeightFormat::Awq { group_size: nz(8) }
     }
 
-    /// Every planar format SC-001 (card 542c) names: the six E4M3 scale encodings, E2M1 row-32,
-    /// GPTQ contiguous and act-order, and AWQ.
+    /// Every planar format SC-001 (card 542c) names, from the shared format list: the six E4M3 scale encodings,
+    /// E2M1 row-32, GPTQ contiguous and act-order, and AWQ, with the small groups these fixtures' `K` holds.
     pub(super) fn every_planar_format() -> Vec<WeightFormat> {
-        E4M3.into_iter()
-            .chain([WeightFormat::E2m1Row32])
-            .chain([gptq_contiguous(), gptq_indexed(2), awq()])
+        SAFETENSORS_FORMATS
+            .into_iter()
+            .map(|format| match format {
+                WeightFormat::Gptq {
+                    groups: GroupMap::Contiguous { .. },
+                } => gptq_contiguous(),
+                WeightFormat::Gptq {
+                    groups: GroupMap::Indexed { .. },
+                } => gptq_indexed(2),
+                WeightFormat::Awq { .. } => awq(),
+                other => other,
+            })
             .collect()
     }
 
@@ -674,7 +668,7 @@ mod planar_fixtures {
                 let SourceRole::Planar(operand_role) = role else {
                     unreachable!("format tests: every planar source is SourceRole::Planar")
                 };
-                let bytes = if operand_role == OperandRole::GroupIndex {
+                let bytes = if operand_role == PlanarRole::GroupIndex {
                     let WeightFormat::Gptq {
                         groups: GroupMap::Indexed { groups },
                     } = format
@@ -699,7 +693,7 @@ mod planar_fixtures {
                 (role, bytes)
             })
             .collect();
-        let source_refs: Vec<(OperandRole, &[u8])> = sources
+        let source_refs: Vec<(PlanarRole, &[u8])> = sources
             .iter()
             .map(|(role, bytes)| {
                 let SourceRole::Planar(operand_role) = role else {
@@ -823,7 +817,7 @@ mod row_gather_tests {
     use poot_kernel_ir::interp::{Buffer, run};
     use poot_kernel_ir::test_support::workgroups_covering;
 
-    use super::fixtures::{BLOCK32, GatherCase, KQUANT, fixture, kquant_gather_cases, pack_words};
+    use super::fixtures::{GatherCase, block32, fixture, kquant, kquant_gather_cases, pack_words};
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_kernel};
 
     /// POOT-1317: the row gather's block address and bit offset are `usize` arithmetic with no 32-bit step, so
@@ -908,7 +902,7 @@ mod row_gather_tests {
 
     #[test]
     fn row_gather_bodies_compile_for_kquant_spirv_and_nvptx() {
-        for format in KQUANT {
+        for format in kquant() {
             let spec = PackedKernelSpec {
                 format,
                 op: PackedKernelOp::RowGather,
@@ -925,7 +919,7 @@ mod row_gather_tests {
         let arch = poot_target::AmdArch::gfx1151();
         // False once the AMD toolchain proved absent: the SPIR-V and NVPTX compiles still run.
         let mut amd = true;
-        for format in KQUANT {
+        for format in kquant() {
             let spec = PackedKernelSpec {
                 format,
                 op: PackedKernelOp::RowGather,
@@ -1015,7 +1009,7 @@ mod row_gather_tests {
         let blocks_per_row = 2;
         let ids: [u32; 4] = [3, 0, 4, 3];
         let ids_i32: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
-        for (seed, format) in BLOCK32.into_iter().enumerate() {
+        for (seed, format) in block32().into_iter().enumerate() {
             let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
             let expected: Vec<f32> = ids
                 .iter()
@@ -1062,7 +1056,7 @@ mod row_gather_tests {
     /// (`row_gather_<format>_spv`/`_ptx`) for the PTX pod batch (SC-004).
     #[test]
     fn row_gather_bodies_compile_for_spirv_and_nvptx() {
-        for format in BLOCK32 {
+        for format in block32() {
             let spec = PackedKernelSpec {
                 format,
                 op: PackedKernelOp::RowGather,
@@ -1079,7 +1073,7 @@ mod row_gather_tests {
         let arch = poot_target::AmdArch::gfx1151();
         // False once the AMD toolchain proved absent: the SPIR-V and NVPTX compiles still run.
         let mut amd = true;
-        for format in BLOCK32 {
+        for format in block32() {
             let spec = PackedKernelSpec {
                 format,
                 op: PackedKernelOp::RowGather,
@@ -1117,7 +1111,7 @@ mod row_gather_tests {
         let blocks_per_row = 2;
         let ids: [u32; 4] = [3, 0, 4, 3];
         let ids_i32: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
-        for (seed, format) in BLOCK32.into_iter().enumerate() {
+        for (seed, format) in block32().into_iter().enumerate() {
             let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
             let expected: Vec<f32> = ids
                 .iter()
@@ -1182,7 +1176,7 @@ mod contraction_tests {
     use poot_kernel_ir::test_support::workgroups_covering;
 
     use super::fixtures::{
-        BLOCK32, GEMV_SCHEDULES, KQUANT, assert_close, contraction_fixture, pack_words,
+        GEMV_SCHEDULES, assert_close, block32, contraction_fixture, kquant, pack_words,
         register_tiled, schedule_tag,
     };
     use super::kernel::packed_contraction;
@@ -1298,7 +1292,7 @@ mod contraction_tests {
             *conversions == poot_target::RoundingConversions::NONE
                 || precision.fragment_dtype() == Some(FragmentDtype::F16)
         }) {
-            for format in BLOCK32.into_iter().chain(KQUANT) {
+            for format in block32().into_iter().chain(kquant()) {
                 // Two blocks per row with a hand-made tiling, and eight (K = 256 for the 32-value formats) with the
                 // tiling the planner's cost model picks for the shape.
                 for (blocks_per_row, m, planned) in [(2, 5, false), (8, 4, true)] {
@@ -1422,7 +1416,7 @@ mod contraction_tests {
     #[test]
     fn a_vector_activation_read_matches_the_scalar_read_bit_for_bit() {
         let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-        for format in BLOCK32.into_iter().chain(KQUANT) {
+        for format in block32().into_iter().chain(kquant()) {
             for scalar in GEMV_SCHEDULES {
                 let Schedule::Gemv {
                     width,
@@ -1490,7 +1484,7 @@ mod contraction_tests {
 
     #[test]
     fn contraction_gemv_matches_reference_blocks_1_and_2() {
-        for format in BLOCK32 {
+        for format in block32() {
             for schedule in GEMV_SCHEDULES {
                 run_case(format, schedule, 1, 1, 11);
                 run_case(format, schedule, 2, 1, 5);
@@ -1500,7 +1494,7 @@ mod contraction_tests {
 
     #[test]
     fn contraction_gemv_matches_reference_blocks_1_and_2_kquant() {
-        for format in KQUANT {
+        for format in kquant() {
             for schedule in GEMV_SCHEDULES {
                 run_case(format, schedule, 1, 1, 11);
                 run_case(format, schedule, 2, 1, 5);
@@ -1651,7 +1645,7 @@ mod contraction_tests {
     /// tiles_per_block`, fixed per workgroup), so this test's `blocks == 1` cases stay green unchanged.
     #[test]
     fn contraction_tiled_matches_reference_aligned_and_ragged() {
-        for format in BLOCK32.into_iter().chain(KQUANT) {
+        for format in block32().into_iter().chain(kquant()) {
             run_case(format, register_tiled(2, 32), 1, 4, 4);
             run_case(format, register_tiled(2, 32), 1, 7, 7);
             run_case(format, register_tiled(2, 32), 1, 8, 8);
@@ -1675,7 +1669,7 @@ mod contraction_tests {
     /// block 1's weight into some of block 2's rows, and this test goes red.
     #[test]
     fn contraction_tiled_matches_reference_block_diagonal_ragged() {
-        for format in BLOCK32.into_iter().chain(KQUANT) {
+        for format in block32().into_iter().chain(kquant()) {
             run_case(format, register_tiled(2, 32), 3, 7, 5);
         }
     }
@@ -1704,7 +1698,7 @@ mod contraction_tests {
             (x_groups as usize) * (y_groups as usize) > tiles,
             "the fold must dispatch at least one padding workgroup for this to be a real test"
         );
-        for format in BLOCK32.into_iter().chain(KQUANT) {
+        for format in block32().into_iter().chain(kquant()) {
             let (k, bytes, activation, expected) =
                 contraction_fixture(format, blocks, m_per_block, out_per_block);
             let schedule = register_tiled(tile, 32);
@@ -1758,7 +1752,7 @@ mod contraction_tests {
         let arch = poot_target::AmdArch::gfx1151();
         // False once the AMD toolchain proved absent: the SPIR-V and NVPTX compiles still run.
         let mut amd = true;
-        for format in BLOCK32 {
+        for format in block32() {
             for schedule in GEMV_SCHEDULES {
                 let name = format!("contraction_{format:?}_{}", schedule_tag(schedule));
                 let body = packed_contraction(
@@ -1793,7 +1787,7 @@ mod contraction_tests {
         let arch = poot_target::AmdArch::gfx1151();
         // False once the AMD toolchain proved absent: the SPIR-V and NVPTX compiles still run.
         let mut amd = true;
-        for format in KQUANT {
+        for format in kquant() {
             for schedule in GEMV_SCHEDULES {
                 let name = format!("contraction_kquant_{format:?}_{}", schedule_tag(schedule));
                 let body = packed_contraction(
@@ -1817,7 +1811,7 @@ mod contraction_tests {
                 amd = amd && crate::unit_helpers::compile_amdgcn_or_skip(&name, &body, arch, &out);
             }
         }
-        for format in BLOCK32.into_iter().chain(KQUANT) {
+        for format in block32().into_iter().chain(kquant()) {
             let schedule = register_tiled(2, 32);
             let name = format!("contraction_{format:?}_{}", schedule_tag(schedule));
             let body = packed_contraction(
@@ -1927,7 +1921,7 @@ mod contraction_tests {
                 return;
             }
         };
-        for format in BLOCK32 {
+        for format in block32() {
             for schedule in GEMV_SCHEDULES {
                 run_wgpu_case(&ctx, format, schedule, 1, 1, 11);
                 run_wgpu_case(&ctx, format, schedule, 2, 1, 5);
@@ -1947,7 +1941,7 @@ mod contraction_tests {
                 return;
             }
         };
-        for format in KQUANT {
+        for format in kquant() {
             for schedule in GEMV_SCHEDULES {
                 run_wgpu_case(&ctx, format, schedule, 1, 1, 11);
                 run_wgpu_case(&ctx, format, schedule, 2, 1, 5);
@@ -1970,7 +1964,7 @@ mod contraction_tests {
                 return;
             }
         };
-        for format in BLOCK32.into_iter().chain(KQUANT) {
+        for format in block32().into_iter().chain(kquant()) {
             run_wgpu_case(&ctx, format, register_tiled(2, 32), 1, 4, 4);
             run_wgpu_case(&ctx, format, register_tiled(2, 32), 1, 7, 7);
         }
@@ -1994,7 +1988,7 @@ mod contraction_tests {
                 return;
             }
         };
-        for format in BLOCK32.into_iter().chain(KQUANT) {
+        for format in block32().into_iter().chain(kquant()) {
             run_wgpu_case(&ctx, format, register_tiled(2, 32), 3, 7, 5);
         }
     }
@@ -2034,7 +2028,7 @@ mod contraction_tests {
             (x_groups as usize) * (y_groups as usize) >= tiles,
             "the folded grid must address every tile"
         );
-        for format in BLOCK32.into_iter().chain(KQUANT) {
+        for format in block32().into_iter().chain(kquant()) {
             let (k, bytes, activation, expected) =
                 contraction_fixture(format, blocks, m_per_block, out_per_block);
             let schedule = register_tiled(tile, 32);
@@ -2343,7 +2337,7 @@ mod rocm_tests {
     use poot_target::ElementKind;
 
     use super::fixtures::{
-        BLOCK32, GEMV_SCHEDULES, GatherCase, KQUANT, assert_close, contraction_fixture, fixture,
+        GEMV_SCHEDULES, GatherCase, assert_close, block32, contraction_fixture, fixture, kquant,
         kquant_gather_cases, pack_words, register_tiled, schedule_tag,
     };
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_contraction, packed_kernel};
@@ -2496,7 +2490,7 @@ mod rocm_tests {
         let out_rows = 5;
         let blocks_per_row = 2;
         let ids: [u32; 4] = [3, 0, 4, 3];
-        for (seed, format) in BLOCK32.into_iter().enumerate() {
+        for (seed, format) in block32().into_iter().enumerate() {
             let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
             let expected: Vec<f32> = ids
                 .iter()
@@ -2654,7 +2648,7 @@ mod rocm_tests {
             run: crate::contraction::RunLength::dividing(k),
             depth: 32,
         };
-        for format in BLOCK32.into_iter().chain(KQUANT) {
+        for format in block32().into_iter().chain(kquant()) {
             for precision in [
                 OperandPrecision::Narrow(FragmentDtype::Bf16),
                 OperandPrecision::Split(FragmentDtype::Bf16),
@@ -2697,7 +2691,7 @@ mod rocm_tests {
         else {
             return;
         };
-        for format in BLOCK32 {
+        for format in block32() {
             for schedule in GEMV_SCHEDULES {
                 run_contraction_case(&ctx, format, schedule, 1, 1, 11);
                 run_contraction_case(&ctx, format, schedule, 2, 1, 5);
@@ -2757,7 +2751,7 @@ mod rocm_tests {
         else {
             return;
         };
-        for format in KQUANT {
+        for format in kquant() {
             for schedule in GEMV_SCHEDULES {
                 run_contraction_case(&ctx, format, schedule, 1, 1, 11);
                 run_contraction_case(&ctx, format, schedule, 2, 1, 5);
@@ -2776,7 +2770,7 @@ mod rocm_tests {
         else {
             return;
         };
-        for format in BLOCK32.into_iter().chain(KQUANT) {
+        for format in block32().into_iter().chain(kquant()) {
             run_contraction_case(&ctx, format, register_tiled(2, 32), 1, 4, 4);
             run_contraction_case(&ctx, format, register_tiled(2, 32), 1, 7, 7);
         }
@@ -2791,7 +2785,7 @@ mod rocm_tests {
         else {
             return;
         };
-        for format in BLOCK32.into_iter().chain(KQUANT) {
+        for format in block32().into_iter().chain(kquant()) {
             run_contraction_case(&ctx, format, register_tiled(2, 32), 3, 7, 5);
         }
     }
@@ -3035,7 +3029,7 @@ mod ptx_tests {
     use poot_ptx_runtime::{PtxBuffer, PtxContext};
 
     use super::fixtures::{
-        BLOCK32, GEMV_SCHEDULES, GatherCase, KQUANT, assert_close, contraction_fixture, fixture,
+        GEMV_SCHEDULES, GatherCase, assert_close, block32, contraction_fixture, fixture, kquant,
         kquant_gather_cases, pack_words, register_tiled, schedule_tag,
     };
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_contraction, packed_kernel};
@@ -3078,7 +3072,7 @@ mod ptx_tests {
         let out_rows = 5;
         let blocks_per_row = 2;
         let ids: [u32; 4] = [3, 0, 4, 3];
-        for (seed, format) in BLOCK32.into_iter().enumerate() {
+        for (seed, format) in block32().into_iter().enumerate() {
             let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
             let expected: Vec<f32> = ids
                 .iter()
@@ -3201,7 +3195,7 @@ mod ptx_tests {
         else {
             return;
         };
-        for format in BLOCK32 {
+        for format in block32() {
             for schedule in GEMV_SCHEDULES {
                 run_contraction_case(&ctx, format, schedule, 1, 1, 11);
                 run_contraction_case(&ctx, format, schedule, 2, 1, 5);
@@ -3270,7 +3264,7 @@ mod ptx_tests {
         else {
             return;
         };
-        for format in KQUANT {
+        for format in kquant() {
             for schedule in GEMV_SCHEDULES {
                 run_contraction_case(&ctx, format, schedule, 1, 1, 11);
                 run_contraction_case(&ctx, format, schedule, 2, 1, 5);
@@ -3289,7 +3283,7 @@ mod ptx_tests {
         else {
             return;
         };
-        for format in BLOCK32.into_iter().chain(KQUANT) {
+        for format in block32().into_iter().chain(kquant()) {
             run_contraction_case(&ctx, format, register_tiled(2, 32), 1, 4, 4);
             run_contraction_case(&ctx, format, register_tiled(2, 32), 1, 7, 7);
         }
@@ -3309,7 +3303,7 @@ mod ptx_tests {
         else {
             return;
         };
-        for format in BLOCK32.into_iter().chain(KQUANT) {
+        for format in block32().into_iter().chain(kquant()) {
             run_contraction_case(&ctx, format, register_tiled(2, 32), 3, 7, 5);
         }
     }

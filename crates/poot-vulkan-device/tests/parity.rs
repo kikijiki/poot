@@ -533,11 +533,11 @@ fn chunked_gdn_prefill_matches_the_sequential_recurrence_on_vulkan() {
 /// plans the split-KV schedule (two launches through one scratch) and, stepped at live lengths 1024, 5, 400,
 /// 1, 1024 over one executable, matches the CPU oracle's evaluation of each length within
 /// `SPLIT_KV_DEVICE_TOLERANCE`. The scratch slot is stale from the
-/// previous step at every step but the first (length 5 leaves seven of the eight splits with no key), so a
-/// split that did not publish its own neutral partial reads the first step's.
-/// Mutation: in `poot-kernelgen`'s `attention_body`, skip the partial writes of a split with no key; the
-/// length-5 and length-1 steps go red. Dropping one split's partial in the combine (`count` starting at 1)
-/// goes red on every step.
+/// previous step at every step but the first (length 5 needs one share of the eight splits), so a
+/// combine that read past the splits its row published reads the first step's partials.
+/// Mutation: in `poot-kernelgen`'s `attention_combine_body`, loop to `splits` instead of the published count; the
+/// length-5, length-400 and length-1 steps go red. Dropping one split's partial in the combine (`count`
+/// starting at 1) goes red on every step.
 #[test]
 fn split_kv_decode_matches_the_oracle_on_vulkan() {
     let Some(device) = open_or_skip(DeviceBackend::Vulkan, VulkanDevice::new()) else {
@@ -547,6 +547,26 @@ fn split_kv_decode_matches_the_oracle_on_vulkan() {
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     poot_executor_parity::attention::assert_split_kv_decode_matches_the_oracle(exec.as_mut(), t)
         .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// POOT-1400: the split-KV decode over the same live prefix of a 256-key and of a 4096-key cache gives
+/// bit-identical outputs, though the two plan different grids: the live length alone partitions the keys. The
+/// keys past the length are NaN in both caches.
+///
+/// Mutation: in `poot-kernelgen`'s `attention_body`, cut the shares from the capacity (`per = ceil(lk / splits)`,
+/// every split published); the 129-key step differs in bits between the two capacities.
+#[test]
+fn split_kv_decode_is_capacity_independent_on_vulkan() {
+    let Some(device) = open_or_skip(DeviceBackend::Vulkan, VulkanDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::attention::assert_split_kv_decode_is_capacity_independent(
+        exec.as_mut(),
+        t,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
 }
 
 /// A paged decode attention reads the K and V pools in place through the `[B, Lk]` read map: the plan holds one

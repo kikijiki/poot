@@ -368,6 +368,7 @@ fn a_run_of_rows_outside_the_grid_is_a_typed_error() {
         schedule: kg::AttentionSchedule::SplitKv {
             lanes: 4,
             splits: 2,
+            min_units: 1,
         },
         ..spec.clone()
     };
@@ -732,10 +733,26 @@ fn an_out_of_range_live_length_is_safe_and_selects_what_the_decomposition_select
 /// hide a dropped split (its weight is `O(1/splits)` of the row), which the mutation rows below show.
 const SPLIT_KV_TOLERANCE: f32 = 1e-5;
 
+/// `spec` under a split-KV schedule of `splits` workgroups per row whose shares may be a single step wide, so a
+/// row of `n` visited steps uses `min(splits, n)` of them.
 fn with_splits(spec: kg::AttentionSpec, lanes: usize, splits: usize) -> kg::AttentionSpec {
+    with_split_floor(spec, lanes, splits, 1)
+}
+
+/// [`with_splits`] with shares of at least `min_units` steps.
+fn with_split_floor(
+    spec: kg::AttentionSpec,
+    lanes: usize,
+    splits: usize,
+    min_units: usize,
+) -> kg::AttentionSpec {
     kg::AttentionSpec {
         kv: poot_kernelgen::KvLane::F32,
-        schedule: kg::AttentionSchedule::SplitKv { lanes, splits },
+        schedule: kg::AttentionSchedule::SplitKv {
+            lanes,
+            splits,
+            min_units,
+        },
         ..spec
     }
 }
@@ -753,6 +770,50 @@ fn interpret_split(
     operands: &Operands,
     scratch_fill: f32,
 ) -> (Vec<f32>, [usize; 2]) {
+    let run = interpret_split_scratch(spec, caps, operands, scratch_fill);
+    (run.out, run.workgroups)
+}
+
+/// What both stages of a split-KV attention left behind.
+struct SplitRun {
+    out: Vec<f32>,
+    /// The partial-state scratch after stage one: the partials of each `(row, split)`, then the published
+    /// split count of each row.
+    scratch: Vec<f32>,
+    workgroups: [usize; 2],
+}
+
+impl SplitRun {
+    /// The `(o, m, l)` words of `split` of `row`.
+    fn partial(&self, spec: &kg::AttentionSpec, row: usize, split: usize) -> &[f32] {
+        let splits = grid_splits(spec);
+        let width = spec.dv + 2;
+        let at = (row * splits + split) * width;
+        &self.scratch[at..at + width]
+    }
+
+    /// How many splits `row`'s stage one published.
+    fn published_splits(&self, spec: &kg::AttentionSpec, row: usize) -> f32 {
+        let splits = grid_splits(spec);
+        self.scratch[spec.rows() * splits * (spec.dv + 2) + row]
+    }
+}
+
+/// The splits per row a split schedule's grid has.
+fn grid_splits(spec: &kg::AttentionSpec) -> usize {
+    let kg::AttentionSchedule::SplitKv { splits, .. } = spec.schedule else {
+        panic!("a split-KV schedule has partials");
+    };
+    splits
+}
+
+/// [`interpret_split`], keeping the scratch.
+fn interpret_split_scratch(
+    spec: &kg::AttentionSpec,
+    caps: &DeviceCaps,
+    operands: &Operands,
+    scratch_fill: f32,
+) -> SplitRun {
     let partials = kg::generate(&kg::KernelRequest::Attention(spec.clone()), caps, &LIMITS)
         .expect("the split request generates");
     let combine_spec = kg::AttentionCombineSpec::of(spec).expect("a split schedule combines");
@@ -784,10 +845,11 @@ fn interpret_split(
         let [x, y, z] = groups(launch);
         (x * y * z) as usize
     };
-    (
-        combine_buffers[1].to_f32s().unwrap(),
-        [workgroups(&partials.launch), workgroups(&combine.launch)],
-    )
+    SplitRun {
+        out: combine_buffers[1].to_f32s().unwrap(),
+        scratch: combine_buffers[0].to_f32s().unwrap(),
+        workgroups: [workgroups(&partials.launch), workgroups(&combine.launch)],
+    }
 }
 
 /// Decode over 4 splits of a 41-key cache (a chunk of 11 keys, the last split holding 8), lane count 4 so
@@ -831,12 +893,12 @@ fn a_sink_under_split_kv_is_counted_once() {
     assert_close(&got, &operands.reference(&live), SPLIT_KV_TOLERANCE);
 }
 
-/// A live length of 5 against 4 splits of 11 keys leaves splits 1..4 with no key to visit. The scratch
-/// arrives full of NaN (an arena slot is never zeroed): the empty splits must publish the neutral partial
-/// themselves, so the output is finite and equals the reference.
+/// A live length of 5 against 4 splits of a 41-key cache leaves splits past the row's shares with no key to
+/// visit. The scratch arrives full of NaN (an arena slot is never zeroed): those splits publish nothing and
+/// the combine reads only the published ones, so the output is finite and equals the reference.
 ///
-/// Mutation: guard stage one's partial writes with `begin < key_end` (skip empty splits); the stale NaN
-/// reaches the combine and the output row goes NaN.
+/// Mutation: in `attention_combine_body`, loop to `splits` instead of the published count; the stale NaN of
+/// the unpublished splits reaches the combine and the output row goes NaN.
 #[test]
 fn a_poisoned_scratch_with_trailing_empty_splits_matches_the_reference() {
     let live = kg::AttentionSpec {
@@ -1175,8 +1237,8 @@ fn a_causal_row_at_a_negative_position_sees_the_first_key() {
     assert_eq!(got.len(), 2 * row);
 }
 
-/// A causal row under the split schedule: 4 splits of a 41-key cache with a window, so most splits hold no
-/// visible key and publish the neutral partial, and the keys outside the window are poison.
+/// A causal row under the split schedule: 4 splits of a 41-key cache with a window, so the row's shares cover
+/// only the window, and the keys outside the window are poison.
 #[test]
 fn a_causal_row_under_split_kv_matches_the_reference() {
     let split = with_splits(
@@ -1199,6 +1261,178 @@ fn a_causal_row_under_split_kv_matches_the_reference() {
         "poison reached the output: {got:?}"
     );
     assert_close(&got, &operands.reference(&split), SPLIT_KV_TOLERANCE);
+}
+
+/// The splits of each row a split-KV attention made partials for, from the live length alone. Six rows of one
+/// attention: a grid of 8 splits, shares of at least 16 steps over 4 lanes. Hand-derived: live length 1, 5 and
+/// 16 fit one share; 17 needs 2 (balanced to 3 lane steps of 4 keys, 12 keys each, so 2 shares cover it);
+/// 100 needs 7 (25 lane steps over 7 shares is 4 each, 16 keys, 7 cover 100); 1024 fills all 8.
+const ROW_SHARES: [(i32, usize); 6] = [(1, 1), (5, 1), (16, 1), (17, 2), (100, 7), (1024, 8)];
+
+/// The combine reads only the splits stage one published, and a split past a row's shares writes nothing. The
+/// scratch arrives full of NaN and a row of live length `n` uses `ROW_SHARES` of the 8 splits of its grid: the
+/// output equals the reference and is finite, the row publishes its count, the other splits' partials are
+/// still NaN, and the used ones are finite.
+///
+/// Mutation: in `attention_combine_body`, loop to `splits` instead of the published count; the combine reads
+/// the NaN of the unused splits and every short row goes NaN.
+/// Mutation: in `attention_body`, run the workgroups past a row's shares too; they publish neutral partials
+/// into slots that must stay untouched and the NaN check goes red.
+#[test]
+fn the_combine_reads_only_the_splits_stage_one_published() {
+    let live = kg::AttentionSpec {
+        bound: kg::KeyBound::Live,
+        ..with_split_floor(with_lanes(spec(6, 2, 1, 1, 1024, 8), 4), 4, 8, 16)
+    };
+    let lens = ROW_SHARES.map(|(len, _)| len);
+    let operands = Operands::new(&live, vec![0.0; 6 * 1024]).with_len(&lens);
+    let run = interpret_split_scratch(&live, &caps(), &operands, f32::NAN);
+    assert!(run.out.iter().all(|x| x.is_finite()), "{:?}", run.out);
+    assert_close(&run.out, &operands.reference(&live), SPLIT_KV_TOLERANCE);
+    for (batch, &(len, shares)) in ROW_SHARES.iter().enumerate() {
+        for row in [2 * batch, 2 * batch + 1] {
+            assert_eq!(
+                run.published_splits(&live, row),
+                shares as f32,
+                "row {row}, live length {len}"
+            );
+            for split in 0..8 {
+                let partial = run.partial(&live, row, split);
+                if split < shares {
+                    assert!(
+                        partial.iter().all(|x| x.is_finite()),
+                        "row {row} split {split} has a share of {len} keys: {partial:?}"
+                    );
+                } else {
+                    assert!(
+                        partial.iter().all(|x| x.is_nan()),
+                        "row {row} split {split} has no share of {len} keys but wrote {partial:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The published count is the shares of a balanced cut with none empty. A grid of 8 splits, shares of at least
+/// 2 steps over 4 lanes and a cache of 64 keys; hand-derived per live length `n` as
+/// `s = min(8, ceil(n / 2))` shares of `ceil(ceil(n / 4) / s)` lane steps (4 keys each), recounted as
+/// `ceil(n / keys per share)`: n 1 -> 1, n 2 -> 1, n 3 -> `s` 2, 1 lane step, 4 keys per share, recount 1;
+/// n 33 -> `s` 8, 2 lane steps, 8 keys, recount 5; n 64 -> 8 shares of 8 keys. Every published split has a
+/// finite maximum, so none is an empty share.
+///
+/// Mutation: in `split_shares`, publish `shares` and skip the recount; n 3 publishes 2 splits and n 33 publishes
+/// 8, with empty shares whose maximum is `-inf`.
+#[test]
+fn no_published_split_is_an_empty_share() {
+    let live = kg::AttentionSpec {
+        bound: kg::KeyBound::Live,
+        ..with_split_floor(with_lanes(spec(5, 1, 1, 1, 64, 8), 4), 4, 8, 2)
+    };
+    let expected = [(1, 1), (2, 1), (3, 1), (33, 5), (64, 8)];
+    let lens = expected.map(|(len, _)| len);
+    let operands = Operands::new(&live, vec![0.0; 5 * 64]).with_len(&lens);
+    let run = interpret_split_scratch(&live, &caps(), &operands, f32::NAN);
+    assert_close(&run.out, &operands.reference(&live), SPLIT_KV_TOLERANCE);
+    for (row, &(len, shares)) in expected.iter().enumerate() {
+        assert_eq!(
+            run.published_splits(&live, row),
+            shares as f32,
+            "live length {len}"
+        );
+        for split in 0..shares {
+            let [.., m, _l] = run.partial(&live, row, split) else {
+                unreachable!("a partial has o, m and l")
+            };
+            assert!(
+                m.is_finite(),
+                "live length {len}: split {split} of {shares} saw no key"
+            );
+        }
+    }
+}
+
+/// A decode attention over a cache of `lk` keys with a grid of `splits`, its live length a run-time operand.
+fn capacity_spec(lk: usize, splits: usize) -> kg::AttentionSpec {
+    kg::AttentionSpec {
+        bound: kg::KeyBound::Live,
+        ..causal(
+            with_split_floor(with_lanes(spec(1, 2, 1, 1, lk, 8), 4), 4, splits, 128),
+            None,
+        )
+    }
+}
+
+/// The same live prefix of two caches of different capacity and grid gives the same bits. The prefix is the
+/// first `len` keys of a 256-key cache and of a 4096-key cache whose keys past 256 are NaN; the grids are 2
+/// and 16 splits with shares of at least 128 steps, so a row of at most 256 keys has at most 2 shares in
+/// both. The partition depends on the live length alone, so the rows are bit-identical (and finite: no key
+/// past the length is read). Live lengths 5, 128, 129, 200 and 256 cover one share, the edge of the floor, and
+/// two shares with the second ragged and full.
+///
+/// Mutation: in `attention_body`, cut the shares from the capacity (`per = ceil(lk / splits)`, every split
+/// published); the 129-key row is two shares of 128 and 1 keys on the 256-key cache and one on the 4096-key
+/// cache, and differs in bits.
+#[test]
+fn the_partition_does_not_depend_on_the_cache_capacity() {
+    let (small, big) = (capacity_spec(256, 2), capacity_spec(4096, 16));
+    assert_ne!(
+        small.workgroups(),
+        big.workgroups(),
+        "the two capacities plan different grids"
+    );
+    let (hkv, d) = (2, 8);
+    for len in [5, 128, 129, 200, 256] {
+        let small_operands = Operands::new(&small, Vec::new())
+            .with_positions(&[255])
+            .with_len(&[len]);
+        let widen = |plane: &[f32]| {
+            let mut wide = vec![f32::NAN; hkv * 4096 * d];
+            for head in 0..hkv {
+                wide[head * 4096 * d..][..256 * d]
+                    .copy_from_slice(&plane[head * 256 * d..][..256 * d]);
+            }
+            wide
+        };
+        let big_operands = Operands {
+            k: widen(&small_operands.k),
+            v: widen(&small_operands.v),
+            q: small_operands.q.clone(),
+            positions: small_operands.positions.clone(),
+            len: small_operands.len.clone(),
+            ..Operands::new(&big, Vec::new())
+        };
+        let (from_small, _) = interpret_split(&small, &caps(), &small_operands, f32::NAN);
+        let (from_big, _) = interpret_split(&big, &caps(), &big_operands, f32::NAN);
+        assert!(from_small.iter().all(|x| x.is_finite()), "len {len}");
+        let bits = |row: &[f32]| row.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&from_small), bits(&from_big), "live length {len}");
+    }
+}
+
+/// A windowed decode partitions its window, not its cache: position 900 of a 1024-key cache under a window of
+/// 64 visits 64 keys, which a grid of 8 splits with shares of at least 16 steps cuts into 4. The keys outside
+/// the window are NaN, so a share that strayed outside it would poison the output.
+///
+/// Mutation: in `attention_body`, start a causal row's range at 0 instead of its window's first key; the
+/// shares reach the poisoned keys before the window and the output goes NaN (and the row would publish 8
+/// splits).
+#[test]
+fn a_window_is_partitioned_not_the_cache() {
+    let windowed = causal(
+        with_split_floor(with_lanes(spec(1, 2, 1, 1, 1024, 8), 4), 4, 8, 16),
+        Some(64),
+    );
+    let mut operands = Operands::new(&windowed, Vec::new()).with_positions(&[900]);
+    for t in (0..1024).filter(|&t| !(837..=900).contains(&t)) {
+        poison_key(&mut operands, &windowed, 0, t);
+    }
+    let run = interpret_split_scratch(&windowed, &caps(), &operands, f32::NAN);
+    assert!(run.out.iter().all(|x| x.is_finite()), "{:?}", run.out);
+    assert_close(&run.out, &operands.reference(&windowed), SPLIT_KV_TOLERANCE);
+    for row in 0..2 {
+        assert_eq!(run.published_splits(&windowed, row), 4.0, "row {row}");
+    }
 }
 
 /// `spec` under the tiled schedule: `br` query positions per workgroup, `bc` keys per block, and the per-lane

@@ -236,28 +236,20 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Address a `Ty::Vec` access `(*place.local)[i]` at vector-group index `i` (spec 134 P1,
-    /// `Rvalue::VectorLoad`/`Statement::VectorStore`): elements `[i*lanes, i*lanes+lanes)` of the underlying scalar
-    /// buffer, reinterpreted as one `vec_ty` value. On NVPTX it is a GEP over `<lanes x elem>` into the param's own
-    /// pointer, so the same param may also be read element by element. On SpirvVulkan the resource for this access
-    /// is declared with the `<lanes x elem>` element type (FR-004, the A1 probe fixture), which may differ from the
-    /// scalar-typed resource `element_ptr`/`param_bind_ty` would pick, so a body must not mix scalar and vector
-    /// access to one param there (FR-004b's two-binding fallback is not wired; `param_bind_ty` picks one binding
-    /// type per param). Other targets refuse `Ty::Vec` in `scalar_llty`.
+    /// Address a `Ty::Vec` store `(*place.local)[i]` at vector-group index `i` (spec 134 P1,
+    /// `Statement::VectorStore`): elements `[i*lanes, i*lanes+lanes)` of the underlying scalar buffer, reinterpreted
+    /// as one `vec_ty` value. On NVPTX it is a GEP over `<lanes x elem>` into the param's own pointer. On SpirvVulkan
+    /// the resource for this access is declared with the `<lanes x elem>` element type (FR-004, the A1 probe fixture),
+    /// which differs from the scalar-typed resource `element_ptr`/`param_bind_ty` would pick, so a body must not mix
+    /// scalar and vector access to one param there (FR-004b's two-binding fallback is not wired). Other targets
+    /// refuse `Ty::Vec` in `scalar_llty`.
     pub(super) fn vector_element_ptr(
         &mut self,
         place: &Place,
         vec_ty: &Ty,
         w: &mut String,
     ) -> Result<(String, String, u32), EmitError> {
-        let idx_local = match place.projection.as_slice() {
-            [ProjectionElem::Deref, ProjectionElem::Index(i)] => *i,
-            other => {
-                return Err(EmitError::Unsupported(format!(
-                    "vector projection {other:?}"
-                )));
-            }
-        };
+        let idx_local = vector_index_local(place)?;
         // `scalar_llty` refuses `Ty::Vec` on a target without vector codegen.
         let elem_llty = self.scalar_llty(vec_ty)?;
         let (idx_val, idx_llty) = self.load_place(&Place::local(idx_local), w)?;
@@ -272,35 +264,158 @@ impl<'a> Emitter<'a> {
             );
             return Ok((p, elem_llty, 1));
         }
+        self.spirv_vector_group_ptr(place.local, vec_ty, &idx_val, w)
+    }
+
+    /// The pointer to group `group` of the vector resource of param `param` (declared by `param_bind_ty`).
+    fn spirv_vector_group_ptr(
+        &mut self,
+        param: Local,
+        vec_ty: &Ty,
+        group: &str,
+        w: &mut String,
+    ) -> Result<(String, String, u32), EmitError> {
+        let elem_llty = self.scalar_llty(vec_ty)?;
         let (bufty, mangle) = self.spirv_buf(vec_ty, true)?;
         let p = self.fresh();
         let _ = writeln!(
             w,
-            "  {p} = tail call ptr addrspace(11) @llvm.spv.resource.getpointer.p11.{mangle}({bufty} %h{}, i32 {idx_val})",
-            place.local.index
+            "  {p} = tail call ptr addrspace(11) @llvm.spv.resource.getpointer.p11.{mangle}({bufty} %h{}, i32 {group})",
+            param.index
         );
         Ok((p, elem_llty, 11))
     }
 
-    /// The `Ty` used to declare param `p`'s SPIR-V resource binding: the scalar slice element type (`slice_elem`),
-    /// unless the body accesses `p` via `VectorLoad`/`VectorStore`, in which case that access's vector `Ty`
-    /// (elem+lanes) is used (FR-004: the resource must be declared with the vector element type, not bitcast from a
-    /// scalar one). Only the first vector access found is consulted; mixing scalar and vector access on one param
-    /// needs FR-004b's two-binding mechanism, deferred to the P1 dequant-kernel adoption.
-    pub(super) fn param_bind_ty(&self, p: Local) -> Result<Ty, EmitError> {
-        for bb in &self.body.blocks {
-            for s in &bb.statements {
-                match s {
-                    Statement::Assign(dest, Rvalue::VectorLoad { place }) if place.local == p => {
-                        return Ok(self.body.locals[dest.local.index as usize].ty.clone());
-                    }
-                    Statement::VectorStore { place, value } if place.local == p => {
-                        return self.operand_ty(value);
-                    }
-                    _ => {}
-                }
-            }
+    /// Lower [`poot_kernel_ir::Rvalue::VectorLoad`] of `dest_ty` (`lanes` of `elem`) at the element index `place`
+    /// holds, whose address the emitter proved `align_bytes`-aligned.
+    ///
+    /// NVPTX and AMDGPU load `<lanes x elem>` through the same element pointer a scalar read of the param uses, so
+    /// one param may be read both ways ([`crate::Capability::mixed_vector_reads`]); the backend emits one vector
+    /// instruction where `align_bytes` covers the whole vector and scalar loads where it does not. SpirvVulkan has
+    /// typed resources: a param every access of which is a vector-aligned load of one vector type is declared with
+    /// that vector element and read by group; any other param reads its lanes as scalar loads (same values, no
+    /// vector instruction). Other targets refuse `Ty::Vec` in `scalar_llty`.
+    pub(super) fn emit_vector_load(
+        &mut self,
+        place: &Place,
+        align_bytes: u32,
+        dest_ty: &Ty,
+        w: &mut String,
+    ) -> Result<(String, String), EmitError> {
+        let Ty::Vec { elem, lanes } = dest_ty else {
+            return Err(EmitError::Unsupported(
+                "VectorLoad requires a Ty::Vec destination local".into(),
+            ));
+        };
+        let vec_llty = self.scalar_llty(dest_ty)?;
+        let v = self.fresh();
+        if self.target != Target::SpirvVulkan {
+            let (ptr, _, addrspace) = self.element_ptr(place, w)?;
+            let _ = writeln!(
+                w,
+                "  {v} = load {vec_llty}, ptr addrspace({addrspace}) {ptr}, align {align_bytes}"
+            );
+            return Ok((v, vec_llty));
         }
-        self.slice_elem(p)
+        let idx_local = vector_index_local(place)?;
+        let (idx_val, _) = self.load_place(&Place::local(idx_local), w)?;
+        if self.vector_binding(place.local).is_some() {
+            // The binding proof gave every load of this param an alignment of a whole vector, so the element index
+            // is a multiple of `lanes` and the group index is its quotient.
+            let group = self.fresh();
+            let _ = writeln!(
+                w,
+                "  {group} = lshr i32 {idx_val}, {}",
+                lanes.trailing_zeros()
+            );
+            let (ptr, _, addrspace) =
+                self.spirv_vector_group_ptr(place.local, dest_ty, &group, w)?;
+            let _ = writeln!(
+                w,
+                "  {v} = load {vec_llty}, ptr addrspace({addrspace}) {ptr}, align {align_bytes}"
+            );
+            return Ok((v, vec_llty));
+        }
+        let lane_llty = self.scalar_llty(elem)?;
+        let (bufty, mangle) = self.spirv_buf(elem, true)?;
+        let lane_align = align_of(&lane_llty);
+        let mut vector = "poison".to_string();
+        for lane in 0..*lanes {
+            let at = self.fresh();
+            let _ = writeln!(w, "  {at} = add i32 {idx_val}, {lane}");
+            let ptr = self.fresh();
+            let _ = writeln!(
+                w,
+                "  {ptr} = tail call ptr addrspace(11) @llvm.spv.resource.getpointer.p11.{mangle}({bufty} %h{}, i32 {at})",
+                place.local.index
+            );
+            let value = self.fresh();
+            let _ = writeln!(
+                w,
+                "  {value} = load {lane_llty}, ptr addrspace(11) {ptr}, align {lane_align}"
+            );
+            let next = self.fresh();
+            let _ = writeln!(
+                w,
+                "  {next} = insertelement {vec_llty} {vector}, {lane_llty} {value}, i32 {lane}"
+            );
+            vector = next;
+        }
+        Ok((vector, vec_llty))
+    }
+
+    /// The vector type param `p`'s SpirvVulkan resource is declared with, when every access of `p` is a load or
+    /// store of that one vector type and every load proves an alignment of a whole vector (so its element index
+    /// divides into a group index). `None` for a param with any other access: it keeps its scalar resource.
+    fn vector_binding(&self, p: Local) -> Option<Ty> {
+        let mut found: Option<Ty> = None;
+        let mut vector_accesses = 0usize;
+        let mut accesses = 0usize;
+        for statement in self.body.blocks.iter().flat_map(|b| &b.statements) {
+            statement.for_each_read(|l| accesses += usize::from(l == p));
+            let (place, ty) = match statement {
+                Statement::Assign(dest, Rvalue::VectorLoad { place, align_bytes }) => {
+                    let ty = self.body.locals[dest.local.index as usize].ty.clone();
+                    let Ty::Vec { elem, lanes } = &ty else {
+                        return None;
+                    };
+                    let whole = u64::from(*lanes) * u64::from(elem.buffer_element_bytes()?);
+                    if u64::from(*align_bytes) < whole {
+                        return None;
+                    }
+                    (place, ty)
+                }
+                Statement::VectorStore { place, value } => (place, self.operand_ty(value).ok()?),
+                _ => continue,
+            };
+            if place.local != p {
+                continue;
+            }
+            if found.get_or_insert_with(|| ty.clone()) != &ty {
+                return None;
+            }
+            vector_accesses += 1;
+        }
+        found.filter(|_| accesses == vector_accesses)
+    }
+
+    /// The `Ty` used to declare param `p`'s SPIR-V resource binding: its [`Self::vector_binding`] when it has one
+    /// (FR-004: the resource must be declared with the vector element type, not bitcast from a scalar one), else
+    /// the scalar slice element type.
+    pub(super) fn param_bind_ty(&self, p: Local) -> Result<Ty, EmitError> {
+        match self.vector_binding(p) {
+            Some(ty) => Ok(ty),
+            None => self.slice_elem(p),
+        }
+    }
+}
+
+/// The local holding the index of a vector access `place`, which must project `[Deref, Index(i)]`.
+fn vector_index_local(place: &Place) -> Result<Local, EmitError> {
+    match place.projection.as_slice() {
+        [ProjectionElem::Deref, ProjectionElem::Index(i)] => Ok(*i),
+        other => Err(EmitError::Unsupported(format!(
+            "vector projection {other:?}"
+        ))),
     }
 }

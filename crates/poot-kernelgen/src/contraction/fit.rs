@@ -107,6 +107,8 @@ mod tests {
             direct_per_lane: 0.0,
             rounding: 0.0,
             occupancy: (tiles * lanes / device_lanes).max(1.0),
+            rounds_per_k: None,
+            grouping_per_k: 0.0,
         }
     }
 
@@ -129,6 +131,8 @@ mod tests {
             lds_read: 1.7,
             staged_value: 5.2,
             direct_value: 4.0,
+            fragment_round: None,
+            group_scan: None,
         };
         let samples: Vec<_> = corpus()
             .into_iter()

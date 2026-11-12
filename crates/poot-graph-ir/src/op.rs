@@ -3789,9 +3789,9 @@ fn check_axis(axis: usize, rank: usize) -> Result<(), ShapeError> {
 mod tests {
     use super::*;
     use crate::types::DType;
-    use poot_quant::format::ScaleEncoding;
     use poot_quant::format::WeightFormat;
-    use poot_quant::{OperandRole, PackedWeight, SourceRole};
+    use poot_quant::test_support::formats::two_source_formats;
+    use poot_quant::{PackedWeight, PlanarRole, SourceRole};
 
     fn f(shape: &[usize]) -> TensorType {
         TensorType::f32(shape.to_vec())
@@ -4265,31 +4265,19 @@ mod tests {
 
     #[test]
     fn packed_dequant_inference_uses_two_source_packed_formats() {
-        let formats = [
-            WeightFormat::E4m3Block128 {
-                scale: ScaleEncoding::Bf16,
-            },
-            WeightFormat::E4m3Block128 {
-                scale: ScaleEncoding::F32,
-            },
-            WeightFormat::E4m3Block128 {
-                scale: ScaleEncoding::E8m0,
-            },
-            WeightFormat::E2m1Row32,
-        ];
-        for (index, format) in formats.into_iter().enumerate() {
+        for (index, format) in two_source_formats().into_iter().enumerate() {
             let logical = if index % 2 == 0 { [2, 256] } else { [3, 129] };
             let descriptor = PackedWeight::try_new(format, logical).unwrap();
             let inputs = [
                 TensorType::new(
                     descriptor
-                        .source_shape(SourceRole::Planar(OperandRole::Codes))
+                        .source_shape(SourceRole::Planar(PlanarRole::Codes))
                         .to_vec(),
                     DType::I8,
                 ),
                 TensorType::new(
                     descriptor
-                        .source_shape(SourceRole::Planar(OperandRole::Scale))
+                        .source_shape(SourceRole::Planar(PlanarRole::Scale))
                         .to_vec(),
                     DType::I8,
                 ),
@@ -4303,7 +4291,7 @@ mod tests {
             assert!(matches!(
                 OpKind::PackedDequant { descriptor }.infer(&wrong),
                 Err(ShapeError::PackedDequantOperand {
-                    role: SourceRole::Planar(OperandRole::Scale),
+                    role: SourceRole::Planar(PlanarRole::Scale),
                     field: "shape",
                     ..
                 })
@@ -4312,21 +4300,13 @@ mod tests {
             let mut malformed = Vec::new();
             let mut weight_dtype = inputs.clone();
             weight_dtype[0].dtype = DType::F32;
-            malformed.push((
-                SourceRole::Planar(OperandRole::Codes),
-                "dtype",
-                weight_dtype,
-            ));
+            malformed.push((SourceRole::Planar(PlanarRole::Codes), "dtype", weight_dtype));
             let mut weight_shape = inputs.clone();
             weight_shape[0].shape[1] += 1;
-            malformed.push((
-                SourceRole::Planar(OperandRole::Codes),
-                "shape",
-                weight_shape,
-            ));
+            malformed.push((SourceRole::Planar(PlanarRole::Codes), "shape", weight_shape));
             let mut scale_dtype = inputs.clone();
             scale_dtype[1].dtype = DType::F32;
-            malformed.push((SourceRole::Planar(OperandRole::Scale), "dtype", scale_dtype));
+            malformed.push((SourceRole::Planar(PlanarRole::Scale), "dtype", scale_dtype));
             for (expected_role, expected_field, malformed_inputs) in malformed {
                 assert!(matches!(
                     OpKind::PackedDequant { descriptor }.infer(&malformed_inputs),
@@ -4425,13 +4405,13 @@ mod tests {
         let carriers = [
             TensorType::new(
                 descriptor
-                    .source_shape(SourceRole::Planar(OperandRole::Codes))
+                    .source_shape(SourceRole::Planar(PlanarRole::Codes))
                     .to_vec(),
                 DType::I8,
             ),
             TensorType::new(
                 descriptor
-                    .source_shape(SourceRole::Planar(OperandRole::Scale))
+                    .source_shape(SourceRole::Planar(PlanarRole::Scale))
                     .to_vec(),
                 DType::I8,
             ),
@@ -4470,13 +4450,13 @@ mod tests {
         let carriers = [
             TensorType::new(
                 descriptor
-                    .source_shape(SourceRole::Planar(OperandRole::Codes))
+                    .source_shape(SourceRole::Planar(PlanarRole::Codes))
                     .to_vec(),
                 DType::I8,
             ),
             TensorType::new(
                 descriptor
-                    .source_shape(SourceRole::Planar(OperandRole::Scale))
+                    .source_shape(SourceRole::Planar(PlanarRole::Scale))
                     .to_vec(),
                 DType::I8,
             ),

@@ -55,7 +55,11 @@ fn interpret(
         sink: kg::AttentionSink::Absent,
         schedule: match splits {
             None => kg::AttentionSchedule::Streaming { lanes },
-            Some(splits) => kg::AttentionSchedule::SplitKv { lanes, splits },
+            Some(splits) => kg::AttentionSchedule::SplitKv {
+                lanes,
+                splits,
+                min_units: 1,
+            },
         },
         precision: poot_graph_ir::OperandPrecision::Exact,
     };

@@ -269,6 +269,7 @@ mod tests {
     use crate::packed_source::PackedSourceName;
     use poot_quant::PackedWeight;
     use poot_quant::format::WeightFormat;
+    use poot_quant::test_support::formats::packed_formats;
 
     #[test]
     fn packed_linear_append_is_transactional() -> Result<(), BuilderError> {
@@ -489,26 +490,9 @@ mod tests {
     #[test]
     fn packed_indexed_linear_is_one_claimed_contraction_over_stacked_carriers()
     -> Result<(), BuilderError> {
-        use poot_quant::format::GroupMap;
-        use std::num::NonZeroUsize;
-        let formats = [
-            WeightFormat::Q8_0,
-            WeightFormat::Q4_K,
-            WeightFormat::Awq {
-                group_size: NonZeroUsize::new(32).unwrap(),
-            },
-            WeightFormat::Gptq {
-                groups: GroupMap::Indexed {
-                    groups: NonZeroUsize::new(2).unwrap(),
-                },
-            },
-            WeightFormat::Mxfp4,
-        ];
-        for format in formats {
-            let k = match format {
-                WeightFormat::Q4_K => 256,
-                _ => 64,
-            };
+        // 256 values per row: a whole number of blocks of every block format and of groups of every planar one.
+        let k = 256;
+        for format in packed_formats() {
             let descriptor = PackedWeight::try_new(format, [3, k]).unwrap();
             let table = PackedExpertStack {
                 stack: TEST_STACK,

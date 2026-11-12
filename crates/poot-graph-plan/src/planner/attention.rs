@@ -149,17 +149,9 @@ pub(super) fn plan(
     }
     // The streaming and split-KV schedules are exact: a narrowed or split read with no matrix-unit tiling is refused.
     super::matmul::refuse_unless_exact(site, *precision)?;
-    let splits = attention_splits(&streaming, caps);
-    match splits {
+    match attention_splits(&streaming, caps) {
         None => row_runs(site, streaming, backend, caps),
-        Some(splits) => split_kv(
-            site,
-            streaming,
-            SplitKv { lanes, splits },
-            ids.len(),
-            backend,
-            caps,
-        ),
+        Some(schedule) => split_kv(site, streaming, schedule, ids.len(), backend, caps),
     }
 }
 
@@ -238,14 +230,7 @@ fn plan_selected(
     // many-CU device idle: the same split-KV rule divides the candidates.
     match attention_splits(&spec, caps) {
         None => row_runs(site, spec, backend, caps),
-        Some(splits) => split_kv(
-            site,
-            spec,
-            SplitKv { lanes, splits },
-            operand_types.len(),
-            backend,
-            caps,
-        ),
+        Some(schedule) => split_kv(site, spec, schedule, operand_types.len(), backend, caps),
     }
 }
 
@@ -296,29 +281,20 @@ fn row_runs(
     Planned::split(runs)
 }
 
-/// The lanes and key chunks of a split-KV attention.
-struct SplitKv {
-    lanes: usize,
-    splits: usize,
-}
-
-/// The split-KV plan of a decode attention (POOT-1113): stage one writes the `splits` partial `(o, m, l)`
-/// states of every row into one scratch buffer, stage two combines them into the output. The scratch is the
+/// The split-KV plan of a decode attention (POOT-1113): stage one writes the partial `(o, m, l)` states of the
+/// splits each row has, up to `schedule`'s `splits`, and that count, into one scratch buffer, stage two combines them into the output. The scratch is the
 /// equation's own (`ScratchDecl`), colored by the buffer plan with the values, so it is budgeted and reused
 /// across layers with no allocator of its own.
 fn split_kv(
     site: Site<'_>,
     streaming: AttentionSpec,
-    split: SplitKv,
+    schedule: AttentionSchedule,
     operands: usize,
     backend: Backend,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
     let partials = AttentionSpec {
-        schedule: AttentionSchedule::SplitKv {
-            lanes: split.lanes,
-            splits: split.splits,
-        },
+        schedule,
         ..streaming
     };
     let combine =

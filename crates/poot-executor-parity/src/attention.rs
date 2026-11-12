@@ -281,7 +281,7 @@ pub fn assert_paged_attention_matches_the_oracle(
 // ---- Split-KV decode attention (POOT-1113) ----
 
 /// Two query rows against a 1024-key cache of one key/value head: the low-head decode a 40-compute-unit
-/// device leaves almost idle, which the planner splits into eight 128-key chunks.
+/// device leaves almost idle, which the planner gives a grid of eight splits (of at least 128 keys each).
 fn split_kv_fixture() -> poot_eval::test_support::live_attention::LiveAttentionFixture {
     poot_eval::test_support::live_attention::LiveAttentionFixture {
         batch: 1,
@@ -296,11 +296,11 @@ fn split_kv_fixture() -> poot_eval::test_support::live_attention::LiveAttentionF
     }
 }
 
-/// The live length of each step of the split-KV rows, in order. The first fills the cache, so every split
-/// publishes real partials into the arena's scratch slot; the second leaves seven of the eight splits with
-/// no key (a one-chunk live length), so a split that did not publish its own neutral partial would hand the
-/// combine the first step's stale one; then a mid-length that ends inside a chunk, a one-key length, and the
-/// full cache again. Each step is compared against an independent evaluation of that length.
+/// The live length of each step of the split-KV rows, in order. The first fills the cache, so all eight splits
+/// publish real partials into the arena's scratch slot; the second needs one share of the eight, so a combine
+/// that read past the splits its row published would take the first step's stale partials; then a mid-length
+/// that ends inside a share, a one-key length, and the full cache again. Each step is compared against an
+/// independent evaluation of that length.
 pub const SPLIT_KV_LIVE_LENGTHS: [i32; 5] = [1024, 5, 400, 1, 1024];
 
 /// How many dispatches and scratch buffers the live decode's attention plans at `target`: `(2, 1)` for the
@@ -418,6 +418,128 @@ pub fn assert_split_kv_decode_replays_bit_identically(
             return Err(format!(
                 "split-KV replay of live length {} is not bit-identical to the first pass",
                 SPLIT_KV_LIVE_LENGTHS[i]
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The live prefix lengths of [`assert_split_kv_decode_is_capacity_independent`]: inside one share, at and just
+/// past the planner's 128-key floor (two shares, the second a single key), a ragged second share, and the
+/// whole small cache.
+const CAPACITY_LIVE_LENGTHS: [i32; 5] = [5, 128, 129, 200, 256];
+/// The capacities of [`assert_split_kv_decode_is_capacity_independent`].
+const SMALL_CAPACITY: usize = 256;
+const LARGE_CAPACITY: usize = 4096;
+
+/// The splits of the one attention equation of `built` compiled for `target`.
+fn planned_grid(
+    built: &poot_eval::test_support::live_attention::LiveAttentionGraph,
+    target: poot_graph_plan::Target,
+) -> Result<usize, String> {
+    let program = crate::live_attention::compile_live(&built.graph, target);
+    let mut found = None;
+    for (_, _, stage) in program.stages() {
+        for (eqn, _) in stage.planned() {
+            if !matches!(eqn.op, poot_graph_ir::OpKind::Attention(_)) {
+                continue;
+            }
+            let poot_graph_plan::KernelChoice::Generated(poot_kernelgen::KernelRequest::Attention(
+                spec,
+            )) = stage.kernel_choice(eqn)
+            else {
+                return Err("the live decode did not plan a generated attention".to_string());
+            };
+            let poot_kernelgen::AttentionSchedule::SplitKv { splits, .. } = spec.schedule else {
+                return Err(format!(
+                    "the live decode did not plan the split plan: {spec:?}"
+                ));
+            };
+            found = Some(splits);
+        }
+    }
+    found.ok_or_else(|| "the live decode keeps one attention equation".to_string())
+}
+
+/// The split-KV decode over the same live prefix of a 256-key and of a 4096-key cache gives bit-identical
+/// outputs (POOT-1400). The two plan different grids (the capacity bounds the grid), but the live length alone
+/// partitions it, and a prefix of at most 256 keys has at most two shares in both. The keys past the live
+/// length are NaN in both caches, so a share that strayed past the length poisons its output, and the prefix
+/// holds the same values in both. One step per live length in [`CAPACITY_LIVE_LENGTHS`], each through the
+/// executor's recording step.
+pub fn assert_split_kv_decode_is_capacity_independent(
+    exec: &mut dyn Executor,
+    target: poot_graph_plan::Target,
+) -> Result<(), String> {
+    let at = |cap| poot_eval::test_support::live_attention::LiveAttentionFixture {
+        cap,
+        ..split_kv_fixture()
+    };
+    let (small, large) = (at(SMALL_CAPACITY), at(LARGE_CAPACITY));
+    let (small_built, large_built) = (small.build(true), large.build(true));
+    let (small_grid, large_grid) = (
+        planned_grid(&small_built, target)?,
+        planned_grid(&large_built, target)?,
+    );
+    if small_grid >= large_grid {
+        return Err(format!(
+            "the two capacities must plan different grids, the larger the wider: {small_grid} splits at \
+             {SMALL_CAPACITY} keys, {large_grid} at {LARGE_CAPACITY}"
+        ));
+    }
+    for len in CAPACITY_LIVE_LENGTHS {
+        let small_inputs = small.inputs(&small_built, &[len], true);
+        let mut large_inputs = large.inputs(&large_built, &[len], true);
+        // The small cache's first `len` key and value rows, copied into the large cache's layout.
+        for (small_id, large_id, width) in [
+            (small_built.k, large_built.k, small.dk),
+            (small_built.v, large_built.v, small.dv),
+        ] {
+            let prefix = small_inputs.0[&small_id].as_f32().expect("f32 operand");
+            let mut wide = large_inputs.0[&large_id]
+                .as_f32()
+                .expect("f32 operand")
+                .to_vec();
+            for head in 0..large.hkv {
+                let (from, to) = (head * SMALL_CAPACITY * width, head * LARGE_CAPACITY * width);
+                let live = len as usize * width;
+                wide[to..to + live].copy_from_slice(&prefix[from..from + live]);
+            }
+            large_inputs.0.insert(
+                large_id,
+                HostTensor::f32(vec![large.batch, large.hkv, LARGE_CAPACITY, width], wide),
+            );
+        }
+        let positions = [vec![len - 1]];
+        let from_small = crate::live_attention::live_steps(
+            exec,
+            target,
+            &small_built,
+            &small_inputs,
+            &positions,
+        )
+        .map_err(|e| format!("capacity {SMALL_CAPACITY} live length {len}: {e}"))?;
+        let from_large = crate::live_attention::live_steps(
+            exec,
+            target,
+            &large_built,
+            &large_inputs,
+            &positions,
+        )
+        .map_err(|e| format!("capacity {LARGE_CAPACITY} live length {len}: {e}"))?;
+        let bits = |steps: &[Vec<f32>]| -> Vec<u32> {
+            steps.iter().flatten().map(|x| x.to_bits()).collect()
+        };
+        if from_small[0].iter().any(|x| !x.is_finite()) {
+            return Err(format!(
+                "live length {len}: a non-finite output at capacity {SMALL_CAPACITY}: {:?}",
+                from_small[0]
+            ));
+        }
+        if bits(&from_small) != bits(&from_large) {
+            return Err(format!(
+                "live length {len}: the output at capacity {LARGE_CAPACITY} ({large_grid} splits) is not \
+                 bit-identical to capacity {SMALL_CAPACITY} ({small_grid} splits)"
             ));
         }
     }

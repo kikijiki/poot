@@ -871,8 +871,8 @@ mod tests {
     }
 
     /// R469-007: `validate_packed_carriers` must identify the weight and scale carriers by their
-    /// typed operand position - already tied to `descriptor.source_shape(SourceRole::Planar(OperandRole::Codes))` and
-    /// `descriptor.source_shape(SourceRole::Planar(OperandRole::Scale))` by `PackedDequant::infer` (and, for `PackedContraction`,
+    /// typed operand position - already tied to `descriptor.source_shape(SourceRole::Planar(PlanarRole::Codes))` and
+    /// `descriptor.source_shape(SourceRole::Planar(PlanarRole::Scale))` by `PackedDequant::infer` (and, for `PackedContraction`,
     /// by its own `infer` delegating to `PackedDequant::infer(&ins[1..])`), checked at
     /// `graph.validate()` - not by parsing a `PackedSourceName` suffix off `ValueMeta::name` and
     /// matching linear-id prefixes. Clearing every value's name must not change which contraction is

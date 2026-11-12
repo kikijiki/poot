@@ -970,8 +970,8 @@ fn zero_checkpoint(config: serde_json::Value) -> Fixture {
                         StoredBytes::from(vec![0u8; weight.source_bytes(role)]),
                     )
                 };
-                let codes = poot_quant::SourceRole::Planar(poot_quant::OperandRole::Codes);
-                let scales = poot_quant::SourceRole::Planar(poot_quant::OperandRole::Scale);
+                let codes = poot_quant::SourceRole::Planar(poot_quant::PlanarRole::Codes);
+                let scales = poot_quant::SourceRole::Planar(poot_quant::PlanarRole::Scale);
                 store
                     .insert(
                         bare,

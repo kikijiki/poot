@@ -92,7 +92,7 @@ pub fn packed_value_bits(format: WeightFormat) -> u32 {
         Storage::Planar(layout) => layout
             .operands
             .iter()
-            .find(|operand| operand.role == poot_quant::format::OperandRole::Codes)
+            .find(|operand| operand.role == poot_quant::format::PlanarRole::Codes)
             .map_or(32, |operand| operand.bits),
     }
 }

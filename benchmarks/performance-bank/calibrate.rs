@@ -33,11 +33,18 @@
 //! bank case) at several prompt lengths:
 //! - `packed-cells --bank B --case ID`: one `tokens<TAB>precision<TAB>index` line per tiling the device runs for the
 //!   case's rows at each of [`PACKED_TOKENS`], exact and narrow, each grouped at its own output-tile rows;
-//! - `packed-measure --bank B --case ID --tokens T --precision exact|narrow --tiling INDEX|chosen`: pin that tiling
+//! - `packed-measure --bank B --case ID --tokens T --precision exact|narrow|gemv --tiling INDEX|chosen`: pin that tiling
 //!   (or none), time the plan on the device clock and print one TSV row with the tiling's cost-model terms;
-//! - `packed-fit --rows F --out E`: regress the rows on the terms (a fit is reported, never written as a figure),
-//!   and score the model's choice per cell under the device's own ratios: its tiling against the fastest measured, and
-//!   its precision (the cheapest modelled of each) against the faster measured. It opens no device.
+//!
+//! Each packed row prints the median device microseconds of the step, of its `expert_group` dispatch and of its
+//! contraction dispatch, then the cost-model terms of the schedule that ran. `scripts/calibrate-launch rocm fragment`
+//! measures the packed and dense rows `benchmarks/calibration/<device>.tsv` holds, which
+//! `benchmarks/calibration/fit_fragment_cost.py` fits (POOT-1547). The precision `gemv` is the per-row Gemv.
+//!
+//! Dense modes (POOT-1547), the same row for a dense contraction:
+//! - `dense-cells --bank B`: one `MxKxN<TAB>precision<TAB>index` line per tiling of the dense corpus, exact and narrow,
+//!   and a `gemv` line for each one-row shape;
+//! - `dense-measure --bank B --shape MxKxN --precision exact|narrow|gemv --tiling INDEX|chosen`: one TSV row.
 //!
 //! `scripts/calibrate-launch <backend>` runs them in order under the GPU lock. The corpus is a grid of shapes,
 //! never a model's: one run calibrates every shape, and no shape-specific figure enters the table.
@@ -102,8 +109,8 @@ fn flag(args: &[String], name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{name} is required"))
 }
 
-/// The schedules of the register-tiled dense contractions `program` plans, in plan order, as their `Debug` text.
-fn tiled_schedules_of(program: &StagedProgram) -> Vec<String> {
+/// The schedules of the register-tiled dense contractions `program` plans, in plan order.
+fn dense_tiled_schedules_of(program: &StagedProgram) -> Vec<Schedule> {
     program
         .stages()
         .flat_map(|(_, _, p)| p.planned())
@@ -111,9 +118,17 @@ fn tiled_schedules_of(program: &StagedProgram) -> Vec<String> {
         .filter_map(|d| match d.choice() {
             KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled(
                 spec,
-            ))) => Some(format!("{:?}", spec.schedule)),
+            ))) => Some(spec.schedule),
             _ => None,
         })
+        .collect()
+}
+
+/// The same schedules as their `Debug` text.
+fn tiled_schedules_of(program: &StagedProgram) -> Vec<String> {
+    dense_tiled_schedules_of(program)
+        .into_iter()
+        .map(|schedule| format!("{schedule:?}"))
         .collect()
 }
 
@@ -264,6 +279,7 @@ where
                     direct_per_lane: 0.0,
                     rounding: number(5)?,
                     occupancy: number(6)?,
+                    ..CostTerms::default()
                 };
                 // The model's time is per staged `K` value (`K` is common to every tiling of one shape, so it is left
                 // out of the terms); the corpus varies `K`, so the measured time is put on the same footing.
@@ -313,11 +329,12 @@ where
         }
         Some("gemv-measure") => gemv_measure(&args, device),
         Some("gemv-fit") => gemv_fit(backend, &args),
+        Some("dense-cells") => dense_cells(device),
+        Some("dense-measure") => dense_measure(&args, device),
         Some("packed-cells") => packed_cells(&args, device),
         Some("packed-measure") => packed_measure(&args, device),
-        Some("packed-fit") => packed_fit(backend, &args),
         other => Err(format!(
-            "usage: calibrate_launch shapes|measure|fit|indexed-cells|indexed-measure|indexed-choice|indexed-fit|gemv-cells|gemv-measure|gemv-fit|packed-cells|packed-measure|packed-fit, got {other:?}"
+            "usage: calibrate_launch shapes|measure|fit|indexed-cells|indexed-measure|indexed-choice|indexed-fit|gemv-cells|gemv-measure|gemv-fit|dense-cells|dense-measure|packed-cells|packed-measure, got {other:?}"
         )),
     }
 }
@@ -628,6 +645,7 @@ fn parse_indexed_rows(text: &str) -> Result<Vec<IndexedRow>, String> {
                     direct_per_lane: number(6)?,
                     rounding: number(7)?,
                     occupancy: number(8)?,
+                    ..CostTerms::default()
                 },
             })
         })
@@ -1045,7 +1063,7 @@ fn gemv_fit(backend: &str, args: &[String]) -> Result<(), String> {
 
 /// The token counts of the packed grouped corpus (POOT-1505): a short prompt to a long prefill chunk, so the routed
 /// rows per expert of a wide mixture run from a few (each grouped tile mostly padding) to many.
-const PACKED_TOKENS: [usize; 6] = [128, 256, 512, 1024, 2048, 4096];
+const PACKED_TOKENS: [usize; 3] = [128, 512, 2048];
 
 /// The bank case `id` with its token count replaced.
 fn packed_case(bank: &Value, id: &str, tokens: usize) -> Result<Value, String> {
@@ -1064,12 +1082,19 @@ fn packed_case(bank: &Value, id: &str, tokens: usize) -> Result<Value, String> {
 /// The precision a `--precision` names, and the operands of a measurement at it on `target` with its rows grouped:
 /// the bank's own narrow operands ([`Operands::of`]).
 fn packed_operands(name: &str, target: Target) -> Result<crate::runner::Operands, String> {
-    let case = match name {
-        "exact" | "narrow" => serde_json::json!({ "numerics": { "operand_precision": name } }),
-        other => return Err(format!("--precision is exact or narrow, not {other:?}")),
+    let (precision, rows) = match name {
+        "exact" | "narrow" => (name, IndexedRows::Grouped),
+        // The per-row Gemv the exact twin runs where it wins: exact operands, no grouping.
+        "gemv" => ("exact", IndexedRows::Gemv),
+        other => {
+            return Err(format!(
+                "--precision is exact, narrow or gemv, not {other:?}"
+            ));
+        }
     };
+    let case = serde_json::json!({ "numerics": { "operand_precision": precision } });
     Ok(Operands {
-        indexed_rows: Some(IndexedRows::Grouped),
+        indexed_rows: Some(rows),
         ..Operands::of(target, &case)?
     })
 }
@@ -1151,6 +1176,7 @@ where
                 println!("{tokens}\t{precision}\t{index}");
             }
         }
+        println!("{tokens}\tgemv\tchosen");
     }
     Ok(())
 }
@@ -1239,139 +1265,281 @@ where
             "{id} at {tokens}: the planner ran {schedules:?}, not the pinned {tiling:?}"
         ));
     }
-    let ran = RegisterTiling::of(schedule).ok_or("the grouped rows ran no tiling")?;
-    let shape = packed_grouped_shape(&case, ops, ran.output_tile().0)?;
-    let terms = ran.cost_terms(shape, &caps);
+    let shape = &case["shape"];
+    let dim = |name: &str| shape[name].as_u64().map_or(0, |v| v as usize);
+    let rows = dim("tokens") * dim("top_k").max(1);
+    let step_us = median(
+        measured
+            .device_us
+            .clone()
+            .ok_or("the device reports no timestamps; build it with device timing")?,
+    );
+    let group_us = dispatch_us(&measured, "expert_group")?.unwrap_or(0.0);
+    let contraction_us = dispatch_us(&measured, "contraction:packed")?
+        .ok_or_else(|| format!("{id} at {tokens}: no packed contraction dispatch"))?;
+    // The terms of the schedule that ran: a Gemv's, or the tiling's with its rows grouped at its own tile, and the
+    // tiles it launches and the `K` rounds each runs (a Gemv has neither).
+    let (terms, tiles, rounds, tile, lanes, depth) = match schedule {
+        Schedule::Gemv { width, cols, .. } => (
+            GemvShape {
+                outputs: rows * dim("n"),
+                width,
+                cols,
+            }
+            .cost_terms(&caps),
+            0,
+            0,
+            "gemv".to_string(),
+            width as usize,
+            0,
+        ),
+        other => {
+            let ran = RegisterTiling::of(other).ok_or("the grouped rows ran no tiling")?;
+            let grouped = packed_grouped_shape(&case, ops, ran.output_tile().0)?;
+            let (tile_rows, tile_cols) = ran.output_tile();
+            (
+                ran.cost_terms(grouped, &caps),
+                grouped.blocks
+                    * grouped.working_row_tiles(tile_rows)
+                    * grouped.out_per_block.div_ceil(tile_cols),
+                grouped.k.div_ceil(ran.depth()),
+                format!("{tile_rows}x{tile_cols}"),
+                ran.workgroup_lanes(),
+                ran.depth(),
+            )
+        }
+    };
     let modelled = terms.modelled_time(caps.gemm_launch().calibrated.figures().cost);
-    let mut samples = measured
-        .device_us
-        .ok_or("the device reports no timestamps; build it with device timing")?;
-    samples.sort_by(f64::total_cmp);
-    let (tile_rows, tile_cols) = ran.output_tile();
     println!(
-        "{tokens}\t{precision}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{modelled}\t{tile_rows}x{tile_cols}\t{}\t{}\t{schedule:?}",
-        samples[samples.len() / 2],
+        "{tokens}\t{precision}\t{step_us}\t{group_us}\t{contraction_us}\t{}\t{}\t{}\t{}\t{}\t{}\t{modelled}\t{tile}\t{lanes}\t{depth}\t{tiles}\t{rounds}\t{}\t{schedule:?}",
         terms.fma,
         terms.lds_reads,
         terms.staged_per_lane,
+        terms.direct_per_lane,
         terms.rounding,
         terms.occupancy,
-        ran.workgroup_lanes(),
-        ran.depth(),
         flag(args, "--tiling")?,
     );
     Ok(())
 }
 
-/// One measured row of the packed grouped dataset.
-struct PackedRow {
-    tokens: usize,
-    precision: String,
-    device_us: f64,
-    terms: CostTerms,
-    modelled: f64,
-    tiling: String,
-    schedule: String,
-}
-
-fn parse_packed_rows(text: &str) -> Result<Vec<PackedRow>, String> {
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|line| {
-            let f: Vec<&str> = line.split('\t').collect();
-            let number = |i: usize| {
-                f.get(i)
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .ok_or_else(|| format!("bad row {line:?}"))
-            };
-            Ok(PackedRow {
-                tokens: number(0)? as usize,
-                precision: f.get(1).ok_or("empty row")?.to_string(),
-                device_us: number(2)?,
-                terms: CostTerms {
-                    fma: number(3)?,
-                    lds_reads: number(4)?,
-                    staged_per_lane: number(5)?,
-                    direct_per_lane: 0.0,
-                    rounding: number(6)?,
-                    occupancy: number(7)?,
-                },
-                modelled: number(9)?,
-                tiling: f.get(12).unwrap_or(&"").to_string(),
-                schedule: f.get(13).unwrap_or(&"").to_string(),
-            })
-        })
-        .collect()
-}
-
-/// `packed-fit`: the regression of the packed rows on the model's terms, reported (the device's entry is left as it
-/// is: one case's tilings rarely determine the ratios), and the model's choices scored against the measurements.
-fn packed_fit(backend: &str, args: &[String]) -> Result<(), String> {
-    let rows = parse_packed_rows(
-        &std::fs::read_to_string(flag(args, "--rows")?).map_err(|e| e.to_string())?,
-    )?;
-    let out = PathBuf::from(flag(args, "--out")?);
-    // Each pinned tiling once; the planner's own choice repeats one of them.
-    let pinned: Vec<&PackedRow> = rows.iter().filter(|r| r.tiling != "chosen").collect();
-    let samples: Vec<(CostTerms, f64)> = pinned.iter().map(|r| (r.terms, r.device_us)).collect();
-    let mut report = format!(
-        "// calibrate-launch packed-fit ({backend}), {} pinned rows. Reported only: no figure is written.\n",
-        pinned.len()
-    );
-    match fit_cost_ratios(&samples) {
-        Some(fit) => report.push_str(&format!(
-            "// Fit over these rows: lds_read {:.3}, staged_value {:.3}, R^2 {:.4}.\n",
-            fit.lds_read, fit.staged_value, fit.r_squared
-        )),
-        None => report.push_str("// These rows do not determine the ratios.\n"),
-    }
-    let mut cells: Vec<(usize, String)> = pinned
+/// The median over the timed repeats of the device time of the dispatches whose plan entry starts with `prefix`
+/// (summed when a contraction splits into several), or `None` when the plan has none.
+fn dispatch_us(measured: &crate::runner::Measured, prefix: &str) -> Result<Option<f64>, String> {
+    let positions: Vec<usize> = measured
+        .plan
         .iter()
-        .map(|r| (r.tokens, r.precision.clone()))
+        .enumerate()
+        .filter(|(_, entry)| entry.starts_with(prefix))
+        .map(|(position, _)| position)
         .collect();
-    cells.sort();
-    cells.dedup();
-    report.push_str("// tokens precision: fastest measured tiling, the model's cheapest, its time over the fastest\n");
-    let best = |tokens: usize, precision: &str, key: fn(&PackedRow) -> f64| {
-        pinned
-            .iter()
-            .filter(|r| r.tokens == tokens && r.precision == precision)
-            .min_by(|a, b| key(a).total_cmp(&key(b)))
-            .copied()
-    };
-    for (tokens, precision) in &cells {
-        let (Some(fastest), Some(modelled)) = (
-            best(*tokens, precision, |r| r.device_us),
-            best(*tokens, precision, |r| r.modelled),
-        ) else {
-            continue;
-        };
-        report.push_str(&format!(
-            "{tokens}\t{precision}\t{:.1} us {}\t{:.1} us {}\t{:.3}\n",
-            fastest.device_us,
-            fastest.schedule,
-            modelled.device_us,
-            modelled.schedule,
-            modelled.device_us / fastest.device_us,
-        ));
+    if positions.is_empty() {
+        return Ok(None);
     }
-    report.push_str("// tokens: the precision the model ranks cheaper, the measured faster (each its fastest tiling)\n");
-    let mut tokens: Vec<usize> = cells.iter().map(|(t, _)| *t).collect();
-    tokens.dedup();
-    for t in tokens {
-        let pick = |key: fn(&PackedRow) -> f64| {
-            let exact = best(t, "exact", key).map(key);
-            let narrow = best(t, "narrow", key).map(key);
-            match (exact, narrow) {
-                (Some(e), Some(n)) => Some(if n < e { "narrow" } else { "exact" }),
-                _ => None,
+    let per_repeat = measured
+        .dispatch_us
+        .iter()
+        .map(|repeat| {
+            positions
+                .iter()
+                .map(|&position| {
+                    repeat
+                        .get(position)
+                        .copied()
+                        .ok_or_else(|| "the device reports no per-dispatch time".to_string())
+                })
+                .sum::<Result<f64, String>>()
+        })
+        .collect::<Result<Vec<f64>, String>>()?;
+    Ok(Some(median(per_repeat)))
+}
+
+/// The median of `samples`.
+fn median(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
+}
+
+/// The dense shapes of the fragment corpus (POOT-1547), as `MxKxN`: prefill chunks of the corpus's projections, and
+/// the one-row decode of a vocabulary head, where the planner must keep the Gemv.
+const DENSE_CELLS: [(usize, usize, usize); 6] = [
+    (64, 1024, 1024),
+    (512, 1024, 3072),
+    (2048, 1024, 3072),
+    (512, 3072, 1024),
+    (1, 1024, 65_536),
+    (1, 2560, 151_936),
+];
+
+/// The operands of a dense measurement at `precision` (`exact`, `narrow`, or `gemv`: the exact decode Gemv).
+fn dense_operands(precision: &str, target: Target) -> Result<Operands, String> {
+    let name = match precision {
+        "exact" | "gemv" => "exact",
+        "narrow" => "narrow",
+        other => {
+            return Err(format!(
+                "--precision is exact, narrow or gemv, not {other:?}"
+            ));
+        }
+    };
+    Operands::of(
+        target,
+        &serde_json::json!({ "numerics": { "operand_precision": name } }),
+    )
+}
+
+/// The dense tiled shape of `shape` under `ops`: the narrowed terms when the operands are narrow.
+fn dense_shape(shape: (usize, usize, usize), ops: Operands) -> TiledShape {
+    let precision = match ops.narrow {
+        None => poot_graph_ir::OperandPrecision::Exact,
+        Some(dtype) => poot_graph_ir::OperandPrecision::Narrow(dtype),
+    };
+    TiledShape {
+        terms: StagedTerms::of(precision, None, None),
+        ..tiled_shape(shape)
+    }
+}
+
+/// `dense-cells`: one `MxKxN<TAB>precision<TAB>index` line per tiling of the dense corpus, exact and narrow, and the
+/// `gemv` line of each one-row shape.
+fn dense_cells<D>(device: impl FnOnce() -> Result<D, String>) -> Result<(), String>
+where
+    D: Device + 'static,
+{
+    let device = device()?;
+    let Target::Gpu { caps, .. } = device.target() else {
+        return Err("the device is not a GPU target".into());
+    };
+    for shape in DENSE_CELLS {
+        let text = format!("{}x{}x{}", shape.0, shape.1, shape.2);
+        for precision in ["exact", "narrow"] {
+            let ops = dense_operands(precision, device.target())?;
+            for index in 0..RegisterTiling::candidates(dense_shape(shape, ops), &caps).count() {
+                println!("{text}\t{precision}\t{index}");
             }
-        };
-        if let (Some(model), Some(measured)) = (pick(|r| r.modelled), pick(|r| r.device_us)) {
-            report.push_str(&format!("{t}\t{model}\t{measured}\n"));
+        }
+        if shape.0 == 1 {
+            println!("{text}\tgemv\tchosen");
         }
     }
-    std::fs::write(&out, &report).map_err(|e| format!("write {}: {e}", out.display()))?;
-    print!("{report}");
+    Ok(())
+}
+
+/// `dense-measure --bank B --shape MxKxN --precision exact|narrow|gemv --tiling INDEX|chosen`: one row in the packed
+/// grouped dataset's columns (`packed-measure`) for a dense contraction, its `group` column zero.
+fn dense_measure<D>(
+    args: &[String],
+    device: impl FnOnce() -> Result<D, String>,
+) -> Result<(), String>
+where
+    D: Device + 'static,
+{
+    let bank = read_bank(args)?;
+    let text = flag(args, "--shape")?;
+    let shape = parse_shape(&text)?;
+    let precision = flag(args, "--precision")?;
+    let device = device()?;
+    let target = device.target();
+    let Target::Gpu { caps, .. } = target else {
+        return Err("the device is not a GPU target".into());
+    };
+    let mut ops = dense_operands(&precision, target)?;
+    let tiling = match flag(args, "--tiling")?.as_str() {
+        "chosen" => None,
+        index => {
+            let index: usize = index.parse().map_err(|e| format!("--tiling: {e}"))?;
+            Some(
+                RegisterTiling::candidates(dense_shape(shape, ops), &caps)
+                    .nth(index)
+                    .ok_or_else(|| format!("{text} has no candidate tiling {index}"))?,
+            )
+        }
+    };
+    ops.tiling = tiling;
+    let template = if shape.0 == 1 {
+        "dense-decode-head-bf16"
+    } else {
+        "prefill-dense-bf16-nk"
+    };
+    let mut case = bank["cases"]
+        .as_array()
+        .and_then(|cases| cases.iter().find(|c| c["id"] == template))
+        .ok_or_else(|| format!("the bank has no case {template}"))?
+        .clone();
+    case["shape"] = serde_json::json!({ "m": shape.0, "k": shape.1, "n": shape.2 });
+    let prepared = prepare(&bank, &case, ops)?;
+    let program = staged(&prepared.graphs[0], target, ops, &facts_of(&device))?;
+    let tiled = dense_tiled_schedules_of(&program);
+    let gemv = dense_gemv_schedules_of(&program);
+    let measured = measure(device, &bank, &prepared, ops)?;
+    if !measured.agrees {
+        return Err(format!(
+            "{text}: the output disagrees with the reference (worst {})",
+            measured.worst
+        ));
+    }
+    let step_us = median(
+        measured
+            .device_us
+            .clone()
+            .ok_or("the device reports no timestamps; build it with device timing")?,
+    );
+    let contraction_us = dispatch_us(&measured, "contraction:dense")?
+        .ok_or_else(|| format!("{text}: no dense contraction dispatch"))?;
+    let (terms, tiles, rounds, tile, lanes, depth) = match (gemv.first(), tiled.first()) {
+        (Some(&Schedule::Gemv { width, cols, .. }), None) => (
+            GemvShape {
+                outputs: shape.0 * shape.2,
+                width,
+                cols,
+            }
+            .cost_terms(&caps),
+            0,
+            0,
+            "gemv".to_string(),
+            width as usize,
+            0,
+        ),
+        (None, Some(&ran)) => {
+            let tiling = RegisterTiling::of(ran).ok_or("the dense contraction ran no tiling")?;
+            let dense = dense_shape(shape, ops);
+            let (tile_rows, tile_cols) = tiling.output_tile();
+            if tiled.iter().any(|schedule| *schedule != ran)
+                || ops.tiling.is_some_and(|pin| pin.schedule() != ran)
+            {
+                return Err(format!(
+                    "{text}: the planner ran {tiled:?}, not the pinned {:?}",
+                    ops.tiling
+                ));
+            }
+            (
+                tiling.cost_terms(dense, &caps),
+                dense.blocks
+                    * dense.working_row_tiles(tile_rows)
+                    * dense.out_per_block.div_ceil(tile_cols),
+                dense.k.div_ceil(tiling.depth()),
+                format!("{tile_rows}x{tile_cols}"),
+                tiling.workgroup_lanes(),
+                tiling.depth(),
+            )
+        }
+        other => {
+            return Err(format!(
+                "{text}: the plan holds {other:?}, not one schedule"
+            ));
+        }
+    };
+    let modelled = terms.modelled_time(caps.gemm_launch().calibrated.figures().cost);
+    println!(
+        "{}\t{precision}\t{step_us}\t0\t{contraction_us}\t{}\t{}\t{}\t{}\t{}\t{}\t{modelled}\t{tile}\t{lanes}\t{depth}\t{tiles}\t{rounds}\t{}\t{text}",
+        shape.0,
+        terms.fma,
+        terms.lds_reads,
+        terms.staged_per_lane,
+        terms.direct_per_lane,
+        terms.rounding,
+        terms.occupancy,
+        flag(args, "--tiling")?,
+    );
     Ok(())
 }

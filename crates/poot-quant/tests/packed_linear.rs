@@ -4,7 +4,8 @@
 use std::num::NonZeroUsize;
 
 use poot_quant::decode::DecodeError;
-use poot_quant::format::{GroupMap, OperandRole, ScaleEncoding, Storage, WeightFormat};
+use poot_quant::format::{GroupMap, OperandRole, PlanarRole, ScaleEncoding, Storage, WeightFormat};
+use poot_quant::test_support::formats::{GGUF_FORMATS, packed_block_formats, packed_formats};
 use poot_quant::{
     LogicalAxis, PackedPayload, PackedWeight, PackedWeightError, SourceRole, StoredBytes,
 };
@@ -24,8 +25,8 @@ fn nonzero(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).unwrap()
 }
 
-const CODES: SourceRole = SourceRole::Planar(OperandRole::Codes);
-const SCALE: SourceRole = SourceRole::Planar(OperandRole::Scale);
+const CODES: SourceRole = SourceRole::Planar(PlanarRole::Codes);
+const SCALE: SourceRole = SourceRole::Planar(PlanarRole::Scale);
 
 /// SC-001: `PackedWeight::try_new` refuses each invalid case with a typed error.
 ///
@@ -65,7 +66,12 @@ fn packed_weight_try_new_rejects_a_partial_block() {
 
 #[test]
 fn packed_weight_try_new_rejects_a_dense_format() {
-    for format in [WeightFormat::F32, WeightFormat::F16, WeightFormat::Bf16] {
+    let dense: Vec<WeightFormat> = GGUF_FORMATS
+        .into_iter()
+        .filter(|format| !packed_formats().contains(format))
+        .collect();
+    assert_eq!(dense.len(), 3, "F32, F16 and BF16 are the dense dtypes");
+    for format in dense {
         assert_eq!(
             PackedWeight::try_new(format, [4, 4]),
             Err(PackedWeightError::DenseFormat { format })
@@ -75,45 +81,12 @@ fn packed_weight_try_new_rejects_a_dense_format() {
 
 #[test]
 fn packed_weight_try_new_accepts_every_named_scheme() {
-    for format in [
-        WeightFormat::Q4_0,
-        WeightFormat::Q4_1,
-        WeightFormat::Q5_0,
-        WeightFormat::Q5_1,
-        WeightFormat::Q8_0,
-        WeightFormat::Q2_K,
-        WeightFormat::Q3_K,
-        WeightFormat::Q4_K,
-        WeightFormat::Q5_K,
-        WeightFormat::Q6_K,
-        WeightFormat::Iq4_Nl,
-        WeightFormat::Iq4_Xs,
-        WeightFormat::Iq2_Xs,
-        WeightFormat::Iq3_Xxs,
-        WeightFormat::Iq3_S,
-        WeightFormat::Mxfp4,
-        WeightFormat::E4m3PerChannel {
-            scale: ScaleEncoding::F32,
-        },
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::Bf16,
-        },
-        WeightFormat::E2m1Row32,
-        WeightFormat::Gptq {
-            groups: GroupMap::Contiguous { size: nonzero(8) },
-        },
-        WeightFormat::Gptq {
-            groups: GroupMap::Indexed { groups: nonzero(2) },
-        },
-        WeightFormat::Awq {
-            group_size: nonzero(8),
-        },
-    ] {
+    for format in packed_formats() {
         let block_values = match format.descriptor().storage {
             poot_quant::format::Storage::Blocks(layout) => layout.values,
             poot_quant::format::Storage::Planar(_) => 1,
         };
-        let shape = [8, block_values.max(32)];
+        let shape = [8, block_values.max(256)];
         assert!(
             PackedWeight::try_new(format, shape).is_ok(),
             "{format:?} {shape:?}"
@@ -123,7 +96,7 @@ fn packed_weight_try_new_accepts_every_named_scheme() {
 
 /// SC-002: `source_shape`/`source_bytes` equal the descriptor's stored grid, for every scheme
 /// [`format::WeightFormat`] names. Every expected `[rows, row_bytes]` pair below is written by hand
-/// from the block byte counts in `blocks.rs`'s doc comments and the operand grids in `planar.rs`,
+/// from the block byte counts in the `blocks` modules' doc comments and the operand grids in `planar.rs`,
 /// not derived from the function under test; several also cross-check against the source byte
 /// lengths `planar.rs`'s own reference-vector tests already pin.
 ///
@@ -133,7 +106,7 @@ fn packed_weight_try_new_accepts_every_named_scheme() {
 /// with `left: [3, 64], right: [3, 36]`. Restored.
 #[test]
 fn packed_weight_source_shape_and_bytes_match_the_stored_grid_for_every_scheme() {
-    // Block formats (GGUF): out = 3, K = two blocks. `values`/`bytes` are `blocks.rs`'s own per-row
+    // Block formats (GGUF): out = 3, K = two blocks. `values`/`bytes` are the `blocks` modules' own per-row
     // doc comments (`Q4_0` `18 bytes per 32`, and so on).
     for (format, values, bytes) in [
         (WeightFormat::Q4_0, 32, 18),
@@ -207,7 +180,7 @@ fn packed_weight_source_shape_and_bytes_match_the_stored_grid_for_every_scheme()
         gptq_shape,
         &[
             (CODES, [2, 32]),
-            (SourceRole::Planar(OperandRole::Zero), [2, 4]),
+            (SourceRole::Planar(PlanarRole::Zero), [2, 4]),
             (SCALE, [2, 16]),
         ],
     );
@@ -218,9 +191,9 @@ fn packed_weight_source_shape_and_bytes_match_the_stored_grid_for_every_scheme()
         gptq_shape,
         &[
             (CODES, [2, 32]),
-            (SourceRole::Planar(OperandRole::Zero), [2, 4]),
+            (SourceRole::Planar(PlanarRole::Zero), [2, 4]),
             (SCALE, [2, 16]),
-            (SourceRole::Planar(OperandRole::GroupIndex), [16, 4]),
+            (SourceRole::Planar(PlanarRole::GroupIndex), [16, 4]),
         ],
     );
     assert_planar_shapes(
@@ -230,7 +203,7 @@ fn packed_weight_source_shape_and_bytes_match_the_stored_grid_for_every_scheme()
         gptq_shape,
         &[
             (CODES, [16, 4]),
-            (SourceRole::Planar(OperandRole::Zero), [2, 4]),
+            (SourceRole::Planar(PlanarRole::Zero), [2, 4]),
             (SCALE, [2, 16]),
         ],
     );
@@ -690,43 +663,7 @@ fn adjacent_e2m1_ragged_padding_and_nibble_mapping_are_exact() {
 /// (`start = 0` in the block arm); the Q4_0 `[1,0]` comparison goes red.
 #[test]
 fn decode_row_matches_the_scalar_decoder_bit_for_bit() {
-    let block_formats = [
-        WeightFormat::Q4_0,
-        WeightFormat::Q4_1,
-        WeightFormat::Q5_0,
-        WeightFormat::Q5_1,
-        WeightFormat::Q8_0,
-        WeightFormat::Iq4_Nl,
-        WeightFormat::Mxfp4,
-        WeightFormat::Q2_K,
-        WeightFormat::Q3_K,
-        WeightFormat::Q4_K,
-        WeightFormat::Q5_K,
-        WeightFormat::Q6_K,
-        WeightFormat::Iq4_Xs,
-        WeightFormat::Iq2_Xs,
-        WeightFormat::Iq3_Xxs,
-        WeightFormat::Iq3_S,
-    ];
-    let planar_formats = [
-        WeightFormat::E4m3PerChannel {
-            scale: ScaleEncoding::F32,
-        },
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::Bf16,
-        },
-        WeightFormat::E2m1Row32,
-        WeightFormat::Gptq {
-            groups: GroupMap::Contiguous { size: nonzero(64) },
-        },
-        WeightFormat::Gptq {
-            groups: GroupMap::Indexed { groups: nonzero(4) },
-        },
-        WeightFormat::Awq {
-            group_size: nonzero(64),
-        },
-    ];
-    for (seed, format) in block_formats.into_iter().chain(planar_formats).enumerate() {
+    for (seed, format) in packed_formats().into_iter().enumerate() {
         let shape = [3, 512];
         let payload = poot_quant::test_support::packed::random_payload(format, shape, seed as u64);
         let descriptor = format.descriptor();
@@ -739,7 +676,7 @@ fn decode_row_matches_the_scalar_decoder_bit_for_bit() {
                 let bytes = &payload.bytes(SourceRole::Blocks)[r * row_bytes..(r + 1) * row_bytes];
                 descriptor.decode_blocks(bytes, &mut reference).unwrap();
             } else {
-                let sources: Vec<(OperandRole, &[u8])> = payload
+                let sources: Vec<(PlanarRole, &[u8])> = payload
                     .weight()
                     .sources()
                     .into_iter()
@@ -796,19 +733,7 @@ fn decoded_rows(payload: &PackedPayload) -> Vec<Vec<u32>> {
 /// format, mismatched parts and a row past the stack are refused.
 #[test]
 fn gather_rows_moves_whole_stored_rows_of_every_block_format() {
-    let block_formats = [
-        WeightFormat::Q4_0,
-        WeightFormat::Q8_0,
-        WeightFormat::Q4_K,
-        WeightFormat::Q5_K,
-        WeightFormat::Q6_K,
-        WeightFormat::Mxfp4,
-        WeightFormat::Iq4_Xs,
-        WeightFormat::Iq2_Xs,
-        WeightFormat::Iq3_Xxs,
-        WeightFormat::Iq3_S,
-    ];
-    for (seed, format) in block_formats.into_iter().enumerate() {
+    for (seed, format) in packed_block_formats().into_iter().enumerate() {
         let gate =
             poot_quant::test_support::packed::random_payload(format, [4, 256], 2 * seed as u64);
         let up =

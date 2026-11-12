@@ -166,24 +166,29 @@ bind). Other cached values (latent, indexer, sliding-window) keep the gathered v
 ## Split-KV decode
 
 Decode launches only `B * n_q_heads` workgroups, which leaves most of a large device idle. The split-KV schedule
-(Flash-Decoding [^flashdecoding]) cuts the keys into `splits` chunks and runs two launches:
+(Flash-Decoding [^flashdecoding]) cuts the keys into at most `splits` shares and runs two launches. The grid is fixed by the
+plan, but the shares are not: each workgroup works out the range its row visits (live length, causal position, window) and cuts
+that range, so a short context in a large cache uses few shares whatever the cache capacity.
 
-1. **Partials:** one workgroup per (row, split) runs the streaming body over its chunk and writes the unnormalized
-   `(o[dv], m, l)` to scratch. A split past the live length, or fully masked, writes the neutral `(0, -inf, 0)`, so the scratch
-   needs no initialization.
-2. **Combine:** one workgroup per row merges the partials with the `exp(m_i - M)` weighting and writes the output.
+1. **Partials:** one workgroup per (row, split) cuts its row's visited range into `active` balanced shares, at most `splits` and
+   each at least a floor of keys, and a split with a share runs the streaming body over it and writes the unnormalized
+   `(o[dv], m, l)` to scratch. A split past `active` returns and writes nothing. Split 0 publishes `active` in the row's word
+   after the partials, so the scratch needs no initialization.
+2. **Combine:** one workgroup per row merges the `active` partials its row published with the `exp(m_i - M)` weighting and writes
+   the output.
 
 The scratch is a plan-local buffer. The buffer plan shares one arena slot across layers, so the arena does not grow with layer
-count. The split count is part of the request and the plan key. The planner chooses it as follows:
+count. The grid and the share floor are part of the request and the plan key. The planner chooses them as follows:
 
 | Rule | Value |
 | --- | --- |
 | Applies to | Decode (`Lq == 1`) whose rows do not fill the compute units |
-| Splits | At most 16, chunks of at least 128 keys |
+| Grid | At most 16 splits, a cache holding at least 128 keys per split; shares of at least 128 keys |
 | Falls back to streaming | Partial state over the single-buffer limit, or the 2-D fold passing the grid |
 
 A scratch the device cannot allocate is refused with a typed `ScratchBytes`. The combine reassociates float sums, so results
-match the oracle within a tolerance, not bit for bit.
+match the oracle within a tolerance, not bit for bit. The shares depend on the live length alone, so the same live prefix of
+two caches of different capacity produces the same bits whenever both grids hold the shares it needs.
 
 ## KV cache
 

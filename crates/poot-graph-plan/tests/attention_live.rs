@@ -470,8 +470,7 @@ fn gemma2_softcap_decode_and_mla_select_the_streaming_attention_schedule() {
 /// SC-002, planning half: the compiled live decode plans `bound=live` over the length operand the graph derived
 /// from `Pos`, with launches whose grids do not depend on the length. Two query rows on a 4096-key cache is the
 /// low-head case the split-KV schedule serves (POOT-1113): its two launches (partials, then combine) take their
-/// grids from the shape alone, and a split a short live length leaves empty publishes its own neutral partial
-/// at run time. Mutation: plan the bound as `Static` in `planner/attention.rs`; the assertion on `spec.bound`
+/// grids from the shape alone, and a short live length is cut into fewer shares at run time. Mutation: plan the bound as `Static` in `planner/attention.rs`; the assertion on `spec.bound`
 /// fails.
 #[test]
 fn the_compiled_live_decode_plans_a_live_bound_and_a_length_independent_launch() {

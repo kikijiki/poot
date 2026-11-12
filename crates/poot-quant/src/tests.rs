@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::format::ScaleEncoding;
+use crate::test_support::formats::GGUF_FORMATS;
 
 fn owner(bytes: &[u8]) -> StoredBytes {
     StoredBytes::from(bytes.to_vec())
@@ -17,8 +18,8 @@ fn payload(
     PackedPayload::try_new(
         weight,
         [
-            (SourceRole::Planar(OperandRole::Codes), weight_bytes),
-            (SourceRole::Planar(OperandRole::Scale), scale_bytes),
+            (SourceRole::Planar(PlanarRole::Codes), weight_bytes),
+            (SourceRole::Planar(PlanarRole::Scale), scale_bytes),
         ],
     )
     .unwrap()
@@ -209,16 +210,9 @@ fn scale_byte_offset(format: WeightFormat) -> usize {
 /// is a legitimate, not a refused, scale) of every one.
 #[test]
 fn block32_formats_refuse_non_finite_fields_and_accept_everything_else() {
-    const BLOCK32: [WeightFormat; 7] = [
-        WeightFormat::Q4_0,
-        WeightFormat::Q4_1,
-        WeightFormat::Q5_0,
-        WeightFormat::Q5_1,
-        WeightFormat::Q8_0,
-        WeightFormat::Iq4_Nl,
-        WeightFormat::Mxfp4,
-    ];
-    for format in BLOCK32 {
+    for format in GGUF_FORMATS.into_iter().filter(|format| {
+        matches!(format.descriptor().storage, Storage::Blocks(layout) if layout.values == 32)
+    }) {
         let Storage::Blocks(layout) = format.descriptor().storage else {
             unreachable!()
         };
@@ -284,9 +278,9 @@ fn gptq_act_order_refuses_negative_and_out_of_range_group_index() {
     };
     let weight = PackedWeight::try_new(format, [4, 8]).unwrap();
 
-    let codes = vec![0u8; weight.source_bytes(SourceRole::Planar(OperandRole::Codes))];
-    let zero = vec![0u8; weight.source_bytes(SourceRole::Planar(OperandRole::Zero))];
-    let scale = vec![0u8; weight.source_bytes(SourceRole::Planar(OperandRole::Scale))];
+    let codes = vec![0u8; weight.source_bytes(SourceRole::Planar(PlanarRole::Codes))];
+    let zero = vec![0u8; weight.source_bytes(SourceRole::Planar(PlanarRole::Zero))];
+    let scale = vec![0u8; weight.source_bytes(SourceRole::Planar(PlanarRole::Scale))];
     let valid_g_idx: Vec<u8> = (0..8u32)
         .flat_map(|k| ((k % groups as u32) as i32).to_le_bytes())
         .collect();
@@ -296,19 +290,19 @@ fn gptq_act_order_refuses_negative_and_out_of_range_group_index() {
             weight,
             [
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     StoredBytes::from(codes.clone()),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Zero),
+                    SourceRole::Planar(PlanarRole::Zero),
                     StoredBytes::from(zero.clone()),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     StoredBytes::from(scale.clone()),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::GroupIndex),
+                    SourceRole::Planar(PlanarRole::GroupIndex),
                     StoredBytes::from(g_idx),
                 ),
             ],

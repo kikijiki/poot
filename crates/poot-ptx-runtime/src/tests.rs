@@ -823,7 +823,7 @@ fn captured_graph_owns_dispatched_buffers_until_it_drops() {
         )
         .expect("mock allocation")
     };
-    // Fake device addresses on the binding alignment (`poot_codegen::BUFFER_PARAM_ALIGN`), as `cuMemAlloc` returns.
+    // Fake device addresses on the binding alignment (`poot_kernel_ir::BUFFER_PARAM_ALIGN`), as `cuMemAlloc` returns.
     let (a, b, out) = (alloc(0x1010), alloc(0x1020), alloc(0x1030));
     let uncaptured = alloc(0x1040);
 
@@ -1888,4 +1888,57 @@ fn an_out_of_bounds_store_is_device_lost_and_poisons_the_context() {
         matches!(next, Err(PtxError::Poisoned { .. })),
         "got {next:?}"
     );
+}
+
+/// SC-d (PTX, run on a pod): the integer `Rvalue::VectorLoad` fixtures, compiled for NVPTX and dispatched, read what
+/// scalar loads of the same words read: `ld.global.v4.b32` for the first fixture, a `v4` and a `v2` next to a scalar
+/// load of the same param for the second. Mutation (kept out of the tree): in `emit_vector_load`'s pointer arm, load
+/// `<2 x i32>` at the element index and again at the index plus one in place of the `<4 x i32>`; the lanes of every
+/// other word are wrong and this row goes red. Skips with no CUDA device.
+#[test]
+fn u32x4_vector_load_matches_scalar_loads_on_ptx() {
+    let Ok(ctx) = PtxContext::new() else {
+        eprintln!("POOT-SKIP u32x4_vector_load_matches_scalar_loads_on_ptx: no NVIDIA GPU");
+        return;
+    };
+    let dir = std::env::temp_dir().join("poot-ptx-runtime-vector-load-test");
+    std::fs::create_dir_all(&dir).expect("create fixture artifact dir");
+    for case in poot_kernel_ir::test_support::vector_load_cases() {
+        let name = case.body.name.clone();
+        let out = poot_codegen::artifact_path(&dir, &name, poot_codegen::Target::Nvptx);
+        let artifact = poot_codegen::compile_kernel(&case.body, poot_target::Backend::Nvptx, &out)
+            .unwrap_or_else(|e| panic!("compile {name}: {e}"));
+        let kernel = poot_codegen::kernel_handle(&case.body, &artifact).unwrap();
+        let input = ctx
+            .alloc_storage(BufferRole::Input, BufferStorage::i32(), case.input.len())
+            .expect("alloc input");
+        let bytes: Vec<u8> = case.input.iter().flat_map(|w| w.to_le_bytes()).collect();
+        ctx.write_with(&input, 0, bytes.len(), &mut |range, out| {
+            out.copy_from_slice(&bytes[range]);
+        })
+        .expect("write input");
+        let output = ctx
+            .alloc_storage(BufferRole::Output, BufferStorage::i32(), case.want.len())
+            .expect("alloc output");
+        ctx.dispatch_dev(
+            &name,
+            &kernel,
+            case.body.workgroup_size,
+            [poot_kernel_ir::test_support::VECTOR_LOAD_THREADS, 1, 1],
+            &[&input],
+            &[case.input.len()],
+            &output,
+            case.want.len(),
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut raw = vec![0u8; case.want.len() * 4];
+        ctx.read_bytes(&output, &mut raw).expect("read output");
+        let got: Vec<u32> = raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect();
+        assert_eq!(got, case.want, "{name}");
+    }
 }

@@ -185,7 +185,11 @@ impl FormatDescriptor {
             return Ok(None);
         };
         if operand.packing.is_some() || operand.bits != float.bits() {
-            return Err(unsupported(self, operand.role));
+            let role = operand
+                .role
+                .operand()
+                .expect("a float operand enters the value formula");
+            return Err(unsupported(self, role));
         }
         Ok(Some(OperandContentCheck {
             width: float_width(float),
@@ -254,11 +258,11 @@ impl OperandContentCheck {
 mod tests {
     use crate::StoredBytes;
     use std::collections::BTreeSet;
-    use std::num::NonZeroUsize;
 
     use super::*;
-    use crate::format::{GroupMap, ScaleEncoding, WeightFormat};
+    use crate::format::{PlanarRole, WeightFormat};
     use crate::scalar::float_to_f32;
+    use crate::test_support::formats::{GGUF_FORMATS, SAFETENSORS_FORMATS};
     use crate::{PackedPayload, PackedWeight, PackedWeightError, SourceRole};
 
     /// Whether the stored `bits` decode finite under the format's non-finite pattern.
@@ -276,47 +280,6 @@ mod tests {
         FloatFormat::E2m1,
         FloatFormat::E8m0,
     ];
-
-    const BLOCK_FORMATS: [WeightFormat; 19] = [
-        WeightFormat::F32,
-        WeightFormat::F16,
-        WeightFormat::Bf16,
-        WeightFormat::Q4_0,
-        WeightFormat::Q4_1,
-        WeightFormat::Q5_0,
-        WeightFormat::Q5_1,
-        WeightFormat::Q8_0,
-        WeightFormat::Q2_K,
-        WeightFormat::Q3_K,
-        WeightFormat::Q4_K,
-        WeightFormat::Q5_K,
-        WeightFormat::Q6_K,
-        WeightFormat::Iq4_Nl,
-        WeightFormat::Iq4_Xs,
-        WeightFormat::Iq2_Xs,
-        WeightFormat::Iq3_Xxs,
-        WeightFormat::Iq3_S,
-        WeightFormat::Mxfp4,
-    ];
-
-    fn planar_formats() -> Vec<WeightFormat> {
-        let size = NonZeroUsize::new(32).unwrap();
-        let mut formats = vec![WeightFormat::E2m1Row32];
-        for scale in [ScaleEncoding::F32, ScaleEncoding::Bf16, ScaleEncoding::E8m0] {
-            formats.push(WeightFormat::E4m3PerChannel { scale });
-            formats.push(WeightFormat::E4m3Block128 { scale });
-        }
-        formats.push(WeightFormat::Gptq {
-            groups: GroupMap::Contiguous { size },
-        });
-        formats.push(WeightFormat::Gptq {
-            groups: GroupMap::Indexed {
-                groups: NonZeroUsize::new(1).unwrap(),
-            },
-        });
-        formats.push(WeightFormat::Awq { group_size: size });
-        formats
-    }
 
     /// The stored patterns of `float` that do not decode finite, found by decoding every pattern
     /// (or, for f32, from the IEEE special values): the independent oracle for the compiled masks.
@@ -391,7 +354,7 @@ mod tests {
     #[test]
     fn every_block_format_refuses_a_non_finite_field_at_first_middle_and_last_block() {
         const BLOCKS: usize = 5;
-        for format in BLOCK_FORMATS {
+        for format in GGUF_FORMATS {
             let descriptor = format.descriptor();
             let Storage::Blocks(layout) = descriptor.storage else {
                 unreachable!()
@@ -464,7 +427,7 @@ mod tests {
     /// `Float` operand with a pattern, at the first, a middle and the last element.
     #[test]
     fn every_planar_format_refuses_a_non_finite_operand_element_at_first_middle_and_last() {
-        for format in planar_formats() {
+        for format in SAFETENSORS_FORMATS {
             let weight = PackedWeight::try_new(format, [4, 256]).unwrap();
             let descriptor = format.descriptor();
             let Storage::Planar(layout) = descriptor.storage else {
@@ -497,7 +460,7 @@ mod tests {
                             PackedWeightError::NonFiniteField {
                                 format,
                                 role,
-                                operand: operand.role,
+                                operand: operand.role.operand().unwrap(),
                                 element,
                             },
                             "{format:?} {:?} element {element} {pattern:#x}",
@@ -535,7 +498,7 @@ mod tests {
     #[test]
     fn a_block_scan_reads_each_stored_float_once_per_block() {
         const BLOCKS: usize = 1000;
-        for format in BLOCK_FORMATS {
+        for format in GGUF_FORMATS {
             let descriptor = format.descriptor();
             let Storage::Blocks(layout) = descriptor.storage else {
                 unreachable!()
@@ -594,7 +557,7 @@ mod tests {
         for operand in layout.operands {
             let check = descriptor.operand_content_check(operand).unwrap();
             match operand.role {
-                OperandRole::Codes => assert!(check.is_none()),
+                PlanarRole::Codes => assert!(check.is_none()),
                 role => {
                     let len = weight.source_bytes(SourceRole::Planar(role));
                     let mut counter = Counter::default();
@@ -614,10 +577,10 @@ mod tests {
     /// locate (no descriptor reaches `UnsupportedFloatField`).
     #[test]
     fn every_registered_format_compiles_a_content_check() {
-        for format in BLOCK_FORMATS {
+        for format in GGUF_FORMATS {
             format.descriptor().block_content_check().unwrap();
         }
-        for format in planar_formats() {
+        for format in SAFETENSORS_FORMATS {
             let Storage::Planar(layout) = format.descriptor().storage else {
                 unreachable!()
             };

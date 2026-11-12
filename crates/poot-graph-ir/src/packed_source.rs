@@ -8,20 +8,17 @@
 
 use std::fmt;
 
-use poot_quant::{OperandRole, PackedWeight, SourceRole};
+use poot_quant::{PackedWeight, PlanarRole, SourceRole};
 
 use crate::types::{DType, TensorType};
 
 /// Every [`SourceRole`] a packed source name can carry.
-const ALL_ROLES: [SourceRole; 8] = [
+const ALL_ROLES: [SourceRole; 5] = [
     SourceRole::Blocks,
-    SourceRole::Planar(OperandRole::Codes),
-    SourceRole::Planar(OperandRole::Scale),
-    SourceRole::Planar(OperandRole::SubScale),
-    SourceRole::Planar(OperandRole::Zero),
-    SourceRole::Planar(OperandRole::Min),
-    SourceRole::Planar(OperandRole::SubMin),
-    SourceRole::Planar(OperandRole::GroupIndex),
+    SourceRole::Planar(PlanarRole::Codes),
+    SourceRole::Planar(PlanarRole::Scale),
+    SourceRole::Planar(PlanarRole::Zero),
+    SourceRole::Planar(PlanarRole::GroupIndex),
 ];
 
 /// The graph constant name of one packed weight's source component:
@@ -66,16 +63,10 @@ impl PackedSourceName {
     pub const fn suffix(role: SourceRole) -> &'static str {
         match role {
             SourceRole::Blocks => ".packed_blocks_source",
-            SourceRole::Planar(OperandRole::Codes) => ".packed_weight_source",
-            SourceRole::Planar(OperandRole::Scale) => ".packed_scale_source",
-            SourceRole::Planar(OperandRole::SubScale) => ".packed_subscale_source",
-            SourceRole::Planar(OperandRole::Zero) => ".packed_zero_source",
-            SourceRole::Planar(OperandRole::Min) => ".packed_min_source",
-            SourceRole::Planar(OperandRole::SubMin) => ".packed_submin_source",
-            SourceRole::Planar(OperandRole::GroupIndex) => ".packed_group_index_source",
-            SourceRole::Planar(OperandRole::Signs) => {
-                panic!("Signs is read inside a block format source, never planar")
-            }
+            SourceRole::Planar(PlanarRole::Codes) => ".packed_weight_source",
+            SourceRole::Planar(PlanarRole::Scale) => ".packed_scale_source",
+            SourceRole::Planar(PlanarRole::Zero) => ".packed_zero_source",
+            SourceRole::Planar(PlanarRole::GroupIndex) => ".packed_group_index_source",
         }
     }
 
@@ -90,12 +81,12 @@ impl PackedSourceName {
 
     /// The name of `linear_id`'s weight codes source, the `Codes` planar role.
     pub fn weight(linear_id: &str) -> Self {
-        Self::new(linear_id, SourceRole::Planar(OperandRole::Codes))
+        Self::new(linear_id, SourceRole::Planar(PlanarRole::Codes))
     }
 
     /// The name of `linear_id`'s scale source, the `Scale` planar role.
     pub fn scale(linear_id: &str) -> Self {
-        Self::new(linear_id, SourceRole::Planar(OperandRole::Scale))
+        Self::new(linear_id, SourceRole::Planar(PlanarRole::Scale))
     }
 
     /// Both source names of one linear built from exactly `Codes` and `Scale`, weight first.
@@ -187,7 +178,7 @@ pub fn packed_source_constants(
 
 #[cfg(test)]
 mod tests {
-    use poot_quant::format::{ScaleEncoding, WeightFormat};
+    use poot_quant::test_support::formats::two_source_formats;
 
     use super::*;
 
@@ -246,19 +237,7 @@ mod tests {
     /// lengths, for every registered format.
     #[test]
     fn packed_source_types_span_the_authoritative_source_buffers() {
-        let formats = [
-            WeightFormat::E4m3Block128 {
-                scale: ScaleEncoding::Bf16,
-            },
-            WeightFormat::E4m3Block128 {
-                scale: ScaleEncoding::F32,
-            },
-            WeightFormat::E4m3Block128 {
-                scale: ScaleEncoding::E8m0,
-            },
-            WeightFormat::E2m1Row32,
-        ];
-        for (index, format) in formats.into_iter().enumerate() {
+        for (index, format) in two_source_formats().into_iter().enumerate() {
             let logical = if index % 2 == 0 { [2, 256] } else { [3, 129] };
             let weight = PackedWeight::try_new(format, logical).unwrap();
             let constants = packed_source_constants("layer", weight);
@@ -266,30 +245,30 @@ mod tests {
                 <[(PackedSourceName, TensorType); 2]>::try_from(constants)
                     .expect("a registered packed-linear format has exactly two sources");
 
-            assert_eq!(weight_name.role(), SourceRole::Planar(OperandRole::Codes));
-            assert_eq!(scale_name.role(), SourceRole::Planar(OperandRole::Scale));
+            assert_eq!(weight_name.role(), SourceRole::Planar(PlanarRole::Codes));
+            assert_eq!(scale_name.role(), SourceRole::Planar(PlanarRole::Scale));
             assert_eq!(weight_type.dtype, DType::I8, "{format:?}");
             assert_eq!(scale_type.dtype, DType::I8, "{format:?}");
             assert_eq!(
                 weight_type.shape,
                 weight
-                    .source_shape(SourceRole::Planar(OperandRole::Codes))
+                    .source_shape(SourceRole::Planar(PlanarRole::Codes))
                     .to_vec(),
                 "{format:?}"
             );
             assert_eq!(
                 weight_type.shape.iter().product::<usize>(),
-                weight.source_bytes(SourceRole::Planar(OperandRole::Codes)),
+                weight.source_bytes(SourceRole::Planar(PlanarRole::Codes)),
                 "{format:?}"
             );
             assert_eq!(
                 scale_type.shape.iter().product::<usize>(),
-                weight.source_bytes(SourceRole::Planar(OperandRole::Scale)),
+                weight.source_bytes(SourceRole::Planar(PlanarRole::Scale)),
                 "{format:?}"
             );
             assert_eq!(
                 scale_type.shape[0],
-                weight.source_shape(SourceRole::Planar(OperandRole::Scale))[0],
+                weight.source_shape(SourceRole::Planar(PlanarRole::Scale))[0],
                 "{format:?}"
             );
         }

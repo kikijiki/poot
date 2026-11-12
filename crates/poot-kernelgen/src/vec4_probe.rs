@@ -17,7 +17,7 @@ use crate::unit_helpers::{ctx, spv, which};
 /// `Statement::VectorStore`. No bounds-check block: the dispatch is sized exactly to the buffer.
 pub(crate) fn vec4_add_splat(name: &str, add: f32) -> Body {
     // _0 ret, _1 a: &[f32], _2 out: &mut [f32], _3 i (vector-group index), _4 v (loaded vec4),
-    // _5 splat (broadcast add), _6 sum (v + splat).
+    // _5 splat (broadcast add), _6 sum (v + splat), _7 base (the element index of group `i`).
     let locals = vec![
         ld(Ty::Unit, false),
         ld(slice_f32(false), false),
@@ -44,8 +44,17 @@ pub(crate) fn vec4_add_splat(name: &str, add: f32) -> Body {
             },
             false,
         ),
+        ld(Ty::Usize, false),
     ];
-    let (a, out, i, v, splat, sum) = (local(1), local(2), local(3), local(4), local(5), local(6));
+    let (a, out, i, v, splat, sum, base) = (
+        local(1),
+        local(2),
+        local(3),
+        local(4),
+        local(5),
+        local(6),
+        local(7),
+    );
     let bb0 = BasicBlock {
         statements: vec![],
         terminator: Terminator::ThreadIndexCall {
@@ -56,7 +65,21 @@ pub(crate) fn vec4_add_splat(name: &str, add: f32) -> Body {
     };
     let bb1 = BasicBlock {
         statements: vec![
-            Statement::Assign(Place::local(v), Rvalue::VectorLoad { place: elem(a, i) }),
+            Statement::Assign(
+                Place::local(base),
+                Rvalue::BinaryOp(
+                    BinOp::Mul,
+                    copy(Place::local(i)),
+                    Operand::Const(Constant::Usize(4)),
+                ),
+            ),
+            Statement::Assign(
+                Place::local(v),
+                Rvalue::VectorLoad {
+                    place: elem(a, base),
+                    align_bytes: 16,
+                },
+            ),
             Statement::Assign(
                 Place::local(splat),
                 Rvalue::VectorSplat(Operand::Const(Constant::F32(add))),

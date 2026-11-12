@@ -781,45 +781,9 @@ mod tests {
         }
     }
 
-    /// Every packed format the Gemv admits, with the planar formats' parameters spelled out.
+    /// Every packed format the Gemv admits.
     fn packed_gemv_formats() -> Vec<WeightFormat> {
-        use poot_quant::format::{GroupMap, ScaleEncoding};
-        use std::num::NonZeroUsize;
-        let size = |n: usize| NonZeroUsize::new(n).unwrap();
-        vec![
-            WeightFormat::Q4_0,
-            WeightFormat::Q4_1,
-            WeightFormat::Q5_0,
-            WeightFormat::Q5_1,
-            WeightFormat::Q8_0,
-            WeightFormat::Q2_K,
-            WeightFormat::Q3_K,
-            WeightFormat::Q4_K,
-            WeightFormat::Q5_K,
-            WeightFormat::Q6_K,
-            WeightFormat::Iq4_Nl,
-            WeightFormat::Iq4_Xs,
-            WeightFormat::Iq2_Xs,
-            WeightFormat::Iq3_Xxs,
-            WeightFormat::Iq3_S,
-            WeightFormat::Mxfp4,
-            WeightFormat::E4m3PerChannel {
-                scale: ScaleEncoding::Bf16,
-            },
-            WeightFormat::E4m3Block128 {
-                scale: ScaleEncoding::F32,
-            },
-            WeightFormat::E2m1Row32,
-            WeightFormat::Gptq {
-                groups: GroupMap::Contiguous { size: size(128) },
-            },
-            WeightFormat::Gptq {
-                groups: GroupMap::Indexed { groups: size(4) },
-            },
-            WeightFormat::Awq {
-                group_size: size(64),
-            },
-        ]
+        poot_quant::test_support::formats::packed_formats()
     }
 
     /// The `unroll` (a lane's contiguous run of K elements per trip) of the decode Gemv `compile` plans for a
@@ -976,7 +940,7 @@ mod tests {
             ),
             (
                 WeightFormat::Gptq {
-                    groups: GroupMap::Indexed { groups: size(4) },
+                    groups: GroupMap::Indexed { groups: size(32) },
                 },
                 8,
             ),

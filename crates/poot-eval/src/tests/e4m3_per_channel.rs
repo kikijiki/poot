@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use poot_graph_ir::{Builder, OpKind, Operand, Slot, TensorType, packed_source_constants};
 use poot_quant::format::{ScaleEncoding, WeightFormat};
-use poot_quant::{OperandRole, PackedComponentRef, PackedPayload, PackedWeight, SourceRole};
+use poot_quant::{PackedComponentRef, PackedPayload, PackedWeight, PlanarRole, SourceRole};
 
 use crate::{EvalOptions, Value, eval};
 use poot_tensor::HostTensor;
@@ -61,8 +61,8 @@ fn run_case(x_shape: Vec<usize>, x_data: Vec<f32>, bytes: Vec<Vec<u8>>, scales: 
         PackedPayload::try_new(
             descriptor,
             [
-                (SourceRole::Planar(OperandRole::Codes), weight_bytes.into()),
-                (SourceRole::Planar(OperandRole::Scale), scale_bytes.into()),
+                (SourceRole::Planar(PlanarRole::Codes), weight_bytes.into()),
+                (SourceRole::Planar(PlanarRole::Scale), scale_bytes.into()),
             ],
         )
         .expect("valid E4m3PerChannel payload"),

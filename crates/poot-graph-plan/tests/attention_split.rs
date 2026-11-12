@@ -91,7 +91,8 @@ fn attentions(
 }
 
 /// A low-head decode over a long cache plans stage one into a scratch and the combine out of it: two
-/// launches, one declared scratch of `rows * splits * (dv + 2)` f32 elements, the first dispatch writing it
+/// launches, one declared scratch of `rows * (splits * (dv + 2) + 1)` f32 elements (the partials, then each row's
+/// published split count), the first dispatch writing it
 /// and the second reading it and writing the output. The chain's kernel request is the split schedule.
 #[test]
 fn a_low_head_decode_plans_two_launches_through_one_scratch() {
@@ -109,7 +110,7 @@ fn a_low_head_decode_plans_two_launches_through_one_scratch() {
         let [decl] = plan.scratch() else {
             panic!("{name}: one scratch: {:?}", plan.scratch());
         };
-        assert_eq!(decl.elems(), 2 * splits * (64 + 2), "{name}");
+        assert_eq!(decl.elems(), 2 * (splits * (64 + 2) + 1), "{name}");
         assert_eq!(decl.storage(), poot_target::BufferStorage::f32(), "{name}");
         let id = ScratchId::new(0);
         assert_eq!(plan[0].binding().write(), Sink::Scratch(id), "{name}");
@@ -183,6 +184,44 @@ fn a_live_decode_over_a_declared_position_slot_plans_the_split_schedule() {
             "{name}: {spec:?}"
         );
         assert_eq!((plan.len(), plan.scratch().len()), (2, 1), "{name}");
+    }
+}
+
+/// The capacity bounds the grid and the planner states the floor the live range is partitioned against
+/// (POOT-1400). A 16-head decode on a 64-compute-unit device (an RTX A5000) over a 8320-key cache plans a grid of
+/// 8 splits with shares of at least the planner's 128 keys; over a 256-key cache the grid is 2. The shares are
+/// the kernel's to cut from the live length, so the planned floor is 128 steps in both, not the capacity's chunk,
+/// and the scratch holds the grid's partials plus one published count per row.
+///
+/// Mutation: in `attention_splits`, state the floor as the cache capacity (`min_units: spec.lk`); the floor
+/// assertion goes red.
+#[test]
+fn the_split_grid_follows_the_capacity_and_the_floor_does_not() {
+    let backend = Backend::Nvptx;
+    let caps = DeviceCaps {
+        compute_units: poot_target::Queried::Known(64),
+        ..default_caps_for(backend)
+    };
+    for (capacity, grid) in [(8320, 8), (256, 2)] {
+        let program = compiled(&decode_chain(1, 16, capacity, 128), &target(backend, caps));
+        let [(_, _, plan, spec)] = attentions(&program)[..] else {
+            panic!("capacity {capacity}: one attention");
+        };
+        let AttentionSchedule::SplitKv {
+            splits, min_units, ..
+        } = spec.schedule
+        else {
+            panic!("capacity {capacity}: a 16-row decode on 64 compute units splits: {spec:?}");
+        };
+        assert_eq!((splits, min_units), (grid, 128), "capacity {capacity}");
+        let [decl] = plan.scratch() else {
+            panic!("capacity {capacity}: one scratch: {:?}", plan.scratch());
+        };
+        assert_eq!(
+            decl.elems(),
+            16 * (splits * (128 + 2) + 1),
+            "capacity {capacity}"
+        );
     }
 }
 

@@ -28,6 +28,9 @@ pub(crate) struct GemvLaunch {
 /// The lanes of one [`GemvActivation::Vec4`] group read.
 const ACTIVATION_GROUP: usize = GemvActivation::VEC4_LANES;
 
+/// The alignment, in bytes, of one f32 activation group: its address is a multiple of the group's size.
+const ACTIVATION_GROUP_ALIGN: u32 = (ACTIVATION_GROUP * size_of::<f32>()) as u32;
+
 impl GemvLaunch {
     pub(crate) fn new(
         width: u32,
@@ -214,23 +217,25 @@ pub(crate) fn gemv_body(
         // The vector groups are read before the run's products; a scalar run reads each value as it meets it.
         let grouped: Option<Vec<Local>> =
             (activation_read == GemvActivation::Vec4 && count == unroll).then(|| {
-                let first_group = bin(
-                    e,
-                    Ty::Usize,
-                    BinOp::Div,
-                    copy(act_base),
-                    cu(ACTIVATION_GROUP),
-                );
                 (0..count / ACTIVATION_GROUP)
                     .flat_map(|g| {
-                        let group_idx = bin(e, Ty::Usize, BinOp::Add, copy(first_group), cu(g));
+                        // The group starts at element `act_base + 4g`, a multiple of four; the activation binding
+                        // starts on `BUFFER_PARAM_ALIGN`, so the group's address is 16-byte aligned.
+                        let group_at = bin(
+                            e,
+                            Ty::Usize,
+                            BinOp::Add,
+                            copy(act_base),
+                            cu(g * ACTIVATION_GROUP),
+                        );
                         let group = e.let_(
                             Ty::Vec {
                                 elem: Box::new(Ty::F32),
                                 lanes: ACTIVATION_GROUP as u32,
                             },
                             Rvalue::VectorLoad {
-                                place: elem(activation, group_idx),
+                                place: elem(activation, group_at),
+                                align_bytes: ACTIVATION_GROUP_ALIGN,
                             },
                         );
                         (0..ACTIVATION_GROUP as u32)

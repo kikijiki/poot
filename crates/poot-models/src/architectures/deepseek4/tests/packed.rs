@@ -3,7 +3,7 @@
 //! projection against it compares two independent implementations.
 
 use poot_quant::format::{ScaleEncoding, WeightFormat};
-use poot_quant::{OperandRole, PackedPayload, PackedWeight, SourceRole, StoredBytes};
+use poot_quant::{PackedPayload, PackedWeight, PlanarRole, SourceRole, StoredBytes};
 
 /// The routed experts: adjacent-K E2M1 codes with one E8M0 scale per row per 32 values of K.
 pub(super) const FP4: WeightFormat = WeightFormat::E2m1Row32;
@@ -53,8 +53,8 @@ pub(super) fn payload(
     scale: impl Fn(usize, usize) -> u8,
 ) -> PackedPayload {
     let weight = PackedWeight::try_new(format, shape).expect("a valid packed shape");
-    let codes = SourceRole::Planar(OperandRole::Codes);
-    let scales = SourceRole::Planar(OperandRole::Scale);
+    let codes = SourceRole::Planar(PlanarRole::Codes);
+    let scales = SourceRole::Planar(PlanarRole::Scale);
     let code_bytes: Vec<u8> = (0..weight.source_bytes(codes))
         .map(|i| match format {
             WeightFormat::E2m1Row32 => mix(seed, i) as u8,
@@ -82,8 +82,8 @@ pub(super) fn payload(
 pub(super) fn literal(payload: &PackedPayload) -> Vec<f32> {
     let weight = payload.weight();
     let [out, k] = weight.shape();
-    let codes = SourceRole::Planar(OperandRole::Codes);
-    let scales = SourceRole::Planar(OperandRole::Scale);
+    let codes = SourceRole::Planar(PlanarRole::Codes);
+    let scales = SourceRole::Planar(PlanarRole::Scale);
     let [_, code_columns] = weight.source_shape(codes);
     let [_, scale_columns] = weight.source_shape(scales);
     let (code_bytes, scale_bytes) = (payload.bytes(codes), payload.bytes(scales));

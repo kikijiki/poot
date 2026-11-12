@@ -16,7 +16,8 @@ use poot_graph_ir::{
 };
 use poot_quant::format::{GroupMap, ScaleEncoding, WeightFormat};
 use poot_quant::{
-    OperandRole, PackedComponentRef, PackedPayload, PackedWeight, SourceRole, StoredBytes,
+    OperandRole, PackedComponentRef, PackedPayload, PackedWeight, PlanarRole, SourceRole,
+    StoredBytes,
 };
 use poot_tensor::{DType, HostTensor};
 
@@ -197,11 +198,11 @@ fn cases() -> Vec<Case> {
             shape: e4m3_per_channel_shape,
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     e4m3_weight_per_channel.clone(),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     hex("0000003f0000e0bfa69b443b"),
                 ),
             ],
@@ -214,10 +215,10 @@ fn cases() -> Vec<Case> {
             shape: e4m3_per_channel_shape,
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     e4m3_weight_per_channel.clone(),
                 ),
-                (SourceRole::Planar(OperandRole::Scale), hex("403f80bf003c")),
+                (SourceRole::Planar(PlanarRole::Scale), hex("403f80bf003c")),
             ],
         },
         Case {
@@ -228,10 +229,10 @@ fn cases() -> Vec<Case> {
             shape: e4m3_per_channel_shape,
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     e4m3_weight_per_channel.clone(),
                 ),
-                (SourceRole::Planar(OperandRole::Scale), hex("7e8278")),
+                (SourceRole::Planar(PlanarRole::Scale), hex("7e8278")),
             ],
         },
         Case {
@@ -242,11 +243,11 @@ fn cases() -> Vec<Case> {
             shape: e4m3_block128_shape,
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     e4m3_weight_block128.clone(),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     // `poot_quant::planar`'s own literal test pins scale index 1 to `-2.0` (negative on
                     // purpose, to prove the scale field's sign math), covered by `[0,128]`, `[0,129]`
                     // and `[64,129]`. `PackedPayload::try_new` additionally enforces the *production*
@@ -267,11 +268,11 @@ fn cases() -> Vec<Case> {
             shape: e4m3_block128_shape,
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     e4m3_weight_block128.clone(),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     // See the F32 case above: same fix, same three points dropped.
                     hex("803e0040403fe040"),
                 ),
@@ -285,10 +286,10 @@ fn cases() -> Vec<Case> {
             shape: e4m3_block128_shape,
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     e4m3_weight_block128.clone(),
                 ),
-                (SourceRole::Planar(OperandRole::Scale), hex("7d807981")),
+                (SourceRole::Planar(PlanarRole::Scale), hex("7d807981")),
             ],
         },
         Case {
@@ -297,10 +298,10 @@ fn cases() -> Vec<Case> {
             shape: [2, 35],
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     hex("80837d1d0612d0e601c6d1bdf94dad156304c0dca8af7231d39ce31efb211b9916741c0a"),
                 ),
-                (SourceRole::Planar(OperandRole::Scale), hex("7f817a02")),
+                (SourceRole::Planar(PlanarRole::Scale), hex("7f817a02")),
             ],
         },
         Case {
@@ -311,17 +312,17 @@ fn cases() -> Vec<Case> {
             shape: [8, 16],
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     hex(
                         "6187f803f0423141182c8d58e2912c82c2b7f4045a572fb18fe594e3b5e79e9806fada64fa70e9ce9a1e4d9d1e4970acab2968c3f084cc5f1de2b0ccc9cd39c1",
                     ),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Zero),
+                    SourceRole::Planar(PlanarRole::Zero),
                     hex("c0ad6caaba893613"),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     hex("aea7c32500310a27ae273daab8aa33abaea7c321cda87e21ae233daa7b287d23"),
                 ),
             ],
@@ -334,21 +335,21 @@ fn cases() -> Vec<Case> {
             shape: [8, 16],
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     hex(
                         "6187f803f0423141182c8d58e2912c82c2b7f4045a572fb18fe594e3b5e79e9806fada64fa70e9ce9a1e4d9d1e4970acab2968c3f084cc5f1de2b0ccc9cd39c1",
                     ),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Zero),
+                    SourceRole::Planar(PlanarRole::Zero),
                     hex("c0ad6caaba893613"),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     hex("aea7c32500310a27ae273daab8aa33abaea7c321cda87e21ae233daa7b287d23"),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::GroupIndex),
+                    SourceRole::Planar(PlanarRole::GroupIndex),
                     hex(
                         "01000000000000000100000000000000010000000000000001000000000000000100000000000000010000000000000001000000000000000100000000000000",
                     ),
@@ -363,17 +364,17 @@ fn cases() -> Vec<Case> {
             shape: [8, 16],
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     hex(
                         "81f2205a168cefb5c757127728eb94e5d844c1ef8f9f23928334218150e0849ba6dbea90901a1fcfea2990d41fe247c8da08099c4db67e3cd4c3ce1f96ccacc5",
                     ),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Zero),
+                    SourceRole::Planar(PlanarRole::Zero),
                     hex("d0acaca69a368b13"),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     hex("aea7c32500310a27ae273daab8aa33abaea7c321cda87e21ae233daa7b287d23"),
                 ),
             ],
@@ -509,8 +510,8 @@ fn gguf_case(label: &'static str, format: WeightFormat, shape: [usize; 2]) -> Ca
 fn e2m1_case() -> Case {
     let shape = [8, 35];
     let descriptor = PackedWeight::try_new(WeightFormat::E2m1Row32, shape).unwrap();
-    let row_bytes = descriptor.source_shape(SourceRole::Planar(OperandRole::Codes))[1];
-    let mut codes = vec![0u8; descriptor.source_bytes(SourceRole::Planar(OperandRole::Codes))];
+    let row_bytes = descriptor.source_shape(SourceRole::Planar(PlanarRole::Codes))[1];
+    let mut codes = vec![0u8; descriptor.source_bytes(SourceRole::Planar(PlanarRole::Codes))];
     for row in 0..shape[0] {
         for byte in 0..row_bytes {
             codes[row * row_bytes + byte] =
@@ -519,7 +520,7 @@ fn e2m1_case() -> Case {
         // K is odd: the last byte holds one element, its high nibble unused.
         codes[(row + 1) * row_bytes - 1] &= 0x0f;
     }
-    let scales: Vec<u8> = (0..descriptor.source_bytes(SourceRole::Planar(OperandRole::Scale)))
+    let scales: Vec<u8> = (0..descriptor.source_bytes(SourceRole::Planar(PlanarRole::Scale)))
         .map(|index| [0x7f, 0x80, 0x81, 0x7e][index % 4])
         .collect();
     Case {
@@ -527,8 +528,8 @@ fn e2m1_case() -> Case {
         format: WeightFormat::E2m1Row32,
         shape,
         sources: vec![
-            (SourceRole::Planar(OperandRole::Codes), codes),
-            (SourceRole::Planar(OperandRole::Scale), scales),
+            (SourceRole::Planar(PlanarRole::Codes), codes),
+            (SourceRole::Planar(PlanarRole::Scale), scales),
         ],
     }
 }

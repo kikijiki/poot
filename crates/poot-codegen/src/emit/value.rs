@@ -283,22 +283,10 @@ impl<'a> Emitter<'a> {
                 Ok((t, elem_llty))
             }
             // spec 134 P1 (FR-001, read side): load `lanes` contiguous elements of a scalar-element slice as one
-            // `Ty::Vec` at `place`'s vector-group index. `dest_ty` (the Assign's LHS local) supplies `elem`/`lanes`;
-            // `vector_element_ptr` declares the vec4-typed resource (FR-004) instead of bitcasting a scalar one.
-            Rvalue::VectorLoad { place } => {
-                if !matches!(dest_ty, Ty::Vec { .. }) {
-                    return Err(EmitError::Unsupported(
-                        "VectorLoad requires a Ty::Vec destination local".into(),
-                    ));
-                }
-                let (ptr, elem_llty, addrspace) = self.vector_element_ptr(place, dest_ty, w)?;
-                let v = self.fresh();
-                let align = align_of(&elem_llty);
-                let _ = writeln!(
-                    w,
-                    "  {v} = load {elem_llty}, ptr addrspace({addrspace}) {ptr}, align {align}"
-                );
-                Ok((v, elem_llty))
+            // `Ty::Vec` from `place`'s element index. `dest_ty` (the Assign's LHS local) supplies `elem`/`lanes`;
+            // `emit_vector_load` picks the per-target lowering from the proven `align_bytes`.
+            Rvalue::VectorLoad { place, align_bytes } => {
+                self.emit_vector_load(place, *align_bytes, dest_ty, w)
             }
             // Broadcast: insert the scalar into lane 0 of a poison vector, then `shufflevector` with an all-zero mask to
             // splat it (the same insertelement/extractelement style the WMMA fragment-build code uses).

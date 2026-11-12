@@ -16,7 +16,8 @@
 
 use poot_target::calibration::CostRatios;
 
-use super::{RegisterTiling, TiledShape};
+use super::{RegisterTiling, TiledRows, TiledShape};
+use crate::data_movement::expert_group_scan_steps;
 use crate::microtile::{FRAGMENT_LANES, MicroTile};
 
 /// The issue cost, in FMAs, of what one lane does per staged `K` value: an FMA per accumulator (the unit), an LDS
@@ -34,7 +35,7 @@ const FRAGMENT_MULTIPLY_FMAS: f64 = 4096.0 / FRAGMENT_LANES as f64;
 /// The terms of a tiling's modelled time on a device, before the device's [`CostRatios`] weigh them: one lane's
 /// issues per staged `K` value and the occupancy factor that turns them into the launch's time. Linear in the
 /// ratios, which is what lets a measured device time be regressed on them (`fit_cost_ratios`).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CostTerms {
     /// The multiply-accumulates one lane issues, in FMAs.
     pub fma: f64,
@@ -49,16 +50,32 @@ pub struct CostTerms {
     pub rounding: f64,
     /// The launch's lanes over the device's saturating lanes, never below 1.
     pub occupancy: f64,
+    /// For a fragment tiling over rows grouped by expert, the `K` rounds a lane runs per `K` value (one over the
+    /// round's depth), which a device that identified the fragment cost weighs by
+    /// [`poot_target::calibration::CostRatios::fragment_round`]; `None` for any other tiling and for a Gemv.
+    pub rounds_per_k: Option<f64>,
+    /// The scan steps of the expert grouping this contraction's rows need, per `K` value (the grouping runs once, in
+    /// one workgroup, so the occupancy does not scale it): none for dense rows and for a Gemv.
+    pub grouping_per_k: f64,
 }
 
 impl CostTerms {
     /// The modelled time under `ratios`, in FMA issues of one saturated lane per staged `K` value.
     pub fn modelled_time(self, ratios: CostRatios) -> f64 {
-        let lane_step = self.fma
-            + self.lds_reads * ratios.lds_read
-            + self.staged_per_lane * (ratios.staged_value + self.rounding)
-            + self.direct_per_lane * ratios.direct_value;
+        let lane_step = match (self.rounds_per_k, ratios.fragment_round) {
+            // A fragment tiling on a device that identified it: the multiplies and the rounds, and no staging term.
+            (Some(rounds), Some(round)) => self.fma + rounds * round,
+            _ => {
+                self.fma
+                    + self.lds_reads * ratios.lds_read
+                    + self.staged_per_lane * (ratios.staged_value + self.rounding)
+                    + self.direct_per_lane * ratios.direct_value
+            }
+        };
         lane_step * self.occupancy
+            + ratios
+                .group_scan
+                .map_or(0.0, |scan| self.grouping_per_k * scan)
     }
 }
 
@@ -144,6 +161,13 @@ impl ContractionCost {
         let tiles = shape.blocks
             * shape.working_row_tiles(tile_rows)
             * shape.out_per_block.div_ceil(tile_cols);
+        let grouping_per_k = match shape.rows {
+            TiledRows::Dense => 0.0,
+            TiledRows::Grouped { groups, .. } => {
+                expert_group_scan_steps(groups, shape.blocks * shape.m_per_block) as f64
+                    / shape.k.max(1) as f64
+            }
+        };
         CostTerms {
             fma,
             lds_reads,
@@ -151,6 +175,10 @@ impl ContractionCost {
             direct_per_lane: 0.0,
             rounding,
             occupancy: Self::fill(tiles as f64 * lane_count, caps),
+            rounds_per_k: (matches!(tiling.micro, MicroTile::Fragment(_))
+                && matches!(shape.rows, TiledRows::Grouped { .. }))
+            .then(|| 1.0 / tiling.depth() as f64),
+            grouping_per_k,
         }
     }
 
@@ -174,6 +202,8 @@ impl ContractionCost {
             direct_per_lane: (cols + 1.0) / width,
             rounding: 0.0,
             occupancy: Self::fill(lanes, caps),
+            rounds_per_k: None,
+            grouping_per_k: 0.0,
         }
     }
 

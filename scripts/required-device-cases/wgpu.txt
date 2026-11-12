@@ -311,6 +311,7 @@ poot-wgpu-device	parity_tests::packed_linears_and_the_indexed_expert_contraction
 poot-wgpu-device	parity_tests::paged_attention_reads_the_pools_in_place_and_matches_the_oracle_on_wgpu
 poot-wgpu-device	parity_tests::select_is_bitwise_on_wgpu
 poot-wgpu-device	parity_tests::selected_attention_reads_exactly_the_selected_blocks_on_wgpu
+poot-wgpu-device	parity_tests::split_kv_decode_is_capacity_independent_on_wgpu
 poot-wgpu-device	parity_tests::split_kv_decode_matches_the_oracle_on_wgpu
 poot-wgpu-device	parity_tests::split_kv_decode_replay_equals_the_recording_step_on_wgpu
 poot-wgpu-device	parity_tests::stable_rank_ranks_what_the_plain_sort_ranks_on_wgpu
@@ -426,3 +427,4 @@ poot-wgpu-runtime::run_add	add_device_resident
 poot-wgpu-runtime::run_add	add_runs_on_gpu
 poot-wgpu-runtime::run_add	matmul_runs_on_gpu
 poot-wgpu-runtime::run_add	square_runs_on_gpu
+poot-wgpu-runtime::vector_load	u32x4_vector_load_matches_scalar_loads_on_wgpu

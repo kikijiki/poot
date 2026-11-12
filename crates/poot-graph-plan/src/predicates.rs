@@ -550,11 +550,11 @@ pub(crate) fn selected_attention_lanes(
 /// The most key chunks one decode row is split into: past this the combine stage's per-row reduction costs
 /// more than the extra workgroups hide.
 const MAX_ATTENTION_SPLITS: usize = 16;
-/// The fewest keys a split walks. A shorter chunk leaves a workgroup's lanes mostly idle and the launch
+/// The fewest keys a split walks. A shorter share leaves a workgroup's lanes mostly idle and the launch
 /// is the combine's overhead alone.
 const MIN_KEYS_PER_SPLIT: usize = 128;
 
-/// The split-KV factor of a decode attention (`Lq == 1`), or `None` for the streaming schedule.
+/// The split-KV schedule of a decode attention (`Lq == 1`), or `None` for the streaming schedule.
 ///
 /// The streaming schedule runs `batch * heads` workgroups; at a few heads that leaves most of a many-CU
 /// device idle while each workgroup walks the whole cache (the Strix Halo shape: 2 workgroups on 40 CUs).
@@ -563,8 +563,10 @@ const MIN_KEYS_PER_SPLIT: usize = 128;
 /// vLLM's Triton decode attention chooses its split count the same way, from the occupancy the
 /// batch-and-head grid leaves
 /// (<https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_decode_attention.py>,
-/// retrieved 2026-10-11). The count follows `caps.compute_units` and the cache length, never the live
-/// length (which is a run-time value: a split a short length leaves empty publishes a neutral partial).
+/// retrieved 2026-10-11). The capacity bounds the grid, the live range partitions it: `splits` follows
+/// `caps.compute_units` and the cache length, and is only the ceiling. The live length is a run-time value, so
+/// the kernel cuts each row's visited keys into at most that many shares of at least `min_units` steps
+/// ([`poot_kernelgen::AttentionSchedule::SplitKv`]), and the workgroups past the row's shares return.
 ///
 /// Streaming is kept when any of these holds, so a request never needs a capability the device lacks:
 /// the rows already fill the device, the cache is too short for two chunks of [`MIN_KEYS_PER_SPLIT`], the
@@ -573,7 +575,7 @@ const MIN_KEYS_PER_SPLIT: usize = 128;
 pub(crate) fn attention_splits(
     spec: &poot_kernelgen::AttentionSpec,
     caps: &DeviceCaps,
-) -> Option<usize> {
+) -> Option<poot_kernelgen::AttentionSchedule> {
     if spec.lq != 1 {
         return None;
     }
@@ -590,11 +592,13 @@ pub(crate) fn attention_splits(
     if splits < 2 || rows >= compute_units {
         return None;
     }
+    let schedule = poot_kernelgen::AttentionSchedule::SplitKv {
+        lanes: spec.schedule.lanes(),
+        splits,
+        min_units: MIN_KEYS_PER_SPLIT.div_ceil(spec.keys_per_unit()),
+    };
     let split = poot_kernelgen::AttentionSpec {
-        schedule: poot_kernelgen::AttentionSchedule::SplitKv {
-            lanes: spec.schedule.lanes(),
-            splits,
-        },
+        schedule,
         ..spec.clone()
     };
     let scratch_bytes = split.partial_elems()? as u64 * 4;
@@ -602,7 +606,7 @@ pub(crate) fn attention_splits(
         return None;
     }
     let (_, y) = poot_kernelgen::fold_groups(split.workgroups(), caps.max_grid[0]);
-    (y <= caps.max_grid[1] as usize).then_some(splits)
+    (y <= caps.max_grid[1] as usize).then_some(schedule)
 }
 
 /// The most tile rows (query positions times packed heads) one tiled attention workgroup serves.

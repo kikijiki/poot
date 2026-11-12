@@ -5,7 +5,7 @@ use crate::StoredBytes;
 
 use crate::format::{
     Axis, Extent, FieldEncoding, FloatFormat, FormatDescriptor, GroupMap, LaneOrder, Major,
-    OperandRole, Packing, PlanarLayout, PlanarOperand, ScaleEncoding, Storage, ValueMap,
+    Packing, PlanarLayout, PlanarOperand, PlanarRole, ScaleEncoding, Storage, ValueMap,
     WeightFormat,
 };
 use crate::{PackedPayload, PackedWeight, PackedWeightError, SourceRole};
@@ -104,7 +104,7 @@ const fn scale_float(scale: ScaleEncoding) -> FloatFormat {
 }
 
 /// An unpacked operand of one float per stored element, `[out, K]`-major.
-const fn float_operand(role: OperandRole, float: FloatFormat, grid: [Extent; 2]) -> PlanarOperand {
+const fn float_operand(role: PlanarRole, float: FloatFormat, grid: [Extent; 2]) -> PlanarOperand {
     PlanarOperand {
         role,
         encoding: FieldEncoding::Float(float),
@@ -116,7 +116,7 @@ const fn float_operand(role: OperandRole, float: FloatFormat, grid: [Extent; 2])
 }
 
 const E4M3_CODES: PlanarOperand = float_operand(
-    OperandRole::Codes,
+    PlanarRole::Codes,
     FloatFormat::E4m3Fn,
     [Extent::Values(1), Extent::Values(1)],
 );
@@ -129,7 +129,7 @@ macro_rules! e4m3 {
             storage: Storage::Planar(PlanarLayout {
                 operands: &[
                     E4M3_CODES,
-                    float_operand(OperandRole::Scale, scale_float($scale), $grid),
+                    float_operand(PlanarRole::Scale, scale_float($scale), $grid),
                 ],
             }),
             value: ValueMap::Float,
@@ -208,7 +208,7 @@ pub(crate) const E2M1_ROW32: FormatDescriptor = FormatDescriptor {
     storage: Storage::Planar(PlanarLayout {
         operands: &[
             PlanarOperand {
-                role: OperandRole::Codes,
+                role: PlanarRole::Codes,
                 encoding: FieldEncoding::Float(FloatFormat::E2m1),
                 bits: 4,
                 grid: [Extent::Values(1), Extent::Values(1)],
@@ -221,7 +221,7 @@ pub(crate) const E2M1_ROW32: FormatDescriptor = FormatDescriptor {
                 major: Major::OutMajor,
             },
             float_operand(
-                OperandRole::Scale,
+                PlanarRole::Scale,
                 FloatFormat::E8m0,
                 [Extent::Values(1), Extent::Values(32)],
             ),
@@ -243,7 +243,7 @@ const fn int4x8(axis: Axis, lanes: LaneOrder) -> Option<Packing> {
 
 /// One f16 scale per `[out, group]`, stored `[groups, out]`.
 const GROUP_SCALE: PlanarOperand = PlanarOperand {
-    role: OperandRole::Scale,
+    role: PlanarRole::Scale,
     encoding: FieldEncoding::Float(FloatFormat::F16),
     bits: 16,
     grid: [Extent::Values(1), Extent::Group],
@@ -252,7 +252,7 @@ const GROUP_SCALE: PlanarOperand = PlanarOperand {
 };
 
 const GPTQ_CODES: PlanarOperand = PlanarOperand {
-    role: OperandRole::Codes,
+    role: PlanarRole::Codes,
     encoding: FieldEncoding::Unsigned { offset: 0 },
     bits: 4,
     grid: [Extent::Values(1), Extent::Values(1)],
@@ -261,7 +261,7 @@ const GPTQ_CODES: PlanarOperand = PlanarOperand {
 };
 
 const GPTQ_ZERO: PlanarOperand = PlanarOperand {
-    role: OperandRole::Zero,
+    role: PlanarRole::Zero,
     encoding: FieldEncoding::Unsigned { offset: 1 },
     bits: 4,
     grid: [Extent::Values(1), Extent::Group],
@@ -271,7 +271,7 @@ const GPTQ_ZERO: PlanarOperand = PlanarOperand {
 
 /// GPTQ act-order `g_idx [K]` (i32): the group of each K index.
 const GPTQ_GROUP_INDEX: PlanarOperand = PlanarOperand {
-    role: OperandRole::GroupIndex,
+    role: PlanarRole::GroupIndex,
     encoding: FieldEncoding::Signed,
     bits: 32,
     grid: [Extent::Whole, Extent::Values(1)],
@@ -298,7 +298,7 @@ pub(crate) const fn gptq(groups: GroupMap) -> FormatDescriptor {
 /// AutoAWQ's order), `scales [groups, out]`: `w = scale * (q - z)`.
 const AWQ_OPERANDS: &[PlanarOperand] = &[
     PlanarOperand {
-        role: OperandRole::Codes,
+        role: PlanarRole::Codes,
         encoding: FieldEncoding::Unsigned { offset: 0 },
         bits: 4,
         grid: [Extent::Values(1), Extent::Values(1)],
@@ -306,7 +306,7 @@ const AWQ_OPERANDS: &[PlanarOperand] = &[
         major: Major::KMajor,
     },
     PlanarOperand {
-        role: OperandRole::Zero,
+        role: PlanarRole::Zero,
         encoding: FieldEncoding::Unsigned { offset: 0 },
         bits: 4,
         grid: [Extent::Values(1), Extent::Group],
@@ -347,10 +347,10 @@ mod tests {
     fn assert_planar(
         format: WeightFormat,
         shape: [usize; 2],
-        sources: &[(OperandRole, Vec<u8>)],
+        sources: &[(PlanarRole, Vec<u8>)],
         expected: &[([usize; 2], f32)],
     ) {
-        let sources: Vec<(OperandRole, &[u8])> = sources
+        let sources: Vec<(PlanarRole, &[u8])> = sources
             .iter()
             .map(|(role, bytes)| (*role, bytes.as_slice()))
             .collect();
@@ -387,8 +387,8 @@ mod tests {
             format,
             shape,
             &[
-                (OperandRole::Codes, weight),
-                (OperandRole::Scale, hex(scales)),
+                (PlanarRole::Codes, weight),
+                (PlanarRole::Scale, hex(scales)),
             ],
             expected,
         );
@@ -559,10 +559,10 @@ mod tests {
             [2, 35],
             &[
                 (
-                    OperandRole::Codes,
+                    PlanarRole::Codes,
                     hex("80837d1d0612d0e601c6d1bdf94dad156304c0dca8af7231d39ce31efb211b9916741c0a"),
                 ),
-                (OperandRole::Scale, hex("7f817a02")),
+                (PlanarRole::Scale, hex("7f817a02")),
             ],
             &[
                 ([0, 0], 0.0),
@@ -632,21 +632,21 @@ mod tests {
         );
     }
 
-    fn gptq_sources(g_idx: Option<Vec<u8>>) -> Vec<(OperandRole, Vec<u8>)> {
+    fn gptq_sources(g_idx: Option<Vec<u8>>) -> Vec<(PlanarRole, Vec<u8>)> {
         let mut sources = vec![
             (
-                OperandRole::Codes,
+                PlanarRole::Codes,
                 hex(
                     "6187f803f0423141182c8d58e2912c82c2b7f4045a572fb18fe594e3b5e79e9806fada64fa70e9ce9a1e4d9d1e4970acab2968c3f084cc5f1de2b0ccc9cd39c1",
                 ),
             ),
-            (OperandRole::Zero, hex("c0ad6caaba893613")),
+            (PlanarRole::Zero, hex("c0ad6caaba893613")),
             (
-                OperandRole::Scale,
+                PlanarRole::Scale,
                 hex("aea7c32500310a27ae273daab8aa33abaea7c321cda87e21ae233daa7b287d23"),
             ),
         ];
-        sources.extend(g_idx.map(|g_idx| (OperandRole::GroupIndex, g_idx)));
+        sources.extend(g_idx.map(|g_idx| (PlanarRole::GroupIndex, g_idx)));
         sources
     }
 
@@ -659,14 +659,14 @@ mod tests {
             [8, 16],
             &[
                 (
-                    OperandRole::Codes,
+                    PlanarRole::Codes,
                     hex(
                         "81f2205a168cefb5c757127728eb94e5d844c1ef8f9f23928334218150e0849ba6dbea90901a1fcfea2990d41fe247c8da08099c4db67e3cd4c3ce1f96ccacc5",
                     ),
                 ),
-                (OperandRole::Zero, hex("d0acaca69a368b13")),
+                (PlanarRole::Zero, hex("d0acaca69a368b13")),
                 (
-                    OperandRole::Scale,
+                    PlanarRole::Scale,
                     hex("aea7c32500310a27ae273daab8aa33abaea7c321cda87e21ae233daa7b287d23"),
                 ),
             ],
@@ -704,11 +704,11 @@ mod tests {
             weight,
             [
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     StoredBytes::from(codes),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     StoredBytes::from(scales),
                 ),
             ],
@@ -754,7 +754,7 @@ mod tests {
             PackedPayload::concat_rows(&[&gate, &up]),
             Err(PackedWeightError::RowConcatUnaligned {
                 format: BLOCK128_F32,
-                role: OperandRole::Scale,
+                role: PlanarRole::Scale,
                 rows: 100,
                 block_rows: 128,
             })
@@ -786,7 +786,7 @@ mod tests {
             PackedPayload::concat_rows(&[&gptq, &gptq]),
             Err(PackedWeightError::RowConcatLayout {
                 format,
-                role: OperandRole::Codes,
+                role: PlanarRole::Codes,
             })
         );
     }

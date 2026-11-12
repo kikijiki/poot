@@ -5,3 +5,4 @@
 pub mod formats;
 pub mod packed;
 pub mod safetensors;
+pub mod synthetic;

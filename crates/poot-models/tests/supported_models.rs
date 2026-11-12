@@ -120,50 +120,23 @@ fn family_graphs(fixtured: &Fixtured) -> Vec<(&'static str, Graph)> {
 
 // ---- table (b): weight formats x targets ------------------------------------------------------
 
-/// The packed formats the weight-format table renders: one representative per packed variant of
-/// [`WeightFormat`], with the parameters that change the lowering (a GPTQ group map, a scale encoding).
-/// The dense dtypes are not packed payloads; the table's dense row is the reference checkpoint itself.
+/// The packed formats the weight-format table renders: the shared format list without the dense dtypes (the
+/// table's dense row is the reference checkpoint itself) and without the E8M0-scaled FP8 cells, which lower
+/// as the BF16- and F32-scaled ones do.
 fn weight_formats() -> Vec<WeightFormat> {
-    let group = std::num::NonZeroUsize::new(128).expect("nonzero");
-    let act_order = std::num::NonZeroUsize::new(2).expect("nonzero");
-    vec![
-        WeightFormat::Q4_0,
-        WeightFormat::Q4_1,
-        WeightFormat::Q5_0,
-        WeightFormat::Q5_1,
-        WeightFormat::Q8_0,
-        WeightFormat::Q2_K,
-        WeightFormat::Q3_K,
-        WeightFormat::Q4_K,
-        WeightFormat::Q5_K,
-        WeightFormat::Q6_K,
-        WeightFormat::Iq4_Nl,
-        WeightFormat::Iq4_Xs,
-        WeightFormat::Iq2_Xs,
-        WeightFormat::Iq3_Xxs,
-        WeightFormat::Iq3_S,
-        WeightFormat::Mxfp4,
-        WeightFormat::E4m3PerChannel {
-            scale: ScaleEncoding::Bf16,
-        },
-        WeightFormat::E4m3PerChannel {
-            scale: ScaleEncoding::F32,
-        },
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::Bf16,
-        },
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::F32,
-        },
-        WeightFormat::E2m1Row32,
-        WeightFormat::Gptq {
-            groups: GroupMap::Contiguous { size: group },
-        },
-        WeightFormat::Gptq {
-            groups: GroupMap::Indexed { groups: act_order },
-        },
-        WeightFormat::Awq { group_size: group },
-    ]
+    poot_quant::test_support::formats::packed_formats()
+        .into_iter()
+        .filter(|format| {
+            !matches!(
+                format,
+                WeightFormat::E4m3PerChannel {
+                    scale: ScaleEncoding::E8m0
+                } | WeightFormat::E4m3Block128 {
+                    scale: ScaleEncoding::E8m0
+                }
+            )
+        })
+        .collect()
 }
 
 /// How the table names a stored scale encoding.

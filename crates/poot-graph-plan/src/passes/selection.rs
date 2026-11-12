@@ -17,6 +17,8 @@
 //! lowering, so a target that cannot plan the composite refuses it with its own typed refusal.
 //!
 //! - `BlockTopK`: the root is the `Concat` of the ids and the keep indicator ([`ops::block_top_k_packed`]).
+//! - `StableRank`: the root is the non-keepdim `Reduce(Sum)` over the new last axis that ends
+//!   [`ops::stable_descending_rank`] or [`ops::stable_descending_rank_masked`], the router's rank.
 //! - `SelectedAttention`: the root is an additive, capacity-bound `Attention` the flash pass formed, whose
 //!   mask is [`ops::selected_block_mask`] over the selected block ids and the query positions.
 
@@ -24,8 +26,8 @@ use std::collections::{HashMap, HashSet};
 
 use poot_graph_ir::graph::{EditError, Eqn, Graph, Operand, Storage, ValueId};
 use poot_graph_ir::op::{
-    AttentionAttrs, BinOp, BlockTopKAttrs, KeyLayout, KvBound, MaskOperand, OpKind,
-    SelectedAttentionAttrs, SinkOperand,
+    AttentionAttrs, BinOp, BlockTopKAttrs, KeyLayout, KvBound, MaskOperand, OpKind, RedOp,
+    SelectedAttentionAttrs, SinkOperand, StableRankAttrs,
 };
 use poot_graph_ir::types::{Scalar, TensorType};
 use poot_graph_ir::{BuilderError, Outputs, TraceLimits, Traced, ops};
@@ -75,6 +77,11 @@ fn recognize(g: &Graph, producers: &HashMap<ValueId, usize>, eqn: &Eqn) -> Optio
     match &eqn.op {
         OpKind::Concat { axis: 3 } => block_top_k(g, producers, eqn),
         OpKind::Attention(attrs) => selected_attention(g, producers, eqn, attrs),
+        OpKind::Reduce {
+            op: RedOp::Sum,
+            axis,
+            keepdim: false,
+        } => stable_rank(g, producers, eqn, *axis),
         _ => None,
     }
 }
@@ -281,6 +288,42 @@ fn block_top_k(g: &Graph, producers: &HashMap<ValueId, usize>, root: &Eqn) -> Op
         OpKind::BlockTopK(attrs),
         bound.into_iter().map(Operand::Value).collect(),
     )
+}
+
+/// A `StableRank` from the `Reduce(Sum)` that ends [`ops::stable_descending_rank`] or its masked variant: the
+/// reduce sums the pairwise `precedes` indicator over the new last axis, so its result has the scores' type.
+/// The unmasked definition is tried first, then the masked one over a second operand of the same type.
+fn stable_rank(
+    g: &Graph,
+    producers: &HashMap<ValueId, usize>,
+    root: &Eqn,
+    axis: usize,
+) -> Option<Eqn> {
+    let [Operand::Value(input)] = root.inputs[..] else {
+        return None;
+    };
+    let scores = g.aval(root.out).clone();
+    if scores.dtype != DType::F32 || axis != scores.rank() || g.aval(input).rank() != axis + 1 {
+        return None;
+    }
+    let formed = |masked: bool| {
+        let operands = vec![scores.clone(); 1 + usize::from(masked)];
+        let definition = Definition::new(&operands, |b, ops_in| {
+            if masked {
+                ops::stable_descending_rank_masked(b, ops_in[0], ops_in[1])
+            } else {
+                ops::stable_descending_rank(b, ops_in[0])
+            }
+        })?;
+        let bound = definition.unify(g, producers, root.out)?;
+        composite(
+            g,
+            root,
+            OpKind::StableRank(StableRankAttrs { masked }),
+            bound.into_iter().map(Operand::Value).collect(),
+        )
+    };
+    formed(false).or_else(|| formed(true))
 }
 
 /// A `SelectedAttention` from the additive attention whose mask is [`ops::selected_block_mask`]: the block ids
@@ -709,5 +752,137 @@ mod tests {
             0
         );
         assert_eq!(count(&formed, |op| matches!(op, OpKind::Attention(_))), 1);
+    }
+
+    const EXPERTS: usize = 6;
+
+    /// The traced rank of 3 rows of `EXPERTS` scores (ties, a signed zero, NaN and both infinities), masked by a
+    /// second operand when `masked`, and the inputs it runs on.
+    fn rank_graph(masked: bool) -> (Graph, HashMap<ValueId, Value>) {
+        let b = Builder::for_tests();
+        let ty = TensorType::f32(vec![3, EXPERTS]);
+        let scores = b.constant("scores", ty.clone()).unwrap();
+        let eligible = masked.then(|| b.constant("eligible", ty).unwrap());
+        let rank = match eligible {
+            Some(eligible) => ops::stable_descending_rank_masked(&b, scores, eligible).unwrap(),
+            None => ops::stable_descending_rank(&b, scores).unwrap(),
+        };
+        let graph = b.finish(Outputs::new(rank)).unwrap();
+        let rows = vec![
+            1.0,
+            1.0,
+            0.5,
+            1.0,
+            0.5,
+            2.0, //
+            0.0,
+            -0.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX, //
+            3.0,
+            3.0,
+            3.0,
+            3.0,
+            3.0,
+            3.0,
+        ];
+        let class = vec![
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            1.0, //
+            0.0,
+            1.0,
+            1.0,
+            0.5,
+            2.0,
+            f32::NAN, //
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+        ];
+        let mut inputs = HashMap::from([(
+            scores.id(),
+            Value::from(HostTensor::f32(vec![3, EXPERTS], rows)),
+        )]);
+        if let Some(eligible) = eligible {
+            inputs.insert(
+                eligible.id(),
+                Value::from(HostTensor::f32(vec![3, EXPERTS], class)),
+            );
+        }
+        (graph, inputs)
+    }
+
+    fn stable_ranks(graph: &Graph) -> Vec<StableRankAttrs> {
+        graph
+            .eqns()
+            .iter()
+            .filter_map(|eqn| match &eqn.op {
+                OpKind::StableRank(attrs) => Some(*attrs),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The rank `ops::stable_descending_rank` states, plain and masked, becomes one `StableRank` of its own
+    /// kind, the `[.., E, E]` chain goes with it, and the result is the composition's bit for bit. Mutation:
+    /// have `recognize` skip the `Reduce` arm; no rank forms and this row goes red.
+    #[test]
+    fn the_rank_composition_is_formed_into_the_op() {
+        for masked in [false, true] {
+            let (traced, inputs) = rank_graph(masked);
+            assert!(stable_ranks(&traced).is_empty());
+            let formed = passes_without_target(&traced).unwrap();
+            assert_eq!(stable_ranks(&formed), [StableRankAttrs { masked }]);
+            assert_eq!(
+                count(&formed, |op| matches!(op, OpKind::Reduce { .. })),
+                0,
+                "masked={masked}: the pairwise reduce is gone"
+            );
+            assert_eq!(
+                run(&formed, &inputs),
+                run(&traced, &inputs),
+                "masked={masked}: the formed op is the composition's result"
+            );
+        }
+    }
+
+    /// A rank that differs from the definition in its tie rule (`j > i` where the definition ranks the lower
+    /// index first) or in its canonicalization (`Add` where the definition takes `Max`) is not the op.
+    /// Mutation: have `Unifier::value` accept any op for a producer; both near-misses form and this row goes red.
+    #[test]
+    fn a_near_miss_rank_is_left_alone() {
+        let (traced, _) = rank_graph(false);
+        let mut flip_tie_rule = traced.edit();
+        let tie = flip_tie_rule
+            .eqns_mut()
+            .iter_mut()
+            .rev()
+            .find(|eqn| eqn.op == OpKind::Binary(BinOp::Ge))
+            .expect("the index comparison is the last Ge");
+        tie.inputs.swap(0, 1);
+        let mut drop_canonicalization = traced.edit();
+        let max = drop_canonicalization
+            .eqns_mut()
+            .iter_mut()
+            .find(|eqn| eqn.op == OpKind::Binary(BinOp::Max))
+            .expect("the scores are canonicalized by Max");
+        max.op = OpKind::Binary(BinOp::Add);
+        for (what, edit) in [
+            ("tie rule", flip_tie_rule),
+            ("canonicalization", drop_canonicalization),
+        ] {
+            let near_miss = edit.commit().unwrap();
+            let formed = passes_without_target(&near_miss).unwrap();
+            assert!(stable_ranks(&formed).is_empty(), "{what}: formed");
+        }
     }
 }

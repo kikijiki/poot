@@ -9,20 +9,16 @@
 
 use poot_kernel_ir::{BinOp, ConstantTableDecl, Local, Rvalue, Ty};
 use poot_quant::format::{
-    BitLayout, BlockLayout, Field, FieldEncoding, FormatDescriptor, MinSign, OperandRole, SignRule,
-    SignedGrid, Storage, ValueMap, WeightFormat,
+    BitLayout, BlockLayout, Field, FieldEncoding, FormatDescriptor, MinSign, OperandRole, Storage,
+    WeightFormat,
 };
 
+use super::family::{Codes, Family, Position};
 use super::float_decode::emit_float_decode;
 use super::kernel::emit_block_address;
 use super::source::Source;
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy, cu};
-
-/// The one constant table a table-decoded format's kernel declares ([`DecodePlan::constant_tables`]):
-/// a lattice's grid words ([`SignedGrid::word`]) or a codebook's entries as `f32` bits, read by
-/// [`DecodePlan::emit_value`] as table 0.
-const VALUE_TABLE: u8 = 0;
 
 /// The `Scale`/`Min` factors of one block, hoisted once and reused by every element the block holds
 /// (`emit_value` combines them with the per-element code through the value formula).
@@ -38,8 +34,9 @@ pub(crate) struct DecodePlan {
     sub_scale: Option<Field>,
     min: Option<Field>,
     sub_min: Option<Field>,
-    signs: Option<Field>,
-    value: ValueMap,
+    family: Family,
+    /// The fields the family reads besides `Codes` ([`Family::operands`]), in that order.
+    extras: Vec<Field>,
     min_sign: Option<MinSign>,
 }
 
@@ -56,26 +53,17 @@ impl DecodePlan {
         let Some(codes) = layout.field(OperandRole::Codes) else {
             return Err(reject(format, "no Codes field"));
         };
-        if matches!(descriptor.value, ValueMap::SignedGrid(_))
-            && layout.field(OperandRole::Signs).is_none()
-        {
-            return Err(reject(format, "a signed grid without a Signs field"));
-        }
-        for field in [
-            Some(codes),
-            layout.field(OperandRole::Scale),
-            layout.field(OperandRole::SubScale),
-            layout.field(OperandRole::Min),
-            layout.field(OperandRole::SubMin),
-            layout.field(OperandRole::Signs),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if field.field.pieces.len() > 2 {
-                return Err(reject(format, "a field of more than two pieces"));
-            }
-        }
+        let family = Family::of(descriptor.value);
+        let extras = family
+            .operands()
+            .iter()
+            .map(|&role| {
+                layout
+                    .field(role)
+                    .map(|field| field.field)
+                    .ok_or(reject(format, "a value family's operand is missing"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             layout,
             codes: codes.field,
@@ -83,26 +71,16 @@ impl DecodePlan {
             sub_scale: layout.field(OperandRole::SubScale).map(|f| f.field),
             min: layout.field(OperandRole::Min).map(|f| f.field),
             sub_min: layout.field(OperandRole::SubMin).map(|f| f.field),
-            signs: layout.field(OperandRole::Signs).map(|f| f.field),
-            value: descriptor.value,
+            family,
+            extras,
             min_sign: descriptor.min_sign,
         })
     }
 
     /// The constant tables the decode reads, for the kernel body to declare
-    /// ([`poot_kernel_ir::Body::constant_tables`]): the lattice of a [`ValueMap::SignedGrid`]
-    /// format, as the `u32` words a device reads it in; the entries of a [`ValueMap::Codebook`],
-    /// bit for bit; nothing for a format whose value is computed from the code.
+    /// ([`poot_kernel_ir::Body::constant_tables`]): the value family's, if it has any.
     pub(crate) fn constant_tables(&self) -> Vec<ConstantTableDecl> {
-        match self.value {
-            ValueMap::SignedGrid(grid) => vec![ConstantTableDecl {
-                words: (0..grid.words()).map(|word| grid.word(word)).collect(),
-            }],
-            ValueMap::Codebook(table) => vec![ConstantTableDecl {
-                words: table.iter().map(|value| value.to_bits()).collect(),
-            }],
-            ValueMap::Integer | ValueMap::Float => Vec::new(),
-        }
+        self.family.tables()
     }
 
     /// Values per block (the block-32 formats' `32`).
@@ -177,24 +155,29 @@ impl DecodePlan {
         i: Local,
     ) -> Local {
         assert!(
-            !field.pieces.is_empty() && field.pieces.len() <= 2,
-            "format tests / DecodePlan::of: a field of one or two pieces"
+            !field.pieces.is_empty(),
+            "format tests: a field has at least one piece"
         );
-        let low_piece = &field.pieces[0];
-        let low_bit = self.emit_bit_layout(e, block_bit, &low_piece.layout, i);
-        let low = src.read_bits(e, low_bit, low_piece.width);
-        let Some(high_piece) = field.pieces.get(1) else {
-            return low;
-        };
-        let high_bit = self.emit_bit_layout(e, block_bit, &high_piece.layout, i);
-        let high = src.read_bits(e, high_bit, high_piece.width);
-        // Low bits first (`format::Field` docs): the high piece shifts up by the low piece's width.
-        let shifted = bin(e, Ty::U32, BinOp::Shl, copy(high), c32(low_piece.width));
-        bin(e, Ty::U32, BinOp::BitOr, copy(low), copy(shifted))
+        let mut bits: Option<Local> = None;
+        let mut below = 0;
+        for piece in field.pieces {
+            let bit = self.emit_bit_layout(e, block_bit, &piece.layout, i);
+            let read = src.read_bits(e, bit, piece.width);
+            bits = Some(match bits {
+                None => read,
+                // Low bits first (`format::Field` docs): a piece shifts up by the widths below it.
+                Some(low) => {
+                    let shifted = bin(e, Ty::U32, BinOp::Shl, copy(read), c32(below));
+                    bin(e, Ty::U32, BinOp::BitOr, copy(low), copy(shifted))
+                }
+            });
+            below += piece.width;
+        }
+        bits.expect("a field has at least one piece")
     }
 
     /// `field`'s value at in-block index `i`, through its own [`FieldEncoding`] (never the `Codes`
-    /// field's [`ValueMap`], which [`Self::emit_value`] applies separately): used for `Scale`/`Min`,
+    /// field's value family, which [`Self::emit_value`] applies separately): used for `Scale`/`Min`,
     /// which are always plain numbers (`Unsigned`, `Signed` or `Float`).
     fn emit_field_number(
         &self,
@@ -233,20 +216,23 @@ impl DecodePlan {
         if let (Some((block, first)), Some(factors)) = (run_block, &run_factors) {
             let block_bit = self.block_base_bit(e, block);
             let codes = self.emit_field_run(e, src, block_bit, &self.codes, first, count);
-            let signs = self
-                .signs
-                .as_ref()
-                .filter(|_| matches!(self.value, ValueMap::SignedGrid(_)))
-                .map(|field| self.emit_field_run(e, src, block_bit, field, first, count));
+            let extras: Vec<Vec<Local>> = self
+                .extras
+                .iter()
+                .map(|field| self.emit_field_run(e, src, block_bit, field, first, count))
+                .collect();
             return (0..count)
                 .map(|j| {
-                    let i_in_block = bin(e, Ty::Usize, BinOp::Add, copy(first), cu(j));
-                    let sign_bits = signs.as_ref().map(|signs| signs[j]);
+                    let index = bin(e, Ty::Usize, BinOp::Add, copy(first), cu(j));
+                    let extra_bits: Vec<Local> = extras.iter().map(|run| run[j]).collect();
                     self.emit_value_of_bits(
                         e,
                         factors,
-                        (codes[j], sign_bits),
-                        (i_in_block, Some((j, count))),
+                        (codes[j], &extra_bits),
+                        Position {
+                            index,
+                            known: Some((j, count)),
+                        },
                     )
                 })
                 .collect();
@@ -290,8 +276,8 @@ impl DecodePlan {
         count: usize,
     ) -> Vec<Local> {
         assert!(
-            !field.pieces.is_empty() && field.pieces.len() <= 2,
-            "format tests / DecodePlan::of: a field of one or two pieces"
+            !field.pieces.is_empty(),
+            "format tests: a field has at least one piece"
         );
         let pieces: Option<Vec<Vec<Local>>> = field
             .pieces
@@ -304,19 +290,16 @@ impl DecodePlan {
             .collect();
         match pieces {
             Some(pieces) => (0..count)
-                .map(|j| match pieces.as_slice() {
-                    [low] => low[j],
-                    [low, high] => {
-                        let shifted = bin(
-                            e,
-                            Ty::U32,
-                            BinOp::Shl,
-                            copy(high[j]),
-                            c32(field.pieces[0].width),
-                        );
-                        bin(e, Ty::U32, BinOp::BitOr, copy(low[j]), copy(shifted))
+                .map(|j| {
+                    let mut bits = pieces[0][j];
+                    let mut below = field.pieces[0].width;
+                    for (run, piece) in pieces.iter().zip(field.pieces).skip(1) {
+                        // Low bits first: a piece shifts up by the widths below it.
+                        let shifted = bin(e, Ty::U32, BinOp::Shl, copy(run[j]), c32(below));
+                        bits = bin(e, Ty::U32, BinOp::BitOr, copy(bits), copy(shifted));
+                        below += piece.width;
                     }
-                    _ => unreachable!("a field has one or two pieces"),
+                    bits
                 })
                 .collect(),
             None => (0..count)
@@ -380,47 +363,37 @@ impl DecodePlan {
     ) -> Local {
         let block_bit = self.block_base_bit(e, block);
         let coded_bits = self.emit_field_bits(e, src, block_bit, &self.codes, i);
-        let sign_bits = match (&self.value, &self.signs) {
-            (ValueMap::SignedGrid(_), Some(signs)) => {
-                Some(self.emit_field_bits(e, src, block_bit, signs, i))
-            }
-            (ValueMap::SignedGrid(_), None) => {
-                unreachable!("DecodePlan::of: a signed grid has a Signs field")
-            }
-            _ => None,
-        };
-        self.emit_value_of_bits(e, factors, (coded_bits, sign_bits), (i, None))
+        let extra_bits: Vec<Local> = self
+            .extras
+            .iter()
+            .map(|field| self.emit_field_bits(e, src, block_bit, field, i))
+            .collect();
+        self.emit_value_of_bits(
+            e,
+            factors,
+            (coded_bits, &extra_bits),
+            Position {
+                index: i,
+                known: None,
+            },
+        )
     }
 
-    /// [`Self::emit_value`] over bits already read: the `Codes` field's `bits.0` and, for a signed grid, the
-    /// `Signs` field's `bits.1`, at in-block index `at.0`. `at.1` is `Some((r, m))` when `at.0 % m == r` is known
-    /// at emission (a run's element `j` of `count`: `(j, count)`), which lets the signed grid fold its lane
-    /// arithmetic to constants.
+    /// [`Self::emit_value`] over bits already read: the `Codes` field's `bits.0` and the family's other
+    /// fields' `bits.1` ([`Family::operands`]), at the element `at`.
     fn emit_value_of_bits(
         &self,
         e: &mut Emit,
         factors: &Factors,
-        bits: (Local, Option<Local>),
-        at: (Local, Option<(usize, usize)>),
+        bits: (Local, &[Local]),
+        at: Position,
     ) -> Local {
-        let (coded_bits, sign_bits) = bits;
-        let (i, known) = at;
-        let value = match self.value {
-            ValueMap::Integer => {
-                emit_encoded_number(e, self.codes.encoding, self.codes.width(), coded_bits)
-            }
-            ValueMap::Codebook(_) => emit_codebook(e, coded_bits),
-            ValueMap::SignedGrid(grid) => {
-                let sign_bits = sign_bits.expect("DecodePlan::of: a signed grid has a Signs field");
-                emit_signed_grid(e, grid, coded_bits, sign_bits, (i, known))
-            }
-            ValueMap::Float => {
-                let FieldEncoding::Float(format) = self.codes.encoding else {
-                    unreachable!("format tests: a Float value map has a Float-encoded Codes field")
-                };
-                emit_float_decode(e, format, coded_bits)
-            }
+        let (coded_bits, extra_bits) = bits;
+        let codes = Codes {
+            bits: coded_bits,
+            field: self.codes,
         };
+        let value = self.family.emit_value(e, codes, extra_bits, at);
         let scaled = match factors.scale {
             Some(scale) => e.let_(
                 Ty::F32,
@@ -560,9 +533,14 @@ fn combine_product(e: &mut Emit, lhs: Option<Local>, rhs: Option<Local>) -> Opti
     }
 }
 
-/// A plain number (never the `Codes` field's [`ValueMap`]) from its raw bits: `Unsigned`/`Signed`
+/// A plain number (never the `Codes` field's value family) from its raw bits: `Unsigned`/`Signed`
 /// through an `i32`/f32 cast, `Float` through [`emit_float_decode`].
-fn emit_encoded_number(e: &mut Emit, encoding: FieldEncoding, width: u32, bits: Local) -> Local {
+pub(super) fn emit_encoded_number(
+    e: &mut Emit,
+    encoding: FieldEncoding,
+    width: u32,
+    bits: Local,
+) -> Local {
     match encoding {
         FieldEncoding::Unsigned { offset } => {
             let signed = e.let_(
@@ -648,153 +626,6 @@ fn emit_encoded_number(e: &mut Emit, encoding: FieldEncoding, width: u32, bits: 
             )
         }
     }
-}
-
-/// `sign * grid[code][i % lanes]` ([`ValueMap::SignedGrid`]): the lattice point's word read from
-/// constant table [`VALUE_TABLE`], the lane's byte widened to f32, and the lane's sign bit XORed
-/// into the float's sign. `sign_bits` are the seven stored sign bits of the eight-value group of
-/// `i`, completed by `grid.signs` ([`SignRule::negative`]). Exact: integer magnitudes and a
-/// sign flip.
-fn emit_signed_grid(
-    e: &mut Emit,
-    grid: &'static SignedGrid,
-    code: Local,
-    sign_bits: Local,
-    (i, known): (Local, Option<(usize, usize)>),
-) -> Local {
-    let words_per_point = grid.lanes / 4;
-    // `i % modulus` is an emission-time constant when the run `i` belongs to fixes it (`known`: `i % m == r` with
-    // `modulus` dividing `m`), else a runtime remainder.
-    let constant_mod = |modulus: usize| {
-        known
-            .filter(|&(_, m)| m.is_multiple_of(modulus))
-            .map(|(r, _)| r % modulus)
-    };
-    let (lane_word, byte_shift) = match constant_mod(grid.lanes) {
-        Some(lane) => (cu(lane / 4), c32((lane % 4) as u32 * 8)),
-        None => {
-            let lane = bin(e, Ty::Usize, BinOp::Rem, copy(i), cu(grid.lanes));
-            let lane_word = bin(e, Ty::Usize, BinOp::Div, copy(lane), cu(4));
-            let lane_byte = bin(e, Ty::Usize, BinOp::Rem, copy(lane), cu(4));
-            let lane_byte = e.let_(
-                Ty::U32,
-                Rvalue::Cast {
-                    to: Ty::U32,
-                    operand: copy(lane_byte),
-                },
-            );
-            (
-                copy(lane_word),
-                copy(bin(e, Ty::U32, BinOp::Mul, copy(lane_byte), c32(8))),
-            )
-        }
-    };
-    let code_index = e.let_(
-        Ty::Usize,
-        Rvalue::Cast {
-            to: Ty::Usize,
-            operand: copy(code),
-        },
-    );
-    let point_word = bin(
-        e,
-        Ty::Usize,
-        BinOp::Mul,
-        copy(code_index),
-        cu(words_per_point),
-    );
-    let word_index = bin(e, Ty::Usize, BinOp::Add, copy(point_word), lane_word);
-    let word = e.let_(
-        Ty::U32,
-        Rvalue::ConstantTableRead {
-            idx: copy(word_index),
-            table: VALUE_TABLE,
-        },
-    );
-    let shifted = bin(e, Ty::U32, BinOp::Shr, copy(word), byte_shift);
-    let magnitude_bits = bin(e, Ty::U32, BinOp::BitAnd, copy(shifted), c32(0xff));
-    let magnitude = e.let_(
-        Ty::F32,
-        Rvalue::Cast {
-            to: Ty::F32,
-            operand: copy(magnitude_bits),
-        },
-    );
-    // The sign pattern: eight stored bits, or seven plus their parity as bit 7 (`ksigns_iq2xs`).
-    let pattern = match grid.signs {
-        SignRule::Direct => sign_bits,
-        SignRule::ParityOfSeven => {
-            // The parity of seven bits, folded: `x ^ x >> 4`, then `^ >> 2`, then `^ >> 1`, bit 0.
-            let mut folded = sign_bits;
-            for shift in [4, 2, 1] {
-                let high = bin(e, Ty::U32, BinOp::Shr, copy(folded), c32(shift));
-                folded = bin(e, Ty::U32, BinOp::BitXor, copy(folded), copy(high));
-            }
-            let parity = bin(e, Ty::U32, BinOp::BitAnd, copy(folded), c32(1));
-            let parity_bit = bin(e, Ty::U32, BinOp::Shl, copy(parity), c32(7));
-            bin(e, Ty::U32, BinOp::BitOr, copy(sign_bits), copy(parity_bit))
-        }
-    };
-    let group_shift = match constant_mod(8) {
-        Some(group_lane) => c32(group_lane as u32),
-        None => {
-            let group_lane = bin(e, Ty::Usize, BinOp::Rem, copy(i), cu(8));
-            copy(e.let_(
-                Ty::U32,
-                Rvalue::Cast {
-                    to: Ty::U32,
-                    operand: copy(group_lane),
-                },
-            ))
-        }
-    };
-    let selected = bin(e, Ty::U32, BinOp::Shr, copy(pattern), group_shift);
-    let negative = bin(e, Ty::U32, BinOp::BitAnd, copy(selected), c32(1));
-    let flip = bin(e, Ty::U32, BinOp::Shl, copy(negative), c32(31));
-    let magnitude_raw = e.let_(
-        Ty::U32,
-        Rvalue::Bitcast {
-            to: Ty::U32,
-            operand: copy(magnitude),
-        },
-    );
-    let signed_raw = bin(e, Ty::U32, BinOp::BitXor, copy(magnitude_raw), copy(flip));
-    e.let_(
-        Ty::F32,
-        Rvalue::Bitcast {
-            to: Ty::F32,
-            operand: copy(signed_raw),
-        },
-    )
-}
-
-/// `table[code]` ([`ValueMap::Codebook`], `IQ4_NL`/`IQ4_XS`): the entry's bits read from constant
-/// table [`VALUE_TABLE`] at the code and reinterpreted as `f32`. Exact: the table holds the entries
-/// bit for bit. The `Codes` field is 4 bits wide (the format tests pin a codebook's code width), so
-/// the index stays within the table's 16 words. One cached load per weight where a select tree over
-/// immediates costs 15 selects (designs/quant-matmul-1390.md B2).
-fn emit_codebook(e: &mut Emit, code: Local) -> Local {
-    let index = e.let_(
-        Ty::Usize,
-        Rvalue::Cast {
-            to: Ty::Usize,
-            operand: copy(code),
-        },
-    );
-    let bits = e.let_(
-        Ty::U32,
-        Rvalue::ConstantTableRead {
-            idx: copy(index),
-            table: VALUE_TABLE,
-        },
-    );
-    e.let_(
-        Ty::F32,
-        Rvalue::Bitcast {
-            to: Ty::F32,
-            operand: copy(bits),
-        },
-    )
 }
 
 #[cfg(test)]
@@ -1011,6 +842,74 @@ mod tests {
                     "{count} elements from {first} of {field:?} in a block at bit {block_bit}"
                 );
             }
+        }
+    }
+
+    /// POOT-1539 SC-4: a field of four pieces decodes in the emitted KIR as direct arithmetic on the block's
+    /// bytes does, bit for bit: element by element (`emit_value`, the four scale nibbles through
+    /// `emit_field_bits`) and as runs of 4, 8 and 32 (`emit_run`, the four code bit planes through
+    /// `emit_field_run`'s shared windows). Mutation: skip the last piece in `emit_field_bits` or in
+    /// `emit_field_run`; the matching rows go red.
+    #[test]
+    fn a_field_of_four_pieces_decodes_in_the_emitted_kernel() {
+        use poot_quant::test_support::synthetic::{
+            FOUR_PIECE, four_piece_blocks, four_piece_reference,
+        };
+
+        let blocks = 6;
+        let bytes = four_piece_blocks(blocks, 0xfeed_f00d);
+        let want: Vec<u32> = bytes
+            .as_chunks::<24>()
+            .0
+            .iter()
+            .flat_map(|block| four_piece_reference(block))
+            .map(f32::to_bits)
+            .collect();
+        let plan = DecodePlan::of(&FOUR_PIECE).unwrap();
+        let k_total = blocks * 32;
+        for count in [1, 4, 8, 32] {
+            let mut al = Alloc::new(vec![
+                ld(Ty::Unit, false),
+                ld(slice_dtype(Ty::U32, false), false),
+                ld(slice_f32(true), true),
+            ]);
+            let (words, out) = (local(1), local(2));
+            let mut e = Emit::new(&mut al);
+            let source = Source::plain(words);
+            let row = e.let_(Ty::Usize, Rvalue::Use(cu(0)));
+            let total = e.let_(Ty::Usize, Rvalue::Use(cu(k_total)));
+            for first in (0..k_total).step_by(count) {
+                let values = if count == 1 {
+                    let block = e.let_(Ty::Usize, Rvalue::Use(cu(first / 32)));
+                    let element = e.let_(Ty::Usize, Rvalue::Use(cu(first % 32)));
+                    let factors = plan.emit_factors(&mut e, source, block, element);
+                    vec![plan.emit_value(&mut e, source, block, element, &factors)]
+                } else {
+                    let k0 = e.let_(Ty::Usize, Rvalue::Use(cu(first)));
+                    plan.emit_run(&mut e, source, row, k0, count, total)
+                };
+                for (j, value) in values.into_iter().enumerate() {
+                    let at = e.let_(Ty::Usize, Rvalue::Use(cu(first + j)));
+                    e.assign(elem(out, at), Rvalue::Use(copy(value)));
+                }
+            }
+            let block = BasicBlock {
+                statements: e.take(),
+                terminator: Terminator::Return,
+            };
+            let body = Body::new("four_pieces", 2, al.locals, vec![block]);
+            let mut buffers = [
+                Buffer::from_u32s(&super::super::fixtures::pack_words(&bytes)),
+                Buffer::from_f32s(&vec![0.0; k_total]),
+            ];
+            run(&body, workgroups_covering(&body, 1), &mut buffers).unwrap();
+            let got: Vec<u32> = buffers[1]
+                .to_f32s()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            assert_eq!(got, want, "runs of {count}");
         }
     }
 }

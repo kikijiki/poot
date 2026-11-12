@@ -3110,3 +3110,57 @@ fn an_invalid_aql_packet_inactivates_the_queue_into_a_typed_fault() {
         "got {next:?}"
     );
 }
+
+/// SC-d (ROCm): the integer `Rvalue::VectorLoad` fixtures, compiled for the live device through the production path
+/// and dispatched, read what scalar loads of the same words read. The first fixture is one `u32x4` load per thread;
+/// the second reads one param as `u32x4`, `u32x2` and scalar. Mutation (kept out of the tree): in
+/// `emit_vector_load`'s pointer arm, load `<2 x i32>` at the element index and again at the index plus one in place
+/// of the `<4 x i32>`; the lanes of every other word are wrong and this row goes red.
+#[test]
+fn u32x4_vector_load_matches_scalar_loads_on_rocm() {
+    let Some(ctx) = open_context_or_skip("u32x4_vector_load_matches_scalar_loads_on_rocm") else {
+        return;
+    };
+    for case in poot_kernel_ir::test_support::vector_load_cases() {
+        let name = case.body.name.clone();
+        let (module, compiled) = compile_and_load(&ctx, &name, &case.body);
+        let kernel = ctx
+            .lookup_kernel(&module, compiled.entry_point())
+            .unwrap_or_else(|e| panic!("lookup {name}: {e}"));
+        let input = ctx
+            .allocate(BufferRole::Input, BufferStorage::i32(), case.input.len())
+            .expect("allocate input");
+        let bytes: Vec<u8> = case.input.iter().flat_map(|w| w.to_le_bytes()).collect();
+        write_host_bytes(&ctx, &input, 0, &bytes).expect("write input");
+        let output = ctx
+            .allocate(BufferRole::Output, BufferStorage::i32(), case.want.len())
+            .expect("allocate output");
+        let kernarg = ctx
+            .bind_kernarg(
+                &kernel,
+                &[
+                    (&input, case.input.len() as u64),
+                    (&output, case.want.len() as u64),
+                ],
+            )
+            .expect("bind kernarg");
+        let threads = poot_kernel_ir::test_support::VECTOR_LOAD_THREADS;
+        ctx.dispatch(
+            &kernel,
+            &kernarg,
+            &[ElementKind::I32, ElementKind::I32],
+            (threads, 1, 1),
+            (threads, 1, 1),
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut raw = vec![0u8; case.want.len() * 4];
+        ctx.read_bytes(&output, &mut raw).expect("read output");
+        let got: Vec<u32> = raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect();
+        assert_eq!(got, case.want, "{name}");
+    }
+}

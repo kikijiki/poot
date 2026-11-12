@@ -7,8 +7,7 @@
 //! payload of scale bytes drawn from every bit pattern would put outputs at magnitudes no real
 //! checkpoint has.
 
-use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use poot_graph_ir::test_support::packed_graphs::{
     PackedExpertStack, packed_indexed_linear, packed_linear,
@@ -16,9 +15,10 @@ use poot_graph_ir::test_support::packed_graphs::{
 use poot_graph_ir::{Builder, Slot, TensorType};
 use poot_quant::StoredBytes;
 use poot_quant::format::{
-    FieldEncoding, FloatFormat, GroupMap, OperandRole, ScaleEncoding, Storage as FormatStorage,
-    WeightFormat,
+    FieldEncoding, FloatFormat, GroupMap, OperandRole, PlanarRole, ScaleEncoding,
+    Storage as FormatStorage, WeightFormat,
 };
+use poot_quant::test_support::formats::{GGUF_FORMATS, SAFETENSORS_FORMATS};
 use poot_quant::test_support::packed::prescribed_scale_payload;
 use poot_quant::weights::{WeightEntry, WeightStore};
 use poot_quant::{PackedPayload, PackedWeight, SourceRole};
@@ -61,135 +61,90 @@ struct Scheme {
     experts: &'static str,
 }
 
-/// A [`Scheme`] named `stem` in its three fixture names.
-macro_rules! scheme {
-    ($stem:literal, $format:expr, $magnitude:expr) => {
-        Scheme {
-            format: $format,
-            magnitude: $magnitude,
-            linear_m1: concat!("packed_linear_", $stem, "_m1"),
-            linear_m4: concat!("packed_linear_", $stem, "_m4"),
-            experts: concat!("packed_experts_", $stem),
-        }
-    };
-}
+/// One scheme per packed format the device lanes check: every GGUF and safetensors format of the shared
+/// format list that is a packed weight at the fixtures' shape (the dense dtypes are not), so a new format is
+/// covered by every backend's parity rows with no edit here. `the_schemes_are_every_format_the_lowering_table_admits`
+/// fails when a scheme's format has no `PACKED_LOWERING` row.
+static SCHEMES: LazyLock<Vec<Scheme>> = LazyLock::new(|| {
+    GGUF_FORMATS
+        .into_iter()
+        .chain(SAFETENSORS_FORMATS)
+        .filter(|&format| PackedWeight::try_new(format, [OUT, K]).is_ok())
+        .map(Scheme::of)
+        .collect()
+});
 
-const fn nonzero(n: usize) -> NonZeroUsize {
-    NonZeroUsize::new(n).unwrap()
-}
+impl Scheme {
+    /// The scheme of `format`: its magnitude and fixture names.
+    fn of(format: WeightFormat) -> Self {
+        let stem = Self::stem(format);
+        Self {
+            format,
+            magnitude: Self::magnitude(format),
+            linear_m1: format!("packed_linear_{stem}_m1").leak(),
+            linear_m4: format!("packed_linear_{stem}_m4").leak(),
+            experts: format!("packed_experts_{stem}").leak(),
+        }
+    }
 
-/// One scheme per packed format `PACKED_LOWERING` lowers (`the_schemes_are_every_format_the_lowering_table_admits`
-/// fails when a format is missing), so each has a device parity row on every backend that runs these fixtures.
-const SCHEMES: [Scheme; 26] = [
-    scheme!(
-        "q4_0",
-        WeightFormat::Q4_0,
-        Magnitude::Scaled {
-            peak: PEAK,
-            max_code: 8.0
+    /// The fixture-name fragment of `format`: its ggml name for a block format, the layout and scale for a
+    /// planar one.
+    fn stem(format: WeightFormat) -> String {
+        let scale = |scale| match scale {
+            ScaleEncoding::F32 => "f32",
+            ScaleEncoding::Bf16 => "bf16",
+            ScaleEncoding::E8m0 => "e8m0",
+        };
+        match format {
+            WeightFormat::E4m3PerChannel { scale: encoding } => {
+                format!("e4m3_channel_{}", scale(encoding))
+            }
+            WeightFormat::E4m3Block128 { scale: encoding } => {
+                format!("e4m3_block_{}", scale(encoding))
+            }
+            WeightFormat::E2m1Row32 => "e2m1".to_string(),
+            WeightFormat::Gptq {
+                groups: GroupMap::Contiguous { .. },
+            } => "gptq_contiguous".to_string(),
+            WeightFormat::Gptq {
+                groups: GroupMap::Indexed { .. },
+            } => "gptq".to_string(),
+            WeightFormat::Awq { .. } => "awq".to_string(),
+            block => format!("{block:?}").to_lowercase(),
         }
-    ),
-    scheme!("q4_1", WeightFormat::Q4_1, Magnitude::Admitted),
-    scheme!("q5_0", WeightFormat::Q5_0, Magnitude::Admitted),
-    scheme!("q5_1", WeightFormat::Q5_1, Magnitude::Admitted),
-    scheme!(
-        "q8_0",
-        WeightFormat::Q8_0,
-        Magnitude::Scaled {
-            peak: PEAK,
-            max_code: 127.0
+    }
+
+    /// How `format`'s payload is made: the formats whose random scales would put a decoded weight far above a
+    /// trained one state the largest code magnitude their decode multiplies a scale by.
+    fn magnitude(format: WeightFormat) -> Magnitude {
+        match format {
+            WeightFormat::Q4_0 => Magnitude::Scaled {
+                peak: PEAK,
+                max_code: 8.0,
+            },
+            WeightFormat::Q8_0 => Magnitude::Scaled {
+                peak: PEAK,
+                max_code: 127.0,
+            },
+            // The largest decoded magnitude is a grid point of 15 times an odd-integer sub-scale of 31.
+            WeightFormat::Iq3_S => Magnitude::Scaled {
+                peak: 2.0 * PEAK,
+                max_code: 15.0 * 31.0,
+            },
+            WeightFormat::Gptq {
+                groups: GroupMap::Indexed { .. },
+            } => Magnitude::Scaled {
+                peak: PEAK,
+                max_code: 16.0,
+            },
+            WeightFormat::Awq { .. } => Magnitude::Scaled {
+                peak: PEAK,
+                max_code: 15.0,
+            },
+            _ => Magnitude::Admitted,
         }
-    ),
-    scheme!("q2_k", WeightFormat::Q2_K, Magnitude::Admitted),
-    scheme!("q3_k", WeightFormat::Q3_K, Magnitude::Admitted),
-    scheme!("q4_k", WeightFormat::Q4_K, Magnitude::Admitted),
-    scheme!("q5_k", WeightFormat::Q5_K, Magnitude::Admitted),
-    scheme!("q6_k", WeightFormat::Q6_K, Magnitude::Admitted),
-    scheme!("iq4_nl", WeightFormat::Iq4_Nl, Magnitude::Admitted),
-    scheme!("iq4_xs", WeightFormat::Iq4_Xs, Magnitude::Admitted),
-    scheme!("iq2_xs", WeightFormat::Iq2_Xs, Magnitude::Admitted),
-    scheme!("iq3_xxs", WeightFormat::Iq3_Xxs, Magnitude::Admitted),
-    // The largest decoded magnitude is a grid point of 15 times an odd-integer sub-scale of 31.
-    scheme!(
-        "iq3_s",
-        WeightFormat::Iq3_S,
-        Magnitude::Scaled {
-            peak: 2.0 * PEAK,
-            max_code: 15.0 * 31.0
-        }
-    ),
-    scheme!("mxfp4", WeightFormat::Mxfp4, Magnitude::Admitted),
-    scheme!(
-        "e4m3_channel_bf16",
-        WeightFormat::E4m3PerChannel {
-            scale: ScaleEncoding::Bf16
-        },
-        Magnitude::Admitted
-    ),
-    scheme!(
-        "e4m3_channel_f32",
-        WeightFormat::E4m3PerChannel {
-            scale: ScaleEncoding::F32
-        },
-        Magnitude::Admitted
-    ),
-    scheme!(
-        "e4m3_block_bf16",
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::Bf16
-        },
-        Magnitude::Admitted
-    ),
-    scheme!(
-        "e4m3_block_f32",
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::F32
-        },
-        Magnitude::Admitted
-    ),
-    scheme!("e2m1", WeightFormat::E2m1Row32, Magnitude::Admitted),
-    scheme!(
-        "gptq_contiguous",
-        WeightFormat::Gptq {
-            groups: GroupMap::Contiguous { size: nonzero(64) }
-        },
-        Magnitude::Admitted
-    ),
-    scheme!(
-        "gptq",
-        WeightFormat::Gptq {
-            groups: GroupMap::Indexed { groups: nonzero(4) }
-        },
-        Magnitude::Scaled {
-            peak: PEAK,
-            max_code: 16.0
-        }
-    ),
-    scheme!(
-        "awq",
-        WeightFormat::Awq {
-            group_size: nonzero(64)
-        },
-        Magnitude::Scaled {
-            peak: PEAK,
-            max_code: 15.0
-        }
-    ),
-    scheme!(
-        "e4m3_channel_e8m0",
-        WeightFormat::E4m3PerChannel {
-            scale: ScaleEncoding::E8m0
-        },
-        Magnitude::Admitted
-    ),
-    scheme!(
-        "e4m3_block_e8m0",
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::E8m0
-        },
-        Magnitude::Admitted
-    ),
-];
+    }
+}
 
 /// xorshift64 bytes: every bit pattern of every code field.
 fn random_bytes(len: usize, seed: u64) -> Vec<u8> {
@@ -277,7 +232,7 @@ fn real_magnitude_payload(
                         );
                     }
                 }
-                (FormatStorage::Planar(_), SourceRole::Planar(OperandRole::GroupIndex)) => {
+                (FormatStorage::Planar(_), SourceRole::Planar(PlanarRole::GroupIndex)) => {
                     let GroupMap::Indexed { groups } = (match format {
                         WeightFormat::Gptq { groups } => groups,
                         _ => unreachable!("only GPTQ has a group index"),
@@ -447,118 +402,48 @@ mod tests {
     use super::*;
     use poot_graph_plan::packed_block_float::PACKED_LOWERING;
 
-    /// Every [`WeightFormat`] variant at least once, with the parameters that change the lowering. The match in
-    /// [`variant_is_listed`] has no wildcard: a new variant does not compile until it is added there, and the
-    /// reminder is to list it here.
-    fn every_weight_format() -> Vec<WeightFormat> {
-        let mut formats = vec![WeightFormat::F32, WeightFormat::F16, WeightFormat::Bf16];
-        formats.extend([
-            WeightFormat::Q4_0,
-            WeightFormat::Q4_1,
-            WeightFormat::Q5_0,
-            WeightFormat::Q5_1,
-            WeightFormat::Q8_0,
-            WeightFormat::Q2_K,
-            WeightFormat::Q3_K,
-            WeightFormat::Q4_K,
-            WeightFormat::Q5_K,
-            WeightFormat::Q6_K,
-            WeightFormat::Iq4_Nl,
-            WeightFormat::Iq4_Xs,
-            WeightFormat::Iq2_Xs,
-            WeightFormat::Iq3_Xxs,
-            WeightFormat::Iq3_S,
-            WeightFormat::Mxfp4,
-            WeightFormat::E2m1Row32,
-            WeightFormat::Gptq {
-                groups: GroupMap::Contiguous { size: nonzero(64) },
-            },
-            WeightFormat::Gptq {
-                groups: GroupMap::Indexed { groups: nonzero(4) },
-            },
-            WeightFormat::Awq {
-                group_size: nonzero(64),
-            },
-        ]);
-        for scale in [ScaleEncoding::F32, ScaleEncoding::Bf16, ScaleEncoding::E8m0] {
-            formats.push(WeightFormat::E4m3PerChannel { scale });
-            formats.push(WeightFormat::E4m3Block128 { scale });
-        }
-        formats
-    }
-
-    /// Whether the list above names `format`'s variant: an exhaustive match, so it breaks at a new variant.
-    fn variant_is_listed(format: WeightFormat) -> bool {
-        let variant = std::mem::discriminant(&format);
-        every_weight_format()
-            .iter()
-            .any(|listed| std::mem::discriminant(listed) == variant)
-    }
-
-    /// The compile-time guard for [`variant_is_listed`]: no wildcard arm.
-    fn variants_are_enumerated(format: WeightFormat) {
-        match format {
-            WeightFormat::F32
-            | WeightFormat::F16
-            | WeightFormat::Bf16
-            | WeightFormat::Q4_0
-            | WeightFormat::Q4_1
-            | WeightFormat::Q5_0
-            | WeightFormat::Q5_1
-            | WeightFormat::Q8_0
-            | WeightFormat::Q2_K
-            | WeightFormat::Q3_K
-            | WeightFormat::Q4_K
-            | WeightFormat::Q5_K
-            | WeightFormat::Q6_K
-            | WeightFormat::Iq4_Nl
-            | WeightFormat::Iq4_Xs
-            | WeightFormat::Iq2_Xs
-            | WeightFormat::Iq3_Xxs
-            | WeightFormat::Iq3_S
-            | WeightFormat::Mxfp4
-            | WeightFormat::E4m3PerChannel { .. }
-            | WeightFormat::E4m3Block128 { .. }
-            | WeightFormat::E2m1Row32
-            | WeightFormat::Gptq { .. }
-            | WeightFormat::Awq { .. } => {}
-        }
-    }
-
-    /// A format is lowered when it is a packed weight at the fixtures' shape and a row of `PACKED_LOWERING`
-    /// admits its descriptor. The dense dtypes are not packed weights.
+    /// A scheme's format is lowered when a row of `PACKED_LOWERING` admits its descriptor.
     fn is_lowered(format: WeightFormat) -> bool {
-        PackedWeight::try_new(format, [OUT, K]).is_ok()
-            && PACKED_LOWERING
-                .iter()
-                .any(|row| (row.admits)(&format.descriptor()))
+        PACKED_LOWERING
+            .iter()
+            .any(|row| (row.admits)(&format.descriptor()))
     }
 
-    /// SC-006 (card 1218): every packed format the lowering table admits has a scheme, so a device parity row on
-    /// every backend that runs these fixtures; and a scheme names no format twice or one the table does not lower.
-    /// Mutation: remove one `SCHEMES` entry; this goes red naming the format.
+    /// SC-006 (card 1218): every packed format of the shared format list has a scheme, so a device parity row on
+    /// every backend that runs these fixtures, and every scheme's format is one a `PACKED_LOWERING` row admits.
+    /// A scheme names no format twice. Mutation: remove the `PACKED_LOWERING` row of one format; this goes red
+    /// naming the format.
     #[test]
     fn the_schemes_are_every_format_the_lowering_table_admits() {
-        for format in every_weight_format() {
-            variants_are_enumerated(format);
-            assert!(variant_is_listed(format));
+        let listed: Vec<WeightFormat> = GGUF_FORMATS
+            .into_iter()
+            .chain(SAFETENSORS_FORMATS)
+            .collect();
+        for &format in &listed {
+            let packed = PackedWeight::try_new(format, [OUT, K]).is_ok();
             let has_scheme = SCHEMES.iter().any(|scheme| scheme.format == format);
             assert_eq!(
-                has_scheme,
-                is_lowered(format),
-                "{format:?}: {}",
-                if has_scheme {
-                    "has a scheme but no PACKED_LOWERING row admits it"
-                } else {
-                    "PACKED_LOWERING admits it but no SCHEMES entry gives it a device parity row"
-                }
+                has_scheme, packed,
+                "{format:?}: a packed weight has a scheme and a dense dtype has none"
             );
+            if has_scheme {
+                assert!(
+                    is_lowered(format),
+                    "{format:?}: has a scheme but no PACKED_LOWERING row admits it"
+                );
+            }
         }
         for (index, scheme) in SCHEMES.iter().enumerate() {
             assert!(
+                listed.contains(&scheme.format),
+                "{:?} is not in the format list",
+                scheme.format
+            );
+            assert!(
                 !SCHEMES[..index]
                     .iter()
-                    .any(|earlier| earlier.format == scheme.format),
+                    .any(|earlier| earlier.format == scheme.format
+                        || earlier.experts == scheme.experts),
                 "{:?} has two schemes",
                 scheme.format
             );

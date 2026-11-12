@@ -634,6 +634,82 @@ fn every_corpus_trace_is_primitive_before_compile() {
     );
 }
 
+/// The routers of the registry's MoE families (granitemoe, qwen3.8 and the group-limited deepseek3) compile to
+/// `StableRank` composites, one per routed rank, on every reference target, and the pairwise `[.., E, E]`
+/// rank workspace is gone: no value of the compiled program has a formed rank's scores shape with its last axis repeated. Mutation: have `form_selection` skip the rank arm; the router rows hold no `StableRank` and this row
+/// goes red naming the graph.
+#[test]
+fn router_ranks_form_stable_rank_and_leave_no_pairwise_value() {
+    use poot_graph_ir::OpKind;
+
+    let registry = registry();
+    let mut routed = 0usize;
+    let mut formed: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for RefTarget { column, target, .. } in reference_targets() {
+        for row in corpus(&registry) {
+            let Ok(program) = compile(&row.graph(), &target, &targets::options()) else {
+                continue;
+            };
+            let g = program.graph();
+            for eqn in g.eqns() {
+                if let OpKind::StableRank(attrs) = eqn.op {
+                    let (plain, masked) = formed.entry(row.name.clone()).or_default();
+                    *(if attrs.masked { masked } else { plain }) += 1;
+                }
+            }
+            // The pairwise workspace of a rank over `[.., E]` scores is `[.., E, E]`.
+            let pairwise: Vec<Vec<usize>> = g
+                .eqns()
+                .iter()
+                .filter(|eqn| matches!(eqn.op, OpKind::StableRank(_)))
+                .map(|eqn| {
+                    let mut shape = g.aval(eqn.out).shape.clone();
+                    shape.push(shape[shape.len() - 1]);
+                    shape
+                })
+                .collect();
+            if pairwise.is_empty() {
+                continue;
+            }
+            routed += 1;
+            // Only a value the pairwise chain computes counts: a reshape or a cache update of that shape at
+            // tiny dimensions is a coincidence.
+            let computes = |op: &OpKind| {
+                matches!(
+                    op,
+                    OpKind::Broadcast { .. }
+                        | OpKind::Binary(_)
+                        | OpKind::Fused(_)
+                        | OpKind::FusedRow(_)
+                )
+            };
+            for (at, eqn) in g.eqns().iter().enumerate().filter(|(_, e)| computes(&e.op)) {
+                let shape = &g.aval(eqn.out).shape;
+                assert!(
+                    !pairwise.contains(shape),
+                    "{} on {column}: eqn {at} ({}) is the pairwise {shape:?} value of a formed rank",
+                    row.name,
+                    eqn.op.name()
+                );
+            }
+        }
+    }
+    assert!(routed > 0, "no corpus router formed a StableRank");
+    // A softmax router ranks plainly; the group-limited deepseek3 ranks its groups plainly and its experts under
+    // the group mask. Each rank is counted once per target.
+    let targets = reference_targets().len();
+    assert_eq!(
+        formed["granite/granitemoe.prefill"],
+        (2 * targets, 0),
+        "granitemoe: one plain rank per routed layer"
+    );
+    let (plain, masked) = formed["deepseek3.prefill"];
+    assert!(
+        plain > 0 && masked > 0,
+        "deepseek3 forms its group ranks ({plain}) and its masked expert rank ({masked})"
+    );
+}
+
 // ---- the invariants --------------------------------------------------------------------------
 
 /// SC-003: every plan `compile` makes for the fixture corpus satisfies the launch invariants on its

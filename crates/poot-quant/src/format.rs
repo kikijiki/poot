@@ -24,9 +24,10 @@
 //! - [`ValueMap::Integer`]: the code as an integer, minus the `Zero` operand when the format has
 //!   one (`q - 8` for `Q4_0`, `q - (z + 1)` for GPTQ). Offsets such as `- 8` are part of the
 //!   field's [`FieldEncoding`].
-//! - [`ValueMap::Codebook`]: a 16-entry table (`IQ4_NL`, `IQ4_XS`).
-//! - [`ValueMap::SignedGrid`]: a lattice point looked up by the code, one lane of it picked by the
-//!   element's position, and its sign taken from the `Signs` operand (`IQ2_XS`, `IQ3_XXS`, `IQ3_S`).
+//! - [`ValueMap::Lattice`]: a table point looked up by the code, one lane of it picked by the
+//!   element's position, and, when the lattice has a sign rule, its sign taken from the `Signs`
+//!   operand. `IQ4_NL` and `IQ4_XS` are lattices of 16 one-lane points of f32 cells without signs;
+//!   `IQ2_XS`, `IQ3_XXS` and `IQ3_S` are lattices of four or eight byte lanes with signs.
 //! - [`ValueMap::Float`]: the code is a float (F32, F16, BF16, E4M3FN, E2M1).
 //!
 //! ## Two storage shapes
@@ -81,8 +82,8 @@
 //! | `Q4_K` | `d` f16 | u6 | u4 | - | `-dmin` f16 | u6 |
 //! | `Q5_K` | `d` f16 | u6 | u5 (`qs` + `qh`) | - | `-dmin` f16 | u6 |
 //! | `Q6_K` | `d` f16 | i8 | u6 - 32 (`ql` + `qh`) | - | - | - |
-//! | `IQ4_NL` | `d` f16 | - | codebook | - | - | - |
-//! | `IQ4_XS` | `d` f16 | u6 - 32 | codebook | - | - | - |
+//! | `IQ4_NL` | `d` f16 | - | lattice, 1 lane | - | - | - |
+//! | `IQ4_XS` | `d` f16 | u6 - 32 | lattice, 1 lane | - | - | - |
 //! | `IQ2_XS` | `d` f16 | u4 + 1/2, x 1/4 | u9 grid point, 8 lanes | - | - | - |
 //! | `IQ3_XXS` | `d` f16 | u4 + 1/2, x 1/2 | u8 grid point, 4 lanes | - | - | - |
 //! | `IQ3_S` | `d` f16 | u4 + 1/2, x 2 | u9 grid point, 4 lanes | - | - | - |
@@ -95,7 +96,7 @@
 //!
 //! `IQ2_XS`, `IQ3_XXS` and `IQ3_S` also have a `Signs` operand per group of eight values: seven
 //! stored bits whose parity is the eighth sign (ggml's `ksigns_iq2xs`) for the first two, eight
-//! stored bits for `IQ3_S`. See [`SignedGrid`] and [`SignRule`].
+//! stored bits for `IQ3_S`. See [`Lattice`] and [`crate::families::lattice::SignRule`].
 //!
 //! `Q3_K`'s `hmask` bit is stored inverted (`q = low2 - (h ? 0 : 4)`); as a code it is
 //! `low2 | h << 2` with a `-4` offset, which is the same value for all eight codes.
@@ -131,6 +132,8 @@
 //! scales. E8M0 `0xff` is NaN and is a decode error, never a value.
 
 use std::num::NonZeroUsize;
+
+use crate::families::lattice::Lattice;
 
 /// Every weight storage format poot reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -226,7 +229,7 @@ pub enum GroupMap {
         /// K values per group.
         size: NonZeroUsize,
     },
-    /// Group `g_idx[k]`, read from the [`OperandRole::GroupIndex`] operand (GPTQ act-order), with
+    /// Group `g_idx[k]`, read from the [`PlanarRole::GroupIndex`] operand (GPTQ act-order), with
     /// this many groups.
     Indexed {
         /// Number of groups `g_idx` entries may name.
@@ -234,7 +237,8 @@ pub enum GroupMap {
     },
 }
 
-/// A named operand of the value formula (see the module docs).
+/// A named operand of the value formula (see the module docs): a block format's field role, and the term
+/// an error names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OperandRole {
     /// The quantized value codes.
@@ -249,10 +253,44 @@ pub enum OperandRole {
     Min,
     /// The sub-block min of a super-block (`m`).
     SubMin,
-    /// The sign pattern of a group of eight values ([`SignedGrid`]).
+    /// The sign pattern of a group of eight values ([`Lattice`]).
     Signs,
+}
+
+/// The operand of a planar format a source tensor supplies. A planar format has no `SubScale`, `Min`,
+/// `SubMin` or `Signs` operand (those sit inside a block), so the type cannot name them: a
+/// [`crate::SourceRole::Planar`] is always a tensor that exists.
+///
+/// A block-internal role is not a planar source, and the compiler says so:
+///
+/// ```compile_fail,E0599
+/// use poot_quant::{PlanarRole, SourceRole};
+///
+/// let _ = SourceRole::Planar(PlanarRole::Signs);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PlanarRole {
+    /// The quantized value codes.
+    Codes,
+    /// The group or row scale (`d`).
+    Scale,
+    /// The per-group zero point subtracted from an integer code.
+    Zero,
     /// The group index of each K value (GPTQ `g_idx`).
     GroupIndex,
+}
+
+impl PlanarRole {
+    /// The value-formula operand this tensor supplies; `None` for the group index, which selects a group
+    /// rather than entering the formula.
+    pub const fn operand(self) -> Option<OperandRole> {
+        match self {
+            Self::Codes => Some(OperandRole::Codes),
+            Self::Scale => Some(OperandRole::Scale),
+            Self::Zero => Some(OperandRole::Zero),
+            Self::GroupIndex => None,
+        }
+    }
 }
 
 /// Whether the min term is added (`Q4_1`, `Q5_1`: `x = d*q + m`) or subtracted (K-quants:
@@ -265,86 +303,18 @@ pub enum MinSign {
     Subtract,
 }
 
-/// How the `Codes` operand becomes the value the scale multiplies.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// How the `Codes` operand becomes the value the scale multiplies: one of the value families of
+/// [`crate::families`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValueMap {
     /// The code read through its [`FieldEncoding`] as an integer, minus the `Zero` operand when the
     /// format has one.
     Integer,
-    /// `table[code]`.
-    Codebook(&'static [f32; 16]),
-    /// A lattice point read through a [`SignedGrid`].
-    SignedGrid(&'static SignedGrid),
+    /// A point of a table read through a [`Lattice`]: the code names the point, the element's position
+    /// picks a cell of it, and the `Signs` operand flips it when the lattice has a sign rule.
+    Lattice(&'static Lattice),
     /// The code is a float; its format is the `Codes` field's [`FieldEncoding::Float`].
     Float,
-}
-
-/// The lattice of `IQ2_XS` and `IQ3_XXS`: a table of grid points, each a short run of unsigned
-/// magnitudes, and the sign rule that applies to them.
-///
-/// Element `i` of a block decodes to `sign(i) * magnitudes[code * lanes + i % lanes]`, where `code`
-/// is the `Codes` operand at `i` and the sign comes from the `Signs` operand at `i` under
-/// [`Self::signs`]: the signs of the group of eight values `i / 8 * 8 ..` (bit `j` set means value
-/// `j` of the group is negative), whatever [`Self::lanes`] is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SignedGrid {
-    /// The grid points, row-major: point `g` is `magnitudes[g * lanes .. (g + 1) * lanes]`.
-    pub magnitudes: &'static [u8],
-    /// Values one grid point covers: 8 for `IQ2_XS`, 4 for `IQ3_XXS`. A multiple of four, so a
-    /// point is a whole number of little-endian `u32` words ([`Self::word`]).
-    pub lanes: usize,
-    /// How the `Signs` operand states the eight signs of a group.
-    pub signs: SignRule,
-}
-
-/// How a [`SignedGrid`]'s `Signs` operand states the eight signs of a group of eight values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SignRule {
-    /// Seven stored bits are signs 0 to 6 and sign 7 is their parity, which is how ggml's
-    /// `ksigns_iq2xs` completes a 7-bit index to a byte of even population count (`IQ2_XS`,
-    /// `IQ3_XXS`).
-    ParityOfSeven,
-    /// Eight stored bits, one sign each (`IQ3_S`).
-    Direct,
-}
-
-impl SignRule {
-    /// Whether value `lane` (0 to 7) of a group of eight is negative under the stored `signs`.
-    pub const fn negative(self, signs: u32, lane: u32) -> bool {
-        let pattern = match self {
-            Self::ParityOfSeven => signs | ((signs.count_ones() & 1) << 7),
-            Self::Direct => signs,
-        };
-        pattern >> lane & 1 == 1
-    }
-}
-
-impl SignedGrid {
-    /// Number of grid points.
-    pub const fn points(&self) -> usize {
-        self.magnitudes.len() / self.lanes
-    }
-
-    /// The magnitude of lane `lane` of grid point `code`.
-    pub const fn magnitude(&self, code: usize, lane: usize) -> u8 {
-        self.magnitudes[code * self.lanes + lane]
-    }
-
-    /// Little-endian `u32` word `word` of the table: the form a device kernel reads it in. Grid
-    /// point `g` occupies words `g * lanes / 4 ..`, lane `l` in byte `l % 4` of word `l / 4`.
-    pub const fn word(&self, word: usize) -> u32 {
-        u32::from_le_bytes([
-            self.magnitudes[4 * word],
-            self.magnitudes[4 * word + 1],
-            self.magnitudes[4 * word + 2],
-            self.magnitudes[4 * word + 3],
-        ])
-    }
-
-    /// Number of `u32` words in [`Self::word`]'s form.
-    pub const fn words(&self) -> usize {
-        self.magnitudes.len() / 4
-    }
 }
 
 /// The narrow float formats a code or scale can be stored in.
@@ -620,8 +590,8 @@ pub struct Packing {
 /// One source tensor of a planar format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlanarOperand {
-    /// The operand of the value formula this tensor supplies.
-    pub role: OperandRole,
+    /// The operand this tensor supplies.
+    pub role: PlanarRole,
     /// How a stored value's bits become a number.
     pub encoding: FieldEncoding,
     /// Stored width of one value in bits.
@@ -683,7 +653,7 @@ impl FormatDescriptor {
             Storage::Planar(layout) => layout
                 .operands
                 .iter()
-                .any(|operand| operand.role == OperandRole::Scale),
+                .any(|operand| operand.role == PlanarRole::Scale),
         }
     }
 }

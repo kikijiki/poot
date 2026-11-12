@@ -8,12 +8,28 @@ use poot_quant::format::{FieldEncoding, OperandRole, Storage, WeightFormat};
 use poot_quant::test_support::formats::GGUF_FORMATS;
 use poot_quant::test_support::packed::every_field_blocks;
 
-/// The formats with a llama.cpp reference in `tests/data/ggml_reference/`, written by
-/// `tests/data/ggml_reference.cpp` from [`every_field_blocks`].
-const GGML_REFERENCES: [(WeightFormat, &str); 1] = [(
-    WeightFormat::Iq4_Nl,
-    include_str!("data/ggml_reference/iq4_nl.tsv"),
-)];
+/// The quantized GGUF formats: every listed block format with a `Scale` operand (the dense dtypes have none).
+fn quantized_formats() -> impl Iterator<Item = WeightFormat> {
+    GGUF_FORMATS.into_iter().filter(|format| {
+        matches!(format.descriptor().storage, Storage::Blocks(layout)
+            if layout.field(OperandRole::Scale).is_some())
+    })
+}
+
+/// The reference file of `format` in `tests/data/ggml_reference/`, written by `tests/data/ggml_reference.cpp`
+/// from [`every_field_blocks`]: named after the format (`Iq4_Nl` is `iq4_nl.tsv`).
+fn reference_of(format: WeightFormat) -> String {
+    let name = format!("{format:?}").to_lowercase();
+    let path = poot_test_util::manifest_dir()
+        .join("tests/data/ggml_reference")
+        .join(format!("{name}.tsv"));
+    std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "{format:?} has no llama.cpp reference file {}: {error}; generate it from every_field_blocks",
+            path.display()
+        )
+    })
+}
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -85,27 +101,43 @@ fn the_fixture_reaches_every_value_of_every_field() {
     }
 }
 
-/// A format's decode of its fixture equals llama.cpp's `to_float` (`dequantize_row_*`) bit for bit. Each
-/// reference file holds the fixture's blocks and llama.cpp's output; the blocks must be exactly
-/// [`every_field_blocks`], so the reference covers every value of every field. Mutation: change one entry of
-/// `KVALUES_IQ4NL` (`blocks.rs`); the IQ4_NL row goes red.
+/// SC-2 of POOT-1539: every quantized format's decode of its fixture equals llama.cpp's `to_float`
+/// (`dequantize_row_*`, b9190) bit for bit. Each reference file's first row is the fixture's blocks and
+/// llama.cpp's output; the blocks must be exactly [`every_field_blocks`], so the reference covers every value of
+/// every field. Further rows are extra evidence (real checkpoint blocks) decoded the same way. A row may carry
+/// a third column, the positions where poot decodes `-0.0` and ggml's int8 table gives `+0.0` (MXFP4's E2M1
+/// code `0b1000`, see `poot_quant::format`); the decode differs at exactly those positions and only there.
+/// Mutation: flip one byte of a grid or codebook (`KVALUES_IQ4NL`, an `iq*_grid` entry) and the format's row
+/// goes red naming the value; or change the MXFP4 negative-zero positions in `mxfp4.tsv`.
 #[test]
-fn every_referenced_format_decodes_its_fixture_like_llamacpp() {
-    for (format, rows) in GGML_REFERENCES {
-        let mut checked = 0;
-        for line in rows.lines().filter(|line| !line.starts_with('#')) {
+fn every_quantized_format_decodes_its_fixture_like_llamacpp() {
+    let mut formats = 0;
+    for format in quantized_formats() {
+        let file = reference_of(format);
+        let mut rows = 0;
+        for (index, line) in file
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .enumerate()
+        {
             let mut columns = line.split('\t');
             let (blocks, expected) = (
                 unhex(columns.next().unwrap()),
                 unhex(columns.next().unwrap()),
             );
-            let fixture = every_field_blocks(format);
-            assert!(
-                blocks == fixture,
-                "{format:?}: the reference was not generated from the current fixture; regenerate it \
-                 from these blocks: {}",
-                hex(&fixture)
-            );
+            let negative_zeros: Vec<usize> = columns
+                .next()
+                .map(|positions| positions.split(',').map(|at| at.parse().unwrap()).collect())
+                .unwrap_or_default();
+            if index == 0 {
+                let fixture = every_field_blocks(format);
+                assert!(
+                    blocks == fixture,
+                    "{format:?}: the reference was not generated from the current fixture; regenerate it \
+                     from these blocks: {}",
+                    hex(&fixture)
+                );
+            }
             let expected: Vec<f32> = expected
                 .as_chunks::<4>()
                 .0
@@ -115,9 +147,10 @@ fn every_referenced_format_decodes_its_fixture_like_llamacpp() {
             let mut decoded = vec![0.0f32; expected.len()];
             poot_quant::plan::decode_blocks(format, &blocks, &mut decoded)
                 .unwrap_or_else(|error| panic!("{format:?}: {error}"));
-            if let Some(at) =
-                (0..decoded.len()).find(|&i| decoded[i].to_bits() != expected[i].to_bits())
-            {
+            let differing: Vec<usize> = (0..decoded.len())
+                .filter(|&i| decoded[i].to_bits() != expected[i].to_bits())
+                .collect();
+            if let Some(&at) = differing.iter().find(|at| !negative_zeros.contains(at)) {
                 panic!(
                     "{format:?}: value {at} decodes to {} ({:#010x}), llama.cpp says {} ({:#010x})",
                     decoded[at],
@@ -126,8 +159,25 @@ fn every_referenced_format_decodes_its_fixture_like_llamacpp() {
                     expected[at].to_bits()
                 );
             }
-            checked += 1;
+            for &at in &negative_zeros {
+                assert!(
+                    decoded[at].to_bits() == 0x8000_0000 && expected[at].to_bits() == 0,
+                    "{format:?}: value {at} is listed as poot's -0.0 against ggml's +0.0 but decodes to {} and ggml says {}",
+                    decoded[at],
+                    expected[at]
+                );
+            }
+            assert_eq!(
+                differing, negative_zeros,
+                "{format:?}: the values that differ are exactly the listed negative zeros"
+            );
+            rows += 1;
         }
-        assert_eq!(checked, 1, "{format:?}: one reference row");
+        assert!(
+            rows >= 1,
+            "{format:?}: a reference file holds the fixture row"
+        );
+        formats += 1;
     }
+    assert_eq!(formats, 16, "the sixteen quantized GGUF formats");
 }

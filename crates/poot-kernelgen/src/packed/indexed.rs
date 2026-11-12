@@ -250,11 +250,11 @@ mod tests {
     //! The indexed packed Gemv in the KIR interpreter (GPU-free): every packed layout (block, K-quant and
     //! planar) over a stacked, word-padded table against `PackedPayload::decode_row`.
 
-    use std::num::NonZeroUsize;
     use std::sync::Arc;
 
     use poot_kernel_ir::interp::{Buffer, run};
-    use poot_quant::format::{GroupMap, ScaleEncoding, WeightFormat};
+    use poot_quant::format::WeightFormat;
+    use poot_quant::test_support::formats::packed_formats;
     use poot_quant::{PackedPayload, PackedStack, PackedStackComponentRef, packed_source_words};
 
     use super::super::fixtures::{GEMV_SCHEDULES, schedule_tag};
@@ -264,39 +264,13 @@ mod tests {
 
     const EXPERTS: usize = 3;
 
+    /// Every packed format of the shared list with the contraction length its rows use: 256, a whole number
+    /// of blocks of every block format and of groups of every planar one.
     fn formats() -> Vec<(WeightFormat, usize)> {
-        let nz = |n| NonZeroUsize::new(n).unwrap();
-        vec![
-            (WeightFormat::Q4_0, 64),
-            (WeightFormat::Q5_1, 64),
-            (WeightFormat::Q8_0, 64),
-            (WeightFormat::Q4_K, 256),
-            (WeightFormat::Q6_K, 256),
-            (WeightFormat::Iq2_Xs, 256),
-            (WeightFormat::Iq3_Xxs, 256),
-            (WeightFormat::Iq3_S, 256),
-            (WeightFormat::Mxfp4, 64),
-            (
-                WeightFormat::E4m3PerChannel {
-                    scale: ScaleEncoding::Bf16,
-                },
-                64,
-            ),
-            (
-                WeightFormat::E4m3Block128 {
-                    scale: ScaleEncoding::Bf16,
-                },
-                128,
-            ),
-            (WeightFormat::E2m1Row32, 64),
-            (WeightFormat::Awq { group_size: nz(64) }, 128),
-            (
-                WeightFormat::Gptq {
-                    groups: GroupMap::Indexed { groups: nz(4) },
-                },
-                128,
-            ),
-        ]
+        packed_formats()
+            .into_iter()
+            .map(|format| (format, 256))
+            .collect()
     }
 
     /// The pieces of one indexed packed launch over `EXPERTS` random experts of `format` at `[out, k]`.

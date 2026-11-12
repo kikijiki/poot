@@ -2341,23 +2341,13 @@ mod tests {
     /// from `compile`; every case is refused by the escape gate (`Unmatched`).
     #[test]
     fn compile_claims_packed_linear_as_a_planned_packed_contraction() {
-        use poot_quant::format::{GroupMap, WeightFormat};
-        use std::num::NonZeroUsize;
-        let nz = |n| NonZeroUsize::new(n).unwrap();
-        let formats = [
-            WeightFormat::Q4_K,
-            WeightFormat::Q8_0,
-            WeightFormat::Awq { group_size: nz(64) },
-            WeightFormat::Gptq {
-                groups: GroupMap::Indexed { groups: nz(4) },
-            },
-        ];
+        let formats = poot_quant::test_support::formats::packed_formats();
         for backend in [
             Backend::SpirvVulkan,
             Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
             Backend::Nvptx,
         ] {
-            for format in formats {
+            for &format in &formats {
                 for m in [1, 4] {
                     let what = format!("{backend:?} {format:?} M={m}");
                     let program = compile(
@@ -2461,24 +2451,9 @@ mod tests {
         b.packed_dequant(&sources, moe_descriptor()).unwrap()
     }
 
-    /// Every packed layout the engine serves a routed projection in: a plain block format, a K-quant
-    /// super-block, the two planar integer formats, and a codebook-scaled 4-bit block format.
+    /// Every packed layout the engine serves a routed projection in: the packed formats of the shared list.
     fn moe_formats() -> Vec<poot_quant::format::WeightFormat> {
-        use poot_quant::format::{GroupMap, WeightFormat};
-        use std::num::NonZeroUsize;
-        vec![
-            WeightFormat::Q8_0,
-            WeightFormat::Q4_K,
-            WeightFormat::Awq {
-                group_size: NonZeroUsize::new(64).unwrap(),
-            },
-            WeightFormat::Gptq {
-                groups: GroupMap::Indexed {
-                    groups: NonZeroUsize::new(4).unwrap(),
-                },
-            },
-            WeightFormat::Mxfp4,
-        ]
+        poot_quant::test_support::formats::packed_formats()
     }
 
     fn stack_descriptor(format: poot_quant::format::WeightFormat) -> poot_quant::PackedWeight {

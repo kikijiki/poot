@@ -74,13 +74,6 @@ pub enum Target {
     AmdGcn(AmdArch),
 }
 
-/// The byte alignment every buffer an executor binds to a kernel parameter starts at (POOT-1405): an executor binds
-/// a buffer at its allocation base, never at an offset into it, so this is a floor every native allocator meets
-/// (`cuMemAlloc` returns 256-byte aligned memory). Kernel codegen relies on it: an `Rvalue::VectorLoad` of a
-/// 4-lane f32 group `i` reads bytes `16 * i ..` and is stamped `align 16`. An executor whose binding would break
-/// it refuses the dispatch (the PTX runtime's kernel-argument packing).
-pub const BUFFER_PARAM_ALIGN: u64 = 16;
-
 /// What this target's codegen can lower today, a query the planner reads instead of restating a
 /// per-backend match by hand (card 522, R468-014, R469-022).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,13 +86,16 @@ pub struct Capability {
     /// `Target::Nvptx` like any other kernel; `false` here just meant PTX paid an extra materialize copy
     /// for no codegen reason (R-546-9, card 549).
     pub strided_views: bool,
-    /// A kernel body may read one buffer param both in aligned groups (`Rvalue::VectorLoad` into a 4-lane
-    /// `Ty::Vec`, then `Rvalue::VectorExtract`) and element by element. NVPTX lowers a group read to one
-    /// `ld.global.v4` on the param's pointer; scalar `align 4` reads stay scalar there, since NVPTX
-    /// vectorises only naturally aligned accesses (POOT-1405). SPIR-V binds a vector-read param as a
-    /// vector-typed resource, so it cannot also be read element by element (spec 134 FR-004b, not
-    /// built). AMDGPU has no vector lowering: its backend already merges dword-aligned scalar reads into
-    /// `global_load_b128` (POOT-1390 ISA). The AIE core has no vector types.
+    /// A kernel body may read one buffer param both with [`poot_kernel_ir::Rvalue::VectorLoad`] (into a `Ty::Vec`,
+    /// then `Rvalue::VectorExtract`) and element by element, and the planner may rely on each vector load being one
+    /// vector load. NVPTX loads `<lanes x elem>` through the param's own pointer (`ld.global.v4`), where the load's
+    /// proven alignment covers the vector. SPIR-V binds a param that is only ever vector-loaded as a vector-typed
+    /// resource; a param read both ways (spec 134 FR-004b's two-binding mechanism is not built) is declared scalar
+    /// and its vector loads read the lanes as scalars: the same values, no vector instruction. AMDGPU lowers the
+    /// load as NVPTX does (`global_load_dwordx4`) and is `false` all the same: its backend already merges
+    /// dword-aligned scalar reads into `global_load_b128` (POOT-1390 ISA), and a planner that reads a Gemv's
+    /// activation in groups on ROCm is a measured choice with its plan digests, not a side effect of the lowering.
+    /// The AIE core has no vector types.
     pub mixed_vector_reads: bool,
     /// A body the planner narrowed (`poot_kernel_ir::IndexWidth::U32`) lowers its `usize` as i32 where the
     /// target's own index type is i64: NVPTX, where the 64-bit index math was about a quarter of the decode

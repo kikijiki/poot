@@ -3,7 +3,8 @@
 //! bit pattern of every field is exercised.
 
 use crate::format::{
-    FieldEncoding, FloatFormat, GroupMap, OperandRole, ScaleEncoding, Storage, WeightFormat,
+    FieldEncoding, FloatFormat, GroupMap, OperandRole, PlanarRole, ScaleEncoding, Storage,
+    WeightFormat,
 };
 use crate::{PackedPayload, PackedWeight, SourceRole, StoredBytes};
 
@@ -63,7 +64,7 @@ pub fn random_payload(format: WeightFormat, shape: [usize; 2], seed: u64) -> Pac
                     }
                     bytes
                 }
-                (Storage::Planar(_), SourceRole::Planar(OperandRole::GroupIndex)) => {
+                (Storage::Planar(_), SourceRole::Planar(PlanarRole::GroupIndex)) => {
                     let WeightFormat::Gptq {
                         groups: GroupMap::Indexed { groups },
                     } = format
@@ -128,7 +129,7 @@ pub fn prescribed_scale_payload(
         .into_iter()
         .map(|role| {
             let mut bytes = base.bytes(role).to_vec();
-            if role == SourceRole::Planar(OperandRole::Scale) {
+            if role == SourceRole::Planar(PlanarRole::Scale) {
                 let width = match scale {
                     ScaleEncoding::Bf16 => 2,
                     ScaleEncoding::F32 => 4,

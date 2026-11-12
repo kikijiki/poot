@@ -9,6 +9,7 @@
 //! for bit. Dense formats (one float per block) decode in one loop over the tensor.
 
 use crate::decode::DecodeError;
+use crate::families::{float, integer};
 use crate::format::{
     BlockField, Field, FieldEncoding, FloatFormat, FormatDescriptor, MinSign, OperandRole, Storage,
     ValueMap, WeightFormat,
@@ -22,53 +23,67 @@ type Padded = [u8; MAX_BLOCK_BYTES + 8];
 /// At most this many distinct slots of one repeating factor per block.
 const MAX_SLOTS: usize = 16;
 
-/// One field at one element: up to two pieces, low bits first.
+/// The most pieces one field concatenates (IQ1_M's f16 super-scale is four nibbles).
+const MAX_PIECES: usize = 4;
+
+/// One field at one element: up to [`MAX_PIECES`] pieces, low bits first.
 #[derive(Clone, Copy, Debug)]
 struct Pieces {
-    two: bool,
-    byte: [usize; 2],
-    shift: [u32; 2],
-    mask: [u64; 2],
-    low_width: u32,
+    count: usize,
+    byte: [usize; MAX_PIECES],
+    shift: [u32; MAX_PIECES],
+    mask: [u64; MAX_PIECES],
+    /// Where piece `k` lands in the field: the widths of the pieces below it.
+    offset: [u32; MAX_PIECES],
 }
 
 impl Pieces {
     const EMPTY: Self = Self {
-        two: false,
-        byte: [0; 2],
-        shift: [0; 2],
-        mask: [0; 2],
-        low_width: 0,
+        count: 0,
+        byte: [0; MAX_PIECES],
+        shift: [0; MAX_PIECES],
+        mask: [0; MAX_PIECES],
+        offset: [0; MAX_PIECES],
     };
 
     const fn at(field: &Field, index: u32) -> Self {
         assert!(
-            !field.pieces.is_empty() && field.pieces.len() <= 2,
-            "a field of one or two pieces"
+            !field.pieces.is_empty() && field.pieces.len() <= MAX_PIECES,
+            "a field of one to MAX_PIECES pieces"
         );
         let mut pieces = Self::EMPTY;
-        pieces.two = field.pieces.len() == 2;
-        pieces.low_width = field.pieces[0].width;
+        pieces.count = field.pieces.len();
         let mut slot = 0;
+        let mut below = 0;
         while slot < field.pieces.len() {
             let piece = field.pieces[slot];
             let bit = piece.layout.bit(index);
             pieces.byte[slot] = (bit / 8) as usize;
             pieces.shift[slot] = bit % 8;
             pieces.mask[slot] = (1u64 << piece.width) - 1;
+            pieces.offset[slot] = below;
+            below += piece.width;
             slot += 1;
         }
         pieces
     }
 
     const fn same(&self, other: &Self) -> bool {
-        self.two == other.two
-            && self.byte[0] == other.byte[0]
-            && self.byte[1] == other.byte[1]
-            && self.shift[0] == other.shift[0]
-            && self.shift[1] == other.shift[1]
-            && self.mask[0] == other.mask[0]
-            && self.mask[1] == other.mask[1]
+        if self.count != other.count {
+            return false;
+        }
+        let mut slot = 0;
+        while slot < self.count {
+            if self.byte[slot] != other.byte[slot]
+                || self.shift[slot] != other.shift[slot]
+                || self.mask[slot] != other.mask[slot]
+                || self.offset[slot] != other.offset[slot]
+            {
+                return false;
+            }
+            slot += 1;
+        }
+        true
     }
 
     #[inline(always)]
@@ -81,12 +96,11 @@ impl Pieces {
     /// The raw bits.
     #[inline(always)]
     fn read(&self, padded: &Padded) -> u32 {
-        let low = self.piece(padded, 0);
-        if self.two {
-            low | (self.piece(padded, 1) << self.low_width)
-        } else {
-            low
+        let mut bits = self.piece(padded, 0);
+        for slot in 1..self.count {
+            bits |= self.piece(padded, slot) << self.offset[slot];
         }
+        bits
     }
 }
 
@@ -268,7 +282,7 @@ pub(crate) struct ConstPlan<const N: usize> {
     min_sign: Option<MinSign>,
     codes: Reader,
     code_pieces: [Pieces; N],
-    /// The `Signs` operand's bits at each element, for a [`ValueMap::SignedGrid`] format.
+    /// The `Signs` operand's bits at each element, for a [`ValueMap::Lattice`] format with a sign rule.
     sign_pieces: [Pieces; N],
     /// `Scale`, `SubScale`, `Min`, `SubMin`.
     factors: [Factor<N>; 4],
@@ -372,7 +386,9 @@ impl<const N: usize> ConstPlan<N> {
         {
             self.load(block, &mut padded, &mut slots)?;
             self.decode_block(&padded, &slots, out);
-            if matches!(self.value, ValueMap::Float) && out.iter().any(|value| value.is_nan()) {
+            if matches!(self.value, ValueMap::Float)
+                && out.iter().any(|&value| !float::is_value(value))
+            {
                 return Err(DecodeError::NotANumber {
                     format: self.format,
                     role: OperandRole::Codes,
@@ -389,16 +405,13 @@ impl<const N: usize> ConstPlan<N> {
         unrolled!(N, index => {
             let bits = self.code_pieces[index].read(padded);
             let decoded = match self.value {
-                ValueMap::Integer => self.codes.integer(bits) as f32,
-                ValueMap::Codebook(table) => table[(bits & 0xf) as usize],
-                ValueMap::SignedGrid(grid) => {
-                    let signs = self.sign_pieces[index].read(padded);
-                    let magnitude = f32::from(grid.magnitude(bits as usize, index % grid.lanes));
-                    if grid.signs.negative(signs, (index % 8) as u32) {
-                        -magnitude
-                    } else {
-                        magnitude
-                    }
+                ValueMap::Integer => integer::value(i64::from(self.codes.integer(bits)), 0),
+                ValueMap::Lattice(lattice) => {
+                    let signs = match lattice.signs {
+                        Some(_) => self.sign_pieces[index].read(padded),
+                        None => 0,
+                    };
+                    lattice.value(bits, index, signs)
                 }
                 ValueMap::Float => self.codes.number(bits),
             };
@@ -519,28 +532,8 @@ fn decode_dense_floats(float: FloatFormat, width: usize, bytes: &[u8], out: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const BLOCK_FORMATS: [WeightFormat; 19] = [
-        WeightFormat::F32,
-        WeightFormat::F16,
-        WeightFormat::Bf16,
-        WeightFormat::Q4_0,
-        WeightFormat::Q4_1,
-        WeightFormat::Q5_0,
-        WeightFormat::Q5_1,
-        WeightFormat::Q8_0,
-        WeightFormat::Q2_K,
-        WeightFormat::Q3_K,
-        WeightFormat::Q4_K,
-        WeightFormat::Q5_K,
-        WeightFormat::Q6_K,
-        WeightFormat::Iq4_Nl,
-        WeightFormat::Iq4_Xs,
-        WeightFormat::Iq2_Xs,
-        WeightFormat::Iq3_Xxs,
-        WeightFormat::Iq3_S,
-        WeightFormat::Mxfp4,
-    ];
+    use crate::test_support::formats::GGUF_FORMATS;
+    use crate::test_support::synthetic::{FOUR_PIECE, four_piece_blocks, four_piece_reference};
 
     /// xorshift64 bytes: deterministic blocks covering every bit pattern of every field, NaN
     /// scales included.
@@ -560,7 +553,7 @@ mod tests {
     /// the same error for a block holding a NaN operand.
     #[test]
     fn the_block_plan_decodes_every_format_as_the_interpreter() {
-        for format in BLOCK_FORMATS {
+        for format in GGUF_FORMATS {
             let descriptor = format.descriptor();
             let Storage::Blocks(layout) = descriptor.storage else {
                 unreachable!()
@@ -595,10 +588,10 @@ mod tests {
     /// POOT-1514: over every GGUF format's every-field fixture (each field holds every value it can), the plan
     /// decodes as the interpreter, bit for bit. The format list and the fixture both come from
     /// `test_support`, so a new format is covered here with no edit. Mutation: in `decode_block`, read a
-    /// codebook entry as `table[(bits & 0x7) as usize]`; red at `Iq4_Nl block 0 element 8`.
+    /// lattice cell index as `bits & 0x7`; red at `Iq4_Nl block 0 element 8`.
     #[test]
     fn the_block_plan_decodes_every_field_fixture_as_the_interpreter() {
-        for format in crate::test_support::formats::GGUF_FORMATS {
+        for format in GGUF_FORMATS {
             let descriptor = format.descriptor();
             let Storage::Blocks(layout) = descriptor.storage else {
                 panic!("{format:?} is listed as a GGUF block format");
@@ -646,6 +639,35 @@ mod tests {
                 }),
                 "{bytes} bytes into {values} values"
             );
+        }
+    }
+
+    /// POOT-1539 SC-4: a field of four pieces decodes in the const plan and in the reference interpreter as
+    /// direct arithmetic on the block's bytes does, bit for bit, over 64 blocks. The scale is four nibbles at
+    /// four places and the code four bit planes. Mutation: drop the last piece in `Pieces::at` (`count` less
+    /// one); the scale loses its top nibble and every element goes red.
+    #[test]
+    fn a_field_of_four_pieces_decodes_in_the_plan_and_the_interpreter() {
+        let plan = ConstPlan::<32>::compile(FOUR_PIECE);
+        let bytes = four_piece_blocks(64, 0x51ed_270b);
+        for (index, block) in bytes.as_chunks::<24>().0.iter().enumerate() {
+            let want: Vec<u32> = four_piece_reference(block)
+                .iter()
+                .map(|value| value.to_bits())
+                .collect();
+            let mut planned = [0.0f32; 32];
+            plan.decode_blocks(block, &mut planned).unwrap();
+            let planned: Vec<u32> = planned.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(planned, want, "block {index}: plan");
+            let interpreted: Vec<u32> = (0..32)
+                .map(|element| {
+                    FOUR_PIECE
+                        .decode_block_value(block, element)
+                        .unwrap()
+                        .to_bits()
+                })
+                .collect();
+            assert_eq!(interpreted, want, "block {index}: interpreter");
         }
     }
 }

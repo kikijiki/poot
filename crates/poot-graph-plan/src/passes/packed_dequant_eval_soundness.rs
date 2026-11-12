@@ -14,9 +14,10 @@ use poot_graph_ir::{
 };
 use poot_quant::StoredBytes;
 use poot_quant::format::{ScaleEncoding, Storage, WeightFormat};
+use poot_quant::test_support::formats::two_source_formats;
 use poot_quant::{
     OperandRole, PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef,
-    PackedWeight, SourceRole,
+    PackedWeight, PlanarRole, SourceRole,
 };
 
 use poot_eval::{EvalError, EvalOptions, PackedEvalError, Value, eval};
@@ -105,16 +106,16 @@ fn scale_elements(descriptor: PackedWeight) -> usize {
     let bytes_per_element = descriptor
         .format()
         .descriptor()
-        .planar_operand(OperandRole::Scale)
+        .planar_operand(PlanarRole::Scale)
         .expect("a packed weight has a Scale operand")
         .element_bytes();
-    descriptor.source_bytes(SourceRole::Planar(OperandRole::Scale)) / bytes_per_element
+    descriptor.source_bytes(SourceRole::Planar(PlanarRole::Scale)) / bytes_per_element
 }
 
 fn payload(format: WeightFormat, shape: [usize; 2]) -> Arc<PackedPayload> {
     let descriptor = PackedWeight::try_new(format, shape).unwrap();
-    let weight_row_bytes = descriptor.source_shape(SourceRole::Planar(OperandRole::Codes))[1];
-    let mut weights = vec![0u8; descriptor.source_bytes(SourceRole::Planar(OperandRole::Codes))];
+    let weight_row_bytes = descriptor.source_shape(SourceRole::Planar(PlanarRole::Codes))[1];
+    let mut weights = vec![0u8; descriptor.source_bytes(SourceRole::Planar(PlanarRole::Codes))];
     match format {
         WeightFormat::E2m1Row32 => {
             for row in 0..shape[0] {
@@ -160,8 +161,8 @@ fn payload(format: WeightFormat, shape: [usize; 2]) -> Arc<PackedPayload> {
         PackedPayload::try_new(
             descriptor,
             [
-                (SourceRole::Planar(OperandRole::Codes), weights.into()),
-                (SourceRole::Planar(OperandRole::Scale), scales.into()),
+                (SourceRole::Planar(PlanarRole::Codes), weights.into()),
+                (SourceRole::Planar(PlanarRole::Scale), scales.into()),
             ],
         )
         .unwrap(),
@@ -188,7 +189,7 @@ fn independent_fp4(owner: &PackedPayload, coordinate: [usize; 2]) -> f32 {
     ];
     let packed_column = coordinate[1] / 2;
     let byte =
-        owner.bytes(SourceRole::Planar(OperandRole::Codes))[coordinate[0] * 18 + packed_column];
+        owner.bytes(SourceRole::Planar(PlanarRole::Codes))[coordinate[0] * 18 + packed_column];
     let code = if coordinate[1].is_multiple_of(2) {
         byte & 0x0f
     } else {
@@ -196,7 +197,7 @@ fn independent_fp4(owner: &PackedPayload, coordinate: [usize; 2]) -> f32 {
     };
     let scale_column = coordinate[1] / 32;
     let scale =
-        owner.bytes(SourceRole::Planar(OperandRole::Scale))[coordinate[0] * 2 + scale_column];
+        owner.bytes(SourceRole::Planar(PlanarRole::Scale))[coordinate[0] * 2 + scale_column];
     VALUES[usize::from(code)] * f32::from_bits(u32::from(scale) << 23)
 }
 
@@ -213,9 +214,9 @@ fn independent_e4m3(byte: u8) -> f32 {
 
 fn independent_fp8(owner: &PackedPayload, coordinate: [usize; 2]) -> f32 {
     let weight =
-        owner.bytes(SourceRole::Planar(OperandRole::Codes))[coordinate[0] * 129 + coordinate[1]];
+        owner.bytes(SourceRole::Planar(PlanarRole::Codes))[coordinate[0] * 129 + coordinate[1]];
     let scale_index = (coordinate[0] / 128) * 2 + coordinate[1] / 128;
-    let scale_bytes = owner.bytes(SourceRole::Planar(OperandRole::Scale));
+    let scale_bytes = owner.bytes(SourceRole::Planar(PlanarRole::Scale));
     let format = owner.weight().format();
     let scale = match format {
         WeightFormat::E4m3Block128 {
@@ -245,18 +246,13 @@ fn independent_fp8(owner: &PackedPayload, coordinate: [usize; 2]) -> f32 {
 
 #[test]
 fn packed_dequant_eval_matches_independent_rows() {
-    for format in [
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::Bf16,
-        },
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::F32,
-        },
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::E8m0,
-        },
-        WeightFormat::E2m1Row32,
-    ] {
+    // The formats this row holds an independent reference for: the E4M3 block-128 cells and E2M1.
+    for format in two_source_formats().into_iter().filter(|format| {
+        matches!(
+            format,
+            WeightFormat::E4m3Block128 { .. } | WeightFormat::E2m1Row32
+        )
+    }) {
         let shape = if format == WeightFormat::E2m1Row32 {
             [2, 35]
         } else {
@@ -265,14 +261,14 @@ fn packed_dequant_eval_matches_independent_rows() {
         let owner = payload(format, shape);
         if format == WeightFormat::E2m1Row32 {
             let mut seen = [false; 16];
-            for &byte in owner.bytes(SourceRole::Planar(OperandRole::Codes)) {
+            for &byte in owner.bytes(SourceRole::Planar(PlanarRole::Codes)) {
                 seen[usize::from(byte & 0x0f)] = true;
                 seen[usize::from(byte >> 4)] = true;
             }
             assert!(seen[8..].iter().all(|present| *present));
         } else {
-            assert_eq!(owner.bytes(SourceRole::Planar(OperandRole::Codes))[0], 0x07);
-            assert_eq!(owner.bytes(SourceRole::Planar(OperandRole::Codes))[1], 0x08);
+            assert_eq!(owner.bytes(SourceRole::Planar(PlanarRole::Codes))[0], 0x07);
+            assert_eq!(owner.bytes(SourceRole::Planar(PlanarRole::Codes))[1], 0x08);
         }
         let (graph, weight, scale) = primitive_graph(&owner);
         let inputs = HashMap::from([
@@ -280,14 +276,14 @@ fn packed_dequant_eval_matches_independent_rows() {
                 weight,
                 Value::Packed(PackedComponentRef::new(
                     Arc::clone(&owner),
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                 )),
             ),
             (
                 scale,
                 Value::Packed(PackedComponentRef::new(
                     Arc::clone(&owner),
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                 )),
             ),
         ]);
@@ -324,19 +320,18 @@ fn packed_dequant_binding_reuses_payload_owner() {
     );
     let weak = Arc::downgrade(&owner);
     let baseline = Arc::strong_count(&owner);
-    let weight =
-        PackedComponentRef::new(Arc::clone(&owner), SourceRole::Planar(OperandRole::Codes));
-    let scale = PackedComponentRef::new(Arc::clone(&owner), SourceRole::Planar(OperandRole::Scale));
+    let weight = PackedComponentRef::new(Arc::clone(&owner), SourceRole::Planar(PlanarRole::Codes));
+    let scale = PackedComponentRef::new(Arc::clone(&owner), SourceRole::Planar(PlanarRole::Scale));
     assert!(weight.same_owner(&scale));
     assert!(Arc::ptr_eq(weight.owner(), &owner));
     assert!(Arc::ptr_eq(scale.owner(), &owner));
     assert_eq!(
         weight.bytes().as_ptr(),
-        owner.bytes(SourceRole::Planar(OperandRole::Codes)).as_ptr()
+        owner.bytes(SourceRole::Planar(PlanarRole::Codes)).as_ptr()
     );
     assert_eq!(
         scale.bytes().as_ptr(),
-        owner.bytes(SourceRole::Planar(OperandRole::Scale)).as_ptr()
+        owner.bytes(SourceRole::Planar(PlanarRole::Scale)).as_ptr()
     );
     assert_eq!(Arc::strong_count(&owner), baseline + 2);
     let (graph, weight_id, scale_id) = primitive_graph(&owner);
@@ -445,11 +440,11 @@ fn indexed_experts(experts: u8) -> (PackedWeight, Vec<Arc<PackedPayload>>) {
                     descriptor,
                     [
                         (
-                            SourceRole::Planar(OperandRole::Codes),
+                            SourceRole::Planar(PlanarRole::Codes),
                             StoredBytes::from(codes),
                         ),
                         (
-                            SourceRole::Planar(OperandRole::Scale),
+                            SourceRole::Planar(PlanarRole::Scale),
                             StoredBytes::from(vec![0x7f + expert]),
                         ),
                     ],
@@ -1699,11 +1694,11 @@ fn packed_dequant_oracle_matches_the_539a_literal_reference_for_every_scheme()
             shape: e4m3_per_channel_shape,
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     e4m3_weight_per_channel.clone(),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     hex("0000003f0000e0bfa69b443b"),
                 ),
             ],
@@ -1733,10 +1728,10 @@ fn packed_dequant_oracle_matches_the_539a_literal_reference_for_every_scheme()
             shape: e4m3_per_channel_shape,
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     e4m3_weight_per_channel.clone(),
                 ),
-                (SourceRole::Planar(OperandRole::Scale), hex("403f80bf003c")),
+                (SourceRole::Planar(PlanarRole::Scale), hex("403f80bf003c")),
             ],
             points: vec![
                 ([0, 0], 0.0043945312),
@@ -1764,10 +1759,10 @@ fn packed_dequant_oracle_matches_the_539a_literal_reference_for_every_scheme()
             shape: e4m3_per_channel_shape,
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     e4m3_weight_per_channel.clone(),
                 ),
-                (SourceRole::Planar(OperandRole::Scale), hex("7e8278")),
+                (SourceRole::Planar(PlanarRole::Scale), hex("7e8278")),
             ],
             points: vec![
                 ([0, 0], 0.0029296875),
@@ -1795,11 +1790,11 @@ fn packed_dequant_oracle_matches_the_539a_literal_reference_for_every_scheme()
             shape: e4m3_block128_shape,
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     e4m3_weight_block128.clone(),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     // `poot_quant::planar`'s own literal test pins scale index 1 to `-2.0` (negative on
                     // purpose, to prove the scale field's sign math), covered by `[0,128]`, `[0,129]`
                     // and `[64,129]`. `PackedPayload::try_new` additionally enforces the *production*
@@ -1830,11 +1825,11 @@ fn packed_dequant_oracle_matches_the_539a_literal_reference_for_every_scheme()
             shape: e4m3_block128_shape,
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     e4m3_weight_block128.clone(),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     // See the F32 case above: same fix, same three points dropped.
                     hex("803e0040403fe040"),
                 ),
@@ -1858,10 +1853,10 @@ fn packed_dequant_oracle_matches_the_539a_literal_reference_for_every_scheme()
             shape: e4m3_block128_shape,
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     e4m3_weight_block128.clone(),
                 ),
-                (SourceRole::Planar(OperandRole::Scale), hex("7d807981")),
+                (SourceRole::Planar(PlanarRole::Scale), hex("7d807981")),
             ],
             points: vec![
                 ([0, 0], 0.0014648438),
@@ -1883,10 +1878,10 @@ fn packed_dequant_oracle_matches_the_539a_literal_reference_for_every_scheme()
             shape: [2, 35],
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     hex("80837d1d0612d0e601c6d1bdf94dad156304c0dca8af7231d39ce31efb211b9916741c0a"),
                 ),
-                (SourceRole::Planar(OperandRole::Scale), hex("7f817a02")),
+                (SourceRole::Planar(PlanarRole::Scale), hex("7f817a02")),
             ],
             points: vec![
                 ([0, 0], 0.0),
@@ -1917,17 +1912,17 @@ fn packed_dequant_oracle_matches_the_539a_literal_reference_for_every_scheme()
             shape: [8, 16],
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     hex(
                         "6187f803f0423141182c8d58e2912c82c2b7f4045a572fb18fe594e3b5e79e9806fada64fa70e9ce9a1e4d9d1e4970acab2968c3f084cc5f1de2b0ccc9cd39c1",
                     ),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Zero),
+                    SourceRole::Planar(PlanarRole::Zero),
                     hex("c0ad6caaba893613"),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     hex("aea7c32500310a27ae273daab8aa33abaea7c321cda87e21ae233daa7b287d23"),
                 ),
             ],
@@ -1950,21 +1945,21 @@ fn packed_dequant_oracle_matches_the_539a_literal_reference_for_every_scheme()
             shape: [8, 16],
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     hex(
                         "6187f803f0423141182c8d58e2912c82c2b7f4045a572fb18fe594e3b5e79e9806fada64fa70e9ce9a1e4d9d1e4970acab2968c3f084cc5f1de2b0ccc9cd39c1",
                     ),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Zero),
+                    SourceRole::Planar(PlanarRole::Zero),
                     hex("c0ad6caaba893613"),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     hex("aea7c32500310a27ae273daab8aa33abaea7c321cda87e21ae233daa7b287d23"),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::GroupIndex),
+                    SourceRole::Planar(PlanarRole::GroupIndex),
                     hex(
                         "01000000000000000100000000000000010000000000000001000000000000000100000000000000010000000000000001000000000000000100000000000000",
                     ),
@@ -1989,17 +1984,17 @@ fn packed_dequant_oracle_matches_the_539a_literal_reference_for_every_scheme()
             shape: [8, 16],
             sources: vec![
                 (
-                    SourceRole::Planar(OperandRole::Codes),
+                    SourceRole::Planar(PlanarRole::Codes),
                     hex(
                         "81f2205a168cefb5c757127728eb94e5d844c1ef8f9f23928334218150e0849ba6dbea90901a1fcfea2990d41fe247c8da08099c4db67e3cd4c3ce1f96ccacc5",
                     ),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Zero),
+                    SourceRole::Planar(PlanarRole::Zero),
                     hex("d0acaca69a368b13"),
                 ),
                 (
-                    SourceRole::Planar(OperandRole::Scale),
+                    SourceRole::Planar(PlanarRole::Scale),
                     hex("aea7c32500310a27ae273daab8aa33abaea7c321cda87e21ae233daa7b287d23"),
                 ),
             ],

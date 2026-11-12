@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use poot_graph_ir::{Builder, PackedSourceName, TensorType, packed_source_constants};
 use poot_quant::format::{ScaleEncoding, WeightFormat};
-use poot_quant::{OperandRole, PackedComponentRef, PackedPayload, PackedWeight, SourceRole};
+use poot_quant::{PackedComponentRef, PackedPayload, PackedWeight, PlanarRole, SourceRole};
 
 use crate::{EvalError, PackedEvalError, Value};
 use poot_graph_ir::{ValueId, ValueTable};
@@ -15,16 +15,16 @@ fn scale_elements(descriptor: PackedWeight) -> usize {
     let bytes_per_element = descriptor
         .format()
         .descriptor()
-        .planar_operand(OperandRole::Scale)
+        .planar_operand(PlanarRole::Scale)
         .expect("a packed weight has a Scale operand")
         .element_bytes();
-    descriptor.source_bytes(SourceRole::Planar(OperandRole::Scale)) / bytes_per_element
+    descriptor.source_bytes(SourceRole::Planar(PlanarRole::Scale)) / bytes_per_element
 }
 
 fn payload(format: WeightFormat, shape: [usize; 2]) -> Arc<PackedPayload> {
     let descriptor = PackedWeight::try_new(format, shape).unwrap();
-    let weight_row_bytes = descriptor.source_shape(SourceRole::Planar(OperandRole::Codes))[1];
-    let mut weights = vec![0u8; descriptor.source_bytes(SourceRole::Planar(OperandRole::Codes))];
+    let weight_row_bytes = descriptor.source_shape(SourceRole::Planar(PlanarRole::Codes))[1];
+    let mut weights = vec![0u8; descriptor.source_bytes(SourceRole::Planar(PlanarRole::Codes))];
     match format {
         WeightFormat::E2m1Row32 => {
             for row in 0..shape[0] {
@@ -70,8 +70,8 @@ fn payload(format: WeightFormat, shape: [usize; 2]) -> Arc<PackedPayload> {
         PackedPayload::try_new(
             descriptor,
             [
-                (SourceRole::Planar(OperandRole::Codes), weights.into()),
-                (SourceRole::Planar(OperandRole::Scale), scales.into()),
+                (SourceRole::Planar(PlanarRole::Codes), weights.into()),
+                (SourceRole::Planar(PlanarRole::Scale), scales.into()),
             ],
         )
         .unwrap(),
@@ -121,11 +121,11 @@ fn packed_dequant_binding_rejects_a_swapped_role() {
     let mut env: ValueTable<Option<Value>> = ValueTable::filled(graph.values().len(), None);
     env[weight_id] = Some(Value::Packed(PackedComponentRef::new(
         Arc::clone(&owner),
-        SourceRole::Planar(OperandRole::Scale),
+        SourceRole::Planar(PlanarRole::Scale),
     )));
     env[scale_id] = Some(Value::Packed(PackedComponentRef::new(
         Arc::clone(&owner),
-        SourceRole::Planar(OperandRole::Codes),
+        SourceRole::Planar(PlanarRole::Codes),
     )));
     let result = crate::ops::packed_components(&graph, &graph.eqns()[0], &env, descriptor);
     assert!(

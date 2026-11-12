@@ -262,6 +262,19 @@ pub enum Fault {
         /// The storage's length.
         len: usize,
     },
+    /// A [`Rvalue::VectorLoad`] whose element index is not a multiple of the alignment it claims: the emitter's
+    /// alignment proof is wrong.
+    #[error(
+        "vector load at element {index} ({elem_bytes}-byte lanes) breaks its claimed {align_bytes}-byte alignment"
+    )]
+    MisalignedVectorLoad {
+        /// The element index of the first lane.
+        index: usize,
+        /// The bytes of one lane.
+        elem_bytes: u32,
+        /// The alignment the load claims.
+        align_bytes: u32,
+    },
     #[error("{what} element {index} is read before it is written")]
     /// An element was read before any write to it.
     Uninitialized {
@@ -996,13 +1009,28 @@ impl Workgroup<'_> {
                 }
                 Ok(Value::Scalar(old))
             }
-            Rvalue::VectorLoad { place } => {
+            Rvalue::VectorLoad { place, align_bytes } => {
                 let lanes = lanes_of(dest)?;
+                let Some(Ty::Vec { elem, .. }) = dest else {
+                    return Err(Fault::IllTyped("a vector rvalue assigns a Ty::Vec local"));
+                };
+                let elem_bytes = elem
+                    .buffer_element_bytes()
+                    .ok_or(Fault::IllTyped("a vector load lane is a buffer element"))?;
                 let Cell::Buffer { param, index } = self.cell(lane, place)? else {
                     return Err(Fault::IllTyped("a vector load reads a buffer"));
                 };
                 let buffer = &self.buffers[param];
-                let range = vector_range(index, lanes, buffer.data.len())?;
+                let range = lane_run(index, lanes, buffer.data.len())?;
+                if !(index as u128 * u128::from(elem_bytes))
+                    .is_multiple_of(u128::from(*align_bytes))
+                {
+                    return Err(Fault::MisalignedVectorLoad {
+                        index,
+                        elem_bytes,
+                        align_bytes: *align_bytes,
+                    });
+                }
                 buffer.count_reads(range.clone());
                 Ok(Value::Vector(buffer.data[range].to_vec()))
             }
@@ -1082,6 +1110,18 @@ impl Workgroup<'_> {
             IndexAxis::GroupY => u64::from(self.group[1]),
             IndexAxis::GroupZ => u64::from(self.group[2]),
         }
+    }
+}
+
+/// The element range of `lanes` elements starting at element `index` in a buffer of `len` elements.
+fn lane_run(index: usize, lanes: usize, len: usize) -> Result<std::ops::Range<usize>, Fault> {
+    match index.checked_add(lanes) {
+        Some(end) if end <= len => Ok(index..end),
+        _ => Err(Fault::OutOfBounds {
+            what: "buffer",
+            index: index.saturating_add(lanes - 1),
+            len,
+        }),
     }
 }
 
@@ -2728,11 +2768,12 @@ mod tests {
                         Place::local(l(6)),
                         Rvalue::Use(copy_place(element_of(1, 3))),
                     ),
-                    assign(3, Rvalue::Use(cusize(1))),
+                    assign(3, Rvalue::Use(cusize(4))),
                     assign(
                         7,
                         Rvalue::VectorLoad {
                             place: element_of(1, 3),
+                            align_bytes: 16,
                         },
                     ),
                     assign(3, Rvalue::Use(cusize(0))),
@@ -2744,7 +2785,7 @@ mod tests {
         );
         let mut buffers = [Buffer::from_f32s(&[0.0; 8]), Buffer::from_f32s(&[0.0; 1])];
         run(&body, [1, 1, 1], &mut buffers).unwrap();
-        // Group 1 of the vector load covers elements 4..8.
+        // The vector load at element 4 covers elements 4..8.
         assert_eq!(buffers[0].read_counts(), vec![0, 2, 0, 1, 1, 1, 1, 1]);
         assert_eq!(buffers[1].read_counts(), vec![0]);
     }
@@ -2774,6 +2815,7 @@ mod tests {
                         4,
                         Rvalue::VectorLoad {
                             place: element_of(1, 3),
+                            align_bytes: 16,
                         },
                     ),
                     assign(5, Rvalue::VectorSplat(Operand::Const(Constant::F32(2.0)))),
@@ -2814,7 +2856,7 @@ mod tests {
     }
 
     #[test]
-    fn a_vector_load_at_a_near_usize_max_group_index_is_a_typed_fault() {
+    fn a_vector_load_at_a_near_usize_max_element_index_is_a_typed_fault() {
         // _1 input, _2 group index, _3 v
         let vec4 = Ty::Vec {
             elem: Box::new(Ty::F32),
@@ -2830,6 +2872,7 @@ mod tests {
                         3,
                         Rvalue::VectorLoad {
                             place: element_of(1, 2),
+                            align_bytes: 16,
                         },
                     ),
                 ],
@@ -2852,6 +2895,176 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    /// `u32` buffer of 16 words, one `lanes`-wide integer vector load at element `index` claiming `align_bytes`.
+    fn u32_vector_load(index: u64, lanes: u32, align_bytes: u32) -> Body {
+        // _1 input, _2 element index, _3 loaded vector
+        body_of(
+            1,
+            vec![
+                buffer_ty(Ty::U32),
+                Ty::Usize,
+                Ty::Vec {
+                    elem: Box::new(Ty::U32),
+                    lanes,
+                },
+            ],
+            vec![block(
+                vec![
+                    assign(2, Rvalue::Use(cusize(index))),
+                    assign(
+                        3,
+                        Rvalue::VectorLoad {
+                            place: element_of(1, 2),
+                            align_bytes,
+                        },
+                    ),
+                ],
+                Terminator::Return,
+            )],
+            [1, 1, 1],
+        )
+    }
+
+    fn run_u32_vector_load(index: u64, lanes: u32, align_bytes: u32) -> Result<(), InterpError> {
+        let words: Vec<u32> = (0..16).collect();
+        run(
+            &u32_vector_load(index, lanes, align_bytes),
+            [1, 1, 1],
+            &mut [Buffer::from_u32s(&words)],
+        )
+    }
+
+    /// A vector load whose element index is not a multiple of the alignment it claims is a typed interpreter
+    /// fault, so a wrong alignment proof fails a tier-1 test instead of a device. The same loads at an index that
+    /// keeps the claim, and a load that claims only what it has, run.
+    /// Mutation: drop the alignment check in the `Rvalue::VectorLoad` arm of `Interp::rvalue`; the refused loads
+    /// below run to completion and this row goes red.
+    #[test]
+    fn vector_load_refuses_a_misaligned_index() {
+        for (index, lanes, align_bytes) in [(2, 4, 16), (1, 2, 8), (6, 4, 16), (3, 4, 8)] {
+            let error = run_u32_vector_load(index as u64, lanes, align_bytes)
+                .expect_err("the claimed alignment does not hold");
+            assert!(
+                matches!(
+                    &error,
+                    InterpError::Fault {
+                        fault: Fault::MisalignedVectorLoad { index: i, elem_bytes: 4, align_bytes: a },
+                        ..
+                    } if (*i, *a) == (index, align_bytes)
+                ),
+                "u32x{lanes} at element {index} claiming {align_bytes}: {error}"
+            );
+        }
+        for (index, lanes, align_bytes) in
+            [(4, 4, 16), (12, 4, 16), (2, 2, 8), (0, 4, 16), (1, 4, 4)]
+        {
+            run_u32_vector_load(index, lanes, align_bytes).unwrap_or_else(|e| {
+                panic!("u32x{lanes} at element {index} claiming {align_bytes}: {e}")
+            });
+        }
+    }
+
+    /// The load reads the `lanes` words from the element index, whatever the alignment it proved: the lane values are
+    /// the words, not the words of a group.
+    #[test]
+    fn an_integer_vector_load_reads_the_lanes_from_its_element_index() {
+        // _1 input, _2 out, _3 index, _4 loaded, _5.._8 lanes
+        let vec = Ty::Vec {
+            elem: Box::new(Ty::U32),
+            lanes: 2,
+        };
+        let body = body_of(
+            2,
+            vec![
+                buffer_ty(Ty::U32),
+                buffer_ty(Ty::U32),
+                Ty::Usize,
+                vec,
+                Ty::U32,
+                Ty::U32,
+                Ty::Usize,
+            ],
+            vec![block(
+                vec![
+                    assign(3, Rvalue::Use(cusize(6))),
+                    assign(
+                        4,
+                        Rvalue::VectorLoad {
+                            place: element_of(1, 3),
+                            align_bytes: 8,
+                        },
+                    ),
+                    assign(
+                        5,
+                        Rvalue::VectorExtract {
+                            vector: copy(4),
+                            lane: 0,
+                        },
+                    ),
+                    assign(
+                        6,
+                        Rvalue::VectorExtract {
+                            vector: copy(4),
+                            lane: 1,
+                        },
+                    ),
+                    assign(7, Rvalue::Use(cusize(0))),
+                    Statement::Assign(element_of(2, 7), Rvalue::Use(copy(5))),
+                    assign(7, Rvalue::Use(cusize(1))),
+                    Statement::Assign(element_of(2, 7), Rvalue::Use(copy(6))),
+                ],
+                Terminator::Return,
+            )],
+            [1, 1, 1],
+        );
+        let words: Vec<u32> = (100..116).collect();
+        let mut buffers = [Buffer::from_u32s(&words), Buffer::from_u32s(&[0; 2])];
+        run(&body, [1, 1, 1], &mut buffers).unwrap();
+        assert_eq!(buffers[1].to_u32s().unwrap(), vec![106, 107]);
+    }
+
+    /// An alignment that no buffer binding can back is rejected by the verifier: not a power of two, below the
+    /// element size, or above the binding alignment.
+    /// Mutation: drop the `BUFFER_PARAM_ALIGN` bound in the verifier; the 32-byte claim verifies and this row goes red.
+    #[test]
+    fn a_vector_load_alignment_no_binding_can_back_is_rejected() {
+        for align_bytes in [0, 2, 3, 12, 32, 64] {
+            let error = u32_vector_load(0, 4, align_bytes)
+                .verify()
+                .expect_err("no binding backs this alignment");
+            assert_eq!(
+                error.kind,
+                crate::VerifyErrorKind::VectorLoadAlignment {
+                    align_bytes,
+                    elem_bytes: 4
+                },
+                "{align_bytes}"
+            );
+        }
+        for align_bytes in [4, 8, 16] {
+            u32_vector_load(0, 4, align_bytes).verify().unwrap();
+        }
+    }
+
+    /// Both integer vector-load fixtures the device rows dispatch compute what the scalar loads of the same words
+    /// do, on the interpreter.
+    #[test]
+    fn the_integer_vector_load_fixtures_copy_their_words() {
+        for case in crate::test_support::vector_load_cases() {
+            let mut buffers = [
+                Buffer::from_u32s(&case.input),
+                Buffer::from_u32s(&vec![0; case.want.len()]),
+            ];
+            run(&case.body, [1, 1, 1], &mut buffers).unwrap();
+            assert_eq!(
+                buffers[1].to_u32s().unwrap(),
+                case.want,
+                "{}",
+                case.body.name
+            );
+        }
     }
 
     /// `Rvalue::MulAdd` rounds once: on operands where `a * b` is inexact in f32, the fused probe stores

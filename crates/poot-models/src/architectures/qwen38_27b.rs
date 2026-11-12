@@ -32,11 +32,11 @@ use std::sync::Arc;
 
 use poot_graph_ir::{Builder, Graph};
 #[cfg(feature = "test-support")]
-use poot_quant::OperandRole;
-#[cfg(feature = "test-support")]
 use poot_quant::PackedPayload;
 #[cfg(feature = "test-support")]
 use poot_quant::PackedWeight;
+#[cfg(feature = "test-support")]
+use poot_quant::PlanarRole;
 #[cfg(feature = "test-support")]
 use poot_quant::SourceRole;
 #[cfg(feature = "test-support")]
@@ -732,7 +732,7 @@ fn fp8_payload(stem: &str, shape: [usize; 2]) -> PackedPayload {
     )
     .unwrap();
     let bf16 = ((scale.to_bits() >> 16) as u16).to_le_bytes();
-    let scale_bytes = descriptor.source_bytes(SourceRole::Planar(OperandRole::Scale));
+    let scale_bytes = descriptor.source_bytes(SourceRole::Planar(PlanarRole::Scale));
     let scales = bf16
         .iter()
         .copied()
@@ -742,8 +742,8 @@ fn fp8_payload(stem: &str, shape: [usize; 2]) -> PackedPayload {
     PackedPayload::try_new(
         descriptor,
         [
-            (SourceRole::Planar(OperandRole::Codes), codes.into()),
-            (SourceRole::Planar(OperandRole::Scale), scales.into()),
+            (SourceRole::Planar(PlanarRole::Codes), codes.into()),
+            (SourceRole::Planar(PlanarRole::Scale), scales.into()),
         ],
     )
     .unwrap()

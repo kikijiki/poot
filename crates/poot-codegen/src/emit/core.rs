@@ -73,19 +73,18 @@ impl<'a> Emitter<'a> {
             },
             Ty::F32 => "float".into(),
             Ty::F64 => "double".into(),
-            // spec 134 P1: `Ty::Vec` lowers on SpirvVulkan (the `<lanes x elem>`-typed-resource path, `spirv_buf`) and
-            // NVPTX (`ld.global.v4` through `vector_element_ptr`, POOT-1405). AMDGCN vector lowering is not built (its
-            // backend already merges dword-aligned scalar loads into `global_load_b128`, POOT-1390); reject by name (as
-            // for bf16 above) rather than let an un-lowered vector rvalue reach llc.
+            // spec 134 P1: `Ty::Vec` lowers to an LLVM `<lanes x elem>` on SpirvVulkan (the vector-typed-resource path,
+            // `spirv_buf`), NVPTX (`ld.global.v4`) and AMDGCN (`global_load_dwordx4`); the AIE core has no vector types, so
+            // an un-lowered vector rvalue is rejected by name instead of reaching its llc.
             Ty::Vec { elem, lanes } => match self.target {
-                Target::SpirvVulkan | Target::Nvptx => {
+                Target::SpirvVulkan | Target::Nvptx | Target::AmdGcn(_) => {
                     let inner = self.scalar_llty(elem)?;
                     format!("<{lanes} x {inner}>")
                 }
-                Target::AmdGcn(_) | Target::AieCore => {
+                Target::AieCore => {
                     return Err(EmitError::Unsupported(format!(
                         "Ty::Vec{{elem={elem:?}, lanes={lanes}}} on {:?}: vector codegen lowers on \
-                         SpirvVulkan and NVPTX only (spec 134 P1)",
+                         SpirvVulkan, NVPTX and AMDGCN only (spec 134 P1)",
                         self.target
                     )));
                 }

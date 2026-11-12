@@ -31,7 +31,7 @@ use poot_quant::SourceRole;
 #[cfg(feature = "test-support")]
 use poot_quant::StoredBytes;
 #[cfg(feature = "test-support")]
-use poot_quant::format::OperandRole;
+use poot_quant::format::PlanarRole;
 #[cfg(feature = "test-support")]
 use poot_quant::format::ScaleEncoding;
 #[cfg(feature = "test-support")]
@@ -454,7 +454,7 @@ fn e4m3_payload(shape: [usize; 2], seed: u64) -> PackedPayload {
         .into_iter()
         .map(|role| {
             let bytes: Vec<u8> = match role {
-                SourceRole::Planar(OperandRole::Scale) => (0..weight.source_bytes(role) / 2)
+                SourceRole::Planar(PlanarRole::Scale) => (0..weight.source_bytes(role) / 2)
                     .flat_map(|i| SCALES[i % SCALES.len()].to_le_bytes())
                     .collect(),
                 _ => (0..weight.source_bytes(role))

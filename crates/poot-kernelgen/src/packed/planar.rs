@@ -1,6 +1,6 @@
 //! `PlanarPlan`: the planar (safetensors) storage front end for the descriptor-driven packed decode
 //! emitter (dquant.md 3.3, card 542c). A planar format has one source tensor per
-//! [`OperandRole`] (`PackedWeight::sources()`'s order), addressed directly by the logical
+//! [`PlanarRole`] (`PackedWeight::sources()`'s order), addressed directly by the logical
 //! coordinate `[o, k]` through each operand's `grid`/`packing`/`major` (`poot_quant::decode`'s
 //! `read_planar`/`stored_shape` is the host reference this mirrors bit for bit). Block storage has
 //! its own front end ([`super::decode_plan::DecodePlan`]); the two share `emit_read_bits` and
@@ -13,8 +13,8 @@
 
 use poot_kernel_ir::{BinOp, Local, Rvalue, Ty};
 use poot_quant::format::{
-    Axis, Extent, FieldEncoding, FormatDescriptor, GroupMap, LaneOrder, Major, OperandRole,
-    PlanarOperand, Storage, ValueMap, WeightFormat,
+    Axis, Extent, FieldEncoding, FormatDescriptor, GroupMap, LaneOrder, Major, PlanarOperand,
+    PlanarRole, Storage, ValueMap, WeightFormat,
 };
 
 use super::decode_plan::Factors;
@@ -47,28 +47,17 @@ impl PlanarPlan {
         let operands = layout.operands.to_vec();
         let codes = operands
             .iter()
-            .position(|operand| operand.role == OperandRole::Codes)
+            .position(|operand| operand.role == PlanarRole::Codes)
             .ok_or(reject(format, "no Codes operand"))?;
-        if operands.iter().any(|operand| {
-            matches!(
-                operand.role,
-                OperandRole::SubScale | OperandRole::Min | OperandRole::SubMin
-            )
-        }) {
-            return Err(reject(
-                format,
-                "a planar SubScale/Min/SubMin operand (not modeled: no planar format has one)",
-            ));
-        }
         let scale = operands
             .iter()
-            .position(|operand| operand.role == OperandRole::Scale);
+            .position(|operand| operand.role == PlanarRole::Scale);
         let zero = operands
             .iter()
-            .position(|operand| operand.role == OperandRole::Zero);
+            .position(|operand| operand.role == PlanarRole::Zero);
         let group_index = operands
             .iter()
-            .position(|operand| operand.role == OperandRole::GroupIndex);
+            .position(|operand| operand.role == PlanarRole::GroupIndex);
         Ok(Self {
             format,
             operands,
@@ -174,7 +163,7 @@ impl PlanarPlan {
                     },
                 )
             }
-            ValueMap::Codebook(_) | ValueMap::SignedGrid(_) => {
+            ValueMap::Lattice(_) => {
                 unreachable!("format tests: a planar format's value map is Integer or Float")
             }
         };

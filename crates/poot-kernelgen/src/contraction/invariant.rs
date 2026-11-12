@@ -19,6 +19,7 @@
 
 use poot_graph_ir::{FragmentDtype, OperandPrecision};
 use poot_quant::format::WeightFormat;
+use poot_quant::test_support::formats::packed_block_formats;
 use poot_target::{Backend, DeviceCaps};
 
 use super::cost::ContractionCost;
@@ -173,14 +174,8 @@ fn cases() -> Vec<Case> {
             }
         }
     }
-    // Packed dense: decode (with the Gemv) and prefill, over the formats the checkpoints carry.
-    for format in [
-        WeightFormat::Q8_0,
-        WeightFormat::Q4_K,
-        WeightFormat::Q6_K,
-        WeightFormat::Iq4_Nl,
-        WeightFormat::Iq2_Xs,
-    ] {
+    // Packed dense: decode (with the Gemv) and prefill, over every packed GGUF block format the shared list holds.
+    for format in packed_block_formats() {
         for rows in [1, 4, 16, 64, 128, 512, 2048] {
             for (k, n) in [(2048, 2048), (2560, 9728)] {
                 let gemv = (rows == 1).then_some(GemvShape {
@@ -493,5 +488,28 @@ fn a_compiled_choice_never_runs_a_tiling_its_compiler_spills() {
     assert!(
         model_multi_wave,
         "the model never picks a multi-wave tiling: the stand-in compiler refuses nothing"
+    );
+}
+
+/// The packed-dense sweep follows the shared format list and still holds the formats the grouped-expert rows and the
+/// bank's packed cases name, so a filter that shrank the list would not pass silently. Mutation: make
+/// `packed_block_formats` return no format (or only dense ones); the sweep loses its packed rows and this row goes red.
+#[test]
+fn the_packed_sweep_covers_the_formats_the_grouped_rows_name() {
+    let formats = packed_block_formats();
+    for format in [WeightFormat::Iq2_Xs, WeightFormat::Iq4_Nl] {
+        assert!(
+            formats.contains(&format),
+            "{format:?} is not in the packed sweep"
+        );
+    }
+    let packed_rows = cases()
+        .iter()
+        .filter(|case| case.name.starts_with("packed ") && !case.name.starts_with("packed grouped"))
+        .count();
+    assert!(
+        packed_rows >= formats.len() * 7 * 2,
+        "{packed_rows} packed rows for {} formats",
+        formats.len()
     );
 }

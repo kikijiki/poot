@@ -343,6 +343,19 @@ impl TiledShape {
     }
 }
 
+/// The order of two modelled costs, equal when they differ by less than float noise: the grouped fragment tilings'
+/// costs tie exactly in the model (a tile of twice the columns at half the depth is the same lane step over the
+/// same lanes), and a tie must not be broken by the last bit of a product. Over the POOT-1547 corpus the deeper round
+/// takes the cell to within 1.02 of its fastest schedule where the larger tile took it to 1.12 to 1.49 (fewer barriers:
+/// better in 4 of the 6 packed cells, equal in 2).
+fn same_cost(a: f64, b: f64) -> std::cmp::Ordering {
+    if (a - b).abs() <= 1e-9 * a.abs().max(b.abs()) {
+        std::cmp::Ordering::Equal
+    } else {
+        a.total_cmp(&b)
+    }
+}
+
 /// The buckets `rows` rows are expected to touch among `groups` when each picks one uniformly: `G (1 - (1 - 1/G)^M)`,
 /// rounded up, at least one and at most `rows`. A shape carries no routing, so uniform routing is the documented prior
 /// (llama.cpp sizes an RDNA MoE tile against the average tokens per expert, `mmq.cu:299-304`; vLLM uses `M / E`): rows
@@ -465,8 +478,9 @@ impl RegisterTiling {
 
     /// The cheapest candidate of `shape` on `caps` and its modelled cost, as [`Self::choose`] ranks them; `None`
     /// when the device runs none. Under [`Feasibility::Compiled`] the candidates are compiled in cost order (a tie
-    /// going to the larger output tile, then the earlier candidate) and the first whose probe holds its registers is
-    /// the cheapest: usually the first compile, the kernel the plan runs.
+    /// going to the deeper round, which runs fewer barriers, then the larger output tile, then the earlier candidate)
+    /// and the first whose probe holds its registers is the cheapest: usually the first compile, the kernel the plan
+    /// runs.
     fn cheapest(
         shape: TiledShape,
         caps: &poot_target::DeviceCaps,
@@ -476,10 +490,10 @@ impl RegisterTiling {
             .into_iter()
             .map(|tiling| (ContractionCost::tiled(tiling, shape, caps), tiling))
             .collect();
-        // Stable: equal costs and tiles keep the candidates' order.
+        // Stable: equal costs, rounds and tiles keep the candidates' order.
         ranked.sort_by(|(a_cost, a), (b_cost, b)| {
-            a_cost
-                .total_cmp(b_cost)
+            same_cost(*a_cost, *b_cost)
+                .then(b.depth().cmp(&a.depth()))
                 .then(b.outputs_per_tile().cmp(&a.outputs_per_tile()))
         });
         match feasibility {

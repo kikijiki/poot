@@ -1269,6 +1269,303 @@ pub fn wmma_tile_of(name: &str, dtype: WmmaDtype) -> Body {
     body
 }
 
+fn slice_u32(mutable: bool) -> Ty {
+    Ty::Ref {
+        mutable,
+        pointee: Box::new(Ty::Slice(Box::new(Ty::U32))),
+    }
+}
+
+/// The words of `input` a thread of [`u32_vector_load_kernel`] reads: its own four, `input[4t .. 4t + 4]`.
+const U32_VECTOR_LOAD_WORDS_PER_THREAD: usize = 4;
+
+/// `u32_vector_load(input: Slice<u32>, out: SliceMut<u32>)`: thread `t` loads `input[4t .. 4t + 4]` as one `u32x4`
+/// (element index `4t`, `align 16`) and stores its four lanes, one scalar store each, to `out[4t ..]`. The dispatch is
+/// sized to `input` exactly, in whole workgroups (no bounds check), so `out == input` when the vector load reads what four scalar loads read.
+/// `input` is read only through the vector load, so every target can bind it as a vector resource.
+pub fn u32_vector_load_kernel() -> Body {
+    let l = |i| Local { index: i };
+    let (input, out, thread, base, vector) = (l(1), l(2), l(3), l(4), l(5));
+    let words = U32_VECTOR_LOAD_WORDS_PER_THREAD as u32;
+    // _6 + 2k: lane k as a scalar; _7 + 2k: its output index.
+    let mut locals = vec![
+        LocalDecl {
+            ty: Ty::Unit,
+            mutable: false,
+        },
+        LocalDecl {
+            ty: slice_u32(false),
+            mutable: false,
+        },
+        LocalDecl {
+            ty: slice_u32(true),
+            mutable: true,
+        },
+        LocalDecl {
+            ty: Ty::Usize,
+            mutable: false,
+        },
+        LocalDecl {
+            ty: Ty::Usize,
+            mutable: false,
+        },
+        LocalDecl {
+            ty: Ty::Vec {
+                elem: Box::new(Ty::U32),
+                lanes: words,
+            },
+            mutable: false,
+        },
+    ];
+    let element = |buffer: Local, index: Local| Place {
+        local: buffer,
+        projection: vec![ProjectionElem::Deref, ProjectionElem::Index(index)],
+    };
+    let mut statements = vec![
+        Statement::Assign(
+            Place::local(base),
+            Rvalue::BinaryOp(
+                BinOp::Mul,
+                Operand::Copy(Place::local(thread)),
+                Operand::Const(Constant::Usize(u64::from(words))),
+            ),
+        ),
+        Statement::Assign(
+            Place::local(vector),
+            Rvalue::VectorLoad {
+                place: element(input, base),
+                align_bytes: 16,
+            },
+        ),
+    ];
+    for lane in 0..words {
+        let (value, index) = (l(6 + 2 * lane), l(7 + 2 * lane));
+        locals.extend([
+            LocalDecl {
+                ty: Ty::U32,
+                mutable: false,
+            },
+            LocalDecl {
+                ty: Ty::Usize,
+                mutable: false,
+            },
+        ]);
+        statements.extend([
+            Statement::Assign(
+                Place::local(value),
+                Rvalue::VectorExtract {
+                    vector: Operand::Copy(Place::local(vector)),
+                    lane,
+                },
+            ),
+            Statement::Assign(
+                Place::local(index),
+                Rvalue::BinaryOp(
+                    BinOp::Add,
+                    Operand::Copy(Place::local(base)),
+                    Operand::Const(Constant::Usize(u64::from(lane))),
+                ),
+            ),
+            Statement::Assign(
+                element(out, index),
+                Rvalue::Use(Operand::Copy(Place::local(value))),
+            ),
+        ]);
+    }
+    Body::new(
+        "u32_vector_load",
+        2,
+        locals,
+        vec![
+            BasicBlock {
+                statements: vec![],
+                terminator: Terminator::ThreadIndexCall {
+                    destination: Place::local(thread),
+                    dim: IndexAxis::X,
+                    target: BlockId { index: 1 },
+                },
+            },
+            BasicBlock {
+                statements,
+                terminator: Terminator::Return,
+            },
+        ],
+    )
+}
+
+/// `out` words a thread of [`u32_vector_load_mixed_kernel`] writes.
+const U32_VECTOR_LOAD_MIXED_OUT_WORDS: usize = 7;
+
+/// `u32_vector_load_mixed(input: Slice<u32>, out: SliceMut<u32>)`: thread `t` reads one param three ways, with
+/// `b = 4t`: a `u32x4` at element `b` (`align 16`), a `u32x2` at element `b + 2` (`align 8`) and the scalar
+/// `input[b + 1]`. It stores `out[7t ..]` = the four lanes of the first, the two of the second, then the scalar. A
+/// target that cannot keep a vector load on a param it also reads by element must read the same words as scalars.
+pub fn u32_vector_load_mixed_kernel() -> Body {
+    let l = |i| Local { index: i };
+    let (input, out, thread, base) = (l(1), l(2), l(3), l(4));
+    let vec_ty = |lanes| Ty::Vec {
+        elem: Box::new(Ty::U32),
+        lanes,
+    };
+    let local = |ty| LocalDecl { ty, mutable: false };
+    let element = |buffer: Local, index: Local| Place {
+        local: buffer,
+        projection: vec![ProjectionElem::Deref, ProjectionElem::Index(index)],
+    };
+    let usize_const = |v: u64| Operand::Const(Constant::Usize(v));
+    let copy = |v: Local| Operand::Copy(Place::local(v));
+    // _5 wide (u32x4), _6 narrow (u32x2), _7 narrow's index, _8 the scalar's index, _9 the scalar; then per output word
+    // an index and a value.
+    let (wide, narrow, narrow_at, scalar_at, scalar) = (l(5), l(6), l(7), l(8), l(9));
+    let mut locals = vec![
+        local(Ty::Unit),
+        local(slice_u32(false)),
+        LocalDecl {
+            ty: slice_u32(true),
+            mutable: true,
+        },
+        local(Ty::Usize),
+        local(Ty::Usize),
+        local(vec_ty(4)),
+        local(vec_ty(2)),
+        local(Ty::Usize),
+        local(Ty::Usize),
+        local(Ty::U32),
+    ];
+    let mut statements = vec![
+        Statement::Assign(
+            Place::local(base),
+            Rvalue::BinaryOp(BinOp::Mul, copy(thread), usize_const(4)),
+        ),
+        Statement::Assign(
+            Place::local(wide),
+            Rvalue::VectorLoad {
+                place: element(input, base),
+                align_bytes: 16,
+            },
+        ),
+        Statement::Assign(
+            Place::local(narrow_at),
+            Rvalue::BinaryOp(BinOp::Add, copy(base), usize_const(2)),
+        ),
+        Statement::Assign(
+            Place::local(narrow),
+            Rvalue::VectorLoad {
+                place: element(input, narrow_at),
+                align_bytes: 8,
+            },
+        ),
+        Statement::Assign(
+            Place::local(scalar_at),
+            Rvalue::BinaryOp(BinOp::Add, copy(base), usize_const(1)),
+        ),
+        Statement::Assign(
+            Place::local(scalar),
+            Rvalue::Use(Operand::Copy(element(input, scalar_at))),
+        ),
+    ];
+    let out_base = l(10);
+    locals.push(local(Ty::Usize));
+    statements.push(Statement::Assign(
+        Place::local(out_base),
+        Rvalue::BinaryOp(
+            BinOp::Mul,
+            copy(thread),
+            usize_const(U32_VECTOR_LOAD_MIXED_OUT_WORDS as u64),
+        ),
+    ));
+    // The seven stored words: (vector local, lane) pairs, then the scalar.
+    let words: Vec<(Local, Option<u32>)> = (0..4)
+        .map(|lane| (wide, Some(lane)))
+        .chain((0..2).map(|lane| (narrow, Some(lane))))
+        .chain([(scalar, None)])
+        .collect();
+    for (word, (source, lane)) in words.into_iter().enumerate() {
+        let (index, value) = (l(11 + 2 * word as u32), l(12 + 2 * word as u32));
+        locals.extend([local(Ty::Usize), local(Ty::U32)]);
+        statements.push(Statement::Assign(
+            Place::local(index),
+            Rvalue::BinaryOp(BinOp::Add, copy(out_base), usize_const(word as u64)),
+        ));
+        statements.push(Statement::Assign(
+            Place::local(value),
+            match lane {
+                Some(lane) => Rvalue::VectorExtract {
+                    vector: copy(source),
+                    lane,
+                },
+                None => Rvalue::Use(copy(source)),
+            },
+        ));
+        statements.push(Statement::Assign(
+            element(out, index),
+            Rvalue::Use(copy(value)),
+        ));
+    }
+    Body::new(
+        "u32_vector_load_mixed",
+        2,
+        locals,
+        vec![
+            BasicBlock {
+                statements: vec![],
+                terminator: Terminator::ThreadIndexCall {
+                    destination: Place::local(thread),
+                    dim: IndexAxis::X,
+                    target: BlockId { index: 1 },
+                },
+            },
+            BasicBlock {
+                statements,
+                terminator: Terminator::Return,
+            },
+        ],
+    )
+}
+
+/// One integer vector-load kernel with the input it runs on and the output four scalar loads of the same words give.
+pub struct VectorLoadCase {
+    /// The kernel: params `input: &[u32]` then `out: &mut [u32]`, one thread per four input words.
+    pub body: Body,
+    /// The input words, full 32-bit patterns so a lane read from the wrong word changes the output.
+    pub input: Vec<u32>,
+    /// The expected `out`, read with scalar loads on the host.
+    pub want: Vec<u32>,
+}
+
+/// The threads of [`vector_load_cases`]: one whole workgroup of the fixtures' default shape, since they have no
+/// bounds guard. Dispatch exactly this many threads.
+pub const VECTOR_LOAD_THREADS: u32 = 64;
+
+/// Both integer vector-load fixtures with their inputs and expected outputs.
+pub fn vector_load_cases() -> [VectorLoadCase; 2] {
+    let threads = VECTOR_LOAD_THREADS as usize;
+    let input: Vec<u32> = (0..(threads * U32_VECTOR_LOAD_WORDS_PER_THREAD) as u32)
+        .map(|word| word.wrapping_mul(0x9e37_79b9) ^ 0x1234_5678)
+        .collect();
+    let words = |thread: usize| &input[thread * 4..thread * 4 + 4];
+    let identity = input.clone();
+    let mixed = (0..threads)
+        .flat_map(|thread| {
+            let w = words(thread);
+            // the u32x4, the u32x2 at element 2, the scalar at element 1
+            [w[0], w[1], w[2], w[3], w[2], w[3], w[1]]
+        })
+        .collect();
+    [
+        VectorLoadCase {
+            body: u32_vector_load_kernel(),
+            input: input.clone(),
+            want: identity,
+        },
+        VectorLoadCase {
+            body: u32_vector_load_mixed_kernel(),
+            input,
+            want: mixed,
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

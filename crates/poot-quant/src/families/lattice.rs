@@ -1,0 +1,138 @@
+//! The lattice family: a code names a point of a table, the element's lane picks one cell of the
+//! point, and an optional sign pattern flips it.
+//!
+//! `IQ4_NL` and `IQ4_XS` are lattices of 16 one-lane points whose cells are f32 bit patterns;
+//! `IQ2_XS`, `IQ3_XXS` and `IQ3_S` are lattices of four or eight lanes of unsigned magnitude bytes
+//! with a sign group of eight values. One statement serves all five.
+
+use crate::format::FieldEncoding;
+use crate::scalar::float_to_f32;
+
+/// A table of `width`-bit cells packed little-endian into `u32` words, the form a device kernel reads.
+///
+/// A cell never straddles a word, so `width` divides 32. Cell `c` is at bit `c * width` of the words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellTable {
+    /// The cells, packed low bits first.
+    pub words: &'static [u32],
+    /// Bits per cell: 1, 2, 4, 8, 16 or 32.
+    pub width: u32,
+    /// How a cell's bits become a number: `Unsigned` (an integer plus an offset) or `Float`.
+    pub encoding: FieldEncoding,
+}
+
+impl CellTable {
+    /// The bits of cell `index`.
+    pub const fn cell(&self, index: usize) -> u32 {
+        let bit = index * self.width as usize;
+        let word = self.words[bit / 32] >> (bit % 32);
+        if self.width == 32 {
+            word
+        } else {
+            word & ((1u32 << self.width) - 1)
+        }
+    }
+
+    /// The number cell `index` holds.
+    pub fn number(&self, index: usize) -> f32 {
+        let bits = self.cell(index);
+        match self.encoding {
+            FieldEncoding::Unsigned { offset } => (bits as i32 + offset) as f32,
+            FieldEncoding::Float(format) => float_to_f32(format, bits),
+            FieldEncoding::Signed | FieldEncoding::HalfStep { .. } => {
+                unreachable!("descriptor tests: a cell is an unsigned integer or a float")
+            }
+        }
+    }
+
+    /// Number of cells.
+    pub const fn cells(&self) -> usize {
+        self.words.len() * 32 / self.width as usize
+    }
+}
+
+/// How a lattice's `Signs` operand states the eight signs of a group of eight values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignRule {
+    /// Seven stored bits are signs 0 to 6 and sign 7 is their parity, which is how ggml's
+    /// `ksigns_iq2xs` completes a 7-bit index to a byte of even population count (`IQ2_XS`,
+    /// `IQ3_XXS`).
+    ParityOfSeven,
+    /// Eight stored bits, one sign each (`IQ3_S`).
+    Direct,
+}
+
+impl SignRule {
+    /// Whether value `lane` (0 to 7) of a group of eight is negative under the stored `signs`.
+    pub const fn negative(self, signs: u32, lane: u32) -> bool {
+        let pattern = match self {
+            Self::ParityOfSeven => signs | ((signs.count_ones() & 1) << 7),
+            Self::Direct => signs,
+        };
+        pattern >> lane & 1 == 1
+    }
+}
+
+/// A table of points, each a run of `lanes` cells, and the sign rule that applies to them.
+///
+/// Element `i` of a block decodes to `sign(i) * cells[code * lanes + i % lanes]`, where `code` is the
+/// `Codes` operand at `i`. When [`Self::signs`] is set the sign comes from the `Signs` operand at `i`:
+/// the signs of the group of eight values `i / 8 * 8 ..` (bit `j` set means value `j` of the group is
+/// negative), whatever [`Self::lanes`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lattice {
+    /// The cells of every point, row-major: point `g` is cells `g * lanes .. (g + 1) * lanes`.
+    pub cells: CellTable,
+    /// Cells one point covers: 1 for the `IQ4` codebooks, 8 for `IQ2_XS`, 4 for `IQ3_XXS` and `IQ3_S`.
+    /// A point is a whole number of `u32` words, so a kernel reads a point without crossing a word.
+    pub lanes: usize,
+    /// The sign rule, or `None` for a lattice without a `Signs` operand.
+    pub signs: Option<SignRule>,
+}
+
+impl Lattice {
+    /// Number of points.
+    pub const fn points(&self) -> usize {
+        self.cells.cells() / self.lanes
+    }
+
+    /// The value of in-block element `element` whose `Codes` operand is `code` and whose `Signs`
+    /// operand is `signs` (ignored when [`Self::signs`] is `None`).
+    #[inline(always)]
+    pub fn value(&self, code: u32, element: usize, signs: u32) -> f32 {
+        let magnitude = self
+            .cells
+            .number(code as usize * self.lanes + element % self.lanes);
+        match self.signs {
+            Some(rule) if rule.negative(signs, (element % 8) as u32) => -magnitude,
+            _ => magnitude,
+        }
+    }
+}
+
+/// The bit patterns of a table of f32 cells, the word form of a 32-bit float [`CellTable`].
+pub(crate) const fn f32_words<const N: usize>(values: [f32; N]) -> [u32; N] {
+    let mut words = [0u32; N];
+    let mut index = 0;
+    while index < N {
+        words[index] = values[index].to_bits();
+        index += 1;
+    }
+    words
+}
+
+/// A table of 8-lane points of byte cells, each point a little-endian `u64` as ggml writes it, as the two
+/// words per point of a 8-bit [`CellTable`]. `WORDS` is twice the number of points.
+pub(crate) const fn u64_words<const POINTS: usize, const WORDS: usize>(
+    points: &[u64; POINTS],
+) -> [u32; WORDS] {
+    assert!(WORDS == 2 * POINTS, "two words per 8-lane point");
+    let mut words = [0u32; WORDS];
+    let mut point = 0;
+    while point < POINTS {
+        words[2 * point] = points[point] as u32;
+        words[2 * point + 1] = (points[point] >> 32) as u32;
+        point += 1;
+    }
+    words
+}

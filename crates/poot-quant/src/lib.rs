@@ -14,6 +14,7 @@ mod blocks;
 mod content;
 pub mod decode;
 mod encode;
+pub mod families;
 pub mod format;
 mod grids;
 pub mod plan;
@@ -35,7 +36,7 @@ use decode::DecodeError;
 use format::{Axis, GroupMap, Storage, WeightFormat};
 
 pub use encode::{EncodeError, encode};
-pub use format::OperandRole;
+pub use format::{OperandRole, PlanarRole};
 pub use stored::{
     FileIdentity, MapError, ReadError, SliceError, SourceChanged, StoredBytes, StoredReader,
     read_split,
@@ -58,7 +59,7 @@ pub enum SourceRole {
     /// The one buffer of a block format ([`format::Storage::Blocks`]).
     Blocks,
     /// One safetensors tensor of a planar format ([`format::Storage::Planar`]).
-    Planar(OperandRole),
+    Planar(PlanarRole),
 }
 
 /// Typed failures from [`PackedWeight`] or [`PackedPayload`] construction.
@@ -163,7 +164,7 @@ pub enum PackedWeightError {
         /// The planar format whose parts were to be stacked.
         format: WeightFormat,
         /// The operand whose stored rows are not out-major in blocks.
-        role: OperandRole,
+        role: PlanarRole,
     },
     /// [`PackedPayload::concat_rows`] part of `rows` rows that is not a whole number of `role`'s
     /// `block_rows`-row blocks: its last block would straddle the boundary to the next part
@@ -172,7 +173,7 @@ pub enum PackedWeightError {
         /// The planar format whose parts were to be stacked.
         format: WeightFormat,
         /// The operand whose scale blocks would straddle the boundary.
-        role: OperandRole,
+        role: PlanarRole,
         /// Row count of the offending part.
         rows: usize,
         /// Rows per block of `role`; `rows` is not a multiple of it.
@@ -1069,7 +1070,7 @@ impl PackedPayload {
                 descriptor.decode_blocks(bytes, out)
             }
             Storage::Planar(_) => {
-                let sources: Vec<(OperandRole, &[u8])> = self
+                let sources: Vec<(PlanarRole, &[u8])> = self
                     .sources
                     .iter()
                     .map(|source| {
@@ -1128,11 +1129,13 @@ fn validate_content(
                     return Err(PackedWeightError::NonFiniteField {
                         format,
                         role,
-                        operand: operand.role,
+                        operand: operand.role.operand().expect(
+                            "only a float operand has a content check, and it enters the formula",
+                        ),
                         element,
                     });
                 }
-                if operand.role == OperandRole::GroupIndex
+                if operand.role == PlanarRole::GroupIndex
                     && let WeightFormat::Gptq {
                         groups: GroupMap::Indexed { groups },
                     } = format
@@ -1171,7 +1174,7 @@ fn validate_adjacent_k_padding(
     let Some(codes) = layout
         .operands
         .iter()
-        .find(|operand| operand.role == OperandRole::Codes)
+        .find(|operand| operand.role == PlanarRole::Codes)
     else {
         return Ok(());
     };
@@ -1183,7 +1186,7 @@ fn validate_adjacent_k_padding(
         return Ok(());
     }
 
-    let role = SourceRole::Planar(OperandRole::Codes);
+    let role = SourceRole::Planar(PlanarRole::Codes);
     let weight_bytes = sources
         .iter()
         .find(|source| source.role == role)

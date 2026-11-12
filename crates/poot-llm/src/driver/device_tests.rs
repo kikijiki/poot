@@ -1804,7 +1804,7 @@ fn a_finetune_like_qwen35_checkpoint_loads_through_model_handle_load() {
 fn a_block_fp8_qwen35_checkpoint_loads_packed_through_model_handle_load() {
     use poot_quant::format::{ScaleEncoding, WeightFormat};
     use poot_quant::weights::WeightEntry;
-    use poot_quant::{OperandRole, SourceRole};
+    use poot_quant::{PlanarRole, SourceRole};
     use poot_weights::HandleFormat;
     let registry = Registry::builtin().unwrap();
     let entry = registry
@@ -1837,7 +1837,7 @@ fn a_block_fp8_qwen35_checkpoint_loads_packed_through_model_handle_load() {
                     dtype: "F8_E4M3",
                     shape: vec![rows, k],
                     bytes: payload
-                        .bytes(SourceRole::Planar(OperandRole::Codes))
+                        .bytes(SourceRole::Planar(PlanarRole::Codes))
                         .to_vec(),
                 });
                 tensors.push(ArchiveTensor {
@@ -1845,7 +1845,7 @@ fn a_block_fp8_qwen35_checkpoint_loads_packed_through_model_handle_load() {
                     dtype: "BF16",
                     shape: vec![rows.div_ceil(128), k.div_ceil(128)],
                     bytes: payload
-                        .bytes(SourceRole::Planar(OperandRole::Scale))
+                        .bytes(SourceRole::Planar(PlanarRole::Scale))
                         .to_vec(),
                 });
             }
@@ -1869,7 +1869,7 @@ fn a_block_fp8_qwen35_checkpoint_loads_packed_through_model_handle_load() {
                 scale: ScaleEncoding::Bf16
             }
         );
-        for role in [OperandRole::Codes, OperandRole::Scale] {
+        for role in [PlanarRole::Codes, PlanarRole::Scale] {
             assert_eq!(
                 got.bytes(SourceRole::Planar(role)),
                 want.bytes(SourceRole::Planar(role)),
@@ -2192,7 +2192,7 @@ fn packed_bytes(store: &WeightStore, name: &str, role: poot_quant::SourceRole) -
 /// is refused and the row goes red.
 fn packed_checkpoints_load_as_stored_through_the_registry(choice: BackendChoice) {
     use poot_quant::format::WeightFormat;
-    use poot_quant::{OperandRole, SourceRole};
+    use poot_quant::{PlanarRole, SourceRole};
     let registry = Registry::builtin().unwrap();
     let base = {
         let entry = registry
@@ -2234,7 +2234,7 @@ fn packed_checkpoints_load_as_stored_through_the_registry(choice: BackendChoice)
         let codes = packed_bytes(
             fp8.store(),
             &tensor.name,
-            SourceRole::Planar(OperandRole::Codes),
+            SourceRole::Planar(PlanarRole::Codes),
         );
         assert_eq!(
             codes, tensor.bytes,

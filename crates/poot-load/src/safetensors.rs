@@ -372,7 +372,7 @@ pub fn pack_quantized_linears(
     store: &WeightStore,
     scheme: QuantScheme,
 ) -> Result<WeightStore, LoadError> {
-    use poot_quant::format::{GroupMap, OperandRole, ScaleEncoding, WeightFormat};
+    use poot_quant::format::{GroupMap, PlanarRole, ScaleEncoding, WeightFormat};
     use poot_quant::{PackedPayload, PackedWeight, SourceRole};
 
     // Every layout refusal names the checkpoint tensor it is about (SC-008).
@@ -508,15 +508,12 @@ pub fn pack_quantized_linears(
                     .all(|(k, word)| i32::from_le_bytes(*word) as usize == k / group_size);
                 let mut sources = vec![
                     (
-                        SourceRole::Planar(OperandRole::Codes),
+                        SourceRole::Planar(PlanarRole::Codes),
                         qweight.bytes().clone(),
                     ),
+                    (SourceRole::Planar(PlanarRole::Zero), qzeros.bytes().clone()),
                     (
-                        SourceRole::Planar(OperandRole::Zero),
-                        qzeros.bytes().clone(),
-                    ),
-                    (
-                        SourceRole::Planar(OperandRole::Scale),
+                        SourceRole::Planar(PlanarRole::Scale),
                         scales.bytes().clone(),
                     ),
                 ];
@@ -524,7 +521,7 @@ pub fn pack_quantized_linears(
                     GroupMap::Contiguous { size: group_size }
                 } else {
                     sources.push((
-                        SourceRole::Planar(OperandRole::GroupIndex),
+                        SourceRole::Planar(PlanarRole::GroupIndex),
                         g_idx.bytes().clone(),
                     ));
                     GroupMap::Indexed {
@@ -553,15 +550,12 @@ pub fn pack_quantized_linears(
                     [pack_extent(format!("{prefix}.qweight"), out8, "out/8")?, k],
                     vec![
                         (
-                            SourceRole::Planar(OperandRole::Codes),
+                            SourceRole::Planar(PlanarRole::Codes),
                             qweight.bytes().clone(),
                         ),
+                        (SourceRole::Planar(PlanarRole::Zero), qzeros.bytes().clone()),
                         (
-                            SourceRole::Planar(OperandRole::Zero),
-                            qzeros.bytes().clone(),
-                        ),
-                        (
-                            SourceRole::Planar(OperandRole::Scale),
+                            SourceRole::Planar(PlanarRole::Scale),
                             scales.bytes().clone(),
                         ),
                     ],
@@ -630,13 +624,10 @@ pub fn pack_quantized_linears(
                     [out, k],
                     vec![
                         (
-                            SourceRole::Planar(OperandRole::Codes),
+                            SourceRole::Planar(PlanarRole::Codes),
                             weight.bytes().clone(),
                         ),
-                        (
-                            SourceRole::Planar(OperandRole::Scale),
-                            scale.bytes().clone(),
-                        ),
+                        (SourceRole::Planar(PlanarRole::Scale), scale.bytes().clone()),
                     ],
                     vec![".weight", suffix],
                 )

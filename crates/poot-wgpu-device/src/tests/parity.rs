@@ -294,7 +294,7 @@ fn bf16_const_cast_is_bit_exact_on_wgpu() {
 /// wgpu witness that the shared oracle's packed arm is live: with the arm gone a packed const binds as dense and
 /// the oracle panics in `materialize_dense`.
 /// Mutation: drop the packed-components arm of `poot_eval::test_support::weight_map_oracle::oracle_for`; every row goes red.
-/// Mutation (IQ3_S, POOT-1197): in `poot-kernelgen`'s `emit_signed_grid`, take the sign lane as `i % 7` instead
+/// Mutation (IQ3_S, POOT-1197): in `poot-kernelgen`'s `packed/family/lattice.rs` (`emit_signed`), take the sign lane as `i % 7` instead
 /// of `i % 8`; the `packed_linear_iq3_s_*` rows go red. A change to the IQ3_S descriptor itself moves the kernel
 /// and this oracle together (both read it), so it cannot turn this row red; the CPU rows against llama.cpp
 /// (`iq3_s_blocks_decode_to_the_llamacpp_reference_bit_for_bit`) pin the descriptor.
@@ -355,11 +355,11 @@ fn state_pool_rows_reset_independently_on_wgpu() {
 /// plans the split-KV schedule (two launches through one scratch) and, stepped at live lengths 1024, 5, 400,
 /// 1, 1024 over one executable, matches the CPU oracle's evaluation of each length within
 /// `SPLIT_KV_DEVICE_TOLERANCE`. The scratch slot is stale from the
-/// previous step at every step but the first (length 5 leaves seven of the eight splits with no key), so a
-/// split that did not publish its own neutral partial reads the first step's.
-/// Mutation: in `poot-kernelgen`'s `attention_body`, skip the partial writes of a split with no key; the
-/// length-5 and length-1 steps go red. Dropping one split's partial in the combine (`count` starting at 1)
-/// goes red on every step.
+/// previous step at every step but the first (length 5 needs one share of the eight splits), so a
+/// combine that read past the splits its row published reads the first step's partials.
+/// Mutation: in `poot-kernelgen`'s `attention_combine_body`, loop to `splits` instead of the published count; the
+/// length-5, length-400 and length-1 steps go red. Dropping one split's partial in the combine (`count`
+/// starting at 1) goes red on every step.
 #[test]
 fn split_kv_decode_matches_the_oracle_on_wgpu() {
     let Some(device) = wgpu() else {
@@ -369,6 +369,26 @@ fn split_kv_decode_matches_the_oracle_on_wgpu() {
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     poot_executor_parity::attention::assert_split_kv_decode_matches_the_oracle(exec.as_mut(), t)
         .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// POOT-1400: the split-KV decode over the same live prefix of a 256-key and of a 4096-key cache gives
+/// bit-identical outputs, though the two plan different grids: the live length alone partitions the keys. The
+/// keys past the length are NaN in both caches.
+///
+/// Mutation: in `poot-kernelgen`'s `attention_body`, cut the shares from the capacity (`per = ceil(lk / splits)`,
+/// every split published); the 129-key step differs in bits between the two capacities.
+#[test]
+fn split_kv_decode_is_capacity_independent_on_wgpu() {
+    let Some(device) = wgpu() else {
+        return;
+    };
+    let t = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::attention::assert_split_kv_decode_is_capacity_independent(
+        exec.as_mut(),
+        t,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
 }
 
 /// A paged decode attention reads the K and V pools in place through the `[B, Lk]` read map: the plan holds one

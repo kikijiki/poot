@@ -1359,7 +1359,11 @@ pub(crate) struct Measured {
     /// Sum of the step's dispatch durations on the device clock, per repeat; `None` when the device
     /// reports no timestamps (`DeviceTime::Unknown`), never a fabricated zero.
     pub(crate) device_us: Option<Vec<f64>>,
-    plan: Vec<String>,
+    /// Per timed repeat, each dispatch's own device microseconds in plan order; empty rows where the device reports
+    /// no per-dispatch time.
+    pub(crate) dispatch_us: Vec<Vec<f64>>,
+    /// The kernels the planner chose, in plan order (`plan_of`).
+    pub(crate) plan: Vec<String>,
     pub(crate) worst: f64,
     pub(crate) agrees: bool,
     /// Whether the planner chose a narrowed operand read for any contraction or attention of the case; the output
@@ -1368,6 +1372,27 @@ pub(crate) struct Measured {
     memory: Vec<Value>,
     recordings: u64,
     replays: u64,
+}
+
+impl Measured {
+    /// Each dispatch's median device microseconds over the timed repeats, in plan order; empty where the device
+    /// reports no per-dispatch time.
+    fn dispatch_medians(&self) -> Vec<f64> {
+        let Some(first) = self.dispatch_us.first() else {
+            return Vec::new();
+        };
+        (0..first.len())
+            .map(|position| {
+                let mut samples: Vec<f64> = self
+                    .dispatch_us
+                    .iter()
+                    .filter_map(|repeat| repeat.get(position).copied())
+                    .collect();
+                samples.sort_by(f64::total_cmp);
+                samples[samples.len() / 2]
+            })
+            .collect()
+    }
 }
 
 pub(crate) fn measure<D>(
@@ -1422,8 +1447,9 @@ where
     let timing = &bank["timing_policy"];
     let warmup = timing["warmup"].as_u64().ok_or("timing_policy.warmup")? as usize;
     let repeats = timing["repeats"].as_u64().ok_or("timing_policy.repeats")? as usize;
-    // One step: (wall microseconds, device microseconds when the device timed it, the read-back output).
-    let mut step = |index: usize| -> Result<(f64, Option<f64>, HostTensor), String> {
+    // One step: (wall microseconds, device microseconds when the device timed it, each dispatch's own device
+    // microseconds in plan order when it reports them, the read-back output).
+    let mut step = |index: usize| -> Result<(f64, Option<f64>, Vec<f64>, HostTensor), String> {
         let entry = entries[index % entries.len()];
         let mut inputs = StepInputs::new();
         for (key, shape, bytes) in &prepared.slots {
@@ -1435,6 +1461,14 @@ where
         let mut outputs = exec
             .step(exe, entry, &inputs, &mut NoSync)
             .map_err(|e| format!("step: {e}"))?;
+        let dispatch_us: Vec<f64> = match outputs.device_time() {
+            DeviceTime::Measured(measured) => measured
+                .dispatches
+                .iter()
+                .map(|d| d.duration.as_secs_f64() * 1e6)
+                .collect(),
+            DeviceTime::Unknown => Vec::new(),
+        };
         let device_us = match outputs.device_time() {
             // The sum of the dispatches' own durations where the device times each; else the span of the step's replay
             // (PTX brackets a captured graph with an event pair and has no per-dispatch time inside it).
@@ -1445,7 +1479,12 @@ where
             DeviceTime::Unknown => None,
         };
         let output = outputs.to_host().map_err(|e| format!("read: {e}"))?;
-        Ok((started.elapsed().as_secs_f64() * 1e6, device_us, output))
+        Ok((
+            started.elapsed().as_secs_f64() * 1e6,
+            device_us,
+            dispatch_us,
+            output,
+        ))
     };
 
     // The first pass over the copies records every entry and checks each copy's output against its own
@@ -1459,7 +1498,7 @@ where
         _ => (&prepared.references, ops.tolerance()),
     };
     for (copy, want) in references.iter().enumerate() {
-        let (_, _, output) = step(copy)?;
+        let (_, _, _, output) = step(copy)?;
         if output.shape() != prepared.out_shape.as_slice() {
             return Err(format!(
                 "output shape {:?}, expected {:?}",
@@ -1477,9 +1516,11 @@ where
     }
     let (mut wall_us, mut device_samples) =
         (Vec::with_capacity(repeats), Vec::with_capacity(repeats));
+    let mut dispatch_samples: Vec<Vec<f64>> = Vec::with_capacity(repeats);
     for index in 0..repeats {
-        let (wall, device, _) = step(references.len() + warmup + index)?;
+        let (wall, device, dispatches, _) = step(references.len() + warmup + index)?;
         wall_us.push(wall);
+        dispatch_samples.push(dispatches);
         device_samples.push(device);
     }
     // A device either times every step or none: a partly timed run would mix two populations in one cell.
@@ -1500,6 +1541,7 @@ where
     Ok(Measured {
         wall_us,
         device_us,
+        dispatch_us: dispatch_samples,
         plan,
         worst,
         agrees,
@@ -1559,6 +1601,7 @@ where
         "binary": exe_path.display().to_string(),
         "observed": prepared.observed,
         "plan": wall.plan,
+        "dispatch_device_us": timed.dispatch_medians(),
         "plan_id": hex(&digest),
         "reference": {
             "provenance": "independent-golden",

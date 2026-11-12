@@ -333,3 +333,12 @@ pub(crate) fn expert_group(name: &str, experts: usize, block: usize) -> Body {
 pub(crate) const fn expert_group_lanes() -> usize {
     LANES
 }
+
+/// The row ids one lane of [`expert_group`] scans for `rows` rows over `buckets` buckets (the experts and the bucket
+/// of ids outside them): the buckets are strided over the [`LANES`] lanes, and each bucket costs its lane two scans
+/// of all the rows (the count and the placement). The longest lane sets the dispatch's time (about 0.27 us per row at
+/// 513 buckets on gfx1151, whatever the block), which the contraction's cost model prices as a grouping step
+/// ([`poot_target::calibration::CostRatios::group_scan`], POOT-1547).
+pub(crate) fn expert_group_scan_steps(buckets: usize, rows: usize) -> usize {
+    2 * buckets.div_ceil(LANES) * rows
+}

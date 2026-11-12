@@ -5,9 +5,11 @@
 
 use std::fmt;
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::families::{float, integer};
 use crate::format::{
     Axis, Extent, FormatDescriptor, GroupMap, Major, OperandRole, PlanarLayout, PlanarOperand,
-    Storage, WeightFormat,
+    PlanarRole, Storage, WeightFormat,
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::format::{FieldEncoding, MinSign, ValueMap};
@@ -72,6 +74,14 @@ pub enum DecodeError {
         /// The format that needs the operand.
         format: WeightFormat,
         /// The role of the operand that was not supplied.
+        role: PlanarRole,
+    },
+    /// The descriptor has no operand for a term its value formula reads (a block layout without `Codes`, a
+    /// lattice with signs and no `Signs` field).
+    MissingTerm {
+        /// The format whose descriptor lacks the operand.
+        format: WeightFormat,
+        /// The formula operand the descriptor does not state.
         role: OperandRole,
     },
     /// A planar operand's source has the wrong byte length for the shape.
@@ -79,7 +89,7 @@ pub enum DecodeError {
         /// The format that owns the operand.
         format: WeightFormat,
         /// The role of the operand whose source is the wrong size.
-        role: OperandRole,
+        role: PlanarRole,
         /// Byte length the operand's shape and encoding require.
         expected: usize,
         /// Byte length of the source that was supplied.
@@ -169,6 +179,12 @@ impl fmt::Display for DecodeError {
             ),
             Self::MissingOperand { format, role } => {
                 write!(f, "{format:?} needs a {role:?} operand")
+            }
+            Self::MissingTerm { format, role } => {
+                write!(
+                    f,
+                    "{format:?} states no {role:?} operand for its value formula"
+                )
             }
             Self::OperandLength {
                 format,
@@ -265,14 +281,14 @@ impl Formula<'_> {
         };
         let scale = product(number(OperandRole::Scale)?, number(OperandRole::SubScale)?);
         let min = product(number(OperandRole::Min)?, number(OperandRole::SubMin)?);
-        let code = operand(OperandRole::Codes)?.ok_or(DecodeError::MissingOperand {
+        let code = operand(OperandRole::Codes)?.ok_or(DecodeError::MissingTerm {
             format,
             role: OperandRole::Codes,
         })?;
         Ok((scale, min, code))
     }
 
-    /// The value at in-block element `element`, which only a [`ValueMap::SignedGrid`] reads (its
+    /// The value at in-block element `element`, which only a [`ValueMap::Lattice`] reads (its
     /// lane and sign bit are positions in the block); planar formats have no such map and pass 0.
     fn evaluate(
         &self,
@@ -283,30 +299,31 @@ impl Formula<'_> {
         let value = match self.descriptor.value {
             ValueMap::Integer => {
                 let zero = operand(OperandRole::Zero)?.map_or(0, Raw::integer);
-                (code.integer() - zero) as f32
+                integer::value(code.integer(), zero)
             }
-            ValueMap::Codebook(table) => table[code.bits as usize],
-            ValueMap::SignedGrid(grid) => {
-                let signs = operand(OperandRole::Signs)?.ok_or(DecodeError::MissingOperand {
-                    format: self.descriptor.format,
-                    role: OperandRole::Signs,
-                })?;
-                let magnitude = f32::from(grid.magnitude(code.bits as usize, element % grid.lanes));
-                if grid.signs.negative(signs.bits, (element % 8) as u32) {
-                    -magnitude
-                } else {
-                    magnitude
-                }
+            ValueMap::Lattice(lattice) => {
+                let signs = match lattice.signs {
+                    Some(_) => {
+                        operand(OperandRole::Signs)?
+                            .ok_or(DecodeError::MissingTerm {
+                                format: self.descriptor.format,
+                                role: OperandRole::Signs,
+                            })?
+                            .bits
+                    }
+                    None => 0,
+                };
+                lattice.value(code.bits, element, signs)
             }
             ValueMap::Float => {
-                let value = code.number();
-                if value.is_nan() {
+                let number = code.number();
+                if !float::is_value(number) {
                     return Err(DecodeError::NotANumber {
                         format: self.descriptor.format,
                         role: OperandRole::Codes,
                     });
                 }
-                value
+                number
             }
         };
         let scaled = scale.map_or(value, |scale| scale * value);
@@ -351,7 +368,7 @@ impl FormatDescriptor {
 
     /// The first stored `GroupIndex` value (GPTQ act-order `g_idx`) that names no group - negative,
     /// or `>= groups` - as `(k, value)`, or `None` if every stored value is in range. `operand` must
-    /// be the format's own `GroupIndex` operand (`OperandRole::GroupIndex`, act-order GPTQ's only
+    /// be the format's own `GroupIndex` operand (`PlanarRole::GroupIndex`, act-order GPTQ's only
     /// one); `groups` is the caller's own `GroupMap::Indexed` count. Checked once at construction
     /// (`PackedPayload::try_new`), so no decoder - the CPU oracle's `group_of` or a device kernel's
     /// `emit_group_of` - ever reads an out-of-range group index (dquant.md 4, "kernels decode the
@@ -390,7 +407,7 @@ impl FormatDescriptor {
     /// comes from here, never restated.
     pub fn source_shape(
         &self,
-        role: OperandRole,
+        role: PlanarRole,
         shape: [usize; 2],
     ) -> Result<[usize; 2], DecodeError> {
         let operand = self.planar_operand(role)?;
@@ -409,7 +426,7 @@ impl FormatDescriptor {
     pub fn planar_operand_bytes(
         &self,
         shape: [usize; 2],
-        role: OperandRole,
+        role: PlanarRole,
     ) -> Result<usize, DecodeError> {
         let [rows, row_bytes] = self.source_shape(role, shape)?;
         rows.checked_mul(row_bytes).ok_or(DecodeError::Overflow {
@@ -423,7 +440,7 @@ impl FormatDescriptor {
     pub fn decode_planar_value(
         &self,
         shape: [usize; 2],
-        sources: &[(OperandRole, &[u8])],
+        sources: &[(PlanarRole, &[u8])],
         coordinate: [usize; 2],
     ) -> Result<f32, DecodeError> {
         let layout = self.planar()?;
@@ -450,7 +467,7 @@ impl FormatDescriptor {
             layout
                 .operands
                 .iter()
-                .find(|operand| operand.role == role)
+                .find(|operand| operand.role.operand() == Some(role))
                 .map(|operand| self.read_planar(operand, shape, sources, coordinate))
                 .transpose()
         })
@@ -463,7 +480,7 @@ impl FormatDescriptor {
     pub fn decode_planar_row(
         &self,
         shape: [usize; 2],
-        sources: &[(OperandRole, &[u8])],
+        sources: &[(PlanarRole, &[u8])],
         row: usize,
         out: &mut [f32],
     ) -> Result<(), DecodeError> {
@@ -492,7 +509,7 @@ impl FormatDescriptor {
                 layout
                     .operands
                     .iter()
-                    .find(|operand| operand.role == role)
+                    .find(|operand| operand.role.operand() == Some(role))
                     .map(|operand| self.read_planar(operand, shape, sources, [row, column]))
                     .transpose()
             })?;
@@ -501,7 +518,7 @@ impl FormatDescriptor {
     }
 
     /// The planar operand with this role.
-    pub fn planar_operand(&self, role: OperandRole) -> Result<PlanarOperand, DecodeError> {
+    pub fn planar_operand(&self, role: PlanarRole) -> Result<PlanarOperand, DecodeError> {
         self.planar()?
             .operands
             .iter()
@@ -516,8 +533,8 @@ impl FormatDescriptor {
     #[cfg(any(test, feature = "test-support"))]
     fn source<'s>(
         &self,
-        sources: &[(OperandRole, &'s [u8])],
-        role: OperandRole,
+        sources: &[(PlanarRole, &'s [u8])],
+        role: PlanarRole,
     ) -> Result<&'s [u8], DecodeError> {
         sources
             .iter()
@@ -572,7 +589,7 @@ impl FormatDescriptor {
         &self,
         operand: &PlanarOperand,
         shape: [usize; 2],
-        sources: &[(OperandRole, &[u8])],
+        sources: &[(PlanarRole, &[u8])],
         [o, k]: [usize; 2],
     ) -> Result<Raw, DecodeError> {
         let mut element = [0; 2];
@@ -609,14 +626,14 @@ impl FormatDescriptor {
     fn group_of(
         &self,
         shape: [usize; 2],
-        sources: &[(OperandRole, &[u8])],
+        sources: &[(PlanarRole, &[u8])],
         k: usize,
     ) -> Result<usize, DecodeError> {
         match self.format {
             WeightFormat::Gptq {
                 groups: GroupMap::Indexed { groups },
             } => {
-                let operand = self.planar_operand(OperandRole::GroupIndex)?;
+                let operand = self.planar_operand(PlanarRole::GroupIndex)?;
                 let group = self
                     .read_planar(&operand, shape, sources, [0, k])?
                     .integer();
@@ -647,7 +664,7 @@ const fn axis_index(axis: Axis) -> usize {
 
 // Card 638: a bare `#[cfg(test)] impl` outside a test tree is a
 // pattern the gate rejects; a genuine test oracle belongs inside a `mod tests`. Inherent impls
-// resolve by crate regardless of which module declares them, so plan.rs, blocks.rs and tests.rs
+// resolve by crate regardless of which module declares them, so plan.rs, blocks/tests.rs and tests.rs
 // keep calling `descriptor.decode_block_value(...)` with no call-site change.
 #[cfg(test)]
 mod tests {

@@ -10,7 +10,7 @@
 //! # Buffer binding contract
 //!
 //! Every buffer a [`Device`] binds to a kernel parameter starts at its allocation base, aligned to at
-//! least [`poot_codegen::BUFFER_PARAM_ALIGN`] (16) bytes: an arena slot shares a whole allocation from
+//! least [`poot_kernel_ir::BUFFER_PARAM_ALIGN`] (16) bytes: an arena slot shares a whole allocation from
 //! offset 0, and no dispatch binds an offset into a buffer. Generated kernels rely on it (a Gemv reads its
 //! activation in aligned 16-byte groups where the planner proved the group offsets, POOT-1405). A device
 //! refuses a binding that breaks it instead of launching: the PTX runtime's kernel-argument packing

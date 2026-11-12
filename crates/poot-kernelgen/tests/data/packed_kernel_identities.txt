@@ -1,0 +1,377 @@
+F32 | row_gather | 2e31b27e243e8fe2
+F32 | gemv0 | 68cb578e8123fba2
+F32 | gemv1 | cad65707e2ee5283
+F32 | gemv2 | 77122a8f57de0ac3
+F32 | gemv3 | ce5adbf044798ce7
+F32 | gemv0_indexed | fbd3ab3b16e1d50e
+F32 | gemv1_indexed | 33158898ded5f9f9
+F32 | gemv_vec4 | 34372f1bfcc524a5
+F32 | register_tiled | 7961459a4e0c80d4
+F32 | register_tiled_indexed | 012ed09f5c3e72eb
+F32 | register_tiled_narrow_f16 | f46f86b187365cf3
+F32 | fragment_tiled_split_bf16 | 1c81f5d540d06328
+F32 | run_sharing | FactorRun { factor_run: 1 } 32 bits
+F16 | row_gather | af71a35ebc84b024
+F16 | gemv0 | becf3c04cac61f70
+F16 | gemv1 | 332a41152602564f
+F16 | gemv2 | e265d08834b9adb5
+F16 | gemv3 | 68a963a5dcd69282
+F16 | gemv0_indexed | a00ece032ab9843d
+F16 | gemv1_indexed | 816fb6b8c512e9ec
+F16 | gemv_vec4 | 560f4001b1bf0062
+F16 | register_tiled | 2f6522c6827745af
+F16 | register_tiled_indexed | 922bc2c9bddbdeb3
+F16 | register_tiled_narrow_f16 | ec21e042c2e83e8d
+F16 | fragment_tiled_split_bf16 | 9b70e03f1658ccdb
+F16 | run_sharing | FactorRun { factor_run: 1 } 16 bits
+Q4_0 | row_gather | 9aac4068679359b1
+Q4_0 | gemv0 | f47f703ad488f762
+Q4_0 | gemv1 | c9f928609a6fa217
+Q4_0 | gemv2 | b60bfc0d63511be1
+Q4_0 | gemv3 | a1ed3a44a26bc82a
+Q4_0 | gemv0_indexed | a4ca94d45851f9a1
+Q4_0 | gemv1_indexed | 314e5b2b53e4f0fe
+Q4_0 | gemv_vec4 | a823318bb256cbc0
+Q4_0 | register_tiled | 3ce16ef88ec3d79a
+Q4_0 | register_tiled_indexed | b70f4563532b7da8
+Q4_0 | register_tiled_narrow_f16 | 2b5b3f9434232a71
+Q4_0 | fragment_tiled_split_bf16 | 05116bcb299b89e0
+Q4_0 | run_sharing | FactorRun { factor_run: 32 } 5 bits
+Q4_1 | row_gather | 5dbdd48c58e8bef6
+Q4_1 | gemv0 | dce76d459a66bab7
+Q4_1 | gemv1 | 6155036eed878de1
+Q4_1 | gemv2 | 2f754911c9659904
+Q4_1 | gemv3 | 11993f9358dd9e5b
+Q4_1 | gemv0_indexed | 3e0e4fd25e9f04ac
+Q4_1 | gemv1_indexed | b40a1c9eb747aff2
+Q4_1 | gemv_vec4 | b0c71f94a46e71b6
+Q4_1 | register_tiled | 26500b9f6ce309af
+Q4_1 | register_tiled_indexed | 29e9d65e49a65435
+Q4_1 | register_tiled_narrow_f16 | 2fb3778a4512f3e6
+Q4_1 | fragment_tiled_split_bf16 | 4e840246226b22ef
+Q4_1 | run_sharing | FactorRun { factor_run: 32 } 5 bits
+Q5_0 | row_gather | 1c8d62601f6c5a39
+Q5_0 | gemv0 | 63e1b3e627e0312d
+Q5_0 | gemv1 | 7b87fc74513015b2
+Q5_0 | gemv2 | 56a56289341589e2
+Q5_0 | gemv3 | 3ff477f71e99bf32
+Q5_0 | gemv0_indexed | 3f7395de04b49665
+Q5_0 | gemv1_indexed | 483dfd7ca6d2d5b4
+Q5_0 | gemv_vec4 | 585bbe6ca516276a
+Q5_0 | register_tiled | 9ff9f89476d42c8e
+Q5_0 | register_tiled_indexed | c915792bf8cc2435
+Q5_0 | register_tiled_narrow_f16 | 675148d807f7b172
+Q5_0 | fragment_tiled_split_bf16 | e3c5aef0931b982e
+Q5_0 | run_sharing | FactorRun { factor_run: 32 } 6 bits
+Q5_1 | row_gather | a63c3b62c7358da1
+Q5_1 | gemv0 | 6b35c126c8e874e2
+Q5_1 | gemv1 | 675827c829a0a5df
+Q5_1 | gemv2 | b30118f60d4f46b8
+Q5_1 | gemv3 | b2c49b09700c6552
+Q5_1 | gemv0_indexed | 99da2a9512ce555f
+Q5_1 | gemv1_indexed | 55310ad34a93df8d
+Q5_1 | gemv_vec4 | f97944095578b4db
+Q5_1 | register_tiled | 6d2bc89d1907a435
+Q5_1 | register_tiled_indexed | 618ff441db26463f
+Q5_1 | register_tiled_narrow_f16 | fe5a81a02197c782
+Q5_1 | fragment_tiled_split_bf16 | bf5f96ece1e735af
+Q5_1 | run_sharing | FactorRun { factor_run: 32 } 6 bits
+Q8_0 | row_gather | c751eb92d2e06d38
+Q8_0 | gemv0 | 89ddbbd89eec1c51
+Q8_0 | gemv1 | d2374dcde4d54e9b
+Q8_0 | gemv2 | cd73ac09e769b6d2
+Q8_0 | gemv3 | 93755769a3f3128f
+Q8_0 | gemv0_indexed | 1fa07acf3d46d69e
+Q8_0 | gemv1_indexed | c1a2299896c31eb9
+Q8_0 | gemv_vec4 | e92066eb7f426120
+Q8_0 | register_tiled | 8c43792406b08f4c
+Q8_0 | register_tiled_indexed | d847698341efa2c4
+Q8_0 | register_tiled_narrow_f16 | efa458e094985810
+Q8_0 | fragment_tiled_split_bf16 | 0fa9f4029840f7fe
+Q8_0 | run_sharing | FactorRun { factor_run: 32 } 9 bits
+Q2_K | row_gather | 002094b0619ab1f4
+Q2_K | gemv0 | e4014a2b7d697549
+Q2_K | gemv1 | d66d56e3a930ba13
+Q2_K | gemv2 | 3359ca2c48103e23
+Q2_K | gemv3 | 8a4ac1927a822e20
+Q2_K | gemv0_indexed | 6e1ab47d43534862
+Q2_K | gemv1_indexed | 1b265d6830b4f36f
+Q2_K | gemv_vec4 | 9d65ca492a81837e
+Q2_K | register_tiled | 4550df66f67cb568
+Q2_K | register_tiled_indexed | dabe5b5ecb009cae
+Q2_K | register_tiled_narrow_f16 | 56d05c6dd5c5e7fd
+Q2_K | fragment_tiled_split_bf16 | acfe3a49ff22eab4
+Q2_K | run_sharing | FactorRun { factor_run: 16 } 3 bits
+Q3_K | row_gather | da26b8e938fcae9d
+Q3_K | gemv0 | 4892c0e50a410f2c
+Q3_K | gemv1 | 76a99b61ac60e015
+Q3_K | gemv2 | f6edd5539d1e3ae7
+Q3_K | gemv3 | 6bd2934787899059
+Q3_K | gemv0_indexed | 26d8d0697abe8b9a
+Q3_K | gemv1_indexed | 5c3808b67fe780a6
+Q3_K | gemv_vec4 | 1a32ef150544422d
+Q3_K | register_tiled | ec1b7405fede9949
+Q3_K | register_tiled_indexed | 1b9cb998c22e4a07
+Q3_K | register_tiled_narrow_f16 | e0774dd53ac05805
+Q3_K | fragment_tiled_split_bf16 | c5d52e6c3abdc28b
+Q3_K | run_sharing | FactorRun { factor_run: 16 } 4 bits
+Q4_K | row_gather | ed38073316fc3b08
+Q4_K | gemv0 | b78af652b6833134
+Q4_K | gemv1 | 8a9d578d33270bb4
+Q4_K | gemv2 | b784afb7f8598402
+Q4_K | gemv3 | 2b98ec505589474c
+Q4_K | gemv0_indexed | a7dd908d6d868a3a
+Q4_K | gemv1_indexed | 3275c7719cde2cf9
+Q4_K | gemv_vec4 | 363fe36c20c84fef
+Q4_K | register_tiled | a799ffb53cbcd6f1
+Q4_K | register_tiled_indexed | d7fbd685fb2d9b45
+Q4_K | register_tiled_narrow_f16 | 99b806466a2af06b
+Q4_K | fragment_tiled_split_bf16 | a10860cb21fc32e5
+Q4_K | run_sharing | FactorRun { factor_run: 32 } 5 bits
+Q5_K | row_gather | 29dce72676d4649c
+Q5_K | gemv0 | 2748bdb0a6e6727e
+Q5_K | gemv1 | 22efd567727a6a73
+Q5_K | gemv2 | c921a4706cba4713
+Q5_K | gemv3 | e174d900a59e5978
+Q5_K | gemv0_indexed | b1d07101515b7d0e
+Q5_K | gemv1_indexed | bf842ff0a0eab920
+Q5_K | gemv_vec4 | 9a024bd36940185f
+Q5_K | register_tiled | 1c90b7e331f0becf
+Q5_K | register_tiled_indexed | 4cfbbac751c6837b
+Q5_K | register_tiled_narrow_f16 | c0041794f188f30d
+Q5_K | fragment_tiled_split_bf16 | 27e23c1a870d3c03
+Q5_K | run_sharing | FactorRun { factor_run: 32 } 6 bits
+Q6_K | row_gather | 9271aa04e5fc994d
+Q6_K | gemv0 | 427063617b8d66af
+Q6_K | gemv1 | 3230d77cd1236985
+Q6_K | gemv2 | aad0b1eefc8bee0b
+Q6_K | gemv3 | ec82283a793398c4
+Q6_K | gemv0_indexed | 85ec5380ee789fb1
+Q6_K | gemv1_indexed | 2ce74cea6d10178a
+Q6_K | gemv_vec4 | 8d034654e084b460
+Q6_K | register_tiled | 1e7b82d93d32e8d1
+Q6_K | register_tiled_indexed | 50ff54a00ed95be2
+Q6_K | register_tiled_narrow_f16 | 387e0ad941467b0f
+Q6_K | fragment_tiled_split_bf16 | 1abeae602672b7e3
+Q6_K | run_sharing | FactorRun { factor_run: 16 } 7 bits
+Iq2_Xs | row_gather | 4e3e4fc7a52e4252
+Iq2_Xs | gemv0 | cd640613c5f3cd5d
+Iq2_Xs | gemv1 | 81c1b85d8972f5cd
+Iq2_Xs | gemv2 | db62c3c4c5bd4503
+Iq2_Xs | gemv3 | 8dba645cb53d42a0
+Iq2_Xs | gemv0_indexed | 9dcd04554d88afbf
+Iq2_Xs | gemv1_indexed | 67e2ded758cfb58d
+Iq2_Xs | gemv_vec4 | 0052219384439db8
+Iq2_Xs | register_tiled | 4dacf7905948d6a2
+Iq2_Xs | register_tiled_indexed | f6e837abf6e6f1b8
+Iq2_Xs | register_tiled_narrow_f16 | 83279a40ac7d8ffe
+Iq2_Xs | fragment_tiled_split_bf16 | a7558da73c55124e
+Iq2_Xs | run_sharing | FactorRun { factor_run: 16 } 3 bits
+Iq3_Xxs | row_gather | 02a91ebecb7f161e
+Iq3_Xxs | gemv0 | 2d50b3a658112052
+Iq3_Xxs | gemv1 | 6feb4bb75dfaa70b
+Iq3_Xxs | gemv2 | dc87c5a840200d08
+Iq3_Xxs | gemv3 | 5926c5f45a47e5be
+Iq3_Xxs | gemv0_indexed | 1a83dd08c07c3f3a
+Iq3_Xxs | gemv1_indexed | 1c3537a7170fdda5
+Iq3_Xxs | gemv_vec4 | 00c6baa1a66a6336
+Iq3_Xxs | register_tiled | 2d93452b7ca91cc8
+Iq3_Xxs | register_tiled_indexed | ba2e392ff630d1f0
+Iq3_Xxs | register_tiled_narrow_f16 | 9cd089bd2fac50ad
+Iq3_Xxs | fragment_tiled_split_bf16 | 3aff23c2e0c25141
+Iq3_Xxs | run_sharing | FactorRun { factor_run: 32 } 4 bits
+Iq4_Nl | row_gather | 3eed9128612c2f57
+Iq4_Nl | gemv0 | 72a0ee1af2b9a461
+Iq4_Nl | gemv1 | 4b1d4f9762c57c45
+Iq4_Nl | gemv2 | 2243548047d8ce22
+Iq4_Nl | gemv3 | 86e6fd828c0756d8
+Iq4_Nl | gemv0_indexed | 4e0e86c75d7789d2
+Iq4_Nl | gemv1_indexed | 96ad881185b4da78
+Iq4_Nl | gemv_vec4 | 84e6a3068695f3e6
+Iq4_Nl | register_tiled | a2a8d97fa536b24f
+Iq4_Nl | register_tiled_indexed | d317ebb68538ef05
+Iq4_Nl | register_tiled_narrow_f16 | 5d0cf4412678cb2e
+Iq4_Nl | fragment_tiled_split_bf16 | 9585f46925ce19af
+Iq4_Nl | run_sharing | FactorRun { factor_run: 32 } 5 bits
+Iq3_S | row_gather | 17e3c366faad92d0
+Iq3_S | gemv0 | 1e8fd4a727d1d5db
+Iq3_S | gemv1 | cfc4d02c665d40ba
+Iq3_S | gemv2 | f41571548c008438
+Iq3_S | gemv3 | 9ac674331dc5850e
+Iq3_S | gemv0_indexed | de8ee92df2c92dc8
+Iq3_S | gemv1_indexed | 0f90f070b96eb544
+Iq3_S | gemv_vec4 | 67832f75f46fcdaf
+Iq3_S | register_tiled | 5aaae26e79d014c2
+Iq3_S | register_tiled_indexed | 528ab0d4cb91c37a
+Iq3_S | register_tiled_narrow_f16 | 3aa78d5b1094b493
+Iq3_S | fragment_tiled_split_bf16 | 3715daf1cceaee7e
+Iq3_S | run_sharing | FactorRun { factor_run: 32 } 4 bits
+Iq4_Xs | row_gather | a42b4b889f513fee
+Iq4_Xs | gemv0 | 33fadd7ab8a235fd
+Iq4_Xs | gemv1 | f0e8784e202dd1fe
+Iq4_Xs | gemv2 | 44b7f09588b4caab
+Iq4_Xs | gemv3 | b2262946ea97d835
+Iq4_Xs | gemv0_indexed | 50561bb5c9f9eb4b
+Iq4_Xs | gemv1_indexed | 699488d53807081c
+Iq4_Xs | gemv_vec4 | 6d0d168db05ab2b0
+Iq4_Xs | register_tiled | 3c9947ac70714347
+Iq4_Xs | register_tiled_indexed | 3fe01831d513ab9d
+Iq4_Xs | register_tiled_narrow_f16 | d29089272232d474
+Iq4_Xs | fragment_tiled_split_bf16 | 0d3d36c645442d61
+Iq4_Xs | run_sharing | FactorRun { factor_run: 32 } 5 bits
+Bf16 | row_gather | 715e096dd33d3bb9
+Bf16 | gemv0 | f895a34a5fbb735f
+Bf16 | gemv1 | cf2ba2187947af58
+Bf16 | gemv2 | 6667e998edc103b8
+Bf16 | gemv3 | cbe1160256652b07
+Bf16 | gemv0_indexed | 1e74bd0399b719ea
+Bf16 | gemv1_indexed | a765041f9643d80a
+Bf16 | gemv_vec4 | 9964c34f1d62a157
+Bf16 | register_tiled | d58b52a0eba4fa96
+Bf16 | register_tiled_indexed | 112e94a0ecd671ca
+Bf16 | register_tiled_narrow_f16 | 4ae85a8dfd2c5c0b
+Bf16 | fragment_tiled_split_bf16 | 9da91ad471a6a3ab
+Bf16 | run_sharing | FactorRun { factor_run: 1 } 16 bits
+Mxfp4 | row_gather | e05729b5c1651d12
+Mxfp4 | gemv0 | 6f2988b40d59eb57
+Mxfp4 | gemv1 | 4291afbc1932b216
+Mxfp4 | gemv2 | e8b7f321113a3506
+Mxfp4 | gemv3 | c9da2df94bcfd44b
+Mxfp4 | gemv0_indexed | 9dcc2a819a6ef5f5
+Mxfp4 | gemv1_indexed | 7d31ebc6b03b0c9b
+Mxfp4 | gemv_vec4 | 7a39a9d3f76a8bde
+Mxfp4 | register_tiled | 2b309265b54ecb7a
+Mxfp4 | register_tiled_indexed | 58b23f17a6fbcfc1
+Mxfp4 | register_tiled_narrow_f16 | f8be584418fb68ae
+Mxfp4 | fragment_tiled_split_bf16 | 1dfe044b2ad3c135
+Mxfp4 | run_sharing | FactorRun { factor_run: 32 } 5 bits
+E4m3PerChannel { scale: F32 } | row_gather | refused: packed_kernel: E4m3PerChannel { scale: F32 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
+E4m3PerChannel { scale: F32 } | gemv0 | eba82dbadfb8f941
+E4m3PerChannel { scale: F32 } | gemv1 | afb0477048c10a19
+E4m3PerChannel { scale: F32 } | gemv2 | abe2baa18747b8c9
+E4m3PerChannel { scale: F32 } | gemv3 | 52f5410904f8ac88
+E4m3PerChannel { scale: F32 } | gemv0_indexed | 9bdcbc0ea516ea6a
+E4m3PerChannel { scale: F32 } | gemv1_indexed | cc5c3fae50616797
+E4m3PerChannel { scale: F32 } | gemv_vec4 | 969546f5a3172b29
+E4m3PerChannel { scale: F32 } | register_tiled | 58c090a42aaf4164
+E4m3PerChannel { scale: F32 } | register_tiled_indexed | ce9a6ae94426f693
+E4m3PerChannel { scale: F32 } | register_tiled_narrow_f16 | d1a4342118191a9a
+E4m3PerChannel { scale: F32 } | fragment_tiled_split_bf16 | 4cf44189cb97aa96
+E4m3PerChannel { scale: F32 } | run_sharing | Elementwise 8 bits
+E4m3PerChannel { scale: Bf16 } | row_gather | refused: packed_kernel: E4m3PerChannel { scale: Bf16 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
+E4m3PerChannel { scale: Bf16 } | gemv0 | b8c27a3fd548e076
+E4m3PerChannel { scale: Bf16 } | gemv1 | 6420a9e208f7f057
+E4m3PerChannel { scale: Bf16 } | gemv2 | 3ba72db3235dfd5b
+E4m3PerChannel { scale: Bf16 } | gemv3 | 9859eaa1876ea6fd
+E4m3PerChannel { scale: Bf16 } | gemv0_indexed | edf9cda8dfb13e80
+E4m3PerChannel { scale: Bf16 } | gemv1_indexed | ecf61b7e91c1f84c
+E4m3PerChannel { scale: Bf16 } | gemv_vec4 | f2de3af70dd4c489
+E4m3PerChannel { scale: Bf16 } | register_tiled | bd7dcf116e21010c
+E4m3PerChannel { scale: Bf16 } | register_tiled_indexed | d303a7b247ed4187
+E4m3PerChannel { scale: Bf16 } | register_tiled_narrow_f16 | 2ad398464fcfe176
+E4m3PerChannel { scale: Bf16 } | fragment_tiled_split_bf16 | b1e42d71c2a2008c
+E4m3PerChannel { scale: Bf16 } | run_sharing | Elementwise 8 bits
+E4m3PerChannel { scale: E8m0 } | row_gather | refused: packed_kernel: E4m3PerChannel { scale: E8m0 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
+E4m3PerChannel { scale: E8m0 } | gemv0 | baf46d452869aaf0
+E4m3PerChannel { scale: E8m0 } | gemv1 | 36e1832972f5e5d1
+E4m3PerChannel { scale: E8m0 } | gemv2 | c057c5a672ea57db
+E4m3PerChannel { scale: E8m0 } | gemv3 | 46032601a7969537
+E4m3PerChannel { scale: E8m0 } | gemv0_indexed | 10b62f3a0ddf7dee
+E4m3PerChannel { scale: E8m0 } | gemv1_indexed | 84a0ab314eec015f
+E4m3PerChannel { scale: E8m0 } | gemv_vec4 | 2b75a8dfa3a7202d
+E4m3PerChannel { scale: E8m0 } | register_tiled | 3d3d31f6662ad018
+E4m3PerChannel { scale: E8m0 } | register_tiled_indexed | 137a0fb538d3d960
+E4m3PerChannel { scale: E8m0 } | register_tiled_narrow_f16 | 0bc6eedbe4b2ba91
+E4m3PerChannel { scale: E8m0 } | fragment_tiled_split_bf16 | 2c715bc93123a77b
+E4m3PerChannel { scale: E8m0 } | run_sharing | Elementwise 8 bits
+E4m3Block128 { scale: F32 } | row_gather | refused: packed_kernel: E4m3Block128 { scale: F32 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
+E4m3Block128 { scale: F32 } | gemv0 | 6e3f3b1e56f80bc9
+E4m3Block128 { scale: F32 } | gemv1 | a9bad1ab67e783c2
+E4m3Block128 { scale: F32 } | gemv2 | 20c2bb03eef95d19
+E4m3Block128 { scale: F32 } | gemv3 | 664101b29d2f3079
+E4m3Block128 { scale: F32 } | gemv0_indexed | 99d9e12fd5c1653d
+E4m3Block128 { scale: F32 } | gemv1_indexed | 4d30cb7925120244
+E4m3Block128 { scale: F32 } | gemv_vec4 | 7f9ab3efc96f1e51
+E4m3Block128 { scale: F32 } | register_tiled | b2960cbedcced976
+E4m3Block128 { scale: F32 } | register_tiled_indexed | 16183520c269bb1e
+E4m3Block128 { scale: F32 } | register_tiled_narrow_f16 | c050018fe94e1b2b
+E4m3Block128 { scale: F32 } | fragment_tiled_split_bf16 | a32533193890d452
+E4m3Block128 { scale: F32 } | run_sharing | Elementwise 8 bits
+E4m3Block128 { scale: Bf16 } | row_gather | refused: packed_kernel: E4m3Block128 { scale: Bf16 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
+E4m3Block128 { scale: Bf16 } | gemv0 | 836463eecfe0f4ce
+E4m3Block128 { scale: Bf16 } | gemv1 | 73d61aa2bc6df885
+E4m3Block128 { scale: Bf16 } | gemv2 | 658b5f8ff846736d
+E4m3Block128 { scale: Bf16 } | gemv3 | 122f76406979c9f2
+E4m3Block128 { scale: Bf16 } | gemv0_indexed | 5ee82b7d486a915b
+E4m3Block128 { scale: Bf16 } | gemv1_indexed | 6fbc9dea59da0cc5
+E4m3Block128 { scale: Bf16 } | gemv_vec4 | 9653c3713ca01112
+E4m3Block128 { scale: Bf16 } | register_tiled | b5a9145650ae5a52
+E4m3Block128 { scale: Bf16 } | register_tiled_indexed | 941a9b6d45186e03
+E4m3Block128 { scale: Bf16 } | register_tiled_narrow_f16 | 0f7cbb2558fe0ebd
+E4m3Block128 { scale: Bf16 } | fragment_tiled_split_bf16 | 4f138baa25bc5025
+E4m3Block128 { scale: Bf16 } | run_sharing | Elementwise 8 bits
+E4m3Block128 { scale: E8m0 } | row_gather | refused: packed_kernel: E4m3Block128 { scale: E8m0 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
+E4m3Block128 { scale: E8m0 } | gemv0 | e1e1519f087316b5
+E4m3Block128 { scale: E8m0 } | gemv1 | 5640e2552ef7baa8
+E4m3Block128 { scale: E8m0 } | gemv2 | 241a67732a87af4a
+E4m3Block128 { scale: E8m0 } | gemv3 | b57923446945f1ce
+E4m3Block128 { scale: E8m0 } | gemv0_indexed | 7b76d04ec93928f2
+E4m3Block128 { scale: E8m0 } | gemv1_indexed | 884c64e40131124d
+E4m3Block128 { scale: E8m0 } | gemv_vec4 | 288594ed3a9be7df
+E4m3Block128 { scale: E8m0 } | register_tiled | c6c88b66ae9cf1d2
+E4m3Block128 { scale: E8m0 } | register_tiled_indexed | 7cacedd51eb5a2d2
+E4m3Block128 { scale: E8m0 } | register_tiled_narrow_f16 | e6b1e0ddf210edb6
+E4m3Block128 { scale: E8m0 } | fragment_tiled_split_bf16 | b74453e4c04b58c6
+E4m3Block128 { scale: E8m0 } | run_sharing | Elementwise 8 bits
+E2m1Row32 | row_gather | refused: packed_kernel: E2m1Row32: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
+E2m1Row32 | gemv0 | d84c6c14f12c588a
+E2m1Row32 | gemv1 | d08ce8de93a89b67
+E2m1Row32 | gemv2 | ff38520cbd7d4033
+E2m1Row32 | gemv3 | 19ffd157ea332d18
+E2m1Row32 | gemv0_indexed | ec1f1015f9168feb
+E2m1Row32 | gemv1_indexed | b96427548dbd0038
+E2m1Row32 | gemv_vec4 | 5fdf9c8339967473
+E2m1Row32 | register_tiled | 5dcf0d86106b539c
+E2m1Row32 | register_tiled_indexed | d465950127596207
+E2m1Row32 | register_tiled_narrow_f16 | 4fa72b20d57d2bd8
+E2m1Row32 | fragment_tiled_split_bf16 | 3ff3fb0a5a890763
+E2m1Row32 | run_sharing | Elementwise 4 bits
+Gptq { groups: Contiguous { size: 128 } } | row_gather | refused: packed_kernel: Gptq { groups: Contiguous { size: 128 } }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
+Gptq { groups: Contiguous { size: 128 } } | gemv0 | 152e202dcd30b8dc
+Gptq { groups: Contiguous { size: 128 } } | gemv1 | 504c5b3b4a5cad2b
+Gptq { groups: Contiguous { size: 128 } } | gemv2 | c30cbb210ba1531b
+Gptq { groups: Contiguous { size: 128 } } | gemv3 | 14076e79b6e760a6
+Gptq { groups: Contiguous { size: 128 } } | gemv0_indexed | f7d61cb5474300a9
+Gptq { groups: Contiguous { size: 128 } } | gemv1_indexed | 38830d4229517716
+Gptq { groups: Contiguous { size: 128 } } | gemv_vec4 | ae99c9427732a3c4
+Gptq { groups: Contiguous { size: 128 } } | register_tiled | 50f49618363bcb8e
+Gptq { groups: Contiguous { size: 128 } } | register_tiled_indexed | fb528661f20380ba
+Gptq { groups: Contiguous { size: 128 } } | register_tiled_narrow_f16 | 387a3fa02fefd7b8
+Gptq { groups: Contiguous { size: 128 } } | fragment_tiled_split_bf16 | 420e544ebed8d101
+Gptq { groups: Contiguous { size: 128 } } | run_sharing | Elementwise 4 bits
+Gptq { groups: Indexed { groups: 32 } } | row_gather | refused: packed_kernel: Gptq { groups: Indexed { groups: 32 } }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
+Gptq { groups: Indexed { groups: 32 } } | gemv0 | 0209fd96bc855670
+Gptq { groups: Indexed { groups: 32 } } | gemv1 | 3bad23a512586dca
+Gptq { groups: Indexed { groups: 32 } } | gemv2 | 1044dd139eb07547
+Gptq { groups: Indexed { groups: 32 } } | gemv3 | e27f69352916fcd6
+Gptq { groups: Indexed { groups: 32 } } | gemv0_indexed | 74849d0e558cc598
+Gptq { groups: Indexed { groups: 32 } } | gemv1_indexed | 5a1a8f63ec5c203b
+Gptq { groups: Indexed { groups: 32 } } | gemv_vec4 | 9ba16edf2d1c7047
+Gptq { groups: Indexed { groups: 32 } } | register_tiled | e12495c6ab9035d3
+Gptq { groups: Indexed { groups: 32 } } | register_tiled_indexed | 33d4c024d385742e
+Gptq { groups: Indexed { groups: 32 } } | register_tiled_narrow_f16 | ed529dd13540d96a
+Gptq { groups: Indexed { groups: 32 } } | fragment_tiled_split_bf16 | bfaaeae0923ba658
+Gptq { groups: Indexed { groups: 32 } } | run_sharing | Elementwise 4 bits
+Awq { group_size: 128 } | row_gather | refused: packed_kernel: Awq { group_size: 128 }: planar RowGather (only Contraction is admitted for planar storage; no production consumer gathers planar-format rows today)
+Awq { group_size: 128 } | gemv0 | f121aed6878ca6e7
+Awq { group_size: 128 } | gemv1 | 9421f37b89b7c146
+Awq { group_size: 128 } | gemv2 | be6d91f51e698cd2
+Awq { group_size: 128 } | gemv3 | 876f1edecdfa8609
+Awq { group_size: 128 } | gemv0_indexed | 392ca8fedf3360c6
+Awq { group_size: 128 } | gemv1_indexed | 6442b87d5cccbc42
+Awq { group_size: 128 } | gemv_vec4 | 0cdc08fcd245c5bd
+Awq { group_size: 128 } | register_tiled | 95014c9572b711d5
+Awq { group_size: 128 } | register_tiled_indexed | 2f85c209868d93b9
+Awq { group_size: 128 } | register_tiled_narrow_f16 | d57d9b3c3e284d91
+Awq { group_size: 128 } | fragment_tiled_split_bf16 | 81a78d71da266f9f
+Awq { group_size: 128 } | run_sharing | Elementwise 4 bits

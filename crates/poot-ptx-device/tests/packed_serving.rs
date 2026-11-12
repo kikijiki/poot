@@ -35,7 +35,8 @@ use poot_graph_ir::{
 use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
 use poot_graph_plan::{CompileOptions, IndexedRows, Target, compile};
 use poot_ptx_device::PtxDevice;
-use poot_quant::format::{GroupMap, WeightFormat};
+use poot_quant::format::WeightFormat;
+use poot_quant::test_support::formats::{packed_block_formats, packed_formats};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_quant::{PackedComponentRef, PackedPayload, StoredBytes};
 use poot_runtime_common::DeviceBackend;
@@ -49,27 +50,10 @@ const K: usize = 256;
 const OUT: usize = 8;
 const STEPS: usize = 4;
 
+/// Every packed format of the shared list: the block layouts (K-quants, block-32, the lattice quants with a
+/// constant grid table and a sign field per block) and the planar cells.
 fn formats() -> Vec<WeightFormat> {
-    let nz = |n| std::num::NonZeroUsize::new(n).unwrap();
-    vec![
-        WeightFormat::Q4_K,
-        WeightFormat::Q8_0,
-        WeightFormat::Awq { group_size: nz(64) },
-        WeightFormat::Gptq {
-            groups: GroupMap::Indexed { groups: nz(4) },
-        },
-        // The lattice quants: a constant grid table and a sign field per block.
-        WeightFormat::Iq2_Xs,
-        WeightFormat::Iq3_Xxs,
-        WeightFormat::Iq3_S,
-    ]
-}
-
-/// The layouts of a routed expert table: [`formats`] and the codebook-scaled 4-bit block format.
-fn expert_formats() -> Vec<WeightFormat> {
-    let mut formats = formats();
-    formats.push(WeightFormat::Mxfp4);
-    formats
+    packed_formats()
 }
 
 /// The decode column one step selects.
@@ -233,7 +217,7 @@ fn packed_decode_through_resident_path_is_bit_exact_on_ptx() {
         return;
     };
     for (seed, format) in formats().into_iter().enumerate() {
-        let owner = Arc::new(poot_quant::test_support::packed::random_payload(
+        let owner = Arc::new(poot_quant::test_support::packed::prescribed_scale_payload(
             format,
             [OUT, K],
             seed as u64 + 11,
@@ -283,7 +267,7 @@ fn packed_decode_through_capture_and_replay_is_bit_exact_on_ptx() {
         return;
     };
     for (seed, format) in formats().into_iter().enumerate() {
-        let owner = Arc::new(poot_quant::test_support::packed::random_payload(
+        let owner = Arc::new(poot_quant::test_support::packed::prescribed_scale_payload(
             format,
             [OUT, K],
             seed as u64 + 47,
@@ -343,7 +327,7 @@ fn packed_prefill_through_serving_path_is_bit_exact_on_ptx() {
         return;
     };
     for (seed, format) in formats().into_iter().enumerate() {
-        let owner = Arc::new(poot_quant::test_support::packed::random_payload(
+        let owner = Arc::new(poot_quant::test_support::packed::prescribed_scale_payload(
             format,
             [OUT, K],
             seed as u64 + 29,
@@ -627,7 +611,7 @@ fn packed_indexed_contraction_runs_bit_exact_on_ptx() {
     let Some(mut ptx) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
         return;
     };
-    for format in expert_formats() {
+    for format in formats() {
         run_indexed_case(
             &mut ptx,
             format,
@@ -651,7 +635,7 @@ fn a_split_expert_stack_runs_bit_exact_on_ptx() {
     let Some(mut ptx) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
         return;
     };
-    for format in expert_formats() {
+    for format in formats() {
         run_indexed_case(
             &mut ptx,
             format,
@@ -714,7 +698,7 @@ fn packed_indexed_prefill_runs_bit_exact_on_ptx() {
     let Some(mut ptx) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
         return;
     };
-    for format in expert_formats() {
+    for format in formats() {
         run_indexed_case(
             &mut ptx,
             format,
@@ -758,11 +742,8 @@ fn packed_embedding_row_gather_is_bit_exact_on_ptx() {
         return;
     };
     const VOCAB: usize = 12;
-    for (seed, format) in [WeightFormat::Q4_K, WeightFormat::Q8_0, WeightFormat::Q6_K]
-        .into_iter()
-        .enumerate()
-    {
-        let owner = Arc::new(poot_quant::test_support::packed::random_payload(
+    for (seed, format) in packed_block_formats().into_iter().enumerate() {
+        let owner = Arc::new(poot_quant::test_support::packed::prescribed_scale_payload(
             format,
             [VOCAB, K],
             seed as u64 + 61,
@@ -912,20 +893,10 @@ fn dense_e4m3_row_gather_is_bit_exact_on_ptx() {
 
 // --- SC-001 and SC-003 of POOT-728: dense activations through the packed loaders, and a packed head's epilogue ---
 
-/// The packed formats of the loader rows: the K-quant and block-32 GGUF layouts and the FP8 planar cells (a
-/// per-row and a 128x128-block scale), so the block-storage and planar front ends both serve every row.
+/// The packed formats of the loader rows: every packed format of the shared list, so the block-storage and
+/// planar front ends both serve every row.
 fn loader_formats() -> Vec<WeightFormat> {
-    use poot_quant::format::ScaleEncoding;
-    vec![
-        WeightFormat::Q4_K,
-        WeightFormat::Q8_0,
-        WeightFormat::E4m3PerChannel {
-            scale: ScaleEncoding::Bf16,
-        },
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::Bf16,
-        },
-    ]
+    packed_formats()
 }
 
 /// A deterministic fill in `[-0.5, 0.5)` with no zero element, so a dropped term changes every output.

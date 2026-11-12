@@ -116,6 +116,13 @@ ir_node! {
     }
 }
 
+/// The byte alignment every buffer an executor binds to a kernel parameter starts at (POOT-1405): an executor binds
+/// a buffer at its allocation base, never at an offset into it, so this is a floor every native allocator meets
+/// (`cuMemAlloc` returns 256-byte aligned memory). A kernel relies on it: an [`Rvalue::VectorLoad`] that proves its
+/// element index is a multiple of its `align_bytes` is stamped with that alignment, at most this one. An executor
+/// whose binding would break it refuses the dispatch (the PTX runtime's kernel-argument packing).
+pub const BUFFER_PARAM_ALIGN: u64 = 16;
+
 /// The lane count of a collective scope: one 32-lane subgroup (an NVPTX warp, a gfx11 wave32, a Vulkan
 /// subgroup of size 32), or half of a wider one. Every `Wmma*` statement and every
 /// [`Rvalue::SubgroupShuffleXor`] is executed by all of these lanes together or by none; the verifier proves
@@ -129,6 +136,15 @@ impl Ty {
             Ty::F16 | Ty::BF16 | Ty::F32 | Ty::F64 => true,
             Ty::Vec { elem, .. } => elem.is_float(),
             _ => false,
+        }
+    }
+    /// The bytes one buffer element of this scalar type occupies, `None` for a type no buffer holds.
+    pub fn buffer_element_bytes(&self) -> Option<u32> {
+        match self {
+            Ty::F16 | Ty::BF16 => Some(2),
+            Ty::F32 | Ty::I32 | Ty::U32 => Some(4),
+            Ty::F64 => Some(8),
+            _ => None,
         }
     }
     /// Whether the type is a signed integer scalar, or a vector of one.
@@ -523,17 +539,22 @@ ir_node! {
             desired: Operand,
         },
         /// Load `lanes` contiguous elements of a scalar-element slice as one `Ty::Vec` value (spec 134,
-        /// FR-001). `place` must project a slice-typed local at `[Deref, Index(i)]`; `i` is the vector-group
-        /// index (elements `[i*lanes, i*lanes+lanes)`), not a scalar element index. `lanes`/`elem` come from
-        /// the destination local's declared `Ty::Vec`. Codegen stamps the group's natural alignment
-        /// (`lanes` times the element size): group `i` is aligned because every buffer an executor binds
-        /// starts on a 16-byte boundary (the binding contract in `poot-executor`). Whether one param may
-        /// also be read element by element is the target's `poot_codegen::Capability::mixed_vector_reads`:
-        /// NVPTX lowers both on one pointer, SPIR-V declares a vector-read param as a vector resource
-        /// (the two-binding mechanism, FR-004b, is not implemented).
+        /// FR-001). `place` must project a slice-typed local at `[Deref, Index(i)]`; `i` is the **element**
+        /// index of the first lane (elements `[i, i+lanes)`). `lanes`/`elem` come from the destination
+        /// local's declared `Ty::Vec`. `align_bytes` is the alignment the emitter proved for the load's byte
+        /// address: `i * size_of(elem)` is a multiple of it, and the buffer itself starts on
+        /// [`BUFFER_PARAM_ALIGN`]. The verifier bounds it (a power of two, from the element size up to
+        /// [`BUFFER_PARAM_ALIGN`]); the interpreter faults a load whose index breaks it, so a wrong proof is a
+        /// test failure, not a device fault. Codegen stamps it on the load: a load as wide as its alignment is
+        /// one vector instruction, a narrower proof keeps a vector value but is no wider than that
+        /// alignment allows. Whether one param may also be read element by element, with the load still one
+        /// vector load, is the target's `poot_codegen::Capability::mixed_vector_reads`; where it is absent
+        /// codegen reads the lanes as scalars, with the same values.
         VectorLoad {
             /// The slice element group loaded.
             place: Place,
+            /// The alignment, in bytes, of the load's address.
+            align_bytes: u32,
         },
         /// Broadcast a scalar operand to every lane of the destination's declared `Ty::Vec` type.
         VectorSplat(Operand),
@@ -739,8 +760,9 @@ ir_node! {
             array: u8,
         },
         /// Store a `Ty::Vec` operand as `lanes` contiguous elements of a scalar-element slice at `place`'s
-        /// vector-group index (counterpart of `Rvalue::VectorLoad`; same indexing and FR-004b caveat).
-        /// `lanes`/`elem` come from `value`'s type.
+        /// vector-group index (elements `[i*lanes, i*lanes+lanes)`), naturally aligned like any buffer group.
+        /// Unlike [`Rvalue::VectorLoad`] the index counts groups, not elements. `lanes`/`elem` come from
+        /// `value`'s type.
         VectorStore {
             /// The slice element group stored to.
             place: Place,
@@ -1358,6 +1380,18 @@ mod verify {
         ShuffleMaskOutOfRange {
             /// The mask the shuffle names.
             mask: u32,
+        },
+        /// A [`Rvalue::VectorLoad`] `align_bytes` that is not a power of two between the element size and
+        /// [`BUFFER_PARAM_ALIGN`]: no buffer binding can back the claim.
+        #[error(
+            "vector load alignment {align_bytes} is not a power of two from {elem_bytes} up to {}",
+            crate::BUFFER_PARAM_ALIGN
+        )]
+        VectorLoadAlignment {
+            /// The alignment the load claims.
+            align_bytes: u32,
+            /// The bytes of one lane.
+            elem_bytes: u32,
         },
         /// A fragment element access names an element a lane does not hold
         /// (`accumulator_map::ELEMENTS_PER_LANE` per lane).
@@ -2065,7 +2099,7 @@ mod verify {
                     expect_ty("desired value", &element.ty, &self.operand_ty(desired)?)?;
                     Ok(element.ty)
                 }
-                Rvalue::VectorLoad { place } => {
+                Rvalue::VectorLoad { place, align_bytes } => {
                     let element =
                         self.element(place)?
                             .ok_or_else(|| VerifyErrorKind::MalformedPlace {
@@ -2075,6 +2109,21 @@ mod verify {
                     match dest {
                         Ty::Vec { elem, .. } => {
                             expect_ty("vector load lane", &element.ty, elem)?;
+                            let elem_bytes = elem.buffer_element_bytes().ok_or_else(|| {
+                                VerifyErrorKind::InvalidOperandType {
+                                    what: "vector load lane",
+                                    found: (**elem).clone(),
+                                }
+                            })?;
+                            if !align_bytes.is_power_of_two()
+                                || *align_bytes < elem_bytes
+                                || u64::from(*align_bytes) > crate::BUFFER_PARAM_ALIGN
+                            {
+                                return Err(VerifyErrorKind::VectorLoadAlignment {
+                                    align_bytes: *align_bytes,
+                                    elem_bytes,
+                                });
+                            }
                             Ok(dest.clone())
                         }
                         other => Err(VerifyErrorKind::InvalidOperandType {
@@ -2842,7 +2891,7 @@ mod verify {
                 operand_reads(if_true, f);
                 operand_reads(if_false, f);
             }
-            Rvalue::Len(place) | Rvalue::VectorLoad { place } => place_reads(place, f),
+            Rvalue::Len(place) | Rvalue::VectorLoad { place, .. } => place_reads(place, f),
             Rvalue::WorkgroupLocalRead { idx, .. } | Rvalue::ConstantTableRead { idx, .. } => {
                 operand_reads(idx, f)
             }

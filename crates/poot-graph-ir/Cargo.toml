@@ -26,6 +26,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 poot-test-util.workspace = true
+# `test_support::formats`: the shared format list the format-parametrized rows iterate.
+poot-quant = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

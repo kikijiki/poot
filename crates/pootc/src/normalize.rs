@@ -436,7 +436,7 @@ fn rewrite_rvalue(rv: &mut Rvalue, aliases: &HashMap<u32, Place>) {
             rewrite_operand(desired, aliases);
         }
         // Spec 134 P1: vector ops are hand-built in kernelgen (like WMMA), never produced by MIR lowering; rewritten for completeness.
-        Rvalue::VectorLoad { place } => rewrite_place(place, aliases),
+        Rvalue::VectorLoad { place, .. } => rewrite_place(place, aliases),
         Rvalue::VectorSplat(op) | Rvalue::VectorExtract { vector: op, .. } => {
             rewrite_operand(op, aliases)
         }

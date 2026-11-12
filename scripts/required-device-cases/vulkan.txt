@@ -100,6 +100,7 @@ poot-vulkan-device::parity	packed_linears_and_the_indexed_expert_contraction_mat
 poot-vulkan-device::parity	paged_attention_reads_the_pools_in_place_and_matches_the_oracle_on_vulkan
 poot-vulkan-device::parity	select_is_bitwise_on_vulkan
 poot-vulkan-device::parity	selected_attention_reads_exactly_the_selected_blocks_on_vulkan
+poot-vulkan-device::parity	split_kv_decode_is_capacity_independent_on_vulkan
 poot-vulkan-device::parity	split_kv_decode_matches_the_oracle_on_vulkan
 poot-vulkan-device::parity	split_kv_decode_replay_equals_the_recording_step_on_vulkan
 poot-vulkan-device::parity	stable_rank_ranks_what_the_plain_sort_ranks_on_vulkan
@@ -111,3 +112,4 @@ poot-vulkan-runtime::device_caps	device_caps_is_plausible_on_the_real_device
 poot-vulkan-runtime::device_caps	raw_vulkan_reports_exactly_an_opaque_f16_fragment_on_this_box
 poot-vulkan-runtime::device_caps	the_reference_caps_of_the_raw_vulkan_column_are_what_the_radv_device_reports
 poot-vulkan-runtime::run_add	add_runs_on_gpu_via_raw_vulkan
+poot-vulkan-runtime::vector_load	u32x4_vector_load_matches_scalar_loads_on_vulkan

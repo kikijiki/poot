@@ -241,13 +241,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "rocm dense-decode-head-bf16, receipt 2c8f8aedb21e",
+     "receipt": "rocm dense-decode-head-bf16, receipt 00d2f0e99d72",
      "regime": "dense bandwidth decode of a vocabulary head (151936 outputs over K 1024) over a checkpoint-order bf16 weight",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 1500.541,
-      "median": 1481.475,
-      "min": 1467.119,
+      "max": 1532.68,
+      "median": 1490.772,
+      "min": 1479.13,
       "n": 9
      },
      "storage": "bf16"
@@ -283,13 +283,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "rocm dense-decode-head-bf16-narrow, receipt 334e233dd3b8",
+     "receipt": "rocm dense-decode-head-bf16-narrow, receipt 5e2de6b31f42",
      "regime": "dense bandwidth decode of a vocabulary head (151936 outputs over K 1024) over a checkpoint-order bf16 weight, narrow operands",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 1630.244,
-      "median": 1481.174,
-      "min": 1463.431,
+      "max": 1600.096,
+      "median": 1503.836,
+      "min": 1466.677,
       "n": 9
      },
      "storage": "bf16"
@@ -328,13 +328,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "rocm expert-prefill-packed-iq2xs-up, receipt e0bb77204d97",
+     "receipt": "rocm expert-prefill-packed-iq2xs-up, receipt 393bdef48e0c",
      "regime": "MoE prefill routed expert projection over a packed IQ2_XS expert stack at a wide mixture's dimensions (128 tokens, each to 10 of 512 experts, K 2560, N 640: about 2.5 routed rows per expert), exact operands",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 5355.421,
-      "median": 5306.771,
-      "min": 5229.886,
+      "max": 5490.952,
+      "median": 5346.792,
+      "min": 5206.429,
       "n": 9
      },
      "storage": "iq2_xs"
@@ -376,13 +376,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "rocm expert-prefill-packed-iq2xs-up-narrow, receipt c3331c3c2ee6",
+     "receipt": "rocm expert-prefill-packed-iq2xs-up-narrow, receipt ee5f4f6b3cc8",
      "regime": "The same packed IQ2_XS routed projection with narrow operands (the matrix unit)",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 5822.125,
-      "median": 5736.044,
-      "min": 5635.446,
+      "max": 4886.29,
+      "median": 4780.793,
+      "min": 4621.053,
       "n": 9
      },
      "storage": "iq2_xs"
@@ -424,13 +424,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "rocm expert-prefill-qwen3moe-up, receipt 07f7d3388409",
+     "receipt": "rocm expert-prefill-qwen3moe-up, receipt 3704f1654eec",
      "regime": "MoE prefill routed expert projection at Qwen3-MoE dimensions (512 tokens, each to 8 of 128 experts) over a checkpoint-order bf16 expert stack, exact operands",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 22874.698,
-      "median": 21149.055,
-      "min": 18742.868,
+      "max": 23280.575,
+      "median": 22752.997,
+      "min": 18425.203,
       "n": 9
      },
      "storage": "bf16"
@@ -472,13 +472,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "rocm expert-prefill-qwen3moe-up-narrow, receipt b792fce2118b",
+     "receipt": "rocm expert-prefill-qwen3moe-up-narrow, receipt 8623e8deeb07",
      "regime": "MoE prefill routed expert projection at Qwen3-MoE dimensions (512 tokens, each to 8 of 128 experts) over a checkpoint-order bf16 expert stack, narrow operands",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 15599.44,
-      "median": 14118.456,
-      "min": 13282.811,
+      "max": 14631.689,
+      "median": 12457.778,
+      "min": 10977.406,
       "n": 9
      },
      "storage": "bf16"
@@ -561,13 +561,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": 2048,
-     "receipt": "rocm prefill-attention-2048, receipt 50b5b3164776",
+     "receipt": "rocm prefill-attention-2048, receipt 5a37468b19f0",
      "regime": "causal prefill attention, GQA",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 14049.139,
-      "median": 12900.67,
-      "min": 12092.367,
+      "max": 11522.126,
+      "median": 8747.22,
+      "min": 8294.832,
       "n": 9
      },
      "storage": "f32"
@@ -597,6 +597,75 @@
     },
     {
      "backend": "rocm",
+     "case": "prefill-attention-2048-kvf16",
+     "dimensions": {
+      "cap": 2048,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 2048
+     },
+     "driver": "host kernel 7.3.0",
+     "live_context": 2048,
+     "receipt": "rocm prefill-attention-2048-kvf16, receipt 95ef1cd8448a",
+     "regime": "causal prefill attention, GQA, f16 KV cache",
+     "series": "poot (ROCm)",
+     "step_us": {
+      "max": 9953.098,
+      "median": 9220.817,
+      "min": 8899.074,
+      "n": 9
+     },
+     "storage": "f16"
+    },
+    {
+     "backend": "rocm",
+     "case": "prefill-attention-2048-kvf16-narrow",
+     "dimensions": {
+      "cap": 2048,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 2048
+     },
+     "driver": "host kernel 7.3.0",
+     "live_context": 2048,
+     "receipt": "rocm prefill-attention-2048-kvf16-narrow, receipt 98cf41bd8a10",
+     "regime": "causal prefill attention, GQA, narrow operands on matrix units, f16 KV cache",
+     "series": "poot (ROCm)",
+     "step_us": {
+      "max": 8003.106,
+      "median": 6837.243,
+      "min": 6159.584,
+      "n": 9
+     },
+     "storage": "f16"
+    },
+    {
+     "backend": "rocm",
+     "case": "prefill-attention-2048-narrow",
+     "dimensions": {
+      "cap": 2048,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 2048
+     },
+     "driver": "host kernel 7.3.0",
+     "live_context": 2048,
+     "receipt": "rocm prefill-attention-2048-narrow, receipt fff837a5fe15",
+     "regime": "causal prefill attention, GQA, narrow operands on matrix units",
+     "series": "poot (ROCm)",
+     "step_us": {
+      "max": 10123.126,
+      "median": 6551.949,
+      "min": 5634.811,
+      "n": 9
+     },
+     "storage": "f32"
+    },
+    {
+     "backend": "rocm",
      "case": "prefill-attention-8192",
      "dimensions": {
       "cap": 8192,
@@ -607,13 +676,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": 8192,
-     "receipt": "rocm prefill-attention-8192, receipt a20cb51399c6",
+     "receipt": "rocm prefill-attention-8192, receipt 08d955db89e6",
      "regime": "causal prefill attention, GQA",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 198778.388,
-      "median": 196375.191,
-      "min": 175121.65,
+      "max": 107913.086,
+      "median": 101854.942,
+      "min": 98656.753,
       "n": 9
      },
      "storage": "f32"
@@ -643,6 +712,75 @@
     },
     {
      "backend": "rocm",
+     "case": "prefill-attention-8192-kvf16",
+     "dimensions": {
+      "cap": 8192,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 8192
+     },
+     "driver": "host kernel 7.3.0",
+     "live_context": 8192,
+     "receipt": "rocm prefill-attention-8192-kvf16, receipt 567b8edb0961",
+     "regime": "causal prefill attention, GQA, f16 KV cache",
+     "series": "poot (ROCm)",
+     "step_us": {
+      "max": 109290.254,
+      "median": 106581.452,
+      "min": 102299.113,
+      "n": 9
+     },
+     "storage": "f16"
+    },
+    {
+     "backend": "rocm",
+     "case": "prefill-attention-8192-kvf16-narrow",
+     "dimensions": {
+      "cap": 8192,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 8192
+     },
+     "driver": "host kernel 7.3.0",
+     "live_context": 8192,
+     "receipt": "rocm prefill-attention-8192-kvf16-narrow, receipt 7aeb4cc13e3f",
+     "regime": "causal prefill attention, GQA, narrow operands on matrix units, f16 KV cache",
+     "series": "poot (ROCm)",
+     "step_us": {
+      "max": 68327.128,
+      "median": 65816.126,
+      "min": 62376.554,
+      "n": 9
+     },
+     "storage": "f16"
+    },
+    {
+     "backend": "rocm",
+     "case": "prefill-attention-8192-narrow",
+     "dimensions": {
+      "cap": 8192,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 8192
+     },
+     "driver": "host kernel 7.3.0",
+     "live_context": 8192,
+     "receipt": "rocm prefill-attention-8192-narrow, receipt 8e26ddfa83d7",
+     "regime": "causal prefill attention, GQA, narrow operands on matrix units",
+     "series": "poot (ROCm)",
+     "step_us": {
+      "max": 70374.963,
+      "median": 68245.364,
+      "min": 65785.879,
+      "n": 9
+     },
+     "storage": "f32"
+    },
+    {
+     "backend": "rocm",
      "case": "prefill-dense-bf16-nk",
      "dimensions": {
       "k": 1024,
@@ -651,13 +789,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "rocm prefill-dense-bf16-nk, receipt 17852f92b7a9",
+     "receipt": "rocm prefill-dense-bf16-nk, receipt 12a8b64d36ec",
      "regime": "compute-heavy prefill projection over a checkpoint-order bf16 weight",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 10671.219,
-      "median": 9568.222,
-      "min": 8740.873,
+      "max": 11561.394,
+      "median": 10530.392,
+      "min": 9294.979,
       "n": 9
      },
      "storage": "bf16"
@@ -693,13 +831,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "rocm prefill-dense-bf16-nk-down-k9728, receipt 5607e5179e1d",
+     "receipt": "rocm prefill-dense-bf16-nk-down-k9728, receipt 472ab127fe9f",
      "regime": "compute-heavy prefill down projection (K 9728) over a checkpoint-order bf16 weight",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 25491.409,
-      "median": 23944.602,
-      "min": 21480.657,
+      "max": 25829.308,
+      "median": 23776.093,
+      "min": 22549.976,
       "n": 9
      },
      "storage": "bf16"
@@ -735,13 +873,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "rocm prefill-dense-bf16-nk-down-k9728-narrow, receipt b8ffae1ff815",
+     "receipt": "rocm prefill-dense-bf16-nk-down-k9728-narrow, receipt c82943743b24",
      "regime": "compute-heavy prefill down projection (K 9728), narrow operands",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 12203.329,
-      "median": 10840.706,
-      "min": 10745.998,
+      "max": 14590.842,
+      "median": 12494.797,
+      "min": 10522.034,
       "n": 9
      },
      "storage": "bf16"
@@ -777,13 +915,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "rocm prefill-dense-bf16-nk-narrow, receipt 451609542b7e",
+     "receipt": "rocm prefill-dense-bf16-nk-narrow, receipt a7ba017130ad",
      "regime": "compute-heavy prefill projection over a checkpoint-order bf16 weight, narrow operands",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 11658.899,
-      "median": 9684.481,
-      "min": 8249.623,
+      "max": 9956.478,
+      "median": 8990.97,
+      "min": 8245.222,
       "n": 9
      },
      "storage": "bf16"
@@ -819,13 +957,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "rocm prefill-long-gemm, receipt 85f5dcdf32c4",
+     "receipt": "rocm prefill-long-gemm, receipt 3421cb870632",
      "regime": "compute-heavy long prefill",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 1793.339,
-      "median": 1628.912,
-      "min": 1572.595,
+      "max": 2075.286,
+      "median": 1664.908,
+      "min": 1582.423,
       "n": 9
      },
      "storage": "f32"
@@ -861,13 +999,13 @@
      },
      "driver": "host kernel 7.3.0",
      "live_context": "n/a",
-     "receipt": "rocm prefill-long-gemm-narrow, receipt 94f6c17c0f48",
+     "receipt": "rocm prefill-long-gemm-narrow, receipt 72cf5a9d5c1c",
      "regime": "compute-heavy long prefill on matrix units, narrow operands",
      "series": "poot (ROCm)",
      "step_us": {
-      "max": 1232.278,
-      "median": 1044.797,
-      "min": 1021.344,
+      "max": 1095.231,
+      "median": 1028.856,
+      "min": 1000.684,
       "n": 9
      },
      "storage": "f32"

@@ -152,9 +152,10 @@ class PlannerInvariant(unittest.TestCase):
             with self.assertRaises(ValueError):
                 inv.load_losses(path)
 
-    def test_the_checked_in_declarations_name_a_follow_up_card(self):
-        declared = inv.load_losses(inv.committed_losses_path())
-        self.assertIn(("expert-prefill-packed-iq2xs-up-narrow", "rocm"), declared)
+    def test_the_checked_in_list_declares_no_loss(self):
+        """POOT-1547 fixed the last declared loss; a loss declared later names its follow-up card (the parser test
+        above holds that), and this list is empty while no root-cause card is open."""
+        self.assertEqual(inv.load_losses(inv.committed_losses_path()), {})
 
     def test_the_checked_in_bank_pairs_every_narrow_case_and_has_no_loss(self):
         self.assertEqual(inv.invariant_errors(), [])

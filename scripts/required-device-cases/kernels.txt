@@ -10,8 +10,11 @@
 # hidden ROCm device turns it into a skip - and a skipped required case fails the gate.
 poot-kernelgen	contraction::invariant::a_compiled_choice_never_runs_a_tiling_its_compiler_spills
 poot-kernelgen	contraction::invariant::the_chosen_schedule_never_loses_to_exact
+poot-kernelgen	contraction::invariant::the_packed_sweep_covers_the_formats_the_grouped_rows_name
 poot-kernelgen	contraction::invariant::the_sweep_reaches_both_sides_of_the_choice
 poot-kernelgen	contraction::tests::a_one_row_dense_decode_stays_on_the_gemv_at_every_output_count
+poot-kernelgen	packed::decode_plan::tests::a_field_of_four_pieces_decodes_in_the_emitted_kernel
+poot-kernelgen	packed::identity_tests::every_format_emits_the_kernel_recorded_before_the_lattice_refactor
 poot-kernelgen	packed::planar_wgpu_tests::the_register_tiled_body_runs_256_lane_workgroups_on_radv
 poot-kernelgen	packed::rocm_tests::contraction_wide_register_tile_matches_reference_on_rocm
 poot-kernelgen	packed::rocm_tests::packed_fragment_contractions_match_the_scalar_tiling_of_the_same_precision_on_rocm

@@ -75,6 +75,8 @@ pub const PORTABLE_COST_RATIOS: CostRatios = CostRatios {
     lds_read: 1.0,
     staged_value: 8.0,
     direct_value: 7.6,
+    fragment_round: None,
+    group_scan: None,
 };
 
 /// The cost model's ratios on Strix Halo through HSA (ROCm), identified by `calibrate-launch` over every candidate
@@ -84,10 +86,26 @@ pub const PORTABLE_COST_RATIOS: CostRatios = CostRatios {
 /// the retired 32-row switch (11.9 to 23.6), cut at the top by the dense decode Gemv: above 15.2 the model puts a
 /// one-row contraction of a vocabulary-sized output onto a matrix unit, which is slower (POOT-1503). The centre of
 /// 11.9 to 15.2.
+///
+/// The grouped fragment tilings and the grouping of rows by expert were identified on the corpus of POOT-1547
+/// (`scripts/calibrate-launch rocm fragment`, rows in `benchmarks/calibration/rocm-gfx1151.tsv`): the packed grouped
+/// projections IQ2_XS up and IQ4_NL down of a 512-expert mixture at 128, 512 and 2048 tokens, four dense prefill
+/// projections and two vocabulary-head decodes, every tiling the device runs exact and narrow plus the Gemv, 611 rows
+/// with the dispatches timed one by one. A fragment tiling over rows grouped by expert costs its multiplies at the
+/// matrix unit's rate plus [`CostRatios::fragment_round`] FMA issues per `K` round and nothing for staging (no LDS
+/// read or staged value is identified on one: the fit puts both at zero; the dense fragment cells keep the scalar
+/// model, which serves them); a grouping scan step costs [`CostRatios::group_scan`] (4.6 direct reads). The round is
+/// the interior best-fit point of the grid cells that minimise the worst per-cell regret and then the mean. Under these
+/// figures and a tie rule that takes the deeper round (the grouped fragment tilings tie in the model) the packed cells
+/// choose within 1.02 of the fastest measured schedule (the shipped model: 1.49), and the IQ2_XS up projection at 128
+/// tokens, which the shipped model lost 2.5 % to the Gemv on, narrows to a tiling 14 % faster than the Gemv.
+/// `benchmarks/calibration/fit_fragment_cost.py` recomputes both figures from the rows.
 pub const STRIX_HALO_HSA_COST_RATIOS: CostRatios = CostRatios {
     lds_read: 9.88,
     staged_value: 8.43,
     direct_value: 13.4,
+    fragment_round: Some(800.0),
+    group_scan: Some(61.4),
 };
 
 /// The Gemv's direct value on the RTX PRO 6000 Blackwell Server (sm_120), identified by `calibrate-launch indexed` on
@@ -139,6 +157,15 @@ pub struct CostRatios {
     /// One value a Gemv lane reads straight from global memory: no LDS stage and no barrier, but also no row to
     /// amortize the load over, so a Gemv lane pays it per FMA where a tile pays a staged value per tile row.
     pub direct_value: f64,
+    /// On a device that identified it, the FMA issues of one lane a `K` round of a fragment tiling over rows grouped
+    /// by expert costs (the barriers and the waits on its staged loads); such a tiling is then priced by its
+    /// multiplies and its rounds alone. `None`, and every other tiling, prices a tile like a scalar one (an LDS read
+    /// and a staged value per operand value).
+    pub fragment_round: Option<f64>,
+    /// On a device that identified it, one scan step of the expert-grouping kernel (`ExpertGroup`: one workgroup whose
+    /// lanes each scan the row ids for their buckets), in FMA issues of one lane: a grouped contraction then pays
+    /// the grouping before its first tile. `None` leaves the grouping unpriced.
+    pub group_scan: Option<f64>,
 }
 
 /// The performance figures one device's launches were measured with. A figure here only ranks schedules that are
@@ -210,6 +237,8 @@ impl PerfCalibration {
             lds_read: Self::PORTABLE.cost.lds_read,
             staged_value: Self::PORTABLE.cost.staged_value,
             direct_value: SM_120_DIRECT_VALUE_COST,
+            fragment_round: None,
+            group_scan: None,
         },
         attention_key_blocks: Self::PORTABLE.attention_key_blocks,
         packed_gemv_max_run: SM_120_PACKED_GEMV_RUN,
@@ -599,6 +628,16 @@ mod tests {
             source: "POOT-1489 calibrate-launch indexed, gfx1151 ROCm, the same 88 cells: the direct values at which the model's choices are never slower than the retired 32-row switch (within 5 %) and within 5 % of the best mean regret are 11.9 to 23.6. POOT-1503 cut the range at 15.2, the crossover at which the model's cost of a one-row dense Gemv of four columns per workgroup passes a fragment tiling's once both fill the device (the 16.8 centre moved the 151936-column head of qwen3-0.6b and qwen3-4b onto a matrix unit: decode 8 % and 5 % slower on ROCm); the geometric centre of 11.9 to 15.2. Two runs; the dense side is the model's own crossover, confirmed by the A/B of that head on ROCm",
         },
         Provenance {
+            name: "STRIX_HALO_HSA_FRAGMENT_ROUND_COST",
+            value: 800.0,
+            source: "POOT-1547 calibrate-launch fragment, gfx1151 ROCm, 611 rows (packed grouped IQ2_XS up and IQ4_NL down at 128, 512 and 2048 tokens, dense prefill and decode-head shapes; every tiling exact and narrow plus the Gemv; dispatches timed one by one; benchmarks/calibration/rocm-gfx1151.tsv): the FMA issues per K round of a grouped fragment tiling that minimise the worst per-cell regret (1.663, the dense 64-row cell the round does not touch) and then the mean (1.174 against 1.222) with the fragment multiply at the matrix unit's rate and no staging term; the interior best-fit point of the optimal cells (141 to 951), recomputed by fit_fragment_cost.py",
+        },
+        Provenance {
+            name: "STRIX_HALO_HSA_GROUP_SCAN_COST",
+            value: 61.4,
+            source: "POOT-1547, the same corpus: the expert-grouping dispatch (one workgroup, 2 scans of the rows per bucket a lane owns) measured 0.0468 us per scan step over the packed rows whatever the block, which is 61.4 FMA issues at the unit the scalar fit sets (least squares, fit_fragment_cost.py)",
+        },
+        Provenance {
             name: "SM_120_DIRECT_VALUE_COST",
             value: 14.15,
             source: "POOT-1490 calibrate-launch indexed on one RTX PRO 6000 Blackwell Server (sm_120, secure pod, 88 cells, 176 rows): the direct values at which the model's choices are never slower than the retired 32-row switch (within 5 %) and within 5 % of the best mean regret are 11.9 to 16.8; the geometric centre. Mean regret against the faster schedule 1.056 against the retired switch's 1.177. An RTX 4090 (sm_89) gave 7.6 to 11.9, so the figure moves between parts and this one is that part's; receipts/1490-cuda-sweep/",
@@ -787,6 +826,21 @@ mod tests {
         assert_provenance("STRIX_HALO_HSA_LDS_READ_COST", hsa.lds_read);
         assert_provenance("STRIX_HALO_HSA_STAGED_VALUE_COST", hsa.staged_value);
         assert_provenance("STRIX_HALO_HSA_DIRECT_VALUE_COST", hsa.direct_value);
+        assert_provenance(
+            "STRIX_HALO_HSA_FRAGMENT_ROUND_COST",
+            hsa.fragment_round
+                .expect("gfx1151 through HSA identified the fragment round"),
+        );
+        assert_provenance(
+            "STRIX_HALO_HSA_GROUP_SCAN_COST",
+            hsa.group_scan
+                .expect("gfx1151 through HSA identified the grouping scan"),
+        );
+        assert_eq!(
+            (portable.fragment_round, portable.group_scan),
+            (None, None),
+            "the prior identifies neither the fragment round nor the grouping"
+        );
         assert_eq!(
             PerfCalibration::STRIX_HALO_VULKAN.cost,
             portable,
@@ -827,6 +881,8 @@ mod tests {
             "STRIX_HALO_HSA_LDS_READ_COST",
             "STRIX_HALO_HSA_STAGED_VALUE_COST",
             "STRIX_HALO_HSA_DIRECT_VALUE_COST",
+            "STRIX_HALO_HSA_FRAGMENT_ROUND_COST",
+            "STRIX_HALO_HSA_GROUP_SCAN_COST",
             "SM_120_DIRECT_VALUE_COST",
             "STRIX_HALO_ATTENTION_KEY_BLOCK_WIDEST",
             "STRIX_HALO_ATTENTION_KEY_BLOCK_NARROWEST",
