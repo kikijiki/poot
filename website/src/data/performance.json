@@ -1201,6 +1201,26 @@
     },
     {
      "backend": "rocm",
+     "case": "router-rank-prefill",
+     "dimensions": {
+      "experts": 512,
+      "tokens": 128
+     },
+     "driver": "host kernel 7.3.0",
+     "live_context": "n/a",
+     "receipt": "rocm router-rank-prefill, receipt 4b4d97898bf5",
+     "regime": "MoE prefill router rank over a wide mixture's scores (128 tokens, 512 experts), exact f32",
+     "series": "poot (ROCm)",
+     "step_us": {
+      "max": 65.773,
+      "median": 65.523,
+      "min": 55.894,
+      "n": 9
+     },
+     "storage": "f32"
+    },
+    {
+     "backend": "rocm",
      "case": "ssd-long-recurrence-scan",
      "dimensions": {
       "family": "ssd",
@@ -14905,6 +14925,72 @@
     },
     {
      "backend": "ptx",
+     "case": "dense-decode-head-bf16",
+     "dimensions": {
+      "k": 1024,
+      "m": 1,
+      "n": 151936
+     },
+     "driver": "595.91.07",
+     "live_context": "n/a",
+     "receipt": "ptx dense-decode-head-bf16, receipt 8392758d2cca",
+     "regime": "dense bandwidth decode of a vocabulary head (151936 outputs over K 1024) over a checkpoint-order bf16 weight",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 278.598,
+      "median": 275.223,
+      "min": 273.931,
+      "n": 9
+     },
+     "storage": "bf16"
+    },
+    {
+     "backend": "ptx",
+     "case": "dense-decode-head-bf16-narrow",
+     "dimensions": {
+      "k": 1024,
+      "m": 1,
+      "n": 151936
+     },
+     "driver": "595.91.07",
+     "live_context": "n/a",
+     "receipt": "ptx dense-decode-head-bf16-narrow, receipt 39d5dd6ea7e3",
+     "regime": "dense bandwidth decode of a vocabulary head (151936 outputs over K 1024) over a checkpoint-order bf16 weight, narrow operands",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 277.136,
+      "median": 275.944,
+      "min": 274.983,
+      "n": 9
+     },
+     "storage": "bf16"
+    },
+    {
+     "backend": "ptx",
+     "case": "expert-prefill-packed-iq2xs-up",
+     "dimensions": {
+      "experts": 512,
+      "k": 2560,
+      "n": 640,
+      "order": "routed",
+      "tokens": 128,
+      "top_k": 10
+     },
+     "driver": "595.91.07",
+     "live_context": "n/a",
+     "receipt": "ptx expert-prefill-packed-iq2xs-up, receipt 21edd9f3900f",
+     "regime": "MoE prefill routed expert projection over a packed IQ2_XS expert stack at a wide mixture's dimensions (128 tokens, each to 10 of 512 experts, K 2560, N 640: about 2.5 routed rows per expert), exact operands",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 2452.451,
+      "median": 2418.89,
+      "min": 2404.628,
+      "n": 9
+     },
+     "storage": "iq2_xs"
+    },
+    {
+     "backend": "ptx",
      "case": "expert-prefill-packed-iq2xs-up-narrow",
      "dimensions": {
       "experts": 512,
@@ -14916,16 +15002,40 @@
      },
      "driver": "595.91.07",
      "live_context": "n/a",
-     "receipt": "ptx expert-prefill-packed-iq2xs-up-narrow, receipt 414ee77445e9",
+     "receipt": "ptx expert-prefill-packed-iq2xs-up-narrow, receipt 462f2f3fc7d9",
      "regime": "The same packed IQ2_XS routed projection with narrow operands (the matrix unit)",
      "series": "poot (PTX)",
      "step_us": {
-      "max": 1822.441,
-      "median": 1812.932,
-      "min": 1807.341,
+      "max": 2159.661,
+      "median": 2149.436,
+      "min": 2136.827,
       "n": 9
      },
      "storage": "iq2_xs"
+    },
+    {
+     "backend": "ptx",
+     "case": "expert-prefill-qwen3moe-up",
+     "dimensions": {
+      "experts": 128,
+      "k": 2048,
+      "n": 768,
+      "order": "routed",
+      "tokens": 512,
+      "top_k": 8
+     },
+     "driver": "595.91.07",
+     "live_context": "n/a",
+     "receipt": "ptx expert-prefill-qwen3moe-up, receipt 97b13f1f512e",
+     "regime": "MoE prefill routed expert projection at Qwen3-MoE dimensions (512 tokens, each to 8 of 128 experts) over a checkpoint-order bf16 expert stack, exact operands",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 6274.497,
+      "median": 5999.173,
+      "min": 5943.5,
+      "n": 9
+     },
+     "storage": "bf16"
     },
     {
      "backend": "ptx",
@@ -14940,13 +15050,13 @@
      },
      "driver": "595.91.07",
      "live_context": "n/a",
-     "receipt": "ptx expert-prefill-qwen3moe-up-narrow, receipt fc10a8ddf09e",
+     "receipt": "ptx expert-prefill-qwen3moe-up-narrow, receipt 0cb4807bafe2",
      "regime": "MoE prefill routed expert projection at Qwen3-MoE dimensions (512 tokens, each to 8 of 128 experts) over a checkpoint-order bf16 expert stack, narrow operands",
      "series": "poot (PTX)",
      "step_us": {
-      "max": 17293.425,
-      "median": 11559.62,
-      "min": 11475.172,
+      "max": 5540.445,
+      "median": 5357.06,
+      "min": 5298.072,
       "n": 9
      },
      "storage": "bf16"
@@ -14963,13 +15073,82 @@
      },
      "driver": "595.91.07",
      "live_context": 2048,
-     "receipt": "ptx prefill-attention-2048, receipt a2aae4983507",
+     "receipt": "ptx prefill-attention-2048, receipt ee4e8c7949c0",
      "regime": "causal prefill attention, GQA",
      "series": "poot (PTX)",
      "step_us": {
-      "max": 7993.32,
-      "median": 7867.431,
-      "min": 7785.739,
+      "max": 8196.581,
+      "median": 8026.927,
+      "min": 7996.41,
+      "n": 9
+     },
+     "storage": "f32"
+    },
+    {
+     "backend": "ptx",
+     "case": "prefill-attention-2048-kvf16",
+     "dimensions": {
+      "cap": 2048,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 2048
+     },
+     "driver": "595.91.07",
+     "live_context": 2048,
+     "receipt": "ptx prefill-attention-2048-kvf16, receipt fd3caac38447",
+     "regime": "causal prefill attention, GQA, f16 KV cache",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 8163.913,
+      "median": 8040.297,
+      "min": 7975.189,
+      "n": 9
+     },
+     "storage": "f16"
+    },
+    {
+     "backend": "ptx",
+     "case": "prefill-attention-2048-kvf16-narrow",
+     "dimensions": {
+      "cap": 2048,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 2048
+     },
+     "driver": "595.91.07",
+     "live_context": 2048,
+     "receipt": "ptx prefill-attention-2048-kvf16-narrow, receipt 4c043bc0984f",
+     "regime": "causal prefill attention, GQA, narrow operands on matrix units, f16 KV cache",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 6868.708,
+      "median": 6850.01,
+      "min": 6792.524,
+      "n": 9
+     },
+     "storage": "f16"
+    },
+    {
+     "backend": "ptx",
+     "case": "prefill-attention-2048-narrow",
+     "dimensions": {
+      "cap": 2048,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 2048
+     },
+     "driver": "595.91.07",
+     "live_context": 2048,
+     "receipt": "ptx prefill-attention-2048-narrow, receipt b29464286fd0",
+     "regime": "causal prefill attention, GQA, narrow operands on matrix units",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 6923.881,
+      "median": 6849.099,
+      "min": 6801.177,
       "n": 9
      },
      "storage": "f32"
@@ -14986,13 +15165,82 @@
      },
      "driver": "595.91.07",
      "live_context": 8192,
-     "receipt": "ptx prefill-attention-8192, receipt d7839f27c447",
+     "receipt": "ptx prefill-attention-8192, receipt b9ca2ef05072",
      "regime": "causal prefill attention, GQA",
      "series": "poot (PTX)",
      "step_us": {
-      "max": 48310.661,
-      "median": 48026.974,
-      "min": 47900.193,
+      "max": 50285.368,
+      "median": 49741.001,
+      "min": 49349.273,
+      "n": 9
+     },
+     "storage": "f32"
+    },
+    {
+     "backend": "ptx",
+     "case": "prefill-attention-8192-kvf16",
+     "dimensions": {
+      "cap": 8192,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 8192
+     },
+     "driver": "595.91.07",
+     "live_context": 8192,
+     "receipt": "ptx prefill-attention-8192-kvf16, receipt 4dd8f8ebd71f",
+     "regime": "causal prefill attention, GQA, f16 KV cache",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 50984.286,
+      "median": 49951.136,
+      "min": 49497.845,
+      "n": 9
+     },
+     "storage": "f16"
+    },
+    {
+     "backend": "ptx",
+     "case": "prefill-attention-8192-kvf16-narrow",
+     "dimensions": {
+      "cap": 8192,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 8192
+     },
+     "driver": "595.91.07",
+     "live_context": 8192,
+     "receipt": "ptx prefill-attention-8192-kvf16-narrow, receipt 811fc0adaa84",
+     "regime": "causal prefill attention, GQA, narrow operands on matrix units, f16 KV cache",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 36121.932,
+      "median": 35787.8,
+      "min": 35120.689,
+      "n": 9
+     },
+     "storage": "f16"
+    },
+    {
+     "backend": "ptx",
+     "case": "prefill-attention-8192-narrow",
+     "dimensions": {
+      "cap": 8192,
+      "d": 128,
+      "hkv": 8,
+      "hq": 16,
+      "lq": 8192
+     },
+     "driver": "595.91.07",
+     "live_context": 8192,
+     "receipt": "ptx prefill-attention-8192-narrow, receipt ff335bb165b9",
+     "regime": "causal prefill attention, GQA, narrow operands on matrix units",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 37619.919,
+      "median": 36803.905,
+      "min": 36160.59,
       "n": 9
      },
      "storage": "f32"
@@ -15007,13 +15255,76 @@
      },
      "driver": "595.91.07",
      "live_context": "n/a",
-     "receipt": "ptx prefill-dense-bf16-nk, receipt e92e76c1b982",
+     "receipt": "ptx prefill-dense-bf16-nk, receipt 377159ce2fe5",
      "regime": "compute-heavy prefill projection over a checkpoint-order bf16 weight",
      "series": "poot (PTX)",
      "step_us": {
-      "max": 10215.333,
-      "median": 10154.29,
-      "min": 10125.637,
+      "max": 10083.633,
+      "median": 10011.184,
+      "min": 9987.78,
+      "n": 9
+     },
+     "storage": "bf16"
+    },
+    {
+     "backend": "ptx",
+     "case": "prefill-dense-bf16-nk-down-k9728",
+     "dimensions": {
+      "k": 9728,
+      "m": 2048,
+      "n": 2560
+     },
+     "driver": "595.91.07",
+     "live_context": "n/a",
+     "receipt": "ptx prefill-dense-bf16-nk-down-k9728, receipt 5d251cd6f294",
+     "regime": "compute-heavy prefill down projection (K 9728) over a checkpoint-order bf16 weight",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 11042.463,
+      "median": 10731.565,
+      "min": 10617.434,
+      "n": 9
+     },
+     "storage": "bf16"
+    },
+    {
+     "backend": "ptx",
+     "case": "prefill-dense-bf16-nk-down-k9728-narrow",
+     "dimensions": {
+      "k": 9728,
+      "m": 2048,
+      "n": 2560
+     },
+     "driver": "595.91.07",
+     "live_context": "n/a",
+     "receipt": "ptx prefill-dense-bf16-nk-down-k9728-narrow, receipt fea51ac787f7",
+     "regime": "compute-heavy prefill down projection (K 9728), narrow operands",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 8719.876,
+      "median": 8601.319,
+      "min": 8567.228,
+      "n": 9
+     },
+     "storage": "bf16"
+    },
+    {
+     "backend": "ptx",
+     "case": "prefill-dense-bf16-nk-narrow",
+     "dimensions": {
+      "k": 1024,
+      "m": 2048,
+      "n": 3072
+     },
+     "driver": "595.91.07",
+     "live_context": "n/a",
+     "receipt": "ptx prefill-dense-bf16-nk-narrow, receipt 4c55b4084fdc",
+     "regime": "compute-heavy prefill projection over a checkpoint-order bf16 weight, narrow operands",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 9812.066,
+      "median": 9758.355,
+      "min": 9719.066,
       "n": 9
      },
      "storage": "bf16"
@@ -15028,13 +15339,34 @@
      },
      "driver": "595.91.07",
      "live_context": "n/a",
-     "receipt": "ptx prefill-long-gemm, receipt 3af98da4ee79",
+     "receipt": "ptx prefill-long-gemm, receipt a7c98850a861",
      "regime": "compute-heavy long prefill",
      "series": "poot (PTX)",
      "step_us": {
-      "max": 1015.537,
-      "median": 1010.559,
-      "min": 989.067,
+      "max": 1046.901,
+      "median": 1044.117,
+      "min": 1038.538,
+      "n": 9
+     },
+     "storage": "f32"
+    },
+    {
+     "backend": "ptx",
+     "case": "prefill-long-gemm-narrow",
+     "dimensions": {
+      "k": 2048,
+      "m": 1024,
+      "n": 2048
+     },
+     "driver": "595.91.07",
+     "live_context": "n/a",
+     "receipt": "ptx prefill-long-gemm-narrow, receipt 056cfd71b87c",
+     "regime": "compute-heavy long prefill on matrix units, narrow operands",
+     "series": "poot (PTX)",
+     "step_us": {
+      "max": 832.249,
+      "median": 819.089,
+      "min": 799.991,
       "n": 9
      },
      "storage": "f32"

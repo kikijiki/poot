@@ -236,10 +236,11 @@ fn main() {
         report("dus", &dus, &want_dus, &mut failures);
     }
 
-    // Attention decode: the generated online-softmax kernel, 4 lanes per head. Dims match the staged kernel
-    // (Hq=4, n_rep=2, 6 keys, D=8); compared to the textbook two-pass attention.
+    // Attention decode: the generated clustered key-walk kernel, one 32-lane workgroup per KV head (the n_rep
+    // query heads of a group share its walk). Dims match the staged kernel (Hq=4, n_rep=2, 6 keys, D=8); compared
+    // to the textbook two-pass attention.
     if fixtures.staged("attention_decode") {
-        let (hq, n_rep, cap, d, lanes) = (4usize, 2usize, 6usize, 8usize, 4usize);
+        let (hq, n_rep, cap, d, lanes) = (4usize, 2usize, 6usize, 8usize, 32usize);
         let hkv = hq / n_rep;
         let scale = 0.35355338f32;
         let q = det_fill(hq * d, 1);
@@ -256,7 +257,7 @@ fn main() {
             &[&q, &k, &v, &mask],
             hq * d,
             [lanes as u32, 1, 1],
-            [(hq * lanes) as u32, 1, 1],
+            [((hq / n_rep) * lanes) as u32, 1, 1],
         );
         let want = attention_decode_ref(&q, &k, &v, &mask, hq, n_rep, cap, d, scale);
         report_close("attention_decode", &got, &want, 1e-4, &mut failures);

@@ -8,7 +8,19 @@
 //!
 //! Re-recorded once, for POOT-1558: `VectorLoad` became element-indexed and carries `align_bytes`, so the 29
 //! `gemv_vec4` bodies (the only users, one per format) read their activation group at element `act_base + 4g` with
-//! a 16-byte alignment. Every other row is unchanged. To re-record, run the test and copy its `full table`.
+//! a 16-byte alignment. Every other row is unchanged.
+//!
+//! Re-recorded again for POOT-1559 (static-alignment reads): the block formats' run reads and factor reads no longer
+//! load `chunks + 1` words through a clamp and a runtime funnel shift, and read each factor piece as one word where
+//! the descriptor proves it never straddles. 213 of 377 rows changed: every row of the 16 block formats (Q4_0, Q4_1,
+//! Q5_0, Q5_1, Q8_0, Mxfp4, Iq4_Nl, Q2_K to Q6_K, Iq2_Xs, Iq3_S, Iq3_Xxs, Iq4_Xs) under `row_gather`, `gemv0` to
+//! `gemv3`, `gemv0_indexed`, `gemv1_indexed`, `gemv_vec4`, `register_tiled`, `register_tiled_indexed`,
+//! `register_tiled_narrow_f16` and `fragment_tiled_split_bf16`, because each emits `DecodePlan::emit_run` or
+//! `emit_factors`; and the Gemv rows of the three one-value block formats (F32, F16, Bf16), whose single-element
+//! tail run now reads its word aligned. The planar formats and every `run_sharing` row are unchanged. The numerics
+//! are bit-identical: `every_format_gemv_is_bit_identical_after_static_alignment` pins the interpreter output of
+//! every block format under every Gemv schedule from the body before this change. To re-record, run the test and
+//! copy its `full table`.
 
 use poot_graph_ir::{FragmentDtype, OperandPrecision};
 use poot_quant::format::WeightFormat;
@@ -24,7 +36,7 @@ const K: usize = 2048;
 const OUT_PER_BLOCK: u32 = 16;
 
 /// FNV-1a over the body's `Debug` text: a stable digest with no dependency, enough to tell two kernels apart.
-fn digest(text: &str) -> u64 {
+pub(super) fn digest(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     })

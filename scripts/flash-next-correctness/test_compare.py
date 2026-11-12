@@ -59,13 +59,17 @@ class Compare(unittest.TestCase):
             handle.write(data)
         return path
 
-    def run_compare(self, cuda_shift, poot_shift):
+    def run_compare(self, other_shift, poot_shift, *extra):
         cpu = self.write("cpu.bin", logits_file())
-        cuda = self.write("cuda.bin", logits_file(cuda_shift))
+        other = self.write("other.bin", logits_file(other_shift))
         poot = self.write("poot.json", json.dumps(poot_report(poot_shift)), "w")
         with contextlib.redirect_stdout(io.StringIO()):
-            return compare.main(["--cpu", cpu, "--cuda", cuda, "--poot", poot, "--top", "5", "--out",
-                                 os.path.join(self.dir.name, "report.json")])
+            return compare.main(["--cpu", cpu, "--other", other, "--poot", poot, "--top", "5", "--out",
+                                 os.path.join(self.dir.name, "report.json"), *extra])
+
+    def report(self):
+        with open(os.path.join(self.dir.name, "report.json")) as handle:
+            return json.load(handle)
 
     def test_reading_back_the_window(self):
         reference = compare.Reference(logits_file())
@@ -77,17 +81,15 @@ class Compare(unittest.TestCase):
         self.assertAlmostEqual(top[list(top)[0]], max(expected), places=3)
 
     def test_an_exact_poot_passes(self):
-        self.assertEqual(self.run_compare(0.0, 0.0), 0)
+        self.assertEqual(self.run_compare(0.05, 0.0), 0)
 
     def test_poot_within_the_reference_noise_passes(self):
         # CPU vs CUDA differ by 0.05 in one logit; poot by the same amount.
         self.assertEqual(self.run_compare(0.05, 0.05), 0)
 
     def test_a_perturbed_poot_fails_the_kl_and_abs_gates(self):
-        self.assertEqual(self.run_compare(0.0, 2.5), 1)
-        with open(os.path.join(self.dir.name, "report.json")) as handle:
-            report = json.load(handle)
-        failed = {f["metric"] for f in report["failures"]}
+        self.assertEqual(self.run_compare(0.05, 2.5), 1)
+        failed = {f["metric"] for f in self.report()["failures"]}
         self.assertIn("max_abs", failed)
         self.assertIn("mean_kl", failed)
 
@@ -95,10 +97,54 @@ class Compare(unittest.TestCase):
         poot = poot_report()
         poot["positions"].pop()
         cpu = self.write("cpu.bin", logits_file())
+        other = self.write("other.bin", logits_file(0.05))
         path = self.write("poot.json", json.dumps(poot), "w")
         with contextlib.redirect_stderr(io.StringIO()):
-            status = compare.main(["--cpu", cpu, "--cuda", cpu, "--poot", path, "--top", "5"])
+            status = compare.main(["--cpu", cpu, "--other", other, "--poot", path, "--top", "5"])
         self.assertEqual(status, 2)
+
+    def test_a_noise_pair_identical_to_the_reference_is_refused(self):
+        # POOT-1569: the CPU dump passed as both the reference and the noise pair measured zero noise, which
+        # collapsed every limit to the absolute floors and judged poot against 18x tighter bounds than two
+        # llama.cpp backends agree to.
+        cpu = self.write("cpu.bin", logits_file())
+        poot = self.write("poot.json", json.dumps(poot_report()), "w")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            status = compare.main(["--cpu", cpu, "--other", cpu, "--poot", poot, "--top", "5", "--out",
+                                   os.path.join(self.dir.name, "report.json")])
+        self.assertEqual(status, 2)
+        self.assertIn("no spread", err.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.dir.name, "report.json")))
+
+    def test_a_separate_dump_with_the_same_bytes_is_refused_too(self):
+        self.assertEqual(self.run_compare(0.0, 0.0), 2)
+
+    def test_require_spread_accepts_any_one_nonzero_metric(self):
+        zero = {"mean_kl": 0.0, "max_kl": 0.0, "max_abs": 0.0}
+        with self.assertRaises(compare.Malformed):
+            compare.require_spread(zero)
+        for metric in zero:
+            compare.require_spread(dict(zero, **{metric: 1e-9}))
+
+    def test_a_real_pair_derives_the_limits_and_the_report_documents_them(self):
+        self.assertEqual(self.run_compare(0.5, 0.0), 0)
+        report = self.report()
+        noise = report["noise_pair"]["noise"]
+        self.assertEqual(report["noise_pair"]["factor"], 3.0)
+        self.assertTrue(report["noise_pair"]["reference"].endswith("cpu.bin"))
+        self.assertTrue(report["noise_pair"]["other"].endswith("other.bin"))
+        for metric in ("mean_kl", "max_kl", "max_abs"):
+            self.assertGreater(3.0 * noise[metric], report["floors"][metric], metric)
+            self.assertAlmostEqual(report["limits"][metric], 3.0 * noise[metric], msg=metric)
+
+    def test_the_factor_scales_the_derived_limits(self):
+        self.assertEqual(self.run_compare(0.5, 0.0, "--factor", "3"), 0)
+        three = self.report()["limits"]
+        self.assertEqual(self.run_compare(0.5, 0.0, "--factor", "6"), 0)
+        six = self.report()["limits"]
+        for metric in ("mean_kl", "max_kl", "max_abs"):
+            self.assertAlmostEqual(six[metric], 2 * three[metric], msg=metric)
 
     def test_a_nan_never_passes(self):
         limits = {"mean_kl": 1.0, "max_kl": 1.0, "max_abs": 1.0, "top1": 0.5}

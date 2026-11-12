@@ -1,5 +1,5 @@
 //! POOT-1505 / POOT-1509: the PTX register oracle against the POOT-1509 sweep. Every kernel the sweep compiled for
-//! sm_120 (784 tilings of eight shapes, 434 distinct bodies) is rebuilt the way the sweep built it, then asked of the
+//! sm_120 (826 tilings of eight shapes, 457 distinct bodies) is rebuilt the way the sweep built it, then asked of the
 //! CUDA driver's JIT through the engine's compile feedback (the engine lowers the probe, [`PtxKernelRegisters`] compiles it); the verdict must be the one `ptxas` and the JIT gave then
 //! (`tests/data/ptxas_sweep_sm120.tsv`). A host without an NVIDIA device skips.
 
@@ -31,9 +31,9 @@ const SWEEP_DRIVER_RELEASE: u32 = 13_020;
 const SWEEP_COMPUTE_CAPABILITY: (u32, u32) = (12, 0);
 /// The distinct kernel bodies of the sm_120 sweep. The table was swept at 385 (POOT-1509), when a narrowed bf16 dense
 /// weight was stored f16 and shared its body with the f16 shape; since POOT-1535 it stays bf16 and the narrowed
-/// contraction rounds it in staging, a body of its own. The `Dense(bf16)` narrow rows' verdicts are owed a re-sweep on
-/// a pod (POOT-1478): the device row of this file fails on them until it is done.
-const SWEEP_DISTINCT_BODIES: usize = 434;
+/// contraction rounds it in staging, a body of its own. It was swept again on a pod (POOT-1537) after the run readers,
+/// the attention walk and the stable rank changed the kernels the planner emits: 457 bodies.
+const SWEEP_DISTINCT_BODIES: usize = 457;
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -306,7 +306,7 @@ fn sweep_kernels() -> Vec<Kernel> {
     kernels
 }
 
-/// The sweep's kernels are rebuilt from the planner, not read from a file: all 784 tilings of the table, 434 distinct
+/// The sweep's kernels are rebuilt from the planner, not read from a file: all 826 tilings of the table, 457 distinct
 /// bodies. Needs no device. Mutation: leave `lifted` out of the enumeration in `sweep_kernels`; the tilings only the
 /// lifted register model admits are missing.
 #[test]
@@ -314,7 +314,7 @@ fn the_sweep_table_is_the_planners_kernels() {
     let kernels = sweep_kernels();
     let distinct: HashSet<_> = kernels.iter().map(|k| k.probe.digest()).collect();
     assert_eq!(distinct.len(), SWEEP_DISTINCT_BODIES);
-    assert_eq!(kernels.iter().filter(|k| k.spills).count(), 318);
+    assert_eq!(kernels.iter().filter(|k| k.spills).count(), 374);
 }
 
 fn open() -> Option<PtxDevice> {
@@ -347,8 +347,8 @@ fn engine_feedback(device: PtxDevice) -> (Engine<PtxDevice>, RegisterFeedback) {
 }
 
 /// The oracle reports the sweep's verdict on every kernel of the sm_120 sweep, from any thread, and names the
-/// compiler it asked. Mutation: report `local_bytes: 0` in `PtxKernelRegisters::registers`; the 141 distinct bodies
-/// (318 tilings) the compiler spills read "holds".
+/// compiler it asked. Mutation: report `local_bytes: 0` in `PtxKernelRegisters::registers`; the 187 distinct bodies
+/// (374 tilings) the compiler spills read "holds".
 #[test]
 fn the_ptx_oracle_matches_the_ptxas_sweep_verdicts() {
     let Some(device) = open() else { return };

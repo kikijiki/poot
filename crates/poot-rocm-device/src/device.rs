@@ -49,6 +49,9 @@ struct CapturedAql {
     elements: Box<[ElementKind]>,
     grid: (u32, u32, u32),
     block: (u32, u32, u32),
+    /// Whether this packet is one of the engine's buffer copies (state commits, output snapshots) rather than a
+    /// dispatch of a plan step: the copy kernel runs on the same queue but is not a step the engine labels.
+    is_copy: bool,
 }
 
 /// One flattened entry of [`poot_rocm_runtime::RocmContext::enqueue_graph_batched`]'s dispatch list.
@@ -73,6 +76,9 @@ pub struct RocmDevice {
     /// the engine has loaded it ([`Device::copy_mechanism`]): `Device::copy` takes no kernel or launch shape, so this
     /// is the only place either is known.
     copy: Option<CopyLaunch>,
+    /// For each packet replayed since [`Device::begin_step`], whether it is a buffer copy: the HSA profiler
+    /// reports one span per packet, and the engine's per-dispatch labels cover the plan steps only.
+    replayed_copies: Vec<bool>,
 }
 
 /// The loaded copy kernel and the workgroup shape it was compiled for.
@@ -131,6 +137,7 @@ impl RocmDevice {
             arch,
             open: None,
             copy: None,
+            replayed_copies: Vec::new(),
         })
     }
 
@@ -311,6 +318,7 @@ impl Device for RocmDevice {
             elements: elements.into_boxed_slice(),
             grid,
             block,
+            is_copy: false,
         });
         Ok(())
     }
@@ -341,6 +349,7 @@ impl Device for RocmDevice {
             elements: Box::new([ElementKind::I32, ElementKind::I32]),
             grid,
             block,
+            is_copy: true,
         };
         self.recording("copy")?.push(aql);
         Ok(())
@@ -356,6 +365,7 @@ impl Device for RocmDevice {
 
     fn begin_step(&mut self) -> Result<(), RocmGpuError> {
         self.ctx.clear_dispatch_spans();
+        self.replayed_copies.clear();
         Ok(())
     }
 
@@ -371,6 +381,8 @@ impl Device for RocmDevice {
         let elements: Vec<&[ElementKind]> =
             recording.aqls.iter().map(|aql| &*aql.elements).collect();
         self.ctx.enqueue_graph_batched(&dispatches, &elements)?;
+        self.replayed_copies
+            .extend(recording.aqls.iter().map(|aql| aql.is_copy));
         Ok(())
     }
 
@@ -399,7 +411,7 @@ impl Device for RocmDevice {
     /// (POOT-1079). `Unknown` for a device not built with [`Self::new_with_device_timing`], or a step
     /// that completed no dispatch - never host wall, never a fabricated zero (Card 552).
     fn device_time(&self) -> DeviceTime {
-        measured(&self.ctx.dispatch_spans())
+        measured(&self.ctx.dispatch_spans(), &self.replayed_copies)
     }
 
     fn abort(&mut self) -> Result<(), RocmGpuError> {
@@ -408,6 +420,7 @@ impl Device for RocmDevice {
         // before the engine releases anything. `self.open` is the only other Rust-level state abort must
         // clear.
         self.open = None;
+        self.replayed_copies.clear();
         self.ctx.clear_dispatch_spans();
         let drained = self.ctx.synchronize();
         // CR30: a failed replay/synchronize that timed out already poisoned the underlying
@@ -422,25 +435,71 @@ impl Device for RocmDevice {
     }
 }
 
-/// A step's device time from its dispatches' spans: `Unknown` for none, else the sum of the
-/// durations, the first start to the last end, and each dispatch in submission order.
-fn measured(spans: &[DispatchSpan]) -> DeviceTime {
+/// A step's device time from its packets' spans: `Unknown` for none, else the first start to the last end over every
+/// packet, and, over the packets that are plan-step dispatches (`copies[i]` false), their summed durations and each
+/// duration indexed by the dispatch's order among the dispatches. A buffer copy runs on the same queue and has a span
+/// of its own, but the engine labels dispatches by their order among the plan's steps, so a copy takes no index.
+fn measured(spans: &[DispatchSpan], copies: &[bool]) -> DeviceTime {
     let (Some(start), Some(end)) = (
         spans.iter().map(|span| span.start).min(),
         spans.iter().map(|span| span.end).max(),
     ) else {
         return DeviceTime::Unknown;
     };
+    let dispatches: Vec<DispatchDeviceTime> = spans
+        .iter()
+        .zip(copies.iter().chain(std::iter::repeat(&false)))
+        .filter(|(_, is_copy)| !**is_copy)
+        .enumerate()
+        .map(|(index, (span, _))| DispatchDeviceTime {
+            index,
+            duration: span.duration(),
+        })
+        .collect();
     DeviceTime::Measured(MeasuredDeviceTime {
-        sum_of_dispatch_durations: Some(spans.iter().map(DispatchSpan::duration).sum()),
+        sum_of_dispatch_durations: Some(dispatches.iter().map(|d| d.duration).sum()),
         device_span: Some(end.saturating_sub(start)),
-        dispatches: spans
-            .iter()
-            .enumerate()
-            .map(|(index, span)| DispatchDeviceTime {
-                index,
-                duration: span.duration(),
-            })
-            .collect(),
+        dispatches,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn span(start_us: u64, end_us: u64) -> DispatchSpan {
+        DispatchSpan {
+            start: Duration::from_micros(start_us),
+            end: Duration::from_micros(end_us),
+        }
+    }
+
+    /// A buffer copy has a span of its own on the queue, but the engine labels dispatches by their order among the
+    /// plan's steps: the copies around and between them take no index, and their time is outside the dispatch sum
+    /// (the span still covers them). Before this every label after a stage's commit copies was three packets off on a
+    /// real model (POOT-1568: the 'slow combine reduce' was another kernel's time).
+    ///
+    /// Mutation: drop the `.filter(|(_, is_copy)| !**is_copy)` in [`measured`]; the copies get indices 0 and 3 and
+    /// the sum includes them, so the index assertion goes red (observed: left `[(0, 5µs), (1, 10µs), (2, 20µs), (3, 7µs)]`).
+    #[test]
+    fn copies_take_no_dispatch_index_and_no_dispatch_time() {
+        let spans = [span(0, 5), span(6, 16), span(17, 37), span(38, 45)];
+        let copies = [true, false, false, true];
+        let DeviceTime::Measured(m) = measured(&spans, &copies) else {
+            panic!("four spans are a measured step");
+        };
+        let dispatches: Vec<(usize, Duration)> =
+            m.dispatches.iter().map(|d| (d.index, d.duration)).collect();
+        assert_eq!(
+            dispatches,
+            [
+                (0, Duration::from_micros(10)),
+                (1, Duration::from_micros(20))
+            ],
+            "the two dispatches, indexed among themselves"
+        );
+        assert_eq!(m.sum_of_dispatch_durations, Some(Duration::from_micros(30)));
+        assert_eq!(m.device_span, Some(Duration::from_micros(45)));
+    }
 }

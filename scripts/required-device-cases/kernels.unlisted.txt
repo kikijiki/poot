@@ -28,6 +28,8 @@ poot-kernelgen	contraction::tests::the_gemv_gives_way_to_the_grouping_where_the_
 poot-kernelgen	contraction::tests::the_matrix_units_rate_discounts_the_fragment_multiply	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tiled::tests::a_round_holds_the_reads_its_decode_uses	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	contraction::tiled::tests::a_split_moves_the_reads_ahead_and_keeps_their_uses	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	emit::tests::a_run_declared_more_aligned_than_its_start_is_refused	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	emit::tests::an_aligned_run_reads_only_its_words	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	emit::tests::reads_a_full_word_at_a_word_boundary	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	emit::tests::reads_spanning_a_word_boundary	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	emit::tests::reads_the_last_bit_of_a_word_without_touching_the_guard	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -55,8 +57,10 @@ poot-kernelgen	helpers::stride_tests::view_eff_strides_transposed_layout_is_not_
 poot-kernelgen	packed::contraction_tests::a_gemv_refuses_a_narrowed_precision	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_narrowed_packed_contraction_rounds_the_decoded_weight_and_the_activation	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_tiled_packed_contraction_refuses_an_epilogue_by_name	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::contraction_tests::a_two_byte_aligned_run_reads_its_span_plus_one_word	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_vector_activation_read_matches_the_scalar_read_bit_for_bit	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::a_vector_activation_read_over_a_partial_group_run_is_refused	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::contraction_tests::an_aligned_run_reads_exactly_its_span	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::contraction_bodies_compile_for_spirv_nvptx_and_amdgcn	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::contraction_gemv_epilogue_is_applied_once_to_the_completed_sum	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::contraction_gemv_matches_reference_blocks_1_and_2	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
@@ -70,6 +74,7 @@ poot-kernelgen	packed::contraction_tests::contraction_tiled_matches_reference_al
 poot-kernelgen	packed::contraction_tests::contraction_tiled_matches_reference_aligned_and_ragged_on_wgpu	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::contraction_tiled_matches_reference_block_diagonal_ragged	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::contraction_tests::contraction_tiled_matches_reference_block_diagonal_ragged_on_wgpu	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
+poot-kernelgen	packed::contraction_tests::every_format_gemv_is_bit_identical_after_static_alignment	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::decode_plan::tests::a_count_that_does_not_factor_over_the_digits_has_no_constant_offsets	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::decode_plan::tests::a_run_moves_the_bit_offset_by_constants_over_the_digits	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case
 poot-kernelgen	packed::decode_plan::tests::a_run_of_field_bits_equals_the_scalar_read_of_each_element	kernelgen unit row (emitters, plans, refusals); runs whole with the package, no named device case

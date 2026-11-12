@@ -1502,6 +1502,120 @@ mod contraction_tests {
         }
     }
 
+    /// POOT-1559 SC-a: the Gemv reads every bit offset of a run at an alignment proven from the descriptor, and
+    /// reads exactly the bits the unaligned windows read, so the output of every GGUF block format under every
+    /// `GEMV_SCHEDULES` entry is the one recorded from the body before the static-alignment reader (the f32 bits of
+    /// the interpreter's output over the shared fixture, digested).
+    /// Mutation: make `PieceAlignment::of` return 64 bits for a 2-byte-aligned format; the interpreter faults the
+    /// misaligned vector load, or the Q6_K row reads wrong bits.
+    #[test]
+    fn every_format_gemv_is_bit_identical_after_static_alignment() {
+        let recorded = include_str!("../../tests/data/packed_gemv_output_bits.txt");
+        let mut current = Vec::new();
+        for format in block32().into_iter().chain(kquant()) {
+            for (index, schedule) in GEMV_SCHEDULES.into_iter().enumerate() {
+                for (blocks, out_per_block) in [(1, 11), (2, 5)] {
+                    let (got, _) = interpret(format, schedule, blocks, 1, out_per_block);
+                    let text: String = got.iter().map(|v| format!("{:08x}", v.to_bits())).collect();
+                    current.push(format!(
+                        "{format:?} | gemv{index} blocks={blocks} | {:016x}",
+                        super::identity_tests::digest(&text)
+                    ));
+                }
+            }
+        }
+        let expected: Vec<&str> = recorded.lines().collect();
+        let changed: Vec<String> = current
+            .iter()
+            .zip(&expected)
+            .filter(|(now, was)| now.as_str() != **was)
+            .map(|(now, was)| format!("recorded {was}\n     now {now}"))
+            .collect();
+        assert!(
+            changed.is_empty() && current.len() == expected.len(),
+            "{} of {} Gemv outputs changed ({} recorded):\n{}\n--- full table ---\n{}",
+            changed.len(),
+            current.len(),
+            expected.len(),
+            changed.join("\n"),
+            current.join("\n")
+        );
+    }
+
+    /// The weight reads of one run of 16 elements of `format` (`DecodePlan::emit_run`, the statements a Gemv trip
+    /// emits for it): the lane counts of its vector loads of the packed words, its scalar loads of them, and the
+    /// `min` clamps in the run.
+    fn weight_reads(format: poot_quant::format::WeightFormat) -> (Vec<u32>, usize, usize) {
+        use poot_kernel_ir::{BinOp, Operand, Rvalue, Statement, Ty};
+
+        use super::decode_plan::DecodePlan;
+        use super::source::Source;
+        use crate::emit::Emit;
+        use crate::helpers::{Alloc, ld, local, slice_dtype};
+
+        let plan = DecodePlan::of(&format.descriptor()).unwrap();
+        let mut al = Alloc::new(vec![
+            ld(Ty::Unit, false),
+            ld(slice_dtype(Ty::U32, false), false),
+        ]);
+        let words = local(1);
+        let [row, k0, k] = [(); 3].map(|()| al.add(Ty::Usize, false));
+        let mut e = Emit::new(&mut al);
+        plan.emit_run(&mut e, Source::plain(words), row, k0, 16, k);
+        let statements = e.take();
+        let (mut vectors, mut scalars, mut clamps) = (Vec::new(), 0, 0);
+        for statement in &statements {
+            let Statement::Assign(dest, rvalue) = statement else {
+                continue;
+            };
+            match rvalue {
+                Rvalue::VectorLoad { place, .. } if place.local == words => {
+                    let Ty::Vec { lanes, .. } = &al.locals[dest.local.index as usize].ty else {
+                        unreachable!("a vector load assigns a vector")
+                    };
+                    vectors.push(*lanes);
+                }
+                Rvalue::Use(Operand::Copy(place)) if place.local == words => scalars += 1,
+                Rvalue::BinaryOp(BinOp::Min, ..) => clamps += 1,
+                _ => {}
+            }
+        }
+        (vectors, scalars, clamps)
+    }
+
+    /// POOT-1559 SC-b: an aligned run reads exactly its span. A Q4_K run of 16 codes is the same nibble of 16
+    /// consecutive bytes, 128 bits starting in a 128-bit-aligned word, so it is one `u32x4` load and no other code
+    /// word, with one runtime shift by the nibble; its factors are one narrow word each (`d`, `dmin`, two pieces
+    /// of `SubScale`, two of `SubMin`), where the unaligned reader loaded two stretches of code words and 12
+    /// scalar header words. Nothing clamps.
+    /// Mutation: read one word more than the span touches on the aligned path of `emit_read_run` (the `+1` word the
+    /// unaligned reader loads); the vector load is a `u32x4` and a scalar, and the row is red.
+    #[test]
+    fn an_aligned_run_reads_exactly_its_span() {
+        let (vectors, scalars, clamps) = weight_reads(poot_quant::format::WeightFormat::Q4_K);
+        assert_eq!(
+            (vectors.as_slice(), scalars, clamps),
+            (&[4][..], 6, 0),
+            "Q4_K run 16: one u32x4 code load, six narrow factor loads, no clamp"
+        );
+    }
+
+    /// POOT-1559 SC-b, the 2-byte-aligned side: a Q6_K block is 210 bytes, so a run starts on a 16-bit boundary,
+    /// possibly 16 bits into a word, and reads the 16 bytes of its `ql` codes and of its `qh` bits from 5 words each
+    /// (the span plus one word, the funnel's residue), scalar loads: no vector load can be proven for an
+    /// odd block, and no clamp. Beside them one narrow word each for the `i8` sub-scale and `d`.
+    /// Mutation: `PieceAlignment::of` reports a zero residue for any format; the codes read a word fewer, and the
+    /// load count and SC-a's bits are red.
+    #[test]
+    fn a_two_byte_aligned_run_reads_its_span_plus_one_word() {
+        let (vectors, scalars, clamps) = weight_reads(poot_quant::format::WeightFormat::Q6_K);
+        assert_eq!(
+            (vectors.as_slice(), scalars, clamps),
+            (&[][..], 12, 0),
+            "Q6_K run 16: no vector load, 5 + 5 code words and two factor words, no clamp"
+        );
+    }
+
     /// The bias, tanh, scale and residual chain of the fuse rule: `tanh(head + bias) * 0.5 + residual`, as the
     /// kernelgen epilogue the planner builds from a `ContractionEpilogue` over a packed head.
     pub(super) fn bias_activation_residual_chain(out: usize) -> crate::contraction::Epilogue {

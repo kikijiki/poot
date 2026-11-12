@@ -1431,6 +1431,41 @@
       "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
       "identity_digest": "30c4233ddc4becf3447a778bacefbbf0322b11fbb2386587db383e127d24af91",
       "status": "runnable"
+    },
+    {
+      "id": "router-rank-prefill",
+      "regime": "MoE prefill router rank over a wide mixture's scores (128 tokens, 512 experts), exact f32",
+      "level": "kernel",
+      "producer": "router_rank",
+      "shape": {
+        "tokens": 128,
+        "experts": 512
+      },
+      "storage": "f32",
+      "layout": "te",
+      "numerics": {
+        "accumulate": "exact integer rank",
+        "scores": "one f32 per token and expert drawn from the fixture stream, rows in token order, rounded down to a multiple of 2^-10 so each row holds tied scores",
+        "rank": "ops::stable_descending_rank: strictly greater scores first, equal scores by lower expert index",
+        "reference": "f64 count of the elements of the row that precede each element, sharing no code with the engine"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "b551f4031ab0976f9f4e461e5d6224b52ec805716d66fd2aedcfa8631c73a247",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "1cfd9ea7a2fe49d94bd235fb8350996784b4415685ecfefd64d6748d1ea7085a"
     }
   ]
 }

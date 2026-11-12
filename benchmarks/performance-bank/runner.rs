@@ -1251,6 +1251,62 @@ fn delta_rule_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
     })
 }
 
+/// The router's stable descending rank of a MoE prefill (POOT-1538): `tokens` rows of `experts` scores, each element
+/// ranked within its row as [`ops::stable_descending_rank`] states it (strictly greater scores first, equal scores
+/// by lower index), traced as a model traces it so `compile` decides how the rank runs. The scores are fixture
+/// draws rounded down to multiples of 2^-10, so a row holds tied scores (about 64 tied pairs per 512-expert row) and
+/// the tie-break is part of what is measured; the rank is a permutation of `0..experts` per row. The f64 reference
+/// counts, for each element, the elements of its row that precede it, sharing no code with the engine. Ranks are
+/// integers, so any difference from the reference is a wrong rank, not rounding.
+fn router_rank(bank: &Value, case: &Value) -> Result<Prepared, String> {
+    let shape = &case["shape"];
+    let (tokens, experts) = (dim(shape, "tokens")?, dim(shape, "experts")?);
+    let mut stream = SplitMix64(
+        bank["token_fixtures"][case["token_fixture"].as_str().unwrap()]["seed"]
+            .as_u64()
+            .ok_or("fixture has no seed")?,
+    );
+    let scores: Vec<f32> = stream
+        .tensor(tokens * experts)
+        .into_iter()
+        .map(|u| (u * 1024.0).floor() / 1024.0)
+        .collect();
+    let mut want = vec![0.0f64; tokens * experts];
+    for (row, out) in scores.chunks(experts).zip(want.chunks_mut(experts)) {
+        for (i, rank) in out.iter_mut().enumerate() {
+            *rank = row
+                .iter()
+                .enumerate()
+                .filter(|&(j, &s)| s > row[i] || (s == row[i] && j < i))
+                .count() as f64;
+        }
+    }
+    let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
+    let x = b
+        .constant("scores", TensorType::f32(vec![tokens, experts]))
+        .unwrap();
+    let rank = ops::stable_descending_rank(&b, x).unwrap();
+    Ok(Prepared {
+        exact_references: None,
+        graphs: vec![b.finish(rank).unwrap()],
+        consts: vec![(
+            "scores".into(),
+            HostTensor::f32(vec![tokens, experts], scores),
+        )],
+        references: vec![want],
+        out_shape: vec![tokens, experts],
+        packed: Vec::new(),
+        slots: Vec::new(),
+        observed: json!({
+            "shape": shape.clone(),
+            "storage": case["storage"].clone(),
+            "layout": case["layout"].clone(),
+            "weight_copies": 1,
+            "weight_bytes_per_copy": 4 * tokens * experts,
+        }),
+    })
+}
+
 pub(crate) fn prepare(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared, String> {
     let mut prepared = prepare_reading(bank, case, ops)?;
     if ops.narrow.is_some() {
@@ -1279,6 +1335,7 @@ fn prepare_reading(bank: &Value, case: &Value, ops: Operands) -> Result<Prepared
         Some("recurrence_scan") => recurrence_scan(bank, case),
         Some("grouped_experts") => grouped_experts(bank, case, ops),
         Some("packed_grouped_experts") => packed_grouped_experts(bank, case, ops),
+        Some("router_rank") => router_rank(bank, case),
         other => Err(format!("no runner for producer {other:?}")),
     }
 }

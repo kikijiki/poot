@@ -182,24 +182,69 @@ pub(crate) fn emit_read_bits(e: &mut Emit, words: Local, bit: Local, width: u32)
     bin(e, Ty::U32, BinOp::BitAnd, copy(combined), c32(mask))
 }
 
-/// `chunks` consecutive 32-bit windows of `words` starting at bit `bit`: window `c` holds bits
-/// `bit + 32 * c ..` as a `u32`, whatever the alignment of `bit`. One load per word covered
-/// (`chunks + 1`), then one funnel shift per window, `(lo >> sh) | (hi << (32 - sh))` with the left
-/// shift split in two (`(hi << 1) << (31 - sh)`) so `sh == 0` never shifts by 32. This is the read a
-/// run of neighbouring fields shares: a run of `n` fields of `w` bits costs `n * w / 32 + 1` loads here,
-/// against two per field through [`emit_read_bits`].
+/// `words[bit..bit+width]` for a field the emitter proved never straddles a word (`bit % 32 + width <= 32`, which
+/// `bit` aligned to at least `width` bits guarantees): one word load, a shift and a mask. No second load, no
+/// comparison, no multiply-select, unlike [`emit_read_bits`].
+pub(crate) fn emit_read_narrow(e: &mut Emit, words: Local, bit: Local, width: u32) -> Local {
+    assert!((1..=32).contains(&width), "emit_read_narrow: width {width}");
+    let word_idx = bin(e, Ty::Usize, BinOp::Div, copy(bit), cu(32));
+    let bit_in_word = bin(e, Ty::Usize, BinOp::Rem, copy(bit), cu(32));
+    let word = e.let_(Ty::U32, Rvalue::Use(Operand::Copy(elem(words, word_idx))));
+    let shift = e.let_(
+        Ty::U32,
+        Rvalue::Cast {
+            to: Ty::U32,
+            operand: copy(bit_in_word),
+        },
+    );
+    let shifted = bin(e, Ty::U32, BinOp::Shr, copy(word), copy(shift));
+    if width == 32 {
+        return shifted;
+    }
+    bin(
+        e,
+        Ty::U32,
+        BinOp::BitAnd,
+        copy(shifted),
+        c32((1u32 << width) - 1),
+    )
+}
+
+/// The `span_bits` bits of `words` starting at bit `bit`, as `span_bits.div_ceil(32)` consecutive 32-bit windows:
+/// window `c` holds bits `bit + 32 * c ..` as a `u32`, and bits at or past `bit + span_bits` are unspecified. This is
+/// the read a run of neighbouring fields shares.
 ///
-/// The word at `bit / 32 + 1` is the zero guard word at worst; later words are clamped to the last word of
-/// the slice, so a window that reaches past the data reads the last word instead of past the buffer (the
-/// bits a caller extracts never lie there).
-pub(crate) fn emit_read_windows(
+/// The emitter proved two facts about `bit` ([`crate::packed::PieceAlignment`]): the word it starts in,
+/// `bit / 32`, is a multiple of `word_align_bits / 32` words (a power of two, at most
+/// [`poot_kernel_ir::BUFFER_PARAM_ALIGN`] bytes), and `bit % 32 <= max_residue`. The read is exactly the words
+/// `[bit / 32, (bit % 32 + span_bits).div_ceil(32))` the span can touch, which is at most
+/// `(max_residue + span_bits).div_ceil(32)` words: in `u32x4` loads where the word index is 4-aligned and four words
+/// remain, `u32x2` loads where it is 2-aligned and two remain, scalar loads for the rest. When `max_residue` is
+/// zero the windows are the words. Otherwise one funnel shift per window, `(lo >> sh) | (hi << (32 - sh))` with the
+/// left shift split in two (`(hi << 1) << (31 - sh)`) so `sh == 0` never shifts by 32; a window whose high word the
+/// span cannot reach is the low word shifted alone. No word past the span's last bit is read and nothing is clamped.
+pub(crate) fn emit_read_run(
     e: &mut Emit,
     words: Local,
     bit: Local,
-    chunks: usize,
+    span_bits: usize,
+    word_align_bits: u32,
+    max_residue: u32,
 ) -> Vec<Local> {
-    assert!(chunks >= 1, "emit_read_windows: no windows");
+    assert!(span_bits >= 1, "emit_read_run: empty span");
+    assert!(
+        word_align_bits.is_power_of_two()
+            && (32..=poot_kernel_ir::BUFFER_PARAM_ALIGN as u32 * 8).contains(&word_align_bits)
+            && max_residue < 32,
+        "emit_read_run: word alignment {word_align_bits} bits, residue {max_residue}"
+    );
+    let chunks = span_bits.div_ceil(32);
+    let touched = (max_residue as usize + span_bits).div_ceil(32);
     let first = bin(e, Ty::Usize, BinOp::Div, copy(bit), cu(32));
+    let loaded = emit_aligned_words(e, words, first, touched, word_align_bits);
+    if max_residue == 0 {
+        return loaded;
+    }
     let bit_in_word = bin(e, Ty::Usize, BinOp::Rem, copy(bit), cu(32));
     let shift = e.let_(
         Ty::U32,
@@ -209,28 +254,66 @@ pub(crate) fn emit_read_windows(
         },
     );
     let complement = bin(e, Ty::U32, BinOp::Sub, c32(31), copy(shift));
-    let len = e.let_(Ty::Usize, Rvalue::Len(Place::local(words)));
-    let last = bin(e, Ty::Usize, BinOp::Sub, copy(len), cu(1));
-    let loaded: Vec<Local> = (0..=chunks)
-        .map(|k| {
-            let at = bin(e, Ty::Usize, BinOp::Add, copy(first), cu(k));
-            let at = if k >= 2 {
-                bin(e, Ty::Usize, BinOp::Min, copy(at), copy(last))
-            } else {
-                at
+    (0..chunks)
+        .map(|c| {
+            let low = bin(e, Ty::U32, BinOp::Shr, copy(loaded[c]), copy(shift));
+            let Some(&next) = loaded.get(c + 1) else {
+                return low;
             };
-            e.let_(Ty::U32, Rvalue::Use(Operand::Copy(elem(words, at))))
-        })
-        .collect();
-    loaded
-        .windows(2)
-        .map(|pair| {
-            let low = bin(e, Ty::U32, BinOp::Shr, copy(pair[0]), copy(shift));
-            let once = bin(e, Ty::U32, BinOp::Shl, copy(pair[1]), c32(1));
+            let once = bin(e, Ty::U32, BinOp::Shl, copy(next), c32(1));
             let high = bin(e, Ty::U32, BinOp::Shl, copy(once), copy(complement));
             bin(e, Ty::U32, BinOp::BitOr, copy(low), copy(high))
         })
         .collect()
+}
+
+/// `chunks` words of `words` from word `first`, a multiple of `align_bits / 32` words: the widest vector load the
+/// alignment proves for each group the remaining words fill.
+fn emit_aligned_words(
+    e: &mut Emit,
+    words: Local,
+    first: Local,
+    chunks: usize,
+    align_bits: u32,
+) -> Vec<Local> {
+    let mut windows = Vec::with_capacity(chunks);
+    while windows.len() < chunks {
+        let at = windows.len();
+        let left = chunks - at;
+        let lanes = [4usize, 2, 1]
+            .into_iter()
+            .find(|&lanes| left >= lanes && align_bits as usize >= lanes * 32)
+            .expect("one word always fits");
+        let index = if at == 0 {
+            first
+        } else {
+            bin(e, Ty::Usize, BinOp::Add, copy(first), cu(at))
+        };
+        if lanes == 1 {
+            windows.push(e.let_(Ty::U32, Rvalue::Use(Operand::Copy(elem(words, index)))));
+            continue;
+        }
+        let group = e.let_(
+            Ty::Vec {
+                elem: Box::new(Ty::U32),
+                lanes: lanes as u32,
+            },
+            Rvalue::VectorLoad {
+                place: elem(words, index),
+                align_bytes: lanes as u32 * 4,
+            },
+        );
+        for lane in 0..lanes as u32 {
+            windows.push(e.let_(
+                Ty::U32,
+                Rvalue::VectorExtract {
+                    vector: copy(group),
+                    lane,
+                },
+            ));
+        }
+    }
+    windows
 }
 
 #[cfg(test)]
@@ -309,9 +392,10 @@ mod tests {
         assert_eq!(read_at(&words, 31, 1), 1);
     }
 
-    /// A one-thread body that stores `chunks` windows of [`emit_read_windows`] at bit `bit` of `words`, bitcast to
-    /// `f32` (the interpreter has no `u32` readback), into `out[0..chunks]`.
-    fn windows_body(bit: usize, chunks: usize) -> Body {
+    /// A one-thread body that stores the windows of [`emit_read_run`] over `span` bits at bit `bit` of `words`, whose
+    /// start the emitter proves word-aligned to `word_align` bits with at most `residue` bits in its word, bitcast to
+    /// `f32` (the interpreter has no `u32` readback), into `out[0..windows]`.
+    fn windows_body(bit: usize, span: usize, word_align: u32, residue: u32) -> Body {
         let mut al = Alloc::new(vec![
             ld(Ty::Unit, false),
             ld(slice_dtype(Ty::U32, false), false),
@@ -320,7 +404,7 @@ mod tests {
         let (words, out) = (local(1), local(2));
         let mut emit = Emit::new(&mut al);
         let bit_local = emit.let_(Ty::Usize, Rvalue::Use(cu(bit)));
-        let windows = emit_read_windows(&mut emit, words, bit_local, chunks);
+        let windows = emit_read_run(&mut emit, words, bit_local, span, word_align, residue);
         for (c, window) in windows.into_iter().enumerate() {
             let as_f32 = emit.let_(
                 Ty::F32,
@@ -339,19 +423,25 @@ mod tests {
         Body::new("read_windows_probe", 2, al.locals, vec![block])
     }
 
-    fn windows_at(words: &[u32], bit: usize, chunks: usize) -> Vec<u32> {
-        let body = windows_body(bit, chunks);
+    fn windows_at(
+        words: &[u32],
+        bit: usize,
+        span: usize,
+        word_align: u32,
+        residue: u32,
+    ) -> Result<Vec<u32>, poot_kernel_ir::interp::InterpError> {
+        let body = windows_body(bit, span, word_align, residue);
         let mut buffers = [
             Buffer::from_u32s(words),
-            Buffer::from_f32s(&vec![0.0; chunks]),
+            Buffer::from_f32s(&vec![0.0; span.div_ceil(32)]),
         ];
-        run(&body, workgroups_covering(&body, 1), &mut buffers).unwrap();
-        buffers[1]
+        run(&body, workgroups_covering(&body, 1), &mut buffers)?;
+        Ok(buffers[1]
             .to_f32s()
             .unwrap()
             .into_iter()
             .map(f32::to_bits)
-            .collect()
+            .collect())
     }
 
     /// Bits `at .. at + 32` of `words` read one bit at a time, zero past the last word.
@@ -365,21 +455,95 @@ mod tests {
         })
     }
 
-    /// Every window at every start bit of the data words (the last word is the zero guard): `bit % 32 == 0`
-    /// (the funnel's shift is 0, so `hi << 32` would be undefined unless split), the last data bit, and one to
-    /// three windows, whose later words clamp to the last word of the slice and so read the zero guard.
-    /// Mutation: `31 - shift` -> `30 - shift` in `emit_read_windows`; every start bit but 0 goes red.
+    /// The widest alignment in bits, from 32 to 128, that the word `bit` starts in is a multiple of.
+    fn word_alignment_of(bit: usize) -> u32 {
+        1 << ((bit - bit % 32) | 128).trailing_zeros().min(7)
+    }
+
+    /// Every window over every span of 1 to 160 bits at every start bit of the data words (the last word is the
+    /// zero guard), read at the word alignment the start's word has and the residue it has: the widest vector
+    /// load, plain words, or the funnel (`bit % 32 == 0` with a residue bound, where the shift is 0 and `hi << 32`
+    /// would be undefined unless split; the last data bit). Only the bits of the span are compared: the rest of
+    /// the last window is unspecified.
+    /// Mutation: `31 - shift` -> `30 - shift` in `emit_read_run`; every start bit but a word's first goes red.
     #[test]
     fn windows_equal_the_scalar_read_at_every_start_bit() {
-        let words = [0xdead_beef_u32, 0x1234_5678, 0x8000_0001, 0xffff_0000, 0];
-        for chunks in 1..=3 {
+        let words = [
+            0xdead_beef_u32,
+            0x1234_5678,
+            0x8000_0001,
+            0xffff_0000,
+            0x0f0f_a5a5,
+            0x7777_1111,
+            0xcafe_f00d,
+            0x0123_4567,
+            0x89ab_cdef,
+            0x1357_9bdf,
+            0,
+        ];
+        for span in (1..=160).step_by(7).chain([32, 64, 96, 128, 160]) {
             for bit in 0..(words.len() - 1) * 32 {
-                let got = windows_at(&words, bit, chunks);
-                let want: Vec<u32> = (0..chunks)
-                    .map(|c| scalar_window(&words, bit + 32 * c))
-                    .collect();
-                assert_eq!(got, want, "bit {bit}, {chunks} window(s)");
+                let residue = (bit % 32) as u32;
+                // The words the span touches, all inside the slice: the data and its zero guard.
+                if bit / 32 + (bit % 32 + span).div_ceil(32) > words.len() {
+                    continue;
+                }
+                let align = word_alignment_of(bit);
+                let got = windows_at(&words, bit, span, align, residue).unwrap();
+                assert_eq!(got.len(), span.div_ceil(32));
+                for (c, window) in got.into_iter().enumerate() {
+                    let used = (span - 32 * c).min(32);
+                    let mask = if used == 32 {
+                        u32::MAX
+                    } else {
+                        (1 << used) - 1
+                    };
+                    assert_eq!(
+                        window & mask,
+                        scalar_window(&words, bit + 32 * c) & mask,
+                        "bit {bit} (word align {align}), span {span}, window {c}"
+                    );
+                }
             }
         }
+    }
+
+    /// An aligned run reads exactly the words of its span: no word past it, whatever the vector split, so the last
+    /// word of the data needs no guard. Mutation: read one word more than `touched` in `emit_read_run`; the
+    /// buffer ends and the interpreter faults.
+    #[test]
+    fn an_aligned_run_reads_only_its_words() {
+        let words = [
+            0xdead_beef_u32,
+            0x1234_5678,
+            0x8000_0001,
+            0xffff_0000,
+            0x0f0f_a5a5,
+        ];
+        for count in 1..=5 {
+            let got = windows_at(&words[..count], 0, count * 32, 128, 0).unwrap();
+            assert_eq!(
+                got,
+                words[..count],
+                "{count} word(s) of a {count}-word buffer"
+            );
+        }
+    }
+
+    /// A run declared more aligned than its start is a wrong proof: the interpreter refuses the vector load.
+    #[test]
+    fn a_run_declared_more_aligned_than_its_start_is_refused() {
+        let words = [1u32, 2, 3, 4, 5, 6, 7, 8, 0];
+        let refused = windows_at(&words, 32, 128, 128, 0).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                poot_kernel_ir::interp::InterpError::Fault {
+                    fault: poot_kernel_ir::interp::Fault::MisalignedVectorLoad { .. },
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
     }
 }

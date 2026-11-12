@@ -1645,6 +1645,8 @@ poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_gemv_gives_way_
 poot-kernelgen	poot-kernelgen	model-free	contraction::tests::the_matrix_units_rate_discounts_the_fragment_multiply
 poot-kernelgen	poot-kernelgen	model-free	contraction::tiled::tests::a_round_holds_the_reads_its_decode_uses
 poot-kernelgen	poot-kernelgen	model-free	contraction::tiled::tests::a_split_moves_the_reads_ahead_and_keeps_their_uses
+poot-kernelgen	poot-kernelgen	model-free	emit::tests::a_run_declared_more_aligned_than_its_start_is_refused
+poot-kernelgen	poot-kernelgen	model-free	emit::tests::an_aligned_run_reads_only_its_words
 poot-kernelgen	poot-kernelgen	model-free	emit::tests::reads_a_full_word_at_a_word_boundary
 poot-kernelgen	poot-kernelgen	model-free	emit::tests::reads_spanning_a_word_boundary
 poot-kernelgen	poot-kernelgen	model-free	emit::tests::reads_the_last_bit_of_a_word_without_touching_the_guard
@@ -1667,8 +1669,10 @@ poot-kernelgen	poot-kernelgen	model-free	helpers::stride_tests::view_eff_strides
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::a_gemv_refuses_a_narrowed_precision
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::a_narrowed_packed_contraction_rounds_the_decoded_weight_and_the_activation
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::a_tiled_packed_contraction_refuses_an_epilogue_by_name
+poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::a_two_byte_aligned_run_reads_its_span_plus_one_word
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::a_vector_activation_read_matches_the_scalar_read_bit_for_bit
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::a_vector_activation_read_over_a_partial_group_run_is_refused
+poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::an_aligned_run_reads_exactly_its_span
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::contraction_bodies_compile_for_spirv_nvptx_and_amdgcn
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::contraction_gemv_epilogue_is_applied_once_to_the_completed_sum
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::contraction_gemv_matches_reference_blocks_1_and_2
@@ -1677,6 +1681,7 @@ poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::contraction_
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::contraction_tiled_folded_grid_padding_workgroups_stay_in_bounds
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::contraction_tiled_matches_reference_aligned_and_ragged
 poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::contraction_tiled_matches_reference_block_diagonal_ragged
+poot-kernelgen	poot-kernelgen	model-free	packed::contraction_tests::every_format_gemv_is_bit_identical_after_static_alignment
 poot-kernelgen	poot-kernelgen	model-free	packed::decode_plan::tests::a_count_that_does_not_factor_over_the_digits_has_no_constant_offsets
 poot-kernelgen	poot-kernelgen	model-free	packed::decode_plan::tests::a_field_of_four_pieces_decodes_in_the_emitted_kernel
 poot-kernelgen	poot-kernelgen	model-free	packed::decode_plan::tests::a_run_moves_the_bit_offset_by_constants_over_the_digits
@@ -4555,6 +4560,7 @@ poot-quant	poot-quant::packed_linear	model-free	packed_weight_try_new_accepts_ev
 poot-quant	poot-quant::packed_linear	model-free	packed_weight_try_new_rejects_a_dense_format
 poot-quant	poot-quant::packed_linear	model-free	packed_weight_try_new_rejects_a_partial_block
 poot-quant	poot-quant::packed_linear	model-free	packed_weight_try_new_rejects_a_zero_extent
+poot-rocm-device	poot-rocm-device	model-free	device::tests::copies_take_no_dispatch_index_and_no_dispatch_time
 poot-rocm-device	poot-rocm-device::attention	device	a_declined_live_attention_graph_runs_as_primitives_on_rocm
 poot-rocm-device	poot-rocm-device::attention	device	a_live_length_never_reads_the_poisoned_tail_on_rocm
 poot-rocm-device	poot-rocm-device::attention	device	a_narrow_live_attention_graph_runs_on_rocm_and_never_reads_the_poisoned_tail

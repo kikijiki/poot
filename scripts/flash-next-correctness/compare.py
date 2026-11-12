@@ -5,8 +5,9 @@ Three distribution sources, all for the same token sequence, scored at the posit
 one `llama-perplexity` window (`first = n_ctx // 2 .. n_ctx - 2`; the record at position `p` is the distribution
 of the token at `p + 1`):
 
-  --cpu   a `llama-perplexity --save-all-logits` file from the CPU backend (the reference)
-  --cuda  the same file from the CUDA backend (the reference's own noise: CPU vs CUDA on identical weights)
+  --cpu    a `llama-perplexity --save-all-logits` file from the CPU backend (the reference)
+  --other  the same file from a second, distinct llama.cpp backend (CUDA, Vulkan, HIP: the reference's own noise,
+           CPU vs that backend on identical weights)
   --poot  `poot-score` output (top-K log-probabilities per position, from the production driver)
 
 `compare.py tokens <logits file> <out>` writes the token ids of a logits file's window (the input of `poot-score`).
@@ -21,12 +22,16 @@ compared, so llama.cpp against llama.cpp and llama.cpp against poot are measured
             differs from the logit by the same per-position constant in both engines, so this is the logit
             difference up to the log-sum-exp difference, which is what the card calls "max abs logit difference")
 
-The tolerance is derived, not chosen: poot passes when each metric is within `--factor` times the CPU-vs-CUDA
-noise (plus a small absolute floor so a noiseless pair does not demand exactness of poot) and its top-1 rate is
-within `--top1-slack` of the noise pair's. The greedy continuations (`llama-server` responses
+The tolerance is derived, not chosen: poot passes when each metric is within `--factor` times the measured
+noise of the CPU-vs-other pair and its top-1 rate is within `--top1-slack` of the noise pair's. The small absolute
+floors only keep a near-noiseless pair from demanding exactness of poot; a pair with no measured spread at all
+(the same dump passed twice, or two backends that agree to the bit) is refused, because it would collapse every
+limit to the floors, which are far tighter than two real backends agree on a low-bit quantization (POOT-1569).
+The report records the pair, its measured noise, the floors and the derived limits. The greedy continuations (`llama-server` responses
 with `return_tokens`, and poot's) are compared by the index of the first differing token.
 
-Exit status: 0 when poot is within tolerance, 1 when it is not, 2 for a malformed input.
+Exit status: 0 when poot is within tolerance, 1 when it is not, 2 for a malformed input or a noise pair that
+measures no spread.
 """
 
 import argparse
@@ -208,7 +213,7 @@ def first_divergence(a, b):
 
 def tolerance(noise, factor, top1_slack, floors):
     # The top-1 rate moves in steps of 1/positions: a window of two dozen positions cannot resolve 2%, and a
-    # near-tie flipping at one or two positions is what the CPU-vs-CUDA pair does too.
+    # near-tie flipping at one or two positions is what the CPU-vs-other pair does too.
     top1_slack = max(top1_slack, 2.0 / noise["positions"])
     return {
         "mean_kl": max(factor * noise["mean_kl"], floors["mean_kl"]),
@@ -216,6 +221,16 @@ def tolerance(noise, factor, top1_slack, floors):
         "max_abs": max(factor * noise["max_abs"], floors["max_abs"]),
         "top1": noise["top1"] - top1_slack,
     }
+
+
+def require_spread(noise):
+    """Refuse a noise pair that measures no spread: its factor multiple is zero, so every limit would fall back to
+    the absolute floors."""
+    if noise["mean_kl"] == 0 and noise["max_kl"] == 0 and noise["max_abs"] == 0:
+        raise Malformed(
+            "the noise pair measures no spread (identical or bit-equal dumps): pass a distinct second "
+            "llama.cpp backend as --other"
+        )
 
 
 MAX_DROPPED = 0.1
@@ -252,24 +267,25 @@ def main(argv=None):
         return 0
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--cpu", required=True, help="llama-perplexity logits file, CPU backend (reference)")
-    parser.add_argument("--cuda", required=True, help="the same, CUDA backend (the reference's noise)")
+    parser.add_argument("--other", required=True, help="the same, a distinct second llama.cpp backend (the reference's noise)")
     parser.add_argument("--poot", required=True, help="poot-score JSON")
     parser.add_argument("--top", type=int, default=20)
-    parser.add_argument("--factor", type=float, default=3.0, help="tolerance = factor x the CPU-vs-CUDA noise")
+    parser.add_argument("--factor", type=float, default=3.0, help="tolerance = factor x the CPU-vs-other noise")
     parser.add_argument("--top1-slack", type=float, default=0.02)
     parser.add_argument("--floor-kl", type=float, default=1e-3)
     parser.add_argument("--floor-max-abs", type=float, default=0.05)
     parser.add_argument("--greedy-cpu", help="llama-server /completion response of the greedy continuation, CPU")
-    parser.add_argument("--greedy-cuda", help="the same, CUDA")
+    parser.add_argument("--greedy-other", help="the same, the second backend")
     parser.add_argument("--out", help="write the report JSON here")
     args = parser.parse_args(argv)
 
     try:
-        cpu, cuda = load_reference(args.cpu), load_reference(args.cuda)
+        cpu, other = load_reference(args.cpu), load_reference(args.other)
         positions, poot = poot_positions(args.poot)
-        noise = reference_vs_reference(cpu, cuda, args.top)
+        noise = reference_vs_reference(cpu, other, args.top)
+        require_spread(noise)
         subject = reference_vs_poot(cpu, positions, args.top)
-        subject_vs_cuda = reference_vs_poot(cuda, positions, args.top)
+        subject_vs_other = reference_vs_poot(other, positions, args.top)
     except Malformed as error:
         print("malformed input: %s" % error, file=sys.stderr)
         return 2
@@ -284,9 +300,10 @@ def main(argv=None):
         "scored_positions": cpu.scored,
         "poot_device": poot.get("adapter"),
         "prefill_chunk": poot.get("prefill_chunk"),
-        "noise_cpu_vs_cuda": noise,
+        "noise_pair": {"reference": args.cpu, "other": args.other, "factor": args.factor, "noise": noise},
         "poot_vs_cpu": subject,
-        "poot_vs_cuda": subject_vs_cuda,
+        "poot_vs_other": subject_vs_other,
+        "floors": floors,
         "limits": limits,
         "failures": [{"metric": m, "observed": v, "limit": l} for m, v, l in failures],
         "greedy": greedy_report(args, poot),
@@ -302,19 +319,19 @@ def main(argv=None):
 
 def greedy_report(args, poot):
     runs = {"poot": poot["greedy"]["ids"]}
-    for name, path in (("llama_cpu", args.greedy_cpu), ("llama_cuda", args.greedy_cuda)):
+    for name, path in (("llama_cpu", args.greedy_cpu), ("llama_other", args.greedy_other)):
         if path:
             with open(path) as handle:
                 runs[name] = json.load(handle)["tokens"]
     report = {"poot_text": poot["greedy"]["text"]}
     names = list(runs)
-    if "llama_cpu" in runs and "llama_cuda" in runs:
+    if "llama_cpu" in runs and "llama_other" in runs:
         # Informational, not a gate: one 64-token sample cannot carry a verdict. poot is "within noise" when it
-        # follows the CPU reference for at least as long as the CUDA backend does.
+        # follows the CPU reference for at least as long as the second backend does.
         inf = float("inf")
         poot_at = first_divergence(runs["llama_cpu"], runs["poot"])
-        noise_at = first_divergence(runs["llama_cpu"], runs["llama_cuda"])
-        report["poot_diverges_no_earlier_than_llama_cuda"] = (inf if poot_at is None else poot_at) >= (
+        noise_at = first_divergence(runs["llama_cpu"], runs["llama_other"])
+        report["poot_diverges_no_earlier_than_llama_other"] = (inf if poot_at is None else poot_at) >= (
             inf if noise_at is None else noise_at
         )
     for i, a in enumerate(names):

@@ -10,7 +10,8 @@
 # Cases (default: all): `short` (kl_corpus.txt, a window of SHORT_CTX tokens) and `long` (long.txt, LONG_CTX).
 # llama-perplexity needs two windows of text and scores one (`--chunks 1`); its window is the token sequence both
 # engines then score, and the prompt of the greedy continuation (llama-server /completion with token ids, so no
-# tokenizer difference can enter). CPU and GPU runs of llama.cpp are the reference's own noise (compare.py).
+# tokenizer difference can enter). CPU and GPU runs of llama.cpp are the reference's own noise (compare.py); the GPU run must be a real second
+# backend (compare.py refuses a pair with no spread).
 #
 # Every step runs under a time limit (STEP_TIMEOUT_*): a step that hangs or fails is logged, marks the run failed
 # and the pipeline goes on, so one stuck engine costs its limit, not the pod hour. The GPU phase runs first (it
@@ -115,9 +116,9 @@ phase_cpu() { # <name> <corpus> <n_ctx>
 phase_compare() { # <name>
     local dir=$OUT/$1 optional=()
     [ -s "$dir/greedy-cpu.json" ] && optional+=(--greedy-cpu "$dir/greedy-cpu.json")
-    [ -s "$dir/greedy-gpu.json" ] && optional+=(--greedy-cuda "$dir/greedy-gpu.json")
+    [ -s "$dir/greedy-gpu.json" ] && optional+=(--greedy-other "$dir/greedy-gpu.json")
     step "$STEP_TIMEOUT_COMPARE" "$1: compare" \
-        "$PYTHON" "$here/compare.py" --cpu "$dir/cpu.bin" --cuda "$dir/gpu.bin" --poot "$dir/poot.json" \
+        "$PYTHON" "$here/compare.py" --cpu "$dir/cpu.bin" --other "$dir/gpu.bin" --poot "$dir/poot.json" \
         "${optional[@]}" --out "$dir/report.json" >/dev/null
     [ -s "$dir/report.json" ] || return 0
     echo "== $1: $("$PYTHON" -c "import json,sys; r=json.load(open(sys.argv[1])); print('PASS' if r['pass'] else 'FAIL', r['failures'])" "$dir/report.json")" >&2

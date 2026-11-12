@@ -1688,10 +1688,12 @@ mod tests {
         assert!(spills_first.asked.get() >= 2);
     }
 
-    /// The compiler, not the held share, decides: the Flash-Next expert projection's one-wave 16 x 16 tile at a 64-deep
-    /// round counts 136 registers on an sm_120 lane, over the held share (127), so the register model never weighs
-    /// it, and under compile feedback it is a candidate (POOT-1509 measured it at 2.00 ms against the exact 2.35 ms,
-    /// unspilled). Mutation: hold `Bound::Lane` to `RegisterBudget::loop_registers` in `RegisterTiling::runs_on`; the
+    /// The compiler, not the held share, decides: the Flash-Next expert projection's one-wave 16 x 32 tile at a 64-deep
+    /// round counts 208 registers on an sm_120 lane, over the held share (127), so the register model never weighs
+    /// it, and under compile feedback it is a candidate. (The one-wave 16 x 16 tile POOT-1509 measured at 2.00 ms
+    /// against the exact 2.35 ms, unspilled, counted 136 until POOT-1559's static-alignment reads shrank the decode's
+    /// held reads; it counts 120 and the model weighs it.) Mutation: hold `Bound::Lane` to
+    /// `RegisterBudget::loop_registers` in `RegisterTiling::runs_on`; the
     /// tile is no candidate.
     #[test]
     fn compile_feedback_weighs_a_tiling_the_held_share_refuses() {
@@ -1731,7 +1733,7 @@ mod tests {
                 dtype: FragmentDtype::F16,
                 layout,
                 rows: 1,
-                cols: 1,
+                cols: 2,
             }),
             run: RunLength::dividing(2560),
             depth: 64,
@@ -1744,7 +1746,7 @@ mod tests {
         assert!(
             RegisterTiling::prefiltered(grouped, &caps, Feasibility::Compiled(&all))
                 .contains(&tile),
-            "the compiler is asked about the 64-deep 16 x 16 tile"
+            "the compiler is asked about the 64-deep 16 x 32 tile"
         );
     }
 

@@ -9,14 +9,14 @@
 
 use poot_kernel_ir::{BinOp, ConstantTableDecl, Local, Rvalue, Ty};
 use poot_quant::format::{
-    BitLayout, BlockLayout, Field, FieldEncoding, FormatDescriptor, MinSign, OperandRole, Storage,
-    WeightFormat,
+    BitLayout, BlockLayout, Field, FieldEncoding, FormatDescriptor, MinSign, OperandRole, Piece,
+    Storage, WeightFormat,
 };
 
 use super::family::{Codes, Family, Position};
 use super::float_decode::emit_float_decode;
 use super::kernel::emit_block_address;
-use super::source::Source;
+use super::source::{PieceAlignment, Source};
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy, cu};
 
@@ -154,6 +154,21 @@ impl DecodePlan {
         field: &Field,
         i: Local,
     ) -> Local {
+        self.emit_pieces(e, block_bit, field, i, |e, bit, piece| {
+            src.read_bits(e, bit, piece.width)
+        })
+    }
+
+    /// `field`'s raw bits at in-block index `i`, each piece read by `read` at the bit offset the piece's layout
+    /// gives (`read(e, bit, piece)`) and concatenated low bits first.
+    fn emit_pieces(
+        &self,
+        e: &mut Emit,
+        block_bit: Local,
+        field: &Field,
+        i: Local,
+        mut read: impl FnMut(&mut Emit, Local, &Piece) -> Local,
+    ) -> Local {
         assert!(
             !field.pieces.is_empty(),
             "format tests: a field has at least one piece"
@@ -162,12 +177,12 @@ impl DecodePlan {
         let mut below = 0;
         for piece in field.pieces {
             let bit = self.emit_bit_layout(e, block_bit, &piece.layout, i);
-            let read = src.read_bits(e, bit, piece.width);
+            let piece_bits = read(e, bit, piece);
             bits = Some(match bits {
-                None => read,
+                None => piece_bits,
                 // Low bits first (`format::Field` docs): a piece shifts up by the widths below it.
                 Some(low) => {
-                    let shifted = bin(e, Ty::U32, BinOp::Shl, copy(read), c32(below));
+                    let shifted = bin(e, Ty::U32, BinOp::Shl, copy(piece_bits), c32(below));
                     bin(e, Ty::U32, BinOp::BitOr, copy(low), copy(shifted))
                 }
             });
@@ -187,7 +202,11 @@ impl DecodePlan {
         field: &Field,
         i: Local,
     ) -> Local {
-        let bits = self.emit_field_bits(e, src, block_bit, field, i);
+        // A factor field sits at a position the descriptor aligns, so each piece is one load of its own word.
+        let bits = self.emit_pieces(e, block_bit, field, i, |e, bit, piece| {
+            let align = PieceAlignment::of(self.layout, piece, 1, 0);
+            src.read_field(e, bit, piece.width, align)
+        });
         emit_encoded_number(e, field.encoding, field.width(), bits)
     }
 
@@ -285,7 +304,13 @@ impl DecodePlan {
             .map(|piece| {
                 let deltas = run_deltas(&piece.layout, count)?;
                 let first_bit = self.emit_bit_layout(e, block_bit, &piece.layout, first);
-                Some(emit_piece_run(e, src, first_bit, piece.width, &deltas))
+                Some(emit_piece_run(
+                    e,
+                    src,
+                    first_bit,
+                    (self.layout, piece, count),
+                    &deltas,
+                ))
             })
             .collect();
         match pieces {
@@ -449,18 +474,24 @@ fn run_deltas(layout: &BitLayout, count: usize) -> Option<Vec<usize>> {
     (remaining == 1).then_some(deltas)
 }
 
+/// The most bits a stretch of one run read spans from its first value's offset: a 128-bit span is four words.
+const STRETCH_BITS: usize = 128;
+
 /// The `width`-bit values at bit `first_bit + deltas[j]` for each `j`, each stretch of nearby offsets read once
-/// through shared 32-bit windows ([`Source::read_windows`]) and cut into its values with constant shifts. Offsets
-/// more than 64 bits apart start a new stretch, so a run whose elements sit far apart reads each part separately;
-/// elements at the same offset (a broadcast field) share one extraction.
+/// through shared 32-bit windows ([`Source::read_run`]) and cut into its values with constant shifts. `run` is the
+/// block layout, the piece and the run length whose starts `first_bit` ranges over ([`PieceAlignment::of`]). A
+/// stretch ends where the next offset is a whole word past the last value's end, or more than [`STRETCH_BITS`] past
+/// the stretch's start, so a run whose elements sit far apart reads each part separately and never a word nothing
+/// uses; elements at the same offset (a broadcast field) share one extraction.
 fn emit_piece_run(
     e: &mut Emit,
     src: Source,
     first_bit: Local,
-    width: u32,
+    run: (BlockLayout, &Piece, usize),
     deltas: &[usize],
 ) -> Vec<Local> {
-    let width = width as usize;
+    let (layout, piece, count) = run;
+    let width = piece.width as usize;
     let mut distinct: Vec<usize> = deltas.to_vec();
     distinct.sort_unstable();
     distinct.dedup();
@@ -468,10 +499,12 @@ fn emit_piece_run(
     let mut at = 0;
     while at < distinct.len() {
         let start = distinct[at];
-        let end = distinct[at..]
-            .iter()
-            .position(|&delta| delta - start > 64)
-            .map_or(distinct.len(), |len| at + len);
+        let end = (at + 1..distinct.len())
+            .find(|&next| {
+                distinct[next] - start > STRETCH_BITS
+                    || distinct[next] - distinct[next - 1] >= 32 + width
+            })
+            .unwrap_or(distinct.len());
         let stretch = &distinct[at..end];
         let span = stretch[stretch.len() - 1] - start + width;
         let bit = if start == 0 {
@@ -479,7 +512,8 @@ fn emit_piece_run(
         } else {
             bin(e, Ty::Usize, BinOp::Add, copy(first_bit), cu(start))
         };
-        let windows = src.read_windows(e, bit, span.div_ceil(32));
+        let align = PieceAlignment::of(layout, piece, count, start);
+        let windows = src.read_run(e, bit, span, align);
         for &delta in stretch {
             let (window, shift) = ((delta - start) / 32, ((delta - start) % 32) as u32);
             let low = bin(e, Ty::U32, BinOp::Shr, copy(windows[window]), c32(shift));
@@ -779,7 +813,7 @@ mod tests {
     /// factors (blocks starting at bit 0, a word boundary, and 272, which is not one), through the element-by-
     /// element fallback for one that does not, for a broadcast field (one extraction shared by the group), for
     /// runs crossing two digits, and for a two-piece field whose pieces are joined low bits first.
-    /// Mutation: `31 - shift` -> `30 - shift` in `emit_read_windows`; the windowed rows go red.
+    /// Mutation: `31 - shift` -> `30 - shift` in `emit_read_run`; the windowed rows go red.
     #[test]
     fn a_run_of_field_bits_equals_the_scalar_read_of_each_element() {
         static SIX_FIELD: [Piece; 1] = [Piece {

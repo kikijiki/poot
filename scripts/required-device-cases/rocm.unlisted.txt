@@ -2,6 +2,7 @@
 # A row the lane runs and passes that is in neither rocm.txt nor here fails scripts/check-required-cases.py;
 # a row that prints a skip report fails whether listed or not. Sorted in canonical (LC_ALL=C) order; every row must run in the lane or the gate fails.
 poot-llm::rocm_parity_models	softcapped_qwen2_matches_the_oracle_on_rocm	poot-llm `rocm_parity_models` binary selected whole by the lane; covered by its own assertion, the lane's named cases are in the required list
+poot-rocm-device	device::tests::copies_take_no_dispatch_index_and_no_dispatch_time	pure span arithmetic over synthetic spans: needs no device, and runs under `just test` (model-free)
 poot-rocm-device::bin/rocm-check	tests::a_missing_device_is_a_failure_when_rocm_is_required	host-only check of the rocm-check binary's own logic: needs no device, and runs under `just test`
 poot-rocm-device::bin/rocm-check	tests::out_of_resources_is_no_device_only_without_the_kfd_node	host-only check of the rocm-check binary's own logic: needs no device, and runs under `just test`
 poot-rocm-device::bin/rocm-check	tests::pcie_receipt_skip_is_decided_by_the_rocm_requirement_only	host-only check of the rocm-check binary's own logic: needs no device, and runs under `just test`
